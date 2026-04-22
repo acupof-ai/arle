@@ -32,6 +32,41 @@ struct QueuedAdmissionCandidate {
     plan: PrefixAdmissionPlan,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WaitingRequestHint {
+    immediate_reuse_tokens: usize,
+    total_reuse_tokens: usize,
+}
+
+impl WaitingRequestHint {
+    fn from_plan(plan: &PrefixAdmissionPlan, reusable_prefix_len: usize) -> Self {
+        let immediate_reuse_tokens = if plan.direct_gpu_attach {
+            plan.lookup.matched_len
+        } else {
+            reusable_prefix_len
+        };
+        let total_reuse_tokens = if immediate_reuse_tokens > 0 {
+            immediate_reuse_tokens
+        } else if let Some(staged_prefix_plan) = plan.staged_prefix_plan.as_ref() {
+            staged_prefix_plan.matched_len
+        } else if !plan.lookup.recompute_advised {
+            plan.lookup.matched_len
+        } else {
+            0
+        };
+        Self {
+            immediate_reuse_tokens,
+            total_reuse_tokens,
+        }
+    }
+}
+
+struct DeferredWaitingRequest {
+    incoming: super::IncomingRequest,
+    prompt_tokens: Vec<u32>,
+    hint: WaitingRequestHint,
+}
+
 pub(super) fn best_reusable_slot_for_radix_hit(
     matched_blocks: &[crate::prefix_cache::BlockId],
     free_slots: &[usize],
@@ -78,21 +113,80 @@ pub(super) enum WaitingInsertBias {
     AfterEqual,
 }
 
+fn waiting_request_precedes(
+    incoming_priority: super::RequestPriority,
+    incoming_hint: WaitingRequestHint,
+    queued_priority: super::RequestPriority,
+    queued_hint: WaitingRequestHint,
+    bias: WaitingInsertBias,
+) -> bool {
+    match incoming_priority.cmp(&queued_priority) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match (
+            incoming_hint.immediate_reuse_tokens,
+            incoming_hint.total_reuse_tokens,
+        )
+            .cmp(&(
+                queued_hint.immediate_reuse_tokens,
+                queued_hint.total_reuse_tokens,
+            )) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
+        },
+    }
+}
+
+fn waiting_insert_position<T>(
+    waiting: &std::collections::VecDeque<T>,
+    incoming_priority: super::RequestPriority,
+    incoming_hint: WaitingRequestHint,
+    bias: WaitingInsertBias,
+    queued_key: impl Fn(&T) -> (super::RequestPriority, WaitingRequestHint),
+) -> usize {
+    waiting
+        .iter()
+        .position(|queued| {
+            let (queued_priority, queued_hint) = queued_key(queued);
+            waiting_request_precedes(
+                incoming_priority,
+                incoming_hint,
+                queued_priority,
+                queued_hint,
+                bias,
+            )
+        })
+        .unwrap_or(waiting.len())
+}
+
 fn insert_waiting_request_by_priority(
     waiting: &mut std::collections::VecDeque<super::IncomingRequest>,
     incoming: super::IncomingRequest,
     bias: WaitingInsertBias,
 ) {
-    let insert_at = match bias {
-        WaitingInsertBias::BeforeEqual => waiting
-            .iter()
-            .position(|queued| incoming.priority >= queued.priority)
-            .unwrap_or(waiting.len()),
-        WaitingInsertBias::AfterEqual => waiting
-            .iter()
-            .position(|queued| incoming.priority > queued.priority)
-            .unwrap_or(waiting.len()),
-    };
+    let insert_at = waiting_insert_position(
+        waiting,
+        incoming.priority,
+        WaitingRequestHint::default(),
+        bias,
+        |queued| (queued.priority, WaitingRequestHint::default()),
+    );
+    waiting.insert(insert_at, incoming);
+}
+
+fn insert_deferred_waiting_request(
+    waiting: &mut std::collections::VecDeque<DeferredWaitingRequest>,
+    incoming: DeferredWaitingRequest,
+    bias: WaitingInsertBias,
+) {
+    let insert_at = waiting_insert_position(
+        waiting,
+        incoming.incoming.priority,
+        incoming.hint,
+        bias,
+        |queued| (queued.incoming.priority, queued.hint),
+    );
     waiting.insert(insert_at, incoming);
 }
 
@@ -213,13 +307,14 @@ impl<M: ModelForward> Scheduler<M> {
         Some((free_slots[0], 0, 0))
     }
 
-    fn defer_waiting_request(
+    fn restore_deferred_waiting_requests(
         &mut self,
-        mut incoming: super::IncomingRequest,
-        prompt_tokens: Vec<u32>,
+        mut deferred_waiting: std::collections::VecDeque<DeferredWaitingRequest>,
     ) {
-        incoming.prompt_tokens = Some(prompt_tokens);
-        self.enqueue_waiting_request(incoming, WaitingInsertBias::BeforeEqual);
+        while let Some(mut deferred) = deferred_waiting.pop_front() {
+            deferred.incoming.prompt_tokens = Some(deferred.prompt_tokens);
+            self.waiting.push_back(deferred.incoming);
+        }
     }
 
     /// Canonical admission decision for one incoming prompt.
@@ -1103,10 +1198,9 @@ impl<M: ModelForward> Scheduler<M> {
             if let Ok(event) = self.coordinator_events.recv() {
                 self.handle_coordinator_event(event);
                 return true;
-            } else {
-                error!("Coordinator event channel disconnected");
-                return true;
             }
+            error!("Coordinator event channel disconnected");
+            return true;
         }
 
         crossbeam_channel::select! {
@@ -1144,11 +1238,10 @@ impl<M: ModelForward> Scheduler<M> {
                 self.drain_request_rx();
                 self.drain_wakeup_rx();
                 return true;
-            } else {
-                self.handle_wakeup_disconnect();
-                info!("Scheduler shutting down: all handles dropped");
-                return false;
             }
+            self.handle_wakeup_disconnect();
+            info!("Scheduler shutting down: all handles dropped");
+            return false;
         }
 
         true
@@ -1246,6 +1339,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let candidates = self.collect_admission_candidates(&available_free_slots, length_contract);
+        let mut deferred_waiting = std::collections::VecDeque::new();
         let mut admission_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
         for (slot_idx, req) in self.active.iter().enumerate() {
             let Some(req) = req.as_ref() else {
@@ -1265,8 +1359,17 @@ impl<M: ModelForward> Scheduler<M> {
             let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) =
                 Self::choose_admission_slot(&candidate.plan, &available_free_slots)
             else {
+                let hint = WaitingRequestHint::from_plan(&candidate.plan, 0);
                 self.release_admission_plan(&candidate.plan);
-                self.defer_waiting_request(candidate.incoming, candidate.prompt_tokens);
+                insert_deferred_waiting_request(
+                    &mut deferred_waiting,
+                    DeferredWaitingRequest {
+                        incoming: candidate.incoming,
+                        prompt_tokens: candidate.prompt_tokens,
+                        hint,
+                    },
+                    WaitingInsertBias::BeforeEqual,
+                );
                 continue;
             };
             let reserved_prefix_tokens =
@@ -1278,8 +1381,17 @@ impl<M: ModelForward> Scheduler<M> {
                 candidate.incoming.max_tokens,
                 reserved_prefix_tokens,
             ) {
+                let hint = WaitingRequestHint::from_plan(&candidate.plan, reusable_prefix_len);
                 self.release_admission_plan(&candidate.plan);
-                self.defer_waiting_request(candidate.incoming, candidate.prompt_tokens);
+                insert_deferred_waiting_request(
+                    &mut deferred_waiting,
+                    DeferredWaitingRequest {
+                        incoming: candidate.incoming,
+                        prompt_tokens: candidate.prompt_tokens,
+                        hint,
+                    },
+                    WaitingInsertBias::BeforeEqual,
+                );
                 continue;
             }
             if candidate.plan.attached_prefix_blocks.is_empty()
@@ -1308,6 +1420,7 @@ impl<M: ModelForward> Scheduler<M> {
                 reusable_cached_prompt_len,
             );
         }
+        self.restore_deferred_waiting_requests(deferred_waiting);
     }
 
     /// Find all free slot indices.
@@ -1397,7 +1510,8 @@ impl<M: ModelForward> Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        WaitingInsertBias, best_reusable_slot_for_radix_hit, finish_rejected_request,
+        DeferredWaitingRequest, PrefixAdmissionPlan, WaitingInsertBias, WaitingRequestHint,
+        best_reusable_slot_for_radix_hit, finish_rejected_request, insert_deferred_waiting_request,
         insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu,
         matched_sealed_lookup_blocks,
     };
@@ -1510,6 +1624,132 @@ mod tests {
                 .map(|req| req.prompt)
                 .collect::<Vec<_>>(),
             vec!["high", "requeued-normal", "queued-normal"]
+        );
+    }
+
+    fn deferred_request(
+        label: &str,
+        priority: RequestPriority,
+        hint: WaitingRequestHint,
+    ) -> DeferredWaitingRequest {
+        DeferredWaitingRequest {
+            incoming: queued_request(label, priority),
+            prompt_tokens: vec![1, 2, 3],
+            hint,
+        }
+    }
+
+    fn hint_plan(
+        matched_len: usize,
+        reusable_prefix_len: usize,
+        direct_gpu_attach: bool,
+        staged_prefix_len: Option<usize>,
+        recompute_advised: bool,
+    ) -> WaitingRequestHint {
+        let staged_prefix_plan = staged_prefix_len
+            .map(|matched_len| crate::kv_tier::ReadmissionPlan::new(matched_len, Vec::new()));
+        WaitingRequestHint::from_plan(
+            &PrefixAdmissionPlan {
+                radix_blocks: Vec::new(),
+                lookup: crate::kv_tier::LookupOutcome::new(
+                    matched_len,
+                    Vec::new(),
+                    recompute_advised,
+                ),
+                reusable: None,
+                direct_gpu_attach,
+                attached_prefix_blocks: Vec::new(),
+                staged_prefix_plan,
+            },
+            reusable_prefix_len,
+        )
+    }
+
+    #[test]
+    fn deferred_waiting_keeps_priority_primary_over_prefix_hint() {
+        let mut waiting = std::collections::VecDeque::from(vec![deferred_request(
+            "high-cold",
+            RequestPriority::High,
+            WaitingRequestHint::default(),
+        )]);
+
+        insert_deferred_waiting_request(
+            &mut waiting,
+            deferred_request(
+                "normal-gpu-ready",
+                RequestPriority::Normal,
+                hint_plan(48, 48, false, None, false),
+            ),
+            WaitingInsertBias::BeforeEqual,
+        );
+
+        assert_eq!(
+            waiting
+                .into_iter()
+                .map(|req| req.incoming.prompt)
+                .collect::<Vec<_>>(),
+            vec!["high-cold", "normal-gpu-ready"]
+        );
+    }
+
+    #[test]
+    fn deferred_waiting_prefers_gpu_ready_then_larger_prefix_within_same_priority() {
+        let mut waiting = std::collections::VecDeque::from(vec![
+            deferred_request(
+                "queued-staged",
+                RequestPriority::Normal,
+                hint_plan(64, 0, false, Some(64), false),
+            ),
+            deferred_request(
+                "queued-cold",
+                RequestPriority::Normal,
+                WaitingRequestHint::default(),
+            ),
+        ]);
+
+        insert_deferred_waiting_request(
+            &mut waiting,
+            deferred_request(
+                "gpu-ready",
+                RequestPriority::Normal,
+                hint_plan(16, 16, false, None, false),
+            ),
+            WaitingInsertBias::BeforeEqual,
+        );
+
+        assert_eq!(
+            waiting
+                .into_iter()
+                .map(|req| req.incoming.prompt)
+                .collect::<Vec<_>>(),
+            vec!["gpu-ready", "queued-staged", "queued-cold"]
+        );
+    }
+
+    #[test]
+    fn deferred_waiting_before_equal_still_precedes_same_hint_peer() {
+        let mut waiting = std::collections::VecDeque::from(vec![deferred_request(
+            "queued",
+            RequestPriority::Normal,
+            hint_plan(32, 32, false, None, false),
+        )]);
+
+        insert_deferred_waiting_request(
+            &mut waiting,
+            deferred_request(
+                "requeued",
+                RequestPriority::Normal,
+                hint_plan(32, 32, false, None, false),
+            ),
+            WaitingInsertBias::BeforeEqual,
+        );
+
+        assert_eq!(
+            waiting
+                .into_iter()
+                .map(|req| req.incoming.prompt)
+                .collect::<Vec<_>>(),
+            vec!["requeued", "queued"]
         );
     }
 

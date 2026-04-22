@@ -64,6 +64,7 @@ pub(super) fn is_full_sealed_prefix(
 ) -> bool {
     block_count > 0 && matched_len == sealed_block_token_count(block_size, block_count)
 }
+
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
