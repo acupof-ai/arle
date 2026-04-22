@@ -949,7 +949,7 @@ impl<M: ModelForward> Scheduler<M> {
                 if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
                     let prompt_vec = prompt_tokens.to_vec();
                     self.slot_materialized_prompt_lens[slot_idx] = prompt_vec.len();
-                    self.publish_to_prefix_cache(slot_idx, &prompt_vec, req.session_id.clone());
+                    self.publish_to_prefix_cache(slot_idx, &prompt_vec, req.session_id.as_ref());
                 } else {
                     self.slot_materialized_prompt_lens[slot_idx] = 0;
                 }
