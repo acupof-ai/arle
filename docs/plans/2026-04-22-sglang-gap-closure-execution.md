@@ -274,3 +274,5 @@ External follow-up remains mandatory:
   `docs/plans/2026-04-22-cuda-unified-budget.md`
 - unified scheduler budget local regression check:
   `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-4eddda8-unified-budget.md`
+- unified scheduler budget bottleneck trace:
+  `docs/experience/wins/2026-04-22-profile-cuda-qwen3-4b-c16-unified-budget-bottleneck.md`
