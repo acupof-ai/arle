@@ -9,18 +9,17 @@ use crate::hardware::{self, GpuInfo};
 use crate::hub_discovery;
 use crate::model_catalog;
 
+struct DoctorSnapshot {
+    info: hardware::SystemInfo,
+    env_model: Option<String>,
+    discovered: Option<(String, PathBuf)>,
+    snapshots: Vec<hub_discovery::HubSnapshot>,
+    recommendations: Vec<&'static model_catalog::CatalogEntry>,
+    selected: Result<SelectedModelSource>,
+}
+
 pub(crate) fn run(args: &Args) -> Result<()> {
-    let info = hardware::detect_system();
-    let env_model =
-        non_empty_value(std::env::var("AGENT_INFER_MODEL").ok().as_deref()).map(ToOwned::to_owned);
-    let discovered = infer::hf_hub::discover_local_model();
-    let snapshots = hub_discovery::discover_hub_snapshots();
-    let recommendations = model_catalog::recommend_models(&info);
-    let selected = select_model_source(
-        args.model_path.as_deref(),
-        env_model.as_deref(),
-        discovered.clone(),
-    );
+    let snapshot = collect_snapshot(args);
 
     println!("{}", style("agent-infer doctor").bold().cyan());
     println!();
@@ -32,7 +31,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     println!(
         "{} {}",
         style("compiled backend").dim(),
-        style(info.compiled_backend.name()).bold()
+        style(snapshot.info.compiled_backend.name()).bold()
     );
     println!(
         "{} stdin={} stdout={} stderr={}",
@@ -44,27 +43,27 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     println!(
         "{} {} · {} cores",
         style("cpu").dim(),
-        info.cpu_name,
-        info.cpu_cores
+        snapshot.info.cpu_name,
+        snapshot.info.cpu_cores
     );
     println!(
         "{} {:.1} GB total · {:.1} GB free",
         style("ram").dim(),
-        info.total_ram_gb,
-        info.available_ram_gb
+        snapshot.info.total_ram_gb,
+        snapshot.info.available_ram_gb
     );
     println!(
         "{} {:.1} GB",
         style("effective memory").dim(),
-        info.effective_memory_gb()
+        snapshot.info.effective_memory_gb()
     );
-    println!("{} {}", style("gpu").dim(), gpu_summary(&info.gpu));
+    println!("{} {}", style("gpu").dim(), gpu_summary(&snapshot.info.gpu));
     println!();
 
     println!(
         "{} {}",
         style("env AGENT_INFER_MODEL").dim(),
-        env_model.as_deref().unwrap_or("<unset>")
+        snapshot.env_model.as_deref().unwrap_or("<unset>")
     );
     println!(
         "{} {}",
@@ -81,7 +80,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     println!();
 
     println!("{}", style("Resolution").bold());
-    match &selected {
+    match &snapshot.selected {
         Ok(source) => {
             println!("{} {}", style("selected via").dim(), source.origin_label());
             println!("{} {}", style("selected source").dim(), source.value());
@@ -96,8 +95,90 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     }
     println!();
 
+    print_discovery_section(&snapshot);
+    print_recommendations_section(&snapshot);
+
+    println!("{}", style("Checks").bold());
+    if snapshot.info.compiled_backend.supports_inference() {
+        println!(
+            "{} {} backend is available in this binary",
+            style("backend").dim(),
+            snapshot.info.compiled_backend.name()
+        );
+    } else {
+        println!(
+            "{} rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` to run inference",
+            style("backend").yellow().bold()
+        );
+    }
+    if snapshot.recommendations.is_empty() && snapshot.info.compiled_backend.supports_inference() {
+        println!(
+            "{} detected memory does not fit any curated model for this backend",
+            style("catalog").yellow().bold()
+        );
+    }
+    if snapshot.selected.is_err() {
+        println!(
+            "{} set `--model-path`, `AGENT_INFER_MODEL`, or cache a supported local model",
+            style("resolution").yellow().bold()
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn list_models(args: &Args) -> Result<()> {
+    let snapshot = collect_snapshot(args);
+
+    println!("{}", style("agent-infer models").bold().cyan());
+    println!();
+    println!("{}", style("Resolution").bold());
+    match &snapshot.selected {
+        Ok(source) => {
+            println!("{} {}", style("selected via").dim(), source.origin_label());
+            println!("{} {}", style("selected source").dim(), source.value());
+            match source.local_path() {
+                Some(path) => println!("{} {}", style("local path").dim(), path.display()),
+                None => println!("{} <not present locally>", style("local path").dim()),
+            }
+        }
+        Err(err) => {
+            println!("{} {err:#}", style("resolution error").red().bold());
+        }
+    }
+    println!();
+
+    print_discovery_section(&snapshot);
+    print_recommendations_section(&snapshot);
+
+    Ok(())
+}
+
+fn collect_snapshot(args: &Args) -> DoctorSnapshot {
+    let info = hardware::detect_system();
+    let env_model =
+        non_empty_value(std::env::var("AGENT_INFER_MODEL").ok().as_deref()).map(ToOwned::to_owned);
+    let discovered = infer::hf_hub::discover_local_model();
+    let snapshots = hub_discovery::discover_hub_snapshots();
+    let recommendations = model_catalog::recommend_models(&info);
+    let selected = select_model_source(
+        args.model_path.as_deref(),
+        env_model.as_deref(),
+        discovered.clone(),
+    );
+    DoctorSnapshot {
+        info,
+        env_model,
+        discovered,
+        snapshots,
+        recommendations,
+        selected,
+    }
+}
+
+fn print_discovery_section(snapshot: &DoctorSnapshot) {
     println!("{}", style("Discovery").bold());
-    match discovered {
+    match &snapshot.discovered {
         Some((candidate, path)) => {
             println!(
                 "{} {} -> {}",
@@ -108,28 +189,30 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         }
         None => println!("{} <none>", style("preferred local model").dim()),
     }
-    if snapshots.is_empty() {
+    if snapshot.snapshots.is_empty() {
         println!("{} <none>", style("supported hub snapshots").dim());
     } else {
         println!(
             "{} {}",
             style("supported hub snapshots").dim(),
-            snapshots.len()
+            snapshot.snapshots.len()
         );
-        for snapshot in snapshots.iter().take(5) {
-            println!("  - {} -> {}", snapshot.model_id, snapshot.path.display());
+        for item in snapshot.snapshots.iter().take(5) {
+            println!("  - {} -> {}", item.model_id, item.path.display());
         }
-        if snapshots.len() > 5 {
-            println!("  - ... and {} more", snapshots.len() - 5);
+        if snapshot.snapshots.len() > 5 {
+            println!("  - ... and {} more", snapshot.snapshots.len() - 5);
         }
     }
     println!();
+}
 
+fn print_recommendations_section(snapshot: &DoctorSnapshot) {
     println!("{}", style("Recommendations").bold());
-    if recommendations.is_empty() {
+    if snapshot.recommendations.is_empty() {
         println!("{} <none fit this machine>", style("catalog").dim());
     } else {
-        for entry in recommendations.iter().take(5) {
+        for entry in snapshot.recommendations.iter().take(5) {
             let quant = entry
                 .quantization
                 .map(|value| format!(" ({value})"))
@@ -141,34 +224,6 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         }
     }
     println!();
-
-    println!("{}", style("Checks").bold());
-    if info.compiled_backend.supports_inference() {
-        println!(
-            "{} {} backend is available in this binary",
-            style("backend").dim(),
-            info.compiled_backend.name()
-        );
-    } else {
-        println!(
-            "{} rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` to run inference",
-            style("backend").yellow().bold()
-        );
-    }
-    if recommendations.is_empty() && info.compiled_backend.supports_inference() {
-        println!(
-            "{} detected memory does not fit any curated model for this backend",
-            style("catalog").yellow().bold()
-        );
-    }
-    if selected.is_err() {
-        println!(
-            "{} set `--model-path`, `AGENT_INFER_MODEL`, or cache a supported local model",
-            style("resolution").yellow().bold()
-        );
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

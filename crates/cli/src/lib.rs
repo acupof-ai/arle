@@ -48,6 +48,11 @@ fn run_impl() -> Result<()> {
         return Ok(());
     }
 
+    if args.list_models {
+        doctor::list_models(&args)?;
+        return Ok(());
+    }
+
     #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
     {
         anyhow::bail!(
