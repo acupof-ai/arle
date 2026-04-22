@@ -2388,14 +2388,12 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
 
     // ── 1. Pack block tokens ─ [B, block_size] int32. ──
     let mut packed_block_tokens: Vec<i32> = Vec::with_capacity(batch * runtime.block_size);
-    let mut per_row_block_tokens: Vec<Vec<u32>> = Vec::with_capacity(batch);
     for &cur in current_tokens {
-        let mut row = vec![runtime.mask_token_id; runtime.block_size];
-        row[0] = cur;
-        for &tok in &row {
-            packed_block_tokens.push(tok as i32);
-        }
-        per_row_block_tokens.push(row);
+        packed_block_tokens.push(cur as i32);
+        packed_block_tokens.extend(std::iter::repeat_n(
+            runtime.mask_token_id as i32,
+            runtime.block_size - 1,
+        ));
     }
 
     // ── 2. Pack noise embeddings + target hiddens. ──
@@ -2403,7 +2401,10 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     // `embed_tokens` of the flat [B*block_size] token list, reshape to
     // [B, block_size, hidden]. Equivalent to per-row embed + axis-0 stack
     // but cheaper.
-    let flat_tokens_u32: Vec<u32> = per_row_block_tokens.iter().flatten().copied().collect();
+    let flat_tokens_u32: Vec<u32> = packed_block_tokens
+        .iter()
+        .map(|&token| token as u32)
+        .collect();
     let noise_flat = embed_tokens(embed_table, &flat_tokens_u32);
     let noise_packed = reshape(&noise_flat, &[batch_i32, block_size_i32, hidden_size_i32]);
 
@@ -2555,27 +2556,43 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         ds.capacity = new_draft_len;
     }
 
-    // ── 4. Per-row draft sampling. ──
+    // ── 4. Packed draft sampling. ──
     //
-    // Slice draft_hidden_packed `[B, block_size, hidden]` per row,
-    // skip position 0 (which sees current_token), keep positions
-    // `1..block_size` → block_size-1 draft positions.
+    // Slice draft_hidden_packed `[B, block_size, hidden]`, skip position 0
+    // for every row, flatten to `[B * (block_size - 1), hidden]`, and sample
+    // the whole packed suffix in one linear + batched-sampling pass.
     let draft_suffix_len = block_size_i32 - 1;
     debug_assert!(draft_suffix_len >= 0);
-    for b in 0..batch_i32 {
-        let row_hidden = slice(
-            &draft_hidden_packed,
-            &[b, 1, 0],
-            &[b + 1, block_size_i32, hidden_size_i32],
-            &[1, 1, 1],
-        );
-        let row_hidden_2d = reshape(&row_hidden, &[draft_suffix_len, hidden_size_i32]);
-        let row_logits = linear(&row_hidden_2d, lm_head);
-        let drafted_suffix = sample_rows_array(&row_logits, &params_per_row[b as usize])?;
-        let drafted_suffix = materialize_token_array(&drafted_suffix);
-        let row_block = &mut per_row_block_tokens[b as usize];
-        for (dst, src) in row_block.iter_mut().skip(1).zip(drafted_suffix.iter()) {
-            *dst = *src;
+    let suffix_hidden = slice(
+        &draft_hidden_packed,
+        &[0, 1, 0],
+        &[batch_i32, block_size_i32, hidden_size_i32],
+        &[1, 1, 1],
+    );
+    let suffix_hidden_2d = reshape(
+        &suffix_hidden,
+        &[batch_i32 * draft_suffix_len, hidden_size_i32],
+    );
+    let suffix_logits = linear(&suffix_hidden_2d, lm_head);
+    let drafted_suffix = sample_rows_array(&suffix_logits, &params_per_row[0])?;
+    let drafted_suffix = materialize_token_array(&drafted_suffix);
+    ensure!(
+        drafted_suffix.len() == batch * runtime.block_size.saturating_sub(1),
+        "Qwen3.5 DFlash batched draft sampled {} suffix tokens, expected {}",
+        drafted_suffix.len(),
+        batch * runtime.block_size.saturating_sub(1)
+    );
+    for (row_idx, drafted_row) in drafted_suffix
+        .chunks_exact(runtime.block_size.saturating_sub(1))
+        .enumerate()
+    {
+        let row_start = row_idx * runtime.block_size + 1;
+        let row_end = row_start + drafted_row.len();
+        for (dst, src) in packed_block_tokens[row_start..row_end]
+            .iter_mut()
+            .zip(drafted_row.iter())
+        {
+            *dst = *src as i32;
         }
     }
 
@@ -2607,18 +2624,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     };
 
     // ── 7. Build packed verify inputs and call verify_block_batched. ──
-    //
-    // After the per-row token rewrites in step 4 we need to repack the
-    // [B, block_size] int32 token tensor — block_tokens may now contain
-    // the drafted suffix.
-    packed_block_tokens.clear();
-    for row in &per_row_block_tokens {
-        for &tok in row {
-            packed_block_tokens.push(tok as i32);
-        }
-    }
     let tokens_arr = MlxArray::from_slice_i32(&packed_block_tokens, &[batch_i32, block_size_i32]);
-    let cache_pos_arr = MlxArray::from_slice_i32(target_cache_lens, &[batch_i32]);
     let rope_offsets = MlxArray::from_slice_i32(target_cache_lens, &[batch_i32]);
     let attn_mask =
         super::mlx::build_varlen_verify_mask(left_padding, block_size_i32, batch_cache_len);
@@ -2630,7 +2636,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         &tokens_arr,
         batch_i32,
         block_size_i32,
-        &cache_pos_arr,
+        target_cache_lens,
         packed_target_kv_flat,
         packed_target_gdr_flat,
         Some(&attn_mask),
@@ -2656,18 +2662,18 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     let mut posterior_token_per_row: Vec<u32> = Vec::with_capacity(batch);
     for b in 0..batch_i32 {
         let row_offset = (b as usize) * runtime.block_size;
+        let row_block = &packed_block_tokens[row_offset..row_offset + runtime.block_size];
         let posterior: Vec<u32> = posterior_tokens[row_offset..row_offset + runtime.block_size]
             .iter()
             .map(|&tok| tok as u32)
             .collect();
 
-        let row_block = &per_row_block_tokens[b as usize];
         let matched = row_block
             .iter()
             .skip(1)
             .zip(posterior.iter())
             .take(runtime.block_size.saturating_sub(1))
-            .take_while(|(draft, target)| draft == target)
+            .take_while(|(draft, target)| (**draft as u32) == **target)
             .count();
         let accepted = (matched + 1) as i32;
         let posterior_token = *posterior.get(matched).ok_or_else(|| {
@@ -2739,10 +2745,11 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     let mut out = Vec::with_capacity(batch);
     for (b, updated_target_hidden) in updated_per_row.into_iter().enumerate() {
         let accepted = accepted_inputs[b] as usize;
-        let row_block = &per_row_block_tokens[b];
+        let row_offset = b * runtime.block_size;
+        let row_block = &packed_block_tokens[row_offset..row_offset + runtime.block_size];
         let mut accepted_tokens = Vec::with_capacity(accepted);
         for &tok in row_block.iter().skip(1).take(accepted.saturating_sub(1)) {
-            accepted_tokens.push(tok);
+            accepted_tokens.push(tok as u32);
         }
         accepted_tokens.push(posterior_token_per_row[b]);
         out.push(DFlashBlockResult {
@@ -2990,13 +2997,12 @@ mod tests {
         let mut post_verify_kv = kv_flat.clone();
         let mut post_verify_gdr = gdr_flat.clone();
         let batched_tokens = MlxArray::from_slice_i32(&block_tokens, &[1, block_size]);
-        let cache_pos_arr = MlxArray::from_slice_i32(&[cache_pos], &[1]);
         let rope_offsets = MlxArray::from_slice_i32(&[cache_pos], &[1]);
         let verify_logits = cpp_model.verify_block_batched(
             &batched_tokens,
             1,
             block_size,
-            &cache_pos_arr,
+            &[cache_pos],
             &mut post_verify_kv,
             &mut post_verify_gdr,
             None,

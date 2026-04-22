@@ -470,7 +470,7 @@ struct Qwen35CompiledModel {
         bool has_attn_mask = false;
         array attn_mask = array(0);
         bool has_cache_pos_arr = false;
-        array cache_pos_arr = array(0);
+        const int32_t* cache_pos_arr = nullptr;
         bool has_rope_offsets = false;
         array rope_offsets = array(0);
         bool keep_intermediates = false;
@@ -517,9 +517,9 @@ struct Qwen35CompiledModel {
     //
     // RoPE offsets already encode each row's logical token positions, but
     // `cache_pos` is also used to select the KV slice-update window. Route 2
-    // therefore threads an int32[B] cache_pos array through the forward
+    // therefore threads a host int32[B] cache_pos slice through the forward
     // context and uses it only when the batched verify entrypoint requests it.
-    mutable array current_cache_pos_arr = array(0);
+    mutable const int32_t* current_cache_pos_arr = nullptr;
     mutable bool current_has_cache_pos_arr = false;
     // Per-row RoPE offsets (int32 array of length batch_size).
     //
@@ -575,7 +575,7 @@ struct Qwen35CompiledModel {
     void clear_optional_batch_inputs() {
         current_attn_mask = array(0);
         current_has_attn_mask = false;
-        current_cache_pos_arr = array(0);
+        current_cache_pos_arr = nullptr;
         current_has_cache_pos_arr = false;
         current_rope_offsets = array(0);
         current_has_rope_offsets = false;
@@ -675,8 +675,7 @@ struct Qwen35CompiledModel {
             // Batched verify can mix rows with different physical KV cursors.
             // RoPE still comes from ctx.rope_offsets; cache_pos_arr is only for
             // where each row writes into the packed KV cache.
-            eval(ctx.cache_pos_arr);
-            const int32_t* cache_pos_data = ctx.cache_pos_arr.data<int32_t>();
+            const int32_t* cache_pos_data = ctx.cache_pos_arr;
 
             std::vector<array> new_k_rows;
             std::vector<array> new_v_rows;
@@ -1798,7 +1797,7 @@ int32_t qwen35_compiled_step_batch(
             m->current_attn_mask = array(0);
         }
         m->current_has_cache_pos_arr = false;
-        m->current_cache_pos_arr = array(0);
+        m->current_cache_pos_arr = nullptr;
         m->current_has_rope_offsets = rope_offsets != nullptr;
         if (m->current_has_rope_offsets) {
             m->current_rope_offsets = *to_arr(rope_offsets);
@@ -1902,7 +1901,7 @@ int32_t qwen35_compiled_step_batch_packed(
             m->current_attn_mask = array(0);
         }
         m->current_has_cache_pos_arr = false;
-        m->current_cache_pos_arr = array(0);
+        m->current_cache_pos_arr = nullptr;
         m->current_has_rope_offsets = rope_offsets != nullptr;
         if (m->current_has_rope_offsets) {
             m->current_rope_offsets = *to_arr(rope_offsets);
@@ -2124,7 +2123,7 @@ int32_t qwen35_compiled_verify_block_batched(
     mlx_array* token_ids,           // int32 [B, block_size]
     int32_t batch_size,
     int32_t block_size,
-    mlx_array* cache_pos_arr,       // int32 [B] per-row cache_pos
+    const int32_t* cache_pos_arr,   // host int32 [B] per-row cache_pos
     mlx_array** packed_kv_caches, int32_t n_kv,
     mlx_array** packed_gdr_states, int32_t n_gdr,
     mlx_array* attn_mask,           // additive [B, 1, block_size, key_len], nullable
@@ -2168,7 +2167,7 @@ int32_t qwen35_compiled_verify_block_batched(
             m->current_attn_mask = array(0);
         }
         m->current_has_cache_pos_arr = true;
-        m->current_cache_pos_arr = *to_arr(cache_pos_arr);
+        m->current_cache_pos_arr = cache_pos_arr;
         m->current_has_rope_offsets = true;
         m->current_rope_offsets = *to_arr(rope_offsets);
         m->current_is_verify = true;
@@ -2212,7 +2211,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
     mlx_array* token_ids,           // int32 [B, block_size]
     int32_t batch_size,
     int32_t block_size,
-    mlx_array* cache_pos_arr,       // int32 [B] per-row cache_pos
+    const int32_t* cache_pos_arr,   // host int32 [B] per-row cache_pos
     mlx_array** packed_kv_caches, int32_t n_kv,
     mlx_array** packed_gdr_states, int32_t n_gdr,
     mlx_array* attn_mask,           // additive [B, 1, block_size, key_len], nullable
@@ -2255,7 +2254,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
             m->current_attn_mask = array(0);
         }
         m->current_has_cache_pos_arr = true;
-        m->current_cache_pos_arr = *to_arr(cache_pos_arr);
+        m->current_cache_pos_arr = cache_pos_arr;
         m->current_has_rope_offsets = true;
         m->current_rope_offsets = *to_arr(rope_offsets);
         m->current_is_verify = true;
