@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
+SNAPSHOT_ROOT=""
 
 info() { echo "[pre-push] $*"; }
 
@@ -16,6 +16,19 @@ run() {
     info "$*"
     "$@"
 }
+
+cleanup() {
+    if [[ -n "${SNAPSHOT_ROOT}" && -d "${SNAPSHOT_ROOT}" ]]; then
+        rm -rf "${SNAPSHOT_ROOT}"
+    fi
+}
+
+trap cleanup EXIT
+
+SNAPSHOT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agent-infer-pre-push.XXXXXX")"
+info "exporting HEAD snapshot to ${SNAPSHOT_ROOT}"
+git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${SNAPSHOT_ROOT}"
+cd "${SNAPSHOT_ROOT}"
 
 export ZIG
 ZIG="$(./scripts/setup_zig_toolchain.sh --print-zig)"
@@ -26,6 +39,8 @@ export RUSTFLAGS="-D warnings"
 
 run cargo fmt --manifest-path infer/Cargo.toml --all -- --check
 run ./scripts/check_kv_zig.sh
+run cargo check --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
+run cargo clippy --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib -- -D warnings
 run cargo test --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
 run python -m pytest tests/ -v
 
