@@ -783,6 +783,237 @@ pub fn try_open(model_path: &str) -> Option<GgufFile> {
     None
 }
 
+#[derive(Debug, Clone)]
+pub struct HostTensor<T> {
+    pub data: Vec<T>,
+    pub shape: Vec<usize>,
+}
+
+impl<T> HostTensor<T> {
+    fn vector(data: Vec<T>) -> Self {
+        let len = data.len();
+        Self {
+            data,
+            shape: vec![len],
+        }
+    }
+
+    fn matrix(data: Vec<T>, rows: usize, cols: usize) -> Self {
+        Self {
+            data,
+            shape: vec![rows, cols],
+        }
+    }
+
+    fn with_shape(data: Vec<T>, shape: Vec<usize>) -> Self {
+        Self { data, shape }
+    }
+}
+
+fn gguf_vector_len(gguf: &GgufFile, hf_name: &str) -> Result<usize> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 1,
+        "expected 1D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    Ok(info.shape[0] as usize)
+}
+
+fn gguf_matrix_dims(gguf: &GgufFile, hf_name: &str) -> Result<(usize, usize)> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 2,
+        "expected 2D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    Ok((info.shape[1] as usize, info.shape[0] as usize))
+}
+
+pub fn load_vector_bf16_host(gguf: &GgufFile, hf_name: &str) -> Result<HostTensor<bf16>> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let data = gguf.read_tensor_bf16(&gguf_name)?;
+    let len = gguf_vector_len(gguf, hf_name)?;
+    anyhow::ensure!(
+        data.len() == len,
+        "unexpected element count for '{hf_name}': got {}, expected {len}",
+        data.len()
+    );
+    Ok(HostTensor::vector(data))
+}
+
+pub fn load_vector_offset_norm_bf16_host(
+    gguf: &GgufFile,
+    hf_name: &str,
+) -> Result<HostTensor<bf16>> {
+    let mut tensor = load_vector_bf16_host(gguf, hf_name)?;
+    for value in &mut tensor.data {
+        *value = bf16::from_f32(value.to_f32() - 1.0);
+    }
+    Ok(tensor)
+}
+
+pub fn load_vector_v_reorder_bf16_host(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) -> Result<HostTensor<bf16>> {
+    let mut tensor = load_vector_bf16_host(gguf, hf_name)?;
+    reverse_v_reorder(&mut tensor.data, num_k_heads, num_v_per_k, head_dim);
+    Ok(tensor)
+}
+
+pub fn load_vector_f32_host(gguf: &GgufFile, hf_name: &str) -> Result<HostTensor<f32>> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let data = gguf.read_tensor_f32(&gguf_name)?;
+    let len = gguf_vector_len(gguf, hf_name)?;
+    anyhow::ensure!(
+        data.len() == len,
+        "unexpected element count for '{hf_name}': got {}, expected {len}",
+        data.len()
+    );
+    Ok(HostTensor::vector(data))
+}
+
+pub fn load_matrix_bf16_host(gguf: &GgufFile, hf_name: &str) -> Result<HostTensor<bf16>> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let data = gguf.read_tensor_bf16(&gguf_name)?;
+    let (rows, cols) = gguf_matrix_dims(gguf, hf_name)?;
+    anyhow::ensure!(
+        data.len() == rows * cols,
+        "unexpected element count for '{hf_name}': got {}, expected {}",
+        data.len(),
+        rows * cols
+    );
+    Ok(HostTensor::matrix(data, rows, cols))
+}
+
+pub fn load_matrix_v_reorder_rows_bf16_host(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) -> Result<HostTensor<bf16>> {
+    let mut tensor = load_matrix_bf16_host(gguf, hf_name)?;
+    let rows = tensor.shape[0];
+    let cols = tensor.shape[1];
+    reverse_v_reorder_rows(
+        &mut tensor.data,
+        rows,
+        cols,
+        num_k_heads,
+        num_v_per_k,
+        head_dim,
+    );
+    Ok(tensor)
+}
+
+pub fn load_matrix_v_reorder_cols_bf16_host(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) -> Result<HostTensor<bf16>> {
+    let mut tensor = load_matrix_bf16_host(gguf, hf_name)?;
+    let rows = tensor.shape[0];
+    let cols = tensor.shape[1];
+    reverse_v_reorder_cols(
+        &mut tensor.data,
+        rows,
+        cols,
+        num_k_heads,
+        num_v_per_k,
+        head_dim,
+    );
+    Ok(tensor)
+}
+
+pub fn load_qwen35_qkv_matrix_bf16_host(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+) -> Result<HostTensor<bf16>> {
+    let mut tensor = load_matrix_bf16_host(gguf, hf_name)?;
+    let cols = tensor.shape[1];
+    let q_rows = num_k_heads * key_head_dim;
+    let k_rows = num_k_heads * key_head_dim;
+    let v_rows = num_k_heads * num_v_per_k * value_head_dim;
+    let expected_rows = q_rows + k_rows + v_rows;
+    anyhow::ensure!(
+        tensor.shape[0] == expected_rows,
+        "unexpected Qwen3.5 QKV rows for '{hf_name}': got {}, expected {expected_rows}",
+        tensor.shape[0]
+    );
+    let v_start = (q_rows + k_rows) * cols;
+    reverse_v_reorder_rows(
+        &mut tensor.data[v_start..v_start + v_rows * cols],
+        v_rows,
+        cols,
+        num_k_heads,
+        num_v_per_k,
+        value_head_dim,
+    );
+    Ok(tensor)
+}
+
+pub fn load_qwen35_conv1d_bf16_host(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_key_heads: usize,
+    key_head_dim: usize,
+    num_value_heads: usize,
+    value_head_dim: usize,
+    kernel_dim: usize,
+) -> Result<HostTensor<bf16>> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
+    let qk_channels = key_head_dim * num_key_heads * 2;
+    let v_channels = num_value_heads * value_head_dim;
+    let expected = (qk_channels + v_channels) * kernel_dim;
+    anyhow::ensure!(
+        data.len() == expected,
+        "unexpected conv1d weight size for '{hf_name}': got {}, expected {expected}",
+        data.len()
+    );
+    let v_start = qk_channels * kernel_dim;
+    reverse_v_reorder_rows(
+        &mut data[v_start..v_start + v_channels * kernel_dim],
+        v_channels,
+        kernel_dim,
+        num_key_heads,
+        num_value_heads / num_key_heads,
+        value_head_dim,
+    );
+    Ok(HostTensor::with_shape(
+        data,
+        vec![qk_channels + v_channels, kernel_dim, 1],
+    ))
+}
+
+pub fn load_qwen35_a_log_f32_host(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+) -> Result<HostTensor<f32>> {
+    let mut tensor = load_vector_f32_host(gguf, hf_name)?;
+    for value in &mut tensor.data {
+        let abs_a = value.abs().max(1e-10);
+        *value = abs_a.ln();
+    }
+    reverse_v_reorder_f32(&mut tensor.data, num_k_heads, num_v_per_k, 1);
+    Ok(tensor)
+}
+
 /// Generic model config extracted from GGUF metadata.
 #[derive(Debug, Clone)]
 pub struct GgufModelConfig {

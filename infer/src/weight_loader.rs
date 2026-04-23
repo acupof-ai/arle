@@ -15,8 +15,9 @@ use std::fs;
 use std::time::Instant;
 
 use crate::gguf::{
-    self, GgufFile, find_tensor_name, reverse_v_reorder, reverse_v_reorder_cols,
-    reverse_v_reorder_rows,
+    self, GgufFile, find_tensor_name, load_matrix_v_reorder_cols_bf16_host,
+    load_matrix_v_reorder_rows_bf16_host, load_vector_bf16_host, load_vector_offset_norm_bf16_host,
+    load_vector_v_reorder_bf16_host,
 };
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
@@ -567,9 +568,8 @@ pub(crate) fn load_tensor_1d_gguf(
     gguf: &GgufFile,
     hf_name: &str,
 ) -> Result<DeviceVec> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
-    DeviceVec::from_host(ctx, &bf16_data)
+    let tensor = load_vector_bf16_host(gguf, hf_name)?;
+    DeviceVec::from_host(ctx, &tensor.data)
 }
 
 /// Load a 1D norm weight from GGUF, subtracting 1.0 (offset RMSNorm correction).
@@ -582,13 +582,8 @@ pub(crate) fn load_tensor_1d_gguf_offset_norm(
     gguf: &GgufFile,
     hf_name: &str,
 ) -> Result<DeviceVec> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
-    // Subtract 1.0 to convert from GGUF convention (1+w) to HF convention (w)
-    for v in &mut bf16_data {
-        *v = bf16::from_f32(v.to_f32() - 1.0);
-    }
-    DeviceVec::from_host(ctx, &bf16_data)
+    let tensor = load_vector_offset_norm_bf16_host(gguf, hf_name)?;
+    DeviceVec::from_host(ctx, &tensor.data)
 }
 
 /// Load 1D GGUF tensor with V-head reorder reversal (a_log, dt_bias).
@@ -599,10 +594,8 @@ pub(crate) fn load_tensor_1d_gguf_v_reorder(
     num_k_heads: usize,
     num_v_per_k: usize,
 ) -> Result<DeviceVec> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
-    reverse_v_reorder(&mut bf16_data, num_k_heads, num_v_per_k, 1);
-    DeviceVec::from_host(ctx, &bf16_data)
+    let tensor = load_vector_v_reorder_bf16_host(gguf, hf_name, num_k_heads, num_v_per_k, 1)?;
+    DeviceVec::from_host(ctx, &tensor.data)
 }
 
 /// Load 2D GGUF tensor with V-head row reorder reversal (in_proj_z, in_proj_a/b).
@@ -696,16 +689,9 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
     }
 
     // BF16 fallback (existing path).
-    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
-    reverse_v_reorder_rows(
-        &mut bf16_data,
-        rows,
-        cols,
-        num_k_heads,
-        num_v_per_k,
-        head_dim,
-    );
-    DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
+    let tensor =
+        load_matrix_v_reorder_rows_bf16_host(gguf, hf_name, num_k_heads, num_v_per_k, head_dim)?;
+    DeviceMatrix::from_host(ctx, &tensor.data, rows, cols)
 }
 
 /// Load 2D GGUF tensor with V-head column reorder reversal (out_proj).
@@ -719,21 +705,14 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_cols(
 ) -> Result<DeviceMatrix> {
     let gguf_name = find_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
-    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     let (rows, cols) = if info.shape.len() == 2 {
         (info.shape[1] as usize, info.shape[0] as usize)
     } else {
         (1, info.shape[0] as usize)
     };
-    reverse_v_reorder_cols(
-        &mut bf16_data,
-        rows,
-        cols,
-        num_k_heads,
-        num_v_per_k,
-        head_dim,
-    );
-    DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
+    let tensor =
+        load_matrix_v_reorder_cols_bf16_host(gguf, hf_name, num_k_heads, num_v_per_k, head_dim)?;
+    DeviceMatrix::from_host(ctx, &tensor.data, rows, cols)
 }
 
 /// Load a 2D tensor (e.g., linear weight) from a GGUF file.
