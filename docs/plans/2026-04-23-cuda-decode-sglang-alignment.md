@@ -7,6 +7,19 @@
 **Supersedes for current decode truth:** [`qwen35-sglang-parity.md`](qwen35-sglang-parity.md), [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md), [`2026-04-21-sglang-control-exec-alignment.md`](2026-04-21-sglang-control-exec-alignment.md), [`2026-04-22-sglang-gap-closure-execution.md`](2026-04-22-sglang-gap-closure-execution.md)  
 **Out of scope:** Metal runtime, PD cluster split, speculative decode, quant-specific custom decode rewrites, and copying SGLang's pool types verbatim
 
+## 审计基线
+
+- Local repo audit date: `2026-04-23`
+- Audited SGLang revision: `214c35b03184c354acf1f86f99746799e1c9b3a9`
+- SGLang anchor command:
+
+```bash
+git -C /tmp/sglang fetch origin main
+git -C /tmp/sglang rev-parse FETCH_HEAD
+```
+
+本文所有 SGLang 链接都固定到这个 commit，而不是漂移的 `main` 链接。
+
 ## 一句话结论
 
 现在不能说 "`decode` 已经对齐当前 SGLang 了"。更准确的说法是：
@@ -30,19 +43,120 @@
 
 | Area | Local repo | Current SGLang | Judgment |
 | --- | --- | --- | --- |
-| decode retract heuristic | [`infer/src/scheduler/cuda/decode.rs`](../../infer/src/scheduler/cuda/decode.rs) 先按 generated token 少的撤回；相同再按 prompt 更长的撤回 | [`schedule_batch.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/schedule_batch.py#L2064-L2083) 同样按 `(len(output_ids), -len(origin_input_ids))` | aligned |
-| prefill admission 粒度 | [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) 已经是 chunk 预算，不再整条 prompt 一次性预留 | [`schedule_policy.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/schedule_policy.py#L767-L860) 的 `PrefillAdder` 也是 chunk 粒度 | aligned |
-| decode 前置 staging 顺序 | scheduler 显式做 `upload_token_ids -> update_metadata -> plan_attention -> forward_decode_batch` | [`model_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py#L2782-L2854) + [`flashinfer_backend.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/flashinfer_backend.py#L1097-L1199) 也是先准备 metadata/plan 再 decode | broadly aligned |
+| decode retract heuristic | [`infer/src/scheduler/cuda/decode.rs`](../../infer/src/scheduler/cuda/decode.rs) 先按 generated token 少的撤回；相同再按 prompt 更长的撤回 | [`schedule_batch.py`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/schedule_batch.py#L2064-L2083) 同样按 `(len(output_ids), -len(origin_input_ids))` | aligned |
+| prefill admission 粒度 | [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) 已经是 chunk 预算，不再整条 prompt 一次性预留 | [`schedule_policy.py`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/schedule_policy.py#L767-L860) 的 `PrefillAdder` 也是 chunk 粒度 | aligned |
+| decode 前置 staging 顺序 | scheduler 显式做 `upload_token_ids -> update_metadata -> plan_attention -> forward_decode_batch` | [`model_runner.py`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/model_executor/model_runner.py#L2782-L2854) + [`flashinfer_backend.py`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/layers/attention/flashinfer_backend.py#L1097-L1199) 也是先准备 metadata/plan 再 decode | broadly aligned |
 
 ### 还没对齐的关键点
 
 | Area | Local repo | Current SGLang | Why this blocks a real “aligned” claim |
 | --- | --- | --- | --- |
-| scheduler tick 形态 | [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) 的 `step()` 还能在同一 tick 里先 launch prefill、再 launch decode | [`scheduler.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/scheduler.py#L2308-L2400) 的 `get_next_batch_to_run()` 一次返回一个 batch | 现在是“同 tick 双执行”，不是 “单批次执行 contract” |
-| mixed-chunk 执行形态 | CUDA 当前仍是同一 tick 的两次独立路径；[`crates/cuda-kernels/src/flashinfer.rs`](../../crates/cuda-kernels/src/flashinfer.rs) 里的 `update_mixed_batch()` 存在，但当前 CUDA path 没有消费它 | [`scheduler.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/scheduler.py#L2654-L2667) 会 `prepare_for_decode()` 后 `mix_with_running(...)`，形成一个真实 mixed batch | 这是当前最大缺口；没有这一点，不能说 decode shape 对齐 |
+| scheduler tick 形态 | [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) 的 `step()` 还能在同一 tick 里先 launch prefill、再 launch decode | [`scheduler.py`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/scheduler.py#L2302-L2411) 的 `get_next_batch_to_run()` 一次返回一个 batch | 现在是“同 tick 双执行”，不是 “单批次执行 contract” |
+| mixed-chunk 执行形态 | CUDA 当前仍是同一 tick 的两次独立路径；[`crates/cuda-kernels/src/flashinfer.rs`](../../crates/cuda-kernels/src/flashinfer.rs) 里的 `update_mixed_batch()` 存在，但当前 CUDA path 没有消费它 | [`scheduler.py`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/scheduler.py#L2654-L2667) 会 `prepare_for_decode()` 后 `mix_with_running(...)`，形成一个真实 mixed batch | 这是当前最大缺口；没有这一点，不能说 decode shape 对齐 |
 | metadata / graph ownership | scheduler 直接编排 `upload -> update_metadata -> plan_attention -> forward` | SGLang 把 lowering + graph inputs 放在 `model_runner` / attention backend | contract 分层还不是一套 |
 | Qwen3.5 decode shape | [`infer/src/model/qwen35/batch_decode.rs`](../../infer/src/model/qwen35/batch_decode.rs) 仍是 piecewise graph；linear groups graph，full-attn 层 eager | SGLang 当前 decode ownership 更集中在 backend / runner 层 | Qwen3.5 仍是最明显的 model-specific decode outlier |
 | KV contract | 本地是 native `PagedKVPool + slot_epoch + page table`，主路径 `page_size=16` | SGLang 还是 `req_to_token_pool + token_to_kv_pool_allocator` | 语义接近，但结构不同；这里需要先定义“要语义对齐还是实现同构” |
+
+## 可追溯证据矩阵
+
+下面只列能直接从代码定位到的证据。每条都分成：
+
+- Local observation: 本地仓库里的直接代码证据
+- SGLang observation: `214c35b` 上的直接代码证据
+- Judgment: 这条证据支持的结论
+
+### 1. Decode retract 规则已经对齐
+
+- Local observation:
+  `infer/src/scheduler/cuda/decode.rs:7-12` 定义了撤回排序键
+  `(generated_tokens, Reverse(prompt_tokens))`；
+  `infer/src/scheduler/cuda/decode.rs:22-55` 用这个键挑 victim 并循环撤回直到 fit。
+- SGLang observation:
+  [`schedule_batch.py:L2064-L2083`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/schedule_batch.py#L2064-L2083)
+  按 `(len(output_ids), -len(origin_input_ids))` 排序，再从排序结果尾部弹出要撤回的请求。
+- Judgment:
+  这两边是同一套 heuristic family。这里可以明确写成 aligned。
+
+### 2. Prefill admission 已经对齐到 chunk 预算，而不是整条 prompt 预留
+
+- Local observation:
+  `infer/src/scheduler/cuda/execution.rs:56-102` 构造 `PrefillBudget`；
+  `:156-193` 对单个 request 只预留当前 chunk 的 `prefill_tokens`，再加剩余 decode growth；
+  `:225-237` 从 scored candidates 里做 fit selection。
+- SGLang observation:
+  [`schedule_policy.py:L767-L860`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/schedule_policy.py#L767-L860)
+  的 `PrefillAdder.add_one_req()` 也是在剩余 token/page 预算内增量接纳，而不是整条 prompt 一次性吃满。
+- Judgment:
+  admission 粒度已经明显向当前 SGLang 靠齐。这里不是主 blocker。
+
+### 3. Scheduler tick 形态没有对齐
+
+- Local observation:
+  `infer/src/scheduler/cuda/execution.rs:27-40` 的 `StepPlan::label()` 明确存在 `decode+prefill`；
+  `:288-300` 在同一个 `step()` 里先 `step_prefill_batch(&plan.prefill)`，再 `step_decode_launch()`。
+- SGLang observation:
+  [`scheduler.py:L2388-L2400`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/scheduler.py#L2388-L2400)
+  在 `get_next_batch_to_run()` 中要么返回 `new_batch`，要么返回更新后的 `running_batch`，一次只返回一个 batch。
+- Judgment:
+  这不是实现细节差异，而是 scheduler contract 差异。当前本地还是“同 tick 双执行”。
+
+### 4. Mixed-chunk 还不是真正的一次 mixed forward
+
+- Local observation:
+  `crates/cuda-kernels/src/flashinfer.rs:904-1025` 已经有 `update_mixed_batch()`；
+  但 audit 当天的 repo search
+
+```bash
+rg -n "update_mixed_batch\\(" infer/src crates/cuda-kernels/src
+```
+
+  只返回 `crates/cuda-kernels/src/flashinfer.rs:910` 这一处定义，没有 CUDA 调用点。
+  与此同时，`infer/src/scheduler/cuda/execution.rs:288-300` 仍然是 prefill launch 后再 decode launch。
+- SGLang observation:
+  [`schedule_batch.py:L1973-L2003`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/schedule_batch.py#L1973-L2003)
+  的 `mix_with_running()` 会真的把 running decode rows 并进 extend batch；
+  [`scheduler.py:L2654-L2667`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/scheduler.py#L2654-L2667)
+  在 mixed-chunk 分支里先 `prepare_for_decode()` 再 `mix_with_running(...)`。
+- Judgment:
+  当前本地只有 mixed metadata helper，还没有 shipped mixed forward path。这是“还不能说对齐”的最硬证据。
+
+### 5. Metadata / graph ownership 还留在 scheduler 层
+
+- Local observation:
+  `infer/src/model.rs:64-108` 明确把 `upload_token_ids`、`update_metadata`、`plan_attention` 定义成 `DecodeContextOps` 的 scheduler-level 操作；
+  `infer/src/scheduler/cuda/decode.rs:187-227` 里 scheduler 逐步调用这些操作；
+  `infer/src/model.rs:500-517` 的 decode surface 仍是 `forward_decode_batch(tokens, states, slot_indices, paged_kv_pool, decode_ctx, ...)`，不是一个一等 batch object。
+- SGLang observation:
+  [`forward_batch_info.py:L279-L375`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/model_executor/forward_batch_info.py#L279-L375)
+  有显式 `ForwardBatch`；
+  [`model_runner.py:L2782-L2803`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/model_executor/model_runner.py#L2782-L2803)
+  在 `forward_decode()` 中先 `init_forward_metadata(forward_batch)`，再把 `forward_batch` 交给 model；
+  [`flashinfer_backend.py:L1097-L1199`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/layers/attention/flashinfer_backend.py#L1097-L1199)
+  负责写 wrapper 的 graph input buffers、`kv_indptr`、`kv_indices`，并走 `begin_forward` / `fast_decode_plan`。
+- Judgment:
+  两边做的是相似工作，但 ownership boundary 不一样。当前本地更像“scheduler 手写 lowering 时序”，SGLang 更像“ForwardBatch + backend-owned lowering”。
+
+### 6. Qwen3.5 decode 仍然是 scheduler-visible outlier
+
+- Local observation:
+  `infer/src/model/qwen35/batch_decode.rs:493-555` 把 decode body 显式拆成 linear groups + eager full-attn layers；
+  `:559-630` 的 graph capture 只覆盖 linear groups；
+  `:517-522` 还明确注释 full attention eager 的原因是 FlashInfer metadata changes。
+- SGLang observation:
+  [`model_runner.py:L2782-L2803`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/model_executor/model_runner.py#L2782-L2803)
+  和 [`forward_batch_info.py:L279-L375`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/model_executor/forward_batch_info.py#L279-L375)
+  暴露给 scheduler 的仍是统一的 `ForwardBatch` contract，而不是 `Qwen3.5` 特有的 group-level decode contract。
+- Judgment:
+  这里的直接证据支持的是“本地 Qwen3.5 decode shape 仍然泄漏到顶层 contract”。  
+  这不是在声称 SGLang 内部绝对没有 piecewise graph；更准确的说法是：即便它内部有模型特化，这种特化没有像本地这样暴露成 scheduler-facing 差异。
+
+## 哪些结论是直接观察，哪些是推断
+
+- 直接观察：
+  retract 排序键、chunk admission 粒度、`decode+prefill` 同 tick 双 launch、`update_mixed_batch()` 只有定义没有调用点、scheduler-level `DecodeContextOps`、Qwen3.5 piecewise decode body。
+- 推断：
+  “SGLang 的 decode ownership 更集中在 backend / runner 层，因此本地当前 contract 仍未对齐。”
+  这个推断是基于 `ForwardBatch -> model_runner -> attn_backend` 这条明确接口链，而不是基于对 SGLang 内部每个 model kernel 细节的穷举。
 
 ## 为什么旧计划现在会让人误读
 
@@ -245,8 +359,9 @@ Qwen3.5 可以继续保留内部 hybrid 复杂度，但不能继续作为 schedu
 
 ### Current SGLang
 
-- [`schedule_batch.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/schedule_batch.py)
-- [`schedule_policy.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/schedule_policy.py)
-- [`scheduler.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/scheduler.py)
-- [`model_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py)
-- [`flashinfer_backend.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/flashinfer_backend.py)
+- [`schedule_batch.py @ 214c35b`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/schedule_batch.py)
+- [`schedule_policy.py @ 214c35b`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/schedule_policy.py)
+- [`scheduler.py @ 214c35b`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/managers/scheduler.py)
+- [`forward_batch_info.py @ 214c35b`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/model_executor/forward_batch_info.py)
+- [`model_runner.py @ 214c35b`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/model_executor/model_runner.py)
+- [`flashinfer_backend.py @ 214c35b`](https://github.com/sgl-project/sglang/blob/214c35b03184c354acf1f86f99746799e1c9b3a9/python/sglang/srt/layers/attention/flashinfer_backend.py)
