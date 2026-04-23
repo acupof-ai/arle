@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for the agent-infer CLI and metal_serve HTTP surface.
+# End-to-end smoke test for the ARLE CLI and metal_serve HTTP surface.
 #
 # Drives the REPL via piped stdin (no TTY) and hits the OpenAI v1 surface on
 # the background server. Exits non-zero on any assertion failure; echoes raw
@@ -18,9 +18,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO}"
 
 MODEL="${1:-${REPO}/models/Qwen3-0.6B}"
-BIN_CLI="${REPO}/target/release/agent-infer"
+BIN_CLI="${REPO}/target/release/arle"
 BIN_SERVE="${REPO}/target/release/metal_serve"
-OUT_DIR="$(mktemp -d -t agent-infer-e2e-XXXXXX)"
+OUT_DIR="$(mktemp -d -t arle-e2e-XXXXXX)"
 PORT="${PORT:-8765}"
 FAIL=0
 
@@ -57,7 +57,7 @@ for b in "$BIN_CLI" "$BIN_SERVE"; do
 done
 
 # ----- Section 1: piped REPL -----------------------------------------------
-info "Section 1 — agent-infer piped REPL (Chat mode)"
+info "Section 1 — ARLE piped REPL (Chat mode)"
 SCRIPT_IN="$OUT_DIR/repl_in.txt"
 REPL_OUT="$OUT_DIR/repl.out"
 EXPORT_PATH="$OUT_DIR/exported.md"
@@ -100,7 +100,7 @@ while kill -0 "$REPL_PID" 2>/dev/null; do
 done
 wait "$REPL_PID" 2>/dev/null || true
 
-assert_contains "banner"        "agent-infer REPL" "$REPL_OUT"
+assert_contains "banner"        "ARLE REPL" "$REPL_OUT"
 assert_contains "model line"    "Model:"           "$REPL_OUT"
 assert_contains "help listing"  "/help"            "$REPL_OUT"
 assert_contains "stats turns"   "turns"            "$REPL_OUT"

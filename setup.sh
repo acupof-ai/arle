@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
-# agent-infer — reproducible dev environment setup
+# ARLE — reproducible dev environment setup
 #
 # Usage:
 #   ./setup.sh              # Full setup: Linux/CUDA toolchain + Zig + venv + build + model
+#   ./setup.sh --full       # Alias for the default full setup
 #   ./setup.sh --deps-only  # Toolchains + venv only, no build/model
 #   ./setup.sh --build-only # Build only (assumes venv exists)
 #   ./setup.sh --model-only # Download model only
@@ -79,6 +80,7 @@ PYTHON="${PYTHON:-python3}"
 # ---------------------------------------------------------------------------
 MODE="full"
 case "${1:-}" in
+    --full)        MODE="full" ;;
     --deps-only)   MODE="deps" ;;
     --build-only)  MODE="build" ;;
     --model-only)  MODE="model" ;;
@@ -186,10 +188,10 @@ do_check() {
     fi
 
     # Binaries
-    if [ -x target/release/agent-infer ]; then
-        ok "target/release/agent-infer built"
+    if [ -x target/release/arle ]; then
+        ok "target/release/arle built"
     else
-        fail "agent-infer binary not found — run ./setup.sh --build-only"
+        fail "ARLE binary not found — run ./setup.sh --build-only"
         errors=$((errors + 1))
     fi
     if [ -x target/release/infer ]; then
@@ -347,7 +349,7 @@ do_deps() {
 # BUILD — compile Rust + CUDA kernels
 # ============================================================================
 do_build() {
-    step "Building agent-infer CLI + infer server (release, CUDA)"
+    step "Building ARLE CLI + infer server (release, CUDA)"
     activate_venv
 
     # Ensure cargo is on PATH
@@ -368,7 +370,7 @@ do_build() {
     local start
     start=$(date +%s)
 
-    cargo build --release --features cli -p agent-infer 2>&1 | while IFS= read -r line; do
+    cargo build --release --features cli -p agent-infer --bin arle 2>&1 | while IFS= read -r line; do
         case "$line" in
             *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
                 echo "  $line" ;;
@@ -385,8 +387,8 @@ do_build() {
     local elapsed=$(( $(date +%s) - start ))
     ok "Build complete in ${elapsed}s"
 
-    if [ -x target/release/agent-infer ]; then
-        info "Binary: target/release/agent-infer ($(du -h target/release/agent-infer | awk '{print $1}'))"
+    if [ -x target/release/arle ]; then
+        info "Binary: target/release/arle ($(du -h target/release/arle | awk '{print $1}'))"
     fi
     if [ -x target/release/infer ]; then
         info "Binary: target/release/infer ($(du -h target/release/infer | awk '{print $1}'))"
@@ -432,7 +434,7 @@ print(f\"hidden={c.get('hidden_size','?')}, layers={c.get('num_hidden_layers','?
 do_full() {
     echo ""
     echo "╔══════════════════════════════════════════════╗"
-    echo "║       agent-infer — environment setup        ║"
+    echo "║           ARLE — environment setup           ║"
     echo "╚══════════════════════════════════════════════╝"
     echo ""
 
@@ -456,7 +458,7 @@ do_full() {
     echo "  export LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
     echo ""
     echo "  # 3. Run agent REPL"
-    echo "  ./target/release/agent-infer --model-path $MODEL_DIR"
+    echo "  ./target/release/arle --model-path $MODEL_DIR"
     echo ""
     echo "  # 4. Run HTTP server"
     echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"

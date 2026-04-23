@@ -8,18 +8,19 @@
 #   help     Show this help
 #
 # Env overrides:
-#   AGENT_INFER_TARGET       default: mlx-community/Qwen3.5-4B-MLX-4bit
-#   AGENT_INFER_DFLASH_DRAFT default: z-lab/Qwen3.5-4B-DFlash
-#   AGENT_INFER_PORT         default: 8000
-#   AGENT_INFER_PROMPT_TOK   default: 32 (bench)
-#   AGENT_INFER_GEN_TOK      default: 256 (bench)
+#   ARLE_TARGET              default: mlx-community/Qwen3.5-4B-MLX-4bit
+#   ARLE_DFLASH_DRAFT        default: z-lab/Qwen3.5-4B-DFlash
+#   ARLE_PORT                default: 8000
+#   ARLE_PROMPT_TOK          default: 32 (bench)
+#   ARLE_GEN_TOK             default: 256 (bench)
+#   Legacy AGENT_INFER_* names still work.
 #
 # Examples:
 #   ./scripts/run_dflash.sh
 #   ./scripts/run_dflash.sh bench
 #   ./scripts/run_dflash.sh request "write quicksort in python"
-#   AGENT_INFER_TARGET=mlx-community/Qwen3-4B-bf16 \
-#     AGENT_INFER_DFLASH_DRAFT=z-lab/Qwen3-4B-DFlash-b16 \
+#   ARLE_TARGET=mlx-community/Qwen3-4B-bf16 \
+#     ARLE_DFLASH_DRAFT=z-lab/Qwen3-4B-DFlash-b16 \
 #     ./scripts/run_dflash.sh
 
 set -euo pipefail
@@ -43,11 +44,11 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-TARGET="${AGENT_INFER_TARGET:-mlx-community/Qwen3.5-4B-MLX-4bit}"
-DRAFT="${AGENT_INFER_DFLASH_DRAFT:-z-lab/Qwen3.5-4B-DFlash}"
-PORT="${AGENT_INFER_PORT:-8000}"
-PROMPT_TOK="${AGENT_INFER_PROMPT_TOK:-32}"
-GEN_TOK="${AGENT_INFER_GEN_TOK:-256}"
+TARGET="${ARLE_TARGET:-${AGENT_INFER_TARGET:-mlx-community/Qwen3.5-4B-MLX-4bit}}"
+DRAFT="${ARLE_DFLASH_DRAFT:-${AGENT_INFER_DFLASH_DRAFT:-z-lab/Qwen3.5-4B-DFlash}}"
+PORT="${ARLE_PORT:-${AGENT_INFER_PORT:-8000}}"
+PROMPT_TOK="${ARLE_PROMPT_TOK:-${AGENT_INFER_PROMPT_TOK:-32}}"
+GEN_TOK="${ARLE_GEN_TOK:-${AGENT_INFER_GEN_TOK:-256}}"
 
 CARGO_COMMON=(--release -p infer --no-default-features --features metal,no-cuda)
 
@@ -67,7 +68,8 @@ Defaults:
   port:     ${PORT}
   bench:    prompt_tokens=${PROMPT_TOK}, generation_tokens=${GEN_TOK}
 
-Override via AGENT_INFER_TARGET / AGENT_INFER_DFLASH_DRAFT / AGENT_INFER_PORT.
+Override via ARLE_TARGET / ARLE_DFLASH_DRAFT / ARLE_PORT.
+Legacy AGENT_INFER_TARGET / AGENT_INFER_DFLASH_DRAFT / AGENT_INFER_PORT also work.
 EOF
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command Metal GPU capture driver for agent-infer.
+# One-command Metal GPU capture driver for ARLE.
 #
 # Subcommands:
 #   gputrace    Programmatic MTLCaptureManager capture inside
@@ -12,20 +12,24 @@
 #   help        Show usage.
 #
 # Env overrides:
-#   AGENT_INFER_TARGET         gputrace: default Qwen3.5-4B-MLX-4bit local snapshot.
+#   ARLE_TARGET                gputrace: default Qwen3.5-4B-MLX-4bit local snapshot.
 #                              xctrace:  default Qwen3-0.6B-4bit local snapshot.
-#   AGENT_INFER_CAPTURE_STEP   gputrace: default 2 (first post-warmup decode when
+#                              Legacy `AGENT_INFER_TARGET` also works.
+#   ARLE_CAPTURE_STEP          gputrace: default 2 (first post-warmup decode when
 #                              --warmup 1 --generation-tokens 2 --use-step-driver).
 #                              Counter is process-global: N = W*G for the first
 #                              post-warmup decode step.
-#   AGENT_INFER_CAPTURE_PATH   gputrace: default /tmp/qwen35_step_<epoch>.gputrace
-#   AGENT_INFER_XCTRACE_OUT    xctrace:  default /tmp/agent_infer_metal.trace
+#                              Legacy `AGENT_INFER_CAPTURE_STEP` also works.
+#   ARLE_CAPTURE_PATH          gputrace: default /tmp/qwen35_step_<epoch>.gputrace
+#                              Legacy `AGENT_INFER_CAPTURE_PATH` also works.
+#   ARLE_XCTRACE_OUT           xctrace:  default /tmp/arle_metal.trace
+#                              Legacy `AGENT_INFER_XCTRACE_OUT` also works.
 #
 # Examples:
 #   ./scripts/capture_metal.sh gputrace
-#   AGENT_INFER_CAPTURE_STEP=12 ./scripts/capture_metal.sh gputrace
+#   ARLE_CAPTURE_STEP=12 ./scripts/capture_metal.sh gputrace
 #   ./scripts/capture_metal.sh xctrace
-#   AGENT_INFER_TARGET=/path/to/Qwen3-4B-bf16 ./scripts/capture_metal.sh xctrace
+#   ARLE_TARGET=/path/to/Qwen3-4B-bf16 ./scripts/capture_metal.sh xctrace
 
 set -euo pipefail
 
@@ -66,18 +70,19 @@ Subcommands:
   help        Show this help
 
 Env:
-  AGENT_INFER_TARGET        path/repo to model (backend-dependent default)
-  AGENT_INFER_CAPTURE_STEP  gputrace capture step index (default 2)
-  AGENT_INFER_CAPTURE_PATH  gputrace output (.gputrace bundle)
-  AGENT_INFER_XCTRACE_OUT   xctrace output (.trace bundle)
+  ARLE_TARGET               path/repo to model (backend-dependent default)
+  ARLE_CAPTURE_STEP         gputrace capture step index (default 2)
+  ARLE_CAPTURE_PATH         gputrace output (.gputrace bundle)
+  ARLE_XCTRACE_OUT          xctrace output (.trace bundle)
+  Legacy AGENT_INFER_* names still work.
 EOF
 }
 
 run_gputrace() {
     cd "${REPO_ROOT}"
     local target
-    if [ -n "${AGENT_INFER_TARGET:-}" ]; then
-        target="${AGENT_INFER_TARGET}"
+    if [ -n "${ARLE_TARGET:-${AGENT_INFER_TARGET:-}}" ]; then
+        target="${ARLE_TARGET:-${AGENT_INFER_TARGET:-}}"
     else
         if ! target="$(resolve_snapshot "${QWEN35_REPO}")"; then
             echo "capture_metal.sh: cannot find Qwen3.5-4B-MLX-4bit snapshot under" >&2
@@ -89,8 +94,8 @@ run_gputrace() {
         fi
     fi
 
-    local step="${AGENT_INFER_CAPTURE_STEP:-2}"
-    local out_path="${AGENT_INFER_CAPTURE_PATH:-/tmp/qwen35_step_$(date +%s).gputrace}"
+    local step="${ARLE_CAPTURE_STEP:-${AGENT_INFER_CAPTURE_STEP:-2}}"
+    local out_path="${ARLE_CAPTURE_PATH:-${AGENT_INFER_CAPTURE_PATH:-/tmp/qwen35_step_$(date +%s).gputrace}}"
 
     # Fresh destination: MTLCaptureManager refuses to overwrite existing bundles.
     rm -rf "${out_path}"
@@ -132,19 +137,19 @@ run_xctrace() {
     }
 
     local target
-    if [ -n "${AGENT_INFER_TARGET:-}" ]; then
-        target="${AGENT_INFER_TARGET}"
+    if [ -n "${ARLE_TARGET:-${AGENT_INFER_TARGET:-}}" ]; then
+        target="${ARLE_TARGET:-${AGENT_INFER_TARGET:-}}"
     else
         if ! target="$(resolve_snapshot "${QWEN3_REPO}")"; then
             if ! target="$(resolve_snapshot "${QWEN35_REPO}")"; then
                 echo "capture_metal.sh: no default Qwen3 / Qwen3.5 snapshot under ${HF_HUB}." >&2
-                echo "Set AGENT_INFER_TARGET to a model path/repo and retry." >&2
+                echo "Set ARLE_TARGET (legacy AGENT_INFER_TARGET also works) to a model path/repo and retry." >&2
                 exit 1
             fi
         fi
     fi
 
-    local out="${AGENT_INFER_XCTRACE_OUT:-/tmp/agent_infer_metal.trace}"
+    local out="${ARLE_XCTRACE_OUT:-${AGENT_INFER_XCTRACE_OUT:-/tmp/arle_metal.trace}}"
     rm -rf "${out}"
 
     # Pre-build so xctrace doesn't time the compile.

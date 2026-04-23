@@ -1,4 +1,4 @@
-"""Benchmark agent-infer Rust binary with long agent prompts.
+"""Benchmark the ARLE Rust binary with long agent prompts.
 
 Sends multi-turn agent conversations via stdin to the Rust binary,
 measures TTFT, throughput, KV cache hit rates from logs.
@@ -34,7 +34,7 @@ BENCHMARK_PROMPTS = [
 def run_single_prompt(prompt: str, max_tokens: int = 4096) -> dict:
     """Run a single prompt through the Rust agent binary."""
     cmd = [
-        "./target/release/agent-infer",
+        "./target/release/arle",
         "--model-path", MODEL_PATH,
         "--max-tokens", str(max_tokens),
         "--max-turns", "5",
@@ -92,7 +92,7 @@ def run_single_prompt(prompt: str, max_tokens: int = 4096) -> dict:
 
 def main():
     print("=" * 70)
-    print("agent-infer Benchmark (Pure Rust, No Python Glue)")
+    print("ARLE Benchmark (Pure Rust, No Python Glue)")
     print("=" * 70)
     print(f"Model: {MODEL_PATH}")
     print(f"Prompts: {len(BENCHMARK_PROMPTS)}")

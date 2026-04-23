@@ -1,9 +1,9 @@
-# agent-infer — local development shortcuts
+# ARLE — local development shortcuts
 #
 # Usage:
 #   make build-metal               # macOS / Apple Silicon
 #   make build-agent-metal         # macOS / Apple Silicon CLI
-#   make check-metal               # verify infer + agent-infer Metal surfaces
+#   make check-metal               # verify infer + arle Metal surfaces
 #   make test-metal                # run Metal lib tests serially
 #   make bench-metal METAL_MODEL=models/Qwen3-0.6B-4bit
 #   make build-cuda                # Linux / NVIDIA GPU
@@ -21,11 +21,11 @@ build-metal:
 	cargo build --release --no-default-features --features metal,no-cuda -p infer
 
 build-agent-metal:
-	cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer
+	cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
 
 check-metal:
 	cargo check --no-default-features --features metal,no-cuda -p infer --lib
-	cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer
+	cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
 
 test-metal:
 	cargo test --no-default-features --features metal,no-cuda -p infer --lib -- --test-threads 1

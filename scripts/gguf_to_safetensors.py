@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert GGUF model to safetensors format for agent-infer.
+"""Convert GGUF model to safetensors format for ARLE.
 
 Handles all llama.cpp GGUF conventions:
 - Dequantizes Q4_K_M/Q8_0/etc. to BF16
@@ -8,7 +8,7 @@ Handles all llama.cpp GGUF conventions:
 - Removes norm +1 offset
 - Maps GGUF tensor names to HuggingFace convention
 
-Output: standard safetensors + config.json that agent-infer loads directly.
+Output: standard safetensors + config.json that ARLE loads directly.
 
 Usage:
     python scripts/gguf_to_safetensors.py \
