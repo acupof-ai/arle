@@ -402,87 +402,45 @@ pub(super) fn apply_gguf_metadata_overrides(config: &mut MetalModelConfig, gguf:
 }
 
 fn load_qwen35_config_from_gguf(gguf: &GgufFile) -> Result<MetalModelConfig> {
-    let common = gguf.extract_model_config()?;
-    let full_attention_interval = gguf
-        .meta_u32("qwen35.full_attention_interval")
-        .unwrap_or(1)
-        .max(1) as usize;
-    let rotary_dim = gguf
-        .meta_u32("qwen35.rope.dimension_count")
-        .context("GGUF missing qwen35.rope.dimension_count")? as usize;
-    let eos_token_id = gguf
-        .meta_u32("tokenizer.ggml.eos_token_id")
-        .unwrap_or(151_645);
-    #[cfg(feature = "metal")]
-    let (linear_num_key_heads, linear_key_head_dim, linear_num_value_heads, linear_conv_kernel) = {
-        let linear_num_key_heads =
-            gguf.meta_u32("qwen35.ssm.group_count")
-                .context("GGUF missing qwen35.ssm.group_count")? as usize;
-        let linear_key_head_dim =
-            gguf.meta_u32("qwen35.ssm.state_size")
-                .context("GGUF missing qwen35.ssm.state_size")? as usize;
-        let linear_inner_size =
-            gguf.meta_u32("qwen35.ssm.inner_size")
-                .context("GGUF missing qwen35.ssm.inner_size")? as usize;
-        anyhow::ensure!(
-            linear_key_head_dim > 0 && linear_inner_size.is_multiple_of(linear_key_head_dim),
-            "invalid Qwen3.5 GGUF SSM metadata: inner_size={linear_inner_size}, state_size={linear_key_head_dim}"
-        );
-        (
-            linear_num_key_heads,
-            linear_key_head_dim,
-            linear_inner_size / linear_key_head_dim,
-            gguf.meta_u32("qwen35.ssm.conv_kernel").unwrap_or(4) as usize,
-        )
-    };
+    let qwen35 = gguf.extract_qwen35_config()?;
+    let layer_types = qwen35
+        .layer_types
+        .iter()
+        .map(|layer| match layer {
+            qwen35_spec::LayerType::FullAttention => MetalQwen35LayerType::FullAttention,
+            qwen35_spec::LayerType::LinearAttention => MetalQwen35LayerType::LinearAttention,
+        })
+        .collect();
 
     Ok(MetalModelConfig {
-        hidden_size: common.hidden_size,
-        num_attention_heads: common.num_attention_heads,
-        num_key_value_heads: common.num_key_value_heads,
-        num_hidden_layers: common.num_hidden_layers,
-        vocab_size: common.vocab_size,
-        rms_norm_eps: common.rms_norm_eps as f64,
-        rope_theta: common.rope_theta as f64,
-        head_dim: common.head_dim,
-        eos_token_id,
-        stop_token_ids: vec![eos_token_id],
+        hidden_size: qwen35.hidden_size,
+        num_attention_heads: qwen35.num_attention_heads,
+        num_key_value_heads: qwen35.num_key_value_heads,
+        num_hidden_layers: qwen35.num_hidden_layers,
+        vocab_size: qwen35.vocab_size,
+        rms_norm_eps: qwen35.rms_norm_eps as f64,
+        rope_theta: qwen35.rope_theta as f64,
+        head_dim: qwen35.head_dim,
+        eos_token_id: qwen35.eos_token_id,
+        stop_token_ids: qwen35.stop_token_ids.clone(),
         quantization: None,
         norm_weight_mode: MetalNormWeightMode::Direct,
         arch: MetalModelArch::Qwen35(MetalQwen35ArchConfig {
-            layer_types: qwen35_layer_types_from_interval(
-                common.num_hidden_layers,
-                full_attention_interval,
-            ),
-            rotary_dim,
+            layer_types,
+            rotary_dim: qwen35.rotary_dim,
             #[cfg(feature = "metal")]
             linear: super::gdr::MetalGdrConfig {
-                num_key_heads: linear_num_key_heads,
-                key_dim: linear_key_head_dim,
-                num_value_heads: linear_num_value_heads,
-                value_dim: linear_key_head_dim,
-                conv_kernel: linear_conv_kernel,
-                hidden_size: common.hidden_size,
-                rms_norm_eps: common.rms_norm_eps,
+                num_key_heads: qwen35.linear_num_key_heads,
+                key_dim: qwen35.linear_key_head_dim,
+                num_value_heads: qwen35.linear_num_value_heads,
+                value_dim: qwen35.linear_value_head_dim,
+                conv_kernel: qwen35.linear_conv_kernel_dim,
+                hidden_size: qwen35.hidden_size,
+                rms_norm_eps: qwen35.rms_norm_eps,
             },
             moe: None,
         }),
     })
-}
-
-fn qwen35_layer_types_from_interval(
-    num_hidden_layers: usize,
-    full_attention_interval: usize,
-) -> Vec<MetalQwen35LayerType> {
-    (0..num_hidden_layers)
-        .map(|idx| {
-            if (idx + 1).is_multiple_of(full_attention_interval.max(1)) {
-                MetalQwen35LayerType::FullAttention
-            } else {
-                MetalQwen35LayerType::LinearAttention
-            }
-        })
-        .collect()
 }
 
 fn load_stop_token_ids(model_dir: &Path, fallback_eos_token_id: u32) -> Result<Vec<u32>> {

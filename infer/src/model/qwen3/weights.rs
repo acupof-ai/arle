@@ -1,9 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, info};
 use std::time::Instant;
 
 use super::config::Config;
 use crate::model::common::{self, MLP};
+use crate::model_source::ResolvedModelSource;
 use crate::ops;
 use crate::weight_loader::{
     load_tensor_1d, load_tensor_2d, load_tensor_2d_maybe_quantized, precompute_rope,
@@ -70,18 +71,21 @@ impl Qwen3Model {
         info!("Loading model from: {}", model_path);
         debug!("Initializing GPU");
         let ctx = DeviceContext::new()?;
+        let source = ResolvedModelSource::resolve(model_path)?;
+        let resolved_path = source.resolved_path().to_str().unwrap_or(model_path);
 
         // Try GGUF first — if found, use dequant-at-load path
-        if let Some(gguf) = crate::gguf::try_open(model_path) {
+        if let Some(gguf) = source.gguf() {
             info!("Loading from GGUF: {} tensors", gguf.tensors.len());
-            // Config: prefer config.json, fallback to GGUF metadata
-            let config = Config::from_file(model_path).or_else(|_| -> Result<Config> {
+            let config = if let Some(config_dir) = source.config_dir() {
+                Config::from_file(config_dir.to_str().unwrap_or(resolved_path))?
+            } else {
                 let gc = gguf.extract_model_config()?;
                 info!(
                     "Config from GGUF metadata: {}×{}, {} layers",
                     gc.hidden_size, gc.intermediate_size, gc.num_hidden_layers
                 );
-                Ok(Config::from_parts(
+                Config::from_parts(
                     qwen3_spec::Qwen3Config {
                         hidden_size: gc.hidden_size,
                         intermediate_size: gc.intermediate_size,
@@ -98,20 +102,21 @@ impl Qwen3Model {
                     0,
                     0,
                     vec![],
-                ))
-            })?;
-            return Self::from_gguf(&ctx, &config, &gguf, runtime);
+                )
+            };
+            return Self::from_gguf(&ctx, &config, gguf, runtime);
         }
 
-        let config = Config::from_file(model_path)?;
+        let config = Config::from_file(resolved_path)
+            .with_context(|| format!("failed to load Qwen3 config from {}", resolved_path))?;
 
-        let (mmaps, weight_map) = common::load_safetensors(model_path, false)?;
+        let (mmaps, weight_map) = common::load_safetensors(resolved_path, false)?;
         let shards = common::deserialize_shards(&mmaps)?;
 
         // Detect weight quantization (quantize_config.json or turboquant_config.json)
         let quant_group_size = {
-            let qc_path = std::path::Path::new(model_path).join("quantize_config.json");
-            let tq_path = std::path::Path::new(model_path).join("turboquant_config.json");
+            let qc_path = std::path::Path::new(resolved_path).join("quantize_config.json");
+            let tq_path = std::path::Path::new(resolved_path).join("turboquant_config.json");
             if qc_path.exists() {
                 let qc: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(&qc_path)?)?;

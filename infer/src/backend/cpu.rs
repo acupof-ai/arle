@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
-use crate::hf_hub;
+use crate::model_source::ResolvedModelSource;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
@@ -104,11 +104,19 @@ impl Default for CpuBackend {
 
 impl InferenceBackend for CpuBackend {
     fn load(&mut self, model_path: &Path) -> Result<()> {
-        let resolved = resolve_cpu_model_path(model_path)?;
+        let source = ResolvedModelSource::resolve(&model_path.to_string_lossy())?;
         self.model_id = display_model_id(model_path);
-        self.model_family = load_model_family(&resolved).ok();
-        self.tokenizer = Tokenizer::from_file(&resolved.to_string_lossy()).ok();
-        self.model_path = Some(resolved);
+        self.model_family = source
+            .config_dir()
+            .and_then(|dir| load_model_family(dir).ok())
+            .or_else(|| {
+                source
+                    .gguf()
+                    .and_then(|gguf| gguf.architecture())
+                    .map(str::to_string)
+            });
+        self.tokenizer = source.load_tokenizer().ok();
+        self.model_path = Some(source.model_root().to_path_buf());
         Ok(())
     }
 
@@ -155,19 +163,6 @@ impl StreamingInferenceBackend for CpuBackend {
         }
         Ok(generated)
     }
-}
-
-fn resolve_cpu_model_path(model_source: &Path) -> Result<PathBuf> {
-    if model_source.exists() {
-        return Ok(model_source.to_path_buf());
-    }
-
-    let model_id = model_source
-        .to_str()
-        .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-
-    hf_hub::download_runtime_assets_from_hub(model_id)
-        .with_context(|| format!("failed to fetch CPU runtime assets for '{model_id}'"))
 }
 
 fn load_model_family(model_dir: &Path) -> Result<String> {
