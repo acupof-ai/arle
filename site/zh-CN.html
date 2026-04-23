@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ARLE(1) — agent reinforcement learning engine</title>
-<meta name="description" content="ARLE 是纯 Rust 的 agent reinforcement learning engine。这里提供安装入口、公共文档、发布产物和贡献者工作流。">
+<title>ARLE(1) — runtime-first Rust workspace</title>
+<meta name="description" content="ARLE 是以 runtime 为主干的 Rust workspace，覆盖 serving、本地 agent、训练、评测与数据集工具。">
 <meta name="color-scheme" content="light">
-<meta property="og:title" content="ARLE — agent reinforcement learning engine">
-<meta property="og:description" content="同一套 workspace 里收口 serving、agent runtime、训练 / 评测与公共文档。">
+<meta property="og:title" content="ARLE — runtime-first Rust workspace">
+<meta property="og:description" content="同一套 Rust workspace 里收口 infer serving、arle 前门、训练 / 评测、数据集工具与公共文档。">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://cklxx.github.io/arle/zh-CN.html">
 <link rel="canonical" href="https://cklxx.github.io/arle/zh-CN.html">
@@ -26,20 +26,22 @@
 </header>
 
 <section class="hero" aria-label="banner">
-<h1 class="sr-only">ARLE(1) — agent reinforcement learning engine</h1>
+<h1 class="sr-only">ARLE(1) — runtime-first Rust workspace</h1>
 <pre class="ascii" aria-hidden="true">
-<span class="ascii-art"> ██████  ██████  ██      ███████
-██    ██ ██   ██ ██      ██
-████████ ██████  ██      █████
-██    ██ ██   ██ ██      ██
-██    ██ ██   ██ ███████ ███████</span>
+<span class="ascii-art"> █████╗ ██████╗ ██╗     ███████╗
+██╔══██╗██╔══██╗██║     ██╔════╝
+███████║██████╔╝██║     █████╗
+██╔══██║██╔══██╗██║     ██╔══╝
+██║  ██║██║  ██║███████╗███████╗
+╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝</span>
 </pre>
 <p class="tagline">
-  Rust-native 的 <span class="hl">inference runtime</span>，
-  本地 agent、训练、评测与文档入口都收口在同一套 workspace 里。
+  一套运行时权威。<span class="hl">infer</span> 负责 OpenAI 兼容 serving；
+  <span class="hl">arle</span> 负责本地 agent、训练、评测与数据工作流前门。
 </p>
 <nav class="jumps" aria-label="sections">
   <a href="#synopsis">[概要]</a>
+  <a href="#surfaces">[入口面]</a>
   <a href="#status">[状态]</a>
   <a href="#quickstart">[快速开始]</a>
   <a href="#docs">[文档]</a>
@@ -52,32 +54,46 @@
 <section id="name">
 <h2>名称</h2>
 <p class="block">
-  <b>ARLE</b> — 以 Rust-native inference runtime 为主干，并在其上集成本地
-  agent、训练与评测工作流。CUDA 是主部署路径；Metal 和 CPU 冒烟路径与
-  serving 共用同一套 workspace、模型代码和工具链。
+  <b>ARLE</b> — 以 runtime 为主干的 Rust workspace。<code>infer</code>
+  是专门的 serving 二进制；<code>arle</code> 是本地 agent、训练、评测与
+  数据工作的统一前门。
 </p>
 <p class="note">
-  这个站点现在只保留稳定入口职责。更细的产品事实，请直接看下面列出的仓库文档。
+  这个页面只保留稳定入口职责；更细的产品真相请直接看下面列出的仓库文档。
 </p>
 </section>
 
 <section id="synopsis">
 <h2>概要</h2>
-<pre class="cmd"><span class="p">$</span> docker run --gpus all -v /path/to/Qwen3-4B:/model \
-    ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
-<span class="p">$</span> cargo build -p infer --release
+<pre class="cmd"><span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
-<span class="p">$</span> cargo build -p agent-infer --release --features cli --bin arle
-<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B --max-turns 10<span class="caret"></span></pre>
+<span class="p">$</span> cargo build --release --features cli --bin arle
+<span class="p">$</span> ./target/release/arle --doctor
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B run --prompt <i>"总结一下这个仓库"</i>
+<span class="p">$</span> ./target/release/arle train env
+<span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span></pre>
+</section>
+
+<section id="surfaces">
+<h2>入口面</h2>
+<table class="why">
+  <tbody>
+    <tr><td class="cap"><code>infer</code></td><td>OpenAI 兼容 HTTP serving、metrics、stats 与 session 接口都收口在运行时的标准服务面上。</td></tr>
+    <tr><td class="cap"><code>arle run</code></td><td>交互式 REPL 与一次性 prompt 执行，共用同一套 Rust 运行时权威，直接面向本地 agent 工作流。</td></tr>
+    <tr><td class="cap"><code>arle train</code></td><td>Pretrain、SFT、GRPO、多轮 RL 与 eval 共用一张前门，不再依赖分散的训练二进制。</td></tr>
+    <tr><td class="cap"><code>arle data</code></td><td>数据集下载与 schema 转换工具，和同一套 workspace、版本、文档一起演进。</td></tr>
+  </tbody>
+</table>
 </section>
 
 <section id="status">
 <h2>状态</h2>
 <table class="why">
   <tbody>
-    <tr><td class="cap">CUDA</td><td>Linux + NVIDIA 上的稳定主 serving 路径。</td></tr>
-    <tr><td class="cap">Metal</td><td>Apple Silicon 上的 Beta 路径，带 live runtime、DFlash 与 MLX 桥接。</td></tr>
-    <tr><td class="cap">CPU</td><td>仅开发态冒烟路径，用于请求面验证，不是部署目标。</td></tr>
+    <tr><td class="cap">项目姿态</td><td>Runtime-first。<code>infer</code> 仍是主 serving 面；<code>arle</code> 在同一套运行时之上向 agent、train、eval、data 扩展。</td></tr>
+    <tr><td class="cap">后端</td><td>CUDA 是 Linux + NVIDIA 上的稳定主 serving 路径。Metal 在 Apple Silicon 上是 beta。CPU 仅用于开发态冒烟覆盖。</td></tr>
+    <tr><td class="cap">模型</td><td>当前已交付 Qwen3 与 Qwen3.5-4B。Llama 3 / 4 与 DeepSeek V3 / R1 仍是规划中，不做暗示性承诺。</td></tr>
+    <tr><td class="cap">HTTP</td><td><code>/v1/completions</code>、<code>/v1/chat/completions</code>、<code>/v1/models</code>、<code>/metrics</code> 与 <code>/v1/stats</code> 是稳定公共服务面。</td></tr>
     <tr><td class="cap">Benchmark</td><td>带日期的快照集中放在 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>；当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">当前 decode 对齐计划</a>。</td></tr>
   </tbody>
 </table>
@@ -86,21 +102,24 @@
 <section id="quickstart">
 <h2>快速开始</h2>
 
-<h3>&mdash; 源码构建</h3>
+<h3>&mdash; 本地 CLI 冒烟</h3>
 <pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/arle
 <span class="p">$</span> cd arle
 <span class="p">$</span> ./setup.sh
-<span class="p">$</span> cargo build -p infer --release
-<span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000</pre>
+<span class="p">$</span> cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
+<span class="p">$</span> ./target/release/arle --doctor
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B run --prompt <i>"用一句话打个招呼"</i>
+<span class="p">$</span> ./target/release/arle train env</pre>
 
-<h3>&mdash; API 冒烟</h3>
-<pre class="cmd"><span class="p">$</span> curl http://localhost:8000/v1/chat/completions \
+<h3>&mdash; Serving 冒烟</h3>
+<pre class="cmd"><span class="p">$</span> cargo build -p infer --release
+<span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
+<span class="p">$</span> curl http://127.0.0.1:8000/v1/chat/completions \
     -H <i>'Content-Type: application/json'</i> \
     -d <i>'{"messages":[{"role":"user","content":"你好"}],"max_tokens":64}'</i></pre>
 
 <p class="note">
-  请使用 <code>rust-toolchain.toml</code> 固定的 Rust 工具链。
-  <code>./setup.sh</code> 会引导 Rust、Python、Zig 和本地检查。
+  默认 CUDA CLI 用 <code>--features cli</code>，Apple Silicon 用 <code>metal,no-cuda,cli</code>，便携冒烟路径用 <code>cpu,no-cuda,cli</code>。<code>./setup.sh</code> 会引导 Rust、Python、Zig 和本地检查。
 </p>
 </section>
 
@@ -112,7 +131,8 @@
 <a href="https://github.com/cklxx/arle/blob/main/docs/http-api.md">/docs/http-api.md</a>              HTTP 契约 · 流式行为
 <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>        后端 / 模型 / 量化支持矩阵
 <a href="https://github.com/cklxx/arle/blob/main/docs/stability-policy.md">/docs/stability-policy.md</a>      稳定性分级 · 兼容性姿态
-<a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>               贡献者初始化 · 验证 · 发版要求
+<a href="https://github.com/cklxx/arle/blob/main/docs/compatibility.md">/docs/compatibility.md</a>         兼容性与废弃策略
+<a href="https://github.com/cklxx/arle/blob/main/docs/environment.md">/docs/environment.md</a>           环境变量与默认值
 <a href="https://github.com/cklxx/arle/blob/main/docs/index.md">/docs/index.md</a>                 维护者 PARA 索引
 <a href="https://github.com/cklxx/arle/releases">/releases</a>                      发版二进制 · 校验和
 </pre>
@@ -121,9 +141,9 @@
 <section id="see-also">
 <h2>另见</h2>
 <ul class="seealso">
-  <li><code>ghcr.io/cklxx/agent-infer:latest</code> &mdash; 当前已发布的容器镜像路径</li>
   <li><a href="https://github.com/cklxx/arle/blob/main/CHANGELOG.md">CHANGELOG.md</a> &mdash; 带日期的项目历史</li>
   <li><a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; 接下来的里程碑</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> &mdash; 贡献者初始化与验证门槛</li>
   <li><a href="https://github.com/cklxx/arle/blob/main/SECURITY.md">SECURITY.md</a> &mdash; 私有漏洞报告策略</li>
 </ul>
 <p class="note">
@@ -143,8 +163,8 @@
 
 <nav class="statusline" aria-label="快捷入口">
   <a class="sl-seg sl-mode" href="#">NOR</a>
-  <a class="sl-seg sl-accent" href="#name">arle/site</a>
-  <a class="sl-seg sl-ok" href="#docs"><span class="dot"></span> 公开文档</a>
+  <a class="sl-seg sl-accent" href="#name">arle/frontdoor</a>
+  <a class="sl-seg sl-ok" href="#status"><span class="dot"></span> runtime-first</a>
   <a class="sl-seg" href="./" hreflang="en">en</a>
   <a class="sl-seg" href="https://github.com/cklxx/arle">gh:cklxx/arle</a>
   <span class="sl-seg sl-spacer" aria-hidden="true"></span>

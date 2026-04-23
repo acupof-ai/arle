@@ -25,7 +25,7 @@
   --ch: 0.62ch; /* half a character-cell for box-drawing gutters */
   --fs: 15px;
   --lh: 1.55;
-  --col: 82ch; /* man pages are traditionally 80; we give 2ch of breathing */
+  --col: 84ch; /* keep the man-page feel but leave a little more room for the hero */
 }
 
 * { box-sizing: border-box; }
@@ -144,16 +144,16 @@ code      { font-family: inherit; color: var(--coral-dim); }
 /* ── hero ──────────────────────────────────────────────────────────── */
 
 .hero {
-  padding: 18px 0 10px;
+  padding: 20px 0 12px;
   margin-bottom: 8px;
   border-bottom: 1px dashed var(--ochre);
 }
 
 .ascii {
   margin: 0;
-  padding: 2px 0 8px;
-  font-size: 10px;
-  line-height: 1.02;
+  padding: 4px 0 10px;
+  font-size: 13px;
+  line-height: 0.88;
   color: var(--coral-dim);
   overflow-x: auto;
   letter-spacing: 0;
@@ -162,15 +162,17 @@ code      { font-family: inherit; color: var(--coral-dim); }
 }
 .ascii-art {
   display: inline-block;
-  transform: scaleX(1.85);
+  transform: scaleX(1.34);
   transform-origin: left top;
+  text-shadow: 1px 1px 0 rgba(217,119,87,0.12);
 }
 @media (min-width: 760px) {
-  .ascii { font-size: 11px; }
+  .ascii { font-size: 14px; }
 }
 
 .tagline {
-  margin: 8px 0 12px;
+  max-width: 68ch;
+  margin: 10px 0 14px;
   color: var(--ink-soft);
   font-size: 15px;
 }
@@ -330,7 +332,7 @@ table.why td {
 table.why td.cap {
   color: var(--coral-dim);
   white-space: nowrap;
-  width: 24ch;
+  width: 18ch;
   font-weight: 700;
 }
 
@@ -425,8 +427,14 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
 @media (max-width: 640px) {
   :root { --fs: 14px; }
   .page { padding: 18px 14px 18px; }
-  .ascii { font-size: 8px; }
-  .ascii-art { transform: scaleX(1.18); }
+  .ascii {
+    font-size: 7.2px;
+    line-height: 0.92;
+  }
+  .ascii-art {
+    transform: scaleX(1.02);
+    text-shadow: 1px 1px 0 rgba(217,119,87,0.08);
+  }
   .manhead-c, .manfoot-c { display: none; }
   pre.cmd, pre.tbl, pre.diagram, pre.files { font-size: 12px; }
   .statusline { font-size: 11px; }
