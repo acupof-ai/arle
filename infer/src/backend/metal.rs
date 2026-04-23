@@ -655,7 +655,7 @@ impl InferenceBackend for MetalBackend {
                         anyhow::bail!("Metal GGUF loading currently supports Qwen3.5 only");
                     }
                     MetalWeights::Qwen3(
-                        self::weights::load_qwen3_metal_weights(&resolved_path, &config)
+                        self::weights::load_qwen3_metal_weights(resolved_path, &config)
                             .with_context(|| "failed to load Qwen3 weights into Metal memory")?,
                     )
                 }
@@ -663,7 +663,7 @@ impl InferenceBackend for MetalBackend {
                     load_qwen35_metal_weights_from_gguf(gguf, &config)
                         .with_context(|| "failed to load Qwen3.5 GGUF weights into Metal memory")?
                 } else {
-                    load_qwen35_metal_weights(&resolved_path, &config)
+                    load_qwen35_metal_weights(resolved_path, &config)
                         .with_context(|| "failed to load Qwen3.5 weights into Metal memory")?
                 }),
             };
