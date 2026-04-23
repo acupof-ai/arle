@@ -54,6 +54,35 @@ Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model 
 | ... (sweep auto-steps) ... |
 | saturation | ... | ... | ... | ... | ... | ... |
 
+## Results — service-side KV / scheduler metrics
+
+| metric | value |
+|---|---:|
+| peak active | ... |
+| peak waiting | ... |
+| peak prefill_queue | ... |
+| peak kv_util | ... |
+| `prefix_hit_rate` | ... |
+| `prefix_skip_rate` | ... |
+| `kv_fetch_q` | ... |
+| `kv_fetch_waiters` | ... |
+| `kv_store_q` | ... |
+| `kv_store` | ... |
+| `kv_bp` | ... |
+| `tier_recall` | ... / n/a |
+| `tier_src` | ... / n/a |
+| `tier_promoted` | ... / n/a |
+| `tier_fallback` | ... / n/a |
+
+## Results — request accounting
+
+| metric | value |
+|---|---:|
+| completed input tokens | ... |
+| incomplete input tokens | ... |
+| completed output tokens | ... |
+| incomplete output tokens | ... |
+
 ## Problems
 
 - <anything that degraded, crashed, or deviated from the watch-list>
