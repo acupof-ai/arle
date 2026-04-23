@@ -15,8 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
-    AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, AgentTurnCallbacks,
-    ToolExecutor, ToolPolicy,
+    AgentSession, AgentSessionStats, AgentSettings, AgentTurnCallbacks, ToolExecutor, ToolPolicy,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
@@ -76,14 +75,23 @@ struct SessionStats {
     weighted_rate_numer: f64,
     /// Sum of elapsed seconds across turns (the /stats "wall time" row).
     total_secs: f64,
+    /// Number of tool calls executed during the session.
+    tool_calls: usize,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl SessionStats {
-    fn record_turn(&mut self, prompt_tokens: u64, completion_tokens: u64, elapsed: Duration) {
+    fn record_turn(
+        &mut self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls: usize,
+        elapsed: Duration,
+    ) {
         self.turn_count = self.turn_count.saturating_add(1);
         self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
         self.completion_tokens = self.completion_tokens.saturating_add(completion_tokens);
+        self.tool_calls = self.tool_calls.saturating_add(tool_calls);
         let secs = elapsed.as_secs_f64();
         self.total_secs += secs;
         if secs > f64::EPSILON {
@@ -160,11 +168,13 @@ impl ToolPolicy for BuiltinToolPolicy {
         &self,
         user_input: &str,
         last_tool_name: Option<&str>,
+        last_tool_result: Option<&str>,
         last_tool_scalar_result: Option<&str>,
     ) -> Option<String> {
         BuiltinToolPolicyHooks.finalize_after_tool_execution(
             user_input,
             last_tool_name,
+            last_tool_result,
             last_tool_scalar_result,
         )
     }
@@ -243,20 +253,12 @@ fn print_repl_banner(
     max_tokens: usize,
     temperature: f32,
 ) {
-    let tools_label = if tools.is_empty() {
-        "none".to_string()
-    } else {
-        tools
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     println!();
     println!("=== agent-infer REPL ===");
     println!("Model: {}", engine.model_id());
     println!("Backend: {}", backend_name);
-    println!("Tools: {tools_label}");
+    println!("Mode: agent");
+    println!("Tools available: {}", tools.len());
     println!(
         "Max turns: {}, Max tokens: {}, Temperature: {}",
         max_turns, max_tokens, temperature
@@ -582,7 +584,7 @@ fn run_agent_turn(
 ) {
     let start = Instant::now();
     let color_on = io::stdout().is_terminal();
-    let render_state = RefCell::new((false, false, false));
+    let render_state = RefCell::new((false, false));
     let mut tps_meter = crate::tps::TpsMeter::new();
     let mut on_text_chunk = |chunk: &str| {
         if chunk.is_empty() {
@@ -599,20 +601,6 @@ fn run_agent_turn(
         let _ = io::stdout().flush();
         tps_meter.record_chunk(chunk.len());
         state.1 = true;
-        state.2 = true;
-    };
-    let mut on_trace_event = |event: &AgentTraceEvent| {
-        let mut state = render_state.borrow_mut();
-        if color_on && state.0 {
-            print!("\x1b[0m");
-            let _ = io::stdout().flush();
-            state.0 = false;
-        }
-        if state.2 {
-            println!();
-            state.2 = false;
-        }
-        print_trace_event(event);
     };
     match session.run_turn_interruptibly_with_callbacks(
         engine,
@@ -628,16 +616,16 @@ fn run_agent_turn(
         cancel.as_ref(),
         AgentTurnCallbacks {
             on_text_chunk: Some(&mut on_text_chunk),
-            on_trace_event: Some(&mut on_trace_event),
+            on_trace_event: None,
         },
     ) {
         Ok(Some(result)) => {
-            let (color_open, streamed_any, streamed_line_open) = *render_state.borrow();
+            let (color_open, streamed_any) = *render_state.borrow();
             if color_on && color_open {
                 print!("\x1b[0m");
                 let _ = io::stdout().flush();
             }
-            if streamed_line_open {
+            if streamed_any {
                 println!();
             }
             if !streamed_any {
@@ -648,16 +636,21 @@ fn run_agent_turn(
             }
             let elapsed = start.elapsed();
             tps_meter.print_final(Some(result.completion_tokens));
-            session_stats.record_turn(result.prompt_tokens, result.completion_tokens, elapsed);
+            session_stats.record_turn(
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.tool_calls_executed,
+                elapsed,
+            );
             println!();
         }
         Ok(None) => {
-            let (color_open, _streamed_any, streamed_line_open) = *render_state.borrow();
+            let (color_open, streamed_any) = *render_state.borrow();
             if color_on && color_open {
                 print!("\x1b[0m");
                 let _ = io::stdout().flush();
             }
-            if streamed_line_open {
+            if streamed_any {
                 println!();
             }
             println!();
@@ -666,12 +659,12 @@ fn run_agent_turn(
             println!();
         }
         Err(e) => {
-            let (color_open, _streamed_any, streamed_line_open) = *render_state.borrow();
+            let (color_open, streamed_any) = *render_state.borrow();
             if color_on && color_open {
                 print!("\x1b[0m");
                 let _ = io::stdout().flush();
             }
-            if streamed_line_open {
+            if streamed_any {
                 println!();
             }
             eprintln!("\x1b[1;31mError: {e:#}\x1b[0m");
@@ -1081,34 +1074,6 @@ fn print_tools_help(tools: &[ToolDefinition]) {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn print_trace_event(event: &AgentTraceEvent) {
-    match event {
-        AgentTraceEvent::AssistantNote(content) => {
-            println!("\x1b[2m{}\x1b[0m", content);
-        }
-        AgentTraceEvent::ToolCall {
-            name,
-            arguments,
-            result,
-        } => {
-            println!();
-            println!(
-                "\x1b[33m[tool: {}]\x1b[0m {}",
-                name,
-                serde_json::to_string(arguments).unwrap_or_default()
-            );
-            let display_result = if result.len() > 500 {
-                format!("{}... ({} chars total)", &result[..500], result.len())
-            } else {
-                result.clone()
-            };
-            println!("\x1b[36m{}\x1b[0m", display_result);
-            println!();
-        }
-    }
-}
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn print_session_stats(
     model_id: &str,
@@ -1131,11 +1096,10 @@ fn print_session_stats(
     println!("  messages:    {}", agent_stats.conversation_messages);
     println!("  users:       {}", agent_stats.user_messages);
     println!("  assistants:  {}", agent_stats.assistant_messages);
-    println!("  tool results:{}", agent_stats.tool_messages);
-    println!("  tool calls:  {}", agent_stats.tool_calls);
     println!("  chars:       {}", agent_stats.content_chars);
     println!("Runtime:");
     println!("  tools: {}", tool_count);
+    println!("  tool calls: {}", session.tool_calls);
     println!("  max turns: {}", max_turns);
     println!("  max tokens: {}", max_tokens);
     println!("  temperature: {}", temperature);

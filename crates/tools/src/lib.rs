@@ -440,6 +440,13 @@ impl BuiltinToolPolicyHooks {
             ));
         }
 
+        if tool_available(tools, "shell") && asks_for_repository_overview(user_input) {
+            return Some(single_tool_response(
+                "shell",
+                json!({ "command": default_repository_overview_command() }),
+            ));
+        }
+
         None
     }
 
@@ -510,9 +517,17 @@ impl BuiltinToolPolicyHooks {
     pub fn finalize_after_tool_execution(
         &self,
         user_input: &str,
-        _last_tool_name: Option<&str>,
+        last_tool_name: Option<&str>,
+        last_tool_result: Option<&str>,
         last_tool_scalar_result: Option<&str>,
     ) -> Option<String> {
+        if last_tool_name == Some("shell")
+            && asks_for_file_listing(user_input)
+            && let Some(result) = last_tool_result
+        {
+            return Some(result.to_string());
+        }
+
         if asks_for_exact_scalar_output(user_input)
             && let Some(result) = last_tool_scalar_result
         {
@@ -576,6 +591,34 @@ fn asks_for_file_listing(text: &str) -> bool {
         .any(|needle| text.contains(needle))
 }
 
+fn asks_for_repository_overview(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "look at this repo",
+        "look at the repo",
+        "inspect this repo",
+        "inspect the repo",
+        "inspect the repository",
+        "look at the repository",
+        "look at the codebase",
+        "inspect the codebase",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || [
+            "看看本地仓库",
+            "看看仓库",
+            "看下仓库",
+            "检查仓库",
+            "看看代码仓库",
+            "看看这个仓库",
+            "看看代码库",
+            "看看本地代码",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
 #[cfg(target_os = "windows")]
 fn default_directory_listing_command() -> &'static str {
     "cd && dir /a"
@@ -584,6 +627,16 @@ fn default_directory_listing_command() -> &'static str {
 #[cfg(not(target_os = "windows"))]
 fn default_directory_listing_command() -> &'static str {
     "pwd && ls -la"
+}
+
+#[cfg(target_os = "windows")]
+fn default_repository_overview_command() -> &'static str {
+    "cd && dir /a /s /b"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_repository_overview_command() -> &'static str {
+    "pwd && if command -v rg >/dev/null 2>&1; then rg --files --hidden -g '!.git' | sed -n '1,200p'; else find . -type f -not -path '*/.git/*' | sed -n '1,200p'; fi"
 }
 
 fn extract_python_code(text: &str) -> Option<String> {
@@ -986,9 +1039,10 @@ mod tests {
         let shell_result = BuiltinToolPolicyHooks.finalize_after_tool_execution(
             "本地有哪些文件",
             Some("shell"),
+            Some("file-a\nfile-b"),
             Some("ignored"),
         );
-        assert_eq!(shell_result, None);
+        assert_eq!(shell_result, Some("file-a\nfile-b".to_string()));
 
         let tool_call = BuiltinToolPolicyHooks
             .recover_tool_calls_from_draft(
@@ -1018,5 +1072,26 @@ mod tests {
         );
 
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn builtin_policy_recovers_repo_overview_request() {
+        let tools = builtin_tools()
+            .into_iter()
+            .map(|tool| tool.to_definition())
+            .collect::<Vec<_>>();
+
+        let parsed = BuiltinToolPolicyHooks
+            .recover_tool_calls_from_user_request("你看看本地仓库", &tools)
+            .expect("recover repo overview tool call");
+
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert!(
+            parsed.tool_calls[0].arguments["command"]
+                .as_str()
+                .expect("shell command")
+                .contains("pwd")
+        );
     }
 }
