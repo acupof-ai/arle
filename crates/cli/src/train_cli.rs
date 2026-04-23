@@ -146,7 +146,9 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
                 if let Some(model_dir) = &report.servable_model_dir {
                     println!("model {}", model_dir);
                 } else {
-                    println!("note pass --keep-artifacts or --out-dir to keep the final checkpoint");
+                    println!(
+                        "note pass --keep-artifacts or --out-dir to keep the final checkpoint"
+                    );
                 }
                 for step in &report.steps {
                     println!("{} {}", step.name, step.status);
