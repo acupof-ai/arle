@@ -16,10 +16,10 @@ use train::{
 
 use crate::{
     args::{
-        BackendArg, CliCommand, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs,
-        DatasetFormatArg, ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg, TrainArgs,
-        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs,
-        TrainMultiTurnArgs, TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
+        BackendArg, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs, DatasetFormatArg,
+        ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg, TrainArgs, TrainCommand,
+        TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs, TrainMultiTurnArgs,
+        TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
 };
@@ -59,14 +59,7 @@ const TRAIN_ENV_COMMANDS: &[&str] = &[
     "data convert",
 ];
 
-pub(crate) fn run(command: CliCommand) -> ExitCode {
-    match command {
-        CliCommand::Train(train) => run_train(*train),
-        CliCommand::Data(data) => run_data(*data),
-    }
-}
-
-fn run_train(train: TrainArgs) -> ExitCode {
+pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
     match train.command {
         TrainCommand::Env(args) => exit_from_result(run_train_env(args)),
         TrainCommand::Test(args) => run_train_test(args),
@@ -79,7 +72,7 @@ fn run_train(train: TrainArgs) -> ExitCode {
     }
 }
 
-fn run_data(data: DataArgs) -> ExitCode {
+pub(crate) fn run_data(data: DataArgs) -> ExitCode {
     match data.command {
         DataCommand::Download(args) => run_data_download(args),
         DataCommand::Convert(args) => run_data_convert(args),

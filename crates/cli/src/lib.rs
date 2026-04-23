@@ -26,19 +26,29 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
-use args::Args;
+use args::{Args, CliCommand, RunArgs};
 use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
 
 pub fn run() -> ExitCode {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    let command = args.command.take();
 
-    if let Some(command) = args.command {
-        return train_cli::run(command);
+    match command {
+        Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
+        Some(CliCommand::Data(command)) => return train_cli::run_data(*command),
+        Some(CliCommand::Run(run_args)) => match run_impl(args, Some(*run_args)) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("[ARLE] error: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {}
     }
 
-    match run_impl(args) {
+    match run_impl(args, None) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("[ARLE] error: {err:#}");
@@ -47,7 +57,10 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn run_impl(args: Args) -> Result<()> {
+fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
+    let _ = &run_args;
+
     if args.doctor {
         doctor::run(&args)?;
         return Ok(());
@@ -130,13 +143,23 @@ fn run_impl(args: Args) -> Result<()> {
             welcome::print_welcome_banner(engine.model_id());
         }
 
-        repl::run_repl(
-            &mut engine,
-            &backend_name,
-            args.max_turns,
-            args.max_tokens,
-            args.temperature,
-        )?;
+        match run_args {
+            Some(run_args) if run_args.prompt.is_some() || run_args.stdin => repl::run_one_shot(
+                &mut engine,
+                &backend_name,
+                args.max_turns,
+                args.max_tokens,
+                args.temperature,
+                &run_args,
+            )?,
+            _ => repl::run_repl(
+                &mut engine,
+                &backend_name,
+                args.max_turns,
+                args.max_tokens,
+                args.temperature,
+            )?,
+        }
 
         Ok(())
     }

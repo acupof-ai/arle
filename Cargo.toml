@@ -74,6 +74,7 @@ cli = { path = "crates/cli", default-features = false, optional = true }
 
 [dev-dependencies]
 infer = { path = "infer", default-features = false }
+serde_json = { workspace = true }
 
 [[bin]]
 name = "arle"
