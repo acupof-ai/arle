@@ -1,4 +1,4 @@
-use super::budget::{PageBudget, full_request_target};
+use super::budget::{PageBudget, estimated_request_target};
 use super::core::PrefetchTicketState;
 use super::core::{is_full_sealed_prefix, sealed_block_token_count};
 use super::{
@@ -270,7 +270,7 @@ impl<M: ModelForward> Scheduler<M> {
         max_tokens: usize,
         reserved_prefix_tokens: usize,
     ) -> bool {
-        budget.can_fit_target(full_request_target(
+        budget.can_fit_target(estimated_request_target(
             slot_idx,
             prompt_tokens,
             max_tokens,
@@ -455,19 +455,23 @@ impl<M: ModelForward> Scheduler<M> {
     fn collect_admission_candidates(
         &mut self,
         free_slots: &[usize],
-        length_contract: RequestLengthContract,
     ) -> Vec<QueuedAdmissionCandidate> {
         let mut candidates = Vec::new();
         let scan_len = self.waiting.len();
         for _ in 0..scan_len {
-            let Some(incoming) = self.waiting.pop_front() else {
+            let Some(mut incoming) = self.waiting.pop_front() else {
                 break;
             };
-            let Some((incoming, prompt_tokens)) =
-                self.normalize_waiting_request(incoming, length_contract)
-            else {
+            let Some(prompt_tokens) = incoming.prompt_tokens.take() else {
+                error!("Waiting request missing normalized prompt tokens, rejecting");
+                finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
                 continue;
             };
+            if prompt_tokens.is_empty() {
+                error!("Waiting request has empty normalized prompt tokens, rejecting");
+                finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
+                continue;
+            }
             let plan = self.build_prefix_admission_plan(&prompt_tokens, free_slots);
             candidates.push(QueuedAdmissionCandidate {
                 incoming,
@@ -1302,9 +1306,19 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn drain_request_rx(&mut self) {
+        let length_contract = RequestLengthContract::derive(
+            self.paged_kv_pool.max_total_tokens,
+            self.effective_max_seq_len,
+        );
         while let Ok(req) = self.request_rx.try_recv() {
             self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-            self.enqueue_waiting_request(req, WaitingInsertBias::AfterEqual);
+            let Some((mut incoming, prompt_tokens)) =
+                self.normalize_waiting_request(req, length_contract)
+            else {
+                continue;
+            };
+            incoming.prompt_tokens = Some(prompt_tokens);
+            self.enqueue_waiting_request(incoming, WaitingInsertBias::AfterEqual);
         }
     }
 
@@ -1317,47 +1331,22 @@ impl<M: ModelForward> Scheduler<M> {
         self.drain_request_rx();
     }
 
-    pub(super) fn wait_for_emit_gates(&mut self) -> u128 {
-        if self.emit_gate_waiting.is_empty() {
-            return 0;
-        }
-
-        let wait_t = std::time::Instant::now();
-        while !self.emit_gate_waiting.is_empty() {
+    fn wait_for_coordinator_or_request(&mut self) -> bool {
+        if !self.wakeup_live {
             crossbeam_channel::select! {
-                recv(self.emit_events) -> event => {
-                    match event {
-                        Ok(event) => self.handle_emit_event(event),
-                        Err(err) => panic!("emit event channel disconnected: {err}"),
-                    }
-                }
                 recv(self.coordinator_events) -> event => {
                     match event {
                         Ok(event) => self.handle_coordinator_event(event),
                         Err(_) => error!("Coordinator event channel disconnected"),
                     }
                 }
-                recv(self.wakeup_rx) -> wakeup => {
-                    match wakeup {
-                        Ok(()) => {
-                            self.drain_request_rx();
-                            self.drain_wakeup_rx();
-                        }
-                        Err(_) => self.handle_wakeup_disconnect(),
+                recv(self.emit_events) -> event => {
+                    match event {
+                        Ok(event) => self.handle_emit_event(event),
+                        Err(err) => panic!("emit event channel disconnected: {err}"),
                     }
                 }
             }
-        }
-        wait_t.elapsed().as_micros()
-    }
-
-    fn wait_for_coordinator_or_request(&mut self) -> bool {
-        if !self.wakeup_live {
-            if let Ok(event) = self.coordinator_events.recv() {
-                self.handle_coordinator_event(event);
-                return true;
-            }
-            error!("Coordinator event channel disconnected");
             return true;
         }
 
@@ -1366,6 +1355,13 @@ impl<M: ModelForward> Scheduler<M> {
                 match event {
                     Ok(event) => self.handle_coordinator_event(event),
                     Err(_) => error!("Coordinator event channel disconnected"),
+                }
+                true
+            }
+            recv(self.emit_events) -> event => {
+                match event {
+                    Ok(event) => self.handle_emit_event(event),
+                    Err(err) => panic!("emit event channel disconnected: {err}"),
                 }
                 true
             }
@@ -1384,6 +1380,15 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn wait_for_wakeup(&mut self) -> bool {
         if self.is_fetch_wait_bound() {
+            return self.wait_for_coordinator_or_request();
+        }
+
+        if self.waiting.is_empty()
+            && self.prefill_queue.is_empty()
+            && !self.has_pending_gpu_work()
+            && !self.emit_gate_waiting.is_empty()
+            && !self.has_runnable_decode_work()
+        {
             return self.wait_for_coordinator_or_request();
         }
 
@@ -1496,14 +1501,10 @@ impl<M: ModelForward> Scheduler<M> {
         if self.waiting.is_empty() {
             return;
         }
-        let length_contract = RequestLengthContract::derive(
-            self.paged_kv_pool.max_total_tokens,
-            self.effective_max_seq_len,
-        );
         let _ = self.evict_prefix_cache_if_pressured();
         let mut available_free_slots = self.free_slots();
 
-        let candidates = self.collect_admission_candidates(&available_free_slots, length_contract);
+        let candidates = self.collect_admission_candidates(&available_free_slots);
         let mut deferred_waiting = std::collections::VecDeque::new();
         let mut admission_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
         for (slot_idx, req) in self.active.iter().enumerate() {
@@ -1513,7 +1514,7 @@ impl<M: ModelForward> Scheduler<M> {
             if req.delta_tx.is_closed() || matches!(req.phase, Phase::Finished) {
                 continue;
             }
-            admission_budget.reserve_target(full_request_target(
+            admission_budget.reserve_target(estimated_request_target(
                 slot_idx,
                 req.prompt_tokens.len(),
                 req.max_tokens,
@@ -1566,7 +1567,7 @@ impl<M: ModelForward> Scheduler<M> {
             {
                 self.release_admission_plan(&candidate.plan);
             }
-            admission_budget.reserve_target(full_request_target(
+            admission_budget.reserve_target(estimated_request_target(
                 slot_idx,
                 candidate.prompt_tokens.len(),
                 candidate.incoming.max_tokens,
@@ -1688,7 +1689,7 @@ mod tests {
     };
     use crate::kv_tier::{HostPinnedRegion, ReadmissionBlock, ReadmissionPlan, ReadmissionSource};
     use crate::prefix_cache::BlockId;
-    use crate::scheduler::cuda::budget::{PageBudget, full_request_target};
+    use crate::scheduler::cuda::budget::{PageBudget, estimated_request_target};
     use crate::scheduler::cuda::core::is_full_sealed_prefix;
     use crate::scheduler::{IncomingRequest, RequestPriority};
     use crate::server_engine::FinishReason;
@@ -2016,11 +2017,11 @@ mod tests {
     fn admission_budget_accounts_for_prior_reservations_in_same_pass() {
         let mut budget = PageBudget::new(3, vec![0, 0], 4, true);
 
-        assert!(budget.can_fit_target(full_request_target(0, 8, 4, 0)));
-        budget.reserve_target(full_request_target(0, 8, 4, 0));
+        assert!(budget.can_fit_target(estimated_request_target(0, 8, 4, 0)));
+        budget.reserve_target(estimated_request_target(0, 8, 4, 0));
 
         assert!(
-            !budget.can_fit_target(full_request_target(1, 8, 8, 0)),
+            !budget.can_fit_target(estimated_request_target(1, 8, 8, 0)),
             "later admissions must see pages reserved by earlier ones in the same assign pass",
         );
     }
@@ -2029,27 +2030,27 @@ mod tests {
     fn admission_budget_honors_attached_prefix_as_existing_seq() {
         let mut budget = PageBudget::new(1, vec![0], 4, true);
 
-        assert!(budget.can_fit_target(full_request_target(0, 4, 4, 4)));
-        budget.reserve_target(full_request_target(0, 4, 4, 4));
+        assert!(budget.can_fit_target(estimated_request_target(0, 4, 4, 4)));
+        budget.reserve_target(estimated_request_target(0, 4, 4, 4));
         assert_eq!(budget.remaining_free_pages(), 0);
         assert_eq!(budget.planned_seq_len(0), 8);
     }
 
     #[test]
-    fn admission_budget_keeps_full_request_headroom_for_active_slots() {
+    fn admission_budget_keeps_estimated_request_headroom_for_active_slots() {
         let mut budget = PageBudget::new(2, vec![4, 0], 4, true);
 
-        // An already-admitted slot with a 4-token prompt and 4-token decode
-        // tail must keep the extra decode page reserved across scheduler
-        // iterations; new admissions cannot borrow it away.
-        budget.reserve_target(full_request_target(0, 4, 4, 0));
+        // An already-admitted slot must keep its estimated decode tail
+        // reserved across scheduler iterations; new admissions cannot borrow
+        // it away.
+        budget.reserve_target(estimated_request_target(0, 4, 4, 0));
         assert_eq!(budget.remaining_free_pages(), 1);
 
         assert!(
-            !budget.can_fit_target(full_request_target(1, 4, 4, 0)),
-            "later admissions must respect full-request headroom held by active slots",
+            !budget.can_fit_target(estimated_request_target(1, 4, 4, 0)),
+            "later admissions must respect estimated headroom held by active slots",
         );
-        assert!(budget.can_fit_target(full_request_target(1, 4, 0, 0)));
+        assert!(budget.can_fit_target(estimated_request_target(1, 4, 0, 0)));
     }
 
     #[test]
