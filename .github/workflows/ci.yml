@@ -69,6 +69,12 @@ jobs:
       - name: cargo test (Metal ARLE smoke path)
         run: cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_smoke
 
+      - name: cargo test (Metal ARLE tiny fixture live path)
+        run: >
+          cargo test -p agent-infer --release
+          --no-default-features --features metal,no-cuda,cli
+          --test cli_tiny_fixture_live -- --test-threads 1
+
   # ── Linux: CPU-only (no CUDA, no Metal) ─────────────────────────────────────
   check:
     name: Check
