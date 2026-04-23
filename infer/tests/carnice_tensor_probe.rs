@@ -50,8 +50,8 @@ fn probe_q4k_superblock() {
         mn[i] = scales_raw[i + 4] & 0x3F;
     }
     for i in 0..4 {
-        sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
-        mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
+        sc[4 + i] = (scales_raw[8 + i] & 0x0F) | ((scales_raw[i] >> 6) << 4);
+        mn[4 + i] = (scales_raw[8 + i] >> 4) | ((scales_raw[i + 4] >> 6) << 4);
     }
     println!("sub_scales={sc:?}  sub_mins={mn:?}");
 

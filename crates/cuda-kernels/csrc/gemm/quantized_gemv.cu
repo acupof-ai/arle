@@ -813,8 +813,8 @@ __device__ __forceinline__ void q4k_decode_scales(
     }
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        sc[4 + i] = (scales_raw[i]     >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
-        mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4)   << 2);
+        sc[4 + i] = (scales_raw[8 + i] & 0x0F) | ((scales_raw[i]     >> 6) << 4);
+        mn[4 + i] = (scales_raw[8 + i] >> 4)   | ((scales_raw[i + 4] >> 6) << 4);
     }
 }
 
