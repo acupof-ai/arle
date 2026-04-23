@@ -27,17 +27,10 @@
 
 <section class="hero" aria-label="banner">
 <h1 class="sr-only">ARLE(1) — agent reinforcement learning engine</h1>
-<pre class="ascii" aria-hidden="true">
- █████╗  ██████╗ ███████╗███╗   ██╗████████╗       ██╗███╗   ██╗███████╗███████╗██████╗
-██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝       ██║████╗  ██║██╔════╝██╔════╝██╔══██╗
-███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║    ─●─   ██║██╔██╗ ██║█████╗  █████╗  ██████╔╝
-██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║          ██║██║╚██╗██║██╔══╝  ██╔══╝  ██╔══██╗
-██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║          ██║██║ ╚████║██║     ███████╗██║  ██║
-╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝          ╚═╝╚═╝  ╚═══╝╚═╝     ╚══════╝╚═╝  ╚═╝
-</pre>
+<p class="wordmark" aria-hidden="true">ARLE</p>
 <p class="tagline">
-  pure-Rust <span class="hl">agent reinforcement learning engine</span>:
-  serving, agent runtime, train/eval, and docs in one workspace.
+  Rust-native <span class="hl">inference runtime</span> with integrated local
+  agent, train, eval, and docs surfaces.
 </p>
 <nav class="jumps" aria-label="sections">
   <a href="#synopsis">[synopsis]</a>
@@ -53,9 +46,9 @@
 <section id="name">
 <h2>NAME</h2>
 <p class="block">
-  <b>ARLE</b> — the pure-Rust agent reinforcement learning engine.
-  CUDA is the primary serving path; Metal and CPU smoke paths share the same
-  workspace, model code, and tooling surface.
+  <b>ARLE</b> — a Rust-native inference runtime with integrated local agent,
+  train, and eval workflows. CUDA is the primary serving path; Metal and CPU
+  smoke paths share the same workspace, model code, and tooling surface.
 </p>
 <p class="note">
   This site is intentionally a stable landing page. Detailed product facts live
@@ -80,7 +73,7 @@
     <tr><td class="cap">CUDA</td><td>Stable primary serving path on Linux + NVIDIA.</td></tr>
     <tr><td class="cap">Metal</td><td>Beta Apple Silicon path with live runtime, DFlash, and the MLX bridge.</td></tr>
     <tr><td class="cap">CPU</td><td>Development-only smoke path for request-surface validation.</td></tr>
-    <tr><td class="cap">Bench claims</td><td>Dated snapshots live under <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-22-sglang-gap-closure-execution.md">the current execution plan</a>.</td></tr>
+    <tr><td class="cap">Bench claims</td><td>Dated snapshots live under <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">the current decode-alignment plan</a>.</td></tr>
   </tbody>
 </table>
 </section>
@@ -112,6 +105,7 @@
 <a href="https://github.com/cklxx/arle/blob/main/README.md">/README.md</a>                         public overview · install · CLI · architecture
 <a href="https://github.com/cklxx/arle/blob/main/docs/http-api.md">/docs/http-api.md</a>                HTTP contract · streaming behavior
 <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>          backend / model / quant support
+<a href="https://github.com/cklxx/arle/blob/main/docs/stability-policy.md">/docs/stability-policy.md</a>        stability levels · compatibility posture
 <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>                 contributor setup · validation · release expectations
 <a href="https://github.com/cklxx/arle/blob/main/docs/index.md">/docs/index.md</a>                   maintainer-facing PARA index
 <a href="https://github.com/cklxx/arle/releases">/releases</a>                        tagged binaries · checksums
