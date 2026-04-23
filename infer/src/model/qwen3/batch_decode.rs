@@ -80,6 +80,7 @@ pub struct BatchDecodeBuffers {
 
     /// Max batch size this buffer set was allocated for.
     max_batch_size: usize,
+    max_total_pages: usize,
 
     /// CUDA Graph cache: index = batch_size - 1. Vec avoids HashMap overhead.
     graph_cache: Vec<Option<CudaGraph>>,
@@ -110,6 +111,7 @@ pub(crate) struct MixedBatchBuffers {
     token_ids_gpu: CudaSlice<i32>,
     metadata: FlashInferDecodeMetadata,
     max_tokens: usize,
+    max_total_pages: usize,
 }
 
 unsafe impl Send for MixedBatchBuffers {}
@@ -150,6 +152,7 @@ impl MixedBatchBuffers {
                 model.config.num_attention_heads,
             )?,
             max_tokens,
+            max_total_pages,
         })
     }
 
@@ -289,6 +292,7 @@ impl BatchDecodeBuffers {
                 .map_err(|e| anyhow::anyhow!("Alloc quantized_kv_meta failed: {e}"))?,
 
             max_batch_size,
+            max_total_pages,
             graph_cache: (0..max_batch_size).map(|_| None).collect(),
             mixed: None,
         })
@@ -314,22 +318,17 @@ impl BatchDecodeBuffers {
     fn ensure_mixed_buffers(
         &mut self,
         model: &Qwen3Model,
-        kv_pool: &PagedKVPool,
         min_total_tokens: usize,
     ) -> Result<&mut MixedBatchBuffers> {
-        let needs_realloc = self
-            .mixed
-            .as_ref()
-            .map_or(true, |mixed| mixed.max_tokens < min_total_tokens);
+        let needs_realloc = self.mixed.as_ref().map_or(true, |mixed| {
+            mixed.max_tokens < min_total_tokens || mixed.max_total_pages < self.max_total_pages
+        });
         if needs_realloc {
-            let max_total_pages = kv_pool
-                .max_total_pages
-                .saturating_add(min_total_tokens.max(1));
             self.mixed = Some(MixedBatchBuffers::new(
                 &model.ctx,
                 model,
                 min_total_tokens.max(self.max_batch_size),
-                max_total_pages,
+                self.max_total_pages,
             )?);
         }
         Ok(self.mixed.as_mut().expect("mixed buffers allocated"))
@@ -457,7 +456,7 @@ impl Qwen3Model {
         );
 
         let total_tokens = b + c;
-        let mixed = bufs.ensure_mixed_buffers(self, paged_kv_pool, total_tokens)?;
+        let mixed = bufs.ensure_mixed_buffers(self, total_tokens)?;
         mixed.set_seq_len(total_tokens);
 
         paged_kv_pool.alloc_tokens(batch.prefill.slot_idx, c)?;

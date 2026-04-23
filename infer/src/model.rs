@@ -45,6 +45,19 @@ pub struct MixedBatchRequest<'a> {
     pub prefill_start_pos: usize,
 }
 
+pub(crate) fn decode_metadata_page_capacity(
+    max_batch_size: usize,
+    max_seq_len: Option<usize>,
+    page_size: usize,
+    fallback_max_total_pages: usize,
+) -> usize {
+    max_seq_len.map_or(fallback_max_total_pages.max(1), |max_seq_len| {
+        max_batch_size
+            .max(1)
+            .saturating_mul(max_seq_len.div_ceil(page_size.max(1)).max(1))
+    })
+}
+
 pub(crate) fn prepare_paged_prefill_batch(
     requests: &[PrefillBatchRequest<'_>],
     pool: &mut PagedKVPool,
@@ -215,6 +228,7 @@ pub trait ModelForward: Send {
     fn create_decode_context(
         &self,
         max_batch_size: usize,
+        max_seq_len: Option<usize>,
         pool: &PagedKVPool,
     ) -> Result<Self::DecodeContext>;
 
@@ -452,6 +466,8 @@ pub trait ModelForward: Send {
         &self,
         _max_batch_size: usize,
         _prefill_budget_tokens: usize,
+        _max_seq_len: Option<usize>,
+        _kv_pool_format: kv_cache::KVFormat,
     ) -> usize {
         0
     }
@@ -529,8 +545,9 @@ pub trait ModelForward: Send {
         Ok(())
     }
 
-    /// Whether this model has a validated mixed decode + prefill path.
-    fn supports_mixed_batch(&self) -> bool {
+    /// Whether this model has a validated mixed decode + prefill path for the
+    /// current paged-KV format.
+    fn supports_mixed_batch(&self, _kv_pool_format: kv_cache::KVFormat) -> bool {
         false
     }
 

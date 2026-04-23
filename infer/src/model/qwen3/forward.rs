@@ -8,7 +8,7 @@ use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
     GenerationState, MixedBatchRequest, ModelForward, PrefillBatchRequest,
-    prepare_paged_prefill_batch,
+    decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
 use crate::ops;
 use crate::sampler::SamplingParams;
@@ -98,6 +98,7 @@ impl ModelForward for Qwen3Model {
     fn create_decode_context(
         &self,
         max_batch_size: usize,
+        max_seq_len: Option<usize>,
         pool: &PagedKVPool,
     ) -> Result<Self::DecodeContext> {
         let num_heads = self.config.num_attention_heads;
@@ -106,7 +107,12 @@ impl ModelForward for Qwen3Model {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let inter_dim = self.config.intermediate_size;
-        let max_pages = pool.max_total_pages.saturating_mul(max_batch_size.max(1));
+        let max_pages = decode_metadata_page_capacity(
+            max_batch_size,
+            max_seq_len,
+            pool.page_size,
+            pool.max_total_pages,
+        );
         super::batch_decode::BatchDecodeBuffers::new(
             &self.ctx,
             self.config.hidden_size,
@@ -132,11 +138,23 @@ impl ModelForward for Qwen3Model {
         &self,
         max_batch_size: usize,
         prefill_budget_tokens: usize,
+        max_seq_len: Option<usize>,
+        kv_pool_format: crate::model::kv_cache::KVFormat,
     ) -> usize {
         let prefill_budget_tokens = prefill_budget_tokens.max(1);
         let num_heads = self.config.num_attention_heads;
         let q_dim = num_heads * self.config.head_dim;
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
+        let page_size = kv_pool_format.default_page_size().max(1);
+        let fallback_max_total_pages = max_batch_size
+            .max(1)
+            .saturating_mul(prefill_budget_tokens.div_ceil(page_size).max(1));
+        let metadata_max_pages = decode_metadata_page_capacity(
+            max_batch_size,
+            max_seq_len,
+            page_size,
+            fallback_max_total_pages,
+        );
         let decode_context = super::batch_decode::BatchDecodeBuffers::device_bytes(
             self.config.hidden_size,
             q_dim,
@@ -144,23 +162,27 @@ impl ModelForward for Qwen3Model {
             self.config.intermediate_size,
             max_batch_size,
             num_heads,
-            1,
+            metadata_max_pages,
         );
         let decode_logits = super::batch_decode::BatchDecodeBuffers::logits_device_bytes(
             self.config.vocab_size,
             max_batch_size,
         );
-        let mixed_total_tokens = max_batch_size.saturating_add(prefill_budget_tokens);
-        let mixed_workspace = super::batch_decode::BatchDecodeBuffers::mixed_device_bytes(
-            self.config.hidden_size,
-            q_dim,
-            kv_dim,
-            self.config.intermediate_size,
-            self.config.vocab_size,
-            mixed_total_tokens.max(1),
-            num_heads,
-            mixed_total_tokens.max(1),
-        );
+        let mixed_workspace = if self.supports_mixed_batch(kv_pool_format) {
+            let mixed_total_tokens = max_batch_size.saturating_add(prefill_budget_tokens);
+            super::batch_decode::BatchDecodeBuffers::mixed_device_bytes(
+                self.config.hidden_size,
+                q_dim,
+                kv_dim,
+                self.config.intermediate_size,
+                self.config.vocab_size,
+                mixed_total_tokens.max(1),
+                num_heads,
+                metadata_max_pages,
+            )
+        } else {
+            0
+        };
 
         let prefill_activation_dims = 4usize
             .saturating_mul(self.config.hidden_size)
@@ -546,8 +568,10 @@ impl ModelForward for Qwen3Model {
         }
     }
 
-    fn supports_mixed_batch(&self) -> bool {
-        self.prefill_uses_paged_pool() && self.lora.is_none()
+    fn supports_mixed_batch(&self, kv_pool_format: crate::model::kv_cache::KVFormat) -> bool {
+        self.prefill_uses_paged_pool()
+            && self.lora.is_none()
+            && matches!(kv_pool_format, crate::model::kv_cache::KVFormat::BF16)
     }
 
     fn forward_mixed_batch(

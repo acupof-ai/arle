@@ -29,6 +29,7 @@ enum StepPlan {
     Idle,
     Decode,
     Prefill(Vec<PrefillCandidate>),
+    Split(Vec<PrefillCandidate>),
     Mixed(PrefillCandidate),
 }
 
@@ -38,6 +39,7 @@ impl StepPlan {
             Self::Idle => "idle",
             Self::Decode => "decode",
             Self::Prefill(_) => "prefill",
+            Self::Split(_) => "decode+prefill",
             Self::Mixed(_) => "mixed",
         }
     }
@@ -48,7 +50,7 @@ impl StepPlan {
 
     fn scheduled_prefill_rows(&self) -> u64 {
         match self {
-            Self::Prefill(candidates) => candidates.len() as u64,
+            Self::Prefill(candidates) | Self::Split(candidates) => candidates.len() as u64,
             Self::Mixed(_) => 1,
             Self::Idle | Self::Decode => 0,
         }
@@ -56,7 +58,7 @@ impl StepPlan {
 
     fn scheduled_prefill_tokens(&self) -> u64 {
         match self {
-            Self::Prefill(candidates) => candidates
+            Self::Prefill(candidates) | Self::Split(candidates) => candidates
                 .iter()
                 .map(|candidate| candidate.reservation.prefill_tokens as u64)
                 .sum(),
@@ -253,12 +255,15 @@ impl<M: ModelForward> Scheduler<M> {
         let scored_candidates = self.collect_prefill_candidates(&budget);
         let candidates = select_prefill_candidates(&mut budget, scored_candidates);
         if has_decode {
-            if self.model.supports_mixed_batch() {
-                if let Some(candidate) = candidates.into_iter().next() {
-                    return StepPlan::Mixed(candidate);
-                }
+            if candidates.is_empty() {
+                return StepPlan::Decode;
             }
-            return StepPlan::Decode;
+            if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
+                return StepPlan::Mixed(candidates[0]);
+            }
+            // Keep the legacy split launches for models that do not have a
+            // real single-launch mixed lowering yet.
+            return StepPlan::Split(candidates);
         }
         if candidates.is_empty() {
             StepPlan::Idle
@@ -311,22 +316,31 @@ impl<M: ModelForward> Scheduler<M> {
             "pending prefill must be cleared before the next launch"
         );
 
-        let launch_t = std::time::Instant::now();
-        match &plan {
-            StepPlan::Idle => {}
-            StepPlan::Decode => self.step_decode_launch(),
-            StepPlan::Prefill(candidates) => self.step_prefill_batch(candidates),
-            StepPlan::Mixed(candidate) => self.step_mixed_launch(*candidate),
-        }
-        let launch_us = launch_t.elapsed().as_micros();
-
-        let prefill_us = match &plan {
-            StepPlan::Prefill(_) => launch_us,
-            StepPlan::Idle | StepPlan::Decode | StepPlan::Mixed(_) => 0,
-        };
-        let decode_launch_us = match &plan {
-            StepPlan::Decode | StepPlan::Mixed(_) => launch_us,
-            StepPlan::Idle | StepPlan::Prefill(_) => 0,
+        let (prefill_us, decode_launch_us) = match &plan {
+            StepPlan::Idle => (0, 0),
+            StepPlan::Decode => {
+                let t = std::time::Instant::now();
+                self.step_decode_launch();
+                (0, t.elapsed().as_micros())
+            }
+            StepPlan::Prefill(candidates) => {
+                let t = std::time::Instant::now();
+                self.step_prefill_batch(candidates);
+                (t.elapsed().as_micros(), 0)
+            }
+            StepPlan::Split(candidates) => {
+                let prefill_t = std::time::Instant::now();
+                self.step_prefill_batch(candidates);
+                let prefill_us = prefill_t.elapsed().as_micros();
+                let decode_t = std::time::Instant::now();
+                self.step_decode_launch();
+                (prefill_us, decode_t.elapsed().as_micros())
+            }
+            StepPlan::Mixed(candidate) => {
+                let t = std::time::Instant::now();
+                self.step_mixed_launch(*candidate);
+                (0, t.elapsed().as_micros())
+            }
         };
         let scheduled_decode_rows = self
             .pending_decode
