@@ -15,7 +15,7 @@
   <a href="#-latest-updates">News</a> ·
   <a href="#-status-at-a-glance">Status</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#api">API</a> ·
+  <a href="docs/http-api.md">API</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="ROADMAP.md">Roadmap</a> ·
   <a href="CHANGELOG.md">Changelog</a>
@@ -67,7 +67,7 @@ Four axes, each answering one question. Authoritative matrix lives in
 
 | Endpoint | Status | Notes |
 |----------|:------:|-------|
-| `POST /v1/completions` · `POST /v1/chat/completions` · `GET /v1/models` | **Stable** | OpenAI-compatible. Chat supports SSE streaming. |
+| `POST /v1/completions` · `POST /v1/chat/completions` · `GET /v1/models` | **Stable** | OpenAI-compatible core serving surface. Full contract: [`docs/http-api.md`](docs/http-api.md). |
 | `POST /v1/responses` | **Beta** | Text/tool-call subset with both non-streaming and SSE forms. |
 | `GET /metrics` · `GET /v1/stats` | **Stable** | Prometheus + human-readable ops surface. |
 
@@ -77,7 +77,7 @@ Four axes, each answering one question. Authoritative matrix lives in
 |--------|:------:|--------------|
 | FP8 / INT8 / TurboQuant KV | **Beta** | CUDA |
 | GPTQ W4 · AWQ W4 | **Beta** | CUDA |
-| Q4_K GGUF | **Beta** | CUDA |
+| Q4_K GGUF | **Beta** | CUDA; Metal (dense Qwen3.5 GGUF via load-time dequant) |
 | MLX 4-bit | **Beta** | Metal (default for the canonical `start_metal_serve.sh` path) |
 
 ---
@@ -219,88 +219,20 @@ See [ROADMAP.md](ROADMAP.md) for the full plan.
 
 ## API
 
-OpenAI-compatible. Current HTTP surface:
+The serving API reference now lives in [docs/http-api.md](docs/http-api.md).
+That document is the single place for the route map, streaming behavior,
+boundary guarantees, auth and request-id behavior, and current gaps.
 
-- `POST /v1/completions`
-- `POST /v1/chat/completions`
-- `GET /v1/models`
-- `GET /healthz`
-- `GET /readyz`
-- `POST /v1/responses` for the current text/tool-call subset
-- `POST /v1/sessions/{session_id}/save`
-- `POST /v1/sessions/{session_id}/load`
-- `GET /v1/sessions/{session_id}/manifest`
-- `DELETE /v1/sessions/{session_id}`
+The core generation surface is `POST /v1/completions`,
+`POST /v1/chat/completions`, `POST /v1/responses`, and `GET /v1/models`.
+Operational probes live at `GET /healthz`, `GET /readyz`, `GET /metrics`, and
+`GET /v1/stats`. Session persistence lives under
+`/v1/sessions/{session_id}/*`.
 
-Streaming today is available on both `/v1/chat/completions` and
-`/v1/responses`. On `/v1/chat/completions`, tool definitions are currently
-non-streaming only: `stream=true` requests with `tools` are rejected until
-the server can emit structured `delta.tool_calls` chunks.
-
-HTTP boundary guarantees:
-
-- JSON routes require `Content-Type: application/json`; malformed JSON, missing content type, and oversized bodies return structured JSON errors instead of framework default text.
-- Unsupported top-level parameters on `/v1/completions`, `/v1/chat/completions`, and `/v1/responses` return structured `invalid_parameter` errors instead of being silently ignored.
-- Structured `invalid_parameter` responses include a machine-readable `error.param` field, so clients do not need to parse the human message to find the offending request field.
-- Blank `prompt`, empty `messages`, and blank `input` are validated through the same structured `invalid_parameter` path instead of route-specific error codes.
-- `model` is optional on request bodies, but when present it must match the currently served model reported by `GET /v1/models` (case-insensitive, final path segment match allowed); mismatches return `404 model_not_found`.
-- Streaming completions/chat accept `stream_options.include_usage`; `/v1/completions` also accepts `stream_options.continuous_usage_stats` as a compatibility hint, and it requires `stream_options.include_usage=true`.
-- Chat / responses message validation is explicit: supported roles are `system`, `user`, `assistant`, and `tool`; `content` part arrays must be text-only; tool definitions must use `type=function`; malformed assistant `tool_calls` and tool messages without `tool_call_id` are rejected with structured `invalid_parameter` errors.
-- `/v1/chat/completions` rejects `stream=true` when `tools` are present instead of pretending to support streamed tool-call deltas it cannot emit yet.
-- Request body limit for JSON routes is an explicit `16 MiB`.
-- Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
-- Every HTTP response includes `X-Request-Id`; a client-supplied value is preserved when valid, otherwise the server generates one.
-- `GET /healthz` and `GET /readyz` are lightweight unauthenticated JSON probes; `readyz` includes the boot-time model identity snapshot without probing the backend again.
-- `405 Method Not Allowed` responses keep structured JSON bodies and now also include the standard `Allow` header on both top-level and session routes.
-
-```bash
-# Streaming
-curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Explain KV caching"}],"stream":true}'
-
-# Completions
-curl http://localhost:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"The quick brown fox","max_tokens":64,"temperature":0.7}'
-
-# Model discovery
-curl http://localhost:8000/v1/models
-
-# Responses API
-curl http://localhost:8000/v1/responses \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"Summarize radix prefix caching in one sentence.","max_output_tokens":32}'
-
-# Responses API streaming
-curl -N http://localhost:8000/v1/responses \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"Summarize radix prefix caching in one sentence.","max_output_tokens":32,"stream":true}'
-```
-
-<details>
-<summary>Full parameter reference</summary>
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `max_tokens` | int | 16 | Maximum output tokens |
-| `temperature` | float | 0.0 | Sampling temperature (0 = greedy) |
-| `top_p` | float | 1.0 | Nucleus sampling |
-| `top_k` | int | -1 | Top-K (-1 = off) |
-| `min_p` | float | 0.0 | Min-P filter |
-| `repetition_penalty` | float | 1.0 | Repetition penalty |
-| `frequency_penalty` | float | 0.0 | Frequency penalty |
-| `presence_penalty` | float | 0.0 | Presence penalty |
-| `stop` | list | null | Stop strings |
-| `seed` | int | null | RNG seed |
-| `stream` | bool | false | SSE streaming |
-
-</details>
-
-Additional endpoints: `GET /healthz`, `GET /readyz`, `GET /metrics`
-(Prometheus), `GET /v1/stats` (human-readable). On Metal, `/metrics` and
-`/v1/stats` expose live queue / latency / MLX memory stats from the running
-runtime.
+SSE streaming ships on `/v1/completions`, `/v1/chat/completions`, and
+`/v1/responses`. Requests that combine `stream=true` with `tools` are rejected
+on chat completions and responses until the server can emit structured
+tool-call deltas.
 
 ---
 
@@ -365,9 +297,16 @@ Invalid `--max-turns`, `--max-tokens`, and `--temperature` values fail during
 argument parsing instead of surfacing later at runtime.
 
 Tools: `python` (execute Python snippets), `shell` (execute bash commands). The
-KV prefix cache reuses the full prior-turn KV in place for every subsequent
-turn of a session — only the new user message (and any tool-result content)
-runs prefill. CUDA runtime reuse now sits on top of the same radix / tiered-KV
+CLI keeps tool protocol internal by default: raw tool-call / tool-result trace
+output is hidden unless you opt into verbose logging with `RUST_LOG`, and
+`/tools` remains the explicit way to inspect the built-in tool inventory. File
+listing requests (`本地有哪些文件`, `list files`, etc.) return the shell output
+directly; broader repo-inspection requests (`你看看本地仓库`, `look at the repo`)
+use a deterministic shell overview before the model continues. Completed turns
+are compacted back down to `user -> assistant`, so old raw tool results do not
+keep polluting later prompts. The KV prefix cache therefore reuses the compact
+prior-turn KV in place for every subsequent turn of a session — only the new
+user message plus the current turn's temporary tool context runs prefill. CUDA runtime reuse now sits on top of the same radix / tiered-KV
 surface used by the HTTP scheduler; the main remaining model-specific limit is
 that hybrid `Qwen3.5` does not yet support cross-slot partial-prefix restore.
 On macOS, tool execution uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
