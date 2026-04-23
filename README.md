@@ -198,11 +198,41 @@ Two entrypoints are first-class:
 
 ```bash
 git clone https://github.com/cklxx/arle && cd arle
+```
+
+Build the `arle` binary for the backend you actually want to run:
+
+```bash
+# Linux + NVIDIA (default CUDA path)
 cargo build --release --features cli -p agent-infer --bin arle
-./target/release/arle --model-path /path/to/Qwen3-4B --max-turns 10
+
+# Apple Silicon (Metal)
+cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
+
+# CPU-only smoke / CI
+cargo build --release --no-default-features --features cpu,no-cuda,cli -p agent-infer --bin arle
+```
+
+First commands:
+
+```bash
+./target/release/arle --help
+./target/release/arle --doctor
+./target/release/arle --model-path /path/to/Qwen3-4B
+./target/release/arle --model-path /path/to/Qwen3-4B run --prompt "Summarize this repo"
+./target/release/arle --model-path /path/to/Qwen3-4B run --stdin --json < prompt.txt
 ./target/release/arle train env
+./target/release/arle train test --backend cpu --json
 ./target/release/arle train eval --help
 ```
+
+`arle` with no subcommand starts the interactive REPL. `arle run` is the
+explicit alias for the same surface, and `arle run --prompt ...` / `--stdin`
+are the script-friendly one-shot paths.
+
+Prefer the prebuilt binaries from
+[GitHub Releases](https://github.com/cklxx/arle/releases) when you do not want
+to compile from source.
 
 ### `infer` — OpenAI-compatible serving
 
@@ -227,12 +257,14 @@ curl http://localhost:8000/v1/chat/completions \
 and dataset utilities. `infer` is the dedicated OpenAI-compatible serving
 binary.
 
-**Prerequisites**: CUDA 12.x, the repo-pinned Rust toolchain from
-[`rust-toolchain.toml`](rust-toolchain.toml) (currently `1.95.0`), and Python
-3.10+ with `flashinfer-python` (build-time only). Zig `0.16.0` for
+**Prerequisites**: the repo-pinned Rust toolchain from
+[`rust-toolchain.toml`](rust-toolchain.toml) (currently `1.95.0`). For the
+default CUDA build you also need CUDA 12.x and Python 3.10+ with
+`flashinfer-python` (build-time only). Zig `0.16.0` for
 `crates/kv-native-sys` is bootstrapped by
 [`scripts/setup_zig_toolchain.sh`](scripts/setup_zig_toolchain.sh) and
-`./setup.sh`.
+`./setup.sh`. Metal and CPU-only CLI builds use the feature-specific commands
+above instead of the default CUDA feature set.
 
 For a repo-managed workstation bootstrap, run [`./setup.sh`](setup.sh). For
 contributor workflow and validation expectations, use

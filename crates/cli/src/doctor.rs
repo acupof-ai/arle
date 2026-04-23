@@ -10,7 +10,7 @@ use crate::hardware::{self, GpuInfo};
 use crate::hub_discovery;
 use crate::model_catalog;
 
-const INSPECTION_SCHEMA_VERSION: u32 = 1;
+const INSPECTION_SCHEMA_VERSION: u32 = 2;
 const PRIMARY_MODEL_ENV: &str = "ARLE_MODEL";
 const LEGACY_MODEL_ENV: &str = "AGENT_INFER_MODEL";
 
@@ -54,6 +54,11 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         style(snapshot.info.compiled_backend.name()).bold()
     );
     println!(
+        "{} {}",
+        style("host accelerator").dim(),
+        gpu_summary(&snapshot.info.gpu)
+    );
+    println!(
         "{} stdin={} stdout={} stderr={}",
         style("tty").dim(),
         snapshot.tty.stdin,
@@ -74,10 +79,9 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     );
     println!(
         "{} {:.1} GB",
-        style("effective memory").dim(),
+        style("effective backend memory").dim(),
         snapshot.info.effective_memory_gb()
     );
-    println!("{} {}", style("gpu").dim(), gpu_summary(&snapshot.info.gpu));
     println!();
 
     println!(
@@ -129,8 +133,9 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         );
     } else {
         println!(
-            "{} rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` to run inference",
-            style("backend").yellow().bold()
+            "{} {}",
+            style("backend").yellow().bold(),
+            rebuild_backend_message(&snapshot.info.gpu)
         );
     }
     if snapshot.recommendations.is_empty() && snapshot.info.compiled_backend.supports_inference() {
@@ -487,8 +492,7 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
             code: "backend_missing",
             name: "backend",
             status: "warn",
-            message: "rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` to run inference"
-                .to_string(),
+            message: rebuild_backend_message(&snapshot.info.gpu),
         });
     }
     if !supports_inference {
@@ -581,8 +585,9 @@ fn print_recommendations_section(snapshot: &DoctorSnapshot) {
     println!("{}", style("Recommendations").bold());
     if !snapshot.info.compiled_backend.supports_inference() {
         println!(
-            "{} rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` for backend-specific recommendations",
-            style("catalog").dim()
+            "{} {}",
+            style("catalog").dim(),
+            rebuild_catalog_message(&snapshot.info.gpu)
         );
     } else if snapshot.recommendations.is_empty() {
         println!("{} <none fit this machine>", style("catalog").dim());
@@ -682,6 +687,38 @@ fn gpu_summary(gpu: &GpuInfo) -> String {
             unified_memory_gb,
         } => format!("{chip} · {unified_memory_gb:.0} GB unified memory"),
         GpuInfo::None => "none detected".to_string(),
+    }
+}
+
+fn rebuild_backend_message(gpu: &GpuInfo) -> String {
+    match gpu {
+        GpuInfo::Cuda { .. } => {
+            "host NVIDIA GPU detected; rebuild with the default `cuda` feature to run inference"
+                .to_string()
+        }
+        GpuInfo::Metal { .. } => {
+            "host Apple Silicon GPU detected; rebuild with `--no-default-features --features metal,no-cuda` to run inference"
+                .to_string()
+        }
+        GpuInfo::None => {
+            "no local GPU backend compiled; rebuild with `--no-default-features --features cpu,no-cuda` for CPU inference, or with `cuda` / `metal,no-cuda` on a supported host"
+                .to_string()
+        }
+    }
+}
+
+fn rebuild_catalog_message(gpu: &GpuInfo) -> String {
+    match gpu {
+        GpuInfo::Cuda { .. } => {
+            "backend-specific recommendations require a CUDA build on this host".to_string()
+        }
+        GpuInfo::Metal { .. } => {
+            "backend-specific recommendations require a Metal build on this host".to_string()
+        }
+        GpuInfo::None => {
+            "backend-specific recommendations require a build with `cuda`, `metal,no-cuda`, or `cpu,no-cuda`"
+                .to_string()
+        }
     }
 }
 
@@ -789,7 +826,7 @@ mod tests {
         )));
         let value = serde_json::to_value(doctor_report(&snapshot)).expect("serialize doctor json");
 
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["mode"], "doctor");
         assert_eq!(
             value["status"],
@@ -837,7 +874,7 @@ mod tests {
         let snapshot = test_snapshot(Err(anyhow::anyhow!("no model selected")));
         let value = serde_json::to_value(models_report(&snapshot)).expect("serialize models json");
 
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["mode"], "list_models");
         assert_eq!(value["status"], "warn");
         assert!(value.get("checks").is_none());

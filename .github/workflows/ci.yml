@@ -64,7 +64,10 @@ jobs:
           cargo check -p train --release --features metal --lib
 
       - name: cargo test (Metal CLI unit tests)
-        run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer
+        run: cargo test -p cli --release --no-default-features --features metal,no-cuda
+
+      - name: cargo test (Metal ARLE smoke path)
+        run: cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_smoke
 
   # ── Linux: CPU-only (no CUDA, no Metal) ─────────────────────────────────────
   check:
@@ -132,6 +135,9 @@ jobs:
         working-directory: infer
         run: cargo test --no-default-features --features no-cuda --lib
 
+      - name: cargo test (CLI crate)
+        run: cargo test -p cli --release --no-default-features --features no-cuda
+
       - name: cargo test (ARLE CPU smoke path)
         run: cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
 
@@ -170,6 +176,9 @@ jobs:
       - name: cargo clippy (CPU-only)
         working-directory: infer
         run: cargo clippy --no-default-features --features no-cuda --lib -- -D warnings
+
+      - name: cargo clippy (CLI crate)
+        run: cargo clippy -p cli --release --no-default-features --features no-cuda -- -D warnings
 
       - name: cargo clippy (ARLE CPU smoke path)
         run: cargo clippy -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings

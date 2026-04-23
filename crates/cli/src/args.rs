@@ -136,14 +136,15 @@ pub(crate) struct RenderArgs {
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct ExtraArgs {
     /// Forward additional advanced flags after `--` to the underlying train binary.
-    #[arg(last = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(last = true, allow_hyphen_values = true)]
     pub(crate) extra_args: Vec<String>,
 }
 
 #[derive(Parser)]
 #[command(
     name = "arle",
-    about = "Local LLM inference, training, and dataset CLI",
+    about = "ARLE local agent, training, and dataset CLI",
+    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train test --backend metal --json     Run the real train smoke and keep stdout machine-readable.",
     group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
 )]
 pub(crate) struct Args {
@@ -204,14 +205,38 @@ pub(crate) struct Args {
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum CliCommand {
+    /// Agent REPL and one-shot prompt execution.
+    Run(Box<RunArgs>),
     /// Training jobs.
     Train(Box<TrainArgs>),
     /// Dataset utilities.
     Data(Box<DataArgs>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, ClapArgs)]
+#[command(
+    group(ArgGroup::new("run_input").args(["prompt", "stdin"])),
+    after_help = "Output:\n  Plain text is written to stdout by default.\n  `--json` emits one machine-readable document with model, backend, usage, and tool-call stats.\n\nExamples:\n  arle --model-path /path/to/model run\n  arle --model-path /path/to/model run --prompt \"Summarize this repo\"\n  arle --model-path /path/to/model run --stdin --json < prompt.txt"
+)]
+pub(crate) struct RunArgs {
+    /// Run a single prompt and exit.
+    #[arg(long)]
+    pub(crate) prompt: Option<String>,
+
+    /// Read one prompt from stdin, run it, and exit.
+    #[arg(long, default_value_t = false)]
+    pub(crate) stdin: bool,
+
+    /// Render one-shot output as JSON for scripts and CI.
+    #[arg(long, default_value_t = false, requires = "run_input")]
+    pub(crate) json: bool,
+}
+
 #[derive(Debug, Clone, clap::Args)]
-#[command(arg_required_else_help = true)]
+#[command(
+    arg_required_else_help = true,
+    after_help = "Examples:\n  arle train env\n  arle train test --backend metal --json\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --preset small-25m"
+)]
 pub(crate) struct TrainArgs {
     #[command(subcommand)]
     pub(crate) command: TrainCommand,
@@ -238,7 +263,10 @@ pub(crate) enum TrainCommand {
 }
 
 #[derive(Debug, Clone, clap::Args)]
-#[command(arg_required_else_help = true)]
+#[command(
+    arg_required_else_help = true,
+    after_help = "Examples:\n  arle data download --repo tatsu-lab/alpaca --file alpaca_data.json\n  arle data convert --input alpaca.jsonl --format alpaca\n  arle data convert --input data.jsonl --format sharegpt --dry-run --json"
+)]
 pub(crate) struct DataArgs {
     #[command(subcommand)]
     pub(crate) command: DataCommand,
@@ -260,6 +288,9 @@ pub(crate) struct TrainEnvArgs {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "This command runs a real local convert -> pretrain -> sft -> eval smoke.\nUse `--keep-artifacts` or `--out-dir` when you want to inspect the generated files."
+)]
 pub(crate) struct TrainTestArgs {
     /// Training backend to exercise; `auto` selects the compiled backend.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
@@ -279,6 +310,9 @@ pub(crate) struct TrainTestArgs {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m\n  arle train estimate-memory --model checkpoints/base --lora-rank 32 --json"
+)]
 pub(crate) struct TrainEstimateMemoryArgs {
     /// Existing model directory to inspect for LoRA SFT / eval-style runs.
     #[arg(long, alias = "model-path")]
@@ -312,30 +346,39 @@ pub(crate) struct TrainEstimateMemoryArgs {
     #[arg(long, value_enum, default_value_t = SaveDtypeArg::Bf16)]
     pub(crate) save_dtype: SaveDtypeArg,
 
+    /// Scratch vocab size override.
     #[arg(long)]
     pub(crate) vocab_size: Option<usize>,
 
+    /// Scratch hidden width override.
     #[arg(long)]
     pub(crate) hidden: Option<usize>,
 
+    /// Scratch transformer layer count override.
     #[arg(long)]
     pub(crate) layers: Option<usize>,
 
+    /// Scratch attention head count override.
     #[arg(long)]
     pub(crate) heads: Option<usize>,
 
+    /// Scratch KV head count override.
     #[arg(long)]
     pub(crate) kv_heads: Option<usize>,
 
+    /// Scratch per-head dimension override.
     #[arg(long)]
     pub(crate) head_dim: Option<usize>,
 
+    /// Scratch MLP intermediate width override.
     #[arg(long)]
     pub(crate) intermediate: Option<usize>,
 
+    /// Scratch maximum position embeddings override.
     #[arg(long)]
     pub(crate) max_pos: Option<usize>,
 
+    /// For Qwen3.5 scratch estimates, insert one linear-attention layer every N layers.
     #[arg(long)]
     pub(crate) linear_attn_every: Option<usize>,
 
@@ -346,7 +389,7 @@ pub(crate) struct TrainEstimateMemoryArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced pretrain flags still work after `--`, for example:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json -- --bos-token <s>"
+    after_help = "Examples:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --preset small-25m\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --dry-run --json\n\nAdvanced pretrain flags still work after `--`, for example:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json -- --bos-token <s>"
 )]
 pub(crate) struct TrainPretrainArgs {
     /// Plain-text training corpus.
@@ -369,105 +412,139 @@ pub(crate) struct TrainPretrainArgs {
     #[arg(long, value_enum)]
     pub(crate) model_family: Option<ModelFamilyArg>,
 
+    /// Total optimizer steps.
     #[arg(long)]
     pub(crate) steps: Option<usize>,
 
+    /// Micro-batch size in sequences per step.
     #[arg(long)]
     pub(crate) batch: Option<usize>,
 
+    /// Sequence length in tokens.
     #[arg(long)]
     pub(crate) seq: Option<usize>,
 
+    /// Learning rate.
     #[arg(long)]
     pub(crate) lr: Option<f32>,
 
+    /// Gradient accumulation steps before each optimizer update.
     #[arg(long)]
     pub(crate) grad_accum_steps: Option<usize>,
 
+    /// Log training metrics every N steps.
     #[arg(long)]
     pub(crate) log_every: Option<usize>,
 
+    /// Write a checkpoint every N steps.
     #[arg(long)]
     pub(crate) save_every: Option<usize>,
 
+    /// Run evaluation every N steps.
     #[arg(long)]
     pub(crate) eval_every: Option<usize>,
 
+    /// Number of evaluation windows to sample per eval pass.
     #[arg(long)]
     pub(crate) eval_windows: Option<usize>,
 
+    /// Fraction of the corpus reserved for evaluation.
     #[arg(long)]
     pub(crate) eval_frac: Option<f32>,
 
+    /// Resume from an existing checkpoint directory.
     #[arg(long)]
     pub(crate) resume_from: Option<PathBuf>,
 
+    /// Random seed.
     #[arg(long)]
     pub(crate) seed: Option<u64>,
 
+    /// Gradient clipping norm.
     #[arg(long, conflicts_with = "no_grad_clip")]
     pub(crate) grad_clip: Option<f32>,
 
+    /// Disable gradient clipping.
     #[arg(long, default_value_t = false)]
     pub(crate) no_grad_clip: bool,
 
+    /// Training backend.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     pub(crate) backend: BackendArg,
 
+    /// Checkpoint dtype to write.
     #[arg(long, value_enum)]
     pub(crate) save_dtype: Option<SaveDtypeArg>,
 
+    /// Scratch vocab size override.
     #[arg(long)]
     pub(crate) vocab_size: Option<usize>,
 
+    /// Scratch hidden width override.
     #[arg(long)]
     pub(crate) hidden: Option<usize>,
 
+    /// Scratch transformer layer count override.
     #[arg(long)]
     pub(crate) layers: Option<usize>,
 
+    /// Scratch attention head count override.
     #[arg(long)]
     pub(crate) heads: Option<usize>,
 
+    /// Scratch KV head count override.
     #[arg(long)]
     pub(crate) kv_heads: Option<usize>,
 
+    /// Scratch per-head dimension override.
     #[arg(long)]
     pub(crate) head_dim: Option<usize>,
 
+    /// Scratch MLP intermediate width override.
     #[arg(long)]
     pub(crate) intermediate: Option<usize>,
 
+    /// Scratch maximum position embeddings.
     #[arg(long)]
     pub(crate) max_pos: Option<usize>,
 
+    /// RMSNorm epsilon.
     #[arg(long)]
     pub(crate) rms_eps: Option<f32>,
 
+    /// RoPE theta.
     #[arg(long)]
     pub(crate) rope_theta: Option<f32>,
 
+    /// Do not tie input embedding and LM head weights.
     #[arg(long, default_value_t = false)]
     pub(crate) no_tie_embed: bool,
 
+    /// For Qwen3.5 scratch models, insert one linear-attention layer every N layers.
     #[arg(long)]
     pub(crate) linear_attn_every: Option<usize>,
 
+    /// Override BOS token text.
     #[arg(long)]
     pub(crate) bos_token: Option<String>,
 
+    /// Override EOS token text.
     #[arg(long)]
     pub(crate) eos_token: Option<String>,
 
+    /// Override BOS token id.
     #[arg(long)]
     pub(crate) bos_token_id: Option<u32>,
 
+    /// Override EOS token id.
     #[arg(long)]
     pub(crate) eos_token_id: Option<u32>,
 
+    /// Append per-step metrics to this JSONL file.
     #[arg(long)]
     pub(crate) metrics_jsonl: Option<PathBuf>,
 
+    /// Expose a small HTTP status endpoint on this port during training.
     #[arg(long)]
     pub(crate) serve: Option<u16>,
 
@@ -480,7 +557,7 @@ pub(crate) struct TrainPretrainArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced SFT flags still work after `--`, for example:\n  arle train sft --model models/base --data train.chat.jsonl -- --resume-from runs/sft/step_000100"
+    after_help = "Examples:\n  arle train sft --model models/base --data train.chat.jsonl\n  arle train sft --model models/base --data train.chat.jsonl --dry-run --json\n\nAdvanced SFT flags still work after `--`, for example:\n  arle train sft --model models/base --data train.chat.jsonl -- --resume-from runs/sft/step_000100"
 )]
 pub(crate) struct TrainSftArgs {
     /// Base checkpoint directory or HF model ID.
@@ -499,57 +576,75 @@ pub(crate) struct TrainSftArgs {
     #[arg(long, value_enum)]
     pub(crate) model_family: Option<ModelFamilyArg>,
 
+    /// Total optimizer steps.
     #[arg(long)]
     pub(crate) steps: Option<usize>,
 
+    /// Micro-batch size in sequences per step.
     #[arg(long)]
     pub(crate) batch: Option<usize>,
 
+    /// Learning rate.
     #[arg(long)]
     pub(crate) lr: Option<f32>,
 
+    /// Sequence length in tokens.
     #[arg(long)]
     pub(crate) seq_len: Option<usize>,
 
+    /// Training backend.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     pub(crate) backend: BackendArg,
 
+    /// Write a checkpoint every N steps.
     #[arg(long)]
     pub(crate) save_every: Option<usize>,
 
+    /// Log training metrics every N steps.
     #[arg(long)]
     pub(crate) log_every: Option<usize>,
 
+    /// Random seed.
     #[arg(long)]
     pub(crate) seed: Option<u64>,
 
+    /// Checkpoint dtype to write.
     #[arg(long, value_enum)]
     pub(crate) save_dtype: Option<SaveDtypeArg>,
 
+    /// Learning-rate schedule name forwarded to the train binary.
     #[arg(long)]
     pub(crate) lr_schedule: Option<String>,
 
+    /// Warmup steps for the learning-rate schedule.
     #[arg(long)]
     pub(crate) warmup_steps: Option<u64>,
 
+    /// Floor learning rate for schedules that decay.
     #[arg(long)]
     pub(crate) min_lr: Option<f32>,
 
+    /// Gradient accumulation steps before each optimizer update.
     #[arg(long)]
     pub(crate) grad_accum_steps: Option<usize>,
 
+    /// Append per-step metrics to this JSONL file.
     #[arg(long)]
     pub(crate) metrics_jsonl: Option<PathBuf>,
 
+    /// Resume from an existing checkpoint directory.
     #[arg(long)]
     pub(crate) resume_from: Option<PathBuf>,
 
+    /// LoRA rank.
     #[arg(long)]
     pub(crate) lora_rank: Option<usize>,
 
+    /// LoRA alpha.
     #[arg(long)]
     pub(crate) lora_alpha: Option<f32>,
 
+    /// Expose a small HTTP status endpoint on this port during training.
     #[arg(long)]
     pub(crate) serve: Option<u16>,
 
@@ -562,7 +657,7 @@ pub(crate) struct TrainSftArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced eval flags still work after `--`, for example:\n  arle train eval --model checkpoints/base --data eval.chat.jsonl -- --metrics-jsonl metrics.jsonl"
+    after_help = "Examples:\n  arle train eval --model checkpoints/base --data eval.chat.jsonl\n  arle train eval --model checkpoints/base --data eval.chat.jsonl --dry-run --json\n\nAdvanced eval flags still work after `--`, for example:\n  arle train eval --model checkpoints/base --data eval.chat.jsonl -- --metrics-jsonl metrics.jsonl"
 )]
 pub(crate) struct TrainEvalArgs {
     /// Checkpoint directory or HF model ID.
@@ -581,12 +676,15 @@ pub(crate) struct TrainEvalArgs {
     #[arg(long)]
     pub(crate) tokenizer: Option<PathBuf>,
 
+    /// Sequence length in tokens.
     #[arg(long)]
     pub(crate) seq_len: Option<usize>,
 
+    /// Evaluation backend.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     pub(crate) backend: BackendArg,
 
+    /// Append evaluation metrics to this JSONL file.
     #[arg(long)]
     pub(crate) metrics_jsonl: Option<PathBuf>,
 
@@ -599,69 +697,90 @@ pub(crate) struct TrainEvalArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced GRPO flags still work after `--`, for example:\n  arle train grpo --grpo-iters 20 -- --resume-from runs/grpo/step_000010"
+    after_help = "Examples:\n  arle train grpo --grpo-iters 20 --batch-prompts 8 --group-size 4\n  arle train grpo --grpo-iters 20 --dry-run --json\n\nAdvanced GRPO flags still work after `--`, for example:\n  arle train grpo --grpo-iters 20 -- --resume-from runs/grpo/step_000010"
 )]
 pub(crate) struct TrainGrpoArgs {
+    /// Scratch policy family override.
     #[arg(long, value_enum)]
     pub(crate) model_family: Option<ModelFamilyArg>,
 
+    /// Warm-start SFT steps before GRPO.
     #[arg(long)]
     pub(crate) sft_steps: Option<usize>,
 
+    /// Total GRPO iterations.
     #[arg(long)]
     pub(crate) grpo_iters: Option<usize>,
 
+    /// Write a checkpoint every N iterations.
     #[arg(long)]
     pub(crate) save_every: Option<usize>,
 
+    /// Prompt batch size per GRPO iteration.
     #[arg(long)]
     pub(crate) batch_prompts: Option<usize>,
 
+    /// Number of rollouts sampled per prompt.
     #[arg(long)]
     pub(crate) group_size: Option<usize>,
 
+    /// Prompt-plus-response sequence budget in tokens.
     #[arg(long)]
     pub(crate) seq: Option<usize>,
 
+    /// Policy learning rate.
     #[arg(long)]
     pub(crate) lr: Option<f32>,
 
+    /// KL penalty coefficient against the reference policy.
     #[arg(long)]
     pub(crate) kl_coef: Option<f32>,
 
+    /// Sampling temperature for rollout generation.
     #[arg(long)]
     pub(crate) temperature: Option<f32>,
 
+    /// Random seed.
     #[arg(long)]
     pub(crate) seed: Option<u64>,
 
+    /// LoRA rank.
     #[arg(long)]
     pub(crate) lora_rank: Option<usize>,
 
+    /// LoRA alpha.
     #[arg(long)]
     pub(crate) lora_alpha: Option<f32>,
 
+    /// Training backend.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     pub(crate) backend: BackendArg,
 
+    /// Gradient clipping norm.
     #[arg(long, conflicts_with = "no_grad_clip")]
     pub(crate) grad_clip: Option<f32>,
 
+    /// Disable gradient clipping.
     #[arg(long, default_value_t = false)]
     pub(crate) no_grad_clip: bool,
 
+    /// Append per-step metrics to this JSONL file.
     #[arg(long)]
     pub(crate) metrics_jsonl: Option<PathBuf>,
 
+    /// Output checkpoint directory.
     #[arg(long)]
     pub(crate) save_path: Option<PathBuf>,
 
+    /// Resume from an existing checkpoint directory.
     #[arg(long)]
     pub(crate) resume_from: Option<PathBuf>,
 
+    /// Expose a small HTTP status endpoint on this port during training.
     #[arg(long)]
     pub(crate) serve: Option<u16>,
 
+    /// For Qwen3.5 scratch policies, insert one linear-attention layer every N layers.
     #[arg(long)]
     pub(crate) linear_attn_every: Option<usize>,
 
@@ -674,105 +793,138 @@ pub(crate) struct TrainGrpoArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced multi-turn flags still work after `--`, for example:\n  arle train multi-turn --iters 20 -- --resume-from runs/multi-turn/step_000010"
+    after_help = "Examples:\n  arle train multi-turn --iters 20 --group-size 4 --turns 6\n  arle train multi-turn --iters 20 --dry-run --json\n\nAdvanced multi-turn flags still work after `--`, for example:\n  arle train multi-turn --iters 20 -- --resume-from runs/multi-turn/step_000010"
 )]
 pub(crate) struct TrainMultiTurnArgs {
+    /// Total training iterations.
     #[arg(long)]
     pub(crate) iters: Option<usize>,
 
+    /// Number of episodes sampled per prompt.
     #[arg(long)]
     pub(crate) group_size: Option<usize>,
 
+    /// Per-turn agent token budget.
     #[arg(long)]
     pub(crate) agent_tokens: Option<usize>,
 
+    /// Per-turn observation token budget.
     #[arg(long)]
     pub(crate) obs_tokens: Option<usize>,
 
+    /// Maximum environment turns per episode.
     #[arg(long)]
     pub(crate) turns: Option<usize>,
 
+    /// Initial prompt length in tokens.
     #[arg(long)]
     pub(crate) prompt_len: Option<usize>,
 
+    /// Policy learning rate.
     #[arg(long)]
     pub(crate) lr: Option<f32>,
 
+    /// KL penalty coefficient against the reference policy.
     #[arg(long)]
     pub(crate) kl_coef: Option<f32>,
 
+    /// PPO-style clip epsilon.
     #[arg(long)]
     pub(crate) clip_eps: Option<f32>,
 
+    /// Sampling temperature for rollout generation.
     #[arg(long)]
     pub(crate) temperature: Option<f32>,
 
+    /// Reward discount factor.
     #[arg(long)]
     pub(crate) gamma: Option<f32>,
 
+    /// LoRA rank.
     #[arg(long)]
     pub(crate) lora_rank: Option<usize>,
 
+    /// LoRA alpha.
     #[arg(long)]
     pub(crate) lora_alpha: Option<f32>,
 
+    /// Random seed.
     #[arg(long)]
     pub(crate) seed: Option<u64>,
 
+    /// Scratch vocab size override.
     #[arg(long)]
     pub(crate) vocab: Option<usize>,
 
+    /// Scratch synthetic target-range override.
     #[arg(long)]
     pub(crate) target_range: Option<usize>,
 
+    /// Scratch hidden width override.
     #[arg(long)]
     pub(crate) d_model: Option<usize>,
 
+    /// Scratch transformer layer count override.
     #[arg(long)]
     pub(crate) n_layers: Option<usize>,
 
+    /// Scratch attention head count override.
     #[arg(long)]
     pub(crate) n_heads: Option<usize>,
 
+    /// Scratch per-head dimension override.
     #[arg(long)]
     pub(crate) d_head: Option<usize>,
 
+    /// Scratch MLP intermediate width override.
     #[arg(long)]
     pub(crate) d_ff: Option<usize>,
 
+    /// For Qwen3.5 scratch policies, insert one linear-attention layer every N layers.
     #[arg(long)]
     pub(crate) linear_attn_every: Option<usize>,
 
+    /// Run evaluation every N iterations.
     #[arg(long)]
     pub(crate) eval_every: Option<usize>,
 
+    /// Number of evaluation prompts per eval pass.
     #[arg(long)]
     pub(crate) eval_prompts: Option<usize>,
 
+    /// Sampling temperature for evaluation rollouts.
     #[arg(long)]
     pub(crate) eval_temperature: Option<f32>,
 
+    /// Training backend.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     pub(crate) backend: BackendArg,
 
+    /// Output checkpoint directory.
     #[arg(long)]
     pub(crate) save_path: Option<PathBuf>,
 
+    /// Resume from an existing checkpoint directory.
     #[arg(long)]
     pub(crate) resume_from: Option<PathBuf>,
 
+    /// Expose a small HTTP status endpoint on this port during training.
     #[arg(long)]
     pub(crate) serve: Option<u16>,
 
+    /// Gradient clipping norm.
     #[arg(long, conflicts_with = "no_grad_clip")]
     pub(crate) grad_clip: Option<f32>,
 
+    /// Disable gradient clipping.
     #[arg(long, default_value_t = false)]
     pub(crate) no_grad_clip: bool,
 
+    /// Append per-step metrics to this JSONL file.
     #[arg(long)]
     pub(crate) metrics_jsonl: Option<PathBuf>,
 
+    /// Reward aggregation objective.
     #[arg(long, value_enum)]
     pub(crate) objective: Option<MultiTurnObjectiveArg>,
 
@@ -784,7 +936,9 @@ pub(crate) struct TrainMultiTurnArgs {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
-#[command(after_help = "The output path defaults to `<input-stem>.chat.jsonl`.")]
+#[command(
+    after_help = "The output path defaults to `<input-stem>.chat.jsonl`.\nExample:\n  arle data convert --input alpaca.jsonl --format alpaca"
+)]
 pub(crate) struct DataConvertArgs {
     /// Input JSONL file in a supported public schema.
     #[arg(long)]
@@ -803,6 +957,9 @@ pub(crate) struct DataConvertArgs {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Example:\n  arle data download --repo tatsu-lab/alpaca --file alpaca_data.json"
+)]
 pub(crate) struct DataDownloadArgs {
     /// Hugging Face dataset repo ID.
     #[arg(long)]
@@ -819,7 +976,7 @@ pub(crate) struct DataDownloadArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, CliCommand, DataCommand, DatasetFormatArg, ModelFamilyArg, TrainCommand,
+        Args, CliCommand, DataCommand, DatasetFormatArg, ModelFamilyArg, RunArgs, TrainCommand,
         TrainPretrainArgs,
     };
     use clap::{CommandFactory, Parser};
@@ -976,6 +1133,43 @@ mod tests {
         assert_eq!(corpus, std::path::PathBuf::from("train.txt"));
         assert_eq!(tokenizer, std::path::PathBuf::from("tok.json"));
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn accepts_run_prompt() {
+        let args = Args::try_parse_from(["arle", "run", "--prompt", "hello"])
+            .expect("run prompt should parse");
+        let Some(CliCommand::Run(run)) = args.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            *run,
+            RunArgs {
+                prompt: Some("hello".to_string()),
+                stdin: false,
+                json: false,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_run_stdin_json() {
+        let args = Args::try_parse_from(["arle", "run", "--stdin", "--json"])
+            .expect("run stdin json should parse");
+        let Some(CliCommand::Run(run)) = args.command else {
+            panic!("expected run command");
+        };
+        assert!(run.stdin);
+        assert!(run.json);
+        assert!(run.prompt.is_none());
+    }
+
+    #[test]
+    fn rejects_run_json_without_input() {
+        let err = Args::try_parse_from(["arle", "run", "--json"])
+            .err()
+            .expect("run --json without input should fail");
+        assert!(err.to_string().contains("--prompt"));
     }
 
     #[test]

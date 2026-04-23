@@ -89,14 +89,23 @@ pub(crate) struct SystemInfo {
 
 impl SystemInfo {
     /// Effective memory available for model loading (VRAM for CUDA, unified
-    /// RAM for Metal, system RAM for CPU).
+    /// RAM for Metal, system RAM for CPU). This is keyed to the backend
+    /// compiled into the current binary, not just the host accelerator.
     pub(crate) fn effective_memory_gb(&self) -> f64 {
-        match &self.gpu {
-            GpuInfo::Cuda { vram_gb, .. } => *vram_gb,
-            GpuInfo::Metal {
-                unified_memory_gb, ..
-            } => *unified_memory_gb * 0.75, // leave headroom for OS
-            GpuInfo::None => self.available_ram_gb,
+        match self.compiled_backend {
+            CompiledBackend::Cuda => match &self.gpu {
+                GpuInfo::Cuda { vram_gb, .. } => *vram_gb,
+                _ => 0.0,
+            },
+            CompiledBackend::Metal => match &self.gpu {
+                GpuInfo::Metal {
+                    unified_memory_gb, ..
+                } => *unified_memory_gb * 0.75, // leave headroom for OS
+                _ => 0.0,
+            },
+            CompiledBackend::Cpu => self.available_ram_gb,
+            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            CompiledBackend::None => 0.0,
         }
     }
 }
@@ -117,7 +126,7 @@ pub(crate) fn detect_system() -> SystemInfo {
     let available_ram_gb = sys.available_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
 
     let compiled_backend = CompiledBackend::detect();
-    let gpu = detect_gpu(compiled_backend, total_ram_gb);
+    let gpu = detect_gpu(total_ram_gb);
 
     SystemInfo {
         cpu_name,
@@ -129,14 +138,13 @@ pub(crate) fn detect_system() -> SystemInfo {
     }
 }
 
-fn detect_gpu(backend: CompiledBackend, total_ram_gb: f64) -> GpuInfo {
-    match backend {
-        CompiledBackend::Cuda => detect_nvidia_gpu(),
-        CompiledBackend::Metal => detect_apple_gpu(total_ram_gb),
-        CompiledBackend::Cpu => GpuInfo::None,
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
-        CompiledBackend::None => GpuInfo::None,
+fn detect_gpu(total_ram_gb: f64) -> GpuInfo {
+    let nvidia = detect_nvidia_gpu();
+    if !matches!(nvidia, GpuInfo::None) {
+        return nvidia;
     }
+
+    detect_apple_gpu(total_ram_gb)
 }
 
 /// Detect NVIDIA GPU via nvidia-smi subprocess (2s timeout).
@@ -167,6 +175,10 @@ fn detect_nvidia_gpu() -> GpuInfo {
 
 /// Detect Apple Silicon chip name via sysctl.
 fn detect_apple_gpu(total_ram_gb: f64) -> GpuInfo {
+    if !cfg!(target_os = "macos") {
+        return GpuInfo::None;
+    }
+
     let output = Command::new("sysctl")
         .args(["-n", "machdep.cpu.brand_string"])
         .output();
@@ -179,9 +191,13 @@ fn detect_apple_gpu(total_ram_gb: f64) -> GpuInfo {
         _ => "Apple Silicon".to_string(),
     };
 
-    GpuInfo::Metal {
-        chip,
-        unified_memory_gb: total_ram_gb,
+    if chip.contains("Apple") {
+        GpuInfo::Metal {
+            chip,
+            unified_memory_gb: total_ram_gb,
+        }
+    } else {
+        GpuInfo::None
     }
 }
 
@@ -200,7 +216,15 @@ mod tests {
     #[test]
     fn effective_memory_positive() {
         let info = detect_system();
-        assert!(info.effective_memory_gb() > 0.0);
+        match CompiledBackend::detect() {
+            CompiledBackend::Cuda | CompiledBackend::Metal | CompiledBackend::Cpu => {
+                assert!(info.effective_memory_gb() > 0.0);
+            }
+            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            CompiledBackend::None => {
+                assert_eq!(info.effective_memory_gb(), 0.0);
+            }
+        }
     }
 
     #[test]

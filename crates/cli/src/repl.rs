@@ -1,7 +1,7 @@
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::cell::RefCell;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use crate::args::RunArgs;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
     AgentSession, AgentSessionStats, AgentSettings, AgentTurnCallbacks, ToolExecutor, ToolPolicy,
@@ -28,10 +30,25 @@ use rustyline::DefaultEditor;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::error::ReadlineError;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use serde::Serialize;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use tools::{BuiltinToolPolicyHooks, builtin_tools, execute_tool_call};
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const REPL_PROMPT: &str = "\x1b[1;35m> \x1b[0m";
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[derive(Debug, Serialize)]
+struct OneShotOutput {
+    model_id: String,
+    backend: String,
+    text: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    tool_calls_executed: usize,
+    max_turns_reached: bool,
+}
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +262,61 @@ pub(crate) fn run_repl(
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+pub(crate) fn run_one_shot(
+    engine: &mut dyn InferenceEngine,
+    backend_name: &str,
+    max_turns: usize,
+    max_tokens: usize,
+    temperature: f32,
+    run_args: &RunArgs,
+) -> Result<()> {
+    let prompt = resolve_one_shot_prompt(run_args)?;
+    anyhow::ensure!(
+        !prompt.trim().is_empty(),
+        "one-shot prompt is empty; pass --prompt or pipe non-empty stdin to --stdin"
+    );
+
+    let tools = builtin_tools()
+        .into_iter()
+        .map(|tool| tool.to_definition())
+        .collect::<Vec<_>>();
+    let mut session = AgentSession::new();
+    let result = session.run_turn(
+        engine,
+        &prompt,
+        &tools,
+        &BuiltinToolExecutor,
+        &BuiltinToolPolicy,
+        AgentSettings {
+            max_turns,
+            max_tokens,
+            temperature,
+        },
+    )?;
+
+    let output = OneShotOutput {
+        model_id: engine.model_id().to_string(),
+        backend: backend_name.to_string(),
+        text: result.text,
+        prompt_tokens: result.prompt_tokens,
+        completion_tokens: result.completion_tokens,
+        total_tokens: result
+            .prompt_tokens
+            .saturating_add(result.completion_tokens),
+        tool_calls_executed: result.tool_calls_executed,
+        max_turns_reached: result.max_turns_reached,
+    };
+
+    if run_args.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{}", output.text);
+    }
+
+    Ok(())
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_banner(
     engine: &dyn InferenceEngine,
     backend_name: &str,
@@ -347,10 +419,15 @@ fn read_multiline(editor: &mut DefaultEditor) -> Result<Option<String>, Readline
 
 /// Same `\` continuation, but for piped stdin.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn read_multiline_piped<R: BufRead>(reader: &mut R, prompt: &str) -> io::Result<Option<String>> {
+fn read_multiline_piped<R: BufRead>(
+    reader: &mut R,
+    prompt: Option<&str>,
+) -> io::Result<Option<String>> {
     let mut stdout = io::stdout();
-    print!("{prompt}");
-    stdout.flush()?;
+    if let Some(prompt) = prompt {
+        print!("{prompt}");
+        stdout.flush()?;
+    }
 
     let mut accumulated: Option<String> = None;
     loop {
@@ -371,8 +448,10 @@ fn read_multiline_piped<R: BufRead>(reader: &mut R, prompt: &str) -> io::Result<
                 acc.push('\n');
             }
             acc.push_str(stripped);
-            print!("{prompt}");
-            stdout.flush()?;
+            if let Some(prompt) = prompt {
+                print!("{prompt}");
+                stdout.flush()?;
+            }
             continue;
         }
         let result = if let Some(mut acc) = accumulated.take() {
@@ -513,18 +592,9 @@ fn run_piped_repl(
     cancel.store(false, Ordering::Relaxed);
     exit.store(false, Ordering::Relaxed);
 
-    print_repl_banner(
-        engine,
-        backend_name,
-        &tools,
-        max_turns,
-        max_tokens,
-        temperature,
-    );
-
     loop {
         cancel.store(false, Ordering::Relaxed);
-        match read_multiline_piped(&mut reader, REPL_PROMPT)? {
+        match read_multiline_piped(&mut reader, None)? {
             Some(line) => {
                 let input = line.trim();
                 if input.is_empty() {
@@ -557,6 +627,19 @@ fn run_piped_repl(
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn resolve_one_shot_prompt(run_args: &RunArgs) -> Result<String> {
+    match (&run_args.prompt, run_args.stdin) {
+        (Some(prompt), false) => Ok(prompt.clone()),
+        (None, true) => {
+            let mut input = String::new();
+            io::stdin().read_to_string(&mut input)?;
+            Ok(input)
+        }
+        _ => anyhow::bail!("run one-shot mode requires exactly one of --prompt or --stdin"),
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]

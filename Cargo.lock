@@ -29,6 +29,7 @@ dependencies = [
  "anyhow",
  "cli",
  "infer",
+ "serde_json",
 ]
 
 [[package]]

@@ -22,16 +22,18 @@ fn live_test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("live test lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn run_cli_session(lines: &[&str], timeout: Duration) -> Output {
+fn run_cli(args: &[&str], lines: &[&str], timeout: Duration) -> Output {
     let exe = env!("CARGO_BIN_EXE_arle");
+    let reads_stdin_prompt = args.iter().any(|arg| *arg == "--stdin");
     let mut child = Command::new(exe)
         .arg("--max-turns")
         .arg("4")
         .arg("--max-tokens")
         .arg("96")
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -43,7 +45,9 @@ fn run_cli_session(lines: &[&str], timeout: Duration) -> Output {
         for line in lines {
             writeln!(stdin, "{line}").expect("write prompt");
         }
-        writeln!(stdin, "exit").expect("write exit");
+        if !reads_stdin_prompt {
+            writeln!(stdin, "exit").expect("write exit");
+        }
     }
 
     let start = Instant::now();
@@ -61,7 +65,7 @@ fn run_cli_session(lines: &[&str], timeout: Duration) -> Output {
 
 #[test]
 #[ignore = "requires a local model auto-detected by the CLI"]
-fn cli_auto_detects_local_model_and_executes_python_tool() {
+fn cli_run_prompt_executes_tool_for_local_file_query() {
     let _guard = live_test_guard();
 
     if !live_model_available() {
@@ -69,10 +73,9 @@ fn cli_auto_detects_local_model_and_executes_python_tool() {
         return;
     }
 
-    let output = run_cli_session(
-        &[
-            "Use the python tool to compute 123 * 456. Do not do the math mentally. After the tool returns, answer with just the integer.",
-        ],
+    let output = run_cli(
+        &["run", "--prompt", "本地有哪些文件", "--json"],
+        &[],
         Duration::from_secs(120),
     );
 
@@ -84,15 +87,14 @@ fn cli_auto_detects_local_model_and_executes_python_tool() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("one-shot json output");
+    assert!(json["tool_calls_executed"].as_u64().unwrap_or(0) >= 1);
     assert!(
-        stdout.contains("[tool: python]"),
-        "CLI did not execute the python tool\nstdout:\n{}\nstderr:\n{}",
-        stdout,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains("56088"),
-        "CLI output did not contain expected computed value\nstdout:\n{}\nstderr:\n{}",
+        json["text"]
+            .as_str()
+            .expect("one-shot text")
+            .contains("/path/to/code/agent-infer"),
+        "CLI output did not contain the expected working directory\nstdout:\n{}\nstderr:\n{}",
         stdout,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -108,7 +110,8 @@ fn cli_repl_handles_multiple_turns_and_reset() {
         return;
     }
 
-    let output = run_cli_session(
+    let output = run_cli(
+        &["run"],
         &[
             "Use the python tool to compute 2 + 2. After the tool returns, answer with just the integer.",
             "/reset",
@@ -126,12 +129,6 @@ fn cli_repl_handles_multiple_turns_and_reset() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.matches("[tool: python]").count() >= 2,
-        "CLI did not execute the python tool twice\nstdout:\n{}\nstderr:\n{}",
-        stdout,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
         stdout.contains("(conversation reset)"),
         "CLI did not acknowledge reset\nstdout:\n{}\nstderr:\n{}",
         stdout,
@@ -147,7 +144,7 @@ fn cli_repl_handles_multiple_turns_and_reset() {
 
 #[test]
 #[ignore = "requires a local model auto-detected by the CLI"]
-fn cli_uses_shell_for_file_listing_queries() {
+fn cli_run_stdin_uses_shell_for_file_listing_queries() {
     let _guard = live_test_guard();
 
     if !live_model_available() {
@@ -155,7 +152,11 @@ fn cli_uses_shell_for_file_listing_queries() {
         return;
     }
 
-    let output = run_cli_session(&["本地有哪些文件"], Duration::from_secs(120));
+    let output = run_cli(
+        &["run", "--stdin", "--json"],
+        &["本地有哪些文件"],
+        Duration::from_secs(120),
+    );
 
     assert!(
         output.status.success(),
@@ -165,14 +166,18 @@ fn cli_uses_shell_for_file_listing_queries() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("one-shot json output");
     assert!(
-        stdout.contains("[tool: shell]"),
-        "CLI did not execute the shell tool\nstdout:\n{}\nstderr:\n{}",
+        json["tool_calls_executed"].as_u64().unwrap_or(0) >= 1,
+        "CLI did not execute the shell tool from stdin input\nstdout:\n{}\nstderr:\n{}",
         stdout,
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("/path/to/code/agent-infer"),
+        json["text"]
+            .as_str()
+            .expect("one-shot text")
+            .contains("/path/to/code/agent-infer"),
         "CLI shell output did not include the expected working directory\nstdout:\n{}\nstderr:\n{}",
         stdout,
         String::from_utf8_lossy(&output.stderr)

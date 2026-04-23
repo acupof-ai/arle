@@ -300,10 +300,10 @@ mod tests {
     #[test]
     fn abbreviate_path_preserves_head_and_tail_components() {
         let abbreviated = abbreviate_path(Path::new(
-            "/path/to/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/73e3e38d981303bc594367cd910ea6eb48349da8",
+            "/opt/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/73e3e38d981303bc594367cd910ea6eb48349da8",
         ));
 
-        assert!(abbreviated.starts_with("/path/to/"));
+        assert!(abbreviated.starts_with("/opt/huggingface/"));
         assert!(abbreviated.contains("/.../"));
         assert!(abbreviated.ends_with(
             "models--mlx-community--Qwen3-0.6B-4bit/snapshots/73e3e38d981303bc594367cd910ea6eb48349da8"
