@@ -1,10 +1,15 @@
 # Support Matrix
 
-This document states what `agent-infer` currently supports, what is still
-limited, and what validation exists for each area.
+This document is the canonical support-status truth for `agent-infer`.
 
-If something is not listed as supported here, do not assume it is supported
-just because it compiled locally.
+It states what the repository currently supports, what is still limited, and
+what validation exists for each area. If something is not listed as supported
+here, do not assume it is supported just because it compiled locally.
+
+Project-positioning note: the repository is runtime-first. `infer` is the
+primary serving/runtime surface; `arle` and the in-tree train/eval flows are
+integrated on top of that runtime rather than standing as a second equal
+product line.
 
 State reflected here is based on repository evidence as of 2026-04-23.
 
@@ -131,8 +136,9 @@ update all of the following together:
 
 1. `README.md`
 2. `ROADMAP.md` if roadmap status changed
-3. this file
-4. `CHANGELOG.md` when user-visible
+3. `docs/index.md` if the active-doc listing changed
+4. this file
+5. `CHANGELOG.md` when user-visible
 
 Related docs:
 

@@ -3,6 +3,10 @@
 **Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
 **Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相，`infer --train-control-url` 可选暴露代理入口） / 训练端从零写 / sole train-side model line is the Qwen3.5-family path with HF-style checkpoint dirs; hybrid linear-attn is now locally accepted on CPU + Metal across scratch pretrain / LoRA-eval / RL, handwritten Transformer/TinyLM runtime compat deleted
 
+This plan executes under the runtime-first rule: `infer` remains the primary
+runtime truth, and Phase 6 work is only valid if it converges on that spine
+instead of creating a second product boundary.
+
 ---
 
 ## 0. 阅读顺序
@@ -20,7 +24,7 @@
 > metrics / server 的真实边界，先看
 > [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
 > 和 [`docs/codebase-map.md`](../codebase-map.md)。
-> 当前 train-side 训练模型实现已经是 Qwen3.5-family 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线。当前 acceptance 切分也已经更新：hybrid linear-attn 已经在 CPU / Metal 上覆盖 scratch pretrain、LoRA/eval、以及 RL；剩余主要是 CUDA hybrid runtime acceptance，而不是本地 runtime 缺口。
+> 当前 train-side 训练模型实现已经是 Qwen3.5-family 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再作为单独主线描述。当前 acceptance 切分也已经更新：hybrid linear-attn 已经在 CPU / Metal 上覆盖 scratch pretrain、LoRA/eval、以及 RL；剩余主要是 CUDA hybrid runtime acceptance，而不是本地 runtime 缺口。
 
 ---
 

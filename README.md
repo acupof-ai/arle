@@ -32,17 +32,18 @@
 <!-- Keep this list to the last 3 entries. Older history lives in CHANGELOG.md. -->
 
 - **2026-04-23** — The `arle` front door now unifies `train pretrain|sft|grpo|multi-turn|eval` and `data download|convert` under one top-level Rust CLI, instead of requiring users to memorize separate train binaries. Entry-point consolidation notes: [`docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md`](docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md).
-- **2026-04-22** — CUDA `Qwen3.5` now ships through a true packed multi-request paged-prefill path. Full-attention layers write directly into the paged pool, hybrid linear-attention layers use packed recurrent-state launches, and paged-prefill logits now land on the canonical sampling surface. See [`docs/plans/2026-04-22-sglang-gap-closure-execution.md`](docs/plans/2026-04-22-sglang-gap-closure-execution.md).
+- **2026-04-22** — CUDA `Qwen3.5` now ships through a true packed multi-request paged-prefill path. Full-attention layers write directly into the paged pool, hybrid linear-attention layers use packed recurrent-state launches, and paged-prefill logits now land on the canonical sampling surface. Current decode truth now lives in [`docs/plans/2026-04-23-cuda-decode-sglang-alignment.md`](docs/plans/2026-04-23-cuda-decode-sglang-alignment.md).
 - **2026-04-20** — Metal DFlash long-prompt prefill fixed (`fast_forward_prefill`, commit `3bc8802`) and batched terminal `eval` deferred via `async_eval` (commit `d8cb2f4`). DFlash is now default-on for Qwen3.5 on Metal, validated across guidellm's 10-strategy sweep with 5400-token prompts — zero `WrongPhase` errors, 100% request success. Canonical usage: [`docs/resources/metal-dflash.md`](docs/resources/metal-dflash.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
 
 ARLE stands for **agent reinforcement learning engine**: one Rust workspace for
 serving, agent execution, training, evaluation, and the toolchain around them.
-The serving/runtime path is still CUDA-first, but the project identity is now
-broader than a standalone inference binary.
+The repository is still runtime-first: `infer` is the primary shipping surface,
+while `arle` and the in-tree train/eval flows extend that same Rust runtime
+instead of forming a second equal stack.
 
-In practice that shows up as three top-level surfaces:
+In practice that shows up as three runtime-led entry surfaces:
 
 - `infer` for OpenAI-compatible HTTP serving
 - `arle` for the local agent runtime plus `train/*` and `data/*` workflows
@@ -51,8 +52,7 @@ In practice that shows up as three top-level surfaces:
 ## 🚦 Status at a glance
 
 Five axes, each answering one question. Authoritative matrix lives in
-[docs/support-matrix.md](docs/support-matrix.md); stability tiers
-(**Stable** → **Beta** → **Dev**) are defined in
+[docs/support-matrix.md](docs/support-matrix.md); stability tiers are defined in
 [docs/stability-policy.md](docs/stability-policy.md).
 
 ### Backends — *where does it run?*
@@ -62,7 +62,7 @@ Five axes, each answering one question. Authoritative matrix lives in
 | **CUDA** | Linux + NVIDIA | **Stable** | Primary serving path. Continuous batching, paged KV, radix-backed reuse, tiered-KV readmission, FlashInfer, CUDA Graph decode, packed paged-prefill for Qwen3 and Qwen3.5. |
 | **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse. Still behind CUDA on serving-grade batched decode and long-context parity. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-identical parity, c=1..8 validated (2026-04-20). |
-| **CPU** | Portable | **Dev only** | Smoke tests and request-path validation. Not a serving target. |
+| **CPU** | Portable | **Development-only** | Smoke tests and request-path validation. Not a serving target. |
 
 ### Models — *what does it load?*
 
@@ -121,11 +121,11 @@ ARLE (agent reinforcement learning engine) treats this as the core problem in bo
 | **Scheduler overlap** | CUDA scheduler overlaps decode launch/readback across iterations, sleeps on fetch waits instead of spinning, and uses an emit worker for streaming text decode and stop scanning. | Better CPU/GPU overlap and less scheduler-side overhead at concurrency |
 | **Shared runtime authority** | `infer`, `arle`, and the in-tree train/eval jobs resolve models and reuse the same Rust runtime/model contracts. | Serving, local agent work, and RL tooling stay on one code path instead of drifting across separate stacks |
 
-ARLE is therefore not "an inference engine plus some scripts". The inference
-spine is what the wider agent RL loop builds on: shared Rust model/runtime
-authority, train-side binaries in the same workspace, and a top-level CLI that
-can act as local agent, training front-end, or evaluation entrypoint without
-bouncing through a separate Python control plane.
+ARLE is therefore runtime-first, not two adjacent projects living in one tree.
+The inference spine is what the wider agent RL loop builds on: shared Rust
+model/runtime authority, train-side binaries in the same workspace, and a
+top-level CLI that can act as local agent, training front-end, or evaluation
+entrypoint without bouncing through a separate Python control plane.
 
 Current benchmark closure work is focused on high-concurrency CUDA parity
 (`c4/c8/c16`) against SGLang; treat the dated headline snapshots below as
@@ -140,9 +140,10 @@ Canonical benchmark source of truth is the dated snapshot log under
 [`scripts/bench_guidellm.sh`](scripts/bench_guidellm.sh).
 
 The published numbers below are still mostly serving-side because the active
-benchmark closure program is concentrated on CUDA parity. The project surface is
-broader than that chart: the same runtime authority also backs the local
-`arle` agent front door and the in-tree train/eval stack.
+benchmark closure program is concentrated on CUDA parity. That is deliberate:
+runtime credibility remains the primary benchmark surface, while the same
+runtime authority also backs the local `arle` front door and the in-tree
+train/eval stack.
 
 The current CUDA benchmark program is not "publish one timeless headline
 number"; it is an active closure effort against SGLang focused on the
@@ -153,7 +154,7 @@ remaining high-concurrency gap:
 - `c4/c8/c16`: still the main open optimization target
 
 Active execution plan:
-[`docs/plans/2026-04-22-sglang-gap-closure-execution.md`](docs/plans/2026-04-22-sglang-gap-closure-execution.md)
+[`docs/plans/2026-04-23-cuda-decode-sglang-alignment.md`](docs/plans/2026-04-23-cuda-decode-sglang-alignment.md)
 
 <details>
 <summary>Agent benchmark (multi-turn tool calling)</summary>
