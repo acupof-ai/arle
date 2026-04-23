@@ -27,6 +27,9 @@
 
 <section class="hero" aria-label="banner">
 <h1 class="sr-only">ARLE(1) — runtime-first Rust workspace</h1>
+<div class="hero-shell">
+<div class="hero-art">
+<p class="hero-kicker">runtime-first rust workspace</p>
 <pre class="ascii" aria-hidden="true">
 <span class="ascii-art"> █████╗ ██████╗ ██╗     ███████╗
 ██╔══██╗██╔══██╗██║     ██╔════╝
@@ -35,11 +38,38 @@
 ██║  ██║██║  ██║███████╗███████╗
 ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝</span>
 </pre>
+<p class="subline">agent reinforcement learning engine</p>
 <p class="tagline">
   一套运行时权威。<span class="hl">infer</span> 负责 OpenAI 兼容 serving；
   <span class="hl">arle</span> 负责本地 agent、训练、评测与数据工作流前门。
 </p>
+<div class="hero-signals" aria-label="project signals">
+  <span>CUDA 主路径</span>
+  <span>Metal beta</span>
+  <span>OpenAI 兼容</span>
+  <span>统一前门</span>
+</div>
+</div>
+<aside class="hero-panel" aria-label="project summary">
+  <p class="panel-kicker">PUBLIC SURFACE</p>
+  <p class="panel-title"><code>infer</code> 负责 serving，<code>arle</code> 负责操作前门。</p>
+  <table class="hero-meta">
+    <tbody>
+      <tr><td>项目名</td><td>ARLE</td></tr>
+      <tr><td>前门</td><td><code>arle</code></td></tr>
+      <tr><td>服务面</td><td><code>infer</code></td></tr>
+      <tr><td>主后端</td><td>CUDA</td></tr>
+      <tr><td>本地路径</td><td>Metal / CPU</td></tr>
+    </tbody>
+  </table>
+  <p class="panel-note">
+    文档、二进制、train/eval 流程和数据集工具都跟随同一套 workspace 演进，
+    不再拆成几条并行口径。
+  </p>
+</aside>
+</div>
 <nav class="jumps" aria-label="sections">
+  <a href="#glance">[概览]</a>
   <a href="#synopsis">[概要]</a>
   <a href="#surfaces">[入口面]</a>
   <a href="#status">[状态]</a>
@@ -63,13 +93,41 @@
 </p>
 </section>
 
+<section id="glance">
+<h2>概览</h2>
+<div class="glance-grid">
+  <article class="mini-card">
+    <h3>&mdash; Runtime 主干</h3>
+    <p>
+      Serving 仍是主线。<code>infer</code> 是生成、metrics、stats 与
+      session 的标准 HTTP 服务面。
+    </p>
+  </article>
+  <article class="mini-card">
+    <h3>&mdash; 一张前门</h3>
+    <p>
+      <code>arle run</code>、<code>arle train</code> 与
+      <code>arle data</code> 把用户入口收成一张前门，不再分散成多组二进制。
+    </p>
+  </article>
+  <article class="mini-card">
+    <h3>&mdash; 同一套权威</h3>
+    <p>
+      运行时代码、模型加载、train/eval 流程与公共文档都落在同一套 Rust
+      workspace 里，避免口径漂移。
+    </p>
+  </article>
+</div>
+</section>
+
 <section id="synopsis">
 <h2>概要</h2>
 <pre class="cmd"><span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
 <span class="p">$</span> cargo build --release --features cli --bin arle
 <span class="p">$</span> ./target/release/arle --doctor
-<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B run --prompt <i>"总结一下这个仓库"</i>
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B \
+    run --prompt <i>"总结一下这个仓库"</i>
 <span class="p">$</span> ./target/release/arle train env
 <span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span></pre>
 </section>
@@ -101,22 +159,28 @@
 
 <section id="quickstart">
 <h2>快速开始</h2>
-
+<div class="quickgrid">
+<article class="mini-card quick-card">
 <h3>&mdash; 本地 CLI 冒烟</h3>
 <pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/arle
 <span class="p">$</span> cd arle
 <span class="p">$</span> ./setup.sh
-<span class="p">$</span> cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
+<span class="p">$</span> cargo build --release --no-default-features \
+    --features cpu,no-cuda,cli --bin arle
 <span class="p">$</span> ./target/release/arle --doctor
-<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B run --prompt <i>"用一句话打个招呼"</i>
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B \
+    run --prompt <i>"用一句话打个招呼"</i>
 <span class="p">$</span> ./target/release/arle train env</pre>
-
+</article>
+<article class="mini-card quick-card">
 <h3>&mdash; Serving 冒烟</h3>
 <pre class="cmd"><span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
 <span class="p">$</span> curl http://127.0.0.1:8000/v1/chat/completions \
     -H <i>'Content-Type: application/json'</i> \
     -d <i>'{"messages":[{"role":"user","content":"你好"}],"max_tokens":64}'</i></pre>
+</article>
+</div>
 
 <p class="note">
   默认 CUDA CLI 用 <code>--features cli</code>，Apple Silicon 用 <code>metal,no-cuda,cli</code>，便携冒烟路径用 <code>cpu,no-cuda,cli</code>。<code>./setup.sh</code> 会引导 Rust、Python、Zig 和本地检查。
