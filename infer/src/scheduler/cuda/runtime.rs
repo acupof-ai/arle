@@ -1,4 +1,5 @@
 use super::budget::{PageBudget, full_request_target};
+use super::core::PrefetchTicketState;
 use super::core::{is_full_sealed_prefix, sealed_block_token_count};
 use super::{
     ActiveRequest, CompletionStreamDelta, FinishReason, ModelForward, Ordering, Phase,
@@ -65,6 +66,42 @@ struct DeferredWaitingRequest {
     incoming: super::IncomingRequest,
     prompt_tokens: Vec<u32>,
     hint: WaitingRequestHint,
+}
+
+fn staged_prefix_direct_host_blocks(
+    plan: &crate::kv_tier::ReadmissionPlan,
+) -> Option<Vec<crate::kv_tier::FetchedBlock>> {
+    let mut fetched_blocks = Vec::new();
+    let mut host_blocks = 0usize;
+    for block in &plan.blocks {
+        match block.source.as_ref() {
+            None => {}
+            Some(ReadmissionSource::HostPinned { region }) => {
+                host_blocks += 1;
+                fetched_blocks.push(crate::kv_tier::FetchedBlock {
+                    block_id: block.block_id,
+                    host_region: *region,
+                    byte_len: region.len,
+                    release_after_promote: false,
+                });
+            }
+            Some(ReadmissionSource::Disk { .. } | ReadmissionSource::Remote { .. }) => {
+                return None;
+            }
+        }
+    }
+    (host_blocks > 0).then_some(fetched_blocks)
+}
+
+fn staged_prefix_prefetch_state(
+    plan: &crate::kv_tier::ReadmissionPlan,
+) -> Option<PrefetchTicketState> {
+    let (host_blocks, disk_blocks, remote_blocks) = plan.source_counts();
+    (disk_blocks + remote_blocks > 0).then_some(PrefetchTicketState {
+        host_blocks,
+        disk_blocks,
+        remote_blocks,
+    })
 }
 
 pub(super) fn best_reusable_slot_for_radix_hit(
@@ -569,6 +606,9 @@ impl<M: ModelForward> Scheduler<M> {
             self.request(slot_idx).map(|req| &req.phase),
             Some(Phase::WaitingFetch)
         ) {
+            if self.try_complete_direct_host_staged_prefix(slot_idx) {
+                return;
+            }
             let Some(staged_prefix) = self
                 .request(slot_idx)
                 .and_then(|req| req.staged_prefix.as_ref())
@@ -711,6 +751,46 @@ impl<M: ModelForward> Scheduler<M> {
                 self.release_host_region(block.host_region);
             }
         }
+    }
+
+    fn maybe_prefetch_staged_prefix(&mut self, plan: &PrefixAdmissionPlan) {
+        let Some(staged_prefix) = plan.staged_prefix_plan.as_ref() else {
+            return;
+        };
+        let Some(prefetch_state) = staged_prefix_prefetch_state(staged_prefix) else {
+            return;
+        };
+        if !self.tier_policy.allow_prefetch(
+            self.coordinator_handle
+                .queue_stats(crate::kv_tier::QueueKind::Fetch),
+        ) {
+            return;
+        }
+        let Some(fetch_key) = staged_prefix.fetch_key() else {
+            return;
+        };
+        if self.fetch_dedupe.contains_key(&fetch_key) {
+            return;
+        }
+        let Some(fetch_requests) = staged_prefix.fetch_requests(&self.host_pinned_pool) else {
+            return;
+        };
+        let Some(ticket) = self.coordinator_handle.submit_fetch(fetch_requests) else {
+            return;
+        };
+        self.fetch_dedupe.insert(fetch_key.clone(), ticket);
+        self.fetch_ticket_keys.insert(ticket, fetch_key);
+        self.fetch_ticket_started_at
+            .insert(ticket, std::time::Instant::now());
+        self.prefetch_fetching.insert(ticket, prefetch_state);
+        info!(
+            "Prefetch {} queued: matched={} src=h:{}/d:{}/r:{}",
+            ticket.0,
+            staged_prefix.matched_len,
+            prefetch_state.host_blocks,
+            prefetch_state.disk_blocks,
+            prefetch_state.remote_blocks
+        );
     }
 
     fn validate_staged_sealed_prefix(
@@ -967,6 +1047,89 @@ impl<M: ModelForward> Scheduler<M> {
         ready
     }
 
+    fn complete_ready_fetch_waiters(
+        &mut self,
+        ready_waiters: Vec<FetchWaiter>,
+        blocks: &[crate::kv_tier::FetchedBlock],
+        readmit_started_at: Option<std::time::Instant>,
+    ) {
+        if ready_waiters.is_empty() {
+            self.release_unclaimed_fetch_regions(blocks);
+            return;
+        }
+        for waiter in &ready_waiters {
+            self.prefix_cache.release(&waiter.staged_prefix.block_ids());
+        }
+        if let Err(err) = self.promote_fetched_prefix(&ready_waiters[0], blocks) {
+            warn!(
+                "Request {}: staged prefix fetch failed, falling back to cold prefill: {}",
+                ready_waiters[0].request_id, err
+            );
+            for waiter in ready_waiters {
+                self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
+            }
+            self.release_unclaimed_fetch_regions(blocks);
+            return;
+        }
+        let (host_blocks, disk_blocks, remote_blocks) =
+            ready_waiters[0].staged_prefix.source_counts();
+        if let Some(started_at) = readmit_started_at {
+            info!(
+                "Request {}: staged prefix ready in {:.1}ms src=h:{}/d:{}/r:{} waiters={}",
+                ready_waiters[0].request_id,
+                started_at.elapsed().as_secs_f64() * 1000.0,
+                host_blocks,
+                disk_blocks,
+                remote_blocks,
+                ready_waiters.len()
+            );
+        }
+        for waiter in ready_waiters {
+            match self.adopt_promoted_prefix(&waiter) {
+                Ok(true) => {
+                    self.step_new(waiter.slot_idx);
+                    if matches!(
+                        self.request(waiter.slot_idx).map(|req| &req.phase),
+                        Some(Phase::Prefilling { .. })
+                    ) {
+                        self.queue_prefill(waiter.slot_idx);
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        "Request {}: staged prefix adopt failed, falling back to cold prefill: {}",
+                        waiter.request_id, err
+                    );
+                    self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
+                }
+            }
+        }
+        self.release_unclaimed_fetch_regions(blocks);
+    }
+
+    fn try_complete_direct_host_staged_prefix(&mut self, slot_idx: usize) -> bool {
+        let Some(req) = self.request(slot_idx) else {
+            return false;
+        };
+        let Some(staged_prefix) = req.staged_prefix.as_ref() else {
+            return false;
+        };
+        let Some(fetched_blocks) = staged_prefix_direct_host_blocks(staged_prefix) else {
+            return false;
+        };
+        let waiter = FetchWaiter {
+            slot_idx,
+            request_id: req.id,
+            prompt_tokens: req.prompt_tokens.clone(),
+            session_id: req.session_id.clone(),
+            staged_prefix: staged_prefix.clone(),
+        };
+        let start = std::time::Instant::now();
+        self.complete_ready_fetch_waiters(vec![waiter], &fetched_blocks, Some(start));
+        true
+    }
+
     fn handle_coordinator_event(&mut self, event: crate::kv_tier::CoordinatorEvent) {
         // The runtime consumes coordinator results in one place so the request
         // state machine stays linear:
@@ -1027,55 +1190,33 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
             crate::kv_tier::CoordinatorEvent::FetchCompleted { ticket, blocks } => {
-                self.fetch_ticket_started_at.remove(&ticket);
-                let Some(waiters) = self.fetch_waiting.remove(&ticket) else {
-                    self.release_unclaimed_fetch_regions(&blocks);
-                    return;
-                };
+                let fetch_started_at = self.fetch_ticket_started_at.remove(&ticket);
+                let prefetch_state = self.prefetch_fetching.remove(&ticket);
+                let waiters = self.fetch_waiting.remove(&ticket).unwrap_or_default();
                 if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
                     self.fetch_dedupe.remove(&key);
                 }
+                if waiters.is_empty() {
+                    if let Some(prefetch_state) = prefetch_state {
+                        let materialized = self.materialize_prefetched_host_blocks(&blocks);
+                        info!(
+                            "Prefetch {} ready: {:.1}ms materialized={} src=h:{}/d:{}/r:{}",
+                            ticket.0,
+                            fetch_started_at
+                                .map(|started_at| started_at.elapsed().as_secs_f64() * 1000.0)
+                                .unwrap_or_default(),
+                            materialized,
+                            prefetch_state.host_blocks,
+                            prefetch_state.disk_blocks,
+                            prefetch_state.remote_blocks
+                        );
+                    } else {
+                        self.release_unclaimed_fetch_regions(&blocks);
+                    }
+                    return;
+                }
                 let ready_waiters = self.collect_fetch_waiters(waiters);
-                if ready_waiters.is_empty() {
-                    self.release_unclaimed_fetch_regions(&blocks);
-                    return;
-                }
-                for waiter in &ready_waiters {
-                    self.prefix_cache.release(&waiter.staged_prefix.block_ids());
-                }
-                if let Err(err) = self.promote_fetched_prefix(&ready_waiters[0], &blocks) {
-                    warn!(
-                        "Request {}: staged prefix fetch failed, falling back to cold prefill: {}",
-                        ready_waiters[0].request_id, err
-                    );
-                    for waiter in ready_waiters {
-                        self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
-                    }
-                    self.release_unclaimed_fetch_regions(&blocks);
-                    return;
-                }
-                for waiter in ready_waiters {
-                    match self.adopt_promoted_prefix(&waiter) {
-                        Ok(true) => {
-                            self.step_new(waiter.slot_idx);
-                            if matches!(
-                                self.request(waiter.slot_idx).map(|req| &req.phase),
-                                Some(Phase::Prefilling { .. })
-                            ) {
-                                self.queue_prefill(waiter.slot_idx);
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(err) => {
-                            warn!(
-                                "Request {}: staged prefix adopt failed, falling back to cold prefill: {}",
-                                waiter.request_id, err
-                            );
-                            self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
-                        }
-                    }
-                }
-                self.release_unclaimed_fetch_regions(&blocks);
+                self.complete_ready_fetch_waiters(ready_waiters, &blocks, fetch_started_at);
             }
             crate::kv_tier::CoordinatorEvent::FetchFailed {
                 ticket,
@@ -1087,6 +1228,7 @@ impl<M: ModelForward> Scheduler<M> {
                     ticket.0, failed_block, reason
                 );
                 self.fetch_ticket_started_at.remove(&ticket);
+                self.prefetch_fetching.remove(&ticket);
                 let waiters = self.fetch_waiting.remove(&ticket).unwrap_or_default();
                 if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
                     self.fetch_dedupe.remove(&key);
@@ -1351,15 +1493,15 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn assign_slots(&mut self) {
+        if self.waiting.is_empty() {
+            return;
+        }
         let length_contract = RequestLengthContract::derive(
             self.paged_kv_pool.max_total_tokens,
             self.effective_max_seq_len,
         );
         let _ = self.evict_prefix_cache_if_pressured();
         let mut available_free_slots = self.free_slots();
-        if available_free_slots.is_empty() {
-            return;
-        }
 
         let candidates = self.collect_admission_candidates(&available_free_slots, length_contract);
         let mut deferred_waiting = std::collections::VecDeque::new();
@@ -1382,6 +1524,7 @@ impl<M: ModelForward> Scheduler<M> {
             let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) =
                 Self::choose_admission_slot(&candidate.plan, &available_free_slots)
             else {
+                self.maybe_prefetch_staged_prefix(&candidate.plan);
                 let hint = WaitingRequestHint::from_plan(&candidate.plan, 0);
                 self.release_admission_plan(&candidate.plan);
                 insert_deferred_waiting_request(
@@ -1404,6 +1547,7 @@ impl<M: ModelForward> Scheduler<M> {
                 candidate.incoming.max_tokens,
                 reserved_prefix_tokens,
             ) {
+                self.maybe_prefetch_staged_prefix(&candidate.plan);
                 let hint = WaitingRequestHint::from_plan(&candidate.plan, reusable_prefix_len);
                 self.release_admission_plan(&candidate.plan);
                 insert_deferred_waiting_request(
@@ -1539,13 +1683,16 @@ mod tests {
         DeferredWaitingRequest, PrefixAdmissionPlan, WaitingInsertBias, WaitingRequestHint,
         best_reusable_slot_for_radix_hit, finish_rejected_request, insert_deferred_waiting_request,
         insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu,
-        matched_sealed_lookup_blocks,
+        matched_sealed_lookup_blocks, staged_prefix_direct_host_blocks,
+        staged_prefix_prefetch_state,
     };
+    use crate::kv_tier::{HostPinnedRegion, ReadmissionBlock, ReadmissionPlan, ReadmissionSource};
     use crate::prefix_cache::BlockId;
     use crate::scheduler::cuda::budget::{PageBudget, full_request_target};
     use crate::scheduler::cuda::core::is_full_sealed_prefix;
     use crate::scheduler::{IncomingRequest, RequestPriority};
     use crate::server_engine::FinishReason;
+    use crate::types::BlockFingerprint;
     use std::collections::{HashMap, VecDeque};
     use tokio::sync::mpsc;
 
@@ -1592,6 +1739,92 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 17);
         assert_eq!(usage.completion_tokens, 0);
         assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn direct_host_blocks_require_host_only_sources() {
+        let region = HostPinnedRegion {
+            offset: 4096,
+            len: 2048,
+        };
+        let host_only = ReadmissionPlan::new(
+            16,
+            vec![ReadmissionBlock {
+                block_id: BlockId(7),
+                fingerprint: BlockFingerprint([7; 16]),
+                source: Some(ReadmissionSource::HostPinned { region }),
+            }],
+        );
+        let fetched = staged_prefix_direct_host_blocks(&host_only).expect("host-only fetch blocks");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].block_id, BlockId(7));
+        assert_eq!(fetched[0].host_region, region);
+        assert!(!fetched[0].release_after_promote);
+
+        let mixed = ReadmissionPlan::new(
+            16,
+            vec![
+                ReadmissionBlock {
+                    block_id: BlockId(8),
+                    fingerprint: BlockFingerprint([8; 16]),
+                    source: Some(ReadmissionSource::HostPinned { region }),
+                },
+                ReadmissionBlock {
+                    block_id: BlockId(9),
+                    fingerprint: BlockFingerprint([9; 16]),
+                    source: Some(ReadmissionSource::Disk {
+                        fingerprint: BlockFingerprint([9; 16]),
+                        payload_len: 4096,
+                    }),
+                },
+            ],
+        );
+        assert!(staged_prefix_direct_host_blocks(&mixed).is_none());
+    }
+
+    #[test]
+    fn prefetch_state_only_exists_for_slower_tier_blocks() {
+        let host_only = ReadmissionPlan::new(
+            16,
+            vec![ReadmissionBlock {
+                block_id: BlockId(1),
+                fingerprint: BlockFingerprint([1; 16]),
+                source: Some(ReadmissionSource::HostPinned {
+                    region: HostPinnedRegion {
+                        offset: 0,
+                        len: 4096,
+                    },
+                }),
+            }],
+        );
+        assert!(staged_prefix_prefetch_state(&host_only).is_none());
+
+        let disk_plan = ReadmissionPlan::new(
+            32,
+            vec![
+                ReadmissionBlock {
+                    block_id: BlockId(2),
+                    fingerprint: BlockFingerprint([2; 16]),
+                    source: None,
+                },
+                ReadmissionBlock {
+                    block_id: BlockId(3),
+                    fingerprint: BlockFingerprint([3; 16]),
+                    source: Some(ReadmissionSource::Disk {
+                        fingerprint: BlockFingerprint([3; 16]),
+                        payload_len: 4096,
+                    }),
+                },
+            ],
+        );
+        assert_eq!(
+            staged_prefix_prefetch_state(&disk_plan),
+            Some(super::PrefetchTicketState {
+                host_blocks: 0,
+                disk_blocks: 1,
+                remote_blocks: 0,
+            })
+        );
     }
 
     fn queued_request(label: &str, priority: RequestPriority) -> IncomingRequest {
