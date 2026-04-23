@@ -88,11 +88,11 @@ Four axes, each answering one question. Authoritative matrix lives in
   API-level shifts. Fresh project state lives in the two sections above.
 -->
 
-## Why ARLE (agent rl engine)?
+## Why ARLE (agent reinforcement learning engine)?
 
 In agent workloads every turn pays a prefill tax: system prompt + conversation history + tool results must be re-processed. As context grows, **prefill dominates latency**.
 
-ARLE (agent rl engine) treats this as the core problem:
+ARLE (agent reinforcement learning engine) treats this as the core problem:
 
 | Capability | What it does | Impact |
 |---|---|---|
@@ -241,18 +241,18 @@ tool-call deltas.
 Built-in agent runtime with tool calling:
 
 ```bash
-./target/release/agent-infer \
+./target/release/arle \
   --max-turns 10 --temperature 0
 ```
 
-The root CLI binary is behind the `cli` feature. Without `--features cli`, `agent-infer` is not built.
+The root CLI binary is behind the `cli` feature. Without `--features cli`, `arle` is not built.
 
 The CLI is agent-first: there is no separate chat mode and no `--tools`
 switch. Tool calling is the default runtime.
 
 Current package boundary for the CLI:
 
-- `agent-infer` -> thin binary wrapper
+- `arle` -> thin binary wrapper
 - `cli` -> REPL and slash commands
 - `infer` -> `server_engine::LoadedInferenceEngine` backend loading and `hf_hub::resolve_model_source` for model auto-discovery
 - `agent` -> conversation loop and tool-call recovery
@@ -270,13 +270,13 @@ from prose. Add `--strict` when you want `--doctor` to exit non-zero on
 warnings.
 
 ```bash
-cargo run -p agent-infer --release --no-default-features --features cpu,no-cuda,cli -- \
+cargo run -p agent-infer --bin arle --release --no-default-features --features cpu,no-cuda,cli -- \
   --doctor
 
-cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
   --doctor --json
 
-cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
   --doctor --json --strict
 ```
 
@@ -286,10 +286,10 @@ recommendations without the full environment report. It also supports
 `--json`.
 
 ```bash
-cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
   --list-models
 
-cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
   --list-models --json
 ```
 
@@ -319,7 +319,7 @@ cargo run --release --no-default-features --features metal,no-cuda,cli -- \
 ```
 
 The CLI keeps conversation history across turns, stores line history in
-`~/.agent-infer-history`, and supports slash commands:
+`~/.arle-history`, and supports slash commands:
 
 - `/help` for command help
 - `/reset` or `/clear` to clear the current conversation
@@ -335,7 +335,7 @@ The CLI keeps conversation history across turns, stores line history in
 
 Workspace split:
 
-- `agent-infer` — thin binary wrapper
+- `arle` — thin binary wrapper
 - `cli` — REPL / CLI flow
 - `agent` — conversation state, tool-call recovery, agent turn loop
 - `tools` / `chat` — tool execution helpers and protocol types
@@ -392,7 +392,7 @@ Detailed runtime ownership graph:
 
 ## Stability and Support
 
-`agent-infer` uses explicit stability tiers:
+`arle` uses explicit stability tiers:
 
 - **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`,
   `GET /v1/models`, `GET /healthz`, `GET /readyz`), `GET /metrics`,
@@ -428,7 +428,7 @@ cargo clippy --workspace -- -D warnings                # Lint
 cargo fmt --all -- --check                             # Format
 
 # CPU backend smoke path (downloads runtime assets like config/tokenizer, not full weights)
-cargo run -p agent-infer --no-default-features --features cpu,no-cuda,cli -- \
+cargo run -p agent-infer --bin arle --no-default-features --features cpu,no-cuda,cli -- \
   --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
 
 # E2E (requires GPU + model weights)

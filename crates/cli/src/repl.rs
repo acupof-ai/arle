@@ -848,7 +848,7 @@ fn handle_models_command(maybe_idx: Option<usize>) {
         let picked = &snapshots[idx_one_based - 1];
         println!("\x1b[2m(mid-REPL model hot-swap is not yet supported.)\x1b[0m");
         println!(
-            "\x1b[2m Restart with:  agent-infer --model-path {}\x1b[0m",
+            "\x1b[2m Restart with:  arle --model-path {}\x1b[0m",
             picked.path.display()
         );
         return;
@@ -1209,7 +1209,7 @@ mod tests {
         assert_eq!(count_export_turns(&history), 4);
 
         let md = render_history_markdown("Qwen/Qwen3-4B", &history);
-        assert!(md.starts_with("# agent-infer conversation — Qwen/Qwen3-4B"));
+        assert!(md.starts_with("# ARLE conversation — Qwen/Qwen3-4B"));
         assert!(md.contains("> Mode: agent"));
         assert!(md.contains("> Turns: 4"));
         assert!(md.contains("## You\n\nhello"));
