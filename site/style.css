@@ -152,8 +152,8 @@ code      { font-family: inherit; color: var(--coral-dim); }
 .ascii {
   margin: 0;
   padding: 2px 0 8px;
-  font-size: 11px;
-  line-height: 1.08;
+  font-size: 10px;
+  line-height: 1.1;
   color: var(--coral-dim);
   overflow-x: auto;
   letter-spacing: 0;
@@ -161,7 +161,7 @@ code      { font-family: inherit; color: var(--coral-dim); }
   font-weight: 700;
 }
 @media (min-width: 760px) {
-  .ascii { font-size: 12px; }
+  .ascii { font-size: 11px; }
 }
 
 .tagline {
