@@ -136,21 +136,21 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
     } else {
         Some(root_dir.clone())
     };
-    match train_test_inner(&args, &root_dir) {
+    let result = train_test_inner(&args, &root_dir);
+    if let Some(path) = cleanup_path.as_ref() {
+        let _ = fs::remove_dir_all(path);
+    }
+    match result {
         Ok(report) => {
-            if report.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&TrainTestJsonReport::from(&report)).unwrap()
-                );
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
                 println!("agent-infer train test");
                 println!("backend {}", report.backend);
                 println!("root {}", report.root_dir);
-                println!("convert {}", report.convert_status);
-                println!("pretrain {}", report.pretrain_status);
-                println!("sft {}", report.sft_status);
-                println!("eval {}", report.eval_status);
+                for step in &report.steps {
+                    println!("{} {}", step.name, step.status);
+                }
                 if let Some(eval_summary) = &report.eval_summary {
                     println!(
                         "eval metrics loss={:.6} ppl={:.6} tokens={}",
@@ -162,15 +162,9 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
                     println!("artifacts kept {}", report.root_dir);
                 }
             }
-            if let Some(path) = cleanup_path {
-                let _ = fs::remove_dir_all(path);
-            }
             ExitCode::SUCCESS
         }
         Err(err) => {
-            if let Some(path) = cleanup_path {
-                let _ = fs::remove_dir_all(path);
-            }
             eprintln!("[agent-infer train test] error: {err:#}");
             ExitCode::FAILURE
         }
@@ -230,48 +224,33 @@ fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
 }
 
 fn run_pretrain(args: TrainPretrainArgs) -> ExitCode {
-    match resolve_pretrain_invocation(&args) {
-        Ok(invocation) => run_train_invocation(
-            invocation,
-            args.render.dry_run,
-            args.render.json,
-            pretrain_entry::dispatch_from_args,
-        ),
-        Err(err) => {
-            eprintln!("[agent-infer train pretrain] error: {err:#}");
-            ExitCode::FAILURE
-        }
-    }
+    run_resolved_train_invocation(
+        "train pretrain",
+        resolve_pretrain_invocation(&args),
+        args.render.dry_run,
+        args.render.json,
+        pretrain_entry::dispatch_from_args,
+    )
 }
 
 fn run_sft(args: TrainSftArgs) -> ExitCode {
-    match resolve_sft_invocation(&args) {
-        Ok(invocation) => run_train_invocation(
-            invocation,
-            args.render.dry_run,
-            args.render.json,
-            train_sft_entry::dispatch_from_args,
-        ),
-        Err(err) => {
-            eprintln!("[agent-infer train sft] error: {err:#}");
-            ExitCode::FAILURE
-        }
-    }
+    run_resolved_train_invocation(
+        "train sft",
+        resolve_sft_invocation(&args),
+        args.render.dry_run,
+        args.render.json,
+        train_sft_entry::dispatch_from_args,
+    )
 }
 
 fn run_eval(args: TrainEvalArgs) -> ExitCode {
-    match resolve_eval_invocation(&args) {
-        Ok(invocation) => run_train_invocation(
-            invocation,
-            args.render.dry_run,
-            args.render.json,
-            eval_lm_entry::dispatch_from_args,
-        ),
-        Err(err) => {
-            eprintln!("[agent-infer train eval] error: {err:#}");
-            ExitCode::FAILURE
-        }
-    }
+    run_resolved_train_invocation(
+        "train eval",
+        resolve_eval_invocation(&args),
+        args.render.dry_run,
+        args.render.json,
+        eval_lm_entry::dispatch_from_args,
+    )
 }
 
 fn run_grpo(args: TrainGrpoArgs) -> ExitCode {
@@ -362,6 +341,25 @@ where
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("[agent-infer {}] error: {err}", invocation.command);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_resolved_train_invocation<F>(
+    command: &'static str,
+    resolved: Result<ResolvedInvocation>,
+    dry_run: bool,
+    json: bool,
+    run: F,
+) -> ExitCode
+where
+    F: FnOnce(Vec<String>) -> std::result::Result<(), String>,
+{
+    match resolved {
+        Ok(invocation) => run_train_invocation(invocation, dry_run, json, run),
+        Err(err) => {
+            eprintln!("[agent-infer {command}] error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -854,13 +852,9 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         backend,
         root_dir: root_dir.display().to_string(),
         wall_secs: started.elapsed().as_secs_f64(),
-        convert_status: "ok".to_string(),
-        pretrain_status: "ok".to_string(),
-        sft_status: "ok".to_string(),
-        eval_status: "ok".to_string(),
+        steps: ok_train_test_steps(),
         eval_summary: Some(eval_summary),
         kept_artifacts: args.keep_artifacts || args.out_dir.is_some(),
-        json: args.json,
     };
     Ok(report)
 }
@@ -1343,6 +1337,27 @@ fn printable_output(output: &str) -> &str {
     }
 }
 
+fn ok_train_test_steps() -> Vec<TrainTestStep> {
+    vec![
+        TrainTestStep {
+            name: "convert",
+            status: "ok",
+        },
+        TrainTestStep {
+            name: "pretrain",
+            status: "ok",
+        },
+        TrainTestStep {
+            name: "sft",
+            status: "ok",
+        },
+        TrainTestStep {
+            name: "eval",
+            status: "ok",
+        },
+    ]
+}
+
 impl TrainPretrainArgs {
     fn has_shape_overrides(&self) -> bool {
         self.hidden.is_some()
@@ -1696,22 +1711,8 @@ struct EstimateMemoryReport {
     save_dtype: String,
 }
 
-#[derive(Debug)]
-struct TrainTestReport {
-    backend: String,
-    root_dir: String,
-    wall_secs: f64,
-    convert_status: String,
-    pretrain_status: String,
-    sft_status: String,
-    eval_status: String,
-    eval_summary: Option<EvalSummary>,
-    kept_artifacts: bool,
-    json: bool,
-}
-
 #[derive(Debug, Serialize)]
-struct TrainTestJsonReport {
+struct TrainTestReport {
     backend: String,
     root_dir: String,
     wall_secs: f64,
@@ -1721,10 +1722,10 @@ struct TrainTestJsonReport {
     kept_artifacts: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct TrainTestStep {
     name: &'static str,
-    status: String,
+    status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -1739,36 +1740,6 @@ struct CapturedStepOutput {
     stdout: String,
 }
 
-impl From<&TrainTestReport> for TrainTestJsonReport {
-    fn from(value: &TrainTestReport) -> Self {
-        Self {
-            backend: value.backend.clone(),
-            root_dir: value.root_dir.clone(),
-            wall_secs: value.wall_secs,
-            steps: vec![
-                TrainTestStep {
-                    name: "convert",
-                    status: value.convert_status.clone(),
-                },
-                TrainTestStep {
-                    name: "pretrain",
-                    status: value.pretrain_status.clone(),
-                },
-                TrainTestStep {
-                    name: "sft",
-                    status: value.sft_status.clone(),
-                },
-                TrainTestStep {
-                    name: "eval",
-                    status: value.eval_status.clone(),
-                },
-            ],
-            eval_summary: value.eval_summary.clone(),
-            kept_artifacts: value.kept_artifacts,
-        }
-    }
-}
-
 impl SaveDtypeArg {
     fn bytes_per_param(self) -> u64 {
         match self {
@@ -1781,8 +1752,8 @@ impl SaveDtypeArg {
 #[cfg(test)]
 mod tests {
     use super::{
-        PretrainPresetArg, ScratchShape, default_chat_output_path, resolve_pretrain_invocation,
-        sanitize_name,
+        EvalSummary, PretrainPresetArg, ScratchShape, TrainTestReport, TrainTestStep,
+        default_chat_output_path, resolve_pretrain_invocation, sanitize_name,
     };
     use crate::args::{BackendArg, ExtraArgs, RenderArgs, TrainPretrainArgs};
     use std::path::Path;
@@ -1832,6 +1803,36 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("underlying pretrain defaults apply"))
         );
+    }
+
+    #[test]
+    fn train_test_report_serializes_public_fields_only() {
+        let report = TrainTestReport {
+            backend: "metal".to_string(),
+            root_dir: "/tmp/agent-infer-train-test".to_string(),
+            wall_secs: 1.25,
+            steps: vec![
+                TrainTestStep {
+                    name: "convert",
+                    status: "ok",
+                },
+                TrainTestStep {
+                    name: "eval",
+                    status: "ok",
+                },
+            ],
+            eval_summary: Some(EvalSummary {
+                loss: 1.0,
+                ppl: 2.0,
+                tokens: 3,
+            }),
+            kept_artifacts: false,
+        };
+        let value = serde_json::to_value(report).expect("serialize train test report");
+        assert_eq!(value["backend"], "metal");
+        assert_eq!(value["steps"][0]["name"], "convert");
+        assert_eq!(value["steps"][1]["status"], "ok");
+        assert!(value.get("json").is_none());
     }
 
     fn base_pretrain_args(tokenizer: &Path) -> TrainPretrainArgs {
