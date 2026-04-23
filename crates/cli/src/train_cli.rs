@@ -17,8 +17,8 @@ use train::{
 use crate::{
     args::{
         CliCommand, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs, DatasetFormatArg,
-        ModelFamilyArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs,
-        TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs, TrainMultiTurnArgs,
+        ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg, TrainArgs, TrainCommand,
+        TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs, TrainMultiTurnArgs,
         TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
@@ -45,6 +45,19 @@ mod train_multi_turn_entry;
 #[allow(dead_code)]
 #[path = "../../train/src/bin/train_sft.rs"]
 mod train_sft_entry;
+
+const TRAIN_ENV_COMMANDS: &[&str] = &[
+    "train env",
+    "train test",
+    "train estimate-memory",
+    "train pretrain",
+    "train sft",
+    "train grpo",
+    "train multi-turn",
+    "train eval",
+    "data download",
+    "data convert",
+];
 
 pub(crate) fn run(command: CliCommand) -> ExitCode {
     match command {
@@ -92,18 +105,10 @@ fn run_train_env(args: TrainEnvArgs) -> Result<()> {
             .ok()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unknown>".to_string()),
-        commands: vec![
-            "train env".to_string(),
-            "train test".to_string(),
-            "train estimate-memory".to_string(),
-            "train pretrain".to_string(),
-            "train sft".to_string(),
-            "train grpo".to_string(),
-            "train multi-turn".to_string(),
-            "train eval".to_string(),
-            "data download".to_string(),
-            "data convert".to_string(),
-        ],
+        commands: TRAIN_ENV_COMMANDS
+            .iter()
+            .map(|command| (*command).to_string())
+            .collect(),
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -224,51 +229,46 @@ fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
 }
 
 fn run_pretrain(args: TrainPretrainArgs) -> ExitCode {
-    run_resolved_train_invocation(
+    run_train_command(
         "train pretrain",
         resolve_pretrain_invocation(&args),
-        args.render.dry_run,
-        args.render.json,
+        &args.render,
         pretrain_entry::dispatch_from_args,
     )
 }
 
 fn run_sft(args: TrainSftArgs) -> ExitCode {
-    run_resolved_train_invocation(
+    run_train_command(
         "train sft",
         resolve_sft_invocation(&args),
-        args.render.dry_run,
-        args.render.json,
+        &args.render,
         train_sft_entry::dispatch_from_args,
     )
 }
 
 fn run_eval(args: TrainEvalArgs) -> ExitCode {
-    run_resolved_train_invocation(
+    run_train_command(
         "train eval",
         resolve_eval_invocation(&args),
-        args.render.dry_run,
-        args.render.json,
+        &args.render,
         eval_lm_entry::dispatch_from_args,
     )
 }
 
 fn run_grpo(args: TrainGrpoArgs) -> ExitCode {
-    let invocation = resolve_grpo_invocation(&args);
-    run_train_invocation(
-        invocation,
-        args.render.dry_run,
-        args.render.json,
+    run_train_command(
+        "train grpo",
+        Ok(resolve_grpo_invocation(&args)),
+        &args.render,
         train_grpo_entry::dispatch_from_args,
     )
 }
 
 fn run_multi_turn(args: TrainMultiTurnArgs) -> ExitCode {
-    let invocation = resolve_multi_turn_invocation(&args);
-    run_train_invocation(
-        invocation,
-        args.render.dry_run,
-        args.render.json,
+    run_train_command(
+        "train multi-turn",
+        Ok(resolve_multi_turn_invocation(&args)),
+        &args.render,
         train_multi_turn_entry::dispatch_from_args,
     )
 }
@@ -298,10 +298,11 @@ fn run_data_convert(args: DataConvertArgs) -> ExitCode {
         },
     };
 
-    if args.render.dry_run {
-        return print_invocation(invocation, args.render.json);
-    }
-    convert_dataset_entry::dispatch_from_args(invocation.argv)
+    run_passthrough_invocation(
+        invocation,
+        &args.render,
+        convert_dataset_entry::dispatch_from_args,
+    )
 }
 
 fn run_data_download(args: DataDownloadArgs) -> ExitCode {
@@ -319,23 +320,19 @@ fn run_data_download(args: DataDownloadArgs) -> ExitCode {
         notes: Vec::new(),
     };
 
-    if args.render.dry_run {
-        return print_invocation(invocation, args.render.json);
-    }
-    download_dataset_entry::dispatch_from_args(invocation.argv)
+    run_passthrough_invocation(
+        invocation,
+        &args.render,
+        download_dataset_entry::dispatch_from_args,
+    )
 }
 
-fn run_train_invocation<F>(
-    invocation: ResolvedInvocation,
-    dry_run: bool,
-    json: bool,
-    run: F,
-) -> ExitCode
+fn run_train_invocation<F>(invocation: ResolvedInvocation, render: &RenderArgs, run: F) -> ExitCode
 where
     F: FnOnce(Vec<String>) -> std::result::Result<(), String>,
 {
-    if dry_run {
-        return print_invocation(invocation, json);
+    if let Some(exit) = dry_run_exit(&invocation, render) {
+        return exit;
     }
     match run(invocation.argv) {
         Ok(()) => ExitCode::SUCCESS,
@@ -346,18 +343,17 @@ where
     }
 }
 
-fn run_resolved_train_invocation<F>(
+fn run_train_command<F>(
     command: &'static str,
     resolved: Result<ResolvedInvocation>,
-    dry_run: bool,
-    json: bool,
+    render: &RenderArgs,
     run: F,
 ) -> ExitCode
 where
     F: FnOnce(Vec<String>) -> std::result::Result<(), String>,
 {
     match resolved {
-        Ok(invocation) => run_train_invocation(invocation, dry_run, json, run),
+        Ok(invocation) => run_train_invocation(invocation, render, run),
         Err(err) => {
             eprintln!("[agent-infer {command}] error: {err:#}");
             ExitCode::FAILURE
@@ -365,12 +361,32 @@ where
     }
 }
 
-fn print_invocation(invocation: ResolvedInvocation, json: bool) -> ExitCode {
+fn run_passthrough_invocation<F>(
+    invocation: ResolvedInvocation,
+    render: &RenderArgs,
+    run: F,
+) -> ExitCode
+where
+    F: FnOnce(Vec<String>) -> ExitCode,
+{
+    if let Some(exit) = dry_run_exit(&invocation, render) {
+        return exit;
+    }
+    run(invocation.argv)
+}
+
+fn dry_run_exit(invocation: &ResolvedInvocation, render: &RenderArgs) -> Option<ExitCode> {
+    render
+        .dry_run
+        .then(|| print_invocation(invocation, render.json))
+}
+
+fn print_invocation(invocation: &ResolvedInvocation, json: bool) -> ExitCode {
     if json {
         println!("{}", serde_json::to_string_pretty(&invocation).unwrap());
     } else {
         println!("command {}", invocation.command);
-        if let Some(backend) = invocation.backend {
+        if let Some(backend) = &invocation.backend {
             println!("backend {}", backend);
         }
         if let Some(output_dir) = &invocation.output_dir {
@@ -1752,11 +1768,12 @@ impl SaveDtypeArg {
 #[cfg(test)]
 mod tests {
     use super::{
-        EvalSummary, PretrainPresetArg, ScratchShape, TrainTestReport, TrainTestStep,
-        default_chat_output_path, resolve_pretrain_invocation, sanitize_name,
+        EvalSummary, PretrainPresetArg, ResolvedInvocation, ScratchShape, TrainTestReport,
+        TrainTestStep, default_chat_output_path, resolve_pretrain_invocation,
+        run_passthrough_invocation, run_train_command, sanitize_name,
     };
     use crate::args::{BackendArg, ExtraArgs, RenderArgs, TrainPretrainArgs};
-    use std::path::Path;
+    use std::{cell::Cell, path::Path, process::ExitCode};
 
     #[test]
     fn default_chat_output_uses_chat_suffix() {
@@ -1835,6 +1852,45 @@ mod tests {
         assert!(value.get("json").is_none());
     }
 
+    #[test]
+    fn train_command_runs_dispatch_for_non_dry_run() {
+        let called = Cell::new(false);
+        let exit = run_train_command(
+            "train eval",
+            Ok(test_invocation("train eval", ["--seq-len", "32"])),
+            &RenderArgs {
+                dry_run: false,
+                json: false,
+            },
+            |argv| {
+                called.set(true);
+                assert_eq!(argv, vec!["--seq-len".to_string(), "32".to_string()]);
+                Ok(())
+            },
+        );
+        assert!(called.get());
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn passthrough_invocation_preserves_child_exit_code() {
+        let called = Cell::new(false);
+        let exit = run_passthrough_invocation(
+            test_invocation("data convert", ["--input", "train.jsonl"]),
+            &RenderArgs {
+                dry_run: false,
+                json: false,
+            },
+            |argv| {
+                called.set(true);
+                assert_eq!(argv, vec!["--input".to_string(), "train.jsonl".to_string()]);
+                ExitCode::from(2)
+            },
+        );
+        assert!(called.get());
+        assert_eq!(exit, ExitCode::from(2));
+    }
+
     fn base_pretrain_args(tokenizer: &Path) -> TrainPretrainArgs {
         TrainPretrainArgs {
             corpus: "corpus.txt".into(),
@@ -1883,6 +1939,20 @@ mod tests {
             extra: ExtraArgs {
                 extra_args: Vec::new(),
             },
+        }
+    }
+
+    fn test_invocation<const N: usize>(
+        command: &'static str,
+        argv: [&str; N],
+    ) -> ResolvedInvocation {
+        ResolvedInvocation {
+            command,
+            argv: argv.into_iter().map(ToString::to_string).collect(),
+            backend: None,
+            output_dir: None,
+            model: None,
+            notes: Vec::new(),
         }
     }
 }
