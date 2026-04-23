@@ -7,7 +7,8 @@ use super::prefill::{Qwen3PagedPrefillRequest, Qwen3PrefillContext};
 use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
-    GenerationState, ModelForward, PrefillBatchRequest, prepare_paged_prefill_batch,
+    GenerationState, MixedBatchRequest, ModelForward, PrefillBatchRequest,
+    prepare_paged_prefill_batch,
 };
 use crate::ops;
 use crate::sampler::SamplingParams;
@@ -149,6 +150,17 @@ impl ModelForward for Qwen3Model {
             self.config.vocab_size,
             max_batch_size,
         );
+        let mixed_total_tokens = max_batch_size.saturating_add(prefill_budget_tokens);
+        let mixed_workspace = super::batch_decode::BatchDecodeBuffers::mixed_device_bytes(
+            self.config.hidden_size,
+            q_dim,
+            kv_dim,
+            self.config.intermediate_size,
+            self.config.vocab_size,
+            mixed_total_tokens.max(1),
+            num_heads,
+            mixed_total_tokens.max(1),
+        );
 
         let prefill_activation_dims = 4usize
             .saturating_mul(self.config.hidden_size)
@@ -162,11 +174,11 @@ impl ModelForward for Qwen3Model {
             prefill_budget_tokens.max(4096),
             num_heads,
         );
+        let prefill_workspace = prefill_plan.saturating_add(prefill_activation);
 
         decode_context
             .saturating_add(decode_logits)
-            .saturating_add(prefill_plan)
-            .saturating_add(prefill_activation)
+            .saturating_add(prefill_workspace.max(mixed_workspace))
             .saturating_add(128 * 1024 * 1024)
     }
 
@@ -519,15 +531,37 @@ impl ModelForward for Qwen3Model {
         // (2) Triton and FlashInfer attention produce numerically different bf16
         // results, making greedy (argmax) output depend on batch composition.
         match paged_kv_pool {
-            Some(pool) if pool.is_active() => self.decode_batch(
-                tokens,
-                states,
-                slot_indices,
-                skip_logit_scatter,
-                pool,
-                decode_ctx,
-            ),
+            Some(pool) if pool.is_active() => {
+                self.prepare_decode_context(tokens, slot_indices, pool, decode_ctx)?;
+                self.decode_batch(
+                    tokens,
+                    states,
+                    slot_indices,
+                    skip_logit_scatter,
+                    pool,
+                    decode_ctx,
+                )
+            }
             _ => self.decode_batch_contiguous(tokens, states, slot_indices),
+        }
+    }
+
+    fn supports_mixed_batch(&self) -> bool {
+        self.prefill_uses_paged_pool() && self.lora.is_none()
+    }
+
+    fn forward_mixed_batch(
+        &self,
+        batch: MixedBatchRequest<'_>,
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<bool> {
+        match paged_kv_pool {
+            Some(pool) if pool.is_active() => {
+                self.decode_batch_with_prefill(batch, states, pool, decode_ctx)
+            }
+            _ => Ok(false),
         }
     }
 

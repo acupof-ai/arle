@@ -358,6 +358,33 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
 }
 
 impl Qwen35Model {
+    pub(crate) fn prepare_decode_context(
+        &self,
+        tokens: &[u32],
+        slot_indices: &[usize],
+        paged_kv_pool: &PagedKVPool,
+        bufs: &mut BatchDecodeBuffers35,
+    ) -> Result<()> {
+        use crate::model::DecodeContextOps;
+
+        bufs.set_batch_size(tokens.len());
+        bufs.upload_token_ids(&self.ctx, tokens)?;
+        let reallocated = bufs.update_metadata(&self.ctx, paged_kv_pool, slot_indices)?;
+        if reallocated {
+            bufs.invalidate_graph_cache(tokens.len());
+        }
+        bufs.plan_attention(
+            &self.ctx,
+            tokens.len(),
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            paged_kv_pool.page_size,
+            self.config.head_dim,
+            paged_kv_pool.format,
+        )?;
+        Ok(())
+    }
+
     /// Batched decode: process B tokens from B different requests in one pass.
     /// Falls back to sequential forward_decode() for non-paged path.
     pub fn decode_batch_contiguous(

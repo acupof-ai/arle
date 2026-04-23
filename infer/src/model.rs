@@ -32,6 +32,19 @@ pub struct PrefillBatchRequest<'a> {
     pub tokens: &'a [u32],
 }
 
+/// One scheduler-planned mixed decode + prefill batch.
+///
+/// The current scheduler lowers at most one prefill row into a mixed batch and
+/// keeps the decode rows in compact batch order. Model implementations own how
+/// that mixed batch is executed internally.
+#[derive(Clone, Copy, Debug)]
+pub struct MixedBatchRequest<'a> {
+    pub decode_tokens: &'a [u32],
+    pub decode_slot_indices: &'a [usize],
+    pub prefill: PrefillBatchRequest<'a>,
+    pub prefill_start_pos: usize,
+}
+
 pub(crate) fn prepare_paged_prefill_batch(
     requests: &[PrefillBatchRequest<'_>],
     pool: &mut PagedKVPool,
@@ -514,6 +527,26 @@ pub trait ModelForward: Send {
             self.forward_decode(token, &mut states[slot_indices[i]])?;
         }
         Ok(())
+    }
+
+    /// Whether this model has a validated mixed decode + prefill path.
+    fn supports_mixed_batch(&self) -> bool {
+        false
+    }
+
+    /// Mixed-batch forward: decode rows plus one prefill row in a single
+    /// scheduler-lowered execution unit.
+    ///
+    /// Returns `Ok(true)` when the model consumed the mixed batch,
+    /// `Ok(false)` when the caller should fall back to a non-mixed plan.
+    fn forward_mixed_batch(
+        &self,
+        _batch: MixedBatchRequest<'_>,
+        _states: &mut [Self::State],
+        _paged_kv_pool: Option<&mut PagedKVPool>,
+        _decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Whether batched decode for this model can be replayed via a captured
