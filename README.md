@@ -302,13 +302,16 @@ output is hidden unless you opt into verbose logging with `RUST_LOG`, and
 `/tools` remains the explicit way to inspect the built-in tool inventory. File
 listing requests (`本地有哪些文件`, `list files`, etc.) return the shell output
 directly; broader repo-inspection requests (`你看看本地仓库`, `look at the repo`)
-use a deterministic shell overview before the model continues. Completed turns
-are compacted back down to `user -> assistant`, so old raw tool results do not
-keep polluting later prompts. The KV prefix cache therefore reuses the compact
-prior-turn KV in place for every subsequent turn of a session — only the new
-user message plus the current turn's temporary tool context runs prefill. CUDA runtime reuse now sits on top of the same radix / tiered-KV
-surface used by the HTTP scheduler; the main remaining model-specific limit is
-that hybrid `Qwen3.5` does not yet support cross-slot partial-prefix restore.
+return a deterministic shell overview of the repo root, top-level entries, and
+`git status` instead of bouncing that tool output back through the model.
+Completed turns are compacted back down to `user -> assistant`, so old raw tool
+results do not keep polluting later prompts. The KV prefix cache therefore
+reuses the compact prior-turn KV in place for every subsequent turn of a
+session — only the new user message plus the current turn's temporary tool
+context runs prefill. CUDA runtime reuse now sits on top of the same radix /
+tiered-KV surface used by the HTTP scheduler; the main remaining
+model-specific limit is that hybrid `Qwen3.5` does not yet support cross-slot
+partial-prefix restore.
 On macOS, tool execution uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
 
 On Apple Silicon, build the same CLI against the Metal backend:
