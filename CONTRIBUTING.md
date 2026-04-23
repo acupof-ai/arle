@@ -54,6 +54,7 @@ cargo test --no-default-features --features no-cuda   # Unit tests (~9s)
 cargo test --release --test e2e                         # E2E (GPU required)
 cargo test -p train --release --features no-cuda --lib
 cargo test -p autograd --release --features no-cuda --lib
+cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_tiny_fixture_live
 
 # Lint + format
 cargo clippy --workspace -- -D warnings
@@ -123,6 +124,12 @@ Use the lightest meaningful validation first, then broaden based on risk.
 - **CUDA / Metal / scheduler runtime / quantization changes**: run targeted
   correctness checks and include benchmark evidence when claiming a performance
   improvement.
+
+The CLI now has one canonical tiny-fixture path for real backend validation:
+`arle train test --out-dir <tmp>` leaves a checkpoint at `<tmp>/sft/latest`,
+and the Metal/CUDA CI lanes reuse that artifact for `arle run --json` coverage.
+GitHub-hosted macOS runners cover Metal; CUDA CI lives in the dedicated
+`.github/workflows/cuda-ci.yml` self-hosted GPU lane.
 
 See [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
 for the detailed matrix.

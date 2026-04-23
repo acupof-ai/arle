@@ -8,16 +8,20 @@ on:
       - 'crates/mlx-sys/**'
       - 'infer/build.rs'
       - 'infer/Cargo.toml'
+      - 'crates/cli/**'
+      - 'crates/train/**'
       - 'crates/kv-native-sys/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
+      - 'tests/**'
       - 'scripts/start_agent.sh'
       - 'scripts/setup_zig_toolchain.sh'
       - 'scripts/check_kv_zig.sh'
       - 'setup.sh'
       - 'Makefile'
       - 'README.md'
+      - 'CONTRIBUTING.md'
       - 'CHANGELOG.md'
       - 'docs/compatibility.md'
       - 'docs/release-checklist.md'
@@ -34,16 +38,20 @@ on:
       - 'crates/mlx-sys/**'
       - 'infer/build.rs'
       - 'infer/Cargo.toml'
+      - 'crates/cli/**'
+      - 'crates/train/**'
       - 'crates/kv-native-sys/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
+      - 'tests/**'
       - 'scripts/start_agent.sh'
       - 'scripts/setup_zig_toolchain.sh'
       - 'scripts/check_kv_zig.sh'
       - 'setup.sh'
       - 'Makefile'
       - 'README.md'
+      - 'CONTRIBUTING.md'
       - 'CHANGELOG.md'
       - 'docs/compatibility.md'
       - 'docs/release-checklist.md'
@@ -114,6 +122,14 @@ jobs:
 
       - name: cargo test (metal + no-cuda CLI unit tests)
         run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer --release
+
+      - name: cargo test (metal + no-cuda tiny fixture live path)
+        run: >
+          cargo test
+          --no-default-features --features metal,no-cuda,cli
+          -p agent-infer --release
+          --test cli_tiny_fixture_live
+          -- --test-threads 1
 
       - name: cargo build metal_serve
         working-directory: infer
