@@ -22,6 +22,9 @@ pub mod model_registry;
 pub mod model_source;
 pub mod prefix_cache;
 pub mod quant;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[path = "model/qwen35/gguf_host.rs"]
+pub(crate) mod qwen35_gguf_host;
 pub mod request_handle;
 pub mod sampler;
 pub mod scheduler;
