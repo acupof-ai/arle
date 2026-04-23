@@ -152,15 +152,16 @@ code      { font-family: inherit; color: var(--coral-dim); }
 .ascii {
   margin: 0;
   padding: 2px 0 8px;
-  font-size: 10px;
-  line-height: 1.1;
+  font-size: 11px;
+  line-height: 1.08;
   color: var(--coral-dim);
   overflow-x: auto;
   letter-spacing: 0;
   white-space: pre;
+  font-weight: 700;
 }
 @media (min-width: 760px) {
-  .ascii { font-size: 11px; }
+  .ascii { font-size: 12px; }
 }
 
 .tagline {
@@ -374,6 +375,22 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+.statusline a.sl-seg {
+  color: inherit;
+  text-decoration: none;
+  transition: background-color 90ms ease, color 90ms ease;
+}
+.statusline a.sl-seg:hover {
+  background: var(--paper);
+  color: var(--ink);
+  outline: none;
+}
+.statusline a.sl-seg:focus-visible {
+  background: var(--paper);
+  color: var(--ink);
+  outline: 2px solid var(--coral);
+  outline-offset: -2px;
 }
 .statusline .sl-seg:last-child { border-right: none; }
 .statusline .sl-spacer { flex: 1; border: none; padding: 0; }
