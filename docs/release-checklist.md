@@ -1,7 +1,7 @@
 # Release Checklist
 
 This checklist defines the minimum steps for cutting a release of
-`agent-infer`.
+`ARLE`.
 
 It is meant to keep releases repeatable, readable, and safe.
 
@@ -76,11 +76,8 @@ When the release surface changes:
 Current release automation publishes:
 
 - Linux x86_64 CUDA artifacts
-- macOS arm64 Metal artifacts as
-  `agent-infer-<ref>-macos-arm64.tar.gz` containing a top-level
-  `metal_serve` binary
-- branch CI uploads the same tarball layout for validation with the
-  branch-local filename `agent-infer-macos-arm64.tar.gz`
+- macOS arm64 Metal artifacts containing a top-level `metal_serve` binary
+- branch CI uploads the same tarball layout for validation
 
 Before release, verify:
 

@@ -1,6 +1,6 @@
 <p align="center">
   <strong>ARLE</strong><br>
-  <em>面向长上下文 LLM 智能体的 agent reinforcement learning engine。纯 Rust 实现，CUDA 为主部署路径，训练 / 评测 / agent 工作流都在同一仓库内。</em>
+  <em>以 runtime 为主干的 Rust workspace，覆盖 serving、本地 agent、训练、评测与数据集工具。纯 Rust 实现；<code>infer</code> 负责服务，<code>arle</code> 是用户前门。</em>
 </p>
 
 <p align="center">
@@ -197,13 +197,13 @@ git clone https://github.com/cklxx/arle && cd arle
 
 ```bash
 # Linux + NVIDIA（默认 CUDA 路径）
-cargo build --release --features cli -p agent-infer --bin arle
+cargo build --release --features cli --bin arle
 
 # Apple Silicon（Metal）
-cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
+cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
 
 # 纯 CPU 冒烟 / CI
-cargo build --release --no-default-features --features cpu,no-cuda,cli -p agent-infer --bin arle
+cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
 ```
 
 第一批常用命令：
@@ -211,16 +211,25 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli -p agent-
 ```bash
 ./target/release/arle --help
 ./target/release/arle --doctor
-./target/release/arle --model-path /path/to/Qwen3-4B
 ./target/release/arle --model-path /path/to/Qwen3-4B run --prompt "总结一下这个仓库"
 ./target/release/arle --model-path /path/to/Qwen3-4B run --stdin --json < prompt.txt
 ./target/release/arle train env
 ./target/release/arle train test --backend cpu --json
-./target/release/arle train eval --help
+./target/release/arle data convert --help
 ```
 
 `arle` 不带子命令时会直接进入交互式 REPL。`arle run` 是同一入口的显式别名，
 而 `arle run --prompt ...` / `--stdin` 则是更适合脚本的单次执行路径。
+
+`arle train test` 也是 CI 使用的 canonical tiny fixture 路径。配合
+`--keep-artifacts` 或 `--out-dir`，它会在 `<root>/sft/latest` 留下一个真实
+checkpoint，可直接回喂给 CLI：
+
+```bash
+tmp=$(mktemp -d)
+./target/release/arle train test --backend metal --out-dir "$tmp"
+./target/release/arle --model-path "$tmp/sft/latest" run --prompt "Say hello in one word." --json
+```
 
 如果你不想从源码编译，优先直接使用
 [GitHub Releases](https://github.com/cklxx/arle/releases) 里的预编译二进制。
@@ -228,11 +237,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli -p agent-
 ### `infer` — OpenAI 兼容 serving
 
 ```bash
-# 当前已发布的容器镜像路径
-docker run --gpus all -v /path/to/Qwen3-4B:/model \
-  ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
-
-# 或者从源码构建服务二进制
+# 从源码构建服务二进制
 cargo build -p infer --release
 ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
 ```
@@ -257,6 +262,13 @@ curl http://localhost:8000/v1/chat/completions \
 
 如果想用仓库自带流程完成本机初始化，直接跑 [`./setup.sh`](setup.sh)。
 贡献者工作流与验证要求以 [CONTRIBUTING.md](CONTRIBUTING.md) 为准。
+
+## 入口面
+
+- `infer` — 专门的 OpenAI 兼容 serving 二进制。
+- `arle run` — 本地 agent runtime、REPL 与一次性 prompt 执行。
+- `arle train` — pretrain / SFT / GRPO / multi-turn / eval 工作流。
+- `arle data` — 数据集下载与转换工具。
 
 常用仓库卫生检查命令：
 
@@ -360,8 +372,8 @@ ARLE 这张前门背后的包边界：
 - `agent` → 会话循环与工具调用恢复
 - `tools` / `chat` → 共享工具定义、执行助手、协议类型
 
-若省略 `--model-path`，CLI 会先看 `ARLE_MODEL`，再回退到旧的
-`AGENT_INFER_MODEL`，然后从常用目录和本地 HuggingFace 缓存中自动探测模型。
+若省略 `--model-path`，CLI 会先看 `ARLE_MODEL`，再从常用目录和本地
+HuggingFace 缓存中自动探测模型。
 
 工具：`python`（执行 Python 片段）、`shell`（执行 bash 命令）。KV 前缀
 缓存在每轮会话中原地复用完整上一轮 KV，只有新用户消息（以及任何工具
@@ -381,8 +393,7 @@ cargo run --release --no-default-features --features metal,no-cuda,cli -- \
   --model-path mlx-community/Qwen3-0.6B-4bit
 ```
 
-CLI 跨轮保留会话历史，行历史存在 `~/.arle-history`（首次运行会迁移旧的
-`~/.agent-infer-history`），支持斜杠命令：
+CLI 跨轮保留会话历史，行历史存在 `~/.arle-history`，支持斜杠命令：
 
 - `/help` 查看命令帮助
 - `/reset` 或 `/clear` 清空当前会话
@@ -477,7 +488,7 @@ cargo clippy --workspace -- -D warnings                # Lint
 cargo fmt --all -- --check                             # 格式
 
 # CPU 后端冒烟路径（只下载 config / tokenizer 等运行时资源，不下完整权重）
-cargo run -p agent-infer --bin arle --no-default-features --features cpu,no-cuda,cli -- \
+cargo run --bin arle --release --no-default-features --features cpu,no-cuda,cli -- \
   --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
 
 # E2E（需要 GPU + 模型权重）

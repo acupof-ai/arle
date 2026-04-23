@@ -1,6 +1,6 @@
 <p align="center">
   <strong>ARLE</strong><br>
-  <em>Agent reinforcement learning engine for long-context LLM agents. Pure Rust, with CUDA as the primary serving path and train/eval/agent workflows in-tree.</em>
+  <em>Runtime-first Rust workspace for serving, local agents, training, evaluation, and dataset tooling. Pure Rust; <code>infer</code> ships the server, <code>arle</code> is the user front door.</em>
 </p>
 
 <p align="center">
@@ -204,13 +204,13 @@ Build the `arle` binary for the backend you actually want to run:
 
 ```bash
 # Linux + NVIDIA (default CUDA path)
-cargo build --release --features cli -p agent-infer --bin arle
+cargo build --release --features cli --bin arle
 
 # Apple Silicon (Metal)
-cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
+cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
 
 # CPU-only smoke / CI
-cargo build --release --no-default-features --features cpu,no-cuda,cli -p agent-infer --bin arle
+cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
 ```
 
 First commands:
@@ -218,17 +218,26 @@ First commands:
 ```bash
 ./target/release/arle --help
 ./target/release/arle --doctor
-./target/release/arle --model-path /path/to/Qwen3-4B
 ./target/release/arle --model-path /path/to/Qwen3-4B run --prompt "Summarize this repo"
 ./target/release/arle --model-path /path/to/Qwen3-4B run --stdin --json < prompt.txt
 ./target/release/arle train env
 ./target/release/arle train test --backend cpu --json
-./target/release/arle train eval --help
+./target/release/arle data convert --help
 ```
 
 `arle` with no subcommand starts the interactive REPL. `arle run` is the
 explicit alias for the same surface, and `arle run --prompt ...` / `--stdin`
 are the script-friendly one-shot paths.
+
+`arle train test` is also the canonical tiny fixture path used by CI. With
+`--keep-artifacts` or `--out-dir`, it leaves a real checkpoint at
+`<root>/sft/latest` that you can pass straight back into the CLI:
+
+```bash
+tmp=$(mktemp -d)
+./target/release/arle train test --backend metal --out-dir "$tmp"
+./target/release/arle --model-path "$tmp/sft/latest" run --prompt "Say hello in one word." --json
+```
 
 Prefer the prebuilt binaries from
 [GitHub Releases](https://github.com/cklxx/arle/releases) when you do not want
@@ -237,11 +246,7 @@ to compile from source.
 ### `infer` — OpenAI-compatible serving
 
 ```bash
-# Current published container image path
-docker run --gpus all -v /path/to/Qwen3-4B:/model \
-  ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
-
-# Or build the serving binary from source
+# Build the serving binary from source
 cargo build -p infer --release
 ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
 ```
@@ -269,6 +274,13 @@ above instead of the default CUDA feature set.
 For a repo-managed workstation bootstrap, run [`./setup.sh`](setup.sh). For
 contributor workflow and validation expectations, use
 [CONTRIBUTING.md](CONTRIBUTING.md) as the source of truth.
+
+## Entry Surfaces
+
+- `infer` — dedicated OpenAI-compatible serving binary.
+- `arle run` — local agent runtime, REPL, and one-shot prompt execution.
+- `arle train` — pretrain / SFT / GRPO / multi-turn / eval workflows.
+- `arle data` — dataset download and conversion utilities.
 
 Common repo hygiene commands:
 
@@ -377,9 +389,9 @@ Current package boundary behind the ARLE front door:
 - `agent` -> conversation loop and tool-call recovery
 - `tools` / `chat` -> shared tool definitions, execution helpers, and protocol types
 
-If `--model-path` is omitted, the CLI first checks `ARLE_MODEL`, then falls
-back to legacy `AGENT_INFER_MODEL`, then auto-detects a local model from
-common directories and the local HuggingFace cache.
+If `--model-path` is omitted, the CLI first checks `ARLE_MODEL`, then
+auto-detects a local model from common directories and the local HuggingFace
+cache.
 
 Use `--doctor` to print a self-check report for the current CLI build without
 loading a model. It shows the compiled backend, detected hardware, TTY state,
@@ -391,13 +403,13 @@ from prose. Add `--strict` when you want `--doctor` to exit non-zero on
 warnings.
 
 ```bash
-cargo run -p agent-infer --bin arle --release --no-default-features --features cpu,no-cuda,cli -- \
+cargo run --bin arle --release --no-default-features --features cpu,no-cuda,cli -- \
   --doctor
 
-cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
+cargo run --bin arle --release --no-default-features --features cli,no-cuda -- \
   --doctor --json
 
-cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
+cargo run --bin arle --release --no-default-features --features cli,no-cuda -- \
   --doctor --json --strict
 ```
 
@@ -407,10 +419,10 @@ recommendations without the full environment report. It also supports
 `--json`.
 
 ```bash
-cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
+cargo run --bin arle --release --no-default-features --features cli,no-cuda -- \
   --list-models
 
-cargo run -p agent-infer --bin arle --release --no-default-features --features cli,no-cuda -- \
+cargo run --bin arle --release --no-default-features --features cli,no-cuda -- \
   --list-models --json
 ```
 
@@ -443,8 +455,7 @@ cargo run --release --no-default-features --features metal,no-cuda,cli -- \
 ```
 
 The CLI keeps conversation history across turns, stores line history in
-`~/.arle-history` (migrating legacy `~/.agent-infer-history` on first run),
-and supports slash commands:
+`~/.arle-history`, and supports slash commands:
 
 - `/help` for command help
 - `/reset` or `/clear` to clear the current conversation
@@ -562,7 +573,7 @@ cargo clippy --workspace -- -D warnings                # Lint
 cargo fmt --all -- --check                             # Format
 
 # CPU backend smoke path (downloads runtime assets like config/tokenizer, not full weights)
-cargo run -p agent-infer --bin arle --no-default-features --features cpu,no-cuda,cli -- \
+cargo run --bin arle --release --no-default-features --features cpu,no-cuda,cli -- \
   --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
 
 # E2E (requires GPU + model weights)

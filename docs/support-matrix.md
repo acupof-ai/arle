@@ -1,6 +1,6 @@
-# Support Matrix
+# ARLE Support Matrix
 
-This document is the canonical support-status truth for `agent-infer`.
+This document is the canonical support-status truth for `ARLE`.
 
 It states what the repository currently supports, what is still limited, and
 what validation exists for each area. If something is not listed as supported
@@ -106,7 +106,7 @@ Backend note:
 | Surface | Status | Notes |
 | --- | --- | --- |
 | `pretrain` | Supported | Canonical scratch-pretrain entrypoint for the current Qwen-family train stack. HF-style checkpoint dirs + `latest` marker + exact optimizer-state resume. CUDA save/eval/resume was validated on L4 on 2026-04-21. Hybrid Qwen3.5 scratch-pretrain is now accepted locally on CPU + Metal via `pretrain --linear-attn-every 2 -> eval_lm` using the same checkpoint layout. |
-| `train_sft` | Supported | Qwen3 / Qwen3.5 family dispatch, LoRA-only fine-tune surface, adapter-aware checkpointing and resume. CUDA smoke was validated on Qwen3-0.6B for `train_sft -> eval_lm -> agent-infer -> resume` on 2026-04-21, and Mac-local Metal validation covers the dense/full-attn Qwen3.5 path (`pretrain -> train_sft --backend metal -> eval_lm -> resume`, LoRA rank=8, Apple M4 Pro, 2026-04-21). Hybrid linear-attn Qwen3.5 LoRA fine-tune is also validated on CPU + Metal for tiny synthetic checkpoints on 2026-04-21; CUDA compile surface is checked, but CUDA runtime acceptance for the hybrid path is not yet closed. |
+| `train_sft` | Supported | Qwen3 / Qwen3.5 family dispatch, LoRA-only fine-tune surface, adapter-aware checkpointing and resume. CUDA smoke was validated on Qwen3-0.6B for `train_sft -> eval_lm -> arle -> resume` on 2026-04-21, and Mac-local Metal validation covers the dense/full-attn Qwen3.5 path (`pretrain -> train_sft --backend metal -> eval_lm -> resume`, LoRA rank=8, Apple M4 Pro, 2026-04-21). Hybrid linear-attn Qwen3.5 LoRA fine-tune is also validated on CPU + Metal for tiny synthetic checkpoints on 2026-04-21; CUDA compile surface is checked, but CUDA runtime acceptance for the hybrid path is not yet closed. |
 | `train_grpo` | Supported | Single-turn RL surface with exact checkpoint/resume, shared observability/control-plane wiring, and backend selection across `cpu|metal|cuda`. CUDA was validated on 2026-04-21 for `train_grpo -> checkpoint/latest -> eval_lm -> resume` plus live `/v1/train/{status,events,save,stop}` control-plane behavior on the synthetic dense Qwen3.5 path. Hybrid linear-attn Qwen3.5 end-to-end acceptance is now closed locally on CPU + Metal for `train_grpo --linear-attn-every 2` including checkpoint materialization; CUDA compile surface is checked, but CUDA hybrid runtime acceptance is still pending. |
 | `train_multi_turn` | Supported | Backend flag supports `cpu|metal|cuda`. CUDA was validated on 2026-04-21 for stepwise GRPO, sequence-level GSPO, exact resume, `/v1/train/{status,events,save,stop}` control-plane endpoints, and checkpoint reload through `eval_lm` on the dense/full-attn path. Hybrid linear-attn Qwen3.5 end-to-end acceptance is now closed locally on CPU + Metal: stepwise-GRPO and sequence-level-GSPO both run against hybrid configs and save checkpoints; CUDA compile surface is checked, but CUDA hybrid runtime acceptance is still pending. |
 | `eval_lm` | Supported | Standalone loss / perplexity evaluation for Qwen3 / Qwen3.5 checkpoint dirs on tokenized or chat JSONL. Hybrid linear-attn Qwen3.5 checkpoint evaluation is validated on CPU + Metal on 2026-04-21. |

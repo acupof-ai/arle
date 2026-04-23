@@ -1,11 +1,11 @@
-# agent-infer Codebase Map
+# ARLE Codebase Map
 
 Updated 2026-04-23 after the runtime-first documentation cleanup.
 
 This document is the canonical workspace-topology truth. README and ROADMAP may
 summarize it, but they do not define a different repository shape.
 
-`agent-infer` is a runtime-first workspace:
+`ARLE` is a runtime-first workspace:
 
 - `infer` owns serving/runtime truth.
 - `arle` is the local front door built on that runtime.
@@ -35,7 +35,7 @@ the CUDA kernel layer was extracted into `crates/cuda-kernels/`
 
 The repository has four practical layers:
 
-- `agent-infer` (root package): thin binary wrapper in `src/main.rs` that calls
+- workspace root package: thin binary wrapper in `src/main.rs` that calls
   `infer_cli::run()`.
 - `infer/`: the runtime-heavy crate. It owns the HTTP server, scheduler,
   backends, model/runtime modules, and the unified
@@ -47,7 +47,7 @@ The repository has four practical layers:
 
 Current workspace members:
 
-- `agent-infer`
+- workspace root package
 - `infer`
 - `crates/cuda-kernels`
 - `crates/mlx-sys`
@@ -242,7 +242,7 @@ These crates remain independent after Route A:
 Current dependency direction:
 
 ```text
-agent-infer
+workspace root package
   -> cli
      -> infer
      -> agent

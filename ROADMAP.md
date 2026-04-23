@@ -1,4 +1,4 @@
-# agent-infer Roadmap
+# ARLE Roadmap
 
 Updated 2026-04-23.
 
@@ -13,7 +13,7 @@ document, the canonical document wins:
 
 ## Project Positioning
 
-`agent-infer` is a Rust-native inference runtime with integrated local
+`ARLE` is a Rust-native inference runtime with integrated local
 agent/train/self-evolution workflows.
 
 - The runtime stays primary.

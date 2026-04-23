@@ -1,7 +1,7 @@
 # Performance and Correctness Gates
 
 This document defines the minimum validation expectations for changes in
-`agent-infer`.
+`ARLE`.
 
 The project is both performance-sensitive and correctness-sensitive. A change is
 not good enough just because it compiles or appears faster once.
