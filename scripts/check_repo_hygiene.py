@@ -192,10 +192,15 @@ def check_git_tracked_junk() -> list[str]:
             cwd=ROOT,
             text=True,
         )
-    except subprocess.CalledProcessError as exc:
-        return [f"git ls-files failed: {exc}"]
+        candidates = output.splitlines()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        candidates = [
+            repo_path(path)
+            for path in ROOT.rglob("*")
+            if path.is_file() and ".git" not in path.parts
+        ]
 
-    offenders = [line for line in output.splitlines() if JUNK_PATH_RE.search(line)]
+    offenders = [line for line in candidates if JUNK_PATH_RE.search(line)]
     if not offenders:
         return []
     return [f"tracked junk file: {path}" for path in offenders]
