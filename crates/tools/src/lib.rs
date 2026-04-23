@@ -522,10 +522,9 @@ impl BuiltinToolPolicyHooks {
         last_tool_scalar_result: Option<&str>,
     ) -> Option<String> {
         if last_tool_name == Some("shell")
-            && asks_for_file_listing(user_input)
-            && let Some(result) = last_tool_result
+            && should_return_shell_result_directly(user_input)
         {
-            return Some(result.to_string());
+            return last_tool_result.map(str::to_string);
         }
 
         if asks_for_exact_scalar_output(user_input)
@@ -619,6 +618,10 @@ fn asks_for_repository_overview(text: &str) -> bool {
         .any(|needle| text.contains(needle))
 }
 
+fn should_return_shell_result_directly(text: &str) -> bool {
+    asks_for_file_listing(text) || asks_for_repository_overview(text)
+}
+
 #[cfg(target_os = "windows")]
 fn default_directory_listing_command() -> &'static str {
     "cd && dir /a"
@@ -631,12 +634,12 @@ fn default_directory_listing_command() -> &'static str {
 
 #[cfg(target_os = "windows")]
 fn default_repository_overview_command() -> &'static str {
-    "cd && dir /a /s /b"
+    "for /f \"delims=\" %i in ('git rev-parse --show-toplevel 2^>nul') do set REPO_ROOT=%i & if not defined REPO_ROOT set REPO_ROOT=%CD% & echo repo: %REPO_ROOT% & echo. & echo == top-level == & dir /a \"%REPO_ROOT%\" & echo. & echo == git status == & git -C \"%REPO_ROOT%\" status --short --branch 2>nul"
 }
 
 #[cfg(not(target_os = "windows"))]
 fn default_repository_overview_command() -> &'static str {
-    "pwd && if command -v rg >/dev/null 2>&1; then rg --files --hidden -g '!.git' | sed -n '1,200p'; else find . -type f -not -path '*/.git/*' | sed -n '1,200p'; fi"
+    "repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd); printf 'repo: %s\\n' \"$repo_root\"; printf '\\n== top-level ==\\n'; find \"$repo_root\" -mindepth 1 -maxdepth 1 ! -name '.git' ! -name 'target' ! -name 'bench-output' ! -name 'node_modules' ! -name '.pytest_cache' ! -name '.claude' ! -name '.claire' ! -name '.context' -print | sed \"s#^$repo_root/##\" | sort | sed -n '1,80p'; if git -C \"$repo_root\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then printf '\\n== git status ==\\n'; git -C \"$repo_root\" status --short --branch | sed -n '1,40p'; fi"
 }
 
 fn extract_python_code(text: &str) -> Option<String> {
@@ -1044,6 +1047,17 @@ mod tests {
         );
         assert_eq!(shell_result, Some("file-a\nfile-b".to_string()));
 
+        let repo_result = BuiltinToolPolicyHooks.finalize_after_tool_execution(
+            "你看看本地仓库",
+            Some("shell"),
+            Some("repo: /tmp/demo\n\n== top-level ==\nsrc\nCargo.toml"),
+            Some("ignored"),
+        );
+        assert_eq!(
+            repo_result,
+            Some("repo: /tmp/demo\n\n== top-level ==\nsrc\nCargo.toml".to_string())
+        );
+
         let tool_call = BuiltinToolPolicyHooks
             .recover_tool_calls_from_draft(
                 "I should use the Python tool here. I can run print(7 * 8).",
@@ -1091,7 +1105,7 @@ mod tests {
             parsed.tool_calls[0].arguments["command"]
                 .as_str()
                 .expect("shell command")
-                .contains("pwd")
+                .contains("git rev-parse")
         );
     }
 }
