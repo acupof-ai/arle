@@ -16,10 +16,10 @@ use train::{
 
 use crate::{
     args::{
-        CliCommand, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs, DatasetFormatArg,
-        ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg, TrainArgs, TrainCommand,
-        TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs, TrainMultiTurnArgs,
-        TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
+        BackendArg, CliCommand, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs,
+        DatasetFormatArg, ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg, TrainArgs,
+        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs,
+        TrainMultiTurnArgs, TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
 };
@@ -105,10 +105,7 @@ fn run_train_env(args: TrainEnvArgs) -> Result<()> {
             .ok()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unknown>".to_string()),
-        commands: TRAIN_ENV_COMMANDS
-            .iter()
-            .map(|command| (*command).to_string())
-            .collect(),
+        commands: TRAIN_ENV_COMMANDS,
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -511,28 +508,21 @@ fn resolve_pretrain_invocation(args: &TrainPretrainArgs) -> Result<ResolvedInvoc
 }
 
 fn resolve_sft_invocation(args: &TrainSftArgs) -> Result<ResolvedInvocation> {
-    let model = inspect_model_source(&args.model, !args.render.dry_run)?;
+    let model = resolve_model_command(&args.model, args.backend, args.render.dry_run)?;
     let out_dir = args
         .out
         .clone()
         .unwrap_or_else(|| default_job_output("sft", &args.model));
-    let backend = args
-        .backend
-        .as_train_backend()
-        .unwrap_or_else(default_train_backend);
 
     let mut argv = vec![
         "--model".to_string(),
-        model
-            .resolved_dir
-            .clone()
-            .unwrap_or_else(|| args.model.display().to_string()),
+        model.model_arg.clone(),
         "--data".to_string(),
         args.data.display().to_string(),
         "--out".to_string(),
         out_dir.display().to_string(),
         "--backend".to_string(),
-        backend.to_string(),
+        model.backend.clone(),
     ];
     push_opt_family(&mut argv, args.model_family);
     push_opt_value(&mut argv, "--steps", args.steps);
@@ -554,7 +544,7 @@ fn resolve_sft_invocation(args: &TrainSftArgs) -> Result<ResolvedInvocation> {
     push_opt_value(&mut argv, "--serve", args.serve);
     argv.extend(args.extra.extra_args.iter().cloned());
 
-    let mut notes = model.notes.clone();
+    let mut notes = model.inspection.notes.clone();
     if args.out.is_none() {
         notes.push("out omitted; defaulted under runs/sft".to_string());
     }
@@ -563,30 +553,23 @@ fn resolve_sft_invocation(args: &TrainSftArgs) -> Result<ResolvedInvocation> {
     Ok(ResolvedInvocation {
         command: "train sft",
         argv,
-        backend: Some(backend.to_string()),
+        backend: Some(model.backend),
         output_dir: Some(out_dir.display().to_string()),
-        model: Some(model),
+        model: Some(model.inspection),
         notes,
     })
 }
 
 fn resolve_eval_invocation(args: &TrainEvalArgs) -> Result<ResolvedInvocation> {
-    let model = inspect_model_source(&args.model, !args.render.dry_run)?;
-    let backend = args
-        .backend
-        .as_train_backend()
-        .unwrap_or_else(default_train_backend);
+    let model = resolve_model_command(&args.model, args.backend, args.render.dry_run)?;
 
     let mut argv = vec![
         "--model-path".to_string(),
-        model
-            .resolved_dir
-            .clone()
-            .unwrap_or_else(|| args.model.display().to_string()),
+        model.model_arg.clone(),
         "--data".to_string(),
         args.data.display().to_string(),
         "--backend".to_string(),
-        backend.to_string(),
+        model.backend.clone(),
     ];
     push_opt_family(&mut argv, args.model_family);
     if let Some(tokenizer) = args.tokenizer.as_deref() {
@@ -598,7 +581,7 @@ fn resolve_eval_invocation(args: &TrainEvalArgs) -> Result<ResolvedInvocation> {
     push_opt_path(&mut argv, "--metrics-jsonl", args.metrics_jsonl.as_deref());
     argv.extend(args.extra.extra_args.iter().cloned());
 
-    let mut notes = model.notes.clone();
+    let mut notes = model.inspection.notes.clone();
     notes.push(
         "config/tokenizer are auto-loaded from --model unless --tokenizer overrides it".to_string(),
     );
@@ -606,9 +589,9 @@ fn resolve_eval_invocation(args: &TrainEvalArgs) -> Result<ResolvedInvocation> {
     Ok(ResolvedInvocation {
         command: "train eval",
         argv,
-        backend: Some(backend.to_string()),
+        backend: Some(model.backend),
         output_dir: None,
-        model: Some(model),
+        model: Some(model.inspection),
         notes,
     })
 }
@@ -993,6 +976,25 @@ fn inspect_model_source(source: &Path, allow_download: bool) -> Result<ModelInsp
             .and_then(|s| s.generation_config_path.clone()),
         family: summary.as_ref().map(|s| s.family.clone()),
         notes,
+    })
+}
+
+fn resolve_model_command(
+    source: &Path,
+    backend: BackendArg,
+    dry_run: bool,
+) -> Result<ResolvedModelCommand> {
+    let inspection = inspect_model_source(source, !dry_run)?;
+    Ok(ResolvedModelCommand {
+        model_arg: inspection
+            .resolved_dir
+            .clone()
+            .unwrap_or_else(|| source.display().to_string()),
+        backend: backend
+            .as_train_backend()
+            .unwrap_or_else(default_train_backend)
+            .to_string(),
+        inspection,
     })
 }
 
@@ -1645,7 +1647,7 @@ struct TrainEnvReport {
     gpu: String,
     hf_cache_root: String,
     cwd: String,
-    commands: Vec<String>,
+    commands: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1683,6 +1685,13 @@ impl ModelInspection {
     fn local_dir_path(&self) -> Option<PathBuf> {
         self.resolved_dir.as_ref().map(PathBuf::from)
     }
+}
+
+#[derive(Debug)]
+struct ResolvedModelCommand {
+    inspection: ModelInspection,
+    model_arg: String,
+    backend: String,
 }
 
 #[derive(Debug)]
