@@ -521,9 +521,7 @@ impl BuiltinToolPolicyHooks {
         last_tool_result: Option<&str>,
         last_tool_scalar_result: Option<&str>,
     ) -> Option<String> {
-        if last_tool_name == Some("shell")
-            && should_return_shell_result_directly(user_input)
-        {
+        if last_tool_name == Some("shell") && should_return_shell_result_directly(user_input) {
             return last_tool_result.map(str::to_string);
         }
 
