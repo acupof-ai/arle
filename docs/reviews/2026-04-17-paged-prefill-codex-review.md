@@ -15,7 +15,7 @@ ship with changes — the direction is sound, but the plan misses active contigu
 
 The file list is incomplete for the stated end state. The common migration and capacity hooks live in `infer/src/model.rs:96-120` and `infer/src/model/generation_state.rs:55-167`, not just the per-model `forward.rs` files. If prefill no longer uses contiguous KV or `set_max_seq_len`, those shared contracts need explicit plan coverage.
 
-`KVCache` still does more than "INT8 working-buffer only." `GenerationStateBase::migrate_kv_range_to_paged` dispatches BF16, FP8, INT8, and TurboQuant via `k_caches()/v_caches()` plus `max_seq_len()` (`infer/src/model/generation_state.rs:121-165`). Single-token decode for Qwen3 and GLM4 also still writes/reads contiguous KV via `fused_attention_decode_into` (`infer/src/model/qwen3/decode.rs:11-38`, `infer/src/model/glm4/decode.rs:11-38`).
+`KVCache` still does more than "INT8 working-buffer only." `GenerationStateBase::migrate_kv_range_to_paged` dispatches BF16, FP8, INT8, and TurboQuant via `k_caches()/v_caches()` plus `max_seq_len()` (`infer/src/model/generation_state.rs:121-165`). Single-token decode for Qwen3 still writes/reads contiguous KV via `fused_attention_decode_into` (`infer/src/model/qwen3/decode.rs:11-38`).
 
 The plan omits `infer/src/model/qwen3/batch_decode.rs`. That mixed decode+prefill path explicitly requires contiguous caches: it checks `kv_cache.k_caches().is_empty()` and `max_seq_len()` before launching `prefill_attention_prep_dual_write_cuda` (`batch_decode.rs:360-364`, `batch_decode.rs:543-566`).
 
@@ -27,7 +27,7 @@ Phase 3 is blocked by Phase 4. The scheduler still caps chunk size with `.min(CO
 
 The Phase 2 acceptance command does not map to the repo. `ops/tests.rs` is an internal unit-test module declared from `infer/src/ops.rs:20-22`, not a runnable integration target named `ops`.
 
-The Phase 3 acceptance command pattern is also off. The repo has `infer/tests/e2e.rs` and `infer/tests/e2e_qwen35.rs`, but no `e2e_qwen3.rs` or GLM4-specific e2e harness. Until Phase 1 kernels are called by any production path, they are untested dead code — there is no way to exercise them between Phase 1 and Phase 3.
+The Phase 3 acceptance command pattern is also off. The repo has `infer/tests/e2e.rs` and `infer/tests/e2e_qwen35.rs`, but no `e2e_qwen3.rs`. Until Phase 1 kernels are called by any production path, they are untested dead code — there is no way to exercise them between Phase 1 and Phase 3.
 
 ---
 
@@ -63,7 +63,7 @@ The +26% Qwen3.5 throughput target is not supported by the timing breakdown. Tha
 
 The root-cause win doc explicitly recommends a lower-risk sequence: try Path A (`CONTIGUOUS_KV_TOKENS = 2048`) first, keep P1 in parallel, and defer Path B until measured (`docs/experience/wins/2026-04-17-prefill-ttft-root-cause-contiguous-kv-cap.md:81-137`). The plan skips this de-risking step without explanation.
 
-There is also already an incremental dual-write hook in the shared model contract: `forward_prefill_with_pool()` is documented as the future direct-pool path in `infer/src/model.rs:249-272`, and Qwen3/GLM4 already implement it (`infer/src/model/qwen3/forward.rs:163-188`, `infer/src/model/glm4/forward.rs:164-180`). That is a better stepping stone than jumping straight from contiguous prefill to full paged prefill plus scheduler cleanup in the same phase.
+There is also already an incremental dual-write hook in the shared model contract: `forward_prefill_with_pool()` is documented as the future direct-pool path in `infer/src/model.rs:249-272`, and Qwen3 already implements it (`infer/src/model/qwen3/forward.rs:163-188`). That is a better stepping stone than jumping straight from contiguous prefill to full paged prefill plus scheduler cleanup in the same phase.
 
 ---
 
@@ -73,7 +73,7 @@ There is also already an incremental dual-write hook in the shared model contrac
 - Phase ordering — reorder so scheduler/core/prefix-reuse work lands before or with the first model migration; Phase 3 currently depends on Phase 4 changes to be meaningful.
 - Bitwise parity claim — replace with greedy-token parity plus per-op tensor tolerances; fix the Qwen3.5 TTFT baseline from 820 ms to 982.6 ms and throughput target to match what the timing breakdown actually supports.
 - Prefix-cache risk section — rewrite: today same-slot resurrection depends on contiguous state (`prefill.rs:99-156`), not just paged pages; the claim that prefix cache already operates on the paged pool is premature.
-- Test commands — replace with repo-real targets (`infer/tests/e2e.rs`, `infer/tests/e2e_qwen35.rs`); spell out what covers GLM4 decode parity.
+- Test commands — replace with repo-real targets (`infer/tests/e2e.rs`, `infer/tests/e2e_qwen35.rs`); spell out what covers Qwen3 decode parity.
 - Add an explicit "Path A first" decision gate (raise cap to 2048, measure TTFT delta, then decide whether full Path B is worth the scope) or justify why the root-cause doc's recommended sequence is being bypassed.
 
 ---

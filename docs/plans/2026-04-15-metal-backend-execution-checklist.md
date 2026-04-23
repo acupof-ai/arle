@@ -92,7 +92,7 @@ This checklist is the execution companion to:
   hard-coded model family path.
 - [ ] `M2.2` Expand Metal model coverage deliberately.
   Exit:
-  GLM4 reaches supported status; Gemma text path has an explicit support decision.
+  Gemma text path has an explicit support decision.
 - [ ] `M2.3` Add capture/profiling ergonomics.
   Exit:
   MLX / Metal capture can be enabled from the CLI and documented for regression work.

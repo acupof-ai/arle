@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Result, anyhow};
 use tokenizers::Tokenizer as HfTokenizer;
 use tokenizers::tokenizer::{
@@ -30,7 +32,12 @@ pub(crate) struct IncrementalDecoder<'a> {
 
 impl Tokenizer {
     pub fn from_file(path: &str) -> Result<Self> {
-        let tokenizer_path = format!("{}/tokenizer.json", path);
+        let path = Path::new(path);
+        let tokenizer_path = if path.is_dir() {
+            path.join("tokenizer.json")
+        } else {
+            path.to_path_buf()
+        };
         let inner = HfTokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         Ok(Self { inner })

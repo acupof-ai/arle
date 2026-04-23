@@ -108,17 +108,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         backends: &[Cuda, Metal],
         implemented: true,
     },
-    CatalogEntry {
-        hf_id: "THUDM/glm-4-9b-chat",
-        display_name: "GLM-4 9B",
-        family: "GLM4",
-        param_count: "9B",
-        quantization: None,
-        size_gb: 18.0,
-        min_memory_gb: 19.0,
-        backends: &[Cuda],
-        implemented: true,
-    },
     // ── Community quantized (popular picks) ──────────────────────────────
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-4B-4bit",
@@ -219,8 +208,10 @@ mod tests {
     fn cpu_backend_excludes_gpu_only_models() {
         let info = make_info(CompiledBackend::Cpu, 32.0);
         let recs = recommend_models(&info);
-        // GLM-4 is CUDA-only
-        assert!(recs.iter().all(|e| e.family != "GLM4"));
+        assert!(
+            recs.iter()
+                .all(|e| e.backends.contains(&CompiledBackend::Cpu))
+        );
     }
 
     #[test]

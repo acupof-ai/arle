@@ -1,6 +1,6 @@
 # `infer::model` — Agent Guide
 
-Model implementations (`qwen3`, `qwen35`, `glm4`) + the `ModelForward` and
+Model implementations (`qwen3`, `qwen35`) + the `ModelForward` and
 `DecodeContextOps` traits. Load before editing any model or adding a new one.
 
 ## Refactor posture
@@ -55,7 +55,6 @@ of peers next to its root file:
 ```
 model/qwen3.rs   + model/qwen3/{config, weights, forward, prefill, decode, batch_decode, decode_buffers}.rs
 model/qwen35.rs  + model/qwen35/{..., recurrent_state, prefill_buffers, single_token_buffers}.rs
-model/glm4.rs    + model/glm4/{...}
 model/common.rs  — cross-model CUDA graph glue
 model/generation_state.rs — GenerationStateBase shared scaffolding
 model/kv_cache.rs — KVCacheDtype, KVFormat (re-exports from infer_cuda_kernels)

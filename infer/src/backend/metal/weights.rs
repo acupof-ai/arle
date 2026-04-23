@@ -22,6 +22,7 @@ use super::qwen35;
 /// eliminating one `transpose()` view creation per forward-pass call.
 // GPU required: MlxArray is backed by Metal buffers.
 #[cfg(feature = "metal")]
+#[derive(Clone)]
 pub enum WeightTensor {
     /// Pre-transposed weight: shape [in, out] = w.T. Ready for `x @ w_t`.
     Dense(MlxArray),

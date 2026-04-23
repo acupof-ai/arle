@@ -35,7 +35,6 @@ rg -n "OFFLOAD_BLOCK_SIZE|prefetch_kv_to_gpu|offload_kv_if_needed|prefetch_to_gp
   infer/src/model/kv_cache.rs \
   infer/src/model/qwen3/forward.rs \
   infer/src/model/qwen35/forward.rs \
-  infer/src/model/glm4/forward.rs \
   infer/src/scheduler/cuda/prefill.rs \
   infer/src/scheduler/cuda/runtime.rs \
   infer/src/server_engine.rs
@@ -57,7 +56,7 @@ rg -n "set_max_gpu_kv" infer/src/server_engine.rs crates/cli/src/{args,lib}.rs
   legacy contiguous CPU KV offload has been retired", max_tokens);`.
 - `infer/src/server_engine.rs:1126-1146` —
   `LoadedInferenceEngine::set_max_gpu_kv` dispatch:
-  Qwen3/Qwen3.5/GLM4 forward to the ModelInferenceEngine shim,
+  Qwen3/Qwen3.5 forward to the ModelInferenceEngine shim,
   Metal/Cpu variants log an analogous "was CUDA-only and has been
   retired" warning.
 - `crates/cli/src/lib.rs:41` — `engine.set_max_gpu_kv(max_kv)`,

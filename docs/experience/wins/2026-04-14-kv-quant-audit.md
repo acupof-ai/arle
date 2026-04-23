@@ -13,8 +13,8 @@
   (now `crates/cuda-kernels/src/paged_kv.rs`)
 - `crates/infer-engine/src/ops/kv_quant.rs`
   (now `crates/cuda-kernels/src/kv_quant.rs`)
-- `crates/infer-engine/src/model/{qwen3,qwen35,glm4}/batch_decode.rs`
-  (now `infer/src/model/{qwen3,qwen35,glm4}/batch_decode.rs` — the model
+- `crates/infer-engine/src/model/{qwen3,qwen35}/batch_decode.rs`
+  (now `infer/src/model/{qwen3,qwen35}/batch_decode.rs` — the model
   layer stayed in `infer` and was never actually split into `infer-engine`)
 - `infer/src/scheduler/cuda/prefill.rs`
 - `ROADMAP.md`

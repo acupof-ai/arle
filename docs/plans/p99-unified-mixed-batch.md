@@ -32,7 +32,7 @@ stepping on each other. Concretely:
    **and** the old contiguous+scatter path (`decode_batch_with_prefill`
    → `prefill_attention_prep_dual_write_cuda`). Mixed P+D uses the old path, so
    P+D fusion doesn't get the paged benefits.
-2. Qwen3.5 and GLM4 never migrated to paged at all — the full-attn layers still
+2. Qwen3.5 never migrated to paged at all — the full-attn layers still
    hit a 512-token chunk ceiling because `CONTIGUOUS_KV_TOKENS` can't be lifted
    while they read from contiguous scratch.
 3. The scheduler's `step()` already does launch/decode-overlap correctly, but
@@ -70,8 +70,8 @@ layer.** That answers the user's question directly — here's where the line is:
 
 ### What is NOT and cannot be unified
 
-- **`forward()` body.** Qwen3 (HD128), Qwen3.5 (HD256 + linear-attn DeltaNet),
-  GLM4 (HD128 + QKV bias). Each has its own op-tape. That's the whole point of
+- **`forward()` body.** Qwen3 (HD128) and Qwen3.5 (HD256 + linear-attn DeltaNet)
+  each have their own op-tape. That's the whole point of
   the `ModelForward` trait — architectural differences live here.
 - **Quantization KV paths.** INT8 KV has no FlashInfer wrapper and uses a
   project-specific kernel that assumes `qo_len=1`. Paged-KV is BF16 first;
@@ -114,19 +114,6 @@ left on the default prefill.
   CONTIGUOUS_KV_TOKENS cap via `prefill_chunk_size()` (already in
   `infer/src/scheduler/cuda/core.rs:884`).
 
-**1B — GLM4 paged prefill (follow-up, HD128):**
-- Scoped out of the first commit. GLM4 adds two complications on top of the
-  Qwen3 pattern: (a) QKV bias must broadcast-add after the projections and
-  before the paged prep kernel; (b) GLM-4's RoPE shape needs to be reconciled
-  with `prefill_attention_paged_prep_cuda` (it currently bakes in the HD128
-  full-rotate layout Qwen3 uses). Both are contained but not trivial.
-- Approach when we take it: apply `add_bias_batch_into` to q/k/v, then call
-  `ops::prefill_attention_paged_batch` with dummy-identity q_norm/k_norm
-  (same trick the current GLM4 code already uses for the contiguous path).
-  Compare numerics against the existing contiguous path before deleting it.
-- Until then GLM4 keeps its existing contiguous+scatter path — it works, it
-  just doesn't get the >512-token chunk win.
-
 **1C — Drop Qwen3's legacy dual-write path from mixed-batch (follow-up):**
 - `batch_decode::decode_batch_with_prefill` currently calls
   `prefill_attention_prep_dual_write_cuda`. Once Phase 2 lands a true paged
@@ -136,7 +123,7 @@ left on the default prefill.
 **Verification for Phase 1:**
 - `cargo check -p infer --no-default-features --features cuda,no-cuda` (here, Mac).
 - CUDA box: `cargo test --release --test e2e` (Qwen3), `cargo test --release
-  --test e2e_qwen35`, GLM4 e2e, then `scripts/bench_guidellm.sh paged-all`
+  --test e2e_qwen35`, then `scripts/bench_guidellm.sh paged-all`
   snapshot vs. the Apr 17 baseline. Expected: Qwen3.5 TTFT gap closes
   substantially once 512-token cap lifts.
 
@@ -166,8 +153,8 @@ pub struct MixedBatch {
 - `ModelForward::forward_batch(&self, batch: &MixedBatch, states: &mut [State],
   pool: &PagedKVPool) -> Result<Logits>`. Default impl delegates to existing
   decode/prefill for backward compat during migration.
-- Models that support true mixed (Qwen3 full-attn, Qwen3.5 full-attn only,
-  GLM4) implement `forward_batch` to run one FlashInfer
+- Models that support true mixed (Qwen3 full-attn, Qwen3.5 full-attn only)
+  implement `forward_batch` to run one FlashInfer
   `BatchPrefillWithPagedKVCacheDispatched` call with the per-row varlen shape.
 - Scheduler `step()` builds one `MixedBatch` per step; drops
   `pending_mixed_prefill_idx` and `step_decode_launch_mixed` specials.
@@ -247,4 +234,4 @@ the admission-thrashing seen under `max_num_seqs=500` load.
   - No regression in Qwen3 ITL or Qwen3 TTFT.
 - Qwen3.5 `forward_prefill_with_pool` + `prefill_uses_paged_pool() → true`
   wired through the scheduler (lifts the 512-token cap for Qwen3.5).
-- GLM4 untouched in Phase 1 (tracked as 1B follow-up).
+- Qwen3.5 remains the only follow-up model migration in Phase 1.

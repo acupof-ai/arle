@@ -6,7 +6,7 @@ limited, and what validation exists for each area.
 If something is not listed as supported here, do not assume it is supported
 just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-04-21.
+State reflected here is based on repository evidence as of 2026-04-23.
 
 ---
 
@@ -41,8 +41,7 @@ Notes:
 | Model family | Status | Notes |
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
-| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime now has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Metal DFlash is Beta; see §4a for the current validation note. |
-| GLM4 | Limited support | Present in project state, but less established than Qwen paths. |
+| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime now has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Dense Qwen3.5 GGUF now also loads on Metal via Rust GGUF parsing + load-time dequant (validated locally on `Qwen3.5-0.8B-Q4_K_M`, 2026-04-23). Metal DFlash is Beta; see §4a for the current validation note. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
@@ -58,7 +57,7 @@ Notes:
 | TurboQuant KV (2–4 bit) | Experimental | Fused decode attention with dequant. Fast-moving optimization area. |
 | W8 / W4 / W2 weight quantization | Beta | Native W4 GEMV path + Marlin W4 prefill (5–25× TTFT on long prompts). |
 | GPTQ / AWQ (W4A16) | Beta | GEMV + Marlin kernel path; format detection production-ready. |
-| GGUF loading | Beta | Supported loader path. Native Q4_K GPU kernel shipped (`q4k_gemv_kernel` + packed fast path in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. |
+| GGUF loading | Beta | Supported loader path. CUDA ships the native packed Q4_K GPU kernel (`q4k_gemv_kernel` + packed fast path in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. Metal now supports dense Qwen3.5 GGUF on Apple Silicon via the shared Rust GGUF parser with load-time BF16 dequant. |
 
 Backend note:
 

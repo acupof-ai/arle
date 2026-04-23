@@ -39,6 +39,7 @@ use anyhow::{Context, Result};
 use crate::backend::StreamingInferenceBackend;
 use crate::{
     backend::{GenerateResult, InferenceBackend, is_stream_stop_matched},
+    gguf::{GgufFile, try_open as try_open_gguf},
     hf_hub,
     sampler::SamplingParams,
     tokenizer::Tokenizer,
@@ -103,7 +104,10 @@ use self::sampling::gpu_sample_token;
 use self::weights::{
     MetalWeights, MlpInputProjection, WeightTensor, merge_quantized_projection_rows,
 };
-use config::{MetalModelArch, MetalModelConfig, load_metal_config};
+use config::{
+    MetalModelArch, MetalModelConfig, apply_gguf_metadata_overrides, load_metal_config,
+    load_metal_config_from_gguf,
+};
 #[cfg(feature = "metal")]
 use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
 #[cfg(feature = "metal")]
@@ -114,7 +118,9 @@ use loader::{
     tie_lm_head_from_embed_tokens,
 };
 #[cfg(feature = "metal")]
-use qwen35::{load_qwen35_metal_weights, metal_generate_qwen35};
+use qwen35::{
+    load_qwen35_metal_weights, load_qwen35_metal_weights_from_gguf, metal_generate_qwen35,
+};
 #[cfg(feature = "metal")]
 pub use runtime::{
     MetalSchedulerHandle, spawn_metal_scheduler_handle_from_path,
@@ -543,6 +549,86 @@ impl Default for MetalBackend {
 #[cfg(feature = "metal")]
 unsafe impl Send for MetalBackend {}
 
+fn gguf_model_root(path: &Path) -> PathBuf {
+    if path.is_file() {
+        path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn gguf_base_model_repo_id(gguf: &GgufFile) -> Option<String> {
+    gguf.meta_str("general.base_model.0.repo_url")
+        .and_then(|url| url.strip_prefix("https://huggingface.co/"))
+        .map(|repo_id| repo_id.trim_end_matches('/').to_string())
+}
+
+fn resolve_gguf_runtime_assets_dir(
+    resolved_path: &Path,
+    gguf: &GgufFile,
+) -> Result<Option<PathBuf>> {
+    let local_root = gguf_model_root(resolved_path);
+    let has_local_config = local_root.join("config.json").exists();
+    let has_local_tokenizer = local_root.join("tokenizer.json").exists();
+    if has_local_config && has_local_tokenizer {
+        return Ok(Some(local_root));
+    }
+
+    if let Some(repo_id) = gguf_base_model_repo_id(gguf) {
+        let assets_dir = hf_hub::download_runtime_assets_from_hub(&repo_id).with_context(|| {
+            format!("failed to resolve runtime assets for GGUF base model '{repo_id}'")
+        })?;
+        return Ok(Some(assets_dir));
+    }
+
+    if has_local_config {
+        return Ok(Some(local_root));
+    }
+
+    Ok(None)
+}
+
+fn load_gguf_tokenizer(
+    resolved_path: &Path,
+    runtime_assets_dir: Option<&Path>,
+    gguf: &GgufFile,
+) -> Result<Tokenizer> {
+    if let Some(dir) = runtime_assets_dir.filter(|dir| dir.join("tokenizer.json").exists()) {
+        return Tokenizer::from_file(dir.to_str().unwrap_or("."))
+            .with_context(|| format!("failed to load tokenizer from {}", dir.display()));
+    }
+
+    if let Some(json_str) = gguf.extract_tokenizer_json() {
+        let tok_path = gguf_model_root(resolved_path).join("_gguf_tokenizer.json");
+        std::fs::write(&tok_path, json_str).with_context(|| {
+            format!(
+                "failed to write extracted tokenizer to {}",
+                tok_path.display()
+            )
+        })?;
+        return Tokenizer::from_file(tok_path.to_str().unwrap_or("."))
+            .with_context(|| format!("failed to load tokenizer from {}", tok_path.display()));
+    }
+
+    anyhow::bail!(
+        "GGUF model is missing tokenizer.json and does not embed tokenizer.huggingface.json; place tokenizer.json next to the GGUF or make the base-model runtime assets available"
+    )
+}
+
+fn load_gguf_metal_config(
+    runtime_assets_dir: Option<&Path>,
+    gguf: &GgufFile,
+) -> Result<MetalModelConfig> {
+    let mut config =
+        if let Some(dir) = runtime_assets_dir.filter(|dir| dir.join("config.json").exists()) {
+            load_metal_config(dir)?
+        } else {
+            load_metal_config_from_gguf(gguf)?
+        };
+    apply_gguf_metadata_overrides(&mut config, gguf);
+    Ok(config)
+}
+
 impl InferenceBackend for MetalBackend {
     fn name(&self) -> &'static str {
         "metal"
@@ -559,17 +645,46 @@ impl InferenceBackend for MetalBackend {
 
         // ── 1. Resolve model path ────────────────────────────────────────────
         let path_str = model_path.to_string_lossy();
-        let local_dir = hf_hub::resolve_model_path(&path_str)
+        let resolved_path = hf_hub::resolve_model_path(&path_str)
             .with_context(|| format!("failed to resolve model '{path_str}'"))?;
 
-        log::info!("MetalBackend: loading model from {}", local_dir.display());
+        let gguf = try_open_gguf(resolved_path.to_str().unwrap_or(&path_str));
+        let runtime_assets_dir = if let Some(ref gguf) = gguf {
+            resolve_gguf_runtime_assets_dir(&resolved_path, gguf)?
+        } else {
+            None
+        };
+
+        if gguf.is_some() {
+            log::info!(
+                "MetalBackend: loading GGUF weights from {}",
+                resolved_path.display()
+            );
+            if let Some(runtime_assets_dir) = &runtime_assets_dir {
+                log::info!("  runtime assets from {}", runtime_assets_dir.display());
+            }
+        } else {
+            log::info!(
+                "MetalBackend: loading model from {}",
+                resolved_path.display()
+            );
+        }
 
         // ── 2. Load tokenizer ────────────────────────────────────────────────
-        let tokenizer = Tokenizer::from_file(local_dir.to_str().unwrap_or("."))
-            .with_context(|| format!("failed to load tokenizer from {}", local_dir.display()))?;
+        let tokenizer = if let Some(ref gguf) = gguf {
+            load_gguf_tokenizer(&resolved_path, runtime_assets_dir.as_deref(), gguf)?
+        } else {
+            Tokenizer::from_file(resolved_path.to_str().unwrap_or(".")).with_context(|| {
+                format!("failed to load tokenizer from {}", resolved_path.display())
+            })?
+        };
 
         // ── 3. Parse config.json ─────────────────────────────────────────────
-        let config = load_metal_config(&local_dir)?;
+        let config = if let Some(ref gguf) = gguf {
+            load_gguf_metal_config(runtime_assets_dir.as_deref(), gguf)?
+        } else {
+            load_metal_config(&resolved_path)?
+        };
 
         match &config.arch {
             MetalModelArch::Qwen3 => log::info!(
@@ -617,14 +732,22 @@ impl InferenceBackend for MetalBackend {
         #[cfg(feature = "metal")]
         {
             let weights = match &config.arch {
-                MetalModelArch::Qwen3 => MetalWeights::Qwen3(
-                    self::weights::load_qwen3_metal_weights(&local_dir, &config)
-                        .with_context(|| "failed to load Qwen3 weights into Metal memory")?,
-                ),
-                MetalModelArch::Qwen35(_) => MetalWeights::Qwen35(
-                    load_qwen35_metal_weights(&local_dir, &config)
-                        .with_context(|| "failed to load Qwen3.5 weights into Metal memory")?,
-                ),
+                MetalModelArch::Qwen3 => {
+                    if gguf.is_some() {
+                        anyhow::bail!("Metal GGUF loading currently supports Qwen3.5 only");
+                    }
+                    MetalWeights::Qwen3(
+                        self::weights::load_qwen3_metal_weights(&resolved_path, &config)
+                            .with_context(|| "failed to load Qwen3 weights into Metal memory")?,
+                    )
+                }
+                MetalModelArch::Qwen35(_) => MetalWeights::Qwen35(if let Some(ref gguf) = gguf {
+                    load_qwen35_metal_weights_from_gguf(gguf, &config)
+                        .with_context(|| "failed to load Qwen3.5 GGUF weights into Metal memory")?
+                } else {
+                    load_qwen35_metal_weights(&resolved_path, &config)
+                        .with_context(|| "failed to load Qwen3.5 weights into Metal memory")?
+                }),
             };
             self.weights = Some(weights);
             log::info!("  weights loaded into Metal unified memory");
@@ -656,7 +779,11 @@ impl InferenceBackend for MetalBackend {
 
         self.tokenizer = Some(tokenizer);
         self.config = Some(config);
-        self.model_dir = Some(local_dir);
+        self.model_dir = Some(if gguf.is_some() {
+            gguf_model_root(&resolved_path)
+        } else {
+            resolved_path
+        });
         Ok(())
     }
 

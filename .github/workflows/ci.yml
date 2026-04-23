@@ -10,6 +10,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ── macOS arm64: Metal feature surface ──────────────────────────────────────
   check-macos:
@@ -43,7 +47,12 @@ jobs:
         run: cargo check --no-default-features --features metal,no-cuda --lib
 
       - name: cargo check (Metal CLI surface)
-        run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer
+        run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
+
+      - name: cargo check (Metal train/autograd libs)
+        run: |
+          cargo check -p autograd --release --features metal --lib
+          cargo check -p train --release --features metal --lib
 
       - name: cargo test (Metal CLI unit tests)
         run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer
@@ -78,6 +87,14 @@ jobs:
         working-directory: infer
         run: cargo check --no-default-features --features no-cuda --lib
 
+      - name: cargo check (ARLE CPU smoke path)
+        run: cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle
+
+      - name: cargo check (workspace support crates)
+        run: |
+          cargo check -p autograd --release --features no-cuda --lib
+          cargo check -p train --release --features no-cuda --lib
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -105,6 +122,15 @@ jobs:
       - name: cargo test (CPU-only)
         working-directory: infer
         run: cargo test --no-default-features --features no-cuda --lib
+
+      - name: cargo test (ARLE CPU smoke path)
+        run: cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
+
+      - name: cargo test (workspace support crates)
+        run: |
+          cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --release
+          cargo test -p autograd --release --features no-cuda --lib
+          cargo test -p train --release --features no-cuda --lib
 
   clippy:
     name: Clippy
@@ -136,6 +162,14 @@ jobs:
         working-directory: infer
         run: cargo clippy --no-default-features --features no-cuda --lib -- -D warnings
 
+      - name: cargo clippy (ARLE CPU smoke path)
+        run: cargo clippy -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
+
+      - name: cargo clippy (workspace support crates)
+        run: |
+          cargo clippy -p autograd --release --features no-cuda --lib -- -D warnings
+          cargo clippy -p train --release --features no-cuda --lib -- -D warnings
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -147,9 +181,7 @@ jobs:
         with:
           components: rustfmt
 
-      # Match the Rust CI scope and format the infer crate from its own manifest root.
       - name: cargo fmt check
-        working-directory: infer
         run: cargo fmt --all -- --check
 
   python-test:

@@ -17,7 +17,6 @@
 //! | `DeepseekV3ForCausalLM`               | `DeepSeekV3`             |
 //! | `GemmaForCausalLM` / `Gemma2ForCausalLM` | `Gemma`               |
 //! | `PhiForCausalLM` / `Phi3ForCausalLM`  | `Phi`                    |
-//! | `ChatGLMModel` / `Glm4ForCausalLM`   | `GLM4`                   |
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -49,7 +48,6 @@ pub enum ModelArch {
     DeepSeekV3,
     Gemma,
     Phi,
-    GLM4,
 }
 
 impl ModelArch {
@@ -66,7 +64,6 @@ impl ModelArch {
             Self::DeepSeekV3 => "DeepSeek-V3",
             Self::Gemma => "Gemma",
             Self::Phi => "Phi",
-            Self::GLM4 => "GLM-4",
         }
     }
 
@@ -76,7 +73,7 @@ impl ModelArch {
             Self::Qwen35 | Self::Qwen3_5_Moe => AttentionVariant::HybridGqa,
             Self::DeepSeekV2 | Self::DeepSeekV3 => AttentionVariant::Mla,
             Self::Gemma => AttentionVariant::Mha,
-            Self::Qwen3 | Self::Llama | Self::Mistral | Self::Mixtral | Self::Phi | Self::GLM4 => {
+            Self::Qwen3 | Self::Llama | Self::Mistral | Self::Mixtral | Self::Phi => {
                 AttentionVariant::Gqa
             }
         }
@@ -88,7 +85,7 @@ impl ModelArch {
     /// until the CUDA MoE kernel lands (see `docs/plans/qwen36-moe-metal.md`).
     pub fn is_implemented(self) -> bool {
         match self {
-            Self::Qwen3 | Self::Qwen35 | Self::GLM4 => true,
+            Self::Qwen3 | Self::Qwen35 => true,
             Self::Qwen3_5_Moe => cfg!(feature = "metal"),
             Self::Llama
             | Self::Mistral
@@ -162,9 +159,6 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
         m.insert("PhiForCausalLM", ModelArch::Phi);
         m.insert("Phi3ForCausalLM", ModelArch::Phi);
         m.insert("Phi3SmallForCausalLM", ModelArch::Phi);
-        // GLM-4
-        m.insert("ChatGLMModel", ModelArch::GLM4);
-        m.insert("Glm4ForCausalLM", ModelArch::GLM4);
         m
     })
 }
@@ -293,10 +287,6 @@ mod tests {
         r#"{"architectures":["Phi3ForCausalLM"],"hidden_size":3072}"#
     }
 
-    fn glm4_config() -> &'static str {
-        r#"{"architectures":["ChatGLMModel"],"hidden_size":4096}"#
-    }
-
     fn qwen35_moe_explicit_arch_config() -> &'static str {
         r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"text_config":{"hidden_size":2048,"num_experts":256}}"#
     }
@@ -367,14 +357,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_glm4() {
-        assert_eq!(
-            detect_arch_from_json(glm4_config()).unwrap(),
-            ModelArch::GLM4
-        );
-    }
-
-    #[test]
     fn detects_qwen35_moe_via_explicit_arch() {
         assert_eq!(
             detect_arch_from_json(qwen35_moe_explicit_arch_config()).unwrap(),
@@ -404,7 +386,6 @@ mod tests {
     fn implemented_models() {
         assert!(ModelArch::Qwen3.is_implemented());
         assert!(ModelArch::Qwen35.is_implemented());
-        assert!(ModelArch::GLM4.is_implemented());
     }
 
     #[test]
@@ -429,7 +410,6 @@ mod tests {
         );
         assert_eq!(ModelArch::Gemma.attention_variant(), AttentionVariant::Mha);
         assert_eq!(ModelArch::Llama.attention_variant(), AttentionVariant::Gqa);
-        assert_eq!(ModelArch::GLM4.attention_variant(), AttentionVariant::Gqa);
     }
 
     #[test]
@@ -445,7 +425,6 @@ mod tests {
             ModelArch::DeepSeekV3,
             ModelArch::Gemma,
             ModelArch::Phi,
-            ModelArch::GLM4,
         ] {
             assert!(!arch.display_name().is_empty(), "arch={arch:?}");
         }

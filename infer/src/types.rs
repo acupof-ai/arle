@@ -253,7 +253,7 @@ mod tests {
         );
         let b = BlockFingerprint::compute(
             KvContentContext {
-                model_fingerprint: b"glm4",
+                model_fingerprint: b"qwen35-4b",
                 kv_format_tag: 1,
                 parent: None,
             },

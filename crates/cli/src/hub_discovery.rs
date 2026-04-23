@@ -11,7 +11,7 @@ use std::time::SystemTime;
 /// Supported model family substrings (case-insensitive).
 ///
 /// Keep in sync with `docs/support-matrix.md`.
-const SUPPORTED_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "qwen3.5", "glm4"];
+const SUPPORTED_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "qwen3.5"];
 
 /// A discovered HuggingFace-cache snapshot ready for the picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,11 +162,10 @@ mod tests {
     }
 
     #[test]
-    fn is_family_supported_matches_qwen_and_glm() {
+    fn is_family_supported_matches_supported_qwen_families() {
         assert!(is_family_supported("Qwen/Qwen3-4B"));
         assert!(is_family_supported("mlx-community/qwen3.5-4b-4bit"));
         assert!(is_family_supported("Qwen/Qwen2.5-7B"));
-        assert!(is_family_supported("THUDM/glm4-9b-chat"));
         assert!(!is_family_supported("mistralai/Mistral-7B"));
         assert!(!is_family_supported("meta-llama/Llama-3-8B"));
     }

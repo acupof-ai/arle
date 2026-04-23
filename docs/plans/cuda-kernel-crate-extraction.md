@@ -34,7 +34,7 @@ reasoning, in one paragraph:
 > `crate::tokenizer::Tokenizer`, and `crate::model_registry::*` to load and
 > dispatch model-specific CUDA engines. Extracting `backend/cuda/` now would
 > force `Tokenizer` / `KVCacheDtype` / `ModelType` / `Qwen3Model` /
-> `Qwen35Model` / `GLM4Model` to become `pub` cross-crate (they are currently
+> `Qwen35Model` to become `pub` cross-crate (it is currently
 > `pub(crate)`), and `bootstrap.rs::load_*_components` would straddle the new
 > crate boundary. That is the exact failure mode of the Route-A four-shell
 > split. Doing it before the consumer signals are real would relocate files
@@ -365,7 +365,7 @@ state. Bootstrap is the one and only place where the two layers meet.
   them next to the models that own the layouts.
 - **No `infer-scheduler-core` extraction.** The CUDA scheduler reaches into
   `PagedKVPool`, `FlashInferDecodeMetadata`, model-specific `Qwen3Model` /
-  `Qwen35Model` / `GLM4Model` types in bootstrap. Splitting it out would
+  `Qwen35Model` types in bootstrap. Splitting it out would
   re-create the bootstrap straddle problem.
 - **No `infer-runtime-api` trait crate.** Already covered by
   `infer::server_engine::InferenceEngine`. Putting it in a separate crate

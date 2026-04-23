@@ -890,7 +890,7 @@ the file paths mid-stream; the final local implementation landed on the new
   (post `a4e12f5 refactor(cuda): extract cuda-kernels api`, 2026-04-15)
 - `crates/cuda-kernels/src/flashinfer.rs` (incremental metadata update)
 - `infer/src/model/qwen3/batch_decode.rs:384`,
-  `qwen35/batch_decode.rs:724`, `glm4/batch_decode.rs:338` — drop the
+  `qwen35/batch_decode.rs:724` — drop the
   `let page_size = 1;` locals
 - `infer/src/scheduler/cuda/decode.rs:193` — literal `1` → `pool.page_size`
 - Kernels (post-extraction path): `kv_cache_to_paged.cu:64-103`,

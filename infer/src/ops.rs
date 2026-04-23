@@ -56,8 +56,7 @@ pub(crate) use attention::{
     flashinfer_run_layer_hd256,
 };
 pub(crate) use elementwise::{
-    add_batch_into, add_bias_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into,
-    silu_mul_fused_batch_into, split_qkv_batch, vec_add_inplace,
+    add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into, silu_mul_fused_batch_into,
 };
 pub(crate) use linear::{gemm_graphsafe_batched_into, gemm_into, linear};
 pub(crate) use norm::{
@@ -70,6 +69,5 @@ pub(crate) use recurrent::{
     gated_delta_rule_prefill_chunkwise_batch_into, gdr_decode_batch_into,
 };
 pub(crate) use sampling::{
-    argmax_batch_launch, argmax_batch_logprob_launch, argmax_batch_readback_into,
-    gpu_sample_launch_raw,
+    argmax_batch_logprob_launch, argmax_batch_readback_into, gpu_sample_launch_raw,
 };

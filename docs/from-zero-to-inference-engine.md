@@ -208,7 +208,7 @@ Mini-SGLang（~5000 行代码）靠 5 个优化就达到了 SGLang 80% 的性能
 
 **FusedAddRMSNorm（Qwen3.5 batched path）+ 剩余 kernel 级优化**：Overlap scheduling 已经在 2026-04-09 落地（dual-stream + decode-first reordering）。Qwen3 batched path 也已经接上 `fused_add_rms_norm_batch_into`。剩下的主要是把 FusedAddRMSNorm 搬到 Qwen3.5 的 recurrent batched path 上，以及 argmax / GPU-side KV indices 等小颗粒度优化。
 
-**更多模型架构**：目前支持 Qwen3、Qwen3.5 和 GLM4 三族。Llama、DeepSeek、Mistral、Gemma 这些主流架构还没有——每个新模型都要实现 `ModelForward` trait，工作量相对可控。
+**更多模型架构**：目前支持 Qwen3 和 Qwen3.5 两族。Llama、DeepSeek、Mistral、Gemma 这些主流架构还没有——每个新模型都要实现 `ModelForward` trait，工作量相对可控。
 
 **量化内核**：Phase 2 已经基本完成——GPTQ/AWQ W4A16 GEMV + Marlin W4 prefill（5–25× TTFT 提速）、FP8 E4M3 KV + 融合反量化 decode attention、INT8 W8A16 + INT8 KV 融合反量化、以及 TurboQuant 2–4bit KV/weight 全链路都已经在主路径上。
 

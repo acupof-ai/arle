@@ -87,7 +87,7 @@
   Q8_0 / Q4_K_M fast paths, plus `load_tensor_2d_gguf_v_reorder_rows`
   for V-head row permutation on packed Q4_K
 - GGUF → HF name mapping handled inline in `weight_loader.rs`
-- Integrated with the 3 currently-supported models (Qwen3, Qwen3.5, GLM4)
+- Integrated with the 2 currently-supported models (Qwen3, Qwen3.5)
 
 ### Original plan (preserved for historical rationale)
 

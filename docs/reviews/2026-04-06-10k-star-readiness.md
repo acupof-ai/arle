@@ -6,7 +6,7 @@
 
 **更新结论（2026-04-10）：项目已经跨过"玩具 / 个人项目"阶段，具备成长为高质量开源 AI 基础设施的技术底座；但若目标是"顶级 AI 项目"与"可长期被很多维护者共同维护"，当前短板已不再主要是代码能不能跑，而是模块边界、兼容性治理、发布纪律、多人协作约束和可预期的演进机制。**
 
-**二次更新（2026-04-15）：原审查里一部分具体事实已经过时——模型覆盖已扩到 Qwen3/Qwen3.5/GLM4 三族；GPTQ/AWQ W4 + Marlin W4 prefill、FP8/INT8 KV + 融合反量化 decode、TurboQuant 2–4 bit 全链路都已落地；`docs/stability-policy.md`、`docs/support-matrix.md`、`docs/compatibility.md`、`docs/perf-and-correctness-gates.md` 都已经存在。下文保留原结论以便对比，但相关段落已就地标注。**
+**二次更新（2026-04-15）：原审查里一部分具体事实已经过时——模型覆盖已扩到 Qwen3/Qwen3.5 两族；GPTQ/AWQ W4 + Marlin W4 prefill、FP8/INT8 KV + 融合反量化 decode、TurboQuant 2–4 bit 全链路都已落地；`docs/stability-policy.md`、`docs/support-matrix.md`、`docs/compatibility.md`、`docs/perf-and-correctness-gates.md` 都已经存在。下文保留原结论以便对比，但相关段落已就地标注。**
 
 换句话说：
 
@@ -28,7 +28,7 @@
 - 性能已达 SGLang 同级（TTFT 4.6x 快，吞吐 0.92-0.99x）
 
 **不足（2026-04-15 订正）：**
-- 仅支持 Qwen3 / Qwen3.5 / GLM4 三个模型族 — 相对 vLLM / SGLang 仍偏窄，万星项目仍需补齐 Llama、DeepSeek、Gemma 等主流模型
+- 仅支持 Qwen3 / Qwen3.5 两个模型族 — 相对 vLLM / SGLang 仍偏窄，万星项目仍需补齐 Llama、DeepSeek、Gemma 等主流模型
 - 量化链路已不再是空白：GPTQ/AWQ W4A16 GEMV + Marlin W4 prefill、FP8 E4M3 KV、INT8 W8A16 + INT8 KV、TurboQuant 2–4 bit KV/weight 全链路均已 production-ready；GGUF 加载路径也已接通（见 `ROADMAP.md` Phase 2 与 `docs/experience/wins/` 条目）。剩余的是把这些做成稳定的支持矩阵承诺
 
 ## 二、文档与 README — 7/10
@@ -283,7 +283,7 @@
 
 | 对比项 | agent-infer | vLLM | SGLang | llama.cpp |
 |--------|-------------|------|--------|-----------|
-| 模型覆盖 | 3 族（Qwen3 / Qwen3.5 / GLM4） | 50+ | 30+ | 100+ |
+| 模型覆盖 | 2 族（Qwen3 / Qwen3.5） | 50+ | 30+ | 100+ |
 | 量化 | W4A16 (GPTQ/AWQ + Marlin), W8A16, FP8 KV, INT8 KV, TurboQuant 2–4 bit | FP8/INT8/AWQ/GPTQ | 同 | Q4/Q5/Q8/... |
 | 多 GPU | TP config + sharding math 落地，NCCL comm 未接 | TP/PP | TP | 无 |
 | 语言 | Rust | Python+C++ | Python+C++ | C/C++ |

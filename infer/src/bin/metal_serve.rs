@@ -25,7 +25,7 @@ use infer::server_engine::CompletionStreamDelta;
 use log::info;
 
 const DEFAULT_WARMUP_PROMPT: &str = "Write one short sentence about Metal inference.";
-const WARMUP_TIMEOUT: Duration = Duration::from_secs(300);
+const WARMUP_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Parser)]
 #[command(

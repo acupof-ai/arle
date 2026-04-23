@@ -22,9 +22,7 @@ use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
 use infer::logging;
-use infer::model::{
-    GLM4Model, GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
-};
+use infer::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 use infer::sampler::SamplingParams;
 use infer::server_engine::{ModelType, detect_model_type};
 use infer::tokenizer::Tokenizer;
@@ -1176,14 +1174,6 @@ fn main() -> Result<()> {
                 &cli.model_path,
                 runtime.enable_cuda_graph,
             )?;
-            let state = model.create_state()?;
-            let tokenizer = Tokenizer::from_file(&cli.model_path)?;
-            let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = ModelWithState { model, state };
-            run_command(&cli, model_type, load_ms, &mut bench, &tokenizer)?
-        }
-        ModelType::GLM4 => {
-            let model = GLM4Model::from_safetensors(&cli.model_path, runtime.enable_cuda_graph)?;
             let state = model.create_state()?;
             let tokenizer = Tokenizer::from_file(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());

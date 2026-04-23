@@ -27,7 +27,7 @@
 //!
 //! - **It is consumed by ≥3 files outside `backend/cuda/`.** Two-file
 //!   helpers stay on direct module paths (e.g. `TokenKVPool`, used by
-//!   `model/qwen3/prefill.rs` + `model/glm4/prefill.rs` + `model.rs`,
+//!   `model/qwen3/prefill.rs` + `model/qwen35/prefill.rs` + `model.rs`,
 //!   does not qualify and lives at `super::paged_kv::TokenKVPool`).
 //! - **It is stable.** "Stable" means: its name, layout, and method
 //!   signatures will not change in the next 6 months. Internal types

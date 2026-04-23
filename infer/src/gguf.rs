@@ -20,8 +20,10 @@
 //! [`map_gguf_name`] converts to HuggingFace naming (`model.layers.N.self_attn.q_proj.weight`).
 
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use half::{bf16, f16};
@@ -454,6 +456,28 @@ impl GgufFile {
         dequant_to_bf16(&raw, info.dtype, numel)
     }
 
+    /// Read and dequantize a tensor to F32.
+    ///
+    /// Keeps native F32 tensors lossless and promotes every other supported
+    /// storage type through the existing BF16 dequant path.
+    pub fn read_tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("Tensor '{}' not found in GGUF", name))?;
+        let raw = self.read_tensor_raw(name)?;
+        if info.dtype == GgmlType::F32 {
+            return Ok(raw
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect());
+        }
+        Ok(dequant_to_bf16(&raw, info.dtype, info.numel())?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect())
+    }
+
     /// Get the architecture string from metadata (e.g., "llama", "gemma").
     pub fn architecture(&self) -> Option<&str> {
         self.metadata.get("general.architecture")?.as_str()
@@ -525,6 +549,172 @@ impl GgufFile {
     pub fn extract_tokenizer_json(&self) -> Option<&str> {
         self.meta_str("tokenizer.huggingface.json")
     }
+}
+
+/// Reverse llama.cpp's `_reorder_v_heads` permutation for BF16 1-D data.
+///
+/// GGUF stores V heads tiled by V-within-K-group; the HF/Qwen runtime paths
+/// expect them grouped by K head. `head_dim=1` covers scalar tensors like
+/// `dt_bias`.
+pub fn reverse_v_reorder(
+    data: &mut [bf16],
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) {
+    if num_v_per_k <= 1 {
+        return;
+    }
+    let src = data.to_vec();
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
+            for d in 0..head_dim {
+                let gguf_idx = (v * num_k_heads + k) * head_dim + d;
+                let hf_idx = (k * num_v_per_k + v) * head_dim + d;
+                data[hf_idx] = src[gguf_idx];
+            }
+        }
+    }
+}
+
+/// Same V-head reorder reversal as [`reverse_v_reorder`], but for `f32`.
+pub fn reverse_v_reorder_f32(
+    data: &mut [f32],
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) {
+    if num_v_per_k <= 1 {
+        return;
+    }
+    let src = data.to_vec();
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
+            for d in 0..head_dim {
+                let gguf_idx = (v * num_k_heads + k) * head_dim + d;
+                let hf_idx = (k * num_v_per_k + v) * head_dim + d;
+                data[hf_idx] = src[gguf_idx];
+            }
+        }
+    }
+}
+
+/// Reverse llama.cpp's V-head tiling for BF16 2-D row-major matrices where
+/// the reordered dimension lives on rows.
+pub fn reverse_v_reorder_rows(
+    data: &mut [bf16],
+    rows: usize,
+    cols: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) {
+    if num_v_per_k <= 1 {
+        return;
+    }
+    let src = data.to_vec();
+    let _ = rows;
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
+            let gguf_head = v * num_k_heads + k;
+            let hf_head = k * num_v_per_k + v;
+            let src_start = gguf_head * head_dim * cols;
+            let dst_start = hf_head * head_dim * cols;
+            let size = head_dim * cols;
+            data[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
+        }
+    }
+}
+
+/// Reverse llama.cpp's V-head tiling for BF16 2-D row-major matrices where
+/// the reordered dimension lives on columns.
+pub fn reverse_v_reorder_cols(
+    data: &mut [bf16],
+    rows: usize,
+    cols: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) {
+    if num_v_per_k <= 1 {
+        return;
+    }
+    let src = data.to_vec();
+    for r in 0..rows {
+        for k in 0..num_k_heads {
+            for v in 0..num_v_per_k {
+                let gguf_head = v * num_k_heads + k;
+                let hf_head = k * num_v_per_k + v;
+                for d in 0..head_dim {
+                    data[r * cols + hf_head * head_dim + d] =
+                        src[r * cols + gguf_head * head_dim + d];
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a HuggingFace tensor name to the actual GGUF tensor name.
+///
+/// Tries direct lookup first, then reverse-maps llama.cpp names using the
+/// Qwen/Qwen3.5 prefixes we support today.
+pub fn find_tensor_name(gguf: &GgufFile, hf_name: &str) -> Result<String> {
+    if gguf.tensors.contains_key(hf_name) {
+        return Ok(hf_name.to_string());
+    }
+
+    let prefixes = ["model", "model.language_model"];
+    for gguf_name in gguf.tensors.keys() {
+        for prefix in &prefixes {
+            if map_gguf_name_with_prefix(gguf_name, prefix) == hf_name {
+                return Ok(gguf_name.clone());
+            }
+        }
+    }
+
+    bail!(
+        "Tensor '{}' not found in GGUF (tried {} tensor names with prefixes {:?})",
+        hf_name,
+        gguf.tensors.len(),
+        prefixes
+    )
+}
+
+/// Open a GGUF file from either a direct `.gguf` path or a directory
+/// containing at least one `.gguf`.
+pub fn try_open(model_path: &str) -> Option<GgufFile> {
+    let path = Path::new(model_path);
+    if path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        return GgufFile::open(path.to_str()?).ok();
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    for entry in fs::read_dir(path).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        if candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            match GgufFile::open(candidate.to_str()?) {
+                Ok(gguf) => return Some(gguf),
+                Err(err) => {
+                    log::warn!("Failed to parse GGUF {}: {}", candidate.display(), err);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Generic model config extracted from GGUF metadata.

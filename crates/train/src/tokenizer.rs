@@ -2,7 +2,7 @@
 //!
 //! Mirrors the split already in `infer/` (which only ever decodes today).
 //! Training needs both encode + decode + chat-template assembly against
-//! pretrained vocabs (Qwen3 family, GLM4 share the `<|im_start|>` template).
+//! pretrained vocabs (the supported Qwen families share the `<|im_start|>` template).
 
 use std::{collections::HashSet, fmt::Display, path::Path};
 

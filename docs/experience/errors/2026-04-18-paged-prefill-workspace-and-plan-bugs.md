@@ -62,7 +62,7 @@ HD128 `_run` had the same omission.
 
 Even with the three kernel fixes applied, a different crash appears when
 the slot is reused with a non-zero radix hit for a
-`supports_partial_prefix() = false` model (Qwen3.5, GLM4): the scheduler
+`supports_partial_prefix() = false` model (Qwen3.5): the scheduler
 classifies the hit as MISS and does a full recompute, but the paged-pool
 seq_len from the prior request carries forward and the next
 `alloc_pool_tokens_with_retry` hits the poisoned state. Reverting

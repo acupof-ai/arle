@@ -53,7 +53,7 @@ rg -n "reusable_prefix_len|reusable_cached_prompt_len|block_owner_slots|slot_mat
 Expected: matches in `request.rs`, `runtime.rs`, `core.rs`, and `prefill.rs`.
 
 ```bash
-rg -n "prefetch_kv_to_gpu" infer/src/model.rs infer/src/model/qwen3/forward.rs infer/src/model/qwen35/forward.rs infer/src/model/glm4/forward.rs || true
+rg -n "prefetch_kv_to_gpu" infer/src/model.rs infer/src/model/qwen3/forward.rs infer/src/model/qwen35/forward.rs || true
 ```
 
 Expected:

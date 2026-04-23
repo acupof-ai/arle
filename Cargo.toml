@@ -80,5 +80,10 @@ name = "arle"
 path = "src/main.rs"
 required-features = ["cli"]
 
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
 [lints]
 workspace = true
