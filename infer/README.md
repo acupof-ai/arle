@@ -106,7 +106,7 @@ does not claim production-grade CPU inference throughput.
 ```bash
 # Reuse a public Hugging Face repo ID. The CPU backend only downloads runtime
 # assets such as config/tokenizer for smoke validation.
-cargo run -p agent-infer --no-default-features --features cpu,no-cuda,cli -- \
+cargo run -p agent-infer --bin arle --no-default-features --features cpu,no-cuda,cli -- \
   --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
 
 # Or run the serial HTTP server variant directly.
@@ -292,7 +292,7 @@ See [ROADMAP.md](../ROADMAP.md) for the full phased plan.
 
 ## Acknowledgments
 
-- [PegaInfer](https://github.com/pega-infer/infer) — agent-infer 的 CUDA 推理核心基于 PegaInfer 构建，感谢其高性能 kernel 和模型实现。
+- [PegaInfer](https://github.com/pega-infer/infer) — arle 的 CUDA 推理核心基于 PegaInfer 构建，感谢其高性能 kernel 和模型实现。
 
 ## License
 

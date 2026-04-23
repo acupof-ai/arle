@@ -142,7 +142,7 @@ pub(crate) struct ExtraArgs {
 
 #[derive(Parser)]
 #[command(
-    name = "agent-infer",
+    name = "arle",
     about = "Local LLM inference, training, and dataset CLI",
     group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
 )]
@@ -346,7 +346,7 @@ pub(crate) struct TrainEstimateMemoryArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced pretrain flags still work after `--`, for example:\n  agent-infer train pretrain --corpus corpus.txt --tokenizer tokenizer.json -- --bos-token <s>"
+    after_help = "Advanced pretrain flags still work after `--`, for example:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json -- --bos-token <s>"
 )]
 pub(crate) struct TrainPretrainArgs {
     /// Plain-text training corpus.
@@ -480,7 +480,7 @@ pub(crate) struct TrainPretrainArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced SFT flags still work after `--`, for example:\n  agent-infer train sft --model models/base --data train.chat.jsonl -- --resume-from runs/sft/step_000100"
+    after_help = "Advanced SFT flags still work after `--`, for example:\n  arle train sft --model models/base --data train.chat.jsonl -- --resume-from runs/sft/step_000100"
 )]
 pub(crate) struct TrainSftArgs {
     /// Base checkpoint directory or HF model ID.
@@ -562,7 +562,7 @@ pub(crate) struct TrainSftArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced eval flags still work after `--`, for example:\n  agent-infer train eval --model checkpoints/base --data eval.chat.jsonl -- --metrics-jsonl metrics.jsonl"
+    after_help = "Advanced eval flags still work after `--`, for example:\n  arle train eval --model checkpoints/base --data eval.chat.jsonl -- --metrics-jsonl metrics.jsonl"
 )]
 pub(crate) struct TrainEvalArgs {
     /// Checkpoint directory or HF model ID.
@@ -599,7 +599,7 @@ pub(crate) struct TrainEvalArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced GRPO flags still work after `--`, for example:\n  agent-infer train grpo --grpo-iters 20 -- --resume-from runs/grpo/step_000010"
+    after_help = "Advanced GRPO flags still work after `--`, for example:\n  arle train grpo --grpo-iters 20 -- --resume-from runs/grpo/step_000010"
 )]
 pub(crate) struct TrainGrpoArgs {
     #[arg(long, value_enum)]
@@ -674,7 +674,7 @@ pub(crate) struct TrainGrpoArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Advanced multi-turn flags still work after `--`, for example:\n  agent-infer train multi-turn --iters 20 -- --resume-from runs/multi-turn/step_000010"
+    after_help = "Advanced multi-turn flags still work after `--`, for example:\n  arle train multi-turn --iters 20 -- --resume-from runs/multi-turn/step_000010"
 )]
 pub(crate) struct TrainMultiTurnArgs {
     #[arg(long)]
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn rejects_removed_max_gpu_kv_flag() {
-        let err = Args::try_parse_from(["agent-infer", "--max-gpu-kv", "256"])
+        let err = Args::try_parse_from(["arle", "--max-gpu-kv", "256"])
             .err()
             .expect("removed flag should be rejected");
         let rendered = err.to_string();
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn rejects_removed_tools_flag() {
-        let err = Args::try_parse_from(["agent-infer", "--tools"])
+        let err = Args::try_parse_from(["arle", "--tools"])
             .err()
             .expect("removed flag should be rejected");
         assert!(err.to_string().contains("--tools"));
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_max_turns() {
-        let err = Args::try_parse_from(["agent-infer", "--max-turns", "0"])
+        let err = Args::try_parse_from(["arle", "--max-turns", "0"])
             .err()
             .expect("zero max-turns should be rejected");
         assert!(err.to_string().contains("at least 1"));
@@ -851,7 +851,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_max_tokens() {
-        let err = Args::try_parse_from(["agent-infer", "--max-tokens", "0"])
+        let err = Args::try_parse_from(["arle", "--max-tokens", "0"])
             .err()
             .expect("zero max-tokens should be rejected");
         assert!(err.to_string().contains("at least 1"));
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn rejects_negative_temperature() {
-        let err = Args::try_parse_from(["agent-infer", "--temperature", "-0.1"])
+        let err = Args::try_parse_from(["arle", "--temperature", "-0.1"])
             .err()
             .expect("negative temperature should be rejected");
         assert!(err.to_string().contains("temperature must be >= 0.0"));
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_temperature() {
-        let err = Args::try_parse_from(["agent-infer", "--temperature", "NaN"])
+        let err = Args::try_parse_from(["arle", "--temperature", "NaN"])
             .err()
             .expect("NaN temperature should be rejected");
         assert!(err.to_string().contains("temperature must be finite"));
@@ -875,21 +875,20 @@ mod tests {
 
     #[test]
     fn accepts_doctor_flag() {
-        let args =
-            Args::try_parse_from(["agent-infer", "--doctor"]).expect("doctor flag should parse");
+        let args = Args::try_parse_from(["arle", "--doctor"]).expect("doctor flag should parse");
         assert!(args.doctor);
     }
 
     #[test]
     fn accepts_list_models_flag() {
-        let args = Args::try_parse_from(["agent-infer", "--list-models"])
-            .expect("list-models flag should parse");
+        let args =
+            Args::try_parse_from(["arle", "--list-models"]).expect("list-models flag should parse");
         assert!(args.list_models);
     }
 
     #[test]
     fn rejects_doctor_and_list_models_together() {
-        let err = Args::try_parse_from(["agent-infer", "--doctor", "--list-models"])
+        let err = Args::try_parse_from(["arle", "--doctor", "--list-models"])
             .err()
             .expect("doctor and list-models should conflict");
         assert!(err.to_string().contains("--list-models"));
@@ -897,7 +896,7 @@ mod tests {
 
     #[test]
     fn accepts_doctor_json_flag() {
-        let args = Args::try_parse_from(["agent-infer", "--doctor", "--json"])
+        let args = Args::try_parse_from(["arle", "--doctor", "--json"])
             .expect("doctor json flag should parse");
         assert!(args.doctor);
         assert!(args.json);
@@ -905,7 +904,7 @@ mod tests {
 
     #[test]
     fn accepts_doctor_strict_flag() {
-        let args = Args::try_parse_from(["agent-infer", "--doctor", "--strict"])
+        let args = Args::try_parse_from(["arle", "--doctor", "--strict"])
             .expect("doctor strict flag should parse");
         assert!(args.doctor);
         assert!(args.strict);
@@ -913,7 +912,7 @@ mod tests {
 
     #[test]
     fn accepts_list_models_json_flag() {
-        let args = Args::try_parse_from(["agent-infer", "--list-models", "--json"])
+        let args = Args::try_parse_from(["arle", "--list-models", "--json"])
             .expect("list-models json flag should parse");
         assert!(args.list_models);
         assert!(args.json);
@@ -921,7 +920,7 @@ mod tests {
 
     #[test]
     fn rejects_json_without_inspection_mode() {
-        let err = Args::try_parse_from(["agent-infer", "--json"])
+        let err = Args::try_parse_from(["arle", "--json"])
             .err()
             .expect("--json without inspection mode should fail");
         assert!(err.to_string().contains("--doctor"));
@@ -929,7 +928,7 @@ mod tests {
 
     #[test]
     fn rejects_strict_without_doctor() {
-        let err = Args::try_parse_from(["agent-infer", "--strict"])
+        let err = Args::try_parse_from(["arle", "--strict"])
             .err()
             .expect("--strict without doctor should fail");
         assert!(err.to_string().contains("--doctor"));
@@ -937,7 +936,7 @@ mod tests {
 
     #[test]
     fn rejects_strict_with_list_models() {
-        let err = Args::try_parse_from(["agent-infer", "--list-models", "--strict"])
+        let err = Args::try_parse_from(["arle", "--list-models", "--strict"])
             .err()
             .expect("--strict with list-models should fail");
         let rendered = err.to_string();
@@ -953,7 +952,7 @@ mod tests {
     #[test]
     fn accepts_train_pretrain_core_args() {
         let args = Args::try_parse_from([
-            "agent-infer",
+            "arle",
             "train",
             "pretrain",
             "--corpus",
@@ -982,7 +981,7 @@ mod tests {
     #[test]
     fn accepts_train_multi_turn_extra_args() {
         let args = Args::try_parse_from([
-            "agent-infer",
+            "arle",
             "train",
             "multi-turn",
             "--iters",
@@ -1005,7 +1004,7 @@ mod tests {
     #[test]
     fn accepts_data_convert_typed_args() {
         let args = Args::try_parse_from([
-            "agent-infer",
+            "arle",
             "data",
             "convert",
             "--input",
@@ -1028,7 +1027,7 @@ mod tests {
     #[test]
     fn accepts_train_sft_model_family_override() {
         let args = Args::try_parse_from([
-            "agent-infer",
+            "arle",
             "train",
             "sft",
             "--model",
@@ -1051,7 +1050,7 @@ mod tests {
     #[test]
     fn rejects_train_pretrain_json_without_dry_run() {
         let err = Args::try_parse_from([
-            "agent-infer",
+            "arle",
             "train",
             "pretrain",
             "--corpus",

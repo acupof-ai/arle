@@ -699,7 +699,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         .to_string();
     fs::create_dir_all(root_dir)?;
 
-    let executable = agent_infer_executable()?;
+    let executable = arle_executable()?;
     let corpus = root_dir.join("corpus.txt");
     let tokenizer = root_dir.join("tokenizer.json");
     let raw = root_dir.join("raw_dolly.jsonl");
@@ -740,7 +740,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
     )?;
 
     let started = Instant::now();
-    run_agent_infer_step(
+    run_arle_step(
         &executable,
         "convert",
         &[
@@ -755,7 +755,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         ],
     )?;
 
-    run_agent_infer_step(
+    run_arle_step(
         &executable,
         "pretrain",
         &[
@@ -794,7 +794,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         ],
     )?;
 
-    run_agent_infer_step(
+    run_arle_step(
         &executable,
         "sft",
         &[
@@ -823,7 +823,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         ],
     )?;
 
-    let eval = run_agent_infer_step(
+    let eval = run_arle_step(
         &executable,
         "eval",
         &[
@@ -1302,14 +1302,14 @@ fn existing_display_path(path: PathBuf) -> Option<String> {
     path.is_file().then(|| path.display().to_string())
 }
 
-fn agent_infer_executable() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_agent-infer").map(PathBuf::from) {
+fn arle_executable() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_arle").map(PathBuf::from) {
         return Ok(path);
     }
     std::env::current_exe().context("resolve current ARLE executable")
 }
 
-fn run_agent_infer_step(
+fn run_arle_step(
     executable: &Path,
     step: &'static str,
     args: &[String],
