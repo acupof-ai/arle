@@ -19,6 +19,7 @@ pub mod logging;
 pub mod memory_planner;
 pub mod metrics;
 pub mod model_registry;
+pub mod model_source;
 pub mod prefix_cache;
 pub mod quant;
 pub mod request_handle;

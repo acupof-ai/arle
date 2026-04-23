@@ -6,6 +6,7 @@ use std::time::Instant;
 use super::config::{Config35, LayerType};
 use crate::model::common::{self, MLP};
 use crate::model::qwen35::prefill_buffers::PagedPrefillBuffers35;
+use crate::model_source::ResolvedModelSource;
 use crate::weight_loader::{
     load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, precompute_rope, resolve_rope_cache_len,
 };
@@ -89,8 +90,16 @@ impl Qwen35Model {
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU");
         let ctx = DeviceContext::new()?;
+        let source = ResolvedModelSource::resolve(model_path)?;
+        let resolved_path = source.resolved_path().to_str().unwrap_or(model_path);
 
-        let config = Config35::from_file(model_path)?;
+        let config = if let Some(config_dir) = source.config_dir() {
+            Config35::from_file(config_dir.to_str().unwrap_or(resolved_path))?
+        } else if let Some(gguf) = source.gguf() {
+            gguf.extract_qwen35_config()?
+        } else {
+            Config35::from_file(resolved_path)?
+        };
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}",
             config.hidden_size,
@@ -100,12 +109,12 @@ impl Qwen35Model {
         );
 
         // Try GGUF first
-        if let Some(gguf) = crate::gguf::try_open(model_path) {
+        if let Some(gguf) = source.gguf() {
             info!("Loading Qwen3.5 from GGUF: {} tensors", gguf.tensors.len());
-            return Self::from_gguf(&ctx, &config, &gguf, enable_cuda_graph);
+            return Self::from_gguf(&ctx, &config, gguf, enable_cuda_graph);
         }
 
-        let (mmaps, weight_map) = common::load_safetensors(model_path, true)?;
+        let (mmaps, weight_map) = common::load_safetensors(resolved_path, true)?;
         let shards = common::deserialize_shards(&mmaps)?;
 
         let t_gpu = Instant::now();

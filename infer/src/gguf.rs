@@ -25,8 +25,9 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use half::{bf16, f16};
+use qwen35_spec::{LayerType as Qwen35LayerType, Qwen35Config};
 
 // ── GGUF Constants ──
 
@@ -539,6 +540,71 @@ impl GgufFile {
         })
     }
 
+    pub fn extract_qwen35_config(&self) -> Result<Qwen35Config> {
+        let common = self.extract_model_config()?;
+        let full_attention_interval = self
+            .meta_u32("qwen35.full_attention_interval")
+            .unwrap_or(1)
+            .max(1) as usize;
+        let rotary_dim = self
+            .meta_u32("qwen35.rope.dimension_count")
+            .context("GGUF missing qwen35.rope.dimension_count")? as usize;
+        let linear_num_key_heads =
+            self.meta_u32("qwen35.ssm.group_count")
+                .context("GGUF missing qwen35.ssm.group_count")? as usize;
+        let linear_key_head_dim =
+            self.meta_u32("qwen35.ssm.state_size")
+                .context("GGUF missing qwen35.ssm.state_size")? as usize;
+        let linear_inner_size =
+            self.meta_u32("qwen35.ssm.inner_size")
+                .context("GGUF missing qwen35.ssm.inner_size")? as usize;
+        anyhow::ensure!(
+            linear_key_head_dim > 0 && linear_inner_size.is_multiple_of(linear_key_head_dim),
+            "invalid Qwen3.5 GGUF SSM metadata: inner_size={linear_inner_size}, state_size={linear_key_head_dim}"
+        );
+
+        let eos_token_id = self
+            .meta_u32("tokenizer.ggml.eos_token_id")
+            .unwrap_or(151_645);
+        let bos_token_id = self.meta_u32("tokenizer.ggml.bos_token_id");
+        let config = Qwen35Config {
+            hidden_size: common.hidden_size,
+            intermediate_size: common.intermediate_size,
+            num_hidden_layers: common.num_hidden_layers,
+            vocab_size: common.vocab_size,
+            rms_norm_eps: common.rms_norm_eps,
+            stop_token_ids: vec![eos_token_id],
+            bos_token_id,
+            eos_token_id,
+            tie_word_embeddings: true,
+            num_attention_heads: common.num_attention_heads,
+            num_key_value_heads: common.num_key_value_heads,
+            head_dim: common.head_dim,
+            linear_num_key_heads,
+            linear_key_head_dim,
+            linear_num_value_heads: linear_inner_size / linear_key_head_dim,
+            linear_value_head_dim: linear_key_head_dim,
+            linear_conv_kernel_dim: self.meta_u32("qwen35.ssm.conv_kernel").unwrap_or(4) as usize,
+            rope_theta: common.rope_theta,
+            partial_rotary_factor: rotary_dim as f32 / common.head_dim as f32,
+            rotary_dim,
+            rope_cache_len_hint: Some(common.context_length),
+            layer_types: qwen35_layer_types_from_interval(
+                common.num_hidden_layers,
+                full_attention_interval,
+            ),
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+        };
+        config.validate().map_err(anyhow::Error::from)?;
+        Ok(config)
+    }
+
     /// Check if this GGUF embeds a HuggingFace tokenizer JSON blob.
     pub fn has_embedded_tokenizer(&self) -> bool {
         self.metadata.contains_key("tokenizer.huggingface.json")
@@ -731,6 +797,21 @@ pub struct GgufModelConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub context_length: usize,
+}
+
+fn qwen35_layer_types_from_interval(
+    num_hidden_layers: usize,
+    full_attention_interval: usize,
+) -> Vec<Qwen35LayerType> {
+    (0..num_hidden_layers)
+        .map(|idx| {
+            if (idx + 1).is_multiple_of(full_attention_interval.max(1)) {
+                Qwen35LayerType::FullAttention
+            } else {
+                Qwen35LayerType::LinearAttention
+            }
+        })
+        .collect()
 }
 
 // ── Dequantization ──
