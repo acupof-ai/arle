@@ -5,7 +5,7 @@
 #   ./scripts/start_metal_serve.sh [model-path-or-hf-id] [port] [-- extra metal_serve args]
 #
 # Defaults:
-#   model: ${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}
+#   model: ${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}}
 #   port:  8000
 #   bind:  127.0.0.1
 #
@@ -23,7 +23,7 @@ Usage:
   ./scripts/start_metal_serve.sh [model-path-or-hf-id] [port] [-- extra metal_serve args]
 
 Defaults:
-  model: ${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}
+  model: ${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}}
   port:  8000
   bind:  127.0.0.1
 
@@ -56,7 +56,7 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-MODEL_PATH="${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}"
+MODEL_PATH="${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}}"
 PORT="8000"
 
 if [[ $# -gt 0 && "${1}" != --* ]]; then
@@ -75,7 +75,7 @@ fi
 
 cd "${REPO_ROOT}"
 
-echo "=== agent-infer Metal bring-up ==="
+echo "=== ARLE Metal bring-up ==="
 echo "  Model: ${MODEL_PATH}"
 echo "  Port:  ${PORT}"
 echo "  Bind:  127.0.0.1"

@@ -18,7 +18,7 @@ import time
 import os
 
 MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else None
-BINARY = "./target/release/agent-infer"
+BINARY = "./target/release/arle"
 
 
 # ============================================================================

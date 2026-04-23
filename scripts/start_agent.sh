@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the local agent-infer REPL against a model.
+# Start the local ARLE REPL against a model.
 #
 # Usage:
 #   ./scripts/start_agent.sh [model-path-or-hf-id] [extra-agent-args...]
@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BIN="${AGENT_INFER_BIN:-${REPO_ROOT}/target/release/agent-infer}"
+BIN="${ARLE_BIN:-${AGENT_INFER_BIN:-${REPO_ROOT}/target/release/arle}}"
 
 MODEL_ARGS=()
 if [[ $# -gt 0 && "${1}" != --* ]]; then
@@ -21,14 +21,14 @@ if [[ $# -gt 0 && "${1}" != --* ]]; then
 fi
 
 if [[ ! -x "${BIN}" ]]; then
-    echo "agent-infer binary not found at ${BIN}" >&2
+    echo "ARLE binary not found at ${BIN}" >&2
     echo "Build one of these first:" >&2
-    echo "  cargo build --release --features cli -p agent-infer" >&2
-    echo "  cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer" >&2
+    echo "  cargo build --release --features cli -p agent-infer --bin arle" >&2
+    echo "  cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle" >&2
     exit 1
 fi
 
-echo "=== agent-infer REPL ==="
+echo "=== ARLE REPL ==="
 echo "  Binary: ${BIN}"
 if [[ ${#MODEL_ARGS[@]} -gt 0 ]]; then
     echo "  Model:  ${MODEL_ARGS[1]}"

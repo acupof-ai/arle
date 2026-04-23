@@ -6,9 +6,9 @@
 #
 # Env:
 #   CUDA_HOME            default: /usr/local/cuda
-#   CARGO_TARGET_DIR     default: /tmp/agent-infer-target-cuda
+#   CARGO_TARGET_DIR     default: /tmp/arle-target-cuda
 #   INFER_TEST_MODEL_ID  default: Qwen/Qwen3-0.6B
-#   INFER_TEST_MODEL_PATH default: /tmp/agent-infer-models/Qwen3-0.6B
+#   INFER_TEST_MODEL_PATH default: /tmp/arle-models/Qwen3-0.6B
 #   CUDA_MIN_FREE_MIB    default: 4096
 
 set -euo pipefail
@@ -18,9 +18,9 @@ cd "$REPO_ROOT"
 
 OUT_DIR="${1:-/tmp/train_cuda_e2e_$$}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/agent-infer-target-cuda}"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/arle-target-cuda}"
 MODEL_ID="${INFER_TEST_MODEL_ID:-Qwen/Qwen3-0.6B}"
-MODEL_PATH="${INFER_TEST_MODEL_PATH:-/tmp/agent-infer-models/Qwen3-0.6B}"
+MODEL_PATH="${INFER_TEST_MODEL_PATH:-/tmp/arle-models/Qwen3-0.6B}"
 CUDA_MIN_FREE_MIB="${CUDA_MIN_FREE_MIB:-4096}"
 TRAIN_OUT="${OUT_DIR}/train"
 SFT_DATA="${OUT_DIR}/tiny_sft.jsonl"
@@ -30,7 +30,7 @@ AGENT_OUT="${OUT_DIR}/agent.out"
 BIN_DIR="${CARGO_TARGET_DIR}/release"
 TRAIN_BIN="${BIN_DIR}/train_sft"
 EVAL_BIN="${BIN_DIR}/eval_lm"
-AGENT_BIN="${BIN_DIR}/agent-infer"
+AGENT_BIN="${BIN_DIR}/arle"
 
 info() { echo "[train_cuda_e2e] $*"; }
 die() { echo "[train_cuda_e2e] error: $*" >&2; exit 1; }
@@ -114,7 +114,7 @@ info "building train/eval/infer release binaries"
 CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo build --release --features cuda -p train --bin train_sft --bin eval_lm
 CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
-  cargo build --release -p agent-infer --features cli
+  cargo build --release -p agent-infer --features cli --bin arle
 
 require_file "$TRAIN_BIN"
 require_file "$EVAL_BIN"
@@ -157,10 +157,10 @@ printf 'hi\n/quit\n' | \
   --model-path "$LATEST" \
   --max-tokens 8 \
   --non-interactive > "$AGENT_OUT" 2>&1
-grep -q "=== agent-infer REPL ===" "$AGENT_OUT" || die "agent-infer banner missing"
-grep -q "Model:" "$AGENT_OUT" || die "agent-infer model line missing"
+grep -q "=== ARLE REPL ===" "$AGENT_OUT" || die "ARLE banner missing"
+grep -q "Model:" "$AGENT_OUT" || die "ARLE model line missing"
 if grep -q "panicked at" "$AGENT_OUT"; then
-  die "agent-infer panicked while loading checkpoint"
+  die "ARLE panicked while loading checkpoint"
 fi
 
 info "running CUDA resume smoke"
@@ -183,4 +183,4 @@ CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
 require_file "${LATEST}/trainer_state.json"
 require_file "${LATEST}/optimizer.safetensors"
 
-info "OK train_sft -> eval_lm -> agent-infer -> resume"
+info "OK train_sft -> eval_lm -> arle -> resume"

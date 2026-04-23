@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/train_and_chat.sh — 2-step SFT smoke test that exercises the full
 # train → save → load → generate loop on Metal. If this ever fails, the
-# trainer-to-inference contract is broken regardless of unit tests.
+# trainer-to-ARLE runtime contract is broken regardless of unit tests.
 #
 # DX-1 (docs/plans/train-eval-infer-dx-v1.md) note: we address the checkpoint
 # via `$OUT_DIR/latest` — a symlink the trainer refreshes on every save.
@@ -64,8 +64,8 @@ if [[ ! -f "$CHECKPOINT/model.safetensors" ]]; then
 fi
 
 echo "[train_and_chat] === generate 8 tokens from $(readlink "$CHECKPOINT") ==="
-echo "hi" | cargo run --release --no-default-features --features metal,no-cuda \
-  -p agent-infer -- \
+echo "hi" | cargo run --release --no-default-features --features metal,no-cuda,cli \
+  -p agent-infer --bin arle -- \
   --model-path "$CHECKPOINT" \
   --max-tokens 8 --non-interactive
 
