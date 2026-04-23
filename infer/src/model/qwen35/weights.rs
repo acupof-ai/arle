@@ -447,22 +447,13 @@ impl Qwen35Model {
         gguf: &crate::gguf::GgufFile,
         enable_cuda_graph: bool,
     ) -> Result<Self> {
-        use crate::gguf::{
-            load_qwen35_a_log_f32_host, load_qwen35_conv1d_bf16_host,
-            load_qwen35_qkv_matrix_bf16_host, load_vector_f32_host,
-        };
+        use crate::qwen35_gguf_host::{Qwen35LinearGgufLayout, load_qwen35_linear_attention_host};
         use crate::weight_loader::{
-            load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_v_reorder, load_tensor_2d_gguf,
-            load_tensor_2d_gguf_bf16, load_tensor_2d_gguf_v_reorder_cols,
-            load_tensor_2d_gguf_v_reorder_rows, precompute_rope,
+            load_tensor_1d_gguf_offset_norm, load_tensor_2d_gguf, load_tensor_2d_gguf_bf16,
+            precompute_rope,
         };
 
-        // SSM V-head reorder config (from llama.cpp _reorder_v_heads)
-        let num_k = config.linear_num_key_heads;
-        let num_v = config.linear_num_value_heads;
-        let vpk = num_v / num_k; // num_v_per_k
-        let hd_k = config.linear_key_head_dim;
-        let hd_v = config.linear_value_head_dim;
+        let linear_layout = Qwen35LinearGgufLayout::from_config(config)?;
         // GGUF stores norm weights with +1 offset baked in (e.g., w_gguf = 1 + w_hf).
         // Use load_tensor_1d_gguf_offset_norm for all RMSNorm/QK-norm weights.
         let load_norm =
@@ -506,90 +497,43 @@ impl Qwen35Model {
                 }
                 LayerType::LinearAttention => {
                     let ap = format!("{p}.linear_attn");
+                    let host = load_qwen35_linear_attention_host(gguf, &ap, linear_layout)?;
                     LayerKind::LinearAttention(LinearAttentionLayer {
                         in_proj_qkv: {
-                            let tensor = load_qwen35_qkv_matrix_bf16_host(
-                                gguf,
-                                &format!("{ap}.in_proj_qkv.weight"),
-                                num_k,
-                                vpk,
-                                hd_k,
-                                hd_v,
-                            )?;
                             DeviceMatrix::from_host(
                                 ctx,
-                                &tensor.data,
-                                tensor.shape[0],
-                                tensor.shape[1],
+                                &host.in_proj_qkv.data,
+                                host.in_proj_qkv.shape[0],
+                                host.in_proj_qkv.shape[1],
                             )?
                         },
-                        // in_proj_z: V-reorder rows (head_dim = hd_v)
-                        in_proj_z: load_tensor_2d_gguf_v_reorder_rows(
+                        in_proj_z: DeviceMatrix::from_host(
                             ctx,
-                            gguf,
-                            &format!("{ap}.in_proj_z.weight"),
-                            num_k,
-                            vpk,
-                            hd_v,
+                            &host.in_proj_z.data,
+                            host.in_proj_z.shape[0],
+                            host.in_proj_z.shape[1],
                         )?,
-                        // in_proj_a/b: V-reorder rows (head_dim = 1)
-                        in_proj_b: load_tensor_2d_gguf_v_reorder_rows(
+                        in_proj_b: DeviceMatrix::from_host(
                             ctx,
-                            gguf,
-                            &format!("{ap}.in_proj_b.weight"),
-                            num_k,
-                            vpk,
-                            1,
+                            &host.in_proj_b.data,
+                            host.in_proj_b.shape[0],
+                            host.in_proj_b.shape[1],
                         )?,
-                        in_proj_a: load_tensor_2d_gguf_v_reorder_rows(
+                        in_proj_a: DeviceMatrix::from_host(
                             ctx,
-                            gguf,
-                            &format!("{ap}.in_proj_a.weight"),
-                            num_k,
-                            vpk,
-                            1,
+                            &host.in_proj_a.data,
+                            host.in_proj_a.shape[0],
+                            host.in_proj_a.shape[1],
                         )?,
-                        conv1d_weight: {
-                            let tensor = load_qwen35_conv1d_bf16_host(
-                                gguf,
-                                &format!("{ap}.conv1d.weight"),
-                                num_k,
-                                hd_k,
-                                num_v,
-                                hd_v,
-                                config.linear_conv_kernel_dim,
-                            )?;
-                            DeviceVec::from_host(ctx, &tensor.data)?
-                        },
-                        // dt_bias: 1D V-reorder (head_dim = 1)
-                        dt_bias: load_tensor_1d_gguf_v_reorder(
+                        conv1d_weight: { DeviceVec::from_host(ctx, &host.conv1d_weight.data)? },
+                        dt_bias: DeviceVec::from_host(ctx, &host.dt_bias.data)?,
+                        a_log: ctx.stream.clone_htod(&host.a_log.data)?,
+                        norm_weight: ctx.stream.clone_htod(&host.norm_weight.data)?,
+                        out_proj: DeviceMatrix::from_host(
                             ctx,
-                            gguf,
-                            &format!("{ap}.dt_bias"),
-                            num_k,
-                            vpk,
-                        )?,
-                        a_log: {
-                            let tensor = load_qwen35_a_log_f32_host(
-                                gguf,
-                                &format!("{ap}.a_log"),
-                                num_k,
-                                vpk,
-                            )?;
-                            ctx.stream.clone_htod(&tensor.data)?
-                        },
-                        norm_weight: {
-                            let tensor = load_vector_f32_host(gguf, &format!("{ap}.norm.weight"))?;
-                            ctx.stream.clone_htod(&tensor.data)?
-                        },
-                        // out_proj: V-reorder columns (input dim = num_v × hd_v)
-                        out_proj: load_tensor_2d_gguf_v_reorder_cols(
-                            ctx,
-                            gguf,
-                            &format!("{ap}.out_proj.weight"),
-                            num_k,
-                            vpk,
-                            hd_v,
+                            &host.out_proj.data,
+                            host.out_proj.shape[0],
+                            host.out_proj.shape[1],
                         )?,
                     })
                 }

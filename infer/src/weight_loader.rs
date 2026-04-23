@@ -15,9 +15,7 @@ use std::fs;
 use std::time::Instant;
 
 use crate::gguf::{
-    self, GgufFile, find_tensor_name, load_matrix_v_reorder_cols_bf16_host,
-    load_matrix_v_reorder_rows_bf16_host, load_vector_bf16_host, load_vector_offset_norm_bf16_host,
-    load_vector_v_reorder_bf16_host,
+    self, GgufFile, find_tensor_name, load_vector_bf16_host, load_vector_offset_norm_bf16_host,
 };
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
@@ -584,135 +582,6 @@ pub(crate) fn load_tensor_1d_gguf_offset_norm(
 ) -> Result<DeviceVec> {
     let tensor = load_vector_offset_norm_bf16_host(gguf, hf_name)?;
     DeviceVec::from_host(ctx, &tensor.data)
-}
-
-/// Load 1D GGUF tensor with V-head reorder reversal (a_log, dt_bias).
-pub(crate) fn load_tensor_1d_gguf_v_reorder(
-    ctx: &DeviceContext,
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-) -> Result<DeviceVec> {
-    let tensor = load_vector_v_reorder_bf16_host(gguf, hf_name, num_k_heads, num_v_per_k, 1)?;
-    DeviceVec::from_host(ctx, &tensor.data)
-}
-
-/// Load 2D GGUF tensor with V-head row reorder reversal (in_proj_z, in_proj_a/b).
-///
-/// For Q4_K_M / Q4_K_S, the permutation happens on packed superblock bytes at
-/// row granularity — each row's `(cols/256) * 144` bytes move as one unit,
-/// preserving superblock integrity. No BF16 intermediate is materialised.
-pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
-    ctx: &DeviceContext,
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) -> Result<DeviceMatrix> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    let (rows, cols) = if info.shape.len() == 2 {
-        (info.shape[1] as usize, info.shape[0] as usize)
-    } else {
-        (1, info.shape[0] as usize)
-    };
-
-    // Q4_K packed: byte-level row permutation.
-    if info.dtype == gguf::GgmlType::Q4_K && info.shape.len() == 2 && cols % 256 == 0 {
-        let src = gguf.read_tensor_q4k_packed(&gguf_name)?;
-        let row_bytes = cols * 9 / 16; // (cols/256) * 144
-        assert_eq!(src.len(), rows * row_bytes);
-        if num_v_per_k <= 1 {
-            return DeviceMatrix::from_quantized_q4k(ctx, &src, rows, cols);
-        }
-        let mut dst = vec![0u8; src.len()];
-        for k in 0..num_k_heads {
-            for v in 0..num_v_per_k {
-                let gguf_head = v * num_k_heads + k;
-                let hf_head = k * num_v_per_k + v;
-                let src_start = gguf_head * head_dim * row_bytes;
-                let dst_start = hf_head * head_dim * row_bytes;
-                let size = head_dim * row_bytes;
-                dst[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
-            }
-        }
-        drop(src);
-        return DeviceMatrix::from_quantized_q4k(ctx, &dst, rows, cols);
-    }
-
-    // Q3_K packed: same byte-level row permutation at 110-byte stride.
-    if info.dtype == gguf::GgmlType::Q3_K && info.shape.len() == 2 && cols % 256 == 0 {
-        let src = gguf.read_tensor_q3k_packed(&gguf_name)?;
-        let row_bytes = cols * 55 / 128; // (cols/256) * 110
-        assert_eq!(src.len(), rows * row_bytes);
-        if num_v_per_k <= 1 {
-            return DeviceMatrix::from_quantized_q3k(ctx, &src, rows, cols);
-        }
-        let mut dst = vec![0u8; src.len()];
-        for k in 0..num_k_heads {
-            for v in 0..num_v_per_k {
-                let gguf_head = v * num_k_heads + k;
-                let hf_head = k * num_v_per_k + v;
-                let src_start = gguf_head * head_dim * row_bytes;
-                let dst_start = hf_head * head_dim * row_bytes;
-                let size = head_dim * row_bytes;
-                dst[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
-            }
-        }
-        drop(src);
-        return DeviceMatrix::from_quantized_q3k(ctx, &dst, rows, cols);
-    }
-
-    // Q6_K packed: same byte-level row permutation at 210-byte stride.
-    if info.dtype == gguf::GgmlType::Q6_K && info.shape.len() == 2 && cols % 256 == 0 {
-        let src = gguf.read_tensor_q6k_packed(&gguf_name)?;
-        let row_bytes = cols * 210 / 256;
-        assert_eq!(src.len(), rows * row_bytes);
-        if num_v_per_k <= 1 {
-            return DeviceMatrix::from_quantized_q6k(ctx, &src, rows, cols);
-        }
-        let mut dst = vec![0u8; src.len()];
-        for k in 0..num_k_heads {
-            for v in 0..num_v_per_k {
-                let gguf_head = v * num_k_heads + k;
-                let hf_head = k * num_v_per_k + v;
-                let src_start = gguf_head * head_dim * row_bytes;
-                let dst_start = hf_head * head_dim * row_bytes;
-                let size = head_dim * row_bytes;
-                dst[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
-            }
-        }
-        drop(src);
-        return DeviceMatrix::from_quantized_q6k(ctx, &dst, rows, cols);
-    }
-
-    // BF16 fallback (existing path).
-    let tensor =
-        load_matrix_v_reorder_rows_bf16_host(gguf, hf_name, num_k_heads, num_v_per_k, head_dim)?;
-    DeviceMatrix::from_host(ctx, &tensor.data, rows, cols)
-}
-
-/// Load 2D GGUF tensor with V-head column reorder reversal (out_proj).
-pub(crate) fn load_tensor_2d_gguf_v_reorder_cols(
-    ctx: &DeviceContext,
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) -> Result<DeviceMatrix> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    let (rows, cols) = if info.shape.len() == 2 {
-        (info.shape[1] as usize, info.shape[0] as usize)
-    } else {
-        (1, info.shape[0] as usize)
-    };
-    let tensor =
-        load_matrix_v_reorder_cols_bf16_host(gguf, hf_name, num_k_heads, num_v_per_k, head_dim)?;
-    DeviceMatrix::from_host(ctx, &tensor.data, rows, cols)
 }
 
 /// Load a 2D tensor (e.g., linear weight) from a GGUF file.
