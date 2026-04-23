@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ARLE(1) — agent reinforcement learning engine</title>
-<meta name="description" content="ARLE is the pure-Rust agent reinforcement learning engine. Start here for install, docs, releases, and contributor workflow.">
+<title>ARLE(1) — runtime-first Rust workspace</title>
+<meta name="description" content="ARLE is the runtime-first Rust workspace for serving, local agents, training, evaluation, and dataset tooling.">
 <meta name="color-scheme" content="light">
-<meta property="og:title" content="ARLE — agent reinforcement learning engine">
-<meta property="og:description" content="Pure-Rust serving, agent runtime, train/eval workflows, and project docs in one workspace.">
+<meta property="og:title" content="ARLE — runtime-first Rust workspace">
+<meta property="og:description" content="One Rust workspace for infer serving, the arle front door, train/eval flows, dataset tooling, and public docs.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://cklxx.github.io/arle/">
 <link rel="canonical" href="https://cklxx.github.io/arle/">
@@ -26,20 +26,23 @@
 </header>
 
 <section class="hero" aria-label="banner">
-<h1 class="sr-only">ARLE(1) — agent reinforcement learning engine</h1>
+<h1 class="sr-only">ARLE(1) — runtime-first Rust workspace</h1>
 <pre class="ascii" aria-hidden="true">
-<span class="ascii-art"> ██████  ██████  ██      ███████
-██    ██ ██   ██ ██      ██
-████████ ██████  ██      █████
-██    ██ ██   ██ ██      ██
-██    ██ ██   ██ ███████ ███████</span>
+<span class="ascii-art"> █████╗ ██████╗ ██╗     ███████╗
+██╔══██╗██╔══██╗██║     ██╔════╝
+███████║██████╔╝██║     █████╗
+██╔══██║██╔══██╗██║     ██╔══╝
+██║  ██║██║  ██║███████╗███████╗
+╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝</span>
 </pre>
 <p class="tagline">
-  Rust-native <span class="hl">inference runtime</span> with integrated local
-  agent, train, eval, and docs surfaces.
+  One runtime authority. <span class="hl">infer</span> serves OpenAI-compatible
+  traffic; <span class="hl">arle</span> fronts local agent, train, eval, and
+  data workflows.
 </p>
 <nav class="jumps" aria-label="sections">
   <a href="#synopsis">[synopsis]</a>
+  <a href="#surfaces">[surfaces]</a>
   <a href="#status">[status]</a>
   <a href="#quickstart">[quickstart]</a>
   <a href="#docs">[docs]</a>
@@ -52,34 +55,48 @@
 <section id="name">
 <h2>NAME</h2>
 <p class="block">
-  <b>ARLE</b> — a Rust-native inference runtime with integrated local agent,
-  train, and eval workflows. CUDA is the primary serving path; Metal and CPU
-  smoke paths share the same workspace, model code, and tooling surface.
+  <b>ARLE</b> — a runtime-first Rust workspace. <code>infer</code> is the
+  dedicated serving binary; <code>arle</code> is the front door for local
+  agent execution, training, evaluation, and dataset work.
 </p>
 <p class="note">
-  This site is intentionally a stable landing page. Detailed product facts live
-  in the repo docs linked below.
+  This page stays deliberately stable. Detailed product truth lives in the
+  repo docs linked below.
 </p>
 </section>
 
 <section id="synopsis">
 <h2>SYNOPSIS</h2>
-<pre class="cmd"><span class="p">$</span> docker run --gpus all -v /path/to/Qwen3-4B:/model \
-    ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
-<span class="p">$</span> cargo build -p infer --release
+<pre class="cmd"><span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
-<span class="p">$</span> cargo build -p agent-infer --release --features cli --bin arle
-<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B --max-turns 10<span class="caret"></span></pre>
+<span class="p">$</span> cargo build --release --features cli --bin arle
+<span class="p">$</span> ./target/release/arle --doctor
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B run --prompt <i>"Summarize this repo"</i>
+<span class="p">$</span> ./target/release/arle train env
+<span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span></pre>
+</section>
+
+<section id="surfaces">
+<h2>SURFACES</h2>
+<table class="why">
+  <tbody>
+    <tr><td class="cap"><code>infer</code></td><td>OpenAI-compatible HTTP serving, metrics, stats, and session endpoints on the runtime's canonical server surface.</td></tr>
+    <tr><td class="cap"><code>arle run</code></td><td>Interactive REPL and one-shot prompt execution with the same Rust runtime authority behind the local agent loop.</td></tr>
+    <tr><td class="cap"><code>arle train</code></td><td>Pretrain, SFT, GRPO, multi-turn RL, and eval workflows through one front door instead of scattered train binaries.</td></tr>
+    <tr><td class="cap"><code>arle data</code></td><td>Dataset download and schema conversion utilities that stay versioned with the same workspace and docs.</td></tr>
+  </tbody>
+</table>
 </section>
 
 <section id="status">
 <h2>STATUS</h2>
 <table class="why">
   <tbody>
-    <tr><td class="cap">CUDA</td><td>Stable primary serving path on Linux + NVIDIA.</td></tr>
-    <tr><td class="cap">Metal</td><td>Beta Apple Silicon path with live runtime, DFlash, and the MLX bridge.</td></tr>
-    <tr><td class="cap">CPU</td><td>Development-only smoke path for request-surface validation.</td></tr>
-    <tr><td class="cap">Bench claims</td><td>Dated snapshots live under <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">the current decode-alignment plan</a>.</td></tr>
+    <tr><td class="cap">Project posture</td><td>Runtime-first. <code>infer</code> remains the primary serving surface; <code>arle</code> extends that same runtime into agent, train, eval, and data workflows.</td></tr>
+    <tr><td class="cap">Backends</td><td>CUDA is the stable primary serving path on Linux + NVIDIA. Metal is beta on Apple Silicon. CPU is development-only for smoke coverage.</td></tr>
+    <tr><td class="cap">Models</td><td>Qwen3 and Qwen3.5-4B ship today. Llama 3 / 4 and DeepSeek V3 / R1 remain planned, not implied.</td></tr>
+    <tr><td class="cap">HTTP</td><td><code>/v1/completions</code>, <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/metrics</code>, and <code>/v1/stats</code> are the stable public serving surface.</td></tr>
+    <tr><td class="cap">Bench program</td><td>Dated snapshots live under <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">the current decode-alignment plan</a>.</td></tr>
   </tbody>
 </table>
 </section>
@@ -87,21 +104,24 @@
 <section id="quickstart">
 <h2>QUICKSTART</h2>
 
-<h3>&mdash; Source build</h3>
+<h3>&mdash; Local CLI smoke</h3>
 <pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/arle
 <span class="p">$</span> cd arle
 <span class="p">$</span> ./setup.sh
-<span class="p">$</span> cargo build -p infer --release
-<span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000</pre>
+<span class="p">$</span> cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
+<span class="p">$</span> ./target/release/arle --doctor
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B run --prompt <i>"Say hello in one sentence"</i>
+<span class="p">$</span> ./target/release/arle train env</pre>
 
-<h3>&mdash; API smoke</h3>
-<pre class="cmd"><span class="p">$</span> curl http://localhost:8000/v1/chat/completions \
+<h3>&mdash; Serving smoke</h3>
+<pre class="cmd"><span class="p">$</span> cargo build -p infer --release
+<span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
+<span class="p">$</span> curl http://127.0.0.1:8000/v1/chat/completions \
     -H <i>'Content-Type: application/json'</i> \
     -d <i>'{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'</i></pre>
 
 <p class="note">
-  Use the repo-pinned Rust toolchain from <code>rust-toolchain.toml</code>.
-  <code>./setup.sh</code> bootstraps Rust, Python, Zig, and local checks.
+  Use <code>--features cli</code> for the default CUDA build, <code>metal,no-cuda,cli</code> on Apple Silicon, and <code>cpu,no-cuda,cli</code> for portable smoke paths. <code>./setup.sh</code> bootstraps Rust, Python, Zig, and local checks.
 </p>
 </section>
 
@@ -109,10 +129,12 @@
 <h2>FILES</h2>
 <pre class="files">
 <a href="https://github.com/cklxx/arle/blob/main/README.md">/README.md</a>                         public overview · install · CLI · architecture
+<a href="https://github.com/cklxx/arle/blob/main/README.zh-CN.md">/README.zh-CN.md</a>                 simplified Chinese public entry
 <a href="https://github.com/cklxx/arle/blob/main/docs/http-api.md">/docs/http-api.md</a>                HTTP contract · streaming behavior
 <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>          backend / model / quant support
 <a href="https://github.com/cklxx/arle/blob/main/docs/stability-policy.md">/docs/stability-policy.md</a>        stability levels · compatibility posture
-<a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>                 contributor setup · validation · release expectations
+<a href="https://github.com/cklxx/arle/blob/main/docs/compatibility.md">/docs/compatibility.md</a>           compatibility and deprecation policy
+<a href="https://github.com/cklxx/arle/blob/main/docs/environment.md">/docs/environment.md</a>             environment variables · operator defaults
 <a href="https://github.com/cklxx/arle/blob/main/docs/index.md">/docs/index.md</a>                   maintainer-facing PARA index
 <a href="https://github.com/cklxx/arle/releases">/releases</a>                        tagged binaries · checksums
 </pre>
@@ -121,9 +143,9 @@
 <section id="see-also">
 <h2>SEE ALSO</h2>
 <ul class="seealso">
-  <li><code>ghcr.io/cklxx/agent-infer:latest</code> &mdash; current published container image path</li>
   <li><a href="https://github.com/cklxx/arle/blob/main/CHANGELOG.md">CHANGELOG.md</a> &mdash; dated project history</li>
   <li><a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; next milestones</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> &mdash; contributor setup and verification gates</li>
   <li><a href="https://github.com/cklxx/arle/blob/main/SECURITY.md">SECURITY.md</a> &mdash; private vulnerability reporting policy</li>
 </ul>
 <p class="note">
@@ -143,8 +165,8 @@
 
 <nav class="statusline" aria-label="Quick links">
   <a class="sl-seg sl-mode" href="#">NOR</a>
-  <a class="sl-seg sl-accent" href="#name">arle/site</a>
-  <a class="sl-seg sl-ok" href="#docs"><span class="dot"></span> public docs</a>
+  <a class="sl-seg sl-accent" href="#name">arle/frontdoor</a>
+  <a class="sl-seg sl-ok" href="#status"><span class="dot"></span> runtime-first</a>
   <a class="sl-seg" href="./zh-CN.html" hreflang="zh-Hans">zh</a>
   <a class="sl-seg" href="https://github.com/cklxx/arle">gh:cklxx/arle</a>
   <span class="sl-seg sl-spacer" aria-hidden="true"></span>
