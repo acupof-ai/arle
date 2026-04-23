@@ -7,10 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn live_model_available() -> bool {
-    std::env::var("AGENT_INFER_MODEL")
+    std::env::var("ARLE_MODEL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .is_some()
+        || std::env::var("AGENT_INFER_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
         || infer::hf_hub::discover_local_model().is_some()
 }
 
@@ -22,7 +26,7 @@ fn live_test_guard() -> MutexGuard<'static, ()> {
 }
 
 fn run_cli_session(lines: &[&str], timeout: Duration) -> Output {
-    let exe = env!("CARGO_BIN_EXE_agent-infer");
+    let exe = env!("CARGO_BIN_EXE_arle");
     let mut child = Command::new(exe)
         .arg("--max-turns")
         .arg("4")
@@ -32,7 +36,7 @@ fn run_cli_session(lines: &[&str], timeout: Duration) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn agent-infer");
+        .expect("spawn arle");
 
     {
         let mut stdin = child.stdin.take().expect("stdin");
@@ -49,7 +53,7 @@ fn run_cli_session(lines: &[&str], timeout: Duration) -> Output {
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
-            panic!("agent-infer CLI timed out after {:?}", timeout);
+            panic!("ARLE CLI timed out after {:?}", timeout);
         }
         thread::sleep(Duration::from_millis(50));
     }
