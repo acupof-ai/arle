@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security report
-    url: https://github.com/cklxx/agent-infer/security/advisories/new
+    url: https://github.com/cklxx/arle/security/advisories/new
     about: Report security issues privately instead of opening a public issue.
   - name: Contributing guide
-    url: https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md
+    url: https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md
     about: Read the contribution workflow, validation gates, and support policy first.

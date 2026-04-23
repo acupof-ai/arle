@@ -9,10 +9,10 @@
 <meta property="og:title" content="ARLE — agent reinforcement learning engine">
 <meta property="og:description" content="同一套 workspace 里收口 serving、agent runtime、训练 / 评测与公共文档。">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://cklxx.github.io/agent-infer/zh-CN.html">
-<link rel="canonical" href="https://cklxx.github.io/agent-infer/zh-CN.html">
-<link rel="alternate" hreflang="en" href="https://cklxx.github.io/agent-infer/">
-<link rel="alternate" hreflang="zh-Hans" href="https://cklxx.github.io/agent-infer/zh-CN.html">
+<meta property="og:url" content="https://cklxx.github.io/arle/zh-CN.html">
+<link rel="canonical" href="https://cklxx.github.io/arle/zh-CN.html">
+<link rel="alternate" hreflang="en" href="https://cklxx.github.io/arle/">
+<link rel="alternate" hreflang="zh-Hans" href="https://cklxx.github.io/arle/zh-CN.html">
 <link rel="stylesheet" href="./style.css">
 <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23F4EDE0'/><text x='16' y='22' font-family='monospace' font-size='22' text-anchor='middle' fill='%23D97757'>$</text></svg>">
 </head>
@@ -44,8 +44,8 @@
   <a href="#status">[状态]</a>
   <a href="#quickstart">[快速开始]</a>
   <a href="#docs">[文档]</a>
-  <a href="https://github.com/cklxx/agent-infer">[github]</a>
-  <a href="https://github.com/cklxx/agent-infer/releases">[发版]</a>
+  <a href="https://github.com/cklxx/arle">[github]</a>
+  <a href="https://github.com/cklxx/arle/releases">[发版]</a>
   <span class="lang" aria-label="language"><a href="./" hreflang="en">en</a> · <b>zh</b></span>
 </nav>
 </section>
@@ -79,7 +79,7 @@
     <tr><td class="cap">CUDA</td><td>Linux + NVIDIA 上的稳定主 serving 路径。</td></tr>
     <tr><td class="cap">Metal</td><td>Apple Silicon 上的 Beta 路径，带 live runtime、DFlash 与 MLX 桥接。</td></tr>
     <tr><td class="cap">CPU</td><td>仅开发态冒烟路径，用于请求面验证，不是部署目标。</td></tr>
-    <tr><td class="cap">Benchmark</td><td>带日期的快照集中放在 <a href="https://github.com/cklxx/agent-infer/tree/main/docs/experience/wins">docs/experience/wins/</a>；当前 CUDA 收口工作见 <a href="https://github.com/cklxx/agent-infer/blob/main/docs/plans/2026-04-22-sglang-gap-closure-execution.md">执行计划</a>。</td></tr>
+    <tr><td class="cap">Benchmark</td><td>带日期的快照集中放在 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>；当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-22-sglang-gap-closure-execution.md">执行计划</a>。</td></tr>
   </tbody>
 </table>
 </section>
@@ -88,8 +88,8 @@
 <h2>快速开始</h2>
 
 <h3>&mdash; 源码构建</h3>
-<pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/agent-infer
-<span class="p">$</span> cd agent-infer
+<pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/arle
+<span class="p">$</span> cd arle
 <span class="p">$</span> ./setup.sh
 <span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000</pre>
@@ -108,27 +108,27 @@
 <section id="docs">
 <h2>文件</h2>
 <pre class="files">
-<a href="https://github.com/cklxx/agent-infer/blob/main/README.zh-CN.md">/README.zh-CN.md</a>                中文公共入口：安装 · CLI · 架构
-<a href="https://github.com/cklxx/agent-infer/blob/main/README.md">/README.md</a>                      英文公共入口
-<a href="https://github.com/cklxx/agent-infer/blob/main/docs/http-api.md">/docs/http-api.md</a>              HTTP 契约 · 流式行为
-<a href="https://github.com/cklxx/agent-infer/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>        后端 / 模型 / 量化支持矩阵
-<a href="https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>               贡献者初始化 · 验证 · 发版要求
-<a href="https://github.com/cklxx/agent-infer/blob/main/docs/index.md">/docs/index.md</a>                 维护者 PARA 索引
-<a href="https://github.com/cklxx/agent-infer/releases">/releases</a>                      发版二进制 · 校验和
+<a href="https://github.com/cklxx/arle/blob/main/README.zh-CN.md">/README.zh-CN.md</a>                中文公共入口：安装 · CLI · 架构
+<a href="https://github.com/cklxx/arle/blob/main/README.md">/README.md</a>                      英文公共入口
+<a href="https://github.com/cklxx/arle/blob/main/docs/http-api.md">/docs/http-api.md</a>              HTTP 契约 · 流式行为
+<a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>        后端 / 模型 / 量化支持矩阵
+<a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>               贡献者初始化 · 验证 · 发版要求
+<a href="https://github.com/cklxx/arle/blob/main/docs/index.md">/docs/index.md</a>                 维护者 PARA 索引
+<a href="https://github.com/cklxx/arle/releases">/releases</a>                      发版二进制 · 校验和
 </pre>
 </section>
 
 <section id="see-also">
 <h2>另见</h2>
 <ul class="seealso">
-  <li><a href="https://github.com/cklxx/agent-infer/pkgs/container/agent-infer">GHCR package</a> &mdash; 由 <code>main</code> 和 release tag 构建的容器镜像</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">CHANGELOG.md</a> &mdash; 带日期的项目历史</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; 接下来的里程碑</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/SECURITY.md">SECURITY.md</a> &mdash; 私有漏洞报告策略</li>
+  <li><code>ghcr.io/cklxx/agent-infer:latest</code> &mdash; 当前已发布的容器镜像路径</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/CHANGELOG.md">CHANGELOG.md</a> &mdash; 带日期的项目历史</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; 接下来的里程碑</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/SECURITY.md">SECURITY.md</a> &mdash; 私有漏洞报告策略</li>
 </ul>
 <p class="note">
   如果你是来提改动的，先看
-  <a href="https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>，
+  <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>，
   不要先钻进维护者计划树。
 </p>
 </section>
@@ -146,7 +146,7 @@
   <span class="sl-seg sl-accent">arle/site</span>
   <span class="sl-seg sl-ok"><span class="dot"></span> public docs</span>
   <span class="sl-seg">zh</span>
-  <span class="sl-seg">gh:cklxx/agent-infer</span>
+  <span class="sl-seg">gh:cklxx/arle</span>
   <span class="sl-seg sl-spacer"></span>
   <span class="sl-seg">README / docs / releases</span>
 </div>
