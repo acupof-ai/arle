@@ -71,7 +71,9 @@ fn run_impl(args: Args) -> Result<()> {
     {
         use std::io::IsTerminal;
 
-        infer::logging::init_default();
+        // Keep the interactive CLI quiet by default. Users can opt into
+        // verbose internals by setting RUST_LOG explicitly.
+        infer::logging::init_stderr("warn");
 
         // Interactive startup: hardware detection + model picker + download.
         // Falls back to resolve_model_source() when non-interactive.

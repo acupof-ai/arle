@@ -58,6 +58,7 @@ pub trait ToolPolicy {
         &self,
         _user_input: &str,
         _last_tool_name: Option<&str>,
+        _last_tool_result: Option<&str>,
         _last_tool_scalar_result: Option<&str>,
     ) -> Option<String> {
         None
@@ -76,10 +77,10 @@ fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
     parsed
 }
 
-const DEFAULT_SYSTEM_PROMPT: &str = r"You are a local CLI assistant.
-Answer briefly.
-If a tool is needed, emit a <tool_call> block immediately with no explanation first.
-After tool results, answer directly.
+const DEFAULT_SYSTEM_PROMPT: &str = r"You are a local CLI coding assistant.
+Answer briefly and directly.
+Use tools silently when needed.
+Never expose raw role markers, XML protocol tags, or internal tool protocol in user-facing answers.
 If the user asks for an exact format, output exactly that.
 Do not expose chain-of-thought.";
 const TOOL_PLANNING_MAX_TOKENS: usize = 256;
@@ -291,98 +292,110 @@ impl AgentSession {
         cancel: Option<&AtomicBool>,
         callbacks: AgentTurnCallbacks<'_>,
     ) -> Result<Option<AgentTurnResult>> {
+        let turn_start = self.messages.len();
         self.messages.push(Message::user(user_input));
 
         let mut tool_calls_executed = 0usize;
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
         let mut last_tool_name = None::<String>;
+        let mut last_tool_result = None::<String>;
         let mut last_tool_scalar_result = None::<String>;
         let mut trace_events = Vec::new();
         let mut on_text_chunk = callbacks.on_text_chunk;
         let mut on_trace_event = callbacks.on_trace_event;
+        let mut recovered_user_request = (!tools.is_empty())
+            .then(|| tool_policy.recover_tool_calls_from_user_request(user_input, tools))
+            .flatten();
 
         for turn in 0..settings.max_turns {
-            let prompt = format_prompt(&self.messages, tools);
-            info!(
-                "Agent turn {}/{}: prompt length = {} chars",
-                turn + 1,
-                settings.max_turns,
-                prompt.len()
-            );
-
-            let turn_max_tokens = if tool_calls_executed == 0 && !tools.is_empty() {
-                settings.max_tokens.min(TOOL_PLANNING_MAX_TOKENS)
+            let parsed = if let Some(parsed) = recovered_user_request.take() {
+                info!("Recovered tool call(s) directly from user request");
+                parsed
             } else {
-                settings.max_tokens
-            };
+                let prompt = format_prompt(&self.messages, tools);
+                info!(
+                    "Agent turn {}/{}: prompt length = {} chars",
+                    turn + 1,
+                    settings.max_turns,
+                    prompt.len()
+                );
 
-            let mut visible_stream = VisibleTextStream::default();
-            let stream_visible_enabled = on_text_chunk.is_some();
-            let mut stream_visible_chunk = |chunk: &str| {
-                let visible = visible_stream.push(chunk);
-                if !visible.is_empty()
-                    && let Some(callback) = on_text_chunk.as_deref_mut()
-                {
-                    callback(&visible);
-                }
-            };
-            let Some(output) = complete_with_optional_cancel(
-                engine,
-                CompletionRequest {
-                    prompt,
-                    max_tokens: turn_max_tokens,
-                    sampling: SamplingParams {
-                        temperature: settings.temperature,
-                        ..SamplingParams::default()
+                let turn_max_tokens = if tool_calls_executed == 0 && !tools.is_empty() {
+                    settings.max_tokens.min(TOOL_PLANNING_MAX_TOKENS)
+                } else {
+                    settings.max_tokens
+                };
+
+                let mut visible_stream = VisibleTextStream::default();
+                let stream_visible_enabled = on_text_chunk.is_some();
+                let mut stream_visible_chunk = |chunk: &str| {
+                    let visible = visible_stream.push(chunk);
+                    if !visible.is_empty()
+                        && let Some(callback) = on_text_chunk.as_deref_mut()
+                    {
+                        callback(&visible);
+                    }
+                };
+                let Some(output) = complete_with_optional_cancel(
+                    engine,
+                    CompletionRequest {
+                        prompt,
+                        max_tokens: turn_max_tokens,
+                        sampling: SamplingParams {
+                            temperature: settings.temperature,
+                            ..SamplingParams::default()
+                        },
+                        stop: Some(vec!["<|im_end|>".to_string()]),
+                        logprobs: false,
                     },
-                    stop: Some(vec!["<|im_end|>".to_string()]),
-                    logprobs: false,
-                },
-                cancel,
-                stream_visible_enabled.then_some(&mut stream_visible_chunk as &mut dyn FnMut(&str)),
-            )?
-            else {
-                return Ok(None);
+                    cancel,
+                    stream_visible_enabled
+                        .then_some(&mut stream_visible_chunk as &mut dyn FnMut(&str)),
+                )?
+                else {
+                    return Ok(None);
+                };
+                if let Some(callback) = on_text_chunk.as_deref_mut() {
+                    let tail = visible_stream.finish();
+                    if !tail.is_empty() {
+                        callback(&tail);
+                    }
+                }
+
+                info!(
+                    "Generated {} chars, finish_reason={:?}",
+                    output.text.len(),
+                    output.finish_reason
+                );
+                prompt_tokens = prompt_tokens.saturating_add(output.usage.prompt_tokens as u64);
+                completion_tokens =
+                    completion_tokens.saturating_add(output.usage.completion_tokens as u64);
+
+                let mut parsed = parse_tool_calls(&output.text);
+                if parsed.tool_calls.is_empty() && tool_calls_executed == 0 && !tools.is_empty() {
+                    if let Some(recovered) =
+                        tool_policy.recover_tool_calls_from_draft(&output.text, tools)
+                    {
+                        info!("Recovered tool call(s) via deterministic extraction");
+                        parsed = recovered;
+                    } else if (output.text.contains("<tool_call>")
+                        || tool_policy.should_repair_tool_calls(&parsed.content))
+                        && let Some(repaired) = repair_tool_calls(
+                            engine,
+                            &self.messages,
+                            tools,
+                            settings,
+                            &output.text,
+                            cancel,
+                        )?
+                    {
+                        info!("Recovered tool call(s) via repair turn");
+                        parsed = repaired;
+                    }
+                }
+                parsed
             };
-            if let Some(callback) = on_text_chunk.as_deref_mut() {
-                let tail = visible_stream.finish();
-                if !tail.is_empty() {
-                    callback(&tail);
-                }
-            }
-
-            info!(
-                "Generated {} chars, finish_reason={:?}",
-                output.text.len(),
-                output.finish_reason
-            );
-            prompt_tokens = prompt_tokens.saturating_add(output.usage.prompt_tokens as u64);
-            completion_tokens =
-                completion_tokens.saturating_add(output.usage.completion_tokens as u64);
-
-            let mut parsed = parse_tool_calls(&output.text);
-            if parsed.tool_calls.is_empty() && tool_calls_executed == 0 && !tools.is_empty() {
-                if let Some(recovered) =
-                    tool_policy.recover_tool_calls_from_draft(&output.text, tools)
-                {
-                    info!("Recovered tool call(s) via deterministic extraction");
-                    parsed = recovered;
-                } else if (output.text.contains("<tool_call>")
-                    || tool_policy.should_repair_tool_calls(&parsed.content))
-                    && let Some(repaired) = repair_tool_calls(
-                        engine,
-                        &self.messages,
-                        tools,
-                        settings,
-                        &output.text,
-                        cancel,
-                    )?
-                {
-                    info!("Recovered tool call(s) via repair turn");
-                    parsed = repaired;
-                }
-            }
 
             let content = tool_policy.finalize_response_text(
                 user_input,
@@ -397,6 +410,7 @@ impl AgentSession {
                 .push(Message::assistant(&content, tool_calls.clone()));
 
             if tool_calls.is_empty() {
+                self.compact_turn_history(turn_start, &content);
                 return Ok(Some(AgentTurnResult {
                     text: content,
                     tool_calls_executed,
@@ -417,6 +431,7 @@ impl AgentSession {
                 &mut self.messages,
                 &mut tool_calls_executed,
                 &mut last_tool_name,
+                &mut last_tool_result,
                 &mut last_tool_scalar_result,
                 &mut trace_events,
                 match on_trace_event {
@@ -428,8 +443,10 @@ impl AgentSession {
             if let Some(text) = tool_policy.finalize_after_tool_execution(
                 user_input,
                 last_tool_name.as_deref(),
+                last_tool_result.as_deref(),
                 last_tool_scalar_result.as_deref(),
             ) {
+                self.compact_turn_history(turn_start, &text);
                 return Ok(Some(AgentTurnResult {
                     text,
                     tool_calls_executed,
@@ -441,14 +458,22 @@ impl AgentSession {
             }
         }
 
+        let final_text = "(max turns reached - agent stopped)".to_string();
+        self.compact_turn_history(turn_start, &final_text);
         Ok(Some(AgentTurnResult {
-            text: "(max turns reached - agent stopped)".to_string(),
+            text: final_text,
             tool_calls_executed,
             prompt_tokens,
             completion_tokens,
             max_turns_reached: true,
             trace_events,
         }))
+    }
+
+    fn compact_turn_history(&mut self, turn_start: usize, assistant_text: &str) {
+        self.messages.truncate(turn_start + 1);
+        self.messages
+            .push(Message::assistant(assistant_text, vec![]));
     }
 }
 
@@ -565,6 +590,7 @@ fn execute_tool_calls(
     messages: &mut Vec<Message>,
     tool_calls_executed: &mut usize,
     last_tool_name: &mut Option<String>,
+    last_tool_result: &mut Option<String>,
     last_tool_scalar_result: &mut Option<String>,
     trace_events: &mut Vec<AgentTraceEvent>,
     mut on_trace_event: Option<&mut dyn FnMut(&AgentTraceEvent)>,
@@ -573,6 +599,7 @@ fn execute_tool_calls(
         *tool_calls_executed += 1;
         let result = tool_executor.execute(tool_call);
 
+        *last_tool_result = Some(result.clone());
         *last_tool_scalar_result = scalar_tool_result(&result);
         *last_tool_name = Some(tool_call.name.clone());
         trace_events.push(AgentTraceEvent::ToolCall {
@@ -885,11 +912,13 @@ mod tests {
             &self,
             user_input: &str,
             last_tool_name: Option<&str>,
+            last_tool_result: Option<&str>,
             last_tool_scalar_result: Option<&str>,
         ) -> Option<String> {
             BuiltinToolPolicyHooks.finalize_after_tool_execution(
                 user_input,
                 last_tool_name,
+                last_tool_result,
                 last_tool_scalar_result,
             )
         }
@@ -1088,11 +1117,11 @@ mod tests {
             .expect("tool turn");
 
         let stats = session.stats();
-        assert_eq!(stats.conversation_messages, 3);
+        assert_eq!(stats.conversation_messages, 2);
         assert_eq!(stats.user_messages, 1);
         assert_eq!(stats.assistant_messages, 1);
-        assert_eq!(stats.tool_messages, 1);
-        assert_eq!(stats.tool_calls, 1);
+        assert_eq!(stats.tool_messages, 0);
+        assert_eq!(stats.tool_calls, 0);
         assert!(stats.content_chars > 0);
     }
 
@@ -1134,14 +1163,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_python_request_waits_for_model_tool_choice() {
+    fn explicit_python_request_uses_deterministic_recovery() {
         if !python_tool_available() {
             eprintln!("Skipping test: python tool is unavailable in this environment");
             return;
         }
 
         let mut session = AgentSession::new();
-        let mut engine = FakeEngine::new(vec!["I'll help with that."]);
+        let mut engine = FakeEngine::new(vec!["56088"]);
 
         let result = session
             .run_turn(
@@ -1154,9 +1183,9 @@ mod tests {
             )
             .expect("tool recovery turn");
 
-        assert_eq!(result.tool_calls_executed, 0);
-        assert_eq!(result.text, "I'll help with that.");
-        assert_eq!(engine.prompts.len(), 1);
+        assert_eq!(result.tool_calls_executed, 1);
+        assert_eq!(result.text, "56088");
+        assert_eq!(engine.prompts.len(), 0);
     }
 
     #[test]
@@ -1202,12 +1231,9 @@ mod tests {
     }
 
     #[test]
-    fn chinese_file_listing_request_waits_for_model_tool_choice() {
+    fn chinese_file_listing_request_uses_deterministic_recovery() {
         let mut session = AgentSession::new();
-        let mut engine = FakeEngine::new(vec![
-            "I don't have a tool for listing files.",
-            "I still don't have a suitable tool for this.",
-        ]);
+        let mut engine = FakeEngine::new(vec!["I listed the current directory contents above."]);
 
         let result = session
             .run_turn(
@@ -1220,9 +1246,10 @@ mod tests {
             )
             .expect("file listing turn");
 
-        assert_eq!(result.tool_calls_executed, 0);
-        assert_eq!(result.text, "I don't have a tool for listing files.");
-        assert_eq!(engine.prompts.len(), 2);
+        assert_eq!(result.tool_calls_executed, 1);
+        assert!(result.text.contains("Cargo.toml"));
+        assert!(result.text.contains("src"));
+        assert_eq!(engine.prompts.len(), 0);
     }
 
     #[test]
@@ -1236,7 +1263,7 @@ mod tests {
         let result = session
             .run_turn(
                 &mut engine,
-                "本地有哪些文件",
+                "Check the workspace root.",
                 &[shell_tool()],
                 &tool_executor(),
                 &tool_policy(),
@@ -1290,7 +1317,7 @@ mod tests {
         let result = session
             .run_turn(
                 &mut engine,
-                "本地有哪些文件",
+                "Check the workspace root.",
                 &[shell_tool()],
                 &tool_executor(),
                 &tool_policy(),

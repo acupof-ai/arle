@@ -237,7 +237,11 @@ fn append_structured_chatml_message_with_span(
 ) -> ChatMlSpan {
     let turn_start = prompt.len();
     prompt.push_str("<|im_start|>");
-    prompt.push_str(message.role.as_str());
+    let rendered_role = match message.role {
+        ChatRole::Tool => ChatRole::User.as_str(),
+        _ => message.role.as_str(),
+    };
+    prompt.push_str(rendered_role);
     prompt.push('\n');
 
     let supervised_start = prompt.len();
@@ -348,7 +352,9 @@ impl<'a> PromptRenderer<'a> {
     }
 
     fn push_tool(&mut self, content: &str) {
-        self.start_message(ChatRole::Tool.as_str());
+        // Qwen's official tool-calling template feeds tool results back as
+        // special user messages rather than a dedicated `tool` role.
+        self.start_message(ChatRole::User.as_str());
         self.prompt.push_str("<tool_response>\n");
         self.prompt.push_str(content);
         self.prompt.push_str("\n</tool_response>");
@@ -557,7 +563,10 @@ pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
         );
     }
 
-    out.push_str("\n</tools>\nUse <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>.");
+    out.push_str(
+        "\n</tools>\nUse <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. \
+Never echo <tools>, <tool_call>, or <tool_response> in the final user-facing answer.",
+    );
     out
 }
 
