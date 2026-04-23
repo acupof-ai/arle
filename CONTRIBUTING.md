@@ -1,4 +1,4 @@
-# Contributing to agent-infer
+# Contributing to ARLE
 
 Thanks for your interest in contributing! This document is the main entry point
 for contribution workflow.
@@ -16,9 +16,12 @@ or release-related, also read:
 ## Getting Started
 
 ```bash
-git clone https://github.com/cklxx/agent-infer && cd agent-infer
+git clone https://github.com/cklxx/arle && cd arle
 ./setup.sh                 # Installs Rust, Python venv, builds, downloads model
-./setup.sh --check         # Verifies the local toolchain and binaries
+./setup.sh --check         # Linux/CUDA workstation check
+make hygiene               # Public docs/templates/link guardrails
+make pre-push              # CI-aligned snapshot validation
+make check-metal           # Apple Silicon quick check
 ```
 
 Or manually:
@@ -63,7 +66,7 @@ cargo deny check advisories bans licenses sources
 1. Fork the repo and create a branch from `main`
 2. Follow [Commitizen](https://www.conventionalcommits.org/) format: `<type>(<scope>): <subject>`
    - Types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `chore`
-3. Ensure CI passes: `cargo test`, `cargo clippy`, `cargo fmt --check`, `cargo deny`
+3. Ensure CI passes: `make hygiene`, `cargo test`, `cargo clippy`, `cargo fmt --check`, `cargo deny`
 4. One logical change per PR. Keep diffs focused.
 5. If the change affects a documented API, CLI behavior, environment variable,
    benchmark claim, or migration-sensitive workflow, include the relevant docs

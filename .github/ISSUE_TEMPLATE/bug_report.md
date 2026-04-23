@@ -9,6 +9,12 @@ labels: bug
 
 A clear description of the bug.
 
+## Surface
+
+- **Backend**: (e.g. CUDA, Metal, CPU)
+- **Route / command**: (e.g. `POST /v1/chat/completions`, `arle train eval`)
+- **Regression?**: (e.g. yes/no, last known good commit if known)
+
 ## Steps to Reproduce
 
 1. Start server with `...`
@@ -25,9 +31,16 @@ What actually happens. Include error messages or logs.
 
 ## Environment
 
-- **GPU**: (e.g. A100-40GB)
-- **CUDA version**: (e.g. 12.8)
+- **Backend**: (e.g. CUDA, Metal, CPU)
+- **GPU / Metal chip / CPU**: (e.g. A100-40GB, M4 Pro)
+- **CUDA / macOS / compiler version**: (e.g. CUDA 12.8, macOS 15.4)
 - **agent-infer version/commit**: 
 - **OS**: 
 - **Model**: (e.g. Qwen3-4B)
-- **Server flags**: (e.g. `--num-slots 4 --cuda-graph true`)
+- **Command / server flags**: (e.g. `infer --num-slots 4 --cuda-graph true`)
+- **Relevant env vars**: (e.g. `INFER_CUDA_SM=90`)
+
+## Evidence
+
+- Logs / stack trace:
+- Benchmark / trace / `/v1/stats` snapshot:
