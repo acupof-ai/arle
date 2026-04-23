@@ -191,6 +191,7 @@ def check_git_tracked_junk() -> list[str]:
             ["git", "ls-files"],
             cwd=ROOT,
             text=True,
+            stderr=subprocess.DEVNULL,
         )
         candidates = output.splitlines()
     except (subprocess.CalledProcessError, FileNotFoundError):
