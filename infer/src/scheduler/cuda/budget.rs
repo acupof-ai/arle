@@ -1,5 +1,7 @@
 use super::{ModelForward, Scheduler};
 
+pub(super) const CLIPPED_MAX_NEW_TOKENS_ESTIMATE: usize = 4_096;
+
 pub(super) fn normalized_page_size(page_size: usize) -> usize {
     page_size.max(1)
 }
@@ -8,12 +10,23 @@ pub(super) fn page_count(tokens: usize, page_size: usize) -> usize {
     tokens.div_ceil(normalized_page_size(page_size))
 }
 
-pub(super) fn full_request_pages(
+pub(super) fn clipped_max_new_tokens_estimate(max_tokens: usize) -> usize {
+    max_tokens.min(CLIPPED_MAX_NEW_TOKENS_ESTIMATE)
+}
+
+pub(super) fn estimated_request_target_tokens(prompt_tokens: usize, max_tokens: usize) -> usize {
+    prompt_tokens.saturating_add(clipped_max_new_tokens_estimate(max_tokens))
+}
+
+pub(super) fn estimated_request_pages(
     prompt_tokens: usize,
     max_tokens: usize,
     page_size: usize,
 ) -> usize {
-    page_count(prompt_tokens.saturating_add(max_tokens), page_size)
+    page_count(
+        estimated_request_target_tokens(prompt_tokens, max_tokens),
+        page_size,
+    )
 }
 
 pub(super) fn additional_pages_needed(
@@ -59,7 +72,7 @@ pub(super) struct PageTarget {
     pub target_seq: usize,
 }
 
-pub(super) fn full_request_target(
+pub(super) fn estimated_request_target(
     slot_idx: usize,
     prompt_tokens: usize,
     max_tokens: usize,
@@ -68,7 +81,7 @@ pub(super) fn full_request_target(
     PageTarget {
         slot_idx,
         seq_floor: reserved_prefix_tokens,
-        target_seq: prompt_tokens.saturating_add(max_tokens),
+        target_seq: estimated_request_target_tokens(prompt_tokens, max_tokens),
     }
 }
 
@@ -233,7 +246,7 @@ where
         let Some(prompt_tokens) = prompt_tokens else {
             continue;
         };
-        requested_pages = requested_pages.saturating_add(full_request_pages(
+        requested_pages = requested_pages.saturating_add(estimated_request_pages(
             prompt_tokens,
             max_tokens,
             page_size,
@@ -270,8 +283,9 @@ pub(super) fn coordinator_submit_headroom(capacity: usize, active: usize) -> usi
 mod tests {
     use super::{
         PageBudget, PageGrowth, PageTarget, StepTokenBudget, additional_pages_needed,
-        coordinator_submit_headroom, full_request_pages, full_request_target, page_count,
-        partial_tail_capacity, prefix_cache_reclaim_goal_pages, waiting_admission_shortage_pages,
+        clipped_max_new_tokens_estimate, coordinator_submit_headroom, estimated_request_pages,
+        estimated_request_target, page_count, partial_tail_capacity,
+        prefix_cache_reclaim_goal_pages, waiting_admission_shortage_pages,
     };
 
     #[test]
@@ -284,8 +298,14 @@ mod tests {
     }
 
     #[test]
-    fn full_request_pages_rounds_prompt_plus_decode_up() {
-        assert_eq!(full_request_pages(4_097, 256, 16), 273);
+    fn estimated_request_pages_rounds_prompt_plus_decode_up() {
+        assert_eq!(estimated_request_pages(4_097, 256, 16), 273);
+    }
+
+    #[test]
+    fn estimated_request_pages_clips_long_decode_tail() {
+        assert_eq!(estimated_request_pages(2_048, 8_192, 16), 384);
+        assert_eq!(clipped_max_new_tokens_estimate(8_192), 4_096);
     }
 
     #[test]
@@ -358,9 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn full_request_target_sets_prefix_floor_and_goal() {
+    fn estimated_request_target_sets_prefix_floor_and_goal() {
         assert_eq!(
-            full_request_target(3, 128, 64, 96),
+            estimated_request_target(3, 128, 64, 96),
             PageTarget {
                 slot_idx: 3,
                 seq_floor: 96,

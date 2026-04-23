@@ -64,14 +64,15 @@ works with any backend. Load before editing any scheduler internals.
    `paged_kv` tail-page COW before append. Keep those two paths explicit: the
    contiguous fallback is model-compatibility glue, the paged attach path is
    the canonical shared-page flow.
-9. **`runtime.rs::assign_slots()` owns waiting-queue normalization/admission.**
-   Tokenization, prompt-length rejection/clamping, cancellation skip, radix
-   classification, and slot materialization happen there before
-   `execution.rs::plan_step()` decides the current tick's prefill/decode mix.
-   The waiting queue itself now stays priority-ordered incrementally on
-   ingress/requeue; `assign_slots()` is no longer allowed to re-sort the whole
-   queue every tick. Do not recreate a second waiting-queue planner in
-   `execution.rs`.
+9. **`runtime.rs` ingress owns waiting-queue normalization; `assign_slots()`
+   owns admission only.** Tokenization, prompt-length rejection/clamping, and
+   cancellation skip happen when requests enter the scheduler so the waiting
+   queue always carries normalized prompt tokens. `assign_slots()` then does
+   radix classification and slot materialization before `execution.rs::plan_step()`
+   decides the current tick's prefill/decode mix. The waiting queue itself now
+   stays priority-ordered incrementally on ingress/requeue; `assign_slots()` is
+   no longer allowed to re-sort the whole queue every tick. Do not recreate a
+   second waiting-queue planner in `execution.rs`.
 10. **Eviction never touches pages backing an active slot.** Radix eviction
    only frees pages whose `block_owner_slots` entry is either missing (the
    slot has already been freed) or points at a slot currently in `Idle`
