@@ -1,7 +1,7 @@
 # Quickstart — download a dataset, SFT Qwen3, chat with the result
 
 End-to-end recipe for going from a public HuggingFace dataset to a
-trained checkpoint you can chat with via `agent-infer`. Verified on
+trained checkpoint you can chat with via `arle`. Verified on
 2026-04-19 for Qwen3-0.6B on Metal and on 2026-04-21 for Qwen3-0.6B on
 CUDA via `scripts/train_cuda_e2e.sh`.
 
@@ -10,6 +10,7 @@ CUDA via `scripts/train_cuda_e2e.sh`.
 ```bash
 cargo build --release -p train --bin download_dataset --bin convert_dataset --bin train_sft
 cargo build --release --no-default-features --features metal
+cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
 ```
 
 ## 1. Download a dataset
@@ -72,7 +73,7 @@ step_000002`.
 ## 4. Chat with the trained model
 
 ```bash
-echo "What is the capital of France?" | target/release/agent-infer \
+echo "What is the capital of France?" | target/release/arle \
   --model-path /tmp/dolly_sft/latest --max-tokens 16 --non-interactive
 # → TTFT 69 ms · 167 tok/s · "Okay, the user is asking for the capital of France. I need"
 ```
@@ -100,7 +101,7 @@ breaks, the integration is broken.
 INFER_TEST_MODEL_PATH=models/Qwen3-0.6B scripts/train_and_chat.sh
 ```
 
-For the canonical CUDA smoke that also covers `eval_lm`, `agent-infer`,
+For the canonical CUDA smoke that also covers `eval_lm`, `arle`,
 and resume, run:
 
 ```bash
