@@ -15,7 +15,7 @@ and the Metal scheduler runtime (Apple Silicon, `crates/mlx-sys` C++ bridge —
 continuous batching with variable-length packed decode via mlx-lm
 `BatchKVCache` pattern: left-padding + additive mask + per-row RoPE offsets,
 see [`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7).
-Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention), GLM4.
+Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention).
 FlashInfer drives CUDA prefill HD128 and batched decode HD128+HD256.
 Tests compare against JSON baselines in `infer/test_data/` — regenerate
 after any change affecting numerical output.
@@ -166,7 +166,7 @@ changes.
 ### Git
 
 - Commitizen: `<type>(<scope>): <subject>`. Scopes: `metal`, `cuda`,
-  `scheduler`, `qwen3`, `qwen35`, `glm4`, `http`, `kv-tier`, `docs`.
+  `scheduler`, `qwen3`, `qwen35`, `http`, `kv-tier`, `docs`.
 - Commit directly to `main` (no feature branches — `feedback_commit_to_main.md`).
 - After `git mv` + batch Edits, re-check `git status` and re-stage by path —
   the fmt hook de-stages renames (`feedback_git_mv_with_fmt_hook.md`).

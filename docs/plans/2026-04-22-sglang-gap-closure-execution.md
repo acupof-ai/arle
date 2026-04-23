@@ -144,7 +144,6 @@ That pointed at one bottleneck cluster:
 - `infer/src/model.rs`
 - `infer/src/model/qwen3/batch_decode.rs`
 - `infer/src/model/qwen35/batch_decode.rs`
-- `infer/src/model/glm4/batch_decode.rs`
 
 **Delete-first rules**
 

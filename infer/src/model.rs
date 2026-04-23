@@ -16,16 +16,11 @@ pub(crate) mod generation_state;
 #[path = "model/kv_cache.rs"]
 pub(crate) mod kv_cache;
 
-#[path = "model/glm4.rs"]
-pub mod glm4;
 #[path = "model/qwen3.rs"]
 pub mod qwen3;
 #[path = "model/qwen35.rs"]
 pub mod qwen35;
 
-pub use glm4::GLM4Model;
-#[cfg(feature = "cuda")]
-pub use glm4::GLM4State;
 pub use kv_cache::{KVCacheDtype, KVFormat};
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
 pub use qwen35::{Qwen35Model, Qwen35State};

@@ -6,7 +6,7 @@
 //!   - **FP8**: Custom split-KV kernel with FP8→FP32 cast (`decode_attention_fp8`)
 //!
 //! Prefill uses FlashInfer batch-forward with layout dispatch:
-//!   - HD128: `flashinfer_batch_forward_with_layout` (Qwen3, GLM4)
+//!   - HD128: `flashinfer_batch_forward_with_layout` (Qwen3)
 //!   - HD256: `flashinfer_batch_forward_hd256` (Qwen3.5 full-attention layers)
 //!
 //! Single-token decode uses Triton AOT kernel: fused QK-norm + RoPE + split-KV

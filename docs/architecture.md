@@ -57,7 +57,7 @@ agent-infer (root binary)
   -> tools builtin tools
   -> chat prompt/tool-call protocol
   -> infer::server_engine::LoadedInferenceEngine
-     - CUDA: Qwen3InferenceEngine / Qwen35InferenceEngine / GLM4InferenceEngine
+     - CUDA: Qwen3InferenceEngine / Qwen35InferenceEngine
      - Metal: BackendInferenceEngine<MetalBackend>
      - CPU:   BackendInferenceEngine<CpuBackend>
 ```

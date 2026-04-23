@@ -14,7 +14,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
-use crate::gguf::{self, GgufFile};
+use crate::gguf::{
+    self, GgufFile, find_tensor_name, reverse_v_reorder, reverse_v_reorder_cols,
+    reverse_v_reorder_rows,
+};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -564,7 +567,7 @@ pub(crate) fn load_tensor_1d_gguf(
     gguf: &GgufFile,
     hf_name: &str,
 ) -> Result<DeviceVec> {
-    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
     let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     DeviceVec::from_host(ctx, &bf16_data)
 }
@@ -579,122 +582,13 @@ pub(crate) fn load_tensor_1d_gguf_offset_norm(
     gguf: &GgufFile,
     hf_name: &str,
 ) -> Result<DeviceVec> {
-    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
     let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     // Subtract 1.0 to convert from GGUF convention (1+w) to HF convention (w)
     for v in &mut bf16_data {
         *v = bf16::from_f32(v.to_f32() - 1.0);
     }
     DeviceVec::from_host(ctx, &bf16_data)
-}
-
-/// Reverse llama.cpp's `_reorder_v_heads` permutation for 1D data.
-///
-/// llama.cpp reorders V heads from grouped (by K head) to tiled:
-///   HF:   [G0_v0, G0_v1, G1_v0, G1_v1, ...]  (grouped by K head)
-///   GGUF: [G0_v0, G1_v0, G0_v1, G1_v1, ...]  (tiled for ggml broadcast)
-///
-/// This reverses: reshape [num_v_per_k, num_k_heads, head_dim] → transpose → flatten.
-/// For 1D tensors (A_log, dt_bias): head_dim=1.
-pub(crate) fn reverse_v_reorder(
-    data: &mut [bf16],
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) {
-    if num_v_per_k <= 1 {
-        return;
-    }
-    let src = data.to_vec();
-    // GGUF order: [vpk, nk, hd] flattened. Reverse to [nk, vpk, hd].
-    for k in 0..num_k_heads {
-        for v in 0..num_v_per_k {
-            for d in 0..head_dim {
-                let gguf_idx = (v * num_k_heads + k) * head_dim + d;
-                let hf_idx = (k * num_v_per_k + v) * head_dim + d;
-                data[hf_idx] = src[gguf_idx];
-            }
-        }
-    }
-}
-
-/// Same as reverse_v_reorder but for f32 data.
-pub(crate) fn reverse_v_reorder_f32(
-    data: &mut [f32],
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) {
-    if num_v_per_k <= 1 {
-        return;
-    }
-    let src = data.to_vec();
-    for k in 0..num_k_heads {
-        for v in 0..num_v_per_k {
-            for d in 0..head_dim {
-                let gguf_idx = (v * num_k_heads + k) * head_dim + d;
-                let hf_idx = (k * num_v_per_k + v) * head_dim + d;
-                data[hf_idx] = src[gguf_idx];
-            }
-        }
-    }
-}
-
-/// Reverse llama.cpp's `_reorder_v_heads` for 2D tensor rows.
-///
-/// Rows are grouped as [num_v_per_k, num_k_heads, head_dim, cols] in GGUF.
-/// Reverse to [num_k_heads, num_v_per_k, head_dim, cols] (HF grouped order).
-pub(crate) fn reverse_v_reorder_rows(
-    data: &mut [bf16],
-    rows: usize,
-    cols: usize,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) {
-    if num_v_per_k <= 1 {
-        return;
-    }
-    let src = data.to_vec();
-    let _ = rows; // used for assertion only
-    for k in 0..num_k_heads {
-        for v in 0..num_v_per_k {
-            let gguf_head = v * num_k_heads + k;
-            let hf_head = k * num_v_per_k + v;
-            let src_start = gguf_head * head_dim * cols;
-            let dst_start = hf_head * head_dim * cols;
-            let size = head_dim * cols;
-            data[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
-        }
-    }
-}
-
-/// Reverse llama.cpp's `_reorder_v_heads` for 2D tensor columns.
-/// Used for out_proj where cols = num_v_heads × value_head_dim.
-pub(crate) fn reverse_v_reorder_cols(
-    data: &mut [bf16],
-    rows: usize,
-    cols: usize,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) {
-    if num_v_per_k <= 1 {
-        return;
-    }
-    let src = data.to_vec();
-    for r in 0..rows {
-        for k in 0..num_k_heads {
-            for v in 0..num_v_per_k {
-                let gguf_head = v * num_k_heads + k;
-                let hf_head = k * num_v_per_k + v;
-                for d in 0..head_dim {
-                    data[r * cols + hf_head * head_dim + d] =
-                        src[r * cols + gguf_head * head_dim + d];
-                }
-            }
-        }
-    }
 }
 
 /// Load 1D GGUF tensor with V-head reorder reversal (a_log, dt_bias).
@@ -705,7 +599,7 @@ pub(crate) fn load_tensor_1d_gguf_v_reorder(
     num_k_heads: usize,
     num_v_per_k: usize,
 ) -> Result<DeviceVec> {
-    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
     let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     reverse_v_reorder(&mut bf16_data, num_k_heads, num_v_per_k, 1);
     DeviceVec::from_host(ctx, &bf16_data)
@@ -724,7 +618,7 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
     num_v_per_k: usize,
     head_dim: usize,
 ) -> Result<DeviceMatrix> {
-    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
     let (rows, cols) = if info.shape.len() == 2 {
         (info.shape[1] as usize, info.shape[0] as usize)
@@ -823,7 +717,7 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_cols(
     num_v_per_k: usize,
     head_dim: usize,
 ) -> Result<DeviceMatrix> {
-    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
     let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     let (rows, cols) = if info.shape.len() == 2 {
@@ -856,7 +750,7 @@ pub(crate) fn load_tensor_2d_gguf_bf16(
     gguf: &GgufFile,
     hf_name: &str,
 ) -> Result<DeviceMatrix> {
-    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
     let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     let (rows, cols) = if info.shape.len() == 2 {
@@ -878,7 +772,7 @@ pub(crate) fn load_tensor_2d_gguf(
     gguf: &GgufFile,
     hf_name: &str,
 ) -> Result<DeviceMatrix> {
-    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
 
     // `INFER_FORCE_BF16_QUANT=1` skips all packed fast paths and forces the
@@ -952,62 +846,6 @@ pub(crate) fn load_tensor_2d_gguf(
     };
 
     DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
-}
-
-/// Find a tensor in the GGUF file by HuggingFace name.
-///
-/// Tries: direct lookup → reverse name mapping → prefix stripping.
-fn find_gguf_tensor_name(gguf: &GgufFile, hf_name: &str) -> Result<String> {
-    // Direct match (some GGUF files use HF naming)
-    if gguf.tensors.contains_key(hf_name) {
-        return Ok(hf_name.to_string());
-    }
-
-    // Reverse mapping: try multiple prefixes (Qwen3 uses "model", Qwen3.5 uses "model.language_model")
-    let prefixes = ["model", "model.language_model"];
-    for gguf_name in gguf.tensors.keys() {
-        for prefix in &prefixes {
-            if gguf::map_gguf_name_with_prefix(gguf_name, prefix) == hf_name {
-                return Ok(gguf_name.clone());
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "Tensor '{}' not found in GGUF (tried {} tensor names with prefixes {:?})",
-        hf_name,
-        gguf.tensors.len(),
-        prefixes
-    )
-}
-
-/// Public version of find_gguf_tensor_name for use by model-specific loaders.
-pub(crate) fn find_gguf_tensor_name_pub(gguf: &GgufFile, hf_name: &str) -> Result<String> {
-    find_gguf_tensor_name(gguf, hf_name)
-}
-
-/// Detect if a model path contains a GGUF file and return the GgufFile handle.
-///
-/// Scans for `.gguf` files in the directory. Returns the first one found.
-pub(crate) fn try_open_gguf(model_path: &str) -> Option<GgufFile> {
-    let dir = std::path::Path::new(model_path);
-    if !dir.is_dir() {
-        return None;
-    }
-    for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        let name = entry.file_name();
-        if name.to_string_lossy().ends_with(".gguf") {
-            let path = entry.path();
-            match GgufFile::open(path.to_str()?) {
-                Ok(gguf) => return Some(gguf),
-                Err(e) => {
-                    log::warn!("Failed to parse GGUF {}: {}", path.display(), e);
-                }
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

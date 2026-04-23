@@ -1,6 +1,7 @@
 use std::{path::Path, time::Instant};
 
 use anyhow::{Context, Result, ensure};
+use half::bf16;
 
 use super::mlx::{
     Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
@@ -18,6 +19,10 @@ use super::{
 };
 use crate::backend::is_stream_stop_matched;
 use crate::backend::metal::dflash::MetalDflashRuntime;
+use crate::gguf::{
+    GgufFile, find_tensor_name, reverse_v_reorder, reverse_v_reorder_cols, reverse_v_reorder_f32,
+    reverse_v_reorder_rows,
+};
 use crate::sampler::SamplingParams;
 
 pub(super) struct MetalQwen35FullAttentionWeights {
@@ -116,6 +121,217 @@ pub(super) struct Qwen35MetalWeights {
     pub(super) cpp_model: Option<CppQwen35Model>,
 }
 
+fn mlx_bf16_array(data: &[bf16], shape: &[i32]) -> MlxArray {
+    unsafe { MlxArray::from_raw_data(data.as_ptr().cast(), shape, Dtype::Bfloat16) }
+}
+
+fn gguf_matrix_shape(gguf: &GgufFile, hf_name: &str) -> Result<[i32; 2]> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 2,
+        "expected 2D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    Ok([info.shape[1] as i32, info.shape[0] as i32])
+}
+
+fn gguf_load_matrix_bf16(gguf: &GgufFile, hf_name: &str) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let data = gguf.read_tensor_bf16(&gguf_name)?;
+    Ok(mlx_bf16_array(&data, &gguf_matrix_shape(gguf, hf_name)?))
+}
+
+fn gguf_load_vector_bf16(gguf: &GgufFile, hf_name: &str) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 1,
+        "expected 1D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    let data = gguf.read_tensor_bf16(&gguf_name)?;
+    Ok(mlx_bf16_array(&data, &[info.shape[0] as i32]))
+}
+
+fn gguf_load_direct_norm_vector(gguf: &GgufFile, hf_name: &str) -> Result<MlxArray> {
+    gguf_load_vector_bf16(gguf, hf_name)
+}
+
+fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
+    let weight_f32 = as_dtype(weight, Dtype::Float32);
+    super::mlx::eval(&[&weight_f32]);
+    let slice = weight_f32.as_slice_f32();
+    let mean_abs = slice.iter().map(|v| v.abs()).sum::<f32>() / slice.len().max(1) as f32;
+    mean_abs < 0.75
+}
+
+fn qwen35_normalize_direct_norm_weight(
+    weight: &MlxArray,
+    needs_offset_correction: bool,
+) -> MlxArray {
+    if !needs_offset_correction {
+        return weight.clone();
+    }
+    let one = as_dtype(&MlxArray::scalar_f32(1.0), weight.dtype());
+    add(weight, &one)
+}
+
+fn gguf_load_v_reorder_vector(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 1,
+        "expected 1D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
+    reverse_v_reorder(&mut data, num_k_heads, num_v_per_k, 1);
+    Ok(mlx_bf16_array(&data, &[info.shape[0] as i32]))
+}
+
+fn gguf_load_v_reorder_rows_matrix(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 2,
+        "expected 2D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    let rows = info.shape[1] as usize;
+    let cols = info.shape[0] as usize;
+    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
+    reverse_v_reorder_rows(&mut data, rows, cols, num_k_heads, num_v_per_k, head_dim);
+    Ok(mlx_bf16_array(&data, &[rows as i32, cols as i32]))
+}
+
+fn gguf_load_v_reorder_cols_matrix(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 2,
+        "expected 2D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    let rows = info.shape[1] as usize;
+    let cols = info.shape[0] as usize;
+    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
+    reverse_v_reorder_cols(&mut data, rows, cols, num_k_heads, num_v_per_k, head_dim);
+    Ok(mlx_bf16_array(&data, &[rows as i32, cols as i32]))
+}
+
+fn gguf_load_qwen35_qkv_matrix(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    anyhow::ensure!(
+        info.shape.len() == 2,
+        "expected 2D GGUF tensor for '{hf_name}', got {}D",
+        info.shape.len()
+    );
+    let cols = info.shape[0] as usize;
+    let q_rows = num_k_heads * key_head_dim;
+    let k_rows = num_k_heads * key_head_dim;
+    let v_rows = num_k_heads * num_v_per_k * value_head_dim;
+    let rows = q_rows + k_rows + v_rows;
+    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
+    let v_start = (q_rows + k_rows) * cols;
+    reverse_v_reorder_rows(
+        &mut data[v_start..v_start + v_rows * cols],
+        v_rows,
+        cols,
+        num_k_heads,
+        num_v_per_k,
+        value_head_dim,
+    );
+    Ok(mlx_bf16_array(&data, &[rows as i32, cols as i32]))
+}
+
+fn gguf_load_qwen35_conv1d(
+    gguf: &GgufFile,
+    hf_name: &str,
+    arch: &MetalQwen35ArchConfig,
+) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
+    let qk_channels = arch.linear.key_dim * arch.linear.num_key_heads * 2;
+    let v_channels = arch.linear.num_value_heads * arch.linear.value_dim;
+    let kernel_dim = arch.linear.conv_kernel;
+    anyhow::ensure!(
+        data.len() == (qk_channels + v_channels) * kernel_dim,
+        "unexpected conv1d weight size for '{hf_name}': got {}, expected {}",
+        data.len(),
+        (qk_channels + v_channels) * kernel_dim
+    );
+    let v_start = qk_channels * kernel_dim;
+    reverse_v_reorder_rows(
+        &mut data[v_start..v_start + v_channels * kernel_dim],
+        v_channels,
+        kernel_dim,
+        arch.linear.num_key_heads,
+        arch.linear.num_value_heads / arch.linear.num_key_heads,
+        arch.linear.value_dim,
+    );
+    Ok(mlx_bf16_array(
+        &data,
+        &[(qk_channels + v_channels) as i32, kernel_dim as i32, 1],
+    ))
+}
+
+fn gguf_load_qwen35_a_log(
+    gguf: &GgufFile,
+    hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+) -> Result<MlxArray> {
+    let gguf_name = find_tensor_name(gguf, hf_name)?;
+    let mut a_log = gguf.read_tensor_f32(&gguf_name)?;
+    for value in &mut a_log {
+        let abs_a = value.abs().max(1e-10);
+        *value = abs_a.ln();
+    }
+    reverse_v_reorder_f32(&mut a_log, num_k_heads, num_v_per_k, 1);
+    Ok(MlxArray::from_slice_f32(&a_log, &[a_log.len() as i32]))
+}
+
+fn dense_weight_from_matrix(matrix: &MlxArray) -> WeightTensor {
+    let w_t = super::mlx::transpose_all(matrix);
+    super::mlx::eval(&[&w_t]);
+    WeightTensor::Dense(w_t)
+}
+
+fn concat_dense_weights(lhs: &WeightTensor, rhs: &WeightTensor) -> Result<WeightTensor> {
+    match (lhs, rhs) {
+        (WeightTensor::Dense(lhs), WeightTensor::Dense(rhs)) => Ok(WeightTensor::Dense(
+            concatenate_axis(&[lhs.clone(), rhs.clone()], 1),
+        )),
+        _ => anyhow::bail!("expected dense GGUF weights during Metal GGUF load"),
+    }
+}
+
 /// RAII wrapper for the C++ Qwen35 forward model.
 pub(crate) struct CppQwen35Model(*mut std::ffi::c_void);
 
@@ -207,9 +423,7 @@ pub(crate) fn with_qwen35_capture_layers<T>(
 }
 
 fn use_qwen35_cpp_separate_proj() -> bool {
-    std::env::var("AGENT_INFER_QWEN35_CPP_SEPARATE")
-        .map(|value| value != "0")
-        .unwrap_or(true)
+    std::env::var("AGENT_INFER_QWEN35_CPP_SEPARATE").map_or(true, |value| value != "0")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1904,9 +2118,7 @@ pub(super) fn qwen35_forward_with_hidden_states(
     // Capture hidden states after each layer for selected layers.
     let mut all_per_token_hidden: Vec<Vec<MlxArray>> = Vec::new();
     let mut last_logits = MlxArray::scalar_f32(0.0);
-    let mut pos = cache_len;
-
-    for &token in input_ids {
+    for (pos, &token) in (cache_len..).zip(input_ids.iter()) {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
         let mut x = take_axis(&weights.embed_tokens, &token_arr, 0);
         let mut full_idx = 0usize;
@@ -1969,7 +2181,6 @@ pub(super) fn qwen35_forward_with_hidden_states(
         );
         last_logits = linear(&final_norm, &weights.lm_head);
         all_per_token_hidden.push(token_hidden);
-        pos += 1;
     }
 
     // Concatenate: for each target layer, stack all tokens along axis 0,
@@ -2251,6 +2462,203 @@ fn mlp_project(mlp: &MlpInputProjection, x: &MlxArray) -> (MlxArray, MlxArray) {
     }
 }
 
+pub(super) fn load_qwen35_metal_weights_from_gguf(
+    gguf: &GgufFile,
+    config: &MetalModelConfig,
+) -> Result<Qwen35MetalWeights> {
+    let MetalModelArch::Qwen35(arch) = &config.arch else {
+        anyhow::bail!("Qwen3.5 Metal GGUF loader requires a Qwen3.5 config");
+    };
+    ensure!(
+        arch.moe.is_none(),
+        "Metal GGUF loading currently supports dense Qwen3.5 only"
+    );
+
+    let num_k = arch.linear.num_key_heads;
+    let num_v = arch.linear.num_value_heads;
+    ensure!(
+        num_k > 0 && num_v.is_multiple_of(num_k),
+        "invalid Qwen3.5 linear-attention dimensions: num_key_heads={num_k}, num_value_heads={num_v}"
+    );
+    let num_v_per_k = num_v / num_k;
+    let key_head_dim = arch.linear.key_dim;
+    let value_head_dim = arch.linear.value_dim;
+    let prefix = "model";
+
+    log::info!("  loading Qwen3.5 GGUF on Metal — dequantizing to BF16 during load");
+
+    let embed_tokens = gguf_load_matrix_bf16(gguf, &format!("{prefix}.embed_tokens.weight"))?;
+    let norm = gguf_load_direct_norm_vector(gguf, &format!("{prefix}.norm.weight"))?;
+    let lm_head = if find_tensor_name(gguf, "lm_head.weight").is_ok() {
+        dense_weight_from_matrix(&gguf_load_matrix_bf16(gguf, "lm_head.weight")?)
+    } else {
+        tie_lm_head_from_embed_tokens(&embed_tokens)
+    };
+
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for i in 0..config.num_hidden_layers {
+        let layer_prefix = format!("{prefix}.layers.{i}");
+        let attention = match arch.layer_types[i] {
+            MetalQwen35LayerType::FullAttention => {
+                let attn_prefix = format!("{layer_prefix}.self_attn");
+                MetalQwen35Attention::Full(MetalQwen35FullAttentionWeights {
+                    q_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                        gguf,
+                        &format!("{attn_prefix}.q_proj.weight"),
+                    )?),
+                    k_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                        gguf,
+                        &format!("{attn_prefix}.k_proj.weight"),
+                    )?),
+                    v_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                        gguf,
+                        &format!("{attn_prefix}.v_proj.weight"),
+                    )?),
+                    o_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                        gguf,
+                        &format!("{attn_prefix}.o_proj.weight"),
+                    )?),
+                    q_norm: gguf_load_direct_norm_vector(
+                        gguf,
+                        &format!("{attn_prefix}.q_norm.weight"),
+                    )?,
+                    k_norm: gguf_load_direct_norm_vector(
+                        gguf,
+                        &format!("{attn_prefix}.k_norm.weight"),
+                    )?,
+                })
+            }
+            MetalQwen35LayerType::LinearAttention => {
+                let attn_prefix = format!("{layer_prefix}.linear_attn");
+                let qkv_proj = dense_weight_from_matrix(&gguf_load_qwen35_qkv_matrix(
+                    gguf,
+                    &format!("{attn_prefix}.in_proj_qkv.weight"),
+                    num_k,
+                    num_v_per_k,
+                    key_head_dim,
+                    value_head_dim,
+                )?);
+                let z_proj = dense_weight_from_matrix(&gguf_load_v_reorder_rows_matrix(
+                    gguf,
+                    &format!("{attn_prefix}.in_proj_z.weight"),
+                    num_k,
+                    num_v_per_k,
+                    value_head_dim,
+                )?);
+                let beta_proj = dense_weight_from_matrix(&gguf_load_v_reorder_rows_matrix(
+                    gguf,
+                    &format!("{attn_prefix}.in_proj_b.weight"),
+                    num_k,
+                    num_v_per_k,
+                    1,
+                )?);
+                let alpha_proj = dense_weight_from_matrix(&gguf_load_v_reorder_rows_matrix(
+                    gguf,
+                    &format!("{attn_prefix}.in_proj_a.weight"),
+                    num_k,
+                    num_v_per_k,
+                    1,
+                )?);
+                let qkv_dim = qkv_proj.output_dim()?;
+                let z_dim = z_proj.output_dim()?;
+                let beta_dim = beta_proj.output_dim()?;
+                let in_proj_qkvz = concat_dense_weights(&qkv_proj, &z_proj)?;
+                let in_proj_ba = concat_dense_weights(&beta_proj, &alpha_proj)?;
+                let inv_scale = 1.0 / (arch.linear.key_dim as f32).sqrt();
+                MetalQwen35Attention::Linear(MetalLinearAttnWeights {
+                    in_proj_qkvz,
+                    in_proj_ba,
+                    in_proj_qkv: qkv_proj,
+                    in_proj_z: z_proj,
+                    in_proj_b: beta_proj,
+                    in_proj_a: alpha_proj,
+                    qkvz_split: (qkv_dim, z_dim),
+                    ba_num_heads: beta_dim,
+                    conv1d_weight: gguf_load_qwen35_conv1d(
+                        gguf,
+                        &format!("{attn_prefix}.conv1d.weight"),
+                        arch,
+                    )?,
+                    dt_bias: gguf_load_v_reorder_vector(
+                        gguf,
+                        &format!("{attn_prefix}.dt_bias"),
+                        num_k,
+                        num_v_per_k,
+                    )?,
+                    a_log: gguf_load_qwen35_a_log(
+                        gguf,
+                        &format!("{attn_prefix}.a_log"),
+                        num_k,
+                        num_v_per_k,
+                    )?,
+                    norm_weight: gguf_load_vector_bf16(
+                        gguf,
+                        &format!("{attn_prefix}.norm.weight"),
+                    )?,
+                    out_proj: dense_weight_from_matrix(&gguf_load_v_reorder_cols_matrix(
+                        gguf,
+                        &format!("{attn_prefix}.out_proj.weight"),
+                        num_k,
+                        num_v_per_k,
+                        value_head_dim,
+                    )?),
+                    q_scale: MlxArray::scalar_f32(inv_scale * inv_scale),
+                    k_scale: MlxArray::scalar_f32(inv_scale),
+                })
+            }
+        };
+
+        let gate_proj = dense_weight_from_matrix(&gguf_load_matrix_bf16(
+            gguf,
+            &format!("{layer_prefix}.mlp.gate_proj.weight"),
+        )?);
+        let up_proj = dense_weight_from_matrix(&gguf_load_matrix_bf16(
+            gguf,
+            &format!("{layer_prefix}.mlp.up_proj.weight"),
+        )?);
+        let mlp = MlpKind::Dense(MetalQwen35DenseMlpWeights {
+            inputs: MlpInputProjection::Split {
+                gate_proj: gate_proj.clone(),
+                up_proj: up_proj.clone(),
+            },
+            down_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                gguf,
+                &format!("{layer_prefix}.mlp.down_proj.weight"),
+            )?),
+            gate_proj,
+            up_proj,
+        });
+
+        layers.push(MetalQwen35BlockWeights {
+            input_layernorm: gguf_load_direct_norm_vector(
+                gguf,
+                &format!("{layer_prefix}.input_layernorm.weight"),
+            )?,
+            attention,
+            post_attention_layernorm: gguf_load_direct_norm_vector(
+                gguf,
+                &format!("{layer_prefix}.post_attention_layernorm.weight"),
+            )?,
+            mlp,
+        });
+    }
+
+    let mut weights = Qwen35MetalWeights {
+        embed_tokens,
+        layers,
+        norm,
+        lm_head,
+        embed_quantized: None,
+        cpp_model: None,
+    };
+
+    if std::env::var("METAL_NO_CPP").is_err() {
+        weights.cpp_model = CppQwen35Model::build(&weights, config, arch);
+    }
+
+    Ok(weights)
+}
+
 pub(super) fn load_qwen35_metal_weights(
     model_dir: &Path,
     config: &MetalModelConfig,
@@ -2270,6 +2678,22 @@ pub(super) fn load_qwen35_metal_weights(
 
     let get = |name: &str| tensor_get(&tensors, name);
     let load_proj = |base: &str| load_proj_from_tensors(&tensors, base, config.quantization);
+    let norms_need_offset_correction = {
+        let sample = get(&format!("{prefix}.layers.0.input_layernorm.weight"))?;
+        qwen35_norm_needs_offset_correction(&sample)
+    };
+    if norms_need_offset_correction {
+        log::info!(
+            "  Qwen3.5 safetensors use HF offset RMSNorm weights — normalizing to direct form at load"
+        );
+    }
+    let load_norm = |name: &str| -> Result<MlxArray> {
+        let weight = get(name)?;
+        Ok(qwen35_normalize_direct_norm_weight(
+            &weight,
+            norms_need_offset_correction,
+        ))
+    };
 
     let embed_base = format!("{prefix}.embed_tokens");
     let embed_tokens = load_embed_tokens_from_tensors(&tensors, &embed_base, config.quantization)?;
@@ -2279,7 +2703,7 @@ pub(super) fn load_qwen35_metal_weights(
     } else {
         None
     };
-    let norm = get(&format!("{prefix}.norm.weight"))?;
+    let norm = load_norm(&format!("{prefix}.norm.weight"))?;
     let lm_head = load_lm_head(
         &tensors,
         &[
@@ -2311,8 +2735,8 @@ pub(super) fn load_qwen35_metal_weights(
                     k_proj: load_proj(&format!("{attn_prefix}.k_proj"))?,
                     v_proj: load_proj(&format!("{attn_prefix}.v_proj"))?,
                     o_proj: load_proj(&format!("{attn_prefix}.o_proj"))?,
-                    q_norm: get(&format!("{attn_prefix}.q_norm.weight"))?,
-                    k_norm: get(&format!("{attn_prefix}.k_norm.weight"))?,
+                    q_norm: load_norm(&format!("{attn_prefix}.q_norm.weight"))?,
+                    k_norm: load_norm(&format!("{attn_prefix}.k_norm.weight"))?,
                 })
             }
             MetalQwen35LayerType::LinearAttention => {
@@ -2415,9 +2839,9 @@ pub(super) fn load_qwen35_metal_weights(
         };
 
         layers.push(MetalQwen35BlockWeights {
-            input_layernorm: get(&format!("{layer_prefix}.input_layernorm.weight"))?,
+            input_layernorm: load_norm(&format!("{layer_prefix}.input_layernorm.weight"))?,
             attention,
-            post_attention_layernorm: get(&format!(
+            post_attention_layernorm: load_norm(&format!(
                 "{layer_prefix}.post_attention_layernorm.weight"
             ))?,
             mlp,
@@ -2538,13 +2962,16 @@ fn load_conv1d_weight(
     weight: &MlxArray,
     linear_cfg: &super::gdr::MetalGdrConfig,
 ) -> Result<MlxArray> {
+    use super::mlx::transpose_axes;
+
     let c = linear_cfg.qkv_dim() as i32;
     let k = linear_cfg.conv_kernel as i32;
     match weight.shape() {
         // Already [C, K, 1] — nn.Conv1d format
         [ch, ks, 1] if *ch == c && *ks == k => Ok(weight.clone()),
-        // [C, 1, K] — transpose to [C, K, 1]
-        [ch, 1, ks] if *ch == c && *ks == k => Ok(reshape(weight, &[c, k, 1])),
+        // HF safetensors store Conv1d kernels in PyTorch layout [C, 1, K].
+        // This must be a real axis swap, not a reshape, or the time axis is scrambled.
+        [ch, 1, ks] if *ch == c && *ks == k => Ok(transpose_axes(weight, &[0, 2, 1])),
         // [C, K] — reshape to [C, K, 1]
         [ch, ks] if *ch == c && *ks == k => Ok(reshape(weight, &[c, k, 1])),
         shape => anyhow::bail!(
@@ -2564,7 +2991,7 @@ mod tests {
     use crate::backend::metal::{
         config::load_metal_config,
         gdr::MetalRecurrentState,
-        mlx::{Dtype, as_dtype, concatenate_axis, eval, slice, slice_update, zeros},
+        mlx::{Dtype, as_dtype, concatenate_axis, eval, reshape, slice, slice_update, zeros},
         weights::load_qwen3_metal_weights,
     };
     use crate::test_support::metal_test_guard;
@@ -2877,6 +3304,143 @@ mod tests {
                     "layer {layer_idx} v[{idx}] mismatch: cpp={lhs} session={rhs}"
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_conv1d_weight_transposes_pytorch_depthwise_layout() -> Result<()> {
+        let _guard = metal_test_guard();
+
+        let cfg = crate::backend::metal::gdr::MetalGdrConfig {
+            num_key_heads: 1,
+            key_dim: 1,
+            num_value_heads: 1,
+            value_dim: 2,
+            conv_kernel: 4,
+            hidden_size: 1,
+            rms_norm_eps: 1e-6,
+        };
+
+        let raw = MlxArray::from_slice_f32(
+            &[
+                1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0, 1000.0,
+                2000.0, 3000.0, 4000.0,
+            ],
+            &[4, 1, 4],
+        );
+        let weight = load_conv1d_weight(&raw, &cfg)?;
+        let weight_f32 = as_dtype(&weight, Dtype::Float32);
+        eval(&[&weight_f32]);
+
+        assert_eq!(weight_f32.shape(), &[4, 4, 1]);
+        assert_eq!(
+            weight_f32.as_slice_f32(),
+            &[
+                1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0, 1000.0,
+                2000.0, 3000.0, 4000.0,
+            ]
+        );
+
+        let reshaped = reshape(&weight_f32, &[4, 4]);
+        eval(&[&reshaped]);
+        assert_eq!(
+            reshaped.as_slice_f32(),
+            &[
+                1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0, 1000.0,
+                2000.0, 3000.0, 4000.0,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "debug helper for local Metal Qwen3.5 layer norm inspection"]
+    fn debug_qwen35_single_token_hidden_norms() -> Result<()> {
+        let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
+            eprintln!("QWEN35_MODEL_PATH unset; skipping debug_qwen35_single_token_hidden_norms");
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let weights = load_qwen35_metal_weights(&model_path, &config)?;
+        let num_full_layers = arch.num_full_attention_layers();
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            8,
+            config.head_dim as i32,
+        ];
+        let mut k_caches: Vec<MlxArray> = (0..num_full_layers)
+            .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+            .collect();
+        let mut v_caches: Vec<MlxArray> = (0..num_full_layers)
+            .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+            .collect();
+        let mut recurrent =
+            MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+        let target_layers: Vec<usize> = (0..config.num_hidden_layers).collect();
+        let input_ids: Vec<u32> = env::var("QWEN35_DEBUG_IDS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|part| {
+                        let trimmed = part.trim();
+                        (!trimmed.is_empty())
+                            .then(|| trimmed.parse::<u32>().ok())
+                            .flatten()
+                    })
+                    .collect()
+            })
+            .filter(|ids: &Vec<u32>| !ids.is_empty())
+            .unwrap_or_else(|| vec![9419]);
+
+        let (logits, hidden) = qwen35_forward_with_hidden_states(
+            &input_ids,
+            &weights,
+            &config,
+            arch,
+            &mut k_caches,
+            &mut v_caches,
+            &mut recurrent,
+            0,
+            &target_layers,
+        );
+        let logits = as_dtype(&logits, Dtype::Float32);
+        let hidden = as_dtype(&hidden, Dtype::Float32);
+        eval(&[&logits, &hidden]);
+
+        let sampled = gpu_sample_token(
+            &logits,
+            &crate::sampler::SamplingParams {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        );
+        eval(&[&sampled]);
+        eprintln!(
+            "input_ids={input_ids:?} sampled token={}",
+            sampled.item_i32()
+        );
+
+        let hidden_slice = hidden.as_slice_f32();
+        let row_stride = config.num_hidden_layers * config.hidden_size;
+        let last_row_start = (input_ids.len() - 1) * row_stride;
+        for layer_idx in 0..config.num_hidden_layers {
+            let start = last_row_start + layer_idx * config.hidden_size;
+            let end = start + config.hidden_size;
+            let norm = hidden_slice[start..end]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
+            eprintln!("layer {layer_idx:02} norm={norm:.6}");
         }
 
         Ok(())

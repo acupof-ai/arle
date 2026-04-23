@@ -1,7 +1,7 @@
 //! GPU sampling ops: argmax, top-k, nucleus, temperature, penalties.
 //!
 //! Two sampling paths:
-//!   - **Greedy** (`argmax_batch_launch`): single kernel, batched across requests
+//!   - **Greedy** (`argmax_batch_logprob_launch`): single kernel, batched across requests
 //!   - **Full** (`gpu_sample_launch`): softmax + top-k filter + multinomial via
 //!     parallel prefix sum (Blelloch scan)
 //!
@@ -47,29 +47,6 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
         .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
 
     Ok(result[0] as u32)
-}
-
-/// Launch batched argmax on a HiddenStates [B, vocab] buffer. No sync, no readback.
-pub(crate) fn argmax_batch_launch(
-    ctx: &DeviceContext,
-    logits: &HiddenStates,
-    out: &mut CudaSlice<i32>,
-    batch_size: usize,
-) -> Result<()> {
-    let vocab_size = logits.hidden_dim;
-    let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::argmax_batch_cuda(
-            l_ptr as *const ffi::Half,
-            o_ptr as *mut i32,
-            batch_size as i32,
-            vocab_size as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
 }
 
 /// Batched argmax + logprob launch (no sync). Returns token IDs + logprobs.

@@ -105,7 +105,6 @@ Metal 这条线现在要把“量化 KV 是否需要做”说清楚，不再和 
 
 后续扩展优先级：
 
-1. GLM-4
-2. Gemma 4 text path
+1. Gemma 4 text path
 
 Llama 不在这条近期路线的优先级里。

@@ -38,8 +38,7 @@ scripts/bench_guidellm.sh post-route-a-cuda
   trait, `LoadedInferenceEngine` enum (CUDA + Metal + CPU variants),
   `CompletionRequest`, `CompletionOutput`, `TokenUsage`,
   `CompletionStreamDelta`, `ModelInferenceEngine<M>`, and the
-  `Qwen3InferenceEngine` / `Qwen35InferenceEngine` / `GLM4InferenceEngine`
-  aliases.
+  `Qwen3InferenceEngine` / `Qwen35InferenceEngine` aliases.
 - `Cargo.toml` workspace members do not list `infer-core`, `infer-engine`,
   `infer-observability`, or `infer-policy`.
 - `crates/` contains `agent`, `chat`, `cli`,

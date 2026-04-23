@@ -72,7 +72,7 @@ impl Qwen3Model {
         let ctx = DeviceContext::new()?;
 
         // Try GGUF first — if found, use dequant-at-load path
-        if let Some(gguf) = crate::weight_loader::try_open_gguf(model_path) {
+        if let Some(gguf) = crate::gguf::try_open(model_path) {
             info!("Loading from GGUF: {} tensors", gguf.tensors.len());
             // Config: prefer config.json, fallback to GGUF metadata
             let config = Config::from_file(model_path).or_else(|_| -> Result<Config> {

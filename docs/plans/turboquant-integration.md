@@ -371,7 +371,7 @@ compression where per-token error doesn't accumulate across layers.
 
 1. ✅ **Fused kernel**: `tq_decode_attention_cuda` — score from packed K, no dequant
 2. ✅ **Q rotation**: `tq_rotate_query_cuda` — sign flip + FWHT per-layer
-3. ✅ **Wired into all 3 models**: Qwen3, Qwen3.5, GLM4
+3. ✅ **Wired into both supported models**: Qwen3, Qwen3.5
 
 ---
 

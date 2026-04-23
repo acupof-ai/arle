@@ -60,7 +60,7 @@ For the greedy fast path, the concrete boundary is inside
   `infer/src/model/qwen35/forward.rs` call
   `argmax_batch_logprob_launch(...)`, then `self.ctx.sync()?`, then
   `argmax_batch_readback_into(...)`, then D2H-copy logprobs.
-- `infer/src/model/glm4/forward.rs` does the same pattern with
+- `infer/src/model/qwen3/forward.rs` shows the same pattern with
   `argmax_batch_launch(...)`, then `self.ctx.sync()?`, then
   `argmax_batch_readback_into(...)`.
 
@@ -151,7 +151,7 @@ Minimum shape for a real overlap implementation:
 - The split point is after forward launch and before token/logprob
   readback, not merely before `plan_attention(...)` or after sampling is
   already complete.
-- Greedy fast paths for Qwen3, Qwen3.5, and GLM4 preserve current output
+- Greedy fast paths for Qwen3 and Qwen3.5 preserve current output
   parity and logprob behavior.
 - Non-greedy / fallback sampling still works correctly with the new
   phase structure.

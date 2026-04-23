@@ -20,8 +20,8 @@ cross-slot page aliasing.
 - Made `step_new()` consume that metadata and reuse the matched prefix via
   safe same-slot resurrection. Exact-hit replay, partial-hit truncation,
   and prompt-prefix-of-cached fallback all remain model-aware.
-- Added `GenerationState::prefetch_kv_to_gpu()` and wired it for Qwen3,
-  Qwen3.5, and GLM4 so any CPU-offloaded contiguous KV is back on GPU
+- Added `GenerationState::prefetch_kv_to_gpu()` and wired it for Qwen3
+  and Qwen3.5 so any CPU-offloaded contiguous KV is back on GPU
   before prefix reuse touches it.
 - Aligned the deprecated single-request engine in `server_engine.rs` with
   the same correctness rules: prefetch before reuse, save a prompt snapshot

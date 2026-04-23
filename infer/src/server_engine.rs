@@ -31,7 +31,7 @@ use crate::backend::runtime::StopChunkProcessor;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::{InferenceBackend, StreamStopMatched, StreamingInferenceBackend};
 #[cfg(feature = "cuda")]
-use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
+use crate::model::{GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 #[cfg(any(feature = "metal", test))]
 use crate::request_handle::RequestHandle;
 use crate::sampler::SamplingParams;
@@ -884,8 +884,6 @@ impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
 pub type Qwen3InferenceEngine = ModelInferenceEngine<Qwen3Model>;
 #[cfg(feature = "cuda")]
 pub type Qwen35InferenceEngine = ModelInferenceEngine<Qwen35Model>;
-#[cfg(feature = "cuda")]
-pub type GLM4InferenceEngine = ModelInferenceEngine<GLM4Model>;
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
 pub struct BackendInferenceEngine<B: InferenceBackend> {
@@ -1184,8 +1182,6 @@ pub enum LoadedInferenceEngine {
     /// stub under CUDA; the Metal path does not route through here.
     #[cfg(feature = "cuda")]
     Qwen35Moe(Qwen35InferenceEngine),
-    #[cfg(feature = "cuda")]
-    GLM4(GLM4InferenceEngine),
     #[cfg(feature = "metal")]
     Metal(RequestHandleInferenceEngine<MetalSchedulerHandle>),
     #[cfg(feature = "cpu")]
@@ -1226,27 +1222,6 @@ impl Qwen35InferenceEngine {
     ) -> Result<Self> {
         let components =
             crate::backend::cuda::bootstrap::load_qwen35_components(model_path, options)?;
-        Self::from_model_components(components, seed)
-    }
-
-    pub fn vocab_size(&self) -> usize {
-        self.tokenizer.vocab_size()
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl GLM4InferenceEngine {
-    pub fn load(model_path: &str, seed: u64) -> Result<Self> {
-        Self::load_with_options(model_path, seed, InferenceEngineOptions::default())
-    }
-
-    pub fn load_with_options(
-        model_path: &str,
-        seed: u64,
-        options: InferenceEngineOptions,
-    ) -> Result<Self> {
-        let components =
-            crate::backend::cuda::bootstrap::load_glm4_components(model_path, options)?;
         Self::from_model_components(components, seed)
     }
 
@@ -1308,16 +1283,13 @@ impl LoadedInferenceEngine {
                     Qwen35InferenceEngine::from_model_components(components, seed)?,
                 ))
             }
-            ModelType::GLM4 => Ok(Self::GLM4(GLM4InferenceEngine::load_with_options(
-                model_path, seed, options,
-            )?)),
         }
     }
 
     pub fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen35Moe(_) | Self::GLM4(_) => "cuda",
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen35Moe(_) => "cuda",
             #[cfg(feature = "metal")]
             Self::Metal(_) => "metal",
             #[cfg(feature = "cpu")]
@@ -1331,7 +1303,6 @@ impl LoadedInferenceEngine {
             Self::Qwen3(_) => ModelType::Qwen3,
             Self::Qwen35(_) => ModelType::Qwen35,
             Self::Qwen35Moe(_) => ModelType::Qwen35Moe,
-            Self::GLM4(_) => ModelType::GLM4,
             #[cfg(feature = "metal")]
             Self::Metal(_) => unreachable!("model_type is only defined for CUDA engines"),
             #[cfg(feature = "cpu")]
@@ -1350,8 +1321,6 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.model_id(),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.model_id(),
-            #[cfg(feature = "cuda")]
-            Self::GLM4(engine) => engine.model_id(),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.model_id(),
             #[cfg(feature = "cpu")]
@@ -1367,8 +1336,6 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.complete(req),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.complete(req),
-            #[cfg(feature = "cuda")]
-            Self::GLM4(engine) => engine.complete(req),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete(req),
             #[cfg(feature = "cpu")]
@@ -1388,8 +1355,6 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.complete_stream(req, tx),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.complete_stream(req, tx),
-            #[cfg(feature = "cuda")]
-            Self::GLM4(engine) => engine.complete_stream(req, tx),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete_stream(req, tx),
             #[cfg(feature = "cpu")]

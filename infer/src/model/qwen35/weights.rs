@@ -100,7 +100,7 @@ impl Qwen35Model {
         );
 
         // Try GGUF first
-        if let Some(gguf) = crate::weight_loader::try_open_gguf(model_path) {
+        if let Some(gguf) = crate::gguf::try_open(model_path) {
             info!("Loading Qwen3.5 from GGUF: {} tensors", gguf.tensors.len());
             return Self::from_gguf(&ctx, &config, &gguf, enable_cuda_graph);
         }
@@ -438,11 +438,11 @@ impl Qwen35Model {
         gguf: &crate::gguf::GgufFile,
         enable_cuda_graph: bool,
     ) -> Result<Self> {
+        use crate::gguf::{find_tensor_name, reverse_v_reorder_f32, reverse_v_reorder_rows};
         use crate::weight_loader::{
             load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_v_reorder, load_tensor_2d_gguf,
             load_tensor_2d_gguf_bf16, load_tensor_2d_gguf_v_reorder_cols,
-            load_tensor_2d_gguf_v_reorder_rows, precompute_rope, reverse_v_reorder_f32,
-            reverse_v_reorder_rows,
+            load_tensor_2d_gguf_v_reorder_rows, precompute_rope,
         };
 
         // SSM V-head reorder config (from llama.cpp _reorder_v_heads)
@@ -501,10 +501,8 @@ impl Qwen35Model {
                             let q_rows = num_k * hd_k;
                             let k_rows = num_k * hd_k;
                             let v_rows = num_v * hd_v;
-                            let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
-                                gguf,
-                                &format!("{ap}.in_proj_qkv.weight"),
-                            )?;
+                            let gguf_name =
+                                find_tensor_name(gguf, &format!("{ap}.in_proj_qkv.weight"))?;
                             let info = &gguf.tensors[&gguf_name];
                             let mut data = gguf.read_tensor_bf16(&gguf_name)?;
                             let cols = info.shape[0] as usize;
@@ -550,10 +548,7 @@ impl Qwen35Model {
                         // conv1d: [qkv_channels=8192, kernel=4], reorder only V rows.
                         // Each channel has kernel_dim consecutive weights.
                         conv1d_weight: {
-                            let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
-                                gguf,
-                                &format!("{ap}.conv1d.weight"),
-                            )?;
+                            let gguf_name = find_tensor_name(gguf, &format!("{ap}.conv1d.weight"))?;
                             let mut data = gguf.read_tensor_bf16(&gguf_name)?;
                             let kernel_dim = config.linear_conv_kernel_dim;
                             let qk_channels = hd_k * num_k * 2;
@@ -593,26 +588,8 @@ impl Qwen35Model {
                             // every forward step produce garbage generation on any model
                             // that exercises this GGUF path (Qwen3.5-4B passed the e2e test
                             // only because it loads via safetensors, not via this branch).
-                            let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
-                                gguf,
-                                &format!("{ap}.a_log"),
-                            )?;
-                            let raw = gguf.read_tensor_raw(&gguf_name)?;
-                            let info = &gguf.tensors[&gguf_name];
-                            let raw_f32: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
-                                unsafe {
-                                    std::slice::from_raw_parts(
-                                        raw.as_ptr().cast::<f32>(),
-                                        info.numel(),
-                                    )
-                                }
-                                .to_vec()
-                            } else {
-                                gguf.read_tensor_bf16(&gguf_name)?
-                                    .iter()
-                                    .map(|v| v.to_f32())
-                                    .collect()
-                            };
+                            let gguf_name = find_tensor_name(gguf, &format!("{ap}.a_log"))?;
+                            let raw_f32 = gguf.read_tensor_f32(&gguf_name)?;
                             // A → A_log = log(|A|)  (matches llama.cpp convention)
                             let mut a_log: Vec<f32> = raw_f32
                                 .iter()
@@ -626,26 +603,8 @@ impl Qwen35Model {
                             ctx.stream.clone_htod(&a_log)?
                         },
                         norm_weight: {
-                            let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
-                                gguf,
-                                &format!("{ap}.norm.weight"),
-                            )?;
-                            let raw = gguf.read_tensor_raw(&gguf_name)?;
-                            let info = &gguf.tensors[&gguf_name];
-                            let f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
-                                unsafe {
-                                    std::slice::from_raw_parts(
-                                        raw.as_ptr().cast::<f32>(),
-                                        info.numel(),
-                                    )
-                                }
-                                .to_vec()
-                            } else {
-                                gguf.read_tensor_bf16(&gguf_name)?
-                                    .iter()
-                                    .map(|v| v.to_f32())
-                                    .collect()
-                            };
+                            let gguf_name = find_tensor_name(gguf, &format!("{ap}.norm.weight"))?;
+                            let f32s = gguf.read_tensor_f32(&gguf_name)?;
                             // SSM norm does NOT have +1 offset in GGUF
                             // (verified: GGUF[0]=0.884 == HF[0]=0.884).
                             // Only RMSNorm layer norms have the offset.

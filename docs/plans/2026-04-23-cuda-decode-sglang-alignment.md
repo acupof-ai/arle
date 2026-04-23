@@ -35,7 +35,7 @@ git -C /tmp/sglang rev-parse HEAD
 1. 一个 scheduler tick 只产出一个执行批次，而不是同一 tick 里分开 launch `prefill` 和 `decode`。
 2. `mixed-chunk` 在 CUDA 上是真正的一次 mixed forward，而不是“同一轮先 prefill、再 decode”的双 launch 近似。
 3. decode metadata、attention planning、graph input buffer 的 ownership 落在 execution/backend 边界，而不是散落在 scheduler 显式时序里。
-4. `Qwen3`、`Qwen3.5`、`GLM4` 共享同一个 scheduler entry contract，且 model-specific 特化不再主导 canonical decode hotpath 的差异判断。
+4. `Qwen3`、`Qwen3.5` 共享同一个 scheduler entry contract，且 model-specific 特化不再主导 canonical decode hotpath 的差异判断。
 5. 剩余差异是刻意保留且有 bench/traces 支撑的实现差异，不是历史路径残留。
 
 ## 当前审计结论
@@ -153,11 +153,10 @@ rg -n "update_mixed_batch\\(" infer/src crates/cuda-kernels/src
   `:559-630` 的 graph capture 只覆盖 linear groups；
   `:517-522` 还明确注释 full attention eager 的原因是 FlashInfer metadata changes。
 - SGLang observation:
-  本地 `Qwen3`、`Qwen3.5`、`GLM4` 其实已经共享同一个 `ModelForward::forward_decode_batch(...)` 入口：
+  本地 `Qwen3`、`Qwen3.5` 其实已经共享同一个 `ModelForward::forward_decode_batch(...)` 入口：
   [`model.rs:L188-L197`](../../infer/src/model.rs#L188-L197)、
   [`qwen3/forward.rs:L503-L510`](../../infer/src/model/qwen3/forward.rs#L503-L510)、
-  [`qwen35/forward.rs:L426-L433`](../../infer/src/model/qwen35/forward.rs#L426-L433)、
-  [`glm4/forward.rs:L332-L339`](../../infer/src/model/glm4/forward.rs#L332-L339)。
+  [`qwen35/forward.rs:L426-L433`](../../infer/src/model/qwen35/forward.rs#L426-L433)。
   SGLang 的审计路径同样通过统一的 `ForwardBatch` 入口进入 model/runner/backend。
 - Judgment:
   更准确的结论是：`Qwen3.5` 的差异目前体现在 model-internal decode hotpath，而不是 scheduler-visible contract leak。  
@@ -190,7 +189,7 @@ rg -n "update_mixed_batch\\(" infer/src crates/cuda-kernels/src
 1. scheduler 每轮只 lower 一次，输出一个 `ForwardBatch`。
 2. mixed batch 在 CUDA 上只有一个 canonical path，并且是一次真实 forward。
 3. scheduler 只表达“这轮要跑什么 batch”，不再手写 metadata / graph / attention planning 的时序细节。
-4. `Qwen3`、`Qwen3.5`、`GLM4` 保持同一 scheduler entry contract，同时 `Qwen3.5` 的 model-internal decode 特例不再主导 hotpath 结论。
+4. `Qwen3`、`Qwen3.5` 保持同一 scheduler entry contract，同时 `Qwen3.5` 的 model-internal decode 特例不再主导 hotpath 结论。
 5. 如果保留 native `PagedKVPool` 而不照搬 SGLang pool types，这个差异被明确记录为“实现差异”，不是“未对齐”。
 
 ## 最小可交付 patch 集
@@ -234,7 +233,6 @@ rg -n "update_mixed_batch\\(" infer/src crates/cuda-kernels/src
 
 - `crates/cuda-kernels/src/flashinfer.rs`
 - `infer/src/model/qwen3/batch_decode.rs`
-- `infer/src/model/glm4/batch_decode.rs`
 - `infer/src/scheduler/cuda/execution.rs`
 
 验收：
@@ -257,7 +255,6 @@ rg -n "update_mixed_batch\\(" infer/src crates/cuda-kernels/src
 - `infer/src/model.rs`
 - `infer/src/model/qwen3/forward.rs`
 - `infer/src/model/qwen35/forward.rs`
-- `infer/src/model/glm4/forward.rs`
 - `crates/cuda-kernels/src/flashinfer.rs`
 - `infer/src/scheduler/cuda/decode.rs`
 
@@ -272,7 +269,7 @@ Qwen3.5 可以继续保留内部 hybrid 复杂度，但 piecewise graph + eager 
 
 交付物：
 
-- 保持 `Qwen3.5` 继续消费和 `Qwen3` / `GLM4` 相同的 decode 入口
+- 保持 `Qwen3.5` 继续消费和 `Qwen3` 相同的 decode 入口
 - piecewise graph 细节继续留在 model 内部，但不再作为 decode hotpath 的主要差异来源
 - 如需分两步，先收敛 full-attn metadata / graph 策略，再看是否进一步统一 capture/replay 形态
 

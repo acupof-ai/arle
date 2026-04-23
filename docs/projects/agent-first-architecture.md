@@ -261,8 +261,8 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **What**: A slow-path model loader that can serve any HF architecture
   by composing existing `ops::{linear, norm, attention, embedding}` with
   a config-driven layer graph. No new CUDA kernels required per model.
-- **Why**: `model_registry::is_implemented` covers 3 architectures
-  (`Qwen3 | Qwen35 | GLM4`). Agent ecosystem demands Llama / Mistral /
+- **Why**: `model_registry::is_implemented` covers 2 architectures
+  (`Qwen3 | Qwen35`). Agent ecosystem demands Llama / Mistral /
   Gemma / Phi / DeepSeek. The fast path stays specialized; the slow path
   is the on-ramp.
 - **Where**:

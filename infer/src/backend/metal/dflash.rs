@@ -850,7 +850,7 @@ impl DFlashDraftCppModel {
         if rc != 0 {
             return Err(super::mlx::check_mlx_error().unwrap_err());
         }
-        for (slot, ptr) in kv_flat.iter_mut().zip(out_kv.into_iter()) {
+        for (slot, ptr) in kv_flat.iter_mut().zip(out_kv) {
             let old = std::mem::replace(slot, unsafe { MlxArray::from_raw(ptr) });
             drop(old);
         }

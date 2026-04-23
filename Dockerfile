@@ -2,7 +2,7 @@
 # agent-infer: multi-stage Docker build
 # ============================================================================
 # Build:  docker build -t agent-infer .
-# Run:    docker run --gpus all -v /path/to/model:/model agent-infer --model-path /model
+# Run:    docker run --gpus all -v /path/to/model:/model ghcr.io/cklxx/agent-infer:latest --model-path /model
 # ============================================================================
 
 # --- Stage 1: Build ---
@@ -24,7 +24,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 RUN python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir flashinfer-python==0.6.3 triton==3.5.1
 
-ENV PEGAINFER_TRITON_PYTHON=/opt/venv/bin/python3
+ENV INFER_TRITON_PYTHON=/opt/venv/bin/python3
 ENV CUDA_HOME=/usr/local/cuda
 
 WORKDIR /build
@@ -39,11 +39,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/infer /usr/local/bin/agent-infer
+COPY --from=builder /build/target/release/infer /usr/local/bin/infer
+RUN ln -s /usr/local/bin/infer /usr/local/bin/agent-infer
 
 ENV LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64
 
 EXPOSE 8000
 
-ENTRYPOINT ["agent-infer"]
+ENTRYPOINT ["infer"]
 CMD ["--port", "8000", "--num-slots", "4", "--cuda-graph", "true"]

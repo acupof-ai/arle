@@ -1,8 +1,29 @@
 # Doc index
 
-Last refreshed: 2026-04-21. Phase 6 Agent RL 训推一体 through 2026-04-21: M0/M1 autograd, M2b Qwen-family LoRA training, and M4.1–M4.8 agent infra are landed locally. M5.1 + M5.2 route (b) are locked, and M5.3 is no longer "Metal matmul only": the current local Metal train path already includes the device-resident / lazy-eval tranche plus the active training-critical ops (matmul, sum, log_softmax, rope, rmsnorm, embedding, gather_last_dim, mean, sigmoid, mul, add_broadcast, and AdamW-on-device). Current train-side truth is a generic Qwen-family control plane with Qwen3.5 as the optimized default: the canonical scratch-pretrain entrypoint is `pretrain`; `train_sft` and `train_grpo` dispatch across Qwen3/Qwen3.5 families; both active RL entrypoints (`train_grpo`, `train_multi_turn`) support exact checkpoint/resume; `train_multi_turn` exposes stepwise GRPO and sequence-level GSPO objectives; all active train binaries (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) expose the same train-side `/v1/train/status|events|stop|save` control surface via `--serve`; `eval_lm` evaluates Qwen3/Qwen3.5 checkpoint dirs directly on tokenized or chat JSONL; and shared async observability now includes lifecycle/artifact events, bounded async backpressure handling, `dropped_metrics` status reporting, MLflow metrics + checkpoint artifact export, OTLP log export over HTTP for vendor-neutral collectors, and an optional W&B sidecar adapter that uses the official SDK in offline-first mode. Train-side remote CUDA acceptance is now closed across all four active binaries. Mac-local Metal LoRA validation is closed on the dense/full-attn Qwen3.5 path (`pretrain -> train_sft --backend metal -> eval_lm -> resume` on `Apple M4 Pro`, LoRA rank=8). Hybrid linear-attn Qwen3.5 is now accepted on the full local train-side CPU + Metal path for scratch pretrain, `train_grpo`, and `train_multi_turn`; `train_sft` and `eval_lm` already covered the LoRA/frozen-eval side, and the CUDA compile surface is checked. `infer` also now exposes an optional unified `/v1/train/*` bridge via `--train-control-url`, forwarding to the train-side server instead of duplicating trainer control logic. The remaining active gaps are broader train CLI normalization, CUDA hybrid runtime acceptance, and infer-side benchmark/acceptance closure. 2026-04-20 also opens the project constitution / SSOT / boundary-tightening refactor as an active cross-cutting plan.
+This page is the maintainer-facing PARA index for ARLE. It is not the public
+project landing page.
 
-PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
+Public / canonical entry points:
+
+- [../README.md](../README.md) — public overview, install, CLI, architecture
+- [../README.zh-CN.md](../README.zh-CN.md) — 中文公共入口
+- [http-api.md](http-api.md) — HTTP contract and streaming behavior
+- [support-matrix.md](support-matrix.md) — backend / model / quant support
+- [../CONTRIBUTING.md](../CONTRIBUTING.md) — contributor workflow
+- [../CHANGELOG.md](../CHANGELOG.md) — release history
+
+Last refreshed: 2026-04-23. Current maintainer snapshot: Phase 6 agent
+train/infer unification is landed locally through the active autograd, train,
+and agent tranches; the main open cross-cutting work is infer-side benchmark
+closure plus the constitution / SSOT / release cleanup plan opened on
+2026-04-20.
+
+PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design +
+execution) · **Research** (feasibility studies) · **Reviews** (standalone
+audits) · **Resources** (references) · **Areas** (long-running concerns) ·
+**Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`)
+are listed at the bottom in reverse chronological order; the latest 3 of each
+are always-loaded per `AGENTS.md`.
 
 | Path | Status | TL;DR |
 | --- | --- | --- |

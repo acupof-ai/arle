@@ -55,7 +55,6 @@ rg -n "OFFLOAD_BLOCK_SIZE|prefetch_kv_to_gpu|offload_kv_if_needed|prefetch_to_gp
   infer/src/model/kv_cache.rs \
   infer/src/model/qwen3/forward.rs \
   infer/src/model/qwen35/forward.rs \
-  infer/src/model/glm4/forward.rs \
   infer/src/scheduler/cuda/prefill.rs \
   infer/src/scheduler/cuda/runtime.rs \
   infer/src/server_engine.rs

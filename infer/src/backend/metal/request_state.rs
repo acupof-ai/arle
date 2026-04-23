@@ -2035,11 +2035,7 @@ fn decode_qwen35_packed_batch<'a>(
     };
 
     let mut sampled_tokens_out = Vec::with_capacity(states.len());
-    for (row_idx, (state, token)) in states
-        .iter_mut()
-        .zip(sampled_tokens.into_iter())
-        .enumerate()
-    {
+    for (row_idx, (state, token)) in states.iter_mut().zip(sampled_tokens).enumerate() {
         // Each row's own logical length = batch_cursor - its own pad, so a
         // row that joined late stays at its shorter length.
         state.driver.cache_len = batch.batch_cache_len - batch.left_padding[row_idx];
@@ -2304,7 +2300,7 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
     // ── 5. Reinstall draft states before bailing on error (even on failure
     //      the kernel mutates them in place and the caller's State should
     //      reflect whatever the kernel left behind). ──
-    for (state, draft) in states.iter_mut().zip(draft_states.into_iter()) {
+    for (state, draft) in states.iter_mut().zip(draft_states) {
         let dflash_state = state.driver.dflash.as_mut().expect("validated above");
         dflash_state.draft_state = draft;
     }
@@ -2340,7 +2336,7 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
     // ── 7. Per-row scheduler state: cache_len advance + token_buffer fan-out +
     //      updated_target_hidden + acceptance metrics + record first token. ──
     let mut sampled_first_tokens: Vec<u32> = Vec::with_capacity(states.len());
-    for (row_idx, (state, block)) in states.iter_mut().zip(block_results.into_iter()).enumerate() {
+    for (row_idx, (state, block)) in states.iter_mut().zip(block_results).enumerate() {
         ensure!(
             !block.accepted_tokens.is_empty(),
             "DFlash batched block row {row_idx} produced zero accepted tokens"

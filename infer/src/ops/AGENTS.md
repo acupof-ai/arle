@@ -18,7 +18,7 @@ ops/attention.rs      — prefill (FlashInfer HD128/HD256) + decode (Triton AOT 
 ops/linear.rs         — gemm, gemv, fused_mlp
 ops/norm.rs           — rms_norm, fused_add_rms_norm (batched + offset variants)
 ops/embedding.rs      — embedding_batch, embedding_decode_into
-ops/elementwise.rs    — add_batch, silu_mul_batch, split_qkv_batch
+ops/elementwise.rs    — add_batch, silu_mul_batch, extract_vec
 ops/kv_ops.rs         — scatter_write_kv
 ops/recurrent.rs      — gated_delta_rule_prefill_chunkwise + decode (Qwen3.5 linear attention)
 ops/sampling.rs       — argmax, argmax_with_logprob, gpu_sample
@@ -68,7 +68,7 @@ there's an existing caller that can't hold the buffer.
    custom split-KV kernel with FP32 cast. The selector is `KVFormat`, not
    the model — adding a fourth format means a fourth path.
 6. **Prefill dispatches on head dim:** HD128 → `flashinfer_batch_forward_with_layout`,
-   HD256 → `flashinfer_batch_forward_hd256`. Qwen3/GLM4 = HD128;
+   HD256 → `flashinfer_batch_forward_hd256`. Qwen3 = HD128;
    Qwen3.5 full-attention = HD256.
 7. **Single-token decode** uses the Triton AOT kernel that fuses QK-norm +
    RoPE + split-KV attention + online softmax + merge in one launch. Don't

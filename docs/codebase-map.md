@@ -157,7 +157,7 @@ Key files:
 
 ### Runtime entry, serving, and wiring
 
-- `infer/src/server_engine.rs`: unified `InferenceEngine` trait, `CompletionRequest`/`CompletionOutput`/`TokenUsage`/`CompletionStreamDelta` types, CUDA generation loop, and the `LoadedInferenceEngine` enum that dispatches to Qwen3/Qwen35/GLM4 (CUDA), `BackendInferenceEngine<MetalBackend>` (Metal), or `BackendInferenceEngine<CpuBackend>` (CPU)
+- `infer/src/server_engine.rs`: unified `InferenceEngine` trait, `CompletionRequest`/`CompletionOutput`/`TokenUsage`/`CompletionStreamDelta` types, CUDA generation loop, and the `LoadedInferenceEngine` enum that dispatches to Qwen3/Qwen35/Qwen35Moe (CUDA), `BackendInferenceEngine<MetalBackend>` (Metal), or `BackendInferenceEngine<CpuBackend>` (CPU)
 - `infer/src/backend/cuda/bootstrap.rs`: builds CUDA engines and schedulers
 - `infer/src/backend/runtime.rs`: serial backend runtime for CPU/Metal
 - `infer/src/http_server.rs`: axum wiring for serving
@@ -211,7 +211,6 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 - `infer/src/model.rs`: `ModelForward`, `GenerationState`, decode-context abstractions
 - `infer/src/model/qwen3.rs`
 - `infer/src/model/qwen35.rs`
-- `infer/src/model/glm4.rs`
 - supporting files under `infer/src/model/`
 - `infer/src/ops.rs` and `infer/src/ops/*`
 - `crates/cuda-kernels/src/tensor.rs`: CUDA tensor/device abstractions (`DeviceContext`, `DeviceVec`, `DeviceMatrix`, `HiddenStates`, `RawDevicePtr`)

@@ -767,7 +767,7 @@ body = body.replace("<SHORT TITLE>", f"guidellm sweep {label}")
 body = body.replace("<BACKEND-LABEL>", label)
 body = body.replace("<YYYY-MM-DD>", date)
 body = body.replace("<short sha>", sha)
-body = body.replace("<Qwen/Qwen3-4B | Qwen/Qwen3.5-4B | THUDM/GLM-4 | ...>", model)
+body = body.replace("<Qwen/Qwen3-4B | Qwen/Qwen3.5-4B | ...>", model)
 body = body.replace("http://localhost:8000", target)
 body = body.replace("bench-output/<date>-<label>/", outdir.rstrip('/') + "/")
 

@@ -17,14 +17,22 @@ or release-related, also read:
 
 ```bash
 git clone https://github.com/cklxx/agent-infer && cd agent-infer
-./setup.sh --full          # Installs Rust, Python venv, builds, downloads model
+./setup.sh                 # Installs Rust, Python venv, builds, downloads model
+./setup.sh --check         # Verifies the local toolchain and binaries
 ```
 
 Or manually:
 
-1. **Rust 1.85+**: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+1. **Rust**: use the pinned toolchain from [`rust-toolchain.toml`](rust-toolchain.toml)
 2. **CUDA 12.x** (for GPU builds)
 3. **Python 3.10+** with `flashinfer-python` and `triton` (build-time only)
+
+For first-time contributor setup, install the repo-managed hook path:
+
+```bash
+make install-hooks
+make pre-push
+```
 
 ## Development Workflow
 
@@ -32,16 +40,22 @@ Or manually:
 # Build (CPU-only, fast iteration)
 cargo build --no-default-features --features no-cuda
 
+# Build the CLI smoke path
+cargo build -p agent-infer --release --no-default-features --features cpu,no-cuda,cli --bin arle
+
 # Build (GPU)
 cargo build -p infer --release
 
 # Test
 cargo test --no-default-features --features no-cuda   # Unit tests (~9s)
 cargo test --release --test e2e                         # E2E (GPU required)
+cargo test -p train --release --features no-cuda --lib
+cargo test -p autograd --release --features no-cuda --lib
 
 # Lint + format
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
+cargo deny check advisories bans licenses sources
 ```
 
 ## Pull Requests
@@ -49,7 +63,7 @@ cargo fmt --all -- --check
 1. Fork the repo and create a branch from `main`
 2. Follow [Commitizen](https://www.conventionalcommits.org/) format: `<type>(<scope>): <subject>`
    - Types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `chore`
-3. Ensure CI passes: `cargo test`, `cargo clippy`, `cargo fmt --check`
+3. Ensure CI passes: `cargo test`, `cargo clippy`, `cargo fmt --check`, `cargo deny`
 4. One logical change per PR. Keep diffs focused.
 5. If the change affects a documented API, CLI behavior, environment variable,
    benchmark claim, or migration-sensitive workflow, include the relevant docs
@@ -121,6 +135,13 @@ Use [docs/environment.md](docs/environment.md) as the source of truth for:
 
 If you add, rename, or deprecate an environment variable, update that document
 in the same PR.
+
+## Dependency Hygiene
+
+- Rust and GitHub Actions dependencies are updated via `dependabot.yml`.
+- Supply-chain policy is checked with `cargo deny` using [`deny.toml`](deny.toml).
+- If you add a dependency with a new license or a new registry source, update
+  `deny.toml` in the same PR.
 
 ## Release Work
 

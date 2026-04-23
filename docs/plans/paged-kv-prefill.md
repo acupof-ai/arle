@@ -2,7 +2,7 @@
 
 > **Partially superseded (2026-04-17):** Phase 1 (kernel FFI), Phase 2 (Rust
 > ops), and Phase 3a (Qwen3 scheduler wiring) are complete. Phase 3b (Qwen3.5),
-> 3c (GLM4), and Phase 4 (delete `CONTIGUOUS_KV_TOKENS`) are re-sequenced under
+> Phase 4 (delete `CONTIGUOUS_KV_TOKENS`) is re-sequenced under
 > [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md) §Phase 1. Refer
 > there for ordering and acceptance.
 
@@ -74,15 +74,14 @@ buffer that's later migrated).
 | 7 | `infer/src/ops.rs` | Re-export new ops. |
 | 8 | `infer/src/model/qwen3/prefill.rs` | Switch both call sites (`prefill_attention_batch`@278,460) to `prefill_attention_paged_batch`. Pass paged metadata threaded through from the scheduler. |
 | 9 | `infer/src/model/qwen35/prefill.rs` | Switch both call sites (`prefill_attention_hd256_batch`@164,356) to `prefill_attention_hd256_paged_batch`. Qwen3.5 linear-attn layers are unaffected (they use GDN chunkwise, no contiguous K/V issue). |
-| 10 | `infer/src/model/glm4/prefill.rs` | Switch both call sites (`prefill_attention_batch`@230,365). |
 | 11 | `infer/src/scheduler/cuda/prefill.rs` | Pre-allocate paged pages for the full prompt length *before* the first forward (currently done per-chunk at L253–L270). After forward, no migration step — delete `migrate_kv_range_to_paged` call and the retry/error path around it for prefill. Prefix-hit migration (L174–L194) still needs to migrate prefix-cache hits into paged pool — that stays. |
 | 12 | `infer/src/scheduler/cuda/core.rs` | Delete `CONTIGUOUS_KV_TOKENS`; delete `state.set_max_seq_len(CONTIGUOUS_KV_TOKENS)` at line 304; delete `.min(CONTIGUOUS_KV_TOKENS)` at line 886. `prefill_chunk_size()` now returns the DecodeAwareChunking result capped only by `self.config.prefill_chunk_size`. |
 | 13 | `infer/src/scheduler/types.rs` | `prefill_chunk_size` default stays 4096 in `runtime_defaults`; the `Default` for cpu-only scheduling stays 512 (it's an arbitrary value since no GPU buffer is sized from it anymore). Update the `// Default 512 is chunking cap …` doc comment to reflect the new role (scheduler fairness knob only). |
-| 14 | `infer/src/model/kv_cache.rs` | `KVCache` still backs single-token-decode contiguous K/V read/write for Qwen3/GLM4 (`fused_attention_decode_into` at `model/qwen3/decode.rs:11-38`, `model/glm4/decode.rs:11-38`), AND the migrate_kv_range_to_paged dispatch path for BF16/FP8/INT8/TurboQuant (`model/generation_state.rs:121-165`). Downsize `max_seq_len` only where it was inflated for prefill chunk capacity; do NOT remove the struct. |
-| 15 | `infer/src/model.rs` | Re-examine `ModelForward` trait surface — `set_max_seq_len` (`model.rs:98`), `migrate_kv_to_paged` / `migrate_kv_range_to_paged` (`model.rs:105-120`), `forward_prefill_with_pool` (`model.rs:249-272`). The paged-prefill path should plug into the **existing** `forward_prefill_with_pool` contract that Qwen3/GLM4 already implement (`model/qwen3/forward.rs:163-188`, `model/glm4/forward.rs:164-180`) — not add a parallel entry point. |
+| 14 | `infer/src/model/kv_cache.rs` | `KVCache` still backs single-token-decode contiguous K/V read/write for Qwen3 (`fused_attention_decode_into` at `model/qwen3/decode.rs:11-38`), AND the migrate_kv_range_to_paged dispatch path for BF16/FP8/INT8/TurboQuant (`model/generation_state.rs:121-165`). Downsize `max_seq_len` only where it was inflated for prefill chunk capacity; do NOT remove the struct. |
+| 15 | `infer/src/model.rs` | Re-examine `ModelForward` trait surface — `set_max_seq_len` (`model.rs:98`), `migrate_kv_to_paged` / `migrate_kv_range_to_paged` (`model.rs:105-120`), `forward_prefill_with_pool` (`model.rs:249-272`). The paged-prefill path should plug into the **existing** `forward_prefill_with_pool` contract that Qwen3 already implements (`model/qwen3/forward.rs:163-188`) — not add a parallel entry point. |
 | 16 | `infer/src/model/generation_state.rs` | `migrate_kv_range_to_paged` dispatch stays (still used for prefix-cache hits and INT8 quant migration). Audit which branches are hit from which call sites; nothing here is deleted as part of this refactor. |
 | 17 | `infer/src/model/qwen3/batch_decode.rs` | Mixed decode+prefill path currently requires contiguous caches via `kv_cache.k_caches().is_empty()` + `max_seq_len()` guards (`batch_decode.rs:360-364,543-566`) and `prefill_attention_prep_dual_write_cuda`. Must either migrate this path to paged-only or keep its contiguous dependency explicitly (documented carve-out). |
-| 18 | `infer/src/model/{qwen3,qwen35,glm4}/forward.rs` | `fn set_max_seq_len` stays (INT8 + single-token-decode contiguous path still uses it). Value passed in reduces from `CONTIGUOUS_KV_TOKENS` constant to a dynamically-sized value matching single-token-decode needs. |
+| 18 | `infer/src/model/{qwen3,qwen35}/forward.rs` | `fn set_max_seq_len` stays (INT8 + single-token-decode contiguous path still uses it). Value passed in reduces from `CONTIGUOUS_KV_TOKENS` constant to a dynamically-sized value matching single-token-decode needs. |
 | 19 | `infer/src/ops/tests.rs` | Existing `test_prefill_attention_*` already use **tolerances, not bitwise** (`ops/tests.rs:596-606,816-818`). Add parallel `test_prefill_attention_paged_*` that compare to the same CPU reference within the same tolerance. Do NOT tighten to bitwise — the kernel template is different (`BatchPrefillPagedParams` vs `SinglePrefillParams`). |
 | 20 | `infer/test_data/*.json` | Regenerate greedy baselines iff **greedy-token-id parity fails** — i.e. sampled token IDs must match bitwise even if intermediate tensor values differ within tolerance. Numerical drift at the tensor level within existing tolerance is acceptable; different greedy token sequences are not. |
 | 21 | `infer/benches/ops/ops_attention_bench.rs` + `ops_qwen35_state_bench.rs` | Add paged variants alongside existing benches to measure the contiguous → paged delta directly. |
@@ -115,13 +114,13 @@ the **same** commit, per-model.
 - Acceptance: test module in `infer/src/ops/tests.rs` passes — e.g.
   `cargo test --release -p infer -- test_prefill_attention_paged`.
 
-**Phase 3 — one model migration at a time** (Qwen3 → Qwen3.5 → GLM4)
+**Phase 3 — one model migration at a time** (Qwen3 → Qwen3.5)
 Each model = one commit that includes:
 1. Model `prefill.rs` switched to paged variant.
 2. Scheduler `prefill_chunk_size()` lifts the `.min(CONTIGUOUS_KV_TOKENS)`
    cap **for that model** (gate via the model's
    `forward_prefill_with_pool` availability at `model.rs:249-272`,
-   which Qwen3/GLM4 already implement).
+   which Qwen3 already implements).
 3. Scheduler `prefill.rs:253-277` skips `migrate_kv_range_to_paged`
    when the model uses paged-prefill.
 4. Prefix-cache hit path (`prefill.rs:99-156,174-194`) audited — same-slot
@@ -132,7 +131,7 @@ Each model = one commit that includes:
    what's least invasive.
 
 For each model:
-- Run `cargo test --release --test e2e` (Qwen3 / GLM4) or
+- Run `cargo test --release --test e2e` (Qwen3) or
   `cargo test --release --test e2e_qwen35` (Qwen3.5).
 - **Greedy-token parity required**: sampled token IDs must match the
   `infer/test_data/*.json` baseline exactly. Per-tensor values can
@@ -145,7 +144,7 @@ For each model:
   `prefill_attention_prep_cuda`, `prefill_attention_hd256_prep_cuda`
   and their FFI declarations.
 - Downsize `KVCache::max_seq_len` to the size actually required by
-  single-token decode (Qwen3/GLM4) + INT8 working buffer — these are
+  single-token decode (Qwen3) + INT8 working buffer — these are
   the surviving uses per Codex review.
 - Update architecture docs.
 - Acceptance: grep shows no remaining references to deleted constants
@@ -250,18 +249,18 @@ between phases rather than delegating all at once.
 
 `ModelForward::forward_prefill_with_pool` at `infer/src/model.rs:262-272`
 is an already-declared trait method with a default impl that delegates
-to `forward_prefill`. Qwen3 (`model/qwen3/forward.rs:163-192`) and GLM4
-(`model/glm4/forward.rs:164-180`) already implement it via
+to `forward_prefill`. Qwen3 (`model/qwen3/forward.rs:163-192`) already
+implements it via
 `process_all_layers_batch_with_pool` — **a dual-write path** that
 writes K/V to contiguous cache AND token pool.
 
 **But no caller exists yet**: scheduler only calls `forward_prefill`
-at `scheduler/cuda/prefill.rs:234`. The Qwen3/GLM4 dual-write
-implementations are dead code today.
+at `scheduler/cuda/prefill.rs:234`. The Qwen3 dual-write
+implementation is dead code today.
 
 This reshapes Phase 3:
 - **Integration point**: rewrite `process_all_layers_batch_with_pool`
-  (in Qwen3 + GLM4) to call the new paged-prefill kernel
+  (in Qwen3) to call the new paged-prefill kernel
   **paged-only** (drop the contiguous write). Qwen3.5 doesn't have
   this method yet — it needs to be added, following the same pattern.
 - **Scheduler switch**: change `scheduler/cuda/prefill.rs:234` from

@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use log::{info, warn};
 
 #[cfg(feature = "cuda")]
-use crate::model::{GLM4Model, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 #[cfg(feature = "cuda")]
 use crate::model_registry::{ModelArch, detect_arch};
 #[cfg(feature = "cuda")]
@@ -34,7 +34,6 @@ pub enum ModelType {
     /// `todo!()` stub until the CUDA MoE kernel lands; Metal path lives
     /// entirely outside this module. See `docs/plans/qwen36-moe-metal.md`.
     Qwen35Moe,
-    GLM4,
 }
 
 #[cfg(feature = "cuda")]
@@ -44,7 +43,6 @@ impl fmt::Display for ModelType {
             Self::Qwen3 => write!(f, "Qwen3"),
             Self::Qwen35 => write!(f, "Qwen3.5"),
             Self::Qwen35Moe => write!(f, "Qwen3.5-MoE"),
-            Self::GLM4 => write!(f, "GLM-4"),
         }
     }
 }
@@ -107,7 +105,6 @@ pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
         ModelArch::Qwen3 => Ok(ModelType::Qwen3),
         ModelArch::Qwen35 => Ok(ModelType::Qwen35),
         ModelArch::Qwen3_5_Moe => Ok(ModelType::Qwen35Moe),
-        ModelArch::GLM4 => Ok(ModelType::GLM4),
         arch => bail!("model architecture {arch:?} is not supported by the runtime yet"),
     }
 }
@@ -133,7 +130,6 @@ pub enum LoadedModelComponents {
     /// MoE-specific dispatch happens at the engine layer. The CUDA loader
     /// for this variant is intentionally a `todo!()` stub.
     Qwen35Moe(ModelComponents<Qwen35Model>),
-    GLM4(ModelComponents<GLM4Model>),
 }
 
 #[cfg(feature = "cuda")]
@@ -146,7 +142,7 @@ fn load_model_with<M>(
     let resolved_str = resolved.to_str().unwrap_or(model_path);
     let tokenizer = Tokenizer::from_file(resolved_str).or_else(|e| {
         // Fallback: extract tokenizer from GGUF metadata if tokenizer.json missing
-        if let Some(gguf) = crate::weight_loader::try_open_gguf(resolved_str) {
+        if let Some(gguf) = crate::gguf::try_open(resolved_str) {
             if let Some(json_str) = gguf.extract_tokenizer_json() {
                 log::info!("Extracting tokenizer from GGUF metadata");
                 let tok_path = resolved.join("_gguf_tokenizer.json");
@@ -211,16 +207,6 @@ pub fn load_qwen35_moe_components(
 }
 
 #[cfg(feature = "cuda")]
-pub fn load_glm4_components(
-    model_path: &str,
-    options: InferenceEngineOptions,
-) -> Result<ModelComponents<GLM4Model>> {
-    load_model_with(model_path, options, |model_path, options| {
-        GLM4Model::from_safetensors(model_path, options.enable_cuda_graph)
-    })
-}
-
-#[cfg(feature = "cuda")]
 pub fn load_model_components(
     model_path: &str,
     options: InferenceEngineOptions,
@@ -235,9 +221,6 @@ pub fn load_model_components(
         ModelType::Qwen35Moe => Ok(LoadedModelComponents::Qwen35Moe(
             load_qwen35_moe_components(model_path, options)?,
         )),
-        ModelType::GLM4 => Ok(LoadedModelComponents::GLM4(load_glm4_components(
-            model_path, options,
-        )?)),
     }
 }
 
@@ -251,13 +234,8 @@ pub fn spawn_scheduler_handle(
         LoadedModelComponents::Qwen3(components) => {
             spawn_scheduler_for_model(components, runtime, metrics)
         }
-        LoadedModelComponents::Qwen35(components) => {
-            spawn_scheduler_for_model(components, runtime, metrics)
-        }
-        LoadedModelComponents::Qwen35Moe(components) => {
-            spawn_scheduler_for_model(components, runtime, metrics)
-        }
-        LoadedModelComponents::GLM4(components) => {
+        LoadedModelComponents::Qwen35(components)
+        | LoadedModelComponents::Qwen35Moe(components) => {
             spawn_scheduler_for_model(components, runtime, metrics)
         }
     }
@@ -352,12 +330,8 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         kv_cache_dtype,
         kv_pool_format,
     )?;
-    let model_id_for_guard = model_id.clone();
     let thread = std::thread::spawn(move || scheduler.run());
-    Ok((
-        handle,
-        SchedulerRuntimeGuard::new(model_id_for_guard, thread),
-    ))
+    Ok((handle, SchedulerRuntimeGuard::new(model_id, thread)))
 }
 
 #[cfg(all(feature = "cuda", test))]

@@ -1,0 +1,9 @@
+* @cklxx
+
+/infer/ @cklxx
+/crates/cuda-kernels/ @cklxx
+/crates/mlx-sys/ @cklxx
+/crates/train/ @cklxx
+/docs/ @cklxx
+/.github/ @cklxx
+/scripts/ @cklxx
