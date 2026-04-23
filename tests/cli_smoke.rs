@@ -123,7 +123,7 @@ fn train_test_cpu_json_smoke_is_machine_readable() {
     let value: serde_json::Value =
         serde_json::from_str(&stdout(&output)).expect("train test output is valid json");
     assert_eq!(value["backend"], "cpu");
-    assert!(value["servable_model_dir"].is_string());
+    assert!(value.get("servable_model_dir").is_none());
     assert_eq!(value["steps"][0]["name"], "convert");
     assert_eq!(value["steps"][0]["status"], "ok");
     assert_eq!(value["steps"][3]["name"], "eval");
