@@ -152,8 +152,8 @@ def dequant_tensor(path, data_offset, info):
             for i in range(4):
                 sc[i] = sr[i] & 63; mn[i] = sr[i+4] & 63
             for i in range(4):
-                sc[4+i] = (sr[i] >> 6) | ((sr[8+i] & 0x0F) << 2)
-                mn[4+i] = (sr[i+4] >> 6) | ((sr[8+i] >> 4) << 2)
+                sc[4+i] = (sr[8+i] & 0x0F) | ((sr[i] >> 6) << 4)
+                mn[4+i] = (sr[8+i] >> 4) | ((sr[i+4] >> 6) << 4)
             for j in range(8):
                 sub_d = d * sc[j]; sub_m = dmin * mn[j]
                 for i in range(16):

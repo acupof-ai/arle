@@ -18,6 +18,18 @@ use infer::ops;
 /// Element → qs byte layout follows llama.cpp: each outer iter holds 32 qs
 /// bytes; the first 32 elements of the iter are the LOW nibbles of those
 /// bytes, the next 32 are the HIGH nibbles.
+fn decode_scale_min_k4(scales: &[u8], index: usize) -> (u8, u8) {
+    debug_assert!(scales.len() >= 12);
+    debug_assert!(index < 8);
+    if index < 4 {
+        (scales[index] & 0x3F, scales[index + 4] & 0x3F)
+    } else {
+        let scale = (scales[index + 4] & 0x0F) | ((scales[index - 4] >> 6) << 4);
+        let min = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+        (scale, min)
+    }
+}
+
 fn make_superblock(
     d: f32,
     dmin: f32,
@@ -31,9 +43,9 @@ fn make_superblock(
 
     // scales_packed (same as Q5_K's get_scale_min_k4).
     for i in 0..4 {
-        out[4 + i] = (sub_scales[i] & 0x3F) | ((sub_scales[4 + i] & 0x03) << 6);
-        out[8 + i] = (sub_mins[i] & 0x3F) | ((sub_mins[4 + i] & 0x03) << 6);
-        out[12 + i] = ((sub_scales[4 + i] >> 2) & 0x0F) | (((sub_mins[4 + i] >> 2) & 0x0F) << 4);
+        out[4 + i] = (sub_scales[i] & 0x3F) | (((sub_scales[4 + i] >> 4) & 0x03) << 6);
+        out[8 + i] = (sub_mins[i] & 0x3F) | (((sub_mins[4 + i] >> 4) & 0x03) << 6);
+        out[12 + i] = (sub_scales[4 + i] & 0x0F) | ((sub_mins[4 + i] & 0x0F) << 4);
     }
 
     // qs: 4 outer iterations of 32 bytes each. For each iter, byte l carries
@@ -57,25 +69,16 @@ fn dequant_superblock_cpu(sb: &[u8; 144]) -> [f32; 256] {
     let scales_raw = &sb[4..16];
     let qs = &sb[16..144];
 
-    let mut sc = [0u8; 8];
-    let mut mn = [0u8; 8];
-    for i in 0..4 {
-        sc[i] = scales_raw[i] & 0x3F;
-        mn[i] = scales_raw[i + 4] & 0x3F;
-    }
-    for i in 0..4 {
-        sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
-        mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
-    }
-
     let mut out = [0f32; 256];
     for iter in 0..4 {
         let j_lo = iter * 2;
         let j_hi = j_lo + 1;
-        let d1 = d * sc[j_lo] as f32;
-        let m1 = dmin * mn[j_lo] as f32;
-        let d2 = d * sc[j_hi] as f32;
-        let m2 = dmin * mn[j_hi] as f32;
+        let (sc_lo, mn_lo) = decode_scale_min_k4(scales_raw, j_lo);
+        let (sc_hi, mn_hi) = decode_scale_min_k4(scales_raw, j_hi);
+        let d1 = d * sc_lo as f32;
+        let m1 = dmin * mn_lo as f32;
+        let d2 = d * sc_hi as f32;
+        let m2 = dmin * mn_hi as f32;
         for l in 0..32 {
             let byte = qs[iter * 32 + l];
             let lo = (byte & 0x0F) as f32;
@@ -119,16 +122,8 @@ fn q4k_superblock_encode_decode_roundtrip() {
 
     // Decode the packed 12-byte scales header back and check against the originals.
     let scales_raw = &sb[4..16];
-    let mut sc = [0u8; 8];
-    let mut mn = [0u8; 8];
-    for i in 0..4 {
-        sc[i] = scales_raw[i] & 0x3F;
-        mn[i] = scales_raw[i + 4] & 0x3F;
-    }
-    for i in 0..4 {
-        sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
-        mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
-    }
+    let sc = std::array::from_fn(|i| decode_scale_min_k4(scales_raw, i).0);
+    let mn = std::array::from_fn(|i| decode_scale_min_k4(scales_raw, i).1);
     assert_eq!(sc, sub_scales);
     assert_eq!(mn, sub_mins);
 

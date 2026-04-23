@@ -1139,6 +1139,21 @@ fn dequant_q4_0(raw: &[u8], numel: usize) -> Vec<bf16> {
     out
 }
 
+/// Decode one packed `(scale, min)` pair from the 12-byte K-quants header.
+///
+/// This mirrors ggml's `get_scale_min_k4()` bit layout exactly.
+fn decode_scale_min_k4(scales: &[u8], index: usize) -> (u8, u8) {
+    debug_assert!(scales.len() >= 12);
+    debug_assert!(index < 8);
+    if index < 4 {
+        (scales[index] & 0x3F, scales[index + 4] & 0x3F)
+    } else {
+        let scale = (scales[index + 4] & 0x0F) | ((scales[index - 4] >> 6) << 4);
+        let min = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+        (scale, min)
+    }
+}
+
 /// Q4_K (Q4_K_M/Q4_K_S): 256 elements per superblock (144 bytes). Mirrors
 /// llama.cpp's `dequantize_row_q4_K` exactly.
 ///
@@ -1175,28 +1190,17 @@ fn dequant_q4_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
         let scales_raw = &raw[base + 4..base + 16];
         let qs = &raw[base + 16..base + 144];
 
-        // Decode 8 sub-block scales + 8 sub-block mins (6-bit each, packed
-        // across 12 bytes — the same get_scale_min_k4 layout used by Q5_K).
-        let mut sc = [0u8; 8];
-        let mut mn = [0u8; 8];
-        for i in 0..4 {
-            sc[i] = scales_raw[i] & 0x3F;
-            mn[i] = scales_raw[i + 4] & 0x3F;
-        }
-        for i in 0..4 {
-            sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
-            mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
-        }
-
         let out_base = b * QK_K;
         // 4 outer iterations of 64 elements (2 sub-blocks each).
         for iter in 0..4 {
             let j_lo = iter * 2;
             let j_hi = j_lo + 1;
-            let d1 = d * sc[j_lo] as f32;
-            let m1 = dmin * mn[j_lo] as f32;
-            let d2 = d * sc[j_hi] as f32;
-            let m2 = dmin * mn[j_hi] as f32;
+            let (sc_lo, mn_lo) = decode_scale_min_k4(scales_raw, j_lo);
+            let (sc_hi, mn_hi) = decode_scale_min_k4(scales_raw, j_hi);
+            let d1 = d * sc_lo as f32;
+            let m1 = dmin * mn_lo as f32;
+            let d2 = d * sc_hi as f32;
+            let m2 = dmin * mn_hi as f32;
             let ql_slice = &qs[iter * 32..iter * 32 + 32];
             for l in 0..32 {
                 let byte = ql_slice[l];
@@ -1308,27 +1312,17 @@ fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
         let qh = &raw[base + 16..base + 48];
         let qs = &raw[base + 48..base + 176];
 
-        // Decode scales (same 6-bit packing as Q4_K's get_scale_min_k4).
-        let mut sc = [0u8; 8];
-        let mut mn = [0u8; 8];
-        for i in 0..4 {
-            sc[i] = scales_raw[i] & 0x3F;
-            mn[i] = scales_raw[i + 4] & 0x3F;
-        }
-        for i in 0..4 {
-            sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
-            mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
-        }
-
         let out_base = b * QK_K;
         // 4 outer iterations of 64 elements, 2 sub-blocks each.
         for iter in 0..4 {
             let j_lo = iter * 2;
             let j_hi = j_lo + 1;
-            let d1 = d * sc[j_lo] as f32;
-            let m1 = dmin * mn[j_lo] as f32;
-            let d2 = d * sc[j_hi] as f32;
-            let m2 = dmin * mn[j_hi] as f32;
+            let (sc_lo, mn_lo) = decode_scale_min_k4(scales_raw, j_lo);
+            let (sc_hi, mn_hi) = decode_scale_min_k4(scales_raw, j_hi);
+            let d1 = d * sc_lo as f32;
+            let m1 = dmin * mn_lo as f32;
+            let d2 = d * sc_hi as f32;
+            let m2 = dmin * mn_hi as f32;
             let ql_slice = &qs[iter * 32..iter * 32 + 32];
             for l in 0..32 {
                 let ql_byte = ql_slice[l];
@@ -1663,6 +1657,19 @@ mod tests {
         assert_eq!(result[0], bf16::from_f32(0.0));
         // hi = (9 - 8) * 1.0 = 1.0
         assert!((result[1].to_f32() - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_decode_scale_min_k4_matches_ggml_layout() {
+        let mut scales = [0u8; 12];
+        scales[0] = 0b1000_0000;
+        scales[1] = 0b0010_1010;
+        scales[4] = 0b1100_0000;
+        scales[5] = 0b0001_0001;
+        scales[8] = 0x75;
+
+        assert_eq!(decode_scale_min_k4(&scales, 1), (42, 17));
+        assert_eq!(decode_scale_min_k4(&scales, 4), (37, 55));
     }
 
     #[test]

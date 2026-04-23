@@ -54,12 +54,14 @@ fn make_request(
     let (tx, rx) = mpsc::unbounded_channel();
     let req = IncomingRequest {
         prompt: prompt.to_string(),
+        prompt_tokens: None,
         max_tokens,
         sampling: SamplingParams::default(), // greedy (temperature=0)
         stop: None,
         priority: RequestPriority::default(),
         session_id: None,
         delta_tx: tx,
+        trace_context: None,
     };
     (req, rx)
 }
