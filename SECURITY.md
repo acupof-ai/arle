@@ -13,7 +13,7 @@
 If you discover a security vulnerability, please report it responsibly:
 
 1. **Do NOT open a public issue.**
-2. Use [GitHub Security Advisories](https://github.com/cklxx/agent-infer/security/advisories/new) to report privately.
+2. Use [GitHub Security Advisories](https://github.com/cklxx/arle/security/advisories/new) to report privately.
 3. If the advisory flow is unavailable, open a minimal public issue requesting a private contact channel **without** including exploit details or reproduction steps.
 4. Include: description, reproduction steps, affected surface, and potential impact.
 
@@ -21,7 +21,7 @@ We will acknowledge receipt within 48 hours and provide a fix timeline within 7 
 
 ## Scope
 
-This policy covers the `agent-infer` inference engine, including:
+This policy covers ARLE, including:
 
 - HTTP API endpoints (`/v1/completions`, `/v1/chat/completions`)
 - Agent tool execution (`shell`, `python` tools)

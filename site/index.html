@@ -9,10 +9,10 @@
 <meta property="og:title" content="ARLE — agent reinforcement learning engine">
 <meta property="og:description" content="Pure-Rust serving, agent runtime, train/eval workflows, and project docs in one workspace.">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://cklxx.github.io/agent-infer/">
-<link rel="canonical" href="https://cklxx.github.io/agent-infer/">
-<link rel="alternate" hreflang="en" href="https://cklxx.github.io/agent-infer/">
-<link rel="alternate" hreflang="zh-Hans" href="https://cklxx.github.io/agent-infer/zh-CN.html">
+<meta property="og:url" content="https://cklxx.github.io/arle/">
+<link rel="canonical" href="https://cklxx.github.io/arle/">
+<link rel="alternate" hreflang="en" href="https://cklxx.github.io/arle/">
+<link rel="alternate" hreflang="zh-Hans" href="https://cklxx.github.io/arle/zh-CN.html">
 <link rel="stylesheet" href="./style.css">
 <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23F4EDE0'/><text x='16' y='22' font-family='monospace' font-size='22' text-anchor='middle' fill='%23D97757'>$</text></svg>">
 </head>
@@ -44,8 +44,8 @@
   <a href="#status">[status]</a>
   <a href="#quickstart">[quickstart]</a>
   <a href="#docs">[docs]</a>
-  <a href="https://github.com/cklxx/agent-infer">[github]</a>
-  <a href="https://github.com/cklxx/agent-infer/releases">[releases]</a>
+  <a href="https://github.com/cklxx/arle">[github]</a>
+  <a href="https://github.com/cklxx/arle/releases">[releases]</a>
   <span class="lang" aria-label="language"><b>en</b> · <a href="./zh-CN.html" hreflang="zh-Hans">zh</a></span>
 </nav>
 </section>
@@ -80,7 +80,7 @@
     <tr><td class="cap">CUDA</td><td>Stable primary serving path on Linux + NVIDIA.</td></tr>
     <tr><td class="cap">Metal</td><td>Beta Apple Silicon path with live runtime, DFlash, and the MLX bridge.</td></tr>
     <tr><td class="cap">CPU</td><td>Development-only smoke path for request-surface validation.</td></tr>
-    <tr><td class="cap">Bench claims</td><td>Dated snapshots live under <a href="https://github.com/cklxx/agent-infer/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/agent-infer/blob/main/docs/plans/2026-04-22-sglang-gap-closure-execution.md">the current execution plan</a>.</td></tr>
+    <tr><td class="cap">Bench claims</td><td>Dated snapshots live under <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-22-sglang-gap-closure-execution.md">the current execution plan</a>.</td></tr>
   </tbody>
 </table>
 </section>
@@ -89,8 +89,8 @@
 <h2>QUICKSTART</h2>
 
 <h3>&mdash; Source build</h3>
-<pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/agent-infer
-<span class="p">$</span> cd agent-infer
+<pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/arle
+<span class="p">$</span> cd arle
 <span class="p">$</span> ./setup.sh
 <span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000</pre>
@@ -109,26 +109,26 @@
 <section id="docs">
 <h2>FILES</h2>
 <pre class="files">
-<a href="https://github.com/cklxx/agent-infer/blob/main/README.md">/README.md</a>                         public overview · install · CLI · architecture
-<a href="https://github.com/cklxx/agent-infer/blob/main/docs/http-api.md">/docs/http-api.md</a>                HTTP contract · streaming behavior
-<a href="https://github.com/cklxx/agent-infer/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>          backend / model / quant support
-<a href="https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>                 contributor setup · validation · release expectations
-<a href="https://github.com/cklxx/agent-infer/blob/main/docs/index.md">/docs/index.md</a>                   maintainer-facing PARA index
-<a href="https://github.com/cklxx/agent-infer/releases">/releases</a>                        tagged binaries · checksums
+<a href="https://github.com/cklxx/arle/blob/main/README.md">/README.md</a>                         public overview · install · CLI · architecture
+<a href="https://github.com/cklxx/arle/blob/main/docs/http-api.md">/docs/http-api.md</a>                HTTP contract · streaming behavior
+<a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>          backend / model / quant support
+<a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>                 contributor setup · validation · release expectations
+<a href="https://github.com/cklxx/arle/blob/main/docs/index.md">/docs/index.md</a>                   maintainer-facing PARA index
+<a href="https://github.com/cklxx/arle/releases">/releases</a>                        tagged binaries · checksums
 </pre>
 </section>
 
 <section id="see-also">
 <h2>SEE ALSO</h2>
 <ul class="seealso">
-  <li><a href="https://github.com/cklxx/agent-infer/pkgs/container/agent-infer">GHCR package</a> &mdash; container images built from <code>main</code> and release tags</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">CHANGELOG.md</a> &mdash; dated project history</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; next milestones</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/SECURITY.md">SECURITY.md</a> &mdash; private vulnerability reporting policy</li>
+  <li><code>ghcr.io/cklxx/agent-infer:latest</code> &mdash; current published container image path</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/CHANGELOG.md">CHANGELOG.md</a> &mdash; dated project history</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; next milestones</li>
+  <li><a href="https://github.com/cklxx/arle/blob/main/SECURITY.md">SECURITY.md</a> &mdash; private vulnerability reporting policy</li>
 </ul>
 <p class="note">
   If you are here to contribute, start with
-  <a href="https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>,
+  <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>,
   not the maintainer plans tree.
 </p>
 </section>
@@ -146,7 +146,7 @@
   <span class="sl-seg sl-accent">arle/site</span>
   <span class="sl-seg sl-ok"><span class="dot"></span> public docs</span>
   <span class="sl-seg">en</span>
-  <span class="sl-seg">gh:cklxx/agent-infer</span>
+  <span class="sl-seg">gh:cklxx/arle</span>
   <span class="sl-seg sl-spacer"></span>
   <span class="sl-seg">README / docs / releases</span>
 </div>
