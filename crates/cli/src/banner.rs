@@ -11,10 +11,7 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
     let version = env!("CARGO_PKG_VERSION");
 
     eprintln!();
-    eprintln!(
-        "  {}",
-        style(format!("agent-infer v{version}")).bold().cyan()
-    );
+    eprintln!("  {}", style(format!("ARLE v{version}")).bold().cyan());
     eprintln!();
 
     // CPU

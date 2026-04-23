@@ -112,7 +112,7 @@ fn run_train_env(args: TrainEnvArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("agent-infer train env");
+    println!("ARLE train env");
     println!("version {}", report.version);
     println!("train default backend {}", report.train_default_backend);
     println!("compiled infer backend {}", report.compiled_infer_backend);
@@ -132,7 +132,7 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
     let root_dir = args
         .out_dir
         .clone()
-        .unwrap_or_else(|| unique_temp_dir("agent-infer-train-test"));
+        .unwrap_or_else(|| unique_temp_dir("arle-train-test"));
     let cleanup_path = if args.keep_artifacts || args.out_dir.is_some() {
         None
     } else {
@@ -147,7 +147,7 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
-                println!("agent-infer train test");
+                println!("ARLE train test");
                 println!("backend {}", report.backend);
                 println!("root {}", report.root_dir);
                 for step in &report.steps {
@@ -167,7 +167,7 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("[agent-infer train test] error: {err:#}");
+            eprintln!("[ARLE train test] error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -185,7 +185,7 @@ fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("agent-infer train estimate-memory");
+    println!("ARLE train estimate-memory");
     println!("mode {}", report.mode);
     println!("family {}", report.family);
     if let Some(model_dir) = &report.model_dir {
@@ -334,7 +334,7 @@ where
     match run(invocation.argv) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("[agent-infer {}] error: {err}", invocation.command);
+            eprintln!("[ARLE {}] error: {err}", invocation.command);
             ExitCode::FAILURE
         }
     }
@@ -352,7 +352,7 @@ where
     match resolved {
         Ok(invocation) => run_train_invocation(invocation, render, run),
         Err(err) => {
-            eprintln!("[agent-infer {command}] error: {err:#}");
+            eprintln!("[ARLE {command}] error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -699,7 +699,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         .to_string();
     fs::create_dir_all(root_dir)?;
 
-    let executable = agent_infer_executable()?;
+    let executable = arle_executable()?;
     let corpus = root_dir.join("corpus.txt");
     let tokenizer = root_dir.join("tokenizer.json");
     let raw = root_dir.join("raw_dolly.jsonl");
@@ -740,7 +740,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
     )?;
 
     let started = Instant::now();
-    run_agent_infer_step(
+    run_arle_step(
         &executable,
         "convert",
         &[
@@ -755,7 +755,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         ],
     )?;
 
-    run_agent_infer_step(
+    run_arle_step(
         &executable,
         "pretrain",
         &[
@@ -794,7 +794,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         ],
     )?;
 
-    run_agent_infer_step(
+    run_arle_step(
         &executable,
         "sft",
         &[
@@ -823,7 +823,7 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
         ],
     )?;
 
-    let eval = run_agent_infer_step(
+    let eval = run_arle_step(
         &executable,
         "eval",
         &[
@@ -1302,14 +1302,14 @@ fn existing_display_path(path: PathBuf) -> Option<String> {
     path.is_file().then(|| path.display().to_string())
 }
 
-fn agent_infer_executable() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_agent-infer").map(PathBuf::from) {
+fn arle_executable() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_arle").map(PathBuf::from) {
         return Ok(path);
     }
-    std::env::current_exe().context("resolve current agent-infer executable")
+    std::env::current_exe().context("resolve current ARLE executable")
 }
 
-fn run_agent_infer_step(
+fn run_arle_step(
     executable: &Path,
     step: &'static str,
     args: &[String],
@@ -1421,7 +1421,7 @@ fn exit_from_result(result: Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("[agent-infer train] error: {err:#}");
+            eprintln!("[ARLE train] error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -1835,7 +1835,7 @@ mod tests {
     fn train_test_report_serializes_public_fields_only() {
         let report = TrainTestReport {
             backend: "metal".to_string(),
-            root_dir: "/tmp/agent-infer-train-test".to_string(),
+            root_dir: "/tmp/arle-train-test".to_string(),
             wall_secs: 1.25,
             steps: vec![
                 TrainTestStep {

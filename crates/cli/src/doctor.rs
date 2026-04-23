@@ -39,7 +39,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         return enforce_strict(args, &report);
     }
 
-    println!("{}", style("agent-infer doctor").bold().cyan());
+    println!("{}", style("ARLE doctor").bold().cyan());
     println!();
     println!(
         "{} {}",
@@ -153,7 +153,7 @@ pub(crate) fn list_models(args: &Args) -> Result<()> {
         return print_json(&models_report(&snapshot));
     }
 
-    println!("{}", style("agent-infer models").bold().cyan());
+    println!("{}", style("ARLE models").bold().cyan());
     println!();
     println!("{}", style("Resolution").bold());
     match &snapshot.selected {

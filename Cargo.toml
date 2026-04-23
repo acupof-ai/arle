@@ -76,7 +76,7 @@ cli = { path = "crates/cli", default-features = false, optional = true }
 infer = { path = "infer", default-features = false }
 
 [[bin]]
-name = "agent-infer"
+name = "arle"
 path = "src/main.rs"
 required-features = ["cli"]
 

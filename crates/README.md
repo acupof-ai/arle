@@ -4,7 +4,7 @@ This folder hosts the reusable crates around `infer`:
 
 - `agent`: reusable agent session/control-plane logic
 - `chat`: shared ChatML/tool-call protocol and OpenAI chat surface types
-- `cli`: reusable REPL/CLI flow for the `agent-infer` binary
+- `cli`: reusable REPL/CLI flow for the `arle` binary
 - `tools`: reusable builtin tool definitions and sandboxed execution
 - `mlx-sys`: MLX C++ bridge used by the Metal backend
 - `cuda-kernels`: extracted CUDA kernel layer (CUDA C/Triton sources,
