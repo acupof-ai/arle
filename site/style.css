@@ -148,10 +148,26 @@ code      { font-family: inherit; color: var(--coral-dim); }
   margin-bottom: 8px;
   border-bottom: 1px dashed var(--ochre);
 }
+.hero-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(18rem, 0.95fr);
+  gap: 18px;
+  align-items: start;
+}
+.hero-art {
+  min-width: 0;
+}
+.hero-kicker {
+  margin: 0 0 6px;
+  color: var(--ochre);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
 
 .ascii {
   margin: 0;
-  padding: 4px 0 10px;
+  padding: 8px 10px 12px;
   font-size: 13px;
   line-height: 0.88;
   color: var(--coral-dim);
@@ -159,6 +175,13 @@ code      { font-family: inherit; color: var(--coral-dim); }
   letter-spacing: 0;
   white-space: pre;
   font-weight: 700;
+  border: 1px solid rgba(217,119,87,0.32);
+  background:
+    linear-gradient(180deg, rgba(217,119,87,0.06), rgba(217,119,87,0.01)),
+    var(--paper-dim);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.48),
+    0 1px 0 rgba(26,23,20,0.08);
 }
 .ascii-art {
   display: inline-block;
@@ -169,12 +192,72 @@ code      { font-family: inherit; color: var(--coral-dim); }
 @media (min-width: 760px) {
   .ascii { font-size: 14px; }
 }
+.subline {
+  margin: 8px 0 0;
+  color: var(--ink-dim);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
 
 .tagline {
   max-width: 68ch;
   margin: 10px 0 14px;
   color: var(--ink-soft);
   font-size: 15px;
+}
+.hero-signals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.hero-signals span {
+  display: inline-block;
+  padding: 3px 8px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  border: 1px dashed rgba(139,111,71,0.55);
+  background: rgba(239,229,212,0.68);
+}
+.hero-panel {
+  border: 1px solid var(--rule);
+  background: var(--paper-dim);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.44),
+    0 1px 0 rgba(26,23,20,0.08);
+  padding: 12px 14px;
+}
+.panel-kicker {
+  margin: 0 0 8px;
+  color: var(--ochre);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+.panel-title {
+  margin: 0 0 10px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.45;
+}
+.panel-note {
+  margin: 10px 0 0;
+  color: var(--ink-dim);
+  font-size: 13px;
+}
+.hero-meta {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.hero-meta td {
+  padding: 4px 0;
+  border-bottom: 1px dotted rgba(42,36,30,0.2);
+  vertical-align: top;
+}
+.hero-meta td:first-child {
+  width: 42%;
+  color: var(--ink-dim);
 }
 .hl {
   background: linear-gradient(to top, rgba(217,119,87,0.18) 55%, transparent 55%);
@@ -211,6 +294,27 @@ code      { font-family: inherit; color: var(--coral-dim); }
 .jumps .lang b { color: var(--coral-dim); font-weight: 700; }
 .jumps .lang a { color: var(--ochre); padding: 0 2px; }
 .jumps .lang a:hover { color: var(--paper); background: var(--ochre); }
+.glance-grid,
+.quickgrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.quickgrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.mini-card {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(42,36,30,0.18);
+  background: linear-gradient(180deg, rgba(239,229,212,0.72), rgba(244,237,224,0.96));
+}
+.mini-card p:last-child {
+  margin-bottom: 0;
+}
+.quick-card pre.cmd {
+  margin-bottom: 0;
+}
 
 /* ── sections ──────────────────────────────────────────────────────── */
 
@@ -427,18 +531,29 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
 @media (max-width: 640px) {
   :root { --fs: 14px; }
   .page { padding: 18px 14px 18px; }
+  body { padding-bottom: 0; }
+  .hero-shell,
+  .glance-grid,
+  .quickgrid {
+    grid-template-columns: 1fr;
+  }
   .ascii {
     font-size: 7.2px;
     line-height: 0.92;
+    padding: 6px 8px 10px;
   }
   .ascii-art {
     transform: scaleX(1.02);
     text-shadow: 1px 1px 0 rgba(217,119,87,0.08);
   }
+  .subline,
+  .hero-kicker,
+  .panel-kicker {
+    letter-spacing: 0.12em;
+  }
   .manhead-c, .manfoot-c { display: none; }
   pre.cmd, pre.tbl, pre.diagram, pre.files { font-size: 12px; }
-  .statusline { font-size: 11px; }
-  .statusline .sl-seg { padding: 5px 8px; }
+  .statusline { display: none; }
 }
 
 /* prefers-color-scheme: we intentionally stay in paper-warm even when

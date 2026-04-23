@@ -27,6 +27,9 @@
 
 <section class="hero" aria-label="banner">
 <h1 class="sr-only">ARLE(1) — runtime-first Rust workspace</h1>
+<div class="hero-shell">
+<div class="hero-art">
+<p class="hero-kicker">runtime-first rust workspace</p>
 <pre class="ascii" aria-hidden="true">
 <span class="ascii-art"> █████╗ ██████╗ ██╗     ███████╗
 ██╔══██╗██╔══██╗██║     ██╔════╝
@@ -35,12 +38,39 @@
 ██║  ██║██║  ██║███████╗███████╗
 ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝</span>
 </pre>
+<p class="subline">agent reinforcement learning engine</p>
 <p class="tagline">
   One runtime authority. <span class="hl">infer</span> serves OpenAI-compatible
   traffic; <span class="hl">arle</span> fronts local agent, train, eval, and
   data workflows.
 </p>
+<div class="hero-signals" aria-label="project signals">
+  <span>CUDA primary</span>
+  <span>Metal beta</span>
+  <span>OpenAI-compatible</span>
+  <span>one front door</span>
+</div>
+</div>
+<aside class="hero-panel" aria-label="project summary">
+  <p class="panel-kicker">PUBLIC SURFACE</p>
+  <p class="panel-title"><code>infer</code> serves. <code>arle</code> operates.</p>
+  <table class="hero-meta">
+    <tbody>
+      <tr><td>Project</td><td>ARLE</td></tr>
+      <tr><td>Front door</td><td><code>arle</code></td></tr>
+      <tr><td>Serving</td><td><code>infer</code></td></tr>
+      <tr><td>Primary backend</td><td>CUDA</td></tr>
+      <tr><td>Local path</td><td>Metal / CPU</td></tr>
+    </tbody>
+  </table>
+  <p class="panel-note">
+    Docs, binaries, train/eval flows, and dataset tooling move together in one
+    workspace instead of splitting across parallel stacks.
+  </p>
+</aside>
+</div>
 <nav class="jumps" aria-label="sections">
+  <a href="#glance">[glance]</a>
   <a href="#synopsis">[synopsis]</a>
   <a href="#surfaces">[surfaces]</a>
   <a href="#status">[status]</a>
@@ -65,13 +95,42 @@
 </p>
 </section>
 
+<section id="glance">
+<h2>AT A GLANCE</h2>
+<div class="glance-grid">
+  <article class="mini-card">
+    <h3>&mdash; Runtime Spine</h3>
+    <p>
+      Serving remains primary. <code>infer</code> is the canonical HTTP
+      surface for generation, metrics, stats, and sessions.
+    </p>
+  </article>
+  <article class="mini-card">
+    <h3>&mdash; One Front Door</h3>
+    <p>
+      <code>arle run</code>, <code>arle train</code>, and
+      <code>arle data</code> give users one stable front door instead of a
+      scatter of task-specific binaries.
+    </p>
+  </article>
+  <article class="mini-card">
+    <h3>&mdash; Shared Authority</h3>
+    <p>
+      Runtime code, model loading, train/eval flows, and public docs stay in
+      one Rust workspace so operator truth does not drift.
+    </p>
+  </article>
+</div>
+</section>
+
 <section id="synopsis">
 <h2>SYNOPSIS</h2>
 <pre class="cmd"><span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
 <span class="p">$</span> cargo build --release --features cli --bin arle
 <span class="p">$</span> ./target/release/arle --doctor
-<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B run --prompt <i>"Summarize this repo"</i>
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B \
+    run --prompt <i>"Summarize this repo"</i>
 <span class="p">$</span> ./target/release/arle train env
 <span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span></pre>
 </section>
@@ -103,22 +162,28 @@
 
 <section id="quickstart">
 <h2>QUICKSTART</h2>
-
+<div class="quickgrid">
+<article class="mini-card quick-card">
 <h3>&mdash; Local CLI smoke</h3>
 <pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/arle
 <span class="p">$</span> cd arle
 <span class="p">$</span> ./setup.sh
-<span class="p">$</span> cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
+<span class="p">$</span> cargo build --release --no-default-features \
+    --features cpu,no-cuda,cli --bin arle
 <span class="p">$</span> ./target/release/arle --doctor
-<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B run --prompt <i>"Say hello in one sentence"</i>
+<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B \
+    run --prompt <i>"Say hello in one sentence"</i>
 <span class="p">$</span> ./target/release/arle train env</pre>
-
+</article>
+<article class="mini-card quick-card">
 <h3>&mdash; Serving smoke</h3>
 <pre class="cmd"><span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
 <span class="p">$</span> curl http://127.0.0.1:8000/v1/chat/completions \
     -H <i>'Content-Type: application/json'</i> \
     -d <i>'{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'</i></pre>
+</article>
+</div>
 
 <p class="note">
   Use <code>--features cli</code> for the default CUDA build, <code>metal,no-cuda,cli</code> on Apple Silicon, and <code>cpu,no-cuda,cli</code> for portable smoke paths. <code>./setup.sh</code> bootstraps Rust, Python, Zig, and local checks.
