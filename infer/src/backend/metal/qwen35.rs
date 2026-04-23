@@ -20,8 +20,10 @@ use super::{
 use crate::backend::is_stream_stop_matched;
 use crate::backend::metal::dflash::MetalDflashRuntime;
 use crate::gguf::{
-    GgufFile, find_tensor_name, reverse_v_reorder, reverse_v_reorder_cols, reverse_v_reorder_f32,
-    reverse_v_reorder_rows,
+    GgufFile, HostTensor, find_tensor_name, load_matrix_bf16_host,
+    load_matrix_v_reorder_cols_bf16_host, load_matrix_v_reorder_rows_bf16_host,
+    load_qwen35_a_log_f32_host, load_qwen35_conv1d_bf16_host, load_qwen35_qkv_matrix_bf16_host,
+    load_vector_bf16_host, load_vector_v_reorder_bf16_host,
 };
 use crate::sampler::SamplingParams;
 
@@ -125,37 +127,21 @@ fn mlx_bf16_array(data: &[bf16], shape: &[i32]) -> MlxArray {
     unsafe { MlxArray::from_raw_data(data.as_ptr().cast(), shape, Dtype::Bfloat16) }
 }
 
-fn gguf_matrix_shape(gguf: &GgufFile, hf_name: &str) -> Result<[i32; 2]> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    anyhow::ensure!(
-        info.shape.len() == 2,
-        "expected 2D GGUF tensor for '{hf_name}', got {}D",
-        info.shape.len()
-    );
-    Ok([info.shape[1] as i32, info.shape[0] as i32])
+fn mlx_tensor_shape(shape: &[usize]) -> Vec<i32> {
+    shape
+        .iter()
+        .map(|&dim| i32::try_from(dim).expect("GGUF tensor dim fits in i32"))
+        .collect()
 }
 
-fn gguf_load_matrix_bf16(gguf: &GgufFile, hf_name: &str) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let data = gguf.read_tensor_bf16(&gguf_name)?;
-    Ok(mlx_bf16_array(&data, &gguf_matrix_shape(gguf, hf_name)?))
+fn mlx_bf16_tensor(tensor: HostTensor<bf16>) -> MlxArray {
+    let shape = mlx_tensor_shape(&tensor.shape);
+    mlx_bf16_array(&tensor.data, &shape)
 }
 
-fn gguf_load_vector_bf16(gguf: &GgufFile, hf_name: &str) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    anyhow::ensure!(
-        info.shape.len() == 1,
-        "expected 1D GGUF tensor for '{hf_name}', got {}D",
-        info.shape.len()
-    );
-    let data = gguf.read_tensor_bf16(&gguf_name)?;
-    Ok(mlx_bf16_array(&data, &[info.shape[0] as i32]))
-}
-
-fn gguf_load_direct_norm_vector(gguf: &GgufFile, hf_name: &str) -> Result<MlxArray> {
-    gguf_load_vector_bf16(gguf, hf_name)
+fn mlx_f32_tensor(tensor: HostTensor<f32>) -> MlxArray {
+    let shape = mlx_tensor_shape(&tensor.shape);
+    MlxArray::from_slice_f32(&tensor.data, &shape)
 }
 
 fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
@@ -175,146 +161,6 @@ fn qwen35_normalize_direct_norm_weight(
     }
     let one = as_dtype(&MlxArray::scalar_f32(1.0), weight.dtype());
     add(weight, &one)
-}
-
-fn gguf_load_v_reorder_vector(
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    anyhow::ensure!(
-        info.shape.len() == 1,
-        "expected 1D GGUF tensor for '{hf_name}', got {}D",
-        info.shape.len()
-    );
-    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
-    reverse_v_reorder(&mut data, num_k_heads, num_v_per_k, 1);
-    Ok(mlx_bf16_array(&data, &[info.shape[0] as i32]))
-}
-
-fn gguf_load_v_reorder_rows_matrix(
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    anyhow::ensure!(
-        info.shape.len() == 2,
-        "expected 2D GGUF tensor for '{hf_name}', got {}D",
-        info.shape.len()
-    );
-    let rows = info.shape[1] as usize;
-    let cols = info.shape[0] as usize;
-    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
-    reverse_v_reorder_rows(&mut data, rows, cols, num_k_heads, num_v_per_k, head_dim);
-    Ok(mlx_bf16_array(&data, &[rows as i32, cols as i32]))
-}
-
-fn gguf_load_v_reorder_cols_matrix(
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    head_dim: usize,
-) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    anyhow::ensure!(
-        info.shape.len() == 2,
-        "expected 2D GGUF tensor for '{hf_name}', got {}D",
-        info.shape.len()
-    );
-    let rows = info.shape[1] as usize;
-    let cols = info.shape[0] as usize;
-    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
-    reverse_v_reorder_cols(&mut data, rows, cols, num_k_heads, num_v_per_k, head_dim);
-    Ok(mlx_bf16_array(&data, &[rows as i32, cols as i32]))
-}
-
-fn gguf_load_qwen35_qkv_matrix(
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-    key_head_dim: usize,
-    value_head_dim: usize,
-) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = &gguf.tensors[&gguf_name];
-    anyhow::ensure!(
-        info.shape.len() == 2,
-        "expected 2D GGUF tensor for '{hf_name}', got {}D",
-        info.shape.len()
-    );
-    let cols = info.shape[0] as usize;
-    let q_rows = num_k_heads * key_head_dim;
-    let k_rows = num_k_heads * key_head_dim;
-    let v_rows = num_k_heads * num_v_per_k * value_head_dim;
-    let rows = q_rows + k_rows + v_rows;
-    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
-    let v_start = (q_rows + k_rows) * cols;
-    reverse_v_reorder_rows(
-        &mut data[v_start..v_start + v_rows * cols],
-        v_rows,
-        cols,
-        num_k_heads,
-        num_v_per_k,
-        value_head_dim,
-    );
-    Ok(mlx_bf16_array(&data, &[rows as i32, cols as i32]))
-}
-
-fn gguf_load_qwen35_conv1d(
-    gguf: &GgufFile,
-    hf_name: &str,
-    arch: &MetalQwen35ArchConfig,
-) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let mut data = gguf.read_tensor_bf16(&gguf_name)?;
-    let qk_channels = arch.linear.key_dim * arch.linear.num_key_heads * 2;
-    let v_channels = arch.linear.num_value_heads * arch.linear.value_dim;
-    let kernel_dim = arch.linear.conv_kernel;
-    anyhow::ensure!(
-        data.len() == (qk_channels + v_channels) * kernel_dim,
-        "unexpected conv1d weight size for '{hf_name}': got {}, expected {}",
-        data.len(),
-        (qk_channels + v_channels) * kernel_dim
-    );
-    let v_start = qk_channels * kernel_dim;
-    reverse_v_reorder_rows(
-        &mut data[v_start..v_start + v_channels * kernel_dim],
-        v_channels,
-        kernel_dim,
-        arch.linear.num_key_heads,
-        arch.linear.num_value_heads / arch.linear.num_key_heads,
-        arch.linear.value_dim,
-    );
-    Ok(mlx_bf16_array(
-        &data,
-        &[(qk_channels + v_channels) as i32, kernel_dim as i32, 1],
-    ))
-}
-
-fn gguf_load_qwen35_a_log(
-    gguf: &GgufFile,
-    hf_name: &str,
-    num_k_heads: usize,
-    num_v_per_k: usize,
-) -> Result<MlxArray> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let mut a_log = gguf.read_tensor_f32(&gguf_name)?;
-    for value in &mut a_log {
-        let abs_a = value.abs().max(1e-10);
-        *value = abs_a.ln();
-    }
-    reverse_v_reorder_f32(&mut a_log, num_k_heads, num_v_per_k, 1);
-    Ok(MlxArray::from_slice_f32(&a_log, &[a_log.len() as i32]))
 }
 
 fn dense_weight_from_matrix(matrix: &MlxArray) -> WeightTensor {
@@ -2487,10 +2333,19 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
 
     log::info!("  loading Qwen3.5 GGUF on Metal — dequantizing to BF16 during load");
 
-    let embed_tokens = gguf_load_matrix_bf16(gguf, &format!("{prefix}.embed_tokens.weight"))?;
-    let norm = gguf_load_direct_norm_vector(gguf, &format!("{prefix}.norm.weight"))?;
+    let embed_tokens = mlx_bf16_tensor(load_matrix_bf16_host(
+        gguf,
+        &format!("{prefix}.embed_tokens.weight"),
+    )?);
+    let norm = mlx_bf16_tensor(load_vector_bf16_host(
+        gguf,
+        &format!("{prefix}.norm.weight"),
+    )?);
     let lm_head = if find_tensor_name(gguf, "lm_head.weight").is_ok() {
-        dense_weight_from_matrix(&gguf_load_matrix_bf16(gguf, "lm_head.weight")?)
+        dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+            gguf,
+            "lm_head.weight",
+        )?))
     } else {
         tie_lm_head_from_embed_tokens(&embed_tokens)
     };
@@ -2502,63 +2357,70 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
             MetalQwen35LayerType::FullAttention => {
                 let attn_prefix = format!("{layer_prefix}.self_attn");
                 MetalQwen35Attention::Full(MetalQwen35FullAttentionWeights {
-                    q_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                    q_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.q_proj.weight"),
-                    )?),
-                    k_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                    )?)),
+                    k_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.k_proj.weight"),
-                    )?),
-                    v_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                    )?)),
+                    v_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.v_proj.weight"),
-                    )?),
-                    o_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+                    )?)),
+                    o_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.o_proj.weight"),
-                    )?),
-                    q_norm: gguf_load_direct_norm_vector(
+                    )?)),
+                    q_norm: mlx_bf16_tensor(load_vector_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.q_norm.weight"),
-                    )?,
-                    k_norm: gguf_load_direct_norm_vector(
+                    )?),
+                    k_norm: mlx_bf16_tensor(load_vector_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.k_norm.weight"),
-                    )?,
+                    )?),
                 })
             }
             MetalQwen35LayerType::LinearAttention => {
                 let attn_prefix = format!("{layer_prefix}.linear_attn");
-                let qkv_proj = dense_weight_from_matrix(&gguf_load_qwen35_qkv_matrix(
-                    gguf,
-                    &format!("{attn_prefix}.in_proj_qkv.weight"),
-                    num_k,
-                    num_v_per_k,
-                    key_head_dim,
-                    value_head_dim,
-                )?);
-                let z_proj = dense_weight_from_matrix(&gguf_load_v_reorder_rows_matrix(
-                    gguf,
-                    &format!("{attn_prefix}.in_proj_z.weight"),
-                    num_k,
-                    num_v_per_k,
-                    value_head_dim,
-                )?);
-                let beta_proj = dense_weight_from_matrix(&gguf_load_v_reorder_rows_matrix(
-                    gguf,
-                    &format!("{attn_prefix}.in_proj_b.weight"),
-                    num_k,
-                    num_v_per_k,
-                    1,
-                )?);
-                let alpha_proj = dense_weight_from_matrix(&gguf_load_v_reorder_rows_matrix(
-                    gguf,
-                    &format!("{attn_prefix}.in_proj_a.weight"),
-                    num_k,
-                    num_v_per_k,
-                    1,
-                )?);
+                let qkv_proj =
+                    dense_weight_from_matrix(&mlx_bf16_tensor(load_qwen35_qkv_matrix_bf16_host(
+                        gguf,
+                        &format!("{attn_prefix}.in_proj_qkv.weight"),
+                        num_k,
+                        num_v_per_k,
+                        key_head_dim,
+                        value_head_dim,
+                    )?));
+                let z_proj = dense_weight_from_matrix(&mlx_bf16_tensor(
+                    load_matrix_v_reorder_rows_bf16_host(
+                        gguf,
+                        &format!("{attn_prefix}.in_proj_z.weight"),
+                        num_k,
+                        num_v_per_k,
+                        value_head_dim,
+                    )?,
+                ));
+                let beta_proj = dense_weight_from_matrix(&mlx_bf16_tensor(
+                    load_matrix_v_reorder_rows_bf16_host(
+                        gguf,
+                        &format!("{attn_prefix}.in_proj_b.weight"),
+                        num_k,
+                        num_v_per_k,
+                        1,
+                    )?,
+                ));
+                let alpha_proj = dense_weight_from_matrix(&mlx_bf16_tensor(
+                    load_matrix_v_reorder_rows_bf16_host(
+                        gguf,
+                        &format!("{attn_prefix}.in_proj_a.weight"),
+                        num_k,
+                        num_v_per_k,
+                        1,
+                    )?,
+                ));
                 let qkv_dim = qkv_proj.output_dim()?;
                 let z_dim = z_proj.output_dim()?;
                 let beta_dim = beta_proj.output_dim()?;
@@ -2574,71 +2436,78 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
                     in_proj_a: alpha_proj,
                     qkvz_split: (qkv_dim, z_dim),
                     ba_num_heads: beta_dim,
-                    conv1d_weight: gguf_load_qwen35_conv1d(
+                    conv1d_weight: mlx_bf16_tensor(load_qwen35_conv1d_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.conv1d.weight"),
-                        arch,
-                    )?,
-                    dt_bias: gguf_load_v_reorder_vector(
+                        arch.linear.num_key_heads,
+                        arch.linear.key_dim,
+                        arch.linear.num_value_heads,
+                        arch.linear.value_dim,
+                        arch.linear.conv_kernel,
+                    )?),
+                    dt_bias: mlx_bf16_tensor(load_vector_v_reorder_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.dt_bias"),
                         num_k,
                         num_v_per_k,
-                    )?,
-                    a_log: gguf_load_qwen35_a_log(
+                        1,
+                    )?),
+                    a_log: mlx_f32_tensor(load_qwen35_a_log_f32_host(
                         gguf,
                         &format!("{attn_prefix}.a_log"),
                         num_k,
                         num_v_per_k,
-                    )?,
-                    norm_weight: gguf_load_vector_bf16(
+                    )?),
+                    norm_weight: mlx_bf16_tensor(load_vector_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.norm.weight"),
-                    )?,
-                    out_proj: dense_weight_from_matrix(&gguf_load_v_reorder_cols_matrix(
-                        gguf,
-                        &format!("{attn_prefix}.out_proj.weight"),
-                        num_k,
-                        num_v_per_k,
-                        value_head_dim,
                     )?),
+                    out_proj: dense_weight_from_matrix(&mlx_bf16_tensor(
+                        load_matrix_v_reorder_cols_bf16_host(
+                            gguf,
+                            &format!("{attn_prefix}.out_proj.weight"),
+                            num_k,
+                            num_v_per_k,
+                            value_head_dim,
+                        )?,
+                    )),
                     q_scale: MlxArray::scalar_f32(inv_scale * inv_scale),
                     k_scale: MlxArray::scalar_f32(inv_scale),
                 })
             }
         };
 
-        let gate_proj = dense_weight_from_matrix(&gguf_load_matrix_bf16(
+        let gate_proj = dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
             gguf,
             &format!("{layer_prefix}.mlp.gate_proj.weight"),
-        )?);
-        let up_proj = dense_weight_from_matrix(&gguf_load_matrix_bf16(
+        )?));
+        let up_proj = dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
             gguf,
             &format!("{layer_prefix}.mlp.up_proj.weight"),
-        )?);
+        )?));
         let mlp = MlpKind::Dense(MetalQwen35DenseMlpWeights {
             inputs: MlpInputProjection::Split {
                 gate_proj: gate_proj.clone(),
                 up_proj: up_proj.clone(),
             },
-            down_proj: dense_weight_from_matrix(&gguf_load_matrix_bf16(
+            down_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
                 gguf,
                 &format!("{layer_prefix}.mlp.down_proj.weight"),
-            )?),
+            )?)),
             gate_proj,
             up_proj,
         });
 
         layers.push(MetalQwen35BlockWeights {
-            input_layernorm: gguf_load_direct_norm_vector(
+            input_layernorm: mlx_bf16_tensor(load_vector_bf16_host(
                 gguf,
                 &format!("{layer_prefix}.input_layernorm.weight"),
-            )?,
+            )?),
             attention,
-            post_attention_layernorm: gguf_load_direct_norm_vector(
+            post_attention_layernorm: mlx_bf16_tensor(load_vector_bf16_host(
                 gguf,
                 &format!("{layer_prefix}.post_attention_layernorm.weight"),
-            )?,
+            )?),
             mlp,
         });
     }
@@ -2995,6 +2864,7 @@ mod tests {
         weights::load_qwen3_metal_weights,
     };
     use crate::test_support::metal_test_guard;
+    use crate::tokenizer::Tokenizer;
 
     fn slice_row_for_sampling(array: &MlxArray, row: i32) -> MlxArray {
         let mut start = vec![0; array.shape().len()];
@@ -3065,6 +2935,258 @@ mod tests {
                     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/Qwen3-0.6B");
                 fallback.exists().then_some(fallback)
             })
+    }
+
+    fn qwen35_safetensors_model_path() -> Option<PathBuf> {
+        env::var_os("QWEN35_MODEL_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                let fallback =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/Qwen3.5-0.8B");
+                fallback.exists().then_some(fallback)
+            })
+    }
+
+    fn qwen35_gguf_model_path() -> Option<PathBuf> {
+        env::var_os("QWEN35_GGUF_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf");
+                fallback.exists().then_some(fallback)
+            })
+    }
+
+    fn dense_weight_f32(weight: &WeightTensor) -> Result<MlxArray> {
+        match weight {
+            WeightTensor::Dense(tensor) => {
+                let tensor = as_dtype(tensor, Dtype::Float32);
+                eval(&[&tensor]);
+                Ok(tensor)
+            }
+            WeightTensor::Quantized { .. } => anyhow::bail!("expected dense weight tensor"),
+        }
+    }
+
+    fn tensor_diff_stats(lhs: &MlxArray, rhs: &MlxArray) -> (f32, usize, f32, f32) {
+        let lhs = as_dtype(lhs, Dtype::Float32);
+        let rhs = as_dtype(rhs, Dtype::Float32);
+        eval(&[&lhs, &rhs]);
+        assert_eq!(lhs.shape(), rhs.shape(), "shape mismatch");
+
+        let lhs_slice = lhs.as_slice_f32();
+        let rhs_slice = rhs.as_slice_f32();
+        let mut max_abs = 0.0_f32;
+        let mut max_idx = 0_usize;
+        let mut diff_sq = 0.0_f32;
+        let mut rhs_sq = 0.0_f32;
+        for (idx, (&lhs_value, &rhs_value)) in lhs_slice.iter().zip(rhs_slice.iter()).enumerate() {
+            let diff = lhs_value - rhs_value;
+            let abs = diff.abs();
+            if abs > max_abs {
+                max_abs = abs;
+                max_idx = idx;
+            }
+            diff_sq += diff * diff;
+            rhs_sq += rhs_value * rhs_value;
+        }
+
+        let rms = (diff_sq / lhs_slice.len().max(1) as f32).sqrt();
+        let rel_rms = rms / rhs_sq.max(1e-12).sqrt();
+        (max_abs, max_idx, rms, rel_rms)
+    }
+
+    fn print_tensor_diff(name: &str, lhs: &MlxArray, rhs: &MlxArray) {
+        let lhs = as_dtype(lhs, Dtype::Float32);
+        let rhs = as_dtype(rhs, Dtype::Float32);
+        eval(&[&lhs, &rhs]);
+        assert_eq!(lhs.shape(), rhs.shape(), "{name}: shape mismatch");
+
+        let lhs_slice = lhs.as_slice_f32();
+        let rhs_slice = rhs.as_slice_f32();
+        let (max_abs, max_idx, rms, rel_rms) = tensor_diff_stats(&lhs, &rhs);
+        let head_len = lhs_slice.len().min(8);
+        eprintln!(
+            "{name}: shape={:?} max_abs={max_abs:.6} @ {max_idx} rms={rms:.6} rel_rms={rel_rms:.6} lhs_head={:?} rhs_head={:?}",
+            lhs.shape(),
+            &lhs_slice[..head_len],
+            &rhs_slice[..head_len],
+        );
+    }
+
+    fn print_tensor_diff_with_transpose_hint(name: &str, lhs: &MlxArray, rhs: &MlxArray) {
+        print_tensor_diff(name, lhs, rhs);
+        if lhs.shape().len() != 2 || rhs.shape().len() != 2 {
+            return;
+        }
+        let rhs_t = transpose_axes(rhs, &[1, 0]);
+        eval(&[&rhs_t]);
+        if lhs.shape() != rhs_t.shape() {
+            eprintln!(
+                "{name}: transpose_hint skipped lhs_shape={:?} rhs_t_shape={:?}",
+                lhs.shape(),
+                rhs_t.shape(),
+            );
+            return;
+        }
+        let (max_abs, max_idx, rms, rel_rms) = tensor_diff_stats(lhs, &rhs_t);
+        eprintln!(
+            "{name}: transpose_hint max_abs={max_abs:.6} @ {max_idx} rms={rms:.6} rel_rms={rel_rms:.6}",
+        );
+    }
+
+    fn print_embed_row_diff(name: &str, lhs: &MlxArray, rhs: &MlxArray, row: i32, width: i32) {
+        let lhs_row = slice(lhs, &[row, 0], &[row + 1, width], &[1, 1]);
+        let rhs_row = slice(rhs, &[row, 0], &[row + 1, width], &[1, 1]);
+        print_tensor_diff(name, &lhs_row, &rhs_row);
+    }
+
+    fn print_gguf_tensor_info(gguf: &GgufFile, hf_name: &str) -> Result<()> {
+        let Ok(gguf_name) = find_tensor_name(gguf, hf_name) else {
+            eprintln!("{hf_name}: gguf lookup missing");
+            return Ok(());
+        };
+        let info = &gguf.tensors[&gguf_name];
+        let raw_len = gguf.read_tensor_raw(&gguf_name)?.len();
+        eprintln!(
+            "{hf_name}: gguf_name={gguf_name} dtype={:?} shape={:?} raw_bytes={} size_bytes={}",
+            info.dtype,
+            info.shape,
+            raw_len,
+            info.size_bytes(),
+        );
+        Ok(())
+    }
+
+    fn topk_logits(logits: &MlxArray, k: usize) -> Vec<(usize, f32)> {
+        let logits = as_dtype(logits, Dtype::Float32);
+        eval(&[&logits]);
+        let shape = logits.shape();
+        let slice = logits.as_slice_f32();
+        let row = match shape {
+            [vocab] => &slice[..*vocab as usize],
+            [batch, vocab] => {
+                let batch = *batch as usize;
+                let vocab = *vocab as usize;
+                let start = batch.saturating_sub(1) * vocab;
+                &slice[start..start + vocab]
+            }
+            other => panic!("unexpected logits shape: {other:?}"),
+        };
+
+        let mut pairs: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+        pairs.sort_unstable_by(|lhs, rhs| rhs.1.total_cmp(&lhs.1));
+        pairs.truncate(k);
+        pairs
+    }
+
+    fn clone_linear_attn_weights(weights: &MetalLinearAttnWeights) -> MetalLinearAttnWeights {
+        MetalLinearAttnWeights {
+            in_proj_qkvz: weights.in_proj_qkvz.clone(),
+            in_proj_ba: weights.in_proj_ba.clone(),
+            in_proj_qkv: weights.in_proj_qkv.clone(),
+            in_proj_z: weights.in_proj_z.clone(),
+            in_proj_b: weights.in_proj_b.clone(),
+            in_proj_a: weights.in_proj_a.clone(),
+            qkvz_split: weights.qkvz_split,
+            ba_num_heads: weights.ba_num_heads,
+            conv1d_weight: weights.conv1d_weight.clone(),
+            dt_bias: weights.dt_bias.clone(),
+            a_log: weights.a_log.clone(),
+            norm_weight: weights.norm_weight.clone(),
+            out_proj: weights.out_proj.clone(),
+            q_scale: weights.q_scale.clone(),
+            k_scale: weights.k_scale.clone(),
+        }
+    }
+
+    fn clone_dense_mlp_weights(weights: &MetalQwen35DenseMlpWeights) -> MetalQwen35DenseMlpWeights {
+        MetalQwen35DenseMlpWeights {
+            inputs: MlpInputProjection::Split {
+                gate_proj: weights.gate_proj.clone(),
+                up_proj: weights.up_proj.clone(),
+            },
+            down_proj: weights.down_proj.clone(),
+            gate_proj: weights.gate_proj.clone(),
+            up_proj: weights.up_proj.clone(),
+        }
+    }
+
+    fn clone_dense_mlp_kind(mlp: &MlpKind) -> Result<MlpKind> {
+        match mlp {
+            MlpKind::Dense(weights) => Ok(MlpKind::Dense(clone_dense_mlp_weights(weights))),
+            MlpKind::Moe(_) => anyhow::bail!("expected dense MLP"),
+        }
+    }
+
+    fn clone_linear_block(block: &MetalQwen35BlockWeights) -> Result<MetalQwen35BlockWeights> {
+        let attention = match &block.attention {
+            MetalQwen35Attention::Linear(attn) => {
+                MetalQwen35Attention::Linear(clone_linear_attn_weights(attn))
+            }
+            MetalQwen35Attention::Full(_) => anyhow::bail!("expected linear-attention block"),
+        };
+        Ok(MetalQwen35BlockWeights {
+            input_layernorm: block.input_layernorm.clone(),
+            attention,
+            post_attention_layernorm: block.post_attention_layernorm.clone(),
+            mlp: clone_dense_mlp_kind(&block.mlp)?,
+        })
+    }
+
+    fn forward_linear_block_outputs(
+        x: &MlxArray,
+        block: &MetalQwen35BlockWeights,
+        arch: &MetalQwen35ArchConfig,
+        config: &MetalModelConfig,
+    ) -> Result<(MlxArray, MlxArray)> {
+        let MetalQwen35Attention::Linear(attn) = &block.attention else {
+            anyhow::bail!("expected linear-attention block");
+        };
+        let mut recurrent = MetalRecurrentState::new(1, &arch.linear);
+        let attn_out = fused_gdr_step(
+            x,
+            &block.input_layernorm,
+            attn,
+            &mut recurrent,
+            0,
+            &arch.linear,
+            config,
+        );
+        let after_attn = add(x, &attn_out);
+        let xn = rms_norm_last_dim(
+            &after_attn,
+            &block.post_attention_layernorm,
+            config.rms_norm_eps as f32,
+            config.norm_weight_mode.uses_offset(),
+        );
+        let mlp = mlp_forward(&block.mlp, &xn);
+        let after_block = add(&after_attn, &mlp);
+        Ok((after_attn, after_block))
+    }
+
+    fn print_linear_block_mix_diff(
+        name: &str,
+        x: &MlxArray,
+        block: &MetalQwen35BlockWeights,
+        st_after_attn: &MlxArray,
+        st_after_block: &MlxArray,
+        arch: &MetalQwen35ArchConfig,
+        config: &MetalModelConfig,
+    ) -> Result<()> {
+        let (mix_after_attn, mix_after_block) =
+            forward_linear_block_outputs(x, block, arch, config)?;
+        print_tensor_diff(
+            &format!("{name}.after_attn"),
+            st_after_attn,
+            &mix_after_attn,
+        );
+        print_tensor_diff(
+            &format!("{name}.after_block"),
+            st_after_block,
+            &mix_after_block,
+        );
+        Ok(())
     }
 
     #[test]
@@ -3441,6 +3563,794 @@ mod tests {
                 .sum::<f32>()
                 .sqrt();
             eprintln!("layer {layer_idx:02} norm={norm:.6}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "debug helper for comparing loaded Qwen3.5 safetensors vs GGUF tensors"]
+    fn compare_qwen35_0p8b_loaded_tensors_safetensors_vs_gguf() -> Result<()> {
+        let Some(model_path) = qwen35_safetensors_model_path() else {
+            eprintln!("QWEN35_MODEL_PATH unset and ../models/Qwen3.5-0.8B missing; skipping");
+            return Ok(());
+        };
+        let Some(gguf_path) = qwen35_gguf_model_path() else {
+            eprintln!(
+                "QWEN35_GGUF_PATH unset and ../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf missing; skipping"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let gguf = GgufFile::open(gguf_path.to_str().context("invalid GGUF path")?)?;
+        let safetensors = load_qwen35_metal_weights(&model_path, &config)?;
+        let gguf_weights = load_qwen35_metal_weights_from_gguf(&gguf, &config)?;
+
+        print_gguf_tensor_info(&gguf, "model.norm.weight")?;
+        print_tensor_diff("final_norm", &safetensors.norm, &gguf_weights.norm);
+        print_gguf_tensor_info(&gguf, "model.embed_tokens.weight")?;
+        print_embed_row_diff(
+            "embed_tokens[row0, :64]",
+            &safetensors.embed_tokens,
+            &gguf_weights.embed_tokens,
+            0,
+            64,
+        );
+        print_embed_row_diff(
+            "embed_tokens[row9419, :64]",
+            &safetensors.embed_tokens,
+            &gguf_weights.embed_tokens,
+            9419,
+            64,
+        );
+
+        let full_idx = arch
+            .layer_types
+            .iter()
+            .position(|layer| *layer == MetalQwen35LayerType::FullAttention)
+            .context("missing full-attention layer")?;
+        let linear_idx = arch
+            .layer_types
+            .iter()
+            .position(|layer| *layer == MetalQwen35LayerType::LinearAttention)
+            .context("missing linear-attention layer")?;
+
+        let full_s = &safetensors.layers[full_idx];
+        let full_g = &gguf_weights.layers[full_idx];
+        print_gguf_tensor_info(
+            &gguf,
+            &format!("model.layers.{full_idx}.input_layernorm.weight"),
+        )?;
+        print_tensor_diff(
+            &format!("layer{full_idx}.input_layernorm"),
+            &full_s.input_layernorm,
+            &full_g.input_layernorm,
+        );
+        if let (MetalQwen35Attention::Full(full_s), MetalQwen35Attention::Full(full_g)) =
+            (&full_s.attention, &full_g.attention)
+        {
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{full_idx}.self_attn.q_norm.weight"),
+            )?;
+            print_tensor_diff(
+                &format!("layer{full_idx}.self_attn.q_norm"),
+                &full_s.q_norm,
+                &full_g.q_norm,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{full_idx}.self_attn.k_norm.weight"),
+            )?;
+            print_tensor_diff(
+                &format!("layer{full_idx}.self_attn.k_norm"),
+                &full_s.k_norm,
+                &full_g.k_norm,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{full_idx}.self_attn.q_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{full_idx}.self_attn.q_proj"),
+                &dense_weight_f32(&full_s.q_proj)?,
+                &dense_weight_f32(&full_g.q_proj)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{full_idx}.self_attn.k_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{full_idx}.self_attn.k_proj"),
+                &dense_weight_f32(&full_s.k_proj)?,
+                &dense_weight_f32(&full_g.k_proj)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{full_idx}.self_attn.v_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{full_idx}.self_attn.v_proj"),
+                &dense_weight_f32(&full_s.v_proj)?,
+                &dense_weight_f32(&full_g.v_proj)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{full_idx}.self_attn.o_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{full_idx}.self_attn.o_proj"),
+                &dense_weight_f32(&full_s.o_proj)?,
+                &dense_weight_f32(&full_g.o_proj)?,
+            );
+        }
+
+        let linear_s = &safetensors.layers[linear_idx];
+        let linear_g = &gguf_weights.layers[linear_idx];
+        print_gguf_tensor_info(
+            &gguf,
+            &format!("model.layers.{linear_idx}.input_layernorm.weight"),
+        )?;
+        print_tensor_diff(
+            &format!("layer{linear_idx}.input_layernorm"),
+            &linear_s.input_layernorm,
+            &linear_g.input_layernorm,
+        );
+        if let (MetalQwen35Attention::Linear(linear_s), MetalQwen35Attention::Linear(linear_g)) =
+            (&linear_s.attention, &linear_g.attention)
+        {
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.in_proj_qkv.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.linear_attn.in_proj_qkv"),
+                &dense_weight_f32(&linear_s.in_proj_qkv)?,
+                &dense_weight_f32(&linear_g.in_proj_qkv)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.in_proj_z.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.linear_attn.in_proj_z"),
+                &dense_weight_f32(&linear_s.in_proj_z)?,
+                &dense_weight_f32(&linear_g.in_proj_z)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.in_proj_b.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.linear_attn.in_proj_b"),
+                &dense_weight_f32(&linear_s.in_proj_b)?,
+                &dense_weight_f32(&linear_g.in_proj_b)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.in_proj_a.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.linear_attn.in_proj_a"),
+                &dense_weight_f32(&linear_s.in_proj_a)?,
+                &dense_weight_f32(&linear_g.in_proj_a)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.conv1d.weight"),
+            )?;
+            print_tensor_diff(
+                &format!("layer{linear_idx}.linear_attn.conv1d_weight"),
+                &linear_s.conv1d_weight,
+                &linear_g.conv1d_weight,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.dt_bias"),
+            )?;
+            print_tensor_diff(
+                &format!("layer{linear_idx}.linear_attn.dt_bias"),
+                &linear_s.dt_bias,
+                &linear_g.dt_bias,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.a_log"),
+            )?;
+            print_tensor_diff(
+                &format!("layer{linear_idx}.linear_attn.a_log"),
+                &linear_s.a_log,
+                &linear_g.a_log,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.norm.weight"),
+            )?;
+            print_tensor_diff(
+                &format!("layer{linear_idx}.linear_attn.norm_weight"),
+                &linear_s.norm_weight,
+                &linear_g.norm_weight,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.linear_attn.out_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.linear_attn.out_proj"),
+                &dense_weight_f32(&linear_s.out_proj)?,
+                &dense_weight_f32(&linear_g.out_proj)?,
+            );
+        }
+
+        if let (MlpKind::Dense(mlp_s), MlpKind::Dense(mlp_g)) = (&linear_s.mlp, &linear_g.mlp) {
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.mlp.gate_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.mlp.gate_proj"),
+                &dense_weight_f32(&mlp_s.gate_proj)?,
+                &dense_weight_f32(&mlp_g.gate_proj)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.mlp.up_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.mlp.up_proj"),
+                &dense_weight_f32(&mlp_s.up_proj)?,
+                &dense_weight_f32(&mlp_g.up_proj)?,
+            );
+            print_gguf_tensor_info(
+                &gguf,
+                &format!("model.layers.{linear_idx}.mlp.down_proj.weight"),
+            )?;
+            print_tensor_diff_with_transpose_hint(
+                &format!("layer{linear_idx}.mlp.down_proj"),
+                &dense_weight_f32(&mlp_s.down_proj)?,
+                &dense_weight_f32(&mlp_g.down_proj)?,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "debug helper for comparing Qwen3.5 safetensors vs GGUF first-token logits"]
+    fn compare_qwen35_0p8b_first_token_logits_safetensors_vs_gguf() -> Result<()> {
+        let Some(model_path) = qwen35_safetensors_model_path() else {
+            eprintln!("QWEN35_MODEL_PATH unset and ../models/Qwen3.5-0.8B missing; skipping");
+            return Ok(());
+        };
+        let Some(gguf_path) = qwen35_gguf_model_path() else {
+            eprintln!(
+                "QWEN35_GGUF_PATH unset and ../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf missing; skipping"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let tokenizer = Tokenizer::from_file(model_path.to_str().context("invalid model path")?)?;
+        let input_ids = tokenizer.encode("Hello")?;
+        eprintln!("input_ids={input_ids:?}");
+
+        let gguf = GgufFile::open(gguf_path.to_str().context("invalid GGUF path")?)?;
+        let safetensors = load_qwen35_metal_weights(&model_path, &config)?;
+        let gguf_weights = load_qwen35_metal_weights_from_gguf(&gguf, &config)?;
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            input_ids.len() as i32 + 8,
+            config.head_dim as i32,
+        ];
+        let init_kv = || {
+            (
+                (0..num_full_layers)
+                    .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+                    .collect::<Vec<_>>(),
+                (0..num_full_layers)
+                    .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let (mut st_k, mut st_v) = init_kv();
+        let (mut gg_k, mut gg_v) = init_kv();
+        let mut st_recurrent =
+            MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+        let mut gg_recurrent =
+            MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+
+        let target_layer = config.num_hidden_layers - 1;
+        let (st_logits, st_hidden) = qwen35_forward_with_hidden_states(
+            &input_ids,
+            &safetensors,
+            &config,
+            arch,
+            &mut st_k,
+            &mut st_v,
+            &mut st_recurrent,
+            0,
+            &[target_layer],
+        );
+        let (gg_logits, gg_hidden) = qwen35_forward_with_hidden_states(
+            &input_ids,
+            &gguf_weights,
+            &config,
+            arch,
+            &mut gg_k,
+            &mut gg_v,
+            &mut gg_recurrent,
+            0,
+            &[target_layer],
+        );
+
+        print_tensor_diff("final_hidden", &st_hidden, &gg_hidden);
+
+        let st_final_norm = rms_norm_last_dim(
+            &st_hidden,
+            &safetensors.norm,
+            config.rms_norm_eps as f32,
+            config.norm_weight_mode.uses_offset(),
+        );
+        let gg_final_norm = rms_norm_last_dim(
+            &gg_hidden,
+            &gguf_weights.norm,
+            config.rms_norm_eps as f32,
+            config.norm_weight_mode.uses_offset(),
+        );
+        let st_hidden_st_lm = linear(&st_final_norm, &safetensors.lm_head);
+        let st_hidden_gg_lm = linear(&st_final_norm, &gguf_weights.lm_head);
+        let gg_hidden_st_lm = linear(&gg_final_norm, &safetensors.lm_head);
+        let gg_hidden_gg_lm = linear(&gg_final_norm, &gguf_weights.lm_head);
+
+        let st_top = topk_logits(&st_logits, 8);
+        let gg_top = topk_logits(&gg_logits, 8);
+        let st_hidden_st_lm_top = topk_logits(&st_hidden_st_lm, 4);
+        let st_hidden_gg_lm_top = topk_logits(&st_hidden_gg_lm, 4);
+        let gg_hidden_st_lm_top = topk_logits(&gg_hidden_st_lm, 4);
+        let gg_hidden_gg_lm_top = topk_logits(&gg_hidden_gg_lm, 4);
+        let decode = |id: usize| {
+            tokenizer
+                .decode(&[id as u32])
+                .unwrap_or_else(|_| "<decode err>".into())
+        };
+
+        eprintln!("safetensors_top8:");
+        for (id, logit) in &st_top {
+            eprintln!("  id={id} logit={logit:.6} text={:?}", decode(*id));
+        }
+        eprintln!("gguf_top8:");
+        for (id, logit) in &gg_top {
+            eprintln!("  id={id} logit={logit:.6} text={:?}", decode(*id));
+        }
+        eprintln!("cross_top4 st_hidden + st_lm_head:");
+        for (id, logit) in &st_hidden_st_lm_top {
+            eprintln!("  id={id} logit={logit:.6} text={:?}", decode(*id));
+        }
+        eprintln!("cross_top4 st_hidden + gg_lm_head:");
+        for (id, logit) in &st_hidden_gg_lm_top {
+            eprintln!("  id={id} logit={logit:.6} text={:?}", decode(*id));
+        }
+        eprintln!("cross_top4 gg_hidden + st_lm_head:");
+        for (id, logit) in &gg_hidden_st_lm_top {
+            eprintln!("  id={id} logit={logit:.6} text={:?}", decode(*id));
+        }
+        eprintln!("cross_top4 gg_hidden + gg_lm_head:");
+        for (id, logit) in &gg_hidden_gg_lm_top {
+            eprintln!("  id={id} logit={logit:.6} text={:?}", decode(*id));
+        }
+
+        let st_sampled = gpu_sample_token(
+            &st_logits,
+            &crate::sampler::SamplingParams {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        );
+        let gg_sampled = gpu_sample_token(
+            &gg_logits,
+            &crate::sampler::SamplingParams {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        );
+        eval(&[&st_sampled, &gg_sampled]);
+        let st_id = st_sampled.item_i32() as usize;
+        let gg_id = gg_sampled.item_i32() as usize;
+        eprintln!(
+            "sampled: safetensors id={st_id} text={:?} | gguf id={gg_id} text={:?}",
+            decode(st_id),
+            decode(gg_id),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "debug helper for comparing Qwen3.5 safetensors vs GGUF layer-wise hidden states"]
+    fn compare_qwen35_0p8b_layerwise_hidden_safetensors_vs_gguf() -> Result<()> {
+        let Some(model_path) = qwen35_safetensors_model_path() else {
+            eprintln!("QWEN35_MODEL_PATH unset and ../models/Qwen3.5-0.8B missing; skipping");
+            return Ok(());
+        };
+        let Some(gguf_path) = qwen35_gguf_model_path() else {
+            eprintln!(
+                "QWEN35_GGUF_PATH unset and ../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf missing; skipping"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let tokenizer = Tokenizer::from_file(model_path.to_str().context("invalid model path")?)?;
+        let input_ids = tokenizer.encode("Hello")?;
+        eprintln!("input_ids={input_ids:?}");
+
+        let gguf = GgufFile::open(gguf_path.to_str().context("invalid GGUF path")?)?;
+        let safetensors = load_qwen35_metal_weights(&model_path, &config)?;
+        let gguf_weights = load_qwen35_metal_weights_from_gguf(&gguf, &config)?;
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            input_ids.len() as i32 + 8,
+            config.head_dim as i32,
+        ];
+        let init_kv = || {
+            (
+                (0..num_full_layers)
+                    .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+                    .collect::<Vec<_>>(),
+                (0..num_full_layers)
+                    .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let target_layers: Vec<usize> = (0..config.num_hidden_layers).collect();
+
+        let (mut st_k, mut st_v) = init_kv();
+        let (mut gg_k, mut gg_v) = init_kv();
+        let mut st_recurrent =
+            MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+        let mut gg_recurrent =
+            MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+
+        let (_, st_hidden) = qwen35_forward_with_hidden_states(
+            &input_ids,
+            &safetensors,
+            &config,
+            arch,
+            &mut st_k,
+            &mut st_v,
+            &mut st_recurrent,
+            0,
+            &target_layers,
+        );
+        let (_, gg_hidden) = qwen35_forward_with_hidden_states(
+            &input_ids,
+            &gguf_weights,
+            &config,
+            arch,
+            &mut gg_k,
+            &mut gg_v,
+            &mut gg_recurrent,
+            0,
+            &target_layers,
+        );
+
+        let st_hidden = as_dtype(&st_hidden, Dtype::Float32);
+        let gg_hidden = as_dtype(&gg_hidden, Dtype::Float32);
+        eval(&[&st_hidden, &gg_hidden]);
+        let st_slice = st_hidden.as_slice_f32();
+        let gg_slice = gg_hidden.as_slice_f32();
+        let hidden_size = config.hidden_size;
+        for layer_idx in 0..config.num_hidden_layers {
+            let start = layer_idx * hidden_size;
+            let end = start + hidden_size;
+            let st_layer =
+                MlxArray::from_slice_f32(&st_slice[start..end], &[1, hidden_size as i32]);
+            let gg_layer =
+                MlxArray::from_slice_f32(&gg_slice[start..end], &[1, hidden_size as i32]);
+            print_tensor_diff(&format!("layer{layer_idx}.hidden"), &st_layer, &gg_layer);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "debug helper for isolating the first divergent Qwen3.5 GGUF layer0 subgroup"]
+    fn compare_qwen35_0p8b_layer0_linear_subgroup_ablation() -> Result<()> {
+        let Some(model_path) = qwen35_safetensors_model_path() else {
+            eprintln!("QWEN35_MODEL_PATH unset and ../models/Qwen3.5-0.8B missing; skipping");
+            return Ok(());
+        };
+        let Some(gguf_path) = qwen35_gguf_model_path() else {
+            eprintln!(
+                "QWEN35_GGUF_PATH unset and ../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf missing; skipping"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        anyhow::ensure!(
+            arch.layer_types.first() == Some(&MetalQwen35LayerType::LinearAttention),
+            "expected Qwen3.5-0.8B layer0 to be linear attention"
+        );
+
+        let tokenizer = Tokenizer::from_file(model_path.to_str().context("invalid model path")?)?;
+        let input_ids = tokenizer.encode("Hello")?;
+        anyhow::ensure!(
+            !input_ids.is_empty(),
+            "expected non-empty tokenized prompt for layer0 ablation"
+        );
+        let token = MlxArray::from_slice_i32(&[input_ids[0] as i32], &[1]);
+
+        let gguf = GgufFile::open(gguf_path.to_str().context("invalid GGUF path")?)?;
+        let safetensors = load_qwen35_metal_weights(&model_path, &config)?;
+        let gguf_weights = load_qwen35_metal_weights_from_gguf(&gguf, &config)?;
+
+        let x = take_axis(&safetensors.embed_tokens, &token, 0);
+        let st_block = clone_linear_block(&safetensors.layers[0])?;
+        let gg_block = clone_linear_block(&gguf_weights.layers[0])?;
+
+        let (st_after_attn, st_after_block) =
+            forward_linear_block_outputs(&x, &st_block, arch, &config)?;
+        let (gg_after_attn, gg_after_block) =
+            forward_linear_block_outputs(&x, &gg_block, arch, &config)?;
+        print_tensor_diff("layer0.gguf.after_attn", &st_after_attn, &gg_after_attn);
+        print_tensor_diff("layer0.gguf.after_block", &st_after_block, &gg_after_block);
+
+        let (
+            MetalQwen35Attention::Linear(st_attn),
+            MetalQwen35Attention::Linear(gg_attn),
+            MlpKind::Dense(st_mlp),
+            MlpKind::Dense(gg_mlp),
+        ) = (
+            &st_block.attention,
+            &gg_block.attention,
+            &st_block.mlp,
+            &gg_block.mlp,
+        )
+        else {
+            anyhow::bail!("expected dense linear-attention layer0");
+        };
+
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            mix.input_layernorm = gg_block.input_layernorm.clone();
+            print_linear_block_mix_diff(
+                "layer0.swap_input_layernorm",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.in_proj_qkvz = gg_attn.in_proj_qkvz.clone();
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_in_proj_qkvz",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.in_proj_qkv = gg_attn.in_proj_qkv.clone();
+                attn.in_proj_qkvz = concat_dense_weights(&gg_attn.in_proj_qkv, &st_attn.in_proj_z)?;
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_in_proj_qkv_only",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.in_proj_z = gg_attn.in_proj_z.clone();
+                attn.in_proj_qkvz = concat_dense_weights(&st_attn.in_proj_qkv, &gg_attn.in_proj_z)?;
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_in_proj_z_only",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.in_proj_ba = gg_attn.in_proj_ba.clone();
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_in_proj_ba",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.conv1d_weight = gg_attn.conv1d_weight.clone();
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_conv1d",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.dt_bias = gg_attn.dt_bias.clone();
+                attn.a_log = gg_attn.a_log.clone();
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_gate_params",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.norm_weight = gg_attn.norm_weight.clone();
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_linear_norm",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            if let MetalQwen35Attention::Linear(attn) = &mut mix.attention {
+                attn.out_proj = gg_attn.out_proj.clone();
+            }
+            print_linear_block_mix_diff(
+                "layer0.swap_out_proj",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            mix.post_attention_layernorm = gg_block.post_attention_layernorm.clone();
+            print_linear_block_mix_diff(
+                "layer0.swap_post_attention_layernorm",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            mix.mlp = MlpKind::Dense(clone_dense_mlp_weights(gg_mlp));
+            print_linear_block_mix_diff(
+                "layer0.swap_mlp_all",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            mix.mlp = MlpKind::Dense(MetalQwen35DenseMlpWeights {
+                inputs: MlpInputProjection::Split {
+                    gate_proj: gg_mlp.gate_proj.clone(),
+                    up_proj: gg_mlp.up_proj.clone(),
+                },
+                down_proj: st_mlp.down_proj.clone(),
+                gate_proj: gg_mlp.gate_proj.clone(),
+                up_proj: gg_mlp.up_proj.clone(),
+            });
+            print_linear_block_mix_diff(
+                "layer0.swap_mlp_gate_up",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            mix.mlp = MlpKind::Dense(MetalQwen35DenseMlpWeights {
+                inputs: MlpInputProjection::Split {
+                    gate_proj: st_mlp.gate_proj.clone(),
+                    up_proj: st_mlp.up_proj.clone(),
+                },
+                down_proj: gg_mlp.down_proj.clone(),
+                gate_proj: st_mlp.gate_proj.clone(),
+                up_proj: st_mlp.up_proj.clone(),
+            });
+            print_linear_block_mix_diff(
+                "layer0.swap_mlp_down_proj",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
+        }
+        {
+            let mut mix = clone_linear_block(&st_block)?;
+            mix.attention = MetalQwen35Attention::Linear(clone_linear_attn_weights(gg_attn));
+            print_linear_block_mix_diff(
+                "layer0.swap_attention_all",
+                &x,
+                &mix,
+                &st_after_attn,
+                &st_after_block,
+                arch,
+                &config,
+            )?;
         }
 
         Ok(())

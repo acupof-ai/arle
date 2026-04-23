@@ -447,7 +447,10 @@ impl Qwen35Model {
         gguf: &crate::gguf::GgufFile,
         enable_cuda_graph: bool,
     ) -> Result<Self> {
-        use crate::gguf::{find_tensor_name, reverse_v_reorder_f32, reverse_v_reorder_rows};
+        use crate::gguf::{
+            load_qwen35_a_log_f32_host, load_qwen35_conv1d_bf16_host,
+            load_qwen35_qkv_matrix_bf16_host, load_vector_f32_host,
+        };
         use crate::weight_loader::{
             load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_v_reorder, load_tensor_2d_gguf,
             load_tensor_2d_gguf_bf16, load_tensor_2d_gguf_v_reorder_cols,
@@ -504,29 +507,21 @@ impl Qwen35Model {
                 LayerType::LinearAttention => {
                     let ap = format!("{p}.linear_attn");
                     LayerKind::LinearAttention(LinearAttentionLayer {
-                        // QKV: only V rows are reordered (Q/K stay in place)
-                        // Ref: llama.cpp _LinearAttentionVReorderBase.modify_tensors
                         in_proj_qkv: {
-                            let q_rows = num_k * hd_k;
-                            let k_rows = num_k * hd_k;
-                            let v_rows = num_v * hd_v;
-                            let gguf_name =
-                                find_tensor_name(gguf, &format!("{ap}.in_proj_qkv.weight"))?;
-                            let info = &gguf.tensors[&gguf_name];
-                            let mut data = gguf.read_tensor_bf16(&gguf_name)?;
-                            let cols = info.shape[0] as usize;
-                            // Reorder only V rows
-                            let v_start = (q_rows + k_rows) * cols;
-                            reverse_v_reorder_rows(
-                                &mut data[v_start..v_start + v_rows * cols],
-                                v_rows,
-                                cols,
+                            let tensor = load_qwen35_qkv_matrix_bf16_host(
+                                gguf,
+                                &format!("{ap}.in_proj_qkv.weight"),
                                 num_k,
                                 vpk,
+                                hd_k,
                                 hd_v,
-                            );
-                            let rows = q_rows + k_rows + v_rows;
-                            DeviceMatrix::from_host(ctx, &data, rows, cols)?
+                            )?;
+                            DeviceMatrix::from_host(
+                                ctx,
+                                &tensor.data,
+                                tensor.shape[0],
+                                tensor.shape[1],
+                            )?
                         },
                         // in_proj_z: V-reorder rows (head_dim = hd_v)
                         in_proj_z: load_tensor_2d_gguf_v_reorder_rows(
@@ -554,27 +549,17 @@ impl Qwen35Model {
                             vpk,
                             1,
                         )?,
-                        // conv1d: [qkv_channels=8192, kernel=4], reorder only V rows.
-                        // Each channel has kernel_dim consecutive weights.
                         conv1d_weight: {
-                            let gguf_name = find_tensor_name(gguf, &format!("{ap}.conv1d.weight"))?;
-                            let mut data = gguf.read_tensor_bf16(&gguf_name)?;
-                            let kernel_dim = config.linear_conv_kernel_dim;
-                            let qk_channels = hd_k * num_k * 2;
-                            let v_channels = num_v * hd_v;
-                            assert_eq!(data.len(), (qk_channels + v_channels) * kernel_dim);
-                            // Reorder only V portion: treat as [v_channels, kernel] matrix
-                            let v_start = qk_channels * kernel_dim;
-                            let v_size = v_channels * kernel_dim;
-                            reverse_v_reorder_rows(
-                                &mut data[v_start..v_start + v_size],
-                                v_channels,
-                                kernel_dim,
+                            let tensor = load_qwen35_conv1d_bf16_host(
+                                gguf,
+                                &format!("{ap}.conv1d.weight"),
                                 num_k,
-                                vpk,
+                                hd_k,
+                                num_v,
                                 hd_v,
-                            );
-                            DeviceVec::from_host(ctx, &data)?
+                                config.linear_conv_kernel_dim,
+                            )?;
+                            DeviceVec::from_host(ctx, &tensor.data)?
                         },
                         // dt_bias: 1D V-reorder (head_dim = 1)
                         dt_bias: load_tensor_1d_gguf_v_reorder(
@@ -585,39 +570,17 @@ impl Qwen35Model {
                             vpk,
                         )?,
                         a_log: {
-                            // GGUF `ssm_a` stores the raw (negative) A parameter per V-head,
-                            // following llama.cpp's `A = -exp(A_log)` convention — so
-                            //   |A| = exp(A_log)   ⇒   A_log = log(|A|).
-                            // Values we see in Carnice-27b are A ≈ -0.04..-0.3 → A_log ≈ -3..−1.
-                            //
-                            // The GDR kernel (`gated_delta_rule.cu`) computes
-                            //   g = -exp(a_log) * softplus(a_proj + dt_bias)
-                            // so a_log must carry the log-magnitude with the correct sign.
-                            // Earlier code used `-log(|A|)` which flipped the sign and made
-                            // every forward step produce garbage generation on any model
-                            // that exercises this GGUF path (Qwen3.5-4B passed the e2e test
-                            // only because it loads via safetensors, not via this branch).
-                            let gguf_name = find_tensor_name(gguf, &format!("{ap}.a_log"))?;
-                            let raw_f32 = gguf.read_tensor_f32(&gguf_name)?;
-                            // A → A_log = log(|A|)  (matches llama.cpp convention)
-                            let mut a_log: Vec<f32> = raw_f32
-                                .iter()
-                                .map(|&a| {
-                                    let abs_a = a.abs().max(1e-10);
-                                    abs_a.ln()
-                                })
-                                .collect();
-                            // Reverse llama.cpp V-head reorder (head_dim = 1 for A_log)
-                            reverse_v_reorder_f32(&mut a_log, num_k, vpk, 1);
-                            ctx.stream.clone_htod(&a_log)?
+                            let tensor = load_qwen35_a_log_f32_host(
+                                gguf,
+                                &format!("{ap}.a_log"),
+                                num_k,
+                                vpk,
+                            )?;
+                            ctx.stream.clone_htod(&tensor.data)?
                         },
                         norm_weight: {
-                            let gguf_name = find_tensor_name(gguf, &format!("{ap}.norm.weight"))?;
-                            let f32s = gguf.read_tensor_f32(&gguf_name)?;
-                            // SSM norm does NOT have +1 offset in GGUF
-                            // (verified: GGUF[0]=0.884 == HF[0]=0.884).
-                            // Only RMSNorm layer norms have the offset.
-                            ctx.stream.clone_htod(&f32s)?
+                            let tensor = load_vector_f32_host(gguf, &format!("{ap}.norm.weight"))?;
+                            ctx.stream.clone_htod(&tensor.data)?
                         },
                         // out_proj: V-reorder columns (input dim = num_v × hd_v)
                         out_proj: load_tensor_2d_gguf_v_reorder_cols(
