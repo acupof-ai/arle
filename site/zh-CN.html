@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-infer(1) — 纯 Rust LLM 推理引擎</title>
-<meta name="description" content="agent-infer 是一个围绕多轮 KV 复用设计的纯 Rust LLM 推理引擎。CUDA 为主，Apple Silicon 上的 Metal 后端，OpenAI 兼容的 HTTP 接口。">
+<title>ARLE(1) — agent reinforcement learning engine</title>
+<meta name="description" content="ARLE 是纯 Rust 的 agent reinforcement learning engine：以 KV-cache-first serving 为核心，把 agent 执行、训练、评测和工具链收进同一套 workspace。CUDA 为主，Apple Silicon 上有 Metal 后端，HTTP 接口 OpenAI 兼容。">
 <meta name="color-scheme" content="light">
-<meta property="og:title" content="agent-infer — 纯 Rust LLM 推理引擎">
-<meta property="og:description" content="面向 LLM 智能体的 KV-cache 优先推理引擎。c=1 下 TTFT 比 SGLang 快 4.6×。CUDA + Metal 后端。">
+<meta property="og:title" content="ARLE — agent reinforcement learning engine">
+<meta property="og:description" content="同一套纯 Rust workspace 里收口 KV-cache-first serving、agent 执行、训练与评测。CUDA + Metal 双后端。">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://cklxx.github.io/agent-infer/zh-CN.html">
 <link rel="canonical" href="https://cklxx.github.io/agent-infer/zh-CN.html">
@@ -20,13 +20,13 @@
 <main class="page">
 
 <header class="manhead" aria-label="man page header">
-  <span class="manhead-l">AGENT-INFER(1)</span>
+  <span class="manhead-l">ARLE(1)</span>
   <span class="manhead-c">用户命令手册</span>
-  <span class="manhead-r">AGENT-INFER(1)</span>
+  <span class="manhead-r">ARLE(1)</span>
 </header>
 
 <section class="hero" aria-label="banner">
-<h1 class="sr-only">agent-infer(1) — 纯 Rust LLM 推理引擎</h1>
+<h1 class="sr-only">ARLE(1) — agent reinforcement learning engine</h1>
 <pre class="ascii" aria-hidden="true">
  █████╗  ██████╗ ███████╗███╗   ██╗████████╗       ██╗███╗   ██╗███████╗███████╗██████╗
 ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝       ██║████╗  ██║██╔════╝██╔════╝██╔══██╗
@@ -36,8 +36,8 @@
 ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝          ╚═╝╚═╝  ╚═══╝╚═╝     ╚══════╝╚═╝  ╚═╝
 </pre>
 <p class="tagline">
-  纯 Rust LLM 推理引擎 &mdash;
-  <span class="hl">KV-cache 优先</span>，为多轮智能体而建。
+  纯 Rust 的 <span class="hl">agent reinforcement learning engine</span> &mdash;
+  以 KV-cache-first serving 为核心，为多轮智能体而建。
 </p>
 <nav class="jumps" aria-label="sections">
   <a href="#synopsis">[概要]</a>
@@ -53,15 +53,18 @@
 <section id="name">
 <h2>名称</h2>
 <p class="block">
-  <b>agent-infer</b> &mdash; 纯 Rust 的持续批处理 LLM 推理引擎。
+  <b>ARLE</b> &mdash; 纯 Rust 的 agent reinforcement learning engine。
   CUDA 为主部署路径；Apple Silicon 通过 MLX C++ 桥接运行 Metal。
-  OpenAI 兼容的 HTTP 接口，内置 agent 运行时。
+  OpenAI 兼容的 HTTP 接口，内置 agent 运行时，训练 / 评测 / data 工作流也在
+  同一个 workspace 内。
 </p>
 </section>
 
 <section id="synopsis">
 <h2>概要</h2>
 <pre class="cmd"><span class="p">$</span> infer --model-path <u>Qwen3-4B</u> --port <u>8000</u>      <span class="c"># cuda / linux</span>
+<span class="p">$</span> ./target/release/arle --model-path <u>Qwen3-4B</u> --max-turns <u>10</u>   <span class="c"># 本地 agent runtime</span>
+<span class="p">$</span> ./target/release/arle train env              <span class="c"># train / eval 前门</span>
 <span class="p">$</span> ./scripts/start_metal_serve.sh               <span class="c"># apple silicon</span>
 <span class="p">$</span> curl localhost:8000/v1/chat/completions \
     -H <i>'content-type: application/json'</i> \
@@ -72,8 +75,9 @@
 <h2>描述</h2>
 <p class="block">
   智能体每一轮都要付 prefill 税：系统提示 + 历史对话 + 工具结果都会被
-  重新处理。agent-infer 把前缀 KV 复用当成核心问题 &mdash; 其它一切都
-  是结果。
+  重新处理。ARLE 把前缀 KV 复用当成 serving 核心，再在这条运行时主干上
+  往外长出更完整的 agent reinforcement learning engine。<code>infer</code>
+  是 HTTP 服务面；<code>arle</code> 是本地 agent / train / data 前门。
 </p>
 <table class="why">
   <tbody>
@@ -130,7 +134,6 @@
 ┌──────────────────┬───────────────────────────────────┬──────────────┐
 │ Qwen3 (0.5B–72B) │ GQA                               │ ✓ 已支持     │
 │ Qwen3.5-4B       │ 混合（线性 + 全注意力）           │ ✓ 已支持     │
-│ GLM4             │ GQA                               │ ✓ 已支持     │
 │ Llama 3 / 4      │ GQA                               │ … 规划中     │
 │ DeepSeek V3 / R1 │ MLA                               │ … 规划中     │
 └──────────────────┴───────────────────────────────────┴──────────────┘</pre>
@@ -167,13 +170,14 @@
 <section id="api">
 <h2>API</h2>
 <p class="block">
-  OpenAI 兼容。稳定面：
+  Serving 只是 ARLE 的一个对外面。完整契约见
+  <a href="https://github.com/cklxx/agent-infer/blob/main/docs/http-api.md">docs/http-api.md</a>：
   <code>POST /v1/completions</code>、
   <code>POST /v1/chat/completions</code>、
-  <code>GET  /v1/models</code>。
-  Beta：<code>POST /v1/responses</code>（非流式子集 + SSE
-  <code>output_text.delta</code>）。
-  运维：<code>GET /metrics</code>（Prometheus）、<code>GET /v1/stats</code>。
+  <code>POST /v1/responses</code>、<code>GET /v1/models</code>、
+  <code>GET /healthz</code>、<code>GET /readyz</code>、
+  <code>GET /metrics</code>、<code>GET /v1/stats</code>，以及
+  <code>/v1/sessions/{session_id}/*</code> 下的会话持久化接口。
 </p>
 <pre class="cmd"><span class="p">$</span> curl localhost:8000/v1/chat/completions \
     -d <i>'{"messages":[{"role":"user","content":"解释一下 kv 缓存"}],"stream":true}'</i></pre>
@@ -195,7 +199,7 @@
 └────────────────────────────┬───────────────────────────────────────────┘
                              ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│  MODEL FORWARD   Qwen3 (GQA) · Qwen3.5 (hybrid) · GLM4                 │
+│  MODEL FORWARD   Qwen3 (GQA) · Qwen3.5 (hybrid)                        │
 └────────────────────────────┬───────────────────────────────────────────┘
                              ▼
    ┌────────────────────────────┐     ┌────────────────────────────┐
@@ -207,7 +211,7 @@
 <section id="files">
 <h2>文件</h2>
 <pre class="files">
-<a href="https://github.com/cklxx/agent-infer/blob/main/README.zh-CN.md">/README.zh-CN.md</a>     工程概览 · 安装 · API 参考（中文）
+<a href="https://github.com/cklxx/agent-infer/blob/main/README.zh-CN.md">/README.zh-CN.md</a>     工程概览 · 安装 · agent/train/API 入口（中文）
 <a href="https://github.com/cklxx/agent-infer/blob/main/README.md">/README.md</a>           engineering overview（English）
 <a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">/ROADMAP.md</a>          接下来 · 模型覆盖 · 架构押注
 <a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">/CHANGELOG.md</a>        完整版本历史
@@ -219,9 +223,9 @@
 <section id="news">
 <h2>动态</h2>
 <ul class="news">
+  <li><time class="date" datetime="2026-04-22">2026-04-22</time>&nbsp; CUDA 调度重叠继续收紧：decode launch/readback 继续拆分，fetch wait 改成事件驱动，streaming emit 搬到独立 worker。</li>
+  <li><time class="date" datetime="2026-04-22">2026-04-22</time>&nbsp; CUDA Qwen3.5 现在走真正的 packed multi-request paged-prefill 路径，混合层也接上 packed recurrent-state 发射。</li>
   <li><time class="date" datetime="2026-04-20">2026-04-20</time>&nbsp; Metal DFlash 长提示词 prefill 修复；在 Metal 上对 Qwen3.5 默认开启，通过 guidellm 10-strategy 套件（5400-token 提示词）验证。</li>
-  <li><time class="date" datetime="2026-04-19">2026-04-19</time>&nbsp; DFlash 在 Metal 上默认开启。Qwen3.5-4B-4bit 与标量路径逐位一致。</li>
-  <li><time class="date" datetime="2026-04-16">2026-04-16</time>&nbsp; Metal packed-batch 并发解码：<code>extend_kv_cache</code> batch-dim bug 修好；4× / 8× 并发下 packed decode 稳定。</li>
 </ul>
 <p class="note">
   完整历史：<a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">CHANGELOG.md</a>
@@ -248,9 +252,9 @@
 </section>
 
 <footer class="manfoot" aria-label="man page footer">
-  <span class="manfoot-l">agent-infer</span>
-  <span class="manfoot-c">2026-04-20</span>
-  <span class="manfoot-r">AGENT-INFER(1)</span>
+  <span class="manfoot-l">ARLE</span>
+  <span class="manfoot-c">2026-04-23</span>
+  <span class="manfoot-r">ARLE(1)</span>
 </footer>
 
 </main>
@@ -263,7 +267,7 @@
   <span class="sl-seg sl-spacer"></span>
   <span class="sl-seg">MIT</span>
   <span class="sl-seg">gh:cklxx/agent-infer</span>
-  <span class="sl-seg sl-accent">⌁&nbsp;2026-04-20</span>
+  <span class="sl-seg sl-accent">⌁&nbsp;2026-04-23</span>
 </div>
 
 </body>

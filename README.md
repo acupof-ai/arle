@@ -1,6 +1,6 @@
 <p align="center">
   <strong>ARLE</strong><br>
-  <em>KV-cache-first inference engine for LLM agents. Pure Rust, with CUDA as the primary serving path.</em>
+  <em>Agent reinforcement learning engine for long-context LLM agents. Pure Rust, with CUDA as the primary serving path and train/eval/agent workflows in-tree.</em>
 </p>
 
 <p align="center">
@@ -37,6 +37,17 @@
 
 Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
 
+ARLE stands for **agent reinforcement learning engine**: one Rust workspace for
+serving, agent execution, training, evaluation, and the toolchain around them.
+The serving/runtime path is still CUDA-first, but the project identity is now
+broader than a standalone inference binary.
+
+In practice that shows up as three top-level surfaces:
+
+- `infer` for OpenAI-compatible HTTP serving
+- `arle` for the local agent runtime plus `train/*` and `data/*` workflows
+- shared in-tree Rust runtime / model code underneath both, so serving and RL tooling do not drift apart
+
 ## 🚦 Status at a glance
 
 Four axes, each answering one question. Authoritative matrix lives in
@@ -59,7 +70,6 @@ Four axes, each answering one question. Authoritative matrix lives in
 |-------|-----------|:----:|:-----:|
 | Qwen3 (0.6B – 72B) | GQA | ✅ | ✅ |
 | Qwen3.5-4B | Hybrid (linear + full) | ✅ | ✅ |
-| GLM4 | GQA | ✅ | — |
 | Llama 3 / 4 | GQA | *planned* | *planned* |
 | DeepSeek V3 / R1 | MLA | *planned* | *planned* |
 
@@ -101,6 +111,11 @@ ARLE (agent reinforcement learning engine) treats this as the core problem:
 | **Transparent slower-tier spill / promote** | Cold blocks can spill from GPU to host pinned memory and local disk, then promote back before use. The in-tree cluster-shared path is currently a minimal shared-fs backend. | Longer contexts and cached-prefix reuse beyond pure GPU residency |
 | **Shared-prefix CoW** | Shared full blocks stay immutable on the radix path; writes split only the active tail page. | Shared prefixes across concurrent requests do not multiply base KV memory |
 | **Scheduler overlap** | CUDA scheduler overlaps decode launch/readback across iterations, sleeps on fetch waits instead of spinning, and uses an emit worker for streaming text decode and stop scanning. | Better CPU/GPU overlap and less scheduler-side overhead at concurrency |
+
+That inference spine is what ARLE builds on for the wider agent RL loop:
+shared Rust model/runtime authority, train-side binaries in the same workspace,
+and a top-level CLI that can act as local agent, training front-end, or
+evaluation entrypoint without bouncing through a separate Python control plane.
 
 Current benchmark closure work is focused on high-concurrency CUDA parity
 (`c4/c8/c16`) against SGLang; treat the dated headline snapshots below as
@@ -179,7 +194,35 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-**Prerequisites**: CUDA 12.x, Rust 1.85+, Python 3.10+ with `flashinfer-python` (build-time only). Zig `0.16.0` for `crates/kv-native-sys` is bootstrapped by [`scripts/setup_zig_toolchain.sh`](scripts/setup_zig_toolchain.sh) and `./setup.sh`.
+```bash
+# Local agent / train front door
+cargo build --release --features cli -p agent-infer --bin arle
+./target/release/arle --model-path /path/to/Qwen3-4B --max-turns 10
+./target/release/arle train env
+```
+
+`infer` is the serving binary; `arle` is the ARLE workspace front-end for
+agent execution, train/eval jobs, and dataset utilities.
+
+**Prerequisites**: CUDA 12.x, the repo-pinned Rust toolchain from
+[`rust-toolchain.toml`](rust-toolchain.toml) (currently `1.95.0`), and Python
+3.10+ with `flashinfer-python` (build-time only). Zig `0.16.0` for
+`crates/kv-native-sys` is bootstrapped by
+[`scripts/setup_zig_toolchain.sh`](scripts/setup_zig_toolchain.sh) and
+`./setup.sh`.
+
+For a repo-managed workstation bootstrap, run [`./setup.sh`](setup.sh). For
+contributor workflow and validation expectations, use
+[CONTRIBUTING.md](CONTRIBUTING.md) as the source of truth.
+
+## Documentation Map
+
+- [README.md](README.md) — public project overview, install, CLI, architecture
+- [docs/http-api.md](docs/http-api.md) — HTTP route contract and streaming behavior
+- [docs/support-matrix.md](docs/support-matrix.md) — backend/model/quant support levels
+- [docs/stability-policy.md](docs/stability-policy.md) — stability tiers and compatibility posture
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contributor setup, validation, release expectations
+- [docs/index.md](docs/index.md) — maintainer-facing PARA index, plans, and experience logs
 
 ## Metal on Apple Silicon
 
@@ -209,7 +252,6 @@ allocator caps. Full DFlash reference and supported model pairs:
 |-------|-----------|:------:|
 | Qwen3 (0.5B-72B) | GQA | :white_check_mark: |
 | Qwen3.5-4B | Hybrid (linear + full attention) | :white_check_mark: |
-| GLM4 | GQA | :white_check_mark: |
 | Llama 3 / 4 | GQA | Planned |
 | DeepSeek-V3 / R1 | MLA | Planned |
 
@@ -219,15 +261,20 @@ See [ROADMAP.md](ROADMAP.md) for the full plan.
 
 ## API
 
-The serving API reference now lives in [docs/http-api.md](docs/http-api.md).
-That document is the single place for the route map, streaming behavior,
-boundary guarantees, auth and request-id behavior, and current gaps.
+Serving is one surface of ARLE. The full HTTP API reference now lives in
+[docs/http-api.md](docs/http-api.md). That document is the single place for
+the route map, streaming behavior, boundary guarantees, auth and request-id
+behavior, and current gaps.
 
 The core generation surface is `POST /v1/completions`,
 `POST /v1/chat/completions`, `POST /v1/responses`, and `GET /v1/models`.
 Operational probes live at `GET /healthz`, `GET /readyz`, `GET /metrics`, and
 `GET /v1/stats`. Session persistence lives under
 `/v1/sessions/{session_id}/*`.
+
+The same runtime authority also sits behind the local `arle` CLI and the
+training/eval flows, so the HTTP surface is not a separate Python control
+plane layered on top of a different engine.
 
 SSE streaming ships on `/v1/completions`, `/v1/chat/completions`, and
 `/v1/responses`. Requests that combine `stream=true` with `tools` are rejected
@@ -236,21 +283,29 @@ tool-call deltas.
 
 ---
 
-## Agent CLI
+## ARLE CLI
 
-Built-in agent runtime with tool calling:
+Built-in ARLE runtime with tool calling:
 
 ```bash
 ./target/release/arle \
   --max-turns 10 --temperature 0
 ```
 
+```bash
+./target/release/arle train env
+./target/release/arle train sft --help
+./target/release/arle data convert --help
+```
+
 The root CLI binary is behind the `cli` feature. Without `--features cli`, `arle` is not built.
 
 The CLI is agent-first: there is no separate chat mode and no `--tools`
-switch. Tool calling is the default runtime.
+switch. Tool calling is the default runtime, and the same top-level entrypoint
+also fronts the train/eval/data subcommands that make the "agent reinforcement
+learning engine" identity concrete in day-to-day DX.
 
-Current package boundary for the CLI:
+Current package boundary behind the ARLE front door:
 
 - `arle` -> thin binary wrapper
 - `cli` -> REPL and slash commands
@@ -258,7 +313,9 @@ Current package boundary for the CLI:
 - `agent` -> conversation loop and tool-call recovery
 - `tools` / `chat` -> shared tool definitions, execution helpers, and protocol types
 
-If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
+If `--model-path` is omitted, the CLI first checks `ARLE_MODEL`, then falls
+back to legacy `AGENT_INFER_MODEL`, then auto-detects a local model from
+common directories and the local HuggingFace cache.
 
 Use `--doctor` to print a self-check report for the current CLI build without
 loading a model. It shows the compiled backend, detected hardware, TTY state,
@@ -322,7 +379,8 @@ cargo run --release --no-default-features --features metal,no-cuda,cli -- \
 ```
 
 The CLI keeps conversation history across turns, stores line history in
-`~/.arle-history`, and supports slash commands:
+`~/.arle-history` (migrating legacy `~/.agent-infer-history` on first run),
+and supports slash commands:
 
 - `/help` for command help
 - `/reset` or `/clear` to clear the current conversation
@@ -336,7 +394,7 @@ The CLI keeps conversation history across turns, stores line history in
 
 ## Architecture
 
-Workspace split:
+ARLE is one workspace, not just one binary. Workspace split:
 
 - `arle` — thin binary wrapper
 - `cli` — REPL / CLI flow
@@ -421,6 +479,9 @@ Governance references:
 
 ## Development
 
+The day-to-day developer loop spans both sides of ARLE: the `infer` serving
+surface and the `arle` agent/train/data front door.
+
 ```bash
 make install-hooks                                      # Install repo-managed Git hooks (.githooks/pre-push)
 make pre-push                                           # Run the CI-aligned local pre-push checks
@@ -450,7 +511,8 @@ Before opening a PR: [CONTRIBUTING.md](CONTRIBUTING.md),
 
 After `make install-hooks`, every `git push` runs `.githooks/pre-push`, which
 delegates to `scripts/pre_push_checks.sh`. Set
-`AGENT_INFER_SKIP_PRE_PUSH=1` only when you explicitly need to bypass the hook.
+`ARLE_SKIP_PRE_PUSH=1` only when you explicitly need to bypass the hook
+(`AGENT_INFER_SKIP_PRE_PUSH=1` still works as a legacy alias).
 
 ---
 

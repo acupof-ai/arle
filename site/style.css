@@ -1,4 +1,4 @@
-/* agent-infer landing — man-page typeset, warm paper palette.
+/* ARLE landing — man-page typeset, warm paper palette.
    zero JS, zero external fonts, single CSS. */
 
 :root {
@@ -411,7 +411,7 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
 }
 
 /* prefers-color-scheme: we intentionally stay in paper-warm even when
-   the OS prefers dark. agent-infer's visual identity is warm paper. */
+   the OS prefers dark. ARLE's visual identity is warm paper. */
 
 /* ── print: it IS a man page, so make it print like one ───────────── */
 
