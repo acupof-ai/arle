@@ -38,6 +38,7 @@ export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-D warnings"
 export CARGO_TARGET_DIR="${REPO_ROOT}/target/pre-push-quick"
 
+run python3 scripts/check_repo_hygiene.py
 run cargo fmt --manifest-path infer/Cargo.toml --all -- --check
 run cargo check --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
 run cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle

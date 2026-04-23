@@ -15,6 +15,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repo-hygiene:
+    name: Repo Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run repo hygiene checks
+        run: python3 scripts/check_repo_hygiene.py
+
   # ── macOS arm64: Metal feature surface ──────────────────────────────────────
   check-macos:
     name: Check (macOS Metal)

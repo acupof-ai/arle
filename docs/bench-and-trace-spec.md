@@ -78,7 +78,7 @@ reran this?" from §3+§4 alone, the entry is incomplete.
 Confirm each before trusting §5 results. Deviation → §6 entry.
 
 1. **Warmup.** Discard first 3–5s. Cold caches skew TTFT p50.
-2. **Launches per token.** If ≈ tokens, bottleneck is dispatch not compute — don't claim a compute ceiling. ([feedback_measure_batching_before_ceiling](../.claude/projects/-Users-user-code-agent-infer/memory/feedback_measure_batching_before_ceiling.md))
+2. **Launches per token.** If launches are roughly equal to generated tokens, the bottleneck is dispatch rather than compute; do not claim a compute ceiling from that run shape.
 3. **Determinism.** Same seed twice → TTFT p50 within ±2%. Higher variance = investigate first.
 4. **Thermal + background noise.** Check `nvidia-smi dmon` / `powermetrics` for throttling; no other GPU processes.
 5. **Prefix-cache state + tokenizer.** Declare cold/warm in §3; verify `prompt_tokens` matches model tokenizer.

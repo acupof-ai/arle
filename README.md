@@ -4,14 +4,14 @@
 </p>
 
 <p align="center">
-  <a href="https://cklxx.github.io/agent-infer/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Fagent--infer-D97757?style=flat-square" alt="Website"></a>
-  <a href="https://github.com/cklxx/agent-infer/actions"><img src="https://github.com/cklxx/agent-infer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://cklxx.github.io/arle/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Farle-D97757?style=flat-square" alt="Website"></a>
+  <a href="https://github.com/cklxx/arle/actions"><img src="https://github.com/cklxx/arle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <a href="https://github.com/cklxx/agent-infer/releases"><img src="https://img.shields.io/github/v/release/cklxx/agent-infer?include_prereleases" alt="Release"></a>
+  <a href="https://github.com/cklxx/arle/releases"><img src="https://img.shields.io/github/v/release/cklxx/arle?include_prereleases" alt="Release"></a>
 </p>
 
 <p align="center">
-  <a href="https://cklxx.github.io/agent-infer/">Website</a> ·
+  <a href="https://cklxx.github.io/arle/">Website</a> ·
   <a href="#-latest-updates">News</a> ·
   <a href="#-status-at-a-glance">Status</a> ·
   <a href="#quick-start">Quick Start</a> ·
@@ -31,8 +31,8 @@
 
 <!-- Keep this list to the last 3 entries. Older history lives in CHANGELOG.md. -->
 
+- **2026-04-23** — The `arle` front door now unifies `train pretrain|sft|grpo|multi-turn|eval` and `data download|convert` under one top-level Rust CLI, instead of requiring users to memorize separate train binaries. Entry-point consolidation notes: [`docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md`](docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md).
 - **2026-04-22** — CUDA `Qwen3.5` now ships through a true packed multi-request paged-prefill path. Full-attention layers write directly into the paged pool, hybrid linear-attention layers use packed recurrent-state launches, and paged-prefill logits now land on the canonical sampling surface. See [`docs/plans/2026-04-22-sglang-gap-closure-execution.md`](docs/plans/2026-04-22-sglang-gap-closure-execution.md).
-- **2026-04-22** — CUDA scheduler overlap was tightened again: decode launch/readback is split across iterations, fetch waits are event-driven instead of hot polling, and streaming emit now goes through a dedicated emit worker with gate results fed back into the scheduler loop. Runtime ownership graph: [`docs/projects/tiered-kv-runtime-flow.md`](docs/projects/tiered-kv-runtime-flow.md).
 - **2026-04-20** — Metal DFlash long-prompt prefill fixed (`fast_forward_prefill`, commit `3bc8802`) and batched terminal `eval` deferred via `async_eval` (commit `d8cb2f4`). DFlash is now default-on for Qwen3.5 on Metal, validated across guidellm's 10-strategy sweep with 5400-token prompts — zero `WrongPhase` errors, 100% request success. Canonical usage: [`docs/resources/metal-dflash.md`](docs/resources/metal-dflash.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
@@ -50,7 +50,7 @@ In practice that shows up as three top-level surfaces:
 
 ## 🚦 Status at a glance
 
-Four axes, each answering one question. Authoritative matrix lives in
+Five axes, each answering one question. Authoritative matrix lives in
 [docs/support-matrix.md](docs/support-matrix.md); stability tiers
 (**Stable** → **Beta** → **Dev**) are defined in
 [docs/stability-policy.md](docs/stability-policy.md).
@@ -81,6 +81,14 @@ Four axes, each answering one question. Authoritative matrix lives in
 | `POST /v1/responses` | **Beta** | Text/tool-call subset with both non-streaming and SSE forms. |
 | `GET /metrics` · `GET /v1/stats` | **Stable** | Prometheus + human-readable ops surface. |
 
+### Agent / Train / Eval — *what does ARLE itself run?*
+
+| Surface | Status | What ships |
+|---------|:------:|------------|
+| `arle` local agent runtime | **Beta** | Tool calling by default, session save/load/export, `--doctor`, model auto-discovery, and KV-backed multi-turn reuse. |
+| `train pretrain|sft|grpo|multi-turn|eval` | **Beta** | Unified CLI front door into the in-tree Rust train stack, exact resume, HF-style checkpoint directories, and the active Qwen3.5-family train/RL path. |
+| `data download|convert` + operator DX | **Beta** | Dataset utilities, `train env`, standalone eval, and one coherent Rust front door instead of separate ad-hoc binaries. |
+
 ### Quantization — *how small does it get?*
 
 | Format | Status | Available on |
@@ -102,7 +110,7 @@ Four axes, each answering one question. Authoritative matrix lives in
 
 In agent workloads every turn pays a prefill tax: system prompt + conversation history + tool results must be re-processed. As context grows, **prefill dominates latency**.
 
-ARLE (agent reinforcement learning engine) treats this as the core problem:
+ARLE (agent reinforcement learning engine) treats this as the core problem in both serving and agent/RL loops:
 
 | Capability | What it does | Impact |
 |---|---|---|
@@ -111,11 +119,13 @@ ARLE (agent reinforcement learning engine) treats this as the core problem:
 | **Transparent slower-tier spill / promote** | Cold blocks can spill from GPU to host pinned memory and local disk, then promote back before use. The in-tree cluster-shared path is currently a minimal shared-fs backend. | Longer contexts and cached-prefix reuse beyond pure GPU residency |
 | **Shared-prefix CoW** | Shared full blocks stay immutable on the radix path; writes split only the active tail page. | Shared prefixes across concurrent requests do not multiply base KV memory |
 | **Scheduler overlap** | CUDA scheduler overlaps decode launch/readback across iterations, sleeps on fetch waits instead of spinning, and uses an emit worker for streaming text decode and stop scanning. | Better CPU/GPU overlap and less scheduler-side overhead at concurrency |
+| **Shared runtime authority** | `infer`, `arle`, and the in-tree train/eval jobs resolve models and reuse the same Rust runtime/model contracts. | Serving, local agent work, and RL tooling stay on one code path instead of drifting across separate stacks |
 
-That inference spine is what ARLE builds on for the wider agent RL loop:
-shared Rust model/runtime authority, train-side binaries in the same workspace,
-and a top-level CLI that can act as local agent, training front-end, or
-evaluation entrypoint without bouncing through a separate Python control plane.
+ARLE is therefore not "an inference engine plus some scripts". The inference
+spine is what the wider agent RL loop builds on: shared Rust model/runtime
+authority, train-side binaries in the same workspace, and a top-level CLI that
+can act as local agent, training front-end, or evaluation entrypoint without
+bouncing through a separate Python control plane.
 
 Current benchmark closure work is focused on high-concurrency CUDA parity
 (`c4/c8/c16`) against SGLang; treat the dated headline snapshots below as
@@ -128,6 +138,11 @@ historical records, not as the current public claim.
 Canonical benchmark source of truth is the dated snapshot log under
 [`docs/experience/wins/`](docs/experience/wins/), produced via
 [`scripts/bench_guidellm.sh`](scripts/bench_guidellm.sh).
+
+The published numbers below are still mostly serving-side because the active
+benchmark closure program is concentrated on CUDA parity. The project surface is
+broader than that chart: the same runtime authority also backs the local
+`arle` agent front door and the in-tree train/eval stack.
 
 The current CUDA benchmark program is not "publish one timeless headline
 number"; it is an active closure effort against SGLang focused on the
@@ -176,33 +191,40 @@ Run your own: [docs/plans/guidellm-integration.md](docs/plans/guidellm-integrati
 
 ## Quick Start
 
+Two entrypoints are first-class:
+
+### `arle` — local agent / train / eval front door
+
 ```bash
-# Docker (recommended)
+git clone https://github.com/cklxx/arle && cd arle
+cargo build --release --features cli -p agent-infer --bin arle
+./target/release/arle --model-path /path/to/Qwen3-4B --max-turns 10
+./target/release/arle train env
+./target/release/arle train eval --help
+```
+
+### `infer` — OpenAI-compatible serving
+
+```bash
+# Current published container image path
 docker run --gpus all -v /path/to/Qwen3-4B:/model \
   ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
 
-# Or build from source
-git clone https://github.com/cklxx/agent-infer && cd agent-infer
+# Or build the serving binary from source
 cargo build -p infer --release
 ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
 ```
 
 ```bash
-# Test it
+# Smoke test the HTTP surface
 curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-```bash
-# Local agent / train front door
-cargo build --release --features cli -p agent-infer --bin arle
-./target/release/arle --model-path /path/to/Qwen3-4B --max-turns 10
-./target/release/arle train env
-```
-
-`infer` is the serving binary; `arle` is the ARLE workspace front-end for
-agent execution, train/eval jobs, and dataset utilities.
+`arle` is the ARLE workspace front-end for agent execution, train/eval jobs,
+and dataset utilities. `infer` is the dedicated OpenAI-compatible serving
+binary.
 
 **Prerequisites**: CUDA 12.x, the repo-pinned Rust toolchain from
 [`rust-toolchain.toml`](rust-toolchain.toml) (currently `1.95.0`), and Python
@@ -214,6 +236,15 @@ agent execution, train/eval jobs, and dataset utilities.
 For a repo-managed workstation bootstrap, run [`./setup.sh`](setup.sh). For
 contributor workflow and validation expectations, use
 [CONTRIBUTING.md](CONTRIBUTING.md) as the source of truth.
+
+Common repo hygiene commands:
+
+```bash
+make hygiene      # public docs / templates / local-link guardrails
+make pre-push     # CI-aligned snapshot validation before git push
+make check-metal  # Apple Silicon quick check
+./setup.sh --check  # Linux/CUDA workstation check
+```
 
 ## Documentation Map
 
@@ -400,12 +431,18 @@ ARLE is one workspace, not just one binary. Workspace split:
 - `cli` — REPL / CLI flow
 - `agent` — conversation state, tool-call recovery, agent turn loop
 - `tools` / `chat` — tool execution helpers and protocol types
+- `autograd` — from-scratch autograd and optimizer core for the train stack
+- `train` — pretrain / SFT / GRPO / multi-turn / eval runtime and control plane
 - `infer` — HTTP server, scheduler, runtime, backend implementations; owns the single `InferenceEngine` contract
 - `cuda-kernels` — extracted CUDA kernel layer (csrc/, Triton AOT, Rust FFI). One-way dep: `infer → cuda-kernels`.
 - `mlx-sys` — MLX C++ bridge for the Metal backend
 
 See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/codebase-map.md), and [crates/README.md](crates/README.md)
 for the current package boundaries.
+
+The diagram below is the serving hot path. The agent/runtime and train/eval
+surfaces sit beside it on the same shared Rust model/runtime authority; they
+are not a separate Python layer wrapped around a different engine.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐

@@ -1,6 +1,7 @@
 # ARLE — local development shortcuts
 #
 # Usage:
+#   make hygiene                  # public docs/templates/link guardrails
 #   make build-metal               # macOS / Apple Silicon
 #   make build-agent-metal         # macOS / Apple Silicon CLI
 #   make check-metal               # verify infer + arle Metal surfaces
@@ -14,7 +15,10 @@
 METAL_MODEL ?= models/Qwen3-0.6B-4bit
 CUDA_MODEL ?= models/Qwen3-4B
 
-.PHONY: build-metal build-agent-metal check-metal test-metal bench-metal bench-metal-compare build-cuda bench-cuda test test-py pre-push install-hooks
+.PHONY: hygiene build-metal build-agent-metal check-metal test-metal bench-metal bench-metal-compare build-cuda bench-cuda test test-py pre-push install-hooks
+
+hygiene:
+	python3 scripts/check_repo_hygiene.py
 
 # ── Metal (macOS / Apple Silicon) ────────────────────────────────────────────
 build-metal:
