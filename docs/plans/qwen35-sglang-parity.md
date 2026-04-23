@@ -1,5 +1,7 @@
 # Plan: Qwen3.5 SGLang 0.5.9 Parity (Qwen3.5-4B, A100-80GB)
 
+> Status (2026-04-23): **Historical reference only.** This file tracks the older `SGLang 0.5.9` parity target and should not be used as the current decode-alignment truth. Use [`2026-04-23-cuda-decode-sglang-alignment.md`](2026-04-23-cuda-decode-sglang-alignment.md) for the current plan against SGLang `main`.
+
 > Status: **Near-complete** — prefix cache fixed (2026-04-09), batched prefill remaining
 > Created: 2026-04-01
 > Updated: 2026-04-09 (Steps 1–7 record); remaining-work list verified still open on 2026-04-15 (grep `batched_prefill` returns zero hits in `model/qwen35/` and `scheduler/cuda/`)

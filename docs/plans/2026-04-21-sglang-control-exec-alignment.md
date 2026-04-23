@@ -1,5 +1,7 @@
 # 2026-04-21 SGLang 控制面/执行面对齐重构计划
 
+> Status (2026-04-23): **Historical architecture precursor.** The `ScheduleBatch -> ForwardBatch` direction in this file is still useful, but the current decode-alignment truth and execution order now live in [`2026-04-23-cuda-decode-sglang-alignment.md`](2026-04-23-cuda-decode-sglang-alignment.md).
+
 ## 目标
 
 - 把当前 CUDA 调度路径重构为明确的两层语义：
@@ -151,4 +153,3 @@ Scheduler Reconcile
 1. 先做 W1+W2（结构落地，不改语义）。  
 2. 再做 W3+W5（删除旧路径，统一执行入口）。  
 3. 最后做 W4+W6 + 验证/bench/wins。  
-

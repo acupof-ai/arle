@@ -1,5 +1,7 @@
 # SGLang Gap Closure — Execution Plan
 
+> Status (2026-04-23): **Historical execution ledger.** This file records real landed cleanup work, but it should not be read as proof that the current CUDA decode path is already aligned with SGLang `main`. Use [`2026-04-23-cuda-decode-sglang-alignment.md`](2026-04-23-cuda-decode-sglang-alignment.md) for the current decode-focused plan.
+
 **Status:** partially landed; in-repo runtime follow-ons still active, remote CUDA bench pending (2026-04-22)  
 **Commissioned by:** benchmark gap sweep (`c1/c2/c4/c8/c16`) + repo-grounded `nlm` review  
 **Complements:** [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md), [`qwen35-single-graph-prefill.md`](qwen35-single-graph-prefill.md), [`scheduler-gpu-cpu-overlap.md`](scheduler-gpu-cpu-overlap.md)

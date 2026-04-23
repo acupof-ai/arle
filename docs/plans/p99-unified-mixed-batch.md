@@ -1,5 +1,7 @@
 # P99 Unification — Mixed-Batch Scheduler & Paged-KV Everywhere
 
+> Status (2026-04-23): **Historical master plan.** This file still explains the broader mixed-batch / paged-prefill motivation, but it is not the current source of truth for CUDA decode alignment against SGLang `main`. Use [`2026-04-23-cuda-decode-sglang-alignment.md`](2026-04-23-cuda-decode-sglang-alignment.md) for the current decode-focused plan.
+
 **Status:** active master plan (2026-04-17)
 **Supersedes:** `paged-kv-prefill.md` (Phase 3b/3c/4), `qwen35-single-graph-prefill.md`,
 `flashinfer-planned-prefill.md`, `scheduler-gpu-cpu-overlap.md`.
