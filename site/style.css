@@ -149,14 +149,18 @@ code      { font-family: inherit; color: var(--coral-dim); }
   border-bottom: 1px dashed var(--ochre);
 }
 
-.wordmark {
-  margin: 0 0 10px;
-  font-size: clamp(34px, 8vw, 72px);
-  line-height: 0.95;
-  letter-spacing: 0.12em;
-  font-weight: 700;
+.ascii {
+  margin: 0;
+  padding: 2px 0 8px;
+  font-size: 10px;
+  line-height: 1.1;
   color: var(--coral-dim);
-  text-transform: uppercase;
+  overflow-x: auto;
+  letter-spacing: 0;
+  white-space: pre;
+}
+@media (min-width: 760px) {
+  .ascii { font-size: 11px; }
 }
 
 .tagline {
@@ -399,7 +403,7 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
 @media (max-width: 640px) {
   :root { --fs: 14px; }
   .page { padding: 18px 14px 18px; }
-  .wordmark { font-size: clamp(30px, 12vw, 54px); }
+  .ascii { font-size: 8px; }
   .manhead-c, .manfoot-c { display: none; }
   pre.cmd, pre.tbl, pre.diagram, pre.files { font-size: 12px; }
   .statusline { font-size: 11px; }
