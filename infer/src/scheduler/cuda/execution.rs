@@ -1,4 +1,4 @@
-use super::budget::{PageBudget, PageGrowth, StepTokenBudget};
+use super::budget::{PageBudget, PageGrowth, StepTokenBudget, clipped_max_new_tokens_estimate};
 use super::{ModelForward, Phase, Scheduler, info};
 
 #[derive(Clone, Copy, Debug)]
@@ -81,11 +81,7 @@ impl PrefillBudget {
         let running_decode_tokens = scheduler
             .running_batch
             .iter()
-            .filter(|&&slot_idx| {
-                scheduler.request(slot_idx).is_some_and(|req| {
-                    matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
-                })
-            })
+            .filter(|&&slot_idx| scheduler.slot_is_runnable_decode(slot_idx))
             .count();
         let mut budget = Self {
             token_budget: StepTokenBudget::for_prefill(
@@ -99,7 +95,13 @@ impl PrefillBudget {
             page_budget: PageBudget::from_scheduler(scheduler, true),
         };
         for &slot_idx in &scheduler.running_batch {
-            let remaining = scheduler.remaining_decode_tokens(slot_idx);
+            let reserve_decode_headroom = scheduler.request(slot_idx).is_some_and(|req| {
+                matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
+            });
+            if !reserve_decode_headroom {
+                continue;
+            }
+            let remaining = scheduler.remaining_decode_reservation_tokens(slot_idx);
             if remaining > 0 {
                 budget.page_budget.reserve_growth(PageGrowth {
                     slot_idx,
@@ -170,9 +172,11 @@ impl<M: ModelForward> Scheduler<M> {
         emit_t.elapsed().as_micros()
     }
 
-    fn remaining_decode_tokens(&self, slot_idx: usize) -> usize {
+    fn remaining_decode_reservation_tokens(&self, slot_idx: usize) -> usize {
         self.request(slot_idx).map_or(0, |req| {
-            req.max_tokens.saturating_sub(req.generated_tokens.len())
+            clipped_max_new_tokens_estimate(
+                req.max_tokens.saturating_sub(req.generated_tokens.len()),
+            )
         })
     }
 
@@ -210,7 +214,7 @@ impl<M: ModelForward> Scheduler<M> {
             page_growth: PageGrowth {
                 slot_idx,
                 tokens: prefill_tokens
-                    .saturating_add(req.max_tokens.saturating_sub(req.generated_tokens.len())),
+                    .saturating_add(self.remaining_decode_reservation_tokens(slot_idx)),
             },
         })
     }
@@ -246,11 +250,10 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn plan_step(&mut self) -> StepPlan {
-        let has_decode = self.running_batch.iter().any(|&slot_idx| {
-            self.request(slot_idx).is_some_and(|req| {
-                matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
-            })
-        });
+        let has_decode = self
+            .running_batch
+            .iter()
+            .any(|&slot_idx| self.slot_is_runnable_decode(slot_idx));
         let mut budget = PrefillBudget::from_scheduler(self);
         let scored_candidates = self.collect_prefill_candidates(&budget);
         let candidates = select_prefill_candidates(&mut budget, scored_candidates);
@@ -299,8 +302,6 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
 
-        let emit_gate_wait_us = self.wait_for_emit_gates();
-
         let plan_t = std::time::Instant::now();
         let plan = self.plan_step();
         let admission_us = plan_t.elapsed().as_micros();
@@ -346,8 +347,7 @@ impl<M: ModelForward> Scheduler<M> {
             .pending_decode
             .as_ref()
             .map_or(0, |pending| pending.decode_indices.len() as u64);
-        let emit_dispatch_us = self.dispatch_decode_emits();
-        let emit_us = emit_gate_wait_us + emit_dispatch_us;
+        let emit_us = self.dispatch_decode_emits();
         let decode_us = decode_launch_us + readback_us;
         let scheduled_rows = scheduled_decode_rows + scheduled_prefill_rows;
 

@@ -124,7 +124,7 @@ impl<M: ModelForward> Scheduler<M> {
                 self.finish_slot(slot_idx);
                 continue;
             }
-            if matches!(req.phase, Phase::Decoding) {
+            if self.slot_is_runnable_decode(slot_idx) {
                 decode_slots.push(slot_idx);
             }
         }

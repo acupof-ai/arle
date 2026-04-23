@@ -1123,6 +1123,26 @@ impl<M: ModelForward> Scheduler<M> {
         })
     }
 
+    pub(super) fn slot_is_emit_gated(&self, slot_idx: usize) -> bool {
+        self.request(slot_idx).is_some_and(|req| {
+            self.emit_gate_waiting
+                .get(&req.id)
+                .is_some_and(|&waiting_slot| waiting_slot == slot_idx)
+        })
+    }
+
+    pub(super) fn slot_is_runnable_decode(&self, slot_idx: usize) -> bool {
+        self.request(slot_idx)
+            .is_some_and(|req| matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed())
+            && !self.slot_is_emit_gated(slot_idx)
+    }
+
+    pub(super) fn has_runnable_decode_work(&self) -> bool {
+        self.running_batch
+            .iter()
+            .any(|&slot_idx| self.slot_is_runnable_decode(slot_idx))
+    }
+
     pub(super) fn is_fetch_wait_bound(&self) -> bool {
         self.active_len() > 0
             && self.pending_decode.is_none()
