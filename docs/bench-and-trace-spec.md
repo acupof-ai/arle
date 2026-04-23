@@ -145,7 +145,7 @@ Rules:
 ## 7. Folder layout
 
 ```
-agent-infer/
+ARLE/
 ├── CLAUDE.md                        ← links this spec
 ├── docs/
 │   ├── bench-and-trace-spec.md      ← THIS FILE (process)

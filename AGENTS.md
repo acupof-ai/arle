@@ -1,4 +1,4 @@
-# agent-infer — Agent Contract
+# ARLE — Agent Contract
 
 Assisting **ckl**. **Project-specific** rules only; generic Rust/CUDA/Metal/git
 knowledge is intentionally absent. Load the relevant module `AGENTS.md`
@@ -8,7 +8,7 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 
 ## Project shape
 
-`agent-infer` is a Rust-native inference runtime with integrated local
+`ARLE` is a Rust-native inference runtime with integrated local
 agent/train/self-evolution workflows. The runtime remains primary:
 
 - `infer` owns serving/runtime truth.
@@ -31,7 +31,7 @@ batched decode HD128+HD256. Tests compare against JSON baselines in
 **Workspace (current):**
 
 ```
-agent-infer/
+ARLE/
 ├── src/                       ← thin `arle` binary
 ├── infer/                     ← primary runtime crate (scheduler/model/ops/backends/HTTP)
 ├── crates/

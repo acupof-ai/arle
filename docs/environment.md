@@ -1,11 +1,11 @@
 # Environment Variables
 
-This document lists the environment variables used by `ARLE` across
-runtime, build, test, and setup workflows.
+This document lists the environment variables used by `ARLE` across runtime,
+build, test, and setup workflows.
 
-The repository currently contains a mix of `ARLE_*`, legacy
-`AGENT_INFER_*`, and `INFER_*` variables. Use this document as the source of
-truth for which names are preferred vs compatibility-only.
+Current truth is simple: prefer `ARLE_*` for the `arle` front door, keep
+`INFER_*` for build/test/runtime plumbing, and treat any remaining
+`AGENT_INFER_*` names as compatibility-only.
 
 ---
 
@@ -44,7 +44,8 @@ document the debug-only status here.
 ### `ARLE_MODEL`
 
 Default model path for the top-level CLI when `--model-path` is omitted.
-Legacy `AGENT_INFER_MODEL` is still accepted as a fallback.
+Legacy `AGENT_INFER_MODEL` remains a compatibility fallback, but new docs and
+scripts should use `ARLE_MODEL`.
 
 Example:
 

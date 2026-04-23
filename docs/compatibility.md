@@ -1,6 +1,6 @@
 # Compatibility and Deprecation Policy
 
-This document defines how `agent-infer` handles breaking changes,
+This document defines how `ARLE` handles breaking changes,
 compatibility-sensitive behavior, and deprecations.
 
 The rule is simple: if users can reasonably build around a documented surface,

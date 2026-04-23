@@ -1,8 +1,8 @@
-# agent-infer Architecture
+# ARLE Architecture
 
 Updated 2026-04-23 after the runtime-first documentation cleanup.
 
-`agent-infer` is a runtime-first workspace:
+`ARLE` is a runtime-first workspace:
 
 - `infer` is the primary serving/runtime surface.
 - `arle` is the unified local front door for agent, train, eval, and data
@@ -15,7 +15,7 @@ Updated 2026-04-23 after the runtime-first documentation cleanup.
 The repository is a runtime-heavy workspace with a small set of control-plane
 and integration crates around it:
 
-- `agent-infer`: thin root package that builds the `arle` binary
+- root package: thin entry package that builds the `arle` binary
 - `infer`: inference runtime, HTTP server, scheduler, backend runtime, model
   loading, CUDA/Metal/CPU backends, and the unified `server_engine::InferenceEngine`
   contract that both the HTTP server and the agent CLI call through
@@ -60,7 +60,7 @@ achieved real independence.
 ### Agent CLI
 
 ```text
-arle (root binary from the `agent-infer` package)
+arle (root binary from the workspace root package)
   -> cli::run()
   -> infer::hf_hub::resolve_model_source() / infer::server_engine::LoadedInferenceEngine::load()
   -> agent::AgentSession (uses `dyn InferenceEngine`)
@@ -87,7 +87,7 @@ infer binary / metal_serve / cpu_serve
 
 | Crate | Owns | Does not own |
 | --- | --- | --- |
-| `agent-infer` | Binary entrypoint only | REPL logic, backend loading |
+| workspace root package | Binary entrypoint only | REPL logic, backend loading |
 | `cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
 | `agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |

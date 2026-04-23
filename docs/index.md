@@ -17,7 +17,7 @@ Last refreshed: 2026-04-23.
 
 ## Current Positioning
 
-`agent-infer` is a runtime-first Rust workspace.
+`ARLE` is a runtime-first Rust workspace.
 
 - `infer` is the primary serving/runtime surface.
 - `arle` is the unified local front door for agent, train, eval, and data

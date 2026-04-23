@@ -1,6 +1,6 @@
 # Stability Policy
 
-This document defines the stability levels used by `agent-infer` and how they
+This document defines the stability levels used by `ARLE` and how they
 affect compatibility, review, and release decisions.
 
 The purpose is simple: users and contributors should know what they can depend
@@ -10,7 +10,7 @@ on, and maintainers should know what must be treated carefully.
 
 ## 1. Stability Levels
 
-`agent-infer` uses four levels.
+`ARLE` uses four levels.
 
 ### Stable
 

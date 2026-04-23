@@ -1,8 +1,8 @@
 # HTTP API
 
-`agent-infer` exposes an OpenAI-compatible serving surface for text generation,
-model discovery, health/readiness probes, runtime stats, and session
-persistence.
+`ARLE` exposes an OpenAI-compatible serving surface for text generation, model
+discovery, health/readiness probes, runtime stats, and session persistence
+through the dedicated `infer` binary.
 
 This document is the reference map for the current HTTP boundary. Stability
 tiers still live in [docs/support-matrix.md](support-matrix.md) and
@@ -69,7 +69,7 @@ under `/v1/train/*` is documented separately in the train/runtime docs.
   are present instead of pretending to support streamed tool-call deltas.
 - JSON request bodies are capped at `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include
-  `WWW-Authenticate: Bearer realm="agent-infer"`.
+  `WWW-Authenticate`.
 - Every HTTP response includes `X-Request-Id`; a client-supplied value is
   preserved when valid, otherwise the server generates one.
 - `GET /healthz` and `GET /readyz` stay lightweight and unauthenticated;
