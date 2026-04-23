@@ -1,7 +1,7 @@
 //! First-run welcome banner + per-user marker file.
 //!
 //! - First launch: prints a 3-line banner and writes
-//!   `${XDG_CONFIG_HOME:-$HOME/.config}/agent-infer/seen` with a timestamp.
+//!   `${XDG_CONFIG_HOME:-$HOME/.config}/arle/seen` with a timestamp.
 //! - Subsequent launches: prints a single info line so the model stays visible.
 //! - Non-writable config dir → silently fall back to the short one-liner.
 
@@ -23,7 +23,7 @@ pub(crate) fn banner_marker_path() -> Option<PathBuf> {
     } else {
         PathBuf::from(std::env::var_os("HOME")?).join(".config")
     };
-    Some(base.join("agent-infer").join("seen"))
+    Some(base.join("arle").join("seen"))
 }
 
 fn marker_exists(path: &Path) -> bool {
@@ -53,10 +53,7 @@ pub(crate) fn print_welcome_banner(model_id: &str) {
     };
 
     if first_run {
-        eprintln!(
-            "{}",
-            dim.apply_to(format!("▎ agent-infer · model: {model_id}"))
-        );
+        eprintln!("{}", dim.apply_to(format!("▎ ARLE · model: {model_id}")));
         eprintln!(
             "{}",
             dim.apply_to("▎ commands: /help  /reset  /tools  /quit      \\ at EOL = multi-line")
@@ -75,10 +72,7 @@ pub(crate) fn print_welcome_banner(model_id: &str) {
             log::debug!("could not write welcome marker");
         }
     } else {
-        eprintln!(
-            "{}",
-            dim.apply_to(format!("▎ agent-infer · model: {model_id}"))
-        );
+        eprintln!("{}", dim.apply_to(format!("▎ ARLE · model: {model_id}")));
     }
 }
 
@@ -116,7 +110,7 @@ mod tests {
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", Some("/tmp/xdgtest"));
         let _home = EnvGuard::set("HOME", Some("/home/ignored"));
         let p = banner_marker_path().expect("xdg set => Some");
-        assert_eq!(p, PathBuf::from("/tmp/xdgtest/agent-infer/seen"));
+        assert_eq!(p, PathBuf::from("/tmp/xdgtest/arle/seen"));
     }
 
     #[test]
@@ -124,7 +118,7 @@ mod tests {
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", None);
         let _home = EnvGuard::set("HOME", Some("/home/u"));
         let p = banner_marker_path().expect("home set => Some");
-        assert_eq!(p, PathBuf::from("/home/u/.config/agent-infer/seen"));
+        assert_eq!(p, PathBuf::from("/home/u/.config/arle/seen"));
     }
 
     #[test]
@@ -132,6 +126,6 @@ mod tests {
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", Some(""));
         let _home = EnvGuard::set("HOME", Some("/home/u"));
         let p = banner_marker_path().expect("home set => Some");
-        assert_eq!(p, PathBuf::from("/home/u/.config/agent-infer/seen"));
+        assert_eq!(p, PathBuf::from("/home/u/.config/arle/seen"));
     }
 }

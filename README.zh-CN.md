@@ -1,5 +1,5 @@
 <p align="center">
-  <strong>agent-infer</strong><br>
+  <strong>ARLE</strong><br>
   <em>面向 LLM 智能体的 KV-cache 优先推理引擎。纯 Rust 实现，CUDA 为主部署路径。</em>
 </p>
 
@@ -87,11 +87,11 @@
   仅在架构或 API 级别发生变化时更新。项目的当前状态体现在上方两节。
 -->
 
-## 为什么要 agent-infer？
+## 为什么要 ARLE（agent rl engine）？
 
 智能体工作流每一轮都要付 "prefill 税"：系统提示 + 历史对话 + 工具结果都要被重新处理。上下文越长，**prefill 越主导延迟**。
 
-agent-infer 把这件事当成核心问题：
+ARLE（agent rl engine）把这件事当成核心问题：
 
 | 能力 | 做的事情 | 效果 |
 |------|----------|------|

@@ -22,7 +22,7 @@ pub(crate) struct CatalogEntry {
     pub(crate) min_memory_gb: f64,
     /// Which backends can run this model.
     pub(crate) backends: &'static [CompiledBackend],
-    /// Whether agent-infer has a working implementation for this arch.
+    /// Whether ARLE has a working implementation for this arch.
     pub(crate) implemented: bool,
 }
 
