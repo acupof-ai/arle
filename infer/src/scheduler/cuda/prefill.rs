@@ -349,7 +349,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn prepare_prefill_completion(
+    pub(super) fn prepare_prefill_completion(
         &mut self,
         slot_idx: usize,
         total: usize,
@@ -392,7 +392,7 @@ impl<M: ModelForward> Scheduler<M> {
             .expect("prefill completion requires live request")
     }
 
-    fn apply_prefill_completion_token(&mut self, slot_idx: usize, token: u32) {
+    pub(super) fn apply_prefill_completion_token(&mut self, slot_idx: usize, token: u32) {
         let Some((ignore_eos, generated_tokens_after_push, max_tokens)) =
             self.request(slot_idx).map(|req| {
                 (

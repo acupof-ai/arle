@@ -99,6 +99,7 @@ pub(super) struct PendingDecode {
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
     pub decode_spans: Vec<(usize, Span)>,
+    pub mixed_prefill: Option<PendingMixedPrefill>,
 }
 
 pub(super) struct PendingPrefillRow {
@@ -111,6 +112,12 @@ pub(super) struct PendingPrefill {
     pub rows: Vec<PendingPrefillRow>,
     pub uses_paged: bool,
     pub prefill_spans: Vec<(usize, Span)>,
+}
+
+pub(super) struct PendingMixedPrefill {
+    pub row: PendingPrefillRow,
+    pub uses_paged: bool,
+    pub prefill_span: Option<(usize, Span)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

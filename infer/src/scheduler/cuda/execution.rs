@@ -24,24 +24,45 @@ struct ScoredPrefillCandidate {
     score: PrefillCandidateScore,
 }
 
-#[derive(Clone, Debug, Default)]
-struct StepPlan {
-    launch_decode: bool,
-    prefill: Vec<PrefillCandidate>,
+#[derive(Clone, Debug)]
+enum StepPlan {
+    Idle,
+    Decode,
+    Prefill(Vec<PrefillCandidate>),
+    Mixed(PrefillCandidate),
 }
 
 impl StepPlan {
     fn label(&self) -> &'static str {
-        match (self.launch_decode, self.prefill.is_empty()) {
-            (false, true) => "idle",
-            (true, true) => "decode",
-            (false, false) => "prefill",
-            (true, false) => "decode+prefill",
+        match self {
+            Self::Idle => "idle",
+            Self::Decode => "decode",
+            Self::Prefill(_) => "prefill",
+            Self::Mixed(_) => "mixed",
         }
     }
 
     fn is_idle(&self) -> bool {
-        !self.launch_decode && self.prefill.is_empty()
+        matches!(self, Self::Idle)
+    }
+
+    fn scheduled_prefill_rows(&self) -> u64 {
+        match self {
+            Self::Prefill(candidates) => candidates.len() as u64,
+            Self::Mixed(_) => 1,
+            Self::Idle | Self::Decode => 0,
+        }
+    }
+
+    fn scheduled_prefill_tokens(&self) -> u64 {
+        match self {
+            Self::Prefill(candidates) => candidates
+                .iter()
+                .map(|candidate| candidate.reservation.prefill_tokens as u64)
+                .sum(),
+            Self::Mixed(candidate) => candidate.reservation.prefill_tokens as u64,
+            Self::Idle | Self::Decode => 0,
+        }
     }
 }
 
@@ -139,7 +160,7 @@ impl<M: ModelForward> Scheduler<M> {
         for slot_idx in decode_slots {
             let has_pending_emit = self
                 .request(slot_idx)
-                .is_some_and(|req| req.has_pending_emit());
+                .is_some_and(super::request::ActiveRequest::has_pending_emit);
             if has_pending_emit {
                 self.dispatch_emit(slot_idx);
             }
@@ -148,9 +169,9 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn remaining_decode_tokens(&self, slot_idx: usize) -> usize {
-        self.request(slot_idx)
-            .map(|req| req.max_tokens.saturating_sub(req.generated_tokens.len()))
-            .unwrap_or(0)
+        self.request(slot_idx).map_or(0, |req| {
+            req.max_tokens.saturating_sub(req.generated_tokens.len())
+        })
     }
 
     fn prefill_reservation(
@@ -231,9 +252,18 @@ impl<M: ModelForward> Scheduler<M> {
         let mut budget = PrefillBudget::from_scheduler(self);
         let scored_candidates = self.collect_prefill_candidates(&budget);
         let candidates = select_prefill_candidates(&mut budget, scored_candidates);
-        StepPlan {
-            launch_decode: has_decode,
-            prefill: candidates,
+        if has_decode {
+            if self.model.supports_mixed_batch() {
+                if let Some(candidate) = candidates.into_iter().next() {
+                    return StepPlan::Mixed(candidate);
+                }
+            }
+            return StepPlan::Decode;
+        }
+        if candidates.is_empty() {
+            StepPlan::Idle
+        } else {
+            StepPlan::Prefill(candidates)
         }
     }
 
@@ -269,12 +299,8 @@ impl<M: ModelForward> Scheduler<M> {
         let plan_t = std::time::Instant::now();
         let plan = self.plan_step();
         let admission_us = plan_t.elapsed().as_micros();
-        let scheduled_prefill_rows = plan.prefill.len() as u64;
-        let scheduled_prefill_tokens: u64 = plan
-            .prefill
-            .iter()
-            .map(|candidate| candidate.reservation.prefill_tokens as u64)
-            .sum();
+        let scheduled_prefill_rows = plan.scheduled_prefill_rows();
+        let scheduled_prefill_tokens = plan.scheduled_prefill_tokens();
 
         assert!(
             self.pending_decode.is_none(),
@@ -285,18 +311,22 @@ impl<M: ModelForward> Scheduler<M> {
             "pending prefill must be cleared before the next launch"
         );
 
-        let prefill_t = std::time::Instant::now();
-        if !plan.prefill.is_empty() {
-            self.step_prefill_batch(&plan.prefill);
+        let launch_t = std::time::Instant::now();
+        match &plan {
+            StepPlan::Idle => {}
+            StepPlan::Decode => self.step_decode_launch(),
+            StepPlan::Prefill(candidates) => self.step_prefill_batch(candidates),
+            StepPlan::Mixed(candidate) => self.step_mixed_launch(*candidate),
         }
-        let prefill_us = prefill_t.elapsed().as_micros();
+        let launch_us = launch_t.elapsed().as_micros();
 
-        let decode_launch_us = if plan.launch_decode {
-            let t = std::time::Instant::now();
-            self.step_decode_launch();
-            t.elapsed().as_micros()
-        } else {
-            0
+        let prefill_us = match &plan {
+            StepPlan::Prefill(_) => launch_us,
+            StepPlan::Idle | StepPlan::Decode | StepPlan::Mixed(_) => 0,
+        };
+        let decode_launch_us = match &plan {
+            StepPlan::Decode | StepPlan::Mixed(_) => launch_us,
+            StepPlan::Idle | StepPlan::Prefill(_) => 0,
         };
         let scheduled_decode_rows = self
             .pending_decode
