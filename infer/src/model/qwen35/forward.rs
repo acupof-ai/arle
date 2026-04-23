@@ -9,7 +9,7 @@ use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
-    GenerationState, MixedBatchRequest, ModelForward, PrefillBatchRequest,
+    GenerationState, ModelForward, PrefillBatchRequest, decode_metadata_page_capacity,
     prepare_paged_prefill_batch,
 };
 use crate::ops;
@@ -190,6 +190,7 @@ impl ModelForward for Qwen35Model {
     fn create_decode_context(
         &self,
         max_batch_size: usize,
+        max_seq_len: Option<usize>,
         pool: &PagedKVPool,
     ) -> Result<Self::DecodeContext> {
         use super::batch_decode::BatchDecodeBuffers35;
@@ -201,7 +202,12 @@ impl ModelForward for Qwen35Model {
         let qkv_dim = c.linear_attn_qkv_dim();
         let z_dim = c.linear_attn_z_dim();
         let b_dim = c.linear_num_value_heads;
-        let max_pages = pool.max_total_pages;
+        let max_pages = decode_metadata_page_capacity(
+            max_batch_size,
+            max_seq_len,
+            pool.page_size,
+            pool.max_total_pages,
+        );
         let num_linear_layers = c.num_hidden_layers - c.num_full_attention_layers();
         BatchDecodeBuffers35::new(
             &self.ctx,
@@ -452,37 +458,6 @@ impl ModelForward for Qwen35Model {
             }
             _ => self.decode_batch_contiguous(tokens, states, slot_indices),
         }
-    }
-
-    fn supports_mixed_batch(&self) -> bool {
-        self.prefill_uses_paged_pool()
-    }
-
-    fn forward_mixed_batch(
-        &self,
-        batch: MixedBatchRequest<'_>,
-        states: &mut [Self::State],
-        paged_kv_pool: Option<&mut PagedKVPool>,
-        decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
-        let Some(pool) = paged_kv_pool else {
-            return Ok(false);
-        };
-        if !pool.is_active() {
-            return Ok(false);
-        }
-
-        self.forward_decode_batch(
-            batch.decode_tokens,
-            states,
-            batch.decode_slot_indices,
-            Some(&mut *pool),
-            decode_ctx,
-            false,
-        )?;
-        let prefill = [batch.prefill];
-        let _ = self.forward_prefill_batch_with_pool(&prefill, states, pool)?;
-        Ok(true)
     }
 
     fn sample_batch_greedy(

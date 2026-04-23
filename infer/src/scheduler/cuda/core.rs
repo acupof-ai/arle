@@ -960,6 +960,8 @@ impl<M: ModelForward> Scheduler<M> {
             let runtime_workspace = model.scheduler_runtime_workspace_bytes(
                 config.max_slots,
                 effective_prefill_token_budget,
+                effective_max_seq_len,
+                kv_pool_format,
             );
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
             {
@@ -1139,13 +1141,16 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn slot_has_pending_gpu_work(&self, slot_idx: usize) -> bool {
-        self.pending_decode
+        self.pending_decode.as_ref().is_some_and(|pending| {
+            pending.decode_indices.contains(&slot_idx)
+                || pending
+                    .mixed_prefill
+                    .as_ref()
+                    .is_some_and(|mixed| mixed.row.slot_idx == slot_idx)
+        }) || self
+            .pending_prefill
             .as_ref()
-            .is_some_and(|pending| pending.decode_indices.contains(&slot_idx))
-            || self
-                .pending_prefill
-                .as_ref()
-                .is_some_and(|pending| pending.rows.iter().any(|row| row.slot_idx == slot_idx))
+            .is_some_and(|pending| pending.rows.iter().any(|row| row.slot_idx == slot_idx))
     }
 
     pub(super) fn request(&self, slot_idx: usize) -> Option<&ActiveRequest> {
@@ -2037,10 +2042,11 @@ impl<M: ModelForward> Scheduler<M> {
 
             // Lazy-init decode context before warmup.
             if self.decode_bufs.is_none() {
-                match self
-                    .model
-                    .create_decode_context(self.states.len(), &self.paged_kv_pool)
-                {
+                match self.model.create_decode_context(
+                    self.states.len(),
+                    self.effective_max_seq_len,
+                    &self.paged_kv_pool,
+                ) {
                     Ok(ctx) => self.decode_bufs = Some(ctx),
                     Err(e) => {
                         error!("Warmup: failed to create decode context: {}", e);

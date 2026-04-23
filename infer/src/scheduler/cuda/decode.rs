@@ -240,10 +240,11 @@ impl<M: ModelForward> Scheduler<M> {
             .all(|p| p.is_greedy() && !p.has_penalties());
 
         if self.decode_bufs.is_none() {
-            match self
-                .model
-                .create_decode_context(self.states.len(), &self.paged_kv_pool)
-            {
+            match self.model.create_decode_context(
+                self.states.len(),
+                self.effective_max_seq_len,
+                &self.paged_kv_pool,
+            ) {
                 Ok(ctx) => self.decode_bufs = Some(ctx),
                 Err(e) => {
                     error!("Failed to create decode context: {}", e);
@@ -382,10 +383,11 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         if self.decode_bufs.is_none() {
-            match self
-                .model
-                .create_decode_context(self.states.len(), &self.paged_kv_pool)
-            {
+            match self.model.create_decode_context(
+                self.states.len(),
+                self.effective_max_seq_len,
+                &self.paged_kv_pool,
+            ) {
                 Ok(ctx) => self.decode_bufs = Some(ctx),
                 Err(e) => {
                     error!("Failed to create decode context: {}", e);
