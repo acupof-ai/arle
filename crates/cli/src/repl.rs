@@ -275,6 +275,38 @@ fn history_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".arle-history"))
 }
 
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn legacy_history_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".agent-infer-history"))
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn migrate_legacy_history(path: &Path) {
+    if path.exists() {
+        return;
+    }
+    let Some(legacy_path) = legacy_history_path() else {
+        return;
+    };
+    if !legacy_path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        log::debug!("Skipping history migration to {}: {err}", path.display());
+        return;
+    }
+    if let Err(err) = std::fs::copy(&legacy_path, path) {
+        log::debug!(
+            "Skipping history migration from {} to {}: {err}",
+            legacy_path.display(),
+            path.display()
+        );
+    }
+}
+
 /// Read one logical input from rustyline. Lines ending with `\` are joined
 /// with `\n` until a line without a trailing backslash is entered.
 ///
@@ -373,6 +405,9 @@ fn run_interactive_repl(
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
 
+    if let Some(path) = history.as_ref() {
+        migrate_legacy_history(path);
+    }
     if let Some(path) = history.as_ref()
         && let Err(err) = editor.load_history(path)
     {
@@ -904,8 +939,6 @@ pub(crate) fn detect_family(model_id: &str) -> &'static str {
         "qwen2.5"
     } else if lc.contains("qwen3") {
         "qwen3"
-    } else if lc.contains("glm4") || lc.contains("glm-4") {
-        "glm4"
     } else {
         "other"
     }
@@ -1265,8 +1298,8 @@ mod tests {
     #[test]
     fn stats_accumulator_sums_across_turns() {
         let mut s = SessionStats::default();
-        s.record_turn(10, 20, Duration::from_secs(1));
-        s.record_turn(5, 40, Duration::from_secs(2));
+        s.record_turn(10, 20, 0, Duration::from_secs(1));
+        s.record_turn(5, 40, 0, Duration::from_secs(2));
         assert_eq!(s.turn_count, 2);
         assert_eq!(s.prompt_tokens, 15);
         assert_eq!(s.completion_tokens, 60);
@@ -1282,8 +1315,8 @@ mod tests {
         // A 1-tok 1s turn (1 tok/s) should be dominated by a 1000-tok 10s
         // turn (100 tok/s). Plain mean would be ~50.5; weighted ≈ 99.9.
         let mut s = SessionStats::default();
-        s.record_turn(1, 1, Duration::from_secs(1));
-        s.record_turn(1, 1000, Duration::from_secs(10));
+        s.record_turn(1, 1, 0, Duration::from_secs(1));
+        s.record_turn(1, 1000, 0, Duration::from_secs(10));
         let avg = s.avg_tps();
         assert!(
             avg > 99.0,
@@ -1296,7 +1329,7 @@ mod tests {
         // A turn with zero elapsed time (should never happen at runtime
         // but the math must not NaN out). weighted_rate_numer stays 0.
         let mut s = SessionStats::default();
-        s.record_turn(5, 10, Duration::ZERO);
+        s.record_turn(5, 10, 0, Duration::ZERO);
         assert_eq!(s.turn_count, 1);
         assert_eq!(s.avg_tps(), 0.0);
     }
@@ -1343,7 +1376,6 @@ mod tests {
         assert_eq!(detect_family("Qwen/Qwen3-4B"), "qwen3");
         assert_eq!(detect_family("Qwen/Qwen3.5-4B"), "qwen3.5");
         assert_eq!(detect_family("Qwen/Qwen2.5-7B"), "qwen2.5");
-        assert_eq!(detect_family("THUDM/glm-4-9b-chat"), "glm4");
         assert_eq!(detect_family("something-else"), "other");
     }
 

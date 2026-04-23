@@ -1,11 +1,11 @@
 # Environment Variables
 
-This document lists the environment variables used by `agent-infer` across
+This document lists the environment variables used by `ARLE` across
 runtime, build, test, and setup workflows.
 
-The repository currently contains both `AGENT_INFER_*` and `INFER_*`
-variables. Until naming is fully unified, use this document as the source of
-truth.
+The repository currently contains a mix of `ARLE_*`, legacy
+`AGENT_INFER_*`, and `INFER_*` variables. Use this document as the source of
+truth for which names are preferred vs compatibility-only.
 
 ---
 
@@ -30,24 +30,27 @@ document the debug-only status here.
 
 ## 1. Naming Rule
 
-- Prefer `AGENT_INFER_*` for user-facing runtime behavior when available.
-- Treat `INFER_*` primarily as legacy, build, test, or compatibility
-  variables unless documented otherwise.
+- Prefer `ARLE_*` for newly documented user-facing CLI/runtime behavior.
+- Treat `AGENT_INFER_*` as legacy compatibility names unless this document
+  explicitly calls them out as the current canonical surface.
+- Treat `INFER_*` primarily as build, test, or compatibility variables unless
+  documented otherwise.
 - Treat undocumented variables as internal or experimental.
 
 ---
 
 ## 2. User-Facing Runtime Variables
 
-### `AGENT_INFER_MODEL`
+### `ARLE_MODEL`
 
 Default model path for the top-level CLI when `--model-path` is omitted.
+Legacy `AGENT_INFER_MODEL` is still accepted as a fallback.
 
 Example:
 
 ```bash
-export AGENT_INFER_MODEL=models/Qwen3-4B
-./target/release/agent-infer --max-turns 10
+export ARLE_MODEL=models/Qwen3-4B
+./target/release/arle --max-turns 10
 ```
 
 ### `AGENT_INFER_API_KEY`
@@ -74,7 +77,7 @@ Cargo feature flags, builds `metal_serve`, and starts the server on
 
 Defaults:
 
-- model: `AGENT_INFER_MODEL` if set, otherwise `mlx-community/Qwen3-0.6B-4bit`
+- model: `ARLE_MODEL` if set, otherwise legacy `AGENT_INFER_MODEL`, otherwise `mlx-community/Qwen3-0.6B-4bit`
 - port: `8000`
 - bind: `127.0.0.1`
 
@@ -361,7 +364,7 @@ sandboxing.
 ### CLI usage
 
 ```bash
-export AGENT_INFER_MODEL=models/Qwen3-4B
+export ARLE_MODEL=models/Qwen3-4B
 ```
 
 ### CUDA build

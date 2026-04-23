@@ -11,6 +11,8 @@ use crate::hub_discovery;
 use crate::model_catalog;
 
 const INSPECTION_SCHEMA_VERSION: u32 = 1;
+const PRIMARY_MODEL_ENV: &str = "ARLE_MODEL";
+const LEGACY_MODEL_ENV: &str = "AGENT_INFER_MODEL";
 
 struct DoctorSnapshot {
     info: hardware::SystemInfo,
@@ -80,7 +82,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
 
     println!(
         "{} {}",
-        style("env AGENT_INFER_MODEL").dim(),
+        style("env ARLE_MODEL (legacy: AGENT_INFER_MODEL)").dim(),
         snapshot.env_model.as_deref().unwrap_or("<unset>")
     );
     println!(
@@ -139,7 +141,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     }
     if snapshot.selected.is_err() {
         println!(
-            "{} set `--model-path`, `AGENT_INFER_MODEL`, or cache a supported local model",
+            "{} set `--model-path`, `ARLE_MODEL` (legacy `AGENT_INFER_MODEL` also works), or cache a supported local model",
             style("resolution").yellow().bold()
         );
     }
@@ -184,8 +186,7 @@ fn collect_snapshot(args: &Args) -> DoctorSnapshot {
         stdout: std::io::stdout().is_terminal(),
         stderr: std::io::stderr().is_terminal(),
     };
-    let env_model =
-        non_empty_value(std::env::var("AGENT_INFER_MODEL").ok().as_deref()).map(ToOwned::to_owned);
+    let env_model = preferred_model_env_value();
     let arg_model_path = non_empty_value(args.model_path.as_deref()).map(ToOwned::to_owned);
     let hf_cache_root = hub_discovery::hub_cache_root();
     let discovered = infer::hf_hub::discover_local_model();
@@ -529,8 +530,9 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
             code: "resolution_missing",
             name: "resolution",
             status: "warn",
-            message: "set `--model-path`, `AGENT_INFER_MODEL`, or cache a supported local model"
-                .to_string(),
+            message:
+                "set `--model-path`, `ARLE_MODEL` (legacy `AGENT_INFER_MODEL` also works), or cache a supported local model"
+                    .to_string(),
         });
     }
     checks
@@ -610,7 +612,7 @@ impl SelectedModelSource {
     fn origin_label(&self) -> &'static str {
         match self {
             Self::Explicit(_) => "--model-path",
-            Self::Environment(_) => "AGENT_INFER_MODEL",
+            Self::Environment(_) => "ARLE_MODEL / AGENT_INFER_MODEL",
             Self::AutoDiscovered { .. } => "auto-discovered local model",
         }
     }
@@ -656,12 +658,20 @@ fn select_model_source(
     }
 
     anyhow::bail!(
-        "no model selected; pass --model-path, set AGENT_INFER_MODEL, or place a supported model in the local HuggingFace cache"
+        "no model selected; pass --model-path, set ARLE_MODEL (legacy AGENT_INFER_MODEL also works), or place a supported model in the local HuggingFace cache"
     )
 }
 
 fn non_empty_value(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn preferred_model_env_value() -> Option<String> {
+    non_empty_value(std::env::var(PRIMARY_MODEL_ENV).ok().as_deref())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            non_empty_value(std::env::var(LEGACY_MODEL_ENV).ok().as_deref()).map(ToOwned::to_owned)
+        })
 }
 
 fn gpu_summary(gpu: &GpuInfo) -> String {

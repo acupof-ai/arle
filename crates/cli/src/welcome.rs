@@ -11,19 +11,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use console::Style;
 
+fn config_home() -> Option<PathBuf> {
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME")
+        && !x.is_empty()
+    {
+        Some(PathBuf::from(x))
+    } else {
+        Some(PathBuf::from(std::env::var_os("HOME")?).join(".config"))
+    }
+}
+
 /// Compute the `seen` marker file path honouring `$XDG_CONFIG_HOME`.
 ///
 /// Returns `None` only when `$HOME` is unset AND `$XDG_CONFIG_HOME` is
 /// unset — on any sane dev environment this is always `Some`.
 pub(crate) fn banner_marker_path() -> Option<PathBuf> {
-    let base = if let Some(x) = std::env::var_os("XDG_CONFIG_HOME")
-        && !x.is_empty()
-    {
-        PathBuf::from(x)
-    } else {
-        PathBuf::from(std::env::var_os("HOME")?).join(".config")
-    };
-    Some(base.join("arle").join("seen"))
+    Some(config_home()?.join("arle").join("seen"))
+}
+
+fn legacy_banner_marker_path() -> Option<PathBuf> {
+    Some(config_home()?.join("agent-infer").join("seen"))
 }
 
 fn marker_exists(path: &Path) -> bool {
@@ -47,10 +54,12 @@ fn write_marker(path: &Path) -> std::io::Result<()> {
 pub(crate) fn print_welcome_banner(model_id: &str) {
     let dim = Style::new().dim();
     let marker = banner_marker_path();
-    let first_run = match marker.as_ref() {
-        Some(p) => !marker_exists(p),
-        None => false,
-    };
+    let legacy_marker = legacy_banner_marker_path();
+    let marker_seen = marker.as_ref().is_some_and(|path| marker_exists(path));
+    let legacy_seen = legacy_marker
+        .as_ref()
+        .is_some_and(|path| marker_exists(path));
+    let first_run = !marker_seen && !legacy_seen;
 
     if first_run {
         eprintln!("{}", dim.apply_to(format!("▎ ARLE · model: {model_id}")));
@@ -62,17 +71,18 @@ pub(crate) fn print_welcome_banner(model_id: &str) {
             "{}",
             dim.apply_to("▎ Ctrl-C to cancel generation · Ctrl-D to exit")
         );
-
-        // Attempt the marker write. A failure here (read-only $HOME, etc.)
-        // is swallowed — next launch will just show the banner again, which
-        // is strictly better than erroring out.
-        if let Some(p) = marker
-            && write_marker(&p).is_err()
-        {
-            log::debug!("could not write welcome marker");
-        }
     } else {
         eprintln!("{}", dim.apply_to(format!("▎ ARLE · model: {model_id}")));
+    }
+
+    // Attempt the marker write. A failure here (read-only $HOME, etc.)
+    // is swallowed — next launch will just show the banner again, which
+    // is strictly better than erroring out.
+    if !marker_seen
+        && let Some(path) = marker
+        && write_marker(&path).is_err()
+    {
+        log::debug!("could not write welcome marker");
     }
 }
 
