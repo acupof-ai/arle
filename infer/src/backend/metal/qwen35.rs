@@ -23,7 +23,7 @@ use crate::gguf::{
     GgufFile, HostTensor, find_tensor_name, load_matrix_bf16_host,
     load_matrix_v_reorder_cols_bf16_host, load_matrix_v_reorder_rows_bf16_host,
     load_qwen35_a_log_f32_host, load_qwen35_conv1d_bf16_host, load_qwen35_qkv_matrix_bf16_host,
-    load_vector_bf16_host, load_vector_v_reorder_bf16_host,
+    load_vector_bf16_host, load_vector_f32_host, load_vector_v_reorder_bf16_host,
 };
 use crate::sampler::SamplingParams;
 
@@ -134,12 +134,12 @@ fn mlx_tensor_shape(shape: &[usize]) -> Vec<i32> {
         .collect()
 }
 
-fn mlx_bf16_tensor(tensor: HostTensor<bf16>) -> MlxArray {
+fn mlx_bf16_tensor(tensor: &HostTensor<bf16>) -> MlxArray {
     let shape = mlx_tensor_shape(&tensor.shape);
     mlx_bf16_array(&tensor.data, &shape)
 }
 
-fn mlx_f32_tensor(tensor: HostTensor<f32>) -> MlxArray {
+fn mlx_f32_tensor(tensor: &HostTensor<f32>) -> MlxArray {
     let shape = mlx_tensor_shape(&tensor.shape);
     MlxArray::from_slice_f32(&tensor.data, &shape)
 }
@@ -1618,28 +1618,13 @@ pub(super) fn metal_generate_qwen35(
     let mut generated = Vec::new();
     let mut ttft_ms = 0.0;
 
-    // ── mlx_lm-style double-buffered decode loop ────────────────────────
+    // Decode must materialize the sampled token before feeding it back into the
+    // next step. Reusing the lazy sampled array directly as a token input can
+    // build an invalid follow-on graph and corrupt generation.
     let mut y = gpu_sample_token(&logits, params);
     super::mlx::async_eval(&[&y]);
 
     let finish_reason = 'decode: loop {
-        // Build NEXT graph while GPU computes CURRENT y.
-        let next_logits = do_step(
-            &y,
-            &weights.cpp_model,
-            &mut kv_flat,
-            &mut gdr_flat,
-            &mut k_caches,
-            &mut v_caches,
-            &mut recurrent,
-            cache_len,
-        )?;
-        cache_len += 1;
-        recurrent.seq_len = cache_len as usize;
-        let next_y = gpu_sample_token(&next_logits, params);
-        super::mlx::async_eval(&[&next_y]);
-
-        // Now wait for CURRENT y and process the token.
         super::mlx::eval(&[&y]);
         let next_token = y.item_i32() as u32;
 
@@ -1708,7 +1693,21 @@ pub(super) fn metal_generate_qwen35(
             clear_metal_cache();
         }
 
-        y = next_y;
+        let token_arr = MlxArray::from_slice_i32(&[next_token as i32], &[1]);
+        let next_logits = do_step(
+            &token_arr,
+            &weights.cpp_model,
+            &mut kv_flat,
+            &mut gdr_flat,
+            &mut k_caches,
+            &mut v_caches,
+            &mut recurrent,
+            cache_len,
+        )?;
+        cache_len += 1;
+        recurrent.seq_len = cache_len as usize;
+        y = gpu_sample_token(&next_logits, params);
+        super::mlx::async_eval(&[&y]);
     };
 
     let elapsed = t0.elapsed().as_secs_f64();
@@ -1873,7 +1872,7 @@ fn metal_generate_qwen35_dflash(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn qwen35_forward_step(
+fn qwen35_forward_step_impl(
     token: &MlxArray,
     weights: &Qwen35MetalWeights,
     config: &MetalModelConfig,
@@ -1882,15 +1881,16 @@ pub(super) fn qwen35_forward_step(
     v_caches: &mut [MlxArray],
     recurrent: &mut MetalRecurrentState,
     cache_len: i32,
-) -> MlxArray {
+    capture_layers: Option<&std::collections::HashSet<usize>>,
+) -> (MlxArray, Vec<MlxArray>) {
     let mut x = take_axis(&weights.embed_tokens, token, 0);
     let mut full_idx = 0usize;
     let mut linear_idx = 0usize;
+    let mut captured = Vec::with_capacity(capture_layers.map_or(0, std::collections::HashSet::len));
 
-    for layer in &weights.layers {
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let residual = x.clone();
 
-        // Full-attention and GDR steps both operate on the normalized input.
         let attn_out = match &layer.attention {
             MetalQwen35Attention::Full(attn) => {
                 let out = fused_full_attn_step(
@@ -1932,6 +1932,12 @@ pub(super) fn qwen35_forward_step(
         );
         let mlp = mlp_forward(&layer.mlp, &xn);
         x = add(&residual2, &mlp);
+
+        if capture_layers.is_some_and(|layers| layers.contains(&layer_idx)) {
+            let hidden = x.clone();
+            super::mlx::eval(&[&hidden]);
+            captured.push(hidden);
+        }
     }
 
     let final_norm = rms_norm_last_dim(
@@ -1940,7 +1946,23 @@ pub(super) fn qwen35_forward_step(
         config.rms_norm_eps as f32,
         config.norm_weight_mode.uses_offset(),
     );
-    linear(&final_norm, &weights.lm_head)
+    (linear(&final_norm, &weights.lm_head), captured)
+}
+
+pub(super) fn qwen35_forward_step(
+    token: &MlxArray,
+    weights: &Qwen35MetalWeights,
+    config: &MetalModelConfig,
+    arch: &MetalQwen35ArchConfig,
+    k_caches: &mut [MlxArray],
+    v_caches: &mut [MlxArray],
+    recurrent: &mut MetalRecurrentState,
+    cache_len: i32,
+) -> MlxArray {
+    qwen35_forward_step_impl(
+        token, weights, config, arch, k_caches, v_caches, recurrent, cache_len, None,
+    )
+    .0
 }
 
 /// Like `qwen35_forward_step` but captures hidden states at specified layer indices.
@@ -1956,76 +1978,24 @@ pub(super) fn qwen35_forward_with_hidden_states(
     cache_len: i32,
     target_layer_ids: &[usize],
 ) -> (MlxArray, MlxArray) {
-    use std::collections::HashSet;
-    let selected: HashSet<usize> = target_layer_ids.iter().copied().collect();
-    let _selected_hidden: Vec<MlxArray> = Vec::with_capacity(target_layer_ids.len());
-
-    // Process tokens one at a time (the attention/GDR helpers expect single-token input).
-    // Capture hidden states after each layer for selected layers.
+    let selected: std::collections::HashSet<usize> = target_layer_ids.iter().copied().collect();
     let mut all_per_token_hidden: Vec<Vec<MlxArray>> = Vec::new();
     let mut last_logits = MlxArray::scalar_f32(0.0);
     for (pos, &token) in (cache_len..).zip(input_ids.iter()) {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
-        let mut x = take_axis(&weights.embed_tokens, &token_arr, 0);
-        let mut full_idx = 0usize;
-        let mut linear_idx = 0usize;
-        let mut token_hidden: Vec<MlxArray> = Vec::new();
-
-        for (layer_idx, layer) in weights.layers.iter().enumerate() {
-            let residual = x.clone();
-            let attn_out = match &layer.attention {
-                MetalQwen35Attention::Full(attn) => {
-                    let out = fused_full_attn_step(
-                        &x,
-                        &layer.input_layernorm,
-                        attn,
-                        config,
-                        arch,
-                        &mut k_caches[full_idx],
-                        &mut v_caches[full_idx],
-                        pos,
-                    );
-                    full_idx += 1;
-                    out
-                }
-                MetalQwen35Attention::Linear(attn) => {
-                    let out = fused_gdr_step(
-                        &x,
-                        &layer.input_layernorm,
-                        attn,
-                        recurrent,
-                        linear_idx,
-                        &arch.linear,
-                        config,
-                    );
-                    linear_idx += 1;
-                    out
-                }
-            };
-
-            x = add(&residual, &attn_out);
-            let residual2 = x.clone();
-            let xn = rms_norm_last_dim(
-                &x,
-                &layer.post_attention_layernorm,
-                config.rms_norm_eps as f32,
-                config.norm_weight_mode.uses_offset(),
-            );
-            let mlp = mlp_forward(&layer.mlp, &xn);
-            x = add(&residual2, &mlp);
-
-            if selected.contains(&layer_idx) {
-                token_hidden.push(x.clone());
-            }
-        }
-
-        let final_norm = rms_norm_last_dim(
-            &x,
-            &weights.norm,
-            config.rms_norm_eps as f32,
-            config.norm_weight_mode.uses_offset(),
+        let (logits, token_hidden) = qwen35_forward_step_impl(
+            &token_arr,
+            weights,
+            config,
+            arch,
+            k_caches,
+            v_caches,
+            recurrent,
+            pos,
+            Some(&selected),
         );
-        last_logits = linear(&final_norm, &weights.lm_head);
+        super::mlx::eval(&[&logits]);
+        last_logits = logits;
         all_per_token_hidden.push(token_hidden);
     }
 
@@ -2333,16 +2303,16 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
 
     log::info!("  loading Qwen3.5 GGUF on Metal — dequantizing to BF16 during load");
 
-    let embed_tokens = mlx_bf16_tensor(load_matrix_bf16_host(
+    let embed_tokens = mlx_bf16_tensor(&load_matrix_bf16_host(
         gguf,
         &format!("{prefix}.embed_tokens.weight"),
     )?);
-    let norm = mlx_bf16_tensor(load_vector_bf16_host(
+    let norm = mlx_bf16_tensor(&load_vector_bf16_host(
         gguf,
         &format!("{prefix}.norm.weight"),
     )?);
     let lm_head = if find_tensor_name(gguf, "lm_head.weight").is_ok() {
-        dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+        dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
             gguf,
             "lm_head.weight",
         )?))
@@ -2357,27 +2327,27 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
             MetalQwen35LayerType::FullAttention => {
                 let attn_prefix = format!("{layer_prefix}.self_attn");
                 MetalQwen35Attention::Full(MetalQwen35FullAttentionWeights {
-                    q_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+                    q_proj: dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.q_proj.weight"),
                     )?)),
-                    k_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+                    k_proj: dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.k_proj.weight"),
                     )?)),
-                    v_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+                    v_proj: dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.v_proj.weight"),
                     )?)),
-                    o_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+                    o_proj: dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.o_proj.weight"),
                     )?)),
-                    q_norm: mlx_bf16_tensor(load_vector_bf16_host(
+                    q_norm: mlx_bf16_tensor(&load_vector_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.q_norm.weight"),
                     )?),
-                    k_norm: mlx_bf16_tensor(load_vector_bf16_host(
+                    k_norm: mlx_bf16_tensor(&load_vector_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.k_norm.weight"),
                     )?),
@@ -2386,7 +2356,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
             MetalQwen35LayerType::LinearAttention => {
                 let attn_prefix = format!("{layer_prefix}.linear_attn");
                 let qkv_proj =
-                    dense_weight_from_matrix(&mlx_bf16_tensor(load_qwen35_qkv_matrix_bf16_host(
+                    dense_weight_from_matrix(&mlx_bf16_tensor(&load_qwen35_qkv_matrix_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.in_proj_qkv.weight"),
                         num_k,
@@ -2395,7 +2365,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
                         value_head_dim,
                     )?));
                 let z_proj = dense_weight_from_matrix(&mlx_bf16_tensor(
-                    load_matrix_v_reorder_rows_bf16_host(
+                    &load_matrix_v_reorder_rows_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.in_proj_z.weight"),
                         num_k,
@@ -2404,7 +2374,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
                     )?,
                 ));
                 let beta_proj = dense_weight_from_matrix(&mlx_bf16_tensor(
-                    load_matrix_v_reorder_rows_bf16_host(
+                    &load_matrix_v_reorder_rows_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.in_proj_b.weight"),
                         num_k,
@@ -2413,7 +2383,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
                     )?,
                 ));
                 let alpha_proj = dense_weight_from_matrix(&mlx_bf16_tensor(
-                    load_matrix_v_reorder_rows_bf16_host(
+                    &load_matrix_v_reorder_rows_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.in_proj_a.weight"),
                         num_k,
@@ -2436,7 +2406,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
                     in_proj_a: alpha_proj,
                     qkvz_split: (qkv_dim, z_dim),
                     ba_num_heads: beta_dim,
-                    conv1d_weight: mlx_bf16_tensor(load_qwen35_conv1d_bf16_host(
+                    conv1d_weight: mlx_bf16_tensor(&load_qwen35_conv1d_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.conv1d.weight"),
                         arch.linear.num_key_heads,
@@ -2445,25 +2415,25 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
                         arch.linear.value_dim,
                         arch.linear.conv_kernel,
                     )?),
-                    dt_bias: mlx_bf16_tensor(load_vector_v_reorder_bf16_host(
+                    dt_bias: mlx_bf16_tensor(&load_vector_v_reorder_bf16_host(
                         gguf,
                         &format!("{attn_prefix}.dt_bias"),
                         num_k,
                         num_v_per_k,
                         1,
                     )?),
-                    a_log: mlx_f32_tensor(load_qwen35_a_log_f32_host(
+                    a_log: mlx_f32_tensor(&load_qwen35_a_log_f32_host(
                         gguf,
                         &format!("{attn_prefix}.a_log"),
                         num_k,
                         num_v_per_k,
                     )?),
-                    norm_weight: mlx_bf16_tensor(load_vector_bf16_host(
+                    norm_weight: mlx_f32_tensor(&load_vector_f32_host(
                         gguf,
                         &format!("{attn_prefix}.norm.weight"),
                     )?),
                     out_proj: dense_weight_from_matrix(&mlx_bf16_tensor(
-                        load_matrix_v_reorder_cols_bf16_host(
+                        &load_matrix_v_reorder_cols_bf16_host(
                             gguf,
                             &format!("{attn_prefix}.out_proj.weight"),
                             num_k,
@@ -2477,11 +2447,11 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
             }
         };
 
-        let gate_proj = dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+        let gate_proj = dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
             gguf,
             &format!("{layer_prefix}.mlp.gate_proj.weight"),
         )?));
-        let up_proj = dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+        let up_proj = dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
             gguf,
             &format!("{layer_prefix}.mlp.up_proj.weight"),
         )?));
@@ -2490,7 +2460,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
                 gate_proj: gate_proj.clone(),
                 up_proj: up_proj.clone(),
             },
-            down_proj: dense_weight_from_matrix(&mlx_bf16_tensor(load_matrix_bf16_host(
+            down_proj: dense_weight_from_matrix(&mlx_bf16_tensor(&load_matrix_bf16_host(
                 gguf,
                 &format!("{layer_prefix}.mlp.down_proj.weight"),
             )?)),
@@ -2499,12 +2469,12 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
         });
 
         layers.push(MetalQwen35BlockWeights {
-            input_layernorm: mlx_bf16_tensor(load_vector_bf16_host(
+            input_layernorm: mlx_bf16_tensor(&load_vector_bf16_host(
                 gguf,
                 &format!("{layer_prefix}.input_layernorm.weight"),
             )?),
             attention,
-            post_attention_layernorm: mlx_bf16_tensor(load_vector_bf16_host(
+            post_attention_layernorm: mlx_bf16_tensor(&load_vector_bf16_host(
                 gguf,
                 &format!("{layer_prefix}.post_attention_layernorm.weight"),
             )?),
@@ -4068,6 +4038,148 @@ mod tests {
             let gg_layer =
                 MlxArray::from_slice_f32(&gg_slice[start..end], &[1, hidden_size as i32]);
             print_tensor_diff(&format!("layer{layer_idx}.hidden"), &st_layer, &gg_layer);
+        }
+
+        Ok(())
+    }
+
+    fn qwen35_replay_logits(
+        input_ids: &[u32],
+        weights: &Qwen35MetalWeights,
+        config: &MetalModelConfig,
+        arch: &MetalQwen35ArchConfig,
+    ) -> Result<MlxArray> {
+        let num_full_layers = arch.num_full_attention_layers();
+        let kv_capacity = input_ids.len() as i32 + 8;
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+        let mut k_caches: Vec<MlxArray> = (0..num_full_layers)
+            .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+            .collect();
+        let mut v_caches: Vec<MlxArray> = (0..num_full_layers)
+            .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+            .collect();
+        let mut recurrent =
+            MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+
+        let mut logits = None;
+        for (cache_len, &token) in (0_i32..).zip(input_ids.iter()) {
+            let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
+            logits = Some(qwen35_forward_step(
+                &token_arr,
+                weights,
+                config,
+                arch,
+                &mut k_caches,
+                &mut v_caches,
+                &mut recurrent,
+                cache_len,
+            ));
+        }
+
+        logits.context("expected replay sequence to produce logits")
+    }
+
+    fn greedy_token_id(logits: &MlxArray) -> u32 {
+        let sampled = gpu_sample_token(
+            logits,
+            &crate::sampler::SamplingParams {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        );
+        eval(&[&sampled]);
+        sampled.item_i32() as u32
+    }
+
+    #[test]
+    #[ignore = "debug helper for comparing Qwen3.5 GGUF incremental decode vs full replay"]
+    fn compare_qwen35_0p8b_gguf_incremental_decode_vs_full_replay() -> Result<()> {
+        let Some(model_path) = qwen35_safetensors_model_path() else {
+            eprintln!("QWEN35_MODEL_PATH unset and ../models/Qwen3.5-0.8B missing; skipping");
+            return Ok(());
+        };
+        let Some(gguf_path) = qwen35_gguf_model_path() else {
+            eprintln!(
+                "QWEN35_GGUF_PATH unset and ../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf missing; skipping"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let tokenizer = Tokenizer::from_file(model_path.to_str().context("invalid model path")?)?;
+        let gguf = GgufFile::open(gguf_path.to_str().context("invalid GGUF path")?)?;
+        let weights = load_qwen35_metal_weights_from_gguf(&gguf, &config)?;
+
+        let mut sequence = tokenizer.encode("Hello")?;
+        anyhow::ensure!(!sequence.is_empty(), "expected non-empty prompt");
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let kv_capacity = sequence.len() as i32 + 16;
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+        let mut k_caches: Vec<MlxArray> = (0..num_full_layers)
+            .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+            .collect();
+        let mut v_caches: Vec<MlxArray> = (0..num_full_layers)
+            .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+            .collect();
+        let mut recurrent =
+            MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+
+        let mut incremental_logits = qwen35_replay_logits(&sequence, &weights, &config, arch)?;
+        for (cache_len, &token) in (0_i32..).zip(sequence.iter()) {
+            let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
+            incremental_logits = qwen35_forward_step(
+                &token_arr,
+                &weights,
+                &config,
+                arch,
+                &mut k_caches,
+                &mut v_caches,
+                &mut recurrent,
+                cache_len,
+            );
+        }
+
+        for step_idx in 0..4 {
+            let replay_logits = qwen35_replay_logits(&sequence, &weights, &config, arch)?;
+            let incremental_token = greedy_token_id(&incremental_logits);
+            let replay_token = greedy_token_id(&replay_logits);
+            eprintln!(
+                "step {step_idx}: incremental id={incremental_token} text={:?} | replay id={replay_token} text={:?}",
+                tokenizer.decode(&[incremental_token])?,
+                tokenizer.decode(&[replay_token])?,
+            );
+            anyhow::ensure!(
+                incremental_token == replay_token,
+                "GGUF incremental decode diverged from full replay at step {step_idx}: incremental={incremental_token} replay={replay_token}"
+            );
+
+            sequence.push(incremental_token);
+            let token_arr = MlxArray::from_slice_i32(&[incremental_token as i32], &[1]);
+            incremental_logits = qwen35_forward_step(
+                &token_arr,
+                &weights,
+                &config,
+                arch,
+                &mut k_caches,
+                &mut v_caches,
+                &mut recurrent,
+                (sequence.len() - 1) as i32,
+            );
         }
 
         Ok(())
