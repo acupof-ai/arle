@@ -11,6 +11,7 @@ where the staged prefix was recalled from.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import signal
@@ -40,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--churn-requests", type=int, default=24)
     parser.add_argument("--replay-prefixes", type=int, default=1)
     parser.add_argument("--replay-repeats", type=int, default=2)
+    parser.add_argument("--replay-concurrency", type=int, default=1)
+    parser.add_argument("--replay-blockers", type=int, default=0)
+    parser.add_argument("--replay-blocker-max-tokens", type=int, default=256)
     parser.add_argument("--num-slots", type=int, default=16)
     parser.add_argument("--max-seq-len", type=int, default=4608)
     parser.add_argument("--mem-fraction-static", type=float, default=0.94)
@@ -134,11 +138,23 @@ def run_phase(
     model_id: str,
     prompts: list[str],
     max_tokens: int,
+    concurrency: int = 1,
 ) -> list[dict]:
-    results = []
-    for prompt in prompts:
-        results.append(issue_completion(base_url, model_id, prompt, max_tokens))
-    return results
+    if concurrency <= 1:
+        results = []
+        for prompt in prompts:
+            results.append(issue_completion(base_url, model_id, prompt, max_tokens))
+        return results
+
+    results: list[dict | None] = [None] * len(prompts)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_index = {
+            executor.submit(issue_completion, base_url, model_id, prompt, max_tokens): index
+            for index, prompt in enumerate(prompts)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            results[future_to_index[future]] = future.result()
+    return [result for result in results if result is not None]
 
 
 def summarize_phase(name: str, stats: dict[str, str], results: list[dict]) -> dict:
@@ -146,6 +162,16 @@ def summarize_phase(name: str, stats: dict[str, str], results: list[dict]) -> di
         "name": name,
         "stats": stats,
         "requests": len(results),
+        "elapsed_ms_avg": round(
+            sum(result["elapsed_ms"] for result in results) / len(results), 1
+        )
+        if results
+        else 0.0,
+        "elapsed_ms_p50": round(
+            sorted(result["elapsed_ms"] for result in results)[len(results) // 2], 1
+        )
+        if results
+        else 0.0,
         "elapsed_ms": [result["elapsed_ms"] for result in results],
         "prompt_tokens": [result["prompt_tokens"] for result in results],
         "completion_tokens": [result["completion_tokens"] for result in results],
@@ -179,6 +205,7 @@ def main() -> int:
         build_prompt(tokenizer, args.prompt_tokens, f"churn-{index:03d}")
         for index in range(args.churn_requests)
     ]
+    blocker_prompts = churn_prompts[: args.replay_blockers]
 
     server_cmd = [
         "./target/release/infer",
@@ -248,16 +275,39 @@ def main() -> int:
             time.sleep(2.0)
             after_churn = fetch_stats(base_url)
 
-            replay_results = run_phase(
-                base_url,
-                model_id,
-                [
-                    prompt
-                    for prompt in warm_prompts[: args.replay_prefixes]
-                    for _ in range(args.replay_repeats)
-                ],
-                args.max_tokens,
-            )
+            blocker_results: list[dict] = []
+            replay_prompts = [
+                prompt
+                for prompt in warm_prompts[: args.replay_prefixes]
+                for _ in range(args.replay_repeats)
+            ]
+            if blocker_prompts:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    blocker_future = executor.submit(
+                        run_phase,
+                        base_url,
+                        model_id,
+                        blocker_prompts,
+                        args.replay_blocker_max_tokens,
+                        len(blocker_prompts),
+                    )
+                    time.sleep(1.0)
+                    replay_results = run_phase(
+                        base_url,
+                        model_id,
+                        replay_prompts,
+                        args.max_tokens,
+                        concurrency=args.replay_concurrency,
+                    )
+                    blocker_results = blocker_future.result()
+            else:
+                replay_results = run_phase(
+                    base_url,
+                    model_id,
+                    replay_prompts,
+                    args.max_tokens,
+                    concurrency=args.replay_concurrency,
+                )
             after_replay = fetch_stats(base_url)
         finally:
             server.send_signal(signal.SIGINT)
@@ -272,6 +322,9 @@ def main() -> int:
         "after_replay": after_replay,
         "warm": summarize_phase("warm", after_warm, warm_results),
         "churn": summarize_phase("churn", after_churn, churn_results),
+        "blocker": summarize_phase("blocker", after_replay, blocker_results)
+        if blocker_prompts
+        else None,
         "replay": summarize_phase("replay", after_replay, replay_results),
         "artefacts": {
             "log_path": str(log_path),
