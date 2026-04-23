@@ -27,17 +27,10 @@
 
 <section class="hero" aria-label="banner">
 <h1 class="sr-only">ARLE(1) — agent reinforcement learning engine</h1>
-<pre class="ascii" aria-hidden="true">
- █████╗  ██████╗ ███████╗███╗   ██╗████████╗       ██╗███╗   ██╗███████╗███████╗██████╗
-██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝       ██║████╗  ██║██╔════╝██╔════╝██╔══██╗
-███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║    ─●─   ██║██╔██╗ ██║█████╗  █████╗  ██████╔╝
-██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║          ██║██║╚██╗██║██╔══╝  ██╔══╝  ██╔══██╗
-██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║          ██║██║ ╚████║██║     ███████╗██║  ██║
-╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝          ╚═╝╚═╝  ╚═══╝╚═╝     ╚══════╝╚═╝  ╚═╝
-</pre>
+<p class="wordmark" aria-hidden="true">ARLE</p>
 <p class="tagline">
-  纯 Rust 的 <span class="hl">agent reinforcement learning engine</span>：
-  serving、agent runtime、训练 / 评测与文档收口在同一套 workspace 里。
+  Rust-native 的 <span class="hl">inference runtime</span>，
+  本地 agent、训练、评测与文档入口都收口在同一套 workspace 里。
 </p>
 <nav class="jumps" aria-label="sections">
   <a href="#synopsis">[概要]</a>
@@ -53,9 +46,9 @@
 <section id="name">
 <h2>名称</h2>
 <p class="block">
-  <b>ARLE</b> — 纯 Rust 的 agent reinforcement learning engine。
-  CUDA 是主部署路径；Metal 和 CPU 冒烟路径与 serving 共用同一套 workspace、
-  模型代码和工具链。
+  <b>ARLE</b> — 以 Rust-native inference runtime 为主干，并在其上集成本地
+  agent、训练与评测工作流。CUDA 是主部署路径；Metal 和 CPU 冒烟路径与
+  serving 共用同一套 workspace、模型代码和工具链。
 </p>
 <p class="note">
   这个站点现在只保留稳定入口职责。更细的产品事实，请直接看下面列出的仓库文档。
@@ -79,7 +72,7 @@
     <tr><td class="cap">CUDA</td><td>Linux + NVIDIA 上的稳定主 serving 路径。</td></tr>
     <tr><td class="cap">Metal</td><td>Apple Silicon 上的 Beta 路径，带 live runtime、DFlash 与 MLX 桥接。</td></tr>
     <tr><td class="cap">CPU</td><td>仅开发态冒烟路径，用于请求面验证，不是部署目标。</td></tr>
-    <tr><td class="cap">Benchmark</td><td>带日期的快照集中放在 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>；当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-22-sglang-gap-closure-execution.md">执行计划</a>。</td></tr>
+    <tr><td class="cap">Benchmark</td><td>带日期的快照集中放在 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>；当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">当前 decode 对齐计划</a>。</td></tr>
   </tbody>
 </table>
 </section>
@@ -112,6 +105,7 @@
 <a href="https://github.com/cklxx/arle/blob/main/README.md">/README.md</a>                      英文公共入口
 <a href="https://github.com/cklxx/arle/blob/main/docs/http-api.md">/docs/http-api.md</a>              HTTP 契约 · 流式行为
 <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md">/docs/support-matrix.md</a>        后端 / 模型 / 量化支持矩阵
+<a href="https://github.com/cklxx/arle/blob/main/docs/stability-policy.md">/docs/stability-policy.md</a>      稳定性分级 · 兼容性姿态
 <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">/CONTRIBUTING.md</a>               贡献者初始化 · 验证 · 发版要求
 <a href="https://github.com/cklxx/arle/blob/main/docs/index.md">/docs/index.md</a>                 维护者 PARA 索引
 <a href="https://github.com/cklxx/arle/releases">/releases</a>                      发版二进制 · 校验和
