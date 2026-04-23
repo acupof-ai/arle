@@ -14,6 +14,10 @@ fn retract_victim_score(
     (generated_tokens, std::cmp::Reverse(prompt_tokens))
 }
 
+fn mixed_prefill_pages_needed(seq_len: usize, prefill_tokens: usize, page_size: usize) -> usize {
+    super::budget::additional_pages_needed(seq_len, prefill_tokens, page_size)
+}
+
 impl<M: ModelForward> Scheduler<M> {
     fn collect_decode_batch_inputs(&mut self) -> (Vec<usize>, Vec<u32>) {
         let decode_indices = self.running_decode_slots();
@@ -332,11 +336,12 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        self.retract_decode_to_fit(
-            &mut decode_indices,
-            &mut token_ids,
+        let extra_pages = mixed_prefill_pages_needed(
+            self.paged_kv_pool.seq_len(candidate.slot_idx),
             candidate.reservation.prefill_tokens,
+            self.paged_kv_pool.page_size,
         );
+        self.retract_decode_to_fit(&mut decode_indices, &mut token_ids, extra_pages);
         if decode_indices.is_empty() {
             self.step_prefill_batch(std::slice::from_ref(&candidate));
             return;
@@ -683,7 +688,7 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::retract_victim_score;
+    use super::{mixed_prefill_pages_needed, retract_victim_score};
 
     #[test]
     fn retract_prefers_less_progress_even_if_other_prompt_is_shorter() {
@@ -699,5 +704,12 @@ mod tests {
             retract_victim_score(3, 1024) < retract_victim_score(3, 128),
             "when decode progress ties, the longer prompt must retract first",
         );
+    }
+
+    #[test]
+    fn mixed_prefill_retract_budget_counts_pages_not_tokens() {
+        assert_eq!(mixed_prefill_pages_needed(0, 16, 16), 1);
+        assert_eq!(mixed_prefill_pages_needed(8, 4, 16), 0);
+        assert_eq!(mixed_prefill_pages_needed(8, 12, 16), 1);
     }
 }
