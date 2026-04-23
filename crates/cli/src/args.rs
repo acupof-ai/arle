@@ -144,7 +144,7 @@ pub(crate) struct ExtraArgs {
 #[command(
     name = "arle",
     about = "ARLE local agent, training, and dataset CLI",
-    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train test --backend metal --json     Run the real train smoke and keep stdout machine-readable.",
+    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive agent REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train test --backend metal --json     Build the canonical tiny fixture and keep stdout machine-readable.",
     group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
 )]
 pub(crate) struct Args {
@@ -235,7 +235,7 @@ pub(crate) struct RunArgs {
 #[derive(Debug, Clone, clap::Args)]
 #[command(
     arg_required_else_help = true,
-    after_help = "Examples:\n  arle train env\n  arle train test --backend metal --json\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --preset small-25m"
+    after_help = "Examples:\n  arle train env\n  arle train test --backend metal --json\n  arle train test --backend metal --out-dir /tmp/arle-fixture\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --preset small-25m"
 )]
 pub(crate) struct TrainArgs {
     #[command(subcommand)]
@@ -246,7 +246,7 @@ pub(crate) struct TrainArgs {
 pub(crate) enum TrainCommand {
     /// Print train-time environment diagnostics.
     Env(TrainEnvArgs),
-    /// Run a local end-to-end smoke over convert -> pretrain -> sft -> eval.
+    /// Build the canonical tiny fixture via convert -> pretrain -> sft -> eval.
     Test(TrainTestArgs),
     /// Estimate parameter count and rough memory for scratch pretrain or LoRA SFT.
     EstimateMemory(TrainEstimateMemoryArgs),
@@ -289,18 +289,18 @@ pub(crate) struct TrainEnvArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "This command runs a real local convert -> pretrain -> sft -> eval smoke.\nUse `--keep-artifacts` or `--out-dir` when you want to inspect the generated files."
+    after_help = "This command builds the canonical tiny fixture through convert -> pretrain -> sft -> eval.\nUse `--keep-artifacts` or `--out-dir` when you want to keep the generated checkpoint.\nThe final checkpoint lives at `<root>/sft/latest` and can be passed directly to `arle --model-path` or `infer --model-path`."
 )]
 pub(crate) struct TrainTestArgs {
     /// Training backend to exercise; `auto` selects the compiled backend.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     pub(crate) backend: BackendArg,
 
-    /// Keep the temporary smoke directory instead of deleting it.
+    /// Keep the temporary fixture directory instead of deleting it.
     #[arg(long, default_value_t = false)]
     pub(crate) keep_artifacts: bool,
 
-    /// Override the smoke output directory. Defaults to a temp folder.
+    /// Override the fixture output directory. Defaults to a temp folder.
     #[arg(long)]
     pub(crate) out_dir: Option<PathBuf>,
 
@@ -389,7 +389,7 @@ pub(crate) struct TrainEstimateMemoryArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Examples:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --preset small-25m\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --dry-run --json\n\nAdvanced pretrain flags still work after `--`, for example:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json -- --bos-token <s>"
+    after_help = "Examples:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --preset small-25m\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json --dry-run --json\n\nPreset labels only pick the transformer shape. Final parameter count still depends on tokenizer vocab size; use `arle train estimate-memory ...` when you need the exact total.\n\nAdvanced pretrain flags still work after `--`, for example:\n  arle train pretrain --corpus corpus.txt --tokenizer tokenizer.json -- --bos-token <s>"
 )]
 pub(crate) struct TrainPretrainArgs {
     /// Plain-text training corpus.

@@ -1,21 +1,9 @@
 #![cfg(feature = "cli")]
 
-use std::process::{Command, Output};
+#[path = "cli_test_support.rs"]
+mod cli_test_support;
 
-fn run_arle(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_arle"))
-        .args(args)
-        .output()
-        .expect("spawn arle")
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
+use cli_test_support::{run_arle, stderr, stdout};
 
 #[test]
 fn root_help_mentions_explicit_run_entrypoint() {
@@ -30,7 +18,7 @@ fn root_help_mentions_explicit_run_entrypoint() {
     let help = stdout(&output);
     assert!(help.contains("run"));
     assert!(help.contains("Start the interactive agent REPL."));
-    assert!(help.contains("Explicit alias for the interactive REPL."));
+    assert!(help.contains("Explicit alias for the interactive agent REPL."));
     assert!(help.contains("arle --doctor"));
     assert!(help.contains("arle train test --backend metal --json"));
 }
@@ -135,6 +123,7 @@ fn train_test_cpu_json_smoke_is_machine_readable() {
     let value: serde_json::Value =
         serde_json::from_str(&stdout(&output)).expect("train test output is valid json");
     assert_eq!(value["backend"], "cpu");
+    assert!(value["servable_model_dir"].is_string());
     assert_eq!(value["steps"][0]["name"], "convert");
     assert_eq!(value["steps"][0]["status"], "ok");
     assert_eq!(value["steps"][3]["name"], "eval");

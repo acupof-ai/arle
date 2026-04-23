@@ -143,6 +143,7 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
                 println!("ARLE train test");
                 println!("backend {}", report.backend);
                 println!("root {}", report.root_dir);
+                println!("model {}", report.servable_model_dir);
                 for step in &report.steps {
                     println!("{} {}", step.name, step.status);
                 }
@@ -839,10 +840,12 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
                 printable_output(&eval.stdout)
             )
         })?;
+    let servable_model_dir = sft_out.join("latest");
 
     let report = TrainTestReport {
         backend,
         root_dir: root_dir.display().to_string(),
+        servable_model_dir: servable_model_dir.display().to_string(),
         wall_secs: started.elapsed().as_secs_f64(),
         steps: ok_train_test_steps(),
         eval_summary: Some(eval_summary),
@@ -1733,6 +1736,7 @@ struct EstimateMemoryReport {
 struct TrainTestReport {
     backend: String,
     root_dir: String,
+    servable_model_dir: String,
     wall_secs: f64,
     steps: Vec<TrainTestStep>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1829,6 +1833,7 @@ mod tests {
         let report = TrainTestReport {
             backend: "metal".to_string(),
             root_dir: "/tmp/arle-train-test".to_string(),
+            servable_model_dir: "/tmp/arle-train-test/sft/latest".to_string(),
             wall_secs: 1.25,
             steps: vec![
                 TrainTestStep {
@@ -1849,6 +1854,10 @@ mod tests {
         };
         let value = serde_json::to_value(report).expect("serialize train test report");
         assert_eq!(value["backend"], "metal");
+        assert_eq!(
+            value["servable_model_dir"],
+            "/tmp/arle-train-test/sft/latest"
+        );
         assert_eq!(value["steps"][0]["name"], "convert");
         assert_eq!(value["steps"][1]["status"], "ok");
         assert!(value.get("json").is_none());
