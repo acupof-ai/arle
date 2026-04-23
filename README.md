@@ -1,5 +1,5 @@
 <p align="center">
-  <strong>agent-infer</strong><br>
+  <strong>ARLE</strong><br>
   <em>KV-cache-first inference engine for LLM agents. Pure Rust, with CUDA as the primary serving path.</em>
 </p>
 
@@ -88,11 +88,11 @@ Four axes, each answering one question. Authoritative matrix lives in
   API-level shifts. Fresh project state lives in the two sections above.
 -->
 
-## Why agent-infer?
+## Why ARLE (agent rl engine)?
 
 In agent workloads every turn pays a prefill tax: system prompt + conversation history + tool results must be re-processed. As context grows, **prefill dominates latency**.
 
-agent-infer treats this as the core problem:
+ARLE (agent rl engine) treats this as the core problem:
 
 | Capability | What it does | Impact |
 |---|---|---|

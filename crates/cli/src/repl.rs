@@ -254,7 +254,7 @@ fn print_repl_banner(
     temperature: f32,
 ) {
     println!();
-    println!("=== agent-infer REPL ===");
+    println!("=== ARLE REPL ===");
     println!("Model: {}", engine.model_id());
     println!("Backend: {}", backend_name);
     println!("Mode: agent");
@@ -272,7 +272,7 @@ fn print_repl_banner(
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn history_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".agent-infer-history"))
+    Some(PathBuf::from(home).join(".arle-history"))
 }
 
 /// Read one logical input from rustyline. Lines ending with `\` are joined
@@ -952,8 +952,8 @@ fn count_export_turns(history: &[ChatMessage]) -> usize {
 }
 
 /// Resolve the destination path:
-/// - empty arg    → `./agent-infer-<ts>.md` in CWD
-/// - dir path     → `<dir>/agent-infer-<ts>.md`
+/// - empty arg    → `./arle-<ts>.md` in CWD
+/// - dir path     → `<dir>/arle-<ts>.md`
 /// - file path    → used verbatim
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn resolve_export_path(path_arg: &str) -> PathBuf {
@@ -961,7 +961,7 @@ fn resolve_export_path(path_arg: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let default_name = format!("agent-infer-{ts}.md");
+    let default_name = format!("arle-{ts}.md");
 
     if path_arg.is_empty() {
         return PathBuf::from(&default_name);
@@ -980,7 +980,7 @@ fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
     let turns = count_export_turns(history);
 
     let mut out = String::new();
-    out.push_str(&format!("# agent-infer conversation — {model_id}\n\n"));
+    out.push_str(&format!("# ARLE conversation — {model_id}\n\n"));
     out.push_str(&format!("> Started: {ts}\n"));
     out.push_str("> Mode: agent\n");
     out.push_str(&format!("> Turns: {turns}\n\n"));
@@ -1054,9 +1054,7 @@ fn print_repl_help() {
     println!("  /stats           Show session token/throughput rollup");
     println!("  /save <path>     Save the current agent session to JSON");
     println!("  /load <path>     Load a saved agent session JSON");
-    println!(
-        "  /export [path]   Dump the conversation to markdown (default: ./agent-infer-<ts>.md)"
-    );
+    println!("  /export [path]   Dump the conversation to markdown (default: ./arle-<ts>.md)");
     println!("  /quit, /exit     Leave the REPL");
     println!();
     println!("Input:");
@@ -1193,10 +1191,7 @@ mod tests {
         // Exporting to a nonexistent path should NOT create the file —
         // 0 turns short-circuits the write. Use a path we can sanity-
         // check post-call.
-        let tmp = std::env::temp_dir().join(format!(
-            "agent-infer-export-empty-{}.md",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("arle-export-empty-{}.md", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         handle_export_command("dummy/model", &history, tmp.to_str().unwrap());
         assert!(!tmp.exists(), "no file should be written for empty history");
@@ -1225,10 +1220,8 @@ mod tests {
         assert!(!md.contains("\nsys\n"));
 
         // Round-trip through handle_export_command to a temp file.
-        let tmp = std::env::temp_dir().join(format!(
-            "agent-infer-export-writes-{}.md",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("arle-export-writes-{}.md", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         handle_export_command("Qwen/Qwen3-4B", &history, tmp.to_str().unwrap());
         let written = std::fs::read_to_string(&tmp).expect("file written");
@@ -1241,8 +1234,8 @@ mod tests {
         let p = resolve_export_path("");
         let name = p.file_name().unwrap().to_str().unwrap();
         assert!(
-            name.starts_with("agent-infer-") && name.ends_with(".md"),
-            "default filename should be agent-infer-<ts>.md, got {name}"
+            name.starts_with("arle-") && name.ends_with(".md"),
+            "default filename should be arle-<ts>.md, got {name}"
         );
         assert!(
             p.parent()
@@ -1264,7 +1257,7 @@ mod tests {
             p.display()
         );
         let name = p.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with("agent-infer-") && name.ends_with(".md"));
+        assert!(name.starts_with("arle-") && name.ends_with(".md"));
     }
 
     // ── /stats session accumulator ──────────────────────────────────────
@@ -1315,8 +1308,7 @@ mod tests {
         // Point HF cache at an empty temp dir so discover_hub_snapshots
         // returns zero entries. handle_models_command should then emit
         // the offline hint without touching the filesystem further.
-        let tmp =
-            std::env::temp_dir().join(format!("agent-infer-empty-hub-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("arle-empty-hub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 

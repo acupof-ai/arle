@@ -41,7 +41,7 @@ pub fn run() -> ExitCode {
     match run_impl(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("[agent-infer] error: {err:#}");
+            eprintln!("[ARLE] error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -61,7 +61,7 @@ fn run_impl(args: Args) -> Result<()> {
     #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
     {
         anyhow::bail!(
-            "agent-infer requires a local inference backend. Rebuild with either \
+            "ARLE requires a local inference backend. Rebuild with either \
              the default `cuda` feature, `--no-default-features --features metal,no-cuda`, \
              or `--no-default-features --features cpu,no-cuda`."
         );
