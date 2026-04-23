@@ -113,6 +113,13 @@ pub(super) struct PendingPrefill {
     pub prefill_spans: Vec<(usize, Span)>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PrefetchTicketState {
+    pub host_blocks: usize,
+    pub disk_blocks: usize,
+    pub remote_blocks: usize,
+}
+
 enum EmitCommand {
     Append {
         request_id: u64,
@@ -359,6 +366,7 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) fetch_dedupe: HashMap<ReadmissionKey, crate::kv_tier::FetchTicket>,
     pub(super) fetch_ticket_keys: HashMap<crate::kv_tier::FetchTicket, ReadmissionKey>,
     pub(super) fetch_ticket_started_at: HashMap<crate::kv_tier::FetchTicket, std::time::Instant>,
+    pub(super) prefetch_fetching: HashMap<crate::kv_tier::FetchTicket, PrefetchTicketState>,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     pub(super) wakeup_rx: crossbeam_channel::Receiver<()>,
     pub(super) wakeup_live: bool,
@@ -686,6 +694,46 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    pub(super) fn materialize_prefetched_host_blocks(
+        &mut self,
+        fetched_blocks: &[crate::kv_tier::FetchedBlock],
+    ) -> usize {
+        let mut materialized = 0usize;
+        for block in fetched_blocks {
+            let Some(metadata) = self.block_metadata(block.block_id) else {
+                if block.release_after_promote {
+                    self.release_host_region(block.host_region);
+                }
+                continue;
+            };
+            let keepalive_deadline = metadata.session_id.as_ref().map(|_| {
+                Some(
+                    self.prefix_cache
+                        .logical_clock()
+                        .saturating_add(self.config.t1_host_pinned_keepalive_ticks),
+                )
+            });
+            let updated = self.prefix_cache.update_block_metadata(
+                block.block_id,
+                BlockMetadataUpdate {
+                    location: Some(BlockLocation::HostPinned {
+                        offset: block.host_region.offset,
+                    }),
+                    byte_len: Some(block.byte_len as u32),
+                    host_spill_pin_until: keepalive_deadline,
+                    entry_state: Some(crate::kv_tier::IndexEntryState::Ready),
+                    ..BlockMetadataUpdate::default()
+                },
+            );
+            if updated {
+                materialized += 1;
+            } else if block.release_after_promote {
+                self.release_host_region(block.host_region);
+            }
+        }
+        materialized
+    }
+
     pub(super) fn clear_fetch_waiting_for_slot(&mut self, slot_idx: usize, request_id: u64) {
         let mut emptied = Vec::new();
         for (ticket, waiters) in &mut self.fetch_waiting {
@@ -698,6 +746,9 @@ impl<M: ModelForward> Scheduler<M> {
         }
         for ticket in emptied {
             self.fetch_waiting.remove(&ticket);
+            if self.prefetch_fetching.contains_key(&ticket) {
+                continue;
+            }
             if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
                 self.fetch_dedupe.remove(&key);
             }
@@ -1011,6 +1062,7 @@ impl<M: ModelForward> Scheduler<M> {
             fetch_dedupe: HashMap::new(),
             fetch_ticket_keys: HashMap::new(),
             fetch_ticket_started_at: HashMap::new(),
+            prefetch_fetching: HashMap::new(),
             request_rx: rx,
             wakeup_rx,
             wakeup_live: true,
