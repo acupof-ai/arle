@@ -143,7 +143,11 @@ fn run_train_test(args: TrainTestArgs) -> ExitCode {
                 println!("ARLE train test");
                 println!("backend {}", report.backend);
                 println!("root {}", report.root_dir);
-                println!("model {}", report.servable_model_dir);
+                if let Some(model_dir) = &report.servable_model_dir {
+                    println!("model {}", model_dir);
+                } else {
+                    println!("note pass --keep-artifacts or --out-dir to keep the final checkpoint");
+                }
                 for step in &report.steps {
                     println!("{} {}", step.name, step.status);
                 }
@@ -840,16 +844,17 @@ fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestRe
                 printable_output(&eval.stdout)
             )
         })?;
-    let servable_model_dir = sft_out.join("latest");
+    let kept_artifacts = args.keep_artifacts || args.out_dir.is_some();
+    let servable_model_dir = kept_artifacts.then(|| sft_out.join("latest").display().to_string());
 
     let report = TrainTestReport {
         backend,
         root_dir: root_dir.display().to_string(),
-        servable_model_dir: servable_model_dir.display().to_string(),
+        servable_model_dir,
         wall_secs: started.elapsed().as_secs_f64(),
         steps: ok_train_test_steps(),
         eval_summary: Some(eval_summary),
-        kept_artifacts: args.keep_artifacts || args.out_dir.is_some(),
+        kept_artifacts,
     };
     Ok(report)
 }
@@ -1736,7 +1741,8 @@ struct EstimateMemoryReport {
 struct TrainTestReport {
     backend: String,
     root_dir: String,
-    servable_model_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    servable_model_dir: Option<String>,
     wall_secs: f64,
     steps: Vec<TrainTestStep>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1833,7 +1839,7 @@ mod tests {
         let report = TrainTestReport {
             backend: "metal".to_string(),
             root_dir: "/tmp/arle-train-test".to_string(),
-            servable_model_dir: "/tmp/arle-train-test/sft/latest".to_string(),
+            servable_model_dir: Some("/tmp/arle-train-test/sft/latest".to_string()),
             wall_secs: 1.25,
             steps: vec![
                 TrainTestStep {
@@ -1861,6 +1867,24 @@ mod tests {
         assert_eq!(value["steps"][0]["name"], "convert");
         assert_eq!(value["steps"][1]["status"], "ok");
         assert!(value.get("json").is_none());
+    }
+
+    #[test]
+    fn train_test_report_omits_model_dir_when_artifacts_are_deleted() {
+        let report = TrainTestReport {
+            backend: "cpu".to_string(),
+            root_dir: "/tmp/arle-train-test".to_string(),
+            servable_model_dir: None,
+            wall_secs: 1.25,
+            steps: vec![TrainTestStep {
+                name: "convert",
+                status: "ok",
+            }],
+            eval_summary: None,
+            kept_artifacts: false,
+        };
+        let value = serde_json::to_value(report).expect("serialize train test report");
+        assert!(value.get("servable_model_dir").is_none());
     }
 
     #[test]
