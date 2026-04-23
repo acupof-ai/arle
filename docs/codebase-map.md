@@ -1,32 +1,31 @@
 # agent-infer Codebase Map
 
-Updated 2026-04-21 (post `cuda-kernels` extraction, tiered KV
-M3a/M3b/M3c local, the current Phase 6 `crates/autograd` + `crates/train`
-landing, and the train-side control-plane / observability refresh).
-Supplemented 2026-04-21 with the canonical `pretrain` entrypoint and
-the latest Phase 6 runtime truth.
-(Earlier 2026-04-20 supplement introduced Phase 6 `crates/autograd` + `crates/train`
-(from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md))
-and the canonical guidellm bench SSOT alignment.)
-Current train control-plane truth: `crates/train` owns the active
-training server, surfaced by `pretrain --serve`, `train_sft --serve`,
-`train_grpo --serve`, and `train_multi_turn --serve`; the current
-surface is `/v1/train/status|events|stop|save`. `infer` now also exposes
-an optional `/v1/train/*` bridge via `--train-control-url http://...`,
-forwarding those routes to the train-side server instead of duplicating
-trainer control logic.
-Current train-side model reality is a generic Qwen-family control plane
-with Qwen3.5 as the optimized default: `train_sft` and `train_grpo`
-dispatch across Qwen3 / Qwen3.5 families, `train_multi_turn` already
-runs on the dense/full-attn Qwen3.5 path and now exposes a stepwise-GRPO
-vs sequence-level-GSPO objective switch, `eval_lm` reads the same
-checkpoint dirs for tokenized or chat JSONL evaluation, the canonical
-scratch-pretrain entrypoint is `pretrain`, checkpoints are written as
-HF-style directories, the handwritten Transformer/TinyLM runtime
-compatibility path has been deleted, and hybrid linear-attn Qwen3.5 is
-now accepted locally across scratch pretrain, LoRA/eval, and RL on CPU
-and Metal; CUDA compile coverage is in place while CUDA hybrid runtime
-acceptance remains pending.
+Updated 2026-04-23 after the runtime-first documentation cleanup.
+
+This document is the canonical workspace-topology truth. README and ROADMAP may
+summarize it, but they do not define a different repository shape.
+
+`agent-infer` is a runtime-first workspace:
+
+- `infer` owns serving/runtime truth.
+- `arle` is the local front door built on that runtime.
+- `train` is an integrated extension of the same runtime/model authority, not a
+  second equal architecture.
+
+Current train/runtime truth, compressed:
+
+- Control plane: `crates/train` owns the active training server via
+  `pretrain --serve`, `train_sft --serve`, `train_grpo --serve`, and
+  `train_multi_turn --serve`; the live surface is
+  `/v1/train/{status,events,stop,save}`. `infer` can optionally proxy that
+  surface via `--train-control-url`.
+- Model line: the active train-side path is a generic Qwen-family control
+  plane with Qwen3.5 as the optimized default. `pretrain` is the canonical
+  scratch-pretrain entrypoint, checkpoints are HF-style directories, the
+  handwritten Transformer/TinyLM compatibility path is gone, and hybrid
+  linear-attn Qwen3.5 is accepted locally across scratch pretrain, LoRA/eval,
+  and RL on CPU + Metal. CUDA compile coverage is in place; CUDA hybrid runtime
+  acceptance remains pending.
 This document describes the repository as it exists after the Route-A
 refactor folded the partial runtime split back into `infer`, and after
 the CUDA kernel layer was extracted into `crates/cuda-kernels/`
@@ -77,7 +76,7 @@ src/main.rs
 
 Key files:
 
-- `src/main.rs`: root binary entrypoint
+- `src/main.rs`: `arle` binary entrypoint from the root package
 - `crates/cli/src/lib.rs`: CLI startup and backend selection
 - `crates/cli/src/repl.rs`: REPL loop, slash commands, terminal UX
 - `infer/src/server_engine.rs`: unified `InferenceEngine` trait, `CompletionRequest`/`CompletionOutput`/`TokenUsage`/`CompletionStreamDelta` types, and `LoadedInferenceEngine` backend dispatch enum

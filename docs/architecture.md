@@ -1,13 +1,21 @@
 # agent-infer Architecture
 
-Updated 2026-04-21 after the Route-A refactor, the Phase 6 train-side control-plane landing, and the canonical `pretrain` entrypoint cleanup.
+Updated 2026-04-23 after the runtime-first documentation cleanup.
+
+`agent-infer` is a runtime-first workspace:
+
+- `infer` is the primary serving/runtime surface.
+- `arle` is the unified local front door for agent, train, eval, and data
+  workflows.
+- The train stack is integrated on top of the same runtime/model authority; it
+  does not define a second competing architecture truth.
 
 ## Workspace Layout
 
-The repository is a small control-plane workspace around one runtime-heavy
-crate:
+The repository is a runtime-heavy workspace with a small set of control-plane
+and integration crates around it:
 
-- `agent-infer`: thin binary wrapper that delegates to `cli`
+- `agent-infer`: thin root package that builds the `arle` binary
 - `infer`: inference runtime, HTTP server, scheduler, backend runtime, model
   loading, CUDA/Metal/CPU backends, and the unified `server_engine::InferenceEngine`
   contract that both the HTTP server and the agent CLI call through
@@ -15,15 +23,17 @@ crate:
 - `tools`: builtin tool definitions plus sandboxed execution helpers
 - `agent`: agent session state, prompt assembly, tool-call recovery, and
   turn loop logic
-- `cli`: REPL and CLI wiring for the `agent-infer` binary
+- `cli`: REPL and CLI wiring for the `arle` binary
 - `cuda-kernels`: CUDA kernel layer — `csrc/` + Triton AOT + Rust FFI
   (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`,
   `kv_turboquant`). Extracted from `infer` in commit `a4e12f5` (2026-04-15).
+- `kv-native-sys`: local persistence substrate used by the KV-tier disk/shared
+  transport path
 - `mlx-sys`: MLX C++ bridge used by the Metal backend
 - `qwen3-spec` / `qwen35-spec`: shared train↔infer model-contract crates for
   canonical Qwen config fields and tensor names
 
-Phase 6 training stack (orthogonal to the inference runtime; see
+Integrated train/runtime extension (see
 [projects/agent-rl-self-evolving.md](projects/agent-rl-self-evolving.md)):
 - `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend` trait, with the current local Metal path already using the device-resident / lazy-eval tranche for the active training-critical ops
 - `train`: generic Qwen-family pretrain/SFT/GRPO stack with Qwen3.5-optimized defaults, exact-resume checkpoint dirs, a train-side `/v1/train/status|events|stop|save` control plane, and shared async observability (JSONL + MLflow + OTLP + optional W&B sidecar). `train_multi_turn` supports stepwise-GRPO vs sequence-level-GSPO objectives, `train_sft` / `train_grpo` dispatch across Qwen3 / Qwen3.5 families, and the shared Qwen3.5 model path is now accepted locally on CPU + Metal across dense and hybrid scratch-pretrain / RL / LoRA-eval surfaces. CUDA hybrid runtime acceptance is still pending; the compile surface is checked. Depends on `autograd`
@@ -50,7 +60,7 @@ achieved real independence.
 ### Agent CLI
 
 ```text
-agent-infer (root binary)
+arle (root binary from the `agent-infer` package)
   -> cli::run()
   -> infer::hf_hub::resolve_model_source() / infer::server_engine::LoadedInferenceEngine::load()
   -> agent::AgentSession (uses `dyn InferenceEngine`)

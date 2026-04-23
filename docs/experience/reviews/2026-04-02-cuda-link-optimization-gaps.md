@@ -143,10 +143,7 @@ Qwen3 batched decode 中，tensor-core decode 的实现并不是 stub：
 - partial H2D
 - GPU-side metadata update
 
-而 repo 内文档已经把 “GPU-side metadata” 单列为剩余优化方向：
-
-- `docs/from-zero-to-inference-engine.md:187`
-- `docs/from-zero-to-inference-engine.md:197`
+而仓库里当时的历史实现说明也已经把 “GPU-side metadata” 单列为剩余优化方向。
 
 所以这条链路属于“思路已经落到一半，但没走完”。
 
@@ -210,10 +207,8 @@ Qwen3.5 batched decode 仍然是分开的：
 - `infer/src/model/qwen35/batch_decode.rs:570`
 - `infer/src/model/qwen35/batch_decode.rs:600`
 
-这和 repo 内对剩余差距的判断一致。文档早就把 FusedAddRMSNorm 列成剩余关键优化：
-
-- `docs/from-zero-to-inference-engine.md:175`
-- `docs/from-zero-to-inference-engine.md:194`
+这和 repo 内对剩余差距的判断一致：早期实现说明里已经把
+`FusedAddRMSNorm` 列成剩余关键优化。
 
 所以这里也属于“优化方向已经有实现样板，也被性能分析明确点名，但 Qwen3.5 并发热路径没有吃到”。
 

@@ -8,30 +8,41 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 
 ## Project shape
 
-Pure-Rust LLM inference engine; no PyTorch, no Python on the hot path. Two
-backends plug into one contract (`server_engine::InferenceEngine`): the CUDA
-continuous-batching scheduler (Linux/NVIDIA, `cudarc` + FlashInfer + Triton AOT)
-and the Metal scheduler runtime (Apple Silicon, `crates/mlx-sys` C++ bridge —
-continuous batching with variable-length packed decode via mlx-lm
-`BatchKVCache` pattern: left-padding + additive mask + per-row RoPE offsets,
-see [`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7).
-Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention).
-FlashInfer drives CUDA prefill HD128 and batched decode HD128+HD256.
-Tests compare against JSON baselines in `infer/test_data/` — regenerate
-after any change affecting numerical output.
+`agent-infer` is a Rust-native inference runtime with integrated local
+agent/train/self-evolution workflows. The runtime remains primary:
 
-**Workspace (post 2026-04-20 Phase 6 landing):**
+- `infer` owns serving/runtime truth.
+- `arle` is the runtime-led CLI front door for local agent, train, eval, and
+  data workflows.
+- `train` extends the same runtime/model authority; it is not a second equal
+  product line with its own independent truth surface.
+
+No PyTorch and no Python on the hot path. Two backends plug into one contract
+(`server_engine::InferenceEngine`): the CUDA continuous-batching scheduler
+(Linux/NVIDIA, `cudarc` + FlashInfer + Triton AOT) and the Metal scheduler
+runtime (Apple Silicon, `crates/mlx-sys` C++ bridge — continuous batching with
+variable-length packed decode via mlx-lm `BatchKVCache` pattern: left-padding +
+additive mask + per-row RoPE offsets, see
+[`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7).
+Models: Qwen3 and Qwen3.5-family. FlashInfer drives CUDA prefill HD128 and
+batched decode HD128+HD256. Tests compare against JSON baselines in
+`infer/test_data/` — regenerate after any change affecting numerical output.
+
+**Workspace (current):**
 
 ```
 agent-infer/
-├── src/                       ← thin cli::run() binary
-├── infer/                     ← runtime crate (scheduler/model/ops/backends/HTTP)
+├── src/                       ← thin `arle` binary
+├── infer/                     ← primary runtime crate (scheduler/model/ops/backends/HTTP)
 ├── crates/
-│   ├── agent/chat/cli/tools
+│   ├── agent/chat/cli/tools   ← runtime-facing control-plane crates
 │   ├── autograd/              ← from-scratch autograd + optimizer core
 │   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
+│   ├── kv-native-sys/         ← local persistence substrate for KV tier transports
 │   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
-│   └── train/                 ← LoRA + GRPO trainer and control plane
+│   ├── qwen3-spec/            ← shared Qwen3 config + tensor-name contract
+│   ├── qwen35-spec/           ← shared Qwen3.5 config + tensor-name contract
+│   └── train/                 ← train-side control plane + runtime-integrated RL stack
 └── docs/                      ← projects/ plans/ experience/ reviews/ resources/
 ```
 

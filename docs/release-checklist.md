@@ -23,11 +23,14 @@ Before tagging, confirm:
 Review and update, as needed:
 
 1. `README.md`
-2. `CONTRIBUTING.md`
-3. `CHANGELOG.md`
-4. `docs/support-matrix.md`
-5. `docs/compatibility.md`
-6. `docs/stability-policy.md`
+2. `README.zh-CN.md`
+3. `ROADMAP.md`
+4. `docs/index.md`
+5. `CONTRIBUTING.md`
+6. `CHANGELOG.md`
+7. `docs/support-matrix.md`
+8. `docs/compatibility.md`
+9. `docs/stability-policy.md`
 
 At minimum, make sure:
 
