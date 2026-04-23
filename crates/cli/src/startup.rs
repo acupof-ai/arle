@@ -3,7 +3,9 @@
 //! Ties together hardware detection, model catalog, banner, picker, and
 //! download into a single cohesive startup experience.
 
+use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use console::style;
@@ -40,11 +42,11 @@ pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
     banner::print_startup_banner(&info);
 
     // Discover locally available models.
-    let local_models = discover_all_local_models();
+    let local_snapshots = discover_local_snapshots();
+    let local_models = local_models_from_snapshots(&local_snapshots);
 
     // Get catalog recommendations.
     let recommended = model_catalog::recommend_models(&info);
-    let all_backend = model_catalog::all_for_backend(&info);
 
     // If we found exactly one local model and nothing else makes sense,
     // just confirm and go.
@@ -60,7 +62,7 @@ pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
     }
 
     // Show the interactive picker.
-    match model_picker::pick_model(&local_models, &recommended, &all_backend)? {
+    match model_picker::pick_model(&local_models, &recommended)? {
         PickerResult::LocalModel(name) => Ok(name),
         PickerResult::RemoteModel(hf_id) => {
             download::download_model_with_progress(&hf_id)?;
@@ -78,25 +80,20 @@ pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
 pub(crate) fn run_hub_wizard() -> Result<Option<String>> {
     use dialoguer::Select;
 
-    let snapshots = hub_discovery::discover_hub_snapshots();
+    let snapshots = discover_local_snapshots();
     if snapshots.is_empty() {
         return Ok(None);
     }
 
     let items: Vec<String> = snapshots
         .iter()
-        .map(|s| {
-            format!(
-                "{}  {}",
-                style(&s.model_id).bold(),
-                style(s.path.display().to_string()).dim()
-            )
-        })
+        .map(|s| model_picker::name_path_item(&s.model_id, &s.path))
         .collect();
 
     let selection = Select::new()
         .with_prompt("Select a model (or press Esc to cancel):")
         .items(&items)
+        .max_length(model_picker::picker_page_len(items.len()))
         .default(0)
         .interact_opt()?;
 
@@ -106,25 +103,91 @@ pub(crate) fn run_hub_wizard() -> Result<Option<String>> {
     }
 }
 
-/// Discover all locally available models from the default candidate list.
-fn discover_all_local_models() -> Vec<(String, std::path::PathBuf)> {
-    let candidates = [
-        "mlx-community/Qwen3-0.6B-4bit",
-        "mlx-community/Qwen3-0.6B-bf16",
-        "Qwen/Qwen3-0.6B",
-        "Qwen/Qwen3-4B",
-        "Qwen/Qwen3-8B",
-        "Qwen/Qwen3.5-4B",
-        "mlx-community/Qwen3-4B-4bit",
-        "mlx-community/Qwen3-8B-4bit",
-        "THUDM/glm-4-9b-chat",
-    ];
+fn discover_local_snapshots() -> Vec<hub_discovery::HubSnapshot> {
+    dedupe_snapshots_by_model_id(hub_discovery::discover_hub_snapshots())
+}
 
-    candidates
+fn local_models_from_snapshots(snapshots: &[hub_discovery::HubSnapshot]) -> Vec<(String, PathBuf)> {
+    snapshots
         .iter()
-        .filter_map(|candidate| {
-            infer::hf_hub::resolve_local_model_path(candidate)
-                .map(|path| ((*candidate).to_string(), path))
-        })
+        .map(|snapshot| (snapshot.model_id.clone(), snapshot.path.clone()))
         .collect()
+}
+
+fn dedupe_snapshots_by_model_id(
+    snapshots: Vec<hub_discovery::HubSnapshot>,
+) -> Vec<hub_discovery::HubSnapshot> {
+    let mut seen = HashSet::new();
+    snapshots
+        .into_iter()
+        .filter(|snapshot| seen.insert(snapshot.model_id.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dedupe_snapshots_by_model_id, local_models_from_snapshots};
+    use crate::hub_discovery::HubSnapshot;
+    use std::path::PathBuf;
+
+    #[test]
+    fn local_models_preserve_snapshot_identity() {
+        let snapshots = vec![
+            HubSnapshot {
+                model_id: "mlx-community/Qwen3.6-35B-A3B-4bit".to_string(),
+                path: PathBuf::from("/tmp/qwen35b"),
+            },
+            HubSnapshot {
+                model_id: "mlx-community/Qwen3.5-4B-MLX-4bit".to_string(),
+                path: PathBuf::from("/tmp/qwen35-4b"),
+            },
+        ];
+
+        let models = local_models_from_snapshots(&snapshots);
+        assert_eq!(
+            models,
+            vec![
+                (
+                    "mlx-community/Qwen3.6-35B-A3B-4bit".to_string(),
+                    PathBuf::from("/tmp/qwen35b"),
+                ),
+                (
+                    "mlx-community/Qwen3.5-4B-MLX-4bit".to_string(),
+                    PathBuf::from("/tmp/qwen35-4b"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dedupe_snapshots_by_model_id_keeps_newest_snapshot() {
+        let snapshots = vec![
+            HubSnapshot {
+                model_id: "Qwen/Qwen3-4B".to_string(),
+                path: PathBuf::from("/tmp/newer"),
+            },
+            HubSnapshot {
+                model_id: "mlx-community/Qwen3.6-35B-A3B-4bit".to_string(),
+                path: PathBuf::from("/tmp/moe"),
+            },
+            HubSnapshot {
+                model_id: "Qwen/Qwen3-4B".to_string(),
+                path: PathBuf::from("/tmp/older"),
+            },
+        ];
+
+        assert_eq!(
+            dedupe_snapshots_by_model_id(snapshots),
+            vec![
+                HubSnapshot {
+                    model_id: "Qwen/Qwen3-4B".to_string(),
+                    path: PathBuf::from("/tmp/newer"),
+                },
+                HubSnapshot {
+                    model_id: "mlx-community/Qwen3.6-35B-A3B-4bit".to_string(),
+                    path: PathBuf::from("/tmp/moe"),
+                },
+            ]
+        );
+    }
 }

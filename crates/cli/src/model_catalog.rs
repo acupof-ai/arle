@@ -33,16 +33,6 @@ impl CatalogEntry {
             && self.backends.contains(&info.compiled_backend)
             && self.min_memory_gb <= info.effective_memory_gb()
     }
-
-    /// Format a one-line display string for the picker.
-    #[allow(dead_code)]
-    pub(crate) fn picker_line(&self) -> String {
-        let quant = self
-            .quantization
-            .map(|q| format!(" ({q})"))
-            .unwrap_or_default();
-        format!("{}{:<6}  {:.1} GB", self.display_name, quant, self.size_gb)
-    }
 }
 
 use CompiledBackend::{Cpu, Cuda, Metal};
@@ -178,16 +168,6 @@ pub(crate) fn recommend_models(info: &SystemInfo) -> Vec<&'static CatalogEntry> 
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     fits
-}
-
-/// Return all catalog entries compatible with this backend (regardless of
-/// RAM), for display with "insufficient memory" notes.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-pub(crate) fn all_for_backend(info: &SystemInfo) -> Vec<&'static CatalogEntry> {
-    CATALOG
-        .iter()
-        .filter(|e| e.implemented && e.backends.contains(&info.compiled_backend))
-        .collect()
 }
 
 #[cfg(test)]
