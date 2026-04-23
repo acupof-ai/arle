@@ -153,12 +153,17 @@ code      { font-family: inherit; color: var(--coral-dim); }
   margin: 0;
   padding: 2px 0 8px;
   font-size: 10px;
-  line-height: 1.1;
+  line-height: 1.02;
   color: var(--coral-dim);
   overflow-x: auto;
   letter-spacing: 0;
   white-space: pre;
   font-weight: 700;
+}
+.ascii-art {
+  display: inline-block;
+  transform: scaleX(1.85);
+  transform-origin: left top;
 }
 @media (min-width: 760px) {
   .ascii { font-size: 11px; }
@@ -421,6 +426,7 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   :root { --fs: 14px; }
   .page { padding: 18px 14px 18px; }
   .ascii { font-size: 8px; }
+  .ascii-art { transform: scaleX(1.18); }
   .manhead-c, .manfoot-c { display: none; }
   pre.cmd, pre.tbl, pre.diagram, pre.files { font-size: 12px; }
   .statusline { font-size: 11px; }
