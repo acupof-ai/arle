@@ -1353,7 +1353,7 @@ already shipped, and M1 can proceed on M0.1 alone.
   When M1 lands, A1 moves to the Done section; when M3 lands, B3 moves;
   when M4 lands, B1 moves. `agent-first-architecture.md` gets an update
   pointer to this doc in the same PR series.
-- [`kv-quantization-long-context.md`](kv-quantization-long-context.md) —
+- [`../resources/kv-cache-quantization.md`](../resources/kv-cache-quantization.md) —
   KV quantization formats (FP8, INT8, TurboQuant) live inside T0 blocks.
   `byte_len` on `RadixNode` must account for scale bytes. M0.3 must not
   regress the quantized fast paths; the M0.3 per-format dispatch keeps
