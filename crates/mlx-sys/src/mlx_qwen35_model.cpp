@@ -1642,8 +1642,7 @@ int32_t qwen35_session_end(
 }
 
 // Env-gated MTLCaptureManager hook — default no-op, enabled by
-// INFER_CAPTURE_STEP=N (see crates/mlx-sys/src/mlx_metal_capture.mm and
-// docs/plans/metal-gdr-kernel-xcode-capture.md §Step 2b).
+// INFER_CAPTURE_STEP=N (see crates/mlx-sys/src/mlx_metal_capture.mm).
 extern "C" int32_t maybe_capture_qwen35_step_begin(void);
 extern "C" void maybe_capture_qwen35_step_end(int32_t started);
 

@@ -18,11 +18,8 @@
 
 相关上下文来自：
 
-- `docs/experience/wins/2026-03-31-throughput-profiling.md`
-- `docs/experience/wins/2026-03-31-nsys-profiling-decode.md`
+- `docs/resources/profiling-guide.md`
 - `docs/experience/reviews/2026-04-02-cuda-link-optimization-gaps.md`
-- `infer/docs/resources/profiling-guide.md`
-- `infer/docs/projects/qwen35-4b-optimization.md`
 
 ## Heat Map
 

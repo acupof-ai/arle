@@ -122,15 +122,12 @@ INFER_CAPTURE_STEP=5 \
   eval failure cleanly rolls back — the caller sees `-1` with no partial
   cache advance and no leaked output handle.
 
-Open the resulting `.gputrace` in Xcode. Full runbook:
-[`docs/plans/metal-gdr-kernel-xcode-capture.md`](../../docs/plans/metal-gdr-kernel-xcode-capture.md).
+Open the resulting `.gputrace` in Xcode for inspection.
 
 ## Pointers
 
 - `infer/src/backend/metal/AGENTS.md` — the Rust consumer side.
 - `infer/src/backend/metal/mlx.rs` — the thin wrapper that turns this
   FFI into safe-ish Rust.
-- `docs/plans/2026-04-15-metal-backend-execution-checklist.md` — active
-  Metal backend checklist.
-- `docs/experience/wins/2026-04-13-qwen35-metal-cpp-path-tuning.md` — why
-  the dedicated C++ step model beat the generic Rust path for Qwen3.5.
+- `docs/projects/mlx-backend-roadmap.md` — current Metal backend project,
+  including continuous-batching / batched-decode milestones.

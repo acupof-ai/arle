@@ -31,7 +31,7 @@ pub(crate) static MLX_GUARD: Mutex<()> = Mutex::new(());
 // Per-process counter for every `mlx_eval` call that flows through the
 // Metal backend. Used by M5.3a acceptance tests to confirm that a
 // well-structured forward+backward step terminates in exactly one eval
-// boundary (see `docs/plans/m5.3-device-resident-tensor.md` §5). Covers
+// boundary (see `docs/projects/agent-rl-self-evolving.md` §M5). Covers
 // `MetalBackend::eval` as well as the legacy `eval_and_readback` tail
 // used by non-device-resident ops.
 static METAL_EVAL_COUNT: AtomicU64 = AtomicU64::new(0);
