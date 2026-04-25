@@ -8,11 +8,11 @@ call is syntactically valid on first try, and every session can survive a
 process restart without paying the cold-prefill tax.
 
 This doc is a **priority ledger**, not a design spec. Each item is scoped to
-land as a single PR under the Phase 1 PR discipline (one main topic per PR);
-the original "Phase 1 split" plan was reverted by Route-A on 2026-04-15 — see
-`docs/archives/art-grade-architecture-for-long-agent-infer.md` for the dead
-proposal and `docs/architecture.md` / `docs/codebase-map.md` for the current
-canonical workspace shape.
+land as a single PR under the Phase-1 PR discipline (one main topic per PR);
+the original 8-crate split proposal was reverted by Route-A on 2026-04-15.
+See `docs/architecture.md` / `docs/codebase-map.md` for the current canonical
+workspace shape, and `docs/architecture.md` § "Workspace governance rules"
+for the PR-discipline contract that survived the revert.
 
 > **Status update — 2026-04-15** (post M1+M2a, post Codex review)
 >
@@ -433,12 +433,8 @@ A4 is on the critical path for the stated goal.
 - [`tiered-kv-cache.md`](tiered-kv-cache.md) — Hierarchical KV cache project.
   Owns the implementation shape for A1, B1, and B3. Any contract change
   affecting those three items lands there first and propagates here.
-- [`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md) —
-  archived 8-crate decomposition proposal. Its §六 governance rules and §七
-  acceptance criteria still inform PR discipline; its §一 / 二 / 三 crate
-  topology was reverted by Route-A.
-- `docs/architecture.md` — current workspace/package topology.
+- `docs/architecture.md` — current workspace/package topology and the
+  surviving "Workspace governance rules" (PR discipline + crate-admission
+  criteria) that govern any future split.
 - `docs/projects/mlx-backend-roadmap.md` — Metal-side work that must stay
   consistent with tier-A contract changes.
-- `docs/projects/kv-quantization-long-context.md` — complements A1/B1:
-  radix cache plus quantized KV is the long-context story.

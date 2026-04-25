@@ -65,8 +65,7 @@ marked as the current source of truth, treat it as historical context.
   `docs/experience/reviews/` are the evidence log and learning archive. The
   latest three wins/errors are always-loaded per `AGENTS.md`; the directories
   themselves are not re-indexed here because that listing decays quickly.
-- `docs/archives/` contains inactive architectural proposals kept only as
-  historical context.
-- Plans not listed in the active section above should be treated as superseded
-  or historical unless they explicitly mark themselves as the current source of
-  truth for a topic.
+- Plans / projects / research / reviews not listed in the active section
+  above are not historical fallbacks: they have been retired during the
+  2026-04-25 truth-surface cleanup. Anything not on this index is not a
+  source of truth.

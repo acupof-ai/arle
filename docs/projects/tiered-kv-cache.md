@@ -16,11 +16,10 @@ items share one code topology and must be built against one data-structure
 contract; splitting them into independent designs is how we end up with three
 incompatible caches. This doc owns that contract.
 
-This doc operates under the Phase-1 PR discipline originally proposed in
-[`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md)
-(now archived; the crate topology was reverted by Route-A but the PR
-discipline still applies): one main topic per PR, structure-before-behavior,
-no mixed kernel+scheduler+workspace diffs in the same review.
+This doc operates under the Phase-1 PR discipline now codified in
+[`../architecture.md`](../architecture.md) § "Workspace governance rules":
+one main topic per PR, structure-before-behavior, no mixed kernel+scheduler+
+workspace diffs in the same review.
 
 ---
 
@@ -1366,12 +1365,10 @@ already shipped, and M1 can proceed on M0.1 alone.
 - [`cuda-kernel-crate-extraction.md`](../plans/cuda-kernel-crate-extraction.md) —
   the `.cu` file moves landed 2026-04-15, so M0.3 kernel references now live at
   `crates/cuda-kernels/csrc/kv/*.cu` (and `crates/cuda-kernels/csrc/attention/decode_prep_paged*.cu`).
-- [`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md) —
-  archived workspace crate topology proposal. PR discipline (§六) and
-  crate admission criteria (§七) still apply; the §一 topology was
-  reverted by Route-A. If M3 or later promotes `kv_tier` to a separate
-  crate, the promotion still has to pass the §六 "two direct consumers"
-  gate.
+- [`../architecture.md`](../architecture.md) § "Workspace governance rules" —
+  PR discipline + crate-admission criteria. If M3 or later promotes
+  `kv_tier` to a separate crate, the promotion still has to pass the
+  "two direct consumers" gate captured there.
 
 ---
 
