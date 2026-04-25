@@ -101,7 +101,7 @@ fn metal_handle_drops_cleanly_on_scope_exit() -> Result<()> {
     Ok(())
 }
 
-/// M5.3a + M5.3b.1 acceptance (`docs/plans/m5.3-device-resident-tensor.md` §5):
+/// M5.3a + M5.3b.1 acceptance (`docs/projects/agent-rl-self-evolving.md` §M5):
 /// a single forward+backward pass of `y = x @ w; loss = y.sum()` through
 /// the Metal backend must resolve to a small, deterministic number of
 /// `mlx_eval` boundaries — not one per op (the pre-M5.3a degenerate path

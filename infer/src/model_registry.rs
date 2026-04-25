@@ -82,7 +82,7 @@ impl ModelArch {
     /// Whether an implementation is available in this build.
     ///
     /// `Qwen3_5_Moe` is Metal-only for now; the CUDA path is a `todo!` stub
-    /// until the CUDA MoE kernel lands (see `docs/plans/qwen36-moe-metal.md`).
+    /// until the CUDA MoE kernel lands.
     pub fn is_implemented(self) -> bool {
         match self {
             Self::Qwen3 | Self::Qwen35 => true,

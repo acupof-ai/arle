@@ -81,8 +81,7 @@ works with any backend. Load before editing any scheduler internals.
    — if you add a new eviction trigger (e.g. tier-demotion under pool
    pressure), preserve this gate. Verified statically at the
    paged-prefill lifecycle audit (2026-04-18); no property test locks
-   it in yet (backlog item §4 in
-   `docs/plans/paged-prefill-followups-2026-04-18.md`).
+   it in yet.
 
 ## Common mistakes
 

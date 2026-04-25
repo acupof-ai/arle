@@ -38,7 +38,7 @@ separate:
 - opt-in trace file emission through:
   [`infer/src/main.rs`](../../infer/src/main.rs)
 - older CUDA profiling notes in:
-  [`infer/docs/resources/profiling-guide.md`](../../infer/docs/resources/profiling-guide.md)
+  [`docs/resources/profiling-guide.md`](../resources/profiling-guide.md)
 
 What is missing is a single operator story that says:
 

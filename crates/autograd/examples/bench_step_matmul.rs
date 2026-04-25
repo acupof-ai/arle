@@ -1,6 +1,6 @@
 //! TinyLM-shape training-step micro-bench for the M5.3a acceptance check.
 //!
-//! Plan: `docs/plans/m5.3-device-resident-tensor.md` §5 requires Metal ≥ 1.1×
+//! Plan: `docs/projects/agent-rl-self-evolving.md` §M5 requires Metal ≥ 1.1×
 //! CPU at d_model=128 on a forward-matmul + sum + backward loop (the
 //! shape that regressed to 0.52× under the pre-M5.3a 1-op-per-eval
 //! path). This bench isolates that loop — no tokenizer, no sampler, no
