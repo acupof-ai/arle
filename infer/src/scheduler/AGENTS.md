@@ -106,8 +106,7 @@ works with any backend. Load before editing any scheduler internals.
 
 ## Pointers
 
-- `docs/projects/tiered-kv-cache.md` — project driving scheduler internals right now.
-- `docs/plans/tiered-kv-cache-tasks.md` — milestone ledger.
+- `docs/projects/tiered-kv-cache.md` — project driving scheduler internals right now (also the milestone ledger).
 - `docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md` — what changed at M2b.
 - `docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md` —
   preemption policy rationale.
