@@ -353,8 +353,8 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 > `scripts/data/agent_trace_default.jsonl` (renamed from the originally
 > proposed `bench_agent.py` because that file already exists as a
 > binary-subprocess benchmark; the two measure different things and
-> cohabit). Landed 2026-04-13 under the Tiered KV Cache task split
-> (`docs/plans/tiered-kv-cache-tasks.md` §7.1).
+> cohabit). Landed 2026-04-13 under the Tiered KV Cache project (now
+> tracked in `docs/projects/tiered-kv-cache.md` §6).
 
 - **What**: `scripts/bench_agent_trace.py` — replays a multi-turn
   tool-calling trace against a running server, reports TTFT per turn,

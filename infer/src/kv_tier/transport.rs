@@ -1,10 +1,9 @@
 //! [`KVTransport`] trait — backend-agnostic data-plane transfer surface.
 //!
-//! Shape frozen per `docs/plans/tiered-kv-cache-tasks.md §6.3`: the trait
-//! exposes `type Op` plus explicit `poll` and `abort` methods, NOT
-//! `type Completion: Future`. NIXL, Mooncake, and UCX all expose polling
-//! completion; keeping the trait Future-free lets each backend hide its
-//! own completion model.
+//! Shape: the trait exposes `type Op` plus explicit `poll` and `abort`
+//! methods, NOT `type Completion: Future`. NIXL, Mooncake, and UCX all
+//! expose polling completion; keeping the trait Future-free lets each
+//! backend hide its own completion model.
 //!
 //! See `crate::kv_tier` for the module-level design notes.
 //! `crate::kv_tier::backend::KVBackend` is the slower-tier object-store

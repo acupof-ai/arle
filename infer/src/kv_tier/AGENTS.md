@@ -91,14 +91,10 @@ produced it can decode. Example payloads documented in `tier.rs`:
 
 ## Pointers
 
-- `docs/projects/tiered-kv-cache.md` — live design doc, revised 2026-04-15.
+- `docs/projects/tiered-kv-cache.md` — live design doc and milestone ledger.
   §4.1 (tier model), §4.2 (invariants), §5.2 (why the directory was removed),
-  §8 (pitfalls).
-- `docs/plans/tiered-kv-cache-tasks.md` — milestone ledger (local Mac / remote
-  GPU / parallel-GPU lanes).
-- `docs/plans/tiered-kv-cache-m2b-remote-acceptance.md` — remote CUDA
-  acceptance checklist for the 2026-04-15 M2b batch.
-- `docs/experience/errors/2026-04-14-p0-page16-blocker.md` — the NHD/HND
-  blocker hit at page_size=16.
+  §6 (M0–M5 milestones), §8 (pitfalls).
+- `docs/plans/tiered-kv-hicache-readmission.md` — current staged-readmission
+  + remote/shared backend plan.
 - `docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md` — what shipped
   at M2b local (selector flip, resurrection, retain hard cap, tombstone GC).
