@@ -71,7 +71,7 @@ project is committed to following SGLang/vLLM in capability:
 | **T3** | **FlashAttention-3 (H100 / sm_90) prefill** | `ROADMAP.md` §1.2. FA-3 needs warp specialization + async pipeline. The current `prefill_attention.cu` + `flashinfer_single_prefill` path is sm_80-tuned. Adding FA-3 means **two parallel attention kernel implementations selected by SM target** — i.e., trip wire T1 follows. |
 | **T4** | **MLA attention (DeepSeek-V2/V3/R1) + DeepSeek MoE + FP8 GEMM (sm_90)** | `ROADMAP.md` §1.3 + §1.4. This is essentially a second compute backend: new attention algorithm (latent KV compression), new GEMM family (FP8 E4M3), new model family. ~30+ new kernel files. The `crates/cuda-kernels/csrc/` tree doubles in size, and the parallel kernel set forces T1 / T2 anyway. |
 | **T5** | **Speculative decoding GPU integration** | `ROADMAP.md` §"Missing". Today `infer/src/speculative.rs` and `infer/src/speculative/cuda.rs` are CPU stubs. Real GPU integration means a draft kernel surface that gets called from inside the scheduler hot loop. The existing scheduler→backend→cuda boundary will need cleanup before this lands cleanly. |
-| **T6** | **A second team / external consumer starts owning only the kernel layer** | E.g. another inference project wants to reuse `cuda-kernels` directly without pulling in the agent runtime. The "two direct consumers" admission criterion from `docs/archives/art-grade-architecture-for-long-agent-infer.md` §六 is met. |
+| **T6** | **A second team / external consumer starts owning only the kernel layer** | E.g. another inference project wants to reuse `cuda-kernels` directly without pulling in the agent runtime. The "two direct consumers" admission criterion in `docs/architecture.md` § "Workspace governance rules" is met. |
 
 **Decision rule:** if **any one** of T1–T6 enters in-flight implementation
 status (i.e., a real PR opens against it), execute this blueprint *as part of
@@ -397,15 +397,10 @@ revert if reality rejects the plan.
 
 ## 9 · Cross-references
 
-- `docs/architecture.md` — current workspace topology + Future Evolution section
-  pointing here.
+- `docs/architecture.md` — current workspace topology + the surviving
+  "Workspace governance rules" (PR discipline + crate-admission criteria)
+  that still inform the trip-wire bar.
 - `docs/codebase-map.md` — current `infer/` tree layout.
-- `docs/archives/art-grade-architecture-for-long-agent-infer.md` — the
-  ambitious 8-crate split that Route-A reverted; §六 governance rules and §七
-  acceptance criteria still inform the trip wire criteria above.
-- `docs/archives/cuda-crate-extraction.md` — the original (overly ambitious)
-  Round-3 extraction plan that bundled `backend + ops + model + scheduler`
-  together. Superseded by this narrower kernel-only blueprint.
 - `infer/src/backend/cuda/prelude.rs` — the proto-API contract that becomes
   the public surface of the extracted crate.
 - `ROADMAP.md` §"Missing" — the source of trip wires T1–T6.
