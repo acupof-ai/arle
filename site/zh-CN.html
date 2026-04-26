@@ -19,6 +19,16 @@
 <body>
 <main class="page">
 
+<div class="termtabs" aria-hidden="true">
+  <span class="termdot termdot-r"></span>
+  <span class="termdot termdot-y"></span>
+  <span class="termdot termdot-g"></span>
+  <span class="termtab on">man arle.1</span>
+  <span class="termtab">~/code/arle</span>
+  <span class="termflex"></span>
+  <span class="termmeta">zsh · 104×42</span>
+</div>
+
 <header class="manhead" aria-label="man page header">
   <span class="manhead-l">ARLE(1)</span>
   <span class="manhead-c">用户命令手册</span>
@@ -44,10 +54,14 @@
   <span class="hl">arle</span> 负责本地 agent、训练、评测与数据工作流前门。
 </p>
 <div class="hero-signals" aria-label="project signals">
-  <span>CUDA 主路径</span>
-  <span>Metal beta</span>
-  <span>OpenAI 兼容</span>
-  <span>统一前门</span>
+  <span class="sig"><b>&#9656;</b><span class="sig-kv">backend=<code>cuda</code></span><i class="sig-dot sig-dot-ok" aria-hidden="true"></i></span>
+  <span class="sig"><b>&#9656;</b><span class="sig-kv">backend=<code>metal</code></span><i class="sig-dot sig-dot-warn" aria-hidden="true"></i></span>
+  <span class="sig"><b>&#9656;</b><span class="sig-kv">api=<code>openai-v1</code></span><i class="sig-dot sig-dot-ok" aria-hidden="true"></i></span>
+  <span class="sig"><b>&#9656;</b><span class="sig-kv">doors=<code>1</code></span><i class="sig-dot sig-dot-ok" aria-hidden="true"></i></span>
+</div>
+<div class="hero-cta" aria-label="主要入口">
+  <a class="hero-cta-primary" href="#quickstart"><span class="p">$</span> arle --doctor</a>
+  <a class="hero-cta-secondary" href="https://github.com/cklxx/arle">cklxx/arle <span class="arrow" aria-hidden="true">&#x2197;</span></a>
 </div>
 </div>
 <aside class="hero-panel" aria-label="project summary">
@@ -74,6 +88,7 @@
   <a href="#surfaces">[入口面]</a>
   <a href="#status">[状态]</a>
   <a href="#quickstart">[快速开始]</a>
+  <a href="#examples">[示例]</a>
   <a href="#docs">[文档]</a>
   <a href="https://github.com/cklxx/arle">[github]</a>
   <a href="https://github.com/cklxx/arle/releases">[发版]</a>
@@ -106,8 +121,8 @@
   <article class="mini-card">
     <h3>&mdash; 一张前门</h3>
     <p>
-      <code>arle run</code>、<code>arle train</code> 与
-      <code>arle data</code> 把用户入口收成一张前门，不再分散成多组二进制。
+      <code>arle run</code>、<code>arle serve</code>、<code>arle train</code>
+      与 <code>arle data</code> 把用户入口收成一张前门，不再分散成多组二进制。
     </p>
   </article>
   <article class="mini-card">
@@ -122,14 +137,16 @@
 
 <section id="synopsis">
 <h2>概要</h2>
-<pre class="cmd"><span class="p">$</span> cargo build -p infer --release
-<span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
-<span class="p">$</span> cargo build --release --features cli --bin arle
-<span class="p">$</span> ./target/release/arle --doctor
-<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B \
-    run --prompt <i>"总结一下这个仓库"</i>
-<span class="p">$</span> ./target/release/arle train env
-<span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span></pre>
+<pre class="cmd lined"><span class="ln">1</span><span class="p">$</span> cargo build -p infer --release
+<span class="ln">2</span><span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
+<span class="ln">3</span><span class="p">$</span> cargo build --release --features cli --bin arle
+<span class="ln">4</span><span class="p">$</span> ./target/release/arle --doctor
+<span class="ln">5</span><span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B \
+<span class="ln"> </span>    run --prompt <i>"总结一下这个仓库"</i>
+<span class="ln">6</span><span class="p">$</span> ./target/release/arle serve --backend cuda \
+<span class="ln"> </span>    --model-path /path/to/Qwen3-4B --port 8000
+<span class="ln">7</span><span class="p">$</span> ./target/release/arle train env
+<span class="ln">8</span><span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span></pre>
 </section>
 
 <section id="surfaces">
@@ -138,6 +155,7 @@
   <tbody>
     <tr><td class="cap"><code>infer</code></td><td>OpenAI 兼容 HTTP serving、metrics、stats 与 session 接口都收口在运行时的标准服务面上。</td></tr>
     <tr><td class="cap"><code>arle run</code></td><td>交互式 REPL 与一次性 prompt 执行，共用同一套 Rust 运行时权威，直接面向本地 agent 工作流。</td></tr>
+    <tr><td class="cap"><code>arle serve</code></td><td>统一前门，从 release artifact 或 PATH 拉起匹配的 serving 二进制。</td></tr>
     <tr><td class="cap"><code>arle train</code></td><td>Pretrain、SFT、GRPO、多轮 RL 与 eval 共用一张前门，不再依赖分散的训练二进制。</td></tr>
     <tr><td class="cap"><code>arle data</code></td><td>数据集下载与 schema 转换工具，和同一套 workspace、版本、文档一起演进。</td></tr>
   </tbody>
@@ -161,6 +179,13 @@
 <h2>快速开始</h2>
 <div class="quickgrid">
 <article class="mini-card quick-card">
+<h3>&mdash; CUDA 容器</h3>
+<pre class="cmd"><span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \
+    -v /path/to/Qwen3-4B:/model:ro \
+    ghcr.io/cklxx/arle:latest \
+    serve --backend cuda --model-path /model --port 8000</pre>
+</article>
+<article class="mini-card quick-card">
 <h3>&mdash; 本地 CLI 冒烟</h3>
 <pre class="cmd"><span class="p">$</span> git clone https://github.com/cklxx/arle
 <span class="p">$</span> cd arle
@@ -169,13 +194,15 @@
     --features cpu,no-cuda,cli --bin arle
 <span class="p">$</span> ./target/release/arle --doctor
 <span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B \
-    run --prompt <i>"用一句话打个招呼"</i>
+    run --no-tools --prompt <i>"用一句话打个招呼"</i>
 <span class="p">$</span> ./target/release/arle train env</pre>
 </article>
 <article class="mini-card quick-card">
 <h3>&mdash; Serving 冒烟</h3>
 <pre class="cmd"><span class="p">$</span> cargo build -p infer --release
-<span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
+<span class="p">$</span> cargo build --release --features cli --bin arle
+<span class="p">$</span> ./target/release/arle serve --backend cuda \
+    --model-path /path/to/Qwen3-4B --port 8000
 <span class="p">$</span> curl http://127.0.0.1:8000/v1/chat/completions \
     -H <i>'Content-Type: application/json'</i> \
     -d <i>'{"messages":[{"role":"user","content":"你好"}],"max_tokens":64}'</i></pre>
@@ -184,6 +211,26 @@
 
 <p class="note">
   默认 CUDA CLI 用 <code>--features cli</code>，Apple Silicon 用 <code>metal,no-cuda,cli</code>，便携冒烟路径用 <code>cpu,no-cuda,cli</code>。<code>./setup.sh</code> 会引导 Rust、Python、Zig 和本地检查。
+</p>
+</section>
+
+<section id="examples">
+<h2>示例</h2>
+<p class="block">
+  对本地 <code>infer</code> server 发一次 OpenAI 兼容的 chat 请求，再用
+  <code>jq</code> 把 assistant 消息切出来：
+</p>
+<pre class="cmd lined"><span class="ln">1</span><span class="p">$</span> curl -s http://127.0.0.1:8000/v1/chat/completions \
+<span class="ln"> </span>    -H <i>'Content-Type: application/json'</i> \
+<span class="ln"> </span>    -d <i>'{"model":"qwen3-4b","messages":[{"role":"user","content":"用 8 个词解释 ARLE。"}],"max_tokens":40}'</i> \
+<span class="ln"> </span>    | jq .choices[0].message
+<span class="ln">2</span>{
+<span class="ln"> </span>  "role": <i>"assistant"</i>,
+<span class="ln"> </span>  "content": <i>"以 runtime 为主干的 Rust workspace，统一 serving 与本地 agent。"</i>
+<span class="ln"> </span>}</pre>
+<p class="note">
+  另见 <a href="#synopsis">概要</a>、<a href="#surfaces">入口面</a>、
+  <a href="#quickstart">快速开始</a>。
 </p>
 </section>
 
@@ -197,6 +244,7 @@
 <a href="https://github.com/cklxx/arle/blob/main/docs/stability-policy.md">/docs/stability-policy.md</a>      稳定性分级 · 兼容性姿态
 <a href="https://github.com/cklxx/arle/blob/main/docs/compatibility.md">/docs/compatibility.md</a>         兼容性与废弃策略
 <a href="https://github.com/cklxx/arle/blob/main/docs/environment.md">/docs/environment.md</a>           环境变量与默认值
+<a href="https://github.com/cklxx/arle/tree/main/examples">/examples</a>                      curl · Docker · Metal · tiny train 冒烟示例
 <a href="https://github.com/cklxx/arle/blob/main/docs/index.md">/docs/index.md</a>                 维护者 PARA 索引
 <a href="https://github.com/cklxx/arle/releases">/releases</a>                      发版二进制 · 校验和
 </pre>
