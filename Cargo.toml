@@ -100,5 +100,14 @@ strip = "symbols"
 lto = "thin"
 codegen-units = 1
 
+[profile.release.package."*"]
+debug = false
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [lints]
 workspace = true
