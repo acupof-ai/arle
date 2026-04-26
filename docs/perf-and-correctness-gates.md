@@ -147,5 +147,4 @@ Before merge, answer:
 Related docs:
 
 - [stability-policy.md](stability-policy.md)
-- [compatibility.md](compatibility.md)
 - [release-checklist.md](release-checklist.md)

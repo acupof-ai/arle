@@ -9,7 +9,7 @@ Last refreshed: 2026-04-25 (truth-surface cleanup).
 | Concern | Canonical source | Notes |
 | --- | --- | --- |
 | Support status of backends / APIs / model families / quantization | [support-matrix.md](support-matrix.md) | README and roadmap summarize only. |
-| Stability levels and compatibility posture | [stability-policy.md](stability-policy.md), [compatibility.md](compatibility.md) | Do not redefine tiers elsewhere. |
+| Stability levels and compatibility posture | [stability-policy.md](stability-policy.md) | Do not redefine tiers elsewhere. |
 | Workspace topology and module entry points | [codebase-map.md](codebase-map.md) | Source of truth for "what exists today". |
 | Architecture ownership and boundaries | [architecture.md](architecture.md) | `infer` owns runtime truth. |
 | Benchmark and trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) | `guidellm` is the canonical e2e benchmark path. |

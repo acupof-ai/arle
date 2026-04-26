@@ -1,223 +1,83 @@
 # ARLE Architecture
 
-Updated 2026-04-23 after the runtime-first documentation cleanup.
+This document is the canonical source for ownership boundaries, dependency
+direction, and crate-admission governance. For "what files exist and where
+to start reading", see [codebase-map.md](codebase-map.md). For the
+extraction story behind `crates/cuda-kernels`, see
+[plans/cuda-kernel-crate-extraction.md](plans/cuda-kernel-crate-extraction.md).
 
-`ARLE` is a runtime-first workspace:
-
-- `infer` is the primary serving/runtime surface.
-- `arle` is the unified local front door for agent, train, eval, and data
-  workflows.
-- The train stack is integrated on top of the same runtime/model authority; it
-  does not define a second competing architecture truth.
-
-## Workspace Layout
-
-The repository is a runtime-heavy workspace with a small set of control-plane
-and integration crates around it:
-
-- root package: thin entry package that builds the `arle` binary
-- `infer`: inference runtime, HTTP server, scheduler, backend runtime, model
-  loading, CUDA/Metal/CPU backends, and the unified `server_engine::InferenceEngine`
-  contract that both the HTTP server and the agent CLI call through
-- `chat`: shared chat/tool-call protocol and OpenAI chat surface types
-- `tools`: builtin tool definitions plus sandboxed execution helpers
-- `agent`: agent session state, prompt assembly, tool-call recovery, and
-  turn loop logic
-- `cli`: REPL and CLI wiring for the `arle` binary
-- `cuda-kernels`: CUDA kernel layer — `csrc/` + Triton AOT + Rust FFI
-  (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`,
-  `kv_turboquant`). Extracted from `infer` in commit `a4e12f5` (2026-04-15).
-- `kv-native-sys`: local persistence substrate used by the KV-tier disk/shared
-  transport path
-- `mlx-sys`: MLX C++ bridge used by the Metal backend
-- `qwen3-spec` / `qwen35-spec`: shared train↔infer model-contract crates for
-  canonical Qwen config fields and tensor names
-
-Integrated train/runtime extension (see
-[projects/agent-rl-self-evolving.md](projects/agent-rl-self-evolving.md)):
-- `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend` trait, with the current local Metal path already using the device-resident / lazy-eval tranche for the active training-critical ops
-- `train`: generic Qwen-family pretrain/SFT/GRPO stack with Qwen3.5-optimized defaults, exact-resume checkpoint dirs, a train-side `/v1/train/status|events|stop|save` control plane, and shared async observability (JSONL + MLflow + OTLP + optional W&B sidecar). `train_multi_turn` supports stepwise-GRPO vs sequence-level-GSPO objectives, `train_sft` / `train_grpo` dispatch across Qwen3 / Qwen3.5 families, and the shared Qwen3.5 model path is now accepted locally on CPU + Metal across dense and hybrid scratch-pretrain / RL / LoRA-eval surfaces. CUDA hybrid runtime acceptance is still pending; the compile surface is checked. Depends on `autograd`
-
-Current reality note: the train-side implementation already includes the
-dense/full-attn Qwen3.5-family path and a generic family-dispatch control
-plane. `train_multi_turn` runs on the Qwen3.5 path today and exposes a
-stepwise-GRPO vs sequence-level-GSPO objective switch, `train_sft` and
-`train_grpo` can dispatch across Qwen3 / Qwen3.5 families, checkpoints are
-written as HF-style directories, the handwritten Transformer/TinyLM runtime
-compatibility path has been deleted, and the shared Qwen3.5 model path now
-supports hybrid linear-attn layers across scratch pretrain, LoRA/frozen-eval,
-and RL on the locally accepted CPU + Metal path. The shared config/tensor-name
-truth now lives in the dedicated `qwen*-spec` crates, `pretrain` is the
-sole canonical scratch-pretrain entrypoint, and `infer` can optionally proxy
-the train-side `/v1/train/*` control plane when `--train-control-url` is set.
-
-The 2026-04-15 Route-A refactor folded `infer-core`, `infer-observability`,
-`infer-policy`, and `infer-engine` back into `infer` because the split never
-achieved real independence.
-
-## Runtime Paths
-
-### Agent CLI
-
-```text
-arle (root binary from the workspace root package)
-  -> cli::run()
-  -> infer::hf_hub::resolve_model_source() / infer::server_engine::LoadedInferenceEngine::load()
-  -> agent::AgentSession (uses `dyn InferenceEngine`)
-  -> tools builtin tools
-  -> chat prompt/tool-call protocol
-  -> infer::server_engine::LoadedInferenceEngine
-     - CUDA: Qwen3InferenceEngine / Qwen35InferenceEngine
-     - Metal: BackendInferenceEngine<MetalBackend>
-     - CPU:   BackendInferenceEngine<CpuBackend>
-```
-
-### OpenAI-Compatible Serving
-
-```text
-infer binary / metal_serve / cpu_serve
-  -> axum handlers
-  -> request parsing + sampling params
-  -> scheduler or backend::runtime
-  -> model forward path
-  -> backend-specific kernels/runtime
-```
+Project framing (also in [index.md](index.md) §Current Positioning):
+`infer` owns serving/runtime truth, `arle` is the local front door built on
+top of it, and the train stack extends the same runtime/model authority
+rather than defining a second equal architecture.
 
 ## Package Boundaries
 
 | Crate | Owns | Does not own |
 | --- | --- | --- |
-| workspace root package | Binary entrypoint only | REPL logic, backend loading |
+| workspace root package | `arle` binary entrypoint only | REPL logic, backend loading |
 | `cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
 | `agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
-| `chat` | Shared protocol formatting/parsing | Runtime scheduling and backend logic |
+| `chat` | Shared protocol formatting/parsing, OpenAI chat surface types | Runtime scheduling and backend logic |
 | `infer` | Scheduler, HTTP server, backend runtime, model/kernel integration, `server_engine::InferenceEngine` contract | Terminal UX and agent-session orchestration |
+| `cuda-kernels` | CUDA kernel layer (`csrc/`, Triton AOT, Rust FFI, paged-KV / FlashInfer / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
+| `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
+| `kv-native-sys` | Local persistence substrate (file/block ABI, mmap, WAL, shm descriptors) for the KV-tier disk/shared transport path | Tier policy, scheduler, GPU code |
+| `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names | Implementation code |
+| `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
+| `train` | Generic Qwen-family pretrain/SFT/GRPO stack, train-side `/v1/train/*` control plane, shared async observability | GPU kernels, scheduler |
+
+## Dependency Direction
+
+```text
+workspace root package
+  -> cli
+     -> infer
+     -> agent
+     -> chat
+     -> tools
+
+agent
+  -> infer
+  -> chat
+
+infer
+  -> chat
+  -> cuda-kernels  (one-way; never the reverse)
+  -> mlx-sys (feature = "metal")
+```
+
+Reverse dependencies from `runtime-*` (or any `infer`-internal layer) into
+`http`/`cli` are rejected on sight.
 
 ## Backend Split
 
 - `cuda`: full scheduler path with chunked prefill, decode-priority batching,
-  paged KV, FlashInfer/Triton/CUDA kernels
-- `metal`: serial backend path for Apple Silicon via `mlx-sys`
+  paged KV, FlashInfer/Triton/CUDA kernels.
+- `metal`: serial backend path for Apple Silicon via `mlx-sys`.
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
-  end-to-end validation on non-GPU machines
+  end-to-end validation on non-GPU machines.
 
-## Current Notes
+## Route-A Note (Historical)
 
-- The old agent-facing adapter (`infer::agent_engine::AgentEngine` / `LoadedAgentEngine`)
-  was deleted entirely. Its responsibilities are now satisfied by
-  `infer::server_engine::InferenceEngine` and `LoadedInferenceEngine`, which
-  serve both the HTTP server and the agent CLI through a single unified
-  contract. `resolve_model_source` moved into `infer::hf_hub`.
-- Shared runtime contracts for request/session ids, scheduler policies, and
-  event sinks now live inside `infer` as `types.rs`, `scheduler/policy.rs`, and
-  `events.rs`.
-- Architecture details for CUDA kernels, paged KV, and scheduler internals
-  still live in the `infer` crate; this document tracks package ownership, not
-  every implementation detail.
+The 2026-04-15 Route-A refactor folded the experimental `infer-core`,
+`infer-observability`, `infer-policy`, and `infer-engine` crates back into
+`infer` because the split never achieved real independence. A follow-up the
+same day deleted `infer/src/agent_engine.rs` after confirming every `Agent*`
+type duplicated a corresponding `Completion*` / `InferenceEngine` type in
+`server_engine.rs`.
 
-## Kernel-Crate Extraction (post-2026-04-15)
+The old agent-facing adapter (`AgentEngine` / `LoadedAgentEngine`) is gone;
+`server_engine::InferenceEngine` and `LoadedInferenceEngine` now serve both
+the HTTP server and the agent CLI through one contract. `resolve_model_source`
+moved into `infer::hf_hub`. Shared runtime contracts (request/session ids,
+scheduler policies, event sinks) live inside `infer` as `types.rs`,
+`scheduler/policy.rs`, and `events.rs`.
 
-The workspace originally had two decision points: whether to split the CUDA
-kernel layer out of `infer` (option B), and, if so, what the minimal safe
-surface looked like. The discussion happened between Claude and Codex on
-2026-04-15 and the trip wires were locked in before execution so the work
-could land as mechanical refactor, not re-debate.
+## Crate-Split Governance
 
-The extraction **landed in commit `a4e12f5 refactor(cuda): extract
-cuda-kernels api`**, followed by `f81e2d5 style(workspace): run
-cargo fmt after kernel-crate extraction`. From that point on, the
-"option A vs option B" framing is historical; the current tree is
-option B.
-
-### Current layout (what the extraction moved)
-
-```
-crates/cuda-kernels/
-├── Cargo.toml
-├── build.rs                 ← nvcc + Triton AOT, lifted from infer/build.rs
-├── csrc/
-│   ├── attention/           ← flashinfer_*, fused_attention, prefill_attention, decode_prep_paged, …
-│   ├── gemm/                ← gemv, quantized_gemv, marlin_*, turboquant_weight_gemv
-│   ├── kv/                  ← paged_kv_append, kv_cache_to_paged, kv_quant, scatter_kv
-│   ├── quant/               ← turboquant, turboquant_fast, dtype_convert
-│   ├── misc/                ← norm, sampling, pos_enc, conv1d, gdr, fused_mlp, …
-│   └── common.cuh
-├── tools/triton/            ← flash_attention_prefill_hd256, gated_delta_rule_chunkwise, silu_mul, basic, …
-└── src/
-    ├── lib.rs
-    ├── ffi.rs + ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,recurrent,misc}.rs
-    ├── tensor.rs            ← DeviceContext / DeviceVec / DeviceMatrix / HiddenStates / RawDevicePtr
-    ├── paged_kv.rs          ← PagedKVPool / TokenKVPool
-    ├── flashinfer.rs        ← FlashInferDecodeMetadata / workspace
-    ├── graph_pool.rs
-    ├── kv_quant.rs / kv_turboquant.rs / kv_types.rs / turboquant_state.rs
-    └── prelude.rs           ← public API surface (the proto-API graduated)
-```
-
-```
-infer/
-└── src/backend/
-    ├── cuda.rs              ← thin `pub use infer_cuda_kernels::*;` re-export
-    │                           shim; ~60 `crate::backend::cuda::…` call sites
-    │                           keep resolving unchanged.
-    └── cuda/
-        └── bootstrap.rs     ← STAYS in infer; reaches into crate::model::*,
-                                crate::scheduler::*, crate::tokenizer::Tokenizer,
-                                crate::model_registry::*.
-```
-
-The dependency edge is **`infer → cuda-kernels`, never the reverse**.
-`bootstrap.rs` is the only file where kernel concerns and model/scheduler
-concerns meet; keeping it in `infer` is what let the kernel crate ship
-without forcing `Tokenizer`, `KVCacheDtype`, `ModelType`, or per-model
-weight structs to become cross-crate `pub`.
-
-### Why the earlier internal hygiene work still matters
-
-Three pre-extraction moves landed in commits `26c8f39` and `efcc991` and
-are what made the single-day extraction actually mechanical:
-
-1. `infer/src/backend/cuda/ffi.rs` was split into 10 domain submodules
-   (`ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,
-   recurrent,misc}.rs`). They carried over intact to
-   `crates/cuda-kernels/src/ffi/`.
-2. `prelude.rs` was the **proto-API contract** — seven cross-cutting types
-   that 25+ files imported through, gated by a "≥3 consumers + stable +
-   would not force any `infer` type to become cross-crate `pub`" rule.
-   At extraction time those `pub(crate)` items became real cross-crate
-   `pub` with no new symbols added.
-3. Triton `cargo:rerun-if-changed` is derived from a `read_dir(tools/triton)`
-   walk so the build script can never drift from the actual kernel set.
-
-### Further extraction (still future)
-
-The kernel-crate extraction was deliberately narrow. The items below remain
-anti-goals **unless** a concrete second consumer forces them.
-
-- **No `infer-ops` crate.** Ops are tightly coupled to model data layouts.
-- **No `infer-scheduler-core` crate.** The CUDA scheduler reaches into
-  `PagedKVPool`, `FlashInferDecodeMetadata`, and model-specific types in
-  `bootstrap`.
-- **No `infer-runtime-api` trait crate.** Already covered by
-  `infer::server_engine::InferenceEngine`.
-- **No `*-sys` / Rust-types split for the kernel crate.** One crate holds
-  both layers; splitting them creates a `*-sys` boundary with one consumer.
-
-The original trip wires (T1 NCCL, T2 FA-3, T3 MLA/FP8 GEMM, T4 spec
-decoding, T5 second external consumer) are arguments for the **next**
-extraction boundary — whichever one, if any, eventually peels scheduler
-or model layers out. They are not arguments about the kernel crate.
-
-### Additional anti-goal (CPU backend)
-
-- **No CPU backend extraction.** `infer/src/backend/cpu.rs` is a 309-line
-  smoke-test backend that generates synthetic responses; extracting it
-  would create a one-consumer crate with zero independence benefit.
-
-### Workspace governance rules (any future crate split)
-
-These rules govern when a new crate may be cut, and when one must not:
+These rules govern when a new crate may be cut, and when one must not.
 
 1. New module → prefer placing it in an existing crate; cut a new crate only
    when the existing one cannot contain it without leaking concerns.
@@ -232,7 +92,26 @@ These rules govern when a new crate may be cut, and when one must not:
    kernel + scheduler + workspace semantics in their head at once, the
    split has already failed.
 
-### Cross-references
+### Active anti-goals
 
-- `docs/plans/cuda-kernel-crate-extraction.md` — full execution blueprint.
-- `crates/cuda-kernels/src/prelude.rs` — the proto-API contract (graduated from `infer/src/backend/cuda/prelude.rs` at extraction time).
+The kernel-crate extraction (`a4e12f5`, 2026-04-15) was deliberately narrow.
+The items below remain anti-goals **unless** a concrete second consumer
+forces them.
+
+- **No `infer-ops` crate.** Ops are tightly coupled to model data layouts.
+- **No `infer-scheduler-core` crate.** The CUDA scheduler reaches into
+  `PagedKVPool`, `FlashInferDecodeMetadata`, and model-specific types in
+  `bootstrap`.
+- **No `infer-runtime-api` trait crate.** Already covered by
+  `infer::server_engine::InferenceEngine`.
+- **No `*-sys` / Rust-types split for the kernel crate.** One crate holds
+  both layers; splitting them creates a `*-sys` boundary with one consumer.
+- **No CPU backend extraction.** `infer/src/backend/cpu.rs` is a 309-line
+  smoke-test backend that generates synthetic responses; extracting it
+  would create a one-consumer crate with zero independence benefit.
+
+The original kernel-crate trip wires (T1 NCCL, T2 FA-3, T3 MLA/FP8 GEMM,
+T4 spec decoding, T5 second external consumer) are arguments for the
+**next** extraction boundary — whichever one, if any, eventually peels
+scheduler or model layers out. They are not arguments about the kernel
+crate itself.

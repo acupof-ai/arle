@@ -1,10 +1,13 @@
-# Stability Policy
+# Stability and Compatibility Policy
 
-This document defines the stability levels used by `ARLE` and how they
-affect compatibility, review, and release decisions.
+This document is the single source of truth for `ARLE` stability levels,
+compatibility-sensitive surfaces, breaking-change rules, and the deprecation
+process.
 
-The purpose is simple: users and contributors should know what they can depend
-on, and maintainers should know what must be treated carefully.
+The rule is simple: if users can reasonably build around a documented surface,
+maintainers must treat it carefully. Users and contributors should know what
+they can depend on, and maintainers should know what must be reviewed
+carefully.
 
 ---
 
@@ -16,8 +19,6 @@ on, and maintainers should know what must be treated carefully.
 
 For documented, intended-for-use surfaces.
 
-Rules:
-
 - avoid breaking changes
 - document user-visible behavior changes
 - provide migration guidance when users must act
@@ -25,8 +26,6 @@ Rules:
 ### Beta
 
 For documented and usable surfaces that are still evolving.
-
-Rules:
 
 - keep behavior reasonably consistent
 - document meaningful user-visible changes
@@ -36,8 +35,6 @@ Rules:
 
 For early-stage or fast-moving surfaces.
 
-Rules:
-
 - may change faster
 - must still be explicit about limitations
 - should not be presented as long-term stable contracts
@@ -46,8 +43,6 @@ Rules:
 
 For implementation details.
 
-Rules:
-
 - may be refactored freely
 - must not be treated as public extension points unless promoted explicitly
 
@@ -55,7 +50,9 @@ Rules:
 
 ## 2. Current Classification
 
-This reflects repository state as of 2026-04-21.
+This reflects repository state as of 2026-04-21. Per-surface support status
+lives in [support-matrix.md](support-matrix.md); this section names which
+surfaces fall under each tier.
 
 ### Stable
 
@@ -96,7 +93,20 @@ This reflects repository state as of 2026-04-21.
 
 ---
 
-## 3. What Counts as Breaking
+## 3. Compatibility-Sensitive Surfaces
+
+The following are compatibility-sensitive when documented:
+
+- HTTP APIs
+- CLI commands and flags
+- environment variables (see [environment.md](environment.md) for the
+  reference list)
+- session or output formats
+- operational workflows documented in `README.md` or `CONTRIBUTING.md`
+
+Undocumented internal modules are not covered by this policy.
+
+### What Counts as Breaking
 
 For stable surfaces, these count as breaking changes:
 
@@ -114,37 +124,70 @@ These usually do not count as breaking:
 
 When in doubt, treat the change as breaking and document it.
 
----
+### Environment Variable Rule
 
-## 4. Review Expectations by Level
+Environment variables are part of the external surface once documented.
 
-### Stable
-
-Require:
-
-- tests or targeted verification
-- docs update if behavior changed
-- changelog coverage when user-visible
-- migration note when needed
-
-### Beta
-
-Require:
-
-- explicit verification path
-- docs update when behavior changes materially
-
-### Experimental
-
-Require:
-
-- clear scope
-- minimal validation
-- explicit limitation framing
+- documented variables are compatibility-sensitive
+- undocumented variables are not guaranteed stable
+- naming should converge toward one primary prefix over time
+- legacy variables may remain temporarily, but should be called out clearly
 
 ---
 
-## 5. Promotion Rule
+## 4. Before Breaking Something
+
+Before changing a documented surface, answer:
+
+1. Is this breaking?
+2. Who is affected?
+3. Why is the change necessary?
+4. What is the migration path?
+5. What docs and tests must change?
+
+If those answers are unclear, the change is not ready.
+
+---
+
+## 5. Deprecation Process
+
+When practical, use this order:
+
+1. document the replacement
+2. mark the old surface deprecated
+3. keep compatibility for at least one release cycle
+4. remove the old surface with migration notes
+
+If fast removal is required for correctness or security, say so explicitly in
+the changelog or release notes.
+
+---
+
+## 6. Review Expectations by Level
+
+| Level | Required for review |
+| --- | --- |
+| Stable | Tests or targeted verification; docs update on behavior change; changelog coverage when user-visible; migration note when needed. |
+| Beta | Explicit verification path; docs update when behavior changes materially. |
+| Experimental | Clear scope, minimal validation, explicit limitation framing. |
+
+---
+
+## 7. Changelog Rule
+
+If a change affects compatibility, the changelog must say so.
+
+At minimum, record:
+
+- breaking changes
+- deprecated surfaces
+- removed surfaces
+- migration notes when users must act
+- support changes when they affect user expectations
+
+---
+
+## 8. Promotion Rule
 
 A surface should move toward stable only when it has all of the following:
 
@@ -156,9 +199,11 @@ A surface should move toward stable only when it has all of the following:
 
 ---
 
-## 6. Maintainer Rule of Thumb
+## 9. Maintainer Rule of Thumb
 
-If users are likely to depend on a behavior, classify it explicitly.
+If users are likely to depend on a behavior, classify it explicitly. If a user
+could reasonably learn a behavior from the docs and rely on it, treat that
+behavior as compatibility-sensitive.
 
 If the project is not ready to support that behavior long-term, mark it beta or
 experimental instead of letting it become an accidental stable contract.
@@ -166,5 +211,5 @@ experimental instead of letting it become an accidental stable contract.
 Related docs:
 
 - [support-matrix.md](support-matrix.md)
-- [compatibility.md](compatibility.md)
+- [environment.md](environment.md)
 - [perf-and-correctness-gates.md](perf-and-correctness-gates.md)
