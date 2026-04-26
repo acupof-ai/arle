@@ -360,6 +360,7 @@ unsafe extern "C" {
 
     pub fn qwen35_compiled_new() -> *mut std::ffi::c_void;
     pub fn qwen35_compiled_free(model: *mut std::ffi::c_void);
+    pub fn qwen35_compiled_set_gdr_metal_kernel_enabled(model: *mut std::ffi::c_void, enabled: i32);
     pub fn qwen35_compiled_add_dense_weight(model: *mut std::ffi::c_void, w: *mut mlx_array)
     -> i32;
     pub fn qwen35_compiled_add_affine_weight(
@@ -387,6 +388,9 @@ unsafe extern "C" {
         rotary_dim: i32,
         hidden_size: i32,
     );
+    /// Declare whether Q has the gated half (Qwen3.5 = 1, Qwen3 = 0).
+    /// Must be called before `qwen35_compiled_finalize`.
+    pub fn qwen35_compiled_set_qk_gate(model: *mut std::ffi::c_void, enabled: i32);
     pub fn qwen35_compiled_set_embed(
         model: *mut std::ffi::c_void,
         embed_tokens: *mut mlx_array,

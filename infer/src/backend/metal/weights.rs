@@ -625,6 +625,8 @@ fn build_qwen3_cpp_model(
             config.head_dim as i32, // rotary_dim = head_dim for Qwen3
             config.hidden_size as i32,
         );
+        // Qwen3 has no QK gate (q_dim = nh*hd).
+        mlx_sys::qwen35_compiled_set_qk_gate(model, 0);
     }
 
     // Embed + norm + lm_head

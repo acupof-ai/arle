@@ -610,10 +610,15 @@ impl CppQwen35Model {
         weights: &Qwen35MetalWeights,
         config: &MetalModelConfig,
         arch: &MetalQwen35ArchConfig,
+        disable_gdr_metal_kernel: bool,
     ) -> Option<Self> {
         let model = unsafe { mlx_sys::qwen35_compiled_new() };
         if model.is_null() {
             return None;
+        }
+
+        if disable_gdr_metal_kernel {
+            unsafe { mlx_sys::qwen35_compiled_set_gdr_metal_kernel_enabled(model, 0) };
         }
 
         let add_weight = |weight: &WeightTensor| -> Option<i32> {
@@ -686,6 +691,10 @@ impl CppQwen35Model {
                 arch.rotary_dim as i32,
                 config.hidden_size as i32,
             );
+            // Qwen3.5 always gates Q (q_dim = nh*hd*2). Declare this explicitly
+            // so dense-only checkpoints (no GDR layers) still take the gated
+            // reshape path in the C++ apply_layer.
+            mlx_sys::qwen35_compiled_set_qk_gate(model, 1);
         }
 
         let lm_head_id = add_or_free!(&weights.lm_head);
@@ -843,8 +852,13 @@ impl CppQwen35Model {
         }
 
         log::info!(
-            "  C++ forward model ready (all {} layers wired through one step call)",
-            weights.layers.len()
+            "  C++ forward model ready (all {} layers wired through one step call; gdr_kernel={})",
+            weights.layers.len(),
+            if disable_gdr_metal_kernel {
+                "ops-fallback"
+            } else {
+                "metal"
+            }
         );
         Some(Self(model))
     }
@@ -2654,7 +2668,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
         });
     }
 
-    let weights = Qwen35MetalWeights {
+    let mut weights = Qwen35MetalWeights {
         embedding,
         layers,
         norm,
@@ -2663,9 +2677,9 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
         cpp_model: None,
     };
 
-    // The C++ Qwen3.5 step path uses the custom GDR recurrent kernel, which
-    // is not yet correct for packed GGUF stateful decode. Keep GGUF on the
-    // Rust/MLX path; linear and embedding ops still consume packed weights.
+    if std::env::var("METAL_NO_CPP").is_err() {
+        weights.cpp_model = CppQwen35Model::build(&weights, config, arch, true);
+    }
 
     Ok(weights)
 }
@@ -2805,7 +2819,7 @@ pub(super) fn load_qwen35_metal_weights(
 
     // Try to build the optional C++ step model.
     if std::env::var("METAL_NO_CPP").is_err() {
-        weights.cpp_model = CppQwen35Model::build(&weights, config, arch);
+        weights.cpp_model = CppQwen35Model::build(&weights, config, arch, false);
     }
 
     Ok(weights)
@@ -4307,6 +4321,86 @@ mod tests {
                 (sequence.len() - 1) as i32,
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5-0.8B safetensors config plus Q4_K_M GGUF weights"]
+    fn compare_qwen35_0p8b_gguf_cpp_generate_vs_rust_replay() -> Result<()> {
+        let Some(model_path) = qwen35_safetensors_model_path() else {
+            eprintln!("QWEN35_MODEL_PATH unset and ../models/Qwen3.5-0.8B missing; skipping");
+            return Ok(());
+        };
+        let Some(gguf_path) = qwen35_gguf_model_path() else {
+            eprintln!(
+                "QWEN35_GGUF_PATH unset and ../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf missing; skipping"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let tokenizer = Tokenizer::from_file(model_path.to_str().context("invalid model path")?)?;
+        let gguf = GgufFile::open(gguf_path.to_str().context("invalid GGUF path")?)?;
+        let weights = load_qwen35_metal_weights_from_gguf(&gguf, &config)?;
+        anyhow::ensure!(
+            weights.cpp_model.is_some(),
+            "GGUF Qwen3.5 should build the C++ model unless METAL_NO_CPP is set"
+        );
+
+        let prompt_ids = tokenizer.encode("Hello world from the GGUF C++ path.")?;
+        anyhow::ensure!(
+            prompt_ids.len() > 1,
+            "expected a multi-token prompt to exercise C++ GDR fallback prefill"
+        );
+
+        let max_new_tokens = 4;
+        let mut replay_sequence = prompt_ids.clone();
+        let mut expected = Vec::with_capacity(max_new_tokens);
+        for step_idx in 0..max_new_tokens {
+            let replay_logits = qwen35_replay_logits(&replay_sequence, &weights, &config, arch)?;
+            let token = greedy_token_id(&replay_logits);
+            eprintln!(
+                "replay step {step_idx}: id={token} text={:?}",
+                tokenizer.decode(&[token])?,
+            );
+            expected.push(token);
+            replay_sequence.push(token);
+        }
+
+        let mut streamed = Vec::new();
+        let generated = metal_generate_qwen35(
+            &prompt_ids,
+            &weights,
+            &config,
+            None,
+            &SamplingParams {
+                temperature: 0.0,
+                ignore_eos: true,
+                ..Default::default()
+            },
+            max_new_tokens,
+            Instant::now(),
+            &mut |token| {
+                streamed.push(token);
+                Ok(())
+            },
+        )?;
+
+        anyhow::ensure!(
+            generated.tokens == expected,
+            "GGUF C++ generate diverged from Rust replay: generated={:?} expected={:?}",
+            generated.tokens,
+            expected
+        );
+        anyhow::ensure!(
+            streamed == expected,
+            "GGUF C++ callback tokens diverged from Rust replay: streamed={streamed:?} expected={expected:?}"
+        );
 
         Ok(())
     }
