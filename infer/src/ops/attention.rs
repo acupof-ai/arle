@@ -650,10 +650,31 @@ pub(crate) fn prefill_attention_paged_batch(
 
     #[cfg(feature = "tilelang-attn")]
     {
-        let _ = plan; // plan was set up but TileLang skips plan_info entirely.
+        let _ = plan; // TileLang reads paged KV directly; FlashInfer plan_info unused.
+        // HD128 + page_size=16 are already enforced by the function-level
+        // invariants above. (num_q_heads, num_kv_heads) picks the matching
+        // AOT-specialized kernel; unsupported configs fail loudly with a
+        // pointer to where to add the new specialization.
+        let kernel = match (num_q_heads, num_kv_heads) {
+            (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
+            (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
+            (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
+            (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
+            other => {
+                return Err(anyhow!(
+                    "tilelang-attn: no specialized prefill HD128 kernel for \
+                     (num_q_heads, num_kv_heads) = {other:?}; supported configs \
+                     are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
+                     in tools/tilelang/batch_prefill_paged_hd128.py, \
+                     TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
+                     and the FFI macro + this match in lockstep, then rebuild."
+                ));
+            }
+        };
+        let max_qlen = meta.sequences.iter().map(|s| s.seq_len).max().unwrap_or(0) as i32;
         let sm_scale = 1.0_f32 / (head_dim as f32).sqrt();
         unsafe {
-            ffi::tilelang_batch_prefill_paged_hd128_run_cuda(
+            kernel(
                 q_u64 as *mut ffi::Half,
                 qoi_u64 as *const i32,
                 kp_u64 as *mut ffi::Half,
@@ -664,6 +685,7 @@ pub(crate) fn prefill_attention_paged_batch(
                 o_u64 as *mut ffi::Half,
                 fwd.batch_size as i32,
                 fwd.total_qo_rows as i32,
+                max_qlen,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 page_size as i32,

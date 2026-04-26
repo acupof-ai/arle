@@ -583,11 +583,21 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     println!("cargo:rerun-if-env-changed=INFER_TRITON_PYTHON");
 }
 
+/// One AOT-specialized prefill HD128 kernel per (num_q_heads, num_kv_heads).
+/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_prefill_paged_hd128.py`
+/// — when adding a new Qwen3 head config, extend both lists in lockstep
+/// AND add the matching FFI extern + dispatch arm in
+/// `crates/cuda-kernels/src/ffi/attention.rs` and
+/// `infer/src/ops/attention.rs`.
+const TILELANG_PREFILL_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (40, 8), (64, 8)];
+
 struct TileLangKernelSpec {
-    artifact_dir: &'static str,
+    artifact_dir: String,
     kernel_path: &'static str,
-    kernel_name: &'static str,
-    out_name: &'static str,
+    kernel_name: String,
+    out_name: String,
+    num_q_heads: u32,
+    num_kv_heads: u32,
 }
 
 fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
@@ -669,20 +679,24 @@ fn generate_tilelang_artifacts(
     spec: &TileLangKernelSpec,
 ) -> (String, PathBuf) {
     let generator_path = PathBuf::from("tools/tilelang/gen_tilelang_aot.py");
-    let artifact_dir = out_dir.join("tilelang_aot").join(spec.artifact_dir);
+    let artifact_dir = out_dir.join("tilelang_aot").join(&spec.artifact_dir);
 
     let output = Command::new(python)
         .arg(&generator_path)
         .arg("--kernel-path")
         .arg(spec.kernel_path)
         .arg("--kernel-name")
-        .arg(spec.kernel_name)
+        .arg(&spec.kernel_name)
         .arg("--out-name")
-        .arg(spec.out_name)
+        .arg(&spec.out_name)
         .arg("--out-dir")
         .arg(&artifact_dir)
         .arg("--target")
         .arg(target)
+        .arg("--num-q-heads")
+        .arg(spec.num_q_heads.to_string())
+        .arg("--num-kv-heads")
+        .arg(spec.num_kv_heads.to_string())
         .output()
         .unwrap_or_else(|err| {
             panic!(
@@ -720,15 +734,19 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
     let target = tilelang_target(sm_targets);
     let mut generated_sources = Vec::new();
 
-    let prefill_hd128_spec = TileLangKernelSpec {
-        artifact_dir: "batch_prefill_paged_hd128",
-        kernel_path: "tools/tilelang/batch_prefill_paged_hd128.py",
-        kernel_name: "tilelang_batch_prefill_paged_hd128_run",
-        out_name: "tilelang_batch_prefill_paged_hd128",
-    };
-    let (_func, c_path) =
-        generate_tilelang_artifacts(&python, out_dir, &target, &prefill_hd128_spec);
-    generated_sources.push(c_path);
+    for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_prefill_paged_hd128_{suffix}"),
+            kernel_path: "tools/tilelang/batch_prefill_paged_hd128.py",
+            kernel_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
+            out_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
+            num_q_heads: q,
+            num_kv_heads: kv,
+        };
+        let (_func, c_path) = generate_tilelang_artifacts(&python, out_dir, &target, &spec);
+        generated_sources.push(c_path);
+    }
 
     let mut build = cc::Build::new();
     build

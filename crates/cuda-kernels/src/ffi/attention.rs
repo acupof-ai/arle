@@ -529,24 +529,45 @@ unsafe extern "C" {
     ) -> CUresult;
 }
 
+// One AOT-specialized symbol per (num_q_heads, num_kv_heads). The matching
+// Rust dispatch table lives in `infer/src/ops/attention.rs`. Adding a new
+// Qwen3 head config requires extending all three:
+//   - SUPPORTED_HEADS in tools/tilelang/batch_prefill_paged_hd128.py
+//   - TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs
+//   - the macro invocation below + the dispatch arm in attention.rs
 #[cfg(feature = "tilelang-attn")]
-#[allow(dead_code)]
-unsafe extern "C" {
-    pub fn tilelang_batch_prefill_paged_hd128_run_cuda(
-        q: *mut Half,
-        q_indptr: *const i32,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-        kv_indptr: *const i32,
-        kv_indices: *const i32,
-        kv_last_page_len: *const i32,
-        o: *mut Half,
-        batch_size: i32,
-        total_q_tokens: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> CUresult;
+macro_rules! tilelang_prefill_hd128_decl {
+    ($($name:ident),+ $(,)?) => {
+        unsafe extern "C" {
+            $(
+                #[allow(dead_code)]
+                pub fn $name(
+                    q: *mut Half,
+                    q_indptr: *const i32,
+                    k_pool: *mut Half,
+                    v_pool: *mut Half,
+                    kv_indptr: *const i32,
+                    kv_indices: *const i32,
+                    kv_last_page_len: *const i32,
+                    o: *mut Half,
+                    batch_size: i32,
+                    total_q_tokens: i32,
+                    max_qlen: i32,
+                    num_q_heads: i32,
+                    num_kv_heads: i32,
+                    page_size: i32,
+                    sm_scale: f32,
+                    stream: CUstream,
+                ) -> CUresult;
+            )+
+        }
+    };
 }
+
+#[cfg(feature = "tilelang-attn")]
+tilelang_prefill_hd128_decl!(
+    tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
+    tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
+    tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
+    tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
+);

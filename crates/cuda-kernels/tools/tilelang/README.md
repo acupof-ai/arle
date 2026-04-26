@@ -6,10 +6,15 @@ Build-time AOT for the prefill HD128 paged attention kernel, gated behind
 
 ## What this covers
 
-- One TileLang kernel: `batch_prefill_paged_hd128.py` (BF16, causal, page_size=16).
+- TileLang kernel: `batch_prefill_paged_hd128.py` (BF16, causal, page_size=16).
+- AOT-specialized per Qwen3 head config in `SUPPORTED_HEADS`. Today:
+  `(16,8)` 0.6B/1.7B, `(32,8)` 4B/8B, `(40,8)` 14B, `(64,8)` 32B.
+  Build emits one cubin + C wrapper per config; Rust dispatches by
+  `(num_q_heads, num_kv_heads)`. Add a new size by extending three
+  in-lockstep lists (see comments in `build.rs` and `ffi/attention.rs`).
 - Build-time CUBIN generation under `OUT_DIR/tilelang_aot/<artifact>/`.
-- Generated C wrapper compiled into `libtilelang_kernels_aot.a` and linked
-  alongside the Triton AOT artifacts.
+- Generated C wrappers compiled into `libtilelang_kernels_aot.a` and
+  linked alongside the Triton AOT artifacts.
 - Compile-time dispatch: `--features tilelang-attn` swaps the FlashInfer
   `_run` call for the TileLang one. Default builds are unchanged.
 
@@ -47,11 +52,23 @@ export INFER_CUDA_SM=90
 
 ## Build
 
+The `tilelang-attn` feature is declared on `infer` and `cuda-kernels`, not on
+the workspace root binary. Build the runtime crate directly:
+
 ```bash
-cargo build --release --features cuda,tilelang-attn
+cargo build --release -p infer --features cuda,tilelang-attn
 ```
 
+For binaries that must be built through the workspace root (`arle`, `cli`)
+the feature has to be forwarded there first; that is intentionally deferred
+until Phase 1 because Phase 0 is evaluated by running the `infer` server
+binary plus `scripts/bench_guidellm.sh`.
+
 Artifacts land under `target/release/build/cuda-kernels-*/out/tilelang_aot/`.
+The generated C wrapper embeds the cubin bytes via `cuModuleLoadData`, so
+the produced binary is self-contained and survives `cargo clean` /
+relocation. Compare against the Triton AOT track which links the cubin
+through Triton's own runtime.
 
 ## Phase 0 status
 
