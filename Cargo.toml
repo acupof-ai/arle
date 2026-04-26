@@ -18,6 +18,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+publish = false
 
 # Workspace-wide lint posture. Only universally-agreed lints live here; crates
 # that want stricter pedantic enforcement (currently only `infer`) opt in via
@@ -55,6 +57,8 @@ tokenizers = "0.22"
 name = "agent-infer"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+publish = false
 
 [features]
 # Enable CUDA (mirrors infer's cuda feature). Default on, like infer.

@@ -2,6 +2,8 @@
 name = "mlx-sys"
 version = "0.3.0"
 edition = "2024"
+license = "MIT"
+publish = false
 
 [build-dependencies]
 cmake = "0.1"
