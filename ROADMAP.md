@@ -68,16 +68,16 @@ This roadmap revision is only useful if all of the following hold:
 ## Historical Note
 
 The old phase-by-phase long-form roadmap was removed from this file because it
-had become a stale second source of truth.
+had become a stale second source of truth. The 2026-04-25 truth-surface cleanup
+also retired the inactive `docs/plans/`, `docs/projects/`, `docs/research/`,
+`docs/reviews/`, `docs/archives/`, and `docs/areas/` entries that no longer
+described current reality.
 
-History still lives in:
+Engineering history now lives in:
 
-- `docs/experience/wins/`
-- `docs/experience/errors/`
-- `docs/projects/`
-- `docs/plans/`
-- `docs/archives/`
+- `docs/experience/wins/` and `docs/experience/errors/` (curated evidence log)
+- `CHANGELOG.md`
+- `git log`
 
-Use [`docs/index.md`](docs/index.md) to find the current documents. Treat plans
-or project notes not called out there as historical context unless they
-explicitly mark themselves as the current source of truth for their topic.
+Use [`docs/index.md`](docs/index.md) to find current documents. Anything not
+listed there is not a source of truth.

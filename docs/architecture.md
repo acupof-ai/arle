@@ -193,9 +193,7 @@ are what made the single-day extraction actually mechanical:
 ### Further extraction (still future)
 
 The kernel-crate extraction was deliberately narrow. The items below remain
-anti-goals **unless** a concrete second consumer forces them — the bar
-documented in `docs/archives/art-grade-architecture-for-long-agent-infer.md`
-§六 / §七 applies:
+anti-goals **unless** a concrete second consumer forces them.
 
 - **No `infer-ops` crate.** Ops are tightly coupled to model data layouts.
 - **No `infer-scheduler-core` crate.** The CUDA scheduler reaches into
@@ -207,9 +205,9 @@ documented in `docs/archives/art-grade-architecture-for-long-agent-infer.md`
   both layers; splitting them creates a `*-sys` boundary with one consumer.
 
 The original trip wires (T1 NCCL, T2 FA-3, T3 MLA/FP8 GEMM, T4 spec
-decoding, T5 second external consumer) are now arguments for the **next**
+decoding, T5 second external consumer) are arguments for the **next**
 extraction boundary — whichever one, if any, eventually peels scheduler
-or model layers out. They are no longer arguments about the kernel crate.
+or model layers out. They are not arguments about the kernel crate.
 
 ### Additional anti-goal (CPU backend)
 
@@ -217,13 +215,24 @@ or model layers out. They are no longer arguments about the kernel crate.
   smoke-test backend that generates synthetic responses; extracting it
   would create a one-consumer crate with zero independence benefit.
 
+### Workspace governance rules (any future crate split)
+
+These rules govern when a new crate may be cut, and when one must not:
+
+1. New module → prefer placing it in an existing crate; cut a new crate only
+   when the existing one cannot contain it without leaking concerns.
+2. Cross-crate calls go through public traits; never import private
+   implementation modules across the boundary.
+3. Every new crate must name **at least two direct consumers** in its PR
+   description. If you cannot, the split is premature.
+4. Every PR states its "affected layer" and "does this break a dependency
+   direction" up front; reverse dependencies from `runtime-*` into
+   `http/cli` are rejected on sight.
+5. Branches must arrive as single-topic commits; if a reviewer must hold
+   kernel + scheduler + workspace semantics in their head at once, the
+   split has already failed.
+
 ### Cross-references
 
 - `docs/plans/cuda-kernel-crate-extraction.md` — full execution blueprint.
 - `crates/cuda-kernels/src/prelude.rs` — the proto-API contract (graduated from `infer/src/backend/cuda/prelude.rs` at extraction time).
-- `docs/archives/art-grade-architecture-for-long-agent-infer.md` — the
-  ambitious 8-crate split that Route-A reverted; §六 governance and §七
-  acceptance criteria still inform the trip wire bar.
-- `docs/archives/cuda-crate-extraction.md` — the original (overly broad)
-  Round-3 extraction plan that bundled `backend + ops + model + scheduler`,
-  superseded by the kernel-only blueprint above.

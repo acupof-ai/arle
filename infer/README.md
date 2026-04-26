@@ -76,6 +76,6 @@ If you change numerical output, regenerate the JSON baselines under
 - Dated benchmark snapshots live under
   [../docs/experience/wins/](../docs/experience/wins/).
 - Active benchmark closure work lives in
-  [../docs/plans/2026-04-22-sglang-gap-closure-execution.md](../docs/plans/2026-04-22-sglang-gap-closure-execution.md).
+  [../docs/plans/2026-04-23-cuda-decode-sglang-alignment.md](../docs/plans/2026-04-23-cuda-decode-sglang-alignment.md).
 - Public API claims belong in [../docs/http-api.md](../docs/http-api.md), not
   in this crate README.

@@ -20,6 +20,51 @@ Related governance docs:
 
 ## [Unreleased]
 
+### 2026-04-25 — Truth-surface cleanup
+
+Documentation-only refactor that collapses `docs/` to a single source of
+truth per [`docs/plans/2026-04-20-project-constitution-and-refactor-plan.md`](docs/plans/2026-04-20-project-constitution-and-refactor-plan.md)
+§2. No code or behavior change.
+
+Net effect: the documentation tree shrinks by ~330 markdown files. After
+this commit series, `docs/index.md` lists every document that counts as a
+source of truth; anything not on that index is not.
+
+Retired surfaces:
+
+- `docs/archives/` and `docs/areas/` removed; the surviving "Workspace
+  governance rules" (PR discipline + crate-admission criteria) inlined
+  into `docs/architecture.md`.
+- `docs/plans/` collapsed from 58 entries to 10 — the 8 active plans
+  listed in `docs/index.md` plus the canonical bench-parameter
+  (`guidellm-integration.md`) and kernel-crate-extraction blueprints.
+  Six tiered-kv `*-remote-acceptance.md` checklists folded into the
+  `docs/projects/tiered-kv-cache.md` milestone ledger as one-line
+  "completed YYYY-MM-DD; see wins/<file>" pointers.
+- `docs/projects/` collapsed from 8 to 5; the dropped three
+  (`kv-quantization-long-context`, `qwen35-batched-decode`,
+  `xma-future-research`) are either superseded by `docs/resources/
+  kv-cache-quantization.md` or off-roadmap.
+- `docs/research/` collapsed from 6 to 1 (only the
+  `mni-ml-framework-notes.md` reference referenced from the agent-RL
+  project survives).
+- `docs/reviews/` collapsed from 4 to 2 (cuda-kernel-six-principles +
+  metal-ecosystem-route-correction; both still cited from active docs).
+- `infer/docs/` parallel tree retired; `profiling-guide.md` consolidated
+  into `docs/resources/`.
+- 45 `pending-remote` / `pending-local-rerun` stub wins/ entries that
+  never converted to real measurements deleted.
+- 44 pre-2026-04-15 micro-cleanup wins/ + early errors/ retired (history
+  preserved in git log + this CHANGELOG).
+- 150 superseded bench wins/ entries retired (intra-step iterations of
+  CUDA c1–c16 closure, Qwen3.5 paged-prefill landing, Qwen3.6 MoE
+  DFlash bring-up, and per-step scheduler / KV-tier redesigns) — kept
+  the milestone summaries and the latest-per-topic entry only.
+
+Survival criteria for future cleanups: `docs/index.md` lists every
+source-of-truth file. Adding a second index, a parallel doc tree, or a
+sibling status matrix is a regression and must be rejected at PR time.
+
 ### 2026-04-15 — Workspace consolidation + CUDA layer hygiene
 
 Coordinated refactor round finishing Route-A and pre-staging the internal seams for a future CUDA kernel crate extraction. No user-facing behavior changes — all work is structural.

@@ -152,11 +152,10 @@ metal/scheduler.rs      — MetalScheduler policy (decode-first step + optional 
 ## Pointers
 
 - `crates/mlx-sys/AGENTS.md` — the bridge layer below this.
-- `docs/plans/2026-04-15-metal-backend-execution-checklist.md` — active
-  prioritized backlog.
-- `docs/plans/2026-04-15-metal-backend-acceptance-plan.md` — acceptance gates
-  for turning Metal from beta into production.
+- `docs/projects/mlx-backend-roadmap.md` — current Metal backend project,
+  including the prioritized backlog and acceptance gates.
 - `docs/resources/metal-dflash-params.md` — DFlash CLI parameter reference.
+- `docs/resources/metal-dflash.md` — DFlash usage runbook.
 - `docs/experience/errors/2026-04-09-metal-optimization-pitfalls.md` — Metal-specific
   optimization gotchas collected from earlier waves.
 - `docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md` —

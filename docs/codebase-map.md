@@ -42,8 +42,9 @@ The repository has four practical layers:
   `server_engine::InferenceEngine` contract used by the HTTP server and agent
   CLI alike.
 - `crates/`: reusable control-plane/helper crates around the runtime.
-- `docs/` and `infer/docs/`: architecture, plans, research, and implementation
-  notes.
+- `docs/`: architecture, plans, research, and implementation notes (single
+  source of truth; the historical `infer/docs/` parallel tree was retired
+  during the 2026-04-25 truth-surface cleanup).
 
 Current workspace members:
 

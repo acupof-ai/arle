@@ -1,8 +1,9 @@
 # Project Constitution and Refactor Plan
 
-**Status:** Active  
-**Started:** 2026-04-20  
-**Owner:** ckl  
+**Status:** Reference (T0 + T3 completed 2026-04-25; T1 + T2 still active)
+**Started:** 2026-04-20
+**Owner:** ckl
+
 **Purpose:** turn `agent-infer` from a technically strong repository into a top-tier project with a clear identity, one authoritative documentation system, one coherent runtime boundary, and a smoother toolchain.
 
 ---
@@ -188,12 +189,27 @@ Goal: reduce long-term drift between training and inference model definitions.
 
 ### Tranche T3 — docs and toolchain maturity
 
-Goal: make the repo feel complete to a serious external user.
+**Status: completed 2026-04-25** (truth-surface cleanup commit series).
 
-- make `docs/index.md` current and mechanically maintainable
-- trim or clearly scope crate-local READMEs
-- align CI/release with the documented operator path
-- add supply-chain/security/release metadata improvements
+- `docs/index.md` rewritten as the mechanically-maintained index of
+  every active project / plan / resource. Anything not on it is not a
+  source of truth.
+- Inactive plans (47), projects (3), archives (2), areas (1), research
+  (5), reviews (2) retired. The parallel `infer/docs/` tree retired;
+  `profiling-guide.md` consolidated into `docs/resources/`.
+- Experience log curated: 45 unfulfilled `pending-remote` / `pending-
+  local-rerun` stubs deleted, pre-2026-04-15 micro-cleanups (44) and
+  superseded bench iterations (~150) retired. The remaining wins/
+  entries are milestones + the latest-per-topic summaries.
+- Crate-local READMEs scoped: `infer/README.md` retargeted at the live
+  CUDA closure plan.
+- Goal acceptance §6: a maintainer can answer "what is authoritative?"
+  in one sentence — every row of `docs/index.md` § Canonical Truth
+  Surfaces.
+- Open follow-ups under T3: CI/release alignment with the documented
+  operator path; supply-chain/security/release metadata improvements
+  (Diataxis, MLPerf-style bench discipline, OpenSSF Scorecard, SLSA,
+  CycloneDX/ML-BOM). These are not blocked on doc cleanup anymore.
 
 ---
 

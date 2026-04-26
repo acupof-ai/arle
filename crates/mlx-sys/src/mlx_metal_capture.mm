@@ -20,8 +20,6 @@
 //                           it.
 //
 // C ABI consumed by mlx_qwen35_model.cpp::qwen35_compiled_step_session.
-//
-// See docs/plans/metal-gdr-kernel-xcode-capture.md §Step 2b.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

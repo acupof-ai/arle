@@ -25,7 +25,7 @@ fn is_prompt_prefix_of_cached_hit(prompt_len: usize, cached_len: usize, prefix_l
 /// + full re-prefill rather than `truncate_to + restore_prefix_snapshot`.
 ///
 /// Any partial hit — including the exact-block-aligned `raw == cached < prompt_len`
-/// case — must downgrade. See docs/plans/paged-prefill-followups-2026-04-18.md §3.
+/// case — must downgrade.
 fn should_downgrade_partial_hit_to_miss(
     raw_prefix_len: usize,
     prompt_len: usize,
@@ -164,7 +164,7 @@ impl<M: ModelForward> Scheduler<M> {
         // exact-block-aligned prompts where `raw == cached < prompt_len` fell
         // through to the `truncate_to + restore_prefix_snapshot` branch at
         // line 99, which zeroes recurrent state and depends on the snapshot
-        // being valid. See docs/plans/paged-prefill-followups-2026-04-18.md §3.
+        // being valid.
         let (effective, pool_prefix_len) = {
             let state = &mut self.states[si];
 
