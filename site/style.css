@@ -326,8 +326,8 @@ code      { font-family: inherit; color: var(--coral-dim); }
   box-shadow: 0 0 6px rgba(76,195,161,0.65);
 }
 .sig-dot-warn {
-  background: var(--ochre);
-  box-shadow: 0 0 5px rgba(109,113,54,0.55);
+  background: #D9A641;
+  box-shadow: 0 0 6px rgba(217,166,65,0.65);
 }
 .hero-panel {
   border: 1px solid rgba(30,42,37,0.28);
