@@ -80,8 +80,13 @@ jobs:
           cuda: '12.8.0'
           method: network
 
-      - name: Install Python + Triton (required for AOT kernel compilation)
-        run: pip install triton
+      - name: Install Python + Triton + FlashInfer (required for AOT kernel compilation)
+        # Mirrors Dockerfile's pip line. Without flashinfer-python the
+        # cuda-kernels build script cannot find `flashinfer/pos_enc.cuh`
+        # and nvcc bails on attention/flashinfer_decode.cu. Pinning matches
+        # the Docker image so prebuilt tarballs and prebuilt GHCR images
+        # stay in lockstep.
+        run: pip install --no-cache-dir flashinfer-python==0.6.3 triton==3.5.1
 
       - name: Cache cargo registry
         uses: actions/cache@v4
