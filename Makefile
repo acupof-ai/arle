@@ -11,11 +11,16 @@
 #   make bench-cuda
 #   make test                      # any platform (CPU-only)
 #   make test-py
+#   make web-install               # bun install for the web/ landing
+#   make web-dev                   # dev server with HMR (Astro+Vite)
+#   make web-build                 # production build to web/dist/
+#   make web-check                 # type-check the web/ frontend
+#   make web-clean                 # remove web/dist + web/.astro + web/node_modules
 
 METAL_MODEL ?= models/Qwen3-0.6B-4bit
 CUDA_MODEL ?= models/Qwen3-4B
 
-.PHONY: hygiene build-metal build-agent-metal check-metal test-metal bench-metal bench-metal-compare build-cuda bench-cuda test test-py pre-push install-hooks
+.PHONY: hygiene build-metal build-agent-metal check-metal test-metal bench-metal bench-metal-compare build-cuda bench-cuda test test-py pre-push install-hooks web-install web-dev web-build web-check web-clean
 
 hygiene:
 	python3 scripts/check_repo_hygiene.py
@@ -61,3 +66,21 @@ pre-push:
 
 install-hooks:
 	./scripts/install_git_hooks.sh
+
+# ── Web frontend (web/ — Astro 5 + Vite + bun) ───────────────────────────────
+# Drives the public landing at https://cklxx.github.io/arle/. Requires bun on
+# PATH; `./setup.sh --web-only` will bootstrap it if missing.
+web-install:
+	cd web && bun install --frozen-lockfile
+
+web-dev:
+	cd web && bun run dev
+
+web-build:
+	cd web && bun install --frozen-lockfile && bun run build
+
+web-check:
+	cd web && bun run check
+
+web-clean:
+	rm -rf web/dist web/.astro web/node_modules

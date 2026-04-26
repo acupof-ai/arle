@@ -61,6 +61,26 @@ cargo fmt --all -- --check
 cargo deny check advisories bans licenses sources
 ```
 
+### Frontend (`web/` — public landing site)
+
+The landing at <https://cklxx.github.io/arle/> is built from `web/` (Astro + Vite,
+bun-managed). It deploys via `.github/workflows/pages.yml`. Touch this only when
+you are editing the public landing or the future docs site.
+
+```bash
+./setup.sh --web-only    # bootstrap bun + install web/ deps (cross-platform)
+
+make web-dev             # dev server with HMR (default :4321)
+make web-build           # production static build → web/dist/
+make web-check           # type-check the .astro / .ts surface
+make web-clean           # rm -rf web/{dist,.astro,node_modules}
+```
+
+`./setup.sh --check` reports the bun version and whether `web/node_modules` is
+populated, alongside the rest of the toolchain. `--web-only` is safe on macOS
+without CUDA. Set `ARLE_SKIP_WEB=1` to skip the web step inside `--full` /
+`--deps-only`.
+
 ## Pull Requests
 
 1. Fork the repo and create a branch from `main`

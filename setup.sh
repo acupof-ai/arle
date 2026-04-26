@@ -17,6 +17,7 @@
 #   MODEL_DIR     — Local path for model  (default: models/Qwen3-8B)
 #   CUDA_HOME     — CUDA toolkit path     (default: /usr/local/cuda)
 #   SKIP_MODEL    — Set to 1 to skip model download
+#   ARLE_SKIP_WEB — Set to 1 to skip the web/ frontend (bun + Astro) bootstrap
 #   PYTHON        — Python interpreter     (default: python3)
 #   KV_ZIG_VERSION      — Zig version override for kv-native-sys (default: 0.16.0)
 #   KV_ZIG_INSTALL_ROOT — Repo-local Zig install root (default: .toolchains/zig)
@@ -363,6 +364,10 @@ do_deps() {
     echo ""
     ok "All dependencies installed into $VENV_DIR"
     info "Activate: ${BOLD}source .venv/bin/activate${NC}"
+
+    if [ "${ARLE_SKIP_WEB:-0}" != "1" ]; then
+        do_web || warn "Web frontend setup failed (non-fatal); rerun: ./setup.sh --web-only"
+    fi
 }
 
 # ============================================================================
@@ -449,6 +454,40 @@ print(f\"hidden={c.get('hidden_size','?')}, layers={c.get('num_hidden_layers','?
 }
 
 # ============================================================================
+# WEB — bun + web/ frontend deps (Astro + Vite landing site)
+# Cross-platform; safe to run on macOS and Linux without CUDA.
+# ============================================================================
+do_web() {
+    step "Web frontend (web/ — Astro + Vite + bun)"
+
+    if [ ! -d web ]; then
+        warn "web/ directory not present; skipping"
+        return 0
+    fi
+
+    # Make sure bun is on PATH (handle prior install at $HOME/.bun)
+    if ! command -v bun &>/dev/null && [ -x "$HOME/.bun/bin/bun" ]; then
+        export PATH="$HOME/.bun/bin:$PATH"
+    fi
+
+    if ! command -v bun &>/dev/null; then
+        info "Installing bun (bun.sh)..."
+        curl -fsSL https://bun.sh/install | bash
+        export PATH="$HOME/.bun/bin:$PATH"
+    fi
+
+    if ! command -v bun &>/dev/null; then
+        fail "bun install did not put bun on PATH; check \$HOME/.bun/bin"
+        return 1
+    fi
+
+    ok "bun $(bun --version)"
+    info "Installing web/ dependencies..."
+    (cd web && bun install --frozen-lockfile)
+    ok "web/ ready — make web-dev / make web-build"
+}
+
+# ============================================================================
 # FULL — run everything
 # ============================================================================
 do_full() {
@@ -464,6 +503,9 @@ do_full() {
         do_model
     else
         warn "Skipping model download (SKIP_MODEL=1)"
+    fi
+    if [ "${ARLE_SKIP_WEB:-0}" != "1" ]; then
+        do_web || warn "Web frontend setup failed (non-fatal); rerun: ./setup.sh --web-only"
     fi
 
     echo ""
@@ -503,6 +545,7 @@ case "$MODE" in
     deps)  do_deps ;;
     build) do_build ;;
     model) do_model ;;
+    web)   do_web ;;
     clean) do_clean ;;
     full)  do_full ;;
 esac
