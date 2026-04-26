@@ -1,0 +1,152 @@
+//! Command and event payloads exchanged between scheduler / coordinator /
+//! orchestrator. Plain data — no I/O, no thread state.
+
+use crate::kv_tier::tier::BlockLocation;
+use crate::types::BlockId;
+
+use super::types::{FetchTicket, PlanTicket, QueueKind, QueueTicket, StoreTicket};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StoreTarget {
+    Disk,
+    Remote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRequest {
+    pub block_id: BlockId,
+    pub fingerprint: crate::types::BlockFingerprint,
+    pub kv_format_tag: u8,
+    pub host_pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
+    pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
+    pub target: StoreTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefetchPlanRequest {
+    pub block_id: BlockId,
+    pub source: Option<BlockLocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchAction {
+    ReadyOnGpu,
+    PromoteFromHost,
+    FetchFromDisk,
+    FetchFromRemote,
+    Recompute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefetchPlan {
+    pub block_id: BlockId,
+    pub action: PrefetchAction,
+}
+
+/// Request handed to the coordinator for a T1/T2 → T0 prefetch preparation.
+///
+/// The coordinator always materializes the result into a host-pinned region so
+/// the scheduler can run one canonical `host -> gpu` promote path afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRequest {
+    pub block_id: BlockId,
+    pub source: BlockLocation,
+    pub byte_len: usize,
+    pub host_pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedBlock {
+    pub block_id: BlockId,
+    pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
+    pub byte_len: usize,
+    /// True when the coordinator allocated the region for this fetch and the
+    /// scheduler should release it after promotion. False when the block was
+    /// already resident in T1 and the region is the canonical host location.
+    pub release_after_promote: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorCommand {
+    Plan {
+        ticket: PlanTicket,
+        blocks: Vec<PrefetchPlanRequest>,
+    },
+    Store {
+        ticket: StoreTicket,
+        blocks: Vec<StoreRequest>,
+    },
+    /// Prepare staged blocks for local readmission. Host-pinned sources are
+    /// reported back as-is; disk sources are fetched into temporary host
+    /// regions first.
+    Fetch {
+        ticket: FetchTicket,
+        blocks: Vec<FetchRequest>,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorEvent {
+    CommandQueued(CoordinatorCommand),
+    StoreQueued {
+        ticket: StoreTicket,
+        block_count: usize,
+    },
+    StoreCompleted {
+        ticket: StoreTicket,
+        locations: Vec<(BlockId, BlockLocation)>,
+    },
+    StoreFailed {
+        ticket: StoreTicket,
+        failed_block: BlockId,
+        reason: String,
+    },
+    FetchQueued {
+        ticket: FetchTicket,
+        block_count: usize,
+    },
+    FetchCompleted {
+        ticket: FetchTicket,
+        blocks: Vec<FetchedBlock>,
+    },
+    FetchFailed {
+        ticket: FetchTicket,
+        failed_block: BlockId,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchestratorEvent {
+    PlanQueued {
+        ticket: PlanTicket,
+        block_count: usize,
+    },
+    PlanCompleted {
+        ticket: PlanTicket,
+        plans: Vec<PrefetchPlan>,
+    },
+    FetchQueued {
+        ticket: FetchTicket,
+        block_count: usize,
+    },
+    FetchCompleted {
+        ticket: FetchTicket,
+        blocks: Vec<FetchedBlock>,
+    },
+    StoreQueued {
+        ticket: StoreTicket,
+        block_count: usize,
+    },
+    StoreCompleted {
+        ticket: StoreTicket,
+        locations: Vec<(BlockId, BlockLocation)>,
+    },
+    TaskFailed {
+        queue: QueueKind,
+        ticket: QueueTicket,
+        failed_block: BlockId,
+        reason: String,
+    },
+}
