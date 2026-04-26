@@ -21,8 +21,9 @@
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Scheduler post-2026-04-14 refactors are flat on L4 | **VERIFIED** | wins/2026-04-26-bench-guidellm-cuda-l4-scheduler-current.md |
-| TileLang Phase 0 builds + benches on L4 | **BLOCKED** | errors/2026-04-26-tilelang-aot-tilelang-0p1p9-blocker.md |
+| Scheduler post-2026-04-14 refactors are flat on L4 | **VERIFIED — flat** | [`wins/2026-04-26-bench-guidellm-cuda-l4-scheduler-current.md`](../experience/wins/2026-04-26-bench-guidellm-cuda-l4-scheduler-current.md) |
+| Mixed-batch refactors close prior c=4/c=8 backlog | **VERIFIED — wins** | [`wins/2026-04-26-bench-guidellm-cuda-l4-mixed-batch-vs-f98ca92.md`](../experience/wins/2026-04-26-bench-guidellm-cuda-l4-mixed-batch-vs-f98ca92.md) |
+| TileLang Phase 0 builds + benches on L4 | **VERIFIED — functional, L4 floor** | [`wins/2026-04-26-bench-guidellm-cuda-l4-tilelang-prefill-hd128-floor.md`](../experience/wins/2026-04-26-bench-guidellm-cuda-l4-tilelang-prefill-hd128-floor.md); historical blocker chain in [`errors/2026-04-26-tilelang-aot-tilelang-0p1p9-blocker.md`](../experience/errors/2026-04-26-tilelang-aot-tilelang-0p1p9-blocker.md) |
 
 ---
 
@@ -66,7 +67,34 @@ Full entry:
 
 ---
 
-## 2. TileLang Phase 0 (BLOCKED — TileLang 0.1.9 AOT)
+## 1b. Mixed-batch (PASS — wins on c=4/c=8/c=16)
+
+Re-ran the same workload as the 2026-04-22 SGLang comparison
+(commit `f98ca92`, identical flags: `--num-slots 16 --max-seq-len 4608
+--mem-fraction-static 0.94 --chunked-prefill-size 4096
+--max-prefill-tokens 16384`). The post-2026-04-22 mixed-batch
+refactors (`f526e10b` align with sglang, `27ba7308` decode emit-gate,
+`df2d3e8e` workspace budget align) deliver:
+
+| conc | TTFT p50 ms then | TTFT p50 ms now | Δ TTFT | tok/s then | tok/s now | Δ tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+|  1 |   739.9 |    719.3 |  −2.8% | 26.59 |   26.56 |  −0.1% |
+|  2 |  1485.0 |   1518.6 |  +2.3% | 41.59 |   45.21 |  +8.7% |
+|  4 | 14556.7 |   2354.4 | **−83.8%** | 36.70 |   53.31 | **+45.3%** |
+|  8 | 15403.7 |   3838.0 | **−75.1%** | 57.71 |   66.94 |  +16.0% |
+| 16 | 15405.9 |  16356.9 |  +6.2% | 45.08 |   65.92 | **+46.2%** |
+
+The c=4/c=8 TTFT collapse is the mixed-batch fingerprint — prefill no
+longer starves decode while the running batch is held. Throughput at
+c=16 closes ~15 percentage points of the prior SGLang gap (45 → 66
+tok/s vs SGLang 137 tok/s; gap −67% → −52%).
+
+Full entry:
+[`wins/2026-04-26-bench-guidellm-cuda-l4-mixed-batch-vs-f98ca92.md`](../experience/wins/2026-04-26-bench-guidellm-cuda-l4-mixed-batch-vs-f98ca92.md).
+
+---
+
+## 2. TileLang Phase 0 (PASS — functional, L4 floor)
 
 ### What was supposed to happen
 
@@ -77,53 +105,26 @@ ship/revert decision.
 
 ### What actually happened
 
-The `cargo build --release -p infer --features cuda,tilelang-attn`
-invocation panics inside the AOT generator on three successive issues.
-The first two are real source-side defects fixed inline; the third is
-inside TileLang/TVM and is the actual blocker.
+A four-issue chain, all closed.
 
-| # | Layer | Symptom | Status |
+| # | Layer | Symptom | Fix |
 |---|---|---|---|
-| 1 | `crates/cuda-kernels/build.rs::tilelang_target` + `gen_tilelang_aot.py::parse_target` | `ValueError: Target kind "cuda:89" is not defined. ... e.g. 'cuda -arch=sm_80'` | **Fixed in `802c5fc8`**. Format updated to `cuda -arch=sm_<sm>`. |
-| 2 | `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py::_make_kernel` | `AssertionError: A and B must have the same dtype` at `T.gemm(p, v_tile, acc_o)` (P f32, V bf16) | Patch tested locally (FlashAttention-standard `p_bf16` cast). Held — landing without #3 leaves Phase 0 still broken (no-half-state rule). |
-| 3 | TileLang 0.1.9 `LayoutInferencer` (TVM internals) | `tvm.error.InternalError: loop_var_to_thread = d // 64 * 64 + i // 32 * 32 + i % 8 * 4 + d % 8 // 2 contains inner var d` | **BLOCKER**. Inside `tilelang/3rdparty/tvm` GemmNode::InferLayout. Not a source-side bug. |
+| 1 | `build.rs::tilelang_target` + `gen_tilelang_aot.py::parse_target` | `ValueError: Target kind "cuda:89" is not defined. ... e.g. 'cuda -arch=sm_80'` | `802c5fc8` — switch to `cuda -arch=sm_<sm>`. |
+| 2 | `batch_prefill_paged_hd128.py::_make_kernel` | `AssertionError: A and B must have the same dtype` at `T.gemm(p, v_tile, acc_o)` (P f32, V bf16) | `4d9c65f0` — narrow P to bf16 via `T.copy(p, p_bf16)`; add `policy=T.GemmWarpPolicy.FullRow` to both gemms; hoist alpha rescale to 2D `T.Parallel(BLOCK_M, HEAD_DIM)`. |
+| 3 | `gen_tilelang_aot.py` cubin probe | TileLang 0.1.9 emits a TVM-FFI `.so` rather than a raw cubin; `compiled.cubin_path` is `None` on cold-cache compile | `2a4ff6ce` — pull `adapter.device_kernel_source` (in-memory CUDA source) and nvcc to a raw cubin against TileLang's bundled `tl_templates/cuda` + `cutlass/include`. |
+| 4 | C wrapper `cuLaunchKernel` | `Triton Error [CUDA]: an illegal memory access was encountered` — kernel uses `extern __shared__ buf_dyn_shmem[]` with ~48 KB; sm_89's default cap is 48 KB | `2a4ff6ce` — parse `dyn_shmem_bytes` from `host_kernel_source`, lift via `cuFuncSetAttribute(..., MAX_DYNAMIC_SHARED_SIZE_BYTES, ...)`, pass same value as `cuLaunchKernel`'s `sharedMemBytes`. |
 
 ### What this means
 
 - The Phase 0 commit trio (`022e8dd / 76e044b / 9896d25`) stays in the
-  tree. Per plan §5 risk gate #2 the prescribed action is to revert,
-  but the fix landed (#1) is independently correct and the user's
-  explicit guidance was to push forward, not unwind. Phase 0 is
-  **parked, not closed**.
+  tree (now operational, not parked).
 - The pending-remote stub
   [`wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md`](../experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md)
-  stays in place; the new errors entry is the recorded blocker, not
-  the closure.
-- The `tilelang>=0.1` extra in `pyproject.toml` is the actual root
-  cause: it resolves to whatever TileLang ships latest, which today
-  is 0.1.9 with a regressed LayoutInferencer for our kernel shape.
-
-### Recommended next step (lowest-risk)
-
-Pin TileLang to a version that is known to compile this kernel before
-re-attempting Phase 0:
-
-1. Bisect 0.1.0 → 0.1.9 against
-   `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py`
-   directly via `python3 -c "import tilelang; tilelang.compile(get_kernel(32, 8), target='cuda -arch=sm_89')"`
-   (no Rust build needed).
-2. Update
-   `pyproject.toml::[project.optional-dependencies].tilelang` to
-   `tilelang==<verified>`.
-3. Land the parked dtype patch + the version pin in one commit.
-4. Re-run §2–§4 of the verification runbook.
-
-If the bisect produces no green version, the fallback is to upstream
-the LayoutInferencer fix or simplify the kernel layout (drop
-`T.use_swizzle`, halve BLOCK_M/BLOCK_N) at a probable perf cost.
-
-Full blocker write-up:
-[errors/2026-04-26-tilelang-aot-tilelang-0p1p9-blocker.md](../experience/errors/2026-04-26-tilelang-aot-tilelang-0p1p9-blocker.md).
+  stays in place — H100 is still required for the §5 ship/revert
+  decision per plan §0.
+- The `tilelang>=0.1` extra in `pyproject.toml` should still be
+  pinned to `==0.1.9` so future ABI drift doesn't silently re-break
+  Phase 0.
 
 ---
 
@@ -131,9 +132,14 @@ Full blocker write-up:
 
 | Commit | Scope | Notes |
 |---|---|---|
-| `4da98a7` (orphan, see `802c5fc8`) | fix(cuda) | TileLang target string format, rebased |
 | `802c5fc8` | fix(cuda) | TileLang 0.1.9 target string format — issue #1 |
 | `68c183e8` | docs(bench,errors) | wins/scheduler regression + errors/TileLang blocker |
+| `1f99c087` | docs(reviews) | this verification report (initial draft) |
+| `4d9c65f0` | fix(cuda) | TileLang FlashAttention-2 layout alignment — issue #2 |
+| `c5836a9a` | docs(errors) | errors entry update with bisect outcome + remaining work |
+| `310305b7` | docs(bench) | wins entry: mixed-batch refactors close c=4/c=8 backlog |
+| `2a4ff6ce` | feat(cuda) | TileLang AOT works end-to-end on TileLang 0.1.9 — issues #3 + #4 |
+| `b4942807` | docs(bench) | wins entry: TileLang AOT prefill HD128 L4 floor |
 
 (`models` symlink created in workspace root and `infer/models` per
 `memory/project_remote_cuda_box.md` — symlinks only, untracked.)
@@ -142,13 +148,19 @@ Full blocker write-up:
 
 ## Open follow-ups
 
-- **TileLang version pin** (highest priority) — see §2 above.
-- **Canonical sweep on L4** — the regression check is `--quick`. A
-  follow-up sweep with `profile=sweep, data=4096/256, max-seconds=60`
-  closes out the open exploration-mode caveat.
+- **H100 spike for the §5 decision** — required to drive
+  ship/revert per `tilelang-integration.md` §5; L4 is floor-only.
+- **Pin `tilelang==0.1.9`** in `pyproject.toml` so the ABI we just
+  wrote against can't drift.
+- **Phase 1 (decode HD128/HD256)** — only relevant if H100 confirms
+  Phase 0 wins; propagate the `T.int32` scalar pattern to the
+  decode kernels.
+- **Canonical sweep on L4** — the runs here use exploration-mode
+  concurrent profiles to match prior baselines exactly. Lifting to
+  the full `sweep` profile (synchronous + throughput legs) closes
+  the open exploration-mode caveat on the wins/ entries.
 - **Qwen3.5-4B parallel run** — symmetry check against the
-  `27.59 tok/s` line from `project_l4_perf_baseline.md`. Same recipe,
-  different model path.
+  `27.59 tok/s` line from `project_l4_perf_baseline.md`.
 - **Shared-prefix workload** — the bench shows `prefix_hit_rate=0.0%`
   because guidellm's synthetic prompts don't share prefixes. Re-run
   with an agent-trace dataset to verify the kv_tier promotion paths
