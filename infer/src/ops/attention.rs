@@ -628,22 +628,51 @@ pub(crate) fn prefill_attention_paged_batch(
     let (kvidx_u64, _gkvidx) = meta.page_indices.device_ptr(&ctx.stream);
     let (kvlpl_u64, _gkvlpl) = fwd.kv_last_page_len_dev.device_ptr(&ctx.stream);
 
-    plan.run_hd128(
-        ctx,
-        q_u64,
-        qoi_u64,
-        kp_u64,
-        vp_u64,
-        kvi_u64,
-        kvidx_u64,
-        kvlpl_u64,
-        o_u64,
-        /* lse_ptr */ None,
-        fwd.batch_size,
-        num_q_heads,
-        num_kv_heads,
-        page_size,
-    )?;
+    #[cfg(not(feature = "tilelang-attn"))]
+    {
+        plan.run_hd128(
+            ctx,
+            q_u64,
+            qoi_u64,
+            kp_u64,
+            vp_u64,
+            kvi_u64,
+            kvidx_u64,
+            kvlpl_u64,
+            o_u64,
+            /* lse_ptr */ None,
+            fwd.batch_size,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        )?;
+    }
+
+    #[cfg(feature = "tilelang-attn")]
+    {
+        let _ = plan; // plan was set up but TileLang skips plan_info entirely.
+        let sm_scale = 1.0_f32 / (head_dim as f32).sqrt();
+        unsafe {
+            ffi::tilelang_batch_prefill_paged_hd128_run_cuda(
+                q_u64 as *mut ffi::Half,
+                qoi_u64 as *const i32,
+                kp_u64 as *mut ffi::Half,
+                vp_u64 as *mut ffi::Half,
+                kvi_u64 as *const i32,
+                kvidx_u64 as *const i32,
+                kvlpl_u64 as *const i32,
+                o_u64 as *mut ffi::Half,
+                fwd.batch_size as i32,
+                fwd.total_qo_rows as i32,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                page_size as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
 
     Ok(())
 }

@@ -583,6 +583,181 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     println!("cargo:rerun-if-env-changed=INFER_TRITON_PYTHON");
 }
 
+struct TileLangKernelSpec {
+    artifact_dir: &'static str,
+    kernel_path: &'static str,
+    kernel_name: &'static str,
+    out_name: &'static str,
+}
+
+fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
+    let output = Command::new(candidate)
+        .args(["-c", "import tilelang"])
+        .output()
+        .map_err(|err| format!("{candidate}: {err}"))?;
+
+    if output.status.success() {
+        Ok(candidate.to_string())
+    } else {
+        Err(format!(
+            "{candidate}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn find_tilelang_python() -> Result<String, String> {
+    if let Ok(candidate) = std::env::var("INFER_TILELANG_PYTHON") {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            return Err(
+                "INFER_TILELANG_PYTHON is set but empty. See tools/tilelang/README.md.".to_string(),
+            );
+        }
+        return probe_tilelang_python(candidate).map_err(|message| {
+            format!(
+                "INFER_TILELANG_PYTHON=`{candidate}` could not import tilelang. {message}. See tools/tilelang/README.md."
+            )
+        });
+    }
+
+    let tool_venv = PathBuf::from("tools/tilelang/.venv/bin/python");
+    let local_venv = PathBuf::from(".venv/bin/python");
+    let mut diagnostics = Vec::new();
+    let mut candidates = Vec::new();
+    if tool_venv.exists() {
+        candidates.push(tool_venv.to_string_lossy().to_string());
+    }
+    if local_venv.exists() {
+        candidates.push(local_venv.to_string_lossy().to_string());
+    }
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+
+    for candidate in candidates {
+        match probe_tilelang_python(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(message) => diagnostics.push(message),
+        }
+    }
+
+    Err(format!(
+        "Could not find a Python interpreter with TileLang installed. Set INFER_TILELANG_PYTHON, bootstrap tools/tilelang/.venv, or `pip install -e .[tilelang]`. Probe results: {}.",
+        diagnostics.join(" | ")
+    ))
+}
+
+fn tilelang_target(sm_targets: &[String]) -> String {
+    let max_sm = sm_targets
+        .iter()
+        .filter_map(|sm| sm.parse::<u32>().ok())
+        .max()
+        .expect("expected at least one CUDA SM target for TileLang AOT");
+
+    if sm_targets.len() > 1 {
+        println!(
+            "cargo:warning=TileLang AOT emits one cubin per kernel; using highest detected target sm_{max_sm}. Set INFER_CUDA_SM to pin one target explicitly."
+        );
+    }
+
+    format!("cuda:{max_sm}")
+}
+
+fn generate_tilelang_artifacts(
+    python: &str,
+    out_dir: &Path,
+    target: &str,
+    spec: &TileLangKernelSpec,
+) -> (String, PathBuf) {
+    let generator_path = PathBuf::from("tools/tilelang/gen_tilelang_aot.py");
+    let artifact_dir = out_dir.join("tilelang_aot").join(spec.artifact_dir);
+
+    let output = Command::new(python)
+        .arg(&generator_path)
+        .arg("--kernel-path")
+        .arg(spec.kernel_path)
+        .arg("--kernel-name")
+        .arg(spec.kernel_name)
+        .arg("--out-name")
+        .arg(spec.out_name)
+        .arg("--out-dir")
+        .arg(&artifact_dir)
+        .arg("--target")
+        .arg(target)
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to run TileLang AOT generator for {}: {err}",
+                spec.kernel_name
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "TileLang AOT generator failed for {}. stdout: {} stderr: {}",
+        spec.kernel_name,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut func_name = None;
+    let mut c_path = None;
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("FUNC_NAME=") {
+            func_name = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("C_PATH=") {
+            c_path = Some(PathBuf::from(value.trim()));
+        }
+    }
+
+    let func_name = func_name.expect("TileLang generator did not print FUNC_NAME");
+    let c_path = c_path.expect("TileLang generator did not print C_PATH");
+    (func_name, c_path)
+}
+
+fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
+    let python = find_tilelang_python().unwrap_or_else(|message| panic!("{message}"));
+    let target = tilelang_target(sm_targets);
+    let mut generated_sources = Vec::new();
+
+    let prefill_hd128_spec = TileLangKernelSpec {
+        artifact_dir: "batch_prefill_paged_hd128",
+        kernel_path: "tools/tilelang/batch_prefill_paged_hd128.py",
+        kernel_name: "tilelang_batch_prefill_paged_hd128_run",
+        out_name: "tilelang_batch_prefill_paged_hd128",
+    };
+    let (_func, c_path) =
+        generate_tilelang_artifacts(&python, out_dir, &target, &prefill_hd128_spec);
+    generated_sources.push(c_path);
+
+    let mut build = cc::Build::new();
+    build
+        .cuda(false)
+        .include(format!("{}/include", cuda_path))
+        .flag("-std=c11")
+        .warnings(false);
+    for source in &generated_sources {
+        build.file(source);
+    }
+    build.compile("tilelang_kernels_aot");
+
+    println!("cargo:rustc-link-lib=cuda");
+    println!(
+        "cargo:warning=TileLang AOT enabled: prefill HD128 will dispatch to TileLang instead of FlashInfer."
+    );
+    for entry in std::fs::read_dir("tools/tilelang")
+        .expect("tools/tilelang directory must exist")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    println!("cargo:rerun-if-changed=tools/tilelang");
+    println!("cargo:rerun-if-env-changed=INFER_TILELANG_PYTHON");
+}
+
 /// Find FlashInfer C++ include directory.
 ///
 /// Search order:
@@ -763,6 +938,11 @@ fn main() {
     assert!(status.success(), "ar failed");
 
     compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+
+    if std::env::var("CARGO_FEATURE_TILELANG_ATTN").is_ok() {
+        compile_tilelang_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TILELANG_ATTN");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     if cfg!(target_os = "windows") {

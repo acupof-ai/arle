@@ -528,3 +528,25 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 }
+
+#[cfg(feature = "tilelang-attn")]
+#[allow(dead_code)]
+unsafe extern "C" {
+    pub fn tilelang_batch_prefill_paged_hd128_run_cuda(
+        q: *mut Half,
+        q_indptr: *const i32,
+        k_pool: *mut Half,
+        v_pool: *mut Half,
+        kv_indptr: *const i32,
+        kv_indices: *const i32,
+        kv_last_page_len: *const i32,
+        o: *mut Half,
+        batch_size: i32,
+        total_q_tokens: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+}
