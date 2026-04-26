@@ -1,28 +1,71 @@
 version: 2
+# Moderate-faction config (post-2026-04-26 reset).
+#
+# Why monthly + grouped: the prior weekly + ungrouped setup produced 23 open
+# PRs at once and cost a full afternoon of CI iteration to merge a fraction
+# of them. Most bumps are no-op action version pumps; the value lives in
+# RUSTSEC advisories, which arrive via security-update PRs regardless of
+# the schedule below.
+#
+# Net target: at most ~1 PR per ecosystem per month. Security advisories
+# fire on top of that as soon as they land.
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 2
     labels:
       - dependencies
       - rust
+    groups:
+      cargo-all:
+        patterns: ["*"]
+        update-types:
+          - patch
+          - minor
+    ignore:
+      # Pre-1.0 minors get reopened too easily and historically broke API
+      # surface (cudarc, dialoguer, ndarray, reqwest, sysinfo, ureq,
+      # rustyline). Only let dependabot bump these on patch-level.
+      - dependency-name: "cudarc"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "dialoguer"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "ndarray"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "reqwest"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "rustyline"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "sysinfo"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "ureq"
+        update-types: ["version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 1
     labels:
       - dependencies
       - ci
+    groups:
+      gha-all:
+        patterns: ["*"]
 
   - package-ecosystem: pip
     directory: /
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 1
     labels:
       - dependencies
       - python
+    groups:
+      pip-all:
+        patterns: ["*"]
+        update-types:
+          - patch
+          - minor
