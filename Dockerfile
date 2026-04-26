@@ -30,8 +30,15 @@ ENV CUDA_HOME=/usr/local/cuda
 WORKDIR /build
 COPY . .
 
-RUN cargo build -p infer --release --features cuda && \
-    cargo build --release --features cuda,cli -p agent-infer --bin arle
+# kv-native-sys's build script needs the Zig 0.16 toolchain. The repo-managed
+# installer downloads a pinned tarball into .toolchains/zig and prints the
+# resolved zig binary; export it as ZIG so the build script picks it up.
+RUN ZIG="$(./scripts/setup_zig_toolchain.sh --print-zig)" && \
+    echo "ZIG=$ZIG" > /tmp/zig.env
+
+RUN . /tmp/zig.env && \
+    ZIG="$ZIG" cargo build -p infer --release --features cuda && \
+    ZIG="$ZIG" cargo build --release --features cuda,cli -p agent-infer --bin arle
 
 # --- Stage 2: Runtime ---
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
