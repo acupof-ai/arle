@@ -144,7 +144,7 @@ pub(crate) struct ExtraArgs {
 #[command(
     name = "arle",
     about = "ARLE local agent, training, and dataset CLI",
-    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive agent REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train test --backend metal --json     Build the canonical tiny fixture and keep stdout machine-readable.",
+    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive agent REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle serve --model-path /path/to/model      Start the OpenAI-compatible server.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train test --backend metal --json     Build the canonical tiny fixture and keep stdout machine-readable.",
     group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
 )]
 pub(crate) struct Args {
@@ -198,6 +198,10 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) no_cuda_graph: bool,
 
+    /// Disable built-in shell/python tools for the local agent runtime.
+    #[arg(long, default_value_t = false)]
+    pub(crate) no_tools: bool,
+
     /// Skip interactive model selection (use auto-discovery)
     #[arg(long, default_value_t = false)]
     pub(crate) non_interactive: bool,
@@ -207,6 +211,8 @@ pub(crate) struct Args {
 pub(crate) enum CliCommand {
     /// Agent REPL and one-shot prompt execution.
     Run(Box<RunArgs>),
+    /// OpenAI-compatible serving through the matching backend binary.
+    Serve(Box<ServeArgs>),
     /// Training jobs.
     Train(Box<TrainArgs>),
     /// Dataset utilities.
@@ -216,7 +222,7 @@ pub(crate) enum CliCommand {
 #[derive(Debug, Clone, PartialEq, Eq, ClapArgs)]
 #[command(
     group(ArgGroup::new("run_input").args(["prompt", "stdin"])),
-    after_help = "Output:\n  Plain text is written to stdout by default.\n  `--json` emits one machine-readable document with model, backend, usage, and tool-call stats.\n\nExamples:\n  arle --model-path /path/to/model run\n  arle --model-path /path/to/model run --prompt \"Summarize this repo\"\n  arle --model-path /path/to/model run --stdin --json < prompt.txt"
+    after_help = "Output:\n  Plain text is written to stdout by default.\n  `--json` emits one machine-readable document with model, backend, usage, and tool-call stats.\n\nExamples:\n  arle --model-path /path/to/model run\n  arle --model-path /path/to/model run --prompt \"Summarize this repo\"\n  arle --model-path /path/to/model run --stdin --json < prompt.txt\n  arle --model-path /path/to/model run --no-tools --prompt \"No tool execution\""
 )]
 pub(crate) struct RunArgs {
     /// Run a single prompt and exit.
@@ -230,6 +236,40 @@ pub(crate) struct RunArgs {
     /// Render one-shot output as JSON for scripts and CI.
     #[arg(long, default_value_t = false, requires = "run_input")]
     pub(crate) json: bool,
+
+    /// Disable built-in shell/python tools for this run.
+    #[arg(long, default_value_t = false)]
+    pub(crate) no_tools: bool,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "This is a thin front door over the backend serving binaries shipped in release artifacts.\nIt looks for `infer`, `metal_serve`, or `cpu_serve` next to the current `arle` binary first, then on PATH.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend cuda --model-path /models/Qwen3-4B -- --num-slots 8"
+)]
+pub(crate) struct ServeArgs {
+    /// Model directory or HuggingFace model ID. Defaults to the top-level --model-path.
+    #[arg(long)]
+    pub(crate) model_path: Option<String>,
+
+    /// Serving backend to launch; `auto` selects the compiled backend.
+    #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+    pub(crate) backend: BackendArg,
+
+    /// Port to listen on.
+    #[arg(long, default_value_t = 8000)]
+    pub(crate) port: u16,
+
+    /// Host or IP address to bind to when the backend binary supports it.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub(crate) bind: String,
+
+    /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
+    #[arg(long)]
+    pub(crate) train_control_url: Option<String>,
+
+    /// Forward additional backend-specific flags after `--`.
+    #[arg(last = true, allow_hyphen_values = true)]
+    pub(crate) extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -999,6 +1039,50 @@ mod tests {
     }
 
     #[test]
+    fn accepts_no_tools_flag() {
+        let args = Args::try_parse_from(["arle", "--no-tools"])
+            .expect("global no-tools flag should parse");
+        assert!(args.no_tools);
+    }
+
+    #[test]
+    fn accepts_run_no_tools_flag() {
+        let args = Args::try_parse_from(["arle", "run", "--no-tools"])
+            .expect("run no-tools flag should parse");
+        match args.command.expect("run command") {
+            CliCommand::Run(run) => assert!(run.no_tools),
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_serve_command() {
+        let args = Args::try_parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "cpu",
+            "--model-path",
+            "models/tiny",
+            "--port",
+            "8010",
+            "--",
+            "--max-waiting",
+            "8",
+        ])
+        .expect("serve command should parse");
+        match args.command.expect("serve command") {
+            CliCommand::Serve(serve) => {
+                assert_eq!(serve.backend, super::BackendArg::Cpu);
+                assert_eq!(serve.model_path.as_deref(), Some("models/tiny"));
+                assert_eq!(serve.port, 8010);
+                assert_eq!(serve.extra_args, ["--max-waiting", "8"]);
+            }
+            other => panic!("expected serve command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_zero_max_turns() {
         let err = Args::try_parse_from(["arle", "--max-turns", "0"])
             .err()
@@ -1148,6 +1232,7 @@ mod tests {
                 prompt: Some("hello".to_string()),
                 stdin: false,
                 json: false,
+                no_tools: false,
             }
         );
     }

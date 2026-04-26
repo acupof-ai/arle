@@ -30,4 +30,22 @@ This policy covers ARLE, including:
 
 ## Agent Tool Execution
 
-The built-in agent tools (`shell`, `python`) execute arbitrary code by design. These tools are intended for local/trusted use only. **Do not expose the agent binary to untrusted input without sandboxing.**
+The built-in agent tools (`shell`, `python`) execute arbitrary code by design.
+These tools are intended for local/trusted use only. **Do not expose the
+tool-enabled local agent to untrusted input.**
+
+Use:
+
+```bash
+arle --doctor
+arle --model-path /path/to/model run --no-tools --prompt "..."
+```
+
+`arle --doctor` reports the active tool sandbox backend:
+
+- `nsjail`: preferred Linux sandbox path when installed.
+- `sandbox-exec`: macOS fallback when available.
+- `bare`: no supported sandbox backend was detected.
+
+If the backend is `bare`, use `--no-tools` for untrusted prompts or install a
+supported sandbox before enabling tool execution.

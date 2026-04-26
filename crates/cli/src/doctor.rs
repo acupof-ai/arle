@@ -10,7 +10,7 @@ use crate::hardware::{self, GpuInfo};
 use crate::hub_discovery;
 use crate::model_catalog;
 
-const INSPECTION_SCHEMA_VERSION: u32 = 2;
+const INSPECTION_SCHEMA_VERSION: u32 = 3;
 const PRIMARY_MODEL_ENV: &str = "ARLE_MODEL";
 const LEGACY_MODEL_ENV: &str = "AGENT_INFER_MODEL";
 
@@ -123,6 +123,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
 
     print_discovery_section(&snapshot);
     print_recommendations_section(&snapshot);
+    print_tools_section();
 
     println!("{}", style("Checks").bold());
     if snapshot.info.compiled_backend.supports_inference() {
@@ -231,6 +232,7 @@ struct DoctorJsonReport {
     resolution: ResolutionReport,
     discovery: DiscoveryReport,
     recommendations: Vec<ModelRecommendationReport>,
+    tools: tools::ToolRuntimeReport,
     checks: Vec<CheckReport>,
 }
 
@@ -371,6 +373,7 @@ fn doctor_report(snapshot: &DoctorSnapshot) -> DoctorJsonReport {
         resolution: resolution_report(&snapshot.selected),
         discovery: discovery_report(snapshot),
         recommendations: recommendation_reports(snapshot),
+        tools: tools::tool_runtime_report(),
         checks,
     }
 }
@@ -539,6 +542,24 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
                     .to_string(),
         });
     }
+    let tools = tools::tool_runtime_report();
+    if tools.sandboxed {
+        checks.push(CheckReport {
+            code: "tool_sandbox_available",
+            name: "tool_sandbox",
+            status: "ok",
+            message: format!("built-in tools will run through {}", tools.sandbox_backend),
+        });
+    } else {
+        checks.push(CheckReport {
+            code: "tool_sandbox_missing",
+            name: "tool_sandbox",
+            status: "warn",
+            message:
+                "built-in shell/python tools are enabled by default and no supported sandbox backend was detected"
+                    .to_string(),
+        });
+    }
     checks
 }
 
@@ -602,6 +623,45 @@ fn print_recommendations_section(snapshot: &DoctorSnapshot) {
                 entry.display_name, quant, entry.hf_id, entry.size_gb, entry.min_memory_gb
             );
         }
+    }
+    println!();
+}
+
+fn print_tools_section() {
+    let report = tools::tool_runtime_report();
+    println!("{}", style("Tools").bold());
+    println!(
+        "{} {}",
+        style("enabled by default").dim(),
+        report.enabled_by_default
+    );
+    println!(
+        "{} {}",
+        style("built-ins").dim(),
+        report.builtin_tools.join(", ")
+    );
+    println!(
+        "{} {}{}",
+        style("sandbox").dim(),
+        report.sandbox_backend,
+        if report.sandboxed {
+            ""
+        } else {
+            " (not isolated)"
+        }
+    );
+    println!(
+        "{} {}s · {} MiB",
+        style("limits").dim(),
+        report.timeout_secs,
+        report.max_memory_mb
+    );
+    println!("{} {}", style("python").dim(), report.python);
+    if !report.sandboxed {
+        println!(
+            "{} run with `--no-tools` for prompts that must not execute shell/python code",
+            style("safety").yellow().bold()
+        );
     }
     println!();
 }
@@ -826,7 +886,7 @@ mod tests {
         )));
         let value = serde_json::to_value(doctor_report(&snapshot)).expect("serialize doctor json");
 
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["mode"], "doctor");
         assert_eq!(
             value["status"],
@@ -843,6 +903,8 @@ mod tests {
         assert_eq!(value["resolution"]["status"], "ok");
         assert_eq!(value["resolution"]["selected"]["origin"], "env_model");
         assert_eq!(value["inputs"]["hf_cache_root"], "/tmp/hf-cache");
+        assert!(value["tools"].is_object());
+        assert!(value["tools"]["builtin_tools"].is_array());
         assert_eq!(
             value["discovery"]["supported_hub_snapshots"]
                 .as_array()
@@ -874,7 +936,7 @@ mod tests {
         let snapshot = test_snapshot(Err(anyhow::anyhow!("no model selected")));
         let value = serde_json::to_value(models_report(&snapshot)).expect("serialize models json");
 
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["mode"], "list_models");
         assert_eq!(value["status"], "warn");
         assert!(value.get("checks").is_none());

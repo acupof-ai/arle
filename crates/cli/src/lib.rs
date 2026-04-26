@@ -13,6 +13,7 @@ mod model_catalog;
 mod model_picker;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
+mod serve;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod startup;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -38,6 +39,7 @@ pub fn run() -> ExitCode {
     match command {
         Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
         Some(CliCommand::Data(command)) => return train_cli::run_data(*command),
+        Some(CliCommand::Serve(command)) => return serve::run_serve(&args, *command),
         Some(CliCommand::Run(run_args)) => match run_impl(args, Some(*run_args)) {
             Ok(()) => return ExitCode::SUCCESS,
             Err(err) => {
@@ -144,20 +146,33 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
         }
 
         match run_args {
-            Some(run_args) if run_args.prompt.is_some() || run_args.stdin => repl::run_one_shot(
+            Some(run_args) if run_args.prompt.is_some() || run_args.stdin => {
+                let tools_enabled = !(args.no_tools || run_args.no_tools);
+                repl::run_one_shot(
+                    &mut engine,
+                    &backend_name,
+                    args.max_turns,
+                    args.max_tokens,
+                    args.temperature,
+                    &run_args,
+                    tools_enabled,
+                )?
+            }
+            Some(run_args) => repl::run_repl(
                 &mut engine,
                 &backend_name,
                 args.max_turns,
                 args.max_tokens,
                 args.temperature,
-                &run_args,
+                !(args.no_tools || run_args.no_tools),
             )?,
-            _ => repl::run_repl(
+            None => repl::run_repl(
                 &mut engine,
                 &backend_name,
                 args.max_turns,
                 args.max_tokens,
                 args.temperature,
+                !args.no_tools,
             )?,
         }
 

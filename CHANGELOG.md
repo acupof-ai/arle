@@ -19,6 +19,30 @@ Related governance docs:
 
 ## [Unreleased]
 
+### 2026-04-26 — Open-source usability and `arle` front door cleanup
+
+#### CLI / DX
+- Added `arle serve`, a unified front door that launches the matching serving
+  binary (`infer`, `metal_serve`, or `cpu_serve`) from the release artifact or
+  PATH.
+- Added `--no-tools` for the local agent runtime so one-shot and REPL prompts
+  can explicitly disable built-in shell/python tool execution.
+- Extended `arle --doctor --json` to schema version 3 with tool/sandbox
+  diagnostics, including the detected sandbox backend.
+
+#### Packaging
+- Renamed release tarballs to `arle-<version>-<platform>.tar.gz`.
+- macOS release artifacts now include both `arle` and `metal_serve`; Linux
+  artifacts include `arle`, `infer`, and `bench_serving`.
+- The Docker image now uses `ghcr.io/cklxx/arle` and enters through `arle`
+  instead of exposing only `infer`.
+
+#### Docs and examples
+- Added copyable examples under `examples/` for curl, stdlib Python,
+  Docker Compose, Apple Silicon local serving, and the tiny train fixture.
+- Updated README, Chinese README, support matrix, release checklist, and
+  security guidance for the unified front door and tool safety controls.
+
 ### 2026-04-25 — Truth-surface cleanup
 
 Documentation-only refactor that collapses `docs/` to a single source of

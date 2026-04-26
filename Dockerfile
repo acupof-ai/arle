@@ -1,8 +1,8 @@
 # ============================================================================
-# agent-infer: multi-stage Docker build
+# ARLE: multi-stage Docker build
 # ============================================================================
-# Build:  docker build -t agent-infer .
-# Run:    docker run --gpus all -v /path/to/model:/model ghcr.io/cklxx/agent-infer:latest --model-path /model
+# Build:  docker build -t arle .
+# Run:    docker run --gpus all -v /path/to/model:/model ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /model
 # ============================================================================
 
 # --- Stage 1: Build ---
@@ -30,7 +30,8 @@ ENV CUDA_HOME=/usr/local/cuda
 WORKDIR /build
 COPY . .
 
-RUN cargo build -p infer --release
+RUN cargo build -p infer --release && \
+    cargo build --release --features cli -p agent-infer --bin arle
 
 # --- Stage 2: Runtime ---
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
@@ -40,11 +41,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/infer /usr/local/bin/infer
-RUN ln -s /usr/local/bin/infer /usr/local/bin/agent-infer
+COPY --from=builder /build/target/release/arle /usr/local/bin/arle
+RUN ln -s /usr/local/bin/arle /usr/local/bin/agent-infer
 
 ENV LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64
 
 EXPOSE 8000
 
-ENTRYPOINT ["infer"]
-CMD ["--port", "8000", "--num-slots", "4", "--cuda-graph", "true"]
+ENTRYPOINT ["arle"]
+CMD ["--help"]
