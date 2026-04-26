@@ -39,11 +39,14 @@ Invoked via: pending remote H100 host (user-driven verification).
 - **Hardware:** pending remote NVIDIA H100 host
 - **Commit:** pending; will be filled in once the implementation tranche
   lands and the remote sweep runs.
-- **Feature set (off):** `CUDA_HOME=/usr/local/cuda cargo build --release`
-- **Feature set (on):**  `CUDA_HOME=/usr/local/cuda cargo build --release --features cuda,tilelang-attn`
+- **Feature set (off):** `CUDA_HOME=/usr/local/cuda cargo build --release --features cuda` (workspace root)
+- **Feature set (on):**  `CUDA_HOME=/usr/local/cuda cargo build --release --features cuda,tilelang-attn` (workspace root)
 - **Non-default flags / env vars:** `INFER_TILELANG_PYTHON` if a non-default
   Python interpreter is needed for AOT, otherwise none.
-- **Server launch:** `scripts/start_infer.sh models/Qwen3-4B 8000`
+- **Server launch (off):** `INFER_FEATURES="cuda" scripts/start_infer.sh models/Qwen3-4B 8000`
+- **Server launch (on):**  `INFER_FEATURES="cuda,tilelang-attn" scripts/start_infer.sh models/Qwen3-4B 8000`
+  Both invocations build and run the `infer` binary directly so the Tile-
+  Lang feature actually reaches the prefill path.
 
 ## Canonical params (DO NOT CHANGE PER-RUN)
 
@@ -60,7 +63,11 @@ Invoked via: pending remote H100 host (user-driven verification).
 - Local verification completed (macOS workspace):
   - `cargo fmt --check`
   - `cargo check -p infer --no-default-features --features cuda,no-cuda`
-  - (Optionally: `cargo check -p infer-cuda-kernels --features tilelang-attn`
+  - `cargo check -p infer --no-default-features --features cuda,no-cuda,tilelang-attn`
+  - `cargo check --features cuda,tilelang-attn` (workspace root, with `no-cuda`
+    on macOS) verifies the feature forwarding chain root → cli → infer →
+    cuda-kernels.
+  - (Optionally: `cargo check -p cuda-kernels --features tilelang-attn`
     once the spike lands; this verifies the build.rs Python probe path
     without nvcc.)
 

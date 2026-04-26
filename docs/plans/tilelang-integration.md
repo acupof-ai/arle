@@ -34,23 +34,25 @@ remote-only.
 
 ## 2 · Sub-graph contract (precise boundary)
 
-Replace **only** these two FFI calls:
+Replace both halves of the FlashInfer paged prefill HD128 path under
+`feature = "tilelang-attn"`:
 
-- `flashinfer_batch_prefill_paged_hd128_plan`
-  (`crates/cuda-kernels/src/ffi/attention.rs:410`)
-- `flashinfer_batch_prefill_paged_hd128_run`
-  (`crates/cuda-kernels/src/ffi/attention.rs:427`)
+- The per-forward `plan.plan_hd128(...)` call in
+  `PagedPrefillForward::new_hd128` (`infer/src/ops/attention.rs`) — TileLang
+  reads paged KV directly and never consumes the FlashInfer plan_info, so
+  paying for the plan would taint the A/B comparison.
+- The per-layer `flashinfer_batch_prefill_paged_hd128_run` FFI call in
+  `prefill_attention_paged_batch` (same file).
 
 Keep untouched:
 
 - `prefill_attention_paged_prep_cuda` (RMS norm + RoPE + KV write to paged
-  pool) — this is data-path, orthogonal to attention compute.
-- HD256 prefill (`flashinfer_batch_prefill_paged_hd256_*`) — Qwen3.5
-  full-attn parity, out of scope.
+  pool) — data-path, orthogonal to attention compute.
+- HD256 prefill — Qwen3.5 full-attn parity, out of scope.
 - Decode HD128/HD256 — out of scope (Phase 1 if Phase 0 wins).
 - All projections, residual, MLP, norms outside the prep kernel.
 
-**Contract for the TileLang kernel** (BF16 throughout, causal mask, no soft-cap):
+**Contract for each TileLang kernel** (BF16 throughout, causal mask, no soft-cap):
 
 ```text
 Inputs (device pointers):
@@ -63,14 +65,24 @@ Inputs (device pointers):
   kv_last_page_len : [batch_size]
 Outputs:
   o          : [packed_tokens, num_q_heads * 128]
-Scalars:
-  num_q_heads = 32, num_kv_heads = 8 (Qwen3-4B/8B; both share these)
-  head_dim    = 128
-  sm_scale    = 1.0 / sqrt(128)
+Compile-time invariants (one cubin per (num_q_heads, num_kv_heads) pair):
+  head_dim   = 128
+  page_size  = 16
+  sm_scale   = 1.0 / sqrt(128)
+Runtime scalars:
+  batch_size, total_q_tokens, max_qlen,
+  num_q_heads, num_kv_heads (passed for symmetry; redundant with the cubin's
+  baked constants but kept in the FFI signature so the C wrapper can
+  validate-and-launch without indirection).
 ```
 
-This signature is identical to the FlashInfer `_run` call, minus the
-plan-info opaque buffer and minus LSE (we never read it).
+The cubin set is AOT-specialized at build time over the Qwen3 HD128 family:
+`(16,8)` 0.6B/1.7B, `(32,8)` 4B/8B, `(40,8)` 14B, `(64,8)` 32B.  Rust
+dispatches by `(num_q_heads, num_kv_heads)`; an unsupported pair returns an
+`anyhow!` error pointing at the three lockstep lists to extend
+(`SUPPORTED_HEADS` in the Python kernel module,
+`TILELANG_PREFILL_HD128_HEAD_CONFIGS` in `cuda-kernels/build.rs`, and the
+FFI macro arms in `cuda-kernels/src/ffi/attention.rs`).
 
 ---
 
@@ -122,16 +134,15 @@ not in the source tree. No hand-written `.cu` wrapper is added.
 
 | Path | Change |
 |------|--------|
-| `infer/Cargo.toml` | Add `tilelang-attn` feature → forwards to `cuda-kernels/tilelang-attn`. Implies `cuda`. |
-| `crates/cuda-kernels/Cargo.toml` | Add `tilelang-attn = ["cuda"]` feature. |
-| `crates/cuda-kernels/build.rs` | Behind `cfg(feature = "tilelang-attn")`: probe Python with `import tilelang`, run AOT generator for the prefill kernel, compile generated C wrapper into the kernel `.a`. Mirrors the existing Triton track lines 265–510. |
-| `crates/cuda-kernels/src/ffi/attention.rs` | Add `tilelang_batch_prefill_paged_hd128_run` extern declaration behind `cfg(feature = "tilelang-attn")`. Same arg list as the FlashInfer `_run`, minus the opaque plan info. |
-| `crates/cuda-kernels/src/lib.rs` | Module/feature gating only. |
-| `infer/src/ops/attention.rs` | At the FlashInfer call site (~line 540 in `prefill_attention_paged_batch`): when `cfg(feature = "tilelang-attn")` is set, dispatch to TileLang; otherwise dispatch to FlashInfer. **No runtime branch** (compile-time only) for Phase 0 — A/B is feature-build vs default-build, not a runtime toggle. This matches `feedback_no_half_states.md`: one canonical path per build. |
-| `pyproject.toml` | Add `[project.optional-dependencies] tilelang = ["tilelang>=…"]`. Pin in §6 once spike picks a version. |
-
-**Total:** 6 new files, 7 modified files = 13 files. Within the >5-file
-threshold; this is why approach-first + plan doc lands before code.
+| `Cargo.toml` (workspace root) | Add `tilelang-attn = ["cli/tilelang-attn"]` so `cargo build --features cuda,tilelang-attn` at the repo root reaches the actual prefill path instead of producing a silently-FlashInfer binary. |
+| `crates/cli/Cargo.toml` | Add `tilelang-attn = ["infer/tilelang-attn"]` to forward through the CLI crate. |
+| `infer/Cargo.toml` | Add `tilelang-attn = ["cuda", "cuda-kernels/tilelang-attn"]`. |
+| `crates/cuda-kernels/Cargo.toml` | Add `tilelang-attn = ["cuda"]`. |
+| `crates/cuda-kernels/build.rs` | Behind `cfg(feature = "tilelang-attn")`: probe Python with `import tilelang`, loop over `TILELANG_PREFILL_HD128_HEAD_CONFIGS` running the AOT generator once per `(num_q_heads, num_kv_heads)` pair, compile all generated C wrappers into a single `libtilelang_kernels_aot.a`. Mirrors the existing Triton track. |
+| `crates/cuda-kernels/src/ffi/attention.rs` | Declare one `tilelang_batch_prefill_paged_hd128_q{Q}_kv{KV}_run_cuda` extern per supported head config via a small `macro_rules!`. Single shared parameter list. |
+| `infer/src/ops/attention.rs` | (a) Cfg-gate the per-forward `plan.plan_hd128(...)` call so `tilelang-attn` skips FlashInfer plan setup. (b) At the per-layer dispatch site, match on `(num_q_heads, num_kv_heads)` to pick the matching FFI symbol; unsupported pairs return an `anyhow!` error pointing at the three lockstep lists. **Compile-time only** — one canonical path per build (`feedback_no_half_states.md`). |
+| `scripts/start_infer.sh` | Honor `INFER_FEATURES` env var (default `cuda`) so the bench wrapper can launch a TileLang-on server without editing the script. |
+| `pyproject.toml` | Add `[project.optional-dependencies] tilelang = ["tilelang>=…"]`. Pin in §6 once the H100 spike picks a version. |
 
 ### 4.3 Deliberately NOT changed
 
