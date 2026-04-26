@@ -149,9 +149,9 @@ pub use chunk::{
 };
 pub use coordinator::{
     Coordinator, CoordinatorBuilder, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle,
-    CoordinatorQueueStats, FailureClass, FetchRequest, FetchTicket, FetchedBlock,
+    CoordinatorQueueStats, FailureClass, FetchRequest, FetchTicket, FetchedBlock, NoOrchestrator,
     QueueBackpressure, QueueControlStats, QueueKind, QueueTicket, StoreRequest, StoreTarget,
-    StoreTicket,
+    StoreTicket, WithOrchestrator,
 };
 pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;

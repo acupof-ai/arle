@@ -3,12 +3,22 @@
 //! is the snapshot types in [`super::types`].
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::types::{
     CoordinatorQueueStats, QueueControlStats, QueueKind, QueueOutcome, QueueTicket,
 };
+
+/// Acquire `mutex`, recovering by `PoisonError::into_inner` if poisoned.
+/// Coordinator policy: bookkeeping locks are kept narrow and any poisoning
+/// is local to a single failed ticket, so we trade strict poison propagation
+/// for forward progress on the queue. The canonical write-up of why
+/// coordinator paths use `into_inner` while direct host-pool I/O does not
+/// lives at `kv_tier::host_pool::SharedHostPinnedPool::lock`.
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Debug)]
 pub(super) struct QueueCounters {
@@ -82,10 +92,7 @@ impl CoordinatorControl {
         let queue = self.queue(ticket.kind());
         queue.submitted.fetch_add(1, Ordering::Relaxed);
         queue.queued.fetch_add(1, Ordering::Relaxed);
-        let mut live = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = lock_recover(&self.live);
         live.insert(ticket);
     }
 
@@ -113,39 +120,24 @@ impl CoordinatorControl {
                 queue.cancelled.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let mut live = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = lock_recover(&self.live);
         live.remove(&ticket);
-        let mut cancelled = self
-            .cancelled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cancelled = lock_recover(&self.cancelled);
         cancelled.remove(&ticket);
     }
 
     pub(super) fn cancel(&self, ticket: QueueTicket) -> bool {
-        let live = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = lock_recover(&self.live);
         if !live.contains(&ticket) {
             return false;
         }
         drop(live);
-        let mut cancelled = self
-            .cancelled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cancelled = lock_recover(&self.cancelled);
         cancelled.insert(ticket)
     }
 
     pub(super) fn is_cancelled(&self, ticket: QueueTicket) -> bool {
-        let cancelled = self
-            .cancelled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancelled = lock_recover(&self.cancelled);
         cancelled.contains(&ticket)
     }
 

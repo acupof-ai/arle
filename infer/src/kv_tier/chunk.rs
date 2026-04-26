@@ -155,9 +155,16 @@ impl KVSpan {
 }
 
 /// Lightweight control-plane reference that points at a concrete location.
+///
+/// `span_id` is `Option`al because some callers (notably the coordinator's
+/// per-block remote store / fetch path) construct one-off handles for blocks
+/// that do not belong to a tracked [`KVSpan`]. Span-level dedup keys live
+/// in [`SpanTaskKey`], which still requires a real span — code that builds a
+/// `SpanTaskKey` from a `KVHandle` must skip handles where `span_id` is
+/// `None`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KVHandle {
-    pub span_id: KVSpanId,
+    pub span_id: Option<KVSpanId>,
     pub block_id: BlockId,
     pub location: BlockLocation,
     pub epoch: u64,
@@ -166,7 +173,7 @@ pub struct KVHandle {
 
 impl KVHandle {
     pub fn new(
-        span_id: KVSpanId,
+        span_id: Option<KVSpanId>,
         block_id: BlockId,
         location: BlockLocation,
         epoch: u64,
@@ -234,7 +241,7 @@ mod tests {
     #[test]
     fn handle_location_updates_do_not_mutate_original() {
         let handle = KVHandle::new(
-            KVSpanId(11),
+            Some(KVSpanId(11)),
             BlockId(5),
             BlockLocation::Gpu { slot: 3 },
             9,
