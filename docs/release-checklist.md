@@ -24,7 +24,10 @@ Review and update, as needed:
 
 1. `README.md`
 2. `README.zh-CN.md`
-3. `ROADMAP.md`
+3. `ROADMAP.md` — **read top-to-bottom**: the file is a public commitment;
+   pull anything that has actually shipped out of "Active Priorities" into
+   `CHANGELOG.md`, and re-state the next-release horizon honestly. A stale
+   ROADMAP is a worse signal than no ROADMAP.
 4. `docs/index.md`
 5. `CONTRIBUTING.md`
 6. `CHANGELOG.md`
@@ -38,6 +41,22 @@ At minimum, make sure:
 - deprecated or removed surfaces are documented
 - migration guidance exists when required
 
+### 2a. Bump the workspace version
+
+Cargo's `workspace.package.version` lives in the root `Cargo.toml`. Before
+tagging `vX.Y.Z`, sync it to that version so anyone reading `Cargo.lock` or
+`cargo metadata` can correlate a build to the release. The simplest path:
+
+```bash
+cargo install cargo-edit            # one-time, if not already installed
+cargo set-version --workspace X.Y.Z # then commit the change
+```
+
+If you skip this step, the binaries you ship will still report the *previous*
+version via `arle --version`, which has confused operators and bisecting
+contributors before. The hygiene check does not catch this — that's why the
+bump lives in this checklist.
+
 ---
 
 ## 3. Run Validation
@@ -48,7 +67,7 @@ Typical baseline:
 cargo test --no-default-features --features no-cuda
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
-python -m pytest tests/ -v
+python -m pytest tests/python/ -v
 ```
 
 Then add targeted validation depending on what changed.
@@ -140,6 +159,8 @@ After release:
 ## 8. Short Checklist
 
 - [ ] Docs updated
+- [ ] ROADMAP reviewed top-to-bottom; shipped items moved to CHANGELOG
+- [ ] Workspace version bumped (`cargo set-version --workspace X.Y.Z`)
 - [ ] Changelog updated
 - [ ] Compatibility reviewed
 - [ ] Support matrix updated
