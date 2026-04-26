@@ -66,11 +66,6 @@ export type FooterCol = {
   links: { label: string; href: string; placeholder?: boolean }[];
 };
 
-export type DemoLine = {
-  // Pre-formatted HTML (using the `demo-*` span classes) — keeps spacing intact.
-  html: string;
-};
-
 export type Locale = {
   lang: string;
   hreflang: string;
@@ -91,18 +86,10 @@ export type Locale = {
   manfoot: { left: string; center: string; right: string };
   hero: {
     kicker: string;
-    subline: string;
     tagline: string; // raw HTML allowed
     signals: Signal[];
     primaryCta: string;
     secondaryCta: string;
-    panelKicker: string;
-    panelTitle: string; // raw HTML allowed
-    metaRows: { k: string; v: string }[]; // v allows HTML
-    panelNote: string;
-    demoKicker: string;
-    demoLabel: string;
-    demoLines: DemoLine[];
   };
   jumps: { label: string; href: string }[];
   langSwitch: {
@@ -195,18 +182,6 @@ const TOPOLOGY_DIAGRAM = `   ┌────────────────
    cuda-kernels      mlx-sys             kv-native-sys
    FlashInfer +      MLX C++ bridge      local KV-tier
    Triton AOT        cmake + cc build    persistence`;
-
-// Demo terminal — same lines for both locales. Lead with the runnable
-// install line so the hero shows action, not narration.
-const DEMO_LINES_EN: DemoLine[] = [
-  { html: '<span class="demo-prompt">$</span> docker run --gpus all -p 8000:8000 \\' },
-  { html: '<span class="demo-comment">    </span>-v /models/Qwen3-4B:/model:ro \\' },
-  { html: '<span class="demo-comment">    </span>ghcr.io/cklxx/arle:latest serve' },
-  { html: '<span class="demo-ok">✓</span> <span class="demo-key">backend</span>=<span class="demo-val">cuda</span>   <span class="demo-key">model</span>=<span class="demo-val">Qwen3-4B</span>   <span class="demo-key">paged</span>=<span class="demo-val">16</span>' },
-  { html: '<span class="demo-ready">READY</span>' },
-  { html: '<span class="demo-listen">listening</span> on <span class="demo-val">127.0.0.1:8000</span>   <span class="demo-comment">openai-v1</span>' },
-  { html: '<span class="demo-prompt">$</span> curl -s :8000/v1/models | jq -r .data[0].id' },
-];
 
 const DOCFOOT_EN: FooterCol[] = [
   {
@@ -302,26 +277,11 @@ export const EN: Locale = {
   manfoot: { left: "ARLE(1)", center: "April 2026", right: "ARLE(1)" },
   hero: {
     kicker: "runtime-first rust workspace",
-    subline: "agent reinforcement learning engine",
     tagline:
-      'One runtime authority. <span class="hl">infer</span> serves OpenAI-compatible traffic; <span class="hl">arle</span> fronts local agent, train, eval, and data workflows.',
+      '<span class="hl">infer</span> serves OpenAI-compatible traffic. <span class="hl">arle</span> operates the local agent, train, eval, and data flows. One Rust workspace.',
     signals: SIGNALS,
     primaryCta: "Quickstart",
     secondaryCta: "cklxx/arle",
-    panelKicker: "PUBLIC SURFACE",
-    panelTitle: "<code>infer</code> serves. <code>arle</code> operates.",
-    metaRows: [
-      { k: "Project", v: "ARLE" },
-      { k: "Front door", v: "<code>arle</code>" },
-      { k: "Serving", v: "<code>infer</code>" },
-      { k: "Primary backend", v: "CUDA" },
-      { k: "Local path", v: "Metal / CPU" },
-    ],
-    panelNote:
-      "Docs, binaries, train/eval flows, and dataset tooling move together in one workspace instead of splitting across parallel stacks.",
-    demoKicker: "live demo",
-    demoLabel: "/dev/tty · zsh",
-    demoLines: DEMO_LINES_EN,
   },
   jumps: [
     { label: "[install]", href: "#install" },
@@ -598,26 +558,11 @@ export const ZH: Locale = {
   manfoot: { left: "ARLE(1)", center: "2026 年 4 月", right: "ARLE(1)" },
   hero: {
     kicker: "runtime-first rust workspace",
-    subline: "agent reinforcement learning engine",
     tagline:
-      '一套运行时权威。<span class="hl">infer</span> 负责 OpenAI 兼容 serving；<span class="hl">arle</span> 负责本地 agent、训练、评测与数据工作流前门。',
+      '<span class="hl">infer</span> 负责 OpenAI 兼容 serving。<span class="hl">arle</span> 负责本地 agent、训练、评测、数据流。一套 Rust workspace。',
     signals: SIGNALS,
     primaryCta: "Quickstart",
     secondaryCta: "cklxx/arle",
-    panelKicker: "PUBLIC SURFACE",
-    panelTitle: "<code>infer</code> 负责 serving，<code>arle</code> 负责操作前门。",
-    metaRows: [
-      { k: "项目名", v: "ARLE" },
-      { k: "前门", v: "<code>arle</code>" },
-      { k: "服务面", v: "<code>infer</code>" },
-      { k: "主后端", v: "CUDA" },
-      { k: "本地路径", v: "Metal / CPU" },
-    ],
-    panelNote:
-      "文档、二进制、train/eval 流程和数据集工具都跟随同一套 workspace 演进，不再拆成几条并行口径。",
-    demoKicker: "实时演示",
-    demoLabel: "/dev/tty · zsh",
-    demoLines: DEMO_LINES_EN,
   },
   jumps: [
     { label: "[安装]", href: "#install" },
