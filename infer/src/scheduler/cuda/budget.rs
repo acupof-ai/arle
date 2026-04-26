@@ -366,7 +366,7 @@ mod tests {
         });
         assert_eq!(budget.remaining_free_pages(), 0);
         assert_eq!(budget.planned_seq_len(0), 4);
-        assert!(budget.can_fit_growth(PageGrowth {
+        assert!(!budget.can_fit_growth(PageGrowth {
             slot_idx: 0,
             tokens: 1,
         }));

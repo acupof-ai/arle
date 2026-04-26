@@ -161,6 +161,22 @@ fn select_prefill_candidates(
     selected
 }
 
+fn cap_prefill_candidates_by_tokens(
+    candidates: Vec<PrefillCandidate>,
+    token_budget: usize,
+) -> Vec<PrefillCandidate> {
+    let mut remaining = token_budget;
+    let mut capped = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if candidate.reservation.prefill_tokens > remaining {
+            continue;
+        }
+        remaining -= candidate.reservation.prefill_tokens;
+        capped.push(candidate);
+    }
+    capped
+}
+
 impl<M: ModelForward> Scheduler<M> {
     fn dispatch_decode_emits(&mut self) -> u128 {
         let emit_t = std::time::Instant::now();
@@ -265,6 +281,27 @@ impl<M: ModelForward> Scheduler<M> {
             });
         }
         select_prefill_candidates(&mut budget, scored_candidates)
+    }
+
+    fn mixed_prefill_token_budget(&self) -> usize {
+        // Mixed uses one TC FlashInfer plan for decode rows plus all packed
+        // prefill rows. Keep the total prefill side at the long-prefill cap
+        // instead of letting the whole step budget become one huge QO tensor.
+        self.config
+            .max_prefill_tokens
+            .min(self.config.long_prefill_token_threshold)
+            .max(1)
+    }
+
+    pub(super) fn select_mixed_launch_prefill_candidates(
+        &self,
+        candidates: &[PrefillCandidate],
+        decode_slots: &[usize],
+    ) -> Vec<PrefillCandidate> {
+        cap_prefill_candidates_by_tokens(
+            self.select_launch_prefill_candidates(candidates, decode_slots),
+            self.mixed_prefill_token_budget(),
+        )
     }
 
     fn collect_prefill_candidates(
@@ -446,7 +483,8 @@ impl<M: ModelForward> Scheduler<M> {
 mod tests {
     use super::{
         PrefillBudget, PrefillCandidate, PrefillCandidateScore, PrefillReservation,
-        ScoredPrefillCandidate, score_prefill_candidates, select_prefill_candidates,
+        ScoredPrefillCandidate, cap_prefill_candidates_by_tokens, score_prefill_candidates,
+        select_prefill_candidates,
     };
     use crate::scheduler::cuda::budget::{PageBudget, PageGrowth, StepTokenBudget};
 
@@ -651,6 +689,52 @@ mod tests {
                 PrefillCandidateScore { queue_rank: 0 },
                 PrefillCandidateScore { queue_rank: 1 }
             ]
+        );
+    }
+
+    #[test]
+    fn mixed_prefill_cap_preserves_queue_order_and_skips_oversized_rows() {
+        let candidates = vec![
+            PrefillCandidate {
+                slot_idx: 0,
+                reservation: PrefillReservation {
+                    prefill_tokens: 3,
+                    page_growth: PageGrowth {
+                        slot_idx: 0,
+                        tokens: 3,
+                    },
+                },
+            },
+            PrefillCandidate {
+                slot_idx: 1,
+                reservation: PrefillReservation {
+                    prefill_tokens: 4,
+                    page_growth: PageGrowth {
+                        slot_idx: 1,
+                        tokens: 4,
+                    },
+                },
+            },
+            PrefillCandidate {
+                slot_idx: 2,
+                reservation: PrefillReservation {
+                    prefill_tokens: 2,
+                    page_growth: PageGrowth {
+                        slot_idx: 2,
+                        tokens: 2,
+                    },
+                },
+            },
+        ];
+
+        let selected = cap_prefill_candidates_by_tokens(candidates, 5);
+
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|candidate| candidate.slot_idx)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
         );
     }
 
