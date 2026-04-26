@@ -923,6 +923,7 @@ impl<M: ModelForward> Scheduler<M> {
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
         let effective_prefill_token_budget = config.max_prefill_tokens;
+        let effective_mixed_prefill_token_budget = config.mixed_prefill_token_budget();
 
         // When the model writes prefill K/V directly to the paged pool, the
         // per-slot contiguous scratch buffer is unused by prefill. Shrink it
@@ -958,10 +959,13 @@ impl<M: ModelForward> Scheduler<M> {
             // large pool can leave no contiguous room for decode / prefill
             // attention workspaces and fail mid-request.
             let runtime_workspace = model.scheduler_runtime_workspace_bytes(
-                config.max_slots,
-                effective_prefill_token_budget,
-                effective_max_seq_len,
-                kv_pool_format,
+                crate::model::SchedulerRuntimeWorkspaceBudget {
+                    max_batch_size: config.max_slots,
+                    prefill_tokens: effective_prefill_token_budget,
+                    mixed_prefill_tokens: effective_mixed_prefill_token_budget,
+                    max_seq_len: effective_max_seq_len,
+                    kv_pool_format,
+                },
             );
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
             {
