@@ -124,6 +124,9 @@ pub struct CoordinatorQueueStats {
     pub plan: QueueControlStats,
     pub fetch: QueueControlStats,
     pub store: QueueControlStats,
+    /// Filled by scheduler post-snapshot via [`Self::with_fetch_waiters`];
+    /// the coordinator itself does not track scheduler-side waiters.
+    /// See `scheduler/cuda/core.rs`.
     pub fetch_waiters: usize,
 }
 
@@ -343,6 +346,25 @@ enum QueueOutcome {
     Completed,
     Failed,
     Cancelled,
+}
+
+/// Typed classification of how a queue task failed. Each call site already
+/// knows whether it is reporting a cooperative cancel (saw `is_cancelled`
+/// return true) or a hard failure — pass the typed variant instead of
+/// shipping the distinction through reason-string substring matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    Cancelled,
+    Failed,
+}
+
+impl FailureClass {
+    fn into_outcome(self) -> QueueOutcome {
+        match self {
+            Self::Cancelled => QueueOutcome::Cancelled,
+            Self::Failed => QueueOutcome::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -598,48 +620,170 @@ pub struct Coordinator {
     control: Arc<CoordinatorControl>,
 }
 
-impl Coordinator {
-    pub fn new(queue_capacity: usize) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        Self::new_with_optional_backends(queue_capacity, None, None)
+/// RAII guard for host-pinned regions allocated mid-fetch that must be
+/// released back to the pool unless ownership transfers to the caller via
+/// the success path.
+///
+/// Replaces the prior pattern of calling a static `release_allocated_regions`
+/// helper at every `return self.fetch_failed(...)` branch — easy to forget
+/// when adding a new branch and the source of one historical leak audit.
+/// The fetch happy-path explicitly calls [`Self::commit`] at the end, which
+/// no-ops the destructor; every error path simply returns and Drop releases.
+struct AllocatedRegions {
+    regions: Vec<(
+        crate::kv_tier::host_pool::SharedHostPinnedPool,
+        crate::kv_tier::host_pool::HostPinnedRegion,
+    )>,
+    committed: bool,
+}
+
+impl AllocatedRegions {
+    fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+            committed: false,
+        }
     }
 
-    pub fn new_with_disk_store(
-        queue_capacity: usize,
-        disk_store: Arc<DiskStore>,
-    ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        Self::new_with_optional_backends(queue_capacity, Some(disk_store), None)
+    fn push(
+        &mut self,
+        pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
+        region: crate::kv_tier::host_pool::HostPinnedRegion,
+    ) {
+        self.regions.push((pool, region));
     }
 
-    pub fn new_with_backends(
-        queue_capacity: usize,
-        disk_store: Option<Arc<DiskStore>>,
-        cluster_shared_backend: Option<ClusterSharedBackend>,
-    ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        Self::new_with_optional_backends(queue_capacity, disk_store, cluster_shared_backend)
+    /// Mark every accumulated region as ownership-transferred to the caller.
+    /// After commit, `Drop` is a no-op.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AllocatedRegions {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (pool, region) in &self.regions {
+            if let Err(err) = pool.release_region(*region) {
+                log::warn!(
+                    "coordinator AllocatedRegions drop: release_region failed offset={} len={}: {}",
+                    region.offset,
+                    region.len,
+                    err
+                );
+            }
+        }
+    }
+}
+
+/// Fluent builder for [`Coordinator`]. Replaced the previous family of
+/// telescoping constructors (`Coordinator::new`, `new_with_disk_store`,
+/// `new_with_backends`, `new_with_orchestrator_events`) so that adding a new
+/// optional backend or channel does not multiply constructor surface.
+pub struct CoordinatorBuilder {
+    queue_capacity: usize,
+    disk_store: Option<Arc<DiskStore>>,
+    cluster_shared_backend: Option<ClusterSharedBackend>,
+    with_orchestrator_events: bool,
+}
+
+impl CoordinatorBuilder {
+    /// New builder with the given bounded-channel capacity. Capacity is
+    /// clamped to `>= 1` at `build*` time.
+    pub fn new(queue_capacity: usize) -> Self {
+        Self {
+            queue_capacity,
+            disk_store: None,
+            cluster_shared_backend: None,
+            with_orchestrator_events: false,
+        }
     }
 
-    pub fn new_with_orchestrator_events(
-        queue_capacity: usize,
-        disk_store: Option<Arc<DiskStore>>,
-        cluster_shared_backend: Option<ClusterSharedBackend>,
+    /// Attach a node-local disk-tier store (T2). Required for any disk-backed
+    /// store/fetch; absent → coordinator returns "disk store not configured".
+    #[must_use]
+    pub fn disk_store(mut self, store: Arc<DiskStore>) -> Self {
+        self.disk_store = Some(store);
+        self
+    }
+
+    /// Attach a cluster-shared backend (T3). Required for any remote-target
+    /// store/fetch; absent → coordinator returns "remote store not configured".
+    #[must_use]
+    pub fn cluster_shared_backend(mut self, backend: ClusterSharedBackend) -> Self {
+        self.cluster_shared_backend = Some(backend);
+        self
+    }
+
+    /// Enable the secondary orchestrator-events channel. When set, `build` is
+    /// not callable — use [`Self::build_with_orchestrator`] instead so the
+    /// extra `Receiver<OrchestratorEvent>` is returned.
+    #[must_use]
+    pub fn with_orchestrator_events(mut self) -> Self {
+        self.with_orchestrator_events = true;
+        self
+    }
+
+    /// Build a coordinator without the orchestrator-events channel.
+    /// Panics if [`Self::with_orchestrator_events`] was set; that path must
+    /// use [`Self::build_with_orchestrator`].
+    pub fn build(self) -> (Coordinator, CoordinatorHandle, Receiver<CoordinatorEvent>) {
+        assert!(
+            !self.with_orchestrator_events,
+            "CoordinatorBuilder::build called with orchestrator events enabled; use build_with_orchestrator",
+        );
+        let (coord, handle, events, _) = self.build_inner(false);
+        (coord, handle, events)
+    }
+
+    /// Build a coordinator with both the legacy event channel and the
+    /// orchestrator-events channel.
+    pub fn build_with_orchestrator(
+        mut self,
     ) -> (
-        Self,
+        Coordinator,
         CoordinatorHandle,
         Receiver<CoordinatorEvent>,
         Receiver<OrchestratorEvent>,
     ) {
-        let capacity = queue_capacity.max(1);
+        self.with_orchestrator_events = true;
+        let (coord, handle, events, orch) = self.build_inner(true);
+        (
+            coord,
+            handle,
+            events,
+            orch.expect("orchestrator events requested"),
+        )
+    }
+
+    fn build_inner(
+        self,
+        with_orchestrator: bool,
+    ) -> (
+        Coordinator,
+        CoordinatorHandle,
+        Receiver<CoordinatorEvent>,
+        Option<Receiver<OrchestratorEvent>>,
+    ) {
+        let capacity = self.queue_capacity.max(1);
         let (tx, rx) = bounded(capacity);
         let (event_tx, event_rx) = bounded(capacity);
-        let (orchestrator_tx, orchestrator_rx) = bounded(capacity);
+        let (orchestrator_tx, orchestrator_rx) = if with_orchestrator {
+            let (tx, rx) = bounded::<OrchestratorEvent>(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let control = Arc::new(CoordinatorControl::new(capacity));
         (
-            Self {
+            Coordinator {
                 rx,
                 events: event_tx,
-                orchestrator_events: Some(orchestrator_tx),
-                disk_store,
-                cluster_shared_backend,
+                orchestrator_events: orchestrator_tx,
+                disk_store: self.disk_store,
+                cluster_shared_backend: self.cluster_shared_backend,
                 control: control.clone(),
             },
             CoordinatorHandle {
@@ -651,34 +795,9 @@ impl Coordinator {
             orchestrator_rx,
         )
     }
+}
 
-    fn new_with_optional_backends(
-        queue_capacity: usize,
-        disk_store: Option<Arc<DiskStore>>,
-        cluster_shared_backend: Option<ClusterSharedBackend>,
-    ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        let capacity = queue_capacity.max(1);
-        let (tx, rx) = bounded(capacity);
-        let (event_tx, event_rx) = bounded(capacity);
-        let control = Arc::new(CoordinatorControl::new(capacity));
-        (
-            Self {
-                rx,
-                events: event_tx,
-                orchestrator_events: None,
-                disk_store,
-                cluster_shared_backend,
-                control: control.clone(),
-            },
-            CoordinatorHandle {
-                tx,
-                next_ticket: Arc::new(AtomicU64::new(1)),
-                control,
-            },
-            event_rx,
-        )
-    }
-
+impl Coordinator {
     fn emit_event(&self, event: CoordinatorEvent) -> Result<()> {
         self.events
             .send(event)
@@ -695,102 +814,64 @@ impl Coordinator {
         self.control.is_cancelled(ticket)
     }
 
-    fn release_allocated_regions(
-        regions: &[(
-            crate::kv_tier::host_pool::SharedHostPinnedPool,
-            crate::kv_tier::host_pool::HostPinnedRegion,
-        )],
-    ) {
-        for (pool, region) in regions {
-            if let Err(err) = pool.release_region(*region) {
-                log::warn!(
-                    "coordinator failed to release allocated host region offset={} len={}: {}",
-                    region.offset,
-                    region.len,
-                    err
-                );
-            }
-        }
-    }
-
-    fn plan_failed(
+    /// Typed classification of how a queued task ended in non-success.
+    /// Replaces fragile substring matching on the failure reason string —
+    /// each call site already knows whether it is reporting a cancel
+    /// (cooperative `is_cancelled` check returned true) or a hard failure.
+    fn report_failure(
         &self,
-        ticket: PlanTicket,
+        ticket: QueueTicket,
         failed_block: BlockId,
-        reason: impl Into<String>,
-    ) -> QueueOutcome {
-        let reason = reason.into();
-        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-            queue: QueueKind::Plan,
-            ticket: QueueTicket::Plan(ticket),
-            failed_block,
-            reason: reason.clone(),
-        });
-        if reason.contains("cancelled") {
-            QueueOutcome::Cancelled
-        } else {
-            QueueOutcome::Failed
-        }
-    }
-
-    fn store_failed(
-        &self,
-        ticket: StoreTicket,
-        failed_block: BlockId,
-        reason: impl Into<String>,
-    ) -> QueueOutcome {
-        let reason = reason.into();
-        let _ = self.emit_event(CoordinatorEvent::StoreFailed {
-            ticket,
-            failed_block,
-            reason: reason.clone(),
-        });
-        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-            queue: QueueKind::Store,
-            ticket: QueueTicket::Store(ticket),
-            failed_block,
-            reason: reason.clone(),
-        });
-        if reason.contains("cancelled") {
-            QueueOutcome::Cancelled
-        } else {
-            QueueOutcome::Failed
-        }
-    }
-
-    fn fetch_failed(
-        &self,
-        ticket: FetchTicket,
-        failed_block: BlockId,
+        class: FailureClass,
         reason: impl Into<String>,
     ) -> Result<QueueOutcome> {
         let reason = reason.into();
-        self.emit_event(CoordinatorEvent::FetchFailed {
+        // Per-queue legacy `CoordinatorEvent` emission. Plan has no
+        // `CoordinatorEvent::PlanFailed` variant — surfacing plan failures
+        // is exclusively the orchestrator channel's job.
+        match ticket {
+            QueueTicket::Plan(_) => {}
+            QueueTicket::Store(store_ticket) => {
+                let _ = self.emit_event(CoordinatorEvent::StoreFailed {
+                    ticket: store_ticket,
+                    failed_block,
+                    reason: reason.clone(),
+                });
+            }
+            QueueTicket::Fetch(fetch_ticket) => {
+                self.emit_event(CoordinatorEvent::FetchFailed {
+                    ticket: fetch_ticket,
+                    failed_block,
+                    reason: reason.clone(),
+                })?;
+            }
+        }
+        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
+            queue: ticket.kind(),
             ticket,
             failed_block,
-            reason: reason.clone(),
-        })?;
-        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-            queue: QueueKind::Fetch,
-            ticket: QueueTicket::Fetch(ticket),
-            failed_block,
-            reason: reason.clone(),
+            reason,
         });
-        Ok(if reason.contains("cancelled") {
-            QueueOutcome::Cancelled
-        } else {
-            QueueOutcome::Failed
-        })
+        Ok(class.into_outcome())
     }
 
-    fn handle_plan(&self, ticket: PlanTicket, blocks: &[PrefetchPlanRequest]) -> QueueOutcome {
+    fn handle_plan(
+        &self,
+        ticket: PlanTicket,
+        blocks: &[PrefetchPlanRequest],
+    ) -> Result<QueueOutcome> {
         self.emit_orchestrator_event(OrchestratorEvent::PlanQueued {
             ticket,
             block_count: blocks.len(),
         });
         if self.is_cancelled(ticket.into()) {
             let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
-            return self.plan_failed(ticket, failed_block, "plan cancelled");
+            return self.report_failure(
+                ticket.into(),
+                failed_block,
+                FailureClass::Cancelled,
+                "plan cancelled",
+            );
         }
         let plans = blocks
             .iter()
@@ -806,10 +887,10 @@ impl Coordinator {
             })
             .collect();
         self.emit_orchestrator_event(OrchestratorEvent::PlanCompleted { ticket, plans });
-        QueueOutcome::Completed
+        Ok(QueueOutcome::Completed)
     }
 
-    fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) -> QueueOutcome {
+    fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) -> Result<QueueOutcome> {
         let _ = self.emit_event(CoordinatorEvent::StoreQueued {
             ticket,
             block_count: blocks.len(),
@@ -818,9 +899,15 @@ impl Coordinator {
             ticket,
             block_count: blocks.len(),
         });
-        if self.is_cancelled(ticket.into()) {
+        let queue_ticket: QueueTicket = ticket.into();
+        if self.is_cancelled(queue_ticket) {
             let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
-            return self.store_failed(ticket, failed_block, "store cancelled");
+            return self.report_failure(
+                queue_ticket,
+                failed_block,
+                FailureClass::Cancelled,
+                "store cancelled",
+            );
         }
 
         let disk_store = self.disk_store.as_ref();
@@ -828,20 +915,33 @@ impl Coordinator {
 
         let mut locations = Vec::with_capacity(blocks.len());
         for block in blocks {
-            if self.is_cancelled(ticket.into()) {
-                return self.store_failed(ticket, block.block_id, "store cancelled");
+            if self.is_cancelled(queue_ticket) {
+                return self.report_failure(
+                    queue_ticket,
+                    block.block_id,
+                    FailureClass::Cancelled,
+                    "store cancelled",
+                );
             }
             let payload = match block.host_pool.read_region(block.host_region) {
                 Ok(payload) => payload,
-                Err(err) => return self.store_failed(ticket, block.block_id, err.to_string()),
+                Err(err) => {
+                    return self.report_failure(
+                        queue_ticket,
+                        block.block_id,
+                        FailureClass::Failed,
+                        err.to_string(),
+                    );
+                }
             };
 
             match block.target {
                 StoreTarget::Disk => {
                     let Some(disk_store) = disk_store else {
-                        return self.store_failed(
-                            ticket,
+                        return self.report_failure(
+                            queue_ticket,
                             block.block_id,
+                            FailureClass::Failed,
                             "coordinator disk store not configured",
                         );
                     };
@@ -854,15 +954,21 @@ impl Coordinator {
                             },
                         )),
                         Err(err) => {
-                            return self.store_failed(ticket, block.block_id, err.to_string());
+                            return self.report_failure(
+                                queue_ticket,
+                                block.block_id,
+                                FailureClass::Failed,
+                                err.to_string(),
+                            );
                         }
                     }
                 }
                 StoreTarget::Remote => {
                     let Some(cluster_shared_backend) = cluster_shared_backend else {
-                        return self.store_failed(
-                            ticket,
+                        return self.report_failure(
+                            queue_ticket,
                             block.block_id,
+                            FailureClass::Failed,
                             "coordinator remote store not configured",
                         );
                     };
@@ -872,7 +978,12 @@ impl Coordinator {
                     {
                         Ok(location) => location,
                         Err(err) => {
-                            return self.store_failed(ticket, block.block_id, err.to_string());
+                            return self.report_failure(
+                                queue_ticket,
+                                block.block_id,
+                                FailureClass::Failed,
+                                err.to_string(),
+                            );
                         }
                     };
                     let handle = KVHandle::new(
@@ -889,7 +1000,12 @@ impl Coordinator {
                         }
                         Ok(false) => {}
                         Err(err) => {
-                            return self.store_failed(ticket, block.block_id, err.to_string());
+                            return self.report_failure(
+                                queue_ticket,
+                                block.block_id,
+                                FailureClass::Failed,
+                                err.to_string(),
+                            );
                         }
                     }
                     let block_meta = KVBlock::new(
@@ -907,7 +1023,12 @@ impl Coordinator {
                     }) {
                         Ok(op) => op,
                         Err(err) => {
-                            return self.store_failed(ticket, block.block_id, err.to_string());
+                            return self.report_failure(
+                                queue_ticket,
+                                block.block_id,
+                                FailureClass::Failed,
+                                err.to_string(),
+                            );
                         }
                     };
                     match cluster_shared_backend.poll(&mut op) {
@@ -915,19 +1036,26 @@ impl Coordinator {
                             locations.push((block.block_id, handle.location));
                         }
                         std::task::Poll::Ready(Ok(other)) => {
-                            return self.store_failed(
-                                ticket,
+                            return self.report_failure(
+                                queue_ticket,
                                 block.block_id,
+                                FailureClass::Failed,
                                 format!("unexpected remote store completion: {other:?}"),
                             );
                         }
                         std::task::Poll::Ready(Err(err)) => {
-                            return self.store_failed(ticket, block.block_id, err.to_string());
+                            return self.report_failure(
+                                queue_ticket,
+                                block.block_id,
+                                FailureClass::Failed,
+                                err.to_string(),
+                            );
                         }
                         std::task::Poll::Pending => {
-                            return self.store_failed(
-                                ticket,
+                            return self.report_failure(
+                                queue_ticket,
                                 block.block_id,
+                                FailureClass::Failed,
                                 "remote store unexpectedly returned Pending",
                             );
                         }
@@ -941,7 +1069,7 @@ impl Coordinator {
             locations: locations.clone(),
         });
         self.emit_orchestrator_event(OrchestratorEvent::StoreCompleted { ticket, locations });
-        QueueOutcome::Completed
+        Ok(QueueOutcome::Completed)
     }
 
     fn handle_fetch(&self, ticket: FetchTicket, blocks: &[FetchRequest]) -> Result<QueueOutcome> {
@@ -953,17 +1081,31 @@ impl Coordinator {
             ticket,
             block_count: blocks.len(),
         });
-        if self.is_cancelled(ticket.into()) {
+        let queue_ticket: QueueTicket = ticket.into();
+        if self.is_cancelled(queue_ticket) {
             let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
-            return self.fetch_failed(ticket, failed_block, "fetch cancelled");
+            return self.report_failure(
+                queue_ticket,
+                failed_block,
+                FailureClass::Cancelled,
+                "fetch cancelled",
+            );
         }
 
         let mut fetched = Vec::with_capacity(blocks.len());
-        let mut allocated_regions = Vec::new();
+        // RAII: every region pushed here is released on early-return. The
+        // happy path at the end of this function calls `regions.commit()`
+        // before returning, which no-ops the destructor and transfers
+        // ownership to the scheduler via `FetchedBlock.release_after_promote`.
+        let mut regions = AllocatedRegions::new();
         for block in blocks {
-            if self.is_cancelled(ticket.into()) {
-                Self::release_allocated_regions(&allocated_regions);
-                return self.fetch_failed(ticket, block.block_id, "fetch cancelled");
+            if self.is_cancelled(queue_ticket) {
+                return self.report_failure(
+                    queue_ticket,
+                    block.block_id,
+                    FailureClass::Cancelled,
+                    "fetch cancelled",
+                );
             }
             match &block.source {
                 BlockLocation::HostPinned { offset } => {
@@ -981,59 +1123,29 @@ impl Coordinator {
                     fingerprint,
                     payload_len,
                 } => {
-                    let Some(disk_store) = &self.disk_store else {
-                        Self::release_allocated_regions(&allocated_regions);
-                        return self.fetch_failed(
-                            ticket,
-                            block.block_id,
-                            "coordinator disk store not configured",
-                        );
-                    };
-                    let location = DiskBlockLocation {
-                        path: match disk_store.block_path_for(*fingerprint) {
-                            Ok(path) => path,
-                            Err(err) => {
-                                Self::release_allocated_regions(&allocated_regions);
-                                return self.fetch_failed(ticket, block.block_id, err.to_string());
-                            }
-                        },
-                        payload_len: *payload_len,
-                        fingerprint: *fingerprint,
-                    };
-                    let payload = match disk_store.get_block(&location, Some(*fingerprint)) {
+                    let payload = match self.fetch_disk_payload(*fingerprint, *payload_len) {
                         Ok(payload) => payload,
-                        Err(err) => {
-                            Self::release_allocated_regions(&allocated_regions);
-                            return self.fetch_failed(ticket, block.block_id, err.to_string());
+                        Err(reason) => {
+                            return self.report_failure(
+                                queue_ticket,
+                                block.block_id,
+                                FailureClass::Failed,
+                                reason,
+                            );
                         }
                     };
-                    let region = {
-                        let mut pool = match block.host_pool.lock() {
-                            Ok(pool) => pool,
-                            Err(err) => {
-                                Self::release_allocated_regions(&allocated_regions);
-                                return self.fetch_failed(ticket, block.block_id, err.to_string());
-                            }
-                        };
-                        let region = match pool.reserve(payload.len()) {
-                            Ok(Some(region)) => region,
-                            Ok(None) => {
-                                Self::release_allocated_regions(&allocated_regions);
-                                return self.fetch_failed(
-                                    ticket,
-                                    block.block_id,
-                                    "host pinned pool exhausted",
-                                );
-                            }
-                            Err(err) => {
-                                Self::release_allocated_regions(&allocated_regions);
-                                return self.fetch_failed(ticket, block.block_id, err.to_string());
-                            }
-                        };
-                        pool.as_mut_slice(region).copy_from_slice(&payload);
-                        region
+                    let region = match Self::stage_into_host_pool(&block.host_pool, &payload) {
+                        Ok(region) => region,
+                        Err(reason) => {
+                            return self.report_failure(
+                                queue_ticket,
+                                block.block_id,
+                                FailureClass::Failed,
+                                reason,
+                            );
+                        }
                     };
-                    allocated_regions.push((block.host_pool.clone(), region));
+                    regions.push(block.host_pool.clone(), region);
                     fetched.push(FetchedBlock {
                         block_id: block.block_id,
                         host_region: region,
@@ -1042,81 +1154,30 @@ impl Coordinator {
                     });
                 }
                 BlockLocation::Remote { .. } => {
-                    let Some(cluster_shared_backend) = &self.cluster_shared_backend else {
-                        Self::release_allocated_regions(&allocated_regions);
-                        return self.fetch_failed(
-                            ticket,
-                            block.block_id,
-                            "coordinator remote store not configured",
-                        );
-                    };
-                    let handle = KVHandle::new(
-                        KVSpanId(u64::from(block.block_id.0)),
-                        block.block_id,
-                        block.source.clone(),
-                        0,
-                        block.byte_len as u64,
-                    );
-                    let mut op = match cluster_shared_backend.fetch(KVBackendFetch { handle }) {
-                        Ok(op) => op,
-                        Err(err) => {
-                            Self::release_allocated_regions(&allocated_regions);
-                            return self.fetch_failed(ticket, block.block_id, err.to_string());
-                        }
-                    };
-                    let payload = match cluster_shared_backend.poll(&mut op) {
-                        std::task::Poll::Ready(Ok(KVBackendCompletion::Loaded {
-                            payload, ..
-                        })) => payload,
-                        std::task::Poll::Ready(Ok(other)) => {
-                            Self::release_allocated_regions(&allocated_regions);
-                            return self.fetch_failed(
-                                ticket,
+                    let payload = match self.fetch_remote_payload(block) {
+                        Ok(payload) => payload,
+                        Err(reason) => {
+                            return self.report_failure(
+                                queue_ticket,
                                 block.block_id,
-                                format!("unexpected remote fetch completion: {other:?}"),
-                            );
-                        }
-                        std::task::Poll::Ready(Err(err)) => {
-                            Self::release_allocated_regions(&allocated_regions);
-                            return self.fetch_failed(ticket, block.block_id, err.to_string());
-                        }
-                        std::task::Poll::Pending => {
-                            Self::release_allocated_regions(&allocated_regions);
-                            return self.fetch_failed(
-                                ticket,
-                                block.block_id,
-                                "remote fetch unexpectedly returned Pending",
+                                FailureClass::Failed,
+                                reason,
                             );
                         }
                     };
-                    let region = {
-                        let mut pool = match block.host_pool.lock() {
-                            Ok(pool) => pool,
-                            Err(err) => {
-                                Self::release_allocated_regions(&allocated_regions);
-                                return self.fetch_failed(ticket, block.block_id, err.to_string());
-                            }
-                        };
-                        let region = match pool.reserve(payload.len()) {
-                            Ok(Some(region)) => region,
-                            Ok(None) => {
-                                Self::release_allocated_regions(&allocated_regions);
-                                return self.fetch_failed(
-                                    ticket,
+                    let region =
+                        match Self::stage_into_host_pool(&block.host_pool, payload.as_slice()) {
+                            Ok(region) => region,
+                            Err(reason) => {
+                                return self.report_failure(
+                                    queue_ticket,
                                     block.block_id,
-                                    "host pinned pool exhausted",
+                                    FailureClass::Failed,
+                                    reason,
                                 );
                             }
-                            Err(err) => {
-                                Self::release_allocated_regions(&allocated_regions);
-                                return self.fetch_failed(ticket, block.block_id, err.to_string());
-                            }
                         };
-                        pool.as_mut_slice(region)
-                            .copy_from_slice(payload.as_slice());
-                        region
-                    };
-                    allocated_regions.push((block.host_pool.clone(), region));
+                    regions.push(block.host_pool.clone(), region);
                     fetched.push(FetchedBlock {
                         block_id: block.block_id,
                         host_region: region,
@@ -1125,16 +1186,17 @@ impl Coordinator {
                     });
                 }
                 BlockLocation::Gpu { .. } => {
-                    Self::release_allocated_regions(&allocated_regions);
-                    return self.fetch_failed(
-                        ticket,
+                    return self.report_failure(
+                        queue_ticket,
                         block.block_id,
+                        FailureClass::Failed,
                         "gpu source should not go through fetch queue",
                     );
                 }
             }
         }
 
+        regions.commit();
         self.emit_orchestrator_event(OrchestratorEvent::FetchCompleted {
             ticket,
             blocks: fetched.clone(),
@@ -1144,6 +1206,72 @@ impl Coordinator {
             blocks: fetched,
         })?;
         Ok(QueueOutcome::Completed)
+    }
+
+    /// Read a disk-backed block payload. `Err(String)` carries a
+    /// human-readable reason to feed straight into `report_failure`.
+    fn fetch_disk_payload(
+        &self,
+        fingerprint: crate::types::BlockFingerprint,
+        payload_len: u64,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let disk_store = self
+            .disk_store
+            .as_ref()
+            .ok_or_else(|| "coordinator disk store not configured".to_string())?;
+        let location = DiskBlockLocation {
+            path: disk_store
+                .block_path_for(fingerprint)
+                .map_err(|e| e.to_string())?,
+            payload_len,
+            fingerprint,
+        };
+        disk_store
+            .get_block(&location, Some(fingerprint))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Read a remote-backed block payload via the cluster-shared backend.
+    fn fetch_remote_payload(&self, block: &FetchRequest) -> std::result::Result<KVPayload, String> {
+        let backend = self
+            .cluster_shared_backend
+            .as_ref()
+            .ok_or_else(|| "coordinator remote store not configured".to_string())?;
+        let handle = KVHandle::new(
+            KVSpanId(u64::from(block.block_id.0)),
+            block.block_id,
+            block.source.clone(),
+            0,
+            block.byte_len as u64,
+        );
+        let mut op = backend
+            .fetch(KVBackendFetch { handle })
+            .map_err(|e| e.to_string())?;
+        match backend.poll(&mut op) {
+            std::task::Poll::Ready(Ok(KVBackendCompletion::Loaded { payload, .. })) => Ok(payload),
+            std::task::Poll::Ready(Ok(other)) => {
+                Err(format!("unexpected remote fetch completion: {other:?}"))
+            }
+            std::task::Poll::Ready(Err(err)) => Err(err.to_string()),
+            std::task::Poll::Pending => Err("remote fetch unexpectedly returned Pending".into()),
+        }
+    }
+
+    /// Reserve a host-pinned region and copy `payload` into it. Returns the
+    /// region on success; the caller is responsible for either pushing it
+    /// into [`AllocatedRegions`] (so Drop releases on later failure) or
+    /// keeping it owned.
+    fn stage_into_host_pool(
+        host_pool: &crate::kv_tier::host_pool::SharedHostPinnedPool,
+        payload: &[u8],
+    ) -> std::result::Result<crate::kv_tier::host_pool::HostPinnedRegion, String> {
+        let mut pool = host_pool.lock().map_err(|e| e.to_string())?;
+        let region = pool
+            .reserve(payload.len())
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "host pinned pool exhausted".to_string())?;
+        pool.as_mut_slice(region).copy_from_slice(payload);
+        Ok(region)
     }
 
     pub fn run_once(&self) -> Result<bool> {
@@ -1160,10 +1288,10 @@ impl Coordinator {
                 }
                 let outcome = match &cmd {
                     CoordinatorCommand::Plan { ticket, blocks } => {
-                        Some(self.handle_plan(*ticket, blocks))
+                        Some(self.handle_plan(*ticket, blocks)?)
                     }
                     CoordinatorCommand::Store { ticket, blocks } => {
-                        Some(self.handle_store(*ticket, blocks))
+                        Some(self.handle_store(*ticket, blocks)?)
                     }
                     CoordinatorCommand::Fetch { ticket, blocks } => {
                         Some(self.handle_fetch(*ticket, blocks)?)
@@ -1206,7 +1334,7 @@ mod tests {
 
     #[test]
     fn coordinator_receives_commands() {
-        let (coordinator, handle, events) = Coordinator::new(4);
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
         handle.send(CoordinatorCommand::Shutdown).unwrap();
         assert!(!coordinator.run_once().unwrap());
         let evt = events.recv().unwrap();
@@ -1218,7 +1346,7 @@ mod tests {
 
     #[test]
     fn coordinator_shutdown_joins_thread_cleanly() {
-        let (coordinator, handle, _events) = Coordinator::new(4);
+        let (coordinator, handle, _events) = CoordinatorBuilder::new(4).build();
         let join_handle = coordinator.spawn("infer-tiered-kv-coord-test");
         handle.send(CoordinatorCommand::Shutdown).unwrap();
 
@@ -1237,7 +1365,9 @@ mod tests {
     fn store_roundtrip_through_disk_store() {
         let dir = tempdir().unwrap();
         let disk_store = Arc::new(DiskStore::new(dir.path()));
-        let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store.clone());
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4)
+            .disk_store(disk_store.clone())
+            .build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(256).unwrap(),
         );
@@ -1298,7 +1428,7 @@ mod tests {
 
     #[test]
     fn store_to_disk_fails_without_configured_disk_store() {
-        let (coordinator, handle, events) = Coordinator::new(4);
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
         );
@@ -1343,7 +1473,7 @@ mod tests {
 
     #[test]
     fn fetch_from_host_passthrough_keeps_existing_region() {
-        let (coordinator, handle, events) = Coordinator::new(4);
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(128).unwrap(),
         );
@@ -1397,7 +1527,9 @@ mod tests {
     fn fetch_from_disk_materializes_temp_host_region() {
         let dir = tempdir().unwrap();
         let disk_store = Arc::new(DiskStore::new(dir.path()));
-        let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store.clone());
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4)
+            .disk_store(disk_store.clone())
+            .build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(256).unwrap(),
         );
@@ -1445,7 +1577,7 @@ mod tests {
 
     #[test]
     fn fetch_fails_for_gpu_source() {
-        let (coordinator, handle, events) = Coordinator::new(4);
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
         );
@@ -1482,7 +1614,7 @@ mod tests {
 
     #[test]
     fn submit_store_is_non_blocking_when_queue_is_full() {
-        let (_coordinator, handle, _events) = Coordinator::new(1);
+        let (_coordinator, handle, _events) = CoordinatorBuilder::new(1).build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
         );
@@ -1516,7 +1648,7 @@ mod tests {
 
     #[test]
     fn queue_stats_report_backpressure_and_rejections() {
-        let (_coordinator, handle, _events) = Coordinator::new(1);
+        let (_coordinator, handle, _events) = CoordinatorBuilder::new(1).build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
         );
@@ -1561,7 +1693,7 @@ mod tests {
 
     #[test]
     fn cancelled_fetch_updates_stats_and_reports_cancel_reason() {
-        let (coordinator, handle, events) = Coordinator::new(4);
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(128).unwrap(),
         );
@@ -1617,7 +1749,7 @@ mod tests {
     #[test]
     fn orchestrator_plan_classifies_tiers_without_touching_legacy_events() {
         let (coordinator, handle, _events, orchestrator_events) =
-            Coordinator::new_with_orchestrator_events(4, None, None);
+            CoordinatorBuilder::new(4).build_with_orchestrator();
         let ticket = handle
             .submit_prefetch_plan(vec![
                 PrefetchPlanRequest {
@@ -1698,7 +1830,7 @@ mod tests {
     #[test]
     fn orchestrator_store_reports_remote_stub_failure() {
         let (coordinator, handle, _events, orchestrator_events) =
-            Coordinator::new_with_orchestrator_events(4, None, None);
+            CoordinatorBuilder::new(4).build_with_orchestrator();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
         );
@@ -1748,11 +1880,9 @@ mod tests {
     fn remote_store_and_fetch_roundtrip_through_shared_fs_backend() {
         let dir = tempdir().unwrap();
         let remote_store = Arc::new(SharedFsStore::new(dir.path()));
-        let (coordinator, handle, events) = Coordinator::new_with_backends(
-            4,
-            None,
-            Some(ClusterSharedBackend::SharedFs(remote_store.clone())),
-        );
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4)
+            .cluster_shared_backend(ClusterSharedBackend::SharedFs(remote_store.clone()))
+            .build();
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(256).unwrap(),
         );
@@ -1865,5 +1995,138 @@ mod tests {
             }
             other => panic!("unexpected remote fetch event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn coordinator_builder_constructs_with_no_backends() {
+        // Smoke test: the new builder reaches a working coordinator with
+        // zero optional backends configured (replaces the implicit shape
+        // assertion that lived inside the old `Coordinator::new` path).
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
+        assert_eq!(handle.stats().capacity, 4);
+        handle.send(CoordinatorCommand::Shutdown).unwrap();
+        assert!(!coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::CommandQueued(CoordinatorCommand::Shutdown),
+        );
+    }
+
+    #[test]
+    fn report_failure_classifies_cancel_vs_fail() {
+        // Drive the typed `FailureClass` end-to-end and verify both legs
+        // surface their queue-specific event shape; this is the main
+        // protection against silent drift back to substring matching.
+        let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(64).unwrap(),
+        );
+
+        // Cancel path.
+        let ticket = handle
+            .submit_fetch(vec![FetchRequest {
+                block_id: BlockId(101),
+                source: BlockLocation::HostPinned { offset: 0 },
+                byte_len: 4,
+                host_pool: host_pool.clone(),
+            }])
+            .unwrap();
+        assert!(handle.cancel_fetch(ticket));
+        assert!(coordinator.run_once().unwrap());
+        let _queued = events.recv().unwrap();
+        match events.recv().unwrap() {
+            CoordinatorEvent::FetchFailed { reason, .. } => {
+                assert!(reason.contains("cancelled"));
+            }
+            other => panic!("expected FetchFailed cancel, got {other:?}"),
+        }
+        assert_eq!(handle.stats().fetch.cancelled, 1);
+        assert_eq!(handle.stats().fetch.failed, 0);
+
+        // Hard-fail path (no remote backend configured for a remote fetch).
+        let ticket2 = handle
+            .submit_fetch(vec![FetchRequest {
+                block_id: BlockId(102),
+                source: BlockLocation::Remote {
+                    desc: crate::kv_tier::RemoteBlockDesc {
+                        transport: crate::kv_tier::TransportId::Nixl,
+                        payload: vec![0],
+                    },
+                },
+                byte_len: 4,
+                host_pool,
+            }])
+            .unwrap();
+        assert!(coordinator.run_once().unwrap());
+        let _queued2 = events.recv().unwrap();
+        match events.recv().unwrap() {
+            CoordinatorEvent::FetchFailed { reason, .. } => {
+                assert!(reason.contains("remote store not configured"));
+                assert!(!reason.contains("cancelled"));
+            }
+            other => panic!("expected FetchFailed hard error, got {other:?}"),
+        }
+        let stats = handle.stats();
+        assert_eq!(stats.fetch.cancelled, 1, "cancel count untouched");
+        assert_eq!(stats.fetch.failed, 1, "hard fail recorded");
+        let _ = ticket2;
+    }
+
+    #[test]
+    fn allocated_regions_releases_on_drop_when_uncommitted() {
+        // Reserve a region, hand it to AllocatedRegions, drop without
+        // committing — the region must be released and the pool ready
+        // to reserve the same span again.
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(64).unwrap(),
+        );
+        let region = {
+            let mut pool = host_pool.lock().unwrap();
+            pool.reserve(32).unwrap().unwrap()
+        };
+        {
+            let mut regions = AllocatedRegions::new();
+            regions.push(host_pool.clone(), region);
+            // Dropped here without commit.
+        }
+        // After drop, the pool should accept another full reservation.
+        let mut pool = host_pool.lock().unwrap();
+        let r2 = pool
+            .reserve(32)
+            .unwrap()
+            .expect("pool should have free space after drop release");
+        // Release for cleanliness (region tracker may otherwise leak in
+        // the test-scoped pool).
+        pool.release(r2).unwrap();
+    }
+
+    #[test]
+    fn allocated_regions_no_release_when_committed() {
+        // Commit before drop → region stays reserved; a follow-up full
+        // reserve must fail because no slot is free.
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(32).unwrap(),
+        );
+        let region = {
+            let mut pool = host_pool.lock().unwrap();
+            pool.reserve(32).unwrap().unwrap()
+        };
+        {
+            let mut regions = AllocatedRegions::new();
+            regions.push(host_pool.clone(), region);
+            regions.commit();
+        }
+        // Pool is full; a new full reservation must be None (or the
+        // reserve returns Err if the implementation rejects oversize
+        // requests up front). Both indicate the committed region was
+        // not released.
+        let mut pool = host_pool.lock().unwrap();
+        let outcome = pool.reserve(32).unwrap();
+        assert!(
+            outcome.is_none(),
+            "committed region should NOT have been released",
+        );
+        // Cleanup — release the original region so the pool is tidy.
+        pool.release(region).unwrap();
     }
 }
