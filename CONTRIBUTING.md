@@ -45,12 +45,12 @@ cargo build --no-default-features --features no-cuda
 # Build the CLI smoke path
 cargo build -p agent-infer --release --no-default-features --features cpu,no-cuda,cli --bin arle
 
-# Build (GPU)
-cargo build -p infer --release
+# Build (GPU). The cuda feature is no longer the default — pass it explicitly:
+cargo build -p infer --release --features cuda
 
 # Test
 cargo test --no-default-features --features no-cuda   # Unit tests (~9s)
-cargo test --release --test e2e                         # E2E (GPU required)
+cargo test --release --features cuda --test e2e        # E2E (GPU required)
 cargo test -p train --release --features no-cuda --lib
 cargo test -p autograd --release --features no-cuda --lib
 cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_tiny_fixture_live
