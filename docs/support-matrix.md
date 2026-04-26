@@ -72,6 +72,24 @@ Backend note:
 
 ---
 
+## 4b. Multi-turn KV Reuse / Tiered KV Matrix
+
+The KV-reuse architecture that the README calls out (slot-sticky multi-turn
+reuse + radix-backed `T0 GPU → T1 host pinned → T2 NVMe → T3 cluster-shared`).
+Code lives in `infer/src/prefix_cache.rs` (radix tree) and
+`infer/src/kv_tier/` (tiered-KV plumbing); see
+[`docs/codebase-map.md`](codebase-map.md) for the per-file map.
+
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Slot-sticky multi-turn KV reuse | Supported (CUDA), Beta (Metal) | Prior-turn KV stays in slot for the next turn so only new user tokens prefill. CUDA is the primary path; Metal Qwen3 ships live prefix reuse via shared KV pool, Qwen3.5 via replayed compiled-path snapshots (see §1). |
+| Radix-backed prefix cache (T0 GPU) | Supported (CUDA) | Direct GPU-page attach + tail-page CoW on shared prefixes; `RadixNode` carries `hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`. |
+| T1 host-pinned spillover | Beta (CUDA) | Cold blocks demote from GPU to host pinned memory via `HostPinnedPool` (Zig-backed); promote-on-use through `ReadmissionPlan`. |
+| T2 NVMe local-disk transport | Beta (CUDA) | Node-local persistence via `kv_tier/transport/disk.rs` on top of `crates/kv-native-sys` (file/block ABI, mmap, WAL). |
+| T3 cluster-shared backend | Experimental | Minimal `transport/shared_fs.rs` reference backend ships; **NIXL transport remains stub-only** (`nixl-sys` activates the stub feature, no real link). Treat T3 as scaffolding, not a production tier today. |
+
+---
+
 ## 4a. Speculative Decoding Matrix
 
 | Capability | Status | Notes |
