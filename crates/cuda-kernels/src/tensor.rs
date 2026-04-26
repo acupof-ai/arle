@@ -1,6 +1,6 @@
 //! Device tensor types and CUDA context.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::marker::PhantomData;
@@ -358,19 +358,143 @@ impl std::fmt::Debug for DeviceVec {
     }
 }
 
-/// 2D device tensor (matrix) — stored in row-major order as bf16.
+/// Explicit storage format for a linear weight matrix.
+///
+/// This is the Rust-side kernel ABI selector: checkpoint format detection and
+/// loader packing set this once, then inference dispatch matches this enum
+/// instead of re-interpreting packed buffers through bit-width sentinels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WeightFormat {
+    /// Dense row-major BF16 weights.
+    #[default]
+    DenseBf16,
+    /// Uniform per-group signed INT8 weights with BF16 scales.
+    W8A16,
+    /// Uniform per-group packed INT4 weights with BF16 scales.
+    W4A16,
+    /// Uniform per-group packed INT2 weights with BF16 scales.
+    W2A16,
+    /// GGUF Q3_K packed superblocks, scales embedded in each 256-wide block.
+    GgufQ3K,
+    /// GGUF Q4_K packed superblocks, scales embedded in each 256-wide block.
+    GgufQ4K,
+    /// GGUF Q6_K packed superblocks, scales embedded in each 256-wide block.
+    GgufQ6K,
+    /// TurboQuant packed indices + FP16 group norms + Hadamard signs.
+    TurboQuant,
+}
+
+/// Shape/layout constraints expected by the matching CUDA kernels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WeightKernelAlignment {
+    pub weight_layout: &'static str,
+    pub scale_layout: &'static str,
+    pub k_multiple: usize,
+    pub n_multiple: usize,
+    pub group_size: usize,
+}
+
+impl WeightFormat {
+    #[must_use]
+    pub fn is_quantized(self) -> bool {
+        !matches!(self, Self::DenseBf16)
+    }
+
+    #[must_use]
+    pub fn is_gguf_k_quant(self) -> bool {
+        matches!(self, Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ6K)
+    }
+
+    #[must_use]
+    pub fn kernel_alignment(self, group_size: usize) -> WeightKernelAlignment {
+        match self {
+            Self::DenseBf16 => WeightKernelAlignment {
+                weight_layout: "bf16.row_major",
+                scale_layout: "none",
+                k_multiple: 1,
+                n_multiple: 1,
+                group_size: 0,
+            },
+            Self::W8A16 | Self::W4A16 | Self::W2A16 => WeightKernelAlignment {
+                weight_layout: "wN.row_major.group_packed",
+                scale_layout: "bf16[row, k/group_size]",
+                k_multiple: group_size.max(1),
+                n_multiple: 1,
+                group_size,
+            },
+            Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ6K => WeightKernelAlignment {
+                weight_layout: "gguf.qk.row_major.superblock256",
+                scale_layout: "embedded.superblock",
+                k_multiple: 256,
+                n_multiple: 1,
+                group_size: 256,
+            },
+            Self::TurboQuant => WeightKernelAlignment {
+                weight_layout: "turboquant.row_major.group_packed",
+                scale_layout: "fp16[row, k/group_size]",
+                k_multiple: group_size.max(1),
+                n_multiple: 1,
+                group_size,
+            },
+        }
+    }
+
+    pub fn validate_shape(self, rows: usize, cols: usize, group_size: usize) -> Result<()> {
+        ensure!(rows > 0, "{self} requires rows > 0");
+        ensure!(cols > 0, "{self} requires cols > 0");
+        match self {
+            Self::DenseBf16 => Ok(()),
+            Self::W8A16 | Self::W4A16 | Self::W2A16 | Self::TurboQuant => {
+                ensure!(group_size > 0, "{self} requires group_size > 0");
+                ensure!(
+                    cols.is_multiple_of(group_size),
+                    "{self} requires cols % group_size == 0, got cols={cols}, group_size={group_size}"
+                );
+                Ok(())
+            }
+            Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ6K => {
+                ensure!(
+                    cols.is_multiple_of(256),
+                    "{self} requires cols % 256 == 0, got {cols}"
+                );
+                ensure!(
+                    group_size == 256,
+                    "{self} requires synthetic group_size=256, got {group_size}"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for WeightFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DenseBf16 => f.write_str("dense_bf16"),
+            Self::W8A16 => f.write_str("w8a16"),
+            Self::W4A16 => f.write_str("w4a16"),
+            Self::W2A16 => f.write_str("w2a16"),
+            Self::GgufQ3K => f.write_str("gguf_q3_k"),
+            Self::GgufQ4K => f.write_str("gguf_q4_k"),
+            Self::GgufQ6K => f.write_str("gguf_q6_k"),
+            Self::TurboQuant => f.write_str("turboquant"),
+        }
+    }
+}
+
+/// 2D device tensor (matrix) — stored in row-major order as bf16 unless
+/// `weight_format` names an explicit packed layout.
 pub struct DeviceMatrix {
     pub data: CudaSlice<bf16>,
     pub rows: usize,
     pub cols: usize,
+    pub weight_format: WeightFormat,
     /// INT8 quantized weights (if quantized). When set, `data` is unused.
     pub qweight: Option<CudaSlice<i8>>,
     /// Per-group bf16 scales for quantized weights. Shape: [rows, cols/group_size].
     pub qscales: Option<CudaSlice<bf16>>,
     /// Quantization group size (0 = not quantized).
     pub group_size: usize,
-    /// Quantization bit width (8 or 4). 0 = not quantized.
-    pub quant_bits: usize,
     /// Marlin-repacked INT4 weights for prefill GEMM (None if not W4 or repack failed).
     pub marlin_packed: Option<CudaSlice<u8>>,
     /// FP16 scales in Marlin layout [K/group_size, N] (transposed from qscales).
@@ -401,10 +525,10 @@ impl DeviceMatrix {
             data: gpu_data,
             rows,
             cols,
+            weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
             group_size: 0,
-            quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -424,9 +548,10 @@ impl DeviceMatrix {
         cols: usize,
         group_size: usize,
     ) -> Result<Self> {
-        assert_eq!(qweight_data.len(), rows * cols);
+        WeightFormat::W8A16.validate_shape(rows, cols, group_size)?;
+        ensure!(qweight_data.len() == rows * cols);
         let num_groups = cols / group_size;
-        assert_eq!(scales_data.len(), rows * num_groups);
+        ensure!(scales_data.len() == rows * num_groups);
 
         let qw = ctx
             .stream
@@ -445,10 +570,10 @@ impl DeviceMatrix {
             data: dummy,
             rows,
             cols,
+            weight_format: WeightFormat::W8A16,
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 8,
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -470,9 +595,14 @@ impl DeviceMatrix {
         cols: usize,
         group_size: usize,
     ) -> Result<Self> {
-        assert_eq!(packed_data.len(), rows * cols / 2);
+        WeightFormat::W4A16.validate_shape(rows, cols, group_size)?;
+        ensure!(
+            cols.is_multiple_of(2),
+            "W4A16 requires cols % 2 == 0, got {cols}"
+        );
+        ensure!(packed_data.len() == rows * cols / 2);
         let num_groups = cols / group_size;
-        assert_eq!(scales_data.len(), rows * num_groups);
+        ensure!(scales_data.len() == rows * num_groups);
 
         // Upload packed INT4 data directly — native W4 kernel handles nibble extraction
         let qw: CudaSlice<i8> = ctx
@@ -493,10 +623,10 @@ impl DeviceMatrix {
             data: dummy,
             rows,
             cols,
+            weight_format: WeightFormat::W4A16,
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 4, // Native packed INT4; W4 kernel extracts nibbles
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -511,21 +641,16 @@ impl DeviceMatrix {
     ///
     /// Each 256-element superblock is 210 bytes: ql(128)|qh(64)|scales(16×i8)|d(f16).
     /// Per-row byte stride = `(cols/256) * 210`.
-    /// `quant_bits = 66` is the Q6_K discriminator in `ops::linear` dispatch.
     pub fn from_quantized_q6k(
         ctx: &DeviceContext,
         packed_bytes: &[u8],
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(
-            cols.is_multiple_of(256),
-            "Q6_K requires cols % 256 == 0, got {cols}"
-        );
+        WeightFormat::GgufQ6K.validate_shape(rows, cols, 256)?;
         let expected = rows * cols * 210 / 256;
-        assert_eq!(
-            packed_bytes.len(),
-            expected,
+        ensure!(
+            packed_bytes.len() == expected,
             "Q6_K packed size {} != expected {} for rows={} cols={}",
             packed_bytes.len(),
             expected,
@@ -551,10 +676,10 @@ impl DeviceMatrix {
             data: dummy,
             rows,
             cols,
+            weight_format: WeightFormat::GgufQ6K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
             group_size: 256,
-            quant_bits: 66, // sentinel for Q6_K
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -569,21 +694,16 @@ impl DeviceMatrix {
     ///
     /// Each 256-element superblock is 110 bytes: hmask(32)|qs(64)|scales(12)|d(f16).
     /// Per-row byte stride = `(cols/256) * 110 = cols * 55/128`.
-    /// `quant_bits = 33` is the Q3_K discriminator in `ops::linear` dispatch.
     pub fn from_quantized_q3k(
         ctx: &DeviceContext,
         packed_bytes: &[u8],
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(
-            cols.is_multiple_of(256),
-            "Q3_K requires cols % 256 == 0, got {cols}"
-        );
+        WeightFormat::GgufQ3K.validate_shape(rows, cols, 256)?;
         let expected = rows * cols * 55 / 128; // (cols/256) * 110 per row
-        assert_eq!(
-            packed_bytes.len(),
-            expected,
+        ensure!(
+            packed_bytes.len() == expected,
             "Q3_K packed size {} != expected {} for rows={} cols={}",
             packed_bytes.len(),
             expected,
@@ -609,10 +729,10 @@ impl DeviceMatrix {
             data: dummy,
             rows,
             cols,
+            weight_format: WeightFormat::GgufQ3K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
             group_size: 256,
-            quant_bits: 33, // sentinel for Q3_K
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -629,24 +749,20 @@ impl DeviceMatrix {
     /// intermediate ever materialises. One row consists of `cols/256` contiguous
     /// superblocks, so the per-row byte stride is `(cols/256)*144 = cols*9/16`.
     ///
-    /// `quant_bits = 44` is the Q4_K discriminator used by `ops/linear.rs` to
-    /// dispatch to `q4k_gemv_cuda` / `q4k_gemm_cuda` instead of the uniform-group
-    /// W4A16 path. `group_size` is set to 256 (superblock size) for informational
-    /// purposes; the kernel decodes scales per superblock.
+    /// `weight_format` is set to `GgufQ4K` so dispatch can distinguish this
+    /// embedded-scale superblock layout from uniform-group W4A16. `group_size`
+    /// is set to 256 (superblock size) for informational purposes; the kernel
+    /// decodes scales per superblock.
     pub fn from_quantized_q4k(
         ctx: &DeviceContext,
         packed_bytes: &[u8],
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(
-            cols.is_multiple_of(256),
-            "Q4_K requires cols % 256 == 0, got {cols}"
-        );
+        WeightFormat::GgufQ4K.validate_shape(rows, cols, 256)?;
         let expected = rows * cols * 9 / 16; // (cols/256) * 144 per row
-        assert_eq!(
-            packed_bytes.len(),
-            expected,
+        ensure!(
+            packed_bytes.len() == expected,
             "Q4_K packed size {} != expected {} for rows={} cols={}",
             packed_bytes.len(),
             expected,
@@ -672,10 +788,10 @@ impl DeviceMatrix {
             data: dummy,
             rows,
             cols,
+            weight_format: WeightFormat::GgufQ4K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
             group_size: 256,
-            quant_bits: 44, // sentinel for Q4_K (distinct from W4A16's bits=4)
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -696,9 +812,14 @@ impl DeviceMatrix {
         cols: usize,
         group_size: usize,
     ) -> Result<Self> {
-        assert_eq!(packed_data.len(), rows * cols / 4);
+        WeightFormat::W2A16.validate_shape(rows, cols, group_size)?;
+        ensure!(
+            cols.is_multiple_of(4),
+            "W2A16 requires cols % 4 == 0, got {cols}"
+        );
+        ensure!(packed_data.len() == rows * cols / 4);
         let num_groups = cols / group_size;
-        assert_eq!(scales_data.len(), rows * num_groups);
+        ensure!(scales_data.len() == rows * num_groups);
 
         // Upload packed data directly (native W2 kernel handles bit extraction)
         let qw: CudaSlice<i8> = ctx
@@ -719,10 +840,10 @@ impl DeviceMatrix {
             data: dummy,
             rows,
             cols,
+            weight_format: WeightFormat::W2A16,
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 2,
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -735,7 +856,19 @@ impl DeviceMatrix {
 
     /// Whether this matrix uses quantized weights.
     pub fn is_quantized(&self) -> bool {
-        self.qweight.is_some()
+        self.weight_format.is_quantized() && (self.qweight.is_some() || self.tq_packed.is_some())
+    }
+
+    /// Whether this matrix is plain BF16 with no packed side buffers.
+    pub fn is_dense_bf16(&self) -> bool {
+        self.weight_format == WeightFormat::DenseBf16
+            && self.qweight.is_none()
+            && self.tq_packed.is_none()
+    }
+
+    #[must_use]
+    pub fn weight_format(&self) -> WeightFormat {
+        self.weight_format
     }
 
     /// Whether this matrix has Marlin-repacked weights for fast prefill GEMM.
@@ -790,10 +923,10 @@ impl DeviceMatrix {
             data: dummy,
             rows,
             cols,
+            weight_format: WeightFormat::TurboQuant,
             qweight: None,
             qscales: None,
             group_size,
-            quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: Some(tq_p),
@@ -809,7 +942,10 @@ impl DeviceMatrix {
     /// Marlin format: tiled int32 layout optimized for tensor core MMA.
     /// Also transposes scales from [N, K/group_size] bf16 → [K/group_size, N] fp16.
     pub fn repack_for_marlin(&mut self, ctx: &DeviceContext) -> Result<()> {
-        if self.quant_bits != 4 || self.qweight.is_none() || self.qscales.is_none() {
+        if self.weight_format != WeightFormat::W4A16
+            || self.qweight.is_none()
+            || self.qscales.is_none()
+        {
             return Ok(()); // Only for W4
         }
         let n = self.rows; // output dim
@@ -935,10 +1071,10 @@ impl DeviceMatrix {
             data: gpu_data,
             rows,
             cols,
+            weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
             group_size: 0,
-            quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -978,10 +1114,10 @@ impl DeviceMatrix {
             data: dst,
             rows: out_rows,
             cols: src.cols,
+            weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
             group_size: 0,
-            quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -1014,10 +1150,10 @@ impl DeviceMatrix {
                 data: dummy,
                 rows: total_rows,
                 cols,
+                weight_format: WeightFormat::DenseBf16,
                 qweight: None,
                 qscales: None,
                 group_size: 0,
-                quant_bits: 0,
                 marlin_packed: None,
                 marlin_scales: None,
                 tq_packed: None,
@@ -1047,10 +1183,10 @@ impl DeviceMatrix {
             data: merged,
             rows: total_rows,
             cols,
+            weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
             group_size: 0,
-            quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
             tq_packed: None,
@@ -1131,6 +1267,33 @@ pub fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uniform_quant_formats_require_group_aligned_k() {
+        assert!(WeightFormat::W4A16.validate_shape(64, 4096, 128).is_ok());
+        assert!(WeightFormat::W4A16.validate_shape(64, 4097, 128).is_err());
+        assert!(WeightFormat::W8A16.validate_shape(64, 4096, 0).is_err());
+    }
+
+    #[test]
+    fn gguf_k_formats_require_256_wide_superblocks() {
+        assert!(WeightFormat::GgufQ4K.validate_shape(64, 4096, 256).is_ok());
+        assert!(WeightFormat::GgufQ4K.validate_shape(64, 4096, 128).is_err());
+        assert!(WeightFormat::GgufQ4K.validate_shape(64, 4100, 256).is_err());
+    }
+
+    #[test]
+    fn kernel_alignment_names_scale_layout_explicitly() {
+        let w4 = WeightFormat::W4A16.kernel_alignment(128);
+        assert_eq!(w4.weight_layout, "wN.row_major.group_packed");
+        assert_eq!(w4.scale_layout, "bf16[row, k/group_size]");
+        assert_eq!(w4.k_multiple, 128);
+
+        let q4k = WeightFormat::GgufQ4K.kernel_alignment(256);
+        assert_eq!(q4k.weight_layout, "gguf.qk.row_major.superblock256");
+        assert_eq!(q4k.scale_layout, "embedded.superblock");
+        assert_eq!(q4k.k_multiple, 256);
+    }
 
     fn copy_matrix_to_host(ctx: &DeviceContext, matrix: &DeviceMatrix) -> Vec<bf16> {
         let host = ctx
