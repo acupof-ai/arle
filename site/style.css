@@ -122,6 +122,54 @@ code      { font-family: inherit; color: var(--coral-dim); }
   padding: 28px 24px 24px;
 }
 
+/* ── terminal tab strip (above manhead) ────────────────────────────── */
+
+.termtabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--ink-dim);
+  background: linear-gradient(180deg, var(--paper-dim), var(--paper));
+  border: 1px solid rgba(30,42,37,0.18);
+  border-bottom: none;
+  letter-spacing: 0;
+  user-select: none;
+}
+.termdot {
+  display: inline-block;
+  width: 9px; height: 9px; border-radius: 50%;
+  border: 1px solid rgba(17,23,20,0.22);
+  flex: none;
+}
+.termdot-r { background: var(--coral); }
+.termdot-y { background: #D9A641; }
+.termdot-g { background: #4CC3A1; }
+.termtab {
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  color: var(--ink-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.termtab.on {
+  background: var(--panel-strong);
+  color: var(--ink);
+  border: 1px solid rgba(30,42,37,0.18);
+  border-bottom-color: var(--panel-strong);
+  position: relative;
+  top: 1px;
+  padding-bottom: 3px;
+}
+.termflex { flex: 1; }
+.termmeta {
+  color: var(--ink-dim);
+  font-size: 11px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
 /* ── man-page header / footer ──────────────────────────────────────── */
 
 .manhead, .manfoot {
@@ -244,13 +292,42 @@ code      { font-family: inherit; color: var(--coral-dim); }
   gap: 8px;
 }
 .hero-signals span {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 4px 8px;
   font-size: 12px;
   color: var(--ink-soft);
   border: 1px solid rgba(8,122,115,0.24);
   background: rgba(251,252,248,0.82);
   box-shadow: 0 1px 0 rgba(30,42,37,0.05);
+}
+.hero-signals .sig b {
+  color: var(--teal);
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.hero-signals .sig-kv {
+  white-space: nowrap;
+}
+.hero-signals .sig code {
+  color: var(--ink);
+  font-weight: 700;
+}
+.sig-dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  flex: none;
+  margin-left: 2px;
+}
+.sig-dot-ok {
+  background: #4CC3A1;
+  box-shadow: 0 0 6px rgba(76,195,161,0.65);
+}
+.sig-dot-warn {
+  background: var(--ochre);
+  box-shadow: 0 0 5px rgba(109,113,54,0.55);
 }
 .hero-panel {
   border: 1px solid rgba(30,42,37,0.28);
@@ -261,6 +338,64 @@ code      { font-family: inherit; color: var(--coral-dim); }
     0 12px 30px rgba(17,23,20,0.10);
   padding: 14px 16px;
 }
+
+/* ── hero CTAs ─────────────────────────────────────────────────────── */
+
+.hero-cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 0;
+}
+.hero-cta-primary,
+.hero-cta-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-family: var(--mono);
+  text-decoration: none;
+  border: 1px solid var(--rule);
+  letter-spacing: 0;
+  transition: background-color 90ms ease, color 90ms ease, border-color 90ms ease;
+}
+.hero-cta-primary {
+  background: var(--console);
+  color: var(--paper);
+  border-color: var(--console);
+  box-shadow: 0 6px 14px rgba(17,23,20,0.18);
+}
+.hero-cta-primary .p {
+  color: #4CC3A1;
+  user-select: none;
+  font-weight: 700;
+}
+.hero-cta-primary:hover,
+.hero-cta-primary:focus-visible {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: var(--paper);
+  outline: none;
+}
+.hero-cta-secondary {
+  background: var(--panel-strong);
+  color: var(--ink-soft);
+  border-color: rgba(30,42,37,0.28);
+}
+.hero-cta-secondary:hover,
+.hero-cta-secondary:focus-visible {
+  background: var(--coral);
+  color: var(--paper);
+  border-color: var(--coral);
+  outline: none;
+}
+.hero-cta .arrow {
+  color: var(--ink-dim);
+  font-size: 11px;
+}
+.hero-cta-secondary:hover .arrow,
+.hero-cta-secondary:focus-visible .arrow { color: var(--paper); }
 .panel-kicker {
   margin: 0 0 8px;
   color: var(--teal-dim);
@@ -442,6 +577,17 @@ pre.files a:hover {
   border-bottom-color: transparent;
 }
 
+pre.cmd.lined .ln {
+  display: inline-block;
+  width: 2.5ch;
+  margin-right: 0.6ch;
+  padding-right: 0.4ch;
+  text-align: right;
+  color: var(--ink-dim);
+  border-right: 1px solid rgba(30,42,37,0.16);
+  user-select: none;
+}
+
 pre .p  { color: var(--teal); font-weight: 700; user-select: none; } /* prompt */
 pre .c  { color: var(--ink-dim); font-style: normal; }                /* comment */
 pre i   { color: var(--moss); }                                       /* string */
@@ -591,6 +737,13 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   .manhead-c, .manfoot-c { display: none; }
   pre.cmd, pre.tbl, pre.diagram, pre.files { font-size: 12px; }
   .statusline { display: none; }
+  .termtabs { padding: 5px 8px; gap: 6px; }
+  .termtab:nth-of-type(2),
+  .termmeta { display: none; }
+  .hero-cta { margin-top: 12px; }
+  .hero-cta-primary,
+  .hero-cta-secondary { flex: 1 1 auto; justify-content: center; }
+  pre.cmd.lined .ln { width: 2ch; margin-right: 0.4ch; padding-right: 0.3ch; }
 }
 
 /* prefers-color-scheme: we intentionally stay in paper-warm even when
@@ -610,6 +763,8 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   }
   .statusline,
   .jumps,
+  .termtabs,
+  .hero-cta,
   .caret { display: none !important; }
   a {
     color: inherit;
