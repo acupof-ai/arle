@@ -1031,12 +1031,12 @@ impl<M: ModelForward> Scheduler<M> {
             .as_ref()
             .map(crate::kv_tier::ClusterSharedBackendConfig::build);
         let coordinator_queue_capacity = config.max_slots.max(16);
-        let (coordinator, coordinator_handle, coordinator_events) =
-            crate::kv_tier::Coordinator::new_with_backends(
-                coordinator_queue_capacity,
-                Some(Arc::clone(&disk_store)),
-                cluster_shared_backend.clone(),
-            );
+        let mut coord_builder = crate::kv_tier::CoordinatorBuilder::new(coordinator_queue_capacity)
+            .disk_store(Arc::clone(&disk_store));
+        if let Some(backend) = cluster_shared_backend.clone() {
+            coord_builder = coord_builder.cluster_shared_backend(backend);
+        }
+        let (coordinator, coordinator_handle, coordinator_events) = coord_builder.build();
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
         let (emit_tx, emit_events, emit_thread) = spawn_emit_worker(tokenizer.clone());
         let max_slots = config.max_slots;
@@ -2268,7 +2268,8 @@ impl<M: ModelForward> Drop for Scheduler<M> {
         // channel disconnects. Dropping `_old_events` kills the
         // coordinator's event path on its next send. Either one is
         // sufficient to unwedge `run_once`; we do both for safety.
-        let (dummy_coord, dummy_handle, dummy_events) = crate::kv_tier::Coordinator::new(1);
+        let (dummy_coord, dummy_handle, dummy_events) =
+            crate::kv_tier::CoordinatorBuilder::new(1).build();
         drop(dummy_coord);
         let old_handle = std::mem::replace(&mut self.coordinator_handle, dummy_handle);
         let old_events = std::mem::replace(&mut self.coordinator_events, dummy_events);

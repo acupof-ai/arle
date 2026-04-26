@@ -148,9 +148,10 @@ pub use chunk::{
     SpanTaskKey, StoreState, TokenRange,
 };
 pub use coordinator::{
-    Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle, CoordinatorQueueStats,
-    FetchRequest, FetchTicket, FetchedBlock, QueueBackpressure, QueueControlStats, QueueKind,
-    QueueTicket, StoreRequest, StoreTarget, StoreTicket,
+    Coordinator, CoordinatorBuilder, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle,
+    CoordinatorQueueStats, FailureClass, FetchRequest, FetchTicket, FetchedBlock,
+    QueueBackpressure, QueueControlStats, QueueKind, QueueTicket, StoreRequest, StoreTarget,
+    StoreTicket,
 };
 pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;
