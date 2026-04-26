@@ -345,7 +345,8 @@ impl<M: ModelForward> Scheduler<M> {
 
         let mut launch_candidates;
         loop {
-            launch_candidates = self.select_launch_prefill_candidates(candidates, &decode_indices);
+            launch_candidates =
+                self.select_mixed_launch_prefill_candidates(candidates, &decode_indices);
             if launch_candidates.is_empty() {
                 self.launch_decode_batch_from_tokens(decode_indices, token_ids, false);
                 return;
@@ -380,7 +381,8 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        launch_candidates = self.select_launch_prefill_candidates(candidates, &decode_indices);
+        launch_candidates =
+            self.select_mixed_launch_prefill_candidates(candidates, &decode_indices);
         if launch_candidates.is_empty() {
             self.launch_decode_batch_from_tokens(decode_indices, token_ids, true);
             return;
@@ -566,6 +568,20 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         } else {
+            if let Err(e) = self.model.prepare_batch_sampling_fallback(
+                &mut self.states,
+                &slot_indices,
+                decode_ctx,
+            ) {
+                error!("Preparing mixed-batch sampling fallback failed: {}", e);
+                for row in &pending_rows {
+                    self.finish_slot(row.slot_idx);
+                }
+                for &slot_idx in &decode_indices {
+                    self.finish_slot(slot_idx);
+                }
+                return;
+            }
             false
         };
 

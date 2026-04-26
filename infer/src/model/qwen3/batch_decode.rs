@@ -18,6 +18,7 @@ use crate::model::kv_cache::KVFormat;
 use crate::model::{MixedBatchRequest, ModelForward};
 use crate::ops;
 use cuda_kernels::ffi;
+use cuda_kernels::flashinfer::FlashInferWorkspace;
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
 use cuda_kernels::prelude::{
@@ -25,6 +26,10 @@ use cuda_kernels::prelude::{
 };
 
 const BF16_BYTES: usize = 2;
+// Packed mixed batches can have thousands of QO rows. Reuse the large
+// split-KV workspace instead of the decode-only default.
+const MIXED_FLOAT_WORKSPACE_BYTES: usize = FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES;
+
 fn bf16_matrix_bytes(rows: usize, cols: usize) -> usize {
     rows.saturating_mul(cols).saturating_mul(BF16_BYTES)
 }
@@ -145,11 +150,12 @@ impl MixedBatchBuffers {
                 .stream
                 .alloc_zeros(max_tokens)
                 .map_err(|e| anyhow::anyhow!("Alloc mixed token_ids_gpu failed: {e}"))?,
-            metadata: FlashInferDecodeMetadata::new(
+            metadata: FlashInferDecodeMetadata::new_with_float_workspace_bytes(
                 ctx,
                 max_tokens,
                 max_total_pages,
                 model.config.num_attention_heads,
+                MIXED_FLOAT_WORKSPACE_BYTES,
             )?,
             max_tokens,
             max_total_pages,
@@ -225,10 +231,11 @@ impl BatchDecodeBuffers {
 
         bf16_matrix_bytes(activation_dims, max_total_tokens)
             .saturating_add(bytes_for::<i32>(max_total_tokens))
-            .saturating_add(FlashInferDecodeMetadata::device_bytes(
+            .saturating_add(FlashInferDecodeMetadata::device_bytes_with_float_workspace(
                 max_total_tokens,
                 max_total_pages,
                 num_qheads,
+                MIXED_FLOAT_WORKSPACE_BYTES,
             ))
     }
 
