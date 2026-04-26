@@ -6,7 +6,7 @@ RequestPriority ordering, and the Phase state machine described in
 infer/src/scheduler.rs — all using pure Python mirrors.
 
 Run:
-    pytest tests/test_scheduler.py -v
+    pytest tests/python/test_scheduler.py -v
 """
 
 import threading

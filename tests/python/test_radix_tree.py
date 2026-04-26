@@ -6,7 +6,7 @@ Tests node insertion, longest-prefix matching, reference counting,
 LRU eviction, and edge cases.
 
 Run:
-    pytest tests/test_radix_tree.py -v
+    pytest tests/python/test_radix_tree.py -v
 """
 
 from __future__ import annotations

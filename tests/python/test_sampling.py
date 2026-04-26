@@ -5,7 +5,7 @@ Tests the sampling math and parameter validation logic that mirrors
 infer/src/sampler.rs. All tests are pure Python.
 
 Run:
-    pytest tests/test_sampling.py -v
+    pytest tests/python/test_sampling.py -v
 """
 
 import math
