@@ -89,6 +89,7 @@ pub(super) fn estimated_request_target(
 pub(super) struct PageBudget {
     remaining_free_pages: usize,
     planned_seq_lens: Vec<usize>,
+    append_cow_pages: Vec<usize>,
     page_size: usize,
     active: bool,
 }
@@ -103,20 +104,25 @@ impl PageBudget {
         Self {
             remaining_free_pages,
             planned_seq_lens,
+            append_cow_pages: Vec::new(),
             page_size: normalized_page_size(page_size),
             active,
         }
     }
 
     pub(super) fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>, active: bool) -> Self {
-        Self::new(
+        let mut budget = Self::new(
             scheduler.pool_free_pages(),
             (0..scheduler.states.len())
                 .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
                 .collect(),
             scheduler.paged_kv_pool.page_size,
             active,
-        )
+        );
+        budget.append_cow_pages = (0..scheduler.states.len())
+            .map(|slot_idx| scheduler.paged_kv_pool.append_cow_pages_needed(slot_idx))
+            .collect();
+        budget
     }
 
     #[cfg(test)]
@@ -138,10 +144,14 @@ impl PageBudget {
             return;
         }
         let new_pages = self.additional_pages_for_growth(growth);
-        debug_assert!(new_pages <= self.remaining_free_pages);
         self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
         self.planned_seq_lens[growth.slot_idx] =
             self.planned_seq_lens[growth.slot_idx].saturating_add(growth.tokens);
+        if let Some(cow_pages) = self.append_cow_pages.get_mut(growth.slot_idx)
+            && growth.tokens > 0
+        {
+            *cow_pages = 0;
+        }
     }
 
     pub(super) fn can_fit_target(&self, target: PageTarget) -> bool {
@@ -154,14 +164,14 @@ impl PageBudget {
         }
         let current_seq = self.effective_seq_len(target.slot_idx, target.seq_floor);
         let target_seq = target.target_seq.max(target.seq_floor);
-        let new_pages = additional_pages_needed(
-            current_seq,
-            target_seq.saturating_sub(current_seq),
-            self.page_size,
-        );
-        debug_assert!(new_pages <= self.remaining_free_pages);
+        let new_pages = self.additional_pages_for_target(target);
         self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
         self.planned_seq_lens[target.slot_idx] = target_seq;
+        if let Some(cow_pages) = self.append_cow_pages.get_mut(target.slot_idx)
+            && target_seq > current_seq
+        {
+            *cow_pages = 0;
+        }
     }
 
     fn additional_pages_for_growth(&self, growth: PageGrowth) -> usize {
@@ -169,7 +179,14 @@ impl PageBudget {
             self.planned_seq_lens[growth.slot_idx],
             growth.tokens,
             self.page_size,
-        )
+        ) + if growth.tokens > 0 {
+            self.append_cow_pages
+                .get(growth.slot_idx)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     fn additional_pages_for_target(&self, target: PageTarget) -> usize {
@@ -179,7 +196,14 @@ impl PageBudget {
             current_seq,
             target_seq.saturating_sub(current_seq),
             self.page_size,
-        )
+        ) + if target_seq > current_seq {
+            self.append_cow_pages
+                .get(target.slot_idx)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     fn effective_seq_len(&self, slot_idx: usize, seq_floor: usize) -> usize {
@@ -324,6 +348,52 @@ mod tests {
         assert!(!budget.can_fit_growth(PageGrowth {
             slot_idx: 1,
             tokens: 4,
+        }));
+    }
+
+    #[test]
+    fn page_budget_growth_counts_shared_tail_cow_once() {
+        let mut budget = PageBudget::new(1, vec![3], 4, true);
+        budget.append_cow_pages = vec![1];
+
+        assert!(budget.can_fit_growth(PageGrowth {
+            slot_idx: 0,
+            tokens: 1,
+        }));
+        budget.reserve_growth(PageGrowth {
+            slot_idx: 0,
+            tokens: 1,
+        });
+        assert_eq!(budget.remaining_free_pages(), 0);
+        assert_eq!(budget.planned_seq_len(0), 4);
+        assert!(budget.can_fit_growth(PageGrowth {
+            slot_idx: 0,
+            tokens: 1,
+        }));
+        assert!(budget.can_fit_growth(PageGrowth {
+            slot_idx: 0,
+            tokens: 0,
+        }));
+    }
+
+    #[test]
+    fn page_budget_target_counts_shared_tail_cow_once() {
+        let mut budget = PageBudget::new(1, vec![3], 4, true);
+        budget.append_cow_pages = vec![1];
+        let target = PageTarget {
+            slot_idx: 0,
+            seq_floor: 3,
+            target_seq: 4,
+        };
+
+        assert!(budget.can_fit_target(target));
+        budget.reserve_target(target);
+        assert_eq!(budget.remaining_free_pages(), 0);
+        assert_eq!(budget.planned_seq_len(0), 4);
+        assert!(budget.can_fit_target(PageTarget {
+            slot_idx: 0,
+            seq_floor: 4,
+            target_seq: 4,
         }));
     }
 

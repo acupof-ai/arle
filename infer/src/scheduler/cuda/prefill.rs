@@ -509,7 +509,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn finish_prefill_batch(&mut self, pending: PendingPrefill) {
+    pub(super) fn finish_prefill_batch(&mut self, pending: PendingPrefill) {
         for (slot_idx, span) in &pending.prefill_spans {
             if let Some(req) = self.request_mut(*slot_idx) {
                 req.update_trace_context(Some(span));
@@ -673,7 +673,9 @@ impl<M: ModelForward> Scheduler<M> {
     /// Process one scheduler-planned prefill batch. Single-request prefill is
     /// just the batch_size=1 case.
     pub(super) fn step_prefill_batch(&mut self, candidates: &[PrefillCandidate]) {
-        let batch = self.prepare_prefill_batch(candidates);
+        let decode_slots = self.runnable_decode_reservation_slots();
+        let candidates = self.select_launch_prefill_candidates(candidates, &decode_slots);
+        let batch = self.prepare_prefill_batch(&candidates);
         if batch.is_empty() {
             return;
         }

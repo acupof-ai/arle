@@ -4,8 +4,8 @@ use fastrace::Span;
 use fastrace::collector::SpanContext;
 
 use super::budget::{
-    additional_pages_needed, coordinator_submit_headroom, partial_tail_capacity,
-    prefix_cache_reclaim_goal_pages, waiting_admission_shortage_pages,
+    coordinator_submit_headroom, partial_tail_capacity, prefix_cache_reclaim_goal_pages,
+    waiting_admission_shortage_pages,
 };
 use super::{
     ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
@@ -115,9 +115,9 @@ pub(super) struct PendingPrefill {
 }
 
 pub(super) struct PendingMixedPrefill {
-    pub row: PendingPrefillRow,
+    pub rows: Vec<PendingPrefillRow>,
     pub uses_paged: bool,
-    pub prefill_span: Option<(usize, Span)>,
+    pub prefill_spans: Vec<(usize, Span)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1166,7 +1166,7 @@ impl<M: ModelForward> Scheduler<M> {
                 || pending
                     .mixed_prefill
                     .as_ref()
-                    .is_some_and(|mixed| mixed.row.slot_idx == slot_idx)
+                    .is_some_and(|mixed| mixed.rows.iter().any(|row| row.slot_idx == slot_idx))
         }) || self
             .pending_prefill
             .as_ref()
@@ -1217,23 +1217,13 @@ impl<M: ModelForward> Scheduler<M> {
         free_page_tokens / page_size
     }
 
-    pub(super) fn additional_pages_needed_for_seq_len(
-        &self,
-        seq_len: usize,
-        additional_tokens: usize,
-    ) -> usize {
-        additional_pages_needed(seq_len, additional_tokens, self.paged_kv_pool.page_size)
-    }
-
     pub(super) fn additional_pages_needed_for_slot(
         &self,
         slot_idx: usize,
         additional_tokens: usize,
     ) -> usize {
-        self.additional_pages_needed_for_seq_len(
-            self.paged_kv_pool.seq_len(slot_idx),
-            additional_tokens,
-        )
+        self.paged_kv_pool
+            .append_pages_needed(slot_idx, additional_tokens)
     }
 
     pub(super) fn dispatch_emit(&mut self, slot_idx: usize) {
@@ -1871,9 +1861,9 @@ impl<M: ModelForward> Scheduler<M> {
     /// allocation fails. Unlike the watermark-based cleanup path, this may run
     /// below the usual high-water mark: the immediate goal is to recover enough
     /// prefix-cache pages to satisfy one allocation.
-    pub(super) fn evict_prefix_cache_for_allocation(&mut self, required_tokens: usize) -> usize {
-        let shortage = required_tokens.saturating_sub(self.paged_kv_pool.free_count());
-        if shortage == 0 {
+    pub(super) fn evict_prefix_cache_for_allocation(&mut self, required_pages: usize) -> usize {
+        let shortage_pages = required_pages.saturating_sub(self.pool_free_pages());
+        if shortage_pages == 0 {
             return 0;
         }
 
@@ -1882,12 +1872,9 @@ impl<M: ModelForward> Scheduler<M> {
             .block_size()
             .div_ceil(self.paged_kv_pool.page_size);
         let mut reclaimed_pages = 0usize;
-        let mut reclaimed_tokens = 0usize;
-        let mut remaining = shortage;
-        while remaining > 0 {
-            let blocks_to_move = remaining
-                .div_ceil((pages_per_block * self.paged_kv_pool.page_size).max(1))
-                .max(1);
+        let mut remaining_pages = shortage_pages;
+        while remaining_pages > 0 {
+            let blocks_to_move = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
             let candidates = self.prefix_cache.select_blocks_with_policy(
                 &SessionBiasedLru::default(),
                 self.eviction_signals(),
@@ -1904,7 +1891,6 @@ impl<M: ModelForward> Scheduler<M> {
                 match self.demote_block_to_host(bid) {
                     Ok(freed_now) => {
                         reclaimed_pages += freed_now;
-                        reclaimed_tokens += freed_now * self.paged_kv_pool.page_size;
                     }
                     Err(err) => {
                         warn!(
@@ -1918,13 +1904,11 @@ impl<M: ModelForward> Scheduler<M> {
             if reclaimed_pages == before {
                 break;
             }
-            remaining = shortage.saturating_sub(reclaimed_tokens);
+            remaining_pages = shortage_pages.saturating_sub(reclaimed_pages);
         }
 
-        if reclaimed_tokens < shortage {
-            let blocks_to_drop = remaining
-                .div_ceil((pages_per_block * self.paged_kv_pool.page_size).max(1))
-                .max(1);
+        if reclaimed_pages < shortage_pages {
+            let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
             let evicted = self.prefix_cache.evict_with_policy(
                 &SessionBiasedLru::default(),
                 self.eviction_signals(),
@@ -1937,13 +1921,21 @@ impl<M: ModelForward> Scheduler<M> {
         if reclaimed_pages > 0 {
             info!(
                 "prefix cache emergency eviction: reclaimed {} pool pages for allocation \
-                 (required={}, free_now={})",
+                 (required_pages={}, free_pages_now={})",
                 reclaimed_pages,
-                required_tokens,
-                self.paged_kv_pool.free_count(),
+                required_pages,
+                self.pool_free_pages(),
             );
         }
         reclaimed_pages
+    }
+
+    fn try_alloc_pool_tokens_once(&mut self, slot: usize, count: usize) -> Result<Vec<u32>> {
+        if count > 0 {
+            self.paged_kv_pool
+                .cow_tail_page_for_append(self.model.device_context(), slot)?;
+        }
+        self.paged_kv_pool.alloc_tokens(slot, count)
     }
 
     /// Allocate pool pages, forcing prefix-cache eviction and retrying once on
@@ -1954,19 +1946,19 @@ impl<M: ModelForward> Scheduler<M> {
         slot: usize,
         count: usize,
     ) -> Result<Vec<u32>> {
-        if count > 0 {
-            self.paged_kv_pool
-                .cow_tail_page_for_append(self.model.device_context(), slot)?;
+        let required_pages = self.additional_pages_needed_for_slot(slot, count);
+        if required_pages > self.pool_free_pages() {
+            self.evict_prefix_cache_for_allocation(required_pages);
         }
-        match self.paged_kv_pool.alloc_tokens(slot, count) {
+        match self.try_alloc_pool_tokens_once(slot, count) {
             Ok(indices) => Ok(indices),
             Err(first_err) => {
-                let reclaimed = self.evict_prefix_cache_for_allocation(count);
+                let required_pages = self.additional_pages_needed_for_slot(slot, count);
+                let reclaimed = self.evict_prefix_cache_for_allocation(required_pages);
                 if reclaimed == 0 {
                     Err(first_err)
                 } else {
-                    self.paged_kv_pool
-                        .alloc_tokens(slot, count)
+                    self.try_alloc_pool_tokens_once(slot, count)
                         .map_err(|retry_err| {
                             anyhow::anyhow!(
                             "TokenKVPool alloc retry failed after reclaiming {reclaimed} pages: \

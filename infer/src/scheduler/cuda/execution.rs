@@ -30,7 +30,7 @@ enum StepPlan {
     Decode,
     Prefill(Vec<PrefillCandidate>),
     Split(Vec<PrefillCandidate>),
-    Mixed(PrefillCandidate),
+    Mixed(Vec<PrefillCandidate>),
 }
 
 impl StepPlan {
@@ -50,19 +50,21 @@ impl StepPlan {
 
     fn scheduled_prefill_rows(&self) -> u64 {
         match self {
-            Self::Prefill(candidates) | Self::Split(candidates) => candidates.len() as u64,
-            Self::Mixed(_) => 1,
+            Self::Prefill(candidates) | Self::Split(candidates) | Self::Mixed(candidates) => {
+                candidates.len() as u64
+            }
             Self::Idle | Self::Decode => 0,
         }
     }
 
     fn scheduled_prefill_tokens(&self) -> u64 {
         match self {
-            Self::Prefill(candidates) | Self::Split(candidates) => candidates
-                .iter()
-                .map(|candidate| candidate.reservation.prefill_tokens as u64)
-                .sum(),
-            Self::Mixed(candidate) => candidate.reservation.prefill_tokens as u64,
+            Self::Prefill(candidates) | Self::Split(candidates) | Self::Mixed(candidates) => {
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.reservation.prefill_tokens as u64)
+                    .sum()
+            }
             Self::Idle | Self::Decode => 0,
         }
     }
@@ -78,29 +80,31 @@ struct PrefillBudget {
 
 impl PrefillBudget {
     fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
-        let running_decode_tokens = scheduler
+        let decode_slots: Vec<usize> = scheduler
             .running_batch
             .iter()
             .filter(|&&slot_idx| scheduler.slot_is_runnable_decode(slot_idx))
-            .count();
+            .copied()
+            .collect();
+        Self::from_scheduler_for_decode_slots(scheduler, &decode_slots)
+    }
+
+    fn from_scheduler_for_decode_slots<M: ModelForward>(
+        scheduler: &Scheduler<M>,
+        decode_slots: &[usize],
+    ) -> Self {
         let mut budget = Self {
             token_budget: StepTokenBudget::for_prefill(
                 scheduler.config.max_num_batched_tokens,
                 scheduler.config.max_prefill_tokens,
-                running_decode_tokens,
+                decode_slots.len(),
                 scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
             ),
             long_prefill_token_threshold: scheduler.config.long_prefill_token_threshold,
-            decode_active: running_decode_tokens > 0,
+            decode_active: !decode_slots.is_empty(),
             page_budget: PageBudget::from_scheduler(scheduler, true),
         };
-        for &slot_idx in &scheduler.running_batch {
-            let reserve_decode_headroom = scheduler.request(slot_idx).is_some_and(|req| {
-                matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
-            });
-            if !reserve_decode_headroom {
-                continue;
-            }
+        for &slot_idx in decode_slots {
             let remaining = scheduler.remaining_decode_reservation_tokens(slot_idx);
             if remaining > 0 {
                 budget.page_budget.reserve_growth(PageGrowth {
@@ -180,12 +184,22 @@ impl<M: ModelForward> Scheduler<M> {
         })
     }
 
-    fn prefill_reservation(
+    pub(super) fn runnable_decode_reservation_slots(&self) -> Vec<usize> {
+        self.running_batch
+            .iter()
+            .filter(|&&slot_idx| self.slot_is_runnable_decode(slot_idx))
+            .copied()
+            .collect()
+    }
+
+    fn capped_prefill_reservation(
         &self,
         slot_idx: usize,
-        decode_active: bool,
-        long_prefill_token_threshold: usize,
+        prefill_token_cap: usize,
     ) -> Option<PrefillReservation> {
+        if prefill_token_cap == 0 {
+            return None;
+        }
         let req = self.request(slot_idx)?;
         if req.delta_tx.is_closed() {
             return None;
@@ -203,12 +217,7 @@ impl<M: ModelForward> Scheduler<M> {
             return None;
         }
 
-        let per_request_cap = if decode_active {
-            self.prefill_chunk_size().min(long_prefill_token_threshold)
-        } else {
-            self.prefill_chunk_size()
-        };
-        let prefill_tokens = remaining_tokens.min(per_request_cap.max(1));
+        let prefill_tokens = remaining_tokens.min(prefill_token_cap);
         Some(PrefillReservation {
             prefill_tokens,
             page_growth: PageGrowth {
@@ -217,6 +226,45 @@ impl<M: ModelForward> Scheduler<M> {
                     .saturating_add(self.remaining_decode_reservation_tokens(slot_idx)),
             },
         })
+    }
+
+    fn prefill_reservation(
+        &self,
+        slot_idx: usize,
+        decode_active: bool,
+        long_prefill_token_threshold: usize,
+    ) -> Option<PrefillReservation> {
+        let per_request_cap = if decode_active {
+            self.prefill_chunk_size().min(long_prefill_token_threshold)
+        } else {
+            self.prefill_chunk_size()
+        };
+        self.capped_prefill_reservation(slot_idx, per_request_cap.max(1))
+    }
+
+    pub(super) fn select_launch_prefill_candidates(
+        &self,
+        candidates: &[PrefillCandidate],
+        decode_slots: &[usize],
+    ) -> Vec<PrefillCandidate> {
+        let mut budget = PrefillBudget::from_scheduler_for_decode_slots(self, decode_slots);
+        let mut scored_candidates = Vec::with_capacity(candidates.len());
+        for (queue_rank, candidate) in candidates.iter().enumerate() {
+            let Some(reservation) = self.capped_prefill_reservation(
+                candidate.slot_idx,
+                candidate.reservation.prefill_tokens,
+            ) else {
+                continue;
+            };
+            scored_candidates.push(ScoredPrefillCandidate {
+                candidate: PrefillCandidate {
+                    slot_idx: candidate.slot_idx,
+                    reservation,
+                },
+                score: PrefillCandidateScore { queue_rank },
+            });
+        }
+        select_prefill_candidates(&mut budget, scored_candidates)
     }
 
     fn collect_prefill_candidates(
@@ -262,7 +310,7 @@ impl<M: ModelForward> Scheduler<M> {
                 return StepPlan::Decode;
             }
             if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
-                return StepPlan::Mixed(candidates[0]);
+                return StepPlan::Mixed(candidates);
             }
             // Keep the legacy split launches for models that do not have a
             // real single-launch mixed lowering yet.
@@ -337,9 +385,9 @@ impl<M: ModelForward> Scheduler<M> {
                 self.step_decode_launch();
                 (prefill_us, decode_t.elapsed().as_micros())
             }
-            StepPlan::Mixed(candidate) => {
+            StepPlan::Mixed(candidates) => {
                 let t = std::time::Instant::now();
-                self.step_mixed_launch(*candidate);
+                self.step_mixed_launch(candidates);
                 (0, t.elapsed().as_micros())
             }
         };
