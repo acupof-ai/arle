@@ -3,14 +3,8 @@ interface Props {
   ariaLabel: string;
 }
 const { ariaLabel } = Astro.props;
-// figlet "standard" — only _ / \ | characters, renders identically in every
-// monospace font and will not garble even when fallback fonts are in use.
-const ART = `    _    ____  _     _____
-   / \\  |  _ \\| |   | ____|
-  / _ \\ | |_) | |   |  _|
- / ___ \\|  _ <| |___| |___
-/_/   \\_\\_| \\_\\_____|_____|`;
 ---
-<pre class="ascii" aria-label={ariaLabel}>
-<span class="ascii-art" aria-hidden="true">{ART}</span>
-</pre>
+<div class="wordmark" aria-label={ariaLabel}>
+  <span class="wordmark-name">arle</span><span class="wordmark-section">(1)</span>
+  <span class="wordmark-rule" aria-hidden="true"></span>
+</div>

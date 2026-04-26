@@ -134,28 +134,22 @@ const heroInstall = s.install.cards[0];
 
 <Section id="bench" title={s.bench.title}>
   <p class="block" set:html={s.bench.caption} />
-  <div class="matrix-wrap">
-    <table class="matrix bench-table">
-      <thead>
-        <tr>
-          {s.bench.head.map((h) => (
-            <th>{h}</th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {s.bench.rows.map((r) => (
-          <tr>
-            <td class="m-key">{r.date}</td>
-            <td><code>{r.backend}</code></td>
-            <td>{r.model}</td>
-            <td>{r.hardware}</td>
-            <td set:html={r.metric} />
-            <td><a class="bench-link" href={r.href}>snapshot &#x2197;</a></td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+  <div class="bench-grid">
+    {s.bench.rows.map((r) => (
+      <article class="bench-card">
+        <header class="bench-card-meta">
+          <span class="bench-card-date">{r.date}</span>
+          <span class="bench-card-sep" aria-hidden="true">·</span>
+          <code class="bench-card-backend">{r.backend}</code>
+          <span class="bench-card-sep" aria-hidden="true">·</span>
+          <span class="bench-card-model">{r.model}</span>
+          <span class="bench-card-sep" aria-hidden="true">·</span>
+          <span class="bench-card-hw">{r.hardware}</span>
+        </header>
+        <p class="bench-card-metric" set:html={r.metric} />
+        <a class="bench-card-link" href={r.href}>full snapshot &#x2197;</a>
+      </article>
+    ))}
   </div>
   <p class="note" set:html={s.bench.note} />
 </Section>
