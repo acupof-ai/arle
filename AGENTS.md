@@ -249,6 +249,10 @@ Env vars: `INFER_CUDA_SM` (SM override), `INFER_TRITON_PYTHON`
 (Triton AOT Python), `INFER_TEST_MODEL_PATH` (default `models/Qwen3-4B`).
 Full list: [`docs/environment.md`](docs/environment.md).
 
+Disk hygiene: `cargo sweep --time 30` (weekly) prunes target/ artifacts
+older than 30 days. Dev profile already keeps deps DWARF-free (see root
+`Cargo.toml` `[profile.dev.package."*"] debug = false`).
+
 ---
 
 ## Module Guides
