@@ -10,8 +10,9 @@ Build-time AOT for the prefill HD128 paged attention kernel, gated behind
 - AOT-specialized per Qwen3 head config in `SUPPORTED_HEADS`. Today:
   `(16,8)` 0.6B/1.7B, `(32,8)` 4B/8B, `(40,8)` 14B, `(64,8)` 32B.
   Build emits one cubin + C wrapper per config; Rust dispatches by
-  `(num_q_heads, num_kv_heads)`. Add a new size by extending three
-  in-lockstep lists (see comments in `build.rs` and `ffi/attention.rs`).
+  `(num_q_heads, num_kv_heads)`. Add a new size by extending the lockstep
+  lists in this kernel module, `build.rs`, `ffi/attention.rs`, and
+  `infer/src/ops/attention.rs`.
 - Build-time CUBIN generation under `OUT_DIR/tilelang_aot/<artifact>/`.
 - Generated C wrappers compiled into `libtilelang_kernels_aot.a` and
   linked alongside the Triton AOT artifacts.
@@ -52,17 +53,20 @@ export INFER_CUDA_SM=90
 
 ## Build
 
-The `tilelang-attn` feature is declared on `infer` and `cuda-kernels`, not on
-the workspace root binary. Build the runtime crate directly:
+Build through the workspace root when you want the `arle`/`cli` binaries:
+
+```bash
+cargo build --release --features cuda,tilelang-attn
+```
+
+Build the runtime crate directly when you only need `infer`:
 
 ```bash
 cargo build --release -p infer --features cuda,tilelang-attn
 ```
 
-For binaries that must be built through the workspace root (`arle`, `cli`)
-the feature has to be forwarded there first; that is intentionally deferred
-until Phase 1 because Phase 0 is evaluated by running the `infer` server
-binary plus `scripts/bench_guidellm.sh`.
+For scripted server launches, set `INFER_FEATURES=cuda,tilelang-attn` before
+calling `scripts/start_infer.sh`.
 
 Artifacts land under `target/release/build/cuda-kernels-*/out/tilelang_aot/`.
 The generated C wrapper embeds the cubin bytes via `cuModuleLoadData`, so

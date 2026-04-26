@@ -1,12 +1,12 @@
-# TileLang Phase 0 — H100 verification runbook
+# TileLang Phase 0 — GPU verification runbook
 
 Companion to [`tilelang-integration.md`](tilelang-integration.md). Step-by-
-step procedure the operator runs on a remote H100 to take Phase 0 from
-"committed locally" to a reviewable bench delta. Every step has a
+step procedure the operator runs on a remote GPU host to take Phase 0
+from "committed locally" to a reviewable bench delta. Every step has a
 copy-paste command and an explicit pass/fail signal so the run is
 reproducible without referring back to other docs.
 
-Target commits (everything from this range must be present on the H100
+Target commits (everything from this range must be present on the host
 checkout):
 
 ```text
@@ -22,14 +22,78 @@ the tree).
 
 ---
 
+## 0 · Hardware modes
+
+Phase 0 supports two GPU targets. The verification procedure below
+applies to both, but only H100 numbers drive the §5 ship/revert
+decision.
+
+| Mode | SM    | Use                                                                                              | Decision authority |
+|------|-------|--------------------------------------------------------------------------------------------------|--------------------|
+| H100 | 9.0 (sm_90) | Primary. TileLang's TMA / WGMMA / warp-spec leverage fires here.                          | Yes — §5 thresholds calibrated for this. |
+| L4   | 8.9 (sm_89) | Risk-gate + compatibility regression. Cheap pre-flight before booking H100 time.          | No — record as floor only; do not cite to ship Phase 1 or revert Phase 0. |
+
+Build picks the SM via `INFER_CUDA_SM` (overrides `nvidia-smi` auto-
+detect):
+
+```bash
+# H100
+INFER_CUDA_SM=90 cargo build --release --features cuda,tilelang-attn
+
+# L4
+INFER_CUDA_SM=89 cargo build --release --features cuda,tilelang-attn
+```
+
+Cubins land under `target/release/build/cuda-kernels-*/out/tilelang_aot/<config>/<name>.cubin`
+and are SM-specific. A cubin built for sm_90 will fail
+`cuModuleLoadData` with `CUDA_ERROR_INVALID_SOURCE` on sm_89 and vice
+versa — re-build per host, do not ship the wrong cubin to the wrong
+GPU.
+
+### What L4 actually proves
+
+§1 + §2 + §3 of this runbook are SM-independent in their assertions:
+
+- §1 (pre-flight): same checks; expect compute_cap 8.9 instead of 9.0.
+- §2 (build): TileLang AOT for sm_89 succeeding clears risk gate #1
+  per [`tilelang-integration.md`](tilelang-integration.md) §5 on Ada —
+  and almost certainly on Hopper too. Cheap H100-spike insurance.
+- §3 (numerical parity): does not depend on SM. If e2e passes on L4 it
+  passes on H100.
+
+§4 + §5 are SM-dependent. L4 bench numbers go in a `wins/` entry
+labelled `…-l4-floor.md`, not the canonical pending-remote stub —
+they do not retire it.
+
+### Multi-SM in one binary (Phase 1+, not Phase 0)
+
+Today each binary is single-SM. Three options if Phase 0 ships:
+
+1. **PTX + driver JIT** — switch the TileLang target from `cuda:<sm>`
+   to plain `cuda`, let the driver JIT on first launch. Cheapest. Loses
+   Hopper-only intrinsics (TMA, WGMMA) wherever they don't lower
+   through PTX.
+2. **nvcc fatbin** — AOT-compile per `(head_config × SM)`, bundle via
+   `fatbinary --create`, embed via the existing `cuModuleLoadData`
+   path. Build time ×N_SMs; binary +KBs per `(config, SM)`. The
+   Phase 1+ target shape.
+3. **Runtime SM dispatch with multi-cubin embed** — explicit C wrapper
+   logic. More verbose than fatbin and equivalent in function. Skip.
+
+Phase 0 verification doesn't need any of this — pick a host, set
+`INFER_CUDA_SM`, build, verify, move on.
+
+---
+
 ## 1 · Pre-flight (don't skip)
 
 Each line below should pass before touching the build.
 
 ```bash
-# 1.1 GPU is what we expect (sm_90, ≥40 GB free)
+# 1.1 GPU is what we expect (≥40 GB free; sm_90 for H100 or sm_89 for L4)
 nvidia-smi --query-gpu=name,compute_cap,memory.free --format=csv,noheader
-# Expect: H100*, 9.0, free ≥ 40000 MiB
+# Expect: H100* 9.0 OR L4* 8.9, free ≥ 40000 MiB. Record which mode
+# §0 you are in; the §5 decision matrix branches on it.
 
 # 1.2 CUDA toolkit is reachable
 echo "CUDA_HOME=$CUDA_HOME"
@@ -211,18 +275,30 @@ strings target/release/infer | grep -c tilelang_batch_prefill_paged_hd128_q
 ## 5 · Decision matrix
 
 Per [`tilelang-integration.md`](tilelang-integration.md) §5, with the
-exact thresholds spelt out:
+exact thresholds spelt out. **Applies on H100 only** — see §0 for why
+L4 numbers are floor-only.
 
-| `on` Δ vs `off`                                  | Action |
+| `on` Δ vs `off` (H100)                           | Action |
 |---|---|
 | TTFT p50 ≥ −10 % at synchronous **AND** out-tok-s ≥ +10 % at saturation | **Phase 1 starts.** Open `docs/plans/tilelang-decode.md` from this template; migrate decode HD128/HD256. |
 | Both metrics within ±5 %                          | **Ship-and-hold.** Update bench entry to "flat", land it; do not start Phase 1. Feature stays in tree, default off. |
 | TTFT regresses ≥5 % at synchronous **OR** out-tok-s regresses ≥5 % at saturation | **Revert.** `git revert 9896d25 76e044b 022e8dd`, write errors/ entry, push. |
-| Anywhere in §1–§4 a step failed | **Revert per the action listed at that step.** |
+| Anywhere in §1–§4 a step failed                  | **Revert per the action listed at that step.** |
 
 The 5–10 % no-go band is intentional. A 7 % win does not justify
 carrying two attention paths long-term; a 7 % loss is too small to
 matter relative to bench noise.
+
+### L4 only (no H100 access yet)
+
+Run §1–§4 to produce a `…-l4-floor.md` wins entry, then **stop**:
+
+- §2/§3 passing → risk gates #1 + #2 are clear; H100 spike is safe to
+  request budget for.
+- §4 produces L4 Δ% — record but do not act on it. Phase 1 / revert
+  decisions wait for the H100 numbers.
+- The pending-remote H100 stub stays in place; do not retire it from
+  an L4-only run.
 
 ---
 

@@ -80,7 +80,7 @@ cpu = ["cli/cpu"]
 metal = ["cli/metal"]
 # TileLang prefill HD128 attention path (Phase 0 A/B vs FlashInfer).
 # Implies `cuda`. Forwards through `cli` and `infer` to `cuda-kernels`.
-tilelang-attn = ["cli/tilelang-attn"]
+tilelang-attn = ["cuda", "cli/tilelang-attn"]
 
 [dependencies]
 anyhow = "1.0"

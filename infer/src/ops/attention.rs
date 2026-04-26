@@ -16,7 +16,9 @@ use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use cuda_kernels::ffi;
-use cuda_kernels::flashinfer::{BatchPrefillPagedPlan, FlashInferWorkspace};
+#[cfg(not(feature = "tilelang-attn"))]
+use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
+use cuda_kernels::flashinfer::FlashInferWorkspace;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
 
 // ============================================================================
@@ -355,7 +357,7 @@ pub(crate) fn prefill_attention_hd256_batch_with_scratch(
 // Paged-KV prefill (Phase 2 — consumes Phase 1 FFI)
 //
 // Callers pass in a paged KV pool + per-slot page indices (GPU-resident) +
-// a `BatchPrefillPagedPlan` (one per forward, reused across layers).
+// per-forward metadata reused across layers.
 // Unlike the contiguous prefill path this writes K/V directly into pool pages
 // via page-table indirection — no migrate_kv_range_to_paged step needed
 // afterward.
@@ -394,9 +396,13 @@ fn paged_prefill_last_page_len(kv_len: usize, page_size: usize) -> i32 {
     ((kv_len - 1) % page_size + 1) as i32
 }
 
-/// Per-forward scratch that holds the already-planned FlashInfer state and
-/// the uploaded indptr/last-page-len device buffers. Built once before the
-/// per-layer loop and passed by `&mut` to each layer's attention call.
+/// Per-forward scratch that holds uploaded indptr/last-page-len device
+/// buffers. Built once before the per-layer loop and passed by `&mut` to each
+/// layer's attention call.
+///
+/// In FlashInfer builds, the caller also keeps one `BatchPrefillPagedPlan`
+/// planned once for the same metadata. In TileLang builds there is no
+/// FlashInfer plan object or workspace on this path.
 ///
 /// This type exists to close an async-memcpy race: FlashInfer's `PrefillPlan`
 /// writes metadata into the plan's `page_locked_workspace` (host pinned) and
@@ -419,6 +425,7 @@ pub(crate) struct PagedPrefillForward {
 
 impl PagedPrefillForward {
     /// Plan and upload indptrs ONCE for the whole forward. HD128 flavour.
+    #[cfg(not(feature = "tilelang-attn"))]
     pub(crate) fn new_hd128(
         ctx: &DeviceContext,
         plan: &mut BatchPrefillPagedPlan,
@@ -430,13 +437,23 @@ impl PagedPrefillForward {
         Self::new_inner(ctx, plan, sequences, num_q_heads, num_kv_heads, page_size)
     }
 
+    /// Upload indptrs ONCE for the whole TileLang forward. HD128 flavour.
+    #[cfg(feature = "tilelang-attn")]
+    pub(crate) fn new_hd128(
+        ctx: &DeviceContext,
+        sequences: &[PagedPrefillSequence],
+        page_size: usize,
+    ) -> Result<Self> {
+        Self::new_inner(ctx, sequences, page_size)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
         ctx: &DeviceContext,
-        plan: &mut BatchPrefillPagedPlan,
+        #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
         sequences: &[PagedPrefillSequence],
-        num_q_heads: usize,
-        num_kv_heads: usize,
+        #[cfg(not(feature = "tilelang-attn"))] num_q_heads: usize,
+        #[cfg(not(feature = "tilelang-attn"))] num_kv_heads: usize,
         page_size: usize,
     ) -> Result<Self> {
         ensure!(
@@ -483,11 +500,9 @@ impl PagedPrefillForward {
             kv_last_page_len.push(paged_prefill_last_page_len(kv_len, page_size));
         }
 
-        // Single plan call for the whole forward. All layers share the same
-        // (batch_size, qo_len, kv_len, page_size, num_heads) shape, so one
-        // plan covers them all. TileLang reads paged KV directly and never
-        // consumes plan_info — skip the plan to keep the A/B comparison a
-        // pure _run swap.
+        // Single FlashInfer plan call for the whole forward. All layers share
+        // the same (batch_size, qo_len, kv_len, page_size, num_heads) shape,
+        // so one plan covers them all.
         #[cfg(not(feature = "tilelang-attn"))]
         plan.plan_hd128(
             ctx,
@@ -498,8 +513,6 @@ impl PagedPrefillForward {
             num_kv_heads,
             page_size,
         )?;
-        #[cfg(feature = "tilelang-attn")]
-        let _ = (plan, num_q_heads, num_kv_heads);
 
         let qo_indptr_dev: CudaSlice<i32> = ctx
             .stream
@@ -529,12 +542,12 @@ impl PagedPrefillForward {
 ///
 /// Structural contract: the caller MUST have built a `PagedPrefillForward`
 /// via `PagedPrefillForward::new_hd128` BEFORE the per-layer loop and
-/// passes it by `&mut` into each layer. That struct holds the single-plan
-/// state (already uploaded to `int_workspace`) and the pre-uploaded
-/// qo/kv indptrs. This function only runs:
+/// passes it by `&mut` into each layer. That struct holds the pre-uploaded
+/// qo/kv indptrs. FlashInfer builds also pass a separately planned
+/// `BatchPrefillPagedPlan`. This function only runs:
 ///  1. QK norm + RoPE + paged K/V write (per-layer, touches per-layer K/V
 ///     pool pointers).
-///  2. FlashInfer `BatchPrefillWithPagedKVCacheDispatched<HD=128>` `_run`.
+///  2. FlashInfer or TileLang paged-prefill HD128 `_run`.
 ///
 /// Do NOT call `plan.plan_hd128` here. Calling plan per layer overwrites
 /// the plan's `page_locked_workspace` while a prior layer's
@@ -549,7 +562,7 @@ pub(crate) fn prefill_attention_paged_batch(
     v_batch: &HiddenStates,
     nrp: &NormRopeParams,
     meta: &PagedPrefillMeta,
-    plan: &mut BatchPrefillPagedPlan,
+    #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
     fwd: &mut PagedPrefillForward,
     output: &mut HiddenStates,
     heads: &HeadConfig,
@@ -655,7 +668,6 @@ pub(crate) fn prefill_attention_paged_batch(
 
     #[cfg(feature = "tilelang-attn")]
     {
-        let _ = plan; // TileLang reads paged KV directly; FlashInfer plan_info unused.
         // HD128 + page_size=16 are already enforced by the function-level
         // invariants above. (num_q_heads, num_kv_heads) picks the matching
         // AOT-specialized kernel; unsupported configs fail loudly with a
