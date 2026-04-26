@@ -1,8 +1,11 @@
-# Doc Index
+# Maintainer Doc Index
 
-Maintainer-facing index for current truth. This is not the public landing page.
+> **Looking for getting-started, install, or HTTP API docs?** Go to
+> [README.md](../README.md), [docs/troubleshooting.md](troubleshooting.md), or
+> [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
+> tracking canonical truth surfaces, active plans, and experience logs.
 
-Last refreshed: 2026-04-25 (truth-surface cleanup).
+Last refreshed: 2026-04-26 (front-door polish series).
 
 ## Canonical Truth Surfaces
 
