@@ -69,7 +69,7 @@ crates/autograd/
 
 ## DeviceHandle contract (M5.3a)
 
-**Spec**: [`docs/plans/m5.3-device-resident-tensor.md`](../../docs/plans/m5.3-device-resident-tensor.md).
+**Spec**: see [`docs/projects/agent-rl-self-evolving.md`](../../docs/projects/agent-rl-self-evolving.md) §M5 for the device-resident tensor milestone scope.
 
 ### Types
 

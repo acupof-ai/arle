@@ -233,7 +233,8 @@ acceptance and throughput.
   ≥ 2 scales linearly through B=8.
 - **Full-concurrency ceiling**: ~145 tok/s aggregate at c=8 (Qwen3.5-4B-4bit).
   Further gains require GDR kernel work (profile via Xcode Metal capture —
-  see [`metal-gdr-kernel-xcode-capture.md`](../plans/metal-gdr-kernel-xcode-capture.md)).
+  set `INFER_CAPTURE_STEP=N` + `MTL_CAPTURE_ENABLED=1`, then open the
+  resulting `.gputrace` in Xcode).
 - **Qwen3-4B bf16**: 5.9× decode speedup (25.9 → 152.0 tok/s) on M4 Pro at
   `prompt=20, generation=256`.
 
@@ -247,7 +248,7 @@ for definitions; listed here so operators know what's supported:
 | `DFLASH_DRAFT_MASK=causal` | `dflash.rs:271` | Force causal draft attention (diagnostic only) |
 | `DFLASH_DRAFT_CPP=<path>` | `dflash.rs:534` | Override compiled draft kernel cache path |
 | `QWEN35_DFLASH_PROFILE=1` | `dflash.rs:1870` | Emit per-block profiling to stderr |
-| `INFER_CAPTURE_STEP=N` + `MTL_CAPTURE_ENABLED=1` | GPU capture hook | Xcode trace one step; see [GDR capture runbook](../plans/metal-gdr-kernel-xcode-capture.md) |
+| `INFER_CAPTURE_STEP=N` + `MTL_CAPTURE_ENABLED=1` | GPU capture hook | Xcode trace one step; opens `/tmp/qwen35_step_<unix_ts>.gputrace` |
 
 ## Troubleshooting
 
@@ -275,7 +276,7 @@ needs only config + weights.
 ## Related docs
 
 - [`metal-dflash-params.md`](metal-dflash-params.md) — full parameter table
-- [`../plans/metal-gdr-kernel-xcode-capture.md`](../plans/metal-gdr-kernel-xcode-capture.md) — GPU profiling runbook
+- [`profiling-guide.md`](profiling-guide.md) — GPU profiling playbook
 - [`../experience/wins/2026-04-19-metal-qwen35-final-state.md`](../experience/wins/2026-04-19-metal-qwen35-final-state.md) — terminal state of the Qwen3.5 DFlash arc
 - [`../experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md`](../experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md) — root cause for the prefill fast-forward fix
 - Code: `infer/src/backend/metal/dflash.rs`, `scheduler.rs::fast_forward_prefill`, `crates/mlx-sys/src/mlx_dflash_draft_model.cpp`

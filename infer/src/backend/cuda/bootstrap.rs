@@ -34,7 +34,7 @@ pub enum ModelType {
     Qwen35,
     /// Qwen3.5 Mixture-of-Experts (Qwen3.6-35B-A3B). CUDA path is a
     /// `todo!()` stub until the CUDA MoE kernel lands; Metal path lives
-    /// entirely outside this module. See `docs/plans/qwen36-moe-metal.md`.
+    /// entirely outside this module.
     Qwen35Moe,
 }
 

@@ -16,11 +16,10 @@ items share one code topology and must be built against one data-structure
 contract; splitting them into independent designs is how we end up with three
 incompatible caches. This doc owns that contract.
 
-This doc operates under the Phase-1 PR discipline originally proposed in
-[`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md)
-(now archived; the crate topology was reverted by Route-A but the PR
-discipline still applies): one main topic per PR, structure-before-behavior,
-no mixed kernel+scheduler+workspace diffs in the same review.
+This doc operates under the Phase-1 PR discipline now codified in
+[`../architecture.md`](../architecture.md) § "Workspace governance rules":
+one main topic per PR, structure-before-behavior, no mixed kernel+scheduler+
+workspace diffs in the same review.
 
 ---
 
@@ -99,8 +98,9 @@ check), `7b72d02` (M4c `RadixCache::reconcile` + full serde
 round-trip + runtime-only fields marked `#[serde(skip)]`), and
 `c87c68b` (M4d pure-Rust `infer/src/http_server/sessions.rs` with
 `save_session` / `load_session` / `LoadedSession` / 3 end-to-end
-unit tests). Combined remote CUDA acceptance for M4 is pending;
-see `docs/plans/tiered-kv-cache-m4-remote-acceptance.md`.
+unit tests). M4 remote CUDA acceptance landed 2026-04-16
+(`docs/experience/wins/2026-04-16-tiered-kv-m4*-local.md` +
+`tier-abc-remote.md`).
 
 The remaining live gaps are: remote/shared staged readmission beyond the
 current local CUDA path, the HTTP route wrappers around the M4d session
@@ -1030,9 +1030,8 @@ load-bearing. Scope:
 4. Stress test: 100 concurrent requests sharing one 4 k-token prefix
    does not produce pool-allocation failures (`alloc_pool_tokens_with_retry`
    + retain hard cap protect the free list)
-5. The dedicated acceptance checklist in
-   [`../plans/tiered-kv-cache-m2b-remote-acceptance.md`](../plans/tiered-kv-cache-m2b-remote-acceptance.md)
-   is completed and archived into `docs/experience/wins/`
+5. M2b remote CUDA acceptance landed 2026-04-15 — evidence at
+   `docs/experience/wins/2026-04-15-tiered-kv-m2b-{local,remote}.md`.
 
 ### M3 — T1 host pinned tier + coordinator (stacked PR series)
 
@@ -1081,18 +1080,18 @@ for the stacked M2b + M0.3 + M3a local batches.
   (`ReadmissionPlan -> WaitingFetch -> promote_fetched_prefix`), and
   decode-time tail-page COW before append. The shared-filesystem remote backend,
   queue cancellation, and store/readmission path are now landed locally too.
-  The remaining work is remote CUDA validation plus the future RDMA-class
-  transports. Remote
-  checklist: `docs/plans/tiered-kv-cache-m3b-remote-acceptance.md`.
+  M3b remote CUDA acceptance landed 2026-04-15 — evidence at
+  `docs/experience/wins/2026-04-15-tiered-kv-m3b-{local,remote,runtime-local}.md`.
+  Future RDMA-class transports remain out of scope for M3b.
 - **M3c · T1→T0 promotion wiring + delete legacy CPU offload.**
   The **cleanup half is now shipped locally**: the old contiguous
   `model/kv_cache.rs` CPU-offload implementation (`k_host/v_host`,
   `OFFLOAD_BLOCK_SIZE = 64`, `prefetch/offload` hooks), the stale
   `set_max_gpu_kv` shim, and the obsolete offload bench entrypoint are gone. The
   remaining M3c work is the **runtime half**: promotion wiring on radix lookup hit
-  when the matched node's `tier_location` is `HostPinned`, plus remote CUDA
-  regression validation of the cleanup batch. Remote checklist:
-  `docs/plans/tiered-kv-cache-m3c-remote-acceptance.md`.
+  when the matched node's `tier_location` is `HostPinned`. Remote CUDA
+  regression of the cleanup batch landed 2026-04-15 — evidence at
+  `docs/experience/wins/2026-04-15-tiered-kv-m3c-{local,remote}.md`.
 
 **Exit**:
 1. A long-agent-session benchmark (32k+ cumulative tokens,
@@ -1354,7 +1353,7 @@ already shipped, and M1 can proceed on M0.1 alone.
   When M1 lands, A1 moves to the Done section; when M3 lands, B3 moves;
   when M4 lands, B1 moves. `agent-first-architecture.md` gets an update
   pointer to this doc in the same PR series.
-- [`kv-quantization-long-context.md`](kv-quantization-long-context.md) —
+- [`../resources/kv-cache-quantization.md`](../resources/kv-cache-quantization.md) —
   KV quantization formats (FP8, INT8, TurboQuant) live inside T0 blocks.
   `byte_len` on `RadixNode` must account for scale bytes. M0.3 must not
   regress the quantized fast paths; the M0.3 per-format dispatch keeps
@@ -1366,12 +1365,10 @@ already shipped, and M1 can proceed on M0.1 alone.
 - [`cuda-kernel-crate-extraction.md`](../plans/cuda-kernel-crate-extraction.md) —
   the `.cu` file moves landed 2026-04-15, so M0.3 kernel references now live at
   `crates/cuda-kernels/csrc/kv/*.cu` (and `crates/cuda-kernels/csrc/attention/decode_prep_paged*.cu`).
-- [`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md) —
-  archived workspace crate topology proposal. PR discipline (§六) and
-  crate admission criteria (§七) still apply; the §一 topology was
-  reverted by Route-A. If M3 or later promotes `kv_tier` to a separate
-  crate, the promotion still has to pass the §六 "two direct consumers"
-  gate.
+- [`../architecture.md`](../architecture.md) § "Workspace governance rules" —
+  PR discipline + crate-admission criteria. If M3 or later promotes
+  `kv_tier` to a separate crate, the promotion still has to pass the
+  "two direct consumers" gate captured there.
 
 ---
 
@@ -1708,14 +1705,11 @@ revision supersedes all three of those as documented above.
 
 **Next, in dependency order**:
 
-1. **Remote CUDA acceptance for the stacked local batches** (immediate next
-   step). Run the existing
-   [`../plans/tiered-kv-cache-m2b-remote-acceptance.md`](../plans/tiered-kv-cache-m2b-remote-acceptance.md)
-   checklist for the selector flip, then run
-   [`../plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md`](../plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md)
-   for the BF16 `page_size=16` path and the first M3a structural smoke.
-   Record the results in `docs/experience/wins/`. This is the gate from
-   "local impl done" to "accepted on CUDA".
+1. **Remote CUDA acceptance for the stacked local batches** — landed
+   2026-04-15. Selector-flip evidence at
+   `docs/experience/wins/2026-04-15-tiered-kv-m2b-{local,remote}.md`;
+   BF16 `page_size=16` + M3a structural smoke at
+   `docs/experience/wins/2026-04-15-tiered-kv-m0.3-m3a-{local,remote}.md`.
 2. **M3b · coordinator + page lifecycle + policy convergence + recompute
    fallback**. The M3 correctness centre. Three-state page lifecycle
    (`Free | Resident | Demoting`), policy-trait wire (`evict_with_policy`),

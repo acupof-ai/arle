@@ -1183,7 +1183,7 @@ fn main() -> Result<()> {
         ModelType::Qwen35Moe => {
             // Qwen3.5 MoE (Qwen3.6) CUDA path is intentionally stubbed; the
             // Metal backend runs MoE in its own dispatch, not through this
-            // benchmark harness. See `docs/plans/qwen36-moe-metal.md`.
+            // benchmark harness.
             todo!("GPU required: Qwen3.6 CUDA not yet implemented")
         }
     };

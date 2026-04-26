@@ -93,10 +93,9 @@ O(1) recurrent state.
 
 ## Pointers
 
-- `docs/experience/wins/2026-04-02-modelforward-trait-redesign.md` — why the
-  trait looks the way it does.
-- `docs/plans/qwen35-sglang-parity.md` — Qwen3.5 hybrid-attention contract.
-- `docs/experience/errors/2026-04-02-rope-axis-bug.md` — RoPE pitfall for
-  Qwen3.5.
+- `crates/qwen3-spec/` and `crates/qwen35-spec/` — canonical config + tensor-name
+  contract shared between train and infer.
+- `docs/projects/agent-first-architecture.md` — current model/runtime priorities
+  including the hybrid Qwen3.5 attention surface.
 - `feedback_mlx_rope_layout.md` / `feedback_mlx_rope_axis.md` (auto-memory) —
   MLX `fast::rope` layout gotchas for the Metal side.
