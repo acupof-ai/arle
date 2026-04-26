@@ -134,21 +134,21 @@ not in the source tree. No hand-written `.cu` wrapper is added.
 
 | Path | Change |
 |------|--------|
-| `Cargo.toml` (workspace root) | Add `tilelang-attn = ["cli/tilelang-attn"]` so `cargo build --features cuda,tilelang-attn` at the repo root reaches the actual prefill path instead of producing a silently-FlashInfer binary. |
-| `crates/cli/Cargo.toml` | Add `tilelang-attn = ["infer/tilelang-attn"]` to forward through the CLI crate. |
+| `Cargo.toml` (workspace root) | Add `tilelang-attn = ["cuda", "cli/tilelang-attn"]` so `cargo build --features tilelang-attn` implies the CUDA backend instead of producing a binary without a selected backend. |
+| `crates/cli/Cargo.toml` | Add `tilelang-attn = ["cuda", "infer/tilelang-attn"]` to forward through the CLI crate and keep the CLI backend enabled. |
 | `infer/Cargo.toml` | Add `tilelang-attn = ["cuda", "cuda-kernels/tilelang-attn"]`. |
 | `crates/cuda-kernels/Cargo.toml` | Add `tilelang-attn = ["cuda"]`. |
 | `crates/cuda-kernels/build.rs` | Behind `cfg(feature = "tilelang-attn")`: probe Python with `import tilelang`, loop over `TILELANG_PREFILL_HD128_HEAD_CONFIGS` running the AOT generator once per `(num_q_heads, num_kv_heads)` pair, compile all generated C wrappers into a single `libtilelang_kernels_aot.a`. Mirrors the existing Triton track. |
 | `crates/cuda-kernels/src/ffi/attention.rs` | Declare one `tilelang_batch_prefill_paged_hd128_q{Q}_kv{KV}_run_cuda` extern per supported head config via a small `macro_rules!`. Single shared parameter list. |
-| `infer/src/ops/attention.rs` | (a) Cfg-gate the per-forward `plan.plan_hd128(...)` call so `tilelang-attn` skips FlashInfer plan setup. (b) At the per-layer dispatch site, match on `(num_q_heads, num_kv_heads)` to pick the matching FFI symbol; unsupported pairs return an `anyhow!` error pointing at the three lockstep lists. **Compile-time only** — one canonical path per build (`feedback_no_half_states.md`). |
+| `infer/src/ops/attention.rs` | (a) Keep `BatchPrefillPagedPlan` out of the TileLang signature so TileLang builds upload only shared indptr/last-page-len metadata and allocate no FlashInfer plan/workspace on this path. (b) At the per-layer dispatch site, match on `(num_q_heads, num_kv_heads)` to pick the matching FFI symbol; unsupported pairs return an `anyhow!` error pointing at the lockstep lists. **Compile-time only** — one canonical path per build (`feedback_no_half_states.md`). |
+| `infer/src/model/qwen3/prefill.rs` | Cfg-gate the FlashInfer prefill plan storage and calls so Qwen3 TileLang prefill does not construct a `BatchPrefillPagedPlan`. |
 | `scripts/start_infer.sh` | Honor `INFER_FEATURES` env var (default `cuda`) so the bench wrapper can launch a TileLang-on server without editing the script. |
 | `pyproject.toml` | Add `[project.optional-dependencies] tilelang = ["tilelang>=…"]`. Pin in §6 once the H100 spike picks a version. |
 
 ### 4.3 Deliberately NOT changed
 
-- HD256 prefill, decode HD128/HD256, prep kernel, scheduler, model code
-  outside the single dispatch site, any `.cu` source, any Triton kernel,
-  any test data baseline.
+- HD256 prefill, decode HD128/HD256, prep kernel, scheduler, any `.cu`
+  source, any Triton kernel, any test data baseline.
 - No changes to `crates/cuda-kernels/src/prelude.rs` — the new FFI is not a
   proto-public symbol, it's an internal alternate path.
 

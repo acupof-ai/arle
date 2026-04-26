@@ -64,9 +64,10 @@ Invoked via: pending remote H100 host (user-driven verification).
   - `cargo fmt --check`
   - `cargo check -p infer --no-default-features --features cuda,no-cuda`
   - `cargo check -p infer --no-default-features --features cuda,no-cuda,tilelang-attn`
-  - `cargo check --features cuda,tilelang-attn` (workspace root, with `no-cuda`
-    on macOS) verifies the feature forwarding chain root → cli → infer →
-    cuda-kernels.
+  - `cargo check --features cuda,no-cuda,tilelang-attn` verifies the explicit
+    workspace root feature chain root → cli → infer → cuda-kernels.
+  - `cargo check --features tilelang-attn,no-cuda` verifies `tilelang-attn`
+    itself implies the CLI CUDA backend.
   - (Optionally: `cargo check -p cuda-kernels --features tilelang-attn`
     once the spike lands; this verifies the build.rs Python probe path
     without nvcc.)
@@ -125,8 +126,10 @@ Invoked via: pending remote H100 host (user-driven verification).
   `docs/plans/tilelang-integration.md` §4 — TileLang AOT track added to
   `crates/cuda-kernels/build.rs`, new FFI for
   `tilelang_batch_prefill_paged_hd128_run`, compile-time dispatch in
-  `infer/src/ops/attention.rs::prefill_attention_paged_batch`. No change
-  to the prep kernel, HD256 path, decode path, or any default build.
+  `infer/src/ops/attention.rs::prefill_attention_paged_batch`, and a
+  TileLang Qwen3 prefill path that uploads shared metadata without
+  constructing a FlashInfer `BatchPrefillPagedPlan`. No change to the prep
+  kernel, HD256 path, decode path, or any default build.
 - Suspected cause of any regression: AOT compile may pick suboptimal
   pipeline stages or warp count; tunables logged in the kernel module
   per plan §6.
