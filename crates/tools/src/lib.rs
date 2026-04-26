@@ -912,9 +912,11 @@ fn execute_python(code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::SandboxConfig;
     use super::{
-        BuiltinToolPolicyHooks, SandboxConfig, TimedCommandResult, active_sandbox_backend,
-        builtin_tools, default_workdir, resolved_python_executable, run_command_with_timeout,
+        BuiltinToolPolicyHooks, TimedCommandResult, active_sandbox_backend, builtin_tools,
+        default_workdir, resolved_python_executable, run_command_with_timeout,
     };
     use serde_json::json;
     use std::process::Command;

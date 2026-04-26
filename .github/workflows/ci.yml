@@ -28,6 +28,10 @@ jobs:
   check-macos:
     name: Check (macOS Metal)
     runs-on: macos-14
+    env:
+      # Match the SDK used to compile mlx C++ (which calls `@available(macOS 14, *)`),
+      # otherwise the linker can't resolve `__isPlatformVersionAtLeast`.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
 
