@@ -42,8 +42,10 @@ docker run --rm --gpus all -p 8000:8000 \
 ```
 
 The `:latest` tag tracks `main`; tagged releases are published as
-`ghcr.io/cklxx/arle:vX.Y.Z` once available — see
-[Releases](https://github.com/cklxx/arle/releases).
+`ghcr.io/cklxx/arle:X.Y.Z` (note: no `v` prefix — docker metadata-action
+strips it). For v0.1.0 today: `ghcr.io/cklxx/arle:0.1.0`. See
+[Releases](https://github.com/cklxx/arle/releases) for the matching
+GitHub Release page.
 
 **Apple Silicon — build from source (Metal backend):**
 
