@@ -35,9 +35,11 @@ Train-side runtime extension (per
 
 - `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend`
   trait with the device-resident / lazy-eval Metal path
-- `train`: generic Qwen-family pretrain / SFT / GRPO / multi-turn trainer,
-  train-side `/v1/train/{status,events,stop,save}` control plane, shared
-  async observability sinks (JSONL + MLflow + OTLP + W&B sidecar)
+- `train`: generic Qwen-family pretrain / SFT / GRPO / multi-turn trainer
+  (library only — surfaces are reached via `arle train ...` / `arle data ...`,
+  which include `src/bin/*.rs` as in-process dispatch sources), train-side
+  `/v1/train/{status,events,stop,save}` control plane, shared async
+  observability sinks (JSONL + MLflow + OTLP + W&B sidecar)
 
 The 2026-04-15 Route-A refactor folded the experimental `infer-core`,
 `infer-engine`, `infer-observability`, and `infer-policy` crates back into

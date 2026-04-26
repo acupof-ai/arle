@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+# train/* CLI surfaces are exposed exclusively via `arle train ...`
+# (crates/cli/src/train_cli.rs includes src/bin/*.rs as modules and dispatches
+# in-process). The standalone `[[bin]]` targets that previously shipped
+# `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` / `eval_lm` /
+# `download_dataset` / `convert_dataset` are intentionally removed; autobins is
+# disabled so Cargo does not auto-rediscover src/bin/*.rs.
+autobins = false
 
 [features]
 default = []
@@ -30,30 +37,6 @@ chat = { path = "../chat" }
 
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "pretrain"
-path = "src/bin/pretrain.rs"
-
-[[bin]]
-name = "train_grpo"
-path = "src/bin/train_grpo.rs"
-
-[[bin]]
-name = "train_sft"
-path = "src/bin/train_sft.rs"
-
-[[bin]]
-name = "download_dataset"
-path = "src/bin/download_dataset.rs"
-
-[[bin]]
-name = "convert_dataset"
-path = "src/bin/convert_dataset.rs"
-
-[[bin]]
-name = "eval_lm"
-path = "src/bin/eval_lm.rs"
 
 [lints]
 workspace = true
