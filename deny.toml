@@ -13,6 +13,24 @@
 [advisories]
 version = 2
 yanked = "warn"
+# Open advisories tracked but not yet fixed at the source. Each entry is a
+# "we know about this, dependency bump is queued" stake — revisit when
+# upstream lands a fix or when we touch the dep deliberately.
+ignore = [
+    # `paste` proc-macro is unmaintained. Pulled in transitively by several
+    # crates; no actively-exploited security implication, low priority swap.
+    "RUSTSEC-2024-0436",
+    # `rand::rng()` unsound with a custom logger. We do not install a
+    # custom global logger that would trigger the unsound path; track the
+    # `rand` 0.10 fix when it ships.
+    "RUSTSEC-2026-0097",
+    # Three `rustls`/`webpki`/CRL-related vulnerabilities. Pulled in via
+    # reqwest's TLS path. Bumping the TLS stack is queued as a deliberate
+    # PR; ignoring here so dep-bumps unrelated to TLS don't get blocked.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]
 
 [licenses]
 version = 2
@@ -23,6 +41,9 @@ allow = [
     "BSD-3-Clause",
     "BSL-1.0",
     "CC0-1.0",
+    # CDLA-Permissive-2.0 = Linux Foundation Community Data License Agreement
+    # (permissive). Pulled in by transitive deps such as `webpki-roots`.
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",
