@@ -237,12 +237,10 @@ code      { font-family: inherit; color: var(--coral-dim); }
   position: relative;
   z-index: 1;
   display: inline-block;
-  transform: scaleX(1.22);
-  transform-origin: left top;
-  text-shadow: 0 0 14px rgba(242, 167, 110, 0.24);
+  text-shadow: 0 0 12px rgba(242, 167, 110, 0.20);
 }
 @media (min-width: 760px) {
-  .ascii { font-size: 18px; }
+  .ascii { font-size: 22px; line-height: 1.05; }
 }
 .subline {
   margin: var(--sp-3) 0 0;
@@ -476,21 +474,21 @@ code      { font-family: inherit; color: var(--coral-dim); }
 /* ── hero meta callout (was hero-panel; now lives below the hero) ───── */
 
 .hero-meta-callout {
-  border: 1px solid rgba(30, 42, 37, 0.28);
-  border-top: 4px solid var(--coral);
-  background: linear-gradient(180deg, var(--panel-strong), var(--paper-dim));
+  border: 1px solid rgba(30, 42, 37, 0.18);
+  border-left: 3px solid var(--teal);
+  background: var(--panel);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.7),
-    0 12px 30px rgba(17, 23, 20, 0.10);
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    0 8px 18px rgba(17, 23, 20, 0.05);
   padding: var(--sp-4) var(--sp-5);
   margin: var(--sp-5) 0 0;
 }
 @media (prefers-color-scheme: dark) {
   .hero-meta-callout {
-    border-color: rgba(231, 238, 234, 0.18);
+    border-color: rgba(231, 238, 234, 0.16);
     box-shadow:
       inset 0 1px 0 rgba(255, 255, 255, 0.04),
-      0 12px 30px rgba(0, 0, 0, 0.45);
+      0 8px 18px rgba(0, 0, 0, 0.40);
   }
 }
 .hero-meta-callout .meta-shell {
@@ -594,35 +592,30 @@ code      { font-family: inherit; color: var(--coral-dim); }
 .mini-card {
   min-width: 0;
   padding: var(--sp-4) var(--sp-4);
-  border: 1px solid rgba(30, 42, 37, 0.16);
-  border-top: 3px solid rgba(8, 122, 115, 0.54);
-  background: linear-gradient(180deg, var(--panel-strong), rgba(233, 238, 229, 0.72));
-  box-shadow: 0 10px 24px rgba(17, 23, 20, 0.06);
-  transition: transform 120ms ease, box-shadow 120ms ease;
+  border: 1px solid rgba(30, 42, 37, 0.18);
+  border-left: 3px solid var(--teal);
+  background: var(--panel);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    0 8px 18px rgba(17, 23, 20, 0.05);
 }
-.mini-card:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 14px 30px rgba(17, 23, 20, 0.10);
-}
-.glance-grid .mini-card:nth-child(2) { border-top-color: rgba(201, 87, 59, 0.60); }
-.glance-grid .mini-card:nth-child(3) { border-top-color: rgba(109, 113, 54, 0.60); }
 @media (prefers-color-scheme: dark) {
   .mini-card {
-    border-color: rgba(231, 238, 234, 0.12);
-    border-top-color: rgba(77, 179, 169, 0.50);
-    background: linear-gradient(180deg, var(--panel-strong), rgba(18, 32, 25, 0.72));
-    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.40);
+    border-color: rgba(231, 238, 234, 0.16);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 8px 18px rgba(0, 0, 0, 0.40);
   }
-  .mini-card:hover { box-shadow: 0 14px 30px rgba(0, 0, 0, 0.55); }
-  .glance-grid .mini-card:nth-child(2) { border-top-color: rgba(231, 129, 97, 0.60); }
-  .glance-grid .mini-card:nth-child(3) { border-top-color: rgba(199, 197, 122, 0.50); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .mini-card { transition: none; }
-  .mini-card:hover { transform: none; }
 }
 .mini-card p:last-child { margin-bottom: 0; }
-.quick-card pre.cmd { margin-bottom: 0; }
+.quick-card { border-left-color: var(--coral); }
+.quick-card pre.cmd {
+  margin: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
 
 /* ── sections ──────────────────────────────────────────────────────── */
 
@@ -652,10 +645,6 @@ h2 .h2-rule {
   flex: 1;
   height: 1px;
   background: var(--line);
-}
-h2 .h2-sect {
-  color: var(--teal);
-  font-weight: 400;
 }
 h2 .h2-num::before {
   content: counter(section, decimal-leading-zero);
@@ -1183,8 +1172,8 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   table.why td.cap { padding-left: var(--sp-3); }
   table.why td.cap::before { width: 4px; }
   h2 { font-size: 12px; gap: var(--sp-2); }
-  .ascii { font-size: 7.6px; line-height: 0.92; padding: var(--sp-3); }
-  .ascii-art { transform: scaleX(1); text-shadow: 0 0 9px rgba(242, 167, 110, 0.20); }
+  .ascii { font-size: 13px; line-height: 1.05; padding: var(--sp-3); }
+  .ascii-art { text-shadow: 0 0 8px rgba(242, 167, 110, 0.18); }
   .hero-demo { font-size: 12px; padding: var(--sp-3) var(--sp-3); }
   .manhead-c, .manfoot-c { display: none; }
   pre.cmd, pre.tbl, pre.diagram, pre.files { font-size: 12px; }
