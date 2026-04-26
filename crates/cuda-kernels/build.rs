@@ -656,7 +656,7 @@ fn find_tilelang_python() -> Result<String, String> {
     ))
 }
 
-fn tilelang_target(sm_targets: &[String]) -> String {
+fn tilelang_target(sm_targets: &[String]) -> (String, u32) {
     let max_sm = sm_targets
         .iter()
         .filter_map(|sm| sm.parse::<u32>().ok())
@@ -669,13 +669,57 @@ fn tilelang_target(sm_targets: &[String]) -> String {
         );
     }
 
-    format!("cuda -arch=sm_{max_sm}")
+    (format!("cuda -arch=sm_{max_sm}"), max_sm)
+}
+
+/// Locate the directories the TileLang AOT generator needs for nvcc to
+/// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
+/// the cutlass headers it bundles, and the active CUDA toolkit include.
+fn tilelang_include_dirs(python: &str) -> (PathBuf, PathBuf) {
+    let probe = r#"
+import importlib.util, json, sys
+spec = importlib.util.find_spec("tilelang")
+if spec is None or not spec.submodule_search_locations:
+    print("ERR_NOT_INSTALLED")
+    sys.exit(0)
+pkg = spec.submodule_search_locations[0]
+print(json.dumps({
+    "src": f"{pkg}/src",
+    "cutlass_include": f"{pkg}/3rdparty/cutlass/include",
+}))
+"#;
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(probe)
+        .output()
+        .expect("failed to probe tilelang install path");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+    if stdout == "ERR_NOT_INSTALLED" {
+        panic!("tilelang Python package not installed for the chosen interpreter");
+    }
+    // Tiny hand-rolled parse — JSON has only two known keys, no need to add a dep.
+    let src = stdout
+        .split("\"src\":")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .expect("tilelang probe: src field missing");
+    let cutlass_include = stdout
+        .split("\"cutlass_include\":")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .expect("tilelang probe: cutlass_include field missing");
+    (PathBuf::from(src), PathBuf::from(cutlass_include))
 }
 
 fn generate_tilelang_artifacts(
     python: &str,
     out_dir: &Path,
     target: &str,
+    cuda_arch: u32,
+    cuda_path: &str,
+    tilelang_src: &Path,
+    cutlass_include: &Path,
     spec: &TileLangKernelSpec,
 ) -> (String, PathBuf) {
     let generator_path = PathBuf::from("tools/tilelang/gen_tilelang_aot.py");
@@ -697,6 +741,14 @@ fn generate_tilelang_artifacts(
         .arg(spec.num_q_heads.to_string())
         .arg("--num-kv-heads")
         .arg(spec.num_kv_heads.to_string())
+        .arg("--cuda-arch")
+        .arg(cuda_arch.to_string())
+        .arg("--tilelang-src")
+        .arg(tilelang_src)
+        .arg("--cutlass-include")
+        .arg(cutlass_include)
+        .arg("--cuda-include")
+        .arg(format!("{cuda_path}/include"))
         .output()
         .unwrap_or_else(|err| {
             panic!(
@@ -731,7 +783,8 @@ fn generate_tilelang_artifacts(
 
 fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
     let python = find_tilelang_python().unwrap_or_else(|message| panic!("{message}"));
-    let target = tilelang_target(sm_targets);
+    let (target, cuda_arch) = tilelang_target(sm_targets);
+    let (tilelang_src, cutlass_include) = tilelang_include_dirs(&python);
     let mut generated_sources = Vec::new();
 
     for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
@@ -744,7 +797,16 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             num_q_heads: q,
             num_kv_heads: kv,
         };
-        let (_func, c_path) = generate_tilelang_artifacts(&python, out_dir, &target, &spec);
+        let (_func, c_path) = generate_tilelang_artifacts(
+            &python,
+            out_dir,
+            &target,
+            cuda_arch,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &spec,
+        );
         generated_sources.push(c_path);
     }
 

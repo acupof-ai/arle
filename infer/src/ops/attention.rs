@@ -695,6 +695,12 @@ pub(crate) fn prefill_attention_paged_batch(
     {
         let max_qlen = meta.sequences.iter().map(|s| s.seq_len).max().unwrap_or(0) as i32;
         let sm_scale = 1.0_f32 / (head_dim as f32).sqrt();
+        // TileLang 0.1.9 auto-promotes T.symbolic shape vars into kernel
+        // arguments; the wrapper needs concrete values for the K/V pool
+        // capacity (`num_pages`) and the per-batch page-table length
+        // (`total_pages`). Both come from the runtime metadata.
+        let num_pages = meta.pool.max_total_pages as i32;
+        let total_pages = meta.sequences.iter().map(|s| s.num_pages).sum::<usize>() as i32;
         unsafe {
             tilelang_kernel(
                 q_u64 as *mut ffi::Half,
@@ -708,6 +714,8 @@ pub(crate) fn prefill_attention_paged_batch(
                 fwd.batch_size as i32,
                 fwd.total_qo_rows as i32,
                 max_qlen,
+                num_pages,
+                total_pages,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 page_size as i32,
