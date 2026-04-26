@@ -1,27 +1,27 @@
 """TileLang AOT generator. Mirrors tools/triton/gen_triton_aot.py contract.
 
 Inputs (CLI flags):
-  --kernel-path : path to a .py module exposing get_kernel() -> tilelang prim_func
-  --kernel-name : symbolic name; used to prefix the emitted C function
-  --out-dir     : directory to write CUBIN + C wrapper into
-  --target      : "cuda:<sm>" (e.g. "cuda:90"). The :32 warp-size suffix
-                  used by Triton is not honored here — TileLang infers it.
-  --out-name    : basename for the generated artifacts
+  --kernel-path    : .py module exposing get_kernel(num_q_heads, num_kv_heads)
+  --kernel-name    : C function name (the wrapper exports `<name>_cuda`)
+  --out-dir        : directory to write CUBIN + C wrapper into
+  --target         : "cuda:<sm>" (e.g. "cuda:90")
+  --out-name       : basename for the generated artifacts
+  --num-q-heads    : Q-head count this AOT specialization is for
+  --num-kv-heads   : KV-head count this AOT specialization is for
 
 Outputs (stdout, one per line, parsed by build.rs):
   FUNC_NAME=<exported C function>
   C_PATH=<absolute path to generated .c wrapper>
 
-The generated C wrapper exposes a single
+The generated C wrapper exposes one
     extern "C" CUresult <kernel-name>_cuda(<params>, CUstream stream)
-that loads the AOT CUBIN once and dispatches to the kernel. The exact
-parameter list is hard-coded for the prefill HD128 contract because Phase 0
-ships exactly one TileLang kernel; widening this to a generic dispatcher is
-a Phase 1 concern.
+per (num_q_heads, num_kv_heads) specialization. The kernel parameter list
+is identical across specializations — the head config is baked into the
+cubin, not passed as a runtime arg.
 
-If TileLang's installed version cannot AOT-export for the requested SM, this
-script exits non-zero with a clear error per docs/plans/tilelang-integration.md
-§5 risk #1.
+If TileLang's installed version cannot AOT-export for the requested SM,
+this script exits non-zero with a clear error per
+docs/plans/tilelang-integration.md §5 risk #1.
 """
 
 import argparse
@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 
-def load_kernel(kernel_path: str):
+def load_kernel(kernel_path: str, num_q_heads: int, num_kv_heads: int):
     spec = importlib.util.spec_from_file_location("tilelang_kernel_module", kernel_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load kernel module from {kernel_path}")
@@ -38,9 +38,9 @@ def load_kernel(kernel_path: str):
     spec.loader.exec_module(module)
     if not hasattr(module, "get_kernel"):
         raise RuntimeError(
-            f"{kernel_path} must expose get_kernel() returning a tilelang prim_func"
+            f"{kernel_path} must expose get_kernel(num_q_heads, num_kv_heads)"
         )
-    return module.get_kernel()
+    return module.get_kernel(num_q_heads, num_kv_heads)
 
 
 def parse_target(target: str) -> str:
@@ -108,25 +108,36 @@ def compile_kernel(prim_func, target: str, out_dir: Path, out_name: str):
     return func_symbol, staged_cubin
 
 
+def _format_cubin_bytes(data: bytes) -> str:
+    lines = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
+    return "\n".join(lines)
+
+
 def write_c_wrapper(c_path: Path, kernel_name: str, cubin_path: Path, kernel_symbol: str) -> None:
-    # The wrapper loads the cubin lazily on first call, then launches via
-    # cuLaunchKernel. The grid dims are derived from runtime scalars, mirroring
-    # how Triton AOT wrappers handle dynamic shapes. The contract matches the
-    # Rust FFI declaration in crates/cuda-kernels/src/ffi/attention.rs.
+    # Embed the cubin bytes directly in the C source so the linked binary is
+    # self-contained: no absolute OUT_DIR lookup at runtime, survives `cargo
+    # clean` and binary relocation. cuModuleLoadData reads from memory.
+    cubin_bytes = Path(cubin_path).read_bytes()
+    cubin_array = _format_cubin_bytes(cubin_bytes)
     src = f"""#include <cuda.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 static CUmodule g_module = NULL;
 static CUfunction g_function = NULL;
-static const char *kCubinPath = "{cubin_path.as_posix()}";
 static const char *kFuncSymbol = "{kernel_symbol}";
+
+static const unsigned char kCubinData[] = {{
+{cubin_array}
+}};
+static const unsigned int kCubinSize = (unsigned int)sizeof(kCubinData);
 
 static CUresult ensure_loaded(void) {{
     if (g_function != NULL) return CUDA_SUCCESS;
-    CUresult r = cuModuleLoad(&g_module, kCubinPath);
+    (void)kCubinSize;
+    CUresult r = cuModuleLoadData(&g_module, kCubinData);
     if (r != CUDA_SUCCESS) return r;
     return cuModuleGetFunction(&g_function, g_module, kFuncSymbol);
 }}
@@ -142,6 +153,7 @@ CUresult {kernel_name}_cuda(
     uint16_t *o,
     int32_t batch_size,
     int32_t total_q_tokens,
+    int32_t max_qlen,
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t page_size,
@@ -161,11 +173,11 @@ CUresult {kernel_name}_cuda(
         &kv_indptr, &kv_indices, &kv_last_page_len, &o,
     }};
 
-    // Grid dims: (q_tile_blocks, num_q_heads, batch_size). The Python kernel
-    // uses block_m=64 for query rows; must match BLOCK_M in batch_prefill_paged_hd128.py.
+    // Grid dims: (per-request q-tile blocks, num_q_heads, batch_size).
+    // Use the longest request's qlen — total_q_tokens over-launches by ~B.
     const int block_m = 64;
-    int max_qlen = total_q_tokens; // upper bound; per-request rows are masked.
-    int grid_x = (max_qlen + block_m - 1) / block_m;
+    int qlen = max_qlen > 0 ? max_qlen : 1;
+    int grid_x = (qlen + block_m - 1) / block_m;
     int grid_y = num_q_heads;
     int grid_z = batch_size;
 
@@ -187,10 +199,12 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--out-name", required=True)
+    parser.add_argument("--num-q-heads", type=int, required=True)
+    parser.add_argument("--num-kv-heads", type=int, required=True)
     args = parser.parse_args()
 
     target = parse_target(args.target)
-    prim_func = load_kernel(args.kernel_path)
+    prim_func = load_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
     out_dir = Path(args.out_dir).resolve()
 
     func_symbol, cubin_path = compile_kernel(prim_func, target, out_dir, args.out_name)
