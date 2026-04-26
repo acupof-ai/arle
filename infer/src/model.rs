@@ -44,6 +44,15 @@ pub struct MixedBatchRequest<'a> {
     pub prefill_start_positions: &'a [usize],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SchedulerRuntimeWorkspaceBudget {
+    pub max_batch_size: usize,
+    pub prefill_tokens: usize,
+    pub mixed_prefill_tokens: usize,
+    pub max_seq_len: Option<usize>,
+    pub kv_pool_format: kv_cache::KVFormat,
+}
+
 pub(crate) fn decode_metadata_page_capacity(
     max_batch_size: usize,
     max_seq_len: Option<usize>,
@@ -477,13 +486,7 @@ pub trait ModelForward: Send {
     /// workspaces, logits buffers, and optional mixed prefill/decode scratch.
     /// Returning zero preserves the old behavior for models without a precise
     /// estimate.
-    fn scheduler_runtime_workspace_bytes(
-        &self,
-        _max_batch_size: usize,
-        _prefill_budget_tokens: usize,
-        _max_seq_len: Option<usize>,
-        _kv_pool_format: kv_cache::KVFormat,
-    ) -> usize {
+    fn scheduler_runtime_workspace_bytes(&self, _budget: SchedulerRuntimeWorkspaceBudget) -> usize {
         0
     }
 

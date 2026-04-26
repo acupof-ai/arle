@@ -156,6 +156,17 @@ impl SchedulerConfig {
         }
     }
 
+    /// Total prefill rows allowed inside a mixed decode+prefill launch.
+    ///
+    /// Mixed uses one packed FlashInfer plan for decode rows plus prefill rows,
+    /// so it follows the decode-active long-prefill cap instead of the full
+    /// standalone prefill budget.
+    pub fn mixed_prefill_token_budget(&self) -> usize {
+        self.max_prefill_tokens
+            .min(self.long_prefill_token_threshold)
+            .max(1)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.max_slots == 0 {
             anyhow::bail!("max_slots must be ≥ 1");
@@ -485,6 +496,7 @@ mod tests {
         assert_eq!(cfg.max_num_batched_tokens, 16384);
         assert_eq!(cfg.max_prefill_tokens, 16384);
         assert_eq!(cfg.long_prefill_token_threshold, 4096);
+        assert_eq!(cfg.mixed_prefill_token_budget(), 4096);
         assert_eq!(cfg.prefill_max_requests, None);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
@@ -495,6 +507,18 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
         assert_eq!(cfg.cluster_shared_backend, None);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn mixed_prefill_token_budget_tracks_smaller_runtime_cap() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.max_prefill_tokens = 2048;
+        cfg.long_prefill_token_threshold = 4096;
+        assert_eq!(cfg.mixed_prefill_token_budget(), 2048);
+
+        cfg.max_prefill_tokens = 16384;
+        cfg.long_prefill_token_threshold = 1024;
+        assert_eq!(cfg.mixed_prefill_token_budget(), 1024);
     }
 
     #[test]

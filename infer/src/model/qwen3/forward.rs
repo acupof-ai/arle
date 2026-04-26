@@ -8,7 +8,7 @@ use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
     GenerationState, MixedBatchRequest, ModelForward, PrefillBatchRequest,
-    decode_metadata_page_capacity, prepare_paged_prefill_batch,
+    SchedulerRuntimeWorkspaceBudget, decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
 use crate::ops;
 use crate::sampler::SamplingParams;
@@ -134,14 +134,12 @@ impl ModelForward for Qwen3Model {
         Ok(Qwen3PrefillContext::new())
     }
 
-    fn scheduler_runtime_workspace_bytes(
-        &self,
-        max_batch_size: usize,
-        prefill_budget_tokens: usize,
-        max_seq_len: Option<usize>,
-        kv_pool_format: crate::model::kv_cache::KVFormat,
-    ) -> usize {
-        let prefill_budget_tokens = prefill_budget_tokens.max(1);
+    fn scheduler_runtime_workspace_bytes(&self, budget: SchedulerRuntimeWorkspaceBudget) -> usize {
+        let max_batch_size = budget.max_batch_size;
+        let prefill_budget_tokens = budget.prefill_tokens.max(1);
+        let mixed_prefill_tokens = budget.mixed_prefill_tokens.max(1);
+        let max_seq_len = budget.max_seq_len;
+        let kv_pool_format = budget.kv_pool_format;
         let num_heads = self.config.num_attention_heads;
         let q_dim = num_heads * self.config.head_dim;
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
@@ -169,7 +167,7 @@ impl ModelForward for Qwen3Model {
             max_batch_size,
         );
         let mixed_workspace = if self.supports_mixed_batch(kv_pool_format) {
-            let mixed_total_tokens = max_batch_size.saturating_add(prefill_budget_tokens);
+            let mixed_total_tokens = max_batch_size.saturating_add(mixed_prefill_tokens);
             super::batch_decode::BatchDecodeBuffers::mixed_device_bytes(
                 self.config.hidden_size,
                 q_dim,
@@ -198,9 +196,12 @@ impl ModelForward for Qwen3Model {
         );
         let prefill_workspace = prefill_plan.saturating_add(prefill_activation);
 
+        // Async prefill pending buffers and the lazy persistent mixed buffer
+        // can coexist, so both must be subtracted before sizing the KV pool.
         decode_context
             .saturating_add(decode_logits)
-            .saturating_add(prefill_workspace.max(mixed_workspace))
+            .saturating_add(prefill_workspace)
+            .saturating_add(mixed_workspace)
             .saturating_add(128 * 1024 * 1024)
     }
 

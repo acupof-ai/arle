@@ -283,16 +283,6 @@ impl<M: ModelForward> Scheduler<M> {
         select_prefill_candidates(&mut budget, scored_candidates)
     }
 
-    fn mixed_prefill_token_budget(&self) -> usize {
-        // Mixed uses one TC FlashInfer plan for decode rows plus all packed
-        // prefill rows. Keep the total prefill side at the long-prefill cap
-        // instead of letting the whole step budget become one huge QO tensor.
-        self.config
-            .max_prefill_tokens
-            .min(self.config.long_prefill_token_threshold)
-            .max(1)
-    }
-
     pub(super) fn select_mixed_launch_prefill_candidates(
         &self,
         candidates: &[PrefillCandidate],
@@ -300,7 +290,7 @@ impl<M: ModelForward> Scheduler<M> {
     ) -> Vec<PrefillCandidate> {
         cap_prefill_candidates_by_tokens(
             self.select_launch_prefill_candidates(candidates, decode_slots),
-            self.mixed_prefill_token_budget(),
+            self.config.mixed_prefill_token_budget(),
         )
     }
 
