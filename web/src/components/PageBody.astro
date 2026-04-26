@@ -152,10 +152,15 @@ const s = locale.sections;
 </Section>
 
 <Section id="docs" title={s.files.title}>
-  <pre class="files" set:html={s.files.rows.map((r) => {
-    const pad = r.path.length < 36 ? " ".repeat(36 - r.path.length) : "  ";
-    return `<a href="${r.href}">${r.path}</a>${pad}${r.desc}`;
-  }).join("\n")}></pre>
+  <ul class="files-list">
+    {s.files.rows.map((r) => (
+      <li>
+        <a class="files-path" href={r.href}>{r.path}</a>
+        <span class="files-leader" aria-hidden="true"></span>
+        <span class="files-desc" set:html={r.desc} />
+      </li>
+    ))}
+  </ul>
 </Section>
 
 <Section id="see-also" title={s.seealso.title}>
