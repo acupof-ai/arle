@@ -27,7 +27,6 @@ GOVERNANCE_DOCS = [
     Path("docs/http-api.md"),
     Path("docs/support-matrix.md"),
     Path("docs/stability-policy.md"),
-    Path("docs/compatibility.md"),
     Path("docs/perf-and-correctness-gates.md"),
     Path("docs/release-checklist.md"),
     Path("docs/environment.md"),
@@ -57,7 +56,6 @@ PR_TEMPLATE_REQUIRED_HEADINGS = [
 PR_TEMPLATE_REQUIRED_DOC_REFS = [
     "docs/support-matrix.md",
     "docs/stability-policy.md",
-    "docs/compatibility.md",
     "docs/perf-and-correctness-gates.md",
     "docs/release-checklist.md",
 ]

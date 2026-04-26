@@ -1,7 +1,6 @@
 Relevant policies:
 - [docs/support-matrix.md](../docs/support-matrix.md)
 - [docs/stability-policy.md](../docs/stability-policy.md)
-- [docs/compatibility.md](../docs/compatibility.md)
 - [docs/perf-and-correctness-gates.md](../docs/perf-and-correctness-gates.md)
 - [docs/release-checklist.md](../docs/release-checklist.md)
 
@@ -31,7 +30,6 @@ What problem does this solve?
 - [ ] `README.md` / `README.zh-CN.md`
 - [ ] `docs/support-matrix.md`
 - [ ] `docs/stability-policy.md`
-- [ ] `docs/compatibility.md`
 - [ ] `docs/environment.md`
 - [ ] `CHANGELOG.md`
 - [ ] No doc updates required

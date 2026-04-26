@@ -1,35 +1,11 @@
 # ARLE Codebase Map
 
-Updated 2026-04-23 after the runtime-first documentation cleanup.
+Updated 2026-04-26 after the truth-surface cleanup.
 
-This document is the canonical workspace-topology truth. README and ROADMAP may
-summarize it, but they do not define a different repository shape.
-
-`ARLE` is a runtime-first workspace:
-
-- `infer` owns serving/runtime truth.
-- `arle` is the local front door built on that runtime.
-- `train` is an integrated extension of the same runtime/model authority, not a
-  second equal architecture.
-
-Current train/runtime truth, compressed:
-
-- Control plane: `crates/train` owns the active training server via
-  `pretrain --serve`, `train_sft --serve`, `train_grpo --serve`, and
-  `train_multi_turn --serve`; the live surface is
-  `/v1/train/{status,events,stop,save}`. `infer` can optionally proxy that
-  surface via `--train-control-url`.
-- Model line: the active train-side path is a generic Qwen-family control
-  plane with Qwen3.5 as the optimized default. `pretrain` is the canonical
-  scratch-pretrain entrypoint, checkpoints are HF-style directories, the
-  handwritten Transformer/TinyLM compatibility path is gone, and hybrid
-  linear-attn Qwen3.5 is accepted locally across scratch pretrain, LoRA/eval,
-  and RL on CPU + Metal. CUDA compile coverage is in place; CUDA hybrid runtime
-  acceptance remains pending.
-This document describes the repository as it exists after the Route-A
-refactor folded the partial runtime split back into `infer`, and after
-the CUDA kernel layer was extracted into `crates/cuda-kernels/`
-(commit `a4e12f5`).
+This document is the canonical workspace-topology truth: where files live,
+what each crate owns, and where to start reading. For ownership boundaries
+and crate-admission governance see [architecture.md](architecture.md);
+support status by surface lives in [support-matrix.md](support-matrix.md).
 
 ## 1. Workspace at a glance
 
@@ -46,7 +22,8 @@ The repository has four practical layers:
   source of truth; the historical `infer/docs/` parallel tree was retired
   during the 2026-04-25 truth-surface cleanup).
 
-Current workspace members:
+Current workspace members (ownership and boundaries are listed in
+[architecture.md §Package Boundaries](architecture.md#package-boundaries)):
 
 - workspace root package
 - `infer`
@@ -56,11 +33,10 @@ Current workspace members:
 - `crates/chat`
 - `crates/cli`
 - `crates/tools`
-- `crates/qwen3-spec` (shared Qwen3 config + canonical tensor-name contract)
-- `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
-- `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait; the current local Metal train path already uses the device-resident / lazy-eval tranche for the active training-critical ops, while CUDA remains the primary full-acceptance target)
-- `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by the active train binaries' `--serve` flag; current optimized path is Qwen3.5-family across scratch pretrain + RL, with hybrid linear-attn accepted locally on CPU + Metal and CUDA compile coverage in place; HF-style checkpoint dirs and shared async observability, bounded backpressure + `dropped_metrics` status reporting, MLflow export, OTLP log export, and optional W&B sidecar export; depends on `autograd`)
-- `crates/kv-native-sys` (local persistence substrate for `infer/src/kv_tier/transport/disk.rs`; now owns file + block object ABI plus mmap/WAL/shm descriptor primitives used by local validation and by coordinator spill/persist paths)
+- `crates/qwen3-spec`, `crates/qwen35-spec`
+- `crates/autograd`
+- `crates/train`
+- `crates/kv-native-sys`
 
 ## 2. Main execution paths
 
@@ -184,13 +160,8 @@ Key files:
   `agent_engine.rs` duplicate facade was deleted and its responsibilities
   collapsed into `server_engine.rs` so HTTP and agent CLI share one contract
 
-The 2026-04-15 Route-A refactor folded the experimental `infer-core`,
-`infer-observability`, `infer-policy`, and `infer-engine` crates back into
-these in-tree modules because the split never achieved real independence.
-A follow-up pass in the same day also deleted `infer/src/agent_engine.rs`
-after confirming every `Agent*` type exactly duplicated a corresponding
-`Completion*` / `InferenceEngine` / `LoadedInferenceEngine` type in
-`server_engine.rs`.
+For the Route-A folding rationale see
+[architecture.md §Route-A Note](architecture.md#route-a-note-historical).
 
 ### Memory, KV, caching, and batching support
 

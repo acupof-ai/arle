@@ -8,7 +8,6 @@ or release-related, also read:
 
 - [docs/stability-policy.md](docs/stability-policy.md)
 - [docs/support-matrix.md](docs/support-matrix.md)
-- [docs/compatibility.md](docs/compatibility.md)
 - [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
 - [docs/release-checklist.md](docs/release-checklist.md)
 - [docs/environment.md](docs/environment.md)
@@ -111,7 +110,7 @@ If you cannot answer those questions yet, the PR is not ready.
   `CHANGELOG.md` together.
 - If you deprecate or replace a documented surface, include migration guidance.
 
-See [docs/compatibility.md](docs/compatibility.md) for the full policy.
+See [docs/stability-policy.md](docs/stability-policy.md) for the full policy.
 
 ## Validation Expectations
 

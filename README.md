@@ -551,7 +551,6 @@ and in the authoritative [docs/support-matrix.md](docs/support-matrix.md).
 Governance references:
 
 - [docs/stability-policy.md](docs/stability-policy.md)
-- [docs/compatibility.md](docs/compatibility.md)
 - [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
 - [docs/release-checklist.md](docs/release-checklist.md)
 - [docs/environment.md](docs/environment.md)
@@ -586,7 +585,7 @@ cargo test --release --no-default-features --features metal,no-cuda,cli -- --ign
 Before opening a PR: [CONTRIBUTING.md](CONTRIBUTING.md),
 [support-matrix](docs/support-matrix.md),
 [perf-and-correctness-gates](docs/perf-and-correctness-gates.md),
-[compatibility](docs/compatibility.md),
+[stability-policy](docs/stability-policy.md),
 [environment](docs/environment.md). Release work:
 [release-checklist](docs/release-checklist.md).
 

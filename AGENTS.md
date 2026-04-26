@@ -273,6 +273,6 @@ Load the relevant `AGENTS.md` **before** editing inside a module.
 
 - [`docs/index.md`](docs/index.md) — PARA index; always start a session here.
 - [`docs/codebase-map.md`](docs/codebase-map.md) — execution paths + where to start reading.
-- [`docs/architecture.md`](docs/architecture.md) — workspace topology + Option-A→B kernel-crate extraction story.
+- [`docs/architecture.md`](docs/architecture.md) — package boundaries, dependency direction, crate-split governance.
 - [`docs/plans/cuda-kernel-crate-extraction.md`](docs/plans/cuda-kernel-crate-extraction.md) — final `cuda-kernels` extraction blueprint (trip wires + acceptance).
 - [`docs/support-matrix.md`](docs/support-matrix.md) — backend / model / quant support levels.

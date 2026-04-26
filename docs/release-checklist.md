@@ -29,8 +29,7 @@ Review and update, as needed:
 5. `CONTRIBUTING.md`
 6. `CHANGELOG.md`
 7. `docs/support-matrix.md`
-8. `docs/compatibility.md`
-9. `docs/stability-policy.md`
+8. `docs/stability-policy.md`
 
 At minimum, make sure:
 
@@ -105,7 +104,7 @@ Before tagging, answer:
 If yes, reflect that in:
 
 - `CHANGELOG.md`
-- `docs/compatibility.md`
+- `docs/stability-policy.md`
 - `docs/support-matrix.md`
 - README examples when relevant
 
@@ -145,6 +144,6 @@ After release:
 
 Related docs:
 
-- [compatibility.md](compatibility.md)
+- [stability-policy.md](stability-policy.md)
 - [support-matrix.md](support-matrix.md)
 - [perf-and-correctness-gates.md](perf-and-correctness-gates.md)

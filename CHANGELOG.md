@@ -16,7 +16,6 @@ Related governance docs:
 
 - [docs/stability-policy.md](docs/stability-policy.md)
 - [docs/support-matrix.md](docs/support-matrix.md)
-- [docs/compatibility.md](docs/compatibility.md)
 
 ## [Unreleased]
 
