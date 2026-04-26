@@ -135,7 +135,6 @@ pub mod host_pool;
 pub mod id;
 pub mod io;
 pub mod lookup;
-pub mod policy;
 pub mod readmission;
 pub mod tier;
 pub mod transport;
@@ -160,7 +159,6 @@ pub use io::{
     KVPayload, KVPayloadRef,
 };
 pub use lookup::{HitKind, LookupBlock, LookupHeuristics, LookupOutcome};
-pub use policy::{PrefetchMode, TieredKvPolicy, WriteBackMode};
 pub use readmission::{ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource};
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{DiskStore, KVTransport, SharedFsStore, TransferOp, TransportError};

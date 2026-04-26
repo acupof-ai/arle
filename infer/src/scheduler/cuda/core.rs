@@ -7,6 +7,7 @@ use super::budget::{
     coordinator_submit_headroom, partial_tail_capacity, prefix_cache_reclaim_goal_pages,
     waiting_admission_shortage_pages,
 };
+use super::policy::TieredKvPolicy;
 use super::{
     ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
     Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
@@ -15,7 +16,7 @@ use super::{
 use crate::kv_tier::transport::DiskStore;
 use crate::kv_tier::{
     BlockLocation, ClusterSharedBackend, CoordinatorQueueStats, ReadmissionBlock, ReadmissionKey,
-    ReadmissionPlan, ReadmissionSource, TieredKvPolicy,
+    ReadmissionPlan, ReadmissionSource,
 };
 use crate::prefix_cache::{
     BlockId, BlockMetadata, BlockMetadataUpdate, BlockSelectionIntent, RadixCache,
