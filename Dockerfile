@@ -14,7 +14,7 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH="/usr/local/cargo/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential pkg-config python3 python3-pip python3-venv git ca-certificates \
+    curl build-essential pkg-config libssl-dev python3 python3-pip python3-venv git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
