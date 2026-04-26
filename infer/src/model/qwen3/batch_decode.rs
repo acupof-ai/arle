@@ -320,7 +320,7 @@ impl BatchDecodeBuffers {
         model: &Qwen3Model,
         min_total_tokens: usize,
     ) -> Result<&mut MixedBatchBuffers> {
-        let needs_realloc = self.mixed.as_ref().map_or(true, |mixed| {
+        let needs_realloc = self.mixed.as_ref().is_none_or(|mixed| {
             mixed.max_tokens < min_total_tokens || mixed.max_total_pages < self.max_total_pages
         });
         if needs_realloc {
@@ -434,12 +434,29 @@ impl Qwen3Model {
             return Ok(false);
         }
         let b = batch.decode_tokens.len();
-        let c = batch.prefill.tokens.len();
-        if b == 0 || c == 0 {
+        let prefill_count = batch.prefills.len();
+        if b == 0
+            || b != batch.decode_slot_indices.len()
+            || prefill_count == 0
+            || prefill_count != batch.prefill_start_positions.len()
+        {
             return Ok(false);
         }
-        if paged_kv_pool.seq_len(batch.prefill.slot_idx) != batch.prefill_start_pos {
-            return Ok(false);
+
+        let mut prefill_slot_indices = Vec::with_capacity(prefill_count);
+        let mut prefill_token_counts = Vec::with_capacity(prefill_count);
+        let mut total_prefill_tokens = 0usize;
+        for (prefill, &start_pos) in batch.prefills.iter().zip(batch.prefill_start_positions) {
+            if prefill.tokens.is_empty()
+                || batch.decode_slot_indices.contains(&prefill.slot_idx)
+                || prefill_slot_indices.contains(&prefill.slot_idx)
+                || paged_kv_pool.seq_len(prefill.slot_idx) != start_pos
+            {
+                return Ok(false);
+            }
+            prefill_slot_indices.push(prefill.slot_idx);
+            prefill_token_counts.push(prefill.tokens.len());
+            total_prefill_tokens += prefill.tokens.len();
         }
 
         if bufs.logits_batch.is_none() {
@@ -455,15 +472,20 @@ impl Qwen3Model {
                 .expect("decode logits buffer initialized before mixed forward"),
         );
 
-        let total_tokens = b + c;
+        let total_tokens = b + total_prefill_tokens;
         let mixed = bufs.ensure_mixed_buffers(self, total_tokens)?;
         mixed.set_seq_len(total_tokens);
 
-        paged_kv_pool.alloc_tokens(batch.prefill.slot_idx, c)?;
+        for prefill in batch.prefills {
+            paged_kv_pool.cow_tail_page_for_append(&self.ctx, prefill.slot_idx)?;
+            paged_kv_pool.alloc_tokens(prefill.slot_idx, prefill.tokens.len())?;
+        }
 
         let mut combined_tokens = Vec::with_capacity(total_tokens);
         combined_tokens.extend(batch.decode_tokens.iter().map(|&tok| tok as i32));
-        combined_tokens.extend(batch.prefill.tokens.iter().map(|&tok| tok as i32));
+        for prefill in batch.prefills {
+            combined_tokens.extend(prefill.tokens.iter().map(|&tok| tok as i32));
+        }
         self.ctx
             .stream
             .memcpy_htod(&combined_tokens, &mut mixed.token_ids_gpu)
@@ -473,13 +495,13 @@ impl Qwen3Model {
             &self.ctx,
             paged_kv_pool,
             batch.decode_slot_indices,
-            &[batch.prefill.slot_idx],
-            &[batch.prefill_start_pos],
-            &[c],
+            &prefill_slot_indices,
+            batch.prefill_start_positions,
+            &prefill_token_counts,
         )?;
         mixed.metadata.tc_plan(
             &self.ctx,
-            b + 1,
+            b + prefill_count,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
             paged_kv_pool.page_size,
@@ -493,16 +515,20 @@ impl Qwen3Model {
             &mut mixed.embedding_out,
         )?;
 
-        let prefill_page_table_host: Vec<i32> = paged_kv_pool
-            .page_indices(batch.prefill.slot_idx)
-            .iter()
-            .map(|&idx| idx as i32)
-            .collect();
-        let prefill_page_table_dev = self
-            .ctx
-            .stream
-            .clone_htod(&prefill_page_table_host)
-            .map_err(|e| anyhow::anyhow!("H2D prefill_page_table: {e}"))?;
+        let mut prefill_page_table_devs: Vec<CudaSlice<i32>> = Vec::with_capacity(prefill_count);
+        for prefill in batch.prefills {
+            let prefill_page_table_host: Vec<i32> = paged_kv_pool
+                .page_indices(prefill.slot_idx)
+                .iter()
+                .map(|&idx| idx as i32)
+                .collect();
+            prefill_page_table_devs.push(
+                self.ctx
+                    .stream
+                    .clone_htod(&prefill_page_table_host)
+                    .map_err(|e| anyhow::anyhow!("H2D prefill_page_table: {e}"))?,
+            );
+        }
 
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
@@ -625,34 +651,44 @@ impl Qwen3Model {
                 .result()?;
             }
 
-            let q_prefill_ptr = (q_ptr as usize + b * q_dim * bf16_size) as *mut ffi::Half;
-            let k_prefill_ptr = (k_ptr as usize + b * kv_dim * bf16_size) as *mut ffi::Half;
-            let v_prefill_ptr = (v_ptr as usize + b * kv_dim * bf16_size) as *const ffi::Half;
-            unsafe {
-                ffi::prefill_attention_paged_prep_cuda(
-                    q_prefill_ptr,
-                    k_prefill_ptr,
-                    v_prefill_ptr,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    {
-                        let (ptr, _g) = prefill_page_table_dev.device_ptr(&self.ctx.stream);
-                        ptr as *const i32
-                    },
-                    page_size as i32,
-                    k_pool_ptr as *mut ffi::Half,
-                    v_pool_ptr as *mut ffi::Half,
-                    num_heads as i32,
-                    num_kv_heads as i32,
-                    head_dim as i32,
-                    c as i32,
-                    batch.prefill_start_pos as i32,
-                    eps,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
+            let mut prefill_token_offset = 0usize;
+            for (prefill_idx, prefill) in batch.prefills.iter().enumerate() {
+                let c = prefill.tokens.len();
+                let token_offset = b + prefill_token_offset;
+                let q_prefill_ptr =
+                    (q_ptr as usize + token_offset * q_dim * bf16_size) as *mut ffi::Half;
+                let k_prefill_ptr =
+                    (k_ptr as usize + token_offset * kv_dim * bf16_size) as *mut ffi::Half;
+                let v_prefill_ptr =
+                    (v_ptr as usize + token_offset * kv_dim * bf16_size) as *const ffi::Half;
+                unsafe {
+                    ffi::prefill_attention_paged_prep_cuda(
+                        q_prefill_ptr,
+                        k_prefill_ptr,
+                        v_prefill_ptr,
+                        qn_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        cos_ptr as *const ffi::Half,
+                        sin_ptr as *const ffi::Half,
+                        {
+                            let (ptr, _g) =
+                                prefill_page_table_devs[prefill_idx].device_ptr(&self.ctx.stream);
+                            ptr as *const i32
+                        },
+                        page_size as i32,
+                        k_pool_ptr as *mut ffi::Half,
+                        v_pool_ptr as *mut ffi::Half,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        head_dim as i32,
+                        c as i32,
+                        batch.prefill_start_positions[prefill_idx] as i32,
+                        eps,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                prefill_token_offset += c;
             }
 
             {
@@ -688,7 +724,7 @@ impl Qwen3Model {
                         lp_ptr as *const i32,
                         o_ptr as *mut ffi::Half,
                         lse_ptr as *mut f32,
-                        (b + 1) as i32,
+                        (b + prefill_count) as i32,
                         num_heads as i32,
                         num_kv_heads as i32,
                         page_size as i32,
@@ -774,10 +810,12 @@ impl Qwen3Model {
             }
         }
 
-        states[batch.prefill.slot_idx]
-            .base
-            .kv_cache
-            .advance_seq_len(c);
+        for prefill in batch.prefills {
+            states[prefill.slot_idx]
+                .base
+                .kv_cache
+                .advance_seq_len(prefill.tokens.len());
+        }
 
         let hidden = unsafe { &*hidden_ptr };
         ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut mixed.normed);
@@ -799,21 +837,25 @@ impl Qwen3Model {
             .memcpy_dtod(&src, &mut dst)
             .map_err(|e| anyhow::anyhow!("D2D mixed decode logits: {e}"))?;
 
-        let prefill_state = &mut states[batch.prefill.slot_idx];
-        if prefill_state.base.prefill_logits.is_none() {
-            prefill_state.base.prefill_logits =
-                Some(DeviceVec::zeros(&self.ctx, self.output_projection().rows)?);
+        let mut prefill_token_offset = 0usize;
+        for prefill in batch.prefills {
+            let prefill_state = &mut states[prefill.slot_idx];
+            if prefill_state.base.prefill_logits.is_none() {
+                prefill_state.base.prefill_logits =
+                    Some(DeviceVec::zeros(&self.ctx, self.output_projection().rows)?);
+            }
+            ops::extract_vec_into(
+                &self.ctx,
+                &mixed.logits,
+                b + prefill_token_offset + prefill.tokens.len() - 1,
+                prefill_state
+                    .base
+                    .prefill_logits
+                    .as_mut()
+                    .expect("prefill logits allocated"),
+            )?;
+            prefill_token_offset += prefill.tokens.len();
         }
-        ops::extract_vec_into(
-            &self.ctx,
-            &mixed.logits,
-            total_tokens - 1,
-            prefill_state
-                .base
-                .prefill_logits
-                .as_mut()
-                .expect("prefill logits allocated"),
-        )?;
 
         Ok(true)
     }

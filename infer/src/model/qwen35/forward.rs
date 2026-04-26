@@ -79,7 +79,7 @@ impl Qwen35State {
         let needs_realloc = self
             .paged_prefill
             .as_ref()
-            .map_or(true, |bufs| !bufs.matches_shape(seq_len, page_size));
+            .is_none_or(|bufs| !bufs.matches_shape(seq_len, page_size));
         if needs_realloc {
             self.paged_prefill = Some(PagedPrefillBuffers35::new(ctx, config, seq_len, page_size)?);
         }
@@ -301,7 +301,7 @@ impl ModelForward for Qwen35Model {
         states: &mut [Self::State],
         pool: &mut PagedKVPool,
     ) -> Result<bool> {
-        if !prepare_paged_prefill_batch(requests, pool)? {
+        if !prepare_paged_prefill_batch(&self.ctx, requests, pool)? {
             return Ok(false);
         }
 

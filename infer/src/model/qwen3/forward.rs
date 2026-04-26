@@ -270,7 +270,7 @@ impl ModelForward for Qwen3Model {
         states: &mut [Self::State],
         pool: &mut PagedKVPool,
     ) -> Result<bool> {
-        if !prepare_paged_prefill_batch(requests, pool)? {
+        if !prepare_paged_prefill_batch(&self.ctx, requests, pool)? {
             return Ok(false);
         }
 
@@ -303,7 +303,7 @@ impl ModelForward for Qwen3Model {
     ) -> Result<()> {
         match paged_kv_pool {
             Some(pool) if self.prefill_uses_paged_pool() && pool.is_active() => {
-                if !prepare_paged_prefill_batch(requests, pool)? {
+                if !prepare_paged_prefill_batch(&self.ctx, requests, pool)? {
                     return Ok(());
                 }
                 let paged_requests: Vec<Qwen3PagedPrefillRequest<'_>> = requests
@@ -569,6 +569,9 @@ impl ModelForward for Qwen3Model {
     }
 
     fn supports_mixed_batch(&self, kv_pool_format: crate::model::kv_cache::KVFormat) -> bool {
+        // Mixed is format-specific: BF16 uses FlashInfer varlen TC attention.
+        // Quantized KV formats keep the split path until fused-dequant mixed
+        // kernels exist, so INT8/FP8/TurboQuant coverage stays explicit.
         self.prefill_uses_paged_pool()
             && self.lora.is_none()
             && matches!(kv_pool_format, crate::model::kv_cache::KVFormat::BF16)

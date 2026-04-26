@@ -226,6 +226,32 @@ impl TokenKVPool {
             .then_some(hot_tail_page)
     }
 
+    /// Extra physical pages needed to detach a shared partial tail before append.
+    pub fn append_cow_pages_needed(&self, slot: usize) -> usize {
+        usize::from(self.slot_shared_hot_tail_page(slot).is_some())
+    }
+
+    /// Physical pages needed to append `count` logical tokens to `slot`.
+    ///
+    /// This includes both the optional COW page for a radix-shared hot tail and
+    /// any fresh pages required after filling the current tail.
+    pub fn append_pages_needed(&self, slot: usize, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let page_size = self.page_size.max(1);
+        let hot_tail_len = self.slot_hot_tail_len(slot);
+        let available_in_last_page = if hot_tail_len == 0 {
+            0
+        } else {
+            page_size - hot_tail_len
+        };
+        self.append_cow_pages_needed(slot)
+            + count
+                .saturating_sub(available_in_last_page)
+                .div_ceil(page_size)
+    }
+
     fn recycle_page_if_unreferenced(&mut self, page: u32) {
         let page_idx = page as usize;
         if self.page_attach_count[page_idx] == 0 && self.page_ref_count[page_idx] == 0 {
@@ -1071,6 +1097,11 @@ impl TokenKVPool {
             })
             .sum::<usize>();
         self.free_pages.len() * self.page_size + partial_capacity
+    }
+
+    /// Number of currently free physical pages.
+    pub fn free_page_count(&self) -> usize {
+        self.free_pages.len()
     }
 
     fn page_span_for_token_range(

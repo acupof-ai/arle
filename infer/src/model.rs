@@ -32,17 +32,16 @@ pub struct PrefillBatchRequest<'a> {
     pub tokens: &'a [u32],
 }
 
-/// One scheduler-planned mixed decode + prefill batch.
+/// One scheduler-planned mixed decode + packed-prefill batch.
 ///
-/// The current scheduler lowers at most one prefill row into a mixed batch and
-/// keeps the decode rows in compact batch order. Model implementations own how
-/// that mixed batch is executed internally.
+/// `prefills[i]` and `prefill_start_positions[i]` are ordered together; model
+/// implementations must treat the two slices as a single row table.
 #[derive(Clone, Copy, Debug)]
 pub struct MixedBatchRequest<'a> {
     pub decode_tokens: &'a [u32],
     pub decode_slot_indices: &'a [usize],
-    pub prefill: PrefillBatchRequest<'a>,
-    pub prefill_start_pos: usize,
+    pub prefills: &'a [PrefillBatchRequest<'a>],
+    pub prefill_start_positions: &'a [usize],
 }
 
 pub(crate) fn decode_metadata_page_capacity(
@@ -59,6 +58,7 @@ pub(crate) fn decode_metadata_page_capacity(
 }
 
 pub(crate) fn prepare_paged_prefill_batch(
+    ctx: &DeviceContext,
     requests: &[PrefillBatchRequest<'_>],
     pool: &mut PagedKVPool,
 ) -> Result<bool> {
@@ -74,7 +74,19 @@ pub(crate) fn prepare_paged_prefill_batch(
         seen_slots.push(request.slot_idx);
     }
 
+    let required_pages: usize = requests
+        .iter()
+        .map(|request| pool.append_pages_needed(request.slot_idx, request.tokens.len()))
+        .sum();
+    if required_pages > pool.free_page_count() {
+        anyhow::bail!(
+            "paged prefill batch needs {required_pages} free pages, only {} available",
+            pool.free_page_count()
+        );
+    }
+
     for request in requests {
+        pool.cow_tail_page_for_append(ctx, request.slot_idx)?;
         pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
     }
 
@@ -411,13 +423,16 @@ pub trait ModelForward: Send {
             return Ok(false);
         }
 
+        if !prepare_paged_prefill_batch(self.device_context(), requests, pool)? {
+            return Ok(false);
+        }
+
         let dummy_indices = self
             .device_context()
             .stream
             .clone_htod(&[0i32])
             .map_err(|e| anyhow::anyhow!("dummy indices H2D failed: {e}"))?;
         for request in requests {
-            pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
             self.forward_prefill_with_pool(
                 request.tokens,
                 &mut states[request.slot_idx],
@@ -546,12 +561,13 @@ pub trait ModelForward: Send {
     }
 
     /// Whether this model has a validated mixed decode + prefill path for the
-    /// current paged-KV format.
+    /// current paged-KV format. Unsupported formats must return false so the
+    /// scheduler uses the separate prefill + decode path instead.
     fn supports_mixed_batch(&self, _kv_pool_format: kv_cache::KVFormat) -> bool {
         false
     }
 
-    /// Mixed-batch forward: decode rows plus one prefill row in a single
+    /// Mixed-batch forward: decode rows plus packed prefill rows in a single
     /// scheduler-lowered execution unit.
     ///
     /// Returns `Ok(true)` when the model consumed the mixed batch,
