@@ -1,0 +1,17 @@
+---
+interface Props {
+  on: string;
+  cwd: string;
+  meta: string;
+}
+const { on, cwd, meta } = Astro.props;
+---
+<div class="termtabs" aria-hidden="true">
+  <span class="termdot termdot-r"></span>
+  <span class="termdot termdot-y"></span>
+  <span class="termdot termdot-g"></span>
+  <span class="termtab on">{on}</span>
+  <span class="termtab">{cwd}</span>
+  <span class="termflex"></span>
+  <span class="termmeta">{meta}</span>
+</div>

@@ -1,0 +1,635 @@
+// Content for both ARLE landing pages. Each page imports its locale block
+// and feeds the same components — visual identity is shared, copy is not.
+
+export type Signal = {
+  kv: string; // raw HTML allowed: e.g. `backend=<code>cuda</code>`
+  status: "ok" | "warn";
+};
+
+export type Surface = { cap: string; body: string };
+export type StatusRow = { cap: string; body: string };
+
+export type QuickCard = {
+  title: string;
+  lines: string[];
+};
+
+export type FileRow = {
+  href: string;
+  path: string;
+  desc: string;
+};
+
+export type FooterCol = {
+  heading: string;
+  links: { label: string; href: string; placeholder?: boolean }[];
+};
+
+export type DemoLine = {
+  // Pre-formatted HTML (using the `demo-*` span classes) — keeps spacing intact.
+  html: string;
+};
+
+export type Locale = {
+  lang: string;
+  hreflang: string;
+  meta: {
+    title: string;
+    description: string;
+    ogTitle: string;
+    ogDescription: string;
+    ogUrl: string;
+    canonical: string;
+  };
+  termtabs: {
+    on: string;
+    cwd: string;
+    meta: string;
+  };
+  manhead: { left: string; center: string; right: string };
+  manfoot: { left: string; center: string; right: string };
+  hero: {
+    kicker: string;
+    subline: string;
+    tagline: string; // raw HTML allowed
+    signals: Signal[];
+    primaryCta: string;
+    secondaryCta: string;
+    panelKicker: string;
+    panelTitle: string; // raw HTML allowed
+    metaRows: { k: string; v: string }[]; // v allows HTML
+    panelNote: string;
+    demoKicker: string;
+    demoLabel: string;
+    demoLines: DemoLine[];
+  };
+  jumps: { label: string; href: string }[];
+  langSwitch: {
+    other: { label: string; href: string; hreflang: string };
+    selfLabel: string; // bold marker for current locale
+  };
+  sections: {
+    name: { title: string; body: string; note: string };
+    glance: {
+      title: string;
+      cards: { h: string; body: string }[];
+    };
+    synopsis: { title: string; lines: string[] };
+    surfaces: { title: string; rows: Surface[] };
+    status: { title: string; rows: StatusRow[] };
+    quickstart: {
+      title: string;
+      cards: QuickCard[];
+      note: string;
+    };
+    examples: {
+      title: string;
+      lead: string;
+      lines: string[];
+      seeAlso: string;
+    };
+    files: { title: string; rows: FileRow[] };
+    seealso: {
+      title: string;
+      items: string[];
+      note: string;
+    };
+  };
+  docfoot: {
+    cols: FooterCol[];
+    meta: string;
+  };
+  statusline: { label: string; href: string; cls?: string }[];
+};
+
+const FILES_EN = [
+  { href: "https://github.com/cklxx/arle/blob/main/README.md", path: "/README.md", desc: "public overview · install · CLI · architecture" },
+  { href: "https://github.com/cklxx/arle/blob/main/README.zh-CN.md", path: "/README.zh-CN.md", desc: "simplified Chinese public entry" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md", path: "/docs/http-api.md", desc: "HTTP contract · streaming behavior" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md", path: "/docs/support-matrix.md", desc: "backend / model / quant support" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/stability-policy.md", path: "/docs/stability-policy.md", desc: "stability levels · compatibility posture" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/compatibility.md", path: "/docs/compatibility.md", desc: "compatibility and deprecation policy" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/environment.md", path: "/docs/environment.md", desc: "environment variables · operator defaults" },
+  { href: "https://github.com/cklxx/arle/tree/main/examples", path: "/examples", desc: "copyable curl · Docker · Metal · tiny train smokes" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/index.md", path: "/docs/index.md", desc: "maintainer-facing PARA index" },
+  { href: "https://github.com/cklxx/arle/releases", path: "/releases", desc: "tagged binaries · checksums" },
+];
+
+const FILES_ZH = [
+  { href: "https://github.com/cklxx/arle/blob/main/README.zh-CN.md", path: "/README.zh-CN.md", desc: "中文公共入口：安装 · CLI · 架构" },
+  { href: "https://github.com/cklxx/arle/blob/main/README.md", path: "/README.md", desc: "英文公共入口" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md", path: "/docs/http-api.md", desc: "HTTP 契约 · 流式行为" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md", path: "/docs/support-matrix.md", desc: "后端 / 模型 / 量化支持矩阵" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/stability-policy.md", path: "/docs/stability-policy.md", desc: "稳定性分级 · 兼容性姿态" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/compatibility.md", path: "/docs/compatibility.md", desc: "兼容性与废弃策略" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/environment.md", path: "/docs/environment.md", desc: "环境变量与默认值" },
+  { href: "https://github.com/cklxx/arle/tree/main/examples", path: "/examples", desc: "curl · Docker · Metal · tiny train 冒烟示例" },
+  { href: "https://github.com/cklxx/arle/blob/main/docs/index.md", path: "/docs/index.md", desc: "维护者 PARA 索引" },
+  { href: "https://github.com/cklxx/arle/releases", path: "/releases", desc: "发版二进制 · 校验和" },
+];
+
+const SIGNALS: Signal[] = [
+  { kv: 'backend=<code>cuda</code>', status: "ok" },
+  { kv: 'backend=<code>metal</code>', status: "warn" },
+  { kv: 'api=<code>openai-v1</code>', status: "ok" },
+  { kv: 'doors=<code>1</code>', status: "ok" },
+];
+
+// Demo terminal — same lines for both locales (commands stay in English).
+const DEMO_LINES_EN: DemoLine[] = [
+  { html: '<span class="demo-prompt">$</span> arle --doctor' },
+  { html: '<span class="demo-ok">✓</span> <span class="demo-key">backend</span>=<span class="demo-val">cuda</span>     <span class="demo-comment"># FlashInfer + Triton AOT</span>' },
+  { html: '<span class="demo-ok">✓</span> <span class="demo-key">model</span>=<span class="demo-val">Qwen3-4B</span>   <span class="demo-comment"># resolved from $ARLE_MODEL</span>' },
+  { html: '<span class="demo-ok">✓</span> <span class="demo-key">kv</span>=<span class="demo-val">paged-16</span>      <span class="demo-comment"># radix tier T0..T3</span>' },
+  { html: '<span class="demo-ready">READY</span>' },
+  { html: '<span class="demo-prompt">$</span> arle serve --port 8000' },
+  { html: '<span class="demo-listen">listening</span> on <span class="demo-val">127.0.0.1:8000</span>   <span class="demo-comment">c=8 paged=16</span>' },
+];
+
+const DOCFOOT_EN: FooterCol[] = [
+  {
+    heading: "Documentation",
+    links: [
+      { label: "Getting Started", href: "https://github.com/cklxx/arle/blob/main/README.md" },
+      { label: "HTTP API", href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md" },
+      { label: "Examples", href: "https://github.com/cklxx/arle/tree/main/examples" },
+      { label: "Quickstart", href: "#quickstart" },
+    ],
+  },
+  {
+    heading: "Project",
+    links: [
+      { label: "About", href: "https://github.com/cklxx/arle" },
+      { label: "Architecture", href: "https://github.com/cklxx/arle/blob/main/docs/architecture.md" },
+      { label: "License", href: "https://github.com/cklxx/arle/blob/main/LICENSE" },
+      { label: "Code of Conduct", href: "https://github.com/cklxx/arle/blob/main/CODE_OF_CONDUCT.md" },
+    ],
+  },
+  {
+    heading: "Community",
+    links: [
+      { label: "GitHub Issues", href: "https://github.com/cklxx/arle/issues" },
+      { label: "Discussions", href: "https://github.com/cklxx/arle/discussions" },
+      { label: "Security", href: "https://github.com/cklxx/arle/blob/main/SECURITY.md" },
+    ],
+  },
+  {
+    heading: "Status",
+    links: [
+      { label: "Roadmap", href: "https://github.com/cklxx/arle/blob/main/ROADMAP.md" },
+      { label: "Changelog", href: "https://github.com/cklxx/arle/blob/main/CHANGELOG.md" },
+      { label: "Releases", href: "https://github.com/cklxx/arle/releases" },
+      { label: "Bench Snapshots", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
+    ],
+  },
+];
+
+const DOCFOOT_ZH: FooterCol[] = [
+  {
+    heading: "文档",
+    links: [
+      { label: "快速开始", href: "https://github.com/cklxx/arle/blob/main/README.zh-CN.md" },
+      { label: "HTTP API", href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md" },
+      { label: "示例", href: "https://github.com/cklxx/arle/tree/main/examples" },
+      { label: "Quickstart", href: "#quickstart" },
+    ],
+  },
+  {
+    heading: "项目",
+    links: [
+      { label: "项目主页", href: "https://github.com/cklxx/arle" },
+      { label: "架构", href: "https://github.com/cklxx/arle/blob/main/docs/architecture.md" },
+      { label: "许可证", href: "https://github.com/cklxx/arle/blob/main/LICENSE" },
+      { label: "Code of Conduct", href: "https://github.com/cklxx/arle/blob/main/CODE_OF_CONDUCT.md" },
+    ],
+  },
+  {
+    heading: "社区",
+    links: [
+      { label: "GitHub Issues", href: "https://github.com/cklxx/arle/issues" },
+      { label: "Discussions", href: "https://github.com/cklxx/arle/discussions" },
+      { label: "安全策略", href: "https://github.com/cklxx/arle/blob/main/SECURITY.md" },
+    ],
+  },
+  {
+    heading: "状态",
+    links: [
+      { label: "Roadmap", href: "https://github.com/cklxx/arle/blob/main/ROADMAP.md" },
+      { label: "Changelog", href: "https://github.com/cklxx/arle/blob/main/CHANGELOG.md" },
+      { label: "发版", href: "https://github.com/cklxx/arle/releases" },
+      { label: "Bench 快照", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
+    ],
+  },
+];
+
+export const EN: Locale = {
+  lang: "en",
+  hreflang: "en",
+  meta: {
+    title: "ARLE(1) — runtime-first Rust workspace",
+    description:
+      "ARLE is the runtime-first Rust workspace for serving, local agents, training, evaluation, and dataset tooling.",
+    ogTitle: "ARLE — runtime-first Rust workspace",
+    ogDescription:
+      "One Rust workspace for infer serving, the arle front door, train/eval flows, dataset tooling, and public docs.",
+    ogUrl: "https://cklxx.github.io/arle/",
+    canonical: "https://cklxx.github.io/arle/",
+  },
+  termtabs: { on: "man arle.1", cwd: "~/code/arle", meta: "zsh · 104×42" },
+  manhead: { left: "ARLE(1)", center: "General Commands Manual", right: "ARLE(1)" },
+  manfoot: { left: "ARLE(1)", center: "April 2026", right: "ARLE(1)" },
+  hero: {
+    kicker: "runtime-first rust workspace",
+    subline: "agent reinforcement learning engine",
+    tagline:
+      'One runtime authority. <span class="hl">infer</span> serves OpenAI-compatible traffic; <span class="hl">arle</span> fronts local agent, train, eval, and data workflows.',
+    signals: SIGNALS,
+    primaryCta: "arle --doctor",
+    secondaryCta: "cklxx/arle",
+    panelKicker: "PUBLIC SURFACE",
+    panelTitle: "<code>infer</code> serves. <code>arle</code> operates.",
+    metaRows: [
+      { k: "Project", v: "ARLE" },
+      { k: "Front door", v: "<code>arle</code>" },
+      { k: "Serving", v: "<code>infer</code>" },
+      { k: "Primary backend", v: "CUDA" },
+      { k: "Local path", v: "Metal / CPU" },
+    ],
+    panelNote:
+      "Docs, binaries, train/eval flows, and dataset tooling move together in one workspace instead of splitting across parallel stacks.",
+    demoKicker: "live demo",
+    demoLabel: "/dev/tty · zsh",
+    demoLines: DEMO_LINES_EN,
+  },
+  jumps: [
+    { label: "[glance]", href: "#glance" },
+    { label: "[synopsis]", href: "#synopsis" },
+    { label: "[surfaces]", href: "#surfaces" },
+    { label: "[status]", href: "#status" },
+    { label: "[quickstart]", href: "#quickstart" },
+    { label: "[examples]", href: "#examples" },
+    { label: "[docs]", href: "#docs" },
+    { label: "[github]", href: "https://github.com/cklxx/arle" },
+    { label: "[releases]", href: "https://github.com/cklxx/arle/releases" },
+  ],
+  langSwitch: {
+    other: { label: "zh", href: "zh-cn/", hreflang: "zh-Hans" },
+    selfLabel: "en",
+  },
+  sections: {
+    name: {
+      title: "NAME",
+      body:
+        "<b>ARLE</b> — a runtime-first Rust workspace. <code>infer</code> is the dedicated serving binary; <code>arle</code> is the front door for local agent execution, training, evaluation, and dataset work.",
+      note:
+        "This page stays deliberately stable. Detailed product truth lives in the repo docs linked below.",
+    },
+    glance: {
+      title: "AT A GLANCE",
+      cards: [
+        {
+          h: "— Runtime Spine",
+          body:
+            "Serving remains primary. <code>infer</code> is the canonical HTTP surface for generation, metrics, stats, and sessions.",
+        },
+        {
+          h: "— One Front Door",
+          body:
+            "<code>arle run</code>, <code>arle serve</code>, <code>arle train</code>, and <code>arle data</code> give users one stable front door instead of a scatter of task-specific binaries.",
+        },
+        {
+          h: "— Shared Authority",
+          body:
+            "Runtime code, model loading, train/eval flows, and public docs stay in one Rust workspace so operator truth does not drift.",
+        },
+      ],
+    },
+    synopsis: {
+      title: "SYNOPSIS",
+      lines: [
+        '<span class="ln">1</span><span class="p">$</span> cargo build -p infer --release',
+        '<span class="ln">2</span><span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000',
+        '<span class="ln">3</span><span class="p">$</span> cargo build --release --features cli --bin arle',
+        '<span class="ln">4</span><span class="p">$</span> ./target/release/arle --doctor',
+        '<span class="ln">5</span><span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B \\',
+        '<span class="ln"> </span>    run --prompt <i>"Summarize this repo"</i>',
+        '<span class="ln">6</span><span class="p">$</span> ./target/release/arle serve --backend cuda \\',
+        '<span class="ln"> </span>    --model-path /path/to/Qwen3-4B --port 8000',
+        '<span class="ln">7</span><span class="p">$</span> ./target/release/arle train env',
+        '<span class="ln">8</span><span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span>',
+      ],
+    },
+    surfaces: {
+      title: "SURFACES",
+      rows: [
+        { cap: "<code>infer</code>", body: "OpenAI-compatible HTTP serving, metrics, stats, and session endpoints on the runtime's canonical server surface." },
+        { cap: "<code>arle run</code>", body: "Interactive REPL and one-shot prompt execution with the same Rust runtime authority behind the local agent loop." },
+        { cap: "<code>arle serve</code>", body: "Unified front door that launches the matching serving binary from the release artifact or PATH." },
+        { cap: "<code>arle train</code>", body: "Pretrain, SFT, GRPO, multi-turn RL, and eval workflows through one front door instead of scattered train binaries." },
+        { cap: "<code>arle data</code>", body: "Dataset download and schema conversion utilities that stay versioned with the same workspace and docs." },
+      ],
+    },
+    status: {
+      title: "STATUS",
+      rows: [
+        { cap: "Project posture", body: "Runtime-first. <code>infer</code> remains the primary serving surface; <code>arle</code> extends that same runtime into agent, train, eval, and data workflows." },
+        { cap: "Backends", body: "CUDA is the stable primary serving path on Linux + NVIDIA. Metal is beta on Apple Silicon. CPU is development-only for smoke coverage." },
+        { cap: "Models", body: "Qwen3 and Qwen3.5-4B ship today. Llama 3 / 4 and DeepSeek V3 / R1 remain planned, not implied." },
+        { cap: "HTTP", body: "<code>/v1/completions</code>, <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/metrics</code>, and <code>/v1/stats</code> are the stable public serving surface." },
+        { cap: "Bench program", body: 'Dated snapshots live under <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">the current decode-alignment plan</a>.' },
+      ],
+    },
+    quickstart: {
+      title: "QUICKSTART",
+      cards: [
+        {
+          title: "— CUDA container",
+          lines: [
+            '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
+            '    -v /path/to/Qwen3-4B:/model:ro \\',
+            '    ghcr.io/cklxx/arle:latest \\',
+            '    serve --backend cuda --model-path /model --port 8000',
+          ],
+        },
+        {
+          title: "— Local CLI smoke",
+          lines: [
+            '<span class="p">$</span> git clone https://github.com/cklxx/arle',
+            '<span class="p">$</span> cd arle',
+            '<span class="p">$</span> ./setup.sh',
+            '<span class="p">$</span> cargo build --release --no-default-features \\',
+            '    --features cpu,no-cuda,cli --bin arle',
+            '<span class="p">$</span> ./target/release/arle --doctor',
+            '<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B \\',
+            '    run --no-tools --prompt <i>"Say hello in one sentence"</i>',
+            '<span class="p">$</span> ./target/release/arle train env',
+          ],
+        },
+        {
+          title: "— Serving smoke",
+          lines: [
+            '<span class="p">$</span> cargo build -p infer --release',
+            '<span class="p">$</span> cargo build --release --features cli --bin arle',
+            '<span class="p">$</span> ./target/release/arle serve --backend cuda \\',
+            '    --model-path /path/to/Qwen3-4B --port 8000',
+            '<span class="p">$</span> curl http://127.0.0.1:8000/v1/chat/completions \\',
+            '    -H <i>\'Content-Type: application/json\'</i> \\',
+            '    -d <i>\'{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}\'</i>',
+          ],
+        },
+      ],
+      note:
+        'Use <code>--features cli</code> for the default CUDA build, <code>metal,no-cuda,cli</code> on Apple Silicon, and <code>cpu,no-cuda,cli</code> for portable smoke paths. <code>./setup.sh</code> bootstraps Rust, Python, Zig, and local checks.',
+    },
+    examples: {
+      title: "EXAMPLES",
+      lead:
+        "An OpenAI-compatible chat call against a local <code>infer</code> server, piped through <code>jq</code> for the assistant message:",
+      lines: [
+        '<span class="ln">1</span><span class="p">$</span> curl -s http://127.0.0.1:8000/v1/chat/completions \\',
+        '<span class="ln"> </span>    -H <i>\'Content-Type: application/json\'</i> \\',
+        '<span class="ln"> </span>    -d <i>\'{"model":"qwen3-4b","messages":[{"role":"user","content":"Define ARLE in 8 words."}],"max_tokens":40}\'</i> \\',
+        '<span class="ln"> </span>    | jq .choices[0].message',
+        '<span class="ln">2</span>{',
+        '<span class="ln"> </span>  "role": <i>"assistant"</i>,',
+        '<span class="ln"> </span>  "content": <i>"runtime-first Rust workspace serving and orchestrating local agents."</i>',
+        '<span class="ln"> </span>}',
+      ],
+      seeAlso:
+        'See also <a href="#synopsis">SYNOPSIS</a>, <a href="#surfaces">SURFACES</a>, <a href="#quickstart">QUICKSTART</a>.',
+    },
+    files: {
+      title: "FILES",
+      rows: FILES_EN,
+    },
+    seealso: {
+      title: "SEE ALSO",
+      items: [
+        '<a href="https://github.com/cklxx/arle/blob/main/CHANGELOG.md">CHANGELOG.md</a> — dated project history',
+        '<a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md">ROADMAP.md</a> — next milestones',
+        '<a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> — contributor setup and verification gates',
+        '<a href="https://github.com/cklxx/arle/blob/main/SECURITY.md">SECURITY.md</a> — private vulnerability reporting policy',
+      ],
+      note:
+        'If you are here to contribute, start with <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>, not the maintainer plans tree.',
+    },
+  },
+  docfoot: {
+    cols: DOCFOOT_EN,
+    meta:
+      'Documentation site coming. For now everything stable lives in the <a href="https://github.com/cklxx/arle">repo</a>.',
+  },
+  statusline: [
+    { label: "NOR", href: "#", cls: "sl-mode" },
+    { label: "arle/frontdoor", href: "#name", cls: "sl-accent" },
+    { label: "<span class=\"dot\"></span> runtime-first", href: "#status", cls: "sl-ok" },
+    { label: "gh:cklxx/arle", href: "https://github.com/cklxx/arle" },
+    { label: "releases", href: "https://github.com/cklxx/arle/releases" },
+  ],
+};
+
+export const ZH: Locale = {
+  lang: "zh-Hans",
+  hreflang: "zh-Hans",
+  meta: {
+    title: "ARLE(1) — runtime-first Rust workspace",
+    description:
+      "ARLE 是以 runtime 为主干的 Rust workspace，覆盖 serving、本地 agent、训练、评测与数据集工具。",
+    ogTitle: "ARLE — runtime-first Rust workspace",
+    ogDescription:
+      "同一套 Rust workspace 里收口 infer serving、arle 前门、训练 / 评测、数据集工具与公共文档。",
+    ogUrl: "https://cklxx.github.io/arle/zh-cn/",
+    canonical: "https://cklxx.github.io/arle/zh-cn/",
+  },
+  termtabs: { on: "man arle.1", cwd: "~/code/arle", meta: "zsh · 104×42" },
+  manhead: { left: "ARLE(1)", center: "用户命令手册", right: "ARLE(1)" },
+  manfoot: { left: "ARLE(1)", center: "2026 年 4 月", right: "ARLE(1)" },
+  hero: {
+    kicker: "runtime-first rust workspace",
+    subline: "agent reinforcement learning engine",
+    tagline:
+      '一套运行时权威。<span class="hl">infer</span> 负责 OpenAI 兼容 serving；<span class="hl">arle</span> 负责本地 agent、训练、评测与数据工作流前门。',
+    signals: SIGNALS,
+    primaryCta: "arle --doctor",
+    secondaryCta: "cklxx/arle",
+    panelKicker: "PUBLIC SURFACE",
+    panelTitle: "<code>infer</code> 负责 serving，<code>arle</code> 负责操作前门。",
+    metaRows: [
+      { k: "项目名", v: "ARLE" },
+      { k: "前门", v: "<code>arle</code>" },
+      { k: "服务面", v: "<code>infer</code>" },
+      { k: "主后端", v: "CUDA" },
+      { k: "本地路径", v: "Metal / CPU" },
+    ],
+    panelNote:
+      "文档、二进制、train/eval 流程和数据集工具都跟随同一套 workspace 演进，不再拆成几条并行口径。",
+    demoKicker: "实时演示",
+    demoLabel: "/dev/tty · zsh",
+    demoLines: DEMO_LINES_EN,
+  },
+  jumps: [
+    { label: "[概览]", href: "#glance" },
+    { label: "[概要]", href: "#synopsis" },
+    { label: "[入口面]", href: "#surfaces" },
+    { label: "[状态]", href: "#status" },
+    { label: "[快速开始]", href: "#quickstart" },
+    { label: "[示例]", href: "#examples" },
+    { label: "[文档]", href: "#docs" },
+    { label: "[github]", href: "https://github.com/cklxx/arle" },
+    { label: "[发版]", href: "https://github.com/cklxx/arle/releases" },
+  ],
+  langSwitch: {
+    other: { label: "en", href: "", hreflang: "en" }, // base URL is the EN page
+    selfLabel: "zh",
+  },
+  sections: {
+    name: {
+      title: "名称",
+      body:
+        "<b>ARLE</b> — 以 runtime 为主干的 Rust workspace。<code>infer</code> 是专门的 serving 二进制；<code>arle</code> 是本地 agent、训练、评测与数据工作的统一前门。",
+      note:
+        "这个页面只保留稳定入口职责；更细的产品真相请直接看下面列出的仓库文档。",
+    },
+    glance: {
+      title: "概览",
+      cards: [
+        {
+          h: "— Runtime 主干",
+          body:
+            "Serving 仍是主线。<code>infer</code> 是生成、metrics、stats 与 session 的标准 HTTP 服务面。",
+        },
+        {
+          h: "— 一张前门",
+          body:
+            "<code>arle run</code>、<code>arle serve</code>、<code>arle train</code> 与 <code>arle data</code> 把用户入口收成一张前门，不再分散成多组二进制。",
+        },
+        {
+          h: "— 同一套权威",
+          body:
+            "运行时代码、模型加载、train/eval 流程与公共文档都落在同一套 Rust workspace 里，避免口径漂移。",
+        },
+      ],
+    },
+    synopsis: {
+      title: "概要",
+      lines: [
+        '<span class="ln">1</span><span class="p">$</span> cargo build -p infer --release',
+        '<span class="ln">2</span><span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000',
+        '<span class="ln">3</span><span class="p">$</span> cargo build --release --features cli --bin arle',
+        '<span class="ln">4</span><span class="p">$</span> ./target/release/arle --doctor',
+        '<span class="ln">5</span><span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-4B \\',
+        '<span class="ln"> </span>    run --prompt <i>"总结一下这个仓库"</i>',
+        '<span class="ln">6</span><span class="p">$</span> ./target/release/arle serve --backend cuda \\',
+        '<span class="ln"> </span>    --model-path /path/to/Qwen3-4B --port 8000',
+        '<span class="ln">7</span><span class="p">$</span> ./target/release/arle train env',
+        '<span class="ln">8</span><span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span>',
+      ],
+    },
+    surfaces: {
+      title: "入口面",
+      rows: [
+        { cap: "<code>infer</code>", body: "OpenAI 兼容 HTTP serving、metrics、stats 与 session 接口都收口在运行时的标准服务面上。" },
+        { cap: "<code>arle run</code>", body: "交互式 REPL 与一次性 prompt 执行，共用同一套 Rust 运行时权威，直接面向本地 agent 工作流。" },
+        { cap: "<code>arle serve</code>", body: "统一前门，从 release artifact 或 PATH 拉起匹配的 serving 二进制。" },
+        { cap: "<code>arle train</code>", body: "Pretrain、SFT、GRPO、多轮 RL 与 eval 共用一张前门，不再依赖分散的训练二进制。" },
+        { cap: "<code>arle data</code>", body: "数据集下载与 schema 转换工具，和同一套 workspace、版本、文档一起演进。" },
+      ],
+    },
+    status: {
+      title: "状态",
+      rows: [
+        { cap: "项目姿态", body: "Runtime-first。<code>infer</code> 仍是主 serving 面；<code>arle</code> 在同一套运行时之上向 agent、train、eval、data 扩展。" },
+        { cap: "后端", body: "CUDA 是 Linux + NVIDIA 上的稳定主 serving 路径。Metal 在 Apple Silicon 上是 beta。CPU 仅用于开发态冒烟覆盖。" },
+        { cap: "模型", body: "当前已交付 Qwen3 与 Qwen3.5-4B。Llama 3 / 4 与 DeepSeek V3 / R1 仍是规划中，不做暗示性承诺。" },
+        { cap: "HTTP", body: "<code>/v1/completions</code>、<code>/v1/chat/completions</code>、<code>/v1/models</code>、<code>/metrics</code> 与 <code>/v1/stats</code> 是稳定公共服务面。" },
+        { cap: "Benchmark", body: '带日期的快照集中放在 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>；当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">当前 decode 对齐计划</a>。' },
+      ],
+    },
+    quickstart: {
+      title: "快速开始",
+      cards: [
+        {
+          title: "— CUDA 容器",
+          lines: [
+            '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
+            '    -v /path/to/Qwen3-4B:/model:ro \\',
+            '    ghcr.io/cklxx/arle:latest \\',
+            '    serve --backend cuda --model-path /model --port 8000',
+          ],
+        },
+        {
+          title: "— 本地 CLI 冒烟",
+          lines: [
+            '<span class="p">$</span> git clone https://github.com/cklxx/arle',
+            '<span class="p">$</span> cd arle',
+            '<span class="p">$</span> ./setup.sh',
+            '<span class="p">$</span> cargo build --release --no-default-features \\',
+            '    --features cpu,no-cuda,cli --bin arle',
+            '<span class="p">$</span> ./target/release/arle --doctor',
+            '<span class="p">$</span> ./target/release/arle --model-path /path/to/Qwen3-0.6B \\',
+            '    run --no-tools --prompt <i>"用一句话打个招呼"</i>',
+            '<span class="p">$</span> ./target/release/arle train env',
+          ],
+        },
+        {
+          title: "— Serving 冒烟",
+          lines: [
+            '<span class="p">$</span> cargo build -p infer --release',
+            '<span class="p">$</span> cargo build --release --features cli --bin arle',
+            '<span class="p">$</span> ./target/release/arle serve --backend cuda \\',
+            '    --model-path /path/to/Qwen3-4B --port 8000',
+            '<span class="p">$</span> curl http://127.0.0.1:8000/v1/chat/completions \\',
+            '    -H <i>\'Content-Type: application/json\'</i> \\',
+            '    -d <i>\'{"messages":[{"role":"user","content":"你好"}],"max_tokens":64}\'</i>',
+          ],
+        },
+      ],
+      note:
+        '默认 CUDA CLI 用 <code>--features cli</code>，Apple Silicon 用 <code>metal,no-cuda,cli</code>，便携冒烟路径用 <code>cpu,no-cuda,cli</code>。<code>./setup.sh</code> 会引导 Rust、Python、Zig 和本地检查。',
+    },
+    examples: {
+      title: "示例",
+      lead:
+        "对本地 <code>infer</code> server 发一次 OpenAI 兼容的 chat 请求，再用 <code>jq</code> 把 assistant 消息切出来：",
+      lines: [
+        '<span class="ln">1</span><span class="p">$</span> curl -s http://127.0.0.1:8000/v1/chat/completions \\',
+        '<span class="ln"> </span>    -H <i>\'Content-Type: application/json\'</i> \\',
+        '<span class="ln"> </span>    -d <i>\'{"model":"qwen3-4b","messages":[{"role":"user","content":"用 8 个词解释 ARLE。"}],"max_tokens":40}\'</i> \\',
+        '<span class="ln"> </span>    | jq .choices[0].message',
+        '<span class="ln">2</span>{',
+        '<span class="ln"> </span>  "role": <i>"assistant"</i>,',
+        '<span class="ln"> </span>  "content": <i>"以 runtime 为主干的 Rust workspace，统一 serving 与本地 agent。"</i>',
+        '<span class="ln"> </span>}',
+      ],
+      seeAlso:
+        '另见 <a href="#synopsis">概要</a>、<a href="#surfaces">入口面</a>、<a href="#quickstart">快速开始</a>。',
+    },
+    files: {
+      title: "文件",
+      rows: FILES_ZH,
+    },
+    seealso: {
+      title: "另见",
+      items: [
+        '<a href="https://github.com/cklxx/arle/blob/main/CHANGELOG.md">CHANGELOG.md</a> — 带日期的项目历史',
+        '<a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md">ROADMAP.md</a> — 接下来的里程碑',
+        '<a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> — 贡献者初始化与验证门槛',
+        '<a href="https://github.com/cklxx/arle/blob/main/SECURITY.md">SECURITY.md</a> — 私有漏洞报告策略',
+      ],
+      note:
+        '如果你是来提改动的，先看 <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>，不要先钻进维护者计划树。',
+    },
+  },
+  docfoot: {
+    cols: DOCFOOT_ZH,
+    meta:
+      '完整文档站点正在筹备中，目前所有稳定信息都收口在 <a href="https://github.com/cklxx/arle">repo</a>。',
+  },
+  statusline: [
+    { label: "NOR", href: "#", cls: "sl-mode" },
+    { label: "arle/frontdoor", href: "#name", cls: "sl-accent" },
+    { label: "<span class=\"dot\"></span> runtime-first", href: "#status", cls: "sl-ok" },
+    { label: "gh:cklxx/arle", href: "https://github.com/cklxx/arle" },
+    { label: "发版", href: "https://github.com/cklxx/arle/releases" },
+  ],
+};

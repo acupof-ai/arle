@@ -15,3 +15,8 @@ models/
 .context/
 /vendor/
 bench-output/
+
+# web frontend build
+web/node_modules/
+web/dist/
+web/.astro/

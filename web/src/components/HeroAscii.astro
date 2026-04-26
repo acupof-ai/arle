@@ -1,0 +1,15 @@
+---
+interface Props {
+  ariaLabel: string;
+}
+const { ariaLabel } = Astro.props;
+const ART = ` █████╗ ██████╗ ██╗     ███████╗
+██╔══██╗██╔══██╗██║     ██╔════╝
+███████║██████╔╝██║     █████╗
+██╔══██║██╔══██╗██║     ██╔══╝
+██║  ██║██║  ██║███████╗███████╗
+╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝`;
+---
+<pre class="ascii" aria-label={ariaLabel}>
+<span class="ascii-art" aria-hidden="true">{ART}</span>
+</pre>

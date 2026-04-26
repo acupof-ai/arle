@@ -1,0 +1,12 @@
+---
+interface Props {
+  lines: string[];     // each line is raw HTML (allows <span class="p">$</span>, <i>, etc.)
+  lined?: boolean;
+  extraClass?: string;
+}
+const { lines, lined = false, extraClass = "" } = Astro.props;
+const cls = ["cmd", lined ? "lined" : "", extraClass].filter(Boolean).join(" ");
+// Pre-join into a single HTML string so whitespace between siblings doesn't pollute the <pre>.
+const inner = lines.join("\n");
+---
+<pre class={cls} set:html={inner}></pre>

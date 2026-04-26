@@ -1,0 +1,14 @@
+---
+interface Props {
+  left: string;
+  center: string;
+  right: string;
+  ariaLabel?: string;
+}
+const { left, center, right, ariaLabel = "man page footer" } = Astro.props;
+---
+<footer class="manfoot" aria-label={ariaLabel}>
+  <span class="manfoot-l">{left}</span>
+  <span class="manfoot-c">{center}</span>
+  <span class="manfoot-r">{right}</span>
+</footer>
