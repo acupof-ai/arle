@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-import json
+"""Minimal OpenAI-SDK example against an `arle serve` instance.
+
+    pip install openai
+    python examples/openai_chat.py
+"""
 import os
-import urllib.request
 
-base_url = os.environ.get("ARLE_BASE_URL", "http://127.0.0.1:8000")
-payload = {
-    "messages": [{"role": "user", "content": "Hello from ARLE"}],
-    "max_tokens": 64,
-}
+from openai import OpenAI
 
-request = urllib.request.Request(
-    f"{base_url}/v1/chat/completions",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type": "application/json"},
-    method="POST",
+base_url = os.environ.get("ARLE_BASE_URL", "http://127.0.0.1:8000") + "/v1"
+model = os.environ.get("ARLE_MODEL", "qwen3-4b")
+
+client = OpenAI(base_url=base_url, api_key="not-needed")
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Hello from ARLE"}],
+    max_tokens=64,
 )
-
-with urllib.request.urlopen(request, timeout=120) as response:
-    print(response.read().decode("utf-8"))
+print(response.choices[0].message.content)
