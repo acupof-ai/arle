@@ -128,7 +128,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     )
 
                 T.clear(scores)
-                T.gemm(q_tile, k_tile, scores, transpose_B=True)
+                T.gemm(q_tile, k_tile, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
                 # Causal mask: q's absolute pos = (kv_total_len - qlen) + row.
                 kv_offset = kv_total_len - qlen
@@ -152,17 +152,30 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     m_new[i] = T.max(m_prev[i], m_new[i])
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     p[i, j] = T.exp2((scores[i, j] - m_new[i]) * log2e)
+                # Hoist the per-row alpha into its own fragment then drive
+                # the acc_o rescale as a 2D T.Parallel — the nested
+                # T.serial(HEAD_DIM) inside T.Parallel(BLOCK_M) version
+                # produced a layout TileLang 0.1.9's LayoutInferencer can't
+                # map to threads (`loop_var_to_thread ... contains inner
+                # var d`).
+                scale_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 for i in T.Parallel(BLOCK_M):
-                    alpha = T.exp2((m_prev[i] - m_new[i]) * log2e)
-                    l_i[i] = l_i[i] * alpha
-                    for d in T.serial(HEAD_DIM):
-                        acc_o[i, d] = acc_o[i, d] * alpha
+                    scale_i[i] = T.exp2((m_prev[i] - m_new[i]) * log2e)
+                    l_i[i] = l_i[i] * scale_i[i]
+                for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
+                    acc_o[i, d] = acc_o[i, d] * scale_i[i]
                 row_sum = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 T.reduce_sum(p, row_sum, dim=1)
                 for i in T.Parallel(BLOCK_M):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
-                T.gemm(p, v_tile, acc_o)
+                # Narrow the f32 softmax output to bf16 to match v_tile
+                # before the P @ V matmul (standard FlashAttention-2
+                # pattern). TileLang 0.1.9's gemm asserts A.dtype ==
+                # B.dtype; older versions auto-cast silently.
+                p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
+                T.copy(p, p_bf16)
+                T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 row = row0 + i
