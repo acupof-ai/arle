@@ -75,7 +75,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install CUDA toolkit 12.8
-        uses: Jimver/cuda-toolkit@v0.2.22
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.8.0'
           method: network
