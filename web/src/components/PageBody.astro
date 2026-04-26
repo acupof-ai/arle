@@ -3,8 +3,6 @@ import type { Locale } from "../data/content.ts";
 import HeroAscii from "./HeroAscii.astro";
 import HeroSignals from "./HeroSignals.astro";
 import HeroCta from "./HeroCta.astro";
-import HeroTerminal from "./HeroTerminal.astro";
-import HeroPanel from "./HeroPanel.astro";
 import Section from "./Section.astro";
 import Cmd from "./Cmd.astro";
 import Jumps from "./Jumps.astro";
@@ -15,36 +13,24 @@ interface Props {
 }
 const { locale } = Astro.props;
 const s = locale.sections;
+const heroInstall = s.install.cards[0];
 ---
 
 <section class="hero" aria-label="banner">
   <h1 class="sr-only">{locale.meta.title}</h1>
-  <div class="hero-shell">
-    <div class="hero-art">
-      <p class="hero-kicker">{locale.hero.kicker}</p>
-      <HeroAscii ariaLabel="ARLE — runtime-first Rust workspace" />
-      <p class="subline">{locale.hero.subline}</p>
-      <p class="tagline" set:html={locale.hero.tagline} />
-      <HeroSignals signals={locale.hero.signals} />
-      <HeroCta
-        primaryHref="#install"
-        primaryLabel={locale.hero.primaryCta}
-        secondaryHref="https://github.com/cklxx/arle"
-        secondaryLabel={locale.hero.secondaryCta}
-      />
-    </div>
-    <HeroTerminal
-      kicker={locale.hero.demoKicker}
-      label={locale.hero.demoLabel}
-      lines={locale.hero.demoLines}
+  <p class="hero-kicker">{locale.hero.kicker}</p>
+  <HeroAscii ariaLabel="ARLE — runtime-first Rust workspace" />
+  <p class="hero-tagline" set:html={locale.hero.tagline} />
+  <pre class="hero-install" aria-label="primary install line" set:html={heroInstall.lines.join("\n")}></pre>
+  <div class="hero-row">
+    <HeroCta
+      primaryHref="#install"
+      primaryLabel={locale.hero.primaryCta}
+      secondaryHref="https://github.com/cklxx/arle"
+      secondaryLabel={locale.hero.secondaryCta}
     />
+    <HeroSignals signals={locale.hero.signals} ariaLabel="status chips" />
   </div>
-  <HeroPanel
-    kicker={locale.hero.panelKicker}
-    title={locale.hero.panelTitle}
-    rows={locale.hero.metaRows}
-    note={locale.hero.panelNote}
-  />
   <Jumps items={locale.jumps} lang={locale.langSwitch} />
 </section>
 
