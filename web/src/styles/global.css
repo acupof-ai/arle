@@ -158,39 +158,43 @@ code      { font-family: inherit; color: var(--coral-dim); }
 .wordmark {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: 0;
   margin: 0 0 var(--sp-7);
   font-family: var(--mono);
   line-height: 1;
+  color: var(--ink);
+}
+.wordmark-mark {
+  width: 60px;
+  height: 72px;
+  display: block;
+  margin-right: 4px;
+  flex: none;
+  align-self: baseline;
   position: relative;
+  top: 4px;
 }
 .wordmark-name {
   font-size: 96px;
   font-weight: 700;
   color: var(--ink);
-  letter-spacing: -0.04em;
+  letter-spacing: -0.045em;
+  line-height: 1;
 }
 .wordmark-section {
   font-size: 22px;
   color: var(--coral);
   font-weight: 400;
   align-self: flex-start;
-  margin-top: 0.1em;
+  margin-top: 0.18em;
+  margin-left: 4px;
   letter-spacing: 0;
 }
-.wordmark-rule {
-  position: absolute;
-  left: 0;
-  bottom: -14px;
-  width: 56px;
-  height: 3px;
-  background: var(--coral);
-}
 @media (max-width: 640px) {
+  .wordmark-mark { width: 40px; height: 48px; margin-right: 3px; top: 2px; }
   .wordmark-name { font-size: 64px; }
   .wordmark-section { font-size: 16px; }
   .wordmark { margin-bottom: var(--sp-6); }
-  .wordmark-rule { width: 40px; height: 2px; bottom: -10px; }
 }
 
 .hero-tagline {

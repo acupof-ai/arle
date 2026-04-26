@@ -1,1 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#F6F8F2"/><text x="16" y="22" font-family="monospace" font-size="22" text-anchor="middle" fill="#087A73">$</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" aria-label="arle">
+  <rect width="100" height="100" fill="#F6F8F2"/>
+  <path d="M 57 35 A 24 24 0 1 0 57 77" fill="none" stroke="#111714" stroke-width="16" stroke-linecap="butt"/>
+  <rect x="53" y="20" width="16" height="68" fill="#111714"/>
+  <polygon points="26,46 26,62 44,54" fill="#C9573B"/>
+</svg>
