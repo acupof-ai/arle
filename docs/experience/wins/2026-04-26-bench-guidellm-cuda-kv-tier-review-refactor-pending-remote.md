@@ -14,18 +14,86 @@
 
 ## Hypothesis
 
-- All three Wave-1 changes are pure refactors with no algorithmic delta:
-  - backend.rs: macro-collapsed dispatch is identical to manual match
-    (compiler should produce the same code; only difference is the
-    eliminated unreachable runtime error arm)
-  - scheduler/cuda/policy.rs: file move only, no type/method changes
-  - host_pool.rs `with_region_slice`: removes one `Vec<u8>` alloc + memcpy
-    per readmitted block on the H2D promote path. **Should be neutral or
-    very slightly faster** at high readmission rates; not measurable on a
-    cold sweep without prior staged blocks.
+- All Wave-1/2/3 changes are pure refactors with no algorithmic delta:
+  - **Wave 1**:
+    - backend.rs: macro-collapsed dispatch is identical to manual match
+      (compiler should produce the same code; only difference is the
+      eliminated unreachable runtime error arm)
+    - scheduler/cuda/policy.rs: file move only, no type/method changes
+    - host_pool.rs `with_region_slice`: removes one `Vec<u8>` alloc + memcpy
+      per readmitted block on the H2D promote path. **Should be neutral or
+      very slightly faster** at high readmission rates; not measurable on a
+      cold sweep without prior staged blocks.
+  - **Wave 2**: CoordinatorBuilder (telescoping ctor → builder), typed
+    FailureClass, AllocatedRegions RAII guard, three `*_failed` methods
+    collapsed to one `report_failure`. All structural; zero behavioral
+    delta. The new `with_region_slice` slice-API shaves one alloc per
+    readmission promote — same direction as Wave 1 §host_pool.
+  - **Wave 3**: pure file split (coordinator.rs 2132 → 623 lines, 5 new
+    coordinator/* files). Zero code change, only relocation + visibility
+    narrowing.
 
   Expected Δ on canonical Qwen3 sweep: **0% TTFT / 0% ITL / 0% out-tok-s
   within run-to-run noise (≤1.5%)**.
+
+## Local Metal sanity-check (regression-only, 2026-04-26)
+
+Per the user request to validate locally as well, ran the Metal lane
+end-to-end after the full refactor (commits 64e350c..a94682a). Note
+that **Apple Silicon skips T1** (per `kv_tier/AGENTS.md`) — the Metal
+serve path doesn't exercise the refactored coordinator/host_pool hot
+paths, only their always-on type compilation. So the Metal evidence
+proves the refactor doesn't break Metal **compile + serve**, not that
+the CUDA hot paths are perf-equivalent.
+
+### Codex review
+
+```bash
+codex review --base cae7e05    # Wave 1
+codex review --base 99b7bcb    # Wave 2 + 3
+```
+
+Wave-1 verdict: *"No actionable correctness issues were found in the
+changes relative to the specified base. The touched feature
+combinations type-check in the available local no-CUDA/Metal lanes."*
+
+### Lib test sweep (Metal)
+
+```bash
+cargo test -p infer --release --no-default-features --features metal --lib
+```
+
+Result: **475 passed; 0 failed; 19 ignored** (all kv_tier 57 + coordinator
+17 included; zero new test failures across the wave-1/2/3 commit range).
+
+### metal_bench Qwen3-0.6B bf16, 1024 prompt + 128 gen, 2 warmup + 3 timed runs
+
+```bash
+./target/release/metal_bench --model models/Qwen3-0.6B \
+  --prompt-tokens 1024 --generation-tokens 128 --warmup 2 --runs 3
+```
+
+| metric | mean | p50 | p99 |
+|---|---:|---:|---:|
+| Prompt speed (tok/s) | 6435.4 | 6435.1 | 6440.1 |
+| Generation (tok/s) | 140.2 | 140.2 | 140.4 |
+| TTFT (ms) | 159 | 159 | 159 |
+| Total wall (ms) | 1072 | 1072 | 1074 |
+| Repo E2E (tok/s) | 119.4 | 119.4 | 119.6 |
+| Peak RSS | 1598 MB | — | — |
+
+Per-run variance < 0.1% — Metal lane is stable post-refactor. This is
+not a Δ baseline (no pre-refactor Metal snapshot at these exact params),
+just a "Metal still works" regression check.
+
+### What was NOT validated locally
+
+- The actual CUDA `kv_tier::coordinator` hot paths (Apple Silicon skips
+  T1; CUDA bench remains pending-remote).
+- The user's in-progress Qwen3.5 work (`metal/qwen35.rs`,
+  `mlx-sys/mlx_qwen35_model.cpp`) — `metal_bench --use-step-driver
+  --model models/Qwen3.5-0.8B` triggered a GPU Hang in the user's WIP
+  paths; those changes are uncommitted and unrelated to this refactor.
 
 ## Command
 
