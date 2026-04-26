@@ -32,7 +32,6 @@ body {
   font-feature-settings: "liga" 0, "calt" 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  padding-bottom: 52px; /* clear fixed statusline */
   background-image:
     repeating-linear-gradient(
       0deg,
@@ -1085,53 +1084,68 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
 }
 .docfoot-meta a { color: var(--ink-dim); }
 
-/* ── statusline (fixed, vim/tmux style) ────────────────────────────── */
+/* ── install (hero-priority runnable lines) ────────────────────────── */
 
-.statusline {
-  position: fixed;
-  bottom: 0; left: 0; right: 0;
-  display: flex;
-  align-items: center;
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
-  background: var(--console);
-  color: #F6F8F2;
-  border-top: 1px solid var(--rule);
+.install-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-4);
+  margin-top: var(--sp-3);
+}
+.install-card {
+  border-left-color: var(--coral);
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+}
+.install-label {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--coral-dim);
+  font-weight: 700;
+}
+.install-card pre.cmd {
+  margin: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
   padding: 0;
-  z-index: 10;
-  user-select: none;
+}
+
+/* ── bench (dated snapshots table, narrower than the support matrix) ─ */
+
+table.bench-table tbody td:nth-child(1) {
   white-space: nowrap;
-  overflow-x: auto;
+  color: var(--coral-dim);
+  font-weight: 700;
 }
-.statusline .sl-seg {
-  padding: 6px var(--sp-3);
-  border-right: 1px solid rgba(246, 248, 242, 0.14);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.statusline a.sl-seg {
-  color: inherit;
+table.bench-table tbody td:last-child { white-space: nowrap; }
+.bench-link {
+  color: var(--teal-dim);
   text-decoration: none;
-  transition: background-color 90ms ease, color 90ms ease;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px dotted var(--teal-dim);
 }
-.statusline a.sl-seg:hover,
-.statusline a.sl-seg:focus-visible {
-  background: var(--paper);
-  color: var(--ink);
-  outline: none;
+.bench-link:hover,
+.bench-link:focus-visible {
+  color: var(--paper);
+  background: var(--teal);
+  outline: 1px solid var(--teal);
+  border-bottom-color: transparent;
 }
-.statusline .sl-seg:last-child { border-right: none; }
-.statusline .sl-spacer { flex: 1; border: none; padding: 0; }
-.sl-mode { background: var(--teal); color: #F6F8F2; font-weight: 700; }
-.sl-accent { background: var(--coral); color: #F6F8F2; font-weight: 700; }
-.sl-ok { color: #B8DFC9; }
-.sl-ok .dot {
-  display: inline-block;
-  width: 7px; height: 7px;
-  background: var(--ok);
-  border-radius: 50%;
-  box-shadow: 0 0 6px rgba(76, 195, 161, 0.9);
+
+a.topo-cap {
+  text-decoration: none;
+  border-bottom: 1px dotted var(--teal-dim);
+}
+a.topo-cap:hover,
+a.topo-cap:focus-visible {
+  color: var(--paper);
+  background: var(--teal);
+  border-bottom-color: transparent;
+  outline: 1px solid var(--teal);
 }
 
 /* ── responsive ────────────────────────────────────────────────────── */
@@ -1142,6 +1156,7 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   .docfoot { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topo-shell { grid-template-columns: 1fr; gap: var(--sp-4); }
   .topo-legend li { grid-template-columns: 10ch minmax(0, 1fr); gap: var(--sp-2); }
+  .install-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 640px) {
@@ -1177,7 +1192,6 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   .hero-demo { font-size: 12px; padding: var(--sp-3) var(--sp-3); }
   .manhead-c, .manfoot-c { display: none; }
   pre.cmd, pre.tbl, pre.diagram, pre.files { font-size: 12px; }
-  .statusline { display: none; }
   .termtabs { padding: 5px 8px; gap: 6px; }
   .termtab:nth-of-type(2),
   .termmeta { display: none; }
@@ -1192,7 +1206,6 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
   :root { --fs-base: 11pt; }
   html, body { background: #ffffff; color: #000000; }
   body { background-image: none; padding-bottom: 0; }
-  .statusline,
   .jumps,
   .termtabs,
   .hero-cta,
