@@ -6,7 +6,7 @@
 flashinfer-python==0.6.9
 
 # Triton: AOT kernel compilation (silu_mul, add, embedding, attention decode).
-triton==3.5.1
+triton==3.6.0
 
 # HuggingFace Hub: model weight download.
 huggingface_hub==0.36.2
