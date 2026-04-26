@@ -29,9 +29,13 @@ jobs:
     name: Check (macOS Metal)
     runs-on: macos-14
     env:
-      # Match the SDK used to compile mlx C++ (which calls `@available(macOS 14, *)`),
-      # otherwise the linker can't resolve `__isPlatformVersionAtLeast`.
-      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # mlx C++ uses `@available(macOS 14, *)` checks that emit
+      # `__isPlatformVersionAtLeast` calls (from compiler-rt). Setting the
+      # deployment target to 14.0 wasn't enough — the macos-14 runner builds
+      # mlx against SDK 14.8.5, so the symbol still gets emitted. Bumping to
+      # 15.0 makes the @available branch always-true at compile time so the
+      # check is elided entirely.
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v4
 
