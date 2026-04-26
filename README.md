@@ -194,6 +194,31 @@ Run your own: [docs/plans/guidellm-integration.md](docs/plans/guidellm-integrati
 
 Two entrypoints are first-class:
 
+- `arle` is the user front door: local agent, `serve`, train/eval, and data.
+- `infer` remains the dedicated serving binary for operators who want the
+  backend surface directly.
+
+Fastest paths:
+
+```bash
+# Linux + NVIDIA, prebuilt container
+docker run --rm --gpus all -p 8000:8000 \
+  -v /path/to/Qwen3-4B:/model:ro \
+  ghcr.io/cklxx/arle:latest \
+  serve --backend cuda --model-path /model --port 8000
+
+# Apple Silicon local smoke
+cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
+cargo build -p infer --release --no-default-features --features metal,no-cuda --bin metal_serve
+./target/release/arle --doctor
+./target/release/arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit
+
+# Portable CPU smoke / CI
+cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
+./target/release/arle --doctor --json
+./target/release/arle train test --backend cpu --json
+```
+
 ### `arle` — local agent / train / eval front door
 
 ```bash
@@ -219,7 +244,9 @@ First commands:
 ./target/release/arle --help
 ./target/release/arle --doctor
 ./target/release/arle --model-path /path/to/Qwen3-4B run --prompt "Summarize this repo"
+./target/release/arle --model-path /path/to/Qwen3-4B run --no-tools --prompt "Summarize this repo without tools"
 ./target/release/arle --model-path /path/to/Qwen3-4B run --stdin --json < prompt.txt
+./target/release/arle serve --backend cuda --model-path /path/to/Qwen3-4B --port 8000
 ./target/release/arle train env
 ./target/release/arle train test --backend cpu --json
 ./target/release/arle data convert --help
@@ -227,7 +254,8 @@ First commands:
 
 `arle` with no subcommand starts the interactive REPL. `arle run` is the
 explicit alias for the same surface, and `arle run --prompt ...` / `--stdin`
-are the script-friendly one-shot paths.
+are the script-friendly one-shot paths. Use `--no-tools` when a prompt must not
+execute the built-in shell/python tools.
 
 `arle train test` is also the canonical tiny fixture path used by CI. With
 `--keep-artifacts` or `--out-dir`, it leaves a real checkpoint at
@@ -241,7 +269,8 @@ tmp=$(mktemp -d)
 
 Prefer the prebuilt binaries from
 [GitHub Releases](https://github.com/cklxx/arle/releases) when you do not want
-to compile from source.
+to compile from source. Release tarballs are named `arle-<version>-<platform>.tar.gz`
+and include the `arle` front door plus the matching serving binary.
 
 ### `infer` — OpenAI-compatible serving
 
@@ -279,6 +308,8 @@ contributor workflow and validation expectations, use
 
 - `infer` — dedicated OpenAI-compatible serving binary.
 - `arle run` — local agent runtime, REPL, and one-shot prompt execution.
+- `arle serve` — unified front door that launches the matching serving binary
+  (`infer`, `metal_serve`, or `cpu_serve`) from the release artifact or PATH.
 - `arle train` — pretrain / SFT / GRPO / multi-turn / eval workflows.
 - `arle data` — dataset download and conversion utilities.
 
@@ -299,6 +330,7 @@ make check-metal  # Apple Silicon quick check
 - [docs/stability-policy.md](docs/stability-policy.md) — stability tiers and compatibility posture
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contributor setup, validation, release expectations
 - [docs/index.md](docs/index.md) — maintainer-facing PARA index, plans, and experience logs
+- [examples/](examples/) — copyable smoke paths for curl, Docker, Metal, and tiny train fixtures
 
 ## Metal on Apple Silicon
 
@@ -380,6 +412,16 @@ The CLI is agent-first: there is no separate chat mode and no `--tools`
 switch. Tool calling is the default runtime, and the same top-level entrypoint
 also fronts the train/eval/data subcommands that make the "agent reinforcement
 learning engine" identity concrete in day-to-day DX.
+Use `--no-tools` on either the top-level CLI or `arle run` when the local agent
+must answer without executing shell/python tools.
+
+Serving through the unified front door:
+
+```bash
+./target/release/arle serve --backend cuda --model-path /path/to/Qwen3-4B --port 8000
+./target/release/arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010
+./target/release/arle serve --backend cuda --model-path /path/to/Qwen3-4B -- --num-slots 8
+```
 
 Current package boundary behind the ARLE front door:
 
@@ -446,6 +488,8 @@ tiered-KV surface used by the HTTP scheduler; the main remaining
 model-specific limit is that hybrid `Qwen3.5` does not yet support cross-slot
 partial-prefix restore.
 On macOS, tool execution uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
+`arle --doctor` reports the active tool sandbox backend; if it reports `bare`,
+use `--no-tools` for untrusted prompts.
 
 On Apple Silicon, build the same CLI against the Metal backend:
 

@@ -197,6 +197,18 @@ impl ToolPolicy for BuiltinToolPolicy {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn tool_definitions(enabled: bool) -> Vec<ToolDefinition> {
+    if enabled {
+        builtin_tools()
+            .into_iter()
+            .map(|tool| tool.to_definition())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Process-wide cancel flag for an in-flight generation. Flipped by SIGINT;
 /// the streaming loop polls it and short-circuits on cancel.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -253,12 +265,27 @@ pub(crate) fn run_repl(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
+    tools_enabled: bool,
 ) -> Result<()> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        return run_interactive_repl(engine, backend_name, max_turns, max_tokens, temperature);
+        return run_interactive_repl(
+            engine,
+            backend_name,
+            max_turns,
+            max_tokens,
+            temperature,
+            tools_enabled,
+        );
     }
 
-    run_piped_repl(engine, backend_name, max_turns, max_tokens, temperature)
+    run_piped_repl(
+        engine,
+        backend_name,
+        max_turns,
+        max_tokens,
+        temperature,
+        tools_enabled,
+    )
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -269,6 +296,7 @@ pub(crate) fn run_one_shot(
     max_tokens: usize,
     temperature: f32,
     run_args: &RunArgs,
+    tools_enabled: bool,
 ) -> Result<()> {
     let prompt = resolve_one_shot_prompt(run_args)?;
     anyhow::ensure!(
@@ -276,10 +304,7 @@ pub(crate) fn run_one_shot(
         "one-shot prompt is empty; pass --prompt or pipe non-empty stdin to --stdin"
     );
 
-    let tools = builtin_tools()
-        .into_iter()
-        .map(|tool| tool.to_definition())
-        .collect::<Vec<_>>();
+    let tools = tool_definitions(tools_enabled);
     let mut session = AgentSession::new();
     let result = session.run_turn(
         engine,
@@ -474,11 +499,9 @@ fn run_interactive_repl(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
+    tools_enabled: bool,
 ) -> Result<()> {
-    let tools = builtin_tools()
-        .into_iter()
-        .map(|tool| tool.to_definition())
-        .collect::<Vec<_>>();
+    let tools = tool_definitions(tools_enabled);
     let mut session = AgentSession::new();
     let mut session_stats = SessionStats::default();
     let mut editor = DefaultEditor::new()?;
@@ -578,11 +601,9 @@ fn run_piped_repl(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
+    tools_enabled: bool,
 ) -> Result<()> {
-    let tools = builtin_tools()
-        .into_iter()
-        .map(|tool| tool.to_definition())
-        .collect::<Vec<_>>();
+    let tools = tool_definitions(tools_enabled);
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut session = AgentSession::new();

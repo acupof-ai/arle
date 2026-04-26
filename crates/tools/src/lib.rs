@@ -157,6 +157,36 @@ fn active_sandbox_backend() -> SandboxBackend {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolRuntimeReport {
+    pub enabled_by_default: bool,
+    pub builtin_tools: Vec<String>,
+    pub sandbox_backend: String,
+    pub sandboxed: bool,
+    pub timeout_secs: u64,
+    pub max_memory_mb: u64,
+    pub workdir: String,
+    pub python: String,
+}
+
+pub fn tool_runtime_report() -> ToolRuntimeReport {
+    let sandbox = SandboxConfig::default();
+    let backend = active_sandbox_backend();
+    ToolRuntimeReport {
+        enabled_by_default: true,
+        builtin_tools: BuiltinToolKind::ALL
+            .into_iter()
+            .map(|kind| kind.name().to_string())
+            .collect(),
+        sandbox_backend: backend.label().to_string(),
+        sandboxed: backend != SandboxBackend::Bare,
+        timeout_secs: sandbox.timeout_secs,
+        max_memory_mb: sandbox.max_memory_mb,
+        workdir: sandbox.workdir,
+        python: resolved_python_executable().display().to_string(),
+    }
+}
+
 fn default_env_path() -> String {
     std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string())
 }

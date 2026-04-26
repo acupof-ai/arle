@@ -1,0 +1,22 @@
+services:
+  arle:
+    image: ghcr.io/cklxx/arle:latest
+    command:
+      - serve
+      - --backend
+      - cuda
+      - --model-path
+      - /model
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${ARLE_MODEL_DIR:?set ARLE_MODEL_DIR to a local model directory}:/model:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

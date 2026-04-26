@@ -17,7 +17,9 @@ fn root_help_mentions_explicit_run_entrypoint() {
 
     let help = stdout(&output);
     assert!(help.contains("run"));
+    assert!(help.contains("serve"));
     assert!(help.contains("Start the interactive agent REPL."));
+    assert!(help.contains("Start the OpenAI-compatible server."));
     assert!(help.contains("Explicit alias for the interactive agent REPL."));
     assert!(help.contains("arle --doctor"));
     assert!(help.contains("arle train test --backend metal --json"));
@@ -37,7 +39,25 @@ fn run_help_exposes_one_shot_inputs() {
     assert!(help.contains("--prompt"));
     assert!(help.contains("--stdin"));
     assert!(help.contains("--json"));
+    assert!(help.contains("--no-tools"));
     assert!(help.contains("tool-call stats"));
+}
+
+#[test]
+fn serve_help_exposes_unified_server_frontdoor() {
+    let output = run_arle(&["serve", "--help"]);
+    assert!(
+        output.status.success(),
+        "arle serve --help failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let help = stdout(&output);
+    assert!(help.contains("--backend"));
+    assert!(help.contains("--model-path"));
+    assert!(help.contains("OpenAI-compatible serving"));
+    assert!(help.contains("arle serve --backend metal"));
 }
 
 #[test]
@@ -102,10 +122,11 @@ fn doctor_json_reports_schema_and_compiled_backend() {
 
     let value: serde_json::Value =
         serde_json::from_str(&stdout(&output)).expect("doctor output is valid json");
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], 3);
     assert_eq!(value["mode"], "doctor");
     assert!(value.get("compiled_backend").is_some());
     assert!(value.get("gpu").is_some());
+    assert!(value.get("tools").is_some());
     assert!(value.get("checks").is_some());
 }
 

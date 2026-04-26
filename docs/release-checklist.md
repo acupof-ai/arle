@@ -66,6 +66,7 @@ When the release surface changes:
   `scripts/package_macos_metal_artifact.sh`
 - for Metal-facing changes, make sure branch validation still covers the
   exact `cargo build --no-default-features --features metal,no-cuda --bin metal_serve --release`
+  path and the matching `cargo build --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle --release`
   path, not just library checks
 
 ---
@@ -74,8 +75,10 @@ When the release surface changes:
 
 Current release automation publishes:
 
-- Linux x86_64 CUDA artifacts
-- macOS arm64 Metal artifacts containing a top-level `metal_serve` binary
+- Linux x86_64 CUDA artifacts named `arle-<version>-linux-x86_64.tar.gz`
+  containing `arle`, `infer`, and `bench_serving`
+- macOS arm64 Metal artifacts named `arle-<version>-macos-arm64.tar.gz`
+  containing `arle` and `metal_serve`
 - branch CI uploads the same tarball layout for validation
 
 Before release, verify:
@@ -86,8 +89,10 @@ Before release, verify:
   packaging script used by release packaging
 - both workflows still call `scripts/package_macos_metal_artifact.sh`
 - artifact names are correct
-- packaged binaries are the intended ones (`infer` / `bench_serving` on Linux,
-  `metal_serve` inside the macOS tarball)
+- packaged binaries are the intended ones (`arle`, `infer`, `bench_serving` on
+  Linux; `arle`, `metal_serve` on macOS)
+- unpacked artifacts pass the local smoke check:
+  `./arle --doctor --json` and `./arle serve --help`
 
 ---
 
