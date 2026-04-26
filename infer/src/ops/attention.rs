@@ -5,9 +5,10 @@
 //!   - **INT8**: Custom split-KV kernel with fused INT8 dequant (`decode_attention_int8`)
 //!   - **FP8**: Custom split-KV kernel with FP8→FP32 cast (`decode_attention_fp8`)
 //!
-//! Prefill uses FlashInfer batch-forward with layout dispatch:
+//! Prefill uses FlashInfer batch-forward with layout dispatch by default:
 //!   - HD128: `flashinfer_batch_forward_with_layout` (Qwen3)
 //!   - HD256: `flashinfer_batch_forward_hd256` (Qwen3.5 full-attention layers)
+//!   - `tilelang-attn` swaps Qwen3 paged-prefill HD128 run dispatch to TileLang.
 //!
 //! Single-token decode uses Triton AOT kernel: fused QK-norm + RoPE + split-KV
 //! attention + online softmax + merge in one kernel launch.
@@ -582,9 +583,33 @@ pub(crate) fn prefill_attention_paged_batch(
     );
     let page_size = meta.page_size;
 
+    #[cfg(feature = "tilelang-attn")]
+    let tilelang_kernel = {
+        ensure!(
+            page_size == 16,
+            "tilelang-attn: prefill HD128 kernel requires page_size=16, got {page_size}"
+        );
+        match (num_q_heads, num_kv_heads) {
+            (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
+            (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
+            (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
+            (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
+            other => {
+                return Err(anyhow!(
+                    "tilelang-attn: no specialized prefill HD128 kernel for \
+                     (num_q_heads, num_kv_heads) = {other:?}; supported configs \
+                     are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
+                     in tools/tilelang/batch_prefill_paged_hd128.py, \
+                     TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
+                     and the FFI macro + this match in lockstep, then rebuild."
+                ));
+            }
+        }
+    };
+
     // Step 1: QK norm + RoPE + paged K/V write. The prep kernel is still
     // single-sequence, so we launch it once per packed sequence before the
-    // single batched FlashInfer run below.
+    // single batched paged-prefill run below.
     unsafe {
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
@@ -668,30 +693,10 @@ pub(crate) fn prefill_attention_paged_batch(
 
     #[cfg(feature = "tilelang-attn")]
     {
-        // HD128 + page_size=16 are already enforced by the function-level
-        // invariants above. (num_q_heads, num_kv_heads) picks the matching
-        // AOT-specialized kernel; unsupported configs fail loudly with a
-        // pointer to where to add the new specialization.
-        let kernel = match (num_q_heads, num_kv_heads) {
-            (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
-            (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
-            (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
-            (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
-            other => {
-                return Err(anyhow!(
-                    "tilelang-attn: no specialized prefill HD128 kernel for \
-                     (num_q_heads, num_kv_heads) = {other:?}; supported configs \
-                     are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
-                     in tools/tilelang/batch_prefill_paged_hd128.py, \
-                     TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
-                     and the FFI macro + this match in lockstep, then rebuild."
-                ));
-            }
-        };
         let max_qlen = meta.sequences.iter().map(|s| s.seq_len).max().unwrap_or(0) as i32;
         let sm_scale = 1.0_f32 / (head_dim as f32).sqrt();
         unsafe {
-            kernel(
+            tilelang_kernel(
                 q_u64 as *mut ffi::Half,
                 qoi_u64 as *const i32,
                 kp_u64 as *mut ffi::Half,
