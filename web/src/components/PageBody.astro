@@ -68,6 +68,20 @@ const s = locale.sections;
   <Cmd lines={s.synopsis.lines} lined={true} />
 </Section>
 
+<Section id="topology" title={s.topology.title}>
+  <div class="topo-shell">
+    <pre class="topo-art" aria-label="ARLE workspace topology">{s.topology.diagram}</pre>
+    <ul class="topo-legend">
+      {s.topology.legend.map((l) => (
+        <li>
+          <span class="topo-cap" set:html={l.cap} />
+          <span class="topo-body" set:html={l.body} />
+        </li>
+      ))}
+    </ul>
+  </div>
+</Section>
+
 <Section id="surfaces" title={s.surfaces.title}>
   <table class="why">
     <tbody>
@@ -79,6 +93,31 @@ const s = locale.sections;
       ))}
     </tbody>
   </table>
+</Section>
+
+<Section id="matrix" title={s.matrix.title}>
+  <p class="block" set:html={s.matrix.caption} />
+  <div class="matrix-wrap">
+    <table class="matrix">
+      <thead>
+        <tr>
+          {s.matrix.head.map((h) => (
+            <th>{h}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {s.matrix.rows.map((row) => (
+          <tr>
+            {row.map((cell, idx) => (
+              <td class={idx === 0 ? "m-key" : ""} set:html={cell} />
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+  <p class="note" set:html={s.matrix.note} />
 </Section>
 
 <Section id="status" title={s.status.title}>

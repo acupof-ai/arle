@@ -9,6 +9,21 @@ export type Signal = {
 export type Surface = { cap: string; body: string };
 export type StatusRow = { cap: string; body: string };
 
+export type MatrixCell = string; // raw HTML allowed
+export type MatrixRow = MatrixCell[];
+export type Topology = {
+  title: string;
+  diagram: string; // monospace ASCII, rendered in <pre>
+  legend: { cap: string; body: string }[];
+};
+export type Matrix = {
+  title: string;
+  caption: string;
+  head: string[];
+  rows: MatrixRow[];
+  note: string;
+};
+
 export type QuickCard = {
   title: string;
   lines: string[];
@@ -75,7 +90,9 @@ export type Locale = {
       cards: { h: string; body: string }[];
     };
     synopsis: { title: string; lines: string[] };
+    topology: Topology;
     surfaces: { title: string; rows: Surface[] };
+    matrix: Matrix;
     status: { title: string; rows: StatusRow[] };
     quickstart: {
       title: string;
@@ -134,6 +151,23 @@ const SIGNALS: Signal[] = [
   { kv: 'api=<code>openai-v1</code>', status: "ok" },
   { kv: 'doors=<code>1</code>', status: "ok" },
 ];
+
+// Workspace topology — ASCII diagram is locale-neutral; only labels around it
+// translate. Width is ~58 cols to fit narrow viewports without horizontal scroll
+// while staying legible on desktop.
+const TOPOLOGY_DIAGRAM = `   ┌────────────────────────────────────────────────────┐
+   │  arle   ·   one front door  (cli + repl)           │
+   └──┬─────────┬───────────┬──────────────┬────────────┘
+      │ run     │ serve     │ train        │ data
+      ▼         ▼           ▼              ▼
+   ┌────────────────────────────────────────────────────┐
+   │  infer  ·  runtime spine                           │
+   │  scheduler · model · ops · backend · http_server   │
+   └──┬─────────────────┬───────────────────┬───────────┘
+      ▼                 ▼                   ▼
+   cuda-kernels      mlx-sys             kv-native-sys
+   FlashInfer +      MLX C++ bridge      local KV-tier
+   Triton AOT        cmake + cc build    persistence`;
 
 // Demo terminal — same lines for both locales (commands stay in English).
 const DEMO_LINES_EN: DemoLine[] = [
@@ -263,8 +297,10 @@ export const EN: Locale = {
   },
   jumps: [
     { label: "[glance]", href: "#glance" },
+    { label: "[topology]", href: "#topology" },
     { label: "[synopsis]", href: "#synopsis" },
     { label: "[surfaces]", href: "#surfaces" },
+    { label: "[matrix]", href: "#matrix" },
     { label: "[status]", href: "#status" },
     { label: "[quickstart]", href: "#quickstart" },
     { label: "[examples]", href: "#examples" },
@@ -319,6 +355,15 @@ export const EN: Locale = {
         '<span class="ln">8</span><span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span>',
       ],
     },
+    topology: {
+      title: "TOPOLOGY",
+      diagram: TOPOLOGY_DIAGRAM,
+      legend: [
+        { cap: "front door", body: "<code>arle</code> fans out to <code>run</code>, <code>serve</code>, <code>train</code>, and <code>data</code> verbs &mdash; one stable CLI instead of a scatter of task binaries." },
+        { cap: "runtime spine", body: "<code>infer</code> owns scheduling, model loading, ops, backend dispatch, and the OpenAI-compatible HTTP surface." },
+        { cap: "kernel crates", body: "<code>cuda-kernels</code> ships the CUDA kernel + Triton AOT prelude; <code>mlx-sys</code> is the single Apple Silicon C++ bridge; <code>kv-native-sys</code> is the local KV-tier substrate." },
+      ],
+    },
     surfaces: {
       title: "SURFACES",
       rows: [
@@ -328,6 +373,40 @@ export const EN: Locale = {
         { cap: "<code>arle train</code>", body: "Pretrain, SFT, GRPO, multi-turn RL, and eval workflows through one front door instead of scattered train binaries." },
         { cap: "<code>arle data</code>", body: "Dataset download and schema conversion utilities that stay versioned with the same workspace and docs." },
       ],
+    },
+    matrix: {
+      title: "SUPPORT MATRIX",
+      caption:
+        "Three backends, one runtime contract. Authoritative truth lives in <a href=\"https://github.com/cklxx/arle/blob/main/docs/support-matrix.md\">docs/support-matrix.md</a>.",
+      head: ["backend", "stability", "os / hardware", "models", "quants", "api"],
+      rows: [
+        [
+          "<code>cuda</code>",
+          '<span class="m-ok">stable</span>',
+          "Linux + NVIDIA Ampere+",
+          "Qwen3 / Qwen3.5",
+          "FP16 / BF16, GGUF Q4_K",
+          "OpenAI v1",
+        ],
+        [
+          "<code>metal</code>",
+          '<span class="m-warn">beta</span>',
+          "Apple Silicon (M1+)",
+          "Qwen3 / Qwen3.5",
+          "FP16 / BF16, dense GGUF",
+          "OpenAI v1",
+        ],
+        [
+          "<code>cpu</code>",
+          '<span class="m-dim">dev only</span>',
+          "portable smoke",
+          "Qwen3 / Qwen3.5 (small)",
+          "FP16 / BF16",
+          "OpenAI v1",
+        ],
+      ],
+      note:
+        'Stable means CI-gated and shipped; beta means actively validated but uneven; dev-only is for smoke coverage on machines without a GPU.',
     },
     status: {
       title: "STATUS",
@@ -469,8 +548,10 @@ export const ZH: Locale = {
   },
   jumps: [
     { label: "[概览]", href: "#glance" },
+    { label: "[拓扑]", href: "#topology" },
     { label: "[概要]", href: "#synopsis" },
     { label: "[入口面]", href: "#surfaces" },
+    { label: "[支持矩阵]", href: "#matrix" },
     { label: "[状态]", href: "#status" },
     { label: "[快速开始]", href: "#quickstart" },
     { label: "[示例]", href: "#examples" },
@@ -525,6 +606,15 @@ export const ZH: Locale = {
         '<span class="ln">8</span><span class="p">$</span> ./target/release/arle data convert --help<span class="caret"></span>',
       ],
     },
+    topology: {
+      title: "拓扑",
+      diagram: TOPOLOGY_DIAGRAM,
+      legend: [
+        { cap: "前门", body: "<code>arle</code> 通过 <code>run</code>、<code>serve</code>、<code>train</code>、<code>data</code> 这几个动词分流，避免再为每个任务拉一个独立二进制。" },
+        { cap: "运行时主干", body: "<code>infer</code> 负责调度、模型加载、ops、后端 dispatch 与 OpenAI 兼容 HTTP 服务面。" },
+        { cap: "Kernel 子 crate", body: "<code>cuda-kernels</code> 汇集 CUDA kernel 与 Triton AOT prelude；<code>mlx-sys</code> 是 Apple Silicon 唯一的 C++ 桥；<code>kv-native-sys</code> 是本地 KV-tier 持久化基座。" },
+      ],
+    },
     surfaces: {
       title: "入口面",
       rows: [
@@ -534,6 +624,39 @@ export const ZH: Locale = {
         { cap: "<code>arle train</code>", body: "Pretrain、SFT、GRPO、多轮 RL 与 eval 共用一张前门，不再依赖分散的训练二进制。" },
         { cap: "<code>arle data</code>", body: "数据集下载与 schema 转换工具，和同一套 workspace、版本、文档一起演进。" },
       ],
+    },
+    matrix: {
+      title: "支持矩阵",
+      caption:
+        '三种后端，一份运行时契约。权威矩阵见 <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md">docs/support-matrix.md</a>。',
+      head: ["后端", "稳定度", "系统 / 硬件", "模型", "量化", "API"],
+      rows: [
+        [
+          "<code>cuda</code>",
+          '<span class="m-ok">stable</span>',
+          "Linux + NVIDIA Ampere+",
+          "Qwen3 / Qwen3.5",
+          "FP16 / BF16、GGUF Q4_K",
+          "OpenAI v1",
+        ],
+        [
+          "<code>metal</code>",
+          '<span class="m-warn">beta</span>',
+          "Apple Silicon（M1+）",
+          "Qwen3 / Qwen3.5",
+          "FP16 / BF16、dense GGUF",
+          "OpenAI v1",
+        ],
+        [
+          "<code>cpu</code>",
+          '<span class="m-dim">dev only</span>',
+          "便携冒烟",
+          "Qwen3 / Qwen3.5（小尺寸）",
+          "FP16 / BF16",
+          "OpenAI v1",
+        ],
+      ],
+      note: "stable = 已上 CI 与发版；beta = 持续验证但稳定性不齐；dev-only = 仅用于无 GPU 机器上的冒烟覆盖。",
     },
     status: {
       title: "状态",
