@@ -1,5 +1,14 @@
 [graph]
-all-features = true
+# Audit against the default feature set (cuda).
+#
+# We deliberately do NOT set `all-features = true`: `infer` exposes two
+# mutually exclusive features (`rdma-nixl` stub vs `rdma-nixl-real`) that
+# both alias the same `nixl-sys` crate, and `--all-features` activates them
+# together — which trips a `cargo metadata` "depends on the same crate
+# multiple times with different names" error before cargo-deny gets to run.
+# The non-default rdma-nixl path is the same upstream crate (just a
+# stub-vs-real link surface), so license/ban audit value is identical to
+# the default surface.
 
 [advisories]
 version = 2
