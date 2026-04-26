@@ -8,6 +8,7 @@ publish = false
 [features]
 cuda = ["dep:cudarc"]
 no-cuda = []
+tilelang-attn = ["cuda"]
 
 [dependencies]
 anyhow = "1.0"

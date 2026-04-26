@@ -40,3 +40,6 @@ bench = [
 observe = [
     "wandb>=0.19",
 ]
+tilelang = [
+    "tilelang>=0.1",
+]

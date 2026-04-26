@@ -65,6 +65,8 @@ qwen35-spec = { path = "../crates/qwen35-spec" }
 cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda"]
 # Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = ["cuda-kernels/no-cuda"]
+# TileLang prefill HD128 attention path. Compile-time A/B against FlashInfer.
+tilelang-attn = ["cuda", "cuda-kernels/tilelang-attn"]
 # Development-oriented CPU backend for serial smoke tests and local validation.
 cpu = []
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).
