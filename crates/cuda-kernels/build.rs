@@ -669,7 +669,7 @@ fn tilelang_target(sm_targets: &[String]) -> String {
         );
     }
 
-    format!("cuda:{max_sm}")
+    format!("cuda -arch=sm_{max_sm}")
 }
 
 fn generate_tilelang_artifacts(

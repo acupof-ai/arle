@@ -4,7 +4,7 @@ Inputs (CLI flags):
   --kernel-path    : .py module exposing get_kernel(num_q_heads, num_kv_heads)
   --kernel-name    : C function name (the wrapper exports `<name>_cuda`)
   --out-dir        : directory to write CUBIN + C wrapper into
-  --target         : "cuda:<sm>" (e.g. "cuda:90")
+  --target         : "cuda -arch=sm_<sm>" (e.g. "cuda -arch=sm_90")
   --out-name       : basename for the generated artifacts
   --num-q-heads    : Q-head count this AOT specialization is for
   --num-kv-heads   : KV-head count this AOT specialization is for
@@ -44,7 +44,7 @@ def load_kernel(kernel_path: str, num_q_heads: int, num_kv_heads: int):
 
 
 def parse_target(target: str) -> str:
-    if not target.startswith("cuda:"):
+    if not target.startswith("cuda"):
         raise ValueError(f"unsupported TileLang AOT target: {target}")
     return target
 
