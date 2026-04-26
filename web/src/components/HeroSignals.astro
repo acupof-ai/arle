@@ -1,0 +1,15 @@
+---
+import type { Signal } from "../data/content.ts";
+interface Props {
+  signals: Signal[];
+  ariaLabel?: string;
+}
+const { signals, ariaLabel = "project signals" } = Astro.props;
+---
+<div class="hero-signals" aria-label={ariaLabel}>
+  {signals.map((s) => (
+    <span class="sig">
+      <b>&#9656;</b><span class="sig-kv" set:html={s.kv} /><i class={`sig-dot sig-dot-${s.status}`} aria-hidden="true"></i>
+    </span>
+  ))}
+</div>

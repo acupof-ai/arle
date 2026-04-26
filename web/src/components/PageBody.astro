@@ -1,0 +1,131 @@
+---
+import type { Locale } from "../data/content.ts";
+import HeroAscii from "./HeroAscii.astro";
+import HeroSignals from "./HeroSignals.astro";
+import HeroCta from "./HeroCta.astro";
+import HeroTerminal from "./HeroTerminal.astro";
+import HeroPanel from "./HeroPanel.astro";
+import Section from "./Section.astro";
+import Cmd from "./Cmd.astro";
+import Jumps from "./Jumps.astro";
+import DocFooter from "./DocFooter.astro";
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const s = locale.sections;
+---
+
+<section class="hero" aria-label="banner">
+  <h1 class="sr-only">{locale.meta.title}</h1>
+  <div class="hero-shell">
+    <div class="hero-art">
+      <p class="hero-kicker">{locale.hero.kicker}</p>
+      <HeroAscii ariaLabel="ARLE — runtime-first Rust workspace" />
+      <p class="subline">{locale.hero.subline}</p>
+      <p class="tagline" set:html={locale.hero.tagline} />
+      <HeroSignals signals={locale.hero.signals} />
+      <HeroCta
+        primaryHref="#quickstart"
+        primaryLabel={locale.hero.primaryCta}
+        secondaryHref="https://github.com/cklxx/arle"
+        secondaryLabel={locale.hero.secondaryCta}
+      />
+    </div>
+    <HeroTerminal
+      kicker={locale.hero.demoKicker}
+      label={locale.hero.demoLabel}
+      lines={locale.hero.demoLines}
+    />
+  </div>
+  <HeroPanel
+    kicker={locale.hero.panelKicker}
+    title={locale.hero.panelTitle}
+    rows={locale.hero.metaRows}
+    note={locale.hero.panelNote}
+  />
+  <Jumps items={locale.jumps} lang={locale.langSwitch} />
+</section>
+
+<Section id="name" title={s.name.title}>
+  <p class="block" set:html={s.name.body} />
+  <p class="note" set:html={s.name.note} />
+</Section>
+
+<Section id="glance" title={s.glance.title}>
+  <div class="glance-grid">
+    {s.glance.cards.map((c) => (
+      <article class="mini-card">
+        <h3 set:html={`&mdash; ${c.h.replace(/^—\s*/, "")}`} />
+        <p set:html={c.body} />
+      </article>
+    ))}
+  </div>
+</Section>
+
+<Section id="synopsis" title={s.synopsis.title}>
+  <Cmd lines={s.synopsis.lines} lined={true} />
+</Section>
+
+<Section id="surfaces" title={s.surfaces.title}>
+  <table class="why">
+    <tbody>
+      {s.surfaces.rows.map((r) => (
+        <tr>
+          <td class="cap" set:html={r.cap} />
+          <td set:html={r.body} />
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</Section>
+
+<Section id="status" title={s.status.title}>
+  <table class="why">
+    <tbody>
+      {s.status.rows.map((r) => (
+        <tr>
+          <td class="cap" set:html={r.cap} />
+          <td set:html={r.body} />
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</Section>
+
+<Section id="quickstart" title={s.quickstart.title}>
+  <div class="quickgrid">
+    {s.quickstart.cards.map((c) => (
+      <article class="mini-card quick-card">
+        <h3 set:html={`&mdash; ${c.title.replace(/^—\s*/, "")}`} />
+        <Cmd lines={c.lines} />
+      </article>
+    ))}
+  </div>
+  <p class="note" set:html={s.quickstart.note} />
+</Section>
+
+<Section id="examples" title={s.examples.title}>
+  <p class="block" set:html={s.examples.lead} />
+  <Cmd lines={s.examples.lines} lined={true} />
+  <p class="note" set:html={s.examples.seeAlso} />
+</Section>
+
+<Section id="docs" title={s.files.title}>
+  <pre class="files" set:html={s.files.rows.map((r) => {
+    const pad = r.path.length < 36 ? " ".repeat(36 - r.path.length) : "  ";
+    return `<a href="${r.href}">${r.path}</a>${pad}${r.desc}`;
+  }).join("\n")}></pre>
+</Section>
+
+<Section id="see-also" title={s.seealso.title}>
+  <ul class="seealso">
+    {s.seealso.items.map((it) => (
+      <li set:html={it} />
+    ))}
+  </ul>
+  <p class="note" set:html={s.seealso.note} />
+</Section>
+
+<DocFooter cols={locale.docfoot.cols} meta={locale.docfoot.meta} />

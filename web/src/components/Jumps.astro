@@ -1,0 +1,34 @@
+---
+interface Item { label: string; href: string }
+interface Lang {
+  selfLabel: string;
+  other: { label: string; href: string; hreflang: string };
+}
+interface Props {
+  items: Item[];
+  lang: Lang;
+  langAriaLabel?: string;
+  navAriaLabel?: string;
+}
+const { items, lang, langAriaLabel = "language", navAriaLabel = "sections" } = Astro.props;
+const base = import.meta.env.BASE_URL;
+const otherHref = lang.other.href.startsWith("http") || lang.other.href.startsWith("#")
+  ? lang.other.href
+  : `${base}${lang.other.href}`;
+---
+<nav class="jumps" aria-label={navAriaLabel}>
+  {items.map((it) => (
+    <a href={it.href}>{it.label}</a>
+  ))}
+  <span class="lang" aria-label={langAriaLabel}>
+    {lang.selfLabel === "en" ? (
+      <>
+        <b>en</b> · <a href={otherHref} hreflang={lang.other.hreflang}>{lang.other.label}</a>
+      </>
+    ) : (
+      <>
+        <a href={otherHref} hreflang={lang.other.hreflang}>{lang.other.label}</a> · <b>zh</b>
+      </>
+    )}
+  </span>
+</nav>

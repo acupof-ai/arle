@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'site/**'
+      - 'web/**'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -24,8 +24,22 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: web
     steps:
       - uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build site
+        run: bun run build
 
       - name: Configure Pages
         uses: actions/configure-pages@v6
@@ -33,7 +47,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: site
+          path: web/dist
 
       - name: Deploy to GitHub Pages
         id: deployment

@@ -1,0 +1,42 @@
+---
+import "../styles/tokens.css";
+import "../styles/global.css";
+import type { Locale } from "../data/content.ts";
+import TermTabs from "../components/TermTabs.astro";
+import ManHead from "../components/ManHead.astro";
+import ManFoot from "../components/ManFoot.astro";
+import StatusLine from "../components/StatusLine.astro";
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const base = import.meta.env.BASE_URL;
+---
+<!doctype html>
+<html lang={locale.lang}>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{locale.meta.title}</title>
+<meta name="description" content={locale.meta.description} />
+<meta name="color-scheme" content="light dark" />
+<meta property="og:title" content={locale.meta.ogTitle} />
+<meta property="og:description" content={locale.meta.ogDescription} />
+<meta property="og:type" content="website" />
+<meta property="og:url" content={locale.meta.ogUrl} />
+<link rel="canonical" href={locale.meta.canonical} />
+<link rel="alternate" hreflang="en" href="https://cklxx.github.io/arle/" />
+<link rel="alternate" hreflang="zh-Hans" href="https://cklxx.github.io/arle/zh-cn/" />
+<link rel="icon" href={`${base}favicon.svg`} />
+</head>
+<body>
+<main class="page">
+  <TermTabs on={locale.termtabs.on} cwd={locale.termtabs.cwd} meta={locale.termtabs.meta} />
+  <ManHead left={locale.manhead.left} center={locale.manhead.center} right={locale.manhead.right} />
+  <slot />
+  <ManFoot left={locale.manfoot.left} center={locale.manfoot.center} right={locale.manfoot.right} />
+</main>
+<StatusLine segments={locale.statusline} />
+</body>
+</html>
