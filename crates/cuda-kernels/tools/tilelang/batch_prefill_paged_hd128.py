@@ -60,14 +60,20 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
         KV_indices: T.Tensor((T.symbolic("total_pages"),), index_dtype),
         KV_last_page_len: T.Tensor((T.symbolic("batch_size"),), index_dtype),
         Output: T.Tensor((T.symbolic("total_q_tokens"), num_q_heads * HEAD_DIM), dtype),
+        # TileLang 0.1.9 cannot use T.symbolic in grid extents — symbols
+        # there must come from a tensor shape or a kernel scalar arg.
+        # Pass batch / max_qlen as int32 runtime scalars instead, mirroring
+        # tile-ai/tilelang's example_gqa_fwd_varlen pattern.
+        batch_size: T.int32,
+        max_qlen: T.int32,
     ):
         # Grid: (q_tile_blocks_for_longest_request, num_q_heads, batch_size).
         # Each block handles BLOCK_M consecutive q rows of one request, for
         # one query head. KV pages walked sequentially via KV_indices.
         with T.Kernel(
-            T.ceildiv(T.symbolic("max_qlen"), BLOCK_M),
+            T.ceildiv(max_qlen, BLOCK_M),
             num_q_heads,
-            T.symbolic("batch_size"),
+            batch_size,
             threads=NUM_THREADS,
         ) as (bx, by, bz):
             q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), dtype)

@@ -553,6 +553,8 @@ macro_rules! tilelang_prefill_hd128_decl {
                     batch_size: i32,
                     total_q_tokens: i32,
                     max_qlen: i32,
+                    num_pages: i32,
+                    total_pages: i32,
                     num_q_heads: i32,
                     num_kv_heads: i32,
                     page_size: i32,
