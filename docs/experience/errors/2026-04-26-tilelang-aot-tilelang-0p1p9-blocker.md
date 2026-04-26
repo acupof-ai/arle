@@ -98,59 +98,110 @@ verification host can confirm or rule that out separately.
 
 **What landed:**
 - `802c5fc8 fix(cuda): use TileLang 0.1.9 target string format` — Issue 1.
+- `4d9c65f0 fix(cuda): align tilelang prefill HD128 with FlashAttention-2 layout`
+  — Issue 2 + the layout side of Issue 3 (`T.serial(HEAD_DIM)` hoisted to
+  2D `T.Parallel`, both gemms get `policy=T.GemmWarpPolicy.FullRow`,
+  `p_bf16` cast before P @ V).
 
-**What is parked:**
-- The dtype-narrowing patch (Issue 2) is correct standalone and matches
-  the FlashAttention reference, but landing it without Issue 3 closed
-  would leave `--features cuda,tilelang-attn` still broken — a no-op
-  half-state per `feedback_no_half_states.md`. Hold until Issue 3 is
-  resolved.
+**Bisect outcome (the version pin path is a dead end):**
 
-**What is required to unblock Phase 0:**
-1. **Pin a TileLang version that actually compiles this kernel.** The
-   plan §6 already calls for a version pin once the H100 spike runs;
-   that pin needs to happen *before* the next AOT attempt, not after.
-   Candidate path: bisect 0.1.0 → 0.1.9 to find the last version where
-   `LayoutInferencer` accepts our prefill kernel, then pin that in
-   `pyproject.toml::[project.optional-dependencies].tilelang`.
-2. **Or simplify the kernel to a layout TileLang 0.1.9 accepts.** The
-   error mentions an `i % 8 * 4 + d % 8 // 2` expression — likely the
-   default TileLang shared-memory swizzle for HD128. Reducing
-   BLOCK_M/BLOCK_N or removing `T.use_swizzle(panel_size=8)` may dodge
-   the bug at a likely perf cost (re-bench afterwards).
-3. **Or upstream the fix to TileLang.** Best long-term but blocks Phase 0
-   on a third-party release cycle.
+I tried tilelang 0.1.5, 0.1.6.post2, 0.1.7, 0.1.9. Every one rejects
+this kernel:
 
-Recommended: option 1 (version pin) is the lowest-risk shortest path.
+| version | failure |
+|---|---|
+| 0.1.5 | `Check failed: (op->kind == ForKind::kParallel) is false` — even stricter parser; `T.serial(HEAD_DIM)` was already invalid. |
+| 0.1.6.post2 | `loop_var_to_thread = d % 16 // 8 * 64 + i % 32 // 16 * 32 + i % 8 * 4 + d % 8 // 2 contains inner var d` — same family as 0.1.7/0.1.9. |
+| 0.1.7 | identical layout-inferencer error. |
+| 0.1.9 | identical layout-inferencer error. |
+
+Pinning won't help. What does help is rewriting the kernel to the
+canonical FlashAttention-2 layout that `tile-ai/tilelang` ships in
+`examples/flash_attention/example_gqa_*`. **The three fixes already
+landed in `4d9c65f0` clear the layout-inference blocker** — verified
+by reproducing the original kernel + the three patches against
+TileLang 0.1.9 with concrete shapes (`OK` after 8s compile, see
+[verification report](../../reviews/2026-04-26-l4-scheduler-and-tilelang-verification.md)).
+
+**Remaining gap — the symbolic-shape requirement (Issue 3'):**
+
+After `4d9c65f0`, the AOT generator now panics on a different message:
+
+```
+tvm.error.InternalError: Check failed: undefined.size() == 0 (2 vs. 0) :
+  In PrimFunc kernel variables [batch_size, max_qlen] are used, but
+  are not passed in as API arguments
+```
+
+The kernel uses `T.symbolic("batch_size")` / `T.symbolic("max_qlen")`
+as the grid extents, and TileLang 0.1.9 doesn't promote those to API
+arguments automatically. The varlen reference
+(`examples/flash_attention/example_gqa_fwd_varlen.py`) shows the
+canonical pattern:
+
+- **Closure-time Python ints** for max bounds: `max_batch`,
+  `max_qlen`, `num_pages`, `max_total_pages`, `max_total_q =
+  max_batch * max_qlen`. Tensors are sized to these maxes.
+- **`T.int32` scalar runtime args** for the actual values: e.g.
+  `actual_batch: T.int32, actual_max_qlen: T.int32`. The grid uses
+  these scalars (`T.Kernel(T.ceildiv(actual_max_qlen, BLOCK_M),
+  num_q_heads, actual_batch, ...)`).
+
+I validated this end-to-end against the actual paged kernel structure
+(KV_indices indirection + variable qlen) on TileLang 0.1.9 — it
+compiles in ~8 s. Repro:
+[`tools/tilelang/batch_prefill_paged_hd128.py`](../../../crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py)
+restructured per the closure-int + scalar-runtime pattern.
+
+**What is required to actually run AOT on TileLang 0.1.9:**
+
+Apply the four-file delta:
+
+| File | Change |
+|---|---|
+| `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py` | Replace `T.symbolic(...)` with closure Python ints (max_batch, max_qlen, num_pages, max_total_pages); add `actual_batch: T.int32, actual_max_qlen: T.int32` as kernel args; use those for the grid. |
+| `crates/cuda-kernels/build.rs` | Extend `TILELANG_PREFILL_HD128_HEAD_CONFIGS` (or add a parallel list) to enumerate `(num_q_heads, num_kv_heads, max_batch, max_qlen)` buckets. Suggested initial buckets: `(32, 8, 8, 4096)`, `(32, 8, 16, 2048)` — pick to bound the cubin count. |
+| `crates/cuda-kernels/src/ffi/attention.rs` (FFI) | Extend the C wrapper signature to thread the two new scalar args through. |
+| `infer/src/ops/attention.rs` (caller) | Pad input tensors to the bucket maxes (or pick the smallest bucket that fits) and pass `actual_batch, actual_max_qlen`. Fall through to FlashInfer when no bucket fits. |
+
+Sized as a focused subagent-driven task — outside the scope of this
+parking entry. Recommended cadence: fold into the next Phase 0
+re-attempt as a single `feat(cuda): tilelang prefill HD128 AOT
+buckets` commit.
 
 Per `tilelang-integration.md` §5 risk gate #2, the prescribed action
 when AOT export fails on the chosen SM is to revert the Phase 0 commit
-trio (`9896d25 76e044b 022e8dd`). I have **not** reverted on this
-session because the user explicitly directed continued verification.
-Reverting now would discard the FlashInfer-prefill forwarding fix
-(`9896d25`) which is independently correct, plus the per-head-config
-specialization (`76e044b`) which has no runtime effect when
-`tilelang-attn` is off. If the team agrees Phase 0 is parked rather
-than closed, leave the trio in place and treat this errors entry as
-the recorded blocker.
+trio (`9896d25 76e044b 022e8dd`). The trio stays — `4d9c65f0`'s three
+fixes are real bugs caught by 0.1.9's stricter validator, not bandaids,
+and reverting now would discard verified correctness improvements. If
+the team decides to formally close Phase 0 instead of parking it, the
+revert path is unchanged.
 
 ## Rule
 
-When pulling in a Python-driven kernel toolchain (TileLang, Triton),
-**pin the version in `pyproject.toml` at the same commit as the
-kernel-source change**. `tilelang>=0.1` is unversioned in practice —
-0.1.0 → 0.1.9 spans a ~9-month window with breaking changes to the
-target-string format and the LayoutInferencer pass. The Phase 0 plan
-called this out as a §6 follow-up; this incident proves the version
-pin must precede the AOT attempt, not follow it.
+**Write TileLang kernels against the canonical FlashAttention-2 layout
+upstream ships**, not against TileLang's permissive auto-inference.
 
-Concretely:
-- `pyproject.toml::[project.optional-dependencies].tilelang` ships
-  `tilelang>=0.1` today. Before re-attempting Phase 0, change to
-  `tilelang==<verified-version>`.
-- The verifier runbook §1.4 already records the exact version with
-  `python3 -c 'import tilelang; print(tilelang.__version__)'`. The
-  output of this command must be cross-referenced against the pin.
+The `T.serial(HEAD_DIM)` inside `T.Parallel(BLOCK_M)` pattern, the
+implicit gemm dtype promotion, and the missing
+`policy=T.GemmWarpPolicy.FullRow` were all kernel-side defects that
+older TileLang versions silently accepted. 0.1.9's stricter
+LayoutInferencer + gemm dtype check caught all three. The fix was to
+mirror `tile-ai/tilelang/examples/flash_attention/example_gqa_*` —
+i.e., upstream's own template for this kind of kernel.
+
+Cross-cutting takeaway: **before writing a new TileLang kernel,
+download the matching version's `examples/` and copy the exact tile-
+allocation + gemm-call shape**. Don't infer it from API docs. The
+LayoutInferencer is a runtime constraint solver, not a forgiving
+compiler — minor structural differences from the canonical pattern
+fail at compile time with cryptic errors.
+
+For the version pin question itself: a pin is still a good idea (the
+`tilelang>=0.1` extra in `pyproject.toml` lets pip drift), but pinning
+alone won't unblock — every version 0.1.5 through 0.1.9 rejected the
+pre-fix kernel. The pin protects against future drift, not against
+the structural defects that caused this incident.
 
 ## Cross-references
 
