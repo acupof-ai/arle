@@ -2282,7 +2282,10 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
     // ── 4. Invoke the batched kernel. ──
     let kernel_result = dflash::qwen35_dflash_speculative_block_batched(
         runtime,
-        &weights.embed_tokens,
+        weights
+            .embedding
+            .dense()
+            .context("Qwen3.5/Qwen3.6 DFlash requires dense target embeddings")?,
         &weights.lm_head,
         target_config,
         cpp_model,
@@ -3927,7 +3930,10 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     dflash.runtime,
                     token,
                     &target_hidden,
-                    &self.weights.embed_tokens,
+                    self.weights
+                        .embedding
+                        .dense()
+                        .context("Qwen3.5/Qwen3.6 DFlash requires dense target embeddings")?,
                     &self.weights.lm_head,
                     dflash.config,
                     cpp_model,

@@ -32,12 +32,15 @@ enum LinearKernelPlan {
     W8A16BatchGemv,
     Q3KGemv,
     Q4KGemv,
+    Q5KGemv,
     Q6KGemv,
     Q3KBatchGemv,
     Q4KBatchGemv,
+    Q5KBatchGemv,
     Q6KBatchGemv,
     Q3KDequantCublasGemm,
     Q4KDequantCublasGemm,
+    Q5KDequantCublasGemm,
     Q6KDequantCublasGemm,
     MarlinW4Gemm,
     TurboQuantGemv,
@@ -53,6 +56,7 @@ impl LinearKernelPlan {
             WeightFormat::W8A16 => Self::W8A16Gemv,
             WeightFormat::GgufQ3K => Self::Q3KGemv,
             WeightFormat::GgufQ4K => Self::Q4KGemv,
+            WeightFormat::GgufQ5K => Self::Q5KGemv,
             WeightFormat::GgufQ6K => Self::Q6KGemv,
             WeightFormat::TurboQuant => Self::TurboQuantGemv,
         }
@@ -78,9 +82,11 @@ impl LinearKernelPlan {
             (_, WeightFormat::W8A16) => Self::W8A16BatchGemv,
             (2..=8, WeightFormat::GgufQ3K) => Self::Q3KBatchGemv,
             (2..=8, WeightFormat::GgufQ4K) => Self::Q4KBatchGemv,
+            (2..=8, WeightFormat::GgufQ5K) => Self::Q5KBatchGemv,
             (2..=8, WeightFormat::GgufQ6K) => Self::Q6KBatchGemv,
             (_, WeightFormat::GgufQ3K) => Self::Q3KDequantCublasGemm,
             (_, WeightFormat::GgufQ4K) => Self::Q4KDequantCublasGemm,
+            (_, WeightFormat::GgufQ5K) => Self::Q5KDequantCublasGemm,
             (_, WeightFormat::GgufQ6K) => Self::Q6KDequantCublasGemm,
             (_, WeightFormat::TurboQuant) => Self::TurboQuantDequantCublasGemm,
         }
@@ -349,6 +355,9 @@ pub fn gemv(
                 }
                 LinearKernelPlan::Q4KGemv => {
                     ffi::q4k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
+                }
+                LinearKernelPlan::Q5KGemv => {
+                    ffi::q5k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
                 }
                 LinearKernelPlan::Q6KGemv => {
                     ffi::q6k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
@@ -788,6 +797,7 @@ fn run_qweight_linear(
         let res = match plan {
             LinearKernelPlan::Q3KDequantCublasGemm
             | LinearKernelPlan::Q4KDequantCublasGemm
+            | LinearKernelPlan::Q5KDequantCublasGemm
             | LinearKernelPlan::Q6KDequantCublasGemm => {
                 let ws_elems = weight.rows * weight.cols;
                 let mut workspace: CudaSlice<bf16> = ctx
@@ -803,6 +813,9 @@ fn run_qweight_linear(
                     LinearKernelPlan::Q4KDequantCublasGemm => {
                         ffi::q4k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
                     }
+                    LinearKernelPlan::Q5KDequantCublasGemm => {
+                        ffi::q5k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
+                    }
                     LinearKernelPlan::Q6KDequantCublasGemm => {
                         ffi::q6k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
                     }
@@ -813,6 +826,7 @@ fn run_qweight_linear(
             }
             LinearKernelPlan::Q3KGemv => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
             LinearKernelPlan::Q4KGemv => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernelPlan::Q5KGemv => ffi::q5k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
             LinearKernelPlan::Q6KGemv => ffi::q6k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
             LinearKernelPlan::W2A16Gemv => {
                 ffi::w2a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, group_size, stream)
@@ -828,6 +842,9 @@ fn run_qweight_linear(
             }
             LinearKernelPlan::Q4KBatchGemv => {
                 ffi::q4k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
+            }
+            LinearKernelPlan::Q5KBatchGemv => {
+                ffi::q5k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
             }
             LinearKernelPlan::Q6KBatchGemv => {
                 ffi::q6k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)

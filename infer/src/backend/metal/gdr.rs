@@ -86,9 +86,9 @@ impl MetalGdrConfig {
 #[cfg(feature = "metal")]
 pub struct MetalLinearAttnWeights {
     /// Merged QKV+Z projection: [qkv_dim + z_dim, hidden_size].
-    pub in_proj_qkvz: WeightTensor,
+    pub in_proj_qkvz: Option<WeightTensor>,
     /// Merged Beta+Alpha projection: [num_value_heads * 2, hidden_size].
-    pub in_proj_ba: WeightTensor,
+    pub in_proj_ba: Option<WeightTensor>,
     /// Individual projections used by the optional C++ step path.
     pub in_proj_qkv: WeightTensor,
     pub in_proj_z: WeightTensor,
@@ -184,7 +184,7 @@ impl MetalRecurrentState {
 #[cfg(feature = "metal")]
 #[inline]
 fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
-    use super::mlx::{matmul, quantized_matmul};
+    use super::mlx::{gguf_quantized_matmul, matmul, quantized_matmul};
     match weight {
         WeightTensor::Dense(w_t) => matmul(x, w_t),
         WeightTensor::Quantized {
@@ -194,7 +194,35 @@ fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
             group_size,
             bits,
         } => quantized_matmul(x, w, scales, biases, true, *group_size, *bits),
+        WeightTensor::GgufPacked {
+            w,
+            format,
+            rows,
+            cols,
+        } => gguf_quantized_matmul(x, w, format.as_i32(), *rows, *cols),
     }
+}
+
+#[cfg(feature = "metal")]
+fn is_gguf_packed(weight: &WeightTensor) -> bool {
+    matches!(weight, WeightTensor::GgufPacked { .. })
+}
+
+#[cfg(feature = "metal")]
+fn linear_attn_uses_gguf_packed(layer_weights: &MetalLinearAttnWeights) -> bool {
+    layer_weights
+        .in_proj_qkvz
+        .as_ref()
+        .is_some_and(is_gguf_packed)
+        || layer_weights
+            .in_proj_ba
+            .as_ref()
+            .is_some_and(is_gguf_packed)
+        || is_gguf_packed(&layer_weights.in_proj_qkv)
+        || is_gguf_packed(&layer_weights.in_proj_z)
+        || is_gguf_packed(&layer_weights.in_proj_b)
+        || is_gguf_packed(&layer_weights.in_proj_a)
+        || is_gguf_packed(&layer_weights.out_proj)
 }
 
 // ── Helper: RMS normalize ────────────────────────────────────────────────────
@@ -410,24 +438,24 @@ fn try_cpp_gdr_forward(
 
     // Extract quantized weight params. Bail to Rust path if any are Dense.
     let (qkvz_w, qkvz_s, qkvz_b, qkvz_gs, qkvz_bits) = match &lw.in_proj_qkvz {
-        WeightTensor::Quantized {
+        Some(WeightTensor::Quantized {
             w,
             scales,
             biases,
             group_size,
             bits,
-        } => (w, scales, biases, *group_size, *bits),
-        WeightTensor::Dense(_) => return None,
+        }) => (w, scales, biases, *group_size, *bits),
+        _ => return None,
     };
     let (ba_w, ba_s, ba_b, ba_gs, ba_bits) = match &lw.in_proj_ba {
-        WeightTensor::Quantized {
+        Some(WeightTensor::Quantized {
             w,
             scales,
             biases,
             group_size,
             bits,
-        } => (w, scales, biases, *group_size, *bits),
-        WeightTensor::Dense(_) => return None,
+        }) => (w, scales, biases, *group_size, *bits),
+        _ => return None,
     };
     let (out_w, out_s, out_b, out_gs, out_bits) = match &lw.out_proj {
         WeightTensor::Quantized {
@@ -437,7 +465,7 @@ fn try_cpp_gdr_forward(
             group_size,
             bits,
         } => (w, scales, biases, *group_size, *bits),
-        WeightTensor::Dense(_) => return None,
+        _ => return None,
     };
 
     let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
@@ -524,9 +552,13 @@ pub fn metal_gdr_decode_step(
 ) -> MlxArray {
     use super::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
 
-    // Try the optional C++ step path first; it requires fully quantized weights.
-    if let Some(result) = try_cpp_gdr_forward(x, layer_weights, state, layer_idx, config) {
-        return result;
+    let uses_gguf_packed = linear_attn_uses_gguf_packed(layer_weights);
+
+    // Try the optional C++ step path first; it requires affine-quantized weights.
+    if !uses_gguf_packed {
+        if let Some(result) = try_cpp_gdr_forward(x, layer_weights, state, layer_idx, config) {
+            return result;
+        }
     }
     // Fallback to Rust per-op path for Dense weights.
 
@@ -538,21 +570,38 @@ pub fn metal_gdr_decode_step(
     // ── 1. Projections (2 fused matmuls) ─────────────────────────────────
     let x_flat = reshape(x, &[1, 1, config.hidden_size as i32]);
 
-    let qkvz = linear(&x_flat, &layer_weights.in_proj_qkvz);
-    let (qkv_split, z_split) = layer_weights.qkvz_split;
-    // qkv: [1, 1, qkv_dim], z: [1, 1, z_dim]
-    let qkv = slice(&qkvz, &[0, 0, 0], &[1, 1, qkv_split], &[1, 1, 1]);
-    let z = slice(
-        &qkvz,
-        &[0, 0, qkv_split],
-        &[1, 1, qkv_split + z_split],
-        &[1, 1, 1],
-    );
+    let (qkv, z) = if let Some(qkvz_proj) = &layer_weights.in_proj_qkvz {
+        let qkvz = linear(&x_flat, qkvz_proj);
+        let (qkv_split, z_split) = layer_weights.qkvz_split;
+        (
+            slice(&qkvz, &[0, 0, 0], &[1, 1, qkv_split], &[1, 1, 1]),
+            slice(
+                &qkvz,
+                &[0, 0, qkv_split],
+                &[1, 1, qkv_split + z_split],
+                &[1, 1, 1],
+            ),
+        )
+    } else {
+        (
+            linear(&x_flat, &layer_weights.in_proj_qkv),
+            linear(&x_flat, &layer_weights.in_proj_z),
+        )
+    };
 
-    let ba = linear(&x_flat, &layer_weights.in_proj_ba);
     let nh = layer_weights.ba_num_heads;
-    let b_raw = slice(&ba, &[0, 0, 0], &[1, 1, nh], &[1, 1, 1]);
-    let a_raw = slice(&ba, &[0, 0, nh], &[1, 1, nh * 2], &[1, 1, 1]);
+    let (b_raw, a_raw) = if let Some(ba_proj) = &layer_weights.in_proj_ba {
+        let ba = linear(&x_flat, ba_proj);
+        (
+            slice(&ba, &[0, 0, 0], &[1, 1, nh], &[1, 1, 1]),
+            slice(&ba, &[0, 0, nh], &[1, 1, nh * 2], &[1, 1, 1]),
+        )
+    } else {
+        (
+            linear(&x_flat, &layer_weights.in_proj_b),
+            linear(&x_flat, &layer_weights.in_proj_a),
+        )
+    };
 
     // ── 2. Conv1d (standard mlx::conv1d, depthwise) ──────────────────────
     // qkv is [1, 1, qkv_dim] bf16 — same layout as mlx_lm
@@ -616,9 +665,10 @@ pub fn metal_gdr_decode_step(
     };
 
     // ── 5. Metal kernel GDR state update ─────────────────────────────────
-    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
-        .ok()
-        .is_none_or(|value| value != "0");
+    let use_metal_kernel = !uses_gguf_packed
+        && std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+            .ok()
+            .is_none_or(|value| value != "0");
 
     let y = if use_metal_kernel {
         // Reshape for kernel: q/k [1,1,Hk,Dk]→bf16, v [1,1,Hv,Dv]→bf16

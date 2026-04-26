@@ -253,6 +253,46 @@ __global__ void w8a16_gemv_batch_kernel(
     }
 }
 
+__global__ void q8_embedding_batched_kernel(
+    const int8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    const int* __restrict__ token_ids,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_dim,
+    int batch_size,
+    int group_size)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = hidden_dim * batch_size;
+    if (idx >= total) return;
+
+    const int batch = idx / hidden_dim;
+    const int col = idx - batch * hidden_dim;
+    const int row = token_ids[batch];
+    const int num_groups = hidden_dim / group_size;
+    const float scale = __bfloat162float(scales[row * num_groups + col / group_size]);
+    const int8_t q = weight[row * hidden_dim + col];
+    out[idx] = __float2bfloat16(static_cast<float>(q) * scale);
+}
+
+__global__ void q8_embedding_decode_kernel(
+    const int8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    const int* __restrict__ token_id,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_dim,
+    int group_size)
+{
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= hidden_dim) return;
+
+    const int row = token_id[0];
+    const int num_groups = hidden_dim / group_size;
+    const float scale = __bfloat162float(scales[row * num_groups + col / group_size]);
+    const int8_t q = weight[row * hidden_dim + col];
+    out[col] = __float2bfloat16(static_cast<float>(q) * scale);
+}
+
 // ============================================================================
 // Batched W4A16 GEMV: [B, K] × [N, K/2]^T → [B, N]
 // Same nibble extraction as single W4A16, with batch dimension in grid.y.
@@ -984,6 +1024,292 @@ __global__ void q4k_dequant_chunk_kernel(
 }
 
 // ============================================================================
+// Q5_K (GGUF Q5_K_M / Q5_K_S) native packed GEMV + dequant.
+//
+// One superblock = 256 K-dim elements = 176 bytes:
+//   d:f16(2) | dmin:f16(2) | scales_packed(12) | qh(32) | qs(128)
+//
+// Q5_K shares Q4_K's scale/min packing and element order. `qs` stores low
+// nibbles, while `qh[l]` contributes one high bit for each of the 8 sub-blocks.
+// ============================================================================
+#define Q5K_GEMV_ROWS 8
+#define Q5K_GEMV_THREADS 256
+#define Q5K_SB_SIZE 256
+#define Q5K_SB_BYTES 176
+
+__global__ void q5k_gemv_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int N, int K)
+{
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int row     = blockIdx.x * Q5K_GEMV_ROWS + warp_id;
+    if (row >= N) return;
+
+    const int num_sb = K / Q5K_SB_SIZE;
+    const int row_bytes = num_sb * Q5K_SB_BYTES;
+    const uint8_t* row_p = weight + row * row_bytes;
+
+    float sum = 0.0f;
+
+    for (int sb = 0; sb < num_sb; ++sb) {
+        const uint8_t* sb_p = row_p + sb * Q5K_SB_BYTES;
+        const unsigned short d_u16    = ((const unsigned short*)sb_p)[0];
+        const unsigned short dmin_u16 = ((const unsigned short*)sb_p)[1];
+        const float d    = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(&dmin_u16));
+
+        uint8_t sc[8], mn[8];
+        q4k_decode_scales(sb_p + 4, sc, mn);
+
+        const uint8_t* qh = sb_p + 16;
+        const uint8_t* qs = sb_p + 48;
+        const int k_base = sb * Q5K_SB_SIZE;
+
+        #pragma unroll
+        for (int iter = 0; iter < 4; ++iter) {
+            const int j_lo = iter * 2;
+            const int j_hi = j_lo + 1;
+            const float d1 = d * (float)sc[j_lo];
+            const float m1 = dmin * (float)mn[j_lo];
+            const float d2 = d * (float)sc[j_hi];
+            const float m2 = dmin * (float)mn[j_hi];
+            const uint8_t byte = qs[iter * 32 + lane];
+            const int q_lo = (int)(byte & 0x0F) | (((int)(qh[lane] >> j_lo) & 1) << 4);
+            const int q_hi = (int)(byte >> 4) | (((int)(qh[lane] >> j_hi) & 1) << 4);
+            sum += ((float)q_lo * d1 - m1) * __bfloat162float(input[k_base + j_lo * 32 + lane]);
+            sum += ((float)q_hi * d2 - m2) * __bfloat162float(input[k_base + j_hi * 32 + lane]);
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) output[row] = __float2bfloat16(sum);
+}
+
+__global__ void q5k_gemv_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K)
+{
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int row     = blockIdx.x * Q5K_GEMV_ROWS + warp_id;
+    const int batch   = blockIdx.y;
+    if (row >= N || batch >= B) return;
+
+    const int num_sb = K / Q5K_SB_SIZE;
+    const int row_bytes = num_sb * Q5K_SB_BYTES;
+    const uint8_t* row_p = weight + row * row_bytes;
+    const __nv_bfloat16* x = input + batch * K;
+
+    float sum = 0.0f;
+
+    for (int sb = 0; sb < num_sb; ++sb) {
+        const uint8_t* sb_p = row_p + sb * Q5K_SB_BYTES;
+        const unsigned short d_u16    = ((const unsigned short*)sb_p)[0];
+        const unsigned short dmin_u16 = ((const unsigned short*)sb_p)[1];
+        const float d    = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(&dmin_u16));
+
+        uint8_t sc[8], mn[8];
+        q4k_decode_scales(sb_p + 4, sc, mn);
+
+        const uint8_t* qh = sb_p + 16;
+        const uint8_t* qs = sb_p + 48;
+        const int k_base = sb * Q5K_SB_SIZE;
+
+        #pragma unroll
+        for (int iter = 0; iter < 4; ++iter) {
+            const int j_lo = iter * 2;
+            const int j_hi = j_lo + 1;
+            const float d1 = d * (float)sc[j_lo];
+            const float m1 = dmin * (float)mn[j_lo];
+            const float d2 = d * (float)sc[j_hi];
+            const float m2 = dmin * (float)mn[j_hi];
+            const uint8_t byte = qs[iter * 32 + lane];
+            const int q_lo = (int)(byte & 0x0F) | (((int)(qh[lane] >> j_lo) & 1) << 4);
+            const int q_hi = (int)(byte >> 4) | (((int)(qh[lane] >> j_hi) & 1) << 4);
+            sum += ((float)q_lo * d1 - m1) * __bfloat162float(x[k_base + j_lo * 32 + lane]);
+            sum += ((float)q_hi * d2 - m2) * __bfloat162float(x[k_base + j_hi * 32 + lane]);
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) output[batch * N + row] = __float2bfloat16(sum);
+}
+
+__global__ void q5k_dequant_chunk_kernel(
+    const uint8_t* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int N, int K, int k_start, int k_len)
+{
+    const int row = blockIdx.x;
+    const int sb_in_chunk = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (row >= N) return;
+
+    const int num_sb_total = K / Q5K_SB_SIZE;
+    const int sb_global = (k_start / Q5K_SB_SIZE) + sb_in_chunk;
+    const int row_bytes = num_sb_total * Q5K_SB_BYTES;
+    const uint8_t* sb_p = weight + row * row_bytes + sb_global * Q5K_SB_BYTES;
+
+    __shared__ float s_d;
+    __shared__ float s_dmin;
+    __shared__ uint8_t s_sc[8];
+    __shared__ uint8_t s_mn[8];
+
+    if (tid == 0) {
+        const unsigned short d_u16    = ((const unsigned short*)sb_p)[0];
+        const unsigned short dmin_u16 = ((const unsigned short*)sb_p)[1];
+        s_d    = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+        s_dmin = __half2float(*reinterpret_cast<const __half*>(&dmin_u16));
+        q4k_decode_scales(sb_p + 4, s_sc, s_mn);
+    }
+    __syncthreads();
+
+    const uint8_t* qh = sb_p + 16;
+    const uint8_t* qs = sb_p + 48;
+    const int iter = (tid >> 6) & 3;
+    const int half = (tid >> 5) & 1;
+    const int l = tid & 31;
+    const int sub = iter * 2 + half;
+    const uint8_t byte = qs[iter * 32 + l];
+    const int low = half ? (byte >> 4) : (byte & 0x0F);
+    const int q = low | ((((int)qh[l] >> sub) & 1) << 4);
+    const float w = (float)q * (s_d * (float)s_sc[sub]) - (s_dmin * (float)s_mn[sub]);
+
+    const int out_k = sb_in_chunk * Q5K_SB_SIZE + sub * 32 + l;
+    out[row * k_len + out_k] = __float2bfloat16(w);
+}
+
+__device__ __forceinline__ float q3k_value(const uint8_t* __restrict__ sb_p, int k_local)
+{
+    int8_t scales[16];
+    q3k_decode_scales(sb_p + 96, scales);
+    const unsigned short d_u16 = ((const unsigned short*)(sb_p + 108))[0];
+    const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+    const uint8_t* hmask = sb_p;
+    const uint8_t* qs = sb_p + 32;
+    const int q2 = (qs[k_local >> 2] >> ((k_local & 3) << 1)) & 0x3;
+    const int hbit = (hmask[k_local >> 3] >> (k_local & 7)) & 0x1;
+    const int q3 = q2 | (hbit << 2);
+    return d * (float)scales[k_local >> 4] * ((float)q3 - 4.0f);
+}
+
+__device__ __forceinline__ float q4k_value(const uint8_t* __restrict__ sb_p, int k_local)
+{
+    uint8_t sc[8], mn[8];
+    q4k_decode_scales(sb_p + 4, sc, mn);
+    const unsigned short d_u16 = ((const unsigned short*)sb_p)[0];
+    const unsigned short dmin_u16 = ((const unsigned short*)sb_p)[1];
+    const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(&dmin_u16));
+    const int iter = k_local >> 6;
+    const int half = (k_local >> 5) & 1;
+    const int l = k_local & 31;
+    const int sub = iter * 2 + half;
+    const uint8_t byte = sb_p[16 + iter * 32 + l];
+    const int q = half ? (byte >> 4) : (byte & 0x0F);
+    return (float)q * (d * (float)sc[sub]) - (dmin * (float)mn[sub]);
+}
+
+__device__ __forceinline__ float q5k_value(const uint8_t* __restrict__ sb_p, int k_local)
+{
+    uint8_t sc[8], mn[8];
+    q4k_decode_scales(sb_p + 4, sc, mn);
+    const unsigned short d_u16 = ((const unsigned short*)sb_p)[0];
+    const unsigned short dmin_u16 = ((const unsigned short*)sb_p)[1];
+    const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(&dmin_u16));
+    const int iter = k_local >> 6;
+    const int half = (k_local >> 5) & 1;
+    const int l = k_local & 31;
+    const int sub = iter * 2 + half;
+    const uint8_t byte = sb_p[48 + iter * 32 + l];
+    const int low = half ? (byte >> 4) : (byte & 0x0F);
+    const int q = low | ((((int)sb_p[16 + l] >> sub) & 1) << 4);
+    return (float)q * (d * (float)sc[sub]) - (dmin * (float)mn[sub]);
+}
+
+__device__ __forceinline__ float q6k_value(const uint8_t* __restrict__ sb_p, int k_local)
+{
+    const int half = k_local >> 7;
+    const int j_local = k_local & 127;
+    const int quad = j_local >> 5;
+    const int l = j_local & 31;
+    const int is = l >> 4;
+    const uint8_t* ql = sb_p + half * 64;
+    const uint8_t* qh = sb_p + 128 + half * 32;
+    uint8_t low4, high2;
+    switch (quad) {
+        case 0: low4 = ql[l] & 0x0F;      high2 = (qh[l] >> 0) & 0x03; break;
+        case 1: low4 = ql[l + 32] & 0x0F; high2 = (qh[l] >> 2) & 0x03; break;
+        case 2: low4 = ql[l] >> 4;        high2 = (qh[l] >> 4) & 0x03; break;
+        default: low4 = ql[l + 32] >> 4;  high2 = (qh[l] >> 6) & 0x03; break;
+    }
+    const int q = (int)(low4 | (high2 << 4)) - 32;
+    const int8_t sc = ((const int8_t*)(sb_p + 192))[half * 8 + is + quad * 2];
+    const unsigned short d_u16 = ((const unsigned short*)(sb_p + 208))[0];
+    const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+    return d * (float)sc * (float)q;
+}
+
+__global__ void qxk_embedding_batched_kernel(
+    const uint8_t* __restrict__ weight,
+    const int* __restrict__ token_ids,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_dim,
+    int batch_size,
+    int format,
+    int block_bytes)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = hidden_dim * batch_size;
+    if (tid >= total) return;
+    const int b = tid / hidden_dim;
+    const int k = tid - b * hidden_dim;
+    const int row = __ldg(&token_ids[b]);
+    const int num_sb = hidden_dim / 256;
+    const uint8_t* row_p = weight + row * num_sb * block_bytes;
+    const uint8_t* sb_p = row_p + (k >> 8) * block_bytes;
+    float value;
+    switch (format) {
+        case 3: value = q3k_value(sb_p, k & 255); break;
+        case 4: value = q4k_value(sb_p, k & 255); break;
+        case 5: value = q5k_value(sb_p, k & 255); break;
+        default: value = q6k_value(sb_p, k & 255); break;
+    }
+    out[tid] = __float2bfloat16(value);
+}
+
+__global__ void qxk_embedding_decode_kernel(
+    const uint8_t* __restrict__ weight,
+    const int* __restrict__ token_id,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_dim,
+    int format,
+    int block_bytes)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= hidden_dim) return;
+    const int row = __ldg(&token_id[0]);
+    const int num_sb = hidden_dim / 256;
+    const uint8_t* row_p = weight + row * num_sb * block_bytes;
+    const uint8_t* sb_p = row_p + (tid >> 8) * block_bytes;
+    float value;
+    switch (format) {
+        case 3: value = q3k_value(sb_p, tid & 255); break;
+        case 4: value = q4k_value(sb_p, tid & 255); break;
+        case 5: value = q5k_value(sb_p, tid & 255); break;
+        default: value = q6k_value(sb_p, tid & 255); break;
+    }
+    out[tid] = __float2bfloat16(value);
+}
+
+// ============================================================================
 // C API
 // ============================================================================
 extern "C" {
@@ -1173,6 +1499,174 @@ cudaError_t q4k_dequant_chunk_cuda(
     q4k_dequant_chunk_kernel<<<grid, block, 0, stream>>>(
         weight, out, N, K, k_start, k_len);
     return cudaGetLastError();
+}
+
+// ── Q5_K (GGUF) native packed ──
+
+cudaError_t q5k_gemv_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int N, int K, cudaStream_t stream)
+{
+    dim3 grid((N + Q5K_GEMV_ROWS - 1) / Q5K_GEMV_ROWS);
+    dim3 block(Q5K_GEMV_THREADS);
+    q5k_gemv_kernel<<<grid, block, 0, stream>>>(weight, input, output, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t q5k_gemv_batch_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int B, int N, int K, cudaStream_t stream)
+{
+    dim3 grid((N + Q5K_GEMV_ROWS - 1) / Q5K_GEMV_ROWS, B);
+    dim3 block(Q5K_GEMV_THREADS);
+    q5k_gemv_batch_kernel<<<grid, block, 0, stream>>>(weight, input, output, B, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t q5k_dequant_chunk_cuda(
+    const uint8_t* weight, __nv_bfloat16* out,
+    int N, int K, int k_start, int k_len, cudaStream_t stream)
+{
+    if ((k_start % Q5K_SB_SIZE) != 0 || (k_len % Q5K_SB_SIZE) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(N, k_len / Q5K_SB_SIZE);
+    dim3 block(Q5K_SB_SIZE);
+    q5k_dequant_chunk_kernel<<<grid, block, 0, stream>>>(
+        weight, out, N, K, k_start, k_len);
+    return cudaGetLastError();
+}
+
+cudaError_t q8_embedding_batched_cuda(
+    const int8_t* weight, const __nv_bfloat16* scales, const int* token_ids,
+    __nv_bfloat16* out, int hidden_dim, int batch_size, int group_size,
+    cudaStream_t stream)
+{
+    if (hidden_dim <= 0 || group_size <= 0 || (hidden_dim % group_size) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const int total = hidden_dim * batch_size;
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    q8_embedding_batched_kernel<<<grid, block, 0, stream>>>(
+        weight, scales, token_ids, out, hidden_dim, batch_size, group_size);
+    return cudaGetLastError();
+}
+
+cudaError_t q8_embedding_decode_cuda(
+    const int8_t* weight, const __nv_bfloat16* scales, const int* token_id,
+    __nv_bfloat16* out, int hidden_dim, int group_size, cudaStream_t stream)
+{
+    if (hidden_dim <= 0 || group_size <= 0 || (hidden_dim % group_size) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const int block = 256;
+    const int grid = (hidden_dim + block - 1) / block;
+    q8_embedding_decode_kernel<<<grid, block, 0, stream>>>(
+        weight, scales, token_id, out, hidden_dim, group_size);
+    return cudaGetLastError();
+}
+
+static cudaError_t qxk_embedding_batched_cuda(
+    const uint8_t* weight,
+    const int* token_ids,
+    __nv_bfloat16* out,
+    int hidden_dim,
+    int batch_size,
+    int format,
+    int block_bytes,
+    cudaStream_t stream)
+{
+    if ((hidden_dim % 256) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const int total = hidden_dim * batch_size;
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    qxk_embedding_batched_kernel<<<grid, block, 0, stream>>>(
+        weight, token_ids, out, hidden_dim, batch_size, format, block_bytes);
+    return cudaGetLastError();
+}
+
+static cudaError_t qxk_embedding_decode_cuda(
+    const uint8_t* weight,
+    const int* token_id,
+    __nv_bfloat16* out,
+    int hidden_dim,
+    int format,
+    int block_bytes,
+    cudaStream_t stream)
+{
+    if ((hidden_dim % 256) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const int block = 256;
+    const int grid = (hidden_dim + block - 1) / block;
+    qxk_embedding_decode_kernel<<<grid, block, 0, stream>>>(
+        weight, token_id, out, hidden_dim, format, block_bytes);
+    return cudaGetLastError();
+}
+
+cudaError_t q3k_embedding_batched_cuda(
+    const uint8_t* weight, const int* token_ids, __nv_bfloat16* out,
+    int hidden_dim, int batch_size, cudaStream_t stream)
+{
+    return qxk_embedding_batched_cuda(
+        weight, token_ids, out, hidden_dim, batch_size, 3, Q3K_SB_BYTES, stream);
+}
+
+cudaError_t q4k_embedding_batched_cuda(
+    const uint8_t* weight, const int* token_ids, __nv_bfloat16* out,
+    int hidden_dim, int batch_size, cudaStream_t stream)
+{
+    return qxk_embedding_batched_cuda(
+        weight, token_ids, out, hidden_dim, batch_size, 4, Q4K_SB_BYTES, stream);
+}
+
+cudaError_t q5k_embedding_batched_cuda(
+    const uint8_t* weight, const int* token_ids, __nv_bfloat16* out,
+    int hidden_dim, int batch_size, cudaStream_t stream)
+{
+    return qxk_embedding_batched_cuda(
+        weight, token_ids, out, hidden_dim, batch_size, 5, Q5K_SB_BYTES, stream);
+}
+
+cudaError_t q6k_embedding_batched_cuda(
+    const uint8_t* weight, const int* token_ids, __nv_bfloat16* out,
+    int hidden_dim, int batch_size, cudaStream_t stream)
+{
+    return qxk_embedding_batched_cuda(
+        weight, token_ids, out, hidden_dim, batch_size, 6, Q6K_SB_BYTES, stream);
+}
+
+cudaError_t q3k_embedding_decode_cuda(
+    const uint8_t* weight, const int* token_id, __nv_bfloat16* out,
+    int hidden_dim, cudaStream_t stream)
+{
+    return qxk_embedding_decode_cuda(weight, token_id, out, hidden_dim, 3, Q3K_SB_BYTES, stream);
+}
+
+cudaError_t q4k_embedding_decode_cuda(
+    const uint8_t* weight, const int* token_id, __nv_bfloat16* out,
+    int hidden_dim, cudaStream_t stream)
+{
+    return qxk_embedding_decode_cuda(weight, token_id, out, hidden_dim, 4, Q4K_SB_BYTES, stream);
+}
+
+cudaError_t q5k_embedding_decode_cuda(
+    const uint8_t* weight, const int* token_id, __nv_bfloat16* out,
+    int hidden_dim, cudaStream_t stream)
+{
+    return qxk_embedding_decode_cuda(weight, token_id, out, hidden_dim, 5, Q5K_SB_BYTES, stream);
+}
+
+cudaError_t q6k_embedding_decode_cuda(
+    const uint8_t* weight, const int* token_id, __nv_bfloat16* out,
+    int hidden_dim, cudaStream_t stream)
+{
+    return qxk_embedding_decode_cuda(weight, token_id, out, hidden_dim, 6, Q6K_SB_BYTES, stream);
 }
 
 }  // extern "C"

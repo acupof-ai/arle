@@ -1,5 +1,6 @@
 use super::mlx::{
-    MlxArray, async_eval, clear_cache, concatenate_axis, matmul, quantized_matmul, zeros,
+    MlxArray, async_eval, clear_cache, concatenate_axis, gguf_quantized_matmul, matmul,
+    quantized_matmul, zeros,
 };
 use super::weights::WeightTensor;
 
@@ -52,5 +53,11 @@ pub(super) fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
             // w stored as [out, in] packed uint32; transpose=true → x @ w.T
             quantized_matmul(x, w, scales, biases, true, *group_size, *bits)
         }
+        WeightTensor::GgufPacked {
+            w,
+            format,
+            rows,
+            cols,
+        } => gguf_quantized_matmul(x, w, format.as_i32(), *rows, *cols),
     }
 }

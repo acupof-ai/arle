@@ -175,6 +175,9 @@ impl MlxArray {
     pub fn from_slice_i32(data: &[i32], shape: &[i32]) -> Self {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Int32) }
     }
+    pub fn from_slice_u8(data: &[u8], shape: &[i32]) -> Self {
+        unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Uint8) }
+    }
     pub fn from_slice_f32(data: &[f32], shape: &[i32]) -> Self {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Float32) }
     }
@@ -427,6 +430,26 @@ pub fn dequantize(w: &MlxArray, s: &MlxArray, b: &MlxArray, gs: i32, bits: i32) 
     mlx_array_from_raw_or_panic(
         unsafe { mlx_sys::mlx_dequantize(w.0, s.0, b.0, gs, bits) },
         "mlx_dequantize",
+    )
+}
+
+pub fn gguf_quantized_matmul(
+    x: &MlxArray,
+    w: &MlxArray,
+    format: i32,
+    rows: i32,
+    cols: i32,
+) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_gguf_quantized_matmul(x.0, w.0, format, rows, cols) },
+        "mlx_gguf_quantized_matmul",
+    )
+}
+
+pub fn gguf_embedding(ids: &MlxArray, w: &MlxArray, format: i32, rows: i32, cols: i32) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_gguf_embedding(ids.0, w.0, format, rows, cols) },
+        "mlx_gguf_embedding",
     )
 }
 pub fn contiguous(a: &MlxArray) -> MlxArray {

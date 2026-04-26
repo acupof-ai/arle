@@ -182,6 +182,20 @@ unsafe extern "C" {
         group_size: i32,
         bits: i32,
     ) -> *mut mlx_array;
+    pub fn mlx_gguf_quantized_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        format: i32,
+        rows: i32,
+        cols: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_gguf_embedding(
+        ids: *mut mlx_array,
+        w: *mut mlx_array,
+        format: i32,
+        rows: i32,
+        cols: i32,
+    ) -> *mut mlx_array;
 
     // === Contiguous ===
 
@@ -346,6 +360,23 @@ unsafe extern "C" {
 
     pub fn qwen35_compiled_new() -> *mut std::ffi::c_void;
     pub fn qwen35_compiled_free(model: *mut std::ffi::c_void);
+    pub fn qwen35_compiled_add_dense_weight(model: *mut std::ffi::c_void, w: *mut mlx_array)
+    -> i32;
+    pub fn qwen35_compiled_add_affine_weight(
+        model: *mut std::ffi::c_void,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+    ) -> i32;
+    pub fn qwen35_compiled_add_gguf_weight(
+        model: *mut std::ffi::c_void,
+        w: *mut mlx_array,
+        format: i32,
+        rows: i32,
+        cols: i32,
+    ) -> i32;
     pub fn qwen35_compiled_set_config(
         model: *mut std::ffi::c_void,
         rope_theta: f32,
@@ -366,6 +397,18 @@ unsafe extern "C" {
         lm_gs: i32,
         lm_bits: i32,
     );
+    pub fn qwen35_compiled_set_embed_v2(
+        model: *mut std::ffi::c_void,
+        embed_tokens: *mut mlx_array,
+        final_norm_w: *mut mlx_array,
+        lm_head_id: i32,
+    );
+    pub fn qwen35_compiled_set_packed_embed_v2(
+        model: *mut std::ffi::c_void,
+        embed_id: i32,
+        final_norm_w: *mut mlx_array,
+        lm_head_id: i32,
+    );
     /// Set quantized embed weights for as_linear lm_head (tie_word_embeddings).
     pub fn qwen35_compiled_set_embed_as_linear(
         model: *mut std::ffi::c_void,
@@ -375,6 +418,7 @@ unsafe extern "C" {
         gs: i32,
         bits: i32,
     );
+    pub fn qwen35_compiled_set_embed_as_linear_v2(model: *mut std::ffi::c_void, embed_id: i32);
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_push_full_attn(
         model: *mut std::ffi::c_void,
@@ -405,6 +449,21 @@ unsafe extern "C" {
         dw_w: *mut mlx_array,
         dw_s: *mut mlx_array,
         dw_b: *mut mlx_array,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_push_full_attn_v2(
+        model: *mut std::ffi::c_void,
+        input_ln: *mut mlx_array,
+        post_ln: *mut mlx_array,
+        q_id: i32,
+        k_id: i32,
+        v_id: i32,
+        o_id: i32,
+        q_norm: *mut mlx_array,
+        k_norm: *mut mlx_array,
+        gate_up_id: i32,
+        gate_dim: i32,
+        down_id: i32,
     );
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_push_gdr(
@@ -448,6 +507,31 @@ unsafe extern "C" {
         dw_w: *mut mlx_array,
         dw_s: *mut mlx_array,
         dw_b: *mut mlx_array,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_push_gdr_v2(
+        model: *mut std::ffi::c_void,
+        input_ln: *mut mlx_array,
+        post_ln: *mut mlx_array,
+        qkvz_id: i32,
+        qkv_split: i32,
+        z_split: i32,
+        ba_id: i32,
+        ba_num_heads: i32,
+        conv1d_w: *mut mlx_array,
+        conv_kernel: i32,
+        a_log: *mut mlx_array,
+        dt_bias: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        gdr_rms_eps: f32,
+        out_id: i32,
+        num_key_heads: i32,
+        key_dim: i32,
+        num_value_heads: i32,
+        value_dim: i32,
+        gate_up_id: i32,
+        gate_dim: i32,
+        down_id: i32,
     );
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_set_last_moe_mlp(
@@ -510,6 +594,15 @@ unsafe extern "C" {
         up_s: *mut mlx_array,
         up_b: *mut mlx_array,
     );
+    pub fn qwen35_compiled_set_separate_proj_v2(
+        model: *mut std::ffi::c_void,
+        qkv_id: i32,
+        z_id: i32,
+        b_id: i32,
+        a_id: i32,
+        gate_id: i32,
+        up_id: i32,
+    );
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_set_separate_mlp(
         model: *mut std::ffi::c_void,
@@ -521,6 +614,11 @@ unsafe extern "C" {
         up_w: *mut mlx_array,
         up_s: *mut mlx_array,
         up_b: *mut mlx_array,
+    );
+    pub fn qwen35_compiled_set_separate_mlp_v2(
+        model: *mut std::ffi::c_void,
+        gate_id: i32,
+        up_id: i32,
     );
     pub fn qwen35_compiled_finalize(model: *mut std::ffi::c_void) -> i32;
     #[allow(clippy::too_many_arguments)]

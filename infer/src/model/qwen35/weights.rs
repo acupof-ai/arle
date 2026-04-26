@@ -454,7 +454,7 @@ impl Qwen35Model {
         };
         use crate::qwen35_gguf_host::Qwen35LinearGgufLayout;
         use crate::weight_loader::{
-            load_tensor_1d_gguf_offset_norm, load_tensor_2d_gguf, load_tensor_2d_gguf_bf16,
+            load_tensor_1d_gguf_offset_norm, load_tensor_2d_gguf,
             load_tensor_2d_gguf_v_reorder_rows, precompute_rope,
         };
 
@@ -482,11 +482,7 @@ impl Qwen35Model {
         let t_gpu = std::time::Instant::now();
         let wp = "model.language_model";
 
-        // embed_tokens is read directly via embedding_decode_cuda, which is
-        // NOT quant-aware — it would read from the 1-element dummy `.data`
-        // buffer of a packed matrix and produce garbage. Force BF16 load.
-        let embed_tokens =
-            load_tensor_2d_gguf_bf16(ctx, gguf, &format!("{wp}.embed_tokens.weight"))?;
+        let embed_tokens = load_tensor_2d_gguf(ctx, gguf, &format!("{wp}.embed_tokens.weight"))?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -509,20 +505,24 @@ impl Qwen35Model {
                     let ap = format!("{p}.linear_attn");
                     LayerKind::LinearAttention(LinearAttentionLayer {
                         in_proj_qkv: {
-                            let tensor = load_qwen35_qkv_matrix_bf16_host(
-                                gguf,
-                                &format!("{ap}.in_proj_qkv.weight"),
-                                num_k,
-                                vpk,
-                                hd_k,
-                                hd_v,
-                            )?;
-                            DeviceMatrix::from_host(
-                                ctx,
-                                &tensor.data,
-                                tensor.shape[0],
-                                tensor.shape[1],
-                            )?
+                            if vpk <= 1 {
+                                load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.in_proj_qkv.weight"))?
+                            } else {
+                                let tensor = load_qwen35_qkv_matrix_bf16_host(
+                                    gguf,
+                                    &format!("{ap}.in_proj_qkv.weight"),
+                                    num_k,
+                                    vpk,
+                                    hd_k,
+                                    hd_v,
+                                )?;
+                                DeviceMatrix::from_host(
+                                    ctx,
+                                    &tensor.data,
+                                    tensor.shape[0],
+                                    tensor.shape[1],
+                                )?
+                            }
                         },
                         in_proj_z: load_tensor_2d_gguf_v_reorder_rows(
                             ctx,
@@ -584,19 +584,23 @@ impl Qwen35Model {
                             ctx.stream.clone_htod(&tensor.data)?
                         },
                         out_proj: {
-                            let tensor = load_matrix_v_reorder_cols_bf16_host(
-                                gguf,
-                                &format!("{ap}.out_proj.weight"),
-                                num_k,
-                                vpk,
-                                hd_v,
-                            )?;
-                            DeviceMatrix::from_host(
-                                ctx,
-                                &tensor.data,
-                                tensor.shape[0],
-                                tensor.shape[1],
-                            )?
+                            if vpk <= 1 {
+                                load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.out_proj.weight"))?
+                            } else {
+                                let tensor = load_matrix_v_reorder_cols_bf16_host(
+                                    gguf,
+                                    &format!("{ap}.out_proj.weight"),
+                                    num_k,
+                                    vpk,
+                                    hd_v,
+                                )?;
+                                DeviceMatrix::from_host(
+                                    ctx,
+                                    &tensor.data,
+                                    tensor.shape[0],
+                                    tensor.shape[1],
+                                )?
+                            }
                         },
                     })
                 }

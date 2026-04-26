@@ -676,6 +676,17 @@ fn clone_weight_tensor(weight: &WeightTensor) -> WeightTensor {
             group_size: *group_size,
             bits: *bits,
         },
+        WeightTensor::GgufPacked {
+            w,
+            format,
+            rows,
+            cols,
+        } => WeightTensor::GgufPacked {
+            w: w.clone(),
+            format: *format,
+            rows: *rows,
+            cols: *cols,
+        },
     }
 }
 
@@ -703,6 +714,9 @@ fn extract_dflash_weight(
             *group_size,
             *bits,
         ),
+        WeightTensor::GgufPacked { .. } => {
+            panic!("DFlash draft model does not support packed GGUF weights")
+        }
     }
 }
 
@@ -2909,6 +2923,7 @@ mod tests {
             WeightTensor::Quantized {
                 scales, group_size, ..
             } => scales.shape()[1] * *group_size,
+            WeightTensor::GgufPacked { cols, .. } => *cols,
         }
     }
 
@@ -3352,7 +3367,10 @@ mod tests {
                 &runtime,
                 row_currents[row_idx],
                 &target_hidden_per_row[row_idx],
-                &weights.embed_tokens,
+                weights
+                    .embedding
+                    .dense()
+                    .context("Qwen3.5/Qwen3.6 DFlash requires dense target embeddings")?,
                 &weights.lm_head,
                 &target_config,
                 cpp_model,
@@ -3412,7 +3430,10 @@ mod tests {
         eprintln!("dflash_qwen35_verify_batched_matches_two_single_row_runs batched_start");
         let batched_results = qwen35_dflash_speculative_block_batched(
             &runtime,
-            &weights.embed_tokens,
+            weights
+                .embedding
+                .dense()
+                .context("Qwen3.5/Qwen3.6 DFlash requires dense target embeddings")?,
             &weights.lm_head,
             &target_config,
             cpp_model,

@@ -378,6 +378,8 @@ pub enum WeightFormat {
     GgufQ3K,
     /// GGUF Q4_K packed superblocks, scales embedded in each 256-wide block.
     GgufQ4K,
+    /// GGUF Q5_K packed superblocks, scales embedded in each 256-wide block.
+    GgufQ5K,
     /// GGUF Q6_K packed superblocks, scales embedded in each 256-wide block.
     GgufQ6K,
     /// TurboQuant packed indices + FP16 group norms + Hadamard signs.
@@ -402,7 +404,10 @@ impl WeightFormat {
 
     #[must_use]
     pub fn is_gguf_k_quant(self) -> bool {
-        matches!(self, Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ6K)
+        matches!(
+            self,
+            Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K
+        )
     }
 
     #[must_use]
@@ -422,13 +427,15 @@ impl WeightFormat {
                 n_multiple: 1,
                 group_size,
             },
-            Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ6K => WeightKernelAlignment {
-                weight_layout: "gguf.qk.row_major.superblock256",
-                scale_layout: "embedded.superblock",
-                k_multiple: 256,
-                n_multiple: 1,
-                group_size: 256,
-            },
+            Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K => {
+                WeightKernelAlignment {
+                    weight_layout: "gguf.qk.row_major.superblock256",
+                    scale_layout: "embedded.superblock",
+                    k_multiple: 256,
+                    n_multiple: 1,
+                    group_size: 256,
+                }
+            }
             Self::TurboQuant => WeightKernelAlignment {
                 weight_layout: "turboquant.row_major.group_packed",
                 scale_layout: "fp16[row, k/group_size]",
@@ -452,7 +459,7 @@ impl WeightFormat {
                 );
                 Ok(())
             }
-            Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ6K => {
+            Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K => {
                 ensure!(
                     cols.is_multiple_of(256),
                     "{self} requires cols % 256 == 0, got {cols}"
@@ -476,6 +483,7 @@ impl std::fmt::Display for WeightFormat {
             Self::W2A16 => f.write_str("w2a16"),
             Self::GgufQ3K => f.write_str("gguf_q3_k"),
             Self::GgufQ4K => f.write_str("gguf_q4_k"),
+            Self::GgufQ5K => f.write_str("gguf_q5_k"),
             Self::GgufQ6K => f.write_str("gguf_q6_k"),
             Self::TurboQuant => f.write_str("turboquant"),
         }
@@ -789,6 +797,59 @@ impl DeviceMatrix {
             rows,
             cols,
             weight_format: WeightFormat::GgufQ4K,
+            qweight: Some(qw),
+            qscales: Some(dummy_scales),
+            group_size: 256,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from Q5_K packed GGUF superblocks.
+    ///
+    /// Each 256-element superblock is 176 bytes:
+    /// d(2)|dmin(2)|scales(12)|qh(32)|qs(128).
+    pub fn from_quantized_q5k(
+        ctx: &DeviceContext,
+        packed_bytes: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        WeightFormat::GgufQ5K.validate_shape(rows, cols, 256)?;
+        let expected = rows * cols * 11 / 16; // (cols/256) * 176 per row
+        ensure!(
+            packed_bytes.len() == expected,
+            "Q5_K packed size {} != expected {} for rows={} cols={}",
+            packed_bytes.len(),
+            expected,
+            rows,
+            cols
+        );
+
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
+            })
+            .map_err(|e| anyhow!("H2D Q5_K packed upload failed: {}", e))?;
+        let dummy_scales: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc Q5_K dummy scales: {}", e))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            weight_format: WeightFormat::GgufQ5K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
             group_size: 256,

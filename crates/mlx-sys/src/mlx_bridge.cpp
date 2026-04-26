@@ -610,6 +610,248 @@ auto& verify_qmm_mma2big_kernel(int group_size) {
     }
 }
 
+std::string gguf_quant_source() {
+    return R"(
+        using namespace metal;
+
+        float gguf_f16(const device uint8_t* p) {
+            ushort bits = ushort(p[0]) | (ushort(p[1]) << 8);
+            return float(as_type<half>(bits));
+        }
+
+        int gguf_i8(uint8_t v) {
+            int x = int(v);
+            return x >= 128 ? x - 256 : x;
+        }
+
+        void gguf_q4_scales(const device uint8_t* s, thread uint8_t sc[8], thread uint8_t mn[8]) {
+            for (int i = 0; i < 4; ++i) {
+                sc[i] = s[i] & 0x3f;
+                mn[i] = s[i + 4] & 0x3f;
+            }
+            for (int i = 0; i < 4; ++i) {
+                sc[4 + i] = (s[8 + i] & 0x0f) | ((s[i] >> 6) << 4);
+                mn[4 + i] = (s[8 + i] >> 4) | ((s[i + 4] >> 6) << 4);
+            }
+        }
+
+        float gguf_q8_0_value(const device uint8_t* row, int k) {
+            int block = k >> 5;
+            int lane = k & 31;
+            const device uint8_t* p = row + block * 34;
+            return gguf_f16(p) * float(gguf_i8(p[2 + lane]));
+        }
+
+        float gguf_q4_k_value(const device uint8_t* row, int k) {
+            int sb = k >> 8;
+            int local = k & 255;
+            const device uint8_t* p = row + sb * 144;
+            float d = gguf_f16(p);
+            float dmin = gguf_f16(p + 2);
+            uint8_t sc[8], mn[8];
+            gguf_q4_scales(p + 4, sc, mn);
+            int iter = local >> 6;
+            int h = (local >> 5) & 1;
+            int lane = local & 31;
+            int sub = iter * 2 + h;
+            uint8_t byte = p[16 + iter * 32 + lane];
+            float q = h == 0 ? float(byte & 0x0f) : float(byte >> 4);
+            return q * (d * float(sc[sub])) - dmin * float(mn[sub]);
+        }
+
+        float gguf_q5_k_value(const device uint8_t* row, int k) {
+            int sb = k >> 8;
+            int local = k & 255;
+            const device uint8_t* p = row + sb * 176;
+            float d = gguf_f16(p);
+            float dmin = gguf_f16(p + 2);
+            uint8_t sc[8], mn[8];
+            gguf_q4_scales(p + 4, sc, mn);
+            const device uint8_t* qh = p + 16;
+            const device uint8_t* qs = p + 48;
+            int iter = local >> 6;
+            int h = (local >> 5) & 1;
+            int lane = local & 31;
+            int sub = iter * 2 + h;
+            uint8_t byte = qs[iter * 32 + lane];
+            int nib = h == 0 ? int(byte & 0x0f) : int(byte >> 4);
+            int hi = (int(qh[lane]) >> sub) & 1;
+            float q = float(nib | (hi << 4));
+            return q * (d * float(sc[sub])) - dmin * float(mn[sub]);
+        }
+
+        float gguf_q6_k_value(const device uint8_t* row, int k) {
+            int sb = k >> 8;
+            int local = k & 255;
+            const device uint8_t* p = row + sb * 210;
+            const device uint8_t* ql_all = p;
+            const device uint8_t* qh_all = p + 128;
+            const device uint8_t* scales_all = p + 192;
+            float d = gguf_f16(p + 208);
+            int h = local >> 7;
+            int rem = local & 127;
+            int lane = rem & 31;
+            const device uint8_t* ql = ql_all + h * 64;
+            const device uint8_t* qh = qh_all + h * 32;
+            const device uint8_t* sc = scales_all + h * 8;
+            int q;
+            int scale_idx;
+            if (rem < 32) {
+                q = int((ql[lane] & 0x0f) | ((qh[lane] & 0x03) << 4)) - 32;
+                scale_idx = lane / 16;
+            } else if (rem < 64) {
+                q = int((ql[lane + 32] & 0x0f) | (((qh[lane] >> 2) & 0x03) << 4)) - 32;
+                scale_idx = lane / 16 + 2;
+            } else if (rem < 96) {
+                q = int((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4)) - 32;
+                scale_idx = lane / 16 + 4;
+            } else {
+                q = int((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4)) - 32;
+                scale_idx = lane / 16 + 6;
+            }
+            return d * float(gguf_i8(sc[scale_idx])) * float(q);
+        }
+
+    )";
+}
+
+auto make_gguf_matmul_kernel(const std::string& name) {
+    return fast::metal_kernel(
+        name,
+        {"x", "w", "M_size", "K_size", "N_size"},
+        {"y"},
+        R"(
+        uint tid = thread_position_in_threadgroup.x;
+        uint n = threadgroup_position_in_grid.x;
+        uint m = threadgroup_position_in_grid.y;
+        int M = int(M_size);
+        int K = int(K_size);
+        int N = int(N_size);
+        if (m >= uint(M) || n >= uint(N)) {
+            return;
+        }
+
+        constexpr int TG = 256;
+        threadgroup float partial[TG];
+        int block_bytes;
+        if constexpr (FORMAT == 8) {
+            block_bytes = 34;
+        } else if constexpr (FORMAT == 12) {
+            block_bytes = 144;
+        } else if constexpr (FORMAT == 13) {
+            block_bytes = 176;
+        } else {
+            block_bytes = 210;
+        }
+        int block_size = FORMAT == 8 ? 32 : 256;
+        int row_bytes = (K / block_size) * block_bytes;
+        const device uint8_t* row = w + int(n) * row_bytes;
+
+        float sum = 0.0f;
+        for (int k = int(tid); k < K; k += TG) {
+            float wv;
+            if constexpr (FORMAT == 8) {
+                wv = gguf_q8_0_value(row, k);
+            } else if constexpr (FORMAT == 12) {
+                wv = gguf_q4_k_value(row, k);
+            } else if constexpr (FORMAT == 13) {
+                wv = gguf_q5_k_value(row, k);
+            } else {
+                wv = gguf_q6_k_value(row, k);
+            }
+            sum += float(x[int(m) * K + k]) * wv;
+        }
+        partial[tid] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = TG >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            y[int(m) * N + int(n)] = T(partial[0]);
+        }
+        )",
+        gguf_quant_source(),
+        true,
+        false);
+}
+
+auto& gguf_matmul_kernel(int format) {
+    switch (format) {
+        case 8: {
+            static auto kernel = make_gguf_matmul_kernel("gguf_q8_0_matmul");
+            return kernel;
+        }
+        case 12: {
+            static auto kernel = make_gguf_matmul_kernel("gguf_q4_k_matmul");
+            return kernel;
+        }
+        case 13: {
+            static auto kernel = make_gguf_matmul_kernel("gguf_q5_k_matmul");
+            return kernel;
+        }
+        case 14: {
+            static auto kernel = make_gguf_matmul_kernel("gguf_q6_k_matmul");
+            return kernel;
+        }
+        default:
+            throw std::invalid_argument("GGUF matmul supports Q8_0, Q4_K, Q5_K, and Q6_K only");
+    }
+}
+
+auto& gguf_embedding_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "gguf_embedding",
+        {"ids", "w", "T_size", "K_size", "N_size"},
+        {"y"},
+        R"(
+        uint idx = thread_position_in_grid.x;
+        int Tn = int(T_size);
+        int K = int(K_size);
+        int N = int(N_size);
+        if (idx >= uint(Tn * K)) {
+            return;
+        }
+        int token_idx = int(idx) / K;
+        int col = int(idx) - token_idx * K;
+        int row_id = int(ids[token_idx]);
+        if (row_id < 0 || row_id >= N) {
+            y[idx] = T(0);
+            return;
+        }
+        int block_bytes;
+        if constexpr (FORMAT == 8) {
+            block_bytes = 34;
+        } else if constexpr (FORMAT == 12) {
+            block_bytes = 144;
+        } else if constexpr (FORMAT == 13) {
+            block_bytes = 176;
+        } else {
+            block_bytes = 210;
+        }
+        int block_size = FORMAT == 8 ? 32 : 256;
+        int row_bytes = (K / block_size) * block_bytes;
+        const device uint8_t* row = w + row_id * row_bytes;
+        float value;
+        if constexpr (FORMAT == 8) {
+            value = gguf_q8_0_value(row, col);
+        } else if constexpr (FORMAT == 12) {
+            value = gguf_q4_k_value(row, col);
+        } else if constexpr (FORMAT == 13) {
+            value = gguf_q5_k_value(row, col);
+        } else {
+            value = gguf_q6_k_value(row, col);
+        }
+        y[idx] = T(value);
+        )",
+        gguf_quant_source(),
+        true,
+        false);
+    return kernel;
+}
+
 } // namespace
 
 array batched_sdpa_2pass_cpp(
@@ -765,6 +1007,92 @@ array verify_quantized_matmul_cpp(
 
     original_shape.back() = N;
     return reshape(y[0], original_shape);
+}
+
+array gguf_quantized_matmul_cpp(
+    const array& x,
+    const array& w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols) {
+    if (w.dtype() != uint8) {
+        throw std::invalid_argument("GGUF packed matmul requires uint8 packed weights");
+    }
+    if (x.dtype() != bfloat16 && x.dtype() != float16 && x.dtype() != float32) {
+        throw std::invalid_argument("GGUF packed matmul requires floating activations");
+    }
+    if (x.shape(x.ndim() - 1) != cols) {
+        throw std::invalid_argument("GGUF packed matmul input K does not match weight cols");
+    }
+    auto original_shape = x.shape();
+    int64_t m64 = 1;
+    for (int i = 0; i < x.ndim() - 1; ++i) {
+        m64 *= x.shape(i);
+    }
+    int M = static_cast<int>(m64);
+    auto x_2d = contiguous(reshape(x, {M, cols}));
+    auto w_q = contiguous(w);
+
+    std::vector<array> inputs = {
+        x_2d,
+        w_q,
+        array(M),
+        array(cols),
+        array(rows),
+    };
+    std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+        {"T", fast::TemplateArg(x_2d.dtype())},
+        {"FORMAT", fast::TemplateArg(format)},
+    };
+    auto y = gguf_matmul_kernel(format)(
+        inputs,
+        {Shape{M, rows}},
+        {x_2d.dtype()},
+        std::make_tuple(rows * 256, M, 1),
+        std::make_tuple(256, 1, 1),
+        tmpl,
+        std::nullopt,
+        false,
+        {});
+    original_shape.back() = rows;
+    return reshape(y[0], original_shape);
+}
+
+array gguf_embedding_cpp(
+    const array& ids,
+    const array& w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols) {
+    if (w.dtype() != uint8) {
+        throw std::invalid_argument("GGUF packed embedding requires uint8 packed weights");
+    }
+    auto ids_flat = contiguous(astype(flatten(ids), int32));
+    int tokens = ids_flat.size();
+    std::vector<array> inputs = {
+        ids_flat,
+        contiguous(w),
+        array(tokens),
+        array(cols),
+        array(rows),
+    };
+    std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+        {"T", fast::TemplateArg(bfloat16)},
+        {"FORMAT", fast::TemplateArg(format)},
+    };
+    auto y = gguf_embedding_kernel()(
+        inputs,
+        {Shape{tokens, cols}},
+        {bfloat16},
+        std::make_tuple(tokens * cols, 1, 1),
+        std::make_tuple(256, 1, 1),
+        tmpl,
+        std::nullopt,
+        false,
+        {});
+    auto out_shape = ids.shape();
+    out_shape.push_back(cols);
+    return reshape(y[0], out_shape);
 }
 
 extern "C" {
@@ -1198,6 +1526,26 @@ mlx_array* mlx_dequantize(mlx_array* w, mlx_array* scales, mlx_array* biases,
                           int32_t group_size, int32_t bits) {
     MLX_TRY_RETURN(from_arr(dequantize(*to_arr(w), *to_arr(scales), *to_arr(biases),
                                        group_size, bits)));
+}
+
+mlx_array* mlx_gguf_quantized_matmul(
+    mlx_array* x,
+    mlx_array* w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols) {
+    MLX_TRY_RETURN(from_arr(gguf_quantized_matmul_cpp(
+        *to_arr(x), *to_arr(w), format, rows, cols)));
+}
+
+mlx_array* mlx_gguf_embedding(
+    mlx_array* ids,
+    mlx_array* w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols) {
+    MLX_TRY_RETURN(from_arr(gguf_embedding_cpp(
+        *to_arr(ids), *to_arr(w), format, rows, cols)));
 }
 
 // === Fast ops ===

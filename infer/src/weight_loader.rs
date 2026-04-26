@@ -623,6 +623,44 @@ fn reorder_packed_v_rows(
     Ok(dst)
 }
 
+fn reorder_v_rows<T: Copy>(
+    src: &[T],
+    rows: usize,
+    row_elems: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+    hf_name: &str,
+) -> Result<Vec<T>> {
+    anyhow::ensure!(
+        src.len() == rows * row_elems,
+        "unexpected row element count for '{}': got {}, expected {}",
+        hf_name,
+        src.len(),
+        rows * row_elems
+    );
+    anyhow::ensure!(
+        rows == num_k_heads * num_v_per_k * head_dim,
+        "unexpected V-row count for '{}': got {}, expected {}",
+        hf_name,
+        rows,
+        num_k_heads * num_v_per_k * head_dim
+    );
+
+    let mut dst = src.to_vec();
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
+            let gguf_head = v * num_k_heads + k;
+            let hf_head = k * num_v_per_k + v;
+            let src_start = gguf_head * head_dim * row_elems;
+            let dst_start = hf_head * head_dim * row_elems;
+            let len = head_dim * row_elems;
+            dst[dst_start..dst_start + len].copy_from_slice(&src[src_start..src_start + len]);
+        }
+    }
+    Ok(dst)
+}
+
 /// Load a 2D GGUF tensor with Qwen3.5 V-head row reorder reversal.
 ///
 /// Q3_K/Q4_K/Q6_K can stay packed because the permutation moves whole rows,
@@ -648,6 +686,31 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
     };
 
     let force_bf16 = std::env::var_os("INFER_FORCE_BF16_QUANT").is_some();
+    if !force_bf16 && info.dtype == gguf::GgmlType::Q8_0 {
+        let (mut qweight, mut scales, group_size) = gguf.read_tensor_q8_packed(&gguf_name)?;
+        if num_v_per_k > 1 {
+            qweight = reorder_v_rows(
+                &qweight,
+                rows,
+                cols,
+                num_k_heads,
+                num_v_per_k,
+                head_dim,
+                hf_name,
+            )?;
+            scales = reorder_v_rows(
+                &scales,
+                rows,
+                cols / group_size,
+                num_k_heads,
+                num_v_per_k,
+                head_dim,
+                hf_name,
+            )?;
+        }
+        return DeviceMatrix::from_quantized_int8(ctx, &qweight, &scales, rows, cols, group_size);
+    }
+
     if !force_bf16 && cols % 256 == 0 {
         if info.dtype == gguf::GgmlType::Q4_K {
             let packed = gguf.read_tensor_q4k_packed(&gguf_name)?;
@@ -664,6 +727,23 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
                 hf_name,
             )?;
             return DeviceMatrix::from_quantized_q4k(ctx, &reordered, rows, cols);
+        }
+
+        if info.dtype == gguf::GgmlType::Q5_K {
+            let packed = gguf.read_tensor_q5k_packed(&gguf_name)?;
+            if num_v_per_k <= 1 {
+                return DeviceMatrix::from_quantized_q5k(ctx, &packed, rows, cols);
+            }
+            let reordered = reorder_packed_v_rows(
+                &packed,
+                rows,
+                cols * 11 / 16,
+                num_k_heads,
+                num_v_per_k,
+                head_dim,
+                hf_name,
+            )?;
+            return DeviceMatrix::from_quantized_q5k(ctx, &reordered, rows, cols);
         }
 
         if info.dtype == gguf::GgmlType::Q3_K {
@@ -772,6 +852,15 @@ pub(crate) fn load_tensor_2d_gguf(
         let ne1 = info.shape[1] as usize;
         let (rows, cols) = (ne1, ne0);
         return DeviceMatrix::from_quantized_q4k(ctx, &packed, rows, cols);
+    }
+
+    // Q5_K: keep packed — native q5k_gemv kernel.
+    if info.dtype == gguf::GgmlType::Q5_K && info.shape.len() == 2 {
+        let packed = gguf.read_tensor_q5k_packed(&gguf_name)?;
+        let ne0 = info.shape[0] as usize;
+        let ne1 = info.shape[1] as usize;
+        let (rows, cols) = (ne1, ne0);
+        return DeviceMatrix::from_quantized_q5k(ctx, &packed, rows, cols);
     }
 
     // Q3_K: keep packed — native q3k_gemv kernel.
