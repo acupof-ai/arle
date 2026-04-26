@@ -33,7 +33,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crate::types::BlockId;
 
 use super::backend::ClusterSharedBackend;
-use super::chunk::{KVBlock, KVHandle, KVSpanId, LayerRange, TokenRange};
+use super::chunk::{KVBlock, KVHandle, LayerRange, TokenRange};
 use super::io::{KVBackendCompletion, KVBackendFetch, KVBackendStore, KVPayload};
 use super::tier::BlockLocation;
 use super::transport::disk::{DiskBlockLocation, DiskStore};
@@ -47,7 +47,7 @@ pub mod events;
 #[path = "coordinator/types.rs"]
 pub mod types;
 
-pub use builder::{CoordinatorBuilder, CoordinatorHandle};
+pub use builder::{CoordinatorBuilder, CoordinatorHandle, NoOrchestrator, WithOrchestrator};
 pub use events::{
     CoordinatorCommand, CoordinatorEvent, FetchRequest, FetchedBlock, OrchestratorEvent,
     PrefetchAction, PrefetchPlan, PrefetchPlanRequest, StoreRequest, StoreTarget,
@@ -71,9 +71,9 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Construct a `Coordinator` from the parts assembled by
-    /// [`builder::CoordinatorBuilder::build_inner`]. Internal to the
-    /// coordinator subtree — external callers must go through the builder.
+    /// Construct a `Coordinator` from parts assembled by `builder::build_inner`.
+    /// Internal to the coordinator subtree — external callers must go through
+    /// the builder.
     pub(in crate::kv_tier::coordinator) fn assemble(
         rx: Receiver<CoordinatorCommand>,
         events: Sender<CoordinatorEvent>,
@@ -280,13 +280,8 @@ impl Coordinator {
                             );
                         }
                     };
-                    let handle = KVHandle::new(
-                        KVSpanId(u64::from(block.block_id.0)),
-                        block.block_id,
-                        location.clone(),
-                        0,
-                        payload_len,
-                    );
+                    let handle =
+                        KVHandle::new(None, block.block_id, location.clone(), 0, payload_len);
                     match cluster_shared_backend.exists(&handle) {
                         Ok(true) => {
                             locations.push((block.block_id, location));
@@ -543,7 +538,7 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| "coordinator remote store not configured".to_string())?;
         let handle = KVHandle::new(
-            KVSpanId(u64::from(block.block_id.0)),
+            None,
             block.block_id,
             block.source.clone(),
             0,
@@ -601,12 +596,7 @@ impl Coordinator {
                     CoordinatorCommand::Fetch { ticket, blocks } => {
                         Some(self.handle_fetch(*ticket, blocks)?)
                     }
-                    CoordinatorCommand::Shutdown => {
-                        self.events
-                            .send(CoordinatorEvent::CommandQueued(cmd.clone()))
-                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
-                        None
-                    }
+                    CoordinatorCommand::Shutdown => None,
                 };
                 if let (Some(ticket), Some(outcome)) = (queue_ticket, outcome) {
                     self.control.on_finish(ticket, outcome);

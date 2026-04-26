@@ -293,7 +293,7 @@ mod tests {
         )
         .with_fingerprint(fingerprint);
         let handle = KVHandle::new(
-            KVSpanId(3),
+            Some(KVSpanId(3)),
             block.block_id,
             BlockLocation::HostPinned { offset: 0 },
             1,
@@ -361,7 +361,7 @@ mod tests {
         let store = SharedFsStore::new(dir.path());
         let fingerprint = BlockFingerprint([0x52; 16]);
         let handle = KVHandle::new(
-            KVSpanId(5),
+            Some(KVSpanId(5)),
             crate::types::BlockId(13),
             SharedFsBlockLocation::new(fingerprint, 6)
                 .into_block_location()
@@ -382,7 +382,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SharedFsStore::new(dir.path());
         let mut op = SharedFsStore::ready_op(Ok(KVBackendCompletion::Deleted(KVHandle::new(
-            KVSpanId(0),
+            Some(KVSpanId(0)),
             crate::types::BlockId(0),
             BlockLocation::HostPinned { offset: 0 },
             0,

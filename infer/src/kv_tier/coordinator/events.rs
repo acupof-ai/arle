@@ -88,7 +88,6 @@ pub enum CoordinatorCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorEvent {
-    CommandQueued(CoordinatorCommand),
     StoreQueued {
         ticket: StoreTicket,
         block_count: usize,

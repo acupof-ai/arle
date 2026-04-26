@@ -754,7 +754,7 @@ mod tests {
         )
         .with_fingerprint(fingerprint);
         let host_handle = KVHandle::new(
-            KVSpanId(9),
+            Some(KVSpanId(9)),
             block.block_id,
             BlockLocation::HostPinned { offset: 0 },
             1,

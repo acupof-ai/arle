@@ -1153,8 +1153,7 @@ impl<M: ModelForward> Scheduler<M> {
         //   normal prefill path
         // - `FetchFailed` always falls back to cold prefill
         match event {
-            crate::kv_tier::CoordinatorEvent::CommandQueued(_)
-            | crate::kv_tier::CoordinatorEvent::FetchQueued { .. } => {}
+            crate::kv_tier::CoordinatorEvent::FetchQueued { .. } => {}
             crate::kv_tier::CoordinatorEvent::StoreQueued { ticket, .. } => {
                 if let Some(waiters) = self.store_waiting.get(&ticket) {
                     for (block_id, _) in waiters {

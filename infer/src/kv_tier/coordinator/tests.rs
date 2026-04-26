@@ -20,11 +20,8 @@ fn coordinator_receives_commands() {
     let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
     handle.send(CoordinatorCommand::Shutdown).unwrap();
     assert!(!coordinator.run_once().unwrap());
-    let evt = events.recv().unwrap();
-    assert_eq!(
-        evt,
-        CoordinatorEvent::CommandQueued(CoordinatorCommand::Shutdown)
-    );
+    // Shutdown does not emit a coordinator event; the channel stays empty.
+    assert!(events.try_recv().is_err());
 }
 
 #[test]
@@ -431,8 +428,9 @@ fn cancelled_fetch_updates_stats_and_reports_cancel_reason() {
 
 #[test]
 fn orchestrator_plan_classifies_tiers_without_touching_legacy_events() {
-    let (coordinator, handle, _events, orchestrator_events) =
-        CoordinatorBuilder::new(4).build_with_orchestrator();
+    let (coordinator, handle, _events, orchestrator_events) = CoordinatorBuilder::new(4)
+        .with_orchestrator_events()
+        .build();
     let ticket = handle
         .submit_prefetch_plan(vec![
             PrefetchPlanRequest {
@@ -512,8 +510,9 @@ fn orchestrator_plan_classifies_tiers_without_touching_legacy_events() {
 
 #[test]
 fn orchestrator_store_reports_remote_stub_failure() {
-    let (coordinator, handle, _events, orchestrator_events) =
-        CoordinatorBuilder::new(4).build_with_orchestrator();
+    let (coordinator, handle, _events, orchestrator_events) = CoordinatorBuilder::new(4)
+        .with_orchestrator_events()
+        .build();
     let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
         crate::kv_tier::HostPinnedPool::new(64).unwrap(),
     );
@@ -689,10 +688,8 @@ fn coordinator_builder_constructs_with_no_backends() {
     assert_eq!(handle.stats().capacity, 4);
     handle.send(CoordinatorCommand::Shutdown).unwrap();
     assert!(!coordinator.run_once().unwrap());
-    assert_eq!(
-        events.recv().unwrap(),
-        CoordinatorEvent::CommandQueued(CoordinatorCommand::Shutdown),
-    );
+    // Shutdown is silent on the event channel.
+    assert!(events.try_recv().is_err());
 }
 
 #[test]
