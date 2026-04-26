@@ -6,8 +6,8 @@ API shapes using a mock HTTP server. Integration tests against a real
 running infer server are skipped when no server is available.
 
 Run:
-    pytest tests/test_openai_api.py -v                   # mock only
-    INFER_URL=http://localhost:8000 pytest tests/test_openai_api.py -v  # + integration
+    pytest tests/python/test_openai_api.py -v                   # mock only
+    INFER_URL=http://localhost:8000 pytest tests/python/test_openai_api.py -v  # + integration
 """
 
 import json

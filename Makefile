@@ -54,7 +54,7 @@ test:
 	cargo test --no-default-features --features no-cuda -p infer --lib
 
 test-py:
-	pytest tests/ -x
+	pytest tests/python/ -x
 
 pre-push:
 	./scripts/pre_push_checks.sh

@@ -6,7 +6,7 @@ Tests sequence length tracking, prefix truncation, reset behavior, and TokenKVPo
 budget accounting without touching actual GPU memory.
 
 Run:
-    pytest tests/test_kv_cache.py -v
+    pytest tests/python/test_kv_cache.py -v
 """
 
 import pytest

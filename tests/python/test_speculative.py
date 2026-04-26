@@ -6,7 +6,7 @@ Tests the acceptance/rejection sampling algorithm, AcceptanceTracker,
 and expected_speedup formula.
 
 Run:
-    pytest tests/test_speculative.py -v
+    pytest tests/python/test_speculative.py -v
 """
 
 import math
