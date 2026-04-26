@@ -1,6 +1,6 @@
 # ARLE Roadmap
 
-Updated 2026-04-23.
+Updated 2026-04-26.
 
 This file is a derived planning surface. If it conflicts with a canonical
 document, the canonical document wins:
@@ -10,6 +10,14 @@ document, the canonical document wins:
 - architecture boundaries: [`docs/architecture.md`](docs/architecture.md)
 - benchmark process: [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md)
 - contributor operating contract: [`AGENTS.md`](AGENTS.md)
+
+## Released
+
+- **v0.1.0 — 2026-04-26.** First tagged release. CUDA Stable, Metal /
+  Metal DFlash Beta, Qwen3 + Qwen3.5, unified `arle` front door, Docker
+  image on GHCR, prebuilt Linux + macOS tarballs. See
+  [GitHub Release](https://github.com/cklxx/arle/releases/tag/v0.1.0)
+  and [`CHANGELOG.md` §0.1.0](CHANGELOG.md).
 
 ## Project Positioning
 
