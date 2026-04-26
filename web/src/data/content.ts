@@ -14,13 +14,39 @@ export type MatrixRow = MatrixCell[];
 export type Topology = {
   title: string;
   diagram: string; // monospace ASCII, rendered in <pre>
-  legend: { cap: string; body: string }[];
+  legend: { cap: string; body: string; href?: string }[];
 };
 export type Matrix = {
   title: string;
   caption: string;
   head: string[];
   rows: MatrixRow[];
+  note: string;
+};
+
+export type Install = {
+  title: string;
+  caption: string;
+  cards: {
+    label: string; // small kicker shown above the command
+    lines: string[]; // raw HTML allowed
+  }[];
+  note: string;
+};
+
+export type BenchRow = {
+  date: string;
+  backend: string;
+  model: string;
+  hardware: string;
+  metric: string; // raw HTML allowed
+  href: string;
+};
+export type Bench = {
+  title: string;
+  caption: string;
+  head: string[];
+  rows: BenchRow[];
   note: string;
 };
 
@@ -85,6 +111,7 @@ export type Locale = {
   };
   sections: {
     name: { title: string; body: string; note: string };
+    install: Install;
     glance: {
       title: string;
       cards: { h: string; body: string }[];
@@ -94,6 +121,7 @@ export type Locale = {
     surfaces: { title: string; rows: Surface[] };
     matrix: Matrix;
     status: { title: string; rows: StatusRow[] };
+    bench: Bench;
     quickstart: {
       title: string;
       cards: QuickCard[];
@@ -116,7 +144,6 @@ export type Locale = {
     cols: FooterCol[];
     meta: string;
   };
-  statusline: { label: string; href: string; cls?: string }[];
 };
 
 const FILES_EN = [
@@ -169,15 +196,16 @@ const TOPOLOGY_DIAGRAM = `   ┌────────────────
    FlashInfer +      MLX C++ bridge      local KV-tier
    Triton AOT        cmake + cc build    persistence`;
 
-// Demo terminal — same lines for both locales (commands stay in English).
+// Demo terminal — same lines for both locales. Lead with the runnable
+// install line so the hero shows action, not narration.
 const DEMO_LINES_EN: DemoLine[] = [
-  { html: '<span class="demo-prompt">$</span> arle --doctor' },
-  { html: '<span class="demo-ok">✓</span> <span class="demo-key">backend</span>=<span class="demo-val">cuda</span>     <span class="demo-comment"># FlashInfer + Triton AOT</span>' },
-  { html: '<span class="demo-ok">✓</span> <span class="demo-key">model</span>=<span class="demo-val">Qwen3-4B</span>   <span class="demo-comment"># resolved from $ARLE_MODEL</span>' },
-  { html: '<span class="demo-ok">✓</span> <span class="demo-key">kv</span>=<span class="demo-val">paged-16</span>      <span class="demo-comment"># radix tier T0..T3</span>' },
+  { html: '<span class="demo-prompt">$</span> docker run --gpus all -p 8000:8000 \\' },
+  { html: '<span class="demo-comment">    </span>-v /models/Qwen3-4B:/model:ro \\' },
+  { html: '<span class="demo-comment">    </span>ghcr.io/cklxx/arle:latest serve' },
+  { html: '<span class="demo-ok">✓</span> <span class="demo-key">backend</span>=<span class="demo-val">cuda</span>   <span class="demo-key">model</span>=<span class="demo-val">Qwen3-4B</span>   <span class="demo-key">paged</span>=<span class="demo-val">16</span>' },
   { html: '<span class="demo-ready">READY</span>' },
-  { html: '<span class="demo-prompt">$</span> arle serve --port 8000' },
-  { html: '<span class="demo-listen">listening</span> on <span class="demo-val">127.0.0.1:8000</span>   <span class="demo-comment">c=8 paged=16</span>' },
+  { html: '<span class="demo-listen">listening</span> on <span class="demo-val">127.0.0.1:8000</span>   <span class="demo-comment">openai-v1</span>' },
+  { html: '<span class="demo-prompt">$</span> curl -s :8000/v1/models | jq -r .data[0].id' },
 ];
 
 const DOCFOOT_EN: FooterCol[] = [
@@ -278,7 +306,7 @@ export const EN: Locale = {
     tagline:
       'One runtime authority. <span class="hl">infer</span> serves OpenAI-compatible traffic; <span class="hl">arle</span> fronts local agent, train, eval, and data workflows.',
     signals: SIGNALS,
-    primaryCta: "arle --doctor",
+    primaryCta: "Quickstart",
     secondaryCta: "cklxx/arle",
     panelKicker: "PUBLIC SURFACE",
     panelTitle: "<code>infer</code> serves. <code>arle</code> operates.",
@@ -296,13 +324,13 @@ export const EN: Locale = {
     demoLines: DEMO_LINES_EN,
   },
   jumps: [
+    { label: "[install]", href: "#install" },
     { label: "[glance]", href: "#glance" },
     { label: "[topology]", href: "#topology" },
-    { label: "[synopsis]", href: "#synopsis" },
-    { label: "[surfaces]", href: "#surfaces" },
     { label: "[matrix]", href: "#matrix" },
-    { label: "[status]", href: "#status" },
+    { label: "[bench]", href: "#bench" },
     { label: "[quickstart]", href: "#quickstart" },
+    { label: "[synopsis]", href: "#synopsis" },
     { label: "[examples]", href: "#examples" },
     { label: "[docs]", href: "#docs" },
     { label: "[github]", href: "https://github.com/cklxx/arle" },
@@ -316,9 +344,36 @@ export const EN: Locale = {
     name: {
       title: "NAME",
       body:
-        "<b>ARLE</b> — a runtime-first Rust workspace. <code>infer</code> is the dedicated serving binary; <code>arle</code> is the front door for local agent execution, training, evaluation, and dataset work.",
+        "<b>arle</b> — runtime-first Rust workspace. <code>infer</code> serves; <code>arle</code> operates.",
       note:
-        "This page stays deliberately stable. Detailed product truth lives in the repo docs linked below.",
+        "This page is the stable entry. Product truth lives in the repo docs linked below.",
+    },
+    install: {
+      title: "INSTALL",
+      caption:
+        "One runnable line per platform. Full quickstart with smoke tests &amp; train/data flows in <a href=\"#quickstart\">QUICKSTART</a>.",
+      cards: [
+        {
+          label: "CUDA · GPU container",
+          lines: [
+            '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
+            '    -v /path/to/Qwen3-4B:/model:ro \\',
+            '    ghcr.io/cklxx/arle:latest \\',
+            '    serve --backend cuda --model-path /model',
+          ],
+        },
+        {
+          label: "Source · Linux / Apple Silicon",
+          lines: [
+            '<span class="p">$</span> git clone https://github.com/cklxx/arle &amp;&amp; cd arle',
+            '<span class="p">$</span> ./setup.sh',
+            '<span class="p">$</span> cargo build --release --features cli --bin arle',
+            '<span class="p">$</span> ./target/release/arle serve --model-path /path/to/Qwen3-4B --port 8000',
+          ],
+        },
+      ],
+      note:
+        '<code>./setup.sh</code> bootstraps Rust, Python, Zig, and local checks. Apple Silicon? Swap <code>--features cli</code> → <code>--features metal,no-cuda,cli</code>.',
     },
     glance: {
       title: "AT A GLANCE",
@@ -359,9 +414,9 @@ export const EN: Locale = {
       title: "TOPOLOGY",
       diagram: TOPOLOGY_DIAGRAM,
       legend: [
-        { cap: "front door", body: "<code>arle</code> fans out to <code>run</code>, <code>serve</code>, <code>train</code>, and <code>data</code> verbs &mdash; one stable CLI instead of a scatter of task binaries." },
-        { cap: "runtime spine", body: "<code>infer</code> owns scheduling, model loading, ops, backend dispatch, and the OpenAI-compatible HTTP surface." },
-        { cap: "kernel crates", body: "<code>cuda-kernels</code> ships the CUDA kernel + Triton AOT prelude; <code>mlx-sys</code> is the single Apple Silicon C++ bridge; <code>kv-native-sys</code> is the local KV-tier substrate." },
+        { cap: "front door", href: "https://github.com/cklxx/arle/tree/main/crates/cli", body: "<code>arle</code> fans out to <code>run</code>, <code>serve</code>, <code>train</code>, and <code>data</code> verbs. One stable CLI instead of a scatter of task binaries." },
+        { cap: "runtime spine", href: "https://github.com/cklxx/arle/tree/main/infer/src", body: "<code>infer</code> owns scheduling, model loading, ops, backend dispatch, and the OpenAI-compatible HTTP surface." },
+        { cap: "kernel crates", href: "https://github.com/cklxx/arle/tree/main/crates", body: "<code>cuda-kernels</code> ships the CUDA kernel + Triton AOT prelude. <code>mlx-sys</code> is the single Apple Silicon C++ bridge. <code>kv-native-sys</code> is the local KV-tier substrate." },
       ],
     },
     surfaces: {
@@ -411,12 +466,37 @@ export const EN: Locale = {
     status: {
       title: "STATUS",
       rows: [
-        { cap: "Project posture", body: "Runtime-first. <code>infer</code> remains the primary serving surface; <code>arle</code> extends that same runtime into agent, train, eval, and data workflows." },
-        { cap: "Backends", body: "CUDA is the stable primary serving path on Linux + NVIDIA. Metal is beta on Apple Silicon. CPU is development-only for smoke coverage." },
-        { cap: "Models", body: "Qwen3 and Qwen3.5-4B ship today. Llama 3 / 4 and DeepSeek V3 / R1 remain planned, not implied." },
-        { cap: "HTTP", body: "<code>/v1/completions</code>, <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/metrics</code>, and <code>/v1/stats</code> are the stable public serving surface." },
-        { cap: "Bench program", body: 'Dated snapshots live under <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>; active CUDA closure work lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">the current decode-alignment plan</a>.' },
+        { cap: "Project posture", body: "Runtime-first. <code>infer</code> is the primary serving surface; <code>arle</code> extends the same runtime into agent, train, eval, and data flows." },
+        { cap: "Backends", body: "CUDA stable on Linux + NVIDIA Ampere+. Metal beta on Apple Silicon. CPU dev-only for smoke." },
+        { cap: "Models", body: "Qwen3 and Qwen3.5 ship today. Llama 3 / 4 and DeepSeek V3 / R1 remain planned, not implied." },
+        { cap: "HTTP", body: "<code>/v1/completions</code>, <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/metrics</code>, <code>/v1/stats</code> — stable public surface." },
+        { cap: "Bench program", body: 'Dated snapshots live in <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>. Tooling: <code>scripts/bench_guidellm.sh</code>, locked in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/guidellm-integration.md">guidellm-integration.md</a>.' },
       ],
+    },
+    bench: {
+      title: "BENCH",
+      caption:
+        'Dated snapshots straight from <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>. Numbers come out of <code>scripts/bench_guidellm.sh</code> and the canonical step-driver smokes &mdash; nothing is curated.',
+      head: ["date", "backend", "model", "hardware", "metric", ""],
+      rows: [
+        {
+          date: "2026-04-23",
+          backend: "cuda",
+          model: "Qwen3-4B",
+          hardware: "NVIDIA L4",
+          metric: 'ITL p50 <b>59.93 ms</b> &middot; out <b>118 tok/s</b> &middot; conc=16',
+          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-23-bench-guidellm-qwen3-4b-l4-c16-tier-prefetch-42ce889.md",
+        },
+        {
+          date: "2026-04-26",
+          backend: "metal",
+          model: "Qwen3.5-0.8B",
+          hardware: "Apple M-class",
+          metric: 'gen p50 <b>30.4 tok/s</b> &middot; step-driver, BF16',
+          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-26-bench-metal-qwen35-0p8b-gguf-vs-safetensors-local.md",
+        },
+      ],
+      note: 'See full snapshots for env, params, regression deltas, and the problems the bench surfaced. CUDA closure work currently lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">the decode-alignment plan</a>.',
     },
     quickstart: {
       title: "QUICKSTART",
@@ -498,13 +578,6 @@ export const EN: Locale = {
     meta:
       'Documentation site coming. For now everything stable lives in the <a href="https://github.com/cklxx/arle">repo</a>.',
   },
-  statusline: [
-    { label: "NOR", href: "#", cls: "sl-mode" },
-    { label: "arle/frontdoor", href: "#name", cls: "sl-accent" },
-    { label: "<span class=\"dot\"></span> runtime-first", href: "#status", cls: "sl-ok" },
-    { label: "gh:cklxx/arle", href: "https://github.com/cklxx/arle" },
-    { label: "releases", href: "https://github.com/cklxx/arle/releases" },
-  ],
 };
 
 export const ZH: Locale = {
@@ -529,7 +602,7 @@ export const ZH: Locale = {
     tagline:
       '一套运行时权威。<span class="hl">infer</span> 负责 OpenAI 兼容 serving；<span class="hl">arle</span> 负责本地 agent、训练、评测与数据工作流前门。',
     signals: SIGNALS,
-    primaryCta: "arle --doctor",
+    primaryCta: "Quickstart",
     secondaryCta: "cklxx/arle",
     panelKicker: "PUBLIC SURFACE",
     panelTitle: "<code>infer</code> 负责 serving，<code>arle</code> 负责操作前门。",
@@ -547,13 +620,13 @@ export const ZH: Locale = {
     demoLines: DEMO_LINES_EN,
   },
   jumps: [
+    { label: "[安装]", href: "#install" },
     { label: "[概览]", href: "#glance" },
     { label: "[拓扑]", href: "#topology" },
-    { label: "[概要]", href: "#synopsis" },
-    { label: "[入口面]", href: "#surfaces" },
     { label: "[支持矩阵]", href: "#matrix" },
-    { label: "[状态]", href: "#status" },
+    { label: "[基准]", href: "#bench" },
     { label: "[快速开始]", href: "#quickstart" },
+    { label: "[概要]", href: "#synopsis" },
     { label: "[示例]", href: "#examples" },
     { label: "[文档]", href: "#docs" },
     { label: "[github]", href: "https://github.com/cklxx/arle" },
@@ -567,9 +640,36 @@ export const ZH: Locale = {
     name: {
       title: "名称",
       body:
-        "<b>ARLE</b> — 以 runtime 为主干的 Rust workspace。<code>infer</code> 是专门的 serving 二进制；<code>arle</code> 是本地 agent、训练、评测与数据工作的统一前门。",
+        "<b>arle</b> — 以 runtime 为主干的 Rust workspace。<code>infer</code> 负责 serving，<code>arle</code> 负责操作。",
       note:
-        "这个页面只保留稳定入口职责；更细的产品真相请直接看下面列出的仓库文档。",
+        "这是一张稳定入口；产品真相在下面列出的仓库文档里。",
+    },
+    install: {
+      title: "安装",
+      caption:
+        '每个平台一行能跑的命令。完整的 quickstart、冒烟与 train/data 流程见 <a href="#quickstart">快速开始</a>。',
+      cards: [
+        {
+          label: "CUDA · GPU 容器",
+          lines: [
+            '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
+            '    -v /path/to/Qwen3-4B:/model:ro \\',
+            '    ghcr.io/cklxx/arle:latest \\',
+            '    serve --backend cuda --model-path /model',
+          ],
+        },
+        {
+          label: "源码 · Linux / Apple Silicon",
+          lines: [
+            '<span class="p">$</span> git clone https://github.com/cklxx/arle &amp;&amp; cd arle',
+            '<span class="p">$</span> ./setup.sh',
+            '<span class="p">$</span> cargo build --release --features cli --bin arle',
+            '<span class="p">$</span> ./target/release/arle serve --model-path /path/to/Qwen3-4B --port 8000',
+          ],
+        },
+      ],
+      note:
+        '<code>./setup.sh</code> 会引导 Rust、Python、Zig 和本地检查。Apple Silicon 把 <code>--features cli</code> 换成 <code>--features metal,no-cuda,cli</code>。',
     },
     glance: {
       title: "概览",
@@ -610,9 +710,9 @@ export const ZH: Locale = {
       title: "拓扑",
       diagram: TOPOLOGY_DIAGRAM,
       legend: [
-        { cap: "前门", body: "<code>arle</code> 通过 <code>run</code>、<code>serve</code>、<code>train</code>、<code>data</code> 这几个动词分流，避免再为每个任务拉一个独立二进制。" },
-        { cap: "运行时主干", body: "<code>infer</code> 负责调度、模型加载、ops、后端 dispatch 与 OpenAI 兼容 HTTP 服务面。" },
-        { cap: "Kernel 子 crate", body: "<code>cuda-kernels</code> 汇集 CUDA kernel 与 Triton AOT prelude；<code>mlx-sys</code> 是 Apple Silicon 唯一的 C++ 桥；<code>kv-native-sys</code> 是本地 KV-tier 持久化基座。" },
+        { cap: "前门", href: "https://github.com/cklxx/arle/tree/main/crates/cli", body: "<code>arle</code> 通过 <code>run</code>、<code>serve</code>、<code>train</code>、<code>data</code> 几个动词分流；不再为每个任务拉独立二进制。" },
+        { cap: "运行时主干", href: "https://github.com/cklxx/arle/tree/main/infer/src", body: "<code>infer</code> 负责调度、模型加载、ops、后端 dispatch 与 OpenAI 兼容 HTTP 服务面。" },
+        { cap: "Kernel 子 crate", href: "https://github.com/cklxx/arle/tree/main/crates", body: "<code>cuda-kernels</code> 汇集 CUDA kernel 与 Triton AOT prelude。<code>mlx-sys</code> 是 Apple Silicon 唯一的 C++ 桥。<code>kv-native-sys</code> 是本地 KV-tier 基座。" },
       ],
     },
     surfaces: {
@@ -661,12 +761,37 @@ export const ZH: Locale = {
     status: {
       title: "状态",
       rows: [
-        { cap: "项目姿态", body: "Runtime-first。<code>infer</code> 仍是主 serving 面；<code>arle</code> 在同一套运行时之上向 agent、train、eval、data 扩展。" },
-        { cap: "后端", body: "CUDA 是 Linux + NVIDIA 上的稳定主 serving 路径。Metal 在 Apple Silicon 上是 beta。CPU 仅用于开发态冒烟覆盖。" },
-        { cap: "模型", body: "当前已交付 Qwen3 与 Qwen3.5-4B。Llama 3 / 4 与 DeepSeek V3 / R1 仍是规划中，不做暗示性承诺。" },
-        { cap: "HTTP", body: "<code>/v1/completions</code>、<code>/v1/chat/completions</code>、<code>/v1/models</code>、<code>/metrics</code> 与 <code>/v1/stats</code> 是稳定公共服务面。" },
-        { cap: "Benchmark", body: '带日期的快照集中放在 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>；当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">当前 decode 对齐计划</a>。' },
+        { cap: "项目姿态", body: "Runtime-first。<code>infer</code> 是主 serving 面；<code>arle</code> 在同一套运行时之上向 agent、train、eval、data 扩展。" },
+        { cap: "后端", body: "CUDA 在 Linux + NVIDIA Ampere+ 上 stable。Metal 在 Apple Silicon 上 beta。CPU 仅用于冒烟。" },
+        { cap: "模型", body: "已交付 Qwen3 与 Qwen3.5。Llama 3 / 4 与 DeepSeek V3 / R1 仍是规划，不做暗示。" },
+        { cap: "HTTP", body: "<code>/v1/completions</code>、<code>/v1/chat/completions</code>、<code>/v1/models</code>、<code>/metrics</code>、<code>/v1/stats</code> — 稳定公共服务面。" },
+        { cap: "Bench 程序", body: '带日期快照在 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>。工具：<code>scripts/bench_guidellm.sh</code>，参数锁在 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/guidellm-integration.md">guidellm-integration.md</a>。' },
       ],
+    },
+    bench: {
+      title: "基准",
+      caption:
+        '直接来自 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a> 的带日期快照。数字出自 <code>scripts/bench_guidellm.sh</code> 与标准 step-driver 冒烟，未做挑选。',
+      head: ["日期", "后端", "模型", "硬件", "指标", ""],
+      rows: [
+        {
+          date: "2026-04-23",
+          backend: "cuda",
+          model: "Qwen3-4B",
+          hardware: "NVIDIA L4",
+          metric: 'ITL p50 <b>59.93 ms</b> &middot; 输出 <b>118 tok/s</b> &middot; conc=16',
+          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-23-bench-guidellm-qwen3-4b-l4-c16-tier-prefetch-42ce889.md",
+        },
+        {
+          date: "2026-04-26",
+          backend: "metal",
+          model: "Qwen3.5-0.8B",
+          hardware: "Apple M-class",
+          metric: 'gen p50 <b>30.4 tok/s</b> &middot; step-driver, BF16',
+          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-26-bench-metal-qwen35-0p8b-gguf-vs-safetensors-local.md",
+        },
+      ],
+      note: '完整环境、参数、回归 Δ 与 bench 暴露的问题请看快照本身。当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">decode 对齐计划</a>。',
     },
     quickstart: {
       title: "快速开始",
@@ -748,11 +873,4 @@ export const ZH: Locale = {
     meta:
       '完整文档站点正在筹备中，目前所有稳定信息都收口在 <a href="https://github.com/cklxx/arle">repo</a>。',
   },
-  statusline: [
-    { label: "NOR", href: "#", cls: "sl-mode" },
-    { label: "arle/frontdoor", href: "#name", cls: "sl-accent" },
-    { label: "<span class=\"dot\"></span> runtime-first", href: "#status", cls: "sl-ok" },
-    { label: "gh:cklxx/arle", href: "https://github.com/cklxx/arle" },
-    { label: "发版", href: "https://github.com/cklxx/arle/releases" },
-  ],
 };

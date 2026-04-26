@@ -27,7 +27,7 @@ const s = locale.sections;
       <p class="tagline" set:html={locale.hero.tagline} />
       <HeroSignals signals={locale.hero.signals} />
       <HeroCta
-        primaryHref="#quickstart"
+        primaryHref="#install"
         primaryLabel={locale.hero.primaryCta}
         secondaryHref="https://github.com/cklxx/arle"
         secondaryLabel={locale.hero.secondaryCta}
@@ -53,6 +53,19 @@ const s = locale.sections;
   <p class="note" set:html={s.name.note} />
 </Section>
 
+<Section id="install" title={s.install.title}>
+  <p class="block" set:html={s.install.caption} />
+  <div class="install-grid">
+    {s.install.cards.map((c) => (
+      <article class="mini-card install-card">
+        <p class="install-label">{c.label}</p>
+        <Cmd lines={c.lines} />
+      </article>
+    ))}
+  </div>
+  <p class="note" set:html={s.install.note} />
+</Section>
+
 <Section id="glance" title={s.glance.title}>
   <div class="glance-grid">
     {s.glance.cards.map((c) => (
@@ -64,17 +77,17 @@ const s = locale.sections;
   </div>
 </Section>
 
-<Section id="synopsis" title={s.synopsis.title}>
-  <Cmd lines={s.synopsis.lines} lined={true} />
-</Section>
-
 <Section id="topology" title={s.topology.title}>
   <div class="topo-shell">
     <pre class="topo-art" aria-label="ARLE workspace topology">{s.topology.diagram}</pre>
     <ul class="topo-legend">
       {s.topology.legend.map((l) => (
         <li>
-          <span class="topo-cap" set:html={l.cap} />
+          {l.href ? (
+            <a class="topo-cap" href={l.href} set:html={l.cap} />
+          ) : (
+            <span class="topo-cap" set:html={l.cap} />
+          )}
           <span class="topo-body" set:html={l.body} />
         </li>
       ))}
@@ -133,6 +146,34 @@ const s = locale.sections;
   </table>
 </Section>
 
+<Section id="bench" title={s.bench.title}>
+  <p class="block" set:html={s.bench.caption} />
+  <div class="matrix-wrap">
+    <table class="matrix bench-table">
+      <thead>
+        <tr>
+          {s.bench.head.map((h) => (
+            <th>{h}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {s.bench.rows.map((r) => (
+          <tr>
+            <td class="m-key">{r.date}</td>
+            <td><code>{r.backend}</code></td>
+            <td>{r.model}</td>
+            <td>{r.hardware}</td>
+            <td set:html={r.metric} />
+            <td><a class="bench-link" href={r.href}>snapshot &#x2197;</a></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+  <p class="note" set:html={s.bench.note} />
+</Section>
+
 <Section id="quickstart" title={s.quickstart.title}>
   <div class="quickgrid">
     {s.quickstart.cards.map((c) => (
@@ -143,6 +184,10 @@ const s = locale.sections;
     ))}
   </div>
   <p class="note" set:html={s.quickstart.note} />
+</Section>
+
+<Section id="synopsis" title={s.synopsis.title}>
+  <Cmd lines={s.synopsis.lines} lined={true} />
 </Section>
 
 <Section id="examples" title={s.examples.title}>

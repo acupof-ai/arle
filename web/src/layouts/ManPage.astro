@@ -5,7 +5,6 @@ import type { Locale } from "../data/content.ts";
 import TermTabs from "../components/TermTabs.astro";
 import ManHead from "../components/ManHead.astro";
 import ManFoot from "../components/ManFoot.astro";
-import StatusLine from "../components/StatusLine.astro";
 
 interface Props {
   locale: Locale;
@@ -37,6 +36,5 @@ const base = import.meta.env.BASE_URL;
   <slot />
   <ManFoot left={locale.manfoot.left} center={locale.manfoot.center} right={locale.manfoot.right} />
 </main>
-<StatusLine segments={locale.statusline} />
 </body>
 </html>
