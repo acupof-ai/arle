@@ -19,6 +19,45 @@ Related governance docs:
 
 ## [Unreleased]
 
+Post-v0.1.0 work landed on `main`; will be cut into the next release.
+
+- TileLang prefill HD128 path behind the `tilelang-attn` feature
+  (Experimental); per-Qwen3 head-config specialization; reaches the
+  prefill path correctly. H100 verification runbook landed.
+- macOS Metal link fix: `compiler-rt` now linked so mlx-sys resolves
+  `__isPlatformVersionAtLeast`; release tarballs and Metal CI now build
+  cleanly on hosted runners.
+- `release.yml` now installs `flashinfer-python` (in lockstep with
+  Dockerfile) so Linux CUDA tarballs build without the
+  `flashinfer/pos_enc.cuh` not-found regression.
+- `docs/support-matrix.md` §4b now documents the multi-turn KV reuse /
+  tiered-KV stability tiers (T0 GPU Supported, T1 host-pinned Beta,
+  T2 NVMe Beta, T3 cluster-shared Experimental — NIXL stub-only).
+- `docs/experience/wins/README.md` explains the `*pending-remote*.md`
+  filename convention so external readers do not mistake stubs for
+  published claims.
+- `docs/troubleshooting.md` and `docs/comparison.md` added; README
+  slimmed and split on macOS-default-features and on the GHCR tag
+  format (no `v` prefix).
+- `cargo build` no longer requires an explicit backend feature on
+  macOS — `default = ["cuda"]` was dropped from the workspace,
+  `agent-infer`, and `crates/cli` so a flag-less build no longer pulls
+  cudarc on platforms without nvcc.
+- Standalone `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn`
+  / `eval_lm` / `download_dataset` / `convert_dataset` binaries removed
+  from `crates/train`; `arle train …` and `arle data …` are the single
+  front door (sources still in `crates/train/src/bin/*.rs` as
+  in-process dispatch modules under `autobins = false`).
+- Astro/Vite landing site at `web/` (deploys via `pages.yml` to
+  `https://cklxx.github.io/arle/`); homepage IA refactor — runnable
+  hero, dated bench, dropped chrome.
+
+## [0.1.0] — 2026-04-26
+
+First tagged release. Pre-built artifacts live on the
+[GitHub Release page](https://github.com/cklxx/arle/releases/tag/v0.1.0)
+and on GHCR (`ghcr.io/cklxx/arle:0.1.0`, `:0.1`, `:latest`).
+
 ### 2026-04-26 — Open-source usability and `arle` front door cleanup
 
 #### CLI / DX
