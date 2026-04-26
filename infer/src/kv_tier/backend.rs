@@ -87,31 +87,43 @@ pub enum ClusterSharedBackend {
     Nixl(Arc<NixlTransport>),
 }
 
+// `enum_dispatch` would be the natural fit, but it panics on traits with
+// associated types (`KVBackend::Op` differs per variant). We collapse the
+// per-variant match boilerplate through these two local macros instead.
+macro_rules! dispatch {
+    ($self:expr, $store:ident => $body:expr) => {
+        match $self {
+            Self::SharedFs($store) => $body,
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
+            Self::Nixl($store) => $body,
+        }
+    };
+}
+macro_rules! dispatch_op {
+    ($self:expr, $store:ident => $call:expr) => {
+        match $self {
+            Self::SharedFs($store) => $call.map(ClusterSharedBackendOp::SharedFs),
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
+            Self::Nixl($store) => $call.map(ClusterSharedBackendOp::Nixl),
+        }
+    };
+}
+
 impl ClusterSharedBackend {
     pub fn backend_id(&self) -> &'static str {
-        match self {
-            Self::SharedFs(store) => store.backend_id(),
-            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
-            Self::Nixl(store) => store.backend_id(),
-        }
+        dispatch!(self, store => store.backend_id())
     }
 
     pub fn tier(&self) -> Tier {
-        match self {
-            Self::SharedFs(store) => store.tier(),
-            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
-            Self::Nixl(store) => store.tier(),
-        }
+        dispatch!(self, store => store.tier())
     }
 
     pub fn exists(&self, handle: &KVHandle) -> Result<bool, TransportError> {
-        match self {
-            Self::SharedFs(store) => store.exists(handle),
-            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
-            Self::Nixl(store) => store.exists(handle),
-        }
+        dispatch!(self, store => store.exists(handle))
     }
 
+    // Variant-specific bodies (not just dispatch): SharedFs synthesises the
+    // descriptor inline, Nixl needs real backend metadata. Stays manual.
     pub fn remote_location_for(
         &self,
         fingerprint: BlockFingerprint,
@@ -129,29 +141,24 @@ impl ClusterSharedBackend {
     }
 
     pub fn store(&self, req: KVBackendStore) -> Result<ClusterSharedBackendOp, TransportError> {
-        match self {
-            Self::SharedFs(store) => store.store(req).map(ClusterSharedBackendOp::SharedFs),
-            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
-            Self::Nixl(store) => store.store(req).map(ClusterSharedBackendOp::Nixl),
-        }
+        dispatch_op!(self, store => store.store(req))
     }
 
     pub fn fetch(&self, req: KVBackendFetch) -> Result<ClusterSharedBackendOp, TransportError> {
-        match self {
-            Self::SharedFs(store) => store.fetch(req).map(ClusterSharedBackendOp::SharedFs),
-            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
-            Self::Nixl(store) => store.fetch(req).map(ClusterSharedBackendOp::Nixl),
-        }
+        dispatch_op!(self, store => store.fetch(req))
     }
 
     pub fn delete(&self, req: KVBackendDelete) -> Result<ClusterSharedBackendOp, TransportError> {
-        match self {
-            Self::SharedFs(store) => store.delete(req).map(ClusterSharedBackendOp::SharedFs),
-            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
-            Self::Nixl(store) => store.delete(req).map(ClusterSharedBackendOp::Nixl),
-        }
+        dispatch_op!(self, store => store.delete(req))
     }
 
+    // Each `ClusterSharedBackendOp` is minted by `store`/`fetch`/`delete` on
+    // a specific `ClusterSharedBackend` instance, so the (self, op) pairing
+    // is fixed at construction. A mismatch is a programming bug — we panic
+    // via `unreachable!` instead of surfacing a "backend/op mismatch" error
+    // arm guarded by `#[allow(unreachable_patterns)]`. The catchall is itself
+    // cfg-gated to the rdma-nixl features, so without them the match is
+    // exhaustive and no `unreachable_patterns` allow is needed at all.
     pub fn poll(
         &self,
         op: &mut ClusterSharedBackendOp,
@@ -160,20 +167,25 @@ impl ClusterSharedBackend {
             (Self::SharedFs(store), ClusterSharedBackendOp::SharedFs(op)) => store.poll(op),
             #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             (Self::Nixl(store), ClusterSharedBackendOp::Nixl(op)) => store.poll(op),
-            #[allow(unreachable_patterns)]
-            _ => Poll::Ready(Err(TransportError::Other(
-                "cluster-shared backend/op mismatch".into(),
-            ))),
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
+            _ => unreachable!(
+                "ClusterSharedBackend::poll: backend/op variant mismatch — \
+                 ops must be polled by their originating backend"
+            ),
         }
     }
 
+    // Cancellation; same (self, op) pairing invariant as `poll` above.
     pub fn abort(&self, op: &mut ClusterSharedBackendOp) {
         match (self, op) {
             (Self::SharedFs(store), ClusterSharedBackendOp::SharedFs(op)) => store.abort(op),
             #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             (Self::Nixl(store), ClusterSharedBackendOp::Nixl(op)) => store.abort(op),
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
+            _ => unreachable!(
+                "ClusterSharedBackend::abort: backend/op variant mismatch — \
+                 ops must be aborted by their originating backend"
+            ),
         }
     }
 }
