@@ -8,6 +8,7 @@
 #   ./setup.sh --deps-only  # Toolchains + venv only, no build/model
 #   ./setup.sh --build-only # Build only (assumes venv exists)
 #   ./setup.sh --model-only # Download model only
+#   ./setup.sh --web-only   # Bootstrap bun + install web/ frontend deps (cross-platform)
 #   ./setup.sh --check      # Verify environment
 #   ./setup.sh --clean      # Remove venv and build artifacts
 #
@@ -84,6 +85,7 @@ case "${1:-}" in
     --deps-only)   MODE="deps" ;;
     --build-only)  MODE="build" ;;
     --model-only)  MODE="model" ;;
+    --web-only)    MODE="web" ;;
     --check)       MODE="check" ;;
     --clean)       MODE="clean" ;;
     --help|-h)
@@ -185,6 +187,24 @@ do_check() {
         info "  sandbox isolation active"
     else
         warn "nsjail not found — tool execution will run without sandbox"
+    fi
+
+    # bun + web/ frontend
+    local bun_bin=""
+    if command -v bun &>/dev/null; then
+        bun_bin="$(command -v bun)"
+    elif [ -x "$HOME/.bun/bin/bun" ]; then
+        bun_bin="$HOME/.bun/bin/bun"
+    fi
+    if [ -n "$bun_bin" ]; then
+        ok "bun $("$bun_bin" --version 2>/dev/null) ($bun_bin)"
+        if [ -d web/node_modules/astro ]; then
+            ok "  web/node_modules ready"
+        else
+            warn "  web/node_modules missing — run ./setup.sh --web-only"
+        fi
+    else
+        warn "bun not installed — run ./setup.sh --web-only to bootstrap web/ frontend"
     fi
 
     # Binaries
@@ -370,7 +390,7 @@ do_build() {
     local start
     start=$(date +%s)
 
-    cargo build --release --features cli -p agent-infer --bin arle 2>&1 | while IFS= read -r line; do
+    cargo build --release --features cuda,cli -p agent-infer --bin arle 2>&1 | while IFS= read -r line; do
         case "$line" in
             *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
                 echo "  $line" ;;

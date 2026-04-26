@@ -133,7 +133,7 @@ Latest benchmark snapshots (per change, dated): [docs/experience/wins/](docs/exp
 
 The REPL persists line history at `~/.arle-history` and exposes slash commands: `/help`, `/reset`, `/clear`, `/tools`, `/model`, `/stats`, `/models`, `/save`, `/load`, `/export`.
 
-Operators who want only the serving binary can use `infer` directly (`cargo build -p infer --release`) — same HTTP contract, no agent / train / data surface.
+Operators who want only the serving binary can use `infer` directly (`cargo build -p infer --release --features cuda` on Linux, `--features metal,no-cuda` on Apple Silicon) — same HTTP contract, no agent / train / data surface.
 
 ---
 

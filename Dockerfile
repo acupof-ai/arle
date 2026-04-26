@@ -30,8 +30,8 @@ ENV CUDA_HOME=/usr/local/cuda
 WORKDIR /build
 COPY . .
 
-RUN cargo build -p infer --release && \
-    cargo build --release --features cli -p agent-infer --bin arle
+RUN cargo build -p infer --release --features cuda && \
+    cargo build --release --features cuda,cli -p agent-infer --bin arle
 
 # --- Stage 2: Runtime ---
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04

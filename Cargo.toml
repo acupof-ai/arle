@@ -61,15 +61,22 @@ license = "MIT"
 publish = false
 
 [features]
-# Enable CUDA (mirrors infer's cuda feature). Default on, like infer.
-default = ["cuda"]
+# `cli` is on by default so `cargo build` always produces the `arle` binary.
+# Backend is no longer defaulted: pick one explicitly so macOS users do not hit
+# the cudarc nvcc requirement (which used to require everyone to type
+# `--no-default-features --features metal,no-cuda,cli`):
+#   --features cuda            Linux + NVIDIA
+#   --features metal,no-cuda   Apple Silicon
+#   --features cpu,no-cuda     portable smoke / CI
+# `arle --doctor` reports the compiled backend when none is selected.
+default = ["cli"]
 cli = ["dep:cli"]
 cuda = ["cli/cuda"]
-# Marker feature for CPU-only builds (CI, macOS). Pass --no-default-features --features no-cuda.
+# Marker feature for builds without CUDA toolchain (macOS, dev CI).
 no-cuda = ["cli/no-cuda"]
-# Development-oriented CPU backend. Use with --no-default-features --features cpu,no-cuda.
+# Development-oriented CPU backend. Pair with `no-cuda`.
 cpu = ["cli/cpu"]
-# Metal backend via mlx-rs (Apple Silicon). Use with --no-default-features --features metal,no-cuda.
+# Metal backend via mlx-sys (Apple Silicon). Pair with `no-cuda`.
 metal = ["cli/metal"]
 
 [dependencies]

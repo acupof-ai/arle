@@ -132,7 +132,7 @@ agent 与 RL 工作负载里，每一轮都要付 prefill 税：system prompt + 
 
 REPL 在 `~/.arle-history` 持久化输入历史，支持斜杠命令：`/help`、`/reset`、`/clear`、`/tools`、`/model`、`/stats`、`/models`、`/save`、`/load`、`/export`。
 
-只想要服务二进制的运维同学可以直接用 `infer`（`cargo build -p infer --release`）—— 同一份 HTTP 契约，不带 agent / train / data 表面。
+只想要服务二进制的运维同学可以直接用 `infer`（Linux 用 `cargo build -p infer --release --features cuda`；Apple Silicon 用 `--features metal,no-cuda`）—— 同一份 HTTP 契约，不带 agent / train / data 表面。
 
 ---
 

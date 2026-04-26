@@ -74,7 +74,13 @@ metal = ["dep:mlx-sys", "dep:libc"]
 # - `rdma-nixl-real` = compile against the real native link surface
 rdma-nixl = ["dep:nixl-sys-stub"]
 rdma-nixl-real = ["dep:nixl-sys-real"]
-default = ["cuda"]
+# No backend default. macOS users (where cudarc cannot link without nvcc) used
+# to have to pass `--no-default-features` for every command; that footgun is
+# gone. Pick a backend explicitly:
+#   --features cuda       Linux + NVIDIA
+#   --features metal,no-cuda    Apple Silicon
+#   --features cpu,no-cuda      portable smoke
+default = []
 reference = []
 
 # CUDA-only binaries — skipped under --features metal,no-cuda

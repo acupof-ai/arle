@@ -6,7 +6,11 @@ license = "MIT"
 publish = false
 
 [features]
-default = ["cuda"]
+# No backend default — pick one explicitly:
+#   --features cuda            Linux + NVIDIA
+#   --features metal,no-cuda   Apple Silicon
+#   --features cpu,no-cuda     portable smoke
+default = []
 cuda = ["infer/cuda", "train/cuda", "autograd/cuda"]
 no-cuda = ["infer/no-cuda", "train/no-cuda", "autograd/no-cuda"]
 cpu = ["infer/cpu"]
