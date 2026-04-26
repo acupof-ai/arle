@@ -392,8 +392,14 @@ impl Coordinator {
         // before returning, which no-ops the destructor and transfers
         // ownership to the scheduler via `FetchedBlock.release_after_promote`.
         let mut regions = AllocatedRegions::new();
+        // Every report_failure inside this loop must `regions.release_now()`
+        // first: report_failure sends on a bounded event channel, and a slow
+        // receiver would otherwise keep the staged host-pool regions reserved
+        // for the duration of the stall (relying on the implicit Drop is too
+        // late). See codex review comment 2026-04-26.
         for block in blocks {
             if self.is_cancelled(queue_ticket) {
+                regions.release_now();
                 return self.report_failure(
                     queue_ticket,
                     block.block_id,
@@ -420,6 +426,7 @@ impl Coordinator {
                     let payload = match self.fetch_disk_payload(*fingerprint, *payload_len) {
                         Ok(payload) => payload,
                         Err(reason) => {
+                            regions.release_now();
                             return self.report_failure(
                                 queue_ticket,
                                 block.block_id,
@@ -431,6 +438,7 @@ impl Coordinator {
                     let region = match Self::stage_into_host_pool(&block.host_pool, &payload) {
                         Ok(region) => region,
                         Err(reason) => {
+                            regions.release_now();
                             return self.report_failure(
                                 queue_ticket,
                                 block.block_id,
@@ -451,6 +459,7 @@ impl Coordinator {
                     let payload = match self.fetch_remote_payload(block) {
                         Ok(payload) => payload,
                         Err(reason) => {
+                            regions.release_now();
                             return self.report_failure(
                                 queue_ticket,
                                 block.block_id,
@@ -463,6 +472,7 @@ impl Coordinator {
                         match Self::stage_into_host_pool(&block.host_pool, payload.as_slice()) {
                             Ok(region) => region,
                             Err(reason) => {
+                                regions.release_now();
                                 return self.report_failure(
                                     queue_ticket,
                                     block.block_id,
@@ -480,6 +490,7 @@ impl Coordinator {
                     });
                 }
                 BlockLocation::Gpu { .. } => {
+                    regions.release_now();
                     return self.report_failure(
                         queue_ticket,
                         block.block_id,

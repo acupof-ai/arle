@@ -160,6 +160,31 @@ impl AllocatedRegions {
     pub(super) fn commit(&mut self) {
         self.committed = true;
     }
+
+    /// Eagerly release every accumulated region back to its pool, then mark
+    /// the guard committed so `Drop` is a no-op. Idempotent.
+    ///
+    /// Use this on error paths that do potentially-blocking work *after*
+    /// staging some regions — e.g. emitting on a bounded event channel whose
+    /// receiver may be slow. Without `release_now`, the implicit `Drop` only
+    /// fires after the blocked send returns, holding host-pinned-pool capacity
+    /// reserved for the duration of the stall.
+    pub(super) fn release_now(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (pool, region) in self.regions.drain(..) {
+            if let Err(err) = pool.release_region(region) {
+                log::warn!(
+                    "coordinator AllocatedRegions::release_now failed offset={} len={}: {}",
+                    region.offset,
+                    region.len,
+                    err
+                );
+            }
+        }
+        self.committed = true;
+    }
 }
 
 impl Drop for AllocatedRegions {
