@@ -527,6 +527,11 @@ struct Qwen35CompiledModel {
     int rotary_dim = 256;
     int hidden_size = 2560;
     int n_full_attn = 0, n_gdr = 0;
+    // Whether full-attn Q projection includes the gated half (q_dim = nh*hd*2).
+    // Qwen3.5 always gates Q; Qwen3 never does. Set explicitly by the Rust
+    // builder before finalize so dense full-attn-only Qwen3.5 fixtures are
+    // routed correctly (n_gdr alone cannot tell the families apart).
+    bool model_has_qk_gate = false;
 
     // Compiled function
     std::function<std::vector<array>(const std::vector<array>&)> compiled_fn;
@@ -574,6 +579,7 @@ struct Qwen35CompiledModel {
     // ── DFlash support ────────────────────────────────────────────────
     // When tape_mode is on, gdr_step() records innovation tapes for each GDR layer.
     bool tape_mode = false;
+    bool gdr_metal_kernel_enabled = true;
     // When non-empty, forward() captures hidden states after the listed layers
     // and appends them to the output vector (after logits + caches + gdr states).
     std::vector<int> capture_layer_ids;
@@ -906,7 +912,7 @@ struct Qwen35CompiledModel {
         }
 
         array y(0);
-        if (use_gdr_metal_kernel()) {
+        if (gdr_metal_kernel_enabled && use_gdr_metal_kernel()) {
             auto& v_bf16 = v_raw;
             // g and beta are [1, S, Hv] — no reshape needed
             auto& g_3d = g;
@@ -971,26 +977,49 @@ struct Qwen35CompiledModel {
                 intermediates.push_back(beta_3d);
             }
         } else {
+            if (ctx.record_tapes) {
+                throw std::runtime_error(
+                    "Qwen3.5 GDR tape mode requires the custom Metal recurrent kernel");
+            }
             int heads_per_key = hv / hk;
-            auto g_4d = reshape(g, {B, hv, 1, 1});
-            auto s_decayed = gdr_state_in * g_4d;
+            array state = gdr_state_in;
+            std::vector<array> y_steps;
+            y_steps.reserve(S);
 
-            // GQA: repeat k/q from [1,1,Hk,Dk] to [1,Hv,Dk] by inserting + broadcasting
-            array k_exp = (heads_per_key > 1)
-                ? reshape(broadcast_to(expand_dims(k, 3), {B,1,hk,heads_per_key,dk}), {B,hv,dk})
-                : reshape(k, {B,hv,dk});
-            array q_exp = (heads_per_key > 1)
-                ? reshape(broadcast_to(expand_dims(q, 3), {B,1,hk,heads_per_key,dk}), {B,hv,dk})
-                : reshape(q, {B,hv,dk});
+            for (int t = 0; t < S; ++t) {
+                auto q_t = slice(q, {0, t, 0, 0}, {B, t + 1, hk, dk});
+                auto k_t = slice(k, {0, t, 0, 0}, {B, t + 1, hk, dk});
+                auto v_t = slice(v_raw, {0, t, 0, 0}, {B, t + 1, hv, dv});
+                auto g_t = slice(g, {0, t, 0}, {B, t + 1, hv});
+                auto beta_t = slice(beta, {0, t, 0}, {B, t + 1, hv});
 
-            auto v_3d = reshape(v_raw, {B, hv, dv});
-            auto k_4d = reshape(k_exp, {B, hv, 1, dk});
-            auto kv_mem = sum(s_decayed * k_4d, -1, false);
-            auto beta_3d = reshape(beta, {B, hv, 1});
-            auto delta = (v_3d - kv_mem) * beta_3d;
-            gdr_state_out = s_decayed + reshape(delta, {B,hv,dv,1}) * k_4d;
-            auto q_4d = reshape(q_exp, {B, hv, 1, dk});
-            y = reshape(sum(gdr_state_out * q_4d, -1, false), {B,1,hv,dv});
+                auto g_4d = reshape(g_t, {B, hv, 1, 1});
+                auto s_decayed = state * g_4d;
+
+                auto k_exp = (heads_per_key > 1)
+                    ? reshape(
+                        broadcast_to(expand_dims(k_t, 3), {B, 1, hk, heads_per_key, dk}),
+                        {B, hv, dk})
+                    : reshape(k_t, {B, hv, dk});
+                auto q_exp = (heads_per_key > 1)
+                    ? reshape(
+                        broadcast_to(expand_dims(q_t, 3), {B, 1, hk, heads_per_key, dk}),
+                        {B, hv, dk})
+                    : reshape(q_t, {B, hv, dk});
+
+                auto v_3d = reshape(v_t, {B, hv, dv});
+                auto k_4d = reshape(k_exp, {B, hv, 1, dk});
+                auto kv_mem = sum(s_decayed * k_4d, -1, false);
+                auto beta_3d = reshape(beta_t, {B, hv, 1});
+                auto delta = (v_3d - kv_mem) * beta_3d;
+                state = s_decayed + reshape(delta, {B, hv, dv, 1}) * k_4d;
+
+                auto q_4d = reshape(q_exp, {B, hv, 1, dk});
+                y_steps.push_back(reshape(sum(state * q_4d, -1, false), {B, 1, hv, dv}));
+            }
+
+            gdr_state_out = state;
+            y = y_steps.size() == 1 ? y_steps[0] : concatenate(y_steps, 1);
         }
 
         // Output norm + gate (S-aware)
@@ -1256,12 +1285,13 @@ struct Qwen35CompiledModel {
     }
 
     void prepare_forward() {
-        // Auto-detect gate mode: Qwen3.5 (has GDR layers) uses gated Q,
-        // Qwen3 (pure attention) does not.
-        bool has_gate = (n_gdr > 0);
+        // The Rust builder sets `model_has_qk_gate` explicitly per family
+        // (Qwen3 → false, Qwen3.5 → true). A `n_gdr > 0` heuristic would
+        // misclassify dense-only Qwen3.5 checkpoints (no GDR layers but
+        // Q is still gated) as Qwen3.
         for (auto& lw : layers) {
             if (!lw.is_gdr) {
-                lw.full.has_qk_gate = has_gate;
+                lw.full.has_qk_gate = model_has_qk_gate;
             }
         }
 
@@ -1293,6 +1323,13 @@ void* qwen35_compiled_new() {
 
 void qwen35_compiled_free(void* model) {
     MLX_TRY_VOID(delete static_cast<Qwen35CompiledModel*>(model));
+}
+
+void qwen35_compiled_set_gdr_metal_kernel_enabled(void* model, int32_t enabled) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->gdr_metal_kernel_enabled = enabled != 0;
+    });
 }
 
 int32_t qwen35_compiled_add_dense_weight(void* model, mlx_array* w) {
@@ -1351,6 +1388,13 @@ void qwen35_compiled_set_config(
         m->head_dim = head_dim;
         m->rotary_dim = rotary_dim;
         m->hidden_size = hidden_size;
+    });
+}
+
+void qwen35_compiled_set_qk_gate(void* model, int32_t enabled) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->model_has_qk_gate = enabled != 0;
     });
 }
 
