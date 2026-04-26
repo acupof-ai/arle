@@ -124,8 +124,17 @@ def compile_kernel(prim_func, target: str):
 
     compiled = tilelang.compile(prim_func, target=target)
     adapter = getattr(compiled, "adapter", None)
-    device_source = getattr(adapter, "device_kernel_source", None) if adapter is not None else None
-    host_source = getattr(adapter, "host_kernel_source", None) if adapter is not None else None
+    # On a cold-cache compile the attribute-style accessors return None;
+    # only the `get_*()` getter methods materialize the source. On a
+    # warm cache both work. Use the methods for both.
+    if adapter is not None and hasattr(adapter, "get_device_source"):
+        device_source = adapter.get_device_source()
+    else:
+        device_source = getattr(adapter, "device_kernel_source", None) if adapter is not None else None
+    if adapter is not None and hasattr(adapter, "get_host_source"):
+        host_source = adapter.get_host_source()
+    else:
+        host_source = getattr(adapter, "host_kernel_source", None) if adapter is not None else None
     if not device_source:
         adapter_attrs = sorted(a for a in dir(adapter) if not a.startswith("_")) if adapter is not None else []
         raise RuntimeError(
@@ -136,22 +145,58 @@ def compile_kernel(prim_func, target: str):
             "TileLang ABI changed — update gen_tilelang_aot.py."
         )
 
-    # Extract the dynamic-shared-memory size TileLang baked into the kernel.
-    # The host source's TVM FFI call sequence stores it as the trailing
-    # int64 argument before the stream slot (host_kernel.cu line of the
-    # form `[N].v_int64) = ((int64_t)<bytes>);` immediately followed by
-    # the stream `[N+1].v_int64) = (int64_t)0` slot).
-    dyn_shmem_match = re.search(
-        r'v_int64\)\s*=\s*\(\(int64_t\)(\d+)\)\s*;\s*'
-        r'\(\(\(TVMFFIAny\*\)stack_ffi_any\)\[\d+\]\.type_index\)\s*=\s*0\s*;',
-        host_source or "",
+    # Extract the dynamic-shared-memory size TileLang baked into the
+    # kernel launch. TVM FFI's call sequence builds a `stack_ffi_any[]`
+    # array of the form
+    #   ...
+    #   [k+0].v_int64 = grid_x      [k+1].v_int64 = grid_y
+    #   [k+2].v_int64 = grid_z      [k+3].v_int64 = block_x
+    #   [k+4].v_int64 = block_y     [k+5].v_int64 = block_z
+    #   [k+6].v_int64 = <dyn shmem bytes>
+    #   [k+7].v_int64 = (int64_t)0  // stream handle, set later
+    # so the dyn-shmem entry is the int64 literal immediately preceding
+    # the stream-handle slot. Pull both lines and confirm the pairing
+    # before trusting the value.
+    # Find every `[idx].v_int64 = ((int64_t)<literal>);` assignment in
+    # the kernel-launch packing block, then pick the one whose slot
+    # index is immediately followed by another `[idx+1].v_int64` slot
+    # set to literal `(int64_t)0` (that's the stream handle, always
+    # 0 at packing time and filled in later). The dyn-shmem entry is
+    # always one slot before the stream slot, regardless of how many
+    # type_index / zero_padding helper assignments TileLang interleaves.
+    src = host_source or ""
+    int_assign_re = re.compile(
+        r'\(\(\(TVMFFIAny\*\)stack_ffi_any\)\[(\d+)\]\.v_int64\)\s*=\s*'
+        r'\(\(int64_t\)(\d+)\)\s*;'
     )
-    if dyn_shmem_match is None:
+    zero_assign_re = re.compile(
+        r'\(\(\(TVMFFIAny\*\)stack_ffi_any\)\[(\d+)\]\.v_int64\)\s*=\s*'
+        r'\(int64_t\)0\s*;'
+    )
+    int_by_slot = {int(m.group(1)): (int(m.group(2)), m.start()) for m in int_assign_re.finditer(src)}
+    zero_slots = {int(m.group(1)) for m in zero_assign_re.finditer(src)}
+    launch_call_pos = src.rfind("kernel_kernel_packed")
+    candidates = [
+        (slot, val)
+        for slot, (val, pos) in int_by_slot.items()
+        if (slot + 1) in zero_slots and pos < launch_call_pos
+    ]
+    if not candidates:
+        # Diagnostic dump so the next person knows what shifted.
+        all_int_slots = sorted(int_by_slot.keys())
+        all_zero_slots = sorted(zero_slots)
+        host_len = len(src)
         raise RuntimeError(
-            "Could not extract dynamic shared-memory size from host_kernel_source. "
-            "TileLang ABI changed — update gen_tilelang_aot.py."
+            "Could not extract dynamic shared-memory size from "
+            "host_kernel_source. TileLang ABI changed — update "
+            f"gen_tilelang_aot.py. Diagnostics: host_source_len={host_len}, "
+            f"int_slots={all_int_slots}, zero_slots={all_zero_slots}, "
+            f"launch_call_pos={launch_call_pos}, "
+            f"int_int_pairs_total={len(int_by_slot)}"
         )
-    dyn_shmem_bytes = int(dyn_shmem_match.group(1))
+    # The kernel-launch packing is the highest-slot pair that fits.
+    candidates.sort()
+    dyn_shmem_bytes = candidates[-1][1]
 
     match = re.search(
         r'extern "C" __global__ void __launch_bounds__\([^)]+\) (\w+)\((.*?)\)\s*\{',
