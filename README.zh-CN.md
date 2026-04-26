@@ -42,8 +42,9 @@ docker run --rm --gpus all -p 8000:8000 \
 ```
 
 `:latest` 跟踪 `main`；打过 tag 的版本会发布为
-`ghcr.io/cklxx/arle:vX.Y.Z`，详见
-[Releases](https://github.com/cklxx/arle/releases)。
+`ghcr.io/cklxx/arle:X.Y.Z`（注意：没有 `v` 前缀 —— docker metadata-action
+默认会去掉）。当前 v0.1.0 对应 `ghcr.io/cklxx/arle:0.1.0`。
+GitHub Release 页面：[Releases](https://github.com/cklxx/arle/releases)。
 
 **Apple Silicon — 从源码构建（Metal 后端）：**
 
