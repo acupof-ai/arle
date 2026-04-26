@@ -40,6 +40,25 @@ impl SharedHostPinnedPool {
         Arc::clone(&self.inner)
     }
 
+    /// Acquire the inner pool guard.
+    ///
+    /// **Poison policy: propagate as `anyhow!`, do not auto-recover.**
+    ///
+    /// A poisoned mutex means a previous holder panicked mid-operation, which
+    /// for the host pinned pool can leave the Zig arena's free-list / live-set
+    /// in an inconsistent state (e.g. a `reserve` that bumped the bump pointer
+    /// but never inserted into `live_regions`, or a `release` that ran the
+    /// native call but never updated the Rust-side mirror). Continuing past
+    /// that with `into_inner` risks double-frees or silent metadata drift, so
+    /// the data-plane API surfaces poisoning as a hard error.
+    ///
+    /// Some callers (notably `coordinator.rs`) currently use
+    /// `PoisonError::into_inner` to recover at scheduler boundaries; that is a
+    /// deliberate trade-off in the coordinator's bookkeeping path (the
+    /// coordinator can fail-fast the offending ticket without corrupting the
+    /// pool itself) and is **not** the policy for direct pool I/O. If you need
+    /// to soft-recover here, do it at the call site after demonstrating that
+    /// the protected invariants are still intact.
     pub fn lock(&self) -> Result<MutexGuard<'_, HostPinnedPool>> {
         self.inner
             .lock()
@@ -55,6 +74,28 @@ impl SharedHostPinnedPool {
             unsafe { std::slice::from_raw_parts(pool.arena.base_ptr.add(offset), region.len) }
                 .to_vec(),
         )
+    }
+
+    /// Run `f` over a borrowed slice of the region while the pool lock is
+    /// held. Avoids the `Vec<u8>` allocation that [`Self::read_region`]
+    /// requires for callers that only need to consume the bytes.
+    ///
+    /// **Caution:** `f` runs while the pool mutex is held. Do **not** perform
+    /// blocking I/O (disk writes, network send, etc.) inside `f` — that
+    /// stalls every other reservation/release on the same pool. Use this only
+    /// for short, CPU-bound consumers (e.g. `memcpy_htod`, hashing,
+    /// `Arc::from(slice)`). For blocking consumers, fall back to
+    /// [`Self::read_region`] and pay the one-shot allocation.
+    pub fn with_region_slice<R>(
+        &self,
+        region: HostPinnedRegion,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
+        let pool = self.lock()?;
+        let offset = pool.validate_live_region(region)?;
+        let slice =
+            unsafe { std::slice::from_raw_parts(pool.arena.base_ptr.add(offset), region.len) };
+        Ok(f(slice))
     }
 
     pub fn write_region(&self, region: HostPinnedRegion, bytes: &[u8]) -> Result<()> {

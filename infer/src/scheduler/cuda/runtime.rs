@@ -918,13 +918,24 @@ impl<M: ModelForward> Scheduler<M> {
                             block.block_id
                         )
                     })?;
-                    let payload = self.host_pinned_pool.read_region(fetched.host_region)?;
                     let pages = self.paged_kv_pool.alloc_detached_pages(pages_per_block)?;
-                    if let Err(err) = self.paged_kv_pool.copy_pages_from_host(
-                        self.model.device_context(),
-                        &pages,
-                        &payload,
-                    ) {
+                    let copy_result =
+                        self.host_pinned_pool
+                            .with_region_slice(fetched.host_region, |payload| {
+                                self.paged_kv_pool.copy_pages_from_host(
+                                    self.model.device_context(),
+                                    &pages,
+                                    payload,
+                                )
+                            });
+                    let copy_result = match copy_result {
+                        Ok(inner) => inner,
+                        Err(err) => {
+                            let _ = self.paged_kv_pool.release_pages(&pages);
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) = copy_result {
                         let _ = self.paged_kv_pool.release_pages(&pages);
                         return Err(err);
                     }
