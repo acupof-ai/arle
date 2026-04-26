@@ -1,7 +1,7 @@
 //! Linear projection ops: GEMV (decode) and GEMM (prefill/batch).
 //!
 //! Dispatch priority for `gemv()` (single token, decode path):
-//!   1. Quantized INT2/4/8 → `w{2,4,8}a16_gemv_cuda` (fused dequant)
+//!   1. Packed quantized weights → matching fused-dequant GEMV kernel
 //!   2. BF16 → `gemv_cuda` (handwritten BF16×4 vectorized kernel)
 //!
 //! Dispatch priority for `gemm_into()` (batched, prefill path):
@@ -17,20 +17,105 @@ use half::bf16;
 
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::tensor::WeightFormat;
 
-/// `DeviceMatrix::quant_bits` discriminators. Named so dispatch sites can
-/// `match` on intent instead of hardcoding magic numbers.
-///
-/// Uniform group-scale formats use the "real" bit width (2/4/8). GGUF
-/// superblock formats reserve two-digit sentinels distinct from those:
-///   * `Q3K` (Q3_K_{S,M,L}) : 3-bit in 256-element superblocks, 110 bytes
-///   * `Q4K` (Q4_K_{S,M})   : 4-bit in 256-element superblocks, 144 bytes
-mod qbits {
-    pub(super) const W2: usize = 2;
-    pub(super) const W4: usize = 4;
-    pub(super) const Q3K: usize = 33;
-    pub(super) const Q4K: usize = 44;
-    pub(super) const Q6K: usize = 66;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinearKernelPlan {
+    Bf16Gemv,
+    Bf16GraphsafeGemm,
+    Bf16CublasGemm,
+    W2A16Gemv,
+    W4A16Gemv,
+    W8A16Gemv,
+    W2A16BatchGemv,
+    W4A16BatchGemv,
+    W8A16BatchGemv,
+    Q3KGemv,
+    Q4KGemv,
+    Q6KGemv,
+    Q3KBatchGemv,
+    Q4KBatchGemv,
+    Q6KBatchGemv,
+    Q3KDequantCublasGemm,
+    Q4KDequantCublasGemm,
+    Q6KDequantCublasGemm,
+    MarlinW4Gemm,
+    TurboQuantGemv,
+    TurboQuantDequantCublasGemm,
+}
+
+impl LinearKernelPlan {
+    fn decode(weight: &DeviceMatrix) -> Self {
+        match weight.weight_format() {
+            WeightFormat::DenseBf16 => Self::Bf16Gemv,
+            WeightFormat::W2A16 => Self::W2A16Gemv,
+            WeightFormat::W4A16 => Self::W4A16Gemv,
+            WeightFormat::W8A16 => Self::W8A16Gemv,
+            WeightFormat::GgufQ3K => Self::Q3KGemv,
+            WeightFormat::GgufQ4K => Self::Q4KGemv,
+            WeightFormat::GgufQ6K => Self::Q6KGemv,
+            WeightFormat::TurboQuant => Self::TurboQuantGemv,
+        }
+    }
+
+    fn batched(weight: &DeviceMatrix, batch: usize) -> Self {
+        if batch > 1 && marlin_prefill_aligned(weight).is_ok() {
+            return Self::MarlinW4Gemm;
+        }
+        if batch > 1
+            && weight.has_marlin()
+            && let Err(reason) = marlin_prefill_aligned(weight)
+        {
+            log::trace!("Marlin W4 fallback: {reason}");
+        }
+
+        match (batch, weight.weight_format()) {
+            (1, WeightFormat::DenseBf16) => Self::Bf16GraphsafeGemm,
+            (_, WeightFormat::DenseBf16) => Self::Bf16CublasGemm,
+            (1, _) => Self::decode(weight),
+            (_, WeightFormat::W2A16) => Self::W2A16BatchGemv,
+            (_, WeightFormat::W4A16) => Self::W4A16BatchGemv,
+            (_, WeightFormat::W8A16) => Self::W8A16BatchGemv,
+            (2..=8, WeightFormat::GgufQ3K) => Self::Q3KBatchGemv,
+            (2..=8, WeightFormat::GgufQ4K) => Self::Q4KBatchGemv,
+            (2..=8, WeightFormat::GgufQ6K) => Self::Q6KBatchGemv,
+            (_, WeightFormat::GgufQ3K) => Self::Q3KDequantCublasGemm,
+            (_, WeightFormat::GgufQ4K) => Self::Q4KDequantCublasGemm,
+            (_, WeightFormat::GgufQ6K) => Self::Q6KDequantCublasGemm,
+            (_, WeightFormat::TurboQuant) => Self::TurboQuantDequantCublasGemm,
+        }
+    }
+}
+
+fn marlin_prefill_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'static str> {
+    if !weight.has_marlin() {
+        return Err("missing marlin-packed side buffer");
+    }
+    if weight.weight_format() != WeightFormat::W4A16 {
+        return Err("source format is not W4A16");
+    }
+    if !weight.cols.is_multiple_of(16) {
+        return Err("K is not multiple of 16");
+    }
+    if !weight.rows.is_multiple_of(64) {
+        return Err("N is not multiple of 64");
+    }
+    Ok(())
+}
+
+fn turboquant_params(weight: &DeviceMatrix) -> (i32, i32, i32, i32, i32, i32) {
+    let n = weight.rows as i32;
+    let k = weight.cols as i32;
+    let group_size = weight.group_size as i32;
+    let num_groups = (weight.cols / weight.group_size) as i32;
+    let effective_bits = if weight.tq_bits == 3 {
+        4
+    } else {
+        weight.tq_bits as usize
+    };
+    let packed_cols = (weight.cols * effective_bits).div_ceil(8) as i32;
+    let bits = weight.tq_bits as i32;
+    (n, k, group_size, packed_cols, num_groups, bits)
 }
 
 /// Additive LoRA GEMV: `y += B @ (A @ x)`.
@@ -51,34 +136,42 @@ mod qbits {
 /// decode path shows churn overhead in practice.
 pub fn apply_lora_gemv_add(
     ctx: &DeviceContext,
-    a: &DeviceMatrix,
-    b: &DeviceMatrix,
-    x: &DeviceVec,
-    y: &mut DeviceVec,
+    lora_a: &DeviceMatrix,
+    lora_b: &DeviceMatrix,
+    input: &DeviceVec,
+    output: &mut DeviceVec,
 ) -> Result<()> {
-    assert_eq!(a.cols, x.len, "lora A cols {} != x len {}", a.cols, x.len);
-    assert_eq!(b.rows, y.len, "lora B rows {} != y len {}", b.rows, y.len);
     assert_eq!(
-        a.rows, b.cols,
+        lora_a.cols, input.len,
+        "lora A cols {} != x len {}",
+        lora_a.cols, input.len
+    );
+    assert_eq!(
+        lora_b.rows, output.len,
+        "lora B rows {} != y len {}",
+        lora_b.rows, output.len
+    );
+    assert_eq!(
+        lora_a.rows, lora_b.cols,
         "lora rank mismatch: A rows {} != B cols {}",
-        a.rows, b.cols
+        lora_a.rows, lora_b.cols
     );
 
-    let rank = a.rows;
+    let rank = lora_a.rows;
     let mut tmp_a = DeviceVec::zeros(ctx, rank)?;
-    gemv(ctx, a, x, &mut tmp_a)?;
+    gemv(ctx, lora_a, input, &mut tmp_a)?;
 
-    let mut tmp_b = DeviceVec::zeros(ctx, b.rows)?;
-    gemv(ctx, b, &tmp_a, &mut tmp_b)?;
+    let mut tmp_b = DeviceVec::zeros(ctx, lora_b.rows)?;
+    gemv(ctx, lora_b, &tmp_a, &mut tmp_b)?;
 
     let (tmp_ptr, _gt) = tmp_b.data.device_ptr(&ctx.stream);
-    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
     unsafe {
         ffi::add_cuda(
-            y_ptr as *const ffi::Half,
+            output_ptr as *const ffi::Half,
             tmp_ptr as *const ffi::Half,
-            y_ptr as *mut ffi::Half,
-            y.len as i32,
+            output_ptr as *mut ffi::Half,
+            output.len as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -98,48 +191,48 @@ pub fn apply_lora_gemv_add(
 /// `[out_features, seq_len]`.
 pub fn apply_lora_gemm_add(
     ctx: &DeviceContext,
-    a: &DeviceMatrix,
-    b: &DeviceMatrix,
-    x: &HiddenStates,
-    y: &mut HiddenStates,
+    lora_a: &DeviceMatrix,
+    lora_b: &DeviceMatrix,
+    input: &HiddenStates,
+    output: &mut HiddenStates,
 ) -> Result<()> {
     assert_eq!(
-        a.cols, x.hidden_dim,
+        lora_a.cols, input.hidden_dim,
         "lora A cols {} != x hidden_dim {}",
-        a.cols, x.hidden_dim
+        lora_a.cols, input.hidden_dim
     );
     assert_eq!(
-        b.rows, y.hidden_dim,
+        lora_b.rows, output.hidden_dim,
         "lora B rows {} != y hidden_dim {}",
-        b.rows, y.hidden_dim
+        lora_b.rows, output.hidden_dim
     );
     assert_eq!(
-        a.rows, b.cols,
+        lora_a.rows, lora_b.cols,
         "lora rank mismatch: A rows {} != B cols {}",
-        a.rows, b.cols
+        lora_a.rows, lora_b.cols
     );
     assert_eq!(
-        x.seq_len, y.seq_len,
+        input.seq_len, output.seq_len,
         "lora gemm seq_len mismatch: x {} != y {}",
-        x.seq_len, y.seq_len
+        input.seq_len, output.seq_len
     );
 
-    let rank = a.rows;
-    let mut tmp_a = HiddenStates::zeros(ctx, rank, x.seq_len)?;
-    gemm_into(ctx, a, x, &mut tmp_a);
+    let rank = lora_a.rows;
+    let mut tmp_a = HiddenStates::zeros(ctx, rank, input.seq_len)?;
+    gemm_into(ctx, lora_a, input, &mut tmp_a);
 
-    let mut tmp_b = HiddenStates::zeros(ctx, b.rows, x.seq_len)?;
-    gemm_into(ctx, b, &tmp_a, &mut tmp_b);
+    let mut tmp_b = HiddenStates::zeros(ctx, lora_b.rows, input.seq_len)?;
+    gemm_into(ctx, lora_b, &tmp_a, &mut tmp_b);
 
-    let n = y.hidden_dim * y.seq_len;
+    let total_elems = output.hidden_dim * output.seq_len;
     let (tmp_ptr, _gt) = tmp_b.data.device_ptr(&ctx.stream);
-    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
     unsafe {
         ffi::add_cuda(
-            y_ptr as *const ffi::Half,
+            output_ptr as *const ffi::Half,
             tmp_ptr as *const ffi::Half,
-            y_ptr as *mut ffi::Half,
-            n as i32,
+            output_ptr as *mut ffi::Half,
+            total_elems as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -150,70 +243,140 @@ pub fn apply_lora_gemm_add(
 /// Matrix-vector multiplication: y = A @ x
 /// A: (M, K) row-major, x: (K,), y: (M,)
 /// Supports BF16, W8A16, W4A16, and W2A16 weights.
-pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut DeviceVec) -> Result<()> {
-    assert_eq!(a.cols, x.len, "A cols {} != x len {}", a.cols, x.len);
-    assert_eq!(a.rows, y.len, "A rows {} != y len {}", a.rows, y.len);
+pub fn gemv(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &DeviceVec,
+    output: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(
+        weight.cols, input.len,
+        "A cols {} != x len {}",
+        weight.cols, input.len
+    );
+    assert_eq!(
+        weight.rows, output.len,
+        "A rows {} != y len {}",
+        weight.rows, output.len
+    );
 
-    if a.is_quantized() {
-        let qw = a
-            .qweight
+    let plan = LinearKernelPlan::decode(weight);
+    if plan == LinearKernelPlan::Bf16Gemv {
+        let (weight_ptr, _ga) = weight.data.device_ptr(&ctx.stream);
+        let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
+        let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
+
+        // Handwritten GEMV with BF16×4 vectorized loads.
+        // cuBLAS GEMM(M,1,K) was tested but has higher dispatch overhead
+        // on Ada (L4) for single-vector operations. The handwritten kernel
+        // wins at B=1; cuBLAS wins at B≥2 (handled by gemm_into path).
+        // On A100/H100 with tensor cores, cuBLAS may be faster — profile first.
+        unsafe {
+            ffi::gemv_cuda(
+                weight_ptr as *const ffi::Half,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        return Ok(());
+    }
+
+    if plan == LinearKernelPlan::TurboQuantGemv {
+        let tq_p = weight
+            .tq_packed
             .as_ref()
-            .expect("quantized matrix missing qweight");
-        let qs = a
+            .expect("TQ matrix missing packed weights");
+        let tq_s = weight.tq_scales.as_ref().expect("TQ matrix missing scales");
+        let tq_sg = weight.tq_signs.as_ref().expect("TQ matrix missing signs");
+        let tq_c = weight
+            .tq_centroids
+            .as_ref()
+            .expect("TQ matrix missing centroids");
+        let (out_dim, in_dim, group_size, packed_cols, num_groups, bits) =
+            turboquant_params(weight);
+        let (tp_ptr, _g1) = tq_p.device_ptr(&ctx.stream);
+        let (ts_ptr, _g2) = tq_s.device_ptr(&ctx.stream);
+        let (tsg_ptr, _g3) = tq_sg.device_ptr(&ctx.stream);
+        let (tc_ptr, _g4) = tq_c.device_ptr(&ctx.stream);
+        let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
+        let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::turboquant_weight_gemv_cuda(
+                tp_ptr as *const u8,
+                ts_ptr as *const ffi::Half,
+                tsg_ptr as *const i8,
+                tc_ptr as *const f32,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                out_dim,
+                in_dim,
+                group_size,
+                packed_cols,
+                num_groups,
+                bits,
+                ctx.stream.cu_stream(),
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(qw) = weight.qweight.as_ref() {
+        let qs = weight
             .qscales
             .as_ref()
             .expect("quantized matrix missing qscales");
         let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
         let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
-        let n = a.rows as i32;
-        let k = a.cols as i32;
-        let grp = a.group_size as i32;
+        let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
+        let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
+        let out_dim = weight.rows as i32;
+        let in_dim = weight.cols as i32;
+        let group_size = weight.group_size as i32;
         let stream = ctx.stream.cu_stream();
         let wptr = qw_ptr as *const u8;
-        let xptr = x_ptr as *const ffi::Half;
-        let yptr = y_ptr as *mut ffi::Half;
+        let xptr = input_ptr as *const ffi::Half;
+        let yptr = output_ptr as *mut ffi::Half;
         let sptr = qs_ptr as *const ffi::Half;
 
         unsafe {
-            use qbits::{Q3K, Q4K, Q6K, W2, W4};
-            let res = match a.quant_bits {
-                Q3K => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-                Q4K => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-                Q6K => ffi::q6k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-                W2 => ffi::w2a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, grp, stream),
-                W4 => ffi::w4a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, grp, stream),
-                // Default: W8A16 (signed int8).
-                _ => ffi::w8a16_gemv_cuda(qw_ptr as *const i8, sptr, xptr, yptr, n, k, grp, stream),
+            let res = match plan {
+                LinearKernelPlan::Q3KGemv => {
+                    ffi::q3k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
+                }
+                LinearKernelPlan::Q4KGemv => {
+                    ffi::q4k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
+                }
+                LinearKernelPlan::Q6KGemv => {
+                    ffi::q6k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
+                }
+                LinearKernelPlan::W2A16Gemv => ffi::w2a16_gemv_cuda(
+                    wptr, sptr, xptr, yptr, out_dim, in_dim, group_size, stream,
+                ),
+                LinearKernelPlan::W4A16Gemv => ffi::w4a16_gemv_cuda(
+                    wptr, sptr, xptr, yptr, out_dim, in_dim, group_size, stream,
+                ),
+                LinearKernelPlan::W8A16Gemv => ffi::w8a16_gemv_cuda(
+                    qw_ptr as *const i8,
+                    sptr,
+                    xptr,
+                    yptr,
+                    out_dim,
+                    in_dim,
+                    group_size,
+                    stream,
+                ),
+                _ => unreachable!("unexpected decode linear plan {plan:?}"),
             };
             res.result()?;
         }
         return Ok(());
     }
 
-    let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
-
-    // Handwritten GEMV with BF16×4 vectorized loads.
-    // cuBLAS GEMM(M,1,K) was tested but has higher dispatch overhead
-    // on Ada (L4) for single-vector operations. The handwritten kernel
-    // wins at B=1; cuBLAS wins at B≥2 (handled by gemm_into path).
-    // On A100/H100 with tensor cores, cuBLAS may be faster — profile first.
-    unsafe {
-        ffi::gemv_cuda(
-            a_ptr as *const ffi::Half,
-            x_ptr as *const ffi::Half,
-            y_ptr as *mut ffi::Half,
-            a.rows as i32,
-            a.cols as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-
-    Ok(())
+    unreachable!("linear decode plan {plan:?} has no matching weight storage")
 }
 /// Linear layer: y = weight @ x
 pub(crate) fn linear(
@@ -406,7 +569,7 @@ pub(crate) fn gemm_graphsafe_batched_into(
         out.seq_len, x.seq_len
     );
     anyhow::ensure!(
-        !weight.is_quantized() && !weight.has_marlin() && !weight.has_tq(),
+        weight.is_dense_bf16(),
         "graph-safe batched GEMM requires plain BF16 weights"
     );
 
@@ -429,6 +592,299 @@ pub(crate) fn gemm_graphsafe_batched_into(
     }
 
     Ok(())
+}
+
+fn run_marlin_w4_gemm(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) {
+    let mp = weight.marlin_packed.as_ref().unwrap();
+    let ms = weight.marlin_scales.as_ref().unwrap();
+    let m = x.seq_len;
+    let n = weight.rows;
+    let k = weight.cols;
+
+    let mut x_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * k).expect("alloc x_fp16");
+    {
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (xf_ptr, _gf) = x_fp16.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::bf16_to_fp16_cuda(
+                x_ptr as *const ffi::Half,
+                xf_ptr as *mut ffi::Half,
+                (m * k) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("bf16_to_fp16 failed");
+        }
+    }
+
+    let mut y_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * n).expect("alloc y_fp16");
+    let sms = ctx.sm_count() as i32;
+    let ws_size = unsafe { ffi::marlin_workspace_size(n as i32, sms) };
+    let ws_elems = ws_size.div_ceil(4);
+    let mut workspace: CudaSlice<i32> = ctx
+        .stream
+        .alloc_zeros(ws_elems)
+        .expect("alloc marlin workspace");
+
+    {
+        let (xf_ptr, _g1) = x_fp16.device_ptr(&ctx.stream);
+        let (mp_ptr, _g2) = mp.device_ptr(&ctx.stream);
+        let (yf_ptr, _g3) = y_fp16.device_ptr_mut(&ctx.stream);
+        let (ms_ptr, _g4) = ms.device_ptr(&ctx.stream);
+        let (ws_ptr, _g5) = workspace.device_ptr_mut(&ctx.stream);
+        let ret = unsafe {
+            ffi::marlin_gemm_cuda(
+                xf_ptr as *const ffi::Half,
+                mp_ptr as *const u8,
+                yf_ptr as *mut ffi::Half,
+                ms_ptr as *mut ffi::Half,
+                m as i32,
+                n as i32,
+                k as i32,
+                ws_ptr as *mut i32,
+                weight.group_size as i32,
+                0,
+                ctx.stream.cu_stream(),
+                -1,
+                -1,
+                sms,
+                16,
+            )
+        };
+        assert_eq!(ret, 0, "marlin_gemm_cuda failed with code {ret}");
+    }
+
+    {
+        let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);
+        let (y_ptr, _g2) = out.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::fp16_to_bf16_cuda(
+                yf_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                (m * n) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("fp16_to_bf16 failed");
+        }
+    }
+}
+
+fn run_turboquant_linear(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    plan: LinearKernelPlan,
+) {
+    let tq_p = weight.tq_packed.as_ref().unwrap();
+    let tq_s = weight.tq_scales.as_ref().unwrap();
+    let tq_sg = weight.tq_signs.as_ref().unwrap();
+    let tq_c = weight.tq_centroids.as_ref().unwrap();
+    let (n, k, group_size, packed_cols, num_groups, bits) = turboquant_params(weight);
+    let stream = ctx.stream.cu_stream();
+
+    let (tp_ptr, _g1) = tq_p.device_ptr(&ctx.stream);
+    let (ts_ptr, _g2) = tq_s.device_ptr(&ctx.stream);
+    let (tsg_ptr, _g3) = tq_sg.device_ptr(&ctx.stream);
+    let (tc_ptr, _g4) = tq_c.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    match plan {
+        LinearKernelPlan::TurboQuantGemv => unsafe {
+            ffi::turboquant_weight_gemv_cuda(
+                tp_ptr as *const u8,
+                ts_ptr as *const ffi::Half,
+                tsg_ptr as *const i8,
+                tc_ptr as *const f32,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                n,
+                k,
+                group_size,
+                packed_cols,
+                num_groups,
+                bits,
+                stream,
+            );
+        },
+        LinearKernelPlan::TurboQuantDequantCublasGemm => {
+            let ws_size = weight.rows * weight.cols;
+            let mut workspace: CudaSlice<bf16> = ctx
+                .stream
+                .alloc_zeros(ws_size)
+                .expect("alloc TQ dequant workspace");
+            let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::turboquant_weight_dequant_cuda(
+                    tp_ptr as *const u8,
+                    ts_ptr as *const ffi::Half,
+                    tsg_ptr as *const i8,
+                    tc_ptr as *const f32,
+                    ws_ptr as *mut ffi::Half,
+                    n,
+                    k,
+                    group_size,
+                    packed_cols,
+                    num_groups,
+                    bits,
+                    stream,
+                );
+                ffi::gemm_cuda(
+                    ws_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    n,
+                    x.seq_len as i32,
+                    k,
+                    stream,
+                )
+                .result()
+                .expect("TQ dequant+cuBLAS GEMM failed");
+            }
+        }
+        _ => unreachable!("unexpected TurboQuant linear plan {plan:?}"),
+    }
+}
+
+fn run_qweight_linear(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    plan: LinearKernelPlan,
+) {
+    let qw = weight
+        .qweight
+        .as_ref()
+        .expect("quantized matrix missing qweight");
+    let qs = weight
+        .qscales
+        .as_ref()
+        .expect("quantized matrix missing qscales");
+    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+    let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+    let n = weight.rows as i32;
+    let k = weight.cols as i32;
+    let group_size = weight.group_size as i32;
+    let batch = x.seq_len as i32;
+    let stream = ctx.stream.cu_stream();
+
+    let wptr = qw_ptr as *const u8;
+    let wptr_i8 = qw_ptr as *const i8;
+    let xptr = x_ptr as *const ffi::Half;
+    let yptr = y_ptr as *mut ffi::Half;
+    let sptr = qs_ptr as *const ffi::Half;
+
+    unsafe {
+        let res = match plan {
+            LinearKernelPlan::Q3KDequantCublasGemm
+            | LinearKernelPlan::Q4KDequantCublasGemm
+            | LinearKernelPlan::Q6KDequantCublasGemm => {
+                let ws_elems = weight.rows * weight.cols;
+                let mut workspace: CudaSlice<bf16> = ctx
+                    .stream
+                    .alloc_zeros(ws_elems)
+                    .expect("alloc QxK dequant workspace");
+                let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
+                let tile = ws_ptr as *mut ffi::Half;
+                let dq = match plan {
+                    LinearKernelPlan::Q3KDequantCublasGemm => {
+                        ffi::q3k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
+                    }
+                    LinearKernelPlan::Q4KDequantCublasGemm => {
+                        ffi::q4k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
+                    }
+                    LinearKernelPlan::Q6KDequantCublasGemm => {
+                        ffi::q6k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
+                    }
+                    _ => unreachable!(),
+                };
+                dq.result().expect("qxk_dequant_chunk_cuda failed");
+                ffi::gemm_cuda(tile.cast_const(), xptr, yptr, n, batch, k, stream)
+            }
+            LinearKernelPlan::Q3KGemv => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernelPlan::Q4KGemv => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernelPlan::Q6KGemv => ffi::q6k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernelPlan::W2A16Gemv => {
+                ffi::w2a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, group_size, stream)
+            }
+            LinearKernelPlan::W4A16Gemv => {
+                ffi::w4a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, group_size, stream)
+            }
+            LinearKernelPlan::W8A16Gemv => {
+                ffi::w8a16_gemv_cuda(wptr_i8, sptr, xptr, yptr, n, k, group_size, stream)
+            }
+            LinearKernelPlan::Q3KBatchGemv => {
+                ffi::q3k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
+            }
+            LinearKernelPlan::Q4KBatchGemv => {
+                ffi::q4k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
+            }
+            LinearKernelPlan::Q6KBatchGemv => {
+                ffi::q6k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
+            }
+            LinearKernelPlan::W2A16BatchGemv => {
+                ffi::w2a16_gemv_batch_cuda(wptr, sptr, xptr, yptr, batch, n, k, group_size, stream)
+            }
+            LinearKernelPlan::W4A16BatchGemv => {
+                ffi::w4a16_gemv_batch_cuda(wptr, sptr, xptr, yptr, batch, n, k, group_size, stream)
+            }
+            LinearKernelPlan::W8A16BatchGemv => ffi::w8a16_gemv_batch_cuda(
+                wptr_i8, sptr, xptr, yptr, batch, n, k, group_size, stream,
+            ),
+            _ => unreachable!("unexpected qweight linear plan {plan:?}"),
+        };
+        res.result().expect("quantized linear kernel failed");
+    }
+}
+
+fn run_bf16_linear(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    plan: LinearKernelPlan,
+) {
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        match plan {
+            LinearKernelPlan::Bf16GraphsafeGemm => ffi::gemm_graphsafe_cuda(
+                w_ptr as *const ffi::Half,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                1,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("gemm_graphsafe_cuda failed"),
+            LinearKernelPlan::Bf16CublasGemm => ffi::gemm_cuda(
+                w_ptr as *const ffi::Half,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                x.seq_len as i32,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("gemm_cuda failed"),
+            _ => unreachable!("unexpected BF16 linear plan {plan:?}"),
+        }
+    }
 }
 
 /// GEMM into pre-allocated output buffer (zero allocation).
@@ -456,293 +912,16 @@ pub(crate) fn gemm_into(
         out.seq_len, x.seq_len
     );
 
-    // ── Marlin W4 GEMM for prefill (seq_len > 1) ──
-    // Massive speedup (5-25x TTFT) but causes decode quality degradation
-    // due to FP16↔BF16 precision differences at prefill/decode boundary.
-    // Enable with models repacked via scripts/marlin_repack.py.
-    if x.seq_len > 1 && weight.has_marlin() {
-        let mp = weight.marlin_packed.as_ref().unwrap();
-        let ms = weight.marlin_scales.as_ref().unwrap();
-        let m = x.seq_len;
-        let n = weight.rows;
-        let k = weight.cols;
-
-        // BF16→FP16 input conversion
-        let mut x_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * k).expect("alloc x_fp16");
-        {
-            let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-            let (xf_ptr, _gf) = x_fp16.device_ptr_mut(&ctx.stream);
-            unsafe {
-                ffi::bf16_to_fp16_cuda(
-                    x_ptr as *const ffi::Half,
-                    xf_ptr as *mut ffi::Half,
-                    (m * k) as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("bf16_to_fp16 failed");
-            }
+    let plan = LinearKernelPlan::batched(weight, x.seq_len);
+    match plan {
+        LinearKernelPlan::MarlinW4Gemm => run_marlin_w4_gemm(ctx, weight, x, out),
+        LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
+            run_turboquant_linear(ctx, weight, x, out, plan);
         }
-
-        // FP16 output buffer
-        let mut y_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * n).expect("alloc y_fp16");
-
-        // Marlin workspace (lock buffer)
-        let sms = ctx.sm_count() as i32;
-        let ws_size = unsafe { ffi::marlin_workspace_size(n as i32, sms) };
-        let ws_elems = ws_size.div_ceil(4); // round up to i32 count
-        let mut workspace: CudaSlice<i32> = ctx
-            .stream
-            .alloc_zeros(ws_elems)
-            .expect("alloc marlin workspace");
-
-        // Run Marlin GEMM
-        {
-            let (xf_ptr, _g1) = x_fp16.device_ptr(&ctx.stream);
-            let (mp_ptr, _g2) = mp.device_ptr(&ctx.stream);
-            let (yf_ptr, _g3) = y_fp16.device_ptr_mut(&ctx.stream);
-            let (ms_ptr, _g4) = ms.device_ptr(&ctx.stream);
-            let (ws_ptr, _g5) = workspace.device_ptr_mut(&ctx.stream);
-            let ret = unsafe {
-                ffi::marlin_gemm_cuda(
-                    xf_ptr as *const ffi::Half,
-                    mp_ptr as *const u8,
-                    yf_ptr as *mut ffi::Half,
-                    ms_ptr as *mut ffi::Half, // scales (fp16)
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    ws_ptr as *mut i32,
-                    weight.group_size as i32,
-                    0, // dev
-                    ctx.stream.cu_stream(),
-                    -1, // thread_k (auto)
-                    -1, // thread_n (auto)
-                    sms,
-                    16, // max_par
-                )
-            };
-            assert_eq!(ret, 0, "marlin_gemm_cuda failed with code {ret}");
+        LinearKernelPlan::Bf16GraphsafeGemm | LinearKernelPlan::Bf16CublasGemm => {
+            run_bf16_linear(ctx, weight, x, out, plan);
         }
-
-        // FP16→BF16 output conversion
-        {
-            let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);
-            let (y_ptr, _g2) = out.data.device_ptr_mut(&ctx.stream);
-            unsafe {
-                ffi::fp16_to_bf16_cuda(
-                    yf_ptr as *const ffi::Half,
-                    y_ptr as *mut ffi::Half,
-                    (m * n) as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("fp16_to_bf16 failed");
-            }
-        }
-
-        return;
-    }
-
-    // ── TurboQuant weight dispatch (fused dequant GEMV / dequant + cuBLAS) ──
-    if weight.has_tq() {
-        let tq_p = weight.tq_packed.as_ref().unwrap();
-        let tq_s = weight.tq_scales.as_ref().unwrap();
-        let tq_sg = weight.tq_signs.as_ref().unwrap();
-        let tq_c = weight.tq_centroids.as_ref().unwrap();
-
-        let n = weight.rows as i32;
-        let k = weight.cols as i32;
-        let gs = weight.group_size as i32;
-        let num_groups = (weight.cols / weight.group_size) as i32;
-        let effective_bits = if weight.tq_bits == 3 {
-            4
-        } else {
-            weight.tq_bits as usize
-        };
-        let packed_cols = (weight.cols * effective_bits).div_ceil(8) as i32;
-        let bits = weight.tq_bits as i32;
-        let stream = ctx.stream.cu_stream();
-
-        let (tp_ptr, _g1) = tq_p.device_ptr(&ctx.stream);
-        let (ts_ptr, _g2) = tq_s.device_ptr(&ctx.stream);
-        let (tsg_ptr, _g3) = tq_sg.device_ptr(&ctx.stream);
-        let (tc_ptr, _g4) = tq_c.device_ptr(&ctx.stream);
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
-
-        if x.seq_len == 1 {
-            // Decode: fused dequant-GEMV (reads packed weights, ~4x less bandwidth)
-            unsafe {
-                ffi::turboquant_weight_gemv_cuda(
-                    tp_ptr as *const u8,
-                    ts_ptr as *const ffi::Half,
-                    tsg_ptr as *const i8,
-                    tc_ptr as *const f32,
-                    x_ptr as *const ffi::Half,
-                    y_ptr as *mut ffi::Half,
-                    n,
-                    k,
-                    gs,
-                    packed_cols,
-                    num_groups,
-                    bits,
-                    stream,
-                );
-            }
-        } else {
-            // Prefill: bulk dequant to BF16 workspace → cuBLAS GEMM
-            let ws_size = weight.rows * weight.cols;
-            let mut workspace: CudaSlice<bf16> = ctx
-                .stream
-                .alloc_zeros(ws_size)
-                .expect("alloc TQ dequant workspace");
-            let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
-            unsafe {
-                ffi::turboquant_weight_dequant_cuda(
-                    tp_ptr as *const u8,
-                    ts_ptr as *const ffi::Half,
-                    tsg_ptr as *const i8,
-                    tc_ptr as *const f32,
-                    ws_ptr as *mut ffi::Half,
-                    n,
-                    k,
-                    gs,
-                    packed_cols,
-                    num_groups,
-                    bits,
-                    stream,
-                );
-                ffi::gemm_cuda(
-                    ws_ptr as *const ffi::Half,
-                    x_ptr as *const ffi::Half,
-                    y_ptr as *mut ffi::Half,
-                    n,
-                    x.seq_len as i32,
-                    k,
-                    stream,
-                )
-                .result()
-                .expect("TQ dequant+cuBLAS GEMM failed");
-            }
-        }
-        return;
-    }
-
-    // ── Quantized weight dispatch (Q3_K / Q4_K / W2/4/8 A16) ──
-    //
-    // Decode (B=1)          → single-row GEMV kernel for the matching bit width.
-    // Small batch (2..=8)   → batched GEMV (cheap; avoids the dequant-to-tile cost).
-    // Prefill (B>8)         → QxK: dequant the whole weight to a BF16 tile then
-    //                         cuBLAS GEMM. W2/W4/W8: batched GEMV (cuBLAS-free
-    //                         path keeps CUDA Graph compatibility).
-    if weight.is_quantized() {
-        let qw = weight
-            .qweight
-            .as_ref()
-            .expect("quantized matrix missing qweight");
-        let qs = weight
-            .qscales
-            .as_ref()
-            .expect("quantized matrix missing qscales");
-        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-        let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-        let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
-        let n = weight.rows as i32;
-        let k = weight.cols as i32;
-        let gs = weight.group_size as i32;
-        let b = x.seq_len as i32;
-        let stream = ctx.stream.cu_stream();
-
-        let wptr = qw_ptr as *const u8;
-        let wptr_i8 = qw_ptr as *const i8;
-        let xptr = x_ptr as *const ffi::Half;
-        let yptr = y_ptr as *mut ffi::Half;
-        let sptr = qs_ptr as *const ffi::Half;
-
-        // QxK prefill path: dequant → cuBLAS GEMM. Branches out on big B.
-        let is_qxk = matches!(weight.quant_bits, qbits::Q3K | qbits::Q4K | qbits::Q6K);
-        if b > 8 && is_qxk {
-            let ws_elems = weight.rows * weight.cols;
-            let mut workspace: CudaSlice<bf16> = ctx
-                .stream
-                .alloc_zeros(ws_elems)
-                .expect("alloc QxK dequant workspace");
-            let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
-            let tile = ws_ptr as *mut ffi::Half;
-            unsafe {
-                let dq = match weight.quant_bits {
-                    qbits::Q3K => ffi::q3k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream),
-                    qbits::Q4K => ffi::q4k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream),
-                    qbits::Q6K => ffi::q6k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream),
-                    _ => unreachable!(),
-                };
-                dq.result().expect("qxk_dequant_chunk_cuda failed");
-                ffi::gemm_cuda(tile.cast_const(), xptr, yptr, n, b, k, stream)
-                    .result()
-                    .expect("QxK prefill cuBLAS GEMM failed");
-            }
-            return;
-        }
-
-        // GEMV path for everything else (decode or batched).
-        unsafe {
-            use qbits::{Q3K, Q4K, Q6K, W2, W4};
-            let res = match (b == 1, weight.quant_bits) {
-                (true, Q3K) => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-                (true, Q4K) => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-                (true, Q6K) => ffi::q6k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-                (true, W2) => ffi::w2a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, gs, stream),
-                (true, W4) => ffi::w4a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, gs, stream),
-                (true, _) => ffi::w8a16_gemv_cuda(wptr_i8, sptr, xptr, yptr, n, k, gs, stream),
-                (false, Q3K) => ffi::q3k_gemv_batch_cuda(wptr, xptr, yptr, b, n, k, stream),
-                (false, Q4K) => ffi::q4k_gemv_batch_cuda(wptr, xptr, yptr, b, n, k, stream),
-                (false, Q6K) => ffi::q6k_gemv_batch_cuda(wptr, xptr, yptr, b, n, k, stream),
-                (false, W2) => {
-                    ffi::w2a16_gemv_batch_cuda(wptr, sptr, xptr, yptr, b, n, k, gs, stream)
-                }
-                (false, W4) => {
-                    ffi::w4a16_gemv_batch_cuda(wptr, sptr, xptr, yptr, b, n, k, gs, stream)
-                }
-                (false, _) => {
-                    ffi::w8a16_gemv_batch_cuda(wptr_i8, sptr, xptr, yptr, b, n, k, gs, stream)
-                }
-            };
-            res.result().expect("quantized GEMV/GEMM failed");
-        }
-        return;
-    }
-
-    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        if x.seq_len == 1 {
-            ffi::gemm_graphsafe_cuda(
-                w_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                y_ptr as *mut ffi::Half,
-                weight.rows as i32,
-                1,
-                weight.cols as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .expect("gemm_graphsafe_cuda failed");
-        } else {
-            ffi::gemm_cuda(
-                w_ptr as *const ffi::Half,
-                x_ptr as *const ffi::Half,
-                y_ptr as *mut ffi::Half,
-                weight.rows as i32,
-                x.seq_len as i32,
-                weight.cols as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .expect("gemm_cuda failed");
-        }
+        LinearKernelPlan::Bf16Gemv => unreachable!("batched linear never selects BF16 GEMV"),
+        _ => run_qweight_linear(ctx, weight, x, out, plan),
     }
 }

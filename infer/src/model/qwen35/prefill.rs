@@ -837,7 +837,7 @@ impl Qwen35Model {
     }
 
     fn graphsafe_batched_weight(weight: &DeviceMatrix) -> bool {
-        !weight.is_quantized() && !weight.has_marlin() && !weight.has_tq()
+        weight.is_dense_bf16()
     }
 
     fn prefill_gemm_into(
