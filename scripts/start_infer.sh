@@ -31,6 +31,14 @@ echo ""
 
 cd "$(dirname "$0")/../infer"
 
-cargo run --release -- \
+# `infer` has no default backend; the caller picks one (and optionally adds
+# tilelang-attn for the Phase 0 A/B). Default to `cuda` so the existing
+# bench wrappers keep working.
+INFER_FEATURES="${INFER_FEATURES:-cuda}"
+
+cargo run --release \
+    --no-default-features \
+    --features "${INFER_FEATURES}" \
+    -- \
     --model-path "../${MODEL_PATH}" \
     --port "${PORT}"

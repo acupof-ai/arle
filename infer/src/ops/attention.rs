@@ -485,7 +485,10 @@ impl PagedPrefillForward {
 
         // Single plan call for the whole forward. All layers share the same
         // (batch_size, qo_len, kv_len, page_size, num_heads) shape, so one
-        // plan covers them all.
+        // plan covers them all. TileLang reads paged KV directly and never
+        // consumes plan_info — skip the plan to keep the A/B comparison a
+        // pure _run swap.
+        #[cfg(not(feature = "tilelang-attn"))]
         plan.plan_hd128(
             ctx,
             &qo_indptr,
@@ -495,6 +498,8 @@ impl PagedPrefillForward {
             num_kv_heads,
             page_size,
         )?;
+        #[cfg(feature = "tilelang-attn")]
+        let _ = (plan, num_q_heads, num_kv_heads);
 
         let qo_indptr_dev: CudaSlice<i32> = ctx
             .stream
