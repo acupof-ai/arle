@@ -1,12 +1,13 @@
-//! CLI: convert an instruction-tuning dataset JSONL from a common public
-//! schema into the canonical `{"messages": [...]}` format consumed by
-//! `train_sft`. See `train::data_adapter` for supported formats.
+//! Dispatch source for `arle data convert`. Converts an instruction-tuning
+//! dataset JSONL from a common public schema into the canonical
+//! `{"messages": [...]}` format consumed by `arle train sft`. See
+//! `train::data_adapter` for supported formats.
 //!
-//! Usage:
+//! Usage (via the unified front door):
 //! ```bash
-//! convert_dataset --input  /path/to/dolly.jsonl \
-//!                 --format dolly \
-//!                 --output /path/to/dolly.chat.jsonl
+//! arle data convert --input /path/to/dolly.jsonl \
+//!                   --format dolly \
+//!                   --output /path/to/dolly.chat.jsonl
 //! ```
 
 use std::{path::PathBuf, process::ExitCode};
@@ -34,7 +35,7 @@ where
             "--format" => format = args.next(),
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: convert_dataset --input <jsonl> --format <chat|dolly|alpaca|sharegpt> --output <jsonl>"
+                    "usage: arle data convert --input <jsonl> --format <chat|dolly|alpaca|sharegpt> --output <jsonl>"
                 );
                 return ExitCode::from(0);
             }

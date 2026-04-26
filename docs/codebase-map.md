@@ -120,11 +120,13 @@ surface.
 
 Key files:
 
-- `crates/train/src/bin/eval_lm.rs`: standalone eval entrypoint for checkpoint dirs written by current train code
-- `crates/train/src/bin/pretrain.rs`: canonical `pretrain` entrypoint; `--serve` starts the train-side control plane for scratch pretraining
-- `crates/train/src/bin/train_sft.rs`: supervised fine-tune entrypoint; `--serve` starts the same control plane
-- `crates/train/src/bin/train_grpo.rs`: single-turn GRPO entrypoint; `--serve` starts the same control plane
-- `crates/train/src/bin/train_multi_turn.rs`: current multi-turn entrypoint on the Qwen3.5-family dense/full-attn path; `--serve` starts the same control plane
+- `crates/train/src/bin/eval_lm.rs`: dispatch source for `arle train eval`; included as a module by `crates/cli/src/train_cli.rs`
+- `crates/train/src/bin/pretrain.rs`: dispatch source for `arle train pretrain`; `--serve` starts the train-side control plane for scratch pretraining
+- `crates/train/src/bin/train_sft.rs`: dispatch source for `arle train sft`; `--serve` starts the same control plane
+- `crates/train/src/bin/train_grpo.rs`: dispatch source for `arle train grpo`; `--serve` starts the same control plane
+- `crates/train/src/bin/train_multi_turn.rs`: dispatch source for `arle train multi-turn` on the Qwen3.5-family dense/full-attn path; `--serve` starts the same control plane
+
+> The standalone `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` / `eval_lm` / `download_dataset` / `convert_dataset` binaries that previously shipped from `crates/train` are no longer produced. Each `src/bin/*.rs` file now exists solely as a dispatch source included in-process by `train_cli.rs`; there is one user-facing front door (`arle train ...` / `arle data ...`).
 - `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|events|stop|save`
 - `crates/train/src/control.rs`: shared controller / status state plus recent event ring buffer used by the server thread and trainer loop
 - `crates/train/src/metrics.rs`: shared async observability sink, lifecycle/artifact events, bounded-queue backpressure accounting, and MLflow / OTLP / W&B export adapters

@@ -34,8 +34,9 @@ As of 2026-04-23, the repository already ships:
   live prefix reuse, and Beta DFlash work.
 - A strong local tiered-KV path (`T0 GPU -> T1 host pinned -> T2 local disk`,
   with a minimal shared backend surface for cluster-shared experiments).
-- A runtime-led local agent/train/eval stack: `arle`, `pretrain`, `train_sft`,
-  `train_grpo`, `train_multi_turn`, `eval_lm`, and the train-side
+- A runtime-led local agent/train/eval stack: `arle` as the unified front
+  door (`arle run`, `arle serve`, `arle train {pretrain,sft,grpo,multi-turn,eval}`,
+  `arle data {download,convert}`), plus the train-side
   `/v1/train/{status,events,stop,save}` control plane.
 
 Evidence for performance claims lives under

@@ -1,11 +1,11 @@
-//! CLI: download a single file from a HuggingFace dataset repo and print
-//! the resulting local cache path on stdout. Designed to be chained with
-//! other trainer binaries:
+//! Dispatch source for `arle data download`. Downloads a single file from a
+//! HuggingFace dataset repo and prints the resulting local cache path on
+//! stdout, intended to be chained with other train surfaces:
 //!
 //! ```bash
-//! DATA=$(download_dataset --repo allenai/tulu-3-sft-mixture \
-//!                         --file data/train.jsonl)
-//! train_sft --data "$DATA" ...
+//! DATA=$(arle data download --repo allenai/tulu-3-sft-mixture \
+//!                           --file data/train.jsonl)
+//! arle train sft --data "$DATA" ...
 //! ```
 //!
 //! Stderr is reserved for progress / log output; stdout is *only* the
@@ -34,7 +34,7 @@ where
             "--repo" => repo = args.next(),
             "--file" => file = args.next(),
             "--help" | "-h" => {
-                eprintln!("usage: download_dataset --repo <hf-dataset-id> --file <path-in-repo>");
+                eprintln!("usage: arle data download --repo <hf-dataset-id> --file <path-in-repo>");
                 return ExitCode::from(0);
             }
             other => {

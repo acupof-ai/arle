@@ -16,9 +16,9 @@
 //! Intended wire-up:
 //!
 //! ```bash
-//! DATA=$(cargo run --release -p train --bin download_dataset -- \
-//!        --repo allenai/tulu-3-sft-mixture --file data/train.jsonl)
-//! cargo run --release -p train --bin train_sft -- --data "$DATA" ...
+//! DATA=$(arle data download --repo allenai/tulu-3-sft-mixture \
+//!        --file data/train.jsonl)
+//! arle train sft --data "$DATA" ...
 //! ```
 
 use std::path::PathBuf;
