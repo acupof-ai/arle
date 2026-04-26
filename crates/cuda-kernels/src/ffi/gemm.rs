@@ -227,6 +227,35 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn q5k_gemv_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn q5k_gemv_batch_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn q5k_dequant_chunk_cuda(
+        weight: *const u8,
+        out_bf16: *mut Half,
+        n: i32,
+        k: i32,
+        k_start: i32,
+        k_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn turboquant_weight_gemv_cuda(
         packed: *const u8,
         scales: *const Half, // f16

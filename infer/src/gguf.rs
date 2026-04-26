@@ -446,6 +446,40 @@ impl GgufFile {
         Ok(raw)
     }
 
+    /// Read a Q5_K tensor in packed form (raw 176-byte superblock layout).
+    ///
+    /// Layout per superblock:
+    /// `d:f16(2) | dmin:f16(2) | scales_packed(12) | qh(32) | qs(128)`.
+    pub fn read_tensor_q5k_packed(&self, name: &str) -> Result<Vec<u8>> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("Tensor '{}' not found in GGUF", name))?;
+        if info.dtype != GgmlType::Q5_K {
+            bail!("Expected Q5_K, got {:?}", info.dtype);
+        }
+        let numel = info.numel();
+        if numel % 256 != 0 {
+            bail!(
+                "Q5_K tensor '{}' numel {} is not a multiple of 256",
+                name,
+                numel
+            );
+        }
+        let expected = (numel / 256) * 176;
+        let raw = self.read_tensor_raw(name)?;
+        if raw.len() != expected {
+            bail!(
+                "Q5_K tensor '{}': expected {} bytes ({} superblocks), got {}",
+                name,
+                expected,
+                numel / 256,
+                raw.len()
+            );
+        }
+        Ok(raw)
+    }
+
     /// Read and dequantize a tensor to BF16.
     pub fn read_tensor_bf16(&self, name: &str) -> Result<Vec<bf16>> {
         let info = self

@@ -113,6 +113,20 @@ array verify_quantized_matmul_cpp(
     int32_t bits,
     bool transpose = true);
 
+array gguf_quantized_matmul_cpp(
+    const array& x,
+    const array& w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols);
+
+array gguf_embedding_cpp(
+    const array& ids,
+    const array& w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols);
+
 extern "C" mlx_array* qwen35_moe_block_forward(
     mlx_array* hidden,
     mlx_array* router_w,

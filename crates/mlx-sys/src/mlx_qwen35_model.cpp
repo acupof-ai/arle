@@ -401,8 +401,14 @@ struct QWeight {
     int group_size = 64;
     int bits = 4;
     bool is_dense = false;  // if true, w is already transposed, use matmul directly
+    int gguf_format = 0;
+    int rows = 0;
+    int cols = 0;
 
     array apply(const array& x, bool prefer_verify_m16 = false) const {
+        if (gguf_format != 0) {
+            return gguf_quantized_matmul_cpp(x, w, gguf_format, rows, cols);
+        }
         if (is_dense) {
             return matmul(x, w);  // w is already transposed at load time
         }
@@ -508,8 +514,11 @@ struct Qwen35CompiledModel {
     QWeight lm_head;
     // Quantized embed weights for as_linear lm_head (when tied)
     QWeight embed_as_linear;
+    QWeight embed_packed;
+    bool use_packed_embed = false;
     bool use_embed_as_linear = false;
     std::vector<LayerWeights> layers;
+    std::vector<QWeight> weight_pool;
 
     // Config
     float rope_theta = 1e6f;
@@ -1104,7 +1113,9 @@ struct Qwen35CompiledModel {
         int S = ctx.seq_len;  // 1 for decode, >1 for batch prefill
 
         int F = n_full_attn, G = n_gdr;
-        auto x = take(embed_tokens, flatten(token_id), 0);
+        auto x = use_packed_embed
+            ? gguf_embedding_cpp(token_id, embed_packed.w, embed_packed.gguf_format, embed_packed.rows, embed_packed.cols)
+            : take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {B, S, hidden_size});
         bool keep_intermediates = ctx.keep_intermediates && artifacts;
         bool prefer_verify_m16 = should_prefer_verify_m16(ctx);
@@ -1267,6 +1278,13 @@ struct Qwen35CompiledModel {
 
 // ── FFI ────────────────────────────────────────────────────────────────────
 
+QWeight& qwen35_weight_by_id(Qwen35CompiledModel* model, int32_t id) {
+    if (id < 0 || id >= static_cast<int32_t>(model->weight_pool.size())) {
+        throw std::runtime_error("invalid Qwen3.5 compiled weight id");
+    }
+    return model->weight_pool[static_cast<size_t>(id)];
+}
+
 extern "C" {
 
 void* qwen35_compiled_new() {
@@ -1275,6 +1293,47 @@ void* qwen35_compiled_new() {
 
 void qwen35_compiled_free(void* model) {
     MLX_TRY_VOID(delete static_cast<Qwen35CompiledModel*>(model));
+}
+
+int32_t qwen35_compiled_add_dense_weight(void* model, mlx_array* w) {
+    MLX_TRY_RETURN_VALUE(-1, [&]() {
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->weight_pool.push_back({*to_arr(w), array(0), array(0), 0, 0, true});
+        return static_cast<int32_t>(m->weight_pool.size() - 1);
+    }());
+}
+
+int32_t qwen35_compiled_add_affine_weight(
+    void* model,
+    mlx_array* w,
+    mlx_array* scales,
+    mlx_array* biases,
+    int32_t group_size,
+    int32_t bits) {
+    MLX_TRY_RETURN_VALUE(-1, [&]() {
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->weight_pool.push_back({
+            *to_arr(w), *to_arr(scales), *to_arr(biases), group_size, bits, false});
+        return static_cast<int32_t>(m->weight_pool.size() - 1);
+    }());
+}
+
+int32_t qwen35_compiled_add_gguf_weight(
+    void* model,
+    mlx_array* w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols) {
+    MLX_TRY_RETURN_VALUE(-1, [&]() {
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        QWeight weight;
+        weight.w = *to_arr(w);
+        weight.gguf_format = format;
+        weight.rows = rows;
+        weight.cols = cols;
+        m->weight_pool.push_back(std::move(weight));
+        return static_cast<int32_t>(m->weight_pool.size() - 1);
+    }());
 }
 
 void qwen35_compiled_set_config(
@@ -1316,6 +1375,36 @@ void qwen35_compiled_set_embed(
     });
 }
 
+void qwen35_compiled_set_embed_v2(
+    void* model,
+    mlx_array* embed_tokens,
+    mlx_array* final_norm_w,
+    int32_t lm_head_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->embed_tokens = embed_tokens == nullptr ? array(0) : *to_arr(embed_tokens);
+        m->use_packed_embed = false;
+        m->final_norm_w = *to_arr(final_norm_w);
+        m->lm_head = qwen35_weight_by_id(m, lm_head_id);
+        m->use_embed_as_linear = false;
+    });
+}
+
+void qwen35_compiled_set_packed_embed_v2(
+    void* model,
+    int32_t embed_id,
+    mlx_array* final_norm_w,
+    int32_t lm_head_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->embed_packed = qwen35_weight_by_id(m, embed_id);
+        m->use_packed_embed = true;
+        m->final_norm_w = *to_arr(final_norm_w);
+        m->lm_head = qwen35_weight_by_id(m, lm_head_id);
+        m->use_embed_as_linear = false;
+    });
+}
+
 // Set quantized embed weights for as_linear lm_head (when tie_word_embeddings=true).
 // This uses quantized_matmul instead of dense matmul, reading 0.3GB vs 1.2GB per step.
 void qwen35_compiled_set_embed_as_linear(
@@ -1326,6 +1415,14 @@ void qwen35_compiled_set_embed_as_linear(
     auto* m = static_cast<Qwen35CompiledModel*>(model);
     m->embed_as_linear = {*to_arr(w), *to_arr(s), *to_arr(b), gs, bits, false};
     m->use_embed_as_linear = true;
+}
+
+void qwen35_compiled_set_embed_as_linear_v2(void* model, int32_t embed_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->embed_as_linear = qwen35_weight_by_id(m, embed_id);
+        m->use_embed_as_linear = true;
+    });
 }
 
 void qwen35_compiled_push_full_attn(
@@ -1413,6 +1510,99 @@ void qwen35_compiled_push_gdr(
     });
 }
 
+void qwen35_compiled_push_full_attn_v2(
+    void* model,
+    mlx_array* input_ln,
+    mlx_array* post_ln,
+    int32_t q_id,
+    int32_t k_id,
+    int32_t v_id,
+    int32_t o_id,
+    mlx_array* q_norm,
+    mlx_array* k_norm,
+    int32_t gate_up_id,
+    int32_t gate_dim,
+    int32_t down_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        LayerWeights lw;
+        lw.is_gdr = false;
+        lw.full.input_ln_w = *to_arr(input_ln);
+        lw.full.post_attn_ln_w = *to_arr(post_ln);
+        lw.full.q_proj = qwen35_weight_by_id(m, q_id);
+        lw.full.k_proj = qwen35_weight_by_id(m, k_id);
+        lw.full.v_proj = qwen35_weight_by_id(m, v_id);
+        lw.full.o_proj = qwen35_weight_by_id(m, o_id);
+        lw.full.q_norm_w = *to_arr(q_norm);
+        lw.full.k_norm_w = *to_arr(k_norm);
+        lw.full.gate_up = qwen35_weight_by_id(m, gate_up_id);
+        lw.full.down = qwen35_weight_by_id(m, down_id);
+        lw.full.gate_dim = gate_dim;
+        m->layers.push_back(std::move(lw));
+        m->n_full_attn++;
+    });
+}
+
+void qwen35_compiled_push_gdr_v2(
+    void* model,
+    mlx_array* input_ln,
+    mlx_array* post_ln,
+    int32_t qkvz_id,
+    int32_t qkv_split,
+    int32_t z_split,
+    int32_t ba_id,
+    int32_t ba_num_heads,
+    mlx_array* conv1d_w,
+    int32_t conv_kernel,
+    mlx_array* a_log,
+    mlx_array* dt_bias,
+    mlx_array* norm_w,
+    float gdr_rms_eps,
+    int32_t out_id,
+    int32_t num_key_heads,
+    int32_t key_dim,
+    int32_t num_value_heads,
+    int32_t value_dim,
+    int32_t gate_up_id,
+    int32_t gate_dim,
+    int32_t down_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        LayerWeights lw;
+        lw.is_gdr = true;
+        lw.gdr.input_ln_w = *to_arr(input_ln);
+        lw.gdr.post_attn_ln_w = *to_arr(post_ln);
+        if (qkvz_id >= 0) {
+            lw.gdr.qkvz_proj = qwen35_weight_by_id(m, qkvz_id);
+        }
+        lw.gdr.qkv_split = qkv_split;
+        lw.gdr.z_split = z_split;
+        if (ba_id >= 0) {
+            lw.gdr.ba_proj = qwen35_weight_by_id(m, ba_id);
+        }
+        lw.gdr.ba_num_heads = ba_num_heads;
+        lw.gdr.conv1d_w = *to_arr(conv1d_w);
+        lw.gdr.conv_kernel = conv_kernel;
+        lw.gdr.a_log = negative(exp(astype(*to_arr(a_log), float32)));
+        lw.gdr.dt_bias = *to_arr(dt_bias);
+        lw.gdr.norm_w = *to_arr(norm_w);
+        lw.gdr.rms_eps = gdr_rms_eps;
+        lw.gdr.out_proj = qwen35_weight_by_id(m, out_id);
+        lw.gdr.num_key_heads = num_key_heads;
+        lw.gdr.key_dim = key_dim;
+        lw.gdr.num_value_heads = num_value_heads;
+        lw.gdr.value_dim = value_dim;
+        float inv = 1.0f / std::sqrt((float)key_dim);
+        lw.gdr.q_scale_arr = astype(array(inv * inv), bfloat16);
+        lw.gdr.k_scale_arr = astype(array(inv), bfloat16);
+        lw.gdr.gate_up = qwen35_weight_by_id(m, gate_up_id);
+        lw.gdr.down = qwen35_weight_by_id(m, down_id);
+        lw.gdr.gate_dim = gate_dim;
+        m->layers.push_back(std::move(lw));
+        m->n_gdr++;
+    });
+}
+
 void qwen35_compiled_set_last_moe_mlp(
     void* model,
     mlx_array* router_w, mlx_array* router_s, mlx_array* router_b, int32_t router_gs, int32_t router_bits,
@@ -1483,6 +1673,28 @@ void qwen35_compiled_set_separate_proj(
     });
 }
 
+void qwen35_compiled_set_separate_proj_v2(
+    void* model,
+    int32_t qkv_id,
+    int32_t z_id,
+    int32_t b_id,
+    int32_t a_id,
+    int32_t gate_id,
+    int32_t up_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        auto& lw = m->layers.back().gdr;
+        lw.qkv_proj = qwen35_weight_by_id(m, qkv_id);
+        lw.z_proj = qwen35_weight_by_id(m, z_id);
+        lw.b_proj = qwen35_weight_by_id(m, b_id);
+        lw.a_proj = qwen35_weight_by_id(m, a_id);
+        lw.gate_proj = qwen35_weight_by_id(m, gate_id);
+        lw.up_proj = qwen35_weight_by_id(m, up_id);
+        lw.has_separate_mlp = true;
+        lw.use_separate_proj = true;
+    });
+}
+
 void qwen35_compiled_set_separate_mlp(
     void* model,
     mlx_array* gate_w, mlx_array* gate_s, mlx_array* gate_b, int32_t mlp_gs, int32_t mlp_bits,
@@ -1493,6 +1705,19 @@ void qwen35_compiled_set_separate_mlp(
         auto& lw = m->layers.back().gdr;
         lw.gate_proj = {*to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), mlp_gs, mlp_bits};
         lw.up_proj = {*to_arr(up_w), *to_arr(up_s), *to_arr(up_b), mlp_gs, mlp_bits};
+        lw.has_separate_mlp = true;
+    });
+}
+
+void qwen35_compiled_set_separate_mlp_v2(
+    void* model,
+    int32_t gate_id,
+    int32_t up_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        auto& lw = m->layers.back().gdr;
+        lw.gate_proj = qwen35_weight_by_id(m, gate_id);
+        lw.up_proj = qwen35_weight_by_id(m, up_id);
         lw.has_separate_mlp = true;
     });
 }

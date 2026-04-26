@@ -416,7 +416,16 @@ fn run_bench() -> Result<()> {
     backend.load(std::path::Path::new(&cli.model))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
-    let quant_hint = if cli.model.contains("4bit") || cli.model.contains("4-bit") {
+    let model_lower = cli.model.to_lowercase();
+    let quant_hint = if model_lower.contains("q4_k") {
+        "gguf-q4_k"
+    } else if model_lower.contains("q5_k") {
+        "gguf-q5_k"
+    } else if model_lower.contains("q6_k") {
+        "gguf-q6_k"
+    } else if model_lower.contains("q8_0") {
+        "gguf-q8_0"
+    } else if cli.model.contains("4bit") || cli.model.contains("4-bit") {
         "4-bit"
     } else if cli.model.contains("8bit") || cli.model.contains("8-bit") {
         "8-bit"
