@@ -1,11 +1,13 @@
-# ARLE Examples
+# Examples
 
-These examples are copyable entry points for the public surfaces.
+Copy-paste paths for the public surfaces. Set `ARLE_MODEL` (and `ARLE_BASE_URL`) to avoid repeating flags.
 
-- `curl_chat.sh`: minimal OpenAI-compatible chat request.
-- `openai_chat.py`: stdlib Python client for `/v1/chat/completions`.
-- `docker-compose.cuda.yml`: CUDA container serving through `arle serve`.
-- `metal_local.sh`: Apple Silicon local serving smoke.
-- `train_tiny_fixture.sh`: build the canonical tiny train fixture and run it.
+| File | What it is |
+|---|---|
+| [`curl_chat.sh`](curl_chat.sh) | Minimal OpenAI-compatible chat request via `curl`. |
+| [`openai_chat.py`](openai_chat.py) | OpenAI Python SDK client against `/v1/chat/completions`. |
+| [`docker-compose.cuda.yml`](docker-compose.cuda.yml) | CUDA serving via `docker compose up`. |
+| [`metal_local.sh`](metal_local.sh) | Apple Silicon local serving smoke. |
+| [`train_tiny_fixture.sh`](train_tiny_fixture.sh) | Build and run the canonical tiny train fixture. |
 
-Set `ARLE_MODEL` to avoid repeating `--model-path`.
+Server-side prerequisite for all of the above: a running `arle serve …` (or `infer …`) instance — see [Quick Start](../README.md#quick-start).
