@@ -63,13 +63,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # mlx C++ uses `@available(macOS 14, *)` checks that emit
-  # `__isPlatformVersionAtLeast` calls (from compiler-rt). Setting the
-  # deployment target to 14.0 wasn't enough — the macos-14 runner builds
-  # mlx against SDK 14.8.5, so the symbol still gets emitted. Bumping to
-  # 15.0 makes the @available branch always-true at compile time so the
-  # check is elided entirely.
-  MACOSX_DEPLOYMENT_TARGET: "15.0"
 
 concurrency:
   group: metal-ci-${{ github.ref }}
