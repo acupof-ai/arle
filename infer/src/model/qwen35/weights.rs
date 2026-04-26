@@ -447,13 +447,23 @@ impl Qwen35Model {
         gguf: &crate::gguf::GgufFile,
         enable_cuda_graph: bool,
     ) -> Result<Self> {
-        use crate::qwen35_gguf_host::{Qwen35LinearGgufLayout, load_qwen35_linear_attention_host};
+        use crate::gguf::{
+            load_matrix_v_reorder_cols_bf16_host, load_qwen35_a_log_f32_host,
+            load_qwen35_conv1d_bf16_host, load_qwen35_qkv_matrix_bf16_host, load_vector_f32_host,
+            load_vector_v_reorder_bf16_host,
+        };
+        use crate::qwen35_gguf_host::Qwen35LinearGgufLayout;
         use crate::weight_loader::{
             load_tensor_1d_gguf_offset_norm, load_tensor_2d_gguf, load_tensor_2d_gguf_bf16,
-            precompute_rope,
+            load_tensor_2d_gguf_v_reorder_rows, precompute_rope,
         };
 
         let linear_layout = Qwen35LinearGgufLayout::from_config(config)?;
+        let num_k = linear_layout.num_key_heads;
+        let num_v = linear_layout.num_value_heads;
+        let vpk = linear_layout.num_value_heads_per_key();
+        let hd_k = linear_layout.key_head_dim;
+        let hd_v = linear_layout.value_head_dim;
         // GGUF stores norm weights with +1 offset baked in (e.g., w_gguf = 1 + w_hf).
         // Use load_tensor_1d_gguf_offset_norm for all RMSNorm/QK-norm weights.
         let load_norm =
@@ -497,44 +507,97 @@ impl Qwen35Model {
                 }
                 LayerType::LinearAttention => {
                     let ap = format!("{p}.linear_attn");
-                    let host = load_qwen35_linear_attention_host(gguf, &ap, linear_layout)?;
                     LayerKind::LinearAttention(LinearAttentionLayer {
                         in_proj_qkv: {
+                            let tensor = load_qwen35_qkv_matrix_bf16_host(
+                                gguf,
+                                &format!("{ap}.in_proj_qkv.weight"),
+                                num_k,
+                                vpk,
+                                hd_k,
+                                hd_v,
+                            )?;
                             DeviceMatrix::from_host(
                                 ctx,
-                                &host.in_proj_qkv.data,
-                                host.in_proj_qkv.shape[0],
-                                host.in_proj_qkv.shape[1],
+                                &tensor.data,
+                                tensor.shape[0],
+                                tensor.shape[1],
                             )?
                         },
-                        in_proj_z: DeviceMatrix::from_host(
+                        in_proj_z: load_tensor_2d_gguf_v_reorder_rows(
                             ctx,
-                            &host.in_proj_z.data,
-                            host.in_proj_z.shape[0],
-                            host.in_proj_z.shape[1],
+                            gguf,
+                            &format!("{ap}.in_proj_z.weight"),
+                            num_k,
+                            vpk,
+                            hd_v,
                         )?,
-                        in_proj_b: DeviceMatrix::from_host(
+                        in_proj_b: load_tensor_2d_gguf_v_reorder_rows(
                             ctx,
-                            &host.in_proj_b.data,
-                            host.in_proj_b.shape[0],
-                            host.in_proj_b.shape[1],
+                            gguf,
+                            &format!("{ap}.in_proj_b.weight"),
+                            num_k,
+                            vpk,
+                            1,
                         )?,
-                        in_proj_a: DeviceMatrix::from_host(
+                        in_proj_a: load_tensor_2d_gguf_v_reorder_rows(
                             ctx,
-                            &host.in_proj_a.data,
-                            host.in_proj_a.shape[0],
-                            host.in_proj_a.shape[1],
+                            gguf,
+                            &format!("{ap}.in_proj_a.weight"),
+                            num_k,
+                            vpk,
+                            1,
                         )?,
-                        conv1d_weight: { DeviceVec::from_host(ctx, &host.conv1d_weight.data)? },
-                        dt_bias: DeviceVec::from_host(ctx, &host.dt_bias.data)?,
-                        a_log: ctx.stream.clone_htod(&host.a_log.data)?,
-                        norm_weight: ctx.stream.clone_htod(&host.norm_weight.data)?,
-                        out_proj: DeviceMatrix::from_host(
-                            ctx,
-                            &host.out_proj.data,
-                            host.out_proj.shape[0],
-                            host.out_proj.shape[1],
-                        )?,
+                        conv1d_weight: {
+                            let tensor = load_qwen35_conv1d_bf16_host(
+                                gguf,
+                                &format!("{ap}.conv1d.weight"),
+                                num_k,
+                                hd_k,
+                                num_v,
+                                hd_v,
+                                linear_layout.conv_kernel_dim,
+                            )?;
+                            DeviceVec::from_host(ctx, &tensor.data)?
+                        },
+                        dt_bias: {
+                            let tensor = load_vector_v_reorder_bf16_host(
+                                gguf,
+                                &format!("{ap}.dt_bias"),
+                                num_k,
+                                vpk,
+                                1,
+                            )?;
+                            DeviceVec::from_host(ctx, &tensor.data)?
+                        },
+                        a_log: {
+                            let tensor = load_qwen35_a_log_f32_host(
+                                gguf,
+                                &format!("{ap}.a_log"),
+                                num_k,
+                                vpk,
+                            )?;
+                            ctx.stream.clone_htod(&tensor.data)?
+                        },
+                        norm_weight: {
+                            let tensor = load_vector_f32_host(gguf, &format!("{ap}.norm.weight"))?;
+                            ctx.stream.clone_htod(&tensor.data)?
+                        },
+                        out_proj: {
+                            let tensor = load_matrix_v_reorder_cols_bf16_host(
+                                gguf,
+                                &format!("{ap}.out_proj.weight"),
+                                num_k,
+                                vpk,
+                                hd_v,
+                            )?;
+                            DeviceMatrix::from_host(
+                                ctx,
+                                &tensor.data,
+                                tensor.shape[0],
+                                tensor.shape[1],
+                            )?
+                        },
                     })
                 }
             };

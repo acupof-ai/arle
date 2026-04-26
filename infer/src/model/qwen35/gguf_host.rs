@@ -75,6 +75,7 @@ pub(crate) struct Qwen35GgufFullAttentionHost {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) struct Qwen35GgufLinearAttentionHost {
     pub(crate) in_proj_qkv: HostTensor<bf16>,
     pub(crate) in_proj_z: HostTensor<bf16>,
@@ -120,6 +121,7 @@ pub(crate) struct Qwen35GgufHostWeights {
     pub(crate) layers: Vec<Qwen35GgufBlockHost>,
 }
 
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn load_qwen35_linear_attention_host(
     gguf: &GgufFile,
     attn_prefix: &str,
