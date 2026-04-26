@@ -157,6 +157,7 @@ Full history: [CHANGELOG.md](CHANGELOG.md). Next up: [ROADMAP.md](ROADMAP.md).
 - [docs/codebase-map.md](docs/codebase-map.md) — workspace layout and main execution paths
 - [docs/environment.md](docs/environment.md) — environment variables and runtime knobs
 - [docs/troubleshooting.md](docs/troubleshooting.md) — common build / runtime errors and fixes
+- [docs/comparison.md](docs/comparison.md) — how ARLE compares to vLLM / SGLang / mistral.rs / llama.cpp
 - [docs/release-checklist.md](docs/release-checklist.md) · [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contributor setup, validation, release expectations
 - [SECURITY.md](SECURITY.md) — vulnerability reporting policy
