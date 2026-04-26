@@ -19,6 +19,7 @@ mod budget;
 mod core;
 mod decode;
 mod execution;
+mod policy;
 mod prefill;
 mod request;
 mod runtime;

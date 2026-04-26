@@ -4,19 +4,21 @@ use crate::kv_tier::coordinator::{CoordinatorQueueStats, QueueControlStats, Stor
 use crate::prefix_cache::BlockMetadata;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum PrefetchMode {
+#[allow(dead_code)] // `WaitComplete` reserved for future policy mode.
+pub(super) enum PrefetchMode {
     BestEffort,
     WaitComplete,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum WriteBackMode {
+#[allow(dead_code)] // `WriteThrough` reserved for future policy mode.
+pub(super) enum WriteBackMode {
     WriteThrough,
     WriteThroughSelective,
 }
 
 #[derive(Clone, Debug)]
-pub struct TieredKvPolicy {
+pub(super) struct TieredKvPolicy {
     fetch_soft_limit: f64,
     store_soft_limit: f64,
     remote_store_min_hits: u32,
@@ -37,18 +39,18 @@ impl Default for TieredKvPolicy {
 }
 
 impl TieredKvPolicy {
-    pub fn allow_prefetch(&self, queue: QueueControlStats) -> bool {
+    pub(super) fn allow_prefetch(&self, queue: QueueControlStats) -> bool {
         match self.prefetch_mode {
             PrefetchMode::BestEffort => !queue.soft_saturated(self.fetch_soft_limit),
             PrefetchMode::WaitComplete => true,
         }
     }
 
-    pub fn allow_store(&self, queue: QueueControlStats) -> bool {
+    pub(super) fn allow_store(&self, queue: QueueControlStats) -> bool {
         !queue.soft_saturated(self.store_soft_limit)
     }
 
-    pub fn choose_store_target(
+    pub(super) fn choose_store_target(
         &self,
         metadata: &BlockMetadata,
         stats: CoordinatorQueueStats,
