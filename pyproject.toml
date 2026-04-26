@@ -1,12 +1,24 @@
+# This file is NOT a publishable Python package. It exists only so
+# `pip install -e ".[bench|dev|observe|serve]"` resolves the named bundles
+# of Python tooling that ARLE's CI / bench scripts / wandb sidecar use.
+# The Rust crates that actually ship under the name "ARLE" live in
+# Cargo.toml, infer/Cargo.toml, and crates/*/Cargo.toml.
+#
+# Do not upload this to PyPI. The `Private :: Do Not Upload` classifier
+# below makes that explicit; the package name is `arle-pytools` for the
+# same reason — to avoid being confused with the Rust `agent-infer`
+# crate / `arle` binary if anyone ever runs `pip install agent-infer`.
+
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-infer"
+name = "arle-pytools"
 version = "0.1.0"
-description = "Rust LLM inference engine with a local agent binary"
+description = "Private Python tooling bundle for ARLE (bench, dev, observe, serve). Not a publishable package."
 requires-python = ">=3.10"
+classifiers = ["Private :: Do Not Upload"]
 dependencies = [
     "httpx>=0.27",
     "tokenizers>=0.20",
