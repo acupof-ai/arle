@@ -156,6 +156,7 @@ Full history: [CHANGELOG.md](CHANGELOG.md). Next up: [ROADMAP.md](ROADMAP.md).
 - [docs/architecture.md](docs/architecture.md) — package boundaries and dependency direction
 - [docs/codebase-map.md](docs/codebase-map.md) — workspace layout and main execution paths
 - [docs/environment.md](docs/environment.md) — environment variables and runtime knobs
+- [docs/troubleshooting.md](docs/troubleshooting.md) — common build / runtime errors and fixes
 - [docs/release-checklist.md](docs/release-checklist.md) · [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contributor setup, validation, release expectations
 - [SECURITY.md](SECURITY.md) — vulnerability reporting policy
