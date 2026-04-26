@@ -3,7 +3,7 @@
 #
 # FlashInfer: C++ headers only (--no-deps install). Version MUST match
 # csrc/cuda/flashinfer_decode.cu API (0.6.x has enable_pdl param).
-flashinfer-python==0.6.3
+flashinfer-python==0.6.9
 
 # Triton: AOT kernel compilation (silu_mul, add, embedding, attention decode).
 triton==3.5.1
