@@ -1082,7 +1082,7 @@ fn qwen35_layer_types_from_interval(
 // ── Dequantization ──
 
 /// Dequantize raw GGUF tensor bytes to BF16.
-fn dequant_to_bf16(raw: &[u8], dtype: GgmlType, numel: usize) -> Result<Vec<bf16>> {
+pub(crate) fn dequant_to_bf16(raw: &[u8], dtype: GgmlType, numel: usize) -> Result<Vec<bf16>> {
     match dtype {
         GgmlType::BF16 => {
             assert_eq!(raw.len(), numel * 2);
@@ -1691,6 +1691,24 @@ mod tests {
         assert_eq!(result[0], bf16::from_f32(0.0));
         // hi = (9 - 8) * 1.0 = 1.0
         assert!((result[1].to_f32() - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn parse_only_gguf_quant_types_fail_explicitly_in_dequant_path() {
+        for dtype in [
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q8_1,
+            GgmlType::Q2_K,
+            GgmlType::Q8_K,
+        ] {
+            let err = dequant_to_bf16(&[], dtype, 0).unwrap_err().to_string();
+            assert!(
+                err.contains("Dequant not yet implemented"),
+                "unexpected error for {dtype:?}: {err}"
+            );
+        }
     }
 
     #[test]

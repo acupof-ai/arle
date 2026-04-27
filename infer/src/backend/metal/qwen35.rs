@@ -159,6 +159,7 @@ fn mlx_f32_tensor(tensor: &HostTensor<f32>) -> MlxArray {
 fn gguf_packed_format(dtype: GgmlType) -> Option<GgufPackedFormat> {
     match dtype {
         GgmlType::Q8_0 => Some(GgufPackedFormat::Q8_0),
+        GgmlType::Q3_K => Some(GgufPackedFormat::Q3_K),
         GgmlType::Q4_K => Some(GgufPackedFormat::Q4_K),
         GgmlType::Q5_K => Some(GgufPackedFormat::Q5_K),
         GgmlType::Q6_K => Some(GgufPackedFormat::Q6_K),
@@ -166,7 +167,7 @@ fn gguf_packed_format(dtype: GgmlType) -> Option<GgufPackedFormat> {
     }
 }
 
-fn load_gguf_weight_tensor(gguf: &GgufFile, hf_name: &str) -> Result<WeightTensor> {
+fn gguf_matrix_info(gguf: &GgufFile, hf_name: &str) -> Result<(String, GgmlType, usize, usize)> {
     let gguf_name = find_tensor_name(gguf, hf_name)?;
     let info = gguf
         .tensors
@@ -179,30 +180,50 @@ fn load_gguf_weight_tensor(gguf: &GgufFile, hf_name: &str) -> Result<WeightTenso
     );
     let rows = usize::try_from(info.shape[1]).context("GGUF row count overflows usize")?;
     let cols = usize::try_from(info.shape[0]).context("GGUF col count overflows usize")?;
+    Ok((gguf_name, info.dtype, rows, cols))
+}
 
-    if let Some(format) = gguf_packed_format(info.dtype) {
-        ensure!(
-            cols.is_multiple_of(format.block_size()),
-            "GGUF tensor '{hf_name}' cols={cols} is not aligned to {:?}",
-            format
-        );
+fn packed_row_bytes(format: GgufPackedFormat, cols: usize, hf_name: &str) -> Result<usize> {
+    ensure!(
+        cols.is_multiple_of(format.block_size()),
+        "GGUF tensor '{hf_name}' cols={cols} is not aligned to {:?}",
+        format
+    );
+    Ok((cols / format.block_size()) * format.block_bytes())
+}
+
+fn gguf_packed_weight_from_bytes(
+    hf_name: &str,
+    packed: &[u8],
+    format: GgufPackedFormat,
+    rows: usize,
+    cols: usize,
+) -> Result<WeightTensor> {
+    let row_bytes = packed_row_bytes(format, cols, hf_name)?;
+    let expected = rows * row_bytes;
+    ensure!(
+        packed.len() == expected,
+        "GGUF tensor '{hf_name}' packed size {} != expected {expected}",
+        packed.len()
+    );
+    let w = MlxArray::from_slice_u8(
+        packed,
+        &[i32::try_from(packed.len()).context("packed GGUF tensor too large")?],
+    );
+    Ok(WeightTensor::GgufPacked {
+        w,
+        format,
+        rows: i32::try_from(rows).context("GGUF row count overflows i32")?,
+        cols: i32::try_from(cols).context("GGUF col count overflows i32")?,
+    })
+}
+
+fn load_gguf_weight_tensor(gguf: &GgufFile, hf_name: &str) -> Result<WeightTensor> {
+    let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
+
+    if let Some(format) = gguf_packed_format(dtype) {
         let packed = gguf.read_tensor_raw(&gguf_name)?;
-        let expected = rows * (cols / format.block_size()) * format.block_bytes();
-        ensure!(
-            packed.len() == expected,
-            "GGUF tensor '{hf_name}' packed size {} != expected {expected}",
-            packed.len()
-        );
-        let w = MlxArray::from_slice_u8(
-            &packed,
-            &[i32::try_from(packed.len()).context("packed GGUF tensor too large")?],
-        );
-        return Ok(WeightTensor::GgufPacked {
-            w,
-            format,
-            rows: i32::try_from(rows).context("GGUF row count overflows i32")?,
-            cols: i32::try_from(cols).context("GGUF col count overflows i32")?,
-        });
+        return gguf_packed_weight_from_bytes(hf_name, &packed, format, rows, cols);
     }
 
     let dense = gguf.read_tensor_bf16(&gguf_name)?;
@@ -219,44 +240,11 @@ fn load_gguf_weight_tensor(gguf: &GgufFile, hf_name: &str) -> Result<WeightTenso
 }
 
 fn load_gguf_embedding(gguf: &GgufFile, hf_name: &str) -> Result<(Qwen35Embedding, WeightTensor)> {
-    let gguf_name = find_tensor_name(gguf, hf_name)?;
-    let info = gguf
-        .tensors
-        .get(&gguf_name)
-        .with_context(|| format!("missing GGUF tensor metadata for '{gguf_name}'"))?;
-    ensure!(
-        info.shape.len() == 2,
-        "expected 2D GGUF embedding for '{hf_name}', got {}D",
-        info.shape.len()
-    );
-    let rows =
-        usize::try_from(info.shape[1]).context("GGUF embedding row count overflows usize")?;
-    let cols =
-        usize::try_from(info.shape[0]).context("GGUF embedding col count overflows usize")?;
+    let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
 
-    if let Some(format) = gguf_packed_format(info.dtype) {
-        ensure!(
-            cols.is_multiple_of(format.block_size()),
-            "GGUF embedding '{hf_name}' cols={cols} is not aligned to {:?}",
-            format
-        );
+    if let Some(format) = gguf_packed_format(dtype) {
         let packed = gguf.read_tensor_raw(&gguf_name)?;
-        let expected = rows * (cols / format.block_size()) * format.block_bytes();
-        ensure!(
-            packed.len() == expected,
-            "GGUF embedding '{hf_name}' packed size {} != expected {expected}",
-            packed.len()
-        );
-        let w = MlxArray::from_slice_u8(
-            &packed,
-            &[i32::try_from(packed.len()).context("packed GGUF embedding too large")?],
-        );
-        let weight = WeightTensor::GgufPacked {
-            w,
-            format,
-            rows: i32::try_from(rows).context("GGUF embedding row count overflows i32")?,
-            cols: i32::try_from(cols).context("GGUF embedding col count overflows i32")?,
-        };
+        let weight = gguf_packed_weight_from_bytes(hf_name, &packed, format, rows, cols)?;
         return Ok((Qwen35Embedding::GgufPacked(weight.clone()), weight));
     }
 
@@ -276,6 +264,90 @@ fn load_gguf_embedding(gguf: &GgufFile, hf_name: &str) -> Result<(Qwen35Embeddin
     Ok((Qwen35Embedding::Dense(embed_tokens), lm_head))
 }
 
+fn reorder_gguf_packed_v_rows(
+    src: &[u8],
+    rows: usize,
+    row_bytes: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+    hf_name: &str,
+) -> Result<Vec<u8>> {
+    ensure!(
+        row_bytes > 0,
+        "packed GGUF row bytes must be non-zero for '{hf_name}'"
+    );
+    ensure!(
+        src.len() == rows * row_bytes,
+        "unexpected packed GGUF byte count for '{}': got {}, expected {}",
+        hf_name,
+        src.len(),
+        rows * row_bytes
+    );
+    ensure!(
+        rows == num_k_heads * num_v_per_k * head_dim,
+        "unexpected packed V-row count for '{}': got {}, expected {}",
+        hf_name,
+        rows,
+        num_k_heads * num_v_per_k * head_dim
+    );
+
+    let mut dst = src.to_vec();
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
+            let gguf_head = v * num_k_heads + k;
+            let hf_head = k * num_v_per_k + v;
+            let src_start = gguf_head * head_dim * row_bytes;
+            let dst_start = hf_head * head_dim * row_bytes;
+            let len = head_dim * row_bytes;
+            dst[dst_start..dst_start + len].copy_from_slice(&src[src_start..src_start + len]);
+        }
+    }
+    Ok(dst)
+}
+
+fn reorder_qwen35_qkv_packed_v_rows(
+    packed: &mut [u8],
+    rows: usize,
+    cols: usize,
+    format: GgufPackedFormat,
+    layout: Qwen35LinearGgufLayout,
+    hf_name: &str,
+) -> Result<()> {
+    let row_bytes = packed_row_bytes(format, cols, hf_name)?;
+    let q_rows = layout.num_key_heads * layout.key_head_dim;
+    let k_rows = layout.num_key_heads * layout.key_head_dim;
+    let v_rows = layout.num_key_heads * layout.num_value_heads_per_key() * layout.value_head_dim;
+    ensure!(
+        rows == q_rows + k_rows + v_rows,
+        "unexpected packed QKV row count for '{}': got {}, expected {}",
+        hf_name,
+        rows,
+        q_rows + k_rows + v_rows
+    );
+    ensure!(
+        packed.len() == rows * row_bytes,
+        "unexpected packed QKV byte count for '{}': got {}, expected {}",
+        hf_name,
+        packed.len(),
+        rows * row_bytes
+    );
+
+    let v_start = (q_rows + k_rows) * row_bytes;
+    let v_end = v_start + v_rows * row_bytes;
+    let reordered = reorder_gguf_packed_v_rows(
+        &packed[v_start..v_end],
+        v_rows,
+        row_bytes,
+        layout.num_key_heads,
+        layout.num_value_heads_per_key(),
+        layout.value_head_dim,
+        hf_name,
+    )?;
+    packed[v_start..v_end].copy_from_slice(&reordered);
+    Ok(())
+}
+
 fn load_gguf_qwen35_qkv_weight(
     gguf: &GgufFile,
     hf_name: &str,
@@ -283,6 +355,13 @@ fn load_gguf_qwen35_qkv_weight(
 ) -> Result<WeightTensor> {
     if layout.num_value_heads_per_key() <= 1 {
         return load_gguf_weight_tensor(gguf, hf_name);
+    }
+
+    let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
+    if let Some(format) = gguf_packed_format(dtype) {
+        let mut packed = gguf.read_tensor_raw(&gguf_name)?;
+        reorder_qwen35_qkv_packed_v_rows(&mut packed, rows, cols, format, layout, hf_name)?;
+        return gguf_packed_weight_from_bytes(hf_name, &packed, format, rows, cols);
     }
 
     let tensor = crate::gguf::load_qwen35_qkv_matrix_bf16_host(
@@ -306,6 +385,22 @@ fn load_gguf_v_rows_weight(
         return load_gguf_weight_tensor(gguf, hf_name);
     }
 
+    let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
+    if let Some(format) = gguf_packed_format(dtype) {
+        let packed = gguf.read_tensor_raw(&gguf_name)?;
+        let row_bytes = packed_row_bytes(format, cols, hf_name)?;
+        let reordered = reorder_gguf_packed_v_rows(
+            &packed,
+            rows,
+            row_bytes,
+            layout.num_key_heads,
+            layout.num_value_heads_per_key(),
+            head_dim,
+            hf_name,
+        )?;
+        return gguf_packed_weight_from_bytes(hf_name, &reordered, format, rows, cols);
+    }
+
     let tensor = crate::gguf::load_matrix_v_reorder_rows_bf16_host(
         gguf,
         hf_name,
@@ -324,6 +419,32 @@ fn load_gguf_v_cols_weight(
 ) -> Result<WeightTensor> {
     if layout.num_value_heads_per_key() <= 1 {
         return load_gguf_weight_tensor(gguf, hf_name);
+    }
+
+    let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
+    if let Some(format) = gguf_packed_format(dtype) {
+        let packed = gguf.read_tensor_raw(&gguf_name)?;
+        let row_bytes = packed_row_bytes(format, cols, hf_name)?;
+        ensure!(
+            packed.len() == rows * row_bytes,
+            "GGUF tensor '{hf_name}' packed size {} != expected {}",
+            packed.len(),
+            rows * row_bytes
+        );
+        return Ok(WeightTensor::GgufPackedInputReordered {
+            w: MlxArray::from_slice_u8(
+                &packed,
+                &[i32::try_from(packed.len()).context("packed GGUF tensor too large")?],
+            ),
+            format,
+            rows: i32::try_from(rows).context("GGUF row count overflows i32")?,
+            cols: i32::try_from(cols).context("GGUF col count overflows i32")?,
+            num_key_heads: i32::try_from(layout.num_key_heads)
+                .context("Qwen3.5 key head count overflows i32")?,
+            num_value_heads_per_key: i32::try_from(layout.num_value_heads_per_key())
+                .context("Qwen3.5 grouped value-head count overflows i32")?,
+            head_dim: i32::try_from(head_dim).context("Qwen3.5 head_dim overflows i32")?,
+        });
     }
 
     let tensor = crate::gguf::load_matrix_v_reorder_cols_bf16_host(
@@ -663,6 +784,24 @@ impl CppQwen35Model {
                         format.as_i32(),
                         *rows,
                         *cols,
+                    ),
+                    WeightTensor::GgufPackedInputReordered {
+                        w,
+                        format,
+                        rows,
+                        cols,
+                        num_key_heads,
+                        num_value_heads_per_key,
+                        head_dim,
+                    } => mlx_sys::qwen35_compiled_add_gguf_input_reordered_weight(
+                        model,
+                        w.as_raw(),
+                        format.as_i32(),
+                        *rows,
+                        *cols,
+                        *num_key_heads,
+                        *num_value_heads_per_key,
+                        *head_dim,
                     ),
                 }
             };
@@ -1676,7 +1815,9 @@ fn extract_qw(
             *group_size,
             *bits,
         )),
-        WeightTensor::Dense(_) | WeightTensor::GgufPacked { .. } => None,
+        WeightTensor::Dense(_)
+        | WeightTensor::GgufPacked { .. }
+        | WeightTensor::GgufPackedInputReordered { .. } => None,
     }
 }
 
@@ -2577,7 +2718,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
     log::info!("  loading Qwen3.5 GGUF on Metal — preserving packed quantized weights");
     if linear_layout.num_value_heads_per_key() > 1 {
         log::info!(
-            "  grouped value heads detected; using BF16 reorder fallback for Qwen3.5 linear-attention V projections"
+            "  grouped value heads detected; QKV/Z/B/A stay packed, out_proj reorders activations before packed matmul"
         );
     }
     let (embedding, tied_lm_head) = load_gguf_embedding(gguf, "model.embed_tokens.weight")?;
@@ -2977,11 +3118,16 @@ mod tests {
     use crate::backend::metal::{
         config::load_metal_config,
         gdr::MetalRecurrentState,
-        mlx::{Dtype, as_dtype, concatenate_axis, eval, reshape, slice, slice_update, zeros},
+        mlx::{
+            Dtype, as_dtype, concatenate_axis, eval, gguf_quantized_matmul, reshape, slice,
+            slice_update, zeros,
+        },
         weights::load_qwen3_metal_weights,
     };
+    use crate::gguf::dequant_to_bf16;
     use crate::test_support::metal_test_guard;
     use crate::tokenizer::Tokenizer;
+    use half::f16;
 
     fn slice_row_for_sampling(array: &MlxArray, row: i32) -> MlxArray {
         let mut start = vec![0; array.shape().len()];
@@ -3010,6 +3156,147 @@ mod tests {
         eval(&[&combined]);
         assert_eq!(combined.shape(), &[3, 2]);
         assert_eq!(combined.as_slice_f32(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    fn put_f16(dst: &mut [u8], offset: usize, value: f32) {
+        dst[offset..offset + 2].copy_from_slice(&f16::from_f32(value).to_le_bytes());
+    }
+
+    fn synthetic_gguf_packed(format: GgufPackedFormat, rows: usize, cols: usize) -> Vec<u8> {
+        let row_bytes = (cols / format.block_size()) * format.block_bytes();
+        let mut raw = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            for block in 0..(cols / format.block_size()) {
+                let base = row * row_bytes + block * format.block_bytes();
+                for i in 0..format.block_bytes() {
+                    raw[base + i] = (17 * row + 31 * block + 13 * i + 7) as u8;
+                }
+                match format {
+                    GgufPackedFormat::Q8_0 => {
+                        put_f16(&mut raw, base, 0.00390625);
+                        for i in 0..32 {
+                            raw[base + 2 + i] = ((i as i8) - 16) as u8;
+                        }
+                    }
+                    GgufPackedFormat::Q3_K => {
+                        for i in 96..108 {
+                            raw[base + i] = 0x11 + (i as u8 & 0x03);
+                        }
+                        put_f16(&mut raw, base + 108, 0.00390625);
+                    }
+                    GgufPackedFormat::Q4_K => {
+                        put_f16(&mut raw, base, 0.00390625);
+                        put_f16(&mut raw, base + 2, 0.001953125);
+                    }
+                    GgufPackedFormat::Q5_K => {
+                        put_f16(&mut raw, base, 0.00390625);
+                        put_f16(&mut raw, base + 2, 0.001953125);
+                    }
+                    GgufPackedFormat::Q6_K => {
+                        for i in 192..208 {
+                            raw[base + i] = (i as u8).wrapping_sub(200);
+                        }
+                        put_f16(&mut raw, base + 208, 0.00390625);
+                    }
+                }
+            }
+        }
+        raw
+    }
+
+    fn gguf_dtype_for_format(format: GgufPackedFormat) -> GgmlType {
+        match format {
+            GgufPackedFormat::Q8_0 => GgmlType::Q8_0,
+            GgufPackedFormat::Q3_K => GgmlType::Q3_K,
+            GgufPackedFormat::Q4_K => GgmlType::Q4_K,
+            GgufPackedFormat::Q5_K => GgmlType::Q5_K,
+            GgufPackedFormat::Q6_K => GgmlType::Q6_K,
+        }
+    }
+
+    #[test]
+    fn gguf_packed_format_metadata_covers_supported_metal_kernels() {
+        assert_eq!(GgufPackedFormat::Q8_0.block_size(), 32);
+        assert_eq!(GgufPackedFormat::Q8_0.block_bytes(), 34);
+        assert_eq!(GgufPackedFormat::Q3_K.block_size(), 256);
+        assert_eq!(GgufPackedFormat::Q3_K.block_bytes(), 110);
+        assert_eq!(GgufPackedFormat::Q4_K.block_bytes(), 144);
+        assert_eq!(GgufPackedFormat::Q5_K.block_bytes(), 176);
+        assert_eq!(GgufPackedFormat::Q6_K.block_bytes(), 210);
+    }
+
+    #[test]
+    fn qwen35_grouped_v_reorder_preserves_packed_rows() {
+        let rows = 12;
+        let row_bytes = 3;
+        let src: Vec<u8> = (0..rows * row_bytes).map(|i| i as u8).collect();
+        let dst = reorder_gguf_packed_v_rows(&src, rows, row_bytes, 2, 3, 2, "dummy").unwrap();
+        let src_rows = src.chunks_exact(row_bytes).collect::<Vec<_>>();
+        let dst_rows = dst.chunks_exact(row_bytes).collect::<Vec<_>>();
+        assert_eq!(dst_rows[0], src_rows[0]);
+        assert_eq!(dst_rows[1], src_rows[1]);
+        assert_eq!(dst_rows[2], src_rows[4]);
+        assert_eq!(dst_rows[3], src_rows[5]);
+        assert_eq!(dst_rows[4], src_rows[8]);
+        assert_eq!(dst_rows[5], src_rows[9]);
+        assert_eq!(dst_rows[6], src_rows[2]);
+        assert_eq!(dst_rows[7], src_rows[3]);
+        assert_eq!(dst_rows[8], src_rows[6]);
+        assert_eq!(dst_rows[9], src_rows[7]);
+        assert_eq!(dst_rows[10], src_rows[10]);
+        assert_eq!(dst_rows[11], src_rows[11]);
+    }
+
+    #[test]
+    fn gguf_quantized_matmul_matches_cpu_reference_for_all_metal_packed_formats() {
+        let _guard = metal_test_guard();
+        let formats = [
+            GgufPackedFormat::Q8_0,
+            GgufPackedFormat::Q3_K,
+            GgufPackedFormat::Q4_K,
+            GgufPackedFormat::Q5_K,
+            GgufPackedFormat::Q6_K,
+        ];
+        for format in formats {
+            let rows = 3usize;
+            let cols = 256usize;
+            let raw = synthetic_gguf_packed(format, rows, cols);
+            let deq = dequant_to_bf16(&raw, gguf_dtype_for_format(format), rows * cols)
+                .unwrap()
+                .into_iter()
+                .map(f32::from)
+                .collect::<Vec<_>>();
+
+            for m in [1usize, 3] {
+                let x_host = (0..m * cols)
+                    .map(|i| ((i % 13) as f32 - 6.0) * 0.001953125)
+                    .collect::<Vec<_>>();
+                let x = MlxArray::from_slice_f32(&x_host, &[m as i32, cols as i32]);
+                let w = MlxArray::from_slice_u8(&raw, &[raw.len() as i32]);
+                let y = gguf_quantized_matmul(&x, &w, format.as_i32(), rows as i32, cols as i32);
+                let y = as_dtype(&y, Dtype::Float32);
+                eval(&[&y]);
+                let actual = y.as_slice_f32();
+
+                let mut expected = vec![0.0f32; m * rows];
+                for mi in 0..m {
+                    for row in 0..rows {
+                        let mut sum = 0.0f32;
+                        for k in 0..cols {
+                            sum += x_host[mi * cols + k] * deq[row * cols + k];
+                        }
+                        expected[mi * rows + row] = sum;
+                    }
+                }
+                for (idx, (&got, &want)) in actual.iter().zip(expected.iter()).enumerate() {
+                    let diff = (got - want).abs();
+                    assert!(
+                        diff < 0.15,
+                        "format={format:?} m={m} idx={idx} got={got} want={want} diff={diff}"
+                    );
+                }
+            }
+        }
     }
 
     fn left_pad_kv_cache_row_for_test(
@@ -3081,7 +3368,9 @@ mod tests {
                 eval(&[&tensor]);
                 Ok(tensor)
             }
-            WeightTensor::Quantized { .. } | WeightTensor::GgufPacked { .. } => {
+            WeightTensor::Quantized { .. }
+            | WeightTensor::GgufPacked { .. }
+            | WeightTensor::GgufPackedInputReordered { .. } => {
                 anyhow::bail!("expected dense weight tensor")
             }
         }

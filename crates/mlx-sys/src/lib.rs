@@ -378,6 +378,16 @@ unsafe extern "C" {
         rows: i32,
         cols: i32,
     ) -> i32;
+    pub fn qwen35_compiled_add_gguf_input_reordered_weight(
+        model: *mut std::ffi::c_void,
+        w: *mut mlx_array,
+        format: i32,
+        rows: i32,
+        cols: i32,
+        num_key_heads: i32,
+        num_value_heads_per_key: i32,
+        head_dim: i32,
+    ) -> i32;
     pub fn qwen35_compiled_set_config(
         model: *mut std::ffi::c_void,
         rope_theta: f32,

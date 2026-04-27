@@ -687,6 +687,23 @@ fn clone_weight_tensor(weight: &WeightTensor) -> WeightTensor {
             rows: *rows,
             cols: *cols,
         },
+        WeightTensor::GgufPackedInputReordered {
+            w,
+            format,
+            rows,
+            cols,
+            num_key_heads,
+            num_value_heads_per_key,
+            head_dim,
+        } => WeightTensor::GgufPackedInputReordered {
+            w: w.clone(),
+            format: *format,
+            rows: *rows,
+            cols: *cols,
+            num_key_heads: *num_key_heads,
+            num_value_heads_per_key: *num_value_heads_per_key,
+            head_dim: *head_dim,
+        },
     }
 }
 
@@ -714,7 +731,7 @@ fn extract_dflash_weight(
             *group_size,
             *bits,
         ),
-        WeightTensor::GgufPacked { .. } => {
+        WeightTensor::GgufPacked { .. } | WeightTensor::GgufPackedInputReordered { .. } => {
             panic!("DFlash draft model does not support packed GGUF weights")
         }
     }
@@ -2923,7 +2940,8 @@ mod tests {
             WeightTensor::Quantized {
                 scales, group_size, ..
             } => scales.shape()[1] * *group_size,
-            WeightTensor::GgufPacked { cols, .. } => *cols,
+            WeightTensor::GgufPacked { cols, .. }
+            | WeightTensor::GgufPackedInputReordered { cols, .. } => *cols,
         }
     }
 

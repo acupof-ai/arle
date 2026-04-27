@@ -642,6 +642,29 @@ std::string gguf_quant_source() {
             return gguf_f16(p) * float(gguf_i8(p[2 + lane]));
         }
 
+        float gguf_q3_k_value(const device uint8_t* row, int k) {
+            int sb = k >> 8;
+            int local = k & 255;
+            const device uint8_t* p = row + sb * 110;
+            const device uint8_t* hmask = p;
+            const device uint8_t* qs = p + 32;
+            const device uint8_t* scales = p + 96;
+            float d = gguf_f16(p + 108);
+            int sub = local >> 4;
+            int low4;
+            if (sub < 8) {
+                low4 = int(scales[sub] & 0x0f);
+            } else {
+                low4 = int((scales[sub - 8] >> 4) & 0x0f);
+            }
+            int high2 = int((scales[8 + (sub & 3)] >> (2 * (sub / 4))) & 0x03);
+            int scale = (low4 | (high2 << 4)) - 32;
+            int q2 = int((qs[local >> 2] >> ((local & 3) * 2)) & 0x03);
+            int hbit = int((hmask[local >> 3] >> (local & 7)) & 0x01);
+            int q3 = q2 | (hbit << 2);
+            return d * float(scale) * (float(q3) - 4.0f);
+        }
+
         float gguf_q4_k_value(const device uint8_t* row, int k) {
             int sb = k >> 8;
             int local = k & 255;
@@ -736,6 +759,8 @@ auto make_gguf_matmul_kernel(const std::string& name) {
         int block_bytes;
         if constexpr (FORMAT == 8) {
             block_bytes = 34;
+        } else if constexpr (FORMAT == 11) {
+            block_bytes = 110;
         } else if constexpr (FORMAT == 12) {
             block_bytes = 144;
         } else if constexpr (FORMAT == 13) {
@@ -752,6 +777,8 @@ auto make_gguf_matmul_kernel(const std::string& name) {
             float wv;
             if constexpr (FORMAT == 8) {
                 wv = gguf_q8_0_value(row, k);
+            } else if constexpr (FORMAT == 11) {
+                wv = gguf_q3_k_value(row, k);
             } else if constexpr (FORMAT == 12) {
                 wv = gguf_q4_k_value(row, k);
             } else if constexpr (FORMAT == 13) {
@@ -802,6 +829,8 @@ auto make_gguf_matmul_m4_kernel(const std::string& name) {
         int block_bytes;
         if constexpr (FORMAT == 8) {
             block_bytes = 34;
+        } else if constexpr (FORMAT == 11) {
+            block_bytes = 110;
         } else if constexpr (FORMAT == 12) {
             block_bytes = 144;
         } else if constexpr (FORMAT == 13) {
@@ -824,6 +853,8 @@ auto make_gguf_matmul_m4_kernel(const std::string& name) {
             float wv;
             if constexpr (FORMAT == 8) {
                 wv = gguf_q8_0_value(row, k);
+            } else if constexpr (FORMAT == 11) {
+                wv = gguf_q3_k_value(row, k);
             } else if constexpr (FORMAT == 12) {
                 wv = gguf_q4_k_value(row, k);
             } else if constexpr (FORMAT == 13) {
@@ -882,6 +913,10 @@ auto& gguf_matmul_kernel(int format) {
             static auto kernel = make_gguf_matmul_kernel("gguf_q8_0_matmul");
             return kernel;
         }
+        case 11: {
+            static auto kernel = make_gguf_matmul_kernel("gguf_q3_k_matmul");
+            return kernel;
+        }
         case 12: {
             static auto kernel = make_gguf_matmul_kernel("gguf_q4_k_matmul");
             return kernel;
@@ -895,7 +930,7 @@ auto& gguf_matmul_kernel(int format) {
             return kernel;
         }
         default:
-            throw std::invalid_argument("GGUF matmul supports Q8_0, Q4_K, Q5_K, and Q6_K only");
+            throw std::invalid_argument("GGUF matmul supports Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K only");
     }
 }
 
@@ -903,6 +938,10 @@ auto& gguf_matmul_m4_kernel(int format) {
     switch (format) {
         case 8: {
             static auto kernel = make_gguf_matmul_m4_kernel("gguf_q8_0_matmul_m4");
+            return kernel;
+        }
+        case 11: {
+            static auto kernel = make_gguf_matmul_m4_kernel("gguf_q3_k_matmul_m4");
             return kernel;
         }
         case 12: {
@@ -918,7 +957,7 @@ auto& gguf_matmul_m4_kernel(int format) {
             return kernel;
         }
         default:
-            throw std::invalid_argument("GGUF matmul supports Q8_0, Q4_K, Q5_K, and Q6_K only");
+            throw std::invalid_argument("GGUF matmul supports Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K only");
     }
 }
 
@@ -945,6 +984,8 @@ auto& gguf_embedding_kernel() {
         int block_bytes;
         if constexpr (FORMAT == 8) {
             block_bytes = 34;
+        } else if constexpr (FORMAT == 11) {
+            block_bytes = 110;
         } else if constexpr (FORMAT == 12) {
             block_bytes = 144;
         } else if constexpr (FORMAT == 13) {
@@ -958,6 +999,8 @@ auto& gguf_embedding_kernel() {
         float value;
         if constexpr (FORMAT == 8) {
             value = gguf_q8_0_value(row, col);
+        } else if constexpr (FORMAT == 11) {
+            value = gguf_q3_k_value(row, col);
         } else if constexpr (FORMAT == 12) {
             value = gguf_q4_k_value(row, col);
         } else if constexpr (FORMAT == 13) {
@@ -1169,7 +1212,8 @@ array gguf_quantized_matmul_cpp(
         inputs,
         {Shape{M, rows}},
         {x_2d.dtype()},
-        M >= 2 ? std::make_tuple(rows * 256, (M + 3) / 4, 1) : std::make_tuple(rows * 256, M, 1),
+        M >= 2 ? std::make_tuple(rows * 256, (M + 3) / 4, 1)
+               : std::make_tuple(rows * 256, M, 1),
         std::make_tuple(256, 1, 1),
         tmpl,
         std::nullopt,

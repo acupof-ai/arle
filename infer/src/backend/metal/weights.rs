@@ -41,6 +41,18 @@ pub enum WeightTensor {
         rows: i32,
         cols: i32,
     },
+    /// GGUF packed weight whose input columns are stored in llama.cpp's
+    /// value-head order. Reorder the small activation vector before matmul
+    /// instead of dequantizing and rewriting the packed weight.
+    GgufPackedInputReordered {
+        w: MlxArray,
+        format: GgufPackedFormat,
+        rows: i32,
+        cols: i32,
+        num_key_heads: i32,
+        num_value_heads_per_key: i32,
+        head_dim: i32,
+    },
 }
 
 #[cfg(feature = "metal")]
@@ -51,7 +63,9 @@ impl WeightTensor {
         match self {
             WeightTensor::Dense(a) => a.dtype(),
             WeightTensor::Quantized { scales, .. } => scales.dtype(),
-            WeightTensor::GgufPacked { .. } => Dtype::Bfloat16,
+            WeightTensor::GgufPacked { .. } | WeightTensor::GgufPackedInputReordered { .. } => {
+                Dtype::Bfloat16
+            }
         }
     }
 
@@ -63,7 +77,8 @@ impl WeightTensor {
         let shape = match self {
             WeightTensor::Dense(w_t) => w_t.shape(),
             WeightTensor::Quantized { w, .. } => w.shape(),
-            WeightTensor::GgufPacked { rows, .. } => return Ok(*rows),
+            WeightTensor::GgufPacked { rows, .. }
+            | WeightTensor::GgufPackedInputReordered { rows, .. } => return Ok(*rows),
         };
 
         match self {
@@ -75,7 +90,9 @@ impl WeightTensor {
                 .first()
                 .copied()
                 .context("quantized projection missing output dimension"),
-            WeightTensor::GgufPacked { .. } => unreachable!(),
+            WeightTensor::GgufPacked { .. } | WeightTensor::GgufPackedInputReordered { .. } => {
+                unreachable!()
+            }
         }
     }
 }
@@ -86,6 +103,7 @@ impl WeightTensor {
 #[repr(i32)]
 pub enum GgufPackedFormat {
     Q8_0 = 8,
+    Q3_K = 11,
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
@@ -96,13 +114,14 @@ impl GgufPackedFormat {
     pub fn block_size(self) -> usize {
         match self {
             Self::Q8_0 => 32,
-            Self::Q4_K | Self::Q5_K | Self::Q6_K => 256,
+            Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K => 256,
         }
     }
 
     pub fn block_bytes(self) -> usize {
         match self {
             Self::Q8_0 => 34,
+            Self::Q3_K => 110,
             Self::Q4_K => 144,
             Self::Q5_K => 176,
             Self::Q6_K => 210,
@@ -651,7 +670,7 @@ fn build_qwen3_cpp_model(
             0,
             0,
         ),
-        WeightTensor::GgufPacked { .. } => {
+        WeightTensor::GgufPacked { .. } | WeightTensor::GgufPackedInputReordered { .. } => {
             unsafe { mlx_sys::qwen35_compiled_free(model) };
             return None;
         }
@@ -709,7 +728,9 @@ fn build_qwen3_cpp_model(
                     *group_size,
                     *bits,
                 )),
-                WeightTensor::Dense(_) | WeightTensor::GgufPacked { .. } => None,
+                WeightTensor::Dense(_)
+                | WeightTensor::GgufPacked { .. }
+                | WeightTensor::GgufPackedInputReordered { .. } => None,
             }
         };
 
