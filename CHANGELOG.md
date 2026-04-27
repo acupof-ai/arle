@@ -19,38 +19,75 @@ Related governance docs:
 
 ## [Unreleased]
 
-Post-v0.1.0 work landed on `main`; will be cut into the next release.
+## [0.1.1] — 2026-04-27
+
+Install ergonomics + a batch of TileLang, KV-tier, and Metal/Qwen3.5
+follow-ups. Pre-built artifacts on the
+[GitHub Release page](https://github.com/cklxx/arle/releases/tag/v0.1.1)
+and on GHCR (`ghcr.io/cklxx/arle:0.1.1`, `:0.1`, `:latest`).
+
+### Install
+
+- **Homebrew tap**: `brew install cklxx/tap/arle`
+  ([cklxx/homebrew-tap](https://github.com/cklxx/homebrew-tap)). The
+  `bump-homebrew` job in `release.yml` keeps the formula in lockstep
+  with each `v*` tag.
+- **One-line installer**: `curl -fsSL
+  https://github.com/cklxx/arle/releases/latest/download/install.sh
+  | sh`. Detects platform, SHA256-verifies the tarball, installs to
+  `~/.local/bin` (override via `INSTALL_DIR`).
+- New `docs/install.md` documents the full matrix, env-var overrides,
+  and uninstall steps; `docs/release-checklist.md` §4a covers the
+  `HOMEBREW_TAP_TOKEN` secret needed for tap automation.
+
+### Runtime
 
 - TileLang prefill HD128 path behind the `tilelang-attn` feature
-  (Experimental); per-Qwen3 head-config specialization; reaches the
-  prefill path correctly. H100 verification runbook landed.
+  (Experimental); per-Qwen3 head-config specialization. Prefill HD256
+  + decode HD256 + tc-decode AOT kernels added under the same flag.
+  L4 floor verified; H100 verification runbook landed.
 - macOS Metal link fix: `compiler-rt` now linked so mlx-sys resolves
-  `__isPlatformVersionAtLeast`; release tarballs and Metal CI now build
+  `__isPlatformVersionAtLeast`; release tarballs and Metal CI build
   cleanly on hosted runners.
+- Metal Qwen3.5 GGUF Q4 path: aligned `gdr` and prefill matmul; gated
+  GGUF DFlash; preserved greedy C++ generate. Long bench coverage
+  recorded under `docs/experience/wins/`.
 - `release.yml` now installs `flashinfer-python` (in lockstep with
   Dockerfile) so Linux CUDA tarballs build without the
   `flashinfer/pos_enc.cuh` not-found regression.
-- `docs/support-matrix.md` §4b now documents the multi-turn KV reuse /
+- KV-tier P3 follow-ups: typed `FailureClass` in events with explicit
+  emit policy; `OrchestratorEvent` unified into `CoordinatorEvent`;
+  `emit_observability` switched to `try_send` while `Store*` paths
+  retain required delivery.
+- `cargo build` no longer requires an explicit backend feature on
+  macOS — `default = ["cuda"]` was dropped from the workspace,
+  `agent-infer`, and `crates/cli` so a flag-less build no longer pulls
+  cudarc on platforms without nvcc.
+- Standalone `pretrain` / `train_sft` / `train_grpo` /
+  `train_multi_turn` / `eval_lm` / `download_dataset` /
+  `convert_dataset` binaries removed from `crates/train`;
+  `arle train …` and `arle data …` are the single front door
+  (sources still in `crates/train/src/bin/*.rs` as in-process
+  dispatch modules under `autobins = false`).
+
+### Docs & web
+
+- `docs/support-matrix.md` §4b documents the multi-turn KV reuse /
   tiered-KV stability tiers (T0 GPU Supported, T1 host-pinned Beta,
   T2 NVMe Beta, T3 cluster-shared Experimental — NIXL stub-only).
 - `docs/experience/wins/README.md` explains the `*pending-remote*.md`
   filename convention so external readers do not mistake stubs for
   published claims.
-- `docs/troubleshooting.md` and `docs/comparison.md` added; README
-  slimmed and split on macOS-default-features and on the GHCR tag
-  format (no `v` prefix).
-- `cargo build` no longer requires an explicit backend feature on
-  macOS — `default = ["cuda"]` was dropped from the workspace,
-  `agent-infer`, and `crates/cli` so a flag-less build no longer pulls
-  cudarc on platforms without nvcc.
-- Standalone `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn`
-  / `eval_lm` / `download_dataset` / `convert_dataset` binaries removed
-  from `crates/train`; `arle train …` and `arle data …` are the single
-  front door (sources still in `crates/train/src/bin/*.rs` as
-  in-process dispatch modules under `autobins = false`).
+- `docs/troubleshooting.md` and `docs/comparison.md` added.
 - Astro/Vite landing site at `web/` (deploys via `pages.yml` to
-  `https://cklxx.github.io/arle/`); homepage IA refactor — runnable
-  hero, dated bench, dropped chrome.
+  <https://cklxx.github.io/arle/>); homepage IA refactor — runnable
+  hero, dated bench, dropped chrome; switched to minimal-white
+  aesthetic.
+
+### CI
+
+- `cuda-ci.yml` gated behind `workflow_dispatch` until the
+  self-hosted CUDA runner returns.
 
 ## [0.1.0] — 2026-04-26
 
