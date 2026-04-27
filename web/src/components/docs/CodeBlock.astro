@@ -1,0 +1,97 @@
+---
+interface Props {
+  /** File label shown on the left of the header (e.g. "$ shell"). */
+  file?: string;
+  /** Language label shown on the right (e.g. "cuda", "curl", "rust"). */
+  lang?: string;
+  /** Inverted (dark) variant — primary surface for shell sessions. */
+  dark?: boolean;
+  /** Pre-formatted lines (HTML allowed). */
+  lines: string[];
+}
+const { file, lang, dark = false, lines } = Astro.props;
+---
+<div class:list={["code-block", dark ? "dark" : ""]}>
+  <header class="code-block-h">
+    {file && <span class="file">{file}</span>}
+    {lang && <span class="lang">{lang}</span>}
+    <button class="copy" type="button" aria-label="copy">copy</button>
+  </header>
+  <pre set:html={lines.join("\n")}></pre>
+</div>
+<style>
+  .code-block { margin: 24px 0; border: 1px solid var(--line); }
+  .code-block-h {
+    display: flex;
+    align-items: center;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--paper-dim);
+    font-size: 11px;
+    color: var(--ink-dim);
+    letter-spacing: 0.04em;
+  }
+  .code-block-h .file { color: var(--ink); font-weight: 500; }
+  .code-block-h .lang {
+    margin-left: auto;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 10px;
+  }
+  .code-block-h .copy {
+    margin-left: 12px;
+    padding: 2px 8px;
+    border: 1px solid var(--line);
+    background: var(--paper);
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    cursor: pointer;
+    transition: color 100ms ease, border-color 100ms ease;
+  }
+  .code-block-h .copy:hover { color: var(--ink); border-color: var(--ink); }
+
+  .code-block pre {
+    margin: 0;
+    border: none;
+    padding: 16px 20px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: auto;
+    white-space: pre;
+    background: var(--paper-dim);
+    color: var(--ink);
+  }
+  .code-block pre :global(.p) { color: var(--ink-dim); user-select: none; margin-right: 6px; }
+  .code-block pre :global(.c) { color: var(--ink-dim); }
+  .code-block pre :global(i)  { color: var(--ink-soft); font-style: normal; }
+
+  .code-block.dark pre {
+    background: var(--ink);
+    color: var(--paper);
+  }
+  .code-block.dark pre :global(.p) { color: rgba(255,255,255,0.45); }
+  .code-block.dark pre :global(.c) { color: rgba(255,255,255,0.5); }
+  .code-block.dark pre :global(i)  { color: rgba(255,255,255,0.7); }
+  .code-block.dark pre :global(b)  { color: var(--paper); }
+  .code-block.dark pre :global(.k) { color: var(--hl); }
+
+  .code-block.dark .code-block-h {
+    background: var(--ink);
+    color: rgba(255,255,255,0.6);
+    border-bottom-color: rgba(255,255,255,0.1);
+  }
+  .code-block.dark .code-block-h .file { color: var(--paper); }
+  .code-block.dark .code-block-h .copy {
+    background: rgba(255,255,255,0.04);
+    border-color: rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.7);
+  }
+  .code-block.dark .code-block-h .copy:hover {
+    color: var(--paper);
+    border-color: var(--paper);
+  }
+</style>

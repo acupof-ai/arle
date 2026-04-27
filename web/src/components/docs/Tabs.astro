@@ -1,0 +1,145 @@
+---
+interface TabPane {
+  id: string;
+  label: string;
+  /** Pre-formatted code lines (HTML allowed). */
+  lines: string[];
+  /** Header lang label (e.g. "cuda", "metal"). */
+  lang: string;
+}
+interface Props {
+  panes: TabPane[];
+  fileLabel?: string;
+}
+const { panes, fileLabel = "$ shell" } = Astro.props;
+---
+<div class="body-tabs-wrap">
+  <div class="body-tabs" role="tablist">
+    {panes.map((p, i) => (
+      <button
+        type="button"
+        class:list={[i === 0 ? "active" : ""]}
+        data-tab={p.id}
+      >{p.label}</button>
+    ))}
+  </div>
+  {panes.map((p, i) => (
+    <div class:list={["body-pane", i === 0 ? "active" : ""]} data-pane={p.id}>
+      <div class="code-block dark">
+        <header class="code-block-h">
+          <span class="file">{fileLabel}</span>
+          <span class="lang">{p.lang}</span>
+          <button class="copy" type="button">copy</button>
+        </header>
+        <pre set:html={p.lines.join("\n")}></pre>
+      </div>
+    </div>
+  ))}
+</div>
+<style>
+  .body-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--line);
+    margin: 24px 0 0;
+  }
+  .body-tabs button {
+    font-family: var(--mono);
+    background: transparent;
+    border: none;
+    padding: 8px 14px;
+    font-size: 12px;
+    color: var(--ink-soft);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: color 100ms ease, border-color 100ms ease;
+  }
+  .body-tabs button.active {
+    color: var(--ink);
+    border-bottom-color: var(--ink);
+    font-weight: 500;
+  }
+  .body-tabs button:hover { color: var(--ink); }
+  .body-pane { display: none; }
+  .body-pane.active { display: block; }
+
+  .code-block { margin: 24px 0; border: 1px solid var(--line); }
+  .code-block-h {
+    display: flex;
+    align-items: center;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+  }
+  .code-block-h .file { color: var(--paper); font-weight: 500; }
+  .code-block-h .lang {
+    margin-left: auto;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 10px;
+    color: rgba(255,255,255,0.55);
+  }
+  .code-block-h .copy {
+    margin-left: 12px;
+    padding: 2px 8px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.04);
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.7);
+    cursor: pointer;
+  }
+  .code-block-h .copy:hover { color: var(--paper); border-color: var(--paper); }
+
+  .code-block.dark .code-block-h {
+    background: var(--ink);
+    border-bottom-color: rgba(255,255,255,0.1);
+  }
+  .code-block.dark pre {
+    margin: 0;
+    border: none;
+    padding: 16px 20px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: auto;
+    white-space: pre;
+    background: var(--ink);
+    color: var(--paper);
+  }
+  .code-block.dark pre :global(.p) { color: rgba(255,255,255,0.45); user-select: none; }
+  .code-block.dark pre :global(b)  { color: var(--paper); }
+  .code-block.dark pre :global(i)  { color: rgba(255,255,255,0.7); font-style: normal; }
+</style>
+<script>
+  // Tab switching — enhances the static panes; first pane shows by default.
+  document.querySelectorAll<HTMLButtonElement>(".body-tabs button").forEach((b) => {
+    b.addEventListener("click", () => {
+      const tab = b.dataset.tab;
+      const wrap = b.closest(".body-tabs-wrap");
+      if (!wrap || !tab) return;
+      wrap.querySelectorAll<HTMLButtonElement>(".body-tabs button").forEach((x) =>
+        x.classList.toggle("active", x === b),
+      );
+      wrap.querySelectorAll<HTMLElement>(".body-pane").forEach((p) =>
+        p.classList.toggle("active", p.dataset.pane === tab),
+      );
+    });
+  });
+  // Copy-to-clipboard.
+  document.querySelectorAll<HTMLButtonElement>(".copy").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const block = btn.closest(".code-block, .req-res > div, .hero-card");
+      const pre = block?.querySelector("pre");
+      if (!pre) return;
+      navigator.clipboard?.writeText(pre.textContent ?? "");
+      const original = btn.textContent;
+      btn.textContent = "copied";
+      window.setTimeout(() => { btn.textContent = original; }, 1200);
+    });
+  });
+</script>

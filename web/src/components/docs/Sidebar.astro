@@ -1,0 +1,90 @@
+---
+import type { DocsGroup } from "../../data/docs-nav.ts";
+
+interface Props {
+  groups: DocsGroup[];
+}
+const { groups } = Astro.props;
+const base = import.meta.env.BASE_URL;
+const resolveHref = (href: string) =>
+  href.startsWith("http") || href.startsWith("#")
+    ? href
+    : `${base}${href.replace(/^\//, "")}`;
+---
+<aside class="docs-side" aria-label="docs sidebar">
+  {groups.map((g) => (
+    <div class="docs-group">
+      <h4>{g.heading}</h4>
+      <ul>
+        {g.links.map((l) => (
+          <li>
+            <a
+              href={resolveHref(l.href)}
+              class:list={[l.active ? "active" : ""]}
+            >
+              {l.label}
+              {l.badge && <span class={`badge badge-${l.badge}`}>{l.badge}</span>}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ))}
+</aside>
+<style>
+  .docs-side {
+    border-right: 1px solid var(--line);
+    padding: 32px 0 32px 24px;
+    position: sticky;
+    top: 96px;
+    height: calc(100vh - 96px);
+    overflow-y: auto;
+    font-family: var(--mono);
+  }
+  .docs-group h4 {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin: 24px 16px 8px 0;
+    font-weight: 500;
+    padding-right: 16px;
+  }
+  .docs-group:first-of-type h4 { margin-top: 0; }
+  .docs-group ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .docs-group a {
+    display: block;
+    padding: 5px 16px 5px 12px;
+    margin-right: 8px;
+    font-size: 12px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    border-left: 1px solid var(--line);
+    transition: color 100ms ease, border-color 100ms ease;
+  }
+  .docs-group a:hover {
+    color: var(--ink);
+    border-left-color: var(--ink-dim);
+  }
+  .docs-group a.active {
+    color: var(--ink);
+    font-weight: 500;
+    border-left-color: var(--ink);
+    background: var(--paper-dim);
+  }
+  .badge {
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin-left: 6px;
+    padding: 1px 4px;
+    border: 1px solid var(--line);
+  }
+  .badge-new  { color: var(--ok);   border-color: var(--ok); }
+  .badge-beta { color: var(--warn); border-color: var(--warn); }
+</style>
