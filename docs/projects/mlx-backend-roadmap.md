@@ -49,6 +49,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
    补充状态：Qwen3.5 GGUF 单请求 matmul/lm_head floor 已经跨过 200 tok/s；
    这不是 serving 完成态，下一步仍然要把相同 kernel 收益带进 scheduler
    batching、变长 decode 和 Qwen3.6/MoE 路径。
+   Qwen3.6-35B-A3B 也做了 2026-04-27 的本地 quick check：baseline decode
+   约 63 tok/s，DFlash paired TPOT 15.23 ms -> 15.45 ms，没有显示真实收益；
+   这条线下一步看 prefill/TTFT 与 MoE/GDR 执行，而不是继续堆 speculative。
 2. 把 prefix cache / KV pool 生命周期接到多请求服务路径，而不是只在单请求 fallback 中复用。
    当前状态：Qwen3 live runtime 已接上 runtime-owned prefix cache + shared KV
    pool；admission 会先 lookup/import，再把 suffix 交给 scheduler，terminal
