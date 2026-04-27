@@ -32,6 +32,7 @@ and writing a fresh file would lose the trail.
 | Area | Latest validated entry |
 | --- | --- |
 | Metal Qwen3.5 GGUF decode | [`2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md`](2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md) — Qwen3.5-0.8B GGUF Q4_K_M, 512/1024 decode, 211.7 tok/s on M4 Pro. |
+| Metal Qwen3.6 DFlash check | [`2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md`](2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md) — Qwen3.6-35B-A3B, 32/256 quick check, DFlash TPOT flat/slightly worse. |
 
 ---
 

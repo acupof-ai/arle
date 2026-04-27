@@ -237,6 +237,12 @@ acceptance and throughput.
   resulting `.gputrace` in Xcode).
 - **Qwen3-4B bf16**: 5.9× decode speedup (25.9 → 152.0 tok/s) on M4 Pro at
   `prompt=20, generation=256`.
+- **Qwen3.6-35B-A3B-4bit**: 2026-04-27 M4 Pro quick check at
+  `prompt=32, generation=256` did not show a DFlash TPOT win. Baseline decode
+  was 63.0 tok/s, DFlash direct run was 67.1 tok/s, but paired
+  `--baseline-compare` reported 15.23 ms -> 15.45 ms TPOT (+1.4% slower).
+  Treat Qwen3.6 DFlash as experimental until a clean repeated run proves a
+  workload-specific win.
 
 ## Debug env vars
 
