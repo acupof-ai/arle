@@ -8,7 +8,7 @@ use crate::events::{EngineEvent, EventSink, NoopEventSink};
 use crate::scheduler::policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
 use crate::types::{InferenceMode, RequestEventKind, RequestId};
 
-use super::{PreemptionMode, RequestPriority};
+use super::RequestPriority;
 
 /// A request waiting to begin (or resume) prefill.
 pub struct PendingRequest {
@@ -83,8 +83,6 @@ pub struct BatchSchedulerConfig {
     pub prefill_chunk_size: usize,
     /// Policy for adapting prefill chunk size under decode pressure.
     pub chunking_policy: DecodeAwareChunking,
-    /// Preemption strategy when GPU KV cache is exhausted.
-    pub preemption_mode: PreemptionMode,
 }
 
 impl Default for BatchSchedulerConfig {
@@ -96,7 +94,6 @@ impl Default for BatchSchedulerConfig {
                 decode_active_chunk: 64,
                 idle_chunk: 512,
             },
-            preemption_mode: PreemptionMode::Recompute,
         }
     }
 }

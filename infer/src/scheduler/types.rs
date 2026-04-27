@@ -13,18 +13,6 @@ use crate::server_engine::CompletionStreamDelta;
 use crate::tokenizer::Tokenizer;
 use crate::types::SessionId;
 
-/// Preemption strategy when GPU memory is exhausted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
-pub enum PreemptionMode {
-    /// Evict request KV cache and recompute from scratch when resumed.
-    /// Cheaper in GPU memory, more expensive when rescheduled.
-    #[default]
-    Recompute,
-    /// Swap KV cache to CPU memory and swap back in when resumed.
-    /// Preserves decoded state at the cost of CPU memory.
-    Swap,
-}
-
 /// Scheduler configuration.
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
@@ -57,8 +45,6 @@ pub struct SchedulerConfig {
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
     pub max_waiting_requests: usize,
-    /// Strategy to use when a running request must be preempted.
-    pub preemption_mode: PreemptionMode,
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom. Default 0.88.
     pub mem_fraction_static: f64,
@@ -114,7 +100,6 @@ impl Default for SchedulerConfig {
             long_prefill_token_threshold: 512,
             prefill_max_requests: None,
             max_waiting_requests: 256,
-            preemption_mode: PreemptionMode::Recompute,
             mem_fraction_static: 0.88,
             min_seq_len: 256,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
