@@ -14,14 +14,9 @@
 
 use std::process::ExitCode;
 
-use train::hub_dataset::download_dataset_file;
+use crate::hub_dataset::download_dataset_file;
 
-fn main() -> ExitCode {
-    dispatch_from_args(std::env::args().skip(1).collect::<Vec<_>>())
-}
-
-#[allow(dead_code)]
-pub(crate) fn dispatch_from_args<I>(args: I) -> ExitCode
+pub fn dispatch_from_args<I>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = String>,
 {

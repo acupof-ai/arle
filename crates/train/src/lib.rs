@@ -4,6 +4,8 @@ pub mod causal_lm;
 pub mod checkpoint;
 #[path = "cli_args.rs"]
 pub mod cli_args;
+#[path = "commands.rs"]
+pub mod commands;
 #[path = "control.rs"]
 pub mod control;
 #[path = "curriculum.rs"]

@@ -25,12 +25,6 @@ use crate::{
 };
 
 #[allow(dead_code)]
-#[path = "../../train/src/bin/convert_dataset.rs"]
-mod convert_dataset_entry;
-#[allow(dead_code)]
-#[path = "../../train/src/bin/download_dataset.rs"]
-mod download_dataset_entry;
-#[allow(dead_code)]
 #[path = "../../train/src/bin/eval_lm.rs"]
 mod eval_lm_entry;
 #[allow(dead_code)]
@@ -298,7 +292,7 @@ fn run_data_convert(args: DataConvertArgs) -> ExitCode {
     run_passthrough_invocation(
         invocation,
         &args.render,
-        convert_dataset_entry::dispatch_from_args,
+        train::commands::convert_dataset::dispatch_from_args,
     )
 }
 
@@ -320,7 +314,7 @@ fn run_data_download(args: DataDownloadArgs) -> ExitCode {
     run_passthrough_invocation(
         invocation,
         &args.render,
-        download_dataset_entry::dispatch_from_args,
+        train::commands::download_dataset::dispatch_from_args,
     )
 }
 
