@@ -33,7 +33,10 @@ pub struct FlashInferDecodeMetadata {
     /// Scratch buffer for KV index H2D.
     indices_scratch: Vec<i32>,
     /// Cached host-side indptr from last `update()`, reused by `plan()`.
-    indptr_h: Vec<i32>,
+    /// Public so callers (e.g. TileLang TC decode dispatch) can read the
+    /// total page count from the last entry without round-tripping through
+    /// device memory.
+    pub indptr_h: Vec<i32>,
     /// Previous slot indices that produced `indices_scratch`.
     prev_slot_indices: Vec<usize>,
     /// Previous slot epochs; changes when a slot is recycled for a new request.

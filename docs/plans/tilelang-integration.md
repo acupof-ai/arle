@@ -227,3 +227,13 @@ prefill (Qwen3.5 full-attn) follows after decode is stable. MLA (DeepSeek
 path, currently roadmapped) becomes a Phase 2 target with separate plan
 doc — TileLang's MLA primitives are the strongest case in the upstream
 project and warrant their own evaluation.
+
+### Tranche ledger (full-integration / "全部接入" series)
+
+- **Tranche 4 (TC decode alias) — landed 2026-04-27.** Aliases the Qwen3
+  BF16 batched-decode hot path (FlashInfer `flashinfer_tc_decode_run`)
+  onto the existing Phase 0 TileLang prefill HD128 cubin family; pure
+  Rust dispatch swap, no new kernel, no `.cu` changes. Default builds
+  remain on FlashInfer; `--features tilelang-attn` enables the alias.
+  Pending-remote bench stub:
+  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md).

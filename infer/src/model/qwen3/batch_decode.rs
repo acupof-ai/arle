@@ -374,6 +374,9 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
     ) -> Result<()> {
         // Only BF16 uses FlashInfer plan. FP8/INT8 use our fused-dequant kernel
         // which doesn't need FlashInfer's work estimation.
+        // Under `tilelang-attn`, the TC decode path is aliased onto the
+        // TileLang prefill HD128 cubins, which are plan-less — skip the plan.
+        #[cfg(not(feature = "tilelang-attn"))]
         if kv_format == KVFormat::BF16 {
             self.metadata.tc_plan(
                 ctx,
@@ -384,6 +387,16 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
                 head_dim,
             )?;
         }
+        #[cfg(feature = "tilelang-attn")]
+        let _ = (
+            ctx,
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            kv_format,
+        );
         Ok(())
     }
 
@@ -506,6 +519,8 @@ impl Qwen3Model {
             batch.prefill_start_positions,
             &prefill_token_counts,
         )?;
+        // TileLang TC decode alias is plan-less; skip FlashInfer planning.
+        #[cfg(not(feature = "tilelang-attn"))]
         mixed.metadata.tc_plan(
             &self.ctx,
             b + prefill_count,
@@ -618,133 +633,118 @@ impl Qwen3Model {
                 rms_eps: eps,
             };
 
-            let (q_ptr, _gq) = mixed.q_batch.data.device_ptr_mut(&self.ctx.stream);
-            let (k_ptr, _gk) = mixed.k_batch.data.device_ptr(&self.ctx.stream);
-            let (v_ptr, _gv) = mixed.v_batch.data.device_ptr(&self.ctx.stream);
-            let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&self.ctx.stream);
-            let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&self.ctx.stream);
-            let (cos_ptr, _gcos) = nrp.cos_cache.data.device_ptr(&self.ctx.stream);
-            let (sin_ptr, _gsin) = nrp.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (pos_ptr, _gpos) = mixed.metadata.positions.device_ptr(&self.ctx.stream);
-            let (ind_ptr, _gind) = mixed.metadata.kv_indptr.device_ptr(&self.ctx.stream);
-            let (idx_ptr, _gidx) = mixed.metadata.kv_indices.device_ptr(&self.ctx.stream);
-            let (lp_ptr, _glp) = mixed.metadata.kv_last_page_len.device_ptr(&self.ctx.stream);
-            let k_pool_ptr = paged_kv_pool.k_ptr(layer_idx, &self.ctx.stream);
-            let v_pool_ptr = paged_kv_pool.v_ptr(layer_idx, &self.ctx.stream);
+            {
+                let (q_ptr, _gq) = mixed.q_batch.data.device_ptr_mut(&self.ctx.stream);
+                let (k_ptr, _gk) = mixed.k_batch.data.device_ptr(&self.ctx.stream);
+                let (v_ptr, _gv) = mixed.v_batch.data.device_ptr(&self.ctx.stream);
+                let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&self.ctx.stream);
+                let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&self.ctx.stream);
+                let (cos_ptr, _gcos) = nrp.cos_cache.data.device_ptr(&self.ctx.stream);
+                let (sin_ptr, _gsin) = nrp.sin_cache.data.device_ptr(&self.ctx.stream);
+                let (pos_ptr, _gpos) = mixed.metadata.positions.device_ptr(&self.ctx.stream);
+                let (ind_ptr, _gind) = mixed.metadata.kv_indptr.device_ptr(&self.ctx.stream);
+                let (idx_ptr, _gidx) = mixed.metadata.kv_indices.device_ptr(&self.ctx.stream);
+                let (lp_ptr, _glp) = mixed.metadata.kv_last_page_len.device_ptr(&self.ctx.stream);
+                let k_pool_ptr = paged_kv_pool.k_ptr(layer_idx, &self.ctx.stream);
+                let v_pool_ptr = paged_kv_pool.v_ptr(layer_idx, &self.ctx.stream);
 
-            unsafe {
-                ffi::decode_prep_paged_cuda(
-                    q_ptr as *mut ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    pos_ptr as *const i32,
-                    k_pool_ptr as *mut ffi::Half,
-                    v_pool_ptr as *mut ffi::Half,
-                    idx_ptr as *const i32,
-                    ind_ptr as *const i32,
-                    lp_ptr as *const i32,
-                    num_heads as i32,
-                    num_kv_heads as i32,
-                    page_size as i32,
-                    (paged_kv_pool.kv_dim * page_size) as i32,
-                    b as i32,
-                    eps,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-
-            let mut prefill_token_offset = 0usize;
-            for (prefill_idx, prefill) in batch.prefills.iter().enumerate() {
-                let c = prefill.tokens.len();
-                let token_offset = b + prefill_token_offset;
-                let q_prefill_ptr =
-                    (q_ptr as usize + token_offset * q_dim * bf16_size) as *mut ffi::Half;
-                let k_prefill_ptr =
-                    (k_ptr as usize + token_offset * kv_dim * bf16_size) as *mut ffi::Half;
-                let v_prefill_ptr =
-                    (v_ptr as usize + token_offset * kv_dim * bf16_size) as *const ffi::Half;
                 unsafe {
-                    ffi::prefill_attention_paged_prep_cuda(
-                        q_prefill_ptr,
-                        k_prefill_ptr,
-                        v_prefill_ptr,
+                    ffi::decode_prep_paged_cuda(
+                        q_ptr as *mut ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        v_ptr as *const ffi::Half,
                         qn_ptr as *const ffi::Half,
                         kn_ptr as *const ffi::Half,
                         cos_ptr as *const ffi::Half,
                         sin_ptr as *const ffi::Half,
-                        {
-                            let (ptr, _g) =
-                                prefill_page_table_devs[prefill_idx].device_ptr(&self.ctx.stream);
-                            ptr as *const i32
-                        },
-                        page_size as i32,
+                        pos_ptr as *const i32,
                         k_pool_ptr as *mut ffi::Half,
                         v_pool_ptr as *mut ffi::Half,
+                        idx_ptr as *const i32,
+                        ind_ptr as *const i32,
+                        lp_ptr as *const i32,
                         num_heads as i32,
                         num_kv_heads as i32,
-                        head_dim as i32,
-                        c as i32,
-                        batch.prefill_start_positions[prefill_idx] as i32,
+                        page_size as i32,
+                        (paged_kv_pool.kv_dim * page_size) as i32,
+                        b as i32,
                         eps,
                         self.ctx.stream.cu_stream(),
                     )
                     .result()?;
                 }
-                prefill_token_offset += c;
+
+                let mut prefill_token_offset = 0usize;
+                for (prefill_idx, prefill) in batch.prefills.iter().enumerate() {
+                    let c = prefill.tokens.len();
+                    let token_offset = b + prefill_token_offset;
+                    let q_prefill_ptr =
+                        (q_ptr as usize + token_offset * q_dim * bf16_size) as *mut ffi::Half;
+                    let k_prefill_ptr =
+                        (k_ptr as usize + token_offset * kv_dim * bf16_size) as *mut ffi::Half;
+                    let v_prefill_ptr =
+                        (v_ptr as usize + token_offset * kv_dim * bf16_size) as *const ffi::Half;
+                    unsafe {
+                        ffi::prefill_attention_paged_prep_cuda(
+                            q_prefill_ptr,
+                            k_prefill_ptr,
+                            v_prefill_ptr,
+                            qn_ptr as *const ffi::Half,
+                            kn_ptr as *const ffi::Half,
+                            cos_ptr as *const ffi::Half,
+                            sin_ptr as *const ffi::Half,
+                            {
+                                let (ptr, _g) = prefill_page_table_devs[prefill_idx]
+                                    .device_ptr(&self.ctx.stream);
+                                ptr as *const i32
+                            },
+                            page_size as i32,
+                            k_pool_ptr as *mut ffi::Half,
+                            v_pool_ptr as *mut ffi::Half,
+                            num_heads as i32,
+                            num_kv_heads as i32,
+                            head_dim as i32,
+                            c as i32,
+                            batch.prefill_start_positions[prefill_idx] as i32,
+                            eps,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    prefill_token_offset += c;
+                }
             }
 
             {
-                let (fw_ptr, _gfw) = mixed
+                let max_qlen = mixed
                     .metadata
-                    .flashinfer_ws
-                    .float_workspace
-                    .device_ptr_mut(&self.ctx.stream);
-                let (iw_ptr, _giw) = mixed
-                    .metadata
-                    .flashinfer_ws
-                    .int_workspace
-                    .device_ptr_mut(&self.ctx.stream);
-                let (qoi_ptr, _gqoi) = mixed.metadata.qo_indptr.device_ptr(&self.ctx.stream);
-                let (o_ptr, _go) = mixed.attn_output.data.device_ptr_mut(&self.ctx.stream);
-                let (lse_ptr, _glse) = mixed
-                    .metadata
-                    .flashinfer_ws
-                    .lse
-                    .device_ptr_mut(&self.ctx.stream);
-
-                let ret = unsafe {
-                    ffi::flashinfer_tc_decode_run(
-                        fw_ptr as *mut u8,
-                        iw_ptr as *mut u8,
-                        mixed.metadata.flashinfer_ws.plan_info.cast_const(),
-                        q_ptr as *const ffi::Half,
-                        qoi_ptr as *const i32,
-                        k_pool_ptr as *const ffi::Half,
-                        v_pool_ptr as *const ffi::Half,
-                        ind_ptr as *const i32,
-                        idx_ptr as *const i32,
-                        lp_ptr as *const i32,
-                        o_ptr as *mut ffi::Half,
-                        lse_ptr as *mut f32,
-                        (b + prefill_count) as i32,
-                        num_heads as i32,
-                        num_kv_heads as i32,
-                        page_size as i32,
-                        1.0 / (head_dim as f32).sqrt(),
-                        self.ctx.stream.cu_stream(),
-                    )
-                };
-                if ret != 0 {
-                    return Err(anyhow::anyhow!(
-                        "flashinfer_tc_decode_run failed with CUDA error {}",
-                        ret
-                    ));
-                }
+                    .qo_indptr_h
+                    .windows(2)
+                    .map(|w| w[1] - w[0])
+                    .max()
+                    .unwrap_or(0);
+                let total_pages = mixed.metadata.indptr_h.last().copied().unwrap_or(0);
+                ops::flashinfer_tc_run_layer(
+                    &self.ctx,
+                    &mixed.q_batch,
+                    &mixed.metadata.qo_indptr,
+                    paged_kv_pool,
+                    layer_idx,
+                    &mixed.metadata.kv_indptr,
+                    &mixed.metadata.kv_indices,
+                    &mixed.metadata.kv_last_page_len,
+                    &mut mixed.attn_output,
+                    &mut mixed.metadata.flashinfer_ws,
+                    &ops::FlashInferHeadConfig {
+                        num_qo_heads: num_heads,
+                        num_kv_heads,
+                        page_size,
+                        head_dim,
+                    },
+                    (b + prefill_count) as i32,
+                    max_qlen,
+                    total_pages,
+                )?;
             }
 
             ops::gemm_into(
@@ -1247,6 +1247,14 @@ impl Qwen3Model {
                     )?;
                 }
                 KVFormat::BF16 => {
+                    let max_qlen = bufs
+                        .metadata
+                        .qo_indptr_h
+                        .windows(2)
+                        .map(|w| w[1] - w[0])
+                        .max()
+                        .unwrap_or(0);
+                    let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
                     ops::flashinfer_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,
@@ -1264,6 +1272,9 @@ impl Qwen3Model {
                             page_size,
                             head_dim,
                         },
+                        batch_size as i32,
+                        max_qlen,
+                        total_pages,
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
@@ -1652,6 +1663,14 @@ impl Qwen3Model {
                     )?;
                 }
                 KVFormat::BF16 => {
+                    let max_qlen = bufs
+                        .metadata
+                        .qo_indptr_h
+                        .windows(2)
+                        .map(|w| w[1] - w[0])
+                        .max()
+                        .unwrap_or(0);
+                    let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
                     ops::flashinfer_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,
@@ -1669,6 +1688,9 @@ impl Qwen3Model {
                             page_size,
                             head_dim,
                         },
+                        batch_size as i32,
+                        max_qlen,
+                        total_pages,
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
