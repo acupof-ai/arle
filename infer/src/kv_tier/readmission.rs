@@ -99,6 +99,15 @@ pub enum PlanKind {
     /// suffix the staged plan didn't cover.
     #[default]
     Prefix,
+    /// Whole-KV swap-out: the staged blocks cover the full T0 footprint
+    /// of an active decode slot at the moment its owner was preempted
+    /// (prompt + generated tokens). Promotion lands the request directly
+    /// in `Phase::Decoding` — there is no suffix to prefill.
+    ///
+    /// `last_token_pos` is the token count (`prompt_tokens.len() +
+    /// generated_tokens.len()`) at swap-out time. Promotion uses it to
+    /// validate that the resumed slot's cursor matches what was saved.
+    WholeKv { last_token_pos: usize },
 }
 
 /// Request-local staged prefix plan.
@@ -117,6 +126,19 @@ impl ReadmissionPlan {
             blocks,
             state: RequestChunkState::Planned,
             kind: PlanKind::Prefix,
+        }
+    }
+
+    /// Construct a Whole-KV swap-out plan. `matched_len` is the saved
+    /// total token count (= last_token_pos); this lets existing
+    /// length-aware code still treat `matched_len` as "tokens covered
+    /// by the plan's blocks" without special-casing.
+    pub fn new_whole_kv(last_token_pos: usize, blocks: Vec<ReadmissionBlock>) -> Self {
+        Self {
+            matched_len: last_token_pos,
+            blocks,
+            state: RequestChunkState::Planned,
+            kind: PlanKind::WholeKv { last_token_pos },
         }
     }
 
@@ -325,5 +347,18 @@ mod tests {
         assert_eq!(plan.state, RequestChunkState::Ready);
         plan.mark_consumed();
         assert_eq!(plan.state, RequestChunkState::Consumed);
+    }
+
+    #[test]
+    fn new_whole_kv_carries_cursor() {
+        let plan = ReadmissionPlan::new_whole_kv(2048, Vec::new());
+        assert_eq!(plan.matched_len, 2048);
+        assert!(matches!(
+            plan.kind,
+            PlanKind::WholeKv {
+                last_token_pos: 2048
+            }
+        ));
+        assert_eq!(plan.state, RequestChunkState::Planned);
     }
 }
