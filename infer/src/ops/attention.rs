@@ -1112,7 +1112,23 @@ pub fn flashinfer_run_layer(
     Ok(())
 }
 
-/// FlashInfer tensor-core run step only (GPU kernel). Call once per layer after a single plan call.
+/// FlashInfer tensor-core (TC) batched paged-attention run step.
+///
+/// Default builds dispatch to FlashInfer's `flashinfer_tc_decode_run` (which
+/// reuses the prefill kernel for decode-shaped inputs to get tensor-core
+/// utilization). Under `--features tilelang-attn` the same call is aliased
+/// onto the Phase 0 TileLang prefill HD128 cubin family — the kernel
+/// signatures and varlen Q / paged-KV semantics are identical, so no new
+/// kernel is needed.
+///
+/// `batch_size` is the number of requests (qo_indptr length minus 1), which
+/// in mixed decode+prefill batches differs from `q_batch.seq_len` (the total
+/// Q row count).
+///
+/// `max_qlen` and `total_pages` are TileLang-only parameters (TileLang 0.1.9
+/// auto-promotes `T.symbolic` shape vars into kernel arguments). FlashInfer
+/// ignores them.
+#[allow(clippy::too_many_arguments)]
 pub fn flashinfer_tc_run_layer(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
@@ -1125,51 +1141,124 @@ pub fn flashinfer_tc_run_layer(
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
     heads: &FlashInferHeadConfig,
+    batch_size: i32,
+    max_qlen: i32,
+    total_pages: i32,
 ) -> Result<()> {
-    let batch_size = q_batch.seq_len;
     let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+    #[cfg(feature = "tilelang-attn")]
+    let tilelang_kernel = {
+        ensure!(
+            heads.head_dim == 128,
+            "tilelang-attn: TC decode alias requires head_dim=128, got {}",
+            heads.head_dim
+        );
+        ensure!(
+            heads.page_size == 16,
+            "tilelang-attn: TC decode alias requires page_size=16, got {}",
+            heads.page_size
+        );
+        match (heads.num_qo_heads, heads.num_kv_heads) {
+            (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
+            (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
+            (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
+            (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
+            other => {
+                return Err(anyhow!(
+                    "tilelang-attn: no specialized TC-decode HD128 kernel for \
+                     (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
+                     are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
+                     in tools/tilelang/batch_prefill_paged_hd128.py, \
+                     TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
+                     and the FFI macro + this match in lockstep, then rebuild."
+                ));
+            }
+        }
+    };
+
     let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
     let (qoi_ptr, _gqoi) = qo_indptr_gpu.device_ptr(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
     let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
     let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
     let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
-    let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
 
     let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
     let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
 
-    let ret = unsafe {
-        ffi::flashinfer_tc_decode_run(
-            fw_ptr as *mut u8,
-            iw_ptr as *mut u8,
-            workspace.plan_info.cast_const(),
-            q_ptr as *mut ffi::Half,
-            qoi_ptr as *mut i32,
-            k_pool_ptr as *mut ffi::Half,
-            v_pool_ptr as *mut ffi::Half,
-            ind_ptr as *mut i32,
-            idx_ptr as *mut i32,
-            lp_ptr as *mut i32,
-            o_ptr as *mut ffi::Half,
-            lse_ptr as *mut f32,
-            batch_size as i32,
-            heads.num_qo_heads as i32,
-            heads.num_kv_heads as i32,
-            heads.page_size as i32,
-            sm_scale,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_tc_decode_run failed with CUDA error {}",
-            ret
-        ));
+    #[cfg(not(feature = "tilelang-attn"))]
+    {
+        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+        let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
+        let _ = (max_qlen, total_pages); // FlashInfer path does not consume these.
+        let ret = unsafe {
+            ffi::flashinfer_tc_decode_run(
+                fw_ptr as *mut u8,
+                iw_ptr as *mut u8,
+                workspace.plan_info.cast_const(),
+                q_ptr as *mut ffi::Half,
+                qoi_ptr as *mut i32,
+                k_pool_ptr as *mut ffi::Half,
+                v_pool_ptr as *mut ffi::Half,
+                ind_ptr as *mut i32,
+                idx_ptr as *mut i32,
+                lp_ptr as *mut i32,
+                o_ptr as *mut ffi::Half,
+                lse_ptr as *mut f32,
+                batch_size,
+                heads.num_qo_heads as i32,
+                heads.num_kv_heads as i32,
+                heads.page_size as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow!(
+                "flashinfer_tc_decode_run failed with CUDA error {}",
+                ret
+            ));
+        }
     }
+
+    #[cfg(feature = "tilelang-attn")]
+    {
+        let _ = workspace; // TileLang is plan-less; workspace is unused here.
+        let num_pages = kv_pool.max_total_pages as i32;
+        unsafe {
+            tilelang_kernel(
+                q_ptr as *mut ffi::Half,
+                qoi_ptr as *const i32,
+                k_pool_ptr as *mut ffi::Half,
+                v_pool_ptr as *mut ffi::Half,
+                ind_ptr as *const i32,
+                idx_ptr as *const i32,
+                lp_ptr as *const i32,
+                o_ptr as *mut ffi::Half,
+                batch_size,
+                q_batch.seq_len as i32,
+                max_qlen,
+                num_pages,
+                total_pages,
+                heads.num_qo_heads as i32,
+                heads.num_kv_heads as i32,
+                heads.page_size as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| {
+                anyhow!(
+                    "tilelang_batch_prefill_paged_hd128 (TC decode alias, q{}_kv{}) failed: {e}",
+                    heads.num_qo_heads,
+                    heads.num_kv_heads
+                )
+            })?;
+        }
+    }
+
     Ok(())
 }
 
