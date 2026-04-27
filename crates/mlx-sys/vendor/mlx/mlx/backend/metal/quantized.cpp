@@ -248,9 +248,10 @@ void qmv(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int bn = 8;
+  int bn = (bits == 6 && group_size == 16) ? 16 : 8;
   int bk = 32;
-  MTL::Size group_dims(bk, 2, 1);
+  int num_simdgroups = (bits == 6 && group_size == 16) ? 4 : 2;
+  MTL::Size group_dims(bk, num_simdgroups, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
   std::string kname;

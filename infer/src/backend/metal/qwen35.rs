@@ -310,6 +310,166 @@ fn gguf_q4k_affine_weight_from_bytes(
     })
 }
 
+fn gguf_q5k_affine_weight_from_bytes(
+    hf_name: &str,
+    packed: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<WeightTensor> {
+    const BITS: usize = 5;
+    const GROUP_SIZE: usize = 32;
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+
+    let row_bytes = packed_row_bytes(GgufPackedFormat::Q5_K, cols, hf_name)?;
+    ensure!(
+        packed.len() == rows * row_bytes,
+        "GGUF tensor '{hf_name}' packed size {} != expected {}",
+        packed.len(),
+        rows * row_bytes
+    );
+    ensure!(
+        (cols * BITS).is_multiple_of(32),
+        "GGUF tensor '{hf_name}' cols={cols} cannot be packed as MLX Q5"
+    );
+
+    let packed_cols = cols * BITS / 32;
+    let groups_per_row = cols / GROUP_SIZE;
+    let mut w = vec![0u32; rows * packed_cols];
+    let mut scales = vec![bf16::ZERO; rows * groups_per_row];
+    let mut biases = vec![bf16::ZERO; rows * groups_per_row];
+
+    for row in 0..rows {
+        for block in 0..(cols / BLOCK_SIZE) {
+            let base = row * row_bytes + block * BLOCK_BYTES;
+            let d = f16::from_le_bytes([packed[base], packed[base + 1]]).to_f32();
+            let dmin = f16::from_le_bytes([packed[base + 2], packed[base + 3]]).to_f32();
+            let scales_raw = &packed[base + 4..base + 16];
+            let qh = &packed[base + 16..base + 48];
+            let qs = &packed[base + 48..base + 176];
+
+            for iter in 0..4 {
+                let lo_group = iter * 2;
+                let hi_group = lo_group + 1;
+                let (lo_scale, lo_min) = decode_scale_min_k4(scales_raw, lo_group);
+                let (hi_scale, hi_min) = decode_scale_min_k4(scales_raw, hi_group);
+
+                let lo_group_idx = row * groups_per_row + block * 8 + lo_group;
+                let hi_group_idx = row * groups_per_row + block * 8 + hi_group;
+                scales[lo_group_idx] = bf16::from_f32(d * f32::from(lo_scale));
+                biases[lo_group_idx] = bf16::from_f32(-dmin * f32::from(lo_min));
+                scales[hi_group_idx] = bf16::from_f32(d * f32::from(hi_scale));
+                biases[hi_group_idx] = bf16::from_f32(-dmin * f32::from(hi_min));
+
+                let ql = &qs[iter * 32..iter * 32 + 32];
+                for lane in 0..32 {
+                    let byte = ql[lane];
+                    let lo_col = block * BLOCK_SIZE + lo_group * GROUP_SIZE + lane;
+                    let hi_col = block * BLOCK_SIZE + hi_group * GROUP_SIZE + lane;
+                    let lo = (byte & 0x0f) | (((qh[lane] >> lo_group) & 1) << 4);
+                    let hi = (byte >> 4) | (((qh[lane] >> hi_group) & 1) << 4);
+                    set_affine_packed_q(&mut w, row, packed_cols, lo_col, BITS, lo);
+                    set_affine_packed_q(&mut w, row, packed_cols, hi_col, BITS, hi);
+                }
+            }
+        }
+    }
+
+    Ok(WeightTensor::Quantized {
+        w: MlxArray::from_slice_u32(
+            &w,
+            &[
+                i32::try_from(rows).context("GGUF row count overflows i32")?,
+                i32::try_from(packed_cols).context("MLX packed col count overflows i32")?,
+            ],
+        ),
+        scales: mlx_bf16_array(
+            &scales,
+            &[
+                i32::try_from(rows).context("GGUF row count overflows i32")?,
+                i32::try_from(groups_per_row).context("MLX scale group count overflows i32")?,
+            ],
+        ),
+        biases: mlx_bf16_array(
+            &biases,
+            &[
+                i32::try_from(rows).context("GGUF row count overflows i32")?,
+                i32::try_from(groups_per_row).context("MLX bias group count overflows i32")?,
+            ],
+        ),
+        group_size: GROUP_SIZE as i32,
+        bits: BITS as i32,
+    })
+}
+
+fn gguf_q8_0_affine_weight_from_bytes(
+    hf_name: &str,
+    packed: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<WeightTensor> {
+    const BITS: usize = 8;
+    const GROUP_SIZE: usize = 32;
+    const BLOCK_SIZE: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+
+    let row_bytes = packed_row_bytes(GgufPackedFormat::Q8_0, cols, hf_name)?;
+    ensure!(
+        packed.len() == rows * row_bytes,
+        "GGUF tensor '{hf_name}' packed size {} != expected {}",
+        packed.len(),
+        rows * row_bytes
+    );
+
+    let packed_cols = cols * BITS / 32;
+    let groups_per_row = cols / GROUP_SIZE;
+    let mut w = vec![0u32; rows * packed_cols];
+    let mut scales = vec![bf16::ZERO; rows * groups_per_row];
+    let mut biases = vec![bf16::ZERO; rows * groups_per_row];
+
+    for row in 0..rows {
+        for block in 0..(cols / BLOCK_SIZE) {
+            let base = row * row_bytes + block * BLOCK_BYTES;
+            let d = f16::from_le_bytes([packed[base], packed[base + 1]]).to_f32();
+            let group_idx = row * groups_per_row + block;
+            scales[group_idx] = bf16::from_f32(d);
+            biases[group_idx] = bf16::from_f32(-128.0 * d);
+
+            for lane in 0..32 {
+                let col = block * BLOCK_SIZE + lane;
+                let q = packed[base + 2 + lane] ^ 0x80;
+                set_affine_packed_q(&mut w, row, packed_cols, col, BITS, q);
+            }
+        }
+    }
+
+    Ok(WeightTensor::Quantized {
+        w: MlxArray::from_slice_u32(
+            &w,
+            &[
+                i32::try_from(rows).context("GGUF row count overflows i32")?,
+                i32::try_from(packed_cols).context("MLX packed col count overflows i32")?,
+            ],
+        ),
+        scales: mlx_bf16_array(
+            &scales,
+            &[
+                i32::try_from(rows).context("GGUF row count overflows i32")?,
+                i32::try_from(groups_per_row).context("MLX scale group count overflows i32")?,
+            ],
+        ),
+        biases: mlx_bf16_array(
+            &biases,
+            &[
+                i32::try_from(rows).context("GGUF row count overflows i32")?,
+                i32::try_from(groups_per_row).context("MLX bias group count overflows i32")?,
+            ],
+        ),
+        group_size: GROUP_SIZE as i32,
+        bits: BITS as i32,
+    })
+}
+
 fn gguf_q6k_affine_weight_from_bytes(
     hf_name: &str,
     packed: &[u8],
@@ -367,9 +527,8 @@ fn gguf_q6k_affine_weight_from_bytes(
 
                     for idx in 0..4 {
                         let col = half_base_col + local_cols[idx];
-                        let group = col / GROUP_SIZE;
                         let scale = d * f32::from(sc[scale_offsets[idx]] as i8);
-                        let group_idx = row * groups_per_row + group;
+                        let group_idx = row * groups_per_row + col / GROUP_SIZE;
                         scales[group_idx] = bf16::from_f32(scale);
                         biases[group_idx] = bf16::from_f32(-32.0 * scale);
                         set_affine_packed_q(&mut w, row, packed_cols, col, BITS, q[idx]);
@@ -414,13 +573,19 @@ fn gguf_affine_weight_from_bytes(
     cols: usize,
 ) -> Result<Option<WeightTensor>> {
     match format {
+        GgufPackedFormat::Q8_0 => {
+            gguf_q8_0_affine_weight_from_bytes(hf_name, packed, rows, cols).map(Some)
+        }
         GgufPackedFormat::Q4_K => {
             gguf_q4k_affine_weight_from_bytes(hf_name, packed, rows, cols).map(Some)
+        }
+        GgufPackedFormat::Q5_K => {
+            gguf_q5k_affine_weight_from_bytes(hf_name, packed, rows, cols).map(Some)
         }
         GgufPackedFormat::Q6_K => {
             gguf_q6k_affine_weight_from_bytes(hf_name, packed, rows, cols).map(Some)
         }
-        GgufPackedFormat::Q8_0 | GgufPackedFormat::Q3_K | GgufPackedFormat::Q5_K => Ok(None),
+        GgufPackedFormat::Q3_K => Ok(None),
     }
 }
 
@@ -2961,7 +3126,9 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
         arch.linear.value_dim,
         arch.linear.conv_kernel,
     )?;
-    log::info!("  loading Qwen3.5 GGUF on Metal; repacking Q4_K/Q6_K weights to MLX affine");
+    log::info!(
+        "  loading Qwen3.5 GGUF on Metal; repacking Q4_K/Q5_K/Q6_K/Q8_0 weights to MLX affine"
+    );
     if linear_layout.num_value_heads_per_key() > 1 {
         log::info!(
             "  grouped value heads detected; QKV/Z/B/A stay packed, out_proj reorders activations before packed matmul"
@@ -3546,9 +3713,14 @@ mod tests {
     }
 
     #[test]
-    fn gguf_q4_q6_affine_repack_matches_cpu_reference() {
+    fn gguf_affine_repack_matches_cpu_reference() {
         let _guard = metal_test_guard();
-        for format in [GgufPackedFormat::Q4_K, GgufPackedFormat::Q6_K] {
+        for format in [
+            GgufPackedFormat::Q8_0,
+            GgufPackedFormat::Q4_K,
+            GgufPackedFormat::Q5_K,
+            GgufPackedFormat::Q6_K,
+        ] {
             let rows = 3usize;
             let cols = 256usize;
             let raw = synthetic_gguf_packed(format, rows, cols);
@@ -3567,8 +3739,14 @@ mod tests {
                 panic!("expected affine repack for {format:?}");
             };
             match format {
+                GgufPackedFormat::Q8_0 => {
+                    assert_eq!((*group_size, *bits), (32, 8));
+                }
                 GgufPackedFormat::Q4_K => {
                     assert_eq!((*group_size, *bits), (32, 4));
+                }
+                GgufPackedFormat::Q5_K => {
+                    assert_eq!((*group_size, *bits), (32, 5));
                 }
                 GgufPackedFormat::Q6_K => {
                     assert_eq!((*group_size, *bits), (16, 6));
