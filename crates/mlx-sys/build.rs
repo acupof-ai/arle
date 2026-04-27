@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -93,6 +94,34 @@ fn main() {
 
     let mlx_build = mlx_dst.join("build");
 
+    // Stage `mlx.metallib` next to consumer binaries. MLX's
+    // `load_default_library` searches binary-colocated paths first; without
+    // this step `target/<profile>/metal_serve` (and any release tarball that
+    // doesn't ship the metallib) hits "Failed to load the default metallib".
+    // The compile-time `METAL_PATH` fallback only works while the cmake build
+    // dir survives, which it does not across `cargo clean -p mlx-sys` or
+    // distribution.
+    if on_macos {
+        let metallib_src = mlx_build
+            .join("mlx")
+            .join("backend")
+            .join("metal")
+            .join("kernels")
+            .join("mlx.metallib");
+        if metallib_src.is_file() {
+            if let Some(profile_dir) = target_profile_dir(&out_dir) {
+                let metallib_dst = profile_dir.join("mlx.metallib");
+                if let Err(err) = fs::copy(&metallib_src, &metallib_dst) {
+                    println!(
+                        "cargo:warning=mlx-sys: failed to stage {} -> {}: {err}",
+                        metallib_src.display(),
+                        metallib_dst.display()
+                    );
+                }
+            }
+        }
+    }
+
     // Find MLX include directories.
     // MLX sources are vendored under this crate, while any generated headers
     // live in the cmake build tree.
@@ -167,6 +196,21 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx_common.h");
     println!("cargo:rerun-if-changed=vendor");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+}
+
+/// `OUT_DIR` is `<target>/<profile>/build/mlx-sys-<hash>/out`. Walk three
+/// parents back to reach `<target>/<profile>`, where cargo places the final
+/// binaries that need a colocated `mlx.metallib`. Returns `None` if the
+/// directory shape doesn't match (custom target dirs are uncommon and we'd
+/// rather skip silently than guess wrong).
+fn target_profile_dir(out_dir: &Path) -> Option<PathBuf> {
+    let mlx_sys_dir = out_dir.parent()?;
+    let build_dir = mlx_sys_dir.parent()?;
+    let profile_dir = build_dir.parent()?;
+    if build_dir.file_name()?.to_str()? != "build" {
+        return None;
+    }
+    Some(profile_dir.to_path_buf())
 }
 
 /// Locate the active clang's `libclang_rt.osx.a` via

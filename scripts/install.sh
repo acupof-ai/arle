@@ -78,6 +78,14 @@ for bin in $BINARIES; do
   info "Installed ${INSTALL_DIR}/${bin}"
 done
 
+# Stage MLX kernels next to the macOS binaries. MLX searches for
+# `mlx.metallib` colocated with the running binary; without this copy
+# `metal_serve` fails with "Failed to load the default metallib".
+if [ "$PLATFORM" = "macos-arm64" ] && [ -f "${TMPDIR}/mlx.metallib" ]; then
+  install -m 0644 "${TMPDIR}/mlx.metallib" "${INSTALL_DIR}/mlx.metallib"
+  info "Installed ${INSTALL_DIR}/mlx.metallib"
+fi
+
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *)
