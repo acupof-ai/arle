@@ -1,7 +1,6 @@
 //! Builder, public client handle, and the RAII region guard used by the
 //! fetch happy path.
 
-use std::marker::PhantomData;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -16,8 +15,7 @@ use crate::kv_tier::transport::disk::DiskStore;
 use super::Coordinator;
 use super::control::CoordinatorControl;
 use super::events::{
-    CoordinatorCommand, CoordinatorEvent, FetchRequest, OrchestratorEvent, PrefetchPlanRequest,
-    StoreRequest,
+    CoordinatorCommand, CoordinatorEvent, FetchRequest, PrefetchPlanRequest, StoreRequest,
 };
 use super::types::{
     CoordinatorQueueStats, FetchTicket, PlanTicket, QueueBackpressure, QueueControlStats,
@@ -205,34 +203,17 @@ impl Drop for AllocatedRegions {
     }
 }
 
-/// Typestate marker: `CoordinatorBuilder` has no orchestrator-events channel.
-/// The default [`build`](CoordinatorBuilder::build) returns the 3-tuple.
-pub struct NoOrchestrator;
-
-/// Typestate marker: `CoordinatorBuilder` has the orchestrator-events channel
-/// enabled. The corresponding [`build`](CoordinatorBuilder::build) returns the
-/// 4-tuple including the `Receiver<OrchestratorEvent>`.
-pub struct WithOrchestrator;
-
 /// Fluent builder for [`Coordinator`]. Replaced the previous family of
 /// telescoping constructors (`Coordinator::new`, `new_with_disk_store`,
-/// `new_with_backends`, `new_with_orchestrator_events`) so that adding a new
-/// optional backend or channel does not multiply constructor surface.
-///
-/// The `O` type parameter is a phantom typestate that statically tracks
-/// whether the orchestrator-events channel has been enabled. Calling
-/// [`with_orchestrator_events`](CoordinatorBuilder::with_orchestrator_events)
-/// transitions `NoOrchestrator -> WithOrchestrator`; the two states have
-/// different `build` signatures so misuse (calling the 3-tuple `build` after
-/// asking for orchestrator events) is rejected at compile time.
-pub struct CoordinatorBuilder<O = NoOrchestrator> {
+/// `new_with_backends`) so that adding a new optional backend does not
+/// multiply constructor surface.
+pub struct CoordinatorBuilder {
     queue_capacity: usize,
     disk_store: Option<Arc<DiskStore>>,
     cluster_shared_backend: Option<ClusterSharedBackend>,
-    _orchestrator: PhantomData<O>,
 }
 
-impl CoordinatorBuilder<NoOrchestrator> {
+impl CoordinatorBuilder {
     /// New builder with the given bounded-channel capacity. Capacity is
     /// clamped to `>= 1` at `build` time.
     pub fn new(queue_capacity: usize) -> Self {
@@ -240,7 +221,6 @@ impl CoordinatorBuilder<NoOrchestrator> {
             queue_capacity,
             disk_store: None,
             cluster_shared_backend: None,
-            _orchestrator: PhantomData,
         }
     }
 
@@ -260,120 +240,27 @@ impl CoordinatorBuilder<NoOrchestrator> {
         self
     }
 
-    /// Enable the secondary orchestrator-events channel. Transitions the
-    /// builder typestate to [`WithOrchestrator`], so the subsequent `build`
-    /// returns a 4-tuple including the orchestrator-events receiver.
-    ///
-    /// The 3-tuple `build` is only available on `CoordinatorBuilder<NoOrchestrator>`,
-    /// so attempting to destructure the post-orchestrator builder back to a
-    /// 3-tuple is a compile error:
-    ///
-    /// ```compile_fail
-    /// use infer::kv_tier::CoordinatorBuilder;
-    /// let (_coord, _handle, _events) = CoordinatorBuilder::new(4)
-    ///     .with_orchestrator_events()
-    ///     .build();
-    /// ```
-    #[must_use]
-    pub fn with_orchestrator_events(self) -> CoordinatorBuilder<WithOrchestrator> {
-        CoordinatorBuilder {
-            queue_capacity: self.queue_capacity,
-            disk_store: self.disk_store,
-            cluster_shared_backend: self.cluster_shared_backend,
-            _orchestrator: PhantomData,
-        }
-    }
-
-    /// Build a coordinator without the orchestrator-events channel.
+    /// Build a coordinator and its single unified event channel. All event
+    /// shapes (Store*, Fetch*, Plan*) flow through this one stream.
     pub fn build(self) -> (Coordinator, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        let (coord, handle, events, _) = build_inner(
-            self.queue_capacity,
-            self.disk_store,
-            self.cluster_shared_backend,
-            false,
-        );
-        (coord, handle, events)
-    }
-}
-
-impl CoordinatorBuilder<WithOrchestrator> {
-    /// Attach a node-local disk-tier store (T2). Required for any disk-backed
-    /// store/fetch; absent → coordinator returns "disk store not configured".
-    #[must_use]
-    pub fn disk_store(mut self, store: Arc<DiskStore>) -> Self {
-        self.disk_store = Some(store);
-        self
-    }
-
-    /// Attach a cluster-shared backend (T3). Required for any remote-target
-    /// store/fetch; absent → coordinator returns "remote store not configured".
-    #[must_use]
-    pub fn cluster_shared_backend(mut self, backend: ClusterSharedBackend) -> Self {
-        self.cluster_shared_backend = Some(backend);
-        self
-    }
-
-    /// Build a coordinator with both the legacy event channel and the
-    /// orchestrator-events channel.
-    pub fn build(
-        self,
-    ) -> (
-        Coordinator,
-        CoordinatorHandle,
-        Receiver<CoordinatorEvent>,
-        Receiver<OrchestratorEvent>,
-    ) {
-        let (coord, handle, events, orch) = build_inner(
-            self.queue_capacity,
-            self.disk_store,
-            self.cluster_shared_backend,
-            true,
-        );
+        let capacity = self.queue_capacity.max(1);
+        let (tx, rx) = bounded(capacity);
+        let (event_tx, event_rx) = bounded(capacity);
+        let control = Arc::new(CoordinatorControl::new(capacity));
         (
-            coord,
-            handle,
-            events,
-            orch.expect("orchestrator events requested"),
+            Coordinator::assemble(
+                rx,
+                event_tx,
+                self.disk_store,
+                self.cluster_shared_backend,
+                control.clone(),
+            ),
+            CoordinatorHandle {
+                tx,
+                next_ticket: Arc::new(AtomicU64::new(1)),
+                control,
+            },
+            event_rx,
         )
     }
-}
-
-fn build_inner(
-    queue_capacity: usize,
-    disk_store: Option<Arc<DiskStore>>,
-    cluster_shared_backend: Option<ClusterSharedBackend>,
-    with_orchestrator: bool,
-) -> (
-    Coordinator,
-    CoordinatorHandle,
-    Receiver<CoordinatorEvent>,
-    Option<Receiver<OrchestratorEvent>>,
-) {
-    let capacity = queue_capacity.max(1);
-    let (tx, rx) = bounded(capacity);
-    let (event_tx, event_rx) = bounded(capacity);
-    let (orchestrator_tx, orchestrator_rx) = if with_orchestrator {
-        let (tx, rx) = bounded::<OrchestratorEvent>(capacity);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let control = Arc::new(CoordinatorControl::new(capacity));
-    (
-        Coordinator::assemble(
-            rx,
-            event_tx,
-            orchestrator_tx,
-            disk_store,
-            cluster_shared_backend,
-            control.clone(),
-        ),
-        CoordinatorHandle {
-            tx,
-            next_ticket: Arc::new(AtomicU64::new(1)),
-            control,
-        },
-        event_rx,
-        orchestrator_rx,
-    )
 }

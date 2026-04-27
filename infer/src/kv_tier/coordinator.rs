@@ -47,10 +47,10 @@ pub mod events;
 #[path = "coordinator/types.rs"]
 pub mod types;
 
-pub use builder::{CoordinatorBuilder, CoordinatorHandle, NoOrchestrator, WithOrchestrator};
+pub use builder::{CoordinatorBuilder, CoordinatorHandle};
 pub use events::{
-    CoordinatorCommand, CoordinatorEvent, FetchRequest, FetchedBlock, OrchestratorEvent,
-    PrefetchAction, PrefetchPlan, PrefetchPlanRequest, StoreRequest, StoreTarget,
+    CoordinatorCommand, CoordinatorEvent, FetchRequest, FetchedBlock, PrefetchAction, PrefetchPlan,
+    PrefetchPlanRequest, StoreRequest, StoreTarget,
 };
 pub use types::{
     CoordinatorQueueStats, FailureClass, FetchTicket, PlanTicket, QueueBackpressure,
@@ -64,7 +64,6 @@ use types::QueueOutcome;
 pub struct Coordinator {
     rx: Receiver<CoordinatorCommand>,
     events: Sender<CoordinatorEvent>,
-    orchestrator_events: Option<Sender<OrchestratorEvent>>,
     disk_store: Option<Arc<DiskStore>>,
     cluster_shared_backend: Option<ClusterSharedBackend>,
     control: Arc<CoordinatorControl>,
@@ -77,7 +76,6 @@ impl Coordinator {
     pub(in crate::kv_tier::coordinator) fn assemble(
         rx: Receiver<CoordinatorCommand>,
         events: Sender<CoordinatorEvent>,
-        orchestrator_events: Option<Sender<OrchestratorEvent>>,
         disk_store: Option<Arc<DiskStore>>,
         cluster_shared_backend: Option<ClusterSharedBackend>,
         control: Arc<CoordinatorControl>,
@@ -85,7 +83,6 @@ impl Coordinator {
         Self {
             rx,
             events,
-            orchestrator_events,
             disk_store,
             cluster_shared_backend,
             control,
@@ -96,12 +93,6 @@ impl Coordinator {
         self.events
             .send(event)
             .map_err(|e| anyhow!("coordinator event send failed: {e}"))
-    }
-
-    fn emit_orchestrator_event(&self, event: OrchestratorEvent) {
-        if let Some(tx) = &self.orchestrator_events {
-            let _ = tx.send(event);
-        }
     }
 
     fn is_cancelled(&self, ticket: QueueTicket) -> bool {
@@ -120,32 +111,34 @@ impl Coordinator {
         reason: impl Into<String>,
     ) -> Result<QueueOutcome> {
         let reason = reason.into();
-        // Per-queue legacy `CoordinatorEvent` emission. Plan has no
-        // `CoordinatorEvent::PlanFailed` variant — surfacing plan failures
-        // is exclusively the orchestrator channel's job.
+        // Per-queue typed `CoordinatorEvent` emission — single unified
+        // channel. Plan failures land on the same stream as Store/Fetch
+        // failures so downstream consumers (currently the CUDA scheduler
+        // runtime, which listens-only on plan arms) see one coherent
+        // event vocabulary.
         match ticket {
-            QueueTicket::Plan(_) => {}
+            QueueTicket::Plan(plan_ticket) => {
+                let _ = self.emit_event(CoordinatorEvent::PlanFailed {
+                    ticket: plan_ticket,
+                    failed_block,
+                    reason,
+                });
+            }
             QueueTicket::Store(store_ticket) => {
                 let _ = self.emit_event(CoordinatorEvent::StoreFailed {
                     ticket: store_ticket,
                     failed_block,
-                    reason: reason.clone(),
+                    reason,
                 });
             }
             QueueTicket::Fetch(fetch_ticket) => {
                 self.emit_event(CoordinatorEvent::FetchFailed {
                     ticket: fetch_ticket,
                     failed_block,
-                    reason: reason.clone(),
+                    reason,
                 })?;
             }
         }
-        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-            queue: ticket.kind(),
-            ticket,
-            failed_block,
-            reason,
-        });
         Ok(class.into_outcome())
     }
 
@@ -154,7 +147,7 @@ impl Coordinator {
         ticket: PlanTicket,
         blocks: &[PrefetchPlanRequest],
     ) -> Result<QueueOutcome> {
-        self.emit_orchestrator_event(OrchestratorEvent::PlanQueued {
+        let _ = self.emit_event(CoordinatorEvent::PlanQueued {
             ticket,
             block_count: blocks.len(),
         });
@@ -180,16 +173,12 @@ impl Coordinator {
                 },
             })
             .collect();
-        self.emit_orchestrator_event(OrchestratorEvent::PlanCompleted { ticket, plans });
+        let _ = self.emit_event(CoordinatorEvent::PlanCompleted { ticket, plans });
         Ok(QueueOutcome::Completed)
     }
 
     fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) -> Result<QueueOutcome> {
         let _ = self.emit_event(CoordinatorEvent::StoreQueued {
-            ticket,
-            block_count: blocks.len(),
-        });
-        self.emit_orchestrator_event(OrchestratorEvent::StoreQueued {
             ticket,
             block_count: blocks.len(),
         });
@@ -353,11 +342,7 @@ impl Coordinator {
             }
         }
 
-        let _ = self.emit_event(CoordinatorEvent::StoreCompleted {
-            ticket,
-            locations: locations.clone(),
-        });
-        self.emit_orchestrator_event(OrchestratorEvent::StoreCompleted { ticket, locations });
+        let _ = self.emit_event(CoordinatorEvent::StoreCompleted { ticket, locations });
         Ok(QueueOutcome::Completed)
     }
 
@@ -366,10 +351,6 @@ impl Coordinator {
             ticket,
             block_count: blocks.len(),
         })?;
-        self.emit_orchestrator_event(OrchestratorEvent::FetchQueued {
-            ticket,
-            block_count: blocks.len(),
-        });
         let queue_ticket: QueueTicket = ticket.into();
         if self.is_cancelled(queue_ticket) {
             let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
@@ -497,10 +478,6 @@ impl Coordinator {
         }
 
         regions.commit();
-        self.emit_orchestrator_event(OrchestratorEvent::FetchCompleted {
-            ticket,
-            blocks: fetched.clone(),
-        });
         self.emit_event(CoordinatorEvent::FetchCompleted {
             ticket,
             blocks: fetched,

@@ -5,10 +5,10 @@ use tempfile::tempdir;
 
 use super::builder::{AllocatedRegions, CoordinatorBuilder};
 use super::events::{
-    CoordinatorCommand, CoordinatorEvent, FetchRequest, OrchestratorEvent, PrefetchAction,
-    PrefetchPlan, PrefetchPlanRequest, StoreRequest, StoreTarget,
+    CoordinatorCommand, CoordinatorEvent, FetchRequest, PrefetchAction, PrefetchPlan,
+    PrefetchPlanRequest, StoreRequest, StoreTarget,
 };
-use super::types::{QueueBackpressure, QueueKind, QueueTicket};
+use super::types::{QueueBackpressure, QueueKind};
 use crate::kv_tier::backend::ClusterSharedBackend;
 use crate::kv_tier::tier::BlockLocation;
 use crate::kv_tier::transport::disk::DiskStore;
@@ -427,10 +427,8 @@ fn cancelled_fetch_updates_stats_and_reports_cancel_reason() {
 }
 
 #[test]
-fn orchestrator_plan_classifies_tiers_without_touching_legacy_events() {
-    let (coordinator, handle, _events, orchestrator_events) = CoordinatorBuilder::new(4)
-        .with_orchestrator_events()
-        .build();
+fn plan_classifies_tiers_on_unified_event_channel() {
+    let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
     let ticket = handle
         .submit_prefetch_plan(vec![
             PrefetchPlanRequest {
@@ -466,14 +464,14 @@ fn orchestrator_plan_classifies_tiers_without_touching_legacy_events() {
 
     assert!(coordinator.run_once().unwrap());
     assert_eq!(
-        orchestrator_events.recv().unwrap(),
-        OrchestratorEvent::PlanQueued {
+        events.recv().unwrap(),
+        CoordinatorEvent::PlanQueued {
             ticket,
             block_count: 5,
         }
     );
-    match orchestrator_events.recv().unwrap() {
-        OrchestratorEvent::PlanCompleted {
+    match events.recv().unwrap() {
+        CoordinatorEvent::PlanCompleted {
             ticket: done,
             plans,
         } => {
@@ -504,15 +502,13 @@ fn orchestrator_plan_classifies_tiers_without_touching_legacy_events() {
                 ]
             );
         }
-        other => panic!("unexpected orchestrator event: {other:?}"),
+        other => panic!("unexpected plan event: {other:?}"),
     }
 }
 
 #[test]
-fn orchestrator_store_reports_remote_stub_failure() {
-    let (coordinator, handle, _events, orchestrator_events) = CoordinatorBuilder::new(4)
-        .with_orchestrator_events()
-        .build();
+fn store_reports_remote_stub_failure_on_unified_event_channel() {
+    let (coordinator, handle, events) = CoordinatorBuilder::new(4).build();
     let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
         crate::kv_tier::HostPinnedPool::new(64).unwrap(),
     );
@@ -536,25 +532,23 @@ fn orchestrator_store_reports_remote_stub_failure() {
 
     assert!(coordinator.run_once().unwrap());
     assert_eq!(
-        orchestrator_events.recv().unwrap(),
-        OrchestratorEvent::StoreQueued {
+        events.recv().unwrap(),
+        CoordinatorEvent::StoreQueued {
             ticket,
             block_count: 1,
         }
     );
-    match orchestrator_events.recv().unwrap() {
-        OrchestratorEvent::TaskFailed {
-            queue,
+    match events.recv().unwrap() {
+        CoordinatorEvent::StoreFailed {
             ticket: failed_ticket,
             failed_block,
             reason,
         } => {
-            assert_eq!(queue, QueueKind::Store);
-            assert_eq!(failed_ticket, QueueTicket::Store(ticket));
+            assert_eq!(failed_ticket, ticket);
             assert_eq!(failed_block, BlockId(7));
             assert!(reason.contains("remote store not configured"));
         }
-        other => panic!("unexpected orchestrator event: {other:?}"),
+        other => panic!("unexpected store event: {other:?}"),
     }
 }
 
