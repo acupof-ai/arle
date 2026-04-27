@@ -32,12 +32,9 @@ use crate::backend::runtime::StopChunkProcessor;
 use crate::backend::{InferenceBackend, StreamStopMatched, StreamingInferenceBackend};
 #[cfg(feature = "cuda")]
 use crate::model::{GenerationState, ModelForward, Qwen3Model, Qwen35Model};
-#[cfg(any(feature = "metal", test))]
 use crate::request_handle::RequestHandle;
 use crate::sampler::SamplingParams;
-#[cfg(any(feature = "metal", test))]
 use crate::scheduler::{IncomingRequest, RequestPriority};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu", test))]
 use crate::session_persistence::SessionPersistence;
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
@@ -154,6 +151,15 @@ fn model_id_from_path(model_path: &str) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(model_path)
         .to_string()
+}
+
+impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
+    /// Adopt a previously-spawned `RequestHandle` (e.g. the CUDA scheduler
+    /// or the Metal runtime). Caller owns any thread join handle / guard
+    /// that backs the underlying scheduler.
+    pub fn from_handle(model_id: String, handle: H) -> Self {
+        Self { model_id, handle }
+    }
 }
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
@@ -900,7 +906,6 @@ pub struct BackendInferenceEngine<B: InferenceBackend> {
     backend: B,
 }
 
-#[cfg(any(feature = "metal", test))]
 pub struct RequestHandleInferenceEngine<H: RequestHandle> {
     model_id: String,
     handle: H,
@@ -1112,7 +1117,6 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
     }
 }
 
-#[cfg(any(feature = "metal", test))]
 impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
     fn submit_request(
         &self,
@@ -1135,7 +1139,6 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
     }
 }
 
-#[cfg(any(feature = "metal", test))]
 impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
     fn model_id(&self) -> &str {
         &self.model_id
@@ -1191,6 +1194,14 @@ pub enum LoadedInferenceEngine {
     /// stub under CUDA; the Metal path does not route through here.
     #[cfg(feature = "cuda")]
     Qwen35Moe(Qwen35InferenceEngine),
+    /// Unified CUDA variant: drives the multi-request scheduler runtime
+    /// through the same `RequestHandle` contract as Metal. The held
+    /// `SchedulerRuntimeGuard` keeps the scheduler thread joined on drop.
+    #[cfg(feature = "cuda")]
+    Cuda {
+        engine: RequestHandleInferenceEngine<crate::scheduler::SchedulerHandle>,
+        _guard: crate::backend::cuda::bootstrap::SchedulerRuntimeGuard,
+    },
     #[cfg(feature = "metal")]
     Metal(RequestHandleInferenceEngine<MetalSchedulerHandle>),
     #[cfg(feature = "cpu")]
@@ -1244,11 +1255,26 @@ impl LoadedInferenceEngine {
     pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
         #[cfg(feature = "cuda")]
         {
-            return Self::load_with_options(
-                model_path,
-                42,
-                InferenceEngineOptions { enable_cuda_graph },
-            );
+            // Production CLI / agent CUDA path: route through the unified
+            // multi-request scheduler runtime via the `RequestHandle`
+            // contract (matches what the HTTP server already does for its
+            // own `spawn_scheduler_handle_from_path` flow). Legacy
+            // `Qwen3 / Qwen35 / Qwen35Moe` variants are still constructed
+            // explicitly by E2E tests via `LoadedInferenceEngine::load_with_options`.
+            let runtime = crate::backend::cuda::bootstrap::ServerRuntimeConfig {
+                engine: InferenceEngineOptions { enable_cuda_graph },
+                ..Default::default()
+            };
+            let metrics = crate::metrics::ServerMetrics::new("");
+            let (handle, guard) =
+                crate::backend::cuda::bootstrap::spawn_scheduler_handle_from_path(
+                    model_path, runtime, metrics,
+                )?;
+            let model_id = handle.model_id().to_string();
+            return Ok(Self::Cuda {
+                engine: RequestHandleInferenceEngine::from_handle(model_id, handle),
+                _guard: guard,
+            });
         }
 
         #[cfg(all(not(feature = "cuda"), feature = "metal"))]
@@ -1298,7 +1324,7 @@ impl LoadedInferenceEngine {
     pub fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen35Moe(_) => "cuda",
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen35Moe(_) | Self::Cuda { .. } => "cuda",
             #[cfg(feature = "metal")]
             Self::Metal(_) => "metal",
             #[cfg(feature = "cpu")]
@@ -1312,6 +1338,11 @@ impl LoadedInferenceEngine {
             Self::Qwen3(_) => ModelType::Qwen3,
             Self::Qwen35(_) => ModelType::Qwen35,
             Self::Qwen35Moe(_) => ModelType::Qwen35Moe,
+            // The unified `Cuda` variant is type-erased over models — the
+            // scheduler runtime does not surface the legacy `ModelType` enum.
+            Self::Cuda { .. } => {
+                unreachable!("model_type is not defined for the unified Cuda variant")
+            }
             #[cfg(feature = "metal")]
             Self::Metal(_) => unreachable!("model_type is only defined for CUDA engines"),
             #[cfg(feature = "cpu")]
@@ -1330,6 +1361,8 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.model_id(),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.model_id(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda { engine, .. } => engine.model_id(),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.model_id(),
             #[cfg(feature = "cpu")]
@@ -1345,6 +1378,8 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.complete(req),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.complete(req),
+            #[cfg(feature = "cuda")]
+            Self::Cuda { engine, .. } => engine.complete(req),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete(req),
             #[cfg(feature = "cpu")]
@@ -1364,6 +1399,8 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Qwen35(engine) => engine.complete_stream(req, tx),
             #[cfg(feature = "cuda")]
             Self::Qwen35Moe(engine) => engine.complete_stream(req, tx),
+            #[cfg(feature = "cuda")]
+            Self::Cuda { engine, .. } => engine.complete_stream(req, tx),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete_stream(req, tx),
             #[cfg(feature = "cpu")]
@@ -1378,7 +1415,6 @@ impl<M: ModelForward> SessionPersistence for ModelInferenceEngine<M> {}
 #[cfg(any(feature = "metal", feature = "cpu"))]
 impl<B: InferenceBackend> SessionPersistence for BackendInferenceEngine<B> {}
 
-#[cfg(any(feature = "metal", test))]
 impl<H: RequestHandle> SessionPersistence for RequestHandleInferenceEngine<H> {}
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
