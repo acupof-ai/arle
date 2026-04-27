@@ -1,44 +1,10 @@
 name: CUDA CI
 
 on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - 'infer/src/**'
-      - 'crates/cuda-kernels/**'
-      - 'crates/cli/**'
-      - 'crates/train/**'
-      - 'crates/kv-native-sys/**'
-      - 'infer/build.rs'
-      - 'infer/Cargo.toml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'src/**'
-      - 'tests/**'
-      - 'scripts/setup_zig_toolchain.sh'
-      - 'scripts/check_kv_zig.sh'
-      - 'README.md'
-      - 'CONTRIBUTING.md'
-      - '.github/workflows/cuda-ci.yml'
-  pull_request:
-    branches: [ main, master ]
-    paths:
-      - 'infer/src/**'
-      - 'crates/cuda-kernels/**'
-      - 'crates/cli/**'
-      - 'crates/train/**'
-      - 'crates/kv-native-sys/**'
-      - 'infer/build.rs'
-      - 'infer/Cargo.toml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'src/**'
-      - 'tests/**'
-      - 'scripts/setup_zig_toolchain.sh'
-      - 'scripts/check_kv_zig.sh'
-      - 'README.md'
-      - 'CONTRIBUTING.md'
-      - '.github/workflows/cuda-ci.yml'
+  # Auto-trigger disabled: this workflow needs a self-hosted runner with the
+  # `gpu`+`cuda` labels, and none is currently registered for the repo. Pushes
+  # would queue forever and get cancel-in-progress'd by the next push. Re-enable
+  # the `push` / `pull_request` blocks (see git history) once a runner is back.
   workflow_dispatch:
 
 permissions:
