@@ -83,6 +83,8 @@ fn make_request(prompt: &str, max_tokens: usize) -> CompletionRequest {
         sampling: SamplingParams::default(),
         stop: None,
         logprobs: false,
+        session_id: None,
+        trace_context: None,
     }
 }
 

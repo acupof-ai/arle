@@ -183,6 +183,15 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
     /// Return per-token log-probabilities (greedy sampling only).
     pub logprobs: bool,
+    /// Optional client-supplied session identifier used for sticky routing /
+    /// prefix-cache affinity. Forwarded onto `IncomingRequest::session_id`
+    /// when this request is routed through a `RequestHandle`. CLI agent
+    /// callers may populate this; otherwise leave `None`.
+    pub session_id: Option<crate::types::SessionId>,
+    /// Parent tracing context to attach to the scheduler-side request.
+    /// Forwarded onto `IncomingRequest::trace_context`. `None` for
+    /// non-traced callers.
+    pub trace_context: Option<fastrace::collector::SpanContext>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1118,9 +1127,9 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 sampling: req.sampling,
                 stop: req.stop,
                 priority: RequestPriority::Normal,
-                session_id: None,
+                session_id: req.session_id,
                 delta_tx,
-                trace_context: None,
+                trace_context: req.trace_context,
             })
             .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))
     }
@@ -1515,6 +1524,8 @@ mod tests {
                 sampling: SamplingParams::default(),
                 stop: None,
                 logprobs: false,
+                session_id: None,
+                trace_context: None,
             },
             tx,
         );
@@ -1594,6 +1605,8 @@ mod tests {
                 sampling: SamplingParams::default(),
                 stop: None,
                 logprobs: false,
+                session_id: None,
+                trace_context: None,
             },
             tx,
         );
@@ -1669,6 +1682,8 @@ mod tests {
                 sampling: SamplingParams::default(),
                 stop: None,
                 logprobs: false,
+                session_id: None,
+                trace_context: None,
             })
             .expect("complete");
 
@@ -1768,6 +1783,8 @@ mod tests {
                     sampling: SamplingParams::default(),
                     stop: Some(vec!["<|im_end|>".into()]),
                     logprobs: false,
+                    session_id: None,
+                    trace_context: None,
                 },
                 tx,
             )
@@ -1881,6 +1898,8 @@ mod tests {
                     sampling: SamplingParams::default(),
                     stop: Some(vec!["<|im_end|>".into()]),
                     logprobs: false,
+                    session_id: None,
+                    trace_context: None,
                 },
                 tx,
             )
@@ -2016,6 +2035,8 @@ mod tests {
                     sampling: SamplingParams::default(),
                     stop: Some(vec!["<|im_end|>".into()]),
                     logprobs: false,
+                    session_id: None,
+                    trace_context: None,
                 },
                 tx,
             )
