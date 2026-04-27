@@ -1,6 +1,6 @@
 use super::mlx::{
     MlxArray, async_eval, clear_cache, concatenate_axis, gguf_quantized_matmul, matmul,
-    quantized_matmul, zeros,
+    quantized_matmul, reshape, transpose_axes, zeros,
 };
 use super::weights::WeightTensor;
 
@@ -59,5 +59,51 @@ pub(super) fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
             rows,
             cols,
         } => gguf_quantized_matmul(x, w, format.as_i32(), *rows, *cols),
+        WeightTensor::GgufPackedInputReordered {
+            w,
+            format,
+            rows,
+            cols,
+            num_key_heads,
+            num_value_heads_per_key,
+            head_dim,
+        } => {
+            let x_reordered =
+                reorder_qwen35_v_cols_input(x, *num_key_heads, *num_value_heads_per_key, *head_dim);
+            gguf_quantized_matmul(&x_reordered, w, format.as_i32(), *rows, *cols)
+        }
     }
+}
+
+#[cfg(feature = "metal")]
+fn reorder_qwen35_v_cols_input(
+    x: &MlxArray,
+    num_key_heads: i32,
+    num_value_heads_per_key: i32,
+    head_dim: i32,
+) -> MlxArray {
+    if num_value_heads_per_key <= 1 {
+        return x.clone();
+    }
+
+    let shape = x.shape();
+    let Some(&cols) = shape.last() else {
+        return x.clone();
+    };
+    assert_eq!(
+        cols,
+        num_key_heads * num_value_heads_per_key * head_dim,
+        "Qwen3.5 GGUF value-head input reorder dimension mismatch"
+    );
+
+    let prefix_ndim = shape.len() - 1;
+    let mut expanded = shape[..prefix_ndim].to_vec();
+    expanded.extend([num_key_heads, num_value_heads_per_key, head_dim]);
+
+    let mut axes: Vec<i32> = (0..i32::try_from(prefix_ndim).expect("ndim fits i32")).collect();
+    let base = i32::try_from(prefix_ndim).expect("ndim fits i32");
+    axes.extend([base + 1, base, base + 2]);
+
+    let expanded_x = reshape(x, &expanded);
+    reshape(&transpose_axes(&expanded_x, &axes), shape)
 }

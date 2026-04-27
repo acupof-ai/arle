@@ -50,7 +50,7 @@ impl QuantFormat {
             Self::Fp8 => "FP8 (E4M3)",
             Self::Int8 => "INT8 (W8A8)",
             Self::Gguf => "GGUF",
-            Self::TurboQuant => "TurboQuant (TQ3)",
+            Self::TurboQuant => "TurboQuant",
         }
     }
 }
@@ -660,6 +660,7 @@ mod tests {
         assert_eq!(QuantFormat::Gptq.to_string(), "GPTQ (INT4)");
         assert_eq!(QuantFormat::Fp8.to_string(), "FP8 (E4M3)");
         assert_eq!(QuantFormat::None.to_string(), "none (BF16/FP16)");
+        assert_eq!(QuantFormat::TurboQuant.to_string(), "TurboQuant");
     }
 
     #[test]

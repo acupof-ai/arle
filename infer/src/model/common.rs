@@ -13,8 +13,8 @@ use std::collections::HashMap;
 
 use crate::ops;
 use crate::weight_loader::{
-    load_shard_info, load_shard_info_fixed, load_tensor_2d, load_tensor_2d_maybe_quantized,
-    mmap_shards,
+    QuantLoadConfig, load_shard_info, load_shard_info_fixed, load_tensor_2d,
+    load_tensor_2d_maybe_quantized_with_config, mmap_shards,
 };
 
 // ─── MLP weights ─────────────────────────────────────────────────────────────
@@ -36,27 +36,17 @@ impl MLP {
     ///
     /// `prefix` should be e.g. `"model.layers.0.mlp"`.
     /// When `merge_gate_up` is true, a fused `[gate; up]` matrix is also created.
-    pub(crate) fn load(
+    pub(crate) fn load_with_quant_config(
         ctx: &DeviceContext,
         shards: &[SafeTensors],
         weight_map: &HashMap<String, usize>,
         prefix: &str,
         merge_gate_up: bool,
-    ) -> Result<Self> {
-        Self::load_with_quant(ctx, shards, weight_map, prefix, merge_gate_up, 0)
-    }
-
-    pub(crate) fn load_with_quant(
-        ctx: &DeviceContext,
-        shards: &[SafeTensors],
-        weight_map: &HashMap<String, usize>,
-        prefix: &str,
-        merge_gate_up: bool,
-        quant_group_size: usize,
+        quant: QuantLoadConfig,
     ) -> Result<Self> {
         let load_w = |name: &str| -> Result<DeviceMatrix> {
-            if quant_group_size > 0 {
-                load_tensor_2d_maybe_quantized(ctx, shards, weight_map, name, quant_group_size)
+            if quant.enabled() {
+                load_tensor_2d_maybe_quantized_with_config(ctx, shards, weight_map, name, quant)
             } else {
                 load_tensor_2d(ctx, shards, weight_map, name)
             }

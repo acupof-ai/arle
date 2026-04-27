@@ -16,6 +16,7 @@
 #include "mlx_common.h"
 #include <algorithm>
 #include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -109,6 +110,16 @@ bool use_qwen35_cpp_prefill_gbeta_helper() {
 bool use_qwen35_cpp_qk_norm_helper() {
     const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER");
     return !(env && std::string(env) == "0");
+}
+
+bool use_qwen35_cpp_generate_profile() {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_GENERATE_PROFILE");
+    return env && std::string(env) != "0";
+}
+
+template <typename Start, typename End>
+double elapsed_ms(Start start, End end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 array suppress_last_axis_token(const array& logits, int32_t suppress_token_id) {
@@ -390,6 +401,45 @@ auto& compiled_precise_sigmoid_mul() {
     return fn;
 }
 
+array reorder_qwen35_v_cols_input(
+    const array& x,
+    int num_key_heads,
+    int num_value_heads_per_key,
+    int head_dim) {
+    if (num_value_heads_per_key <= 1) {
+        return x;
+    }
+    auto original_shape = x.shape();
+    if (original_shape.empty()) {
+        return x;
+    }
+    int cols = original_shape.back();
+    if (cols != num_key_heads * num_value_heads_per_key * head_dim) {
+        throw std::runtime_error("Qwen3.5 GGUF value-head input reorder dimension mismatch");
+    }
+
+    int prefix_ndim = static_cast<int>(original_shape.size()) - 1;
+    Shape expanded;
+    expanded.reserve(original_shape.size() + 2);
+    for (int i = 0; i < prefix_ndim; ++i) {
+        expanded.push_back(original_shape[i]);
+    }
+    expanded.push_back(num_key_heads);
+    expanded.push_back(num_value_heads_per_key);
+    expanded.push_back(head_dim);
+
+    std::vector<int> axes;
+    axes.reserve(expanded.size());
+    for (int i = 0; i < prefix_ndim; ++i) {
+        axes.push_back(i);
+    }
+    axes.push_back(prefix_ndim + 1);
+    axes.push_back(prefix_ndim);
+    axes.push_back(prefix_ndim + 2);
+
+    return reshape(transpose(reshape(x, expanded), axes), original_shape);
+}
+
 } // namespace
 
 // ── Quantized linear helper ────────────────────────────────────────────────
@@ -404,18 +454,29 @@ struct QWeight {
     int gguf_format = 0;
     int rows = 0;
     int cols = 0;
+    bool reorder_input_v_cols = false;
+    int reorder_num_key_heads = 0;
+    int reorder_num_value_heads_per_key = 0;
+    int reorder_head_dim = 0;
 
     array apply(const array& x, bool prefer_verify_m16 = false) const {
+        auto input = reorder_input_v_cols
+            ? reorder_qwen35_v_cols_input(
+                x,
+                reorder_num_key_heads,
+                reorder_num_value_heads_per_key,
+                reorder_head_dim)
+            : x;
         if (gguf_format != 0) {
-            return gguf_quantized_matmul_cpp(x, w, gguf_format, rows, cols);
+            return gguf_quantized_matmul_cpp(input, w, gguf_format, rows, cols);
         }
         if (is_dense) {
-            return matmul(x, w);  // w is already transposed at load time
+            return matmul(input, w);  // w is already transposed at load time
         }
         if (prefer_verify_m16) {
-            return verify_quantized_matmul_cpp(x, w, scales, biases, group_size, bits);
+            return verify_quantized_matmul_cpp(input, w, scales, biases, group_size, bits);
         }
-        return quantized_matmul(x, w, scales, biases, true, group_size, bits);
+        return quantized_matmul(input, w, scales, biases, true, group_size, bits);
     }
 };
 
@@ -1373,6 +1434,31 @@ int32_t qwen35_compiled_add_gguf_weight(
         weight.gguf_format = format;
         weight.rows = rows;
         weight.cols = cols;
+        m->weight_pool.push_back(std::move(weight));
+        return static_cast<int32_t>(m->weight_pool.size() - 1);
+    }());
+}
+
+int32_t qwen35_compiled_add_gguf_input_reordered_weight(
+    void* model,
+    mlx_array* w,
+    int32_t format,
+    int32_t rows,
+    int32_t cols,
+    int32_t num_key_heads,
+    int32_t num_value_heads_per_key,
+    int32_t head_dim) {
+    MLX_TRY_RETURN_VALUE(-1, [&]() {
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        QWeight weight;
+        weight.w = *to_arr(w);
+        weight.gguf_format = format;
+        weight.rows = rows;
+        weight.cols = cols;
+        weight.reorder_input_v_cols = true;
+        weight.reorder_num_key_heads = num_key_heads;
+        weight.reorder_num_value_heads_per_key = num_value_heads_per_key;
+        weight.reorder_head_dim = head_dim;
         m->weight_pool.push_back(std::move(weight));
         return static_cast<int32_t>(m->weight_pool.size() - 1);
     }());
@@ -2658,6 +2744,36 @@ int32_t qwen35_compiled_generate(
         mlx_clear_error();
         auto t_start = std::chrono::high_resolution_clock::now();
         int F = m->n_full_attn;
+        const bool profile_generate = use_qwen35_cpp_generate_profile();
+        double cache_init_ms = 0.0;
+        double prefill_build_ms = 0.0;
+        double prefill_sample_build_ms = 0.0;
+        double prefill_eval_ms = 0.0;
+        double decode_forward_build_ms = 0.0;
+        double decode_sample_build_ms = 0.0;
+        double decode_async_ms = 0.0;
+        double decode_eval_wait_ms = 0.0;
+        double decode_item_ms = 0.0;
+        double decode_bookkeep_ms = 0.0;
+        double decode_clear_cache_ms = 0.0;
+        int profile_decode_tokens = 0;
+        if (profile_generate) {
+            std::fprintf(
+                stderr,
+                "[qwen35-profile] prompt=%d max_new=%d layers=%zu full=%d gdr=%d hidden=%d "
+                "packed_embed=%d embed_as_linear=%d lm_head_gguf=%d embed_rows=%d embed_cols=%d\n",
+                prompt_len,
+                max_new_tokens,
+                m->layers.size(),
+                m->n_full_attn,
+                m->n_gdr,
+                m->hidden_size,
+                m->use_packed_embed ? 1 : 0,
+                m->use_embed_as_linear ? 1 : 0,
+                m->lm_head.gguf_format,
+                m->use_embed_as_linear ? m->embed_as_linear.rows : m->lm_head.rows,
+                m->use_embed_as_linear ? m->embed_as_linear.cols : m->lm_head.cols);
+        }
 
         // Initialize caches
         constexpr int KV_CACHE_CHUNK = 256;
@@ -2681,7 +2797,12 @@ int32_t qwen35_compiled_generate(
                 gdr_states.push_back(zeros({1, (int)lw.conv_kernel-1, lw.num_key_heads*dk*2 + hv*dv}, bfloat16));  // conv state
             }
         }
+        auto t_cache_eval_start = std::chrono::high_resolution_clock::now();
         eval(kv_caches); eval(gdr_states);
+        auto t_cache_eval_end = std::chrono::high_resolution_clock::now();
+        if (profile_generate) {
+            cache_init_ms = elapsed_ms(t_cache_eval_start, t_cache_eval_end);
+        }
 
         int cache_pos = 0;
 
@@ -2699,7 +2820,12 @@ int32_t qwen35_compiled_generate(
             for (auto& c : kv_caches) inputs.push_back(c);
             for (auto& s : gdr_states) inputs.push_back(s);
 
+            auto t_prefill_build_start = std::chrono::high_resolution_clock::now();
             auto outputs = m->forward(inputs);
+            auto t_prefill_build_end = std::chrono::high_resolution_clock::now();
+            if (profile_generate) {
+                prefill_build_ms = elapsed_ms(t_prefill_build_start, t_prefill_build_end);
+            }
             m->current_seq_len = 1;  // back to decode mode
             m->current_last_logits_only = false;
 
@@ -2715,11 +2841,18 @@ int32_t qwen35_compiled_generate(
                 auto logits = (all_logits.shape(1) == 1)
                     ? all_logits
                     : take(all_logits, array(prompt_len - 1), 1);
+                auto t_prefill_sample_start = std::chrono::high_resolution_clock::now();
                 auto y = greedy
                     ? argmax(logits, true)
                     : random::categorical(logits * array(1.0f / temperature), -1);
+                auto t_prefill_eval_start = std::chrono::high_resolution_clock::now();
                 eval(y);  // single eval for all prefill tokens
                 auto t_prefill_end = std::chrono::high_resolution_clock::now();
+                if (profile_generate) {
+                    prefill_sample_build_ms =
+                        elapsed_ms(t_prefill_sample_start, t_prefill_eval_start);
+                    prefill_eval_ms = elapsed_ms(t_prefill_eval_start, t_prefill_end);
+                }
                 if (out_prefill_ms) {
                     *out_prefill_ms = std::chrono::duration<double, std::milli>(
                         t_prefill_end - t_start).count();
@@ -2735,6 +2868,7 @@ int32_t qwen35_compiled_generate(
                 std::vector<array> prev_step_arrays;
 
                 while (generated < max_new_tokens) {
+                    auto t_step_start = std::chrono::high_resolution_clock::now();
                     // Save current step's key arrays to keep them alive
                     prev_step_arrays.clear();
                     prev_step_arrays.reserve(512);
@@ -2746,7 +2880,12 @@ int32_t qwen35_compiled_generate(
                     for (auto& c : kv_caches) step_inputs.push_back(c);
                     for (auto& s : gdr_states) step_inputs.push_back(s);
 
+                    auto t_forward_start = std::chrono::high_resolution_clock::now();
                     auto step_outputs = m->forward(step_inputs);
+                    auto t_forward_end = std::chrono::high_resolution_clock::now();
+                    if (profile_generate) {
+                        decode_forward_build_ms += elapsed_ms(t_forward_start, t_forward_end);
+                    }
 
                     // Update caches (lazy)
                     for (int j = 0; j < (int)kv_caches.size(); ++j)
@@ -2755,14 +2894,34 @@ int32_t qwen35_compiled_generate(
                         gdr_states[j] = step_outputs[1 + (int)kv_caches.size() + j];
 
                     auto next_logits = step_outputs[0];
+                    auto t_sample_start = std::chrono::high_resolution_clock::now();
                     auto next_y = greedy
                         ? argmax(next_logits, true)
                         : random::categorical(next_logits * array(1.0f / temperature), -1);
+                    auto t_sample_end = std::chrono::high_resolution_clock::now();
+                    if (profile_generate) {
+                        decode_sample_build_ms += elapsed_ms(t_sample_start, t_sample_end);
+                    }
+                    auto t_async_start = std::chrono::high_resolution_clock::now();
                     async_eval(next_y);
+                    auto t_async_end = std::chrono::high_resolution_clock::now();
+                    if (profile_generate) {
+                        decode_async_ms += elapsed_ms(t_async_start, t_async_end);
+                    }
 
                     // Wait for CURRENT y
+                    auto t_eval_start = std::chrono::high_resolution_clock::now();
                     eval(y);
+                    auto t_eval_end = std::chrono::high_resolution_clock::now();
+                    if (profile_generate) {
+                        decode_eval_wait_ms += elapsed_ms(t_eval_start, t_eval_end);
+                    }
+                    auto t_item_start = std::chrono::high_resolution_clock::now();
                     int32_t token_id = y.item<int32_t>();
+                    auto t_item_end = std::chrono::high_resolution_clock::now();
+                    if (profile_generate) {
+                        decode_item_ms += elapsed_ms(t_item_start, t_item_end);
+                    }
 
                     // Check stop
                     bool stop = false;
@@ -2771,6 +2930,9 @@ int32_t qwen35_compiled_generate(
                     }
                     out_tokens[generated] = token_id;
                     generated++;
+                    if (profile_generate) {
+                        profile_decode_tokens++;
+                    }
                     cache_pos++;
 
                     if (on_token && on_token(token_id, callback_ctx) != 0)
@@ -2778,7 +2940,12 @@ int32_t qwen35_compiled_generate(
                     if (stop) break;
 
                     if (use_qwen35_cpp_clear_cache() && generated % 256 == 0) {
+                        auto t_clear_start = std::chrono::high_resolution_clock::now();
                         mlx::core::clear_cache();
+                        auto t_clear_end = std::chrono::high_resolution_clock::now();
+                        if (profile_generate) {
+                            decode_clear_cache_ms += elapsed_ms(t_clear_start, t_clear_end);
+                        }
                     }
 
                     // Keep step_outputs and step_inputs alive until next iteration
@@ -2787,6 +2954,16 @@ int32_t qwen35_compiled_generate(
                     for (auto& a : step_inputs) prev_step_arrays.push_back(std::move(a));
                     // Also keep intermediates from forward()
                     for (auto& a : m->intermediates) prev_step_arrays.push_back(std::move(a));
+
+                    if (profile_generate) {
+                        auto t_step_end = std::chrono::high_resolution_clock::now();
+                        decode_bookkeep_ms += elapsed_ms(t_step_start, t_step_end)
+                            - elapsed_ms(t_forward_start, t_forward_end)
+                            - elapsed_ms(t_sample_start, t_sample_end)
+                            - elapsed_ms(t_async_start, t_async_end)
+                            - elapsed_ms(t_eval_start, t_eval_end)
+                            - elapsed_ms(t_item_start, t_item_end);
+                    }
 
                     y = next_y;
                 }
@@ -2798,10 +2975,42 @@ int32_t qwen35_compiled_generate(
                 }
 
                 *out_count = generated;
+                auto t_decode_end = std::chrono::high_resolution_clock::now();
                 if (out_decode_ms) {
-                    auto t_decode_end = std::chrono::high_resolution_clock::now();
                     *out_decode_ms = std::chrono::duration<double, std::milli>(
                         t_decode_end - t_prefill_end).count();
+                }
+                if (profile_generate) {
+                    const double decode_total_ms = elapsed_ms(t_prefill_end, t_decode_end);
+                    const double denom = profile_decode_tokens > 0
+                        ? static_cast<double>(profile_decode_tokens)
+                        : 1.0;
+                    std::fprintf(
+                        stderr,
+                        "[qwen35-profile] cache_init=%.3fms prefill_total=%.3fms "
+                        "prefill_build=%.3fms prefill_sample_build=%.3fms prefill_eval=%.3fms\n",
+                        cache_init_ms,
+                        elapsed_ms(t_start, t_prefill_end),
+                        prefill_build_ms,
+                        prefill_sample_build_ms,
+                        prefill_eval_ms);
+                    std::fprintf(
+                        stderr,
+                        "[qwen35-profile] decode tokens=%d total=%.3fms avg=%.3fms "
+                        "forward_build_avg=%.3fms sample_build_avg=%.3fms async_avg=%.3fms "
+                        "eval_wait_avg=%.3fms item_avg=%.3fms bookkeep_avg=%.3fms "
+                        "clear_cache_total=%.3fms last_intermediates=%zu\n",
+                        profile_decode_tokens,
+                        decode_total_ms,
+                        decode_total_ms / denom,
+                        decode_forward_build_ms / denom,
+                        decode_sample_build_ms / denom,
+                        decode_async_ms / denom,
+                        decode_eval_wait_ms / denom,
+                        decode_item_ms / denom,
+                        decode_bookkeep_ms / denom,
+                        decode_clear_cache_ms,
+                        m->intermediates.size());
                 }
             }
         }

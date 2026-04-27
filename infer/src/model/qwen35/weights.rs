@@ -8,7 +8,8 @@ use crate::model::common::{self, MLP};
 use crate::model::qwen35::prefill_buffers::PagedPrefillBuffers35;
 use crate::model_source::ResolvedModelSource;
 use crate::weight_loader::{
-    load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, precompute_rope, resolve_rope_cache_len,
+    QuantLoadConfig, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d,
+    load_tensor_2d_maybe_quantized_with_config, precompute_rope, resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -116,6 +117,17 @@ impl Qwen35Model {
 
         let (mmaps, weight_map) = common::load_safetensors(resolved_path, true)?;
         let shards = common::deserialize_shards(&mmaps)?;
+        let quant = QuantLoadConfig::from_model_path(resolved_path)?;
+        if quant.enabled() {
+            info!("Weight quantization detected: {:?}", quant);
+        }
+        let load_linear = |name: &str| -> Result<DeviceMatrix> {
+            if quant.enabled() {
+                load_tensor_2d_maybe_quantized_with_config(&ctx, &shards, &weight_map, name, quant)
+            } else {
+                load_tensor_2d(&ctx, &shards, &weight_map, name)
+            }
+        };
 
         let t_gpu = Instant::now();
         // Weight prefix for Qwen3.5 text model
@@ -146,30 +158,10 @@ impl Qwen35Model {
                 LayerType::FullAttention => {
                     let attn_prefix = format!("{}.self_attn", prefix);
                     LayerKind::FullAttention(FullAttentionLayer {
-                        q_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.q_proj.weight", attn_prefix),
-                        )?,
-                        k_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.k_proj.weight", attn_prefix),
-                        )?,
-                        v_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.v_proj.weight", attn_prefix),
-                        )?,
-                        o_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.o_proj.weight", attn_prefix),
-                        )?,
+                        q_proj: load_linear(&format!("{}.q_proj.weight", attn_prefix))?,
+                        k_proj: load_linear(&format!("{}.k_proj.weight", attn_prefix))?,
+                        v_proj: load_linear(&format!("{}.v_proj.weight", attn_prefix))?,
+                        o_proj: load_linear(&format!("{}.o_proj.weight", attn_prefix))?,
                         q_norm: load_tensor_1d(
                             &ctx,
                             &shards,
@@ -187,30 +179,10 @@ impl Qwen35Model {
                 LayerType::LinearAttention => {
                     let attn_prefix = format!("{}.linear_attn", prefix);
                     LayerKind::LinearAttention(LinearAttentionLayer {
-                        in_proj_qkv: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_qkv.weight", attn_prefix),
-                        )?,
-                        in_proj_z: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_z.weight", attn_prefix),
-                        )?,
-                        in_proj_b: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_b.weight", attn_prefix),
-                        )?,
-                        in_proj_a: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_a.weight", attn_prefix),
-                        )?,
+                        in_proj_qkv: load_linear(&format!("{}.in_proj_qkv.weight", attn_prefix))?,
+                        in_proj_z: load_linear(&format!("{}.in_proj_z.weight", attn_prefix))?,
+                        in_proj_b: load_linear(&format!("{}.in_proj_b.weight", attn_prefix))?,
+                        in_proj_a: load_linear(&format!("{}.in_proj_a.weight", attn_prefix))?,
                         conv1d_weight: load_tensor_1d(
                             &ctx,
                             &shards,
@@ -235,12 +207,7 @@ impl Qwen35Model {
                             &weight_map,
                             &format!("{}.norm.weight", attn_prefix),
                         )?,
-                        out_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.out_proj.weight", attn_prefix),
-                        )?,
+                        out_proj: load_linear(&format!("{}.out_proj.weight", attn_prefix))?,
                     })
                 }
             };
@@ -259,12 +226,13 @@ impl Qwen35Model {
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
-                mlp: MLP::load(
+                mlp: MLP::load_with_quant_config(
                     &ctx,
                     &shards,
                     &weight_map,
                     &format!("{}.mlp", prefix),
                     false, // Qwen3.5 doesn't use merged gate+up
+                    quant,
                 )?,
             };
 

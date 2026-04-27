@@ -23,6 +23,9 @@
 use super::mlx::MlxArray;
 
 #[cfg(feature = "metal")]
+use super::ops::linear;
+
+#[cfg(feature = "metal")]
 use super::WeightTensor;
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -177,35 +180,12 @@ impl MetalRecurrentState {
     }
 }
 
-// ── Helper: linear projection ────────────────────────────────────────────────
-
-/// `x @ weight.T` — dispatches to dense matmul or quantized matmul.
-/// Same as `metal_backend::linear` but avoids cross-module visibility issues.
-#[cfg(feature = "metal")]
-#[inline]
-fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
-    use super::mlx::{gguf_quantized_matmul, matmul, quantized_matmul};
-    match weight {
-        WeightTensor::Dense(w_t) => matmul(x, w_t),
-        WeightTensor::Quantized {
-            w,
-            scales,
-            biases,
-            group_size,
-            bits,
-        } => quantized_matmul(x, w, scales, biases, true, *group_size, *bits),
-        WeightTensor::GgufPacked {
-            w,
-            format,
-            rows,
-            cols,
-        } => gguf_quantized_matmul(x, w, format.as_i32(), *rows, *cols),
-    }
-}
-
 #[cfg(feature = "metal")]
 fn is_gguf_packed(weight: &WeightTensor) -> bool {
-    matches!(weight, WeightTensor::GgufPacked { .. })
+    matches!(
+        weight,
+        WeightTensor::GgufPacked { .. } | WeightTensor::GgufPackedInputReordered { .. }
+    )
 }
 
 #[cfg(feature = "metal")]

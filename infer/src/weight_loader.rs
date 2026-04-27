@@ -7,7 +7,7 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use log::info;
+use log::{info, warn};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
@@ -18,6 +18,7 @@ use crate::gguf::{
     self, GgufFile, find_tensor_name, load_matrix_v_reorder_rows_bf16_host, load_vector_bf16_host,
     load_vector_offset_norm_bf16_host,
 };
+use crate::quant::QuantMeta;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -140,23 +141,220 @@ pub(crate) fn load_tensor_2d(
     DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct QuantLoadConfig {
+    pub(crate) group_size: Option<usize>,
+    pub(crate) bits: Option<u8>,
+    pub(crate) tq_bits: Option<u8>,
+    pub(crate) unsupported_reason: Option<&'static str>,
+}
+
+impl QuantLoadConfig {
+    pub(crate) fn from_meta(meta: &QuantMeta) -> Self {
+        match meta {
+            QuantMeta::Gptq(config) if !config.sym => Self {
+                unsupported_reason: Some(
+                    "asymmetric GPTQ qzeros are not supported by the current CUDA W2/W4/W8 loader",
+                ),
+                ..Self::default()
+            },
+            QuantMeta::Gptq(config) if config.group_size > 0 => Self {
+                group_size: Some(config.group_size as usize),
+                bits: Some(config.bits),
+                tq_bits: None,
+                unsupported_reason: None,
+            },
+            QuantMeta::Gptq(config) => Self {
+                group_size: None,
+                bits: Some(config.bits),
+                tq_bits: None,
+                unsupported_reason: None,
+            },
+            QuantMeta::Awq(config) if config.zero_point => Self {
+                unsupported_reason: Some(
+                    "zero-point AWQ qzeros are not supported by the current CUDA W4 loader",
+                ),
+                ..Self::default()
+            },
+            QuantMeta::Awq(config) => Self {
+                group_size: Some(config.group_size),
+                bits: Some(config.bits),
+                tq_bits: None,
+                unsupported_reason: None,
+            },
+            QuantMeta::Int8(_) => Self {
+                group_size: None,
+                bits: Some(8),
+                tq_bits: None,
+                unsupported_reason: None,
+            },
+            QuantMeta::TurboQuant(config) => Self {
+                group_size: Some(config.group_size),
+                bits: None,
+                tq_bits: Some(config.bits),
+                unsupported_reason: None,
+            },
+            _ => Self::default(),
+        }
+    }
+
+    pub(crate) fn from_model_path(model_path: &str) -> Result<Self> {
+        Ok(Self::from_meta(&crate::quant::load_quant_meta(model_path)?))
+    }
+
+    pub(crate) fn enabled(self) -> bool {
+        self.group_size.is_some()
+            || self.bits.is_some()
+            || self.tq_bits.is_some()
+            || self.unsupported_reason.is_some()
+    }
+}
+
+fn detect_uniform_quant_layout(
+    name: &str,
+    qw_cols: usize,
+    num_groups: usize,
+    config: QuantLoadConfig,
+) -> Result<(usize, usize, u8)> {
+    anyhow::ensure!(
+        num_groups > 0,
+        "{name}: quantized scales must have at least one group"
+    );
+
+    let bits = if let Some(bits) = config.bits {
+        bits
+    } else if let Some(group_size) = config.group_size {
+        let orig_k = num_groups * group_size;
+        if qw_cols == orig_k / 4 {
+            2
+        } else if qw_cols == orig_k / 2 {
+            4
+        } else if qw_cols == orig_k {
+            8
+        } else {
+            anyhow::bail!(
+                "{name}: cannot infer quantized weight bits from qweight cols={qw_cols}, \
+                 groups={num_groups}, group_size={group_size}"
+            );
+        }
+    } else {
+        let mut candidates = [0u8; 3];
+        let mut count = 0usize;
+        for bits in [2u8, 4, 8] {
+            let elems_per_byte = match bits {
+                2 => 4,
+                4 => 2,
+                8 => 1,
+                _ => unreachable!(),
+            };
+            let orig_k = qw_cols * elems_per_byte;
+            if orig_k.is_multiple_of(num_groups) {
+                candidates[count] = bits;
+                count += 1;
+            }
+        }
+        anyhow::ensure!(
+            count == 1,
+            "{name}: quantized weight config must specify bits or group_size; \
+             inferred {count} possible layouts from qweight cols={qw_cols}, groups={num_groups}"
+        );
+        candidates[0]
+    };
+
+    anyhow::ensure!(
+        matches!(bits, 2 | 4 | 8),
+        "{name}: unsupported weight quantization bits={bits} (supported: 2, 4, 8)"
+    );
+    let elems_per_byte = match bits {
+        2 => 4,
+        4 => 2,
+        8 => 1,
+        _ => unreachable!(),
+    };
+    let orig_k = qw_cols * elems_per_byte;
+    let group_size = if let Some(group_size) = config.group_size {
+        anyhow::ensure!(
+            num_groups * group_size == orig_k,
+            "{name}: quantized shape mismatch for bits={bits}: qweight cols={qw_cols} \
+             implies K={orig_k}, but scales groups={num_groups} and group_size={group_size}"
+        );
+        group_size
+    } else {
+        anyhow::ensure!(
+            orig_k.is_multiple_of(num_groups),
+            "{name}: cannot infer group_size from K={orig_k} and groups={num_groups}"
+        );
+        orig_k / num_groups
+    };
+    Ok((orig_k, group_size, bits))
+}
+
+fn detect_turboquant_layout(
+    name: &str,
+    packed_cols: usize,
+    num_groups: usize,
+    config: QuantLoadConfig,
+) -> Result<(usize, usize, u8)> {
+    anyhow::ensure!(
+        num_groups > 0,
+        "{name}: TurboQuant scales must have at least one group"
+    );
+    let bits = config.tq_bits.unwrap_or(0);
+    anyhow::ensure!(
+        matches!(bits, 2 | 3 | 4),
+        "{name}: TurboQuant requires explicit bits in turboquant_config.json or config.json \
+         (got {:?}); supported bits are 2, 3, and 4",
+        config.tq_bits
+    );
+    let elems_per_byte = if bits == 2 { 4 } else { 2 };
+    let orig_k = packed_cols * elems_per_byte;
+    let group_size = if let Some(group_size) = config.group_size {
+        anyhow::ensure!(
+            num_groups * group_size == orig_k,
+            "{name}: TurboQuant shape mismatch for TQ{bits}: packed cols={packed_cols} \
+             implies K={orig_k}, but scales groups={num_groups} and group_size={group_size}"
+        );
+        group_size
+    } else {
+        anyhow::ensure!(
+            orig_k.is_multiple_of(num_groups),
+            "{name}: cannot infer TurboQuant group_size from K={orig_k} and groups={num_groups}"
+        );
+        orig_k / num_groups
+    };
+    Ok((orig_k, group_size, bits))
+}
+
 /// Load a 2D tensor, trying quantized (.qweight + .scales) first, then bf16.
 ///
 /// If `name` = "model.layers.0.self_attn.q_proj.weight", tries:
 ///   1. "model.layers.0.self_attn.q_proj.qweight" + ".scales" → INT8 quantized
 ///   2. "model.layers.0.self_attn.q_proj.weight" → bf16
-pub(crate) fn load_tensor_2d_maybe_quantized(
+pub(crate) fn load_tensor_2d_maybe_quantized_with_config(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
     name: &str,
-    group_size: usize,
+    config: QuantLoadConfig,
 ) -> Result<DeviceMatrix> {
     // Try quantized path: replace ".weight" with ".qweight"
     let qweight_name = name.replace(".weight", ".qweight");
     let scales_name = name.replace(".weight", ".scales");
 
     if weight_map.contains_key(&qweight_name) && weight_map.contains_key(&scales_name) {
+        if let Some(reason) = config.unsupported_reason {
+            let qzeros_name = name.replace(".weight", ".qzeros");
+            let qzeros_suffix = if weight_map.contains_key(&qzeros_name) {
+                format!(" plus {qzeros_name}")
+            } else {
+                String::new()
+            };
+            anyhow::bail!(
+                "{name}: unsupported quantized checkpoint layout: {reason}; found \
+                 {qweight_name} and {scales_name}{qzeros_suffix}; refusing to load it as \
+                 symmetric quantization"
+            );
+        }
         let qw_tensor = find_tensor(shards, weight_map, &qweight_name)?;
         let sc_tensor = find_tensor(shards, weight_map, &scales_name)?;
 
@@ -165,7 +363,8 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
         let rows = qw_shape[0];
         let qw_cols = qw_shape[1];
         let num_groups = sc_shape[1];
-        let orig_k = num_groups * group_size;
+        let (orig_k, group_size, bits) =
+            detect_uniform_quant_layout(name, qw_cols, num_groups, config)?;
 
         let sc_data: &[half::bf16] = unsafe {
             std::slice::from_raw_parts(
@@ -174,8 +373,7 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
             )
         };
 
-        // Detect bit width from packed shape: INT2 (K/4), INT4 (K/2), INT8 (K)
-        if qw_cols == orig_k / 4 {
+        if bits == 2 {
             // INT2 packed: 4 values per byte
             let packed: &[u8] =
                 unsafe { std::slice::from_raw_parts(qw_tensor.data().as_ptr(), rows * qw_cols) };
@@ -190,7 +388,7 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
                 ctx, packed, sc_data, rows, orig_k, group_size,
             );
         }
-        if qw_cols == orig_k / 2 {
+        if bits == 4 {
             // INT4 packed: 2 values per byte
             let packed: &[u8] =
                 unsafe { std::slice::from_raw_parts(qw_tensor.data().as_ptr(), rows * qw_cols) };
@@ -241,6 +439,7 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
             return Ok(mat);
         }
 
+        debug_assert_eq!(bits, 8);
         // INT8
         let qw_data: &[i8] = unsafe {
             std::slice::from_raw_parts(qw_tensor.data().as_ptr().cast::<i8>(), rows * qw_cols)
@@ -271,7 +470,8 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
         let rows = packed_tensor.shape()[0];
         let packed_cols = packed_tensor.shape()[1];
         let num_groups = scales_tensor.shape()[1];
-        let orig_k = num_groups * group_size;
+        let (orig_k, group_size, bits) =
+            detect_turboquant_layout(name, packed_cols, num_groups, config)?;
 
         let packed: &[u8] = unsafe {
             std::slice::from_raw_parts(packed_tensor.data().as_ptr(), rows * packed_cols)
@@ -291,7 +491,6 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
 
         // Phase 2: keep weights packed on GPU — dequant happens at runtime
         // in fused GEMV (decode) or bulk dequant + cuBLAS GEMM (prefill).
-        let bits = 3u8; // TODO: detect from turboquant_config.json
         let num_levels = 1usize << bits;
         let mut centroids_host = vec![0.0f32; num_levels];
         let mut boundaries_host = vec![0.0f32; num_levels + 1];
@@ -334,6 +533,12 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
             bits,
         )?;
         return Ok(mat);
+    }
+
+    if config.enabled() {
+        warn!(
+            "Quant config is present but '{name}' has no supported packed side tensors; loading BF16"
+        );
     }
 
     // Fallback: bf16
@@ -936,6 +1141,87 @@ mod tests {
 
     const QWEN3_4B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
     const QWEN3_8B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-8B");
+
+    #[test]
+    fn quant_layout_uses_configured_bits_and_infers_group_size() {
+        let cfg = QuantLoadConfig {
+            group_size: None,
+            bits: Some(4),
+            tq_bits: None,
+            unsupported_reason: None,
+        };
+        let (orig_k, group_size, bits) = detect_uniform_quant_layout("w", 64, 2, cfg).unwrap();
+        assert_eq!((orig_k, group_size, bits), (128, 64, 4));
+    }
+
+    #[test]
+    fn turboquant_layout_requires_explicit_bits() {
+        let err = detect_turboquant_layout(
+            "w",
+            64,
+            1,
+            QuantLoadConfig {
+                group_size: Some(128),
+                bits: None,
+                tq_bits: None,
+                unsupported_reason: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires explicit bits"));
+    }
+
+    #[test]
+    fn turboquant_layout_accepts_tq2_tq3_tq4() {
+        for (bits, packed_cols) in [(2, 32), (3, 64), (4, 64)] {
+            let (orig_k, group_size, got_bits) = detect_turboquant_layout(
+                "w",
+                packed_cols,
+                2,
+                QuantLoadConfig {
+                    group_size: Some(64),
+                    bits: None,
+                    tq_bits: Some(bits),
+                    unsupported_reason: None,
+                },
+            )
+            .unwrap();
+            assert_eq!((orig_k, group_size, got_bits), (128, 64, bits));
+        }
+    }
+
+    #[test]
+    fn quant_config_rejects_zero_point_layouts_before_symmetric_loader() {
+        let awq =
+            QuantLoadConfig::from_meta(&crate::quant::QuantMeta::Awq(crate::quant::AwqConfig {
+                bits: 4,
+                group_size: 128,
+                zero_point: true,
+                version: crate::quant::AwqVersion::Gemm,
+            }));
+        assert!(awq.enabled());
+        assert!(
+            awq.unsupported_reason
+                .expect("zero-point AWQ must be rejected")
+                .contains("AWQ")
+        );
+
+        let gptq =
+            QuantLoadConfig::from_meta(&crate::quant::QuantMeta::Gptq(crate::quant::GptqConfig {
+                bits: 4,
+                group_size: 128,
+                desc_act: false,
+                sym: false,
+                checkpoint_format: None,
+            }));
+        assert!(gptq.enabled());
+        assert!(
+            gptq.unsupported_reason
+                .expect("asymmetric GPTQ must be rejected")
+                .contains("GPTQ")
+        );
+    }
 
     #[test]
     fn test_load_shard_info_for_tied_qwen3_4b() {
