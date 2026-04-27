@@ -4,7 +4,7 @@
 use crate::kv_tier::tier::BlockLocation;
 use crate::types::BlockId;
 
-use super::types::{FetchTicket, PlanTicket, StoreTicket};
+use super::types::{FailureClass, FetchTicket, PlanTicket, StoreTicket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StoreTarget {
@@ -99,6 +99,10 @@ pub enum CoordinatorEvent {
     StoreFailed {
         ticket: StoreTicket,
         failed_block: BlockId,
+        /// Typed cancel-vs-failure classification. Lets consumers distinguish
+        /// cooperative cancellation from hard failure without parsing
+        /// `reason`. See [`FailureClass`].
+        class: FailureClass,
         reason: String,
     },
     FetchQueued {
@@ -112,6 +116,8 @@ pub enum CoordinatorEvent {
     FetchFailed {
         ticket: FetchTicket,
         failed_block: BlockId,
+        /// Typed cancel-vs-failure classification. See [`FailureClass`].
+        class: FailureClass,
         reason: String,
     },
     PlanQueued {
@@ -125,6 +131,8 @@ pub enum CoordinatorEvent {
     PlanFailed {
         ticket: PlanTicket,
         failed_block: BlockId,
+        /// Typed cancel-vs-failure classification. See [`FailureClass`].
+        class: FailureClass,
         reason: String,
     },
 }

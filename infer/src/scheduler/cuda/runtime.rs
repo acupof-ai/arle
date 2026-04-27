@@ -1192,12 +1192,22 @@ impl<M: ModelForward> Scheduler<M> {
             crate::kv_tier::CoordinatorEvent::StoreFailed {
                 ticket,
                 failed_block,
+                class,
                 reason,
             } => {
-                warn!(
-                    "Store failed for ticket {} on block {:?}: {}",
-                    ticket.0, failed_block, reason
-                );
+                // Typed class lets us downgrade cooperative cancellation to
+                // info — only true store failures need the warn level.
+                if matches!(class, crate::kv_tier::FailureClass::Cancelled) {
+                    info!(
+                        "Store cancelled for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
+                    );
+                } else {
+                    warn!(
+                        "Store failed for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
+                    );
+                }
                 self.store_ticket_started_at.remove(&ticket);
                 if let Some(key) = self.store_ticket_keys.remove(&ticket) {
                     self.store_dedupe.remove(&key);
@@ -1243,12 +1253,20 @@ impl<M: ModelForward> Scheduler<M> {
             crate::kv_tier::CoordinatorEvent::FetchFailed {
                 ticket,
                 failed_block,
+                class,
                 reason,
             } => {
-                warn!(
-                    "Fetch failed for ticket {} on block {:?}: {}",
-                    ticket.0, failed_block, reason
-                );
+                if matches!(class, crate::kv_tier::FailureClass::Cancelled) {
+                    info!(
+                        "Fetch cancelled for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
+                    );
+                } else {
+                    warn!(
+                        "Fetch failed for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
+                    );
+                }
                 self.fetch_ticket_started_at.remove(&ticket);
                 self.prefetch_fetching.remove(&ticket);
                 let waiters = self.fetch_waiting.remove(&ticket).unwrap_or_default();

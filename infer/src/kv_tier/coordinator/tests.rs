@@ -8,7 +8,7 @@ use super::events::{
     CoordinatorCommand, CoordinatorEvent, FetchRequest, PrefetchAction, PrefetchPlan,
     PrefetchPlanRequest, StoreRequest, StoreTarget,
 };
-use super::types::{QueueBackpressure, QueueKind};
+use super::types::{FailureClass, QueueBackpressure, QueueKind};
 use crate::kv_tier::backend::ClusterSharedBackend;
 use crate::kv_tier::tier::BlockLocation;
 use crate::kv_tier::transport::disk::DiskStore;
@@ -141,10 +141,12 @@ fn store_to_disk_fails_without_configured_disk_store() {
         CoordinatorEvent::StoreFailed {
             ticket: failed_ticket,
             failed_block,
+            class,
             reason,
         } => {
             assert_eq!(failed_ticket, ticket);
             assert_eq!(failed_block, BlockId(3));
+            assert_eq!(class, FailureClass::Failed);
             assert!(reason.contains("disk store not configured"));
         }
         other => panic!("unexpected store failure event: {other:?}"),
@@ -282,10 +284,12 @@ fn fetch_fails_for_gpu_source() {
         CoordinatorEvent::FetchFailed {
             ticket: failed_ticket,
             failed_block,
+            class,
             reason,
         } => {
             assert_eq!(failed_ticket, ticket);
             assert_eq!(failed_block, BlockId(13));
+            assert_eq!(class, FailureClass::Failed);
             assert!(reason.contains("gpu source"));
         }
         other => panic!("unexpected fetch failure event: {other:?}"),
@@ -408,10 +412,12 @@ fn cancelled_fetch_updates_stats_and_reports_cancel_reason() {
         CoordinatorEvent::FetchFailed {
             ticket: failed_ticket,
             failed_block,
+            class,
             reason,
         } => {
             assert_eq!(failed_ticket, ticket);
             assert_eq!(failed_block, BlockId(23));
+            assert_eq!(class, FailureClass::Cancelled);
             assert!(reason.contains("cancelled"));
         }
         other => panic!("unexpected fetch cancel event: {other:?}"),
@@ -542,10 +548,12 @@ fn store_reports_remote_stub_failure_on_unified_event_channel() {
         CoordinatorEvent::StoreFailed {
             ticket: failed_ticket,
             failed_block,
+            class,
             reason,
         } => {
             assert_eq!(failed_ticket, ticket);
             assert_eq!(failed_block, BlockId(7));
+            assert_eq!(class, FailureClass::Failed);
             assert!(reason.contains("remote store not configured"));
         }
         other => panic!("unexpected store event: {other:?}"),
@@ -709,7 +717,8 @@ fn report_failure_classifies_cancel_vs_fail() {
     assert!(coordinator.run_once().unwrap());
     let _queued = events.recv().unwrap();
     match events.recv().unwrap() {
-        CoordinatorEvent::FetchFailed { reason, .. } => {
+        CoordinatorEvent::FetchFailed { class, reason, .. } => {
+            assert_eq!(class, FailureClass::Cancelled);
             assert!(reason.contains("cancelled"));
         }
         other => panic!("expected FetchFailed cancel, got {other:?}"),
@@ -734,9 +743,9 @@ fn report_failure_classifies_cancel_vs_fail() {
     assert!(coordinator.run_once().unwrap());
     let _queued2 = events.recv().unwrap();
     match events.recv().unwrap() {
-        CoordinatorEvent::FetchFailed { reason, .. } => {
+        CoordinatorEvent::FetchFailed { class, reason, .. } => {
+            assert_eq!(class, FailureClass::Failed);
             assert!(reason.contains("remote store not configured"));
-            assert!(!reason.contains("cancelled"));
         }
         other => panic!("expected FetchFailed hard error, got {other:?}"),
     }

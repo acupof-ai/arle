@@ -89,10 +89,22 @@ impl Coordinator {
         }
     }
 
-    fn emit_event(&self, event: CoordinatorEvent) -> Result<()> {
+    /// Emit an event whose delivery is critical to caller progress. Currently
+    /// only the `Fetch*` arm uses this — the request blocks in
+    /// `Phase::WaitingFetch` until `FetchCompleted` / `FetchFailed` arrives,
+    /// so a dropped event would hang the request indefinitely.
+    fn emit_required(&self, event: CoordinatorEvent) -> Result<()> {
         self.events
             .send(event)
             .map_err(|e| anyhow!("coordinator event send failed: {e}"))
+    }
+
+    /// Emit an event for downstream observability. Used for `Store*` and
+    /// `Plan*` — the request state machine does not wait on these, so a
+    /// slow / full event receiver should NOT back-pressure the coordinator.
+    /// Send errors are dropped.
+    fn emit_observability(&self, event: CoordinatorEvent) {
+        let _ = self.events.send(event);
     }
 
     fn is_cancelled(&self, ticket: QueueTicket) -> bool {
@@ -118,23 +130,26 @@ impl Coordinator {
         // event vocabulary.
         match ticket {
             QueueTicket::Plan(plan_ticket) => {
-                let _ = self.emit_event(CoordinatorEvent::PlanFailed {
+                self.emit_observability(CoordinatorEvent::PlanFailed {
                     ticket: plan_ticket,
                     failed_block,
+                    class,
                     reason,
                 });
             }
             QueueTicket::Store(store_ticket) => {
-                let _ = self.emit_event(CoordinatorEvent::StoreFailed {
+                self.emit_observability(CoordinatorEvent::StoreFailed {
                     ticket: store_ticket,
                     failed_block,
+                    class,
                     reason,
                 });
             }
             QueueTicket::Fetch(fetch_ticket) => {
-                self.emit_event(CoordinatorEvent::FetchFailed {
+                self.emit_required(CoordinatorEvent::FetchFailed {
                     ticket: fetch_ticket,
                     failed_block,
+                    class,
                     reason,
                 })?;
             }
@@ -147,7 +162,7 @@ impl Coordinator {
         ticket: PlanTicket,
         blocks: &[PrefetchPlanRequest],
     ) -> Result<QueueOutcome> {
-        let _ = self.emit_event(CoordinatorEvent::PlanQueued {
+        self.emit_observability(CoordinatorEvent::PlanQueued {
             ticket,
             block_count: blocks.len(),
         });
@@ -173,12 +188,12 @@ impl Coordinator {
                 },
             })
             .collect();
-        let _ = self.emit_event(CoordinatorEvent::PlanCompleted { ticket, plans });
+        self.emit_observability(CoordinatorEvent::PlanCompleted { ticket, plans });
         Ok(QueueOutcome::Completed)
     }
 
     fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) -> Result<QueueOutcome> {
-        let _ = self.emit_event(CoordinatorEvent::StoreQueued {
+        self.emit_observability(CoordinatorEvent::StoreQueued {
             ticket,
             block_count: blocks.len(),
         });
@@ -342,12 +357,12 @@ impl Coordinator {
             }
         }
 
-        let _ = self.emit_event(CoordinatorEvent::StoreCompleted { ticket, locations });
+        self.emit_observability(CoordinatorEvent::StoreCompleted { ticket, locations });
         Ok(QueueOutcome::Completed)
     }
 
     fn handle_fetch(&self, ticket: FetchTicket, blocks: &[FetchRequest]) -> Result<QueueOutcome> {
-        self.emit_event(CoordinatorEvent::FetchQueued {
+        self.emit_required(CoordinatorEvent::FetchQueued {
             ticket,
             block_count: blocks.len(),
         })?;
@@ -478,7 +493,7 @@ impl Coordinator {
         }
 
         regions.commit();
-        self.emit_event(CoordinatorEvent::FetchCompleted {
+        self.emit_required(CoordinatorEvent::FetchCompleted {
             ticket,
             blocks: fetched,
         })?;
