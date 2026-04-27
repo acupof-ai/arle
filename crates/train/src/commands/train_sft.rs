@@ -1,8 +1,7 @@
 use std::{
     collections::HashSet,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
-    process::ExitCode,
     sync::Arc,
     time::Instant,
 };
@@ -14,7 +13,8 @@ use autograd::{
     ops::{gather_last_dim, log_softmax, matmul, mean, mul},
 };
 use thiserror::Error;
-use train::{
+
+use crate::{
     CausalLm, GrpoPolicy, StepOutcome, Trainer, TrainerConfig,
     causal_lm::{
         build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
@@ -133,7 +133,7 @@ enum CliError {
 }
 
 trait SftFamily {
-    type Config: train::GrpoPolicyConfig + Clone;
+    type Config: crate::GrpoPolicyConfig + Clone;
     type Model: CausalLm<Config = Self::Config>;
 
     fn family_name() -> &'static str;
@@ -259,27 +259,7 @@ impl SftFamily for Qwen35Family {
     }
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        // Display (not Debug): thiserror's #[error(transparent)] already
-        // delegates to the inner error's Display impl, so io errors surface as
-        // "No such file or directory (os error 2)" instead of the Debug blob
-        // "Os { code: 2, kind: NotFound, message: \"...\" }".
-        Err(err) => {
-            eprintln!("[train_sft] error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), CliError> {
-    let args = parse_args()?;
-    run_with_args(args)
-}
-
-#[allow(dead_code)]
-pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
+pub fn dispatch_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -385,7 +365,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let controller = TrainingController::new();
     let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
-    let run_id = train::metrics::default_run_id("train_sft");
+    let run_id = crate::metrics::default_run_id("train_sft");
     let run_timer = Instant::now();
     let backend_name = args.backend.as_str();
 
@@ -527,7 +507,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let mut batch_examples = Vec::with_capacity(batch_size);
     let mut collated = BatchedTokenizedSft::with_capacity(batch_size, args.seq_len);
     let mut input_ids = Vec::with_capacity(batch_size * args.seq_len);
-    let step_fn = |ctx: &mut train::StepCtx<'_>| -> autograd::Result<StepOutcome> {
+    let step_fn = |ctx: &mut crate::StepCtx<'_>| -> autograd::Result<StepOutcome> {
         batch_examples.clear();
         for row in 0..batch_size {
             let example_index = sample_index(
@@ -606,7 +586,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
                 ("artifact_generation_config", "generation_config.json"),
                 ("artifact_tokenizer", "tokenizer.json"),
             ];
-            metrics_for_hooks.emit_event(&train::metrics::TrainEvent {
+            metrics_for_hooks.emit_event(&crate::metrics::TrainEvent {
                 kind: "checkpoint",
                 step: Some(step),
                 strings: &strings,
@@ -659,10 +639,6 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     metrics.flush_blocking();
 
     Ok(())
-}
-
-fn parse_args() -> Result<CliArgs, CliError> {
-    parse_args_from(env::args().skip(1))
 }
 
 fn parse_args_from<I>(mut iter: I) -> Result<CliArgs, CliError>
@@ -1444,11 +1420,11 @@ fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usiz
 #[cfg(test)]
 mod lora_tests {
     use super::*;
+    use crate::LoraAdapterConfig;
+    use crate::causal_lm::build_materialized_registry;
     use qwen35_spec::{LayerType, Qwen35AttentionTensorNames};
     use serde_json::json;
     use tempfile::tempdir;
-    use train::LoraAdapterConfig;
-    use train::causal_lm::build_materialized_registry;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -1664,7 +1640,7 @@ mod tests {
     }
 
     fn write_tiny_tokenizer(path: &Path) -> TestResult {
-        train::tokenizer::write_wordlevel_tokenizer(
+        crate::tokenizer::write_wordlevel_tokenizer(
             path,
             std::iter::empty::<String>(),
             [
@@ -1890,9 +1866,9 @@ mod tests {
         }
 
         let (continuous_doc, continuous_optim) =
-            train::checkpoint::load_trainer_state_v2(&continuous_latest)?;
+            crate::checkpoint::load_trainer_state_v2(&continuous_latest)?;
         let (resumed_doc, resumed_optim) =
-            train::checkpoint::load_trainer_state_v2(&resumed_latest)?;
+            crate::checkpoint::load_trainer_state_v2(&resumed_latest)?;
         assert_eq!(continuous_doc.step, resumed_doc.step);
         assert_eq!(continuous_doc.optim_schema, resumed_doc.optim_schema);
         assert_eq!(continuous_doc.schedule_name, resumed_doc.schedule_name);

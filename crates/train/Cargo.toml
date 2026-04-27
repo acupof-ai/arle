@@ -4,12 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-# train/* CLI surfaces are exposed exclusively via `arle train ...`
-# (crates/cli/src/train_cli.rs includes src/bin/*.rs as modules and dispatches
-# in-process). The standalone `[[bin]]` targets that previously shipped
-# `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` / `eval_lm` /
-# `download_dataset` / `convert_dataset` are intentionally removed; autobins is
-# disabled so Cargo does not auto-rediscover src/bin/*.rs.
+# train CLI commands live in `src/commands/` and are dispatched in-process
+# via `arle train ...` / `arle data ...` (see `crates/cli/src/train_cli.rs`,
+# which calls `train::commands::*::dispatch_from_args`). The standalone
+# `[[bin]]` targets that previously shipped `pretrain` / `train_sft` /
+# `train_grpo` / `train_multi_turn` / `eval_lm` / `download_dataset` /
+# `convert_dataset` are intentionally removed; autobins stays disabled so
+# Cargo does not rediscover anything as a binary.
 autobins = false
 
 [features]

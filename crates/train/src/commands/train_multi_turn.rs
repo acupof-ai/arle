@@ -8,7 +8,7 @@
 //! Mirrors `train_grpo` but on interleaved agent/observation episodes
 //! instead of suffix-only rollouts.
 
-use std::{env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use autograd::{
     AutogradError, Backend, CpuBackend, Tape, TensorStore,
@@ -16,7 +16,8 @@ use autograd::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use train::{
+
+use crate::{
     causal_lm::{
         build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
         trainable_param_name_map,
@@ -242,27 +243,7 @@ fn metal_eval_snapshot() -> Option<u64> {
     None
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        // Display (not Debug): `#[error(transparent)]` delegates to the inner
-        // error's Display impl, so the user sees the real message instead of
-        // `Error: Custom("...")`. Mirrors the `train_sft.rs` / `train_grpo.rs`
-        // pattern.
-        Err(err) => {
-            eprintln!("[train_multi_turn] error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), CliError> {
-    let args = parse_args()?;
-    run_with_args(args)
-}
-
-#[allow(dead_code)]
-pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
+pub fn dispatch_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -278,7 +259,7 @@ fn run_with_args(args: CliArgs) -> Result<(), CliError> {
     let controller = TrainingController::new();
     let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
-    let run_id = train::metrics::default_run_id("train_multi_turn");
+    let run_id = crate::metrics::default_run_id("train_multi_turn");
 
     let total_agent = args.agent_tokens * args.turns;
     let total_obs = args.obs_tokens * (args.turns.saturating_sub(1));
@@ -408,7 +389,7 @@ fn run_with_args(args: CliArgs) -> Result<(), CliError> {
         if controller.should_stop() {
             eprintln!("[train_multi_turn] stop requested at iter {iter}");
             let strings = [("run_id", run_id.as_str()), ("reason", "operator_stop")];
-            metrics.emit_event(&train::metrics::TrainEvent {
+            metrics.emit_event(&crate::metrics::TrainEvent {
                 kind: "status",
                 step: Some(iter as u64),
                 strings: &strings,
@@ -581,7 +562,7 @@ fn run_with_args(args: CliArgs) -> Result<(), CliError> {
                     ("artifact_state", "trainer_state.json"),
                     ("artifact_optimizer", "optimizer.safetensors"),
                 ];
-                metrics.emit_event(&train::metrics::TrainEvent {
+                metrics.emit_event(&crate::metrics::TrainEvent {
                     kind: "checkpoint",
                     step: Some((iter + 1) as u64),
                     strings: &strings,
@@ -593,7 +574,7 @@ fn run_with_args(args: CliArgs) -> Result<(), CliError> {
                     "[train_multi_turn] save requested but no --save-path configured; ignoring"
                 );
                 let strings = [("run_id", run_id.as_str()), ("reason", "save_without_path")];
-                metrics.emit_event(&train::metrics::TrainEvent {
+                metrics.emit_event(&crate::metrics::TrainEvent {
                     kind: "status",
                     step: Some((iter + 1) as u64),
                     strings: &strings,
@@ -681,7 +662,7 @@ fn run_with_args(args: CliArgs) -> Result<(), CliError> {
             ("artifact_state", "trainer_state.json"),
             ("artifact_optimizer", "optimizer.safetensors"),
         ];
-        metrics.emit_event(&train::metrics::TrainEvent {
+        metrics.emit_event(&crate::metrics::TrainEvent {
             kind: "checkpoint",
             step: Some(controller.snapshot().iter as u64),
             strings: &strings,
@@ -1218,10 +1199,6 @@ fn build_prompt(
     prompt
 }
 
-fn parse_args() -> Result<CliArgs, CliError> {
-    parse_args_from(env::args().skip(1))
-}
-
 fn parse_args_from<I>(mut iter: I) -> Result<CliArgs, CliError>
 where
     I: Iterator<Item = String>,
@@ -1357,9 +1334,9 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LoraAdapterConfig, checkpoint::load_trainer_state_v2};
     use qwen35_spec::{LayerType, Qwen35AttentionTensorNames};
     use tempfile::tempdir;
-    use train::{LoraAdapterConfig, checkpoint::load_trainer_state_v2};
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -1571,7 +1548,7 @@ mod tests {
         }
 
         let mut expected_tape = Tape::new();
-        let materialized = train::causal_lm::build_materialized_registry(
+        let materialized = crate::causal_lm::build_materialized_registry(
             &expected_model,
             &mut expected_store,
             &mut expected_tape,
@@ -1617,7 +1594,7 @@ mod tests {
 
         let mut load_store = TensorStore::default();
         let load_model = Qwen35Model::new_with_lora(&cfg, None, &mut load_store)?;
-        let mut registry = train::causal_lm::build_registry(&load_model);
+        let mut registry = crate::causal_lm::build_registry(&load_model);
         registry.load_into_strict(&mut load_store, &step_dir.join("model.safetensors"))?;
         let loaded_q = load_store.to_host(
             *load_model

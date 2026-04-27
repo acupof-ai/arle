@@ -42,8 +42,9 @@ echo "[train_and_chat] === SFT (2 steps, metal backend) ==="
 # --batch       : micro-batch (1 for deterministic per-example loss)
 # --seq-len     : max tokens per example (pad/truncate)
 # --save-every  : trigger a checkpoint every N steps (here: the only one)
-cargo run --release --no-default-features --features metal \
-  -p train --bin train_sft -- \
+cargo run --release --no-default-features --features metal,no-cuda,cli \
+  -p agent-infer --bin arle -- \
+  train sft \
   --model "$MODEL_PATH" \
   --data  "$SFT_DATA" \
   --out   "$OUT_DIR" \
