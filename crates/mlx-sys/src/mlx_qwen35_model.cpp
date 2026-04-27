@@ -913,13 +913,18 @@ struct Qwen35CompiledModel {
 
         array y(0);
         if (gdr_metal_kernel_enabled && use_gdr_metal_kernel()) {
-            auto& v_bf16 = v_raw;
-            // g and beta are [1, S, Hv] — no reshape needed
-            auto& g_3d = g;
-            auto& beta_3d = beta;
+            // The raw Metal kernel does direct pointer arithmetic and assumes
+            // compact row-major inputs. GGUF Q4 projections and split/reshape
+            // results may be lazy views, so materialize the exact kernel
+            // contract before dispatch.
+            auto q_kernel = contiguous(astype(reshape(q, {B, S, hk, dk}), bfloat16));
+            auto k_kernel = contiguous(astype(reshape(k, {B, S, hk, dk}), bfloat16));
+            auto v_kernel = contiguous(astype(reshape(v_raw, {B, S, hv, dv}), bfloat16));
+            auto g_kernel = contiguous(astype(reshape(g, {B, S, hv}), bfloat16));
+            auto beta_kernel = contiguous(astype(reshape(beta, {B, S, hv}), bfloat16));
             int threadgroup_y = qwen35_cpp_gdr_threadgroup_y(S);
             std::vector<array> inputs = {
-                q, k, v_bf16, g_3d, beta_3d, gdr_state_in, gdr_t_arr
+                q_kernel, k_kernel, v_kernel, g_kernel, beta_kernel, gdr_state_in, gdr_t_arr
             };
             std::vector<Shape> out_shapes = {{B, S, hv, dv}, gdr_state_in.shape()};
             std::vector<Dtype> out_dtypes = {bfloat16, float32};
@@ -953,8 +958,8 @@ struct Qwen35CompiledModel {
                 // is f32. Cast here so the tape kernel's dtype gate holds.
                 artifacts->gdr_tapes.push_back({
                     std::move(result[2]),            // innovation_tape (bf16 from kernel)
-                    astype(contiguous(k), bfloat16), // k
-                    astype(contiguous(g_3d), bfloat16), // g (was f32)
+                    k_kernel,                        // k
+                    g_kernel,                        // g (was f32)
                     contiguous(qkv),                 // qkv for conv rebuild
                 });
             } else {
@@ -973,8 +978,8 @@ struct Qwen35CompiledModel {
             }
             if (keep_intermediates) {
                 auto& intermediates = artifacts->intermediates;
-                intermediates.push_back(g_3d);
-                intermediates.push_back(beta_3d);
+                intermediates.push_back(g_kernel);
+                intermediates.push_back(beta_kernel);
             }
         } else {
             if (ctx.record_tapes) {
