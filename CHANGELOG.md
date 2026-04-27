@@ -43,10 +43,10 @@ and on GHCR (`ghcr.io/cklxx/arle:0.1.2`, `:0.1`, `:latest`).
   (211.7 tok/s for 512 prompt / 1024 decode) after Q5_K/Q8_0 affine
   repack and Q6/group16 qmv tile tuning. Evidence:
   [`docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md`](docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md).
-- Qwen3.6-35B-A3B Metal rechecked locally — baseline decode about 63
-  tok/s on the short 32/256 shape; DFlash did not improve paired TPOT
-  (15.23 ms → 15.45 ms), so Qwen3.6 speculative decode remains
-  Experimental. Evidence:
+- Qwen3.6-35B-A3B Metal rechecked locally with a short load/execute
+  diagnostic. This is not DFlash acceptance evidence; future DFlash
+  optimization claims for Qwen3.6 should use long-context /
+  ultra-long-sequence workloads only. Evidence:
   [`docs/experience/wins/2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md`](docs/experience/wins/2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md).
 
 ### HTTP
