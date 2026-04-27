@@ -18,15 +18,17 @@ use mlx_sys::{
     mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // MLX's default stream/device is process-global and its C++ allocator is
 // not re-entrant across threads. Concurrent `mlx_matmul` calls (e.g.
-// default `cargo test` parallelism) SEGV the interpreter. A static
-// mutex here is coarse but correct — training is single-threaded, and
-// the lock is held only for the duration of one matmul FFI round-trip.
-pub(crate) static MLX_GUARD: Mutex<()> = Mutex::new(());
+// default `cargo test` parallelism) SEGV the interpreter. The guard lives in
+// `mlx-sys` so every Rust consumer serializes against the same process-wide
+// boundary.
+pub(crate) fn mlx_guard() -> MutexGuard<'static, ()> {
+    mlx_sys::mlx_guard()
+}
 
 // Per-process counter for every `mlx_eval` call that flows through the
 // Metal backend. Used by M5.3a acceptance tests to confirm that a
@@ -67,7 +69,7 @@ impl Backend for MetalBackend {
 
     fn upload(&self, host: &[f32], shape: &[usize]) -> Result<DeviceHandle> {
         let shape_i32: Vec<i32> = shape.iter().map(|&dim| dim as i32).collect();
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `host` and `shape_i32` stay alive for the duration of the FFI
         // call, MLX copies from the host slice into its own array storage, and
@@ -94,7 +96,7 @@ impl Backend for MetalBackend {
         match handle {
             DeviceHandle::Cpu(data) => Ok(data.clone()),
             DeviceHandle::Metal(handle) => {
-                let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+                let _guard = mlx_guard();
 
                 // Safety: the raw MLX array pointer is owned by `handle` for the
                 // duration of this borrow, the caller is responsible for having
@@ -136,11 +138,11 @@ impl Backend for MetalBackend {
             return Ok(());
         }
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: each pointer comes from a live `MlxHandle` borrowed for the
         // duration of this call, ownership stays with those handles, and MLX
-        // access is serialized under `MLX_GUARD`.
+        // access is serialized under `mlx_guard()`.
         unsafe {
             mlx_eval(metal_handles.as_mut_ptr(), metal_handles.len());
         }
@@ -168,11 +170,11 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: both pointers come from live `MlxHandle`s borrowed for this
         // call, ownership of the returned MLX node transfers into the new
-        // `MlxHandle`, and `MLX_GUARD` serializes access to MLX's global state.
+        // `MlxHandle`, and `mlx_guard()` serializes access to MLX's global state.
         let out = unsafe {
             let out_arr = mlx_matmul(a_handle.as_ptr(), b_handle.as_ptr());
             if out_arr.is_null() {
@@ -249,11 +251,11 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: both pointers come from live `MlxHandle`s borrowed for this
         // call, ownership of the returned MLX node transfers into the new
-        // `MlxHandle`, and `MLX_GUARD` serializes access to MLX's global state.
+        // `MlxHandle`, and `mlx_guard()` serializes access to MLX's global state.
         let out = unsafe {
             let out_arr = mlx_add(a_handle.as_ptr(), b_handle.as_ptr());
             if out_arr.is_null() {
@@ -289,11 +291,11 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: both pointers come from live `MlxHandle`s borrowed for
         // this call; ownership of the returned node transfers into the
-        // new `MlxHandle`; `MLX_GUARD` serializes access to MLX globals.
+        // new `MlxHandle`; `mlx_guard()` serializes access to MLX globals.
         let out = unsafe {
             let out_arr = mlx_add(a_handle.as_ptr(), b_handle.as_ptr());
             if out_arr.is_null() {
@@ -326,12 +328,12 @@ impl Backend for MetalBackend {
         };
 
         let flat_shape = [size as i32];
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `x_handle` is a live MLX array borrowed for this call;
         // both intermediate arrays we allocate here are freed (the reshape
         // node) or transferred into `MlxHandle` (the sum result) before
-        // returning, and `MLX_GUARD` serializes MLX state access.
+        // returning, and `mlx_guard()` serializes MLX state access.
         let out = unsafe {
             let flat = mlx_reshape(x_handle.as_ptr(), flat_shape.as_ptr(), 1);
             if flat.is_null() {
@@ -364,11 +366,11 @@ impl Backend for MetalBackend {
         };
         validate_softmax_shape(shape)?;
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `x_handle` is a live MLX array borrowed for this call;
         // `mlx_softmax_axis` returns a fresh node that we transfer into a
-        // new `MlxHandle`. `MLX_GUARD` serializes MLX state access.
+        // new `MlxHandle`. `mlx_guard()` serializes MLX state access.
         let out = unsafe {
             let out_arr = mlx_softmax_axis(x_handle.as_ptr(), -1_i32, true);
             if out_arr.is_null() {
@@ -394,7 +396,7 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `x_handle` is a live MLX array borrowed for this call;
         // `sig` is allocated here and freed before return; the `out`
@@ -430,7 +432,7 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `x_handle` is a live MLX array borrowed for this call;
         // the `out_arr` result is transferred into the returned `MlxHandle`.
@@ -457,7 +459,7 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `x_handle` is a live MLX array borrowed for this call;
         // the `out_arr` result is transferred into the returned `MlxHandle`.
@@ -497,7 +499,7 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
         unsafe {
             let out = mlx_multiply(a_handle.as_ptr(), b_handle.as_ptr());
             if out.is_null() {
@@ -516,7 +518,7 @@ impl Backend for MetalBackend {
             ));
         };
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `x_handle` is a live MLX array borrowed for this call;
         // `scalar` is allocated here and freed before return; the `out`
@@ -553,7 +555,7 @@ impl Backend for MetalBackend {
         };
         validate_softmax_shape(shape)?;
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: `x_handle` is a live MLX array borrowed for this call;
         // `lse` is allocated here and freed before return; the `diff`
@@ -786,7 +788,7 @@ impl Backend for MetalBackend {
             ));
         };
         let shape_i32: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
         unsafe {
             let reshaped = mlx_reshape(x_handle.as_ptr(), shape_i32.as_ptr(), shape_i32.len());
             if reshaped.is_null() {
@@ -830,7 +832,7 @@ impl Backend for MetalBackend {
             // with identical shape is a cheap view alias; avoids a no-op
             // permutation and keeps ownership semantics consistent.
             let shape_i32: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
-            let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+            let _guard = mlx_guard();
             let view =
                 unsafe { mlx_reshape(x_handle.as_ptr(), shape_i32.as_ptr(), shape_i32.len()) };
             if view.is_null() {
@@ -843,7 +845,7 @@ impl Backend for MetalBackend {
         // Build identity permutation then swap the two chosen axes.
         let mut perm: Vec<i32> = (0..rank as i32).collect();
         perm.swap(axis1, axis2);
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
         unsafe {
             let view = mlx_transpose_axes(x_handle.as_ptr(), perm.as_ptr(), perm.len());
             if view.is_null() {
@@ -917,7 +919,7 @@ impl Backend for MetalBackend {
         let ends_i32: Vec<i32> = ends.iter().map(|&e| e as i32).collect();
         let strides_i32: Vec<i32> = vec![1; rank];
 
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
         unsafe {
             let view = mlx_slice(
                 x_handle.as_ptr(),
@@ -1010,12 +1012,12 @@ impl Backend for MetalBackend {
         };
 
         let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        let _guard = mlx_guard();
 
         // Safety: every intermediate array we allocate is either freed
         // before return or transferred into an `MlxHandle` at the final
         // wrap site. `param_handle` / `m_handle` / `v_handle` are borrowed
-        // for this whole call under `MLX_GUARD`; the returned handles own
+        // for this whole call under `mlx_guard()`; the returned handles own
         // fresh MLX arrays that become the caller's new params+moments.
         // We run the composition inside a single closure so `?` cleanup
         // drops intermediates correctly — but every step below allocates
@@ -1385,7 +1387,7 @@ fn mlx_matmul_backward(
     let b_shape_i32: Vec<i32> = b_shape.iter().map(|&d| d as i32).collect();
     let g_shape_i32: Vec<i32> = grad_out_shape.iter().map(|&d| d as i32).collect();
 
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `a`, `b`, `grad_out` outlive the FFI calls (MLX copies host
     // slices into its own storage); every MLX array allocated below is freed
@@ -1563,7 +1565,7 @@ fn mlx_softmax_like(x: &[f32], shape: &[usize], kind: SoftmaxKind) -> Result<Vec
     // dependency for ranks other than 2/3.
     let axis = -1_i32;
 
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `x` and `shape_i32` stay alive through the FFI call; MLX copies
     // from the host slice into its own array storage; every allocated MLX
@@ -1657,15 +1659,15 @@ enum ReduceOp {
 }
 
 // Upload a 1-D host slice → apply a single MLX op producing a same-sized
-// array → eval → copy back → free. All MLX calls run under `MLX_GUARD`.
+// array → eval → copy back → free. All MLX calls run under `mlx_guard()`.
 fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
     let n = a.len();
     let shape_i32 = [n as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `a` outlives the FFI call (MLX copies from the host slice);
     // every MLX array allocated here is freed on every path before return,
-    // and `MLX_GUARD` serializes all MLX state.
+    // and `mlx_guard()` serializes all MLX state.
     unsafe {
         let input = mlx_array_from_data(
             a.as_ptr() as *const c_void,
@@ -1729,7 +1731,7 @@ fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
 // primitives. Matches `cpu_gelu_forward` (tanh approximation) within f32
 // precision. `input` is borrowed; the returned array is freshly owned.
 //
-// Safety: caller holds `MLX_GUARD`; `input` is a live MLX array; every
+// Safety: caller holds `mlx_guard()`; `input` is a live MLX array; every
 // intermediate we allocate here is freed before returning.
 unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_array> {
     const K: f32 = 0.797_884_6_f32; // sqrt(2/pi)
@@ -1801,7 +1803,7 @@ unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_
 fn mlx_binary_flat(a: &[f32], b: &[f32], op: BinaryOp) -> Result<Vec<f32>> {
     let n = a.len();
     let shape_i32 = [n as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `a`/`b` outlive the FFI call (MLX copies host slices); both
     // allocated inputs plus the result are freed before return.
@@ -1891,7 +1893,7 @@ fn mlx_add_broadcast(
 
     let a_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
     let b_shape_i32: Vec<i32> = b_shape.iter().map(|&d| d as i32).collect();
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: host slices `a`/`b` outlive the FFI call (MLX copies from
     // them). Every MLX array we allocate is freed on every return path.
@@ -1970,7 +1972,7 @@ fn mlx_rms_norm_lazy(
     }
 
     let w_shape = [last_dim as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `x_ptr` is borrowed for the duration of this call; `w_arr`
     // is allocated here and freed before return; the returned `MlxHandle`
@@ -2006,7 +2008,7 @@ fn mlx_gelu_erf_lazy(x_ptr: *mut mlx_array) -> Result<DeviceHandle> {
     // chosen `mlx_erf` matches `libm::erff` to within the ULP range MLX
     // uses for f32 erf — parity test gates at 1e-4.
     const INV_SQRT_2: f32 = 0.707_106_77_f32;
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `x_ptr` is borrowed for the duration of this call. Every
     // intermediate we allocate is freed before the fn returns. The final
@@ -2083,7 +2085,7 @@ fn mlx_embedding_lazy(
 
     let ids_shape = [seq as i32];
     let reshape_shape = [1i32, seq as i32, hidden as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `table_ptr` is borrowed for the duration of this call. The
     // int32 ids array is allocated here and freed before return. The
@@ -2168,7 +2170,7 @@ fn mlx_gather_last_dim_lazy(
         .collect();
     let out_ndim = out_shape_i32.len();
 
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `src_ptr` is borrowed for the duration of this call. The
     // int32 ids array and intermediate `flat` / `gathered` views are
@@ -2239,7 +2241,7 @@ fn mlx_rms_norm(x: &[f32], weight: &[f32], shape: &[usize], eps: f32) -> Result<
 
     let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
     let w_shape = [last_dim as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: both host slices live across the FFI call (MLX copies), and
     // every MLX array allocated here is freed before return.
@@ -2324,7 +2326,7 @@ fn mlx_embedding(weight: &[f32], vocab: usize, dim: usize, ids: &[i32]) -> Resul
     let ids_shape = [n_ids as i32];
     // mask is `[n_ids, 1]` so it broadcasts across the `dim` axis.
     let mask_shape = [n_ids as i32, 1];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `weight`, `safe_ids`, `row_mask` all outlive the FFI calls
     // below (MLX copies host slices into its own storage); every array we
@@ -2419,7 +2421,7 @@ fn mlx_reduce_last_axis(x: &[f32], shape: &[usize], op: ReduceOp) -> Result<Vec<
     }
     let out_elems = expected / last_dim;
     let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `x` outlives the FFI call (MLX copies); both the input and
     // reduced arrays are freed on every return path.
@@ -2494,7 +2496,7 @@ fn mlx_rope(x: &[f32], x_shape: &[usize], cos: &[f32], sin: &[f32]) -> Result<Ve
     // cos/sin are uploaded as `[1, 1, seq, half_dim]` so they broadcast over
     // [B, H] during the multiplies without allocating a full expanded tensor.
     let cache_shape_i32: [i32; 4] = [1, 1, seq as i32, half_dim as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: all three host slices live across the FFI calls (MLX copies);
     // every MLX array allocated below is freed before any early return.
@@ -2666,7 +2668,7 @@ fn mlx_rope_lazy(
     }
 
     let cache_shape_i32: [i32; 4] = [1, 1, seq as i32, half_dim as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `x_ptr` is borrowed for the duration of this call; every
     // MLX array allocated below is freed before any early return; the
@@ -2826,7 +2828,7 @@ fn mlx_gather_last_dim(src: &[f32], src_shape: &[usize], ids: &[i32]) -> Result<
 
     let src_flat_shape = [(prefix * vocab) as i32];
     let ids_shape = [prefix as i32];
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `src` and `flat_ids` both outlive the FFI calls; every MLX
     // array allocated here is freed before return.
@@ -2935,7 +2937,7 @@ fn mlx_scatter_add_rows(
     let feature_i32 = feature_dim as i32;
     let vocab_i32 = vocab as i32;
 
-    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+    let _guard = mlx_guard();
 
     // Safety: `safe_updates` and `safe_indices` outlive the FFI call (the
     // C++ helper memcpy's into its own allocator-backed buffers). The
@@ -2973,7 +2975,7 @@ fn mlx_scatter_add_rows(
 }
 
 // Shared tail: evaluate an MLX array, copy its contents into a freshly-
-// allocated host vector, and return it. Caller holds `MLX_GUARD` and is
+// allocated host vector, and return it. Caller holds `mlx_guard()` and is
 // responsible for freeing `arr` afterwards. Does not free on success or
 // failure — the caller controls the array lifetime.
 //

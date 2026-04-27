@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 // `METAL_EVAL_COUNT` counter has a quiet window for the eval-count
 // acceptance test (`metal_single_forward_backward_step_triggers_one_eval`).
 // Without this, parallel Metal tests concurrently bump the counter and
-// the assertion sees a non-deterministic delta. The MLX_GUARD inside the
+// the assertion sees a non-deterministic delta. The shared MLX guard inside the
 // backend serializes individual FFI calls but not the read→reset→step→read
 // measurement window this test needs.
 #[cfg(feature = "metal")]

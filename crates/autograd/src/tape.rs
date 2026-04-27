@@ -164,7 +164,7 @@ impl Tape {
             // per-id `ensure_host` loop would call `eval` once per handle —
             // a regression once M5.3b.1 made `sum` lazy, because both `y`
             // and `loss` end up Dirty::Device and each per-id eval crosses
-            // the FFI boundary + grabs `MLX_GUARD`. MLX consumes the batch
+            // the FFI boundary + grabs the shared MLX guard. MLX consumes the batch
             // as one graph realization (terminal handles share upstream
             // nodes), so subsequent per-id `readback`s are O(copy) only.
             let device_ids: Vec<TensorId> = self
