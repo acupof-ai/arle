@@ -94,14 +94,14 @@ code      { font-family: inherit; color: var(--ink); font-weight: 500; }
   color: var(--ink);
 }
 .wordmark-mark {
-  width: 60px;
-  height: 72px;
+  width: 70px;
+  height: 76px;
   display: block;
   margin-right: 4px;
   flex: none;
   align-self: baseline;
   position: relative;
-  top: 4px;
+  top: 8px;
 }
 .wordmark-name {
   font-size: 96px;
@@ -111,9 +111,8 @@ code      { font-family: inherit; color: var(--ink); font-weight: 500; }
   line-height: 1;
 }
 @media (max-width: 640px) {
-  .wordmark-mark { width: 40px; height: 48px; margin-right: 3px; top: 2px; }
+  .wordmark-mark { width: 47px; height: 51px; margin-right: 3px; top: 5px; }
   .wordmark-name { font-size: 64px; }
-  .wordmark-section { font-size: 16px; }
   .wordmark { margin-bottom: var(--sp-6); }
 }
 
