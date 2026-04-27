@@ -91,12 +91,23 @@ impl ReadmissionKey {
     }
 }
 
+/// Discriminator for what a readmission plan's staged blocks represent.
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub enum PlanKind {
+    /// Sealed prompt-prefix blocks (matched against the radix cache).
+    /// Promotion lands the request in `Phase::Prefilling` to fill the
+    /// suffix the staged plan didn't cover.
+    #[default]
+    Prefix,
+}
+
 /// Request-local staged prefix plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadmissionPlan {
     pub matched_len: usize,
     pub blocks: Vec<ReadmissionBlock>,
     pub state: RequestChunkState,
+    pub kind: PlanKind,
 }
 
 impl ReadmissionPlan {
@@ -105,6 +116,7 @@ impl ReadmissionPlan {
             matched_len,
             blocks,
             state: RequestChunkState::Planned,
+            kind: PlanKind::Prefix,
         }
     }
 
@@ -222,6 +234,7 @@ mod tests {
                 },
             ],
             state: RequestChunkState::Planned,
+            kind: PlanKind::Prefix,
         };
 
         let key = plan.fetch_key().expect("staged key");
@@ -271,6 +284,7 @@ mod tests {
                 },
             ],
             state: RequestChunkState::Planned,
+            kind: PlanKind::Prefix,
         };
         let requests = plan.fetch_requests(&pool).unwrap();
         assert_eq!(requests.len(), 3);
