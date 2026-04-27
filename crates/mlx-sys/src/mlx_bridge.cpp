@@ -778,6 +778,104 @@ auto make_gguf_matmul_kernel(const std::string& name) {
         false);
 }
 
+auto make_gguf_matmul_m4_kernel(const std::string& name) {
+    return fast::metal_kernel(
+        name,
+        {"x", "w", "M_size", "K_size", "N_size"},
+        {"y"},
+        R"(
+        uint tid = thread_position_in_threadgroup.x;
+        uint n = threadgroup_position_in_grid.x;
+        uint m_tile = threadgroup_position_in_grid.y * 4;
+        int M = int(M_size);
+        int K = int(K_size);
+        int N = int(N_size);
+        if (m_tile >= uint(M) || n >= uint(N)) {
+            return;
+        }
+
+        constexpr int TG = 256;
+        threadgroup float partial0[TG];
+        threadgroup float partial1[TG];
+        threadgroup float partial2[TG];
+        threadgroup float partial3[TG];
+        int block_bytes;
+        if constexpr (FORMAT == 8) {
+            block_bytes = 34;
+        } else if constexpr (FORMAT == 12) {
+            block_bytes = 144;
+        } else if constexpr (FORMAT == 13) {
+            block_bytes = 176;
+        } else {
+            block_bytes = 210;
+        }
+        int block_size = FORMAT == 8 ? 32 : 256;
+        int row_bytes = (K / block_size) * block_bytes;
+        const device uint8_t* row = w + int(n) * row_bytes;
+
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        float sum2 = 0.0f;
+        float sum3 = 0.0f;
+        bool valid1 = int(m_tile) + 1 < M;
+        bool valid2 = int(m_tile) + 2 < M;
+        bool valid3 = int(m_tile) + 3 < M;
+        for (int k = int(tid); k < K; k += TG) {
+            float wv;
+            if constexpr (FORMAT == 8) {
+                wv = gguf_q8_0_value(row, k);
+            } else if constexpr (FORMAT == 12) {
+                wv = gguf_q4_k_value(row, k);
+            } else if constexpr (FORMAT == 13) {
+                wv = gguf_q5_k_value(row, k);
+            } else {
+                wv = gguf_q6_k_value(row, k);
+            }
+            int base = int(m_tile) * K + k;
+            sum0 += float(x[base]) * wv;
+            if (valid1) {
+                sum1 += float(x[base + K]) * wv;
+            }
+            if (valid2) {
+                sum2 += float(x[base + 2 * K]) * wv;
+            }
+            if (valid3) {
+                sum3 += float(x[base + 3 * K]) * wv;
+            }
+        }
+        partial0[tid] = sum0;
+        partial1[tid] = sum1;
+        partial2[tid] = sum2;
+        partial3[tid] = sum3;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = TG >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                partial0[tid] += partial0[tid + stride];
+                partial1[tid] += partial1[tid + stride];
+                partial2[tid] += partial2[tid + stride];
+                partial3[tid] += partial3[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            int out = int(m_tile) * N + int(n);
+            y[out] = T(partial0[0]);
+            if (valid1) {
+                y[out + N] = T(partial1[0]);
+            }
+            if (valid2) {
+                y[out + 2 * N] = T(partial2[0]);
+            }
+            if (valid3) {
+                y[out + 3 * N] = T(partial3[0]);
+            }
+        }
+        )",
+        gguf_quant_source(),
+        true,
+        false);
+}
+
 auto& gguf_matmul_kernel(int format) {
     switch (format) {
         case 8: {
@@ -794,6 +892,29 @@ auto& gguf_matmul_kernel(int format) {
         }
         case 14: {
             static auto kernel = make_gguf_matmul_kernel("gguf_q6_k_matmul");
+            return kernel;
+        }
+        default:
+            throw std::invalid_argument("GGUF matmul supports Q8_0, Q4_K, Q5_K, and Q6_K only");
+    }
+}
+
+auto& gguf_matmul_m4_kernel(int format) {
+    switch (format) {
+        case 8: {
+            static auto kernel = make_gguf_matmul_m4_kernel("gguf_q8_0_matmul_m4");
+            return kernel;
+        }
+        case 12: {
+            static auto kernel = make_gguf_matmul_m4_kernel("gguf_q4_k_matmul_m4");
+            return kernel;
+        }
+        case 13: {
+            static auto kernel = make_gguf_matmul_m4_kernel("gguf_q5_k_matmul_m4");
+            return kernel;
+        }
+        case 14: {
+            static auto kernel = make_gguf_matmul_m4_kernel("gguf_q6_k_matmul_m4");
             return kernel;
         }
         default:
@@ -1044,11 +1165,11 @@ array gguf_quantized_matmul_cpp(
         {"T", fast::TemplateArg(x_2d.dtype())},
         {"FORMAT", fast::TemplateArg(format)},
     };
-    auto y = gguf_matmul_kernel(format)(
+    auto y = (M >= 2 ? gguf_matmul_m4_kernel(format) : gguf_matmul_kernel(format))(
         inputs,
         {Shape{M, rows}},
         {x_2d.dtype()},
-        std::make_tuple(rows * 256, M, 1),
+        M >= 2 ? std::make_tuple(rows * 256, (M + 3) / 4, 1) : std::make_tuple(rows * 256, M, 1),
         std::make_tuple(256, 1, 1),
         tmpl,
         std::nullopt,

@@ -550,7 +550,9 @@ pub fn metal_gdr_decode_step(
     layer_idx: usize,
     config: &MetalGdrConfig,
 ) -> MlxArray {
-    use super::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
+    use super::mlx::{
+        Dtype, add, as_dtype, contiguous, multiply, reshape, rms_norm, sigmoid, silu, slice,
+    };
 
     let uses_gguf_packed = linear_attn_uses_gguf_packed(layer_weights);
 
@@ -560,7 +562,8 @@ pub fn metal_gdr_decode_step(
             return result;
         }
     }
-    // Fallback to Rust per-op path for Dense weights.
+    // Fallback to Rust per-op projection path when the C++ fused affine route
+    // is not available for the weight format.
 
     let hk = config.num_key_heads as i32;
     let dk = config.key_dim as i32;
@@ -665,20 +668,22 @@ pub fn metal_gdr_decode_step(
     };
 
     // ── 5. Metal kernel GDR state update ─────────────────────────────────
-    let use_metal_kernel = !uses_gguf_packed
-        && std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
-            .ok()
-            .is_none_or(|value| value != "0");
+    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+        .ok()
+        .is_none_or(|value| value != "0");
 
     let y = if use_metal_kernel {
         // Reshape for kernel: q/k [1,1,Hk,Dk]→bf16, v [1,1,Hv,Dv]→bf16
         // g [1,1,Hv], beta [1,1,Hv]
         // State already in [1, Hv, Dv, Dk] f32 — no transpose needed!
-        let q_bf16 = as_dtype(&q, Dtype::Bfloat16);
-        let k_bf16 = as_dtype(&k, Dtype::Bfloat16);
-        let v_bf16 = as_dtype(&v_raw, Dtype::Bfloat16);
-        let g_3d = reshape(&g, &[1, 1, hv]);
-        let beta_3d = reshape(&beta, &[1, 1, hv]);
+        let q_bf16 = contiguous(&as_dtype(&reshape(&q, &[1, 1, hk, dk]), Dtype::Bfloat16));
+        let k_bf16 = contiguous(&as_dtype(&reshape(&k, &[1, 1, hk, dk]), Dtype::Bfloat16));
+        let v_bf16 = contiguous(&as_dtype(
+            &reshape(&v_raw, &[1, 1, hv, dv]),
+            Dtype::Bfloat16,
+        ));
+        let g_3d = contiguous(&as_dtype(&reshape(&g, &[1, 1, hv]), Dtype::Bfloat16));
+        let beta_3d = contiguous(&as_dtype(&reshape(&beta, &[1, 1, hv]), Dtype::Bfloat16));
 
         let (y_out, new_state) = metal_gdr_kernel_step(
             &q_bf16,
@@ -916,6 +921,72 @@ mod tests {
         state
     }
 
+    fn reference_grouped_gated_delta(
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        g: &MlxArray,
+        beta: &MlxArray,
+        state_in: &MlxArray,
+    ) -> (Vec<f32>, Vec<f32>) {
+        use crate::backend::metal::mlx::{Dtype, as_dtype, eval};
+
+        let q_f32 = as_dtype(q, Dtype::Float32);
+        let k_f32 = as_dtype(k, Dtype::Float32);
+        let v_f32 = as_dtype(v, Dtype::Float32);
+        let g_f32 = as_dtype(g, Dtype::Float32);
+        let beta_f32 = as_dtype(beta, Dtype::Float32);
+        eval(&[&q_f32, &k_f32, &v_f32, &g_f32, &beta_f32, state_in]);
+
+        let q_vals = q_f32.as_slice_f32();
+        let k_vals = k_f32.as_slice_f32();
+        let v_vals = v_f32.as_slice_f32();
+        let g_vals = g_f32.as_slice_f32();
+        let beta_vals = beta_f32.as_slice_f32();
+        let mut state = state_in.as_slice_f32().to_vec();
+
+        let shape = q.shape();
+        let t_len = shape[1] as usize;
+        let hk = shape[2] as usize;
+        let dk = shape[3] as usize;
+        let hv = v.shape()[2] as usize;
+        let dv = v.shape()[3] as usize;
+        let heads_per_key = hv / hk;
+        let mut y = vec![0.0f32; t_len * hv * dv];
+
+        for t in 0..t_len {
+            for hv_idx in 0..hv {
+                let hk_idx = hv_idx / heads_per_key;
+                let g_step = g_vals[t * hv + hv_idx];
+                let beta_step = beta_vals[t * hv + hv_idx];
+                for dv_idx in 0..dv {
+                    let state_base = (hv_idx * dv + dv_idx) * dk;
+                    let mut kv_mem = 0.0f32;
+                    for dk_idx in 0..dk {
+                        let state_idx = state_base + dk_idx;
+                        state[state_idx] *= g_step;
+                        let k_idx = (t * hk + hk_idx) * dk + dk_idx;
+                        kv_mem += state[state_idx] * k_vals[k_idx];
+                    }
+
+                    let v_idx = (t * hv + hv_idx) * dv + dv_idx;
+                    let delta = (v_vals[v_idx] - kv_mem) * beta_step;
+                    let mut out = 0.0f32;
+                    for dk_idx in 0..dk {
+                        let state_idx = state_base + dk_idx;
+                        let k_idx = (t * hk + hk_idx) * dk + dk_idx;
+                        let q_idx = (t * hk + hk_idx) * dk + dk_idx;
+                        state[state_idx] += k_vals[k_idx] * delta;
+                        out += state[state_idx] * q_vals[q_idx];
+                    }
+                    y[(t * hv + hv_idx) * dv + dv_idx] = out;
+                }
+            }
+        }
+
+        (y, state)
+    }
+
     /// Smoke test: verify shapes through the conv1d step (v2 — standard conv1d).
     #[test]
     fn test_conv1d_step_shapes() {
@@ -1047,6 +1118,70 @@ mod tests {
         assert!(
             diff < 1e-5,
             "parallel gated delta state drifted from serial replay by {diff}"
+        );
+    }
+
+    #[test]
+    #[ignore = "hosted Apple runners intermittently GPU-hang in GDR kernel/tape replay"]
+    fn test_gated_delta_grouped_heads_matches_reference() {
+        let _guard = metal_test_guard();
+        use crate::backend::metal::mlx::{Dtype, as_dtype, eval};
+
+        const T: usize = 3;
+        const HK: usize = 2;
+        const HV: usize = 4;
+        const DK: usize = 128;
+        const DV: usize = 128;
+
+        let q_data: Vec<f32> = (0..T * HK * DK)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.013)
+            .collect();
+        let k_data: Vec<f32> = (0..T * HK * DK)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.011)
+            .collect();
+        let v_data: Vec<f32> = (0..T * HV * DV)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.017)
+            .collect();
+        let g_data: Vec<f32> = (0..T * HV).map(|i| 0.72 + (i % 5) as f32 * 0.035).collect();
+        let beta_data: Vec<f32> = (0..T * HV).map(|i| 0.31 + (i % 7) as f32 * 0.041).collect();
+        let state_data: Vec<f32> = (0..HV * DV * DK)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.006)
+            .collect();
+
+        let q = as_dtype(
+            &MlxArray::from_slice_f32(&q_data, &[1, T as i32, HK as i32, DK as i32]),
+            Dtype::Bfloat16,
+        );
+        let k = as_dtype(
+            &MlxArray::from_slice_f32(&k_data, &[1, T as i32, HK as i32, DK as i32]),
+            Dtype::Bfloat16,
+        );
+        let v = as_dtype(
+            &MlxArray::from_slice_f32(&v_data, &[1, T as i32, HV as i32, DV as i32]),
+            Dtype::Bfloat16,
+        );
+        let g = as_dtype(
+            &MlxArray::from_slice_f32(&g_data, &[1, T as i32, HV as i32]),
+            Dtype::Bfloat16,
+        );
+        let beta = as_dtype(
+            &MlxArray::from_slice_f32(&beta_data, &[1, T as i32, HV as i32]),
+            Dtype::Bfloat16,
+        );
+        let state_in = MlxArray::from_slice_f32(&state_data, &[1, HV as i32, DV as i32, DK as i32]);
+
+        let (actual_y, actual_state, _) =
+            gated_delta_with_tape_raw(&q, &k, &v, &g, &beta, &state_in, T as i32);
+        let actual_y = as_dtype(&actual_y, Dtype::Float32);
+        eval(&[&actual_y, &actual_state]);
+
+        let (expected_y, expected_state) =
+            reference_grouped_gated_delta(&q, &k, &v, &g, &beta, &state_in);
+        let y_diff = max_abs_diff(actual_y.as_slice_f32(), &expected_y);
+        let state_diff = max_abs_diff(actual_state.as_slice_f32(), &expected_state);
+        assert!(
+            y_diff < 3e-3 && state_diff < 1e-5,
+            "grouped GDR mismatch: y_diff={y_diff}, state_diff={state_diff}"
         );
     }
 

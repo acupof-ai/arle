@@ -2704,7 +2704,7 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
     };
 
     if std::env::var("METAL_NO_CPP").is_err() {
-        weights.cpp_model = CppQwen35Model::build(&weights, config, arch, true);
+        weights.cpp_model = CppQwen35Model::build(&weights, config, arch, false);
     }
 
     Ok(weights)
@@ -4250,6 +4250,35 @@ mod tests {
         logits.context("expected replay sequence to produce logits")
     }
 
+    fn fresh_cpp_qwen35_flat_state(
+        config: &MetalModelConfig,
+        arch: &MetalQwen35ArchConfig,
+        kv_capacity: i32,
+    ) -> (Vec<MlxArray>, Vec<MlxArray>) {
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+        let kv_flat: Vec<MlxArray> = (0..arch.num_full_attention_layers())
+            .flat_map(|_| {
+                [
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                ]
+            })
+            .collect();
+        let recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+        let gdr_flat = recurrent
+            .states
+            .iter()
+            .zip(recurrent.conv_states.iter())
+            .flat_map(|(state, conv)| [state.clone(), conv.clone()])
+            .collect();
+        (kv_flat, gdr_flat)
+    }
+
     fn greedy_token_id(logits: &MlxArray) -> u32 {
         let sampled = gpu_sample_token(
             logits,
@@ -4431,6 +4460,88 @@ mod tests {
         anyhow::ensure!(
             streamed == expected,
             "GGUF C++ callback tokens diverged from Rust replay: streamed={streamed:?} expected={expected:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5-0.8B safetensors config plus Q4_K_M GGUF weights"]
+    fn compare_qwen35_0p8b_gguf_cpp_gdr_kernel_vs_fallback_prefill() -> Result<()> {
+        let Some(model_path) = qwen35_safetensors_model_path() else {
+            eprintln!("QWEN35_MODEL_PATH unset and ../models/Qwen3.5-0.8B missing; skipping");
+            return Ok(());
+        };
+        let Some(gguf_path) = qwen35_gguf_model_path() else {
+            eprintln!(
+                "QWEN35_GGUF_PATH unset and ../models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf missing; skipping"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let tokenizer = Tokenizer::from_file(model_path.to_str().context("invalid model path")?)?;
+        let gguf = GgufFile::open(gguf_path.to_str().context("invalid GGUF path")?)?;
+        let weights = load_qwen35_metal_weights_from_gguf(&gguf, &config)?;
+        let cpp_model = weights
+            .cpp_model
+            .as_ref()
+            .context("GGUF Qwen3.5 C++ model unavailable")?;
+
+        let prompt_ids = tokenizer.encode("Hello world from the GGUF C++ path.")?;
+        anyhow::ensure!(prompt_ids.len() > 1, "expected multi-token prompt");
+        let prompt_tokens: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
+        let prompt_len = prompt_tokens.len() as i32;
+        let prompt_arr = MlxArray::from_slice_i32(&prompt_tokens, &[prompt_len]);
+        let kv_capacity = prompt_len + 8;
+
+        let (mut fallback_kv, mut fallback_gdr) =
+            fresh_cpp_qwen35_flat_state(&config, arch, kv_capacity);
+        unsafe { mlx_sys::qwen35_compiled_set_gdr_metal_kernel_enabled(cpp_model.as_raw(), 0) };
+        let fallback_logits = cpp_model.prefill(
+            &prompt_arr,
+            prompt_len,
+            0,
+            &mut fallback_kv,
+            &mut fallback_gdr,
+        )?;
+
+        let (mut kernel_kv, mut kernel_gdr) =
+            fresh_cpp_qwen35_flat_state(&config, arch, kv_capacity);
+        unsafe { mlx_sys::qwen35_compiled_set_gdr_metal_kernel_enabled(cpp_model.as_raw(), 1) };
+        let kernel_logits =
+            cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kernel_kv, &mut kernel_gdr)?;
+        unsafe { mlx_sys::qwen35_compiled_set_gdr_metal_kernel_enabled(cpp_model.as_raw(), 0) };
+
+        let (max_logit_diff, _, _, _) = tensor_diff_stats(&kernel_logits, &fallback_logits);
+        let mut max_kv_diff = 0.0_f32;
+        for (kernel, fallback) in kernel_kv.iter().zip(fallback_kv.iter()) {
+            let (max_abs, _, _, _) = tensor_diff_stats(kernel, fallback);
+            max_kv_diff = max_kv_diff.max(max_abs);
+        }
+        let mut max_gdr_diff = 0.0_f32;
+        for (kernel, fallback) in kernel_gdr.iter().zip(fallback_gdr.iter()) {
+            let (max_abs, _, _, _) = tensor_diff_stats(kernel, fallback);
+            max_gdr_diff = max_gdr_diff.max(max_abs);
+        }
+        eprintln!(
+            "GGUF C++ GDR kernel vs fallback prefill: max_logit={max_logit_diff:.6} max_kv={max_kv_diff:.6} max_gdr={max_gdr_diff:.6}"
+        );
+        anyhow::ensure!(
+            max_logit_diff < 5e-2,
+            "GGUF C++ custom GDR prefill logits diverged from fallback by {max_logit_diff}"
+        );
+        anyhow::ensure!(
+            max_kv_diff < 1e-1,
+            "GGUF C++ custom GDR prefill KV cache diverged from fallback by {max_kv_diff}"
+        );
+        anyhow::ensure!(
+            max_gdr_diff < 5e-2,
+            "GGUF C++ custom GDR prefill state diverged from fallback by {max_gdr_diff}"
         );
 
         Ok(())
