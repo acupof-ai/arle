@@ -113,7 +113,7 @@ fn main() {
         .flag("-Wno-unused-parameter")
         .flag("-Wno-sign-compare");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        bridge.flag(&format!("-mmacosx-version-min={macos_deployment_target}"));
+        bridge.flag(format!("-mmacosx-version-min={macos_deployment_target}"));
     }
     bridge.compile("mlx_ffi");
 
@@ -129,7 +129,7 @@ fn main() {
         .flag("-std=c++17")
         .flag("-Wno-unused-parameter");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        capture.flag(&format!("-mmacosx-version-min={macos_deployment_target}"));
+        capture.flag(format!("-mmacosx-version-min={macos_deployment_target}"));
     }
     capture.compile("mlx_metal_capture");
 

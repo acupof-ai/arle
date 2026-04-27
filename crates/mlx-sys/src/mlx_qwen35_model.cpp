@@ -2636,6 +2636,7 @@ int32_t qwen35_compiled_generate(
     const int32_t* prompt_ids, int32_t prompt_len,
     int32_t max_new_tokens,
     float temperature,
+    bool greedy,
     // Output
     int32_t* out_tokens,
     int32_t* out_count,
@@ -2709,7 +2710,7 @@ int32_t qwen35_compiled_generate(
                 auto logits = (all_logits.shape(1) == 1)
                     ? all_logits
                     : take(all_logits, array(prompt_len - 1), 1);
-                auto y = (temperature <= 1e-6f)
+                auto y = greedy
                     ? argmax(logits, true)
                     : random::categorical(logits * array(1.0f / temperature), -1);
                 eval(y);  // single eval for all prefill tokens
@@ -2749,7 +2750,7 @@ int32_t qwen35_compiled_generate(
                         gdr_states[j] = step_outputs[1 + (int)kv_caches.size() + j];
 
                     auto next_logits = step_outputs[0];
-                    auto next_y = (temperature <= 1e-6f)
+                    auto next_y = greedy
                         ? argmax(next_logits, true)
                         : random::categorical(next_logits * array(1.0f / temperature), -1);
                     async_eval(next_y);

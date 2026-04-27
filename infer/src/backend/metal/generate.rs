@@ -109,6 +109,7 @@ pub(super) fn metal_generate(
             input_ids,
             max_new_tokens,
             params.temperature,
+            params.temperature <= 1e-6 || params.top_k == 1,
             &stop_ids,
             on_token,
         )?;
