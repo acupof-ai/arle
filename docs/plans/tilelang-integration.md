@@ -272,3 +272,28 @@ project and warrant their own evaluation.
   (identical fill rules to the prefill twin). Pending-remote bench
   stub:
   [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-decode-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-decode-hd256-pending-remote.md).
+
+- **Tranche 5 (single-prefill HD128/HD256, contiguous-KV) — landed
+  2026-04-27, Option A: contiguous-KV single-prefill paths deliberately
+  stay on FlashInfer.** Reasoning: T0 verification confirmed these paths
+  are unreachable from the OpenAI hot path
+  (`prefill_uses_paged_pool() = true` for both Qwen3 and Qwen3.5; the
+  paged pool is always active during server warmup). The remaining
+  callers of `flashinfer_single_prefill` (HD128) and
+  `flashinfer_single_prefill_hd256` (HD256) are
+  `infer/src/speculative/cuda.rs` (offline speculative draft model in
+  batch_serving), `infer/tests/bench_prefill.rs`,
+  `infer/examples/regenerate_test_data.rs`, and
+  `infer/src/bin/bench_serving.rs` — all offline / test / bench
+  surfaces. TileLang's AOT cubins are paged-only (`page_size = 16` with
+  `kv_indices` / `kv_indptr` indirection); contiguous-KV input is a flat
+  `[seq_len, num_kv_heads, head_dim]` tensor with no paged pool to
+  index. Synthesizing a "1-page virtual paged pool" wrapper at the call
+  site would add runtime cost and a code path that no production caller
+  benefits from. Keeping FlashInfer canonical here is consistent with
+  the L4 evidence behind "全部接入" (which only covers paged-prefill
+  HD128 / paged-prefill HD256 / paged-decode HD128/HD256 / TC decode)
+  and with the project rule "不着急删除". **No code change** in this
+  tranche — doc-only ledger entry so the next iteration of "全部接入"
+  does not re-investigate. Decision recorded:
+  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-single-prefill-hd128-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-single-prefill-hd128-hd256-pending-remote.md).
