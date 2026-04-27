@@ -573,3 +573,48 @@ tilelang_prefill_hd128_decl!(
     tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
     tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
 );
+
+// HD256 prefill — same FFI shape as HD128 (the kernels share the wrapper
+// fill rules in tools/tilelang/gen_tilelang_aot.py); only the cubin's baked
+// `head_dim` differs. Adding a new Qwen3.5 head config requires extending
+// all three:
+//   - SUPPORTED_HEADS in tools/tilelang/batch_prefill_paged_hd256.py
+//   - TILELANG_PREFILL_HD256_HEAD_CONFIGS in cuda-kernels/build.rs
+//   - the macro invocation below + the dispatch arm in attention.rs
+#[cfg(feature = "tilelang-attn")]
+macro_rules! tilelang_prefill_hd256_decl {
+    ($($name:ident),+ $(,)?) => {
+        unsafe extern "C" {
+            $(
+                #[allow(dead_code)]
+                pub fn $name(
+                    q: *mut Half,
+                    q_indptr: *const i32,
+                    k_pool: *mut Half,
+                    v_pool: *mut Half,
+                    kv_indptr: *const i32,
+                    kv_indices: *const i32,
+                    kv_last_page_len: *const i32,
+                    o: *mut Half,
+                    batch_size: i32,
+                    total_q_tokens: i32,
+                    max_qlen: i32,
+                    num_pages: i32,
+                    total_pages: i32,
+                    num_q_heads: i32,
+                    num_kv_heads: i32,
+                    page_size: i32,
+                    sm_scale: f32,
+                    stream: CUstream,
+                ) -> CUresult;
+            )+
+        }
+    };
+}
+
+#[cfg(feature = "tilelang-attn")]
+tilelang_prefill_hd256_decl!(
+    tilelang_batch_prefill_paged_hd256_q8_kv2_run_cuda,
+    tilelang_batch_prefill_paged_hd256_q16_kv2_run_cuda,
+    tilelang_batch_prefill_paged_hd256_q16_kv4_run_cuda,
+);

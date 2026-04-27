@@ -729,6 +729,128 @@ pub(crate) fn prefill_attention_paged_batch(
     Ok(())
 }
 
+/// HD256 paged-prefill run step — sibling of `BatchPrefillPagedPlan::run_hd256`
+/// that adds a `tilelang-attn` arm. The Qwen3.5 callers do their HD256 prep
+/// kernel inline (it's distinct from the HD128 prep contract used by
+/// `prefill_attention_paged_batch`), so this helper covers the run step
+/// only — qwen35/prefill.rs keeps prep + this run alongside each other.
+///
+/// Default builds dispatch to FlashInfer's `flashinfer_batch_prefill_paged_hd256_run`.
+/// Under `--features tilelang-attn` the same call is routed to the
+/// AOT-specialized TileLang HD256 cubin family
+/// `tilelang_batch_prefill_paged_hd256_q{Q}_kv{KV}_run_cuda`. The kernel
+/// signature and varlen Q / paged-KV semantics are identical to the HD128
+/// twin — only the baked `head_dim` differs.
+///
+/// `max_qlen` and `total_pages` are TileLang-only (TileLang 0.1.9
+/// auto-promotes `T.symbolic` shape vars into kernel arguments). FlashInfer
+/// ignores them and pulls the values from its plan_info.
+///
+/// Caller responsibility:
+///   - Pre-prepped Q lives in `q_ptr` (HD256 RoPE/QK-norm/KV-write done).
+///   - `qo_indptr_ptr` / `kv_indptr_ptr` / `kv_indices_ptr` / `kv_last_page_len_ptr`
+///     are GPU-resident, indexable by `batch_size` requests.
+///   - `k_pool_ptr` / `v_pool_ptr` are the per-layer paged-KV base pointers.
+///   - On FlashInfer builds the caller has already called `plan.plan_hd256(...)`
+///     for the same metadata.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_attention_paged_run_hd256(
+    ctx: &DeviceContext,
+    q_ptr: u64,
+    qo_indptr_ptr: u64,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    kv_indptr_ptr: u64,
+    kv_indices_ptr: u64,
+    kv_last_page_len_ptr: u64,
+    output_ptr: u64,
+    #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
+    #[cfg(feature = "tilelang-attn")] kv_pool: &cuda_kernels::TokenKVPool,
+    batch_size: usize,
+    total_q_tokens: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    #[cfg(feature = "tilelang-attn")] max_qlen: i32,
+    #[cfg(feature = "tilelang-attn")] total_pages: i32,
+) -> Result<()> {
+    #[cfg(not(feature = "tilelang-attn"))]
+    {
+        let _ = total_q_tokens;
+        plan.run_hd256(
+            ctx,
+            q_ptr,
+            qo_indptr_ptr,
+            k_pool_ptr,
+            v_pool_ptr,
+            kv_indptr_ptr,
+            kv_indices_ptr,
+            kv_last_page_len_ptr,
+            output_ptr,
+            /* lse_ptr */ None,
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        )
+    }
+
+    #[cfg(feature = "tilelang-attn")]
+    {
+        ensure!(
+            page_size == 16,
+            "tilelang-attn: prefill HD256 kernel requires page_size=16, got {page_size}"
+        );
+        let tilelang_kernel = match (num_q_heads, num_kv_heads) {
+            (8, 2) => ffi::tilelang_batch_prefill_paged_hd256_q8_kv2_run_cuda,
+            (16, 2) => ffi::tilelang_batch_prefill_paged_hd256_q16_kv2_run_cuda,
+            (16, 4) => ffi::tilelang_batch_prefill_paged_hd256_q16_kv4_run_cuda,
+            other => {
+                return Err(anyhow!(
+                    "tilelang-attn: no specialized prefill HD256 kernel for \
+                     (num_q_heads, num_kv_heads) = {other:?}; supported configs \
+                     are (8,2), (16,2), (16,4). Extend SUPPORTED_HEADS \
+                     in tools/tilelang/batch_prefill_paged_hd256.py, \
+                     TILELANG_PREFILL_HD256_HEAD_CONFIGS in cuda-kernels/build.rs, \
+                     and the FFI macro + this match in lockstep, then rebuild."
+                ));
+            }
+        };
+        let head_dim = 256;
+        let sm_scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let num_pages = kv_pool.max_total_pages as i32;
+        unsafe {
+            tilelang_kernel(
+                q_ptr as *mut ffi::Half,
+                qo_indptr_ptr as *const i32,
+                k_pool_ptr as *mut ffi::Half,
+                v_pool_ptr as *mut ffi::Half,
+                kv_indptr_ptr as *const i32,
+                kv_indices_ptr as *const i32,
+                kv_last_page_len_ptr as *const i32,
+                output_ptr as *mut ffi::Half,
+                batch_size as i32,
+                total_q_tokens as i32,
+                max_qlen,
+                num_pages,
+                total_pages,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                page_size as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| {
+                anyhow!(
+                    "tilelang_batch_prefill_paged_hd256 (q{num_q_heads}_kv{num_kv_heads}) failed: {e}"
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// Batched fused GQA decode attention (CUDA, split-KV, HEAD_DIM=128).
 ///
 /// Processes B requests in two kernel launches (split-KV + reduce) instead of

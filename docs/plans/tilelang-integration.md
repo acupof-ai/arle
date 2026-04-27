@@ -237,3 +237,20 @@ project and warrant their own evaluation.
   remain on FlashInfer; `--features tilelang-attn` enables the alias.
   Pending-remote bench stub:
   [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md).
+
+- **Tranche 2 (HD256 paged-prefill swap) — landed 2026-04-27.** Wires
+  the new TileLang HD256 paged-prefill kernel
+  (`crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd256.py`,
+  authored upstream of this tranche) into build.rs / FFI / Rust dispatch
+  under the same `tilelang-attn` flag. AOT-specialized over the Qwen3.5
+  full-attn head configs `(8,2)`, `(16,2)`, `(16,4)` (covers 0.8B, MoE
+  30B-A3B, medium / 14B / 32B-class). Default builds remain on FlashInfer
+  `flashinfer_batch_prefill_paged_hd256_run`; `--features tilelang-attn`
+  swaps in the TileLang path. The four Qwen3.5 HD256 prefill call sites
+  (single + batched, each with plan + run) converge on
+  `ops::prefill_attention_paged_run_hd256`; the FlashInfer `plan_hd256`
+  calls are cfg-gated since TileLang is plan-less. The
+  `PagedPrefillBuffers35::plan` field stays under both cfg arms (allocated
+  but unused under tilelang-attn — "不着急删除"). Pending-remote bench
+  stub:
+  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-prefill-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-prefill-hd256-pending-remote.md).
