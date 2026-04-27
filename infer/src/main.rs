@@ -13,7 +13,7 @@ use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::scheduler::SchedulerConfig;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
-use log::info;
+use log::{info, warn};
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_SEQ_LEN: usize = 4096;
@@ -147,6 +147,15 @@ struct Args {
     /// Root directory for the cluster-shared T3 shared-fs backend.
     #[arg(long)]
     cluster_shared_root: Option<PathBuf>,
+
+    /// Preemption strategy when the KV pool can't fit a new request:
+    /// `recompute` (default — drop a victim's pages, re-prefill on
+    /// re-admission) or `swap` (copy victim pages T0→T1, resume from
+    /// `Phase::Decoding` after T0 frees up). Swap is the long-prompt
+    /// regime answer; recompute is fine for short prompts. See
+    /// `docs/projects/active-kv-swap-out-unification.md`.
+    #[arg(long, default_value = "recompute")]
+    preemption_mode: String,
 }
 
 #[tokio::main]
@@ -402,6 +411,17 @@ fn kv_mode_candidates(
 }
 
 fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig {
+    let preemption_mode = match args.preemption_mode.to_ascii_lowercase().as_str() {
+        "recompute" => infer::scheduler::PreemptionMode::Recompute,
+        "swap" => infer::scheduler::PreemptionMode::Swap,
+        other => {
+            warn!(
+                "unknown --preemption-mode {:?}, falling back to recompute",
+                other
+            );
+            infer::scheduler::PreemptionMode::Recompute
+        }
+    };
     let mut config = SchedulerConfig {
         chunked_prefill_size: args.chunked_prefill_size,
         max_num_batched_tokens: args.max_num_batched_tokens,
@@ -410,6 +430,7 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
         mem_fraction_static: args.mem_fraction_static,
         min_seq_len: args.min_seq_len,
         kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
+        preemption_mode,
         ..SchedulerConfig::runtime_defaults(num_slots)
     };
     if let Some(high_water) = args.t1_host_pinned_high_water {
