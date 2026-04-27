@@ -293,8 +293,23 @@ export const EN: Locale = {
     install: {
       title: "INSTALL",
       caption:
-        "One runnable line per platform. Full quickstart with smoke tests &amp; train/data flows in <a href=\"#quickstart\">QUICKSTART</a>.",
+        "One runnable line per platform. Full matrix &amp; env-var overrides in <a href=\"https://github.com/cklxx/arle/blob/main/docs/install.md\">docs/install.md</a>.",
       cards: [
+        {
+          label: "Apple Silicon · Homebrew",
+          lines: [
+            '<span class="p">$</span> brew install cklxx/tap/arle',
+            '<span class="p">$</span> arle --doctor',
+          ],
+        },
+        {
+          label: "Apple Silicon / Linux x86_64 · curl",
+          lines: [
+            '<span class="p">$</span> curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh \\',
+            '    | sh',
+            '<span class="p">$</span> arle --doctor',
+          ],
+        },
         {
           label: "CUDA · GPU container",
           lines: [
@@ -315,7 +330,7 @@ export const EN: Locale = {
         },
       ],
       note:
-        '<code>./setup.sh</code> bootstraps Rust, Python, Zig, and local checks. Apple Silicon? Swap <code>--features cli</code> → <code>--features metal,no-cuda,cli</code>.',
+        'Pre-built tarballs &amp; SHAs live on each <a href="https://github.com/cklxx/arle/releases">GitHub Release</a>; the curl installer verifies SHA256 before extracting. Apple Silicon source build: swap <code>--features cli</code> → <code>--features metal,no-cuda,cli</code>.',
     },
     glance: {
       title: "AT A GLANCE",
@@ -573,8 +588,23 @@ export const ZH: Locale = {
     install: {
       title: "安装",
       caption:
-        '每个平台一行能跑的命令。完整的 quickstart、冒烟与 train/data 流程见 <a href="#quickstart">快速开始</a>。',
+        '每个平台一行能跑的命令。完整支持矩阵与环境变量见 <a href="https://github.com/cklxx/arle/blob/main/docs/install.md">docs/install.md</a>。',
       cards: [
+        {
+          label: "Apple Silicon · Homebrew",
+          lines: [
+            '<span class="p">$</span> brew install cklxx/tap/arle',
+            '<span class="p">$</span> arle --doctor',
+          ],
+        },
+        {
+          label: "Apple Silicon / Linux x86_64 · curl",
+          lines: [
+            '<span class="p">$</span> curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh \\',
+            '    | sh',
+            '<span class="p">$</span> arle --doctor',
+          ],
+        },
         {
           label: "CUDA · GPU 容器",
           lines: [
@@ -595,7 +625,7 @@ export const ZH: Locale = {
         },
       ],
       note:
-        '<code>./setup.sh</code> 会引导 Rust、Python、Zig 和本地检查。Apple Silicon 把 <code>--features cli</code> 换成 <code>--features metal,no-cuda,cli</code>。',
+        '预编译 tarball 与 SHA 都在每次 <a href="https://github.com/cklxx/arle/releases">GitHub Release</a>;curl 安装脚本会先校验 SHA256 再解压。Apple Silicon 源码构建把 <code>--features cli</code> 换成 <code>--features metal,no-cuda,cli</code>。',
     },
     glance: {
       title: "概览",

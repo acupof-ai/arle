@@ -14,6 +14,11 @@ or release-related, also read:
 
 ## Getting Started
 
+> **End users**: install pre-built binaries via Homebrew, `curl | sh`, or
+> Docker — see the [README Quick Start](README.md#quick-start) and
+> [docs/install.md](docs/install.md). The build instructions below are for
+> contributors hacking on the runtime.
+
 ```bash
 git clone https://github.com/cklxx/arle && cd arle
 ./setup.sh                 # Installs Rust, Python venv, builds, downloads model
