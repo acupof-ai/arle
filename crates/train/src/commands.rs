@@ -8,3 +8,5 @@ pub mod convert_dataset;
 pub mod download_dataset;
 #[path = "commands/eval_lm.rs"]
 pub mod eval_lm;
+#[path = "commands/pretrain.rs"]
+pub mod pretrain;
