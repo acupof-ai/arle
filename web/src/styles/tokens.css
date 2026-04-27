@@ -28,6 +28,10 @@
   --ok: #16A34A;
   --warn: #D97706;
 
+  /* v2 design — sparing chromatic accents */
+  --hl: #FFE56B;             /* highlight strip (display headings only) */
+  --rule-2: rgba(10,10,10,0.18); /* heavier hairline for split-layout edges */
+
   /* type scale */
   --fs-xs: 11px;
   --fs-sm: 12px;
