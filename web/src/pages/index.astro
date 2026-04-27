@@ -1,8 +1,73 @@
 ---
-import ManPage from "../layouts/ManPage.astro";
-import PageBody from "../components/PageBody.astro";
+import Site from "../layouts/Site.astro";
+import TopNav from "../components/TopNav.astro";
+import HeroSplit from "../components/home/HeroSplit.astro";
+import Frame from "../components/home/Frame.astro";
+import Topology from "../components/home/Topology.astro";
+import Bench from "../components/home/Bench.astro";
+import Install from "../components/home/Install.astro";
+import Matrix from "../components/home/Matrix.astro";
+import Example from "../components/home/Example.astro";
+import SiteFooter from "../components/SiteFooter.astro";
 import { EN } from "../data/content.ts";
+
+const s = EN.sections;
 ---
-<ManPage locale={EN}>
-  <PageBody locale={EN} />
-</ManPage>
+<Site locale={EN}>
+  <TopNav links={EN.hero.nav} version={EN.hero.version} />
+
+  <HeroSplit locale={EN} />
+
+  <Frame
+    id="topology"
+    num="01"
+    label="Topology"
+    heading="One workspace. One front door. Three backends."
+  >
+    <Topology locale={EN} />
+  </Frame>
+
+  <Frame
+    id="bench"
+    num="02"
+    label="Bench"
+    heading={s.bench.v2Heading ?? "Real numbers. Dated, reproducible, in-repo."}
+  >
+    <Bench rows={s.bench.rows} />
+  </Frame>
+
+  <Frame
+    id="install"
+    num="03"
+    label="Install"
+    heading="One runnable line. Per platform."
+  >
+    <Install install={s.install} />
+  </Frame>
+
+  <Frame
+    id="matrix"
+    num="04"
+    label="Support matrix"
+    heading="Three backends. One runtime contract."
+  >
+    <Matrix matrix={s.matrix} />
+  </Frame>
+
+  <Frame
+    id="examples"
+    num="05"
+    label="Examples"
+    heading="OpenAI-compatible. cURL straight in."
+  >
+    <Example
+      title="Chat completion"
+      body={s.examples.lead}
+      lines={s.examples.lines}
+      docsHref={`${import.meta.env.BASE_URL}docs/`}
+      docsLabel="Full HTTP API"
+    />
+  </Frame>
+
+  <SiteFooter cols={EN.docfoot.cols} meta={EN.docfoot.meta} />
+</Site>

@@ -1,0 +1,43 @@
+---
+interface Props {
+  /** Tile size in px (height matches viewBox 96×96 ratio). */
+  size?: number;
+  /** Show the textual "arle" lockup beside the mark. */
+  withName?: boolean;
+  /** Optional secondary label rendered after the name (e.g. "/ docs"). */
+  suffix?: string;
+}
+const { size = 28, withName = true, suffix } = Astro.props;
+---
+<span class="brand-mark" aria-label="arle">
+  <svg viewBox="0 0 96 96" width={size} height={size} aria-hidden="true">
+    <line x1="14" y1="48" x2="82" y2="48" stroke="currentColor" stroke-width="2"/>
+    <rect x="6" y="40" width="16" height="16" fill="currentColor"/>
+    <circle cx="48" cy="48" r="10" fill="none" stroke="currentColor" stroke-width="2"/>
+    <circle cx="48" cy="48" r="3" fill="currentColor"/>
+    <rect x="74" y="40" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"/>
+  </svg>
+  {withName && <span class="brand-name">arle</span>}
+  {suffix && <span class="brand-suffix">{suffix}</span>}
+</span>
+<style>
+  .brand-mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: inherit;
+    line-height: 1;
+  }
+  .brand-mark svg { display: block; flex: none; }
+  .brand-name {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: inherit;
+  }
+  .brand-suffix {
+    font-weight: 400;
+    color: var(--ink-dim);
+    margin-left: -2px;
+  }
+</style>

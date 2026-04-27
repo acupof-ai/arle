@@ -1,0 +1,148 @@
+/* ARLE site v2 — split-layout homepage + 3-pane docs.
+   Pairs with tokens.css. Component-scoped styles live in their .astro
+   files; this stylesheet hosts globals and the home v2 section frame. */
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; }
+html {
+  scroll-behavior: smooth;
+  background: var(--paper);
+  color: var(--ink);
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+body {
+  font-family: var(--mono);
+  font-size: var(--fs-base);
+  line-height: var(--lh);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--paper);
+}
+
+::selection { background: var(--ink); color: var(--paper); }
+
+a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--line);
+  text-underline-offset: 4px;
+  text-decoration-thickness: 1px;
+  transition: text-decoration-color var(--t-base, 120ms ease);
+}
+a:hover { text-decoration-color: var(--ink); }
+a:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+
+b, strong { font-weight: 700; color: var(--ink); }
+i, em     { font-style: normal; color: var(--ink-soft); }
+code      { font-family: inherit; color: var(--ink); font-weight: 500; }
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── shared <pre> defaults for code surfaces ─────────────────────── */
+pre.cmd, pre.tbl, pre.diagram, pre.files {
+  margin: 12px 0;
+  padding: 12px 16px;
+  background: var(--paper-dim);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.7;
+  overflow-x: auto;
+  white-space: pre;
+}
+pre .p  { color: var(--ink-dim); font-weight: 400; user-select: none; margin-right: 6px; }
+pre .c  { color: var(--ink-dim); }
+pre i   { color: var(--ink-soft); }
+pre b   { color: var(--ink); }
+pre .k  { color: var(--coral); }
+
+/* ── home v2 — section frame ─────────────────────────────────────── */
+.frame {
+  padding: 96px 64px;
+  border-bottom: 1px solid var(--line);
+}
+.frame-head {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 64px;
+  margin-bottom: 64px;
+  align-items: end;
+}
+.frame-head .label {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+.frame-head .label .num {
+  color: var(--ink);
+  margin-right: 8px;
+}
+.frame-head h2 {
+  font-size: clamp(28px, 4vw, 56px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  margin: 0;
+  max-width: 22ch;
+  text-transform: none;
+  color: var(--ink);
+}
+
+@media (max-width: 1100px) {
+  .frame { padding: 64px 32px; }
+  .frame-head { grid-template-columns: 1fr; gap: 24px; }
+}
+@media (max-width: 640px) {
+  .frame { padding: 48px 20px; }
+}
+
+/* ── shared status pill (matrix + bench card header) ─────────────── */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 500;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+}
+.pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.pill.ok   { color: var(--ok);   border-color: var(--ok); }
+.pill.warn { color: var(--warn); border-color: var(--warn); }
+.pill.dim  { color: var(--ink-dim); border-color: var(--line); }
+
+/* ── print: still a man page when printed ────────────────────────── */
+@media print {
+  :root { --fs-base: 11pt; }
+  html, body { background: #ffffff; color: #000000; }
+  .topnav, .sfoot, .toc, aside.docs-side { display: none !important; }
+  a { color: inherit; text-decoration: underline; }
+  a[href^="http"]::after {
+    content: " (" attr(href) ")";
+    font-size: 9pt;
+    color: #444;
+  }
+}
