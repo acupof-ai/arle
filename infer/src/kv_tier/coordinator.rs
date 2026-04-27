@@ -89,22 +89,37 @@ impl Coordinator {
         }
     }
 
-    /// Emit an event whose delivery is critical to caller progress. Currently
-    /// only the `Fetch*` arm uses this — the request blocks in
-    /// `Phase::WaitingFetch` until `FetchCompleted` / `FetchFailed` arrives,
-    /// so a dropped event would hang the request indefinitely.
+    /// Emit an event whose delivery is critical to scheduler progress.
+    ///
+    /// Used for `Fetch*` and `Store*`:
+    /// - `Fetch*`: the request blocks in `Phase::WaitingFetch` until
+    ///   `FetchCompleted` / `FetchFailed` arrives — a dropped event would
+    ///   hang the request indefinitely.
+    /// - `Store*`: the scheduler's `StoreCompleted` / `StoreFailed` handlers
+    ///   own host-pool region release + prefix-cache state transitions
+    ///   (`mark_block_stored` / `mark_block_store_failed`). A dropped event
+    ///   leaks regions and leaves blocks stuck in `Storing`.
+    ///
+    /// Uses blocking `send` — the channel is bounded, but back-pressure here
+    /// is intentional: callers needing to publish critical state should wait
+    /// rather than silently drop.
     fn emit_required(&self, event: CoordinatorEvent) -> Result<()> {
         self.events
             .send(event)
             .map_err(|e| anyhow!("coordinator event send failed: {e}"))
     }
 
-    /// Emit an event for downstream observability. Used for `Store*` and
-    /// `Plan*` — the request state machine does not wait on these, so a
-    /// slow / full event receiver should NOT back-pressure the coordinator.
-    /// Send errors are dropped.
+    /// Emit an event for pure downstream observability. Used for `Plan*` —
+    /// the scheduler ignores these events (see `runtime.rs` no-op match
+    /// arm) and no internal state machine depends on them.
+    ///
+    /// Uses non-blocking `try_send` — on a full bounded channel the event
+    /// is dropped silently rather than back-pressuring the coordinator.
+    /// This is the only safe shape: blocking on observability would let
+    /// a slow event consumer stall later critical `Fetch*` / `Store*`
+    /// emissions waiting in line behind it. (Codex review 2026-04-27.)
     fn emit_observability(&self, event: CoordinatorEvent) {
-        let _ = self.events.send(event);
+        let _ = self.events.try_send(event);
     }
 
     fn is_cancelled(&self, ticket: QueueTicket) -> bool {
@@ -138,12 +153,12 @@ impl Coordinator {
                 });
             }
             QueueTicket::Store(store_ticket) => {
-                self.emit_observability(CoordinatorEvent::StoreFailed {
+                self.emit_required(CoordinatorEvent::StoreFailed {
                     ticket: store_ticket,
                     failed_block,
                     class,
                     reason,
-                });
+                })?;
             }
             QueueTicket::Fetch(fetch_ticket) => {
                 self.emit_required(CoordinatorEvent::FetchFailed {
@@ -193,10 +208,10 @@ impl Coordinator {
     }
 
     fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) -> Result<QueueOutcome> {
-        self.emit_observability(CoordinatorEvent::StoreQueued {
+        self.emit_required(CoordinatorEvent::StoreQueued {
             ticket,
             block_count: blocks.len(),
-        });
+        })?;
         let queue_ticket: QueueTicket = ticket.into();
         if self.is_cancelled(queue_ticket) {
             let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
@@ -357,7 +372,7 @@ impl Coordinator {
             }
         }
 
-        self.emit_observability(CoordinatorEvent::StoreCompleted { ticket, locations });
+        self.emit_required(CoordinatorEvent::StoreCompleted { ticket, locations })?;
         Ok(QueueOutcome::Completed)
     }
 
