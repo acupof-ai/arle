@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chat",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "agent-infer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cli",
@@ -178,7 +178,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autograd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "chat"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -487,7 +487,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent",
  "anyhow",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "cuda-kernels"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "infer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "kv-native-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tempfile",
 ]
@@ -2851,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "qwen3-spec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "qwen35-spec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chat",
  "log",
@@ -3911,7 +3911,7 @@ dependencies = [
 
 [[package]]
 name = "train"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "autograd",
