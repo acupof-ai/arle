@@ -1,5 +1,19 @@
 # Active KV swap-out — unify prefix-cache demotion with preemption
 
+> **STATUS: CLOSED — design discarded 2026-04-27.** Phase 2 was
+> implemented end-to-end (codex-clean across 9 review iterations) and
+> reverted in full after the bench showed a 28× ITL regression rooted
+> in scheduler CPU/GPU overlap conflicts. Subsequent primary-source
+> research confirmed vLLM V1 deleted the same path entirely and SGLang
+> never had one. See
+> [`errors/2026-04-27-kv-swap-out-deleted-following-vllm-v1-sglang.md`](../experience/errors/2026-04-27-kv-swap-out-deleted-following-vllm-v1-sglang.md).
+>
+> **Future preemption work must not re-attempt this approach** without
+> first invalidating vLLM V1's and SGLang's reasoning. The c=16 long-prompt
+> concurrency cap remains, but is rooted in admission/budget/kernel
+> quality, not in preemption strategy. Document below kept for historical
+> reference only.
+
 ## Thesis
 
 KV pages are pages. The storage layer (T0 paged pool, T1 host-pinned

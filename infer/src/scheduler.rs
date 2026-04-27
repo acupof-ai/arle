@@ -33,6 +33,5 @@ pub use batch::{
 #[cfg(feature = "cuda")]
 pub use cuda::Scheduler;
 pub use types::{
-    IncomingRequest, PreemptionMode, RequestPriority, SchedulerConfig, SchedulerFull,
-    SchedulerHandle,
+    IncomingRequest, RequestPriority, SchedulerConfig, SchedulerFull, SchedulerHandle,
 };
