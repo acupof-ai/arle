@@ -1001,8 +1001,25 @@ impl<M: ModelForward> Scheduler<M> {
             )?
         };
         let host_block_bytes = paged_kv_pool.storage_bytes_for_tokens(PREFIX_CACHE_BLOCK_SIZE);
-        let host_pool_capacity = host_block_bytes
-            .saturating_mul(config.max_slots.saturating_mul(16).max(1))
+        // Two consumers size T1: prefix-cache demote (~16 sealed blocks per
+        // slot) and Phase 2 whole-slot swap-out (1 slot's full KV per parked
+        // victim). Take the larger of the two so neither use case starves —
+        // for `PreemptionMode::Recompute` the swap term is dead headroom but
+        // the host pool is host-pinned RAM, not GPU memory, so the cost is
+        // a few GB of host RAM that only matters on memory-tight boxes.
+        let prefix_demote_estimate =
+            host_block_bytes.saturating_mul(config.max_slots.saturating_mul(16).max(1));
+        // Half the slots parked simultaneously is enough to absorb a full
+        // c=N admission burst at 4 K-token prompts; doubling it would only
+        // matter under heterogeneous prompt sizes that the canonical bench
+        // doesn't exercise.
+        let swap_seq_len = effective_max_seq_len.unwrap_or(4096);
+        let swap_concurrent_slots = config.max_slots.div_ceil(2).max(1);
+        let swap_estimate = paged_kv_pool
+            .storage_bytes_for_tokens(swap_seq_len)
+            .saturating_mul(swap_concurrent_slots);
+        let host_pool_capacity = prefix_demote_estimate
+            .max(swap_estimate)
             .max(64 * 1024 * 1024);
         let host_pinned_pool = crate::kv_tier::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(host_pool_capacity)?,
