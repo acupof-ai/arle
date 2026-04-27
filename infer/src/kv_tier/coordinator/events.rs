@@ -1,10 +1,10 @@
-//! Command and event payloads exchanged between scheduler / coordinator /
-//! orchestrator. Plain data — no I/O, no thread state.
+//! Command and event payloads exchanged between scheduler and coordinator.
+//! Plain data — no I/O, no thread state.
 
 use crate::kv_tier::tier::BlockLocation;
 use crate::types::BlockId;
 
-use super::types::{FetchTicket, PlanTicket, QueueKind, QueueTicket, StoreTicket};
+use super::types::{FetchTicket, PlanTicket, StoreTicket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StoreTarget {
@@ -114,10 +114,6 @@ pub enum CoordinatorEvent {
         failed_block: BlockId,
         reason: String,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrchestratorEvent {
     PlanQueued {
         ticket: PlanTicket,
         block_count: usize,
@@ -126,25 +122,8 @@ pub enum OrchestratorEvent {
         ticket: PlanTicket,
         plans: Vec<PrefetchPlan>,
     },
-    FetchQueued {
-        ticket: FetchTicket,
-        block_count: usize,
-    },
-    FetchCompleted {
-        ticket: FetchTicket,
-        blocks: Vec<FetchedBlock>,
-    },
-    StoreQueued {
-        ticket: StoreTicket,
-        block_count: usize,
-    },
-    StoreCompleted {
-        ticket: StoreTicket,
-        locations: Vec<(BlockId, BlockLocation)>,
-    },
-    TaskFailed {
-        queue: QueueKind,
-        ticket: QueueTicket,
+    PlanFailed {
+        ticket: PlanTicket,
         failed_block: BlockId,
         reason: String,
     },

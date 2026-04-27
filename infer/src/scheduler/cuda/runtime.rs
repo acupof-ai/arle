@@ -1153,7 +1153,15 @@ impl<M: ModelForward> Scheduler<M> {
         //   normal prefill path
         // - `FetchFailed` always falls back to cold prefill
         match event {
-            crate::kv_tier::CoordinatorEvent::FetchQueued { .. } => {}
+            crate::kv_tier::CoordinatorEvent::FetchQueued { .. }
+            | crate::kv_tier::CoordinatorEvent::PlanQueued { .. }
+            | crate::kv_tier::CoordinatorEvent::PlanCompleted { .. }
+            | crate::kv_tier::CoordinatorEvent::PlanFailed { .. } => {
+                // The scheduler does not act on plan-* events: planning is
+                // currently a coordinator-internal concern (the M3
+                // future-orchestrator integration was scoped down). Listen-only
+                // so the unified event channel stays exhaustive.
+            }
             crate::kv_tier::CoordinatorEvent::StoreQueued { ticket, .. } => {
                 if let Some(waiters) = self.store_waiting.get(&ticket) {
                     for (block_id, _) in waiters {
