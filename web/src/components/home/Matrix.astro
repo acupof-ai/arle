@@ -31,7 +31,7 @@ const { matrix } = Astro.props;
   }
   .mtx { width: 100%; border-collapse: collapse; font-size: 13px; }
   .mtx thead th {
-    padding: 16px 20px;
+    padding: 16px 22px;
     text-align: left;
     font-size: 10px;
     letter-spacing: 0.16em;
@@ -39,7 +39,7 @@ const { matrix } = Astro.props;
     color: var(--ink-dim);
     border-bottom: 1px solid var(--line);
     font-weight: 500;
-    background: var(--paper-dim);
+    background: var(--paper-warm);
     white-space: nowrap;
   }
   .mtx tbody td {
@@ -51,10 +51,11 @@ const { matrix } = Astro.props;
   .mtx tbody tr:last-child td { border-bottom: none; }
   .mtx tbody td.k { color: var(--ink); font-weight: 600; white-space: nowrap; }
   .mtx :global(code) {
-    background: var(--paper-dim);
+    background: var(--paper-warm);
     border: 1px solid var(--line);
     padding: 2px 8px;
     font-weight: 500;
+    font-family: var(--mono);
   }
   /* Map the legacy m-ok/m-warn/m-dim classes (already in content data)
      onto the new pill design so existing data needs no rewrite. */

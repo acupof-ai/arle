@@ -37,6 +37,8 @@ export type BenchGridCell = {
   label: string;
   value: string; // numeric, no unit
   unit: string;  // short unit like "tok/s", "ms"
+  /** v3 — sparkline SVG path on a 64×18 viewBox. Optional. */
+  spark?: string;
 };
 export type BenchRow = {
   date: string;
@@ -76,7 +78,7 @@ export type FooterCol = {
   links: { label: string; href: string; placeholder?: boolean }[];
 };
 
-/** v2 hero — large display heading composed of HTML lines, plus a lede paragraph. */
+/** v3 hero — large display heading composed of HTML lines, plus a lede paragraph. */
 export type HeroDisplay = {
   /** Each entry is an HTML line of the H1 (allows <span class="strike">, <em>). */
   h1Lines: string[];
@@ -84,14 +86,20 @@ export type HeroDisplay = {
   lede: string;
   /** Status label rendered in the kicker bar (e.g. "v0.4.2 stable"). */
   status: string;
+  /** v3 — short uppercase annotation under the H1 (e.g. "Pure Rust · OpenAI v1"). */
+  replPrimary?: string;
+  /** v3 — serif italic suffix on the repl-line (e.g. "— CUDA + Metal + CPU"). */
+  replSuffix?: string;
 };
 
-/** v2 hero-right perf cells. */
+/** v3 hero-right perf cells. */
 export type HeroStat = {
   lbl: string;
   num: string;
   unit: string;
   meta: string; // raw HTML allowed
+  /** v3 — sparkline SVG path on a 60×14 viewBox. Optional. */
+  spark?: string;
 };
 
 /** v2 sticky top-nav link. */
@@ -320,12 +328,14 @@ export const EN: Locale = {
     display: {
       status: "v0.4.2 stable",
       h1Lines: [
-        'Serve <span class="strike">Qwen3</span>',
+        'Serve <span class="strike"><span class="txt">Qwen3</span></span>',
         "at the speed",
         "of <em>cargo build</em>.",
       ],
+      replPrimary: "Pure Rust · OpenAI v1",
+      replSuffix: "— CUDA + Metal + CPU",
       lede:
-        '<b>infer</b> serves OpenAI-compatible traffic on CUDA, Metal, and CPU. <b>arle</b> is the unified front door for run, serve, train, and data flows. One Rust workspace &mdash; zero glue.',
+        '<b>infer</b> serves OpenAI-compatible traffic on CUDA, Metal, and CPU. <b>arle</b> is the unified front door for run, serve, train, and data flows. <a class="inline" href="#topology">One Rust workspace &mdash; zero glue.</a>',
     },
     installLabel: "install · macos · linux",
     stats: [
@@ -333,25 +343,29 @@ export const EN: Locale = {
         lbl: "cuda · L4 · qwen3-4b",
         num: "118",
         unit: "tok/s",
-        meta: 'output throughput · conc=<b>16</b> · BF16',
+        meta: 'conc=<b>16</b> · BF16',
+        spark: "M0 9 L8 8 L16 10 L24 7 L32 6 L40 7 L48 4 L60 3",
       },
       {
         lbl: "cuda · L4 · ITL p50",
         num: "59.9",
         unit: "ms",
-        meta: 'inter-token latency · <b>2026-04-23</b>',
+        meta: '<b>2026-04-23</b>',
+        spark: "M0 5 L8 6 L16 5 L24 8 L32 7 L40 9 L48 10 L60 11",
       },
       {
-        lbl: "metal · M-class · qwen3.5-0.8b",
-        num: "30.4",
+        lbl: "metal · M4 Pro · 0.8b q4_k_m",
+        num: "211",
         unit: "tok/s",
-        meta: 'step-driver · BF16 · <b>2026-04-26</b>',
+        meta: 'gguf decode · <b>2026-04-27</b>',
+        spark: "M0 11 L8 9 L16 7 L24 6 L32 5 L40 4 L48 3 L60 2",
       },
       {
         lbl: "cold start · arle serve",
         num: "1.4",
         unit: "s",
-        meta: "model load + warm first token",
+        meta: "load + first token",
+        spark: "M0 5 L8 6 L16 5 L24 5 L32 4 L40 5 L48 4 L60 4",
       },
     ],
   },
@@ -536,26 +550,46 @@ export const EN: Locale = {
           stability: "stable",
           cmd: "infer bench --model Qwen3-4B",
           grid: [
-            { label: "output throughput", value: "118", unit: "tok/s" },
-            { label: "ITL p50", value: "59.9", unit: "ms" },
+            {
+              label: "output throughput",
+              value: "118",
+              unit: "tok/s",
+              spark: "M0 12 L10 11 L20 13 L30 9 L40 8 L50 6 L64 4",
+            },
+            {
+              label: "ITL p50",
+              value: "59.9",
+              unit: "ms",
+              spark: "M0 6 L10 7 L20 6 L30 9 L40 8 L50 11 L64 13",
+            },
             { label: "concurrency", value: "16", unit: "streams" },
             { label: "first token", value: "412", unit: "ms" },
           ],
         },
         {
-          date: "2026-04-26",
+          date: "2026-04-27",
           backend: "metal",
-          model: "Qwen3.5-0.8B",
-          hardware: "Apple M-class · BF16",
-          metric: 'gen p50 <b>30.4 tok/s</b> &middot; step-driver, BF16',
-          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-26-bench-metal-qwen35-0p8b-gguf-vs-safetensors-local.md",
+          model: "Qwen3.5-0.8B Q4_K_M",
+          hardware: "Apple M4 Pro · GGUF decode",
+          metric: 'gen <b>211 tok/s</b> &middot; e2e <b>202 tok/s</b> &middot; gguf affine repack',
+          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md",
           stability: "beta",
-          cmd: "infer bench --backend metal",
+          cmd: "metal_bench --model Qwen3.5-0.8B-Q4_K_M.gguf",
           grid: [
-            { label: "gen p50", value: "30.4", unit: "tok/s" },
-            { label: "step-driver", value: "2.1", unit: "ms" },
-            { label: "memory", value: "1.6", unit: "GiB" },
-            { label: "first token", value: "288", unit: "ms" },
+            {
+              label: "gen tok/s",
+              value: "211",
+              unit: "tok/s",
+              spark: "M0 14 L10 11 L20 9 L30 7 L40 5 L50 4 L64 3",
+            },
+            {
+              label: "decode ms/tok",
+              value: "4.7",
+              unit: "ms",
+              spark: "M0 12 L10 10 L20 9 L30 7 L40 6 L50 5 L64 4",
+            },
+            { label: "peak RSS", value: "1.4", unit: "GiB" },
+            { label: "TTFT", value: "223", unit: "ms" },
           ],
         },
       ],
@@ -676,12 +710,14 @@ export const ZH: Locale = {
     display: {
       status: "v0.4.2 stable",
       h1Lines: [
-        '让 <span class="strike">Qwen3</span>',
-        "在一次 <em>cargo build</em>",
-        "里跑起来。",
+        '让 <span class="strike"><span class="txt">Qwen3</span></span>',
+        "跑得跟",
+        "<em>cargo build</em> 一样快。",
       ],
+      replPrimary: "纯 Rust · OpenAI v1",
+      replSuffix: "— CUDA + Metal + CPU",
       lede:
-        '<b>infer</b> 在 CUDA、Metal、CPU 上提供 OpenAI 兼容 serving。<b>arle</b> 是 run / serve / train / data 的统一前门 — 一套 Rust workspace，零胶水。',
+        '<b>infer</b> 在 CUDA、Metal、CPU 上提供 OpenAI 兼容 serving。<b>arle</b> 是 run / serve / train / data 的统一前门 — <a class="inline" href="#topology">一套 Rust workspace，零胶水。</a>',
     },
     installLabel: "install · macos · linux",
     stats: [
@@ -689,25 +725,29 @@ export const ZH: Locale = {
         lbl: "cuda · L4 · qwen3-4b",
         num: "118",
         unit: "tok/s",
-        meta: '输出吞吐 · conc=<b>16</b> · BF16',
+        meta: 'conc=<b>16</b> · BF16',
+        spark: "M0 9 L8 8 L16 10 L24 7 L32 6 L40 7 L48 4 L60 3",
       },
       {
         lbl: "cuda · L4 · ITL p50",
         num: "59.9",
         unit: "ms",
-        meta: 'inter-token 延迟 · <b>2026-04-23</b>',
+        meta: '<b>2026-04-23</b>',
+        spark: "M0 5 L8 6 L16 5 L24 8 L32 7 L40 9 L48 10 L60 11",
       },
       {
-        lbl: "metal · M 系列 · qwen3.5-0.8b",
-        num: "30.4",
+        lbl: "metal · M4 Pro · 0.8b q4_k_m",
+        num: "211",
         unit: "tok/s",
-        meta: 'step-driver · BF16 · <b>2026-04-26</b>',
+        meta: 'gguf decode · <b>2026-04-27</b>',
+        spark: "M0 11 L8 9 L16 7 L24 6 L32 5 L40 4 L48 3 L60 2",
       },
       {
         lbl: "冷启动 · arle serve",
         num: "1.4",
         unit: "s",
-        meta: "模型加载 + 首 token 出口",
+        meta: "加载 + 首 token",
+        spark: "M0 5 L8 6 L16 5 L24 5 L32 4 L40 5 L48 4 L60 4",
       },
     ],
   },
@@ -891,26 +931,46 @@ export const ZH: Locale = {
           stability: "stable",
           cmd: "infer bench --model Qwen3-4B",
           grid: [
-            { label: "输出吞吐", value: "118", unit: "tok/s" },
-            { label: "ITL p50", value: "59.9", unit: "ms" },
+            {
+              label: "输出吞吐",
+              value: "118",
+              unit: "tok/s",
+              spark: "M0 12 L10 11 L20 13 L30 9 L40 8 L50 6 L64 4",
+            },
+            {
+              label: "ITL p50",
+              value: "59.9",
+              unit: "ms",
+              spark: "M0 6 L10 7 L20 6 L30 9 L40 8 L50 11 L64 13",
+            },
             { label: "并发", value: "16", unit: "streams" },
             { label: "首 token", value: "412", unit: "ms" },
           ],
         },
         {
-          date: "2026-04-26",
+          date: "2026-04-27",
           backend: "metal",
-          model: "Qwen3.5-0.8B",
-          hardware: "Apple M 系列 · BF16",
-          metric: 'gen p50 <b>30.4 tok/s</b> &middot; step-driver, BF16',
-          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-26-bench-metal-qwen35-0p8b-gguf-vs-safetensors-local.md",
+          model: "Qwen3.5-0.8B Q4_K_M",
+          hardware: "Apple M4 Pro · GGUF decode",
+          metric: 'gen <b>211 tok/s</b> &middot; e2e <b>202 tok/s</b> &middot; GGUF affine repack',
+          href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md",
           stability: "beta",
-          cmd: "infer bench --backend metal",
+          cmd: "metal_bench --model Qwen3.5-0.8B-Q4_K_M.gguf",
           grid: [
-            { label: "gen p50", value: "30.4", unit: "tok/s" },
-            { label: "step-driver", value: "2.1", unit: "ms" },
-            { label: "内存", value: "1.6", unit: "GiB" },
-            { label: "首 token", value: "288", unit: "ms" },
+            {
+              label: "生成吞吐",
+              value: "211",
+              unit: "tok/s",
+              spark: "M0 14 L10 11 L20 9 L30 7 L40 5 L50 4 L64 3",
+            },
+            {
+              label: "decode ms/tok",
+              value: "4.7",
+              unit: "ms",
+              spark: "M0 12 L10 10 L20 9 L30 7 L40 6 L50 5 L64 4",
+            },
+            { label: "峰值内存", value: "1.4", unit: "GiB" },
+            { label: "TTFT", value: "223", unit: "ms" },
           ],
         },
       ],

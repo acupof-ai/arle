@@ -32,6 +32,13 @@
   --hl: #FFE56B;             /* highlight strip (display headings only) */
   --rule-2: rgba(10,10,10,0.18); /* heavier hairline for split-layout edges */
 
+  /* v3 design — ink-blue accent + warm paper second surface + serif italic */
+  --ink-blue:    #1F2A44;          /* runtime accent / contract / link hover */
+  --ink-blue-2:  #2C3958;
+  --paper-warm:  #F5F2EC;          /* second paper surface — callouts / topology bleed / matrix head */
+  --serif: "Newsreader", "Iowan Old Style", "Hoefler Text",
+           "Georgia Pro", Georgia, "Times New Roman", serif;
+
   /* type scale */
   --fs-xs: 11px;
   --fs-sm: 12px;

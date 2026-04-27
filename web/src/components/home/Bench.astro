@@ -7,15 +7,14 @@ interface Props {
 }
 const { rows, isZh = false } = Astro.props;
 const fullSnapshotLabel = isZh ? "完整快照" : "Full snapshot";
-const runCmdLabel = isZh ? "运行命令：" : "Run cmd:";
 ---
 <div class="perf-detail">
   {rows.map((r) => {
     const stab = r.stability ?? "stable";
-    const stabClass = stab === "stable" ? "ok" : "warn";
+    const stabClass = stab === "stable" ? "ok" : stab === "beta" ? "beta" : "dim";
     const grid = r.grid ?? [];
     return (
-      <article class="perf-card">
+      <article class="perf-card reveal">
         <div class="perf-card-h">
           <span class="b">{r.backend}</span>
           <span class="d">{r.date}</span>
@@ -27,14 +26,23 @@ const runCmdLabel = isZh ? "运行命令：" : "Run cmd:";
             {grid.map((g) => (
               <div>
                 <div class="l">{g.label}</div>
-                <div class="v">{g.value}<span class="u">{g.unit}</span></div>
+                <div class="v">
+                  <span class="num-block">
+                    {g.value}<span class="u">{g.unit}</span>
+                  </span>
+                  {g.spark && (
+                    <svg class="spark" viewBox="0 0 64 18" aria-hidden="true">
+                      <path d={g.spark} />
+                    </svg>
+                  )}
+                </div>
               </div>
             ))}
           </div>
         )}
         <div class="perf-card-foot">
           {r.cmd ? (
-            <span>{runCmdLabel} <code>{r.cmd}</code></span>
+            <span>cmd · <code>{r.cmd}</code></span>
           ) : (
             <span set:html={r.metric} />
           )}
@@ -65,11 +73,15 @@ const runCmdLabel = isZh ? "运行命令：" : "Run cmd:";
   }
   .perf-card-h .b {
     color: var(--ink);
-    padding: 1px 6px;
+    padding: 1px 8px;
     border: 1px solid var(--line);
-    background: var(--paper-dim);
+    background: var(--paper-warm);
+    font-weight: 500;
   }
-  .perf-card-h .d { color: var(--ink); }
+  .perf-card-h .d {
+    color: var(--ink);
+    font-feature-settings: "tnum" 1;
+  }
   .perf-card-h .meta { color: var(--ink-soft); }
   .perf-card-h .s {
     margin-left: auto;
@@ -79,12 +91,14 @@ const runCmdLabel = isZh ? "运行命令：" : "Run cmd:";
   }
   .perf-card-h .s::before {
     content: "";
-    width: 6px; height: 6px;
+    width: 6px;
+    height: 6px;
     background: currentColor;
     border-radius: 50%;
   }
-  .perf-card-h .s.s-ok   { color: var(--ok); }
-  .perf-card-h .s.s-warn { color: var(--warn); }
+  .perf-card-h .s-ok    { color: var(--ok); }
+  .perf-card-h .s-beta  { color: var(--warn); }
+  .perf-card-h .s-dim   { color: var(--ink-dim); }
 
   .perf-card-body {
     display: grid;
@@ -94,7 +108,7 @@ const runCmdLabel = isZh ? "运行命令：" : "Run cmd:";
   }
   .perf-card-body > div {
     background: var(--paper);
-    padding: 24px;
+    padding: 22px 24px 18px;
   }
   .perf-card-body .l {
     font-size: 10px;
@@ -104,35 +118,63 @@ const runCmdLabel = isZh ? "运行命令：" : "Run cmd:";
     margin-bottom: 8px;
   }
   .perf-card-body .v {
-    font-size: 36px;
+    font-size: 38px;
     font-weight: 700;
     letter-spacing: -0.025em;
     line-height: 1;
     color: var(--ink);
+    font-feature-settings: "tnum" 1;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+  .perf-card-body .v .num-block {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
   }
   .perf-card-body .v .u {
     font-size: 13px;
     font-weight: 500;
     color: var(--ink-dim);
-    margin-left: 4px;
+  }
+  .perf-card-body .v .spark {
+    margin-left: auto;
+    width: 64px;
+    height: 18px;
+    flex: none;
+    align-self: center;
+  }
+  .perf-card-body .v .spark path {
+    stroke: var(--ink-dim);
+    stroke-width: 1;
+    fill: none;
   }
   .perf-card-foot {
-    padding: 16px 24px;
+    padding: 14px 24px;
     border-top: 1px solid var(--line);
     display: flex;
     justify-content: space-between;
     font-size: 11px;
     color: var(--ink-dim);
-    background: var(--paper-dim);
+    background: var(--paper-warm);
+    align-items: center;
     gap: 12px;
     flex-wrap: wrap;
   }
   .perf-card-foot a {
-    color: var(--ink);
-    text-decoration: none;
-    border-bottom: 1px dotted var(--line);
+    color: var(--ink-blue);
+    text-decoration-color: var(--ink-blue);
   }
-  .perf-card-foot a:hover { border-bottom-color: var(--ink); }
+  .perf-card-foot code {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    padding: 1px 6px;
+    font-size: 11px;
+    color: var(--ink);
+    font-family: var(--mono);
+  }
 
   @media (max-width: 1100px) {
     .perf-detail { grid-template-columns: 1fr; }

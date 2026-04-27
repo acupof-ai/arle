@@ -1,6 +1,10 @@
-/* ARLE site v2 — split-layout homepage + 3-pane docs.
+/* ARLE site v3 — split-layout homepage + 3-pane docs.
    Pairs with tokens.css. Component-scoped styles live in their .astro
-   files; this stylesheet hosts globals and the home v2 section frame. */
+   files; this stylesheet hosts globals, the unified .btn system, the
+   home frame section, and the shared reveal-on-scroll progressive
+   enhancement. */
+
+@import url("https://fonts.googleapis.com/css2?family=Newsreader:ital,wght@0,400;0,500;1,400;1,500&display=swap");
 
 * { box-sizing: border-box; }
 
@@ -70,11 +74,53 @@ pre i   { color: var(--ink-soft); }
 pre b   { color: var(--ink); }
 pre .k  { color: var(--coral); }
 
-/* ── home v2 — section frame ─────────────────────────────────────── */
+/* ── unified button system (v3) ──────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 20px;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  border: 1px solid var(--ink);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.btn-primary {
+  background: var(--ink);
+  color: var(--paper);
+}
+.btn-primary:hover,
+.btn-primary:focus-visible {
+  background: var(--ink-blue);
+  border-color: var(--ink-blue);
+  outline: none;
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--ink);
+  border-color: var(--line);
+}
+.btn-ghost:hover,
+.btn-ghost:focus-visible {
+  border-color: var(--ink);
+  color: var(--ink);
+  outline: none;
+}
+.btn .ar {
+  font-size: 11px;
+  opacity: 0.7;
+  transition: transform 150ms ease;
+}
+.btn:hover .ar { transform: translateX(3px); }
+
+/* ── home v3 — section frame ─────────────────────────────────────── */
 .frame {
-  padding: 96px 64px;
+  padding: 104px 64px;
   border-bottom: 1px solid var(--line);
 }
+.frame.full { padding: 0; }
 .frame-head {
   display: grid;
   grid-template-columns: 240px 1fr;
@@ -91,16 +137,24 @@ pre .k  { color: var(--coral); }
 .frame-head .label .num {
   color: var(--ink);
   margin-right: 8px;
+  font-weight: 500;
 }
 .frame-head h2 {
-  font-size: clamp(28px, 4vw, 56px);
+  font-size: clamp(40px, 5.4vw, 80px);
   font-weight: 700;
-  letter-spacing: -0.03em;
-  line-height: 1.05;
+  letter-spacing: -0.035em;
+  line-height: 1;
   margin: 0;
   max-width: 22ch;
   text-transform: none;
   color: var(--ink);
+}
+.frame-head h2 em {
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 400;
+  color: var(--ink-blue);
+  letter-spacing: -0.02em;
 }
 
 @media (max-width: 1100px) {
@@ -109,6 +163,13 @@ pre .k  { color: var(--coral); }
 }
 @media (max-width: 640px) {
   .frame { padding: 48px 20px; }
+}
+
+/* ── reveal — progressive enhancement ────────────────────────────── */
+.reveal { transition: opacity 380ms ease, transform 380ms ease; }
+html.js-reveal .reveal:not(.in) { opacity: 0; transform: translateY(8px); }
+@media (prefers-reduced-motion: reduce) {
+  html.js-reveal .reveal:not(.in) { opacity: 1; transform: none; }
 }
 
 /* ── shared status pill (matrix + bench card header) ─────────────── */

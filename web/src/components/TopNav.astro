@@ -47,8 +47,8 @@ const brandFullHref = brandHref.startsWith("http") ? brandHref : `${base}${brand
     border-bottom: 1px solid var(--line);
     display: flex;
     align-items: center;
-    height: 56px;
-    padding: 0 24px;
+    height: 60px;
+    padding: 0 32px;
     gap: 32px;
     font-family: var(--mono);
   }
@@ -61,15 +61,30 @@ const brandFullHref = brandHref.startsWith("http") ? brandHref : `${base}${brand
   .topnav-brand:hover { color: var(--ink); }
   .topnav-links {
     display: flex;
-    gap: 24px;
+    gap: 4px;
     font-size: 13px;
   }
   .topnav-links a {
+    position: relative;
     color: var(--ink-soft);
     text-decoration: none;
+    padding: 8px 12px;
     transition: color 100ms ease;
   }
+  .topnav-links a::after {
+    content: "";
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 4px;
+    height: 1px;
+    background: var(--ink);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 180ms ease;
+  }
   .topnav-links a:hover { color: var(--ink); }
+  .topnav-links a:hover::after { transform: scaleX(1); }
   .topnav-right {
     margin-left: auto;
     display: flex;

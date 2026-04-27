@@ -30,5 +30,36 @@ const base = import.meta.env.BASE_URL;
 </head>
 <body>
 <slot />
+<script>
+  // Reveal-on-scroll — opt-in via class so default render is visible.
+  // Copy-to-clipboard for any [data-copy] button next to a <pre>.
+  document.documentElement.classList.add("js-reveal");
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          e.target.classList.add("in");
+          io.unobserve(e.target);
+        }
+      }
+    },
+    { threshold: 0.1, rootMargin: "0px 0px -8% 0px" },
+  );
+  document.querySelectorAll<HTMLElement>(".reveal").forEach((el) => io.observe(el));
+
+  document.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const pre = btn.closest("section, div, header, footer")?.querySelector("pre");
+      if (!pre) return;
+      navigator.clipboard?.writeText(pre.textContent ?? "");
+      btn.textContent = "copied";
+      btn.classList.add("done");
+      window.setTimeout(() => {
+        btn.textContent = "copy";
+        btn.classList.remove("done");
+      }, 1400);
+    });
+  });
+</script>
 </body>
 </html>

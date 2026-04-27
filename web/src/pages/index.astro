@@ -18,13 +18,13 @@ const s = EN.sections;
 
   <HeroSplit locale={EN} />
 
-  <Frame
-    id="topology"
-    num="01"
-    label="Topology"
-    heading="One workspace. One front door. Three backends."
-  >
-    <Topology locale={EN} />
+  <Frame id="topology" num="01" label="Topology" full={true}>
+    <Topology
+      locale={EN}
+      heading="One workspace. One front door. <em>Three backends.</em>"
+      label="Topology"
+      num="01"
+    />
   </Frame>
 
   <Frame
@@ -49,7 +49,7 @@ const s = EN.sections;
     id="matrix"
     num="04"
     label="Support matrix"
-    heading="Three backends. One runtime contract."
+    heading="Three backends. <em>One contract.</em>"
   >
     <Matrix matrix={s.matrix} />
   </Frame>
