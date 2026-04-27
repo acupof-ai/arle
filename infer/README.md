@@ -45,6 +45,15 @@ cargo build -p infer --release --no-default-features --features metal,no-cuda --
 ./target/release/metal_serve --model-path mlx-community/Qwen3-0.6B-4bit
 ```
 
+Current Metal GGUF performance floor:
+
+```bash
+cargo build -p infer --release --no-default-features --features metal,no-cuda --bin metal_bench
+./target/release/metal_bench \
+  --model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --prompt-tokens 512 --generation-tokens 1024 --ignore-eos --json
+```
+
 ### CPU smoke path
 
 ```bash
@@ -75,7 +84,9 @@ If you change numerical output, regenerate the JSON baselines under
 
 - Dated benchmark snapshots live under
   [../docs/experience/wins/](../docs/experience/wins/).
-- Active benchmark closure work lives in
-  [../docs/plans/2026-04-23-cuda-decode-sglang-alignment.md](../docs/plans/2026-04-23-cuda-decode-sglang-alignment.md).
+- Active CUDA benchmark closure work lives in
+  [../docs/plans/2026-04-23-cuda-decode-sglang-alignment.md](../docs/plans/2026-04-23-cuda-decode-sglang-alignment.md);
+  the current Metal GGUF floor is
+  [../docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md](../docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md).
 - Public API claims belong in [../docs/http-api.md](../docs/http-api.md), not
   in this crate README.

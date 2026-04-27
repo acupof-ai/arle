@@ -1,6 +1,6 @@
 # ARLE Codebase Map
 
-Updated 2026-04-26 after the truth-surface cleanup.
+Updated 2026-04-27 after the Metal GGUF Qwen3.5 decode floor update.
 
 This document is the canonical workspace-topology truth: where files live,
 what each crate owns, and where to start reading. For ownership boundaries
@@ -210,7 +210,8 @@ These crates remain independent after Route A:
 - `crates/cli`: CLI entry, arg parsing, REPL UX
 - `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
 - `crates/cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/triton/`, Rust FFI, `paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
-- `crates/mlx-sys`: MLX C++ bridge for the Metal backend
+- `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored
+  MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/kv-native-sys`: local persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors
 
 Current dependency direction:

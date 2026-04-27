@@ -20,7 +20,8 @@ Backend bridges and kernel layer:
   the reverse. See [`cuda-kernels/AGENTS.md`](cuda-kernels/AGENTS.md) and
   [`../docs/plans/cuda-kernel-crate-extraction.md`](../docs/plans/cuda-kernel-crate-extraction.md)
   for the proto-API / prelude discipline.
-- `mlx-sys`: MLX C++ bridge used by the Metal backend
+- `mlx-sys`: MLX C++ bridge and vendored MLX Metal qmv kernels used by the
+  Metal backend
 - `kv-native-sys`: local persistence substrate (Zig) for the `infer/src/kv_tier/`
   disk and shared-memory transport paths
 

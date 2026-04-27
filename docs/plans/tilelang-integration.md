@@ -125,7 +125,7 @@ and breaks parity with how Triton is wired today.
 | `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py` | TileLang kernel definition for the contract in §2. |
 | `crates/cuda-kernels/tools/tilelang/README.md` | Bootstrap notes: `pip install tilelang`, `INFER_TILELANG_PYTHON`, expected versions. |
 | `docs/plans/tilelang-integration.md` | This document. |
-| `docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md` | Bench stub (pending-remote per §Benchmarks rules in CLAUDE.md). |
+| `docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md` | Bench stub (pending-remote per §Benchmarks rules in AGENTS.md / CLAUDE.md). |
 
 The AOT-generated C wrapper lands under `OUT_DIR/tilelang_aot/<artifact>/`,
 not in the source tree. No hand-written `.cu` wrapper is added.
@@ -181,7 +181,7 @@ This plan is fail-fast. Stop conditions, in order:
 
 The 5–10% band is intentionally a no-go zone — too small to justify the
 runtime complexity of carrying two attention paths long-term per the
-"clean and uniform" principle in CLAUDE.md.
+"clean and uniform" principle in AGENTS.md / CLAUDE.md.
 
 ---
 
