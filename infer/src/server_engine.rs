@@ -2,18 +2,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(any(feature = "metal", feature = "cpu", test))]
 use std::path::Path;
-#[cfg(feature = "cuda")]
-use std::time::Instant;
 
 use anyhow::Result;
-#[cfg(feature = "cuda")]
-use fastrace::local::LocalSpan;
-#[cfg(feature = "cuda")]
-use log::{debug, info};
-#[cfg(feature = "cuda")]
-use rand::SeedableRng;
-#[cfg(feature = "cuda")]
-use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(feature = "cpu")]
@@ -30,18 +20,14 @@ use crate::backend::metal::{
 use crate::backend::runtime::StopChunkProcessor;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::{InferenceBackend, StreamStopMatched, StreamingInferenceBackend};
-#[cfg(feature = "cuda")]
-use crate::model::{GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::request_handle::RequestHandle;
 use crate::sampler::SamplingParams;
 use crate::scheduler::{IncomingRequest, RequestPriority};
 use crate::session_persistence::SessionPersistence;
-#[cfg(feature = "cuda")]
-use crate::tokenizer::Tokenizer;
 
 /// Truncate at the first occurrence of any stop string (OpenAI-compatible).
 /// Returns the prefix of `text` up to (but not including) the earliest stop.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu", test))]
+#[cfg(any(feature = "metal", feature = "cpu", test))]
 fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
     let mut earliest = None::<usize>;
     for s in stops {
@@ -57,91 +43,6 @@ fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
         }
     }
     earliest.map(|pos| text[..pos].to_string())
-}
-
-#[cfg(any(feature = "cuda", test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PrefixReuseAction {
-    Miss,
-    FullRecompute,
-    ReplayFinalToken { replay_from: usize },
-    ReuseFullCachedPrefix { prefix_len: usize },
-    PartialReuse { prefix_len: usize },
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn choose_prefix_reuse_action(
-    prompt_len: usize,
-    cached_len: usize,
-    prefix_len: usize,
-    supports_partial_prefix: bool,
-) -> PrefixReuseAction {
-    if prefix_len == 0 {
-        return PrefixReuseAction::Miss;
-    }
-
-    let exact_full_match = prefix_len == prompt_len && prefix_len == cached_len;
-    if exact_full_match {
-        return if supports_partial_prefix {
-            PrefixReuseAction::ReplayFinalToken {
-                replay_from: prefix_len.saturating_sub(1),
-            }
-        } else {
-            PrefixReuseAction::FullRecompute
-        };
-    }
-
-    let prompt_is_strict_prefix_of_cached = prefix_len == prompt_len;
-    if prompt_is_strict_prefix_of_cached {
-        return PrefixReuseAction::FullRecompute;
-    }
-
-    let prompt_extends_cached_exactly = prefix_len == cached_len;
-    if prompt_extends_cached_exactly {
-        return PrefixReuseAction::ReuseFullCachedPrefix { prefix_len };
-    }
-
-    if supports_partial_prefix {
-        PrefixReuseAction::PartialReuse { prefix_len }
-    } else {
-        PrefixReuseAction::FullRecompute
-    }
-}
-
-/// If `new_full` (accumulated text) ends with any of `stops`, return the delta to send
-/// (from `sent_len` up to but not including the stop) and the matching stop.
-/// Prefers the longest matching stop when several match at the end.
-///
-/// Only used by the CUDA single-request streaming path. The shared
-/// `StopChunkProcessor` handles the Metal/CPU/backend-runtime streaming
-/// paths, including mid-chunk and chunk-spanning stops.
-#[cfg(any(feature = "cuda", test))]
-fn truncate_at_stop<'a>(
-    new_full: &str,
-    sent_len: usize,
-    stops: &[&'a str],
-) -> Option<(String, &'a str)> {
-    let mut best: Option<(usize, &'a str)> = None;
-    for s in stops {
-        if s.is_empty() {
-            continue;
-        }
-        if new_full.ends_with(s) {
-            let len = s.len();
-            if best.is_none_or(|(l, _)| len > l) {
-                best = Some((len, *s));
-            }
-        }
-    }
-    best.map(|(stop_len, stop)| {
-        let end = new_full.len().saturating_sub(stop_len);
-        let to_send = if end >= sent_len {
-            new_full[sent_len..end].to_string()
-        } else {
-            String::new()
-        };
-        (to_send, stop)
-    })
 }
 
 #[cfg(any(feature = "metal", feature = "cpu", test))]
@@ -267,638 +168,8 @@ pub trait InferenceEngine: Send {
 }
 
 // ============================================================================
-// Shared generation loop — uses ModelForward trait
-// ============================================================================
-
-#[cfg(feature = "cuda")]
-struct StreamingStats {
-    emitted_tokens: usize,
-    hit_eos: bool,
-    consumer_dropped: bool,
-}
-
-/// Decision returned by a generation sink for each sampled token.
-///
-/// `Continue` advances the loop; `ConsumerDropped` aborts (used by the
-/// streaming path when the HTTP client disconnects).
-#[cfg(feature = "cuda")]
-enum SinkControl {
-    Continue,
-    ConsumerDropped,
-}
-
-/// Telemetry flavor for `generate_inner`. Captures the per-variant observable
-/// differences without introducing a new async boundary or trait object.
-#[cfg(feature = "cuda")]
-#[derive(Clone, Copy)]
-enum TraceMode {
-    /// `generate` — outer span "generate", TTFT/TPOT via both span props and `debug!`.
-    Full,
-    /// `generate_tokens_with_logprobs_inner` — no fastrace span, no TTFT/TPOT debug logs.
-    Silent,
-    /// `generate_streaming_with_callback` — outer span "generate_streaming", TTFT/TPOT via `debug!` only.
-    Streaming,
-}
-
-/// Shared driver for the three CUDA generation variants. All three share the
-/// same tokenize → prefill → (first-token sample) → decode-loop → stop-check →
-/// emit shape; they differ only in:
-///
-/// - **Sampler**: `select_token` vs `select_token_with_logprob` (driven by
-///   `want_logprobs`; pre-existing default impl of `select_token_with_logprob`
-///   falls back to `select_token` so the non-greedy path stays identical).
-/// - **Per-token observation/control**: what to do with the sampled token.
-///   Split into two callbacks to preserve the original logprob-path timing:
-///   `on_sampled` fires **before** the stop-token check (so logprobs for a
-///   stop-token get recorded), `on_emit` fires **after** the token has been
-///   pushed onto `tokens` (so the streaming callback sees tokens that made it
-///   into the output).
-/// - **Trace/debug emission**: see [`TraceMode`].
-#[cfg(feature = "cuda")]
-fn generate_inner<M, Observe, Emit>(
-    model: &M,
-    state: &mut M::State,
-    prompt_tokens: &[u32],
-    max_new_tokens: usize,
-    params: &SamplingParams,
-    rng: &mut StdRng,
-    want_logprobs: bool,
-    trace: TraceMode,
-    mut on_sampled: Observe,
-    mut on_emit: Emit,
-) -> Result<(Vec<u32>, StreamingStats)>
-where
-    M: ModelForward,
-    Observe: FnMut(u32, Option<f32>),
-    Emit: FnMut(u32) -> SinkControl,
-{
-    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-
-    let _outer_span = match trace {
-        TraceMode::Full => Some(
-            LocalSpan::enter_with_local_parent("generate").with_properties(|| {
-                [
-                    ("prompt_len", prompt_tokens.len().to_string()),
-                    ("max_new_tokens", max_new_tokens.to_string()),
-                ]
-            }),
-        ),
-        TraceMode::Streaming => Some(
-            LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
-                [
-                    ("prompt_len", prompt_tokens.len().to_string()),
-                    ("max_new_tokens", max_new_tokens.to_string()),
-                ]
-            }),
-        ),
-        TraceMode::Silent => None,
-    };
-
-    let mut tokens = prompt_tokens.to_vec();
-    let emit_debug = !matches!(trace, TraceMode::Silent);
-
-    // Closure unifying the two sampler shapes. The trait default for
-    // `select_token_with_logprob` is `select_token` + `None`, so passing
-    // `want_logprobs = false` lets model impls that override `select_token`
-    // (e.g. batched decode) skip the logprob path entirely.
-    let sample = |state: &mut M::State, rng: &mut StdRng| -> Result<(u32, Option<f32>)> {
-        if want_logprobs {
-            model.select_token_with_logprob(state, params, rng)
-        } else {
-            model.select_token(state, params, rng).map(|t| (t, None))
-        }
-    };
-
-    let ttft_start = Instant::now();
-    model.forward_prefill(prompt_tokens, state)?;
-    if let Err(e) = state.save_prefix_snapshot() {
-        log::warn!(
-            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
-            e
-        );
-    }
-    let (next_token, next_lp) = sample(state, rng)?;
-    let ttft = ttft_start.elapsed();
-
-    if matches!(trace, TraceMode::Full) {
-        LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
-    }
-    if emit_debug {
-        debug!(
-            "TTFT: {:.2}ms (prompt_len={})",
-            ttft.as_secs_f64() * 1000.0,
-            prompt_tokens.len()
-        );
-    }
-
-    // Observe the freshly sampled token (incl. its logprob) BEFORE the
-    // stop-token check — matches the original logprob-path semantics where
-    // a stop token's logprob is recorded even though the token itself is
-    // not appended to `tokens`.
-    on_sampled(next_token, next_lp);
-
-    // Stop-token early-return. Matches the original per-variant behavior:
-    // - generate / logprobs: return the (unchanged) prompt-only tokens.
-    // - streaming: return emitted=0, hit_eos=true.
-    if !params.ignore_eos && model.is_stop_token(next_token) {
-        return Ok((
-            tokens,
-            StreamingStats {
-                emitted_tokens: 0,
-                hit_eos: true,
-                consumer_dropped: false,
-            },
-        ));
-    }
-
-    // Emit the first generated token. A ConsumerDropped here only happens in
-    // the streaming variant; non-streaming callers always return Continue.
-    // Matches the original streaming behavior exactly: the token IS pushed,
-    // emitted_tokens=1, then we abort with consumer_dropped=true.
-    tokens.push(next_token);
-    let mut emitted_tokens = 1usize;
-    if let SinkControl::ConsumerDropped = on_emit(next_token) {
-        return Ok((
-            tokens,
-            StreamingStats {
-                emitted_tokens,
-                hit_eos: false,
-                consumer_dropped: true,
-            },
-        ));
-    }
-
-    let tpot_start = Instant::now();
-    let mut generated_count = 0;
-    let mut hit_eos = false;
-    for i in 1..max_new_tokens {
-        let _decode_span = if matches!(trace, TraceMode::Full | TraceMode::Streaming) {
-            Some(
-                LocalSpan::enter_with_local_parent("decode_step")
-                    .with_property(|| ("step", i.to_string())),
-            )
-        } else {
-            None
-        };
-        model.forward_decode(*tokens.last().unwrap(), state)?;
-        let (next_token, next_lp) = sample(state, rng)?;
-
-        // Observe BEFORE stop-check (preserves logprob recording for the stop token).
-        on_sampled(next_token, next_lp);
-
-        if !params.ignore_eos && model.is_stop_token(next_token) {
-            hit_eos = true;
-            break;
-        }
-
-        tokens.push(next_token);
-        generated_count += 1;
-        emitted_tokens += 1;
-
-        if let SinkControl::ConsumerDropped = on_emit(next_token) {
-            return Ok((
-                tokens,
-                StreamingStats {
-                    emitted_tokens,
-                    hit_eos: false,
-                    consumer_dropped: true,
-                },
-            ));
-        }
-    }
-
-    if generated_count > 0 {
-        let tpot_total = tpot_start.elapsed();
-        let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-        if matches!(trace, TraceMode::Full) {
-            LocalSpan::add_properties(|| {
-                [
-                    ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
-                    ("generated_tokens", generated_count.to_string()),
-                    (
-                        "tok_per_sec",
-                        format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
-                    ),
-                ]
-            });
-        }
-        if emit_debug {
-            debug!(
-                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-                tpot_avg * 1000.0,
-                generated_count,
-                tpot_total.as_secs_f64() * 1000.0,
-                generated_count as f64 / tpot_total.as_secs_f64()
-            );
-        }
-    }
-
-    Ok((
-        tokens,
-        StreamingStats {
-            emitted_tokens,
-            hit_eos,
-            consumer_dropped: false,
-        },
-    ))
-}
-
-// ============================================================================
-// Model inference engine — shared complete/complete_stream logic
-// ============================================================================
-
-/// Legacy single-request inference engine.
-///
-/// **Deprecated**: Use [`crate::scheduler::Scheduler`] for production serving.
-/// `ModelInferenceEngine` processes one request at a time with no batching or
-/// continuous scheduling. It remains for the agent CLI REPL and E2E tests.
-/// New features should target the `Scheduler` path.
-#[cfg(feature = "cuda")]
-pub struct ModelInferenceEngine<M: ModelForward> {
-    model_id: String,
-    model: M,
-    state: M::State,
-    tokenizer: Tokenizer,
-    rng: StdRng,
-    /// Cached prompt tokens from the last request for prefix reuse.
-    cached_prompt: Vec<u32>,
-}
-
-#[cfg(feature = "cuda")]
-impl<M: ModelForward> ModelInferenceEngine<M> {
-    fn from_model_components(
-        components: crate::backend::cuda::bootstrap::ModelComponents<M>,
-        seed: u64,
-    ) -> Result<Self> {
-        let crate::backend::cuda::bootstrap::ModelComponents {
-            model_id,
-            tokenizer,
-            model,
-        } = components;
-        let state = model.create_state()?;
-        let rng = StdRng::seed_from_u64(seed);
-        Ok(Self {
-            model_id,
-            model,
-            state,
-            tokenizer,
-            rng,
-            cached_prompt: Vec::new(),
-        })
-    }
-
-    /// Prepare state for a new request, reusing cached KV prefix where possible.
-    ///
-    /// Returns the tokens that still need to be processed (the non-cached suffix)
-    /// and the prefix length that was reused.
-    ///
-    /// Key optimizations:
-    /// - **Full prefix hit**: Reuse entire cached KV, only prefill the new suffix.
-    /// - **Partial prefix hit**: Truncate KV to the common prefix (no full reset),
-    ///   then prefill from the divergence point. Saves re-computing the shared part.
-    fn prepare_with_prefix_cache(&mut self, prompt_tokens: &[u32]) -> Result<(Vec<u32>, usize)> {
-        let cached_len = self.cached_prompt.len();
-        let prefix_len = self
-            .cached_prompt
-            .iter()
-            .zip(prompt_tokens.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        match choose_prefix_reuse_action(
-            prompt_tokens.len(),
-            cached_len,
-            prefix_len,
-            self.state.supports_partial_prefix(),
-        ) {
-            PrefixReuseAction::Miss => {
-                info!("KV prefix cache MISS: resetting");
-                self.state.reset()?;
-                self.cached_prompt.clear();
-                Ok((prompt_tokens.to_vec(), 0))
-            }
-            PrefixReuseAction::FullRecompute => {
-                let reason = if prefix_len > 0 && prefix_len == prompt_tokens.len() {
-                    "cached prompt has extra suffix"
-                } else {
-                    "non-truncatable state"
-                };
-                info!(
-                    "KV prefix cache FULL/PARTIAL HIT: {} , falling back to full prefill",
-                    reason
-                );
-                self.state.reset()?;
-                self.cached_prompt.clear();
-                Ok((prompt_tokens.to_vec(), 0))
-            }
-            PrefixReuseAction::ReplayFinalToken { replay_from: _ } => {
-                // Exact prompt match. Rewinding to N-1 and replaying the final
-                // token via a single-token forward_prefill is not numerically
-                // identical to a cold batch prefill of the same N tokens —
-                // FlashInfer and the attention prep kernels produce
-                // slightly different position-N-1 logits at batch=1 vs batch=N,
-                // and greedy argmax flips. See
-                // `docs/experience/errors/2026-04-15-e2e-phase3-replay-drift.md`.
-                // Fall back to a full recompute: correctness over the ~one
-                // prefill saved, which only ever helps exact-same-prompt
-                // retries in the single-request engine.
-                info!(
-                    "KV prefix cache FULL HIT: exact match, falling back to full recompute for numerical consistency"
-                );
-                self.state.reset()?;
-                self.cached_prompt.clear();
-                Ok((prompt_tokens.to_vec(), 0))
-            }
-            PrefixReuseAction::ReuseFullCachedPrefix { prefix_len } => {
-                if self.state.supports_partial_prefix() {
-                    self.state.truncate_to(prefix_len)?;
-                }
-                match self.state.restore_prefix_snapshot() {
-                    Ok(true) => {
-                        info!(
-                            "KV prefix cache HIT: restored clean prompt snapshot for {}/{} reused tokens",
-                            prefix_len,
-                            prompt_tokens.len()
-                        );
-                    }
-                    Ok(false) if self.state.supports_partial_prefix() => {
-                        info!(
-                            "KV prefix cache HIT: reusing {}/{} tokens (saving {:.1}% prefill)",
-                            prefix_len,
-                            prompt_tokens.len(),
-                            prefix_len as f64 / prompt_tokens.len() as f64 * 100.0
-                        );
-                    }
-                    Ok(false) => {
-                        log::warn!(
-                            "KV prefix cache HIT: snapshot missing for non-truncatable state, falling back to full prefill"
-                        );
-                        self.state.reset()?;
-                        self.cached_prompt.clear();
-                        return Ok((prompt_tokens.to_vec(), 0));
-                    }
-                    Err(e) if self.state.supports_partial_prefix() => {
-                        log::warn!(
-                            "KV prefix cache HIT: snapshot restore failed ({}), continuing with truncation-only reuse",
-                            e
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "KV prefix cache HIT: snapshot restore failed for non-truncatable state ({}), falling back to full prefill",
-                            e
-                        );
-                        self.state.reset()?;
-                        self.cached_prompt.clear();
-                        return Ok((prompt_tokens.to_vec(), 0));
-                    }
-                }
-                Ok((prompt_tokens[prefix_len..].to_vec(), prefix_len))
-            }
-            PrefixReuseAction::PartialReuse { prefix_len } => {
-                // Partial prefix hit — truncate KV to common prefix and reuse it.
-                // This avoids re-computing the shared prefix entirely.
-                info!(
-                    "KV prefix cache PARTIAL: reusing {}/{} common tokens, truncating {} stale tokens",
-                    prefix_len,
-                    prompt_tokens.len(),
-                    self.cached_prompt.len() - prefix_len,
-                );
-                self.state.truncate_to(prefix_len)?;
-                self.cached_prompt.truncate(prefix_len);
-                Ok((prompt_tokens[prefix_len..].to_vec(), prefix_len))
-            }
-        }
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
-        let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        let (effective, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
-        let want_logprobs = req.logprobs && req.sampling.is_greedy();
-        let mut token_logprobs: Vec<f32> = Vec::new();
-        let (output_tokens, _stats) = generate_inner(
-            &self.model,
-            &mut self.state,
-            &effective,
-            req.max_tokens,
-            &req.sampling,
-            &mut self.rng,
-            want_logprobs,
-            if want_logprobs {
-                TraceMode::Silent
-            } else {
-                TraceMode::Full
-            },
-            |_token, lp| {
-                if want_logprobs && let Some(lp) = lp {
-                    token_logprobs.push(lp);
-                }
-            },
-            |_token| SinkControl::Continue,
-        )?;
-        // Update cached prompt for next request.
-        self.cached_prompt = prompt_tokens.clone();
-        // output_tokens = effective_prompt + generated tokens
-        let completion_tokens = output_tokens.len().saturating_sub(effective.len());
-        let mut text = self.tokenizer.decode(&output_tokens[effective.len()..])?;
-        let mut finish_reason = if completion_tokens >= req.max_tokens {
-            FinishReason::Length
-        } else {
-            FinishReason::Stop
-        };
-        if let Some(ref stops) = req.stop
-            && let Some(truncated) = truncate_at_first_stop(&text, stops)
-        {
-            text = truncated;
-            finish_reason = FinishReason::Stop;
-        }
-        let usage = TokenUsage {
-            prompt_tokens: prompt_tokens.len(),
-            completion_tokens,
-            total_tokens: output_tokens.len(),
-        };
-        Ok(CompletionOutput {
-            text,
-            finish_reason,
-            usage,
-            token_logprobs,
-        })
-    }
-
-    fn complete_stream(
-        &mut self,
-        req: CompletionRequest,
-        tx: UnboundedSender<CompletionStreamDelta>,
-    ) -> Result<()> {
-        let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        let (tokens_to_process, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
-        let effective_prompt = if tokens_to_process.is_empty() {
-            vec![*prompt_tokens.last().unwrap()]
-        } else {
-            tokens_to_process
-        };
-        let mut decoder = self.tokenizer.incremental_decoder();
-        let mut decode_error = None;
-        let stops: Option<Vec<&str>> = req.stop.as_ref().map(|v| {
-            v.iter()
-                .map(String::as_str)
-                .filter(|s| !s.is_empty())
-                .collect()
-        });
-        let mut sent_len: usize = 0;
-        let stopped_by_stop_sequence = std::cell::Cell::new(false);
-
-        let mut on_token = |token_id: u32| match decoder.step(token_id) {
-            Ok(Some(text_delta)) => {
-                if let Some(ref stop_list) = stops {
-                    let new_full = {
-                        let emitted = decoder.emitted_text();
-                        emitted.to_string()
-                    };
-                    if let Some((to_send, stopped)) =
-                        truncate_at_stop(&new_full, sent_len, stop_list)
-                    {
-                        if !to_send.is_empty()
-                            && tx
-                                .send(CompletionStreamDelta {
-                                    text_delta: to_send,
-                                    finish_reason: None,
-                                    usage: None,
-                                    logprob: None,
-                                })
-                                .is_err()
-                        {
-                            return false;
-                        }
-                        sent_len = new_full.len() - stopped.len();
-                        stopped_by_stop_sequence.set(true);
-                        return false;
-                    }
-                    let to_send = &new_full[sent_len..];
-                    sent_len = new_full.len();
-                    tx.send(CompletionStreamDelta {
-                        text_delta: to_send.to_string(),
-                        finish_reason: None,
-                        usage: None,
-                        logprob: None,
-                    })
-                    .is_ok()
-                } else {
-                    tx.send(CompletionStreamDelta {
-                        text_delta,
-                        finish_reason: None,
-                        usage: None,
-                        logprob: None,
-                    })
-                    .is_ok()
-                }
-            }
-            Ok(None) => true,
-            Err(err) => {
-                decode_error = Some(err);
-                false
-            }
-        };
-        let (_tokens, stats) = generate_inner(
-            &self.model,
-            &mut self.state,
-            &effective_prompt,
-            req.max_tokens,
-            &req.sampling,
-            &mut self.rng,
-            false,
-            TraceMode::Streaming,
-            |_token, _lp| {},
-            |token| {
-                if on_token(token) {
-                    SinkControl::Continue
-                } else {
-                    SinkControl::ConsumerDropped
-                }
-            },
-        )?;
-
-        if let Some(err) = decode_error {
-            return Err(err);
-        }
-
-        if stats.consumer_dropped && !stopped_by_stop_sequence.get() {
-            return Ok(());
-        }
-
-        if !stopped_by_stop_sequence.get()
-            && let Some(text_delta) = decoder.finish()?
-        {
-            if let Some(ref stop_list) = stops {
-                let new_full = decoder.emitted_text().to_string();
-                if let Some((to_send, _)) = truncate_at_stop(&new_full, sent_len, stop_list) {
-                    if !to_send.is_empty() {
-                        let _ = tx.send(CompletionStreamDelta {
-                            text_delta: to_send,
-                            finish_reason: None,
-                            usage: None,
-                            logprob: None,
-                        });
-                    }
-                } else {
-                    let to_send = &new_full[sent_len..];
-                    if !to_send.is_empty() {
-                        let _ = tx.send(CompletionStreamDelta {
-                            text_delta: to_send.to_string(),
-                            finish_reason: None,
-                            usage: None,
-                            logprob: None,
-                        });
-                    }
-                }
-            } else {
-                let _ = tx.send(CompletionStreamDelta {
-                    text_delta,
-                    finish_reason: None,
-                    usage: None,
-                    logprob: None,
-                });
-            }
-        }
-
-        let finish_reason = if stopped_by_stop_sequence.get() || stats.hit_eos {
-            FinishReason::Stop
-        } else {
-            FinishReason::Length
-        };
-
-        let _ = tx.send(CompletionStreamDelta {
-            text_delta: String::new(),
-            finish_reason: Some(finish_reason),
-            usage: Some(TokenUsage {
-                prompt_tokens: prompt_tokens.len(),
-                completion_tokens: stats.emitted_tokens,
-                total_tokens: prompt_tokens.len() + stats.emitted_tokens,
-            }),
-            logprob: None,
-        });
-
-        // Update cached prompt for next request.
-        self.cached_prompt = prompt_tokens;
-
-        Ok(())
-    }
-}
-
-// ============================================================================
 // Public engine constructors
 // ============================================================================
-
-#[cfg(feature = "cuda")]
-pub type Qwen3InferenceEngine = ModelInferenceEngine<Qwen3Model>;
-#[cfg(feature = "cuda")]
-pub type Qwen35InferenceEngine = ModelInferenceEngine<Qwen35Model>;
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
 pub struct BackendInferenceEngine<B: InferenceBackend> {
@@ -1185,15 +456,6 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub enum LoadedInferenceEngine {
-    #[cfg(feature = "cuda")]
-    Qwen3(Qwen3InferenceEngine),
-    #[cfg(feature = "cuda")]
-    Qwen35(Qwen35InferenceEngine),
-    /// Qwen3.5-MoE (Qwen3.6-35B-A3B) — reuses the Qwen35 engine type since
-    /// only the MLP block differs. Loader for this variant is a `todo!()`
-    /// stub under CUDA; the Metal path does not route through here.
-    #[cfg(feature = "cuda")]
-    Qwen35Moe(Qwen35InferenceEngine),
     /// Unified CUDA variant: drives the multi-request scheduler runtime
     /// through the same `RequestHandle` contract as Metal. The held
     /// `SchedulerRuntimeGuard` keeps the scheduler thread joined on drop.
@@ -1206,48 +468,6 @@ pub enum LoadedInferenceEngine {
     Metal(RequestHandleInferenceEngine<MetalSchedulerHandle>),
     #[cfg(feature = "cpu")]
     Cpu(BackendInferenceEngine<CpuBackend>),
-}
-
-#[cfg(feature = "cuda")]
-impl Qwen3InferenceEngine {
-    pub fn load(model_path: &str, seed: u64) -> Result<Self> {
-        Self::load_with_options(model_path, seed, InferenceEngineOptions::default())
-    }
-
-    pub fn load_with_options(
-        model_path: &str,
-        seed: u64,
-        options: InferenceEngineOptions,
-    ) -> Result<Self> {
-        let components =
-            crate::backend::cuda::bootstrap::load_qwen3_components(model_path, options)?;
-        Self::from_model_components(components, seed)
-    }
-
-    pub fn vocab_size(&self) -> usize {
-        self.tokenizer.vocab_size()
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Qwen35InferenceEngine {
-    pub fn load(model_path: &str, seed: u64) -> Result<Self> {
-        Self::load_with_options(model_path, seed, InferenceEngineOptions::default())
-    }
-
-    pub fn load_with_options(
-        model_path: &str,
-        seed: u64,
-        options: InferenceEngineOptions,
-    ) -> Result<Self> {
-        let components =
-            crate::backend::cuda::bootstrap::load_qwen35_components(model_path, options)?;
-        Self::from_model_components(components, seed)
-    }
-
-    pub fn vocab_size(&self) -> usize {
-        self.tokenizer.vocab_size()
-    }
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -1287,10 +507,9 @@ impl LoadedInferenceEngine {
         seed: u64,
         options: InferenceEngineOptions,
     ) -> Result<Self> {
-        // All CUDA loads now route through the unified scheduler runtime.
-        // The legacy `Qwen3 / Qwen35 / Qwen35Moe` variants remain on the
-        // enum only until commit 3d (deletion) — no construction site
-        // produces them anymore.
+        // All CUDA loads route through the unified multi-request scheduler
+        // runtime via the `RequestHandle` contract — same path the HTTP
+        // server uses through `spawn_scheduler_handle_from_path`.
         let runtime = crate::backend::cuda::bootstrap::ServerRuntimeConfig {
             engine: options,
             seed,
@@ -1310,29 +529,11 @@ impl LoadedInferenceEngine {
     pub fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen35Moe(_) | Self::Cuda { .. } => "cuda",
+            Self::Cuda { .. } => "cuda",
             #[cfg(feature = "metal")]
             Self::Metal(_) => "metal",
             #[cfg(feature = "cpu")]
             Self::Cpu(_) => "cpu",
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn model_type(&self) -> ModelType {
-        match self {
-            Self::Qwen3(_) => ModelType::Qwen3,
-            Self::Qwen35(_) => ModelType::Qwen35,
-            Self::Qwen35Moe(_) => ModelType::Qwen35Moe,
-            // The unified `Cuda` variant is type-erased over models — the
-            // scheduler runtime does not surface the legacy `ModelType` enum.
-            Self::Cuda { .. } => {
-                unreachable!("model_type is not defined for the unified Cuda variant")
-            }
-            #[cfg(feature = "metal")]
-            Self::Metal(_) => unreachable!("model_type is only defined for CUDA engines"),
-            #[cfg(feature = "cpu")]
-            Self::Cpu(_) => unreachable!("model_type is only defined for CUDA engines"),
         }
     }
 }
@@ -1341,12 +542,6 @@ impl LoadedInferenceEngine {
 impl InferenceEngine for LoadedInferenceEngine {
     fn model_id(&self) -> &str {
         match self {
-            #[cfg(feature = "cuda")]
-            Self::Qwen3(engine) => engine.model_id(),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35(engine) => engine.model_id(),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35Moe(engine) => engine.model_id(),
             #[cfg(feature = "cuda")]
             Self::Cuda { engine, .. } => engine.model_id(),
             #[cfg(feature = "metal")]
@@ -1358,12 +553,6 @@ impl InferenceEngine for LoadedInferenceEngine {
 
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
         match self {
-            #[cfg(feature = "cuda")]
-            Self::Qwen3(engine) => engine.complete(req),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35(engine) => engine.complete(req),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35Moe(engine) => engine.complete(req),
             #[cfg(feature = "cuda")]
             Self::Cuda { engine, .. } => engine.complete(req),
             #[cfg(feature = "metal")]
@@ -1380,12 +569,6 @@ impl InferenceEngine for LoadedInferenceEngine {
     ) -> Result<()> {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Qwen3(engine) => engine.complete_stream(req, tx),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35(engine) => engine.complete_stream(req, tx),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35Moe(engine) => engine.complete_stream(req, tx),
-            #[cfg(feature = "cuda")]
             Self::Cuda { engine, .. } => engine.complete_stream(req, tx),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete_stream(req, tx),
@@ -1394,9 +577,6 @@ impl InferenceEngine for LoadedInferenceEngine {
         }
     }
 }
-
-#[cfg(feature = "cuda")]
-impl<M: ModelForward> SessionPersistence for ModelInferenceEngine<M> {}
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
 impl<B: InferenceBackend> SessionPersistence for BackendInferenceEngine<B> {}
@@ -1408,11 +588,7 @@ impl SessionPersistence for LoadedInferenceEngine {}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "cuda", test))]
-    use super::truncate_at_stop;
     use super::{FinishReason, model_id_from_path, parse_finish_reason, truncate_at_first_stop};
-    #[cfg(any(feature = "cuda", test))]
-    use super::{PrefixReuseAction, choose_prefix_reuse_action};
 
     #[test]
     fn test_truncate_at_first_stop() {
@@ -1439,21 +615,6 @@ mod tests {
         assert_eq!(
             truncate_at_first_stop("ab", &["ab".to_string()]),
             Some(String::new())
-        );
-    }
-
-    #[cfg(any(feature = "cuda", test))]
-    #[test]
-    fn test_truncate_at_stop() {
-        let stops = ["\n"];
-        assert_eq!(
-            truncate_at_stop("hello\n", 0, &stops),
-            Some(("hello".to_string(), "\n"))
-        );
-        assert_eq!(truncate_at_stop("hello", 0, &stops), None);
-        assert_eq!(
-            truncate_at_stop("ab\n", 2, &stops),
-            Some((String::new(), "\n"))
         );
     }
 
@@ -2103,37 +1264,5 @@ mod tests {
         assert_eq!(parse_finish_reason("length"), FinishReason::Length);
         assert_eq!(parse_finish_reason("stop"), FinishReason::Stop);
         assert_eq!(parse_finish_reason("tool_calls"), FinishReason::Stop);
-    }
-
-    #[test]
-    fn choose_prefix_reuse_action_covers_scheduler_aligned_cases() {
-        assert_eq!(
-            choose_prefix_reuse_action(4, 4, 4, true),
-            PrefixReuseAction::ReplayFinalToken { replay_from: 3 }
-        );
-        assert_eq!(
-            choose_prefix_reuse_action(4, 4, 4, false),
-            PrefixReuseAction::FullRecompute
-        );
-        assert_eq!(
-            choose_prefix_reuse_action(6, 4, 4, true),
-            PrefixReuseAction::ReuseFullCachedPrefix { prefix_len: 4 }
-        );
-        assert_eq!(
-            choose_prefix_reuse_action(6, 5, 3, true),
-            PrefixReuseAction::PartialReuse { prefix_len: 3 }
-        );
-        assert_eq!(
-            choose_prefix_reuse_action(6, 5, 3, false),
-            PrefixReuseAction::FullRecompute
-        );
-        assert_eq!(
-            choose_prefix_reuse_action(3, 5, 3, true),
-            PrefixReuseAction::FullRecompute
-        );
-        assert_eq!(
-            choose_prefix_reuse_action(5, 5, 0, true),
-            PrefixReuseAction::Miss
-        );
     }
 }
