@@ -39,11 +39,11 @@ const DEFAULT_DISCOVERY_CANDIDATES: &[&str] = &[
 ///
 /// Returns the path to the directory that contains `config.json` and weight files.
 ///
-/// Short-circuit: if the input *looks like* a filesystem path
-/// (see [`looks_like_local_path`]) but that path does not exist locally, the
-/// call fails immediately with a clear error rather than falling through to
-/// a HuggingFace Hub download. Repo-id inputs (e.g. `Qwen/Qwen3-0.6B`) still
-/// fall through to the hub as before.
+/// Short-circuit: if the input *looks like* a filesystem path (see the
+/// private `looks_like_local_path` helper below) but that path does not
+/// exist locally, the call fails immediately with a clear error rather than
+/// falling through to a HuggingFace Hub download. Repo-id inputs (e.g.
+/// `Qwen/Qwen3-0.6B`) still fall through to the hub as before.
 pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     if let Some(local) = resolve_local_model_path(model_id_or_path) {
         log::info!("Using local model path: {}", local.display());
