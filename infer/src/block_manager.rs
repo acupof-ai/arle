@@ -3,8 +3,9 @@
 //! # Overview
 //!
 //! This module is used by the standalone CPU accounting scheduler in
-//! [`crate::scheduler::batch`]. It tracks fixed-size KV blocks and can
-//! describe swap plans, but it is **not** the production multilayer KV path.
+//! `crate::scheduler::batch` (private module; no intra-doc link). It tracks
+//! fixed-size KV blocks and can describe swap plans, but it is **not** the
+//! production multilayer KV path.
 //! The serving/runtime path uses:
 //! - [`crate::prefix_cache::RadixCache`] for block metadata and reuse
 //! - [`crate::kv_tier`] for tier transitions
