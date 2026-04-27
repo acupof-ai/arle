@@ -19,22 +19,80 @@ Related governance docs:
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-04-27
+
+Engine consolidation, Metal GGUF perf, train binary migration, and a
+v2 landing site. Pre-built artifacts on the
+[GitHub Release page](https://github.com/cklxx/arle/releases/tag/v0.1.2)
+and on GHCR (`ghcr.io/cklxx/arle:0.1.2`, `:0.1`, `:latest`).
+
 ### Runtime
 
+- `ModelInferenceEngine` and per-model aliases removed; everything now
+  routes through `LoadedInferenceEngine`. The scheduler grew a unified
+  `Cuda(RequestHandle)` variant so CUDA drives the same path as Metal.
+- E2E tests migrated to the `LoadedInferenceEngine` scheduler path,
+  matching the runtime that production serves use.
+- Unused `PreemptionMode` enum and config field dropped from the
+  scheduler — the unification project chose tier demote/promote over
+  the separate preemption type.
+- `kv-tier` gained a `WholeKv` variant on `ReadmissionPlan` plus a
+  `PlanKind` discriminator; the Plan path is documented as
+  reserved-for-distributed scaffolding (no runtime change).
 - Metal Qwen3.5-0.8B GGUF Q4_K_M decode now crosses 200 tok/s on M4 Pro
-  (211.7 tok/s for 512 prompt / 1024 decode) after Q5_K/Q8_0 affine repack
-  and Q6/group16 qmv tile tuning. Evidence:
+  (211.7 tok/s for 512 prompt / 1024 decode) after Q5_K/Q8_0 affine
+  repack and Q6/group16 qmv tile tuning. Evidence:
   [`docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md`](docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md).
-- Qwen3.6-35B-A3B Metal was rechecked locally. Baseline decode was about
-  63 tok/s on the short 32/256 shape; DFlash did not improve paired TPOT
-  (15.23 ms -> 15.45 ms), so Qwen3.6 speculative decode remains experimental.
-  Evidence:
+- Qwen3.6-35B-A3B Metal rechecked locally — baseline decode about 63
+  tok/s on the short 32/256 shape; DFlash did not improve paired TPOT
+  (15.23 ms → 15.45 ms), so Qwen3.6 speculative decode remains
+  Experimental. Evidence:
   [`docs/experience/wins/2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md`](docs/experience/wins/2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md).
 
-### Docs
+### HTTP
 
-- README, roadmap, support matrix, and maintainer docs now share the same
-  Metal GGUF support and benchmark wording.
+- `session_id` now threads through `CompletionRequest`; the hardcoded
+  `None` in the OpenAI-compatible handlers is gone.
+
+### Metal
+
+- Qwen3.5 GGUF decode path tuned (perf); Q4/Q6 weights are now repacked
+  into MLX affine layout at load time so decode hits the fast kernel.
+- `qwen35` GGUF projections kept packed end-to-end (avoids a redundant
+  unpack/repack round-trip).
+- Metal GGUF decode status doc refreshed under
+  `infer/src/backend/metal/AGENTS.md`.
+
+### Train
+
+- `crates/train/src/bin/*` moved to `crates/train/src/commands/*` —
+  `arle train …` and `arle data …` are the only entry points; the
+  `[[bin]]` declarations in `crates/train/Cargo.toml` are gone.
+
+### Docs & web
+
+- Landing site v2: 3-pane docs shell + Quickstart page; homepage
+  split-layout hero with dark footer and framed sections; logo
+  redrawn as a two-story humanist 'a'; wordmark swapped for topology
+  mark with v2 design tokens.
+- Install cards on the landing site now lead with `brew install
+  cklxx/tap/arle` and the `curl | sh` installer (Docker / source
+  demoted to fallbacks).
+- README, roadmap, support matrix, and maintainer docs now share the
+  same Metal GGUF support and benchmark wording.
+- Intra-doc links cleaned up for `rustdoc -D warnings`: links from
+  `kv-tier` and elsewhere now resolve to public items only.
+- `CONTRIBUTING.md` Getting Started leads with an end-user pointer to
+  the README install section so contributors don't assume source
+  build is the canonical path.
+
+### Tooling
+
+- Homebrew formula in `cklxx/homebrew-tap` simplified to macOS-arm64
+  only. The `mislav/bump-homebrew-formula-action` only bumps one URL,
+  so a multi-platform formula went stale on every release; Linux
+  brew users for a CUDA-driven tool are vanishingly rare (Docker /
+  install.sh / source cover that path).
 
 ## [0.1.1] — 2026-04-27
 
