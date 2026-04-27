@@ -618,3 +618,49 @@ tilelang_prefill_hd256_decl!(
     tilelang_batch_prefill_paged_hd256_q16_kv2_run_cuda,
     tilelang_batch_prefill_paged_hd256_q16_kv4_run_cuda,
 );
+
+// HD256 decode — same FFI shape as the HD256/HD128 prefill macros (the
+// kernels share `gen_tilelang_aot.py`'s wrapper fill rules); only the cubin
+// internals differ (qlen=1 grid, no causal mask). A separate macro keeps
+// symbol scoping clean. Adding a new Qwen3.5 head config requires extending
+// all three:
+//   - SUPPORTED_HEADS in tools/tilelang/batch_decode_paged_hd256.py
+//   - TILELANG_DECODE_HD256_HEAD_CONFIGS in cuda-kernels/build.rs
+//   - the macro invocation below + the dispatch arm in attention.rs
+#[cfg(feature = "tilelang-attn")]
+macro_rules! tilelang_decode_hd256_decl {
+    ($($name:ident),+ $(,)?) => {
+        unsafe extern "C" {
+            $(
+                #[allow(dead_code)]
+                pub fn $name(
+                    q: *mut Half,
+                    q_indptr: *const i32,
+                    k_pool: *mut Half,
+                    v_pool: *mut Half,
+                    kv_indptr: *const i32,
+                    kv_indices: *const i32,
+                    kv_last_page_len: *const i32,
+                    o: *mut Half,
+                    batch_size: i32,
+                    total_q_tokens: i32,
+                    max_qlen: i32,
+                    num_pages: i32,
+                    total_pages: i32,
+                    num_q_heads: i32,
+                    num_kv_heads: i32,
+                    page_size: i32,
+                    sm_scale: f32,
+                    stream: CUstream,
+                ) -> CUresult;
+            )+
+        }
+    };
+}
+
+#[cfg(feature = "tilelang-attn")]
+tilelang_decode_hd256_decl!(
+    tilelang_batch_decode_paged_hd256_q8_kv2_run_cuda,
+    tilelang_batch_decode_paged_hd256_q16_kv2_run_cuda,
+    tilelang_batch_decode_paged_hd256_q16_kv4_run_cuda,
+);

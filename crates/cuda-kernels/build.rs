@@ -599,6 +599,14 @@ const TILELANG_PREFILL_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (
 /// `infer/src/ops/attention.rs`.
 const TILELANG_PREFILL_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16, 4)];
 
+/// One AOT-specialized decode HD256 kernel per (num_q_heads, num_kv_heads).
+/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd256.py`
+/// — when adding a new Qwen3.5 full-attn head config, extend both lists in
+/// lockstep AND add the matching FFI extern + dispatch arm in
+/// `crates/cuda-kernels/src/ffi/attention.rs` and
+/// `infer/src/ops/attention.rs`.
+const TILELANG_DECODE_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16, 4)];
+
 struct TileLangKernelSpec {
     artifact_dir: String,
     kernel_path: &'static str,
@@ -841,6 +849,29 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         generated_sources.push(c_path);
     }
 
+    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
+            kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
+            kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
+            out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
+            num_q_heads: q,
+            num_kv_heads: kv,
+        };
+        let (_func, c_path) = generate_tilelang_artifacts(
+            &python,
+            out_dir,
+            &target,
+            cuda_arch,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &spec,
+        );
+        generated_sources.push(c_path);
+    }
+
     let mut build = cc::Build::new();
     build
         .cuda(false)
@@ -854,7 +885,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=TileLang AOT enabled: prefill HD128 + HD256 will dispatch to TileLang instead of FlashInfer."
+        "cargo:warning=TileLang AOT enabled: prefill HD128 + HD256 and decode HD256 will dispatch to TileLang instead of FlashInfer."
     );
     for entry in std::fs::read_dir("tools/tilelang")
         .expect("tools/tilelang directory must exist")
