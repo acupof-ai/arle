@@ -1,12 +1,9 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::ExitCode,
-};
+use std::path::{Path, PathBuf};
 
 use autograd::{AutogradError, Tape, TensorStore};
 use thiserror::Error;
-use train::{
+
+use crate::{
     CausalLm, GrpoPolicyConfig,
     causal_lm::build_registry,
     cli_args::{ArgError, BackendChoice, next_value, parse_value},
@@ -63,7 +60,7 @@ enum CliError {
     #[error(transparent)]
     Qwen35Config(#[from] Qwen35ConfigError),
     #[error(transparent)]
-    EvalLm(#[from] train::eval_lm::EvalLmError),
+    EvalLm(#[from] crate::eval_lm::EvalLmError),
     #[error("{0}")]
     Custom(String),
 }
@@ -115,23 +112,7 @@ impl EvalFamily for Qwen35Family {
     }
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("[eval_lm] error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), CliError> {
-    let args = parse_args()?;
-    run_with_args(args)
-}
-
-#[allow(dead_code)]
-pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
+pub fn dispatch_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -235,10 +216,6 @@ fn run_with_family<F: EvalFamily>(args: &CliArgs, config_path: &Path) -> Result<
     );
 
     Ok(())
-}
-
-fn parse_args() -> Result<CliArgs, CliError> {
-    parse_args_from(env::args().skip(1))
 }
 
 fn parse_args_from<I>(mut iter: I) -> Result<CliArgs, CliError>

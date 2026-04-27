@@ -6,3 +6,5 @@
 pub mod convert_dataset;
 #[path = "commands/download_dataset.rs"]
 pub mod download_dataset;
+#[path = "commands/eval_lm.rs"]
+pub mod eval_lm;
