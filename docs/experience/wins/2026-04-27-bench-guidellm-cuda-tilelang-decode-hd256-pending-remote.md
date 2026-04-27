@@ -21,8 +21,11 @@
 - The TileLang HD256 decode kernel mirrors the HD256 prefill kernel
   one-for-one on the FFI / dispatch side; the cubin internals differ only
   where the decode shape demands it: `BLOCK_M=1` (one Q row per request),
-  `BLOCK_N=64`, no causal mask (qlen=1 means the single Q row legally
-  attends to every KV position), grid `(1, num_q_heads, batch_size)`.
+  `BLOCK_N=32` (mirrors prefill HD256, fits L4 / sm_89 99 KB shmem cap;
+  amended after codex review on commit 02d0333 — the original BLOCK_N=64
+  spec hit ~128 KB and would not load on L4), no causal mask (qlen=1
+  means the single Q row legally attends to every KV position), grid
+  `(1, num_q_heads, batch_size)`.
   FlashAttention-2 online softmax + paged-KV walk are line-for-line the
   upstream `tile-ai/tilelang/examples/flash_attention/example_gqa_decode*`
   template the L4 floor wins entry (2026-04-26) told us to mirror.
