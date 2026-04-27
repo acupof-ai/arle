@@ -1,0 +1,100 @@
+---
+import Brand from "./Brand.astro";
+import type { TopNavLink } from "../data/content.ts";
+
+interface Props {
+  /** Path for the brand link (relative to BASE_URL). */
+  brandHref?: string;
+  /** Primary nav links. */
+  links?: TopNavLink[];
+  /** Build version chip (e.g. "v0.4.2"). */
+  version?: string;
+  /** Optional doc-specific suffix (e.g. "/ docs") next to brand. */
+  brandSuffix?: string;
+}
+const { brandHref = "", links = [], version, brandSuffix } = Astro.props;
+const base = import.meta.env.BASE_URL;
+const resolveHref = (href: string) =>
+  href.startsWith("http") || href.startsWith("#") || href.startsWith(base)
+    ? href
+    : `${base}${href.replace(/^\//, "")}`;
+const brandFullHref = brandHref.startsWith("http") ? brandHref : `${base}${brandHref.replace(/^\//, "")}`;
+---
+<nav class="topnav" aria-label="primary">
+  <a class="topnav-brand" href={brandFullHref}>
+    <Brand size={28} suffix={brandSuffix} />
+  </a>
+  {links.length > 0 && (
+    <div class="topnav-links">
+      {links.map((l) => (
+        <a href={resolveHref(l.href)}>{l.label}</a>
+      ))}
+    </div>
+  )}
+  <div class="topnav-right">
+    {version && <span class="topnav-ver">{version}</span>}
+    <a class="topnav-gh" href="https://github.com/cklxx/arle">
+      GitHub <span class="ar" aria-hidden="true">&#x2197;</span>
+    </a>
+  </div>
+</nav>
+<style>
+  .topnav {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: var(--paper);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    height: 56px;
+    padding: 0 24px;
+    gap: 32px;
+    font-family: var(--mono);
+  }
+  .topnav-brand {
+    color: var(--ink);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+  }
+  .topnav-brand:hover { color: var(--ink); }
+  .topnav-links {
+    display: flex;
+    gap: 24px;
+    font-size: 13px;
+  }
+  .topnav-links a {
+    color: var(--ink-soft);
+    text-decoration: none;
+    transition: color 100ms ease;
+  }
+  .topnav-links a:hover { color: var(--ink); }
+  .topnav-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 13px;
+  }
+  .topnav-ver {
+    font-size: 11px;
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+    padding: 2px 6px;
+  }
+  .topnav-gh {
+    color: var(--ink-soft);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .topnav-gh:hover { color: var(--ink); }
+  .topnav-gh .ar { font-size: 11px; opacity: 0.7; }
+
+  @media (max-width: 760px) {
+    .topnav { gap: 16px; padding: 0 16px; }
+    .topnav-links { display: none; }
+  }
+</style>

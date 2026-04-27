@@ -1,0 +1,313 @@
+---
+import type { Locale } from "../../data/content.ts";
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const base = import.meta.env.BASE_URL;
+
+const display = locale.hero.display;
+const stats = locale.hero.stats ?? [];
+const installLabel = locale.hero.installLabel ?? "install";
+const heroInstall = locale.sections.install.cards[0];
+const heroInstallSecondary = locale.sections.install.cards[1];
+
+// Compose the hero install block: brew block + curl block (single <pre>).
+const installLines = [
+  ...heroInstall.lines,
+  '<span class="c"># or — one-liner curl installer</span>',
+  ...(heroInstallSecondary?.lines ?? []),
+].join("\n");
+
+---
+<section class="hero" aria-label="banner">
+  <div class="hero-l">
+    <div>
+      <p class="hero-kicker">
+        <span class="dot" aria-hidden="true"></span>
+        {display ? display.status : locale.hero.kicker}
+      </p>
+      {display ? (
+        <h1 class="hero-h1">
+          {display.h1Lines.map((line, i) => (
+            <Fragment>
+              <span set:html={line} />
+              {i < display.h1Lines.length - 1 && <br />}
+            </Fragment>
+          ))}
+        </h1>
+      ) : (
+        <h1 class="sr-only">{locale.meta.title}</h1>
+      )}
+      <p class="hero-lede" set:html={display ? display.lede : locale.hero.tagline} />
+      <div class="hero-cta">
+        <a class="hero-btn-primary" href="#install">
+          $ {locale.hero.primaryCta}
+          <span class="ar" aria-hidden="true">&rarr;</span>
+        </a>
+        <a class="hero-btn-ghost" href={`${base}docs/`}>
+          {locale.lang === "zh-Hans" ? "阅读文档" : "Read the docs"}
+          <span class="ar" aria-hidden="true">&#x2197;</span>
+        </a>
+      </div>
+    </div>
+    <div class="hero-signals" aria-label="status chips">
+      {locale.hero.signals.map((s) => (
+        <span class={`sig sig-${s.status}`}>
+          <span set:html={s.kv} />
+        </span>
+      ))}
+    </div>
+  </div>
+
+  <div class="hero-r">
+    <div>
+      <div class="install-label">
+        <span>{installLabel}</span>
+        <span class="install-meta">{heroInstall.label}</span>
+      </div>
+      <pre class="install-pre" set:html={installLines}></pre>
+    </div>
+
+    {stats.length > 0 && (
+      <div class="perf" aria-label="benchmark snapshot">
+        {stats.map((s) => (
+          <div class="stat">
+            <span class="lbl">{s.lbl}</span>
+            <span class="num">{s.num}<span class="u">{s.unit}</span></span>
+            <span class="meta" set:html={s.meta}></span>
+          </div>
+        ))}
+      </div>
+    )}
+  </div>
+</section>
+<style>
+  .hero {
+    display: grid;
+    grid-template-columns: 1.1fr 1fr;
+    min-height: 720px;
+    border-bottom: 1px solid var(--line);
+  }
+  .hero-l {
+    padding: 96px 64px 64px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 48px;
+    min-width: 0;
+  }
+  .hero-r {
+    background: var(--ink);
+    color: var(--paper);
+    padding: 96px 64px 64px;
+    border-left: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+    min-width: 0;
+  }
+
+  .hero-kicker {
+    color: var(--ink-dim);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    margin: 0 0 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .hero-kicker .dot {
+    width: 6px;
+    height: 6px;
+    background: var(--ok);
+    border-radius: 50%;
+  }
+  .hero-h1 {
+    font-size: clamp(44px, 6.5vw, 96px);
+    line-height: 0.95;
+    letter-spacing: -0.045em;
+    margin: 0 0 32px;
+    font-weight: 700;
+    max-width: 14ch;
+    color: var(--ink);
+  }
+  .hero-h1 :global(.strike) {
+    display: inline-block;
+    position: relative;
+    padding: 0 0.05em;
+  }
+  .hero-h1 :global(.strike::after) {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0.18em;
+    height: 0.5em;
+    background: var(--hl);
+    z-index: -1;
+  }
+  .hero-h1 :global(em) {
+    font-style: italic;
+    font-weight: 400;
+    color: var(--ink-soft);
+  }
+  .hero-lede {
+    font-size: 17px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    max-width: 44ch;
+    margin: 0 0 40px;
+  }
+  .hero-lede :global(code) {
+    background: var(--paper-dim);
+    border: 1px solid var(--line);
+    padding: 0 6px;
+    font-weight: 500;
+    color: var(--ink);
+  }
+
+  .hero-cta {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+  }
+  .hero-btn-primary,
+  .hero-btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 18px;
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid var(--ink);
+    transition: all 100ms ease;
+    font-family: var(--mono);
+  }
+  .hero-btn-primary { background: var(--ink); color: var(--paper); }
+  .hero-btn-primary:hover { background: var(--paper); color: var(--ink); }
+  .hero-btn-ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+  .hero-btn-ghost:hover { border-color: var(--ink); }
+  .hero-cta .ar { font-size: 11px; opacity: 0.7; }
+
+  .hero-signals {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px 24px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    max-width: 520px;
+  }
+  .sig {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--ink-dim);
+  }
+  .sig::before {
+    content: "";
+    width: 6px; height: 6px;
+    background: var(--ok);
+    border-radius: 50%;
+    flex: none;
+    transform: translateY(-2px);
+  }
+  .sig.sig-warn::before { background: var(--warn); }
+  .sig :global(code) { color: var(--ink); font-weight: 500; }
+
+  /* hero-right install + perf */
+  .install-label {
+    font-size: 10px;
+    color: rgba(255,255,255,0.5);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    margin: 0 0 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+  .install-meta {
+    color: rgba(255,255,255,0.7);
+    padding: 2px 6px;
+    border: 1px solid rgba(255,255,255,0.15);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: none;
+  }
+  .install-pre {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: var(--paper);
+    margin: 0;
+    padding: 16px 20px;
+    font-size: 13px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-family: var(--mono);
+    overflow-x: auto;
+  }
+  .install-pre :global(.p) { color: rgba(255,255,255,0.45); user-select: none; }
+  .install-pre :global(.c) { color: rgba(255,255,255,0.5); }
+
+  .perf {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1px;
+    background: rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.12);
+    margin-top: auto;
+  }
+  .stat {
+    background: var(--ink);
+    padding: 24px 24px 20px;
+    min-height: 132px;
+    display: flex;
+    flex-direction: column;
+  }
+  .stat .lbl {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.5);
+    margin-bottom: 12px;
+  }
+  .stat .num {
+    font-size: 42px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1;
+    color: var(--paper);
+  }
+  .stat .num .u {
+    font-size: 14px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.6);
+    margin-left: 4px;
+    letter-spacing: 0;
+  }
+  .stat .meta {
+    margin-top: auto;
+    font-size: 11px;
+    color: rgba(255,255,255,0.55);
+    padding-top: 12px;
+  }
+  .stat .meta :global(b) { color: var(--paper); font-weight: 500; }
+
+  @media (max-width: 1100px) {
+    .hero { grid-template-columns: 1fr; min-height: 0; }
+    .hero-r { border-left: none; border-top: 1px solid var(--line); }
+    .hero-l, .hero-r { padding: 64px 32px; }
+  }
+  @media (max-width: 640px) {
+    .hero-l, .hero-r { padding: 48px 20px; }
+    .perf { grid-template-columns: 1fr; }
+    .hero-signals { grid-template-columns: 1fr; }
+  }
+</style>

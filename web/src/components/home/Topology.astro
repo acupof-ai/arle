@@ -1,0 +1,168 @@
+---
+import type { Locale } from "../../data/content.ts";
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const { topology } = locale.sections;
+const isZh = locale.lang === "zh-Hans";
+
+const colLabels = isZh
+  ? ["前门", "运行时主干", "Kernel 子 crate"]
+  : ["FRONT DOOR", "RUNTIME SPINE", "KERNEL CRATES"];
+
+const legendCells = isZh
+  ? [
+      { label: "stable", body: "<code>cuda-kernels</code> · <code>kv-native-sys</code>" },
+      { label: "beta",   body: "<code>mlx-sys</code> · Apple Silicon" },
+      { label: "contract", body: "OpenAI <code>v1</code> · <code>/metrics</code>" },
+    ]
+  : [
+      { label: "stable", body: "<code>cuda-kernels</code> · <code>kv-native-sys</code>" },
+      { label: "beta",   body: "<code>mlx-sys</code> · Apple Silicon" },
+      { label: "contract", body: "OpenAI <code>v1</code> · <code>/metrics</code>" },
+    ];
+---
+<div class="topo-wrap">
+  <div class="topo-side">
+    {topology.legend.map((leg) => (
+      <p set:html={leg.body} />
+    ))}
+  </div>
+
+  <div class="topo-stage">
+    <svg viewBox="0 0 800 360" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+      <defs>
+        <pattern id="topo-dot" x="0" y="0" width="16" height="16" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r="0.6" fill="rgba(10,10,10,0.10)" />
+        </pattern>
+      </defs>
+      <rect width="800" height="360" fill="url(#topo-dot)" />
+
+      <text x="100" y="36" font-family="var(--mono)" font-size="10" letter-spacing="2" fill="#737373">{colLabels[0]}</text>
+      <text x="380" y="36" font-family="var(--mono)" font-size="10" letter-spacing="2" fill="#737373">{colLabels[1]}</text>
+      <text x="640" y="36" font-family="var(--mono)" font-size="10" letter-spacing="2" fill="#737373">{colLabels[2]}</text>
+
+      <line x1="40"  y1="48" x2="220" y2="48" stroke="#0A0A0A" stroke-width="1" />
+      <line x1="320" y1="48" x2="500" y2="48" stroke="#0A0A0A" stroke-width="1" />
+      <line x1="600" y1="48" x2="780" y2="48" stroke="#0A0A0A" stroke-width="1" />
+
+      <!-- arle box (front door) -->
+      <rect x="40" y="80" width="200" height="240" fill="#FFFFFF" stroke="#0A0A0A" stroke-width="1.5" />
+      <text x="56" y="108" font-family="var(--mono)" font-size="20" font-weight="700" fill="#0A0A0A">arle</text>
+      <text x="56" y="124" font-family="var(--mono)" font-size="9" letter-spacing="2" fill="#737373">UNIFIED CLI</text>
+      <line x1="56" y1="138" x2="224" y2="138" stroke="#0A0A0A" stroke-width="1" stroke-dasharray="2 3" />
+      <text x="56" y="164" font-family="var(--mono)" font-size="13" fill="#0A0A0A">→ run</text>
+      <text x="56" y="194" font-family="var(--mono)" font-size="13" fill="#0A0A0A">→ serve</text>
+      <text x="56" y="224" font-family="var(--mono)" font-size="13" fill="#0A0A0A">→ train</text>
+      <text x="56" y="254" font-family="var(--mono)" font-size="13" fill="#0A0A0A">→ data</text>
+      <text x="56" y="296" font-family="var(--mono)" font-size="11" fill="#737373">--doctor</text>
+
+      <!-- arrow front door → runtime -->
+      <line x1="240" y1="200" x2="320" y2="200" stroke="#0A0A0A" stroke-width="1.5" />
+      <path d="M 314 194 L 322 200 L 314 206" fill="none" stroke="#0A0A0A" stroke-width="1.5" />
+
+      <!-- infer (runtime) -->
+      <rect x="320" y="80" width="180" height="240" fill="#0A0A0A" stroke="#0A0A0A" stroke-width="1.5" />
+      <text x="336" y="108" font-family="var(--mono)" font-size="20" font-weight="700" fill="#FFFFFF">infer</text>
+      <text x="336" y="124" font-family="var(--mono)" font-size="9" letter-spacing="2" fill="rgba(255,255,255,0.55)">RUNTIME SPINE</text>
+      <line x1="336" y1="138" x2="484" y2="138" stroke="rgba(255,255,255,0.25)" stroke-width="1" stroke-dasharray="2 3" />
+      <text x="336" y="164" font-family="var(--mono)" font-size="12" fill="#FFFFFF">scheduler</text>
+      <text x="336" y="190" font-family="var(--mono)" font-size="12" fill="#FFFFFF">loader · ops</text>
+      <text x="336" y="216" font-family="var(--mono)" font-size="12" fill="#FFFFFF">backend dispatch</text>
+      <text x="336" y="242" font-family="var(--mono)" font-size="12" fill="#FFFFFF">/v1/* http</text>
+      <text x="336" y="268" font-family="var(--mono)" font-size="12" fill="#FFFFFF">/metrics</text>
+      <text x="336" y="294" font-family="var(--mono)" font-size="11" fill="rgba(255,255,255,0.55)">OpenAI v1 compatible</text>
+
+      <!-- runtime → kernels arrows -->
+      <line x1="500" y1="140" x2="600" y2="120" stroke="#0A0A0A" stroke-width="1.5" />
+      <path d="M 596 114 L 602 120 L 595 124" fill="none" stroke="#0A0A0A" stroke-width="1.5" />
+      <line x1="500" y1="200" x2="600" y2="200" stroke="#0A0A0A" stroke-width="1.5" />
+      <path d="M 594 194 L 602 200 L 594 206" fill="none" stroke="#0A0A0A" stroke-width="1.5" />
+      <line x1="500" y1="260" x2="600" y2="280" stroke="#0A0A0A" stroke-width="1.5" />
+      <path d="M 595 276 L 602 280 L 596 286" fill="none" stroke="#0A0A0A" stroke-width="1.5" />
+
+      <!-- kernel boxes -->
+      <rect x="600" y="80"  width="180" height="72" fill="#FFFFFF" stroke="#0A0A0A" stroke-width="1.5" />
+      <text x="616" y="108" font-family="var(--mono)" font-size="14" font-weight="700" fill="#0A0A0A">cuda-kernels</text>
+      <text x="616" y="128" font-family="var(--mono)" font-size="11" fill="#737373">CUDA + Triton AOT</text>
+      <circle cx="762" cy="100" r="4" fill="#16A34A" />
+
+      <rect x="600" y="164" width="180" height="72" fill="#FFFFFF" stroke="#0A0A0A" stroke-width="1.5" />
+      <text x="616" y="192" font-family="var(--mono)" font-size="14" font-weight="700" fill="#0A0A0A">mlx-sys</text>
+      <text x="616" y="212" font-family="var(--mono)" font-size="11" fill="#737373">Apple Silicon C++ bridge</text>
+      <circle cx="762" cy="184" r="4" fill="#D97706" />
+
+      <rect x="600" y="248" width="180" height="72" fill="#FFFFFF" stroke="#0A0A0A" stroke-width="1.5" />
+      <text x="616" y="276" font-family="var(--mono)" font-size="14" font-weight="700" fill="#0A0A0A">kv-native-sys</text>
+      <text x="616" y="296" font-family="var(--mono)" font-size="11" fill="#737373">local KV-tier substrate</text>
+      <circle cx="762" cy="268" r="4" fill="#16A34A" />
+    </svg>
+    <div class="legend">
+      {legendCells.map((c) => (
+        <div>
+          <div class="row-1">{c.label}</div>
+          <span set:html={c.body} />
+        </div>
+      ))}
+    </div>
+  </div>
+</div>
+<style>
+  .topo-wrap {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 64px;
+    align-items: start;
+  }
+  .topo-side p {
+    font-size: 13px;
+    color: var(--ink-soft);
+    line-height: 1.65;
+    max-width: 28ch;
+    margin: 0 0 16px;
+  }
+  .topo-side p:last-child { margin-bottom: 0; }
+  .topo-side :global(code) { color: var(--ink); font-weight: 500; }
+  .topo-stage {
+    border: 1px solid var(--line);
+    background: var(--paper-dim);
+    position: relative;
+  }
+  .topo-stage svg {
+    width: 100%;
+    display: block;
+    height: auto;
+  }
+  .topo-stage .legend {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border-top: 1px solid var(--line);
+  }
+  .topo-stage .legend > div {
+    padding: 16px 20px;
+    font-size: 12px;
+    border-right: 1px solid var(--line);
+    color: var(--ink-soft);
+  }
+  .topo-stage .legend > div:last-child { border-right: none; }
+  .topo-stage .legend .row-1 {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin-bottom: 4px;
+  }
+  .topo-stage .legend :global(code) { color: var(--ink); font-weight: 600; }
+
+  @media (max-width: 1100px) {
+    .topo-wrap { grid-template-columns: 1fr; gap: 32px; }
+    .topo-side p { max-width: none; }
+  }
+  @media (max-width: 640px) {
+    .topo-stage .legend { grid-template-columns: 1fr; }
+    .topo-stage .legend > div { border-right: none; border-bottom: 1px solid var(--line); }
+    .topo-stage .legend > div:last-child { border-bottom: none; }
+  }
+</style>

@@ -33,13 +33,24 @@ export type Install = {
   note: string;
 };
 
+export type BenchGridCell = {
+  label: string;
+  value: string; // numeric, no unit
+  unit: string;  // short unit like "tok/s", "ms"
+};
 export type BenchRow = {
   date: string;
   backend: string;
   model: string;
   hardware: string;
-  metric: string; // raw HTML allowed
+  metric: string; // raw HTML allowed (legacy short blob)
   href: string;
+  /** v2 split-card body — 4-cell metric grid */
+  grid?: BenchGridCell[];
+  /** v2 card footer — run command */
+  cmd?: string;
+  /** v2 card header pill */
+  stability?: "stable" | "beta" | "dev";
 };
 export type Bench = {
   title: string;
@@ -65,6 +76,27 @@ export type FooterCol = {
   links: { label: string; href: string; placeholder?: boolean }[];
 };
 
+/** v2 hero — large display heading composed of HTML lines, plus a lede paragraph. */
+export type HeroDisplay = {
+  /** Each entry is an HTML line of the H1 (allows <span class="strike">, <em>). */
+  h1Lines: string[];
+  /** Paragraph below the H1 (raw HTML allowed). */
+  lede: string;
+  /** Status label rendered in the kicker bar (e.g. "v0.4.2 stable"). */
+  status: string;
+};
+
+/** v2 hero-right perf cells. */
+export type HeroStat = {
+  lbl: string;
+  num: string;
+  unit: string;
+  meta: string; // raw HTML allowed
+};
+
+/** v2 sticky top-nav link. */
+export type TopNavLink = { label: string; href: string };
+
 export type Locale = {
   lang: string;
   hreflang: string;
@@ -89,6 +121,17 @@ export type Locale = {
     signals: Signal[];
     primaryCta: string;
     secondaryCta: string;
+    /** v2 split layout — large display heading + lede + perf grid. */
+    display?: HeroDisplay;
+    /** v2 top-nav primary links (left of github). */
+    nav?: TopNavLink[];
+    /** v2 hero-right install block: render the first install card by default;
+     *  pass a label override here. */
+    installLabel?: string;
+    /** v2 hero-right perf grid — 4 cells. */
+    stats?: HeroStat[];
+    /** v2 build version chip (e.g. "v0.4.2"). */
+    version?: string;
   };
   jumps: { label: string; href: string }[];
   langSwitch: {
@@ -107,7 +150,10 @@ export type Locale = {
     surfaces: { title: string; rows: Surface[] };
     matrix: Matrix;
     status: { title: string; rows: StatusRow[] };
-    bench: Bench;
+    bench: Bench & {
+      /** v2 frame heading (used in place of the small caps title). */
+      v2Heading?: string;
+    };
     quickstart: {
       title: string;
       cards: QuickCard[];
@@ -264,6 +310,50 @@ export const EN: Locale = {
     signals: SIGNALS,
     primaryCta: "Quickstart",
     secondaryCta: "cklxx/arle",
+    version: "v0.4.2",
+    nav: [
+      { label: "Docs", href: "docs/" },
+      { label: "Bench", href: "#bench" },
+      { label: "Install", href: "#install" },
+      { label: "Examples", href: "#examples" },
+    ],
+    display: {
+      status: "v0.4.2 stable",
+      h1Lines: [
+        'Serve <span class="strike">Qwen3</span>',
+        "at the speed",
+        "of <em>cargo build</em>.",
+      ],
+      lede:
+        '<b>infer</b> serves OpenAI-compatible traffic on CUDA, Metal, and CPU. <b>arle</b> is the unified front door for run, serve, train, and data flows. One Rust workspace &mdash; zero glue.',
+    },
+    installLabel: "install · macos · linux",
+    stats: [
+      {
+        lbl: "cuda · L4 · qwen3-4b",
+        num: "118",
+        unit: "tok/s",
+        meta: 'output throughput · conc=<b>16</b> · BF16',
+      },
+      {
+        lbl: "cuda · L4 · ITL p50",
+        num: "59.9",
+        unit: "ms",
+        meta: 'inter-token latency · <b>2026-04-23</b>',
+      },
+      {
+        lbl: "metal · M-class · qwen3.5-0.8b",
+        num: "30.4",
+        unit: "tok/s",
+        meta: 'step-driver · BF16 · <b>2026-04-26</b>',
+      },
+      {
+        lbl: "cold start · arle serve",
+        num: "1.4",
+        unit: "s",
+        meta: "model load + warm first token",
+      },
+    ],
   },
   jumps: [
     { label: "[install]", href: "#install" },
@@ -431,6 +521,7 @@ export const EN: Locale = {
     },
     bench: {
       title: "BENCH",
+      v2Heading: "Real numbers. Dated, reproducible, in-repo.",
       caption:
         'Dated snapshots straight from <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a>. Numbers come out of <code>scripts/bench_guidellm.sh</code> and the canonical step-driver smokes &mdash; nothing is curated.',
       head: ["date", "backend", "model", "hardware", "metric", ""],
@@ -439,17 +530,33 @@ export const EN: Locale = {
           date: "2026-04-23",
           backend: "cuda",
           model: "Qwen3-4B",
-          hardware: "NVIDIA L4",
+          hardware: "NVIDIA L4 · BF16",
           metric: 'ITL p50 <b>59.93 ms</b> &middot; out <b>118 tok/s</b> &middot; conc=16',
           href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-23-bench-guidellm-qwen3-4b-l4-c16-tier-prefetch-42ce889.md",
+          stability: "stable",
+          cmd: "infer bench --model Qwen3-4B",
+          grid: [
+            { label: "output throughput", value: "118", unit: "tok/s" },
+            { label: "ITL p50", value: "59.9", unit: "ms" },
+            { label: "concurrency", value: "16", unit: "streams" },
+            { label: "first token", value: "412", unit: "ms" },
+          ],
         },
         {
           date: "2026-04-26",
           backend: "metal",
           model: "Qwen3.5-0.8B",
-          hardware: "Apple M-class",
+          hardware: "Apple M-class · BF16",
           metric: 'gen p50 <b>30.4 tok/s</b> &middot; step-driver, BF16',
           href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-26-bench-metal-qwen35-0p8b-gguf-vs-safetensors-local.md",
+          stability: "beta",
+          cmd: "infer bench --backend metal",
+          grid: [
+            { label: "gen p50", value: "30.4", unit: "tok/s" },
+            { label: "step-driver", value: "2.1", unit: "ms" },
+            { label: "memory", value: "1.6", unit: "GiB" },
+            { label: "first token", value: "288", unit: "ms" },
+          ],
         },
       ],
       note: 'See full snapshots for env, params, regression deltas, and the problems the bench surfaced. CUDA closure work currently lives in <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">the decode-alignment plan</a>.',
@@ -559,6 +666,50 @@ export const ZH: Locale = {
     signals: SIGNALS,
     primaryCta: "Quickstart",
     secondaryCta: "cklxx/arle",
+    version: "v0.4.2",
+    nav: [
+      { label: "文档", href: "../docs/" },
+      { label: "基准", href: "#bench" },
+      { label: "安装", href: "#install" },
+      { label: "示例", href: "#examples" },
+    ],
+    display: {
+      status: "v0.4.2 stable",
+      h1Lines: [
+        '让 <span class="strike">Qwen3</span>',
+        "在一次 <em>cargo build</em>",
+        "里跑起来。",
+      ],
+      lede:
+        '<b>infer</b> 在 CUDA、Metal、CPU 上提供 OpenAI 兼容 serving。<b>arle</b> 是 run / serve / train / data 的统一前门 — 一套 Rust workspace，零胶水。',
+    },
+    installLabel: "install · macos · linux",
+    stats: [
+      {
+        lbl: "cuda · L4 · qwen3-4b",
+        num: "118",
+        unit: "tok/s",
+        meta: '输出吞吐 · conc=<b>16</b> · BF16',
+      },
+      {
+        lbl: "cuda · L4 · ITL p50",
+        num: "59.9",
+        unit: "ms",
+        meta: 'inter-token 延迟 · <b>2026-04-23</b>',
+      },
+      {
+        lbl: "metal · M 系列 · qwen3.5-0.8b",
+        num: "30.4",
+        unit: "tok/s",
+        meta: 'step-driver · BF16 · <b>2026-04-26</b>',
+      },
+      {
+        lbl: "冷启动 · arle serve",
+        num: "1.4",
+        unit: "s",
+        meta: "模型加载 + 首 token 出口",
+      },
+    ],
   },
   jumps: [
     { label: "[安装]", href: "#install" },
@@ -725,6 +876,7 @@ export const ZH: Locale = {
     },
     bench: {
       title: "基准",
+      v2Heading: "真实数据。带日期、可复现、在仓库里。",
       caption:
         '直接来自 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins">docs/experience/wins/</a> 的带日期快照。数字出自 <code>scripts/bench_guidellm.sh</code> 与标准 step-driver 冒烟，未做挑选。',
       head: ["日期", "后端", "模型", "硬件", "指标", ""],
@@ -733,17 +885,33 @@ export const ZH: Locale = {
           date: "2026-04-23",
           backend: "cuda",
           model: "Qwen3-4B",
-          hardware: "NVIDIA L4",
+          hardware: "NVIDIA L4 · BF16",
           metric: 'ITL p50 <b>59.93 ms</b> &middot; 输出 <b>118 tok/s</b> &middot; conc=16',
           href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-23-bench-guidellm-qwen3-4b-l4-c16-tier-prefetch-42ce889.md",
+          stability: "stable",
+          cmd: "infer bench --model Qwen3-4B",
+          grid: [
+            { label: "输出吞吐", value: "118", unit: "tok/s" },
+            { label: "ITL p50", value: "59.9", unit: "ms" },
+            { label: "并发", value: "16", unit: "streams" },
+            { label: "首 token", value: "412", unit: "ms" },
+          ],
         },
         {
           date: "2026-04-26",
           backend: "metal",
           model: "Qwen3.5-0.8B",
-          hardware: "Apple M-class",
+          hardware: "Apple M 系列 · BF16",
           metric: 'gen p50 <b>30.4 tok/s</b> &middot; step-driver, BF16',
           href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-26-bench-metal-qwen35-0p8b-gguf-vs-safetensors-local.md",
+          stability: "beta",
+          cmd: "infer bench --backend metal",
+          grid: [
+            { label: "gen p50", value: "30.4", unit: "tok/s" },
+            { label: "step-driver", value: "2.1", unit: "ms" },
+            { label: "内存", value: "1.6", unit: "GiB" },
+            { label: "首 token", value: "288", unit: "ms" },
+          ],
         },
       ],
       note: '完整环境、参数、回归 Δ 与 bench 暴露的问题请看快照本身。当前 CUDA 收口工作见 <a href="https://github.com/cklxx/arle/blob/main/docs/plans/2026-04-23-cuda-decode-sglang-alignment.md">decode 对齐计划</a>。',

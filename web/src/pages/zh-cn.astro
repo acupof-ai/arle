@@ -1,8 +1,54 @@
 ---
-import ManPage from "../layouts/ManPage.astro";
-import PageBody from "../components/PageBody.astro";
+import Site from "../layouts/Site.astro";
+import TopNav from "../components/TopNav.astro";
+import HeroSplit from "../components/home/HeroSplit.astro";
+import Frame from "../components/home/Frame.astro";
+import Topology from "../components/home/Topology.astro";
+import Bench from "../components/home/Bench.astro";
+import Install from "../components/home/Install.astro";
+import Matrix from "../components/home/Matrix.astro";
+import Example from "../components/home/Example.astro";
+import SiteFooter from "../components/SiteFooter.astro";
 import { ZH } from "../data/content.ts";
+
+const s = ZH.sections;
+const base = import.meta.env.BASE_URL;
 ---
-<ManPage locale={ZH}>
-  <PageBody locale={ZH} />
-</ManPage>
+<Site locale={ZH}>
+  <TopNav links={ZH.hero.nav} version={ZH.hero.version} />
+
+  <HeroSplit locale={ZH} />
+
+  <Frame id="topology" num="01" label="拓扑" heading="一套 workspace。一张前门。三个后端。">
+    <Topology locale={ZH} />
+  </Frame>
+
+  <Frame
+    id="bench"
+    num="02"
+    label="基准"
+    heading={s.bench.v2Heading ?? "真实数据。带日期、可复现、在仓库里。"}
+  >
+    <Bench rows={s.bench.rows} isZh={true} />
+  </Frame>
+
+  <Frame id="install" num="03" label="安装" heading="一行能跑。按平台。">
+    <Install install={s.install} />
+  </Frame>
+
+  <Frame id="matrix" num="04" label="支持矩阵" heading="三个后端。一份运行时契约。">
+    <Matrix matrix={s.matrix} />
+  </Frame>
+
+  <Frame id="examples" num="05" label="示例" heading="OpenAI 兼容。cURL 直接打进来。">
+    <Example
+      title="Chat completion"
+      body={s.examples.lead}
+      lines={s.examples.lines}
+      docsHref={`${base}docs/`}
+      docsLabel="完整 HTTP API"
+    />
+  </Frame>
+
+  <SiteFooter cols={ZH.docfoot.cols} meta={ZH.docfoot.meta} />
+</Site>
