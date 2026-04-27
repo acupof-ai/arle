@@ -1,0 +1,90 @@
+---
+interface TocItem { label: string; href: string; level?: number; active?: boolean }
+interface Props {
+  items: TocItem[];
+  editHref?: string;
+  reportHref?: string;
+  sourceHref?: string;
+}
+const { items, editHref, reportHref, sourceHref } = Astro.props;
+---
+<aside class="toc" aria-label="on this page">
+  <h4>On this page</h4>
+  <ul>
+    {items.map((it) => (
+      <li>
+        <a href={it.href} class:list={[
+          it.active ? "active" : "",
+          it.level === 2 ? "lvl-2" : "",
+        ]}>{it.label}</a>
+      </li>
+    ))}
+  </ul>
+  {(editHref || reportHref || sourceHref) && (
+    <div class="toc-foot">
+      {editHref   && <a href={editHref}>Edit this page <span aria-hidden="true">&#x2197;</span></a>}
+      {reportHref && <a href={reportHref}>Report an issue <span aria-hidden="true">&#x2197;</span></a>}
+      {sourceHref && <a href={sourceHref}>View source <span aria-hidden="true">&#x2197;</span></a>}
+    </div>
+  )}
+</aside>
+<style>
+  .toc {
+    padding: 48px 24px 32px 24px;
+    position: sticky;
+    top: 96px;
+    height: calc(100vh - 96px);
+    overflow-y: auto;
+    border-left: 1px solid var(--line);
+    font-family: var(--mono);
+  }
+  .toc h4 {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin: 0 0 12px;
+    font-weight: 500;
+  }
+  .toc ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border-left: 1px solid var(--line);
+  }
+  .toc a {
+    display: block;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    margin-left: -1px;
+    border-left: 1px solid transparent;
+    transition: color 100ms ease, border-color 100ms ease;
+  }
+  .toc a.active {
+    color: var(--ink);
+    border-left-color: var(--ink);
+    font-weight: 500;
+  }
+  .toc a:hover { color: var(--ink); }
+  .toc .lvl-2 { padding-left: 24px; }
+  .toc-foot {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--ink-dim);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .toc-foot a {
+    color: var(--ink-soft);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .toc-foot a:hover { color: var(--ink); }
+</style>

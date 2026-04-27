@@ -1,0 +1,34 @@
+---
+interface Props {
+  /** Label shown on the left (e.g. "Note", "Beta", "Warning"). */
+  label: string;
+  /** Visual variant. */
+  kind?: "note" | "warn";
+}
+const { label, kind = "note" } = Astro.props;
+---
+<div class:list={["callout", `callout-${kind}`]}>
+  <div class="lbl">{label}</div>
+  <div class="body"><slot /></div>
+</div>
+<style>
+  .callout {
+    border: 1px solid var(--line);
+    padding: 16px 20px;
+    margin: 24px 0;
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 16px;
+  }
+  .callout .lbl {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink);
+    padding-top: 2px;
+  }
+  .callout .body :global(p) { margin: 0; font-size: 13px; color: var(--ink-soft); line-height: 1.65; }
+  .callout-note { background: var(--paper-dim); }
+  .callout-warn { border-color: var(--warn); }
+  .callout-warn .lbl { color: var(--warn); }
+</style>

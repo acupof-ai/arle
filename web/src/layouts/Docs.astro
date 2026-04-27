@@ -1,0 +1,206 @@
+---
+import "../styles/tokens.css";
+import "../styles/site.css";
+import Brand from "../components/Brand.astro";
+import Sidebar from "../components/docs/Sidebar.astro";
+import { DOCS_NAV, DOCS_TABS } from "../data/docs-nav.ts";
+
+interface Props {
+  /** Page <title>. */
+  title: string;
+  /** Breadcrumb segments rendered inline (last segment bolded). */
+  crumbs: string[];
+}
+const { title, crumbs } = Astro.props;
+const base = import.meta.env.BASE_URL;
+const resolveHref = (href: string) =>
+  href.startsWith("http") || href.startsWith("#")
+    ? href
+    : `${base}${href.replace(/^\//, "")}`;
+---
+<!doctype html>
+<html lang="en" id="top">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{title} — arle docs</title>
+<meta name="description" content={`${title} — arle docs`} />
+<meta name="color-scheme" content="light" />
+<link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
+</head>
+<body>
+<header class="docs-topbar">
+  <a class="docs-topbar-brand" href={base}>
+    <Brand size={26} suffix="/ docs" />
+  </a>
+  <span class="docs-crumb">
+    {crumbs.map((c, i) => (
+      <Fragment>
+        {i > 0 && <span aria-hidden="true">/</span>}
+        {i === crumbs.length - 1 ? <b>{c}</b> : <span>{c}</span>}
+      </Fragment>
+    ))}
+  </span>
+  <div class="docs-search">
+    <span class="ic" aria-hidden="true">⌕</span>
+    <input
+      type="search"
+      placeholder="Search docs, API, examples…"
+      aria-label="search"
+    />
+    <span class="kbd" aria-hidden="true">⌘ K</span>
+  </div>
+  <div class="docs-actions">
+    <span class="ver">v0.4.2</span>
+    <a href="https://github.com/cklxx/arle/blob/main/CHANGELOG.md">Changelog</a>
+    <a href="https://github.com/cklxx/arle">GitHub <span aria-hidden="true">&#x2197;</span></a>
+  </div>
+</header>
+
+<nav class="docs-tabs" aria-label="doc sections">
+  {DOCS_TABS.map((t) => (
+    <a
+      href={resolveHref(t.href)}
+      class:list={[t.active ? "active" : ""]}
+    >{t.label}</a>
+  ))}
+</nav>
+
+<div class="docs-shell">
+  <Sidebar groups={DOCS_NAV} />
+  <slot />
+</div>
+
+<style>
+  .docs-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: var(--paper);
+    border-bottom: 1px solid var(--line);
+    height: 56px;
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    gap: 24px;
+    font-family: var(--mono);
+  }
+  .docs-topbar-brand {
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .docs-crumb {
+    font-size: 12px;
+    color: var(--ink-dim);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .docs-crumb b { color: var(--ink); font-weight: 500; }
+  .docs-search {
+    flex: 1;
+    max-width: 480px;
+    margin-left: auto;
+    position: relative;
+  }
+  .docs-search input {
+    width: 100%;
+    padding: 8px 12px 8px 32px;
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--paper-dim);
+    border: 1px solid var(--line);
+    color: var(--ink);
+  }
+  .docs-search input::placeholder { color: var(--ink-dim); }
+  .docs-search input:focus { outline: none; border-color: var(--ink); }
+  .docs-search .ic {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 12px;
+    color: var(--ink-dim);
+  }
+  .docs-search .kbd {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+    padding: 1px 6px;
+    background: var(--paper);
+  }
+  .docs-actions {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    font-size: 12px;
+  }
+  .docs-actions a {
+    color: var(--ink-soft);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .docs-actions a:hover { color: var(--ink); }
+  .docs-actions .ver {
+    font-size: 11px;
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+    padding: 2px 6px;
+  }
+
+  .docs-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 0 24px;
+    height: 40px;
+    align-items: stretch;
+    background: var(--paper);
+    position: sticky;
+    top: 56px;
+    z-index: 25;
+    font-family: var(--mono);
+    overflow-x: auto;
+  }
+  .docs-tabs a {
+    padding: 0 16px;
+    display: inline-flex;
+    align-items: center;
+    font-size: 12px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    white-space: nowrap;
+    transition: color 100ms ease, border-color 100ms ease;
+  }
+  .docs-tabs a:hover { color: var(--ink); }
+  .docs-tabs a.active {
+    color: var(--ink);
+    border-bottom-color: var(--ink);
+    font-weight: 500;
+  }
+
+  .docs-shell {
+    display: grid;
+    grid-template-columns: 280px 1fr 240px;
+    min-height: calc(100vh - 96px);
+  }
+
+  @media (max-width: 1280px) {
+    .docs-shell { grid-template-columns: 280px 1fr; }
+  }
+  @media (max-width: 900px) {
+    .docs-shell { grid-template-columns: 1fr; }
+    .docs-topbar { gap: 16px; padding: 0 16px; }
+    .docs-search { display: none; }
+  }
+</style>
+</body>
+</html>

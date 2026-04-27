@@ -1,0 +1,414 @@
+---
+import Docs from "../../layouts/Docs.astro";
+import Toc from "../../components/docs/Toc.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import Callout from "../../components/docs/Callout.astro";
+import Tabs from "../../components/docs/Tabs.astro";
+
+const tocItems = [
+  { label: "Prerequisites",       href: "#prereqs", level: 1 },
+  { label: "Serve a model",       href: "#serve",   level: 1, active: true },
+  { label: "Talk to it",          href: "#talk",    level: 1 },
+  { label: "Verify with metrics", href: "#verify",  level: 1 },
+  { label: "What's next",         href: "#next",    level: 1 },
+];
+
+const heroInstall = [
+  '<span class="p">$</span> brew install cklxx/tap/arle',
+  '<span class="p">$</span> arle --doctor',
+];
+
+const tabPanes = [
+  {
+    id: "cuda",
+    label: "CUDA · Linux",
+    lang: "cuda",
+    lines: [
+      '<span class="p">$</span> arle serve --backend cuda \\',
+      '    --model-path /path/to/Qwen3-4B \\',
+      '    --port 8000',
+      '',
+      '<span class="p">▸</span> infer 0.4.2 · backend=<b>cuda</b> · device=<b>L4</b>',
+      '<span class="p">▸</span> loaded <b>Qwen3-4B</b> in 1.4s · 8.0 GiB',
+      '<span class="p">▸</span> listening on <b>http://0.0.0.0:8000</b>',
+    ],
+  },
+  {
+    id: "metal",
+    label: "Metal · Apple Silicon",
+    lang: "metal",
+    lines: [
+      '<span class="p">$</span> arle serve --backend metal \\',
+      '    --model-path /path/to/Qwen3.5-0.8B \\',
+      '    --port 8000',
+    ],
+  },
+  {
+    id: "docker",
+    label: "Docker · GPU",
+    lang: "docker",
+    lines: [
+      '<span class="p">$</span> docker run --rm --gpus all -p 8000:8000 \\',
+      '    -v /path/to/Qwen3-4B:/model:ro \\',
+      '    ghcr.io/cklxx/arle:latest \\',
+      '    serve --backend cuda --model-path /model',
+    ],
+  },
+];
+
+const requestLines = [
+  '<span class="p">$</span> curl -s http://127.0.0.1:8000/v1/chat/completions \\',
+  '  -H <i>\'Content-Type: application/json\'</i> \\',
+  '  -d <i>\'{',
+  '    "model": "qwen3-4b",',
+  '    "messages": [',
+  '      {"role": "user",',
+  '       "content": "Define ARLE in 8 words."}',
+  '    ]',
+  '  }\'</i>',
+];
+
+const responseLines = [
+  '{',
+  '  "id": <i>"cmpl-1a2b3c"</i>,',
+  '  "model": <i>"qwen3-4b"</i>,',
+  '  "choices": [{',
+  '    "message": {',
+  '      "role": <i>"assistant"</i>,',
+  '      "content": <i>"runtime-first Rust workspace',
+  '                   serving local agents."</i>',
+  '    },',
+  '    "finish_reason": <i>"stop"</i>',
+  '  }],',
+  '  "usage": { "total_tokens": 31 }',
+  '}',
+];
+
+const verifyLines = [
+  '<span class="p">$</span> curl -s http://127.0.0.1:8000/v1/stats | jq',
+  '{',
+  '  "backend": <i>"cuda"</i>,',
+  '  "model":   <i>"qwen3-4b"</i>,',
+  '  "throughput_tok_s": <b>118.2</b>,',
+  '  "itl_p50_ms":       <b>59.93</b>,',
+  '  "first_token_ms":   <b>412</b>,',
+  '  "concurrency":      <b>16</b>',
+  '}',
+];
+---
+<Docs title="Quickstart" crumbs={["Docs", "Get started", "Quickstart"]}>
+  <main class="doc">
+    <div class="meta">
+      <span class="num">02 / Get started</span>
+      <span aria-hidden="true">·</span>
+      <span>5 min read</span>
+      <span aria-hidden="true">·</span>
+      <span>Updated 2026-04-26</span>
+    </div>
+    <h1>Quickstart</h1>
+    <p class="lede">
+      Run a Qwen3 model end-to-end on your laptop or a single GPU. Three
+      commands, no glue. By the end you will have an OpenAI-compatible
+      server answering <code>POST /v1/chat/completions</code> on port 8000.
+    </p>
+
+    <div class="hero-card">
+      <div class="l">
+        <div class="step">step 01 of 03</div>
+        <h3>Install</h3>
+        <p>One runnable line. Homebrew on macOS, curl on Linux, container if you have a GPU.</p>
+      </div>
+      <pre set:html={heroInstall.join("\n")}></pre>
+    </div>
+
+    <h2 id="prereqs">Prerequisites <span class="anchor">#prereqs</span></h2>
+    <p>
+      You need a model directory on disk. <code>arle</code> does not download
+      model weights for you — bring a Qwen3 checkpoint, point at it, and the
+      runtime takes care of the rest.
+    </p>
+    <ul class="body">
+      <li>Rust toolchain not required — prebuilt binaries ship on every release.</li>
+      <li><code>cuda</code> backend: NVIDIA Ampere or newer with the matching CUDA runtime.</li>
+      <li><code>metal</code> backend: Apple Silicon, M1 or newer.</li>
+      <li>A model directory containing <code>config.json</code>, tokenizer files, and weight shards.</li>
+    </ul>
+
+    <Callout label="Note" kind="note">
+      <p>The doctor command prints the active backend, detected hardware, and which model paths it can resolve. Run it after install before anything else.</p>
+    </Callout>
+
+    <h2 id="serve">Serve a model <span class="anchor">#serve</span></h2>
+    <p>
+      The unified front door is <code>arle</code>. The <code>serve</code> verb
+      starts the runtime spine — <code>infer</code> — with the right backend
+      and HTTP surface for you. Pick the tab that matches your machine.
+    </p>
+    <Tabs panes={tabPanes} />
+
+    <h2 id="talk">Talk to it <span class="anchor">#talk</span></h2>
+    <p>
+      Any client expecting <code>v1/chat/completions</code> works. The wire
+      format matches OpenAI, including streaming via
+      <code>text/event-stream</code>.
+    </p>
+
+    <div class="req-res">
+      <div>
+        <div class="h">Request</div>
+        <pre set:html={requestLines.join("\n")}></pre>
+      </div>
+      <div>
+        <div class="h">Response</div>
+        <pre set:html={responseLines.join("\n")}></pre>
+      </div>
+    </div>
+
+    <h2 id="verify">Verify with metrics <span class="anchor">#verify</span></h2>
+    <p>
+      The runtime exposes Prometheus-format metrics on
+      <code>/metrics</code> and a structured stats endpoint at
+      <code>/v1/stats</code>. Together they give you throughput, queue depth,
+      and per-backend memory usage without any external tooling.
+    </p>
+    <CodeBlock file="$ shell" lang="curl" lines={verifyLines} />
+
+    <Callout label="Beta" kind="warn">
+      <p>
+        The <code>metal</code> backend is actively validated but uneven. If
+        you hit an op miss, file an issue with <code>arle --doctor</code>
+        output and the model card.
+      </p>
+    </Callout>
+
+    <h2 id="next">What's next <span class="anchor">#next</span></h2>
+    <p>You now have a runtime serving real traffic. From here:</p>
+    <ul class="body">
+      <li>Swap the model — point <code>--model-path</code> at any Qwen3 / Qwen3.5 directory.</li>
+      <li>Train a small adapter — see <code>arle train</code>.</li>
+      <li>Wire it into your app — same SDKs you use against OpenAI, just change the base URL.</li>
+    </ul>
+
+    <nav class="nav-pn" aria-label="page navigation">
+      <a href="https://github.com/cklxx/arle/blob/main/README.md">
+        <div class="l">← Previous</div>
+        <div class="t">Install</div>
+      </a>
+      <a class="next" href="https://github.com/cklxx/arle/blob/main/docs/http-api.md">
+        <div class="l">Next →</div>
+        <div class="t">HTTP API</div>
+      </a>
+    </nav>
+  </main>
+
+  <Toc
+    items={tocItems}
+    editHref="https://github.com/cklxx/arle/edit/main/web/src/pages/docs/index.astro"
+    reportHref="https://github.com/cklxx/arle/issues/new"
+    sourceHref="https://github.com/cklxx/arle/blob/main/web/src/pages/docs/index.astro"
+  />
+</Docs>
+<style>
+  .doc {
+    min-width: 0;
+    padding: 48px 64px 96px;
+    max-width: 76ch;
+    font-family: var(--mono);
+  }
+  .doc .meta {
+    font-size: 11px;
+    color: var(--ink-dim);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .doc .meta .num { color: var(--ink); }
+  .doc h1 {
+    font-size: 48px;
+    font-weight: 700;
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+    margin: 0 0 16px;
+    color: var(--ink);
+  }
+  .doc .lede {
+    font-size: 18px;
+    color: var(--ink-soft);
+    line-height: 1.55;
+    margin: 0 0 32px;
+    max-width: 60ch;
+  }
+  .doc h2 {
+    font-size: 22px;
+    text-transform: none;
+    letter-spacing: -0.015em;
+    font-weight: 700;
+    color: var(--ink);
+    margin: 56px 0 16px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .doc h2 .anchor {
+    font-size: 11px;
+    color: var(--ink-dim);
+    letter-spacing: 0.04em;
+    font-weight: 400;
+  }
+  .doc h3 {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    margin: 32px 0 12px;
+  }
+  .doc p {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--ink-soft);
+    margin: 0 0 16px;
+    max-width: 60ch;
+  }
+  .doc p :global(code), .doc li :global(code) {
+    background: var(--paper-dim);
+    border: 1px solid var(--line);
+    padding: 1px 6px;
+    font-size: 12.5px;
+    color: var(--ink);
+    font-weight: 500;
+  }
+  .doc ul.body {
+    padding-left: 0;
+    list-style: none;
+    margin: 0 0 16px;
+  }
+  .doc ul.body li {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--ink-soft);
+    padding-left: 24px;
+    margin-bottom: 8px;
+    position: relative;
+  }
+  .doc ul.body li::before {
+    content: "—";
+    position: absolute;
+    left: 0;
+    color: var(--ink-dim);
+  }
+
+  .doc .hero-card {
+    display: flex;
+    gap: 0;
+    align-items: stretch;
+    border: 1px solid var(--line);
+    margin: 0 0 40px;
+  }
+  .doc .hero-card .l {
+    flex: 1;
+    padding: 24px;
+  }
+  .doc .hero-card .l .step {
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin-bottom: 6px;
+  }
+  .doc .hero-card .l h3 {
+    margin: 0 0 8px;
+    font-size: 17px;
+  }
+  .doc .hero-card .l p {
+    font-size: 13px;
+    margin: 0;
+    color: var(--ink-soft);
+  }
+  .doc .hero-card pre {
+    margin: 0;
+    flex: 1.2;
+    border: none;
+    border-left: 1px solid var(--line);
+    background: var(--paper-dim);
+    padding: 24px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .doc .hero-card pre :global(.p) { color: var(--ink-dim); user-select: none; }
+
+  .doc .req-res {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    margin: 24px 0;
+  }
+  .doc .req-res > div { background: var(--paper); }
+  .doc .req-res .h {
+    padding: 8px 16px;
+    font-size: 11px;
+    color: var(--ink-dim);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--line);
+  }
+  .doc .req-res pre {
+    margin: 0;
+    padding: 16px;
+    border: none;
+    background: transparent;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.65;
+    overflow-x: auto;
+  }
+  .doc .req-res pre :global(.p) { color: var(--ink-dim); user-select: none; }
+  .doc .req-res pre :global(i)  { color: var(--ink-soft); font-style: normal; }
+  .doc .req-res pre :global(b)  { color: var(--ink); }
+
+  .doc .nav-pn {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 64px 0 0;
+    padding-top: 32px;
+    border-top: 1px solid var(--line);
+  }
+  .doc .nav-pn a {
+    display: block;
+    padding: 16px 20px;
+    border: 1px solid var(--line);
+    text-decoration: none;
+    color: var(--ink);
+    transition: border-color 100ms ease;
+  }
+  .doc .nav-pn a:hover { border-color: var(--ink); }
+  .doc .nav-pn .l {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    margin-bottom: 4px;
+  }
+  .doc .nav-pn .t { font-size: 14px; font-weight: 600; }
+  .doc .nav-pn .next { text-align: right; }
+
+  @media (max-width: 1100px) {
+    .doc .hero-card { flex-direction: column; }
+    .doc .hero-card pre { border-left: none; border-top: 1px solid var(--line); }
+    .doc .req-res { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 900px) {
+    .doc { padding: 32px 24px 64px; }
+    .doc h1 { font-size: 36px; }
+  }
+</style>
