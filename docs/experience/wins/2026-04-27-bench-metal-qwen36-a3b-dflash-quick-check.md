@@ -1,17 +1,25 @@
 # Metal Qwen3.6 35B-A3B DFlash Quick Check
 
+## Scope Correction
+
+User correction after this quick check: DFlash should be judged only as an
+ultra-long-sequence optimization going forward. The short 32-token prompt runs
+below are retained as a load/execute diagnostic for Qwen3.6, not as acceptance
+evidence for DFlash performance direction.
+
 ## Goal
 
 - Check the current Metal Qwen3.6-35B-A3B path after the Qwen3.5 GGUF decode
-  work, and verify whether DFlash improves short decode on the local M4 Pro.
+  work, and record a short load/execute diagnostic on the local M4 Pro.
 
 ## Hypothesis
 
 - The Qwen3.5 GGUF Q5/Q8 affine repack and Q6 qmv tile work should not be
   assumed to transfer directly to Qwen3.6, because this target is the
   MLX-community 4-bit MoE checkpoint rather than GGUF Q4_K_M.
-- DFlash might improve decode TPOT, but Qwen3.6 prefill/TTFT is likely still
-  the visible short-request bottleneck.
+- Short DFlash numbers should be treated as non-decision-making diagnostics;
+  future DFlash optimization should be measured on ultra-long sequence
+  workloads only.
 
 ## Command
 
@@ -105,8 +113,9 @@ compare | baseline TPOT 15.23 ms -> DFlash 15.45 ms  (delta +1.4%)
 
 ## Problems
 
-- Single-run, no-warmup diagnostic only. This was intentionally short to
-  answer whether Qwen3.6 shows an immediate win after the Qwen3.5 GGUF work.
+- Single-run, no-warmup diagnostic only. This was intentionally short to check
+  whether Qwen3.6 still loads and executes locally; it is not a DFlash
+  optimization acceptance run.
 - The direct JSON path did not emit DFlash acceptance counters for this run
   shape, so the TPOT compare is the cleaner decode-only signal.
 - TTFT/prompt timing variance is large enough that short end-to-end results
@@ -114,10 +123,8 @@ compare | baseline TPOT 15.23 ms -> DFlash 15.45 ms  (delta +1.4%)
 
 ## Learnings
 
-- Qwen3.6-35B-A3B loads and runs on the Metal path locally, but DFlash is not
-  a reliable win in this quick check: the paired TPOT compare is flat to
-  slightly worse.
-- The next Qwen3.6 target is prefill/TTFT and MoE/GDR execution, not more
-  speculative-decode tuning.
+- Qwen3.6-35B-A3B loads and runs on the Metal path locally.
+- The next DFlash performance check must be long-context / ultra-long-sequence;
+  do not draw DFlash direction from this short diagnostic.
 - Do not infer Qwen3.6 gains from the Qwen3.5 GGUF Q4_K_M affine/tiled kernel
   work without a model-specific benchmark.

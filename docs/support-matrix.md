@@ -43,7 +43,7 @@ Notes:
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
 | Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B GGUF Q4_K_M now runs on Metal through the shared Rust GGUF parser plus MLX affine/tiled quant paths for Q4/Q5/Q6/Q8 hot tensors, validated locally at 211.7 tok/s for 512 prompt / 1024 decode on 2026-04-27. Metal DFlash is Beta; see §4a for the current validation note. |
-| Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro diagnostic on 32 prompt / 256 decode measured 63.0 tok/s baseline decode and 67.1 tok/s with DFlash, but paired TPOT compare was flat/slower (15.23 ms -> 15.45 ms), so DFlash is not currently a production win for this model. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. |
+| Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
@@ -97,7 +97,7 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | --- | --- | --- |
 | Metal DFlash (Qwen3) | Beta | Apple Silicon speculative decode path. Validated on Qwen3; benchmark before production use. |
 | Metal DFlash (Qwen3.5) | Beta | End-to-end correctness landed 2026-04-17 (commits `4db4fe9`, `439293d`); benchmark before production use. |
-| Metal DFlash (Qwen3.6 / Qwen3.5-MoE) | Beta / diagnostic | Target/draft pairing is wired for `mlx-community/Qwen3.6-35B-A3B-4bit` + `z-lab/Qwen3.6-35B-A3B-DFlash`, but the 2026-04-27 M4 Pro quick check did not show a TPOT win. Treat as supported-for-experiment, not a default performance path. |
+| Metal DFlash (Qwen3.6 / Qwen3.5-MoE) | Beta / diagnostic | Target/draft pairing is wired for `mlx-community/Qwen3.6-35B-A3B-4bit` + `z-lab/Qwen3.6-35B-A3B-DFlash`. Short checks are smoke diagnostics only; future DFlash optimization claims must come from long-context / ultra-long-sequence runs. |
 | CUDA speculative decoding | Not shipped | `infer/src/speculative.rs` is a CPU-only framework; GPU integration pending (see `plans/speculative-decoding-impl.md`). |
 
 ---
