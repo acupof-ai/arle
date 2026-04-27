@@ -178,6 +178,9 @@ impl MlxArray {
     pub fn from_slice_u8(data: &[u8], shape: &[i32]) -> Self {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Uint8) }
     }
+    pub fn from_slice_u32(data: &[u32], shape: &[i32]) -> Self {
+        unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Uint32) }
+    }
     pub fn from_slice_f32(data: &[f32], shape: &[i32]) -> Self {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Float32) }
     }

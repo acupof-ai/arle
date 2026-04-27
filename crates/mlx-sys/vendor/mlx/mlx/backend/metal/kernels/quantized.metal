@@ -128,12 +128,21 @@
   instantiate_quantized_funcs(float16_t, group_size, bits)  \
   instantiate_quantized_funcs(bfloat16_t, group_size, bits)
 
+#define instantiate_quantized_qmv_types(group_size, bits)       \
+  instantiate_quantized_batched_wrap(affine_qmv_fast, float, group_size, bits)      \
+  instantiate_quantized_batched_wrap(affine_qmv_fast, float16_t, group_size, bits)  \
+  instantiate_quantized_batched_wrap(affine_qmv_fast, bfloat16_t, group_size, bits) \
+  instantiate_quantized_batched_wrap(affine_qmv, float, group_size, bits)           \
+  instantiate_quantized_batched_wrap(affine_qmv, float16_t, group_size, bits)       \
+  instantiate_quantized_batched_wrap(affine_qmv, bfloat16_t, group_size, bits)
+
 #define instantiate_quantized_groups(bits) \
   instantiate_quantized_types(128, bits)   \
   instantiate_quantized_types(64, bits)    \
   instantiate_quantized_types(32, bits)
 
 #define instantiate_quantized_all() \
+  instantiate_quantized_qmv_types(16, 6) \
   instantiate_quantized_groups(2) \
   instantiate_quantized_groups(3) \
   instantiate_quantized_groups(4) \

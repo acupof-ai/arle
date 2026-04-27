@@ -93,13 +93,7 @@ bool use_qwen35_cpp_prefill_last_logits_only() {
 
 bool use_qwen35_cpp_separate_mlp() {
     const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP");
-    if (env) {
-        return std::string(env) != "0";
-    }
-    // Revalidation with longer runs shows separate gate/up matmuls are
-    // equal-or-better across mixed, decode-heavy, and prefill-heavy
-    // workloads, so keep the default simple.
-    return true;
+    return env && std::string(env) != "0";
 }
 
 bool use_qwen35_cpp_prefill_gbeta_helper() {
