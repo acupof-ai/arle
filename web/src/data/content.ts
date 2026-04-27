@@ -13,7 +13,6 @@ export type MatrixCell = string; // raw HTML allowed
 export type MatrixRow = MatrixCell[];
 export type Topology = {
   title: string;
-  diagram: string; // monospace ASCII, rendered in <pre>
   legend: { cap: string; body: string; href?: string }[];
 };
 export type Matrix = {
@@ -165,23 +164,6 @@ const SIGNALS: Signal[] = [
   { kv: 'api=<code>openai-v1</code>', status: "ok" },
   { kv: 'doors=<code>1</code>', status: "ok" },
 ];
-
-// Workspace topology — ASCII diagram is locale-neutral; only labels around it
-// translate. Width is ~58 cols to fit narrow viewports without horizontal scroll
-// while staying legible on desktop.
-const TOPOLOGY_DIAGRAM = `   ┌────────────────────────────────────────────────────┐
-   │  arle   ·   one front door  (cli + repl)           │
-   └──┬─────────┬───────────┬──────────────┬────────────┘
-      │ run     │ serve     │ train        │ data
-      ▼         ▼           ▼              ▼
-   ┌────────────────────────────────────────────────────┐
-   │  infer  ·  runtime spine                           │
-   │  scheduler · model · ops · backend · http_server   │
-   └──┬─────────────────┬───────────────────┬───────────┘
-      ▼                 ▼                   ▼
-   cuda-kernels      mlx-sys             kv-native-sys
-   FlashInfer +      MLX C++ bridge      local KV-tier
-   Triton AOT        cmake + cc build    persistence`;
 
 const DOCFOOT_EN: FooterCol[] = [
   {
@@ -372,7 +354,6 @@ export const EN: Locale = {
     },
     topology: {
       title: "TOPOLOGY",
-      diagram: TOPOLOGY_DIAGRAM,
       legend: [
         { cap: "front door", href: "https://github.com/cklxx/arle/tree/main/crates/cli", body: "<code>arle</code> fans out to <code>run</code>, <code>serve</code>, <code>train</code>, and <code>data</code> verbs. One stable CLI instead of a scatter of task binaries." },
         { cap: "runtime spine", href: "https://github.com/cklxx/arle/tree/main/infer/src", body: "<code>infer</code> owns scheduling, model loading, ops, backend dispatch, and the OpenAI-compatible HTTP surface." },
@@ -653,7 +634,6 @@ export const ZH: Locale = {
     },
     topology: {
       title: "拓扑",
-      diagram: TOPOLOGY_DIAGRAM,
       legend: [
         { cap: "前门", href: "https://github.com/cklxx/arle/tree/main/crates/cli", body: "<code>arle</code> 通过 <code>run</code>、<code>serve</code>、<code>train</code>、<code>data</code> 几个动词分流；不再为每个任务拉独立二进制。" },
         { cap: "运行时主干", href: "https://github.com/cklxx/arle/tree/main/infer/src", body: "<code>infer</code> 负责调度、模型加载、ops、后端 dispatch 与 OpenAI 兼容 HTTP 服务面。" },
