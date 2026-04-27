@@ -160,8 +160,6 @@ pub use io::{
     KVPayload, KVPayloadRef,
 };
 pub use lookup::{HitKind, LookupBlock, LookupHeuristics, LookupOutcome};
-pub use readmission::{
-    PlanKind, ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource,
-};
+pub use readmission::{ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource};
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{DiskStore, KVTransport, SharedFsStore, TransferOp, TransportError};

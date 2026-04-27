@@ -137,24 +137,6 @@ impl<M: ModelForward> Scheduler<M> {
         decode_slots
     }
 
-    /// Release a slot's GPU page allocations and per-slot scratch state,
-    /// without finishing the slot or touching the resident `ActiveRequest`.
-    /// Caller is responsible for setting `req.phase` to whatever comes next
-    /// (`Phase::WaitingFetch` for swap-out, `Phase::Finished` before
-    /// `finish_slot` for recompute).
-    pub(super) fn release_slot_pages_only(&mut self, slot_idx: usize) {
-        let victim_id = self.request(slot_idx).map(|r| r.id).unwrap_or_default();
-        self.paged_kv_pool.free_slot(slot_idx);
-        if let Err(e) = self.states[slot_idx].reset() {
-            error!(
-                "Request {}: slot reset after page release failed: {}",
-                victim_id, e
-            );
-        }
-        self.slot_materialized_prompt_lens[slot_idx] = 0;
-        self.clear_slot_prefix_ownership(slot_idx);
-    }
-
     fn requeue_preempted_decode(&mut self, slot_idx: usize) {
         let (victim_id, generated_tokens, requeue) = {
             let victim = self
@@ -182,7 +164,15 @@ impl<M: ModelForward> Scheduler<M> {
             generated_tokens,
             self.paged_kv_pool.free_count()
         );
-        self.release_slot_pages_only(slot_idx);
+        self.paged_kv_pool.free_slot(slot_idx);
+        if let Err(e) = self.states[slot_idx].reset() {
+            error!(
+                "Request {}: slot reset after preempt failed: {}",
+                victim_id, e
+            );
+        }
+        self.slot_materialized_prompt_lens[slot_idx] = 0;
+        self.clear_slot_prefix_ownership(slot_idx);
         self.finish_slot(slot_idx);
         self.enqueue_waiting_request(requeue, WaitingInsertBias::BeforeEqual);
     }
