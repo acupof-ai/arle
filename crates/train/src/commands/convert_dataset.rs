@@ -12,14 +12,9 @@
 
 use std::{path::PathBuf, process::ExitCode};
 
-use train::data_adapter::{InputFormat, convert_file};
+use crate::data_adapter::{InputFormat, convert_file};
 
-fn main() -> ExitCode {
-    dispatch_from_args(std::env::args().skip(1).collect::<Vec<_>>())
-}
-
-#[allow(dead_code)]
-pub(crate) fn dispatch_from_args<I>(args: I) -> ExitCode
+pub fn dispatch_from_args<I>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = String>,
 {
