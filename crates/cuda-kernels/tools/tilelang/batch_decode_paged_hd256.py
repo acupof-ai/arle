@@ -57,12 +57,13 @@ the host source records):
   V tile : BLOCK_N * HEAD_DIM * 2 B   = 64 * 256 * 2 =  32_768 B
   Sum (single-buffered)                              =  66_048 B (~64 KB)
   K/V are reused inside the `T.Pipelined(..., num_stages=2)` loop, so
-  TileLang will double-buffer them: total dyn shmem ≈
-    Q(512) + 2 * (32_768 + 32_768) = 131_584 B (~128 KB).
-  Fits on H100 (per-block cap 228 KB after lift). On sm_89 / L4 the
-  per-block cap is 99 KB; if this kernel must run there, drop
-  NUM_STAGES to 1 or shrink BLOCK_N to 32. H100 is the target; sm_89
-  is not part of HD256 decode's primary deployment.
+  TileLang will double-buffer them. With BLOCK_N=32 + NUM_STAGES=2:
+    Q(512) + 2 * (32 * 256 * 2 + 32 * 256 * 2) = 65_536 + 512 ≈ 64.5 KB.
+  Fits both H100 (228 KB after lift) AND L4 / sm_89 (99 KB cap), so the
+  cubin runs on the same hardware as the HD256 prefill twin (T2). The
+  earlier BLOCK_N=64 spec hit 128 KB and would not load on L4 — codex
+  review on commit 02d0333 caught this; align with the prefill HD256
+  pattern instead of specializing by SM.
 """
 
 import math
@@ -73,7 +74,10 @@ import tilelang.language as T
 HEAD_DIM = 256
 PAGE_SIZE = 16
 BLOCK_M = 1
-BLOCK_N = 64
+# Mirrors batch_prefill_paged_hd256.py: halve BLOCK_N vs HD128 to keep
+# total dynamic shared memory ≤ 64 KB so the cubin loads on sm_89 / L4
+# (per-block cap ~99 KB) as well as H100 (cap ~228 KB).
+BLOCK_N = 32
 NUM_STAGES = 2
 NUM_THREADS = 128
 
