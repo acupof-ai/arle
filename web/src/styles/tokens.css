@@ -3,30 +3,30 @@
    keeps the dark console panels (they are the brand contrast). */
 
 :root {
-  /* warm-paper palette */
-  --paper: #F6F8F2;
-  --paper-dim: #E9EEE5;
-  --panel: #FBFCF8;
+  /* near-white minimal palette — Linear / Vercel direction */
+  --paper: #FFFFFF;
+  --paper-dim: #FAFAFA;
+  --panel: #FAFAFA;
   --panel-strong: #FFFFFF;
-  --rule: #1E2A25;
-  --line: rgba(30, 42, 37, 0.18);
-  --line-soft: rgba(30, 42, 37, 0.12);
-  --ink: #111714;
-  --ink-soft: #27352F;
-  --ink-dim: #66736C;
-  --ochre: #6D7136;
-  --coral: #C9573B;
-  --coral-dim: #A94731;
-  --teal: #087A73;
-  --teal-dim: #075D58;
-  --moss: #526B39;
-  --amber: #D9A641;
-  --console: #111714;
-  --console-2: #1D2923;
-  --selection: #087A73;
-  --selection-fg: #F6F8F2;
-  --ok: #4CC3A1;
-  --warn: #D9A641;
+  --rule: #0A0A0A;
+  --line: rgba(10, 10, 10, 0.10);
+  --line-soft: rgba(10, 10, 10, 0.06);
+  --ink: #0A0A0A;
+  --ink-soft: #404040;
+  --ink-dim: #737373;
+  --ochre: #737373;
+  --coral: #DC4B2D;
+  --coral-dim: #B73B22;
+  --teal: #0A0A0A;
+  --teal-dim: #404040;
+  --moss: #737373;
+  --amber: #737373;
+  --console: #0A0A0A;
+  --console-2: #171717;
+  --selection: #0A0A0A;
+  --selection-fg: #FFFFFF;
+  --ok: #16A34A;
+  --warn: #D97706;
 
   /* type scale */
   --fs-xs: 11px;
@@ -60,27 +60,5 @@
           "SFMono-Regular", Menlo, Consolas, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --paper: #0E1714;
-    --paper-dim: #122019;
-    --panel: #16221E;
-    --panel-strong: #1A2A24;
-    --rule: #C8D2CB;
-    --line: rgba(231, 238, 234, 0.14);
-    --line-soft: rgba(231, 238, 234, 0.08);
-    --ink: #ECF1ED;
-    --ink-soft: #C8D2CB;
-    --ink-dim: #8C9A92;
-    --ochre: #C7C57A;
-    --coral: #E78161;
-    --coral-dim: #FFA180;
-    --teal: #4DB3A9;
-    --teal-dim: #6FCFC4;
-    --moss: #9CC074;
-    --amber: #E5BB55;
-    --console: #070C0A;
-    --console-2: #0F1814;
-    --selection-fg: #0E1714;
-  }
-}
+/* Light-only palette per user direction. Dark mode maps to the same
+   tokens so the page stays minimal-white in any preference. */

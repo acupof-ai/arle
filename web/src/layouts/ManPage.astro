@@ -2,9 +2,6 @@
 import "../styles/tokens.css";
 import "../styles/global.css";
 import type { Locale } from "../data/content.ts";
-import TermTabs from "../components/TermTabs.astro";
-import ManHead from "../components/ManHead.astro";
-import ManFoot from "../components/ManFoot.astro";
 
 interface Props {
   locale: Locale;
@@ -19,7 +16,7 @@ const base = import.meta.env.BASE_URL;
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>{locale.meta.title}</title>
 <meta name="description" content={locale.meta.description} />
-<meta name="color-scheme" content="light dark" />
+<meta name="color-scheme" content="light" />
 <meta property="og:title" content={locale.meta.ogTitle} />
 <meta property="og:description" content={locale.meta.ogDescription} />
 <meta property="og:type" content="website" />
@@ -31,10 +28,7 @@ const base = import.meta.env.BASE_URL;
 </head>
 <body>
 <main class="page">
-  <TermTabs on={locale.termtabs.on} cwd={locale.termtabs.cwd} meta={locale.termtabs.meta} />
-  <ManHead left={locale.manhead.left} center={locale.manhead.center} right={locale.manhead.right} />
   <slot />
-  <ManFoot left={locale.manfoot.left} center={locale.manfoot.center} right={locale.manfoot.right} />
 </main>
 </body>
 </html>
