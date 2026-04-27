@@ -28,9 +28,7 @@ EVAL_DATA="${OUT_DIR}/tiny_eval.jsonl"
 EVAL_OUT="${OUT_DIR}/eval.json"
 AGENT_OUT="${OUT_DIR}/agent.out"
 BIN_DIR="${CARGO_TARGET_DIR}/release"
-TRAIN_BIN="${BIN_DIR}/train_sft"
-EVAL_BIN="${BIN_DIR}/eval_lm"
-AGENT_BIN="${BIN_DIR}/arle"
+ARLE_BIN="${BIN_DIR}/arle"
 
 info() { echo "[train_cuda_e2e] $*"; }
 die() { echo "[train_cuda_e2e] error: $*" >&2; exit 1; }
@@ -110,19 +108,15 @@ cat > "$EVAL_DATA" <<'EOF'
 {"messages":[{"role":"user","content":"Reply with one fruit."},{"role":"assistant","content":"Apple."}]}
 EOF
 
-info "building train/eval/infer release binaries"
+info "building arle release binary (carries train + eval + agent surfaces)"
 CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
-  cargo build --release --features cuda -p train --bin train_sft --bin eval_lm
-CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
-  cargo build --release -p agent-infer --features cli --bin arle
+  cargo build --release -p agent-infer --features cli,cuda --bin arle
 
-require_file "$TRAIN_BIN"
-require_file "$EVAL_BIN"
-require_file "$AGENT_BIN"
+require_file "$ARLE_BIN"
 
-info "running CUDA train_sft smoke"
+info "running CUDA train sft smoke"
 CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
-  "$TRAIN_BIN" \
+  "$ARLE_BIN" train sft \
   --model "$MODEL_PATH" \
   --data "$SFT_DATA" \
   --out "$TRAIN_OUT" \
@@ -141,19 +135,19 @@ require_file "${LATEST}/adapter_model.safetensors"
 require_file "${LATEST}/optimizer.safetensors"
 info "latest -> $(latest_step_name "$LATEST")"
 
-info "running CUDA eval_lm"
+info "running CUDA train eval"
 CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
-  "$EVAL_BIN" \
+  "$ARLE_BIN" train eval \
   --model-path "$LATEST" \
   --data "$EVAL_DATA" \
   --seq-len 64 \
   --backend cuda | tee "$EVAL_OUT"
-grep -q '"loss"' "$EVAL_OUT" || die "eval_lm output missing loss field"
+grep -q '"loss"' "$EVAL_OUT" || die "train eval output missing loss field"
 
 info "running infer-side load/generate smoke"
 printf 'hi\n/quit\n' | \
   CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
-  "$AGENT_BIN" \
+  "$ARLE_BIN" \
   --model-path "$LATEST" \
   --max-tokens 8 \
   --non-interactive > "$AGENT_OUT" 2>&1
@@ -165,7 +159,7 @@ fi
 
 info "running CUDA resume smoke"
 CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
-  "$TRAIN_BIN" \
+  "$ARLE_BIN" train sft \
   --model "$MODEL_PATH" \
   --data "$SFT_DATA" \
   --out "$TRAIN_OUT" \
@@ -183,4 +177,4 @@ CUDA_HOME="$CUDA_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
 require_file "${LATEST}/trainer_state.json"
 require_file "${LATEST}/optimizer.safetensors"
 
-info "OK train_sft -> eval_lm -> arle -> resume"
+info "OK train sft -> train eval -> arle -> resume"

@@ -24,16 +24,6 @@ use crate::{
     hardware, hub_discovery,
 };
 
-#[allow(dead_code)]
-#[path = "../../train/src/bin/train_grpo.rs"]
-mod train_grpo_entry;
-#[allow(dead_code)]
-#[path = "../../train/src/bin/train_multi_turn.rs"]
-mod train_multi_turn_entry;
-#[allow(dead_code)]
-#[path = "../../train/src/bin/train_sft.rs"]
-mod train_sft_entry;
-
 const TRAIN_ENV_COMMANDS: &[&str] = &[
     "train env",
     "train test",
@@ -227,7 +217,7 @@ fn run_sft(args: TrainSftArgs) -> ExitCode {
         "train sft",
         resolve_sft_invocation(&args),
         &args.render,
-        train_sft_entry::dispatch_from_args,
+        train::commands::train_sft::dispatch_from_args,
     )
 }
 
@@ -245,7 +235,7 @@ fn run_grpo(args: TrainGrpoArgs) -> ExitCode {
         "train grpo",
         Ok(resolve_grpo_invocation(&args)),
         &args.render,
-        train_grpo_entry::dispatch_from_args,
+        train::commands::train_grpo::dispatch_from_args,
     )
 }
 
@@ -254,7 +244,7 @@ fn run_multi_turn(args: TrainMultiTurnArgs) -> ExitCode {
         "train multi-turn",
         Ok(resolve_multi_turn_invocation(&args)),
         &args.render,
-        train_multi_turn_entry::dispatch_from_args,
+        train::commands::train_multi_turn::dispatch_from_args,
     )
 }
 

@@ -1,8 +1,7 @@
 use std::{
     collections::HashSet,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
-    process::ExitCode,
     str::FromStr,
     sync::Arc,
     time::Instant,
@@ -16,7 +15,8 @@ use autograd::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use train::{
+
+use crate::{
     CausalLm, StepCtx, StepOutcome, Trainer, TrainerConfig,
     causal_lm::{
         build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
@@ -56,7 +56,7 @@ use train::{
 };
 
 #[cfg(test)]
-use train::model_family::{synthetic_qwen35_dense_config, synthetic_qwen35_hybrid_config};
+use crate::model_family::{synthetic_qwen35_dense_config, synthetic_qwen35_hybrid_config};
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -448,26 +448,7 @@ fn freeze_policy<P: GrpoPolicy>(model: &P, store: &mut TensorStore) {
     }
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        // Display (not Debug): `#[error(transparent)]` delegates to the inner
-        // error's Display impl, so the user sees the real message instead of
-        // `Error: Custom("...")`. Mirrors the `train_sft.rs` pattern.
-        Err(err) => {
-            eprintln!("[train_grpo] error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), CliError> {
-    let args = parse_args()?;
-    run_with_args(args)
-}
-
-#[allow(dead_code)]
-pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
+pub fn dispatch_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -520,7 +501,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
     let controller = TrainingController::new();
     let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
-    let run_id = train::metrics::default_run_id("train_grpo");
+    let run_id = crate::metrics::default_run_id("train_grpo");
     let run_timer = Instant::now();
     let save_path_string = args
         .save_path
@@ -727,7 +708,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             ("best_mean_reward", best_mean_reward as f64),
             ("mean_kl", last_kl as f64),
         ];
-        metrics.emit_metric(&train::metrics::MetricSample {
+        metrics.emit_metric(&crate::metrics::MetricSample {
             step: (args.sft_steps as u64) + (iter as u64) + 1,
             phase: "grpo",
             fields: &fields,
@@ -773,7 +754,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
                     ("artifact_state", "trainer_state.json"),
                     ("artifact_optimizer", "optimizer.safetensors"),
                 ];
-                metrics.emit_event(&train::metrics::TrainEvent {
+                metrics.emit_event(&crate::metrics::TrainEvent {
                     kind: "checkpoint",
                     step: Some((completed_sft_steps + iter + 1) as u64),
                     strings: &strings,
@@ -783,7 +764,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             }
         } else if save_requested {
             let strings = [("run_id", run_id.as_str()), ("reason", "save_without_path")];
-            metrics.emit_event(&train::metrics::TrainEvent {
+            metrics.emit_event(&crate::metrics::TrainEvent {
                 kind: "status",
                 step: Some((args.sft_steps + iter + 1) as u64),
                 strings: &strings,
@@ -830,7 +811,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             ("artifact_state", "trainer_state.json"),
             ("artifact_optimizer", "optimizer.safetensors"),
         ];
-        metrics.emit_event(&train::metrics::TrainEvent {
+        metrics.emit_event(&crate::metrics::TrainEvent {
             kind: "checkpoint",
             step: Some((completed_sft_steps + completed_grpo_iters) as u64),
             strings: &strings,
@@ -874,7 +855,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
 /// copy per step and only fed the println, no correctness concern.
 fn run_sft_phase<P>(
     args: &CliArgs,
-    metrics: train::metrics::SharedSink,
+    metrics: crate::metrics::SharedSink,
     controller: Arc<TrainingController>,
     policy: &P,
     params: &[TensorId],
@@ -1180,10 +1161,6 @@ fn save_grpo_checkpoint<F: SyntheticGrpoFamily>(
     Ok(step_dir)
 }
 
-fn parse_args() -> Result<CliArgs, CliError> {
-    parse_args_from(env::args().skip(1))
-}
-
 fn parse_args_from<I>(mut iter: I) -> Result<CliArgs, CliError>
 where
     I: Iterator<Item = String>,
@@ -1335,7 +1312,7 @@ fn copy_reward(prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool])
     }
 }
 
-fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
+fn mean_reward(trajectories: &[crate::rollout::Trajectory]) -> f32 {
     if trajectories.is_empty() {
         0.0
     } else {
