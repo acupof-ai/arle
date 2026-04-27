@@ -1313,6 +1313,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+  if (transpose_ && group_size_ == 16 && bits_ == 6) {
+    vector_limit = M + 1;
+  }
   auto mode = quantization_mode_to_string(mode_);
   // It is a matrix matrix product.
   if (M >= vector_limit) {
