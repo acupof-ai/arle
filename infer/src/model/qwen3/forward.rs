@@ -175,6 +175,7 @@ impl ModelForward for Qwen3Model {
                 self.config.intermediate_size,
                 self.config.vocab_size,
                 mixed_total_tokens.max(1),
+                max_batch_size,
                 num_heads,
                 metadata_max_pages,
             )
@@ -187,6 +188,12 @@ impl ModelForward for Qwen3Model {
             .saturating_add(2usize.saturating_mul(q_dim))
             .saturating_add(2usize.saturating_mul(kv_dim))
             .saturating_add(3usize.saturating_mul(self.config.intermediate_size));
+        // Activation holds the SUM of all packed prefill rows in one step.
+        // `step_mixed_launch` / `step_prefill_batch` build a single
+        // `PrefillBuffers` whose row count = Σ per-row chunk sizes, capped
+        // by `prefill_budget_tokens` (= `max_prefill_tokens`). Sizing for
+        // just `chunked_prefill_size` would OOM under multi-row prefill
+        // (codex review caught this on the original Fix 1 attempt).
         let prefill_activation = prefill_activation_dims
             .saturating_mul(prefill_budget_tokens)
             .saturating_mul(2);
