@@ -149,6 +149,14 @@ jobs:
         with:
           name: linux-x86_64
 
+      - name: Check out repo (for install.sh)
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Stage install.sh
+        run: cp src/scripts/install.sh install.sh
+
       - name: Generate release checksums
         run: sha256sum arle-${{ github.ref_name }}-*.tar.gz > SHA256SUMS.txt
 
@@ -170,3 +178,29 @@ jobs:
             arle-${{ github.ref_name }}-macos-arm64.tar.gz
             arle-${{ github.ref_name }}-linux-x86_64.tar.gz
             SHA256SUMS.txt
+            install.sh
+
+  # ── Homebrew tap bump ─────────────────────────────────────────────────────────
+  # Requires repository secret HOMEBREW_TAP_TOKEN: a PAT (or fine-grained token)
+  # with `Contents: Read and write` scope on cklxx/homebrew-tap.
+  bump-homebrew:
+    name: Bump Homebrew formula
+    needs: create-release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref_name, '-') }}  # skip pre-releases (e.g. v0.1.0-rc1)
+    steps:
+      - name: Update Formula/arle.rb in cklxx/homebrew-tap
+        uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: arle
+          formula-path: Formula/arle.rb
+          homebrew-tap: cklxx/homebrew-tap
+          base-branch: main
+          tag-name: ${{ github.ref_name }}
+          download-url: https://github.com/cklxx/arle/releases/download/${{ github.ref_name }}/arle-${{ github.ref_name }}-macos-arm64.tar.gz
+          commit-message: |
+            arle ${{ github.ref_name }}
+
+            Created by https://github.com/mislav/bump-homebrew-formula-action
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

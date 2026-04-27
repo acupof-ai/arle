@@ -1,7 +1,8 @@
 # Maintainer Doc Index
 
 > **Looking for getting-started, install, or HTTP API docs?** Go to
-> [README.md](../README.md), [docs/troubleshooting.md](troubleshooting.md), or
+> [README.md](../README.md), [docs/install.md](install.md),
+> [docs/troubleshooting.md](troubleshooting.md), or
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
 
