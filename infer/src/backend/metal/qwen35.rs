@@ -109,6 +109,8 @@ pub(super) struct MetalQwen35BlockWeights {
     pub(super) mlp: MlpKind,
 }
 
+const RUST_PREFILL_MATERIALIZE_TOKENS: usize = 32;
+
 pub(super) enum Qwen35Embedding {
     Dense(MlxArray),
     GgufPacked(WeightTensor),
@@ -2318,6 +2320,24 @@ fn register_qwen35_moe_layer(model: *mut std::ffi::c_void, moe: &MetalQwen35MoeW
     true
 }
 
+fn materialize_qwen35_rust_prefill_state(
+    logits: &MlxArray,
+    k_caches: &[MlxArray],
+    v_caches: &[MlxArray],
+    recurrent: &MetalRecurrentState,
+) {
+    let mut refs = Vec::with_capacity(
+        1 + k_caches.len() + v_caches.len() + recurrent.states.len() + recurrent.conv_states.len(),
+    );
+    refs.push(logits);
+    refs.extend(k_caches.iter());
+    refs.extend(v_caches.iter());
+    refs.extend(recurrent.states.iter());
+    refs.extend(recurrent.conv_states.iter());
+    super::mlx::eval(&refs);
+    clear_metal_cache();
+}
+
 pub(super) fn metal_generate_qwen35(
     input_ids: &[u32],
     weights: &Qwen35MetalWeights,
@@ -2471,6 +2491,7 @@ pub(super) fn metal_generate_qwen35(
     let mut logits = None;
     let trace_rust_prefill = weights.cpp_model.is_none() && metal_qwen35_trace_enabled();
     let prefill_started = trace_rust_prefill.then(Instant::now);
+    let rust_scalar_prefill = weights.cpp_model.is_none();
     for (idx, &token) in input_ids.iter().enumerate() {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
         let step_logits = do_step(
@@ -2491,9 +2512,15 @@ pub(super) fn metal_generate_qwen35(
             prompt_outputs.extend(gdr_flat.iter());
             super::mlx::eval(&prompt_outputs);
         }
-        logits = Some(step_logits);
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
+        if rust_scalar_prefill
+            && idx + 1 != input_ids.len()
+            && (idx + 1).is_multiple_of(RUST_PREFILL_MATERIALIZE_TOKENS)
+        {
+            materialize_qwen35_rust_prefill_state(&step_logits, &k_caches, &v_caches, &recurrent);
+        }
+        logits = Some(step_logits);
     }
     if let Some(prefill_started) = prefill_started {
         eprintln!(
