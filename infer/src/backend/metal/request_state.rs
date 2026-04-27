@@ -21,87 +21,16 @@ use crate::sampler::SamplingParams;
 
 const METAL_REQUEST_STATE_ID: usize = 0;
 
-fn metal_qwen35_trace_enabled() -> bool {
-    std::env::var("AGENT_INFER_METAL_QWEN35_TRACE")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-}
+#[path = "request_state/helpers.rs"]
+mod helpers;
 
-fn round_up_kv_capacity(tokens: i32) -> i32 {
-    ((tokens + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK
-}
+#[path = "request_state/tests.rs"]
+mod tests_mod;
 
-fn left_pad_kv_cache_row(
-    array: &MlxArray,
-    left_pad: i32,
-    cache_len: i32,
-    target_kv_capacity: i32,
-) -> MlxArray {
-    let shape = array.shape();
-    debug_assert_eq!(shape.len(), 4);
-    debug_assert_eq!(shape[0], 1);
-    debug_assert!(left_pad >= 0);
-    debug_assert!(cache_len >= 0);
-    debug_assert!(left_pad + cache_len <= target_kv_capacity);
-
-    let n_kv = shape[1];
-    let head_dim = shape[3];
-    let mut padded = zeros(&[1, n_kv, target_kv_capacity, head_dim], array.dtype());
-    if cache_len == 0 {
-        return padded;
-    }
-
-    let valid = slice(
-        array,
-        &[0, 0, 0, 0],
-        &[1, n_kv, cache_len, head_dim],
-        &[1, 1, 1, 1],
-    );
-    padded = super::mlx::slice_update(
-        &mut padded,
-        &valid,
-        &[0, 0, left_pad, 0],
-        &[1, n_kv, left_pad + cache_len, head_dim],
-    );
-    padded
-}
-
-fn strip_left_padding_from_packed_row(
-    array: &MlxArray,
-    row: i32,
-    left_pad: i32,
-    batch_cache_len: i32,
-    row_kv_capacity: i32,
-) -> MlxArray {
-    let row_slice = slice_row(array, row);
-    let shape = row_slice.shape();
-    debug_assert_eq!(shape.len(), 4);
-    debug_assert_eq!(shape[0], 1);
-    debug_assert!(left_pad >= 0);
-    debug_assert!(batch_cache_len >= left_pad);
-
-    let n_kv = shape[1];
-    let head_dim = shape[3];
-    let valid_len = batch_cache_len - left_pad;
-    let mut unpadded = zeros(&[1, n_kv, row_kv_capacity, head_dim], row_slice.dtype());
-    if valid_len == 0 {
-        return unpadded;
-    }
-
-    let valid = slice(
-        &row_slice,
-        &[0, 0, left_pad, 0],
-        &[1, n_kv, batch_cache_len, head_dim],
-        &[1, 1, 1, 1],
-    );
-    unpadded = super::mlx::slice_update(
-        &mut unpadded,
-        &valid,
-        &[0, 0, 0, 0],
-        &[1, n_kv, valid_len, head_dim],
-    );
-    unpadded
-}
+use helpers::{
+    left_pad_kv_cache_row, metal_qwen35_trace_enabled, round_up_kv_capacity, slice_row,
+    strip_left_padding_from_packed_row,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetalRequestPhase {
@@ -2636,15 +2565,6 @@ fn decode_qwen35_batch(
     Ok(sampled_tokens)
 }
 
-fn slice_row(array: &MlxArray, row: i32) -> MlxArray {
-    let mut start = vec![0; array.shape().len()];
-    let mut end = array.shape().to_vec();
-    let strides = vec![1; array.shape().len()];
-    start[0] = row;
-    end[0] = row + 1;
-    slice(array, &start, &end, &strides)
-}
-
 fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver<'_>>]) -> bool {
     let Some((first, rest)) = states.split_first() else {
         return false;
@@ -4031,156 +3951,5 @@ impl StepDriver for Qwen35StepDriver<'_> {
             dflash.prefetched_draft = None;
         }
         self.ensure_cpp_session_drained()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    struct FakeDriver {
-        prefill_outputs: VecDeque<Option<u32>>,
-        decode_outputs: VecDeque<u32>,
-        cleanup_calls: Arc<AtomicUsize>,
-    }
-
-    impl FakeDriver {
-        fn new(
-            prefill_outputs: impl IntoIterator<Item = Option<u32>>,
-            decode_outputs: impl IntoIterator<Item = u32>,
-            cleanup_calls: Arc<AtomicUsize>,
-        ) -> Self {
-            Self {
-                prefill_outputs: prefill_outputs.into_iter().collect(),
-                decode_outputs: decode_outputs.into_iter().collect(),
-                cleanup_calls,
-            }
-        }
-    }
-
-    impl StepDriver for FakeDriver {
-        fn prefill_token(&mut self, _token: u32, _terminal_prompt: bool) -> Result<Option<u32>> {
-            self.prefill_outputs
-                .pop_front()
-                .context("missing fake prefill output")
-        }
-
-        fn decode_token(&mut self, _token: u32) -> Result<u32> {
-            self.decode_outputs
-                .pop_front()
-                .context("missing fake decode output")
-        }
-
-        fn cleanup(&mut self) -> Result<()> {
-            self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn prefill_chunk_only_emits_a_token_once_the_prompt_finishes() {
-        let cleanup_calls = Arc::new(AtomicUsize::new(0));
-        let mut state = ResumableRequestState::new(
-            FakeDriver::new([None, None, None, Some(41)], [], cleanup_calls.clone()),
-            vec![1, 2, 3, 4],
-            3,
-            vec![],
-            99,
-            false,
-        )
-        .expect("state");
-
-        let first = state.prefill_chunk(2).expect("chunk 1");
-        assert_eq!(
-            first,
-            PrefillChunkResult {
-                processed_tokens: 2,
-                emitted_token: None,
-                phase: MetalRequestPhase::Prefill,
-                finish_reason: None,
-            }
-        );
-        assert_eq!(state.prompt_progress(), 2);
-        assert_eq!(state.generated_tokens(), 0);
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 0);
-
-        let second = state.prefill_chunk(2).expect("chunk 2");
-        assert_eq!(second.processed_tokens, 2);
-        assert_eq!(second.emitted_token, Some(41));
-        assert_eq!(second.phase, MetalRequestPhase::Decode);
-        assert_eq!(state.prompt_progress(), 4);
-        assert_eq!(state.generated_tokens(), 1);
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn length_finish_cleans_up_after_decode_step() {
-        let cleanup_calls = Arc::new(AtomicUsize::new(0));
-        let mut state = ResumableRequestState::new(
-            FakeDriver::new([Some(7)], [8], cleanup_calls.clone()),
-            vec![1],
-            2,
-            vec![],
-            99,
-            false,
-        )
-        .expect("state");
-
-        let prefill = state.prefill_chunk(1).expect("prefill");
-        assert_eq!(prefill.emitted_token, Some(7));
-        assert_eq!(state.phase(), MetalRequestPhase::Decode);
-        assert_eq!(state.generated_tokens(), 1);
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 0);
-
-        let decoded = state.decode_step().expect("decode");
-        assert_eq!(decoded, Some(8));
-        assert_eq!(state.phase(), MetalRequestPhase::Finished);
-        assert_eq!(state.finish_reason(), Some("length"));
-        assert_eq!(state.generated_tokens(), 2);
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn stop_token_from_prefill_finishes_immediately() {
-        let cleanup_calls = Arc::new(AtomicUsize::new(0));
-        let mut state = ResumableRequestState::new(
-            FakeDriver::new([Some(42)], [], cleanup_calls.clone()),
-            vec![5],
-            4,
-            vec![42],
-            99,
-            false,
-        )
-        .expect("state");
-
-        let prefill = state.prefill_chunk(1).expect("prefill");
-        assert_eq!(prefill.emitted_token, Some(42));
-        assert_eq!(prefill.phase, MetalRequestPhase::Finished);
-        assert_eq!(prefill.finish_reason, Some("stop"));
-        assert_eq!(state.finish_reason(), Some("stop"));
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn dropping_incomplete_state_still_runs_cleanup_once() {
-        let cleanup_calls = Arc::new(AtomicUsize::new(0));
-        {
-            let state = ResumableRequestState::new(
-                FakeDriver::new([None, None], [], cleanup_calls.clone()),
-                vec![1, 2],
-                4,
-                vec![],
-                99,
-                false,
-            )
-            .expect("state");
-            assert_eq!(state.phase(), MetalRequestPhase::Prefill);
-        }
-
-        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
     }
 }
