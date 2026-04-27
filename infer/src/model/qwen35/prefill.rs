@@ -346,6 +346,10 @@ impl Qwen35Model {
         if metadata_reallocated {
             bufs.invalidate_graph();
         }
+        // FlashInfer plans once per forward; TileLang is plan-less so the
+        // plan_hd256 call is cfg-gated. The metadata uploads above are needed
+        // by both paths.
+        #[cfg(not(feature = "tilelang-attn"))]
         bufs.plan.plan_hd256(
             &self.ctx,
             &bufs.metadata.qo_indptr_host,
@@ -578,7 +582,17 @@ impl Qwen35Model {
                 .metadata
                 .kv_last_page_len_gpu
                 .device_ptr(&self.ctx.stream);
-            bufs.plan.run_hd256(
+            #[cfg(feature = "tilelang-attn")]
+            let max_qlen = bufs
+                .metadata
+                .qo_indptr_host
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .max()
+                .unwrap_or(0);
+            #[cfg(feature = "tilelang-attn")]
+            let total_pages = bufs.metadata.kv_indptr_host.last().copied().unwrap_or(0);
+            ops::prefill_attention_paged_run_hd256(
                 &self.ctx,
                 q_u64,
                 qoi_u64,
@@ -588,11 +602,19 @@ impl Qwen35Model {
                 kvidx_u64,
                 kvlpl_u64,
                 o_u64,
-                None,
+                #[cfg(not(feature = "tilelang-attn"))]
+                &mut bufs.plan,
+                #[cfg(feature = "tilelang-attn")]
+                pool,
                 bufs.metadata.batch_size,
+                bufs.seq_len,
                 c.num_attention_heads,
                 c.num_key_value_heads,
                 pool.page_size,
+                #[cfg(feature = "tilelang-attn")]
+                max_qlen,
+                #[cfg(feature = "tilelang-attn")]
+                total_pages,
             )?;
         }
 
@@ -897,6 +919,10 @@ impl Qwen35Model {
         if page_indices_reallocated {
             bufs.invalidate_graph();
         }
+        // FlashInfer plans once per forward; TileLang is plan-less so the
+        // plan_hd256 call is cfg-gated. The metadata uploads above are needed
+        // by both paths.
+        #[cfg(not(feature = "tilelang-attn"))]
         bufs.plan.plan_hd256(
             &self.ctx,
             &bufs.metadata.qo_indptr_host,
@@ -1104,7 +1130,17 @@ impl Qwen35Model {
                 .metadata
                 .kv_last_page_len_gpu
                 .device_ptr(&self.ctx.stream);
-            bufs.plan.run_hd256(
+            #[cfg(feature = "tilelang-attn")]
+            let max_qlen = bufs
+                .metadata
+                .qo_indptr_host
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .max()
+                .unwrap_or(0);
+            #[cfg(feature = "tilelang-attn")]
+            let total_pages = bufs.metadata.kv_indptr_host.last().copied().unwrap_or(0);
+            ops::prefill_attention_paged_run_hd256(
                 &self.ctx,
                 q_u64,
                 qoi_u64,
@@ -1114,11 +1150,19 @@ impl Qwen35Model {
                 kvidx_u64,
                 kvlpl_u64,
                 o_u64,
-                None,
+                #[cfg(not(feature = "tilelang-attn"))]
+                &mut bufs.plan,
+                #[cfg(feature = "tilelang-attn")]
+                pool,
                 1,
+                bufs.seq_len,
                 c.num_attention_heads,
                 c.num_key_value_heads,
                 pool.page_size,
+                #[cfg(feature = "tilelang-attn")]
+                max_qlen,
+                #[cfg(feature = "tilelang-attn")]
+                total_pages,
             )?;
         }
 
