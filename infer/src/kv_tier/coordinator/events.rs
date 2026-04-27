@@ -68,6 +68,12 @@ pub struct FetchedBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorCommand {
+    /// **Reserved for future distributed-scheduler centralization** — see
+    /// [`super::super::Coordinator::handle_plan`] for the rationale. Not wired
+    /// into the live single-scheduler readmission path. Tests cover the
+    /// API contract so the surface stays buildable; production callers
+    /// should NOT add a `submit_prefetch_plan → wait PlanCompleted →
+    /// submit_fetch` round-trip today.
     Plan {
         ticket: PlanTicket,
         blocks: Vec<PrefetchPlanRequest>,
@@ -120,14 +126,21 @@ pub enum CoordinatorEvent {
         class: FailureClass,
         reason: String,
     },
+    /// Reserved for the M5+ distributed-scheduler use case. See the doc on
+    /// [`CoordinatorCommand::Plan`] and on
+    /// [`super::super::Coordinator::handle_plan`]. The single-scheduler
+    /// runtime emits these only when tests drive `submit_prefetch_plan`
+    /// directly.
     PlanQueued {
         ticket: PlanTicket,
         block_count: usize,
     },
+    /// See [`CoordinatorEvent::PlanQueued`] — reserved API.
     PlanCompleted {
         ticket: PlanTicket,
         plans: Vec<PrefetchPlan>,
     },
+    /// See [`CoordinatorEvent::PlanQueued`] — reserved API.
     PlanFailed {
         ticket: PlanTicket,
         failed_block: BlockId,

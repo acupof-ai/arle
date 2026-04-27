@@ -172,6 +172,49 @@ impl Coordinator {
         Ok(class.into_outcome())
     }
 
+    /// Classify each requested block by source location and emit a
+    /// [`PrefetchPlan`] list back to the caller.
+    ///
+    /// # Status: reserved API, not wired into the live readmission path
+    ///
+    /// Today the single-scheduler CUDA runtime does **not** call
+    /// [`super::builder::CoordinatorHandle::submit_prefetch_plan`]. The
+    /// classification this method produces is a strict subset of what the
+    /// scheduler already has from [`crate::prefix_cache::RadixCache::lookup_or_stage`]
+    /// (`HitKind` per block) plus the inline `TieredKvPolicy::allow_prefetch`
+    /// check at `infer/src/scheduler/cuda/runtime.rs:767`, which already gates
+    /// `submit_fetch` on fetch-queue saturation. Adding a
+    /// `submit_prefetch_plan → wait PlanCompleted → submit_fetch` round-trip
+    /// would only introduce:
+    ///
+    /// - extra channel latency on every readmission,
+    /// - a new stale-plan race (queue / slot / eviction state can change
+    ///   between `PlanCompleted` and `submit_fetch`),
+    /// - and another failure path,
+    ///
+    /// without giving the coordinator any state the scheduler does not
+    /// already have. See `feedback_no_speculative_interface_shaping.md`.
+    ///
+    /// # When this becomes useful
+    ///
+    /// The Plan path is reserved for an M5+ **distributed-scheduler**
+    /// scenario where the coordinator owns state the scheduler cannot
+    /// know locally:
+    ///
+    /// - cross-scheduler fetch dedupe,
+    /// - remote peer locality,
+    /// - shared-backend pressure,
+    /// - multi-instance queue pressure,
+    /// - transport-level bandwidth arbitration.
+    ///
+    /// At that point centralizing the policy decision earns the
+    /// round-trip. Until then this method exists only to keep the API
+    /// surface buildable; tests cover its contract so the shape stays
+    /// honest.
+    ///
+    /// Recommendation backed by codex review consultation 2026-04-27 and
+    /// the `2026-04-22-profile-kv-tier-...` wins entry that already noted
+    /// `submit_prefetch_plan` had no runtime call site.
     fn handle_plan(
         &self,
         ticket: PlanTicket,
