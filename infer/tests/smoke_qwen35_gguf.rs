@@ -26,6 +26,8 @@ fn qwen35_gguf_generate() {
             sampling: SamplingParams::default(),
             stop: None,
             logprobs: false,
+            session_id: None,
+            trace_context: None,
         };
         let out = engine.complete(req).unwrap();
         println!(

@@ -138,6 +138,8 @@ fn regen_test_data() {
             },
             stop: None,
             logprobs: false,
+            session_id: None,
+            trace_context: None,
         };
         let resp = engine.complete(req).expect("complete failed");
         let output = resp.text;

@@ -53,6 +53,8 @@ fn qwen3_4b_gguf_generate() {
             sampling: SamplingParams::default(),
             stop: None,
             logprobs: false,
+            session_id: None,
+            trace_context: None,
         };
         // Use the sync complete() so we can see the token_ids directly.
         let out = match &mut engine {

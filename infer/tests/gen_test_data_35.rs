@@ -74,6 +74,8 @@ fn generate_qwen35_test_data() {
                 sampling: SamplingParams::default(),
                 stop: None,
                 logprobs: false,
+                session_id: None,
+                trace_context: None,
             })
             .expect("complete() failed");
 
