@@ -19,6 +19,70 @@ Related governance docs:
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-04-27
+
+Packaging fix release: macOS bottles and release tarballs were missing
+`mlx.metallib`, so every `metal_serve` model load on a fresh install
+hit "Failed to load the default metallib". v0.1.3 ships the metallib
+alongside the binaries on every distribution channel. Also folds in
+the scheduler `cuda/runtime.rs` + `cuda/core.rs` splits and the Phase 2
+KV swap revert. Pre-built artifacts on the
+[GitHub Release page](https://github.com/cklxx/arle/releases/tag/v0.1.3)
+and on GHCR (`ghcr.io/cklxx/arle:0.1.3`, `:0.1`, `:latest`).
+
+### Tooling / packaging
+
+- `scripts/package_macos_metal_artifact.sh` bundles `mlx.metallib`
+  into the macOS tarball (auto-discovers from the cargo build dir;
+  override via `ARLE_MLX_METALLIB`). MLX's `load_default_library`
+  searches binary-colocated paths, so without this the brew bottle
+  and curl-installed binaries fell straight through to the
+  compile-time `METAL_PATH` (a cmake build dir absent in
+  distribution).
+- `scripts/install.sh` installs `mlx.metallib` next to the binaries
+  on macOS-arm64.
+- `crates/mlx-sys/build.rs` stages `mlx.metallib` into
+  `target/<profile>/` after the cmake build, so locally-built
+  `metal_serve` works without colocating the metallib by hand.
+- `cklxx/homebrew-tap` formula picks up `mlx.metallib` via
+  `bin.install "mlx.metallib" if File.exist?("mlx.metallib")` — no
+  effect on installs of older tarballs that don't ship the file.
+
+### Scheduler
+
+- `infer/src/scheduler/cuda/runtime.rs` split into
+  `runtime/{admission,fetch,helpers,scheduler_loop,swap,tests}.rs` to
+  contain the per-iteration scheduler loop. Behavior unchanged.
+- `infer/src/scheduler/cuda/core.rs` extracted into
+  `helpers/state_types/emit_worker/construction/warmup` siblings —
+  same flat-module-no-`mod.rs` shape used elsewhere.
+- Phase 2 KV swap path deleted entirely (vLLM V1 / SGLang precedent
+  — tier demote/promote already covers the workload that motivated
+  swap; the dual path was not paying its complexity cost).
+- Host pool for the now-removed swap path right-sized while the
+  revert was in flight; entry recorded under `errors/`.
+
+### Metal
+
+- Qwen3.5 prefill: Rust fallback path now materializes its hidden
+  state correctly when the C++ prefill bails out (previously
+  returned a stale handle).
+- Qwen3.6 MoE wired through the C++ prefill alongside Qwen3.5 so the
+  large model uses the same fused step path.
+- `mlx-sys` FFI guard shared across the `infer` and `autograd`
+  crates so MLX process-global state has one Rust synchronization
+  boundary regardless of which side enters MLX first.
+
+### HTTP
+
+- `infer/src/http_server.rs` split into
+  `http_server/{types,handlers,router,tests}.rs`. Behavior unchanged.
+
+### Refactors
+
+- `infer/src/backend/metal/request_state.rs` extracted into helper
+  modules + standalone tests.
+
 ## [0.1.2] — 2026-04-27
 
 Engine consolidation, Metal GGUF perf, train binary migration, and a
