@@ -1664,9 +1664,11 @@ void qwen35_compiled_push_full_attn_v2(
         lw.full.o_proj = qwen35_weight_by_id(m, o_id);
         lw.full.q_norm_w = *to_arr(q_norm);
         lw.full.k_norm_w = *to_arr(k_norm);
-        lw.full.gate_up = qwen35_weight_by_id(m, gate_up_id);
-        lw.full.down = qwen35_weight_by_id(m, down_id);
-        lw.full.gate_dim = gate_dim;
+        if (gate_up_id >= 0 && down_id >= 0) {
+            lw.full.gate_up = qwen35_weight_by_id(m, gate_up_id);
+            lw.full.down = qwen35_weight_by_id(m, down_id);
+            lw.full.gate_dim = gate_dim;
+        }
         m->layers.push_back(std::move(lw));
         m->n_full_attn++;
     });
@@ -1724,9 +1726,11 @@ void qwen35_compiled_push_gdr_v2(
         float inv = 1.0f / std::sqrt((float)key_dim);
         lw.gdr.q_scale_arr = astype(array(inv * inv), bfloat16);
         lw.gdr.k_scale_arr = astype(array(inv), bfloat16);
-        lw.gdr.gate_up = qwen35_weight_by_id(m, gate_up_id);
-        lw.gdr.down = qwen35_weight_by_id(m, down_id);
-        lw.gdr.gate_dim = gate_dim;
+        if (gate_up_id >= 0 && down_id >= 0) {
+            lw.gdr.gate_up = qwen35_weight_by_id(m, gate_up_id);
+            lw.gdr.down = qwen35_weight_by_id(m, down_id);
+            lw.gdr.gate_dim = gate_dim;
+        }
         m->layers.push_back(std::move(lw));
         m->n_gdr++;
     });
@@ -1817,9 +1821,11 @@ void qwen35_compiled_set_separate_proj_v2(
         lw.z_proj = qwen35_weight_by_id(m, z_id);
         lw.b_proj = qwen35_weight_by_id(m, b_id);
         lw.a_proj = qwen35_weight_by_id(m, a_id);
-        lw.gate_proj = qwen35_weight_by_id(m, gate_id);
-        lw.up_proj = qwen35_weight_by_id(m, up_id);
-        lw.has_separate_mlp = true;
+        if (gate_id >= 0 && up_id >= 0) {
+            lw.gate_proj = qwen35_weight_by_id(m, gate_id);
+            lw.up_proj = qwen35_weight_by_id(m, up_id);
+            lw.has_separate_mlp = true;
+        }
         lw.use_separate_proj = true;
     });
 }
