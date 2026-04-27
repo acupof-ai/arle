@@ -3,6 +3,7 @@
 Reference review:
 
 - [../reviews/2026-04-15-metal-ecosystem-route-correction.md](../reviews/2026-04-15-metal-ecosystem-route-correction.md)
+- [../experience/errors/2026-04-27-metal-serving-gap-vs-industry.md](../experience/errors/2026-04-27-metal-serving-gap-vs-industry.md)
 
 ## Current State
 
