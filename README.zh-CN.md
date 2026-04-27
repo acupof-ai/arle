@@ -30,9 +30,26 @@
 
 ## 快速开始
 
-### 1. 启动一个 OpenAI 兼容的服务
+### 1. 安装
 
-**Linux + NVIDIA — 直接拉镜像，无需编译：**
+**Apple Silicon — Homebrew（推荐）：**
+
+```bash
+brew install cklxx/tap/arle
+arle --doctor
+```
+
+**Apple Silicon 或 Linux x86_64 — 一行脚本：**
+
+```bash
+curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | sh
+```
+
+脚本会从最新 GitHub Release 下载对应 tarball、校验 SHA256、解压到
+`~/.local/bin`(可用 `INSTALL_DIR=...` 覆盖)。完整支持矩阵、环境变量与卸载步骤
+见 [docs/install.md](docs/install.md)。
+
+**Linux + NVIDIA — 直接拉 Docker 镜像，无需编译：**
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
@@ -42,21 +59,29 @@ docker run --rm --gpus all -p 8000:8000 \
 ```
 
 `:latest` 跟踪 `main`；打过 tag 的版本会发布为
-`ghcr.io/cklxx/arle:X.Y.Z`（注意：没有 `v` 前缀 —— docker metadata-action
-默认会去掉）。当前 v0.1.0 对应 `ghcr.io/cklxx/arle:0.1.0`。
-GitHub Release 页面：[Releases](https://github.com/cklxx/arle/releases)。
+`ghcr.io/cklxx/arle:X.Y.Z`(注意：没有 `v` 前缀)。当前 v0.1.0 对应
+`ghcr.io/cklxx/arle:0.1.0`。
 
-**Apple Silicon — 从源码构建（Metal 后端）：**
+**从源码构建**(任意后端;`cpu`、`tilelang-attn`、本地开发需要)：
 
 ```bash
 git clone https://github.com/cklxx/arle && cd arle
+# Apple Silicon:
 cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
-./target/release/arle --doctor
-./target/release/arle serve --backend metal \
-  --model-path mlx-community/Qwen3-0.6B-4bit --port 8000
+# Linux + NVIDIA:
+cargo build --release --features cli --bin arle
 ```
 
-### 2. 调用它
+### 2. 启动服务
+
+```bash
+arle serve --backend metal \
+  --model-path mlx-community/Qwen3-0.6B-4bit --port 8000   # Apple Silicon
+arle serve --backend cuda \
+  --model-path /path/to/Qwen3-4B --port 8000               # Linux + NVIDIA
+```
+
+### 3. 调用它
 
 ```python
 # pip install openai
@@ -71,16 +96,15 @@ print(client.chat.completions.create(
 
 curl 版本见 [`examples/curl_chat.sh`](examples/curl_chat.sh)，更多示例在 [`examples/`](examples/)。
 
-### 3. 跑本地 agent
+### 4. 跑本地 agent
 
 ```bash
-./target/release/arle                                      # 交互式 REPL，内置工具
-./target/release/arle --model-path /path/to/Qwen3-4B \
-  run --prompt "总结这个仓库"                              # 一次性 prompt
-./target/release/arle --doctor --json                      # 自检，机器可读输出
+arle                                                       # 交互式 REPL，内置工具
+arle --model-path /path/to/Qwen3-4B run --prompt "总结这个仓库"           # 一次性 prompt
+arle --doctor --json                                       # 自检，机器可读输出
 ```
 
-仅 CPU 的冒烟构建（无需 GPU）：
+仅 CPU 的冒烟构建(无需 GPU,源码构建)：
 
 ```bash
 cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle

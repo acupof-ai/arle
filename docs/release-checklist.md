@@ -98,6 +98,9 @@ Current release automation publishes:
   containing `arle`, `infer`, and `bench_serving`
 - macOS arm64 Metal artifacts named `arle-<version>-macos-arm64.tar.gz`
   containing `arle` and `metal_serve`
+- the `install.sh` shell installer (uploaded as a top-level release asset
+  so `curl -fsSL .../releases/latest/download/install.sh | sh` resolves)
+- `SHA256SUMS.txt` (consumed by `install.sh` for verification)
 - branch CI uploads the same tarball layout for validation
 
 Before release, verify:
@@ -107,11 +110,32 @@ Before release, verify:
 - `.github/workflows/metal-ci.yml` still mirrors the same macOS
   packaging script used by release packaging
 - both workflows still call `scripts/package_macos_metal_artifact.sh`
+- `scripts/install.sh` still matches the artifact naming used by
+  release packaging (platform string, binary list)
 - artifact names are correct
 - packaged binaries are the intended ones (`arle`, `infer`, `bench_serving` on
   Linux; `arle`, `metal_serve` on macOS)
 - unpacked artifacts pass the local smoke check:
   `./arle --doctor --json` and `./arle serve --help`
+
+### 4a. Homebrew tap
+
+The `bump-homebrew` job in `release.yml` updates
+[`cklxx/homebrew-tap`](https://github.com/cklxx/homebrew-tap)'s
+`Formula/arle.rb` after `create-release` succeeds. It needs:
+
+- repository secret `HOMEBREW_TAP_TOKEN` — a fine-grained PAT scoped to
+  `cklxx/homebrew-tap` with `Contents: Read and write`. Without it the
+  job fails (the rest of the release still ships).
+- the tag must not contain `-` (pre-releases like `v0.2.0-rc1` are skipped).
+
+After the bump PR/commit lands, validate:
+
+```bash
+brew update
+brew install cklxx/tap/arle
+arle --doctor
+```
 
 ---
 

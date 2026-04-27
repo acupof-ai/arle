@@ -30,9 +30,27 @@
 
 ## Quick Start
 
-### 1. Run an OpenAI-compatible server
+### 1. Install
 
-**Linux + NVIDIA — pull the published image, no compile:**
+**Apple Silicon — Homebrew (recommended):**
+
+```bash
+brew install cklxx/tap/arle
+arle --doctor
+```
+
+**Apple Silicon or Linux x86_64 — one-line installer:**
+
+```bash
+curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | sh
+```
+
+The script grabs the matching tarball from the latest GitHub Release,
+SHA256-verifies it, and drops the binaries into `~/.local/bin` (override
+with `INSTALL_DIR=...`). See [docs/install.md](docs/install.md) for the full
+matrix, env-var overrides, and uninstall steps.
+
+**Linux + NVIDIA — pull the published Docker image, no compile:**
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
@@ -43,21 +61,28 @@ docker run --rm --gpus all -p 8000:8000 \
 
 The `:latest` tag tracks `main`; tagged releases are published as
 `ghcr.io/cklxx/arle:X.Y.Z` (note: no `v` prefix — docker metadata-action
-strips it). For v0.1.0 today: `ghcr.io/cklxx/arle:0.1.0`. See
-[Releases](https://github.com/cklxx/arle/releases) for the matching
-GitHub Release page.
+strips it). For v0.1.0 today: `ghcr.io/cklxx/arle:0.1.0`.
 
-**Apple Silicon — build from source (Metal backend):**
+**From source** (any backend; needed for `cpu`, `tilelang-attn`, or local hacking):
 
 ```bash
 git clone https://github.com/cklxx/arle && cd arle
+# Apple Silicon:
 cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
-./target/release/arle --doctor
-./target/release/arle serve --backend metal \
-  --model-path mlx-community/Qwen3-0.6B-4bit --port 8000
+# Linux + NVIDIA:
+cargo build --release --features cli --bin arle
 ```
 
-### 2. Talk to it
+### 2. Serve a model
+
+```bash
+arle serve --backend metal \
+  --model-path mlx-community/Qwen3-0.6B-4bit --port 8000   # Apple Silicon
+arle serve --backend cuda \
+  --model-path /path/to/Qwen3-4B --port 8000               # Linux + NVIDIA
+```
+
+### 3. Talk to it
 
 ```python
 # pip install openai
@@ -73,16 +98,15 @@ print(client.chat.completions.create(
 Or with curl: see [`examples/curl_chat.sh`](examples/curl_chat.sh).
 More copy-paste paths: [`examples/`](examples/).
 
-### 3. Run the local agent
+### 4. Run the local agent
 
 ```bash
-./target/release/arle                                      # interactive REPL with built-in tools
-./target/release/arle --model-path /path/to/Qwen3-4B \
-  run --prompt "Summarize this repo"                       # one-shot
-./target/release/arle --doctor --json                      # self-check, machine-readable
+arle                                                       # interactive REPL with built-in tools
+arle --model-path /path/to/Qwen3-4B run --prompt "Summarize this repo"   # one-shot
+arle --doctor --json                                       # self-check, machine-readable
 ```
 
-CPU-only smoke build (no GPU required):
+CPU-only smoke build (no GPU required, source build):
 
 ```bash
 cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle
