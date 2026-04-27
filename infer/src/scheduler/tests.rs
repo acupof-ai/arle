@@ -130,11 +130,6 @@ async fn concurrent_submit_does_not_oversubscribe_waiting_capacity() {
     assert!(handle.is_full());
 }
 
-#[test]
-fn preemption_mode_default_is_recompute() {
-    assert_eq!(PreemptionMode::default(), PreemptionMode::Recompute);
-}
-
 fn make_batch_scheduler(
     num_gpu_blocks: usize,
     block_size: usize,
@@ -157,7 +152,6 @@ fn make_batch_scheduler_with_event_sink(
     let config = BatchSchedulerConfig {
         max_tokens_per_step: 4096,
         prefill_chunk_size: chunk_size,
-        preemption_mode: PreemptionMode::Recompute,
         ..Default::default()
     };
     let bm = crate::block_manager::BlockManager::new(num_gpu_blocks, 0, block_size);
