@@ -297,3 +297,27 @@ project and warrant their own evaluation.
   tranche — doc-only ledger entry so the next iteration of "全部接入"
   does not re-investigate. Decision recorded:
   [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-single-prefill-hd128-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-single-prefill-hd128-hd256-pending-remote.md).
+
+### Codex review pass (≥3 rounds, per user requirement)
+
+Three independent `codex review --commit <sha>` rounds ran against the
+chain. Outcomes:
+
+- **Round 1 — T4 (`4b0e3f6`)**: clean. *"I did not find any discrete
+  correctness issues introduced by commit 60c36ba in the reviewed
+  diff."* (commit hash rebased to `4b0e3f6` while reviews ran; same
+  diff content.)
+- **Round 2 — T3 (`02d0333`)**: P2 finding caught and fixed. Codex
+  flagged that `batch_decode_paged_hd256.py` `BLOCK_N=64 + NUM_STAGES=2`
+  produces ~128 KB dynamic shared memory, exceeding sm_89 / L4's ~99 KB
+  per-block cap — the cubin would not load on L4. Fix landed in
+  `ae35aed` (halved BLOCK_N to 32 to mirror the prefill HD256 twin),
+  bench-stub doc synced in `84fc783`.
+- **Round 3 — T2 (`58aa008`)**: clean. *"No discrete, actionable
+  correctness issues were found in the changes introduced by commit
+  58aa008. The default FlashInfer path remains intact, and the TileLang
+  HD256 path is consistently gated behind the opt-in feature."*
+
+T5 (`a4e873c`) is doc-only and was not separately reviewed. The T3 fix
+(`ae35aed`) is a single tile-constant change; trivial mechanical edit
+not separately reviewed.
