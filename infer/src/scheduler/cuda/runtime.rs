@@ -2,8 +2,8 @@ use super::budget::{PageBudget, estimated_request_target};
 use super::core::PrefetchTicketState;
 use super::core::{is_full_sealed_prefix, sealed_block_token_count};
 use super::{
-    ActiveRequest, CompletionStreamDelta, FinishReason, ModelForward, Ordering, Phase,
-    STATS_LOG_INTERVAL, Scheduler, TokenUsage, error, info, warn,
+    ActiveRequest, CompletionStreamDelta, FinishReason, GenerationState, ModelForward, Ordering,
+    Phase, STATS_LOG_INTERVAL, Scheduler, TokenUsage, error, info, warn,
 };
 use crate::kv_tier::{ReadmissionSource, RequestChunkState};
 use crate::scheduler::types::RequestLengthContract;
@@ -1457,6 +1457,15 @@ impl<M: ModelForward> Scheduler<M> {
             self.drain_request_rx();
             self.drain_coordinator_events();
             self.drain_emit_events();
+            // Phase 2 swap-in: resume any victims whose KV is parked on T1 and
+            // whose pool budget now allows restoration. MUST run before
+            // `wait_for_wakeup`: when every active slot is `Phase::WaitingFetch`,
+            // `is_fetch_wait_bound` parks the loop on coordinator events, but
+            // WholeKv swap-out never raises a coordinator event — without this
+            // pre-wait pass the swapped victims would sit forever. Synchronous;
+            // also runs before admission so resumed slots' page reservations
+            // are visible to `assign_slots`.
+            self.try_resume_swapped_victims();
             if !self.wait_for_wakeup() {
                 break;
             }
@@ -1547,7 +1556,14 @@ impl<M: ModelForward> Scheduler<M> {
             let Some(req) = req.as_ref() else {
                 continue;
             };
-            if req.delta_tx.is_closed() || matches!(req.phase, Phase::Finished) {
+            // Don't reserve for finished requests or for our own parked
+            // swap-out victims — their pages were intentionally freed and
+            // should be available to admit new requests. Normal prefix-fetch
+            // WaitingFetch waiters keep their reservation.
+            if req.delta_tx.is_closed()
+                || matches!(req.phase, Phase::Finished)
+                || Self::is_swap_out_victim(req)
+            {
                 continue;
             }
             admission_budget.reserve_target(estimated_request_target(
@@ -1584,19 +1600,99 @@ impl<M: ModelForward> Scheduler<M> {
                 candidate.incoming.max_tokens,
                 reserved_prefix_tokens,
             ) {
-                self.maybe_prefetch_staged_prefix(&candidate.plan);
-                let hint = WaitingRequestHint::from_plan(&candidate.plan, reusable_prefix_len);
-                self.release_admission_plan(&candidate.plan);
-                insert_deferred_waiting_request(
-                    &mut deferred_waiting,
-                    DeferredWaitingRequest {
-                        incoming: candidate.incoming,
-                        prompt_tokens: candidate.prompt_tokens,
-                        hint,
-                    },
-                    WaitingInsertBias::BeforeEqual,
-                );
-                continue;
+                // Phase 2 swap-out: under PreemptionMode::Swap, park as many
+                // active decode victims onto T1 as the new request requires.
+                // Loop because one swap-out frees only one victim's pages,
+                // but the candidate may need more than that to fit; without
+                // looping, the next tick would resume the parked victim
+                // (via `try_resume_swapped_victims`) before admission could
+                // try again, livelocking on T0↔T1 churn.
+                //
+                // Cap iterations at the current running-batch size so we
+                // can never spin past the supply of eligible victims.
+                let mut admit_after_swap = false;
+                if matches!(
+                    self.config.preemption_mode,
+                    crate::scheduler::PreemptionMode::Swap
+                ) {
+                    let max_swap_iters = self.running_batch.len();
+                    for _ in 0..max_swap_iters {
+                        let swapped = match self.try_swap_out_victim_for_admission() {
+                            Ok(true) => true,
+                            Ok(false) => false,
+                            Err(e) => {
+                                warn!("swap-out failed during admission: {}", e);
+                                false
+                            }
+                        };
+                        if !swapped {
+                            break;
+                        }
+                        // Rebuild the budget from the post-swap pool state
+                        // and replay every active request's target
+                        // reservation. The raw `from_scheduler` constructor
+                        // only reflects current residency, not the
+                        // not-yet-paid future allocations (max_tokens) the
+                        // running batch will eventually need — skipping that
+                        // replay would let admission over-commit.
+                        admission_budget =
+                            PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
+                        for (other_slot_idx, other_req) in self.active.iter().enumerate() {
+                            let Some(other_req) = other_req.as_ref() else {
+                                continue;
+                            };
+                            // Skip `Phase::WaitingFetch` so the parked swap
+                            // victims' ISL targets are NOT re-reserved — that
+                            // would cancel the freed pages and defer the
+                            // admission candidate after expensive T0→T1
+                            // copies. Their pages will be re-reserved on
+                            // swap-in through `try_resume_swapped_victims`.
+                            // Normal prefix-fetch WaitingFetch waiters keep
+                            // their ISL reservation — only WholeKv swap
+                            // victims are skipped.
+                            if other_req.delta_tx.is_closed()
+                                || matches!(other_req.phase, Phase::Finished)
+                                || Self::is_swap_out_victim(other_req)
+                            {
+                                continue;
+                            }
+                            admission_budget.reserve_target(estimated_request_target(
+                                other_slot_idx,
+                                other_req.prompt_tokens.len(),
+                                other_req.max_tokens,
+                                other_req.reusable_prefix_len,
+                            ));
+                        }
+                        available_free_slots = self.free_slots();
+                        if Self::can_reserve_full_isl(
+                            &admission_budget,
+                            slot_idx,
+                            candidate.prompt_tokens.len(),
+                            candidate.incoming.max_tokens,
+                            reserved_prefix_tokens,
+                        ) {
+                            admit_after_swap = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !admit_after_swap {
+                    self.maybe_prefetch_staged_prefix(&candidate.plan);
+                    let hint = WaitingRequestHint::from_plan(&candidate.plan, reusable_prefix_len);
+                    self.release_admission_plan(&candidate.plan);
+                    insert_deferred_waiting_request(
+                        &mut deferred_waiting,
+                        DeferredWaitingRequest {
+                            incoming: candidate.incoming,
+                            prompt_tokens: candidate.prompt_tokens,
+                            hint,
+                        },
+                        WaitingInsertBias::BeforeEqual,
+                    );
+                    continue;
+                }
+                // else: fall through to the admission-success path below.
             }
             if candidate.plan.attached_prefix_blocks.is_empty()
                 && candidate.plan.staged_prefix_plan.is_none()
@@ -1627,6 +1723,391 @@ impl<M: ModelForward> Scheduler<M> {
         self.restore_deferred_waiting_requests(deferred_waiting);
     }
 
+    /// Whether a request is a parked Phase 2 swap-out victim (vs a normal
+    /// prefix-fetch waiter). Both share `Phase::WaitingFetch`, but only
+    /// swap-out victims have a `WholeKv` staged plan; prefix-fetch waiters
+    /// hold a `Prefix` plan whose ISL target still needs reservation.
+    fn is_swap_out_victim(req: &super::request::ActiveRequest) -> bool {
+        matches!(req.phase, Phase::WaitingFetch)
+            && req
+                .staged_prefix
+                .as_ref()
+                .is_some_and(|plan| matches!(plan.kind, crate::kv_tier::PlanKind::WholeKv { .. }))
+    }
+
+    /// Release any T1 host-pinned regions held by a swap-out plan when the
+    /// owning request is being torn down (cancelled, finished, etc.).
+    ///
+    /// `WholeKv` plans own their host region for the lifetime of the
+    /// `Phase::WaitingFetch` parked state. The normal `cleanup` path drops
+    /// the request struct without touching the arena's `live_regions` set;
+    /// without this helper, a client disconnecting under swap pressure
+    /// would leak T1 memory until the pool runs dry.
+    ///
+    /// `Prefix`-kind plans don't own their regions (the coordinator does
+    /// via `release_unclaimed_fetch_regions`), so this is a no-op for them.
+    fn release_swapped_kv_regions(&mut self, plan: Option<&crate::kv_tier::ReadmissionPlan>) {
+        let Some(plan) = plan else { return };
+        if !matches!(&plan.kind, crate::kv_tier::PlanKind::WholeKv { .. }) {
+            return;
+        }
+        for block in &plan.blocks {
+            if let Some(crate::kv_tier::ReadmissionSource::HostPinned { region }) = &block.source {
+                self.release_host_region(*region);
+            }
+        }
+    }
+
+    /// Phase 2 swap-out: under `PreemptionMode::Swap`, pick one active
+    /// decode victim, copy its KV pages T0→T1 synchronously, transition
+    /// it to `Phase::WaitingFetch`, and free the pages so admission can
+    /// reuse them in the same tick.
+    ///
+    /// Returns `Ok(true)` on a successful park, `Ok(false)` if no eligible
+    /// victim is available or T1 is full, and `Err` for hard infrastructure
+    /// failures (T0 read, T1 write).
+    pub(super) fn try_swap_out_victim_for_admission(&mut self) -> anyhow::Result<bool> {
+        // Victim ordering: least decode progress first, longest prompt as
+        // tiebreaker (parking a long-prompt victim frees more pages).
+        //
+        // Eligibility filter excludes any slot whose `GenerationState` carries
+        // non-paged auxiliary state (hybrid recurrent / SSM models, where
+        // `supports_partial_prefix() == false`). `release_slot_pages_only`
+        // calls `state.reset()` which would zero that aux state, and the
+        // WholeKv plan only restores paged KV — resuming such a victim in
+        // `Phase::Decoding` would produce incorrect continuations. Pure
+        // attention models (Qwen3) are fully represented by paged KV and
+        // are safe to swap.
+        let Some(victim_slot) = self
+            .running_batch
+            .iter()
+            .copied()
+            .filter(|&slot| {
+                let phase_ok = self
+                    .active
+                    .get(slot)
+                    .and_then(|opt| opt.as_ref())
+                    .is_some_and(|req| matches!(req.phase, Phase::Decoding));
+                if !phase_ok {
+                    return false;
+                }
+                // Exclude slots with un-consumed GPU readback. `assign_slots`
+                // runs before `step_decode_readback`, so a freshly-launched
+                // decode batch's pending sampling/readback can still reference
+                // these slots' state. `release_slot_pages_only` resets state +
+                // frees pages, which would corrupt that pending readback —
+                // notably non-greedy `select_tokens_batch` reads `&mut states`.
+                if self.slot_has_pending_gpu_work(slot) {
+                    return false;
+                }
+                self.states
+                    .get(slot)
+                    .is_some_and(GenerationState::supports_partial_prefix)
+            })
+            .min_by_key(|&slot| {
+                let req = self.active[slot]
+                    .as_ref()
+                    .expect("filtered slot must be occupied");
+                (
+                    req.generated_tokens.len(),
+                    std::cmp::Reverse(req.prompt_tokens.len()),
+                )
+            })
+        else {
+            return Ok(false);
+        };
+
+        // Source of truth for "tokens materialized in paged KV" is the pool's
+        // own `seq_len`, NOT `prompt_tokens.len() + generated_tokens.len()`.
+        //
+        // Mid-decode invariant: `seq_len == prompt_len + gen_len - 1`. The
+        // most-recently-sampled token sits in `generated_tokens` but its KV
+        // has not yet been appended (it will be on the next decode tick, as
+        // that token's input). Saving exactly `seq_len` pages and restoring
+        // them preserves the same invariant on resume — the next decode tick
+        // feeds `generated_tokens.last()` as input and appends its KV
+        // identically to the un-swapped path.
+        let last_token_pos = self.paged_kv_pool.seq_len(victim_slot);
+        if last_token_pos == 0 {
+            return Ok(false);
+        }
+        let victim_id = self.active[victim_slot]
+            .as_ref()
+            .expect("victim slot must be occupied")
+            .id;
+
+        let pages = self.paged_kv_pool.page_indices(victim_slot).to_vec();
+        if pages.is_empty() {
+            return Ok(false);
+        }
+
+        let payload = self
+            .paged_kv_pool
+            .copy_pages_to_host(self.model.device_context(), &pages)
+            .map_err(|e| {
+                anyhow::anyhow!("swap-out T0 read failed for slot {}: {}", victim_slot, e)
+            })?;
+
+        let region = {
+            let mut pool = self.host_pinned_pool.lock()?;
+            match pool.reserve(payload.len())? {
+                Some(region) => region,
+                None => return Ok(false),
+            }
+        };
+
+        if let Err(err) = self.host_pinned_pool.write_region(region, &payload) {
+            self.release_host_region(region);
+            return Err(anyhow::anyhow!(
+                "swap-out T1 write failed for slot {}: {}",
+                victim_slot,
+                err
+            ));
+        }
+
+        // Synthetic block id: the WholeKv plan never enters the radix, so
+        // we just need a stable u32 that won't collide with real radix ids.
+        let synthetic_block_id =
+            crate::types::BlockId(u32::MAX ^ ((victim_id as u32) & 0x7FFF_FFFF));
+        let block = crate::kv_tier::ReadmissionBlock {
+            block_id: synthetic_block_id,
+            fingerprint: crate::types::BlockFingerprint([0; 16]),
+            source: Some(ReadmissionSource::HostPinned { region }),
+        };
+        let plan = crate::kv_tier::ReadmissionPlan::new_whole_kv(last_token_pos, vec![block]);
+
+        // Attach the plan + flip phase. If the slot was reused under us
+        // (shouldn't happen — we haven't yielded), bail and release T1.
+        let attached = match self.active[victim_slot].as_mut() {
+            Some(req) if req.id == victim_id => {
+                req.staged_prefix = Some(plan);
+                req.phase = Phase::WaitingFetch;
+                true
+            }
+            _ => false,
+        };
+        if !attached {
+            self.release_host_region(region);
+            return Ok(false);
+        }
+
+        self.dequeue_running(victim_slot);
+        self.release_slot_pages_only(victim_slot);
+
+        info!(
+            "Request {}: swap-out (Phase::WaitingFetch), {} tokens parked on T1",
+            victim_id, last_token_pos
+        );
+        Ok(true)
+    }
+
+    /// Phase 2 swap-in: scan WaitingFetch slots whose staged plan is a
+    /// `PlanKind::WholeKv` swap-out (NOT a prefix-cache fetch — those
+    /// still go through the coordinator). For each, if the pool can
+    /// satisfy the page demand, allocate fresh pages, copy T1→T0,
+    /// re-attach to the slot, and transition back to `Phase::Decoding`.
+    ///
+    /// Synchronous and tick-driven: runs at the top of `assign_slots` so
+    /// resumed slots' page reservations are visible to admission.
+    pub(super) fn try_resume_swapped_victims(&mut self) {
+        // First sweep: any swap-out victim whose client has disconnected
+        // gets finished now so cleanup can release its T1 region. Without
+        // this, closed WholeKv waiters never reach `collect_fetch_waiters`
+        // (they bypass the coordinator), and would otherwise sit in the
+        // slot forever pinning host memory.
+        let closed_swap_slots: Vec<usize> = self
+            .active
+            .iter()
+            .enumerate()
+            .filter_map(|(slot_idx, slot)| {
+                let req = slot.as_ref()?;
+                if !matches!(req.phase, Phase::WaitingFetch) {
+                    return None;
+                }
+                let plan = req.staged_prefix.as_ref()?;
+                if !matches!(plan.kind, crate::kv_tier::PlanKind::WholeKv { .. }) {
+                    return None;
+                }
+                req.delta_tx.is_closed().then_some(slot_idx)
+            })
+            .collect();
+        for slot_idx in closed_swap_slots {
+            self.finish_slot(slot_idx);
+        }
+
+        // Gather candidates first to avoid borrowing self.active across the
+        // mutating restoration loop.
+        let mut candidates: Vec<(usize, u64, crate::kv_tier::HostPinnedRegion, usize)> = Vec::new();
+        for (slot_idx, slot) in self.active.iter().enumerate() {
+            let Some(req) = slot.as_ref() else {
+                continue;
+            };
+            if !matches!(req.phase, Phase::WaitingFetch) {
+                continue;
+            }
+            let Some(plan) = req.staged_prefix.as_ref() else {
+                continue;
+            };
+            // Match by reference: `PlanKind`/`ReadmissionSource` are not `Copy`
+            // and `plan` is a shared borrow. Pull out copy-only data
+            // (`HostPinnedRegion` is `Copy`, `last_token_pos: usize` is `Copy`).
+            let last_token_pos = match &plan.kind {
+                crate::kv_tier::PlanKind::WholeKv { last_token_pos } => *last_token_pos,
+                crate::kv_tier::PlanKind::Prefix => continue,
+            };
+            // WholeKv plans are constructed with exactly one HostPinned block.
+            let Some(block) = plan.blocks.first() else {
+                continue;
+            };
+            let region = match &block.source {
+                Some(ReadmissionSource::HostPinned { region }) => *region,
+                _ => continue,
+            };
+            candidates.push((slot_idx, req.id, region, last_token_pos));
+        }
+
+        // If we have at least one WholeKv waiter, evict prefix-cache pages
+        // proactively. Swap-in is tick-driven (NOT coordinator-event-driven),
+        // so when every active slot is `WaitingFetch` and `assign_slots` has
+        // no candidates, `wait_for_wakeup` would otherwise park the loop on
+        // events that never arrive while reclaimable cache pages sit idle.
+        if !candidates.is_empty() {
+            let _ = self.evict_prefix_cache_if_pressured();
+        }
+
+        let page_size = self.paged_kv_pool.page_size.max(1);
+        // Build a budget that reserves the future-growth target of every
+        // currently-active non-WaitingFetch request. Without this, swap-in
+        // could restore a victim into pages that are physically free but
+        // earmarked for an admitted request's prompt/decode growth, undoing
+        // the admission headroom that swap-out earned.
+        let mut resume_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
+        for (other_slot_idx, other_req) in self.active.iter().enumerate() {
+            let Some(other_req) = other_req.as_ref() else {
+                continue;
+            };
+            // Reserve future-growth targets for everyone except finished
+            // requests and OUR OWN swap-out victims (they're being restored
+            // here; their pages will be re-reserved per-restoration). Normal
+            // prefix-fetch WaitingFetch requests keep their reservation so
+            // resume budget reflects actual headroom.
+            if other_req.delta_tx.is_closed()
+                || matches!(other_req.phase, Phase::Finished)
+                || Self::is_swap_out_victim(other_req)
+            {
+                continue;
+            }
+            resume_budget.reserve_target(estimated_request_target(
+                other_slot_idx,
+                other_req.prompt_tokens.len(),
+                other_req.max_tokens,
+                other_req.reusable_prefix_len,
+            ));
+        }
+        for (slot_idx, request_id, region, last_token_pos) in candidates {
+            let pages_needed = last_token_pos.div_ceil(page_size);
+            // Resume target: this victim's full ISL footprint (prompt +
+            // generated cushion). Use the same `estimated_request_target`
+            // helper as admission so the budget invariants stay symmetric.
+            let resume_target = self.active[slot_idx].as_ref().map_or_else(
+                || estimated_request_target(slot_idx, last_token_pos, 0, 0),
+                |req| {
+                    estimated_request_target(
+                        slot_idx,
+                        req.prompt_tokens.len(),
+                        req.max_tokens,
+                        req.reusable_prefix_len,
+                    )
+                },
+            );
+            if !resume_budget.can_fit_target(resume_target)
+                || self.paged_kv_pool.free_page_count() < pages_needed
+            {
+                // This victim does not fit, but a later smaller victim might
+                // — `continue` instead of `break` so we don't strand a
+                // ready-to-resume request behind a still-too-large one.
+                // Especially important when every active slot is
+                // WaitingFetch: `is_fetch_wait_bound` would otherwise park
+                // the loop with no coordinator event ever waking it.
+                continue;
+            }
+
+            // Defensive identity check: the slot should still hold the same
+            // request (we left it slot-resident under WaitingFetch). If a
+            // race ever reused it, drop the staged plan and release T1 so
+            // we don't leak the pinned region.
+            let still_owned = self.active[slot_idx]
+                .as_ref()
+                .is_some_and(|req| req.id == request_id);
+            if !still_owned {
+                self.release_host_region(region);
+                continue;
+            }
+
+            let payload = match self.host_pinned_pool.read_region(region) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Request {}: swap-in T1 read failed: {}", request_id, e);
+                    continue;
+                }
+            };
+
+            let pages = match self.paged_kv_pool.alloc_detached_pages(pages_needed) {
+                Ok(pages) => pages,
+                Err(e) => {
+                    error!(
+                        "Request {}: swap-in alloc_detached_pages({}) failed: {}",
+                        request_id, pages_needed, e
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) = self.paged_kv_pool.copy_pages_from_host(
+                self.model.device_context(),
+                &pages,
+                &payload,
+            ) {
+                error!("Request {}: swap-in T1→T0 copy failed: {}", request_id, e);
+                let _ = self.paged_kv_pool.release_pages(&pages);
+                continue;
+            }
+
+            if let Err(e) = self
+                .paged_kv_pool
+                .attach_pages(slot_idx, &pages, last_token_pos)
+            {
+                error!("Request {}: swap-in attach_pages failed: {}", request_id, e);
+                let _ = self.paged_kv_pool.release_pages(&pages);
+                continue;
+            }
+
+            // Drop the external refcount that `alloc_detached_pages` set: the
+            // pages are now pinned via `page_attach_count` for the slot's
+            // lifetime, and the slot's eventual `free_slot()` call will
+            // decrement attach to 0 and reclaim them. Without this drop the
+            // ref_count stays at 1 forever and the pages leak into limbo.
+            let _ = self.paged_kv_pool.release_pages(&pages);
+
+            self.slot_materialized_prompt_lens[slot_idx] = last_token_pos;
+            if let Some(req) = self.active[slot_idx].as_mut() {
+                req.phase = Phase::Decoding;
+                req.staged_prefix = None;
+            }
+            // Reserve the resumed slot's target in the local budget so the
+            // next candidate this tick sees the depletion and doesn't
+            // over-restore.
+            resume_budget.reserve_target(resume_target);
+            self.queue_running(slot_idx);
+            self.release_host_region(region);
+
+            info!(
+                "Request {}: swap-in (Phase::Decoding), {} tokens restored from T1",
+                request_id, last_token_pos
+            );
+        }
+    }
+
     /// Find all free slot indices.
     pub(super) fn free_slots(&self) -> Vec<usize> {
         self.active
@@ -1650,6 +2131,7 @@ impl<M: ModelForward> Scheduler<M> {
                     .take()
                     .expect("finished slot must hold a request");
                 let gen_tokens = req.generated_tokens.len() as u64;
+                self.release_swapped_kv_regions(req.staged_prefix.as_ref());
                 self.release_attached_prefix_blocks(&req.held_prefix_blocks());
                 self.clear_fetch_waiting_for_slot(slot_idx, req.id);
                 self.dequeue_prefill(slot_idx);

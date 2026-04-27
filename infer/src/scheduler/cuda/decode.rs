@@ -142,7 +142,7 @@ impl<M: ModelForward> Scheduler<M> {
     /// Caller is responsible for setting `req.phase` to whatever comes next
     /// (`Phase::WaitingFetch` for swap-out, `Phase::Finished` before
     /// `finish_slot` for recompute).
-    fn release_slot_pages_only(&mut self, slot_idx: usize) {
+    pub(super) fn release_slot_pages_only(&mut self, slot_idx: usize) {
         let victim_id = self.request(slot_idx).map(|r| r.id).unwrap_or_default();
         self.paged_kv_pool.free_slot(slot_idx);
         if let Err(e) = self.states[slot_idx].reset() {

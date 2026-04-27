@@ -13,6 +13,22 @@ use crate::server_engine::CompletionStreamDelta;
 use crate::tokenizer::Tokenizer;
 use crate::types::SessionId;
 
+/// Preemption strategy used by the CUDA admission path when the KV pool
+/// can't fit a new request: either drop a victim's pages and re-prefill on
+/// re-admission (`Recompute`), or copy a victim's pages T0→T1 host-pinned,
+/// park it in `Phase::WaitingFetch`, and resume `Phase::Decoding` once T0
+/// has room again (`Swap`). Default `Recompute` — `Swap` is opt-in for
+/// long-prompt regimes where re-prefill cost dominates the swap copy.
+///
+/// Consumer is `infer::scheduler::cuda::runtime::Scheduler::assign_slots`;
+/// other backends ignore the field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum PreemptionMode {
+    #[default]
+    Recompute,
+    Swap,
+}
+
 /// Scheduler configuration.
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
@@ -88,6 +104,8 @@ pub struct SchedulerConfig {
     /// Optional cluster-shared slower-tier backend config. The current repo-local
     /// implementation supports shared-fs and the NIXL stub behind `rdma-nixl`.
     pub cluster_shared_backend: Option<ClusterSharedBackendConfig>,
+    /// Preemption strategy for the CUDA admission path. See `PreemptionMode`.
+    pub preemption_mode: PreemptionMode,
 }
 
 impl Default for SchedulerConfig {
@@ -119,6 +137,7 @@ impl Default for SchedulerConfig {
             t1_host_pinned_keepalive_ticks: 128,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
             cluster_shared_backend: None,
+            preemption_mode: PreemptionMode::default(),
         }
     }
 }
