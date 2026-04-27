@@ -1483,61 +1483,155 @@ pub(crate) fn attention_gate_paged_hd256(
     }
 }
 
-/// FlashInfer HD256 run-layer: uses the pre-computed plan to run attention for one layer.
+/// FlashInfer HD256 batched paged-decode run step.
+///
+/// Default builds dispatch to FlashInfer's `flashinfer_batch_decode_hd256_run`
+/// for the Qwen3.5 full-attention layers (head_dim=256). Under
+/// `--features tilelang-attn` the same call is routed to the
+/// AOT-specialized TileLang HD256 cubin family
+/// `tilelang_batch_decode_paged_hd256_q{Q}_kv{KV}_run_cuda`. The kernel
+/// signature matches the HD256 prefill twin — only the cubin internals
+/// differ (decode uses qlen=1 per request, no causal mask).
+///
+/// `batch_size` is the number of requests (qo_indptr length minus 1).
+/// For decode, `total_q_tokens == batch_size` (one Q row per request).
+///
+/// `max_qlen` and `total_pages` are TileLang-only parameters (TileLang 0.1.9
+/// auto-promotes `T.symbolic` shape vars into kernel arguments). FlashInfer
+/// ignores them and pulls the values from its plan_info.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn flashinfer_run_layer_hd256(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
     kv_pool: &PagedKVPool,
     layer_idx: usize,
+    qo_indptr_gpu: &CudaSlice<i32>,
     kv_indptr_gpu: &CudaSlice<i32>,
     kv_indices_gpu: &CudaSlice<i32>,
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
     heads: &FlashInferHeadConfig,
+    batch_size: i32,
+    max_qlen: i32,
+    total_pages: i32,
 ) -> Result<()> {
-    let batch_size = q_batch.seq_len;
     let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+    #[cfg(feature = "tilelang-attn")]
+    let tilelang_kernel = {
+        ensure!(
+            heads.head_dim == 256,
+            "tilelang-attn: decode HD256 kernel requires head_dim=256, got {}",
+            heads.head_dim
+        );
+        ensure!(
+            heads.page_size == 16,
+            "tilelang-attn: decode HD256 kernel requires page_size=16, got {}",
+            heads.page_size
+        );
+        match (heads.num_qo_heads, heads.num_kv_heads) {
+            (8, 2) => ffi::tilelang_batch_decode_paged_hd256_q8_kv2_run_cuda,
+            (16, 2) => ffi::tilelang_batch_decode_paged_hd256_q16_kv2_run_cuda,
+            (16, 4) => ffi::tilelang_batch_decode_paged_hd256_q16_kv4_run_cuda,
+            other => {
+                return Err(anyhow!(
+                    "tilelang-attn: no specialized decode HD256 kernel for \
+                     (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
+                     are (8,2), (16,2), (16,4). Extend SUPPORTED_HEADS \
+                     in tools/tilelang/batch_decode_paged_hd256.py, \
+                     TILELANG_DECODE_HD256_HEAD_CONFIGS in cuda-kernels/build.rs, \
+                     and the FFI macro + this match in lockstep, then rebuild."
+                ));
+            }
+        }
+    };
+
     let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (qoi_ptr, _gqoi) = qo_indptr_gpu.device_ptr(&ctx.stream);
     let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
     let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
     let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
-    let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
 
     let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
     let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
 
-    let ret = unsafe {
-        ffi::flashinfer_batch_decode_hd256_run(
-            fw_ptr as *mut u8,
-            iw_ptr as *mut u8,
-            workspace.plan_info.cast_const(),
-            q_ptr as *const ffi::Half,
-            k_pool_ptr as *const ffi::Half,
-            v_pool_ptr as *const ffi::Half,
-            ind_ptr as *const i32,
-            idx_ptr as *const i32,
-            lp_ptr as *const i32,
-            o_ptr as *mut ffi::Half,
-            lse_ptr as *mut f32,
-            batch_size as i32,
-            heads.num_qo_heads as i32,
-            heads.num_kv_heads as i32,
-            heads.page_size as i32,
-            heads.head_dim as i32,
-            sm_scale,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_batch_decode_hd256_run failed with CUDA error {}",
-            ret
-        ));
+    #[cfg(not(feature = "tilelang-attn"))]
+    {
+        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+        let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
+        // FlashInfer decode does not consume qo_indptr / max_qlen / total_pages —
+        // it pulls those values from plan_info instead.
+        let _ = (qoi_ptr, max_qlen, total_pages);
+        let ret = unsafe {
+            ffi::flashinfer_batch_decode_hd256_run(
+                fw_ptr as *mut u8,
+                iw_ptr as *mut u8,
+                workspace.plan_info.cast_const(),
+                q_ptr as *const ffi::Half,
+                k_pool_ptr as *const ffi::Half,
+                v_pool_ptr as *const ffi::Half,
+                ind_ptr as *const i32,
+                idx_ptr as *const i32,
+                lp_ptr as *const i32,
+                o_ptr as *mut ffi::Half,
+                lse_ptr as *mut f32,
+                batch_size,
+                heads.num_qo_heads as i32,
+                heads.num_kv_heads as i32,
+                heads.page_size as i32,
+                heads.head_dim as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow!(
+                "flashinfer_batch_decode_hd256_run failed with CUDA error {}",
+                ret
+            ));
+        }
     }
+
+    #[cfg(feature = "tilelang-attn")]
+    {
+        let _ = workspace; // TileLang is plan-less; workspace is unused here.
+        // Decode: qlen=1 per request, so total_q_tokens == batch_size.
+        let total_q_tokens = batch_size;
+        let num_pages = kv_pool.max_total_pages as i32;
+        unsafe {
+            tilelang_kernel(
+                q_ptr as *mut ffi::Half,
+                qoi_ptr as *const i32,
+                k_pool_ptr as *mut ffi::Half,
+                v_pool_ptr as *mut ffi::Half,
+                ind_ptr as *const i32,
+                idx_ptr as *const i32,
+                lp_ptr as *const i32,
+                o_ptr as *mut ffi::Half,
+                batch_size,
+                total_q_tokens,
+                max_qlen,
+                num_pages,
+                total_pages,
+                heads.num_qo_heads as i32,
+                heads.num_kv_heads as i32,
+                heads.page_size as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| {
+                anyhow!(
+                    "tilelang_batch_decode_paged_hd256 (q{}_kv{}) failed: {e}",
+                    heads.num_qo_heads,
+                    heads.num_kv_heads
+                )
+            })?;
+        }
+    }
+
     Ok(())
 }

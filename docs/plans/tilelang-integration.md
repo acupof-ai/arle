@@ -254,3 +254,21 @@ project and warrant their own evaluation.
   but unused under tilelang-attn — "不着急删除"). Pending-remote bench
   stub:
   [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-prefill-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-prefill-hd256-pending-remote.md).
+
+- **Tranche 3 (HD256 paged-decode swap) — landed 2026-04-27.** Wires the
+  new TileLang HD256 paged-decode kernel
+  (`crates/cuda-kernels/tools/tilelang/batch_decode_paged_hd256.py`,
+  authored upstream of this tranche) into build.rs / FFI / Rust dispatch
+  under the same `tilelang-attn` flag. AOT-specialized over the same
+  Qwen3.5 full-attn head configs as Tranche 2: `(8,2)`, `(16,2)`,
+  `(16,4)`. Default builds remain on FlashInfer
+  `flashinfer_batch_decode_hd256_run`; `--features tilelang-attn` swaps
+  in the TileLang path. The single Qwen3.5 BF16 HD256 decode call site
+  (in `qwen35/batch_decode.rs`) gains the TileLang-only `batch_size` /
+  `max_qlen` / `total_pages` scalars + a `qo_indptr_gpu` slice; the
+  `metadata.plan_hd256(...)` call in `BatchDecodeBuffers35::plan_attention`
+  is cfg-gated since TileLang is plan-less. FFI sym scoping is kept
+  clean by giving decode its own `tilelang_decode_hd256_decl!` macro
+  (identical fill rules to the prefill twin). Pending-remote bench
+  stub:
+  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-decode-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-decode-hd256-pending-remote.md).

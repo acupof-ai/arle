@@ -329,6 +329,11 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
     ) -> Result<()> {
         // Only BF16 full-attention layers run through FlashInfer HD256.
         // FP8/INT8/TurboQuant decode uses our quantized kernels instead.
+        // FlashInfer plans once per forward; TileLang is plan-less so the
+        // plan_hd256 call is cfg-gated. The metadata uploads (positions,
+        // kv_indptr, kv_indices, kv_last_page_len, qo_indptr) above in
+        // `update_metadata` are needed by both paths and stay unconditional.
+        #[cfg(not(feature = "tilelang-attn"))]
         if kv_format == KVFormat::BF16 {
             self.metadata.plan_hd256(
                 ctx,
@@ -338,6 +343,18 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
                 page_size,
                 head_dim,
             )?;
+        }
+        #[cfg(feature = "tilelang-attn")]
+        {
+            let _ = (
+                ctx,
+                batch_size,
+                num_q_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+                kv_format,
+            );
         }
         Ok(())
     }
@@ -969,11 +986,26 @@ impl Qwen35Model {
                     )?;
                 }
                 KVFormat::BF16 => {
+                    // qo_indptr / max_qlen / total_pages are TileLang-only
+                    // (FlashInfer pulls them from plan_info), but we compute
+                    // them unconditionally so the call shape is uniform across
+                    // cfg arms. Decode = 1 Q row per request → max_qlen=1 and
+                    // total_q_tokens=batch_size. Mirrors the T4 TC-decode
+                    // pattern in qwen3/batch_decode.rs.
+                    let max_qlen = bufs
+                        .metadata
+                        .qo_indptr_h
+                        .windows(2)
+                        .map(|w| w[1] - w[0])
+                        .max()
+                        .unwrap_or(0);
+                    let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
                     ops::flashinfer_run_layer_hd256(
                         &self.ctx,
                         &bufs.attn.q_batch,
                         kv_pool,
                         full_idx,
+                        &bufs.metadata.qo_indptr,
                         &bufs.metadata.kv_indptr,
                         &bufs.metadata.kv_indices,
                         &bufs.metadata.kv_last_page_len,
@@ -985,6 +1017,9 @@ impl Qwen35Model {
                             page_size,
                             head_dim,
                         },
+                        batch_size as i32,
+                        max_qlen,
+                        total_pages,
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
