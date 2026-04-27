@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use chat::{OpenAiChatMessage, openai_messages_to_prompt};
 use infer::sampler::SamplingParams;
-use infer::server_engine::{CompletionRequest, InferenceEngine, Qwen3InferenceEngine};
+use infer::server_engine::{CompletionRequest, InferenceEngine, LoadedInferenceEngine};
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -122,7 +122,7 @@ fn regen_test_data() {
         test_data_path.display()
     );
 
-    let mut engine = Qwen3InferenceEngine::load(&model_path, 42).expect("Failed to load model");
+    let mut engine = LoadedInferenceEngine::load(&model_path, true).expect("Failed to load model");
 
     let mut cases_json = Vec::new();
     for case in CASES {

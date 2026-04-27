@@ -16,7 +16,7 @@ use std::time::Instant;
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
     CompletionRequest, CompletionStreamDelta, InferenceEngine, InferenceEngineOptions,
-    Qwen35InferenceEngine,
+    LoadedInferenceEngine,
 };
 use tokio::sync::mpsc;
 
@@ -31,7 +31,7 @@ fn carnice_27b_q4k_load_and_generate() {
     let path = model_path();
     println!("loading Carnice-27b Q4_K_M from {path}");
     let t0 = Instant::now();
-    let mut engine = Qwen35InferenceEngine::load_with_options(
+    let mut engine = LoadedInferenceEngine::load_with_options(
         &path,
         42,
         InferenceEngineOptions {
