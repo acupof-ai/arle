@@ -8,7 +8,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::*;
+    use super::super::*;
 
     struct FakeDriver {
         prefill_outputs: VecDeque<Option<u32>>,

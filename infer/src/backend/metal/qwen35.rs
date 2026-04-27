@@ -1298,27 +1298,27 @@ impl CppQwen35Model {
             );
 
             let dense = match &layer.mlp {
-                MlpKind::Dense(d) => d,
-                MlpKind::Moe(_) => {
-                    log::warn!("C++ Qwen3.5 model v2 does not yet wire MoE weights");
-                    unsafe { mlx_sys::qwen35_compiled_free(model) };
-                    return None;
-                }
+                MlpKind::Dense(dense) => Some(dense),
+                MlpKind::Moe(_) => None,
             };
 
-            let (gate_up_id, gate_dim) = match &dense.inputs {
-                MlpInputProjection::MergedQuantized {
-                    gate_up_proj,
-                    gate_dim,
-                    ..
-                } => (add_or_free!(gate_up_proj), *gate_dim),
-                MlpInputProjection::Split { .. } => {
-                    log::warn!("C++ Qwen3.5 model requires row-merged MLP inputs");
-                    unsafe { mlx_sys::qwen35_compiled_free(model) };
-                    return None;
-                }
+            let (gate_up_id, gate_dim, down_id) = if let Some(dense) = dense {
+                let (gate_up_id, gate_dim) = match &dense.inputs {
+                    MlpInputProjection::MergedQuantized {
+                        gate_up_proj,
+                        gate_dim,
+                        ..
+                    } => (add_or_free!(gate_up_proj), *gate_dim),
+                    MlpInputProjection::Split { .. } => {
+                        log::warn!("C++ Qwen3.5 model requires row-merged MLP inputs");
+                        unsafe { mlx_sys::qwen35_compiled_free(model) };
+                        return None;
+                    }
+                };
+                (gate_up_id, gate_dim, add_or_free!(&dense.down_proj))
+            } else {
+                (-1, 0, -1)
             };
-            let down_id = add_or_free!(&dense.down_proj);
 
             match &layer.attention {
                 MetalQwen35Attention::Full(attn) => {
@@ -1380,8 +1380,6 @@ impl CppQwen35Model {
                         );
                     }
 
-                    let gate_id = add_or_free!(&dense.gate_proj);
-                    let up_id = add_or_free!(&dense.up_proj);
                     let need_separate_proj =
                         use_qwen35_cpp_separate_proj() || qkvz_id < 0 || ba_id < 0;
                     if need_separate_proj {
@@ -1389,17 +1387,31 @@ impl CppQwen35Model {
                         let z_id = add_or_free!(&attn.in_proj_z);
                         let b_id = add_or_free!(&attn.in_proj_b);
                         let a_id = add_or_free!(&attn.in_proj_a);
+                        let (gate_id, up_id) = if let Some(dense) = dense {
+                            (add_or_free!(&dense.gate_proj), add_or_free!(&dense.up_proj))
+                        } else {
+                            (-1, -1)
+                        };
                         unsafe {
                             mlx_sys::qwen35_compiled_set_separate_proj_v2(
                                 model, qkv_id, z_id, b_id, a_id, gate_id, up_id,
                             );
                         }
-                    } else {
+                    } else if let Some(dense) = dense {
+                        let gate_id = add_or_free!(&dense.gate_proj);
+                        let up_id = add_or_free!(&dense.up_proj);
                         unsafe {
                             mlx_sys::qwen35_compiled_set_separate_mlp_v2(model, gate_id, up_id);
                         }
                     }
                 }
+            }
+
+            if let MlpKind::Moe(moe) = &layer.mlp
+                && !register_qwen35_moe_layer(model, moe)
+            {
+                unsafe { mlx_sys::qwen35_compiled_free(model) };
+                return None;
             }
         }
 
@@ -2238,6 +2250,72 @@ pub(super) fn qwen35_dflash_supported(weights: &Qwen35MetalWeights) -> bool {
             .cpp_model
             .as_ref()
             .is_some_and(CppQwen35Model::supports_gdr_tape)
+}
+
+fn register_qwen35_moe_layer(model: *mut std::ffi::c_void, moe: &MetalQwen35MoeWeights) -> bool {
+    let Some(router) = extract_qw(&moe.router) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized router weights");
+        return false;
+    };
+    let Some(shared_gate) = extract_qw(&moe.shared_gate) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared gate weights");
+        return false;
+    };
+    let Some(shared_up) = extract_qw(&moe.shared_up) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared up weights");
+        return false;
+    };
+    let Some(shared_down) = extract_qw(&moe.shared_down) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared down weights");
+        return false;
+    };
+    let Some(shared_expert_gate) = extract_qw(&moe.shared_expert_gate) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared expert gate weights");
+        return false;
+    };
+
+    unsafe {
+        mlx_sys::qwen35_compiled_set_last_moe_mlp(
+            model,
+            router.0,
+            router.1,
+            router.2,
+            moe.router_group_size,
+            moe.router_bits,
+            moe.switch_gate.weight.as_raw(),
+            moe.switch_gate.scales.as_raw(),
+            moe.switch_gate.biases.as_raw(),
+            moe.switch_up.weight.as_raw(),
+            moe.switch_up.scales.as_raw(),
+            moe.switch_up.biases.as_raw(),
+            moe.switch_down.weight.as_raw(),
+            moe.switch_down.scales.as_raw(),
+            moe.switch_down.biases.as_raw(),
+            moe.expert_group_size,
+            moe.expert_bits,
+            shared_gate.0,
+            shared_gate.1,
+            shared_gate.2,
+            shared_up.0,
+            shared_up.1,
+            shared_up.2,
+            shared_down.0,
+            shared_down.1,
+            shared_down.2,
+            shared_expert_gate.0,
+            shared_expert_gate.1,
+            shared_expert_gate.2,
+            moe.num_experts,
+            moe.top_k,
+            moe.norm_topk_prob,
+        );
+    }
+
+    if let Err(err) = super::mlx::check_mlx_error() {
+        log::warn!("C++ Qwen3.5 MoE registration failed: {err}");
+        return false;
+    }
+    true
 }
 
 pub(super) fn metal_generate_qwen35(
