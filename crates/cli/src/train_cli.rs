@@ -25,9 +25,6 @@ use crate::{
 };
 
 #[allow(dead_code)]
-#[path = "../../train/src/bin/pretrain.rs"]
-mod pretrain_entry;
-#[allow(dead_code)]
 #[path = "../../train/src/bin/train_grpo.rs"]
 mod train_grpo_entry;
 #[allow(dead_code)]
@@ -221,7 +218,7 @@ fn run_pretrain(args: TrainPretrainArgs) -> ExitCode {
         "train pretrain",
         resolve_pretrain_invocation(&args),
         &args.render,
-        pretrain_entry::dispatch_from_args,
+        train::commands::pretrain::dispatch_from_args,
     )
 }
 

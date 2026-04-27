@@ -13,19 +13,13 @@
 
 use std::{
     collections::HashSet,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
-use autograd::{
-    AutogradError, ConstantLr, Result as AutogradResult, SafetensorsRegistry, Tape, TensorId,
-    TensorStore,
-};
-use qwen3_spec::Qwen3Config;
-use thiserror::Error;
-use train::{
+use crate::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
     causal_lm::{build_registry, live_tensor_ids, trainable_param_name_map, trainable_params},
     cli_args::{ArgError, BackendChoice, SaveDtype, adamw_for_backend, next_value, parse_value},
@@ -50,6 +44,12 @@ use train::{
     tokenizer::{ChatTokenizer, ResolvedSpecialToken},
     trainer::cross_entropy_loss,
 };
+use autograd::{
+    AutogradError, ConstantLr, Result as AutogradResult, SafetensorsRegistry, Tape, TensorId,
+    TensorStore,
+};
+use qwen3_spec::Qwen3Config;
+use thiserror::Error;
 
 const DEFAULT_BETAS: (f32, f32) = (0.9, 0.999);
 const DEFAULT_EPS: f32 = 1.0e-8;
@@ -235,7 +235,7 @@ enum CliError {
 
 trait PretrainFamily {
     type Config: Clone;
-    type Model: train::CausalLm<Config = Self::Config>;
+    type Model: crate::CausalLm<Config = Self::Config>;
 
     fn family_name() -> &'static str;
     fn build_config(args: &CliArgs, vocab_size: usize) -> Result<Self::Config, CliError>;
@@ -476,17 +476,7 @@ impl PretrainFamily for Qwen35Family {
     }
 }
 
-fn main() -> Result<(), CliError> {
-    run()
-}
-
-fn run() -> Result<(), CliError> {
-    let mut args = parse_args()?;
-    run_with_args(&mut args)
-}
-
-#[allow(dead_code)]
-pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
+pub fn dispatch_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -674,7 +664,7 @@ fn run_with_family<F: PretrainFamily>(
     let controller = TrainingController::new();
     let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
-    let run_id = train::metrics::default_run_id("pretrain");
+    let run_id = crate::metrics::default_run_id("pretrain");
     let backend_name = args.backend.as_str();
     let out_dir_string = args.out.display().to_string();
     let resume_dir_string = resume_dir_canonical
@@ -844,7 +834,7 @@ fn run_with_family<F: PretrainFamily>(
             sum += store.to_host(loss_id)?[0] * chunk as f32;
             count += chunk as u64;
             tape.entries.clear();
-            train::cleanup_after_backward(store, tape, &eval_keep, &eval_model_ids);
+            crate::cleanup_after_backward(store, tape, &eval_keep, &eval_model_ids);
             tape.set_enabled(false);
             remaining -= chunk;
         }
@@ -888,7 +878,7 @@ fn run_with_family<F: PretrainFamily>(
                 ("artifact_generation_config", "generation_config.json"),
                 ("artifact_tokenizer", "tokenizer.json"),
             ];
-            metrics_for_hooks.emit_event(&train::metrics::TrainEvent {
+            metrics_for_hooks.emit_event(&crate::metrics::TrainEvent {
                 kind: "checkpoint",
                 step: Some(trainer_step),
                 strings: &strings,
@@ -1006,10 +996,6 @@ fn validate_qwen35_resume_config(resume_dir: &Path, cfg: &Qwen35Config) -> Resul
         )));
     }
     Ok(())
-}
-
-fn parse_args() -> Result<CliArgs, CliError> {
-    parse_args_from(env::args().skip(1))
 }
 
 fn parse_args_from<I>(mut iter: I) -> Result<CliArgs, CliError>
@@ -1233,7 +1219,7 @@ fn save_qwen3_checkpoint(
         },
         |weights_path| {
             let mut tape = Tape::new();
-            let registry = train::causal_lm::build_materialized_registry(model, store, &mut tape)
+            let registry = crate::causal_lm::build_materialized_registry(model, store, &mut tape)
                 .map_err(Qwen3CheckpointError::from)?;
             match save_dtype {
                 SaveDtype::F32 => registry
@@ -1281,7 +1267,7 @@ fn save_qwen35_checkpoint(
         },
         |weights_path| {
             let mut tape = Tape::new();
-            let registry = train::causal_lm::build_materialized_registry(model, store, &mut tape)
+            let registry = crate::causal_lm::build_materialized_registry(model, store, &mut tape)
                 .map_err(Qwen35CheckpointError::from)?;
             match save_dtype {
                 SaveDtype::F32 => registry
@@ -1308,11 +1294,11 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use autograd::{ConstantLr, Tape, TensorStore, optim::AdamW};
-    use tempfile::tempdir;
-    use train::{
+    use crate::{
         StepOutcome, Trainer, TrainerConfig, qwen35::LayerType, trainer::cross_entropy_loss,
     };
+    use autograd::{ConstantLr, Tape, TensorStore, optim::AdamW};
+    use tempfile::tempdir;
 
     fn tiny_args() -> CliArgs {
         CliArgs {
@@ -1535,7 +1521,7 @@ mod tests {
     fn resolve_special_token_ids_falls_back_to_single_endoftext_token() -> Result<(), CliError> {
         let dir = tempdir().expect("tempdir");
         let tokenizer_path = dir.path().join("tokenizer.json");
-        train::tokenizer::write_wordlevel_tokenizer(
+        crate::tokenizer::write_wordlevel_tokenizer(
             &tokenizer_path,
             ["hello", "world"],
             ["<|endoftext|>"],
@@ -1591,7 +1577,7 @@ mod tests {
             optim,
             NoClip,
             ConstantLr(args.lr),
-            Box::new(train::metrics::NullSink),
+            Box::new(crate::metrics::NullSink),
             trainer_cfg,
         );
 
@@ -1636,7 +1622,7 @@ mod tests {
         let resumed_param_names = trainable_param_name_map(&resumed_model, &resumed_store);
         let mut resumed_registry = build_registry(&resumed_model);
         let (loaded_doc, loaded_optim) =
-            train::checkpoint::load_trainer_state_v2(&step_dir).expect("load trainer state v2");
+            crate::checkpoint::load_trainer_state_v2(&step_dir).expect("load trainer state v2");
         assert_eq!(loaded_doc.step, 1);
         let loaded_step = resume_from_checkpoint::<Qwen35Family>(
             &step_dir,
@@ -1664,7 +1650,7 @@ mod tests {
             AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY),
             NoClip,
             ConstantLr(args.lr),
-            Box::new(train::metrics::NullSink),
+            Box::new(crate::metrics::NullSink),
             TrainerConfig {
                 total_steps: 2,
                 grad_accum_steps: 1,
@@ -1737,20 +1723,20 @@ mod tests {
                 })
                 .collect(),
         };
-        let resume_doc = train::checkpoint::TrainerStateDoc {
+        let resume_doc = crate::checkpoint::TrainerStateDoc {
             step: 7,
             optim_schema: "adamw-v1".to_string(),
             schedule_name: "constant".to_string(),
             schedule_params: serde_json::json!({ "lr": args.lr }),
             grad_accum_current: 1,
             rng_seed: args.seed,
-            codec_version: train::checkpoint::TRAINER_STATE_CODEC_VERSION,
+            codec_version: crate::checkpoint::TRAINER_STATE_CODEC_VERSION,
         };
-        train::checkpoint::save_trainer_state_v2(&step_dir, &resume_doc, &resume_state)
+        crate::checkpoint::save_trainer_state_v2(&step_dir, &resume_doc, &resume_state)
             .expect("save trainer state");
 
         let (loaded_doc, loaded_optim) =
-            train::checkpoint::load_trainer_state_v2(&step_dir).expect("load trainer state");
+            crate::checkpoint::load_trainer_state_v2(&step_dir).expect("load trainer state");
         assert_eq!(loaded_doc.step, 7);
         assert_adamw_state_eq(&resume_state, &loaded_optim);
 
@@ -1785,7 +1771,7 @@ mod tests {
             AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY),
             NoClip,
             ConstantLr(args.lr),
-            Box::new(train::metrics::NullSink),
+            Box::new(crate::metrics::NullSink),
             TrainerConfig {
                 total_steps: 8,
                 grad_accum_steps: 1,
