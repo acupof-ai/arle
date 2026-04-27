@@ -33,14 +33,14 @@ struct MlxHandleInner {
 
 #[cfg(feature = "metal")]
 // Safety: `MlxHandleInner` is just an opaque MLX array pointer. All MLX FFI
-// access in this crate is serialized through `backend_metal.rs`'s
-// `MLX_GUARD`, so moving or sharing the pointer wrapper across threads does
-// not introduce unsynchronized MLX calls.
+// access in this crate is serialized through `mlx_sys::mlx_guard()`, so moving
+// or sharing the pointer wrapper across threads does not introduce
+// unsynchronized MLX calls.
 unsafe impl Send for MlxHandleInner {}
 
 #[cfg(feature = "metal")]
 // Safety: see the `Send` impl above. Shared access only hands the opaque
-// pointer back to MLX while holding `MLX_GUARD`.
+// pointer back to MLX while holding `mlx_guard()`.
 unsafe impl Sync for MlxHandleInner {}
 
 #[cfg(feature = "metal")]
@@ -63,13 +63,11 @@ impl Drop for MlxHandleInner {
             return;
         }
 
-        let _guard = crate::backend_metal::MLX_GUARD
-            .lock()
-            .expect("mlx guard poisoned");
+        let _guard = crate::backend_metal::mlx_guard();
 
         // Safety: `ptr` is owned by this handle, came from MLX FFI allocation,
         // and this Drop impl is the unique free path for the wrapped array.
-        // `MLX_GUARD` serializes the free against all other MLX FFI calls.
+        // `mlx_guard()` serializes the free against all other guarded MLX FFI calls.
         unsafe {
             mlx_sys::mlx_array_free(self.ptr);
         }
@@ -79,13 +77,13 @@ impl Drop for MlxHandleInner {
 #[cfg(feature = "metal")]
 // Safety: `MlxHandle` owns an MLX array pointer. MLX's global stream is not
 // safe for concurrent mutation, but all MLX FFI use in this crate is
-// serialized by `backend_metal.rs`'s `MLX_GUARD`, which is the synchronization
+// serialized by `mlx_sys::mlx_guard()`, which is the synchronization
 // boundary for moving these opaque handles across threads.
 unsafe impl Send for MlxHandle {}
 
 #[cfg(feature = "metal")]
 // Safety: see the `Send` impl above. Shared references are only used to pass
-// opaque handles into MLX while holding `MLX_GUARD`.
+// opaque handles into MLX while holding `mlx_guard()`.
 unsafe impl Sync for MlxHandle {}
 
 #[cfg(feature = "cuda")]

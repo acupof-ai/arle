@@ -7,6 +7,19 @@
 
 #![allow(non_camel_case_types)]
 
+use std::sync::{Mutex, MutexGuard};
+
+static MLX_GUARD: Mutex<()> = Mutex::new(());
+
+/// Process-wide guard for MLX FFI calls that mutate or evaluate MLX global
+/// state. MLX's default device/stream and allocator are process-global, so
+/// Rust callers that need serialization must share this guard across crates.
+pub fn mlx_guard() -> MutexGuard<'static, ()> {
+    MLX_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Opaque handle to `mlx::core::array`. All access through pointers.
 #[repr(C)]
 pub struct mlx_array {

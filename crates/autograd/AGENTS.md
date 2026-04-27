@@ -60,7 +60,11 @@ crates/autograd/
    `#[cfg(feature = "cuda")]` on cudarc imports, `#[cfg(feature = "no-cuda")]`
    stub for CUDA execution paths — always `todo!("GPU required: ...")` so
    a CPU-only binary fails loudly rather than silently.
-5. **No half-states on device-resident ports.** When you add a lazy
+5. **Shared MLX synchronization boundary.** The Metal backend calls
+   `mlx_sys::mlx_guard()` for MLX FFI serialization. Do not add a local
+   autograd-only mutex around MLX; MLX state is process-global and must share
+   the same Rust guard as other `mlx-sys` consumers.
+6. **No half-states on device-resident ports.** When you add a lazy
    device-handle path for an op, finish it: forward + backward both go
    through the handle, or neither does. Do not leave the op in a state
    where forward is lazy but backward does its own upload+eval+readback
@@ -97,7 +101,7 @@ pub enum Dirty { Host, Device, Both }
 ### Lifetime & cloning
 
 - `MlxHandle` is `Arc<MlxHandleInner>`; the inner `Drop` runs
-  `mlx_array_free` under `MLX_GUARD`. Dropping the last clone is the
+  `mlx_array_free` under `mlx_sys::mlx_guard()`. Dropping the last clone is the
   unique free path.
 - `Tensor::clone` asserts `dirty != Device` — cloning a device-only
   tensor is a bug (no host data to copy). Call `ensure_host` first. This

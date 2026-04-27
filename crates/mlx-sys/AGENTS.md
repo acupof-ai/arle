@@ -40,10 +40,13 @@ crates/mlx-sys/
 4. **`mlx_last_error()` is thread-local.** Every C++→C boundary that can
    throw must catch and set it. Rust callers must check for null return
    and read `mlx_last_error()` immediately afterwards.
-5. **Single source of truth for the Metal bridge.** `infer::backend::metal`
-   consumes this crate; nothing else (no scheduler, no model registry)
-   should link `mlx-sys` directly. If you find yourself wiring mlx-sys
-   into a non-Metal module, you're recreating the bridge.
+5. **Single source of truth for the Metal bridge.** Only Metal-facing runtime
+   code should consume this crate directly: `infer::backend::metal` and
+   `autograd`'s Metal backend. Nothing else (no scheduler, no model registry,
+   no generic train logic) should link `mlx-sys` directly. If you find
+   yourself wiring mlx-sys into a non-Metal module, you're recreating the
+   bridge. Callers that serialize MLX access must use `mlx_sys::mlx_guard()`
+   so process-global MLX state has one Rust synchronization boundary.
 6. **The Qwen3.5 step model is a separate C++ file** (`mlx_qwen35_model.cpp`),
    not a generic MLX composition. It exists because Qwen3.5 hybrid attention
    benefits from a fused C++ step path; Qwen3 still goes through the Rust
