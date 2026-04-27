@@ -100,13 +100,48 @@ impl CoordinatorHandle {
         Some(ticket)
     }
 
-    /// **Reserved for future distributed-scheduler centralization.** Not
-    /// called by the live single-scheduler CUDA runtime — see the doc on
-    /// `Coordinator::handle_plan` for the rationale (the scheduler already
-    /// has everything this method would surface, via `lookup_or_stage` +
-    /// inline `TieredKvPolicy::allow_prefetch`). Production callers should
-    /// not add a `submit_prefetch_plan → wait PlanCompleted → submit_fetch`
-    /// round-trip today; tests cover the API contract for the M5+ use case.
+    /// Submit a prefetch-classification plan to the coordinator.
+    ///
+    /// # Status: reserved API, not wired into the live readmission path
+    ///
+    /// The single-scheduler CUDA runtime does **not** call this method.
+    /// The classification it would produce is a strict subset of what the
+    /// scheduler already has from
+    /// [`crate::prefix_cache::RadixCache::lookup_or_stage`] (`HitKind` per
+    /// block) plus the inline `TieredKvPolicy::allow_prefetch` check at
+    /// `infer/src/scheduler/cuda/runtime.rs:767`, which already gates
+    /// `submit_fetch` on fetch-queue saturation. Adding a
+    /// `submit_prefetch_plan` → wait `PlanCompleted` → `submit_fetch`
+    /// round-trip would only introduce:
+    ///
+    /// - extra channel latency on every readmission,
+    /// - a new stale-plan race (queue / slot / eviction state can change
+    ///   between `PlanCompleted` and `submit_fetch`),
+    /// - and another failure path,
+    ///
+    /// without giving the coordinator any state the scheduler does not
+    /// already have. See `feedback_no_speculative_interface_shaping.md`.
+    ///
+    /// # When this becomes useful
+    ///
+    /// The Plan path is reserved for an M5+ **distributed-scheduler**
+    /// scenario where the coordinator owns state the scheduler cannot
+    /// know locally:
+    ///
+    /// - cross-scheduler fetch dedupe,
+    /// - remote peer locality,
+    /// - shared-backend pressure,
+    /// - multi-instance queue pressure,
+    /// - transport-level bandwidth arbitration.
+    ///
+    /// At that point centralizing the policy decision earns the
+    /// round-trip. Until then this method exists only to keep the API
+    /// surface buildable; tests cover its contract so the shape stays
+    /// honest.
+    ///
+    /// Recommendation backed by codex review consultation 2026-04-27 and
+    /// the `2026-04-22-profile-kv-tier-...` wins entry that already noted
+    /// `submit_prefetch_plan` had no runtime call site.
     pub fn submit_prefetch_plan(&self, blocks: Vec<PrefetchPlanRequest>) -> Option<PlanTicket> {
         if blocks.is_empty() {
             return None;
