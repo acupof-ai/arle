@@ -110,15 +110,6 @@ code      { font-family: inherit; color: var(--ink); font-weight: 500; }
   letter-spacing: -0.045em;
   line-height: 1;
 }
-.wordmark-section {
-  font-size: 20px;
-  color: var(--ink-dim);
-  font-weight: 400;
-  align-self: flex-start;
-  margin-top: 0.22em;
-  margin-left: 6px;
-  letter-spacing: 0;
-}
 @media (max-width: 640px) {
   .wordmark-mark { width: 40px; height: 48px; margin-right: 3px; top: 2px; }
   .wordmark-name { font-size: 64px; }
@@ -278,13 +269,16 @@ code      { font-family: inherit; color: var(--ink); font-weight: 500; }
 
 /* ── glance + quickstart grids ─────────────────────────────────────── */
 
-.glance-grid,
-.quickgrid {
+.glance-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--sp-4);
+  gap: var(--sp-5);
 }
-.quickgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.quickgrid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--sp-5);
+}
 
 .mini-card {
   min-width: 0;
@@ -398,49 +392,49 @@ pre b   { color: var(--ink); }
 
 /* ── topology (ASCII diagram + legend) ─────────────────────────────── */
 
-.topo-shell {
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-  gap: var(--sp-5);
-  align-items: stretch;
-}
-.topo-art {
-  margin: 0;
-  padding: var(--sp-4) var(--sp-5);
-  font-size: 12.5px;
-  line-height: 1.35;
-  white-space: pre;
-  overflow-x: auto;
-  color: var(--ink);
-  border: 1px solid var(--line);
-  background: var(--paper-dim);
-}
-.topo-legend {
+.topo {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--sp-3);
 }
-.topo-legend li {
-  border: none;
-  background: transparent;
-  padding: 0;
+.topo-row {
   display: grid;
-  grid-template-columns: 12ch minmax(0, 1fr);
-  gap: var(--sp-3);
+  grid-template-columns: 4ch 14ch minmax(0, 1fr);
+  gap: var(--sp-4);
   align-items: baseline;
-  font-size: 13px;
+  padding: var(--sp-4) 0;
+  border-top: 1px solid var(--line);
+  font-size: 14px;
+}
+.topo-row:last-child { border-bottom: 1px solid var(--line); }
+.topo-step {
+  color: var(--ink-dim);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  letter-spacing: 0.04em;
 }
 .topo-cap {
-  color: var(--ink-dim);
-  font-weight: 500;
+  color: var(--ink);
+  font-weight: 600;
   text-transform: uppercase;
   font-size: var(--fs-xs);
   letter-spacing: 0.06em;
 }
 .topo-body { color: var(--ink-soft); }
+@media (max-width: 640px) {
+  .topo-row {
+    grid-template-columns: 3ch minmax(0, 1fr);
+    grid-template-areas:
+      "step cap"
+      "step body";
+    gap: var(--sp-1) var(--sp-3);
+  }
+  .topo-step { grid-area: step; }
+  .topo-cap  { grid-area: cap; }
+  .topo-body { grid-area: body; }
+}
 
 /* ── support matrix (dense backend × axes table) ───────────────────── */
 
@@ -644,9 +638,9 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
 
 .install-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--sp-4);
-  margin-top: var(--sp-3);
+  grid-template-columns: 1fr;
+  gap: var(--sp-5);
+  margin-top: var(--sp-4);
 }
 .install-card {
   padding: 0;

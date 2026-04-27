@@ -64,21 +64,19 @@ const heroInstall = s.install.cards[0];
 </Section>
 
 <Section id="topology" title={s.topology.title}>
-  <div class="topo-shell">
-    <pre class="topo-art" aria-label="ARLE workspace topology">{s.topology.diagram}</pre>
-    <ul class="topo-legend">
-      {s.topology.legend.map((l) => (
-        <li>
-          {l.href ? (
-            <a class="topo-cap" href={l.href} set:html={l.cap} />
-          ) : (
-            <span class="topo-cap" set:html={l.cap} />
-          )}
-          <span class="topo-body" set:html={l.body} />
-        </li>
-      ))}
-    </ul>
-  </div>
+  <ol class="topo">
+    {s.topology.legend.map((l, i) => (
+      <li class="topo-row">
+        <span class="topo-step">{String(i + 1).padStart(2, "0")}</span>
+        {l.href ? (
+          <a class="topo-cap" href={l.href} set:html={l.cap} />
+        ) : (
+          <span class="topo-cap" set:html={l.cap} />
+        )}
+        <span class="topo-body" set:html={l.body} />
+      </li>
+    ))}
+  </ol>
 </Section>
 
 <Section id="surfaces" title={s.surfaces.title}>
