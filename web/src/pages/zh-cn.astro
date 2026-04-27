@@ -19,8 +19,13 @@ const base = import.meta.env.BASE_URL;
 
   <HeroSplit locale={ZH} />
 
-  <Frame id="topology" num="01" label="拓扑" heading="一套 workspace。一张前门。三个后端。">
-    <Topology locale={ZH} />
+  <Frame id="topology" num="01" label="拓扑" full={true}>
+    <Topology
+      locale={ZH}
+      heading='一套 workspace。一张前门。<em>三个后端。</em>'
+      label="拓扑"
+      num="01"
+    />
   </Frame>
 
   <Frame
@@ -36,7 +41,7 @@ const base = import.meta.env.BASE_URL;
     <Install install={s.install} />
   </Frame>
 
-  <Frame id="matrix" num="04" label="支持矩阵" heading="三个后端。一份运行时契约。">
+  <Frame id="matrix" num="04" label="支持矩阵" heading='三个后端。<em>一份契约。</em>'>
     <Matrix matrix={s.matrix} />
   </Frame>
 

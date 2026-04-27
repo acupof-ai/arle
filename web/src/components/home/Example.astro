@@ -31,23 +31,28 @@ const { title, body, lines, docsHref, docsLabel } = Astro.props;
     align-items: start;
   }
   .example-side h3 {
-    font-size: 18px;
+    font-size: 22px;
     font-weight: 600;
-    letter-spacing: -0.01em;
-    margin: 0 0 12px;
+    letter-spacing: -0.015em;
+    margin: 0 0 14px;
+    font-family: var(--mono);
+    text-transform: none;
   }
   .example-side p {
-    font-size: 13px;
+    font-family: var(--serif);
+    font-size: 14px;
     color: var(--ink-soft);
     line-height: 1.6;
     margin: 0 0 16px;
   }
   .example-side :global(code) {
-    background: var(--paper-dim);
+    font-family: var(--mono);
+    background: var(--paper-warm);
     border: 1px solid var(--line);
-    padding: 0 6px;
+    padding: 1px 6px;
     font-weight: 500;
     color: var(--ink);
+    font-size: 12px;
   }
   .example-side .ghost {
     display: inline-flex;
@@ -66,13 +71,25 @@ const { title, body, lines, docsHref, docsLabel } = Astro.props;
     background: var(--ink);
     color: var(--paper);
     border: none;
-    padding: 32px;
+    padding: 36px 36px 36px 56px;
     font-family: var(--mono);
     font-size: 13px;
     line-height: 1.7;
     overflow-x: auto;
     white-space: pre;
     margin: 0;
+    position: relative;
+  }
+  /* 32px line-number gutter — engineering-tool feel. */
+  .example pre::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 32px;
+    background: rgba(255, 255, 255, 0.04);
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
   }
   .example pre :global(.p) { color: rgba(255,255,255,0.45); user-select: none; }
   .example pre :global(.c) { color: rgba(255,255,255,0.45); }

@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" aria-label="arle">
   <rect width="96" height="96" fill="#FFFFFF"/>
-  <line x1="0" y1="48" x2="96" y2="48" stroke="#0A0A0A" stroke-width="10"/>
-  <rect x="0" y="28" width="40" height="40" fill="#0A0A0A"/>
-  <circle cx="48" cy="48" r="20" fill="#0A0A0A"/>
-  <rect x="56" y="28" width="40" height="40" fill="#0A0A0A"/>
+  <line x1="0" y1="48" x2="96" y2="48" stroke="#0A0A0A" stroke-width="14"/>
+  <circle cx="48" cy="48" r="22" fill="#0A0A0A"/>
 </svg>

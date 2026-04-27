@@ -3,14 +3,19 @@ interface Props {
   id: string;
   num: string;        // e.g. "01"
   label: string;      // small uppercase eyebrow (e.g. "Topology")
-  heading: string;    // large display H2
+  /** Large display H2 — raw HTML allowed (for <em>). Optional in full-bleed mode where the slot supplies its own heading. */
+  heading?: string;
+  /** Full-bleed variant: removes section padding so the slot sets its own. */
+  full?: boolean;
 }
-const { id, num, label, heading } = Astro.props;
+const { id, num, label, heading, full = false } = Astro.props;
 ---
-<section class="frame" id={id}>
-  <div class="frame-head">
-    <span class="label"><span class="num">{num}</span>{label}</span>
-    <h2>{heading}</h2>
-  </div>
+<section class:list={["frame", full ? "full" : ""]} id={id}>
+  {!full && (
+    <div class="frame-head reveal">
+      <span class="label"><span class="num">{num}</span>{label}</span>
+      <h2 set:html={heading}></h2>
+    </div>
+  )}
   <slot />
 </section>
