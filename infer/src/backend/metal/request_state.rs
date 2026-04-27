@@ -12,7 +12,8 @@ use super::kv_pool::MetalKVPool;
 use super::mlx::{MlxArray, async_eval, concatenate_axis, eval, slice, take_axis, zeros};
 use super::ops::{clear_metal_cache, extend_kv_cache};
 use super::qwen35::{
-    CppQwen35Model, Qwen35MetalWeights, qwen35_forward_step, qwen35_forward_with_hidden_states,
+    CppQwen35Model, Qwen35MetalWeights, qwen35_dflash_supported, qwen35_forward_step,
+    qwen35_forward_with_hidden_states,
 };
 use super::sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params};
 use super::weights::{MetalWeights, StandardMetalWeights};
@@ -3260,6 +3261,7 @@ impl<'a> Qwen35StepDriver<'a> {
         let MetalModelArch::Qwen35(arch) = &config.arch else {
             bail!("Qwen3.5 request state requires a Qwen3.5 config");
         };
+        let dflash_runtime = dflash_runtime.filter(|_| qwen35_dflash_supported(weights));
 
         let num_full_layers = arch.num_full_attention_layers();
         let prefill_len = prompt_tokens.len() as i32;

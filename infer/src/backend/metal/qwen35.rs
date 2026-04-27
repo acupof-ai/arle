@@ -496,7 +496,10 @@ fn build_qwen35_dense_mlp(
 }
 
 /// RAII wrapper for the C++ Qwen35 forward model.
-pub(crate) struct CppQwen35Model(*mut std::ffi::c_void);
+pub(crate) struct CppQwen35Model {
+    raw: *mut std::ffi::c_void,
+    gdr_tape_supported: bool,
+}
 
 fn metal_qwen35_trace_enabled() -> bool {
     std::env::var("AGENT_INFER_METAL_QWEN35_TRACE")
@@ -506,7 +509,7 @@ fn metal_qwen35_trace_enabled() -> bool {
 
 impl Drop for CppQwen35Model {
     fn drop(&mut self) {
-        unsafe { mlx_sys::qwen35_compiled_free(self.0) }
+        unsafe { mlx_sys::qwen35_compiled_free(self.raw) }
     }
 }
 unsafe impl Send for CppQwen35Model {}
@@ -598,12 +601,20 @@ pub(super) struct Qwen35VerifySummary {
 impl CppQwen35Model {
     /// Wrap a raw C++ model pointer (takes ownership).
     pub(crate) fn from_raw(ptr: *mut std::ffi::c_void) -> Self {
-        Self(ptr)
+        Self {
+            raw: ptr,
+            gdr_tape_supported: true,
+        }
     }
     /// Raw pointer to the underlying C++ model (for FFI calls).
     pub(crate) fn as_raw(&self) -> *mut std::ffi::c_void {
-        self.0
+        self.raw
     }
+
+    pub(crate) fn supports_gdr_tape(&self) -> bool {
+        self.gdr_tape_supported
+    }
+
     /// Build a C++ step model from loaded Rust weights. Returns None if weights
     /// are not fully supported by the C++ route.
     fn build(
@@ -658,8 +669,7 @@ impl CppQwen35Model {
             if id < 0 {
                 let err = super::mlx::check_mlx_error()
                     .err()
-                    .map(|err| err.to_string())
-                    .unwrap_or_else(|| "unknown MLX error".to_string());
+                    .map_or_else(|| "unknown MLX error".to_string(), |err| err.to_string());
                 log::warn!("C++ Qwen3.5 weight registration failed: {err}");
                 None
             } else {
@@ -860,7 +870,10 @@ impl CppQwen35Model {
                 "metal"
             }
         );
-        Some(Self(model))
+        Some(Self {
+            raw: model,
+            gdr_tape_supported: !disable_gdr_metal_kernel,
+        })
     }
 
     /// Run one decode step. Returns logits. Updates caches in place.
@@ -879,7 +892,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_session_begin(
-                self.0,
+                self.raw,
                 kv_ptrs.as_mut_ptr(),
                 n_kv,
                 gdr_ptrs.as_mut_ptr(),
@@ -904,7 +917,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_session_end(
-                self.0,
+                self.raw,
                 out_kv.as_mut_ptr(),
                 n_kv as i32,
                 out_gdr.as_mut_ptr(),
@@ -932,7 +945,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_step_session(
-                self.0,
+                self.raw,
                 token.as_raw(),
                 cache_pos,
                 &raw mut out_logits,
@@ -956,7 +969,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_prefill_session(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 prompt_len,
                 cache_pos,
@@ -993,7 +1006,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_step(
-                self.0,
+                self.raw,
                 token.as_raw(),
                 cache_pos,
                 kv_ptrs.as_mut_ptr(),
@@ -1047,7 +1060,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_step_batch(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 batch_size,
                 cache_pos,
@@ -1104,7 +1117,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_step_batch_packed(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 batch_size,
                 cache_pos,
@@ -1161,7 +1174,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_prefill(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 prompt_len,
                 cache_pos,
@@ -1216,7 +1229,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_prefill(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 prompt_len,
                 cache_pos,
@@ -1277,7 +1290,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_verify_block(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 block_size,
                 cache_pos,
@@ -1335,7 +1348,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_verify_block_summary(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 block_size,
                 cache_pos,
@@ -1435,7 +1448,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_verify_block_batched(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 batch_size,
                 block_size,
@@ -1509,7 +1522,7 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_verify_block_batched_sampled(
-                self.0,
+                self.raw,
                 tokens.as_raw(),
                 batch_size,
                 block_size,
@@ -1555,6 +1568,7 @@ impl CppQwen35Model {
         prompt_ids: &[u32],
         max_new_tokens: usize,
         temperature: f32,
+        greedy: bool,
         stop_token_ids: &[u32],
         on_token: &mut impl FnMut(u32) -> Result<()>,
     ) -> Result<(Vec<u32>, f64, f64)> {
@@ -1593,11 +1607,12 @@ impl CppQwen35Model {
 
         let rc = unsafe {
             mlx_sys::qwen35_compiled_generate(
-                self.0,
+                self.raw,
                 prompt_i32.as_ptr(),
                 prompt_i32.len() as i32,
                 max_new_tokens as i32,
                 temperature,
+                greedy,
                 out_tokens.as_mut_ptr(),
                 &raw mut out_count,
                 &raw mut prefill_ms,
@@ -1665,6 +1680,14 @@ fn extract_qw(
     }
 }
 
+pub(super) fn qwen35_dflash_supported(weights: &Qwen35MetalWeights) -> bool {
+    weights.embedding.dense().is_some()
+        && weights
+            .cpp_model
+            .as_ref()
+            .is_some_and(CppQwen35Model::supports_gdr_tape)
+}
+
 pub(super) fn metal_generate_qwen35(
     input_ids: &[u32],
     weights: &Qwen35MetalWeights,
@@ -1692,7 +1715,9 @@ pub(super) fn metal_generate_qwen35(
         anyhow::bail!("Qwen3.5 Metal path requires a Qwen3.5 config");
     };
 
-    if let Some(runtime) = dflash_runtime {
+    if let Some(runtime) = dflash_runtime
+        && qwen35_dflash_supported(weights)
+    {
         return metal_generate_qwen35_dflash(
             runtime,
             input_ids,
@@ -1718,6 +1743,7 @@ pub(super) fn metal_generate_qwen35(
             input_ids,
             max_new_tokens,
             params.temperature,
+            params.temperature <= 1e-6 || params.top_k == 1,
             &stop_ids,
             on_token,
         )?;
@@ -4351,6 +4377,10 @@ mod tests {
             weights.cpp_model.is_some(),
             "GGUF Qwen3.5 should build the C++ model unless METAL_NO_CPP is set"
         );
+        anyhow::ensure!(
+            !qwen35_dflash_supported(&weights),
+            "GGUF Qwen3.5 C++ path must not advertise DFlash support"
+        );
 
         let prompt_ids = tokenizer.encode("Hello world from the GGUF C++ path.")?;
         anyhow::ensure!(
@@ -4379,7 +4409,8 @@ mod tests {
             &config,
             None,
             &SamplingParams {
-                temperature: 0.0,
+                temperature: 0.7,
+                top_k: 1,
                 ignore_eos: true,
                 ..Default::default()
             },

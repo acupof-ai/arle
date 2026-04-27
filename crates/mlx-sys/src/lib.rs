@@ -792,6 +792,7 @@ unsafe extern "C" {
         prompt_len: i32,
         max_new_tokens: i32,
         temperature: f32,
+        greedy: bool,
         out_tokens: *mut i32,
         out_count: *mut i32,
         out_prefill_ms: *mut f64,
