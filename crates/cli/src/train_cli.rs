@@ -25,9 +25,6 @@ use crate::{
 };
 
 #[allow(dead_code)]
-#[path = "../../train/src/bin/eval_lm.rs"]
-mod eval_lm_entry;
-#[allow(dead_code)]
 #[path = "../../train/src/bin/pretrain.rs"]
 mod pretrain_entry;
 #[allow(dead_code)]
@@ -242,7 +239,7 @@ fn run_eval(args: TrainEvalArgs) -> ExitCode {
         "train eval",
         resolve_eval_invocation(&args),
         &args.render,
-        eval_lm_entry::dispatch_from_args,
+        train::commands::eval_lm::dispatch_from_args,
     )
 }
 
