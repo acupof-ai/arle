@@ -100,6 +100,13 @@ impl CoordinatorHandle {
         Some(ticket)
     }
 
+    /// **Reserved for future distributed-scheduler centralization.** Not
+    /// called by the live single-scheduler CUDA runtime — see the doc on
+    /// `Coordinator::handle_plan` for the rationale (the scheduler already
+    /// has everything this method would surface, via `lookup_or_stage` +
+    /// inline `TieredKvPolicy::allow_prefetch`). Production callers should
+    /// not add a `submit_prefetch_plan → wait PlanCompleted → submit_fetch`
+    /// round-trip today; tests cover the API contract for the M5+ use case.
     pub fn submit_prefetch_plan(&self, blocks: Vec<PrefetchPlanRequest>) -> Option<PlanTicket> {
         if blocks.is_empty() {
             return None;
