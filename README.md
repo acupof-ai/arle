@@ -120,11 +120,11 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | Backend | Platform | Status | Notes |
 |---|---|:---:|---|
 | **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, FlashInfer, CUDA Graph decode, packed paged-prefill for Qwen3 / Qwen3.5. |
-| **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse. |
+| **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse, and Qwen3.5-0.8B GGUF Q4_K_M decode at 211.7 tok/s on M4 Pro. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-identical parity, c=1..8 validated. |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a serving target. |
 
-Models: **Qwen3 (0.6B – 72B)** and **Qwen3.5-4B** (hybrid linear + full attention) are supported on both CUDA and Metal. Llama 3 / 4 and DeepSeek V3 / R1 are planned — see [ROADMAP.md](ROADMAP.md).
+Models: **Qwen3 (0.6B – 72B)** and the **Qwen3.5 family** (including 0.8B GGUF Q4_K_M and 4B hybrid linear + full attention) are supported on CUDA and Metal according to the current matrix. Llama 3 / 4 and DeepSeek V3 / R1 are planned — see [ROADMAP.md](ROADMAP.md).
 
 Authoritative matrix (HTTP API tiers, quantization, agent / train / eval surfaces): [docs/support-matrix.md](docs/support-matrix.md).
 Stability tiers: [docs/stability-policy.md](docs/stability-policy.md).
@@ -167,8 +167,8 @@ Operators who want only the serving binary can use `infer` directly (`cargo buil
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
+- **2026-04-27** — Metal `Qwen3.5-0.8B` GGUF `Q4_K_M` decode crossed 200 tok/s on M4 Pro after Q5_K/Q8_0 affine repack and Q6/group16 qmv tile tuning. Evidence: [`docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md`](docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md).
 - **2026-04-23** — `arle` front door now unifies `train pretrain|sft|grpo|multi-turn|eval` and `data download|convert` under one top-level Rust CLI. Notes: [`docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md`](docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md).
-- **2026-04-22** — CUDA `Qwen3.5` ships through a true packed multi-request paged-prefill path; full-attention layers write directly into the paged pool, hybrid linear-attention layers use packed recurrent-state launches. Plan: [`docs/plans/2026-04-23-cuda-decode-sglang-alignment.md`](docs/plans/2026-04-23-cuda-decode-sglang-alignment.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md). Next up: [ROADMAP.md](ROADMAP.md).
 

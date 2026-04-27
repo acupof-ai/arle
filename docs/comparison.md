@@ -1,7 +1,7 @@
 # ARLE vs other inference runtimes
 
 A grounded positioning document for "should I use ARLE or X?". Updated
-2026-04-26. Linked projects below have their own docs that supersede anything
+2026-04-27. Linked projects below have their own docs that supersede anything
 this page summarizes.
 
 > **TL;DR.** Pick **vLLM** or **SGLang** if you need broad model coverage and
@@ -13,8 +13,9 @@ this page summarizes.
 
 ## What ARLE is not
 
-ARLE is **not** a drop-in vLLM replacement. As of 2026-04-26 the supported-
-model list is short (Qwen3 0.6B–72B, Qwen3.5-4B); see
+ARLE is **not** a drop-in vLLM replacement. As of 2026-04-27 the supported-
+model list is short (Qwen3 0.6B–72B and the current Qwen3.5 family paths,
+including 0.8B GGUF Q4_K_M and 4B); see
 [support-matrix.md](support-matrix.md). If "support 50 model families on day
 one" is on your requirements list, use vLLM.
 

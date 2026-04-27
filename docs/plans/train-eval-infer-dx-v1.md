@@ -159,7 +159,7 @@ switch loses prior conversation context (`chat_history` and
 ## Bench policy
 
 DX-1 and DX-3 are CLI-only, no hot-path numbers move → bench-exempt
-per CLAUDE.md (document in commit body). DX-2 runs a forward pass;
+per AGENTS.md / CLAUDE.md (document in commit body). DX-2 runs a forward pass;
 bench-exempt for the helper itself (no new kernels) but should
 produce a "before/after consistency" number in the wins entry.
 

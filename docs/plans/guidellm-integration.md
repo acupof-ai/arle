@@ -97,7 +97,7 @@ agent-infer/
 │   │   └── TEMPLATE-bench-guidellm.md                                 # ← NEW skeleton
 │   └── plans/
 │       └── guidellm-integration.md                                    # ← this doc
-├── CLAUDE.md                                                          # ← §Benchmarks updated
+├── AGENTS.md / CLAUDE.md                                              # ← §Benchmarks updated
 ├── infer/src/http_server/AGENTS.md                                    # ← points at guidellm for perf verify
 └── .gitignore                                                         # ← + bench-output/
 ```
@@ -223,7 +223,7 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 - HTML report: `bench-output/<date>-<label>/benchmarks.html`
 ```
 
-CLAUDE.md rule "Never overwrite before-snapshots" carries over verbatim —
+AGENTS.md / CLAUDE.md rule "Never overwrite before-snapshots" carries over verbatim —
 the `<date>-<label>` naming enforces it at the filesystem level.
 
 ---
@@ -261,7 +261,7 @@ Codex-executable gates. Implementation is complete when all hold:
 7. `scripts/bench_throughput.py --help` still works AND prints a
    `DEPRECATED: use scripts/bench_guidellm.sh instead` notice to stderr
    before the normal help.
-8. `CLAUDE.md` §Benchmarks points at the canonical `scripts/bench_guidellm.sh`
+8. `AGENTS.md` / `CLAUDE.md` §Benchmarks points at the canonical `scripts/bench_guidellm.sh`
    wrapper.
 9. Historical wins may still reference the old sweep script, but active docs
    must use the canonical wrapper.
@@ -295,8 +295,8 @@ docs.
 
 ## 10 · Execution
 
-**Claude owns**: this doc, the CLAUDE.md edit, the AGENTS.md pointer, the
-wins template (§6). Reason: planning + docs per CLAUDE.md delegation rule.
+**Claude owns**: this doc, the AGENTS.md / CLAUDE.md benchmark-rule edit, and
+the wins template (§6). Reason: planning + docs per the project delegation rule.
 
 **Codex owns**: `scripts/bench_guidellm.sh` (shell + jq), `pyproject.toml`
 bench extra edit, `requirements-bench.txt` edit, `.gitignore` edit, the
@@ -306,7 +306,7 @@ criteria §8 gates on a reachable server.
 **Hand-off order:**
 1. Claude writes this doc (done).
 2. Claude writes `docs/experience/wins/TEMPLATE-bench-guidellm.md`, the
-   CLAUDE.md §Benchmarks edit, and the `infer/src/http_server/AGENTS.md`
+   AGENTS.md / CLAUDE.md §Benchmarks edit, and the `infer/src/http_server/AGENTS.md`
    pointer.
 3. Codex implements the wrapper + dep edits + deprecation banner and runs
    §8 gates 1, 3, 4, 6, 7, 8, 9 (the ones that don't need a GPU server).

@@ -1,7 +1,8 @@
 # Bench & Trace Specification
 
 > Process rule for running, recording, and **iterating** on benchmarks and
-> traces. Linked from [`CLAUDE.md`](../CLAUDE.md) §Benchmarks. The fill-in
+> traces. Linked from [`AGENTS.md`](../AGENTS.md) and
+> [`CLAUDE.md`](../CLAUDE.md) §Benchmarks. The fill-in
 > skeleton is [`TEMPLATE-bench-guidellm.md`](experience/wins/TEMPLATE-bench-guidellm.md);
 > this doc governs the process, not the skeleton.
 
@@ -146,7 +147,7 @@ Rules:
 
 ```
 ARLE/
-├── CLAUDE.md                        ← links this spec
+├── AGENTS.md / CLAUDE.md            ← link this spec
 ├── docs/
 │   ├── bench-and-trace-spec.md      ← THIS FILE (process)
 │   ├── perf-and-correctness-gates.md← pass/fail thresholds (what)

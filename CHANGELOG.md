@@ -19,6 +19,18 @@ Related governance docs:
 
 ## [Unreleased]
 
+### Runtime
+
+- Metal Qwen3.5-0.8B GGUF Q4_K_M decode now crosses 200 tok/s on M4 Pro
+  (211.7 tok/s for 512 prompt / 1024 decode) after Q5_K/Q8_0 affine repack
+  and Q6/group16 qmv tile tuning. Evidence:
+  [`docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md`](docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md).
+
+### Docs
+
+- README, roadmap, support matrix, and maintainer docs now share the same
+  Metal GGUF support and benchmark wording.
+
 ## [0.1.1] — 2026-04-27
 
 Install ergonomics + a batch of TileLang, KV-tier, and Metal/Qwen3.5

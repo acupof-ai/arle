@@ -24,6 +24,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
   - Qwen3.5 当前仍需每步 concat/split request-local KV / recurrent state，
     所以 quick HTTP sweep 还没有出现明显台阶
   - 变长 decode batch 仍然没有进入 batched GPU 路径
+- Qwen3.5-0.8B GGUF Q4_K_M 的单请求 decode floor 已经从 scalar/raw 路径
+  拉到 MLX affine/tiled quant 主线：Q5_K / Q8_0 load-time repack，Q6/group16
+  qmv tile 调整后，512 prompt / 1024 decode 在 M4 Pro 上达到 211.7 tok/s。
 
 这意味着今天的 Metal 已经不再是“纯串行 serving”，但还没有达到 CUDA
 路径那种真正以 batched decode / prefix reuse 为核心的 serving 形态。
@@ -43,6 +46,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
    当前状态：Qwen3 / Qwen3.5 同长度 decode batch 已落地；下一步是变长
    batch 和去掉 Qwen3.5 每步 batch-state concat/split，而不是继续把
    same-length 路径包装成完成态。
+   补充状态：Qwen3.5 GGUF 单请求 matmul/lm_head floor 已经跨过 200 tok/s；
+   这不是 serving 完成态，下一步仍然要把相同 kernel 收益带进 scheduler
+   batching、变长 decode 和 Qwen3.6/MoE 路径。
 2. 把 prefix cache / KV pool 生命周期接到多请求服务路径，而不是只在单请求 fallback 中复用。
    当前状态：Qwen3 live runtime 已接上 runtime-owned prefix cache + shared KV
    pool；admission 会先 lookup/import，再把 suffix 交给 scheduler，terminal
@@ -68,10 +74,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 
 ### Background work, not main thread
 
-7. 持续优化 Qwen3.5 decode/prefill 热路径，但前提是：
-   - 不打断 `M0.2/M0.3/M0.4`
-   - 有 profiler 或 benchmark 证据
-   - 不把 direct-bench 提升误判成 serving 提升
+7. 继续做 Qwen3.5/Qwen3.6 decode/prefill 热路径，但只保留有 profiler 或
+   benchmark 证据的改动；direct-bench 提升必须明确标注，不能写成 serving
+   吞吐已经闭环。
 8. 在 Metal 路径里把“不支持的架构”保持为显式失败，不允许静默按 Qwen 解析。
 
 ## Quantized KV Posture
