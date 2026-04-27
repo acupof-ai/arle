@@ -14,8 +14,22 @@ pub(super) fn clipped_max_new_tokens_estimate(max_tokens: usize) -> usize {
     max_tokens.min(CLIPPED_MAX_NEW_TOKENS_ESTIMATE)
 }
 
-pub(super) fn estimated_request_target_tokens(prompt_tokens: usize, max_tokens: usize) -> usize {
-    prompt_tokens.saturating_add(clipped_max_new_tokens_estimate(max_tokens))
+/// Pages a request needs *to be admitted*, in tokens.
+///
+/// SGLang-style admission: charge prefill cost only (prompt + 1 page tail
+/// for the just-generated token) and let decode pages allocate lazily during
+/// the decode loop. The mid-step OOM safety net is
+/// [`crate::scheduler::cuda::decode::Scheduler::retract_decode_to_fit`]
+/// (called from both `step_decode_launch` and `step_mixed_launch`), which
+/// preempts the least-progressed decode and re-queues it (Recompute mode).
+///
+/// Already-running decodes still reserve their remaining `max_tokens` against
+/// the page budget when planning prefill admission — that path goes through
+/// [`crate::scheduler::cuda::execution::Scheduler::remaining_decode_reservation_tokens`],
+/// which keeps using `clipped_max_new_tokens_estimate`. Only the *new*
+/// admission path drops the upfront max_tokens reservation.
+pub(super) fn estimated_request_target_tokens(prompt_tokens: usize, _max_tokens: usize) -> usize {
+    prompt_tokens.saturating_add(1)
 }
 
 pub(super) fn estimated_request_pages(
@@ -322,13 +336,20 @@ mod tests {
     }
 
     #[test]
-    fn estimated_request_pages_rounds_prompt_plus_decode_up() {
-        assert_eq!(estimated_request_pages(4_097, 256, 16), 273);
+    fn estimated_request_pages_charges_prompt_only_plus_one() {
+        // SGLang-style admission: prompt + 1 token for the first generated
+        // sample, no upfront reservation for the full max_tokens decode tail.
+        // 4_097 + 1 = 4_098 tokens → ceil(4_098/16) = 257 pages.
+        assert_eq!(estimated_request_pages(4_097, 256, 16), 257);
     }
 
     #[test]
-    fn estimated_request_pages_clips_long_decode_tail() {
-        assert_eq!(estimated_request_pages(2_048, 8_192, 16), 384);
+    fn estimated_request_pages_ignores_max_tokens_at_admission() {
+        // Decode-tail size no longer affects admission; the retract path
+        // handles mid-step OOM. 2_048 + 1 = 2_049 → ceil(2_049/16) = 129.
+        assert_eq!(estimated_request_pages(2_048, 8_192, 16), 129);
+        // The clipping helper itself is still used by execution.rs for
+        // *running* decode reservations, so its semantics are unchanged.
         assert_eq!(clipped_max_new_tokens_estimate(8_192), 4_096);
     }
 
@@ -449,22 +470,28 @@ mod tests {
 
     #[test]
     fn estimated_request_target_sets_prefix_floor_and_goal() {
+        // target_seq = prompt_tokens + 1 (prompt-only admission); seq_floor
+        // is the reserved prefix length, kept untouched.
         assert_eq!(
             estimated_request_target(3, 128, 64, 96),
             PageTarget {
                 slot_idx: 3,
                 seq_floor: 96,
-                target_seq: 192,
+                target_seq: 129,
             }
         );
     }
 
     #[test]
     fn waiting_shortage_expands_beyond_free_slots_for_backlog() {
+        // Per-request page need under prompt-only admission:
+        //   ceil((4_097 + 1) / 16) = 257 pages.
+        // Backlog of 11 requests → 11 * 257 = 2_827 pages.
+        // Free pages = 1_385 → shortage = 2_827 - 1_385 = 1_442.
         let waiting = std::iter::repeat_n((Some(4_097usize), 256usize), 11);
         assert_eq!(
             waiting_admission_shortage_pages(1_385, 16, 5, 11, waiting),
-            1_618
+            1_442
         );
     }
 

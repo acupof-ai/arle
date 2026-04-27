@@ -26,8 +26,17 @@ use cuda_kernels::prelude::{
 };
 
 const BF16_BYTES: usize = 2;
-// Packed mixed batches can have thousands of QO rows. Reuse the large
-// split-KV workspace instead of the decode-only default.
+
+/// Mixed-batch FlashInfer float workspace.
+///
+/// Packed mixed batches can have thousands of QO rows. FlashInfer's
+/// internal `batch_prefill_tmp_v` allocation grows with
+/// `max_total_tokens × num_kv_heads × head_dim`; on Qwen3-4B at
+/// max_total_tokens≈4112 and num_kv_heads=8, head_dim=128 it needs
+/// ~270 MiB, so the 256 MiB DEFAULT_FLOAT_WORKSPACE_BYTES tier is too
+/// tight even for HD128. Stay on the 640 MiB tier for all head_dims —
+/// the activation-side wins from removing vocab_size and the
+/// prefill_activation chunk-size fix already free more than this 384 MiB.
 const MIXED_FLOAT_WORKSPACE_BYTES: usize = FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES;
 
 fn bf16_matrix_bytes(rows: usize, cols: usize) -> usize {
@@ -112,10 +121,18 @@ pub(crate) struct MixedBatchBuffers {
     up_out: HiddenStates,
     gate_up_out: HiddenStates,
     act_out: HiddenStates,
+    /// Logits buffer sized for the *kept* output rows only:
+    /// `max_logit_rows = max_batch_size`. Mixed-batch forward computes vocab
+    /// projections only for decode rows (one per request) and the final token
+    /// of each prefill chunk — never the intermediate prefill tokens. The
+    /// intermediate rows are gathered out of `normed` before the output
+    /// projection, so this stays at `vocab × max_batch_size` instead of
+    /// `vocab × max_total_tokens`.
     logits: HiddenStates,
     token_ids_gpu: CudaSlice<i32>,
     metadata: FlashInferDecodeMetadata,
     max_tokens: usize,
+    max_logit_rows: usize,
     max_total_pages: usize,
 }
 
@@ -126,10 +143,12 @@ impl MixedBatchBuffers {
         ctx: &DeviceContext,
         model: &Qwen3Model,
         max_tokens: usize,
+        max_logit_rows: usize,
         max_total_pages: usize,
     ) -> Result<Self> {
         let q_dim = model.config.num_attention_heads * model.config.head_dim;
         let kv_dim = model.config.num_key_value_heads * model.config.head_dim;
+        let max_logit_rows = max_logit_rows.max(1);
 
         Ok(Self {
             embedding_out: HiddenStates::zeros(ctx, model.config.hidden_size, max_tokens)?,
@@ -145,7 +164,8 @@ impl MixedBatchBuffers {
             up_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
             gate_up_out: HiddenStates::zeros(ctx, 2 * model.config.intermediate_size, max_tokens)?,
             act_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
-            logits: HiddenStates::zeros(ctx, model.config.vocab_size, max_tokens)?,
+            // Sized for kept output rows only — see field doc above.
+            logits: HiddenStates::zeros(ctx, model.config.vocab_size, max_logit_rows)?,
             token_ids_gpu: ctx
                 .stream
                 .alloc_zeros(max_tokens)
@@ -158,10 +178,16 @@ impl MixedBatchBuffers {
                 MIXED_FLOAT_WORKSPACE_BYTES,
             )?,
             max_tokens,
+            max_logit_rows,
             max_total_pages,
         })
     }
 
+    /// Set the per-token sequence length for buffers shared by all rows
+    /// in the mixed batch (decode + every prefill token). The `logits`
+    /// buffer follows a different schedule — it covers only the *kept*
+    /// output rows (decode + final token of each prefill) and is sized
+    /// separately by the forward path.
     fn set_seq_len(&mut self, seq_len: usize) {
         self.embedding_out.seq_len = seq_len;
         self.hidden_out.seq_len = seq_len;
@@ -176,7 +202,6 @@ impl MixedBatchBuffers {
         self.up_out.seq_len = seq_len;
         self.gate_up_out.seq_len = seq_len;
         self.act_out.seq_len = seq_len;
-        self.logits.seq_len = seq_len;
     }
 }
 
@@ -212,6 +237,7 @@ impl BatchDecodeBuffers {
         bf16_matrix_bytes(vocab_size, max_batch_size)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mixed_device_bytes(
         hidden_dim: usize,
         q_dim: usize,
@@ -219,17 +245,21 @@ impl BatchDecodeBuffers {
         inter_dim: usize,
         vocab_size: usize,
         max_total_tokens: usize,
+        max_logit_rows: usize,
         num_qheads: usize,
         max_total_pages: usize,
     ) -> usize {
+        // Per-token activation buffers (every row in the mixed batch).
         let activation_dims = 4usize
             .saturating_mul(hidden_dim)
             .saturating_add(3usize.saturating_mul(q_dim))
             .saturating_add(4usize.saturating_mul(kv_dim))
-            .saturating_add(5usize.saturating_mul(inter_dim))
-            .saturating_add(vocab_size);
+            .saturating_add(5usize.saturating_mul(inter_dim));
 
         bf16_matrix_bytes(activation_dims, max_total_tokens)
+            // Logits buffer — sized for kept output rows only (decode rows +
+            // one final-token row per prefill), not every prefill token.
+            .saturating_add(bf16_matrix_bytes(vocab_size, max_logit_rows))
             .saturating_add(bytes_for::<i32>(max_total_tokens))
             .saturating_add(FlashInferDecodeMetadata::device_bytes_with_float_workspace(
                 max_total_tokens,
@@ -328,13 +358,16 @@ impl BatchDecodeBuffers {
         min_total_tokens: usize,
     ) -> Result<&mut MixedBatchBuffers> {
         let needs_realloc = self.mixed.as_ref().is_none_or(|mixed| {
-            mixed.max_tokens < min_total_tokens || mixed.max_total_pages < self.max_total_pages
+            mixed.max_tokens < min_total_tokens
+                || mixed.max_logit_rows < self.max_batch_size
+                || mixed.max_total_pages < self.max_total_pages
         });
         if needs_realloc {
             self.mixed = Some(MixedBatchBuffers::new(
                 &model.ctx,
                 model,
                 min_total_tokens.max(self.max_batch_size),
+                self.max_batch_size,
                 self.max_total_pages,
             )?);
         }
@@ -826,6 +859,53 @@ impl Qwen3Model {
 
         let hidden = unsafe { &*hidden_ptr };
         ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut mixed.normed);
+
+        // Gather only the rows we will need vocab logits for: every decode
+        // row (rows 0..b are already in place) and the *last* token of each
+        // prefill chunk (sources at b + Σ p_k - 1, destinations at b..b+P).
+        // Compact in place: dst_i = b + i, src_i = b + Σ_{k≤i} p_k - 1.
+        // Since p_k ≥ 1, src_i ≥ dst_i for every i, and src_i strictly
+        // exceeds every earlier dst, so sequential forward copies on a
+        // single stream cannot clobber any later source.
+        //
+        // We copy within the same `mixed.normed.data` buffer, so we go via
+        // raw `cuMemcpyDtoDAsync_v2` to avoid Rust's aliasing rules on
+        // overlapping immutable+mutable slices of the same allocation.
+        let kept_rows = b + prefill_count;
+        debug_assert!(kept_rows <= mixed.max_logit_rows);
+        let hidden_dim = mixed.normed.hidden_dim;
+        {
+            use cudarc::driver::sys::{cuMemcpyDtoDAsync_v2, cudaError_enum::CUDA_SUCCESS};
+            let bf16_size = std::mem::size_of::<u16>();
+            let row_bytes = hidden_dim * bf16_size;
+            let (base_ptr, _guard) = mixed.normed.data.device_ptr_mut(&self.ctx.stream);
+            let mut prefill_token_offset = 0usize;
+            for (i, prefill) in batch.prefills.iter().enumerate() {
+                let src_row = b + prefill_token_offset + prefill.tokens.len() - 1;
+                let dst_row = b + i;
+                if src_row != dst_row {
+                    let src_ptr = base_ptr + (src_row * row_bytes) as u64;
+                    let dst_ptr = base_ptr + (dst_row * row_bytes) as u64;
+                    let result = unsafe {
+                        cuMemcpyDtoDAsync_v2(
+                            dst_ptr,
+                            src_ptr,
+                            row_bytes,
+                            self.ctx.stream.cu_stream(),
+                        )
+                    };
+                    if result != CUDA_SUCCESS {
+                        anyhow::bail!("D2D mixed normed gather failed: {result:?}");
+                    }
+                }
+                prefill_token_offset += prefill.tokens.len();
+            }
+        }
+
+        // Restrict the output projection to the kept rows; mixed.logits is
+        // sized for max_batch_size only.
+        mixed.normed.seq_len = kept_rows;
+        mixed.logits.seq_len = kept_rows;
         ops::gemm_into(
             &self.ctx,
             self.output_projection(),
@@ -835,33 +915,35 @@ impl Qwen3Model {
 
         let decode_logits = unsafe { &mut *logits_batch_ptr };
         decode_logits.seq_len = b;
-        let src = mixed.logits.data.slice(0..b * decode_logits.hidden_dim);
-        let mut dst = decode_logits
-            .data
-            .slice_mut(0..b * decode_logits.hidden_dim);
-        self.ctx
-            .stream
-            .memcpy_dtod(&src, &mut dst)
-            .map_err(|e| anyhow::anyhow!("D2D mixed decode logits: {e}"))?;
+        if b > 0 {
+            let src = mixed.logits.data.slice(0..b * decode_logits.hidden_dim);
+            let mut dst = decode_logits
+                .data
+                .slice_mut(0..b * decode_logits.hidden_dim);
+            self.ctx
+                .stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow::anyhow!("D2D mixed decode logits: {e}"))?;
+        }
 
-        let mut prefill_token_offset = 0usize;
-        for prefill in batch.prefills {
+        for (i, prefill) in batch.prefills.iter().enumerate() {
             let prefill_state = &mut states[prefill.slot_idx];
             if prefill_state.base.prefill_logits.is_none() {
                 prefill_state.base.prefill_logits =
                     Some(DeviceVec::zeros(&self.ctx, self.output_projection().rows)?);
             }
+            // After the in-place compaction above, the final-token row for
+            // prefill i lives at row `b + i` in mixed.logits.
             ops::extract_vec_into(
                 &self.ctx,
                 &mixed.logits,
-                b + prefill_token_offset + prefill.tokens.len() - 1,
+                b + i,
                 prefill_state
                     .base
                     .prefill_logits
                     .as_mut()
                     .expect("prefill logits allocated"),
             )?;
-            prefill_token_offset += prefill.tokens.len();
         }
 
         Ok(true)
