@@ -1255,26 +1255,11 @@ impl LoadedInferenceEngine {
     pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
         #[cfg(feature = "cuda")]
         {
-            // Production CLI / agent CUDA path: route through the unified
-            // multi-request scheduler runtime via the `RequestHandle`
-            // contract (matches what the HTTP server already does for its
-            // own `spawn_scheduler_handle_from_path` flow). Legacy
-            // `Qwen3 / Qwen35 / Qwen35Moe` variants are still constructed
-            // explicitly by E2E tests via `LoadedInferenceEngine::load_with_options`.
-            let runtime = crate::backend::cuda::bootstrap::ServerRuntimeConfig {
-                engine: InferenceEngineOptions { enable_cuda_graph },
-                ..Default::default()
-            };
-            let metrics = crate::metrics::ServerMetrics::new("");
-            let (handle, guard) =
-                crate::backend::cuda::bootstrap::spawn_scheduler_handle_from_path(
-                    model_path, runtime, metrics,
-                )?;
-            let model_id = handle.model_id().to_string();
-            return Ok(Self::Cuda {
-                engine: RequestHandleInferenceEngine::from_handle(model_id, handle),
-                _guard: guard,
-            });
+            return Self::load_with_options(
+                model_path,
+                42,
+                InferenceEngineOptions { enable_cuda_graph },
+            );
         }
 
         #[cfg(all(not(feature = "cuda"), feature = "metal"))]
@@ -1302,23 +1287,24 @@ impl LoadedInferenceEngine {
         seed: u64,
         options: InferenceEngineOptions,
     ) -> Result<Self> {
-        match detect_model_type(model_path)? {
-            ModelType::Qwen3 => Ok(Self::Qwen3(Qwen3InferenceEngine::load_with_options(
-                model_path, seed, options,
-            )?)),
-            ModelType::Qwen35 => Ok(Self::Qwen35(Qwen35InferenceEngine::load_with_options(
-                model_path, seed, options,
-            )?)),
-            ModelType::Qwen35Moe => {
-                // CUDA MoE path is a stub; loader panics with a clear message.
-                let components = crate::backend::cuda::bootstrap::load_qwen35_moe_components(
-                    model_path, options,
-                )?;
-                Ok(Self::Qwen35Moe(
-                    Qwen35InferenceEngine::from_model_components(components, seed)?,
-                ))
-            }
-        }
+        // All CUDA loads now route through the unified scheduler runtime.
+        // The legacy `Qwen3 / Qwen35 / Qwen35Moe` variants remain on the
+        // enum only until commit 3d (deletion) — no construction site
+        // produces them anymore.
+        let runtime = crate::backend::cuda::bootstrap::ServerRuntimeConfig {
+            engine: options,
+            seed,
+            ..Default::default()
+        };
+        let metrics = crate::metrics::ServerMetrics::new("");
+        let (handle, guard) = crate::backend::cuda::bootstrap::spawn_scheduler_handle_from_path(
+            model_path, runtime, metrics,
+        )?;
+        let model_id = handle.model_id().to_string();
+        Ok(Self::Cuda {
+            engine: RequestHandleInferenceEngine::from_handle(model_id, handle),
+            _guard: guard,
+        })
     }
 
     pub fn backend_name(&self) -> &'static str {

@@ -4,7 +4,7 @@
 /// Run with: cargo test -r --test gen_test_data_35 -- --nocapture
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
-    CompletionRequest, InferenceEngine, InferenceEngineOptions, Qwen35InferenceEngine,
+    CompletionRequest, InferenceEngine, InferenceEngineOptions, LoadedInferenceEngine,
 };
 use serde::Serialize;
 
@@ -28,7 +28,7 @@ struct TestCase {
 fn generate_qwen35_test_data() {
     infer::logging::init_stderr("info");
 
-    let mut engine = Qwen35InferenceEngine::load_with_options(
+    let mut engine = LoadedInferenceEngine::load_with_options(
         MODEL_PATH,
         42,
         InferenceEngineOptions {

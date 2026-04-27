@@ -1,7 +1,7 @@
 #![cfg(feature = "cuda")]
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
-    CompletionRequest, InferenceEngine, InferenceEngineOptions, Qwen35InferenceEngine,
+    CompletionRequest, InferenceEngine, InferenceEngineOptions, LoadedInferenceEngine,
 };
 
 #[test]
@@ -11,7 +11,7 @@ fn qwen35_gguf_generate() {
     let p = std::env::var("INFER_Q35_PATH")
         .unwrap_or_else(|_| "models/Qwen3.5-4B-GGUF-Q6_K".to_string());
     println!("loading {p}");
-    let mut engine = Qwen35InferenceEngine::load_with_options(
+    let mut engine = LoadedInferenceEngine::load_with_options(
         &p,
         42,
         InferenceEngineOptions {

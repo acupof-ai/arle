@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
-    CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine, Qwen3InferenceEngine,
+    CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine, LoadedInferenceEngine,
 };
 use infer::trace_reporter::FileReporter;
 
@@ -110,7 +110,7 @@ fn test_e2e_generation() {
 
     info!("Loading engine...");
     let start = Instant::now();
-    let mut engine = Qwen3InferenceEngine::load(&model_path, 42).expect("Failed to load engine");
+    let mut engine = LoadedInferenceEngine::load(&model_path, true).expect("Failed to load engine");
     info!("Engine loaded in {:.2?}", start.elapsed());
 
     // Build expected-output lookup from JSON

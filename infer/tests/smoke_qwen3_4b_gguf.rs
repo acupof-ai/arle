@@ -10,7 +10,9 @@
 use std::time::Instant;
 
 use infer::sampler::SamplingParams;
-use infer::server_engine::{InferenceEngine, InferenceEngineOptions, LoadedInferenceEngine};
+use infer::server_engine::{
+    CompletionRequest, InferenceEngine, InferenceEngineOptions, LoadedInferenceEngine,
+};
 
 fn path() -> String {
     std::env::var("INFER_QWEN3_PATH").unwrap_or_else(|_| "models/Qwen3-4B-GGUF".to_string())
@@ -32,9 +34,9 @@ fn qwen3_4b_gguf_generate() {
     )
     .expect("load failed");
     println!(
-        "loaded in {:.1}s, model_type={:?}",
+        "loaded in {:.1}s, backend={}",
         t0.elapsed().as_secs_f32(),
-        engine.model_type()
+        engine.backend_name()
     );
 
     // Build a long prompt (~1.5k tokens) to stress-test long-context prefill.
@@ -47,7 +49,7 @@ fn qwen3_4b_gguf_generate() {
         long_prompt,
     ];
     for prompt in &prompts {
-        let req = infer::server_engine::CompletionRequest {
+        let req = CompletionRequest {
             prompt: prompt.clone(),
             max_tokens: 16,
             sampling: SamplingParams::default(),
@@ -56,12 +58,7 @@ fn qwen3_4b_gguf_generate() {
             session_id: None,
             trace_context: None,
         };
-        // Use the sync complete() so we can see the token_ids directly.
-        let out = match &mut engine {
-            LoadedInferenceEngine::Qwen3(e) => e.complete(req).unwrap(),
-            LoadedInferenceEngine::Qwen35(e) => e.complete(req).unwrap(),
-            LoadedInferenceEngine::Qwen35Moe(e) => e.complete(req).unwrap(),
-        };
+        let out = engine.complete(req).unwrap();
         let shown: String = prompt.chars().take(60).collect();
         println!("prompt_len={} prompt_head={shown:?}", prompt.len());
         println!("  text={:?}", out.text);

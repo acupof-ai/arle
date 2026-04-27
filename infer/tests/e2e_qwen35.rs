@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
     CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
-    InferenceEngineOptions, Qwen35InferenceEngine,
+    InferenceEngineOptions, LoadedInferenceEngine,
 };
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
@@ -76,7 +76,7 @@ fn test_e2e_qwen35_generation() {
 
     info!("Loading Qwen3.5 engine...");
     let start = Instant::now();
-    let mut engine = Qwen35InferenceEngine::load_with_options(
+    let mut engine = LoadedInferenceEngine::load_with_options(
         MODEL_PATH,
         42,
         InferenceEngineOptions {
@@ -84,11 +84,7 @@ fn test_e2e_qwen35_generation() {
         },
     )
     .expect("Failed to load Qwen3.5 engine");
-    info!(
-        "Engine loaded in {:.2?}, vocab_size={}",
-        start.elapsed(),
-        engine.vocab_size()
-    );
+    info!("Engine loaded in {:.2?}", start.elapsed());
 
     // Build expected-output lookup from JSON
     let expected: HashMap<&str, &str> = test_cases
