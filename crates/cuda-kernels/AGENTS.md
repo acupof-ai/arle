@@ -102,14 +102,17 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
   `TORCH_CUDA_ARCH_LIST=...` value that excludes the failing SM.
 - **Multi-cubin AOT + runtime SM dispatch.** Both Triton AOT
   (`build_triton_kernel`) and TileLang AOT (`build_tilelang_kernel`) loop
-  over `sm_targets` and emit one cubin per (kernel, SM) tuple, each with a
-  `_sm{sm}` suffix in `out_name` / `kernel_name` so generated symbols are
-  unique. A C dispatch wrapper (`format_dispatch_wrapper`) extern-declares
-  every per-SM symbol, caches `compute_capability_major*10 + minor` in a
+  over `sm_targets` and emit one cubin per (kernel, SM) tuple. Per-SM
+  symbol uniqueness comes from a `_sm{sm}` suffix on `out_name` (Triton:
+  the public C symbol the generator writes) and on **both** `kernel_name`
+  and `out_name` for TileLang (TileLang's gen script appends `_cuda` to
+  `kernel_name`, so varying it gives a unique exported symbol per SM).
+  A C dispatch wrapper (`format_dispatch_wrapper`) extern-declares every
+  per-SM symbol, caches `compute_capability_major*10 + minor` in a
   `static __thread` slot via `cuCtxGetDevice` + `cuDeviceGetAttribute`,
   and `switch`es to the matching cubin. Public FFI entry names (e.g.
-  `silu_mul_triton_aot_cuda`, `tilelang_*_run_cuda`) are unchanged from the
-  single-SM era — only the wrapper internals dispatch. **TLS, not
+  `silu_mul_triton_aot_cuda`, `tilelang_*_run_cuda`) are unchanged from
+  the single-SM era — only the wrapper internals dispatch. **TLS, not
   pthread_once + global static**: multi-GPU runtimes may bind different
   threads to different devices, and a process-global cache would race
   + silently dispatch the wrong cubin.
