@@ -11,7 +11,7 @@ publish = false
 # prompts (`qlen < BLOCK_M=64`). FlashInfer prefill HD128 is the default
 # again until the kernel is fixed. See
 # `docs/experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md`.
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "tilelang-attn"]
 no-cuda = []
 # TileLang prefill HD128 path. Implies `cuda` because the kernel code
 # calls into the cuda runtime; `--features tilelang-attn` alone would

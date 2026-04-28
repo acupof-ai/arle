@@ -188,7 +188,14 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 m_new = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 p = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
                 T.copy(m_i, m_prev)
-                T.reduce_max(scores, m_new, dim=1, clear=False)
+                # `clear=True` initializes m_new to -inf before the reduction.
+                # The previous `clear=False` left m_new uninitialized — TileLang
+                # codegen emits `m_new[i] = max(m_new[i], m_new_clear[i])`
+                # reading uninit stack memory, which is the actual root cause
+                # of the short-qlen NaN regression: any nonzero garbage (incl.
+                # NaN) leaks into m_new even on valid rows. See
+                # docs/experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md.
+                T.reduce_max(scores, m_new, dim=1, clear=True)
                 for i in T.Parallel(BLOCK_M):
                     m_new[i] = T.max(m_prev[i], m_new[i])
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
