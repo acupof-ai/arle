@@ -111,6 +111,13 @@ pub struct AgentTurnResult {
     pub completion_tokens: u64,
     pub max_turns_reached: bool,
     pub trace_events: Vec<AgentTraceEvent>,
+    /// Wall-clock latency from turn start to the engine's first emitted
+    /// token, regardless of whether that token was visible after tool-XML
+    /// stripping. This is the metric to use for RL / SLO dashboards —
+    /// `tps`'s visible-text-only TTFT undercounts when a turn opens with
+    /// a `<tool_call>` block. `None` when no tokens streamed at all
+    /// (e.g. the turn was cancelled before generation began).
+    pub time_to_first_token: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +302,13 @@ impl AgentSession {
         let turn_start = self.messages.len();
         self.messages.push(Message::user(user_input));
 
+        // Wall-clock anchor for the engine-token TTFT we surface to the
+        // caller. Captured here (before any sub-turn fires) so a turn that
+        // opens with a `<tool_call>` block — whose visible-text count is
+        // zero — still reports a meaningful first-token latency.
+        let turn_started_at = std::time::Instant::now();
+        let mut first_engine_token_at: Option<std::time::Instant> = None;
+
         let mut tool_calls_executed = 0usize;
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
@@ -328,8 +342,15 @@ impl AgentSession {
                 };
 
                 let mut visible_stream = VisibleTextStream::default();
-                let stream_visible_enabled = on_text_chunk.is_some();
+                // We always need to observe each engine chunk to capture the
+                // engine-token TTFT, even if the caller did not register a
+                // visible-text callback. So `stream_visible_chunk` is now
+                // unconditionally wired into the streaming path; it just
+                // skips the visible-text handoff when no callback is set.
                 let mut stream_visible_chunk = |chunk: &str| {
+                    if !chunk.is_empty() && first_engine_token_at.is_none() {
+                        first_engine_token_at = Some(std::time::Instant::now());
+                    }
                     let visible = visible_stream.push(chunk);
                     if !visible.is_empty()
                         && let Some(callback) = on_text_chunk.as_deref_mut()
@@ -352,8 +373,7 @@ impl AgentSession {
                         trace_context: None,
                     },
                     cancel,
-                    stream_visible_enabled
-                        .then_some(&mut stream_visible_chunk as &mut dyn FnMut(&str)),
+                    Some(&mut stream_visible_chunk as &mut dyn FnMut(&str)),
                 )?
                 else {
                     return Ok(None);
@@ -420,6 +440,8 @@ impl AgentSession {
                     completion_tokens,
                     max_turns_reached: false,
                     trace_events,
+                    time_to_first_token: first_engine_token_at
+                        .map(|t| t.duration_since(turn_started_at)),
                 }));
             }
 
@@ -456,6 +478,8 @@ impl AgentSession {
                     completion_tokens,
                     max_turns_reached: false,
                     trace_events,
+                    time_to_first_token: first_engine_token_at
+                        .map(|t| t.duration_since(turn_started_at)),
                 }));
             }
         }
@@ -469,6 +493,7 @@ impl AgentSession {
             completion_tokens,
             max_turns_reached: true,
             trace_events,
+            time_to_first_token: first_engine_token_at.map(|t| t.duration_since(turn_started_at)),
         }))
     }
 
@@ -1331,5 +1356,63 @@ mod tests {
 
         assert_eq!(result.tool_calls_executed, 1);
         assert_eq!(result.text, "done");
+    }
+
+    #[test]
+    fn ttft_is_captured_for_tool_only_first_subturn() {
+        // Reproduces the REPL screenshot: turn 1 opens with a tool_call
+        // block (zero visible text after stripping). The visible-stream
+        // TTFT capture in `tps` would miss this because it keys on
+        // post-filter chunks; the agent's engine-token TTFT must still
+        // fire on the raw delta and surface a non-None
+        // `time_to_first_token`.
+        if !python_tool_available() {
+            eprintln!("Skipping test: python tool is unavailable in this environment");
+            return;
+        }
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"python\",\"arguments\":{\"code\":\"print(2 + 2)\"}}\n</tool_call>",
+            "The answer is 4.",
+        ]);
+
+        let result = session
+            .run_turn(
+                &mut engine,
+                "compute 2+2",
+                &[python_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
+            .expect("tool turn");
+
+        assert_eq!(result.tool_calls_executed, 1);
+        assert!(
+            result.time_to_first_token.is_some(),
+            "engine emitted text in turn 1 (the tool_call XML) — TTFT must be Some"
+        );
+    }
+
+    #[test]
+    fn ttft_is_none_when_engine_emits_nothing() {
+        // Edge case: a turn that fails before any text streams should
+        // leave time_to_first_token as None, not zero — None means
+        // "the engine never produced a token", which is the honest
+        // signal for SLO dashboards.
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![""]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "hi",
+                &[],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
+            .expect("empty-output turn");
+        assert_eq!(result.text, "");
+        assert!(result.time_to_first_token.is_none());
     }
 }

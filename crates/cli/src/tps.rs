@@ -56,15 +56,22 @@ impl TpsMeter {
 
     /// Print the final summary to stderr on its own line.
     ///
-    /// `prompt_tokens` and `final_tokens` should come from the engine's
-    /// `TokenUsage`. When `final_tokens` is `None` we fall back to the
-    /// rolling chunk counter; when TTFT was never observed (no streamed
-    /// chunks) the input segment is omitted.
-    pub(crate) fn print_final(&mut self, prompt_tokens: u64, final_tokens: Option<u64>) {
+    /// Prefers `external_ttft` when supplied — that's the agent's
+    /// engine-token TTFT, which catches turns that opened with a
+    /// `<tool_call>` block (zero visible text, but the model still
+    /// generated tokens). Falls back to the meter's own visible-text
+    /// first-chunk capture when the caller passes `None`.
+    pub(crate) fn print_final(
+        &mut self,
+        prompt_tokens: u64,
+        final_tokens: Option<u64>,
+        external_ttft: Option<Duration>,
+    ) {
         self.hide_before_chunk();
         let completion = final_tokens.unwrap_or(self.tokens);
         let elapsed = self.start.elapsed();
-        let ttft = self.first_chunk_at.map(|t| t.duration_since(self.start));
+        let ttft =
+            external_ttft.or_else(|| self.first_chunk_at.map(|t| t.duration_since(self.start)));
         let line = format_final(prompt_tokens, ttft, completion, elapsed);
         let mut stderr = io::stderr();
         let _ = writeln!(stderr, "{line}");
