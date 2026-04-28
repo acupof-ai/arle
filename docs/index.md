@@ -6,7 +6,7 @@
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
 
-Last refreshed: 2026-04-27 (Metal GGUF Qwen3.5 decode floor update).
+Last refreshed: 2026-04-28 (Metal Qwen3.5 MLX 4bit SOTA and GGUF matched-gap update).
 
 ## Canonical Truth Surfaces
 

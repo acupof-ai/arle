@@ -6,7 +6,7 @@ It states what the repository currently supports, what is still limited, and
 what validation exists for each area. If something is not listed as supported
 here, do not assume it is supported just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-04-27.
+State reflected here is based on repository evidence as of 2026-04-28.
 Project framing lives in [index.md §Current Positioning](index.md#current-positioning).
 
 ---
@@ -16,7 +16,7 @@ Project framing lives in [index.md §Current Positioning](index.md#current-posit
 | Backend | Status | Meaning |
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |
-| Metal | Beta | Usable for local validation and live scheduler-backed serving. Qwen3 ships live prefix reuse with a shared KV pool; Qwen3.5 ships live prefix reuse via replayed compiled-path snapshots; `scripts/start_metal_serve.sh` is the canonical first-time Apple bring-up path. Qwen3.5-0.8B GGUF Q4_K_M decode is now measured at 211.7 tok/s on M4 Pro after Q5_K/Q8_0 affine repack and Q6/group16 qmv tile tuning. Metal is still missing full batched-decode parity with CUDA, especially on variable-length Qwen3.5 decode. |
+| Metal | Beta | Usable for local validation and live scheduler-backed serving. Qwen3 ships live prefix reuse with a shared KV pool; Qwen3.5 ships live prefix reuse via replayed compiled-path snapshots; `scripts/start_metal_serve.sh` is the canonical first-time Apple bring-up path. Qwen3.5-0.8B MLX 4bit single-request step-driver is measured at 305.5 tok/s on M4 Pro 20c for `1024/256`. The matched GGUF Q4_K_M direct path is 202.1 tok/s and remains a separate packed-K-quant kernel/format gap. Metal is still missing full batched-decode parity with CUDA, especially on variable-length Qwen3.5 decode. |
 | Metal DFlash | Beta | Apple Silicon speculative decode path. Default-on for Qwen3 and Qwen3.5; benchmark before production use. |
 | no-cuda / CPU-only | Development-oriented CPU backend | Build, test, and smoke-validation path for non-GPU logic. Not a production inference target. |
 
@@ -58,7 +58,7 @@ Notes:
 | Model family | Status | Notes |
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
-| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B GGUF Q4_K_M now runs on Metal through the shared Rust GGUF parser plus MLX affine/tiled quant paths for Q4/Q5/Q6/Q8 hot tensors, validated locally at 211.7 tok/s for 512 prompt / 1024 decode on 2026-04-27. Metal DFlash is Beta; see §4a for the current validation note. |
+| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M direct reaches 202.1 tok/s on the same `1024/256` profile. Metal DFlash is Beta; see §4a for the current validation note. |
 | Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |
@@ -75,7 +75,7 @@ Notes:
 | TurboQuant KV (2–4 bit) | Experimental | Fused decode attention with dequant. Fast-moving optimization area. |
 | W8 / W4 / W2 weight quantization | Beta | Native W4 GEMV path + Marlin W4 prefill (5–25× TTFT on long prompts). |
 | GPTQ / AWQ (W4A16) | Beta | GEMV + Marlin kernel path; format detection production-ready. |
-| GGUF loading | Beta | Supported loader path. CUDA ships the native packed Q4_K GPU kernel (`q4k_gemv_kernel` + packed fast path in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. Metal supports Qwen3.5 GGUF on Apple Silicon via the shared Rust GGUF parser; Qwen3.5-0.8B Q4_K_M now keeps the decode hot path on MLX affine/tiled quant kernels for the large Q4/Q5/Q6/Q8 tensors instead of falling back to broad load-time BF16 dequant. |
+| GGUF loading | Beta | Supported loader path. CUDA ships the native packed Q4_K GPU kernel (`q4k_gemv_kernel` + packed fast path in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. Metal supports Qwen3.5 GGUF on Apple Silicon via the shared Rust GGUF parser; Qwen3.5-0.8B Q4_K_M now keeps the decode hot path on MLX affine/tiled quant kernels for the large Q4/Q5/Q6/Q8 tensors instead of falling back to broad load-time BF16 dequant. It is still slower than MLX SafeTensors 4bit because GGUF K-quant blocks are decoded by ARLE's packed-format bridge kernels rather than MLX's native affine quantized matmul format. |
 
 Backend note:
 

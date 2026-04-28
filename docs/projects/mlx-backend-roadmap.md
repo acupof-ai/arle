@@ -28,8 +28,24 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 - Qwen3.5-0.8B 的单请求路线现在分成两条：MLX SafeTensors 4bit 已经
   贴到公开 Apple-native SOTA，M4 Pro 20c 上 serving-equivalent step-driver
   `1024/256` 达到 305.5 tok/s；GGUF Q4_K_M 已经从 scalar/raw 路径拉到
-  MLX affine/tiled quant 主线，但同一 `1024/256` profile 仍在 202 tok/s
+  MLX affine/tiled quant 主线，但同一 `1024/256` profile 仍在 202.1 tok/s
   左右，后续 GGUF 要作为独立 kernel/weight-format 缺口继续追。
+
+当前展示数据统一以 2026-04-28 的 matched profile 为准：
+
+| path | profile | mode | gen tok/s mean | p50 | TTFT mean | peak RSS |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| MLX SafeTensors 4bit | 1024 prompt / 256 decode | step-driver | 305.5 | 304.7 | 206 ms | 652 MB |
+| MLX SafeTensors 4bit | 1024 prompt / 256 decode | direct | 289.6 | 292.5 | 225 ms | 663 MB |
+| GGUF Q4_K_M | 1024 prompt / 256 decode | direct | 202.1 | 202.6 | 241 ms | 1429 MB |
+
+GGUF 慢的直接原因不是 scheduler：单请求已经走到 C++ compiled model /
+MLX bridge，但 GGUF `Q4_K_M` 不是 MLX 原生 4bit affine 权重格式。它需要
+ARLE 自己的 packed K-quant bridge kernel 在 matmul 里解 block scale/min/高位
+布局，lm_head/linear 热路径也不能复用 MLX 4bit 的最优 lowering；同 profile
+下 RSS 也从 652 MB 提到 1429 MB。后续要追 GGUF，重点不是再调 scheduler
+包装，而是重做 GGUF K-quant decode/lm_head 的 Metal kernel 或加载期转换成
+MLX-native quantized layout。
 
 这意味着今天的 Metal 已经不再是“纯串行 serving”，但还没有达到 CUDA
 路径那种真正以 batched decode / prefix reuse 为核心的 serving 形态。
@@ -51,9 +67,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
    same-length 路径包装成完成态。
    补充状态：Qwen3.5 MLX 4bit 单请求 step-driver 已经贴到 oMLX M4 Pro
    20c 的 1k single-request 公开基线；Qwen3.5 GGUF 单请求 matmul/lm_head
-   floor 已经跨过 200 tok/s。二者都不是 serving 完成态，下一步仍然要把
-   相同 kernel 收益带进 scheduler batching、变长 decode 和 Qwen3.6/MoE
-   路径。
+   floor 在 matched `1024/256` profile 上是 202.1 tok/s。二者都不是 serving
+   完成态，下一步仍然要把相同 kernel 收益带进 scheduler batching、变长
+   decode 和 Qwen3.6/MoE 路径。
    2026-04-28 额外保留了一个 Metal-only checkpoint：Qwen3.5 C++ compiled
    session 在 prefill / scalar decode 前会先 drain 其它 request 的活动
    session，并且 scheduler 现在能输出一个 local logical serve plan。这个

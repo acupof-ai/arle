@@ -12,11 +12,16 @@ and the local step-driver smoke reports `cpp_batch_prefill` instead of
 `rust_scalar_prefill`. That fix removes one wrong fallback, but it does not
 close the broader serving gap.
 
-Current local evidence:
+Current local evidence after the 2026-04-28 single-request update:
 
-- Qwen3.5-0.8B GGUF Q4_K_M on M4 Pro reached 211.7 tok/s decode for
-  512 prompt / 1024 decode after Q5_K/Q8_0 affine repack and Q6/group16 qmv
-  tuning.
+- Qwen3.5-0.8B MLX SafeTensors 4bit on M4 Pro 20c reaches 305.5 tok/s mean
+  / 304.7 p50 for the serving-equivalent step-driver `1024/256` profile.
+  This closes the direct Apple-native single-request gap for the MLX-native
+  4bit path.
+- Qwen3.5-0.8B GGUF Q4_K_M on the matched direct `1024/256` profile reaches
+  202.1 tok/s mean / 202.6 p50. The older 211.7 tok/s number was a
+  different 512 prompt / 1024 decode GGUF-only profile; it is historical
+  evidence, not the current Metal headline.
 - Qwen3.6-35B-A3B short diagnostics load and run locally around 63-67 tok/s
   decode, but the short DFlash run is only a load/execute diagnostic.
 - Qwen3.6 MoE C++ prefill routing has a smoke result, not a completed
@@ -24,8 +29,10 @@ Current local evidence:
 
 External calibration snapshot:
 
-- oMLX reports Qwen3.5-0.8B on M4 Pro (16 GPU cores) at 305.8 tok/s TG for
-  1k context, 256.3 tok/s at 8k, and 211.9 tok/s at 16k.
+- oMLX reports Qwen3.5-0.8B 4bit on M4 Pro 20 GPU cores at 299.5 tok/s and
+  307.1 tok/s TG for 1k context in public runs.
+- oMLX reports Qwen3.5-0.8B 4bit on M4 Pro 16 GPU cores at 320.7 tok/s TG
+  for 1k context in a separate public run.
 - oMLX reports Qwen3.5-35B-A3B on M4 Pro (16 GPU cores) at 84.5 tok/s TG for
   1k context and 78.9 tok/s for 4k.
 - vLLM Metal v0.2.0 made a unified paged varlen Metal kernel the default
@@ -35,9 +42,9 @@ External calibration snapshot:
 
 ## Root Cause
 
-The gap is mostly a runtime-serving gap, not a single-model load bug:
+The remaining gap is now split into two problems:
 
-1. ARLE Metal has a live scheduler, but the efficient batched decode path is
+1. **Serving gap:** ARLE Metal has a live scheduler, but the efficient batched decode path is
    still narrow. Qwen3 and Qwen3.5 same-length decode batching exists, while
    variable-length decode batching has not entered the high-efficiency GPU
    path.
@@ -45,16 +52,20 @@ The gap is mostly a runtime-serving gap, not a single-model load bug:
    recurrent state. That overhead prevents the HTTP concurrency sweep from
    showing the throughput step that same-length batching should otherwise
    unlock.
-3. Qwen3.6 / MoE has only just been moved back onto the C++ prefill route.
+3. **GGUF format gap:** GGUF Q4_K_M does not use MLX's native 4bit affine
+   quantized matmul layout. ARLE's bridge kernels decode packed K-quant blocks
+   inside matmul/lm_head, including scale/min/high-bit layout work, so it is
+   materially slower and heavier than MLX SafeTensors 4bit on the same model.
+4. Qwen3.6 / MoE has only just been moved back onto the C++ prefill route.
    The next proof must be a long-context / canonical serving sweep, not a
    short routing smoke.
-4. DFlash is not yet integrated into the live scheduler runtime and must be
+5. DFlash is not yet integrated into the live scheduler runtime and must be
    judged only on long-context or ultra-long sequence workloads. Short
    32-token diagnostics are not optimization evidence.
-5. Metal KV cache remains model-native dtype (`bf16` / `f16` in practice).
+6. Metal KV cache remains model-native dtype (`bf16` / `f16` in practice).
    CUDA has quantized-KV paths; Metal does not. This is not the first
    bottleneck, but it limits long-context and multi-request headroom later.
-6. Observability is still too coarse for full serving work. Queue, latency,
+7. Observability is still too coarse for full serving work. Queue, latency,
    and MLX memory gauges exist; the next layer needs reliable prefix hit,
    active/peak KV use, batch shape, varlen fallback, and DFlash acceptance
    counters.
