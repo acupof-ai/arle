@@ -177,12 +177,20 @@ pub(crate) struct Args {
     #[command(subcommand)]
     pub(crate) command: Option<CliCommand>,
 
-    /// Maximum agent turns (generate-execute cycles) per query
-    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    /// Maximum agent turns (generate-execute cycles) per query.
+    /// 250 lets multi-step tool plans run to completion on long tasks
+    /// (project surveys, refactors, audits). The agent still stops as
+    /// soon as it produces a final answer, so a high cap costs nothing
+    /// on short turns. Override with `--max-turns N`.
+    #[arg(long, default_value_t = 250, value_parser = parse_positive_usize)]
     pub(crate) max_turns: usize,
 
-    /// Maximum tokens to generate per turn
-    #[arg(long, default_value_t = 4096, value_parser = parse_positive_usize)]
+    /// Maximum tokens to generate per turn. The default (65536) is a
+    /// "trust the model" ceiling — modern Qwen3 / Qwen3.5 deployments
+    /// stop at EOS or the model's own context cap well below this, so
+    /// in practice this just removes a 4096-token clamp that was
+    /// truncating long answers. Override with `--max-tokens N`.
+    #[arg(long, default_value_t = 65536, value_parser = parse_positive_usize)]
     pub(crate) max_tokens: usize,
 
     /// Sampling temperature (0.0 = greedy)
