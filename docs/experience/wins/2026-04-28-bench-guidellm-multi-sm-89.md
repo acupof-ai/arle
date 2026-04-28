@@ -55,7 +55,8 @@ _Pending._
 ## Δ vs baseline
 
 - **Baseline:** [`2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md`](2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md)
-  (211.7 tok/s decode @ 512 prompt / 1024 decode reference).
+  (CUDA L4 Qwen3.5-0.8B GGUF Q4_K_M: 183.3 out tok/s at c=1 and
+  222.2 out tok/s at c=2; c>=4 invalid due to allocator/OOM behavior).
 - **Pass criterion:** out_tok/s saturation and TTFT p50 within ±5 % of
   the baseline numbers. Multi-SM cubin dispatch should be neutral.
 

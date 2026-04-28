@@ -38,15 +38,16 @@ agent/train/self-evolution workflows.
 
 ## Current Baseline
 
-As of 2026-04-27, the repository already ships:
+As of 2026-04-28, the repository already ships:
 
 - CUDA as the primary serving path for Qwen3 and Qwen3.5-family models, with
   continuous batching, paged KV, radix-backed prefix reuse, FlashInfer-backed
   prefill/decode, and OpenAI-compatible HTTP surfaces.
 - Metal as the Apple Silicon serving path, including scheduler-backed serving,
-  live prefix reuse, Beta DFlash work, and a measured Qwen3.5-0.8B GGUF
-  Q4_K_M decode floor of 211.7 tok/s on M4 Pro after Q5_K/Q8_0 affine repack
-  and Q6/group16 qmv tile tuning.
+  live prefix reuse, Beta DFlash work, and a measured Qwen3.5-0.8B MLX 4bit
+  single-request step-driver result of 305.5 tok/s on M4 Pro 20c for
+  `1024/256`. The matched GGUF Q4_K_M direct path is 202.1 tok/s on the same
+  profile and remains a separate packed-K-quant kernel/format target.
 - A strong local tiered-KV path (`T0 GPU -> T1 host pinned -> T2 local disk`,
   with a minimal shared backend surface for cluster-shared experiments).
 - A runtime-led local agent/train/eval stack: `arle` as the unified front
