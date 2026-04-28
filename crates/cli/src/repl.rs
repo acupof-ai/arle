@@ -17,7 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::args::RunArgs;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
-    AgentSession, AgentSessionStats, AgentSettings, AgentTurnCallbacks, ToolExecutor, ToolPolicy,
+    AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, AgentTurnCallbacks,
+    ToolExecutor, ToolPolicy,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
@@ -724,13 +725,13 @@ fn run_agent_turn(
     let start = Instant::now();
     let color_on = io::stdout().is_terminal();
     let render_state = RefCell::new((false, false));
-    let mut tps_meter = crate::tps::TpsMeter::new();
+    let tps_meter = RefCell::new(crate::tps::TpsMeter::new());
     let mut on_text_chunk = |chunk: &str| {
         if chunk.is_empty() {
             return;
         }
         let mut state = render_state.borrow_mut();
-        tps_meter.hide_before_chunk();
+        tps_meter.borrow_mut().hide_before_chunk();
         if color_on && !state.0 {
             print!("\x1b[1;34m");
             let _ = io::stdout().flush();
@@ -738,8 +739,33 @@ fn run_agent_turn(
         }
         print!("{chunk}");
         let _ = io::stdout().flush();
-        tps_meter.record_chunk(chunk.len());
+        tps_meter.borrow_mut().record_chunk(chunk.len());
         state.1 = true;
+    };
+    let mut on_trace_event = |event: &AgentTraceEvent| {
+        let AgentTraceEvent::ToolCall {
+            name,
+            arguments,
+            result,
+        } = event
+        else {
+            // AssistantNote text was already streamed via on_text_chunk —
+            // re-emitting it here would just duplicate.
+            return;
+        };
+        let mut state = render_state.borrow_mut();
+        tps_meter.borrow_mut().hide_before_chunk();
+        if color_on && state.0 {
+            print!("\x1b[0m");
+            state.0 = false;
+        }
+        if state.1 {
+            println!();
+            state.1 = false;
+        }
+        let line = format_tool_call_line(name, arguments, result);
+        println!("{line}");
+        let _ = io::stdout().flush();
     };
     match session.run_turn_interruptibly_with_callbacks(
         engine,
@@ -755,7 +781,7 @@ fn run_agent_turn(
         cancel.as_ref(),
         AgentTurnCallbacks {
             on_text_chunk: Some(&mut on_text_chunk),
-            on_trace_event: None,
+            on_trace_event: Some(&mut on_trace_event),
         },
     ) {
         Ok(Some(result)) => {
@@ -774,7 +800,9 @@ fn run_agent_turn(
                 println!("\x1b[2m(agent stopped after reaching max turns)\x1b[0m");
             }
             let elapsed = start.elapsed();
-            tps_meter.print_final(Some(result.completion_tokens));
+            tps_meter
+                .borrow_mut()
+                .print_final(Some(result.completion_tokens));
             session_stats.record_turn(
                 result.prompt_tokens,
                 result.completion_tokens,
@@ -955,6 +983,95 @@ fn execute_repl_command(
             true
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Inline tool-call rendering — one dim line per call:
+//   `  ⏵ name(args) → result`
+// Args/result are aggressively truncated so the line stays scannable.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+const TOOL_ARGS_MAX: usize = 60;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+const TOOL_RESULT_MAX: usize = 80;
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn format_tool_call_line(name: &str, arguments: &serde_json::Value, result: &str) -> String {
+    let args = brief_tool_args(arguments);
+    let result = brief_tool_result(result);
+    format!("\x1b[2m  ⏵ {name}({args}) → {result}\x1b[0m")
+}
+
+/// Pull a one-line argument summary out of a tool call's JSON arguments.
+/// Prefers a single dominant scalar field (`command`, `code`, `path`, …)
+/// when one is present; falls back to compact JSON otherwise.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn brief_tool_args(arguments: &serde_json::Value) -> String {
+    const PREFERRED: &[&str] = &[
+        "command", "code", "path", "file", "query", "pattern", "url", "input",
+    ];
+    let raw = match arguments {
+        serde_json::Value::Object(map) => PREFERRED
+            .iter()
+            .find_map(|key| map.get(*key).and_then(scalar_to_string))
+            .or_else(|| {
+                if map.len() == 1 {
+                    map.values().next().and_then(scalar_to_string)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| serde_json::to_string(arguments).unwrap_or_default()),
+        serde_json::Value::Null => String::new(),
+        other => scalar_to_string(other).unwrap_or_else(|| other.to_string()),
+    };
+    truncate_one_line(&raw, TOOL_ARGS_MAX)
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn brief_tool_result(result: &str) -> String {
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    truncate_one_line(trimmed, TOOL_RESULT_MAX)
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Collapse newlines/tabs to spaces, squeeze runs of whitespace, and cap at
+/// `max` chars (counting Unicode scalars, not bytes — emoji-safe).
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn truncate_one_line(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max + 1));
+    let mut prev_space = false;
+    for ch in s.chars() {
+        let c = if ch.is_whitespace() { ' ' } else { ch };
+        if c == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        out.push(c);
+    }
+    let trimmed = out.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1243,9 +1360,10 @@ fn print_session_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplCommand, SessionStats, count_export_turns, detect_family, format_iso8601_utc,
-        handle_export_command, handle_models_command, parse_repl_command, render_history_markdown,
-        resolve_export_path,
+        ReplCommand, SessionStats, brief_tool_args, brief_tool_result, count_export_turns,
+        detect_family, format_iso8601_utc, format_tool_call_line, handle_export_command,
+        handle_models_command, parse_repl_command, render_history_markdown, resolve_export_path,
+        truncate_one_line,
     };
     use chat::ChatMessage;
     use std::time::Duration;
@@ -1491,5 +1609,69 @@ mod tests {
         assert_eq!(format_iso8601_utc(1_776_643_200), "2026-04-20T00:00:00Z");
         // Pre-2000 sanity: 1999-12-31 23:59:59 UTC = 946_684_799.
         assert_eq!(format_iso8601_utc(946_684_799), "1999-12-31T23:59:59Z");
+    }
+
+    // ── Inline tool-call rendering ──────────────────────────────────────
+
+    #[test]
+    fn brief_tool_args_prefers_known_scalar_field() {
+        let args = serde_json::json!({ "command": "git status", "cwd": "/repo" });
+        assert_eq!(brief_tool_args(&args), "git status");
+    }
+
+    #[test]
+    fn brief_tool_args_falls_back_to_compact_json_for_unknown_shape() {
+        let args = serde_json::json!({ "alpha": 1, "beta": 2 });
+        let out = brief_tool_args(&args);
+        // Unknown shape with multiple non-preferred fields → compact JSON.
+        assert!(out.contains("\"alpha\""));
+        assert!(out.contains("\"beta\""));
+    }
+
+    #[test]
+    fn brief_tool_args_truncates_long_command() {
+        let long = "echo ".to_string() + &"x".repeat(200);
+        let args = serde_json::json!({ "command": long });
+        let out = brief_tool_args(&args);
+        assert!(out.ends_with('…'), "expected ellipsis suffix, got: {out}");
+        assert!(out.chars().count() <= 60);
+    }
+
+    #[test]
+    fn brief_tool_result_collapses_multiline_output() {
+        let raw = "On branch main\n\nmodified: foo.rs\nmodified: bar.rs\n";
+        let out = brief_tool_result(raw);
+        assert!(!out.contains('\n'));
+        assert!(out.starts_with("On branch main"));
+    }
+
+    #[test]
+    fn brief_tool_result_handles_empty() {
+        assert_eq!(brief_tool_result("   \n\t "), "(empty)");
+    }
+
+    #[test]
+    fn truncate_one_line_squeezes_repeated_whitespace() {
+        assert_eq!(truncate_one_line("a   b\t\n c", 32), "a b c");
+    }
+
+    #[test]
+    fn truncate_one_line_caps_at_unicode_chars_not_bytes() {
+        // 4 emoji = 4 chars, 16 bytes — must cap by char count.
+        let out = truncate_one_line("🚀🚀🚀🚀🚀🚀", 4);
+        assert_eq!(out.chars().count(), 4);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn format_tool_call_line_has_dim_style_and_indent() {
+        let args = serde_json::json!({ "command": "ls" });
+        let line = format_tool_call_line("shell", &args, "Cargo.toml\nsrc\n");
+        // Dim ANSI prefix, two-space indent, arrow markers.
+        assert!(line.starts_with("\x1b[2m  ⏵ shell(ls) → "));
+        assert!(line.ends_with("\x1b[0m"));
+        assert!(line.contains("Cargo.toml"));
+        // Result was multi-line — must be flattened.
+        assert!(!line.contains("Cargo.toml\nsrc"));
     }
 }
