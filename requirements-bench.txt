@@ -3,4 +3,7 @@ httpx==0.28.1
 pytest>=8.0
 pytest-asyncio>=0.24
 tokenizers>=0.20
-guidellm[recommended]>=0.3
+# Pin guidellm to 0.6.0 — the wrapper at scripts/bench_guidellm.sh assumes
+# the 0.6.0 CLI/output schema and exports GUIDELLM__MP_CONTEXT_TYPE=forkserver
+# for a 0.6.0/macOS regression. Bumping requires re-validating the bench wrapper.
+guidellm[recommended]==0.6.0

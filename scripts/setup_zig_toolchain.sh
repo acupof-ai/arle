@@ -23,7 +23,10 @@ EXPECTED_VERSION="${KV_ZIG_VERSION:-0.16.0}"
 
 info() {
   if [[ "${PRINT_ZIG}" -eq 0 ]]; then
-    echo "[setup_zig_toolchain] $*"
+    # Route to stderr so that command-substitution callers
+    # (e.g. `zig_bin="$(install_local)"`) don't capture log lines
+    # alongside the binary path.
+    echo "[setup_zig_toolchain] $*" >&2
   fi
 }
 
@@ -87,6 +90,14 @@ pick_zig() {
   fi
   if command -v zig >/dev/null 2>&1; then
     command -v zig
+    return 0
+  fi
+  # Repo-local install from a previous setup run.
+  local triple_check
+  triple_check="$(platform_triple)"
+  local local_zig="${INSTALL_ROOT}/zig-${triple_check}-${EXPECTED_VERSION}/zig"
+  if [[ -x "${local_zig}" ]]; then
+    echo "${local_zig}"
     return 0
   fi
   return 1
