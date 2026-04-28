@@ -992,12 +992,18 @@ fn execute_repl_command(
 // ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+const TOOL_NAME_MAX: usize = 32;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const TOOL_ARGS_MAX: usize = 60;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const TOOL_RESULT_MAX: usize = 80;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn format_tool_call_line(name: &str, arguments: &serde_json::Value, result: &str) -> String {
+    // Cap + flatten the name too — malformed model output can ship a `name`
+    // with embedded newlines or pathological length that would break the
+    // single-line invariant just as easily as a bad args/result.
+    let name = truncate_one_line(name, TOOL_NAME_MAX);
     let args = brief_tool_args(arguments);
     let result = brief_tool_result(result);
     format!("\x1b[2m  ⏵ {name}({args}) → {result}\x1b[0m")
@@ -1673,5 +1679,23 @@ mod tests {
         assert!(line.contains("Cargo.toml"));
         // Result was multi-line — must be flattened.
         assert!(!line.contains("Cargo.toml\nsrc"));
+    }
+
+    #[test]
+    fn format_tool_call_line_sanitizes_pathological_name() {
+        // Malformed model output: name with a newline + pathological length.
+        let bad_name = "evil\nname".to_string() + &"x".repeat(200);
+        let args = serde_json::json!({ "command": "ls" });
+        let line = format_tool_call_line(&bad_name, &args, "ok");
+        // Body (after the dim prefix) must remain a single line.
+        let body = line
+            .trim_start_matches("\x1b[2m")
+            .trim_end_matches("\x1b[0m");
+        assert!(
+            !body.contains('\n'),
+            "name newline must be flattened: {body:?}"
+        );
+        // The whole line stays bounded by the constants.
+        assert!(body.chars().count() < 32 + 60 + 80 + 16);
     }
 }
