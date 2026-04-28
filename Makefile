@@ -65,7 +65,8 @@ pre-push:
 	./scripts/pre_push_checks.sh
 
 install-hooks:
-	./scripts/install_git_hooks.sh
+	git config core.hooksPath .githooks
+	@echo "[install-hooks] configured core.hooksPath=.githooks"
 
 # ── Web frontend (web/ — Astro 5 + Vite + bun) ───────────────────────────────
 # Drives the public landing at https://cklxx.github.io/arle/. Requires bun on

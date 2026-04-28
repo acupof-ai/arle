@@ -21,3 +21,9 @@ bench-output/
 web/node_modules/
 web/dist/
 web/.astro/
+
+# repo-local toolchains (zig managed by setup.sh / scripts/setup_zig_toolchain.sh)
+/.toolchains/
+
+# codex CLI per-session artifact (codex review --uncommitted writes a 0-byte .codex)
+/.codex

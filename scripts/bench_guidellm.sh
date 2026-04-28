@@ -587,8 +587,8 @@ start_service_stats_trace "$SERVICE_STATS_TRACE" "$TRACE_INTERVAL_MS"
 
 # guidellm 0.6.0 hangs at "Setup complete, starting benchmarks..." on macOS
 # under the default `fork` mp context (Python 3.11+ deprecates fork on darwin
-# and the worker_group spawn deadlocks). `forkserver` boots cleanly. See
-# scripts/setup_bench_toolchain.sh for the toolchain pin.
+# and the worker_group spawn deadlocks). `forkserver` boots cleanly. The
+# guidellm pin lives in requirements-bench.txt, installed by setup.sh.
 export GUIDELLM__MP_CONTEXT_TYPE="${GUIDELLM__MP_CONTEXT_TYPE:-forkserver}"
 
 GUIDELLM_ARGS=(

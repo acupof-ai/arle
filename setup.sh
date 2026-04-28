@@ -22,12 +22,23 @@
 #   KV_ZIG_VERSION      — Zig version override for kv-native-sys (default: 0.16.0)
 #   KV_ZIG_INSTALL_ROOT — Repo-local Zig install root (default: .toolchains/zig)
 #
-# This script is CUDA/Linux oriented. It now bootstraps the Zig toolchain used
-# by `crates/kv-native-sys`; use the Makefile targets for Metal/macOS serving.
-# All Python deps are installed into .venv/ — never pollutes system packages.
+# Cross-platform: Linux/CUDA + macOS/Metal. Auto-detects host and routes
+# CUDA-only steps (nvcc validation, nsjail build, CUDA cargo features) to
+# the Linux path; on macOS those are skipped and `cargo build` uses
+# `metal,no-cuda`. Bootstraps the Zig toolchain used by `crates/kv-native-sys`
+# on both platforms. All Python deps install into .venv/.
 # Activate manually:  source .venv/bin/activate
 # ============================================================================
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+case "$(uname -s)" in
+    Linux)  PLATFORM="linux" ;;
+    Darwin) PLATFORM="macos" ;;
+    *)      PLATFORM="unsupported" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Colors & helpers
@@ -58,7 +69,10 @@ ensure_zig() {
     fi
 
     local zig_bin
-    zig_bin="$("$SCRIPT_DIR/scripts/setup_zig_toolchain.sh" "${zig_args[@]}")"
+    if ! zig_bin="$("$SCRIPT_DIR/scripts/setup_zig_toolchain.sh" "${zig_args[@]}")" || [ -z "$zig_bin" ]; then
+        fail "zig toolchain not ready"
+        return 1
+    fi
     export ZIG="$zig_bin"
     ok "zig: $ZIG"
     info "  zig $("${ZIG}" version)"
@@ -69,6 +83,11 @@ ensure_zig() {
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+if [ "$PLATFORM" = "unsupported" ]; then
+    echo "[fail] unsupported host: $(uname -s) $(uname -m). Linux/x86_64 + Darwin/arm64 only." >&2
+    exit 1
+fi
 
 VENV_DIR="$SCRIPT_DIR/.venv"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-8B}"
@@ -137,19 +156,26 @@ do_check() {
         errors=$((errors + 1))
     fi
 
-    # CUDA
-    if [ -x "$CUDA_HOME/bin/nvcc" ]; then
-        ok "nvcc: $CUDA_HOME/bin/nvcc"
-        info "  $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
-    else
-        fail "nvcc not found at $CUDA_HOME/bin/nvcc"
-        errors=$((errors + 1))
-    fi
+    if [ "$PLATFORM" = "linux" ]; then
+        if [ -x "$CUDA_HOME/bin/nvcc" ]; then
+            ok "nvcc: $CUDA_HOME/bin/nvcc"
+            info "  $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
+        else
+            fail "nvcc not found at $CUDA_HOME/bin/nvcc"
+            errors=$((errors + 1))
+        fi
 
-    # GPU
-    if check_cmd nvidia-smi; then
-        info "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-    else errors=$((errors + 1)); fi
+        if check_cmd nvidia-smi; then
+            info "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+        else errors=$((errors + 1)); fi
+    else
+        if xcrun --find metal &>/dev/null; then
+            ok "metal toolchain: $(xcrun --find metal)"
+        else
+            fail "xcrun metal not found — install Xcode CLT: xcode-select --install"
+            errors=$((errors + 1))
+        fi
+    fi
 
     # Venv
     if [ -f "$VENV_DIR/bin/activate" ]; then
@@ -165,12 +191,21 @@ do_check() {
         info "  python $(python --version 2>/dev/null | awk '{print $2}')"
     else errors=$((errors + 1)); fi
 
-    # Pinned packages
+    # Pinned packages — flashinfer + triton are CUDA-only and intentionally
+    # skipped on macOS (see do_deps).
     local pkg_errors=0
+    local skip_re=
+    if [ "$PLATFORM" = "macos" ]; then
+        skip_re='^(flashinfer|triton)'
+    fi
     while IFS= read -r line; do
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
         local pkg ver
         pkg="${line%%==*}"; ver="${line##*==}"
+        if [ -n "$skip_re" ] && [[ "$pkg" =~ $skip_re ]]; then
+            info "  $pkg (CUDA-only; skipped on macOS)"
+            continue
+        fi
         local actual
         actual=$(pip show "$pkg" 2>/dev/null | grep "^Version:" | awk '{print $2}')
         actual="${actual:-MISSING}"
@@ -183,11 +218,12 @@ do_check() {
     done < <(grep -E '^[a-zA-Z].*==' requirements-build.txt)
     errors=$((errors + pkg_errors))
 
-    # nsjail
-    if check_cmd nsjail; then
-        info "  sandbox isolation active"
-    else
-        warn "nsjail not found — tool execution will run without sandbox"
+    if [ "$PLATFORM" = "linux" ]; then
+        if check_cmd nsjail; then
+            info "  sandbox isolation active"
+        else
+            warn "nsjail not found — tool execution will run without sandbox"
+        fi
     fi
 
     # bun + web/ frontend
@@ -215,10 +251,13 @@ do_check() {
         fail "ARLE binary not found — run ./setup.sh --build-only"
         errors=$((errors + 1))
     fi
-    if [ -x target/release/infer ]; then
-        ok "target/release/infer built"
+    local expected_server
+    if [ "$PLATFORM" = "linux" ]; then expected_server="target/release/infer"
+    else expected_server="target/release/metal_serve"; fi
+    if [ -x "$expected_server" ]; then
+        ok "$expected_server built"
     else
-        fail "infer server binary not found — run ./setup.sh --build-only"
+        fail "server binary not found at $expected_server — run ./setup.sh --build-only"
         errors=$((errors + 1))
     fi
 
@@ -260,33 +299,47 @@ do_deps() {
     step "Zig toolchain"
     ensure_zig
 
-    # --- CUDA ---
-    step "CUDA toolkit"
-    if [ -x "$CUDA_HOME/bin/nvcc" ]; then
-        ok "nvcc: $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
+    # --- CUDA / Metal ---
+    if [ "$PLATFORM" = "linux" ]; then
+        step "CUDA toolkit"
+        if [ -x "$CUDA_HOME/bin/nvcc" ]; then
+            ok "nvcc: $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
+        else
+            fail "CUDA toolkit not found at $CUDA_HOME"
+            info "Install CUDA toolkit or set CUDA_HOME=/path/to/cuda"
+            exit 1
+        fi
+
+        step "nsjail (sandbox)"
+        if command -v nsjail &>/dev/null; then
+            ok "nsjail already installed"
+        else
+            info "Building nsjail from source..."
+            apt-get install -y -qq autoconf bison flex gcc g++ git \
+                libprotobuf-dev libnl-route-3-dev libtool make pkg-config protobuf-compiler \
+                >/dev/null 2>&1
+            local nsjail_tmp
+            nsjail_tmp="$(mktemp -d)"
+            git clone --depth 1 https://github.com/google/nsjail.git "$nsjail_tmp/nsjail" 2>/dev/null
+            make -C "$nsjail_tmp/nsjail" -j"$(nproc)" >/dev/null 2>&1
+            cp "$nsjail_tmp/nsjail/nsjail" /usr/local/bin/
+            rm -rf "$nsjail_tmp"
+            ok "nsjail built and installed"
+        fi
     else
-        fail "CUDA toolkit not found at $CUDA_HOME"
-        info "Install CUDA toolkit or set CUDA_HOME=/path/to/cuda"
-        exit 1
+        step "Apple Silicon / Metal backend"
+        if xcrun --find metal &>/dev/null; then
+            ok "Metal toolchain (xcrun): $(xcrun --find metal)"
+        else
+            warn "xcrun metal not found — install Xcode Command Line Tools: xcode-select --install"
+        fi
+        info "skipping nsjail (Linux-only); Mac will run tools without sandbox"
     fi
 
-    # --- nsjail ---
-    step "nsjail (sandbox)"
-    if command -v nsjail &>/dev/null; then
-        ok "nsjail already installed"
-    else
-        info "Building nsjail from source..."
-        apt-get install -y -qq autoconf bison flex gcc g++ git \
-            libprotobuf-dev libnl-route-3-dev libtool make pkg-config protobuf-compiler \
-            >/dev/null 2>&1
-        local nsjail_tmp
-        nsjail_tmp="$(mktemp -d)"
-        git clone --depth 1 https://github.com/google/nsjail.git "$nsjail_tmp/nsjail" 2>/dev/null
-        make -C "$nsjail_tmp/nsjail" -j"$(nproc)" >/dev/null 2>&1
-        cp "$nsjail_tmp/nsjail/nsjail" /usr/local/bin/
-        rm -rf "$nsjail_tmp"
-        ok "nsjail built and installed"
-    fi
+    # --- git hooks (inlined from former scripts/install_git_hooks.sh) ---
+    step "Git hooks"
+    git config core.hooksPath .githooks
+    ok "core.hooksPath=.githooks"
 
     # --- Python venv ---
     step "Python virtual environment"
@@ -313,24 +366,44 @@ do_deps() {
     python -m pip install --upgrade pip -q
 
     # --- Pinned build deps ---
+    # `flashinfer-python` and `triton` are CUDA-only (nvcc-bound), so on macOS
+    # we install only the platform-neutral entries (currently just
+    # `huggingface_hub`, used by `do_model`). Linux installs the full set,
+    # with flashinfer pulled --no-deps because we only consume its headers.
     step "Python build dependencies (from requirements-build.txt)"
-    info "FlashInfer is installed --no-deps (we only need C++ headers)"
+    if [ "$PLATFORM" = "linux" ]; then
+        info "FlashInfer is installed --no-deps (we only need C++ headers)"
+        local fi_line
+        fi_line=$(grep -E '^flashinfer' requirements-build.txt | head -1)
+        pip install "$fi_line" --no-deps -q
+        ok "$fi_line (headers only)"
 
-    # Install flashinfer separately with --no-deps
-    local fi_line
-    fi_line=$(grep -E '^flashinfer' requirements-build.txt | head -1)
-    pip install "$fi_line" --no-deps -q
-    ok "$fi_line (headers only)"
-
-    # Install remaining build deps normally (skip comments, blanks, flashinfer)
-    grep -E '^[a-zA-Z]' requirements-build.txt | grep -v 'flashinfer' | \
-        pip install -r /dev/stdin -q
-    ok "Build deps installed"
+        grep -E '^[a-zA-Z]' requirements-build.txt | grep -v 'flashinfer' | \
+            pip install -r /dev/stdin -q
+        ok "Build deps installed"
+    else
+        # macOS: install only entries unrelated to CUDA/Triton.
+        local cuda_only_re='^(flashinfer|triton)'
+        grep -E '^[a-zA-Z]' requirements-build.txt | grep -Ev "$cuda_only_re" | \
+            pip install -r /dev/stdin -q
+        ok "Platform-neutral build deps installed (flashinfer/triton skipped)"
+    fi
 
     # --- Bench/test deps ---
     step "Bench & test dependencies (from requirements-bench.txt)"
     pip install -r requirements-bench.txt -q
     ok "Bench deps installed"
+
+    # --- TileLang (Linux/CUDA only — AOT codegen for tilelang-attn cubins) ---
+    if [ "$PLATFORM" = "linux" ]; then
+        step "TileLang (AOT codegen for --features tilelang-attn)"
+        if python -c "import tilelang" 2>/dev/null; then
+            ok "tilelang already installed: $(python -c 'import tilelang; print(tilelang.__version__)')"
+        else
+            pip install tilelang -q
+            ok "tilelang installed: $(python -c 'import tilelang; print(tilelang.__version__)')"
+        fi
+    fi
 
     # --- Project install ---
     if [ -f pyproject.toml ]; then
@@ -374,7 +447,11 @@ do_deps() {
 # BUILD — compile Rust + CUDA kernels
 # ============================================================================
 do_build() {
-    step "Building ARLE CLI + infer server (release, CUDA)"
+    if [ "$PLATFORM" = "linux" ]; then
+        step "Building ARLE CLI + infer server (release, CUDA)"
+    else
+        step "Building ARLE CLI + infer server (release, Metal)"
+    fi
     activate_venv
 
     # Ensure cargo is on PATH
@@ -382,45 +459,67 @@ do_build() {
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
     ensure_zig
-    export CUDA_HOME
-    export PATH="$CUDA_HOME/bin:$PATH"
-    export LIBRARY_PATH="$CUDA_HOME/lib64/stubs:${LIBRARY_PATH:-}"
-    # Triton AOT needs Python from venv
-    export INFER_TRITON_PYTHON="$(which python)"
 
-    info "CUDA_HOME=$CUDA_HOME"
-    info "TRITON_PYTHON=$INFER_TRITON_PYTHON"
-    if [ -n "${TORCH_CUDA_ARCH_LIST:-}" ]; then
-        info "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST (override)"
-    elif [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
-        info "CMAKE_CUDA_ARCHITECTURES=$CMAKE_CUDA_ARCHITECTURES (override)"
-    else
-        local detected
-        detected=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr '\n' ' ')
-        if [ -n "$detected" ]; then
-            info "SM targets (auto-detect from nvidia-smi): $detected"
+    local arle_features infer_features
+    if [ "$PLATFORM" = "linux" ]; then
+        export CUDA_HOME
+        export PATH="$CUDA_HOME/bin:$PATH"
+        export LIBRARY_PATH="$CUDA_HOME/lib64/stubs:${LIBRARY_PATH:-}"
+        # Triton AOT needs Python from venv
+        export INFER_TRITON_PYTHON="$(which python)"
+
+        info "CUDA_HOME=$CUDA_HOME"
+        info "TRITON_PYTHON=$INFER_TRITON_PYTHON"
+        if [ -n "${TORCH_CUDA_ARCH_LIST:-}" ]; then
+            info "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST (override)"
+        elif [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
+            info "CMAKE_CUDA_ARCHITECTURES=$CMAKE_CUDA_ARCHITECTURES (override)"
         else
-            info "SM targets: T1 default {sm_80, sm_86, sm_89, sm_90}"
-            info "  set TORCH_CUDA_ARCH_LIST to override; see docs/plans/sm-coverage.md"
+            local detected
+            detected=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr '\n' ' ')
+            if [ -n "$detected" ]; then
+                info "SM targets (auto-detect from nvidia-smi): $detected"
+            else
+                info "SM targets: T1 default {sm_80, sm_86, sm_89, sm_90}"
+                info "  set TORCH_CUDA_ARCH_LIST to override; see docs/plans/sm-coverage.md"
+            fi
         fi
+        arle_features="cuda,cli"
+        infer_features="cuda"
+    else
+        info "Apple Silicon: building with metal,no-cuda"
+        arle_features="metal,no-cuda"
+        infer_features="metal,no-cuda"
     fi
 
     local start
     start=$(date +%s)
 
-    cargo build --release --features cuda,cli -p agent-infer --bin arle 2>&1 | while IFS= read -r line; do
+    cargo build --release --no-default-features --features "$arle_features" -p agent-infer --bin arle 2>&1 | while IFS= read -r line; do
         case "$line" in
             *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
                 echo "  $line" ;;
         esac
     done
 
-    cargo build --release --features cuda -p infer 2>&1 | while IFS= read -r line; do
-        case "$line" in
-            *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
-                echo "  $line" ;;
-        esac
-    done
+    local server_bin
+    if [ "$PLATFORM" = "linux" ]; then
+        cargo build --release --no-default-features --features "$infer_features" -p infer --bin infer 2>&1 | while IFS= read -r line; do
+            case "$line" in
+                *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
+                    echo "  $line" ;;
+            esac
+        done
+        server_bin="target/release/infer"
+    else
+        cargo build --release --no-default-features --features "$infer_features" -p infer --bin metal_serve 2>&1 | while IFS= read -r line; do
+            case "$line" in
+                *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
+                    echo "  $line" ;;
+            esac
+        done
+        server_bin="target/release/metal_serve"
+    fi
 
     local elapsed=$(( $(date +%s) - start ))
     ok "Build complete in ${elapsed}s"
@@ -428,8 +527,8 @@ do_build() {
     if [ -x target/release/arle ]; then
         info "Binary: target/release/arle ($(du -h target/release/arle | awk '{print $1}'))"
     fi
-    if [ -x target/release/infer ]; then
-        info "Binary: target/release/infer ($(du -h target/release/infer | awk '{print $1}'))"
+    if [ -x "$server_bin" ]; then
+        info "Binary: $server_bin ($(du -h "$server_bin" | awk '{print $1}'))"
     fi
 }
 
@@ -529,14 +628,21 @@ do_full() {
     echo "  # 1. Activate the virtual environment"
     echo "  source .venv/bin/activate"
     echo ""
-    echo "  # 2. Set runtime library paths"
-    echo "  export LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
-    echo ""
-    echo "  # 3. Run agent REPL"
+    if [ "$PLATFORM" = "linux" ]; then
+        echo "  # 2. Set runtime library paths (Linux/CUDA)"
+        echo "  export LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
+        echo ""
+    fi
+    echo "  # Run agent REPL"
     echo "  ./target/release/arle --model-path $MODEL_DIR"
     echo ""
-    echo "  # 4. Run HTTP server"
-    echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
+    if [ "$PLATFORM" = "linux" ]; then
+        echo "  # Run HTTP server (CUDA)"
+        echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
+    else
+        echo "  # Run HTTP server (Metal)"
+        echo "  ./target/release/metal_serve --model-path $MODEL_DIR --port 8000"
+    fi
     echo ""
     echo "  # 5. Run benchmarks"
     echo "  ./scripts/bench_guidellm.sh cuda-local --target http://localhost:8000"
