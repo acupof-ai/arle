@@ -15,10 +15,11 @@ checkout):
 9896d25 fix(cuda): make tilelang-attn actually reach the prefill path
 ```
 
-Whatever follows on `main` after these is also fine. The only
-hard requirement is that `git log -1 -- crates/cuda-kernels/build.rs |
-grep -q tilelang_target` returns 0 (i.e., the TileLang AOT track is in
-the tree).
+Whatever follows on `main` after these is also fine. The only hard
+requirement is that the TileLang AOT track is in the tree, which today
+means `grep -q generate_tilelang_artifacts_per_sm crates/cuda-kernels/build.rs`
+returns 0 (the multi-SM driver introduced in commit `9090181` superseded
+the single-SM `tilelang_target` helper that this gate originally tested).
 
 ---
 

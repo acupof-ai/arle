@@ -100,6 +100,19 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 - **AOT failure policy:** any (SM, kernel) combination that fails to emit
   cubin → `panic!`. No warn-skip. Error message must suggest a
   `TORCH_CUDA_ARCH_LIST=...` value that excludes the failing SM.
+- **Multi-cubin AOT + runtime SM dispatch.** Both Triton AOT
+  (`build_triton_kernel`) and TileLang AOT (`build_tilelang_kernel`) loop
+  over `sm_targets` and emit one cubin per (kernel, SM) tuple, each with a
+  `_sm{sm}` suffix in `out_name` / `kernel_name` so generated symbols are
+  unique. A C dispatch wrapper (`format_dispatch_wrapper`) extern-declares
+  every per-SM symbol, caches `compute_capability_major*10 + minor` in a
+  `static __thread` slot via `cuCtxGetDevice` + `cuDeviceGetAttribute`,
+  and `switch`es to the matching cubin. Public FFI entry names (e.g.
+  `silu_mul_triton_aot_cuda`, `tilelang_*_run_cuda`) are unchanged from the
+  single-SM era — only the wrapper internals dispatch. **TLS, not
+  pthread_once + global static**: multi-GPU runtimes may bind different
+  threads to different devices, and a process-global cache would race
+  + silently dispatch the wrong cubin.
 - **Triton AOT** is driven by `find_triton_python()` — order: `INFER_TRITON_PYTHON`
   → `tools/triton/.venv/bin/python` → `./.venv/bin/python` → `python3` → `python`.
   Generated artifacts land under `OUT_DIR/triton/...`.
