@@ -74,29 +74,65 @@ impl RendezvousServer {
     }
 
     /// Block until N-1 clients connect, then broadcast `unique_id` and wait
-    /// for a barrier ack from each.
+    /// for a barrier ack from each. Uses [`SOCKET_TIMEOUT`] as the deadline
+    /// for both accept and the post-accept read/write phases.
     pub fn rendezvous(&mut self, unique_id: &[u8; UNIQUE_ID_BYTES]) -> Result<()> {
+        self.rendezvous_with_timeout(unique_id, SOCKET_TIMEOUT)
+    }
+
+    /// `rendezvous` with an explicit deadline. F1 (NCCL init) and tests use
+    /// this when the default 30s isn't appropriate.
+    pub fn rendezvous_with_timeout(
+        &mut self,
+        unique_id: &[u8; UNIQUE_ID_BYTES],
+        timeout: Duration,
+    ) -> Result<()> {
         let expected_peers = self.world_size - 1;
+        self.listener
+            .set_nonblocking(true)
+            .context("rendezvous server: set_nonblocking failed")?;
+        let deadline = Instant::now() + timeout;
         for peer_idx in 0..expected_peers {
-            let (stream, _addr) = self.listener.accept().with_context(|| {
-                format!("rendezvous server: accept rank {} failed", peer_idx + 1)
+            let (stream, _addr) = loop {
+                match self.listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            bail!(
+                                "rendezvous server: accept rank {} timed out after {:?} ({} of {} peers connected)",
+                                peer_idx + 1,
+                                timeout,
+                                self.peers.len(),
+                                expected_peers
+                            );
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("rendezvous server: accept rank {} failed", peer_idx + 1)
+                        });
+                    }
+                }
+            };
+            stream.set_nonblocking(false).with_context(|| {
+                format!(
+                    "rendezvous server: clear nonblocking for rank {}",
+                    peer_idx + 1
+                )
             })?;
-            stream
-                .set_read_timeout(Some(SOCKET_TIMEOUT))
-                .with_context(|| {
-                    format!(
-                        "rendezvous server: set_read_timeout for rank {}",
-                        peer_idx + 1
-                    )
-                })?;
-            stream
-                .set_write_timeout(Some(SOCKET_TIMEOUT))
-                .with_context(|| {
-                    format!(
-                        "rendezvous server: set_write_timeout for rank {}",
-                        peer_idx + 1
-                    )
-                })?;
+            stream.set_read_timeout(Some(timeout)).with_context(|| {
+                format!(
+                    "rendezvous server: set_read_timeout for rank {}",
+                    peer_idx + 1
+                )
+            })?;
+            stream.set_write_timeout(Some(timeout)).with_context(|| {
+                format!(
+                    "rendezvous server: set_write_timeout for rank {}",
+                    peer_idx + 1
+                )
+            })?;
             self.peers.push(stream);
         }
 
@@ -354,5 +390,28 @@ mod tests {
             .join()
             .expect("bad client panic")
             .expect("bad client ok");
+    }
+
+    #[test]
+    fn server_accept_times_out_when_peer_never_connects() {
+        let mut server = RendezvousServer::bind("127.0.0.1:0", 4).expect("bind ephemeral listener");
+        let unique_id = [0x01u8; UNIQUE_ID_BYTES];
+        let started = Instant::now();
+        let result = run_with_timeout(
+            "server_accept_deadline",
+            Duration::from_secs(2),
+            move || server.rendezvous_with_timeout(&unique_id, Duration::from_millis(200)),
+        );
+        let elapsed = started.elapsed();
+        let err = result.expect_err("rendezvous must fail when peers never connect");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out"),
+            "error should mention 'timed out', got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "deadline should fire well under 1s, took {elapsed:?}"
+        );
     }
 }
