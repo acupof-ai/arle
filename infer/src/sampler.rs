@@ -307,6 +307,109 @@ mod tests {
         assert!((logits[0] - 3.0).abs() < 1e-6);
     }
 
+    /// `apply_penalties` must not produce NaN/Inf even when every logit is
+    /// identical — a pathological input that downstream softmax must still
+    /// see as finite. Catches accidental introduction of `0/0` or `log(0)`.
+    #[test]
+    fn test_apply_penalties_all_equal_logits_stays_finite() {
+        let mut logits = vec![5.0_f32; 8];
+        let counts = vec![1u32; 8];
+        let params = SamplingParams {
+            repetition_penalty: 1.5,
+            frequency_penalty: 0.5,
+            presence_penalty: 0.25,
+            ..Default::default()
+        };
+        params.apply_penalties(&mut logits, &counts);
+
+        for (i, l) in logits.iter().enumerate() {
+            assert!(l.is_finite(), "logits[{i}] = {l} is not finite");
+        }
+
+        // All entries got the same treatment; deterministic argmax tie-break
+        // must remain stable (first-index wins for any greedy implementation).
+        let max = logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
+        let argmax = logits.iter().position(|&l| l == max).unwrap();
+        assert_eq!(argmax, 0, "first index must win the all-equal tie");
+    }
+
+    /// Single-vocab edge — vocab size 1 must not panic and must apply the
+    /// penalty to the only token. Defends against accidental `len() - 1`
+    /// underflow assumptions in any future refactor.
+    #[test]
+    fn test_apply_penalties_single_vocab_edge() {
+        let mut logits = vec![3.0_f32];
+        let counts = vec![2u32];
+        let params = SamplingParams {
+            repetition_penalty: 2.0,
+            frequency_penalty: 1.0,
+            ..Default::default()
+        };
+        params.apply_penalties(&mut logits, &counts);
+
+        // 3.0 / 2.0 = 1.5, then -= 1.0 * 2 = -0.5
+        assert!(logits[0].is_finite());
+        assert!((logits[0] - (-0.5)).abs() < 1e-6);
+    }
+
+    /// `counts.len() > logits.len()` is hostile: a caller could over-report
+    /// the count vector (e.g. tokenizer / vocab mismatch). The loop must
+    /// break cleanly at the logits boundary, not panic with OOB.
+    #[test]
+    fn test_apply_penalties_count_vector_longer_than_logits_clamps() {
+        let mut logits = vec![1.0_f32, 2.0];
+        // Counts vector includes ids past the end of `logits`.
+        let counts = vec![1u32, 1, 1, 1, 1];
+        let params = SamplingParams {
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+        // Must not panic.
+        params.apply_penalties(&mut logits, &counts);
+        assert!((logits[0] - 0.5).abs() < 1e-6);
+        assert!((logits[1] - 1.0).abs() < 1e-6);
+    }
+
+    /// Empty logits + empty counts is a degenerate but valid call (e.g. a
+    /// request with no candidate tokens left after upstream filtering).
+    /// Must early-return without panicking.
+    #[test]
+    fn test_apply_penalties_empty_inputs_does_not_panic() {
+        let mut logits: Vec<f32> = vec![];
+        let counts: Vec<u32> = vec![];
+        let params = SamplingParams {
+            repetition_penalty: 1.5,
+            frequency_penalty: 0.5,
+            presence_penalty: 0.5,
+            ..Default::default()
+        };
+        params.apply_penalties(&mut logits, &counts);
+        assert!(logits.is_empty());
+    }
+
+    /// `is_greedy()` must reject `top_p == 0.0` (the entire probability mass
+    /// is filtered out → ill-defined sampling). Documents the current
+    /// behavior: the sampler will NOT silently fall back to argmax — the
+    /// caller is responsible for normalizing top_p, and ill-formed values
+    /// are not greedy. Defends against an accidental `top_p >= 0.0` bug
+    /// in future refactors.
+    #[test]
+    fn test_is_greedy_rejects_top_p_zero() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 0.0,
+            ..Default::default()
+        };
+        assert!(
+            !params.is_greedy(),
+            "top_p=0.0 with temp=0.0 must not be classified as greedy; \
+             greedy requires top_p >= 1.0"
+        );
+    }
+
     #[test]
     fn test_sampling_params_from_request() {
         let p = sampling_params_from_request(
