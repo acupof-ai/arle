@@ -119,18 +119,34 @@ files compile to no-ops and the gate would pass silently. The GGUF
 smoke is also `#[ignore]`, so `-- --ignored` is required to actually
 run it.
 
+**Feature set must match §4.1.** Cargo features are per-invocation —
+running parity with `--features cuda` on a host that boots the server
+with `cuda,tilelang-attn` (sm_89, sm_90) compiles a *different* test
+binary that doesn't exercise the TileLang wrappers / cubins the bench
+will hit. Set `FEATURES` per host so parity covers the same code path
+as §4.1.
+
 ```bash
+# Pick the same feature set as the §4.1 server build for this host:
+#   sm_80 / sm_86 → FEATURES=cuda
+#   sm_89 / sm_90 → FEATURES=cuda,tilelang-attn   (TileLang validation hosts)
+FEATURES="cuda,tilelang-attn"
+
 # 3.1 Qwen3 e2e (silu_mul / add / embedding / FlashInfer prefill).
-cargo test --release -p infer --features cuda --test e2e
+cargo test --release -p infer --features "$FEATURES" --test e2e
 
 # 3.2 Qwen3.5 e2e (HD256 prefill + GDR chunkwise + TileLang decode HD256).
-cargo test --release -p infer --features cuda --test e2e_qwen35
+cargo test --release -p infer --features "$FEATURES" --test e2e_qwen35
 
-# 3.3 GGUF + Qwen3.5 smoke (Q4_K_M decode hot-path on Metal/CUDA dual paths).
-cargo test --release -p infer --features cuda --test smoke_qwen35_gguf -- --ignored
+# 3.3 GGUF + Qwen3.5 smoke. The test reads $INFER_Q35_PATH; without it
+#     it defaults to models/Qwen3.5-4B-GGUF-Q6_K (not provisioned on the
+#     L4/4090 row). Point it at the §4.1 model for this host.
+INFER_Q35_PATH=models/Qwen3.5-0.8B-GGUF \
+  cargo test --release -p infer --features "$FEATURES" \
+    --test smoke_qwen35_gguf -- --ignored
 
 # 3.4 Q4_K kernel correctness (CUDA-specific quantized embedding).
-cargo test --release -p infer --features cuda --test q4k_kernel_correctness
+cargo test --release -p infer --features "$FEATURES" --test q4k_kernel_correctness
 ```
 
 JSON baselines under `infer/test_data/`:
@@ -234,31 +250,51 @@ The wrapper writes `bench-output/<date>-cuda-multi-sm-${SM}/` with
 
 ### 4.3 Pass criteria (the gate)
 
-| Metric                              | sm_80 | sm_86 | sm_89                                                            | sm_90                                                                  |
-|-------------------------------------|-------|-------|------------------------------------------------------------------|------------------------------------------------------------------------|
-| Baseline                            | first run = baseline | first run = baseline | `2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md` (c=1: TTFT p50 247.4 ms / 183.3 out tok/s · c=2 saturation: 222.2 out tok/s) | TileLang Phase 0 H100 entry (see `tilelang-integration-verification.md` §5) |
-| TTFT p50 @ synchronous, max delta  | n/a   | n/a   | ±5 %                                                             | ±5 %                                                                   |
-| out tok/s @ saturation, max delta  | n/a   | n/a   | ±5 %                                                             | ±5 %                                                                   |
+The gate compares **multi-SM build vs single-SM build on the same
+host, same commit, same nvcc, same TileLang version, back-to-back**
+(matched A/B per `feedback_matched_ab_for_small_bench_effects.md`).
+We are validating that the new pthread_once + cuDeviceGetAttribute
+dispatch overhead is non-measurable, NOT that absolute throughput
+matches an older wins entry: scheduler/KV defaults have shifted since
+the 2026-04-27 L4 entry (auto FP8 KV `0af5769`, HBM-tier
+chunked_prefill `62f44a0`), so a cross-commit absolute compare would
+fold in unrelated changes.
+
+| Metric                              | sm_80 | sm_86 | sm_89                | sm_90                |
+|-------------------------------------|-------|-------|----------------------|----------------------|
+| Baseline                            | first run = baseline | first run = baseline | single-SM rebuild on this host (§4.3.x) | single-SM rebuild on this host (§4.3.x) |
+| TTFT p50 @ synchronous, max delta   | n/a   | n/a   | ±2 % vs single-SM    | ±2 % vs single-SM    |
+| out tok/s @ saturation, max delta   | n/a   | n/a   | ±2 % vs single-SM    | ±2 % vs single-SM    |
 
 For sm_80 and sm_86 the first run *is* the baseline; record the
 absolute numbers in the wins entry. For sm_89 and sm_90, delta against
-the cited baseline.
+the §4.3.x same-host single-SM rebuild.
 
-**Single-SM A/B sanity check** — recommended on sm_89 and sm_90 because
-the multi-SM dispatch overhead is a per-call `pthread_once` + switch,
-and we want to confirm it's non-measurable:
+**Cross-commit sanity floor (informational, not gating).** The
+2026-04-27 L4 entry (`2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md`,
+c=1: TTFT p50 247.4 ms / 183.3 out tok/s · c=2 saturation: 222.2 out
+tok/s) is a useful order-of-magnitude check for sm_89 — if the
+multi-SM run on HEAD is dramatically below that floor (e.g. 50 % out
+tok/s drop), something else regressed and the multi-SM A/B is
+ill-defined. Do not gate on this comparison; defaults have moved.
+
+### 4.3.x Single-SM rebuild for the matched A/B
 
 ```bash
-# 4.3.x On the same host as 4.2, rebuild single-SM and re-run.
-TORCH_CUDA_ARCH_LIST="${SM_DOTTED}" cargo build --release -p infer --features cuda,tilelang-attn
-# (kill + restart server with the rebuilt binary, then)
-scripts/bench_guidellm.sh cuda-single-sm-${SM} ...
+# On the same host as 4.2, rebuild single-SM with the same feature
+# set as §4.1 for this host (cuda or cuda,tilelang-attn).
+TORCH_CUDA_ARCH_LIST="${SM_DOTTED}" cargo build --release -p infer --features "$FEATURES"
+# Kill + restart the server with the rebuilt binary, then:
+scripts/bench_guidellm.sh cuda-single-sm-${SM} \
+  --target http://localhost:8000 \
+  --model "$MODEL" --processor "$PROCESSOR"
 ```
 
-The multi-SM and single-SM TTFT/throughput should match within
-measurement noise (~1-2 %). If multi-SM is consistently slower by >2 %
-across 3+ runs, file `docs/experience/errors/...` with the diff and
-fall back to single-SM build.
+Use the same `--model` / `--processor` arguments as §4.2 for this SM.
+The multi-SM and single-SM TTFT/throughput should match within ±2 %.
+If multi-SM is consistently slower by >2 % across 3+ runs, file
+`docs/experience/errors/...` with the diff and fall back to single-SM
+build for that platform.
 
 ---
 
