@@ -802,7 +802,7 @@ fn run_agent_turn(
             let elapsed = start.elapsed();
             tps_meter
                 .borrow_mut()
-                .print_final(Some(result.completion_tokens));
+                .print_final(result.prompt_tokens, Some(result.completion_tokens));
             session_stats.record_turn(
                 result.prompt_tokens,
                 result.completion_tokens,
