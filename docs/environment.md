@@ -157,6 +157,23 @@ export CUDA_HOME=/usr/local/cuda
 
 Windows-style alternative to `CUDA_HOME`.
 
+### `INFER_CUDA_DEVICE`
+
+CUDA device ordinal that the default `cuda_kernels::tensor::DeviceContext::new()`
+binds to. Single integer, default `0`. Parse failures are a hard error.
+
+Single-GPU runtime path (default): one `DeviceContext::new()` per process,
+honours this variable.
+
+Multi-GPU TP path (F1+, see
+[`docs/plans/2026-04-28-single-node-multi-gpu.md`](plans/2026-04-28-single-node-multi-gpu.md)):
+each rank thread bypasses this variable and calls
+`DeviceContext::on_device(ordinal)` directly with its assigned ordinal.
+
+```bash
+export INFER_CUDA_DEVICE=1   # bind default context to GPU 1
+```
+
 ### `INFER_TRITON_PYTHON`
 
 Python interpreter with Triton installed for build-time AOT kernel generation.

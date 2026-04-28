@@ -22,6 +22,18 @@ pub struct DeviceContext {
     pub stream: Arc<CudaStream>,
     /// Separate stream for async H2D/D2H memory copies.
     pub copy_stream: Arc<CudaStream>,
+    /// CUDA device ordinal this context is bound to.
+    pub ordinal: u32,
+}
+
+/// Parse `INFER_CUDA_DEVICE` (default 0). Selects the device for `DeviceContext::new()`.
+pub fn parse_device_ordinal_from_env() -> Result<u32> {
+    match std::env::var("INFER_CUDA_DEVICE") {
+        Ok(s) => s.trim().parse::<u32>().map_err(|e| {
+            anyhow!("INFER_CUDA_DEVICE must be a non-negative integer, got {s:?}: {e}")
+        }),
+        Err(_) => Ok(0),
+    }
 }
 
 impl DeviceContext {
@@ -32,9 +44,16 @@ impl DeviceContext {
             .map_err(|e| anyhow!("Failed to query GPU memory: {}", e))
     }
 
+    /// Default constructor: honours `INFER_CUDA_DEVICE` (default 0).
+    /// F1+ multi-GPU rank threads bypass this and call `on_device(ordinal)`.
     pub fn new() -> Result<Self> {
-        let ctx =
-            CudaContext::new(0).map_err(|e| anyhow!("Failed to create CUDA context: {}", e))?;
+        let ordinal = parse_device_ordinal_from_env()?;
+        Self::on_device(ordinal)
+    }
+
+    pub fn on_device(ordinal: u32) -> Result<Self> {
+        let ctx = CudaContext::new(ordinal as usize)
+            .map_err(|e| anyhow!("Failed to create CUDA context on device {ordinal}: {e}"))?;
 
         // Disable multi-stream event tracking before creating streams.
         // We use a single compute stream, so no cross-stream synchronization is needed.
@@ -61,10 +80,15 @@ impl DeviceContext {
             ctx,
             stream,
             copy_stream,
+            ordinal,
         })
     }
 
-    /// Query the number of streaming multiprocessors on the GPU.
+    pub fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    /// Query the number of streaming multiprocessors on the GPU this context is bound to.
     pub fn sm_count(&self) -> usize {
         use cudarc::driver::sys::*;
         let mut count: i32 = 0;
@@ -72,7 +96,7 @@ impl DeviceContext {
             cuDeviceGetAttribute(
                 &mut count,
                 CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                0,
+                self.ctx.cu_device(),
             );
         }
         count.max(1) as usize
@@ -1328,6 +1352,41 @@ pub fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_device_ordinal_handles_unset_default_and_invalid() {
+        // SAFETY: tests in this module run in-process; avoid clobbering a real value
+        // by saving + restoring. Cargo serialises tests within a module by default
+        // unless --test-threads >1; we additionally restore on every branch.
+        let prev = std::env::var("INFER_CUDA_DEVICE").ok();
+
+        unsafe {
+            std::env::remove_var("INFER_CUDA_DEVICE");
+        }
+        assert_eq!(parse_device_ordinal_from_env().unwrap(), 0);
+
+        unsafe {
+            std::env::set_var("INFER_CUDA_DEVICE", "3");
+        }
+        assert_eq!(parse_device_ordinal_from_env().unwrap(), 3);
+
+        unsafe {
+            std::env::set_var("INFER_CUDA_DEVICE", "  7 ");
+        }
+        assert_eq!(parse_device_ordinal_from_env().unwrap(), 7);
+
+        unsafe {
+            std::env::set_var("INFER_CUDA_DEVICE", "not-a-number");
+        }
+        assert!(parse_device_ordinal_from_env().is_err());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("INFER_CUDA_DEVICE", v),
+                None => std::env::remove_var("INFER_CUDA_DEVICE"),
+            }
+        }
+    }
 
     #[test]
     fn uniform_quant_formats_require_group_aligned_k() {
