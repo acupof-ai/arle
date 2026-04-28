@@ -627,7 +627,7 @@ tilelang_prefill_hd256_decl!(
 //   - SUPPORTED_HEADS in tools/tilelang/batch_decode_paged_hd256.py
 //   - TILELANG_DECODE_HD256_HEAD_CONFIGS in cuda-kernels/build.rs
 //   - the macro invocation below + the dispatch arm in attention.rs
-#[cfg(feature = "tilelang-attn")]
+#[cfg(feature = "tilelang-decode-hd256")]
 macro_rules! tilelang_decode_hd256_decl {
     ($($name:ident),+ $(,)?) => {
         unsafe extern "C" {
@@ -658,7 +658,7 @@ macro_rules! tilelang_decode_hd256_decl {
     };
 }
 
-#[cfg(feature = "tilelang-attn")]
+#[cfg(feature = "tilelang-decode-hd256")]
 tilelang_decode_hd256_decl!(
     tilelang_batch_decode_paged_hd256_q8_kv2_run_cuda,
     tilelang_batch_decode_paged_hd256_q16_kv2_run_cuda,

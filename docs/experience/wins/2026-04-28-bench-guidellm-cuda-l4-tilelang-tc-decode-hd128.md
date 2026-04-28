@@ -1,0 +1,112 @@
+# cuda-l4 TileLang TC-decode HD128 alias — c=16: -31% (KEEP OFF; build a real decode kernel)
+
+> **Negative result.** This bench is documented as a win because it
+> closes a long-open `pending-remote` claim that the
+> prefill→decode HD128 alias was a free upgrade. Matched A/B on the
+> L4 here shows the alias is -30.6% on out-tok/s at c=16 / 4096-in,
+> roughly as the Tranche 4 stub feared.
+
+## Context
+
+Plan agent (subagent_type=Plan, 2026-04-28) recommended validating
+the already-wired `tilelang-attn` TC-decode HD128 alias as the
+highest-ROI next step after c=16 unblocked at 197 tok/s on FP8 KV.
+The reasoning was sound — Qwen3-4B's decode call site
+(`flashinfer_run_layer_hd128`) is the per-step hot kernel at
+saturation, and the AOT cubins (`q*_kv8`) are already built and
+linked under `tilelang-attn`.
+
+The Tranche 4 stub
+(`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md`)
+explicitly warned: *"the prefill HD128 cubin is tuned for
+many-Q-rows-per-request, but pure decode batches have 1 Q row per
+request. The kernel may waste shared memory on a Q-tile that is
+mostly empty."* That hypothesis was never validated on hardware
+because `--features cuda,tilelang-attn` had been broken since the
+HD256 decode tranche was added (TileLang 0.1.9 codegen failure on
+M=1, see
+[`errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md`](../errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md)).
+
+This commit unblocks the build by gating HD256 decode behind a new
+`tilelang-decode-hd256` feature, then runs the matched A/B that the
+Plan agent commissioned.
+
+## What Worked (the Validation, not the Kernel)
+
+`scripts/bench_guidellm.sh tilelang-tc-decode-{off,on} --fast`
+(profile=concurrent rate=16, data=4096-in/256-out, max-seconds=30,
+random-seed=20260416). Same HEAD, same box, server-restart A/B
+seconds apart.
+
+L4 / Qwen3-4B BF16 weights / FP8 paged KV (auto) / Driver 580.82.07
+/ CUDA 13.0 / guidellm 0.6.0. Both servers:
+`--num-slots 16 --max-seq-len 4608 --mem-fraction-static 0.94 --cuda-graph true`.
+
+| metric              | OFF (`--features cuda`) | ON (`--features cuda,tilelang-attn`) | Δ        |
+|---------------------|------------------------:|-------------------------------------:|---------:|
+| out tok/s           | **197.85**              | 137.37                               | **-30.6%** |
+| TTFT p50 (ms)       | 9797.1                  | 10604.7                              | +8.2%    |
+| TTFT p99 (ms)       | 11630                   | 10605                                | -8.8%    |
+| ITL p50 (ms)        | 77.55                   | 80.39                                | +3.7%    |
+| ITL p99 (ms)        | 77.55                   | 80.39                                | +3.7%    |
+| req/s               | 0.4                     | 0                                    | all in-flight at end of window |
+| peak_active         | 16                      | 16                                   |          |
+| peak_kv_util        | 72.1%                   | 69.3%                                |          |
+| samples             | 65                      | 75                                   | +15%     |
+| failed requests     | 0                       | 0                                    |          |
+
+The +15% samples but -31% out-tok/s is the diagnostic: the ON kernel
+launches **more often** but produces **fewer total tokens per second**
+because each launch is slower than the FlashInfer baseline. ITL p50 is
+only +3.7% worse on the median request, but the long tail dominates
+the 30s-window throughput count. The "0 req/s" on ON is a guidellm
+artifact — at 30s every request is still in-flight when the window
+closes, so completions count as zero, while incomplete request
+output-tokens still go into the throughput numerator.
+
+## Decision
+
+**Keep `tilelang-attn` OFF by default for Qwen3-4B.** The Plan
+agent's Phase-1 §5 rule was explicit: ≥5% worse → revert. We are
+-31% worse on aggregate throughput and +3.7% worse on per-token
+latency, with no advantage anywhere in the percentile distribution.
+
+The Tranche 4 alias is structurally wrong for pure-decode shapes.
+The right next step (also from the Plan agent) is to write a
+**dedicated `tilelang_batch_decode_paged_hd128_q*_kv8` kernel** with
+`BLOCK_M=1, no causal mask, grid (1, num_q_heads, batch)` — i.e. a
+GEMV-like inner loop that doesn't waste shared memory on a 16×128
+Q-tile mostly filled with padding. That kernel has to bypass
+TileLang 0.1.9's `M%kMPerWarp==0` invariant the same way the HD256
+decode kernel does (see the errors entry), so a single architectural
+fix unblocks both.
+
+`tilelang-attn` stays opt-in. The HD128 prefill path (the working
+part of Tranche 4) remains usable behind that feature flag for
+prefill-bound workloads — but is not promoted to default on the 4B
+path until a real decode kernel ships.
+
+## Cross-references
+
+- Code: this commit (gate + errors entry + wins entry, ~7 files).
+- Errors: [`2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md`](../errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md)
+- Plan agent's brief and decision rule: see prior turn's transcript
+  (subagent_type=Plan, 2026-04-28).
+- Prior `pending-remote` claim:
+  [`2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md`](2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md)
+- FP8 KV default that this run was layered on:
+  [`2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md`](2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md)
+- Raw artefacts:
+  `bench-output/2026-04-28-tilelang-tc-decode-{off,on}/`
+
+## Rule
+
+**Run the matched A/B before promoting an "already-wired" path.**
+The Tranche 4 alias was sitting under `--features tilelang-attn`
+for weeks with the working theory that the HD128 prefill cubin
+"should" handle decode. The kernel hypothesis was specific —
+prefill cubin's Q-tile is wasted on 1-row decode — and the Plan
+agent flagged it before the bench. The bench confirmed it. Save
+the steps next time: when a kernel's BLOCK_M / grid shape doesn't
+match the call's actual M / batch shape, **don't ship and validate
+later, write the call-shape-specific kernel first.**
