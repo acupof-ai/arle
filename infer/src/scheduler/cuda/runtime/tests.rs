@@ -14,7 +14,7 @@ mod tests {
     use crate::kv_tier::{HostPinnedRegion, ReadmissionBlock, ReadmissionPlan, ReadmissionSource};
     use crate::prefix_cache::BlockId;
     use crate::scheduler::cuda::budget::{PageBudget, estimated_request_target};
-    use crate::scheduler::cuda::core::is_full_sealed_prefix;
+    use crate::scheduler::cuda::core::{PrefetchTicketState, is_full_sealed_prefix};
     use crate::scheduler::{IncomingRequest, RequestPriority};
     use crate::server_engine::FinishReason;
     use crate::types::BlockFingerprint;
@@ -144,7 +144,7 @@ mod tests {
         );
         assert_eq!(
             staged_prefix_prefetch_state(&disk_plan),
-            Some(super::PrefetchTicketState {
+            Some(PrefetchTicketState {
                 host_blocks: 0,
                 disk_blocks: 1,
                 remote_blocks: 0,
