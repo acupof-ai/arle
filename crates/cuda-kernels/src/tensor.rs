@@ -28,11 +28,18 @@ pub struct DeviceContext {
 
 /// Parse `INFER_CUDA_DEVICE` (default 0). Selects the device for `DeviceContext::new()`.
 pub fn parse_device_ordinal_from_env() -> Result<u32> {
-    match std::env::var("INFER_CUDA_DEVICE") {
-        Ok(s) => s.trim().parse::<u32>().map_err(|e| {
+    parse_device_ordinal(std::env::var("INFER_CUDA_DEVICE").ok().as_deref())
+}
+
+/// String-pure parse of an `INFER_CUDA_DEVICE`-style ordinal. `None` => 0.
+/// Split out from [`parse_device_ordinal_from_env`] so unit tests don't need
+/// to mutate the process environment (which races with concurrent tests).
+fn parse_device_ordinal(value: Option<&str>) -> Result<u32> {
+    match value {
+        Some(s) => s.trim().parse::<u32>().map_err(|e| {
             anyhow!("INFER_CUDA_DEVICE must be a non-negative integer, got {s:?}: {e}")
         }),
-        Err(_) => Ok(0),
+        None => Ok(0),
     }
 }
 
@@ -1355,37 +1362,11 @@ mod tests {
 
     #[test]
     fn parse_device_ordinal_handles_unset_default_and_invalid() {
-        // SAFETY: tests in this module run in-process; avoid clobbering a real value
-        // by saving + restoring. Cargo serialises tests within a module by default
-        // unless --test-threads >1; we additionally restore on every branch.
-        let prev = std::env::var("INFER_CUDA_DEVICE").ok();
-
-        unsafe {
-            std::env::remove_var("INFER_CUDA_DEVICE");
-        }
-        assert_eq!(parse_device_ordinal_from_env().unwrap(), 0);
-
-        unsafe {
-            std::env::set_var("INFER_CUDA_DEVICE", "3");
-        }
-        assert_eq!(parse_device_ordinal_from_env().unwrap(), 3);
-
-        unsafe {
-            std::env::set_var("INFER_CUDA_DEVICE", "  7 ");
-        }
-        assert_eq!(parse_device_ordinal_from_env().unwrap(), 7);
-
-        unsafe {
-            std::env::set_var("INFER_CUDA_DEVICE", "not-a-number");
-        }
-        assert!(parse_device_ordinal_from_env().is_err());
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("INFER_CUDA_DEVICE", v),
-                None => std::env::remove_var("INFER_CUDA_DEVICE"),
-            }
-        }
+        assert_eq!(parse_device_ordinal(None).unwrap(), 0);
+        assert_eq!(parse_device_ordinal(Some("3")).unwrap(), 3);
+        assert_eq!(parse_device_ordinal(Some("  7 ")).unwrap(), 7);
+        assert!(parse_device_ordinal(Some("not-a-number")).is_err());
+        assert!(parse_device_ordinal(Some("")).is_err());
     }
 
     #[test]

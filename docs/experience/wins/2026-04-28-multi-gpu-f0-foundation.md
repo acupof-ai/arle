@@ -70,6 +70,45 @@ If they don't, M0 is not actually a no-op — investigate before F1.
 - **Codex review caught the one feature-gating bug**
   (`nccl = []` should imply `cuda`; fixed before push).
 
+## Codex review rounds
+
+Two rounds of `codex review --base f3fc63a` post-push:
+
+**R1** — 2 findings:
+- [P2] doc command `cargo build --features cuda,nccl` failed at
+  workspace root because `nccl` only existed on `cuda-kernels`.
+  Fix: forward `nccl` through `root → cli → infer → cuda-kernels`,
+  matching existing `tilelang-attn` pattern.
+  Commit `cf12c71` (rebased to `3b333ab` on origin/main).
+- [P2] DFlash row counting in `metal/runtime.rs:1505` — **not in
+  this F0 diff**. Concurrent ckl work; left to ckl per
+  `feedback_commit_only_own_files.md`.
+
+**R2** — 4 findings:
+- [P2] Rendezvous `accept()` had no deadline — only post-accept
+  reads/writes carried `SOCKET_TIMEOUT`. Fixed: nonblocking accept
+  loop with explicit deadline; new `rendezvous_with_timeout`
+  variant for F1 NCCL-init customization. Regression test added
+  (`server_accept_times_out_when_peer_never_connects`).
+- [P2] `parse_device_ordinal_from_env` test mutated process env
+  and could race with concurrent CUDA tests. Fixed: extracted a
+  pure-string `parse_device_ordinal(Option<&str>)` helper; tests
+  call that with explicit strings, no env mutation.
+- [P3] `crates/cli/src/repl.rs:1009` ANSI escape under non-TTY —
+  **not in this F0 diff**. Concurrent ckl work; left to ckl.
+
+**R2 latent — must land before F1:**
+- [P1] `ffi::cublas_init()` initializes process-global cuBLAS
+  handles in `gemv.cu`. F0's `on_device(ordinal)` API is the
+  trigger surface, but no F0 caller uses it from a second thread,
+  so single-GPU is unaffected. F1's `TpModelWorker` rank threads
+  WILL hit this — the bug surfaces as cuBLAS calls using a handle
+  bound to GPU 0's stream while CUDA context is on GPU 1. Fix
+  before F1 lands: per-device cuBLAS handle/workspace map, or TLS
+  init keyed by `cu_device()`. Reference: vLLM and SGLang both
+  treat cuBLAS state as per-device by construction (initialized
+  inside the per-rank worker after device set).
+
 ## Rule
 
 When a foundation phase ships compile-only / test-only changes on a
