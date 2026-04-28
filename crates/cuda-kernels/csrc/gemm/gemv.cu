@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include <cublasLt.h>
 #include <cublas_v2.h>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -149,19 +151,20 @@ __global__ void gemv_handwritten_kernel(
   }
 }
 
-// cuBLAS handle management (external linkage — shared with prefill_attention.cu)
-// g_cublas_handle: workspace-free, safe for CUDA Graph capture (decode path).
-// g_cublas_prefill_handle: has 32MB workspace, allows cuBLAS to pick faster algorithms
-// for the 252 GEMMs per prefill. Never used under CUDA Graphs.
-cublasHandle_t g_cublas_handle = nullptr;
-cublasHandle_t g_cublas_prefill_handle = nullptr;
-cublasLtHandle_t g_cublaslt_handle = nullptr;
-
-static void *g_cublas_workspace = nullptr;
-static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
-static void *g_cublaslt_workspace = nullptr;
-static constexpr size_t kWorkspaceBytes = 32 * 1024 * 1024;
-
+// Per-device cuBLAS state. Each CUDA device gets its own handles, workspaces,
+// and algo cache because cuBLAS handles bind to a specific device at create
+// time and cannot be reused across devices. F1+ multi-GPU rank threads each
+// pin to one ordinal (via cudarc's CudaContext); the lookup keys off
+// `cudaGetDevice()` so callers don't need to thread the ordinal explicitly.
+//
+// Single-GPU (F0 default) path: only ordinal 0 is ever populated; same
+// behavior as the prior process-global state.
+//
+// `handle`: workspace-free, safe for CUDA Graph capture (decode path).
+// `prefill_handle`: 32MB workspace, lets cuBLAS pick faster algorithms for the
+//   252 GEMMs per prefill. Never used under CUDA Graphs.
+// `lt_handle`: cublasLt for cublasLtMatmul.
+// `algo_cache`: per-shape best algorithm chosen by heuristic / autotune.
 struct GemmKey {
   int M;
   int N;
@@ -181,8 +184,42 @@ struct GemmKeyHash {
   }
 };
 
-static std::unordered_map<GemmKey, cublasLtMatmulAlgo_t, GemmKeyHash> g_algo_cache;
-static bool g_gemm_graphsafe_mode = false;
+struct CublasDeviceState {
+  cublasHandle_t handle = nullptr;
+  cublasHandle_t prefill_handle = nullptr;
+  cublasLtHandle_t lt_handle = nullptr;
+  void *cublas_workspace = nullptr;
+  void *cublaslt_workspace = nullptr;
+  std::unordered_map<GemmKey, cublasLtMatmulAlgo_t, GemmKeyHash> algo_cache;
+};
+
+static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
+static constexpr size_t kWorkspaceBytes = 32 * 1024 * 1024;
+
+static std::mutex g_state_mutex;
+static std::unordered_map<int, std::unique_ptr<CublasDeviceState>> g_per_device_state;
+
+// Hot-path lookup avoids the mutex by caching the per-device pointer in TLS.
+// Invalidated when `cudaGetDevice()` reports a different ordinal (rare; rank
+// threads pin once at startup).
+thread_local CublasDeviceState *t_cached_state = nullptr;
+thread_local int t_cached_ordinal = -1;
+
+static CublasDeviceState *current_device_state() {
+  int ordinal = 0;
+  cudaGetDevice(&ordinal);
+  if (ordinal == t_cached_ordinal && t_cached_state != nullptr) {
+    return t_cached_state;
+  }
+  std::lock_guard<std::mutex> lock(g_state_mutex);
+  auto it = g_per_device_state.find(ordinal);
+  if (it == g_per_device_state.end()) {
+    return nullptr;
+  }
+  t_cached_ordinal = ordinal;
+  t_cached_state = it->second.get();
+  return t_cached_state;
+}
 
 static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                         __nv_bfloat16 *Y, int M, int N, int K,
@@ -207,7 +244,12 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
 
 static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                       __nv_bfloat16 *Y, int M, int N, int K,
-                                      cudaStream_t stream) {
+                                      cudaStream_t stream, bool graphsafe) {
+  CublasDeviceState *state = current_device_state();
+  if (state == nullptr) {
+    return cudaErrorNotReady;
+  }
+
   cublasLtMatmulDesc_t operation_desc = nullptr;
   cublasLtMatrixLayout_t w_desc = nullptr;
   cublasLtMatrixLayout_t x_desc = nullptr;
@@ -243,14 +285,14 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
     return cudaErrorUnknown;
   }
 
-  auto algo_it = g_algo_cache.find(key);
-  if (algo_it == g_algo_cache.end()) {
-    if (g_gemm_graphsafe_mode) {
+  auto algo_it = state->algo_cache.find(key);
+  if (algo_it == state->algo_cache.end()) {
+    if (graphsafe) {
       cublasLtMatrixLayoutDestroy(y_desc);
       cublasLtMatrixLayoutDestroy(x_desc);
       cublasLtMatrixLayoutDestroy(w_desc);
       cublasLtMatmulDescDestroy(operation_desc);
-      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, g_cublas_handle);
+      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, state->handle);
     }
 
     if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
@@ -275,23 +317,23 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
     cublasLtMatmulHeuristicResult_t heuristic_results[8];
     int returned_algo_count = 0;
     cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
-        g_cublaslt_handle, operation_desc, w_desc, x_desc, y_desc, y_desc,
+        state->lt_handle, operation_desc, w_desc, x_desc, y_desc, y_desc,
         preference, 8, heuristic_results, &returned_algo_count);
     cublasLtMatmulPreferenceDestroy(preference);
     preference = nullptr;
 
     if (heuristic_status == CUBLAS_STATUS_SUCCESS && returned_algo_count > 0) {
-      algo_it = g_algo_cache.emplace(key, heuristic_results[0].algo).first;
+      algo_it = state->algo_cache.emplace(key, heuristic_results[0].algo).first;
     } else {
       cublasLtMatrixLayoutDestroy(y_desc);
       cublasLtMatrixLayoutDestroy(x_desc);
       cublasLtMatrixLayoutDestroy(w_desc);
       cublasLtMatmulDescDestroy(operation_desc);
-      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, g_cublas_prefill_handle);
+      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, state->prefill_handle);
     }
   }
 
-  if (cublasLtMatmul(g_cublaslt_handle, operation_desc,
+  if (cublasLtMatmul(state->lt_handle, operation_desc,
                      &h_alpha,
                      W, w_desc,
                      X, x_desc,
@@ -299,7 +341,7 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
                      Y, y_desc,
                      Y, y_desc,
                      &algo_it->second,
-                     g_cublaslt_workspace,
+                     state->cublaslt_workspace,
                      kWorkspaceBytes,
                      stream) != CUBLAS_STATUS_SUCCESS) {
     cublasLtMatrixLayoutDestroy(y_desc);
@@ -318,51 +360,62 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
 
 extern "C" {
 
+// Initialize cuBLAS state for the currently-active CUDA device. Idempotent;
+// safe to call multiple times. Caller MUST set the CUDA context to the
+// intended device before calling (cudarc's `CudaContext::new(ordinal)` does
+// this on context creation).
 void cublas_init() {
-  if (g_cublas_handle == nullptr) {
-    cublasCreate(&g_cublas_handle);
-    cublasSetMathMode(g_cublas_handle, CUBLAS_TENSOR_OP_MATH);
+  int ordinal = 0;
+  cudaGetDevice(&ordinal);
+
+  std::lock_guard<std::mutex> lock(g_state_mutex);
+  auto &slot = g_per_device_state[ordinal];
+  if (slot != nullptr) {
+    return;
   }
-  if (g_cublas_prefill_handle == nullptr) {
-    cublasCreate(&g_cublas_prefill_handle);
-    cublasSetMathMode(g_cublas_prefill_handle, CUBLAS_TENSOR_OP_MATH);
+  auto state = std::make_unique<CublasDeviceState>();
+  cublasCreate(&state->handle);
+  cublasSetMathMode(state->handle, CUBLAS_TENSOR_OP_MATH);
+  cublasCreate(&state->prefill_handle);
+  cublasSetMathMode(state->prefill_handle, CUBLAS_TENSOR_OP_MATH);
+  cublasLtCreate(&state->lt_handle);
+  cudaMalloc(&state->cublas_workspace, CUBLAS_WORKSPACE_SIZE);
+  if (state->prefill_handle != nullptr && state->cublas_workspace != nullptr) {
+    cublasSetWorkspace(state->prefill_handle, state->cublas_workspace, CUBLAS_WORKSPACE_SIZE);
   }
-  if (g_cublaslt_handle == nullptr) {
-    cublasLtCreate(&g_cublaslt_handle);
-  }
-  if (g_cublas_workspace == nullptr) {
-    cudaMalloc(&g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
-  }
-  if (g_cublas_prefill_handle != nullptr && g_cublas_workspace != nullptr) {
-    cublasSetWorkspace(g_cublas_prefill_handle, g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
-  }
-  if (g_cublaslt_workspace == nullptr) {
-    cudaMalloc(&g_cublaslt_workspace, kWorkspaceBytes);
-  }
+  cudaMalloc(&state->cublaslt_workspace, kWorkspaceBytes);
+  slot = std::move(state);
 }
 
+// Tear down cuBLAS state for ALL devices the process has initialized.
+// Called at process exit. Each handle/workspace is destroyed under the
+// device that owns it (cuBLAS handles are bound to the device active at
+// `cublasCreate` time, but `cublasDestroy` works from any current device).
 void cublas_destroy() {
-  if (g_cublas_handle != nullptr) {
-    cublasDestroy(g_cublas_handle);
-    g_cublas_handle = nullptr;
+  std::lock_guard<std::mutex> lock(g_state_mutex);
+  for (auto &kv : g_per_device_state) {
+    auto &state = kv.second;
+    if (state->handle != nullptr) {
+      cublasDestroy(state->handle);
+    }
+    if (state->prefill_handle != nullptr) {
+      cublasDestroy(state->prefill_handle);
+    }
+    if (state->lt_handle != nullptr) {
+      cublasLtDestroy(state->lt_handle);
+    }
+    if (state->cublas_workspace != nullptr) {
+      cudaFree(state->cublas_workspace);
+    }
+    if (state->cublaslt_workspace != nullptr) {
+      cudaFree(state->cublaslt_workspace);
+    }
   }
-  if (g_cublas_prefill_handle != nullptr) {
-    cublasDestroy(g_cublas_prefill_handle);
-    g_cublas_prefill_handle = nullptr;
-  }
-  if (g_cublaslt_handle != nullptr) {
-    cublasLtDestroy(g_cublaslt_handle);
-    g_cublaslt_handle = nullptr;
-  }
-  if (g_cublas_workspace != nullptr) {
-    cudaFree(g_cublas_workspace);
-    g_cublas_workspace = nullptr;
-  }
-  if (g_cublaslt_workspace != nullptr) {
-    cudaFree(g_cublaslt_workspace);
-    g_cublaslt_workspace = nullptr;
-  }
-  g_algo_cache.clear();
+  g_per_device_state.clear();
+  // TLS caches in any other thread will see ordinal mismatch on next call
+  // (cleared map) and re-fault — safe.
+  t_cached_state = nullptr;
+  t_cached_ordinal = -1;
 }
 
 
@@ -379,24 +432,22 @@ cudaError_t gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloa
 // Uses prefill handle (with workspace) — only called from prefill path, never under CUDA Graphs.
 cudaError_t gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                int M, int N, int K, cudaStream_t stream) {
-  g_gemm_graphsafe_mode = false;
-  return gemm_cublaslt_impl(W, X, Y, M, N, K, stream);
+  return gemm_cublaslt_impl(W, X, Y, M, N, K, stream, /*graphsafe=*/false);
 }
 
 // Graph-safe GEMM: same math as gemm_cuda but uses the workspace-free handle.
 // Safe for CUDA Graph capture and decode path.
 cudaError_t gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                           int M, int N, int K, cudaStream_t stream) {
-  g_gemm_graphsafe_mode = true;
-  cudaError_t status = gemm_cublaslt_impl(W, X, Y, M, N, K, stream);
-  g_gemm_graphsafe_mode = false;
-  return status;
+  return gemm_cublaslt_impl(W, X, Y, M, N, K, stream, /*graphsafe=*/true);
 }
 
 // Benchmark all cublasLt heuristic algorithms for (M,N,K) and cache the fastest.
 // Called during warmup before CUDA Graph capture.
 cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
-  if (g_cublaslt_handle == nullptr || g_cublaslt_workspace == nullptr)
+  CublasDeviceState *state = current_device_state();
+  if (state == nullptr || state->lt_handle == nullptr ||
+      state->cublaslt_workspace == nullptr)
     return cudaErrorNotReady;
 
   GemmKey key{M, N, K};
@@ -423,7 +474,7 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
 
   cublasLtMatmulHeuristicResult_t results[8];
   int count = 0;
-  cublasLtMatmulAlgoGetHeuristic(g_cublaslt_handle, op, wl, xl, yl, yl,
+  cublasLtMatmulAlgoGetHeuristic(state->lt_handle, op, wl, xl, yl, yl,
                                  pref, 8, results, &count);
   cublasLtMatmulPreferenceDestroy(pref);
 
@@ -436,7 +487,7 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
   }
 
   if (count == 1) {
-    g_algo_cache[key] = results[0].algo;
+    state->algo_cache[key] = results[0].algo;
     cublasLtMatrixLayoutDestroy(yl);
     cublasLtMatrixLayoutDestroy(xl);
     cublasLtMatrixLayoutDestroy(wl);
@@ -456,7 +507,7 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
     if (d_W) cudaFree(d_W);
     if (d_X) cudaFree(d_X);
     if (d_Y) cudaFree(d_Y);
-    g_algo_cache[key] = results[0].algo;
+    state->algo_cache[key] = results[0].algo;
     cublasLtMatrixLayoutDestroy(yl);
     cublasLtMatrixLayoutDestroy(xl);
     cublasLtMatrixLayoutDestroy(wl);
@@ -477,10 +528,10 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
     bool failed = false;
     // Warmup
     for (int w = 0; w < 3; w++) {
-      if (cublasLtMatmul(g_cublaslt_handle, op, &alpha,
+      if (cublasLtMatmul(state->lt_handle, op, &alpha,
                          d_W, wl, d_X, xl, &beta, d_Y, yl, d_Y, yl,
                          &results[i].algo,
-                         g_cublaslt_workspace, kWorkspaceBytes,
+                         state->cublaslt_workspace, kWorkspaceBytes,
                          stream) != CUBLAS_STATUS_SUCCESS) {
         failed = true;
         break;
@@ -491,10 +542,10 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
     // Timed iterations
     cudaEventRecord(ev_start, stream);
     for (int t = 0; t < 10; t++) {
-      cublasLtMatmul(g_cublaslt_handle, op, &alpha,
+      cublasLtMatmul(state->lt_handle, op, &alpha,
                      d_W, wl, d_X, xl, &beta, d_Y, yl, d_Y, yl,
                      &results[i].algo,
-                     g_cublaslt_workspace, kWorkspaceBytes,
+                     state->cublaslt_workspace, kWorkspaceBytes,
                      stream);
     }
     cudaEventRecord(ev_stop, stream);
@@ -508,7 +559,7 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
     }
   }
 
-  g_algo_cache[key] = results[best_idx].algo;
+  state->algo_cache[key] = results[best_idx].algo;
 
   cudaFree(d_W);
   cudaFree(d_X);
@@ -522,16 +573,21 @@ cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
   return cudaSuccess;
 }
 
-// Autotune all GEMM shapes currently in the heuristic cache.
+// Autotune all GEMM shapes currently in the heuristic cache (for the
+// currently-active CUDA device).
 // Replaces heuristic-selected algorithms with benchmarked optimal ones.
 void autotune_all_cached_gemms_cuda(cudaStream_t stream) {
+  CublasDeviceState *state = current_device_state();
+  if (state == nullptr) {
+    return;
+  }
   std::vector<GemmKey> keys;
-  keys.reserve(g_algo_cache.size());
-  for (auto& kv : g_algo_cache) {
+  keys.reserve(state->algo_cache.size());
+  for (auto &kv : state->algo_cache) {
     keys.push_back(kv.first);
   }
-  for (auto& k : keys) {
-    g_algo_cache.erase(k);
+  for (auto &k : keys) {
+    state->algo_cache.erase(k);
     autotune_gemm_cuda(k.M, k.N, k.K, stream);
   }
 }

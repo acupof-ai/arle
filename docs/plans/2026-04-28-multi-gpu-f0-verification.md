@@ -118,16 +118,36 @@ nvidia-smi  # confirm GPU 1 is the one busy, GPU 0 is idle
   output JSON if the bench script writes them; if not, run a short
   prompt manually and diff outputs).
 
-### Step 4 — What's NOT yet verifiable (waits for F1)
+### Step 4 — Multi-device cuBLAS smoke (manual, optional)
+
+The cuBLAS state refactor (per-device handles in `gemv.cu`) is verified
+syntactically on Mac via `cargo check --features cuda,no-cuda`. To
+exercise the per-device path on the CUDA host:
+
+```bash
+# 4.1 Spawn two rank threads on different GPUs, each runs a small
+#     gemm. Bug behavior: cuBLAS error or wrong-device launch on rank 1.
+#     Fixed behavior: both ranks complete cleanly with isolated state.
+#     (No single-binary smoke ships in F0; verification is via F1's
+#     TpModelWorker. For F0, a manual probe via INFER_CUDA_DEVICE
+#     suffices to confirm gpu1 init works in isolation.)
+INFER_CUDA_DEVICE=1 scripts/bench_guidellm.sh m0-pin-1
+nvidia-smi  # confirm GPU 1 used; cuBLAS init succeeds on the second device
+```
+
+If `cublasCreate` errors out under `INFER_CUDA_DEVICE=1`, it means the
+per-device map didn't bind correctly — escalate before F1.
+
+### Step 5 — What's NOT yet verifiable (waits for F1)
 
 These need the F1 layer to land before they can be exercised end-to-end:
 
 - Actual NCCL collective execution. The FFI is declared but no caller
   invokes it yet; F1's `LayerCommunicator::all_reduce_post_attention`
   wires the first one.
-- Per-rank thread spawning. F0 has the `RendezvousServer/Client` and the
-  `CollectiveBackend` trait; F1's `TpModelWorker` is the first
-  consumer.
+- Per-rank thread spawning. F0 has the `RendezvousServer/Client`, the
+  `CollectiveBackend` trait, and per-device cuBLAS state; F1's
+  `TpModelWorker` is the first consumer that exercises all three at once.
 - Sharded weight loading using `Shard` annotations. F1's loader rewrite
   is the first consumer.
 
