@@ -128,7 +128,7 @@ const SIGNALS: Signal[] = [
   { html: '<b>metal</b> beta · apple silicon', dot: "warn" },
   { html: '<b>cpu</b> dev only', dot: "dim" },
   { html: '<b>api</b> openai · v1' },
-  { html: '<b>release</b> v0.4.2 · 2026-04' },
+  { html: '<b>release</b> v0.1.4 · 2026-04-28' },
 ];
 
 const TERMINAL_LINES_EN = [
@@ -223,18 +223,18 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
 
 const BENCH_ROWS_EN: BenchRow[] = [
   {
-    date: "2026-04-23",
+    date: "2026-04-28",
     stability: "stable",
     stabilityLabel: "stable · ci-gated",
-    caption: '<b>cuda</b> · NVIDIA L4 · <code>Qwen3-4B</code> · BF16 · concurrency=16',
+    caption: '<b>cuda</b> · NVIDIA L4 · <code>Qwen3-4B</code> · BF16 + FP8 paged KV (auto) · c=16',
     cells: [
-      { key: "output", value: "118", unit: "tok/s" },
-      { key: "itl p50", value: "59.9", unit: "ms" },
-      { key: "first token", value: "412", unit: "ms" },
-      { key: "streams", value: "16", unit: "conc" },
+      { key: "output", value: "197", unit: "tok/s" },
+      { key: "itl p50", value: "77.9", unit: "ms" },
+      { key: "vs legacy", value: "+64", unit: "%" },
+      { key: "kv util", value: "69", unit: "%" },
     ],
-    cmd: "infer bench --model Qwen3-4B",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-23-bench-guidellm-qwen3-4b-l4-c16-tier-prefetch-42ce889.md",
+    cmd: "scripts/bench_guidellm.sh cuda-l4-hbm-tier-fp8-auto",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md",
   },
   {
     date: "2026-04-27",
@@ -254,18 +254,18 @@ const BENCH_ROWS_EN: BenchRow[] = [
 
 const BENCH_ROWS_ZH: BenchRow[] = [
   {
-    date: "2026-04-23",
+    date: "2026-04-28",
     stability: "stable",
     stabilityLabel: "stable · CI 已门控",
-    caption: '<b>cuda</b> · NVIDIA L4 · <code>Qwen3-4B</code> · BF16 · concurrency=16',
+    caption: '<b>cuda</b> · NVIDIA L4 · <code>Qwen3-4B</code> · BF16 + FP8 分页 KV（auto）· c=16',
     cells: [
-      { key: "输出", value: "118", unit: "tok/s" },
-      { key: "ITL p50", value: "59.9", unit: "ms" },
-      { key: "首 token", value: "412", unit: "ms" },
-      { key: "并发", value: "16", unit: "conc" },
+      { key: "输出", value: "197", unit: "tok/s" },
+      { key: "ITL p50", value: "77.9", unit: "ms" },
+      { key: "对比 legacy", value: "+64", unit: "%" },
+      { key: "KV 利用率", value: "69", unit: "%" },
     ],
-    cmd: "infer bench --model Qwen3-4B",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-23-bench-guidellm-qwen3-4b-l4-c16-tier-prefetch-42ce889.md",
+    cmd: "scripts/bench_guidellm.sh cuda-l4-hbm-tier-fp8-auto",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md",
   },
   {
     date: "2026-04-27",
@@ -428,7 +428,7 @@ export const EN: Locale = {
     },
   },
   footer: {
-    left: "arle(1) · April 2026 · v0.4.2",
+    left: "arle(1) · April 2026 · v0.1.4",
     right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
   },
 };
@@ -496,7 +496,7 @@ export const ZH: Locale = {
     },
   },
   footer: {
-    left: "arle(1) · 2026 年 4 月 · v0.4.2",
+    left: "arle(1) · 2026 年 4 月 · v0.1.4",
     right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
   },
 };
