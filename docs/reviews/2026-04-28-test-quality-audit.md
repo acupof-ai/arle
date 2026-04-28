@@ -1,5 +1,30 @@
 # Test Quality Audit — 2026-04-28
 
+> **2026-04-28 follow-up (codex review + execution corrections).** During
+> Phase 2 execution three audit entries were reclassified to EXEMPT:
+> (a) `infer/src/distributed/init_method.rs:257 unique_id_size_constant` —
+> `UNIQUE_ID_BYTES` is the rendezvous wire payload size matching NCCL's
+> 128-byte `ncclUniqueId`; the other rendezvous tests use the constant
+> via `[u8; UNIQUE_ID_BYTES]` so they would still pass if it drifted off
+> spec. (b) `crates/cuda-kernels/src/collective.rs:361/366 dtype_enum_size,
+> reduce_op_enum_size` — DType / ReduceOp are cast to the matching NCCL
+> enum types across the FFI boundary (same FFI-ABI rationale as the
+> `nccl.rs` size-of pins). (c) `crates/cuda-kernels/src/tensor.rs:1387
+> kernel_alignment_names_scale_layout_explicitly` — the asserted strings
+> are public-API field values on `WeightKernelAlignment` and are
+> consumed by kernel-dispatch routing, not Debug text. Net: Phase 2
+> shipped 10 deletions + 1 refactor (AdamW `is_device_backed()` getter
+> replacing the Debug-string lock in `crates/train/src/cli_args.rs`),
+> not 18.
+>
+> The per-file inventory below was generated against a working tree
+> that included unrelated dirty state; counts in
+> `infer/src/backend/metal/scheduler.rs` and the omission of the root
+> `tests/` directory (`tests/cli_smoke.rs` 8, `tests/cli_agent_live.rs`
+> 3, `tests/cli_tiny_fixture_live.rs` 1 — all behavioral CLI smoke and
+> live-tool tests, EXEMPT) reflect that snapshot. Treat the inventory
+> as a guidepost; trust ripgrep at HEAD for absolute counts.
+
 ## Summary
 
 - Total `#[test]` / `#[tokio::test]`: **~1255** (1230 in `infer/src` + `crates/*/src` + `src`, plus 25 in `infer/tests/`)
