@@ -46,7 +46,7 @@ pub(in crate::scheduler::cuda) use helpers::{
 };
 pub(in crate::scheduler::cuda) use state_types::{
     PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow, PrefetchTicketState,
-    StoreDedupKey,
+    SchedulerRuntimeStats, StoreDedupKey,
 };
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
@@ -143,17 +143,8 @@ pub struct Scheduler<M: ModelForward> {
     /// Pre-allocated buffers for batched prefill that may hold GPU resources
     /// across loop turns when async prefill overlap is enabled.
     pub(super) prefill_ctx: Option<M::PrefillContext>,
-    /// Lifetime stats.
-    pub(super) total_completed: u64,
-    pub(super) total_generated_tokens: u64,
-    /// EMA step timing (microseconds) for /v1/stats profiling.
-    pub(super) step_timing_decode_us: f64,
-    pub(super) step_timing_emit_us: f64,
-    pub(super) step_timing_prefill_us: f64,
-    pub(super) step_timing_total_us: f64,
-    /// Throttled GPU memory query — last poll time and peak high-water mark.
-    pub(super) last_mem_query: std::time::Instant,
-    pub(super) peak_mem_bytes: u64,
+    /// Lifetime counters and local profiling state.
+    pub(super) stats: SchedulerRuntimeStats,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
     /// Pending prefill state for GPU/CPU overlap.

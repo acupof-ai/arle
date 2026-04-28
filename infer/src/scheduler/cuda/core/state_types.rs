@@ -41,6 +41,37 @@ pub(in crate::scheduler::cuda) struct PrefetchTicketState {
     pub remote_blocks: usize,
 }
 
+/// Runtime counters and local profiling state owned by the scheduler thread.
+pub(in crate::scheduler::cuda) struct SchedulerRuntimeStats {
+    /// Lifetime completed request count.
+    pub total_completed: u64,
+    /// Lifetime generated token count.
+    pub total_generated_tokens: u64,
+    /// EMA step timing (microseconds) for `/v1/stats` profiling.
+    pub step_timing_decode_us: f64,
+    pub step_timing_emit_us: f64,
+    pub step_timing_prefill_us: f64,
+    pub step_timing_total_us: f64,
+    /// Throttled GPU memory query state and peak high-water mark.
+    pub last_mem_query: std::time::Instant,
+    pub peak_mem_bytes: u64,
+}
+
+impl SchedulerRuntimeStats {
+    pub(in crate::scheduler::cuda) fn new() -> Self {
+        Self {
+            total_completed: 0,
+            total_generated_tokens: 0,
+            step_timing_decode_us: 0.0,
+            step_timing_emit_us: 0.0,
+            step_timing_prefill_us: 0.0,
+            step_timing_total_us: 0.0,
+            last_mem_query: std::time::Instant::now(),
+            peak_mem_bytes: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(in crate::scheduler::cuda) struct StoreDedupKey {
     pub fingerprint: BlockFingerprint,
