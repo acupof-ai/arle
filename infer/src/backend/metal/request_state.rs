@@ -549,6 +549,25 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
     }
 }
 
+/// Union of per-request `stop_token_ids` and the model's resolved
+/// `stop_token_ids` (HF eos array). Preserves first-seen order, dedups.
+/// Skips the model stops when `ignore_eos` is set, matching the C++
+/// generate paths so benchmarks can still generate past EOS.
+fn merge_stop_ids(request_stops: &[u32], config: &MetalModelConfig, ignore_eos: bool) -> Vec<u32> {
+    let model_stops: &[u32] = if ignore_eos {
+        &[]
+    } else {
+        &config.stop_token_ids
+    };
+    let mut out = Vec::with_capacity(request_stops.len() + model_stops.len());
+    for id in request_stops.iter().chain(model_stops.iter()) {
+        if !out.contains(id) {
+            out.push(*id);
+        }
+    }
+    out
+}
+
 impl<'a> MetalRequestState<'a> {
     pub(super) fn new(
         weights: &'a MetalWeights,
@@ -578,7 +597,7 @@ impl<'a> MetalRequestState<'a> {
                     driver,
                     prompt_tokens,
                     max_new_tokens,
-                    params.stop_token_ids.clone(),
+                    merge_stop_ids(&params.stop_token_ids, config, params.ignore_eos),
                     config.eos_token_id,
                     params.ignore_eos,
                 )?;
@@ -597,7 +616,7 @@ impl<'a> MetalRequestState<'a> {
                     driver,
                     prompt_tokens,
                     max_new_tokens,
-                    params.stop_token_ids.clone(),
+                    merge_stop_ids(&params.stop_token_ids, config, params.ignore_eos),
                     config.eos_token_id,
                     params.ignore_eos,
                 )?;
