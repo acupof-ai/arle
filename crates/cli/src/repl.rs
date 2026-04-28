@@ -793,11 +793,18 @@ fn run_agent_turn(
             if streamed_any {
                 println!();
             }
-            if !streamed_any {
-                println!("\x1b[1;34m{}\x1b[0m", result.text);
-            }
+            // When the agent terminates because it ran out of turn budget,
+            // the engine fills `result.text` with a placeholder ("max turns
+            // reached - agent stopped") and sets `max_turns_reached`. Showing
+            // both the blue placeholder and a dim status marker is double-
+            // talk — keep just the dim marker, and include the hint so the
+            // user can raise the budget without having to dig.
             if result.max_turns_reached {
-                println!("\x1b[2m(agent stopped after reaching max turns)\x1b[0m");
+                println!(
+                    "\x1b[2m(agent stopped — max turns reached; pass --max-turns N to allow more tool steps)\x1b[0m"
+                );
+            } else if !streamed_any {
+                println!("\x1b[1;34m{}\x1b[0m", result.text);
             }
             let elapsed = start.elapsed();
             tps_meter
