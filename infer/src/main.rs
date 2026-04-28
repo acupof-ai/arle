@@ -122,9 +122,10 @@ struct Args {
     /// modes "tq2"/"tq3"/"tq4". FP8 and TurboQuant keep the contiguous prefill
     /// cache in BF16 and quantize when migrating into the paged token pool.
     ///
-    /// `auto` stays BF16 by default, but when `--max-seq-len` is explicit it
-    /// upgrades to a denser paged KV format if BF16 cannot satisfy the
-    /// requested slots × sequence-length envelope.
+    /// `auto` defaults to FP8 paged pool (BF16 contiguous), halving per-token
+    /// KV bytes vs full BF16 with negligible quality impact on Qwen3-family
+    /// models. Falls back to BF16 paged pool if the FP8 dispatch is
+    /// unavailable for the model arch.
     #[arg(long, default_value = "auto")]
     kv_cache_dtype: String,
 
@@ -339,9 +340,17 @@ enum RequestedKvCacheMode {
 }
 
 impl RequestedKvCacheMode {
+    /// Per-slot KV bytes are sized against this format. For `auto`, mirror
+    /// the first candidate in `kv_mode_candidates` (FP8) so the auto slot
+    /// count matches the format the runtime will actually pick. If the FP8
+    /// candidate fails the envelope check and the loop falls back to BF16,
+    /// the caller may end up with more slots than the BF16 pool can fit —
+    /// but that path also retries the whole runtime construction with the
+    /// BF16 format, and the BF16 envelope check rejects oversized slot
+    /// counts there.
     fn slot_sizing_format(self) -> KVFormat {
         match self {
-            Self::Auto => KVFormat::BF16,
+            Self::Auto => KVFormat::FP8E4M3,
             Self::Explicit { kv_pool_format, .. } => kv_pool_format,
         }
     }
@@ -392,16 +401,21 @@ fn parse_kv_cache_mode(mode: &str) -> std::result::Result<RequestedKvCacheMode, 
 
 fn kv_mode_candidates(
     requested_mode: RequestedKvCacheMode,
-    has_explicit_max_seq_len: bool,
+    _has_explicit_max_seq_len: bool,
 ) -> Vec<(KVCacheDtype, KVFormat, &'static str)> {
     match requested_mode {
-        RequestedKvCacheMode::Auto if has_explicit_max_seq_len => {
+        // Pure-inference auto: FP8 paged pool by default — halves the per-token
+        // KV bytes vs BF16 with negligible quality regression on Qwen3 family,
+        // matching SGLang/vLLM v1's default for L4-class GPUs. The contiguous
+        // single-request cache stays BF16; quantization happens on migration
+        // into the paged pool. Fall back to BF16 if the FP8 path can't satisfy
+        // the requested envelope (e.g. no FP8 kernel for the model arch).
+        RequestedKvCacheMode::Auto => {
             vec![
-                (KVCacheDtype::BF16, KVFormat::BF16, "auto-bf16"),
                 (KVCacheDtype::BF16, KVFormat::FP8E4M3, "auto-fp8"),
+                (KVCacheDtype::BF16, KVFormat::BF16, "auto-bf16"),
             ]
         }
-        RequestedKvCacheMode::Auto => vec![(KVCacheDtype::BF16, KVFormat::BF16, "auto-bf16")],
         RequestedKvCacheMode::Explicit {
             kv_cache_dtype,
             kv_pool_format,
