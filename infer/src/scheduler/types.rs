@@ -123,6 +123,27 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// User-supplied prefill-envelope overrides. `None` for a field means
+/// "auto-pick from HBM"; `Some(v)` pins it. Mirrors SGLang's CLI semantics
+/// (`--chunked-prefill-size` defaults to a HBM-tier table; explicit values
+/// always win).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeEnvelopeOverrides {
+    pub chunked_prefill_size: Option<usize>,
+    pub max_prefill_tokens: Option<usize>,
+}
+
+/// SGLang-style HBM tier table for `chunked_prefill_size`.
+pub fn pick_chunked_prefill_size_for_hbm(gpu_total_bytes: usize) -> usize {
+    const GIB: usize = 1024 * 1024 * 1024;
+    match gpu_total_bytes {
+        n if n < 35 * GIB => 2048,
+        n if n < 60 * GIB => 4096,
+        n if n < 90 * GIB => 8192,
+        _ => 16384,
+    }
+}
+
 impl SchedulerConfig {
     /// Runtime-oriented defaults for the CUDA-backed serving scheduler.
     ///
@@ -138,6 +159,44 @@ impl SchedulerConfig {
             max_num_batched_tokens: 16384,
             long_prefill_token_threshold: 4096,
             ..Self::default()
+        }
+    }
+
+    /// Resolve the runtime prefill envelope.
+    ///
+    /// Each field of `overrides` is preserved verbatim when `Some`; when
+    /// `None`, it is auto-picked. `chunked_prefill_size` falls back to the
+    /// SGLang HBM table (`<35 GiB → 2048`, `<60 → 4096`, `<90 → 8192`,
+    /// `≥90 → 16384`). `max_prefill_tokens` falls back to the resolved
+    /// chunk size — keeping the prefill activation buffer sized for one
+    /// chunk rather than the looser whole-step budget that drove the
+    /// 1.22 GB activation cost on L4. `long_prefill_token_threshold` is
+    /// clamped to the resolved chunk size so a stale 4096 default cannot
+    /// exceed a 2048 chunk.
+    ///
+    /// Callers must invoke this **before** [`Self::validate`] when GPU HBM
+    /// is the source of truth. Pure-CPU paths can skip it and rely on the
+    /// values already set by [`Self::runtime_defaults`].
+    pub fn resolve_runtime_envelope(
+        &mut self,
+        overrides: RuntimeEnvelopeOverrides,
+        gpu_total_bytes: usize,
+    ) {
+        self.chunked_prefill_size = overrides
+            .chunked_prefill_size
+            .unwrap_or_else(|| pick_chunked_prefill_size_for_hbm(gpu_total_bytes));
+        // The step planner reserves prefill rows at `chunked_prefill_size`
+        // and rejects them whole when the remaining step budget can't fit
+        // them. Clamp the auto-picked chunk to `max_num_batched_tokens` so a
+        // tightened step budget never starves long prefill rows.
+        if self.max_num_batched_tokens > 0 {
+            self.chunked_prefill_size = self.chunked_prefill_size.min(self.max_num_batched_tokens);
+        }
+        self.max_prefill_tokens = overrides
+            .max_prefill_tokens
+            .unwrap_or(self.chunked_prefill_size);
+        if self.long_prefill_token_threshold > self.chunked_prefill_size {
+            self.long_prefill_token_threshold = self.chunked_prefill_size;
         }
     }
 
@@ -492,6 +551,93 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
         assert_eq!(cfg.cluster_shared_backend, None);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn pick_chunked_prefill_size_matches_sglang_hbm_table() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        assert_eq!(pick_chunked_prefill_size_for_hbm(0), 2048);
+        assert_eq!(pick_chunked_prefill_size_for_hbm(22 * GIB), 2048); // L4
+        assert_eq!(pick_chunked_prefill_size_for_hbm(48 * GIB), 4096); // L40S
+        assert_eq!(pick_chunked_prefill_size_for_hbm(80 * GIB), 8192); // A100-80
+        assert_eq!(pick_chunked_prefill_size_for_hbm(140 * GIB), 16384); // H100-80, H200
+    }
+
+    #[test]
+    fn resolve_runtime_envelope_auto_picks_when_overrides_none() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let mut cfg = SchedulerConfig::runtime_defaults(8);
+        cfg.resolve_runtime_envelope(RuntimeEnvelopeOverrides::default(), 22 * GIB);
+        assert_eq!(cfg.chunked_prefill_size, 2048);
+        assert_eq!(cfg.max_prefill_tokens, 2048);
+        assert_eq!(cfg.long_prefill_token_threshold, 2048);
+    }
+
+    #[test]
+    fn resolve_runtime_envelope_preserves_explicit_overrides() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.resolve_runtime_envelope(
+            RuntimeEnvelopeOverrides {
+                chunked_prefill_size: Some(6144),
+                max_prefill_tokens: Some(12288),
+            },
+            22 * GIB,
+        );
+        assert_eq!(cfg.chunked_prefill_size, 6144);
+        assert_eq!(cfg.max_prefill_tokens, 12288);
+    }
+
+    #[test]
+    fn resolve_runtime_envelope_binds_max_prefill_to_chunk_when_unset() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.resolve_runtime_envelope(
+            RuntimeEnvelopeOverrides {
+                chunked_prefill_size: Some(3072),
+                max_prefill_tokens: None,
+            },
+            22 * GIB,
+        );
+        assert_eq!(cfg.chunked_prefill_size, 3072);
+        assert_eq!(cfg.max_prefill_tokens, 3072);
+    }
+
+    #[test]
+    fn resolve_runtime_envelope_clamps_chunk_to_step_budget() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        // 80 GiB tier auto-picks chunk=8192; tightening max_num_batched_tokens
+        // to 4096 must clamp chunk so prefill rows can't exceed the step.
+        let mut cfg = SchedulerConfig::runtime_defaults(8);
+        cfg.max_num_batched_tokens = 4096;
+        cfg.resolve_runtime_envelope(RuntimeEnvelopeOverrides::default(), 80 * GIB);
+        assert_eq!(cfg.chunked_prefill_size, 4096);
+        assert_eq!(cfg.max_prefill_tokens, 4096);
+    }
+
+    #[test]
+    fn resolve_runtime_envelope_explicit_chunk_also_clamped_to_step_budget() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let mut cfg = SchedulerConfig::runtime_defaults(8);
+        cfg.max_num_batched_tokens = 4096;
+        cfg.resolve_runtime_envelope(
+            RuntimeEnvelopeOverrides {
+                chunked_prefill_size: Some(12288),
+                max_prefill_tokens: None,
+            },
+            80 * GIB,
+        );
+        assert_eq!(cfg.chunked_prefill_size, 4096);
+        assert_eq!(cfg.max_prefill_tokens, 4096);
+    }
+
+    #[test]
+    fn resolve_runtime_envelope_clamps_long_prefill_threshold_to_chunk() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        // runtime_defaults seeds threshold = 4096; auto-pick on L4 = 2048 clamps it.
+        cfg.resolve_runtime_envelope(RuntimeEnvelopeOverrides::default(), 22 * GIB);
+        assert_eq!(cfg.long_prefill_token_threshold, 2048);
     }
 
     #[test]

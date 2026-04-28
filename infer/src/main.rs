@@ -82,8 +82,10 @@ struct Args {
     max_seq_len: Option<usize>,
 
     /// Maximum number of tokens in a single prefill chunk.
-    #[arg(long, default_value_t = 4096)]
-    chunked_prefill_size: usize,
+    /// If unset, auto-picked from total GPU HBM (SGLang-style tiering:
+    /// <35 GiB → 2048, <60 → 4096, <90 → 8192, ≥90 → 16384).
+    #[arg(long)]
+    chunked_prefill_size: Option<usize>,
 
     /// Maximum total tokens to advance in one scheduler step.
     /// Decode rows consume one token each; prefill rows consume their admitted chunk.
@@ -91,8 +93,10 @@ struct Args {
     max_num_batched_tokens: usize,
 
     /// Maximum total prefill tokens to queue in one scheduler step.
-    #[arg(long, default_value_t = 16384)]
-    max_prefill_tokens: usize,
+    /// If unset, defaults to `chunked_prefill_size` so the prefill activation
+    /// buffer stays sized for one chunk rather than the whole-step budget.
+    #[arg(long)]
+    max_prefill_tokens: Option<usize>,
 
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// If omitted, the scheduler only enforces the token budget.
@@ -209,6 +213,10 @@ async fn main() {
                 enable_cuda_graph: args.cuda_graph,
             },
             scheduler: scheduler_config_from_args(&args, num_slots),
+            runtime_envelope: infer::scheduler::RuntimeEnvelopeOverrides {
+                chunked_prefill_size: args.chunked_prefill_size,
+                max_prefill_tokens: args.max_prefill_tokens,
+            },
             seed: 42,
             max_seq_len: args.max_seq_len,
             kv_cache_dtype,
@@ -402,10 +410,12 @@ fn kv_mode_candidates(
 }
 
 fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig {
+    // `chunked_prefill_size` / `max_prefill_tokens` are not plugged into the
+    // `SchedulerConfig` here — when the operator did not supply a value, the
+    // CUDA bootstrap resolves them against HBM via `RuntimeEnvelopeOverrides`.
+    // Anything we set on the config now would be silently overwritten there.
     let mut config = SchedulerConfig {
-        chunked_prefill_size: args.chunked_prefill_size,
         max_num_batched_tokens: args.max_num_batched_tokens,
-        max_prefill_tokens: args.max_prefill_tokens,
         prefill_max_requests: args.prefill_max_requests,
         mem_fraction_static: args.mem_fraction_static,
         min_seq_len: args.min_seq_len,
