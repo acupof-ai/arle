@@ -33,43 +33,76 @@ Plan agent commissioned.
 
 ## What Worked (the Validation, not the Kernel)
 
-`scripts/bench_guidellm.sh tilelang-tc-decode-{off,on} --fast`
+`scripts/bench_guidellm.sh tilelang-{off,on}-r{1..6} --fast`
 (profile=concurrent rate=16, data=4096-in/256-out, max-seconds=30,
-random-seed=20260416). Same HEAD, same box, server-restart A/B
-seconds apart.
+random-seed=20260416). Same HEAD, same box, **6 runs per side**
+(server kept up across runs to amortize CUDA-graph capture; warm vs
+cold prefix-cache state varies inside each side and is the dominant
+source of run-to-run variance).
 
 L4 / Qwen3-4B BF16 weights / FP8 paged KV (auto) / Driver 580.82.07
 / CUDA 13.0 / guidellm 0.6.0. Both servers:
 `--num-slots 16 --max-seq-len 4608 --mem-fraction-static 0.94 --cuda-graph true`.
 
-| metric              | OFF (`--features cuda`) | ON (`--features cuda,tilelang-attn`) | Δ        |
-|---------------------|------------------------:|-------------------------------------:|---------:|
-| out tok/s           | **197.85**              | 137.37                               | **-30.6%** |
-| TTFT p50 (ms)       | 9797.1                  | 10604.7                              | +8.2%    |
-| TTFT p99 (ms)       | 11630                   | 10605                                | -8.8%    |
-| ITL p50 (ms)        | 77.55                   | 80.39                                | +3.7%    |
-| ITL p99 (ms)        | 77.55                   | 80.39                                | +3.7%    |
-| req/s               | 0.4                     | 0                                    | all in-flight at end of window |
-| peak_active         | 16                      | 16                                   |          |
-| peak_kv_util        | 72.1%                   | 69.3%                                |          |
-| samples             | 65                      | 75                                   | +15%     |
-| failed requests     | 0                       | 0                                    |          |
+### Per-run
 
-The +15% samples but -31% out-tok/s is the diagnostic: the ON kernel
-launches **more often** but produces **fewer total tokens per second**
-because each launch is slower than the FlashInfer baseline. ITL p50 is
-only +3.7% worse on the median request, but the long tail dominates
-the 30s-window throughput count. The "0 req/s" on ON is a guidellm
-artifact — at 30s every request is still in-flight when the window
-closes, so completions count as zero, while incomplete request
-output-tokens still go into the throughput numerator.
+| run | OFF tok/s | ON tok/s | OFF ITL p50 | ON ITL p50 | OFF TTFT p50 | ON TTFT p50 |
+|-----|----------:|---------:|------------:|-----------:|-------------:|------------:|
+| r1  | 172.15    | 137.23   | 79.33       | 80.47      | 8486.1       | 10566.7     |
+| r2  | 165.98    | 174.65   | 82.67       | 80.00      | 634.9        | 1337.6      |
+| r3  | 84.38     | 122.51   | 67.92       | 68.21      | 8368.7       | 7466.3      |
+| r4  | 196.64    | 129.70   | 77.94       | 66.06      | 10023.3      | 8235.6      |
+| r5  | 153.84    | 124.06   | 87.37       | 67.90      | 1143.9       | 8194.6      |
+| r6  | 120.78    | 135.57   | 80.59       | 64.51      | 7457.2       | 5757.1      |
+
+### Aggregate (n=6 per side)
+
+| metric         | OFF median | OFF mean | ON median | ON mean | Δ median | Δ mean    |
+|----------------|-----------:|---------:|----------:|--------:|---------:|----------:|
+| out tok/s      | 159.91     | 148.96   | 132.63    | 137.29  | **-17.1%** | **-7.8%** |
+| ITL p50 (ms)   | 79.96      | 79.30    | 68.06     | 71.19   | **-14.9%** | **-10.2%** |
+| TTFT p50 (ms)  | 7912.95    | 6019.02  | 7830.45   | 6926.32 | -1.0%    | +15.1%    |
+
+The ITL/throughput inversion is the diagnostic: TileLang's HD128 alias
+is **15% faster on per-token decode** (ITL p50 drops 79.96 → 68.06 ms
+median) but loses on aggregate tok/s. Decode-rate ceiling at saturated
+B=16: OFF ≈ 16/0.0793 = 202 tok/s; ON ≈ 16/0.0712 = 225 tok/s. Both
+sides run far below ceiling because the c=16 / 4096-in admission burst
+spends most of the 30s window in mixed prefill+decode steps, not pure
+decode. **TileLang prefill HD128 is slower per chunk than FlashInfer's
+prefill HD128**, so each mixed step makes less progress; that
+difference dominates the headline tok/s metric on this workload.
+
+The Tranche 4 stub feared the prefill cubin's 16-row Q-tile would be
+wasted on 1-row decode batches. The data says the opposite: TileLang's
+HD128 cubin actually wins at decode (probably due to better cublasLt
+fusion or warp-spec) but loses at prefill chunk processing. So the
+real architectural fix is **a dedicated decode kernel** (BLOCK_M=1,
+GEMV-style) that locks in the +15% ITL win, **plus continued use of
+FlashInfer for prefill** (OR a prefill cubin retune, separate work).
 
 ## Decision
 
-**Keep `tilelang-attn` OFF by default for Qwen3-4B.** The Plan
-agent's Phase-1 §5 rule was explicit: ≥5% worse → revert. We are
--31% worse on aggregate throughput and +3.7% worse on per-token
-latency, with no advantage anywhere in the percentile distribution.
+**Keep `tilelang-attn` OFF by default for Qwen3-4B's c=16 admission
+workload.** Median tok/s is -17%, well past the -5% revert threshold.
+**But ITL is +15% faster** — for steady-state decode-bound workloads
+(long sessions with low admission rate, where the 30s window is
+dominated by pure-decode steps rather than mixed steps), `tilelang-attn`
+ships a real per-token win.
+
+`tilelang-attn` therefore stays opt-in (current state). Two follow-on
+operator-roadmap items, recorded here:
+
+1. **Dedicated `tilelang_batch_decode_paged_hd128_q*_kv8` kernel**
+   (BLOCK_M=1, no causal mask, grid `(1, num_q_heads, batch)`). Should
+   improve on the +15% ITL win observed here while bypassing the
+   prefill-cubin penalty for decode launches. Same architectural fix
+   that unblocks HD256 decode (see errors entry).
+2. **Investigate prefill HD128 perf parity with FlashInfer.** The
+   pending-remote prefill HD128 wins entry claimed parity; this bench
+   shows a regression at c=16 / 4096-in. Either the canonical
+   measurement diverged, or the chunk size and admission-burst pattern
+   matter and the "floor" win was on a different shape.
 
 The Tranche 4 alias is structurally wrong for pure-decode shapes.
 The right next step (also from the Plan agent) is to write a
