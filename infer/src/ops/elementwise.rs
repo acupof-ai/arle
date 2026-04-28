@@ -116,30 +116,3 @@ pub(crate) fn extract_vec_into(
         .map_err(|e| anyhow!("Device copy failed: {}", e))?;
     Ok(())
 }
-
-/// Fused SiLU-mul from merged gate+up buffer [B, 2*inter_dim].
-/// out = silu(gate_up[..inter_dim]) * gate_up[inter_dim..]
-pub(crate) fn silu_mul_fused_batch_into(
-    ctx: &DeviceContext,
-    gate_up: &HiddenStates,
-    out: &mut HiddenStates,
-) -> Result<()> {
-    let batch_size = gate_up.seq_len;
-    let inter_dim = out.hidden_dim;
-    debug_assert_eq!(gate_up.hidden_dim, 2 * inter_dim);
-
-    let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
-    let (out_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::silu_mul_fused_cuda(
-            gu_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            batch_size as i32,
-            inter_dim as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
-}

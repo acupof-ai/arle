@@ -231,7 +231,6 @@ impl Qwen35Model {
                     &shards,
                     &weight_map,
                     &format!("{}.mlp", prefix),
-                    false, // Qwen3.5 doesn't use merged gate+up
                     quant,
                 )?,
             };
@@ -588,12 +587,10 @@ impl Qwen35Model {
                     let up = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.up_proj.weight"))?;
                     let down =
                         load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.down_proj.weight"))?;
-                    let gate_up = DeviceMatrix::concat_rows(ctx, &[&gate, &up])?;
                     common::MLP {
                         gate_proj: gate,
                         up_proj: up,
                         down_proj: down,
-                        gate_up_proj: Some(gate_up),
                     }
                 },
             });
