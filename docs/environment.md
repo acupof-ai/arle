@@ -467,6 +467,11 @@ docs promote them more clearly:
   Q/K norm variant during Qwen3.5 GDR execution; default off because the
   native MLX `fast::rms_norm(...) * scale` lowering is faster on the
   Qwen3.5-0.8B MLX 4bit single-request path
+- `AGENT_INFER_METAL_GGUF_NATIVE_Q4` — controls Qwen3.5 Metal GGUF
+  load-time conversion for packed K-quant tensors. Default is `off`, keeping
+  exact GGUF affine/packed behavior for correctness. Set to `all` / `1` /
+  `true` for the lossy MLX native q4 group64 speed path, or `higher` to
+  requantize only Q5_K/Q6_K/Q8_0
 - `AGENT_INFER_QWEN35_CPP_GDR_TG_Y` /
   `AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y` /
   `AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y` — Gated Delta Rule tile-Y

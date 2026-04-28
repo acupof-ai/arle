@@ -1667,6 +1667,28 @@ mlx_array* mlx_quantized_matmul(mlx_array* x, mlx_array* w, mlx_array* scales,
         transpose, group_size, bits)));
 }
 
+int32_t mlx_quantize(
+    mlx_array* w,
+    int32_t group_size,
+    int32_t bits,
+    mlx_array** out_w,
+    mlx_array** out_scales,
+    mlx_array** out_biases) {
+    MLX_TRY_RETURN_VALUE(-1, [&]() {
+        if (out_w == nullptr || out_scales == nullptr || out_biases == nullptr) {
+            throw std::invalid_argument("mlx_quantize received null output pointer");
+        }
+        auto outputs = quantize(*to_arr(w), group_size, bits);
+        if (outputs.size() != 3) {
+            throw std::runtime_error("mlx_quantize expected three affine outputs");
+        }
+        *out_w = from_arr(std::move(outputs[0]));
+        *out_scales = from_arr(std::move(outputs[1]));
+        *out_biases = from_arr(std::move(outputs[2]));
+        return 0;
+    }());
+}
+
 // Fused quantized gated MLP: out = down(silu(gate(x)) * up(x))
 // All three projections are 4-bit quantized. The fusion lets MLX's graph
 // compiler merge intermediate kernels and avoid DRAM round-trips for the

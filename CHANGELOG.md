@@ -21,12 +21,15 @@ Related governance docs:
 
 ### Metal
 
-- Qwen3.5-0.8B MLX 4bit single-request step-driver now reaches 305.5 tok/s
-  mean / 304.7 p50 on M4 Pro 20c for `1024/256`. The matched GGUF Q4_K_M
-  direct profile is documented separately at 202.1 tok/s, so current status
-  surfaces no longer present the historical 211.7 tok/s GGUF-only profile as
-  the Metal SOTA headline. Evidence:
+- Qwen3.5-0.8B MLX 4bit single-request step-driver reaches 305.5 tok/s mean
+  / 304.7 p50 on M4 Pro 20c for `1024/256`. The matched GGUF Q4_K_M
+  exact default remains 202.1 tok/s direct for correctness, while the
+  opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s
+  step-driver, so current status surfaces no longer present the historical
+  211.7 tok/s GGUF-only profile as the Metal SOTA headline. Evidence:
   [`docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md`](docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md).
+  Native-q4 GGUF evidence:
+  [`docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md`](docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md).
 
 ## [0.1.4] — 2026-04-28
 

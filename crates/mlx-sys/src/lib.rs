@@ -188,6 +188,14 @@ unsafe extern "C" {
         group_size: i32,
         bits: i32,
     ) -> *mut mlx_array;
+    pub fn mlx_quantize(
+        w: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_w: *mut *mut mlx_array,
+        out_scales: *mut *mut mlx_array,
+        out_biases: *mut *mut mlx_array,
+    ) -> i32;
     pub fn mlx_dequantize(
         w: *mut mlx_array,
         scales: *mut mlx_array,

@@ -1,4 +1,4 @@
-use std::{path::Path, time::Instant};
+use std::{path::Path, sync::OnceLock, time::Instant};
 
 use anyhow::{Context, Result, ensure};
 use half::{bf16, f16};
@@ -21,7 +21,7 @@ use super::{
 };
 use crate::backend::is_stream_stop_matched;
 use crate::backend::metal::dflash::MetalDflashRuntime;
-use crate::gguf::{GgmlType, GgufFile, HostTensor, find_tensor_name};
+use crate::gguf::{GgmlType, GgufFile, HostTensor, dequant_to_bf16, find_tensor_name};
 use crate::qwen35_gguf_host::Qwen35LinearGgufLayout;
 use crate::sampler::SamplingParams;
 
@@ -169,6 +169,52 @@ fn gguf_packed_format(dtype: GgmlType) -> Option<GgufPackedFormat> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GgufNativeQ4Mode {
+    Off,
+    HigherBit,
+    All,
+}
+
+fn gguf_native_q4_mode() -> GgufNativeQ4Mode {
+    static MODE: OnceLock<GgufNativeQ4Mode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("AGENT_INFER_METAL_GGUF_NATIVE_Q4") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "off" | "false" | "exact" => GgufNativeQ4Mode::Off,
+            "high" | "higher" | "higher-bit" | "q5q6" => GgufNativeQ4Mode::HigherBit,
+            "1" | "on" | "true" | "all" | "native" | "q4" | "native-q4" => GgufNativeQ4Mode::All,
+            other => {
+                log::warn!(
+                    "unknown AGENT_INFER_METAL_GGUF_NATIVE_Q4={other:?}; using exact GGUF path"
+                );
+                GgufNativeQ4Mode::Off
+            }
+        },
+        Err(_) => GgufNativeQ4Mode::Off,
+    })
+}
+
+fn gguf_native_q4_enabled(format: GgufPackedFormat) -> bool {
+    match gguf_native_q4_mode() {
+        GgufNativeQ4Mode::Off => false,
+        GgufNativeQ4Mode::HigherBit => matches!(
+            format,
+            GgufPackedFormat::Q5_K | GgufPackedFormat::Q6_K | GgufPackedFormat::Q8_0
+        ),
+        GgufNativeQ4Mode::All => true,
+    }
+}
+
+fn gguf_dtype_for_packed_format(format: GgufPackedFormat) -> GgmlType {
+    match format {
+        GgufPackedFormat::Q8_0 => GgmlType::Q8_0,
+        GgufPackedFormat::Q3_K => GgmlType::Q3_K,
+        GgufPackedFormat::Q4_K => GgmlType::Q4_K,
+        GgufPackedFormat::Q5_K => GgmlType::Q5_K,
+        GgufPackedFormat::Q6_K => GgmlType::Q6_K,
+    }
+}
+
 fn gguf_matrix_info(gguf: &GgufFile, hf_name: &str) -> Result<(String, GgmlType, usize, usize)> {
     let gguf_name = find_tensor_name(gguf, hf_name)?;
     let info = gguf
@@ -222,6 +268,65 @@ fn set_affine_packed_q(
     if shift + bits > 32 {
         packed[word + 1] |= value >> (32 - shift);
     }
+}
+
+fn native_q4_weight_from_bf16_host(
+    hf_name: &str,
+    tensor: &HostTensor<bf16>,
+) -> Result<WeightTensor> {
+    const GROUP_SIZE: i32 = 64;
+    const BITS: i32 = 4;
+
+    ensure!(
+        tensor.shape.len() == 2,
+        "expected 2D tensor for native-q4 GGUF weight '{hf_name}', got {}D",
+        tensor.shape.len()
+    );
+    let rows = tensor.shape[0];
+    let cols = tensor.shape[1];
+    ensure!(
+        cols.is_multiple_of(GROUP_SIZE as usize),
+        "GGUF tensor '{hf_name}' cols={cols} is not divisible by native-q4 group size {GROUP_SIZE}"
+    );
+    let rows_i32 = i32::try_from(rows).context("GGUF row count overflows i32")?;
+    let cols_i32 = i32::try_from(cols).context("GGUF col count overflows i32")?;
+    let dense = mlx_bf16_tensor(tensor);
+    let (w, scales, biases) = super::mlx::quantize(&dense, GROUP_SIZE, BITS);
+    super::mlx::eval(&[&w, &scales, &biases]);
+    ensure!(
+        w.shape() == [rows_i32, (cols_i32 * BITS) / 32],
+        "native-q4 GGUF weight '{hf_name}' produced unexpected packed shape {:?}",
+        w.shape()
+    );
+    Ok(WeightTensor::Quantized {
+        w,
+        scales,
+        biases,
+        group_size: GROUP_SIZE,
+        bits: BITS,
+    })
+}
+
+fn gguf_native_q4_weight_from_bytes(
+    hf_name: &str,
+    packed: &[u8],
+    format: GgufPackedFormat,
+    rows: usize,
+    cols: usize,
+) -> Result<WeightTensor> {
+    let dequantized = dequant_to_bf16(
+        packed,
+        gguf_dtype_for_packed_format(format),
+        rows.checked_mul(cols)
+            .context("GGUF tensor element count overflow")?,
+    )?;
+    native_q4_weight_from_bf16_host(
+        hf_name,
+        &HostTensor {
+            data: dequantized,
+            shape: vec![rows, cols],
+        },
+    )
 }
 
 fn gguf_q4k_affine_weight_from_bytes(
@@ -624,6 +729,9 @@ fn gguf_linear_weight_from_bytes(
     rows: usize,
     cols: usize,
 ) -> Result<WeightTensor> {
+    if gguf_native_q4_enabled(format) {
+        return gguf_native_q4_weight_from_bytes(hf_name, packed, format, rows, cols);
+    }
     if let Some(weight) = gguf_affine_weight_from_bytes(hf_name, packed, format, rows, cols)? {
         return Ok(weight);
     }
@@ -656,6 +764,21 @@ fn load_gguf_embedding(gguf: &GgufFile, hf_name: &str) -> Result<(Qwen35Embeddin
 
     if let Some(format) = gguf_packed_format(dtype) {
         let packed = gguf.read_tensor_raw(&gguf_name)?;
+        if gguf_native_q4_enabled(format) {
+            let dequantized = dequant_to_bf16(
+                &packed,
+                gguf_dtype_for_packed_format(format),
+                rows.checked_mul(cols)
+                    .context("GGUF embedding element count overflow")?,
+            )?;
+            let tensor = HostTensor {
+                data: dequantized,
+                shape: vec![rows, cols],
+            };
+            let lm_head = native_q4_weight_from_bf16_host(hf_name, &tensor)?;
+            let embedding = gguf_packed_weight_from_bytes(hf_name, &packed, format, rows, cols)?;
+            return Ok((Qwen35Embedding::GgufPacked(embedding), lm_head));
+        }
         let embedding = gguf_packed_weight_from_bytes(hf_name, &packed, format, rows, cols)?;
         let lm_head = gguf_linear_weight_from_bytes(hf_name, &packed, format, rows, cols)?;
         return Ok((Qwen35Embedding::GgufPacked(embedding), lm_head));
@@ -772,6 +895,17 @@ fn load_gguf_qwen35_qkv_weight(
 
     let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
     if let Some(format) = gguf_packed_format(dtype) {
+        if gguf_native_q4_enabled(format) {
+            let tensor = crate::gguf::load_qwen35_qkv_matrix_bf16_host(
+                gguf,
+                hf_name,
+                layout.num_key_heads,
+                layout.num_value_heads_per_key(),
+                layout.key_head_dim,
+                layout.value_head_dim,
+            )?;
+            return native_q4_weight_from_bf16_host(hf_name, &tensor);
+        }
         let mut packed = gguf.read_tensor_raw(&gguf_name)?;
         reorder_qwen35_qkv_packed_v_rows(&mut packed, rows, cols, format, layout, hf_name)?;
         return gguf_linear_weight_from_bytes(hf_name, &packed, format, rows, cols);
@@ -800,6 +934,16 @@ fn load_gguf_v_rows_weight(
 
     let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
     if let Some(format) = gguf_packed_format(dtype) {
+        if gguf_native_q4_enabled(format) {
+            let tensor = crate::gguf::load_matrix_v_reorder_rows_bf16_host(
+                gguf,
+                hf_name,
+                layout.num_key_heads,
+                layout.num_value_heads_per_key(),
+                head_dim,
+            )?;
+            return native_q4_weight_from_bf16_host(hf_name, &tensor);
+        }
         let packed = gguf.read_tensor_raw(&gguf_name)?;
         let row_bytes = packed_row_bytes(format, cols, hf_name)?;
         let reordered = reorder_gguf_packed_v_rows(
@@ -836,6 +980,16 @@ fn load_gguf_v_cols_weight(
 
     let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
     if let Some(format) = gguf_packed_format(dtype) {
+        if gguf_native_q4_enabled(format) {
+            let tensor = crate::gguf::load_matrix_v_reorder_cols_bf16_host(
+                gguf,
+                hf_name,
+                layout.num_key_heads,
+                layout.num_value_heads_per_key(),
+                head_dim,
+            )?;
+            return native_q4_weight_from_bf16_host(hf_name, &tensor);
+        }
         let packed = gguf.read_tensor_raw(&gguf_name)?;
         let row_bytes = packed_row_bytes(format, cols, hf_name)?;
         ensure!(
@@ -3238,13 +3392,36 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
         arch.linear.value_dim,
         arch.linear.conv_kernel,
     )?;
-    log::info!(
-        "  loading Qwen3.5 GGUF on Metal; repacking Q4_K/Q5_K/Q6_K/Q8_0 weights to MLX affine"
-    );
+    match gguf_native_q4_mode() {
+        GgufNativeQ4Mode::Off => {
+            log::info!(
+                "  loading Qwen3.5 GGUF on Metal; repacking Q4_K/Q5_K/Q6_K/Q8_0 weights to exact MLX affine"
+            );
+        }
+        GgufNativeQ4Mode::HigherBit => {
+            log::info!(
+                "  loading Qwen3.5 GGUF on Metal; requantizing Q5_K/Q6_K/Q8_0 to MLX native q4 group64"
+            );
+        }
+        GgufNativeQ4Mode::All => {
+            log::info!(
+                "  loading Qwen3.5 GGUF on Metal; requantizing packed GGUF weights to MLX native q4 group64"
+            );
+        }
+    }
     if linear_layout.num_value_heads_per_key() > 1 {
-        log::info!(
-            "  grouped value heads detected; QKV/Z/B/A stay packed, out_proj reorders activations before packed matmul"
-        );
+        match gguf_native_q4_mode() {
+            GgufNativeQ4Mode::Off => {
+                log::info!(
+                    "  grouped value heads detected; QKV/Z/B/A stay packed, out_proj reorders activations before packed matmul"
+                );
+            }
+            _ => {
+                log::info!(
+                    "  grouped value heads detected; applying value-head reorder before native-q4 requantization"
+                );
+            }
+        }
     }
     let (embedding, tied_lm_head) = load_gguf_embedding(gguf, "model.embed_tokens.weight")?;
     let norm = mlx_bf16_tensor(&crate::gguf::load_vector_bf16_host(
@@ -3841,8 +4018,9 @@ mod tests {
                 .into_iter()
                 .map(f32::from)
                 .collect::<Vec<_>>();
-            let weight = gguf_linear_weight_from_bytes("dummy.weight", &raw, format, rows, cols)
-                .expect("repack GGUF K-quant to MLX affine");
+            let weight = gguf_affine_weight_from_bytes("dummy.weight", &raw, format, rows, cols)
+                .expect("repack GGUF K-quant to MLX affine")
+                .expect("expected exact affine repack");
 
             let WeightTensor::Quantized {
                 group_size, bits, ..
@@ -3895,6 +4073,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn gguf_native_q4_requantizes_to_mlx_group64() {
+        let _guard = metal_test_guard();
+        let rows = 3usize;
+        let cols = 256usize;
+        let raw = synthetic_gguf_packed(GgufPackedFormat::Q6_K, rows, cols);
+        let deq = dequant_to_bf16(&raw, GgmlType::Q6_K, rows * cols).unwrap();
+        let weight = native_q4_weight_from_bf16_host(
+            "dummy.weight",
+            &HostTensor {
+                data: deq,
+                shape: vec![rows, cols],
+            },
+        )
+        .expect("requantize GGUF weight to MLX native q4");
+
+        let WeightTensor::Quantized {
+            group_size,
+            bits,
+            w,
+            scales,
+            biases,
+        } = &weight
+        else {
+            panic!("expected native q4 quantized weight");
+        };
+        assert_eq!((*group_size, *bits), (64, 4));
+        assert_eq!(w.shape(), &[rows as i32, (cols / 8) as i32]);
+        assert_eq!(scales.shape(), &[rows as i32, (cols / 64) as i32]);
+        assert_eq!(biases.shape(), &[rows as i32, (cols / 64) as i32]);
+
+        let x = MlxArray::from_slice_f32(&vec![0.001; cols], &[1, cols as i32]);
+        let y = linear(&x, &weight);
+        eval(&[&y]);
+        assert_eq!(y.shape(), &[1, rows as i32]);
     }
 
     fn left_pad_kv_cache_row_for_test(

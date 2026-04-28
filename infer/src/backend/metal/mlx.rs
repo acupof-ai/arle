@@ -429,6 +429,30 @@ pub fn quantized_matmul(
         "mlx_quantized_matmul",
     )
 }
+
+pub fn quantize(w: &MlxArray, group_size: i32, bits: i32) -> (MlxArray, MlxArray, MlxArray) {
+    let mut out_w = std::ptr::null_mut();
+    let mut out_scales = std::ptr::null_mut();
+    let mut out_biases = std::ptr::null_mut();
+    let rc = unsafe {
+        mlx_sys::mlx_quantize(
+            w.0,
+            group_size,
+            bits,
+            std::ptr::addr_of_mut!(out_w),
+            std::ptr::addr_of_mut!(out_scales),
+            std::ptr::addr_of_mut!(out_biases),
+        )
+    };
+    if rc != 0 || out_w.is_null() || out_scales.is_null() || out_biases.is_null() {
+        match mlx_error_message() {
+            Some(msg) => panic!("mlx_quantize failed: {msg}"),
+            None => panic!("mlx_quantize failed"),
+        }
+    }
+    (MlxArray(out_w), MlxArray(out_scales), MlxArray(out_biases))
+}
+
 pub fn dequantize(w: &MlxArray, s: &MlxArray, b: &MlxArray, gs: i32, bits: i32) -> MlxArray {
     mlx_array_from_raw_or_panic(
         unsafe { mlx_sys::mlx_dequantize(w.0, s.0, b.0, gs, bits) },

@@ -120,7 +120,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | Backend | Platform | Status | Notes |
 |---|---|:---:|---|
 | **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, FlashInfer, CUDA Graph decode, packed paged-prefill for Qwen3 / Qwen3.5. **L4 / Qwen3-4B BF16 + FP8 paged KV (auto): 197 tok/s @ c=16 / 4096-in, peak_active=16 saturated.** |
-| **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse. Qwen3.5-0.8B MLX 4bit single-request step-driver reaches 305.5 tok/s on M4 Pro 20c; GGUF Q4_K_M is 202.1 tok/s on the matched 1024/256 profile and remains a separate kernel/format gap. |
+| **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse. Qwen3.5-0.8B MLX 4bit single-request step-driver reaches 305.5 tok/s on M4 Pro 20c; GGUF Q4_K_M exact default is 202.1 tok/s direct, with an opt-in native-q4 Metal load path at 236.7 tok/s direct / 239.8 tok/s step-driver on the matched 1024/256 profile. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-identical parity, c=1..8 validated. |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a serving target. |
 
@@ -167,7 +167,7 @@ Operators who want only the serving binary can use `infer` directly (`cargo buil
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
-- **2026-04-28** — Metal `Qwen3.5-0.8B` MLX 4bit single-request step-driver now reaches **305.5 tok/s mean / 304.7 p50** on M4 Pro 20c for `1024/256`, matching the Apple-native public SOTA band. The matched GGUF `Q4_K_M` direct profile is **202.1 tok/s**, so GGUF is tracked as a separate kernel/weight-format gap. Evidence: [`docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md`](docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md).
+- **2026-04-28** — Metal `Qwen3.5-0.8B` MLX 4bit single-request step-driver reaches **305.5 tok/s mean / 304.7 p50** on M4 Pro 20c for `1024/256`, matching the Apple-native public SOTA band. GGUF `Q4_K_M` keeps the exact affine path as default at **202.1 tok/s direct**; `AGENT_INFER_METAL_GGUF_NATIVE_Q4=all` enables a lossy MLX native-q4 load path at **236.7 tok/s direct / 239.8 tok/s step-driver** on the matched profile. Evidence: [`docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md`](docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md), [`docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md`](docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md).
 - **2026-04-28** — CUDA L4 `Qwen3-4B` BF16, c=16 / 4096-in jumped from **120 → 197 tok/s (+64%)** after auto HBM-tier `chunked_prefill_size` and FP8 paged KV defaulting on L4-class GPUs. `peak_active` saturates at 16/16; +42% vs SGLang reference on the same workload. Evidence: [`docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md`](docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md). Next up: [ROADMAP.md](ROADMAP.md).
