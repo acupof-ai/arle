@@ -121,23 +121,12 @@ impl RendezvousServer {
                     peer_idx + 1
                 )
             })?;
-            stream.set_read_timeout(Some(timeout)).with_context(|| {
-                format!(
-                    "rendezvous server: set_read_timeout for rank {}",
-                    peer_idx + 1
-                )
-            })?;
-            stream.set_write_timeout(Some(timeout)).with_context(|| {
-                format!(
-                    "rendezvous server: set_write_timeout for rank {}",
-                    peer_idx + 1
-                )
-            })?;
             self.peers.push(stream);
         }
 
         for (peer_idx, stream) in self.peers.iter_mut().enumerate() {
             let rank = peer_idx + 1;
+            apply_remaining_timeout(stream, deadline, "write unique_id", rank)?;
             stream
                 .write_all(unique_id)
                 .with_context(|| format!("rendezvous server: write unique_id to rank {rank} failed (timeout or peer disconnect)"))?;
@@ -146,6 +135,7 @@ impl RendezvousServer {
         let mut ack = [0u8; 1];
         for (peer_idx, stream) in self.peers.iter_mut().enumerate() {
             let rank = peer_idx + 1;
+            apply_remaining_timeout(stream, deadline, "read barrier ack", rank)?;
             stream
                 .read_exact(&mut ack)
                 .with_context(|| format!("rendezvous server: read barrier ack from rank {rank} failed (timeout or peer disconnect)"))?;
@@ -159,6 +149,30 @@ impl RendezvousServer {
         }
         Ok(())
     }
+}
+
+/// Set per-stream read+write timeout to whatever remains until `deadline`.
+/// Bail when no time remains so the wall-clock deadline holds across the
+/// sequential write/read loops (codex R3 P2: total wall time was N × timeout
+/// instead of one timeout).
+fn apply_remaining_timeout(
+    stream: &TcpStream,
+    deadline: Instant,
+    stage: &str,
+    rank: usize,
+) -> Result<()> {
+    let now = Instant::now();
+    if now >= deadline {
+        bail!("rendezvous server: deadline exceeded before {stage} for rank {rank}");
+    }
+    let remaining = deadline - now;
+    stream.set_read_timeout(Some(remaining)).with_context(|| {
+        format!("rendezvous server: set_read_timeout for rank {rank} ({stage})")
+    })?;
+    stream.set_write_timeout(Some(remaining)).with_context(|| {
+        format!("rendezvous server: set_write_timeout for rank {rank} ({stage})")
+    })?;
+    Ok(())
 }
 
 impl RendezvousClient {
@@ -413,5 +427,62 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "deadline should fire well under 1s, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn server_total_wait_is_bounded_when_peers_stall_post_accept() {
+        // Codex R3 [P2]: prior fix only bounded accept; if N peers connect
+        // and then go silent, the per-stream timeouts could stack to N × timeout.
+        // After this fix, total wall time must stay near `timeout`, not 3×.
+        let world_size = 4;
+        let timeout = Duration::from_millis(300);
+
+        let (addr_tx, addr_rx) = sync_channel::<SocketAddr>(1);
+        let unique_id = [0x55u8; UNIQUE_ID_BYTES];
+
+        let server = thread::spawn(move || -> Duration {
+            let mut server =
+                RendezvousServer::bind("127.0.0.1:0", world_size).expect("bind listener");
+            addr_tx
+                .send(server.local_addr().expect("local_addr"))
+                .expect("send addr");
+            let started = Instant::now();
+            let result = server.rendezvous_with_timeout(&unique_id, timeout);
+            let elapsed = started.elapsed();
+            assert!(
+                result.is_err(),
+                "rendezvous must fail when peers stall post-accept"
+            );
+            elapsed
+        });
+
+        let addr = addr_rx.recv().expect("recv addr");
+        // All N-1 peers connect but never read/write. Rust drops them when
+        // the spawned threads exit, but the server should bail before that.
+        let stalled: Vec<_> = (0..(world_size - 1))
+            .map(|_| {
+                thread::spawn(move || {
+                    let s =
+                        TcpStream::connect_timeout(&addr, Duration::from_secs(1)).expect("connect");
+                    // Hold the connection open until the test ends.
+                    thread::sleep(Duration::from_secs(3));
+                    drop(s);
+                })
+            })
+            .collect();
+
+        let elapsed = run_with_timeout("post_accept_stall", Duration::from_secs(2), move || {
+            server.join().expect("server panic")
+        });
+        // Allow up to 3× timeout for scheduling jitter on busy CI; the bug
+        // would have produced N × timeout = 4 × 300ms = 1200ms+.
+        assert!(
+            elapsed < timeout * 3,
+            "total wall {elapsed:?} should be near one timeout ({timeout:?}), not stack"
+        );
+
+        for h in stalled {
+            let _ = h.join();
+        }
     }
 }
