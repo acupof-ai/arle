@@ -167,18 +167,39 @@ Typical value:
 export INFER_TRITON_PYTHON=.venv/bin/python
 ```
 
-### `INFER_CUDA_SM` (alt: `CUDA_SM`)
+### `TORCH_CUDA_ARCH_LIST` (alt: `CMAKE_CUDA_ARCHITECTURES`)
 
-Override detected CUDA SM targets. Consumed by `crates/cuda-kernels/build.rs`
-during nvcc + Triton AOT compile; falls back to `CUDA_SM`, then `nvidia-smi`,
-then `sm_80`.
+Override the CUDA SM compile targets. Uses the standard PyTorch / vLLM /
+SGLang / FlashInfer convention. Consumed by
+`crates/cuda-kernels/build.rs::detect_sm_targets`. Resolution order:
 
-Examples:
+1. `TORCH_CUDA_ARCH_LIST`
+2. `CMAKE_CUDA_ARCHITECTURES`
+3. `nvidia-smi --query-gpu=compute_cap`
+4. T1 default set `{80, 86, 89, 90}` (no T2 by default)
+
+Accepted formats (any combination per token; separators `;` `,` whitespace):
 
 ```bash
-export INFER_CUDA_SM=80
-export INFER_CUDA_SM=80,90
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"          # PyTorch native
+export TORCH_CUDA_ARCH_LIST="8.0 9.0"                  # space-separated
+export TORCH_CUDA_ARCH_LIST="80;90"                    # packed integer
+export TORCH_CUDA_ARCH_LIST="sm_80;sm_90"              # nvcc style
+export TORCH_CUDA_ARCH_LIST="9.0+PTX"                  # PyTorch +PTX suffix
+export CMAKE_CUDA_ARCHITECTURES="80;86;89;90"          # CMake alias
 ```
+
+**Tier policy** (see [`plans/sm-coverage.md`](plans/sm-coverage.md)):
+
+- T1 (default): `sm_80 / 86 / 89 / 90` — A100 / A10·3090 / L4·4090 / H100.
+- T2 (opt-in):  `sm_100 / 120` — B100·B200 / RTX 5090. Must be requested
+  explicitly via `TORCH_CUDA_ARCH_LIST`; not auto-included.
+- T3 (rejected): `sm < 80` — V100 / T4 / older. Build panics.
+
+**Difference from PyTorch.** PyTorch is best-effort (warns + skips when
+a kernel can't compile for a target SM). ARLE is hard-fail: every target
+SM must succeed for every AOT kernel, otherwise build panics with a
+suggested `TORCH_CUDA_ARCH_LIST` value that excludes the failing SM.
 
 ### `FLASHINFER_INCLUDE_DIR`
 

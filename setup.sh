@@ -390,7 +390,20 @@ do_build() {
 
     info "CUDA_HOME=$CUDA_HOME"
     info "TRITON_PYTHON=$INFER_TRITON_PYTHON"
-    info "SM targets: $(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
+    if [ -n "${TORCH_CUDA_ARCH_LIST:-}" ]; then
+        info "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST (override)"
+    elif [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
+        info "CMAKE_CUDA_ARCHITECTURES=$CMAKE_CUDA_ARCHITECTURES (override)"
+    else
+        local detected
+        detected=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr '\n' ' ')
+        if [ -n "$detected" ]; then
+            info "SM targets (auto-detect from nvidia-smi): $detected"
+        else
+            info "SM targets: T1 default {sm_80, sm_86, sm_89, sm_90}"
+            info "  set TORCH_CUDA_ARCH_LIST to override; see docs/plans/sm-coverage.md"
+        fi
+    fi
 
     local start
     start=$(date +%s)

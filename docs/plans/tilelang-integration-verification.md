@@ -33,16 +33,19 @@ decision.
 | H100 | 9.0 (sm_90) | Primary. TileLang's TMA / WGMMA / warp-spec leverage fires here.                          | Yes — §5 thresholds calibrated for this. |
 | L4   | 8.9 (sm_89) | Risk-gate + compatibility regression. Cheap pre-flight before booking H100 time.          | No — record as floor only; do not cite to ship Phase 1 or revert Phase 0. |
 
-Build picks the SM via `INFER_CUDA_SM` (overrides `nvidia-smi` auto-
-detect):
+Build picks the SM via `TORCH_CUDA_ARCH_LIST` (overrides `nvidia-smi`
+auto-detect; `CMAKE_CUDA_ARCHITECTURES` works as alias):
 
 ```bash
 # H100
-INFER_CUDA_SM=90 cargo build --release --features cuda,tilelang-attn
+TORCH_CUDA_ARCH_LIST="9.0" cargo build --release --features cuda,tilelang-attn
 
 # L4
-INFER_CUDA_SM=89 cargo build --release --features cuda,tilelang-attn
+TORCH_CUDA_ARCH_LIST="8.9" cargo build --release --features cuda,tilelang-attn
 ```
+
+For the multi-SM rollout that supersedes the per-host single-SM build,
+see [`sm-coverage.md`](sm-coverage.md).
 
 Cubins land under `target/release/build/cuda-kernels-*/out/tilelang_aot/<config>/<name>.cubin`
 and are SM-specific. A cubin built for sm_90 will fail
@@ -81,7 +84,8 @@ Today each binary is single-SM. Three options if Phase 0 ships:
    logic. More verbose than fatbin and equivalent in function. Skip.
 
 Phase 0 verification doesn't need any of this — pick a host, set
-`INFER_CUDA_SM`, build, verify, move on.
+`TORCH_CUDA_ARCH_LIST`, build, verify, move on. The per-SM cubin
+fanout (option 2) is the shape adopted by [`sm-coverage.md`](sm-coverage.md).
 
 ---
 

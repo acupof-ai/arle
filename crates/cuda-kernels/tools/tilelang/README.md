@@ -45,11 +45,15 @@ export INFER_TILELANG_PYTHON=$PWD/crates/cuda-kernels/tools/tilelang/.venv/bin/p
 The build also probes `crates/cuda-kernels/tools/tilelang/.venv/bin/python`
 and `.venv/bin/python` before falling back to `python3` / `python`.
 
-If `nvidia-smi` is unavailable where you build, set the target SM manually:
+If `nvidia-smi` is unavailable where you build, set the target SM manually
+via the standard PyTorch env var:
 
 ```bash
-export INFER_CUDA_SM=90
+export TORCH_CUDA_ARCH_LIST="9.0"               # H100 only
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"   # T1 fat binary
 ```
+
+See [`docs/plans/sm-coverage.md`](../../../../docs/plans/sm-coverage.md) for tier policy.
 
 ## Build
 

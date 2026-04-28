@@ -104,14 +104,15 @@ jobs:
 
       - name: Build infer + bench_serving (CUDA)
         env:
-          # No GPU on CI runners — pin SM targets to avoid nvidia-smi panic.
-          # sm_80 (Ampere/A100) + sm_90 (Hopper/H100) covers common deployments.
-          INFER_CUDA_SM: '80,90'
+          # No GPU on CI runners — pin SM targets to avoid nvidia-smi probing.
+          # T1 set: sm_80 (A100) + sm_86 (A10/3090) + sm_89 (L4/4090) + sm_90 (H100).
+          # See docs/plans/sm-coverage.md for tier policy.
+          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
         run: cargo build --release --features cuda -p infer
 
       - name: Build ARLE CLI (CUDA)
         env:
-          INFER_CUDA_SM: '80,90'
+          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
         run: cargo build --release --features cli -p agent-infer --bin arle
 
       - name: Package Linux artifacts

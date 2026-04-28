@@ -30,10 +30,26 @@ Project framing lives in [index.md §Current Positioning](index.md#current-posit
 | macOS Apple Silicon | Metal | Beta | CI checks and tests Metal/no-cuda surfaces. |
 | Linux/macOS without GPU | no-cuda | Development-oriented CPU backend | Unit tests, compile checks, and CPU backend smoke validation. |
 
+### CUDA GPU / SM Matrix
+
+Tier policy and rationale: see [`plans/sm-coverage.md`](plans/sm-coverage.md).
+Env var contract: see [`environment.md`](environment.md) §`TORCH_CUDA_ARCH_LIST`.
+
+| Tier | SM | Representative GPUs | Status | Default-built |
+| --- | --- | --- | --- | --- |
+| T1 | sm_80 | A100 40/80GB | Supported | yes |
+| T1 | sm_86 | A10, RTX 3090, A40, A6000 | Supported | yes |
+| T1 | sm_89 | L4, RTX 4090, L40 | Supported | yes |
+| T1 | sm_90 | H100, H200 | Supported | yes |
+| T2 | sm_100 | B100, B200 | Beta — opt-in via `TORCH_CUDA_ARCH_LIST` | no |
+| T2 | sm_120 | RTX 5090, RTX PRO 6000 | Beta — opt-in via `TORCH_CUDA_ARCH_LIST` | no |
+| T3 | sm < 80 | V100, T4, Pascal, older | Unsupported — build rejects | n/a |
+
 Notes:
 
 - Hosted CI does not provide full CUDA runtime correctness coverage.
 - CUDA correctness and performance still require dedicated GPU validation.
+- T1 ship gate requires four-card bench validation (sm_80 + sm_86 + sm_89 + sm_90); see [`plans/sm-coverage.md`](plans/sm-coverage.md) §5.
 
 ---
 

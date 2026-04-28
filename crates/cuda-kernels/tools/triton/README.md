@@ -42,10 +42,15 @@ or let `build.rs` auto-probe `tools/triton/.venv/bin/python` before trying `pyth
 If `nvidia-smi` is unavailable where you build, also set the target SM manually.
 
 ```bash
-export INFER_CUDA_SM=120
+export TORCH_CUDA_ARCH_LIST="12.0"        # PyTorch native, RTX 5090 only
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"  # T1 fat binary
 ```
 
-`INFER_CUDA_SM` also drives the explicit Triton AOT compile target, so it is the default escape hatch when the build environment cannot query a live GPU.
+`TORCH_CUDA_ARCH_LIST` (PyTorch / vLLM standard) drives the explicit Triton AOT
+compile target, so it is the default escape hatch when the build environment
+cannot query a live GPU. `CMAKE_CUDA_ARCHITECTURES` works as alias. See
+[`docs/plans/sm-coverage.md`](../../../../docs/plans/sm-coverage.md) for the
+full tier policy.
 
 ### Windows
 
@@ -93,8 +98,8 @@ cargo test --release add_and_add_inplace -- --nocapture
 - `Could not find a Python interpreter with Triton installed`
   - Set `INFER_TRITON_PYTHON`, or bootstrap `tools/triton/.venv` with `uv`.
 - `GPU detection failed`
-  - Set `INFER_CUDA_SM` explicitly if `nvidia-smi` is not available during build.
+  - Set `TORCH_CUDA_ARCH_LIST` explicitly if `nvidia-smi` is not available during build.
 - `Triton AOT generator failed`
-  - Re-run the build and inspect the generator stderr printed by `build.rs`; the generator accepts an explicit `cuda:<sm>:32` target derived from `INFER_CUDA_SM`.
+  - Re-run the build and inspect the generator stderr printed by `build.rs`; the generator accepts an explicit `cuda:<sm>:32` target derived from `TORCH_CUDA_ARCH_LIST`.
 - `CUDA_ERROR_NO_BINARY_FOR_GPU` or similar runtime load errors
   - Rebuild on the target GPU environment; the generated Triton cubin is target-specific.
