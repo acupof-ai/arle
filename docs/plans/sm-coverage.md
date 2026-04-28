@@ -167,6 +167,9 @@ Commit A's tier policy to be in place.
 
 ## 7 · Cross-references
 
+- [`sm-coverage-verification.md`](sm-coverage-verification.md) — full
+  step-by-step verification runbook for Phases B/C/D (build, parity, bench
+  gate, fail-recovery, T2 opt-in, rollback).
 - [`tilelang-integration-verification.md`](tilelang-integration-verification.md)
   — Phase 0 H100/L4 runbook; SM-specific bench thresholds. The §5
   ship/revert thresholds for TileLang prefill HD128 still apply per-SM
