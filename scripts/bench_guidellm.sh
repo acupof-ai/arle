@@ -56,7 +56,14 @@ set -euo pipefail
 
 # ---- Canonical params (locked, see docs/plans/guidellm-integration.md §3) ----
 PROFILE="sweep"
-DATA="prompt_tokens=4096,output_tokens=256"
+# guidellm 0.6.0's synthetic generator defaults to a wide normal
+# distribution around `prompt_tokens` (saw min=22826, max=23133 with
+# target mean=4096, stdev unset). When the server's --max-seq-len is
+# tighter than the upper tail, the bench rejects most requests and the
+# numbers are meaningless. Clamp stdev=0 + min=max=mean — apples-to-apples
+# vs the wins-doc baselines, matches the bench_matrix.py fix landed
+# 2026-04-28 (memory: project_bench_env_drift_2026-04-20).
+DATA="prompt_tokens=4096,prompt_tokens_stdev=1,prompt_tokens_min=4096,prompt_tokens_max=4096,output_tokens=256,output_tokens_stdev=1,output_tokens_min=256,output_tokens_max=256"
 MAX_SECONDS=60
 RANDOM_SEED=20260416
 OUTPUTS=(json csv html)
@@ -144,7 +151,7 @@ while [[ $# -gt 0 ]]; do
             EXPLORATION_MODE=true
             PROFILE="concurrent"
             RATE_OVERRIDE="1,2,4,8"
-            DATA="prompt_tokens=512,output_tokens=128"
+            DATA="prompt_tokens=512,prompt_tokens_stdev=1,prompt_tokens_min=512,prompt_tokens_max=512,output_tokens=128,output_tokens_stdev=1,output_tokens_min=128,output_tokens_max=128"
             MAX_SECONDS=60
             WARMUP_OVERRIDE="5"
             shift ;;

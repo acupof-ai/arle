@@ -57,15 +57,21 @@ the change.
 
 ```
 --profile sweep
---data   prompt_tokens=4096,output_tokens=256
+--data   prompt_tokens=4096,prompt_tokens_stdev=1,prompt_tokens_min=4096,prompt_tokens_max=4096,output_tokens=256,output_tokens_stdev=1,output_tokens_min=256,output_tokens_max=256
 --max-seconds 60
 --outputs json --outputs csv --outputs html
 --random-seed 20260416
 ```
 
 **Why these specific numbers:**
-- `prompt_tokens=4096,output_tokens=256` — matches the shipped wrapper and
-  the long-context / parity sweeps already used as canonical truth points.
+- `prompt_tokens=4096,output_tokens=256` plus the matching `_stdev=1` /
+  `_min=mean` / `_max=mean` clamps — the bare mean alone leaves guidellm
+  0.6.0's synthetic generator with a wide normal distribution (we observed
+  prompts up to ~23k tokens against a target of 4096). When the server's
+  `--max-seq-len` is tighter than the upper tail, most requests are
+  rejected and the bench is meaningless. The clamp pins every prompt at
+  exactly 4096 input / 256 output. (`stdev=0` is rejected by guidellm
+  pydantic with `greater_than: 0`; use the minimum `1` instead.)
   Shorter probes such as `1024/256` remain useful for focused smoke checks,
   but they are not the baseline.
 - `--max-seconds 60` — sweep visits ~6 rate points, so total ~6–10 min per
@@ -143,7 +149,7 @@ Behaviour:
         guidellm benchmark run \
             --target "$TARGET" --model "$MODEL" --processor "$PROCESSOR" \
             --profile sweep \
-            --data "prompt_tokens=4096,output_tokens=256" \
+            --data "prompt_tokens=4096,prompt_tokens_stdev=1,prompt_tokens_min=4096,prompt_tokens_max=4096,output_tokens=256,output_tokens_stdev=1,output_tokens_min=256,output_tokens_max=256" \
             --max-seconds 60 \
             --random-seed 20260416 \
             --output-dir "bench-output/$(date +%Y-%m-%d)-$LABEL/" \
@@ -197,7 +203,7 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 
 ## Canonical params
 - `--profile sweep`
-- `--data prompt_tokens=4096,output_tokens=256`
+- `--data prompt_tokens=4096,prompt_tokens_stdev=1,prompt_tokens_min=4096,prompt_tokens_max=4096,output_tokens=256,output_tokens_stdev=1,output_tokens_min=256,output_tokens_max=256`
 - `--max-seconds 60`
 - `--random-seed 20260416`
 - `--outputs json --outputs csv --outputs html`
