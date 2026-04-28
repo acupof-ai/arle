@@ -150,15 +150,15 @@ impl<M: ModelForward> Scheduler<M> {
                 self.metrics.set_kv_gpu_blocks(free, total);
             }
             // Throttled GPU memory query — at most once per second.
-            if self.last_mem_query.elapsed().as_secs() >= 1 {
-                self.last_mem_query = std::time::Instant::now();
+            if self.stats.last_mem_query.elapsed().as_secs() >= 1 {
+                self.stats.last_mem_query = std::time::Instant::now();
                 if let Ok((free, total)) =
                     crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
                 {
                     let active = (total - free) as u64;
-                    self.peak_mem_bytes = self.peak_mem_bytes.max(active);
+                    self.stats.peak_mem_bytes = self.stats.peak_mem_bytes.max(active);
                     self.metrics
-                        .set_memory_bytes(active, self.peak_mem_bytes, 0);
+                        .set_memory_bytes(active, self.stats.peak_mem_bytes, 0);
                 }
             }
 
@@ -309,8 +309,8 @@ impl<M: ModelForward> Scheduler<M> {
                 }
                 self.paged_kv_pool.free_slot(slot_idx);
 
-                self.total_completed += 1;
-                self.total_generated_tokens += gen_tokens;
+                self.stats.total_completed += 1;
+                self.stats.total_generated_tokens += gen_tokens;
                 let e2e_s = req.admitted_at.elapsed().as_secs_f64();
                 let ttft_s = req
                     .first_token_at
@@ -336,11 +336,15 @@ impl<M: ModelForward> Scheduler<M> {
                     self.waiting.len()
                 );
 
-                if self.total_completed.is_multiple_of(STATS_LOG_INTERVAL) {
+                if self
+                    .stats
+                    .total_completed
+                    .is_multiple_of(STATS_LOG_INTERVAL)
+                {
                     info!(
                         "Scheduler stats: completed={}, generated_tokens={}, active={}, waiting={}",
-                        self.total_completed,
-                        self.total_generated_tokens,
+                        self.stats.total_completed,
+                        self.stats.total_generated_tokens,
                         self.active_len(),
                         self.waiting.len()
                     );

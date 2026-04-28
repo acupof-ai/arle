@@ -446,13 +446,13 @@ impl<M: ModelForward> Scheduler<M> {
                 *ema = ALPHA * v + (1.0 - ALPHA) * *ema;
             }
         };
-        update_ema(&mut self.step_timing_decode_us, decode_us);
-        update_ema(&mut self.step_timing_emit_us, emit_us);
+        update_ema(&mut self.stats.step_timing_decode_us, decode_us);
+        update_ema(&mut self.stats.step_timing_emit_us, emit_us);
         update_ema(
-            &mut self.step_timing_prefill_us,
+            &mut self.stats.step_timing_prefill_us,
             prefill_readback_us + prefill_us,
         );
-        update_ema(&mut self.step_timing_total_us, total_us);
+        update_ema(&mut self.stats.step_timing_total_us, total_us);
 
         if total_us > 100_000 && !plan.is_idle() {
             info!(
