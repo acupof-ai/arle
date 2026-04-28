@@ -123,6 +123,23 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
         let mut engine = match LoadedInferenceEngine::load(&model_source, !args.no_cuda_graph) {
             Ok(e) => e,
             Err(err) => {
+                // Detect the specific case where a user pointed at a DFlash
+                // *draft* model — these have no tokenizer and load fails with
+                // "tokenizer.json not found", which is opaque. The picker
+                // filters them out as of 0.1.5, but `--model-path` can still
+                // hit one directly.
+                if let Some(arch) = peek_model_architecture(&model_source) {
+                    if arch == "DFlashDraftModel" {
+                        return Err(anyhow::anyhow!(
+                            "`{model_source}` is a DFlash *draft* model (architecture `DFlashDraftModel`), \
+                             not a standalone target. Drafts ship without a tokenizer and only assist \
+                             speculative decoding for a paired target.\n\
+                             Hint: load the matching target instead — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit` \
+                             for the `z-lab/Qwen3.6-35B-A3B-DFlash` draft.\n\
+                             Hint: for Apple Silicon DFlash speculative serving, see `./scripts/run_dflash.sh serve`."
+                        ));
+                    }
+                }
                 return Err(anyhow::anyhow!(
                     "failed to load model from `{model_source}`: {err:#}\n\
                      Hint: verify --model-path points to a model directory with config.json.\n\
@@ -207,6 +224,54 @@ fn resolve_max_tokens(model_path: &str, requested: usize) -> usize {
             FALLBACK
         }
     }
+}
+
+/// Best-effort peek at the model's first declared `architectures` entry from
+/// its `config.json`. Accepts either a local directory path or a HuggingFace
+/// repo id (`org/repo`); for the latter we resolve through the HF hub cache
+/// (`~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/<hash>/`) and
+/// try every snapshot dir until one yields an answer. Returns `None` on any
+/// failure — the caller falls back to the generic error path.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn peek_model_architecture(model_source: &str) -> Option<String> {
+    // 1. Local-path case: try `<source>/config.json` first.
+    if let Some(arch) = read_arch_from_dir(std::path::Path::new(model_source)) {
+        return Some(arch);
+    }
+
+    // 2. HuggingFace repo-id case: walk the hub cache for matching snapshots.
+    let (org, repo) = model_source.split_once('/')?;
+    let cache_root = hub_discovery::hub_cache_root()?;
+    let repo_dir = cache_root.join(format!(
+        "models--{}--{}",
+        org,
+        repo.replace('-', "--").replace('-', "-") // safe no-op; preserve as-is
+    ));
+    let repo_dir = if repo_dir.exists() {
+        repo_dir
+    } else {
+        // Fall back to a literal join — HF caches names verbatim with `--`
+        // for path separators only, hyphens are preserved as-is.
+        cache_root.join(format!("models--{org}--{repo}"))
+    };
+    let snapshots = std::fs::read_dir(repo_dir.join("snapshots")).ok()?;
+    for entry in snapshots.flatten() {
+        if let Some(arch) = read_arch_from_dir(&entry.path()) {
+            return Some(arch);
+        }
+    }
+    None
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn read_arch_from_dir(dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    cfg.get("architectures")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
 }
 
 /// Best-effort lookup of the model's context length. Tries, in order,
