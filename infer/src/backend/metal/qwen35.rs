@@ -169,40 +169,21 @@ fn gguf_packed_format(dtype: GgmlType) -> Option<GgufPackedFormat> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GgufNativeQ4Mode {
-    Off,
-    HigherBit,
-    All,
-}
-
-fn gguf_native_q4_mode() -> GgufNativeQ4Mode {
-    static MODE: OnceLock<GgufNativeQ4Mode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("AGENT_INFER_METAL_GGUF_NATIVE_Q4") {
+fn gguf_native_q4_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("AGENT_INFER_METAL_GGUF_NATIVE_Q4") {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "" | "0" | "off" | "false" | "exact" => GgufNativeQ4Mode::Off,
-            "high" | "higher" | "higher-bit" | "q5q6" => GgufNativeQ4Mode::HigherBit,
-            "1" | "on" | "true" | "all" | "native" | "q4" | "native-q4" => GgufNativeQ4Mode::All,
+            "" | "0" | "off" | "false" | "exact" => false,
+            "1" | "on" | "true" | "all" | "native" | "q4" | "native-q4" => true,
             other => {
                 log::warn!(
                     "unknown AGENT_INFER_METAL_GGUF_NATIVE_Q4={other:?}; using exact GGUF path"
                 );
-                GgufNativeQ4Mode::Off
+                false
             }
         },
-        Err(_) => GgufNativeQ4Mode::Off,
+        Err(_) => false,
     })
-}
-
-fn gguf_native_q4_enabled(format: GgufPackedFormat) -> bool {
-    match gguf_native_q4_mode() {
-        GgufNativeQ4Mode::Off => false,
-        GgufNativeQ4Mode::HigherBit => matches!(
-            format,
-            GgufPackedFormat::Q5_K | GgufPackedFormat::Q6_K | GgufPackedFormat::Q8_0
-        ),
-        GgufNativeQ4Mode::All => true,
-    }
 }
 
 fn gguf_dtype_for_packed_format(format: GgufPackedFormat) -> GgmlType {
@@ -729,7 +710,7 @@ fn gguf_linear_weight_from_bytes(
     rows: usize,
     cols: usize,
 ) -> Result<WeightTensor> {
-    if gguf_native_q4_enabled(format) {
+    if gguf_native_q4_enabled() {
         return gguf_native_q4_weight_from_bytes(hf_name, packed, format, rows, cols);
     }
     if let Some(weight) = gguf_affine_weight_from_bytes(hf_name, packed, format, rows, cols)? {
@@ -764,7 +745,7 @@ fn load_gguf_embedding(gguf: &GgufFile, hf_name: &str) -> Result<(Qwen35Embeddin
 
     if let Some(format) = gguf_packed_format(dtype) {
         let packed = gguf.read_tensor_raw(&gguf_name)?;
-        if gguf_native_q4_enabled(format) {
+        if gguf_native_q4_enabled() {
             let dequantized = dequant_to_bf16(
                 &packed,
                 gguf_dtype_for_packed_format(format),
@@ -895,7 +876,7 @@ fn load_gguf_qwen35_qkv_weight(
 
     let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
     if let Some(format) = gguf_packed_format(dtype) {
-        if gguf_native_q4_enabled(format) {
+        if gguf_native_q4_enabled() {
             let tensor = crate::gguf::load_qwen35_qkv_matrix_bf16_host(
                 gguf,
                 hf_name,
@@ -934,7 +915,7 @@ fn load_gguf_v_rows_weight(
 
     let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
     if let Some(format) = gguf_packed_format(dtype) {
-        if gguf_native_q4_enabled(format) {
+        if gguf_native_q4_enabled() {
             let tensor = crate::gguf::load_matrix_v_reorder_rows_bf16_host(
                 gguf,
                 hf_name,
@@ -980,7 +961,7 @@ fn load_gguf_v_cols_weight(
 
     let (gguf_name, dtype, rows, cols) = gguf_matrix_info(gguf, hf_name)?;
     if let Some(format) = gguf_packed_format(dtype) {
-        if gguf_native_q4_enabled(format) {
+        if gguf_native_q4_enabled() {
             let tensor = crate::gguf::load_matrix_v_reorder_cols_bf16_host(
                 gguf,
                 hf_name,
@@ -3392,35 +3373,25 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
         arch.linear.value_dim,
         arch.linear.conv_kernel,
     )?;
-    match gguf_native_q4_mode() {
-        GgufNativeQ4Mode::Off => {
-            log::info!(
-                "  loading Qwen3.5 GGUF on Metal; repacking Q4_K/Q5_K/Q6_K/Q8_0 weights to exact MLX affine"
-            );
-        }
-        GgufNativeQ4Mode::HigherBit => {
-            log::info!(
-                "  loading Qwen3.5 GGUF on Metal; requantizing Q5_K/Q6_K/Q8_0 to MLX native q4 group64"
-            );
-        }
-        GgufNativeQ4Mode::All => {
-            log::info!(
-                "  loading Qwen3.5 GGUF on Metal; requantizing packed GGUF weights to MLX native q4 group64"
-            );
-        }
+    let native_q4 = gguf_native_q4_enabled();
+    if native_q4 {
+        log::info!(
+            "  loading Qwen3.5 GGUF on Metal; requantizing packed GGUF weights to MLX native q4 group64"
+        );
+    } else {
+        log::info!(
+            "  loading Qwen3.5 GGUF on Metal; repacking Q4_K/Q5_K/Q6_K/Q8_0 weights to exact MLX affine"
+        );
     }
     if linear_layout.num_value_heads_per_key() > 1 {
-        match gguf_native_q4_mode() {
-            GgufNativeQ4Mode::Off => {
-                log::info!(
-                    "  grouped value heads detected; QKV/Z/B/A stay packed, out_proj reorders activations before packed matmul"
-                );
-            }
-            _ => {
-                log::info!(
-                    "  grouped value heads detected; applying value-head reorder before native-q4 requantization"
-                );
-            }
+        if native_q4 {
+            log::info!(
+                "  grouped value heads detected; applying value-head reorder before native-q4 requantization"
+            );
+        } else {
+            log::info!(
+                "  grouped value heads detected; QKV/Z/B/A stay packed, out_proj reorders activations before packed matmul"
+            );
         }
     }
     let (embedding, tied_lm_head) = load_gguf_embedding(gguf, "model.embed_tokens.weight")?;
