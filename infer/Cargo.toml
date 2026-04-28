@@ -75,7 +75,7 @@ qwen35-spec = { path = "../crates/qwen35-spec" }
 # for the root cause analysis. Re-enable explicitly via
 # `--features cuda,tilelang-attn` only when ALL prompts are guaranteed
 # `qlen >= 64` (e.g. the canonical c=16/4096-in bench).
-cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda"]
+cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda", "tilelang-attn"]
 # Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = ["cuda-kernels/no-cuda"]
 # TileLang prefill HD128 attention path. Always-on under `cuda`; this

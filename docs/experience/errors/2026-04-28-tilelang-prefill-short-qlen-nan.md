@@ -29,7 +29,46 @@ produces uniform-NaN logits → softmax uniform → argmax = token 0 = `"!"`.
 The kernel was bench-only validated at `qlen=4096` so the partial-tile
 regime was never exercised before e2e short-prompt verification.
 
-## Fix attempted (failed) and resolution
+## Real fix (one line)
+
+**Update 2026-04-28 (later)**: A general-purpose subagent dug deeper and
+found the actual root cause was NOT the score-mask `-inf` propagation
+(my hypothesis) but the running-softmax accumulator `m_new` reading
+uninitialized stack memory:
+
+```python
+T.reduce_max(scores, m_new, dim=1, clear=False)  # WRONG
+```
+
+With `clear=False`, TileLang codegen emits
+`m_new[i] = max(m_new[i], m_new_clear[i])` which reads `m_new` BEFORE
+writing to combine — that's stack garbage on the first iteration. Any
+non-zero / NaN garbage leaks into `m_new` even on valid rows, then
+propagates through `exp2(scores - m_new)` → `p_bf16 @ v_tile` → final
+acc_o → logits → uniform argmax = token 0 = "!".
+
+**Fix**: change to `clear=True`. The agent verified pre/post via
+diffing the generated `device_kernel.cu` at
+`target/release/build/cuda-kernels-*/out/tilelang_aot/.../*.cu`:
+
+- Pre-fix: `m_new[i_6] = max(m_new[i_6], m_new_clear[i_6]);` (uninit read)
+- Post-fix: `m_new[i_6] = -CUDART_INF_F;` (proper init)
+
+E2e validation: all 6 baseline prompts produce coherent text matching
+the HF reference for the first 5–15 tokens, then exhibit the
+pre-existing greedy drift. No "!!!" / token 0 / NaN.
+
+**Lessons that still apply** (the rules below):
+- The "bench is not a correctness test" rule was triggered.
+- The "validate across qlen regimes" rule was triggered.
+- The "AOT cubin opacity" caveat was wrong on this kernel — TileLang's
+  content-hash cache + `cargo:rerun-if-changed=tools/tilelang/*.py`
+  cooperate fine. My earlier "identical logprobs" symptom was real
+  iteration of fixes 2 and 3 already in cubins; I was patching a
+  non-bug. The actual cubin DID change each time — I just hadn't
+  fixed the right line.
+
+## Original fix attempted (failed) and resolution
 
 **Attempted kernel fixes (none of which produced different logprobs)**:
 
