@@ -97,17 +97,20 @@ Two rounds of `codex review --base f3fc63a` post-push:
 - [P3] `crates/cli/src/repl.rs:1009` ANSI escape under non-TTY —
   **not in this F0 diff**. Concurrent ckl work; left to ckl.
 
-**R2 latent — must land before F1:**
-- [P1] `ffi::cublas_init()` initializes process-global cuBLAS
-  handles in `gemv.cu`. F0's `on_device(ordinal)` API is the
-  trigger surface, but no F0 caller uses it from a second thread,
-  so single-GPU is unaffected. F1's `TpModelWorker` rank threads
-  WILL hit this — the bug surfaces as cuBLAS calls using a handle
-  bound to GPU 0's stream while CUDA context is on GPU 1. Fix
-  before F1 lands: per-device cuBLAS handle/workspace map, or TLS
-  init keyed by `cu_device()`. Reference: vLLM and SGLang both
-  treat cuBLAS state as per-device by construction (initialized
-  inside the per-rank worker after device set).
+**R2 [P1] resolved in F0:**
+- [P1] `ffi::cublas_init()` was process-global (single
+  `cublasHandle_t g_cublas_handle` etc. in `gemv.cu`). Fixed by
+  refactoring all 7 globals (handle / prefill_handle / lt_handle /
+  cublas_workspace / cublaslt_workspace / algo_cache / graphsafe_mode)
+  into a per-device `CublasDeviceState` struct, indexed by
+  `cudaGetDevice()` ordinal. Hot-path lookup uses thread-local
+  cache to avoid mutex contention. The `graphsafe` flag became a
+  function parameter on `gemm_cublaslt_impl` (cleaner than a
+  thread_local). Single-GPU (F0 default) path is byte-equivalent
+  — only ordinal 0 ever populates the map. F1 multi-rank threads
+  will each cublas_init() after `on_device(ordinal)` and get
+  isolated per-device state. Reference: vLLM and SGLang both
+  treat cuBLAS state as per-device by construction.
 
 ## Rule
 
