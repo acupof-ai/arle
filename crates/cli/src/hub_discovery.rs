@@ -13,6 +13,15 @@ use std::time::SystemTime;
 /// Keep in sync with `docs/support-matrix.md`.
 const SUPPORTED_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "qwen3.5"];
 
+/// Architectures the picker must never offer as a primary, standalone model.
+///
+/// `DFlashDraftModel` is the speculative-decoding *draft* half of a DFlash
+/// pair — it has no tokenizer and only ~5–8 layers, so loading it as a
+/// target produces a confusing "tokenizer.json not found" error. The
+/// repo names match `qwen3*` so the substring filter alone lets them
+/// through; the only honest signal lives in `config.json#architectures`.
+const DRAFT_ONLY_ARCHITECTURES: &[&str] = &["DFlashDraftModel"];
+
 /// A discovered HuggingFace-cache snapshot ready for the picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HubSnapshot {
@@ -66,6 +75,28 @@ fn snapshot_has_usable_content(path: &Path) -> bool {
     path.join("config.json").exists() || path.join("model.safetensors").exists()
 }
 
+/// Read `<path>/config.json` and return `true` if its `architectures` list
+/// contains any draft-only architecture (see `DRAFT_ONLY_ARCHITECTURES`).
+/// Best-effort: returns `false` on any parse / read failure so a malformed
+/// config doesn't accidentally hide a usable target model.
+fn snapshot_is_draft_only(path: &Path) -> bool {
+    let cfg = path.join("config.json");
+    let Ok(raw) = fs::read_to_string(&cfg) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(archs) = v.get("architectures").and_then(|a| a.as_array()) else {
+        return false;
+    };
+    archs.iter().any(|item| {
+        item.as_str()
+            .map(|s| DRAFT_ONLY_ARCHITECTURES.contains(&s))
+            .unwrap_or(false)
+    })
+}
+
 fn snapshot_mtime(path: &Path) -> SystemTime {
     fs::metadata(path)
         .and_then(|m| m.modified())
@@ -108,6 +139,11 @@ pub(crate) fn discover_hub_snapshots() -> Vec<HubSnapshot> {
                 continue;
             };
             if !is_family_supported(&model_id) {
+                continue;
+            }
+            // Reject draft-only / non-servable architectures (e.g. DFlash
+            // speculative drafts that ship without a tokenizer).
+            if snapshot_is_draft_only(&snap_path) {
                 continue;
             }
             out.push(HubSnapshot {
@@ -168,5 +204,44 @@ mod tests {
         assert!(is_family_supported("Qwen/Qwen2.5-7B"));
         assert!(!is_family_supported("mistralai/Mistral-7B"));
         assert!(!is_family_supported("meta-llama/Llama-3-8B"));
+    }
+
+    fn write_config(json: &str) -> tempfile::TempDir {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut f = std::fs::File::create(dir.path().join("config.json")).expect("create");
+        f.write_all(json.as_bytes()).expect("write");
+        dir
+    }
+
+    #[test]
+    fn snapshot_is_draft_only_detects_dflash_draft_architecture() {
+        // Real DFlash draft config from z-lab/Qwen3.6-35B-A3B-DFlash.
+        let dir = write_config(r#"{"architectures": ["DFlashDraftModel"], "model_type": "qwen3"}"#);
+        assert!(super::snapshot_is_draft_only(dir.path()));
+    }
+
+    #[test]
+    fn snapshot_is_draft_only_passes_normal_target_models() {
+        let dir = write_config(r#"{"architectures": ["Qwen3ForCausalLM"]}"#);
+        assert!(!super::snapshot_is_draft_only(dir.path()));
+
+        let dir = write_config(r#"{"architectures": ["Qwen3_5MoeForConditionalGeneration"]}"#);
+        assert!(!super::snapshot_is_draft_only(dir.path()));
+    }
+
+    #[test]
+    fn snapshot_is_draft_only_handles_missing_or_malformed_config() {
+        // No config at all → don't hide the snapshot defensively.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!super::snapshot_is_draft_only(dir.path()));
+
+        // Malformed JSON → same: don't hide.
+        let dir = write_config("not json {{{");
+        assert!(!super::snapshot_is_draft_only(dir.path()));
+
+        // Architectures missing → don't hide.
+        let dir = write_config(r#"{"model_type": "qwen3"}"#);
+        assert!(!super::snapshot_is_draft_only(dir.path()));
     }
 }
