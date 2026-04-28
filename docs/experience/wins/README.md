@@ -32,7 +32,7 @@ and writing a fresh file would lose the trail.
 | Area | Latest validated entry |
 | --- | --- |
 | Metal Qwen3.5 MLX 4bit single request | [`2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md`](2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md) — Qwen3.5-0.8B MLX 4bit, step-driver 1024/256, 305.5 tok/s mean / 304.7 p50 on M4 Pro 20c. |
-| Metal Qwen3.5 GGUF matched regression | [`2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md`](2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md) — Qwen3.5-0.8B GGUF Q4_K_M, direct 1024/256, 202.1 tok/s mean / 202.6 p50 on M4 Pro 20c. |
+| Metal Qwen3.5 GGUF native-q4 opt-in | [`2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md`](2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md) — Qwen3.5-0.8B GGUF Q4_K_M, opt-in native-q4 load path, direct 1024/256 at 236.7 tok/s mean / 237.3 p50 and step-driver at 239.8 mean / 240.6 p50 on M4 Pro 20c; exact default remains 202.1 tok/s direct. |
 | Metal Qwen3.6 DFlash check | [`2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md`](2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md) — Qwen3.6-35B-A3B short load/execute diagnostic; not DFlash performance acceptance. |
 
 ---
