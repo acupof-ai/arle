@@ -69,6 +69,10 @@ impl Default for InferenceEngineOptions {
 pub struct ServerRuntimeConfig {
     pub engine: InferenceEngineOptions,
     pub scheduler: SchedulerConfig,
+    /// Operator-supplied prefill envelope. Fields left at `None` are
+    /// resolved against the live GPU's HBM size (SGLang-style tier table)
+    /// just before the scheduler is constructed.
+    pub runtime_envelope: crate::scheduler::RuntimeEnvelopeOverrides,
     pub seed: u64,
     pub max_seq_len: Option<usize>,
     /// KV cache quantization dtype for contiguous cache (single-request path).
@@ -83,6 +87,7 @@ impl Default for ServerRuntimeConfig {
         Self {
             engine: InferenceEngineOptions::default(),
             scheduler: SchedulerConfig::runtime_defaults(4),
+            runtime_envelope: crate::scheduler::RuntimeEnvelopeOverrides::default(),
             seed: 42,
             max_seq_len: None,
             kv_cache_dtype: crate::model::kv_cache::KVCacheDtype::BF16,
@@ -302,13 +307,19 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     } = components;
 
     let ServerRuntimeConfig {
-        scheduler,
+        mut scheduler,
+        runtime_envelope,
         seed,
         max_seq_len,
         kv_cache_dtype,
         kv_pool_format,
         ..
     } = runtime;
+
+    let gpu_total_bytes = crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
+        .map(|(_free, total)| total)
+        .unwrap_or(0);
+    scheduler.resolve_runtime_envelope(runtime_envelope, gpu_total_bytes);
 
     let (scheduler, handle) = Scheduler::with_config(
         model,
