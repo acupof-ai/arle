@@ -431,9 +431,14 @@ mod tests {
 
     #[test]
     fn server_total_wait_is_bounded_when_peers_stall_post_accept() {
-        // Codex R3 [P2]: prior fix only bounded accept; if N peers connect
-        // and then go silent, the per-stream timeouts could stack to N × timeout.
-        // After this fix, total wall time must stay near `timeout`, not 3×.
+        // Spec lock for codex R3 [P2]: rendezvous wall time stays bounded by
+        // `timeout` even when N peers connect then go silent. (Codex R4 [P3]
+        // noted this scenario doesn't differentiate old vs new — both bail on
+        // the first read timeout. The test still locks the post-fix invariant
+        // that `rendezvous_with_timeout` honors its single advertised deadline.
+        // A test that exercises the N×timeout stacking regression directly
+        // would need peers synchronized to server's read order, which is more
+        // protocol than this rendezvous warrants.)
         let world_size = 4;
         let timeout = Duration::from_millis(300);
 
@@ -448,23 +453,19 @@ mod tests {
                 .expect("send addr");
             let started = Instant::now();
             let result = server.rendezvous_with_timeout(&unique_id, timeout);
-            let elapsed = started.elapsed();
             assert!(
                 result.is_err(),
                 "rendezvous must fail when peers stall post-accept"
             );
-            elapsed
+            started.elapsed()
         });
 
         let addr = addr_rx.recv().expect("recv addr");
-        // All N-1 peers connect but never read/write. Rust drops them when
-        // the spawned threads exit, but the server should bail before that.
         let stalled: Vec<_> = (0..(world_size - 1))
             .map(|_| {
                 thread::spawn(move || {
                     let s =
                         TcpStream::connect_timeout(&addr, Duration::from_secs(1)).expect("connect");
-                    // Hold the connection open until the test ends.
                     thread::sleep(Duration::from_secs(3));
                     drop(s);
                 })
@@ -474,11 +475,9 @@ mod tests {
         let elapsed = run_with_timeout("post_accept_stall", Duration::from_secs(2), move || {
             server.join().expect("server panic")
         });
-        // Allow up to 3× timeout for scheduling jitter on busy CI; the bug
-        // would have produced N × timeout = 4 × 300ms = 1200ms+.
         assert!(
-            elapsed < timeout * 3,
-            "total wall {elapsed:?} should be near one timeout ({timeout:?}), not stack"
+            elapsed < timeout * 2,
+            "total wall {elapsed:?} should stay near one timeout ({timeout:?})"
         );
 
         for h in stalled {
