@@ -1245,6 +1245,19 @@ fn execute_prefill_chunk(
         return;
     }
 
+    if let Err((owner_req_id, err)) = drain_other_qwen35_cpp_sessions(req_id, active) {
+        error!(
+            "Metal prefill session handoff failed before prefilling {:?}: owner {:?}: {err:#}",
+            req_id, owner_req_id
+        );
+        metrics.record_request_failed();
+        if owner_req_id != req_id {
+            cancel_request(owner_req_id, scheduler, active);
+        }
+        cancel_request(req_id, scheduler, active);
+        return;
+    }
+
     // DFlash requires full-prompt prefill in one shot because
     // `qwen3_forward_with_hidden_states` captures hidden states for all
     // positions — chunked KV-only prefill can't produce them. Override the
@@ -1315,6 +1328,30 @@ fn execute_prefill_chunk(
             cancel_request(req_id, scheduler, active);
         }
     }
+}
+
+fn drain_other_qwen35_cpp_sessions(
+    prefill_req_id: RequestId,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) -> std::result::Result<(), (RequestId, anyhow::Error)> {
+    for (req_id, request) in active.iter_mut() {
+        if *req_id == prefill_req_id {
+            continue;
+        }
+        let drained = request
+            .request_state
+            .drain_qwen35_cpp_session()
+            .with_context(|| format!("drain Qwen3.5 C++ session for {req_id:?}"))
+            .map_err(|err| (*req_id, err))?;
+        if drained {
+            log::debug!(
+                "Metal drained Qwen3.5 C++ session for {:?} before prefilling {:?}",
+                req_id,
+                prefill_req_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn execute_decode_batch(
@@ -1733,6 +1770,19 @@ fn execute_decode_single(
         Failed(anyhow::Error),
     }
 
+    if let Err((owner_req_id, err)) = drain_other_qwen35_cpp_sessions(req_id, active) {
+        error!(
+            "Metal decode session handoff failed before decoding {:?}: owner {:?}: {err:#}",
+            req_id, owner_req_id
+        );
+        metrics.record_request_failed();
+        if owner_req_id != req_id {
+            cancel_request(owner_req_id, scheduler, active);
+        }
+        cancel_detached_request(req_id, request, scheduler);
+        return;
+    }
+
     let outcome = if request.delta_closed() {
         Outcome::ClientDropped
     } else {
@@ -1945,6 +1995,7 @@ fn scheduler_runtime_states(
                 }
             },
             prompt_progress: request.request_state.prompt_progress(),
+            generated_tokens: request.request_state.generated_tokens(),
             last_token: request.request_state.last_token(),
         })
         .collect()

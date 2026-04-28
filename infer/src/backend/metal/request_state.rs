@@ -670,6 +670,21 @@ impl<'a> MetalRequestState<'a> {
         matches!(self.inner, MetalRequestStateInner::Qwen35(_))
     }
 
+    /// Drain a live Qwen3.5 C++ session back into this request's owned state.
+    ///
+    /// The compiled MLX model supports exactly one active session at a time.
+    /// Runtime code calls this before starting another Qwen3.5 request's
+    /// prefill so scalar decode and prefill cannot overlap through nested
+    /// `qwen35_session_begin` calls.
+    pub(crate) fn drain_qwen35_cpp_session(&mut self) -> Result<bool> {
+        let MetalRequestStateInner::Qwen35(state) = &mut self.inner else {
+            return Ok(false);
+        };
+        let was_active = state.driver.cpp_session_active();
+        state.driver.ensure_cpp_session_drained()?;
+        Ok(was_active)
+    }
+
     pub fn finish_reason(&self) -> Option<&'static str> {
         match &self.inner {
             MetalRequestStateInner::Qwen3(state) => state.finish_reason(),

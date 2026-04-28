@@ -12,6 +12,13 @@ use std::sync::Arc;
 use crate::events::{EngineEvent, EventSink, NoopEventSink};
 use crate::types::{InferenceMode, RequestEventKind, RequestId};
 
+#[path = "plan.rs"]
+mod plan;
+
+pub use self::plan::{
+    MetalLogicalBatchShape, MetalLogicalDecodeRow, MetalLogicalPrefillRow, MetalLogicalServePlan,
+};
+
 /// Request priority used by the Metal scheduler.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub enum MetalRequestPriority {
@@ -72,6 +79,7 @@ pub struct MetalRuntimeRequestState {
     pub req_id: RequestId,
     pub phase: MetalRequestPhase,
     pub prompt_progress: usize,
+    pub generated_tokens: usize,
     pub last_token: Option<u32>,
 }
 
@@ -133,11 +141,43 @@ pub struct MetalPrefillChunk {
 pub struct MetalScheduleStep {
     pub decode: Option<MetalDecodeBatch>,
     pub prefill: Option<MetalPrefillChunk>,
+    plan: MetalLogicalServePlan,
 }
 
 impl MetalScheduleStep {
     pub fn is_idle(&self) -> bool {
-        self.decode.is_none() && self.prefill.is_none()
+        self.plan.is_idle()
+    }
+
+    pub fn logical_plan(&self) -> &MetalLogicalServePlan {
+        &self.plan
+    }
+
+    pub fn batch_shape(&self) -> MetalLogicalBatchShape {
+        self.plan.batch_shape
+    }
+
+    fn from_logical_plan(plan: MetalLogicalServePlan) -> Self {
+        debug_assert!(
+            plan.prefill_rows.len() <= 1,
+            "legacy MetalScheduleStep supports at most one prefill row"
+        );
+        let decode = (!plan.decode_rows.is_empty()).then(|| MetalDecodeBatch {
+            req_ids: plan.decode_rows.iter().map(|row| row.req_id).collect(),
+            input_tokens: plan.decode_rows.iter().map(|row| row.input_token).collect(),
+        });
+        let prefill = plan.prefill_rows.first().map(|row| MetalPrefillChunk {
+            req_id: row.req_id,
+            input_tokens: row.input_tokens.clone(),
+            prompt_start: row.prompt_start,
+            prompt_end: row.prompt_end,
+            prompt_len: row.prompt_len,
+        });
+        Self {
+            decode,
+            prefill,
+            plan,
+        }
     }
 }
 
@@ -228,13 +268,8 @@ impl MetalScheduler {
     /// Prefill is chunked so it can be interleaved with decode.
     pub fn step(&mut self, runtime_states: &[MetalRuntimeRequestState]) -> MetalScheduleStep {
         self.validate_runtime_snapshots(runtime_states);
-        let decode_batch = self.build_decode_batch(runtime_states);
-        let prefill_chunk = self.build_prefill_chunk(runtime_states);
-        let decode = (!decode_batch.req_ids.is_empty()).then_some(decode_batch);
-        MetalScheduleStep {
-            decode,
-            prefill: prefill_chunk,
-        }
+        let plan = self.build_logical_plan(runtime_states);
+        MetalScheduleStep::from_logical_plan(plan)
     }
 
     /// Explicitly finish a request, releasing all scheduler bookkeeping.
@@ -286,8 +321,23 @@ impl MetalScheduler {
         Ok(())
     }
 
-    fn build_decode_batch(&self, runtime_states: &[MetalRuntimeRequestState]) -> MetalDecodeBatch {
-        let mut states: Vec<(&MetalRequestState, u32)> = Vec::new();
+    fn build_logical_plan(
+        &mut self,
+        runtime_states: &[MetalRuntimeRequestState],
+    ) -> MetalLogicalServePlan {
+        let decode_rows = self.build_decode_rows(runtime_states);
+        let prefill_rows = self
+            .build_prefill_row(runtime_states, decode_rows.len())
+            .into_iter()
+            .collect();
+        MetalLogicalServePlan::new(decode_rows, prefill_rows)
+    }
+
+    fn build_decode_rows(
+        &self,
+        runtime_states: &[MetalRuntimeRequestState],
+    ) -> Vec<MetalLogicalDecodeRow> {
+        let mut states: Vec<(&MetalRequestState, u32, usize)> = Vec::new();
         for state in self.requests.values() {
             if !state.admitted {
                 continue;
@@ -310,23 +360,27 @@ impl MetalScheduler {
                     state.req_id
                 )
             });
-            states.push((state, last_token));
+            let logical_offset = runtime
+                .prompt_progress
+                .saturating_add(runtime.generated_tokens.saturating_sub(1));
+            states.push((state, last_token, logical_offset));
         }
-        states.sort_by(|(a, _), (b, _)| compare_decode_order(a, b));
+        states.sort_by(|(a, _, _), (b, _, _)| compare_decode_order(a, b));
 
-        let req_ids = states.iter().map(|(state, _)| state.req_id).collect();
-        let input_tokens = states.into_iter().map(|(_, token)| token).collect();
-
-        MetalDecodeBatch {
-            req_ids,
-            input_tokens,
-        }
+        states
+            .into_iter()
+            .enumerate()
+            .map(|(row_index, (state, input_token, logical_offset))| {
+                MetalLogicalDecodeRow::new(row_index, state.req_id, input_token, logical_offset)
+            })
+            .collect::<Vec<_>>()
     }
 
-    fn build_prefill_chunk(
+    fn build_prefill_row(
         &mut self,
         runtime_states: &[MetalRuntimeRequestState],
-    ) -> Option<MetalPrefillChunk> {
+        row_index: usize,
+    ) -> Option<MetalLogicalPrefillRow> {
         let decode_count = Self::count_decode_runtime(runtime_states);
         let chunk_cap = self.prefill_chunk_budget(decode_count);
         if chunk_cap == 0 {
@@ -377,13 +431,14 @@ impl MetalScheduler {
             );
         }
 
-        Some(MetalPrefillChunk {
+        Some(MetalLogicalPrefillRow::new(
+            row_index,
             req_id,
             input_tokens,
             prompt_start,
             prompt_end,
             prompt_len,
-        })
+        ))
     }
 
     fn validate_runtime_snapshots(&self, runtime_states: &[MetalRuntimeRequestState]) {
@@ -508,10 +563,27 @@ mod tests {
         prompt_progress: usize,
         last_token: Option<u32>,
     ) -> MetalRuntimeRequestState {
+        rt_with_generated(
+            req_id,
+            phase,
+            prompt_progress,
+            usize::from(last_token.is_some()),
+            last_token,
+        )
+    }
+
+    fn rt_with_generated(
+        req_id: RequestId,
+        phase: MetalRequestPhase,
+        prompt_progress: usize,
+        generated_tokens: usize,
+        last_token: Option<u32>,
+    ) -> MetalRuntimeRequestState {
         MetalRuntimeRequestState {
             req_id,
             phase,
             prompt_progress,
+            generated_tokens,
             last_token,
         }
     }
@@ -592,6 +664,71 @@ mod tests {
         assert_eq!(prefill.input_tokens, vec![5, 6, 7]);
         assert_eq!(prefill.prompt_start, 0);
         assert_eq!(prefill.prompt_end, 3);
+    }
+
+    #[test]
+    fn logical_plan_captures_mixed_batch_shape() {
+        let mut sched = make_scheduler(2, 4);
+        let req0 = sched
+            .submit(vec![1, 2, 3, 4], 8, MetalRequestPriority::Normal)
+            .expect("submit req0");
+        let req1 = sched
+            .submit(vec![5, 6, 7, 8, 9], 8, MetalRequestPriority::Normal)
+            .expect("submit req1");
+
+        let _ = expect_prefill_only(sched.step(&[]));
+
+        let step = sched.step(&[rt(req0, MetalRequestPhase::Decoding, 4, Some(11))]);
+        let plan = step.logical_plan();
+        assert_eq!(
+            plan.batch_shape,
+            MetalLogicalBatchShape {
+                decode_rows: 1,
+                prefill_rows: 1,
+                total_rows: 2,
+                decode_tokens: 1,
+                prefill_tokens: 3,
+                scheduled_tokens: 4,
+            }
+        );
+        assert_eq!(
+            plan.decode_rows,
+            vec![MetalLogicalDecodeRow::new(0, req0, 11, 4)]
+        );
+        assert_eq!(
+            plan.prefill_rows,
+            vec![MetalLogicalPrefillRow::new(1, req1, vec![5, 6, 7], 0, 3, 5,)]
+        );
+    }
+
+    #[test]
+    fn logical_decode_offsets_follow_runtime_generated_tokens() {
+        let mut sched = make_scheduler(1, 4);
+        let req = sched
+            .submit(vec![1, 2, 3, 4], 8, MetalRequestPriority::Normal)
+            .expect("submit");
+
+        let _ = expect_prefill_only(sched.step(&[]));
+
+        let first_step = sched.step(&[rt(req, MetalRequestPhase::Decoding, 4, Some(11))]);
+        assert_eq!(
+            first_step.logical_plan().decode_rows,
+            vec![MetalLogicalDecodeRow::new(0, req, 11, 4)]
+        );
+        let first = expect_decode_only(first_step);
+        assert_eq!(first.req_ids, vec![req]);
+
+        let second_step = sched.step(&[rt_with_generated(
+            req,
+            MetalRequestPhase::Decoding,
+            4,
+            2,
+            Some(12),
+        )]);
+        assert_eq!(
+            second_step.logical_plan().decode_rows,
+            vec![MetalLogicalDecodeRow::new(0, req, 12, 5)]
+        );
     }
 
     #[test]

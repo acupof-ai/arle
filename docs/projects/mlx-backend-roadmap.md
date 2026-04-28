@@ -50,6 +50,12 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
    补充状态：Qwen3.5 GGUF 单请求 matmul/lm_head floor 已经跨过 200 tok/s；
    这不是 serving 完成态，下一步仍然要把相同 kernel 收益带进 scheduler
    batching、变长 decode 和 Qwen3.6/MoE 路径。
+   2026-04-28 额外保留了一个 Metal-only checkpoint：Qwen3.5 C++ compiled
+   session 在 prefill / scalar decode 前会先 drain 其它 request 的活动
+   session，并且 scheduler 现在能输出一个 local logical serve plan。这个
+   checkpoint 只作为后续 runtime-owned batched state 的基础层保存；它不代表
+   continuous batching / paged KV / prefix lifecycle 已经统一完成。证据见
+   [`../experience/wins/2026-04-28-bench-guidellm-metal-qwen35-session-handoff.md`](../experience/wins/2026-04-28-bench-guidellm-metal-qwen35-session-handoff.md)。
    Qwen3.6-35B-A3B 也做了 2026-04-27 的本地 quick check，确认本地
    Metal 路径仍可加载和执行。该短序列结果不作为 DFlash 优化依据；DFlash
    后续只看 long-context / 超长序列 workload。
