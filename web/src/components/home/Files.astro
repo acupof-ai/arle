@@ -1,0 +1,58 @@
+---
+import type { FileRow } from "../../data/content.ts";
+
+interface Props {
+  rows: FileRow[];
+}
+const { rows } = Astro.props;
+---
+<ul class="files">
+  {rows.map((r) => (
+    <li>
+      <a class="path" href={r.href}>{r.path}</a>
+      <span class="lead" aria-hidden="true"></span>
+      <span class="desc">{r.desc}</span>
+    </li>
+  ))}
+</ul>
+<style>
+  .files {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .files li {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 8px 0;
+    font-size: 13px;
+  }
+  .path {
+    color: var(--ink);
+    font-weight: 600;
+    flex: none;
+    text-decoration: none;
+  }
+  .path:hover { text-decoration: underline; text-decoration-color: var(--ink); }
+  .lead {
+    flex: 1;
+    border-bottom: 1px dotted var(--line);
+    margin: 0 6px;
+    transform: translateY(-3px);
+    min-width: 24px;
+  }
+  .desc {
+    color: var(--ink-soft);
+    font-size: 12px;
+    flex: none;
+    max-width: 56%;
+    text-align: right;
+  }
+
+  @media (max-width: 760px) {
+    .files li { flex-wrap: wrap; }
+    .lead { display: none; }
+    .desc { max-width: 100%; text-align: left; padding-left: 12px; }
+  }
+</style>

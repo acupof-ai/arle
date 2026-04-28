@@ -1,96 +1,56 @@
 ---
-import type { Matrix } from "../../data/content.ts";
-
 interface Props {
-  matrix: Matrix;
+  head: string[];
+  rows: string[][];
 }
-const { matrix } = Astro.props;
+const { head, rows } = Astro.props;
 ---
-<div class="matrix-wrap">
-  <table class="mtx">
-    <thead>
-      <tr>{matrix.head.map((h) => <th>{h}</th>)}</tr>
-    </thead>
-    <tbody>
-      {matrix.rows.map((row) => (
-        <tr>
-          {row.map((cell, idx) => (
-            <td class={idx === 0 ? "k" : ""} set:html={cell} />
-          ))}
-        </tr>
-      ))}
-    </tbody>
-  </table>
-</div>
-<p class="matrix-note" set:html={matrix.note} />
+<table class="matrix">
+  <thead>
+    <tr>{head.map((h) => <th>{h}</th>)}</tr>
+  </thead>
+  <tbody>
+    {rows.map((row) => (
+      <tr>
+        {row.map((cell) => <td set:html={cell} />)}
+      </tr>
+    ))}
+  </tbody>
+</table>
 <style>
-  .matrix-wrap {
-    border: 1px solid var(--line);
-    background: var(--paper);
-    overflow-x: auto;
-  }
-  .mtx { width: 100%; border-collapse: collapse; font-size: 13px; }
-  .mtx thead th {
-    padding: 16px 22px;
-    text-align: left;
-    font-size: 10px;
-    letter-spacing: 0.16em;
-    text-transform: uppercase;
-    color: var(--ink-dim);
-    border-bottom: 1px solid var(--line);
-    font-weight: 500;
-    background: var(--paper-warm);
-    white-space: nowrap;
-  }
-  .mtx tbody td {
-    padding: 18px 20px;
-    border-bottom: 1px solid var(--line-soft);
-    vertical-align: middle;
-    color: var(--ink-soft);
-  }
-  .mtx tbody tr:last-child td { border-bottom: none; }
-  .mtx tbody td.k { color: var(--ink); font-weight: 600; white-space: nowrap; }
-  .mtx :global(code) {
-    background: var(--paper-warm);
-    border: 1px solid var(--line);
-    padding: 2px 8px;
-    font-weight: 500;
-    font-family: var(--mono);
-  }
-  /* Map the legacy m-ok/m-warn/m-dim classes (already in content data)
-     onto the new pill design so existing data needs no rewrite. */
-  .mtx :global(.m-ok),
-  .mtx :global(.m-warn),
-  .mtx :global(.m-dim) {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    font-weight: 500;
-    padding: 4px 10px;
-    border: 1px solid var(--line);
-    background: transparent;
-  }
-  .mtx :global(.m-ok::before),
-  .mtx :global(.m-warn::before),
-  .mtx :global(.m-dim::before) {
-    content: "";
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-  .mtx :global(.m-ok)   { color: var(--ok);   border-color: var(--ok); }
-  .mtx :global(.m-warn) { color: var(--warn); border-color: var(--warn); }
-  .mtx :global(.m-dim)  { color: var(--ink-dim); border-color: var(--line); }
-
-  .matrix-note {
-    margin: 24px 0 0;
+  .matrix {
+    width: 100%;
+    border-collapse: collapse;
     font-size: 13px;
-    color: var(--ink-dim);
-    line-height: 1.65;
   }
-  .matrix-note :global(a) { color: var(--ink); text-decoration-color: var(--line); }
+  .matrix th,
+  .matrix td {
+    text-align: left;
+    padding: 14px 16px 14px 0;
+    border-bottom: 1px solid var(--line-soft);
+    vertical-align: top;
+  }
+  .matrix th {
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    font-weight: 500;
+    border-bottom: 1px solid var(--ink);
+    padding-top: 0;
+  }
+  .matrix td :global(code) { color: var(--ink); font-weight: 600; }
+  .matrix tr:last-child td { border-bottom: none; }
+
+  .matrix :global(.pill) {
+    display: inline-block;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border: 1px solid currentColor;
+  }
+  .matrix :global(.pill.ok)   { color: var(--ok); }
+  .matrix :global(.pill.warn) { color: var(--warn); }
+  .matrix :global(.pill.dim)  { color: var(--ink-dim); }
 </style>

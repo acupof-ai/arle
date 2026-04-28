@@ -1,54 +1,50 @@
-/* ARLE design tokens — palette, type scale, spacing, layout.
-   Identity is warm-paper man-page; dark mode swaps the page surface but
-   keeps the dark console panels (they are the brand contrast). */
+/* ARLE design tokens — paper, ink, hairlines.
+   Mirrors the live cklxx/arle palette: near-monochrome with one coral
+   accent (the wordmark dot) and two pinpoint status colors. */
+
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap");
 
 :root {
-  /* near-white minimal palette — Linear / Vercel direction */
-  --paper: #FFFFFF;
-  --paper-dim: #FAFAFA;
-  --panel: #FAFAFA;
-  --panel-strong: #FFFFFF;
-  --rule: #0A0A0A;
-  --line: rgba(10, 10, 10, 0.10);
-  --line-soft: rgba(10, 10, 10, 0.06);
-  --ink: #0A0A0A;
-  --ink-soft: #404040;
-  --ink-dim: #737373;
-  --ochre: #737373;
-  --coral: #DC4B2D;
-  --coral-dim: #B73B22;
-  --teal: #0A0A0A;
-  --teal-dim: #404040;
-  --moss: #737373;
-  --amber: #737373;
-  --console: #0A0A0A;
-  --console-2: #171717;
-  --selection: #0A0A0A;
+  /* paper / ink */
+  --paper:        #FFFFFF;
+  --paper-dim:    #FAFAFA;
+
+  /* hairlines */
+  --rule:         #0A0A0A;
+  --line:         rgba(10, 10, 10, 0.10);
+  --line-soft:    rgba(10, 10, 10, 0.06);
+
+  /* ink ladder */
+  --ink:          #0A0A0A;
+  --ink-soft:     #404040;
+  --ink-dim:      #737373;
+
+  /* reserved chromatic accent — wordmark dot only */
+  --coral:        #DC4B2D;
+  --coral-dim:    #B73B22;
+
+  /* console (terminal block) */
+  --console:      #0A0A0A;
+  --console-2:    #171717;
+
+  /* status pinpoints */
+  --ok:           #16A34A;
+  --warn:         #D97706;
+
+  /* selection */
+  --selection:    #0A0A0A;
   --selection-fg: #FFFFFF;
-  --ok: #16A34A;
-  --warn: #D97706;
-
-  /* v2 design — sparing chromatic accents */
-  --hl: #FFE56B;             /* highlight strip (display headings only) */
-  --rule-2: rgba(10,10,10,0.18); /* heavier hairline for split-layout edges */
-
-  /* v3 design — ink-blue accent + warm paper second surface + serif italic */
-  --ink-blue:    #1F2A44;          /* runtime accent / contract / link hover */
-  --ink-blue-2:  #2C3958;
-  --paper-warm:  #F5F2EC;          /* second paper surface — callouts / topology bleed / matrix head */
-  --serif: "Newsreader", "Iowan Old Style", "Hoefler Text",
-           "Georgia Pro", Georgia, "Times New Roman", serif;
 
   /* type scale */
-  --fs-xs: 11px;
-  --fs-sm: 12px;
-  --fs-base: 15px;
-  --fs-md: 17px;
-  --fs-lg: 22px;
-  --fs-xl: 34px;
+  --fs-xs:    11px;
+  --fs-sm:    12px;
+  --fs-base:  15px;
+  --fs-md:    17px;
+  --fs-lg:    22px;
+  --fs-xl:    34px;
   --fs-display: 56px;
   --lh-tight: 1.15;
-  --lh: 1.55;
+  --lh:       1.55;
   --lh-loose: 1.7;
 
   /* spacing scale */
@@ -62,14 +58,12 @@
   --sp-8: 64px;
   --sp-9: 96px;
 
-  /* layout */
-  --col: 108ch;
-  --col-narrow: 72ch;
-
-  --mono: "Departure Mono", "Iosevka", "Iosevka Term", "Berkeley Mono",
-          "Commit Mono", "IBM Plex Mono", ui-monospace,
+  /* font stack — single typeface, all weights */
+  --mono: "JetBrains Mono", "Departure Mono", "Iosevka", "Iosevka Term",
+          "Berkeley Mono", "Commit Mono", "IBM Plex Mono", ui-monospace,
           "SFMono-Regular", Menlo, Consolas, monospace;
-}
 
-/* Light-only palette per user direction. Dark mode maps to the same
-   tokens so the page stays minimal-white in any preference. */
+  /* motion */
+  --t-fast: 100ms ease;
+  --t-base: 120ms ease;
+}

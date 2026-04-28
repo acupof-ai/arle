@@ -1,10 +1,6 @@
-/* ARLE site v3 — split-layout homepage + 3-pane docs.
-   Pairs with tokens.css. Component-scoped styles live in their .astro
-   files; this stylesheet hosts globals, the unified .btn system, the
-   home frame section, and the shared reveal-on-scroll progressive
-   enhancement. */
-
-@import url("https://fonts.googleapis.com/css2?family=Newsreader:ital,wght@0,400;0,500;1,400;1,500&display=swap");
+/* ARLE site — globals only.
+   Component styles live in their .astro files. This stylesheet hosts
+   the base typography, the link/code defaults, and the print rules. */
 
 * { box-sizing: border-box; }
 
@@ -19,24 +15,26 @@ html {
 }
 body {
   font-family: var(--mono);
-  font-size: var(--fs-base);
-  line-height: var(--lh);
+  font-size: 14px;
+  line-height: 1.65;
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "calt" 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   background: var(--paper);
+  color: var(--ink);
+  text-rendering: geometricPrecision;
 }
 
-::selection { background: var(--ink); color: var(--paper); }
+::selection { background: var(--selection); color: var(--selection-fg); }
 
 a {
   color: var(--ink);
   text-decoration: underline;
   text-decoration-color: var(--line);
-  text-underline-offset: 4px;
+  text-underline-offset: 3px;
   text-decoration-thickness: 1px;
-  transition: text-decoration-color var(--t-base, 120ms ease);
+  transition: text-decoration-color var(--t-base);
 }
 a:hover { text-decoration-color: var(--ink); }
 a:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
@@ -55,151 +53,10 @@ code      { font-family: inherit; color: var(--ink); font-weight: 500; }
   border: 0;
 }
 
-/* ── shared <pre> defaults for code surfaces ─────────────────────── */
-pre.cmd, pre.tbl, pre.diagram, pre.files {
-  margin: 12px 0;
-  padding: 12px 16px;
-  background: var(--paper-dim);
-  border: 1px solid var(--line);
-  color: var(--ink);
-  font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.7;
-  overflow-x: auto;
-  white-space: pre;
-}
-pre .p  { color: var(--ink-dim); font-weight: 400; user-select: none; margin-right: 6px; }
-pre .c  { color: var(--ink-dim); }
-pre i   { color: var(--ink-soft); }
-pre b   { color: var(--ink); }
-pre .k  { color: var(--coral); }
-
-/* ── unified button system (v3) ──────────────────────────────────── */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  padding: 13px 20px;
-  font-family: var(--mono);
-  font-size: 13px;
-  font-weight: 500;
-  text-decoration: none;
-  border: 1px solid var(--ink);
-  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
-}
-.btn-primary {
-  background: var(--ink);
-  color: var(--paper);
-}
-.btn-primary:hover,
-.btn-primary:focus-visible {
-  background: var(--ink-blue);
-  border-color: var(--ink-blue);
-  outline: none;
-}
-.btn-ghost {
-  background: transparent;
-  color: var(--ink);
-  border-color: var(--line);
-}
-.btn-ghost:hover,
-.btn-ghost:focus-visible {
-  border-color: var(--ink);
-  color: var(--ink);
-  outline: none;
-}
-.btn .ar {
-  font-size: 11px;
-  opacity: 0.7;
-  transition: transform 150ms ease;
-}
-.btn:hover .ar { transform: translateX(3px); }
-
-/* ── home v3 — section frame ─────────────────────────────────────── */
-.frame {
-  padding: 104px 64px;
-  border-bottom: 1px solid var(--line);
-}
-.frame.full { padding: 0; }
-.frame-head {
-  display: grid;
-  grid-template-columns: 240px 1fr;
-  gap: 64px;
-  margin-bottom: 64px;
-  align-items: end;
-}
-.frame-head .label {
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--ink-dim);
-}
-.frame-head .label .num {
-  color: var(--ink);
-  margin-right: 8px;
-  font-weight: 500;
-}
-.frame-head h2 {
-  font-size: clamp(40px, 5.4vw, 80px);
-  font-weight: 700;
-  letter-spacing: -0.035em;
-  line-height: 1;
-  margin: 0;
-  max-width: 22ch;
-  text-transform: none;
-  color: var(--ink);
-}
-.frame-head h2 em {
-  font-family: var(--serif);
-  font-style: italic;
-  font-weight: 400;
-  color: var(--ink-blue);
-  letter-spacing: -0.02em;
-}
-
-@media (max-width: 1100px) {
-  .frame { padding: 64px 32px; }
-  .frame-head { grid-template-columns: 1fr; gap: 24px; }
-}
-@media (max-width: 640px) {
-  .frame { padding: 48px 20px; }
-}
-
-/* ── reveal — progressive enhancement ────────────────────────────── */
-.reveal { transition: opacity 380ms ease, transform 380ms ease; }
-html.js-reveal .reveal:not(.in) { opacity: 0; transform: translateY(8px); }
-@media (prefers-reduced-motion: reduce) {
-  html.js-reveal .reveal:not(.in) { opacity: 1; transform: none; }
-}
-
-/* ── shared status pill (matrix + bench card header) ─────────────── */
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  font-weight: 500;
-  padding: 4px 10px;
-  border: 1px solid var(--line);
-}
-.pill::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-}
-.pill.ok   { color: var(--ok);   border-color: var(--ok); }
-.pill.warn { color: var(--warn); border-color: var(--warn); }
-.pill.dim  { color: var(--ink-dim); border-color: var(--line); }
-
-/* ── print: still a man page when printed ────────────────────────── */
 @media print {
   :root { --fs-base: 11pt; }
   html, body { background: #ffffff; color: #000000; }
-  .topnav, .sfoot, .toc, aside.docs-side { display: none !important; }
+  .topnav, .docs-topbar, .docs-tabs, aside.docs-side, .toc { display: none !important; }
   a { color: inherit; text-decoration: underline; }
   a[href^="http"]::after {
     content: " (" attr(href) ")";

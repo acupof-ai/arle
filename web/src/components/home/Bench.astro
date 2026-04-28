@@ -3,180 +3,129 @@ import type { BenchRow } from "../../data/content.ts";
 
 interface Props {
   rows: BenchRow[];
-  isZh?: boolean;
+  /** Localised label for the right-hand snapshot link. */
+  snapshotLabel?: string;
 }
-const { rows, isZh = false } = Astro.props;
-const fullSnapshotLabel = isZh ? "完整快照" : "Full snapshot";
+const { rows, snapshotLabel = "snapshot ↗" } = Astro.props;
+
+const tagClass = (s: BenchRow["stability"]) =>
+  s === "stable" ? "ok" : s === "beta" ? "warn" : "dim";
 ---
-<div class="perf-detail">
-  {rows.map((r) => {
-    const stab = r.stability ?? "stable";
-    const stabClass = stab === "stable" ? "ok" : stab === "beta" ? "beta" : "dim";
-    const grid = r.grid ?? [];
-    return (
-      <article class="perf-card reveal">
-        <div class="perf-card-h">
-          <span class="b">{r.backend}</span>
-          <span class="d">{r.date}</span>
-          <span class="meta">{r.hardware} · {r.model}</span>
-          <span class={`s s-${stabClass}`}>{stab}</span>
-        </div>
-        {grid.length > 0 && (
-          <div class="perf-card-body">
-            {grid.map((g) => (
-              <div>
-                <div class="l">{g.label}</div>
-                <div class="v">
-                  <span class="num-block">
-                    {g.value}<span class="u">{g.unit}</span>
-                  </span>
-                  {g.spark && (
-                    <svg class="spark" viewBox="0 0 64 18" aria-hidden="true">
-                      <path d={g.spark} />
-                    </svg>
-                  )}
-                </div>
-              </div>
-            ))}
+<div class="bench">
+  {rows.map((r) => (
+    <div class="card">
+      <div class="h">
+        <span class="date">{r.date}</span>
+        <span class={`tag ${tagClass(r.stability)}`}>{r.stabilityLabel}</span>
+      </div>
+      <p class="ttl" set:html={r.caption} />
+      <div class="grid">
+        {r.cells.map((c) => (
+          <div class="cell">
+            <div class="key">{c.key}</div>
+            <div class="val">{c.value}<span class="u">{c.unit}</span></div>
           </div>
-        )}
-        <div class="perf-card-foot">
-          {r.cmd ? (
-            <span>cmd · <code>{r.cmd}</code></span>
-          ) : (
-            <span set:html={r.metric} />
-          )}
-          <a href={r.href}>{fullSnapshotLabel} <span aria-hidden="true">&#x2197;</span></a>
-        </div>
-      </article>
-    );
-  })}
+        ))}
+      </div>
+      <div class="foot">
+        <span><code>{r.cmd}</code></span>
+        <a href={r.href}>{snapshotLabel}</a>
+      </div>
+    </div>
+  ))}
 </div>
 <style>
-  .perf-detail {
+  .bench {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 24px;
+    gap: 20px;
+    grid-template-columns: 1fr 1fr;
   }
-  .perf-card { border: 1px solid var(--line); padding: 0; background: var(--paper); }
-  .perf-card-h {
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--line);
-    display: flex;
-    gap: 16px;
-    font-size: 11px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--ink-dim);
-    align-items: center;
-    flex-wrap: wrap;
-  }
-  .perf-card-h .b {
-    color: var(--ink);
-    padding: 1px 8px;
+  .card {
     border: 1px solid var(--line);
-    background: var(--paper-warm);
-    font-weight: 500;
+    padding: 22px 24px;
+    background: var(--paper);
   }
-  .perf-card-h .d {
+  .h {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+    align-items: baseline;
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-bottom: 14px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .h .date {
     color: var(--ink);
+    font-weight: 700;
     font-feature-settings: "tnum" 1;
   }
-  .perf-card-h .meta { color: var(--ink-soft); }
-  .perf-card-h .s {
+  .h .tag {
     margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border: 1px solid currentColor;
+    white-space: nowrap;
   }
-  .perf-card-h .s::before {
-    content: "";
-    width: 6px;
-    height: 6px;
-    background: currentColor;
-    border-radius: 50%;
-  }
-  .perf-card-h .s-ok    { color: var(--ok); }
-  .perf-card-h .s-beta  { color: var(--warn); }
-  .perf-card-h .s-dim   { color: var(--ink-dim); }
+  .h .tag.ok { color: var(--ok); border-color: rgba(22,163,74,0.4); }
+  .h .tag.warn { color: var(--warn); border-color: rgba(217,119,6,0.4); }
+  .h .tag.dim { color: var(--ink-dim); border-color: var(--line); }
 
-  .perf-card-body {
+  .ttl {
+    font-size: 12px;
+    color: var(--ink-soft);
+    margin: 0 0 18px;
+  }
+  .ttl :global(b) { color: var(--ink); font-weight: 600; }
+  .ttl :global(code) { color: var(--ink); }
+
+  .grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 1px;
-    background: var(--line);
+    gap: 16px 20px;
+    margin-bottom: 18px;
   }
-  .perf-card-body > div {
-    background: var(--paper);
-    padding: 22px 24px 18px;
-  }
-  .perf-card-body .l {
-    font-size: 10px;
-    letter-spacing: 0.16em;
+  .cell .key {
+    font-size: 9px;
+    letter-spacing: 0.20em;
     text-transform: uppercase;
     color: var(--ink-dim);
-    margin-bottom: 8px;
+    margin-bottom: 4px;
   }
-  .perf-card-body .v {
-    font-size: 38px;
+  .cell .val {
+    font-size: 28px;
     font-weight: 700;
-    letter-spacing: -0.025em;
-    line-height: 1;
-    color: var(--ink);
+    letter-spacing: -0.02em;
+    line-height: 1.1;
     font-feature-settings: "tnum" 1;
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-    flex-wrap: nowrap;
+    color: var(--ink);
   }
-  .perf-card-body .v .num-block {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 6px;
-  }
-  .perf-card-body .v .u {
-    font-size: 13px;
+  .cell .val .u {
+    font-size: 11px;
     font-weight: 500;
     color: var(--ink-dim);
+    margin-left: 4px;
+    letter-spacing: 0;
   }
-  .perf-card-body .v .spark {
-    margin-left: auto;
-    width: 64px;
-    height: 18px;
-    flex: none;
-    align-self: center;
-  }
-  .perf-card-body .v .spark path {
-    stroke: var(--ink-dim);
-    stroke-width: 1;
-    fill: none;
-  }
-  .perf-card-foot {
-    padding: 14px 24px;
-    border-top: 1px solid var(--line);
+
+  .foot {
+    font-size: 11px;
+    color: var(--ink-soft);
+    border-top: 1px solid var(--line-soft);
+    padding-top: 12px;
     display: flex;
     justify-content: space-between;
-    font-size: 11px;
-    color: var(--ink-dim);
-    background: var(--paper-warm);
-    align-items: center;
+    align-items: baseline;
     gap: 12px;
     flex-wrap: wrap;
   }
-  .perf-card-foot a {
-    color: var(--ink-blue);
-    text-decoration-color: var(--ink-blue);
-  }
-  .perf-card-foot code {
-    background: var(--paper);
-    border: 1px solid var(--line);
-    padding: 1px 6px;
-    font-size: 11px;
-    color: var(--ink);
-    font-family: var(--mono);
-  }
+  .foot a { font-size: 11px; }
+  .foot code { color: var(--ink); }
 
-  @media (max-width: 1100px) {
-    .perf-detail { grid-template-columns: 1fr; }
+  @media (max-width: 760px) {
+    .bench { grid-template-columns: 1fr; }
   }
 </style>

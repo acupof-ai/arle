@@ -1,0 +1,171 @@
+---
+import type { Locale } from "../../data/content.ts";
+
+interface Props {
+  hero: Locale["hero"];
+}
+const { hero } = Astro.props;
+---
+<section class="hero" aria-label="banner">
+  <h1>
+    <span class="dot" aria-hidden="true">.</span>{hero.wordmark}
+  </h1>
+  <p class="lede" set:html={hero.lede} />
+
+  <div class="signals" aria-label="status chips">
+    {hero.signals.map((s) => (
+      <span class="sig">
+        {s.dot && <span class={`pulse ${s.dot}`} aria-hidden="true" />}
+        <span set:html={s.html} />
+      </span>
+    ))}
+  </div>
+
+  <div class="ctas">
+    <a class="primary" href={hero.primaryCta.href}>{hero.primaryCta.label}</a>
+    <a class="secondary" href={hero.secondaryCta.href}>{hero.secondaryCta.label}</a>
+  </div>
+
+  <div class="terminal" aria-hidden="false">
+    <div class="bar">
+      <span><span class="dots"><i></i><i></i><i></i></span>{hero.terminal.title}</span>
+      <span>{hero.terminal.cwd}</span>
+    </div>
+    <pre set:html={hero.terminal.lines.join("\n")}></pre>
+  </div>
+</section>
+<style>
+  .hero h1 {
+    margin: 0 0 28px;
+    font-size: 88px;
+    font-weight: 700;
+    letter-spacing: -0.05em;
+    line-height: 0.95;
+    color: var(--ink);
+  }
+  .hero h1 .dot { color: var(--coral); }
+
+  .lede {
+    margin: 0 0 28px;
+    font-size: 17px;
+    line-height: 1.5;
+    color: var(--ink);
+    max-width: 58ch;
+  }
+  .lede :global(b) { font-weight: 700; }
+  .lede :global(em) { font-style: normal; color: var(--ink-soft); }
+
+  .signals {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    margin: 0 0 36px;
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+  .sig {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    white-space: nowrap;
+  }
+  .sig :global(b) { color: var(--ink); font-weight: 600; }
+  .pulse {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ok);
+    display: inline-block;
+    flex: none;
+  }
+  .pulse.warn { background: var(--warn); }
+  .pulse.dim  { background: var(--ink-dim); }
+
+  .ctas {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 56px;
+  }
+  .ctas a {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    line-height: 1;
+    white-space: nowrap;
+    padding: 13px 18px;
+    border: 1px solid var(--ink);
+    text-decoration: none;
+    color: var(--ink);
+    transition: background var(--t-base), color var(--t-base);
+  }
+  .ctas a.primary {
+    background: var(--ink);
+    color: var(--paper);
+  }
+  .ctas a.primary:hover {
+    background: var(--paper);
+    color: var(--ink);
+  }
+  .ctas a.secondary:hover { background: var(--paper-dim); }
+
+  .terminal {
+    border: 1px solid var(--ink);
+    background: var(--console);
+    color: var(--paper);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+    overflow: hidden;
+  }
+  .terminal .bar {
+    background: var(--console-2);
+    color: rgba(255, 255, 255, 0.55);
+    border-bottom: 1px solid #2a2a2a;
+    padding: 9px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+  .terminal .bar .dots {
+    display: inline-flex;
+    gap: 6px;
+    margin-right: 14px;
+  }
+  .terminal .bar .dots i {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #3a3a3a;
+    display: inline-block;
+  }
+  /* Override any host stylesheet defaults so the dark terminal stays
+     dark — `!important` defeats cascade-order surprises. */
+  .terminal pre {
+    margin: 0 !important;
+    padding: 16px 18px !important;
+    overflow-x: auto;
+    background: transparent !important;
+    border: none !important;
+    color: rgba(255, 255, 255, 0.92) !important;
+    font-size: 13px !important;
+    line-height: 1.7 !important;
+    white-space: pre;
+  }
+  .terminal pre :global(.p)    { color: rgba(255, 255, 255, 0.45); user-select: none; padding-right: 8px; }
+  .terminal pre :global(.c)    { color: rgba(255, 255, 255, 0.42); }
+  .terminal pre :global(.ok)   { color: #4ADE80; }
+  .terminal pre :global(.warn) { color: #FBBF24; }
+  .terminal pre :global(.k)    { color: #93C5FD; }
+  .terminal pre :global(.out)  { color: rgba(255, 255, 255, 0.92); }
+  .terminal pre :global(.dim)  { color: rgba(255, 255, 255, 0.55); }
+  .terminal pre :global(b)     { color: #fff; font-weight: 700; }
+
+  @media (max-width: 760px) {
+    .hero h1 { font-size: 64px; }
+  }
+</style>

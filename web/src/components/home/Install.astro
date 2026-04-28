@@ -1,103 +1,53 @@
 ---
-import type { Install } from "../../data/content.ts";
+import type { InstallCard } from "../../data/content.ts";
 
 interface Props {
-  install: Install;
+  cards: InstallCard[];
 }
-const { install } = Astro.props;
-
-// Light heuristic: split each label like "Apple Silicon · Homebrew" into
-// the platform (b) and the channel (suffix).
-function splitLabel(label: string): { b: string; suffix: string } {
-  const parts = label.split(/\s+·\s+/);
-  if (parts.length >= 2) return { b: parts[0], suffix: parts.slice(1).join(" · ") };
-  return { b: label, suffix: "" };
-}
+const { cards } = Astro.props;
 ---
-<div class="install-grid">
-  {install.cards.map((c) => {
-    const { b, suffix } = splitLabel(c.label);
-    return (
-      <article class="install-card">
-        <header class="install-card-h">
-          <span class="b">{b}</span>
-          {suffix && <span>{suffix}</span>}
-        </header>
-        <pre set:html={c.lines.join("\n")}></pre>
-      </article>
-    );
-  })}
+<div class="install">
+  {cards.map((c) => (
+    <div class="card">
+      <div class="lab">
+        <b>{c.label}</b>
+        <span>{c.channel}</span>
+      </div>
+      <pre set:html={c.lines.join("\n")}></pre>
+    </div>
+  ))}
 </div>
-<p class="install-caption" set:html={install.caption}></p>
-<p class="install-note" set:html={install.note}></p>
 <style>
-  .install-grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 24px;
-  }
-  .install-card {
+  .install { display: grid; gap: 20px; }
+  .card {
     border: 1px solid var(--line);
-    padding: 0;
-    display: flex;
-    flex-direction: column;
     background: var(--paper);
   }
-  .install-card-h {
-    padding: 14px 22px;
+  .lab {
+    padding: 12px 16px;
     border-bottom: 1px solid var(--line);
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    font-size: 11px;
-    letter-spacing: 0.06em;
+    background: var(--paper-dim);
+    font-size: 10px;
+    letter-spacing: 0.18em;
     text-transform: uppercase;
-    color: var(--ink-dim);
+    color: var(--ink-soft);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
   }
-  .install-card-h .b {
-    color: var(--ink);
-    font-size: 13px;
-    letter-spacing: -0.005em;
-    text-transform: none;
-    font-weight: 600;
-  }
-  .install-card pre {
+  .lab b { color: var(--ink); font-weight: 700; }
+  pre {
     margin: 0;
-    flex: 1;
-    border: none;
-    background: var(--paper-warm);
-    padding: 22px;
+    padding: 16px;
     font-family: var(--mono);
     font-size: 13px;
     line-height: 1.7;
     overflow-x: auto;
     white-space: pre;
     color: var(--ink);
+    background: transparent;
+    border: none;
   }
-  .install-card pre :global(.p) { color: var(--ink-dim); margin-right: 6px; user-select: none; }
-  .install-card pre :global(.c) { color: var(--ink-dim); }
-  .install-card pre :global(i)  { color: var(--ink-soft); font-style: normal; }
-  .install-caption,
-  .install-note {
-    margin: 24px 0 0;
-    font-size: 13px;
-    color: var(--ink-dim);
-    line-height: 1.65;
-  }
-  .install-caption :global(a),
-  .install-note :global(a) {
-    color: var(--ink);
-    text-decoration-color: var(--line);
-  }
-  .install-note :global(code) {
-    background: var(--paper-dim);
-    border: 1px solid var(--line);
-    padding: 0 6px;
-    font-weight: 500;
-    color: var(--ink);
-  }
-
-  @media (max-width: 1100px) {
-    .install-grid { grid-template-columns: 1fr; }
-  }
+  pre :global(.p) { color: var(--ink-dim); user-select: none; padding-right: 8px; }
+  pre :global(.c) { color: var(--ink-dim); }
 </style>

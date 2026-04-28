@@ -1,0 +1,48 @@
+---
+interface Props {
+  /** DOM id used by the masthead links. */
+  id: string;
+  /** Section heading (e.g. "Install"). The `01 02 …` prefix is added by CSS counters. */
+  title: string;
+  /** Sub-caption rendered as raw HTML (links allowed). */
+  caption: string;
+}
+const { id, title, caption } = Astro.props;
+---
+<section id={id}>
+  <h2>{title}</h2>
+  <p class="sub" set:html={caption}></p>
+  <slot />
+</section>
+<style>
+  section {
+    margin-top: 96px;
+    counter-increment: section;
+  }
+  section h2 {
+    margin: 0 0 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.20em;
+    text-transform: uppercase;
+    color: var(--ink);
+  }
+  section h2::before {
+    content: counter(section, decimal-leading-zero) " ";
+    color: var(--ink-dim);
+    font-weight: 500;
+    margin-right: 8px;
+  }
+  .sub {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    max-width: 64ch;
+    margin: 0 0 32px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--line);
+  }
+  .sub :global(b) { color: var(--ink); font-weight: 600; }
+  .sub :global(code) { color: var(--ink); font-weight: 600; }
+  .sub :global(a) { color: var(--ink); }
+</style>
