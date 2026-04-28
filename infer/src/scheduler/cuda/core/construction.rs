@@ -119,10 +119,16 @@ impl<M: ModelForward> Scheduler<M> {
         let paged_kv_pool = {
             let bytes_per_token = model.kv_cache_bytes_per_token();
             let contiguous_cost = config.max_slots * contiguous_tokens * bytes_per_token;
-            // SGLang-compatible: size the KV pool after subtracting runtime
-            // workspaces that are allocated after model load. Otherwise a
-            // large pool can leave no contiguous room for decode / prefill
-            // attention workspaces and fail mid-request.
+            // Estimated runtime workspace — kept for the OOM safety check
+            // below, NOT subtracted from the budget. SGLang's
+            // `profile_max_num_token` (`sglang/srt/model_executor/model_runner_kv_cache_mixin.py:171-177`)
+            // does not pre-deduct workspace; it lets workspace allocate
+            // from the leftover headroom dynamically. Pre-deducting our
+            // ~0.9 GB workspace at default settings ate KV-pool capacity
+            // 1:1 — flipping to SGLang's policy grows the pool by the
+            // same amount with negligible OOM risk as long as
+            // `headroom >= runtime_workspace + safety`. The assertion
+            // below makes that contract explicit.
             let runtime_workspace = model.scheduler_runtime_workspace_bytes(
                 crate::model::SchedulerRuntimeWorkspaceBudget {
                     max_batch_size: config.max_slots,
@@ -135,18 +141,34 @@ impl<M: ModelForward> Scheduler<M> {
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
             {
                 Ok((free, total)) => {
-                    let headroom = ((total as f64) * (1.0 - config.mem_fraction_static)) as usize;
-                    free.saturating_sub(
-                        contiguous_cost
-                            .saturating_add(headroom)
-                            .saturating_add(runtime_workspace),
-                    )
+                    // Headroom = `(1 - mem_fraction_static) × X`. SGLang's
+                    // `profile_max_num_token` uses `pre_model_load_memory`
+                    // (free at process start, before model load) for X;
+                    // the bootstrap path captures that snapshot into
+                    // `config.pre_model_free_bytes`. When unavailable we
+                    // fall back to `total`, which over-counts the driver
+                    // overhead (~500 MB-1 GB on L4) and shrinks the KV
+                    // pool by that much.
+                    let headroom_base = config.pre_model_free_bytes.unwrap_or(total);
+                    let headroom =
+                        ((headroom_base as f64) * (1.0 - config.mem_fraction_static)) as usize;
+                    if headroom < runtime_workspace {
+                        log::warn!(
+                            "TokenKVPool: estimated workspace {:.1} GB exceeds headroom {:.1} GB \
+                             (mem-fraction={:.0}%). Risk of OOM mid-request — consider lowering \
+                             --mem-fraction-static.",
+                            runtime_workspace as f64 / 1e9,
+                            headroom as f64 / 1e9,
+                            config.mem_fraction_static * 100.0,
+                        );
+                    }
+                    free.saturating_sub(contiguous_cost.saturating_add(headroom))
                 }
                 Err(_) => config.kv_pool_fallback_bytes,
             };
 
             info!(
-                "TokenKVPool budget: {:.1} GB (contiguous={:.1} GB, runtime_workspace={:.1} GB, fraction={:.0}%)",
+                "TokenKVPool budget: {:.1} GB (contiguous={:.1} GB, est_workspace={:.1} GB, fraction={:.0}%)",
                 budget_bytes as f64 / 1e9,
                 contiguous_cost as f64 / 1e9,
                 runtime_workspace as f64 / 1e9,

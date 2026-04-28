@@ -6,6 +6,7 @@ use infer::backend::cuda::bootstrap::{
     InferenceEngineOptions, ServerRuntimeConfig, detect_model_type,
     spawn_scheduler_handle_from_path,
 };
+use infer::backend::cuda::tensor::DeviceContext;
 use infer::hf_hub;
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::kv_tier::ClusterSharedBackendConfig;
@@ -187,6 +188,40 @@ async fn main() {
         .expect("Resolved model path must be valid UTF-8");
     let model_type = detect_model_type(resolved_model_path).expect("Failed to detect model type");
     info!("=== Infer Server - {} (GPU) ===", model_type);
+
+    // Earliest possible CUDA snapshot: initialize the primary context (and
+    // cuBLAS handle) here, BEFORE any cuda-kernels lazy-static cubin loaders
+    // fire on first kernel use. The free-memory delta between this and the
+    // pre-model-load snapshot in `bootstrap.rs:spawn_scheduler_handle_from_path`
+    // tells us the AOT cubin + workspace overhead our boot path pays that
+    // SGLang's lazy PyTorch boot does not. The captured value is fed into
+    // `ServerRuntimeConfig.pre_model_free_bytes`, matching SGLang's
+    // `pre_model_load_memory` semantics in `profile_max_num_token`.
+    let pre_model_free_bytes = match DeviceContext::new() {
+        Ok(_ctx) => match DeviceContext::gpu_memory_info() {
+            Ok((free, total)) => {
+                info!(
+                    "GPU memory @ post_cuda_ctx (early): free={:.2} GB / total={:.2} GB \
+                     (driver+ctx+cuBLAS overhead = {:.0} MB)",
+                    free as f64 / 1e9,
+                    total as f64 / 1e9,
+                    (total - free) as f64 / 1e6,
+                );
+                Some(free)
+            }
+            Err(err) => {
+                log::warn!("post_cuda_ctx GPU memory query failed: {err}");
+                None
+            }
+        },
+        Err(err) => {
+            log::warn!(
+                "Early DeviceContext::new() failed: {err} — pre_model_free snapshot disabled"
+            );
+            None
+        }
+    };
+
     info!("Loading model...");
     let start = Instant::now();
     let requested_kv_mode =
@@ -222,6 +257,7 @@ async fn main() {
             max_seq_len: args.max_seq_len,
             kv_cache_dtype,
             kv_pool_format,
+            pre_model_free_bytes,
         };
 
         match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
