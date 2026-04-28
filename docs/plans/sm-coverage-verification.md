@@ -69,25 +69,31 @@ Successful build emits:
 
 ```
 warning: cuda-kernels@0.1.x: Compiling CUDA kernels for targets: sm_80,sm_86,sm_89,sm_90
-warning: cuda-kernels@0.1.x: Triton AOT: built per-SM cubins for 4 target(s); SM dispatch via pthread_once + cuDeviceGetAttribute.
-warning: cuda-kernels@0.1.x: TileLang AOT: built per-SM cubins for 4 target(s) across HD128/HD256 prefill + HD256 decode; ...
+warning: cuda-kernels@0.1.x: Triton AOT: built per-SM cubins for 4 target(s); SM dispatch via __thread cache + cuDeviceGetAttribute.
+warning: cuda-kernels@0.1.x: TileLang AOT: built per-SM cubins for 4 target(s) across HD128/HD256 prefill (HD256 decode gated behind --features tilelang-decode-hd256; falls back to FlashInfer); SM dispatch via __thread cache + cuDeviceGetAttribute.
 ```
 
 ### 2.x Symbol verification
 
 The dispatch wrappers should expose **single** public-symbol entries
-even though there are now 4× cubins per kernel:
+even though there are now 4× cubins per kernel. Per-SM symbol prefixes
+follow Triton's `out_name = triton_<kernel>_sm{sm}` and TileLang's
+`kernel_name = tilelang_<...>_run_sm{sm}` conventions (verified against
+`crates/cuda-kernels/build.rs`):
 
 ```bash
 # Triton: each public _aot_cuda symbol has 4 per-SM siblings (one extern per SM).
 nm target/release/infer | grep -E '\b(silu_mul_triton_aot_cuda|add_cuda)\b' | wc -l   # expect 2
-nm target/release/infer | grep silu_mul_triton_sm | sort                              # expect 4: sm80/86/89/90
-nm target/release/infer | grep add_triton_sm | sort                                   # expect 4
-nm target/release/infer | grep flash_attention_prefill_hd256_sm | sort                # expect 4
+nm target/release/infer | grep triton_silu_mul_sm | sort                              # expect 4: sm80/86/89/90
+nm target/release/infer | grep triton_add_sm | sort                                   # expect 4
+nm target/release/infer | grep triton_flash_attention_prefill_hd256_sm | sort         # expect 4
 
-# TileLang: 10 head-config families × 4 SMs each.
-nm target/release/infer | grep tilelang_batch_prefill_paged_hd128_q16_kv8_sm | sort   # expect 4
-nm target/release/infer | grep -c tilelang_batch_                                     # expect 50: 10 dispatch + 40 per-SM
+# TileLang (canonical `cuda,tilelang-attn` build — HD256 decode is GATED behind
+# the separate `tilelang-decode-hd256` feature and not part of this expansion):
+# 7 head-config families = 4 HD128 prefill + 3 HD256 prefill (no decode).
+nm target/release/infer | grep tilelang_batch_prefill_paged_hd128_q16_kv8_run_sm | sort   # expect 4
+nm target/release/infer | grep -c tilelang_batch_                                     # expect 35: 7 dispatch + 28 per-SM
+# With `--features cuda,tilelang-attn,tilelang-decode-hd256`: expect 50 (10 dispatch + 40 per-SM).
 ```
 
 If any count is wrong, the multi-SM expansion didn't fire — re-run
@@ -263,7 +269,7 @@ The wrapper writes `bench-output/<date>-cuda-multi-sm-${SM}/` with
 The gate compares **multi-SM build vs single-SM build on the same
 host, same commit, same nvcc, same TileLang version, back-to-back**
 (matched A/B per `feedback_matched_ab_for_small_bench_effects.md`).
-We are validating that the new pthread_once + cuDeviceGetAttribute
+We are validating that the new __thread cache + cuDeviceGetAttribute
 dispatch overhead is non-measurable, NOT that absolute throughput
 matches an older wins entry: scheduler/KV defaults have shifted since
 the 2026-04-27 L4 entry (auto FP8 KV `0af5769`, HBM-tier
@@ -280,7 +286,7 @@ The ±5 % threshold matches `tilelang-integration.md` §5 and the
 project-wide stance in `feedback_matched_ab_for_small_bench_effects.md`
 (small effects in a single sweep are thermal noise without matched
 A/B). A multi-SM dispatch slowdown ≤2 % is the ideal — the wrapper is
-just `pthread_once + cuDeviceGetAttribute + indirect call` — but ±2 %
+just `__thread cache hit + cuDeviceGetAttribute (first call only) + indirect call` — but ±2 %
 is below the noise floor in a single sweep, so 5 % is the actionable
 gate. §6's >5 % rollback path uses the same threshold.
 
@@ -378,7 +384,7 @@ Bench failed on this SM?
     ├── Repeat 3+ times to rule out thermal noise (ref `feedback_matched_ab_for_small_bench_effects.md`).
     ├── Run single-SM A/B per §4.3 on same host. If both regress vs single-SM build,
     │   the multi-SM dispatch is the root cause. Profile with `nvprof --print-gpu-trace`
-    │   and check the first-call pthread_once latency.
+    │   and check the first-call __thread probe latency (cuCtxGetDevice + 2× cuDeviceGetAttribute).
     └── If only multi-SM regresses, file `docs/experience/errors/<date>-multi-sm-dispatch-overhead-<SM>.md`
         and either accept (if ≤2 %) or revert to single-SM build for that platform.
 ```
