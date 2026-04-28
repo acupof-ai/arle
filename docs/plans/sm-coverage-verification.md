@@ -113,18 +113,24 @@ Run the e2e tests on each T1 host. They drive the same dispatch path
 the server uses, so passing here is the lower bound for "the cubin is
 correct on this SM."
 
+All four tests are gated by `#![cfg(feature = "cuda")]`; `infer/Cargo.toml`
+declares `default = []`, so without `-p infer --features cuda` the test
+files compile to no-ops and the gate would pass silently. The GGUF
+smoke is also `#[ignore]`, so `-- --ignored` is required to actually
+run it.
+
 ```bash
 # 3.1 Qwen3 e2e (silu_mul / add / embedding / FlashInfer prefill).
-cargo test --release --test e2e
+cargo test --release -p infer --features cuda --test e2e
 
 # 3.2 Qwen3.5 e2e (HD256 prefill + GDR chunkwise + TileLang decode HD256).
-cargo test --release --test e2e_qwen35
+cargo test --release -p infer --features cuda --test e2e_qwen35
 
 # 3.3 GGUF + Qwen3.5 smoke (Q4_K_M decode hot-path on Metal/CUDA dual paths).
-cargo test --release --test smoke_qwen35_gguf
+cargo test --release -p infer --features cuda --test smoke_qwen35_gguf -- --ignored
 
 # 3.4 Q4_K kernel correctness (CUDA-specific quantized embedding).
-cargo test --release --test q4k_kernel_correctness
+cargo test --release -p infer --features cuda --test q4k_kernel_correctness
 ```
 
 JSON baselines under `infer/test_data/`:
@@ -168,8 +174,14 @@ bench results can't be directly compared against the row's baseline.
 # L4 / RTX 4090 (sm_89, 24 GB): Qwen3.5-0.8B Q4_K_M to match the existing
 # 2026-04-27 L4 baseline. Stub declares `cargo build --release --features
 # cuda,tilelang-attn` (sm_89 is the canonical TileLang validation host).
+# Mirror the baseline launch in
+# docs/experience/wins/2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md
+# exactly: GGUF dir holds tokenizer + config so `--model-path` alone is
+# enough; `infer` has no `--gguf-quant` flag (quant is detected from the
+# .gguf header). `--max-seq-len 4608` is required for the canonical
+# guidellm `prompt=4096+output=256` workload to admit on 24 GB.
 ./target/release/infer --model-path models/Qwen3.5-0.8B-GGUF \
-  --gguf-quant Q4_K_M --port 8000 --num-slots 8 --max-seq-len 4096 &
+  --port 8000 --num-slots 8 --max-seq-len 4608 --mem-fraction-static 0.85 &
 
 # H100 (sm_90, 80 GB): Qwen3.5-4B (matches Phase-0 H100 reference workload).
 # Stub declares `cargo build --release --features cuda,tilelang-attn`
@@ -187,12 +199,34 @@ without regression, a follow-up bench can re-test with TileLang on.
 
 ### 4.2 Run guidellm sweep
 
+`--model` MUST match the model name the server registered for itself
+(visible at `GET /v1/models`); the OpenAI-compat preflight rejects any
+mismatch as `model_not_found`. `--processor` MUST point at a directory
+with the safetensors `tokenizer.json` + `config.json` for that model
+(GGUF rows still need the safetensors tokenizer for guidellm's
+client-side tokenisation).
+
 ```bash
-SM=80    # change per host: 80 / 86 / 89 / 90
+# A100 (sm_80) and A10/3090 (sm_86) — Qwen3-8B safetensors.
+SM=80    # or 86
 scripts/bench_guidellm.sh cuda-multi-sm-${SM} \
   --target http://localhost:8000 \
   --model Qwen/Qwen3-8B \
   --processor models/Qwen3-8B
+
+# L4 / RTX 4090 (sm_89) — GGUF row matching the 2026-04-27 baseline.
+SM=89
+scripts/bench_guidellm.sh cuda-multi-sm-${SM} \
+  --target http://localhost:8000 \
+  --model Qwen3.5-0.8B-GGUF \
+  --processor models/Qwen3.5-0.8B
+
+# H100 (sm_90) — Qwen3.5-4B, matches the Phase-0 H100 reference workload.
+SM=90
+scripts/bench_guidellm.sh cuda-multi-sm-${SM} \
+  --target http://localhost:8000 \
+  --model Qwen/Qwen3.5-4B \
+  --processor models/Qwen3.5-4B
 ```
 
 The wrapper writes `bench-output/<date>-cuda-multi-sm-${SM}/` with
@@ -202,7 +236,7 @@ The wrapper writes `bench-output/<date>-cuda-multi-sm-${SM}/` with
 
 | Metric                              | sm_80 | sm_86 | sm_89                                                            | sm_90                                                                  |
 |-------------------------------------|-------|-------|------------------------------------------------------------------|------------------------------------------------------------------------|
-| Baseline                            | first run = baseline | first run = baseline | `2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md` (211.7 tok/s decode) | TileLang Phase 0 H100 entry (see `tilelang-integration-verification.md` §5) |
+| Baseline                            | first run = baseline | first run = baseline | `2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md` (c=1: TTFT p50 247.4 ms / 183.3 out tok/s · c=2 saturation: 222.2 out tok/s) | TileLang Phase 0 H100 entry (see `tilelang-integration-verification.md` §5) |
 | TTFT p50 @ synchronous, max delta  | n/a   | n/a   | ±5 %                                                             | ±5 %                                                                   |
 | out tok/s @ saturation, max delta  | n/a   | n/a   | ±5 %                                                             | ±5 %                                                                   |
 
