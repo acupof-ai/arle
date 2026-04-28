@@ -6,8 +6,21 @@ license = "MIT"
 publish = false
 
 [features]
-cuda = ["dep:cudarc"]
+# `cuda` now implies `tilelang-attn` — TileLang is the default prefill
+# HD128 path on Qwen3 / sm_89+ after the 2026-04-28 bench showed +5.1%
+# tok/s and -82% TTFT vs FlashInfer at c=16/4096-in (see
+# docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md).
+# The FlashInfer prefill HD128 path remains as the reference / fallback
+# but is no longer wired in default builds. To run a matched A/B you
+# need a separate `target-off/` build with `--features cuda` against an
+# older HEAD that still keys the dispatch off `tilelang-attn` cfg —
+# see the wins doc for the procedure.
+cuda = ["dep:cudarc", "tilelang-attn"]
 no-cuda = []
+# Bi-implication with `cuda` — enabling either enables both. The kernel
+# code under `cfg(feature = "tilelang-attn")` calls into the cuda
+# runtime; `--features tilelang-attn` on its own would otherwise
+# compile but not link. Cargo deduplicates the feature loop.
 tilelang-attn = ["cuda"]
 # F0: declare NCCL FFI symbols only. Linking happens in F1 via build.rs.
 # Implies `cuda` because `crate::ffi::nccl` lives under `crate::ffi` which
