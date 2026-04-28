@@ -48,6 +48,11 @@ pub struct SchedulerConfig {
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom. Default 0.88.
     pub mem_fraction_static: f64,
+    /// Free GPU memory (bytes) snapshotted **before** the model is loaded.
+    /// Set by the bootstrap path; `None` means the construction code falls
+    /// back to `total` for the headroom denominator (slightly overcounts
+    /// the driver overhead vs SGLang's `pre_model_load_memory` formula).
+    pub pre_model_free_bytes: Option<usize>,
     /// Minimum sequence length per slot when auto-sizing KV cache.
     pub min_seq_len: usize,
     /// Fallback KV pool budget (bytes) when GPU memory query fails.
@@ -101,6 +106,7 @@ impl Default for SchedulerConfig {
             prefill_max_requests: None,
             max_waiting_requests: 256,
             mem_fraction_static: 0.88,
+            pre_model_free_bytes: None,
             min_seq_len: 256,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
             // Defaults match the M3b shipped constants in

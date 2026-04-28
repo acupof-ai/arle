@@ -79,6 +79,12 @@ pub struct ServerRuntimeConfig {
     pub kv_cache_dtype: crate::model::kv_cache::KVCacheDtype,
     /// KV pool storage format (paged pool). Determines attention dispatch.
     pub kv_pool_format: crate::model::kv_cache::KVFormat,
+    /// Free GPU memory snapshot taken before the model is loaded. Used by
+    /// `Scheduler::with_config` to size the KV pool with the SGLang-aligned
+    /// formula `pre_model_free × (1 - mem_fraction_static)` instead of
+    /// `total × (1 - mem_fraction_static)`. `None` falls back to `total`,
+    /// which over-counts the driver overhead.
+    pub pre_model_free_bytes: Option<usize>,
 }
 
 #[cfg(feature = "cuda")]
@@ -92,6 +98,7 @@ impl Default for ServerRuntimeConfig {
             max_seq_len: None,
             kv_cache_dtype: crate::model::kv_cache::KVCacheDtype::BF16,
             kv_pool_format: crate::model::kv_cache::KVFormat::BF16,
+            pre_model_free_bytes: None,
         }
     }
 }
@@ -240,10 +247,50 @@ pub fn spawn_scheduler_handle(
 #[cfg(feature = "cuda")]
 pub fn spawn_scheduler_handle_from_path(
     model_path: &str,
-    runtime: ServerRuntimeConfig,
+    mut runtime: ServerRuntimeConfig,
     metrics: crate::metrics::ServerMetrics,
 ) -> Result<(SchedulerHandle, SchedulerRuntimeGuard)> {
+    // Snapshot free GPU memory BEFORE model load — the KV-pool budget
+    // formula uses `pre_model_free × (1 - mem_fraction_static)` for the
+    // headroom, matching SGLang's `profile_max_num_token`
+    // (`sglang/srt/model_executor/model_runner_kv_cache_mixin.py:171-177`).
+    //
+    // Preferred source: `runtime.pre_model_free_bytes` already populated by
+    // `main.rs` from the *earliest* possible point (right after CUDA primary
+    // context init, before any cuda-kernels lazy-static cubin loaders fire).
+    // That captures the same boundary SGLang uses for `pre_model_load_memory`.
+    //
+    // Fallback: if main didn't set it (library callers, tests), snapshot here.
+    // This is later than the main.rs path, so the resulting headroom is
+    // tighter — but still better than falling back to `total`. Codex P2:
+    // gpu_memory_info needs a current CUDA context; ensure one exists.
+    if runtime.pre_model_free_bytes.is_none() {
+        let _ = crate::backend::cuda::tensor::DeviceContext::new();
+        if let Ok((free, _total)) = crate::backend::cuda::tensor::DeviceContext::gpu_memory_info() {
+            runtime.pre_model_free_bytes = Some(free);
+        }
+    }
+    if let Ok((free, total)) = crate::backend::cuda::tensor::DeviceContext::gpu_memory_info() {
+        info!(
+            "GPU memory @ pre_model_load: free={:.2} GB / total={:.2} GB \
+             (delta vs post_cuda_ctx = {} bytes — AOT cubins + lazy_static loaders)",
+            free as f64 / 1e9,
+            total as f64 / 1e9,
+            runtime
+                .pre_model_free_bytes
+                .map(|p| p as i64 - free as i64)
+                .map(|d| format!("{:+.0} MB", d as f64 / 1e6))
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
+    }
     let components = load_model_components(model_path, runtime.engine)?;
+    if let Ok((free, total)) = crate::backend::cuda::tensor::DeviceContext::gpu_memory_info() {
+        info!(
+            "GPU memory @ post_model_load: free={:.2} GB / total={:.2} GB",
+            free as f64 / 1e9,
+            total as f64 / 1e9,
+        );
+    }
     spawn_scheduler_handle(components, runtime, metrics)
 }
 
@@ -313,8 +360,17 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         max_seq_len,
         kv_cache_dtype,
         kv_pool_format,
+        pre_model_free_bytes,
         ..
     } = runtime;
+
+    // Propagate the pre-model-load free-memory snapshot into the
+    // scheduler config. The KV-pool budget formula in
+    // `infer/src/scheduler/cuda/core/construction.rs` uses
+    // `pre_model_free × (1 - mem_fraction_static)` for the headroom when
+    // this is `Some`, matching SGLang's `profile_max_num_token` formula
+    // exactly.
+    scheduler.pre_model_free_bytes = pre_model_free_bytes;
 
     let gpu_total_bytes = crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
         .map(|(_free, total)| total)
