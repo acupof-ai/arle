@@ -146,17 +146,44 @@ each row retires its own pending-remote stub independently.
 
 ### 4.1 Boot the server
 
+The model and `--features` set differ per SM by design — they match what
+the corresponding stub at
+`docs/experience/wins/2026-04-28-bench-guidellm-multi-sm-<sm>.md` declares.
+**Always launch the model named in the stub for that SM**, otherwise the
+bench results can't be directly compared against the row's baseline.
+
 ```bash
-# A100 / H100: Qwen3-8B (full bf16; any T1 card with ≥40 GB).
+# A100 (sm_80, 40/80 GB): Qwen3-8B full bf16.
+# Stub declares `cargo build --release --features cuda` (no tilelang-attn:
+# sm_80 has no Phase-0 TileLang validation; first run is the baseline).
 ./target/release/infer --model-path models/Qwen3-8B --port 8000 \
   --num-slots 16 --max-seq-len 8192 &
 
-# A10 / 3090 / L4 / 4090 (24 GB): Qwen3.5-0.8B Q4_K_M for the existing baseline,
-# OR Qwen3-8B if the card is the 80 GB A100/H100. Match the model on the row's
-# stub (`docs/experience/wins/2026-04-28-bench-guidellm-multi-sm-<sm>.md`).
+# A10 / RTX 3090 (sm_86, 24 GB): Qwen3-8B fits at this VRAM.
+# Stub declares `cargo build --release --features cuda` (no tilelang-attn,
+# same reason as sm_80).
+./target/release/infer --model-path models/Qwen3-8B --port 8000 \
+  --num-slots 8 --max-seq-len 4096 &
+
+# L4 / RTX 4090 (sm_89, 24 GB): Qwen3.5-0.8B Q4_K_M to match the existing
+# 2026-04-27 L4 baseline. Stub declares `cargo build --release --features
+# cuda,tilelang-attn` (sm_89 is the canonical TileLang validation host).
 ./target/release/infer --model-path models/Qwen3.5-0.8B-GGUF \
   --gguf-quant Q4_K_M --port 8000 --num-slots 8 --max-seq-len 4096 &
+
+# H100 (sm_90, 80 GB): Qwen3.5-4B (matches Phase-0 H100 reference workload).
+# Stub declares `cargo build --release --features cuda,tilelang-attn`
+# (sm_90 is where TileLang TMA/WGMMA leverage fires; tilelang-attn must be on).
+./target/release/infer --model-path models/Qwen3.5-4B --port 8000 \
+  --num-slots 16 --max-seq-len 8192 &
 ```
+
+**Why the per-SM `tilelang-attn` divergence.** sm_89 and sm_90 carry the
+TileLang Phase-0 validation history (see
+[`tilelang-integration-verification.md`](tilelang-integration-verification.md)
+§0). sm_80 and sm_86 had no TileLang Phase-0 run, so the stubs build
+without `tilelang-attn` for the first run; once those rows are retired
+without regression, a follow-up bench can re-test with TileLang on.
 
 ### 4.2 Run guidellm sweep
 

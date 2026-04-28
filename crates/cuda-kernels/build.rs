@@ -372,14 +372,30 @@ fn generate_triton_artifacts_per_sm(
 }
 
 /// Format a SM-dispatching C wrapper. The generated wrapper:
-///   - Lazily caches `compute_capability_major * 10 + minor` via pthread_once.
+///   - Caches `compute_capability_major * 10 + minor` per-thread via
+///     `__thread` TLS — multi-GPU runtimes (where rank threads bind
+///     different devices) get their own value; single-thread/single-GPU
+///     hits the cache after first call.
 ///   - extern-declares each per-SM AOT func with `extern_signature`.
 ///   - Defines `<public_decl>` whose body is a switch over the SM.
 ///   - Returns `CUDA_ERROR_NOT_SUPPORTED` for SMs not in the build (T1
 ///     hard-fail policy makes this branch unreachable for any SM the
 ///     binary was built to support; the branch exists only as a guard
 ///     for the T2-opt-in case where the user excluded a SM via
-///     `TORCH_CUDA_ARCH_LIST`).
+///     `TORCH_CUDA_ARCH_LIST`, and as the failure path when no CUDA
+///     context is current).
+///
+/// **Why __thread, not pthread_once + global static.** The first design
+/// (pthread_once) was a foot-gun for multi-GPU code: thread A on GPU 0
+/// (sm_80) and thread B on GPU 1 (sm_90) would race on a shared global
+/// and the loser would silently dispatch to the wrong cubin. With
+/// `__thread` storage, each rank thread caches its own bound device's
+/// SM independently — the standard CUDA convention is "one thread, one
+/// device" for the lifetime of a kernel-launch chain, which matches
+/// thread-local storage semantics exactly. A transient
+/// missing-context first call returns NOT_SUPPORTED but does not
+/// poison subsequent calls (we re-read `g_sm_pack` each invocation
+/// and re-probe when it is `-1`).
 fn format_dispatch_wrapper(
     public_decl: &str,
     extern_signature: &str,
@@ -399,27 +415,28 @@ fn format_dispatch_wrapper(
     format!(
         "#include <cuda.h>\n\
          #include <stdint.h>\n\
-         #include <pthread.h>\n\
          \n\
          {externs}\n\
          \n\
-         static int g_sm_pack = -1;\n\
-         static pthread_once_t g_init = PTHREAD_ONCE_INIT;\n\
-         static void init_sm(void) {{\n\
+         static __thread int g_sm_pack = -1;\n\
+         \n\
+         static int load_sm_pack(void) {{\n\
          \x20   int major = 0, minor = 0;\n\
          \x20   CUdevice dev = 0;\n\
-         \x20   if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) {{\n\
-         \x20       g_sm_pack = -1;\n\
-         \x20       return;\n\
-         \x20   }}\n\
-         \x20   cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);\n\
-         \x20   cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);\n\
-         \x20   g_sm_pack = major * 10 + minor;\n\
+         \x20   if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) return -1;\n\
+         \x20   if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) != CUDA_SUCCESS) return -1;\n\
+         \x20   if (cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) != CUDA_SUCCESS) return -1;\n\
+         \x20   return major * 10 + minor;\n\
          }}\n\
          \n\
          CUresult {public_decl} {{\n\
-         \x20   pthread_once(&g_init, init_sm);\n\
-         \x20   switch (g_sm_pack) {{\n\
+         \x20   int sm = g_sm_pack;\n\
+         \x20   if (sm < 0) {{\n\
+         \x20       sm = load_sm_pack();\n\
+         \x20       if (sm < 0) return CUDA_ERROR_NOT_SUPPORTED;\n\
+         \x20       g_sm_pack = sm;\n\
+         \x20   }}\n\
+         \x20   switch (sm) {{\n\
          {cases}\n\
          \x20       default: return CUDA_ERROR_NOT_SUPPORTED;\n\
          \x20   }}\n\
