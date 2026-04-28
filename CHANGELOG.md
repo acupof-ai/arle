@@ -19,6 +19,58 @@ Related governance docs:
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-04-28
+
+Correctness fix release for Metal chat generation. Multimodal Qwen3.5 /
+Qwen3.6 MoE configs (HF `Qwen3_5MoeForConditionalGeneration` family)
+declare `eos_token_id` as an array at the root of `config.json` while
+nesting a single base-LM EOS inside `text_config`. Our Metal config
+loader took only the first element of the array and let `text_config`'s
+scalar shadow the root, then the C++ generate path passed only that one
+id into the stop check — so on `mlx-community/Qwen3.6-35B-A3B-4bit` the
+model walked past `<|im_end|>` after the first reply and hallucinated
+fresh user/assistant turns, with `skip_special_tokens=true` decoding
+leaving "user"/"assistant" plain-text role names visible.
+
+### Metal
+
+- `infer/src/backend/metal/config.rs` — replaced ad-hoc `get_eos` +
+  `load_stop_token_ids` with `resolve_stop_token_ids`, a generic
+  HuggingFace-precedence resolver: `generation_config.json` (HF
+  inference-time authority) → `config.json` root → `text_config`,
+  scalar-or-array normalized to `Vec<u32>`, dedup preserves first-seen
+  order, fall back to 151645. `MetalModelConfig.eos_token_id` is now
+  the first id from the resolved array; `stop_token_ids` is the
+  authoritative list.
+- `infer/src/backend/metal/{qwen35.rs, generate.rs}` — C++ generate
+  paths now extend `stop_ids` with the full `config.stop_token_ids`,
+  not just `config.eos_token_id`. Sort + dedup after merge.
+- `infer/src/backend/metal/request_state.rs` — scheduler/HTTP path
+  also folds `config.stop_token_ids` into `ResumableRequestState`,
+  guarded by `params.ignore_eos` so benchmarks that explicitly want
+  to generate past EOS still can.
+- Three new HF-precedence unit tests in `metal::config::tests`.
+
+Verified on Apple M4 Max with `mlx-community/Qwen3.6-35B-A3B-4bit`:
+multi-turn REPL produces clean, on-topic, EOS-terminated replies; tool
+execution works on the third turn. Background entry under
+`docs/experience/wins/2026-04-28-fix-metal-eos-token-id-array.md`.
+
+### CUDA · breaking — SM env-var policy
+
+- `INFER_CUDA_SM` and `CUDA_SM` are removed. The new build-time env
+  var is `TORCH_CUDA_ARCH_LIST` (alias `CMAKE_CUDA_ARCHITECTURES`),
+  matching the PyTorch / vLLM convention. Migration: replace
+  `INFER_CUDA_SM=89` with `TORCH_CUDA_ARCH_LIST=8.9`.
+- T1 (sm_80/86/89/90) is the default fat-binary set when no env is
+  set. T2 (sm_100/120) is opt-in. T3 (sm < 80) is rejected at build
+  time with a hint. Unknown SMs hard-fail rather than silently
+  falling back.
+- Plan + tier policy live in `docs/plans/sm-coverage.md`; four
+  per-SM bench stubs are tracked under `docs/experience/wins/` as
+  `pending-remote` and will be filled in alongside the multi-cubin
+  AOT dispatch (Phase B/C).
+
 ## [0.1.3] — 2026-04-27
 
 Packaging fix release: macOS bottles and release tarballs were missing
