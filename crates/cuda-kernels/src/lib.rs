@@ -1,3 +1,4 @@
+pub mod collective;
 #[cfg(feature = "cuda")]
 pub mod ffi;
 #[cfg(feature = "cuda")]

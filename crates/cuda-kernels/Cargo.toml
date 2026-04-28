@@ -9,6 +9,10 @@ publish = false
 cuda = ["dep:cudarc"]
 no-cuda = []
 tilelang-attn = ["cuda"]
+# F0: declare NCCL FFI symbols only. Linking happens in F1 via build.rs.
+# Implies `cuda` because `crate::ffi::nccl` lives under `crate::ffi` which
+# is itself gated on `cuda` (matching reality: NCCL requires CUDA).
+nccl = ["cuda"]
 
 [dependencies]
 anyhow = "1.0"

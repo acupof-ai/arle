@@ -15,6 +15,9 @@ pub mod gemm;
 pub mod kv;
 #[path = "ffi/misc.rs"]
 pub mod misc;
+#[cfg(feature = "nccl")]
+#[path = "ffi/nccl.rs"]
+pub mod nccl;
 #[path = "ffi/norm.rs"]
 pub mod norm;
 #[path = "ffi/quant.rs"]
