@@ -265,97 +265,203 @@ fn find_triton_python() -> Result<String, String> {
     ))
 }
 
-fn triton_target(sm_targets: &[SmSpec]) -> String {
-    let max_sm = sm_targets
-        .iter()
-        .filter_map(|s| s.sm.parse::<u32>().ok())
-        .max()
-        .expect("expected at least one CUDA SM target for Triton AOT");
+/// Per-SM Triton AOT artifact: (sm token, mangled func name, generated .c path).
+type TritonPerSmArtifact = (String, String, PathBuf);
 
-    if sm_targets.len() > 1 {
-        println!(
-            "cargo:warning=Triton AOT currently emits one cubin per kernel spec; using highest detected target sm_{max_sm}. \
-             Multi-SM Triton AOT lands in commit B of the multi-SM rollout (docs/plans/sm-coverage.md). \
-             Set TORCH_CUDA_ARCH_LIST to pin one target explicitly."
-        );
+/// Convert "80" -> "8.0", "120" -> "12.0", for inclusion in TORCH_CUDA_ARCH_LIST hint strings.
+fn sm_to_arch_list_token(sm: &str) -> String {
+    let len = sm.len();
+    if len < 2 {
+        return sm.to_string();
     }
-
-    format!("cuda:{max_sm}:32")
+    let (head, tail) = sm.split_at(len - 1);
+    format!("{head}.{tail}")
 }
 
-fn generate_triton_artifacts(
+/// Run gen_triton_aot.py once per SM target; return (sm, func_name, c_path) per success.
+/// Hard-fail with a `TORCH_CUDA_ARCH_LIST=...` hint when any (kernel, SM) pair fails to compile.
+fn generate_triton_artifacts_per_sm(
     python: &str,
     out_dir: &Path,
-    triton_target: &str,
-    spec: &TritonKernelSpec,
-) -> (String, PathBuf) {
+    sm_targets: &[SmSpec],
+    base_spec: &TritonKernelSpec,
+) -> Vec<TritonPerSmArtifact> {
     let generator_path = PathBuf::from("tools/triton/gen_triton_aot.py");
-    let artifact_dir = out_dir.join("triton_aot").join(spec.artifact_dir);
+    let mut results = Vec::new();
 
-    let output = Command::new(python)
-        .arg(&generator_path)
-        .arg("--kernel-path")
-        .arg(spec.kernel_path)
-        .arg("--kernel-name")
-        .arg(spec.kernel_name)
-        .arg("--signature")
-        .arg(spec.signature)
-        .arg("--grid")
-        .arg(spec.grid)
-        .arg("--out-name")
-        .arg(spec.out_name)
-        .arg("--out-dir")
-        .arg(&artifact_dir)
-        .arg("--target")
-        .arg(triton_target)
-        .arg("--num-warps")
-        .arg(spec.num_warps.to_string())
-        .arg("--num-stages")
-        .arg(spec.num_stages.to_string())
-        .output()
-        .unwrap_or_else(|err| {
+    for sm in sm_targets {
+        let sm_token = &sm.sm;
+        let artifact_dir = out_dir
+            .join("triton_aot")
+            .join(format!("{}_sm{sm_token}", base_spec.artifact_dir));
+        let out_name = format!("{}_sm{sm_token}", base_spec.out_name);
+        let target = format!("cuda:{sm_token}:32");
+
+        let output = Command::new(python)
+            .arg(&generator_path)
+            .arg("--kernel-path")
+            .arg(base_spec.kernel_path)
+            .arg("--kernel-name")
+            .arg(base_spec.kernel_name)
+            .arg("--signature")
+            .arg(base_spec.signature)
+            .arg("--grid")
+            .arg(base_spec.grid)
+            .arg("--out-name")
+            .arg(&out_name)
+            .arg("--out-dir")
+            .arg(&artifact_dir)
+            .arg("--target")
+            .arg(&target)
+            .arg("--num-warps")
+            .arg(base_spec.num_warps.to_string())
+            .arg("--num-stages")
+            .arg(base_spec.num_stages.to_string())
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to spawn Triton AOT generator for {} on sm_{sm_token}: {err}",
+                    base_spec.kernel_name
+                )
+            });
+
+        if !output.status.success() {
+            let other_sms: Vec<String> = sm_targets
+                .iter()
+                .filter(|s| s.sm != *sm_token)
+                .map(|s| sm_to_arch_list_token(&s.sm))
+                .collect();
+            let suggestion = if other_sms.is_empty() {
+                "all targets failed; bump triton in requirements-build.txt or pin a working version"
+                    .to_string()
+            } else {
+                format!("TORCH_CUDA_ARCH_LIST=\"{}\"", other_sms.join(";"))
+            };
             panic!(
-                "failed to run Triton AOT generator for {}: {err}",
-                spec.kernel_name
-            )
-        });
-
-    assert!(
-        output.status.success(),
-        "Triton AOT generator failed for {}. stdout: {} stderr: {}",
-        spec.kernel_name,
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut func_name = None;
-    let mut c_path = None;
-    for line in stdout.lines() {
-        if let Some(value) = line.strip_prefix("FUNC_NAME=") {
-            func_name = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("C_PATH=") {
-            c_path = Some(PathBuf::from(value.trim()));
+                "Triton AOT failed to compile {} for sm_{sm_token}.\n\
+                 stdout: {}\n\
+                 stderr: {}\n\n\
+                 Hint: bump triton (pin lives in requirements-build.txt) OR exclude sm_{sm_token} via:\n  \
+                 {suggestion}\n\
+                 See docs/plans/sm-coverage.md.",
+                base_spec.kernel_name,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
         }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut func_name = None;
+        let mut c_path = None;
+        for line in stdout.lines() {
+            if let Some(value) = line.strip_prefix("FUNC_NAME=") {
+                func_name = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("C_PATH=") {
+                c_path = Some(PathBuf::from(value.trim()));
+            }
+        }
+
+        results.push((
+            sm_token.clone(),
+            func_name.expect("Triton generator did not print FUNC_NAME"),
+            c_path.expect("Triton generator did not print C_PATH"),
+        ));
     }
 
-    let func_name = func_name.expect("Triton generator did not print FUNC_NAME");
-    let c_path = c_path.expect("Triton generator did not print C_PATH");
-    (func_name, c_path)
+    results
 }
 
-fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> PathBuf {
-    let wrapper_path = generated_c
-        .parent()
-        .expect("generated Triton source should have a parent directory")
-        .join(file_name);
-    std::fs::write(&wrapper_path, wrapper_src).expect("failed to write Triton wrapper source");
-    wrapper_path
+/// Format a SM-dispatching C wrapper. The generated wrapper:
+///   - Lazily caches `compute_capability_major * 10 + minor` via pthread_once.
+///   - extern-declares each per-SM AOT func with `extern_signature`.
+///   - Defines `<public_decl>` whose body is a switch over the SM.
+///   - Returns `CUDA_ERROR_NOT_SUPPORTED` for SMs not in the build (T1
+///     hard-fail policy makes this branch unreachable for any SM the
+///     binary was built to support; the branch exists only as a guard
+///     for the T2-opt-in case where the user excluded a SM via
+///     `TORCH_CUDA_ARCH_LIST`).
+fn format_dispatch_wrapper(
+    public_decl: &str,
+    extern_signature: &str,
+    call_args: &str,
+    per_sm_funcs: &[(String, String)],
+) -> String {
+    let externs = per_sm_funcs
+        .iter()
+        .map(|(_, func)| format!("CUresult {func}({extern_signature});"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cases = per_sm_funcs
+        .iter()
+        .map(|(sm, func)| format!("        case {sm}: return {func}({call_args});"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "#include <cuda.h>\n\
+         #include <stdint.h>\n\
+         #include <pthread.h>\n\
+         \n\
+         {externs}\n\
+         \n\
+         static int g_sm_pack = -1;\n\
+         static pthread_once_t g_init = PTHREAD_ONCE_INIT;\n\
+         static void init_sm(void) {{\n\
+         \x20   int major = 0, minor = 0;\n\
+         \x20   CUdevice dev = 0;\n\
+         \x20   if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) {{\n\
+         \x20       g_sm_pack = -1;\n\
+         \x20       return;\n\
+         \x20   }}\n\
+         \x20   cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);\n\
+         \x20   cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);\n\
+         \x20   g_sm_pack = major * 10 + minor;\n\
+         }}\n\
+         \n\
+         CUresult {public_decl} {{\n\
+         \x20   pthread_once(&g_init, init_sm);\n\
+         \x20   switch (g_sm_pack) {{\n\
+         {cases}\n\
+         \x20       default: return CUDA_ERROR_NOT_SUPPORTED;\n\
+         \x20   }}\n\
+         }}\n"
+    )
+}
+
+/// Build one Triton kernel for every SM target: generate per-SM artifacts,
+/// write a single dispatch wrapper exposing `public_decl`, and append all
+/// sources to `generated_sources` for cc::Build to compile.
+fn build_triton_kernel(
+    python: &str,
+    out_dir: &Path,
+    sm_targets: &[SmSpec],
+    base_spec: &TritonKernelSpec,
+    public_decl: &str,
+    extern_signature: &str,
+    call_args: &str,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    let per_sm = generate_triton_artifacts_per_sm(python, out_dir, sm_targets, base_spec);
+    let pairs: Vec<(String, String)> = per_sm
+        .iter()
+        .map(|(sm, func, _)| (sm.clone(), func.clone()))
+        .collect();
+    let wrapper_src = format_dispatch_wrapper(public_decl, extern_signature, call_args, &pairs);
+
+    let dispatch_dir = out_dir
+        .join("triton_aot")
+        .join(format!("{}_dispatch", base_spec.artifact_dir));
+    std::fs::create_dir_all(&dispatch_dir).expect("create Triton dispatch directory");
+    let wrapper_path = dispatch_dir.join(format!("triton_{}_dispatch.c", base_spec.artifact_dir));
+    std::fs::write(&wrapper_path, wrapper_src).expect("write Triton dispatch wrapper");
+
+    for (_, _, c) in per_sm {
+        generated_sources.push(c);
+    }
+    generated_sources.push(wrapper_path);
 }
 
 fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
     let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
-    let triton_target = triton_target(sm_targets);
     let mut generated_sources = Vec::new();
     let chunkwise_kernel_path = Path::new("tools/triton/gated_delta_rule_chunkwise_kernels.py");
 
@@ -369,18 +475,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
         num_warps: 4,
         num_stages: 2,
     };
-    let (silu_func, silu_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &silu_spec);
-    let silu_wrapper = write_wrapper(
-        &silu_c,
-        "triton_silu_mul_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements);\n\nCUresult silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n);\n}}\n",
-            func = silu_func
-        ),
+    build_triton_kernel(
+        &python,
+        out_dir,
+        sm_targets,
+        &silu_spec,
+        "silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream)",
+        "CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements",
+        "stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n",
+        &mut generated_sources,
     );
-    generated_sources.push(silu_c);
-    generated_sources.push(silu_wrapper);
 
     let add_spec = TritonKernelSpec {
         artifact_dir: "add",
@@ -392,17 +496,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
         num_warps: 4,
         num_stages: 2,
     };
-    let (add_func, add_c) = generate_triton_artifacts(&python, out_dir, &triton_target, &add_spec);
-    let add_wrapper = write_wrapper(
-        &add_c,
-        "triton_add_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr a, CUdeviceptr b, CUdeviceptr out, int32_t n_elements);\n\nCUresult add_cuda(const uint16_t* a, const uint16_t* b, uint16_t* out, int n, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)a, (CUdeviceptr)b, (CUdeviceptr)out, (int32_t)n);\n}}\n",
-            func = add_func
-        ),
+    build_triton_kernel(
+        &python,
+        out_dir,
+        sm_targets,
+        &add_spec,
+        "add_cuda(const uint16_t* a, const uint16_t* b, uint16_t* out, int n, CUstream stream)",
+        "CUstream stream, CUdeviceptr a, CUdeviceptr b, CUdeviceptr out, int32_t n_elements",
+        "stream, (CUdeviceptr)a, (CUdeviceptr)b, (CUdeviceptr)out, (int32_t)n",
+        &mut generated_sources,
     );
-    generated_sources.push(add_c);
-    generated_sources.push(add_wrapper);
 
     let embedding_decode_spec = TritonKernelSpec {
         artifact_dir: "embedding_decode",
@@ -414,18 +517,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
         num_warps: 4,
         num_stages: 2,
     };
-    let (embedding_decode_func, embedding_decode_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_decode_spec);
-    let embedding_decode_wrapper = write_wrapper(
-        &embedding_decode_c,
-        "triton_embedding_decode_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, CUdeviceptr decode_meta, CUdeviceptr out, int32_t hidden_size);\n\nCUresult embedding_decode_cuda(const uint16_t* embed, const int* decode_meta, uint16_t* out, int hidden_size, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (CUdeviceptr)decode_meta, (CUdeviceptr)out, (int32_t)hidden_size);\n}}\n",
-            func = embedding_decode_func
-        ),
+    build_triton_kernel(
+        &python,
+        out_dir,
+        sm_targets,
+        &embedding_decode_spec,
+        "embedding_decode_cuda(const uint16_t* embed, const int* decode_meta, uint16_t* out, int hidden_size, CUstream stream)",
+        "CUstream stream, CUdeviceptr embed, CUdeviceptr decode_meta, CUdeviceptr out, int32_t hidden_size",
+        "stream, (CUdeviceptr)embed, (CUdeviceptr)decode_meta, (CUdeviceptr)out, (int32_t)hidden_size",
+        &mut generated_sources,
     );
-    generated_sources.push(embedding_decode_c);
-    generated_sources.push(embedding_decode_wrapper);
 
     let embedding_batched_spec = TritonKernelSpec {
         artifact_dir: "embedding_batched",
@@ -437,18 +538,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
         num_warps: 4,
         num_stages: 2,
     };
-    let (embedding_batched_func, embedding_batched_c) =
-        generate_triton_artifacts(&python, out_dir, &triton_target, &embedding_batched_spec);
-    let embedding_batched_wrapper = write_wrapper(
-        &embedding_batched_c,
-        "triton_embedding_batched_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr embed, CUdeviceptr token_ids, CUdeviceptr out, int32_t hidden_size, int32_t seq_len);\n\nCUresult embedding_batched_cuda(const uint16_t* embed, const int* token_ids, uint16_t* out, int hidden_size, int seq_len, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)embed, (CUdeviceptr)token_ids, (CUdeviceptr)out, (int32_t)hidden_size, (int32_t)seq_len);\n}}\n",
-            func = embedding_batched_func
-        ),
+    build_triton_kernel(
+        &python,
+        out_dir,
+        sm_targets,
+        &embedding_batched_spec,
+        "embedding_batched_cuda(const uint16_t* embed, const int* token_ids, uint16_t* out, int hidden_size, int seq_len, CUstream stream)",
+        "CUstream stream, CUdeviceptr embed, CUdeviceptr token_ids, CUdeviceptr out, int32_t hidden_size, int32_t seq_len",
+        "stream, (CUdeviceptr)embed, (CUdeviceptr)token_ids, (CUdeviceptr)out, (int32_t)hidden_size, (int32_t)seq_len",
+        &mut generated_sources,
     );
-    generated_sources.push(embedding_batched_c);
-    generated_sources.push(embedding_batched_wrapper);
 
     let flash_attn_prefill_hd256_spec = TritonKernelSpec {
         artifact_dir: "flash_attention_prefill_hd256",
@@ -460,22 +559,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
         num_warps: 4,
         num_stages: 2,
     };
-    let (flash_attn_hd256_func, flash_attn_hd256_c) = generate_triton_artifacts(
+    build_triton_kernel(
         &python,
         out_dir,
-        &triton_target,
+        sm_targets,
         &flash_attn_prefill_hd256_spec,
+        "flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, const int32_t* start_pos_ptr, int32_t max_seq_len, int32_t q_dim, CUstream stream)",
+        "CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, CUdeviceptr start_pos_ptr, int32_t max_seq_len, int32_t q_dim",
+        "stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, (CUdeviceptr)start_pos_ptr, max_seq_len, q_dim",
+        &mut generated_sources,
     );
-    let flash_attn_hd256_wrapper = write_wrapper(
-        &flash_attn_hd256_c,
-        "triton_flash_attention_prefill_hd256_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, CUdeviceptr start_pos_ptr, int32_t max_seq_len, int32_t q_dim);\n\nCUresult flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, const int32_t* start_pos_ptr, int32_t max_seq_len, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, (CUdeviceptr)start_pos_ptr, max_seq_len, q_dim);\n}}\n",
-            func = flash_attn_hd256_func
-        ),
-    );
-    generated_sources.push(flash_attn_hd256_c);
-    generated_sources.push(flash_attn_hd256_wrapper);
 
     if chunkwise_kernel_path.exists() {
         let gdr_prepare_spec = TritonKernelSpec {
@@ -488,18 +581,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
             num_warps: 4,
             num_stages: 2,
         };
-        let (gdr_prepare_func, gdr_prepare_c) =
-            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_prepare_spec);
-        let gdr_prepare_wrapper = write_wrapper(
-            &gdr_prepare_c,
-            "triton_gated_delta_rule_chunk_prepare_wrapper.c",
-            format!(
-                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr qkv, CUdeviceptr b_proj, CUdeviceptr a_proj, CUdeviceptr dt_bias, CUdeviceptr a_log, CUdeviceptr q_out, CUdeviceptr k_out, CUdeviceptr v_out, CUdeviceptr g_out, CUdeviceptr beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len);\n\nCUresult gated_delta_rule_prefill_chunk_prepare_cuda(const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)qkv, (CUdeviceptr)b_proj, (CUdeviceptr)a_proj, (CUdeviceptr)dt_bias, (CUdeviceptr)a_log, (CUdeviceptr)q_out, (CUdeviceptr)k_out, (CUdeviceptr)v_out, (CUdeviceptr)g_out, (CUdeviceptr)beta_out, num_key_heads, num_value_heads, qkv_dim, seq_len);\n}}\n",
-                func = gdr_prepare_func
-            ),
+        build_triton_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            &gdr_prepare_spec,
+            "gated_delta_rule_prefill_chunk_prepare_cuda(const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream)",
+            "CUstream stream, CUdeviceptr qkv, CUdeviceptr b_proj, CUdeviceptr a_proj, CUdeviceptr dt_bias, CUdeviceptr a_log, CUdeviceptr q_out, CUdeviceptr k_out, CUdeviceptr v_out, CUdeviceptr g_out, CUdeviceptr beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len",
+            "stream, (CUdeviceptr)qkv, (CUdeviceptr)b_proj, (CUdeviceptr)a_proj, (CUdeviceptr)dt_bias, (CUdeviceptr)a_log, (CUdeviceptr)q_out, (CUdeviceptr)k_out, (CUdeviceptr)v_out, (CUdeviceptr)g_out, (CUdeviceptr)beta_out, num_key_heads, num_value_heads, qkv_dim, seq_len",
+            &mut generated_sources,
         );
-        generated_sources.push(gdr_prepare_c);
-        generated_sources.push(gdr_prepare_wrapper);
 
         let gdr_cumsum_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_cumsum",
@@ -511,18 +602,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
             num_warps: 1,
             num_stages: 1,
         };
-        let (gdr_cumsum_func, gdr_cumsum_c) =
-            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_cumsum_spec);
-        let gdr_cumsum_wrapper = write_wrapper(
-            &gdr_cumsum_c,
-            "triton_gated_delta_rule_chunk_cumsum_wrapper.c",
-            format!(
-                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr g_in, CUdeviceptr g_out, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_cumsum_cuda(const float* g_in, float* g_out, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)g_in, (CUdeviceptr)g_out, seq_len, num_value_heads);\n}}\n",
-                func = gdr_cumsum_func
-            ),
+        build_triton_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            &gdr_cumsum_spec,
+            "gated_delta_rule_prefill_chunk_cumsum_cuda(const float* g_in, float* g_out, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
+            "CUstream stream, CUdeviceptr g_in, CUdeviceptr g_out, int32_t seq_len, int32_t num_value_heads",
+            "stream, (CUdeviceptr)g_in, (CUdeviceptr)g_out, seq_len, num_value_heads",
+            &mut generated_sources,
         );
-        generated_sources.push(gdr_cumsum_c);
-        generated_sources.push(gdr_cumsum_wrapper);
 
         let gdr_a_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_a",
@@ -534,18 +623,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
             num_warps: 4,
             num_stages: 2,
         };
-        let (gdr_a_func, gdr_a_c) =
-            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_a_spec);
-        let gdr_a_wrapper = write_wrapper(
-            &gdr_a_c,
-            "triton_gated_delta_rule_chunk_a_wrapper.c",
-            format!(
-                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr k, CUdeviceptr g_cumsum, CUdeviceptr beta, CUdeviceptr a_tril, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_a_cuda(const uint16_t* k, const float* g_cumsum, const float* beta, float* a_tril, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)k, (CUdeviceptr)g_cumsum, (CUdeviceptr)beta, (CUdeviceptr)a_tril, seq_len, num_value_heads);\n}}\n",
-                func = gdr_a_func
-            ),
+        build_triton_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            &gdr_a_spec,
+            "gated_delta_rule_prefill_chunk_a_cuda(const uint16_t* k, const float* g_cumsum, const float* beta, float* a_tril, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
+            "CUstream stream, CUdeviceptr k, CUdeviceptr g_cumsum, CUdeviceptr beta, CUdeviceptr a_tril, int32_t seq_len, int32_t num_value_heads",
+            "stream, (CUdeviceptr)k, (CUdeviceptr)g_cumsum, (CUdeviceptr)beta, (CUdeviceptr)a_tril, seq_len, num_value_heads",
+            &mut generated_sources,
         );
-        generated_sources.push(gdr_a_c);
-        generated_sources.push(gdr_a_wrapper);
 
         let gdr_solve_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_solve",
@@ -557,18 +644,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
             num_warps: 4,
             num_stages: 2,
         };
-        let (gdr_solve_func, gdr_solve_c) =
-            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_solve_spec);
-        let gdr_solve_wrapper = write_wrapper(
-            &gdr_solve_c,
-            "triton_gated_delta_rule_chunk_solve_wrapper.c",
-            format!(
-                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr a_tril, CUdeviceptr a_inv, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_solve_cuda(const float* a_tril, uint16_t* a_inv, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)a_tril, (CUdeviceptr)a_inv, seq_len, num_value_heads);\n}}\n",
-                func = gdr_solve_func
-            ),
+        build_triton_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            &gdr_solve_spec,
+            "gated_delta_rule_prefill_chunk_solve_cuda(const float* a_tril, uint16_t* a_inv, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
+            "CUstream stream, CUdeviceptr a_tril, CUdeviceptr a_inv, int32_t seq_len, int32_t num_value_heads",
+            "stream, (CUdeviceptr)a_tril, (CUdeviceptr)a_inv, seq_len, num_value_heads",
+            &mut generated_sources,
         );
-        generated_sources.push(gdr_solve_c);
-        generated_sources.push(gdr_solve_wrapper);
 
         let gdr_recompute_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_recompute",
@@ -580,18 +665,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
             num_warps: 4,
             num_stages: 2,
         };
-        let (gdr_recompute_func, gdr_recompute_c) =
-            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_recompute_spec);
-        let gdr_recompute_wrapper = write_wrapper(
-            &gdr_recompute_c,
-            "triton_gated_delta_rule_chunk_recompute_wrapper.c",
-            format!(
-                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr k, CUdeviceptr v, CUdeviceptr beta, CUdeviceptr w, CUdeviceptr u, CUdeviceptr a_inv, CUdeviceptr g_cumsum, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_recompute_cuda(const uint16_t* k, const uint16_t* v, const float* beta, uint16_t* w, uint16_t* u, const uint16_t* a_inv, const float* g_cumsum, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)k, (CUdeviceptr)v, (CUdeviceptr)beta, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)a_inv, (CUdeviceptr)g_cumsum, seq_len, num_value_heads);\n}}\n",
-                func = gdr_recompute_func
-            ),
+        build_triton_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            &gdr_recompute_spec,
+            "gated_delta_rule_prefill_chunk_recompute_cuda(const uint16_t* k, const uint16_t* v, const float* beta, uint16_t* w, uint16_t* u, const uint16_t* a_inv, const float* g_cumsum, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
+            "CUstream stream, CUdeviceptr k, CUdeviceptr v, CUdeviceptr beta, CUdeviceptr w, CUdeviceptr u, CUdeviceptr a_inv, CUdeviceptr g_cumsum, int32_t seq_len, int32_t num_value_heads",
+            "stream, (CUdeviceptr)k, (CUdeviceptr)v, (CUdeviceptr)beta, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)a_inv, (CUdeviceptr)g_cumsum, seq_len, num_value_heads",
+            &mut generated_sources,
         );
-        generated_sources.push(gdr_recompute_c);
-        generated_sources.push(gdr_recompute_wrapper);
 
         let gdr_chunk_state_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_state",
@@ -603,18 +686,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
             num_warps: 4,
             num_stages: 2,
         };
-        let (gdr_chunk_state_func, gdr_chunk_state_c) =
-            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_chunk_state_spec);
-        let gdr_chunk_state_wrapper = write_wrapper(
-            &gdr_chunk_state_c,
-            "triton_gated_delta_rule_chunk_state_wrapper.c",
-            format!(
-                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr k, CUdeviceptr w, CUdeviceptr u, CUdeviceptr g_cumsum, CUdeviceptr initial_state, CUdeviceptr chunk_state, CUdeviceptr v_new, CUdeviceptr final_state, int32_t seq_len, int32_t num_value_heads);\n\nCUresult gated_delta_rule_prefill_chunk_state_cuda(const uint16_t* k, const uint16_t* w, const uint16_t* u, const float* g_cumsum, const float* initial_state, float* chunk_state, uint16_t* v_new, float* final_state, int32_t seq_len, int32_t num_value_heads, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)k, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)g_cumsum, (CUdeviceptr)initial_state, (CUdeviceptr)chunk_state, (CUdeviceptr)v_new, (CUdeviceptr)final_state, seq_len, num_value_heads);\n}}\n",
-                func = gdr_chunk_state_func
-            ),
+        build_triton_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            &gdr_chunk_state_spec,
+            "gated_delta_rule_prefill_chunk_state_cuda(const uint16_t* k, const uint16_t* w, const uint16_t* u, const float* g_cumsum, const float* initial_state, float* chunk_state, uint16_t* v_new, float* final_state, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
+            "CUstream stream, CUdeviceptr k, CUdeviceptr w, CUdeviceptr u, CUdeviceptr g_cumsum, CUdeviceptr initial_state, CUdeviceptr chunk_state, CUdeviceptr v_new, CUdeviceptr final_state, int32_t seq_len, int32_t num_value_heads",
+            "stream, (CUdeviceptr)k, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)g_cumsum, (CUdeviceptr)initial_state, (CUdeviceptr)chunk_state, (CUdeviceptr)v_new, (CUdeviceptr)final_state, seq_len, num_value_heads",
+            &mut generated_sources,
         );
-        generated_sources.push(gdr_chunk_state_c);
-        generated_sources.push(gdr_chunk_state_wrapper);
 
         let gdr_chunk_o_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_o",
@@ -626,18 +707,16 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
             num_warps: 4,
             num_stages: 2,
         };
-        let (gdr_chunk_o_func, gdr_chunk_o_c) =
-            generate_triton_artifacts(&python, out_dir, &triton_target, &gdr_chunk_o_spec);
-        let gdr_chunk_o_wrapper = write_wrapper(
-            &gdr_chunk_o_c,
-            "triton_gated_delta_rule_chunk_o_wrapper.c",
-            format!(
-                "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v_new, CUdeviceptr chunk_state, CUdeviceptr g_cumsum, CUdeviceptr output, int32_t seq_len, int32_t num_value_heads, float scale);\n\nCUresult gated_delta_rule_prefill_chunk_o_cuda(const uint16_t* q, const uint16_t* k, const uint16_t* v_new, const float* chunk_state, const float* g_cumsum, uint16_t* output, int32_t seq_len, int32_t num_value_heads, float scale, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)q, (CUdeviceptr)k, (CUdeviceptr)v_new, (CUdeviceptr)chunk_state, (CUdeviceptr)g_cumsum, (CUdeviceptr)output, seq_len, num_value_heads, scale);\n}}\n",
-                func = gdr_chunk_o_func
-            ),
+        build_triton_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            &gdr_chunk_o_spec,
+            "gated_delta_rule_prefill_chunk_o_cuda(const uint16_t* q, const uint16_t* k, const uint16_t* v_new, const float* chunk_state, const float* g_cumsum, uint16_t* output, int32_t seq_len, int32_t num_value_heads, float scale, CUstream stream)",
+            "CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v_new, CUdeviceptr chunk_state, CUdeviceptr g_cumsum, CUdeviceptr output, int32_t seq_len, int32_t num_value_heads, float scale",
+            "stream, (CUdeviceptr)q, (CUdeviceptr)k, (CUdeviceptr)v_new, (CUdeviceptr)chunk_state, (CUdeviceptr)g_cumsum, (CUdeviceptr)output, seq_len, num_value_heads, scale",
+            &mut generated_sources,
         );
-        generated_sources.push(gdr_chunk_o_c);
-        generated_sources.push(gdr_chunk_o_wrapper);
     } else {
         println!(
             "cargo:warning=Skipping chunk-wise GDR Triton AOT scaffolding because {} is not present yet.",
@@ -658,7 +737,8 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=Using Triton AOT as the default path for silu_mul, add, embedding, Qwen3 decode attention, and Qwen3.5 prefill GDR; extract/write vector copies now use cudarc device memcpy"
+        "cargo:warning=Triton AOT: built per-SM cubins for {} target(s); SM dispatch via pthread_once + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        sm_targets.len()
     );
     // Triton kernel sources: invalidate AOT cache if any kernel .py changes.
     for entry in std::fs::read_dir("tools/triton")
@@ -763,23 +843,21 @@ fn find_tilelang_python() -> Result<String, String> {
     ))
 }
 
-fn tilelang_target(sm_targets: &[SmSpec]) -> (String, u32) {
-    let max_sm = sm_targets
-        .iter()
-        .filter_map(|s| s.sm.parse::<u32>().ok())
-        .max()
-        .expect("expected at least one CUDA SM target for TileLang AOT");
+/// Per-SM TileLang AOT artifact: (sm token, exported func name, generated .c path).
+type TileLangPerSmArtifact = (String, String, PathBuf);
 
-    if sm_targets.len() > 1 {
-        println!(
-            "cargo:warning=TileLang AOT emits one cubin per kernel; using highest detected target sm_{max_sm}. \
-             Multi-SM TileLang AOT lands in commit C of the multi-SM rollout (docs/plans/sm-coverage.md). \
-             Set TORCH_CUDA_ARCH_LIST to pin one target explicitly."
-        );
-    }
-
-    (format!("cuda -arch=sm_{max_sm}"), max_sm)
-}
+/// 18-arg public C signature shared by all three TileLang families
+/// (HD128 prefill / HD256 prefill / HD256 decode). Matches the FFI
+/// macros in `crates/cuda-kernels/src/ffi/attention.rs`.
+const TILELANG_DISPATCH_PUBLIC_DECL: &str = "uint16_t *q, const int32_t *q_indptr, uint16_t *k_pool, uint16_t *v_pool, \
+     const int32_t *kv_indptr, const int32_t *kv_indices, const int32_t *kv_last_page_len, \
+     uint16_t *o, int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, \
+     int32_t num_pages, int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, \
+     int32_t page_size, float sm_scale, CUstream stream";
+const TILELANG_DISPATCH_EXTERN_DECL: &str = TILELANG_DISPATCH_PUBLIC_DECL;
+const TILELANG_DISPATCH_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices, kv_last_page_len, o, \
+     batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
+     num_kv_heads, page_size, sm_scale, stream";
 
 /// Locate the directories the TileLang AOT generator needs for nvcc to
 /// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
@@ -821,78 +899,170 @@ print(json.dumps({
     (PathBuf::from(src), PathBuf::from(cutlass_include))
 }
 
-fn generate_tilelang_artifacts(
+/// Run gen_tilelang_aot.py once per SM target. Each per-SM invocation:
+///   - artifact_dir = `<base>_sm{sm}` so cubin/.c paths are unique;
+///   - out_name = `<base>_sm{sm}` (drives the .cubin / .c filenames);
+///   - kernel_name = `<base_kernel_name>_sm{sm}` so the exported symbol is
+///     `<base_kernel_name>_sm{sm}_cuda` (TileLang's gen script appends
+///     `_cuda`). The base symbol (`<base_kernel_name>_cuda`) is reserved
+///     for the dispatch wrapper that this driver writes.
+///
+/// Hard-fail on any (kernel, SM) compile failure; suggest a
+/// `TORCH_CUDA_ARCH_LIST=...` value that excludes the failing SM.
+fn generate_tilelang_artifacts_per_sm(
     python: &str,
     out_dir: &Path,
-    target: &str,
-    cuda_arch: u32,
+    sm_targets: &[SmSpec],
     cuda_path: &str,
     tilelang_src: &Path,
     cutlass_include: &Path,
-    spec: &TileLangKernelSpec,
-) -> (String, PathBuf) {
+    base_spec: &TileLangKernelSpec,
+) -> Vec<TileLangPerSmArtifact> {
     let generator_path = PathBuf::from("tools/tilelang/gen_tilelang_aot.py");
-    let artifact_dir = out_dir.join("tilelang_aot").join(&spec.artifact_dir);
+    let mut results = Vec::new();
 
-    let output = Command::new(python)
-        .arg(&generator_path)
-        .arg("--kernel-path")
-        .arg(spec.kernel_path)
-        .arg("--kernel-name")
-        .arg(&spec.kernel_name)
-        .arg("--out-name")
-        .arg(&spec.out_name)
-        .arg("--out-dir")
-        .arg(&artifact_dir)
-        .arg("--target")
-        .arg(target)
-        .arg("--num-q-heads")
-        .arg(spec.num_q_heads.to_string())
-        .arg("--num-kv-heads")
-        .arg(spec.num_kv_heads.to_string())
-        .arg("--cuda-arch")
-        .arg(cuda_arch.to_string())
-        .arg("--tilelang-src")
-        .arg(tilelang_src)
-        .arg("--cutlass-include")
-        .arg(cutlass_include)
-        .arg("--cuda-include")
-        .arg(format!("{cuda_path}/include"))
-        .output()
-        .unwrap_or_else(|err| {
+    for sm in sm_targets {
+        let sm_token = &sm.sm;
+        let cuda_arch: u32 = sm_token
+            .parse()
+            .expect("SmSpec.sm passed whitelist; must parse as u32");
+        let target = format!("cuda -arch=sm_{sm_token}");
+
+        let per_sm_artifact_dir = format!("{}_sm{sm_token}", base_spec.artifact_dir);
+        let per_sm_out_name = format!("{}_sm{sm_token}", base_spec.out_name);
+        let per_sm_kernel_name = format!("{}_sm{sm_token}", base_spec.kernel_name);
+        let artifact_dir = out_dir.join("tilelang_aot").join(&per_sm_artifact_dir);
+
+        let output = Command::new(python)
+            .arg(&generator_path)
+            .arg("--kernel-path")
+            .arg(base_spec.kernel_path)
+            .arg("--kernel-name")
+            .arg(&per_sm_kernel_name)
+            .arg("--out-name")
+            .arg(&per_sm_out_name)
+            .arg("--out-dir")
+            .arg(&artifact_dir)
+            .arg("--target")
+            .arg(&target)
+            .arg("--num-q-heads")
+            .arg(base_spec.num_q_heads.to_string())
+            .arg("--num-kv-heads")
+            .arg(base_spec.num_kv_heads.to_string())
+            .arg("--cuda-arch")
+            .arg(cuda_arch.to_string())
+            .arg("--tilelang-src")
+            .arg(tilelang_src)
+            .arg("--cutlass-include")
+            .arg(cutlass_include)
+            .arg("--cuda-include")
+            .arg(format!("{cuda_path}/include"))
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to spawn TileLang AOT generator for {} on sm_{sm_token}: {err}",
+                    base_spec.kernel_name
+                )
+            });
+
+        if !output.status.success() {
+            let other_sms: Vec<String> = sm_targets
+                .iter()
+                .filter(|s| s.sm != *sm_token)
+                .map(|s| sm_to_arch_list_token(&s.sm))
+                .collect();
+            let suggestion = if other_sms.is_empty() {
+                "all targets failed; bump tilelang in pyproject.toml or pin a working version"
+                    .to_string()
+            } else {
+                format!("TORCH_CUDA_ARCH_LIST=\"{}\"", other_sms.join(";"))
+            };
             panic!(
-                "failed to run TileLang AOT generator for {}: {err}",
-                spec.kernel_name
-            )
-        });
-
-    assert!(
-        output.status.success(),
-        "TileLang AOT generator failed for {}. stdout: {} stderr: {}",
-        spec.kernel_name,
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut func_name = None;
-    let mut c_path = None;
-    for line in stdout.lines() {
-        if let Some(value) = line.strip_prefix("FUNC_NAME=") {
-            func_name = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("C_PATH=") {
-            c_path = Some(PathBuf::from(value.trim()));
+                "TileLang AOT failed to compile {} for sm_{sm_token}.\n\
+                 stdout: {}\n\
+                 stderr: {}\n\n\
+                 Hint: bump tilelang (pin lives in pyproject.toml) OR exclude sm_{sm_token} via:\n  \
+                 {suggestion}\n\
+                 See docs/plans/sm-coverage.md.",
+                base_spec.kernel_name,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
         }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut func_name = None;
+        let mut c_path = None;
+        for line in stdout.lines() {
+            if let Some(value) = line.strip_prefix("FUNC_NAME=") {
+                func_name = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("C_PATH=") {
+                c_path = Some(PathBuf::from(value.trim()));
+            }
+        }
+
+        results.push((
+            sm_token.clone(),
+            func_name.expect("TileLang generator did not print FUNC_NAME"),
+            c_path.expect("TileLang generator did not print C_PATH"),
+        ));
     }
 
-    let func_name = func_name.expect("TileLang generator did not print FUNC_NAME");
-    let c_path = c_path.expect("TileLang generator did not print C_PATH");
-    (func_name, c_path)
+    results
+}
+
+/// Build one TileLang head-config kernel for every SM target: generate
+/// per-SM artifacts, write a single dispatch wrapper exposing
+/// `<base_kernel_name>_cuda`, and append all sources to
+/// `generated_sources` for cc::Build to compile.
+fn build_tilelang_kernel(
+    python: &str,
+    out_dir: &Path,
+    sm_targets: &[SmSpec],
+    cuda_path: &str,
+    tilelang_src: &Path,
+    cutlass_include: &Path,
+    base_spec: &TileLangKernelSpec,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    let per_sm = generate_tilelang_artifacts_per_sm(
+        python,
+        out_dir,
+        sm_targets,
+        cuda_path,
+        tilelang_src,
+        cutlass_include,
+        base_spec,
+    );
+    let pairs: Vec<(String, String)> = per_sm
+        .iter()
+        .map(|(sm, func, _)| (sm.clone(), func.clone()))
+        .collect();
+
+    let public_name = format!("{}_cuda", base_spec.kernel_name);
+    let public_decl = format!("{public_name}({TILELANG_DISPATCH_PUBLIC_DECL})");
+    let wrapper_src = format_dispatch_wrapper(
+        &public_decl,
+        TILELANG_DISPATCH_EXTERN_DECL,
+        TILELANG_DISPATCH_CALL_ARGS,
+        &pairs,
+    );
+
+    let dispatch_dir = out_dir
+        .join("tilelang_aot")
+        .join(format!("{}_dispatch", base_spec.artifact_dir));
+    std::fs::create_dir_all(&dispatch_dir).expect("create TileLang dispatch directory");
+    let wrapper_path = dispatch_dir.join(format!("{}_dispatch.c", base_spec.out_name));
+    std::fs::write(&wrapper_path, wrapper_src).expect("write TileLang dispatch wrapper");
+
+    for (_, _, c) in per_sm {
+        generated_sources.push(c);
+    }
+    generated_sources.push(wrapper_path);
 }
 
 fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
     let python = find_tilelang_python().unwrap_or_else(|message| panic!("{message}"));
-    let (target, cuda_arch) = tilelang_target(sm_targets);
     let (tilelang_src, cutlass_include) = tilelang_include_dirs(&python);
     let mut generated_sources = Vec::new();
 
@@ -906,17 +1076,16 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             num_q_heads: q,
             num_kv_heads: kv,
         };
-        let (_func, c_path) = generate_tilelang_artifacts(
+        build_tilelang_kernel(
             &python,
             out_dir,
-            &target,
-            cuda_arch,
+            sm_targets,
             cuda_path,
             &tilelang_src,
             &cutlass_include,
             &spec,
+            &mut generated_sources,
         );
-        generated_sources.push(c_path);
     }
 
     for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
@@ -929,17 +1098,16 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             num_q_heads: q,
             num_kv_heads: kv,
         };
-        let (_func, c_path) = generate_tilelang_artifacts(
+        build_tilelang_kernel(
             &python,
             out_dir,
-            &target,
-            cuda_arch,
+            sm_targets,
             cuda_path,
             &tilelang_src,
             &cutlass_include,
             &spec,
+            &mut generated_sources,
         );
-        generated_sources.push(c_path);
     }
 
     for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
@@ -952,17 +1120,16 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             num_q_heads: q,
             num_kv_heads: kv,
         };
-        let (_func, c_path) = generate_tilelang_artifacts(
+        build_tilelang_kernel(
             &python,
             out_dir,
-            &target,
-            cuda_arch,
+            sm_targets,
             cuda_path,
             &tilelang_src,
             &cutlass_include,
             &spec,
+            &mut generated_sources,
         );
-        generated_sources.push(c_path);
     }
 
     let mut build = cc::Build::new();
@@ -978,7 +1145,8 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=TileLang AOT enabled: prefill HD128 + HD256 and decode HD256 will dispatch to TileLang instead of FlashInfer."
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill + HD256 decode; SM dispatch via pthread_once + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        sm_targets.len()
     );
     for entry in std::fs::read_dir("tools/tilelang")
         .expect("tools/tilelang directory must exist")
