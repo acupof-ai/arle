@@ -1110,26 +1110,32 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         );
     }
 
-    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
-            kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
-            kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
-            out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
-            num_q_heads: q,
-            num_kv_heads: kv,
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
-        );
+    // HD256 decode AOT codegen currently fails with `M must be divisible by 16,
+    // but got 1` under TileLang 0.1.9 (BLOCK_M=1 violates GemmWarpPolicy). Gated
+    // behind an opt-in feature so the canonical Qwen3-4B HD128 build is unaffected.
+    // See docs/experience/errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md.
+    if std::env::var("CARGO_FEATURE_TILELANG_DECODE_HD256").is_ok() {
+        for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
+                kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
+                kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
+                out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
+                num_q_heads: q,
+                num_kv_heads: kv,
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
     }
 
     let mut build = cc::Build::new();
@@ -1144,8 +1150,13 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
     build.compile("tilelang_kernels_aot");
 
     println!("cargo:rustc-link-lib=cuda");
+    let decode_hd256_msg = if std::env::var("CARGO_FEATURE_TILELANG_DECODE_HD256").is_ok() {
+        " + HD256 decode"
+    } else {
+        " (HD256 decode gated behind --features tilelang-decode-hd256; falls back to FlashInfer)"
+    };
     println!(
-        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill + HD256 decode; SM dispatch via pthread_once + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill{decode_hd256_msg}; SM dispatch via pthread_once + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
         sm_targets.len()
     );
     for entry in std::fs::read_dir("tools/tilelang")

@@ -1518,16 +1518,21 @@ pub(crate) fn flashinfer_run_layer_hd256(
 ) -> Result<()> {
     let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
-    #[cfg(feature = "tilelang-attn")]
+    // HD256 decode TileLang dispatch is gated by `tilelang-decode-hd256`,
+    // not the broader `tilelang-attn` feature, because the AOT codegen for
+    // HD256 decode currently fails on TileLang 0.1.9. The HD128 prefill /
+    // TC-decode path under `tilelang-attn` is unaffected. See
+    // docs/experience/errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md.
+    #[cfg(feature = "tilelang-decode-hd256")]
     let tilelang_kernel = {
         ensure!(
             heads.head_dim == 256,
-            "tilelang-attn: decode HD256 kernel requires head_dim=256, got {}",
+            "tilelang-decode-hd256: decode HD256 kernel requires head_dim=256, got {}",
             heads.head_dim
         );
         ensure!(
             heads.page_size == 16,
-            "tilelang-attn: decode HD256 kernel requires page_size=16, got {}",
+            "tilelang-decode-hd256: decode HD256 kernel requires page_size=16, got {}",
             heads.page_size
         );
         match (heads.num_qo_heads, heads.num_kv_heads) {
@@ -1536,7 +1541,7 @@ pub(crate) fn flashinfer_run_layer_hd256(
             (16, 4) => ffi::tilelang_batch_decode_paged_hd256_q16_kv4_run_cuda,
             other => {
                 return Err(anyhow!(
-                    "tilelang-attn: no specialized decode HD256 kernel for \
+                    "tilelang-decode-hd256: no specialized decode HD256 kernel for \
                      (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
                      are (8,2), (16,2), (16,4). Extend SUPPORTED_HEADS \
                      in tools/tilelang/batch_decode_paged_hd256.py, \
@@ -1557,7 +1562,7 @@ pub(crate) fn flashinfer_run_layer_hd256(
     let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
     let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
 
-    #[cfg(not(feature = "tilelang-attn"))]
+    #[cfg(not(feature = "tilelang-decode-hd256"))]
     {
         let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
         let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
@@ -1595,7 +1600,7 @@ pub(crate) fn flashinfer_run_layer_hd256(
         }
     }
 
-    #[cfg(feature = "tilelang-attn")]
+    #[cfg(feature = "tilelang-decode-hd256")]
     {
         let _ = workspace; // TileLang is plan-less; workspace is unused here.
         // Decode: qlen=1 per request, so total_q_tokens == batch_size.

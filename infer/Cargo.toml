@@ -67,6 +67,11 @@ cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda"]
 no-cuda = ["cuda-kernels/no-cuda"]
 # TileLang prefill HD128 attention path. Compile-time A/B against FlashInfer.
 tilelang-attn = ["cuda", "cuda-kernels/tilelang-attn"]
+# Opt-in extension that pulls in the broken HD256 decode tranche too —
+# only enable when validating the Qwen3.5 full-attn TileLang path.
+# `cargo build --features cuda,tilelang-attn` (the canonical Qwen3-4B
+# path) should not require this.
+tilelang-decode-hd256 = ["tilelang-attn", "cuda-kernels/tilelang-decode-hd256"]
 # Development-oriented CPU backend for serial smoke tests and local validation.
 cpu = []
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).

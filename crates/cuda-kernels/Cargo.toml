@@ -13,6 +13,14 @@ tilelang-attn = ["cuda"]
 # Implies `cuda` because `crate::ffi::nccl` lives under `crate::ffi` which
 # is itself gated on `cuda` (matching reality: NCCL requires CUDA).
 nccl = ["cuda"]
+# TileLang HD256 decode (Qwen3.5 q*_kv* full-attn path). Off by default
+# because the AOT codegen currently fails with `M must be divisible by
+# 16, but got 1` under TileLang 0.1.9 — pure-decode batches have
+# BLOCK_M=1 which violates the GemmWarpPolicy invariant. Re-enable
+# explicitly once the kernel is rewritten to avoid the M=1 GEMM
+# (e.g. pad Q to 16 and mask, or use a bespoke GEMV path). See
+# docs/experience/errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md.
+tilelang-decode-hd256 = ["tilelang-attn"]
 
 [dependencies]
 anyhow = "1.0"
