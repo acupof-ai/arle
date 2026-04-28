@@ -9,6 +9,7 @@ pub mod weight_loader;
 // Always-available modules (pure Rust, no GPU dependency).
 pub mod backend;
 pub mod block_manager;
+pub mod distributed;
 pub mod error;
 pub mod events;
 pub mod gguf;
