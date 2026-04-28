@@ -12,6 +12,18 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+/// Like `parse_positive_usize` but also accepts `0` as an "auto" sentinel —
+/// used by `--max-tokens` so users can ask the CLI to read the model's
+/// `max_position_embeddings` (or `context_length`) at startup instead of
+/// pinning a fixed cap. Negative or non-integer input is still rejected.
+fn parse_max_tokens_or_auto(value: &str) -> Result<usize, String> {
+    let trimmed = value.trim();
+    if trimmed == "auto" || trimmed == "0" {
+        return Ok(0);
+    }
+    parse_positive_usize(trimmed)
+}
+
 fn parse_temperature(value: &str) -> Result<f32, String> {
     let parsed = value
         .parse::<f32>()
@@ -185,12 +197,13 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 250, value_parser = parse_positive_usize)]
     pub(crate) max_turns: usize,
 
-    /// Maximum tokens to generate per turn. The default (65536) is a
-    /// "trust the model" ceiling — modern Qwen3 / Qwen3.5 deployments
-    /// stop at EOS or the model's own context cap well below this, so
-    /// in practice this just removes a 4096-token clamp that was
-    /// truncating long answers. Override with `--max-tokens N`.
-    #[arg(long, default_value_t = 65536, value_parser = parse_positive_usize)]
+    /// Maximum tokens to generate per turn. Default `0` means "auto" —
+    /// the CLI reads `max_position_embeddings` (or `context_length` for
+    /// GGUF) from the model's config at startup and uses that as the
+    /// per-turn cap. Pass `--max-tokens N` to pin an explicit value.
+    /// Pass `--max-tokens auto` (or `0`) to make the auto-resolution
+    /// explicit. If config can't be read, falls back to 262144 (256K).
+    #[arg(long, default_value_t = 0, value_parser = parse_max_tokens_or_auto)]
     pub(crate) max_tokens: usize,
 
     /// Sampling temperature (0.0 = greedy)
@@ -1099,11 +1112,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_max_tokens() {
-        let err = Args::try_parse_from(["arle", "--max-tokens", "0"])
-            .err()
-            .expect("zero max-tokens should be rejected");
-        assert!(err.to_string().contains("at least 1"));
+    fn accepts_zero_max_tokens_as_auto_sentinel() {
+        // 0 is reserved as the "auto-resolve from model config" sentinel —
+        // the CLI substitutes `max_position_embeddings` at startup before
+        // any inference call, so the engine never sees a literal 0.
+        let args = Args::try_parse_from(["arle", "--max-tokens", "0"])
+            .expect("0 max-tokens should parse as auto");
+        assert_eq!(args.max_tokens, 0);
+    }
+
+    #[test]
+    fn accepts_auto_keyword_for_max_tokens() {
+        let args = Args::try_parse_from(["arle", "--max-tokens", "auto"])
+            .expect("'auto' should parse as the same sentinel");
+        assert_eq!(args.max_tokens, 0);
+    }
+
+    #[test]
+    fn rejects_negative_or_garbage_max_tokens() {
+        // Anything other than 0/auto/positive-integer must still error out.
+        for bad in ["-1", "1.5", "abc", " "] {
+            let err = Args::try_parse_from(["arle", "--max-tokens", bad])
+                .err()
+                .unwrap_or_else(|| panic!("garbage value `{bad}` should be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("expected") || msg.contains("at least 1"),
+                "unexpected error for `{bad}`: {msg}"
+            );
+        }
     }
 
     #[test]

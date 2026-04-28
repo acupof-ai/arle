@@ -145,6 +145,8 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
             welcome::print_welcome_banner(engine.model_id());
         }
 
+        let max_tokens = resolve_max_tokens(&model_source, args.max_tokens);
+
         match run_args {
             Some(run_args) if run_args.prompt.is_some() || run_args.stdin => {
                 let tools_enabled = !(args.no_tools || run_args.no_tools);
@@ -152,7 +154,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                     &mut engine,
                     &backend_name,
                     args.max_turns,
-                    args.max_tokens,
+                    max_tokens,
                     args.temperature,
                     &run_args,
                     tools_enabled,
@@ -162,7 +164,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                 &mut engine,
                 &backend_name,
                 args.max_turns,
-                args.max_tokens,
+                max_tokens,
                 args.temperature,
                 !(args.no_tools || run_args.no_tools),
             )?,
@@ -170,12 +172,105 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                 &mut engine,
                 &backend_name,
                 args.max_turns,
-                args.max_tokens,
+                max_tokens,
                 args.temperature,
                 !args.no_tools,
             )?,
         }
 
         Ok(())
+    }
+}
+
+/// Resolve the per-turn token cap. `requested == 0` means "auto" — read
+/// `max_position_embeddings` (or `context_length` for GGUF) from the
+/// model's config.json and use that. Falls back to 256K (262144) only
+/// when the config truly can't be read, and logs which path won so
+/// users can verify.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn resolve_max_tokens(model_path: &str, requested: usize) -> usize {
+    const FALLBACK: usize = 262_144;
+    if requested > 0 {
+        return requested;
+    }
+    match read_model_max_context(model_path) {
+        Some(n) => {
+            log::info!(
+                "max-tokens: auto-resolved to {n} from {model_path}/config.json (max_position_embeddings)"
+            );
+            n
+        }
+        None => {
+            log::info!(
+                "max-tokens: auto-resolution failed for {model_path}; falling back to {FALLBACK}"
+            );
+            FALLBACK
+        }
+    }
+}
+
+/// Best-effort lookup of the model's context length. Tries, in order,
+/// `max_position_embeddings` (HF transformers convention) and
+/// `context_length` (GGUF / llama.cpp convention) from `<model_path>/config.json`.
+/// Returns `None` for any failure (missing path, bad JSON, missing field).
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn read_model_max_context(model_path: &str) -> Option<usize> {
+    let cfg_path = std::path::Path::new(model_path).join("config.json");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    cfg.get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .or_else(|| cfg.get("context_length").and_then(|v| v.as_u64()))
+        .map(|n| n as usize)
+        .filter(|&n| n > 0)
+}
+
+#[cfg(test)]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod resolve_tests {
+    use super::{read_model_max_context, resolve_max_tokens};
+    use std::io::Write;
+
+    fn write_config(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut f = std::fs::File::create(dir.path().join("config.json")).expect("create");
+        f.write_all(json.as_bytes()).expect("write");
+        dir
+    }
+
+    #[test]
+    fn explicit_max_tokens_wins_over_auto() {
+        let dir = write_config(r#"{"max_position_embeddings": 32768}"#);
+        // requested == 4096 (non-zero) → ignore config, use 4096.
+        assert_eq!(resolve_max_tokens(dir.path().to_str().unwrap(), 4096), 4096);
+    }
+
+    #[test]
+    fn auto_pulls_max_position_embeddings_from_config() {
+        let dir = write_config(r#"{"max_position_embeddings": 262144, "other": "x"}"#);
+        assert_eq!(resolve_max_tokens(dir.path().to_str().unwrap(), 0), 262_144);
+    }
+
+    #[test]
+    fn auto_falls_back_to_context_length_for_gguf_style_config() {
+        // Some configs (often GGUF-derived) only carry `context_length`.
+        let dir = write_config(r#"{"context_length": 32768}"#);
+        assert_eq!(resolve_max_tokens(dir.path().to_str().unwrap(), 0), 32768);
+    }
+
+    #[test]
+    fn auto_falls_back_to_default_when_config_missing() {
+        // /tmp/nonexistent → no config.json → 262144 fallback.
+        let bogus = std::env::temp_dir().join(format!("arle-no-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bogus);
+        assert_eq!(resolve_max_tokens(bogus.to_str().unwrap(), 0), 262_144);
+    }
+
+    #[test]
+    fn read_model_max_context_returns_none_on_zero_value() {
+        // A 0 in the config is nonsense — treat as "absent" and let the
+        // caller's fallback fire instead of pinning the cap to 0.
+        let dir = write_config(r#"{"max_position_embeddings": 0}"#);
+        assert!(read_model_max_context(dir.path().to_str().unwrap()).is_none());
     }
 }
