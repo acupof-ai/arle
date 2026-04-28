@@ -244,10 +244,7 @@ mod tests {
     #[test]
     fn adamw_for_backend_keeps_cpu_host_backed() {
         let optim = adamw_for_backend(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0, Arc::new(CpuBackend));
-        assert!(
-            format!("{optim:?}").contains("device_backed: false"),
-            "cpu helper must keep host AdamW: {optim:?}"
-        );
+        assert!(!optim.is_device_backed(), "cpu helper must keep host AdamW");
     }
 
     #[cfg(feature = "metal")]
@@ -261,8 +258,8 @@ mod tests {
             Arc::new(autograd::backend_metal::MetalBackend),
         );
         assert!(
-            format!("{optim:?}").contains("device_backed: true"),
-            "metal helper must enable device-backed AdamW: {optim:?}"
+            optim.is_device_backed(),
+            "metal helper must enable device-backed AdamW"
         );
     }
 }

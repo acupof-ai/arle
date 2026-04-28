@@ -108,6 +108,11 @@ impl AdamW {
         }
     }
 
+    #[must_use]
+    pub fn is_device_backed(&self) -> bool {
+        self.backend.is_some()
+    }
+
     pub fn step(&mut self, params: &[TensorId], store: &mut TensorStore) {
         self.step += 1;
         let (beta1, beta2) = self.betas;
