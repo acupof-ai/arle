@@ -15,7 +15,8 @@ cuda = ["infer/cuda", "train/cuda", "autograd/cuda"]
 no-cuda = ["infer/no-cuda", "train/no-cuda", "autograd/no-cuda"]
 cpu = ["infer/cpu"]
 metal = ["infer/metal", "train/metal", "autograd/metal"]
-tilelang-attn = ["cuda", "infer/tilelang-attn"]
+# Always-on under `cuda`; kept as a forwarding alias.
+tilelang-attn = ["infer/tilelang-attn"]
 nccl = ["cuda", "infer/nccl"]
 
 [dependencies]

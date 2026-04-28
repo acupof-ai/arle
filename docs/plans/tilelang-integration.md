@@ -1,9 +1,17 @@
 # TileLang integration — Phase 0: prefill HD128 attention
 
-**Status:** Phase 0 in flight (2026-04-26). Owner: ckl. Verification: remote
-H100 (user-driven). Prior art: `docs/plans/cuda-kernel-crate-extraction.md`
-(blueprint style), `crates/cuda-kernels/build.rs` lines 195–263 + 265–510
-(Triton AOT pattern this plan mirrors).
+**Status:** Phase 0 **shipped as default 2026-04-28**. The `cuda` feature
+now implies `tilelang-attn` (see `crates/cuda-kernels/Cargo.toml`); every
+`--features cuda` build uses the TileLang prefill HD128 kernel. The
+matched A/B that motivated the promotion is at
+[`docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md`](../experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md):
+TTFT p50 -82%, out tok/s +5.1% vs FlashInfer at c=16/4096-in/Qwen3-4B/L4
+after Patches A (causal-bound KV loop) + C (page-lookup hoist) landed.
+
+Owner: ckl. Verification: L4 sm_89 (in-tree). Prior art:
+`docs/plans/cuda-kernel-crate-extraction.md` (blueprint style),
+`crates/cuda-kernels/build.rs` lines 195–263 + 265–510 (Triton AOT
+pattern this plan mirrored).
 
 ---
 

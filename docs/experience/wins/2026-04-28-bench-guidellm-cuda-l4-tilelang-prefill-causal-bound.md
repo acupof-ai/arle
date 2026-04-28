@@ -161,6 +161,32 @@ ensure no low-c regression).
   `T.if_then_else` codegen on a scalar TIR Int producing worse
   pipelining than the static loop bound.
 
+## SGLang baseline reference (n=3 medians, same shape)
+
+SGLang 0.5.10.post1 / `--kv-cache-dtype fp8_e4m3 --max-running-requests 16
+--mem-fraction-static 0.85`:
+TTFT p50 = 3357 ms · ITL p50 = 67.14 ms · out tok/s = 201.00.
+
+After A+C our prefill is **faster than SGLang's** (TTFT 1012 vs 3357 ms, -70%)
+but our overall throughput trails (-22% on out tok/s) and our ITL is +25%
+slower. This is **not a kernel-quality gap** — verified via a config-fair
+re-run with `--max-prefill-tokens 16384` (matches SGLang) which actually
+*regressed* TTFT to 8407 ms because raising the prefill budget eats the
+runtime workspace and shrinks our KV pool from 102k → 84k tokens, triggering
+prefix-cache pressure thrashing. The real disparity is **KV pool capacity
+and decode-kernel layout**:
+
+| | Ours | SGLang |
+|---|---:|---:|
+| KV pool (tokens) | ~102k @ 8 GB | ~157k @ ~11.5 GB |
+| `page_size` (KV granularity) | 16 | 1 |
+| Workspace | 0.9 GB | minimal |
+| Decode HD128 | TileLang prefill cubin alias (BLOCK_M=64 wastes 63 padding rows) | dedicated decode kernel |
+
+Closing the gap is now **decode-kernel + KV-page-size** work, not prefill.
+See follow-up Patches B/D/E plus the dedicated `tilelang_batch_decode_paged_hd128`
+kernel called out at the parent doc lines 96-115.
+
 ## Deferred follow-up patches
 
 Same operator-roadmap thread as this one:

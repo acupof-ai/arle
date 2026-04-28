@@ -62,11 +62,14 @@ qwen35-spec = { path = "../crates/qwen35-spec" }
 
 [features]
 # Enable CUDA kernel compilation and GPU inference (default on Linux/GPU machines).
-cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda"]
+# Now implies `tilelang-attn` (TileLang prefill HD128 is the new default
+# path on Qwen3 / sm_89+; see the wins doc cited in cuda-kernels/Cargo.toml).
+cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda", "tilelang-attn"]
 # Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = ["cuda-kernels/no-cuda"]
-# TileLang prefill HD128 attention path. Compile-time A/B against FlashInfer.
-tilelang-attn = ["cuda", "cuda-kernels/tilelang-attn"]
+# TileLang prefill HD128 attention path. Always-on under `cuda`; this
+# feature is kept as a forwarding alias for the cuda-kernels crate gate.
+tilelang-attn = ["cuda-kernels/tilelang-attn"]
 # Opt-in extension that pulls in the broken HD256 decode tranche too —
 # only enable when validating the Qwen3.5 full-attn TileLang path.
 # `cargo build --features cuda,tilelang-attn` (the canonical Qwen3-4B

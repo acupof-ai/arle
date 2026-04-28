@@ -78,9 +78,11 @@ no-cuda = ["cli/no-cuda"]
 cpu = ["cli/cpu"]
 # Metal backend via mlx-sys (Apple Silicon). Pair with `no-cuda`.
 metal = ["cli/metal"]
-# TileLang prefill HD128 attention path (Phase 0 A/B vs FlashInfer).
-# Implies `cuda`. Forwards through `cli` and `infer` to `cuda-kernels`.
-tilelang-attn = ["cuda", "cli/tilelang-attn"]
+# TileLang prefill HD128 attention path. Default under `cuda` since
+# 2026-04-28 (TTFT -82%, tok/s +5.1% vs FlashInfer; see
+# docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md).
+# Kept as a forwarding alias.
+tilelang-attn = ["cli/tilelang-attn"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda`.
 # Forwards through `cli` → `infer` → `cuda-kernels`.
 nccl = ["cuda", "cli/nccl"]

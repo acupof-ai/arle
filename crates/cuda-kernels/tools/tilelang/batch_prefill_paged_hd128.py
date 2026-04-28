@@ -102,14 +102,21 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             row0 = bx * BLOCK_M
             kv_head = by // gqa_group
 
-            # Causal-bound KV loop: rows row0..row0+BLOCK_M-1 attend at most
-            # to KV col kv_offset + row0 + BLOCK_M - 1 (last row's diagonal),
-            # so cap the loop there to skip strictly-upper-triangle KV tiles
-            # entirely. Mirrors FlashInfer's `mask_iteration` pattern in
-            # `prefill.cuh` (skip iterations past the diagonal). For 4096-in
-            # cold prefill this drops ~35-50% of the per-tile QK + softmax
-            # + PV work the unbounded loop wasted.
-            kv_diag_limit = kv_offset + row0 + BLOCK_M
+            # Causal-bound KV loop: rows row0..min(row0+BLOCK_M, qlen)-1
+            # attend at most to KV col `kv_offset + last_row` (the last
+            # real row's diagonal). For full Q-tiles (row0+BLOCK_M ≤ qlen)
+            # the bound is `kv_offset + row0 + BLOCK_M`; for the last
+            # partial Q-tile (row0+BLOCK_M > qlen) the actual rows stop at
+            # qlen-1, so the tighter bound is `kv_offset + qlen = kv_total_len`.
+            # Pick the tighter of the two — `min(row0+BLOCK_M, qlen)`. The
+            # outer `min(_, kv_total_len)` then clamps to the cache extent.
+            # Mirrors FlashInfer's `mask_iteration` pattern in `prefill.cuh`.
+            # For 4096-in cold prefill this drops ~35-50% of the per-tile
+            # QK + softmax + PV work the unbounded loop wasted.
+            q_rows_in_tile = T.if_then_else(
+                row0 + BLOCK_M < qlen, row0 + BLOCK_M, qlen
+            )
+            kv_diag_limit = kv_offset + q_rows_in_tile
             kv_visible_end = T.if_then_else(
                 kv_diag_limit < kv_total_len, kv_diag_limit, kv_total_len
             )
