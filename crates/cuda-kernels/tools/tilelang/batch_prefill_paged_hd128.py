@@ -94,9 +94,25 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             num_kv_pages = kv_page_end - kv_page_start
             last_page_len = KV_last_page_len[bz]
             kv_total_len = (num_kv_pages - 1) * PAGE_SIZE + last_page_len
+            # Hoisted out of the KV loop — same per-request constant the mask
+            # below references; precomputing here also feeds the causal-bound
+            # loop count.
+            kv_offset = kv_total_len - qlen
 
             row0 = bx * BLOCK_M
             kv_head = by // gqa_group
+
+            # Causal-bound KV loop: rows row0..row0+BLOCK_M-1 attend at most
+            # to KV col kv_offset + row0 + BLOCK_M - 1 (last row's diagonal),
+            # so cap the loop there to skip strictly-upper-triangle KV tiles
+            # entirely. Mirrors FlashInfer's `mask_iteration` pattern in
+            # `prefill.cuh` (skip iterations past the diagonal). For 4096-in
+            # cold prefill this drops ~35-50% of the per-tile QK + softmax
+            # + PV work the unbounded loop wasted.
+            kv_diag_limit = kv_offset + row0 + BLOCK_M
+            kv_visible_end = T.if_then_else(
+                kv_diag_limit < kv_total_len, kv_diag_limit, kv_total_len
+            )
 
             T.fill(acc_o, 0)
             T.fill(m_i, -T.infinity(accum_dtype))
@@ -111,7 +127,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     T.cast(0, dtype),
                 )
 
-            for kn in T.Pipelined(T.ceildiv(kv_total_len, BLOCK_N), num_stages=NUM_STAGES):
+            for kn in T.Pipelined(T.ceildiv(kv_visible_end, BLOCK_N), num_stages=NUM_STAGES):
                 col0 = kn * BLOCK_N
                 for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
                     abs_col = col0 + j
