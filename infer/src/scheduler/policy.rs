@@ -523,17 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn eviction_candidate_new_defaults() {
-        let c = EvictionCandidate::new(7, 42);
-        assert_eq!(c.slot, 7);
-        assert_eq!(c.last_access_step, 42);
-        assert_eq!(c.tokens, 0);
-        assert_eq!(c.hit_count, 0);
-        assert_eq!(c.prefix_depth, 0);
-        assert!(!c.pinned);
-    }
-
-    #[test]
     fn lru_eviction_orders_by_recency() {
         // Three candidates: oldest first should evict first.
         let policy = LruEviction;

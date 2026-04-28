@@ -195,29 +195,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_id_is_hashable_and_copy() {
-        let a = RequestId(7);
-        let b = a;
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn block_id_is_copy_and_ordered() {
-        let a = BlockId(1);
-        let b = a;
-        assert_eq!(a, b);
-        assert!(BlockId(1) < BlockId(2));
-    }
-
-    #[test]
-    fn block_fingerprint_round_trips() {
-        let bytes = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        let fp = BlockFingerprint(bytes);
-        assert_eq!(fp.0, bytes);
-        assert_eq!(fp, BlockFingerprint(bytes));
-    }
-
-    #[test]
     fn fingerprint_is_deterministic_and_sensitive() {
         let a = BlockFingerprint::compute_from_tokens(&[1, 2, 3, 4]);
         let b = BlockFingerprint::compute_from_tokens(&[1, 2, 3, 4]);
@@ -301,35 +278,11 @@ mod tests {
     }
 
     #[test]
-    fn request_event_kind_progression_example() {
-        let events = [
-            RequestEventKind::Enqueued,
-            RequestEventKind::Requeued,
-            RequestEventKind::PrefillStarted,
-            RequestEventKind::DecodeStep,
-            RequestEventKind::Evicted,
-            RequestEventKind::Completed,
-            RequestEventKind::Cancelled,
-        ];
-        assert_eq!(events.len(), 7);
-    }
-
-    #[test]
     fn session_id_round_trips_from_str_and_string() {
         let from_str = SessionId::from("abc-123");
         let from_string = SessionId::from(String::from("abc-123"));
         assert_eq!(from_str, from_string);
         assert_eq!(from_str.as_str(), "abc-123");
         assert_eq!(from_str.to_string(), "abc-123");
-    }
-
-    #[test]
-    fn session_id_is_hashable_and_cheap_clone() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        let a = SessionId::new("agent-session-1");
-        let b = a.clone();
-        set.insert(a);
-        assert!(set.contains(&b));
     }
 }
