@@ -531,7 +531,7 @@ pub(super) async fn completions(
         let continuous_usage_stats = options.continuous_usage_stats;
 
         info!(
-            "Received request: prompt_len={}, max_tokens={}, stream={}",
+            "Received request: prompt_bytes={}, max_tokens={}, stream={}",
             req.prompt.len(),
             max_tokens,
             stream,
@@ -613,7 +613,7 @@ pub(super) async fn chat_completions(
         let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
 
         info!(
-            "chat/completions: messages={}, prompt_len={}, max_tokens={}, stream={}",
+            "chat/completions: messages={}, prompt_bytes={}, max_tokens={}, stream={}",
             req.messages.len(),
             prompt.len(),
             max_tokens,
@@ -727,7 +727,7 @@ pub(super) async fn responses_handler(
         let stream = options.stream;
 
         info!(
-            "responses: prompt_len={}, max_output_tokens={}",
+            "responses: prompt_bytes={}, max_output_tokens={}",
             prompt.len(),
             max_tokens,
         );
