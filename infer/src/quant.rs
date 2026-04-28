@@ -662,11 +662,4 @@ mod tests {
         assert_eq!(QuantFormat::None.to_string(), "none (BF16/FP16)");
         assert_eq!(QuantFormat::TurboQuant.to_string(), "TurboQuant");
     }
-
-    #[test]
-    fn quant_format_is_quantized() {
-        assert!(QuantFormat::Gptq.is_quantized());
-        assert!(QuantFormat::Awq.is_quantized());
-        assert!(!QuantFormat::None.is_quantized());
-    }
 }

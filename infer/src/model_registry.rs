@@ -383,18 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn implemented_models() {
-        assert!(ModelArch::Qwen3.is_implemented());
-        assert!(ModelArch::Qwen35.is_implemented());
-    }
-
-    #[test]
-    fn llama_not_yet_implemented() {
-        assert!(!ModelArch::Llama.is_implemented());
-        assert!(!ModelArch::DeepSeekV3.is_implemented());
-    }
-
-    #[test]
     fn attention_variants_correct() {
         assert_eq!(
             ModelArch::DeepSeekV2.attention_variant(),

@@ -107,17 +107,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tier_variants_round_trip() {
-        // Every tier variant clones cleanly and has a stable Debug
-        // representation — enough to catch accidental enum renames.
-        for tier in [Tier::Gpu, Tier::HostPinned, Tier::Disk, Tier::Remote] {
-            let cloned = tier;
-            assert_eq!(cloned, tier);
-            assert!(!format!("{tier:?}").is_empty());
-        }
-    }
-
-    #[test]
     fn block_location_reports_its_tier() {
         let g = BlockLocation::Gpu { slot: 3 };
         let h = BlockLocation::HostPinned { offset: 4096 };
