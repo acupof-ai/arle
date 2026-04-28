@@ -767,7 +767,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=Triton AOT: built per-SM cubins for {} target(s); SM dispatch via pthread_once + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        "cargo:warning=Triton AOT: built per-SM cubins for {} target(s); SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
         sm_targets.len()
     );
     // Triton kernel sources: invalidate AOT cache if any kernel .py changes.
@@ -1186,7 +1186,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         " (HD256 decode gated behind --features tilelang-decode-hd256; falls back to FlashInfer)"
     };
     println!(
-        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill{decode_hd256_msg}; SM dispatch via pthread_once + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill{decode_hd256_msg}; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
         sm_targets.len()
     );
     for entry in std::fs::read_dir("tools/tilelang")
