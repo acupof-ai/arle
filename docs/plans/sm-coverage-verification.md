@@ -222,27 +222,37 @@ with the safetensors `tokenizer.json` + `config.json` for that model
 (GGUF rows still need the safetensors tokenizer for guidellm's
 client-side tokenisation).
 
+Set `SM`, `SM_DOTTED`, `MODEL`, and `PROCESSOR` once per host so §4.3.x
+can reuse them for the matched single-SM rebuild without re-deriving
+the values (`SM_DOTTED` is the `8.0` form `TORCH_CUDA_ARCH_LIST`
+expects; the §3 `FEATURES` variable is also reused there):
+
 ```bash
-# A100 (sm_80) and A10/3090 (sm_86) — Qwen3-8B safetensors.
-SM=80    # or 86
-scripts/bench_guidellm.sh cuda-multi-sm-${SM} \
-  --target http://localhost:8000 \
-  --model Qwen/Qwen3-8B \
-  --processor models/Qwen3-8B
+# A100 (sm_80) — Qwen3-8B safetensors.
+SM=80; SM_DOTTED="8.0"
+MODEL="Qwen/Qwen3-8B"
+PROCESSOR="models/Qwen3-8B"
+
+# A10 / RTX 3090 (sm_86) — Qwen3-8B safetensors.
+SM=86; SM_DOTTED="8.6"
+MODEL="Qwen/Qwen3-8B"
+PROCESSOR="models/Qwen3-8B"
 
 # L4 / RTX 4090 (sm_89) — GGUF row matching the 2026-04-27 baseline.
-SM=89
-scripts/bench_guidellm.sh cuda-multi-sm-${SM} \
-  --target http://localhost:8000 \
-  --model Qwen3.5-0.8B-GGUF \
-  --processor models/Qwen3.5-0.8B
+SM=89; SM_DOTTED="8.9"
+MODEL="Qwen3.5-0.8B-GGUF"
+PROCESSOR="models/Qwen3.5-0.8B"
 
 # H100 (sm_90) — Qwen3.5-4B, matches the Phase-0 H100 reference workload.
-SM=90
+SM=90; SM_DOTTED="9.0"
+MODEL="Qwen/Qwen3.5-4B"
+PROCESSOR="models/Qwen3.5-4B"
+
+# Then, on every host:
 scripts/bench_guidellm.sh cuda-multi-sm-${SM} \
   --target http://localhost:8000 \
-  --model Qwen/Qwen3.5-4B \
-  --processor models/Qwen3.5-4B
+  --model "$MODEL" \
+  --processor "$PROCESSOR"
 ```
 
 The wrapper writes `bench-output/<date>-cuda-multi-sm-${SM}/` with
@@ -263,8 +273,16 @@ fold in unrelated changes.
 | Metric                              | sm_80 | sm_86 | sm_89                | sm_90                |
 |-------------------------------------|-------|-------|----------------------|----------------------|
 | Baseline                            | first run = baseline | first run = baseline | single-SM rebuild on this host (§4.3.x) | single-SM rebuild on this host (§4.3.x) |
-| TTFT p50 @ synchronous, max delta   | n/a   | n/a   | ±2 % vs single-SM    | ±2 % vs single-SM    |
-| out tok/s @ saturation, max delta   | n/a   | n/a   | ±2 % vs single-SM    | ±2 % vs single-SM    |
+| TTFT p50 @ synchronous, max delta   | n/a   | n/a   | ±5 % vs single-SM    | ±5 % vs single-SM    |
+| out tok/s @ saturation, max delta   | n/a   | n/a   | ±5 % vs single-SM    | ±5 % vs single-SM    |
+
+The ±5 % threshold matches `tilelang-integration.md` §5 and the
+project-wide stance in `feedback_matched_ab_for_small_bench_effects.md`
+(small effects in a single sweep are thermal noise without matched
+A/B). A multi-SM dispatch slowdown ≤2 % is the ideal — the wrapper is
+just `pthread_once + cuDeviceGetAttribute + indirect call` — but ±2 %
+is below the noise floor in a single sweep, so 5 % is the actionable
+gate. §6's >5 % rollback path uses the same threshold.
 
 For sm_80 and sm_86 the first run *is* the baseline; record the
 absolute numbers in the wins entry. For sm_89 and sm_90, delta against
@@ -290,11 +308,13 @@ scripts/bench_guidellm.sh cuda-single-sm-${SM} \
   --model "$MODEL" --processor "$PROCESSOR"
 ```
 
-Use the same `--model` / `--processor` arguments as §4.2 for this SM.
-The multi-SM and single-SM TTFT/throughput should match within ±2 %.
-If multi-SM is consistently slower by >2 % across 3+ runs, file
-`docs/experience/errors/...` with the diff and fall back to single-SM
-build for that platform.
+Reuse the `MODEL` / `PROCESSOR` shell variables defined in §4.2 — the
+single-SM run must compare against the same workload, otherwise the
+A/B is meaningless. The multi-SM and single-SM TTFT/throughput should
+match within ±5 % (matches the §4.3 gate and project convention). A
+≤2 % delta is the no-overhead ideal; 2–5 % is an in-noise pass; >5 %
+across 3+ runs is a regression — file `docs/experience/errors/...`
+with the diff and fall back to single-SM build for that platform.
 
 ---
 
