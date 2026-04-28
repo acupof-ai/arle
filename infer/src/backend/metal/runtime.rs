@@ -999,6 +999,14 @@ fn execute_mixed_batch(
         return false;
     };
 
+    // Mixed-batch decode rows ride the same batched GPU path as the
+    // decode-only `execute_decode_batch` call site — count them in the
+    // same Metal decode counters so dashboards don't undercount batched
+    // throughput on mixed steps. (codex round-2 P2)
+    if !decode_tokens.is_empty() {
+        metrics.record_metal_decode_batch(decode_tokens.len());
+    }
+
     for ((req_id, mut request), sampled_token) in decode_rows.into_iter().zip(decode_tokens) {
         if let Err(err) = request.process_token(sampled_token) {
             error!(
@@ -1353,6 +1361,7 @@ fn execute_decode_batch(
     //   - dflash_rows (≥2): new `execute_qwen35_dflash_packed_batch`.
     //   - dflash_rows (==1): fall through to the existing per-row
     //     `execute_decode_single` path (batched-stack overhead not worth it).
+    let scheduled_open_len = open.len();
     let (dflash_requests, non_dflash): (Vec<_>, Vec<_>) = open
         .into_iter()
         .partition(|(_, request)| request.request_state.is_dflash_enabled());
@@ -1360,6 +1369,9 @@ fn execute_decode_batch(
     if dflash_requests.len() >= 2 {
         execute_qwen35_dflash_packed_batch(dflash_requests, metrics, scheduler, active);
     } else {
+        if scheduled_open_len >= 2 && !dflash_requests.is_empty() {
+            metrics.record_metal_decode_batch_fallback(dflash_requests.len());
+        }
         for (req_id, request) in dflash_requests {
             execute_decode_single(req_id, request, metrics, scheduler, active);
         }
@@ -1368,10 +1380,14 @@ fn execute_decode_batch(
 
     let batch_result =
         match execute_qwen35_packed_decode_batch(&mut open, active, qwen35_decode_batch_cache) {
-            Ok(Some(result)) => Some(result),
+            Ok(Some(result)) => {
+                metrics.record_metal_qwen35_packed_decode_batch(result.len());
+                metrics.record_metal_decode_batch(result.len());
+                Some(result)
+            }
             Ok(None) => {
                 invalidate_qwen35_decode_batch_cache(qwen35_decode_batch_cache, active, &mut open);
-                if open.len() >= 2 {
+                let result = if open.len() >= 2 {
                     let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
                         .iter_mut()
                         .map(|(_, request)| &mut request.request_state)
@@ -1389,7 +1405,11 @@ fn execute_decode_batch(
                     }
                 } else {
                     None
+                };
+                if let Some(tokens) = result.as_ref() {
+                    metrics.record_metal_decode_batch(tokens.len());
                 }
+                result
             }
             Err(err) => {
                 error!("Metal packed Qwen3.5 decode failed: {err:#}");
@@ -1418,6 +1438,9 @@ fn execute_decode_batch(
         return;
     }
 
+    if scheduled_open_len >= 2 && !open.is_empty() {
+        metrics.record_metal_decode_batch_fallback(open.len());
+    }
     for (req_id, request) in open {
         execute_decode_single(req_id, request, metrics, scheduler, active);
     }
@@ -1439,6 +1462,9 @@ fn execute_qwen35_dflash_packed_batch(
 ) {
     if rows.len() < 2 {
         // Partition guard already filters on ≥2; defensive fallthrough only.
+        if !rows.is_empty() {
+            metrics.record_metal_decode_batch_fallback(rows.len());
+        }
         for (req_id, request) in rows {
             execute_decode_single(req_id, request, metrics, scheduler, active);
         }
@@ -1458,6 +1484,7 @@ fn execute_qwen35_dflash_packed_batch(
                 // every row falls back to per-row single-path decode. Scalar
                 // `decode_token` handles the stale-target_hidden, Rust-mode,
                 // and buffered-drain cases cleanly.
+                metrics.record_metal_decode_batch_fallback(rows.len());
                 for (req_id, request) in rows {
                     execute_decode_single(req_id, request, metrics, scheduler, active);
                 }
@@ -1490,6 +1517,11 @@ fn execute_qwen35_dflash_packed_batch(
             cancel_detached_request(req_id, request, scheduler);
         }
         return;
+    }
+    metrics.record_metal_decode_batch(ready_indices.len());
+    let fallback_rows = rows.len().saturating_sub(ready_indices.len());
+    if fallback_rows > 0 {
+        metrics.record_metal_decode_batch_fallback(fallback_rows);
     }
 
     // Commit ready-row tokens and dispatch stale rows in the original
@@ -1704,6 +1736,7 @@ fn execute_decode_single(
     let outcome = if request.delta_closed() {
         Outcome::ClientDropped
     } else {
+        metrics.record_metal_decode_scalar_row();
         match request.decode_step() {
             Ok(_sampled_token) => Outcome::Progress {
                 runtime_finished: request.phase() == RuntimePhase::Finished,
