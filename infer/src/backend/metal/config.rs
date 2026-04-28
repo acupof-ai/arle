@@ -151,23 +151,17 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or(default)
         };
-    let get_eos = |obj: &serde_json::Map<String, serde_json::Value>, fallback: u32| -> u32 {
-        obj.get("eos_token_id")
-            .and_then(|e| {
-                e.as_u64().map(|n| n as u32).or_else(|| {
-                    e.as_array()
-                        .and_then(|a| a.first())
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|n| n as u32)
-                })
-            })
-            .unwrap_or(fallback)
-    };
-
     let hidden_size = get_usize(model, "hidden_size", 2048);
     let num_attention_heads = get_usize(model, "num_attention_heads", 16);
     let head_dim = get_usize(model, "head_dim", hidden_size / num_attention_heads.max(1));
-    let eos_token_id = get_eos(model, get_eos(root, 151_645));
+
+    // HuggingFace precedence: generation_config.json beats config.json; eos_token_id
+    // can be a scalar or an array, and the entire array is the stop set. Multimodal
+    // configs may put a base-LM EOS in text_config and the chat-end EOS in the root
+    // array — taking only the text_config scalar would let the model generate past
+    // <|im_end|> and leak fake role markers (Qwen3.6 multimodal MoE).
+    let stop_token_ids = resolve_stop_token_ids(model_dir, root, model)?;
+    let eos_token_id = stop_token_ids.first().copied().unwrap_or(151_645);
     let rms_norm_eps = get_f64(model, "rms_norm_eps", 1e-6);
     let quantization = root
         .get("quantization")
@@ -368,7 +362,7 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         rope_theta,
         head_dim,
         eos_token_id,
-        stop_token_ids: load_stop_token_ids(model_dir, eos_token_id)?,
+        stop_token_ids,
         quantization,
         norm_weight_mode,
         arch,
@@ -443,39 +437,66 @@ fn load_qwen35_config_from_gguf(gguf: &GgufFile) -> Result<MetalModelConfig> {
     })
 }
 
-fn load_stop_token_ids(model_dir: &Path, fallback_eos_token_id: u32) -> Result<Vec<u32>> {
-    let generation_config_path = model_dir.join("generation_config.json");
-    match std::fs::read_to_string(&generation_config_path) {
-        Ok(content) => {
-            let v: serde_json::Value =
-                serde_json::from_str(&content).context("generation_config.json parse")?;
-            let mut ids = Vec::new();
-            if let Some(eos) = v.get("eos_token_id") {
-                match eos {
-                    serde_json::Value::Number(n) => {
-                        if let Some(id) = n.as_u64() {
-                            ids.push(id as u32);
-                        }
-                    }
-                    serde_json::Value::Array(arr) => {
-                        for item in arr {
-                            if let Some(id) = item.as_u64() {
-                                ids.push(id as u32);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+/// Parse a HuggingFace `eos_token_id` value (scalar or array) into a Vec.
+fn parse_eos_field(value: &serde_json::Value) -> Vec<u32> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64().map(|id| vec![id as u32]).unwrap_or_default(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| item.as_u64().map(|id| id as u32))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve the stop-token list following HuggingFace precedence:
+/// `generation_config.json::eos_token_id` (preferred, used by `model.generate()`)
+/// then `config.json::eos_token_id` (root, then `text_config`). All values from
+/// the chosen source are stop tokens; ordering preserves the source order
+/// (HF uses the first id as the "primary" EOS).
+fn resolve_stop_token_ids(
+    model_dir: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+    text_config: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<u32>> {
+    let from_generation_config =
+        match std::fs::read_to_string(model_dir.join("generation_config.json")) {
+            Ok(content) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&content).context("generation_config.json parse")?;
+                v.get("eos_token_id")
+                    .map(parse_eos_field)
+                    .unwrap_or_default()
             }
-            if ids.is_empty() {
-                ids.push(fallback_eos_token_id);
-            }
-            ids.sort_unstable();
-            ids.dedup();
-            Ok(ids)
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+
+    let mut ids: Vec<u32> = from_generation_config;
+    extend_unique(
+        &mut ids,
+        root.get("eos_token_id")
+            .map(parse_eos_field)
+            .unwrap_or_default(),
+    );
+    extend_unique(
+        &mut ids,
+        text_config
+            .get("eos_token_id")
+            .map(parse_eos_field)
+            .unwrap_or_default(),
+    );
+    if ids.is_empty() {
+        ids.push(151_645);
+    }
+    Ok(ids)
+}
+
+fn extend_unique(target: &mut Vec<u32>, src: Vec<u32>) {
+    for id in src {
+        if !target.contains(&id) {
+            target.push(id);
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(vec![fallback_eos_token_id]),
-        Err(err) => Err(err.into()),
     }
 }
 
@@ -597,5 +618,55 @@ mod tests {
             }
             MetalModelArch::Qwen3 => panic!("expected Qwen3.6 config, got Qwen3"),
         }
+    }
+
+    #[test]
+    fn resolves_stop_tokens_following_hf_precedence() {
+        use super::resolve_stop_token_ids;
+        use serde_json::Value;
+
+        // generation_config wins over config.json; both root and text_config
+        // contributions get merged (dedup, generation_config first).
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"eos_token_id": [9001, 9000]}"#,
+        )
+        .unwrap();
+
+        let cfg: Value = serde_json::from_str(
+            r#"{"eos_token_id": [9000, 9002], "text_config": {"eos_token_id": 9000}}"#,
+        )
+        .unwrap();
+        let root = cfg.as_object().unwrap();
+        let text_config = root.get("text_config").and_then(Value::as_object).unwrap();
+
+        let ids = resolve_stop_token_ids(dir.path(), root, text_config).unwrap();
+        assert_eq!(ids, vec![9001, 9000, 9002]);
+    }
+
+    #[test]
+    fn resolves_stop_tokens_handles_scalar_and_missing_generation_config() {
+        use super::resolve_stop_token_ids;
+        use serde_json::Value;
+
+        // No generation_config.json, scalar eos in root, no text_config eos.
+        let dir = tempdir().unwrap();
+        let cfg: Value = serde_json::from_str(r#"{"eos_token_id": 7}"#).unwrap();
+        let root = cfg.as_object().unwrap();
+        let ids = resolve_stop_token_ids(dir.path(), root, root).unwrap();
+        assert_eq!(ids, vec![7]);
+    }
+
+    #[test]
+    fn resolves_stop_tokens_falls_back_when_nothing_specified() {
+        use super::resolve_stop_token_ids;
+        use serde_json::Value;
+
+        let dir = tempdir().unwrap();
+        let cfg: Value = serde_json::from_str("{}").unwrap();
+        let root = cfg.as_object().unwrap();
+        let ids = resolve_stop_token_ids(dir.path(), root, root).unwrap();
+        assert_eq!(ids, vec![151_645]);
     }
 }

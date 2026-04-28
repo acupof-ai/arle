@@ -101,10 +101,14 @@ pub(super) fn metal_generate(
     // C++ full generate path (same as Qwen3.5 — batch prefill + double-buffered decode)
     if let Some(ref cpp_model) = weights.cpp_model {
         log::info!("Metal Qwen3: C++ full generate");
+        // Use config.stop_token_ids (full list from generation_config.json),
+        // not just config.eos_token_id — see qwen35.rs C++ path for context.
         let mut stop_ids: Vec<u32> = params.stop_token_ids.clone();
         if !params.ignore_eos {
-            stop_ids.push(config.eos_token_id);
+            stop_ids.extend(config.stop_token_ids.iter().copied());
         }
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
         let (tokens, prefill_ms, decode_ms) = cpp_model.generate(
             input_ids,
             max_new_tokens,
