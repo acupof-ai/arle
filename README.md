@@ -119,7 +119,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 
 | Backend | Platform | Status | Notes |
 |---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, FlashInfer, CUDA Graph decode, packed paged-prefill for Qwen3 / Qwen3.5. |
+| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, FlashInfer, CUDA Graph decode, packed paged-prefill for Qwen3 / Qwen3.5. **L4 / Qwen3-4B BF16 + FP8 paged KV (auto): 197 tok/s @ c=16 / 4096-in, peak_active=16 saturated.** |
 | **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse, and Qwen3.5-0.8B GGUF Q4_K_M decode at 211.7 tok/s on M4 Pro. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-identical parity, c=1..8 validated. |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a serving target. |
@@ -167,8 +167,8 @@ Operators who want only the serving binary can use `infer` directly (`cargo buil
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
+- **2026-04-28** — CUDA L4 `Qwen3-4B` BF16, c=16 / 4096-in jumped from **120 → 197 tok/s (+64%)** after auto HBM-tier `chunked_prefill_size` and FP8 paged KV defaulting on L4-class GPUs. `peak_active` saturates at 16/16; +42% vs SGLang reference on the same workload. Evidence: [`docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md`](docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md).
 - **2026-04-27** — Metal `Qwen3.5-0.8B` GGUF `Q4_K_M` decode crossed 200 tok/s on M4 Pro after Q5_K/Q8_0 affine repack and Q6/group16 qmv tile tuning. Evidence: [`docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md`](docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md).
-- **2026-04-23** — `arle` front door now unifies `train pretrain|sft|grpo|multi-turn|eval` and `data download|convert` under one top-level Rust CLI. Notes: [`docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md`](docs/experience/wins/2026-04-23-train-cli-unified-entrypoints.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md). Next up: [ROADMAP.md](ROADMAP.md).
 
