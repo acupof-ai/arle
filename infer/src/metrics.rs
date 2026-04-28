@@ -19,6 +19,12 @@
 //! | `infer_scheduler_decode_tokens` | gauge | Decode tokens advanced in the most recent scheduler tick |
 //! | `infer_scheduler_prefill_tokens` | gauge | Prefill tokens advanced in the most recent scheduler tick |
 //! | `infer_scheduler_batch_width` | gauge | Total GPU batch width in the most recent scheduler tick |
+//! | `infer_metal_decode_batches_total` | counter | Metal decode batches executed on a batched GPU path |
+//! | `infer_metal_decode_batched_rows_total` | counter | Metal decode rows executed on a batched GPU path |
+//! | `infer_metal_decode_scalar_rows_total` | counter | Metal decode rows executed by the scalar per-request path |
+//! | `infer_metal_decode_batch_fallback_rows_total` | counter | Metal decode rows scheduled together but forced to scalar fallback |
+//! | `infer_metal_qwen35_packed_decode_batches_total` | counter | Qwen3.5 packed decode batches executed |
+//! | `infer_metal_qwen35_packed_decode_rows_total` | counter | Qwen3.5 packed decode rows executed |
 //! | `infer_kv_coordinator_queue_capacity` | gauge | Coordinator queue capacity |
 //! | `infer_kv_fetch_queue_depth` | gauge | In-flight staged KV fetch tickets |
 //! | `infer_kv_fetch_waiters` | gauge | Requests waiting on staged KV fetches |
@@ -230,6 +236,12 @@ struct MetricsInner {
     pub dflash_blocks_total: AtomicU64,
     pub dflash_accepted_tokens_total: AtomicU64,
     pub dflash_draft_tokens_total: AtomicU64,
+    pub metal_decode_batches_total: AtomicU64,
+    pub metal_decode_batched_rows_total: AtomicU64,
+    pub metal_decode_scalar_rows_total: AtomicU64,
+    pub metal_decode_batch_fallback_rows_total: AtomicU64,
+    pub metal_qwen35_packed_decode_batches_total: AtomicU64,
+    pub metal_qwen35_packed_decode_rows_total: AtomicU64,
 
     // Gauges (atomic).
     pub requests_active: AtomicU64,
@@ -288,6 +300,12 @@ impl ServerMetrics {
                 dflash_blocks_total: AtomicU64::new(0),
                 dflash_accepted_tokens_total: AtomicU64::new(0),
                 dflash_draft_tokens_total: AtomicU64::new(0),
+                metal_decode_batches_total: AtomicU64::new(0),
+                metal_decode_batched_rows_total: AtomicU64::new(0),
+                metal_decode_scalar_rows_total: AtomicU64::new(0),
+                metal_decode_batch_fallback_rows_total: AtomicU64::new(0),
+                metal_qwen35_packed_decode_batches_total: AtomicU64::new(0),
+                metal_qwen35_packed_decode_rows_total: AtomicU64::new(0),
                 requests_active: AtomicU64::new(0),
                 requests_waiting: AtomicU64::new(0),
                 scheduler_running_batch: AtomicU64::new(0),
@@ -767,6 +785,40 @@ impl ServerMetrics {
             .fetch_add(block_size as u64, Ordering::Relaxed);
     }
 
+    /// Record one Metal decode batch that stayed on a batched GPU path.
+    pub fn record_metal_decode_batch(&self, rows: usize) {
+        self.inner
+            .metal_decode_batches_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metal_decode_batched_rows_total
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    /// Record one Metal decode row that ran through the scalar per-request path.
+    pub fn record_metal_decode_scalar_row(&self) {
+        self.inner
+            .metal_decode_scalar_rows_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record rows the scheduler grouped but the backend could not batch.
+    pub fn record_metal_decode_batch_fallback(&self, rows: usize) {
+        self.inner
+            .metal_decode_batch_fallback_rows_total
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    /// Record one Qwen3.5 packed decode batch.
+    pub fn record_metal_qwen35_packed_decode_batch(&self, rows: usize) {
+        self.inner
+            .metal_qwen35_packed_decode_batches_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metal_qwen35_packed_decode_rows_total
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
     /// DFlash acceptance rate: fraction of generated tokens that came from draft
     /// predictions (industry-standard speculative decode metric).
     /// Formula: (accepted_inputs - blocks) / accepted_inputs
@@ -1034,6 +1086,72 @@ impl ServerMetrics {
             out,
             "infer_dflash_utilization{{{labels}}} {:.4}",
             self.dflash_utilization()
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_metal_decode_batches_total Metal decode batches executed on a batched GPU path.\n");
+        out.push_str("# TYPE infer_metal_decode_batches_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_decode_batches_total{{{labels}}} {}",
+            self.inner
+                .metal_decode_batches_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_metal_decode_batched_rows_total Metal decode rows executed on a batched GPU path.\n");
+        out.push_str("# TYPE infer_metal_decode_batched_rows_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_decode_batched_rows_total{{{labels}}} {}",
+            self.inner
+                .metal_decode_batched_rows_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_metal_decode_scalar_rows_total Metal decode rows executed by the scalar per-request path.\n");
+        out.push_str("# TYPE infer_metal_decode_scalar_rows_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_decode_scalar_rows_total{{{labels}}} {}",
+            self.inner
+                .metal_decode_scalar_rows_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_metal_decode_batch_fallback_rows_total Metal decode rows scheduled together but forced to scalar fallback.\n");
+        out.push_str("# TYPE infer_metal_decode_batch_fallback_rows_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_decode_batch_fallback_rows_total{{{labels}}} {}",
+            self.inner
+                .metal_decode_batch_fallback_rows_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_metal_qwen35_packed_decode_batches_total Qwen3.5 packed decode batches executed.\n");
+        out.push_str("# TYPE infer_metal_qwen35_packed_decode_batches_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_qwen35_packed_decode_batches_total{{{labels}}} {}",
+            self.inner
+                .metal_qwen35_packed_decode_batches_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_metal_qwen35_packed_decode_rows_total Qwen3.5 packed decode rows executed.\n");
+        out.push_str("# TYPE infer_metal_qwen35_packed_decode_rows_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_qwen35_packed_decode_rows_total{{{labels}}} {}",
+            self.inner
+                .metal_qwen35_packed_decode_rows_total
+                .load(Ordering::Relaxed)
         )
         .unwrap();
 
@@ -1412,6 +1530,27 @@ impl ServerMetrics {
         } else {
             String::new()
         };
+        let metal_decode_suffix = format!(
+            " metal_decode=batch:{}/{},scalar:{},fallback:{},qwen35_packed:{}/{}",
+            self.inner
+                .metal_decode_batches_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .metal_decode_batched_rows_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .metal_decode_scalar_rows_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .metal_decode_batch_fallback_rows_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .metal_qwen35_packed_decode_batches_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .metal_qwen35_packed_decode_rows_total
+                .load(Ordering::Relaxed),
+        );
         let queue_capacity = self.kv_coordinator_queue_capacity();
         let coordinator_suffix = if queue_capacity > 0 {
             format!(
@@ -1448,7 +1587,7 @@ impl ServerMetrics {
         };
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -1476,6 +1615,7 @@ impl ServerMetrics {
             ttft_p99,
             service_p50,
             tpot_p50,
+            metal_decode_suffix,
             dflash_suffix,
             tier_suffix,
             coordinator_suffix,
@@ -1529,6 +1669,10 @@ mod tests {
         m.record_tier_fetch_plan(2, 3, 4);
         m.record_tier_fetch_promoted(6);
         m.record_tier_fetch_fallback();
+        m.record_metal_decode_batch(3);
+        m.record_metal_decode_scalar_row();
+        m.record_metal_decode_batch_fallback(2);
+        m.record_metal_qwen35_packed_decode_batch(3);
         m.set_memory_bytes(1234, 5678, 42);
 
         let rendered = m.render_prometheus();
@@ -1574,6 +1718,20 @@ mod tests {
         assert!(rendered.contains("infer_tier_fetch_promoted_blocks_total{model=\"Qwen3-4B\",} 6"));
         assert!(rendered.contains("infer_tier_fetch_fallback_total{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_tier_fetch_recall_rate{model=\"Qwen3-4B\",} 0.6667"));
+        assert!(rendered.contains("infer_metal_decode_batches_total{model=\"Qwen3-4B\",} 1"));
+        assert!(rendered.contains("infer_metal_decode_batched_rows_total{model=\"Qwen3-4B\",} 3"));
+        assert!(rendered.contains("infer_metal_decode_scalar_rows_total{model=\"Qwen3-4B\",} 1"));
+        assert!(
+            rendered
+                .contains("infer_metal_decode_batch_fallback_rows_total{model=\"Qwen3-4B\",} 2")
+        );
+        assert!(
+            rendered
+                .contains("infer_metal_qwen35_packed_decode_batches_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_metal_qwen35_packed_decode_rows_total{model=\"Qwen3-4B\",} 3")
+        );
         assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
         assert!(rendered.contains("infer_queue_wait_seconds_count"));
         assert!(rendered.contains("infer_active_ttft_seconds_count"));
@@ -1594,6 +1752,10 @@ mod tests {
         m.record_tier_fetch_plan(1, 2, 0);
         m.record_tier_fetch_promoted(2);
         m.record_tier_fetch_fallback();
+        m.record_metal_decode_batch(4);
+        m.record_metal_decode_scalar_row();
+        m.record_metal_decode_batch_fallback(3);
+        m.record_metal_qwen35_packed_decode_batch(4);
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
@@ -1605,6 +1767,7 @@ mod tests {
         assert!(s.contains("tier_src=h:1/d:2/r:0"));
         assert!(s.contains("tier_promoted=2"));
         assert!(s.contains("tier_fallback=1"));
+        assert!(s.contains("metal_decode=batch:1/4,scalar:1,fallback:3,qwen35_packed:1/4"));
         assert!(s.contains("kv_store=sub:3,done:2,fail:1,rej:4"));
     }
 
