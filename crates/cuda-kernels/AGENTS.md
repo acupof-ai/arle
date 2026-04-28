@@ -90,8 +90,16 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 
 ## `build.rs` rules
 
-- **SM auto-detection order:** `INFER_CUDA_SM` → `CUDA_SM` → `nvidia-smi`
-  → fallback `sm_80` (A100). Always emit a `cargo:warning` on fallback.
+- **SM auto-detection order:** `TORCH_CUDA_ARCH_LIST` → `CMAKE_CUDA_ARCHITECTURES`
+  → `nvidia-smi --query-gpu=compute_cap` → T1 default set `{80, 86, 89, 90}`.
+  Always emit a `cargo:warning` on the T1-default fallback.
+- **Tier policy** (canonical: [`docs/plans/sm-coverage.md`](../../docs/plans/sm-coverage.md)):
+  T1 `{80, 86, 89, 90}` default-built; T2 `{100, 120}` opt-in via env var;
+  T3 `< 80` panics at build time. Adding a new SM = update `T1_SMS`/`T2_SMS`
+  in `build.rs` and the GPU/SM row in `docs/support-matrix.md`.
+- **AOT failure policy:** any (SM, kernel) combination that fails to emit
+  cubin → `panic!`. No warn-skip. Error message must suggest a
+  `TORCH_CUDA_ARCH_LIST=...` value that excludes the failing SM.
 - **Triton AOT** is driven by `find_triton_python()` — order: `INFER_TRITON_PYTHON`
   → `tools/triton/.venv/bin/python` → `./.venv/bin/python` → `python3` → `python`.
   Generated artifacts land under `OUT_DIR/triton/...`.

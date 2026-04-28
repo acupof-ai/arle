@@ -245,9 +245,10 @@ cargo test --release --test e2e_qwen35
 cargo test --release --no-default-features --features metal
 ```
 
-Env vars: `INFER_CUDA_SM` (SM override), `INFER_TRITON_PYTHON`
-(Triton AOT Python), `INFER_TEST_MODEL_PATH` (default `models/Qwen3-4B`).
-Full list: [`docs/environment.md`](docs/environment.md).
+Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),
+`INFER_TRITON_PYTHON` (Triton AOT Python), `INFER_TEST_MODEL_PATH`
+(default `models/Qwen3-4B`). Full list: [`docs/environment.md`](docs/environment.md).
+SM tier policy: [`docs/plans/sm-coverage.md`](docs/plans/sm-coverage.md).
 
 Disk hygiene: `cargo sweep --time 30` (weekly) prunes target/ artifacts
 older than 30 days. Dev profile already keeps deps DWARF-free (see root

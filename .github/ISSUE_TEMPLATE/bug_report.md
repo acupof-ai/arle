@@ -38,7 +38,7 @@ What actually happens. Include error messages or logs.
 - **OS**: 
 - **Model**: (e.g. Qwen3-4B)
 - **Command / server flags**: (e.g. `infer --num-slots 4 --cuda-graph true`)
-- **Relevant env vars**: (e.g. `INFER_CUDA_SM=90`)
+- **Relevant env vars**: (e.g. `TORCH_CUDA_ARCH_LIST="9.0"`)
 
 ## Evidence
 

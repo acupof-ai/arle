@@ -13,35 +13,112 @@ struct TritonKernelSpec {
     num_stages: u32,
 }
 
-fn parse_sm_token(raw: &str) -> Option<String> {
+/// Tier-1 SMs: default-compiled fat-binary set. A100 / A10·3090 / L4·4090 / H100.
+const T1_SMS: &[&str] = &["80", "86", "89", "90"];
+
+/// Tier-2 SMs: opt-in via TORCH_CUDA_ARCH_LIST. B100·B200 / RTX 5090.
+const T2_SMS: &[&str] = &["100", "120"];
+
+fn is_supported_sm(sm: &str) -> bool {
+    T1_SMS.contains(&sm) || T2_SMS.contains(&sm)
+}
+
+#[derive(Clone, Debug)]
+struct SmSpec {
+    sm: String,
+    /// `+PTX` requested for this SM (per PyTorch TORCH_CUDA_ARCH_LIST convention).
+    ptx: bool,
+}
+
+/// Parse a single SM token. Accepts:
+///   - PyTorch:  `8.0`, `9.0`, `12.0+PTX`
+///   - CMake:    `80`, `90`, `120`
+///   - nvcc:     `sm_80`, `compute_90`
+fn parse_sm_token(raw: &str) -> Option<SmSpec> {
     let token = raw.trim().trim_matches('"');
     if token.is_empty() {
         return None;
     }
+
+    let (token, ptx) = if let Some(stem) = token
+        .strip_suffix("+PTX")
+        .or_else(|| token.strip_suffix("+ptx"))
+    {
+        (stem.trim_end(), true)
+    } else {
+        (token, false)
+    };
 
     let token = token
         .strip_prefix("sm_")
         .or_else(|| token.strip_prefix("compute_"))
         .unwrap_or(token);
 
-    if let Some((major, minor)) = token.split_once('.') {
+    let sm = if let Some((major, minor)) = token.split_once('.') {
         if major.chars().all(|c| c.is_ascii_digit()) && minor.chars().all(|c| c.is_ascii_digit()) {
-            return Some(format!("{}{}", major, minor));
+            format!("{major}{minor}")
+        } else {
+            return None;
         }
-        return None;
-    }
-
-    if token.chars().all(|c| c.is_ascii_digit()) {
+    } else if token.chars().all(|c| c.is_ascii_digit()) {
         if token.len() == 1 {
-            return Some(format!("{}0", token));
+            format!("{token}0")
+        } else {
+            token.to_string()
         }
-        return Some(token.to_string());
-    }
+    } else {
+        return None;
+    };
 
-    None
+    Some(SmSpec { sm, ptx })
 }
 
-fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
+/// Reject SMs outside the T1∪T2 whitelist. T3 (Volta/Turing/older) is unsupported.
+fn validate_sm(spec: &SmSpec, source: &str) {
+    if !is_supported_sm(&spec.sm) {
+        panic!(
+            "Unsupported CUDA compute capability 'sm_{}' from {}. \
+             ARLE supports T1={{80,86,89,90}} (default) and T2={{100,120}} (opt-in). \
+             T3 (sm < 80) and unknown SMs are rejected. \
+             See docs/plans/sm-coverage.md and docs/support-matrix.md. \
+             To restrict targets explicitly: TORCH_CUDA_ARCH_LIST=\"8.0;8.6;8.9;9.0\".",
+            spec.sm, source
+        );
+    }
+}
+
+/// Parse TORCH_CUDA_ARCH_LIST / CMAKE_CUDA_ARCHITECTURES.
+/// Separators: `;`, `,`, whitespace. Empty tokens skipped. Each token validated.
+fn parse_arch_list(raw: &str, source: &str) -> Vec<SmSpec> {
+    let mut sms: BTreeSet<String> = BTreeSet::new();
+    let mut ptx_for: BTreeSet<String> = BTreeSet::new();
+
+    for token in raw.split(|c: char| c == ';' || c == ',' || c.is_whitespace()) {
+        if token.is_empty() {
+            continue;
+        }
+        let spec = parse_sm_token(token).unwrap_or_else(|| {
+            panic!(
+                "Failed to parse SM token '{token}' from {source} (raw='{raw}'). \
+                 Expected format e.g. '8.0', '8.0+PTX', '80', 'sm_80'."
+            )
+        });
+        validate_sm(&spec, source);
+        if spec.ptx {
+            ptx_for.insert(spec.sm.clone());
+        }
+        sms.insert(spec.sm);
+    }
+
+    sms.into_iter()
+        .map(|sm| SmSpec {
+            ptx: ptx_for.contains(&sm),
+            sm,
+        })
+        .collect()
+}
+
+fn sm_targets_from_nvidia_smi() -> Option<Vec<SmSpec>> {
     let output = Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
@@ -51,41 +128,35 @@ fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut sms = BTreeSet::new();
+    let mut sms: BTreeSet<String> = BTreeSet::new();
     for line in stdout.lines() {
         let cap = line.split(',').next().unwrap_or(line).trim();
-        if let Some(sm) = parse_sm_token(cap) {
-            sms.insert(sm);
+        if cap.is_empty() {
+            continue;
         }
+        let spec = parse_sm_token(cap)
+            .unwrap_or_else(|| panic!("nvidia-smi reported unparseable compute_cap '{cap}'."));
+        validate_sm(&spec, "nvidia-smi --query-gpu=compute_cap");
+        sms.insert(spec.sm);
     }
 
     if sms.is_empty() {
         None
     } else {
-        Some(sms.into_iter().collect())
+        Some(
+            sms.into_iter()
+                .map(|sm| SmSpec { sm, ptx: false })
+                .collect(),
+        )
     }
 }
 
-fn detect_sm_targets() -> Vec<String> {
-    if let Ok(env) = std::env::var("INFER_CUDA_SM").or_else(|_| std::env::var("CUDA_SM")) {
-        let mut sms = Vec::new();
-        for token in env.split(',') {
-            if let Some(sm) = parse_sm_token(token) {
-                sms.push(sm);
-            } else {
-                print!(
-                    "cargo:warning=Invalid SM token '{}' in CUDA_SM environment variable, skipping.",
-                    token
-                );
-            }
-        }
-        if !sms.is_empty() {
-            return sms;
-        }
-        print!(
-            "cargo:warning=No valid SM tokens found in CUDA_SM environment variable '{}', falling back to auto-detection.",
-            env
-        );
+fn detect_sm_targets() -> Vec<SmSpec> {
+    if let Ok(env) = std::env::var("TORCH_CUDA_ARCH_LIST") {
+        return parse_arch_list(&env, "TORCH_CUDA_ARCH_LIST");
+    }
+    if let Ok(env) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
+        return parse_arch_list(&env, "CMAKE_CUDA_ARCHITECTURES");
     }
 
     if let Some(sms) = sm_targets_from_nvidia_smi() {
@@ -93,28 +164,46 @@ fn detect_sm_targets() -> Vec<String> {
     }
 
     println!(
-        "cargo:warning=Failed to detect GPU SMs via nvidia-smi. Set INFER_CUDA_SM/CUDA_SM environment variable to override."
+        "cargo:warning=No GPU detected and TORCH_CUDA_ARCH_LIST not set; defaulting to T1 SMs (sm_80, sm_86, sm_89, sm_90). \
+         To target Blackwell (sm_100, sm_120), set TORCH_CUDA_ARCH_LIST=\"...;10.0\" or \"...;12.0\". \
+         See docs/plans/sm-coverage.md."
     );
-    // Default to sm_80 (A100) when no GPU is detected, allowing compilation
-    // on CI/dev machines. The binary will still require a compatible GPU at runtime.
-    println!("cargo:warning=Defaulting to sm_80 (A100). Override with INFER_CUDA_SM if needed.");
-    vec!["80".to_string()]
+    T1_SMS
+        .iter()
+        .map(|s| SmSpec {
+            sm: (*s).to_string(),
+            ptx: false,
+        })
+        .collect()
 }
 
-fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {
+fn nvcc_arch_args(sm_targets: &[SmSpec]) -> Vec<String> {
     let mut args = Vec::new();
-    for sm in sm_targets {
+    for spec in sm_targets {
+        // SASS for this SM.
         args.push("-gencode".to_string());
-        args.push(format!("arch=compute_{sm},code=sm_{sm}"));
+        args.push(format!("arch=compute_{sm},code=sm_{sm}", sm = spec.sm));
+        // Per-SM PTX requested via `+PTX` suffix.
+        if spec.ptx {
+            args.push("-gencode".to_string());
+            args.push(format!("arch=compute_{sm},code=compute_{sm}", sm = spec.sm));
+        }
     }
 
-    if let Some(max_sm) = sm_targets
+    // Always emit PTX for the highest SM as a forward-compat JIT fallback for
+    // newer hardware (e.g. T2 sm_120 when only T1 is built). Skip if that SM
+    // already requested `+PTX`.
+    if let Some(max_spec) = sm_targets
         .iter()
-        .filter_map(|sm| sm.parse::<u32>().ok())
-        .max()
+        .max_by_key(|s| s.sm.parse::<u32>().unwrap_or(0))
     {
-        args.push("-gencode".to_string());
-        args.push(format!("arch=compute_{max_sm},code=compute_{max_sm}"));
+        if !max_spec.ptx {
+            args.push("-gencode".to_string());
+            args.push(format!(
+                "arch=compute_{sm},code=compute_{sm}",
+                sm = max_spec.sm
+            ));
+        }
     }
 
     args
@@ -176,16 +265,18 @@ fn find_triton_python() -> Result<String, String> {
     ))
 }
 
-fn triton_target(sm_targets: &[String]) -> String {
+fn triton_target(sm_targets: &[SmSpec]) -> String {
     let max_sm = sm_targets
         .iter()
-        .filter_map(|sm| sm.parse::<u32>().ok())
+        .filter_map(|s| s.sm.parse::<u32>().ok())
         .max()
         .expect("expected at least one CUDA SM target for Triton AOT");
 
     if sm_targets.len() > 1 {
         println!(
-            "cargo:warning=Triton AOT currently emits one cubin per kernel spec; using highest detected target sm_{max_sm}. Set INFER_CUDA_SM to pin one target explicitly."
+            "cargo:warning=Triton AOT currently emits one cubin per kernel spec; using highest detected target sm_{max_sm}. \
+             Multi-SM Triton AOT lands in commit B of the multi-SM rollout (docs/plans/sm-coverage.md). \
+             Set TORCH_CUDA_ARCH_LIST to pin one target explicitly."
         );
     }
 
@@ -262,7 +353,7 @@ fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> Pa
     wrapper_path
 }
 
-fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
+fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
     let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
     let triton_target = triton_target(sm_targets);
     let mut generated_sources = Vec::new();
@@ -672,16 +763,18 @@ fn find_tilelang_python() -> Result<String, String> {
     ))
 }
 
-fn tilelang_target(sm_targets: &[String]) -> (String, u32) {
+fn tilelang_target(sm_targets: &[SmSpec]) -> (String, u32) {
     let max_sm = sm_targets
         .iter()
-        .filter_map(|sm| sm.parse::<u32>().ok())
+        .filter_map(|s| s.sm.parse::<u32>().ok())
         .max()
         .expect("expected at least one CUDA SM target for TileLang AOT");
 
     if sm_targets.len() > 1 {
         println!(
-            "cargo:warning=TileLang AOT emits one cubin per kernel; using highest detected target sm_{max_sm}. Set INFER_CUDA_SM to pin one target explicitly."
+            "cargo:warning=TileLang AOT emits one cubin per kernel; using highest detected target sm_{max_sm}. \
+             Multi-SM TileLang AOT lands in commit C of the multi-SM rollout (docs/plans/sm-coverage.md). \
+             Set TORCH_CUDA_ARCH_LIST to pin one target explicitly."
         );
     }
 
@@ -797,7 +890,7 @@ fn generate_tilelang_artifacts(
     (func_name, c_path)
 }
 
-fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
+fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
     let python = find_tilelang_python().unwrap_or_else(|message| panic!("{message}"));
     let (target, cuda_arch) = tilelang_target(sm_targets);
     let (tilelang_src, cutlass_include) = tilelang_include_dirs(&python);
@@ -999,7 +1092,11 @@ fn main() {
         "cargo:warning=Compiling CUDA kernels for targets: {}",
         sm_targets
             .iter()
-            .map(|sm| format!("sm_{sm}"))
+            .map(|s| if s.ptx {
+                format!("sm_{}+PTX", s.sm)
+            } else {
+                format!("sm_{}", s.sm)
+            })
             .collect::<Vec<_>>()
             .join(",")
     );
@@ -1106,6 +1203,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
-    println!("cargo:rerun-if-env-changed=INFER_CUDA_SM");
-    println!("cargo:rerun-if-env-changed=CUDA_SM");
+    println!("cargo:rerun-if-env-changed=TORCH_CUDA_ARCH_LIST");
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
 }
