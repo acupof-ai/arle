@@ -807,9 +807,11 @@ fn run_agent_turn(
                 println!("\x1b[1;34m{}\x1b[0m", result.text);
             }
             let elapsed = start.elapsed();
-            tps_meter
-                .borrow_mut()
-                .print_final(result.prompt_tokens, Some(result.completion_tokens));
+            tps_meter.borrow_mut().print_final(
+                result.prompt_tokens,
+                Some(result.completion_tokens),
+                result.time_to_first_token,
+            );
             session_stats.record_turn(
                 result.prompt_tokens,
                 result.completion_tokens,
