@@ -81,6 +81,9 @@ metal = ["cli/metal"]
 # TileLang prefill HD128 attention path (Phase 0 A/B vs FlashInfer).
 # Implies `cuda`. Forwards through `cli` and `infer` to `cuda-kernels`.
 tilelang-attn = ["cuda", "cli/tilelang-attn"]
+# NCCL FFI for multi-GPU collectives. Implies `cuda`.
+# Forwards through `cli` → `infer` → `cuda-kernels`.
+nccl = ["cuda", "cli/nccl"]
 
 [dependencies]
 anyhow = "1.0"

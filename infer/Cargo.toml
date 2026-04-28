@@ -72,6 +72,8 @@ tilelang-attn = ["cuda", "cuda-kernels/tilelang-attn"]
 # `cargo build --features cuda,tilelang-attn` (the canonical Qwen3-4B
 # path) should not require this.
 tilelang-decode-hd256 = ["tilelang-attn", "cuda-kernels/tilelang-decode-hd256"]
+# NCCL FFI for multi-GPU collectives. Implies `cuda` (NCCL needs CUDA).
+nccl = ["cuda", "cuda-kernels/nccl"]
 # Development-oriented CPU backend for serial smoke tests and local validation.
 cpu = []
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).
