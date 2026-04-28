@@ -1,7 +1,7 @@
 //! Shared building blocks for transformer model implementations.
 //!
 //! Contains types and functions used by both Qwen3 and Qwen3.5:
-//! - `MLP` — SwiGLU MLP weights with optional merged gate+up projection
+//! - `MLP` — SwiGLU MLP weights (separate gate / up / down projections)
 //! - `get_embeddings_batch` — token ID → hidden state embedding lookup
 //! - `compute_logits_batch` — last hidden → final norm → LM head projection
 //! - `output_projection` — resolve tied vs untied LM head
@@ -24,10 +24,6 @@ use crate::weight_loader::{
 pub(crate) struct MLP {
     pub(crate) gate_proj: DeviceMatrix,
     pub(crate) up_proj: DeviceMatrix,
-    /// Merged gate+up projection: `[2*inter_dim, hidden_dim]`.
-    /// Pre-computed for the batched decode path (one GEMM instead of two).
-    /// `None` when the model variant doesn't use merged projections.
-    pub(crate) gate_up_proj: Option<DeviceMatrix>,
     pub(crate) down_proj: DeviceMatrix,
 }
 
@@ -35,13 +31,11 @@ impl MLP {
     /// Load MLP weights from safetensors.
     ///
     /// `prefix` should be e.g. `"model.layers.0.mlp"`.
-    /// When `merge_gate_up` is true, a fused `[gate; up]` matrix is also created.
     pub(crate) fn load_with_quant_config(
         ctx: &DeviceContext,
         shards: &[SafeTensors],
         weight_map: &HashMap<String, usize>,
         prefix: &str,
-        merge_gate_up: bool,
         quant: QuantLoadConfig,
     ) -> Result<Self> {
         let load_w = |name: &str| -> Result<DeviceMatrix> {
@@ -53,16 +47,10 @@ impl MLP {
         };
         let gate_proj = load_w(&format!("{}.gate_proj.weight", prefix))?;
         let up_proj = load_w(&format!("{}.up_proj.weight", prefix))?;
-        let gate_up_proj = if merge_gate_up {
-            Some(DeviceMatrix::concat_rows(ctx, &[&gate_proj, &up_proj])?)
-        } else {
-            None
-        };
         let down_proj = load_w(&format!("{}.down_proj.weight", prefix))?;
         Ok(Self {
             gate_proj,
             up_proj,
-            gate_up_proj,
             down_proj,
         })
     }

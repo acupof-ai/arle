@@ -55,16 +55,12 @@ pub struct BatchDecodeBuffers {
     q_batch: HiddenStates,
     k_batch: HiddenStates,
     v_batch: HiddenStates,
-    /// Merged QKV output buffer [max_batch_size, q_dim + 2*kv_dim]
-    qkv_batch: HiddenStates,
     attn_output: HiddenStates,
     /// Rotated query buffer for TurboQuant fused attention [max_batch_size, q_dim].
     q_rot: HiddenStates,
     o_buf: HiddenStates,
     gate_out: HiddenStates,
     up_out: HiddenStates,
-    /// Merged gate+up output buffer [max_batch_size, 2*inter_dim]
-    gate_up_out: HiddenStates,
     act_out: HiddenStates,
 
     /// Embedding output buffer [max_batch_size, hidden_dim] — avoids alloc in graph.
@@ -114,12 +110,10 @@ pub(crate) struct MixedBatchBuffers {
     q_batch: HiddenStates,
     k_batch: HiddenStates,
     v_batch: HiddenStates,
-    qkv_batch: HiddenStates,
     attn_output: HiddenStates,
     o_buf: HiddenStates,
     gate_out: HiddenStates,
     up_out: HiddenStates,
-    gate_up_out: HiddenStates,
     act_out: HiddenStates,
     /// Logits buffer sized for the *kept* output rows only:
     /// `max_logit_rows = max_batch_size`. Mixed-batch forward computes vocab
@@ -157,12 +151,10 @@ impl MixedBatchBuffers {
             q_batch: HiddenStates::zeros(ctx, q_dim, max_tokens)?,
             k_batch: HiddenStates::zeros(ctx, kv_dim, max_tokens)?,
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_tokens)?,
-            qkv_batch: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, max_tokens)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_tokens)?,
             o_buf: HiddenStates::zeros(ctx, model.config.hidden_size, max_tokens)?,
             gate_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
             up_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * model.config.intermediate_size, max_tokens)?,
             act_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
             // Sized for kept output rows only — see field doc above.
             logits: HiddenStates::zeros(ctx, model.config.vocab_size, max_logit_rows)?,
@@ -195,12 +187,10 @@ impl MixedBatchBuffers {
         self.q_batch.seq_len = seq_len;
         self.k_batch.seq_len = seq_len;
         self.v_batch.seq_len = seq_len;
-        self.qkv_batch.seq_len = seq_len;
         self.attn_output.seq_len = seq_len;
         self.o_buf.seq_len = seq_len;
         self.gate_out.seq_len = seq_len;
         self.up_out.seq_len = seq_len;
-        self.gate_up_out.seq_len = seq_len;
         self.act_out.seq_len = seq_len;
     }
 }
@@ -215,11 +205,16 @@ impl BatchDecodeBuffers {
         num_qheads: usize,
         max_total_pages: usize,
     ) -> usize {
+        // Buffers in BatchDecodeBuffers::new:
+        //   4×hidden_dim (hidden_out, normed, embedding_out, o_buf)
+        //   3×q_dim      (q_batch, attn_output, q_rot)
+        //   2×kv_dim     (k_batch, v_batch)
+        //   3×inter_dim  (gate_out, up_out, act_out)
         let activation_dims = 4usize
             .saturating_mul(hidden_dim)
-            .saturating_add(4usize.saturating_mul(q_dim))
-            .saturating_add(4usize.saturating_mul(kv_dim))
-            .saturating_add(5usize.saturating_mul(inter_dim));
+            .saturating_add(3usize.saturating_mul(q_dim))
+            .saturating_add(2usize.saturating_mul(kv_dim))
+            .saturating_add(3usize.saturating_mul(inter_dim));
 
         bf16_matrix_bytes(activation_dims, max_batch_size)
             .saturating_add(bytes_for::<i32>(max_batch_size)) // argmax_out
@@ -249,12 +244,16 @@ impl BatchDecodeBuffers {
         num_qheads: usize,
         max_total_pages: usize,
     ) -> usize {
-        // Per-token activation buffers (every row in the mixed batch).
+        // Per-token activation buffers (every row in the mixed batch):
+        //   4×hidden_dim (embedding_out, hidden_out, normed, o_buf)
+        //   2×q_dim      (q_batch, attn_output)
+        //   2×kv_dim     (k_batch, v_batch)
+        //   3×inter_dim  (gate_out, up_out, act_out)
         let activation_dims = 4usize
             .saturating_mul(hidden_dim)
-            .saturating_add(3usize.saturating_mul(q_dim))
-            .saturating_add(4usize.saturating_mul(kv_dim))
-            .saturating_add(5usize.saturating_mul(inter_dim));
+            .saturating_add(2usize.saturating_mul(q_dim))
+            .saturating_add(2usize.saturating_mul(kv_dim))
+            .saturating_add(3usize.saturating_mul(inter_dim));
 
         bf16_matrix_bytes(activation_dims, max_total_tokens)
             // Logits buffer — sized for kept output rows only (decode rows +
@@ -288,13 +287,11 @@ impl BatchDecodeBuffers {
             q_batch: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             k_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
-            qkv_batch: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, max_batch_size)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             q_rot: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             o_buf: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             gate_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
             up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * inter_dim, max_batch_size)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
@@ -343,12 +340,10 @@ impl BatchDecodeBuffers {
         self.q_batch.seq_len = batch_size;
         self.k_batch.seq_len = batch_size;
         self.v_batch.seq_len = batch_size;
-        self.qkv_batch.seq_len = batch_size;
         self.attn_output.seq_len = batch_size;
         self.o_buf.seq_len = batch_size;
         self.gate_out.seq_len = batch_size;
         self.up_out.seq_len = batch_size;
-        self.gate_up_out.seq_len = batch_size;
         self.act_out.seq_len = batch_size;
     }
 
@@ -613,50 +608,24 @@ impl Qwen3Model {
                 );
             }
 
-            if layer.attention.q_proj.is_quantized() {
-                ops::gemm_into(
-                    &self.ctx,
-                    &layer.attention.q_proj,
-                    &mixed.normed,
-                    &mut mixed.q_batch,
-                );
-                ops::gemm_into(
-                    &self.ctx,
-                    &layer.attention.k_proj,
-                    &mixed.normed,
-                    &mut mixed.k_batch,
-                );
-                ops::gemm_into(
-                    &self.ctx,
-                    &layer.attention.v_proj,
-                    &mixed.normed,
-                    &mut mixed.v_batch,
-                );
-            } else {
-                ops::gemm_into(
-                    &self.ctx,
-                    &layer.attention.qkv_proj,
-                    &mixed.normed,
-                    &mut mixed.qkv_batch,
-                );
-                let (qkv_ptr, _gqkv) = mixed.qkv_batch.data.device_ptr(&self.ctx.stream);
-                let (q_ptr, _gq) = mixed.q_batch.data.device_ptr_mut(&self.ctx.stream);
-                let (k_ptr, _gk) = mixed.k_batch.data.device_ptr_mut(&self.ctx.stream);
-                let (v_ptr, _gv) = mixed.v_batch.data.device_ptr_mut(&self.ctx.stream);
-                unsafe {
-                    ffi::split_qkv_cuda(
-                        qkv_ptr as *const ffi::Half,
-                        q_ptr as *mut ffi::Half,
-                        k_ptr as *mut ffi::Half,
-                        v_ptr as *mut ffi::Half,
-                        total_tokens as i32,
-                        q_dim as i32,
-                        kv_dim as i32,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.q_proj,
+                &mixed.normed,
+                &mut mixed.q_batch,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.k_proj,
+                &mixed.normed,
+                &mut mixed.k_batch,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.v_proj,
+                &mixed.normed,
+                &mut mixed.v_batch,
+            );
 
             let nrp = ops::NormRopeParams {
                 q_norm: &layer.attention.q_norm,
@@ -795,38 +764,24 @@ impl Qwen3Model {
                 &mut mixed.normed,
             );
 
-            if layer.mlp.gate_proj.is_quantized() {
-                ops::gemm_into(
-                    &self.ctx,
-                    &layer.mlp.gate_proj,
-                    &mixed.normed,
-                    &mut mixed.gate_out,
-                );
-                ops::gemm_into(
-                    &self.ctx,
-                    &layer.mlp.up_proj,
-                    &mixed.normed,
-                    &mut mixed.up_out,
-                );
-                ops::silu_mul_batch_into(
-                    &self.ctx,
-                    &mixed.gate_out,
-                    &mixed.up_out,
-                    &mut mixed.act_out,
-                )?;
-            } else {
-                ops::gemm_into(
-                    &self.ctx,
-                    layer
-                        .mlp
-                        .gate_up_proj
-                        .as_ref()
-                        .expect("merged gate_up_proj required"),
-                    &mixed.normed,
-                    &mut mixed.gate_up_out,
-                );
-                ops::silu_mul_fused_batch_into(&self.ctx, &mixed.gate_up_out, &mut mixed.act_out)?;
-            }
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.gate_proj,
+                &mixed.normed,
+                &mut mixed.gate_out,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.up_proj,
+                &mixed.normed,
+                &mut mixed.up_out,
+            );
+            ops::silu_mul_batch_into(
+                &self.ctx,
+                &mixed.gate_out,
+                &mixed.up_out,
+                &mut mixed.act_out,
+            )?;
 
             ops::gemm_into(
                 &self.ctx,
@@ -1557,56 +1512,36 @@ impl Qwen3Model {
             page_size,
         };
 
-        if layer.attention.q_proj.is_quantized() {
-            // Quantized: 3 separate GEMVs + original decode_prep
-            ops::gemm_into(
-                &self.ctx,
-                &layer.attention.q_proj,
-                &bufs.normed,
-                &mut bufs.q_batch,
-            );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.attention.k_proj,
-                &bufs.normed,
-                &mut bufs.k_batch,
-            );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.attention.v_proj,
-                &bufs.normed,
-                &mut bufs.v_batch,
-            );
-            ops::decode_prep_paged(
-                &self.ctx,
-                &mut bufs.q_batch,
-                &bufs.k_batch,
-                &bufs.v_batch,
-                &nrp,
-                &bufs.metadata.positions,
-                &paged,
-                num_heads,
-                num_kv_heads,
-            )?;
-        } else {
-            // BF16: merged GEMM → fused QKV decode_prep (saves split_qkv launch)
-            ops::gemm_into(
-                &self.ctx,
-                &layer.attention.qkv_proj,
-                &bufs.normed,
-                &mut bufs.qkv_batch,
-            );
-            ops::decode_prep_paged_fused_qkv(
-                &self.ctx,
-                &bufs.qkv_batch,
-                &mut bufs.q_batch,
-                &nrp,
-                &bufs.metadata.positions,
-                &paged,
-                num_heads,
-                num_kv_heads,
-            )?;
-        }
+        // 3 separate Q/K/V GEMMs → decode_prep_paged (qk-norm + RoPE + paged write).
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.q_proj,
+            &bufs.normed,
+            &mut bufs.q_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.k_proj,
+            &bufs.normed,
+            &mut bufs.k_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.v_proj,
+            &bufs.normed,
+            &mut bufs.v_batch,
+        );
+        ops::decode_prep_paged(
+            &self.ctx,
+            &mut bufs.q_batch,
+            &bufs.k_batch,
+            &bufs.v_batch,
+            &nrp,
+            &bufs.metadata.positions,
+            &paged,
+            num_heads,
+            num_kv_heads,
+        )?;
 
         // 4. Attention dispatch — format-aware
         //
@@ -1849,35 +1784,19 @@ impl Qwen3Model {
         );
 
         // 8. Batched MLP: gate + up projections → fused silu_mul → down
-        if layer.mlp.gate_proj.is_quantized() {
-            // Quantized: separate gate + up GEMVs (merged concat doesn't work)
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.gate_proj,
-                &bufs.normed,
-                &mut bufs.gate_out,
-            );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.up_proj,
-                &bufs.normed,
-                &mut bufs.up_out,
-            );
-            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        } else {
-            // BF16: merged gate+up GEMM + fused silu_mul from merged buffer
-            ops::gemm_into(
-                &self.ctx,
-                layer
-                    .mlp
-                    .gate_up_proj
-                    .as_ref()
-                    .expect("merged gate_up_proj required"),
-                &bufs.normed,
-                &mut bufs.gate_up_out,
-            );
-            ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
-        }
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.gate_proj,
+            &bufs.normed,
+            &mut bufs.gate_out,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.up_proj,
+            &bufs.normed,
+            &mut bufs.up_out,
+        );
+        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

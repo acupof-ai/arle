@@ -30,8 +30,6 @@ pub(super) struct Attention {
     pub(super) q_proj: DeviceMatrix,
     pub(super) k_proj: DeviceMatrix,
     pub(super) v_proj: DeviceMatrix,
-    /// Merged QKV projection: [q_dim + 2*kv_dim, hidden_dim]
-    pub(super) qkv_proj: DeviceMatrix,
     pub(super) o_proj: DeviceMatrix,
     pub(super) q_norm: DeviceVec,
     pub(super) k_norm: DeviceVec,
@@ -167,12 +165,10 @@ impl Qwen3Model {
                     let q_proj = load_linear(&names.q_proj)?;
                     let k_proj = load_linear(&names.k_proj)?;
                     let v_proj = load_linear(&names.v_proj)?;
-                    let qkv_proj = DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?;
                     Attention {
                         q_proj,
                         k_proj,
                         v_proj,
-                        qkv_proj,
                         o_proj: load_linear(&names.o_proj)?,
                         q_norm: load_tensor_1d(&ctx, &shards, &weight_map, &names.q_norm)?,
                         k_norm: load_tensor_1d(&ctx, &shards, &weight_map, &names.k_norm)?,
@@ -189,7 +185,6 @@ impl Qwen3Model {
                     &shards,
                     &weight_map,
                     &names.mlp_prefix,
-                    true, // merge gate+up for batched decode
                     quant,
                 )?,
             };
@@ -381,7 +376,6 @@ impl Qwen3Model {
             let q_proj = load_tensor_2d_gguf(ctx, gguf, &names.q_proj)?;
             let k_proj = load_tensor_2d_gguf(ctx, gguf, &names.k_proj)?;
             let v_proj = load_tensor_2d_gguf(ctx, gguf, &names.v_proj)?;
-            let qkv_proj = DeviceMatrix::concat_rows(ctx, &[&q_proj, &k_proj, &v_proj])?;
 
             layers.push(TransformerBlock {
                 input_layernorm: load_tensor_1d_gguf(ctx, gguf, &names.input_layernorm)?,
@@ -389,7 +383,6 @@ impl Qwen3Model {
                     q_proj,
                     k_proj,
                     v_proj,
-                    qkv_proj,
                     o_proj: load_tensor_2d_gguf(ctx, gguf, &names.o_proj)?,
                     q_norm: load_tensor_1d_gguf(ctx, gguf, &names.q_norm)?,
                     k_norm: load_tensor_1d_gguf(ctx, gguf, &names.k_norm)?,
@@ -403,12 +396,10 @@ impl Qwen3Model {
                     let gate = load_tensor_2d_gguf(ctx, gguf, &names.mlp_gate_proj)?;
                     let up = load_tensor_2d_gguf(ctx, gguf, &names.mlp_up_proj)?;
                     let down = load_tensor_2d_gguf(ctx, gguf, &names.mlp_down_proj)?;
-                    let gate_up = DeviceMatrix::concat_rows(ctx, &[&gate, &up])?;
                     MLP {
                         gate_proj: gate,
                         up_proj: up,
                         down_proj: down,
-                        gate_up_proj: Some(gate_up),
                     }
                 },
             });
