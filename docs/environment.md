@@ -461,9 +461,12 @@ docs promote them more clearly:
   the last token's logits during prefill (default on for the C++ path)
 - `AGENT_INFER_QWEN35_CPP_SEPARATE_MLP` — split the MLP evaluation into
   separate up/gate/down passes instead of the fused path
-- `AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER` /
-  `AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER` — force the helper-kernel
-  variants of g-beta and QK norm during Qwen3.5 prefill
+- `AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER` — toggle the helper-kernel
+  g-beta variant during Qwen3.5 prefill
+- `AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER` — opt into the helper-kernel
+  Q/K norm variant during Qwen3.5 GDR execution; default off because the
+  native MLX `fast::rms_norm(...) * scale` lowering is faster on the
+  Qwen3.5-0.8B MLX 4bit single-request path
 - `AGENT_INFER_QWEN35_CPP_GDR_TG_Y` /
   `AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y` /
   `AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y` — Gated Delta Rule tile-Y

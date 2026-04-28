@@ -103,7 +103,7 @@ bool use_qwen35_cpp_prefill_gbeta_helper() {
 
 bool use_qwen35_cpp_qk_norm_helper() {
     const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER");
-    return !(env && std::string(env) == "0");
+    return env && std::string(env) != "0";
 }
 
 bool use_qwen35_cpp_generate_profile() {
