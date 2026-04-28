@@ -41,7 +41,9 @@ is the dominant remaining gap.
 ## Patch summary
 
 `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py` only.
-Three lines of net code change (plus ~8 lines of comment):
+Two layered patches in one bench cycle:
+
+**Patch A — causal-bound KV loop** (commit `242d766a`):
 
 1. Hoist `kv_offset = kv_total_len - qlen` out of the inner KV loop.
 2. Compute `kv_visible_end = min(kv_total_len, kv_offset + row0 + BLOCK_M)`.
@@ -51,6 +53,24 @@ Three lines of net code change (plus ~8 lines of comment):
 Mirrors FlashInfer's `mask_iteration` / `window_iteration` skip pattern
 in `prefill.cuh:2256-2263` (vendored at
 `/usr/local/lib/python3.12/dist-packages/flashinfer/data/include/`).
+
+**Patch C — page-lookup hoist** (this commit):
+
+1. Allocate three 1D fragments outside the `T.Pipelined` loop:
+   `page_idx_j[BLOCK_N]`, `in_page_j[BLOCK_N]`, `valid_j[BLOCK_N]`
+   (all `index_dtype = int32`).
+2. Inside the loop, fill them with a `T.Parallel(BLOCK_N)` block —
+   one divmod + one `KV_indices[]` gather per `j`.
+3. Replace the original `T.Parallel(BLOCK_N, HEAD_DIM)` per-element
+   page lookup with a fragment-read using the precomputed values.
+
+Eliminates ~128× duplicate divmod + `KV_indices` gather per outer
+KV-tile iteration (only the `(j, d)` load actually needs `d`; pages
+were never `d`-dependent). Mirrors FlashInfer's `thr_local_kv_offset[]`
+cache in `prefill.cuh:2192-2287`. Codex audit + FlashInfer-comparison
+agent both surfaced this independently. The fragment write-then-read
+pattern matches the existing `scale_i[BLOCK_M]` precompute at lines
+167-172 of the same file (LayoutInferencer-tested OK).
 
 ## Cross-validation
 
@@ -127,18 +147,12 @@ Same operator-roadmap thread as this one:
 1. **Patch B** — split mask: full-valid path vs diagonal-tile path.
    Codex audit estimated ~3-8% on top of the bound. Held back today
    because TileLang 0.1.9 runtime `if`-statement codegen risk is
-   unverified — needs an AOT smoke before stacking on Patch A.
-2. **Patch C** — hoist `page_idx[j]` / `in_page[j]` out of the
-   `(j, d)` load. Codex estimate ~2-5%; FlashInfer-compare agent
-   confirms (`prefill.cuh:2192-2287`). Held back: 1D fragment
-   indexing inside `T.Parallel(BLOCK_N, HEAD_DIM)` may trip the same
-   layout-inferencer issue noted by the existing comment at
-   `batch_prefill_paged_hd128.py:161-166`.
-3. **Patch D** — sm_89 AOT variant with `BLOCK_M=128` for
+   unverified — needs an AOT smoke before stacking.
+2. **Patch D** — sm_89 AOT variant with `BLOCK_M=128` for
    `avg_packed_qo_len * gqa_group ≫ 64`. FlashInfer evidence at
    `scheduler.cuh:548-549` -> `utils.cuh:384-402` shows it dispatches
    to 128 on this exact shape. Estimated ~6-12% on top.
-4. **Patch E** — split-KV cooperative grid + merge-states (FlashInfer
+3. **Patch E** — split-KV cooperative grid + merge-states (FlashInfer
    `kv_chunk_size`). Architectural; opens a new plan ticket. Big at
    long-ctx where `~58 SM` L4 leaves CTAs idle. Out of scope for this
    patch.
