@@ -1,120 +1,33 @@
 ---
-import Brand from "./Brand.astro";
-import type { FooterCol } from "../data/content.ts";
-
 interface Props {
-  cols: FooterCol[];
-  meta: string;             // raw HTML
-  tagline?: string;         // shown under brand mark, raw HTML
-  rightMeta?: string;       // shown right of meta
+  left: string;
+  right: { label: string; href: string };
 }
-const {
-  cols,
-  meta,
-  tagline =
-    "Runtime-first Rust workspace. infer serves, arle operates. One front door for run, serve, train, data.",
-  rightMeta = "this page is the stable entry · product truth lives in the repo",
-} = Astro.props;
+const { left, right } = Astro.props;
 ---
-<footer class="sfoot" aria-label="site footer">
-  <div class="sfoot-grid">
-    <div class="sfoot-brand">
-      <a class="sfoot-brand-link" href="#top">
-        <Brand size={36} />
-      </a>
-      <p class="sfoot-tagline" set:html={tagline} />
-    </div>
-    {cols.map((col) => (
-      <div class="sfoot-col">
-        <h4>{col.heading}</h4>
-        <ul>
-          {col.links.map((l) => (
-            <li><a href={l.href}>{l.label}</a></li>
-          ))}
-        </ul>
-      </div>
-    ))}
-  </div>
-  <div class="sfoot-meta">
-    <span set:html={meta} />
-    <span>{rightMeta}</span>
-  </div>
+<footer>
+  <span>{left}</span>
+  <span><a href={right.href}>{right.label}</a></span>
 </footer>
 <style>
-  .sfoot {
-    background: var(--ink);
-    color: var(--paper);
-    padding: 64px;
-    font-family: var(--mono);
-  }
-  .sfoot-grid {
-    display: grid;
-    grid-template-columns: 2fr 1fr 1fr 1fr 1fr;
-    gap: 48px;
-    margin-bottom: 48px;
-  }
-  .sfoot-brand-link {
-    display: inline-flex;
-    align-items: center;
-    color: var(--paper);
-    text-decoration: none;
-    font-size: 24px;
-    font-weight: 700;
-    letter-spacing: -0.03em;
-    margin-bottom: 8px;
-  }
-  .sfoot-tagline {
-    color: rgba(255,255,255,0.55);
-    font-size: 12px;
-    line-height: 1.6;
-    max-width: 32ch;
-    margin: 0;
-  }
-  .sfoot-col h4 {
-    font-size: 10px;
-    letter-spacing: 0.16em;
-    text-transform: uppercase;
-    color: rgba(255,255,255,0.5);
-    margin: 0 0 16px;
-    font-weight: 500;
-  }
-  .sfoot-col ul {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-  .sfoot-col a {
-    color: rgba(255,255,255,0.85);
-    text-decoration: none;
-    font-size: 13px;
-  }
-  .sfoot-col a:hover { color: var(--paper); text-decoration: underline; }
-  .sfoot-meta {
+  footer {
+    margin-top: 96px;
+    padding-top: 22px;
+    border-top: 1px solid var(--ink);
     display: flex;
     justify-content: space-between;
-    padding-top: 24px;
-    border-top: 1px solid rgba(255,255,255,0.1);
-    font-size: 11px;
-    color: rgba(255,255,255,0.45);
-    letter-spacing: 0.04em;
+    align-items: baseline;
     flex-wrap: wrap;
-    gap: 16px;
+    gap: 8px 24px;
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
   }
-  .sfoot-meta a { color: rgba(255,255,255,0.7); }
-  .sfoot-meta a:hover { color: var(--paper); }
-
-  @media (max-width: 1100px) {
-    .sfoot { padding: 48px 32px; }
-    .sfoot-grid {
-      grid-template-columns: 1fr 1fr;
-      gap: 32px;
-    }
-    .sfoot-grid > .sfoot-brand { grid-column: 1 / -1; }
+  footer a {
+    color: inherit;
+    text-decoration: none;
+    transition: color var(--t-base);
   }
-  @media (max-width: 640px) {
-    .sfoot-grid { grid-template-columns: 1fr; }
-  }
+  footer a:hover { color: var(--ink); }
 </style>

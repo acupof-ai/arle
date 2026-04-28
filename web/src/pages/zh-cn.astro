@@ -1,59 +1,50 @@
 ---
 import Site from "../layouts/Site.astro";
-import TopNav from "../components/TopNav.astro";
-import HeroSplit from "../components/home/HeroSplit.astro";
-import Frame from "../components/home/Frame.astro";
-import Topology from "../components/home/Topology.astro";
-import Bench from "../components/home/Bench.astro";
+import Masthead from "../components/Masthead.astro";
+import Hero from "../components/home/Hero.astro";
+import Section from "../components/home/Section.astro";
 import Install from "../components/home/Install.astro";
+import Bench from "../components/home/Bench.astro";
 import Matrix from "../components/home/Matrix.astro";
-import Example from "../components/home/Example.astro";
+import Files from "../components/home/Files.astro";
 import SiteFooter from "../components/SiteFooter.astro";
 import { ZH } from "../data/content.ts";
 
 const s = ZH.sections;
-const base = import.meta.env.BASE_URL;
 ---
 <Site locale={ZH}>
-  <TopNav links={ZH.hero.nav} version={ZH.hero.version} />
+  <div class="page">
+    <Masthead left={ZH.masthead.left} links={ZH.masthead.links} />
+    <Hero hero={ZH.hero} />
 
-  <HeroSplit locale={ZH} />
+    <Section id="install" title={s.install.title} caption={s.install.caption}>
+      <Install cards={s.install.cards} />
+    </Section>
 
-  <Frame id="topology" num="01" label="拓扑" full={true}>
-    <Topology
-      locale={ZH}
-      heading='一套 workspace。一张前门。<em>三个后端。</em>'
-      label="拓扑"
-      num="01"
-    />
-  </Frame>
+    <Section id="bench" title={s.bench.title} caption={s.bench.caption}>
+      <Bench rows={s.bench.rows} snapshotLabel="完整快照 ↗" />
+    </Section>
 
-  <Frame
-    id="bench"
-    num="02"
-    label="基准"
-    heading={s.bench.v2Heading ?? "真实数据。带日期、可复现、在仓库里。"}
-  >
-    <Bench rows={s.bench.rows} isZh={true} />
-  </Frame>
+    <Section id="matrix" title={s.matrix.title} caption={s.matrix.caption}>
+      <Matrix head={s.matrix.head} rows={s.matrix.rows} />
+    </Section>
 
-  <Frame id="install" num="03" label="安装" heading="一行能跑。按平台。">
-    <Install install={s.install} />
-  </Frame>
+    <Section id="files" title={s.files.title} caption={s.files.caption}>
+      <Files rows={s.files.rows} />
+    </Section>
 
-  <Frame id="matrix" num="04" label="支持矩阵" heading='三个后端。<em>一份契约。</em>'>
-    <Matrix matrix={s.matrix} />
-  </Frame>
-
-  <Frame id="examples" num="05" label="示例" heading="OpenAI 兼容。cURL 直接打进来。">
-    <Example
-      title="Chat completion"
-      body={s.examples.lead}
-      lines={s.examples.lines}
-      docsHref={`${base}docs/`}
-      docsLabel="完整 HTTP API"
-    />
-  </Frame>
-
-  <SiteFooter cols={ZH.docfoot.cols} meta={ZH.docfoot.meta} />
+    <SiteFooter left={ZH.footer.left} right={ZH.footer.right} />
+  </div>
 </Site>
+
+<style>
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 56px 36px 72px;
+    counter-reset: section;
+  }
+  @media (max-width: 760px) {
+    .page { padding: 40px 22px 56px; }
+  }
+</style>

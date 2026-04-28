@@ -1,73 +1,50 @@
 ---
 import Site from "../layouts/Site.astro";
-import TopNav from "../components/TopNav.astro";
-import HeroSplit from "../components/home/HeroSplit.astro";
-import Frame from "../components/home/Frame.astro";
-import Topology from "../components/home/Topology.astro";
-import Bench from "../components/home/Bench.astro";
+import Masthead from "../components/Masthead.astro";
+import Hero from "../components/home/Hero.astro";
+import Section from "../components/home/Section.astro";
 import Install from "../components/home/Install.astro";
+import Bench from "../components/home/Bench.astro";
 import Matrix from "../components/home/Matrix.astro";
-import Example from "../components/home/Example.astro";
+import Files from "../components/home/Files.astro";
 import SiteFooter from "../components/SiteFooter.astro";
 import { EN } from "../data/content.ts";
 
 const s = EN.sections;
 ---
 <Site locale={EN}>
-  <TopNav links={EN.hero.nav} version={EN.hero.version} />
+  <div class="page">
+    <Masthead left={EN.masthead.left} links={EN.masthead.links} />
+    <Hero hero={EN.hero} />
 
-  <HeroSplit locale={EN} />
+    <Section id="install" title={s.install.title} caption={s.install.caption}>
+      <Install cards={s.install.cards} />
+    </Section>
 
-  <Frame id="topology" num="01" label="Topology" full={true}>
-    <Topology
-      locale={EN}
-      heading="One workspace. One front door. <em>Three backends.</em>"
-      label="Topology"
-      num="01"
-    />
-  </Frame>
+    <Section id="bench" title={s.bench.title} caption={s.bench.caption}>
+      <Bench rows={s.bench.rows} snapshotLabel="snapshot ↗" />
+    </Section>
 
-  <Frame
-    id="bench"
-    num="02"
-    label="Bench"
-    heading={s.bench.v2Heading ?? "Real numbers. Dated, reproducible, in-repo."}
-  >
-    <Bench rows={s.bench.rows} />
-  </Frame>
+    <Section id="matrix" title={s.matrix.title} caption={s.matrix.caption}>
+      <Matrix head={s.matrix.head} rows={s.matrix.rows} />
+    </Section>
 
-  <Frame
-    id="install"
-    num="03"
-    label="Install"
-    heading="One runnable line. Per platform."
-  >
-    <Install install={s.install} />
-  </Frame>
+    <Section id="files" title={s.files.title} caption={s.files.caption}>
+      <Files rows={s.files.rows} />
+    </Section>
 
-  <Frame
-    id="matrix"
-    num="04"
-    label="Support matrix"
-    heading="Three backends. <em>One contract.</em>"
-  >
-    <Matrix matrix={s.matrix} />
-  </Frame>
-
-  <Frame
-    id="examples"
-    num="05"
-    label="Examples"
-    heading="OpenAI-compatible. cURL straight in."
-  >
-    <Example
-      title="Chat completion"
-      body={s.examples.lead}
-      lines={s.examples.lines}
-      docsHref={`${import.meta.env.BASE_URL}docs/`}
-      docsLabel="Full HTTP API"
-    />
-  </Frame>
-
-  <SiteFooter cols={EN.docfoot.cols} meta={EN.docfoot.meta} />
+    <SiteFooter left={EN.footer.left} right={EN.footer.right} />
+  </div>
 </Site>
+
+<style>
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 56px 36px 72px;
+    counter-reset: section;
+  }
+  @media (max-width: 760px) {
+    .page { padding: 40px 22px 56px; }
+  }
+</style>
