@@ -89,6 +89,11 @@ fn validate_sm(spec: &SmSpec, source: &str) {
 
 /// Parse TORCH_CUDA_ARCH_LIST / CMAKE_CUDA_ARCHITECTURES.
 /// Separators: `;`, `,`, whitespace. Empty tokens skipped. Each token validated.
+///
+/// Empty result panics: an empty / whitespace / separators-only env var is
+/// almost always a typo (e.g. `TORCH_CUDA_ARCH_LIST=""`), and silently
+/// continuing would emit AOT dispatch wrappers with zero `case` arms — every
+/// runtime call would then return `CUDA_ERROR_NOT_SUPPORTED`. Fail fast.
 fn parse_arch_list(raw: &str, source: &str) -> Vec<SmSpec> {
     let mut sms: BTreeSet<String> = BTreeSet::new();
     let mut ptx_for: BTreeSet<String> = BTreeSet::new();
@@ -108,6 +113,14 @@ fn parse_arch_list(raw: &str, source: &str) -> Vec<SmSpec> {
             ptx_for.insert(spec.sm.clone());
         }
         sms.insert(spec.sm);
+    }
+
+    if sms.is_empty() {
+        panic!(
+            "{source} is set but parsed to zero SM targets (raw='{raw}'). \
+             Either unset {source} (auto-detect via nvidia-smi or T1 default) \
+             or pass a non-empty list, e.g. '8.0;8.6;8.9;9.0' (T1) or '9.0' (H100 only)."
+        );
     }
 
     sms.into_iter()
