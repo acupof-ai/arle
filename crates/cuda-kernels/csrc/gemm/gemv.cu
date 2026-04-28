@@ -1,4 +1,6 @@
 #include "common.cuh"
+#include <atomic>
+#include <cstdint>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <memory>
@@ -199,16 +201,27 @@ static constexpr size_t kWorkspaceBytes = 32 * 1024 * 1024;
 static std::mutex g_state_mutex;
 static std::unordered_map<int, std::unique_ptr<CublasDeviceState>> g_per_device_state;
 
+// Generation counter bumped on every `cublas_destroy()`. TLS caches stamp the
+// generation they observed when populating; on mismatch they re-fault under
+// the mutex. This prevents a worker thread from dereferencing a freed
+// `CublasDeviceState` after another thread tore down + re-initialized state
+// (codex R7 [P2]: per-thread TLS clear in destroy is insufficient for
+// surviving worker threads).
+static std::atomic<uint64_t> g_state_generation{0};
+
 // Hot-path lookup avoids the mutex by caching the per-device pointer in TLS.
-// Invalidated when `cudaGetDevice()` reports a different ordinal (rare; rank
-// threads pin once at startup).
+// Invalidated when `cudaGetDevice()` reports a different ordinal OR when the
+// global generation moves (some other thread destroyed state).
 thread_local CublasDeviceState *t_cached_state = nullptr;
 thread_local int t_cached_ordinal = -1;
+thread_local uint64_t t_cached_generation = 0;
 
 static CublasDeviceState *current_device_state() {
   int ordinal = 0;
   cudaGetDevice(&ordinal);
-  if (ordinal == t_cached_ordinal && t_cached_state != nullptr) {
+  uint64_t gen = g_state_generation.load(std::memory_order_acquire);
+  if (ordinal == t_cached_ordinal && t_cached_state != nullptr &&
+      gen == t_cached_generation) {
     return t_cached_state;
   }
   std::lock_guard<std::mutex> lock(g_state_mutex);
@@ -218,6 +231,7 @@ static CublasDeviceState *current_device_state() {
   }
   t_cached_ordinal = ordinal;
   t_cached_state = it->second.get();
+  t_cached_generation = gen;
   return t_cached_state;
 }
 
@@ -412,10 +426,14 @@ void cublas_destroy() {
     }
   }
   g_per_device_state.clear();
-  // TLS caches in any other thread will see ordinal mismatch on next call
-  // (cleared map) and re-fault — safe.
+  // Bump generation so EVERY thread's TLS cache (not just this one's) will
+  // miss on its next lookup and re-fault under the mutex. release-pairs with
+  // the acquire load in `current_device_state()`.
+  g_state_generation.fetch_add(1, std::memory_order_release);
+  // Clear our own TLS for fast-path consistency on this thread.
   t_cached_state = nullptr;
   t_cached_ordinal = -1;
+  t_cached_generation = 0;
 }
 
 
