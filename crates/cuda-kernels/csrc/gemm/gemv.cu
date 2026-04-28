@@ -402,11 +402,34 @@ void cublas_init() {
 }
 
 // Tear down cuBLAS state for ALL devices the process has initialized.
-// Called at process exit. Each handle/workspace is destroyed under the
-// device that owns it (cuBLAS handles are bound to the device active at
-// `cublasCreate` time, but `cublasDestroy` works from any current device).
+//
+// CALLER CONTRACT: every thread that may issue GEMM (gemm_cuda /
+// gemm_graphsafe_cuda / autotune_*) MUST be quiesced (joined, or proven
+// idle) before this function is called. The hot path is intentionally
+// lock-free past the TLS cache; we narrow but cannot fully eliminate the
+// race window without an RWLock-on-every-call cost we don't want to pay
+// in steady state. In practice this runs at process exit when worker
+// threads have stopped, or in a hot-swap path where the caller already
+// synchronizes a full quiesce-then-reinit cycle.
+//
+// Implementation details:
+// - Generation is bumped BEFORE freeing handles so a concurrent reader
+//   that loads `g_state_generation` after the bump observes mismatch and
+//   re-faults under the mutex (where it blocks on us, then sees an empty
+//   map). A reader that loaded the OLD generation before the bump is the
+//   case the caller-contract above must rule out — we narrow the window
+//   but don't eliminate it.
+// - Each handle/workspace is destroyed under the device that owns it
+//   (cuBLAS handles are bound to the device active at `cublasCreate`
+//   time, but `cublasDestroy` works from any current device).
 void cublas_destroy() {
   std::lock_guard<std::mutex> lock(g_state_mutex);
+  // Bump generation FIRST under the mutex so any reader that loads gen
+  // after this point sees the mismatch and re-faults. The actual destroy
+  // happens after the bump so readers that have already passed the gen
+  // check see live state until destroyed (race window narrows to the
+  // gap between "reader loaded old gen" and "reader dereferences ptr").
+  g_state_generation.fetch_add(1, std::memory_order_release);
   for (auto &kv : g_per_device_state) {
     auto &state = kv.second;
     if (state->handle != nullptr) {
@@ -426,10 +449,6 @@ void cublas_destroy() {
     }
   }
   g_per_device_state.clear();
-  // Bump generation so EVERY thread's TLS cache (not just this one's) will
-  // miss on its next lookup and re-fault under the mutex. release-pairs with
-  // the acquire load in `current_device_state()`.
-  g_state_generation.fetch_add(1, std::memory_order_release);
   // Clear our own TLS for fast-path consistency on this thread.
   t_cached_state = nullptr;
   t_cached_ordinal = -1;
