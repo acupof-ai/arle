@@ -16,6 +16,34 @@ pub enum Qwen35ConfigError {
 
 pub type Result<T> = std::result::Result<T, Qwen35ConfigError>;
 
+/// How a tensor's weight should be split across a tensor-parallel group.
+/// Mirrors SGLang `python/sglang/srt/layers/linear.py` parallel-linear classes.
+///
+/// `dim` follows the HF safetensors layout for nn.Linear: row 0 is the output
+/// (out_features) axis and row 1 is the input (in_features) axis. So
+/// `Column { dim: 0 }` matches SGLang's `ColumnParallelLinear` (split output)
+/// and `Row { dim: 1 }` matches `RowParallelLinear` (split input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shard {
+    /// Replicated on every rank (norms, biases that aren't per-head, etc).
+    Replicated,
+    /// Column-parallel: split along output dim. SGLang `linear.py:289`.
+    Column { dim: usize },
+    /// Row-parallel: split along input dim. SGLang `linear.py:1335`.
+    Row { dim: usize },
+    /// Merged column-parallel: SGLang `linear.py:485`. Used by `gate_up_proj`
+    /// and other fused projections; per-projection sizes come from config at
+    /// runtime (not encoded here, since they're model-dependent).
+    MergedColumn { dim: usize },
+    /// Fused QKV: SGLang `linear.py:889 QKVParallelLinear`. The KV-head
+    /// replication rule (SGLang `models/qwen3.py:84-95`) is applied at
+    /// runtime, not encoded here.
+    QkvFused { dim: usize },
+    /// Vocab-parallel: SGLang `vocab_parallel_embedding.py:161`.
+    /// Used for `embed_tokens` and (untied) `lm_head`.
+    VocabParallel { dim: usize },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerType {
@@ -69,6 +97,85 @@ pub enum Qwen35AttentionTensorNames {
 pub struct Qwen35LayerTensorNames {
     pub common: Qwen35CommonLayerTensorNames,
     pub attention: Qwen35AttentionTensorNames,
+}
+
+impl Qwen35CommonLayerTensorNames {
+    pub fn shard_for(&self, name: &str) -> Option<Shard> {
+        if name == self.mlp_gate_proj || name == self.mlp_up_proj {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if name == self.mlp_down_proj {
+            return Some(Shard::Row { dim: 1 });
+        }
+        if name == self.input_layernorm || name == self.post_attention_layernorm {
+            return Some(Shard::Replicated);
+        }
+        None
+    }
+}
+
+impl Qwen35FullAttentionTensorNames {
+    pub fn shard_for(&self, name: &str) -> Option<Shard> {
+        if name == self.q_proj || name == self.k_proj || name == self.v_proj {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if name == self.o_proj {
+            return Some(Shard::Row { dim: 1 });
+        }
+        if name == self.q_norm || name == self.k_norm {
+            return Some(Shard::Replicated);
+        }
+        None
+    }
+}
+
+impl Qwen35LinearAttentionTensorNames {
+    /// Linear-attention (Gated DeltaNet) shard mapping. Mirrors SGLang
+    /// `models/qwen3_5.py`: in-projections are column-parallel (the
+    /// checkpoint stores `in_proj_qkv` already fused along dim 0, so
+    /// `MergedColumn` is the right shape contract); `conv1d`, per-head
+    /// `dt_bias`, and `A_log` are split along dim 0 with
+    /// `sharded_weight_loader(0)`; `out_proj` is row-parallel; the gated
+    /// RMSNorm scale is replicated.
+    pub fn shard_for(&self, name: &str) -> Option<Shard> {
+        if name == self.in_proj_qkv {
+            return Some(Shard::MergedColumn { dim: 0 });
+        }
+        if name == self.in_proj_z || name == self.in_proj_b || name == self.in_proj_a {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if name == self.conv1d_weight || name == self.dt_bias || name == self.a_log {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if name == self.out_proj {
+            return Some(Shard::Row { dim: 1 });
+        }
+        if name == self.norm {
+            return Some(Shard::Replicated);
+        }
+        None
+    }
+}
+
+impl Qwen35AttentionTensorNames {
+    pub fn shard_for(&self, name: &str) -> Option<Shard> {
+        match self {
+            Self::Full(attn) => attn.shard_for(name),
+            Self::Linear(attn) => attn.shard_for(name),
+        }
+    }
+}
+
+impl Qwen35LayerTensorNames {
+    /// Returns `Some(Shard)` for tensors this spec knows about; `None` for
+    /// any name not part of a transformer layer (caller falls back to
+    /// `Shard::Replicated`). Per-layer tensors only — global tensors live
+    /// on `Qwen35Config::shard_for_global_tensor`.
+    pub fn shard_for(&self, name: &str) -> Option<Shard> {
+        self.common
+            .shard_for(name)
+            .or_else(|| self.attention.shard_for(name))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +414,21 @@ impl Qwen35Config {
 
     pub fn lm_head_tensor_name(&self) -> &'static str {
         self.embed_tokens_tensor_name()
+    }
+
+    /// Sharding for non-layer ("global") tensors. Returns `None` for any
+    /// name not recognised; callers fall back to `Shard::Replicated`.
+    pub fn shard_for_global_tensor(&self, name: &str) -> Option<Shard> {
+        if name == self.embed_tokens_tensor_name() {
+            return Some(Shard::VocabParallel { dim: 0 });
+        }
+        if name == "lm_head.weight" {
+            return Some(Shard::VocabParallel { dim: 0 });
+        }
+        if name == self.norm_tensor_name() {
+            return Some(Shard::Replicated);
+        }
+        None
     }
 
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -989,6 +1111,194 @@ mod tests {
         assert_eq!(config.num_experts, 0);
         assert!(!config.is_moe_layer(0));
         assert!(!config.is_moe_layer(5));
+    }
+
+    #[test]
+    fn every_full_attention_tensor_name_has_a_shard() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let names = config.layer_tensor_names(0);
+        let attn = match &names.attention {
+            Qwen35AttentionTensorNames::Full(a) => a.clone(),
+            _ => panic!("expected full attention layer at idx 0"),
+        };
+        for name in [
+            &names.common.input_layernorm,
+            &names.common.post_attention_layernorm,
+            &names.common.mlp_gate_proj,
+            &names.common.mlp_up_proj,
+            &names.common.mlp_down_proj,
+            &attn.q_proj,
+            &attn.k_proj,
+            &attn.v_proj,
+            &attn.o_proj,
+            &attn.q_norm,
+            &attn.k_norm,
+        ] {
+            assert!(names.shard_for(name).is_some(), "missing shard for {name}");
+        }
+    }
+
+    #[test]
+    fn every_linear_attention_tensor_name_has_a_shard() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let names = config.layer_tensor_names(2);
+        let attn = match &names.attention {
+            Qwen35AttentionTensorNames::Linear(a) => a.clone(),
+            _ => panic!("expected linear attention layer at idx 2"),
+        };
+        for name in [
+            &names.common.input_layernorm,
+            &names.common.post_attention_layernorm,
+            &names.common.mlp_gate_proj,
+            &names.common.mlp_up_proj,
+            &names.common.mlp_down_proj,
+            &attn.in_proj_qkv,
+            &attn.in_proj_z,
+            &attn.in_proj_b,
+            &attn.in_proj_a,
+            &attn.conv1d_weight,
+            &attn.dt_bias,
+            &attn.a_log,
+            &attn.norm,
+            &attn.out_proj,
+        ] {
+            assert!(names.shard_for(name).is_some(), "missing shard for {name}");
+        }
+    }
+
+    #[test]
+    fn full_attn_qkv_proj_is_column_dim0_and_o_proj_is_row_dim1() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let names = config.layer_tensor_names(0);
+        let Qwen35AttentionTensorNames::Full(attn) = names.attention.clone() else {
+            panic!("expected full-attention layer");
+        };
+        assert_eq!(
+            names.shard_for(&attn.q_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&attn.k_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&attn.v_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(names.shard_for(&attn.o_proj), Some(Shard::Row { dim: 1 }));
+    }
+
+    #[test]
+    fn mlp_gate_and_up_proj_are_column_dim0() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let names = config.layer_tensor_names(0);
+        assert_eq!(
+            names.shard_for(&names.common.mlp_gate_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&names.common.mlp_up_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+    }
+
+    #[test]
+    fn mlp_down_proj_is_row_dim1() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let names = config.layer_tensor_names(0);
+        assert_eq!(
+            names.shard_for(&names.common.mlp_down_proj),
+            Some(Shard::Row { dim: 1 })
+        );
+    }
+
+    #[test]
+    fn embed_tokens_and_lm_head_are_vocab_parallel_dim0() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        assert_eq!(
+            config.shard_for_global_tensor(config.embed_tokens_tensor_name()),
+            Some(Shard::VocabParallel { dim: 0 })
+        );
+        assert_eq!(
+            config.shard_for_global_tensor("lm_head.weight"),
+            Some(Shard::VocabParallel { dim: 0 })
+        );
+    }
+
+    #[test]
+    fn norm_tensors_are_replicated() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let full = config.layer_tensor_names(0);
+        assert_eq!(
+            full.shard_for(&full.common.input_layernorm),
+            Some(Shard::Replicated)
+        );
+        assert_eq!(
+            full.shard_for(&full.common.post_attention_layernorm),
+            Some(Shard::Replicated)
+        );
+        let Qwen35AttentionTensorNames::Full(attn) = full.attention.clone() else {
+            panic!();
+        };
+        assert_eq!(full.shard_for(&attn.q_norm), Some(Shard::Replicated));
+        assert_eq!(full.shard_for(&attn.k_norm), Some(Shard::Replicated));
+
+        let lin = config.layer_tensor_names(2);
+        let Qwen35AttentionTensorNames::Linear(attn) = lin.attention.clone() else {
+            panic!();
+        };
+        assert_eq!(lin.shard_for(&attn.norm), Some(Shard::Replicated));
+
+        assert_eq!(
+            config.shard_for_global_tensor(config.norm_tensor_name()),
+            Some(Shard::Replicated)
+        );
+    }
+
+    #[test]
+    fn linear_attn_in_proj_qkv_is_merged_column_and_out_proj_is_row() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let names = config.layer_tensor_names(2);
+        let Qwen35AttentionTensorNames::Linear(attn) = names.attention.clone() else {
+            panic!("expected linear-attention layer at idx 2");
+        };
+        assert_eq!(
+            names.shard_for(&attn.in_proj_qkv),
+            Some(Shard::MergedColumn { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&attn.in_proj_z),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&attn.in_proj_b),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&attn.in_proj_a),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&attn.conv1d_weight),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&attn.dt_bias),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(names.shard_for(&attn.a_log), Some(Shard::Column { dim: 0 }));
+        assert_eq!(names.shard_for(&attn.out_proj), Some(Shard::Row { dim: 1 }));
+    }
+
+    #[test]
+    fn unknown_tensor_returns_none() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        let names = config.layer_tensor_names(0);
+        assert_eq!(
+            names.shard_for("model.language_model.layers.0.unknown.weight"),
+            None
+        );
+        assert_eq!(config.shard_for_global_tensor("not.a.tensor"), None);
     }
 
     #[test]

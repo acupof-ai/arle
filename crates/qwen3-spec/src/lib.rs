@@ -16,6 +16,34 @@ pub enum Qwen3ConfigError {
 
 pub type Result<T> = std::result::Result<T, Qwen3ConfigError>;
 
+/// How a tensor's weight should be split across a tensor-parallel group.
+/// Mirrors SGLang `python/sglang/srt/layers/linear.py` parallel-linear classes.
+///
+/// `dim` follows the HF safetensors layout for nn.Linear: row 0 is the output
+/// (out_features) axis and row 1 is the input (in_features) axis. So
+/// `Column { dim: 0 }` matches SGLang's `ColumnParallelLinear` (split output)
+/// and `Row { dim: 1 }` matches `RowParallelLinear` (split input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shard {
+    /// Replicated on every rank (norms, biases that aren't per-head, etc).
+    Replicated,
+    /// Column-parallel: split along output dim. SGLang `linear.py:289`.
+    Column { dim: usize },
+    /// Row-parallel: split along input dim. SGLang `linear.py:1335`.
+    Row { dim: usize },
+    /// Merged column-parallel: SGLang `linear.py:485`. Used by `gate_up_proj`
+    /// and other fused projections; per-projection sizes come from config at
+    /// runtime (not encoded here, since they're model-dependent).
+    MergedColumn { dim: usize },
+    /// Fused QKV: SGLang `linear.py:889 QKVParallelLinear`. The KV-head
+    /// replication rule (SGLang `models/qwen3.py:84-95`) is applied at
+    /// runtime, not encoded here.
+    QkvFused { dim: usize },
+    /// Vocab-parallel: SGLang `vocab_parallel_embedding.py:161`.
+    /// Used for `embed_tokens` and (untied) `lm_head`.
+    VocabParallel { dim: usize },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen3LayerTensorNames {
     pub layer_prefix: String,
@@ -32,6 +60,35 @@ pub struct Qwen3LayerTensorNames {
     pub mlp_gate_proj: String,
     pub mlp_up_proj: String,
     pub mlp_down_proj: String,
+}
+
+impl Qwen3LayerTensorNames {
+    /// Returns `Some(Shard)` for tensors this spec knows about; `None` for
+    /// any name not part of a transformer layer (caller falls back to
+    /// `Shard::Replicated`). Per-layer tensors only — global tensors live
+    /// on `Qwen3Config::shard_for_global_tensor`.
+    pub fn shard_for(&self, name: &str) -> Option<Shard> {
+        if name == self.q_proj || name == self.k_proj || name == self.v_proj {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if name == self.o_proj {
+            return Some(Shard::Row { dim: 1 });
+        }
+        if name == self.mlp_gate_proj || name == self.mlp_up_proj {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if name == self.mlp_down_proj {
+            return Some(Shard::Row { dim: 1 });
+        }
+        if name == self.input_layernorm
+            || name == self.post_attention_layernorm
+            || name == self.q_norm
+            || name == self.k_norm
+        {
+            return Some(Shard::Replicated);
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -107,6 +164,17 @@ impl Qwen3Config {
             self.embed_tokens_tensor_name()
         } else {
             "lm_head.weight"
+        }
+    }
+
+    /// Sharding for non-layer ("global") tensors. Returns `None` for any name
+    /// not recognised; callers fall back to `Shard::Replicated`.
+    pub fn shard_for_global_tensor(&self, name: &str) -> Option<Shard> {
+        match name {
+            "model.embed_tokens.weight" => Some(Shard::VocabParallel { dim: 0 }),
+            "lm_head.weight" => Some(Shard::VocabParallel { dim: 0 }),
+            "model.norm.weight" => Some(Shard::Replicated),
+            _ => None,
         }
     }
 
@@ -231,6 +299,130 @@ mod tests {
         assert_eq!(names.mlp_gate_proj, "model.layers.7.mlp.gate_proj.weight");
         assert_eq!(names.mlp_up_proj, "model.layers.7.mlp.up_proj.weight");
         assert_eq!(names.mlp_down_proj, "model.layers.7.mlp.down_proj.weight");
+    }
+
+    fn shard_test_config() -> Qwen3Config {
+        Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "tie_word_embeddings": false,
+                "max_position_embeddings": 32768
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_layer_tensor_name_has_a_shard() {
+        let cfg = shard_test_config();
+        let names = cfg.layer_tensor_names(0);
+        for name in [
+            &names.input_layernorm,
+            &names.q_proj,
+            &names.k_proj,
+            &names.v_proj,
+            &names.o_proj,
+            &names.q_norm,
+            &names.k_norm,
+            &names.post_attention_layernorm,
+            &names.mlp_gate_proj,
+            &names.mlp_up_proj,
+            &names.mlp_down_proj,
+        ] {
+            assert!(names.shard_for(name).is_some(), "missing shard for {name}");
+        }
+    }
+
+    #[test]
+    fn qkv_proj_is_column_dim0_and_o_proj_is_row_dim1() {
+        let cfg = shard_test_config();
+        let names = cfg.layer_tensor_names(3);
+        assert_eq!(
+            names.shard_for(&names.q_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&names.k_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&names.v_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(names.shard_for(&names.o_proj), Some(Shard::Row { dim: 1 }));
+    }
+
+    #[test]
+    fn mlp_gate_and_up_proj_are_column_dim0() {
+        let cfg = shard_test_config();
+        let names = cfg.layer_tensor_names(0);
+        assert_eq!(
+            names.shard_for(&names.mlp_gate_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&names.mlp_up_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+    }
+
+    #[test]
+    fn mlp_down_proj_is_row_dim1() {
+        let cfg = shard_test_config();
+        let names = cfg.layer_tensor_names(0);
+        assert_eq!(
+            names.shard_for(&names.mlp_down_proj),
+            Some(Shard::Row { dim: 1 })
+        );
+    }
+
+    #[test]
+    fn embed_tokens_and_lm_head_are_vocab_parallel_dim0() {
+        let cfg = shard_test_config();
+        assert_eq!(
+            cfg.shard_for_global_tensor("model.embed_tokens.weight"),
+            Some(Shard::VocabParallel { dim: 0 })
+        );
+        assert_eq!(
+            cfg.shard_for_global_tensor("lm_head.weight"),
+            Some(Shard::VocabParallel { dim: 0 })
+        );
+    }
+
+    #[test]
+    fn norm_tensors_are_replicated() {
+        let cfg = shard_test_config();
+        let names = cfg.layer_tensor_names(0);
+        assert_eq!(
+            names.shard_for(&names.input_layernorm),
+            Some(Shard::Replicated)
+        );
+        assert_eq!(
+            names.shard_for(&names.post_attention_layernorm),
+            Some(Shard::Replicated)
+        );
+        assert_eq!(names.shard_for(&names.q_norm), Some(Shard::Replicated));
+        assert_eq!(names.shard_for(&names.k_norm), Some(Shard::Replicated));
+        assert_eq!(
+            cfg.shard_for_global_tensor("model.norm.weight"),
+            Some(Shard::Replicated)
+        );
+    }
+
+    #[test]
+    fn unknown_tensor_returns_none() {
+        let cfg = shard_test_config();
+        let names = cfg.layer_tensor_names(0);
+        assert_eq!(names.shard_for("model.layers.0.unknown.weight"), None);
+        assert_eq!(cfg.shard_for_global_tensor("not.a.tensor"), None);
     }
 
     #[test]
