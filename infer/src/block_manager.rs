@@ -503,4 +503,62 @@ mod tests {
         m.free(&b);
         assert!((m.gpu_utilization() - 0.0).abs() < 1e-6);
     }
+
+    /// Fill the pool to exhaustion, then attempt a single additional allocation.
+    /// The allocator must (a) return a structured error rather than panic,
+    /// (b) leave already-allocated block ref_counts untouched, (c) keep the
+    /// free list at zero (the failed request must not silently take from or
+    /// add to it).
+    #[test]
+    fn allocate_after_pool_exhausted_preserves_state() {
+        let mut m = BlockManager::new(4, 2, 16);
+
+        // Drain the GPU pool with two requests to make sure the test
+        // exercises the multi-request path, not just a single big one.
+        let first = m.allocate_gpu(3).unwrap();
+        let second = m.allocate_gpu(1).unwrap();
+        assert_eq!(m.free_gpu_blocks(), 0);
+
+        // Capture pre-existing ref_counts.
+        let pre_counts: Vec<u32> = first
+            .iter()
+            .chain(second.iter())
+            .map(|&id| m.ref_count(id))
+            .collect();
+        assert!(pre_counts.iter().all(|&c| c == 1));
+
+        // Single-block additional request must fail without panicking.
+        let err = m.allocate_gpu(1).unwrap_err();
+        match err {
+            AllocationError::InsufficientGpuBlocks {
+                requested,
+                available,
+            } => {
+                assert_eq!(requested, 1);
+                assert_eq!(available, 0);
+            }
+            other => panic!("expected InsufficientGpuBlocks, got {other:?}"),
+        }
+
+        // Pool is still drained, no phantom blocks appeared.
+        assert_eq!(m.free_gpu_blocks(), 0);
+        assert_eq!(m.total_gpu_blocks(), 4);
+
+        // Pre-existing ref_counts must not have moved.
+        let post_counts: Vec<u32> = first
+            .iter()
+            .chain(second.iter())
+            .map(|&id| m.ref_count(id))
+            .collect();
+        assert_eq!(pre_counts, post_counts);
+
+        // CPU pool is untouched by a GPU OOM.
+        assert_eq!(m.free_cpu_blocks(), 2);
+
+        // Recovery path: free one block, then the same request succeeds.
+        m.free(&[first[0]]);
+        assert_eq!(m.free_gpu_blocks(), 1);
+        let recovered = m.allocate_gpu(1).unwrap();
+        assert_eq!(recovered.len(), 1);
+    }
 }
