@@ -709,6 +709,14 @@ impl InferenceBackend for MetalBackend {
         let input_ids = tokenizer.encode(prompt)?;
         self.generate_from_token_ids(&input_ids, params)
     }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .context("model not loaded — call load() first")?;
+        tokenizer.encode(text)
+    }
 }
 
 #[cfg(feature = "metal")]

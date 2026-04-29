@@ -141,6 +141,18 @@ impl InferenceBackend for CpuBackend {
     fn name(&self) -> &'static str {
         "cpu"
     }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        // Phase 2 trajectory token layer. The CPU backend's tokenizer is
+        // best-effort (it is sometimes absent for synthetic test fixtures);
+        // when missing, error so the agent loop downgrades `tokens = None`
+        // rather than fabricating an empty Vec.
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow!("CPU backend has no tokenizer loaded"))?;
+        tokenizer.encode(text)
+    }
 }
 
 impl StreamingInferenceBackend for CpuBackend {

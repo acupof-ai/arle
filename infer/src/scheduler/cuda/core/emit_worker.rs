@@ -162,11 +162,16 @@ pub(in crate::scheduler::cuda) fn spawn_emit_worker(
                                 Span::root("finish", parent)
                                     .with_properties(|| [("request_id", request_id.to_string())])
                             });
+                            // Fallback path: the request was finished
+                            // before any `Append` lifted state into the
+                            // worker's table, so we have no generated
+                            // tokens to surface for `response_token_ids`.
                             StreamDecodeState::default().send_finish(
                                 &delta_tx,
                                 prompt_tokens,
                                 completion_tokens,
                                 reason,
+                                &[],
                             );
                         }
                     }

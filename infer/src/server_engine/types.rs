@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::sampler::SamplingParams;
@@ -43,6 +43,15 @@ pub struct CompletionOutput {
     pub usage: TokenUsage,
     /// Per-token log-probabilities (greedy only). Empty if logprobs not requested.
     pub token_logprobs: Vec<f32>,
+    /// Tokenized prompt the engine actually saw. Empty when the backend
+    /// has not yet populated this field — callers must treat empty as
+    /// "unavailable", not "zero tokens".
+    pub prompt_token_ids: Vec<u32>,
+    /// Generated token IDs (concatenation of every stream delta's
+    /// `token_ids`). Redundant with the streaming channel but cheap and
+    /// useful for non-streaming callers / RL trajectory export. Empty
+    /// when the backend has not populated per-delta token IDs.
+    pub response_token_ids: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,16 +68,22 @@ pub struct CompletionStreamDelta {
     /// Log-probability of the generated token (greedy only, None otherwise).
     #[allow(dead_code)]
     pub logprob: Option<f32>,
+    /// Token IDs newly emitted in this delta (Phase 2 trajectory token
+    /// layer). Empty for backends that have not yet populated this — the
+    /// agent loop treats an empty cumulative response as "unavailable"
+    /// and surfaces `tokens = None` rather than fabricating partial data.
+    pub token_ids: Vec<u32>,
 }
 
 impl CompletionStreamDelta {
-    /// Create a text delta (no finish, no logprob).
+    /// Create a text delta (no finish, no logprob, no token IDs).
     pub fn text(s: String) -> Self {
         Self {
             text_delta: s,
             finish_reason: None,
             usage: None,
             logprob: None,
+            token_ids: Vec::new(),
         }
     }
 }
@@ -86,4 +101,18 @@ pub trait InferenceEngine: Send {
         req: CompletionRequest,
         tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()>;
+
+    /// Encode `text` to token IDs using whatever tokenizer the backend
+    /// already loaded. The agent loop calls this to interleave tool
+    /// results into the trajectory's `response_ids` (with mask=0) so an
+    /// RL trainer can mask environment tokens out of the policy loss.
+    ///
+    /// The default impl errors so the trait stays object-safe and Phase
+    /// 1 backends keep compiling untouched. Phase 2 backends override
+    /// it. Callers must treat an `Err(_)` as "tokenize unavailable" and
+    /// downgrade `tokens` to `None` per the trajectory contract — never
+    /// substitute an empty Vec.
+    fn tokenize(&self, _text: &str) -> Result<Vec<u32>> {
+        Err(anyhow!("backend does not expose tokenize()"))
+    }
 }

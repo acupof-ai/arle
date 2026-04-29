@@ -253,6 +253,7 @@ pub(super) struct BufferedResponse {
     pub(super) finish_reason: FinishReason,
     pub(super) usage: TokenUsage,
     pub(super) token_logprobs: Vec<f32>,
+    pub(super) response_token_ids: Vec<u32>,
     /// `true` once a delta with `finish_reason: Some(_)` has been observed.
     ///
     /// Distinguishes a clean scheduler-side completion from an aborted request
@@ -273,6 +274,7 @@ impl Default for BufferedResponse {
                 total_tokens: 0,
             },
             token_logprobs: Vec::new(),
+            response_token_ids: Vec::new(),
             terminal_seen: false,
         }
     }
@@ -291,6 +293,9 @@ impl BufferedResponse {
         if let Some(lp) = delta.logprob {
             self.token_logprobs.push(lp);
         }
+        if !delta.token_ids.is_empty() {
+            self.response_token_ids.extend(delta.token_ids.iter());
+        }
     }
 
     pub(super) fn into_output(self) -> CompletionOutput {
@@ -299,6 +304,13 @@ impl BufferedResponse {
             finish_reason: self.finish_reason,
             usage: self.usage,
             token_logprobs: self.token_logprobs,
+            // The HTTP non-streaming path doesn't tokenize the prompt
+            // here — the OpenAI-compat response shape doesn't expose
+            // token IDs to the client anyway. Phase 2 trajectory export
+            // runs through the agent loop, which calls `engine.tokenize`
+            // directly.
+            prompt_token_ids: Vec::new(),
+            response_token_ids: self.response_token_ids,
         }
     }
 }

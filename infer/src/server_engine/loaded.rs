@@ -144,6 +144,17 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Cpu(engine) => engine.complete_stream(req, tx),
         }
     }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda { engine, .. } => engine.tokenize(text),
+            #[cfg(feature = "metal")]
+            Self::Metal(engine) => engine.tokenize(text),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.tokenize(text),
+        }
+    }
 }
 
 impl SessionPersistence for LoadedInferenceEngine {}

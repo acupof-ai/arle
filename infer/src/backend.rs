@@ -22,7 +22,7 @@ pub mod runtime;
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use crate::sampler::SamplingParams;
 
@@ -67,6 +67,15 @@ pub trait InferenceBackend: Send {
 
     /// Backend name for logging / metrics.
     fn name(&self) -> &'static str;
+
+    /// Encode `text` to token IDs using the backend's loaded tokenizer.
+    /// Default: error — backends override once a tokenizer is loaded.
+    /// Used by the agent loop's Phase 2 trajectory token layer to
+    /// tokenize tool results so they can land in `response_ids` with
+    /// mask=0 (matches verl's `AgentLoopOutput` semantics).
+    fn tokenize(&self, _text: &str) -> Result<Vec<u32>> {
+        Err(anyhow!("backend does not expose tokenize()"))
+    }
 }
 
 /// Streaming-capable inference backend.

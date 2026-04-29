@@ -82,6 +82,13 @@ struct ActiveMetalRequest {
     enqueued_at: Instant,
     admitted_at: Instant,
     first_token_at: Option<Instant>,
+    /// Phase 2 trajectory token layer. Each `process_token` pushes the
+    /// just-sampled id; whenever a text delta is actually sent
+    /// (post stop-processor / decoder buffering), the pending IDs are
+    /// drained onto that delta. Any IDs still pending at finish time
+    /// ride on the final delta so the cumulative `response_token_ids`
+    /// the consumer collates equals every generated token.
+    pending_token_ids: Vec<u32>,
 }
 
 impl ActiveMetalRequest {
@@ -121,6 +128,7 @@ impl ActiveMetalRequest {
             enqueued_at: pending.enqueued_at,
             admitted_at: Instant::now(),
             first_token_at: None,
+            pending_token_ids: Vec::new(),
         })
     }
 
@@ -164,7 +172,14 @@ impl ActiveMetalRequest {
             self.push_text_chunk(&tail)?;
         }
         if let Some(final_delta) = self.stop_processor.finish() {
-            send_text_delta(&self.delta_tx, final_delta)?;
+            // Final stop-processor flush still belongs to the same
+            // generation — drain any pending IDs onto it so they don't
+            // need to ride the empty terminator delta below.
+            send_text_delta_with_ids(
+                &self.delta_tx,
+                final_delta,
+                std::mem::take(&mut self.pending_token_ids),
+            )?;
         }
 
         let finish_reason = if self.stop_processor.hit_stop() {
@@ -180,11 +195,17 @@ impl ActiveMetalRequest {
             total_tokens: prompt_tokens + completion_tokens,
         };
 
+        // Any IDs still pending (e.g. trailing tokens swallowed by the
+        // stop processor's withheld suffix) ride on the terminator
+        // delta. The collator on the consumer side sums every delta's
+        // `token_ids` into `response_token_ids` — sum must equal
+        // every token `process_token` saw.
         let _ = self.delta_tx.send(CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
             usage: Some(usage),
             logprob: None,
+            token_ids: std::mem::take(&mut self.pending_token_ids),
         });
         Ok(())
     }
@@ -193,6 +214,11 @@ impl ActiveMetalRequest {
         if self.first_token_at.is_none() {
             self.first_token_at = Some(Instant::now());
         }
+        // Record the token id BEFORE asking the incremental decoder for
+        // text — the byte chunk may emit later (or never, if a stop
+        // sequence withholds it), but the id always counts toward
+        // `response_token_ids`.
+        self.pending_token_ids.push(token_id);
         if let Some(chunk) = self.decoder.step(token_id)? {
             self.push_text_chunk(&chunk)?;
         }
@@ -201,7 +227,12 @@ impl ActiveMetalRequest {
 
     fn push_text_chunk(&mut self, chunk: &str) -> Result<()> {
         if let Some(delta) = self.stop_processor.push_chunk(chunk) {
-            send_text_delta(&self.delta_tx, delta)?;
+            // Drain pending token IDs onto the delta we're about to
+            // send. IDs still in the queue when no delta fires (the
+            // decoder buffered, or stop withheld) wait until the next
+            // emit or `send_final_delta`.
+            let ids = std::mem::take(&mut self.pending_token_ids);
+            send_text_delta_with_ids(&self.delta_tx, delta, ids)?;
         }
         Ok(())
     }
@@ -2052,11 +2083,16 @@ fn map_finish_reason(reason: Option<&str>) -> FinishReason {
     }
 }
 
-fn send_text_delta(
+fn send_text_delta_with_ids(
     delta_tx: &mpsc::UnboundedSender<CompletionStreamDelta>,
     text_delta: String,
+    token_ids: Vec<u32>,
 ) -> Result<()> {
-    if text_delta.is_empty() {
+    // We still want to push token_ids even when the text delta is empty,
+    // because the stop processor sometimes withholds bytes while the
+    // decoder has already consumed token IDs that we must surface in
+    // the trajectory. Empty text + empty IDs is the only case we drop.
+    if text_delta.is_empty() && token_ids.is_empty() {
         return Ok(());
     }
 
@@ -2066,6 +2102,7 @@ fn send_text_delta(
             finish_reason: None,
             usage: None,
             logprob: None,
+            token_ids,
         })
         .map_err(|_| anyhow!("stream consumer dropped"))
 }

@@ -90,6 +90,8 @@ fn responses_response_exposes_output_text_and_function_calls() {
                 total_tokens: 5,
             },
             token_logprobs: Vec::new(),
+            prompt_token_ids: Vec::new(),
+            response_token_ids: Vec::new(),
         },
     );
 
@@ -363,6 +365,8 @@ fn completion_response_drops_non_finite_logprobs() {
                 total_tokens: 2,
             },
             token_logprobs: vec![f32::NAN, f32::NEG_INFINITY],
+            prompt_token_ids: Vec::new(),
+            response_token_ids: Vec::new(),
         },
     );
 

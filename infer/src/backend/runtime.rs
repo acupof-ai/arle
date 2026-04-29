@@ -250,8 +250,13 @@ where
     let mut stop_processor = StopChunkProcessor::new(req.stop.unwrap_or_default());
     let delta_tx = req.delta_tx;
 
+    // Phase 2 trajectory: collate visible text we forward so the final
+    // delta can ride its tokenized form as `token_ids`.
+    let emitted_text = std::cell::RefCell::new(String::new());
+
     let generated = backend.generate_stream(&req.prompt, &sampling, |chunk| {
         if let Some(delta) = stop_processor.push_chunk(chunk) {
+            emitted_text.borrow_mut().push_str(&delta);
             send_text_delta(&delta_tx, delta)?;
         }
         if stop_processor.hit_stop() {
@@ -276,6 +281,7 @@ where
     );
 
     if let Some(final_delta) = stop_processor.finish() {
+        emitted_text.borrow_mut().push_str(&final_delta);
         send_text_delta(&delta_tx, final_delta)?;
     }
 
@@ -290,11 +296,20 @@ where
         total_tokens: generated.prompt_tokens + generated.completion_tokens,
     };
 
+    let final_text = emitted_text.borrow();
+    let response_token_ids = if final_text.is_empty() {
+        Vec::new()
+    } else {
+        backend.tokenize(&final_text).unwrap_or_default()
+    };
+    drop(final_text);
+
     let _ = delta_tx.send(CompletionStreamDelta {
         text_delta: String::new(),
         finish_reason: Some(finish_reason),
         usage: Some(usage),
         logprob: None,
+        token_ids: response_token_ids,
     });
 
     Ok(())
@@ -321,6 +336,10 @@ fn send_text_delta(
             finish_reason: None,
             usage: None,
             logprob: None,
+            // Per-chunk token IDs aren't available on the
+            // text-callback streaming path; the cumulative list rides
+            // on the final delta in `execute_request`.
+            token_ids: Vec::new(),
         })
         .map_err(|_| anyhow!("stream consumer dropped"))
 }
