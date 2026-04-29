@@ -12,7 +12,7 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
-use infer::scheduler::SchedulerConfig;
+use infer::scheduler::{SchedulePolicy, SchedulerConfig};
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
 
@@ -35,6 +35,10 @@ struct Args {
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to disable)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     cuda_graph: bool,
+
+    /// SGLang-compatible alias for `--cuda-graph=false`.
+    #[arg(long)]
+    disable_cuda_graph: bool,
 
     /// Enable request tracing and write trace JSON files to this directory
     #[arg(long)]
@@ -103,6 +107,29 @@ struct Args {
     /// If omitted, the scheduler only enforces the token budget.
     #[arg(long)]
     prefill_max_requests: Option<usize>,
+
+    /// Request scheduling policy. ARLE CUDA currently implements SGLang's
+    /// default `fcfs`; other policy names are rejected instead of accepted as
+    /// no-ops.
+    #[arg(long, default_value = "fcfs")]
+    schedule_policy: String,
+
+    /// SGLang-compatible streaming interval in generated tokens.
+    #[arg(long, default_value_t = 1)]
+    stream_interval: usize,
+
+    /// Disable RadixAttention-style prefix cache lookup and publish.
+    #[arg(long)]
+    disable_radix_cache: bool,
+
+    /// Disable short-prompt bypass for prefix prefetch and split scheduling.
+    #[arg(long)]
+    disable_short_prompt_bypass: bool,
+
+    /// Prompt length at or below which ARLE skips staged prefix prefetch and
+    /// avoids decode+prefill split launches.
+    #[arg(long, default_value_t = 256)]
+    short_prompt_bypass_tokens: usize,
 
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom for activations, CUDA graphs,
@@ -250,7 +277,7 @@ async fn main() {
     {
         let runtime = ServerRuntimeConfig {
             engine: InferenceEngineOptions {
-                enable_cuda_graph: args.cuda_graph,
+                enable_cuda_graph: args.cuda_graph && !args.disable_cuda_graph,
             },
             scheduler: scheduler_config_from_args(&args, num_slots),
             runtime_envelope: infer::scheduler::RuntimeEnvelopeOverrides {
@@ -302,7 +329,7 @@ async fn main() {
     info!(
         "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={} ({})",
         args.model_path.display(),
-        args.cuda_graph,
+        args.cuda_graph && !args.disable_cuda_graph,
         num_slots,
         if args.num_slots.is_some() {
             "explicit"
@@ -464,6 +491,8 @@ fn kv_mode_candidates(
 }
 
 fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig {
+    let schedule_policy =
+        SchedulePolicy::parse(&args.schedule_policy).unwrap_or_else(|err| panic!("{err}"));
     // `chunked_prefill_size` / `max_prefill_tokens` are not plugged into the
     // `SchedulerConfig` here — when the operator did not supply a value, the
     // CUDA bootstrap resolves them against HBM via `RuntimeEnvelopeOverrides`.
@@ -471,6 +500,14 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
     let mut config = SchedulerConfig {
         max_num_batched_tokens: args.max_num_batched_tokens,
         prefill_max_requests: args.prefill_max_requests,
+        short_prompt_bypass_tokens: if args.disable_short_prompt_bypass {
+            0
+        } else {
+            args.short_prompt_bypass_tokens
+        },
+        prefix_cache_enabled: !args.disable_radix_cache,
+        schedule_policy,
+        stream_interval: args.stream_interval,
         mem_fraction_static: args.mem_fraction_static,
         min_seq_len: args.min_seq_len,
         kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),

@@ -54,6 +54,7 @@ struct EmitWorkerRequest {
 
 pub(in crate::scheduler::cuda) fn spawn_emit_worker(
     tokenizer: Tokenizer,
+    stream_interval: usize,
 ) -> (
     crossbeam_channel::Sender<EmitCommand>,
     crossbeam_channel::Receiver<EmitEvent>,
@@ -61,6 +62,7 @@ pub(in crate::scheduler::cuda) fn spawn_emit_worker(
 ) {
     let (tx, rx) = crossbeam_channel::unbounded();
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let stream_interval = stream_interval.max(1);
     let thread = std::thread::Builder::new()
         .name("infer-cuda-emit".to_string())
         .spawn(move || {
@@ -97,14 +99,23 @@ pub(in crate::scheduler::cuda) fn spawn_emit_worker(
                             });
                         state.generated_tokens.extend(tokens);
                         state.latest_logprob = latest_logprob;
-                        let outcome = state.stream.emit_delta(
-                            &state.generated_tokens,
-                            &tokenizer,
-                            &state.delta_tx,
-                            state.latest_logprob,
-                            state.stops.as_deref(),
-                            state.prompt_tokens,
-                        );
+                        let should_flush = state
+                            .generated_tokens
+                            .len()
+                            .saturating_sub(state.stream.decoded_token_count)
+                            >= stream_interval;
+                        let outcome = if should_flush || gated {
+                            state.stream.emit_delta(
+                                &state.generated_tokens,
+                                &tokenizer,
+                                &state.delta_tx,
+                                state.latest_logprob,
+                                state.stops.as_deref(),
+                                state.prompt_tokens,
+                            )
+                        } else {
+                            crate::scheduler::cuda::request::EmitOutcome::Continue
+                        };
                         if gated {
                             let finished = matches!(
                                 outcome,

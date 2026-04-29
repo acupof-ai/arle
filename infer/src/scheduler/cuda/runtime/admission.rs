@@ -18,6 +18,17 @@ use crate::scheduler::types::RequestLengthContract;
 use crate::server_engine::FinishReason;
 
 impl<M: ModelForward> Scheduler<M> {
+    fn cold_prefix_admission_plan(&self) -> PrefixAdmissionPlan {
+        PrefixAdmissionPlan {
+            radix_blocks: Vec::new(),
+            lookup: crate::kv_tier::LookupOutcome::new(0, Vec::new(), false),
+            reusable: None,
+            direct_gpu_attach: false,
+            attached_prefix_blocks: Vec::new(),
+            staged_prefix_plan: None,
+        }
+    }
+
     pub(in crate::scheduler::cuda) fn enqueue_waiting_request(
         &mut self,
         incoming: super::super::IncomingRequest,
@@ -150,6 +161,15 @@ impl<M: ModelForward> Scheduler<M> {
         prompt_tokens: &[u32],
         free_slots: &[usize],
     ) -> PrefixAdmissionPlan {
+        if !self.config.prefix_cache_enabled {
+            return self.cold_prefix_admission_plan();
+        }
+        if self.config.short_prompt_bypass_tokens > 0
+            && prompt_tokens.len() <= self.config.short_prompt_bypass_tokens
+        {
+            return self.cold_prefix_admission_plan();
+        }
+
         let block_size = self.prefix_cache.block_size();
         let lookup = self
             .prefix_cache

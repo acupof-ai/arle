@@ -198,7 +198,7 @@ impl<M: ModelForward> Scheduler<M> {
         );
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, host_pool={:.1}MB",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, schedule_policy={}, prefix_cache={}, short_prompt_bypass_tokens={}, stream_interval={}, host_pool={:.1}MB",
             model_id,
             config.max_slots,
             seed,
@@ -210,6 +210,14 @@ impl<M: ModelForward> Scheduler<M> {
             config
                 .prefill_max_requests
                 .map_or_else(|| "none".to_string(), |v| v.to_string()),
+            config.schedule_policy.as_str(),
+            if config.prefix_cache_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            config.short_prompt_bypass_tokens,
+            config.stream_interval,
             host_pool_capacity as f64 / 1e6,
         );
 
@@ -227,7 +235,8 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let (coordinator, coordinator_handle, coordinator_events) = coord_builder.build();
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
-        let (emit_tx, emit_events, emit_thread) = spawn_emit_worker(tokenizer.clone());
+        let (emit_tx, emit_events, emit_thread) =
+            spawn_emit_worker(tokenizer.clone(), config.stream_interval);
         let max_slots = config.max_slots;
         let max_waiting_requests = config.max_waiting_requests;
         let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;

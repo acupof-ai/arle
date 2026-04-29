@@ -33,6 +33,6 @@ pub use batch::{
 #[cfg(feature = "cuda")]
 pub use cuda::Scheduler;
 pub use types::{
-    IncomingRequest, RequestPriority, RuntimeEnvelopeOverrides, SchedulerConfig, SchedulerFull,
-    SchedulerHandle, pick_chunked_prefill_size_for_hbm,
+    IncomingRequest, RequestPriority, RuntimeEnvelopeOverrides, SchedulePolicy, SchedulerConfig,
+    SchedulerFull, SchedulerHandle, pick_chunked_prefill_size_for_hbm,
 };

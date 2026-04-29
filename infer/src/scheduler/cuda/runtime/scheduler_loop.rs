@@ -319,7 +319,12 @@ impl<M: ModelForward> Scheduler<M> {
                 self.dequeue_running(slot_idx);
                 self.clear_slot_prefix_ownership(slot_idx);
 
-                if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
+                let short_prompt_bypass = self.config.short_prompt_bypass_tokens > 0
+                    && req.prompt_tokens.len() <= self.config.short_prompt_bypass_tokens;
+                if self.config.prefix_cache_enabled
+                    && !short_prompt_bypass
+                    && let Some(prompt_tokens) = req.cached_prompt_to_publish()
+                {
                     let prompt_vec = prompt_tokens.to_vec();
                     self.slot_materialized_prompt_lens[slot_idx] = prompt_vec.len();
                     self.publish_to_prefix_cache(slot_idx, &prompt_vec, req.session_id.as_ref());
