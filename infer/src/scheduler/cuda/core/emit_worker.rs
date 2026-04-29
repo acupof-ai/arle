@@ -29,8 +29,10 @@ pub(in crate::scheduler::cuda) enum EmitCommand {
         request_id: u64,
         prompt_tokens: usize,
         completion_tokens: usize,
+        generated_tokens: Vec<u32>,
         reason: FinishReason,
         delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+        stops: Option<Vec<String>>,
         trace_context: Option<SpanContext>,
     },
     Abort {
@@ -146,10 +148,19 @@ pub(in crate::scheduler::cuda) fn spawn_emit_worker(
                         request_id,
                         prompt_tokens,
                         completion_tokens,
+                        generated_tokens,
                         reason,
                         delta_tx,
+                        stops,
                         trace_context,
                     } => {
+                        if completion_tokens != generated_tokens.len() {
+                            log::warn!(
+                                "Request {request_id}: finish token count mismatch \
+                                 completion_tokens={completion_tokens} generated_token_ids={}",
+                                generated_tokens.len()
+                            );
+                        }
                         if let Some(mut state) = active.remove(&request_id) {
                             let finish_parent = state
                                 .stream_flush_span
@@ -160,8 +171,32 @@ pub(in crate::scheduler::cuda) fn spawn_emit_worker(
                                 Span::root("finish", parent)
                                     .with_properties(|| [("request_id", request_id.to_string())])
                             });
+                            let finish_tokens =
+                                if generated_tokens.len() > state.generated_tokens.len() {
+                                    log::debug!(
+                                        "Request {request_id}: finish carried {} scheduler tokens \
+                                     while emit worker had {}; using scheduler copy",
+                                        generated_tokens.len(),
+                                        state.generated_tokens.len()
+                                    );
+                                    &generated_tokens
+                                } else {
+                                    &state.generated_tokens
+                                };
+                            if !finish_tokens.is_empty()
+                                && tokenizer
+                                    .decode(finish_tokens)
+                                    .map(|text| text.is_empty())
+                                    .unwrap_or(false)
+                            {
+                                log::warn!(
+                                    "Request {request_id}: finish has {} generated token ids \
+                                     but decodes to empty visible text",
+                                    finish_tokens.len()
+                                );
+                            }
                             state.stream.finish(
-                                &state.generated_tokens,
+                                finish_tokens,
                                 &tokenizer,
                                 &state.delta_tx,
                                 state.prompt_tokens,
@@ -173,16 +208,20 @@ pub(in crate::scheduler::cuda) fn spawn_emit_worker(
                                 Span::root("finish", parent)
                                     .with_properties(|| [("request_id", request_id.to_string())])
                             });
-                            // Fallback path: the request was finished
-                            // before any `Append` lifted state into the
-                            // worker's table, so we have no generated
-                            // tokens to surface for `response_token_ids`.
-                            StreamDecodeState::default().send_finish(
+                            if completion_tokens > 0 {
+                                log::warn!(
+                                    "Request {request_id}: finish arrived without emit worker \
+                                     state; recovering from {} scheduler token ids",
+                                    generated_tokens.len()
+                                );
+                            }
+                            StreamDecodeState::default().finish(
+                                &generated_tokens,
+                                &tokenizer,
                                 &delta_tx,
                                 prompt_tokens,
-                                completion_tokens,
                                 reason,
-                                &[],
+                                stops.as_deref(),
                             );
                         }
                     }
