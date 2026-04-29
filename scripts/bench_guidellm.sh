@@ -664,23 +664,28 @@ fi
 
 # ---- metric extraction (schema pinned to guidellm 0.6.x) ---------------------
 # Verified 2026-04-15 against Qwen3-0.6B on Metal. Path layout:
-#   .benchmarks[n].metrics.<metric>.successful.{mean,percentiles.p50,p99}
+#   .benchmarks[n].metrics.<metric>.successful.{mean,std_dev,max,total_sum,percentiles.*}
 #   .benchmarks[n].config.strategy.{type_,max_concurrency}
 # Metrics used: time_to_first_token_ms, inter_token_latency_ms,
-#               output_tokens_per_second, requests_per_second.
+#               time_per_output_token_ms, request_latency, request_concurrency,
+#               prompt/output/total tokens_per_second, requests_per_second,
+#               prompt_token_count, output_token_count.
 # If guidellm bumps the schema (see plan §9 trip wires), update this filter.
 JSON_FILE="$OUTPUT_DIR/benchmarks.json"
 TABLE_FILE="$OUTPUT_DIR/headline_table.md"
 
 emit_header() {
-    printf '| rate | TTFT p50 (ms) | TTFT p99 (ms) | ITL p50 (ms) | ITL p99 (ms) | out tok/s | req/s actual |\n'
-    printf '|---|---|---|---|---|---|---|\n'
+    printf '| rate | TTFT mean | TTFT std | TTFT p50 | TTFT p99 | TPOT mean | ITL mean | ITL std | ITL p50 | ITL p95 | ITL p99 | ITL max | E2E mean | E2E p99 | conc p50 | out tok/s | total tok/s | in tok/s | total in | total out | req/s actual |\n'
+    printf '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n'
 }
 
 extract_rows() {
     jq -r '
         def pctl($m): (.metrics[$m].successful.percentiles // {});
         def avg($m):  (.metrics[$m].successful.mean        // null);
+        def std($m):  (.metrics[$m].successful.std_dev     // null);
+        def mx($m):   (.metrics[$m].successful.max         // null);
+        def tot($m):  (.metrics[$m].successful.total_sum   // null);
         def rnd(d): if . == null then "n/a" else (. * pow(10;d) | round / pow(10;d)) end;
         .benchmarks
         | map(
@@ -694,22 +699,36 @@ extract_rows() {
                     else .type_
                     end
               ),
-              ttft_p50: (pctl("time_to_first_token_ms").p50 | rnd(1)),
-              ttft_p99: (pctl("time_to_first_token_ms").p99 | rnd(1)),
-              itl_p50:  (pctl("inter_token_latency_ms").p50 | rnd(2)),
-              itl_p99:  (pctl("inter_token_latency_ms").p99 | rnd(2)),
-              tok_s: (
+              ttft_mean: (avg("time_to_first_token_ms")      | rnd(1)),
+              ttft_std:  (std("time_to_first_token_ms")      | rnd(1)),
+              ttft_p50:  (pctl("time_to_first_token_ms").p50 | rnd(1)),
+              ttft_p99:  (pctl("time_to_first_token_ms").p99 | rnd(1)),
+              tpot_mean: (avg("time_per_output_token_ms")    | rnd(2)),
+              itl_mean:  (avg("inter_token_latency_ms")      | rnd(2)),
+              itl_std:   (std("inter_token_latency_ms")      | rnd(2)),
+              itl_p50:   (pctl("inter_token_latency_ms").p50 | rnd(2)),
+              itl_p95:   (pctl("inter_token_latency_ms").p95 | rnd(2)),
+              itl_p99:   (pctl("inter_token_latency_ms").p99 | rnd(2)),
+              itl_max:   (mx("inter_token_latency_ms")       | rnd(2)),
+              e2e_mean:  (avg("request_latency")             | rnd(2)),
+              e2e_p99:   (pctl("request_latency").p99        | rnd(2)),
+              conc_p50:  (pctl("request_concurrency").p50    | rnd(1)),
+              out_tok_s: (
                   if (((.metrics.request_totals.successful // 0) > 0)
                       and (((.metrics.request_streaming_iterations_count.successful.mean) // 0) == 0))
                   then "OOM/empty"
                   else (avg("output_tokens_per_second") | rnd(2) | tostring)
                   end
               ),
-              req_s:    (avg("requests_per_second")      | rnd(3))
+              total_tok_s: (avg("tokens_per_second")        | rnd(2)),
+              in_tok_s:    (avg("prompt_tokens_per_second") | rnd(2)),
+              total_in:    (tot("prompt_token_count")       | rnd(0)),
+              total_out:   (tot("output_token_count")       | rnd(0)),
+              req_s:       (avg("requests_per_second")      | rnd(3))
             }
           )
         | .[]
-        | "| \(.rate) | \(.ttft_p50) | \(.ttft_p99) | \(.itl_p50) | \(.itl_p99) | \(.tok_s) | \(.req_s) |"
+        | "| \(.rate) | \(.ttft_mean) | \(.ttft_std) | \(.ttft_p50) | \(.ttft_p99) | \(.tpot_mean) | \(.itl_mean) | \(.itl_std) | \(.itl_p50) | \(.itl_p95) | \(.itl_p99) | \(.itl_max) | \(.e2e_mean) | \(.e2e_p99) | \(.conc_p50) | \(.out_tok_s) | \(.total_tok_s) | \(.in_tok_s) | \(.total_in) | \(.total_out) | \(.req_s) |"
     ' "$JSON_FILE" 2>/dev/null || true
 }
 
@@ -746,7 +765,7 @@ emit_oom_warnings() {
     if [[ -n "$rows" ]]; then
         printf '%s\n' "$rows"
     else
-        printf '| _extraction failed_ | see | `benchmarks.html` | for | full | results | . |\n'
+        printf '| _extraction failed_ | see `benchmarks.html` | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |\n'
     fi
 } > "$TABLE_FILE"
 
