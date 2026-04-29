@@ -134,22 +134,6 @@ impl<M: ModelForward> Scheduler<M> {
             let clean_t = std::time::Instant::now();
             self.cleanup();
             let clean_us = clean_t.elapsed().as_micros();
-            let total_us = step_start.elapsed().as_micros();
-            let update_ema = |ema: &mut f64, val: u128| {
-                const ALPHA: f64 = 0.1;
-                let v = val as f64;
-                if *ema == 0.0 {
-                    *ema = v;
-                } else {
-                    *ema = ALPHA * v + (1.0 - ALPHA) * *ema;
-                }
-            };
-            update_ema(&mut self.stats.step_timing_cleanup_us, clean_us);
-            update_ema(&mut self.stats.step_timing_loop_total_us, total_us);
-            self.metrics.set_scheduler_loop_phase_us(
-                self.stats.step_timing_cleanup_us,
-                self.stats.step_timing_loop_total_us,
-            );
             self.metrics.set_active(self.active_len() as u64);
             self.metrics.set_waiting(self.waiting.len() as u64);
             self.metrics.set_scheduler_occupancy(
@@ -192,6 +176,12 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
 
+            let total_us = step_start.elapsed().as_micros();
+            self.stats.record_loop_phase_timing(clean_us, total_us);
+            self.metrics.set_scheduler_loop_phase_us(
+                self.stats.step_timing_cleanup_us,
+                self.stats.step_timing_loop_total_us,
+            );
             if total_us > 50_000 {
                 // Log slow iterations (>50ms)
                 info!(

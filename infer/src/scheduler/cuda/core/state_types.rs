@@ -83,6 +83,40 @@ impl SchedulerRuntimeStats {
             prefill_oom_cooldown_until: None,
         }
     }
+
+    pub(in crate::scheduler::cuda) fn record_loop_phase_timing(
+        &mut self,
+        cleanup_us: u128,
+        loop_total_us: u128,
+    ) {
+        fn update_ema(ema: &mut f64, val: u128) {
+            const ALPHA: f64 = 0.1;
+            let v = val as f64;
+            if *ema == 0.0 {
+                *ema = v;
+            } else {
+                *ema = ALPHA * v + (1.0 - ALPHA) * *ema;
+            }
+        }
+
+        update_ema(&mut self.step_timing_cleanup_us, cleanup_us);
+        update_ema(&mut self.step_timing_loop_total_us, loop_total_us);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SchedulerRuntimeStats;
+
+    #[test]
+    fn loop_total_timing_includes_work_after_step_phase() {
+        let mut stats = SchedulerRuntimeStats::new();
+        stats.step_timing_total_us = 100.0;
+
+        stats.record_loop_phase_timing(10, 125);
+
+        assert!(stats.step_timing_loop_total_us > stats.step_timing_total_us);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
