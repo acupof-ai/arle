@@ -155,17 +155,21 @@ impl<M: ModelForward> Scheduler<M> {
                     let headroom_base = config.pre_model_free_bytes.unwrap_or(total);
                     let headroom =
                         ((headroom_base as f64) * (1.0 - config.mem_fraction_static)) as usize;
+                    const WORKSPACE_SAFETY_BYTES: usize = 256 * 1024 * 1024;
+                    let workspace_reserve =
+                        runtime_workspace.saturating_add(WORKSPACE_SAFETY_BYTES);
+                    let static_reserve = headroom.max(workspace_reserve);
                     if headroom < runtime_workspace {
                         log::warn!(
                             "TokenKVPool: estimated workspace {:.1} GB exceeds headroom {:.1} GB \
-                             (mem-fraction={:.0}%). Risk of OOM mid-request — consider lowering \
-                             --mem-fraction-static.",
+                             (mem-fraction={:.0}%). Reserving {:.1} GB before sizing KV pool.",
                             runtime_workspace as f64 / 1e9,
                             headroom as f64 / 1e9,
                             config.mem_fraction_static * 100.0,
+                            static_reserve as f64 / 1e9,
                         );
                     }
-                    free.saturating_sub(contiguous_cost.saturating_add(headroom))
+                    free.saturating_sub(contiguous_cost.saturating_add(static_reserve))
                 }
                 Err(_) => config.kv_pool_fallback_bytes,
             };
