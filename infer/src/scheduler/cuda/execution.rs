@@ -339,6 +339,17 @@ impl<M: ModelForward> Scheduler<M> {
             if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
                 return StepPlan::Mixed(candidates);
             }
+            if self.config.short_prompt_bypass_tokens > 0
+                && candidates.iter().all(|candidate| {
+                    candidate.reservation.prefill_tokens <= self.config.short_prompt_bypass_tokens
+                })
+            {
+                // Short prompts get their first sampled token from prefill
+                // completion itself. Avoid the legacy decode+prefill split
+                // launch for these requests; the small prefill runs as the
+                // fused first-token path and decode rows resume next tick.
+                return StepPlan::Prefill(candidates);
+            }
             // Keep the legacy split launches for models that do not have a
             // real single-launch mixed lowering yet.
             return StepPlan::Split(candidates);

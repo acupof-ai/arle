@@ -42,6 +42,23 @@ pub struct SchedulerConfig {
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.
     pub prefill_max_requests: Option<usize>,
+    /// Prompt length at or below which prefix staging/prefetch and
+    /// decode+prefill split launches are bypassed.
+    ///
+    /// SGLang exposes `--disable-chunked-prefix-cache` because chunked prefix
+    /// cache overhead can dominate short sequences. ARLE keeps the default
+    /// automatic and length-scoped: short prompts recompute locally and use the
+    /// prefill-completion first token as the fused prefill+decode fast path.
+    /// Set to 0 to disable the bypass.
+    pub short_prompt_bypass_tokens: usize,
+    /// Whether radix prefix-cache lookup/publish is enabled.
+    pub prefix_cache_enabled: bool,
+    /// Operator-facing schedule policy name. The CUDA scheduler currently
+    /// implements SGLang-compatible `fcfs`; other names are rejected at CLI.
+    pub schedule_policy: SchedulePolicy,
+    /// Stream chunking interval in generated tokens. 1 matches SGLang's
+    /// default and flushes every token.
+    pub stream_interval: usize,
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
     pub max_waiting_requests: usize,
@@ -104,6 +121,10 @@ impl Default for SchedulerConfig {
             max_prefill_tokens: 16384,
             long_prefill_token_threshold: 512,
             prefill_max_requests: None,
+            short_prompt_bypass_tokens: 256,
+            prefix_cache_enabled: true,
+            schedule_policy: SchedulePolicy::Fcfs,
+            stream_interval: 1,
             max_waiting_requests: 256,
             // SGLang alignment 2026-04-29
             mem_fraction_static: 0.85,
@@ -256,6 +277,9 @@ impl SchedulerConfig {
         if matches!(self.prefill_max_requests, Some(0)) {
             anyhow::bail!("prefill_max_requests must be ≥ 1 when provided");
         }
+        if self.stream_interval == 0 {
+            anyhow::bail!("stream_interval must be ≥ 1");
+        }
         if self.min_seq_len == 0 {
             anyhow::bail!("min_seq_len must be ≥ 1");
         }
@@ -295,6 +319,29 @@ impl SchedulerConfig {
             anyhow::bail!("t1_host_pinned_keepalive_ticks must be ≥ 1");
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SchedulePolicy {
+    #[default]
+    Fcfs,
+}
+
+impl SchedulePolicy {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fcfs" => Ok(Self::Fcfs),
+            other => anyhow::bail!(
+                "unsupported --schedule-policy '{other}': ARLE CUDA currently supports 'fcfs'"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fcfs => "fcfs",
+        }
     }
 }
 
@@ -771,6 +818,20 @@ mod tests {
         cfg.prefix_cache_retain_hard_cap = 0.95;
         cfg.prefix_cache_keepalive_ticks = 128;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_stream_interval() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.stream_interval = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn schedule_policy_parse_accepts_only_fcfs() {
+        assert_eq!(SchedulePolicy::parse("fcfs").unwrap(), SchedulePolicy::Fcfs);
+        assert_eq!(SchedulePolicy::parse("FCFS").unwrap().as_str(), "fcfs");
+        assert!(SchedulePolicy::parse("lpm").is_err());
     }
 
     #[test]
