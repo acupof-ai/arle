@@ -377,6 +377,33 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         .unwrap_or(0);
     scheduler.resolve_runtime_envelope(runtime_envelope, gpu_total_bytes);
 
+    // Print the resolved scheduling envelope alongside SGLang's defaults
+    // so misalignment is visible at a glance instead of needing a
+    // separate diagnostic run. SGLang reference values are sourced from
+    // `python/sglang/srt/server_args.py` (chunked_prefill_size HBM
+    // table, max_num_batched_tokens=16384, mem_fraction_static=0.85,
+    // schedule_policy LIFO disabled by default).
+    let sglang_chunk = match gpu_total_bytes / (1024 * 1024 * 1024) {
+        0..=34 => 2048,
+        35..=59 => 4096,
+        60..=89 => 8192,
+        _ => 16384,
+    };
+    info!(
+        "Scheduling envelope (resolved | SGLang-equiv): \
+         max_num_batched_tokens={} | 16384, \
+         chunked_prefill_size={} | {}, \
+         max_prefill_tokens={} | 16384, \
+         mem_fraction_static={:.2} | 0.85, \
+         max_slots={} | (n/a — SGLang has no fixed cap)",
+        scheduler.max_num_batched_tokens,
+        scheduler.chunked_prefill_size,
+        sglang_chunk,
+        scheduler.max_prefill_tokens,
+        scheduler.mem_fraction_static,
+        scheduler.max_slots,
+    );
+
     let (scheduler, handle) = Scheduler::with_config(
         model,
         tokenizer,
