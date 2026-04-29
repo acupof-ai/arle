@@ -53,6 +53,8 @@ pub(in crate::scheduler::cuda) struct SchedulerRuntimeStats {
     pub step_timing_emit_us: f64,
     pub step_timing_prefill_us: f64,
     pub step_timing_total_us: f64,
+    pub step_timing_cleanup_us: f64,
+    pub step_timing_loop_total_us: f64,
     /// Throttled GPU memory query state and peak high-water mark.
     pub last_mem_query: std::time::Instant,
     pub peak_mem_bytes: u64,
@@ -74,6 +76,8 @@ impl SchedulerRuntimeStats {
             step_timing_emit_us: 0.0,
             step_timing_prefill_us: 0.0,
             step_timing_total_us: 0.0,
+            step_timing_cleanup_us: 0.0,
+            step_timing_loop_total_us: 0.0,
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             prefill_oom_cooldown_until: None,
