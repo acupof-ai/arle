@@ -457,6 +457,24 @@ impl ServerMetrics {
                 writeln!(out, "{name}{{{labels}}} {value}").unwrap();
             }
         }
+        if let Some((phase_cleanup_us, loop_total_us)) = self.scheduler_loop_phase_us() {
+            for (name, help, value) in [
+                (
+                    "infer_scheduler_step_cleanup_microseconds",
+                    "EMA scheduler cleanup duration after GPU step dispatch/readback.",
+                    phase_cleanup_us,
+                ),
+                (
+                    "infer_scheduler_loop_total_microseconds",
+                    "EMA full scheduler loop duration including cleanup.",
+                    loop_total_us,
+                ),
+            ] {
+                writeln!(out, "# HELP {name} {help}").unwrap();
+                writeln!(out, "# TYPE {name} gauge").unwrap();
+                writeln!(out, "{name}{{{labels}}} {value}").unwrap();
+            }
+        }
 
         out.push_str("# HELP infer_kv_coordinator_queue_capacity Coordinator queue capacity shared by staged KV fetch/store work.\n");
         out.push_str("# TYPE infer_kv_coordinator_queue_capacity gauge\n");
@@ -702,9 +720,15 @@ impl ServerMetrics {
         let phase_suffix = self.scheduler_step_phase_us().map_or_else(
             || " step_phase_us=unavailable".to_string(),
             |(admission_us, prefill_us, decode_us, emit_us, total_us)| {
+                let cleanup_suffix = self.scheduler_loop_phase_us().map_or_else(
+                    || String::new(),
+                    |(cleanup_us, loop_total_us)| {
+                        format!(",cleanup:{cleanup_us},loop_total:{loop_total_us}")
+                    },
+                );
                 format!(
-                    " step_phase_us=adm:{},prefill:{},decode:{},emit:{},total:{}",
-                    admission_us, prefill_us, decode_us, emit_us, total_us
+                    " step_phase_us=adm:{},prefill:{},decode:{},emit:{},total:{}{}",
+                    admission_us, prefill_us, decode_us, emit_us, total_us, cleanup_suffix
                 )
             },
         );
