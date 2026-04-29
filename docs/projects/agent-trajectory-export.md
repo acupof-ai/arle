@@ -15,11 +15,16 @@ field (prompts dominate trace size and can leak operator data).
 
 ---
 
-## v1 schema (shipped)
+## v2 schema (shipped — token layer live; supersedes v1)
+
+v1 (`schema_version: 1`) records are no longer emitted. v2 is fully
+backwards-readable for code that ignores `tokens`. The bump per the
+"format change" rule below: when `tokens` started populating with
+`Some(TokensRecord)` instead of `null`, the version moved.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "ts": "2026-04-29T10:50:00Z",
   "turn_id": "<uuid v4>",
   "model_id": "Qwen3.6-35B-A3B-4bit",

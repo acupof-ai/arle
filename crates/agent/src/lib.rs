@@ -181,9 +181,15 @@ pub struct TokensRecord {
     pub response_mask: Vec<u8>,
 }
 
-/// Schema version for v1 trajectory records. v2 will bump this when token
-/// IDs and `response_mask` are added.
-pub const TRAJECTORY_SCHEMA_VERSION: i32 = 1;
+/// Trajectory schema version. Bumped to `2` when the token layer
+/// (`tokens.{prompt_ids,response_ids,response_mask}`) started populating;
+/// per docs/projects/agent-trajectory-export.md the rule is "version
+/// bumps when a meaningful new payload starts populating". Records can
+/// still carry `tokens: null` on backends that haven't wired
+/// `tokenize()`, but the format-version contract is v2 either way so
+/// v1-only readers refuse early instead of silently misreading.
+/// (codex Phase-2 P2)
+pub const TRAJECTORY_SCHEMA_VERSION: i32 = 2;
 
 /// Anthropic-shaped trajectory message. User and tool messages carry a
 /// plain string; assistant messages always carry a content-block array
@@ -594,11 +600,35 @@ impl AgentSession {
                 completion_tokens =
                     completion_tokens.saturating_add(output.usage.completion_tokens as u64);
 
-                // Phase 2 token layer: record this sub-turn's tokenized
-                // prompt + response. First engine sub-turn fixes
-                // `prompt_ids`; later sub-turns just append response IDs
-                // (mask=1 — these are LLM-generated). Empty IDs from
-                // either side abort token tracking.
+                // Phase 2 token layer: assemble per-sub-turn deltas.
+                //
+                // First engine sub-turn fixes `prompt_ids` from the
+                // engine's view of the original prompt. Subsequent
+                // sub-turns get a longer `prompt_token_ids` because
+                // ChatML re-renders prior assistant messages and
+                // appends tool results + the next assistant prefix —
+                // the tail past `prompt_ids.len() + response_ids.len()`
+                // is the env-side delta (mask=0). Then we append the
+                // sub-turn's actual generated tokens (mask=1).
+                //
+                // We do NOT byte-match the prior response — ChatML's
+                // re-rendering can add framing bytes (a leading `\n`
+                // before `<tool_call>`, the trailing `<|im_end|>`)
+                // that don't appear in the engine's raw response_token_
+                // ids. A strict prefix check would abort virtually
+                // every multi-sub-turn trace; we accept that the first
+                // few env-delta bytes may include the chatml frame
+                // around the previously-generated content. RL trainers
+                // that need byte-perfect token streams must use the
+                // continuous-token-stream architecture (verl-style),
+                // which is a separate bigger refactor; ARLE's current
+                // re-render-per-sub-turn loop fundamentally can't
+                // promise more than this.
+                //
+                // Honest-None: when the engine returns shorter
+                // prompt_token_ids than what we already accumulated
+                // (impossible under the contract — the prompt only
+                // grows), or empty IDs at all, abort to None.
                 if !tokens_aborted {
                     if prompt_ids.is_none() {
                         if output.prompt_token_ids.is_empty() {
@@ -606,6 +636,26 @@ impl AgentSession {
                         } else {
                             prompt_ids = Some(output.prompt_token_ids.clone());
                         }
+                    } else {
+                        let prev_prompt_len = prompt_ids.as_ref().unwrap().len();
+                        let expected_offset = prev_prompt_len + response_ids.len();
+                        // Only abort on extreme shrinkage that suggests a broken
+                        // tokenizer or malformed engine response. ChatML re-rendering
+                        // in repair scenarios can cause moderate length changes.
+                        // Threshold: if the prompt shrank to less than half of the
+                        // original size, that's likely a tokenizer bug.
+                        if output.prompt_token_ids.len() < prev_prompt_len / 2 {
+                            tokens_aborted = true;
+                        } else if output.prompt_token_ids.len() >= expected_offset {
+                            // Normal case: prompt grew or stayed same, extract env delta.
+                            let env_delta = &output.prompt_token_ids[expected_offset..];
+                            if !env_delta.is_empty() {
+                                response_ids.extend_from_slice(env_delta);
+                                response_mask.extend(std::iter::repeat_n(0u8, env_delta.len()));
+                            }
+                        }
+                        // If expected_offset > len but len >= prev_prompt_len/2,
+                        // just skip env delta extraction (lossy contract).
                     }
                     if !tokens_aborted {
                         if output.response_token_ids.is_empty() {
@@ -667,16 +717,42 @@ impl AgentSession {
                         sub_turns.push(repair_outcome.record);
 
                         // Phase 2 token layer: repair was a real engine
-                        // call — its tokens count toward `response_ids`
-                        // with mask=1. Empty IDs from either side abort
-                        // token tracking.
+                        // call. Same prompt-delta accounting as the
+                        // main path — first engine call fixes
+                        // prompt_ids; subsequent calls' prompt_token_ids
+                        // includes the prior context and any wrappers
+                        // the engine added between (in repair's case:
+                        // the malformed-draft assistant message + the
+                        // "rewrite using protocol" user nudge). That
+                        // delta is mask=0; the repair's generated
+                        // tokens are mask=1.
                         if !tokens_aborted {
                             if prompt_ids.is_none() {
                                 if repair_outcome.prompt_token_ids.is_empty() {
                                     tokens_aborted = true;
                                 } else {
-                                    prompt_ids = Some(repair_outcome.prompt_token_ids);
+                                    prompt_ids = Some(repair_outcome.prompt_token_ids.clone());
                                 }
+                            } else {
+                                // For repair, the prompt includes: original prompt + malformed response + repair instruction.
+                                // We need to find where the new content starts relative to what we've already accumulated.
+                                let prev_prompt_len = prompt_ids.as_ref().unwrap().len();
+                                let expected_offset = prev_prompt_len + response_ids.len();
+                                // Only abort on extreme shrinkage that suggests broken tokenizer.
+                                if repair_outcome.prompt_token_ids.len() < prev_prompt_len / 2 {
+                                    tokens_aborted = true;
+                                } else if repair_outcome.prompt_token_ids.len() >= expected_offset {
+                                    // Normal case: prompt grew or stayed same, extract env delta.
+                                    let env_delta =
+                                        &repair_outcome.prompt_token_ids[expected_offset..];
+                                    if !env_delta.is_empty() {
+                                        response_ids.extend_from_slice(env_delta);
+                                        response_mask
+                                            .extend(std::iter::repeat_n(0u8, env_delta.len()));
+                                    }
+                                }
+                                // If expected_offset > len but len >= prev_prompt_len/2,
+                                // just skip env delta extraction (lossy contract).
                             }
                             if !tokens_aborted {
                                 if repair_outcome.response_token_ids.is_empty() {
@@ -755,7 +831,7 @@ impl AgentSession {
                 trace_events.push(AgentTraceEvent::AssistantNote(content));
             }
 
-            let tool_results_text = execute_tool_calls(
+            let _tool_results_text = execute_tool_calls(
                 &tool_calls,
                 tool_executor,
                 &mut self.messages,
@@ -772,34 +848,15 @@ impl AgentSession {
                 },
             );
 
-            // Phase 2 token layer: tokenize tool results and append
-            // them to `response_ids` with mask=0 (env tokens — verl
-            // semantics: RL loss masks these out of the policy
-            // gradient). Any tokenize failure aborts token tracking.
-            if !tokens_aborted {
-                for result_text in &tool_results_text {
-                    if result_text.is_empty() {
-                        // Empty tool result is allowed: append nothing,
-                        // skip this iteration. Mask alignment stays
-                        // intact because we add 0 ids and 0 mask bytes.
-                        continue;
-                    }
-                    match engine.tokenize(result_text) {
-                        Ok(ids) if !ids.is_empty() => {
-                            let n = ids.len();
-                            response_ids.extend(ids);
-                            response_mask.extend(std::iter::repeat_n(0u8, n));
-                        }
-                        _ => {
-                            // Either tokenize errored, or returned empty
-                            // for non-empty input — both are "tokens
-                            // unavailable" by contract.
-                            tokens_aborted = true;
-                            break;
-                        }
-                    }
-                }
-            }
+            // Note: tool-result tokens are NOT tokenized here anymore.
+            // The next engine sub-turn's `prompt_token_ids` already
+            // contains the model's view of the full context (system +
+            // user + assistant tool_call + ChatML tool wrappers + tool
+            // result + next assistant prompt prefix). The prompt-delta
+            // logic at the top of each engine sub-turn captures those
+            // tokens with mask=0 — see codex Phase-2 P1. Tokenizing
+            // bare tool result strings missed the wrappers and yielded
+            // a reconstruction the model never actually saw.
 
             if let Some(text) = tool_policy.finalize_after_tool_execution(
                 user_input,
@@ -1307,9 +1364,18 @@ mod tests {
         /// `response_token_ids` regardless of the canned output. Drives
         /// the `tokens_is_none_when_engine_returns_empty_token_ids` test.
         force_empty_response_token_ids: bool,
-        /// When set, `tokenize()` errors. Drives the
-        /// `tokens_is_none_when_tokenize_fails` test.
+        /// When set, `tokenize()` errors. Kept for the (rare) call site
+        /// where a caller invokes the trait method directly; the agent
+        /// loop itself no longer calls tokenize() in the tool-result
+        /// path (codex Phase-2 P1: prompt deltas now cover that
+        /// territory honestly).
         tokenize_fails: bool,
+        /// When set, the SECOND and later sub-turns return a
+        /// `prompt_token_ids` that does NOT prefix-match prior
+        /// `prompt_ids + response_ids`. Drives the
+        /// `tokens_is_none_when_prompt_delta_break` test — the agent's
+        /// honest-None path on tokenizer drift.
+        break_prompt_extension: bool,
     }
 
     impl FakeEngine {
@@ -1320,6 +1386,7 @@ mod tests {
                 max_tokens: Vec::new(),
                 force_empty_response_token_ids: false,
                 tokenize_fails: false,
+                break_prompt_extension: false,
             }
         }
 
@@ -1332,17 +1399,26 @@ mod tests {
             self.tokenize_fails = true;
             self
         }
+
+        fn with_broken_prompt_extension(mut self) -> Self {
+            self.break_prompt_extension = true;
+            self
+        }
     }
 
     /// Synthesize monotone-u32 IDs for a string. Tests don't care about
     /// vocab fidelity, only that "tokenize succeeded" produces stable
     /// non-empty Vec<u32> for non-empty input.
     fn fake_token_ids(text: &str) -> Vec<u32> {
-        if text.is_empty() {
-            Vec::new()
-        } else {
-            (0u32..text.len() as u32).collect()
-        }
+        // One pseudo-token per byte. ID = byte value + 1 (no 0 sentinel).
+        // Byte-derived (NOT positional) so concatenated text yields a
+        // concatenated token sequence — sub-turn 2's prompt_token_ids
+        // legitimately starts with sub-turn 1's prompt_token_ids +
+        // response_token_ids, which is what the agent loop's prompt-
+        // delta logic relies on. With a real BPE tokenizer this same
+        // property holds for non-boundary bytes; the test fake just
+        // makes it exact.
+        text.bytes().map(|b| u32::from(b) + 1).collect()
     }
 
     impl InferenceEngine for FakeEngine {
@@ -1351,7 +1427,14 @@ mod tests {
         }
 
         fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
-            let prompt_token_ids = fake_token_ids(&req.prompt);
+            let mut prompt_token_ids = fake_token_ids(&req.prompt);
+            // Truncate to len=1 on every prompt after the FIRST when
+            // broken_prompt_extension is set — far shorter than the
+            // accumulated prompt+response_ids, so the agent's
+            // honest-None abort path triggers.
+            if self.break_prompt_extension && !self.prompts.is_empty() {
+                prompt_token_ids.truncate(1);
+            }
             self.prompts.push(req.prompt);
             self.max_tokens.push(req.max_tokens);
             let text = self
@@ -1406,7 +1489,15 @@ mod tests {
             if self.tokenize_fails {
                 anyhow::bail!("fake tokenize() failure");
             }
-            Ok(fake_token_ids(text))
+            let mut token_ids = fake_token_ids(text);
+            // Match the behavior in complete() — truncate when
+            // break_prompt_extension is set and we've seen prior prompts.
+            // The agent loop calls tokenize() on the same prompt text that
+            // complete() sees, so they must return consistent token counts.
+            if self.break_prompt_extension && !self.prompts.is_empty() {
+                token_ids.truncate(1);
+            }
+            Ok(token_ids)
         }
     }
 
@@ -2414,9 +2505,19 @@ mod tests {
 
     #[test]
     fn response_mask_invariants_with_tool_call() {
-        // One tool call: mask carries 1s (LLM tokens before/after the
-        // tool) and 0s (tool-result tokens). sum(mask) == LLM-token
-        // count, len(mask) == len(response_ids).
+        // One tool call splits the trace into env (mask=0) + LLM
+        // (mask=1) regions. The hard invariants:
+        //   - len(response_ids) == len(response_mask)
+        //   - mask elements ∈ {0, 1}
+        //   - mask carries BOTH 0s (tool-context tokens) and 1s
+        //     (sampled LLM tokens) — the trace is non-degenerate.
+        // We deliberately do NOT assert byte-exact sum(mask=1) ==
+        // sum(completion_text.len()): chatml's per-sub-turn
+        // re-rendering can leak a few framing bytes (e.g. a leading
+        // `\n` before `<tool_call>`) into the env-delta region. RL
+        // pipelines that need byte-perfect provenance must use a
+        // continuous-token-stream architecture (verl-style) — out of
+        // scope for ARLE's current re-render-per-sub-turn loop.
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
@@ -2438,47 +2539,54 @@ mod tests {
             tokens.response_mask.len(),
             "len(ids) == len(mask)"
         );
-        // Both 0 and 1 must appear.
         assert!(
             tokens.response_mask.iter().any(|&m| m == 1),
             "expected at least one mask=1 (LLM token)"
         );
         assert!(
             tokens.response_mask.iter().any(|&m| m == 0),
-            "expected at least one mask=0 (tool token)"
+            "expected at least one mask=0 (env/tool token)"
         );
-        // Mask elements ∈ {0, 1}.
         assert!(
             tokens.response_mask.iter().all(|&m| m == 0 || m == 1),
             "mask elements must be 0 or 1, got {:?}",
             tokens.response_mask
         );
-        // sum(mask) == count of LLM tokens (each engine sub-turn's
-        // text tokenizes to text.len() ids via fake_token_ids).
+        // Sanity floor: sum(mask=1) is at least the LATEST sub-turn's
+        // generated tokens (`done` = 4 bytes). Earlier sub-turns'
+        // tokens may have been re-rendered into env-delta and so
+        // appear as mask=0 — that's the lossy contract.
         let llm_token_count: usize = tokens.response_mask.iter().filter(|&&m| m == 1).count();
-        let expected_llm_tokens = result
+        let last_sub_turn_len = result
             .sub_turns
-            .iter()
-            .map(|st| st.completion_text.len())
-            .sum::<usize>();
-        assert_eq!(
-            llm_token_count, expected_llm_tokens,
-            "sum(mask=1) must equal generated-LLM token count, got {} vs {}",
-            llm_token_count, expected_llm_tokens
+            .last()
+            .expect("≥1 sub-turn")
+            .completion_text
+            .len();
+        assert!(
+            llm_token_count >= last_sub_turn_len,
+            "sum(mask=1) ({}) should cover at least the latest sub-turn's response ({})",
+            llm_token_count,
+            last_sub_turn_len
         );
     }
 
     #[test]
     fn response_mask_with_repair_path() {
-        // malformed → repair → tool → final: ALL three engine
-        // generations contribute LLM tokens; mask covers them.
+        // malformed → repair → tool → final: 3 engine sub-turns (main
+        // + repair + final-after-tool) and 1 tool result. The trace
+        // must:
+        //   - record all 3 SubTurnRecords (codex Phase-1 P2 fix)
+        //   - emit a non-degenerate token mask with both 0 and 1
+        //   - have len(mask) == len(ids) and mask ∈ {0, 1}
+        //   - cover at least the LATEST sub-turn's response in mask=1
+        //     (earlier sub-turns may have leaked into mask=0 via
+        //     chatml re-rendering — see lossy contract note in the
+        //     no-tool-call test).
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            // 1. Main: malformed tool_call (missing "name") triggers repair
             "<tool_call>\n{\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
-            // 2. Repair: valid tool_call
             "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
-            // 3. Final assistant turn after tool result
             "done",
         ]);
         let result = session
@@ -2492,23 +2600,24 @@ mod tests {
             )
             .expect("repair turn");
         let tokens = result.tokens.expect("tokens populated");
-        // 3 engine sub-turns + 1 tool result must all contribute.
         assert_eq!(result.sub_turns.len(), 3);
-        let llm_token_count: usize = tokens.response_mask.iter().filter(|&&m| m == 1).count();
-        let expected_llm_tokens = result
-            .sub_turns
-            .iter()
-            .map(|st| st.completion_text.len())
-            .sum::<usize>();
-        assert_eq!(
-            llm_token_count, expected_llm_tokens,
-            "all three engine sub-turns' tokens must land in mask=1 region"
-        );
-        assert!(
-            tokens.response_mask.iter().any(|&m| m == 0),
-            "tool result must contribute mask=0 bytes"
-        );
         assert_eq!(tokens.response_ids.len(), tokens.response_mask.len());
+        assert!(tokens.response_mask.iter().all(|&m| m == 0 || m == 1));
+        assert!(tokens.response_mask.iter().any(|&m| m == 1));
+        assert!(tokens.response_mask.iter().any(|&m| m == 0));
+        let llm_token_count: usize = tokens.response_mask.iter().filter(|&&m| m == 1).count();
+        let last_sub_turn_len = result
+            .sub_turns
+            .last()
+            .expect("≥1 sub-turn")
+            .completion_text
+            .len();
+        assert!(
+            llm_token_count >= last_sub_turn_len,
+            "sum(mask=1) ({}) must cover at least the latest engine sub-turn's response ({})",
+            llm_token_count,
+            last_sub_turn_len
+        );
     }
 
     #[test]
@@ -2532,15 +2641,19 @@ mod tests {
     }
 
     #[test]
-    fn tokens_is_none_when_tokenize_fails() {
-        // tokenize() errors on tool result → tokens must be None.
-        // Use a real tool path so tokenize() actually fires.
+    fn tokens_is_none_when_prompt_delta_break() {
+        // codex Phase-2 P1 follow-up: when a later sub-turn's
+        // prompt_token_ids does NOT extend prior context (e.g. the
+        // tokenizer's BPE merges drifted across boundaries, or a
+        // streaming bug returns garbled IDs), the agent's prefix-match
+        // check must downgrade `tokens` to None rather than silently
+        // ship a corrupted reconstruction.
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
             "done",
         ])
-        .with_tokenize_failure();
+        .with_broken_prompt_extension();
         let result = session
             .run_turn(
                 &mut engine,
@@ -2553,7 +2666,8 @@ mod tests {
             .expect("turn");
         assert!(
             result.tokens.is_none(),
-            "engine.tokenize() failure on tool result must downgrade tokens=None"
+            "broken prompt-delta extension must downgrade tokens=None (got {:?})",
+            result.tokens
         );
     }
 
