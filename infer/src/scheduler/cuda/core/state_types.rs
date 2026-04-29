@@ -48,6 +48,7 @@ pub(in crate::scheduler::cuda) struct SchedulerRuntimeStats {
     /// Lifetime generated token count.
     pub total_generated_tokens: u64,
     /// EMA step timing (microseconds) for `/v1/stats` profiling.
+    pub step_timing_admission_us: f64,
     pub step_timing_decode_us: f64,
     pub step_timing_emit_us: f64,
     pub step_timing_prefill_us: f64,
@@ -68,6 +69,7 @@ impl SchedulerRuntimeStats {
         Self {
             total_completed: 0,
             total_generated_tokens: 0,
+            step_timing_admission_us: 0.0,
             step_timing_decode_us: 0.0,
             step_timing_emit_us: 0.0,
             step_timing_prefill_us: 0.0,

@@ -19,6 +19,7 @@
 //! | `infer_scheduler_decode_tokens` | gauge | Decode tokens advanced in the most recent scheduler tick |
 //! | `infer_scheduler_prefill_tokens` | gauge | Prefill tokens advanced in the most recent scheduler tick |
 //! | `infer_scheduler_batch_width` | gauge | Total GPU batch width in the most recent scheduler tick |
+//! | `infer_scheduler_step_phase_*_microseconds` | gauge | EMA scheduler tick phase duration |
 //! | `infer_metal_decode_batches_total` | counter | Metal decode batches executed on a batched GPU path |
 //! | `infer_metal_decode_batched_rows_total` | counter | Metal decode rows executed on a batched GPU path |
 //! | `infer_metal_decode_scalar_rows_total` | counter | Metal decode rows executed by the scalar per-request path |
@@ -124,6 +125,12 @@ struct MetricsInner {
     pub scheduler_prefill_tokens: AtomicU64,
     pub scheduler_batch_width: AtomicU64,
     pub scheduler_step_last_us: AtomicU64,
+    pub scheduler_step_admission_us: AtomicU64,
+    pub scheduler_step_prefill_us: AtomicU64,
+    pub scheduler_step_decode_us: AtomicU64,
+    pub scheduler_step_emit_us: AtomicU64,
+    pub scheduler_step_total_us: AtomicU64,
+    pub scheduler_step_phase_samples: AtomicU64,
     pub kv_coordinator_queue_capacity: AtomicU64,
     pub kv_fetch_queue_depth: AtomicU64,
     pub kv_fetch_waiters: AtomicU64,
@@ -186,6 +193,12 @@ impl ServerMetrics {
                 scheduler_prefill_tokens: AtomicU64::new(0),
                 scheduler_batch_width: AtomicU64::new(0),
                 scheduler_step_last_us: AtomicU64::new(0),
+                scheduler_step_admission_us: AtomicU64::new(0),
+                scheduler_step_prefill_us: AtomicU64::new(0),
+                scheduler_step_decode_us: AtomicU64::new(0),
+                scheduler_step_emit_us: AtomicU64::new(0),
+                scheduler_step_total_us: AtomicU64::new(0),
+                scheduler_step_phase_samples: AtomicU64::new(0),
                 kv_coordinator_queue_capacity: AtomicU64::new(0),
                 kv_fetch_queue_depth: AtomicU64::new(0),
                 kv_fetch_waiters: AtomicU64::new(0),
@@ -379,6 +392,35 @@ impl ServerMetrics {
         }
     }
 
+    /// Update scheduler tick phase EMAs in microseconds.
+    pub fn set_scheduler_step_phase_us(
+        &self,
+        admission_us: f64,
+        prefill_us: f64,
+        decode_us: f64,
+        emit_us: f64,
+        total_us: f64,
+    ) {
+        self.inner
+            .scheduler_step_admission_us
+            .store(admission_us.max(0.0).round() as u64, Ordering::Relaxed);
+        self.inner
+            .scheduler_step_prefill_us
+            .store(prefill_us.max(0.0).round() as u64, Ordering::Relaxed);
+        self.inner
+            .scheduler_step_decode_us
+            .store(decode_us.max(0.0).round() as u64, Ordering::Relaxed);
+        self.inner
+            .scheduler_step_emit_us
+            .store(emit_us.max(0.0).round() as u64, Ordering::Relaxed);
+        self.inner
+            .scheduler_step_total_us
+            .store(total_us.max(0.0).round() as u64, Ordering::Relaxed);
+        self.inner
+            .scheduler_step_phase_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Update the staged KV coordinator queue gauges and cumulative store counters.
     pub fn set_kv_coordinator(
         &self,
@@ -516,6 +558,26 @@ impl ServerMetrics {
 
     pub fn scheduler_step_last_seconds(&self) -> f64 {
         micros_to_secs(self.inner.scheduler_step_last_us.load(Ordering::Relaxed))
+    }
+
+    pub fn scheduler_step_phase_us(&self) -> Option<(u64, u64, u64, u64, u64)> {
+        if self
+            .inner
+            .scheduler_step_phase_samples
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            return None;
+        }
+        Some((
+            self.inner
+                .scheduler_step_admission_us
+                .load(Ordering::Relaxed),
+            self.inner.scheduler_step_prefill_us.load(Ordering::Relaxed),
+            self.inner.scheduler_step_decode_us.load(Ordering::Relaxed),
+            self.inner.scheduler_step_emit_us.load(Ordering::Relaxed),
+            self.inner.scheduler_step_total_us.load(Ordering::Relaxed),
+        ))
     }
 
     pub fn kv_coordinator_queue_capacity(&self) -> u64 {
@@ -773,6 +835,7 @@ mod tests {
         m.set_scheduler_occupancy(3, 4);
         m.set_scheduler_step(4, 3, 1, 3, 128, 4);
         m.observe_scheduler_step(0.012);
+        m.set_scheduler_step_phase_us(100.0, 200.0, 300.0, 400.0, 1000.0);
         m.set_kv_coordinator(16, 3, 5, 2, true, false, 7, 5, 1, 2);
         m.set_tier_wait_seconds(0.25, 0.5);
         m.set_kv_gpu_blocks(100, 200);
@@ -799,6 +862,28 @@ mod tests {
         assert!(rendered.contains("infer_scheduler_decode_tokens{model=\"Qwen3-4B\",} 3"));
         assert!(rendered.contains("infer_scheduler_prefill_tokens{model=\"Qwen3-4B\",} 128"));
         assert!(rendered.contains("infer_scheduler_batch_width{model=\"Qwen3-4B\",} 4"));
+        assert!(rendered.contains(
+            "infer_scheduler_step_phase_admission_microseconds{model=\"Qwen3-4B\",} 100"
+        ));
+        assert!(
+            rendered.contains(
+                "infer_scheduler_step_phase_prefill_microseconds{model=\"Qwen3-4B\",} 200"
+            )
+        );
+        assert!(
+            rendered.contains(
+                "infer_scheduler_step_phase_decode_microseconds{model=\"Qwen3-4B\",} 300"
+            )
+        );
+        assert!(
+            rendered
+                .contains("infer_scheduler_step_phase_emit_microseconds{model=\"Qwen3-4B\",} 400")
+        );
+        assert!(
+            rendered.contains(
+                "infer_scheduler_step_phase_total_microseconds{model=\"Qwen3-4B\",} 1000"
+            )
+        );
         assert!(rendered.contains("infer_kv_coordinator_queue_capacity{model=\"Qwen3-4B\",} 16"));
         assert!(rendered.contains("infer_kv_fetch_queue_depth{model=\"Qwen3-4B\",} 3"));
         assert!(rendered.contains("infer_kv_fetch_waiters{model=\"Qwen3-4B\",} 5"));
@@ -867,10 +952,12 @@ mod tests {
         m.record_metal_decode_scalar_row();
         m.record_metal_decode_batch_fallback(3);
         m.record_metal_qwen35_packed_decode_batch(4);
+        m.set_scheduler_step_phase_us(11.0, 22.0, 33.0, 44.0, 110.0);
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
         assert!(s.contains("scheduled=0"));
+        assert!(s.contains("step_phase_us=adm:11,prefill:22,decode:33,emit:44,total:110"));
         assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=100.0%"));
         assert!(s.contains("prefix_skip_rate=25.0%"));
