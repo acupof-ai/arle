@@ -21,7 +21,8 @@ use std::sync::Mutex;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
-    AgentTurnResult, SubTurnRecord, TRAJECTORY_SCHEMA_VERSION, TerminalState, TrajectoryMessage,
+    AgentTurnResult, SubTurnRecord, TRAJECTORY_SCHEMA_VERSION, TerminalState, TokensRecord,
+    TrajectoryMessage,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use serde::{Deserialize, Serialize};
@@ -40,9 +41,11 @@ pub(crate) struct AgentTrajectoryRecord {
     pub user_input: String,
     pub messages: Vec<TrajectoryMessage>,
     pub sub_turns: Vec<SubTurnRecord>,
-    /// Phase 1 placeholder. Populated in v2 with `{prompt_ids,
-    /// response_ids, response_mask}`.
-    pub tokens: Option<serde_json::Value>,
+    /// Phase 2 token layer. `Some(record)` when the agent loop tracked
+    /// every component (prompt + each sub-turn response + each tool
+    /// result) successfully; `None` otherwise. Serializes as a JSON
+    /// object or `null` via Option's native serde handling.
+    pub tokens: Option<TokensRecord>,
     pub result: TrajectoryResult,
 }
 
@@ -150,7 +153,7 @@ impl TraceWriter {
             user_input: user_input.to_string(),
             messages: result.messages.clone(),
             sub_turns,
-            tokens: None,
+            tokens: result.tokens.clone(),
             result: TrajectoryResult {
                 text: result.text.clone(),
                 terminal_state: result.terminal_state,
@@ -222,6 +225,7 @@ mod tests {
             }],
             terminal_state: TerminalState::Stop,
             wall_secs: 0.5,
+            tokens: None,
         }
     }
 
@@ -245,6 +249,9 @@ mod tests {
             assert_eq!(parsed["backend"], "metal");
             assert_eq!(parsed["sub_turns"][0]["prompt_text"], "PROMPT");
             assert_eq!(parsed["result"]["terminal_state"], "stop");
+            // `synthetic_turn` constructs `tokens: None` directly, so
+            // the writer must serialize it as JSON null. The end-to-end
+            // FakeEngine test below pins the `tokens.is_object()` path.
             assert!(parsed["tokens"].is_null());
         }
     }
@@ -285,16 +292,22 @@ mod tests {
             outputs: VecDeque<String>,
         }
 
+        fn fake_token_ids(text: &str) -> Vec<u32> {
+            (0u32..text.len() as u32).collect()
+        }
+
         impl InferenceEngine for FakeEngine {
             fn model_id(&self) -> &str {
                 "fake-model"
             }
 
-            fn complete(&mut self, _req: CompletionRequest) -> Result<CompletionOutput> {
+            fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
+                let prompt_token_ids = fake_token_ids(&req.prompt);
                 let text = self
                     .outputs
                     .pop_front()
                     .expect("FakeEngine outputs exhausted");
+                let response_token_ids = fake_token_ids(&text);
                 Ok(CompletionOutput {
                     usage: TokenUsage {
                         prompt_tokens: 1,
@@ -304,6 +317,8 @@ mod tests {
                     text,
                     finish_reason: FinishReason::Stop,
                     token_logprobs: Vec::new(),
+                    prompt_token_ids,
+                    response_token_ids,
                 })
             }
 
@@ -319,6 +334,7 @@ mod tests {
                         finish_reason: None,
                         usage: None,
                         logprob: None,
+                        token_ids: Vec::new(),
                     });
                 }
                 let _ = tx.send(CompletionStreamDelta {
@@ -326,8 +342,13 @@ mod tests {
                     finish_reason: Some(output.finish_reason),
                     usage: Some(output.usage),
                     logprob: None,
+                    token_ids: output.response_token_ids.clone(),
                 });
                 Ok(())
+            }
+
+            fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+                Ok(fake_token_ids(text))
             }
         }
 
@@ -391,10 +412,60 @@ mod tests {
                 .iter()
                 .all(|m| m["role"] != "tool")
         );
-        // tokens placeholder must serialize as JSON null in v1.
-        assert!(parsed["tokens"].is_null());
+        // Phase 2: tokens is now a real object when every component
+        // was tracked. The FakeEngine populates non-empty IDs and
+        // tokenize() succeeds; the no-tools path means no env tokens,
+        // so the mask is all 1s and len matches response_ids.
+        assert!(
+            parsed["tokens"].is_object(),
+            "tokens must serialize as an object in Phase 2, got {:?}",
+            parsed["tokens"]
+        );
+        assert!(
+            parsed["tokens"]["prompt_ids"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "prompt_ids must be non-empty"
+        );
+        let response_ids = parsed["tokens"]["response_ids"]
+            .as_array()
+            .expect("response_ids array");
+        let response_mask = parsed["tokens"]["response_mask"]
+            .as_array()
+            .expect("response_mask array");
+        assert_eq!(
+            response_ids.len(),
+            response_mask.len(),
+            "len(ids) == len(mask)"
+        );
+        assert!(
+            response_mask.iter().all(|m| {
+                let v = m.as_u64().unwrap_or(99);
+                v == 0 || v == 1
+            }),
+            "mask elements must be 0 or 1"
+        );
         // schema_version is 1 (i32) — already asserted above; this also
         // pins the field's name as a smoke for casual schema rename.
         assert!(parsed.get("schema_version").is_some());
+    }
+
+    #[test]
+    fn tokens_record_round_trips_through_serde() {
+        // Schema-level invariant: TokensRecord serializes into a JSON
+        // object with the exact keys the trace writer emits, and
+        // deserializes back to an equal value.
+        let record = TokensRecord {
+            prompt_ids: vec![1, 2, 3],
+            response_ids: vec![10, 20, 30, 40, 50],
+            response_mask: vec![1, 1, 0, 0, 1],
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        assert_eq!(parsed["prompt_ids"][0], 1);
+        assert_eq!(parsed["response_ids"][2], 30);
+        assert_eq!(parsed["response_mask"][3], 0);
+        let back: TokensRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(record, back);
     }
 }

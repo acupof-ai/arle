@@ -154,6 +154,31 @@ pub struct AgentTurnResult {
     /// monotonic anchor as `time_to_first_token`. Surfaced separately
     /// because the trace writer needs it without re-sampling.
     pub wall_secs: f64,
+    /// Phase 2 trajectory token layer. `Some(TokensRecord)` only when
+    /// every component of the turn's token IDs was available — empty
+    /// `prompt_token_ids` from the engine, empty `response_token_ids`
+    /// from any sub-turn, or a tokenize failure on a tool result all
+    /// downgrade to `None`. Honest-`None` lets RL pipelines mask the
+    /// turn out instead of training on partial / lying data.
+    pub tokens: Option<TokensRecord>,
+}
+
+/// Token-level RL-trainer-friendly view of a turn's trajectory.
+///
+/// `response_ids` interleaves LLM-generated tokens AND tool-result
+/// tokens in the order they entered the model's context.
+/// `response_mask` is `1` for LLM tokens, `0` for tool tokens —
+/// matches verl's `AgentLoopOutput` semantics so an RL loss can mask
+/// environment tokens out of the policy gradient.
+///
+/// `prompt_ids` is the tokenized prompt for the FIRST engine sub-turn
+/// (the original user prompt + system); subsequent sub-turns' prompts
+/// are reconstructable from this plus `response_ids` + `response_mask`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokensRecord {
+    pub prompt_ids: Vec<u32>,
+    pub response_ids: Vec<u32>,
+    pub response_mask: Vec<u8>,
 }
 
 /// Schema version for v1 trajectory records. v2 will bump this when token
@@ -464,6 +489,16 @@ impl AgentSession {
         });
         let mut sub_turns: Vec<SubTurnRecord> = Vec::new();
 
+        // Phase 2 trajectory token layer. `prompt_ids` is set on the
+        // FIRST engine sub-turn from `output.prompt_token_ids`; if that
+        // is empty, or any later component is unavailable, we set
+        // `tokens_aborted = true` and surface `tokens = None` from the
+        // ultimate return — never partial / lying data.
+        let mut prompt_ids: Option<Vec<u32>> = None;
+        let mut response_ids: Vec<u32> = Vec::new();
+        let mut response_mask: Vec<u8> = Vec::new();
+        let mut tokens_aborted: bool = false;
+
         for turn in 0..settings.max_turns {
             // Two indices, both monotone: `tool_use_id_base` is the loop
             // iteration (always advances, including on the recovered
@@ -559,6 +594,31 @@ impl AgentSession {
                 completion_tokens =
                     completion_tokens.saturating_add(output.usage.completion_tokens as u64);
 
+                // Phase 2 token layer: record this sub-turn's tokenized
+                // prompt + response. First engine sub-turn fixes
+                // `prompt_ids`; later sub-turns just append response IDs
+                // (mask=1 — these are LLM-generated). Empty IDs from
+                // either side abort token tracking.
+                if !tokens_aborted {
+                    if prompt_ids.is_none() {
+                        if output.prompt_token_ids.is_empty() {
+                            tokens_aborted = true;
+                        } else {
+                            prompt_ids = Some(output.prompt_token_ids.clone());
+                        }
+                    }
+                    if !tokens_aborted {
+                        if output.response_token_ids.is_empty() {
+                            tokens_aborted = true;
+                        } else {
+                            response_ids.extend(output.response_token_ids.iter());
+                            response_mask.extend(
+                                std::iter::repeat(1u8).take(output.response_token_ids.len()),
+                            );
+                        }
+                    }
+                }
+
                 let decode_secs = sub_turn_started_at.elapsed().as_secs_f64();
                 let ttft_ms = sub_turn_first_token_at.map(|t| {
                     u64::try_from(t.duration_since(sub_turn_started_at).as_millis())
@@ -606,6 +666,30 @@ impl AgentSession {
                         // `completion_text` and under-reports engine work.
                         // (codex Phase-1 P2)
                         sub_turns.push(repair_outcome.record);
+
+                        // Phase 2 token layer: repair was a real engine
+                        // call — its tokens count toward `response_ids`
+                        // with mask=1. Empty IDs from either side abort
+                        // token tracking.
+                        if !tokens_aborted {
+                            if prompt_ids.is_none() {
+                                if repair_outcome.prompt_token_ids.is_empty() {
+                                    tokens_aborted = true;
+                                } else {
+                                    prompt_ids = Some(repair_outcome.prompt_token_ids);
+                                }
+                            }
+                            if !tokens_aborted {
+                                if repair_outcome.response_token_ids.is_empty() {
+                                    tokens_aborted = true;
+                                } else {
+                                    let n = repair_outcome.response_token_ids.len();
+                                    response_ids
+                                        .extend(repair_outcome.response_token_ids.into_iter());
+                                    response_mask.extend(std::iter::repeat(1u8).take(n));
+                                }
+                            }
+                        }
                     }
                 }
                 parsed
@@ -646,6 +730,12 @@ impl AgentSession {
                 } else {
                     TerminalState::Stop
                 };
+                let tokens = build_tokens_record(
+                    tokens_aborted,
+                    prompt_ids.clone(),
+                    response_ids.clone(),
+                    response_mask.clone(),
+                );
                 return Ok(Some(AgentTurnResult {
                     text: content,
                     tool_calls_executed,
@@ -659,6 +749,7 @@ impl AgentSession {
                     sub_turns,
                     terminal_state,
                     wall_secs: turn_started_at.elapsed().as_secs_f64(),
+                    tokens,
                 }));
             }
 
@@ -666,7 +757,7 @@ impl AgentSession {
                 trace_events.push(AgentTraceEvent::AssistantNote(content));
             }
 
-            execute_tool_calls(
+            let tool_results_text = execute_tool_calls(
                 &tool_calls,
                 tool_executor,
                 &mut self.messages,
@@ -683,6 +774,35 @@ impl AgentSession {
                 },
             );
 
+            // Phase 2 token layer: tokenize tool results and append
+            // them to `response_ids` with mask=0 (env tokens — verl
+            // semantics: RL loss masks these out of the policy
+            // gradient). Any tokenize failure aborts token tracking.
+            if !tokens_aborted {
+                for result_text in &tool_results_text {
+                    if result_text.is_empty() {
+                        // Empty tool result is allowed: append nothing,
+                        // skip this iteration. Mask alignment stays
+                        // intact because we add 0 ids and 0 mask bytes.
+                        continue;
+                    }
+                    match engine.tokenize(result_text) {
+                        Ok(ids) if !ids.is_empty() => {
+                            let n = ids.len();
+                            response_ids.extend(ids.into_iter());
+                            response_mask.extend(std::iter::repeat(0u8).take(n));
+                        }
+                        _ => {
+                            // Either tokenize errored, or returned empty
+                            // for non-empty input — both are "tokens
+                            // unavailable" by contract.
+                            tokens_aborted = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
             if let Some(text) = tool_policy.finalize_after_tool_execution(
                 user_input,
                 last_tool_name.as_deref(),
@@ -690,6 +810,12 @@ impl AgentSession {
                 last_tool_scalar_result.as_deref(),
             ) {
                 self.compact_turn_history(turn_start, &text);
+                let tokens = build_tokens_record(
+                    tokens_aborted,
+                    prompt_ids.clone(),
+                    response_ids.clone(),
+                    response_mask.clone(),
+                );
                 return Ok(Some(AgentTurnResult {
                     text,
                     tool_calls_executed,
@@ -703,12 +829,14 @@ impl AgentSession {
                     sub_turns,
                     terminal_state: TerminalState::PolicyShortCircuit,
                     wall_secs: turn_started_at.elapsed().as_secs_f64(),
+                    tokens,
                 }));
             }
         }
 
         let final_text = "(max turns reached - agent stopped)".to_string();
         self.compact_turn_history(turn_start, &final_text);
+        let tokens = build_tokens_record(tokens_aborted, prompt_ids, response_ids, response_mask);
         Ok(Some(AgentTurnResult {
             text: final_text,
             tool_calls_executed,
@@ -721,6 +849,7 @@ impl AgentSession {
             sub_turns,
             terminal_state: TerminalState::MaxTurns,
             wall_secs: turn_started_at.elapsed().as_secs_f64(),
+            tokens,
         }))
     }
 
@@ -851,7 +980,11 @@ fn execute_tool_calls(
     trajectory_messages: &mut Vec<TrajectoryMessage>,
     sub_turn_index: usize,
     mut on_trace_event: Option<&mut dyn FnMut(&AgentTraceEvent)>,
-) {
+) -> Vec<String> {
+    // Returns the per-call tool result strings in execution order so
+    // the caller can tokenize them into the trajectory's `response_ids`
+    // (with mask=0 — env tokens RL must mask out of the policy loss).
+    let mut results = Vec::with_capacity(tool_calls.len());
     for (call_index, tool_call) in tool_calls.iter().enumerate() {
         *tool_calls_executed += 1;
         let (result, metadata) = tool_executor.execute_with_metadata(tool_call);
@@ -872,11 +1005,13 @@ fn execute_tool_calls(
         messages.push(Message::tool_result(&tool_call.name, &result));
         trajectory_messages.push(TrajectoryMessage {
             role: TrajectoryRole::Tool,
-            content: MessageContent::Text(result),
+            content: MessageContent::Text(result.clone()),
             tool_use_id: Some(tool_use_id(sub_turn_index, call_index)),
             result_truncated: Some(metadata.truncated),
         });
+        results.push(result);
     }
+    results
 }
 
 /// Build the deterministic `tu_<sub>_<call>` id used to correlate
@@ -915,6 +1050,36 @@ fn finish_reason_to_str(reason: FinishReason) -> &'static str {
     }
 }
 
+/// Phase 2 trajectory token layer assembler. Returns `Some(record)` ONLY
+/// when every required component was available — `tokens_aborted` is
+/// the kill switch that fires the moment any sub-turn or tool result
+/// produced an empty / errored token list. `prompt_ids` must also be
+/// `Some` and non-empty (no engine sub-turn ever fired ⇒ no prompt
+/// ⇒ no record). The contract: never ship a partial / lying mask.
+fn build_tokens_record(
+    tokens_aborted: bool,
+    prompt_ids: Option<Vec<u32>>,
+    response_ids: Vec<u32>,
+    response_mask: Vec<u8>,
+) -> Option<TokensRecord> {
+    if tokens_aborted {
+        return None;
+    }
+    let prompt_ids = prompt_ids?;
+    if prompt_ids.is_empty() {
+        return None;
+    }
+    // Defensive: enforce the docs invariant `len == len`.
+    if response_ids.len() != response_mask.len() {
+        return None;
+    }
+    Some(TokensRecord {
+        prompt_ids,
+        response_ids,
+        response_mask,
+    })
+}
+
 fn scalar_tool_result(result: &str) -> Option<String> {
     if result.contains("[stderr]") {
         return None;
@@ -945,6 +1110,13 @@ fn scalar_tool_result(result: &str) -> Option<String> {
 struct RepairOutcome {
     parsed: ParsedAssistantResponse,
     record: SubTurnRecord,
+    /// Phase 2 trajectory: the engine's tokenized response (mask=1) for
+    /// this repair sub-turn. Empty when the engine didn't surface ids
+    /// — caller should abort token tracking.
+    response_token_ids: Vec<u32>,
+    /// The repair sub-turn's tokenized prompt. Used only when no prior
+    /// engine sub-turn established `prompt_ids` yet.
+    prompt_token_ids: Vec<u32>,
 }
 
 fn repair_tool_calls<E: InferenceEngine + ?Sized>(
@@ -1010,6 +1182,8 @@ If no tool is needed, output exactly NO_TOOL.",
         return Ok(Some(RepairOutcome {
             parsed: repaired,
             record,
+            response_token_ids: repair_output.response_token_ids,
+            prompt_token_ids: repair_output.prompt_token_ids,
         }));
     }
     if repaired.content.trim() == "NO_TOOL" {
@@ -1028,11 +1202,18 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
         return engine.complete(req).map(Some);
     }
 
+    // Phase 2 trajectory: snapshot the prompt's tokenized form before
+    // the worker takes ownership of `req`. Empty Vec on failure — the
+    // agent loop treats empty as "unavailable" and downgrades
+    // `tokens = None`.
+    let prompt_token_ids = engine.tokenize(&req.prompt).unwrap_or_default();
+
     let (tx, rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
     let mut rx: Option<mpsc::UnboundedReceiver<CompletionStreamDelta>> = Some(rx);
     let mut text = String::new();
     let mut finish_reason = None::<FinishReason>;
     let mut usage = None::<TokenUsage>;
+    let mut response_token_ids: Vec<u32> = Vec::new();
     let mut stream_err = None::<anyhow::Error>;
     let mut cancelled = false;
 
@@ -1054,6 +1235,9 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
                             callback(&delta.text_delta);
                         }
                         text.push_str(&delta.text_delta);
+                    }
+                    if !delta.token_ids.is_empty() {
+                        response_token_ids.extend(delta.token_ids.iter());
                     }
                     if let Some(final_usage) = delta.usage {
                         usage = Some(final_usage);
@@ -1094,6 +1278,8 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
         finish_reason,
         usage,
         token_logprobs: Vec::new(),
+        prompt_token_ids,
+        response_token_ids,
     }))
 }
 
@@ -1119,6 +1305,13 @@ mod tests {
         outputs: VecDeque<String>,
         prompts: Vec<String>,
         max_tokens: Vec<usize>,
+        /// When set, every CompletionOutput / final delta uses an empty
+        /// `response_token_ids` regardless of the canned output. Drives
+        /// the `tokens_is_none_when_engine_returns_empty_token_ids` test.
+        force_empty_response_token_ids: bool,
+        /// When set, `tokenize()` errors. Drives the
+        /// `tokens_is_none_when_tokenize_fails` test.
+        tokenize_fails: bool,
     }
 
     impl FakeEngine {
@@ -1127,7 +1320,30 @@ mod tests {
                 outputs: outputs.into_iter().map(str::to_string).collect(),
                 prompts: Vec::new(),
                 max_tokens: Vec::new(),
+                force_empty_response_token_ids: false,
+                tokenize_fails: false,
             }
+        }
+
+        fn with_empty_response_token_ids(mut self) -> Self {
+            self.force_empty_response_token_ids = true;
+            self
+        }
+
+        fn with_tokenize_failure(mut self) -> Self {
+            self.tokenize_fails = true;
+            self
+        }
+    }
+
+    /// Synthesize monotone-u32 IDs for a string. Tests don't care about
+    /// vocab fidelity, only that "tokenize succeeded" produces stable
+    /// non-empty Vec<u32> for non-empty input.
+    fn fake_token_ids(text: &str) -> Vec<u32> {
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            (0u32..text.len() as u32).collect()
         }
     }
 
@@ -1137,12 +1353,18 @@ mod tests {
         }
 
         fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
+            let prompt_token_ids = fake_token_ids(&req.prompt);
             self.prompts.push(req.prompt);
             self.max_tokens.push(req.max_tokens);
             let text = self
                 .outputs
                 .pop_front()
                 .ok_or_else(|| anyhow!("fake engine exhausted"))?;
+            let response_token_ids = if self.force_empty_response_token_ids {
+                Vec::new()
+            } else {
+                fake_token_ids(&text)
+            };
             Ok(CompletionOutput {
                 usage: TokenUsage {
                     prompt_tokens: 1,
@@ -1152,6 +1374,8 @@ mod tests {
                 text,
                 finish_reason: FinishReason::Stop,
                 token_logprobs: Vec::new(),
+                prompt_token_ids,
+                response_token_ids,
             })
         }
 
@@ -1167,6 +1391,7 @@ mod tests {
                     finish_reason: None,
                     usage: None,
                     logprob: None,
+                    token_ids: Vec::new(),
                 });
             }
             let _ = tx.send(CompletionStreamDelta {
@@ -1174,8 +1399,16 @@ mod tests {
                 finish_reason: Some(output.finish_reason),
                 usage: Some(output.usage),
                 logprob: None,
+                token_ids: output.response_token_ids.clone(),
             });
             Ok(())
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+            if self.tokenize_fails {
+                anyhow::bail!("fake tokenize() failure");
+            }
+            Ok(fake_token_ids(text))
         }
     }
 
@@ -2138,5 +2371,203 @@ mod tests {
         let st_json = serde_json::to_string(&st).expect("serialize sub-turn");
         let st_back: SubTurnRecord = serde_json::from_str(&st_json).expect("deserialize sub-turn");
         assert_eq!(st, st_back);
+    }
+
+    // ── Trajectory export (Phase 2 / token layer) ────────────────────────
+
+    use super::TokensRecord;
+
+    #[test]
+    fn response_mask_invariants_no_tools() {
+        // No tool calls → assistant text only → mask is all 1s, len
+        // matches response_ids, prompt_ids non-empty.
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec!["hello world"]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "say hi",
+                &[],
+                &StubToolExecutor::new("ignored"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+        let tokens = result.tokens.expect("tokens populated");
+        assert!(
+            !tokens.prompt_ids.is_empty(),
+            "prompt_ids must be non-empty"
+        );
+        assert!(
+            !tokens.response_ids.is_empty(),
+            "response_ids must be non-empty"
+        );
+        assert_eq!(
+            tokens.response_ids.len(),
+            tokens.response_mask.len(),
+            "len(ids) == len(mask)"
+        );
+        assert!(
+            tokens.response_mask.iter().all(|&m| m == 1),
+            "no tool calls ⇒ every mask byte is 1, got {:?}",
+            tokens.response_mask
+        );
+    }
+
+    #[test]
+    fn response_mask_invariants_with_tool_call() {
+        // One tool call: mask carries 1s (LLM tokens before/after the
+        // tool) and 0s (tool-result tokens). sum(mask) == LLM-token
+        // count, len(mask) == len(response_ids).
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "done",
+        ]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "list files",
+                &[shell_def()],
+                &StubToolExecutor::new("file-a\nfile-b"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+        let tokens = result.tokens.expect("tokens populated");
+        assert_eq!(
+            tokens.response_ids.len(),
+            tokens.response_mask.len(),
+            "len(ids) == len(mask)"
+        );
+        // Both 0 and 1 must appear.
+        assert!(
+            tokens.response_mask.iter().any(|&m| m == 1),
+            "expected at least one mask=1 (LLM token)"
+        );
+        assert!(
+            tokens.response_mask.iter().any(|&m| m == 0),
+            "expected at least one mask=0 (tool token)"
+        );
+        // Mask elements ∈ {0, 1}.
+        assert!(
+            tokens.response_mask.iter().all(|&m| m == 0 || m == 1),
+            "mask elements must be 0 or 1, got {:?}",
+            tokens.response_mask
+        );
+        // sum(mask) == count of LLM tokens (each engine sub-turn's
+        // text tokenizes to text.len() ids via fake_token_ids).
+        let llm_token_count: usize = tokens.response_mask.iter().filter(|&&m| m == 1).count();
+        let expected_llm_tokens = result
+            .sub_turns
+            .iter()
+            .map(|st| st.completion_text.len())
+            .sum::<usize>();
+        assert_eq!(
+            llm_token_count, expected_llm_tokens,
+            "sum(mask=1) must equal generated-LLM token count, got {} vs {}",
+            llm_token_count, expected_llm_tokens
+        );
+    }
+
+    #[test]
+    fn response_mask_with_repair_path() {
+        // malformed → repair → tool → final: ALL three engine
+        // generations contribute LLM tokens; mask covers them.
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            // 1. Main: malformed tool_call (missing "name") triggers repair
+            "<tool_call>\n{\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            // 2. Repair: valid tool_call
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            // 3. Final assistant turn after tool result
+            "done",
+        ]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "Check the workspace root.",
+                &[shell_def()],
+                &StubToolExecutor::new("ok"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("repair turn");
+        let tokens = result.tokens.expect("tokens populated");
+        // 3 engine sub-turns + 1 tool result must all contribute.
+        assert_eq!(result.sub_turns.len(), 3);
+        let llm_token_count: usize = tokens.response_mask.iter().filter(|&&m| m == 1).count();
+        let expected_llm_tokens = result
+            .sub_turns
+            .iter()
+            .map(|st| st.completion_text.len())
+            .sum::<usize>();
+        assert_eq!(
+            llm_token_count, expected_llm_tokens,
+            "all three engine sub-turns' tokens must land in mask=1 region"
+        );
+        assert!(
+            tokens.response_mask.iter().any(|&m| m == 0),
+            "tool result must contribute mask=0 bytes"
+        );
+        assert_eq!(tokens.response_ids.len(), tokens.response_mask.len());
+    }
+
+    #[test]
+    fn tokens_is_none_when_engine_returns_empty_token_ids() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec!["hello"]).with_empty_response_token_ids();
+        let result = session
+            .run_turn(
+                &mut engine,
+                "hi",
+                &[],
+                &StubToolExecutor::new("ignored"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+        assert!(
+            result.tokens.is_none(),
+            "engine returning empty response_token_ids must downgrade tokens=None"
+        );
+    }
+
+    #[test]
+    fn tokens_is_none_when_tokenize_fails() {
+        // tokenize() errors on tool result → tokens must be None.
+        // Use a real tool path so tokenize() actually fires.
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "done",
+        ])
+        .with_tokenize_failure();
+        let result = session
+            .run_turn(
+                &mut engine,
+                "list",
+                &[shell_def()],
+                &StubToolExecutor::new("ok"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+        assert!(
+            result.tokens.is_none(),
+            "engine.tokenize() failure on tool result must downgrade tokens=None"
+        );
+    }
+
+    #[test]
+    fn tokens_record_round_trips_through_serde() {
+        let record = TokensRecord {
+            prompt_ids: vec![1, 2, 3],
+            response_ids: vec![10, 11, 12, 20, 21, 30],
+            response_mask: vec![1, 1, 1, 0, 0, 1],
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        let back: TokensRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(record, back);
     }
 }

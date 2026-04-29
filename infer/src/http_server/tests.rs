@@ -32,6 +32,7 @@ mod tests {
                     finish_reason: None,
                     usage: None,
                     logprob: None,
+                    token_ids: Vec::new(),
                 },
                 CompletionStreamDelta {
                     text_delta: String::new(),
@@ -42,6 +43,7 @@ mod tests {
                         total_tokens: 2,
                     }),
                     logprob: None,
+                    token_ids: Vec::new(),
                 },
             ],
             true,
@@ -69,6 +71,7 @@ mod tests {
                         finish_reason: delta.finish_reason,
                         usage: delta.usage,
                         logprob: delta.logprob,
+                        token_ids: delta.token_ids.clone(),
                     });
                 }
             }
@@ -1139,6 +1142,7 @@ mod tests {
                     finish_reason: None,
                     usage: None,
                     logprob: None,
+                    token_ids: Vec::new(),
                 },
                 CompletionStreamDelta {
                     text_delta: String::new(),
@@ -1149,6 +1153,7 @@ mod tests {
                         total_tokens: 2,
                     }),
                     logprob: None,
+                    token_ids: Vec::new(),
                 },
             ],
             false,
@@ -1260,6 +1265,7 @@ mod tests {
                         total_tokens: 2,
                     }),
                     logprob: None,
+                    token_ids: Vec::new(),
                 });
             }
         });

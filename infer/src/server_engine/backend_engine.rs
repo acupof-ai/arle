@@ -61,6 +61,12 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
         let mut sampling = req.sampling;
         sampling.max_new_tokens = Some(req.max_tokens);
 
+        // Phase 2 trajectory: tokenize prompt+response so the agent loop
+        // can populate `tokens.prompt_ids` / `tokens.response_ids`. Errors
+        // are tolerated — the agent loop treats empty vectors as
+        // "unavailable" and downgrades `tokens = None`.
+        let prompt_token_ids = self.backend.tokenize(&req.prompt).unwrap_or_default();
+
         let generated = catch_unwind(AssertUnwindSafe(|| {
             self.backend.generate(&req.prompt, &sampling)
         }))
@@ -82,6 +88,12 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
             finish_reason = FinishReason::Stop;
         }
 
+        let response_token_ids = if text.is_empty() {
+            Vec::new()
+        } else {
+            self.backend.tokenize(&text).unwrap_or_default()
+        };
+
         Ok(CompletionOutput {
             text,
             finish_reason,
@@ -91,6 +103,8 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
                 total_tokens: generated.prompt_tokens + generated.completion_tokens,
             },
             token_logprobs: Vec::new(),
+            prompt_token_ids,
+            response_token_ids,
         })
     }
 
@@ -112,6 +126,14 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
 
         let processor = std::cell::RefCell::new(StopChunkProcessor::new(stops));
         let consumer_dropped = std::cell::Cell::new(false);
+        // Phase 2 trajectory: collate the visible text we actually
+        // forwarded to the consumer so the final delta can carry its
+        // tokenized form as `token_ids`. Per-chunk token IDs aren't
+        // observable here (the backend hands us raw text), so we emit
+        // the full response on the FINAL delta — the collator's
+        // `response_token_ids = concat(deltas.token_ids)` then sees the
+        // complete tokenized output.
+        let emitted_text = std::cell::RefCell::new(String::new());
 
         let backend_name = self.backend.name();
         let generated = catch_unwind(AssertUnwindSafe(|| {
@@ -125,17 +147,21 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
                     };
                     if let Some(delta) = delta
                         && !delta.is_empty()
-                        && tx
+                    {
+                        emitted_text.borrow_mut().push_str(&delta);
+                        if tx
                             .send(CompletionStreamDelta {
                                 text_delta: delta,
                                 finish_reason: None,
                                 usage: None,
                                 logprob: None,
+                                token_ids: Vec::new(),
                             })
                             .is_err()
-                    {
-                        consumer_dropped.set(true);
-                        return Err(anyhow::anyhow!("consumer dropped"));
+                        {
+                            consumer_dropped.set(true);
+                            return Err(anyhow::anyhow!("consumer dropped"));
+                        }
                     }
                     if stop_hit {
                         return Err(StreamStopMatched.into());
@@ -160,11 +186,13 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
         if let Some(trailing) = processor.borrow_mut().finish()
             && !trailing.is_empty()
         {
+            emitted_text.borrow_mut().push_str(&trailing);
             let _ = tx.send(CompletionStreamDelta {
                 text_delta: trailing,
                 finish_reason: None,
                 usage: None,
                 logprob: None,
+                token_ids: Vec::new(),
             });
         }
 
@@ -179,13 +207,30 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
             total_tokens: generated.prompt_tokens + generated.completion_tokens,
         };
 
+        // Tokenize the visible text we actually emitted (post stop-trim)
+        // and ride it on the final delta. Empty Vec on tokenize failure
+        // is honest signal — the agent loop downgrades `tokens = None`
+        // when any sub-turn produces an empty `response_token_ids`.
+        let final_text = emitted_text.borrow();
+        let response_token_ids = if final_text.is_empty() {
+            Vec::new()
+        } else {
+            self.backend.tokenize(&final_text).unwrap_or_default()
+        };
+        drop(final_text);
+
         let _ = tx.send(CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
             usage: Some(usage),
             logprob: None,
+            token_ids: response_token_ids,
         });
         Ok(())
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        self.backend.tokenize(text)
     }
 }
 

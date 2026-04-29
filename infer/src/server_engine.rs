@@ -284,12 +284,14 @@ mod tests {
                     finish_reason: None,
                     usage: None,
                     logprob: None,
+                    token_ids: Vec::new(),
                 });
                 let _ = req.delta_tx.send(CompletionStreamDelta {
                     text_delta: "lo".into(),
                     finish_reason: None,
                     usage: None,
                     logprob: None,
+                    token_ids: Vec::new(),
                 });
                 let _ = req.delta_tx.send(CompletionStreamDelta {
                     text_delta: String::new(),
@@ -300,6 +302,7 @@ mod tests {
                         total_tokens: 5,
                     }),
                     logprob: None,
+                    token_ids: Vec::new(),
                 });
                 Ok(())
             }
@@ -330,6 +333,8 @@ mod tests {
             finish_reason,
             usage,
             token_logprobs,
+            prompt_token_ids,
+            response_token_ids,
         } = output;
         assert_eq!(text, "hello");
         assert_eq!(finish_reason, FinishReason::Stop);
@@ -342,6 +347,10 @@ mod tests {
             }
         );
         assert!(token_logprobs.is_empty());
+        // MockHandle has no tokenizer attached, so tokenize() errors and
+        // both ID vectors fall back to empty.
+        assert!(prompt_token_ids.is_empty());
+        assert!(response_token_ids.is_empty());
     }
 
     /// Regression for codex review 70e2776 High #1 — stop *inside* a

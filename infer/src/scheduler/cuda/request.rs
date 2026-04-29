@@ -78,6 +78,12 @@ impl StreamDecodeState {
                             finish_reason: None,
                             usage: None,
                             logprob,
+                            // TODO Phase-2 follow-up: per-delta token_ids
+                            // would require correlating sent text byte
+                            // ranges back to token boundaries through
+                            // `decoded_token_count`. The cumulative list
+                            // still rides on `send_finish` below.
+                            token_ids: Vec::new(),
                         });
                     }
                     self.sent_len = stop_pos;
@@ -86,6 +92,7 @@ impl StreamDecodeState {
                         prompt_tokens,
                         generated_tokens.len(),
                         FinishReason::Stop,
+                        generated_tokens,
                     );
                     EmitOutcome::Finished
                 }
@@ -96,6 +103,8 @@ impl StreamDecodeState {
                             finish_reason: None,
                             usage: None,
                             logprob,
+                            // TODO Phase-2 follow-up: see above.
+                            token_ids: Vec::new(),
                         });
                         self.sent_len = safe_len;
                     }
@@ -111,6 +120,8 @@ impl StreamDecodeState {
                         finish_reason: None,
                         usage: None,
                         logprob,
+                        // TODO Phase-2 follow-up: see above.
+                        token_ids: Vec::new(),
                     });
                 }
                 self.sent_len = self.full_decoded.len();
@@ -149,6 +160,8 @@ impl StreamDecodeState {
                             finish_reason: None,
                             usage: None,
                             logprob: None,
+                            // TODO Phase-2 follow-up: see emit_delta.
+                            token_ids: Vec::new(),
                         });
                     }
                 }
@@ -168,7 +181,13 @@ impl StreamDecodeState {
             );
         }
 
-        self.send_finish(delta_tx, prompt_tokens, generated_tokens.len(), reason);
+        self.send_finish(
+            delta_tx,
+            prompt_tokens,
+            generated_tokens.len(),
+            reason,
+            generated_tokens,
+        );
     }
 
     pub(crate) fn send_finish(
@@ -177,7 +196,14 @@ impl StreamDecodeState {
         prompt_tokens: usize,
         completion_tokens: usize,
         reason: FinishReason,
+        generated_tokens: &[u32],
     ) {
+        // Phase 2 trajectory: ride the cumulative response token IDs on
+        // the terminator delta. Per-delta `token_ids` is left as an
+        // empty Vec (TODO above) — the consumer's collator concatenates
+        // every delta's `token_ids` into `response_token_ids`, and with
+        // every text delta empty + the final delta carrying the full
+        // list, that concatenation comes out correct.
         let _ = delta_tx.send(CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: Some(reason),
@@ -187,6 +213,7 @@ impl StreamDecodeState {
                 total_tokens: prompt_tokens + completion_tokens,
             }),
             logprob: None,
+            token_ids: generated_tokens.to_vec(),
         });
     }
 }

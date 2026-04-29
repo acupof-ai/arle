@@ -235,5 +235,8 @@ pub(super) fn finish_rejected_request(
             total_tokens: prompt_tokens,
         }),
         logprob: None,
+        // TODO Phase-2 follow-up: rejected requests have no generated
+        // tokens to surface, so empty is correct here regardless.
+        token_ids: Vec::new(),
     });
 }
