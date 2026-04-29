@@ -460,6 +460,37 @@ def parse_float(fields, key):
     except ValueError:
         return None
 
+def quantile(vals, q):
+    if not vals:
+        return None
+    ordered = sorted(vals)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+def fmt_num(val, digits=0, suffix=""):
+    if val is None:
+        return "n/a"
+    if digits == 0:
+        return f"{val:.0f}{suffix}"
+    return f"{val:.{digits}f}{suffix}"
+
+def fmt_peak(vals, digits=0, suffix=""):
+    return fmt_num(max(vals) if vals else None, digits, suffix)
+
+def distribution_row(name, vals, digits=0, suffix=""):
+    return (
+        f"| {name} | {fmt_num(quantile(vals, 0.25), digits, suffix)} "
+        f"| {fmt_num(quantile(vals, 0.50), digits, suffix)} "
+        f"| {fmt_num(quantile(vals, 0.75), digits, suffix)} "
+        f"| {fmt_num(quantile(vals, 0.99), digits, suffix)} "
+        f"| {fmt_peak(vals, digits, suffix)} |"
+    )
+
 ok_records = [r for r in records if r.get("ok") is True and isinstance(r.get("stats"), str)]
 fail_records = [r for r in records if r.get("ok") is False]
 
@@ -469,12 +500,61 @@ active_vals = [v for f in parsed if (v := parse_int(f, "active")) is not None]
 running_batch_vals = [v for f in parsed if (v := parse_int(f, "running_batch")) is not None]
 prefill_queue_vals = [v for f in parsed if (v := parse_int(f, "prefill_queue")) is not None]
 kv_vals = [v for f in parsed if (v := parse_float(f, "kv_util")) is not None]
+prefix_hit_vals = [v for f in parsed if (v := parse_float(f, "prefix_hit_rate")) is not None]
+prefix_skip_vals = [v for f in parsed if (v := parse_float(f, "prefix_skip_rate")) is not None]
+peak_mem_vals = [v for f in parsed if (v := parse_float(f, "peak_mem")) is not None]
+active_mem_vals = [v for f in parsed if (v := parse_float(f, "active_mem")) is not None]
+cache_mem_vals = [v for f in parsed if (v := parse_float(f, "cache_mem")) is not None]
+queue_p50_vals = [v for f in parsed if (v := parse_float(f, "queue_p50")) is not None]
+ttft_p50_vals = [v for f in parsed if (v := parse_float(f, "ttft_p50")) is not None]
+ttft_p99_vals = [v for f in parsed if (v := parse_float(f, "ttft_p99")) is not None]
+tpot_p50_vals = [v for f in parsed if (v := parse_float(f, "tpot_p50")) is not None]
+service_p50_vals = [v for f in parsed if (v := parse_float(f, "service_p50")) is not None]
+step_last_vals = [v for f in parsed if (v := parse_float(f, "step_last")) is not None]
+step_p50_vals = [v for f in parsed if (v := parse_float(f, "step_p50")) is not None]
+kv_fetch_q_vals = [v for f in parsed if (v := parse_int(f, "kv_fetch_q")) is not None]
+kv_fetch_waiter_vals = [v for f in parsed if (v := parse_int(f, "kv_fetch_waiters")) is not None]
+kv_store_q_vals = [v for f in parsed if (v := parse_int(f, "kv_store_q")) is not None]
+tier_fetch_wait_vals = [v for f in parsed if (v := parse_float(f, "tier_fetch_wait")) is not None]
+tier_store_wait_vals = [v for f in parsed if (v := parse_float(f, "tier_store_wait")) is not None]
+decode_token_vals = [v for f in parsed if (v := parse_int(f, "decode_tokens")) is not None]
+prefill_token_vals = [v for f in parsed if (v := parse_int(f, "prefill_tokens")) is not None]
+tokens_out_vals = [v for f in parsed if (v := parse_int(f, "tokens_out")) is not None]
 
 peak_waiting = max(waiting_vals) if waiting_vals else None
 peak_active = max(active_vals) if active_vals else None
 peak_running_batch = max(running_batch_vals) if running_batch_vals else None
 peak_prefill_queue = max(prefill_queue_vals) if prefill_queue_vals else None
 peak_kv = max(kv_vals) if kv_vals else None
+peak_prefix_hit = max(prefix_hit_vals) if prefix_hit_vals else None
+q75_prefix_hit = quantile(prefix_hit_vals, 0.75)
+peak_prefix_skip = max(prefix_skip_vals) if prefix_skip_vals else None
+peak_mem = max(peak_mem_vals) if peak_mem_vals else None
+before_peak_mem = parse_float(parse_fields(before), "peak_mem")
+peak_mem_delta = (peak_mem - before_peak_mem) if peak_mem is not None and before_peak_mem is not None else None
+kv_fetch_q_saturated = sum(1 for v in kv_fetch_q_vals if v > 0)
+kv_fetch_waiter_saturated = sum(1 for v in kv_fetch_waiter_vals if v > 0)
+kv_store_q_saturated = sum(1 for v in kv_store_q_vals if v > 0)
+service_distribution_rows = [
+    distribution_row("waiting", waiting_vals),
+    distribution_row("kv_util", kv_vals, 1, "%"),
+    distribution_row("queue_p50", queue_p50_vals, 1),
+    distribution_row("ttft_p50", ttft_p50_vals, 1),
+    distribution_row("ttft_p99", ttft_p99_vals, 1),
+    distribution_row("tpot_p50", tpot_p50_vals, 1),
+    distribution_row("service_p50", service_p50_vals, 1),
+    distribution_row("step_last", step_last_vals, 1),
+    distribution_row("step_p50", step_p50_vals, 1),
+    distribution_row("active_mem", active_mem_vals, 1),
+    distribution_row("cache_mem", cache_mem_vals, 1),
+]
+service_distribution_rows = [row for row in service_distribution_rows if "n/a | n/a | n/a | n/a | n/a" not in row]
+token_distribution_rows = [
+    distribution_row("decode_tokens", decode_token_vals),
+    distribution_row("prefill_tokens", prefill_token_vals),
+    distribution_row("tokens_out", tokens_out_vals),
+]
+token_distribution_rows = [row for row in token_distribution_rows if "n/a | n/a | n/a | n/a | n/a" not in row]
 
 lines = [
     "# Service Trace Summary",
@@ -486,6 +566,26 @@ lines = [
     f"- Peak running_batch: `{peak_running_batch if peak_running_batch is not None else 'n/a'}`",
     f"- Peak prefill_queue: `{peak_prefill_queue if peak_prefill_queue is not None else 'n/a'}`",
     f"- Peak kv_util: `{f'{peak_kv:.1f}%' if peak_kv is not None else 'n/a'}`",
+    f"- Prefix hit rate: peak `{fmt_num(peak_prefix_hit, 1, '%')}`, q75 `{fmt_num(q75_prefix_hit, 1, '%')}`",
+    f"- Prefix skip rate peak: `{fmt_num(peak_prefix_skip, 1, '%')}`",
+    f"- Peak mem: `{fmt_num(peak_mem, 1)}` (delta vs before: `{fmt_num(peak_mem_delta, 1)}`)",
+    f"- Server ttft_p99 peak: `{fmt_peak(ttft_p99_vals, 1)}`",
+    f"- KV fetch queue samples >0: `{kv_fetch_q_saturated}/{len(kv_fetch_q_vals)}`",
+    f"- KV fetch waiter samples >0: `{kv_fetch_waiter_saturated}/{len(kv_fetch_waiter_vals)}`",
+    f"- KV store queue samples >0: `{kv_store_q_saturated}/{len(kv_store_q_vals)}`",
+    f"- Tier wait peaks: fetch `{fmt_peak(tier_fetch_wait_vals, 1)}`, store `{fmt_peak(tier_store_wait_vals, 1)}`",
+    "",
+    "## Trace Distributions",
+    "",
+    "| metric | q25 | q50 | q75 | q99 | peak |",
+    "|---|---:|---:|---:|---:|---:|",
+    *(service_distribution_rows or ["| n/a | n/a | n/a | n/a | n/a | n/a |"]),
+    "",
+    "## Token Counters",
+    "",
+    "| metric | q25 | q50 | q75 | q99 | peak |",
+    "|---|---:|---:|---:|---:|---:|",
+    *(token_distribution_rows or ["| n/a | n/a | n/a | n/a | n/a | n/a |"]),
     "",
     "## Before",
     "",
