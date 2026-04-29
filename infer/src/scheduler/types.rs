@@ -105,7 +105,8 @@ impl Default for SchedulerConfig {
             long_prefill_token_threshold: 512,
             prefill_max_requests: None,
             max_waiting_requests: 256,
-            mem_fraction_static: 0.88,
+            // SGLang alignment 2026-04-29
+            mem_fraction_static: 0.85,
             pre_model_free_bytes: None,
             min_seq_len: 256,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
