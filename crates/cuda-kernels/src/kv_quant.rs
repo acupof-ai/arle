@@ -369,6 +369,69 @@ pub fn decode_attention_fp8(
     Ok(())
 }
 
+// ─── Varlen-Q + FP8 paged KV attention (mixed batch path) ───
+//
+// Generalization of `decode_attention_fp8` to mixed prefill+decode batches.
+// Reads FP8 KV directly from the pool (no bf16 shadow); enables lifting the
+// K2 gate in `infer/src/model/qwen3/forward.rs::supports_mixed_batch` once
+// the kernel is wired into `decode_batch_with_prefill`.
+//
+// HD128 + page_size=16 only for now — same coverage envelope as the qlen=1
+// variant. INT8 follow-up uses the same shape with an extra scales pointer.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_varlen_fp8(
+    ctx: &DeviceContext,
+    q_packed: &HiddenStates,
+    qo_indptr: &CudaSlice<i32>,
+    k_pool_ptr: u64,
+    v_pool_ptr: u64,
+    kv_indptr: &CudaSlice<i32>,
+    kv_indices: &CudaSlice<i32>,
+    last_page_len: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    batch_size: usize,
+    total_q_tokens: usize,
+    causal: bool,
+    sm_scale: f32,
+) -> Result<()> {
+    if batch_size == 0 || total_q_tokens == 0 {
+        return Ok(());
+    }
+
+    let (q_ptr, _gq) = q_packed.data.device_ptr(&ctx.stream);
+    let (qoi_ptr, _gqoi) = qo_indptr.device_ptr(&ctx.stream);
+    let (kvi_ptr, _gkvi) = kv_indptr.device_ptr(&ctx.stream);
+    let (kvx_ptr, _gkvx) = kv_indices.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = last_page_len.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::decode_attention_varlen_fp8_cuda(
+            q_ptr as *const ffi::Half,
+            qoi_ptr as *const i32,
+            k_pool_ptr as *const u8,
+            v_pool_ptr as *const u8,
+            kvi_ptr as *const i32,
+            kvx_ptr as *const i32,
+            lpl_ptr as *const i32,
+            o_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            batch_size as i32,
+            total_q_tokens as i32,
+            causal,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Quantize 1 new token per request from bf16 working buffer → INT8 paged pool.
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_paged_kv_single(

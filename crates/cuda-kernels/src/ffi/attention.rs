@@ -527,6 +527,35 @@ unsafe extern "C" {
         workspace: *mut u8,
         workspace_bytes: usize,
     ) -> CUresult;
+
+    /// Variable-length Q + paged FP8 E4M3 KV attention.
+    ///
+    /// Mirrors `flashinfer_tc_run_layer` but reads FP8 KV directly (no bf16
+    /// shadow). Used by the mixed prefill+decode path when KV format is FP8.
+    /// HD128 + page_size=16 only for now.
+    ///
+    /// Q packing: `[total_q_tokens, num_q_heads * HEAD_DIM]` in bf16, where
+    /// `total_q_tokens = qo_indptr[batch_size]`. Output has the same shape.
+    /// `causal=true` enables FlashAttention causal mask for prefill rows
+    /// (qlen > 1); decode rows (qlen=1) ignore the mask.
+    pub fn decode_attention_varlen_fp8_cuda(
+        q_packed: *const Half,
+        qo_indptr: *const i32,
+        k_pool: *const u8, // FP8 E4M3
+        v_pool: *const u8, // FP8 E4M3
+        kv_indptr: *const i32,
+        kv_indices: *const i32,
+        last_page_len: *const i32,
+        output: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        batch_size: i32,
+        total_q_tokens: i32,
+        causal: bool,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // One AOT-specialized symbol per (num_q_heads, num_kv_heads). The matching
