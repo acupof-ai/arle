@@ -9,6 +9,8 @@ use std::fmt;
 #[cfg(feature = "cuda")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "cuda")]
+use std::sync::mpsc;
+#[cfg(feature = "cuda")]
 use std::thread::JoinHandle;
 
 #[cfg(feature = "cuda")]
@@ -298,15 +300,38 @@ pub fn spawn_scheduler_handle_from_path(
 pub struct SchedulerRuntimeGuard {
     model_id: String,
     thread: Option<JoinHandle<()>>,
+    ready_rx: Option<mpsc::Receiver<()>>,
 }
 
 #[cfg(feature = "cuda")]
 impl SchedulerRuntimeGuard {
-    fn new(model_id: String, thread: JoinHandle<()>) -> Self {
+    fn new(model_id: String, thread: JoinHandle<()>, ready_rx: mpsc::Receiver<()>) -> Self {
         Self {
             model_id,
             thread: Some(thread),
+            ready_rx: Some(ready_rx),
         }
+    }
+
+    pub fn wait_ready(&mut self) -> Result<()> {
+        let Some(ready_rx) = self.ready_rx.take() else {
+            return Ok(());
+        };
+        info!(
+            "Waiting for scheduler warmup before accepting traffic (model={})",
+            self.model_id
+        );
+        ready_rx.recv().with_context(|| {
+            format!(
+                "scheduler exited before warmup completed ({})",
+                self.model_id
+            )
+        })?;
+        info!(
+            "Scheduler warmup complete; HTTP readiness may open (model={})",
+            self.model_id
+        );
+        Ok(())
     }
 
     pub fn wait(mut self) {
@@ -415,13 +440,18 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         kv_cache_dtype,
         kv_pool_format,
     )?;
-    let thread = std::thread::spawn(move || scheduler.run());
-    Ok((handle, SchedulerRuntimeGuard::new(model_id, thread)))
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || scheduler.run_with_ready_signal(ready_tx));
+    Ok((
+        handle,
+        SchedulerRuntimeGuard::new(model_id, thread, ready_rx),
+    ))
 }
 
 #[cfg(all(feature = "cuda", test))]
 mod tests {
     use super::SchedulerRuntimeGuard;
+    use anyhow::Result;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -431,12 +461,30 @@ mod tests {
     fn scheduler_runtime_guard_joins_thread_on_drop() {
         let joined = Arc::new(AtomicBool::new(false));
         let joined_thread = Arc::clone(&joined);
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             joined_thread.store(true, Ordering::SeqCst);
         });
 
-        drop(SchedulerRuntimeGuard::new("test-model".to_string(), thread));
+        drop(SchedulerRuntimeGuard::new(
+            "test-model".to_string(),
+            thread,
+            ready_rx,
+        ));
 
         assert!(joined.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn scheduler_runtime_guard_wait_ready_observes_signal() -> Result<()> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+        });
+        let mut guard = SchedulerRuntimeGuard::new("test-model".to_string(), thread, ready_rx);
+
+        guard.wait_ready()?;
+
+        Ok(())
     }
 }

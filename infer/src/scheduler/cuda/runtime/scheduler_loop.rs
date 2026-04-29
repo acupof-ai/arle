@@ -94,8 +94,22 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     /// Run the scheduler loop. Blocks until all handles are dropped.
-    pub fn run(mut self) {
+    pub fn run(self) {
+        self.run_inner(None);
+    }
+
+    /// Run the scheduler loop and notify the bootstrap path once startup
+    /// warmup has completed. HTTP binds only after this signal, so external
+    /// readiness does not race CUDA graph capture or decode planning.
+    pub fn run_with_ready_signal(self, ready_tx: std::sync::mpsc::Sender<()>) {
+        self.run_inner(Some(ready_tx));
+    }
+
+    fn run_inner(mut self, ready_tx: Option<std::sync::mpsc::Sender<()>>) {
         self.warmup_cuda_graphs();
+        if let Some(ready_tx) = ready_tx {
+            let _ = ready_tx.send(());
+        }
         info!("Scheduler run loop started");
         loop {
             self.drain_request_rx();
