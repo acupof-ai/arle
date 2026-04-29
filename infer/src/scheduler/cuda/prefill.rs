@@ -429,13 +429,6 @@ impl<M: ModelForward> Scheduler<M> {
             max_tokens,
         ) {
             PrefillCompletionAction::Stop => {
-                if let Some(req) = self.request(slot_idx) {
-                    log::warn!(
-                        "Request {}: prefill sampled stop token {} before emitting output",
-                        req.id,
-                        token
-                    );
-                }
                 self.finish_request(slot_idx, FinishReason::Stop);
             }
             PrefillCompletionAction::FinishLength => {

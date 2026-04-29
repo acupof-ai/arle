@@ -760,36 +760,26 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn queue_emit_finish(&mut self, slot_idx: usize, reason: FinishReason) {
-        let Some((request_id, prompt_tokens, generated_tokens, delta_tx, stops, trace_context)) =
+        let Some((request_id, prompt_tokens, completion_tokens, delta_tx, trace_context)) =
             self.request(slot_idx).map(|req| {
                 (
                     req.id,
                     req.prompt_tokens.len(),
-                    req.generated_tokens.clone(),
+                    req.generated_tokens.len(),
                     req.delta_tx.clone(),
-                    req.stops_for_emit_dispatch(),
                     req.trace_context,
                 )
             })
         else {
             return;
         };
-        let completion_tokens = generated_tokens.len();
-        if completion_tokens == 0 {
-            log::warn!(
-                "Request {request_id}: queueing finish with 0 generated tokens reason={:?}",
-                reason
-            );
-        }
         self.emit_tx
             .send(EmitCommand::Finish {
                 request_id,
                 prompt_tokens,
                 completion_tokens,
-                generated_tokens,
                 reason,
                 delta_tx,
-                stops,
                 trace_context,
             })
             .expect("emit worker channel disconnected during finish dispatch");
