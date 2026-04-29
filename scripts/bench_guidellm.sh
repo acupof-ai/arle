@@ -25,6 +25,8 @@
 #                        seconds on 4–8B models.
 #   --concurrencies L    comma-separated concurrency list, e.g. "1,2,4,8".
 #                        Switches profile to `concurrent`.
+#   --data SPEC          override synthetic data spec, e.g.
+#                        prompt_tokens=32,...,output_tokens=16,...
 #   --profile TYPE       override profile (sweep|concurrent|synchronous|…).
 #   --max-seconds N      override per-benchmark duration.
 #   --warmup N           run guidellm's warmup phase (seconds or 0 < f < 1).
@@ -117,6 +119,7 @@ Exploration mode (faster, no wins entry):
   --quick                 ~4-min preset: profile=concurrent rate=1,2,4,8
                           data=512-in/128-out max-seconds=60 warmup=5
   --concurrencies LIST    e.g. "1,2,4,8" (switches profile to concurrent)
+  --data SPEC             override synthetic data spec; exploration mode only
   --profile TYPE          sweep|concurrent|synchronous|throughput|…
   --max-seconds N         override per-benchmark duration
   --warmup N              seconds (int >= 1) or fraction (0 < f < 1)
@@ -165,6 +168,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { echo "error: --profile requires a value" >&2; exit 2; }
             EXPLORATION_MODE=true
             PROFILE="$2"; shift 2 ;;
+        --data)
+            [[ $# -ge 2 ]] || { echo "error: --data requires a value" >&2; exit 2; }
+            EXPLORATION_MODE=true
+            DATA="$2"; shift 2 ;;
         --max-seconds)
             [[ $# -ge 2 ]] || { echo "error: --max-seconds requires a value" >&2; exit 2; }
             EXPLORATION_MODE=true
