@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in &lines {
             let parsed: serde_json::Value = serde_json::from_str(line).expect("valid json");
-            assert_eq!(parsed["schema_version"], 1);
+            assert_eq!(parsed["schema_version"], 2);
             assert_eq!(parsed["model_id"], "fake-model");
             assert_eq!(parsed["backend"], "metal");
             assert_eq!(parsed["sub_turns"][0]["prompt_text"], "PROMPT");
@@ -391,7 +391,7 @@ mod tests {
         let lines: Vec<&str> = body.split_terminator('\n').collect();
         assert_eq!(lines.len(), 1, "expected exactly one JSONL record");
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("valid json");
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["schema_version"], 2);
         assert_eq!(parsed["result"]["terminal_state"], "stop");
         assert_eq!(parsed["model_id"], "fake-model");
         assert_eq!(parsed["backend"], "fake-backend");
@@ -445,7 +445,7 @@ mod tests {
             }),
             "mask elements must be 0 or 1"
         );
-        // schema_version is 1 (i32) — already asserted above; this also
+        // schema_version is 2 (i32) — already asserted above; this also
         // pins the field's name as a smoke for casual schema rename.
         assert!(parsed.get("schema_version").is_some());
     }

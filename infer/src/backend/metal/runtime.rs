@@ -550,8 +550,17 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
 
     let (tx, rx) = mpsc::unbounded_channel();
     let waiting_count = Arc::new(AtomicUsize::new(0));
-    let handle =
+    // Forward the loaded tokenizer through the SchedulerHandle so the
+    // server_engine layer's `tokenize()` (used by the v2 trajectory
+    // exporter to mask tool tokens) actually returns IDs on Metal.
+    // Without this, `RequestHandle::tokenizer_clone` returned None →
+    // every Metal agent turn silently downgraded to `tokens: null`.
+    // (codex Phase-2 P1)
+    let mut handle =
         SchedulerHandle::with_shared_waiting_count(tx, &model_id, max_waiting, waiting_count);
+    if let Some(tokenizer) = backend.tokenizer.as_ref() {
+        handle = handle.with_tokenizer(tokenizer.clone());
+    }
 
     let runtime_handle = handle.clone();
     std::thread::spawn(move || {
