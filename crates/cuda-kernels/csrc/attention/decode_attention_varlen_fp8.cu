@@ -16,7 +16,7 @@
 // inline as we read the pool. The pool layout is the same NHD page layout
 // the rest of the FP8 path uses:
 //
-//     k_pool / v_pool: __nv_fp8_e4m3 [max_pages, num_kv_heads, page_size, HEAD_DIM]
+//     k_pool / v_pool: __nv_fp8_e4m3 [max_pages, page_size, num_kv_heads, HEAD_DIM] (NHD)
 //     stride_page = num_kv_heads * page_size * HEAD_DIM
 //
 // Indexing helpers:
@@ -78,7 +78,7 @@ template <int HEAD_DIM, bool CAUSAL>
 __global__ void decode_attention_varlen_fp8_kernel(
     const __nv_bfloat16* __restrict__ Q,            // [total_q_tokens, num_q_heads * HEAD_DIM]
     const int* __restrict__ qo_indptr,              // [batch_size + 1]
-    const __nv_fp8_e4m3* __restrict__ K_pool,       // [max_pages, num_kv_heads, page_size, HEAD_DIM]
+    const __nv_fp8_e4m3* __restrict__ K_pool,       // [max_pages, page_size, num_kv_heads, HEAD_DIM] (NHD)
     const __nv_fp8_e4m3* __restrict__ V_pool,
     const int* __restrict__ kv_indptr,              // [batch_size + 1]
     const int* __restrict__ kv_indices,             // [total_pages]
@@ -182,20 +182,26 @@ __global__ void decode_attention_varlen_fp8_kernel(
 
     // Stream every KV page assigned to this sequence; warps split tokens within
     // a page (warp-stride loop, same shape as the qlen=1 FP8 kernel).
-    int stride_page = num_kv_heads * kPageSize * HEAD_DIM;
+    //
+    // Pool layout (NHD, matches `quantize_scatter_kv_fp8_range` writers and
+    // the qlen=1 `decode_attention_fp8_partial_kernel` readers):
+    //   K_pool[max_pages, page_size, num_kv_heads, HEAD_DIM]
+    //   addr(page, token, head, d) =
+    //     page * (page_size * kv_dim) + token * kv_dim + head * HEAD_DIM + d
+    // where kv_dim = num_kv_heads * HEAD_DIM. Codex P1 (2026-04-29):
+    // earlier draft used HND `[page][head][token][HEAD_DIM]` which mismatches
+    // the writer side and produced wrong attention for any (token>0,head>0).
+    int kv_dim = num_kv_heads * HEAD_DIM;
+    int stride_page = kPageSize * kv_dim;
     int kv_pos_running = 0;  // global kv position cursor across pages
     for (int p = 0; p < num_kv_pages; p++) {
         int phys_page = kv_indices[kv_pages_start + p];
         int page_tokens = (p == num_kv_pages - 1) ? kv_last_page_len_v : kPageSize;
-        // Pointer to this page's KV-head slice: NHD layout
-        //   pool_base = phys_page * stride_page
-        //             + kv_head  * page_size * HEAD_DIM
-        const __nv_fp8_e4m3* k_page_base =
-            K_pool + (size_t)phys_page * stride_page
-                   + (size_t)kv_head   * kPageSize * HEAD_DIM;
-        const __nv_fp8_e4m3* v_page_base =
-            V_pool + (size_t)phys_page * stride_page
-                   + (size_t)kv_head   * kPageSize * HEAD_DIM;
+        // Pointer to this page's start (all heads, all tokens). Indexed
+        // per-token below as `t * kv_dim + kv_head * HEAD_DIM + d`.
+        const __nv_fp8_e4m3* k_page_base = K_pool + (size_t)phys_page * stride_page;
+        const __nv_fp8_e4m3* v_page_base = V_pool + (size_t)phys_page * stride_page;
+        int head_off = kv_head * HEAD_DIM;
 
         for (int t = warp_id; t < page_tokens; t += VLF8_NUM_WARPS) {
             int kv_pos = kv_pos_running + t;
@@ -208,11 +214,12 @@ __global__ void decode_attention_varlen_fp8_kernel(
                 keep = (kv_pos <= causal_limit);
             }
 
+            int row_off = t * kv_dim + head_off;
             float qk = 0.0f;
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float k_val = static_cast<float>(k_page_base[t * HEAD_DIM + d]);
+                float k_val = static_cast<float>(k_page_base[row_off + d]);
                 qk += q_reg[i] * k_val;
             }
             qk = vlf8_warp_reduce_sum(qk);
@@ -231,7 +238,7 @@ __global__ void decode_attention_varlen_fp8_kernel(
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float v_val = static_cast<float>(v_page_base[t * HEAD_DIM + d]);
+                float v_val = static_cast<float>(v_page_base[row_off + d]);
                 o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
             }
             m_local = m_new;
