@@ -595,7 +595,7 @@ mod tests {
         let mut cfg = SchedulerConfig::runtime_defaults(8);
         cfg.resolve_runtime_envelope(RuntimeEnvelopeOverrides::default(), 22 * GIB);
         assert_eq!(cfg.chunked_prefill_size, 2048);
-        assert_eq!(cfg.max_prefill_tokens, 2048);
+        assert_eq!(cfg.max_prefill_tokens, cfg.max_num_batched_tokens);
         assert_eq!(cfg.long_prefill_token_threshold, 2048);
     }
 
