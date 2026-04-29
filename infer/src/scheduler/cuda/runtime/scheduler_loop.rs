@@ -114,7 +114,7 @@ impl<M: ModelForward> Scheduler<M> {
             // so this iteration's intake/admission work can overlap the
             // previous iteration's GPU compute. The sync points live in the
             // corresponding readback/completion calls.
-            self.step();
+            self.step(assign_us);
             let step_us = step_t.elapsed().as_micros();
 
             let clean_t = std::time::Instant::now();

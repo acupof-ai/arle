@@ -417,6 +417,47 @@ impl ServerMetrics {
         )
         .unwrap();
 
+        if let Some((
+            phase_admission_us,
+            phase_prefill_us,
+            phase_decode_us,
+            phase_emit_us,
+            phase_total_us,
+        )) = self.scheduler_step_phase_us()
+        {
+            for (name, help, value) in [
+                (
+                    "infer_scheduler_step_phase_admission_microseconds",
+                    "EMA scheduler tick admission phase duration.",
+                    phase_admission_us,
+                ),
+                (
+                    "infer_scheduler_step_phase_prefill_microseconds",
+                    "EMA scheduler tick prefill phase duration.",
+                    phase_prefill_us,
+                ),
+                (
+                    "infer_scheduler_step_phase_decode_microseconds",
+                    "EMA scheduler tick decode phase duration.",
+                    phase_decode_us,
+                ),
+                (
+                    "infer_scheduler_step_phase_emit_microseconds",
+                    "EMA scheduler tick emit phase duration.",
+                    phase_emit_us,
+                ),
+                (
+                    "infer_scheduler_step_phase_total_microseconds",
+                    "EMA scheduler tick total duration.",
+                    phase_total_us,
+                ),
+            ] {
+                writeln!(out, "# HELP {name} {help}").unwrap();
+                writeln!(out, "# TYPE {name} gauge").unwrap();
+                writeln!(out, "{name}{{{labels}}} {value}").unwrap();
+            }
+        }
+
         out.push_str("# HELP infer_kv_coordinator_queue_capacity Coordinator queue capacity shared by staged KV fetch/store work.\n");
         out.push_str("# TYPE infer_kv_coordinator_queue_capacity gauge\n");
         writeln!(
@@ -658,6 +699,15 @@ impl ServerMetrics {
             self.inner.memory_peak_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
         let cache_mb =
             self.inner.memory_cache_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+        let phase_suffix = self.scheduler_step_phase_us().map_or_else(
+            || " step_phase_us=unavailable".to_string(),
+            |(admission_us, prefill_us, decode_us, emit_us, total_us)| {
+                format!(
+                    " step_phase_us=adm:{},prefill:{},decode:{},emit:{},total:{}",
+                    admission_us, prefill_us, decode_us, emit_us, total_us
+                )
+            },
+        );
 
         let dflash_blocks = self.inner.dflash_blocks_total.load(Ordering::Relaxed);
         let dflash_suffix = if dflash_blocks > 0 {
@@ -727,7 +777,7 @@ impl ServerMetrics {
         };
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -742,6 +792,7 @@ impl ServerMetrics {
             self.tokens_generated_total(),
             self.scheduler_step_last_seconds() * 1000.0,
             step_p50,
+            phase_suffix,
             self.tier_fetch_wait_seconds() * 1000.0,
             self.tier_store_wait_seconds() * 1000.0,
             self.kv_gpu_utilization() * 100.0,
