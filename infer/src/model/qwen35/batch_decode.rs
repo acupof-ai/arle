@@ -329,11 +329,14 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
     ) -> Result<()> {
         // Only BF16 full-attention layers run through FlashInfer HD256.
         // FP8/INT8/TurboQuant decode uses our quantized kernels instead.
-        // FlashInfer plans once per forward; TileLang is plan-less so the
-        // plan_hd256 call is cfg-gated. The metadata uploads (positions,
-        // kv_indptr, kv_indices, kv_last_page_len, qo_indptr) above in
-        // `update_metadata` are needed by both paths and stay unconditional.
-        #[cfg(not(feature = "tilelang-attn"))]
+        // FlashInfer plans once per forward; the TileLang HD256 decode kernel
+        // is plan-less, so this gate must match the actual decode-kernel
+        // selector. The broader `tilelang-attn` feature only covers HD128
+        // prefill/TC-decode paths and still needs FlashInfer's HD256 plan.
+        // Metadata uploads (positions, kv_indptr, kv_indices,
+        // kv_last_page_len, qo_indptr) above in `update_metadata` are needed
+        // by both paths and stay unconditional.
+        #[cfg(not(feature = "tilelang-decode-hd256"))]
         if kv_format == KVFormat::BF16 {
             self.metadata.plan_hd256(
                 ctx,
@@ -344,7 +347,7 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
                 head_dim,
             )?;
         }
-        #[cfg(feature = "tilelang-attn")]
+        #[cfg(feature = "tilelang-decode-hd256")]
         {
             let _ = (
                 ctx,
