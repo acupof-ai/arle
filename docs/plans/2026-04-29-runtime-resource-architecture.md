@@ -112,20 +112,72 @@ guard is only released after readback consumes it).
 
 ---
 
-## Area B — Single capacity-budget admission
+## Area B — Single capacity-budget admission with **lazy reservation**
+
+### Critical principle (added 2026-04-29 per user feedback)
+
+**Reserve at use-time, not at admission-time.** A request entering the
+queue should NOT pre-claim its full
+`(prompt_tokens + max_tokens) × bytes_per_token` of KV pool. That's
+the bug today: every admitted request reserves its worst-case max-ISL
+upfront, so 16 admitted requests claim 16 × 4352 × bytes_per_token
+even though most are sitting idle waiting for their prefill turn.
+This wastes pool, blocks would-be admittees, and is the source of
+the "tune `chunked_prefill_size` to avoid OOM" workaround in the
+2026-04-29 KV-quant matrix wins entry — which the user correctly
+flagged as **NOT** a chunked-prefill issue, it's an
+eager-reservation issue.
+
+The right model:
+
+- **Admission** checks only "is there a slot + can the next *step*
+  fit?" — a small immediate cost, not the full lifetime cost.
+- **Per-step reservation** grows the request's KV claim only as
+  the step actually appends tokens. Decode reserves +1 token's
+  worth; chunked prefill reserves +chunk_size's worth.
+- **Backpressure** at step-time: if the next step's reservation
+  would exceed the pool, the scheduler defers (admits another
+  decode-only step from a different request, or stalls and waits
+  for a finished request to free pages).
+- **Hard 503** only when even a *minimum-step* admission would
+  OOM the pool — i.e., the system is genuinely overloaded.
+
+This is exactly SGLang's PagedAttention model: pages are appended
+on demand by `alloc_tokens` per step, never pre-claimed for the
+remaining max-tokens.
 
 ### Current state
 
-Admission only checks slot availability (`scheduler_loop.rs:185-263`)
-and per-step prefill page budget (`PrefillBudget::from_scheduler`,
-`execution.rs:81-117`).  `runtime_workspace =
-model.scheduler_runtime_workspace_bytes(...)` is computed once at boot
-(`construction.rs:135-143`), warned about if it exceeds headroom
-(`construction.rs:158-167`), then never re-checked.  Mixed workspace,
-recurrent state, and FlashInfer plan allocs happen inside `forward_*`
-calls and can OOM.  `submit` returns 503 only on the bounded waiting
-queue (`max_waiting_requests`, `types.rs:107`,
-`http_server/handlers.rs:247-252`).
+Admission **eagerly reserves** the full ISL footprint at admit-time
+(`scheduler_loop.rs:216-222`):
+
+```rust
+admission_budget.reserve_target(estimated_request_target(
+    slot_idx,
+    req.prompt_tokens.len(),
+    req.max_tokens,           // ← full output cap pre-claimed
+    req.reusable_prefix_len,
+));
+```
+
+and again in `can_reserve_full_isl` (`admission.rs:42-53`) which
+gates new admits on the FULL prompt+max_tokens fitting RIGHT NOW.
+This is the "Reserve at admission" model the user is asking us to
+abandon.
+
+Other state:
+
+- Slot availability check (`scheduler_loop.rs:185-263`).
+- Per-step prefill page budget (`PrefillBudget::from_scheduler`,
+  `execution.rs:81-117`).
+- `runtime_workspace` computed once at boot
+  (`construction.rs:135-143`), warned if exceeds headroom
+  (`construction.rs:158-167`), never re-checked.
+- Mixed workspace, recurrent state, and FlashInfer plan allocs
+  happen inside `forward_*` calls and can OOM.
+- `submit` returns 503 only on bounded waiting queue
+  (`max_waiting_requests`, `types.rs:107`,
+  `http_server/handlers.rs:247-252`).
 
 ### Proposed design
 
@@ -172,18 +224,35 @@ logged once.
 
 ### Migration order
 
-1. **B1.** Add the two trait methods + Qwen3.5 implementation.
+1. **B0.** Replace `can_reserve_full_isl` (eager) with
+   `can_admit_minimum_step(prompt_tokens, prefix_len)` (lazy).
+   The minimum step for a new admit is its first prefill chunk
+   (`min(chunked_prefill_size, prompt_tokens − prefix_len)`).
+   Drops the `max_tokens` arg entirely from the admission gate.
+   Closes the eager-reservation bug independently of A/B/C.
+2. **B1.** Add the two trait methods + Qwen3.5 implementation.
    Independent.
-2. **B2.** Construct `GpuCapacityBudget` in
+3. **B2.** Construct `GpuCapacityBudget` in
    `Scheduler::with_config` from existing
    `construction.rs:135-167` numbers.
-3. **B3.** Wire `try_reserve` into `assign_slots`; refunds in
-   `RequestResources::Drop` (depends on A2).
-4. **B4.** `would_admit` on the handle; gate `submit_request` for 503
-   (depends on B3).
+4. **B3.** Wire per-step `try_reserve(step_delta)` into the
+   step planner (`execution.rs::plan_step`); refunds in
+   `RequestResources::Drop` (depends on A2). Each step's reservation
+   is `Σ(prefill_chunk_tokens) + Σ(decode_step_tokens) +
+   Σ(workspace_for_active_kernels)` — concrete and small, not
+   speculative.
+5. **B4.** `would_admit` on the handle; gate `submit_request` for
+   503 only when even `can_admit_minimum_step` fails (depends on
+   B0 + B3).
 
-B1+B2 ship first; B3 shifts behavior — gate via the bench step from
-area D before promotion.
+**B0 alone closes the immediate "tune chunked_prefill_size to avoid
+OOM" workaround.** Once a new admit reserves only its first chunk
+instead of full max-ISL, 16 admits cost ~`16 × chunked_prefill_size
+× bytes_per_token` upfront (vs ~`16 × 4352 × bytes_per_token`
+today), an 8.5× drop.
+
+B1+B2 ship next as plumbing; B3 shifts the per-step semantics — gate
+via the bench step from area D before promotion.
 
 ### Tests
 
