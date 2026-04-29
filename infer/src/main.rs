@@ -324,7 +324,7 @@ async fn main() {
                 .unwrap_or_default()
         )
     });
-    let (handle, scheduler_runtime) = scheduler.expect("scheduler pair must exist");
+    let (handle, mut scheduler_runtime) = scheduler.expect("scheduler pair must exist");
 
     info!(
         "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={} ({})",
@@ -347,6 +347,9 @@ async fn main() {
         start.elapsed().as_millis(),
         handle.model_id()
     );
+    scheduler_runtime
+        .wait_ready()
+        .unwrap_or_else(|err| panic!("scheduler warmup failed: {err}"));
 
     let train_control_target = args
         .train_control_url
