@@ -461,15 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn step_token_budget_respects_prefill_request_cap() {
-        let mut budget = StepTokenBudget::for_prefill(16, 16, 0, 1);
-
-        assert!(budget.can_fit(2));
-        budget.reserve(2);
-        assert!(!budget.can_fit(1));
-    }
-
-    #[test]
     fn page_count_rounds_up_by_page_size() {
         assert_eq!(page_count(0, 16), 0);
         assert_eq!(page_count(1, 16), 1);

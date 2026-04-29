@@ -98,16 +98,7 @@ impl PrefillBudget {
                 scheduler.config.max_num_batched_tokens,
                 scheduler.config.max_prefill_tokens,
                 decode_slots.len(),
-                scheduler
-                    .config
-                    .prefill_max_requests
-                    .unwrap_or(usize::MAX)
-                    .min(
-                        scheduler
-                            .model
-                            .max_concurrent_prefill_requests()
-                            .unwrap_or(usize::MAX),
-                    ),
+                scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
             ),
             long_prefill_token_threshold: scheduler.config.long_prefill_token_threshold,
             decode_active: !decode_slots.is_empty(),

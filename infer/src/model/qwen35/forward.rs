@@ -9,8 +9,8 @@ use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
-    GenerationState, ModelForward, PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget,
-    decode_metadata_page_capacity, prepare_paged_prefill_batch,
+    GenerationState, ModelForward, PrefillBatchRequest, decode_metadata_page_capacity,
+    prepare_paged_prefill_batch,
 };
 use crate::ops;
 use crate::sampler::SamplingParams;
@@ -233,137 +233,6 @@ impl ModelForward for Qwen35Model {
         _pool: &PagedKVPool,
     ) -> Result<Self::PrefillContext> {
         Ok(())
-    }
-
-    fn scheduler_runtime_workspace_bytes(&self, budget: SchedulerRuntimeWorkspaceBudget) -> usize {
-        let max_batch_size = budget.max_batch_size.max(1);
-        let prefill_tokens = budget.prefill_tokens.max(1);
-        let page_size = budget.kv_pool_format.default_page_size().max(1);
-        let max_seq_len = budget.max_seq_len;
-        let c = &self.config;
-        let q_proj_dim = c.full_attn_q_proj_dim();
-        let q_dim = c.full_attn_q_dim();
-        let kv_dim = c.full_attn_kv_dim();
-        let qkv_dim = c.linear_attn_qkv_dim();
-        let z_dim = c.linear_attn_z_dim();
-        let b_dim = c.linear_num_value_heads;
-        let num_linear_layers = c.num_hidden_layers - c.num_full_attention_layers();
-        let fallback_max_total_pages =
-            max_batch_size.saturating_mul(prefill_tokens.div_ceil(page_size).max(1));
-        let metadata_max_pages = decode_metadata_page_capacity(
-            max_batch_size,
-            max_seq_len,
-            page_size,
-            fallback_max_total_pages,
-        );
-
-        let bf16 = std::mem::size_of::<half::bf16>();
-        let f32_bytes = std::mem::size_of::<f32>();
-        let i32_bytes = std::mem::size_of::<i32>();
-        let u64_bytes = std::mem::size_of::<u64>();
-        let hidden = c.hidden_size;
-        let inter = c.intermediate_size;
-
-        let decode_hidden_dims = 6usize
-            .saturating_mul(hidden)
-            .saturating_add(q_proj_dim)
-            .saturating_add(4usize.saturating_mul(q_dim))
-            .saturating_add(2usize.saturating_mul(kv_dim))
-            .saturating_add(2usize.saturating_mul(qkv_dim))
-            .saturating_add(3usize.saturating_mul(z_dim))
-            .saturating_add(2usize.saturating_mul(b_dim))
-            .saturating_add(3usize.saturating_mul(inter));
-        let decode_context = decode_hidden_dims
-            .saturating_mul(max_batch_size)
-            .saturating_mul(bf16)
-            .saturating_add(
-                num_linear_layers
-                    .saturating_mul(2)
-                    .saturating_mul(max_batch_size)
-                    .saturating_mul(u64_bytes),
-            )
-            .saturating_add(
-                cuda_kernels::flashinfer::FlashInferDecodeMetadata::device_bytes(
-                    max_batch_size,
-                    metadata_max_pages,
-                    c.num_attention_heads,
-                ),
-            )
-            .saturating_add(max_batch_size.saturating_mul(4).saturating_mul(i32_bytes))
-            .saturating_add(max_batch_size.saturating_mul(f32_bytes));
-
-        let prefill_hidden_dims = 6usize
-            .saturating_mul(hidden)
-            .saturating_add(q_proj_dim)
-            .saturating_add(2usize.saturating_mul(q_dim))
-            .saturating_add(2usize.saturating_mul(kv_dim))
-            .saturating_add(2usize.saturating_mul(qkv_dim))
-            .saturating_add(3usize.saturating_mul(z_dim))
-            .saturating_add(2usize.saturating_mul(b_dim))
-            .saturating_add(3usize.saturating_mul(inter));
-        let prefill_core = prefill_hidden_dims
-            .saturating_mul(prefill_tokens)
-            .saturating_mul(bf16)
-            .saturating_add(3usize.saturating_mul(hidden).saturating_mul(bf16))
-            .saturating_add(c.vocab_size.saturating_mul(bf16));
-
-        let num_chunks = prefill_tokens
-            .div_ceil(super::prefill_buffers::GdrChunkwiseScratch35::CHUNK_SIZE)
-            .max(1);
-        let gdr_scratch = 2usize
-            .saturating_mul(prefill_tokens)
-            .saturating_mul(b_dim)
-            .saturating_mul(f32_bytes)
-            .saturating_add(
-                3usize
-                    .saturating_mul(prefill_tokens)
-                    .saturating_mul(z_dim)
-                    .saturating_mul(bf16),
-            )
-            .saturating_add(
-                prefill_tokens
-                    .saturating_mul(b_dim)
-                    .saturating_mul(super::prefill_buffers::GdrChunkwiseScratch35::CHUNK_SIZE)
-                    .saturating_mul(f32_bytes + bf16),
-            )
-            .saturating_add(
-                num_chunks
-                    .saturating_mul(b_dim)
-                    .saturating_mul(c.linear_value_head_dim)
-                    .saturating_mul(c.linear_key_head_dim)
-                    .saturating_mul(f32_bytes),
-            );
-        let prefill_metadata = prefill_tokens
-            .saturating_mul(i32_bytes)
-            .saturating_add(
-                prefill_tokens
-                    .div_ceil(page_size)
-                    .max(1)
-                    .saturating_mul(i32_bytes),
-            )
-            .saturating_add(
-                (max_batch_size + 1)
-                    .saturating_mul(2)
-                    .saturating_mul(i32_bytes),
-            )
-            .saturating_add(max_batch_size.saturating_mul(2).saturating_mul(i32_bytes));
-        let prefill_plan = cuda_kernels::flashinfer::FlashInferWorkspace::device_bytes(
-            prefill_tokens.max(4096),
-            c.num_attention_heads,
-            cuda_kernels::flashinfer::FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
-        );
-        let prefill_workspace = prefill_core
-            .saturating_add(gdr_scratch)
-            .saturating_add(prefill_metadata)
-            .saturating_add(prefill_plan);
-
-        decode_context
-            .saturating_add(prefill_workspace)
-            .saturating_add(256 * 1024 * 1024)
-    }
-
-    fn max_concurrent_prefill_requests(&self) -> Option<usize> {
-        Some(1)
     }
 
     fn kv_cache_bytes_per_token(&self) -> usize {
