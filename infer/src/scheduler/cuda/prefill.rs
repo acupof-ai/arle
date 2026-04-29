@@ -5,6 +5,23 @@ use crate::sampler::SamplingParams;
 
 use super::execution::PrefillCandidate;
 
+/// How long to gate new prefill admits after a workspace OOM. Long enough
+/// for the FlashInfer plan + activation buffers from the failed batch to
+/// drop and for in-flight decode rows to free their growth reservations.
+const PREFILL_OOM_COOLDOWN_MS: u64 = 5_000;
+
+/// Recognise the OOM signature surfaced by `cudarc` / FlashInfer through
+/// `anyhow`. Matches both `DriverError(CUDA_ERROR_OUT_OF_MEMORY, ...)` and
+/// the bare "out of memory" string the kernel-side allocator emits.
+fn prefill_error_is_oom(err: &anyhow::Error) -> bool {
+    let needle_lower = "out of memory";
+    let needle_upper = "OUT_OF_MEMORY";
+    err.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains(needle_upper) || text.to_ascii_lowercase().contains(needle_lower)
+    })
+}
+
 fn is_full_prompt_reuse_hit(prompt_len: usize, prefix_len: usize) -> bool {
     prefix_len > 0 && prefix_len == prompt_len
 }
@@ -588,6 +605,24 @@ impl<M: ModelForward> Scheduler<M> {
                 .unwrap_or_default();
             error!("Request {}: prefill batch failed: {}", req_id, err);
             self.finish_slot(row.slot_idx);
+        }
+        // K7 (perf-bug-roundup 2026-04-29): a single workspace OOM used to
+        // cascade into every subsequent request OOMing too because admission
+        // kept stacking new prefills. Tag the next few seconds as a cooldown
+        // window; `assign_slots` will serialize new prefill admits during it.
+        if prefill_error_is_oom(err) {
+            let cooldown_for = std::time::Duration::from_millis(PREFILL_OOM_COOLDOWN_MS);
+            let until = std::time::Instant::now() + cooldown_for;
+            self.stats.prefill_oom_cooldown_until = Some(
+                self.stats
+                    .prefill_oom_cooldown_until
+                    .map_or(until, |existing| existing.max(until)),
+            );
+            error!(
+                "Prefill OOM detected — gating new admits for {} ms (rows={})",
+                PREFILL_OOM_COOLDOWN_MS,
+                rows.len(),
+            );
         }
     }
 

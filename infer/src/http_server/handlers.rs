@@ -101,7 +101,7 @@ async fn collect_buffered_response(
         buffered
     };
 
-    tokio::time::timeout(RESPONSE_TIMEOUT, collect)
+    let buffered = tokio::time::timeout(RESPONSE_TIMEOUT, collect)
         .await
         .map_err(|_| {
             error!(
@@ -109,7 +109,25 @@ async fn collect_buffered_response(
                 RESPONSE_TIMEOUT.as_secs()
             );
             ApiError::timeout(RESPONSE_TIMEOUT.as_secs())
-        })
+        })?;
+
+    // Channel closed without a terminal delta — the scheduler aborted this
+    // request (e.g. prefill OOM, slot teardown). Returning the buffered
+    // (empty) body as a 200 silently swallows the error and confuses
+    // clients (see K7 in docs/projects/2026-04-29-perf-bug-roundup.md);
+    // surface a 503 instead so callers retry.
+    if !buffered.terminal_seen {
+        warn!(
+            "{request_kind} channel closed without finish_reason ({} completion tokens, {} bytes text); returning 503",
+            buffered.usage.completion_tokens,
+            buffered.text.len(),
+        );
+        return Err(ApiError::service_unavailable(
+            "Inference request aborted before completion (server overloaded or out of memory). Please retry.",
+        ));
+    }
+
+    Ok(buffered)
 }
 
 fn parse_json_request<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
