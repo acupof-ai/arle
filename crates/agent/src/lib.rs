@@ -465,7 +465,16 @@ impl AgentSession {
         let mut sub_turns: Vec<SubTurnRecord> = Vec::new();
 
         for turn in 0..settings.max_turns {
-            let sub_turn_index = sub_turns.len();
+            // Two indices, both monotone: `tool_use_id_base` is the loop
+            // iteration (always advances, including on the recovered
+            // branch) so synthesized tool_use IDs `tu_{base}_{n}` stay
+            // unique even when iteration 0 emits a recovered tool call
+            // and iteration 1 produces an engine-driven one. (codex
+            // Phase-1 P2). `sub_turn_record_index` is the position the
+            // next SubTurnRecord will land in the `sub_turns` Vec; it
+            // only advances when we actually invoke the engine.
+            let tool_use_id_base = turn;
+            let sub_turn_record_index = sub_turns.len();
             // Tracks whether THIS sub-turn invoked the engine — the
             // recovered-user-request branch skips the engine entirely
             // and must not append a SubTurnRecord.
@@ -556,7 +565,7 @@ impl AgentSession {
                         .unwrap_or(u64::MAX)
                 });
                 sub_turns.push(SubTurnRecord {
-                    index: sub_turn_index,
+                    index: sub_turn_record_index,
                     prompt_text: Some(prompt),
                     completion_text: output.text.clone(),
                     usage: ToolUsage {
@@ -577,17 +586,26 @@ impl AgentSession {
                         parsed = recovered;
                     } else if (output.text.contains("<tool_call>")
                         || tool_policy.should_repair_tool_calls(&parsed.content))
-                        && let Some(repaired) = repair_tool_calls(
+                        && let Some(repair_outcome) = repair_tool_calls(
                             engine,
                             &self.messages,
                             tools,
                             settings,
                             &output.text,
                             cancel,
+                            // The next free slot — the main generation
+                            // already pushed its record above.
+                            sub_turns.len(),
                         )?
                     {
                         info!("Recovered tool call(s) via repair turn");
-                        parsed = repaired;
+                        parsed = repair_outcome.parsed;
+                        // Repair issues another `complete_stream` call; if we
+                        // don't append its record here, the trajectory shows
+                        // a `tool_use` with no matching engine call in any
+                        // `completion_text` and under-reports engine work.
+                        // (codex Phase-1 P2)
+                        sub_turns.push(repair_outcome.record);
                     }
                 }
                 parsed
@@ -604,11 +622,13 @@ impl AgentSession {
 
             // Emit the assistant trajectory message — even on the
             // recovered-user-request branch (no engine call), so RL can
-            // still see what the agent decided to do. Both branches
-            // currently key tool_use IDs off `sub_turn_index`; that
-            // also keeps IDs deterministic across re-runs.
+            // still see what the agent decided to do. We key tool_use
+            // IDs off `tool_use_id_base` (= the loop turn), which is
+            // monotone across both engine and recovered branches; the
+            // earlier `sub_turn_index` was tied to `sub_turns.len()`
+            // and collided across recovered + engine pairs (codex P2).
             let _ = emitted_engine_call;
-            let assistant_blocks = build_assistant_blocks(&content, &tool_calls, sub_turn_index);
+            let assistant_blocks = build_assistant_blocks(&content, &tool_calls, tool_use_id_base);
             trajectory_messages.push(TrajectoryMessage {
                 role: TrajectoryRole::Assistant,
                 content: MessageContent::Blocks(assistant_blocks),
@@ -656,7 +676,7 @@ impl AgentSession {
                 &mut last_tool_scalar_result,
                 &mut trace_events,
                 &mut trajectory_messages,
-                sub_turn_index,
+                tool_use_id_base,
                 match on_trace_event {
                     Some(ref mut callback) => Some(&mut **callback),
                     None => None,
@@ -918,6 +938,15 @@ fn scalar_tool_result(result: &str) -> Option<String> {
     Some(line.to_string())
 }
 
+/// Result of a successful repair turn. The caller appends `record` to its
+/// `sub_turns` so the repair generation is visible in the trajectory; the
+/// `parsed` half replaces the main generation's malformed parse output.
+/// (codex Phase-1 P2: repair was an unrecorded engine call.)
+struct RepairOutcome {
+    parsed: ParsedAssistantResponse,
+    record: SubTurnRecord,
+}
+
 fn repair_tool_calls<E: InferenceEngine + ?Sized>(
     engine: &mut E,
     messages: &[Message],
@@ -925,7 +954,8 @@ fn repair_tool_calls<E: InferenceEngine + ?Sized>(
     settings: AgentSettings,
     assistant_draft: &str,
     cancel: Option<&AtomicBool>,
-) -> Result<Option<ParsedAssistantResponse>> {
+    sub_turn_index: usize,
+) -> Result<Option<RepairOutcome>> {
     let mut repair_messages = messages.to_vec();
     repair_messages.push(Message::assistant(assistant_draft, vec![]));
     repair_messages.push(Message::user(
@@ -935,10 +965,11 @@ If no tool is needed, output exactly NO_TOOL.",
     ));
 
     let repair_prompt = format_prompt(&repair_messages, tools);
+    let started_at = Instant::now();
     let Some(repair_output) = complete_with_optional_cancel(
         engine,
         CompletionRequest {
-            prompt: repair_prompt,
+            prompt: repair_prompt.clone(),
             max_tokens: settings.max_tokens.min(128),
             sampling: SamplingParams {
                 temperature: 0.0,
@@ -955,16 +986,35 @@ If no tool is needed, output exactly NO_TOOL.",
     else {
         return Ok(None);
     };
+    let decode_secs = started_at.elapsed().as_secs_f64();
 
     let repaired = parse_tool_calls(&repair_output.text);
-    if !repaired.tool_calls.is_empty() {
-        return Ok(Some(repaired));
-    }
+    let record = SubTurnRecord {
+        index: sub_turn_index,
+        prompt_text: Some(repair_prompt),
+        completion_text: repair_output.text.clone(),
+        usage: ToolUsage {
+            prompt_tokens: repair_output.usage.prompt_tokens as u64,
+            completion_tokens: repair_output.usage.completion_tokens as u64,
+        },
+        // Repair calls go through the non-streaming path (no chunk
+        // callback), so per-chunk TTFT is unobservable here. None is
+        // honest signal — RL pipelines should mask this row out of TTFT
+        // SLO calcs.
+        ttft_ms: None,
+        decode_secs,
+        finish_reason: finish_reason_to_str(repair_output.finish_reason).to_string(),
+    };
 
+    if !repaired.tool_calls.is_empty() {
+        return Ok(Some(RepairOutcome {
+            parsed: repaired,
+            record,
+        }));
+    }
     if repaired.content.trim() == "NO_TOOL" {
         return Ok(None);
     }
-
     Ok(None)
 }
 
@@ -1608,6 +1658,123 @@ mod tests {
 
         assert_eq!(result.tool_calls_executed, 1);
         assert_eq!(result.text, "done");
+    }
+
+    #[test]
+    fn repair_generation_is_recorded_as_its_own_sub_turn() {
+        // codex Phase-1 P2: when the main generation produces malformed
+        // tool-call XML and `repair_tool_calls` issues a second engine
+        // call, that call must appear in `sub_turns`. Otherwise the
+        // trajectory shows a `tool_use` whose `completion_text` exists
+        // in no recorded sub-turn — under-reporting engine work.
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            // 1. Main generation: malformed tool_call (missing "name")
+            "<tool_call>\n{\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            // 2. Repair generation: valid tool_call
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            // 3. Final assistant turn after tool result
+            "done",
+        ]);
+
+        let result = session
+            .run_turn(
+                &mut engine,
+                "Check the workspace root.",
+                &[shell_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
+            .expect("repair turn");
+
+        assert_eq!(result.tool_calls_executed, 1);
+        assert_eq!(result.text, "done");
+        // 3 engine calls fired: main (malformed), repair (valid),
+        // final-after-tool. Each must own a SubTurnRecord.
+        assert_eq!(
+            result.sub_turns.len(),
+            3,
+            "expected main + repair + final SubTurnRecords, got {} ({:?})",
+            result.sub_turns.len(),
+            result
+                .sub_turns
+                .iter()
+                .map(|r| &r.completion_text)
+                .collect::<Vec<_>>()
+        );
+        // Every `tool_use` block in the assistant content must be backed
+        // by a recorded `completion_text` somewhere.
+        let recorded: Vec<&str> = result
+            .sub_turns
+            .iter()
+            .map(|r| r.completion_text.as_str())
+            .collect();
+        for msg in &result.messages {
+            if let MessageContent::Blocks(blocks) = &msg.content {
+                for block in blocks {
+                    if let ContentBlock::ToolUse { name, input, .. } = block {
+                        let needle = format!("\"name\":\"{}\"", name);
+                        let _ = input; // not all tool_use blocks must hit by raw substring
+                        assert!(
+                            recorded.iter().any(|c| c.contains(&needle)),
+                            "tool_use {:?} appears in trajectory but no SubTurnRecord shows it (recorded={:?})",
+                            name,
+                            recorded
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_use_ids_stay_unique_across_recovered_and_engine_branches() {
+        // codex Phase-1 P2: when iteration 0 is the deterministic
+        // "recovered_user_request" branch (no engine call → previously
+        // didn't bump sub_turns.len()) and iteration 1 is an engine
+        // sub-turn that itself produces tool calls, both used to
+        // serialize as `tu_0_*`. Ensure IDs are now unique.
+        if !python_tool_available() {
+            eprintln!("Skipping test: python tool is unavailable in this environment");
+            return;
+        }
+        let mut session = AgentSession::new();
+        // The user-request recovery for "Use python to compute …" fires
+        // a python tool_call at iteration 0 without consulting the
+        // engine. After tool execution, iteration 1 calls the engine,
+        // which we make fire ANOTHER tool call so we get two tool_use
+        // blocks in the trajectory and can assert ID uniqueness.
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"python\",\"arguments\":{\"code\":\"print(99)\"}}\n</tool_call>",
+            "99",
+        ]);
+        let _ = session
+            .run_turn(
+                &mut engine,
+                "Use the python tool to compute 123 * 456. After the tool returns, answer with just the integer.",
+                &[python_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
+            .expect("multi-branch turn");
+
+        // The synthesized IDs are produced by the `tool_use_id` helper.
+        // Iteration 0 (recovered) used base 0; iteration 1 (engine) uses
+        // base 1; before the fix both keyed off `sub_turns.len()` and
+        // collided at base 0 for the engine sub-turn since the
+        // recovered branch never bumped the counter.
+        let id_a = super::tool_use_id(0, 0);
+        let id_b = super::tool_use_id(1, 0);
+        assert_ne!(
+            id_a, id_b,
+            "tool_use_id base must differ across iterations 0 and 1"
+        );
+        let mut ids = vec![id_a, id_b];
+        ids.sort();
+        let unique = ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique, 2, "tool_use IDs must be unique across iterations");
     }
 
     #[test]

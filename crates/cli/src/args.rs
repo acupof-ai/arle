@@ -43,6 +43,11 @@ pub(crate) enum TracePromptsMode {
     Off,
 }
 
+// `keep_prompts` is only consumed by the trajectory writer, which is
+// itself gated on a backend feature being active. Mirror that gate
+// here so `cargo clippy -p cli -- -D warnings` on the no-backend
+// build doesn't trip on `method never used`. (codex Phase-1 P1)
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl TracePromptsMode {
     pub(crate) fn keep_prompts(self) -> bool {
         matches!(self, Self::On)
