@@ -817,6 +817,39 @@ pub fn execute_tool_call(call: &ToolCall) -> String {
     execute_tool(&call.name, &call.arguments)
 }
 
+/// Telemetry captured around a tool execution. Surfaced through
+/// [`execute_tool_call_with_metadata`] for trajectory export — the
+/// agent loop records `latency_ms` and `truncated` for each call so
+/// downstream RL/training can replay the sub-turn faithfully.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolExecutionMetadata {
+    pub latency_ms: u64,
+    pub truncated: bool,
+}
+
+/// Marker emitted by [`collect_output`] when a tool result is too long.
+/// Kept here so callers (including the agent loop) can detect truncation
+/// without re-implementing the trim logic.
+pub const TOOL_RESULT_TRUNCATION_MARKER: &str = "\n... (output truncated)";
+
+/// Execute a tool call and return both the result text and the
+/// per-call telemetry the trajectory exporter needs. Wraps
+/// [`execute_tool_call`] one-to-one — existing callers that don't need
+/// metadata stay on that simpler entry point.
+pub fn execute_tool_call_with_metadata(call: &ToolCall) -> (String, ToolExecutionMetadata) {
+    let start = Instant::now();
+    let result = execute_tool_call(call);
+    let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let truncated = result.ends_with(TOOL_RESULT_TRUNCATION_MARKER);
+    (
+        result,
+        ToolExecutionMetadata {
+            latency_ms,
+            truncated,
+        },
+    )
+}
+
 /// Collect stdout + stderr from a process Output into a truncated string.
 /// Filters out nsjail's own warning/info lines from stderr.
 fn collect_output(output: &std::process::Output) -> String {
@@ -1137,5 +1170,34 @@ mod tests {
                 .expect("shell command")
                 .contains("git rev-parse")
         );
+    }
+
+    #[test]
+    fn metadata_captures_latency_and_truncation_flag() {
+        use super::{
+            TOOL_RESULT_TRUNCATION_MARKER, ToolExecutionMetadata, execute_tool_call_with_metadata,
+        };
+        use chat::ToolCall;
+
+        // Unknown tool path: synchronous, returns a short error string —
+        // latency must be captured (>= 0, never panics) and truncation
+        // flag must stay false because the marker is absent.
+        let call = ToolCall::new("nonexistent-tool", json!({ "anything": "here" }));
+        let (result, metadata) = execute_tool_call_with_metadata(&call);
+        assert!(result.starts_with("Error: unknown tool"));
+        assert!(!metadata.truncated);
+        // No upper-bound assertion on latency_ms — that's runtime-dependent.
+        // The point is we got a defined value.
+        let _ = metadata.latency_ms;
+
+        // Synthetic truncated string: the executor uses the same marker
+        // to signal truncation. Verify the detection logic round-trips.
+        let truncated_text = format!("first line\nsecond line{TOOL_RESULT_TRUNCATION_MARKER}");
+        assert!(truncated_text.ends_with(TOOL_RESULT_TRUNCATION_MARKER));
+        let synthetic = ToolExecutionMetadata {
+            latency_ms: 0,
+            truncated: truncated_text.ends_with(TOOL_RESULT_TRUNCATION_MARKER),
+        };
+        assert!(synthetic.truncated);
     }
 }

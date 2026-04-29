@@ -38,6 +38,26 @@ fn parse_temperature(value: &str) -> Result<f32, String> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum TracePromptsMode {
+    On,
+    Off,
+}
+
+impl TracePromptsMode {
+    pub(crate) fn keep_prompts(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+fn parse_trace_path(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("trace path must not be empty".to_string());
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum BackendArg {
     Auto,
     Cpu,
@@ -226,6 +246,20 @@ pub(crate) struct Args {
     /// Skip interactive model selection (use auto-discovery)
     #[arg(long, default_value_t = false)]
     pub(crate) non_interactive: bool,
+
+    /// Path to a JSONL file that will receive one trajectory record per
+    /// agent turn (Phase 1 / v1 schema). When unset, no trajectory is
+    /// written. See `docs/projects/agent-trajectory-export.md` for the
+    /// canonical schema.
+    #[arg(long, value_parser = parse_trace_path)]
+    pub(crate) trace: Option<PathBuf>,
+
+    /// Whether to record the full ChatML prompt in each trajectory's
+    /// `sub_turns[].prompt_text`. `off` writes JSON `null` for that
+    /// field — useful when the prompt would dominate trace size or
+    /// leak operator data.
+    #[arg(long, value_enum, default_value_t = TracePromptsMode::On)]
+    pub(crate) trace_prompts: TracePromptsMode,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1369,6 +1403,38 @@ mod tests {
             panic!("expected sft command");
         };
         assert_eq!(sft.model_family, Some(ModelFamilyArg::Qwen35));
+    }
+
+    #[test]
+    fn accepts_trace_with_prompts_off() {
+        let args = Args::try_parse_from([
+            "arle",
+            "--trace",
+            "/tmp/trace.jsonl",
+            "--trace-prompts",
+            "off",
+        ])
+        .expect("trace + trace-prompts should parse");
+        assert_eq!(
+            args.trace.as_deref(),
+            Some(std::path::Path::new("/tmp/trace.jsonl"))
+        );
+        assert_eq!(args.trace_prompts, super::TracePromptsMode::Off);
+    }
+
+    #[test]
+    fn trace_prompts_defaults_to_on() {
+        let args = Args::try_parse_from(["arle"]).expect("default args");
+        assert_eq!(args.trace_prompts, super::TracePromptsMode::On);
+        assert!(args.trace.is_none());
+    }
+
+    #[test]
+    fn rejects_empty_trace_path() {
+        let err = Args::try_parse_from(["arle", "--trace", ""])
+            .err()
+            .expect("empty trace path should be rejected");
+        assert!(err.to_string().contains("trace path must not be empty"));
     }
 
     #[test]

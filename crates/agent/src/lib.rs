@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chat::{
@@ -16,10 +16,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+pub use tools::{TOOL_RESULT_TRUNCATION_MARKER, ToolExecutionMetadata};
+
 pub type Message = ChatMessage;
 
 pub trait ToolExecutor {
     fn execute(&self, tool_call: &ToolCall) -> String;
+
+    /// Execute and surface telemetry. Default impl synthesizes neutral
+    /// metadata (`latency_ms = 0`, `truncated = false`) so existing
+    /// implementations keep compiling unchanged. Production executors
+    /// (e.g. the CLI's [`BuiltinToolExecutor`]) override this to emit
+    /// real timings via `tools::execute_tool_call_with_metadata`.
+    fn execute_with_metadata(&self, tool_call: &ToolCall) -> (String, ToolExecutionMetadata) {
+        let result = self.execute(tool_call);
+        let truncated = result.ends_with(TOOL_RESULT_TRUNCATION_MARKER);
+        (
+            result,
+            ToolExecutionMetadata {
+                latency_ms: 0,
+                truncated,
+            },
+        )
+    }
 }
 
 pub trait ToolPolicy {
@@ -118,6 +137,118 @@ pub struct AgentTurnResult {
     /// a `<tool_call>` block. `None` when no tokens streamed at all
     /// (e.g. the turn was cancelled before generation began).
     pub time_to_first_token: Option<Duration>,
+    /// Anthropic-shaped message log captured for trajectory export. The
+    /// system prompt is excluded; the user message starts each turn,
+    /// followed by assistant blocks (text + tool_use) and tool results.
+    pub messages: Vec<TrajectoryMessage>,
+    /// Per-engine-call breakdown for the turn — one entry per
+    /// `InferenceEngine::complete_stream` invocation. Empty when the
+    /// turn finalised entirely through a deterministic policy hook
+    /// (e.g. `recover_tool_calls_from_user_request`).
+    pub sub_turns: Vec<SubTurnRecord>,
+    /// Why the turn ended. Encodes the four exits documented in
+    /// `docs/projects/agent-trajectory-export.md` so RL can reward
+    /// or penalise specific failure modes (notably `EmptyNoProgress`).
+    pub terminal_state: TerminalState,
+    /// Total wall-clock seconds for the turn, captured from the same
+    /// monotonic anchor as `time_to_first_token`. Surfaced separately
+    /// because the trace writer needs it without re-sampling.
+    pub wall_secs: f64,
+}
+
+/// Schema version for v1 trajectory records. v2 will bump this when token
+/// IDs and `response_mask` are added.
+pub const TRAJECTORY_SCHEMA_VERSION: i32 = 1;
+
+/// Anthropic-shaped trajectory message. User and tool messages carry a
+/// plain string; assistant messages always carry a content-block array
+/// so tool_use entries can be correlated with later tool results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrajectoryMessage {
+    pub role: TrajectoryRole,
+    pub content: MessageContent,
+    /// Set on `role: tool` messages; references the matching assistant
+    /// `tool_use` block by deterministic id (`tu_<sub>_<call>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// Set on `role: tool` messages when the underlying tool result
+    /// was truncated by the executor. Mirrors
+    /// [`ToolExecutionMetadata::truncated`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_truncated: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrajectoryRole {
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubTurnRecord {
+    pub index: usize,
+    /// Full ChatML prompt sent to the engine for this sub-turn. `None`
+    /// when `--trace-prompts off` was set on the CLI; the agent loop
+    /// always populates `Some(_)` and the trace writer rewrites to
+    /// `None` per the operator's preference.
+    pub prompt_text: Option<String>,
+    /// Raw text the engine returned, including any `<tool_call>` XML.
+    pub completion_text: String,
+    pub usage: ToolUsage,
+    /// Per-sub-turn TTFT in milliseconds — measured from the
+    /// `complete_stream` call site to the first non-empty delta.
+    /// `None` when the engine never emitted text (cancelled / errored
+    /// before any chunk).
+    pub ttft_ms: Option<u64>,
+    /// Wall-clock seconds for this sub-turn (entire `complete_stream`
+    /// duration).
+    pub decode_secs: f64,
+    /// Lowercased finish reason (`"stop"` / `"length"`).
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalState {
+    /// `tool_calls.is_empty() && !content.trim().is_empty()` — the
+    /// model produced a final answer.
+    Stop,
+    /// `max_turns` exhausted before the model produced a final answer.
+    MaxTurns,
+    /// `tool_calls.is_empty() && content.trim().is_empty()` — the
+    /// model emitted nothing actionable. Surfaced as a distinct state
+    /// so RL can reward against it.
+    EmptyNoProgress,
+    /// `tool_policy.finalize_after_tool_execution` returned `Some(_)`.
+    PolicyShortCircuit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,8 +437,8 @@ impl AgentSession {
         // caller. Captured here (before any sub-turn fires) so a turn that
         // opens with a `<tool_call>` block — whose visible-text count is
         // zero — still reports a meaningful first-token latency.
-        let turn_started_at = std::time::Instant::now();
-        let mut first_engine_token_at: Option<std::time::Instant> = None;
+        let turn_started_at = Instant::now();
+        let mut first_engine_token_at: Option<Instant> = None;
 
         let mut tool_calls_executed = 0usize;
         let mut prompt_tokens = 0u64;
@@ -322,11 +453,28 @@ impl AgentSession {
             .then(|| tool_policy.recover_tool_calls_from_user_request(user_input, tools))
             .flatten();
 
+        // Trajectory accumulators. The user message is the first entry;
+        // assistant + tool messages are appended as the loop progresses.
+        let mut trajectory_messages: Vec<TrajectoryMessage> = Vec::new();
+        trajectory_messages.push(TrajectoryMessage {
+            role: TrajectoryRole::User,
+            content: MessageContent::Text(user_input.to_string()),
+            tool_use_id: None,
+            result_truncated: None,
+        });
+        let mut sub_turns: Vec<SubTurnRecord> = Vec::new();
+
         for turn in 0..settings.max_turns {
+            let sub_turn_index = sub_turns.len();
+            // Tracks whether THIS sub-turn invoked the engine — the
+            // recovered-user-request branch skips the engine entirely
+            // and must not append a SubTurnRecord.
+            let mut emitted_engine_call = false;
             let parsed = if let Some(parsed) = recovered_user_request.take() {
                 info!("Recovered tool call(s) directly from user request");
                 parsed
             } else {
+                emitted_engine_call = true;
                 let prompt = format_prompt(&self.messages, tools);
                 info!(
                     "Agent turn {}/{}: prompt length = {} chars",
@@ -342,14 +490,22 @@ impl AgentSession {
                 };
 
                 let mut visible_stream = VisibleTextStream::default();
+                let sub_turn_started_at = Instant::now();
+                let mut sub_turn_first_token_at: Option<Instant> = None;
                 // We always need to observe each engine chunk to capture the
                 // engine-token TTFT, even if the caller did not register a
                 // visible-text callback. So `stream_visible_chunk` is now
                 // unconditionally wired into the streaming path; it just
                 // skips the visible-text handoff when no callback is set.
                 let mut stream_visible_chunk = |chunk: &str| {
-                    if !chunk.is_empty() && first_engine_token_at.is_none() {
-                        first_engine_token_at = Some(std::time::Instant::now());
+                    if !chunk.is_empty() {
+                        let now = Instant::now();
+                        if first_engine_token_at.is_none() {
+                            first_engine_token_at = Some(now);
+                        }
+                        if sub_turn_first_token_at.is_none() {
+                            sub_turn_first_token_at = Some(now);
+                        }
                     }
                     let visible = visible_stream.push(chunk);
                     if !visible.is_empty()
@@ -361,7 +517,7 @@ impl AgentSession {
                 let Some(output) = complete_with_optional_cancel(
                     engine,
                     CompletionRequest {
-                        prompt,
+                        prompt: prompt.clone(),
                         max_tokens: turn_max_tokens,
                         sampling: SamplingParams {
                             temperature: settings.temperature,
@@ -393,6 +549,24 @@ impl AgentSession {
                 prompt_tokens = prompt_tokens.saturating_add(output.usage.prompt_tokens as u64);
                 completion_tokens =
                     completion_tokens.saturating_add(output.usage.completion_tokens as u64);
+
+                let decode_secs = sub_turn_started_at.elapsed().as_secs_f64();
+                let ttft_ms = sub_turn_first_token_at.map(|t| {
+                    u64::try_from(t.duration_since(sub_turn_started_at).as_millis())
+                        .unwrap_or(u64::MAX)
+                });
+                sub_turns.push(SubTurnRecord {
+                    index: sub_turn_index,
+                    prompt_text: Some(prompt),
+                    completion_text: output.text.clone(),
+                    usage: ToolUsage {
+                        prompt_tokens: output.usage.prompt_tokens as u64,
+                        completion_tokens: output.usage.completion_tokens as u64,
+                    },
+                    ttft_ms,
+                    decode_secs,
+                    finish_reason: finish_reason_to_str(output.finish_reason).to_string(),
+                });
 
                 let mut parsed = parse_tool_calls(&output.text);
                 if parsed.tool_calls.is_empty() && tool_calls_executed == 0 && !tools.is_empty() {
@@ -428,11 +602,30 @@ impl AgentSession {
             );
             let tool_calls = parsed.tool_calls;
 
+            // Emit the assistant trajectory message — even on the
+            // recovered-user-request branch (no engine call), so RL can
+            // still see what the agent decided to do. Both branches
+            // currently key tool_use IDs off `sub_turn_index`; that
+            // also keeps IDs deterministic across re-runs.
+            let _ = emitted_engine_call;
+            let assistant_blocks = build_assistant_blocks(&content, &tool_calls, sub_turn_index);
+            trajectory_messages.push(TrajectoryMessage {
+                role: TrajectoryRole::Assistant,
+                content: MessageContent::Blocks(assistant_blocks),
+                tool_use_id: None,
+                result_truncated: None,
+            });
+
             self.messages
                 .push(Message::assistant(&content, tool_calls.clone()));
 
             if tool_calls.is_empty() {
                 self.compact_turn_history(turn_start, &content);
+                let terminal_state = if content.trim().is_empty() {
+                    TerminalState::EmptyNoProgress
+                } else {
+                    TerminalState::Stop
+                };
                 return Ok(Some(AgentTurnResult {
                     text: content,
                     tool_calls_executed,
@@ -442,6 +635,10 @@ impl AgentSession {
                     trace_events,
                     time_to_first_token: first_engine_token_at
                         .map(|t| t.duration_since(turn_started_at)),
+                    messages: trajectory_messages,
+                    sub_turns,
+                    terminal_state,
+                    wall_secs: turn_started_at.elapsed().as_secs_f64(),
                 }));
             }
 
@@ -458,6 +655,8 @@ impl AgentSession {
                 &mut last_tool_result,
                 &mut last_tool_scalar_result,
                 &mut trace_events,
+                &mut trajectory_messages,
+                sub_turn_index,
                 match on_trace_event {
                     Some(ref mut callback) => Some(&mut **callback),
                     None => None,
@@ -480,6 +679,10 @@ impl AgentSession {
                     trace_events,
                     time_to_first_token: first_engine_token_at
                         .map(|t| t.duration_since(turn_started_at)),
+                    messages: trajectory_messages,
+                    sub_turns,
+                    terminal_state: TerminalState::PolicyShortCircuit,
+                    wall_secs: turn_started_at.elapsed().as_secs_f64(),
                 }));
             }
         }
@@ -494,6 +697,10 @@ impl AgentSession {
             max_turns_reached: true,
             trace_events,
             time_to_first_token: first_engine_token_at.map(|t| t.duration_since(turn_started_at)),
+            messages: trajectory_messages,
+            sub_turns,
+            terminal_state: TerminalState::MaxTurns,
+            wall_secs: turn_started_at.elapsed().as_secs_f64(),
         }))
     }
 
@@ -611,6 +818,7 @@ impl StoredToolCall {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_tool_calls(
     tool_calls: &[ToolCall],
     tool_executor: &dyn ToolExecutor,
@@ -620,11 +828,13 @@ fn execute_tool_calls(
     last_tool_result: &mut Option<String>,
     last_tool_scalar_result: &mut Option<String>,
     trace_events: &mut Vec<AgentTraceEvent>,
+    trajectory_messages: &mut Vec<TrajectoryMessage>,
+    sub_turn_index: usize,
     mut on_trace_event: Option<&mut dyn FnMut(&AgentTraceEvent)>,
 ) {
-    for tool_call in tool_calls {
+    for (call_index, tool_call) in tool_calls.iter().enumerate() {
         *tool_calls_executed += 1;
-        let result = tool_executor.execute(tool_call);
+        let (result, metadata) = tool_executor.execute_with_metadata(tool_call);
 
         *last_tool_result = Some(result.clone());
         *last_tool_scalar_result = scalar_tool_result(&result);
@@ -640,6 +850,48 @@ fn execute_tool_calls(
             callback(event);
         }
         messages.push(Message::tool_result(&tool_call.name, &result));
+        trajectory_messages.push(TrajectoryMessage {
+            role: TrajectoryRole::Tool,
+            content: MessageContent::Text(result),
+            tool_use_id: Some(tool_use_id(sub_turn_index, call_index)),
+            result_truncated: Some(metadata.truncated),
+        });
+    }
+}
+
+/// Build the deterministic `tu_<sub>_<call>` id used to correlate
+/// assistant `tool_use` blocks with their matching `tool` messages.
+/// Stable across runs given the same input — no UUIDs, no clocks.
+fn tool_use_id(sub_turn_index: usize, call_index: usize) -> String {
+    format!("tu_{sub_turn_index}_{call_index}")
+}
+
+fn build_assistant_blocks(
+    content: &str,
+    tool_calls: &[ToolCall],
+    sub_turn_index: usize,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(1 + tool_calls.len());
+    // Always emit a leading text block — even when empty — so the
+    // schema's "assistant content is always blocks" invariant holds
+    // and downstream consumers don't have to special-case empty text.
+    blocks.push(ContentBlock::Text {
+        text: content.to_string(),
+    });
+    for (call_index, call) in tool_calls.iter().enumerate() {
+        blocks.push(ContentBlock::ToolUse {
+            id: tool_use_id(sub_turn_index, call_index),
+            name: call.name.clone(),
+            input: call.arguments.clone(),
+        });
+    }
+    blocks
+}
+
+fn finish_reason_to_str(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
     }
 }
 
@@ -1414,5 +1666,310 @@ mod tests {
             .expect("empty-output turn");
         assert_eq!(result.text, "");
         assert!(result.time_to_first_token.is_none());
+    }
+
+    // ── Trajectory export (Phase 1 / v1) ─────────────────────────────────
+
+    use super::{
+        ContentBlock, MessageContent, SubTurnRecord, TerminalState, TrajectoryMessage,
+        TrajectoryRole,
+    };
+
+    fn shell_recorder_settings() -> AgentSettings {
+        AgentSettings {
+            max_turns: 2,
+            max_tokens: 128,
+            temperature: 0.0,
+        }
+    }
+
+    /// A tool executor that returns a canned string and never touches the
+    /// real sandbox — used to keep these tests deterministic + offline.
+    struct StubToolExecutor {
+        result: String,
+    }
+
+    impl StubToolExecutor {
+        fn new(result: impl Into<String>) -> Self {
+            Self {
+                result: result.into(),
+            }
+        }
+    }
+
+    impl ToolExecutor for StubToolExecutor {
+        fn execute(&self, _tool_call: &ToolCall) -> String {
+            self.result.clone()
+        }
+    }
+
+    /// Bare ToolPolicy with no recovery hooks — keeps the recovered-user
+    /// branch dormant so we exercise the engine path deterministically.
+    struct NoopToolPolicy;
+
+    impl ToolPolicy for NoopToolPolicy {}
+
+    /// Policy that ALWAYS short-circuits with `finalize_after_tool_execution`,
+    /// regardless of input.
+    struct AlwaysShortCircuit;
+
+    impl ToolPolicy for AlwaysShortCircuit {
+        fn finalize_after_tool_execution(
+            &self,
+            _user_input: &str,
+            _last_tool_name: Option<&str>,
+            last_tool_result: Option<&str>,
+            _last_tool_scalar_result: Option<&str>,
+        ) -> Option<String> {
+            Some(
+                last_tool_result
+                    .unwrap_or("policy-short-circuit")
+                    .to_string(),
+            )
+        }
+    }
+
+    fn shell_def() -> ToolDefinition {
+        ToolDefinition::new(
+            "shell",
+            "shell",
+            json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+        )
+    }
+
+    #[test]
+    fn terminal_state_stop_on_normal_finish() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec!["final answer"]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "hello",
+                &[],
+                &StubToolExecutor::new("ignored"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+        assert_eq!(result.terminal_state, TerminalState::Stop);
+        assert_eq!(result.text, "final answer");
+    }
+
+    #[test]
+    fn terminal_state_max_turns_when_budget_exhausted() {
+        // Force every sub-turn to emit a tool call so the loop never
+        // exits via the "tool_calls.is_empty" path. With max_turns=2 and
+        // the StubToolExecutor returning the same string, the loop will
+        // run twice and then fall through to the max-turns return site.
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+        ]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "do thing",
+                &[shell_def()],
+                &StubToolExecutor::new("ok"),
+                &NoopToolPolicy,
+                shell_recorder_settings(),
+            )
+            .expect("turn");
+        assert_eq!(result.terminal_state, TerminalState::MaxTurns);
+        assert!(result.max_turns_reached);
+    }
+
+    #[test]
+    fn terminal_state_empty_no_progress_when_model_emits_nothing() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![""]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "hi",
+                &[],
+                &StubToolExecutor::new("ignored"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+        assert_eq!(result.terminal_state, TerminalState::EmptyNoProgress);
+        assert_eq!(result.text, "");
+    }
+
+    #[test]
+    fn terminal_state_policy_short_circuit_when_policy_returns_text() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+        ]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "list",
+                &[shell_def()],
+                &StubToolExecutor::new("file-a\nfile-b"),
+                &AlwaysShortCircuit,
+                shell_recorder_settings(),
+            )
+            .expect("turn");
+        assert_eq!(result.terminal_state, TerminalState::PolicyShortCircuit);
+        assert!(result.text.contains("file-a"));
+    }
+
+    #[test]
+    fn sub_turns_capture_per_call_usage_and_finish_reason() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "done",
+        ]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "go",
+                &[shell_def()],
+                &StubToolExecutor::new("ok"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+        assert_eq!(result.sub_turns.len(), 2);
+        for st in &result.sub_turns {
+            // FakeEngine emits prompt_tokens=1, completion_tokens=1, finish=stop.
+            assert_eq!(st.usage.prompt_tokens, 1);
+            assert_eq!(st.usage.completion_tokens, 1);
+            assert_eq!(st.finish_reason, "stop");
+            assert!(st.prompt_text.is_some());
+            assert!(st.decode_secs >= 0.0);
+        }
+        assert_eq!(result.sub_turns[0].index, 0);
+        assert_eq!(result.sub_turns[1].index, 1);
+    }
+
+    #[test]
+    fn messages_preserve_tool_use_id_correlation() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "done",
+        ]);
+        let result = session
+            .run_turn(
+                &mut engine,
+                "go",
+                &[shell_def()],
+                &StubToolExecutor::new("ok"),
+                &NoopToolPolicy,
+                settings(),
+            )
+            .expect("turn");
+
+        // Find the assistant message with a tool_use block, then the
+        // following tool message — their ids must match.
+        let mut assistant_tool_use_id = None::<String>;
+        let mut tool_message_id = None::<String>;
+        for msg in &result.messages {
+            match (&msg.role, &msg.content) {
+                (TrajectoryRole::Assistant, MessageContent::Blocks(blocks)) => {
+                    for block in blocks {
+                        if let ContentBlock::ToolUse { id, .. } = block
+                            && assistant_tool_use_id.is_none()
+                        {
+                            assistant_tool_use_id = Some(id.clone());
+                        }
+                    }
+                }
+                (TrajectoryRole::Tool, _) if tool_message_id.is_none() => {
+                    tool_message_id = msg.tool_use_id.clone();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(assistant_tool_use_id, tool_message_id);
+        assert_eq!(assistant_tool_use_id, Some("tu_0_0".to_string()));
+    }
+
+    #[test]
+    fn tool_use_id_is_deterministic_across_runs() {
+        // Same input → same IDs. We don't rely on UUIDs for tool_use ids
+        // exactly so the trajectory stays diff-able across re-runs.
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut session = AgentSession::new();
+            let mut engine = FakeEngine::new(vec![
+                "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+                "done",
+            ]);
+            let result = session
+                .run_turn(
+                    &mut engine,
+                    "go",
+                    &[shell_def()],
+                    &StubToolExecutor::new("ok"),
+                    &NoopToolPolicy,
+                    settings(),
+                )
+                .expect("turn");
+            let mut run_ids = Vec::new();
+            for msg in &result.messages {
+                if let MessageContent::Blocks(blocks) = &msg.content {
+                    for block in blocks {
+                        if let ContentBlock::ToolUse { id, .. } = block {
+                            run_ids.push(id.clone());
+                        }
+                    }
+                }
+            }
+            ids.push(run_ids);
+        }
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(ids[0], vec!["tu_0_0".to_string()]);
+    }
+
+    #[test]
+    fn trajectory_record_round_trips_through_serde() {
+        // Build a minimal record by hand and verify serialize → deserialize
+        // → equality. This is the schema-level invariant the trace writer
+        // depends on.
+        let record = TrajectoryMessage {
+            role: TrajectoryRole::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tu_0_0".to_string(),
+                    name: "shell".to_string(),
+                    input: json!({ "command": "ls" }),
+                },
+            ]),
+            tool_use_id: None,
+            result_truncated: None,
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        let back: TrajectoryMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(record, back);
+
+        let st = SubTurnRecord {
+            index: 0,
+            prompt_text: Some("prompt".to_string()),
+            completion_text: "out".to_string(),
+            usage: super::ToolUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+            },
+            ttft_ms: Some(42),
+            decode_secs: 0.5,
+            finish_reason: "stop".to_string(),
+        };
+        let st_json = serde_json::to_string(&st).expect("serialize sub-turn");
+        let st_back: SubTurnRecord = serde_json::from_str(&st_json).expect("deserialize sub-turn");
+        assert_eq!(st, st_back);
     }
 }

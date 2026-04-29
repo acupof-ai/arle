@@ -18,7 +18,7 @@ use crate::args::RunArgs;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
     AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, AgentTurnCallbacks,
-    ToolExecutor, ToolPolicy,
+    ToolExecutionMetadata, ToolExecutor, ToolPolicy,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
@@ -33,7 +33,12 @@ use rustyline::error::ReadlineError;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use serde::Serialize;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use tools::{BuiltinToolPolicyHooks, builtin_tools, execute_tool_call};
+use tools::{
+    BuiltinToolPolicyHooks, builtin_tools, execute_tool_call, execute_tool_call_with_metadata,
+};
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use crate::trace::TraceWriter;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const REPL_PROMPT: &str = "\x1b[1;35m> \x1b[0m";
@@ -140,6 +145,10 @@ struct BuiltinToolPolicy;
 impl ToolExecutor for BuiltinToolExecutor {
     fn execute(&self, tool_call: &ToolCall) -> String {
         execute_tool_call(tool_call)
+    }
+
+    fn execute_with_metadata(&self, tool_call: &ToolCall) -> (String, ToolExecutionMetadata) {
+        execute_tool_call_with_metadata(tool_call)
     }
 }
 
@@ -260,6 +269,7 @@ fn install_ctrlc_handler() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_repl(
     engine: &mut dyn InferenceEngine,
     backend_name: &str,
@@ -267,6 +277,7 @@ pub(crate) fn run_repl(
     max_tokens: usize,
     temperature: f32,
     tools_enabled: bool,
+    trace: Option<&TraceWriter>,
 ) -> Result<()> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         return run_interactive_repl(
@@ -276,6 +287,7 @@ pub(crate) fn run_repl(
             max_tokens,
             temperature,
             tools_enabled,
+            trace,
         );
     }
 
@@ -286,10 +298,12 @@ pub(crate) fn run_repl(
         max_tokens,
         temperature,
         tools_enabled,
+        trace,
     )
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_one_shot(
     engine: &mut dyn InferenceEngine,
     backend_name: &str,
@@ -298,6 +312,7 @@ pub(crate) fn run_one_shot(
     temperature: f32,
     run_args: &RunArgs,
     tools_enabled: bool,
+    trace: Option<&TraceWriter>,
 ) -> Result<()> {
     let prompt = resolve_one_shot_prompt(run_args)?;
     anyhow::ensure!(
@@ -319,6 +334,10 @@ pub(crate) fn run_one_shot(
             temperature,
         },
     )?;
+
+    if let Some(writer) = trace {
+        writer.write_turn(engine.model_id(), backend_name, &prompt, &result);
+    }
 
     let output = OneShotOutput {
         model_id: engine.model_id().to_string(),
@@ -494,6 +513,7 @@ fn read_multiline_piped<R: BufRead>(
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[allow(clippy::too_many_arguments)]
 fn run_interactive_repl(
     engine: &mut dyn InferenceEngine,
     backend_name: &str,
@@ -501,6 +521,7 @@ fn run_interactive_repl(
     max_tokens: usize,
     temperature: f32,
     tools_enabled: bool,
+    trace: Option<&TraceWriter>,
 ) -> Result<()> {
     let tools = tool_definitions(tools_enabled);
     let mut session = AgentSession::new();
@@ -554,6 +575,7 @@ fn run_interactive_repl(
                     max_tokens,
                     temperature,
                     cancel.clone(),
+                    trace,
                 )? {
                     break;
                 }
@@ -596,6 +618,7 @@ fn run_interactive_repl(
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[allow(clippy::too_many_arguments)]
 fn run_piped_repl(
     engine: &mut dyn InferenceEngine,
     backend_name: &str,
@@ -603,6 +626,7 @@ fn run_piped_repl(
     max_tokens: usize,
     temperature: f32,
     tools_enabled: bool,
+    trace: Option<&TraceWriter>,
 ) -> Result<()> {
     let tools = tool_definitions(tools_enabled);
     let stdin = io::stdin();
@@ -633,6 +657,7 @@ fn run_piped_repl(
                     max_tokens,
                     temperature,
                     cancel.clone(),
+                    trace,
                 )? {
                     break;
                 }
@@ -677,6 +702,7 @@ fn handle_repl_input(
     max_tokens: usize,
     temperature: f32,
     cancel: Arc<AtomicBool>,
+    trace: Option<&TraceWriter>,
 ) -> Result<bool> {
     if input == "quit" || input == "exit" {
         return Ok(false);
@@ -697,6 +723,7 @@ fn handle_repl_input(
 
     run_agent_turn(
         engine,
+        backend_name,
         tools,
         session,
         session_stats,
@@ -705,14 +732,17 @@ fn handle_repl_input(
         max_tokens,
         temperature,
         cancel,
+        trace,
     );
 
     Ok(true)
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[allow(clippy::too_many_arguments)]
 fn run_agent_turn(
     engine: &mut dyn InferenceEngine,
+    backend_name: &str,
     tools: &[ToolDefinition],
     session: &mut AgentSession,
     session_stats: &mut SessionStats,
@@ -721,6 +751,7 @@ fn run_agent_turn(
     max_tokens: usize,
     temperature: f32,
     cancel: Arc<AtomicBool>,
+    trace: Option<&TraceWriter>,
 ) {
     let start = Instant::now();
     let color_on = io::stdout().is_terminal();
@@ -836,6 +867,9 @@ fn run_agent_turn(
                 result.tool_calls_executed,
                 elapsed,
             );
+            if let Some(writer) = trace {
+                writer.write_turn(engine.model_id(), backend_name, input, &result);
+            }
             println!();
         }
         Ok(None) => {
@@ -1306,6 +1340,14 @@ fn iso8601_utc_now() -> String {
 /// Pure function separated out for testing — format Unix seconds as
 /// `YYYY-MM-DDThh:mm:ssZ`. Handles the 1970-… range with proleptic
 /// Gregorian calendar math.
+///
+/// Re-exported as `format_iso8601_utc_secs` for the trace writer; the
+/// markdown export path keeps its private alias for now.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+pub(crate) fn format_iso8601_utc_secs(unix_secs: u64) -> String {
+    format_iso8601_utc(unix_secs)
+}
+
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn format_iso8601_utc(unix_secs: u64) -> String {
     // Days since 1970-01-01.
