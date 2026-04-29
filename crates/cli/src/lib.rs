@@ -18,6 +18,8 @@ mod serve;
 mod startup;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod tps;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod trace;
 mod train_cli;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod welcome;
@@ -164,6 +166,33 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
 
         let max_tokens = resolve_max_tokens(&model_source, args.max_tokens);
 
+        // Open the trajectory writer, if requested. Failures here ARE
+        // surfaced to the user — we want them to know the path was
+        // unwritable before the agent loop quietly drops every record.
+        let trace_writer = match args.trace.as_ref() {
+            Some(path) => match trace::TraceWriter::open(path, args.trace_prompts.keep_prompts()) {
+                Ok(writer) => {
+                    log::info!(
+                        "trajectory: writing JSONL to {} (trace_prompts={})",
+                        writer.path().display(),
+                        if args.trace_prompts.keep_prompts() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                    Some(writer)
+                }
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to open --trace path `{}`: {err:#}",
+                        path.display()
+                    ));
+                }
+            },
+            None => None,
+        };
+
         match run_args {
             Some(run_args) if run_args.prompt.is_some() || run_args.stdin => {
                 let tools_enabled = !(args.no_tools || run_args.no_tools);
@@ -175,6 +204,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                     args.temperature,
                     &run_args,
                     tools_enabled,
+                    trace_writer.as_ref(),
                 )?
             }
             Some(run_args) => repl::run_repl(
@@ -184,6 +214,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                 max_tokens,
                 args.temperature,
                 !(args.no_tools || run_args.no_tools),
+                trace_writer.as_ref(),
             )?,
             None => repl::run_repl(
                 &mut engine,
@@ -192,6 +223,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                 max_tokens,
                 args.temperature,
                 !args.no_tools,
+                trace_writer.as_ref(),
             )?,
         }
 

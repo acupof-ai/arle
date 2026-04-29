@@ -20,6 +20,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tools",
+ "uuid",
 ]
 
 [[package]]
@@ -514,6 +515,7 @@ dependencies = [
  "tokio",
  "tools",
  "train",
+ "uuid",
 ]
 
 [[package]]
