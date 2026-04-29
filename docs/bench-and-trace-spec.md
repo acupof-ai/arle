@@ -203,4 +203,95 @@ One-line: **intent describes, experience records, artefacts hold, this spec gove
 - [ ] §5 stopping rules satisfied (or iteration rationale stated)
 - [ ] Δ% vs prior baseline
 - [ ] Cross-link: project/plan/review that commissioned the run
+- [ ] §10 protocol rules respected (correctness gate, fixed-c benches,
+       duration adequacy, sweep+rate disambiguation)
 ```
+
+## 10. Protocol rules — codified from 2026-04-28→29 lessons
+
+### 10.1 Correctness gate before perf reporting
+
+A bench's tok/s number is meaningless if the model is producing
+garbage. Several wins entries pre-2026-04-29 published headline
+numbers while the model emitted `"!!!!!"` for any short prompt (the
+TileLang `clear=False` regression in `47bad713`). The wins-entry gate
+MUST include either:
+
+- a passing `cargo test --release -p infer --test e2e --features cuda`
+  run, OR
+- a curl-level smoke test where a 4-token prompt produces non-empty,
+  non-degenerate output (first 5 chars not all identical).
+
+The bench wrapper's K6 silent-OOM detector
+(`scripts/bench_guidellm.sh:emit_oom_warnings`) covers
+"successful but empty" but not "successful with `!!!!!` text". The
+e2e test `infer/tests/e2e.rs` post-K5 catches both.
+
+### 10.2 Sweep ≠ fixed-concurrency
+
+`guidellm --profile sweep` auto-picks 10 strategies (sync +
+throughput + 8 async-constant rates linspaced between the two
+measured throughputs). On a 24-GB-class L4 box at 4096-in/256-out,
+the realised sweep is `sync (0.10 r/s) → throughput (0.27 r/s)`, so
+the 8 intermediate rates are `~0.12-0.27 r/s` — concurrency in flight
+is roughly `1×–3×` sync.
+
+This **does NOT cover the `c=16` fixed-concurrency operating point**
+that SGLang and vLLM headline numbers usually report. Comparing our
+sweep "throughput" tok/s to SGLang's "c=16" tok/s is apples-to-oranges
+(throughput-mode = unbounded saturation = TTFT 13 s; c=16 is fixed
+in-flight = TTFT 1-2 s).
+
+**Rule**: when comparing against an SGLang/vLLM reference number,
+match their concurrency model. Use:
+
+- `bash scripts/bench_guidellm.sh <label> --concurrencies 1,4,16,64
+  --max-seconds 120` for fixed-concurrency comparison.
+- `bash scripts/bench_guidellm.sh <label>` (canonical sweep) for
+  rate-handling characterization across the load curve.
+
+Both are valid; they answer different questions. The wins entry must
+state which one.
+
+### 10.3 Duration adequacy
+
+Single-run tok/s variance scales with √(samples). At c=16, a 30s run
+admits ~10-15 requests; a 60s run admits ~30; a 120s run admits ~60.
+At `--fast` (30s) we observed σ ≈ 50 tok/s on the headline metric,
+which makes per-run numbers unreliable for delta-attribution.
+
+**Rule**: minimum durations by purpose:
+
+| Purpose                              | Min duration            |
+|--------------------------------------|-------------------------|
+| Iteration / smoke                    | `--fast` (30 s c=16)    |
+| Wins-entry headline                  | 60 s (sweep default)    |
+| Fixed-concurrency vs reference       | 120 s + n=3 if variance |
+| Long-context (prompt ≥ 8k)           | 180 s                   |
+| Decode-bound (small prompt, long output) | 60 s + n=3            |
+
+When variance > 10% across n=3, double the duration before publishing.
+
+### 10.4 Param alignment with reference
+
+Every bench against a reference (SGLang, vLLM, prior commit) MUST log
+the resolved scheduling envelope at server boot and confirm it matches
+the reference. The "Scheduling envelope (resolved | SGLang-equiv)" log
+line in `infer/src/backend/cuda/bootstrap.rs` is the contract.
+
+Mismatches like "we use `max_prefill_tokens=2048`, SGLang uses
+`16384`" cost 5x TTFT silently — the F4 `8f6965c3` fix was driven by
+exactly this. The envelope log makes drift visible; the wins entry
+must paste it verbatim.
+
+### 10.5 Server lifecycle hygiene
+
+Bench wrapper's `bench-output/.bench_guidellm.lock` enforces serial
+runs. Stale locks happen when bench is killed mid-run. Always
+`rm -f bench-output/.bench_guidellm.lock` after a kill.
+
+Server slots leak when bench client disconnects mid-stream — see K7
+in `docs/projects/2026-04-29-perf-bug-roundup.md`. After a killed
+bench the next run may stall on orphaned slots. Restart server
+between bench sessions when status is uncertain. Verify with
+`/v1/stats` showing `active=0 waiting=0` before re-running.
