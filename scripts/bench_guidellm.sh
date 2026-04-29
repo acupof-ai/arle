@@ -698,12 +698,45 @@ extract_rows() {
               ttft_p99: (pctl("time_to_first_token_ms").p99 | rnd(1)),
               itl_p50:  (pctl("inter_token_latency_ms").p50 | rnd(2)),
               itl_p99:  (pctl("inter_token_latency_ms").p99 | rnd(2)),
-              tok_s:    (avg("output_tokens_per_second") | rnd(2)),
+              tok_s: (
+                  if (((.metrics.request_totals.successful // 0) > 0)
+                      and (((.metrics.request_streaming_iterations_count.successful.mean) // 0) == 0))
+                  then "OOM/empty"
+                  else (avg("output_tokens_per_second") | rnd(2) | tostring)
+                  end
+              ),
               req_s:    (avg("requests_per_second")      | rnd(3))
             }
           )
         | .[]
         | "| \(.rate) | \(.ttft_p50) | \(.ttft_p99) | \(.itl_p50) | \(.itl_p99) | \(.tok_s) | \(.req_s) |"
+    ' "$JSON_FILE" 2>/dev/null || true
+}
+
+# K6 (2026-04-29): silent-OOM detector. When the server OOMs mid-bench,
+# guidellm still records "successful" requests with zero streaming
+# iterations (no tokens emitted). Surface these so they can't be confused
+# with healthy runs. Prints one warning line per offending rate.
+emit_oom_warnings() {
+    jq -r '
+        .benchmarks
+        | map({
+            rate: (
+                .config.strategy
+                | if   .type_ == "synchronous" then "sync"
+                  elif .type_ == "concurrent"  then "conc\(.max_concurrency // "?")"
+                  elif .type_ == "throughput"  then "throughput"
+                  elif (.rate // null) != null then "\(.rate)r/s"
+                  else .type_
+                  end
+            ),
+            successful: (.metrics.request_totals.successful // 0),
+            errored:    (.metrics.request_totals.errored    // 0),
+            iter_mean:  ((.metrics.request_streaming_iterations_count.successful.mean) // 0)
+          })
+        | map(select(.successful > 0 and .iter_mean == 0))
+        | map("  - \(.rate): successful=\(.successful) errored=\(.errored) iter_mean=0 — silent OOM / empty outputs")
+        | .[]
     ' "$JSON_FILE" 2>/dev/null || true
 }
 
@@ -718,6 +751,14 @@ extract_rows() {
 } > "$TABLE_FILE"
 
 echo
+OOM_WARN="$(emit_oom_warnings)"
+if [[ -n "$OOM_WARN" ]]; then
+    echo ">>> WARNING — silent-OOM runs detected (successful>0 but iter_mean=0):"
+    echo "$OOM_WARN"
+    echo "    These rows show tok/s = OOM/empty in the table below. Do not"
+    echo "    treat as healthy results — the server emitted zero tokens."
+    echo
+fi
 echo ">>> headline table"
 cat "$TABLE_FILE"
 echo
