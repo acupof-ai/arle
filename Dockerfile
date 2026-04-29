@@ -20,11 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 
-# Install Python build deps (Triton AOT + FlashInfer)
+# Install Python build deps (Triton AOT + FlashInfer + TileLang AOT)
 RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir flashinfer-python==0.6.3 triton==3.5.1
+    /opt/venv/bin/pip install --no-cache-dir flashinfer-python==0.6.3 triton==3.5.1 "tilelang>=0.1"
 
 ENV INFER_TRITON_PYTHON=/opt/venv/bin/python3
+ENV INFER_TILELANG_PYTHON=/opt/venv/bin/python3
 ENV CUDA_HOME=/usr/local/cuda
 
 WORKDIR /build
