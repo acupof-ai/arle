@@ -106,9 +106,13 @@ struct Args {
 
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom for activations, CUDA graphs,
-    /// FlashInfer workspace, and OS. Default 0.88 matches SGLang's auto-detect.
-    /// Increase to 0.92 on dedicated inference boxes; decrease to 0.80 if sharing GPU.
-    #[arg(long, default_value_t = 0.88)]
+    /// FlashInfer workspace, and OS. Default 0.85 matches SGLang's
+    /// `mem_fraction_static` default in `server_args.py`. K3 follow-up
+    /// 2026-04-29 — bumped from 0.88 → 0.85 so the workspace estimate at
+    /// the new `max_prefill_tokens=16384` default fits headroom without
+    /// the OOM warn firing. Increase to 0.92 on dedicated inference
+    /// boxes; decrease to 0.80 if sharing GPU.
+    #[arg(long, default_value_t = 0.85)]
     mem_fraction_static: f64,
 
     /// Minimum sequence length per slot when auto-sizing KV cache.
