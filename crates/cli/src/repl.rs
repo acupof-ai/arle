@@ -804,7 +804,25 @@ fn run_agent_turn(
                     "\x1b[2m(agent stopped — max turns reached; pass --max-turns N to allow more tool steps)\x1b[0m"
                 );
             } else if !streamed_any {
-                println!("\x1b[1;34m{}\x1b[0m", result.text);
+                // The agent finished without streaming any visible text —
+                // either it produced an empty `result.text`, or it spent
+                // every sub-turn on tool_call XML that VisibleTextStream
+                // stripped. Without this branch the user sees only the
+                // status line and assumes the REPL hung ("没回复"). Print
+                // a dim diagnostic in the empty case so the silent hang
+                // is now an honest "no visible answer was generated"
+                // signal — including how many tool calls fired, so the
+                // user can tell a 0-turn flop from a 250-turn loop.
+                let trimmed = result.text.trim();
+                if trimmed.is_empty() {
+                    println!(
+                        "\x1b[2m(agent finished without a visible reply — {} tool call(s) executed; \
+                         try a more specific prompt, or `/reset` to clear context)\x1b[0m",
+                        result.tool_calls_executed
+                    );
+                } else {
+                    println!("\x1b[1;34m{}\x1b[0m", trimmed);
+                }
             }
             let elapsed = start.elapsed();
             tps_meter.borrow_mut().print_final(
