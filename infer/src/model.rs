@@ -490,6 +490,14 @@ pub trait ModelForward: Send {
         0
     }
 
+    /// Optional model-side cap for how many prefill requests may share one
+    /// scheduler step. Hybrid models with large per-row prefill scratch can
+    /// use this to keep c=16 decode batching without stacking prefill scratch
+    /// beyond the reserved workspace.
+    fn max_concurrent_prefill_requests(&self) -> Option<usize> {
+        None
+    }
+
     /// Fast-path batched greedy sampling on internal contiguous logits.
     ///
     /// Implementations that return `Some(tokens)` should also populate
