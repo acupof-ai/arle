@@ -274,18 +274,9 @@ fn peek_model_architecture(model_source: &str) -> Option<String> {
     // 2. HuggingFace repo-id case: walk the hub cache for matching snapshots.
     let (org, repo) = model_source.split_once('/')?;
     let cache_root = hub_discovery::hub_cache_root()?;
-    let repo_dir = cache_root.join(format!(
-        "models--{}--{}",
-        org,
-        repo.replace('-', "--").replace('-', "-") // safe no-op; preserve as-is
-    ));
-    let repo_dir = if repo_dir.exists() {
-        repo_dir
-    } else {
-        // Fall back to a literal join — HF caches names verbatim with `--`
-        // for path separators only, hyphens are preserved as-is.
-        cache_root.join(format!("models--{org}--{repo}"))
-    };
+    // HF caches repo IDs as `models--org--repo`; hyphens inside the repo name
+    // are preserved as-is.
+    let repo_dir = cache_root.join(format!("models--{org}--{repo}"));
     let snapshots = std::fs::read_dir(repo_dir.join("snapshots")).ok()?;
     for entry in snapshots.flatten() {
         if let Some(arch) = read_arch_from_dir(&entry.path()) {

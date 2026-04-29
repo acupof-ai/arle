@@ -612,9 +612,8 @@ impl AgentSession {
                             tokens_aborted = true;
                         } else {
                             response_ids.extend(output.response_token_ids.iter());
-                            response_mask.extend(
-                                std::iter::repeat(1u8).take(output.response_token_ids.len()),
-                            );
+                            response_mask
+                                .extend(std::iter::repeat_n(1u8, output.response_token_ids.len()));
                         }
                     }
                 }
@@ -684,9 +683,8 @@ impl AgentSession {
                                     tokens_aborted = true;
                                 } else {
                                     let n = repair_outcome.response_token_ids.len();
-                                    response_ids
-                                        .extend(repair_outcome.response_token_ids.into_iter());
-                                    response_mask.extend(std::iter::repeat(1u8).take(n));
+                                    response_ids.extend(repair_outcome.response_token_ids);
+                                    response_mask.extend(std::iter::repeat_n(1u8, n));
                                 }
                             }
                         }
@@ -789,8 +787,8 @@ impl AgentSession {
                     match engine.tokenize(result_text) {
                         Ok(ids) if !ids.is_empty() => {
                             let n = ids.len();
-                            response_ids.extend(ids.into_iter());
-                            response_mask.extend(std::iter::repeat(0u8).take(n));
+                            response_ids.extend(ids);
+                            response_mask.extend(std::iter::repeat_n(0u8, n));
                         }
                         _ => {
                             // Either tokenize errored, or returned empty
