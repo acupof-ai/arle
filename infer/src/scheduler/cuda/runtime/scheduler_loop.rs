@@ -184,6 +184,25 @@ impl<M: ModelForward> Scheduler<M> {
         let _ = self.evict_prefix_cache_if_pressured();
         let mut available_free_slots = self.free_slots();
 
+        // K7 cooldown: after a prefill OOM, serialize new admits until the
+        // cooldown expires. While the window is active, only admit when
+        // there is no in-flight GPU work AND no slot is mid-prefill, and
+        // cap admission to a single new request per pass.
+        let oom_cooldown_active = self
+            .stats
+            .prefill_oom_cooldown_until
+            .is_some_and(|deadline| std::time::Instant::now() < deadline);
+        if oom_cooldown_active {
+            if self.has_pending_gpu_work() || !self.prefill_queue.is_empty() {
+                return;
+            }
+            // Trim free slots to one so at most a single candidate is admitted.
+            available_free_slots.truncate(1);
+        } else if self.stats.prefill_oom_cooldown_until.is_some() {
+            // Window expired — clear the marker so we stop logging or branching.
+            self.stats.prefill_oom_cooldown_until = None;
+        }
+
         let candidates = self.collect_admission_candidates(&available_free_slots);
         let mut deferred_waiting = std::collections::VecDeque::new();
         let mut admission_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());

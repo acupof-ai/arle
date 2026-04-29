@@ -253,6 +253,13 @@ pub(super) struct BufferedResponse {
     pub(super) finish_reason: FinishReason,
     pub(super) usage: TokenUsage,
     pub(super) token_logprobs: Vec<f32>,
+    /// `true` once a delta with `finish_reason: Some(_)` has been observed.
+    ///
+    /// Distinguishes a clean scheduler-side completion from an aborted request
+    /// (e.g. prefill OOM → `EmitCommand::Abort` → `delta_tx` dropped without a
+    /// terminal delta). The non-streaming HTTP handlers use this to return a
+    /// 503 instead of an empty 200 when the server gave up on the request.
+    pub(super) terminal_seen: bool,
 }
 
 impl Default for BufferedResponse {
@@ -266,6 +273,7 @@ impl Default for BufferedResponse {
                 total_tokens: 0,
             },
             token_logprobs: Vec::new(),
+            terminal_seen: false,
         }
     }
 }
@@ -275,6 +283,7 @@ impl BufferedResponse {
         self.text.push_str(&delta.text_delta);
         if let Some(reason) = delta.finish_reason {
             self.finish_reason = reason;
+            self.terminal_seen = true;
         }
         if let Some(usage) = delta.usage {
             self.usage = usage;

@@ -55,6 +55,12 @@ pub(in crate::scheduler::cuda) struct SchedulerRuntimeStats {
     /// Throttled GPU memory query state and peak high-water mark.
     pub last_mem_query: std::time::Instant,
     pub peak_mem_bytes: u64,
+    /// Set when a prefill batch fails with an out-of-memory error.
+    /// While this is in the future, `assign_slots` serializes new
+    /// prefill admits (one at a time, only when no GPU work is in
+    /// flight) so a transient workspace shortage doesn't cascade into
+    /// every subsequent request OOMing too.
+    pub prefill_oom_cooldown_until: Option<std::time::Instant>,
 }
 
 impl SchedulerRuntimeStats {
@@ -68,6 +74,7 @@ impl SchedulerRuntimeStats {
             step_timing_total_us: 0.0,
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
+            prefill_oom_cooldown_until: None,
         }
     }
 }
