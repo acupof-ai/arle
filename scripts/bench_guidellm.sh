@@ -859,6 +859,31 @@ emit_oom_warnings() {
     ' "$JSON_FILE" 2>/dev/null || true
 }
 
+append_service_trace_sections() {
+    local summary_file="$1"
+    [[ -s "$summary_file" ]] || return 0
+
+    printf '\n## Service Trace Peaks\n\n'
+    awk '
+        /^## / { exit }
+        /^- / { print }
+    ' "$summary_file"
+
+    printf '\n## Service Trace Distribution\n\n'
+    awk '
+        /^## Trace Distributions$/ { emit=1; next }
+        /^## Token Counters$/ { emit=0 }
+        emit { print }
+    ' "$summary_file"
+
+    printf '\n## Service Token Counters\n\n'
+    awk '
+        /^## Token Counters$/ { emit=1; next }
+        /^## Before$/ { emit=0 }
+        emit { print }
+    ' "$summary_file"
+}
+
 {
     emit_header
     rows="$(extract_rows)"
@@ -867,6 +892,7 @@ emit_oom_warnings() {
     else
         printf '| _extraction failed_ | see `benchmarks.html` | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |\n'
     fi
+    append_service_trace_sections "$SERVICE_STATS_SUMMARY"
 } > "$TABLE_FILE"
 
 echo
