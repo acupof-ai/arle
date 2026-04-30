@@ -514,7 +514,7 @@ else
     echo "    server : launching SGLang"
     (
         cd "$SGLANG_DIR"
-        export PYTHONPATH="$SGLANG_DIR/python:$PYTHONPATH"
+        export PYTHONPATH="$SGLANG_DIR/python:${PYTHONPATH:-}"
         python3 -m sglang.launch_server \
             --host "$HOST" \
             --port "$PORT" \
