@@ -1,0 +1,16 @@
+{
+  "total_requests": 104,
+  "successful_requests": 104,
+  "failed_requests": 0,
+  "total_time_s": 125.48028206825256,
+  "ttft_p50": 9692.75164604187,
+  "ttft_p99": 10118.854033946991,
+  "ttft_mean": 9477.430375722739,
+  "total_time_p50": 9692.75164604187,
+  "total_time_p99": 10118.854033946991,
+  "total_time_mean": 9477.430375722739,
+  "tokens_per_second": 57.435318770481345,
+  "requests_per_second": 0.828815478303047,
+  "total_tokens": 7207,
+  "avg_tokens_per_request": 69.29807692307692
+}

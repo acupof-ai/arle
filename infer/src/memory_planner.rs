@@ -18,6 +18,17 @@
 //! - **Scratch**: per-step decode/prefill buffers (currently model-owned)
 //! - **Headroom**: reserved for CUDA runtime, cuBLAS workspace, fragmentation
 
+/// Stub implementation of memory planner - TODO: implement fully
+pub struct MemoryPlanner {
+    _placeholder: (),
+}
+
+impl MemoryPlanner {
+    pub fn new() -> Self {
+        Self { _placeholder: () }
+    }
+}
+
 /// Memory budget for a single GPU device.
 pub struct MemoryBudget {
     /// Total GPU memory in bytes.

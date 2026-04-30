@@ -51,7 +51,12 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 comfy-table = "7.2"
 crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+async-trait = "0.1"
 pollster = "0.4"
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+num_cpus = "1.0"
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
