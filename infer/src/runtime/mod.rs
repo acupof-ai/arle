@@ -6,6 +6,8 @@
  * concurrency without Python's GIL limitations.
  */
 
+#![allow(dead_code)]
+
 mod backend_worker;
 mod channels;
 mod config;
@@ -51,6 +53,7 @@ pub struct MultiThreadRuntime {
     config: RuntimeConfig,
 
     // Model information
+    #[allow(dead_code)]
     model_id: String,
 }
 

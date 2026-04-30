@@ -460,9 +460,9 @@ impl MemoryPoolCoordinator {
     /// Request quota increase for a worker
     pub async fn request_quota_increase(
         &self,
-        worker_id: usize,
-        additional_bytes: usize,
-        priority: RebalancePriority,
+        _worker_id: usize,
+        _additional_bytes: usize,
+        _priority: RebalancePriority,
     ) -> Result<bool> {
         // TODO: implement request_rebalance method
         // self.rebalancer.request_rebalance(RebalanceRequest {
@@ -479,7 +479,7 @@ impl MemoryPoolCoordinator {
         // TODO: implement stats methods for SharedMemoryPool
         // let kv_stats = self.kv_cache_pool.stats().await;
         // let host_stats = self.host_memory_pool.stats().await;
-        let quota_stats = self.quota_manager.stats().await;
+        let _quota_stats = self.quota_manager.stats().await;
 
         // TODO: implement proper stats collection
         MemoryCoordinatorStats {

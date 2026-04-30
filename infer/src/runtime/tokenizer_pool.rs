@@ -74,7 +74,7 @@ impl TokenizerPool {
         Ok(())
     }
 
-    pub async fn tokenize_sync(&self, text: &str) -> Result<Vec<u32>> {
+    pub async fn tokenize_sync(&self, _text: &str) -> Result<Vec<u32>> {
         // For sync tokenization, we can use the tokenizer directly
         // This bypasses the worker pool for efficiency
         match &self.worker_count {

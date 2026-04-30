@@ -136,7 +136,7 @@ impl SchedulerActor {
     }
 
     pub async fn start(&self) -> Result<()> {
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Start sub-schedulers
         self.admission_scheduler.start().await?;
@@ -144,7 +144,7 @@ impl SchedulerActor {
         self.memory_scheduler.start().await?;
 
         // Start main scheduler loop
-        let scheduler_handle = {
+        let _scheduler_handle = {
             let state = self.state.clone();
             let config = self.config.clone();
             let admission = self.admission_scheduler.clone();
@@ -285,7 +285,7 @@ impl SchedulerActor {
     async fn handle_scheduling_tick(
         state: &Arc<RwLock<SchedulerState>>,
         config: &RuntimeConfig,
-        admission: &Arc<AdmissionScheduler>,
+        _admission: &Arc<AdmissionScheduler>,
         batch: &Arc<BatchScheduler>,
         memory: &Arc<MemoryScheduler>,
         execute_tx: &mpsc::Sender<ExecuteTask>,
@@ -548,7 +548,7 @@ impl MemoryScheduler {
         Ok(())
     }
 
-    async fn update_memory_stats(&self, stats: &mut MemoryStats) -> Result<()> {
+    async fn update_memory_stats(&self, _stats: &mut MemoryStats) -> Result<()> {
         // Update memory statistics from actual allocators
         // This would integrate with the KV cache and GPU memory management
         Ok(())

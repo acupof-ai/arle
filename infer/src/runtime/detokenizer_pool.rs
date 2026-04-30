@@ -273,7 +273,7 @@ impl DetokenizerWorker {
         state.accumulated_text.push_str(&new_text);
 
         // Check for stop sequences
-        let (final_text, stopped) = self.check_stop_sequences(&new_text, &state.accumulated_text);
+        let (final_text, _stopped) = self.check_stop_sequences(&new_text, &state.accumulated_text);
 
         Ok(IncrementalDelta {
             text_delta: final_text,
