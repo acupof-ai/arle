@@ -721,7 +721,7 @@ impl ServerMetrics {
             || " step_phase_us=unavailable".to_string(),
             |(admission_us, prefill_us, decode_us, emit_us, total_us)| {
                 let cleanup_suffix = self.scheduler_loop_phase_us().map_or_else(
-                    || String::new(),
+                    String::new,
                     |(cleanup_us, loop_total_us)| {
                         format!(",cleanup:{cleanup_us},loop_total:{loop_total_us}")
                     },
