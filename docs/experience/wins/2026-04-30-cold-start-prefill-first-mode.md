@@ -63,18 +63,29 @@ CUDA_HOME=/usr/local/cuda /tmp/arle-target/release/infer \
   --trace-interval-ms 200
 ```
 
-Canonical 120s matrix is pending below and will be filled from clean HEAD.
+Canonical 120s matrix on final HEAD:
+
+```bash
+./scripts/bench_guidellm.sh 2026-04-30-head2-<model>-<kv> \
+  --target http://127.0.0.1:8000 \
+  --model <Qwen/Qwen3-4B|Qwen/Qwen3.5-4B> \
+  --processor infer/models/<Qwen3-4B|Qwen3.5-4B> \
+  --concurrencies 16 \
+  --max-seconds 120 \
+  --trace-interval-ms 1000
+```
 
 ## Environment
 
 - GPU: NVIDIA L4, 23 GiB VRAM
 - CUDA: `/usr/local/cuda`
-- Commit: runtime change committed with this entry
+- Commit: `ecb2fe3c` initial first-batch mode,
+  `16f7aef8` cohort admission follow-up
 - Features: `infer --no-default-features --features cuda`
-- Model: `infer/models/Qwen3.5-4B`
+- Models: `infer/models/Qwen3-4B`, `infer/models/Qwen3.5-4B`
 - Scheduler: `num_slots=16`, `max_seq_len=8192`,
   `chunked_prefill_size=2048`, `max_prefill_tokens=16384`,
-  `kv_cache_dtype=fp8`
+  `kv_cache_dtype=<fp8|bf16>`
 
 ## Results
 
@@ -83,7 +94,8 @@ Canonical 120s matrix is pending below and will be filled from clean HEAD.
 | Run | First-window behavior | Result |
 |---|---|---|
 | pre-fix `c0f4ca8f` | `plan=decode+prefill` starts while requests 2-16 still have unfinished prompt chunks | Mixed ticks spend ~410-440ms in decode and ~3.3ms in prefill launch, so early decode blocks the rest of first-burst TTFT. |
-| post-fix | First c=16 burst runs contiguous `plan=prefill`; no `decode+prefill` before drain completion | `first-batch prefill drain complete: elapsed=13503ms rows=48 tokens=65552 decode_rows=16`. |
+| initial post-fix `ecb2fe3c` | First c=16 burst runs contiguous `plan=prefill` for Qwen3.5 fp8 | `first-batch prefill drain complete: elapsed=13503ms rows=48 tokens=65552 decode_rows=16`. |
+| follow-up `16f7aef8` | Keeps the cold-start cohort admission-open and records all queued prefills until the waiting queue drains | Qwen3.5 bf16 now reaches `rows=48 tokens=65552 decode_rows=16` before any `decode+prefill`. |
 
 ### Exploration Bench
 
@@ -106,14 +118,31 @@ Raw artefacts:
 
 ### Canonical Matrix
 
-Pending clean-HEAD c=16 / 4096 / 256 / 120s reruns:
+Clean-HEAD c=16 / 4096 prompt / 256 output / 120s reruns after the cohort
+follow-up:
 
-| model | kv | tok/s | TTFT p50 | ITL p50 | status |
-|---|---|---:|---:|---:|---|
-| Qwen3-4B | fp8 | pending | pending | pending | pending |
-| Qwen3-4B | bf16 | pending | pending | pending | pending |
-| Qwen3.5-4B | fp8 | pending | pending | pending | pending |
-| Qwen3.5-4B | bf16 | pending | pending | pending | pending |
+| model | kv | tok/s | TTFT p50 | ITL p50 | GPU SM avg | KV pool tokens | peak KV util | first cold drain | status |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| Qwen3-4B | fp8 | 139.19 | 12628.1ms | 78.06ms | 75.1% | 144,000 | 98.4% | 12.821s, 48 rows, 65,552 tokens, 16 decode rows | valid |
+| Qwen3-4B | bf16 | 106.64 | 12137.2ms | 101.29ms | 77.1% | 78,160 | 99.7% | 12.753s, 48 rows, 65,552 tokens, 16 decode rows | valid, 1 incomplete at cutoff |
+| Qwen3.5-4B | fp8 | 151.96 | 13040.7ms | 52.56ms | 74.8% | 393,696 | 84.3% | 13.452s, 48 rows, 65,552 tokens, 16 decode rows | valid |
+| Qwen3.5-4B | bf16 | 161.60 | 13165.1ms | 54.14ms | 72.9% | 249,136 | 80.6% | 13.451s, 48 rows, 65,552 tokens, 16 decode rows | valid |
+
+Delta vs the 2026-04-29 headline summary:
+
+| model | kv | tok/s Δ | TTFT p50 Δ | ITL p50 Δ |
+|---|---|---:|---:|---:|
+| Qwen3-4B | fp8 | +0.7% | -4.6% | +7.6% |
+| Qwen3-4B | bf16 | +27.0% | -5.9% | -1.4% |
+| Qwen3.5-4B | fp8 | +0.1% | -1.8% | -8.0% |
+| Qwen3.5-4B | bf16 | +7.5% | +4.3% | -15.5% |
+
+FP8 vs BF16 on final HEAD:
+
+| model | tok/s Δ | TTFT p50 Δ | ITL p50 Δ | note |
+|---|---:|---:|---:|---|
+| Qwen3-4B | +30.5% | +4.0% slower | -22.9% | fp8 remains the throughput/ITL winner. |
+| Qwen3.5-4B | -6.0% | -0.9% | -2.9% | bf16 wins throughput; fp8 wins latency slightly but still has the numerical-default blocker from the fp8 KV spot-check. |
 
 ## Problems
 
@@ -123,20 +152,38 @@ Pending clean-HEAD c=16 / 4096 / 256 / 120s reruns:
 - The first pre-fix 30s run exited before completion. The server log still
   captured the scheduling defect, but the run cannot be used as a throughput
   baseline.
+- The initial `ecb2fe3c` implementation sealed the cohort too early for
+  Qwen3.5 bf16 because admission could still be draining while a single
+  prefill-cap request had already produced a decode row. Follow-up
+  `16f7aef8` keeps the cohort open until waiting admission drains and tracks
+  the full `prefill_queue`, not only candidates selected in the current tick.
 
 ## Learnings
 
-- Qwen3.5 c=16 TTFT is dominated by the time to finish all prefill chunks, not
-  just decode/prefill interleaving. Removing early decode is still the right
-  scheduler invariant for the first burst, but the next TTFT work should look
-  at prefill compute and prefill first-time planning/autotune.
+- Qwen3.5 c=16 TTFT is dominated by the time to finish all prefill chunks. The
+  fixed first-batch mode makes the invariant explicit, but the measured TTFT
+  remains ~13s because the contiguous prefill drain itself takes ~13.4s.
 - The scheduler needs explicit lifecycle logs for special modes; the new
   `first-batch prefill drain started/complete` lines made the profile
   unambiguous.
+- The strongest win is ITL, not TTFT. Qwen3.5 bf16 ITL improved 15.5% vs the
+  prior headline, and Qwen3.5 fp8 improved 8.0%.
 
 ## Delta vs Baseline
 
 | comparison | tok/s Δ | TTFT p50 Δ | ITL p50 Δ | note |
 |---|---:|---:|---:|---|
 | post-fix 30s vs prior headline Qwen3.5 fp8 120s | +25.4% | -0.6% | -7.8% | Different duration; use only as directional smoke. |
+| final Qwen3.5 fp8 120s vs prior headline | +0.1% | -1.8% | -8.0% | Final same-duration comparison. |
+| final Qwen3.5 bf16 120s vs prior headline | +7.5% | +4.3% | -15.5% | First-batch ordering improves decode cadence, not cold prefill TTFT. |
 
+## Artefacts
+
+- Qwen3 fp8: `bench-output/2026-04-30-2026-04-30-head2-qwen3-fp8/`
+- Qwen3 fp8 server: `bench-output/2026-04-30-2026-04-30-head2-qwen3-fp8-server/server.log`
+- Qwen3 bf16: `bench-output/2026-04-30-2026-04-30-head2-qwen3-bf16/`
+- Qwen3 bf16 server: `bench-output/2026-04-30-2026-04-30-head2-qwen3-bf16-server/server.log`
+- Qwen3.5 fp8: `bench-output/2026-04-30-2026-04-30-head2-qwen35-fp8/`
+- Qwen3.5 fp8 server: `bench-output/2026-04-30-2026-04-30-head2-qwen35-fp8-server/server.log`
+- Qwen3.5 bf16: `bench-output/2026-04-30-2026-04-30-head2-qwen35-bf16/`
+- Qwen3.5 bf16 server: `bench-output/2026-04-30-2026-04-30-head2-qwen35-bf16-server/server.log`
