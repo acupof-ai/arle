@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 
 use crate::prefix_cache::BlockId;
@@ -116,7 +116,7 @@ pub struct AllocationInfo {
 }
 
 /// Per-worker quota information
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WorkerQuota {
     /// Maximum bytes this worker can allocate
     pub max_bytes: usize,
@@ -978,9 +978,9 @@ impl PoolStats {
 impl Default for PressureIndicators {
     fn default() -> Self {
         Self {
-            memory_pressure: 0.0,
-            allocation_failures: 0,
-            fragmentation_level: 0.0,
+            overall_pressure: 0.0,
+            allocation_backlog: 0,
+            recent_failures: 0,
         }
     }
 }

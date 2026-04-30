@@ -13,10 +13,7 @@ use uuid::Uuid;
 use super::channels::{
     BatchResult, BatchedRequest, DetokenizeTask, ExecuteTask, RequestResult, ScheduleTask,
 };
-use super::config::{RuntimeConfig, SchedulingConfig};
-use crate::block_manager::BlockManager;
-use crate::memory_planner::MemoryPlanner;
-use crate::prefix_cache::RadixCache;
+use super::config::RuntimeConfig;
 use crate::server_engine::CompletionRequest;
 
 /// Hybrid scheduler that coordinates multiple specialized sub-schedulers

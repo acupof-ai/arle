@@ -3,6 +3,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::sampler::SamplingParams;
 
+#[derive(Debug)]
 pub struct CompletionRequest {
     pub prompt: String,
     pub max_tokens: usize,

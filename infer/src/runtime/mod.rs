@@ -29,10 +29,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::backend::InferenceBackend;
-use crate::server_engine::{
-    CompletionOutput, CompletionRequest, CompletionStreamDelta, InferenceEngine,
-};
+use crate::server_engine::{CompletionRequest, CompletionStreamDelta};
 
+use self::channels::TokenizeTask;
 use self::detokenizer_pool::DetokenizerPool;
 use self::gpu_executor::GpuExecutorPool;
 use self::scheduler_actor::SchedulerActor;
@@ -48,7 +47,7 @@ pub struct MultiThreadRuntime {
     detokenizer_pool: Arc<DetokenizerPool>,
 
     // Communication infrastructure
-    channels: RuntimeChannels,
+    tokenizer_tx: mpsc::Sender<TokenizeTask>,
     config: RuntimeConfig,
 
     // Model information
@@ -61,7 +60,8 @@ impl MultiThreadRuntime {
         tokenizer: Arc<crate::tokenizer::Tokenizer>,
         config: RuntimeConfig,
     ) -> Result<Self> {
-        let model_id = backend.model_id().to_string();
+        // Use backend name as model identifier for now
+        let model_id = backend.name().to_string();
 
         // Create communication channels
         let channels = RuntimeChannels::new(&config.channel_config)?;
@@ -71,7 +71,7 @@ impl MultiThreadRuntime {
             TokenizerPool::new(
                 tokenizer.clone(),
                 config.threading.tokenizer_workers,
-                channels.tokenizer_tx.clone(),
+                channels.schedule_tx.clone(),
             )
             .await?,
         );
@@ -80,7 +80,7 @@ impl MultiThreadRuntime {
             DetokenizerPool::new(
                 tokenizer.clone(),
                 config.threading.detokenizer_workers,
-                channels.detokenizer_rx.clone(),
+                channels.detokenizer_rx,
             )
             .await?,
         );
@@ -89,7 +89,7 @@ impl MultiThreadRuntime {
             GpuExecutorPool::new(
                 backend,
                 config.threading.gpu_workers_per_device,
-                channels.execute_rx.clone(),
+                channels.execute_rx,
                 channels.gpu_result_tx.clone(),
             )
             .await?,
@@ -98,9 +98,9 @@ impl MultiThreadRuntime {
         let scheduler = Arc::new(
             SchedulerActor::new(
                 config.clone(),
-                channels.schedule_rx.clone(),
+                channels.schedule_rx,
                 channels.execute_tx.clone(),
-                channels.gpu_result_rx.clone(),
+                channels.gpu_result_rx,
                 channels.detokenizer_tx.clone(),
             )
             .await?,
@@ -111,7 +111,7 @@ impl MultiThreadRuntime {
             scheduler,
             gpu_executor,
             detokenizer_pool,
-            channels,
+            tokenizer_tx: channels.tokenizer_tx,
             config,
             model_id,
         })
@@ -159,13 +159,16 @@ impl MultiThreadRuntime {
     ) -> Result<mpsc::UnboundedReceiver<CompletionStreamDelta>> {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
 
-        let task = channels::TokenizeTask {
+        let task = TokenizeTask {
             request_id: uuid::Uuid::new_v4(),
             request: req,
             response_tx,
         };
 
-        self.tokenizer_pool.submit(task).await?;
+        self.tokenizer_tx
+            .send(task)
+            .await
+            .map_err(|_| anyhow::anyhow!("Tokenizer channel closed"))?;
 
         Ok(response_rx)
     }

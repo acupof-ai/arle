@@ -4,12 +4,10 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 
-use super::channels::{RequestId, ScheduleTask, TokenizeTask};
-use crate::server_engine::CompletionRequest;
+use super::channels::{ScheduleTask, TokenizeTask};
 use crate::tokenizer::Tokenizer;
 
 /// Pool of tokenizer workers for parallel text processing
