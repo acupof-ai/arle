@@ -235,6 +235,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_response_includes_token_ids_when_requested() {
+        let app = build_app(mock_scheduler_with_deltas(
+            "Qwen3-4B",
+            vec![
+                CompletionStreamDelta {
+                    text_delta: "A".to_string(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                    token_ids: vec![11],
+                },
+                CompletionStreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 2,
+                        total_tokens: 3,
+                    }),
+                    logprob: None,
+                    token_ids: vec![22],
+                },
+            ],
+            true,
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":2,"return_token_ids":true}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["choices"][0]["token_ids"],
+            serde_json::json!([11, 22])
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_response_uses_loaded_model_id() {
         let app = build_app(mock_scheduler("Qwen3-8B"));
         let request = Request::builder()

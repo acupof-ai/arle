@@ -36,6 +36,24 @@ fn completion_request_accepts_user_alias() {
 }
 
 #[test]
+fn completion_request_accepts_return_token_ids_extension() {
+    let raw = r#"{"prompt":"hi","return_token_ids":true}"#;
+    let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+    assert!(req.return_token_ids_or_default());
+}
+
+#[test]
+fn completion_request_rejects_return_token_ids_with_streaming() {
+    let raw = r#"{"prompt":"hi","stream":true,"return_token_ids":true}"#;
+    let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+    let err = req
+        .validate()
+        .expect_err("streaming token id trajectories are not exposed");
+    assert_eq!(err.body.code, "invalid_parameter");
+    assert_eq!(err.body.param.as_deref(), Some("return_token_ids"));
+}
+
+#[test]
 fn completion_request_accepts_model_alias_by_final_segment() {
     let raw = r#"{"model":"Qwen/Qwen3-4B","prompt":"hi"}"#;
     let req: CompletionRequest = serde_json::from_str(raw).unwrap();
@@ -368,8 +386,37 @@ fn completion_response_drops_non_finite_logprobs() {
             prompt_token_ids: Vec::new(),
             response_token_ids: Vec::new(),
         },
+        false,
     );
 
     let payload = serde_json::to_value(response).unwrap();
     assert!(payload["choices"][0]["logprobs"].is_null());
+    assert!(payload["choices"][0].get("token_ids").is_none());
+}
+
+#[test]
+fn completion_response_exposes_token_ids_when_requested() {
+    let response = CompletionResponse::from_output(
+        "Qwen3-4B".to_string(),
+        1,
+        CompletionOutput {
+            text: "hello".to_string(),
+            finish_reason: crate::server_engine::FinishReason::Stop,
+            usage: crate::server_engine::TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+            },
+            token_logprobs: Vec::new(),
+            prompt_token_ids: Vec::new(),
+            response_token_ids: vec![11, 22],
+        },
+        true,
+    );
+
+    let payload = serde_json::to_value(response).unwrap();
+    assert_eq!(
+        payload["choices"][0]["token_ids"],
+        serde_json::json!([11, 22])
+    );
 }
