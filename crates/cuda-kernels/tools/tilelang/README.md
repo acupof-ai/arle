@@ -85,6 +85,30 @@ through Triton's own runtime.
 - Default build (no `tilelang-attn`) is byte-identical to before this track
   landed.
 
+## macOS Metal dev checkout
+
+For local ARLE development against an upstream TileLang Metal branch, use the
+repo-level wrapper:
+
+```bash
+ARLE_TILELANG_REPO=/tmp/tilelang-metal-pr \
+ARLE_TILELANG_PYTHON=/tmp/arle-tilelang-mac-venv/bin/python \
+  scripts/tilelang_metal_dev_backend.sh smoke
+```
+
+The smoke imports TileLang from that checkout, lowers ARLE's in-tree
+`batch_prefill_paged_hd128.py` attention kernel to Metal, and executes a
+TileLang Metal `T.gemm` kernel on MPS. For a full local server/bench loop:
+
+```bash
+scripts/tilelang_metal_dev_backend.sh bench models/Qwen3-0.6B 8765
+```
+
+This is a Metal dev gate for the local TileLang checkout. The production
+ARLE Metal inference path still runs through `metal_serve` +
+`crates/mlx-sys`; replacing inference ops with TileLang-generated Metal
+kernels requires a separate runtime integration.
+
 ## Risk gates
 
 If `tilelang.compile(...)` cannot AOT-export for `sm_90`, or if the prefill
