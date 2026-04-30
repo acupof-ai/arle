@@ -334,16 +334,72 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn plan_step(&mut self) -> StepPlan {
-        let has_decode = self
+        let runnable_decode_rows = self
             .running_batch
             .iter()
-            .any(|&slot_idx| self.slot_is_runnable_decode(slot_idx));
+            .filter(|&&slot_idx| self.slot_is_runnable_decode(slot_idx))
+            .count();
+        let has_decode = runnable_decode_rows > 0;
         let mut budget = PrefillBudget::from_scheduler(self);
         let scored_candidates = self.collect_prefill_candidates(&budget);
         let candidates = select_prefill_candidates(&mut budget, scored_candidates);
+        let entered_first_batch = self.stats.first_batch_prefill.maybe_enter(
+            !has_decode && self.running_batch.is_empty(),
+            !candidates.is_empty(),
+        );
+        if entered_first_batch {
+            info!(
+                "first-batch prefill drain started: candidates={} prefill_queue={} active={}",
+                candidates.len(),
+                self.prefill_queue.len(),
+                self.active_len()
+            );
+        }
+        if self.stats.first_batch_prefill.active && !has_decode {
+            for candidate in &candidates {
+                if let Some(req_id) = self.request(candidate.slot_idx).map(|req| req.id) {
+                    self.stats
+                        .first_batch_prefill
+                        .include_candidate(candidate.slot_idx, req_id);
+                }
+            }
+        }
+        let mut first_batch_candidates = Vec::new();
+        if self.stats.first_batch_prefill.active && has_decode {
+            self.stats.first_batch_prefill.seal();
+            first_batch_candidates = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    self.request(candidate.slot_idx).is_some_and(|req| {
+                        self.stats
+                            .first_batch_prefill
+                            .contains_candidate(candidate.slot_idx, req.id)
+                    })
+                })
+                .collect();
+        }
+        let first_batch_has_prefill = if self.stats.first_batch_prefill.active && has_decode {
+            !first_batch_candidates.is_empty()
+        } else {
+            !candidates.is_empty()
+        };
+        if let Some((elapsed_ms, rows, tokens, decode_rows)) = self
+            .stats
+            .first_batch_prefill
+            .maybe_exit(first_batch_has_prefill, runnable_decode_rows)
+        {
+            info!(
+                "first-batch prefill drain complete: elapsed={}ms rows={} tokens={} decode_rows={}",
+                elapsed_ms, rows, tokens, decode_rows
+            );
+        }
         if has_decode {
             if candidates.is_empty() {
                 return StepPlan::Decode;
+            }
+            if self.stats.first_batch_prefill.active {
+                return StepPlan::Prefill(first_batch_candidates);
             }
             if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
                 return StepPlan::Mixed(candidates);
@@ -402,6 +458,9 @@ impl<M: ModelForward> Scheduler<M> {
         let admission_us = assign_us + plan_t.elapsed().as_micros();
         let scheduled_prefill_rows = plan.scheduled_prefill_rows();
         let scheduled_prefill_tokens = plan.scheduled_prefill_tokens();
+        self.stats
+            .first_batch_prefill
+            .record_prefill_step(scheduled_prefill_rows, scheduled_prefill_tokens);
 
         assert!(
             self.pending_decode.is_none(),
