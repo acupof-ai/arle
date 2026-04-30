@@ -343,18 +343,20 @@ Phase 1 S5 结论：
 - S3 单目标 32k long-prompt smoke。
 - S4 harness smoke：ARLE 5s smoke，SGLang 60s smoke。
 - S5 ARLE canonical run + SGLang pinned baseline run。
+- P1.0 plan-label counters：`wins/2026-04-30-bench-guidellm-longctx-32k-phase1-s5-plan-label.md`
+  记录 `Mixed=16`、`Split=0`。
 
 缺口：
 
-- ARLE stats/trace 还没有持久化 `plan_label` 计数，S5 不能机器可验地证明
-  `Mixed > 0`、`Split = 0`。
-- W1/c4 需要先补 `+55.2%` output throughput 才到 Phase 1 `0.95x` 门。
-- 达到 mission `1.30x` 还需要相对当前 ARLE `+112.4%`。
+- W1/c4 需要先补 `+55.2%` output throughput 才到 Phase 1 `0.95x` 门
+  （按第一轮 S5 `9.96` vs SGLang `16.27` 计算）。
+- P1.0 复跑暴露新不稳定：同 envelope c=4 只完成 1 个请求，`out tok/s=0.90`，
+  不能作为替代基线，但必须解释。
+- 达到 mission `1.30x` 还需要相对第一轮 ARLE `+112.4%`。
 
-下一刀 = Phase 1 gap closure P1.0：先加 `plan_label` counters，让
-`Mixed/Split/Prefill/Decode` 分布进入 `/v1/stats` 和 S5 wins；随后 profile
-c=4 long prefill，决定是 admission/overlap 先修，还是开 FP8 prefill
-tensor-core kernel 工程。
+下一刀 = Phase 1 gap closure P1.1：profile c=4 long prefill + admission
+progress，解释 P1.0 复跑为什么退化到单请求完成；随后决定是
+admission/overlap 先修，还是开 FP8 prefill tensor-core kernel 工程。
 
 ---
 
