@@ -41,10 +41,21 @@ Do not proceed to Phase 2 as if Phase 1 is green. Open the next tranche as a
 gap-closure pass:
 
 1. Add persistent plan-label counters to the ARLE stats/trace path so S5 can
-   prove `Mixed > 0` and `Split = 0`.
+   prove `Mixed > 0` and `Split = 0`. Done in `0464fb3e`; rerun
+   `wins/2026-04-30-bench-guidellm-longctx-32k-phase1-s5-plan-label.md`
+   recorded `Mixed=16`, `Split=0`.
 2. Profile c=4 long prefill to separate kernel time, scheduler admission, and
    decode overlap.
 3. Target the first +55% lift at W1/c4 before claiming Phase 1 catch-up.
+
+Update after plan-label rerun:
+
+- Observability gate: pass (`Mixed=16`, `Split=0`).
+- Performance gate: still fail, and the rerun was worse at c=4 (`0.90 out
+  tok/s`, only one completed c=4 request in the 300s window).
+- New immediate question: why the same envelope completed six c=4 requests in
+  the first S5 run but only one after the observability-only patch. Treat this
+  as a profiling target before changing kernels.
 
 ## Rule
 
