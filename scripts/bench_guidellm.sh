@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME]
+#   ./scripts/bench_guidellm.sh <backend-label> --workload longctx-32k
 #
 # Environment presets:
 #   WORKLOAD=longctx-32k  32768-in/256-out fixed-concurrency long-context
@@ -30,6 +31,10 @@
 #                        rate=1,2,4,8, data=512-in/128-out, max-seconds=60,
 #                        warmup=5. Short dataset so requests complete in
 #                        seconds on 4–8B models.
+#   --smoke              5s harness validation preset: profile=concurrent,
+#                        rate=1, data=512-in/16-out, no wins entry.
+#   --workload NAME      explicit workload selector; supported:
+#                        default, longctx-32k. Overrides WORKLOAD env.
 #   --concurrencies L    comma-separated concurrency list, e.g. "1,2,4,8".
 #                        Switches profile to `concurrent`.
 #   --data SPEC          override synthetic data spec, e.g.
@@ -109,6 +114,33 @@ RATE_OVERRIDE=""
 WARMUP_OVERRIDE=""
 EXPLORATION_MODE=false
 TRACE_INTERVAL_MS=1000
+SMOKE_MODE=false
+
+# Pre-scan workload/smoke flags before the workload preset is materialized.
+# The main parser below still handles all other flags in their original order.
+PRESET_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workload)
+            [[ $# -ge 2 ]] || { echo "error: --workload requires a value" >&2; exit 2; }
+            WORKLOAD="$2"
+            shift 2
+            ;;
+        --workload=*)
+            WORKLOAD="${1#--workload=}"
+            shift
+            ;;
+        --smoke)
+            SMOKE_MODE=true
+            shift
+            ;;
+        *)
+            PRESET_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${PRESET_ARGS[@]}"
 
 case "$WORKLOAD" in
     default)
@@ -131,6 +163,15 @@ case "$WORKLOAD" in
         ;;
 esac
 
+if [[ "$SMOKE_MODE" == true ]]; then
+    EXPLORATION_MODE=true
+    PROFILE="concurrent"
+    RATE_OVERRIDE="${SMOKE_CONCURRENCY:-1}"
+    DATA="prompt_tokens=${SMOKE_PROMPT_TOKENS:-512},prompt_tokens_stdev=1,prompt_tokens_min=${SMOKE_PROMPT_TOKENS:-512},prompt_tokens_max=${SMOKE_PROMPT_TOKENS:-512},output_tokens=${SMOKE_OUTPUT_TOKENS:-16},output_tokens_stdev=1,output_tokens_min=${SMOKE_OUTPUT_TOKENS:-16},output_tokens_max=${SMOKE_OUTPUT_TOKENS:-16}"
+    MAX_SECONDS="${SMOKE_MAX_SECONDS:-5}"
+    SECONDARY_C1_SECONDS=""
+fi
+
 usage() {
     cat <<EOF
 usage: $(basename "$0") <backend-label> [options]
@@ -142,6 +183,7 @@ Canonical run (produces a wins entry):
   --model NAME           default: $MODEL
   --processor PATH       tokenizer path / HF id (default: local $PROCESSOR_DEFAULT)
   --trace-interval-ms N  /v1/stats polling interval (default: $TRACE_INTERVAL_MS)
+  --workload NAME        supported: default, longctx-32k. Overrides WORKLOAD env.
 
 Environment workloads:
   WORKLOAD=longctx-32k    data=32768-in/256-out, profile=concurrent,
@@ -155,6 +197,8 @@ Exploration mode (faster, no wins entry):
                          data=4096-in/256-out, max-seconds=30
   --quick                 ~4-min preset: profile=concurrent rate=1,2,4,8
                           data=512-in/128-out max-seconds=60 warmup=5
+  --smoke                 5s harness validation preset: profile=concurrent
+                          rate=1 data=512-in/16-out max-seconds=5
   --concurrencies LIST    e.g. "1,2,4,8" (switches profile to concurrent)
   --data SPEC             override synthetic data spec; exploration mode only
   --profile TYPE          sweep|concurrent|synchronous|throughput|…
@@ -195,6 +239,9 @@ while [[ $# -gt 0 ]]; do
             MAX_SECONDS=60
             WARMUP_OVERRIDE="5"
             shift ;;
+        --smoke|--workload|--workload=*)
+            echo "error: internal parser error: preset flag was not consumed: $1" >&2
+            exit 2 ;;
         --concurrencies)
             [[ $# -ge 2 ]] || { echo "error: --concurrencies requires a value" >&2; exit 2; }
             EXPLORATION_MODE=true
@@ -1004,10 +1051,29 @@ fi
 # Copy template, replace placeholders, append the real table into the
 # "Results — sweep headline table" section.
 python3 - "$TEMPLATE_FILE" "$WINS_FILE" "$TABLE_FILE" \
-    "$LABEL" "$DATE" "$COMMIT_SHA" "$MODEL" "$TARGET" "$OUTPUT_DIR" <<'PY'
+    "$LABEL" "$DATE" "$COMMIT_SHA" "$MODEL" "$TARGET" "$OUTPUT_DIR" \
+    "$WORKLOAD" "$PROFILE" "$DATA" "$MAX_SECONDS" "$RANDOM_SEED" \
+    "${RATE_OVERRIDE:-}" "${WARMUP_OVERRIDE:-}" <<'PY'
 import sys, pathlib
 
-template, out, table_file, label, date, sha, model, target, outdir = sys.argv[1:]
+(
+    template,
+    out,
+    table_file,
+    label,
+    date,
+    sha,
+    model,
+    target,
+    outdir,
+    workload,
+    profile,
+    data,
+    max_seconds,
+    random_seed,
+    rate,
+    warmup,
+) = sys.argv[1:]
 body = pathlib.Path(template).read_text()
 table = pathlib.Path(table_file).read_text().rstrip() + "\n"
 
@@ -1019,6 +1085,38 @@ body = body.replace("<short sha>", sha)
 body = body.replace("<Qwen/Qwen3-4B | Qwen/Qwen3.5-4B | ...>", model)
 body = body.replace("http://localhost:8000", target)
 body = body.replace("bench-output/<date>-<label>/", outdir.rstrip('/') + "/")
+
+wrapper = "scripts/bench_guidellm.sh <backend-label>"
+if workload != "default":
+    wrapper = f"scripts/bench_guidellm.sh <backend-label> --workload {workload}"
+params_lines = [
+    "## Canonical params (resolved by wrapper)",
+    "",
+    f"- `--profile {profile}`",
+    f"- `--data {data}`",
+    f"- `--max-seconds {max_seconds}`",
+    f"- `--random-seed {random_seed}`",
+]
+if rate:
+    params_lines.append(f"- `--rate {rate}`")
+if warmup:
+    params_lines.append(f"- `--warmup {warmup}`")
+params_lines.extend(
+    [
+        "- `--outputs json --outputs csv --outputs html`",
+        f"- Workload: `{workload}`",
+        f"- Wrapper: `{wrapper}`",
+        "",
+    ]
+)
+params_block = "\n".join(params_lines)
+params_marker = "## Canonical params (DO NOT CHANGE PER-RUN)"
+parts = body.split(params_marker, 1)
+if len(parts) == 2:
+    tail = parts[1]
+    next_h = tail.find("\n## Results")
+    if next_h != -1:
+        body = parts[0] + params_block + tail[next_h:]
 
 # Replace the skeleton results table with the real one. The template has a
 # header row then a "... sweep auto-steps ..." row; we swap the whole block.

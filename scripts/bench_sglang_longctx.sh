@@ -7,11 +7,15 @@
 #
 # Usage:
 #   scripts/bench_sglang_longctx.sh <label>
+#   scripts/bench_sglang_longctx.sh <label> --smoke
 #
 # Smoke-friendly overrides:
 #   SMOKE=1                         512-in/128-out, c=1, max-seconds=30,
 #                                   no c=1 secondary rerun.
+#   --smoke                         first-class 5s harness validation path.
 #   SGLANG_NO_LAUNCH=1              reuse an existing server at TARGET.
+#   SGLANG_SERVER_COMMIT=<sha>       required to claim a pinned commit when
+#                                   SGLANG_NO_LAUNCH=1 is used.
 #   PROMPT_TOKENS=... OUTPUT_TOKENS=...
 #   CONCURRENCIES=... MAX_SECONDS=...
 #   RUN_SECONDARY_C1=0|1 C1_SECONDS=...
@@ -43,6 +47,29 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 WAIT_SECONDS="${WAIT_SECONDS:-600}"
 OUTPUTS=(json csv html)
 LABEL=""
+SGLANG_COMMIT_FOR_ARTIFACTS="$SGLANG_COMMIT"
+
+PRESET_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --smoke)
+            SMOKE=1
+            SMOKE_MAX_SECONDS="${SMOKE_MAX_SECONDS:-5}"
+            shift
+            ;;
+        --smoke-seconds)
+            [[ $# -ge 2 ]] || { echo "error: --smoke-seconds requires a value" >&2; exit 2; }
+            SMOKE=1
+            SMOKE_MAX_SECONDS="$2"
+            shift 2
+            ;;
+        *)
+            PRESET_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${PRESET_ARGS[@]}"
 
 if [[ "${SMOKE:-0}" == "1" ]]; then
     PROMPT_TOKENS="${SMOKE_PROMPT_TOKENS:-512}"
@@ -67,7 +94,9 @@ Environment:
   CONCURRENCIES=$CONCURRENCIES MAX_SECONDS=$MAX_SECONDS
   RUN_SECONDARY_C1=$RUN_SECONDARY_C1 C1_SECONDS=$C1_SECONDS
   SMOKE=1 for a short non-32k CUDA-light validation shape
+  --smoke for a first-class 5s validation shape
   SGLANG_NO_LAUNCH=1 to reuse an already-running SGLang server
+  SGLANG_SERVER_COMMIT=$SGLANG_COMMIT to mark reused server as pin-verified
 EOF
 }
 
@@ -76,6 +105,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             usage
             exit 0
+            ;;
+        --smoke|--smoke-seconds)
+            echo "error: internal parser error: preset flag was not consumed: $1" >&2
+            exit 2
             ;;
         --*)
             echo "error: unknown flag: $1" >&2
@@ -196,7 +229,11 @@ run_guidellm() {
     done
 
     {
-        echo "SGLANG_COMMIT=$SGLANG_COMMIT"
+        echo "SGLANG_COMMIT=$SGLANG_COMMIT_FOR_ARTIFACTS"
+        if [[ "${SGLANG_NO_LAUNCH:-0}" == "1" ]]; then
+            echo "SGLANG_PIN_EXPECTED=$SGLANG_COMMIT"
+            echo "SGLANG_NO_LAUNCH=1"
+        fi
         echo "SGLANG_LAUNCH_PARAMS=--model-path $MODEL_PATH --kv-cache-dtype $KV_CACHE_DTYPE --max-running-requests $MAX_RUNNING_REQUESTS --mem-fraction-static $MEM_FRACTION_STATIC --disable-radix-cache --max-total-tokens $MAX_TOTAL_TOKENS"
         printf 'guidellm benchmark run'
         local arg
@@ -209,8 +246,49 @@ run_guidellm() {
     guidellm benchmark run "${args[@]}" 2>&1 | tee "$log_file"
 }
 
+validate_guidellm_results() {
+    python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+json_path = pathlib.Path(sys.argv[1])
+obj = json.loads(json_path.read_text())
+benchmarks = obj.get("benchmarks") or []
+if not benchmarks:
+    print(f"guidellm validation failed: no benchmarks in {json_path}", file=sys.stderr)
+    sys.exit(1)
+
+errors = []
+for bm in benchmarks:
+    strategy = bm.get("config", {}).get("strategy", {})
+    rate = strategy.get("type_", "unknown")
+    if rate == "concurrent":
+        rate = f"conc{strategy.get('max_concurrency', '?')}"
+    metrics = bm.get("metrics", {})
+    request_totals = metrics.get("request_totals", {})
+    successful = int(request_totals.get("successful") or 0)
+    output_mean = (metrics.get("output_token_count", {}).get("successful", {}) or {}).get("mean") or 0.0
+    outputs = bm.get("requests", {}).get("successful", []) or []
+    nonempty_outputs = sum(1 for req in outputs if (req.get("output") or "") != "")
+
+    if successful <= 0:
+        errors.append(f"{rate}: no successful requests recorded")
+    elif output_mean > 0.0 and nonempty_outputs == 0:
+        errors.append(
+            f"{rate}: successful requests reported {output_mean:.1f} output tokens on average but every sampled output was empty"
+        )
+
+if errors:
+    print(f"guidellm validation failed for {json_path}:", file=sys.stderr)
+    for line in errors:
+        print(f"  - {line}", file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
 write_headline() {
-    python3 - "$HEADLINE_JSON" "$HEADLINE_TABLE" "$SGLANG_COMMIT" "$PRIMARY_DIR/benchmarks.json" "$SECONDARY_DIR/benchmarks.json" <<'PY'
+    python3 - "$HEADLINE_JSON" "$HEADLINE_TABLE" "$SGLANG_COMMIT_FOR_ARTIFACTS" "$PRIMARY_DIR/benchmarks.json" "$SECONDARY_DIR/benchmarks.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -269,6 +347,140 @@ pathlib.Path(out_table).write_text("\n".join(lines) + "\n")
 PY
 }
 
+write_wins_entry() {
+    if [[ "${SMOKE:-0}" == "1" ]]; then
+        echo ">>> smoke mode — skipping SGLang wins entry seed"
+        return 0
+    fi
+    if [[ "${SGLANG_NO_LAUNCH:-0}" == "1" && "${SGLANG_SERVER_COMMIT:-}" != "$SGLANG_COMMIT" ]]; then
+        echo ">>> reused SGLang server commit is unverified — skipping wins entry seed"
+        echo "    set SGLANG_SERVER_COMMIT=$SGLANG_COMMIT only when the running server is pinned"
+        return 0
+    fi
+
+    local wins_dir="$REPO_ROOT/docs/experience/wins"
+    local wins_base="$wins_dir/${DATE}-bench-sglang-longctx-${LABEL}"
+    local wins_file="${wins_base}.md"
+    local wrun=1
+    while [[ -e "$wins_file" ]]; do
+        wrun=$((wrun + 1))
+        wins_file="${wins_base}-run${wrun}.md"
+    done
+
+    python3 - "$wins_file" "$LABEL" "$DATE" "$SGLANG_COMMIT_FOR_ARTIFACTS" \
+        "$SGLANG_COMMIT" "$MODEL" "$MODEL_PATH" "$TARGET" "$OUTPUT_DIR" \
+        "$PROMPT_TOKENS" "$OUTPUT_TOKENS" "$CONCURRENCIES" "$MAX_SECONDS" \
+        "$RUN_SECONDARY_C1" "$C1_SECONDS" "$HEADLINE_TABLE" \
+        "$KV_CACHE_DTYPE" "$MAX_RUNNING_REQUESTS" "$MEM_FRACTION_STATIC" \
+        "$MAX_TOTAL_TOKENS" "$RANDOM_SEED" <<'PY'
+import pathlib
+import sys
+
+(
+    wins_file,
+    label,
+    date,
+    actual_commit,
+    expected_commit,
+    model,
+    model_path,
+    target,
+    output_dir,
+    prompt_tokens,
+    output_tokens,
+    concurrencies,
+    max_seconds,
+    run_secondary_c1,
+    c1_seconds,
+    table_file,
+    kv_cache_dtype,
+    max_running_requests,
+    mem_fraction_static,
+    max_total_tokens,
+    random_seed,
+) = sys.argv[1:]
+table = pathlib.Path(table_file).read_text().rstrip()
+data_spec = (
+    f"prompt_tokens={prompt_tokens},prompt_tokens_stdev=1,"
+    f"prompt_tokens_min={prompt_tokens},prompt_tokens_max={prompt_tokens},"
+    f"output_tokens={output_tokens},output_tokens_stdev=1,"
+    f"output_tokens_min={output_tokens},output_tokens_max={output_tokens}"
+)
+launch = (
+    f"python3 -m sglang.launch_server --model-path {model_path} "
+    f"--kv-cache-dtype {kv_cache_dtype} "
+    f"--max-running-requests {max_running_requests} "
+    f"--mem-fraction-static {mem_fraction_static} --disable-radix-cache "
+    f"--max-total-tokens {max_total_tokens}"
+)
+body = f"""# SGLang longctx baseline — {label}, {date}
+
+## Goal
+
+- Baseline: capture the pinned SGLang longctx-32k reference row for ARLE
+  Phase 1 S4.
+
+## Hypothesis
+
+- SGLang at the project pin provides the reproducible competitor baseline for
+  prompt={prompt_tokens}, output={output_tokens}, c={concurrencies}.
+
+## Command
+
+```bash
+scripts/bench_sglang_longctx.sh {label}
+```
+
+## Environment
+
+- **Backend:** SGLang
+- **Model:** {model}
+- **Weights:** `{model_path}`
+- **Target:** `{target}`
+- **Commit:** `{actual_commit}`
+- **Expected pin:** `{expected_commit}`
+- **Launch:** `{launch}`
+
+## Canonical params
+
+- `--profile concurrent`
+- `--data {data_spec}`
+- `--rate {concurrencies}`
+- `--max-seconds {max_seconds}`
+- `--random-seed {random_seed}`
+- Secondary c=1 run: `{run_secondary_c1}` (`{c1_seconds}s`)
+
+## Results
+
+{table}
+
+## Problems
+
+- Pending reviewer fill-in after the remote run if startup, CUDA memory, or
+  GuideLLM validation deviated from the watch-list.
+
+## Learnings
+
+- Pending remote run.
+
+## Delta vs baseline
+
+- First pinned SGLang longctx-32k baseline for this mission slice.
+
+## Artefacts
+
+- Raw: `{output_dir}/`
+- Primary: `{output_dir}/guidellm-primary/benchmarks.json`
+- Secondary c=1: `{output_dir}/guidellm-c1-secondary/benchmarks.json`
+- Headline: `{output_dir}/headline_table.md`
+- Server log: `{output_dir}/sglang_server.log`
+"""
+pathlib.Path(wins_file).write_text(body)
+PY
+
+    echo "    wins    : $wins_file"
+}
+
 SGLANG_PID=""
 cleanup() {
     if [[ -n "$SGLANG_PID" ]] && kill -0 "$SGLANG_PID" >/dev/null 2>&1; then
@@ -290,6 +502,13 @@ echo "    output : $OUTPUT_DIR"
 
 if [[ "${SGLANG_NO_LAUNCH:-0}" == "1" ]]; then
     echo "    server : reusing existing target"
+    if [[ "${SGLANG_SERVER_COMMIT:-}" == "$SGLANG_COMMIT" ]]; then
+        SGLANG_COMMIT_FOR_ARTIFACTS="$SGLANG_SERVER_COMMIT"
+        echo "    pin    : verified by SGLANG_SERVER_COMMIT"
+    else
+        SGLANG_COMMIT_FOR_ARTIFACTS="unverified-existing-server(expected:${SGLANG_COMMIT})"
+        echo "    pin    : unverified existing server; wins entry will not be seeded"
+    fi
 else
     ensure_sglang_checkout
     echo "    server : launching SGLang"
@@ -311,13 +530,16 @@ fi
 
 wait_for_server
 run_guidellm "$PRIMARY_DIR" "$CONCURRENCIES" "$MAX_SECONDS"
+validate_guidellm_results "$PRIMARY_DIR/benchmarks.json"
 
 if [[ "$RUN_SECONDARY_C1" == "1" && "$CONCURRENCIES" == *"1"* && "${SMOKE:-0}" != "1" ]]; then
     mkdir -p "$SECONDARY_DIR"
     run_guidellm "$SECONDARY_DIR" "1" "$C1_SECONDS"
+    validate_guidellm_results "$SECONDARY_DIR/benchmarks.json"
 fi
 
 write_headline
+write_wins_entry
 
 echo
 echo ">>> headline table"
