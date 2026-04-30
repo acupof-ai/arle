@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::kv_tier::{BlockLocation, IndexEntryState, StoreState};
-use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, BlockSelectionIntent};
+use crate::prefix_cache::BlockId;
 use crate::types::{BlockFingerprint, SessionId};
 
 /// Thread-safe wrapper around RadixCache with coordinated access

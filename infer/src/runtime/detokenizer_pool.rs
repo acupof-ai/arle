@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use super::channels::{DetokenizeTask, RequestId};
-use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
+use crate::server_engine::{CompletionStreamDelta, TokenUsage};
 use crate::tokenizer::Tokenizer;
 
 /// Pool of detokenizer workers for parallel token-to-text conversion
