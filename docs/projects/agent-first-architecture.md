@@ -28,15 +28,12 @@ for the PR-discipline contract that survived the revert.
 > - **A2** (HTTP `session_id`) — plumbed in `http_server/openai_v1.rs`
 >   and `scheduler/types.rs::IncomingRequest`; **scheduler does not consume
 >   it yet**. Still open.
-> - **B1** (Session save/load + disk tier) — `infer/src/session_store.rs`
->   was never created; the disk tier landed instead as
->   `infer/src/kv_tier/transport/disk.rs::DiskStore`. The HTTP routes
->   are scoped under `tiered-kv-cache.md` §6 M4.
-> - **B3** (Session-aware eviction) — landed as
+> - **B2** (Session-aware eviction) — landed as
 >   `infer/src/scheduler/policy.rs::SessionBiasedLru` (and 3 sibling
 >   `EvictionPolicy` impls). **Trait shipped, zero call sites** —
 >   convergence onto the policy trait is `tiered-kv-cache.md` §5.4.1
->   under M3b.
+>   under M3b. (Renumbered 2026-04-30 from B3 to B2 after the deletion
+>   of the unimplemented session save/load tier.)
 > - **C6** (Agent workload benchmark) — **shipped** as
 >   `scripts/bench_agent_trace.py`.
 >
@@ -200,28 +197,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 
 ### Tier B — defines whether we are professional
 
-#### B1. Session KV snapshot persistence (needs A1)
-> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 M4
-> (formerly P3, renumbered 2026-04-15). B1 is folded into the Tiered KV
-> Cache project. The proposed `infer/src/session_store.rs` does not land
-> as a standalone module; its functionality ships as
-> `kv_tier::transport::disk` (T2 tier after the 2026-04-15 T0/T2/T3/T4 →
-> T0/T1/T2/T3 renumber) plus the HTTP save/load handlers. Radix `serde`
-> lands in M1 as an M4 precondition.
-
-- **What**: `POST /v1/sessions/{id}/save` serializes radix nodes + their
-  KV blocks to local storage. `POST /v1/sessions/{id}/load` re-attaches.
-  Pair with a graceful shutdown hook to persist on SIGTERM.
-- **Why**: Agent processes restart (deploys, OOM, preemption); cold-start
-  prefill tax on a 30k-token system prompt should be payable once.
-- **Where**:
-  - `infer/src/prefix_cache.rs` — serde for nodes.
-  - New: `infer/src/session_store.rs` — LMDB or file-based block storage.
-  - `infer/src/http_server.rs` — session routes.
-- **Exit**: Restart → first request for saved session has TTFT within 20%
-  of the pre-restart warm-state baseline.
-
-#### B2. Streaming tool-call delta protocol
+#### B1. Streaming tool-call delta protocol
 - **What**: Incremental JSON parser tracks the decode stream and emits
   OpenAI-shaped `delta.tool_calls[].function.arguments` chunks as they
   form, instead of post-hoc splitting the full output text.
@@ -235,14 +211,14 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **Exit**: A streaming client observes monotonically-growing tool-call
   arguments; no mid-stream content↔tool_call rewrites.
 
-#### B3. Policy signals for prefix / session awareness
+#### B2. Policy signals for prefix / session awareness
 > **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 M3
 > (formerly P2, renumbered 2026-04-15). The signal extension itself has
 > already shipped (commit `3e1d35f`); the remaining `EvictionPolicy`
 > trait + `SessionBiasedLru` default is already defined in
 > `scheduler/policy.rs:179-189` but has zero scheduler callers — it
 > lands as the M3b coordinator+watermarks stacked PR. When M3 ships,
-> move B3 to Done.
+> move B2 to Done.
 
 - **What**: Extend `infer::scheduler::policy::SchedulerSignals` with
   `prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`. Add a built-in
@@ -257,7 +233,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **Exit**: Benchmarks show warm (session-continuation) requests do not
   get starved behind bursts of cold requests.
 
-#### B4. Generic HuggingFace layer fallback
+#### B3. Generic HuggingFace layer fallback
 - **What**: A slow-path model loader that can serve any HF architecture
   by composing existing `ops::{linear, norm, attention, embedding}` with
   a config-driven layer graph. No new CUDA kernels required per model.
@@ -377,21 +353,20 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 This order respects blocking dependencies and defers work that rewrites
 after A1 lands.
 
-1. **A1** — radix cache into CUDA scheduler *(blocks A2/A4/B1)*
+1. **A1** — radix cache into CUDA scheduler *(blocks A2/A4)*
 2. **C6** — agent bench script *(gives A1 a scoreboard)*
 3. **A2** — session-sticky routing
 4. **A3** — constrained decoding *(independent of A1, ship in parallel if
    bandwidth allows)*
-5. **B3** — prefix/session policy signals
-6. **B2** — streaming tool-call delta
+5. **B2** — prefix/session policy signals
+6. **B1** — streaming tool-call delta
 7. **A4** — speculative decoding end-to-end
-8. **B1** — session KV snapshot persistence
-9. **C1** — single-command serve
-10. **C2** — Rust library quickstart
-11. **C3** — trace endpoint + doctor
-12. **C5** — CPU backend real inference
-13. **B4** — generic HF fallback
-14. **C4** — Pyo3 embedding crate
+8. **C1** — single-command serve
+9. **C2** — Rust library quickstart
+10. **C3** — trace endpoint + doctor
+11. **C5** — CPU backend real inference
+12. **B3** — generic HF fallback
+13. **C4** — Pyo3 embedding crate
 
 A1+A2+A3 together are what take `agent-infer` from "building blocks" to
 "actually agent-grade". Everything after that compounds, but nothing after
@@ -404,7 +379,7 @@ A4 is on the critical path for the stated goal.
 - **New kernel microoptimization**. Every item here is connection or
   protocol work. Kernel perf is a separate track (see
   `experience/wins/` for the ongoing optimization log).
-- **New model families via hand-written fast paths**. B4 handles the
+- **New model families via hand-written fast paths**. B3 handles the
   breadth need via a generic slow path; hand-written fast paths remain
   opportunistic.
 - **Training / fine-tuning**. Out of scope; `agent-infer` is an
@@ -431,7 +406,7 @@ A4 is on the critical path for the stated goal.
 ## 6 · Related docs
 
 - [`tiered-kv-cache.md`](tiered-kv-cache.md) — Hierarchical KV cache project.
-  Owns the implementation shape for A1, B1, and B3. Any contract change
+  Owns the implementation shape for A1 and B2. Any contract change
   affecting those three items lands there first and propagates here.
 - `docs/architecture.md` — current workspace/package topology and the
   surviving "Workspace governance rules" (PR discipline + crate-admission

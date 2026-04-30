@@ -67,7 +67,7 @@ confuse readers about which project they are looking at.
 
 ---
 
-## 3 · Current state (2026-04-16, post M2b + M0.3 + M3a + M3b + M3c + Tier A/B/C remote acceptance AND M4 a/b/c/d local BLAKE3 / disk / reconcile / session save-load)
+## 3 · Current state (2026-04-16, post M2b + M0.3 + M3a + M3b + M3c + Tier A/B/C remote acceptance AND M4 a/b/c local BLAKE3 / disk / reconcile; M4d session save/load deleted 2026-04-30)
 
 Updated after M1a + M1b + M2a landed (commits `08718ad`, `323aee0`,
 `4402ab0`) **and** the 2026-04-15 local batches that (a) switched CUDA
@@ -94,18 +94,23 @@ On top of that, the 2026-04-16 M4 local batch shipped:
 `KvContentContext` input chain + `Scheduler::model_fingerprint` +
 `KVFormat::stable_tag`), `c7cc0d6` (M4b `DiskStore` postcard header
 + fingerprint-hex `.kv` filename + magic/version/fingerprint
-check), `7b72d02` (M4c `RadixCache::reconcile` + full serde
-round-trip + runtime-only fields marked `#[serde(skip)]`), and
-`c87c68b` (M4d pure-Rust `infer/src/http_server/sessions.rs` with
-`save_session` / `load_session` / `LoadedSession` / 3 end-to-end
-unit tests). M4 remote CUDA acceptance landed 2026-04-16
+check), and `7b72d02` (M4c `RadixCache::reconcile` + full serde
+round-trip + runtime-only fields marked `#[serde(skip)]`). M4 remote
+CUDA acceptance landed 2026-04-16
 (`docs/experience/wins/2026-04-16-tiered-kv-m4*-local.md` +
 `tier-abc-remote.md`).
 
+M4d (pure-Rust `infer/src/http_server/sessions.rs` with
+`save_session`/`load_session`) was deleted on 2026-04-30 — the
+implementation was test-only (`#[cfg(test)]`-gated), production
+engines never wired the `SessionPersistence` trait, and the HTTP
+routes always returned 501. If session persistence is revived,
+build it with the production save/load paths gated to non-test code
+from the start.
+
 The remaining live gaps are: remote/shared staged readmission beyond the
-current local CUDA path, the HTTP route wrappers around the M4d session
-module, and the Metal MLX wired-memory bindings that were cut from the M4
-batch. The detailed target design for that next tranche now lives in
+current local CUDA path, and the Metal MLX wired-memory bindings that
+were cut from the M4 batch. The detailed target design for that next tranche now lives in
 [`../plans/tiered-kv-hicache-readmission.md`](../plans/tiered-kv-hicache-readmission.md),
 which records the `L0/L1/L2/L3` physical hierarchy, the
 `KVBlock / KVSpan / KVHandle` object model, the three-queue
@@ -126,7 +131,7 @@ materialises the matched prefix.
 | CUDA scheduler prefix logic | **Hot path is now honest and deletion-first**: `assign_slots()` still uses `lookup_or_stage(...)` for tier-aware classification, but now turns staged hits into `ReadmissionPlan + FetchTicket + Phase::WaitingFetch` when the prefix lives below T0. Paged-prefill models direct-attach radix-backed GPU pages to a fresh slot when already runnable on T0, and otherwise resume only after `promote_fetched_prefix(...)` rebuilds GPU-resident pages from T1/T2-backed bytes. Non-paged models still fall back to same-slot contiguous-state reuse. `cleanup()` demotes T0 blocks into T1, spills T1 to T2 under watermarks, and updates radix metadata in one path. The live local path also publishes coordinator fetch/store queue depth, waiters, and backpressure flags through `ServerMetrics`, and staged readmission now falls back to cold prefill before submitting new fetch work when the fetch queue is saturated. | `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs`, `infer/src/scheduler/cuda/prefill.rs`, `infer/src/scheduler/cuda/decode.rs` |
 | Operator-facing surface | **Converged**: there is no longer any CLI or engine entry point for the retired contiguous CPU offload path. Operator-visible KV controls are the live scheduler/tier config and disk/session plumbing only. | `infer/src/server_engine.rs`, `crates/cli/src/{args,lib}.rs`, `infer/src/scheduler/types.rs` |
 | `infer/src/kv_tier/` | `directory.rs` **deleted** in M1a (commit `08718ad`). The live local path now keeps one source of truth: `lookup.rs` classifies hits, `readmission.rs` carries request-local staged plans, `host_pool.rs` wraps the Zig T1 arena, `coordinator.rs` owns local plan/fetch/store queues, `transport/disk.rs` persists node-local T2, and `transport/shared_fs.rs` exposes a minimal cluster-shared backend using the same fetch/store contract. `NixlTransport` now builds under either `rdma-nixl` (explicit stub dependency) or `rdma-nixl-real` (explicit real-link dependency) instead of silently sharing the same Cargo dep shape. Direct GPU attachment, local staged readmission, shared-fs readmission/store, and queue cancellation/backpressure are live locally. | `infer/src/kv_tier/**`, `infer/src/scheduler/cuda/runtime.rs` |
-| `BlockId` unification | **Done (M0.1).** `infer/src/types.rs:8` is canonical `BlockId(u32)`; `prefix_cache::BlockId` and `kv_tier::id::BlockId` re-export. `block_manager::BlockId` deleted. `BlockFingerprint([u8; 16])` now has local publish-time call sites via `compute_from_tokens`, but M4 session save/load is still the first consumer that must survive restart / reconciliation. | `infer/src/types.rs:8` |
+| `BlockId` unification | **Done (M0.1).** `infer/src/types.rs:8` is canonical `BlockId(u32)`; `prefix_cache::BlockId` and `kv_tier::id::BlockId` re-export. `block_manager::BlockId` deleted. `BlockFingerprint([u8; 16])` now has local publish-time call sites via `compute_from_tokens`. The cross-restart reconciliation primitives (`Scheduler::install_restored_kv`, `RadixCache::reconcile`) survived the 2026-04-30 session save/load deletion and remain available for any future persistence work. | `infer/src/types.rs:8` |
 | `infer::scheduler::policy` | Trait + 4 impls (`LruEviction`, `ReuseBiasedLru`, `HitCountLru`, `SessionBiasedLru`) plus `EvictionCandidate` data struct + `SchedulerSignals`. **M3b local runtime wire landed**: `RadixCache::evict_with_policy` exists, cleanup/allocation eviction now consumes live queue/decode-derived signals rather than `SchedulerSignals::default()`, and published blocks stamp session/keepalive metadata. Tier C local follow-on promoted the prefix-cache watermarks / keepalive knobs onto `SchedulerConfig`; combined remote CUDA acceptance is still pending. | `infer/src/scheduler/policy.rs`, `infer/src/prefix_cache.rs`, `infer/src/scheduler/cuda/core.rs` |
 | A2 session_id plumbing | `IncomingRequest::session_id` populated from HTTP; scheduler now propagates it onto published radix blocks for keepalive/affinity metadata, but it still does not drive full coordinator routing or cross-request staged promotion. | `infer/src/scheduler/types.rs`, `infer/src/http_server/openai_v1.rs`, `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs` |
 | Metal KV pool | `SlotLedger` refcount-only, MLX unified memory, no tier concept. Untouched by M1/M2a. | `infer/src/backend/metal/kv_pool.rs` |
@@ -139,7 +144,7 @@ Seven facts shape everything below (original fact 6 "P1(a) shipped, P1(b) never 
 1. **Production data path is deletion-first and locally split into three real reuse modes.** `paged_kv.rs` now retains pages through `free_slot`, paged-prefill models can direct-attach radix-backed GPU pages and rely on tail-page COW before append, staged prefixes can round-trip `host/disk/shared-fs -> host -> T0` through `ReadmissionPlan + FetchTicket + promote_fetched_prefix`, and non-paged models still use same-slot resurrection instead of scanning `cached_prompts`. Local coordinator fetch/store queue depth, waiters, backpressure, and cancellation are visible through `ServerMetrics`; the remaining gap is remote CUDA validation plus non-shared-fs RDMA transports.
 2. **`RadixCache` is now load-bearing for CUDA admission, publish, and eviction.** The radix is no longer just a shadow observer: it drives reusable-prefix selection, holds the pinned-page ownership map, owns tier/session/keepalive/fingerprint metadata, and now keeps a private `block_index` for O(1) `BlockId` lookup. What it still does **not** own yet is the cross-restart reconciliation logic that turns those fingerprints into durable identity.
 3. **Per-format `page_size` dispatch is accepted remotely and no longer blocks M3.** BF16 lifted to `page_size = 16`; INT8 / FP8 / TurboQuant deliberately remain at `page_size = 1` until their token-granular kernels are rewritten. The remaining CUDA gate is the combined Tier A/B/C follow-on acceptance, not the allocator/kernel rewrite.
-4. **`BlockId` unified, `BlockFingerprint` now computes at publish time with a real BLAKE3 hash over a full domain-tagged input chain.** `BlockFingerprint::compute(KvContentContext, tokens)` mixes `model_fingerprint`, `kv_format_tag`, `parent`, and `tokens` under a version-tagged prefix (`"infer-kv-v2\x00"`), and the reload path uses `RadixCache::reconcile(known)` to remap ids against a fresh pool. **Save format addresses blocks by fingerprint, not by `BlockId`** — pool slot ids do not survive a restart. What is still deferred: a real weight-checksum upgrade for `model_fingerprint` (currently `blake3(model_id)` as a per-engine stable identifier), and the HTTP route wrappers around `save_session` / `load_session`.
+4. **`BlockId` unified, `BlockFingerprint` now computes at publish time with a real BLAKE3 hash over a full domain-tagged input chain.** `BlockFingerprint::compute(KvContentContext, tokens)` mixes `model_fingerprint`, `kv_format_tag`, `parent`, and `tokens` under a version-tagged prefix (`"infer-kv-v2\x00"`), and the reload path uses `RadixCache::reconcile(known)` to remap ids against a fresh pool. **Save format addresses blocks by fingerprint, not by `BlockId`** — pool slot ids do not survive a restart. What is still deferred: a real weight-checksum upgrade for `model_fingerprint` (currently `blake3(model_id)` as a per-engine stable identifier).
 5. **The old contiguous CPU offload surface is gone.** The runtime no longer produces or consumes `k_host/v_host` shadow buffers, and there is no surviving CLI/engine shim for that path. Local operator surface now has one truth for CUDA KV residency: the tiered-KV runtime and its scheduler config. Remaining work is remote CUDA regression validation, not API cleanup. See §8 pitfall 13.
 6. **`policy.rs` scoring trait is now wired into live cleanup/allocation eviction, but the knobs moved to `SchedulerConfig`.** The current follow-on work is no longer "converge onto the policy trait"; it is "keep the configured high/low/retain/keepalive values bench-backed while the Tier A/B/C remote CUDA gate is still pending." See §5.4 convergence note.
 7. **`NixlTransport` trait shape is the right bet.** `type Op: Send` + explicit `poll()` + `abort()` — survives the Codex review unchanged. NIXL ↔ Mooncake plugin compatibility confirmed in 2026-04-15 industry research.
@@ -1110,13 +1115,16 @@ for the stacked M2b + M0.3 + M3a local batches.
    (b) cancels the demote and returns the T0 location — never
    returns stale bytes
 
-### M4 — T2 disk tier + session save/load + first Metal contact
+### M4 — T2 disk tier + first Metal contact
 
 **What**: Add the real coordinator path for T1→T2 spill under watermark.
 Change `DiskStore` wire format from raw-bytes dump to postcard header +
-blake3-hash filename (task doc §4.2 spec). Add
-`POST /v1/sessions/{id}/save` and `POST /v1/sessions/{id}/load` routes
-for session persistence.
+blake3-hash filename (task doc §4.2 spec).
+
+> **Note (2026-04-30):** session save/load HTTP routes were originally
+> part of M4 but the production wiring never landed; the test-only
+> implementation was deleted. See the §3 status note for the full
+> rationale.
 
 **Cross-restart identity must be `BlockFingerprint`, not `BlockId`**
 (Codex review 2026-04-15). `BlockId(u32)` is a pool slot index and
@@ -1151,18 +1159,13 @@ post-M4 optimization if disk footprint becomes the bottleneck.
 
 **Files**:
 - `infer/src/kv_tier/transport/disk.rs` — wire format change
-- `infer/src/http_server.rs:422-427` — new routes
-- `infer/src/http_server/sessions.rs` — new, save/load handlers
 - `crates/mlx-sys/src/lib.rs` — bindings for wired memory
 - `infer/src/backend/metal/kv_pool.rs` — bounded `max_total_tokens` at init
 - `infer/src/backend/metal/prefix_cache.rs` — T2 hook via `TieredKvCache`
   façade
 
 **Exit**:
-1. Restart smoke test: save a 30k-token system prompt session, kill the
-   process, restart, reload, measure TTFT. Must land within 20% of the
-   pre-restart warm-state baseline.
-2. Metal backend with bounded `max_total_tokens` runs a long-context
+1. Metal backend with bounded `max_total_tokens` runs a long-context
    test without a `prepare count underflow` kernel panic.
 
 ### M5 — Real NIXL RDMA path (deferred)
