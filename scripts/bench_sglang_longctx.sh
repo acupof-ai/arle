@@ -38,7 +38,7 @@ BACKEND="${BACKEND:-openai_http}"
 BACKEND_KWARGS="${BACKEND_KWARGS:-{\"validate_backend\":\"/v1/models\",\"request_format\":\"/v1/completions\"}}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
-MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-131072}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-140000}"  # 4 * (32768 + 256) + margin
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 WAIT_SECONDS="${WAIT_SECONDS:-600}"
 OUTPUTS=(json csv html)
@@ -152,6 +152,12 @@ wait_for_server() {
     until curl -sS -f "$TARGET/v1/models" >/dev/null 2>&1; do
         if (( SECONDS >= deadline )); then
             echo "error: SGLang server did not become ready within ${WAIT_SECONDS}s" >&2
+            echo "       log: $SERVER_LOG" >&2
+            exit 3
+        fi
+        # Verify SGLang process is still alive (if we launched it)
+        if [[ "${SGLANG_NO_LAUNCH:-0}" != "1" ]] && ! kill -0 "$SGLANG_PID" 2>/dev/null; then
+            echo "error: SGLang process $SGLANG_PID exited during startup" >&2
             echo "       log: $SERVER_LOG" >&2
             exit 3
         fi
@@ -289,6 +295,7 @@ else
     echo "    server : launching SGLang"
     (
         cd "$SGLANG_DIR"
+        export PYTHONPATH="$SGLANG_DIR/python:$PYTHONPATH"
         python3 -m sglang.launch_server \
             --host "$HOST" \
             --port "$PORT" \
