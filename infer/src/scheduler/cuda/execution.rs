@@ -355,32 +355,37 @@ impl<M: ModelForward> Scheduler<M> {
                 self.active_len()
             );
         }
-        if self.stats.first_batch_prefill.active && !has_decode {
-            for candidate in &candidates {
-                if let Some(req_id) = self.request(candidate.slot_idx).map(|req| req.id) {
+        if self.stats.first_batch_prefill.admission_open() {
+            let queued_slots: Vec<usize> = self.prefill_queue.iter().copied().collect();
+            for slot_idx in queued_slots {
+                if let Some(req_id) = self.request(slot_idx).map(|req| req.id) {
                     self.stats
                         .first_batch_prefill
-                        .include_candidate(candidate.slot_idx, req_id);
+                        .include_candidate(slot_idx, req_id);
                 }
             }
         }
         let mut first_batch_candidates = Vec::new();
         if self.stats.first_batch_prefill.active && has_decode {
-            self.stats.first_batch_prefill.seal();
-            first_batch_candidates = candidates
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    self.request(candidate.slot_idx).is_some_and(|req| {
-                        self.stats
-                            .first_batch_prefill
-                            .contains_candidate(candidate.slot_idx, req.id)
+            if self.waiting.is_empty() {
+                self.stats.first_batch_prefill.seal();
+                first_batch_candidates = candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        self.request(candidate.slot_idx).is_some_and(|req| {
+                            self.stats
+                                .first_batch_prefill
+                                .contains_candidate(candidate.slot_idx, req.id)
+                        })
                     })
-                })
-                .collect();
+                    .collect();
+            } else {
+                first_batch_candidates = candidates.clone();
+            }
         }
         let first_batch_has_prefill = if self.stats.first_batch_prefill.active && has_decode {
-            !first_batch_candidates.is_empty()
+            !first_batch_candidates.is_empty() || !self.waiting.is_empty()
         } else {
             !candidates.is_empty()
         };
@@ -395,11 +400,15 @@ impl<M: ModelForward> Scheduler<M> {
             );
         }
         if has_decode {
+            if self.stats.first_batch_prefill.active {
+                return if first_batch_candidates.is_empty() {
+                    StepPlan::Idle
+                } else {
+                    StepPlan::Prefill(first_batch_candidates)
+                };
+            }
             if candidates.is_empty() {
                 return StepPlan::Decode;
-            }
-            if self.stats.first_batch_prefill.active {
-                return StepPlan::Prefill(first_batch_candidates);
             }
             if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
                 return StepPlan::Mixed(candidates);
