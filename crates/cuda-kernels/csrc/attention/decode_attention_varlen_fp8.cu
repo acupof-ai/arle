@@ -1,41 +1,18 @@
-// Variable-length Q + paged FP8 E4M3 KV decode/prefill attention.
+// Variable-length Q + paged quantized KV attention for Qwen3 HD128.
 //
-// Unblocks `StepPlan::Mixed` for FP8 KV pools. Mirrors the qlen=1 split-KV
-// kernel in `decode_attention_quantized.cu` but generalizes it to:
+// This is the mixed decode+prefill attention path for FP8 E4M3 and INT8 KV
+// pools. It uses FlashDecoding-style split-KV: phase 1 computes one partial
+// softmax accumulator per (q_token, q_head, split), and phase 2 merges those
+// partials over the split axis.
 //
-//   1. Variable Q length per request (qo_indptr-driven).
-//      qlen=1 rows are pure decode; qlen>1 rows are prefill chunks.
-//   2. Optional FlashAttention-2 style causal masking on prefill rows.
-//   3. Single-CTA-per-(q_token, q_head) — one block tile streams the
-//      entire KV history for that row, accumulates online softmax, and
-//      writes the output. No split-KV reduction; varlen makes split-KV
-//      hard because per-row qlen varies and the partial-merge math
-//      assumes uniform qlen=1.
+// Pool layout is NHD durable storage:
+//   data:   [max_pages, page_size, num_kv_heads, HEAD_DIM]
+//   scales: [max_pages * page_size, num_kv_heads] when present
 //
-// FP8 E4M3 has no scale tensor (self-describing 8-bit float). We dequant
-// inline as we read the pool. The pool layout is the same NHD page layout
-// the rest of the FP8 path uses:
-//
-//     k_pool / v_pool: __nv_fp8_e4m3 [max_pages, page_size, num_kv_heads, HEAD_DIM] (NHD)
-//     stride_page = num_kv_heads * page_size * HEAD_DIM
-//
-// Indexing helpers:
-//   - qo_indptr[bz..bz+1]   → q_token range for sequence `bz`
-//   - kv_indptr[bz..bz+1]   → page-index range for sequence `bz`
-//   - kv_indices[...]       → physical page ids
-//   - last_page_len[bz]     → tokens used in the final page (others full)
-//
-// Reads `qlen` from `qo_indptr` per row; reads `kv_total_len` from
-// `(num_kv_pages - 1) * page_size + last_page_len[bz]` (matches the
-// existing FP8 decode kernel and prefill_attention_paged_prep).
-//
-// HD128 only for now — Qwen3-4B/8B/14B all have head_dim=128. HD256
-// (Qwen3.5) reuses the FlashInfer mixed path; quantized HD256 is a
-// future extension.
-//
-// Block size: BLOCK_SIZE = 128 threads = 4 warps. EPT = HEAD_DIM/WARP_SIZE
-// = 4. Each warp owns one Q feature stripe (dims [lane*4 .. lane*4+3])
-// and reduces the QK partial across lanes via __shfl_xor.
+// The FP8 pool currently stores scaled E4M3 values. Therefore FP8 may pass
+// K/V scale pointers. Null scale pointers are still accepted for scale-free
+// fixtures; INT8 always requires scales and is selected by the `int8_kv` C API
+// flag.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -48,62 +25,90 @@
 #define VLF8_BLOCK_SIZE (VLF8_NUM_WARPS * VLF8_WARP_SIZE)
 
 namespace {
-// Pool page size baked into the existing FP8 path. Aligned with
-// `kQuantPageSize` in decode_attention_quantized.cu.
 constexpr int kPageSize = 16;
+constexpr int kMaxSplits = 16;
+constexpr int kSplitTokens = 4096;
 }
 
 __device__ __forceinline__ float vlf8_warp_reduce_sum(float val) {
     #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
+    for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
     return val;
 }
 
-// ============================================================================
-// Single-CTA-per-(q_token, q_head) varlen FP8 attention.
-//
-// Grid: (total_q_tokens, num_q_heads)
-// Block: VLF8_BLOCK_SIZE = 128 threads
-//
-// Each block:
-//   1. Resolves its sequence index `bz` via a binary search over qo_indptr.
-//   2. Loads its Q row (HEAD_DIM bf16 elements) into registers.
-//   3. Streams KV pages for `bz`, dequantizing FP8 → float in registers.
-//   4. Applies causal mask if `causal && qlen > 1`.
-//   5. Online softmax across all KV tokens.
-//   6. Cross-warp merge via shared mem, writes bf16 output.
-// ============================================================================
-template <int HEAD_DIM, bool CAUSAL>
-__global__ void decode_attention_varlen_fp8_kernel(
-    const __nv_bfloat16* __restrict__ Q,            // [total_q_tokens, num_q_heads * HEAD_DIM]
-    const int* __restrict__ qo_indptr,              // [batch_size + 1]
-    const __nv_fp8_e4m3* __restrict__ K_pool,       // [max_pages, page_size, num_kv_heads, HEAD_DIM] (NHD)
-    const __nv_fp8_e4m3* __restrict__ V_pool,
-    const int* __restrict__ kv_indptr,              // [batch_size + 1]
-    const int* __restrict__ kv_indices,             // [total_pages]
-    const int* __restrict__ last_page_len,          // [batch_size]
-    __nv_bfloat16* __restrict__ O,                  // [total_q_tokens, num_q_heads * HEAD_DIM]
+static int choose_varlen_num_splits(int max_kv_len) {
+    int splits = (max_kv_len + kSplitTokens - 1) / kSplitTokens;
+    if (splits < 1) splits = 1;
+    if (splits > kMaxSplits) splits = kMaxSplits;
+    return splits;
+}
+
+extern "C" size_t decode_attention_varlen_fp8_workspace_bytes(
+    int total_q_tokens,
+    int num_q_heads,
+    int head_dim,
+    int num_splits)
+{
+    if (total_q_tokens <= 0 || num_q_heads <= 0 || head_dim <= 0 || num_splits <= 0) {
+        return 0;
+    }
+    size_t total_q_heads = (size_t)total_q_tokens * (size_t)num_q_heads;
+    size_t out_bytes = (size_t)num_splits * total_q_heads * (size_t)head_dim * sizeof(float);
+    size_t m_bytes = (size_t)num_splits * total_q_heads * sizeof(float);
+    size_t l_bytes = (size_t)num_splits * total_q_heads * sizeof(float);
+    return out_bytes + m_bytes + l_bytes;
+}
+
+template <bool INT8_KV>
+__device__ __forceinline__ float load_quantized_value(
+    const void* __restrict__ data,
+    size_t offset,
+    const float* __restrict__ scales,
+    int scale_offset)
+{
+    if (INT8_KV) {
+        float scale = scales ? scales[scale_offset] : 1.0f;
+        return static_cast<float>(reinterpret_cast<const int8_t*>(data)[offset]) * scale;
+    }
+    float value = static_cast<float>(reinterpret_cast<const __nv_fp8_e4m3*>(data)[offset]);
+    return scales ? value * scales[scale_offset] : value;
+}
+
+template <int HEAD_DIM, bool CAUSAL, bool INT8_KV>
+__global__ void decode_attention_varlen_quantized_partial_kernel(
+    const __nv_bfloat16* __restrict__ Q,
+    const int* __restrict__ qo_indptr,
+    const void* __restrict__ K_pool,
+    const void* __restrict__ V_pool,
+    const float* __restrict__ K_scales,
+    const float* __restrict__ V_scales,
+    const int* __restrict__ kv_indptr,
+    const int* __restrict__ kv_indices,
+    const int* __restrict__ last_page_len,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
     int num_q_heads,
     int num_kv_heads,
     int batch_size,
-    float sm_scale)
+    float sm_scale,
+    int num_splits)
 {
-    constexpr int EPT = HEAD_DIM / VLF8_WARP_SIZE;  // 4 for HD128
+    constexpr int EPT = HEAD_DIM / VLF8_WARP_SIZE;
 
     int q_token = blockIdx.x;
-    int q_head  = blockIdx.y;
-    if (q_head >= num_q_heads) return;
+    int q_head = blockIdx.y;
+    int split_idx = blockIdx.z;
+    if (q_head >= num_q_heads || split_idx >= num_splits) return;
 
     int warp_id = threadIdx.x / VLF8_WARP_SIZE;
     int lane_id = threadIdx.x % VLF8_WARP_SIZE;
 
-    // ── Resolve sequence index for this q_token via linear scan over qo_indptr.
-    // Done in shared memory so all threads agree without launch-time fixup.
-    // batch_size <= num_slots (typically <= 32), so linear scan is cheap.
     __shared__ int sm_bz;
     __shared__ int sm_qlen;
-    __shared__ int sm_qrow_local;     // row within sequence
+    __shared__ int sm_qrow_local;
     __shared__ int sm_kv_pages_start;
     __shared__ int sm_kv_pages_end;
     __shared__ int sm_kv_total_len;
@@ -111,7 +116,6 @@ __global__ void decode_attention_varlen_fp8_kernel(
 
     if (threadIdx.x == 0) {
         int bz = 0;
-        // Find bz such that qo_indptr[bz] <= q_token < qo_indptr[bz+1].
         for (int i = 0; i < batch_size; i++) {
             if (q_token >= qo_indptr[i] && q_token < qo_indptr[i + 1]) {
                 bz = i;
@@ -120,49 +124,68 @@ __global__ void decode_attention_varlen_fp8_kernel(
         }
         sm_bz = bz;
         int q_start = qo_indptr[bz];
-        int q_end   = qo_indptr[bz + 1];
+        int q_end = qo_indptr[bz + 1];
         sm_qlen = q_end - q_start;
         sm_qrow_local = q_token - q_start;
 
         int kv_p_start = kv_indptr[bz];
-        int kv_p_end   = kv_indptr[bz + 1];
+        int kv_p_end = kv_indptr[bz + 1];
         sm_kv_pages_start = kv_p_start;
-        sm_kv_pages_end   = kv_p_end;
-        int num_kv_pages  = kv_p_end - kv_p_start;
+        sm_kv_pages_end = kv_p_end;
+        int num_kv_pages = kv_p_end - kv_p_start;
         int lpl = (num_kv_pages > 0) ? last_page_len[bz] : 0;
         sm_kv_last_page_len = lpl;
-        sm_kv_total_len = (num_kv_pages == 0) ? 0
-                                              : (num_kv_pages - 1) * kPageSize + lpl;
+        sm_kv_total_len = (num_kv_pages == 0) ? 0 : (num_kv_pages - 1) * kPageSize + lpl;
     }
     __syncthreads();
 
-    int qlen           = sm_qlen;
-    int qrow_local     = sm_qrow_local;
+    int qlen = sm_qlen;
+    int qrow_local = sm_qrow_local;
     int kv_pages_start = sm_kv_pages_start;
-    int kv_pages_end   = sm_kv_pages_end;
-    int kv_total_len   = sm_kv_total_len;
+    int kv_pages_end = sm_kv_pages_end;
+    int kv_total_len = sm_kv_total_len;
     int kv_last_page_len_v = sm_kv_last_page_len;
-    int num_kv_pages   = kv_pages_end - kv_pages_start;
+    int num_kv_pages = kv_pages_end - kv_pages_start;
 
-    // FlashAttention-2 causal: q_token at logical position
-    //   pos_q = (kv_total_len - qlen) + qrow_local
-    // attends to kv positions [0, pos_q].
-    int kv_offset_for_causal = kv_total_len - qlen;
-    int causal_limit = kv_offset_for_causal + qrow_local;  // inclusive
+    int total_q_heads = gridDim.x * num_q_heads;
+    int q_idx = q_token * num_q_heads + q_head;
+    int out_idx = split_idx * total_q_heads + q_idx;
 
-    // Empty KV → write zeros and return.
-    if (num_kv_pages == 0 || kv_total_len == 0) {
-        if (threadIdx.x < HEAD_DIM) {
-            O[(int64_t)q_token * num_q_heads * HEAD_DIM + q_head * HEAD_DIM + threadIdx.x]
-                = __float2bfloat16(0.0f);
+    auto write_empty_partial = [&]() {
+        if (threadIdx.x == 0) {
+            partial_m[out_idx] = -FLT_MAX;
+            partial_l[out_idx] = 0.0f;
         }
+        if (threadIdx.x < HEAD_DIM) {
+            partial_out[(size_t)out_idx * HEAD_DIM + threadIdx.x] = 0.0f;
+        }
+    };
+
+    if (num_kv_pages == 0 || kv_total_len == 0) {
+        write_empty_partial();
         return;
     }
 
+    int kv_chunk_size = (kv_total_len + num_splits - 1) / num_splits;
+    int kv_chunk_start = split_idx * kv_chunk_size;
+    int kv_chunk_end = min(kv_chunk_start + kv_chunk_size, kv_total_len);
+    if (kv_chunk_start >= kv_total_len || kv_chunk_start >= kv_chunk_end) {
+        write_empty_partial();
+        return;
+    }
+
+    int causal_limit = (kv_total_len - qlen) + qrow_local;
+    if (CAUSAL && qlen > 1 && kv_chunk_start > causal_limit) {
+        write_empty_partial();
+        return;
+    }
+    bool chunk_fully_visible = !(CAUSAL && qlen > 1) || (kv_chunk_end - 1 <= causal_limit);
+
     int gqa_ratio = num_q_heads / num_kv_heads;
     int kv_head = q_head / gqa_ratio;
+    int kv_dim = num_kv_heads * HEAD_DIM;
+    int stride_page = kPageSize * kv_dim;
 
-    // ── Load Q row into registers (each lane owns HEAD_DIM/WARP_SIZE = 4 dims).
     float q_reg[EPT];
     {
         int q_base = q_token * num_q_heads * HEAD_DIM + q_head * HEAD_DIM;
@@ -173,82 +196,58 @@ __global__ void decode_attention_varlen_fp8_kernel(
         }
     }
 
-    // ── Per-warp online softmax state ──
     float o_reg[EPT];
     #pragma unroll
     for (int i = 0; i < EPT; i++) o_reg[i] = 0.0f;
     float m_local = -FLT_MAX;
     float l_local = 0.0f;
 
-    // Stream every KV page assigned to this sequence; warps split tokens within
-    // a page (warp-stride loop, same shape as the qlen=1 FP8 kernel).
-    //
-    // Pool layout (NHD, matches `quantize_scatter_kv_fp8_range` writers and
-    // the qlen=1 `decode_attention_fp8_partial_kernel` readers):
-    //   K_pool[max_pages, page_size, num_kv_heads, HEAD_DIM]
-    //   addr(page, token, head, d) =
-    //     page * (page_size * kv_dim) + token * kv_dim + head * HEAD_DIM + d
-    // where kv_dim = num_kv_heads * HEAD_DIM. Codex P1 (2026-04-29):
-    // earlier draft used HND `[page][head][token][HEAD_DIM]` which mismatches
-    // the writer side and produced wrong attention for any (token>0,head>0).
-    int kv_dim = num_kv_heads * HEAD_DIM;
-    int stride_page = kPageSize * kv_dim;
-    int kv_pos_running = 0;  // global kv position cursor across pages
-    for (int p = 0; p < num_kv_pages; p++) {
+    int first_page = kv_chunk_start / kPageSize;
+    int end_page = (kv_chunk_end + kPageSize - 1) / kPageSize;
+    int head_off = kv_head * HEAD_DIM;
+
+    for (int p = first_page; p < end_page; p++) {
         int phys_page = kv_indices[kv_pages_start + p];
         int page_tokens = (p == num_kv_pages - 1) ? kv_last_page_len_v : kPageSize;
-        // Pointer to this page's start (all heads, all tokens). Indexed
-        // per-token below as `t * kv_dim + kv_head * HEAD_DIM + d`.
-        const __nv_fp8_e4m3* k_page_base = K_pool + (size_t)phys_page * stride_page;
-        const __nv_fp8_e4m3* v_page_base = V_pool + (size_t)phys_page * stride_page;
-        int head_off = kv_head * HEAD_DIM;
+        int token_start = max(0, kv_chunk_start - p * kPageSize);
+        int token_end = min(page_tokens, kv_chunk_end - p * kPageSize);
+        if (token_start >= token_end) continue;
 
-        for (int t = warp_id; t < page_tokens; t += VLF8_NUM_WARPS) {
-            int kv_pos = kv_pos_running + t;
-
-            // Causal mask: skip kv tokens beyond causal_limit when CAUSAL && qlen>1.
-            // For qlen==1 (decode rows) we never mask: causal_limit = kv_total_len-1
-            // and decode rows always see the full history.
-            bool keep = true;
-            if (CAUSAL && qlen > 1) {
-                keep = (kv_pos <= causal_limit);
+        size_t page_base = (size_t)phys_page * stride_page;
+        for (int t = token_start + warp_id; t < token_end; t += VLF8_NUM_WARPS) {
+            int kv_pos = p * kPageSize + t;
+            if (!chunk_fully_visible && kv_pos > causal_limit) {
+                continue;
             }
 
-            int row_off = t * kv_dim + head_off;
+            size_t row_off = page_base + (size_t)t * kv_dim + head_off;
+            int scale_offset = (phys_page * kPageSize + t) * num_kv_heads + kv_head;
+
             float qk = 0.0f;
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float k_val = static_cast<float>(k_page_base[row_off + d]);
+                float k_val = load_quantized_value<INT8_KV>(K_pool, row_off + d, K_scales, scale_offset);
                 qk += q_reg[i] * k_val;
             }
             qk = vlf8_warp_reduce_sum(qk);
-            // Broadcast qk: all lanes already have the reduced sum after xor-reduce.
 
-            if (!keep) {
-                // Skip this kv position (don't update softmax state, don't accumulate V).
-                continue;
-            }
-
-            float m_new   = fmaxf(m_local, qk);
+            float m_new = fmaxf(m_local, qk);
             float exp_diff = __expf(m_local - m_new);
-            float exp_qk   = __expf(qk - m_new);
-            float l_new   = l_local * exp_diff + exp_qk;
+            float exp_qk = __expf(qk - m_new);
+            float l_new = l_local * exp_diff + exp_qk;
 
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float v_val = static_cast<float>(v_page_base[row_off + d]);
+                float v_val = load_quantized_value<INT8_KV>(V_pool, row_off + d, V_scales, scale_offset);
                 o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
             }
             m_local = m_new;
             l_local = l_new;
         }
-
-        kv_pos_running += page_tokens;
     }
 
-    // ── Cross-warp merge via shared memory ──
     __shared__ float smem_m[VLF8_NUM_WARPS];
     __shared__ float smem_l[VLF8_NUM_WARPS];
     __shared__ float smem_o[VLF8_NUM_WARPS * HEAD_DIM];
@@ -264,7 +263,6 @@ __global__ void decode_attention_varlen_fp8_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-        // Unnormalized accumulator: max, sum-of-exp, sum-of-(exp * v).
         float final_m = smem_m[0];
         float final_l = smem_l[0];
         float final_o[EPT];
@@ -273,49 +271,88 @@ __global__ void decode_attention_varlen_fp8_kernel(
             final_o[i] = smem_o[lane_id * EPT + i];
         }
 
-        // FlashAttention merge across warps: keep accumulator unnormalized
-        // (sum-of-exp · V) so the normalization is one divide at the end.
         #pragma unroll
         for (int w = 1; w < VLF8_NUM_WARPS; w++) {
             float m_w = smem_m[w];
             float l_w = smem_l[w];
             if (l_w == 0.0f) continue;
 
-            float m_new   = fmaxf(final_m, m_w);
-            float scale_a = __expf(final_m - m_new);
-            float scale_b = __expf(m_w     - m_new);
+            float m_new = fmaxf(final_m, m_w);
+            float scale_prev = __expf(final_m - m_new);
+            float scale_w = __expf(m_w - m_new);
 
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
-                final_o[i] = final_o[i] * scale_a + o_w * scale_b;
+                final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
-            final_l = final_l * scale_a + l_w * scale_b;
+            final_l = final_l * scale_prev + l_w * scale_w;
             final_m = m_new;
         }
 
-        // Final normalize (single divide). Guard against empty KV path.
+        if (lane_id == 0) {
+            partial_m[out_idx] = final_m;
+            partial_l[out_idx] = final_l;
+        }
         float inv_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
-
-        int o_base = q_token * num_q_heads * HEAD_DIM + q_head * HEAD_DIM;
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
             int d = lane_id * EPT + i;
-            O[o_base + d] = __float2bfloat16(final_o[i] * inv_l);
+            partial_out[(size_t)out_idx * HEAD_DIM + d] = final_o[i] * inv_l;
         }
     }
 }
 
-// ============================================================================
-// C API
-// ============================================================================
-extern "C" {
+template <int HEAD_DIM>
+__global__ void decode_attention_varlen_quantized_merge_kernel(
+    const float* __restrict__ partial_out,
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    __nv_bfloat16* __restrict__ O,
+    int total_q_tokens,
+    int num_q_heads,
+    int num_splits)
+{
+    int q_token = blockIdx.x;
+    int q_head = blockIdx.y;
+    int d = threadIdx.x;
+    if (q_token >= total_q_tokens || q_head >= num_q_heads || d >= HEAD_DIM) return;
 
-cudaError_t decode_attention_varlen_fp8_cuda(
+    int total_q_heads = total_q_tokens * num_q_heads;
+    int q_idx = q_token * num_q_heads + q_head;
+
+    float final_m = -FLT_MAX;
+    float final_l = 0.0f;
+    float final_o = 0.0f;
+
+    for (int s = 0; s < num_splits; s++) {
+        int idx = s * total_q_heads + q_idx;
+        float m_s = partial_m[idx];
+        float l_s = partial_l[idx];
+        float o_s = partial_out[(size_t)idx * HEAD_DIM + d];
+        if (l_s == 0.0f) continue;
+
+        float m_new = fmaxf(final_m, m_s);
+        float s_prev = final_l * __expf(final_m - m_new);
+        float s_cur = l_s * __expf(m_s - m_new);
+        float l_new = s_prev + s_cur;
+
+        final_o = (l_new > 0.0f) ? (final_o * s_prev + o_s * s_cur) / l_new : 0.0f;
+        final_m = m_new;
+        final_l = l_new;
+    }
+
+    int o_base = q_token * num_q_heads * HEAD_DIM + q_head * HEAD_DIM;
+    O[o_base + d] = __float2bfloat16(final_o);
+}
+
+extern "C" cudaError_t decode_attention_varlen_fp8_cuda(
     const __nv_bfloat16* q_packed,
     const int* qo_indptr,
-    const __nv_fp8_e4m3* k_pool,
-    const __nv_fp8_e4m3* v_pool,
+    const void* k_pool,
+    const void* v_pool,
+    const float* k_scales,
+    const float* v_scales,
     const int* kv_indptr,
     const int* kv_indices,
     const int* last_page_len,
@@ -325,42 +362,70 @@ cudaError_t decode_attention_varlen_fp8_cuda(
     int page_size,
     int batch_size,
     int total_q_tokens,
+    int max_kv_len,
+    bool int8_kv,
     bool causal,
     float sm_scale,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    void* workspace,
+    size_t workspace_bytes)
 {
     if (batch_size <= 0 || total_q_tokens <= 0) return cudaSuccess;
 
-    // Today: HEAD_DIM=128 + page_size=16 only. The pool's NHD layout and the
-    // online-softmax math is otherwise dimension-agnostic; HD256 / page_size
-    // variants can specialize the template later.
     constexpr int HEAD_DIM = 128;
-    if (page_size != kPageSize) {
+    if (page_size != kPageSize || num_q_heads <= 0 || num_kv_heads <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (int8_kv && (k_scales == nullptr || v_scales == nullptr)) {
         return cudaErrorInvalidValue;
     }
 
-    dim3 grid(total_q_tokens, num_q_heads);
-    dim3 block(VLF8_BLOCK_SIZE);
-
-    if (causal) {
-        decode_attention_varlen_fp8_kernel<HEAD_DIM, true><<<grid, block, 0, stream>>>(
-            q_packed, qo_indptr,
-            k_pool, v_pool,
-            kv_indptr, kv_indices, last_page_len,
-            output,
-            num_q_heads, num_kv_heads, batch_size,
-            sm_scale);
-    } else {
-        decode_attention_varlen_fp8_kernel<HEAD_DIM, false><<<grid, block, 0, stream>>>(
-            q_packed, qo_indptr,
-            k_pool, v_pool,
-            kv_indptr, kv_indices, last_page_len,
-            output,
-            num_q_heads, num_kv_heads, batch_size,
-            sm_scale);
+    int num_splits = choose_varlen_num_splits(max_kv_len);
+    size_t needed = decode_attention_varlen_fp8_workspace_bytes(
+        total_q_tokens, num_q_heads, HEAD_DIM, num_splits);
+    if (workspace == nullptr || workspace_bytes < needed) {
+        return cudaErrorInvalidValue;
     }
+
+    float* ws_float = reinterpret_cast<float*>(workspace);
+    size_t total_q_heads = (size_t)total_q_tokens * (size_t)num_q_heads;
+    float* partial_out = ws_float;
+    float* partial_m = partial_out + (size_t)num_splits * total_q_heads * HEAD_DIM;
+    float* partial_l = partial_m + (size_t)num_splits * total_q_heads;
+
+    dim3 partial_grid(total_q_tokens, num_q_heads, num_splits);
+    dim3 partial_block(VLF8_BLOCK_SIZE);
+
+#define LAUNCH_PARTIAL(INT8_FLAG, CAUSAL_FLAG) \
+    decode_attention_varlen_quantized_partial_kernel<HEAD_DIM, CAUSAL_FLAG, INT8_FLAG> \
+        <<<partial_grid, partial_block, 0, stream>>>( \
+            q_packed, qo_indptr, k_pool, v_pool, k_scales, v_scales, \
+            kv_indptr, kv_indices, last_page_len, partial_out, partial_m, partial_l, \
+            num_q_heads, num_kv_heads, batch_size, sm_scale, num_splits)
+
+    if (int8_kv) {
+        if (causal) {
+            LAUNCH_PARTIAL(true, true);
+        } else {
+            LAUNCH_PARTIAL(true, false);
+        }
+    } else {
+        if (causal) {
+            LAUNCH_PARTIAL(false, true);
+        } else {
+            LAUNCH_PARTIAL(false, false);
+        }
+    }
+
+#undef LAUNCH_PARTIAL
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    dim3 merge_grid(total_q_tokens, num_q_heads);
+    dim3 merge_block(HEAD_DIM);
+    decode_attention_varlen_quantized_merge_kernel<HEAD_DIM><<<merge_grid, merge_block, 0, stream>>>(
+        partial_out, partial_m, partial_l, output, total_q_tokens, num_q_heads, num_splits);
 
     return cudaGetLastError();
 }
-
-}  // extern "C"

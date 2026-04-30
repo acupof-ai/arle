@@ -413,7 +413,7 @@ pub fn decode_attention_fp8(
     Ok(())
 }
 
-// ─── Varlen-Q + FP8 paged KV attention (mixed batch path) ───
+// ─── Varlen-Q + quantized paged KV attention (mixed batch path) ───
 //
 // Generalization of `decode_attention_fp8` to mixed prefill+decode batches.
 // Reads FP8 KV directly from the pool (no bf16 shadow); enables lifting the
@@ -421,7 +421,26 @@ pub fn decode_attention_fp8(
 // the kernel is wired into `decode_batch_with_prefill`.
 //
 // HD128 + page_size=16 only for now — same coverage envelope as the qlen=1
-// variant. INT8 follow-up uses the same shape with an extra scales pointer.
+// variant. FP8 and INT8 share the split-KV kernel; `int8_kv` controls how the
+// durable bytes are interpreted.
+pub const VARLEN_QUANTIZED_MAX_SPLITS: usize = 16;
+
+pub fn decode_attention_varlen_fp8_workspace_bytes(
+    total_q_tokens: usize,
+    num_q_heads: usize,
+    head_dim: usize,
+    num_splits: usize,
+) -> usize {
+    unsafe {
+        ffi::decode_attention_varlen_fp8_workspace_bytes(
+            total_q_tokens as i32,
+            num_q_heads as i32,
+            head_dim as i32,
+            num_splits as i32,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn decode_attention_varlen_fp8(
     ctx: &DeviceContext,
@@ -429,6 +448,8 @@ pub fn decode_attention_varlen_fp8(
     qo_indptr: &CudaSlice<i32>,
     k_pool_ptr: u64,
     v_pool_ptr: u64,
+    k_scales_ptr: Option<u64>,
+    v_scales_ptr: Option<u64>,
     kv_indptr: &CudaSlice<i32>,
     kv_indices: &CudaSlice<i32>,
     last_page_len: &CudaSlice<i32>,
@@ -438,8 +459,12 @@ pub fn decode_attention_varlen_fp8(
     page_size: usize,
     batch_size: usize,
     total_q_tokens: usize,
+    max_kv_len: usize,
+    int8_kv: bool,
     causal: bool,
     sm_scale: f32,
+    workspace: &CudaSlice<u8>,
+    workspace_bytes: usize,
 ) -> Result<()> {
     if batch_size == 0 || total_q_tokens == 0 {
         return Ok(());
@@ -451,6 +476,7 @@ pub fn decode_attention_varlen_fp8(
     let (kvx_ptr, _gkvx) = kv_indices.device_ptr(&ctx.stream);
     let (lpl_ptr, _glpl) = last_page_len.device_ptr(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (ws_ptr, _gws) = workspace.device_ptr(&ctx.stream);
 
     unsafe {
         ffi::decode_attention_varlen_fp8_cuda(
@@ -458,6 +484,8 @@ pub fn decode_attention_varlen_fp8(
             qoi_ptr as *const i32,
             k_pool_ptr as *const u8,
             v_pool_ptr as *const u8,
+            k_scales_ptr.unwrap_or(0) as *const f32,
+            v_scales_ptr.unwrap_or(0) as *const f32,
             kvi_ptr as *const i32,
             kvx_ptr as *const i32,
             lpl_ptr as *const i32,
@@ -467,9 +495,13 @@ pub fn decode_attention_varlen_fp8(
             page_size as i32,
             batch_size as i32,
             total_q_tokens as i32,
+            max_kv_len as i32,
+            int8_kv,
             causal,
             sm_scale,
             ctx.stream.cu_stream(),
+            ws_ptr as *mut u8,
+            workspace_bytes,
         )
         .result()?;
     }

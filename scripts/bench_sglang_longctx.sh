@@ -3,7 +3,7 @@
 #
 # Pinned against the audited SGLang revision from:
 #   docs/plans/2026-04-23-cuda-decode-sglang-alignment.md
-#   docs/plans/2026-04-30-longctx-32k-throughput.md S4
+#   docs/projects/2026-04-30-longctx-32k-128k-leadership.md Phase 1 S4
 #
 # Usage:
 #   scripts/bench_sglang_longctx.sh <label>

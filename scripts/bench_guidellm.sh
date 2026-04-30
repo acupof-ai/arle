@@ -6,8 +6,9 @@
 #
 # Environment presets:
 #   WORKLOAD=longctx-32k  32768-in/256-out fixed-concurrency long-context
-#                         workload from docs/plans/2026-04-30-longctx-32k-
-#                         throughput.md S4. Default behavior is unchanged
+#                         workload from docs/projects/2026-04-30-longctx-
+#                         32k-128k-leadership.md Phase 1 S4.
+#                         Default behavior is unchanged
 #                         when WORKLOAD is unset.
 #
 # Required:

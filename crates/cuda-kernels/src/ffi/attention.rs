@@ -540,11 +540,20 @@ unsafe extern "C" {
     /// `total_q_tokens = qo_indptr[batch_size]`. Output has the same shape.
     /// `causal=true` enables FlashAttention causal mask for prefill rows
     /// (qlen > 1); decode rows (qlen=1) ignore the mask.
+    pub fn decode_attention_varlen_fp8_workspace_bytes(
+        total_q_tokens: i32,
+        num_q_heads: i32,
+        head_dim: i32,
+        num_splits: i32,
+    ) -> usize;
+
     pub fn decode_attention_varlen_fp8_cuda(
         q_packed: *const Half,
         qo_indptr: *const i32,
         k_pool: *const u8, // FP8 E4M3
         v_pool: *const u8, // FP8 E4M3
+        k_scales: *const f32,
+        v_scales: *const f32,
         kv_indptr: *const i32,
         kv_indices: *const i32,
         last_page_len: *const i32,
@@ -554,9 +563,13 @@ unsafe extern "C" {
         page_size: i32,
         batch_size: i32,
         total_q_tokens: i32,
+        max_kv_len: i32,
+        int8_kv: bool,
         causal: bool,
         sm_scale: f32,
         stream: CUstream,
+        workspace: *mut u8,
+        workspace_bytes: usize,
     ) -> CUresult;
 }
 
