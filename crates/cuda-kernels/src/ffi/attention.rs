@@ -514,6 +514,8 @@ unsafe extern "C" {
         q: *const Half,
         k_data: *const u8, // FP8 E4M3
         v_data: *const u8, // FP8 E4M3
+        k_scales: *const f32,
+        v_scales: *const f32,
         kv_indices: *const i32,
         kv_indptr: *const i32,
         o: *mut Half,

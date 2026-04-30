@@ -683,8 +683,8 @@ fn estimate_per_slot_bytes(
     let kv_layers = num_full_attn.min(num_layers);
 
     // Per-slot contiguous KV bytes, dtype-aware via
-    // KVFormat::pool_bytes_per_kv_head (BF16=2*head_dim, INT8=head_dim+4
-    // including per-token f32 scale, FP8=head_dim, TurboQuant=packed+norms).
+    // KVFormat::pool_bytes_per_kv_head (BF16=2*head_dim, FP8/INT8=head_dim+4
+    // including per-token f32 scale, TurboQuant=packed+norms).
     let bytes_per_kv_head_side = kv_pool_format.pool_bytes_per_kv_head(head_dim);
     // Per-slot cost = contiguous working buffer (chunk_size) + paged pool share (full seq_len).
     // Contiguous is the small prefill chunk; paged covers the full sequence.

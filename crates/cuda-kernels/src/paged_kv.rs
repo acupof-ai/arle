@@ -25,7 +25,7 @@ use crate::turboquant_state::TurboQuantLayerState;
 ///
 /// Storage is format-aware via `KVFormat`:
 /// - `BF16`: `k_data`/`v_data` are `CudaSlice<u8>` holding bf16 (2 bytes/elem)
-/// - `FP8E4M3`: `k_data`/`v_data` hold FP8 E4M3 (1 byte/elem), no scales
+/// - `FP8E4M3`: `k_data`/`v_data` hold FP8 E4M3 (1 byte/elem), + `k_scales`/`v_scales`
 /// - `INT8`: `k_data`/`v_data` hold int8 (1 byte/elem), + `k_scales`/`v_scales`
 ///
 /// For FP8/INT8, a shared bf16 working buffer (1 layer) is used as the write
@@ -354,7 +354,7 @@ impl TokenKVPool {
                 );
             }
 
-            // Scale buffers (INT8 only)
+            // Scale buffers (FP8/INT8)
             if format.has_scales() {
                 for _ in 0..num_layers {
                     k_scales.push(
@@ -1200,13 +1200,13 @@ impl TokenKVPool {
         ptr
     }
 
-    /// K scales device pointer for a layer (INT8 only).
+    /// K scales device pointer for a layer (FP8/INT8).
     pub fn k_scales_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.k_scales[layer].device_ptr(stream);
         ptr
     }
 
-    /// V scales device pointer for a layer (INT8 only).
+    /// V scales device pointer for a layer (FP8/INT8).
     pub fn v_scales_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.v_scales[layer].device_ptr(stream);
         ptr
@@ -1563,6 +1563,7 @@ impl TokenKVPool {
                 ctx,
                 &contiguous_k_caches[layer],
                 self.k_data_ptr(layer, &ctx.stream),
+                self.k_scales_ptr(layer, &ctx.stream),
                 &token_indices_gpu,
                 start_pos,
                 max_seq_len_contiguous,
@@ -1575,6 +1576,7 @@ impl TokenKVPool {
                 ctx,
                 &contiguous_v_caches[layer],
                 self.v_data_ptr(layer, &ctx.stream),
+                self.v_scales_ptr(layer, &ctx.stream),
                 &token_indices_gpu,
                 start_pos,
                 max_seq_len_contiguous,

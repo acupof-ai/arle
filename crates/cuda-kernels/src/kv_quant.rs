@@ -142,6 +142,7 @@ pub fn quantize_paged_kv_fp8(
     ctx: &DeviceContext,
     kv_bf16_ptr: u64,
     kv_fp8_ptr: u64,
+    scales_ptr: u64,
     new_token_indices_gpu: &CudaSlice<i32>,
     num_kv_heads: usize,
     head_dim: usize,
@@ -156,6 +157,7 @@ pub fn quantize_paged_kv_fp8(
         ffi::quantize_paged_kv_fp8_cuda(
             kv_bf16_ptr as *const ffi::Half,
             kv_fp8_ptr as *mut u8,
+            scales_ptr as *mut f32,
             nti_ptr as *const i32,
             num_kv_heads as i32,
             head_dim as i32,
@@ -174,6 +176,7 @@ pub fn quantize_scatter_kv_fp8(
     ctx: &DeviceContext,
     kv_cont: &DeviceVec,
     kv_fp8_ptr: u64,
+    scales_ptr: u64,
     page_indices_gpu: &CudaSlice<i32>,
     max_seq_len: usize,
     seq_len: usize,
@@ -190,6 +193,7 @@ pub fn quantize_scatter_kv_fp8(
         ffi::quantize_scatter_kv_fp8_cuda(
             cont_ptr as *const ffi::Half,
             kv_fp8_ptr as *mut u8,
+            scales_ptr as *mut f32,
             pi_ptr as *const i32,
             max_seq_len as i32,
             seq_len as i32,
@@ -209,6 +213,7 @@ pub fn quantize_scatter_kv_fp8_range(
     ctx: &DeviceContext,
     kv_cont: &DeviceVec,
     kv_fp8_ptr: u64,
+    scales_ptr: u64,
     page_indices_gpu: &CudaSlice<i32>,
     start_pos: usize,
     max_seq_len: usize,
@@ -226,6 +231,7 @@ pub fn quantize_scatter_kv_fp8_range(
         ffi::quantize_scatter_kv_fp8_range_cuda(
             cont_ptr as *const ffi::Half,
             kv_fp8_ptr as *mut u8,
+            scales_ptr as *mut f32,
             pi_ptr as *const i32,
             start_pos as i32,
             max_seq_len as i32,
@@ -233,6 +239,40 @@ pub fn quantize_scatter_kv_fp8_range(
             num_kv_heads as i32,
             head_dim as i32,
             kv_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Dequantize durable FP8 NHD token rows into the BF16 HND paged work buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn dequantize_paged_kv_fp8_to_hnd(
+    ctx: &DeviceContext,
+    kv_fp8_ptr: u64,
+    scales_ptr: u64,
+    kv_bf16_hnd_ptr: u64,
+    token_rows_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    total_tokens: usize,
+) -> Result<()> {
+    if total_tokens == 0 {
+        return Ok(());
+    }
+    let (rows_ptr, _g) = token_rows_gpu.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::dequantize_paged_kv_fp8_to_hnd_cuda(
+            kv_fp8_ptr as *const u8,
+            scales_ptr as *const f32,
+            kv_bf16_hnd_ptr as *mut ffi::Half,
+            rows_ptr as *const i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            kv_dim as i32,
+            total_tokens as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -319,13 +359,15 @@ pub fn decode_attention_int8(
 
 /// Decode attention with fused FP8 E4M3 dequantization (split-KV).
 ///
-/// Same architecture as INT8 variant but simpler — no scales, direct FP8→float cast.
+/// Same architecture as INT8 variant with per-token/per-head FP8 scales.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_attention_fp8(
     ctx: &DeviceContext,
     q: &HiddenStates,
     k_data_ptr: u64,
     v_data_ptr: u64,
+    k_scales_ptr: u64,
+    v_scales_ptr: u64,
     kv_indices: &CudaSlice<i32>,
     kv_meta: &CudaSlice<i32>,
     o: &mut HiddenStates,
@@ -351,6 +393,8 @@ pub fn decode_attention_fp8(
             q_ptr as *const ffi::Half,
             k_data_ptr as *const u8,
             v_data_ptr as *const u8,
+            k_scales_ptr as *const f32,
+            v_scales_ptr as *const f32,
             ki_ptr as *const i32,
             ip_ptr as *const i32,
             o_ptr as *mut ffi::Half,

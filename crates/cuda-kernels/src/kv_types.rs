@@ -32,7 +32,7 @@ impl KVFormat {
         let tag = match *self {
             Self::BF16 => 1,
             Self::INT8 => 3,
-            Self::FP8E4M3 => 4,
+            Self::FP8E4M3 => 5,
             Self::TurboQuant {
                 key_bits: 2,
                 val_bits: 2,
@@ -70,7 +70,7 @@ impl KVFormat {
     }
 
     pub fn has_scales(self) -> bool {
-        matches!(self, Self::INT8)
+        matches!(self, Self::FP8E4M3 | Self::INT8)
     }
 
     pub fn has_norms(self) -> bool {
@@ -89,7 +89,7 @@ impl KVFormat {
     pub fn pool_bytes_per_kv_head(self, head_dim: usize) -> usize {
         match self {
             Self::BF16 => head_dim * 2,
-            Self::FP8E4M3 => head_dim,
+            Self::FP8E4M3 => head_dim + 4,
             Self::INT8 => head_dim + 4,
             Self::TurboQuant { key_bits, .. } => {
                 let packed = crate::turboquant_state::packed_bytes_per_head(head_dim, key_bits);
@@ -107,7 +107,7 @@ mod tests {
     fn stable_tags_are_fixed() {
         assert_eq!(KVFormat::BF16.stable_tag(), Some(1));
         assert_eq!(KVFormat::INT8.stable_tag(), Some(3));
-        assert_eq!(KVFormat::FP8E4M3.stable_tag(), Some(4));
+        assert_eq!(KVFormat::FP8E4M3.stable_tag(), Some(5));
         assert_eq!(
             KVFormat::TurboQuant {
                 key_bits: 2,

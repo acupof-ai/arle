@@ -113,11 +113,21 @@ Both spot-checks used 16 fixed prompts, seed `20260429`, `temperature=0`,
 | ARLE | fp8 vs bf16 | 0 / 16 | 2.79% | generated token 0 | fails fp8 default precision gate |
 | SGLang | fp8_e4m3 vs bf16 | 8 / 16 | 77.54% | generated token 2 | not identical, but far less divergent than ARLE |
 
+2026-04-30 follow-up after fixing ARLE fp8 KV scale ABI/refill bugs
+([error note](../errors/2026-04-30-arle-fp8kv-numerical-drift.md)):
+
+| backend | pair | exact pairs | avg common-token match rate | earliest divergence | conclusion |
+|---|---|---:|---:|---:|---|
+| ARLE | fp8 vs bf16 | 3 / 16 | 39.08% | generated token 1 | improved, still below SGLang; do not flip default |
+
 Spot-check artefacts:
 
 - ARLE fp8: `bench-output/2026-04-29-arle-qwen35-spotcheck-fp8.json`
 - ARLE bf16: `bench-output/2026-04-29-arle-qwen35-spotcheck-bf16.json`
 - ARLE compare: `bench-output/2026-04-29-arle-qwen35-spotcheck-compare.json`
+- ARLE fp8 follow-up: `bench-output/2026-04-30-arle-qwen35-spotcheck-fp8-scale-fused.json`
+- ARLE bf16 follow-up: `bench-output/2026-04-30-arle-qwen35-spotcheck-bf16-scale-fix.json`
+- ARLE compare follow-up: `bench-output/2026-04-30-arle-qwen35-spotcheck-compare-scale-fused.json`
 - SGLang fp8: `bench-output/2026-04-29-sglang-qwen35-spotcheck-fp8.json`
 - SGLang bf16: `bench-output/2026-04-29-sglang-qwen35-spotcheck-bf16.json`
 - SGLang compare: `bench-output/2026-04-29-sglang-qwen35-spotcheck-compare.json`
@@ -131,6 +141,11 @@ capacity/ITL. The blocker is correctness: ARLE Qwen3.5 fp8 vs bf16 diverges
 from the first generated token on some prompts and only matches 2.79% of common
 tokens. fp8 should stay opt-in until the quantized KV decode path's numerical
 behavior is understood and brought within tolerance.
+
+2026-04-30 update: the scale ABI/refill fix improves ARLE Qwen3.5 fp8 vs bf16
+to 3/16 exact and 39.08% common-token match, with all first generated tokens
+aligned. That fixes the worst readback bug but is still not strong enough to
+flip fp8 KV default.
 
 ## Problems
 

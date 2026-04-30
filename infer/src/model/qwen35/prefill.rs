@@ -9,10 +9,10 @@ use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
 use crate::model::cuda_graph::CudaGraphState;
-use crate::model::kv_cache::KVCache;
+use crate::model::kv_cache::{KVCache, KVFormat};
 use crate::ops;
 use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::{TokenKVPool, ffi};
+use cuda_kernels::{TokenKVPool, ffi, kv_quant};
 
 pub(super) struct Qwen35PagedPrefillRequest<'a> {
     pub tokens: &'a [u32],
@@ -506,6 +506,7 @@ impl Qwen35Model {
         ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
         ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
+        self.refill_fp8_paged_prefill_prefix_if_needed(pool, *full_idx, bufs)?;
 
         let nrp = ops::NormRopeParams {
             q_norm: &attn.q_norm,
@@ -617,6 +618,7 @@ impl Qwen35Model {
                 total_pages,
             )?;
         }
+        self.commit_fp8_paged_prefill_if_needed(pool, *full_idx, bufs)?;
 
         unsafe {
             let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
@@ -1074,6 +1076,7 @@ impl Qwen35Model {
         self.prefill_gemm_into(&attn.q_proj, &bufs.normed, &mut bufs.q_full, graphsafe)?;
         self.prefill_gemm_into(&attn.k_proj, &bufs.normed, &mut bufs.k_attn, graphsafe)?;
         self.prefill_gemm_into(&attn.v_proj, &bufs.normed, &mut bufs.v_attn, graphsafe)?;
+        self.refill_fp8_paged_prefill_prefix_if_needed(pool, *full_idx, bufs)?;
 
         let nrp = ops::NormRopeParams {
             q_norm: &attn.q_norm,
@@ -1165,6 +1168,7 @@ impl Qwen35Model {
                 total_pages,
             )?;
         }
+        self.commit_fp8_paged_prefill_if_needed(pool, *full_idx, bufs)?;
 
         unsafe {
             let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
@@ -1185,6 +1189,73 @@ impl Qwen35Model {
             &bufs.attn_out_full,
             &mut bufs.attn_results,
             graphsafe,
+        )
+    }
+
+    fn commit_fp8_paged_prefill_if_needed(
+        &self,
+        pool: &TokenKVPool,
+        full_idx: usize,
+        bufs: &PagedPrefillBuffers35,
+    ) -> Result<()> {
+        if !matches!(pool.format, KVFormat::FP8E4M3) {
+            return Ok(());
+        }
+        let token_count = bufs.seq_len;
+        kv_quant::quantize_paged_kv_fp8(
+            &self.ctx,
+            pool.k_work_ptr(&self.ctx.stream),
+            pool.k_data_ptr(full_idx, &self.ctx.stream),
+            pool.k_scales_ptr(full_idx, &self.ctx.stream),
+            &bufs.metadata.token_rows_gpu,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            pool.kv_dim,
+            token_count,
+        )?;
+        kv_quant::quantize_paged_kv_fp8(
+            &self.ctx,
+            pool.v_work_ptr(&self.ctx.stream),
+            pool.v_data_ptr(full_idx, &self.ctx.stream),
+            pool.v_scales_ptr(full_idx, &self.ctx.stream),
+            &bufs.metadata.token_rows_gpu,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            pool.kv_dim,
+            token_count,
+        )
+    }
+
+    fn refill_fp8_paged_prefill_prefix_if_needed(
+        &self,
+        pool: &TokenKVPool,
+        full_idx: usize,
+        bufs: &PagedPrefillBuffers35,
+    ) -> Result<()> {
+        if !matches!(pool.format, KVFormat::FP8E4M3) || bufs.metadata.prefix_token_count == 0 {
+            return Ok(());
+        }
+        kv_quant::dequantize_paged_kv_fp8_to_hnd(
+            &self.ctx,
+            pool.k_data_ptr(full_idx, &self.ctx.stream),
+            pool.k_scales_ptr(full_idx, &self.ctx.stream),
+            pool.k_work_ptr(&self.ctx.stream),
+            &bufs.metadata.prefix_token_rows_gpu,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            pool.kv_dim,
+            bufs.metadata.prefix_token_count,
+        )?;
+        kv_quant::dequantize_paged_kv_fp8_to_hnd(
+            &self.ctx,
+            pool.v_data_ptr(full_idx, &self.ctx.stream),
+            pool.v_scales_ptr(full_idx, &self.ctx.stream),
+            pool.v_work_ptr(&self.ctx.stream),
+            &bufs.metadata.prefix_token_rows_gpu,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            pool.kv_dim,
+            bufs.metadata.prefix_token_count,
         )
     }
 

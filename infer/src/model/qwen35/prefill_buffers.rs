@@ -153,14 +153,19 @@ impl PackedGdrLaunch35 {
 pub(super) struct PagedPrefillMetadata35 {
     pub token_ids_gpu: CudaSlice<i32>,
     pub page_indices_gpu: CudaSlice<i32>,
+    pub token_rows_gpu: CudaSlice<i32>,
+    pub prefix_token_rows_gpu: CudaSlice<i32>,
     pub qo_indptr_gpu: CudaSlice<i32>,
     pub kv_indptr_gpu: CudaSlice<i32>,
     pub kv_last_page_len_gpu: CudaSlice<i32>,
     pub start_pos_gpu: CudaSlice<i32>,
     pub num_pages: usize,
     pub batch_size: usize,
+    pub prefix_token_count: usize,
     token_ids_host: Vec<i32>,
     page_indices_host: Vec<i32>,
+    pub(super) token_rows_host: Vec<i32>,
+    prefix_token_rows_host: Vec<i32>,
     pub(super) qo_indptr_host: Vec<i32>,
     pub(super) kv_indptr_host: Vec<i32>,
     pub(super) kv_last_page_len_host: Vec<i32>,
@@ -177,6 +182,14 @@ impl PagedPrefillMetadata35 {
             .stream
             .alloc_zeros(initial_pages.max(1))
             .map_err(|e| anyhow::anyhow!("Alloc page_indices failed: {e}"))?;
+        let token_rows_gpu = ctx
+            .stream
+            .alloc_zeros(seq_len.max(1))
+            .map_err(|e| anyhow::anyhow!("Alloc token_rows failed: {e}"))?;
+        let prefix_token_rows_gpu = ctx
+            .stream
+            .alloc_zeros(1)
+            .map_err(|e| anyhow::anyhow!("Alloc prefix_token_rows failed: {e}"))?;
         let qo_indptr_gpu = ctx
             .stream
             .alloc_zeros(2)
@@ -197,14 +210,19 @@ impl PagedPrefillMetadata35 {
         Ok(Self {
             token_ids_gpu,
             page_indices_gpu,
+            token_rows_gpu,
+            prefix_token_rows_gpu,
             qo_indptr_gpu,
             kv_indptr_gpu,
             kv_last_page_len_gpu,
             start_pos_gpu,
             num_pages: 0,
             batch_size: 1,
+            prefix_token_count: 0,
             token_ids_host: vec![0; seq_len],
             page_indices_host: Vec::with_capacity(initial_pages.max(1)),
+            token_rows_host: Vec::with_capacity(seq_len.max(1)),
+            prefix_token_rows_host: Vec::new(),
             qo_indptr_host: vec![0; 2],
             kv_indptr_host: vec![0; 2],
             kv_last_page_len_host: vec![0; 1],
@@ -250,6 +268,23 @@ impl PagedPrefillMetadata35 {
             self.page_indices_host = Vec::with_capacity(num_pages.max(1));
             page_indices_reallocated = true;
         }
+        if self.token_rows_gpu.len() < token_ids.len().max(1) {
+            self.token_rows_gpu = ctx
+                .stream
+                .alloc_zeros(token_ids.len().max(1))
+                .map_err(|e| anyhow::anyhow!("Realloc token_rows failed: {e}"))?;
+            self.token_rows_host = Vec::with_capacity(token_ids.len().max(1));
+            page_indices_reallocated = true;
+        }
+        let prefix_tokens: usize = sequences.iter().map(|seq| seq.start_pos).sum();
+        if self.prefix_token_rows_gpu.len() < prefix_tokens.max(1) {
+            self.prefix_token_rows_gpu = ctx
+                .stream
+                .alloc_zeros(prefix_tokens.max(1))
+                .map_err(|e| anyhow::anyhow!("Realloc prefix_token_rows failed: {e}"))?;
+            self.prefix_token_rows_host = Vec::with_capacity(prefix_tokens.max(1));
+            page_indices_reallocated = true;
+        }
 
         self.page_indices_host.clear();
         self.page_indices_host.extend_from_slice(page_indices);
@@ -288,6 +323,8 @@ impl PagedPrefillMetadata35 {
 
         let mut total_qo_rows = 0usize;
         let mut total_pages = 0usize;
+        self.token_rows_host.clear();
+        self.prefix_token_rows_host.clear();
         self.qo_indptr_host[0] = 0;
         self.kv_indptr_host[0] = 0;
         for (batch_idx, seq) in sequences.iter().enumerate() {
@@ -311,10 +348,27 @@ impl PagedPrefillMetadata35 {
             self.kv_last_page_len_host[batch_idx] =
                 ((seq.start_pos + seq.seq_len - 1) % page_size + 1) as i32;
             self.start_pos_host[batch_idx] = seq.start_pos as i32;
+            for pos in 0..seq.start_pos {
+                let page = page_indices[seq.page_table_offset + pos / page_size] as usize;
+                self.prefix_token_rows_host
+                    .push((page * page_size + pos % page_size) as i32);
+            }
+            for rel_pos in 0..seq.seq_len {
+                let pos = seq.start_pos + rel_pos;
+                let page = page_indices[seq.page_table_offset + pos / page_size] as usize;
+                self.token_rows_host
+                    .push((page * page_size + pos % page_size) as i32);
+            }
         }
         anyhow::ensure!(
             total_qo_rows == token_ids.len(),
             "paged prefill token packing covers {total_qo_rows} rows, expected {}",
+            token_ids.len()
+        );
+        anyhow::ensure!(
+            self.token_rows_host.len() == token_ids.len(),
+            "paged prefill token rows cover {} rows, expected {}",
+            self.token_rows_host.len(),
             token_ids.len()
         );
         anyhow::ensure!(
@@ -334,8 +388,21 @@ impl PagedPrefillMetadata35 {
         ctx.stream
             .memcpy_htod(&self.start_pos_host, &mut self.start_pos_gpu)
             .map_err(|e| anyhow::anyhow!("start_pos H2D failed: {e}"))?;
+        let mut token_rows_view = self.token_rows_gpu.slice_mut(..token_ids.len());
+        ctx.stream
+            .memcpy_htod(&self.token_rows_host, &mut token_rows_view)
+            .map_err(|e| anyhow::anyhow!("token_rows H2D failed: {e}"))?;
+        if !self.prefix_token_rows_host.is_empty() {
+            let mut prefix_rows_view = self
+                .prefix_token_rows_gpu
+                .slice_mut(..self.prefix_token_rows_host.len());
+            ctx.stream
+                .memcpy_htod(&self.prefix_token_rows_host, &mut prefix_rows_view)
+                .map_err(|e| anyhow::anyhow!("prefix_token_rows H2D failed: {e}"))?;
+        }
         self.num_pages = num_pages;
         self.batch_size = batch_size;
+        self.prefix_token_count = self.prefix_token_rows_host.len();
 
         Ok(page_indices_reallocated || metadata_reallocated)
     }

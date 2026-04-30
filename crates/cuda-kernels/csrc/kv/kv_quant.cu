@@ -162,14 +162,15 @@ cudaError_t dequantize_kv_int8_to_bf16_cuda(
 // ============================================================================
 // BF16 → FP8 E4M3 quantize for paged KV pool (NHD layout).
 //
-// Converts 1 new token per request from bf16 working buffer to FP8 E4M3
-// in the paged pool. No separate scale — FP8 E4M3 is self-contained.
+// Converts token rows from the bf16 HND working buffer to scaled FP8 E4M3
+// durable storage in NHD row layout.
 //
 // Grid: (num_kv_heads, batch_size)   Block: (head_dim)
 // ============================================================================
 __global__ void quantize_paged_kv_fp8_kernel(
-    const __nv_bfloat16* __restrict__ kv_bf16,    // working buffer [max_total_tokens * kv_dim]
+    const __nv_bfloat16* __restrict__ kv_bf16,    // working buffer [page, head, token, dim]
     __nv_fp8_e4m3* __restrict__ kv_fp8,           // FP8 pool [max_total_tokens * kv_dim]
+    float* __restrict__ scales,                   // [max_total_tokens * num_kv_heads]
     const int32_t* __restrict__ new_token_indices, // [batch_size] token row of newest token
     int num_kv_heads,
     int head_dim,
@@ -186,9 +187,32 @@ __global__ void quantize_paged_kv_fp8_kernel(
     int page_idx = token_row / kPageSize;
     int offset_in_page = token_row % kPageSize;
     int row_idx = page_idx * kPageSize + offset_in_page;
-    int offset = row_idx * kv_dim + kv_head * head_dim + d;
-    float val = __bfloat162float(kv_bf16[offset]);
-    kv_fp8[offset] = __nv_fp8_e4m3(val);
+    int src_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+    int dst_offset = row_idx * kv_dim + kv_head * head_dim + d;
+    float val = __bfloat162float(kv_bf16[src_offset]);
+
+    float abs_val = warp_reduce_max_abs(fabsf(val));
+    int warp_id = d / 32;
+    int lane_id = d % 32;
+    int num_warps = (head_dim + 31) / 32;
+    extern __shared__ float smem[];
+    if (lane_id == 0) smem[warp_id] = abs_val;
+    __syncthreads();
+
+    __shared__ float s_scale;
+    if (warp_id == 0) {
+        float v = (lane_id < num_warps) ? smem[lane_id] : 0.0f;
+        v = warp_reduce_max_abs(v);
+        if (lane_id == 0) {
+            s_scale = fmaxf(v / 448.0f, 1.0e-6f);
+            scales[row_idx * num_kv_heads + kv_head] = s_scale;
+        }
+    }
+    __syncthreads();
+    kv_fp8[dst_offset] = __nv_fp8_e4m3(val / s_scale);
 }
 
 // BF16 → FP8 E4M3 quantize for contiguous → paged migration.
@@ -197,6 +221,7 @@ __global__ void quantize_paged_kv_fp8_kernel(
 __global__ void quantize_scatter_kv_fp8_kernel(
     const __nv_bfloat16* __restrict__ kv_cont,    // [num_kv_heads, max_seq_len, head_dim] HND
     __nv_fp8_e4m3* __restrict__ kv_fp8,           // [max_total_tokens, kv_dim] NHD
+    float* __restrict__ scales,                   // [max_total_tokens, num_kv_heads]
     const int32_t* __restrict__ page_indices,     // [token_count] token rows
     int start_pos,
     int max_seq_len,
@@ -220,13 +245,33 @@ __global__ void quantize_scatter_kv_fp8_kernel(
     // Dest: NHD
     int dst = row_idx * kv_dim + kv_head * head_dim + d;
     float val = __bfloat162float(kv_cont[src]);
-    kv_fp8[dst] = __nv_fp8_e4m3(val);
+
+    float abs_val = warp_reduce_max_abs(fabsf(val));
+    int warp_id = d / 32;
+    int lane_id = d % 32;
+    int num_warps = (head_dim + 31) / 32;
+    extern __shared__ float smem[];
+    if (lane_id == 0) smem[warp_id] = abs_val;
+    __syncthreads();
+
+    __shared__ float s_scale;
+    if (warp_id == 0) {
+        float v = (lane_id < num_warps) ? smem[lane_id] : 0.0f;
+        v = warp_reduce_max_abs(v);
+        if (lane_id == 0) {
+            s_scale = fmaxf(v / 448.0f, 1.0e-6f);
+            scales[row_idx * num_kv_heads + kv_head] = s_scale;
+        }
+    }
+    __syncthreads();
+    kv_fp8[dst] = __nv_fp8_e4m3(val / s_scale);
 }
 
 // Quantize 1 new token per request: bf16 working → FP8 paged pool.
 cudaError_t quantize_paged_kv_fp8_cuda(
     const __nv_bfloat16* kv_bf16,
     __nv_fp8_e4m3* kv_fp8,
+    float* scales,
     const int32_t* new_token_indices,
     int num_kv_heads, int head_dim, int kv_dim,
     int batch_size,
@@ -235,8 +280,9 @@ cudaError_t quantize_paged_kv_fp8_cuda(
     if (batch_size <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, batch_size);
     dim3 block(head_dim);
-    quantize_paged_kv_fp8_kernel<<<grid, block, 0, stream>>>(
-        kv_bf16, kv_fp8, new_token_indices,
+    int smem_bytes = ((head_dim + 31) / 32) * sizeof(float);
+    quantize_paged_kv_fp8_kernel<<<grid, block, smem_bytes, stream>>>(
+        kv_bf16, kv_fp8, scales, new_token_indices,
         num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();
 }
@@ -245,6 +291,7 @@ cudaError_t quantize_paged_kv_fp8_cuda(
 cudaError_t quantize_scatter_kv_fp8_cuda(
     const __nv_bfloat16* kv_cont,
     __nv_fp8_e4m3* kv_fp8,
+    float* scales,
     const int32_t* page_indices,
     int max_seq_len, int seq_len,
     int num_kv_heads, int head_dim, int kv_dim,
@@ -253,8 +300,9 @@ cudaError_t quantize_scatter_kv_fp8_cuda(
     if (seq_len <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, seq_len);
     dim3 block(head_dim);
-    quantize_scatter_kv_fp8_kernel<<<grid, block, 0, stream>>>(
-        kv_cont, kv_fp8, page_indices,
+    int smem_bytes = ((head_dim + 31) / 32) * sizeof(float);
+    quantize_scatter_kv_fp8_kernel<<<grid, block, smem_bytes, stream>>>(
+        kv_cont, kv_fp8, scales, page_indices,
         0, max_seq_len, num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();
 }
@@ -262,6 +310,7 @@ cudaError_t quantize_scatter_kv_fp8_cuda(
 cudaError_t quantize_scatter_kv_fp8_range_cuda(
     const __nv_bfloat16* kv_cont,
     __nv_fp8_e4m3* kv_fp8,
+    float* scales,
     const int32_t* page_indices,
     int start_pos, int max_seq_len, int token_count,
     int num_kv_heads, int head_dim, int kv_dim,
@@ -270,9 +319,65 @@ cudaError_t quantize_scatter_kv_fp8_range_cuda(
     if (token_count <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, token_count);
     dim3 block(head_dim);
-    quantize_scatter_kv_fp8_kernel<<<grid, block, 0, stream>>>(
-        kv_cont, kv_fp8, page_indices,
+    int smem_bytes = ((head_dim + 31) / 32) * sizeof(float);
+    quantize_scatter_kv_fp8_kernel<<<grid, block, smem_bytes, stream>>>(
+        kv_cont, kv_fp8, scales, page_indices,
         start_pos, max_seq_len, num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
+// Durable FP8 NHD → BF16 HND work-buffer refill for paged prefill.
+//
+// The quantized decode kernels read durable FP8 as NHD token rows:
+//   [page, token, head, dim].
+// TileLang/FlashInfer paged prefill reads BF16 work as HND pages:
+//   [page, head, token, dim].
+// Refill only the historical prefix rows before the prefill prep kernel
+// overwrites the current chunk rows in the same BF16 work buffer.
+__global__ void dequantize_paged_kv_fp8_to_hnd_kernel(
+    const __nv_fp8_e4m3* __restrict__ kv_fp8,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ kv_bf16_hnd,
+    const int32_t* __restrict__ token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)
+{
+    int kv_head = blockIdx.x;
+    int tok_flat = blockIdx.y;
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    int token_row = token_rows[tok_flat];
+    constexpr int kPageSize = 16;
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int src_offset = token_row * kv_dim + kv_head * head_dim + d;
+    int scale_offset = token_row * num_kv_heads + kv_head;
+    int dst_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+    float val = static_cast<float>(kv_fp8[src_offset]) * scales[scale_offset];
+    kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+}
+
+cudaError_t dequantize_paged_kv_fp8_to_hnd_cuda(
+    const __nv_fp8_e4m3* kv_fp8,
+    const float* scales,
+    __nv_bfloat16* kv_bf16_hnd,
+    const int32_t* token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim,
+    int total_tokens,
+    cudaStream_t stream)
+{
+    if (total_tokens <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, total_tokens);
+    dim3 block(head_dim);
+    dequantize_paged_kv_fp8_to_hnd_kernel<<<grid, block, 0, stream>>>(
+        kv_fp8, scales, kv_bf16_hnd, token_rows, num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();
 }
 
