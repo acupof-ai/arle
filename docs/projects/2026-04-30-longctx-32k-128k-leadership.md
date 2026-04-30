@@ -320,17 +320,41 @@ Spawn `docs/plans/YYYY-MM-DD-disaggregated-prefill-decode.md` 时展开。骨架
 
 ---
 
-## 13 · 当前位置（Phase 1 状态 = 50%）
+## 13 · 当前位置（Phase 1 状态 = gap closure）
 
-直接代码证据：
+2026-04-30 本地 L4 已完成 Phase 1 S5 的 ARLE/SGLang 第一轮实跑：
 
-- `crates/cuda-kernels/csrc/attention/decode_attention_varlen_fp8.cu` (commit `4e4906f5`) — 单 CTA varlen kernel 已写
-- `infer/src/model/qwen3/forward.rs:579-601` — `supports_mixed_batch` BF16-only gate
-- `infer/src/model/qwen3/batch_decode.rs:481` — 早 return BF16-only
-- `crates/cuda-kernels/src/kv_quant.rs:426` — Rust wrapper 已在
-- 缺：split-KV phase-1/2 拆分、INT8 K_scales、wire-up、bench harness、SGLang baseline 脚本、4 层数值 gate
+| system | c=1 out tok/s | c=4 out tok/s | c=4 TTFT p50 | c=4 ITL p50 | wins |
+|---|---:|---:|---:|---:|---|
+| ARLE | 9.99 | 9.96 | 39535.2 ms | 96.82 ms | `wins/2026-04-30-bench-guidellm-longctx-32k-phase1-s5-arle.md` |
+| SGLang | 11.67 | 16.27 | 24182.25 ms | 119.43 ms | `wins/2026-04-30-bench-sglang-longctx-longctx-32k-phase1-s5.md` |
 
-下一刀 = Phase 1 S1（kernel split-KV 改造）。
+Phase 1 S5 结论：
+
+- **未过入场券**：W1/c4 `ARLE/SGLang = 0.612x`，低于 `0.95x`。
+- c=1 也未过：`0.856x`，但缺口主要在 c=4。
+- ARLE decode ITL 不差：c=4 ITL p50 比 SGLang 低 `18.9%`。
+- 主要缺口在长 prefill / overlap：c=4 TTFT p50 比 SGLang 高 `63.5%`，且 ARLE c=4 output throughput 未从 c=1 放大。
+- Error entry: `errors/2026-04-30-longctx-phase1-s5-gap.md`。
+
+已完成：
+
+- L4 环境、Qwen3-4B 权重、本地 CUDA release build。
+- S3 单目标 32k long-prompt smoke。
+- S4 harness smoke：ARLE 5s smoke，SGLang 60s smoke。
+- S5 ARLE canonical run + SGLang pinned baseline run。
+
+缺口：
+
+- ARLE stats/trace 还没有持久化 `plan_label` 计数，S5 不能机器可验地证明
+  `Mixed > 0`、`Split = 0`。
+- W1/c4 需要先补 `+55.2%` output throughput 才到 Phase 1 `0.95x` 门。
+- 达到 mission `1.30x` 还需要相对当前 ARLE `+112.4%`。
+
+下一刀 = Phase 1 gap closure P1.0：先加 `plan_label` counters，让
+`Mixed/Split/Prefill/Decode` 分布进入 `/v1/stats` 和 S5 wins；随后 profile
+c=4 long prefill，决定是 admission/overlap 先修，还是开 FP8 prefill
+tensor-core kernel 工程。
 
 ---
 
