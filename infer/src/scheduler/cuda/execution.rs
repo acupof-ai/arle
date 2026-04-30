@@ -94,7 +94,7 @@ impl PrefillBudget {
         let decode_slots: Vec<usize> = scheduler
             .running_batch
             .iter()
-            .filter(|&&slot_idx| scheduler.slot_is_runnable_decode(slot_idx))
+            .filter(|&&slot_idx| scheduler.slot_is_live_decode(slot_idx))
             .copied()
             .collect();
         Self::from_scheduler_for_decode_slots(scheduler, &decode_slots)
@@ -124,7 +124,7 @@ impl PrefillBudget {
             decode_active: !decode_slots.is_empty(),
             page_budget: PageBudget::from_scheduler(scheduler, true),
         };
-        for &slot_idx in decode_slots {
+        for slot_idx in scheduler.decode_reservation_slots(decode_slots) {
             let remaining = scheduler.remaining_decode_reservation_tokens(slot_idx);
             if remaining > 0 {
                 budget.page_budget.reserve_growth(PageGrowth {
@@ -228,6 +228,21 @@ impl<M: ModelForward> Scheduler<M> {
             .collect()
     }
 
+    fn decode_reservation_slots(&self, launch_decode_slots: &[usize]) -> Vec<usize> {
+        let mut slots = Vec::with_capacity(self.running_batch.len());
+        for &slot_idx in &self.running_batch {
+            if self.slot_is_live_decode(slot_idx) {
+                slots.push(slot_idx);
+            }
+        }
+        for &slot_idx in launch_decode_slots {
+            if !slots.contains(&slot_idx) {
+                slots.push(slot_idx);
+            }
+        }
+        slots
+    }
+
     fn capped_prefill_reservation(
         &self,
         slot_idx: usize,
@@ -259,7 +274,8 @@ impl<M: ModelForward> Scheduler<M> {
             page_growth: PageGrowth {
                 slot_idx,
                 tokens: prefill_tokens
-                    .saturating_add(self.remaining_decode_reservation_tokens(slot_idx)),
+                    .saturating_add(self.remaining_decode_reservation_tokens(slot_idx))
+                    .saturating_add(self.paged_kv_pool.page_size.max(1)),
             },
         })
     }

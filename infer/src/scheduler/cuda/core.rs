@@ -617,9 +617,12 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn slot_is_runnable_decode(&self, slot_idx: usize) -> bool {
+        self.slot_is_live_decode(slot_idx) && !self.slot_is_emit_gated(slot_idx)
+    }
+
+    pub(super) fn slot_is_live_decode(&self, slot_idx: usize) -> bool {
         self.request(slot_idx)
             .is_some_and(|req| matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed())
-            && !self.slot_is_emit_gated(slot_idx)
     }
 
     pub(super) fn has_runnable_decode_work(&self) -> bool {
