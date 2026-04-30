@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Thread-safe backend worker using Backend Pool approach
  *

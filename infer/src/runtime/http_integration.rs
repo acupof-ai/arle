@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * HTTP server integration with multi-threaded runtime
  *

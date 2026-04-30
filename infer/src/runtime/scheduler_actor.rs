@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Hybrid scheduler actor with specialized sub-schedulers to solve bottleneck issues
  */

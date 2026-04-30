@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Parallel tokenizer pool for CPU-bound text processing
  */

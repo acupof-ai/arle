@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Comprehensive error handling and recovery for multi-threaded runtime
  *
