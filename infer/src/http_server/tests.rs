@@ -796,6 +796,10 @@ mod tests {
             payload.contains("infer_requests_active"),
             "payload={payload}"
         );
+        assert!(
+            payload.contains("infer_scheduler_plan_total"),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]
@@ -852,6 +856,7 @@ mod tests {
         let payload = String::from_utf8(body.to_vec()).unwrap();
         assert!(!payload.is_empty(), "stats body should not be empty");
         assert!(payload.contains("step_phase_us="));
+        assert!(payload.contains("plan_label="));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use super::budget::{PageBudget, PageGrowth, StepTokenBudget, clipped_max_new_tokens_estimate};
 use super::{ModelForward, Phase, Scheduler, info};
+use crate::metrics::SchedulerPlanLabel;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PrefillReservation {
@@ -39,8 +40,18 @@ impl StepPlan {
             Self::Idle => "idle",
             Self::Decode => "decode",
             Self::Prefill(_) => "prefill",
-            Self::Split(_) => "decode+prefill",
+            Self::Split(_) => "split",
             Self::Mixed(_) => "mixed",
+        }
+    }
+
+    fn metrics_label(&self) -> SchedulerPlanLabel {
+        match self {
+            Self::Idle => SchedulerPlanLabel::Idle,
+            Self::Decode => SchedulerPlanLabel::Decode,
+            Self::Prefill(_) => SchedulerPlanLabel::Prefill,
+            Self::Split(_) => SchedulerPlanLabel::Split,
+            Self::Mixed(_) => SchedulerPlanLabel::Mixed,
         }
     }
 
@@ -402,6 +413,7 @@ impl<M: ModelForward> Scheduler<M> {
         let admission_us = assign_us + plan_t.elapsed().as_micros();
         let scheduled_prefill_rows = plan.scheduled_prefill_rows();
         let scheduled_prefill_tokens = plan.scheduled_prefill_tokens();
+        self.metrics.record_scheduler_plan(plan.metrics_label());
 
         assert!(
             self.pending_decode.is_none(),

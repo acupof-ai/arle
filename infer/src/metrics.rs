@@ -22,6 +22,7 @@
 //! | `infer_scheduler_step_phase_*_microseconds` | gauge | EMA scheduler tick phase duration |
 //! | `infer_scheduler_step_cleanup_microseconds` | gauge | EMA scheduler cleanup duration |
 //! | `infer_scheduler_loop_total_microseconds` | gauge | EMA full scheduler loop duration |
+//! | `infer_scheduler_plan_total` | counter | Scheduler ticks by selected plan label |
 //! | `infer_metal_decode_batches_total` | counter | Metal decode batches executed on a batched GPU path |
 //! | `infer_metal_decode_batched_rows_total` | counter | Metal decode rows executed on a batched GPU path |
 //! | `infer_metal_decode_scalar_rows_total` | counter | Metal decode rows executed by the scalar per-request path |
@@ -82,6 +83,16 @@ use histogram::{micros_to_secs, secs_to_micros};
 // ServerMetrics
 // ============================================================================
 
+/// Scheduler plan selected for one runtime tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerPlanLabel {
+    Idle,
+    Decode,
+    Prefill,
+    Split,
+    Mixed,
+}
+
 /// Shared server metrics — cheap to clone (Arc internals).
 #[derive(Clone)]
 pub struct ServerMetrics {
@@ -135,6 +146,11 @@ struct MetricsInner {
     pub scheduler_step_cleanup_us: AtomicU64,
     pub scheduler_loop_total_us: AtomicU64,
     pub scheduler_step_phase_samples: AtomicU64,
+    pub scheduler_plan_idle_total: AtomicU64,
+    pub scheduler_plan_decode_total: AtomicU64,
+    pub scheduler_plan_prefill_total: AtomicU64,
+    pub scheduler_plan_split_total: AtomicU64,
+    pub scheduler_plan_mixed_total: AtomicU64,
     pub kv_coordinator_queue_capacity: AtomicU64,
     pub kv_fetch_queue_depth: AtomicU64,
     pub kv_fetch_waiters: AtomicU64,
@@ -205,6 +221,11 @@ impl ServerMetrics {
                 scheduler_step_cleanup_us: AtomicU64::new(0),
                 scheduler_loop_total_us: AtomicU64::new(0),
                 scheduler_step_phase_samples: AtomicU64::new(0),
+                scheduler_plan_idle_total: AtomicU64::new(0),
+                scheduler_plan_decode_total: AtomicU64::new(0),
+                scheduler_plan_prefill_total: AtomicU64::new(0),
+                scheduler_plan_split_total: AtomicU64::new(0),
+                scheduler_plan_mixed_total: AtomicU64::new(0),
                 kv_coordinator_queue_capacity: AtomicU64::new(0),
                 kv_fetch_queue_depth: AtomicU64::new(0),
                 kv_fetch_waiters: AtomicU64::new(0),
@@ -437,6 +458,18 @@ impl ServerMetrics {
             .store(loop_total_us.max(0.0).round() as u64, Ordering::Relaxed);
     }
 
+    /// Record the scheduler plan selected for one runtime tick.
+    pub fn record_scheduler_plan(&self, label: SchedulerPlanLabel) {
+        let counter = match label {
+            SchedulerPlanLabel::Idle => &self.inner.scheduler_plan_idle_total,
+            SchedulerPlanLabel::Decode => &self.inner.scheduler_plan_decode_total,
+            SchedulerPlanLabel::Prefill => &self.inner.scheduler_plan_prefill_total,
+            SchedulerPlanLabel::Split => &self.inner.scheduler_plan_split_total,
+            SchedulerPlanLabel::Mixed => &self.inner.scheduler_plan_mixed_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Update the staged KV coordinator queue gauges and cumulative store counters.
     pub fn set_kv_coordinator(
         &self,
@@ -609,6 +642,24 @@ impl ServerMetrics {
             self.inner.scheduler_step_cleanup_us.load(Ordering::Relaxed),
             self.inner.scheduler_loop_total_us.load(Ordering::Relaxed),
         ))
+    }
+
+    pub fn scheduler_plan_totals(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.inner.scheduler_plan_idle_total.load(Ordering::Relaxed),
+            self.inner
+                .scheduler_plan_decode_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_plan_prefill_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_plan_split_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_plan_mixed_total
+                .load(Ordering::Relaxed),
+        )
     }
 
     pub fn kv_coordinator_queue_capacity(&self) -> u64 {
@@ -868,6 +919,9 @@ mod tests {
         m.observe_scheduler_step(0.012);
         m.set_scheduler_step_phase_us(100.0, 200.0, 300.0, 400.0, 1000.0);
         m.set_scheduler_loop_phase_us(50.0, 1050.0);
+        m.record_scheduler_plan(SchedulerPlanLabel::Decode);
+        m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
+        m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
         m.set_kv_coordinator(16, 3, 5, 2, true, false, 7, 5, 1, 2);
         m.set_tier_wait_seconds(0.25, 0.5);
         m.set_kv_gpu_blocks(100, 200);
@@ -921,6 +975,12 @@ mod tests {
         );
         assert!(
             rendered.contains("infer_scheduler_loop_total_microseconds{model=\"Qwen3-4B\",} 1050")
+        );
+        assert!(
+            rendered.contains("infer_scheduler_plan_total{model=\"Qwen3-4B\",plan=\"decode\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_scheduler_plan_total{model=\"Qwen3-4B\",plan=\"mixed\",} 2")
         );
         assert!(rendered.contains("infer_kv_coordinator_queue_capacity{model=\"Qwen3-4B\",} 16"));
         assert!(rendered.contains("infer_kv_fetch_queue_depth{model=\"Qwen3-4B\",} 3"));
@@ -992,6 +1052,10 @@ mod tests {
         m.record_metal_qwen35_packed_decode_batch(4);
         m.set_scheduler_step_phase_us(11.0, 22.0, 33.0, 44.0, 110.0);
         m.set_scheduler_loop_phase_us(55.0, 165.0);
+        m.record_scheduler_plan(SchedulerPlanLabel::Prefill);
+        m.record_scheduler_plan(SchedulerPlanLabel::Split);
+        m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
+        m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
@@ -999,6 +1063,7 @@ mod tests {
         assert!(s.contains(
             "step_phase_us=adm:11,prefill:22,decode:33,emit:44,total:110,cleanup:55,loop_total:165"
         ));
+        assert!(s.contains("plan_label=idle:0,decode:0,prefill:1,split:1,mixed:2"));
         assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=100.0%"));
         assert!(s.contains("prefix_skip_rate=25.0%"));
