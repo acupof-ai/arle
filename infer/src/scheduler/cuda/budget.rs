@@ -14,6 +14,15 @@ pub(super) fn clipped_max_new_tokens_estimate(max_tokens: usize) -> usize {
     max_tokens.min(CLIPPED_MAX_NEW_TOKENS_ESTIMATE)
 }
 
+pub(super) fn ratio_decode_headroom_tokens(remaining_tokens: usize, ratio: f64) -> usize {
+    if remaining_tokens == 0 || ratio <= 0.0 {
+        return 0;
+    }
+    ((clipped_max_new_tokens_estimate(remaining_tokens) as f64) * ratio)
+        .ceil()
+        .min(CLIPPED_MAX_NEW_TOKENS_ESTIMATE as f64) as usize
+}
+
 /// Pages a request needs *to be admitted*, in tokens.
 ///
 /// SGLang-style admission: charge prefill cost only (prompt + 1 page tail
@@ -23,11 +32,10 @@ pub(super) fn clipped_max_new_tokens_estimate(max_tokens: usize) -> usize {
 /// (called from both `step_decode_launch` and `step_mixed_launch`), which
 /// preempts the least-progressed decode and re-queues it (Recompute mode).
 ///
-/// Already-running decodes still reserve their remaining `max_tokens` against
-/// the page budget when planning prefill admission — that path goes through
-/// [`crate::scheduler::cuda::execution::Scheduler::remaining_decode_reservation_tokens`],
-/// which keeps using `clipped_max_new_tokens_estimate`. Only the *new*
-/// admission path drops the upfront max_tokens reservation.
+/// Already-running decodes still reserve ratio-scaled clipped remaining
+/// `max_tokens` against the page budget when planning prefill admission.
+/// Only the *new* waiting-admission path drops the upfront max_tokens
+/// reservation entirely.
 pub(super) fn estimated_request_target_tokens(prompt_tokens: usize, _max_tokens: usize) -> usize {
     prompt_tokens.saturating_add(1)
 }
@@ -323,7 +331,8 @@ mod tests {
         PageBudget, PageGrowth, PageTarget, StepTokenBudget, additional_pages_needed,
         clipped_max_new_tokens_estimate, coordinator_submit_headroom, estimated_request_pages,
         estimated_request_target, page_count, partial_tail_capacity,
-        prefix_cache_reclaim_goal_pages, waiting_admission_shortage_pages,
+        prefix_cache_reclaim_goal_pages, ratio_decode_headroom_tokens,
+        waiting_admission_shortage_pages,
     };
 
     #[test]
@@ -348,9 +357,19 @@ mod tests {
         // Decode-tail size no longer affects admission; the retract path
         // handles mid-step OOM. 2_048 + 1 = 2_049 → ceil(2_049/16) = 129.
         assert_eq!(estimated_request_pages(2_048, 8_192, 16), 129);
-        // The clipping helper itself is still used by execution.rs for
+        // The clipping helper itself is still used for ratio-scaled
         // *running* decode reservations, so its semantics are unchanged.
         assert_eq!(clipped_max_new_tokens_estimate(8_192), 4_096);
+    }
+
+    #[test]
+    fn ratio_decode_headroom_ceilings_clipped_remaining_tokens() {
+        assert_eq!(ratio_decode_headroom_tokens(0, 0.10), 0);
+        assert_eq!(ratio_decode_headroom_tokens(1, 0.10), 1);
+        assert_eq!(ratio_decode_headroom_tokens(255, 0.10), 26);
+        assert_eq!(ratio_decode_headroom_tokens(8_192, 0.10), 410);
+        assert_eq!(ratio_decode_headroom_tokens(8_192, 1.0), 4_096);
+        assert_eq!(ratio_decode_headroom_tokens(8_192, 0.0), 0);
     }
 
     #[test]

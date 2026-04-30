@@ -108,6 +108,12 @@ struct Args {
     #[arg(long)]
     prefill_max_requests: Option<usize>,
 
+    /// Fraction of clipped remaining decode tokens reserved as KV headroom
+    /// when admitting prefill work. This maps to the Phase 1.5 scan values
+    /// 0.05, 0.10, 0.15, and 0.20; it is not a percent of the full KV pool.
+    #[arg(long, default_value_t = 0.10)]
+    decode_headroom_ratio: f64,
+
     /// Request scheduling policy. ARLE CUDA currently implements SGLang's
     /// default `fcfs`; other policy names are rejected instead of accepted as
     /// no-ops.
@@ -503,6 +509,7 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
     let mut config = SchedulerConfig {
         max_num_batched_tokens: args.max_num_batched_tokens,
         prefill_max_requests: args.prefill_max_requests,
+        decode_headroom_ratio: args.decode_headroom_ratio,
         short_prompt_bypass_tokens: if args.disable_short_prompt_bypass {
             0
         } else {
