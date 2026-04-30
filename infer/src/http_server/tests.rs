@@ -6,15 +6,13 @@
 mod tests {
     // Pull in the public surface and the internal items the test bodies
     // reference.
-    use super::super::router::{build_app, build_app_with_config, build_app_with_session_engine};
-    use super::super::sessions;
+    use super::super::router::{build_app, build_app_with_config};
     use super::super::types::{
         HTTP_REQUEST_ID_HEADER, HealthResponse, HttpServerConfig, TrainControlTarget,
     };
     use crate::metrics::ServerMetrics;
     use crate::scheduler::{IncomingRequest, SchedulerHandle};
     use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
-    use crate::session_persistence::SessionPersistence;
     use std::sync::Arc;
 
     use axum::body::{Body, to_bytes};
@@ -78,36 +76,6 @@ mod tests {
         });
 
         SchedulerHandle::from_parts(tx, &model_id)
-    }
-
-    struct MockSessionEngine;
-
-    impl SessionPersistence for MockSessionEngine {
-        fn save_session_snapshot(
-            &self,
-            session_id: &str,
-            _fingerprints: Option<&[crate::types::BlockFingerprint]>,
-        ) -> Result<sessions::SessionSnapshot, sessions::SessionSnapshotError> {
-            Ok(sessions::SessionSnapshot {
-                version: 1,
-                session_id: session_id.to_string(),
-                kv_format_tag: 1,
-                radix_bytes: Vec::new(),
-                persisted_blocks: Vec::new(),
-            })
-        }
-
-        fn load_session_snapshot(
-            &mut self,
-            _snapshot: &sessions::SessionSnapshot,
-        ) -> Result<sessions::LoadResponseBody, sessions::SessionSnapshotError> {
-            Ok(sessions::LoadResponseBody {
-                remapped: 0,
-                tombstoned: 0,
-                orphans_cleared: 0,
-                kv_payloads: 0,
-            })
-        }
     }
 
     fn spawn_train_control_stub_once(
@@ -557,25 +525,6 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers()["allow"], "GET, HEAD");
-    }
-
-    #[tokio::test]
-    async fn session_routes_preserve_request_id_header() {
-        let app = build_app_with_session_engine(
-            mock_scheduler("Qwen3-4B"),
-            Arc::new(tokio::sync::RwLock::new(MockSessionEngine)),
-        );
-        let request = Request::builder()
-            .method("GET")
-            .uri("/v1/sessions/demo/save")
-            .header(HTTP_REQUEST_ID_HEADER, "req-session-1")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(response.headers()[HTTP_REQUEST_ID_HEADER], "req-session-1");
-        assert_eq!(response.headers()["allow"], "POST");
     }
 
     #[tokio::test]

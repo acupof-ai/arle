@@ -29,7 +29,6 @@ pub mod request_handle;
 pub mod sampler;
 pub mod scheduler;
 pub mod server_engine;
-pub mod session_persistence;
 pub mod speculative;
 pub mod tensor_parallel;
 pub mod tokenizer;

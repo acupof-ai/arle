@@ -15,12 +15,10 @@
 //! - `router` — the `build_app*` family that wires handlers + middleware.
 //! - `tests` — end-to-end Axum tests for every route.
 //!
-//! Pre-existing siblings `openai_v1` (request/response DTOs) and
-//! `sessions` (the session subtree router) remain unchanged.
+//! Pre-existing sibling `openai_v1` (request/response DTOs) remains unchanged.
 
 #[allow(clippy::struct_field_names, clippy::needless_pass_by_value)]
 mod openai_v1;
-pub mod sessions;
 
 #[path = "http_server/types.rs"]
 pub(in crate::http_server) mod types;
@@ -35,13 +33,6 @@ pub(in crate::http_server) mod router;
 mod tests_mod;
 
 // Public surface preserved verbatim for `main.rs`, `bin/metal_serve.rs`,
-// `bin/cpu_serve.rs`, and `session_persistence.rs`.
-pub use router::{
-    build_app, build_app_with_config, build_app_with_config_and_session_engine,
-    build_app_with_metrics, build_app_with_session_engine,
-};
+// and `bin/cpu_serve.rs`.
+pub use router::{build_app, build_app_with_config, build_app_with_metrics};
 pub use types::{HttpServerConfig, TrainControlTarget};
-
-// `sessions::session_router` reads `super::HTTP_REQUEST_BODY_LIMIT_BYTES`;
-// keep that path resolvable from the coordinator.
-pub(in crate::http_server) use types::HTTP_REQUEST_BODY_LIMIT_BYTES;
