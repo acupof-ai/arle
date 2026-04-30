@@ -423,7 +423,7 @@ __global__ void dequantize_paged_kv_kernel(
 // head_dim must be <= 1024 and a multiple of 32.
 // ============================================================================
 __global__ void quantize_paged_kv_single_kernel(
-    const __nv_bfloat16* __restrict__ kv_bf16,   // working buffer [max_total_tokens * kv_dim]
+    const __nv_bfloat16* __restrict__ kv_bf16,   // HND work buffer [page, head, token, dim]
     int8_t* __restrict__ kv_int8,                 // INT8 pool [max_total_tokens * kv_dim]
     float* __restrict__ scales,                   // [max_total_tokens * num_kv_heads]
     const int32_t* __restrict__ new_token_indices, // [batch_size] pool index of newest token
@@ -437,9 +437,16 @@ __global__ void quantize_paged_kv_single_kernel(
 
     if (d >= head_dim) return;
 
+    constexpr int kPageSize = 16;
     int pool_idx = new_token_indices[batch_idx];
+    int page_idx = pool_idx / kPageSize;
+    int offset_in_page = pool_idx % kPageSize;
+    int src_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
     int data_offset = pool_idx * kv_dim + kv_head * head_dim + d;
-    float val = __bfloat162float(kv_bf16[data_offset]);
+    float val = __bfloat162float(kv_bf16[src_offset]);
 
     // ─── per-head per-token absmax via warp + shared mem reduction ───
     float abs_val = fabsf(val);

@@ -174,6 +174,7 @@ impl ModelForward for Qwen3Model {
                 kv_dim,
                 self.config.intermediate_size,
                 self.config.vocab_size,
+                kv_pool_format,
                 mixed_total_tokens.max(1),
                 max_batch_size,
                 num_heads,
@@ -577,12 +578,14 @@ impl ModelForward for Qwen3Model {
     }
 
     fn supports_mixed_batch(&self, kv_pool_format: crate::model::kv_cache::KVFormat) -> bool {
-        // Mixed is format-specific: BF16 uses FlashInfer varlen TC attention.
-        // Quantized KV formats keep the split path until fused-dequant mixed
-        // kernels exist, so INT8/FP8/TurboQuant coverage stays explicit.
         self.prefill_uses_paged_pool()
             && self.lora.is_none()
-            && matches!(kv_pool_format, crate::model::kv_cache::KVFormat::BF16)
+            && matches!(
+                kv_pool_format,
+                crate::model::kv_cache::KVFormat::BF16
+                    | crate::model::kv_cache::KVFormat::FP8E4M3
+                    | crate::model::kv_cache::KVFormat::INT8
+            )
     }
 
     fn forward_mixed_batch(

@@ -124,6 +124,7 @@ pub(crate) struct MixedBatchBuffers {
     /// `vocab × max_total_tokens`.
     logits: HiddenStates,
     token_ids_gpu: CudaSlice<i32>,
+    quantized: Option<QuantizedMixedBatchBuffers>,
     metadata: FlashInferDecodeMetadata,
     max_tokens: usize,
     max_logit_rows: usize,
@@ -132,10 +133,48 @@ pub(crate) struct MixedBatchBuffers {
 
 unsafe impl Send for MixedBatchBuffers {}
 
+pub(crate) struct QuantizedMixedBatchBuffers {
+    token_rows_gpu: CudaSlice<i32>,
+    token_rows_host: Vec<i32>,
+    attn_workspace: CudaSlice<u8>,
+    attn_workspace_bytes: usize,
+}
+
+impl QuantizedMixedBatchBuffers {
+    fn new(
+        ctx: &DeviceContext,
+        max_tokens: usize,
+        num_qheads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let attn_workspace_bytes = kv_quant::decode_attention_varlen_fp8_workspace_bytes(
+            max_tokens,
+            num_qheads,
+            head_dim,
+            kv_quant::VARLEN_QUANTIZED_MAX_SPLITS,
+        );
+        Ok(Self {
+            token_rows_gpu: ctx
+                .stream
+                .alloc_zeros(max_tokens)
+                .map_err(|e| anyhow::anyhow!("Alloc mixed quantized token_rows_gpu failed: {e}"))?,
+            token_rows_host: Vec::with_capacity(max_tokens),
+            attn_workspace: ctx
+                .stream
+                .alloc_zeros(attn_workspace_bytes)
+                .map_err(|e| anyhow::anyhow!("Alloc mixed quantized attn_workspace failed: {e}"))?,
+            attn_workspace_bytes,
+        })
+    }
+}
+
+unsafe impl Send for QuantizedMixedBatchBuffers {}
+
 impl MixedBatchBuffers {
     fn new(
         ctx: &DeviceContext,
         model: &Qwen3Model,
+        kv_format: KVFormat,
         max_tokens: usize,
         max_logit_rows: usize,
         max_total_pages: usize,
@@ -162,6 +201,16 @@ impl MixedBatchBuffers {
                 .stream
                 .alloc_zeros(max_tokens)
                 .map_err(|e| anyhow::anyhow!("Alloc mixed token_ids_gpu failed: {e}"))?,
+            quantized: matches!(kv_format, KVFormat::FP8E4M3 | KVFormat::INT8)
+                .then(|| {
+                    QuantizedMixedBatchBuffers::new(
+                        ctx,
+                        max_tokens,
+                        model.config.num_attention_heads,
+                        model.config.head_dim,
+                    )
+                })
+                .transpose()?,
             metadata: FlashInferDecodeMetadata::new_with_float_workspace_bytes(
                 ctx,
                 max_tokens,
@@ -239,6 +288,7 @@ impl BatchDecodeBuffers {
         kv_dim: usize,
         inter_dim: usize,
         vocab_size: usize,
+        kv_format: KVFormat,
         max_total_tokens: usize,
         max_logit_rows: usize,
         num_qheads: usize,
@@ -255,7 +305,7 @@ impl BatchDecodeBuffers {
             .saturating_add(2usize.saturating_mul(kv_dim))
             .saturating_add(3usize.saturating_mul(inter_dim));
 
-        bf16_matrix_bytes(activation_dims, max_total_tokens)
+        let mut total = bf16_matrix_bytes(activation_dims, max_total_tokens)
             // Logits buffer — sized for kept output rows only (decode rows +
             // one final-token row per prefill), not every prefill token.
             .saturating_add(bf16_matrix_bytes(vocab_size, max_logit_rows))
@@ -265,7 +315,18 @@ impl BatchDecodeBuffers {
                 max_total_pages,
                 num_qheads,
                 MIXED_FLOAT_WORKSPACE_BYTES,
-            ))
+            ));
+        if matches!(kv_format, KVFormat::FP8E4M3 | KVFormat::INT8) {
+            total = total
+                .saturating_add(bytes_for::<i32>(max_total_tokens))
+                .saturating_add(kv_quant::decode_attention_varlen_fp8_workspace_bytes(
+                    max_total_tokens,
+                    num_qheads,
+                    q_dim / num_qheads,
+                    kv_quant::VARLEN_QUANTIZED_MAX_SPLITS,
+                ));
+        }
+        total
     }
 
     /// Allocate buffers for up to `max_batch_size` requests.
@@ -350,17 +411,21 @@ impl BatchDecodeBuffers {
     fn ensure_mixed_buffers(
         &mut self,
         model: &Qwen3Model,
+        kv_format: KVFormat,
         min_total_tokens: usize,
     ) -> Result<&mut MixedBatchBuffers> {
+        let needs_quantized = matches!(kv_format, KVFormat::FP8E4M3 | KVFormat::INT8);
         let needs_realloc = self.mixed.as_ref().is_none_or(|mixed| {
             mixed.max_tokens < min_total_tokens
                 || mixed.max_logit_rows < self.max_batch_size
                 || mixed.max_total_pages < self.max_total_pages
+                || (needs_quantized && mixed.quantized.is_none())
         });
         if needs_realloc {
             self.mixed = Some(MixedBatchBuffers::new(
                 &model.ctx,
                 model,
+                kv_format,
                 min_total_tokens.max(self.max_batch_size),
                 self.max_batch_size,
                 self.max_total_pages,
@@ -478,7 +543,14 @@ impl Qwen3Model {
         paged_kv_pool: &mut PagedKVPool,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<bool> {
-        if self.lora.is_some() || paged_kv_pool.format != KVFormat::BF16 {
+        if self.lora.is_some() {
+            return Ok(false);
+        }
+        let kv_format = paged_kv_pool.format;
+        if !matches!(
+            kv_format,
+            KVFormat::BF16 | KVFormat::FP8E4M3 | KVFormat::INT8
+        ) {
             return Ok(false);
         }
         let b = batch.decode_tokens.len();
@@ -521,7 +593,7 @@ impl Qwen3Model {
         );
 
         let total_tokens = b + total_prefill_tokens;
-        let mixed = bufs.ensure_mixed_buffers(self, total_tokens)?;
+        let mixed = bufs.ensure_mixed_buffers(self, kv_format, total_tokens)?;
         mixed.set_seq_len(total_tokens);
 
         for prefill in batch.prefills {
@@ -547,6 +619,40 @@ impl Qwen3Model {
             batch.prefill_start_positions,
             &prefill_token_counts,
         )?;
+        let max_kv_len = batch
+            .decode_slot_indices
+            .iter()
+            .chain(prefill_slot_indices.iter())
+            .map(|&slot| paged_kv_pool.seq_len(slot))
+            .max()
+            .unwrap_or(0);
+        if matches!(kv_format, KVFormat::FP8E4M3 | KVFormat::INT8) {
+            let quantized = mixed
+                .quantized
+                .as_mut()
+                .expect("quantized mixed buffers allocated");
+            quantized.token_rows_host.clear();
+            quantized
+                .token_rows_host
+                .extend(paged_kv_pool.build_last_indices(batch.decode_slot_indices));
+            for ((&slot, &start_pos), &token_count) in prefill_slot_indices
+                .iter()
+                .zip(batch.prefill_start_positions.iter())
+                .zip(prefill_token_counts.iter())
+            {
+                quantized.token_rows_host.extend(
+                    paged_kv_pool
+                        .token_rows_for_range(slot, start_pos, token_count)
+                        .into_iter()
+                        .map(|row| row as i32),
+                );
+            }
+            debug_assert_eq!(quantized.token_rows_host.len(), total_tokens);
+            self.ctx
+                .stream
+                .memcpy_htod(&quantized.token_rows_host, &mut quantized.token_rows_gpu)
+                .map_err(|e| anyhow::anyhow!("H2D mixed quantized token rows: {e}"))?;
+        }
         // TileLang TC decode alias is plan-less; skip FlashInfer planning.
         #[cfg(not(feature = "tilelang-attn"))]
         mixed.metadata.tc_plan(
@@ -718,35 +824,133 @@ impl Qwen3Model {
             }
 
             {
-                let max_qlen = mixed
-                    .metadata
-                    .qo_indptr_h
-                    .windows(2)
-                    .map(|w| w[1] - w[0])
-                    .max()
-                    .unwrap_or(0);
-                let total_pages = mixed.metadata.indptr_h.last().copied().unwrap_or(0);
-                ops::flashinfer_tc_run_layer(
-                    &self.ctx,
-                    &mixed.q_batch,
-                    &mixed.metadata.qo_indptr,
-                    paged_kv_pool,
-                    layer_idx,
-                    &mixed.metadata.kv_indptr,
-                    &mixed.metadata.kv_indices,
-                    &mixed.metadata.kv_last_page_len,
-                    &mut mixed.attn_output,
-                    &mut mixed.metadata.flashinfer_ws,
-                    &ops::FlashInferHeadConfig {
-                        num_qo_heads: num_heads,
-                        num_kv_heads,
-                        page_size,
-                        head_dim,
-                    },
-                    (b + prefill_count) as i32,
-                    max_qlen,
-                    total_pages,
-                )?;
+                let stream = &self.ctx.stream;
+                match kv_format {
+                    KVFormat::FP8E4M3 => {
+                        let quantized = mixed
+                            .quantized
+                            .as_ref()
+                            .expect("quantized mixed buffers allocated");
+                        kv_quant::quantize_paged_kv_fp8(
+                            &self.ctx,
+                            paged_kv_pool.k_work_ptr(stream),
+                            paged_kv_pool.k_data_ptr(layer_idx, stream),
+                            paged_kv_pool.k_scales_ptr(layer_idx, stream),
+                            &quantized.token_rows_gpu,
+                            num_kv_heads,
+                            head_dim,
+                            paged_kv_pool.kv_dim,
+                            total_tokens,
+                        )?;
+                        kv_quant::quantize_paged_kv_fp8(
+                            &self.ctx,
+                            paged_kv_pool.v_work_ptr(stream),
+                            paged_kv_pool.v_data_ptr(layer_idx, stream),
+                            paged_kv_pool.v_scales_ptr(layer_idx, stream),
+                            &quantized.token_rows_gpu,
+                            num_kv_heads,
+                            head_dim,
+                            paged_kv_pool.kv_dim,
+                            total_tokens,
+                        )?;
+                    }
+                    KVFormat::INT8 => {
+                        let quantized = mixed
+                            .quantized
+                            .as_ref()
+                            .expect("quantized mixed buffers allocated");
+                        kv_quant::quantize_paged_kv_single(
+                            &self.ctx,
+                            paged_kv_pool.k_work_ptr(stream),
+                            paged_kv_pool.k_data_ptr(layer_idx, stream),
+                            paged_kv_pool.k_scales_ptr(layer_idx, stream),
+                            &quantized.token_rows_gpu,
+                            num_kv_heads,
+                            head_dim,
+                            paged_kv_pool.kv_dim,
+                            total_tokens,
+                        )?;
+                        kv_quant::quantize_paged_kv_single(
+                            &self.ctx,
+                            paged_kv_pool.v_work_ptr(stream),
+                            paged_kv_pool.v_data_ptr(layer_idx, stream),
+                            paged_kv_pool.v_scales_ptr(layer_idx, stream),
+                            &quantized.token_rows_gpu,
+                            num_kv_heads,
+                            head_dim,
+                            paged_kv_pool.kv_dim,
+                            total_tokens,
+                        )?;
+                    }
+                    KVFormat::BF16 => {}
+                    KVFormat::TurboQuant { .. } => unreachable!("TurboQuant does not enter mixed"),
+                }
+
+                match kv_format {
+                    KVFormat::BF16 => {
+                        let max_qlen = mixed
+                            .metadata
+                            .qo_indptr_h
+                            .windows(2)
+                            .map(|w| w[1] - w[0])
+                            .max()
+                            .unwrap_or(0);
+                        let total_pages = mixed.metadata.indptr_h.last().copied().unwrap_or(0);
+                        ops::flashinfer_tc_run_layer(
+                            &self.ctx,
+                            &mixed.q_batch,
+                            &mixed.metadata.qo_indptr,
+                            paged_kv_pool,
+                            layer_idx,
+                            &mixed.metadata.kv_indptr,
+                            &mixed.metadata.kv_indices,
+                            &mixed.metadata.kv_last_page_len,
+                            &mut mixed.attn_output,
+                            &mut mixed.metadata.flashinfer_ws,
+                            &ops::FlashInferHeadConfig {
+                                num_qo_heads: num_heads,
+                                num_kv_heads,
+                                page_size,
+                                head_dim,
+                            },
+                            (b + prefill_count) as i32,
+                            max_qlen,
+                            total_pages,
+                        )?;
+                    }
+                    KVFormat::FP8E4M3 | KVFormat::INT8 => {
+                        let quantized = mixed
+                            .quantized
+                            .as_ref()
+                            .expect("quantized mixed buffers allocated");
+                        let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                        kv_quant::decode_attention_varlen_fp8(
+                            &self.ctx,
+                            &mixed.q_batch,
+                            &mixed.metadata.qo_indptr,
+                            paged_kv_pool.k_data_ptr(layer_idx, stream),
+                            paged_kv_pool.v_data_ptr(layer_idx, stream),
+                            Some(paged_kv_pool.k_scales_ptr(layer_idx, stream)),
+                            Some(paged_kv_pool.v_scales_ptr(layer_idx, stream)),
+                            &mixed.metadata.kv_indptr,
+                            &mixed.metadata.kv_indices,
+                            &mixed.metadata.kv_last_page_len,
+                            &mut mixed.attn_output,
+                            num_heads,
+                            num_kv_heads,
+                            page_size,
+                            b + prefill_count,
+                            total_tokens,
+                            max_kv_len,
+                            matches!(kv_format, KVFormat::INT8),
+                            true,
+                            sm_scale,
+                            &quantized.attn_workspace,
+                            quantized.attn_workspace_bytes,
+                        )?;
+                    }
+                    KVFormat::TurboQuant { .. } => unreachable!("TurboQuant does not enter mixed"),
+                }
             }
 
             ops::gemm_into(
