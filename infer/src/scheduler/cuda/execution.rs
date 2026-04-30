@@ -1,6 +1,8 @@
 use super::budget::{PageBudget, PageGrowth, StepTokenBudget, clipped_max_new_tokens_estimate};
 use super::{ModelForward, Phase, Scheduler, info};
 
+const FIRST_BATCH_DECODE_READY_THRESHOLD: usize = 2;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PrefillReservation {
     pub prefill_tokens: usize,
@@ -217,6 +219,50 @@ impl<M: ModelForward> Scheduler<M> {
             .collect()
     }
 
+    fn runnable_decode_count(&self) -> usize {
+        self.running_batch
+            .iter()
+            .filter(|&&slot_idx| self.slot_is_runnable_decode(slot_idx))
+            .count()
+    }
+
+    fn enter_first_batch_mode(&mut self, candidates: &[PrefillCandidate]) {
+        if self.first_batch_mode.active {
+            return;
+        }
+        self.first_batch_mode.start();
+        let candidate_tokens: usize = candidates
+            .iter()
+            .map(|candidate| candidate.reservation.prefill_tokens)
+            .sum();
+        info!(
+            "first-batch mode enter: active={} waiting={} prefill_queue={} candidates={} candidate_tokens={}",
+            self.active_len(),
+            self.waiting.len(),
+            self.prefill_queue.len(),
+            candidates.len(),
+            candidate_tokens
+        );
+    }
+
+    fn finish_first_batch_mode(&mut self, decode_ready: usize, reason: &'static str) {
+        if !self.first_batch_mode.active {
+            return;
+        }
+        let (duration_us, prefill_rows, prefill_tokens) = self.first_batch_mode.finish();
+        info!(
+            "first-batch mode exit: reason={} duration_us={} prefill_rows={} prefill_tokens={} decode_ready={} active={} waiting={} prefill_queue={}",
+            reason,
+            duration_us,
+            prefill_rows,
+            prefill_tokens,
+            decode_ready,
+            self.active_len(),
+            self.waiting.len(),
+            self.prefill_queue.len()
+        );
+    }
+
     fn capped_prefill_reservation(
         &self,
         slot_idx: usize,
@@ -341,6 +387,23 @@ impl<M: ModelForward> Scheduler<M> {
         let mut budget = PrefillBudget::from_scheduler(self);
         let scored_candidates = self.collect_prefill_candidates(&budget);
         let candidates = select_prefill_candidates(&mut budget, scored_candidates);
+        if !has_decode && !candidates.is_empty() {
+            self.enter_first_batch_mode(&candidates);
+        }
+        if self.first_batch_mode.active {
+            if !candidates.is_empty() {
+                return StepPlan::Prefill(candidates);
+            }
+            let decode_ready = self.runnable_decode_count();
+            let reason = if decode_ready >= FIRST_BATCH_DECODE_READY_THRESHOLD {
+                "decode-threshold"
+            } else if self.prefill_queue.is_empty() {
+                "prefill-drained"
+            } else {
+                "no-candidates"
+            };
+            self.finish_first_batch_mode(decode_ready, reason);
+        }
         if has_decode {
             if candidates.is_empty() {
                 return StepPlan::Decode;
@@ -402,6 +465,8 @@ impl<M: ModelForward> Scheduler<M> {
         let admission_us = assign_us + plan_t.elapsed().as_micros();
         let scheduled_prefill_rows = plan.scheduled_prefill_rows();
         let scheduled_prefill_tokens = plan.scheduled_prefill_tokens();
+        self.first_batch_mode
+            .record_prefill(scheduled_prefill_rows, scheduled_prefill_tokens);
 
         assert!(
             self.pending_decode.is_none(),
