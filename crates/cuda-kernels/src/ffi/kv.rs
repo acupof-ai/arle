@@ -126,6 +126,7 @@ unsafe extern "C" {
     pub fn quantize_paged_kv_fp8_cuda(
         kv_bf16: *const Half,
         kv_fp8: *mut u8,
+        scales: *mut f32,
         new_token_indices: *const i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -137,6 +138,7 @@ unsafe extern "C" {
     pub fn quantize_scatter_kv_fp8_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,
+        scales: *mut f32,
         page_indices: *const i32,
         max_seq_len: i32,
         seq_len: i32,
@@ -149,6 +151,7 @@ unsafe extern "C" {
     pub fn quantize_scatter_kv_fp8_range_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,
+        scales: *mut f32,
         page_indices: *const i32,
         start_pos: i32,
         max_seq_len: i32,
@@ -156,6 +159,18 @@ unsafe extern "C" {
         num_kv_heads: i32,
         head_dim: i32,
         kv_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dequantize_paged_kv_fp8_to_hnd_cuda(
+        kv_fp8: *const u8,
+        scales: *const f32,
+        kv_bf16_hnd: *mut Half,
+        token_rows: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        total_tokens: i32,
         stream: CUstream,
     ) -> CUresult;
 

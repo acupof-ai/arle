@@ -328,7 +328,7 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         kv_format: crate::model::kv_cache::KVFormat,
     ) -> Result<()> {
         // Only BF16 full-attention layers run through FlashInfer HD256.
-        // FP8/INT8/TurboQuant decode uses our quantized kernels instead.
+        // FP8/INT8/TurboQuant decode uses quantized kernels instead.
         // FlashInfer plans once per forward; the TileLang HD256 decode kernel
         // is plan-less, so this gate must match the actual decode-kernel
         // selector. The broader `tilelang-attn` feature only covers HD128
@@ -873,6 +873,7 @@ impl Qwen35Model {
                         &self.ctx,
                         kv_pool.k_work_ptr(stream),
                         kv_pool.k_data_ptr(full_idx, stream),
+                        kv_pool.k_scales_ptr(full_idx, stream),
                         &bufs.metadata.last_token_indices,
                         num_kv_heads,
                         head_dim,
@@ -883,6 +884,7 @@ impl Qwen35Model {
                         &self.ctx,
                         kv_pool.v_work_ptr(stream),
                         kv_pool.v_data_ptr(full_idx, stream),
+                        kv_pool.v_scales_ptr(full_idx, stream),
                         &bufs.metadata.last_token_indices,
                         num_kv_heads,
                         head_dim,
@@ -975,6 +977,8 @@ impl Qwen35Model {
                         &bufs.attn.q_batch,
                         kv_pool.k_data_ptr(full_idx, stream),
                         kv_pool.v_data_ptr(full_idx, stream),
+                        kv_pool.k_scales_ptr(full_idx, stream),
+                        kv_pool.v_scales_ptr(full_idx, stream),
                         &bufs.metadata.kv_indices,
                         &bufs.quantized_kv_meta,
                         &mut bufs.attn.attn_output,

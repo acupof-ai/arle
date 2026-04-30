@@ -229,18 +229,16 @@ __global__ void decode_attention_int8_partial_kernel(
             if (l_w == 0.0f) continue;
 
             float m_new = fmaxf(final_m, m_w);
-            float s_prev = final_l * __expf(final_m - m_new);
-            float s_w    = l_w * __expf(m_w - m_new);
-            float l_new  = s_prev + s_w;
-            float inv_l  = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
+            float scale_prev = __expf(final_m - m_new);
+            float scale_w    = __expf(m_w - m_new);
 
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
-                final_o[i] = (final_o[i] * s_prev + o_w * s_w) * inv_l;
+                final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
+            final_l = final_l * scale_prev + l_w * scale_w;
             final_m = m_new;
-            final_l = l_new;
         }
 
         // Write partial results to global memory
@@ -249,10 +247,11 @@ __global__ void decode_attention_int8_partial_kernel(
             partial_m[out_idx] = final_m;
             partial_l[out_idx] = final_l;
         }
+        float inv_final_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
             int d = lane_id * EPT + i;
-            partial_out[out_idx * HEAD_DIM + d] = final_o[i];
+            partial_out[out_idx * HEAD_DIM + d] = final_o[i] * inv_final_l;
         }
     }
 }
@@ -302,14 +301,15 @@ __global__ void decode_attention_merge_kernel(
 }
 
 // ============================================================================
-// FP8 E4M3 variant — same split-KV structure, but no separate scales.
-// FP8 E4M3 is a self-contained 8-bit float: direct cast to float.
+// FP8 E4M3 variant — same split-KV structure, with per-token/per-head scales.
 // ============================================================================
 template <int HEAD_DIM>
 __global__ void decode_attention_fp8_partial_kernel(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_fp8_e4m3* __restrict__ K_data,
     const __nv_fp8_e4m3* __restrict__ V_data,
+    const float* __restrict__ K_scales,
+    const float* __restrict__ V_scales,
     const int32_t* __restrict__ kv_indices,
     const int32_t* __restrict__ kv_meta,
     float* __restrict__ partial_out,
@@ -377,13 +377,15 @@ __global__ void decode_attention_fp8_partial_kernel(
         for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
             int row_idx = row_base + t;
             int base = row_idx * kv_dim + kv_head * HEAD_DIM;
+            int scale_offset = row_idx * num_kv_heads + kv_head;
+            float k_scale = K_scales[scale_offset];
+            float v_scale = V_scales[scale_offset];
 
-            // FP8 dequant: direct cast, no scale
             float qk = 0.0f;
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float k_val = static_cast<float>(K_data[base + d]);
+                float k_val = static_cast<float>(K_data[base + d]) * k_scale;
                 qk += q_reg[i] * k_val;
             }
             qk = warp_reduce_sum(qk);
@@ -396,7 +398,7 @@ __global__ void decode_attention_fp8_partial_kernel(
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 int d = lane_id * EPT + i;
-                float v_val = static_cast<float>(V_data[base + d]);
+                float v_val = static_cast<float>(V_data[base + d]) * v_scale;
                 o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
             }
             m_local = m_new;
@@ -426,23 +428,23 @@ __global__ void decode_attention_fp8_partial_kernel(
             float m_w = smem_m[w], l_w = smem_l[w];
             if (l_w == 0.0f) continue;
             float m_new = fmaxf(final_m, m_w);
-            float s_prev = final_l * __expf(final_m - m_new);
-            float s_w = l_w * __expf(m_w - m_new);
-            float l_new = s_prev + s_w;
-            float inv_l = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
+            float scale_prev = __expf(final_m - m_new);
+            float scale_w = __expf(m_w - m_new);
             #pragma unroll
             for (int i = 0; i < EPT; i++) {
                 float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
-                final_o[i] = (final_o[i] * s_prev + o_w * s_w) * inv_l;
+                final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
             }
-            final_m = m_new; final_l = l_new;
+            final_l = final_l * scale_prev + l_w * scale_w;
+            final_m = m_new;
         }
 
         int out_idx = split_idx * (batch_size * num_qo_heads) + total_q_idx;
         if (lane_id == 0) { partial_m[out_idx] = final_m; partial_l[out_idx] = final_l; }
+        float inv_final_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++)
-            partial_out[out_idx * HEAD_DIM + lane_id * EPT + i] = final_o[i];
+            partial_out[out_idx * HEAD_DIM + lane_id * EPT + i] = final_o[i] * inv_final_l;
     }
 }
 
@@ -584,6 +586,8 @@ cudaError_t decode_attention_fp8_cuda(
     const __nv_bfloat16* Q,
     const __nv_fp8_e4m3* K_data,
     const __nv_fp8_e4m3* V_data,
+    const float* K_scales,
+    const float* V_scales,
     const int32_t* kv_indices,
     const int32_t* kv_indptr,
     __nv_bfloat16* O,
@@ -620,12 +624,12 @@ cudaError_t decode_attention_fp8_cuda(
         dim3 block(BLOCK_SIZE);
         if (head_dim == 128) {
             decode_attention_fp8_partial_kernel<128><<<grid, block, 0, stream>>>(
-                Q, K_data, V_data, kv_indices, kv_indptr,
+                Q, K_data, V_data, K_scales, V_scales, kv_indices, kv_indptr,
                 p_out, p_m, p_l,
                 batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
         } else if (head_dim == 256) {
             decode_attention_fp8_partial_kernel<256><<<grid, block, 0, stream>>>(
-                Q, K_data, V_data, kv_indices, kv_indptr,
+                Q, K_data, V_data, K_scales, V_scales, kv_indices, kv_indptr,
                 p_out, p_m, p_l,
                 batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
         }
