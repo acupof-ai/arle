@@ -3,7 +3,6 @@ pub mod collective;
 pub mod ffi;
 #[cfg(feature = "cuda")]
 pub mod flashinfer;
-pub mod graph_pool;
 #[cfg(feature = "cuda")]
 pub mod kv_quant;
 #[cfg(feature = "cuda")]
