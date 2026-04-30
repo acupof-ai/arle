@@ -7,51 +7,6 @@
 use crate::types::BlockFingerprint;
 use fastrace::Span;
 
-pub(in crate::scheduler::cuda) struct FirstBatchMode {
-    pub active: bool,
-    pub started_at: Option<std::time::Instant>,
-    pub prefill_rows: u64,
-    pub prefill_tokens: u64,
-}
-
-impl FirstBatchMode {
-    pub(in crate::scheduler::cuda) fn new() -> Self {
-        Self {
-            active: false,
-            started_at: None,
-            prefill_rows: 0,
-            prefill_tokens: 0,
-        }
-    }
-
-    pub(in crate::scheduler::cuda) fn start(&mut self) {
-        self.active = true;
-        self.started_at = Some(std::time::Instant::now());
-        self.prefill_rows = 0;
-        self.prefill_tokens = 0;
-    }
-
-    pub(in crate::scheduler::cuda) fn record_prefill(&mut self, rows: u64, tokens: u64) {
-        if self.active {
-            self.prefill_rows = self.prefill_rows.saturating_add(rows);
-            self.prefill_tokens = self.prefill_tokens.saturating_add(tokens);
-        }
-    }
-
-    pub(in crate::scheduler::cuda) fn finish(&mut self) -> (u128, u64, u64) {
-        let duration_us = self
-            .started_at
-            .take()
-            .map_or(0, |started_at| started_at.elapsed().as_micros());
-        let prefill_rows = self.prefill_rows;
-        let prefill_tokens = self.prefill_tokens;
-        self.active = false;
-        self.prefill_rows = 0;
-        self.prefill_tokens = 0;
-        (duration_us, prefill_rows, prefill_tokens)
-    }
-}
-
 pub(in crate::scheduler::cuda) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
@@ -151,24 +106,7 @@ impl SchedulerRuntimeStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{FirstBatchMode, SchedulerRuntimeStats};
-
-    #[test]
-    fn first_batch_mode_records_prefill_work_until_finish() {
-        let mut mode = FirstBatchMode::new();
-
-        mode.record_prefill(1, 128);
-        assert_eq!(mode.prefill_rows, 0);
-
-        mode.start();
-        mode.record_prefill(2, 4096);
-        mode.record_prefill(1, 1024);
-
-        let (_duration_us, rows, tokens) = mode.finish();
-        assert_eq!((rows, tokens), (3, 5120));
-        assert!(!mode.active);
-        assert_eq!((mode.prefill_rows, mode.prefill_tokens), (0, 0));
-    }
+    use super::SchedulerRuntimeStats;
 
     #[test]
     fn loop_total_timing_includes_work_after_step_phase() {

@@ -45,8 +45,8 @@ pub(in crate::scheduler::cuda) use helpers::{
     sealed_block_token_count,
 };
 pub(in crate::scheduler::cuda) use state_types::{
-    FirstBatchMode, PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow,
-    PrefetchTicketState, SchedulerRuntimeStats, StoreDedupKey,
+    PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow, PrefetchTicketState,
+    SchedulerRuntimeStats, StoreDedupKey,
 };
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
@@ -145,8 +145,6 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) prefill_ctx: Option<M::PrefillContext>,
     /// Lifetime counters and local profiling state.
     pub(super) stats: SchedulerRuntimeStats,
-    /// Cold-start mode that drains the first prompt burst before decode.
-    pub(super) first_batch_mode: FirstBatchMode,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
     /// Pending prefill state for GPU/CPU overlap.
