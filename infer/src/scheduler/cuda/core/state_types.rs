@@ -151,10 +151,6 @@ impl FirstBatchPrefillStats {
         }
     }
 
-    pub(in crate::scheduler::cuda) fn admission_open(&self) -> bool {
-        self.active && !self.sealed
-    }
-
     pub(in crate::scheduler::cuda) fn seal(&mut self) {
         if self.active {
             self.sealed = true;
@@ -224,7 +220,6 @@ mod tests {
         stats.include_candidate(0, 10);
         stats.seal();
         stats.include_candidate(1, 11);
-        assert!(!stats.admission_open());
         assert!(stats.contains_candidate(0, 10));
         assert!(!stats.contains_candidate(1, 11));
         stats.record_prefill_step(2, 4096);
