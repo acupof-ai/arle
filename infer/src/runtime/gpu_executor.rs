@@ -121,7 +121,7 @@ impl GpuExecutorPool {
         task_receiver: mpsc::Receiver<ExecuteTask>,
         result_sender: mpsc::Sender<BatchResult>,
     ) -> Result<Self> {
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
 
         // Create backend workers using the Backend Pool approach
         let mut workers = Vec::new();
@@ -166,7 +166,7 @@ impl GpuExecutorPool {
         })
     }
 
-    async fn create_compute_stream(worker_id: usize) -> Result<ComputeStream> {
+    async fn create_compute_stream(_worker_id: usize) -> Result<ComputeStream> {
         #[cfg(feature = "cuda")]
         {
             use cudarc::driver::CudaDevice;
@@ -197,7 +197,7 @@ impl GpuExecutorPool {
         }
     }
 
-    async fn create_copy_stream(worker_id: usize) -> Result<CopyStream> {
+    async fn create_copy_stream(_worker_id: usize) -> Result<CopyStream> {
         #[cfg(feature = "cuda")]
         {
             use cudarc::driver::CudaDevice;
@@ -250,7 +250,7 @@ impl GpuExecutorPool {
     }
 
     async fn task_distribution_loop(
-        workers: Vec<Arc<GpuWorker>>,
+        _workers: Vec<Arc<GpuWorker>>,
         load_balancer: LoadBalancer,
         task_receiver: Arc<Mutex<mpsc::Receiver<ExecuteTask>>>,
     ) {
@@ -413,7 +413,7 @@ impl GpuWorker {
         Ok(())
     }
 
-    async fn launch_compute(&self, batch_input: &BackendBatch) -> Result<BackendResult> {
+    async fn launch_compute(&self, _batch_input: &BackendBatch) -> Result<BackendResult> {
         // Use dedicated compute stream to avoid blocking
         match &self.compute_stream {
             #[cfg(feature = "cuda")]

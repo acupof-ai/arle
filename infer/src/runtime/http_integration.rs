@@ -294,7 +294,7 @@ impl MultiThreadedHttpServer {
     // Private helper methods
 
     async fn create_router(&self) -> Result<Router> {
-        let state = AppState {
+        let _state = AppState {
             server: Arc::new(self.clone()),
         };
 
@@ -309,7 +309,7 @@ impl MultiThreadedHttpServer {
     }
 
     async fn create_single_threaded_engine(
-        backend: Box<dyn InferenceBackend>,
+        _backend: Box<dyn InferenceBackend>,
     ) -> Result<Box<dyn InferenceEngine>> {
         // This would wrap the backend in a single-threaded engine
         // For now, we'll return a placeholder
@@ -374,8 +374,8 @@ impl MultiThreadedHttpServer {
 
     async fn handle_single_threaded_completion(
         &self,
-        engine: &Box<dyn InferenceEngine>,
-        request: CompletionRequest,
+        _engine: &Box<dyn InferenceEngine>,
+        _request: CompletionRequest,
     ) -> Result<CompletionOutput> {
         // This would use the single-threaded engine
         // For now, return a placeholder
@@ -424,9 +424,9 @@ impl MultiThreadedHttpServer {
 
     async fn handle_single_threaded_stream(
         &self,
-        engine: &Box<dyn InferenceEngine>,
-        request: CompletionRequest,
-        stream_tx: mpsc::UnboundedSender<ApiStreamResponse>,
+        _engine: &Box<dyn InferenceEngine>,
+        _request: CompletionRequest,
+        _stream_tx: mpsc::UnboundedSender<ApiStreamResponse>,
     ) -> Result<()> {
         // This would use the single-threaded engine for streaming
         // For now, return a placeholder

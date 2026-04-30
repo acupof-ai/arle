@@ -12,6 +12,7 @@ use crate::backend::{GenerateResult, InferenceBackend};
 use crate::sampler::SamplingParams;
 
 /// Backend worker that wraps an InferenceBackend for thread-safe access
+#[allow(dead_code)]
 pub struct BackendWorker {
     worker_id: usize,
     backend: Box<dyn InferenceBackend>,
@@ -170,14 +171,14 @@ impl BackendWorker {
     }
 
     /// Extract log probabilities from backend result
-    fn extract_logprobs(&self, result: &GenerateResult) -> Vec<f32> {
+    fn extract_logprobs(&self, _result: &GenerateResult) -> Vec<f32> {
         // The current GenerateResult doesn't include logprobs
         // This would need to be added to the backend interface
         Vec::new() // No logprobs available in current interface
     }
 
     /// Determine if generation is finished
-    fn determine_if_finished(&self, result: &GenerateResult) -> bool {
+    fn determine_if_finished(&self, _result: &GenerateResult) -> bool {
         // Generation is always finished for non-streaming backends
         true
     }
@@ -230,10 +231,10 @@ pub struct BackendWorkerPool {
 
 impl BackendWorkerPool {
     /// Create a pool of backend workers
-    pub fn new(backend_template: Box<dyn InferenceBackend>, worker_count: usize) -> Result<Self> {
-        let mut workers = Vec::new();
+    pub fn new(_backend_template: Box<dyn InferenceBackend>, worker_count: usize) -> Result<Self> {
+        let workers = Vec::new();
 
-        for worker_id in 0..worker_count {
+        for _worker_id in 0..worker_count {
             // Clone the backend for each worker
             // Note: This requires the backend to be cloneable
             // If not, we'd need a different approach like backend factories
@@ -350,12 +351,12 @@ impl BackendWorkerFactory {
     }
 
     fn create_per_worker_backends(
-        backend_template: Box<dyn InferenceBackend>,
+        _backend_template: Box<dyn InferenceBackend>,
         worker_count: usize,
     ) -> Result<Vec<BackendWorker>> {
-        let mut workers = Vec::new();
+        let workers = Vec::new();
 
-        for worker_id in 0..worker_count {
+        for _worker_id in 0..worker_count {
             // TODO: Fix CloneableBackend implementation
             // let worker_backend = backend_template.clone_box()?;
             // let worker = BackendWorker::new(worker_backend, worker_id)?;
@@ -367,7 +368,7 @@ impl BackendWorkerFactory {
 
     fn create_shared_backends(
         _backend_template: Box<dyn InferenceBackend>,
-        worker_count: usize,
+        _worker_count: usize,
         _max_concurrent: usize,
     ) -> Result<Vec<BackendWorker>> {
         // Implement shared backend strategy
@@ -378,12 +379,12 @@ impl BackendWorkerFactory {
     }
 
     fn create_per_device_backends(
-        backend_template: Box<dyn InferenceBackend>,
+        _backend_template: Box<dyn InferenceBackend>,
         device_count: usize,
         workers_per_device: usize,
     ) -> Result<Vec<BackendWorker>> {
-        let mut workers = Vec::new();
-        let mut worker_id = 0;
+        let workers = Vec::new();
+        let mut _worker_id = 0;
 
         for _device_id in 0..device_count {
             for _ in 0..workers_per_device {
@@ -391,7 +392,7 @@ impl BackendWorkerFactory {
                 // let worker_backend = backend_template.clone_box()?;
                 // let worker = BackendWorker::new(worker_backend, worker_id)?;
                 // workers.push(worker);
-                worker_id += 1;
+                _worker_id += 1;
             }
         }
 
