@@ -202,6 +202,19 @@ fn validate_logprobs(value: Option<u32>) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_return_token_ids(
+    stream: Option<bool>,
+    return_token_ids: Option<bool>,
+) -> Result<(), ApiError> {
+    if stream.unwrap_or(false) && return_token_ids.unwrap_or(false) {
+        return Err(invalid_parameter(
+            "return_token_ids",
+            "is only supported for non-streaming completions",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_text_only_content(content: &OpenAiChatContent, field: &str) -> Result<(), ApiError> {
     let OpenAiChatContent::Parts(parts) = content else {
         return Ok(());
@@ -491,6 +504,9 @@ pub(super) struct CompletionRequest {
     /// Return per-token logprobs. If set to a number > 0, returns logprobs.
     #[allow(dead_code)]
     pub(super) logprobs: Option<u32>,
+    /// ARLE extension for correctness gates that need generated token IDs.
+    #[serde(default)]
+    pub(super) return_token_ids: Option<bool>,
     /// Optional client-supplied session/conversation identifier.
     ///
     /// When present, the scheduler uses it for sticky routing of subsequent
@@ -522,6 +538,7 @@ impl CompletionRequest {
         validate_single_choice(self.n, "n")?;
         validate_stream_options(self.stream, self.stream_options.as_ref())?;
         validate_logprobs(self.logprobs)?;
+        validate_return_token_ids(self.stream, self.return_token_ids)?;
         validate_common_sampling_fields(
             self.temperature,
             self.top_p,
@@ -556,6 +573,10 @@ impl CompletionRequest {
             .unwrap_or(false)
     }
 
+    pub(super) fn return_token_ids_or_default(&self) -> bool {
+        self.return_token_ids.unwrap_or(false)
+    }
+
     pub(super) fn session_id_parsed(&self) -> Option<SessionId> {
         normalize_session_id(self.session_id.as_deref())
     }
@@ -577,6 +598,8 @@ struct Choice {
     index: usize,
     logprobs: Option<LogprobsResult>,
     finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -603,20 +626,34 @@ impl From<crate::server_engine::TokenUsage> for Usage {
 }
 
 impl CompletionResponse {
-    pub(super) fn from_output(model: String, created: u64, output: CompletionOutput) -> Self {
-        let logprobs = sanitize_logprobs(&output.token_logprobs);
+    pub(super) fn from_output(
+        model: String,
+        created: u64,
+        output: CompletionOutput,
+        return_token_ids: bool,
+    ) -> Self {
+        let CompletionOutput {
+            text,
+            finish_reason,
+            usage,
+            token_logprobs,
+            response_token_ids,
+            ..
+        } = output;
+        let logprobs = sanitize_logprobs(&token_logprobs);
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4()),
             object: "text_completion",
             created,
             model,
             choices: vec![Choice {
-                text: output.text,
+                text,
                 index: 0,
                 logprobs,
-                finish_reason: output.finish_reason.as_openai_str().to_string(),
+                finish_reason: finish_reason.as_openai_str().to_string(),
+                token_ids: return_token_ids.then_some(response_token_ids),
             }],
-            usage: output.usage.into(),
+            usage: usage.into(),
         }
     }
 }

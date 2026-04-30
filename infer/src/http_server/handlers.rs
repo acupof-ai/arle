@@ -547,6 +547,7 @@ pub(super) async fn completions(
         let stream = options.stream;
         let include_usage = options.include_usage;
         let continuous_usage_stats = options.continuous_usage_stats;
+        let return_token_ids = req.return_token_ids_or_default();
 
         info!(
             "Received request: prompt_bytes={}, max_tokens={}, stream={}",
@@ -587,8 +588,12 @@ pub(super) async fn completions(
             );
 
             async move {
-                let response =
-                    CompletionResponse::from_output(model_id, now_secs(), buffered.into_output());
+                let response = CompletionResponse::from_output(
+                    model_id,
+                    now_secs(),
+                    buffered.into_output(),
+                    return_token_ids,
+                );
                 Ok(Json(response).into_response())
             }
             .in_span(
