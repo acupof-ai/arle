@@ -302,16 +302,6 @@ fn authorize_v1_request(headers: &HeaderMap, state: &AppState) -> Result<(), Api
     authorize_headers(headers, state.config.api_key.as_deref())
 }
 
-pub(super) async fn authorize_session_request(
-    State(expected_api_key): State<Option<Arc<str>>>,
-    headers: HeaderMap,
-    request: AxumRequest,
-    next: middleware::Next,
-) -> Result<Response, ApiError> {
-    authorize_headers(&headers, expected_api_key.as_deref())?;
-    Ok(next.run(request).await)
-}
-
 fn build_responses_prompt(req: &ResponsesRequest) -> String {
     let mut messages = Vec::new();
     if let Some(instructions) = req.instructions.as_deref() {

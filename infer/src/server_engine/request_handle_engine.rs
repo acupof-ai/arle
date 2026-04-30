@@ -3,7 +3,6 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::request_handle::RequestHandle;
 use crate::scheduler::{IncomingRequest, RequestPriority};
-use crate::session_persistence::SessionPersistence;
 
 use super::{CompletionOutput, CompletionRequest, CompletionStreamDelta, InferenceEngine};
 
@@ -104,5 +103,3 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
         tokenizer.encode(text)
     }
 }
-
-impl<H: RequestHandle> SessionPersistence for RequestHandleInferenceEngine<H> {}

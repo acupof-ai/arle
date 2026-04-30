@@ -10,7 +10,6 @@ use crate::backend::cpu::CpuBackend;
 use crate::backend::metal::MetalBackend;
 use crate::backend::runtime::StopChunkProcessor;
 use crate::backend::{InferenceBackend, StreamStopMatched, StreamingInferenceBackend};
-use crate::session_persistence::SessionPersistence;
 
 use super::stream::{
     model_id_from_path, panic_message, parse_finish_reason, truncate_at_first_stop,
@@ -233,5 +232,3 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
         self.backend.tokenize(text)
     }
 }
-
-impl<B: InferenceBackend> SessionPersistence for BackendInferenceEngine<B> {}

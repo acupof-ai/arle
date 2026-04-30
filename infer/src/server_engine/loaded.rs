@@ -7,7 +7,6 @@ use crate::backend::cpu::CpuBackend;
 use crate::backend::cuda::bootstrap::InferenceEngineOptions;
 #[cfg(feature = "metal")]
 use crate::backend::metal::{MetalSchedulerHandle, spawn_metal_scheduler_handle_from_path};
-use crate::session_persistence::SessionPersistence;
 
 #[cfg(feature = "cpu")]
 use super::BackendInferenceEngine;
@@ -156,5 +155,3 @@ impl InferenceEngine for LoadedInferenceEngine {
         }
     }
 }
-
-impl SessionPersistence for LoadedInferenceEngine {}
