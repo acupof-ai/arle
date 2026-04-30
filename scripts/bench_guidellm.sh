@@ -551,6 +551,21 @@ def parse_float(fields, key):
     except ValueError:
         return None
 
+def parse_plan_label(fields):
+    raw = fields.get("plan_label")
+    if raw is None:
+        return {}
+    counts = {}
+    for item in raw.split(","):
+        if ":" not in item:
+            continue
+        label, value = item.split(":", 1)
+        try:
+            counts[label] = int(value)
+        except ValueError:
+            pass
+    return counts
+
 def quantile(vals, q):
     if not vals:
         return None
@@ -586,6 +601,7 @@ ok_records = [r for r in records if r.get("ok") is True and isinstance(r.get("st
 fail_records = [r for r in records if r.get("ok") is False]
 
 parsed = [parse_fields(r["stats"]) for r in ok_records]
+plan_counts = [parse_plan_label(f) for f in parsed]
 waiting_vals = [v for f in parsed if (v := parse_int(f, "waiting")) is not None]
 active_vals = [v for f in parsed if (v := parse_int(f, "active")) is not None]
 running_batch_vals = [v for f in parsed if (v := parse_int(f, "running_batch")) is not None]
@@ -620,6 +636,10 @@ peak_kv = max(kv_vals) if kv_vals else None
 peak_prefix_hit = max(prefix_hit_vals) if prefix_hit_vals else None
 q75_prefix_hit = quantile(prefix_hit_vals, 0.75)
 peak_prefix_skip = max(prefix_skip_vals) if prefix_skip_vals else None
+plan_peak = {
+    label: max((counts.get(label, 0) for counts in plan_counts), default=None)
+    for label in ("idle", "decode", "prefill", "split", "mixed")
+}
 peak_mem = max(peak_mem_vals) if peak_mem_vals else None
 before_peak_mem = parse_float(parse_fields(before), "peak_mem")
 peak_mem_delta = (peak_mem - before_peak_mem) if peak_mem is not None and before_peak_mem is not None else None
@@ -656,6 +676,11 @@ lines = [
     f"- Peak active: `{peak_active if peak_active is not None else 'n/a'}`",
     f"- Peak running_batch: `{peak_running_batch if peak_running_batch is not None else 'n/a'}`",
     f"- Peak prefill_queue: `{peak_prefill_queue if peak_prefill_queue is not None else 'n/a'}`",
+    "- Plan labels: "
+    + ", ".join(
+        f"`{label}={plan_peak[label] if plan_peak[label] is not None else 'n/a'}`"
+        for label in ("idle", "decode", "prefill", "split", "mixed")
+    ),
     f"- Peak kv_util: `{f'{peak_kv:.1f}%' if peak_kv is not None else 'n/a'}`",
     f"- Prefix hit rate: peak `{fmt_num(peak_prefix_hit, 1, '%')}`, q75 `{fmt_num(q75_prefix_hit, 1, '%')}`",
     f"- Prefix skip rate peak: `{fmt_num(peak_prefix_skip, 1, '%')}`",

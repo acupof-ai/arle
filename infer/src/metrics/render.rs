@@ -476,6 +476,24 @@ impl ServerMetrics {
             }
         }
 
+        out.push_str("# HELP infer_scheduler_plan_total Scheduler ticks by selected plan label.\n");
+        out.push_str("# TYPE infer_scheduler_plan_total counter\n");
+        let (plan_idle, plan_decode, plan_prefill, plan_split, plan_mixed) =
+            self.scheduler_plan_totals();
+        for (plan, value) in [
+            ("idle", plan_idle),
+            ("decode", plan_decode),
+            ("prefill", plan_prefill),
+            ("split", plan_split),
+            ("mixed", plan_mixed),
+        ] {
+            writeln!(
+                out,
+                "infer_scheduler_plan_total{{{labels}plan=\"{plan}\",}} {value}"
+            )
+            .unwrap();
+        }
+
         out.push_str("# HELP infer_kv_coordinator_queue_capacity Coordinator queue capacity shared by staged KV fetch/store work.\n");
         out.push_str("# TYPE infer_kv_coordinator_queue_capacity gauge\n");
         writeln!(
@@ -765,6 +783,11 @@ impl ServerMetrics {
                 .metal_qwen35_packed_decode_rows_total
                 .load(Ordering::Relaxed),
         );
+        let (plan_idle, plan_decode, plan_prefill, plan_split, plan_mixed) =
+            self.scheduler_plan_totals();
+        let plan_suffix = format!(
+            " plan_label=idle:{plan_idle},decode:{plan_decode},prefill:{plan_prefill},split:{plan_split},mixed:{plan_mixed}"
+        );
         let queue_capacity = self.kv_coordinator_queue_capacity();
         let coordinator_suffix = if queue_capacity > 0 {
             format!(
@@ -801,7 +824,7 @@ impl ServerMetrics {
         };
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -817,6 +840,7 @@ impl ServerMetrics {
             self.scheduler_step_last_seconds() * 1000.0,
             step_p50,
             phase_suffix,
+            plan_suffix,
             self.tier_fetch_wait_seconds() * 1000.0,
             self.tier_store_wait_seconds() * 1000.0,
             self.kv_gpu_utilization() * 100.0,
