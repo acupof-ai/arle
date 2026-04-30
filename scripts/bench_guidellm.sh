@@ -4,6 +4,12 @@
 # Usage:
 #   ./scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME]
 #
+# Environment presets:
+#   WORKLOAD=longctx-32k  32768-in/256-out fixed-concurrency long-context
+#                         workload from docs/plans/2026-04-30-longctx-32k-
+#                         throughput.md S4. Default behavior is unchanged
+#                         when WORKLOAD is unset.
+#
 # Required:
 #   <backend-label>  e.g. cuda-h100, cuda-a100, metal-m3max
 #                    used to name the output dir and wins file
@@ -69,6 +75,8 @@ DATA="prompt_tokens=4096,prompt_tokens_stdev=1,prompt_tokens_min=4096,prompt_tok
 MAX_SECONDS=60
 RANDOM_SEED=20260416
 OUTPUTS=(json csv html)
+WORKLOAD="${WORKLOAD:-default}"
+SECONDARY_C1_SECONDS=""
 # **Pin the HTTP backend explicitly.** guidellm 0.6.0's default backend is
 # `vllm_python` (an in-process vLLM import) which silently reports 0
 # successful requests against our infer HTTP server and then crashes the
@@ -101,6 +109,27 @@ WARMUP_OVERRIDE=""
 EXPLORATION_MODE=false
 TRACE_INTERVAL_MS=1000
 
+case "$WORKLOAD" in
+    default)
+        ;;
+    longctx-32k)
+        DATA="prompt_tokens=32768,prompt_tokens_stdev=1,prompt_tokens_min=32768,prompt_tokens_max=32768,output_tokens=256,output_tokens_stdev=1,output_tokens_min=256,output_tokens_max=256"
+        PROFILE="concurrent"
+        RATE_OVERRIDE="${LONGCTX_CONCURRENCIES:-1,4}"
+        MAX_SECONDS="${LONGCTX_MAX_SECONDS:-300}"
+        SECONDARY_C1_SECONDS="${LONGCTX_C1_SECONDS:-360}"
+        if [[ "${LONGCTX_SECONDARY_C1_ONLY:-0}" == "1" ]]; then
+            RATE_OVERRIDE="1"
+            MAX_SECONDS="$SECONDARY_C1_SECONDS"
+        fi
+        ;;
+    *)
+        echo "error: unsupported WORKLOAD: $WORKLOAD" >&2
+        echo "       supported: default, longctx-32k" >&2
+        exit 2
+        ;;
+esac
+
 usage() {
     cat <<EOF
 usage: $(basename "$0") <backend-label> [options]
@@ -112,6 +141,13 @@ Canonical run (produces a wins entry):
   --model NAME           default: $MODEL
   --processor PATH       tokenizer path / HF id (default: local $PROCESSOR_DEFAULT)
   --trace-interval-ms N  /v1/stats polling interval (default: $TRACE_INTERVAL_MS)
+
+Environment workloads:
+  WORKLOAD=longctx-32k    data=32768-in/256-out, profile=concurrent,
+                          concurrency=1,4, max-seconds=300.
+                          For the secondary c=1 publication run:
+                          LONGCTX_SECONDARY_C1_ONLY=1 WORKLOAD=longctx-32k
+                          uses c=1 max-seconds=360.
 
 Exploration mode (faster, no wins entry):
   --fast                 short c=16 preset: profile=concurrent, rate=16,
@@ -657,12 +693,18 @@ echo ">>> guidellm benchmark"
 echo "    target : $TARGET"
 echo "    model  : $MODEL"
 echo "    label  : $LABEL"
+if [[ "$WORKLOAD" != "default" ]]; then
+    echo "    workld : $WORKLOAD"
+fi
 echo "    profile: $PROFILE"
 echo "    data   : $DATA"
 echo "    seconds: $MAX_SECONDS"
 echo "    seed   : $RANDOM_SEED"
 if [[ -n "$RATE_OVERRIDE" ]]; then
     echo "    rate   : $RATE_OVERRIDE"
+fi
+if [[ -n "$SECONDARY_C1_SECONDS" && "${LONGCTX_SECONDARY_C1_ONLY:-0}" != "1" ]]; then
+    echo "    c1 note: secondary c=1 publication run uses LONGCTX_SECONDARY_C1_ONLY=1 max-seconds=$SECONDARY_C1_SECONDS"
 fi
 if [[ -n "$WARMUP_OVERRIDE" ]]; then
     echo "    warmup : $WARMUP_OVERRIDE"
@@ -730,6 +772,12 @@ fi
 
 {
     echo "GUIDELLM__MP_CONTEXT_TYPE=${GUIDELLM__MP_CONTEXT_TYPE:-forkserver}"
+    if [[ "$WORKLOAD" != "default" ]]; then
+        echo "WORKLOAD=$WORKLOAD"
+    fi
+    if [[ -n "$SECONDARY_C1_SECONDS" ]]; then
+        echo "LONGCTX_C1_SECONDS=$SECONDARY_C1_SECONDS"
+    fi
     printf 'guidellm benchmark run'
     for arg in "${GUIDELLM_ARGS[@]}"; do
         printf ' %q' "$arg"
