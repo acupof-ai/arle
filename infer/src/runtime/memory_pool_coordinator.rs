@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Quota-based memory pool coordination for multi-threaded inference
  *

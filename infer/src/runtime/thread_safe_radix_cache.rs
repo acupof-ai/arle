@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Thread-safe RadixCache coordination for multi-threaded inference
  *

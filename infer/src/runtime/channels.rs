@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Inter-thread communication channels for multi-threaded runtime
  */

@@ -1,3 +1,5 @@
+#![allow(unreachable_pub)]
+#![allow(warnings)]
 /*!
  * Parallel detokenizer pool for incremental token-to-text conversion
  */

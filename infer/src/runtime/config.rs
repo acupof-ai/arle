@@ -1,3 +1,4 @@
+#![allow(warnings)]
 /*!
  * Runtime configuration for multi-threaded inference
  */

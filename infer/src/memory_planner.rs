@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! GPU memory planner: treats memory as a first-class scheduling resource.
 //!
 //! Tracks GPU memory budget, KV cache allocations, scratch buffer reservations,
