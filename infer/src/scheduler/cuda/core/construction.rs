@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use super::super::policy::TieredKvPolicy;
 use super::super::{SchedulerConfig, SchedulerHandle, SeedableRng};
 use super::{
-    CONTIGUOUS_KV_TOKENS, PREFIX_CACHE_BLOCK_SIZE, Scheduler, SchedulerRuntimeStats,
-    spawn_emit_worker,
+    CONTIGUOUS_KV_TOKENS, FirstBatchMode, PREFIX_CACHE_BLOCK_SIZE, Scheduler,
+    SchedulerRuntimeStats, spawn_emit_worker,
 };
 use crate::backend::cuda::paged_kv::PagedKVPool;
 use crate::kv_tier::transport::DiskStore;
@@ -294,6 +294,7 @@ impl<M: ModelForward> Scheduler<M> {
             decode_bufs: None,
             prefill_ctx: None,
             stats: SchedulerRuntimeStats::new(),
+            first_batch_mode: FirstBatchMode::new(),
             pending_decode: None,
             pending_prefill: None,
         };
