@@ -630,14 +630,8 @@ impl AgentSession {
                 // (impossible under the contract — the prompt only
                 // grows), or empty IDs at all, abort to None.
                 if !tokens_aborted {
-                    if prompt_ids.is_none() {
-                        if output.prompt_token_ids.is_empty() {
-                            tokens_aborted = true;
-                        } else {
-                            prompt_ids = Some(output.prompt_token_ids.clone());
-                        }
-                    } else {
-                        let prev_prompt_len = prompt_ids.as_ref().unwrap().len();
+                    if let Some(existing_prompt_ids) = prompt_ids.as_ref() {
+                        let prev_prompt_len = existing_prompt_ids.len();
                         let expected_offset = prev_prompt_len + response_ids.len();
                         // Only abort on extreme shrinkage that suggests a broken
                         // tokenizer or malformed engine response. ChatML re-rendering
@@ -656,6 +650,10 @@ impl AgentSession {
                         }
                         // If expected_offset > len but len >= prev_prompt_len/2,
                         // just skip env delta extraction (lossy contract).
+                    } else if output.prompt_token_ids.is_empty() {
+                        tokens_aborted = true;
+                    } else {
+                        prompt_ids = Some(output.prompt_token_ids.clone());
                     }
                     if !tokens_aborted {
                         if output.response_token_ids.is_empty() {
@@ -727,16 +725,10 @@ impl AgentSession {
                         // delta is mask=0; the repair's generated
                         // tokens are mask=1.
                         if !tokens_aborted {
-                            if prompt_ids.is_none() {
-                                if repair_outcome.prompt_token_ids.is_empty() {
-                                    tokens_aborted = true;
-                                } else {
-                                    prompt_ids = Some(repair_outcome.prompt_token_ids.clone());
-                                }
-                            } else {
+                            if let Some(existing_prompt_ids) = prompt_ids.as_ref() {
                                 // For repair, the prompt includes: original prompt + malformed response + repair instruction.
                                 // We need to find where the new content starts relative to what we've already accumulated.
-                                let prev_prompt_len = prompt_ids.as_ref().unwrap().len();
+                                let prev_prompt_len = existing_prompt_ids.len();
                                 let expected_offset = prev_prompt_len + response_ids.len();
                                 // Only abort on extreme shrinkage that suggests broken tokenizer.
                                 if repair_outcome.prompt_token_ids.len() < prev_prompt_len / 2 {
@@ -753,6 +745,10 @@ impl AgentSession {
                                 }
                                 // If expected_offset > len but len >= prev_prompt_len/2,
                                 // just skip env delta extraction (lossy contract).
+                            } else if repair_outcome.prompt_token_ids.is_empty() {
+                                tokens_aborted = true;
+                            } else {
+                                prompt_ids = Some(repair_outcome.prompt_token_ids.clone());
                             }
                             if !tokens_aborted {
                                 if repair_outcome.response_token_ids.is_empty() {
