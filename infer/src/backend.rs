@@ -41,6 +41,12 @@ pub(crate) fn is_stream_stop_matched(err: &anyhow::Error) -> bool {
     err.downcast_ref::<StreamStopMatched>().is_some()
 }
 
+/// Extension trait for InferenceBackend to support cloning for multi-threading
+pub trait CloneableBackend {
+    /// Clone the backend for use in multiple workers
+    fn clone_box(&self) -> Result<Box<dyn InferenceBackend>>;
+}
+
 /// A single-request, synchronous inference backend.
 ///
 /// Implementors load model weights once, then answer repeated `generate` calls.
