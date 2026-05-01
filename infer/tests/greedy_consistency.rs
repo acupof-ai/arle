@@ -58,6 +58,7 @@ fn make_request(
         max_tokens,
         sampling: SamplingParams::default(), // greedy (temperature=0)
         stop: None,
+        speculative: None,
         priority: RequestPriority::default(),
         session_id: None,
         delta_tx: tx,

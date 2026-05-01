@@ -527,6 +527,7 @@ mod tests {
                 max_tokens: 8,
                 sampling: SamplingParams::default(),
                 stop,
+                speculative: None,
                 priority: crate::scheduler::RequestPriority::default(),
                 session_id: None,
                 delta_tx,

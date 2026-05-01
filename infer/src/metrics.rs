@@ -23,6 +23,11 @@
 //! | `infer_scheduler_step_cleanup_microseconds` | gauge | EMA scheduler cleanup duration |
 //! | `infer_scheduler_loop_total_microseconds` | gauge | EMA full scheduler loop duration |
 //! | `infer_scheduler_plan_total` | counter | Scheduler ticks by selected plan label |
+//! | `infer_spec_draft_tokens_total` | counter | Draft tokens proposed by Phase 2 speculative decode |
+//! | `infer_spec_verified_tokens_total` | counter | Draft tokens checked by the target verifier |
+//! | `infer_spec_accepted_tokens_total` | counter | Draft tokens accepted by the verifier |
+//! | `infer_spec_acceptance_rate` | gauge | Aggregate accepted / verified token ratio |
+//! | `infer_spec_step_latency_us` | histogram | Speculative decode step latency |
 //! | `infer_metal_decode_batches_total` | counter | Metal decode batches executed on a batched GPU path |
 //! | `infer_metal_decode_batched_rows_total` | counter | Metal decode rows executed on a batched GPU path |
 //! | `infer_metal_decode_scalar_rows_total` | counter | Metal decode rows executed by the scalar per-request path |
@@ -114,6 +119,9 @@ struct MetricsInner {
     pub tier_fetch_staged_remote_blocks_total: AtomicU64,
     pub tier_fetch_promoted_blocks_total: AtomicU64,
     pub tier_fetch_fallback_total: AtomicU64,
+    pub spec_draft_tokens_total: AtomicU64,
+    pub spec_verified_tokens_total: AtomicU64,
+    pub spec_accepted_tokens_total: AtomicU64,
 
     // DFlash speculative decode counters.
     pub dflash_blocks_total: AtomicU64,
@@ -151,6 +159,7 @@ struct MetricsInner {
     pub scheduler_plan_prefill_total: AtomicU64,
     pub scheduler_plan_split_total: AtomicU64,
     pub scheduler_plan_mixed_total: AtomicU64,
+    pub spec_acceptance_rate_ppm: AtomicU64,
     pub kv_coordinator_queue_capacity: AtomicU64,
     pub kv_fetch_queue_depth: AtomicU64,
     pub kv_fetch_waiters: AtomicU64,
@@ -193,6 +202,9 @@ impl ServerMetrics {
                 tier_fetch_staged_remote_blocks_total: AtomicU64::new(0),
                 tier_fetch_promoted_blocks_total: AtomicU64::new(0),
                 tier_fetch_fallback_total: AtomicU64::new(0),
+                spec_draft_tokens_total: AtomicU64::new(0),
+                spec_verified_tokens_total: AtomicU64::new(0),
+                spec_accepted_tokens_total: AtomicU64::new(0),
                 dflash_blocks_total: AtomicU64::new(0),
                 dflash_accepted_tokens_total: AtomicU64::new(0),
                 dflash_draft_tokens_total: AtomicU64::new(0),
@@ -226,6 +238,7 @@ impl ServerMetrics {
                 scheduler_plan_prefill_total: AtomicU64::new(0),
                 scheduler_plan_split_total: AtomicU64::new(0),
                 scheduler_plan_mixed_total: AtomicU64::new(0),
+                spec_acceptance_rate_ppm: AtomicU64::new(0),
                 kv_coordinator_queue_capacity: AtomicU64::new(0),
                 kv_fetch_queue_depth: AtomicU64::new(0),
                 kv_fetch_waiters: AtomicU64::new(0),
@@ -785,6 +798,33 @@ impl ServerMetrics {
         self.tier_fetch_promoted_blocks_total() as f64 / staged_blocks as f64
     }
 
+    pub fn spec_draft_tokens_total(&self) -> u64 {
+        self.inner.spec_draft_tokens_total.load(Ordering::Relaxed)
+    }
+
+    pub fn spec_verified_tokens_total(&self) -> u64 {
+        self.inner
+            .spec_verified_tokens_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn spec_accepted_tokens_total(&self) -> u64 {
+        self.inner
+            .spec_accepted_tokens_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn spec_acceptance_rate(&self) -> f64 {
+        self.inner.spec_acceptance_rate_ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    pub fn spec_step_latency_count(&self) -> u64 {
+        self.inner
+            .histograms
+            .lock()
+            .map_or(0, |h| h.spec_step_latency_us.count())
+    }
+
     /// Record one DFlash speculative block execution.
     pub fn record_dflash_block(&self, accepted_inputs: usize, block_size: usize) {
         self.inner
@@ -982,6 +1022,10 @@ mod tests {
         assert!(
             rendered.contains("infer_scheduler_plan_total{model=\"Qwen3-4B\",plan=\"mixed\",} 2")
         );
+        assert!(rendered.contains("infer_spec_draft_tokens_total{model=\"Qwen3-4B\",} 0"));
+        assert!(rendered.contains("infer_spec_verified_tokens_total{model=\"Qwen3-4B\",} 0"));
+        assert!(rendered.contains("infer_spec_accepted_tokens_total{model=\"Qwen3-4B\",} 0"));
+        assert!(rendered.contains("infer_spec_acceptance_rate{model=\"Qwen3-4B\",} 0.000000"));
         assert!(rendered.contains("infer_kv_coordinator_queue_capacity{model=\"Qwen3-4B\",} 16"));
         assert!(rendered.contains("infer_kv_fetch_queue_depth{model=\"Qwen3-4B\",} 3"));
         assert!(rendered.contains("infer_kv_fetch_waiters{model=\"Qwen3-4B\",} 5"));
@@ -1034,6 +1078,7 @@ mod tests {
         assert!(rendered.contains("infer_service_seconds_count"));
         assert!(rendered.contains("infer_e2e_seconds_count"));
         assert!(rendered.contains("infer_scheduler_step_seconds_count"));
+        assert!(rendered.contains("infer_spec_step_latency_us_count{model=\"Qwen3-4B\",} 0"));
         assert!(rendered.contains("infer_kv_gpu_blocks_free{model=\"Qwen3-4B\",} 100"));
         assert!(rendered.contains("infer_kv_gpu_blocks_total{model=\"Qwen3-4B\",} 200"));
     }
@@ -1064,6 +1109,9 @@ mod tests {
             "step_phase_us=adm:11,prefill:22,decode:33,emit:44,total:110,cleanup:55,loop_total:165"
         ));
         assert!(s.contains("plan_label=idle:0,decode:0,prefill:1,split:1,mixed:2"));
+        assert!(
+            s.contains("spec=draft:0,verified:0,accepted:0,accept_rate:0.0%,step_latency_count:0")
+        );
         assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=100.0%"));
         assert!(s.contains("prefix_skip_rate=25.0%"));

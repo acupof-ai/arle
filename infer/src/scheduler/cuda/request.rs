@@ -265,6 +265,7 @@ pub(crate) struct ActiveRequest {
     pub(crate) max_tokens: usize,
     pub(crate) sampling: crate::sampler::SamplingParams,
     pub(crate) stop: Option<Vec<String>>,
+    pub(crate) speculative: Option<crate::scheduler::RequestSpecConfig>,
     /// Optional client session identifier forwarded from `IncomingRequest`.
     /// Preserved across preemption so requeued work stays session-sticky.
     pub(crate) session_id: Option<crate::types::SessionId>,
@@ -416,6 +417,7 @@ mod tests {
             max_tokens: 16,
             sampling: SamplingParams::default(),
             stop: None,
+            speculative: None,
             session_id: None,
             trace_context: None,
             delta_tx,

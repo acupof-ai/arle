@@ -31,6 +31,7 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 max_tokens: req.max_tokens,
                 sampling: req.sampling,
                 stop: req.stop,
+                speculative: None,
                 priority: RequestPriority::Normal,
                 session_id: req.session_id,
                 delta_tx,

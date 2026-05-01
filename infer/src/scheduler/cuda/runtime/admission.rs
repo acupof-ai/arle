@@ -374,6 +374,7 @@ impl<M: ModelForward> Scheduler<M> {
             max_tokens: incoming.max_tokens,
             sampling: incoming.sampling,
             stop: incoming.stop,
+            speculative: incoming.speculative,
             session_id: incoming.session_id,
             trace_context: incoming.trace_context,
             delta_tx: incoming.delta_tx,

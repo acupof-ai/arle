@@ -12,6 +12,27 @@ fn completion_request_missing_session_id_is_none() {
     let raw = r#"{"prompt":"hi"}"#;
     let req: CompletionRequest = serde_json::from_str(raw).unwrap();
     assert!(req.session_id_parsed().is_none());
+    assert!(req.speculative.is_none());
+}
+
+#[test]
+fn completion_request_accepts_speculative_override() {
+    let raw = r#"{
+        "prompt":"hi",
+        "speculative":{
+            "enabled":true,
+            "draft_k":5,
+            "acceptance_threshold":0.6,
+            "draft_model":"self"
+        }
+    }"#;
+    let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+    req.validate().unwrap();
+    let spec = req.speculative.as_ref().unwrap();
+    assert_eq!(spec.enabled, Some(true));
+    assert_eq!(spec.draft_k, Some(5));
+    assert_eq!(spec.acceptance_threshold, Some(0.6));
+    assert_eq!(spec.draft_model.as_deref(), Some("self"));
 }
 
 #[test]
@@ -80,11 +101,41 @@ fn chat_completion_request_accepts_session_id_and_trims() {
 }
 
 #[test]
+fn chat_completion_request_accepts_speculative_override() {
+    let raw = r#"{
+        "messages":[{"role":"user","content":"hi"}],
+        "speculative":{"enabled":true,"draft_k":4,"acceptance_threshold":0.7,"draft_model":"self"}
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    req.validate().unwrap();
+    let spec = req.speculative.as_ref().unwrap();
+    assert_eq!(spec.enabled, Some(true));
+    assert_eq!(spec.draft_k, Some(4));
+    assert_eq!(spec.acceptance_threshold, Some(0.7));
+    assert_eq!(spec.draft_model.as_deref(), Some("self"));
+}
+
+#[test]
 fn responses_request_accepts_string_input_and_user_alias() {
     let raw = r#"{"input":"hi","user":"agent-7"}"#;
     let req: ResponsesRequest = serde_json::from_str(raw).unwrap();
     assert_eq!(req.session_id_parsed().unwrap().as_str(), "agent-7");
     assert!(matches!(req.input, ResponsesInput::Text(_)));
+}
+
+#[test]
+fn responses_request_accepts_speculative_override() {
+    let raw = r#"{
+        "input":"hi",
+        "speculative":{"enabled":false,"draft_k":3,"acceptance_threshold":0.5,"draft_model":"external:/models/draft"}
+    }"#;
+    let req: ResponsesRequest = serde_json::from_str(raw).unwrap();
+    req.validate().unwrap();
+    let spec = req.speculative.as_ref().unwrap();
+    assert_eq!(spec.enabled, Some(false));
+    assert_eq!(spec.draft_k, Some(3));
+    assert_eq!(spec.acceptance_threshold, Some(0.5));
+    assert_eq!(spec.draft_model.as_deref(), Some("external:/models/draft"));
 }
 
 #[test]

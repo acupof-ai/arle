@@ -81,6 +81,10 @@ impl StepPlan {
     }
 }
 
+fn route_spec_plan(_spec_enabled: bool, plan: StepPlan) -> StepPlan {
+    plan
+}
+
 #[derive(Debug)]
 struct PrefillBudget {
     token_budget: StepTokenBudget,
@@ -357,13 +361,11 @@ impl<M: ModelForward> Scheduler<M> {
         let scored_candidates = self.collect_prefill_candidates(&budget);
         let candidates = select_prefill_candidates(&mut budget, scored_candidates);
         if has_decode {
-            if candidates.is_empty() {
-                return StepPlan::Decode;
-            }
-            if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
-                return StepPlan::Mixed(candidates);
-            }
-            if self.config.short_prompt_bypass_tokens > 0
+            let plan = if candidates.is_empty() {
+                StepPlan::Decode
+            } else if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
+                StepPlan::Mixed(candidates)
+            } else if self.config.short_prompt_bypass_tokens > 0
                 && candidates.iter().all(|candidate| {
                     candidate.reservation.prefill_tokens <= self.config.short_prompt_bypass_tokens
                 })
@@ -372,17 +374,20 @@ impl<M: ModelForward> Scheduler<M> {
                 // completion itself. Avoid the legacy decode+prefill split
                 // launch for these requests; the small prefill runs as the
                 // fused first-token path and decode rows resume next tick.
-                return StepPlan::Prefill(candidates);
-            }
-            // Keep the legacy split launches for models that do not have a
-            // real single-launch mixed lowering yet.
-            return StepPlan::Split(candidates);
+                StepPlan::Prefill(candidates)
+            } else {
+                // Keep the legacy split launches for models that do not have a
+                // real single-launch mixed lowering yet.
+                StepPlan::Split(candidates)
+            };
+            return route_spec_plan(self.config.spec_enabled, plan);
         }
-        if candidates.is_empty() {
+        let plan = if candidates.is_empty() {
             StepPlan::Idle
         } else {
             StepPlan::Prefill(candidates)
-        }
+        };
+        route_spec_plan(self.config.spec_enabled, plan)
     }
 
     pub(super) fn step(&mut self, assign_us: u128) {
@@ -828,5 +833,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0]
         );
+    }
+
+    #[test]
+    fn spec_disabled_route_returns_existing_step_plan() {
+        let plan = route_spec_plan(false, StepPlan::Decode);
+        assert!(matches!(plan, StepPlan::Decode));
+    }
+
+    #[test]
+    fn spec_enabled_route_is_noop_until_verifier_path_lands() {
+        let plan = route_spec_plan(true, StepPlan::Decode);
+        assert!(matches!(plan, StepPlan::Decode));
     }
 }

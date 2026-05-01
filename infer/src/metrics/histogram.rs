@@ -19,6 +19,30 @@ pub const LATENCY_BUCKETS: &[f64] = &[
     0.150, 0.200, 0.300, 0.500, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Speculative-step latency buckets in microseconds for `*_us` metrics.
+pub(super) const MICROSECOND_BUCKETS: &[f64] = &[
+    10.0,
+    25.0,
+    50.0,
+    75.0,
+    100.0,
+    150.0,
+    200.0,
+    300.0,
+    500.0,
+    750.0,
+    1_000.0,
+    2_000.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+];
+
 pub(super) fn secs_to_micros(secs: f64) -> u64 {
     (secs.max(0.0) * 1_000_000.0).round() as u64
 }
@@ -106,6 +130,7 @@ pub struct HistogramSet {
     pub tpot: Histogram,
     pub e2e: Histogram,
     pub scheduler_step: Histogram,
+    pub spec_step_latency_us: Histogram,
 }
 
 impl HistogramSet {
@@ -119,6 +144,7 @@ impl HistogramSet {
             tpot: Histogram::new(LATENCY_BUCKETS),
             e2e: Histogram::new(LATENCY_BUCKETS),
             scheduler_step: Histogram::new(LATENCY_BUCKETS),
+            spec_step_latency_us: Histogram::new(MICROSECOND_BUCKETS),
         }
     }
 }
