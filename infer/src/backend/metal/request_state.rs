@@ -303,6 +303,228 @@ pub(crate) struct Qwen35PrefixSnapshot {
     pub kv_capacity: i32,
 }
 
+#[allow(dead_code)]
+const QWEN35_PREFIX_SNAPSHOT_MAGIC: [u8; 8] = *b"Q35PFX01";
+#[allow(dead_code)]
+const QWEN35_PREFIX_SNAPSHOT_VERSION: u16 = 1;
+#[allow(dead_code)]
+const QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN: usize = 14;
+
+#[allow(dead_code)]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Qwen35PrefixSnapshotHeader {
+    model_fingerprint: Vec<u8>,
+    token_ids: Vec<u32>,
+    cache_len: i32,
+    kv_capacity: i32,
+    kv_flat: Vec<MlxArrayBytesHeader>,
+    gdr_flat: Vec<MlxArrayBytesHeader>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MlxArrayBytesHeader {
+    name: String,
+    dtype: i32,
+    shape: Vec<i32>,
+    byte_len: usize,
+}
+
+#[allow(dead_code)]
+impl Qwen35PrefixSnapshot {
+    pub(crate) fn encode_for_disk(&self, model_fingerprint: &[u8]) -> Result<Vec<u8>> {
+        ensure!(
+            !model_fingerprint.is_empty(),
+            "Qwen3.5 prefix snapshot encode requires a model fingerprint"
+        );
+        ensure!(
+            self.cache_len > 0 && self.kv_capacity >= self.cache_len,
+            "Qwen3.5 prefix snapshot has invalid cache_len/capacity: {}/{}",
+            self.cache_len,
+            self.kv_capacity
+        );
+        ensure!(
+            self.token_ids.len() == self.cache_len as usize,
+            "Qwen3.5 prefix snapshot token count {} does not match cache_len {}",
+            self.token_ids.len(),
+            self.cache_len
+        );
+
+        let mut body = Vec::new();
+        let header = Qwen35PrefixSnapshotHeader {
+            model_fingerprint: model_fingerprint.to_vec(),
+            token_ids: self.token_ids.clone(),
+            cache_len: self.cache_len,
+            kv_capacity: self.kv_capacity,
+            kv_flat: encode_mlx_array_headers("kv", &self.kv_flat, &mut body)?,
+            gdr_flat: encode_mlx_array_headers("gdr", &self.gdr_flat, &mut body)?,
+        };
+        let header_bytes =
+            postcard::to_allocvec(&header).context("encode Qwen3.5 prefix snapshot header")?;
+        let header_len = u32::try_from(header_bytes.len())
+            .context("Qwen3.5 prefix snapshot header is too large")?;
+
+        let mut payload = Vec::with_capacity(
+            QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN + header_bytes.len() + body.len(),
+        );
+        payload.extend_from_slice(&QWEN35_PREFIX_SNAPSHOT_MAGIC);
+        payload.extend_from_slice(&QWEN35_PREFIX_SNAPSHOT_VERSION.to_le_bytes());
+        payload.extend_from_slice(&header_len.to_le_bytes());
+        payload.extend_from_slice(&header_bytes);
+        payload.extend_from_slice(&body);
+        Ok(payload)
+    }
+
+    pub(crate) fn decode_from_disk(
+        bytes: &[u8],
+        expected_model_fingerprint: &[u8],
+    ) -> Result<Self> {
+        ensure!(
+            !expected_model_fingerprint.is_empty(),
+            "Qwen3.5 prefix snapshot decode requires a model fingerprint"
+        );
+        ensure!(
+            bytes.len() >= QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN,
+            "Qwen3.5 prefix snapshot payload is shorter than fixed header"
+        );
+
+        let magic: [u8; 8] = bytes[..8]
+            .try_into()
+            .context("read Qwen3.5 prefix snapshot magic")?;
+        ensure!(
+            magic == QWEN35_PREFIX_SNAPSHOT_MAGIC,
+            "Qwen3.5 prefix snapshot has invalid magic"
+        );
+
+        let version = u16::from_le_bytes(
+            bytes[8..10]
+                .try_into()
+                .context("read Qwen3.5 prefix snapshot version")?,
+        );
+        ensure!(
+            version == QWEN35_PREFIX_SNAPSHOT_VERSION,
+            "Qwen3.5 prefix snapshot version {} is unsupported",
+            version
+        );
+
+        let header_len = u32::from_le_bytes(
+            bytes[10..14]
+                .try_into()
+                .context("read Qwen3.5 prefix snapshot header length")?,
+        ) as usize;
+        let header_end = QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN
+            .checked_add(header_len)
+            .context("Qwen3.5 prefix snapshot header length overflow")?;
+        ensure!(
+            bytes.len() >= header_end,
+            "Qwen3.5 prefix snapshot payload is shorter than declared header"
+        );
+
+        let header: Qwen35PrefixSnapshotHeader =
+            postcard::from_bytes(&bytes[QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN..header_end])
+                .context("decode Qwen3.5 prefix snapshot header")?;
+        ensure!(
+            header.model_fingerprint == expected_model_fingerprint,
+            "Qwen3.5 prefix snapshot model fingerprint mismatch"
+        );
+        ensure!(
+            header.cache_len > 0 && header.kv_capacity >= header.cache_len,
+            "Qwen3.5 prefix snapshot has invalid cache_len/capacity: {}/{}",
+            header.cache_len,
+            header.kv_capacity
+        );
+        ensure!(
+            header.token_ids.len() == header.cache_len as usize,
+            "Qwen3.5 prefix snapshot token count {} does not match cache_len {}",
+            header.token_ids.len(),
+            header.cache_len
+        );
+
+        let body = &bytes[header_end..];
+        let mut cursor = 0usize;
+        let kv_flat = decode_mlx_array_headers("kv", &header.kv_flat, body, &mut cursor)?;
+        let gdr_flat = decode_mlx_array_headers("gdr", &header.gdr_flat, body, &mut cursor)?;
+        ensure!(
+            cursor == body.len(),
+            "Qwen3.5 prefix snapshot body has {} trailing bytes",
+            body.len() - cursor
+        );
+
+        Ok(Self {
+            token_ids: header.token_ids,
+            kv_flat,
+            gdr_flat,
+            cache_len: header.cache_len,
+            kv_capacity: header.kv_capacity,
+        })
+    }
+}
+
+#[allow(dead_code)]
+fn encode_mlx_array_headers(
+    prefix: &str,
+    arrays: &[MlxArray],
+    body: &mut Vec<u8>,
+) -> Result<Vec<MlxArrayBytesHeader>> {
+    arrays
+        .iter()
+        .enumerate()
+        .map(|(idx, array)| {
+            let bytes = array
+                .to_bytes()
+                .with_context(|| format!("export Qwen3.5 prefix array {prefix}.{idx}"))?;
+            body.extend_from_slice(&bytes);
+            Ok(MlxArrayBytesHeader {
+                name: format!("{prefix}.{idx}"),
+                dtype: array.dtype().to_raw(),
+                shape: array.shape().to_vec(),
+                byte_len: bytes.len(),
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn decode_mlx_array_headers(
+    prefix: &str,
+    records: &[MlxArrayBytesHeader],
+    body: &[u8],
+    cursor: &mut usize,
+) -> Result<Vec<MlxArray>> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(idx, record)| {
+            let expected_name = format!("{prefix}.{idx}");
+            ensure!(
+                record.name == expected_name,
+                "Qwen3.5 prefix snapshot array name mismatch: got {}, expected {}",
+                record.name,
+                expected_name
+            );
+            let dtype = super::mlx::Dtype::from_raw(record.dtype).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Qwen3.5 prefix snapshot array {} has unknown dtype {}",
+                    record.name,
+                    record.dtype
+                )
+            })?;
+            let end = cursor
+                .checked_add(record.byte_len)
+                .context("Qwen3.5 prefix snapshot array byte range overflow")?;
+            ensure!(
+                end <= body.len(),
+                "Qwen3.5 prefix snapshot body is truncated while reading {}",
+                record.name
+            );
+            let array = MlxArray::from_bytes(&body[*cursor..end], &record.shape, dtype)
+                .with_context(|| format!("import Qwen3.5 prefix array {}", record.name))?;
+            *cursor = end;
+            Ok(array)
+        })
+        .collect()
+}
+
 pub(crate) struct Qwen35PackedDecodeBatch<'a> {
     weights: &'a Qwen35MetalWeights,
     config: &'a MetalModelConfig,

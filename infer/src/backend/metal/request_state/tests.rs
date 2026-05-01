@@ -9,6 +9,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::*;
+    use crate::backend::metal::mlx::{Dtype, MlxArray, eval};
+    use crate::test_support::metal_test_guard;
 
     struct FakeDriver {
         prefill_outputs: VecDeque<Option<u32>>,
@@ -150,5 +152,82 @@ mod tests {
         }
 
         assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn qwen35_prefix_snapshot_disk_payload_roundtrips_arrays() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101, 102],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10, 20], &[2])],
+            gdr_flat: vec![MlxArray::from_slice_f32(&[1.5, 2.5], &[2])],
+            cache_len: 2,
+            kv_capacity: 4,
+        };
+
+        let payload = snapshot.encode_for_disk(b"qwen35-test").expect("encode");
+        let restored =
+            Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-test").expect("decode");
+        eval(&[&restored.kv_flat[0], &restored.gdr_flat[0]]);
+
+        assert_eq!(restored.token_ids, vec![101, 102]);
+        assert_eq!(restored.cache_len, 2);
+        assert_eq!(restored.kv_capacity, 4);
+        assert_eq!(restored.kv_flat.len(), 1);
+        assert_eq!(restored.gdr_flat.len(), 1);
+        assert_eq!(restored.kv_flat[0].shape(), &[2]);
+        assert_eq!(restored.kv_flat[0].dtype(), Dtype::Int32);
+        assert_eq!(restored.kv_flat[0].as_slice_i32(), vec![10, 20]);
+        assert_eq!(restored.gdr_flat[0].shape(), &[2]);
+        assert_eq!(restored.gdr_flat[0].dtype(), Dtype::Float32);
+        assert_eq!(restored.gdr_flat[0].as_slice_f32(), &[1.5, 2.5]);
+    }
+
+    #[test]
+    fn qwen35_prefix_snapshot_disk_payload_rejects_wrong_model_fingerprint() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10], &[1])],
+            gdr_flat: Vec::new(),
+            cache_len: 1,
+            kv_capacity: 1,
+        };
+
+        let payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
+        assert!(Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-b").is_err());
+    }
+
+    #[test]
+    fn qwen35_prefix_snapshot_disk_payload_rejects_wrong_model_before_body() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10], &[1])],
+            gdr_flat: Vec::new(),
+            cache_len: 1,
+            kv_capacity: 1,
+        };
+
+        let mut payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
+        payload.pop().expect("payload body byte");
+
+        let wrong_model = match Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-b") {
+            Ok(_) => panic!("wrong model should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            wrong_model.to_string().contains("model fingerprint"),
+            "unexpected wrong-model error: {wrong_model:#}"
+        );
+
+        let truncated_body = match Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-a") {
+            Ok(_) => panic!("truncated body should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            truncated_body.to_string().contains("truncated"),
+            "unexpected truncated-body error: {truncated_body:#}"
+        );
     }
 }
