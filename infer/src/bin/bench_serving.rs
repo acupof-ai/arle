@@ -1157,6 +1157,7 @@ fn main() -> Result<()> {
     debug!("Detected model type: {:?}", model_type);
     let runtime = ModelRuntimeConfig {
         enable_cuda_graph: cli.cuda_graph,
+        ..ModelRuntimeConfig::default()
     };
     let load_start = Instant::now();
 

@@ -7,6 +7,9 @@
 
 use anyhow::{Result, bail};
 
+#[cfg(feature = "cuda")]
+use cuda_kernels::prelude::{DeviceVec, HiddenStates};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayerCollective {
     PostAttentionAllReduce,
@@ -106,6 +109,66 @@ impl LayerCommunicator {
             LayerCollective::PostMlpAllReduce,
             self.tp_world_size,
             hidden.len(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn post_attn_all_reduce_hidden_states(
+        &self,
+        hidden: &mut HiddenStates,
+    ) -> Result<LayerCommStatus> {
+        Self::ensure_noop(
+            LayerCollective::PostAttentionAllReduce,
+            self.tp_world_size,
+            hidden.hidden_dim.saturating_mul(hidden.seq_len),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn post_mlp_all_reduce_hidden_states(
+        &self,
+        hidden: &mut HiddenStates,
+    ) -> Result<LayerCommStatus> {
+        Self::ensure_noop(
+            LayerCollective::PostMlpAllReduce,
+            self.tp_world_size,
+            hidden.hidden_dim.saturating_mul(hidden.seq_len),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn dp_attn_gather_hidden_states(
+        &self,
+        hidden: &mut HiddenStates,
+    ) -> Result<LayerCommStatus> {
+        Self::ensure_noop(
+            LayerCollective::DpAttentionGather,
+            self.dp_world_size,
+            hidden.hidden_dim.saturating_mul(hidden.seq_len),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn post_attn_all_reduce_device_vec(
+        &self,
+        hidden: &mut DeviceVec,
+    ) -> Result<LayerCommStatus> {
+        Self::ensure_noop(
+            LayerCollective::PostAttentionAllReduce,
+            self.tp_world_size,
+            hidden.len,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn post_mlp_all_reduce_device_vec(
+        &self,
+        hidden: &mut DeviceVec,
+    ) -> Result<LayerCommStatus> {
+        Self::ensure_noop(
+            LayerCollective::PostMlpAllReduce,
+            self.tp_world_size,
+            hidden.len,
         )
     }
 

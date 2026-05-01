@@ -25,7 +25,7 @@ pub mod qwen35;
 
 pub use kv_cache::{KVCacheDtype, KVFormat};
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
-pub use qwen35::{Qwen35Model, Qwen35State};
+pub use qwen35::{Qwen35Model, Qwen35RuntimeConfig, Qwen35State};
 
 /// One request worth of prefill work inside a scheduler-planned prefill batch.
 #[derive(Clone, Copy, Debug)]

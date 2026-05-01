@@ -21,4 +21,4 @@ mod single_token_buffers;
 mod weights;
 
 pub use forward::Qwen35State;
-pub use weights::Qwen35Model;
+pub use weights::{Qwen35Model, Qwen35RuntimeConfig};

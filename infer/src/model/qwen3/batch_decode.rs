@@ -966,6 +966,8 @@ impl Qwen3Model {
                 &mixed.attn_output,
                 &mut mixed.o_buf,
             );
+            self.layer_communicator
+                .post_attn_all_reduce_hidden_states(&mut mixed.o_buf)?;
             ops::fused_add_rms_norm_batch_into(
                 &self.ctx,
                 hidden,
@@ -1000,6 +1002,8 @@ impl Qwen3Model {
                 &mixed.act_out,
                 &mut mixed.o_buf,
             );
+            self.layer_communicator
+                .post_mlp_all_reduce_hidden_states(&mut mixed.o_buf)?;
 
             if let Some(next_input_norm) = next_input_norm {
                 ops::fused_add_rms_norm_batch_into(
@@ -1556,6 +1560,8 @@ impl Qwen3Model {
                 )?;
             }
         }
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         ops::fused_add_rms_norm_batch_into(
             &self.ctx,
@@ -1605,6 +1611,8 @@ impl Qwen3Model {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
             }
         }
+        self.layer_communicator
+            .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         if let Some(next_input_norm) = next_input_norm {
             ops::fused_add_rms_norm_batch_into(
@@ -1990,6 +1998,8 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         // 6+7. Fused residual add + MLP RMSNorm:
         //   hidden += o_buf (in-place), normed = rms_norm(hidden, weight)
@@ -2023,6 +2033,8 @@ impl Qwen3Model {
             &bufs.act_out,
             &mut bufs.o_buf,
         );
+        self.layer_communicator
+            .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         // 9. Batched residual add, optionally fused with the next layer's input RMSNorm.
         if let Some(next_input_norm) = next_input_norm {

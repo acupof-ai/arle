@@ -175,6 +175,7 @@ pub fn load_qwen3_components(
             model_path,
             ModelRuntimeConfig {
                 enable_cuda_graph: options.enable_cuda_graph,
+                ..ModelRuntimeConfig::default()
             },
         )?;
         match std::env::var("INFER_LORA_PATH") {

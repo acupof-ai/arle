@@ -1113,6 +1113,8 @@ impl Qwen35Model {
             &bufs.attn.attn_output,
             &mut bufs.common.attn_results,
         );
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut bufs.common.attn_results)?;
 
         // 7. Residual + post-attention norm + MLP
         self.decode_batch_mlp(layer, hidden, bufs, batch_size)?;
@@ -1226,6 +1228,8 @@ impl Qwen35Model {
             &bufs.recurrent.normed_gated,
             &mut bufs.common.attn_results,
         );
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut bufs.common.attn_results)?;
 
         // 6. Residual + post-attention norm + MLP
         self.decode_batch_mlp(layer, hidden, bufs, batch_size)?;
@@ -1285,6 +1289,8 @@ impl Qwen35Model {
             &bufs.mlp.act_out,
             &mut bufs.common.o_buf,
         );
+        self.layer_communicator
+            .post_mlp_all_reduce_hidden_states(&mut bufs.common.o_buf)?;
 
         // Residual 2: hidden = hidden_mid + mlp_out
         ops::add_batch_into(

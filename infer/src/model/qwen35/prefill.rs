@@ -103,7 +103,7 @@ impl Qwen35Model {
         };
 
         // Batch project, then per-token attention/recurrent
-        let attn_results = match &layer.attn {
+        let mut attn_results = match &layer.attn {
             LayerKind::FullAttention(attn) => self.prefill_full_attention(
                 attn,
                 &normed_batch,
@@ -121,6 +121,8 @@ impl Qwen35Model {
                 seq_len,
             )?,
         };
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut attn_results)?;
 
         // 3. Residual + post-attention layernorm
         let hidden_plus_attn = ops::add_batch(&self.ctx, hidden_batch, &attn_results)?;
@@ -133,7 +135,9 @@ impl Qwen35Model {
         let gate_out = ops::gemm(&self.ctx, &layer.mlp.gate_proj, &normed_batch)?;
         let up_out = ops::gemm(&self.ctx, &layer.mlp.up_proj, &normed_batch)?;
         let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
-        let mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
+        let mut mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
+        self.layer_communicator
+            .post_mlp_all_reduce_hidden_states(&mut mlp_out)?;
 
         // 5. Residual
         ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
@@ -446,6 +450,8 @@ impl Qwen35Model {
                     bufs,
                 )?,
             }
+            self.layer_communicator
+                .post_attn_all_reduce_hidden_states(&mut bufs.attn_results)?;
 
             ops::add_batch_into(
                 &self.ctx,
@@ -479,6 +485,8 @@ impl Qwen35Model {
                 &bufs.act_out,
                 &mut bufs.mlp_out,
             );
+            self.layer_communicator
+                .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
             ops::add_batch_into(
                 &self.ctx,
                 &bufs.hidden_mid,
@@ -1011,12 +1019,14 @@ impl Qwen35Model {
 
         match &layer.attn {
             LayerKind::FullAttention(attn) => {
-                self.prefill_full_attention_paged(attn, full_idx, pool, bufs, graphsafe)?
+                self.prefill_full_attention_paged(attn, full_idx, pool, bufs, graphsafe)?;
             }
             LayerKind::LinearAttention(attn) => {
-                self.prefill_linear_attention_paged(attn, linear_idx, recurrent, bufs, graphsafe)?
+                self.prefill_linear_attention_paged(attn, linear_idx, recurrent, bufs, graphsafe)?;
             }
-        };
+        }
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut bufs.attn_results)?;
 
         ops::add_batch_into(
             &self.ctx,
@@ -1051,6 +1061,8 @@ impl Qwen35Model {
             &mut bufs.mlp_out,
             graphsafe,
         )?;
+        self.layer_communicator
+            .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
         ops::add_batch_into(
             &self.ctx,
             &bufs.hidden_mid,
@@ -1518,6 +1530,8 @@ impl Qwen35Model {
                     );
                 }
             }
+            self.layer_communicator
+                .post_attn_all_reduce_hidden_states(&mut bufs.attn_results)?;
 
             // Residual 1: hidden_mid = hidden_a + attn_results
             ops::add_batch_into(
@@ -1556,6 +1570,8 @@ impl Qwen35Model {
                 &bufs.act_out,
                 &mut bufs.mlp_out,
             );
+            self.layer_communicator
+                .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
 
             // Residual 2: hidden_a = hidden_mid + mlp_out (write back for next layer)
             ops::add_batch_into(

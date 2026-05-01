@@ -70,6 +70,7 @@ fn run_prompt(
         path,
         ModelRuntimeConfig {
             enable_cuda_graph: false,
+            ..ModelRuntimeConfig::default()
         },
     )
     .expect("load model");
