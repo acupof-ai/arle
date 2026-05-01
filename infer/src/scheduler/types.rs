@@ -31,6 +31,7 @@ pub struct RequestSpecConfig {
 }
 
 impl RequestSpecConfig {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn allows_single_token_canary(&self, default_draft_k: usize) -> bool {
         if self.enabled == Some(false) || self.draft_k.unwrap_or(default_draft_k) != 1 {
             return false;

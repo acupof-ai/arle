@@ -34,7 +34,7 @@ pub use batch::{
 #[cfg(feature = "cuda")]
 pub use cuda::Scheduler;
 pub use forward_batch::{
-    ForwardBatch, ForwardBatchKind, IntermediateTensorMeta, IntermediateTensors,
+    ForwardBatch, ForwardBatchKind, IntermediateTensorMeta, IntermediateTensors, TensorPayload,
 };
 pub use types::{
     DraftMode, IncomingRequest, RequestPriority, RequestSpecConfig, RuntimeEnvelopeOverrides,

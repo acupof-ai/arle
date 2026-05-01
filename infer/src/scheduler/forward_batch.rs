@@ -37,12 +37,45 @@ impl IntermediateTensorMeta {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TensorPayload<T> {
+    pub meta: IntermediateTensorMeta,
+    pub values: Vec<T>,
+}
+
+impl<T> TensorPayload<T> {
+    pub fn new(meta: IntermediateTensorMeta, values: impl Into<Vec<T>>) -> Self {
+        let values = values.into();
+        assert_eq!(
+            meta.numel(),
+            values.len(),
+            "tensor payload {} shape {:?} expects {} elements, got {}",
+            meta.name,
+            meta.shape,
+            meta.numel(),
+            values.len()
+        );
+        Self { meta, values }
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct IntermediateTensors {
     pub source_pp_rank: usize,
     pub target_pp_rank: usize,
     pub microbatch_id: u64,
     pub tensors: Vec<IntermediateTensorMeta>,
+    pub hidden_states: Option<TensorPayload<f32>>,
+    pub residual: Option<TensorPayload<f32>>,
+    pub position_ids: Option<TensorPayload<u32>>,
 }
 
 impl IntermediateTensors {
@@ -52,16 +85,56 @@ impl IntermediateTensors {
             target_pp_rank,
             microbatch_id,
             tensors: Vec::new(),
+            hidden_states: None,
+            residual: None,
+            position_ids: None,
         }
     }
 
+    #[must_use]
     pub fn with_tensor(mut self, tensor: IntermediateTensorMeta) -> Self {
         self.tensors.push(tensor);
         self
     }
 
+    #[must_use]
+    pub fn with_hidden_states(
+        mut self,
+        shape: impl Into<Vec<usize>>,
+        values: impl Into<Vec<f32>>,
+    ) -> Self {
+        let meta = IntermediateTensorMeta::new("hidden_states", shape, "f32");
+        self.hidden_states = Some(TensorPayload::new(meta.clone(), values));
+        self.with_tensor(meta)
+    }
+
+    #[must_use]
+    pub fn with_residual(
+        mut self,
+        shape: impl Into<Vec<usize>>,
+        values: impl Into<Vec<f32>>,
+    ) -> Self {
+        let meta = IntermediateTensorMeta::new("residual", shape, "f32");
+        self.residual = Some(TensorPayload::new(meta.clone(), values));
+        self.with_tensor(meta)
+    }
+
+    #[must_use]
+    pub fn with_position_ids(
+        mut self,
+        shape: impl Into<Vec<usize>>,
+        values: impl Into<Vec<u32>>,
+    ) -> Self {
+        let meta = IntermediateTensorMeta::new("position_ids", shape, "u32");
+        self.position_ids = Some(TensorPayload::new(meta.clone(), values));
+        self.with_tensor(meta)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
+            && self.hidden_states.is_none()
+            && self.residual.is_none()
+            && self.position_ids.is_none()
     }
 
     pub fn tensor_count(&self) -> usize {
@@ -69,7 +142,7 @@ impl IntermediateTensors {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ForwardBatch {
     pub kind: ForwardBatchKind,
     pub slot_indices: Vec<usize>,
@@ -112,6 +185,7 @@ impl ForwardBatch {
         }
     }
 
+    #[must_use]
     pub fn with_pp_proxy(mut self, proxy: IntermediateTensors) -> Self {
         self.pp_proxy = Some(proxy);
         self
@@ -177,5 +251,12 @@ mod tests {
         batch.clear_pp_proxy();
 
         assert!(batch.pp_proxy.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "expects 4 elements, got 3")]
+    fn tensor_payload_rejects_shape_len_mismatch() {
+        let _ =
+            IntermediateTensors::new(0, 1, 42).with_hidden_states(vec![2, 2], vec![1.0, 2.0, 3.0]);
     }
 }

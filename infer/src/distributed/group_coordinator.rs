@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use super::parallel_state::RankGroup;
+use super::parallel_state::{RankGroup, get_pp_group};
 
 #[cfg(feature = "nccl")]
 use super::nccl::NcclGroup;
@@ -35,6 +35,11 @@ impl GroupCoordinator {
             #[cfg(feature = "nccl")]
             nccl: None,
         }
+    }
+
+    pub fn pipeline_group() -> Result<Self> {
+        let group = get_pp_group()?;
+        Ok(Self::from_rank_group("pp", &group))
     }
 
     #[cfg(feature = "nccl")]
@@ -165,7 +170,10 @@ impl GroupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributed::parallel_state::{ParallelGroupKind, RankGroup};
+    use crate::distributed::parallel_state::{
+        ParallelGroupKind, RankGroup, destroy_model_parallel, initialize_model_parallel,
+    };
+    use crate::tensor_parallel::MultiAxisConfig;
 
     #[test]
     fn single_rank_collectives_are_noops() {
@@ -197,5 +205,30 @@ mod tests {
         };
         let group = GroupCoordinator::from_rank_group("tp", &rank_group);
         assert!(group.broadcast_f32(&[1.0], 1, 1).is_err());
+    }
+
+    #[test]
+    fn pipeline_group_accessor_uses_parallel_state() {
+        destroy_model_parallel();
+        initialize_model_parallel(
+            MultiAxisConfig {
+                tp_size: 1,
+                pp_size: 2,
+                ep_size: 1,
+                attn_dp_size: 1,
+                attn_cp_size: 1,
+                moe_dp_size: 1,
+            },
+            1,
+        )
+        .unwrap();
+
+        let group = GroupCoordinator::pipeline_group().unwrap();
+
+        assert_eq!(group.name(), "pp");
+        assert_eq!(group.ranks(), &[0, 1]);
+        assert_eq!(group.rank(), 1);
+        assert_eq!(group.rank_in_group(), 1);
+        destroy_model_parallel();
     }
 }
