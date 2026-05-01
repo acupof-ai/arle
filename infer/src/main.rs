@@ -134,6 +134,18 @@ struct Args {
     #[arg(long, visible_alias = "spec-draft-mode", default_value = "none")]
     spec_draft_model: String,
 
+    /// Enable MagicDec-style sparse-KV self-spec draft views.
+    #[arg(long, default_value_t = false)]
+    spec_sparse_kv_enabled: bool,
+
+    /// Recent-token window included in each sparse-KV draft view.
+    #[arg(long, default_value_t = 512)]
+    spec_sparse_recent_tokens: usize,
+
+    /// LRU-hot page budget included in each sparse-KV draft view.
+    #[arg(long, default_value_t = 32)]
+    spec_sparse_top_k_pages: usize,
+
     /// Disable RadixAttention-style prefix cache lookup and publish.
     #[arg(long)]
     disable_radix_cache: bool,
@@ -551,6 +563,9 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
         spec_draft_k: args.spec_draft_k,
         spec_acceptance_threshold: args.spec_acceptance_threshold,
         spec_draft_model,
+        spec_sparse_kv_enabled: args.spec_sparse_kv_enabled,
+        spec_sparse_recent_tokens: args.spec_sparse_recent_tokens,
+        spec_sparse_top_k_pages: args.spec_sparse_top_k_pages,
         mem_fraction_static: args.mem_fraction_static,
         min_seq_len: args.min_seq_len,
         kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
