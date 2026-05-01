@@ -39,7 +39,9 @@ struct SlotLedger {
     max_total_tokens: usize,
     free_slots: Vec<u32>,
     slot_refcounts: Vec<u32>,
+    slot_last_access: Vec<u64>,
     request_slots: HashMap<usize, Vec<u32>>,
+    next_access_tick: u64,
 }
 
 #[cfg_attr(not(feature = "metal"), allow(dead_code))]
@@ -50,7 +52,9 @@ impl SlotLedger {
             max_total_tokens,
             free_slots,
             slot_refcounts: vec![0; max_total_tokens],
+            slot_last_access: vec![0; max_total_tokens],
             request_slots: HashMap::new(),
+            next_access_tick: 1,
         }
     }
 
@@ -93,6 +97,7 @@ impl SlotLedger {
             ));
         }
 
+        let access_tick = self.bump_access_tick();
         let mut new_indices = Vec::with_capacity(count);
         for _ in 0..count {
             let idx = self
@@ -100,6 +105,7 @@ impl SlotLedger {
                 .pop()
                 .expect("invariant: free_slots.len() >= count checked above");
             self.bump_refcount(idx)?;
+            self.mark_access_at(idx, access_tick)?;
             new_indices.push(idx);
         }
         Ok(new_indices)
@@ -111,7 +117,12 @@ impl SlotLedger {
         }
 
         for &slot in slots {
+            self.slot_index(slot)?;
+        }
+        let access_tick = self.bump_access_tick();
+        for &slot in slots {
             self.bump_refcount(slot)?;
+            self.mark_access_at(slot, access_tick)?;
         }
 
         let entry = self.request_slots.entry(request_id).or_default();
@@ -165,6 +176,93 @@ impl SlotLedger {
         self.max_total_tokens
     }
 
+    fn register_access(&mut self, slots: &[u32]) -> Result<()> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        for &slot in slots {
+            self.slot_index(slot)?;
+        }
+        let access_tick = self.bump_access_tick();
+        for &slot in slots {
+            self.mark_access_at(slot, access_tick)?;
+        }
+        Ok(())
+    }
+
+    fn reclaim_target_tokens(
+        &self,
+        high_watermark: f64,
+        low_watermark: f64,
+    ) -> Result<Option<usize>> {
+        if !high_watermark.is_finite()
+            || !low_watermark.is_finite()
+            || !(0.0..=1.0).contains(&high_watermark)
+            || !(0.0..=1.0).contains(&low_watermark)
+            || low_watermark > high_watermark
+        {
+            return Err(anyhow!(
+                "MetalKVPool: invalid watermarks low={} high={}",
+                low_watermark,
+                high_watermark
+            ));
+        }
+
+        let used = self.total_tokens_used();
+        let high_tokens = (self.max_total_tokens as f64) * high_watermark;
+        if (used as f64) <= high_tokens {
+            return Ok(None);
+        }
+
+        let low_tokens = ((self.max_total_tokens as f64) * low_watermark).floor() as usize;
+        Ok(Some(used.saturating_sub(low_tokens)))
+    }
+
+    fn select_eviction_candidates(
+        &self,
+        candidate_blocks: &[Vec<u32>],
+        target_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        if target_tokens == 0 || candidate_blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let active_slots = self.active_slot_bitmap();
+        let mut candidates = Vec::new();
+        for block in candidate_blocks {
+            if block.is_empty() {
+                continue;
+            }
+
+            let mut newest_access = 0;
+            let mut eligible = true;
+            for &slot in block {
+                let idx = self.slot_index(slot)?;
+                if active_slots[idx] || self.slot_refcounts[idx] == 0 {
+                    eligible = false;
+                    break;
+                }
+                newest_access = newest_access.max(self.slot_last_access[idx]);
+            }
+            if eligible {
+                candidates.push((newest_access, block.clone()));
+            }
+        }
+
+        candidates.sort_by_key(|(last_access, _)| *last_access);
+
+        let mut selected = Vec::new();
+        let mut selected_tokens = 0usize;
+        for (_, block) in candidates {
+            selected_tokens = selected_tokens.saturating_add(block.len());
+            selected.push(block);
+            if selected_tokens >= target_tokens {
+                break;
+            }
+        }
+        Ok(selected)
+    }
+
     fn slot_index(&self, slot: u32) -> Result<usize> {
         let idx =
             usize::try_from(slot).map_err(|_| anyhow!("MetalKVPool: invalid token slot {slot}"))?;
@@ -176,6 +274,30 @@ impl SlotLedger {
             ));
         }
         Ok(idx)
+    }
+
+    fn active_slot_bitmap(&self) -> Vec<bool> {
+        let mut active = vec![false; self.max_total_tokens];
+        for slots in self.request_slots.values() {
+            for &slot in slots {
+                if let Ok(idx) = self.slot_index(slot) {
+                    active[idx] = true;
+                }
+            }
+        }
+        active
+    }
+
+    fn bump_access_tick(&mut self) -> u64 {
+        let tick = self.next_access_tick;
+        self.next_access_tick = self.next_access_tick.saturating_add(1).max(1);
+        tick
+    }
+
+    fn mark_access_at(&mut self, slot: u32, tick: u64) -> Result<()> {
+        let idx = self.slot_index(slot)?;
+        self.slot_last_access[idx] = tick;
+        Ok(())
     }
 
     fn bump_refcount(&mut self, slot: u32) -> Result<()> {
@@ -202,6 +324,9 @@ impl SlotLedger {
         }
         *count -= 1;
         if *count == 0 {
+            if let Some(last_access) = self.slot_last_access.get_mut(idx) {
+                *last_access = 0;
+            }
             self.free_slots.push(slot);
         }
     }
@@ -316,6 +441,34 @@ impl MetalKVPool {
     /// Release detached token slots back into the pool.
     pub fn release_slots(&mut self, slots: &[u32]) -> Result<()> {
         self.ledger.release_slots(slots)
+    }
+
+    /// Mark token slots as recently accessed for LRU eviction accounting.
+    pub fn register_access(&mut self, slots: &[u32]) -> Result<()> {
+        self.ledger.register_access(slots)
+    }
+
+    /// Return how many tokens should be reclaimed to move from high to low
+    /// watermark, or `None` when the pool is below the high watermark.
+    pub fn reclaim_target_tokens(
+        &self,
+        high_watermark: f64,
+        low_watermark: f64,
+    ) -> Result<Option<usize>> {
+        self.ledger
+            .reclaim_target_tokens(high_watermark, low_watermark)
+    }
+
+    /// Select eviction candidates from caller-supplied cache blocks in LRU
+    /// order. The ledger protects active request slots; the caller owns block
+    /// alignment and cache metadata.
+    pub fn select_eviction_candidates(
+        &self,
+        candidate_blocks: &[Vec<u32>],
+        target_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        self.ledger
+            .select_eviction_candidates(candidate_blocks, target_tokens)
     }
 
     /// Scatter-write K/V tensors into the pool at the request's token positions.
@@ -573,6 +726,60 @@ mod tests {
 
         ledger.free_request(2);
         assert_eq!(ledger.available_tokens(), 4);
+    }
+
+    #[test]
+    fn access_tracking_selects_oldest_detached_blocks() {
+        let mut ledger = SlotLedger::new(8);
+        let old = ledger.alloc_detached_slots(2).expect("old block");
+        let active = ledger.alloc_tokens(7, 2).expect("active block");
+        let new = ledger.alloc_detached_slots(2).expect("new block");
+
+        ledger.register_access(&new).expect("touch new");
+        ledger.register_access(&old).expect("touch old");
+        ledger.register_access(&new).expect("retouch new");
+
+        let candidates = vec![new.clone(), active, old.clone()];
+        let selected = ledger
+            .select_eviction_candidates(&candidates, 2)
+            .expect("select candidates");
+
+        assert_eq!(selected, vec![old]);
+    }
+
+    #[test]
+    fn eviction_selection_skips_free_and_active_slots() {
+        let mut ledger = SlotLedger::new(6);
+        let detached = ledger.alloc_detached_slots(2).expect("detached");
+        let active = ledger.alloc_tokens(1, 2).expect("active");
+        let free = ledger.alloc_detached_slots(2).expect("free");
+        ledger.release_slots(&free).expect("release free");
+
+        let candidates = vec![active, free, detached.clone()];
+        let selected = ledger
+            .select_eviction_candidates(&candidates, 4)
+            .expect("select candidates");
+
+        assert_eq!(selected, vec![detached]);
+    }
+
+    #[test]
+    fn watermarks_compute_reclaim_target() {
+        let mut ledger = SlotLedger::new(10);
+        ledger.alloc_detached_slots(7).expect("alloc");
+
+        assert_eq!(ledger.reclaim_target_tokens(0.6, 0.4).unwrap(), Some(3));
+        assert_eq!(ledger.reclaim_target_tokens(0.7, 0.4).unwrap(), None);
+        assert_eq!(ledger.reclaim_target_tokens(0.95, 0.8).unwrap(), None);
+        assert!(ledger.reclaim_target_tokens(0.3, 0.4).is_err());
+    }
+
+    #[test]
+    fn watermarks_trigger_when_used_exceeds_fractional_high_mark() {
+        let mut ledger = SlotLedger::new(10);
+        ledger.alloc_detached_slots(10).expect("alloc");
+
+        assert_eq!(ledger.reclaim_target_tokens(0.95, 0.8).unwrap(), Some(2));
     }
 
     #[test]
