@@ -520,6 +520,14 @@ impl ServerMetrics {
             self.spec_accepted_tokens_total()
         )
         .unwrap();
+        out.push_str("# HELP infer_spec_sparse_view_empty_total Sparse self-spec decode rows that could not build a sparse KV view.\n");
+        out.push_str("# TYPE infer_spec_sparse_view_empty_total counter\n");
+        writeln!(
+            out,
+            "infer_spec_sparse_view_empty_total{{{labels}}} {}",
+            self.spec_sparse_view_empty_total()
+        )
+        .unwrap();
         out.push_str("# HELP infer_spec_acceptance_rate Aggregate speculative accepted / verified token ratio [0,1].\n");
         out.push_str("# TYPE infer_spec_acceptance_rate gauge\n");
         writeln!(
@@ -836,10 +844,11 @@ impl ServerMetrics {
             " plan_label=idle:{plan_idle},decode:{plan_decode},prefill:{plan_prefill},split:{plan_split},mixed:{plan_mixed}"
         );
         let spec_suffix = format!(
-            " spec=draft:{},verified:{},accepted:{},accept_rate:{:.1}%,step_latency_count:{}",
+            " spec=draft:{},verified:{},accepted:{},empty_sparse_views:{},accept_rate:{:.1}%,step_latency_count:{}",
             self.spec_draft_tokens_total(),
             self.spec_verified_tokens_total(),
             self.spec_accepted_tokens_total(),
+            self.spec_sparse_view_empty_total(),
             self.spec_acceptance_rate() * 100.0,
             spec_step_latency_count,
         );

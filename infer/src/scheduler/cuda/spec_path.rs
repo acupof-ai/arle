@@ -11,7 +11,11 @@ pub(super) struct SpecPath;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SparseDraftView {
     pub(super) slot_idx: usize,
+    /// Sparse-view block ids used for radix metadata/drop accounting.
     pub(super) page_ids: Vec<BlockId>,
+    /// Physical paged-KV page ids selected for sparse draft attention.
+    pub(super) physical_page_ids: Vec<u32>,
+    /// Prefix-cache blocks directly attached from another slot.
     pub(super) attached_page_ids: Vec<BlockId>,
     pub(super) sparse_total_tokens: usize,
     /// Recent active-slot tokens that P2.B.3 must resolve from paged-KV slot
@@ -23,6 +27,7 @@ impl SparseDraftView {
     fn new(
         slot_idx: usize,
         page_ids: Vec<BlockId>,
+        physical_page_ids: Vec<u32>,
         attached_page_ids: Vec<BlockId>,
         block_size: usize,
         active_recent_tokens: usize,
@@ -32,6 +37,7 @@ impl SparseDraftView {
             sparse_total_tokens: page_ids.len().saturating_mul(block_size),
             active_recent_tokens,
             page_ids,
+            physical_page_ids,
             attached_page_ids,
         }
     }
@@ -419,16 +425,6 @@ impl SpecPath {
             let original_target_len = scheduler.paged_kv_pool.seq_len(slot_idx);
             let mut draft_tokens = Vec::with_capacity(scheduler.config.spec_draft_k);
             let mut token = last_token;
-            let page_ids = match scheduler.flattened_pages_for_blocks(&view.page_ids) {
-                Ok(pages) => pages,
-                Err(err) => {
-                    log::warn!(
-                        "sparse draft page expansion failed for request {request_id}: {err}"
-                    );
-                    scheduler.step_decode_launch();
-                    return;
-                }
-            };
 
             for _ in 0..scheduler.config.spec_draft_k {
                 if generated_len + draft_tokens.len() >= max_tokens {
@@ -454,7 +450,7 @@ impl SpecPath {
 
                 let sparse_view = SparseKvDraftView {
                     slot_idx,
-                    page_ids: &page_ids,
+                    page_ids: &view.physical_page_ids,
                     active_recent_tokens: view.active_recent_tokens,
                 };
                 let Some(decode_ctx) = scheduler.decode_bufs.as_mut() else {
@@ -651,13 +647,44 @@ fn build_sparse_draft_views<M: ModelForward>(scheduler: &mut Scheduler<M>) -> Ve
                 scheduler.config.spec_sparse_top_k_pages,
                 &req.attached_prefix_blocks,
             );
+        let (page_ids, physical_page_ids) = if page_ids.is_empty() {
+            let physical_page_ids: Vec<u32> = scheduler
+                .select_sparse_pages_from_active_slot(
+                    slot_idx,
+                    scheduler.config.spec_sparse_recent_tokens,
+                    scheduler.config.spec_sparse_top_k_pages,
+                )
+                .into_iter()
+                .map(|block_id| block_id.0)
+                .collect();
+            (Vec::new(), physical_page_ids)
+        } else {
+            match scheduler.flattened_pages_for_blocks(&page_ids) {
+                Ok(physical_page_ids) => (page_ids, physical_page_ids),
+                Err(err) => {
+                    log::warn!("sparse radix page expansion failed for slot {slot_idx}: {err}");
+                    let physical_page_ids: Vec<u32> = scheduler
+                        .select_sparse_pages_from_active_slot(
+                            slot_idx,
+                            scheduler.config.spec_sparse_recent_tokens,
+                            scheduler.config.spec_sparse_top_k_pages,
+                        )
+                        .into_iter()
+                        .map(|block_id| block_id.0)
+                        .collect();
+                    (Vec::new(), physical_page_ids)
+                }
+            }
+        };
         let active_recent_tokens = scheduler.config.spec_sparse_recent_tokens.min(tokens.len());
-        if page_ids.is_empty() {
+        if physical_page_ids.is_empty() {
+            scheduler.metrics.record_spec_sparse_view_empty(1);
             continue;
         }
         views.push(SparseDraftView::new(
             slot_idx,
             page_ids,
+            physical_page_ids,
             req.attached_prefix_blocks.clone(),
             block_size,
             active_recent_tokens,
@@ -699,12 +726,29 @@ mod tests {
 
     #[test]
     fn sparse_draft_view_counts_selected_block_tokens() {
-        let view = SparseDraftView::new(3, vec![BlockId(7), BlockId(9)], vec![BlockId(5)], 16, 24);
+        let view = SparseDraftView::new(
+            3,
+            vec![BlockId(7), BlockId(9)],
+            vec![7, 9],
+            vec![BlockId(5)],
+            16,
+            24,
+        );
 
         assert_eq!(view.slot_idx, 3);
         assert_eq!(view.page_ids, vec![BlockId(7), BlockId(9)]);
+        assert_eq!(view.physical_page_ids, vec![7, 9]);
         assert_eq!(view.attached_page_ids, vec![BlockId(5)]);
         assert_eq!(view.sparse_total_tokens, 32);
         assert_eq!(view.active_recent_tokens, 24);
+    }
+
+    #[test]
+    fn active_slot_sparse_view_has_no_radix_drop_ids() {
+        let view = SparseDraftView::new(2, Vec::new(), vec![4, 8, 15], Vec::new(), 16, 32);
+
+        assert!(view.page_ids.is_empty());
+        assert_eq!(view.physical_page_ids, vec![4, 8, 15]);
+        assert_eq!(view.sparse_total_tokens, 0);
     }
 }
