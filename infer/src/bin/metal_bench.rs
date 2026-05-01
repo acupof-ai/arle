@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
-use infer::backend::metal::MetalRuntimeLimits;
+use infer::backend::metal::{MetalKvDiskOptions, MetalRuntimeLimits};
 use serde::{Deserialize, Serialize};
 
 /// Metal backend benchmark: prompt speed, TTFT, decode throughput, peak RSS.
@@ -90,6 +90,26 @@ struct Cli {
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
     no_kv_pool: bool,
 
+    /// Directory for experimental Metal SSD KV cache persistence.
+    #[arg(long, value_name = "DIR")]
+    kv_disk_dir: Option<PathBuf>,
+
+    /// Maximum bytes for the experimental Metal SSD KV cache.
+    #[arg(long, value_name = "BYTES", requires = "kv_disk_dir")]
+    kv_disk_max_bytes: Option<u64>,
+
+    /// High watermark for Metal SSD KV cache reclamation.
+    #[arg(long, requires = "kv_disk_dir")]
+    kv_disk_high_watermark: Option<f64>,
+
+    /// Low watermark for Metal SSD KV cache reclamation.
+    #[arg(long, requires = "kv_disk_dir")]
+    kv_disk_low_watermark: Option<f64>,
+
+    /// Fsync each experimental Metal SSD KV cache block write.
+    #[arg(long, action = ArgAction::SetTrue, requires = "kv_disk_dir")]
+    kv_disk_fsync_each_block: bool,
+
     /// Override the MLX allocator memory limit in bytes before model load.
     #[arg(long, value_name = "BYTES")]
     memory_limit_bytes: Option<usize>,
@@ -136,6 +156,25 @@ impl Cli {
             cache_limit_bytes: self.cache_limit_bytes,
             wired_limit_bytes: self.wired_limit_bytes,
         }
+    }
+
+    fn kv_disk_options(&self) -> Result<Option<MetalKvDiskOptions>> {
+        let Some(dir) = self.kv_disk_dir.clone() else {
+            return Ok(None);
+        };
+        let options = MetalKvDiskOptions {
+            dir,
+            max_bytes: self.kv_disk_max_bytes,
+            high_watermark: self
+                .kv_disk_high_watermark
+                .unwrap_or(MetalKvDiskOptions::DEFAULT_HIGH_WATERMARK),
+            low_watermark: self
+                .kv_disk_low_watermark
+                .unwrap_or(MetalKvDiskOptions::DEFAULT_LOW_WATERMARK),
+            fsync_each_block: self.kv_disk_fsync_each_block,
+        };
+        options.validate()?;
+        Ok(Some(options))
     }
 
     fn effective_ignore_eos(&self) -> bool {
@@ -411,6 +450,7 @@ fn run_bench() -> Result<()> {
                 speculative_tokens: cli.speculative_tokens,
             }),
         kv_pool: cli.kv_pool_override(),
+        kv_disk: cli.kv_disk_options()?,
         runtime_limits: cli.runtime_limits(),
     });
     backend.load(std::path::Path::new(&cli.model))?;
@@ -1006,6 +1046,7 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
     let mut baseline_backend = MetalBackend::with_options(MetalBackendOptions {
         dflash: None,
         kv_pool: cli.kv_pool_override(),
+        kv_disk: cli.kv_disk_options()?,
         runtime_limits: cli.runtime_limits(),
     });
     baseline_backend.load(std::path::Path::new(&cli.model))?;
@@ -1026,6 +1067,7 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
             speculative_tokens: cli.speculative_tokens,
         }),
         kv_pool: cli.kv_pool_override(),
+        kv_disk: cli.kv_disk_options()?,
         runtime_limits: cli.runtime_limits(),
     });
     dflash_backend.load(std::path::Path::new(&cli.model))?;
