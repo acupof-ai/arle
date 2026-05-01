@@ -494,6 +494,41 @@ impl ServerMetrics {
             .unwrap();
         }
 
+        out.push_str("# HELP infer_spec_draft_tokens_total Draft tokens proposed by Phase 2 speculative decode.\n");
+        out.push_str("# TYPE infer_spec_draft_tokens_total counter\n");
+        writeln!(
+            out,
+            "infer_spec_draft_tokens_total{{{labels}}} {}",
+            self.spec_draft_tokens_total()
+        )
+        .unwrap();
+        out.push_str("# HELP infer_spec_verified_tokens_total Draft tokens checked by the target verifier.\n");
+        out.push_str("# TYPE infer_spec_verified_tokens_total counter\n");
+        writeln!(
+            out,
+            "infer_spec_verified_tokens_total{{{labels}}} {}",
+            self.spec_verified_tokens_total()
+        )
+        .unwrap();
+        out.push_str(
+            "# HELP infer_spec_accepted_tokens_total Draft tokens accepted by the verifier.\n",
+        );
+        out.push_str("# TYPE infer_spec_accepted_tokens_total counter\n");
+        writeln!(
+            out,
+            "infer_spec_accepted_tokens_total{{{labels}}} {}",
+            self.spec_accepted_tokens_total()
+        )
+        .unwrap();
+        out.push_str("# HELP infer_spec_acceptance_rate Aggregate speculative accepted / verified token ratio [0,1].\n");
+        out.push_str("# TYPE infer_spec_acceptance_rate gauge\n");
+        writeln!(
+            out,
+            "infer_spec_acceptance_rate{{{labels}}} {:.6}",
+            self.spec_acceptance_rate()
+        )
+        .unwrap();
+
         out.push_str("# HELP infer_kv_coordinator_queue_capacity Coordinator queue capacity shared by staged KV fetch/store work.\n");
         out.push_str("# TYPE infer_kv_coordinator_queue_capacity gauge\n");
         writeln!(
@@ -693,6 +728,15 @@ impl ServerMetrics {
                 &h.scheduler_step
                     .render("infer_scheduler_step_seconds", &labels),
             );
+
+            out.push_str(
+                "# HELP infer_spec_step_latency_us Phase 2 speculative decode step latency.\n",
+            );
+            out.push_str("# TYPE infer_spec_step_latency_us histogram\n");
+            out.push_str(
+                &h.spec_step_latency_us
+                    .render("infer_spec_step_latency_us", &labels),
+            );
         }
 
         out
@@ -725,6 +769,9 @@ impl ServerMetrics {
             .as_ref()
             .and_then(|h| h.scheduler_step.percentile(0.50))
             .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
+        let spec_step_latency_count = histograms
+            .as_ref()
+            .map_or(0, |h| h.spec_step_latency_us.count());
         let service_p50 = histograms
             .as_ref()
             .and_then(|h| h.service.percentile(0.50))
@@ -788,6 +835,14 @@ impl ServerMetrics {
         let plan_suffix = format!(
             " plan_label=idle:{plan_idle},decode:{plan_decode},prefill:{plan_prefill},split:{plan_split},mixed:{plan_mixed}"
         );
+        let spec_suffix = format!(
+            " spec=draft:{},verified:{},accepted:{},accept_rate:{:.1}%,step_latency_count:{}",
+            self.spec_draft_tokens_total(),
+            self.spec_verified_tokens_total(),
+            self.spec_accepted_tokens_total(),
+            self.spec_acceptance_rate() * 100.0,
+            spec_step_latency_count,
+        );
         let queue_capacity = self.kv_coordinator_queue_capacity();
         let coordinator_suffix = if queue_capacity > 0 {
             format!(
@@ -824,7 +879,7 @@ impl ServerMetrics {
         };
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -841,6 +896,7 @@ impl ServerMetrics {
             step_p50,
             phase_suffix,
             plan_suffix,
+            spec_suffix,
             self.tier_fetch_wait_seconds() * 1000.0,
             self.tier_store_wait_seconds() * 1000.0,
             self.kv_gpu_utilization() * 100.0,

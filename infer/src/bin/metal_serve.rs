@@ -327,6 +327,7 @@ fn submit_warmup_request(
                 ..Default::default()
             },
             stop: None,
+            speculative: None,
             priority: RequestPriority::High,
             session_id: None,
             delta_tx,

@@ -13,6 +13,23 @@ use crate::server_engine::CompletionStreamDelta;
 use crate::tokenizer::Tokenizer;
 use crate::types::SessionId;
 
+/// Draft-model source for Phase 2 speculative decode wiring.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum DraftMode {
+    #[default]
+    None,
+    SelfSpec,
+    External(PathBuf),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RequestSpecConfig {
+    pub enabled: Option<bool>,
+    pub draft_k: Option<usize>,
+    pub acceptance_threshold: Option<f32>,
+    pub draft_model: Option<String>,
+}
+
 /// Scheduler configuration.
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
@@ -59,6 +76,15 @@ pub struct SchedulerConfig {
     /// Stream chunking interval in generated tokens. 1 matches SGLang's
     /// default and flushes every token.
     pub stream_interval: usize,
+    /// Enable Phase 2 speculative decode. Defaults off; P2.2 only plumbs the
+    /// no-op branch and counters.
+    pub spec_enabled: bool,
+    /// Maximum draft tokens proposed per speculative step.
+    pub spec_draft_k: usize,
+    /// Rolling acceptance-rate floor below which speculation can be disabled.
+    pub spec_acceptance_threshold: f32,
+    /// Draft-model source for speculative decode.
+    pub spec_draft_model: DraftMode,
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
     pub max_waiting_requests: usize,
@@ -125,6 +151,10 @@ impl Default for SchedulerConfig {
             prefix_cache_enabled: true,
             schedule_policy: SchedulePolicy::Fcfs,
             stream_interval: 1,
+            spec_enabled: false,
+            spec_draft_k: 5,
+            spec_acceptance_threshold: 0.6,
+            spec_draft_model: DraftMode::None,
             max_waiting_requests: 256,
             // SGLang alignment 2026-04-29
             mem_fraction_static: 0.85,
@@ -280,6 +310,12 @@ impl SchedulerConfig {
         if self.stream_interval == 0 {
             anyhow::bail!("stream_interval must be ≥ 1");
         }
+        if self.spec_draft_k == 0 {
+            anyhow::bail!("spec_draft_k must be ≥ 1");
+        }
+        if !(0.0..=1.0).contains(&self.spec_acceptance_threshold) {
+            anyhow::bail!("spec_acceptance_threshold must be in [0, 1]");
+        }
         if self.min_seq_len == 0 {
             anyhow::bail!("min_seq_len must be ≥ 1");
         }
@@ -423,6 +459,9 @@ pub struct IncomingRequest {
     pub max_tokens: usize,
     pub sampling: SamplingParams,
     pub stop: Option<Vec<String>>,
+    /// Optional per-request speculative decode override. P2.2 carries this as
+    /// scheduler-visible metadata only; P2.3 consumes it in verifier admission.
+    pub speculative: Option<RequestSpecConfig>,
     /// Scheduling priority. Higher-priority requests are served first.
     pub priority: RequestPriority,
     /// Optional client-supplied session identifier used for sticky routing.
@@ -615,6 +654,10 @@ mod tests {
         assert_eq!(cfg.long_prefill_token_threshold, 4096);
         assert_eq!(cfg.mixed_prefill_token_budget(), 4096);
         assert_eq!(cfg.prefill_max_requests, None);
+        assert!(!cfg.spec_enabled);
+        assert_eq!(cfg.spec_draft_k, 5);
+        assert_eq!(cfg.spec_acceptance_threshold, 0.6);
+        assert_eq!(cfg.spec_draft_model, DraftMode::None);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);

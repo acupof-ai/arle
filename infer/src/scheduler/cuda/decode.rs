@@ -149,6 +149,7 @@ impl<M: ModelForward> Scheduler<M> {
                 max_tokens: victim.max_tokens,
                 sampling: victim.sampling.clone(),
                 stop: victim.stop.take(),
+                speculative: victim.speculative.clone(),
                 priority: victim.priority,
                 session_id: victim.session_id.clone(),
                 trace_context: victim.trace_context,

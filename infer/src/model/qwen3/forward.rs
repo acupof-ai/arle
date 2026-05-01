@@ -80,6 +80,22 @@ impl GenerationState for Qwen3State {
 }
 
 #[cfg(feature = "cuda")]
+impl Qwen3Model {
+    pub fn forward_with_logits(
+        &self,
+        tokens: &[u32],
+        state: &mut Qwen3State,
+    ) -> Result<(Vec<u32>, DeviceVec)> {
+        if tokens.len() == 1 && state.base.kv_cache.len() > 0 {
+            self.forward_decode(tokens[0], state)?;
+        } else {
+            self.forward_prefill(tokens, state)?;
+        }
+        Ok((tokens.to_vec(), state.logits().clone()))
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl ModelForward for Qwen3Model {
     type State = Qwen3State;
     type DecodeContext = super::batch_decode::BatchDecodeBuffers;

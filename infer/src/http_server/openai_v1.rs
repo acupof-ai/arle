@@ -215,6 +215,22 @@ fn validate_return_token_ids(
     Ok(())
 }
 
+fn validate_speculative(value: Option<&SpecConfig>) -> Result<(), ApiError> {
+    let Some(spec) = value else {
+        return Ok(());
+    };
+    if matches!(spec.draft_k, Some(0)) {
+        return Err(invalid_parameter("speculative.draft_k", "must be ≥ 1"));
+    }
+    if matches!(spec.acceptance_threshold, Some(value) if !(0.0..=1.0).contains(&value)) {
+        return Err(invalid_parameter(
+            "speculative.acceptance_threshold",
+            "must be in [0, 1]",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_text_only_content(content: &OpenAiChatContent, field: &str) -> Result<(), ApiError> {
     let OpenAiChatContent::Parts(parts) = content else {
         return Ok(());
@@ -517,6 +533,10 @@ pub(super) struct CompletionRequest {
     /// supplies a stable per-user token" field.
     #[serde(default, alias = "user")]
     pub(super) session_id: Option<String>,
+    /// Optional Phase 2 speculative decode override. P2.2 parses and carries
+    /// it as no-op request metadata; scheduler behavior remains config-gated.
+    #[serde(default)]
+    pub(super) speculative: Option<SpecConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -524,6 +544,15 @@ pub(super) struct CompletionRequest {
 pub(super) struct StreamOptions {
     pub(super) include_usage: Option<bool>,
     pub(super) continuous_usage_stats: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SpecConfig {
+    pub(super) enabled: Option<bool>,
+    pub(super) draft_k: Option<usize>,
+    pub(super) acceptance_threshold: Option<f32>,
+    pub(super) draft_model: Option<String>,
 }
 
 impl CompletionRequest {
@@ -539,6 +568,7 @@ impl CompletionRequest {
         validate_stream_options(self.stream, self.stream_options.as_ref())?;
         validate_logprobs(self.logprobs)?;
         validate_return_token_ids(self.stream, self.return_token_ids)?;
+        validate_speculative(self.speculative.as_ref())?;
         validate_common_sampling_fields(
             self.temperature,
             self.top_p,
@@ -767,6 +797,10 @@ pub(super) struct ChatCompletionRequest {
     /// See [`CompletionRequest::session_id`] for the routing contract.
     #[serde(default, alias = "user")]
     pub(super) session_id: Option<String>,
+    /// Optional Phase 2 speculative decode override. P2.2 parses and carries
+    /// it as no-op request metadata; scheduler behavior remains config-gated.
+    #[serde(default)]
+    pub(super) speculative: Option<SpecConfig>,
 }
 
 impl ChatCompletionRequest {
@@ -784,6 +818,7 @@ impl ChatCompletionRequest {
         }
         validate_max_tokens(self.max_tokens, "max_tokens")?;
         validate_stream_options(self.stream, self.stream_options.as_ref())?;
+        validate_speculative(self.speculative.as_ref())?;
         validate_common_sampling_fields(
             self.temperature,
             self.top_p,
@@ -1066,6 +1101,10 @@ pub(super) struct ResponsesRequest {
     pub(super) tools: Vec<OpenAiToolDefinition>,
     #[serde(default, alias = "user")]
     pub(super) session_id: Option<String>,
+    /// Optional Phase 2 speculative decode override. P2.2 parses and carries
+    /// it as no-op request metadata; scheduler behavior remains config-gated.
+    #[serde(default)]
+    pub(super) speculative: Option<SpecConfig>,
 }
 
 impl ResponsesRequest {
@@ -1076,6 +1115,7 @@ impl ResponsesRequest {
 
     pub(super) fn validate(&self) -> Result<(), ApiError> {
         validate_max_tokens(self.max_output_tokens, "max_output_tokens")?;
+        validate_speculative(self.speculative.as_ref())?;
         validate_common_sampling_fields(
             self.temperature,
             self.top_p,

@@ -12,7 +12,7 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
-use infer::scheduler::{SchedulePolicy, SchedulerConfig};
+use infer::scheduler::{DraftMode, SchedulePolicy, SchedulerConfig};
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
 
@@ -117,6 +117,22 @@ struct Args {
     /// SGLang-compatible streaming interval in generated tokens.
     #[arg(long, default_value_t = 1)]
     stream_interval: usize,
+
+    /// Enable Phase 2 speculative decode plumbing. Defaults off.
+    #[arg(long, default_value_t = false)]
+    spec_enabled: bool,
+
+    /// Maximum draft tokens proposed per speculative decode step.
+    #[arg(long, default_value_t = 5)]
+    spec_draft_k: usize,
+
+    /// Minimum rolling acceptance rate required to keep speculation active.
+    #[arg(long, default_value_t = 0.6)]
+    spec_acceptance_threshold: f32,
+
+    /// Draft mode: "none", "self"/"self-spec", or "external:<path>".
+    #[arg(long, default_value = "none")]
+    spec_draft_model: String,
 
     /// Disable RadixAttention-style prefix cache lookup and publish.
     #[arg(long)]
@@ -496,6 +512,8 @@ fn kv_mode_candidates(
 fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig {
     let schedule_policy =
         SchedulePolicy::parse(&args.schedule_policy).unwrap_or_else(|err| panic!("{err}"));
+    let spec_draft_model =
+        parse_draft_mode(&args.spec_draft_model).unwrap_or_else(|err| panic!("{err}"));
     // `chunked_prefill_size` / `max_prefill_tokens` are not plugged into the
     // `SchedulerConfig` here — when the operator did not supply a value, the
     // CUDA bootstrap resolves them against HBM via `RuntimeEnvelopeOverrides`.
@@ -511,6 +529,10 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
         prefix_cache_enabled: !args.disable_radix_cache,
         schedule_policy,
         stream_interval: args.stream_interval,
+        spec_enabled: args.spec_enabled,
+        spec_draft_k: args.spec_draft_k,
+        spec_acceptance_threshold: args.spec_acceptance_threshold,
+        spec_draft_model,
         mem_fraction_static: args.mem_fraction_static,
         min_seq_len: args.min_seq_len,
         kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
@@ -533,6 +555,27 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
         .as_ref()
         .map(|root| ClusterSharedBackendConfig::SharedFilesystem { root: root.clone() });
     config
+}
+
+fn parse_draft_mode(raw: &str) -> anyhow::Result<DraftMode> {
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "none" => Ok(DraftMode::None),
+        "self" | "self-spec" | "selfspec" => Ok(DraftMode::SelfSpec),
+        _ if trimmed.to_ascii_lowercase().starts_with("external:") => {
+            let path = trimmed
+                .split_once(':')
+                .map(|(_, path)| path.trim())
+                .unwrap_or_default();
+            if path.is_empty() {
+                anyhow::bail!("--spec-draft-model external:<path> requires a non-empty path");
+            }
+            Ok(DraftMode::External(PathBuf::from(path)))
+        }
+        other => anyhow::bail!(
+            "unsupported --spec-draft-model '{other}': expected none, self, self-spec, or external:<path>"
+        ),
+    }
 }
 
 fn log_tier_config_overrides(args: &Args) {

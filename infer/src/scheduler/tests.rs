@@ -13,6 +13,7 @@ fn make_request() -> IncomingRequest {
         max_tokens: 32,
         sampling: SamplingParams::default(),
         stop: None,
+        speculative: None,
         priority: RequestPriority::Normal,
         session_id: None,
         delta_tx: tx,

@@ -160,6 +160,7 @@ mod tests {
             max_tokens: 1,
             sampling: crate::sampler::SamplingParams::default(),
             stop: None,
+            speculative: None,
             priority,
             session_id: None,
             delta_tx: tx,

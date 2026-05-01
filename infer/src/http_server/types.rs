@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use super::openai_v1::{
     ChatCompletionRequest, CompletionRequest as OpenAiCompletionRequest, ResponsesRequest,
+    SpecConfig as OpenAiSpecConfig,
 };
 use crate::metrics::ServerMetrics;
 use crate::request_handle::RequestHandle;
 use crate::sampler::{SamplingParams, sampling_params_from_request};
-use crate::scheduler::{IncomingRequest, RequestPriority};
+use crate::scheduler::{IncomingRequest, RequestPriority, RequestSpecConfig};
 use crate::server_engine::{CompletionOutput, CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::tokenizer::Tokenizer;
 use fastrace::collector::SpanContext;
@@ -155,6 +156,17 @@ pub(super) struct RequestExecutionOptions {
     pub(super) sampling: SamplingParams,
     pub(super) stop: Option<Vec<String>>,
     pub(super) session_id: Option<crate::types::SessionId>,
+    #[allow(dead_code)]
+    pub(super) speculative: Option<RequestSpecConfig>,
+}
+
+fn request_spec_config(spec: Option<&OpenAiSpecConfig>) -> Option<RequestSpecConfig> {
+    spec.map(|spec| RequestSpecConfig {
+        enabled: spec.enabled,
+        draft_k: spec.draft_k,
+        acceptance_threshold: spec.acceptance_threshold,
+        draft_model: spec.draft_model.clone(),
+    })
 }
 
 impl RequestExecutionOptions {
@@ -178,6 +190,7 @@ impl RequestExecutionOptions {
             ),
             stop: req.stop.clone(),
             session_id: req.session_id_parsed(),
+            speculative: request_spec_config(req.speculative.as_ref()),
         }
     }
 
@@ -201,6 +214,7 @@ impl RequestExecutionOptions {
             ),
             stop: req.stop.clone(),
             session_id: req.session_id_parsed(),
+            speculative: request_spec_config(req.speculative.as_ref()),
         }
     }
 
@@ -224,6 +238,7 @@ impl RequestExecutionOptions {
             ),
             stop: req.stop.clone(),
             session_id: req.session_id_parsed(),
+            speculative: request_spec_config(req.speculative.as_ref()),
         }
     }
 
@@ -240,6 +255,7 @@ impl RequestExecutionOptions {
             max_tokens: self.max_tokens,
             sampling: self.sampling,
             stop: self.stop,
+            speculative: self.speculative,
             priority: RequestPriority::default(),
             session_id: self.session_id,
             delta_tx,
