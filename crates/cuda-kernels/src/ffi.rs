@@ -15,6 +15,8 @@ pub mod gemm;
 pub mod kv;
 #[path = "ffi/misc.rs"]
 pub mod misc;
+#[path = "ffi/mla.rs"]
+pub mod mla;
 #[cfg(feature = "nccl")]
 #[path = "ffi/nccl.rs"]
 pub mod nccl;
@@ -33,6 +35,7 @@ pub use embedding::*;
 pub use gemm::*;
 pub use kv::*;
 pub use misc::*;
+pub use mla::*;
 pub use norm::*;
 pub use quant::*;
 pub use recurrent::*;
