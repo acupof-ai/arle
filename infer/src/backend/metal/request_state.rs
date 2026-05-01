@@ -306,7 +306,7 @@ pub(crate) struct Qwen35PrefixSnapshot {
 #[allow(dead_code)]
 const QWEN35_PREFIX_SNAPSHOT_MAGIC: [u8; 8] = *b"Q35PFX01";
 #[allow(dead_code)]
-const QWEN35_PREFIX_SNAPSHOT_VERSION: u16 = 1;
+const QWEN35_PREFIX_SNAPSHOT_VERSION: u16 = 2;
 #[allow(dead_code)]
 const QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN: usize = 14;
 
@@ -317,6 +317,8 @@ struct Qwen35PrefixSnapshotHeader {
     token_ids: Vec<u32>,
     cache_len: i32,
     kv_capacity: i32,
+    metadata_checksum: Vec<u8>,
+    body_checksum: Vec<u8>,
     kv_flat: Vec<MlxArrayBytesHeader>,
     gdr_flat: Vec<MlxArrayBytesHeader>,
 }
@@ -327,7 +329,7 @@ struct MlxArrayBytesHeader {
     name: String,
     dtype: i32,
     shape: Vec<i32>,
-    byte_len: usize,
+    byte_len: u64,
 }
 
 #[allow(dead_code)]
@@ -351,13 +353,26 @@ impl Qwen35PrefixSnapshot {
         );
 
         let mut body = Vec::new();
+        let kv_flat = encode_mlx_array_headers("kv", &self.kv_flat, &mut body)?;
+        let gdr_flat = encode_mlx_array_headers("gdr", &self.gdr_flat, &mut body)?;
+        let metadata_checksum = qwen35_prefix_snapshot_metadata_checksum(
+            model_fingerprint,
+            &self.token_ids,
+            self.cache_len,
+            self.kv_capacity,
+            &kv_flat,
+            &gdr_flat,
+        );
+        let body_checksum = blake3::hash(&body).as_bytes().to_vec();
         let header = Qwen35PrefixSnapshotHeader {
             model_fingerprint: model_fingerprint.to_vec(),
             token_ids: self.token_ids.clone(),
             cache_len: self.cache_len,
             kv_capacity: self.kv_capacity,
-            kv_flat: encode_mlx_array_headers("kv", &self.kv_flat, &mut body)?,
-            gdr_flat: encode_mlx_array_headers("gdr", &self.gdr_flat, &mut body)?,
+            metadata_checksum,
+            body_checksum,
+            kv_flat,
+            gdr_flat,
         };
         let header_bytes =
             postcard::to_allocvec(&header).context("encode Qwen3.5 prefix snapshot header")?;
@@ -375,72 +390,63 @@ impl Qwen35PrefixSnapshot {
         Ok(payload)
     }
 
+    pub(crate) fn estimated_disk_payload_len(&self, model_fingerprint: &[u8]) -> Result<u64> {
+        ensure!(
+            !model_fingerprint.is_empty(),
+            "Qwen3.5 prefix snapshot estimate requires a model fingerprint"
+        );
+        ensure!(
+            self.cache_len > 0 && self.kv_capacity >= self.cache_len,
+            "Qwen3.5 prefix snapshot has invalid cache_len/capacity: {}/{}",
+            self.cache_len,
+            self.kv_capacity
+        );
+        ensure!(
+            self.token_ids.len() == self.cache_len as usize,
+            "Qwen3.5 prefix snapshot token count {} does not match cache_len {}",
+            self.token_ids.len(),
+            self.cache_len
+        );
+
+        let (kv_flat, kv_bytes) = describe_mlx_array_headers("kv", &self.kv_flat)?;
+        let (gdr_flat, gdr_bytes) = describe_mlx_array_headers("gdr", &self.gdr_flat)?;
+        let metadata_checksum = qwen35_prefix_snapshot_metadata_checksum(
+            model_fingerprint,
+            &self.token_ids,
+            self.cache_len,
+            self.kv_capacity,
+            &kv_flat,
+            &gdr_flat,
+        );
+        let header = Qwen35PrefixSnapshotHeader {
+            model_fingerprint: model_fingerprint.to_vec(),
+            token_ids: self.token_ids.clone(),
+            cache_len: self.cache_len,
+            kv_capacity: self.kv_capacity,
+            metadata_checksum,
+            body_checksum: vec![0; blake3::OUT_LEN],
+            kv_flat,
+            gdr_flat,
+        };
+        let header_bytes = postcard::to_allocvec(&header)
+            .context("encode Qwen3.5 prefix snapshot header estimate")?;
+        let fixed_len = u64::try_from(QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN)
+            .context("Qwen3.5 prefix fixed header length exceeds u64")?;
+        let header_len = u64::try_from(header_bytes.len())
+            .context("Qwen3.5 prefix snapshot header length exceeds u64")?;
+        fixed_len
+            .checked_add(header_len)
+            .and_then(|len| len.checked_add(kv_bytes))
+            .and_then(|len| len.checked_add(gdr_bytes))
+            .context("Qwen3.5 prefix snapshot estimated payload length overflow")
+    }
+
     pub(crate) fn decode_from_disk(
         bytes: &[u8],
         expected_model_fingerprint: &[u8],
     ) -> Result<Self> {
-        ensure!(
-            !expected_model_fingerprint.is_empty(),
-            "Qwen3.5 prefix snapshot decode requires a model fingerprint"
-        );
-        ensure!(
-            bytes.len() >= QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN,
-            "Qwen3.5 prefix snapshot payload is shorter than fixed header"
-        );
-
-        let magic: [u8; 8] = bytes[..8]
-            .try_into()
-            .context("read Qwen3.5 prefix snapshot magic")?;
-        ensure!(
-            magic == QWEN35_PREFIX_SNAPSHOT_MAGIC,
-            "Qwen3.5 prefix snapshot has invalid magic"
-        );
-
-        let version = u16::from_le_bytes(
-            bytes[8..10]
-                .try_into()
-                .context("read Qwen3.5 prefix snapshot version")?,
-        );
-        ensure!(
-            version == QWEN35_PREFIX_SNAPSHOT_VERSION,
-            "Qwen3.5 prefix snapshot version {} is unsupported",
-            version
-        );
-
-        let header_len = u32::from_le_bytes(
-            bytes[10..14]
-                .try_into()
-                .context("read Qwen3.5 prefix snapshot header length")?,
-        ) as usize;
-        let header_end = QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN
-            .checked_add(header_len)
-            .context("Qwen3.5 prefix snapshot header length overflow")?;
-        ensure!(
-            bytes.len() >= header_end,
-            "Qwen3.5 prefix snapshot payload is shorter than declared header"
-        );
-
-        let header: Qwen35PrefixSnapshotHeader =
-            postcard::from_bytes(&bytes[QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN..header_end])
-                .context("decode Qwen3.5 prefix snapshot header")?;
-        ensure!(
-            header.model_fingerprint == expected_model_fingerprint,
-            "Qwen3.5 prefix snapshot model fingerprint mismatch"
-        );
-        ensure!(
-            header.cache_len > 0 && header.kv_capacity >= header.cache_len,
-            "Qwen3.5 prefix snapshot has invalid cache_len/capacity: {}/{}",
-            header.cache_len,
-            header.kv_capacity
-        );
-        ensure!(
-            header.token_ids.len() == header.cache_len as usize,
-            "Qwen3.5 prefix snapshot token count {} does not match cache_len {}",
-            header.token_ids.len(),
-            header.cache_len
-        );
-
-        let body = &bytes[header_end..];
+        let (header, body) =
+            decode_qwen35_prefix_snapshot_header(bytes, expected_model_fingerprint, true)?;
         let mut cursor = 0usize;
         let kv_flat = decode_mlx_array_headers("kv", &header.kv_flat, body, &mut cursor)?;
         let gdr_flat = decode_mlx_array_headers("gdr", &header.gdr_flat, body, &mut cursor)?;
@@ -458,6 +464,231 @@ impl Qwen35PrefixSnapshot {
             kv_capacity: header.kv_capacity,
         })
     }
+
+    pub(crate) fn peek_disk_token_ids(
+        bytes: &[u8],
+        expected_model_fingerprint: &[u8],
+    ) -> Result<Vec<u32>> {
+        let (header, _body) =
+            decode_qwen35_prefix_snapshot_header(bytes, expected_model_fingerprint, false)?;
+        Ok(header.token_ids)
+    }
+
+    pub(crate) fn looks_like_disk_payload(bytes: &[u8]) -> bool {
+        bytes.starts_with(&QWEN35_PREFIX_SNAPSHOT_MAGIC)
+    }
+}
+
+#[allow(dead_code)]
+fn decode_qwen35_prefix_snapshot_header<'a>(
+    bytes: &'a [u8],
+    expected_model_fingerprint: &[u8],
+    validate_body: bool,
+) -> Result<(Qwen35PrefixSnapshotHeader, &'a [u8])> {
+    ensure!(
+        !expected_model_fingerprint.is_empty(),
+        "Qwen3.5 prefix snapshot decode requires a model fingerprint"
+    );
+    ensure!(
+        bytes.len() >= QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN,
+        "Qwen3.5 prefix snapshot payload is shorter than fixed header"
+    );
+
+    let magic: [u8; 8] = bytes[..8]
+        .try_into()
+        .context("read Qwen3.5 prefix snapshot magic")?;
+    ensure!(
+        magic == QWEN35_PREFIX_SNAPSHOT_MAGIC,
+        "Qwen3.5 prefix snapshot has invalid magic"
+    );
+
+    let version = u16::from_le_bytes(
+        bytes[8..10]
+            .try_into()
+            .context("read Qwen3.5 prefix snapshot version")?,
+    );
+    ensure!(
+        version == QWEN35_PREFIX_SNAPSHOT_VERSION,
+        "Qwen3.5 prefix snapshot version {} is unsupported",
+        version
+    );
+
+    let header_len = u32::from_le_bytes(
+        bytes[10..14]
+            .try_into()
+            .context("read Qwen3.5 prefix snapshot header length")?,
+    ) as usize;
+    let header_end = QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN
+        .checked_add(header_len)
+        .context("Qwen3.5 prefix snapshot header length overflow")?;
+    ensure!(
+        bytes.len() >= header_end,
+        "Qwen3.5 prefix snapshot payload is shorter than declared header"
+    );
+
+    let header: Qwen35PrefixSnapshotHeader =
+        postcard::from_bytes(&bytes[QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN..header_end])
+            .context("decode Qwen3.5 prefix snapshot header")?;
+    ensure!(
+        header.model_fingerprint == expected_model_fingerprint,
+        "Qwen3.5 prefix snapshot model fingerprint mismatch"
+    );
+    ensure!(
+        header.cache_len > 0 && header.kv_capacity >= header.cache_len,
+        "Qwen3.5 prefix snapshot has invalid cache_len/capacity: {}/{}",
+        header.cache_len,
+        header.kv_capacity
+    );
+    ensure!(
+        header.token_ids.len() == header.cache_len as usize,
+        "Qwen3.5 prefix snapshot token count {} does not match cache_len {}",
+        header.token_ids.len(),
+        header.cache_len
+    );
+    validate_qwen35_prefix_snapshot_metadata_checksum(&header)?;
+
+    let body = &bytes[header_end..];
+    if validate_body {
+        validate_qwen35_prefix_snapshot_body(&header, body)?;
+    }
+    Ok((header, body))
+}
+
+fn qwen35_prefix_snapshot_metadata_checksum(
+    model_fingerprint: &[u8],
+    token_ids: &[u32],
+    cache_len: i32,
+    kv_capacity: i32,
+    kv_flat: &[MlxArrayBytesHeader],
+    gdr_flat: &[MlxArrayBytesHeader],
+) -> Vec<u8> {
+    fn update_bytes(hasher: &mut blake3::Hasher, label: &[u8], bytes: &[u8]) {
+        hasher.update(label);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    fn update_array_records(
+        hasher: &mut blake3::Hasher,
+        label: &[u8],
+        records: &[MlxArrayBytesHeader],
+    ) {
+        hasher.update(label);
+        hasher.update(&(records.len() as u64).to_le_bytes());
+        for record in records {
+            update_bytes(hasher, b"name\0", record.name.as_bytes());
+            hasher.update(b"dtype\0");
+            hasher.update(&record.dtype.to_le_bytes());
+            hasher.update(b"shape\0");
+            hasher.update(&(record.shape.len() as u64).to_le_bytes());
+            for dim in &record.shape {
+                hasher.update(&dim.to_le_bytes());
+            }
+            hasher.update(b"byte_len\0");
+            hasher.update(&record.byte_len.to_le_bytes());
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"arle-qwen35-prefix-snapshot-metadata-v1\0");
+    update_bytes(&mut hasher, b"model\0", model_fingerprint);
+    hasher.update(b"tokens\0");
+    hasher.update(&(token_ids.len() as u64).to_le_bytes());
+    for token_id in token_ids {
+        hasher.update(&token_id.to_le_bytes());
+    }
+    hasher.update(b"cache_len\0");
+    hasher.update(&cache_len.to_le_bytes());
+    hasher.update(b"kv_capacity\0");
+    hasher.update(&kv_capacity.to_le_bytes());
+    update_array_records(&mut hasher, b"kv_flat\0", kv_flat);
+    update_array_records(&mut hasher, b"gdr_flat\0", gdr_flat);
+    hasher.finalize().as_bytes().to_vec()
+}
+
+fn validate_qwen35_prefix_snapshot_metadata_checksum(
+    header: &Qwen35PrefixSnapshotHeader,
+) -> Result<()> {
+    ensure!(
+        header.metadata_checksum.len() == blake3::OUT_LEN,
+        "Qwen3.5 prefix snapshot metadata checksum has invalid length {}",
+        header.metadata_checksum.len()
+    );
+    let actual = qwen35_prefix_snapshot_metadata_checksum(
+        &header.model_fingerprint,
+        &header.token_ids,
+        header.cache_len,
+        header.kv_capacity,
+        &header.kv_flat,
+        &header.gdr_flat,
+    );
+    ensure!(
+        header.metadata_checksum == actual,
+        "Qwen3.5 prefix snapshot metadata checksum mismatch"
+    );
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_qwen35_prefix_snapshot_body(
+    header: &Qwen35PrefixSnapshotHeader,
+    body: &[u8],
+) -> Result<()> {
+    let mut cursor = 0usize;
+    validate_mlx_array_header_layout("kv", &header.kv_flat, body.len(), &mut cursor)?;
+    validate_mlx_array_header_layout("gdr", &header.gdr_flat, body.len(), &mut cursor)?;
+    ensure!(
+        header.body_checksum.len() == blake3::OUT_LEN,
+        "Qwen3.5 prefix snapshot body checksum has invalid length {}",
+        header.body_checksum.len()
+    );
+    let actual_body_checksum = blake3::hash(body);
+    ensure!(
+        header.body_checksum.as_slice() == actual_body_checksum.as_bytes(),
+        "Qwen3.5 prefix snapshot body checksum mismatch"
+    );
+    ensure!(
+        cursor == body.len(),
+        "Qwen3.5 prefix snapshot body has {} trailing bytes",
+        body.len() - cursor
+    );
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_mlx_array_header_layout(
+    prefix: &str,
+    records: &[MlxArrayBytesHeader],
+    body_len: usize,
+    cursor: &mut usize,
+) -> Result<()> {
+    for (idx, record) in records.iter().enumerate() {
+        let expected_name = format!("{prefix}.{idx}");
+        ensure!(
+            record.name == expected_name,
+            "Qwen3.5 prefix snapshot array name mismatch: got {}, expected {}",
+            record.name,
+            expected_name
+        );
+        ensure!(
+            super::mlx::Dtype::from_raw(record.dtype).is_some(),
+            "Qwen3.5 prefix snapshot array {} has unknown dtype {}",
+            record.name,
+            record.dtype
+        );
+        let byte_len = usize::try_from(record.byte_len)
+            .context("Qwen3.5 prefix snapshot array byte length exceeds usize")?;
+        let end = cursor
+            .checked_add(byte_len)
+            .context("Qwen3.5 prefix snapshot array byte range overflow")?;
+        ensure!(
+            end <= body_len,
+            "Qwen3.5 prefix snapshot body is truncated while reading {}",
+            record.name
+        );
+        *cursor = end;
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -478,10 +709,33 @@ fn encode_mlx_array_headers(
                 name: format!("{prefix}.{idx}"),
                 dtype: array.dtype().to_raw(),
                 shape: array.shape().to_vec(),
-                byte_len: bytes.len(),
+                byte_len: u64::try_from(bytes.len())
+                    .context("Qwen3.5 prefix array byte length exceeds u64")?,
             })
         })
         .collect()
+}
+
+fn describe_mlx_array_headers(
+    prefix: &str,
+    arrays: &[MlxArray],
+) -> Result<(Vec<MlxArrayBytesHeader>, u64)> {
+    let mut total_bytes = 0u64;
+    let mut headers = Vec::with_capacity(arrays.len());
+    for (idx, array) in arrays.iter().enumerate() {
+        let byte_len = u64::try_from(array.nbytes())
+            .context("Qwen3.5 prefix array byte length exceeds u64")?;
+        total_bytes = total_bytes
+            .checked_add(byte_len)
+            .context("Qwen3.5 prefix array byte length sum overflow")?;
+        headers.push(MlxArrayBytesHeader {
+            name: format!("{prefix}.{idx}"),
+            dtype: array.dtype().to_raw(),
+            shape: array.shape().to_vec(),
+            byte_len,
+        });
+    }
+    Ok((headers, total_bytes))
 }
 
 #[allow(dead_code)]
@@ -509,8 +763,10 @@ fn decode_mlx_array_headers(
                     record.dtype
                 )
             })?;
+            let byte_len = usize::try_from(record.byte_len)
+                .context("Qwen3.5 prefix snapshot array byte length exceeds usize")?;
             let end = cursor
-                .checked_add(record.byte_len)
+                .checked_add(byte_len)
                 .context("Qwen3.5 prefix snapshot array byte range overflow")?;
             ensure!(
                 end <= body.len(),
@@ -905,6 +1161,13 @@ impl<'a> MetalRequestState<'a> {
         let was_active = state.driver.cpp_session_active();
         state.driver.ensure_cpp_session_drained()?;
         Ok(was_active)
+    }
+
+    pub(crate) fn can_import_qwen35_prefix_snapshot(&self) -> bool {
+        match &self.inner {
+            MetalRequestStateInner::Qwen35(state) => state.driver.can_import_prefix_snapshot(),
+            MetalRequestStateInner::Qwen3(_) => false,
+        }
     }
 
     pub fn finish_reason(&self) -> Option<&'static str> {
@@ -1370,22 +1633,102 @@ impl<'a> MetalRequestState<'a> {
         &self,
         block_size: usize,
     ) -> Result<Vec<Qwen35PrefixSnapshot>> {
+        let mut snapshots = Vec::new();
+        self.visit_qwen35_prompt_prefixes(block_size, |snapshot| {
+            snapshots.push(snapshot);
+            Ok(())
+        })?;
+        Ok(snapshots)
+    }
+
+    pub(crate) fn visit_qwen35_prompt_prefixes(
+        &self,
+        block_size: usize,
+        visit: impl FnMut(Qwen35PrefixSnapshot) -> Result<()>,
+    ) -> Result<()> {
         match &self.inner {
             MetalRequestStateInner::Qwen35(state) => {
-                if block_size == 0 {
-                    return Ok(Vec::new());
-                }
-                let aligned_len = (state.prompt_cursor / block_size) * block_size;
+                let aligned_len = longest_reusable_aligned_prefix_len(
+                    state.prompt_cursor,
+                    state.prompt_tokens.len(),
+                    block_size,
+                );
                 if aligned_len == 0 {
-                    return Ok(Vec::new());
+                    return Ok(());
                 }
-                state
-                    .driver
-                    .build_prefix_snapshots(&state.prompt_tokens[..aligned_len], block_size)
+                state.driver.stream_prefix_snapshots(
+                    &state.prompt_tokens[..aligned_len],
+                    block_size,
+                    visit,
+                )
+            }
+            MetalRequestStateInner::Qwen3(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn export_qwen35_disk_prompt_prefixes(
+        &self,
+        block_size: usize,
+    ) -> Result<Vec<Qwen35PrefixSnapshot>> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen35(state) => {
+                let target_lens = qwen35_disk_publish_prefix_lens(
+                    state.prompt_cursor,
+                    state.prompt_tokens.len(),
+                    block_size,
+                );
+                let Some(&aligned_len) = target_lens.last() else {
+                    return Ok(Vec::new());
+                };
+                let mut snapshots = Vec::with_capacity(target_lens.len());
+                state.driver.stream_prefix_snapshots_at_lengths(
+                    &state.prompt_tokens[..aligned_len],
+                    block_size,
+                    &target_lens,
+                    |snapshot| {
+                        snapshots.push(snapshot);
+                        Ok(())
+                    },
+                )?;
+                Ok(snapshots)
             }
             MetalRequestStateInner::Qwen3(_) => Ok(Vec::new()),
         }
     }
+}
+
+fn qwen35_disk_publish_prefix_lens(
+    prompt_cursor: usize,
+    prompt_len: usize,
+    block_size: usize,
+) -> Vec<usize> {
+    let aligned_len = longest_reusable_aligned_prefix_len(prompt_cursor, prompt_len, block_size);
+    if aligned_len == 0 {
+        return Vec::new();
+    }
+
+    let mut target_lens = Vec::with_capacity(2);
+    if aligned_len >= prompt_len {
+        let importable_len = aligned_len.saturating_sub(block_size);
+        if importable_len > 0 {
+            target_lens.push(importable_len);
+        }
+    }
+    if target_lens.last().copied() != Some(aligned_len) {
+        target_lens.push(aligned_len);
+    }
+    target_lens
+}
+
+fn longest_reusable_aligned_prefix_len(
+    prompt_cursor: usize,
+    prompt_len: usize,
+    block_size: usize,
+) -> usize {
+    if block_size == 0 {
+        return 0;
+    }
+    (prompt_cursor.min(prompt_len) / block_size) * block_size
 }
 
 fn decode_qwen3_batch(
@@ -3589,8 +3932,26 @@ impl<'a> Qwen35StepDriver<'a> {
         }
     }
 
+    fn drain_replay_after_result<T>(&mut self, result: Result<T>, label: &str) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if let Err(drain_err) = self.ensure_cpp_session_drained() {
+                    return Err(err).context(format!(
+                        "{label}; additionally failed to drain replay C++ session: {drain_err:#}"
+                    ));
+                }
+                Err(err)
+            }
+        }
+    }
+
     fn cpp_session_active(&self) -> bool {
         matches!(&self.mode, Qwen35StepMode::Cpp(state) if state.session_active)
+    }
+
+    fn can_import_prefix_snapshot(&self) -> bool {
+        matches!(self.mode, Qwen35StepMode::Cpp(_)) && self.weights.cpp_model.is_some()
     }
 
     fn run_cpp_step(
@@ -3780,11 +4141,29 @@ impl<'a> Qwen35StepDriver<'a> {
         }
     }
 
-    fn build_prefix_snapshots(
+    fn stream_prefix_snapshots(
         &self,
         prompt_tokens: &[u32],
         block_size: usize,
-    ) -> Result<Vec<Qwen35PrefixSnapshot>> {
+        visit: impl FnMut(Qwen35PrefixSnapshot) -> Result<()>,
+    ) -> Result<()> {
+        let target_lens: Vec<_> = if block_size == 0 {
+            Vec::new()
+        } else {
+            (block_size..=prompt_tokens.len())
+                .step_by(block_size)
+                .collect()
+        };
+        self.stream_prefix_snapshots_at_lengths(prompt_tokens, block_size, &target_lens, visit)
+    }
+
+    fn stream_prefix_snapshots_at_lengths(
+        &self,
+        prompt_tokens: &[u32],
+        block_size: usize,
+        target_lens: &[usize],
+        mut visit: impl FnMut(Qwen35PrefixSnapshot) -> Result<()>,
+    ) -> Result<()> {
         ensure!(
             block_size > 0,
             "Qwen3.5/Qwen3.6 prefix snapshot block size must be > 0"
@@ -3794,7 +4173,22 @@ impl<'a> Qwen35StepDriver<'a> {
             "Qwen3.5/Qwen3.6 prefix snapshot build requires a block-aligned prompt"
         );
         if !matches!(self.mode, Qwen35StepMode::Cpp(_)) || prompt_tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
+        }
+        let mut target_lens = target_lens.to_vec();
+        target_lens.sort_unstable();
+        target_lens.dedup();
+        if target_lens.is_empty() {
+            return Ok(());
+        }
+        for &target_len in &target_lens {
+            ensure!(
+                target_len > 0
+                    && target_len <= prompt_tokens.len()
+                    && target_len.is_multiple_of(block_size),
+                "Qwen3.5/Qwen3.6 selected prefix snapshot target {target_len} must be block-aligned and within {} tokens",
+                prompt_tokens.len()
+            );
         }
 
         // The compiled Qwen3.5/Qwen3.6 model owns exactly one live session.
@@ -3804,7 +4198,7 @@ impl<'a> Qwen35StepDriver<'a> {
         // Prefix publish is opportunistic, so skip replay-based export while
         // the live request still owns the compiled session.
         if self.cpp_session_active() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let mut replay = Qwen35StepDriver::new(
@@ -3816,21 +4210,29 @@ impl<'a> Qwen35StepDriver<'a> {
             None,
         )
         .context("build replay driver for Qwen3.5/Qwen3.6 prefix snapshots")?;
-        let mut snapshots = Vec::with_capacity(prompt_tokens.len() / block_size);
-
-        for chunk in prompt_tokens.chunks(block_size) {
-            replay
-                .prefill_tokens(chunk, false)
-                .context("replay Qwen3.5/Qwen3.6 prompt chunk for prefix snapshot")?;
-            let materialized = replay.cache_len as usize;
-            snapshots.push(
+        let result = (|| -> Result<()> {
+            let mut next_target = 0;
+            for chunk in prompt_tokens.chunks(block_size) {
                 replay
-                    .export_current_cpp_snapshot(prompt_tokens[..materialized].to_vec())
-                    .context("export replayed Qwen3.5/Qwen3.6 prefix snapshot")?,
+                    .prefill_tokens(chunk, false)
+                    .context("replay Qwen3.5/Qwen3.6 prompt chunk for prefix snapshot")?;
+                let materialized = replay.cache_len as usize;
+                if next_target < target_lens.len() && target_lens[next_target] == materialized {
+                    let snapshot = replay
+                        .export_current_cpp_snapshot(prompt_tokens[..materialized].to_vec())
+                        .context("export replayed Qwen3.5/Qwen3.6 prefix snapshot")?;
+                    visit(snapshot)?;
+                    next_target += 1;
+                }
+            }
+            ensure!(
+                next_target == target_lens.len(),
+                "Qwen3.5/Qwen3.6 prefix snapshot replay produced {next_target} of {} requested targets",
+                target_lens.len()
             );
-        }
-
-        Ok(snapshots)
+            Ok(())
+        })();
+        replay.drain_replay_after_result(result, "Qwen3.5/Qwen3.6 prefix snapshot replay")
     }
 }
 

@@ -41,7 +41,7 @@
 //!   I/O from an async context.
 //! - `io_uring` — deferred indefinitely per §4.3 course corrections.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::task::Poll;
 
@@ -88,6 +88,16 @@ impl DiskBlockHeader {
     }
 
     fn decode(bytes: &[u8]) -> io::Result<(Self, &[u8])> {
+        let (header, payload) = Self::decode_prefix(bytes)?;
+        let payload_len = usize::try_from(header.payload_len)
+            .map_err(|_| invalid_data("disk store: payload length exceeds platform usize"))?;
+        if payload.len() != payload_len {
+            return Err(invalid_data("disk store: payload length mismatch"));
+        }
+        Ok((header, payload))
+    }
+
+    fn decode_prefix(bytes: &[u8]) -> io::Result<(Self, &[u8])> {
         let (header, payload) = postcard::take_from_bytes::<DiskBlockHeader>(bytes)
             .map_err(|err| invalid_data(format!("disk store: failed to decode header: {err}")))?;
         if header.magic != DISK_BLOCK_MAGIC {
@@ -96,17 +106,52 @@ impl DiskBlockHeader {
         if header.version != DISK_BLOCK_VERSION {
             return Err(invalid_data("disk store: unsupported block version"));
         }
-        let payload_len = usize::try_from(header.payload_len)
-            .map_err(|_| invalid_data("disk store: payload length exceeds platform usize"))?;
-        if payload.len() != payload_len {
-            return Err(invalid_data("disk store: payload length mismatch"));
-        }
         Ok((header, payload))
     }
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn block_fingerprint_from_filename(name: &str) -> Option<BlockFingerprint> {
+    let stem = name.strip_suffix(".kv")?;
+    if stem.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (idx, pair) in stem.as_bytes().chunks_exact(2).enumerate() {
+        let hi = hex_value(pair[0])?;
+        let lo = hex_value(pair[1])?;
+        bytes[idx] = (hi << 4) | lo;
+    }
+    Some(BlockFingerprint(bytes))
+}
+
+fn same_existing_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn read_file_prefix(path: &Path, max_len: usize) -> io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(max_len.min(8192));
+    let limit = u64::try_from(max_len).unwrap_or(u64::MAX);
+    file.by_ref().take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn disk_error(err: &io::Error) -> TransportError {
@@ -216,6 +261,186 @@ impl DiskStore {
         self.block_path_for(fingerprint)?.try_exists()
     }
 
+    /// Visits every valid fingerprint-named block file currently under
+    /// the store root. Invalid filenames are ignored; block contents are
+    /// still validated with the normal postcard header before the
+    /// visitor sees the opaque payload.
+    pub fn visit_blocks(
+        &self,
+        mut visit: impl FnMut(DiskBlockLocation, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                continue;
+            };
+            let Some(fingerprint) = block_fingerprint_from_filename(name) else {
+                continue;
+            };
+
+            let canonical = self.block_path_for(fingerprint)?;
+            if !same_existing_path(&path, &canonical) {
+                return Err(invalid_data(
+                    "disk store: discovered block path outside canonical root",
+                ));
+            }
+
+            let bytes = match kv_native_sys::read_block(self.root(), fingerprint.0) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    log::debug!(
+                        "disk store: skipping unreadable block {}: {err}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let (header, payload) = match DiskBlockHeader::decode(&bytes) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    log::debug!(
+                        "disk store: skipping malformed block {}: {err}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if header.fingerprint != fingerprint.0 {
+                log::debug!("disk store: on-disk fingerprint does not match filename");
+                continue;
+            }
+
+            visit(
+                DiskBlockLocation {
+                    path: canonical,
+                    payload_len: header.payload_len,
+                    fingerprint,
+                },
+                payload,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Visits valid fingerprint-named block files but reads at most
+    /// `max_payload_prefix_len` bytes from each payload. This is intended for
+    /// startup indexing paths that only need caller-owned metadata near the
+    /// front of the payload and must not page in full KV snapshots.
+    pub fn visit_block_payload_prefixes(
+        &self,
+        max_payload_prefix_len: usize,
+        mut visit: impl FnMut(DiskBlockLocation, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        const BLOCK_HEADER_READ_SLOP: usize = 512;
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+
+        let max_file_prefix_len = max_payload_prefix_len.saturating_add(BLOCK_HEADER_READ_SLOP);
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                continue;
+            };
+            let Some(fingerprint) = block_fingerprint_from_filename(name) else {
+                continue;
+            };
+
+            let canonical = self.block_path_for(fingerprint)?;
+            if !same_existing_path(&path, &canonical) {
+                return Err(invalid_data(
+                    "disk store: discovered block path outside canonical root",
+                ));
+            }
+
+            let bytes = match read_file_prefix(&canonical, max_file_prefix_len) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    log::debug!(
+                        "disk store: skipping unreadable block {}: {err}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let (header, payload_prefix) = match DiskBlockHeader::decode_prefix(&bytes) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    log::debug!(
+                        "disk store: skipping malformed block {}: {err}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if header.fingerprint != fingerprint.0 {
+                log::debug!("disk store: on-disk fingerprint does not match filename");
+                continue;
+            }
+
+            let header_len = bytes.len().saturating_sub(payload_prefix.len());
+            let Some(expected_file_len) = u64::try_from(header_len)
+                .ok()
+                .and_then(|len| len.checked_add(header.payload_len))
+            else {
+                log::debug!(
+                    "disk store: skipping block {} with overflowing payload length",
+                    path.display()
+                );
+                continue;
+            };
+            let actual_file_len = match std::fs::metadata(&canonical) {
+                Ok(metadata) => metadata.len(),
+                Err(err) => {
+                    log::debug!(
+                        "disk store: skipping unstatable block {}: {err}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if actual_file_len != expected_file_len {
+                log::debug!(
+                    "disk store: skipping block {} with payload length mismatch",
+                    path.display()
+                );
+                continue;
+            }
+
+            let payload_prefix_len = payload_prefix
+                .len()
+                .min(max_payload_prefix_len)
+                .min(usize::try_from(header.payload_len).unwrap_or(usize::MAX));
+            visit(
+                DiskBlockLocation {
+                    path: canonical,
+                    payload_len: header.payload_len,
+                    fingerprint,
+                },
+                &payload_prefix[..payload_prefix_len],
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Writes a content-addressed block file and returns its stable disk
     /// location metadata. Writes are **crash-safe**: the payload is
     /// written to `<path>.tmp` first and then atomically renamed onto
@@ -226,6 +451,21 @@ impl DiskStore {
         fingerprint: BlockFingerprint,
         kv_format_tag: u8,
         payload: &[u8],
+    ) -> io::Result<DiskBlockLocation> {
+        self.put_block_with_fsync(fingerprint, kv_format_tag, payload, true)
+    }
+
+    /// Writes a content-addressed block, optionally skipping data and parent-dir
+    /// fsync. `fsync_each_block=false` still uses write-to-temp + rename so
+    /// readers never observe a partially written canonical block, but a crash
+    /// may lose the most recent cache entry. That tradeoff is only appropriate
+    /// for opportunistic caches that can fall back to recomputation.
+    pub fn put_block_with_fsync(
+        &self,
+        fingerprint: BlockFingerprint,
+        kv_format_tag: u8,
+        payload: &[u8],
+        fsync_each_block: bool,
     ) -> io::Result<DiskBlockLocation> {
         self.create_root()?;
 
@@ -239,7 +479,17 @@ impl DiskStore {
         file_bytes.extend_from_slice(payload);
 
         let path = self.block_path_for(fingerprint)?;
-        kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)?;
+        if fsync_each_block {
+            kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)?;
+        } else {
+            let tmp_path = path.with_extension("kv.tmp");
+            let write_result = std::fs::write(&tmp_path, &file_bytes)
+                .and_then(|()| std::fs::rename(&tmp_path, &path));
+            if let Err(err) = write_result {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        }
 
         Ok(DiskBlockLocation {
             path,
@@ -535,6 +785,27 @@ mod tests {
     }
 
     #[test]
+    fn put_block_with_fsync_false_roundtrips() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let kv_format_tag = 4;
+        let payload = b"relaxed-cache-write00000".to_vec();
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
+
+        let location = store
+            .put_block_with_fsync(fingerprint, kv_format_tag, &payload, false)
+            .expect("put relaxed block");
+
+        assert_eq!(
+            store
+                .get_block(&location, Some(fingerprint))
+                .expect("get relaxed block"),
+            payload
+        );
+        assert!(!location.path.with_extension("kv.tmp").exists());
+    }
+
+    #[test]
     fn contains_block_tracks_fingerprint_presence() {
         let dir = tempdir().unwrap();
         let store = DiskStore::new(dir.path());
@@ -561,6 +832,139 @@ mod tests {
                 .contains_block(fingerprint)
                 .expect("missing after delete")
         );
+    }
+
+    #[test]
+    fn visit_blocks_returns_valid_fingerprint_blocks() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let payload_a = b"payload-a000".to_vec();
+        let payload_b = b"payload-b000".to_vec();
+        let fingerprint_a = fingerprint_for_payload(&payload_a, 1);
+        let fingerprint_b = fingerprint_for_payload(&payload_b, 1);
+        store.put_block(fingerprint_a, 1, &payload_a).unwrap();
+        store.put_block(fingerprint_b, 1, &payload_b).unwrap();
+        fs::write(dir.path().join("not-a-block.txt"), b"ignored").unwrap();
+
+        let mut visited = Vec::new();
+        store
+            .visit_blocks(|location, payload| {
+                visited.push((location.fingerprint, payload.to_vec()));
+                Ok(())
+            })
+            .expect("visit blocks");
+        visited.sort_by_key(|(fingerprint, _)| fingerprint.0);
+
+        let mut expected = vec![(fingerprint_a, payload_a), (fingerprint_b, payload_b)];
+        expected.sort_by_key(|(fingerprint, _)| fingerprint.0);
+        assert_eq!(visited, expected);
+    }
+
+    #[test]
+    fn visit_blocks_accepts_trailing_slash_roots() {
+        let dir = tempdir().unwrap();
+        let root = PathBuf::from(format!("{}/", dir.path().display()));
+        let store = DiskStore::new(root);
+        let payload = b"payload-trailing-slash00".to_vec();
+        let fingerprint = fingerprint_for_payload(&payload, 1);
+        store.put_block(fingerprint, 1, &payload).unwrap();
+
+        let mut visited = Vec::new();
+        store
+            .visit_blocks(|location, payload| {
+                visited.push((location.fingerprint, payload.to_vec()));
+                Ok(())
+            })
+            .expect("visit trailing slash root");
+
+        assert_eq!(visited, vec![(fingerprint, payload)]);
+    }
+
+    #[test]
+    fn visit_block_payload_prefixes_avoids_full_payload_reads() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let payload = vec![7u8; 4096];
+        let fingerprint = fingerprint_for_payload(&payload, 1);
+        store.put_block(fingerprint, 1, &payload).unwrap();
+
+        let mut visited = Vec::new();
+        store
+            .visit_block_payload_prefixes(32, |location, payload_prefix| {
+                visited.push((location.fingerprint, payload_prefix.len()));
+                Ok(())
+            })
+            .expect("visit block payload prefixes");
+
+        assert_eq!(visited, vec![(fingerprint, 32)]);
+    }
+
+    #[test]
+    fn visit_block_payload_prefixes_skips_payload_len_mismatch() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        store.create_root().unwrap();
+        let payload = vec![7u8; 64];
+        let fingerprint = fingerprint_for_payload(&payload, 1);
+        let header = DiskBlockHeader {
+            magic: DISK_BLOCK_MAGIC,
+            version: DISK_BLOCK_VERSION,
+            fingerprint: fingerprint.0,
+            kv_format_tag: 1,
+            payload_len: 1024,
+        };
+        write_raw_block(
+            &store.block_path_for(fingerprint).unwrap(),
+            &header,
+            &payload,
+        );
+
+        let mut visited = 0usize;
+        store
+            .visit_block_payload_prefixes(32, |_, _| {
+                visited += 1;
+                Ok(())
+            })
+            .expect("visit block payload prefixes");
+
+        assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn visit_blocks_ignores_missing_root() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path().join("missing"));
+        let mut visited = 0usize;
+        store
+            .visit_blocks(|_, _| {
+                visited += 1;
+                Ok(())
+            })
+            .expect("missing root is empty");
+        assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn visit_blocks_skips_malformed_fingerprint_blocks() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let payload = b"valid-payload000".to_vec();
+        let valid_fingerprint = fingerprint_for_payload(&payload, 1);
+        store.put_block(valid_fingerprint, 1, &payload).unwrap();
+
+        let malformed_fingerprint = BlockFingerprint([0x11; 16]);
+        store.create_root().unwrap();
+        let malformed_path = store.block_path_for(malformed_fingerprint).unwrap();
+        fs::write(malformed_path, b"not a disk block").unwrap();
+
+        let mut visited = Vec::new();
+        store
+            .visit_blocks(|location, payload| {
+                visited.push((location.fingerprint, payload.to_vec()));
+                Ok(())
+            })
+            .expect("malformed block is skipped");
+        assert_eq!(visited, vec![(valid_fingerprint, payload)]);
     }
 
     #[test]

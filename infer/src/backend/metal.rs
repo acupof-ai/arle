@@ -139,6 +139,8 @@ pub use runtime::{
 pub struct MetalBackend {
     /// Local directory containing config.json, tokenizer.json, and weight shards.
     model_dir: Option<PathBuf>,
+    /// Exact resolved model source selected at load time (directory or GGUF file).
+    model_source_path: Option<PathBuf>,
     /// Tokenizer loaded from tokenizer.json.
     tokenizer: Option<Tokenizer>,
     /// Loaded model configuration.
@@ -186,6 +188,7 @@ impl MetalBackend {
 
         Self {
             model_dir: None,
+            model_source_path: None,
             tokenizer: None,
             config: None,
             #[cfg(feature = "metal")]
@@ -765,6 +768,7 @@ impl InferenceBackend for MetalBackend {
         self.tokenizer = Some(tokenizer);
         self.config = Some(config);
         self.model_dir = Some(source.model_root().to_path_buf());
+        self.model_source_path = Some(resolved_path.to_path_buf());
         Ok(())
     }
 

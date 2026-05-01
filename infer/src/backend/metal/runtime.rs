@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use log::{error, info, warn};
 use tokio::sync::mpsc;
 
@@ -21,12 +22,13 @@ use super::weights::MetalWeights;
 use super::{MetalBackend, MetalBackendOptions};
 use crate::backend::InferenceBackend;
 use crate::backend::runtime::StopChunkProcessor;
+use crate::kv_tier::transport::disk::{DiskBlockLocation, DiskStore};
 use crate::metrics::ServerMetrics;
 use crate::sampler::SamplingParams;
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
 use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
-use crate::types::{InferenceMode, RequestId};
+use crate::types::{BlockFingerprint, InferenceMode, KvContentContext, RequestId};
 
 struct PendingMetalRequest {
     delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
@@ -244,6 +246,8 @@ impl ActiveMetalRequest {
 
 const METAL_PREFIX_BLOCK_SIZE: usize = 16;
 const METAL_PREFIX_POOL_MULTIPLIER: usize = 4;
+const METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG: u8 = 0x35;
+const METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES: usize = 1024 * 1024;
 const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 
 enum PrefillChunkOutcome {
@@ -265,10 +269,23 @@ struct MetalQwen35CachedPrefix {
     last_used_tick: u64,
 }
 
+struct MetalQwen35DiskPrefix {
+    location: DiskBlockLocation,
+    last_used_tick: u64,
+}
+
 struct MetalQwen35PrefixRuntime {
     entries: HashMap<Vec<u32>, MetalQwen35CachedPrefix>,
+    disk_entries: HashMap<Vec<u32>, MetalQwen35DiskPrefix>,
+    disk_store: Option<Arc<DiskStore>>,
+    model_fingerprint: Vec<u8>,
+    max_disk_bytes: Option<u64>,
+    disk_high_watermark: f64,
+    disk_low_watermark: f64,
+    disk_fsync_each_block: bool,
     max_cached_tokens: usize,
     cached_tokens: usize,
+    disk_bytes: u64,
     next_tick: u64,
     block_size: usize,
 }
@@ -304,10 +321,40 @@ impl MetalLivePrefixRuntime {
                     "Metal live prefix cache enabled for Qwen3.5 snapshot replay: block_size={}, max_cached_tokens={}",
                     METAL_PREFIX_BLOCK_SIZE, max_total_tokens
                 );
+                let (
+                    disk_store,
+                    model_fingerprint,
+                    max_disk_bytes,
+                    disk_high_watermark,
+                    disk_low_watermark,
+                    disk_fsync_each_block,
+                ) = if let Some(options) = backend.kv_disk_options.as_ref() {
+                    let store = Arc::new(DiskStore::new(&options.dir));
+                    store.create_root().with_context(|| {
+                        format!("create Metal Qwen3.5 SSD KV dir {}", options.dir.display())
+                    })?;
+                    let model_fingerprint = metal_prefix_model_fingerprint(backend)?;
+                    (
+                        Some(store),
+                        model_fingerprint,
+                        options.max_bytes,
+                        options.high_watermark,
+                        options.low_watermark,
+                        options.fsync_each_block,
+                    )
+                } else {
+                    (None, Vec::new(), None, 0.90, 0.75, false)
+                };
                 Ok(Some(Self::Qwen35(MetalQwen35PrefixRuntime::new(
                     max_total_tokens,
                     METAL_PREFIX_BLOCK_SIZE,
-                ))))
+                    disk_store,
+                    model_fingerprint,
+                    max_disk_bytes,
+                    disk_high_watermark,
+                    disk_low_watermark,
+                    disk_fsync_each_block,
+                )?)))
             }
         }
     }
@@ -322,7 +369,7 @@ impl MetalLivePrefixRuntime {
         }
     }
 
-    fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
+    fn publish_prompt_prefix(&mut self, request: &mut ActiveMetalRequest) -> Result<()> {
         match self {
             MetalLivePrefixRuntime::Qwen35(runtime) => runtime.publish_prompt_prefix(request),
         }
@@ -330,14 +377,40 @@ impl MetalLivePrefixRuntime {
 }
 
 impl MetalQwen35PrefixRuntime {
-    fn new(max_cached_tokens: usize, block_size: usize) -> Self {
-        Self {
+    fn new(
+        max_cached_tokens: usize,
+        block_size: usize,
+        disk_store: Option<Arc<DiskStore>>,
+        model_fingerprint: Vec<u8>,
+        max_disk_bytes: Option<u64>,
+        disk_high_watermark: f64,
+        disk_low_watermark: f64,
+        disk_fsync_each_block: bool,
+    ) -> Result<Self> {
+        let mut runtime = Self {
             entries: HashMap::new(),
+            disk_entries: HashMap::new(),
+            disk_store,
+            model_fingerprint,
+            max_disk_bytes,
+            disk_high_watermark,
+            disk_low_watermark,
+            disk_fsync_each_block,
             max_cached_tokens,
             cached_tokens: 0,
+            disk_bytes: 0,
             next_tick: 1,
             block_size,
+        };
+        runtime.reconcile_disk_entries()?;
+        if runtime.disk_store.is_some() {
+            info!(
+                "Metal Qwen3.5 SSD prefix cache indexed {} entries ({} bytes)",
+                runtime.disk_entries.len(),
+                runtime.disk_bytes
+            );
         }
+        Ok(runtime)
     }
 
     fn prepare_request(
@@ -345,38 +418,81 @@ impl MetalQwen35PrefixRuntime {
         request: &mut ActiveMetalRequest,
         metrics: &ServerMetrics,
     ) -> Result<()> {
-        let prompt_tokens = &request.prompt_tokens;
-        if prompt_tokens.len() < self.block_size {
-            metrics.record_prefix_lookup(0, prompt_tokens.len());
+        let prompt_len = request.prompt_tokens.len();
+        if prompt_len < self.block_size {
+            metrics.record_prefix_lookup(0, prompt_len);
+            return Ok(());
+        }
+        if request.request_state.is_dflash_enabled() {
+            metrics.record_prefix_lookup(0, prompt_len);
+            return Ok(());
+        }
+        if !request.request_state.can_import_qwen35_prefix_snapshot() {
+            metrics.record_prefix_lookup(0, prompt_len);
             return Ok(());
         }
 
-        let Some(prefix_key) = self.lookup_longest_prefix(prompt_tokens) else {
-            metrics.record_prefix_lookup(0, prompt_tokens.len());
-            return Ok(());
-        };
+        let memory_key = self.lookup_longest_prefix(&request.prompt_tokens);
+        let disk_key = self.lookup_longest_disk_prefix(&request.prompt_tokens);
+        let memory_len = memory_key.as_ref().map_or(0, Vec::len);
+        let disk_len = disk_key.as_ref().map_or(0, Vec::len);
 
-        let imported =
-            if let Some(snapshot) = self.entries.get(&prefix_key).map(|entry| &entry.snapshot) {
-                request
-                    .request_state
-                    .import_qwen35_prefix_snapshot(snapshot, prefix_key.len())
-                    .context("import matched Qwen3.5 prefix snapshot into request state")?
-            } else {
-                false
-            };
-
-        let reused_tokens = if imported { prefix_key.len() } else { 0 };
-        metrics.record_prefix_lookup(reused_tokens, prompt_tokens.len());
-        if !imported {
-            return Ok(());
+        let mut reused_tokens = 0;
+        if disk_len > memory_len {
+            if let Some(prefix_key) = disk_key.as_deref() {
+                if self.try_import_disk_prefix_or_remove(prefix_key, request) {
+                    reused_tokens = prefix_key.len();
+                }
+            }
+            if reused_tokens == 0
+                && let Some(prefix_key) = memory_key.as_deref()
+                && self.try_import_memory_prefix(prefix_key, request)?
+            {
+                reused_tokens = prefix_key.len();
+            }
+        } else {
+            if let Some(prefix_key) = memory_key.as_deref()
+                && self.try_import_memory_prefix(prefix_key, request)?
+            {
+                reused_tokens = prefix_key.len();
+            }
+            if reused_tokens == 0
+                && let Some(prefix_key) = disk_key.as_deref()
+                && self.try_import_disk_prefix_or_remove(prefix_key, request)
+            {
+                reused_tokens = prefix_key.len();
+            }
         }
-
-        self.touch(&prefix_key);
+        metrics.record_prefix_lookup(reused_tokens, prompt_len);
         Ok(())
     }
 
-    fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
+    fn publish_prompt_prefix(&mut self, request: &mut ActiveMetalRequest) -> Result<()> {
+        if !request.request_state.can_import_qwen35_prefix_snapshot() {
+            return Ok(());
+        }
+
+        if self.disk_store.is_some() {
+            request
+                .request_state
+                .drain_qwen35_cpp_session()
+                .context("drain Qwen3.5 C++ session before SSD prefix export")?;
+            let snapshots = request
+                .request_state
+                .export_qwen35_disk_prompt_prefixes(self.block_size)
+                .context("export Qwen3.5 prompt prefix snapshots for SSD")?;
+            for snapshot in snapshots {
+                if let Err(err) = self.persist_snapshot(&snapshot) {
+                    warn!(
+                        "Metal Qwen3.5 SSD prefix publish failed for {} tokens: {err:#}",
+                        snapshot.token_ids.len()
+                    );
+                }
+                self.insert_snapshot(snapshot);
+            }
+            return Ok(());
+        }
+
         let snapshots = request
             .request_state
             .export_qwen35_prompt_prefixes(self.block_size)
@@ -398,6 +514,64 @@ impl MetalQwen35PrefixRuntime {
             })
             .max_by_key(|tokens| tokens.len())
             .cloned()
+    }
+
+    fn lookup_longest_disk_prefix(&self, prompt_tokens: &[u32]) -> Option<Vec<u32>> {
+        self.disk_entries
+            .keys()
+            .filter(|tokens| {
+                let prefix_len = tokens.len();
+                prefix_len >= self.block_size
+                    && prefix_len < prompt_tokens.len()
+                    && prompt_tokens.starts_with(tokens.as_slice())
+            })
+            .max_by_key(|tokens| tokens.len())
+            .cloned()
+    }
+
+    fn try_import_memory_prefix(
+        &mut self,
+        prefix_key: &[u32],
+        request: &mut ActiveMetalRequest,
+    ) -> Result<bool> {
+        let imported = {
+            let Some(snapshot) = self.entries.get(prefix_key).map(|entry| &entry.snapshot) else {
+                return Ok(false);
+            };
+            request
+                .request_state
+                .import_qwen35_prefix_snapshot(snapshot, prefix_key.len())
+                .context("import matched Qwen3.5 prefix snapshot into request state")?
+        };
+        if imported {
+            self.touch(prefix_key);
+        }
+        Ok(imported)
+    }
+
+    fn try_import_disk_prefix_or_remove(
+        &mut self,
+        prefix_key: &[u32],
+        request: &mut ActiveMetalRequest,
+    ) -> bool {
+        if !request.request_state.can_import_qwen35_prefix_snapshot() {
+            warn!(
+                "Metal Qwen3.5 SSD prefix import skipped for {} tokens: compiled step path unavailable",
+                prefix_key.len()
+            );
+            return false;
+        }
+        match self.try_import_disk_prefix(prefix_key, request) {
+            Ok(imported) => imported,
+            Err(err) => {
+                warn!(
+                    "Metal Qwen3.5 SSD prefix import failed for {} tokens: {err:#}",
+                    prefix_key.len()
+                );
+                self.remove_disk_entry(prefix_key);
+                false
+            }
+        }
     }
 
     fn insert_snapshot(&mut self, snapshot: Qwen35PrefixSnapshot) {
@@ -426,6 +600,151 @@ impl MetalQwen35PrefixRuntime {
         );
     }
 
+    fn persist_snapshot(&mut self, snapshot: &Qwen35PrefixSnapshot) -> Result<()> {
+        let Some(store) = self.disk_store.clone() else {
+            return Ok(());
+        };
+        let token_count = snapshot.token_ids.len();
+        if token_count < self.block_size || !token_count.is_multiple_of(self.block_size) {
+            return Ok(());
+        }
+
+        let key = snapshot.token_ids.clone();
+        if self.disk_entries.contains_key(&key) {
+            self.touch_disk(&key);
+            return Ok(());
+        }
+
+        let estimated_payload_len = snapshot
+            .estimated_disk_payload_len(&self.model_fingerprint)
+            .context("estimate Qwen3.5 prefix snapshot size for SSD")?;
+        if !self.ensure_disk_capacity_for(estimated_payload_len) {
+            return Ok(());
+        }
+
+        let payload = snapshot
+            .encode_for_disk(&self.model_fingerprint)
+            .context("encode Qwen3.5 prefix snapshot for SSD")?;
+        let payload_len =
+            u64::try_from(payload.len()).context("Qwen3.5 prefix snapshot payload too large")?;
+        if payload_len != estimated_payload_len && !self.ensure_disk_capacity_for(payload_len) {
+            return Ok(());
+        }
+
+        let fingerprint = self.fingerprint_for_tokens(&key);
+        let location = store
+            .put_block_with_fsync(
+                fingerprint,
+                METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
+                &payload,
+                self.disk_fsync_each_block,
+            )
+            .context("write Qwen3.5 prefix snapshot to DiskStore")?;
+        let tick = self.bump_tick();
+        self.disk_bytes = self.disk_bytes.saturating_add(location.payload_len);
+        self.disk_entries.insert(
+            key,
+            MetalQwen35DiskPrefix {
+                location,
+                last_used_tick: tick,
+            },
+        );
+        Ok(())
+    }
+
+    fn try_import_disk_prefix(
+        &mut self,
+        prefix_key: &[u32],
+        request: &mut ActiveMetalRequest,
+    ) -> Result<bool> {
+        let Some(store) = self.disk_store.clone() else {
+            return Ok(false);
+        };
+        let Some(location) = self
+            .disk_entries
+            .get(prefix_key)
+            .map(|entry| entry.location.clone())
+        else {
+            return Ok(false);
+        };
+        let expected = self.fingerprint_for_tokens(prefix_key);
+        let payload = store
+            .get_block(&location, Some(expected))
+            .context("read Qwen3.5 prefix snapshot from DiskStore")?;
+        let snapshot = Qwen35PrefixSnapshot::decode_from_disk(&payload, &self.model_fingerprint)
+            .context("decode Qwen3.5 prefix snapshot from DiskStore")?;
+        ensure!(
+            snapshot.token_ids == prefix_key,
+            "Qwen3.5 SSD prefix snapshot token key mismatch"
+        );
+
+        let imported = request
+            .request_state
+            .import_qwen35_prefix_snapshot(&snapshot, prefix_key.len())
+            .context("import matched Qwen3.5 SSD prefix snapshot into request state")?;
+        if imported {
+            self.touch_disk(prefix_key);
+            self.insert_snapshot(snapshot);
+        }
+        Ok(imported)
+    }
+
+    fn reconcile_disk_entries(&mut self) -> Result<()> {
+        let Some(store) = self.disk_store.clone() else {
+            return Ok(());
+        };
+        store
+            .visit_block_payload_prefixes(
+                METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES,
+                |location, payload| {
+                    let token_ids = match Qwen35PrefixSnapshot::peek_disk_token_ids(
+                        payload,
+                        &self.model_fingerprint,
+                    ) {
+                        Ok(token_ids) => token_ids,
+                        Err(err) => {
+                            log::debug!(
+                                "Metal Qwen3.5 SSD prefix cache ignored {}: {err:#}",
+                                location.path.display()
+                            );
+                            if Qwen35PrefixSnapshot::looks_like_disk_payload(payload) {
+                                delete_rejected_qwen35_disk_block(&store, &location);
+                            }
+                            return Ok(());
+                        }
+                    };
+                    if token_ids.len() < self.block_size
+                        || !token_ids.len().is_multiple_of(self.block_size)
+                    {
+                        delete_rejected_qwen35_disk_block(&store, &location);
+                        return Ok(());
+                    }
+                    let expected = self.fingerprint_for_tokens(&token_ids);
+                    if location.fingerprint != expected {
+                        log::debug!(
+                            "Metal Qwen3.5 SSD prefix cache ignored {}: fingerprint/token mismatch",
+                            location.path.display()
+                        );
+                        delete_rejected_qwen35_disk_block(&store, &location);
+                        return Ok(());
+                    }
+                    let tick = self.bump_tick();
+                    self.disk_bytes = self.disk_bytes.saturating_add(location.payload_len);
+                    self.disk_entries.insert(
+                        token_ids,
+                        MetalQwen35DiskPrefix {
+                            location,
+                            last_used_tick: tick,
+                        },
+                    );
+                    Ok(())
+                },
+            )
+            .context("scan Metal Qwen3.5 SSD prefix cache")?;
+        self.ensure_disk_capacity_for(0);
+        Ok(())
+    }
+
     fn ensure_capacity_for(&mut self, needed_tokens: usize) {
         while self.cached_tokens.saturating_add(needed_tokens) > self.max_cached_tokens {
             let Some((lru_key, lru_tokens)) = self
@@ -441,6 +760,35 @@ impl MetalQwen35PrefixRuntime {
         }
     }
 
+    fn ensure_disk_capacity_for(&mut self, needed_bytes: u64) -> bool {
+        let Some(max_bytes) = self.max_disk_bytes else {
+            return true;
+        };
+        let high = watermark_bytes(max_bytes, self.disk_high_watermark);
+        let low = watermark_bytes(max_bytes, self.disk_low_watermark);
+        if needed_bytes > high {
+            return false;
+        }
+        if self.disk_bytes.saturating_add(needed_bytes) <= high {
+            return true;
+        }
+
+        let target = low.saturating_sub(needed_bytes);
+        while self.disk_bytes > target {
+            let Some(lru_key) = self
+                .disk_entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_tick)
+                .map(|(tokens, _)| tokens.clone())
+            else {
+                break;
+            };
+            self.remove_disk_entry(&lru_key);
+        }
+
+        self.disk_bytes.saturating_add(needed_bytes) <= high
+    }
+
     fn touch(&mut self, key: &[u32]) {
         let tick = self.bump_tick();
         if let Some(entry) = self.entries.get_mut(key) {
@@ -448,11 +796,194 @@ impl MetalQwen35PrefixRuntime {
         }
     }
 
+    fn touch_disk(&mut self, key: &[u32]) {
+        let tick = self.bump_tick();
+        if let Some(entry) = self.disk_entries.get_mut(key) {
+            entry.last_used_tick = tick;
+        }
+    }
+
+    fn remove_disk_entry(&mut self, key: &[u32]) {
+        let Some(entry) = self.disk_entries.remove(key) else {
+            return;
+        };
+        self.disk_bytes = self.disk_bytes.saturating_sub(entry.location.payload_len);
+        if let Some(store) = self.disk_store.as_ref()
+            && let Err(err) = store.delete_block(&entry.location)
+        {
+            warn!(
+                "Metal Qwen3.5 SSD prefix cache failed to delete {}: {err:#}",
+                entry.location.path.display()
+            );
+        }
+    }
+
+    fn fingerprint_for_tokens(&self, token_ids: &[u32]) -> BlockFingerprint {
+        BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: &self.model_fingerprint,
+                kv_format_tag: METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
+                parent: None,
+            },
+            token_ids,
+        )
+    }
+
     fn bump_tick(&mut self) -> u64 {
         let tick = self.next_tick;
         self.next_tick = self.next_tick.saturating_add(1);
         tick
     }
+}
+
+fn watermark_bytes(max_bytes: u64, watermark: f64) -> u64 {
+    ((max_bytes as f64) * watermark).ceil() as u64
+}
+
+fn delete_rejected_qwen35_disk_block(store: &DiskStore, location: &DiskBlockLocation) {
+    if let Err(err) = store.delete_block(location) {
+        warn!(
+            "Metal Qwen3.5 SSD prefix cache failed to delete rejected block {}: {err}",
+            location.path.display()
+        );
+    }
+}
+
+fn metal_prefix_model_fingerprint(backend: &MetalBackend) -> Result<Vec<u8>> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"arle-metal-qwen35-prefix-v1\0");
+    if let Some(config) = backend.config.as_ref() {
+        hasher.update(b"config\0");
+        hasher.update(format!("{config:?}").as_bytes());
+    }
+    if let Some(source_path) = backend.model_source_path.as_deref() {
+        hasher.update(b"selected-source\0");
+        hasher.update(source_path.to_string_lossy().as_bytes());
+        hash_model_file_identity(&mut hasher, source_path)
+            .with_context(|| format!("fingerprint selected model {}", source_path.display()))?;
+    }
+    let selected_file = backend
+        .model_source_path
+        .as_deref()
+        .filter(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()));
+    if let Some(model_dir) = backend.model_dir.as_deref() {
+        hasher.update(b"model-root\0");
+        hasher.update(model_dir.to_string_lossy().as_bytes());
+        hash_model_tree_metadata(&mut hasher, model_dir, selected_file)
+            .with_context(|| format!("fingerprint Metal model tree {}", model_dir.display()))?;
+    }
+    Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+fn hash_model_tree_metadata(
+    hasher: &mut blake3::Hasher,
+    root: &Path,
+    selected_file: Option<&Path>,
+) -> Result<()> {
+    let mut files = Vec::new();
+    collect_model_files(root, root, selected_file, &mut files)?;
+    files.sort();
+    for relative in files {
+        let path = root.join(&relative);
+        hasher.update(b"file\0");
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hash_model_file_identity(hasher, &path)?;
+    }
+    Ok(())
+}
+
+fn hash_model_file_identity(hasher: &mut blake3::Hasher, path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.is_file() {
+        hasher.update(b"not-file\0");
+        return Ok(());
+    }
+    hasher.update(&metadata.len().to_le_bytes());
+    if should_hash_model_file_contents(path) {
+        hasher.update(b"content-blake3\0");
+        let mut file =
+            std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut file_hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("read {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            file_hasher.update(&buffer[..read]);
+        }
+        let file_hash = file_hasher.finalize();
+        hasher.update(file_hash.as_bytes());
+    }
+    Ok(())
+}
+
+fn collect_model_files(
+    root: &Path,
+    path: &Path,
+    selected_file: Option<&Path>,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if metadata.is_file() {
+        if should_include_model_tree_file(path, selected_file) {
+            out.push(path.strip_prefix(root).unwrap_or(path).to_path_buf());
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry?;
+        collect_model_files(root, &entry.path(), selected_file, out)?;
+    }
+    Ok(())
+}
+
+fn should_include_model_tree_file(path: &Path, selected_file: Option<&Path>) -> bool {
+    if !is_model_fingerprint_file(path) {
+        return false;
+    }
+    if let Some(selected_file) = selected_file {
+        if same_model_file(path, selected_file) || is_model_weight_file(path) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_model_fingerprint_file(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(extension, "json" | "safetensors" | "gguf" | "txt" | "model")
+}
+
+fn is_model_weight_file(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(extension, "safetensors" | "gguf")
+}
+
+fn same_model_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn should_hash_model_file_contents(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(extension, "json" | "safetensors" | "gguf" | "txt" | "model")
 }
 
 /// Spawn the first live Metal scheduler runtime.
@@ -1071,7 +1602,7 @@ fn execute_mixed_batch(
             return true;
         }
         if let Some(prefix_runtime) = prefix_runtime.as_mut()
-            && let Err(err) = prefix_runtime.publish_prompt_prefix(&prefill_request)
+            && let Err(err) = prefix_runtime.publish_prompt_prefix(&mut prefill_request)
         {
             warn!(
                 "Metal live prefix publish failed for {:?}: {err:#}",
@@ -1350,7 +1881,7 @@ fn execute_prefill_chunk(
         } => {
             if let Some(_token) = emitted_token {
                 if let Some(prefix_runtime) = prefix_runtime.as_mut()
-                    && let Some(request) = active.get(&req_id)
+                    && let Some(request) = active.get_mut(&req_id)
                     && let Err(err) = prefix_runtime.publish_prompt_prefix(request)
                 {
                     warn!("Metal live prefix publish failed for {:?}: {err:#}", req_id);
@@ -2114,4 +2645,122 @@ fn send_text_delta_with_ids(
             token_ids,
         })
         .map_err(|_| anyhow!("stream consumer dropped"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::metal::mlx::MlxArray;
+    use crate::test_support::metal_test_guard;
+    use tempfile::tempdir;
+
+    #[test]
+    fn qwen35_disk_prefix_runtime_reconciles_persisted_snapshot_headers() {
+        let _guard = metal_test_guard();
+        let dir = tempdir().expect("tempdir");
+        let store = Arc::new(DiskStore::new(dir.path()));
+        let model_fingerprint = b"qwen35-test-model".to_vec();
+        let mut runtime = MetalQwen35PrefixRuntime::new(
+            64,
+            2,
+            Some(store.clone()),
+            model_fingerprint.clone(),
+            None,
+            0.90,
+            0.75,
+            false,
+        )
+        .expect("runtime");
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![11, 12],
+            kv_flat: vec![MlxArray::from_slice_i32(&[1, 2], &[2])],
+            gdr_flat: Vec::new(),
+            cache_len: 2,
+            kv_capacity: 2,
+        };
+
+        runtime.persist_snapshot(&snapshot).expect("persist");
+        assert!(runtime.disk_entries.contains_key(&vec![11, 12]));
+        let qwen35_fingerprint = runtime.fingerprint_for_tokens(&[11, 12]);
+        let foreign_fingerprint = BlockFingerprint([0x7a; 16]);
+        store
+            .put_block_with_fsync(foreign_fingerprint, 0x99, b"not-a-qwen35-snapshot", false)
+            .expect("persist foreign block");
+        let disk_bytes = runtime.disk_bytes;
+        assert!(disk_bytes > 0);
+
+        let restored = MetalQwen35PrefixRuntime::new(
+            64,
+            2,
+            Some(store.clone()),
+            model_fingerprint,
+            None,
+            0.90,
+            0.75,
+            false,
+        )
+        .expect("restored runtime");
+        assert!(restored.disk_entries.contains_key(&vec![11, 12]));
+        assert_eq!(restored.disk_bytes, disk_bytes);
+
+        let wrong_model = MetalQwen35PrefixRuntime::new(
+            64,
+            2,
+            Some(store.clone()),
+            b"other-model".to_vec(),
+            None,
+            0.90,
+            0.75,
+            false,
+        )
+        .expect("wrong-model runtime");
+        assert!(wrong_model.disk_entries.is_empty());
+        assert!(
+            !store
+                .contains_block(qwen35_fingerprint)
+                .expect("stat stale block"),
+            "wrong-model Qwen3.5 snapshot blocks should be discarded during reconciliation"
+        );
+        assert!(
+            store
+                .contains_block(foreign_fingerprint)
+                .expect("stat foreign block"),
+            "non-Qwen3.5 DiskStore blocks should not be deleted by Qwen3.5 reconciliation"
+        );
+    }
+
+    #[test]
+    fn metal_prefix_model_fingerprint_binds_selected_source_without_mtime() {
+        let dir = tempdir().expect("tempdir");
+        let gguf_a = dir.path().join("a.gguf");
+        let gguf_b = dir.path().join("b.gguf");
+        let tokenizer = dir.path().join("_gguf_tokenizer.json");
+        std::fs::write(&gguf_a, b"same-size-a").expect("write a");
+        std::fs::write(&gguf_b, b"same-size-b").expect("write b");
+        std::fs::write(&tokenizer, br#"{"tokenizer":"stable"}"#).expect("write tokenizer");
+
+        let mut backend = MetalBackend::with_options(MetalBackendOptions::default());
+        backend.model_dir = Some(dir.path().to_path_buf());
+        backend.model_source_path = Some(gguf_a.clone());
+        let fp_a = metal_prefix_model_fingerprint(&backend).expect("fingerprint a");
+
+        std::fs::write(&tokenizer, br#"{"tokenizer":"stable"}"#).expect("rewrite tokenizer");
+        let fp_a_after_rewrite =
+            metal_prefix_model_fingerprint(&backend).expect("fingerprint a after rewrite");
+        assert_eq!(fp_a, fp_a_after_rewrite);
+
+        std::fs::write(&gguf_b, b"same-size-z").expect("replace unrelated b same size");
+        let fp_a_after_unrelated_weight =
+            metal_prefix_model_fingerprint(&backend).expect("fingerprint a after unrelated b");
+        assert_eq!(fp_a, fp_a_after_unrelated_weight);
+
+        std::fs::write(&gguf_a, b"same-size-c").expect("replace a same size");
+        let fp_a_replaced =
+            metal_prefix_model_fingerprint(&backend).expect("fingerprint a after replacement");
+        assert_ne!(fp_a, fp_a_replaced);
+
+        backend.model_source_path = Some(gguf_b);
+        let fp_b = metal_prefix_model_fingerprint(&backend).expect("fingerprint b");
+        assert_ne!(fp_a, fp_b);
+    }
 }
