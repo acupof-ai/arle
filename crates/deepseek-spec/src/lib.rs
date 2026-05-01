@@ -8,6 +8,8 @@ use thiserror::Error;
 pub enum DeepSeekConfigError {
     #[error("invalid deepseek config: {0}")]
     InvalidConfig(&'static str),
+    #[error("invalid deepseek MoE forward batch: {0}")]
+    InvalidForwardBatch(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -239,6 +241,190 @@ impl ExpertParallelConfig {
         (world_size > 0 && self.num_experts.is_multiple_of(world_size))
             .then_some(self.num_experts / world_size)
     }
+
+    pub fn local_expert_range(
+        &self,
+        rank: usize,
+        world_size: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let experts_per_rank = self.experts_per_rank(world_size)?;
+        (rank < world_size).then_some(rank * experts_per_rank..(rank + 1) * experts_per_rank)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DeepSeekMoeRoute {
+    pub token_idx: usize,
+    pub expert_idx: usize,
+    pub weight: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeepSeekMoeForwardBatch {
+    pub layer_idx: usize,
+    pub token_count: usize,
+    pub hidden_size: usize,
+    pub routes: Vec<DeepSeekMoeRoute>,
+    pub include_shared_experts: bool,
+}
+
+impl DeepSeekMoeForwardBatch {
+    pub fn from_config(
+        config: &DeepSeekConfig,
+        layer_idx: usize,
+        token_count: usize,
+        routes: impl Into<Vec<DeepSeekMoeRoute>>,
+    ) -> Self {
+        Self {
+            layer_idx,
+            token_count,
+            hidden_size: config.hidden_size,
+            routes: routes.into(),
+            include_shared_experts: config.n_shared_experts > 0,
+        }
+    }
+
+    pub fn validate_against(&self, config: &DeepSeekConfig) -> Result<()> {
+        let total_forward_layers = config.num_hidden_layers + config.num_nextn_predict_layers;
+        if self.layer_idx >= total_forward_layers {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "layer {} out of range for total forward layers {}",
+                self.layer_idx, total_forward_layers
+            )));
+        }
+        if !config.is_moe_layer(self.layer_idx) {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "layer {} is not a MoE layer",
+                self.layer_idx
+            )));
+        }
+        if self.hidden_size != config.hidden_size {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "hidden_size {} does not match config hidden_size {}",
+                self.hidden_size, config.hidden_size
+            )));
+        }
+        let expected_shared_experts = config.n_shared_experts > 0;
+        if self.include_shared_experts != expected_shared_experts {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "include_shared_experts {} does not match config shared expert requirement {}",
+                self.include_shared_experts, expected_shared_experts
+            )));
+        }
+        let mut routes_per_token = vec![0_usize; self.token_count];
+        let mut experts_per_token = vec![Vec::<usize>::new(); self.token_count];
+        for route in &self.routes {
+            if route.token_idx >= self.token_count {
+                return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                    "route token {} out of range for token_count {}",
+                    route.token_idx, self.token_count
+                )));
+            }
+            if route.expert_idx >= config.num_experts {
+                return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                    "route expert {} out of range for num_experts {}",
+                    route.expert_idx, config.num_experts
+                )));
+            }
+            if !route.weight.is_finite() || route.weight < 0.0 {
+                return Err(DeepSeekConfigError::InvalidForwardBatch(
+                    "route weight must be finite and non-negative".to_string(),
+                ));
+            }
+            if experts_per_token[route.token_idx].contains(&route.expert_idx) {
+                return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                    "token {} routes to expert {} more than once",
+                    route.token_idx, route.expert_idx
+                )));
+            }
+            routes_per_token[route.token_idx] += 1;
+            experts_per_token[route.token_idx].push(route.expert_idx);
+        }
+        for (token_idx, route_count) in routes_per_token.into_iter().enumerate() {
+            if route_count != config.num_experts_per_tok {
+                return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                    "token {token_idx} route count {route_count} does not match num_experts_per_tok {}",
+                    config.num_experts_per_tok
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn expert_inputs(&self) -> Vec<DeepSeekExpertForwardInput> {
+        let mut inputs = Vec::new();
+        for route in &self.routes {
+            if let Some(input_idx) = inputs
+                .iter()
+                .position(|input: &DeepSeekExpertForwardInput| input.expert_idx == route.expert_idx)
+            {
+                inputs[input_idx].token_indices.push(route.token_idx);
+                inputs[input_idx].route_weights.push(route.weight);
+            } else {
+                inputs.push(DeepSeekExpertForwardInput {
+                    expert_idx: route.expert_idx,
+                    token_indices: vec![route.token_idx],
+                    route_weights: vec![route.weight],
+                });
+            }
+        }
+        inputs.sort_by_key(|input| input.expert_idx);
+        inputs
+    }
+
+    pub fn ep_forward_plan(
+        &self,
+        config: &DeepSeekConfig,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<DeepSeekMoeForwardPlan> {
+        self.validate_against(config)?;
+        let ep = config.expert_parallel_config();
+        let local_experts = ep.local_expert_range(rank, world_size).ok_or_else(|| {
+            DeepSeekConfigError::InvalidForwardBatch(format!(
+                "cannot place {} experts across world_size {} rank {}",
+                ep.num_experts, world_size, rank
+            ))
+        })?;
+        let local_expert_indices: Vec<_> = local_experts.collect();
+        let local_inputs = self
+            .expert_inputs()
+            .into_iter()
+            .filter(|input| local_expert_indices.contains(&input.expert_idx))
+            .collect();
+        Ok(DeepSeekMoeForwardPlan {
+            layer_idx: self.layer_idx,
+            rank,
+            world_size,
+            local_experts: local_expert_indices,
+            local_inputs,
+            include_shared_experts: self.include_shared_experts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeepSeekExpertForwardInput {
+    pub expert_idx: usize,
+    pub token_indices: Vec<usize>,
+    pub route_weights: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepSeekExpertForwardOutput {
+    pub expert_idx: usize,
+    pub token_indices: Vec<usize>,
+    pub hidden_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeepSeekMoeForwardPlan {
+    pub layer_idx: usize,
+    pub rank: usize,
+    pub world_size: usize,
+    pub local_experts: Vec<usize>,
+    pub local_inputs: Vec<DeepSeekExpertForwardInput>,
+    pub include_shared_experts: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,6 +753,20 @@ mod tests {
         "num_nextn_predict_layers": 1
     }"#;
 
+    fn topk_routes(
+        token_idx: usize,
+        expert_indices: impl IntoIterator<Item = usize>,
+    ) -> Vec<DeepSeekMoeRoute> {
+        expert_indices
+            .into_iter()
+            .map(|expert_idx| DeepSeekMoeRoute {
+                token_idx,
+                expert_idx,
+                weight: 1.0,
+            })
+            .collect()
+    }
+
     #[test]
     fn parses_deepseek_v3_reference_config() {
         let cfg = DeepSeekConfig::from_json_str(DEEPSEEK_V3_CONFIG).unwrap();
@@ -653,6 +853,160 @@ mod tests {
         assert_eq!(ep.experts_per_rank(7), None);
         assert!(!ep.is_moe_layer(2));
         assert!(ep.is_moe_layer(3));
+    }
+
+    #[test]
+    fn moe_forward_batch_groups_routes_by_expert() {
+        let cfg = DeepSeekConfig::from_json_str(DEEPSEEK_V3_CONFIG).unwrap();
+        let batch = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            3,
+            2,
+            topk_routes(0, 17..25)
+                .into_iter()
+                .chain(topk_routes(1, [17, 32, 33, 34, 35, 36, 37, 38]))
+                .collect::<Vec<_>>(),
+        );
+
+        batch.validate_against(&cfg).unwrap();
+        assert_eq!(batch.hidden_size, 7168);
+        assert!(batch.include_shared_experts);
+
+        let inputs = batch.expert_inputs();
+        let expert17 = inputs.iter().find(|input| input.expert_idx == 17).unwrap();
+        let expert32 = inputs.iter().find(|input| input.expert_idx == 32).unwrap();
+        assert_eq!(expert17.token_indices, vec![0, 1]);
+        assert_eq!(expert17.route_weights, vec![1.0, 1.0]);
+        assert_eq!(expert32.token_indices, vec![1]);
+    }
+
+    #[test]
+    fn moe_forward_plan_filters_local_ep_experts() {
+        let cfg = DeepSeekConfig::from_json_str(DEEPSEEK_V3_CONFIG).unwrap();
+        let batch = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            3,
+            2,
+            topk_routes(0, 10..18)
+                .into_iter()
+                .chain(topk_routes(1, 34..42))
+                .collect::<Vec<_>>(),
+        );
+
+        let rank0 = batch.ep_forward_plan(&cfg, 0, 8).unwrap();
+        let rank1 = batch.ep_forward_plan(&cfg, 1, 8).unwrap();
+
+        assert_eq!(rank0.local_experts, (0..32).collect::<Vec<_>>());
+        assert_eq!(rank0.local_inputs.len(), 8);
+        assert!(
+            rank0
+                .local_inputs
+                .iter()
+                .any(|input| input.expert_idx == 17)
+        );
+        assert_eq!(rank1.local_experts, (32..64).collect::<Vec<_>>());
+        assert_eq!(rank1.local_inputs.len(), 8);
+        assert!(
+            rank1
+                .local_inputs
+                .iter()
+                .any(|input| input.expert_idx == 41)
+        );
+
+        let mtp_batch = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            cfg.num_hidden_layers,
+            1,
+            topk_routes(0, 0..8),
+        );
+        assert!(mtp_batch.validate_against(&cfg).is_ok());
+    }
+
+    #[test]
+    fn moe_forward_batch_rejects_invalid_routes() {
+        let cfg = DeepSeekConfig::from_json_str(DEEPSEEK_V3_CONFIG).unwrap();
+        let dense_layer = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            2,
+            1,
+            vec![DeepSeekMoeRoute {
+                token_idx: 0,
+                expert_idx: 0,
+                weight: 1.0,
+            }],
+        );
+        assert!(dense_layer.validate_against(&cfg).is_err());
+
+        let invalid_expert = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            3,
+            1,
+            vec![DeepSeekMoeRoute {
+                token_idx: 0,
+                expert_idx: 256,
+                weight: 1.0,
+            }],
+        );
+        assert!(invalid_expert.validate_against(&cfg).is_err());
+
+        let invalid_token = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            3,
+            1,
+            vec![DeepSeekMoeRoute {
+                token_idx: 1,
+                expert_idx: 0,
+                weight: 1.0,
+            }],
+        );
+        assert!(invalid_token.validate_against(&cfg).is_err());
+
+        let invalid_layer =
+            DeepSeekMoeForwardBatch::from_config(&cfg, 999, 1, topk_routes(0, 0..8));
+        assert!(invalid_layer.validate_against(&cfg).is_err());
+
+        let mut negative_weight =
+            DeepSeekMoeForwardBatch::from_config(&cfg, 3, 1, topk_routes(0, 0..8));
+        negative_weight.routes[0].weight = -1.0;
+        assert!(negative_weight.validate_against(&cfg).is_err());
+
+        let overloaded_token = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            3,
+            2,
+            (0..9)
+                .map(|expert_idx| DeepSeekMoeRoute {
+                    token_idx: 0,
+                    expert_idx,
+                    weight: 1.0,
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert!(overloaded_token.validate_against(&cfg).is_err());
+
+        let duplicate_expert = DeepSeekMoeForwardBatch::from_config(
+            &cfg,
+            3,
+            1,
+            vec![
+                DeepSeekMoeRoute {
+                    token_idx: 0,
+                    expert_idx: 0,
+                    weight: 0.5,
+                },
+                DeepSeekMoeRoute {
+                    token_idx: 0,
+                    expert_idx: 0,
+                    weight: 0.5,
+                },
+            ],
+        );
+        assert!(duplicate_expert.validate_against(&cfg).is_err());
+
+        let mut missing_shared =
+            DeepSeekMoeForwardBatch::from_config(&cfg, 3, 1, topk_routes(0, 0..8));
+        missing_shared.include_shared_experts = false;
+        assert!(missing_shared.validate_against(&cfg).is_err());
     }
 
     #[test]
