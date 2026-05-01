@@ -87,6 +87,9 @@ pub struct BatchDecodeBuffers {
     /// Packed page-aware metadata for quantized decode kernels:
     /// `[page_indptr..., last_page_len...]`.
     quantized_kv_meta: CudaSlice<i32>,
+    /// One-shot marker for sparse decode calls whose quantized metadata was
+    /// uploaded by `prepare_sparse_decode_context`.
+    sparse_quantized_meta_once: bool,
 
     /// Max batch size this buffer set was allocated for.
     max_batch_size: usize,
@@ -387,6 +390,7 @@ impl BatchDecodeBuffers {
                 .stream
                 .alloc_zeros(2 * max_batch_size + 1)
                 .map_err(|e| anyhow::anyhow!("Alloc quantized_kv_meta failed: {e}"))?,
+            sparse_quantized_meta_once: false,
 
             max_batch_size,
             max_total_pages,
@@ -409,6 +413,30 @@ impl BatchDecodeBuffers {
         self.gate_out.seq_len = batch_size;
         self.up_out.seq_len = batch_size;
         self.act_out.seq_len = batch_size;
+    }
+
+    fn upload_sparse_quantized_meta(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot_idx: usize,
+        sparse_page_indices: &[u32],
+    ) -> Result<()> {
+        let slot_pages = pool.page_indices(slot_idx);
+        let tail_page = slot_pages.last().copied().ok_or_else(|| {
+            anyhow::anyhow!("sparse quantized decode slot {slot_idx} has no pages")
+        })?;
+        let last_page_len = if sparse_page_indices.last().copied() == Some(tail_page) {
+            pool.build_last_page_lens(&[slot_idx])[0]
+        } else {
+            pool.page_size as i32
+        };
+        let packed = [0, sparse_page_indices.len() as i32, last_page_len];
+        ctx.stream
+            .memcpy_htod(&packed, &mut self.quantized_kv_meta)
+            .map_err(|e| anyhow::anyhow!("H2D sparse quantized_kv_meta: {e}"))?;
+        self.sparse_quantized_meta_once = true;
+        Ok(())
     }
 
     fn ensure_mixed_buffers(
@@ -438,6 +466,22 @@ impl BatchDecodeBuffers {
     }
 }
 
+fn upload_decode_quantized_meta(
+    ctx: &DeviceContext,
+    pool: &PagedKVPool,
+    slot_indices: &[usize],
+    bufs: &mut BatchDecodeBuffers,
+) -> Result<()> {
+    if std::mem::take(&mut bufs.sparse_quantized_meta_once) {
+        return Ok(());
+    }
+    let packed = pool.build_quantized_decode_indptr(slot_indices);
+    ctx.stream
+        .memcpy_htod(&packed, &mut bufs.quantized_kv_meta)
+        .map_err(|e| anyhow::anyhow!("H2D quantized_kv_meta: {e}"))?;
+    Ok(())
+}
+
 impl crate::model::DecodeContextOps for BatchDecodeBuffers {
     fn upload_token_ids(&mut self, ctx: &DeviceContext, tokens: &[u32]) -> Result<()> {
         self.token_ids_scratch.clear();
@@ -455,6 +499,7 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         pool: &PagedKVPool,
         slot_indices: &[usize],
     ) -> Result<bool> {
+        self.sparse_quantized_meta_once = false;
         self.metadata.update(ctx, pool, slot_indices)
     }
 
@@ -534,6 +579,48 @@ impl Qwen3Model {
         bufs.plan_attention(
             &self.ctx,
             tokens.len(),
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            paged_kv_pool.page_size,
+            self.config.head_dim,
+            paged_kv_pool.format,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_sparse_decode_context(
+        &self,
+        token: u32,
+        slot_idx: usize,
+        sparse_page_indices: &[u32],
+        paged_kv_pool: &PagedKVPool,
+        bufs: &mut BatchDecodeBuffers,
+    ) -> Result<()> {
+        use crate::model::DecodeContextOps;
+
+        bufs.set_batch_size(1);
+        bufs.upload_token_ids(&self.ctx, &[token])?;
+        let reallocated = bufs.metadata.update_sparse_single(
+            &self.ctx,
+            paged_kv_pool,
+            slot_idx,
+            sparse_page_indices,
+        )?;
+        if reallocated {
+            bufs.invalidate_graph_cache(1);
+        }
+        if matches!(paged_kv_pool.format, KVFormat::INT8 | KVFormat::FP8E4M3) {
+            bufs.upload_sparse_quantized_meta(
+                &self.ctx,
+                paged_kv_pool,
+                slot_idx,
+                sparse_page_indices,
+            )?;
+        }
+        bufs.force_eager_once();
+        bufs.plan_attention(
+            &self.ctx,
+            1,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
             paged_kv_pool.page_size,
@@ -1158,11 +1245,7 @@ impl Qwen3Model {
         // DeviceVecs which CUDA Graph capture rejects.
         if self.lora.is_some() {
             if matches!(paged_kv_pool.format, KVFormat::INT8 | KVFormat::FP8E4M3) {
-                let packed = paged_kv_pool.build_quantized_decode_indptr(slot_indices);
-                self.ctx
-                    .stream
-                    .memcpy_htod(&packed, &mut bufs.quantized_kv_meta)
-                    .map_err(|e| anyhow::anyhow!("H2D quantized_kv_meta: {e}"))?;
+                upload_decode_quantized_meta(&self.ctx, paged_kv_pool, slot_indices, bufs)?;
             }
             bufs.embedding_out.seq_len = batch_size;
             if bufs.logits_batch.is_none() {
@@ -1193,11 +1276,7 @@ impl Qwen3Model {
         // plan_attention are now called by the scheduler via DecodeContextOps
         // before this method is invoked.
         if matches!(paged_kv_pool.format, KVFormat::INT8 | KVFormat::FP8E4M3) {
-            let packed = paged_kv_pool.build_quantized_decode_indptr(slot_indices);
-            self.ctx
-                .stream
-                .memcpy_htod(&packed, &mut bufs.quantized_kv_meta)
-                .map_err(|e| anyhow::anyhow!("H2D quantized_kv_meta: {e}"))?;
+            upload_decode_quantized_meta(&self.ctx, paged_kv_pool, slot_indices, bufs)?;
         }
 
         bufs.embedding_out.seq_len = batch_size;

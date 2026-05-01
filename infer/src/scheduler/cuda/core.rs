@@ -293,7 +293,7 @@ impl<M: ModelForward> Scheduler<M> {
             .collect()
     }
 
-    fn flattened_pages_for_blocks(&self, blocks: &[BlockId]) -> Result<Vec<u32>> {
+    pub(super) fn flattened_pages_for_blocks(&self, blocks: &[BlockId]) -> Result<Vec<u32>> {
         let mut pages = Vec::new();
         for &block_id in blocks {
             let block_pages = self.block_to_pages.get(&block_id).ok_or_else(|| {

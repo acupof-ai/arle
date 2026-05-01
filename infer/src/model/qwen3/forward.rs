@@ -8,7 +8,7 @@ use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
     GenerationState, MixedBatchRequest, ModelForward, PrefillBatchRequest,
-    SchedulerRuntimeWorkspaceBudget, SpecVerifyOutput, SpecVerifyRequest,
+    SchedulerRuntimeWorkspaceBudget, SparseKvDraftView, SpecVerifyOutput, SpecVerifyRequest,
     decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
 use crate::ops;
@@ -113,6 +113,52 @@ impl ModelForward for Qwen3Model {
             self.forward_prefill(tokens, state)?;
         }
         Ok((tokens.to_vec(), state.logits().clone()))
+    }
+
+    fn forward_sparse_decode_with_logits(
+        &self,
+        token: u32,
+        states: &mut [Self::State],
+        slot_idx: usize,
+        pool: &mut PagedKVPool,
+        decode_ctx: &mut Self::DecodeContext,
+        sparse_view: SparseKvDraftView<'_>,
+    ) -> Result<u32> {
+        anyhow::ensure!(
+            sparse_view.slot_idx == slot_idx,
+            "sparse draft view slot mismatch: view={} slot={}",
+            sparse_view.slot_idx,
+            slot_idx
+        );
+        anyhow::ensure!(
+            pool.is_active(),
+            "sparse draft requires active paged KV pool"
+        );
+
+        let sparse_pages = sparse_decode_page_indices(pool, slot_idx, sparse_view)?;
+        self.prepare_sparse_decode_context(token, slot_idx, &sparse_pages, pool, decode_ctx)?;
+        let tokens = [token];
+        self.decode_batch(&tokens, states, &[slot_idx], true, pool, decode_ctx)?;
+
+        let logits = decode_ctx
+            .logits_batch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sparse draft decode did not produce logits"))?;
+        crate::ops::argmax_batch_logprob_launch(
+            &self.ctx,
+            logits,
+            &mut decode_ctx.argmax_out,
+            &mut decode_ctx.logprobs_gpu,
+            1,
+        )?;
+        self.ctx.sync()?;
+        crate::ops::argmax_batch_readback_into(
+            &self.ctx,
+            &decode_ctx.argmax_out,
+            &mut decode_ctx.argmax_host,
+            1,
+        )?;
+        Ok(decode_ctx.argmax_host[0] as u32)
     }
 
     fn create_state(&self) -> Result<Self::State> {
@@ -706,5 +752,80 @@ impl ModelForward for Qwen3Model {
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
         // The LoRA-aware batched decode runs eagerly, so skip warmup.
         self.enable_cuda_graph && self.lora.is_none()
+    }
+}
+
+fn sparse_decode_page_indices(
+    pool: &PagedKVPool,
+    slot_idx: usize,
+    sparse_view: SparseKvDraftView<'_>,
+) -> Result<Vec<u32>> {
+    let slot_pages = pool.page_indices(slot_idx);
+    anyhow::ensure!(
+        !slot_pages.is_empty(),
+        "sparse draft slot {slot_idx} has no KV pages"
+    );
+
+    let selected: std::collections::HashSet<u32> = sparse_view.page_ids.iter().copied().collect();
+    Ok(sparse_decode_page_indices_from_slot(
+        slot_pages,
+        pool.page_size,
+        &selected,
+        sparse_view.active_recent_tokens,
+    ))
+}
+
+fn sparse_decode_page_indices_from_slot(
+    slot_pages: &[u32],
+    page_size: usize,
+    selected: &std::collections::HashSet<u32>,
+    active_recent_tokens: usize,
+) -> Vec<u32> {
+    let recent_pages = active_recent_tokens.div_ceil(page_size.max(1));
+    let recent_start = slot_pages.len().saturating_sub(recent_pages);
+    let tail_page = *slot_pages
+        .last()
+        .expect("slot_pages checked non-empty above");
+
+    let mut pages = Vec::with_capacity(slot_pages.len());
+    for (logical_page_idx, &page) in slot_pages.iter().enumerate() {
+        if selected.contains(&page) || logical_page_idx >= recent_start || page == tail_page {
+            if pages.last().copied() != Some(page) && !pages.contains(&page) {
+                pages.push(page);
+            }
+        }
+    }
+    if pages.last().copied() != Some(tail_page) {
+        pages.push(tail_page);
+    }
+    pages
+}
+
+#[cfg(test)]
+mod sparse_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_decode_pages_preserve_logical_order_and_tail() {
+        let selected = [10, 40].into_iter().collect();
+
+        let pages = sparse_decode_page_indices_from_slot(&[10, 20, 30, 40, 50], 16, &selected, 16);
+
+        assert_eq!(pages, vec![10, 40, 50]);
+    }
+
+    #[test]
+    fn sparse_decode_pages_reduce_full_context_pages() {
+        let selected = [10, 20].into_iter().collect();
+
+        let pages = sparse_decode_page_indices_from_slot(
+            &[10, 20, 30, 40, 50, 60, 70, 80],
+            16,
+            &selected,
+            32,
+        );
+
+        assert_eq!(pages, vec![10, 20, 70, 80]);
+        assert!(pages.len() < 8);
     }
 }

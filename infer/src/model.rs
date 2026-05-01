@@ -63,6 +63,18 @@ pub struct SpecVerifyOutput {
     pub target_argmax_tokens: Vec<u32>,
 }
 
+/// One sparse-KV draft attention view for MagicDec-style self speculation.
+///
+/// `page_ids` are physical paged-KV page IDs selected by the scheduler. Model
+/// implementations must treat this as a draft-only approximation; verifier
+/// paths continue to use the full per-slot KV page table.
+#[derive(Clone, Copy, Debug)]
+pub struct SparseKvDraftView<'a> {
+    pub slot_idx: usize,
+    pub page_ids: &'a [u32],
+    pub active_recent_tokens: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerRuntimeWorkspaceBudget {
     pub max_batch_size: usize,
@@ -323,6 +335,23 @@ pub trait ModelForward: Send {
     ) -> Result<(Vec<u32>, DeviceVec)> {
         self.forward(tokens, state)?;
         Ok((tokens.to_vec(), state.logits().clone()))
+    }
+
+    /// Draft-only sparse-KV decode step.
+    ///
+    /// Implementations may attend to only `sparse_view` plus the active recent
+    /// tail. This method is intentionally separate from the verifier API so
+    /// sparse approximation cannot contaminate full-KV verification.
+    fn forward_sparse_decode_with_logits(
+        &self,
+        _token: u32,
+        _states: &mut [Self::State],
+        _slot_idx: usize,
+        _pool: &mut PagedKVPool,
+        _decode_ctx: &mut Self::DecodeContext,
+        _sparse_view: SparseKvDraftView<'_>,
+    ) -> Result<u32> {
+        anyhow::bail!("model does not support sparse-KV draft decode")
     }
 
     /// Convenience: dispatch to prefill or decode based on token count.
