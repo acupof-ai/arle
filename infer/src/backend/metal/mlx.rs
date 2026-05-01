@@ -3,7 +3,176 @@
 //! `MlxArray` wraps `*mut mlx_sys::mlx_array` (opaque pointer to `mlx::core::array*`).
 //! No streams, no vector_array — the C++ bridge handles everything internally.
 
+use std::ffi::CStr;
 use std::os::raw::c_void;
+use std::process::Command;
+
+pub const MLX_M5_ACCELERATOR_MIN_VERSION: (u32, u32, u32) = (0, 30, 0);
+pub const MLX_M5_ACCELERATOR_MIN_MACOS: (u32, u32, u32) = (26, 2, 0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlxRuntimeDiagnostic {
+    pub mlx_version: String,
+    pub macos_version: Option<String>,
+    pub apple_chip: Option<String>,
+    pub mlx_nax_available: bool,
+    pub m5_neural_accelerator_eligible: bool,
+    pub m5_neural_accelerator_reason: String,
+}
+
+impl MlxRuntimeDiagnostic {
+    pub fn macos_label(&self) -> &str {
+        self.macos_version.as_deref().unwrap_or("unknown")
+    }
+
+    pub fn chip_label(&self) -> &str {
+        self.apple_chip.as_deref().unwrap_or("unknown")
+    }
+
+    pub fn m5_status_label(&self) -> &'static str {
+        if self.m5_neural_accelerator_eligible {
+            "eligible"
+        } else {
+            "not-eligible"
+        }
+    }
+}
+
+pub fn version_string() -> anyhow::Result<String> {
+    unsafe {
+        let ptr = mlx_sys::mlx_version_string();
+        if ptr.is_null() {
+            check_mlx_error()?;
+            anyhow::bail!("MLX version bridge returned null without an error");
+        }
+        Ok(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
+}
+
+pub fn metal_nax_available() -> anyhow::Result<bool> {
+    let status = unsafe { mlx_sys::mlx_metal_nax_available() };
+    match status {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => {
+            check_mlx_error()?;
+            anyhow::bail!("MLX NAX availability bridge returned invalid status {status}");
+        }
+    }
+}
+
+pub fn runtime_diagnostic() -> anyhow::Result<MlxRuntimeDiagnostic> {
+    let mlx_version = version_string()?;
+    let mlx_version_tuple = parse_version_triplet(&mlx_version);
+    let macos_version = os_product_version();
+    let macos_version_tuple = macos_version.as_deref().and_then(parse_version_triplet);
+    let apple_chip = apple_chip_string();
+    let mlx_nax_available = metal_nax_available()?;
+
+    let is_m5 = apple_chip
+        .as_deref()
+        .is_some_and(|chip| chip.contains("Apple M5"));
+    let mlx_ok = mlx_version_tuple
+        .is_some_and(|version| version_at_least(version, MLX_M5_ACCELERATOR_MIN_VERSION));
+    let macos_ok = macos_version_tuple
+        .is_some_and(|version| version_at_least(version, MLX_M5_ACCELERATOR_MIN_MACOS));
+
+    let (eligible, reason) = if !is_m5 {
+        (false, "Apple M5 chip not detected".to_string())
+    } else if !mlx_ok {
+        (
+            false,
+            format!(
+                "MLX {mlx_version} is below required {}",
+                format_version_triplet(MLX_M5_ACCELERATOR_MIN_VERSION)
+            ),
+        )
+    } else if !macos_ok {
+        (
+            false,
+            format!(
+                "macOS {} is below required {}",
+                macos_version.as_deref().unwrap_or("unknown"),
+                format_version_triplet(MLX_M5_ACCELERATOR_MIN_MACOS)
+            ),
+        )
+    } else if !mlx_nax_available {
+        (
+            false,
+            "linked MLX runtime reports NAX kernels unavailable".to_string(),
+        )
+    } else {
+        (
+            true,
+            "Apple M5 chip, MLX runtime, macOS gate, and NAX kernels are eligible".to_string(),
+        )
+    };
+
+    Ok(MlxRuntimeDiagnostic {
+        mlx_version,
+        macos_version,
+        apple_chip,
+        mlx_nax_available,
+        m5_neural_accelerator_eligible: eligible,
+        m5_neural_accelerator_reason: reason,
+    })
+}
+
+pub fn log_runtime_diagnostic() {
+    match runtime_diagnostic() {
+        Ok(diagnostic) => {
+            log::info!(
+                "Metal MLX runtime: version={} macOS={} chip={} nax_available={} m5_neural_accelerator={} ({})",
+                diagnostic.mlx_version,
+                diagnostic.macos_label(),
+                diagnostic.chip_label(),
+                diagnostic.mlx_nax_available,
+                diagnostic.m5_status_label(),
+                diagnostic.m5_neural_accelerator_reason
+            );
+        }
+        Err(err) => {
+            log::warn!("Metal MLX runtime diagnostic unavailable: {err:#}");
+        }
+    }
+}
+
+fn parse_version_triplet(input: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = input
+        .split(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .find(|part| part.chars().any(|ch| ch.is_ascii_digit()))?
+        .split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn version_at_least(actual: (u32, u32, u32), minimum: (u32, u32, u32)) -> bool {
+    actual >= minimum
+}
+
+fn format_version_triplet(version: (u32, u32, u32)) -> String {
+    format!("{}.{}.{}", version.0, version.1, version.2)
+}
+
+fn os_product_version() -> Option<String> {
+    command_output_trimmed("sw_vers", &["-productVersion"])
+}
+
+fn apple_chip_string() -> Option<String> {
+    command_output_trimmed("sysctl", &["-n", "machdep.cpu.brand_string"])
+}
+
+fn command_output_trimmed(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
 
 /// Check the MLX C++ bridge for a pending error. Returns `Err` if an MLX
 /// exception was caught by a try/catch wrapper, `Ok(())` otherwise.
@@ -992,6 +1161,40 @@ pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<
 mod tests {
     use super::*;
     use crate::test_support::metal_test_guard;
+
+    #[test]
+    fn mlx_version_bridge_reports_vendored_runtime_version() {
+        let version = version_string().expect("MLX version");
+        assert!(
+            parse_version_triplet(&version)
+                .is_some_and(|actual| version_at_least(actual, (0, 31, 1))),
+            "unexpected MLX version: {version}"
+        );
+    }
+
+    #[test]
+    fn mlx_nax_availability_bridge_reports_boolean() {
+        let _guard = metal_test_guard();
+        let _available = metal_nax_available().expect("MLX NAX availability");
+    }
+
+    #[test]
+    fn version_triplet_parser_accepts_release_and_dev_suffixes() {
+        assert_eq!(parse_version_triplet("0.31.1"), Some((0, 31, 1)));
+        assert_eq!(
+            parse_version_triplet("0.31.1.dev20260502+abcdef"),
+            Some((0, 31, 1))
+        );
+        assert_eq!(parse_version_triplet("26.2"), Some((26, 2, 0)));
+        assert_eq!(parse_version_triplet("not-a-version"), None);
+    }
+
+    #[test]
+    fn version_gate_handles_m5_minimums() {
+        assert!(version_at_least((0, 31, 1), MLX_M5_ACCELERATOR_MIN_VERSION));
+        assert!(version_at_least((26, 2, 0), MLX_M5_ACCELERATOR_MIN_MACOS));
+        assert!(!version_at_least((26, 1, 9), MLX_M5_ACCELERATOR_MIN_MACOS));
+    }
 
     #[test]
     fn lifecycle() {

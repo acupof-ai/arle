@@ -627,7 +627,10 @@ impl InferenceBackend for MetalBackend {
     /// - A HuggingFace model ID (e.g. `"mlx-community/Qwen3-0.6B-4bit"`)
     fn load(&mut self, model_path: &Path) -> Result<()> {
         #[cfg(feature = "metal")]
-        self.runtime_limits.apply();
+        {
+            mlx::log_runtime_diagnostic();
+            self.runtime_limits.apply();
+        }
         #[cfg(feature = "metal")]
         if let Some(options) = &self.kv_disk_options {
             options.validate()?;

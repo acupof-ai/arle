@@ -1,4 +1,6 @@
 #include "mlx_common.h"
+#include "mlx/backend/metal/device.h"
+#include "mlx/version.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -1267,6 +1269,14 @@ extern "C" {
 
 const char* mlx_last_error() {
     return g_mlx_last_error.empty() ? nullptr : g_mlx_last_error.c_str();
+}
+
+const char* mlx_version_string() {
+    MLX_TRY_RETURN_VALUE(nullptr, version());
+}
+
+int32_t mlx_metal_nax_available() {
+    MLX_TRY_RETURN_VALUE(-1, metal::is_nax_available() ? 1 : 0);
 }
 
 // === Array lifecycle ===

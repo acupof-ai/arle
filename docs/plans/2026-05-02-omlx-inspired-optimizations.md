@@ -157,9 +157,14 @@ only about 1.2x because decode is bandwidth-bound.
 
 ### ARLE Mapping
 
-- Update `crates/mlx-sys/vendor/mlx/` from 0.31.1 to the selected 0.32+
-  upstream snapshot, including local vendored dependencies if upstream CMake
-  changed them.
+- Reality check on 2026-05-02: upstream MLX tags do not expose a 0.32+ line to
+  vendor. M5 support is already present before ARLE's vendored 0.31.1 snapshot,
+  so the shipped action is a load-time MLX/macOS/chip/NAX diagnostic plus a
+  pending M5 bench gate, not a forced vendored rewrite to a nonexistent tag.
+- When a newer upstream snapshot is selected, update
+  `crates/mlx-sys/vendor/mlx/` from 0.31.1 and include local vendored
+  dependencies if upstream CMake changed them. Do not bump for the M5 claim
+  alone while 0.31.1 already covers the MLX-side accelerator gate.
 - Rebuild `crates/mlx-sys/src/mlx_bridge.cpp`,
   `mlx_qwen35_model.cpp`, `mlx_dflash_draft_model.cpp`,
   `mlx_qwen35_moe_block.cpp`, and `mlx_common.h` against the new API.

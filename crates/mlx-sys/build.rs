@@ -138,6 +138,7 @@ fn main() {
         .include("src")
         .include(&mlx_vendor_dir)
         .include(&mlx_build) // for generated headers
+        .include(&metal_cpp_vendor_dir)
         .flag("-Wno-deprecated-copy")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-sign-compare");
