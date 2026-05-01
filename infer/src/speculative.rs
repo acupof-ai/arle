@@ -270,36 +270,66 @@ fn sample_from_dist(dist: &[f32], rng: &mut impl rand::Rng) -> Option<u32> {
 /// Used to decide when to disable speculation (if acceptance rate is too low).
 pub struct AcceptanceTracker {
     window_size: usize,
-    history: std::collections::VecDeque<f32>,
+    history: std::collections::VecDeque<(usize, usize)>,
+    accepted_total: usize,
+    drafted_total: usize,
 }
 
 impl AcceptanceTracker {
+    pub const DEFAULT_WINDOW_STEPS: usize = 64;
+
+    pub fn default_window() -> Self {
+        Self::new(Self::DEFAULT_WINDOW_STEPS)
+    }
+
     pub fn new(window_size: usize) -> Self {
         Self {
             window_size: window_size.max(1),
             history: std::collections::VecDeque::new(),
+            accepted_total: 0,
+            drafted_total: 0,
         }
     }
 
     /// Record the acceptance rate for one speculation step.
     pub fn record(&mut self, rate: f32) {
-        if self.history.len() >= self.window_size {
-            self.history.pop_front();
+        let accepted = (rate.clamp(0.0, 1.0) * 1_000_000.0).round() as usize;
+        self.observe_step(accepted, 1_000_000);
+    }
+
+    /// Record accepted/drafted token counts for one speculation step.
+    pub fn observe_step(&mut self, accepted: usize, drafted: usize) {
+        if drafted == 0 {
+            return;
         }
-        self.history.push_back(rate);
+        let accepted = accepted.min(drafted);
+        if self.history.len() >= self.window_size {
+            if let Some((old_accepted, old_drafted)) = self.history.pop_front() {
+                self.accepted_total = self.accepted_total.saturating_sub(old_accepted);
+                self.drafted_total = self.drafted_total.saturating_sub(old_drafted);
+            }
+        }
+        self.history.push_back((accepted, drafted));
+        self.accepted_total = self.accepted_total.saturating_add(accepted);
+        self.drafted_total = self.drafted_total.saturating_add(drafted);
     }
 
     /// Mean acceptance rate over the window.
     pub fn mean(&self) -> f32 {
-        if self.history.is_empty() {
+        self.current_rate()
+    }
+
+    /// Token-weighted acceptance rate over the current rolling window.
+    pub fn current_rate(&self) -> f32 {
+        if self.drafted_total == 0 {
             return 1.0; // optimistic start
         }
-        self.history.iter().sum::<f32>() / self.history.len() as f32
+        self.accepted_total as f32 / self.drafted_total as f32
     }
 
     /// True if speculation should be disabled based on the configured threshold.
     pub fn should_disable(&self, min_rate: f32) -> bool {
-        self.history.len() >= self.window_size && self.mean() < min_rate
+        self.history.len() >= self.window_size && self.current_rate() < min_rate
     }
 }
 
@@ -548,6 +578,15 @@ mod tests {
         tracker.record(0.5);
         tracker.record(0.0);
         assert!((tracker.mean() - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn tracker_observe_step_uses_token_weighted_rate() {
+        let mut tracker = AcceptanceTracker::new(4);
+        tracker.observe_step(1, 4);
+        tracker.observe_step(3, 4);
+        assert!((tracker.current_rate() - 0.5).abs() < 1e-5);
+        assert!(!tracker.should_disable(0.6));
     }
 
     #[test]

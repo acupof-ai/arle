@@ -375,7 +375,10 @@ impl<M: ModelForward> Scheduler<M> {
             sampling: incoming.sampling,
             stop: incoming.stop,
             speculative: incoming.speculative,
-            spec_acceptance_tracker: crate::speculative::AcceptanceTracker::new(16),
+            spec_acceptance_tracker: self
+                .config
+                .spec_enabled
+                .then(crate::speculative::AcceptanceTracker::default_window),
             spec_decode_disabled: false,
             session_id: incoming.session_id,
             trace_context: incoming.trace_context,
