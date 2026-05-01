@@ -360,6 +360,46 @@ Phase 1 SGLang-row close 结论：
 下一刀 = Phase 2 spec decode plan
 `docs/plans/2026-05-01-longctx-spec-decode-phase2.md`。
 
+### 13.A · 2026-05-01 之后落地的相邻工作（mission §1-12 不变）
+
+以下工作在 Phase 1 关闭后陆续落地。它们不修改本 mission 的成功定义、accept 门、margin 阈值，仅记录"自 Phase 1 close 之后仓库状态发生了什么"以便 Phase 2/3 启动时引用。
+
+**Phase 2 spec-decode plumbing 已落地，throughput 暂未达成（regression entry）：**
+
+- `feat(scheduler): plumb spec decode counters and no-op config`
+- `feat(scheduler): wire spec decode verifier micro-batch path`
+- `fix(scheduler): correct verifier bit-identity`
+- `fix(scheduler): reject fake multi-token spec canary`
+- `feat(scheduler): adaptive spec acceptance rate threshold`
+- `fix(scheduler): reject unwired external draft path`
+- `feat(scheduler): real multi-token speculative decode with external draft model`
+  — 真正 K-token proposals + greedy verifier + bonus-token commit。但 `Qwen3-0.6B` external draft 在 Qwen3-4B target / L4 / FP8 KV / longctx-32k c=4 envelope 下 acceptance `12.0%` (3/25)，effective out tok/s `5.12` vs Phase 1 close `26.169`，**-80.4%**；GuideLLM headline `9.73` vs equivalent baseline `26.169`，**-62.8%**。
+- 详细诊断 + "暂停 Phase 2 throughput 声明，等待 packed K+1 verifier 或 MagicDec sparse-KV self-spec" 决策见 [`docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`](../experience/errors/2026-05-01-phase2-real-spec-regression.md) 与 [`docs/projects/2026-05-01-spec-decode-integration-design.md`](2026-05-01-spec-decode-integration-design.md)。
+- 仓库 §8.3 "已有半成品" 描述同步：`speculative.rs` 现持有真实 `DraftMode` / persistent draft state / acceptance tracking / verifier 计数；`speculative/cuda.rs` + `scheduler/cuda/spec_path.rs` 是 CUDA-side 集成入口。
+
+**Phase 3 多 GPU 前置 (F0–F4 scaffold) 已落地：**
+
+- F0：`feat(cuda): add nccl group coordinator smoke behind nccl feature` — 2-thread `all_reduce(sum)` 通过；`--features cuda,nccl` 链接证明；wins [`docs/experience/wins/2026-05-01-nccl-group-coordinator-smoke.md`](../experience/wins/2026-05-01-nccl-group-coordinator-smoke.md)。
+- F0.7：`feat(scheduler): F0.7 ForwardBatch + IntermediateTensors type` — PP-proxy slot 占位。
+- F0.8：`feat(distributed): LayerCommunicator skeleton` — model-level communicator 单 rank no-op。
+- F1：`feat(distributed): F1 parallel state + tp weight loading` — `parallel_state.rs` 全部 10 个 group accessor + `TpLoadContext` 行/列/头分片 helper；wins [`docs/experience/wins/2026-05-01-f1-parallel-state-tp-load-context.md`](../experience/wins/2026-05-01-f1-parallel-state-tp-load-context.md)。
+- F2：`feat(model): qwen3 + qwen35 TP forward sharding` — Qwen3 / Qwen3.5 BF16 safetensors shard-aware load + forward 接 `LayerCommunicator`；TP=1 no-op，TP>1 production load fail-fast 直到 collective 真接进 forward；wins [`docs/experience/wins/2026-05-01-f2-qwen3-qwen35-tp-forward-sharding.md`](../experience/wins/2026-05-01-f2-qwen3-qwen35-tp-forward-sharding.md)。
+- F3：`feat(distributed): F3 pipeline parallel scaffold`。
+- F4：`feat(distributed): F4 expert parallel scaffold`。
+- 环境变量：`docs(environment): F0.11 multi-rank env vars` — `INFER_TP_SIZE` / `INFER_PP_SIZE` / `INFER_EP_SIZE` / `INFER_ATTN_*` / `INFER_CUDA_DEVICES` / `INFER_NCCL_PORT` 文档化。
+- 部署 bundle：`chore(scripts): h20 single-node deploy bundle`。
+- 父读：[`docs/projects/2026-05-01-multi-gpu-f0-readiness.md`](2026-05-01-multi-gpu-f0-readiness.md)。
+
+**DeepSeek V4 readiness 作为并行 product line 启动（不影响本 mission §1-12）：**
+
+- `docs(projects): deepseek v4 readiness assessment` — 父读 [`docs/projects/2026-05-01-deepseek-v4-readiness.md`](2026-05-01-deepseek-v4-readiness.md)；列出 DS0–DS8 gap matrix。
+- `feat(deepseek-spec): DS0 scaffold crate with config + tensor names + Shard annotations` — 新 crate `crates/deepseek-spec/` 落地，沿用 `qwen3-spec` / `qwen35-spec` 形态。
+- `feat(deepseek-spec): DS2 MoE forward type scaffold`。
+- `docs(projects): MLA kernel design for DeepSeek path` — [`docs/plans/2026-05-01-mla-kernel-design.md`](../plans/2026-05-01-mla-kernel-design.md) 设计稿。
+- 这条线的 DS3 MLA / DS4 CUDA MoE / DS5 NCCL collectives in forward 全部 gate 在上文 F2 collective 真接进 forward 之后。
+
+本 mission 仍按 §3 顺序执行：Phase 1 (closed SGLang row) → Phase 2 (现处于 plumbing-landed / throughput-paused 状态) → Phase 3 (multi-GPU 前置已 scaffold) → Phase 4。Mission §1-12 的 success 公式与硬门保持原样。
+
 ---
 
 ## 14 · 关联文档

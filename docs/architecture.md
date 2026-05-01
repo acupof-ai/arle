@@ -24,7 +24,8 @@ rather than defining a second equal architecture.
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, Triton AOT, Rust FFI, paged-KV / FlashInfer / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
 | `kv-native-sys` | Local persistence substrate (file/block ABI, mmap, WAL, shm descriptors) for the KV-tier disk/shared transport path | Tier policy, scheduler, GPU code |
-| `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names | Implementation code |
+| `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
+| `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations | Runtime model code, MLA/MoE kernels (gated on F0–F4 multi-GPU collectives in forward) |
 | `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
 | `train` | Generic Qwen-family pretrain/SFT/GRPO stack, train-side `/v1/train/*` control plane, shared async observability | GPU kernels, scheduler |
 
@@ -58,6 +59,58 @@ Reverse dependencies from `runtime-*` (or any `infer`-internal layer) into
 - `metal`: serial backend path for Apple Silicon via `mlx-sys`.
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
   end-to-end validation on non-GPU machines.
+
+## Multi-GPU Parallel Axes (single-node F0–F4 scaffold)
+
+The single-node multi-GPU foundation lives under `infer/src/distributed/`
+and is currently a scaffold: type surfaces, group metadata, and an NCCL
+group-coordinator smoke are proven, but real production collectives are
+**not yet wired into model forward**. Mainline default behavior is one
+rank, one model load, one scheduler — unchanged.
+
+Axes scaffolded today (see
+[`docs/projects/2026-05-01-multi-gpu-f0-readiness.md`](projects/2026-05-01-multi-gpu-f0-readiness.md)
+and [`docs/plans/2026-04-28-single-node-multi-gpu.md`](plans/2026-04-28-single-node-multi-gpu.md)):
+
+- **TP (tensor parallel):** F1 `parallel_state.rs` + `TpLoadContext` shard
+  helpers; F2 Qwen3 + Qwen3.5 forward sharding through
+  `LayerCommunicator` (`post_attn_all_reduce`, `post_mlp_all_reduce`,
+  DP-attention gather hook). TP=1 is no-op; TP>1 production model load
+  fails fast until F2 collectives complete.
+- **PP (pipeline parallel):** F0.7 `ForwardBatch.pp_proxy:
+  Option<IntermediateTensors>` + F3 `pipeline_state.rs` scaffold.
+- **EP (expert parallel):** F4 `expert_state.rs` scaffold; no CUDA MoE
+  forward consumer yet.
+- **NCCL backend:** `--features cuda,nccl` gate; 2-thread `all_reduce(sum)`
+  smoke passes via `infer --nccl-smoke` and
+  `infer/tests/distributed_nccl_smoke.rs`.
+
+These axes are the dependency floor for both the longctx Phase 3
+(disaggregated prefill/decode) lever and the DeepSeek V4 readiness path
+(`crates/deepseek-spec` DS0 scaffold + DS3 MLA + DS4 CUDA MoE + DS5 NCCL
+collectives in forward). They must complete real collectives in forward
+before either downstream consumer can claim multi-rank serving.
+
+## Speculative Decode Framework
+
+The Phase 2 spec-decode plumbing landed but does not yet produce a
+throughput lift:
+
+- `infer/src/speculative.rs`: `SpecConfig`, `DraftMode`, persistent
+  per-request external draft state, K-token proposals, greedy verifier
+  accounting, bonus-token commit, and live spec counters.
+- `infer/src/speculative/cuda.rs`: CUDA integration entry points.
+- `infer/src/scheduler/cuda/spec_path.rs`: per-step `SpecPath` dispatch
+  threading through the CUDA execution loop.
+
+The first end-to-end real-spec bench regressed -62.8% vs the Phase 1
+SGLang-row close because the correctness-first verifier still runs the
+target paged decode once per verifier position. Phase 2 throughput
+claims are paused until a packed K+1 verifier or MagicDec sparse-KV
+self-spec lands. See
+[`docs/projects/2026-04-30-longctx-32k-128k-leadership.md`](projects/2026-04-30-longctx-32k-128k-leadership.md)
+§13 and the regression entry in
+[`docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`](experience/errors/2026-05-01-phase2-real-spec-regression.md).
 
 ## Route-A Note (Historical)
 
