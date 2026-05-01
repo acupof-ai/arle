@@ -40,8 +40,7 @@ impl StepPlan {
     fn label(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
-            Self::Decode => "decode",
-            Self::SpecDecode => "decode",
+            Self::Decode | Self::SpecDecode => "decode",
             Self::Prefill(_) => "prefill",
             Self::Split(_) => "split",
             Self::Mixed(_) => "mixed",
@@ -84,8 +83,8 @@ impl StepPlan {
     }
 }
 
-fn route_spec_plan(spec_enabled: bool, spec_draft_k: usize, plan: StepPlan) -> StepPlan {
-    if spec_enabled && spec_draft_k == 1 && matches!(plan, StepPlan::Decode) {
+fn route_spec_plan(spec_enabled: bool, _spec_draft_k: usize, plan: StepPlan) -> StepPlan {
+    if spec_enabled && matches!(plan, StepPlan::Decode) {
         StepPlan::SpecDecode
     } else {
         plan
@@ -862,6 +861,6 @@ mod tests {
     #[test]
     fn multi_token_spec_route_waits_for_real_verifier() {
         let plan = route_spec_plan(true, 5, StepPlan::Decode);
-        assert!(matches!(plan, StepPlan::Decode));
+        assert!(matches!(plan, StepPlan::SpecDecode));
     }
 }

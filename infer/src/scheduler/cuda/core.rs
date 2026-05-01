@@ -135,6 +135,7 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) effective_max_seq_len: Option<usize>,
     pub(super) next_id: u64,
     pub(super) rng: StdRng,
+    pub(super) draft_engine: Option<crate::speculative::DraftEngine>,
     /// Paged KV cache pool shared across all slots (for batched decode).
     pub(super) paged_kv_pool: PagedKVPool,
     /// Pre-allocated buffers for batched decode (reused across steps).
@@ -831,6 +832,9 @@ impl<M: ModelForward> Scheduler<M> {
             req.phase = Phase::Finished;
         }
         if let Some(request_id) = request_id {
+            if let Some(draft_engine) = &self.draft_engine {
+                draft_engine.release_request_state(request_id);
+            }
             self.clear_fetch_waiting_for_slot(slot_idx, request_id);
             self.emit_gate_waiting.remove(&request_id);
             let _ = self.emit_tx.send(EmitCommand::Abort { request_id });

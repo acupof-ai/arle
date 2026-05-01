@@ -22,7 +22,7 @@ fn mixed_prefill_pages_needed(seq_len: usize, prefill_tokens: usize, page_size: 
 }
 
 impl<M: ModelForward> Scheduler<M> {
-    fn collect_decode_batch_inputs(&mut self) -> (Vec<usize>, Vec<u32>) {
+    pub(super) fn collect_decode_batch_inputs(&mut self) -> (Vec<usize>, Vec<u32>) {
         let decode_indices = self.running_decode_slots();
         let mut token_ids = Vec::with_capacity(decode_indices.len());
         let mut valid_decode_indices = Vec::with_capacity(decode_indices.len());
@@ -88,7 +88,7 @@ impl<M: ModelForward> Scheduler<M> {
             .map(|(pos, _)| pos)
     }
 
-    fn retract_decode_to_fit(
+    pub(super) fn retract_decode_to_fit(
         &mut self,
         decode_indices: &mut Vec<usize>,
         token_ids: &mut Vec<u32>,
@@ -217,7 +217,7 @@ impl<M: ModelForward> Scheduler<M> {
         });
     }
 
-    fn launch_decode_batch_from_tokens(
+    pub(super) fn launch_decode_batch_from_tokens(
         &mut self,
         mut decode_indices: Vec<usize>,
         token_ids: Vec<u32>,

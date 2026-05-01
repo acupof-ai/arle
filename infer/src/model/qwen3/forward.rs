@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rand::RngExt;
 use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 
 use super::decode_buffers::DecodeBuffers;
 use super::prefill::{Qwen3PagedPrefillRequest, Qwen3PrefillContext};
@@ -8,7 +8,8 @@ use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
     GenerationState, MixedBatchRequest, ModelForward, PrefillBatchRequest,
-    SchedulerRuntimeWorkspaceBudget, decode_metadata_page_capacity, prepare_paged_prefill_batch,
+    SchedulerRuntimeWorkspaceBudget, SpecVerifyOutput, SpecVerifyRequest,
+    decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
 use crate::ops;
 use crate::sampler::SamplingParams;
@@ -630,6 +631,74 @@ impl ModelForward for Qwen3Model {
             }
             _ => Ok(false),
         }
+    }
+
+    fn forward_spec_verify_batch(
+        &self,
+        requests: &[SpecVerifyRequest<'_>],
+        states: &mut [Self::State],
+        pool: &mut PagedKVPool,
+    ) -> Result<Vec<SpecVerifyOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        for request in requests {
+            anyhow::ensure!(
+                request.input_tokens.len() == request.draft_tokens.len() + 1,
+                "spec verifier input must be last-token + K draft tokens"
+            );
+        }
+
+        let mut outputs: Vec<SpecVerifyOutput> = requests
+            .iter()
+            .map(|request| SpecVerifyOutput {
+                slot_idx: request.slot_idx,
+                target_argmax_tokens: Vec::with_capacity(request.input_tokens.len()),
+            })
+            .collect();
+        let max_steps = requests
+            .iter()
+            .map(|request| request.input_tokens.len())
+            .max()
+            .unwrap_or(0);
+        let mut decode_ctx = self.create_decode_context(requests.len(), None, pool)?;
+        let greedy = SamplingParams::default();
+        let mut rng = StdRng::seed_from_u64(0x5eec_dec0de);
+
+        for step in 0..max_steps {
+            let mut tokens = Vec::new();
+            let mut slot_indices = Vec::new();
+            let mut output_indices = Vec::new();
+            for (idx, request) in requests.iter().enumerate() {
+                let Some(&token) = request.input_tokens.get(step) else {
+                    continue;
+                };
+                pool.cow_tail_page_for_append(&self.ctx, request.slot_idx)?;
+                pool.alloc_tokens(request.slot_idx, 1)?;
+                tokens.push(token);
+                slot_indices.push(request.slot_idx);
+                output_indices.push(idx);
+            }
+            self.forward_decode_batch(
+                &tokens,
+                states,
+                &slot_indices,
+                Some(pool),
+                &mut decode_ctx,
+                false,
+            )?;
+            for (idx, &slot_idx) in output_indices.iter().zip(&slot_indices) {
+                let (token, _) =
+                    self.select_token_with_logprob(&mut states[slot_idx], &greedy, &mut rng)?;
+                outputs[*idx].target_argmax_tokens.push(token);
+            }
+        }
+
+        Ok(requests
+            .iter()
+            .zip(outputs)
+            .map(|(_request, output)| output)
+            .collect())
     }
 
     fn supports_cuda_graph_decode(&self) -> bool {
