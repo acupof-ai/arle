@@ -336,6 +336,11 @@ impl SchedulerConfig {
                 "self-spec multi-token verifier is not implemented yet; set spec_draft_k=1 for the P2.3 canary"
             );
         }
+        if self.spec_enabled && matches!(self.spec_draft_model, DraftMode::External(_)) {
+            anyhow::bail!(
+                "external draft scheduler path is not implemented yet; it needs persistent draft KV state and target paged-KV rollback"
+            );
+        }
         if !(0.0..=1.0).contains(&self.spec_acceptance_threshold) {
             anyhow::bail!("spec_acceptance_threshold must be in [0, 1]");
         }
@@ -732,6 +737,21 @@ mod tests {
             ..spec
         };
         assert!(!spec.allows_single_token_canary(1));
+    }
+
+    #[test]
+    fn external_draft_rejected_until_scheduler_path_lands() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.spec_enabled = true;
+        cfg.spec_draft_model = DraftMode::External(PathBuf::from("infer/models/Qwen3-0.6B"));
+
+        let err = cfg
+            .validate()
+            .expect_err("external draft must reject until wired");
+        assert!(
+            err.to_string().contains("persistent draft KV"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
