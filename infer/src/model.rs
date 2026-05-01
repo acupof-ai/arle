@@ -44,6 +44,23 @@ pub struct MixedBatchRequest<'a> {
     pub prefill_start_positions: &'a [usize],
 }
 
+/// One scheduler-planned speculative verifier row.
+///
+/// `input_tokens` is `[last_committed_token] + draft_tokens`. Logits row `i`
+/// verifies `draft_tokens[i]`; the final row supplies the target bonus token.
+#[derive(Clone, Copy, Debug)]
+pub struct SpecVerifyRequest<'a> {
+    pub slot_idx: usize,
+    pub input_tokens: &'a [u32],
+    pub draft_tokens: &'a [u32],
+}
+
+#[derive(Clone, Debug)]
+pub struct SpecVerifyOutput {
+    pub slot_idx: usize,
+    pub target_argmax_tokens: Vec<u32>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerRuntimeWorkspaceBudget {
     pub max_batch_size: usize,
@@ -613,6 +630,17 @@ pub trait ModelForward: Send {
         _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Batched speculative verifier: append verifier input to paged KV and
+    /// return target argmax tokens for each produced logits row.
+    fn forward_spec_verify_batch(
+        &self,
+        _requests: &[SpecVerifyRequest<'_>],
+        _states: &mut [Self::State],
+        _pool: &mut PagedKVPool,
+    ) -> Result<Vec<SpecVerifyOutput>> {
+        anyhow::bail!("model does not support speculative verifier batch")
     }
 
     /// Whether batched decode for this model can be replayed via a captured

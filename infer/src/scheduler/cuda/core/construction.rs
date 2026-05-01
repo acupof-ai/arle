@@ -23,6 +23,8 @@ use crate::model::{GenerationState, ModelForward};
 use crate::prefix_cache::RadixCache;
 use crate::tokenizer::Tokenizer;
 
+const WORKSPACE_SAFETY_BYTES: usize = 256 * 1024 * 1024;
+
 impl<M: ModelForward> Scheduler<M> {
     /// Create a new scheduler and its handle.
     ///
@@ -106,6 +108,13 @@ impl<M: ModelForward> Scheduler<M> {
             CONTIGUOUS_KV_TOKENS
         };
 
+        let draft_engine = match (&config.spec_enabled, &config.spec_draft_model) {
+            (true, crate::scheduler::DraftMode::External(path)) => Some(
+                crate::speculative::DraftEngine::load_qwen3(&path.to_string_lossy())?,
+            ),
+            _ => None,
+        };
+
         let mut states = Vec::with_capacity(config.max_slots);
         let mut slot_materialized_prompt_lens = Vec::with_capacity(config.max_slots);
         let mut slot_owned_blocks = Vec::with_capacity(config.max_slots);
@@ -155,7 +164,6 @@ impl<M: ModelForward> Scheduler<M> {
                     let headroom_base = config.pre_model_free_bytes.unwrap_or(total);
                     let headroom =
                         ((headroom_base as f64) * (1.0 - config.mem_fraction_static)) as usize;
-                    const WORKSPACE_SAFETY_BYTES: usize = 256 * 1024 * 1024;
                     let workspace_reserve =
                         runtime_workspace.saturating_add(WORKSPACE_SAFETY_BYTES);
                     let static_reserve = headroom.max(workspace_reserve);
@@ -290,6 +298,7 @@ impl<M: ModelForward> Scheduler<M> {
             effective_max_seq_len,
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
+            draft_engine,
             paged_kv_pool,
             decode_bufs: None,
             prefill_ctx: None,

@@ -1,6 +1,7 @@
 #![cfg(feature = "cuda")]
 
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use tokio::sync::mpsc;
 
@@ -9,12 +10,19 @@ use infer::model::{KVCacheDtype, KVFormat, ModelRuntimeConfig, Qwen3Model};
 use infer::sampler::SamplingParams;
 use infer::scheduler::{DraftMode, IncomingRequest, RequestPriority, Scheduler, SchedulerConfig};
 use infer::server_engine::CompletionStreamDelta;
+use infer::speculative::DraftEngine;
 use infer::tokenizer::Tokenizer;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const DRAFT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-0.6B");
 
 fn model_path() -> String {
     std::env::var("INFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
+}
+
+fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
 fn collect_output(rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>) -> String {
@@ -51,7 +59,13 @@ fn make_request(
     (req, rx)
 }
 
-fn run_prompt(path: &str, prompt: &str, spec_enabled: bool) -> (String, ServerMetrics) {
+fn run_prompt(
+    path: &str,
+    prompt: &str,
+    spec_enabled: bool,
+    draft_mode: DraftMode,
+    draft_k: usize,
+) -> (String, ServerMetrics) {
     let model = Qwen3Model::from_safetensors_with_runtime(
         path,
         ModelRuntimeConfig {
@@ -63,10 +77,10 @@ fn run_prompt(path: &str, prompt: &str, spec_enabled: bool) -> (String, ServerMe
     let metrics = ServerMetrics::new("spec-test");
     let mut config = SchedulerConfig::runtime_defaults(2);
     config.spec_enabled = spec_enabled;
-    config.spec_draft_k = 5;
+    config.spec_draft_k = draft_k;
     config.spec_acceptance_threshold = 0.3;
     if spec_enabled {
-        config.spec_draft_model = DraftMode::SelfSpec;
+        config.spec_draft_model = draft_mode;
     }
 
     let (scheduler, handle) = Scheduler::with_config(
@@ -103,6 +117,7 @@ fn first_token_divergence(tokenizer: &Tokenizer, plain: &str, spec: &str) -> Str
 
 #[test]
 fn spec_decode_greedy_is_bit_identical_for_three_prompts() {
+    let _guard = gpu_test_lock();
     infer::logging::init_stderr("info");
     let path = model_path();
     if !Path::new(&path).exists() {
@@ -116,8 +131,8 @@ fn spec_decode_greedy_is_bit_identical_for_three_prompts() {
         "What is 7 plus 5?",
         "Write a tiny Rust function name.",
     ] {
-        let (plain, _) = run_prompt(&path, prompt, false);
-        let (spec, metrics) = run_prompt(&path, prompt, true);
+        let (plain, _) = run_prompt(&path, prompt, false, DraftMode::None, 1);
+        let (spec, metrics) = run_prompt(&path, prompt, true, DraftMode::SelfSpec, 1);
         assert_eq!(
             plain,
             spec,
@@ -130,4 +145,92 @@ fn spec_decode_greedy_is_bit_identical_for_three_prompts() {
             metrics.spec_acceptance_rate()
         );
     }
+}
+
+#[test]
+fn external_spec_decode_greedy_is_bit_identical_for_three_prompts() {
+    let _guard = gpu_test_lock();
+    infer::logging::init_stderr("info");
+    let path = model_path();
+    let draft_path = std::env::var("INFER_TEST_DRAFT_MODEL_PATH")
+        .unwrap_or_else(|_| DRAFT_MODEL_PATH.to_string());
+    if !Path::new(&path).exists() {
+        eprintln!("Skipping test: model not found at {path}");
+        return;
+    }
+    if !Path::new(&draft_path).exists() {
+        eprintln!("Skipping test: draft model not found at {draft_path}");
+        return;
+    }
+    let tokenizer = Tokenizer::from_file(&path).expect("load tokenizer for diagnostics");
+
+    for prompt in [
+        "Explain attention in one sentence.",
+        "What is 7 plus 5?",
+        "Write a tiny Rust function name.",
+    ] {
+        let (plain, _) = run_prompt(&path, prompt, false, DraftMode::None, 1);
+        let (spec, metrics) = run_prompt(
+            &path,
+            prompt,
+            true,
+            DraftMode::External(draft_path.clone().into()),
+            5,
+        );
+        assert_eq!(
+            plain,
+            spec,
+            "external spec decode changed greedy output for {prompt:?}: {}",
+            first_token_divergence(&tokenizer, &plain, &spec)
+        );
+        assert!(
+            metrics.spec_verified_tokens_total() > 0,
+            "expected external verifier to process draft tokens"
+        );
+    }
+}
+
+#[test]
+fn external_draft_state_persists_across_steps() {
+    let _guard = gpu_test_lock();
+    infer::logging::init_stderr("info");
+    let draft_path = std::env::var("INFER_TEST_DRAFT_MODEL_PATH")
+        .unwrap_or_else(|_| DRAFT_MODEL_PATH.to_string());
+    if !Path::new(&draft_path).exists() {
+        eprintln!("Skipping test: draft model not found at {draft_path}");
+        return;
+    }
+
+    let tokenizer = Tokenizer::from_file(&draft_path).expect("load draft tokenizer");
+    let prefix = tokenizer
+        .encode("Persistent draft KV test prompt.")
+        .expect("encode draft prefix");
+    assert!(!prefix.is_empty(), "draft prefix must not be empty");
+
+    let engine = DraftEngine::load_qwen3(&draft_path).expect("load draft engine");
+    let request_id = 20260501;
+    let draft_max_seq_len = prefix.len() + 32;
+    engine
+        .create_request_state(request_id, &prefix, draft_max_seq_len)
+        .expect("create persistent draft state");
+    assert_eq!(engine.request_position(request_id), Some(prefix.len()));
+
+    let first = engine
+        .draft_for_request(request_id, 2)
+        .expect("draft first step");
+    let after_first = engine
+        .request_position(request_id)
+        .expect("position after first draft");
+    assert_eq!(after_first, prefix.len() + first.tokens.len());
+
+    let second = engine
+        .draft_for_request(request_id, 3)
+        .expect("draft second step");
+    let after_second = engine
+        .request_position(request_id)
+        .expect("position after second draft");
+    assert_eq!(after_second, after_first + second.tokens.len());
+
+    engine.release_request_state(request_id);
+    assert!(!engine.has_request_state(request_id));
 }

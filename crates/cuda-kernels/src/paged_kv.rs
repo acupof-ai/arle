@@ -999,6 +999,43 @@ impl TokenKVPool {
         self.seq_lens[slot] = 0;
     }
 
+    /// Truncate a live slot to `new_len` logical tokens and recycle any full
+    /// trailing pages that are no longer reachable.
+    pub fn truncate_slot(&mut self, slot: usize, new_len: usize) -> Result<Vec<u32>> {
+        let old_len = self.seq_lens[slot];
+        if new_len > old_len {
+            return Err(anyhow!(
+                "TokenKVPool: cannot grow slot {slot} via truncate ({new_len} > {old_len})"
+            ));
+        }
+        if new_len == old_len {
+            return Ok(Vec::new());
+        }
+
+        let keep_pages = new_len.div_ceil(self.page_size);
+        let slot_pages = &mut self.page_indices[slot];
+        let removed = slot_pages.split_off(keep_pages.min(slot_pages.len()));
+        if !removed.is_empty() {
+            self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
+        }
+        let mut recycled = Vec::new();
+        for idx in removed {
+            let usize_idx = idx as usize;
+            debug_assert!(
+                self.page_attach_count[usize_idx] > 0,
+                "truncate_slot: page {idx} had zero slot refs"
+            );
+            self.page_attach_count[usize_idx] = self.page_attach_count[usize_idx].saturating_sub(1);
+            let before = self.free_pages.len();
+            self.recycle_page_if_unreferenced(idx);
+            if self.free_pages.len() > before {
+                recycled.push(idx);
+            }
+        }
+        self.seq_lens[slot] = new_len;
+        Ok(recycled)
+    }
+
     /// Bump the external reference count on each of the given pages by one.
     ///
     /// Used by the scheduler's `publish_to_prefix_cache` path: when a
@@ -1887,6 +1924,27 @@ mod tests {
             self.seq_lens[slot] = 0;
         }
 
+        fn truncate_slot(&mut self, slot: usize, new_len: usize) -> Vec<u32> {
+            assert!(new_len <= self.seq_lens[slot]);
+            let keep_pages = new_len.div_ceil(self.page_size);
+            let removed = self.page_indices[slot].split_off(keep_pages);
+            if !removed.is_empty() {
+                self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
+            }
+            let mut recycled = Vec::new();
+            for page in removed {
+                self.page_attach_count[page as usize] =
+                    self.page_attach_count[page as usize].saturating_sub(1);
+                let before = self.free_pages.len();
+                self.recycle_page_if_unreferenced(page);
+                if self.free_pages.len() > before {
+                    recycled.push(page);
+                }
+            }
+            self.seq_lens[slot] = new_len;
+            recycled
+        }
+
         fn detach_shared_hot_tail_page_for_append(&mut self, slot: usize, shared_tail_page: u32) {
             debug_assert_eq!(
                 self.slot_shared_hot_tail_page(slot),
@@ -2132,6 +2190,26 @@ mod tests {
         assert_eq!(freed_now.len(), 1);
         assert_eq!(pool.retained_count(), 0);
         assert_eq!(pool.free_pages.len(), 4, "every page back in the free pool");
+    }
+
+    #[test]
+    fn truncate_slot_reclaims_only_full_trailing_pages() {
+        let mut pool = MockPool::new(4, 1, 16);
+        pool.alloc_tokens(0, 40);
+        assert_eq!(pool.page_indices[0], vec![0, 1, 2]);
+
+        let freed = pool.truncate_slot(0, 20);
+        assert_eq!(freed, vec![2]);
+        assert_eq!(pool.page_indices[0], vec![0, 1]);
+        assert_eq!(pool.seq_lens[0], 20);
+
+        let freed = pool.truncate_slot(0, 17);
+        assert!(
+            freed.is_empty(),
+            "shrinking within the hot page must not recycle storage"
+        );
+        assert_eq!(pool.page_indices[0], vec![0, 1]);
+        assert_eq!(pool.seq_lens[0], 17);
     }
 
     #[test]
