@@ -42,7 +42,7 @@ pub(in crate::scheduler::cuda) use emit_worker::{EmitCommand, EmitEvent, spawn_e
 pub(in crate::scheduler::cuda) use helpers::{
     CONTIGUOUS_KV_TOKENS, PREFIX_CACHE_BLOCK_SIZE, can_publish_prefix_pages,
     host_spill_target_bytes, is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages,
-    sealed_block_token_count,
+    sealed_block_token_count, select_sparse_pages_from_slot_pages,
 };
 pub(in crate::scheduler::cuda) use state_types::{
     PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow, PrefetchTicketState,
@@ -291,6 +291,21 @@ impl<M: ModelForward> Scheduler<M> {
                     .to_vec()
             })
             .collect()
+    }
+
+    pub(super) fn select_sparse_pages_from_active_slot(
+        &self,
+        slot_idx: usize,
+        recent_tokens: usize,
+        top_k: usize,
+    ) -> Vec<BlockId> {
+        select_sparse_pages_from_slot_pages(
+            self.paged_kv_pool.page_indices(slot_idx),
+            self.paged_kv_pool.page_size,
+            self.paged_kv_pool.seq_len(slot_idx),
+            recent_tokens,
+            top_k,
+        )
     }
 
     pub(super) fn flattened_pages_for_blocks(&self, blocks: &[BlockId]) -> Result<Vec<u32>> {

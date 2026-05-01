@@ -4,7 +4,9 @@
 //! Pure functions only: watermark/spill math, sealed-prefix predicates,
 //! and the radix block-size constant.
 
-use crate::prefix_cache::BlockSelectionIntent;
+use std::collections::HashSet;
+
+use crate::prefix_cache::{BlockId, BlockSelectionIntent};
 
 /// Block size (in tokens) for the global `RadixCache` prefix observer.
 /// Chosen to match the M0.3 target paged-pool page size so that when
@@ -78,4 +80,42 @@ pub(in crate::scheduler::cuda) fn is_full_sealed_prefix(
     block_count: usize,
 ) -> bool {
     block_count > 0 && matched_len == sealed_block_token_count(block_size, block_count)
+}
+
+pub(in crate::scheduler::cuda) fn select_sparse_pages_from_slot_pages(
+    slot_pages: &[u32],
+    page_size: usize,
+    seq_len: usize,
+    recent_tokens: usize,
+    top_k: usize,
+) -> Vec<BlockId> {
+    if slot_pages.is_empty() || seq_len == 0 || (recent_tokens == 0 && top_k == 0) {
+        return Vec::new();
+    }
+
+    let live_pages = seq_len.div_ceil(page_size.max(1)).min(slot_pages.len());
+    let slot_pages = &slot_pages[..live_pages];
+    let recent_pages = recent_tokens
+        .div_ceil(page_size.max(1))
+        .min(slot_pages.len());
+    let recent_start = slot_pages.len().saturating_sub(recent_pages);
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    for &page in slot_pages.iter().take(top_k) {
+        let block = BlockId(page);
+        if seen.insert(block) {
+            selected.push(block);
+        }
+    }
+
+    for &page in &slot_pages[recent_start..] {
+        let block = BlockId(page);
+        if seen.insert(block) {
+            selected.push(block);
+        }
+    }
+
+    selected
 }
