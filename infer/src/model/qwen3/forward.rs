@@ -101,6 +101,19 @@ impl ModelForward for Qwen3Model {
     type DecodeContext = super::batch_decode::BatchDecodeBuffers;
     type PrefillContext = Qwen3PrefillContext;
 
+    fn forward_with_logits(
+        &self,
+        tokens: &[u32],
+        state: &mut Self::State,
+    ) -> Result<(Vec<u32>, DeviceVec)> {
+        if tokens.len() == 1 && state.base.kv_cache.len() > 0 {
+            self.forward_decode(tokens[0], state)?;
+        } else {
+            self.forward_prefill(tokens, state)?;
+        }
+        Ok((tokens.to_vec(), state.logits().clone()))
+    }
+
     fn create_state(&self) -> Result<Self::State> {
         Ok(Qwen3State {
             decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,

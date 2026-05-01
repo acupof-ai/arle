@@ -266,6 +266,8 @@ pub(crate) struct ActiveRequest {
     pub(crate) sampling: crate::sampler::SamplingParams,
     pub(crate) stop: Option<Vec<String>>,
     pub(crate) speculative: Option<crate::scheduler::RequestSpecConfig>,
+    pub(crate) spec_acceptance_tracker: crate::speculative::AcceptanceTracker,
+    pub(crate) spec_decode_disabled: bool,
     /// Optional client session identifier forwarded from `IncomingRequest`.
     /// Preserved across preemption so requeued work stays session-sticky.
     pub(crate) session_id: Option<crate::types::SessionId>,
@@ -418,6 +420,8 @@ mod tests {
             sampling: SamplingParams::default(),
             stop: None,
             speculative: None,
+            spec_acceptance_tracker: crate::speculative::AcceptanceTracker::new(16),
+            spec_decode_disabled: false,
             session_id: None,
             trace_context: None,
             delta_tx,

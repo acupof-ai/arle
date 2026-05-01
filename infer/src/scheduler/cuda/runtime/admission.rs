@@ -375,6 +375,8 @@ impl<M: ModelForward> Scheduler<M> {
             sampling: incoming.sampling,
             stop: incoming.stop,
             speculative: incoming.speculative,
+            spec_acceptance_tracker: crate::speculative::AcceptanceTracker::new(16),
+            spec_decode_disabled: false,
             session_id: incoming.session_id,
             trace_context: incoming.trace_context,
             delta_tx: incoming.delta_tx,

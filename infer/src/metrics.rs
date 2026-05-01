@@ -825,6 +825,39 @@ impl ServerMetrics {
             .map_or(0, |h| h.spec_step_latency_us.count())
     }
 
+    pub fn record_spec_step(
+        &self,
+        draft_tokens: usize,
+        verified_tokens: usize,
+        accepted_tokens: usize,
+        latency_us: u64,
+    ) {
+        self.inner
+            .spec_draft_tokens_total
+            .fetch_add(draft_tokens as u64, Ordering::Relaxed);
+        let verified_total = self
+            .inner
+            .spec_verified_tokens_total
+            .fetch_add(verified_tokens as u64, Ordering::Relaxed)
+            .saturating_add(verified_tokens as u64);
+        let accepted_total = self
+            .inner
+            .spec_accepted_tokens_total
+            .fetch_add(accepted_tokens as u64, Ordering::Relaxed)
+            .saturating_add(accepted_tokens as u64);
+        let acceptance_ppm = if verified_total == 0 {
+            0
+        } else {
+            ((accepted_total as f64 / verified_total as f64) * 1_000_000.0).round() as u64
+        };
+        self.inner
+            .spec_acceptance_rate_ppm
+            .store(acceptance_ppm, Ordering::Relaxed);
+        if let Ok(mut histograms) = self.inner.histograms.lock() {
+            histograms.spec_step_latency_us.observe(latency_us as f64);
+        }
+    }
+
     /// Record one DFlash speculative block execution.
     pub fn record_dflash_block(&self, accepted_inputs: usize, block_size: usize) {
         self.inner

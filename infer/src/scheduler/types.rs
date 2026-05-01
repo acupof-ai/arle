@@ -76,8 +76,8 @@ pub struct SchedulerConfig {
     /// Stream chunking interval in generated tokens. 1 matches SGLang's
     /// default and flushes every token.
     pub stream_interval: usize,
-    /// Enable Phase 2 speculative decode. Defaults off; P2.2 only plumbs the
-    /// no-op branch and counters.
+    /// Enable Phase 2 speculative decode. Defaults off; P2.3 routes decode
+    /// steps through the greedy verifier path when enabled.
     pub spec_enabled: bool,
     /// Maximum draft tokens proposed per speculative step.
     pub spec_draft_k: usize,

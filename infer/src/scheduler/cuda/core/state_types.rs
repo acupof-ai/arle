@@ -12,6 +12,11 @@ pub(in crate::scheduler::cuda) struct PendingDecode {
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
+    /// True when the launch was routed through the Phase 2 speculative decode
+    /// verifier path. P2.3's first cut is greedy bit-identical and commits the
+    /// same sampled token as the normal decode path while recording real
+    /// verifier counters.
+    pub speculative: bool,
     pub decode_spans: Vec<(usize, Span)>,
     pub mixed_prefill: Option<PendingMixedPrefill>,
 }
