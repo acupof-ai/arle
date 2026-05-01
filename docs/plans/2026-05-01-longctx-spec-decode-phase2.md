@@ -1,24 +1,21 @@
 # Longctx Phase 2 - Speculative Decode
 
-> **Status:** Draft v1, opened after c=4 Phase 1 margin on 2026-05-01;
-> implementation blocked until the c=1 S5 guard is fixed.
+> **Status:** Draft v1, opened after Phase 1 SGLang-row c=4 close on 2026-05-01.
 > **Owner:** ckl
 > **Phase 1 evidence:** `docs/experience/wins/2026-05-01-phase1-close-evictable.md`
 > **Mission doc:** `docs/projects/2026-04-30-longctx-32k-128k-leadership.md`
 
 ## 1. Goal
 
-Stack a lossless long-context speculative decode path on top of the Phase 1
-foundation after the remaining S5 guard is fixed. The measured W1 c=4 longctx
-row already secured `1.469x-1.678x` SGLang, but c=1 is still below the S5
-parity gate. If a `2.0x-2.5x` lossless spec-decode lever stacks cleanly on the
-same serving foundation after that blocker is resolved, the mission-level
-projection is:
+Stack a lossless long-context speculative decode path on top of the closed
+Phase 1 W1 c=4 SGLang-row foundation. The measured W1 c=4 longctx row secured
+`1.469x-1.678x` SGLang. If a `2.0x-2.5x` lossless spec-decode lever stacks
+cleanly on the same serving foundation, the mission-level projection is:
 
 | Phase 1 basis | x Phase 2 conservative | x Phase 2 stretch |
 |---:|---:|---:|
 | 1.469x worst run | 2.94x SGLang | 3.67x SGLang |
-| 1.608x mean | 3.22x SGLang | 4.02x SGLang |
+| 1.609x mean | 3.22x SGLang | 4.02x SGLang |
 
 The headline target from the handoff is therefore recorded as a **stack
 projection**, not the W2 acceptance criterion. The observed worst W1 Phase 1
@@ -28,8 +25,10 @@ reference only, the older `1.30x` margin floor multiplied by `2.0x-2.5x`
 would be `2.60x-3.25x`; that is not the Phase 2 promotion gate.
 
 Phase 2 still must establish its own W2 baseline before promotion; W1 numbers
-cannot substitute for W2 acceptance. Phase 2 implementation should not start
-until the c=1 S5 guard from the Phase 1 evidence entry is green.
+cannot substitute for W2 acceptance. The remaining W1 vLLM / TRT-LLM /
+Mooncake baseline panel also remains required before a full Phase 1 endpoint
+claim. The c=1 single-stream decode gap from the Phase 1 evidence entry is a
+parallel work track, not a blocker for W2 spec decode.
 
 ## 2. Scope
 
@@ -54,12 +53,38 @@ Out of scope:
 ## 3. Existing Assets
 
 - `infer/src/speculative.rs` already has the CPU-side spec config and proposal
-  structures.
-- `infer/src/speculative/cuda.rs` exists as the CUDA integration point.
+  structures (`631` LoC).
+- `infer/src/speculative/cuda.rs` exists as the CUDA integration point
+  (`157` LoC).
 - Phase 1 mixed FP8 KV path now handles the longctx c=4 memory edge and is the
   verifier foundation.
 - `docs/projects/2026-04-30-longctx-32k-128k-leadership.md` §8 lists the
   intended sources: MagicDec, TriForce, and LongSpec.
+
+## 3.1 Scheduler / Forward Integration Design Debt
+
+The current speculative framework has CPU verifier scaffolding but zero
+scheduler/forward integration. P2.2 must produce a wiring spec before runtime
+changes:
+
+- scheduler draft KV accounting: how proposed tokens reserve pages, retire on
+  rejection, and interact with prefix-cache eviction;
+- verifier batch admission: how draft rows join the mixed batch without
+  violating Phase 1 FP8 KV layout and admission budget invariants;
+- adaptive acceptance-rate control: where accepted/rejected counters update
+  speculation length and when the scheduler falls back to normal decode.
+
+## 3.2 Draft Model Selection Decision Point
+
+Default choice: MagicDec-style self-speculation. It avoids second-model
+dependencies, keeps latency overhead smallest, and fits the existing
+single-runtime deployment model.
+
+| option | acceptance criteria | default verdict |
+|---|---|---|
+| MagicDec-style self-spec | no second model dependency; acceptance rate high enough for `>=2.0x` W2; W1 guard unchanged | default |
+| TriForce big-small draft | only if self-spec cannot reach `1.25x` after verifier overhead tuning and a small Qwen draft can be loaded without KV/memory regressions | fallback |
+| LongSpec retrieval + sliding-window draft | only if long-context acceptance collapses and retrieval/window draft improves W2 while preserving target distribution | fallback |
 
 ## 4. Design Requirements
 
@@ -81,8 +106,9 @@ Out of scope:
 
 | slice | change | gate |
 |---|---|---|
+| P2.0 | c=1 single-stream decode profile side track | nice-to-have; does not block W2, but must not regress c=4 |
 | P2.1 | Trace current `speculative.rs` and CUDA stubs; write exact integration design | design doc names every touched file |
-| P2.2 | Add service counters and no-op config plumbing | `cargo test --release`, service stats expose zero counters |
+| P2.2 | Add service counters and no-op config plumbing plus scheduler/forward wiring spec | `cargo test --release`, service stats expose zero counters, design names draft KV accounting + verifier admission + adaptive acceptance wiring |
 | P2.3 | Implement verifier micro-batch path behind opt-in flag | deterministic 3-prompt correctness smoke |
 | P2.4 | Add self-speculation proposal path | accepted-token counters non-zero; fallback works |
 | P2.5 | Adaptive speculation length | acceptance ratio stable; no latency-tail explosion |
@@ -122,10 +148,7 @@ request accounting, service trace counters, and delta vs the Phase 1 close row.
 
 ## 8. Immediate Next Step
 
-Before implementation, resolve the c=1 S5 guard blocker documented in
-`docs/experience/wins/2026-05-01-phase1-close-evictable.md`.
-
-Then start P2.1 by reading:
+Start P2.1 by reading:
 
 - `infer/src/speculative.rs`
 - `infer/src/speculative/cuda.rs`

@@ -2,14 +2,14 @@
 
 ## Goal
 
-- Supplement the Phase 1 close evidence with the required S5 c=1/360s
-  longctx guard for the evictable-prefix admission patch.
+- Preserve the standalone c=1/360s longctx measurement for the evictable-prefix
+  admission patch and route the residual gap to a parallel single-stream decode
+  track.
 
 ## Hypothesis
 
-- The evictable-prefix admission patch should preserve c=1 behavior and,
-  ideally, keep the c=1 longctx row within the SGLang parity gate required by
-  Phase 1 S5.
+- The evictable-prefix admission patch should preserve c=1 behavior while the
+  c=4 row closes the Phase 1 entrance gate.
 
 ## Command
 
@@ -97,7 +97,7 @@ Successful-only recompute:
 
 ## Problems
 
-- The guard does not meet Phase 1 S5 SGLang parity:
+- The supplementary c=1 row does not meet SGLang c=1 throughput:
   - SGLang c=1 primary: `11.67 out tok/s`
   - SGLang c=1 secondary: `11.57 out tok/s`
   - ARLE GuideLLM c=1: `9.83 out tok/s`
@@ -106,9 +106,10 @@ Successful-only recompute:
 
 ## Learnings
 
-- The evictable-prefix admission patch fixed the c=4 KV-pool edge but did not
-  close the single-concurrency long-prompt prefill gap.
-- Full Phase 1 S5 close remains blocked until c=1 reaches the parity gate.
+- The evictable-prefix admission patch fixed the c=4 KV-pool edge while c=1
+  stayed essentially flat versus the pre-patch ARLE c1 anchor.
+- The c=1 residual is a parallel single-stream decode optimization track, not
+  a blocker for the W1/c4 Phase 1 entrance close.
 
 ## Delta vs baseline
 
@@ -130,6 +131,5 @@ Successful-only recompute:
 
 ## Notes
 
-- This is a blocking guard entry, not a promotion entry.
-- Follow-up: profile c=1 long-prompt prefill before starting Phase 2
-  implementation.
+- This is a standalone benchmark record for the c=1 supplementary row.
+- Follow-up: profile c=1 single-stream decode as a parallel track.

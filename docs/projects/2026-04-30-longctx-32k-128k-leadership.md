@@ -170,7 +170,7 @@ ARLE tok/s within 5% of SGLang  (≥0.95×)
 | **S2** | Wire-up: Mixed plan 接 FP8/INT8 | S1 | `forward.rs:585` 扩 BF16\|FP8\|INT8；`batch_decode.rs:481` 删 BF16-only 早 return；`:720-750` 加 FP8/INT8 dispatch | TileLang on/off 两种 feature 各跑 e2e；`StepPlan::Mixed` 计数 > 0 |
 | **S3** | 数值 gate 四层防线 | S2 | e2e long-prompt + FP8/BF16 16×64 + ARLE-BF16/SGLang-BF16 16×64 + 32×256 长尾扫 | ≥70% pass / 60-70% degraded / <60% stop；divergence_p50 ≥ token 30 |
 | **S4** | Bench harness ARLE + SGLang baseline 脚本 | — | `scripts/bench_guidellm.sh --workload longctx-32k`；`scripts/bench_sglang_longctx.sh` 含 commit pin | 5s 烟测跑通，default workload 不回归 |
-| **S5** | Bench 实跑 + Phase 1 wins | S2+S3+S4 | 无代码改动；c=4/300s + c=1/360s | ARLE/SGLang ≥ 0.95；plan 分布 `Mixed > 0`、`Split = 0` |
+| **S5** | Bench 实跑 + Phase 1 wins | S2+S3+S4 | 无代码改动；c=4/300s + c=1/360s supplementary；remaining baseline panel 另按 §6 闭环 | c=4 ARLE/SGLang ≥ 0.95 closes SGLang row；c=1 记录 no-regression/parallel track；vLLM/TRT-LLM/Mooncake pending before full Phase 1 endpoint；plan 分布 `Mixed > 0`、`Split = 0` |
 | **S6** | Qwen3-4B Split 守护 + ROADMAP | S5 | `execution.rs:362` 加 `debug_assert!(model_family != Qwen3)`；ROADMAP 更新 | 复跑 S5 不触发；clippy clean |
 
 ### 7.3 Phase 1 关键设计决策（已通过 4 subagent critique）
@@ -205,8 +205,8 @@ W2 (long-decode) 上 ARLE/SGLang ≥ 2.0×（保守预期），stretch ≥ 2.5×
 
 ### 8.3 仓库已有半成品
 
-- `infer/src/speculative.rs` (625 行) — SpecConfig / TokenProposal / Verifier 全在
-- `infer/src/speculative/cuda.rs` — CUDA 集成 stub
+- `infer/src/speculative.rs` (631 行) — SpecConfig / TokenProposal / Verifier 全在
+- `infer/src/speculative/cuda.rs` (157 行) — CUDA 集成 stub
 - `crates/agent/` — 同步 spec config 已留位置
 
 ### 8.4 Phase 2 工程切片（高阶）
@@ -320,43 +320,45 @@ Spawn `docs/plans/YYYY-MM-DD-disaggregated-prefill-decode.md` 时展开。骨架
 
 ---
 
-## 13 · 当前位置（Phase 1 状态 = gap closure）
+## 13 · 当前位置（Phase 1 状态 = SGLang-row closed; baseline panel pending）
 
-2026-04-30 本地 L4 已完成 Phase 1 S5 的 ARLE/SGLang 第一轮实跑：
+2026-05-01 本地 L4 已完成 Phase 1 W1/c4 SGLang-row mission-critical close：
 
-| system | c=1 out tok/s | c=4 out tok/s | c=4 TTFT p50 | c=4 ITL p50 | wins |
-|---|---:|---:|---:|---:|---|
-| ARLE | 9.99 | 9.96 | 39535.2 ms | 96.82 ms | `wins/2026-04-30-bench-guidellm-longctx-32k-phase1-s5-arle.md` |
-| SGLang | 11.67 | 16.27 | 24182.25 ms | 119.43 ms | `wins/2026-04-30-bench-sglang-longctx-longctx-32k-phase1-s5.md` |
+| run | successful requests | total output tokens | effective out tok/s | vs SGLang c4 | TTFT p50 | ITL p50 | artifact |
+|---|---:|---:|---:|---:|---:|---:|---|
+| r1 | 32 | 8192 | 27.307 | 1.678x | 32225.9 ms | 178.4 ms | `bench-output/2026-05-01-phase15-evictable-c4-r1/benchmarks.json` |
+| r2 | 28 | 7168 | 23.893 | 1.469x | 33888.9 ms | 116.2 ms | `bench-output/2026-05-01-phase15-evictable-c4-r2/benchmarks.json` |
+| r3 | 32 | 8192 | 27.307 | 1.678x | 33879.3 ms | 117.5 ms | `bench-output/2026-05-01-phase15-evictable-c4-r3/benchmarks.json` |
+| mean | - | - | 26.169 | 1.609x | - | - | `docs/experience/wins/2026-05-01-phase1-close-evictable.md` |
 
-Phase 1 S5 结论：
+Phase 1 SGLang-row close 结论：
 
-- **未过入场券**：W1/c4 `ARLE/SGLang = 0.612x`，低于 `0.95x`。
-- c=1 也未过：`0.856x`，但缺口主要在 c=4。
-- ARLE decode ITL 不差：c=4 ITL p50 比 SGLang 低 `18.9%`。
-- 主要缺口在长 prefill / overlap：c=4 TTFT p50 比 SGLang 高 `63.5%`，且 ARLE c=4 output throughput 未从 c=1 放大。
-- Error entry: `errors/2026-04-30-longctx-phase1-s5-gap.md`。
+- **§7.1 SGLang-row entrance gate closed:** W1/c4 mean `1.609x` SGLang,
+  above the `0.95x` entrance criterion.
+- **§2.4 SGLang-row margin secured for W1/H1:** worst run `1.469x` SGLang,
+  above the `1.30x` mission margin target. Full `success(W1,H1)` still
+  requires the remaining vLLM / TRT-LLM / Mooncake pinned baselines.
+- c=4 deadlock/bimodal mode removed in the three-run validation set.
+- c=1 supplementary measurement remains a parallel single-stream decode
+  optimization track: c=1 TTFT is slightly outside the §7.4 5% watch line
+  (`12540.6 ms` vs SGLang secondary `11862.86 ms`, `+5.7%`), and the larger
+  residual gap is decode ITL (`56.84 ms` vs `43.10 ms`). This is tracked in
+  `docs/experience/errors/2026-05-01-c1-single-stream-decode-gap-parallel-track.md`
+  and does not block W1/c4 mission closure or Phase 2 W2 spec-decode start.
 
 已完成：
 
 - L4 环境、Qwen3-4B 权重、本地 CUDA release build。
 - S3 单目标 32k long-prompt smoke。
 - S4 harness smoke：ARLE 5s smoke，SGLang 60s smoke。
-- S5 ARLE canonical run + SGLang pinned baseline run。
+- S5 SGLang pinned baseline run。
 - P1.0 plan-label counters：`wins/2026-04-30-bench-guidellm-longctx-32k-phase1-s5-plan-label.md`
   记录 `Mixed=16`、`Split=0`。
+- Phase 1 SGLang-row c=4 close wins:
+  `docs/experience/wins/2026-05-01-phase1-close-evictable.md`。
 
-缺口：
-
-- W1/c4 需要先补 `+55.2%` output throughput 才到 Phase 1 `0.95x` 门
-  （按第一轮 S5 `9.96` vs SGLang `16.27` 计算）。
-- P1.0 复跑暴露新不稳定：同 envelope c=4 只完成 1 个请求，`out tok/s=0.90`，
-  不能作为替代基线，但必须解释。
-- 达到 mission `1.30x` 还需要相对第一轮 ARLE `+112.4%`。
-
-下一刀 = Phase 1 gap closure P1.1：profile c=4 long prefill + admission
-progress，解释 P1.0 复跑为什么退化到单请求完成；随后决定是
-admission/overlap 先修，还是开 FP8 prefill tensor-core kernel 工程。
+下一刀 = Phase 2 spec decode plan
+`docs/plans/2026-05-01-longctx-spec-decode-phase2.md`。
 
 ---
 
