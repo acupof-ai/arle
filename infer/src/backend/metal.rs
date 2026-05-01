@@ -154,6 +154,8 @@ pub struct MetalBackend {
     #[cfg(feature = "metal")]
     kv_pool_enabled: bool,
     #[cfg(feature = "metal")]
+    kv_disk_options: Option<MetalKvDiskOptions>,
+    #[cfg(feature = "metal")]
     runtime_limits: MetalRuntimeLimits,
     #[cfg(not(feature = "metal"))]
     _weights: (),
@@ -178,6 +180,7 @@ impl MetalBackend {
         let MetalBackendOptions {
             dflash,
             kv_pool,
+            kv_disk,
             runtime_limits,
         } = options;
 
@@ -193,6 +196,8 @@ impl MetalBackend {
             dflash: None,
             #[cfg(feature = "metal")]
             kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(kv_pool),
+            #[cfg(feature = "metal")]
+            kv_disk_options: kv_disk,
             #[cfg(feature = "metal")]
             runtime_limits,
             #[cfg(not(feature = "metal"))]
@@ -494,7 +499,55 @@ pub struct MetalBackendOptions {
     #[cfg(feature = "metal")]
     pub kv_pool: Option<bool>,
     #[cfg(feature = "metal")]
+    pub kv_disk: Option<MetalKvDiskOptions>,
+    #[cfg(feature = "metal")]
     pub runtime_limits: MetalRuntimeLimits,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetalKvDiskOptions {
+    pub dir: PathBuf,
+    pub max_bytes: Option<u64>,
+    pub high_watermark: f64,
+    pub low_watermark: f64,
+    pub fsync_each_block: bool,
+}
+
+impl MetalKvDiskOptions {
+    pub const DEFAULT_HIGH_WATERMARK: f64 = 0.90;
+    pub const DEFAULT_LOW_WATERMARK: f64 = 0.75;
+
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            max_bytes: None,
+            high_watermark: Self::DEFAULT_HIGH_WATERMARK,
+            low_watermark: Self::DEFAULT_LOW_WATERMARK,
+            fsync_each_block: false,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.dir.as_os_str().is_empty() {
+            anyhow::bail!("Metal SSD KV cache dir must not be empty");
+        }
+        if self.max_bytes == Some(0) {
+            anyhow::bail!("Metal SSD KV cache max bytes must be greater than zero");
+        }
+        if !self.high_watermark.is_finite()
+            || !self.low_watermark.is_finite()
+            || !(0.0..=1.0).contains(&self.high_watermark)
+            || !(0.0..=1.0).contains(&self.low_watermark)
+            || self.low_watermark > self.high_watermark
+        {
+            anyhow::bail!(
+                "invalid Metal SSD KV cache watermarks low={} high={}",
+                self.low_watermark,
+                self.high_watermark
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "metal")]
@@ -572,6 +625,20 @@ impl InferenceBackend for MetalBackend {
     fn load(&mut self, model_path: &Path) -> Result<()> {
         #[cfg(feature = "metal")]
         self.runtime_limits.apply();
+        #[cfg(feature = "metal")]
+        if let Some(options) = &self.kv_disk_options {
+            options.validate()?;
+            log::info!(
+                "Metal SSD KV cache configured: dir={} max_bytes={} watermarks={:.2}/{:.2} fsync_each_block={}",
+                options.dir.display(),
+                options
+                    .max_bytes
+                    .map_or_else(|| "unbounded".to_string(), |bytes| bytes.to_string()),
+                options.high_watermark,
+                options.low_watermark,
+                options.fsync_each_block,
+            );
+        }
 
         // ── 1. Resolve model path ────────────────────────────────────────────
         let path_str = model_path.to_string_lossy();
@@ -736,6 +803,32 @@ impl StreamingInferenceBackend for MetalBackend {
 
 const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod option_tests {
+    use super::MetalKvDiskOptions;
+
+    #[test]
+    fn metal_kv_disk_options_validate_watermarks() {
+        let mut options = MetalKvDiskOptions::new("kv-cache");
+        assert!(options.validate().is_ok());
+
+        options.low_watermark = 0.95;
+        options.high_watermark = 0.90;
+        assert!(options.validate().is_err());
+
+        options.low_watermark = 0.75;
+        options.high_watermark = f64::NAN;
+        assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn metal_kv_disk_options_reject_zero_budget() {
+        let mut options = MetalKvDiskOptions::new("kv-cache");
+        options.max_bytes = Some(0);
+        assert!(options.validate().is_err());
+    }
+}
 
 #[cfg(all(test, feature = "metal"))]
 mod tests {
