@@ -44,15 +44,6 @@ fn scheduler_config_zero_chunk_invalid() {
 }
 
 #[test]
-fn scheduler_config_rejects_invalid_decode_headroom_ratio() {
-    let cfg = SchedulerConfig {
-        decode_headroom_ratio: 1.25,
-        ..Default::default()
-    };
-    assert!(cfg.validate().is_err());
-}
-
-#[test]
 fn priority_ordering() {
     assert!(RequestPriority::High > RequestPriority::Normal);
     assert!(RequestPriority::Normal > RequestPriority::Low);

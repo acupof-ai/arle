@@ -42,10 +42,6 @@ pub struct SchedulerConfig {
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.
     pub prefill_max_requests: Option<usize>,
-    /// Fraction of clipped remaining decode tokens reserved as KV headroom
-    /// when admitting prefill work. This is SGLang-style `new_token_ratio`
-    /// scaffolding, not a percent of the whole KV pool.
-    pub decode_headroom_ratio: f64,
     /// Prompt length at or below which prefix staging/prefetch and
     /// decode+prefill split launches are bypassed.
     ///
@@ -125,7 +121,6 @@ impl Default for SchedulerConfig {
             max_prefill_tokens: 16384,
             long_prefill_token_threshold: 512,
             prefill_max_requests: None,
-            decode_headroom_ratio: 0.10,
             short_prompt_bypass_tokens: 256,
             prefix_cache_enabled: true,
             schedule_policy: SchedulePolicy::Fcfs,
@@ -281,9 +276,6 @@ impl SchedulerConfig {
         }
         if matches!(self.prefill_max_requests, Some(0)) {
             anyhow::bail!("prefill_max_requests must be ≥ 1 when provided");
-        }
-        if !(0.0..=1.0).contains(&self.decode_headroom_ratio) {
-            anyhow::bail!("decode_headroom_ratio must be in [0, 1]");
         }
         if self.stream_interval == 0 {
             anyhow::bail!("stream_interval must be ≥ 1");
