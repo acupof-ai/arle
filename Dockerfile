@@ -1,55 +1,85 @@
-# ============================================================================
-# ARLE: multi-stage Docker build
-# ============================================================================
-# Build:  docker build -t arle .
-# Run:    docker run --gpus all -v /path/to/model:/model ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /model
-# ============================================================================
+# syntax=docker/dockerfile:1.7
 
-# --- Stage 1: Build ---
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
+ARG CUDA_IMAGE=nvidia/cuda:12.8.0-devel-ubuntu22.04
+ARG RUST_TOOLCHAIN=1.95.0
+ARG ZIG_VERSION=0.16.0
+
+FROM ${CUDA_IMAGE} AS base
+ARG RUST_TOOLCHAIN
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
-ENV PATH="/usr/local/cargo/bin:${PATH}"
+ENV PATH=/usr/local/cargo/bin:/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential pkg-config libssl-dev python3 python3-pip python3-venv git ca-certificates \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    build-essential \
+    libffi-dev \
+    libssl-dev \
+    pkg-config \
+    python3 \
+    python3-pip \
+    python3-venv \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" \
+    && rustup component add rustfmt clippy
 
-# Install Python build deps (Triton AOT + FlashInfer + TileLang AOT)
-RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir flashinfer-python==0.6.3 triton==3.5.1 "tilelang>=0.1"
+FROM base AS python-deps
 
-ENV INFER_TRITON_PYTHON=/opt/venv/bin/python3
-ENV INFER_TILELANG_PYTHON=/opt/venv/bin/python3
-ENV CUDA_HOME=/usr/local/cuda
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python3 -m pip install --no-cache-dir \
+      torch \
+      flashinfer-python==0.6.9 \
+      tilelang \
+      "guidellm[recommended]==0.6.0" \
+      huggingface_hub==0.36.2
 
-WORKDIR /build
+FROM base AS zig-toolchain
+ARG ZIG_VERSION
+
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /opt \
+    && mv "/opt/zig-x86_64-linux-${ZIG_VERSION}" /opt/zig
+
+FROM python-deps AS dev
+
+WORKDIR /workspace
+
+COPY --from=zig-toolchain /opt/zig /opt/zig
+RUN ln -s /opt/zig/zig /usr/local/bin/zig && zig version
+
+ENV ZIG=/opt/zig/zig
+ENV INFER_TRITON_PYTHON=/usr/bin/python3
+ENV INFER_TILELANG_PYTHON=/usr/bin/python3
+
+CMD ["bash"]
+
+FROM dev AS builder
+
 COPY . .
 
-# kv-native-sys's build script needs the Zig 0.16 toolchain. The repo-managed
-# installer downloads a pinned tarball into .toolchains/zig and prints the
-# resolved zig binary; export it as ZIG so the build script picks it up.
-RUN ZIG="$(./scripts/setup_zig_toolchain.sh --print-zig)" && \
-    echo "ZIG=$ZIG" > /tmp/zig.env
+RUN cargo build -p infer --release --features cuda \
+    && cargo build --release --features cuda,cli -p agent-infer --bin arle
 
-RUN . /tmp/zig.env && \
-    ZIG="$ZIG" cargo build -p infer --release --features cuda && \
-    ZIG="$ZIG" cargo build --release --features cuda,cli -p agent-infer --bin arle
-
-# --- Stage 2: Runtime ---
-FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates python3 \
+    ca-certificates \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/infer /usr/local/bin/infer
-COPY --from=builder /build/target/release/arle /usr/local/bin/arle
+COPY --from=builder /workspace/target/release/infer /usr/local/bin/infer
+COPY --from=builder /workspace/target/release/arle /usr/local/bin/arle
 RUN ln -s /usr/local/bin/arle /usr/local/bin/agent-infer
 
 ENV LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64
