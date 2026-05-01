@@ -59,6 +59,20 @@ impl BlockFingerprint {
     /// Compute a stable 16-byte content fingerprint over the full block
     /// identity chain.
     pub fn compute(ctx: KvContentContext<'_>, tokens: &[u32]) -> Self {
+        Self::compute_with_multimodal_hashes(ctx, tokens, &[])
+    }
+
+    /// Compute a block fingerprint that also binds non-text media identities.
+    ///
+    /// `mm_hashes` must be in the same order as the synthetic multimodal
+    /// pad-token sequences inserted into `tokens`. Keeping these hashes outside
+    /// the token stream preserves persisted KV identity even when tokenizer or
+    /// packing conventions change.
+    pub fn compute_with_multimodal_hashes(
+        ctx: KvContentContext<'_>,
+        tokens: &[u32],
+        mm_hashes: &[[u8; 16]],
+    ) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(b"infer-kv-v2\x00");
         h.update(b"model\x00");
@@ -80,6 +94,13 @@ impl BlockFingerprint {
         h.update(&(tokens.len() as u64).to_le_bytes());
         for &t in tokens {
             h.update(&t.to_le_bytes());
+        }
+        if !mm_hashes.is_empty() {
+            h.update(b"mm_hashes\x00");
+            h.update(&(mm_hashes.len() as u64).to_le_bytes());
+            for mm_hash in mm_hashes {
+                h.update(mm_hash);
+            }
         }
         let full = h.finalize();
         let mut bytes = [0u8; 16];
@@ -275,6 +296,40 @@ mod tests {
         );
 
         assert_ne!(fp, BlockFingerprint([0; 16]));
+    }
+
+    #[test]
+    fn multimodal_fingerprint_empty_hashes_match_text_path() {
+        let ctx = KvContentContext {
+            model_fingerprint: b"qwen3-vl",
+            kv_format_tag: 1,
+            parent: Some(BlockFingerprint([0x11; 16])),
+        };
+        let tokens = [1, 2, 3, 4];
+
+        assert_eq!(
+            BlockFingerprint::compute(ctx, &tokens),
+            BlockFingerprint::compute_with_multimodal_hashes(ctx, &tokens, &[])
+        );
+    }
+
+    #[test]
+    fn multimodal_fingerprint_binds_media_hashes() {
+        let ctx = KvContentContext {
+            model_fingerprint: b"qwen3-vl",
+            kv_format_tag: 1,
+            parent: None,
+        };
+        let tokens = [1, 0x8000_0001, 2];
+        let image_a = [[0xAA; 16]];
+        let image_b = [[0xBB; 16]];
+
+        let text_only = BlockFingerprint::compute(ctx, &tokens);
+        let with_a = BlockFingerprint::compute_with_multimodal_hashes(ctx, &tokens, &image_a);
+        let with_b = BlockFingerprint::compute_with_multimodal_hashes(ctx, &tokens, &image_b);
+
+        assert_ne!(text_only, with_a);
+        assert_ne!(with_a, with_b);
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub mod tokenizer;
 pub mod tp;
 pub mod trace_reporter;
 pub mod types;
+pub mod vision;
 #[cfg(all(test, feature = "metal"))]
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
