@@ -43,6 +43,20 @@ impl RequestSpecConfig {
             )
         })
     }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn allows_sparse_self_spec(&self, default_draft_k: usize) -> bool {
+        if self.enabled == Some(false) || self.draft_k.unwrap_or(default_draft_k) != default_draft_k
+        {
+            return false;
+        }
+        self.draft_model.as_deref().is_none_or(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "self" | "self-spec" | "selfspec"
+            )
+        })
+    }
 }
 
 /// Scheduler configuration.
@@ -344,19 +358,10 @@ impl SchedulerConfig {
         }
         if self.spec_enabled
             && matches!(self.spec_draft_model, DraftMode::SelfSpec)
-            && self.spec_sparse_kv_enabled
-        {
-            anyhow::bail!(
-                "self-spec sparse-KV forward is not wired yet; keep spec_sparse_kv_enabled=false until P2.B.3"
-            );
-        }
-        if self.spec_enabled
-            && matches!(self.spec_draft_model, DraftMode::SelfSpec)
             && self.spec_draft_k > 1
+            && !self.spec_sparse_kv_enabled
         {
-            anyhow::bail!(
-                "self-spec multi-token verifier is not implemented yet; set spec_draft_k=1 for the P2.3 canary"
-            );
+            anyhow::bail!("self-spec multi-token verifier requires spec_sparse_kv_enabled=true");
         }
         if !(0.0..=1.0).contains(&self.spec_acceptance_threshold) {
             anyhow::bail!("spec_acceptance_threshold must be in [0, 1]");
@@ -726,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn self_spec_multi_token_rejected_until_sparse_forward_lands() {
+    fn self_spec_multi_token_requires_sparse_forward() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.spec_enabled = true;
         cfg.spec_draft_model = DraftMode::SelfSpec;
@@ -734,14 +739,14 @@ mod tests {
 
         let err = cfg
             .validate()
-            .expect_err("multi-token self-spec must reject");
+            .expect_err("multi-token self-spec needs sparse forward");
         assert!(
-            err.to_string().contains("multi-token verifier"),
+            err.to_string().contains("spec_sparse_kv_enabled"),
             "unexpected error: {err}"
         );
 
-        cfg.spec_draft_k = 1;
-        cfg.validate().expect("single-token canary remains valid");
+        cfg.spec_sparse_kv_enabled = true;
+        cfg.validate().expect("sparse self-spec is valid");
     }
 
     #[test]
@@ -765,20 +770,15 @@ mod tests {
     }
 
     #[test]
-    fn sparse_kv_does_not_unlock_self_spec_multi_token_before_forward_wiring() {
+    fn sparse_kv_unlocks_self_spec_multi_token_after_forward_wiring() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.spec_enabled = true;
         cfg.spec_draft_model = DraftMode::SelfSpec;
-        cfg.spec_draft_k = 1;
+        cfg.spec_draft_k = 5;
         cfg.spec_sparse_kv_enabled = true;
 
-        let err = cfg
-            .validate()
-            .expect_err("P2.B.1 sparse view does not wire sparse forward yet");
-        assert!(
-            err.to_string().contains("sparse-KV forward"),
-            "unexpected error: {err}"
-        );
+        cfg.validate()
+            .expect("P2.B.3 sparse forward allows multi-token self-spec");
     }
 
     #[test]
@@ -802,6 +802,41 @@ mod tests {
             ..spec
         };
         assert!(!spec.allows_single_token_canary(1));
+    }
+
+    #[test]
+    fn request_spec_sparse_self_spec_honors_opt_outs() {
+        let spec = RequestSpecConfig {
+            enabled: Some(false),
+            draft_k: None,
+            acceptance_threshold: None,
+            draft_model: Some("self".to_string()),
+        };
+        assert!(!spec.allows_sparse_self_spec(5));
+
+        let spec = RequestSpecConfig {
+            enabled: Some(true),
+            draft_k: Some(4),
+            acceptance_threshold: None,
+            draft_model: Some("self".to_string()),
+        };
+        assert!(!spec.allows_sparse_self_spec(5));
+
+        let spec = RequestSpecConfig {
+            enabled: Some(true),
+            draft_k: Some(5),
+            acceptance_threshold: None,
+            draft_model: Some("external:/models/draft".to_string()),
+        };
+        assert!(!spec.allows_sparse_self_spec(5));
+
+        let spec = RequestSpecConfig {
+            enabled: Some(true),
+            draft_k: Some(5),
+            acceptance_threshold: None,
+            draft_model: Some("self-spec".to_string()),
+        };
+        assert!(spec.allows_sparse_self_spec(5));
     }
 
     #[test]

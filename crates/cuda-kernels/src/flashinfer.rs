@@ -904,6 +904,89 @@ impl FlashInferDecodeMetadata {
         Ok(reallocated)
     }
 
+    /// Upload metadata for one sparse-KV decode row.
+    ///
+    /// `sparse_page_indices` must be in logical attention order. The final
+    /// page length is taken from the real slot tail only when the sparse view
+    /// ends with the slot's current tail page; otherwise all selected pages are
+    /// treated as sealed full pages.
+    pub fn update_sparse_single(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot: usize,
+        sparse_page_indices: &[u32],
+    ) -> Result<bool> {
+        ensure!(
+            !sparse_page_indices.is_empty(),
+            "sparse decode metadata requires at least one page"
+        );
+        ensure!(
+            sparse_page_indices.len() <= self.max_total_pages,
+            "sparse decode metadata exceeded capacity: pages={} capacity={}",
+            sparse_page_indices.len(),
+            self.max_total_pages
+        );
+
+        let seq_len = pool.seq_len(slot);
+        ensure!(seq_len > 0, "sparse decode slot {slot} has empty KV");
+
+        self.positions_scratch.clear();
+        self.positions_scratch.push((seq_len - 1) as i32);
+        ctx.stream
+            .memcpy_htod(&self.positions_scratch, &mut self.positions)
+            .map_err(|e| anyhow::anyhow!("H2D sparse positions: {e}"))?;
+
+        self.indptr_h.clear();
+        self.indptr_h.push(0);
+        self.indptr_h.push(sparse_page_indices.len() as i32);
+        ctx.stream
+            .memcpy_htod(&self.indptr_h, &mut self.kv_indptr)
+            .map_err(|e| anyhow::anyhow!("H2D sparse indptr: {e}"))?;
+
+        let slot_pages = pool.page_indices(slot);
+        let tail_page = slot_pages
+            .last()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("sparse decode slot {slot} has no pages"))?;
+        let sparse_last_page_len = if sparse_page_indices.last().copied() == Some(tail_page) {
+            pool.build_last_page_lens(&[slot])[0]
+        } else {
+            pool.page_size as i32
+        };
+        let last_page_lens_h = [sparse_last_page_len];
+        ctx.stream
+            .memcpy_htod(&last_page_lens_h, &mut self.kv_last_page_len)
+            .map_err(|e| anyhow::anyhow!("H2D sparse last_page_len: {e}"))?;
+
+        self.qo_indptr_h.clear();
+        self.qo_indptr_h.extend([0, 1]);
+        ctx.stream
+            .memcpy_htod(&self.qo_indptr_h, &mut self.qo_indptr)
+            .map_err(|e| anyhow::anyhow!("H2D sparse qo_indptr: {e}"))?;
+
+        self.indices_scratch.clear();
+        self.indices_scratch
+            .extend(sparse_page_indices.iter().map(|&page| page as i32));
+        ctx.stream
+            .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
+            .map_err(|e| anyhow::anyhow!("H2D sparse indices: {e}"))?;
+
+        self.last_token_scratch.clear();
+        self.last_token_scratch
+            .extend(pool.build_last_indices(&[slot]));
+        ctx.stream
+            .memcpy_htod(&self.last_token_scratch, &mut self.last_token_indices)
+            .map_err(|e| anyhow::anyhow!("H2D sparse last_token_indices: {e}"))?;
+
+        self.total_tokens = sparse_page_indices.len();
+        self.plan_batch_size = 0;
+        self.plan_dirty = true;
+        self.prev_slot_indices.clear();
+        self.prev_slot_epochs.clear();
+        Ok(false)
+    }
+
     /// Upload metadata for a mixed decode + packed prefill batch.
     ///
     /// Layout:
