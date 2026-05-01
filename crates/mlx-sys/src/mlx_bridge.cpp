@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include <cstring>
 #include <stdexcept>
 
 namespace {
@@ -1333,6 +1334,30 @@ const int32_t* mlx_array_data_int32(mlx_array* a) {
 
 size_t mlx_array_size(mlx_array* a) {
     MLX_TRY_RETURN_VALUE(0, to_arr(a)->size());
+}
+
+size_t mlx_array_nbytes(mlx_array* a) {
+    MLX_TRY_RETURN_VALUE(0, to_arr(a)->nbytes());
+}
+
+size_t mlx_array_export_bytes(mlx_array* a, void* out, size_t out_len) {
+    MLX_TRY_RETURN_VALUE(0, [&]() -> size_t {
+        if (a == nullptr) {
+            throw std::invalid_argument("mlx_array_export_bytes received null array");
+        }
+        auto arr = contiguous(*to_arr(a));
+        eval(arr);
+
+        size_t nbytes = arr.nbytes();
+        if (out_len < nbytes) {
+            throw std::invalid_argument("mlx_array_export_bytes output buffer is too small");
+        }
+        if (nbytes > 0 && out == nullptr) {
+            throw std::invalid_argument("mlx_array_export_bytes received null output buffer");
+        }
+        std::memcpy(out, arr.data<char>(), nbytes);
+        return nbytes;
+    }());
 }
 
 // === Binary ops ===

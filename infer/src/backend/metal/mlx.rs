@@ -98,6 +98,15 @@ impl Dtype {
             _ => None,
         }
     }
+
+    pub fn byte_size(self) -> usize {
+        match self {
+            Dtype::Bool | Dtype::Uint8 | Dtype::Int8 => 1,
+            Dtype::Uint16 | Dtype::Int16 | Dtype::Float16 | Dtype::Bfloat16 => 2,
+            Dtype::Uint32 | Dtype::Int32 | Dtype::Float32 => 4,
+            Dtype::Uint64 | Dtype::Int64 | Dtype::Float64 | Dtype::Complex64 => 8,
+        }
+    }
 }
 
 pub struct MlxArray(*mut mlx_sys::mlx_array);
@@ -184,6 +193,25 @@ impl MlxArray {
     pub fn from_slice_f32(data: &[f32], shape: &[i32]) -> Self {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Float32) }
     }
+    pub fn from_bytes(bytes: &[u8], shape: &[i32], dtype: Dtype) -> anyhow::Result<Self> {
+        let expected = nbytes_for_shape(shape, dtype)?;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "MLX byte import length {} does not match shape {:?} dtype {:?} (expected {})",
+            bytes.len(),
+            shape,
+            dtype,
+            expected
+        );
+        unsafe {
+            Self::from_raw_checked(mlx_sys::mlx_array_from_data(
+                bytes.as_ptr().cast(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype.to_raw(),
+            ))
+        }
+    }
     pub fn scalar_f32(val: f32) -> Self {
         mlx_array_from_raw_or_panic(
             unsafe { mlx_sys::mlx_array_new_float32(val) },
@@ -258,6 +286,42 @@ impl MlxArray {
             std::slice::from_raw_parts(ptr, len).to_vec()
         }
     }
+    pub fn nbytes(&self) -> usize {
+        let nbytes = unsafe { mlx_sys::mlx_array_nbytes(self.0) };
+        panic_if_mlx_error("mlx_array_nbytes");
+        nbytes
+    }
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        let nbytes = self.nbytes();
+        let mut bytes = vec![0_u8; nbytes];
+        if nbytes == 0 {
+            return Ok(bytes);
+        }
+
+        let written = unsafe {
+            mlx_sys::mlx_array_export_bytes(self.0, bytes.as_mut_ptr().cast(), bytes.len())
+        };
+        if written != nbytes {
+            check_mlx_error()?;
+            anyhow::bail!(
+                "MLX byte export wrote {} bytes, expected {}",
+                written,
+                nbytes
+            );
+        }
+        Ok(bytes)
+    }
+}
+
+fn nbytes_for_shape(shape: &[i32], dtype: Dtype) -> anyhow::Result<usize> {
+    let elements = shape.iter().try_fold(1_usize, |acc, &dim| {
+        anyhow::ensure!(dim >= 0, "MLX shape contains negative dim: {shape:?}");
+        acc.checked_mul(dim as usize)
+            .ok_or_else(|| anyhow::anyhow!("MLX shape byte length overflow: {shape:?}"))
+    })?;
+    elements
+        .checked_mul(dtype.byte_size())
+        .ok_or_else(|| anyhow::anyhow!("MLX shape byte length overflow: {shape:?} {dtype:?}"))
 }
 
 // ── Ops ──────────────────────────────────────────────────────────────────────
@@ -1048,6 +1112,32 @@ mod tests {
         let ints = MlxArray::from_slice_i32(&[1, 2, 3], &[3]);
         let ints64 = as_dtype(&ints, Dtype::Int64);
         assert_eq!(ints64.dtype(), Dtype::Int64);
+    }
+
+    #[test]
+    fn mlx_array_bytes_roundtrip_preserves_i32_shape_and_data() {
+        let _guard = metal_test_guard();
+        let original = MlxArray::from_slice_i32(&[10, 20, 30, 40], &[2, 2]);
+        let bytes = original.to_bytes().expect("export bytes");
+        assert_eq!(bytes.len(), 4 * std::mem::size_of::<i32>());
+
+        let restored = MlxArray::from_bytes(&bytes, &[2, 2], Dtype::Int32).expect("import bytes");
+        eval(&[&restored]);
+
+        assert_eq!(restored.shape(), &[2, 2]);
+        assert_eq!(restored.dtype(), Dtype::Int32);
+        assert_eq!(restored.as_slice_i32(), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn mlx_array_bytes_import_rejects_wrong_length() {
+        let _guard = metal_test_guard();
+        let err = MlxArray::from_bytes(&[1, 2, 3], &[2], Dtype::Int32)
+            .expect_err("wrong byte length must fail");
+        assert!(
+            err.to_string().contains("does not match"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
