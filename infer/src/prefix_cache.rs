@@ -49,6 +49,7 @@ use crate::kv_tier::{
 use crate::scheduler::policy::{EvictionCandidate, EvictionPolicy, SchedulerSignals};
 use crate::types::{BlockFingerprint, SessionId};
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct SparseDraftCandidate {
     block_id: BlockId,
@@ -160,6 +161,11 @@ struct Node {
     /// Write-side persistence state for background store work.
     #[serde(default)]
     store_state: StoreState,
+    /// Runtime-only marker for P2.B sparse-KV drafting. A sparse draft view can
+    /// exclude a block from the draft attention window while the authoritative
+    /// full-KV verifier still owns the physical pages.
+    #[serde(default, skip)]
+    sparse_dropped: bool,
     /// Children, indexed by the first token of their edge.
     children: HashMap<u32, usize>,
 }
@@ -180,6 +186,7 @@ impl Node {
             host_spill_pin_until: None,
             entry_state: IndexEntryState::Ready,
             store_state: StoreState::Idle,
+            sparse_dropped: false,
             children: HashMap::new(),
         }
     }
@@ -1040,7 +1047,8 @@ impl RadixCache {
     /// by radix LRU recency, then always include the most recent
     /// `recent_tokens` worth of blocks by path depth. The recent window may
     /// make the result larger than `top_k`.
-    pub fn select_sparse_pages_for_draft(
+    #[allow(dead_code)]
+    pub(crate) fn select_sparse_pages_for_draft(
         &self,
         slot_idx: usize,
         recent_tokens: usize,
@@ -1083,7 +1091,8 @@ impl RadixCache {
     /// Prefer this over [`Self::select_sparse_pages_for_draft`] when active
     /// request tokens are available: it avoids pulling same-slot blocks from
     /// stale divergent radix branches.
-    pub fn select_sparse_pages_for_draft_tokens(
+    #[allow(dead_code)]
+    pub(crate) fn select_sparse_pages_for_draft_tokens(
         &self,
         slot_idx: usize,
         tokens: &[u32],
@@ -1102,7 +1111,8 @@ impl RadixCache {
     /// Select a sparse draft view along one request token path, treating
     /// directly attached prefix blocks as active for `slot_idx` even though
     /// their radix metadata still points at the source slot.
-    pub fn select_sparse_pages_for_draft_tokens_with_attached(
+    #[allow(dead_code)]
+    pub(crate) fn select_sparse_pages_for_draft_tokens_with_attached(
         &self,
         slot_idx: usize,
         tokens: &[u32],
@@ -1151,6 +1161,7 @@ impl RadixCache {
         self.select_sparse_pages_from_candidates(candidates, recent_tokens, top_k)
     }
 
+    #[allow(dead_code)]
     fn select_sparse_pages_from_candidates(
         &self,
         mut candidates: Vec<SparseDraftCandidate>,
@@ -1189,6 +1200,63 @@ impl RadixCache {
         }
 
         selected
+    }
+
+    /// Mark non-selected GPU blocks for a sparse draft view.
+    ///
+    /// P2.B.2 is deliberately metadata-only: this does not remove radix nodes,
+    /// decrement refs, or release physical paged-KV pages. It records that the
+    /// draft view may ignore these blocks while the full verifier keeps the
+    /// canonical KV intact. Only unpinned ready blocks for `slot_idx` can add
+    /// eviction headroom. Explicitly attached cross-slot blocks may be marked
+    /// even while ref-counted so the sparse draft can omit them, but the normal
+    /// `node_is_reclaimable_now` guard keeps them out of evictable accounting.
+    #[allow(dead_code)]
+    pub(crate) fn drop_pages_for_sparse_view(
+        &mut self,
+        slot_idx: usize,
+        sparse_page_ids: &[BlockId],
+        attached_page_ids: &[BlockId],
+    ) -> Vec<BlockId> {
+        let Ok(slot_idx) = u32::try_from(slot_idx) else {
+            return Vec::new();
+        };
+        let keep: std::collections::HashSet<BlockId> = sparse_page_ids.iter().copied().collect();
+        let attached: std::collections::HashSet<BlockId> =
+            attached_page_ids.iter().copied().collect();
+        let now = self.clock;
+        let mut dropped = Vec::new();
+
+        for node in &mut self.nodes {
+            let Some(block_id) = node.block_id else {
+                continue;
+            };
+            if keep.contains(&block_id) {
+                node.sparse_dropped = false;
+                continue;
+            }
+            let active_for_slot = matches!(
+                node.tier_location.as_ref(),
+                Some(BlockLocation::Gpu { slot }) if *slot == slot_idx
+            ) || attached.contains(&block_id);
+            if !active_for_slot {
+                continue;
+            }
+            let attached_for_slot = attached.contains(&block_id);
+            let ref_ok = node.ref_count == 0 || attached_for_slot;
+            if ref_ok
+                && node.entry_state == IndexEntryState::Ready
+                && node.soft_pin_until.is_none_or(|deadline| deadline <= now)
+            {
+                node.sparse_dropped = true;
+                dropped.push(block_id);
+            } else {
+                node.sparse_dropped = false;
+            }
+        }
+
+        dropped.sort_by_key(|block| block.0);
+        dropped
     }
 
     fn selection_pin_active(
@@ -1317,11 +1385,16 @@ impl RadixCache {
             })
     }
 
+    fn node_counts_as_sparse_dropped(&self, node: &Node, tier_filter: Option<Tier>) -> bool {
+        node.sparse_dropped && self.node_is_reclaimable_now(node, tier_filter)
+    }
+
     fn node_is_cascade_evictable_now(&self, idx: usize, tier_filter: Option<Tier>) -> bool {
         let Some(node) = self.nodes.get(idx) else {
             return false;
         };
-        self.node_is_reclaimable_now(node, tier_filter)
+        (self.node_counts_as_sparse_dropped(node, tier_filter)
+            || self.node_is_reclaimable_now(node, tier_filter))
             && node
                 .children
                 .values()
@@ -1342,7 +1415,9 @@ impl RadixCache {
             children_evictable &=
                 self.collect_cascade_evictable_blocks(child_idx, tier_filter, out);
         }
-        let evictable = self.node_is_reclaimable_now(node, tier_filter) && children_evictable;
+        let evictable = (self.node_counts_as_sparse_dropped(node, tier_filter)
+            || self.node_is_reclaimable_now(node, tier_filter))
+            && children_evictable;
         if evictable && let Some(block_id) = node.block_id {
             out.push(block_id);
         }
