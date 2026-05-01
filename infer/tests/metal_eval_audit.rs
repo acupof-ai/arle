@@ -85,13 +85,13 @@ fn metal_scheduler_runtime_has_no_direct_materialize_boundary() {
 fn metal_materialize_boundaries_stay_classified() {
     let expected = BTreeMap::from([
         ("crates/mlx-sys/src/lib.rs", 2usize),
-        ("crates/mlx-sys/src/mlx_bridge.cpp", 4),
+        ("crates/mlx-sys/src/mlx_bridge.cpp", 5),
         ("crates/mlx-sys/src/mlx_qwen35_model.cpp", 10),
         ("infer/src/backend/metal/dflash.rs", 6),
         ("infer/src/backend/metal/gdr.rs", 10),
         ("infer/src/backend/metal/generate.rs", 2),
         ("infer/src/backend/metal/loader.rs", 2),
-        ("infer/src/backend/metal/mlx.rs", 16),
+        ("infer/src/backend/metal/mlx.rs", 17),
         ("infer/src/backend/metal/ops.rs", 2),
         ("infer/src/backend/metal/qwen35.rs", 10),
         ("infer/src/backend/metal/request_state.rs", 27),

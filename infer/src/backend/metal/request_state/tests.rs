@@ -166,6 +166,12 @@ mod tests {
         };
 
         let payload = snapshot.encode_for_disk(b"qwen35-test").expect("encode");
+        assert_eq!(
+            snapshot
+                .estimated_disk_payload_len(b"qwen35-test")
+                .expect("estimate"),
+            payload.len() as u64
+        );
         let restored =
             Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-test").expect("decode");
         eval(&[&restored.kv_flat[0], &restored.gdr_flat[0]]);
@@ -199,6 +205,56 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_prefix_snapshot_disk_payload_rejects_corrupt_body() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10], &[1])],
+            gdr_flat: Vec::new(),
+            cache_len: 1,
+            kv_capacity: 1,
+        };
+
+        let mut payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
+        let last = payload.last_mut().expect("payload body byte");
+        *last ^= 0x01;
+
+        let err = match Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-a") {
+            Ok(_) => panic!("corrupt body should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("checksum"),
+            "unexpected corrupt-body error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn qwen35_prefix_snapshot_metadata_checksum_covers_header_fields() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10], &[1])],
+            gdr_flat: Vec::new(),
+            cache_len: 1,
+            kv_capacity: 1,
+        };
+
+        let payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
+        let (mut header, _body) =
+            decode_qwen35_prefix_snapshot_header(&payload, b"qwen35-a", false)
+                .expect("decode header");
+        header.kv_capacity += 1;
+
+        let err = validate_qwen35_prefix_snapshot_metadata_checksum(&header)
+            .expect_err("tampered header metadata should fail");
+        assert!(
+            err.to_string().contains("metadata checksum"),
+            "unexpected metadata-checksum error: {err:#}"
+        );
+    }
+
+    #[test]
     fn qwen35_prefix_snapshot_disk_payload_rejects_wrong_model_before_body() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {
@@ -228,6 +284,55 @@ mod tests {
         assert!(
             truncated_body.to_string().contains("truncated"),
             "unexpected truncated-body error: {truncated_body:#}"
+        );
+    }
+
+    #[test]
+    fn qwen35_prefix_snapshot_disk_payload_peeks_tokens_without_import() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101, 102, 103],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10, 20, 30], &[3])],
+            gdr_flat: Vec::new(),
+            cache_len: 3,
+            kv_capacity: 4,
+        };
+
+        let payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
+        let token_ids =
+            Qwen35PrefixSnapshot::peek_disk_token_ids(&payload, b"qwen35-a").expect("peek");
+        assert_eq!(token_ids, vec![101, 102, 103]);
+
+        let err = Qwen35PrefixSnapshot::peek_disk_token_ids(&payload, b"qwen35-b")
+            .expect_err("wrong model should fail");
+        assert!(
+            err.to_string().contains("model fingerprint"),
+            "unexpected peek error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn longest_reusable_aligned_prefix_keeps_full_aligned_prompt() {
+        assert_eq!(longest_reusable_aligned_prefix_len(32, 32, 16), 32);
+        assert_eq!(longest_reusable_aligned_prefix_len(33, 33, 16), 32);
+        assert_eq!(longest_reusable_aligned_prefix_len(15, 15, 16), 0);
+        assert_eq!(longest_reusable_aligned_prefix_len(48, 40, 16), 32);
+        assert_eq!(longest_reusable_aligned_prefix_len(32, 32, 0), 0);
+    }
+
+    #[test]
+    fn qwen35_disk_publish_prefix_lens_include_importable_block_aligned_fallback() {
+        assert_eq!(qwen35_disk_publish_prefix_lens(32, 32, 16), vec![16, 32]);
+        assert_eq!(qwen35_disk_publish_prefix_lens(33, 33, 16), vec![32]);
+        assert_eq!(qwen35_disk_publish_prefix_lens(16, 16, 16), vec![16]);
+        assert_eq!(
+            qwen35_disk_publish_prefix_lens(15, 15, 16),
+            Vec::<usize>::new()
+        );
+        assert_eq!(qwen35_disk_publish_prefix_lens(48, 40, 16), vec![32]);
+        assert_eq!(
+            qwen35_disk_publish_prefix_lens(32, 32, 0),
+            Vec::<usize>::new()
         );
     }
 }

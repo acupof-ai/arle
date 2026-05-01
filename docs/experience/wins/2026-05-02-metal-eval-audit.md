@@ -18,13 +18,13 @@ or `.item()` in scheduler hot loops.
 | Path | Count | Classification |
 | --- | ---: | --- |
 | `crates/mlx-sys/src/lib.rs` | 2 | Green: FFI declarations |
-| `crates/mlx-sys/src/mlx_bridge.cpp` | 4 | Green: bridge wrappers |
+| `crates/mlx-sys/src/mlx_bridge.cpp` | 5 | Green: bridge wrappers, including explicit array byte export |
 | `crates/mlx-sys/src/mlx_qwen35_model.cpp` | 10 | Yellow: C++ Qwen3.5 step/session boundaries |
 | `infer/src/backend/metal/dflash.rs` | 6 | Yellow: DFlash batched staging and sampling boundaries |
 | `infer/src/backend/metal/gdr.rs` | 10 | Yellow: GDR replay/validation boundaries |
 | `infer/src/backend/metal/generate.rs` | 2 | Yellow: legacy Qwen3 generation async staging |
 | `infer/src/backend/metal/loader.rs` | 2 | Green: load-time tensor materialization |
-| `infer/src/backend/metal/mlx.rs` | 16 | Green/yellow: wrapper plus mask/tripwire materialization |
+| `infer/src/backend/metal/mlx.rs` | 17 | Green/yellow: wrapper plus mask/tripwire/byte-export tests |
 | `infer/src/backend/metal/ops.rs` | 2 | Green: async wrapper |
 | `infer/src/backend/metal/qwen35.rs` | 10 | Yellow: Qwen3.5 model-step and load-time boundaries |
 | `infer/src/backend/metal/request_state.rs` | 27 | Yellow: request-state prefill/decode/sampling boundaries |
