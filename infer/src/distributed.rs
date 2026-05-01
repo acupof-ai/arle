@@ -9,6 +9,7 @@ pub mod init_method;
 #[cfg(feature = "nccl")]
 pub mod nccl;
 pub mod parallel_state;
+pub mod pipeline_state;
 
 pub use init_method::{EnvRendezvousConfig, RendezvousClient, RendezvousServer, UNIQUE_ID_BYTES};
 
