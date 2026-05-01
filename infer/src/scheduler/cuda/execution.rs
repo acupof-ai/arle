@@ -448,7 +448,7 @@ impl<M: ModelForward> Scheduler<M> {
             }
             StepPlan::SpecDecode => {
                 let t = std::time::Instant::now();
-                SpecPath::draft_then_verify(self);
+                SpecPath::draft_then_verify(self, None);
                 (0, t.elapsed().as_micros())
             }
             StepPlan::Prefill(candidates) => {

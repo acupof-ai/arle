@@ -1,9 +1,37 @@
-use super::{ModelForward, Scheduler};
+use super::{ModelForward, Phase, Scheduler};
 use crate::model::SpecVerifyRequest;
+use crate::prefix_cache::BlockId;
 use crate::scheduler::DraftMode;
 use crate::server_engine::FinishReason;
 
 pub(super) struct SpecPath;
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SparseDraftView {
+    pub(super) slot_idx: usize,
+    pub(super) page_ids: Vec<BlockId>,
+    pub(super) sparse_total_tokens: usize,
+    /// Recent active-slot tokens that P2.B.3 must resolve from paged-KV slot
+    /// state, including generated tail tokens that are not present in radix.
+    pub(super) active_recent_tokens: usize,
+}
+
+impl SparseDraftView {
+    fn new(
+        slot_idx: usize,
+        page_ids: Vec<BlockId>,
+        block_size: usize,
+        active_recent_tokens: usize,
+    ) -> Self {
+        Self {
+            slot_idx,
+            sparse_total_tokens: page_ids.len().saturating_mul(block_size),
+            active_recent_tokens,
+            page_ids,
+        }
+    }
+}
 
 struct SpecRow {
     slot_idx: usize,
@@ -15,7 +43,19 @@ struct SpecRow {
 }
 
 impl SpecPath {
-    pub(super) fn draft_then_verify<M: ModelForward>(scheduler: &mut Scheduler<M>) {
+    pub(super) fn draft_then_verify<M: ModelForward>(
+        scheduler: &mut Scheduler<M>,
+        force_sparse_view: Option<SparseDraftView>,
+    ) {
+        if matches!(scheduler.config.spec_draft_model, DraftMode::SelfSpec) {
+            if let Some(view) = force_sparse_view {
+                let _sparse_views = vec![view];
+                scheduler.step_decode_launch();
+                return;
+            }
+            scheduler.step_spec_decode_launch_from_path();
+            return;
+        }
         if !matches!(scheduler.config.spec_draft_model, DraftMode::External(_)) {
             scheduler.step_spec_decode_launch_from_path();
             return;
@@ -268,6 +308,38 @@ impl SpecPath {
     }
 }
 
+#[allow(dead_code)]
+fn build_sparse_draft_views<M: ModelForward>(scheduler: &Scheduler<M>) -> Vec<SparseDraftView> {
+    let block_size = scheduler.prefix_cache.block_size();
+    scheduler
+        .active
+        .iter()
+        .enumerate()
+        .filter_map(|(slot_idx, req)| {
+            let req = req.as_ref()?;
+            if !matches!(req.phase, Phase::Decoding) {
+                return None;
+            }
+            let mut tokens =
+                Vec::with_capacity(req.prompt_tokens.len() + req.generated_tokens.len());
+            tokens.extend_from_slice(&req.prompt_tokens);
+            tokens.extend_from_slice(&req.generated_tokens);
+            let page_ids = scheduler
+                .prefix_cache
+                .select_sparse_pages_for_draft_tokens_with_attached(
+                    slot_idx,
+                    &tokens,
+                    scheduler.config.spec_sparse_recent_tokens,
+                    scheduler.config.spec_sparse_top_k_pages,
+                    &req.attached_prefix_blocks,
+                );
+            let active_recent_tokens = scheduler.config.spec_sparse_recent_tokens.min(tokens.len());
+            (!page_ids.is_empty())
+                .then(|| SparseDraftView::new(slot_idx, page_ids, block_size, active_recent_tokens))
+        })
+        .collect()
+}
+
 fn release_draft_states<M: ModelForward>(
     scheduler: &Scheduler<M>,
     rows: &[SpecRow],
@@ -292,5 +364,20 @@ fn release_slot_draft_states<M: ModelForward>(scheduler: &Scheduler<M>, slot_ind
         if let Some(request_id) = scheduler.request(slot_idx).map(|req| req.id) {
             draft_engine.release_request_state(request_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_draft_view_counts_selected_block_tokens() {
+        let view = SparseDraftView::new(3, vec![BlockId(7), BlockId(9)], 16, 24);
+
+        assert_eq!(view.slot_idx, 3);
+        assert_eq!(view.page_ids, vec![BlockId(7), BlockId(9)]);
+        assert_eq!(view.sparse_total_tokens, 32);
+        assert_eq!(view.active_recent_tokens, 24);
     }
 }
