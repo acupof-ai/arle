@@ -712,9 +712,11 @@ impl<M: ModelForward> Scheduler<M> {
                         accepted_tokens = accepted_tokens.saturating_add(row_accepted);
                         let threshold = self.config.spec_acceptance_threshold;
                         if let Some(req) = self.request_mut(slot_idx) {
-                            let row_rate = row_accepted as f32;
-                            req.spec_acceptance_tracker.record(row_rate);
-                            if req.spec_acceptance_tracker.should_disable(threshold) {
+                            let tracker = req.spec_acceptance_tracker.get_or_insert_with(
+                                crate::speculative::AcceptanceTracker::default_window,
+                            );
+                            tracker.observe_step(row_accepted, 1);
+                            if tracker.should_disable(threshold) {
                                 req.spec_decode_disabled = true;
                             }
                         }
