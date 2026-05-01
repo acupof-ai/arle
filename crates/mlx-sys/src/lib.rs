@@ -48,6 +48,11 @@ unsafe extern "C" {
     /// Returns the last error message, or null if no error.
     /// Thread-local — safe to call from any thread.
     pub fn mlx_last_error() -> *const std::ffi::c_char;
+    /// Returns the vendored MLX runtime version string.
+    pub fn mlx_version_string() -> *const std::ffi::c_char;
+    /// Returns 1 when MLX reports Neural Accelerator kernels available, 0 when
+    /// unavailable, and -1 on bridge/runtime error.
+    pub fn mlx_metal_nax_available() -> i32;
 
     // === Array lifecycle ===
 
