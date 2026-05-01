@@ -1464,7 +1464,7 @@ fn execute_decode_batch(
             }
             Ok(None) => {
                 invalidate_qwen35_decode_batch_cache(qwen35_decode_batch_cache, active, &mut open);
-                let result = if open.len() >= 2 {
+                let result = if open.len() >= 1 {
                     let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
                         .iter_mut()
                         .map(|(_, request)| &mut request.request_state)
@@ -1515,7 +1515,7 @@ fn execute_decode_batch(
         return;
     }
 
-    if scheduled_open_len >= 2 && !open.is_empty() {
+    if scheduled_open_len >= 1 && !open.is_empty() {
         metrics.record_metal_decode_batch_fallback(open.len());
     }
     for (req_id, request) in open {
@@ -1634,7 +1634,7 @@ fn execute_qwen35_packed_decode_batch(
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
     cache: &mut Option<CachedQwen35DecodeBatch>,
 ) -> Result<Option<Vec<u32>>> {
-    if open.len() < 2 {
+    if open.len() < 1 {
         return Ok(None);
     }
 
