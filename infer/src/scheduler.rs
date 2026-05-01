@@ -16,6 +16,7 @@
 //! 4. Starting new prefills only when no decode work is pending
 
 mod batch;
+pub mod forward_batch;
 pub mod metrics;
 pub mod policy;
 mod types;
@@ -32,6 +33,9 @@ pub use batch::{
 };
 #[cfg(feature = "cuda")]
 pub use cuda::Scheduler;
+pub use forward_batch::{
+    ForwardBatch, ForwardBatchKind, IntermediateTensorMeta, IntermediateTensors,
+};
 pub use types::{
     DraftMode, IncomingRequest, RequestPriority, RequestSpecConfig, RuntimeEnvelopeOverrides,
     SchedulePolicy, SchedulerConfig, SchedulerFull, SchedulerHandle,
