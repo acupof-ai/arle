@@ -27,6 +27,7 @@
 //! | `infer_spec_verified_tokens_total` | counter | Draft tokens checked by the target verifier |
 //! | `infer_spec_accepted_tokens_total` | counter | Draft tokens accepted by the verifier |
 //! | `infer_spec_acceptance_rate` | gauge | Aggregate accepted / verified token ratio |
+//! | `infer_spec_sparse_view_empty_total` | counter | Sparse self-spec decode rows that could not build a sparse KV view |
 //! | `infer_spec_step_latency_us` | histogram | Speculative decode step latency |
 //! | `infer_metal_decode_batches_total` | counter | Metal decode batches executed on a batched GPU path |
 //! | `infer_metal_decode_batched_rows_total` | counter | Metal decode rows executed on a batched GPU path |
@@ -122,6 +123,7 @@ struct MetricsInner {
     pub spec_draft_tokens_total: AtomicU64,
     pub spec_verified_tokens_total: AtomicU64,
     pub spec_accepted_tokens_total: AtomicU64,
+    pub spec_sparse_view_empty_total: AtomicU64,
 
     // DFlash speculative decode counters.
     pub dflash_blocks_total: AtomicU64,
@@ -205,6 +207,7 @@ impl ServerMetrics {
                 spec_draft_tokens_total: AtomicU64::new(0),
                 spec_verified_tokens_total: AtomicU64::new(0),
                 spec_accepted_tokens_total: AtomicU64::new(0),
+                spec_sparse_view_empty_total: AtomicU64::new(0),
                 dflash_blocks_total: AtomicU64::new(0),
                 dflash_accepted_tokens_total: AtomicU64::new(0),
                 dflash_draft_tokens_total: AtomicU64::new(0),
@@ -814,6 +817,12 @@ impl ServerMetrics {
             .load(Ordering::Relaxed)
     }
 
+    pub fn spec_sparse_view_empty_total(&self) -> u64 {
+        self.inner
+            .spec_sparse_view_empty_total
+            .load(Ordering::Relaxed)
+    }
+
     pub fn spec_acceptance_rate(&self) -> f64 {
         self.inner.spec_acceptance_rate_ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
@@ -856,6 +865,12 @@ impl ServerMetrics {
         if let Ok(mut histograms) = self.inner.histograms.lock() {
             histograms.spec_step_latency_us.observe(latency_us as f64);
         }
+    }
+
+    pub fn record_spec_sparse_view_empty(&self, rows: usize) {
+        self.inner
+            .spec_sparse_view_empty_total
+            .fetch_add(rows as u64, Ordering::Relaxed);
     }
 
     /// Record one DFlash speculative block execution.
@@ -1058,6 +1073,7 @@ mod tests {
         assert!(rendered.contains("infer_spec_draft_tokens_total{model=\"Qwen3-4B\",} 0"));
         assert!(rendered.contains("infer_spec_verified_tokens_total{model=\"Qwen3-4B\",} 0"));
         assert!(rendered.contains("infer_spec_accepted_tokens_total{model=\"Qwen3-4B\",} 0"));
+        assert!(rendered.contains("infer_spec_sparse_view_empty_total{model=\"Qwen3-4B\",} 0"));
         assert!(rendered.contains("infer_spec_acceptance_rate{model=\"Qwen3-4B\",} 0.000000"));
         assert!(rendered.contains("infer_kv_coordinator_queue_capacity{model=\"Qwen3-4B\",} 16"));
         assert!(rendered.contains("infer_kv_fetch_queue_depth{model=\"Qwen3-4B\",} 3"));
@@ -1143,7 +1159,9 @@ mod tests {
         ));
         assert!(s.contains("plan_label=idle:0,decode:0,prefill:1,split:1,mixed:2"));
         assert!(
-            s.contains("spec=draft:0,verified:0,accepted:0,accept_rate:0.0%,step_latency_count:0")
+            s.contains(
+                "spec=draft:0,verified:0,accepted:0,empty_sparse_views:0,accept_rate:0.0%,step_latency_count:0"
+            )
         );
         assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=100.0%"));
