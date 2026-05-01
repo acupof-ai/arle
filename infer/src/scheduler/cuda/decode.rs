@@ -1,7 +1,7 @@
 use super::{
     FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, warn,
 };
-use crate::model::{MixedBatchRequest, PrefillBatchRequest};
+use crate::model::{DecodeContextOps, MixedBatchRequest, PrefillBatchRequest};
 use crate::scheduler::DraftMode;
 use crate::scheduler::cuda::core::{
     PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow,
@@ -267,6 +267,9 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
         let decode_ctx = self.decode_bufs.as_mut().unwrap();
+        if speculative {
+            decode_ctx.force_eager_once();
+        }
 
         let forward_result = self.model.forward_decode_batch(
             &token_ids,
@@ -341,7 +344,8 @@ impl<M: ModelForward> Scheduler<M> {
         let speculative = speculative
             && self.config.spec_draft_model == DraftMode::SelfSpec
             && self.config.spec_draft_k > 0
-            && decode_indices.iter().any(|&slot_idx| {
+            && !decode_indices.is_empty()
+            && decode_indices.iter().all(|&slot_idx| {
                 self.request(slot_idx).is_some_and(|req| {
                     !req.spec_decode_disabled
                         && req.speculative.as_ref().and_then(|spec| spec.enabled) != Some(false)

@@ -94,6 +94,8 @@ pub struct BatchDecodeBuffers {
 
     /// CUDA Graph cache: index = batch_size - 1. Vec avoids HashMap overhead.
     graph_cache: Vec<Option<CudaGraph>>,
+    /// One-shot eager decode override for verifier/correctness-sensitive paths.
+    force_eager_once: bool,
 
     /// Lazily allocated eager mixed-batch workspace.
     mixed: Option<MixedBatchBuffers>,
@@ -389,6 +391,7 @@ impl BatchDecodeBuffers {
             max_batch_size,
             max_total_pages,
             graph_cache: (0..max_batch_size).map(|_| None).collect(),
+            force_eager_once: false,
             mixed: None,
         })
     }
@@ -501,6 +504,10 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         if batch_size >= 1 && batch_size <= self.graph_cache.len() {
             self.graph_cache[batch_size - 1] = None;
         }
+    }
+
+    fn force_eager_once(&mut self) {
+        self.force_eager_once = true;
     }
 
     fn logprobs_host(&self) -> &[f32] {
@@ -1209,7 +1216,8 @@ impl Qwen3Model {
         // plan() was called by the scheduler before this method (updates
         // int_workspace). graph_body only does kernel launches — no allocs, no
         // H2D, no CPU memcpy.
-        if !<Self as crate::model::ModelForward>::supports_cuda_graph_decode(self) {
+        let force_eager = std::mem::take(&mut bufs.force_eager_once);
+        if force_eager || !<Self as crate::model::ModelForward>::supports_cuda_graph_decode(self) {
             self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
         } else if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
             graph

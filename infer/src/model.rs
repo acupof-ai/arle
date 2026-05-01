@@ -149,6 +149,13 @@ pub trait DecodeContextOps {
     /// Called by the scheduler when metadata reallocation invalidates captured pointers.
     fn invalidate_graph_cache(&mut self, batch_size: usize);
 
+    /// Force the next decode call using this context to run eagerly.
+    ///
+    /// Speculative verification needs a bit-identical target path first; models
+    /// with graph replay can opt out for one step while keeping graph capture
+    /// enabled for the normal decode path.
+    fn force_eager_once(&mut self) {}
+
     /// Access per-request logprobs computed by the last `sample_batch_greedy` call.
     fn logprobs_host(&self) -> &[f32] {
         &[]

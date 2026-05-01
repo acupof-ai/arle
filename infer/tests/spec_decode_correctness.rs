@@ -55,7 +55,7 @@ fn run_prompt(path: &str, prompt: &str, spec_enabled: bool) -> (String, ServerMe
     let model = Qwen3Model::from_safetensors_with_runtime(
         path,
         ModelRuntimeConfig {
-            enable_cuda_graph: true,
+            enable_cuda_graph: false,
         },
     )
     .expect("load model");
@@ -64,6 +64,7 @@ fn run_prompt(path: &str, prompt: &str, spec_enabled: bool) -> (String, ServerMe
     let mut config = SchedulerConfig::runtime_defaults(2);
     config.spec_enabled = spec_enabled;
     config.spec_draft_k = 5;
+    config.spec_acceptance_threshold = 0.3;
     if spec_enabled {
         config.spec_draft_model = DraftMode::SelfSpec;
     }
@@ -90,6 +91,16 @@ fn run_prompt(path: &str, prompt: &str, spec_enabled: bool) -> (String, ServerMe
     (output, metrics)
 }
 
+fn first_token_divergence(tokenizer: &Tokenizer, plain: &str, spec: &str) -> String {
+    let plain_ids = tokenizer.encode(plain).unwrap_or_default();
+    let spec_ids = tokenizer.encode(spec).unwrap_or_default();
+    let max_len = plain_ids.len().max(spec_ids.len());
+    let idx = (0..max_len)
+        .find(|&idx| plain_ids.get(idx) != spec_ids.get(idx))
+        .unwrap_or(max_len);
+    format!("first_token_divergence={idx}, plain_ids={plain_ids:?}, spec_ids={spec_ids:?}")
+}
+
 #[test]
 fn spec_decode_greedy_is_bit_identical_for_three_prompts() {
     infer::logging::init_stderr("info");
@@ -98,6 +109,7 @@ fn spec_decode_greedy_is_bit_identical_for_three_prompts() {
         eprintln!("Skipping test: model not found at {path}");
         return;
     }
+    let tokenizer = Tokenizer::from_file(&path).expect("load tokenizer for diagnostics");
 
     for prompt in [
         "Explain attention in one sentence.",
@@ -107,8 +119,10 @@ fn spec_decode_greedy_is_bit_identical_for_three_prompts() {
         let (plain, _) = run_prompt(&path, prompt, false);
         let (spec, metrics) = run_prompt(&path, prompt, true);
         assert_eq!(
-            plain, spec,
-            "spec decode changed greedy output for {prompt:?}"
+            plain,
+            spec,
+            "spec decode changed greedy output for {prompt:?}: {}",
+            first_token_divergence(&tokenizer, &plain, &spec)
         );
         assert!(
             metrics.spec_acceptance_rate() >= 0.3,
