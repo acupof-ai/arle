@@ -1682,6 +1682,147 @@ fn sparse_draft_selection_does_not_mutate_radix_metadata() {
 }
 
 #[test]
+fn sparse_drop_does_not_create_phantom_internal_budget() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        &bids(&[10, 20, 30, 40]),
+    );
+    for block in [10, 20, 30, 40] {
+        assert!(cache.set_block_location(BlockId(block), BlockLocation::Gpu { slot: 0 }));
+    }
+    assert!(cache.update_block_metadata(
+        BlockId(40),
+        BlockMetadataUpdate {
+            entry_state: Some(IndexEntryState::Pending),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+    assert_eq!(cache.evictable_pages(4), 0);
+
+    let dropped = cache.drop_pages_for_sparse_view(0, &bids(&[30, 40]), &[]);
+
+    assert_eq!(dropped, bids(&[10, 20]));
+    assert_eq!(
+        cache.evictable_pages(4),
+        0,
+        "internal sparse drops must still respect cascade child checks"
+    );
+}
+
+#[test]
+fn sparse_drop_keeps_ref_counted_pages() {
+    let mut cache = RadixCache::new(4);
+    let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+    cache.insert(&tokens, &bids(&[10, 20]));
+    for block in [10, 20] {
+        assert!(cache.set_block_location(BlockId(block), BlockLocation::Gpu { slot: 0 }));
+    }
+    let (matched, held) = cache.lookup(&tokens);
+    assert_eq!(matched, 8);
+    assert_eq!(held, bids(&[10, 20]));
+
+    let dropped = cache.drop_pages_for_sparse_view(0, &bids(&[20]), &[]);
+
+    assert!(dropped.is_empty());
+    assert_eq!(cache.evictable_pages(4), 0);
+}
+
+#[test]
+fn sparse_drop_clears_stale_marks_when_page_becomes_ineligible() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert_eq!(cache.drop_pages_for_sparse_view(0, &[], &[]), bids(&[10]));
+    let idx = cache
+        .nodes
+        .iter()
+        .position(|node| node.block_id == Some(BlockId(10)))
+        .unwrap();
+    assert!(cache.nodes[idx].sparse_dropped);
+
+    assert!(cache.update_block_metadata(
+        BlockId(10),
+        BlockMetadataUpdate {
+            entry_state: Some(IndexEntryState::Pending),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+    assert!(cache.drop_pages_for_sparse_view(0, &[], &[]).is_empty());
+    assert!(
+        !cache.nodes[idx].sparse_dropped,
+        "stale sparse-drop marks must clear when a page becomes pending"
+    );
+}
+
+#[test]
+fn sparse_drop_unmarks_selected_attached_cross_slot_page() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert_eq!(cache.drop_pages_for_sparse_view(0, &[], &[]), bids(&[10]));
+    let idx = cache
+        .nodes
+        .iter()
+        .position(|node| node.block_id == Some(BlockId(10)))
+        .unwrap();
+    assert!(cache.nodes[idx].sparse_dropped);
+
+    let dropped = cache.drop_pages_for_sparse_view(1, &bids(&[10]), &[]);
+
+    assert!(dropped.is_empty());
+    assert!(
+        !cache.nodes[idx].sparse_dropped,
+        "selected attached page must be unmarked even when radix metadata points at its source slot"
+    );
+}
+
+#[test]
+fn sparse_drop_marks_non_selected_attached_cross_slot_page() {
+    let mut cache = RadixCache::new(4);
+    let tokens = [1, 2, 3, 4];
+    cache.insert(&tokens, &bids(&[10]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    let (matched, held) = cache.lookup(&tokens);
+    assert_eq!(matched, 4);
+    assert_eq!(held, bids(&[10]));
+
+    let dropped = cache.drop_pages_for_sparse_view(1, &[], &bids(&[10]));
+
+    assert_eq!(dropped, bids(&[10]));
+    let idx = cache
+        .nodes
+        .iter()
+        .position(|node| node.block_id == Some(BlockId(10)))
+        .unwrap();
+    assert!(
+        cache.nodes[idx].sparse_dropped,
+        "non-selected attached page must be sparse-dropped even while held by the active request"
+    );
+    assert_eq!(
+        cache.evictable_pages(4),
+        0,
+        "ref-counted attached pages must not become evictable budget"
+    );
+}
+
+#[test]
+fn sparse_drop_is_scoped_to_slot() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    cache.insert(&[5, 6, 7, 8], &bids(&[20]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 1 }));
+
+    let dropped = cache.drop_pages_for_sparse_view(0, &[], &[]);
+
+    assert_eq!(dropped, bids(&[10]));
+    let mut evictable = cache.cascade_evictable_blocks(Some(Tier::Gpu));
+    evictable.sort_by_key(|block| block.0);
+    assert_eq!(evictable, bids(&[10, 20]));
+}
+
+#[test]
 fn block_state_helpers_cover_read_and_store_lifecycle() {
     let mut cache = RadixCache::new(4);
     cache.insert(&[1, 2, 3, 4], &bids(&[10]));
