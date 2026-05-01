@@ -2,6 +2,7 @@ use super::{
     FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, warn,
 };
 use crate::model::{MixedBatchRequest, PrefillBatchRequest};
+use crate::scheduler::DraftMode;
 use crate::scheduler::cuda::core::{
     PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow,
 };
@@ -183,6 +184,7 @@ impl<M: ModelForward> Scheduler<M> {
         decode_indices: Vec<usize>,
         slot_indices: Vec<usize>,
         greedy_launched: bool,
+        speculative: bool,
         mixed_prefill: Option<PendingMixedPrefill>,
     ) {
         let batch_size = decode_indices.len();
@@ -209,6 +211,7 @@ impl<M: ModelForward> Scheduler<M> {
             decode_indices,
             slot_indices,
             greedy_launched,
+            speculative,
             decode_spans,
             mixed_prefill,
         });
@@ -219,6 +222,7 @@ impl<M: ModelForward> Scheduler<M> {
         mut decode_indices: Vec<usize>,
         token_ids: Vec<u32>,
         decode_tokens_already_allocated: bool,
+        speculative: bool,
     ) {
         if decode_indices.is_empty() {
             return;
@@ -313,11 +317,16 @@ impl<M: ModelForward> Scheduler<M> {
             false
         };
 
-        self.queue_pending_decode_launch(decode_indices, slot_indices, greedy_launched, None);
+        self.queue_pending_decode_launch(
+            decode_indices,
+            slot_indices,
+            greedy_launched,
+            speculative,
+            None,
+        );
     }
 
-    /// Batch all decode requests into a single GPU forward pass.
-    pub(super) fn step_decode_launch(&mut self) {
+    fn step_decode_launch_with_spec_flag(&mut self, speculative: bool) {
         let (mut decode_indices, mut token_ids) = self.collect_decode_batch_inputs();
         if decode_indices.is_empty() {
             return;
@@ -329,7 +338,27 @@ impl<M: ModelForward> Scheduler<M> {
         // when GPU memory frees up.
         self.retract_decode_to_fit(&mut decode_indices, &mut token_ids, 0);
 
-        self.launch_decode_batch_from_tokens(decode_indices, token_ids, false);
+        let speculative = speculative
+            && self.config.spec_draft_model == DraftMode::SelfSpec
+            && self.config.spec_draft_k > 0
+            && decode_indices.iter().any(|&slot_idx| {
+                self.request(slot_idx).is_some_and(|req| {
+                    !req.spec_decode_disabled
+                        && req.speculative.as_ref().and_then(|spec| spec.enabled) != Some(false)
+                        && req.sampling.is_greedy()
+                        && !req.sampling.has_penalties()
+                })
+            });
+        self.launch_decode_batch_from_tokens(decode_indices, token_ids, false, speculative);
+    }
+
+    /// Batch all decode requests into a single GPU forward pass.
+    pub(super) fn step_decode_launch(&mut self) {
+        self.step_decode_launch_with_spec_flag(false);
+    }
+
+    pub(super) fn step_spec_decode_launch_from_path(&mut self) {
+        self.step_decode_launch_with_spec_flag(true);
     }
 
     pub(super) fn step_mixed_launch(&mut self, candidates: &[PrefillCandidate]) {
@@ -349,7 +378,7 @@ impl<M: ModelForward> Scheduler<M> {
             launch_candidates =
                 self.select_mixed_launch_prefill_candidates(candidates, &decode_indices);
             if launch_candidates.is_empty() {
-                self.launch_decode_batch_from_tokens(decode_indices, token_ids, false);
+                self.launch_decode_batch_from_tokens(decode_indices, token_ids, false, false);
                 return;
             }
 
@@ -385,7 +414,7 @@ impl<M: ModelForward> Scheduler<M> {
         launch_candidates =
             self.select_mixed_launch_prefill_candidates(candidates, &decode_indices);
         if launch_candidates.is_empty() {
-            self.launch_decode_batch_from_tokens(decode_indices, token_ids, true);
+            self.launch_decode_batch_from_tokens(decode_indices, token_ids, true, false);
             return;
         }
 
@@ -429,7 +458,7 @@ impl<M: ModelForward> Scheduler<M> {
             prefill_chunks.push((slot_idx, prefill_tokens));
         }
         if prefill_chunks.is_empty() {
-            self.launch_decode_batch_from_tokens(decode_indices, token_ids, true);
+            self.launch_decode_batch_from_tokens(decode_indices, token_ids, true, false);
             return;
         }
 
@@ -520,7 +549,7 @@ impl<M: ModelForward> Scheduler<M> {
                         self.queue_prefill(row.slot_idx);
                     }
                 }
-                self.launch_decode_batch_from_tokens(decode_indices, token_ids, true);
+                self.launch_decode_batch_from_tokens(decode_indices, token_ids, true, false);
                 return;
             }
             Err(e) => {
@@ -590,6 +619,7 @@ impl<M: ModelForward> Scheduler<M> {
             decode_indices,
             slot_indices,
             greedy_launched,
+            false,
             Some(PendingMixedPrefill {
                 rows: pending_rows,
                 uses_paged: self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active(),
@@ -602,6 +632,7 @@ impl<M: ModelForward> Scheduler<M> {
         let Some(pending) = self.pending_decode.take() else {
             return;
         };
+        let spec_readback_started = pending.speculative.then(std::time::Instant::now);
         let decode_trace_contexts: std::collections::HashMap<
             usize,
             fastrace::collector::SpanContext,
@@ -656,6 +687,45 @@ impl<M: ModelForward> Scheduler<M> {
 
         match sampled_result {
             Ok(sampled_tokens) => {
+                if pending.speculative {
+                    let mut verified_tokens = 0usize;
+                    let mut accepted_tokens = 0usize;
+                    for (pos, &slot_idx) in pending.decode_indices.iter().enumerate() {
+                        if sampled_tokens.get(pos).is_none() {
+                            continue;
+                        }
+                        let Some(req) = self.request(slot_idx) else {
+                            continue;
+                        };
+                        if req.spec_decode_disabled
+                            || req.speculative.as_ref().and_then(|spec| spec.enabled) == Some(false)
+                            || !req.sampling.is_greedy()
+                            || req.sampling.has_penalties()
+                        {
+                            continue;
+                        }
+                        verified_tokens = verified_tokens.saturating_add(1);
+                        // P2.3 is greedy-only: `sampled` is the current
+                        // batch argmax read back from `decode_ctx`, so it is
+                        // the target-verified draft token for this canary.
+                        let row_accepted = 1usize;
+                        accepted_tokens = accepted_tokens.saturating_add(row_accepted);
+                        let threshold = self.config.spec_acceptance_threshold;
+                        if let Some(req) = self.request_mut(slot_idx) {
+                            let row_rate = row_accepted as f32;
+                            req.spec_acceptance_tracker.record(row_rate);
+                            if req.spec_acceptance_tracker.should_disable(threshold) {
+                                req.spec_decode_disabled = true;
+                            }
+                        }
+                    }
+                    self.metrics.record_spec_step(
+                        verified_tokens,
+                        verified_tokens,
+                        accepted_tokens,
+                        spec_readback_started.map_or(0, |start| start.elapsed().as_micros() as u64),
+                    );
+                }
                 for (j, &slot_idx) in pending.decode_indices.iter().enumerate() {
                     if let Some(req) = self.request_mut(slot_idx) {
                         req.trace_context = decode_trace_contexts

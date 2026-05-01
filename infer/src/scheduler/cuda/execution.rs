@@ -1,4 +1,5 @@
 use super::budget::{PageBudget, PageGrowth, StepTokenBudget, clipped_max_new_tokens_estimate};
+use super::spec_path::SpecPath;
 use super::{ModelForward, Phase, Scheduler, info};
 use crate::metrics::SchedulerPlanLabel;
 
@@ -29,6 +30,7 @@ struct ScoredPrefillCandidate {
 enum StepPlan {
     Idle,
     Decode,
+    SpecDecode,
     Prefill(Vec<PrefillCandidate>),
     Split(Vec<PrefillCandidate>),
     Mixed(Vec<PrefillCandidate>),
@@ -39,6 +41,7 @@ impl StepPlan {
         match self {
             Self::Idle => "idle",
             Self::Decode => "decode",
+            Self::SpecDecode => "decode",
             Self::Prefill(_) => "prefill",
             Self::Split(_) => "split",
             Self::Mixed(_) => "mixed",
@@ -48,7 +51,7 @@ impl StepPlan {
     fn metrics_label(&self) -> SchedulerPlanLabel {
         match self {
             Self::Idle => SchedulerPlanLabel::Idle,
-            Self::Decode => SchedulerPlanLabel::Decode,
+            Self::Decode | Self::SpecDecode => SchedulerPlanLabel::Decode,
             Self::Prefill(_) => SchedulerPlanLabel::Prefill,
             Self::Split(_) => SchedulerPlanLabel::Split,
             Self::Mixed(_) => SchedulerPlanLabel::Mixed,
@@ -64,7 +67,7 @@ impl StepPlan {
             Self::Prefill(candidates) | Self::Split(candidates) | Self::Mixed(candidates) => {
                 candidates.len() as u64
             }
-            Self::Idle | Self::Decode => 0,
+            Self::Idle | Self::Decode | Self::SpecDecode => 0,
         }
     }
 
@@ -76,13 +79,17 @@ impl StepPlan {
                     .map(|candidate| candidate.reservation.prefill_tokens as u64)
                     .sum()
             }
-            Self::Idle | Self::Decode => 0,
+            Self::Idle | Self::Decode | Self::SpecDecode => 0,
         }
     }
 }
 
 fn route_spec_plan(_spec_enabled: bool, plan: StepPlan) -> StepPlan {
-    plan
+    if _spec_enabled && matches!(plan, StepPlan::Decode) {
+        StepPlan::SpecDecode
+    } else {
+        plan
+    }
 }
 
 #[derive(Debug)]
@@ -440,6 +447,11 @@ impl<M: ModelForward> Scheduler<M> {
                 self.step_decode_launch();
                 (0, t.elapsed().as_micros())
             }
+            StepPlan::SpecDecode => {
+                let t = std::time::Instant::now();
+                SpecPath::draft_then_verify(self);
+                (0, t.elapsed().as_micros())
+            }
             StepPlan::Prefill(candidates) => {
                 let t = std::time::Instant::now();
                 self.step_prefill_batch(candidates);
@@ -531,8 +543,8 @@ impl<M: ModelForward> Scheduler<M> {
 mod tests {
     use super::{
         PrefillBudget, PrefillCandidate, PrefillCandidateScore, PrefillReservation,
-        ScoredPrefillCandidate, cap_prefill_candidates_by_tokens, score_prefill_candidates,
-        select_prefill_candidates,
+        ScoredPrefillCandidate, StepPlan, cap_prefill_candidates_by_tokens, route_spec_plan,
+        score_prefill_candidates, select_prefill_candidates,
     };
     use crate::scheduler::cuda::budget::{PageBudget, PageGrowth, StepTokenBudget};
 
@@ -842,8 +854,8 @@ mod tests {
     }
 
     #[test]
-    fn spec_enabled_route_is_noop_until_verifier_path_lands() {
+    fn spec_enabled_route_uses_verifier_step_plan() {
         let plan = route_spec_plan(true, StepPlan::Decode);
-        assert!(matches!(plan, StepPlan::Decode));
+        assert!(matches!(plan, StepPlan::SpecDecode));
     }
 }

@@ -131,7 +131,7 @@ struct Args {
     spec_acceptance_threshold: f32,
 
     /// Draft mode: "none", "self"/"self-spec", or "external:<path>".
-    #[arg(long, default_value = "none")]
+    #[arg(long, visible_alias = "spec-draft-mode", default_value = "none")]
     spec_draft_model: String,
 
     /// Disable RadixAttention-style prefix cache lookup and publish.

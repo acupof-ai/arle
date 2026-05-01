@@ -23,6 +23,7 @@ mod policy;
 mod prefill;
 mod request;
 mod runtime;
+mod spec_path;
 
 pub use core::Scheduler;
 pub(super) use request::{ActiveRequest, Phase};

@@ -284,6 +284,21 @@ pub trait ModelForward: Send {
     /// Decode: process exactly one token using existing KV cache.
     fn forward_decode(&self, token: u32, state: &mut Self::State) -> Result<()>;
 
+    /// Forward and return the active logits buffer for verifier paths.
+    ///
+    /// The returned `DeviceVec` is an independent handle so callers can keep
+    /// using it after the state advances. Phase 2 verifier code uses this as
+    /// the target-model logits source before specialized batched gather kernels
+    /// land.
+    fn forward_with_logits(
+        &self,
+        tokens: &[u32],
+        state: &mut Self::State,
+    ) -> Result<(Vec<u32>, DeviceVec)> {
+        self.forward(tokens, state)?;
+        Ok((tokens.to_vec(), state.logits().clone()))
+    }
+
     /// Convenience: dispatch to prefill or decode based on token count.
     /// Callers that know the phase should use `forward_prefill`/`forward_decode` directly.
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
