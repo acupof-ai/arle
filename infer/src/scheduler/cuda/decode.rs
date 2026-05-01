@@ -341,14 +341,20 @@ impl<M: ModelForward> Scheduler<M> {
         // when GPU memory frees up.
         self.retract_decode_to_fit(&mut decode_indices, &mut token_ids, 0);
 
+        let global_spec_draft_k = self.config.spec_draft_k;
         let speculative = speculative
             && self.config.spec_draft_model == DraftMode::SelfSpec
-            && self.config.spec_draft_k > 0
+            // P2.3 is a single-token verifier canary. Multi-token speculation
+            // must not reuse it because that reports a fake 100% acceptance
+            // rate while never drafting or verifying K positions.
+            && global_spec_draft_k == 1
             && !decode_indices.is_empty()
             && decode_indices.iter().all(|&slot_idx| {
                 self.request(slot_idx).is_some_and(|req| {
                     !req.spec_decode_disabled
-                        && req.speculative.as_ref().and_then(|spec| spec.enabled) != Some(false)
+                        && req.speculative.as_ref().is_none_or(|spec| {
+                            spec.allows_single_token_canary(global_spec_draft_k)
+                        })
                         && req.sampling.is_greedy()
                         && !req.sampling.has_penalties()
                 })

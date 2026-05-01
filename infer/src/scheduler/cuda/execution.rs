@@ -84,8 +84,8 @@ impl StepPlan {
     }
 }
 
-fn route_spec_plan(_spec_enabled: bool, plan: StepPlan) -> StepPlan {
-    if _spec_enabled && matches!(plan, StepPlan::Decode) {
+fn route_spec_plan(spec_enabled: bool, spec_draft_k: usize, plan: StepPlan) -> StepPlan {
+    if spec_enabled && spec_draft_k == 1 && matches!(plan, StepPlan::Decode) {
         StepPlan::SpecDecode
     } else {
         plan
@@ -387,14 +387,14 @@ impl<M: ModelForward> Scheduler<M> {
                 // real single-launch mixed lowering yet.
                 StepPlan::Split(candidates)
             };
-            return route_spec_plan(self.config.spec_enabled, plan);
+            return route_spec_plan(self.config.spec_enabled, self.config.spec_draft_k, plan);
         }
         let plan = if candidates.is_empty() {
             StepPlan::Idle
         } else {
             StepPlan::Prefill(candidates)
         };
-        route_spec_plan(self.config.spec_enabled, plan)
+        route_spec_plan(self.config.spec_enabled, self.config.spec_draft_k, plan)
     }
 
     pub(super) fn step(&mut self, assign_us: u128) {
@@ -849,13 +849,19 @@ mod tests {
 
     #[test]
     fn spec_disabled_route_returns_existing_step_plan() {
-        let plan = route_spec_plan(false, StepPlan::Decode);
+        let plan = route_spec_plan(false, 1, StepPlan::Decode);
         assert!(matches!(plan, StepPlan::Decode));
     }
 
     #[test]
-    fn spec_enabled_route_uses_verifier_step_plan() {
-        let plan = route_spec_plan(true, StepPlan::Decode);
+    fn spec_enabled_single_token_route_uses_verifier_step_plan() {
+        let plan = route_spec_plan(true, 1, StepPlan::Decode);
         assert!(matches!(plan, StepPlan::SpecDecode));
+    }
+
+    #[test]
+    fn multi_token_spec_route_waits_for_real_verifier() {
+        let plan = route_spec_plan(true, 5, StepPlan::Decode);
+        assert!(matches!(plan, StepPlan::Decode));
     }
 }

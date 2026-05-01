@@ -30,6 +30,20 @@ pub struct RequestSpecConfig {
     pub draft_model: Option<String>,
 }
 
+impl RequestSpecConfig {
+    pub(crate) fn allows_single_token_canary(&self, default_draft_k: usize) -> bool {
+        if self.enabled == Some(false) || self.draft_k.unwrap_or(default_draft_k) != 1 {
+            return false;
+        }
+        self.draft_model.as_deref().is_none_or(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "self" | "self-spec" | "selfspec"
+            )
+        })
+    }
+}
+
 /// Scheduler configuration.
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
@@ -76,8 +90,9 @@ pub struct SchedulerConfig {
     /// Stream chunking interval in generated tokens. 1 matches SGLang's
     /// default and flushes every token.
     pub stream_interval: usize,
-    /// Enable Phase 2 speculative decode. Defaults off; P2.3 routes decode
-    /// steps through the greedy verifier path when enabled.
+    /// Enable Phase 2 speculative decode. Defaults off; P2.3 only routes the
+    /// single-token verifier canary. K-token speculation requires the model-side
+    /// verifier API and paged-KV rollback path.
     pub spec_enabled: bool,
     /// Maximum draft tokens proposed per speculative step.
     pub spec_draft_k: usize,
@@ -312,6 +327,14 @@ impl SchedulerConfig {
         }
         if self.spec_draft_k == 0 {
             anyhow::bail!("spec_draft_k must be ≥ 1");
+        }
+        if self.spec_enabled
+            && matches!(self.spec_draft_model, DraftMode::SelfSpec)
+            && self.spec_draft_k > 1
+        {
+            anyhow::bail!(
+                "self-spec multi-token verifier is not implemented yet; set spec_draft_k=1 for the P2.3 canary"
+            );
         }
         if !(0.0..=1.0).contains(&self.spec_acceptance_threshold) {
             anyhow::bail!("spec_acceptance_threshold must be in [0, 1]");
@@ -667,6 +690,48 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
         assert_eq!(cfg.cluster_shared_backend, None);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn self_spec_multi_token_rejected_until_real_verifier_lands() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.spec_enabled = true;
+        cfg.spec_draft_model = DraftMode::SelfSpec;
+        cfg.spec_draft_k = 5;
+
+        let err = cfg
+            .validate()
+            .expect_err("multi-token self-spec must reject");
+        assert!(
+            err.to_string().contains("multi-token verifier"),
+            "unexpected error: {err}"
+        );
+
+        cfg.spec_draft_k = 1;
+        cfg.validate().expect("single-token canary remains valid");
+    }
+
+    #[test]
+    fn request_spec_canary_rejects_multi_token_override() {
+        let spec = RequestSpecConfig {
+            enabled: Some(true),
+            draft_k: Some(5),
+            acceptance_threshold: None,
+            draft_model: Some("self".to_string()),
+        };
+        assert!(!spec.allows_single_token_canary(1));
+
+        let spec = RequestSpecConfig {
+            draft_k: Some(1),
+            ..spec
+        };
+        assert!(spec.allows_single_token_canary(1));
+
+        let spec = RequestSpecConfig {
+            draft_model: Some("external:/models/draft".to_string()),
+            ..spec
+        };
+        assert!(!spec.allows_single_token_canary(1));
     }
 
     #[test]
