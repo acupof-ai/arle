@@ -32,6 +32,7 @@ pub mod server_engine;
 pub mod speculative;
 pub mod tensor_parallel;
 pub mod tokenizer;
+pub mod tp;
 pub mod trace_reporter;
 pub mod types;
 #[cfg(all(test, feature = "metal"))]

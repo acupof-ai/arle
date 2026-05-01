@@ -46,6 +46,10 @@ impl NcclGroup {
     }
 
     pub fn all_reduce_smoke(&self, input: &[f32]) -> Result<Vec<f32>> {
+        self.all_reduce_f32(input)
+    }
+
+    pub fn all_reduce_f32(&self, input: &[f32]) -> Result<Vec<f32>> {
         let stream = self.comm.stream();
         let send = stream
             .clone_htod(input)
@@ -63,6 +67,71 @@ impl NcclGroup {
         stream
             .clone_dtoh(&recv)
             .with_context(|| format!("rank {} D2H smoke output copy failed", self.rank))
+    }
+
+    pub fn all_gather_f32(&self, input: &[f32], per_rank_count: usize) -> Result<Vec<f32>> {
+        if input.len() != per_rank_count {
+            bail!(
+                "NCCL all_gather rank {} input len {} must equal per-rank count {per_rank_count}",
+                self.rank,
+                input.len()
+            );
+        }
+        let stream = self.comm.stream();
+        let send = stream
+            .clone_htod(input)
+            .with_context(|| format!("rank {} H2D all_gather input copy failed", self.rank))?;
+        let mut recv = stream
+            .alloc_zeros::<f32>(per_rank_count * self.world_size)
+            .with_context(|| format!("rank {} all_gather output allocation failed", self.rank))?;
+
+        self.comm
+            .all_gather(&send, &mut recv)
+            .map_err(|err| anyhow!("rank {} NCCL all_gather failed: {err:?}", self.rank))?;
+        stream
+            .synchronize()
+            .with_context(|| format!("rank {} stream sync after all_gather failed", self.rank))?;
+        stream
+            .clone_dtoh(&recv)
+            .with_context(|| format!("rank {} D2H all_gather output copy failed", self.rank))
+    }
+
+    pub fn broadcast_f32(&self, input: &[f32], count: usize, root_rank: usize) -> Result<Vec<f32>> {
+        if root_rank >= self.world_size {
+            bail!(
+                "NCCL broadcast root {root_rank} must be < world_size {}",
+                self.world_size
+            );
+        }
+        if self.rank == root_rank && input.len() != count {
+            bail!(
+                "NCCL broadcast root rank {} input len {} must equal count {count}",
+                self.rank,
+                input.len()
+            );
+        }
+        let stream = self.comm.stream();
+        let send =
+            if self.rank == root_rank {
+                Some(stream.clone_htod(input).with_context(|| {
+                    format!("rank {} H2D broadcast input copy failed", self.rank)
+                })?)
+            } else {
+                None
+            };
+        let mut recv = stream
+            .alloc_zeros::<f32>(count)
+            .with_context(|| format!("rank {} broadcast output allocation failed", self.rank))?;
+
+        self.comm
+            .broadcast(send.as_ref(), &mut recv, root_rank as i32)
+            .map_err(|err| anyhow!("rank {} NCCL broadcast failed: {err:?}", self.rank))?;
+        stream
+            .synchronize()
+            .with_context(|| format!("rank {} stream sync after broadcast failed", self.rank))?;
+        stream
+            .clone_dtoh(&recv)
+            .with_context(|| format!("rank {} D2H broadcast output copy failed", self.rank))
     }
 }
 
