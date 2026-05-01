@@ -202,7 +202,7 @@ impl<M: ModelForward> Scheduler<M> {
         );
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, decode_headroom_ratio={:.3}, schedule_policy={}, prefix_cache={}, short_prompt_bypass_tokens={}, stream_interval={}, host_pool={:.1}MB",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, schedule_policy={}, prefix_cache={}, short_prompt_bypass_tokens={}, stream_interval={}, host_pool={:.1}MB",
             model_id,
             config.max_slots,
             seed,
@@ -214,7 +214,6 @@ impl<M: ModelForward> Scheduler<M> {
             config
                 .prefill_max_requests
                 .map_or_else(|| "none".to_string(), |v| v.to_string()),
-            config.decode_headroom_ratio,
             config.schedule_policy.as_str(),
             if config.prefix_cache_enabled {
                 "on"

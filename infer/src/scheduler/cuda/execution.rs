@@ -1,4 +1,4 @@
-use super::budget::{PageBudget, PageGrowth, StepTokenBudget, ratio_decode_headroom_tokens};
+use super::budget::{PageBudget, PageGrowth, StepTokenBudget, clipped_max_new_tokens_estimate};
 use super::{ModelForward, Phase, Scheduler, info};
 use crate::metrics::SchedulerPlanLabel;
 
@@ -125,7 +125,7 @@ impl PrefillBudget {
             page_budget: PageBudget::from_scheduler(scheduler, true),
         };
         for &slot_idx in &scheduler.running_batch {
-            let remaining = scheduler.decode_headroom_tokens(slot_idx);
+            let remaining = scheduler.remaining_decode_reservation_tokens(slot_idx);
             if remaining > 0 {
                 budget.page_budget.reserve_growth(PageGrowth {
                     slot_idx,
@@ -212,17 +212,12 @@ impl<M: ModelForward> Scheduler<M> {
         emit_t.elapsed().as_micros()
     }
 
-    fn remaining_decode_tokens(&self, slot_idx: usize) -> usize {
+    fn remaining_decode_reservation_tokens(&self, slot_idx: usize) -> usize {
         self.request(slot_idx).map_or(0, |req| {
-            req.max_tokens.saturating_sub(req.generated_tokens.len())
+            clipped_max_new_tokens_estimate(
+                req.max_tokens.saturating_sub(req.generated_tokens.len()),
+            )
         })
-    }
-
-    fn decode_headroom_tokens(&self, slot_idx: usize) -> usize {
-        ratio_decode_headroom_tokens(
-            self.remaining_decode_tokens(slot_idx),
-            self.config.decode_headroom_ratio,
-        )
     }
 
     pub(super) fn runnable_decode_reservation_slots(&self) -> Vec<usize> {
@@ -259,8 +254,8 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let prefill_tokens = remaining_tokens.min(prefill_token_cap);
-        let decode_tail = if prefill_tokens >= remaining_tokens {
-            self.decode_headroom_tokens(slot_idx)
+        let first_decode_token = if prefill_tokens >= remaining_tokens {
+            usize::from(self.remaining_decode_reservation_tokens(slot_idx) > 0)
         } else {
             0
         };
@@ -268,7 +263,7 @@ impl<M: ModelForward> Scheduler<M> {
             prefill_tokens,
             page_growth: PageGrowth {
                 slot_idx,
-                tokens: prefill_tokens.saturating_add(decode_tail),
+                tokens: prefill_tokens.saturating_add(first_decode_token),
             },
         })
     }
