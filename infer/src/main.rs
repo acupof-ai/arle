@@ -200,6 +200,10 @@ struct Args {
     /// Root directory for the cluster-shared T3 shared-fs backend.
     #[arg(long)]
     cluster_shared_root: Option<PathBuf>,
+
+    /// Run the F0 two-rank NCCL all-reduce smoke and exit.
+    #[arg(long)]
+    nccl_smoke: bool,
 }
 
 #[tokio::main]
@@ -207,6 +211,20 @@ async fn main() {
     logging::init_default();
 
     let args = Args::parse();
+    if args.nccl_smoke {
+        #[cfg(feature = "nccl")]
+        {
+            infer::distributed::smoke_2_thread_all_reduce()
+                .unwrap_or_else(|err| panic!("NCCL smoke failed: {err:#}"));
+            info!("NCCL smoke passed");
+            return;
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            panic!("--nccl-smoke requires building infer with --features nccl");
+        }
+    }
+
     let tracing = configure_global_tracing(TraceStartupConfig {
         level: args.trace_level.clone(),
         sample_rate: args.trace_sample_rate,
