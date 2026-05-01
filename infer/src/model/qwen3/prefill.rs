@@ -611,6 +611,8 @@ impl Qwen3Model {
                 )?;
             }
         }
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
@@ -667,6 +669,8 @@ impl Qwen3Model {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
             }
         }
+        self.layer_communicator
+            .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
@@ -847,6 +851,8 @@ impl Qwen3Model {
                 )?;
             }
         }
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut bufs.o_buf)?;
         crate::model::common::debug_dump_hidden(
             &self.ctx,
             &bufs.o_buf,
@@ -931,6 +937,8 @@ impl Qwen3Model {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
             }
         }
+        self.layer_communicator
+            .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         // 8. Residual add: attn_residual + mlp_out.
         if let Some(ref mut r) = bufs.residual_f32 {

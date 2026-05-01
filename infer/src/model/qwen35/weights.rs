@@ -5,11 +5,18 @@ use std::time::Instant;
 
 use super::config::{Config35, LayerType};
 use crate::model::common::{self, MLP};
+use crate::model::layer_communicator::LayerCommunicator;
 use crate::model::qwen35::prefill_buffers::PagedPrefillBuffers35;
 use crate::model_source::ResolvedModelSource;
+#[cfg(test)]
+use crate::tensor_parallel::ShardingSpec;
+use crate::tensor_parallel::{TpConfig, column_shard};
+use crate::tp::TpLoadContext;
 use crate::weight_loader::{
-    QuantLoadConfig, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d,
-    load_tensor_2d_maybe_quantized_with_config, precompute_rope, resolve_rope_cache_len,
+    QuantLoadConfig, load_tensor_1d, load_tensor_1d_f32, load_tensor_1d_f32_sharded,
+    load_tensor_1d_fused_segments_sharded, load_tensor_1d_sharded, load_tensor_2d,
+    load_tensor_2d_fused_column_segments_sharded, load_tensor_2d_maybe_quantized_with_config,
+    load_tensor_2d_sharded, precompute_rope, resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -64,6 +71,21 @@ pub(super) struct TransformerBlock35 {
     pub(super) mlp: common::MLP,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen35RuntimeConfig {
+    pub enable_cuda_graph: bool,
+    pub tp: TpConfig,
+}
+
+impl Default for Qwen35RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enable_cuda_graph: true,
+            tp: TpConfig::single(),
+        }
+    }
+}
+
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
@@ -75,6 +97,7 @@ pub struct Qwen35Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
+    pub(super) layer_communicator: LayerCommunicator,
     pub(super) paged_prefill_batch: std::sync::Mutex<Option<PagedPrefillBuffers35>>,
 }
 
@@ -87,6 +110,19 @@ impl Qwen35Model {
     pub fn from_safetensors_with_options(
         model_path: &str,
         enable_cuda_graph: bool,
+    ) -> Result<Self> {
+        Self::from_safetensors_with_runtime(
+            model_path,
+            Qwen35RuntimeConfig {
+                enable_cuda_graph,
+                ..Qwen35RuntimeConfig::default()
+            },
+        )
+    }
+
+    pub fn from_safetensors_with_runtime(
+        model_path: &str,
+        runtime: Qwen35RuntimeConfig,
     ) -> Result<Self> {
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU");
@@ -101,6 +137,7 @@ impl Qwen35Model {
         } else {
             Config35::from_file(resolved_path)?
         };
+        let mut runtime_config = config.clone();
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}",
             config.hidden_size,
@@ -111,8 +148,13 @@ impl Qwen35Model {
 
         // Try GGUF first
         if let Some(gguf) = source.gguf() {
+            if !runtime.tp.is_single() {
+                anyhow::bail!(
+                    "Qwen3.5 GGUF tensor-parallel sharded load is not wired yet; use BF16 safetensors for TP"
+                );
+            }
             info!("Loading Qwen3.5 from GGUF: {} tensors", gguf.tensors.len());
-            return Self::from_gguf(&ctx, &config, gguf, enable_cuda_graph);
+            return Self::from_gguf(&ctx, &config, gguf, runtime);
         }
 
         let (mmaps, weight_map) = common::load_safetensors(resolved_path, true)?;
@@ -121,12 +163,128 @@ impl Qwen35Model {
         if quant.enabled() {
             info!("Weight quantization detected: {:?}", quant);
         }
+        if !runtime.tp.is_single() && !tp_forward_collectives_ready() {
+            anyhow::bail!(
+                "Qwen3.5 TP sharded load is staged, but TP forward collectives are not wired yet; keep INFER_TP_SIZE=1 until LayerCommunicator has NCCL all-reduce"
+            );
+        }
+        if !runtime.tp.is_single() {
+            TpLoadContext::head(
+                runtime.tp.rank,
+                runtime.tp.world_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+            )?;
+            TpLoadContext::head(
+                runtime.tp.rank,
+                runtime.tp.world_size,
+                config.linear_num_key_heads,
+                config.linear_num_key_heads,
+            )?;
+            anyhow::ensure!(
+                config
+                    .linear_num_value_heads
+                    .is_multiple_of(runtime.tp.world_size),
+                "Qwen3.5 linear_num_value_heads ({}) must be divisible by TP world size ({})",
+                config.linear_num_value_heads,
+                runtime.tp.world_size
+            );
+            if quant.enabled() {
+                anyhow::bail!(
+                    "Qwen3.5 TP sharded load currently requires BF16 safetensors; quantized load config {:?} cannot be sharded safely yet",
+                    quant
+                );
+            }
+            info!(
+                "Qwen3.5 TP sharded load enabled: rank={}/{}",
+                runtime.tp.rank, runtime.tp.world_size
+            );
+            runtime_config.num_attention_heads /= runtime.tp.world_size;
+            runtime_config.num_key_value_heads /= runtime.tp.world_size;
+            runtime_config.linear_num_key_heads /= runtime.tp.world_size;
+            runtime_config.linear_num_value_heads /= runtime.tp.world_size;
+            runtime_config.intermediate_size =
+                column_shard(config.intermediate_size, &runtime.tp).size;
+        }
         let load_linear = |name: &str| -> Result<DeviceMatrix> {
             if quant.enabled() {
                 load_tensor_2d_maybe_quantized_with_config(&ctx, &shards, &weight_map, name, quant)
             } else {
                 load_tensor_2d(&ctx, &shards, &weight_map, name)
             }
+        };
+        let load_tp_column = |name: &str, total_out_features: usize| -> Result<DeviceMatrix> {
+            if runtime.tp.is_single() {
+                load_linear(name)
+            } else {
+                let tp = TpLoadContext::column(
+                    runtime.tp.rank,
+                    runtime.tp.world_size,
+                    total_out_features,
+                )?;
+                load_tensor_2d_sharded(&ctx, &shards, &weight_map, name, &tp)
+            }
+        };
+        let load_tp_row = |name: &str, total_in_features: usize| -> Result<DeviceMatrix> {
+            if runtime.tp.is_single() {
+                load_linear(name)
+            } else {
+                let tp =
+                    TpLoadContext::row(runtime.tp.rank, runtime.tp.world_size, total_in_features)?;
+                load_tensor_2d_sharded(&ctx, &shards, &weight_map, name, &tp)
+            }
+        };
+        let load_tp_vec = |name: &str, total_len: usize| -> Result<DeviceVec> {
+            if runtime.tp.is_single() {
+                load_tensor_1d(&ctx, &shards, &weight_map, name)
+            } else {
+                let tp = TpLoadContext::column(runtime.tp.rank, runtime.tp.world_size, total_len)?;
+                load_tensor_1d_sharded(&ctx, &shards, &weight_map, name, &tp)
+            }
+        };
+        let load_tp_f32 = |name: &str, total_len: usize| -> Result<CudaSlice<f32>> {
+            if runtime.tp.is_single() {
+                load_tensor_1d_f32(&ctx, &shards, &weight_map, name)
+            } else {
+                let tp = TpLoadContext::column(runtime.tp.rank, runtime.tp.world_size, total_len)?;
+                load_tensor_1d_f32_sharded(&ctx, &shards, &weight_map, name, &tp)
+            }
+        };
+        let load_linear_qkv = |name: &str| -> Result<DeviceMatrix> {
+            load_tensor_2d_fused_column_segments_sharded(
+                &ctx,
+                &shards,
+                &weight_map,
+                name,
+                &[
+                    config.linear_num_key_heads * config.linear_key_head_dim,
+                    config.linear_num_key_heads * config.linear_key_head_dim,
+                    config.linear_num_value_heads * config.linear_value_head_dim,
+                ],
+                runtime.tp.rank,
+                runtime.tp.world_size,
+            )
+        };
+        let load_linear_qkv_vec = |name: &str| -> Result<DeviceVec> {
+            load_tensor_1d_fused_segments_sharded(
+                &ctx,
+                &shards,
+                &weight_map,
+                name,
+                &[
+                    config.linear_num_key_heads
+                        * config.linear_key_head_dim
+                        * config.linear_conv_kernel_dim,
+                    config.linear_num_key_heads
+                        * config.linear_key_head_dim
+                        * config.linear_conv_kernel_dim,
+                    config.linear_num_value_heads
+                        * config.linear_value_head_dim
+                        * config.linear_conv_kernel_dim,
+                ],
+                runtime.tp.rank,
+                runtime.tp.world_size,
+            )
         };
 
         let t_gpu = Instant::now();
@@ -158,10 +316,22 @@ impl Qwen35Model {
                 LayerType::FullAttention => {
                     let attn_prefix = format!("{}.self_attn", prefix);
                     LayerKind::FullAttention(FullAttentionLayer {
-                        q_proj: load_linear(&format!("{}.q_proj.weight", attn_prefix))?,
-                        k_proj: load_linear(&format!("{}.k_proj.weight", attn_prefix))?,
-                        v_proj: load_linear(&format!("{}.v_proj.weight", attn_prefix))?,
-                        o_proj: load_linear(&format!("{}.o_proj.weight", attn_prefix))?,
+                        q_proj: load_tp_column(
+                            &format!("{}.q_proj.weight", attn_prefix),
+                            config.full_attn_q_proj_dim(),
+                        )?,
+                        k_proj: load_tp_column(
+                            &format!("{}.k_proj.weight", attn_prefix),
+                            config.full_attn_kv_dim(),
+                        )?,
+                        v_proj: load_tp_column(
+                            &format!("{}.v_proj.weight", attn_prefix),
+                            config.full_attn_kv_dim(),
+                        )?,
+                        o_proj: load_tp_row(
+                            &format!("{}.o_proj.weight", attn_prefix),
+                            config.full_attn_q_dim(),
+                        )?,
                         q_norm: load_tensor_1d(
                             &ctx,
                             &shards,
@@ -179,27 +349,33 @@ impl Qwen35Model {
                 LayerType::LinearAttention => {
                     let attn_prefix = format!("{}.linear_attn", prefix);
                     LayerKind::LinearAttention(LinearAttentionLayer {
-                        in_proj_qkv: load_linear(&format!("{}.in_proj_qkv.weight", attn_prefix))?,
-                        in_proj_z: load_linear(&format!("{}.in_proj_z.weight", attn_prefix))?,
-                        in_proj_b: load_linear(&format!("{}.in_proj_b.weight", attn_prefix))?,
-                        in_proj_a: load_linear(&format!("{}.in_proj_a.weight", attn_prefix))?,
-                        conv1d_weight: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.conv1d.weight", attn_prefix),
+                        in_proj_qkv: load_linear_qkv(&format!(
+                            "{}.in_proj_qkv.weight",
+                            attn_prefix
+                        ))?,
+                        in_proj_z: load_tp_column(
+                            &format!("{}.in_proj_z.weight", attn_prefix),
+                            config.linear_attn_z_dim(),
                         )?,
-                        dt_bias: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
+                        in_proj_b: load_tp_column(
+                            &format!("{}.in_proj_b.weight", attn_prefix),
+                            config.linear_num_value_heads,
+                        )?,
+                        in_proj_a: load_tp_column(
+                            &format!("{}.in_proj_a.weight", attn_prefix),
+                            config.linear_num_value_heads,
+                        )?,
+                        conv1d_weight: load_linear_qkv_vec(&format!(
+                            "{}.conv1d.weight",
+                            attn_prefix
+                        ))?,
+                        dt_bias: load_tp_vec(
                             &format!("{}.dt_bias", attn_prefix),
+                            config.linear_num_value_heads,
                         )?,
-                        a_log: load_tensor_1d_f32(
-                            &ctx,
-                            &shards,
-                            &weight_map,
+                        a_log: load_tp_f32(
                             &format!("{}.A_log", attn_prefix),
+                            config.linear_num_value_heads,
                         )?,
                         norm_weight: load_tensor_1d_f32(
                             &ctx,
@@ -207,7 +383,10 @@ impl Qwen35Model {
                             &weight_map,
                             &format!("{}.norm.weight", attn_prefix),
                         )?,
-                        out_proj: load_linear(&format!("{}.out_proj.weight", attn_prefix))?,
+                        out_proj: load_tp_row(
+                            &format!("{}.out_proj.weight", attn_prefix),
+                            config.linear_attn_z_dim(),
+                        )?,
                     })
                 }
             };
@@ -226,13 +405,30 @@ impl Qwen35Model {
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
-                mlp: MLP::load_with_quant_config(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp", prefix),
-                    quant,
-                )?,
+                mlp: if runtime.tp.is_single() {
+                    MLP::load_with_quant_config(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &format!("{}.mlp", prefix),
+                        quant,
+                    )?
+                } else {
+                    MLP {
+                        gate_proj: load_tp_column(
+                            &format!("{}.mlp.gate_proj.weight", prefix),
+                            config.intermediate_size,
+                        )?,
+                        up_proj: load_tp_column(
+                            &format!("{}.mlp.up_proj.weight", prefix),
+                            config.intermediate_size,
+                        )?,
+                        down_proj: load_tp_row(
+                            &format!("{}.mlp.down_proj.weight", prefix),
+                            config.intermediate_size,
+                        )?,
+                    }
+                },
             };
 
             debug!(
@@ -260,7 +456,7 @@ impl Qwen35Model {
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
         info!("Qwen3.5 GPU model loaded successfully");
-        if enable_cuda_graph {
+        if runtime.enable_cuda_graph {
             debug!("Decode path CUDA Graph is enabled");
         } else {
             debug!("Decode path CUDA Graph is disabled");
@@ -268,13 +464,21 @@ impl Qwen35Model {
 
         Ok(Self {
             ctx,
-            config,
+            config: runtime_config,
             embed_tokens,
             layers,
             norm,
             cos_cache,
             sin_cache,
-            enable_cuda_graph,
+            enable_cuda_graph: runtime.enable_cuda_graph,
+            layer_communicator: LayerCommunicator::new(
+                runtime.tp.rank,
+                runtime.tp.world_size,
+                0,
+                1,
+                0,
+                1,
+            )?,
             paged_prefill_batch: std::sync::Mutex::new(None),
         })
     }
@@ -412,7 +616,7 @@ impl Qwen35Model {
         ctx: &DeviceContext,
         config: &Config35,
         gguf: &crate::gguf::GgufFile,
-        enable_cuda_graph: bool,
+        runtime: Qwen35RuntimeConfig,
     ) -> Result<Self> {
         use crate::gguf::{
             load_matrix_v_reorder_cols_bf16_host, load_qwen35_a_log_f32_host,
@@ -626,7 +830,15 @@ impl Qwen35Model {
             norm,
             cos_cache,
             sin_cache,
-            enable_cuda_graph,
+            enable_cuda_graph: runtime.enable_cuda_graph,
+            layer_communicator: LayerCommunicator::new(
+                runtime.tp.rank,
+                runtime.tp.world_size,
+                0,
+                1,
+                0,
+                1,
+            )?,
             paged_prefill_batch: std::sync::Mutex::new(None),
         })
     }
@@ -658,11 +870,122 @@ fn assert_vec_len(name: &str, v: &DeviceVec, expected: usize) -> Result<()> {
     Ok(())
 }
 
+fn tp_forward_collectives_ready() -> bool {
+    false
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Qwen35TpLayerShards {
+    pub full_q_proj: ShardingSpec,
+    pub full_k_proj: ShardingSpec,
+    pub full_v_proj: ShardingSpec,
+    pub full_o_proj: ShardingSpec,
+    pub linear_qkv: ShardingSpec,
+    pub linear_z: ShardingSpec,
+    pub linear_b: ShardingSpec,
+    pub linear_a: ShardingSpec,
+    pub linear_conv1d: ShardingSpec,
+    pub linear_dt_bias: ShardingSpec,
+    pub linear_a_log: ShardingSpec,
+    pub linear_out: ShardingSpec,
+    pub mlp_gate: ShardingSpec,
+    pub mlp_up: ShardingSpec,
+    pub mlp_down: ShardingSpec,
+}
+
+#[cfg(test)]
+pub(crate) fn qwen35_tp_layer_shards(
+    config: &Config35,
+    tp: TpConfig,
+) -> Result<Qwen35TpLayerShards> {
+    TpLoadContext::head(
+        tp.rank,
+        tp.world_size,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+    )?;
+    TpLoadContext::head(
+        tp.rank,
+        tp.world_size,
+        config.linear_num_key_heads,
+        config.linear_num_key_heads,
+    )?;
+    Ok(Qwen35TpLayerShards {
+        full_q_proj: TpLoadContext::column(tp.rank, tp.world_size, config.full_attn_q_proj_dim())?
+            .sharding,
+        full_k_proj: TpLoadContext::column(tp.rank, tp.world_size, config.full_attn_kv_dim())?
+            .sharding,
+        full_v_proj: TpLoadContext::column(tp.rank, tp.world_size, config.full_attn_kv_dim())?
+            .sharding,
+        full_o_proj: TpLoadContext::row(tp.rank, tp.world_size, config.full_attn_q_dim())?.sharding,
+        linear_qkv: TpLoadContext::column(tp.rank, tp.world_size, config.linear_attn_qkv_dim())?
+            .sharding,
+        linear_z: TpLoadContext::column(tp.rank, tp.world_size, config.linear_attn_z_dim())?
+            .sharding,
+        linear_b: TpLoadContext::column(tp.rank, tp.world_size, config.linear_num_value_heads)?
+            .sharding,
+        linear_a: TpLoadContext::column(tp.rank, tp.world_size, config.linear_num_value_heads)?
+            .sharding,
+        linear_conv1d: TpLoadContext::column(
+            tp.rank,
+            tp.world_size,
+            config.linear_attn_qkv_dim() * config.linear_conv_kernel_dim,
+        )?
+        .sharding,
+        linear_dt_bias: TpLoadContext::column(
+            tp.rank,
+            tp.world_size,
+            config.linear_num_value_heads,
+        )?
+        .sharding,
+        linear_a_log: TpLoadContext::column(tp.rank, tp.world_size, config.linear_num_value_heads)?
+            .sharding,
+        linear_out: TpLoadContext::row(tp.rank, tp.world_size, config.linear_attn_z_dim())?
+            .sharding,
+        mlp_gate: TpLoadContext::column(tp.rank, tp.world_size, config.intermediate_size)?.sharding,
+        mlp_up: TpLoadContext::column(tp.rank, tp.world_size, config.intermediate_size)?.sharding,
+        mlp_down: TpLoadContext::row(tp.rank, tp.world_size, config.intermediate_size)?.sharding,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
+
+    fn hybrid_config() -> Config35 {
+        Config35::from_json_str(
+            r#"{
+                "text_config": {
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "rms_norm_eps": 1e-6,
+                    "eos_token_id": 127,
+                    "bos_token_id": 0,
+                    "tie_word_embeddings": true,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 4,
+                    "layer_types": ["full_attention", "linear_attention"],
+                    "linear_conv_kernel_dim": 4,
+                    "linear_key_head_dim": 4,
+                    "linear_num_key_heads": 4,
+                    "linear_num_value_heads": 4,
+                    "linear_value_head_dim": 4,
+                    "rope_parameters": {
+                        "rope_theta": 1000000.0,
+                        "partial_rotary_factor": 0.5
+                    },
+                    "max_position_embeddings": 4096
+                }
+            }"#,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_load_qwen35_model() {
@@ -685,5 +1008,95 @@ mod tests {
         assert_eq!(linear_count, 24);
 
         model.verify_shapes().unwrap();
+    }
+
+    #[test]
+    fn qwen35_tp1_layer_shards_are_full_for_hybrid_shapes() {
+        let config = hybrid_config();
+        let shards = qwen35_tp_layer_shards(&config, TpConfig::single()).unwrap();
+
+        assert!(shards.full_q_proj.is_full());
+        assert!(shards.full_k_proj.is_full());
+        assert!(shards.full_v_proj.is_full());
+        assert!(shards.full_o_proj.is_full());
+        assert!(shards.linear_qkv.is_full());
+        assert!(shards.linear_z.is_full());
+        assert!(shards.linear_b.is_full());
+        assert!(shards.linear_a.is_full());
+        assert!(shards.linear_conv1d.is_full());
+        assert!(shards.linear_dt_bias.is_full());
+        assert!(shards.linear_a_log.is_full());
+        assert!(shards.linear_out.is_full());
+        assert!(shards.mlp_gate.is_full());
+        assert!(shards.mlp_up.is_full());
+        assert!(shards.mlp_down.is_full());
+    }
+
+    #[test]
+    fn qwen35_tp2_layer_shards_cover_full_and_linear_attention_dimensions() {
+        let config = hybrid_config();
+        let rank0 = qwen35_tp_layer_shards(&config, TpConfig::new(2, 0).unwrap()).unwrap();
+        let rank1 = qwen35_tp_layer_shards(&config, TpConfig::new(2, 1).unwrap()).unwrap();
+
+        assert_eq!(
+            rank0.full_q_proj.size + rank1.full_q_proj.size,
+            config.full_attn_q_proj_dim()
+        );
+        assert_eq!(
+            rank0.full_k_proj.size + rank1.full_k_proj.size,
+            config.full_attn_kv_dim()
+        );
+        assert_eq!(
+            rank0.full_v_proj.size + rank1.full_v_proj.size,
+            config.full_attn_kv_dim()
+        );
+        assert_eq!(
+            rank0.full_o_proj.size + rank1.full_o_proj.size,
+            config.full_attn_q_dim()
+        );
+        assert_eq!(
+            rank0.linear_qkv.size + rank1.linear_qkv.size,
+            config.linear_attn_qkv_dim()
+        );
+        assert_eq!(
+            rank0.linear_z.size + rank1.linear_z.size,
+            config.linear_attn_z_dim()
+        );
+        assert_eq!(
+            rank0.linear_b.size + rank1.linear_b.size,
+            config.linear_num_value_heads
+        );
+        assert_eq!(
+            rank0.linear_a.size + rank1.linear_a.size,
+            config.linear_num_value_heads
+        );
+        assert_eq!(
+            rank0.linear_conv1d.size + rank1.linear_conv1d.size,
+            config.linear_attn_qkv_dim() * config.linear_conv_kernel_dim
+        );
+        assert_eq!(
+            rank0.linear_dt_bias.size + rank1.linear_dt_bias.size,
+            config.linear_num_value_heads
+        );
+        assert_eq!(
+            rank0.linear_a_log.size + rank1.linear_a_log.size,
+            config.linear_num_value_heads
+        );
+        assert_eq!(
+            rank0.linear_out.size + rank1.linear_out.size,
+            config.linear_attn_z_dim()
+        );
+        assert_eq!(
+            rank0.mlp_gate.size + rank1.mlp_gate.size,
+            config.intermediate_size
+        );
+        assert_eq!(
+            rank0.mlp_up.size + rank1.mlp_up.size,
+            config.intermediate_size
+        );
+        assert_eq!(
+            rank0.mlp_down.size + rank1.mlp_down.size,
+            config.intermediate_size
+        );
     }
 }

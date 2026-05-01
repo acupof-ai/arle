@@ -4,23 +4,30 @@ use std::time::Instant;
 
 use super::config::Config;
 use crate::model::common::{self, MLP};
+use crate::model::layer_communicator::LayerCommunicator;
 use crate::model_source::ResolvedModelSource;
 use crate::ops;
+#[cfg(test)]
+use crate::tensor_parallel::ShardingSpec;
+use crate::tensor_parallel::{TpConfig, column_shard};
+use crate::tp::TpLoadContext;
 use crate::weight_loader::{
     QuantLoadConfig, load_tensor_1d, load_tensor_2d, load_tensor_2d_maybe_quantized_with_config,
-    precompute_rope, resolve_rope_cache_len,
+    load_tensor_2d_sharded, precompute_rope, resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelRuntimeConfig {
     pub enable_cuda_graph: bool,
+    pub tp: TpConfig,
 }
 
 impl Default for ModelRuntimeConfig {
     fn default() -> Self {
         Self {
             enable_cuda_graph: true,
+            tp: TpConfig::single(),
         }
     }
 }
@@ -54,6 +61,7 @@ pub struct Qwen3Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
+    pub(super) layer_communicator: LayerCommunicator,
     /// Optional PEFT LoRA bundle. `None` = no adapter, forward uses base
     /// weights verbatim. When `Some`, every projection site in prefill /
     /// decode / batch_decode checks `lora.layers[layer_idx].<module>` and
@@ -102,11 +110,17 @@ impl Qwen3Model {
                     vec![],
                 )
             };
+            if !runtime.tp.is_single() {
+                anyhow::bail!(
+                    "Qwen3 GGUF tensor-parallel sharded load is not wired yet; use BF16 safetensors for TP"
+                );
+            }
             return Self::from_gguf(&ctx, &config, gguf, runtime);
         }
 
         let config = Config::from_file(resolved_path)
             .with_context(|| format!("failed to load Qwen3 config from {}", resolved_path))?;
+        let mut runtime_config = config.clone();
 
         let (mmaps, weight_map) = common::load_safetensors(resolved_path, false)?;
         let shards = common::deserialize_shards(&mmaps)?;
@@ -116,12 +130,61 @@ impl Qwen3Model {
             info!("Weight quantization detected: {:?}", quant);
         }
 
-        // Helper: load linear weight, quantized if available
+        if !runtime.tp.is_single() && !tp_forward_collectives_ready() {
+            anyhow::bail!(
+                "Qwen3 TP sharded load is staged, but TP forward collectives are not wired yet; keep INFER_TP_SIZE=1 until LayerCommunicator has NCCL all-reduce"
+            );
+        }
+
+        if !runtime.tp.is_single() {
+            TpLoadContext::head(
+                runtime.tp.rank,
+                runtime.tp.world_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+            )?;
+            if quant.enabled() {
+                anyhow::bail!(
+                    "Qwen3 TP sharded load currently requires BF16 safetensors; quantized load config {:?} cannot be sharded safely yet",
+                    quant
+                );
+            }
+            info!(
+                "Qwen3 TP sharded load enabled: rank={}/{}",
+                runtime.tp.rank, runtime.tp.world_size
+            );
+            runtime_config.spec.num_attention_heads /= runtime.tp.world_size;
+            runtime_config.spec.num_key_value_heads /= runtime.tp.world_size;
+            runtime_config.spec.intermediate_size =
+                column_shard(config.intermediate_size, &runtime.tp).size;
+        }
+
         let load_linear = |name: &str| -> Result<DeviceMatrix> {
             if quant.enabled() {
                 load_tensor_2d_maybe_quantized_with_config(&ctx, &shards, &weight_map, name, quant)
             } else {
                 load_tensor_2d(&ctx, &shards, &weight_map, name)
+            }
+        };
+        let load_tp_column = |name: &str, total_out_features: usize| -> Result<DeviceMatrix> {
+            if runtime.tp.is_single() {
+                load_linear(name)
+            } else {
+                let tp = TpLoadContext::column(
+                    runtime.tp.rank,
+                    runtime.tp.world_size,
+                    total_out_features,
+                )?;
+                load_tensor_2d_sharded(&ctx, &shards, &weight_map, name, &tp)
+            }
+        };
+        let load_tp_row = |name: &str, total_in_features: usize| -> Result<DeviceMatrix> {
+            if runtime.tp.is_single() {
+                load_linear(name)
+            } else {
+                let tp =
+                    TpLoadContext::row(runtime.tp.rank, runtime.tp.world_size, total_in_features)?;
+                load_tensor_2d_sharded(&ctx, &shards, &weight_map, name, &tp)
             }
         };
 
@@ -162,14 +225,26 @@ impl Qwen3Model {
                     &names.input_layernorm,
                 )?,
                 attention: {
-                    let q_proj = load_linear(&names.q_proj)?;
-                    let k_proj = load_linear(&names.k_proj)?;
-                    let v_proj = load_linear(&names.v_proj)?;
+                    let q_proj = load_tp_column(
+                        &names.q_proj,
+                        config.num_attention_heads * config.head_dim,
+                    )?;
+                    let k_proj = load_tp_column(
+                        &names.k_proj,
+                        config.num_key_value_heads * config.head_dim,
+                    )?;
+                    let v_proj = load_tp_column(
+                        &names.v_proj,
+                        config.num_key_value_heads * config.head_dim,
+                    )?;
                     Attention {
                         q_proj,
                         k_proj,
                         v_proj,
-                        o_proj: load_linear(&names.o_proj)?,
+                        o_proj: load_tp_row(
+                            &names.o_proj,
+                            config.num_attention_heads * config.head_dim,
+                        )?,
                         q_norm: load_tensor_1d(&ctx, &shards, &weight_map, &names.q_norm)?,
                         k_norm: load_tensor_1d(&ctx, &shards, &weight_map, &names.k_norm)?,
                     }
@@ -180,13 +255,21 @@ impl Qwen3Model {
                     &weight_map,
                     &names.post_attention_layernorm,
                 )?,
-                mlp: MLP::load_with_quant_config(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &names.mlp_prefix,
-                    quant,
-                )?,
+                mlp: if runtime.tp.is_single() {
+                    MLP::load_with_quant_config(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &names.mlp_prefix,
+                        quant,
+                    )?
+                } else {
+                    MLP {
+                        gate_proj: load_tp_column(&names.mlp_gate_proj, config.intermediate_size)?,
+                        up_proj: load_tp_column(&names.mlp_up_proj, config.intermediate_size)?,
+                        down_proj: load_tp_row(&names.mlp_down_proj, config.intermediate_size)?,
+                    }
+                },
             };
             layers.push(block);
         }
@@ -207,7 +290,7 @@ impl Qwen3Model {
 
         let model = Self {
             ctx,
-            config,
+            config: runtime_config,
             embed_tokens,
             lm_head,
             layers,
@@ -215,6 +298,14 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
+            layer_communicator: LayerCommunicator::new(
+                runtime.tp.rank,
+                runtime.tp.world_size,
+                0,
+                1,
+                0,
+                1,
+            )?,
             lora: None,
         };
 
@@ -431,6 +522,14 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
+            layer_communicator: LayerCommunicator::new(
+                runtime.tp.rank,
+                runtime.tp.world_size,
+                0,
+                1,
+                0,
+                1,
+            )?,
             lora: None,
         };
 
@@ -438,5 +537,120 @@ impl Qwen3Model {
             model.preload_decode_triton_kernels()?;
         }
         Ok(model)
+    }
+}
+
+fn tp_forward_collectives_ready() -> bool {
+    false
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Qwen3TpLayerShards {
+    pub q_proj: ShardingSpec,
+    pub k_proj: ShardingSpec,
+    pub v_proj: ShardingSpec,
+    pub o_proj: ShardingSpec,
+    pub gate_proj: ShardingSpec,
+    pub up_proj: ShardingSpec,
+    pub down_proj: ShardingSpec,
+}
+
+#[cfg(test)]
+pub(crate) fn qwen3_tp_layer_shards(config: &Config, tp: TpConfig) -> Result<Qwen3TpLayerShards> {
+    TpLoadContext::head(
+        tp.rank,
+        tp.world_size,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+    )?;
+    Ok(Qwen3TpLayerShards {
+        q_proj: TpLoadContext::column(
+            tp.rank,
+            tp.world_size,
+            config.num_attention_heads * config.head_dim,
+        )?
+        .sharding,
+        k_proj: TpLoadContext::column(
+            tp.rank,
+            tp.world_size,
+            config.num_key_value_heads * config.head_dim,
+        )?
+        .sharding,
+        v_proj: TpLoadContext::column(
+            tp.rank,
+            tp.world_size,
+            config.num_key_value_heads * config.head_dim,
+        )?
+        .sharding,
+        o_proj: TpLoadContext::row(
+            tp.rank,
+            tp.world_size,
+            config.num_attention_heads * config.head_dim,
+        )?
+        .sharding,
+        gate_proj: TpLoadContext::column(tp.rank, tp.world_size, config.intermediate_size)?
+            .sharding,
+        up_proj: TpLoadContext::column(tp.rank, tp.world_size, config.intermediate_size)?.sharding,
+        down_proj: TpLoadContext::row(tp.rank, tp.world_size, config.intermediate_size)?.sharding,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> Config {
+        Config::from_parts(
+            qwen3_spec::Qwen3Config {
+                hidden_size: 16,
+                intermediate_size: 32,
+                num_hidden_layers: 2,
+                num_attention_heads: 4,
+                num_key_value_heads: 2,
+                head_dim: 4,
+                vocab_size: 128,
+                rms_norm_eps: 1e-6,
+                rope_theta: 1_000_000.0,
+                tie_word_embeddings: true,
+                max_position_embeddings: 4096,
+            },
+            0,
+            0,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn qwen3_tp1_layer_shards_are_full() {
+        let config = tiny_config();
+        let shards = qwen3_tp_layer_shards(&config, TpConfig::single()).unwrap();
+
+        assert!(shards.q_proj.is_full());
+        assert!(shards.k_proj.is_full());
+        assert!(shards.v_proj.is_full());
+        assert!(shards.o_proj.is_full());
+        assert!(shards.gate_proj.is_full());
+        assert!(shards.up_proj.is_full());
+        assert!(shards.down_proj.is_full());
+    }
+
+    #[test]
+    fn qwen3_tp2_layer_shards_cover_attention_and_mlp_dimensions() {
+        let config = tiny_config();
+        let rank0 = qwen3_tp_layer_shards(&config, TpConfig::new(2, 0).unwrap()).unwrap();
+        let rank1 = qwen3_tp_layer_shards(&config, TpConfig::new(2, 1).unwrap()).unwrap();
+
+        assert_eq!((rank0.q_proj.offset, rank0.q_proj.size), (0, 8));
+        assert_eq!((rank1.q_proj.offset, rank1.q_proj.size), (8, 8));
+        assert_eq!((rank0.k_proj.offset, rank0.k_proj.size), (0, 4));
+        assert_eq!((rank1.k_proj.offset, rank1.k_proj.size), (4, 4));
+        assert_eq!((rank0.v_proj.offset, rank0.v_proj.size), (0, 4));
+        assert_eq!((rank1.v_proj.offset, rank1.v_proj.size), (4, 4));
+        assert_eq!((rank0.o_proj.offset, rank0.o_proj.size), (0, 8));
+        assert_eq!((rank1.o_proj.offset, rank1.o_proj.size), (8, 8));
+        assert_eq!((rank0.gate_proj.size + rank1.gate_proj.size), 32);
+        assert_eq!((rank0.up_proj.size + rank1.up_proj.size), 32);
+        assert_eq!((rank0.down_proj.size + rank1.down_proj.size), 32);
     }
 }

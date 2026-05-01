@@ -170,6 +170,8 @@ impl Qwen3Model {
                 )?;
             }
         }
+        self.layer_communicator
+            .post_attn_all_reduce_device_vec(&mut bufs.attn_proj)?;
 
         ops::fused_add_rms_norm_into(
             &self.ctx,
@@ -210,6 +212,8 @@ impl Qwen3Model {
                 &mut bufs.mlp_out,
             )?;
         }
+        self.layer_communicator
+            .post_mlp_all_reduce_device_vec(&mut bufs.mlp_out)?;
 
         Ok(())
     }

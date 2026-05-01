@@ -73,6 +73,7 @@ fn run_solo(prompt: &str, max_tokens: usize, model_path: &str) -> String {
         model_path,
         ModelRuntimeConfig {
             enable_cuda_graph: true,
+            ..ModelRuntimeConfig::default()
         },
     )
     .expect("Failed to load model");
@@ -112,6 +113,7 @@ fn run_concurrent(
         model_path,
         ModelRuntimeConfig {
             enable_cuda_graph: true,
+            ..ModelRuntimeConfig::default()
         },
     )
     .expect("Failed to load model");

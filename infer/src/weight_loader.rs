@@ -131,6 +131,39 @@ pub(crate) fn load_tensor_1d(
     DeviceVec::from_safetensors(ctx, tensor.data()).map(|v| v.with_label(label))
 }
 
+#[allow(dead_code)]
+pub(crate) fn load_tensor_1d_sharded(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    tp: &TpLoadContext,
+) -> Result<DeviceVec> {
+    if tp.is_single() {
+        return load_tensor_1d(ctx, shards, weight_map, name);
+    }
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 1,
+        "{name}: expected 1D tensor for TP load, got shape {:?}",
+        shape
+    );
+    anyhow::ensure!(
+        matches!(tp.axis, TpShardAxis::Column),
+        "{name}: 1D TP shard must use column axis"
+    );
+    anyhow::ensure!(
+        tp.sharding.total == shape[0],
+        "{name}: shard total {} does not match tensor len {}",
+        tp.sharding.total,
+        shape[0]
+    );
+    let all = bytes_to_bf16_vec(tensor.data())?;
+    let shard = &all[tp.sharding.range()];
+    DeviceVec::from_host(ctx, shard).map(|v| v.with_label(shape_label_1d(name, &[shard.len()])))
+}
+
 pub(crate) fn load_tensor_2d(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -140,6 +173,50 @@ pub(crate) fn load_tensor_2d(
     let tensor = find_tensor(shards, weight_map, name)?;
     let shape = tensor.shape();
     DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_tensor_1d_f32_sharded(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    tp: &TpLoadContext,
+) -> Result<CudaSlice<f32>> {
+    if tp.is_single() {
+        return load_tensor_1d_f32(ctx, shards, weight_map, name);
+    }
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 1,
+        "{name}: expected 1D f32 tensor for TP load, got shape {:?}",
+        shape
+    );
+    anyhow::ensure!(
+        matches!(tp.axis, TpShardAxis::Column),
+        "{name}: 1D TP shard must use column axis"
+    );
+    anyhow::ensure!(
+        tp.sharding.total == shape[0],
+        "{name}: shard total {} does not match tensor len {}",
+        tp.sharding.total,
+        shape[0]
+    );
+    let bytes = tensor.data();
+    anyhow::ensure!(
+        bytes.len() == shape[0] * std::mem::size_of::<f32>(),
+        "{name}: f32 byte length mismatch: expected {}, got {}",
+        shape[0] * std::mem::size_of::<f32>(),
+        bytes.len()
+    );
+    let all: Vec<f32> = bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    ctx.stream
+        .clone_htod(&all[tp.sharding.range()])
+        .map_err(|e| anyhow::anyhow!("H2D copy failed: {e}"))
 }
 
 #[allow(dead_code)]
@@ -162,6 +239,94 @@ pub(crate) fn load_tensor_2d_sharded(
     );
     let (host, rows, cols) = shard_bf16_matrix_host(tensor.data(), shape[0], shape[1], tp)?;
     DeviceMatrix::from_host(ctx, &host, rows, cols)
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_tensor_2d_fused_column_segments_sharded(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    segment_rows: &[usize],
+    rank: usize,
+    world_size: usize,
+) -> Result<DeviceMatrix> {
+    if world_size == 1 {
+        return load_tensor_2d(ctx, shards, weight_map, name);
+    }
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 2,
+        "{name}: expected 2D fused segmented tensor for TP load, got shape {:?}",
+        shape
+    );
+    let rows = shape[0];
+    let cols = shape[1];
+    anyhow::ensure!(
+        segment_rows.iter().sum::<usize>() == rows,
+        "{name}: fused segment rows {:?} do not sum to tensor rows {rows}",
+        segment_rows
+    );
+    anyhow::ensure!(
+        tensor.data().len() == rows * cols * std::mem::size_of::<bf16>(),
+        "{name}: bf16 matrix byte length mismatch: expected {}, got {}",
+        rows * cols * std::mem::size_of::<bf16>(),
+        tensor.data().len()
+    );
+
+    let mut out = Vec::new();
+    let mut segment_base = 0usize;
+    for &segment_len in segment_rows {
+        let tp = TpLoadContext::column(rank, world_size, segment_len)?;
+        out.reserve(tp.sharding.size * cols);
+        let elem_start = (segment_base + tp.sharding.offset) * cols;
+        let elem_end = (segment_base + tp.sharding.end()) * cols;
+        push_bf16_range(tensor.data(), elem_start, elem_end, &mut out);
+        segment_base += segment_len;
+    }
+    let out_rows = out.len() / cols;
+    DeviceMatrix::from_host(ctx, &out, out_rows, cols)
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_tensor_1d_fused_segments_sharded(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    segment_lens: &[usize],
+    rank: usize,
+    world_size: usize,
+) -> Result<DeviceVec> {
+    if world_size == 1 {
+        return load_tensor_1d(ctx, shards, weight_map, name);
+    }
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 1,
+        "{name}: expected 1D fused segmented tensor for TP load, got shape {:?}",
+        shape
+    );
+    anyhow::ensure!(
+        segment_lens.iter().sum::<usize>() == shape[0],
+        "{name}: fused segment lengths {:?} do not sum to tensor len {}",
+        segment_lens,
+        shape[0]
+    );
+
+    let all = bytes_to_bf16_vec(tensor.data())?;
+    let mut out = Vec::new();
+    let mut segment_base = 0usize;
+    for &segment_len in segment_lens {
+        let tp = TpLoadContext::column(rank, world_size, segment_len)?;
+        out.extend_from_slice(
+            &all[segment_base + tp.sharding.offset..segment_base + tp.sharding.end()],
+        );
+        segment_base += segment_len;
+    }
+    DeviceVec::from_host(ctx, &out).map(|v| v.with_label(shape_label_1d(name, &[out.len()])))
 }
 
 #[allow(dead_code)]
@@ -215,6 +380,18 @@ fn push_bf16_range(data: &[u8], elem_start: usize, elem_end: usize, out: &mut Ve
             .chunks_exact(std::mem::size_of::<bf16>())
             .map(|bytes| bf16::from_le_bytes([bytes[0], bytes[1]])),
     );
+}
+
+fn bytes_to_bf16_vec(data: &[u8]) -> Result<Vec<bf16>> {
+    anyhow::ensure!(
+        data.len().is_multiple_of(std::mem::size_of::<bf16>()),
+        "bf16 byte length must be divisible by 2, got {}",
+        data.len()
+    );
+    Ok(data
+        .chunks_exact(std::mem::size_of::<bf16>())
+        .map(|bytes| bf16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
