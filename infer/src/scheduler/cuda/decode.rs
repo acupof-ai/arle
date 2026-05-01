@@ -97,7 +97,7 @@ impl<M: ModelForward> Scheduler<M> {
             && self
                 .decode_pages_needed(decode_indices)
                 .saturating_add(extra_pages)
-                > self.pool_free_pages()
+                > self.effective_pool_free_pages()
             && decode_indices.len() > 1
         {
             let Some(victim_pos) = self.retract_victim_pos(decode_indices) else {
