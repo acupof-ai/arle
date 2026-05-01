@@ -7,6 +7,7 @@ members = [
     "crates/chat",
     "crates/cli",
     "crates/cuda-kernels",
+    "crates/deepseek-spec",
     "crates/kv-native-sys",
     "crates/mlx-sys",
     "crates/qwen3-spec",
