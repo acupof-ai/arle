@@ -37,6 +37,94 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_RETRY_ATTEMPTS: u32 = 10;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvRendezvousConfig {
+    pub master_addr: String,
+    pub master_port: u16,
+    pub rank: usize,
+    pub world_size: usize,
+    pub local_rank: usize,
+    pub cuda_device: u32,
+}
+
+impl EnvRendezvousConfig {
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let master_addr = lookup("MASTER_ADDR").unwrap_or_else(|| "127.0.0.1".to_string());
+        let master_port = parse_env_u16("MASTER_PORT", lookup("MASTER_PORT"), 29500)?;
+        let rank = parse_env_usize("RANK", lookup("RANK"), 0)?;
+        let world_size = parse_env_usize("WORLD_SIZE", lookup("WORLD_SIZE"), 1)?;
+        if world_size == 0 {
+            bail!("WORLD_SIZE must be >= 1");
+        }
+        if rank >= world_size {
+            bail!("RANK ({rank}) must be < WORLD_SIZE ({world_size})");
+        }
+        let local_rank = parse_env_usize("LOCAL_RANK", lookup("LOCAL_RANK"), rank)?;
+        let cuda_device = parse_env_u32(
+            "INFER_CUDA_DEVICE",
+            lookup("INFER_CUDA_DEVICE"),
+            local_rank as u32,
+        )?;
+        Ok(Self {
+            master_addr,
+            master_port,
+            rank,
+            world_size,
+            local_rank,
+            cuda_device,
+        })
+    }
+
+    pub fn socket_addr(&self) -> Result<SocketAddr> {
+        (self.master_addr.as_str(), self.master_port)
+            .to_socket_addrs()
+            .with_context(|| {
+                format!(
+                    "failed to resolve MASTER_ADDR/MASTER_PORT {}:{}",
+                    self.master_addr, self.master_port
+                )
+            })?
+            .next()
+            .with_context(|| {
+                format!(
+                    "MASTER_ADDR/MASTER_PORT resolved to zero addrs: {}:{}",
+                    self.master_addr, self.master_port
+                )
+            })
+    }
+}
+
+fn parse_env_usize(name: &str, value: Option<String>, default: usize) -> Result<usize> {
+    match value {
+        Some(raw) => raw
+            .parse::<usize>()
+            .with_context(|| format!("{name} must be a non-negative integer, got {raw:?}")),
+        None => Ok(default),
+    }
+}
+
+fn parse_env_u16(name: &str, value: Option<String>, default: u16) -> Result<u16> {
+    match value {
+        Some(raw) => raw
+            .parse::<u16>()
+            .with_context(|| format!("{name} must be a TCP port in 0..=65535, got {raw:?}")),
+        None => Ok(default),
+    }
+}
+
+fn parse_env_u32(name: &str, value: Option<String>, default: u32) -> Result<u32> {
+    match value {
+        Some(raw) => raw
+            .parse::<u32>()
+            .with_context(|| format!("{name} must be a non-negative integer, got {raw:?}")),
+        None => Ok(default),
+    }
+}
+
 /// Rank-0 side of the rendezvous.
 pub struct RendezvousServer {
     listener: TcpListener,
@@ -256,6 +344,48 @@ mod tests {
     #[test]
     fn unique_id_size_constant() {
         assert_eq!(UNIQUE_ID_BYTES, 128);
+    }
+
+    #[test]
+    fn env_rendezvous_defaults_to_single_rank_localhost() {
+        let cfg = EnvRendezvousConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(cfg.master_addr, "127.0.0.1");
+        assert_eq!(cfg.master_port, 29500);
+        assert_eq!(cfg.rank, 0);
+        assert_eq!(cfg.world_size, 1);
+        assert_eq!(cfg.local_rank, 0);
+        assert_eq!(cfg.cuda_device, 0);
+    }
+
+    #[test]
+    fn env_rendezvous_parses_rank_and_device() {
+        let cfg = EnvRendezvousConfig::from_lookup(|key| match key {
+            "MASTER_ADDR" => Some("10.0.0.1".to_string()),
+            "MASTER_PORT" => Some("45678".to_string()),
+            "RANK" => Some("3".to_string()),
+            "WORLD_SIZE" => Some("8".to_string()),
+            "LOCAL_RANK" => Some("1".to_string()),
+            "INFER_CUDA_DEVICE" => Some("2".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.master_addr, "10.0.0.1");
+        assert_eq!(cfg.master_port, 45678);
+        assert_eq!(cfg.rank, 3);
+        assert_eq!(cfg.world_size, 8);
+        assert_eq!(cfg.local_rank, 1);
+        assert_eq!(cfg.cuda_device, 2);
+    }
+
+    #[test]
+    fn env_rendezvous_rejects_rank_out_of_world() {
+        let err = EnvRendezvousConfig::from_lookup(|key| match key {
+            "RANK" => Some("2".to_string()),
+            "WORLD_SIZE" => Some("2".to_string()),
+            _ => None,
+        })
+        .expect_err("rank equal to world size must reject");
+        assert!(err.to_string().contains("RANK"));
     }
 
     #[test]

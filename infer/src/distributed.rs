@@ -1,14 +1,16 @@
 //! Distributed coordination primitives for multi-GPU / multi-host execution.
 //!
-//! F0 foundation: TCP rendezvous (`init_method`). NCCL FFI, group coordinators,
-//! and parallel-state wiring land in later phases — see
+//! F0/F1 foundation: TCP rendezvous (`init_method`), NCCL smoke (`nccl`),
+//! pure parallel-state group layout, and group coordinator metadata — see
 //! [`docs/plans/2026-04-28-single-node-multi-gpu.md`](../../docs/plans/2026-04-28-single-node-multi-gpu.md).
 
+pub mod group_coordinator;
 pub mod init_method;
 #[cfg(feature = "nccl")]
 pub mod nccl;
+pub mod parallel_state;
 
-pub use init_method::{RendezvousClient, RendezvousServer, UNIQUE_ID_BYTES};
+pub use init_method::{EnvRendezvousConfig, RendezvousClient, RendezvousServer, UNIQUE_ID_BYTES};
 
 #[cfg(feature = "nccl")]
 pub fn smoke_2_thread_all_reduce() -> anyhow::Result<()> {

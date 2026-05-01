@@ -19,6 +19,7 @@ use crate::gguf::{
     load_vector_offset_norm_bf16_host,
 };
 use crate::quant::QuantMeta;
+use crate::tp::{TpLoadContext, TpShardAxis};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -139,6 +140,81 @@ pub(crate) fn load_tensor_2d(
     let tensor = find_tensor(shards, weight_map, name)?;
     let shape = tensor.shape();
     DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_tensor_2d_sharded(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    tp: &TpLoadContext,
+) -> Result<DeviceMatrix> {
+    if tp.is_single() {
+        return load_tensor_2d(ctx, shards, weight_map, name);
+    }
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 2,
+        "{name}: expected 2D tensor for TP load, got shape {:?}",
+        shape
+    );
+    let (host, rows, cols) = shard_bf16_matrix_host(tensor.data(), shape[0], shape[1], tp)?;
+    DeviceMatrix::from_host(ctx, &host, rows, cols)
+}
+
+#[allow(dead_code)]
+pub(crate) fn shard_bf16_matrix_host(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    tp: &TpLoadContext,
+) -> Result<(Vec<bf16>, usize, usize)> {
+    anyhow::ensure!(
+        data.len() == rows * cols * std::mem::size_of::<bf16>(),
+        "bf16 matrix byte length mismatch: expected {}, got {}",
+        rows * cols * std::mem::size_of::<bf16>(),
+        data.len()
+    );
+    match tp.axis {
+        TpShardAxis::Row => {
+            anyhow::ensure!(
+                tp.sharding.total == cols,
+                "row shard total {} does not match tensor cols {cols}",
+                tp.sharding.total
+            );
+            let mut out = Vec::with_capacity(rows * tp.sharding.size);
+            for row in 0..rows {
+                let elem_start = row * cols + tp.sharding.offset;
+                let elem_end = elem_start + tp.sharding.size;
+                push_bf16_range(data, elem_start, elem_end, &mut out);
+            }
+            Ok((out, rows, tp.sharding.size))
+        }
+        TpShardAxis::Column => {
+            anyhow::ensure!(
+                tp.sharding.total == rows,
+                "column shard total {} does not match tensor rows {rows}",
+                tp.sharding.total
+            );
+            let elem_start = tp.sharding.offset * cols;
+            let elem_end = tp.sharding.end() * cols;
+            let mut out = Vec::with_capacity(tp.sharding.size * cols);
+            push_bf16_range(data, elem_start, elem_end, &mut out);
+            Ok((out, tp.sharding.size, cols))
+        }
+    }
+}
+
+fn push_bf16_range(data: &[u8], elem_start: usize, elem_end: usize, out: &mut Vec<bf16>) {
+    let byte_start = elem_start * std::mem::size_of::<bf16>();
+    let byte_end = elem_end * std::mem::size_of::<bf16>();
+    out.extend(
+        data[byte_start..byte_end]
+            .chunks_exact(std::mem::size_of::<bf16>())
+            .map(|bytes| bf16::from_le_bytes([bytes[0], bytes[1]])),
+    );
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1220,6 +1296,56 @@ mod tests {
             gptq.unsupported_reason
                 .expect("asymmetric GPTQ must be rejected")
                 .contains("GPTQ")
+        );
+    }
+
+    fn bf16_matrix_bytes(rows: usize, cols: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(rows * cols * 2);
+        for value in 0..(rows * cols) {
+            bytes.extend_from_slice(&bf16::from_f32(value as f32).to_le_bytes());
+        }
+        bytes
+    }
+
+    fn sum_bf16(values: &[bf16]) -> f32 {
+        values.iter().map(|value| value.to_f32()).sum()
+    }
+
+    #[test]
+    fn tp_column_shards_cover_full_bf16_matrix() {
+        let rows = 4;
+        let cols = 6;
+        let bytes = bf16_matrix_bytes(rows, cols);
+        let rank0 = TpLoadContext::column(0, 2, rows).unwrap();
+        let rank1 = TpLoadContext::column(1, 2, rows).unwrap();
+
+        let (shard0, rows0, cols0) = shard_bf16_matrix_host(&bytes, rows, cols, &rank0).unwrap();
+        let (shard1, rows1, cols1) = shard_bf16_matrix_host(&bytes, rows, cols, &rank1).unwrap();
+
+        assert_eq!((rows0, cols0), (2, 6));
+        assert_eq!((rows1, cols1), (2, 6));
+        assert_eq!(
+            sum_bf16(&shard0) + sum_bf16(&shard1),
+            (0..24).sum::<i32>() as f32
+        );
+    }
+
+    #[test]
+    fn tp_row_shards_cover_full_bf16_matrix() {
+        let rows = 5;
+        let cols = 4;
+        let bytes = bf16_matrix_bytes(rows, cols);
+        let rank0 = TpLoadContext::row(0, 2, cols).unwrap();
+        let rank1 = TpLoadContext::row(1, 2, cols).unwrap();
+
+        let (shard0, rows0, cols0) = shard_bf16_matrix_host(&bytes, rows, cols, &rank0).unwrap();
+        let (shard1, rows1, cols1) = shard_bf16_matrix_host(&bytes, rows, cols, &rank1).unwrap();
+
+        assert_eq!((rows0, cols0), (5, 2));
+        assert_eq!((rows1, cols1), (5, 2));
+        assert_eq!(
+            sum_bf16(&shard0) + sum_bf16(&shard1),
+            (0..20).sum::<i32>() as f32
         );
     }
 
