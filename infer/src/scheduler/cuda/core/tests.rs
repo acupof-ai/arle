@@ -1,7 +1,9 @@
 use super::{
     BlockSelectionIntent, can_publish_prefix_pages, host_spill_target_bytes, is_full_sealed_prefix,
     prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
+    select_sparse_pages_from_slot_pages,
 };
+use crate::prefix_cache::BlockId;
 
 const HARD_CAP: f64 = 0.90;
 
@@ -49,4 +51,26 @@ fn drain_target_uses_low_water_even_below_high_water() {
         host_spill_target_bytes(100, 1000, 0.20, 0.10, BlockSelectionIntent::Drain),
         0
     );
+}
+
+#[test]
+fn active_slot_sparse_selection_keeps_sink_and_recent_pages() {
+    let selected = select_sparse_pages_from_slot_pages(&[10, 20, 30, 40, 50, 60], 16, 96, 32, 2);
+
+    assert_eq!(
+        selected,
+        vec![BlockId(10), BlockId(20), BlockId(50), BlockId(60)]
+    );
+}
+
+#[test]
+fn active_slot_sparse_selection_respects_live_seq_len() {
+    let selected = select_sparse_pages_from_slot_pages(&[10, 20, 30, 40, 50, 60], 16, 48, 64, 8);
+
+    assert_eq!(selected, vec![BlockId(10), BlockId(20), BlockId(30)]);
+}
+
+#[test]
+fn active_slot_sparse_selection_zero_budget_returns_empty() {
+    assert!(select_sparse_pages_from_slot_pages(&[10, 20, 30], 16, 48, 0, 0).is_empty());
 }
