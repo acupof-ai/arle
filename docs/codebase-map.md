@@ -1,6 +1,7 @@
 # ARLE Codebase Map
 
-Updated 2026-04-27 after the Metal GGUF Qwen3.5 decode floor update.
+Updated 2026-05-01 after the F0–F4 multi-GPU scaffold, Phase 2 spec-decode
+plumbing, and `crates/deepseek-spec/` DS0 scaffold landed.
 
 This document is the canonical workspace-topology truth: where files live,
 what each crate owns, and where to start reading. For ownership boundaries
@@ -33,7 +34,7 @@ Current workspace members (ownership and boundaries are listed in
 - `crates/chat`
 - `crates/cli`
 - `crates/tools`
-- `crates/qwen3-spec`, `crates/qwen35-spec`
+- `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`
 - `crates/autograd`
 - `crates/train`
 - `crates/kv-native-sys`
@@ -150,8 +151,14 @@ Key files:
 - `infer/src/scheduler/batch.rs`: pure CPU accounting scheduler with lifecycle events
 - `infer/src/scheduler/types.rs`: request types, handles, config, queue admission
 - `infer/src/scheduler/policy.rs`: admission/chunking/eviction policy traits and defaults
+- `infer/src/scheduler/forward_batch.rs`: F0.7 type-only `ForwardBatch` + `IntermediateTensors` PP-proxy slot — present from F0 ahead of pipeline-parallel forward wiring
 - `infer/src/scheduler/cuda/`: production CUDA scheduler
+- `infer/src/scheduler/cuda/spec_path.rs`: per-step `SpecPath` dispatch that gates the speculative decode verifier micro-batch path through the CUDA execution loop
 - `infer/src/backend/metal/scheduler.rs`: Metal scheduling/accounting layer
+
+### Distributed (single-node multi-GPU F0–F4 scaffold)
+
+- `infer/src/distributed.rs` + `infer/src/distributed/{parallel_state,group_coordinator,pipeline_state,expert_state,nccl,init_method}.rs`: F0.1–F0.4 multi-GPU foundation — SGLang-style world / TP / PP / EP / attention-TP/DP/CP / MoE-TP/EP/DP group metadata, a `GroupCoordinator` collective surface (single-rank no-op; wraps the NCCL smoke group for f32 all-reduce, all-gather, broadcast under `--features cuda,nccl`), TCP rendezvous (`TcpStore` / `EnvBootstrap`), F3 pipeline-parallel scaffold (`pipeline_state.rs`), and F4 expert-parallel scaffold (`expert_state.rs`). Real production NCCL collectives in forward are not yet wired; TP>1 production load fails fast until they are.
 
 ### Shared runtime contracts that Route A folded back in
 
@@ -184,14 +191,17 @@ For the Route-A folding rationale see
 - `infer/src/model.rs`: `ModelForward`, `GenerationState`, decode-context abstractions
 - `infer/src/model/qwen3.rs`
 - `infer/src/model/qwen35.rs`
+- `infer/src/model/layer_communicator.rs`: F0.8 model-level communicator skeleton with `post_attn_all_reduce` / `post_mlp_all_reduce` / DP-attention-gather hooks; single-rank no-op, production multi-rank guarded until real collectives ship
 - supporting files under `infer/src/model/`
 - `infer/src/ops.rs` and `infer/src/ops/*`
 - `crates/cuda-kernels/src/tensor.rs`: CUDA tensor/device abstractions (`DeviceContext`, `DeviceVec`, `DeviceMatrix`, `HiddenStates`, `RawDevicePtr`)
 - `infer/src/weight_loader.rs`: weight loading
 - `infer/src/gguf.rs`: GGUF parsing
 - `infer/src/quant.rs`: quantization metadata + dispatch
-- `infer/src/speculative.rs`: speculative decoding experiments
-- `infer/src/tensor_parallel.rs`: tensor-parallel scaffolding
+- `infer/src/speculative.rs`: speculative decoding framework — `SpecConfig`, `DraftMode`, `TokenProposal`, `Verifier`, persistent per-request draft state, K-token proposals, greedy verifier accounting, bonus-token commit, and live spec counters (Phase 2 plumbing landed; throughput regression tracked in `docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`)
+- `infer/src/speculative/cuda.rs`: CUDA-side speculative decode integration — draft/verifier state plumbing for the external-draft path
+- `infer/src/tensor_parallel.rs`: CPU-side TP rank/shard math (used as a library by the `tp` and `distributed` modules; not the runtime collective surface)
+- `infer/src/tp.rs` + `infer/src/tp/load_context.rs`: `TpLoadContext` row/column/head shard helpers that drive shard-aware safetensors loading
 - `infer/src/tokenizer.rs`: tokenizer wrapper
 
 ### Backends and binaries
@@ -213,6 +223,8 @@ These crates remain independent after Route A:
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored
   MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/kv-native-sys`: local persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors
+- `crates/qwen3-spec`, `crates/qwen35-spec`: shared train↔infer Qwen3 / Qwen3.5 config + canonical tensor-name contracts + `Shard` annotations consumed by the F1 sharded loader path
+- `crates/deepseek-spec`: DS0 scaffold crate landed 2026-05-01 — DeepSeek V3 / V4 config parsing, tensor-name builders, MLA/MoE/MTP `Shard` annotations. Implementation gating lives in [`docs/projects/2026-05-01-deepseek-v4-readiness.md`](projects/2026-05-01-deepseek-v4-readiness.md). No CUDA model module, MLA kernel, or MoE forward consumer yet
 
 Current dependency direction:
 

@@ -6,7 +6,7 @@
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
 
-Last refreshed: 2026-04-28 (Metal Qwen3.5 MLX 4bit SOTA and GGUF matched-gap update).
+Last refreshed: 2026-05-01 (longctx Phase 1 SGLang-row close, F0–F4 multi-GPU scaffold, DeepSeek V4 readiness + DS0 spec crate).
 
 ## Canonical Truth Surfaces
 
@@ -37,6 +37,10 @@ marked as the current source of truth, treat it as historical context.
 
 | Path | Status | Use this when |
 | --- | --- | --- |
+| [projects/2026-04-30-longctx-32k-128k-leadership.md](projects/2026-04-30-longctx-32k-128k-leadership.md) | Active — P0 mission | The question is the 32k–128k longctx world-#1 mission (4 phase plan, baseline panel, hardware tiers, current Phase 1 SGLang-row close + Phase 2 plumbing/regression status in §13/§13.A). |
+| [projects/2026-05-01-multi-gpu-f0-readiness.md](projects/2026-05-01-multi-gpu-f0-readiness.md) | Active | The question is single-node multi-GPU F0 readiness, scaffolded TP/PP/EP axes, NCCL smoke, and the gap matrix to real multi-rank serving. |
+| [projects/2026-05-01-deepseek-v4-readiness.md](projects/2026-05-01-deepseek-v4-readiness.md) | Active — parallel product line | The question is DeepSeek V4 readiness, the DS0–DS8 gap matrix, and what `crates/deepseek-spec/` already scaffolds. |
+| [projects/2026-05-01-spec-decode-integration-design.md](projects/2026-05-01-spec-decode-integration-design.md) | Active | The question is how Phase 2 spec decode plumbing integrates with the CUDA scheduler, verifier, and external draft state. |
 | [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | Active | The question is current KV-tier scope, milestones, or operator-facing status. |
 | [projects/tiered-kv-runtime-flow.md](projects/tiered-kv-runtime-flow.md) | Active | The question is how scheduler, RadixCache, and tier coordinator interact at runtime. |
 | [projects/active-kv-swap-out-unification.md](projects/active-kv-swap-out-unification.md) | Active | The question is closing the SGLang admission gap by extending the existing tier demote/promote machinery to in-flight active KV (PreemptionMode wired end-to-end). |
@@ -49,6 +53,10 @@ marked as the current source of truth, treat it as historical context.
 | Path | Status | Use this when |
 | --- | --- | --- |
 | [plans/2026-04-23-cuda-decode-sglang-alignment.md](plans/2026-04-23-cuda-decode-sglang-alignment.md) | Active — current decode truth | The question is CUDA decode alignment vs SGLang `main`. |
+| [plans/2026-04-28-single-node-multi-gpu.md](plans/2026-04-28-single-node-multi-gpu.md) | Active | The question is the single-node multi-GPU plan (F0–F8 phases) for TP/PP/EP scaffolding and forward collectives. |
+| [plans/2026-04-28-multi-gpu-f0-verification.md](plans/2026-04-28-multi-gpu-f0-verification.md) | Active | The question is the F0 verification protocol (NCCL link, rendezvous, all-reduce smoke, single-rank no-regression gate). |
+| [plans/2026-05-01-longctx-spec-decode-phase2.md](plans/2026-05-01-longctx-spec-decode-phase2.md) | Active | The question is Phase 2 long-context speculative decode integration on top of the closed Phase 1 W1 c=4 SGLang row. |
+| [plans/2026-05-01-mla-kernel-design.md](plans/2026-05-01-mla-kernel-design.md) | Design only | The question is the DeepSeek-family MLA CUDA kernel design (DS3) — formula, cache layout, prefill/decode dispatch. |
 | [plans/infer-observability-v1.md](plans/infer-observability-v1.md) | Active | The question is operator-facing observability, traces, or profiling flow. |
 | [plans/2026-04-20-project-constitution-and-refactor-plan.md](plans/2026-04-20-project-constitution-and-refactor-plan.md) | Reference (Tranches T0/T3 completed 2026-04-25) | The question is SSOT identity, project boundaries, or doc/release governance — the constitution itself, not its execution status. |
 | [plans/tiered-kv-hicache-readmission.md](plans/tiered-kv-hicache-readmission.md) | Active | The question is staged KV readmission or remote/shared backend follow-up. |
