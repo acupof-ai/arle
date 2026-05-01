@@ -4,6 +4,7 @@
 //! pure parallel-state group layout, and group coordinator metadata — see
 //! [`docs/plans/2026-04-28-single-node-multi-gpu.md`](../../docs/plans/2026-04-28-single-node-multi-gpu.md).
 
+pub mod expert_state;
 pub mod group_coordinator;
 pub mod init_method;
 #[cfg(feature = "nccl")]

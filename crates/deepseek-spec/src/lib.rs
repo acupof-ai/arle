@@ -199,6 +199,48 @@ pub struct DeepSeekMtpTensorNames {
     pub lm_head: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExpertParallelConfig {
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub first_k_dense_replace: usize,
+    pub moe_intermediate_size: usize,
+    pub n_shared_experts: usize,
+    pub routed_scaling_factor: f32,
+    pub n_group: usize,
+    pub topk_group: usize,
+    pub norm_topk_prob: bool,
+}
+
+impl ExpertParallelConfig {
+    pub fn from_deepseek_config(config: &DeepSeekConfig) -> Self {
+        Self {
+            num_experts: config.num_experts,
+            num_experts_per_tok: config.num_experts_per_tok,
+            first_k_dense_replace: config.first_k_dense_replace,
+            moe_intermediate_size: config.moe_intermediate_size,
+            n_shared_experts: config.n_shared_experts,
+            routed_scaling_factor: config.routed_scaling_factor,
+            n_group: config.n_group,
+            topk_group: config.topk_group,
+            norm_topk_prob: config.norm_topk_prob,
+        }
+    }
+
+    pub fn is_moe(&self) -> bool {
+        self.num_experts > 0
+    }
+
+    pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
+        self.is_moe() && layer_idx >= self.first_k_dense_replace
+    }
+
+    pub fn experts_per_rank(&self, world_size: usize) -> Option<usize> {
+        (world_size > 0 && self.num_experts.is_multiple_of(world_size))
+            .then_some(self.num_experts / world_size)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawDeepSeekConfig {
     vocab_size: usize,
@@ -382,6 +424,10 @@ impl DeepSeekConfig {
 
     pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
         self.is_moe() && layer_idx >= self.first_k_dense_replace
+    }
+
+    pub fn expert_parallel_config(&self) -> ExpertParallelConfig {
+        ExpertParallelConfig::from_deepseek_config(self)
     }
 
     pub fn has_mtp(&self) -> bool {
@@ -592,6 +638,21 @@ mod tests {
         assert_eq!(mtp.embed_tokens, "model.layers.61.embed_tokens.weight");
         assert_eq!(mtp.eh_proj, "model.layers.61.eh_proj.weight");
         assert_eq!(mtp.lm_head, "lm_head.weight");
+    }
+
+    #[test]
+    fn expert_parallel_config_projects_moe_fields() {
+        let cfg = DeepSeekConfig::from_json_str(DEEPSEEK_V3_CONFIG).unwrap();
+        let ep = cfg.expert_parallel_config();
+
+        assert_eq!(ep.num_experts, 256);
+        assert_eq!(ep.num_experts_per_tok, 8);
+        assert_eq!(ep.first_k_dense_replace, 3);
+        assert_eq!(ep.moe_intermediate_size, 2048);
+        assert_eq!(ep.experts_per_rank(8), Some(32));
+        assert_eq!(ep.experts_per_rank(7), None);
+        assert!(!ep.is_moe_layer(2));
+        assert!(ep.is_moe_layer(3));
     }
 
     #[test]
