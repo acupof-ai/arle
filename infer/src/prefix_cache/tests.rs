@@ -237,6 +237,103 @@ fn cached_block_count() {
     assert_eq!(cache.cached_block_count(), 2);
 }
 
+#[test]
+fn evictable_pages_counts_only_ready_unpinned_blocks() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    cache.insert(&[5, 6, 7, 8], &bids(&[20]));
+    cache.insert(&[9, 10, 11, 12], &bids(&[30]));
+
+    let _held = cache.lookup(&[1, 2, 3, 4]);
+    cache.clock = 10;
+    assert!(cache.set_block_soft_pin_until(BlockId(20), Some(20)));
+    assert!(cache.update_block_metadata(
+        BlockId(30),
+        BlockMetadataUpdate {
+            entry_state: Some(IndexEntryState::Pending),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+
+    assert_eq!(cache.cached_block_count(), 3);
+    assert_eq!(cache.evictable_tokens(), 0);
+    assert_eq!(cache.evictable_pages(4), 0);
+
+    cache.release(&bids(&[10]));
+    assert!(cache.set_block_soft_pin_until(BlockId(20), None));
+    assert!(cache.update_block_metadata(
+        BlockId(30),
+        BlockMetadataUpdate {
+            entry_state: Some(IndexEntryState::Ready),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+
+    assert_eq!(cache.evictable_tokens(), 12);
+    assert_eq!(cache.evictable_pages(4), 3);
+    assert_eq!(cache.evictable_pages(8), 2);
+}
+
+#[test]
+fn block_evictable_respects_tier_location() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    cache.insert(&[5, 6, 7, 8], &bids(&[20]));
+    cache.insert(&[9, 10, 11, 12], &bids(&[30]));
+
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_location(BlockId(20), BlockLocation::HostPinned { offset: 4096 }));
+    assert!(cache.set_block_location(
+        BlockId(30),
+        BlockLocation::Disk {
+            fingerprint: crate::types::BlockFingerprint([0xAB; 16]),
+            payload_len: 1024,
+        }
+    ));
+
+    assert!(cache.is_block_evictable(BlockId(10), None));
+    assert!(cache.is_block_evictable(BlockId(10), Some(Tier::Gpu)));
+    assert!(!cache.is_block_evictable(BlockId(20), Some(Tier::Gpu)));
+    assert!(!cache.is_block_evictable(BlockId(30), Some(Tier::Gpu)));
+
+    let _held = cache.lookup(&[1, 2, 3, 4]);
+    assert!(!cache.is_block_evictable(BlockId(10), Some(Tier::Gpu)));
+    cache.release(&bids(&[10]));
+    assert!(cache.is_block_evictable(BlockId(10), Some(Tier::Gpu)));
+}
+
+#[test]
+fn block_evictable_counts_cascade_parents() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 0 }));
+
+    assert!(cache.is_block_evictable(BlockId(10), Some(Tier::Gpu)));
+    assert!(cache.is_block_evictable(BlockId(20), Some(Tier::Gpu)));
+    assert_eq!(cache.evictable_pages(4), 2);
+
+    let freed = cache.evict_with_policy(
+        &crate::scheduler::policy::LruEviction,
+        SchedulerSignals::default(),
+        2,
+        Some(Tier::Gpu),
+    );
+    assert_eq!(freed, bids(&[20, 10]));
+}
+
+#[test]
+fn block_evictable_rejects_parent_with_pinned_child() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_soft_pin_until(BlockId(20), Some(100)));
+
+    assert!(!cache.is_block_evictable(BlockId(10), Some(Tier::Gpu)));
+    assert!(!cache.is_block_evictable(BlockId(20), Some(Tier::Gpu)));
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Regression tests for SGLang-parity fixes (2026-04-13):
 //   - Bug 1: split must inherit ref_count from the old child

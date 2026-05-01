@@ -126,7 +126,7 @@ impl PageBudget {
 
     pub(super) fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>, active: bool) -> Self {
         let mut budget = Self::new(
-            scheduler.pool_free_pages(),
+            scheduler.effective_pool_free_pages(),
             (0..scheduler.states.len())
                 .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
                 .collect(),
@@ -370,6 +370,21 @@ mod tests {
             slot_idx: 1,
             tokens: 4,
         }));
+    }
+
+    #[test]
+    fn page_budget_evictable_pages_expand_admission_capacity() {
+        let old_budget = PageBudget::new(0, vec![4], 4, true);
+        let growth = PageGrowth {
+            slot_idx: 0,
+            tokens: 4,
+        };
+        assert!(!old_budget.can_fit_growth(growth));
+
+        let mut budget_with_evictable = PageBudget::new(1, vec![4], 4, true);
+        assert!(budget_with_evictable.can_fit_growth(growth));
+        budget_with_evictable.reserve_growth(growth);
+        assert_eq!(budget_with_evictable.remaining_free_pages(), 0);
     }
 
     #[test]

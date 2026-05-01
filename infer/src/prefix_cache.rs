@@ -1135,6 +1135,84 @@ impl RadixCache {
         self.nodes.iter().filter(|n| n.block_id.is_some()).count()
     }
 
+    fn node_is_reclaimable_now(&self, node: &Node, tier_filter: Option<Tier>) -> bool {
+        let now = self.clock;
+        node.block_id.is_some()
+            && node.ref_count == 0
+            && node.entry_state == IndexEntryState::Ready
+            && node.soft_pin_until.is_none_or(|deadline| deadline <= now)
+            && tier_filter.is_none_or(|tier| {
+                node.tier_location.as_ref().map(BlockLocation::tier) == Some(tier)
+            })
+    }
+
+    fn node_is_cascade_evictable_now(&self, idx: usize, tier_filter: Option<Tier>) -> bool {
+        let Some(node) = self.nodes.get(idx) else {
+            return false;
+        };
+        self.node_is_reclaimable_now(node, tier_filter)
+            && node
+                .children
+                .values()
+                .all(|&child_idx| self.node_is_cascade_evictable_now(child_idx, tier_filter))
+    }
+
+    fn collect_cascade_evictable_blocks(
+        &self,
+        idx: usize,
+        tier_filter: Option<Tier>,
+        out: &mut Vec<BlockId>,
+    ) -> bool {
+        let Some(node) = self.nodes.get(idx) else {
+            return false;
+        };
+        let mut children_evictable = true;
+        for &child_idx in node.children.values() {
+            children_evictable &=
+                self.collect_cascade_evictable_blocks(child_idx, tier_filter, out);
+        }
+        let evictable = self.node_is_reclaimable_now(node, tier_filter) && children_evictable;
+        if evictable && let Some(block_id) = node.block_id {
+            out.push(block_id);
+        }
+        evictable
+    }
+
+    /// Cached blocks that a single cascade eviction pass can reclaim now.
+    pub fn cascade_evictable_blocks(&self, tier_filter: Option<Tier>) -> Vec<BlockId> {
+        let mut blocks = Vec::new();
+        for &child_idx in self.nodes[Self::root()].children.values() {
+            self.collect_cascade_evictable_blocks(child_idx, tier_filter, &mut blocks);
+        }
+        blocks
+    }
+
+    /// True when a cached block can be reclaimed from the requested tier now.
+    pub fn is_block_evictable(&self, block: BlockId, tier_filter: Option<Tier>) -> bool {
+        let Some(idx) = self.block_index.get(&block).copied() else {
+            return false;
+        };
+        self.node_is_cascade_evictable_now(idx, tier_filter)
+    }
+
+    /// Number of cached block tokens that the eviction path can reclaim now.
+    ///
+    /// This mirrors the lock-ref discipline used by eviction: only ready,
+    /// block-bearing nodes with `ref_count == 0` and no active soft pin are
+    /// counted. Each block-bearing node represents one sealed cache block, even
+    /// if compressed-radix splitting made its local edge shorter than
+    /// `block_size`.
+    pub fn evictable_tokens(&self) -> usize {
+        self.cascade_evictable_blocks(None)
+            .len()
+            .saturating_mul(self.block_size)
+    }
+
+    /// Number of KV pool pages represented by currently evictable cache blocks.
+    pub fn evictable_pages(&self, page_size: usize) -> usize {
+        self.evictable_tokens().div_ceil(page_size.max(1))
+    }
+
     /// Stamp the physical location for a cached block.
     pub fn set_block_location(&mut self, block: BlockId, location: BlockLocation) -> bool {
         self.find_block_node_mut(block)

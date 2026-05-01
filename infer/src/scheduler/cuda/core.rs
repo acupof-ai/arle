@@ -163,6 +163,20 @@ impl<M: ModelForward> Scheduler<M> {
         (high, low)
     }
 
+    pub(super) fn evictable_prefix_gpu_pages(&self) -> usize {
+        self.prefix_cache
+            .cascade_evictable_blocks(Some(crate::kv_tier::Tier::Gpu))
+            .into_iter()
+            .filter_map(|block_id| self.block_to_pages.get(&block_id))
+            .map(Vec::len)
+            .sum()
+    }
+
+    pub(super) fn effective_pool_free_pages(&self) -> usize {
+        self.pool_free_pages()
+            .saturating_add(self.evictable_prefix_gpu_pages())
+    }
+
     fn waiting_admission_shortage_pages(&self) -> usize {
         waiting_admission_shortage_pages(
             self.pool_free_pages(),
