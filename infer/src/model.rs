@@ -15,6 +15,8 @@ pub(crate) mod cuda_graph;
 pub(crate) mod generation_state;
 #[path = "model/kv_cache.rs"]
 pub(crate) mod kv_cache;
+#[path = "model/layer_communicator.rs"]
+pub mod layer_communicator;
 
 #[path = "model/qwen3.rs"]
 pub mod qwen3;
