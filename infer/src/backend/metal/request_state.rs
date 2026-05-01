@@ -745,7 +745,7 @@ impl<'a> MetalRequestState<'a> {
     /// can fall back to per-request decode. Returns sampled tokens in the same
     /// order as the input slice on success.
     pub fn decode_batch(states: &mut [&mut MetalRequestState<'a>]) -> Result<Option<Vec<u32>>> {
-        if states.len() < 1 {
+        if states.is_empty() {
             return Ok(None);
         }
 
@@ -966,7 +966,7 @@ impl<'a> MetalRequestState<'a> {
     pub(crate) fn try_build_qwen35_packed_decode_batch(
         states: &mut [&mut MetalRequestState<'a>],
     ) -> Result<Option<Qwen35PackedDecodeBatch<'a>>> {
-        if states.len() < 1 {
+        if states.is_empty() {
             return Ok(None);
         }
 
@@ -991,7 +991,7 @@ impl<'a> MetalRequestState<'a> {
         states: &mut [&mut MetalRequestState<'a>],
         batch: &mut Qwen35PackedDecodeBatch<'a>,
     ) -> Result<Option<Vec<u32>>> {
-        if states.len() < 1 {
+        if states.is_empty() {
             return Ok(None);
         }
 
