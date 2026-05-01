@@ -95,6 +95,26 @@ works with any backend. Load before editing any scheduler internals.
 - Calling `SchedulerHandle::submit` from the scheduler thread itself. The
   handle is for *external* submitters (HTTP, CLI). Internal resubmission
   (e.g. preemption recompute) pushes back onto `waiting` directly.
+- **Picking `DraftMode::SelfSpec` without MagicDec-style sparse KV is
+  architecturally a no-op.** Plain self-spec runs the *target* model K
+  times to draft + 1 time to verify = K+1 forwards of the **same** model
+  → no speedup, often a net regression (we observed −8.7 % on Qwen3-4B
+  longctx-32k c=4 with K=1 canary at commit `5eddaab8`/`0cc41f6f`).
+  Real speedup requires either (a) `DraftMode::External(path)` with a
+  genuinely smaller draft (e.g. Qwen3-0.5B drafting for Qwen3-4B target)
+  or (b) MagicDec-style sparse-KV self-speculation that makes the draft
+  pass cheap. Plain SelfSpec is only useful as a single-token bit-ident
+  canary (`global_spec_draft_k == 1`); the path in
+  `cuda/decode.rs::step_decode_launch_with_spec_flag` enforces this gate
+  for that reason. Do not raise `K > 1` on `SelfSpec` without first
+  landing a real draft cheapening mechanism.
+- Treating `acceptance_rate = 100 %` as a Phase 2 win. The single-token
+  canary above always reports 100 % because every position is verified
+  against the target's own argmax. The metric is meaningful only once
+  multi-token speculation runs against an *independent* draft source.
+  Cite throughput numbers (effective `total_output_tokens / window`)
+  versus the Phase 1 baseline when claiming spec-decode value, not the
+  bare acceptance gauge.
 
 ## Tests
 
