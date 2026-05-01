@@ -174,6 +174,68 @@ each rank thread bypasses this variable and calls
 export INFER_CUDA_DEVICE=1   # bind default context to GPU 1
 ```
 
+### Single-node multi-GPU topology variables (F0.11)
+
+Status: documented contract for the single-node multi-GPU line. Only
+`INFER_CUDA_DEVICE` is active in the default single-rank runtime today. The
+multi-rank variables below are reserved for F1+ bootstrap; until that parser is
+wired, they must not be treated as evidence that TP/PP/EP serving is active.
+
+| Variable | Parsed at startup today | Accepted range / format | Current behavior |
+|---|---|---|---|
+| `INFER_CUDA_DEVICE` | yes, by `DeviceContext::new()` | one CUDA ordinal, default `0` | Binds the single process to one GPU. Parse failure is a hard error. |
+| `INFER_CUDA_DEVICES` | no, reserved F1+ | comma-separated ordinals such as `0,1,2,3`; unique, non-empty | Future rank-thread bootstrap will map local ranks to these ordinals. |
+| `INFER_TP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future tensor-parallel world size. `1` means disabled. |
+| `INFER_PP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future pipeline-parallel world size. `1` means disabled. |
+| `INFER_EP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future expert-parallel world size. `1` means disabled. |
+| `INFER_ATTN_DP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future attention data-parallel axis. |
+| `INFER_ATTN_CP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future attention context-parallel axis. |
+| `INFER_NCCL_PORT` | no, reserved F1+ | TCP port `1..=65535` | Future convenience alias for `MASTER_PORT` during single-node rendezvous. |
+
+F1+ parser acceptance rules:
+
+- `INFER_CUDA_DEVICES` length must be at least the local rank count.
+- `INFER_TP_SIZE * INFER_PP_SIZE * INFER_EP_SIZE` must equal the model-worker
+  world size for dense TP/PP/EP bootstrap. Attention DP/CP and MoE axes may add
+  further divisibility checks when those phases land.
+- Multi-rank values are rejected if CUDA was not built in, NCCL was not enabled
+  for a path that needs collectives, or the machine exposes fewer devices than
+  requested.
+- `INFER_CUDA_DEVICE` and `INFER_CUDA_DEVICES` should not both be used for a
+  multi-rank run. `INFER_CUDA_DEVICE` is the single-rank compatibility knob;
+  `INFER_CUDA_DEVICES` is the ordered multi-rank map.
+
+Examples of combinations that F1+ bootstrap must reject:
+
+```bash
+INFER_TP_SIZE=2 INFER_CUDA_DEVICES=0          # TP=2 but one local device
+INFER_TP_SIZE=2 INFER_PP_SIZE=2 INFER_CUDA_DEVICES=0,1
+# product world size is 4, but only two local devices are listed
+
+INFER_TP_SIZE=2 INFER_CUDA_DEVICES=0,0        # duplicate device ordinal
+INFER_NCCL_PORT=0                             # invalid TCP port for rendezvous
+```
+
+When the F1+ parser lands, startup logging must print the parsed topology before
+model load so bad jobs fail with actionable context. Expected shape:
+
+```text
+multi_gpu_config:
+  cuda_devices=[0,1]
+  tp_size=2 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1
+  world_size=2 nccl_port=29500
+  status=accepted
+```
+
+For today's single-rank runtime, the equivalent effective topology is:
+
+```text
+multi_gpu_config:
+  cuda_devices=[INFER_CUDA_DEVICE or 0]
+  tp_size=1 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1
+  world_size=1 status=single-rank
+```
+
 ### `INFER_TRITON_PYTHON`
 
 Python interpreter with Triton installed for build-time AOT kernel generation.
