@@ -59,6 +59,23 @@ fn make_request(
     (req, rx)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SpecMetricSnapshot {
+    draft_tokens: u64,
+    verified_tokens: u64,
+    accepted_tokens: u64,
+}
+
+impl SpecMetricSnapshot {
+    fn capture(metrics: &ServerMetrics) -> Self {
+        Self {
+            draft_tokens: metrics.spec_draft_tokens_total(),
+            verified_tokens: metrics.spec_verified_tokens_total(),
+            accepted_tokens: metrics.spec_accepted_tokens_total(),
+        }
+    }
+}
+
 fn run_prompt(
     path: &str,
     prompt: &str,
@@ -66,6 +83,19 @@ fn run_prompt(
     draft_mode: DraftMode,
     draft_k: usize,
 ) -> (String, ServerMetrics) {
+    let (output, metrics, _) =
+        run_prompt_with_sparse(path, prompt, spec_enabled, draft_mode, draft_k, false);
+    (output, metrics)
+}
+
+fn run_prompt_with_sparse(
+    path: &str,
+    prompt: &str,
+    spec_enabled: bool,
+    draft_mode: DraftMode,
+    draft_k: usize,
+    sparse_kv: bool,
+) -> (String, ServerMetrics, SpecMetricSnapshot) {
     let model = Qwen3Model::from_safetensors_with_runtime(
         path,
         ModelRuntimeConfig {
@@ -83,6 +113,12 @@ fn run_prompt(
     if spec_enabled {
         config.spec_draft_model = draft_mode;
     }
+    config.spec_sparse_kv_enabled = sparse_kv;
+    if sparse_kv {
+        config.short_prompt_bypass_tokens = 0;
+        config.spec_sparse_recent_tokens = 64;
+        config.spec_sparse_top_k_pages = 1;
+    }
 
     let (scheduler, handle) = Scheduler::with_config(
         model,
@@ -91,19 +127,25 @@ fn run_prompt(
         42,
         metrics.clone(),
         config,
-        Some(512),
+        Some(2048),
         KVCacheDtype::BF16,
         KVFormat::BF16,
     )
     .expect("create scheduler");
 
     let scheduler_thread = std::thread::spawn(move || scheduler.run());
+    if sparse_kv {
+        let (warmup_req, mut warmup_rx) = make_request(prompt, 1);
+        handle.submit(warmup_req).expect("submit sparse warmup");
+        let _ = collect_output(&mut warmup_rx);
+    }
+    let metric_baseline = SpecMetricSnapshot::capture(&metrics);
     let (req, mut rx) = make_request(prompt, 12);
     handle.submit(req).expect("submit");
     let output = collect_output(&mut rx);
     drop(handle);
     scheduler_thread.join().expect("scheduler join");
-    (output, metrics)
+    (output, metrics, metric_baseline)
 }
 
 fn first_token_divergence(tokenizer: &Tokenizer, plain: &str, spec: &str) -> String {
@@ -189,6 +231,47 @@ fn external_spec_decode_greedy_is_bit_identical_for_three_prompts() {
             "expected external verifier to process draft tokens"
         );
     }
+}
+
+#[test]
+fn sparse_self_spec_decode_greedy_is_bit_identical_and_updates_verifier_metrics() {
+    let _guard = gpu_test_lock();
+    infer::logging::init_stderr("info");
+    let path = model_path();
+    if !Path::new(&path).exists() {
+        eprintln!("Skipping test: model not found at {path}");
+        return;
+    }
+    let tokenizer = Tokenizer::from_file(&path).expect("load tokenizer for diagnostics");
+    let prompt = [
+        "Sparse KV verifier correctness prompt.",
+        "Repeat enough context so radix sealed blocks exist before decode.",
+        "The verifier must use full KV while the draft path may use a sparse view.",
+    ]
+    .repeat(48)
+    .join(" ");
+
+    let (plain, _) = run_prompt(&path, &prompt, false, DraftMode::None, 1);
+    let (spec, metrics, metric_baseline) =
+        run_prompt_with_sparse(&path, &prompt, true, DraftMode::SelfSpec, 5, true);
+    assert_eq!(
+        plain,
+        spec,
+        "sparse self-spec changed greedy output: {}",
+        first_token_divergence(&tokenizer, &plain, &spec)
+    );
+    assert!(
+        metrics.spec_draft_tokens_total() > metric_baseline.draft_tokens,
+        "expected sparse self-spec to draft tokens"
+    );
+    assert!(
+        metrics.spec_verified_tokens_total() > metric_baseline.verified_tokens,
+        "expected full-KV verifier to check sparse draft tokens"
+    );
+    assert!(
+        metrics.spec_accepted_tokens_total() >= metric_baseline.accepted_tokens,
+        "expected sparse self-spec accepted-token counter to remain monotonic"
+    );
 }
 
 #[test]
