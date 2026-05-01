@@ -75,6 +75,12 @@ unsafe extern "C" {
     pub fn mlx_array_data_float32(a: *mut mlx_array) -> *const f32;
     pub fn mlx_array_data_int32(a: *mut mlx_array) -> *const i32;
     pub fn mlx_array_size(a: *mut mlx_array) -> usize;
+    pub fn mlx_array_nbytes(a: *mut mlx_array) -> usize;
+    pub fn mlx_array_export_bytes(
+        a: *mut mlx_array,
+        out: *mut std::ffi::c_void,
+        out_len: usize,
+    ) -> usize;
 
     // === Binary ops ===
 
