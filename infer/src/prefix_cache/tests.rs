@@ -1516,6 +1516,172 @@ fn selection_sorts_lowest_score_first() {
 }
 
 #[test]
+fn sparse_draft_selection_picks_lru_hot_pages_and_recent_window() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        &bids(&[10, 20, 30, 40]),
+    );
+    for block in [10, 20, 30, 40] {
+        assert!(cache.set_block_location(BlockId(block), BlockLocation::Gpu { slot: 0 }));
+    }
+    for (block, access) in [(10, 10), (20, 40), (30, 20), (40, 30)] {
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(block)))
+            .unwrap();
+        cache.nodes[idx].last_access = access;
+    }
+
+    let selected = cache.select_sparse_pages_for_draft(0, 4, 1);
+
+    assert_eq!(
+        selected,
+        vec![BlockId(20), BlockId(40)],
+        "hot LRU page is selected first, deepest recent page is appended"
+    );
+}
+
+#[test]
+fn sparse_draft_selection_recent_window_rounds_to_blocks() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        &bids(&[10, 20, 30, 40]),
+    );
+    for block in [10, 20, 30, 40] {
+        assert!(cache.set_block_location(BlockId(block), BlockLocation::Gpu { slot: 0 }));
+    }
+
+    let selected = cache.select_sparse_pages_for_draft(0, 9, 0);
+
+    assert_eq!(
+        selected,
+        vec![BlockId(40), BlockId(30), BlockId(20)],
+        "9 recent tokens at block_size=4 require the deepest 3 blocks"
+    );
+}
+
+#[test]
+fn sparse_draft_selection_top_k_boundary_and_slot_filter() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        &bids(&[10, 20, 30]),
+    );
+    cache.insert(&[100, 101, 102, 103], &bids(&[99]));
+    for block in [10, 20, 30] {
+        assert!(cache.set_block_location(BlockId(block), BlockLocation::Gpu { slot: 0 }));
+    }
+    assert!(cache.set_block_location(BlockId(99), BlockLocation::Gpu { slot: 1 }));
+    for (block, access) in [(10, 10), (20, 30), (30, 20), (99, 100)] {
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(block)))
+            .unwrap();
+        cache.nodes[idx].last_access = access;
+    }
+
+    let selected = cache.select_sparse_pages_for_draft(0, 0, 3);
+
+    assert_eq!(selected, vec![BlockId(20), BlockId(30), BlockId(10)]);
+    assert!(
+        !selected.contains(&BlockId(99)),
+        "selection is scoped to the requested GPU slot"
+    );
+    assert!(cache.select_sparse_pages_for_draft(0, 0, 0).is_empty());
+}
+
+#[test]
+fn sparse_draft_token_path_avoids_same_slot_divergent_branch() {
+    let mut cache = RadixCache::new(4);
+    let active_tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+    let stale_tokens = [1, 2, 3, 4, 9, 10, 11, 12];
+    cache.insert(&active_tokens, &bids(&[10, 20]));
+    cache.insert(&stale_tokens, &bids(&[10, 30]));
+    for block in [10, 20, 30] {
+        assert!(cache.set_block_location(BlockId(block), BlockLocation::Gpu { slot: 0 }));
+    }
+    for (block, access) in [(10, 10), (20, 20), (30, 100)] {
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(block)))
+            .unwrap();
+        cache.nodes[idx].last_access = access;
+    }
+
+    let selected = cache.select_sparse_pages_for_draft_tokens(0, &active_tokens, 0, 3);
+
+    assert_eq!(selected, vec![BlockId(20), BlockId(10)]);
+    assert!(
+        !selected.contains(&BlockId(30)),
+        "token-path selector must not pull a hotter stale same-slot branch"
+    );
+}
+
+#[test]
+fn sparse_draft_token_path_keeps_attached_cross_slot_prefix_blocks() {
+    let mut cache = RadixCache::new(4);
+    let tokens = &[1, 2, 3, 4, 5, 6, 7, 8];
+    cache.insert(tokens, &bids(&[10, 20]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 0 }));
+
+    let without_attached = cache.select_sparse_pages_for_draft_tokens(1, tokens, 8, 2);
+    let with_attached =
+        cache.select_sparse_pages_for_draft_tokens_with_attached(1, tokens, 8, 2, &bids(&[10, 20]));
+
+    assert_eq!(without_attached, Vec::<BlockId>::new());
+    assert_eq!(
+        with_attached,
+        vec![BlockId(10), BlockId(20)],
+        "direct GPU attach reuses source-slot radix blocks in the active slot"
+    );
+}
+
+#[test]
+fn sparse_draft_selection_does_not_mutate_radix_metadata() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 0 }));
+    let idx10 = cache
+        .nodes
+        .iter()
+        .position(|node| node.block_id == Some(BlockId(10)))
+        .unwrap();
+    let idx20 = cache
+        .nodes
+        .iter()
+        .position(|node| node.block_id == Some(BlockId(20)))
+        .unwrap();
+    cache.nodes[idx10].last_access = 7;
+    cache.nodes[idx20].last_access = 11;
+    let before = [
+        (cache.nodes[idx10].ref_count, cache.nodes[idx10].last_access),
+        (cache.nodes[idx20].ref_count, cache.nodes[idx20].last_access),
+    ];
+
+    let selected = cache.select_sparse_pages_for_draft_tokens(0, &[1, 2, 3, 4, 5, 6, 7, 8], 8, 1);
+
+    assert_eq!(selected, vec![BlockId(20), BlockId(10)]);
+    assert_eq!(
+        before,
+        [
+            (cache.nodes[idx10].ref_count, cache.nodes[idx10].last_access),
+            (cache.nodes[idx20].ref_count, cache.nodes[idx20].last_access),
+        ]
+    );
+    assert_eq!(
+        cache.block_metadata(BlockId(10)).unwrap().location,
+        Some(BlockLocation::Gpu { slot: 0 })
+    );
+}
+
+#[test]
 fn block_state_helpers_cover_read_and_store_lifecycle() {
     let mut cache = RadixCache::new(4);
     cache.insert(&[1, 2, 3, 4], &bids(&[10]));

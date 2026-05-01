@@ -49,6 +49,13 @@ use crate::kv_tier::{
 use crate::scheduler::policy::{EvictionCandidate, EvictionPolicy, SchedulerSignals};
 use crate::types::{BlockFingerprint, SessionId};
 
+#[derive(Clone, Copy)]
+struct SparseDraftCandidate {
+    block_id: BlockId,
+    path_len: usize,
+    last_access: u64,
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -1018,6 +1025,170 @@ impl RadixCache {
                 .then_with(|| a_bid.0.cmp(&b_bid.0))
         });
         candidates.into_iter().take(n).map(|(_, bid)| bid).collect()
+    }
+
+    /// Select a read-only sparse KV page view for MagicDec-style drafting.
+    ///
+    /// This slot-wide selector is only a fallback for callers that do not have
+    /// the active request tokens. Scheduler paths should prefer
+    /// [`Self::select_sparse_pages_for_draft_tokens`] so divergent same-slot
+    /// radix branches cannot enter one request's sparse view.
+    ///
+    /// This does **not** mutate radix refs, LRU clocks, locations, or eviction
+    /// state. The returned block IDs are GPU-resident blocks for `slot_idx`.
+    /// Selection is StreamingLLM-shaped: include up to `top_k` hottest blocks
+    /// by radix LRU recency, then always include the most recent
+    /// `recent_tokens` worth of blocks by path depth. The recent window may
+    /// make the result larger than `top_k`.
+    pub fn select_sparse_pages_for_draft(
+        &self,
+        slot_idx: usize,
+        recent_tokens: usize,
+        top_k: usize,
+    ) -> Vec<BlockId> {
+        fn collect_slot(
+            cache: &RadixCache,
+            node_idx: usize,
+            parent_path_len: usize,
+            slot_idx: u32,
+            out: &mut Vec<SparseDraftCandidate>,
+        ) {
+            let node = &cache.nodes[node_idx];
+            let path_len = parent_path_len + node.tokens.len();
+            if let (Some(block_id), Some(BlockLocation::Gpu { slot })) =
+                (node.block_id, node.tier_location.as_ref())
+                && *slot == slot_idx
+            {
+                out.push(SparseDraftCandidate {
+                    block_id,
+                    path_len,
+                    last_access: node.last_access,
+                });
+            }
+            for &child_idx in node.children.values() {
+                collect_slot(cache, child_idx, path_len, slot_idx, out);
+            }
+        }
+
+        let Ok(slot_idx) = u32::try_from(slot_idx) else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
+        collect_slot(self, Self::root(), 0, slot_idx, &mut candidates);
+        self.select_sparse_pages_from_candidates(candidates, recent_tokens, top_k)
+    }
+
+    /// Select a sparse draft view along one request token path.
+    ///
+    /// Prefer this over [`Self::select_sparse_pages_for_draft`] when active
+    /// request tokens are available: it avoids pulling same-slot blocks from
+    /// stale divergent radix branches.
+    pub fn select_sparse_pages_for_draft_tokens(
+        &self,
+        slot_idx: usize,
+        tokens: &[u32],
+        recent_tokens: usize,
+        top_k: usize,
+    ) -> Vec<BlockId> {
+        self.select_sparse_pages_for_draft_tokens_with_attached(
+            slot_idx,
+            tokens,
+            recent_tokens,
+            top_k,
+            &[],
+        )
+    }
+
+    /// Select a sparse draft view along one request token path, treating
+    /// directly attached prefix blocks as active for `slot_idx` even though
+    /// their radix metadata still points at the source slot.
+    pub fn select_sparse_pages_for_draft_tokens_with_attached(
+        &self,
+        slot_idx: usize,
+        tokens: &[u32],
+        recent_tokens: usize,
+        top_k: usize,
+        attached_blocks: &[BlockId],
+    ) -> Vec<BlockId> {
+        let Ok(slot_idx) = u32::try_from(slot_idx) else {
+            return Vec::new();
+        };
+        if tokens.is_empty() {
+            return self.select_sparse_pages_for_draft(slot_idx as usize, recent_tokens, top_k);
+        }
+
+        let attached_blocks: std::collections::HashSet<BlockId> =
+            attached_blocks.iter().copied().collect();
+        let mut candidates = Vec::new();
+        let mut node_idx = Self::root();
+        let mut pos = 0;
+        loop {
+            if pos >= tokens.len() {
+                break;
+            }
+            let Some(child_idx) = self.nodes[node_idx].children.get(&tokens[pos]).copied() else {
+                break;
+            };
+            let remaining = &tokens[pos..];
+            let (match_len, edge_len) = self.child_edge_match(child_idx, remaining);
+            if match_len < edge_len {
+                break;
+            }
+            pos += match_len;
+            let node = &self.nodes[child_idx];
+            if let (Some(block_id), Some(BlockLocation::Gpu { slot })) =
+                (node.block_id, node.tier_location.as_ref())
+                && (*slot == slot_idx || attached_blocks.contains(&block_id))
+            {
+                candidates.push(SparseDraftCandidate {
+                    block_id,
+                    path_len: pos,
+                    last_access: node.last_access,
+                });
+            }
+            node_idx = child_idx;
+        }
+        self.select_sparse_pages_from_candidates(candidates, recent_tokens, top_k)
+    }
+
+    fn select_sparse_pages_from_candidates(
+        &self,
+        mut candidates: Vec<SparseDraftCandidate>,
+        recent_tokens: usize,
+        top_k: usize,
+    ) -> Vec<BlockId> {
+        if candidates.is_empty() || (recent_tokens == 0 && top_k == 0) {
+            return Vec::new();
+        }
+        let mut selected = Vec::new();
+        let mut selected_set = std::collections::HashSet::new();
+
+        candidates.sort_by(|a, b| {
+            b.last_access
+                .cmp(&a.last_access)
+                .then_with(|| a.block_id.0.cmp(&b.block_id.0))
+        });
+        for candidate in candidates.iter().take(top_k) {
+            if selected_set.insert(candidate.block_id) {
+                selected.push(candidate.block_id);
+            }
+        }
+
+        let recent_blocks = recent_tokens
+            .div_ceil(self.block_size)
+            .min(candidates.len());
+        candidates.sort_by(|a, b| {
+            b.path_len
+                .cmp(&a.path_len)
+                .then_with(|| a.block_id.0.cmp(&b.block_id.0))
+        });
+        for candidate in candidates.iter().take(recent_blocks) {
+            if selected_set.insert(candidate.block_id) {
+                selected.push(candidate.block_id);
+            }
+        }
+
+        selected
     }
 
     fn selection_pin_active(

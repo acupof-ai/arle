@@ -101,6 +101,16 @@ pub struct SchedulerConfig {
     pub spec_acceptance_threshold: f32,
     /// Draft-model source for speculative decode.
     pub spec_draft_model: DraftMode,
+    /// Enable P2.B MagicDec sparse-KV self-spec draft-view construction.
+    ///
+    /// Defaults off. P2.B.1 only builds the scheduler-side view; the CUDA
+    /// dispatch explicitly falls back to normal decode until P2.B.3 wires this
+    /// metadata into sparse forward.
+    pub spec_sparse_kv_enabled: bool,
+    /// Recent-token window included in each sparse draft view.
+    pub spec_sparse_recent_tokens: usize,
+    /// LRU-hot page budget included in each sparse draft view.
+    pub spec_sparse_top_k_pages: usize,
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
     pub max_waiting_requests: usize,
@@ -171,6 +181,9 @@ impl Default for SchedulerConfig {
             spec_draft_k: 5,
             spec_acceptance_threshold: 0.6,
             spec_draft_model: DraftMode::None,
+            spec_sparse_kv_enabled: false,
+            spec_sparse_recent_tokens: 512,
+            spec_sparse_top_k_pages: 32,
             max_waiting_requests: 256,
             // SGLang alignment 2026-04-29
             mem_fraction_static: 0.85,
@@ -331,6 +344,14 @@ impl SchedulerConfig {
         }
         if self.spec_enabled
             && matches!(self.spec_draft_model, DraftMode::SelfSpec)
+            && self.spec_sparse_kv_enabled
+        {
+            anyhow::bail!(
+                "self-spec sparse-KV forward is not wired yet; keep spec_sparse_kv_enabled=false until P2.B.3"
+            );
+        }
+        if self.spec_enabled
+            && matches!(self.spec_draft_model, DraftMode::SelfSpec)
             && self.spec_draft_k > 1
         {
             anyhow::bail!(
@@ -339,6 +360,14 @@ impl SchedulerConfig {
         }
         if !(0.0..=1.0).contains(&self.spec_acceptance_threshold) {
             anyhow::bail!("spec_acceptance_threshold must be in [0, 1]");
+        }
+        if self.spec_sparse_kv_enabled
+            && self.spec_sparse_recent_tokens == 0
+            && self.spec_sparse_top_k_pages == 0
+        {
+            anyhow::bail!(
+                "spec sparse-KV requires spec_sparse_recent_tokens > 0 or spec_sparse_top_k_pages > 0"
+            );
         }
         if self.min_seq_len == 0 {
             anyhow::bail!("min_seq_len must be ≥ 1");
@@ -682,6 +711,9 @@ mod tests {
         assert_eq!(cfg.spec_draft_k, 5);
         assert_eq!(cfg.spec_acceptance_threshold, 0.6);
         assert_eq!(cfg.spec_draft_model, DraftMode::None);
+        assert!(!cfg.spec_sparse_kv_enabled);
+        assert_eq!(cfg.spec_sparse_recent_tokens, 512);
+        assert_eq!(cfg.spec_sparse_top_k_pages, 32);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
@@ -694,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn self_spec_multi_token_rejected_until_real_verifier_lands() {
+    fn self_spec_multi_token_rejected_until_sparse_forward_lands() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.spec_enabled = true;
         cfg.spec_draft_model = DraftMode::SelfSpec;
@@ -710,6 +742,43 @@ mod tests {
 
         cfg.spec_draft_k = 1;
         cfg.validate().expect("single-token canary remains valid");
+    }
+
+    #[test]
+    fn sparse_kv_config_requires_non_empty_budget_when_enabled() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.spec_sparse_kv_enabled = true;
+        cfg.spec_sparse_recent_tokens = 0;
+        cfg.spec_sparse_top_k_pages = 0;
+
+        let err = cfg
+            .validate()
+            .expect_err("enabled sparse KV needs at least one page source");
+        assert!(
+            err.to_string().contains("spec sparse-KV"),
+            "unexpected error: {err}"
+        );
+
+        cfg.spec_sparse_recent_tokens = 512;
+        cfg.validate()
+            .expect("recent window is a valid sparse budget");
+    }
+
+    #[test]
+    fn sparse_kv_does_not_unlock_self_spec_multi_token_before_forward_wiring() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.spec_enabled = true;
+        cfg.spec_draft_model = DraftMode::SelfSpec;
+        cfg.spec_draft_k = 1;
+        cfg.spec_sparse_kv_enabled = true;
+
+        let err = cfg
+            .validate()
+            .expect_err("P2.B.1 sparse view does not wire sparse forward yet");
+        assert!(
+            err.to_string().contains("sparse-KV forward"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
