@@ -25,6 +25,7 @@
 //!
 //! - [`SpecConfig`] validation
 //! - [`verify_tokens`] acceptance/rejection sampling (pure f32 math)
+//! - [`verify_tokens_greedy`] bit-identical greedy verifier (pure token math)
 //! - [`VerificationResult::acceptance_rate`] from a [`VerificationResult`]
 //! - [`DraftModel`] trait (GPU stub)
 
@@ -235,6 +236,37 @@ pub fn verify_tokens(proposal: &TokenProposal, rng: &mut impl rand::Rng) -> Veri
     VerificationResult {
         accepted,
         bonus_token,
+        num_accepted,
+        rejection_index,
+    }
+}
+
+/// Greedy verifier used by the first production scheduler integration.
+///
+/// This is the bit-identical verifier contract for deterministic/self-spec
+/// paths: accept draft token `i` iff the target model argmax at the same
+/// position is exactly the same token id. On the first mismatch, stop and let
+/// the caller continue from the target path.
+pub fn verify_tokens_greedy(
+    draft_tokens: &[u32],
+    target_argmax_tokens: &[u32],
+) -> VerificationResult {
+    let mut accepted = Vec::with_capacity(draft_tokens.len());
+    let mut rejection_index = draft_tokens.len();
+
+    for (idx, &draft_token) in draft_tokens.iter().enumerate() {
+        if target_argmax_tokens.get(idx).copied() == Some(draft_token) {
+            accepted.push(draft_token);
+        } else {
+            rejection_index = idx;
+            break;
+        }
+    }
+
+    let num_accepted = accepted.len();
+    VerificationResult {
+        accepted,
+        bonus_token: None,
         num_accepted,
         rejection_index,
     }
@@ -495,6 +527,25 @@ mod tests {
         assert_eq!(result.num_accepted, 3);
         assert_eq!(result.rejection_index, 3);
         assert_eq!(result.accepted, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn greedy_verify_accepts_until_first_argmax_mismatch() {
+        let result = verify_tokens_greedy(&[10, 11, 12, 13], &[10, 11, 99, 13]);
+
+        assert_eq!(result.accepted, vec![10, 11]);
+        assert_eq!(result.num_accepted, 2);
+        assert_eq!(result.rejection_index, 2);
+        assert_eq!(result.bonus_token, None);
+    }
+
+    #[test]
+    fn greedy_verify_rejects_missing_target_position() {
+        let result = verify_tokens_greedy(&[10, 11, 12], &[10]);
+
+        assert_eq!(result.accepted, vec![10]);
+        assert_eq!(result.num_accepted, 1);
+        assert_eq!(result.rejection_index, 1);
     }
 
     #[test]

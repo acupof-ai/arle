@@ -155,6 +155,8 @@ pub struct BatchDecodeBuffers35 {
     /// Indexed by [group_idx][batch_size - 1].
     /// Full attention layers run eagerly between groups.
     graph_cache: Vec<Vec<Option<CudaGraph>>>,
+    /// One-shot eager decode override for verifier/correctness-sensitive paths.
+    force_eager_once: bool,
 
     max_batch_size: usize,
 }
@@ -283,6 +285,7 @@ impl BatchDecodeBuffers35 {
                     .map(|_| (0..max_batch_size).map(|_| None).collect())
                     .collect()
             },
+            force_eager_once: false,
 
             max_batch_size,
         })
@@ -370,6 +373,10 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         // Qwen3.5 uses piecewise graph cache (per linear-layer group).
         // No per-batch-size invalidation needed — reallocation doesn't
         // happen in the piecewise scheme.
+    }
+
+    fn force_eager_once(&mut self) {
+        self.force_eager_once = true;
     }
 
     fn logprobs_host(&self) -> &[f32] {
@@ -539,6 +546,7 @@ impl Qwen35Model {
 
         // Process layers in groups: each group is consecutive linear layers
         // followed by one full attention layer. Linear groups are graph-captured.
+        let force_eager = std::mem::take(&mut bufs.force_eager_once);
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
         let mut group_idx = 0usize;
@@ -556,7 +564,13 @@ impl Qwen35Model {
                     // Flush any pending linear group with graph capture
                     if let Some(start) = group_start.take() {
                         self.run_linear_group_graphed(
-                            bufs, start, layer_i, linear_idx, group_idx, batch_size,
+                            bufs,
+                            start,
+                            layer_i,
+                            linear_idx,
+                            group_idx,
+                            batch_size,
+                            force_eager,
                         )?;
                         group_idx += 1;
                     }
@@ -579,6 +593,7 @@ impl Qwen35Model {
                 linear_idx,
                 group_idx,
                 batch_size,
+                force_eager,
             )?;
         }
 
@@ -612,12 +627,14 @@ impl Qwen35Model {
         linear_idx_end: usize,
         group_idx: usize,
         batch_size: usize,
+        force_eager: bool,
     ) -> Result<()> {
         let linear_count = layer_end - layer_start;
         let linear_idx_start = linear_idx_end - linear_count;
 
         // Graph capture/replay for this group
-        let use_graph = <Self as crate::model::ModelForward>::supports_cuda_graph_decode(self)
+        let use_graph = !force_eager
+            && <Self as crate::model::ModelForward>::supports_cuda_graph_decode(self)
             && group_idx < bufs.graph_cache.len();
         if use_graph {
             if let Some(ref graph) = bufs.graph_cache[group_idx][batch_size - 1] {
