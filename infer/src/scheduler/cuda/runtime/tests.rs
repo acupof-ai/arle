@@ -5,11 +5,12 @@
 #[cfg(test)]
 mod tests {
     use super::super::helpers::{
-        DeferredWaitingRequest, PrefixAdmissionPlan, WaitingInsertBias, WaitingRequestHint,
-        best_reusable_slot_for_radix_hit, finish_rejected_request, insert_deferred_waiting_request,
+        DeferredWaitingRequest, PrefixAdmissionPlan, QueuedAdmissionCandidate, WaitingInsertBias,
+        WaitingRequestHint, best_reusable_slot_for_radix_hit, choose_session_affinity_candidate,
+        finish_rejected_request, insert_deferred_waiting_request,
         insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu,
-        matched_sealed_lookup_blocks, staged_prefix_direct_host_blocks,
-        staged_prefix_prefetch_state,
+        matched_sealed_lookup_blocks, session_affinity_tokens_for_plan,
+        staged_prefix_direct_host_blocks, staged_prefix_prefetch_state,
     };
     use crate::kv_tier::{HostPinnedRegion, ReadmissionBlock, ReadmissionPlan, ReadmissionSource};
     use crate::prefix_cache::BlockId;
@@ -248,6 +249,132 @@ mod tests {
             },
             reusable_prefix_len,
         )
+    }
+
+    fn lookup_block(
+        block_id: u32,
+        hit_kind: crate::kv_tier::HitKind,
+    ) -> crate::kv_tier::LookupBlock {
+        crate::kv_tier::LookupBlock {
+            block_id: Some(BlockId(block_id)),
+            hit_kind,
+        }
+    }
+
+    #[test]
+    fn session_affinity_tokens_require_matching_session_prefix_blocks() {
+        let session_a = crate::types::SessionId::from("session-a");
+        let session_b = crate::types::SessionId::from("session-b");
+        let plan = PrefixAdmissionPlan {
+            radix_blocks: Vec::new(),
+            lookup: crate::kv_tier::LookupOutcome::new(
+                48,
+                vec![
+                    lookup_block(1, crate::kv_tier::HitKind::ReadyOnGpu),
+                    lookup_block(2, crate::kv_tier::HitKind::ReadyOnGpu),
+                    lookup_block(3, crate::kv_tier::HitKind::ReadyOnGpu),
+                ],
+                false,
+            ),
+            reusable: None,
+            direct_gpu_attach: true,
+            attached_prefix_blocks: Vec::new(),
+            staged_prefix_plan: None,
+        };
+
+        let tokens =
+            session_affinity_tokens_for_plan(
+                &plan,
+                Some(&session_a),
+                16,
+                |block_id| match block_id {
+                    BlockId(1) | BlockId(2) => Some(session_a.clone()),
+                    BlockId(3) => Some(session_b.clone()),
+                    _ => None,
+                },
+            );
+
+        assert_eq!(tokens, 32);
+    }
+
+    #[test]
+    fn session_affinity_tokens_ignore_recompute_advised_hits() {
+        let session = crate::types::SessionId::from("session");
+        let plan = PrefixAdmissionPlan {
+            radix_blocks: Vec::new(),
+            lookup: crate::kv_tier::LookupOutcome::new(
+                16,
+                vec![lookup_block(1, crate::kv_tier::HitKind::StagingFromDisk)],
+                true,
+            ),
+            reusable: None,
+            direct_gpu_attach: false,
+            attached_prefix_blocks: Vec::new(),
+            staged_prefix_plan: None,
+        };
+
+        assert_eq!(
+            session_affinity_tokens_for_plan(&plan, Some(&session), 16, |_| {
+                Some(session.clone())
+            }),
+            0
+        );
+    }
+
+    fn queued_candidate(
+        label: &str,
+        priority: RequestPriority,
+        hint: WaitingRequestHint,
+    ) -> QueuedAdmissionCandidate {
+        QueuedAdmissionCandidate {
+            incoming: queued_request(label, priority),
+            prompt_tokens: vec![1, 2, 3],
+            plan: PrefixAdmissionPlan {
+                radix_blocks: Vec::new(),
+                lookup: crate::kv_tier::LookupOutcome::new(0, Vec::new(), false),
+                reusable: None,
+                direct_gpu_attach: false,
+                attached_prefix_blocks: Vec::new(),
+                staged_prefix_plan: None,
+            },
+            hint,
+        }
+    }
+
+    #[test]
+    fn session_affinity_candidate_overtakes_same_priority_cold_head() {
+        let candidates = vec![
+            queued_candidate(
+                "cold",
+                RequestPriority::Normal,
+                WaitingRequestHint::default(),
+            ),
+            queued_candidate(
+                "warm",
+                RequestPriority::Normal,
+                WaitingRequestHint::default().with_session_affinity_tokens(32),
+            ),
+        ];
+
+        assert_eq!(choose_session_affinity_candidate(&candidates), Some(1));
+    }
+
+    #[test]
+    fn session_affinity_candidate_does_not_overtake_higher_priority_head() {
+        let candidates = vec![
+            queued_candidate(
+                "high-cold",
+                RequestPriority::High,
+                WaitingRequestHint::default(),
+            ),
+            queued_candidate(
+                "normal-warm",
+                RequestPriority::Normal,
+                WaitingRequestHint::default().with_session_affinity_tokens(32),
+            ),
+        ];
+
+        assert_eq!(choose_session_affinity_candidate(&candidates), Some(0));
     }
 
     #[test]

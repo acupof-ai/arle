@@ -11,7 +11,7 @@ use super::helpers::{
     DeferredWaitingRequest, FetchWaiter, PrefixAdmissionPlan, QueuedAdmissionCandidate,
     WaitingInsertBias, best_reusable_slot_for_radix_hit, finish_rejected_request,
     insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu, matched_sealed_lookup_blocks,
-    staged_prefix_prefetch_state,
+    session_affinity_tokens_for_plan, staged_prefix_prefetch_state,
 };
 use crate::kv_tier::{ReadmissionSource, RequestChunkState};
 use crate::scheduler::types::RequestLengthContract;
@@ -269,10 +269,27 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             }
             let plan = self.build_prefix_admission_plan(&prompt_tokens, free_slots);
+            let reusable_prefix_len = plan
+                .reusable
+                .map(|(_, reusable_prefix_len, _)| reusable_prefix_len)
+                .unwrap_or_default();
+            let session_affinity_tokens = session_affinity_tokens_for_plan(
+                &plan,
+                incoming.session_id.as_ref(),
+                self.prefix_cache.block_size(),
+                |block_id| {
+                    self.prefix_cache
+                        .block_metadata(block_id)
+                        .and_then(|metadata| metadata.session_id)
+                },
+            );
+            let hint = super::helpers::WaitingRequestHint::from_plan(&plan, reusable_prefix_len)
+                .with_session_affinity_tokens(session_affinity_tokens);
             candidates.push(QueuedAdmissionCandidate {
                 incoming,
                 prompt_tokens,
                 plan,
+                hint,
             });
         }
         candidates

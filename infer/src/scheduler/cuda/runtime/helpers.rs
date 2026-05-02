@@ -25,10 +25,12 @@ pub(super) struct QueuedAdmissionCandidate {
     pub(super) incoming: super::super::IncomingRequest,
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) plan: PrefixAdmissionPlan,
+    pub(super) hint: WaitingRequestHint,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct WaitingRequestHint {
+    pub(super) session_affinity_tokens: usize,
     pub(super) immediate_reuse_tokens: usize,
     pub(super) total_reuse_tokens: usize,
 }
@@ -50,9 +52,15 @@ impl WaitingRequestHint {
             0
         };
         Self {
+            session_affinity_tokens: 0,
             immediate_reuse_tokens,
             total_reuse_tokens,
         }
+    }
+
+    pub(super) fn with_session_affinity_tokens(mut self, tokens: usize) -> Self {
+        self.session_affinity_tokens = tokens;
+        self
     }
 }
 
@@ -138,6 +146,50 @@ pub(super) fn matched_sealed_lookup_blocks(blocks: &[crate::kv_tier::LookupBlock
         .count()
 }
 
+pub(super) fn session_affinity_tokens_for_plan(
+    plan: &PrefixAdmissionPlan,
+    session_id: Option<&crate::types::SessionId>,
+    block_size: usize,
+    mut block_session_id: impl FnMut(crate::prefix_cache::BlockId) -> Option<crate::types::SessionId>,
+) -> usize {
+    let Some(session_id) = session_id else {
+        return 0;
+    };
+    if plan.lookup.matched_len == 0 || plan.lookup.recompute_advised {
+        return 0;
+    }
+
+    let same_session_blocks = plan
+        .lookup
+        .blocks
+        .iter()
+        .take_while(|block| !matches!(block.hit_kind, crate::kv_tier::HitKind::Miss))
+        .map_while(|block| block.block_id)
+        .take_while(|&block_id| {
+            block_session_id(block_id)
+                .as_ref()
+                .is_some_and(|block_session| block_session == session_id)
+        })
+        .count();
+
+    same_session_blocks
+        .saturating_mul(block_size)
+        .min(plan.lookup.matched_len)
+}
+
+pub(super) fn choose_session_affinity_candidate(
+    candidates: &[QueuedAdmissionCandidate],
+) -> Option<usize> {
+    let head_priority = candidates.first()?.incoming.priority;
+    candidates
+        .iter()
+        .position(|candidate| {
+            candidate.incoming.priority == head_priority
+                && candidate.hint.session_affinity_tokens > 0
+        })
+        .or(Some(0))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::scheduler::cuda) enum WaitingInsertBias {
     BeforeEqual,
@@ -155,10 +207,12 @@ pub(super) fn waiting_request_precedes(
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => match (
+            incoming_hint.session_affinity_tokens,
             incoming_hint.immediate_reuse_tokens,
             incoming_hint.total_reuse_tokens,
         )
             .cmp(&(
+                queued_hint.session_affinity_tokens,
                 queued_hint.immediate_reuse_tokens,
                 queued_hint.total_reuse_tokens,
             )) {
