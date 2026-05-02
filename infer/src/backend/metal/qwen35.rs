@@ -2186,7 +2186,6 @@ impl CppQwen35Model {
     /// Batched DFlash verify fast path: same packed-KV/GDR update as
     /// `verify_block_batched`, but samples the posterior inside C++ and
     /// returns token ids `[B, block_size]` instead of logits.
-    #[allow(dead_code)]
     pub(super) fn verify_block_batched_sampled(
         &self,
         tokens: &MlxArray,
