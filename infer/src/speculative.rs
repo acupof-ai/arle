@@ -122,9 +122,9 @@ impl TokenProposal {
                 self.draft_probs.len()
             );
         }
-        if self.target_probs.len() != k {
+        if !self.target_probs.is_empty() && self.target_probs.len() != k {
             bail!(
-                "target_probs length {} != tokens length {k}",
+                "target_probs length {} != tokens length {k} (empty is OK for greedy verification)",
                 self.target_probs.len()
             );
         }

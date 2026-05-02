@@ -5,11 +5,14 @@ use anyhow::{Result, bail};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use super::{DraftModel, TokenProposal};
+use super::{DraftModel, TokenProposal, verify_tokens_greedy};
 use crate::backend::cuda::bootstrap::{InferenceEngineOptions, load_qwen3_components};
 use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
-use crate::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen3State};
+use crate::model::{
+    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen3State, SpecVerifyRequest,
+};
 use crate::sampler::SamplingParams;
+use cuda_kernels::prelude::PagedKVPool;
 
 /// Default draft-model identifier for the first CUDA implementation pass.
 pub const DEFAULT_QWEN3_DRAFT_MODEL_ID: &str = "Qwen/Qwen3-0.6B";
@@ -192,7 +195,7 @@ impl DraftEngine {
         }
 
         Ok(TokenProposal {
-            target_probs: vec![0.0; tokens.len()],
+            target_probs: Vec::new(), // Greedy verification doesn't use target_probs
             tokens,
             draft_probs,
             target_bonus_dist: Vec::new(),
@@ -229,6 +232,81 @@ impl DraftEngine {
         target_model.forward_prefill(token_ids, &mut target_scratch)?;
         Self::fill_target_probs_from_state(&mut proposal, target_model, &mut target_scratch)?;
         Ok(proposal)
+    }
+
+    /// Draft tokens and perform greedy verification using target model argmax comparison.
+    ///
+    /// This is the main entry point for greedy speculative decoding. It generates
+    /// draft tokens and then gets target argmax tokens for verification, allowing
+    /// the scheduler to use `verify_tokens_greedy` for deterministic acceptance.
+    pub fn draft_then_verify_greedy<M: ModelForward>(
+        &self,
+        target_model: &M,
+        target_states: &mut [M::State],
+        target_pool: &mut PagedKVPool,
+        slot_idx: usize,
+        token_ids: &[u32],
+        num_draft_tokens: usize,
+    ) -> Result<(TokenProposal, Vec<u32>)> {
+        let proposal = self.draft_batch(token_ids, num_draft_tokens)?;
+        if proposal.tokens.is_empty() {
+            return Ok((proposal, Vec::new()));
+        }
+
+        let last_committed_token = token_ids
+            .last()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("need at least one committed token for verification"))?;
+
+        let target_argmax_tokens = Self::fill_target_argmax_tokens(
+            &proposal.tokens,
+            target_model,
+            target_states,
+            target_pool,
+            slot_idx,
+            last_committed_token,
+        )?;
+
+        Ok((proposal, target_argmax_tokens))
+    }
+
+    /// Fill target argmax tokens by running target model verification.
+    ///
+    /// For greedy verification, this extracts target argmax tokens at each
+    /// draft position instead of computing probability ratios. The result can
+    /// be used with `verify_tokens_greedy` for bit-identical deterministic
+    /// verification.
+    pub fn fill_target_argmax_tokens<M: ModelForward>(
+        draft_tokens: &[u32],
+        target_model: &M,
+        target_states: &mut [M::State],
+        target_pool: &mut PagedKVPool,
+        slot_idx: usize,
+        last_committed_token: u32,
+    ) -> Result<Vec<u32>> {
+        if draft_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build input tokens: [last_committed_token] + draft_tokens
+        let mut input_tokens = Vec::with_capacity(draft_tokens.len() + 1);
+        input_tokens.push(last_committed_token);
+        input_tokens.extend_from_slice(draft_tokens);
+
+        let request = super::super::model::SpecVerifyRequest {
+            slot_idx,
+            input_tokens: &input_tokens,
+            draft_tokens,
+        };
+
+        let outputs =
+            target_model.forward_spec_verify_batch(&[request], target_states, target_pool)?;
+
+        outputs
+            .into_iter()
+            .find(|output| output.slot_idx == slot_idx)
+            .map(|output| output.target_argmax_tokens)
+            .ok_or_else(|| anyhow::anyhow!("no verifier output for slot {slot_idx}"))
     }
 
     /// Fill target probabilities by advancing a scratch target state.
@@ -384,7 +462,7 @@ impl DraftModel for DraftEngine {
         }
 
         Ok(TokenProposal {
-            target_probs: vec![0.0; tokens.len()],
+            target_probs: Vec::new(), // Greedy verification doesn't use target_probs
             tokens,
             draft_probs,
             target_bonus_dist: Vec::new(),
