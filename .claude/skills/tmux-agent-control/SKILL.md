@@ -109,6 +109,8 @@ If `capture-pane` after send shows the directive sitting in the input area with 
 tmux send-keys -t <session>:<window> Enter Enter   # force submit
 ```
 
+**Long messages need more Enters.** For directives over ~200 chars / wrapping ≥3 visual lines, the original "Enter Enter" recipe is sometimes not enough — observed needing **4–6 Enters total** before Codex submits. If a recheck shows the message + multiple blank lines + footer (no `Working`, no `Create a plan?` hint), keep sending 2-Enter bursts and re-checking until `Working` appears or the input area clears to the `Implement {feature}` placeholder. Cap at ~10 total Enters before assuming the session is wedged and escalating (Escape + investigate).
+
 ### 4. Verify (every send)
 
 ```bash
