@@ -540,6 +540,124 @@ impl RadixCache {
         LookupOutcome::new(matched_len, blocks, recompute_advised)
     }
 
+    /// Find the longest token-prefix path that is proven to belong to
+    /// `session_id` by at least one block on that path.
+    ///
+    /// Shared ancestor blocks may have their `session_id` metadata overwritten by
+    /// another session that published the same bytes later. The semantic session
+    /// proof is therefore the deepest matching block on the path, not the first
+    /// block. Returned blocks still cover the complete prefix up to that point so
+    /// the scheduler can attach a contiguous KV prefix.
+    pub fn lookup_session_prefix_or_stage(
+        &mut self,
+        session_id: &SessionId,
+        tokens: &[u32],
+        heuristics: LookupHeuristics,
+    ) -> LookupOutcome {
+        let mut node_idx = Self::root();
+        let mut pos = 0;
+        let mut matched_nodes = Vec::new();
+        let mut last_session_block_count = 0;
+        let mut last_session_pos = 0;
+
+        loop {
+            if pos >= tokens.len() {
+                break;
+            }
+
+            let next_token = tokens[pos];
+            let Some(child_idx) = self.nodes[node_idx].children.get(&next_token).copied() else {
+                break;
+            };
+
+            let remaining = &tokens[pos..];
+            let (match_len, edge_len) = self.child_edge_match(child_idx, remaining);
+            if match_len < edge_len {
+                break;
+            }
+
+            pos += match_len;
+            let child = &self.nodes[child_idx];
+            if child.block_id.is_some() {
+                matched_nodes.push((child_idx, pos));
+                if child.session_id.as_ref() == Some(session_id) {
+                    last_session_block_count = matched_nodes.len();
+                    last_session_pos = pos;
+                }
+            } else if child.is_tombstone() {
+                break;
+            }
+
+            node_idx = child_idx;
+        }
+
+        if last_session_block_count == 0 {
+            return LookupOutcome::new(0, Vec::new(), false);
+        }
+
+        let matched_len = self.rounded_prefix_len(last_session_pos, last_session_block_count);
+        let block_count = matched_len / self.block_size;
+        if block_count == 0 {
+            return LookupOutcome::new(0, Vec::new(), false);
+        }
+
+        let now = self.tick();
+        let block_size = self.block_size;
+        let soft_pin_keepalive_ticks = self.soft_pin_keepalive_ticks;
+        let mut blocks = Vec::with_capacity(block_count);
+        let mut recompute_advised = false;
+
+        for (node_idx, _) in matched_nodes.into_iter().take(block_count) {
+            let child = &mut self.nodes[node_idx];
+            child.last_access = now;
+            let Some(block_id) = child.block_id else {
+                blocks.push(LookupBlock {
+                    block_id: None,
+                    hit_kind: HitKind::Miss,
+                });
+                break;
+            };
+
+            child.ref_count += 1;
+            child.hit_count = child.hit_count.saturating_add(1);
+            Self::maybe_refresh_soft_pin(child, now, soft_pin_keepalive_ticks);
+
+            let byte_len = child.byte_len.max(block_size as u32);
+            let hit_kind = match child.tier_location {
+                Some(BlockLocation::HostPinned { .. }) => HitKind::StagingFromHost,
+                Some(BlockLocation::Disk { .. } | BlockLocation::Remote { .. }) => {
+                    HitKind::StagingFromDisk
+                }
+                Some(BlockLocation::Gpu { .. }) | None => HitKind::ReadyOnGpu,
+            };
+            let hit_kind = if child.entry_state == IndexEntryState::Ready {
+                hit_kind
+            } else {
+                HitKind::Miss
+            };
+
+            if matches!(
+                hit_kind,
+                HitKind::StagingFromHost | HitKind::StagingFromDisk
+            ) {
+                recompute_advised |=
+                    heuristics.advise_recompute(hit_kind, block_size, byte_len as u64);
+            }
+
+            blocks.push(LookupBlock {
+                block_id: Some(block_id),
+                hit_kind,
+            });
+        }
+
+        let matched_blocks = blocks
+            .iter()
+            .filter(|block| !matches!(block.hit_kind, HitKind::Miss))
+            .count();
+        let matched_len = self.rounded_prefix_len(matched_len, matched_blocks);
+        LookupOutcome::new(matched_len, blocks, recompute_advised)
+    }
+
     // -------------------------------------------------------------------------
     // Insert
     // -------------------------------------------------------------------------

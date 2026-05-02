@@ -15,6 +15,7 @@ pub(super) struct FetchWaiter {
 pub(super) struct PrefixAdmissionPlan {
     pub(super) radix_blocks: Vec<crate::prefix_cache::BlockId>,
     pub(super) lookup: crate::kv_tier::LookupOutcome,
+    pub(super) session_resume_tokens: usize,
     pub(super) reusable: Option<(usize, usize, usize)>,
     pub(super) direct_gpu_attach: bool,
     pub(super) attached_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
@@ -155,6 +156,9 @@ pub(super) fn session_affinity_tokens_for_plan(
     let Some(session_id) = session_id else {
         return 0;
     };
+    if plan.session_resume_tokens > 0 {
+        return plan.session_resume_tokens;
+    }
     if plan.lookup.matched_len == 0 || plan.lookup.recompute_advised {
         return 0;
     }

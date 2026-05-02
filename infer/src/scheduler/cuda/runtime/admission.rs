@@ -13,15 +13,17 @@ use super::helpers::{
     insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu, matched_sealed_lookup_blocks,
     session_affinity_tokens_for_plan, staged_prefix_prefetch_state,
 };
-use crate::kv_tier::{ReadmissionSource, RequestChunkState};
+use crate::kv_tier::{LookupHeuristics, LookupOutcome, ReadmissionSource, RequestChunkState};
 use crate::scheduler::types::RequestLengthContract;
 use crate::server_engine::FinishReason;
+use crate::types::SessionId;
 
 impl<M: ModelForward> Scheduler<M> {
     fn cold_prefix_admission_plan(&self) -> PrefixAdmissionPlan {
         PrefixAdmissionPlan {
             radix_blocks: Vec::new(),
             lookup: crate::kv_tier::LookupOutcome::new(0, Vec::new(), false),
+            session_resume_tokens: 0,
             reusable: None,
             direct_gpu_attach: false,
             attached_prefix_blocks: Vec::new(),
@@ -159,6 +161,7 @@ impl<M: ModelForward> Scheduler<M> {
     pub(super) fn build_prefix_admission_plan(
         &mut self,
         prompt_tokens: &[u32],
+        session_id: Option<&SessionId>,
         free_slots: &[usize],
     ) -> PrefixAdmissionPlan {
         if !self.config.prefix_cache_enabled {
@@ -171,9 +174,25 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let block_size = self.prefix_cache.block_size();
-        let lookup = self
-            .prefix_cache
-            .lookup_or_stage(prompt_tokens, crate::kv_tier::LookupHeuristics::default());
+        let heuristics = LookupHeuristics::default();
+        let mut lookup = self.prefix_cache.lookup_or_stage(prompt_tokens, heuristics);
+        let mut session_resume_tokens = 0;
+        if let Some(session_id) = session_id {
+            let session_lookup = self.prefix_cache.lookup_session_prefix_or_stage(
+                session_id,
+                prompt_tokens,
+                heuristics,
+            );
+            if session_lookup.matched_len > 0 {
+                session_resume_tokens = session_lookup.matched_len;
+            }
+            if Self::session_lookup_preferred(&session_lookup, &lookup) {
+                self.release_lookup_blocks(&lookup);
+                lookup = session_lookup;
+            } else {
+                self.release_lookup_blocks(&session_lookup);
+            }
+        }
         let radix_blocks: Vec<_> = lookup
             .blocks
             .iter()
@@ -237,6 +256,7 @@ impl<M: ModelForward> Scheduler<M> {
         PrefixAdmissionPlan {
             radix_blocks,
             lookup,
+            session_resume_tokens,
             reusable: reusable_gpu_prefix,
             direct_gpu_attach,
             attached_prefix_blocks: if direct_gpu_attach {
@@ -268,7 +288,11 @@ impl<M: ModelForward> Scheduler<M> {
                 finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
                 continue;
             }
-            let plan = self.build_prefix_admission_plan(&prompt_tokens, free_slots);
+            let plan = self.build_prefix_admission_plan(
+                &prompt_tokens,
+                incoming.session_id.as_ref(),
+                free_slots,
+            );
             let reusable_prefix_len = plan
                 .reusable
                 .map(|(_, reusable_prefix_len, _)| reusable_prefix_len)
@@ -297,6 +321,26 @@ impl<M: ModelForward> Scheduler<M> {
 
     pub(super) fn release_admission_plan(&mut self, plan: &PrefixAdmissionPlan) {
         self.prefix_cache.release(&plan.radix_blocks);
+    }
+
+    fn release_lookup_blocks(&mut self, lookup: &LookupOutcome) {
+        let blocks = lookup
+            .blocks
+            .iter()
+            .filter_map(|block| block.block_id)
+            .collect::<Vec<_>>();
+        self.prefix_cache.release(&blocks);
+    }
+
+    fn session_lookup_preferred(
+        session_lookup: &LookupOutcome,
+        token_lookup: &LookupOutcome,
+    ) -> bool {
+        session_lookup.matched_len > token_lookup.matched_len
+            || (session_lookup.matched_len > 0
+                && session_lookup.matched_len == token_lookup.matched_len
+                && token_lookup.recompute_advised
+                && !session_lookup.recompute_advised)
     }
 
     pub(super) fn admit_waiting_candidate(
