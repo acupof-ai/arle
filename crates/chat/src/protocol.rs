@@ -250,12 +250,7 @@ fn append_structured_chatml_message_with_span(
             prompt.push_str(&message.content);
         }
         ChatRole::Assistant => {
-            prompt.push_str(&message.content);
-            for tool_call in &message.tool_calls {
-                prompt.push_str("\n<tool_call>\n");
-                prompt.push_str(&tool_call.prompt_payload());
-                prompt.push_str("\n</tool_call>");
-            }
+            append_assistant_content(prompt, &message.content, &message.tool_calls);
         }
         ChatRole::Tool => {
             prompt.push_str("<tool_response>\n");
@@ -342,12 +337,7 @@ impl<'a> PromptRenderer<'a> {
 
     fn push_assistant(&mut self, content: &str, tool_calls: &[ToolCall]) {
         self.start_message(ChatRole::Assistant.as_str());
-        self.prompt.push_str(content);
-        for tool_call in tool_calls {
-            self.prompt.push_str("\n<tool_call>\n");
-            self.prompt.push_str(&tool_call.prompt_payload());
-            self.prompt.push_str("\n</tool_call>");
-        }
+        append_assistant_content(&mut self.prompt, content, tool_calls);
         self.end_message();
     }
 
@@ -366,6 +356,24 @@ impl<'a> PromptRenderer<'a> {
         self.prompt.push_str(content);
         self.end_message();
     }
+}
+
+fn append_assistant_content(prompt: &mut String, content: &str, tool_calls: &[ToolCall]) {
+    prompt.push_str(content);
+    for tool_call in tool_calls {
+        append_tool_call_block(prompt, tool_call);
+    }
+}
+
+fn append_tool_call_block(prompt: &mut String, tool_call: &ToolCall) {
+    if !prompt.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str(TOOL_CALL_BLOCK.open);
+    prompt.push('\n');
+    prompt.push_str(&tool_call.prompt_payload());
+    prompt.push('\n');
+    prompt.push_str(TOOL_CALL_BLOCK.close);
 }
 
 /// Structured tool definition used for prompt injection.
