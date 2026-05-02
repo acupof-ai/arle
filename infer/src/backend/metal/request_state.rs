@@ -303,14 +303,10 @@ pub(crate) struct Qwen35PrefixSnapshot {
     pub kv_capacity: i32,
 }
 
-#[allow(dead_code)]
 const QWEN35_PREFIX_SNAPSHOT_MAGIC: [u8; 8] = *b"Q35PFX01";
-#[allow(dead_code)]
 const QWEN35_PREFIX_SNAPSHOT_VERSION: u16 = 2;
-#[allow(dead_code)]
 const QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN: usize = 14;
 
-#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Qwen35PrefixSnapshotHeader {
     model_fingerprint: Vec<u8>,
@@ -323,7 +319,6 @@ struct Qwen35PrefixSnapshotHeader {
     gdr_flat: Vec<MlxArrayBytesHeader>,
 }
 
-#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MlxArrayBytesHeader {
     name: String,
@@ -332,7 +327,6 @@ struct MlxArrayBytesHeader {
     byte_len: u64,
 }
 
-#[allow(dead_code)]
 impl Qwen35PrefixSnapshot {
     pub(crate) fn encode_for_disk(&self, model_fingerprint: &[u8]) -> Result<Vec<u8>> {
         ensure!(
@@ -479,7 +473,6 @@ impl Qwen35PrefixSnapshot {
     }
 }
 
-#[allow(dead_code)]
 fn decode_qwen35_prefix_snapshot_header<'a>(
     bytes: &'a [u8],
     expected_model_fingerprint: &[u8],
@@ -629,7 +622,6 @@ fn validate_qwen35_prefix_snapshot_metadata_checksum(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_qwen35_prefix_snapshot_body(
     header: &Qwen35PrefixSnapshotHeader,
     body: &[u8],
@@ -655,7 +647,6 @@ fn validate_qwen35_prefix_snapshot_body(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_mlx_array_header_layout(
     prefix: &str,
     records: &[MlxArrayBytesHeader],
@@ -691,7 +682,6 @@ fn validate_mlx_array_header_layout(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn encode_mlx_array_headers(
     prefix: &str,
     arrays: &[MlxArray],
@@ -738,7 +728,6 @@ fn describe_mlx_array_headers(
     Ok((headers, total_bytes))
 }
 
-#[allow(dead_code)]
 fn decode_mlx_array_headers(
     prefix: &str,
     records: &[MlxArrayBytesHeader],
@@ -3667,23 +3656,8 @@ impl StepDriver for Qwen3StepDriver<'_> {
     }
 }
 
-/// Innovation tape from one GDR layer during a speculative verify block.
-/// Used for O(accepted) rollback instead of O(N) re-forward.
-#[allow(dead_code)]
-struct GdrTape {
-    /// Innovation delta at each timestep: [1, N, Hv, Dv]
-    innovation_tape: MlxArray,
-    /// Key projections: [1, N, Hk, Dk]
-    k: MlxArray,
-    /// Gating values: [1, N, Hv]
-    g: MlxArray,
-    /// Raw QKV for conv state rebuild: [1, N, qkv_dim]
-    qkv: MlxArray,
-}
-
 /// DFlash speculative decode state for Qwen3.5 hybrid models.
 /// Extends the Qwen3 DFlash pattern with GDR recurrent rollback.
-#[allow(dead_code)]
 struct Qwen35DFlashState {
     runtime: &'static MetalDflashRuntime,
     config: &'static MetalModelConfig,
@@ -3700,10 +3674,6 @@ struct Qwen35DFlashState {
     target_layer_ids: Vec<usize>,
     /// Per-block acceptance lengths for metrics.
     acceptance_lengths: Vec<usize>,
-    /// GDR state snapshot taken before each verify (for rollback).
-    gdr_snapshot: Option<Vec<MlxArray>>,
-    /// Per-layer tapes recorded during verify (for partial replay).
-    gdr_tapes: Vec<GdrTape>,
 }
 
 struct Qwen35CppState {
@@ -3847,8 +3817,6 @@ impl<'a> Qwen35StepDriver<'a> {
                 token_buffer: VecDeque::new(),
                 target_layer_ids: runtime.target_layer_ids().to_vec(),
                 acceptance_lengths: Vec::new(),
-                gdr_snapshot: None,
-                gdr_tapes: Vec::new(),
             })
         } else {
             None

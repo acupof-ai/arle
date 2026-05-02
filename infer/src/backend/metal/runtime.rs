@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use log::{error, info, warn};
 use tokio::sync::mpsc;
 
@@ -258,6 +258,12 @@ enum PrefillChunkOutcome {
     },
     ClientDropped,
     Failed(anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MetalStreamError {
+    #[error("stream consumer dropped")]
+    ConsumerDropped,
 }
 
 enum MetalLivePrefixRuntime {
@@ -1580,12 +1586,14 @@ fn execute_mixed_batch(
 
     for ((req_id, mut request), sampled_token) in decode_rows.into_iter().zip(decode_tokens) {
         if let Err(err) = request.process_token(sampled_token) {
-            error!(
-                "Metal mixed decode post-process failed for {:?}: {err:#}",
-                req_id
+            handle_detached_postprocess_error(
+                "mixed decode",
+                req_id,
+                &err,
+                request,
+                metrics,
+                scheduler,
             );
-            metrics.record_request_failed();
-            cancel_detached_request(req_id, request, scheduler);
             continue;
         }
         finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
@@ -1593,12 +1601,14 @@ fn execute_mixed_batch(
 
     if let Some(sampled_token) = prefill.emitted_token {
         if let Err(err) = prefill_request.process_token(sampled_token) {
-            error!(
-                "Metal mixed prefill post-process failed for {:?}: {err:#}",
-                prefill_req_id
+            handle_detached_postprocess_error(
+                "mixed prefill",
+                prefill_req_id,
+                &err,
+                prefill_request,
+                metrics,
+                scheduler,
             );
-            metrics.record_request_failed();
-            cancel_detached_request(prefill_req_id, prefill_request, scheduler);
             return true;
         }
         if let Some(prefix_runtime) = prefix_runtime.as_mut()
@@ -2033,12 +2043,14 @@ fn execute_decode_batch(
     if let Some(sampled_tokens) = batch_result {
         for ((req_id, mut request), sampled_token) in open.into_iter().zip(sampled_tokens) {
             if let Err(err) = request.process_token(sampled_token) {
-                error!(
-                    "Metal batched decode post-process failed for {:?}: {err:#}",
-                    req_id
+                handle_detached_postprocess_error(
+                    "batched decode",
+                    req_id,
+                    &err,
+                    request,
+                    metrics,
+                    scheduler,
                 );
-                metrics.record_request_failed();
-                cancel_detached_request(req_id, request, scheduler);
                 continue;
             }
             finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
@@ -2139,12 +2151,14 @@ fn execute_qwen35_dflash_packed_batch(
         if let DflashRowDispatch::Batched { sampled_index } = dispatch {
             let sampled_token = sampled[sampled_index];
             if let Err(err) = request.process_token(sampled_token) {
-                error!(
-                    "Metal DFlash batched decode post-process failed for {:?}: {err:#}",
-                    req_id
+                handle_detached_postprocess_error(
+                    "DFlash batched decode",
+                    req_id,
+                    &err,
+                    request,
+                    metrics,
+                    scheduler,
                 );
-                metrics.record_request_failed();
-                cancel_detached_request(req_id, request, scheduler);
                 continue;
             }
             finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
@@ -2447,6 +2461,31 @@ fn finish_or_requeue_decoded_request(
     }
 }
 
+fn handle_detached_postprocess_error(
+    stage: &str,
+    req_id: RequestId,
+    request_err: &anyhow::Error,
+    request: ActiveMetalRequest,
+    metrics: &ServerMetrics,
+    scheduler: &mut MetalScheduler,
+) {
+    if request.delta_closed() || is_stream_consumer_dropped(request_err) {
+        info!("Metal {stage} client dropped for {:?}", req_id);
+    } else {
+        error!(
+            "Metal {stage} post-process failed for {:?}: {request_err:#}",
+            req_id
+        );
+        metrics.record_request_failed();
+    }
+    cancel_detached_request(req_id, request, scheduler);
+}
+
+fn is_stream_consumer_dropped(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<MetalStreamError>().is_some())
+}
+
 fn cancel_detached_request(
     req_id: RequestId,
     mut request: ActiveMetalRequest,
@@ -2676,7 +2715,7 @@ fn send_text_delta_with_ids(
             logprob: None,
             token_ids,
         })
-        .map_err(|_| anyhow!("stream consumer dropped"))
+        .map_err(|_| MetalStreamError::ConsumerDropped.into())
 }
 
 #[cfg(test)]
@@ -2711,6 +2750,15 @@ mod tests {
         assert!(dflash_row_dispatch_plan(3, &[0, 3], 2).is_err());
         assert!(dflash_row_dispatch_plan(3, &[2, 1], 2).is_err());
         assert!(dflash_row_dispatch_plan(3, &[1, 1], 2).is_err());
+    }
+
+    #[test]
+    fn stream_consumer_drop_detection_is_typed() {
+        let dropped: anyhow::Error = MetalStreamError::ConsumerDropped.into();
+        assert!(is_stream_consumer_dropped(&dropped));
+
+        let other = anyhow::anyhow!("stream consumer dropped");
+        assert!(!is_stream_consumer_dropped(&other));
     }
 
     #[test]
