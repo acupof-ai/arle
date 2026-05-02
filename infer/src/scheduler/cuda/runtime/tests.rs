@@ -242,6 +242,7 @@ mod tests {
                     Vec::new(),
                     recompute_advised,
                 ),
+                session_resume_tokens: 0,
                 reusable: None,
                 direct_gpu_attach,
                 attached_prefix_blocks: Vec::new(),
@@ -276,6 +277,7 @@ mod tests {
                 ],
                 false,
             ),
+            session_resume_tokens: 0,
             reusable: None,
             direct_gpu_attach: true,
             attached_prefix_blocks: Vec::new(),
@@ -307,6 +309,7 @@ mod tests {
                 vec![lookup_block(1, crate::kv_tier::HitKind::StagingFromDisk)],
                 true,
             ),
+            session_resume_tokens: 0,
             reusable: None,
             direct_gpu_attach: false,
             attached_prefix_blocks: Vec::new(),
@@ -321,6 +324,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_affinity_tokens_use_session_resume_lookup_when_shared_ancestor_differs() {
+        let session = crate::types::SessionId::from("session-a");
+        let other_session = crate::types::SessionId::from("session-b");
+        let plan = PrefixAdmissionPlan {
+            radix_blocks: Vec::new(),
+            lookup: crate::kv_tier::LookupOutcome::new(
+                48,
+                vec![
+                    lookup_block(1, crate::kv_tier::HitKind::ReadyOnGpu),
+                    lookup_block(2, crate::kv_tier::HitKind::ReadyOnGpu),
+                    lookup_block(3, crate::kv_tier::HitKind::ReadyOnGpu),
+                ],
+                false,
+            ),
+            session_resume_tokens: 48,
+            reusable: None,
+            direct_gpu_attach: true,
+            attached_prefix_blocks: Vec::new(),
+            staged_prefix_plan: None,
+        };
+
+        let tokens =
+            session_affinity_tokens_for_plan(
+                &plan,
+                Some(&session),
+                16,
+                |block_id| match block_id {
+                    BlockId(1) => Some(other_session.clone()),
+                    BlockId(2) | BlockId(3) => Some(session.clone()),
+                    _ => None,
+                },
+            );
+
+        assert_eq!(tokens, 48);
+    }
+
     fn queued_candidate(
         label: &str,
         priority: RequestPriority,
@@ -332,6 +372,7 @@ mod tests {
             plan: PrefixAdmissionPlan {
                 radix_blocks: Vec::new(),
                 lookup: crate::kv_tier::LookupOutcome::new(0, Vec::new(), false),
+                session_resume_tokens: 0,
                 reusable: None,
                 direct_gpu_attach: false,
                 attached_prefix_blocks: Vec::new(),
