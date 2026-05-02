@@ -325,5 +325,15 @@ Request 255: chunked prefill starting (8539 effective tokens, chunk_size=2048)
   code remains A1 at `b1716819`; docs head for this run was `c6a43717`.
 - Suspected cause of W4 weakness: only the small shared transcript prefix is
   resident/matched for resume; the long session prompt is re-prefilled.
+- Refined root-cause (added 2026-05-02 by supervisor after A3 implementation
+  exploration): the byte-level prefix between warmup and resume turns shares
+  ~49.5 KB out of 51.4 KB (>96%), but token-level prefix matches only 32 tokens.
+  The chat template re-encodes the assistant turn to splice in the
+  `<tool_call>` markup after warmup completes, which forces the tokenizer to
+  re-segment the boundary; subsequent tokens diverge byte-for-byte-equal but
+  token-id-different. Fingerprint-based RadixCache lookup cannot bridge this
+  divergence; the fix is session-id-keyed lookup (independent of
+  token-fingerprint), implemented in commit `8aa5d7ab feat(scheduler): add
+  session resume prefix admission lookup`.
 - Follow-ups: wait for the strategy decision before starting A3, W3 deepening,
   or four-engine W4 comparison.
