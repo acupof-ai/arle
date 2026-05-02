@@ -155,6 +155,34 @@ mod tests {
     }
 
     #[test]
+    fn dflash_ready_selection_keeps_largest_compatible_subset() {
+        let ready_flags = [true, true, true, true, false];
+        let ready = select_dflash_batch_ready_indices(&ready_flags, |a, b| {
+            matches!((a, b), (1, 2) | (2, 1) | (1, 3) | (3, 1) | (2, 3) | (3, 2))
+        });
+
+        assert_eq!(ready, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn dflash_ready_selection_returns_empty_without_pair() {
+        let ready_flags = [false, true, false, true];
+        let ready = select_dflash_batch_ready_indices(&ready_flags, |_a, _b| false);
+
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn dflash_ready_selection_preserves_original_row_order() {
+        let ready_flags = [true, false, true, true, true];
+        let ready = select_dflash_batch_ready_indices(&ready_flags, |a, b| {
+            matches!((a, b), (0, 2) | (2, 0) | (0, 4) | (4, 0) | (2, 4) | (4, 2))
+        });
+
+        assert_eq!(ready, vec![0, 2, 4]);
+    }
+
+    #[test]
     fn qwen35_prefix_snapshot_disk_payload_roundtrips_arrays() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {

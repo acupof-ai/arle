@@ -2620,50 +2620,9 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
         ready_flags.push(row_passes_dflash_batch_per_row_predicates(state));
     }
 
-    let mut best_anchor: Option<usize> = None;
-    let mut best_count: usize = 0;
-    for (candidate_idx, &candidate_ready) in ready_flags.iter().enumerate() {
-        if !candidate_ready {
-            continue;
-        }
-        let mut count = 0usize;
-        for (other_idx, &other_ready) in ready_flags.iter().enumerate() {
-            if !other_ready {
-                continue;
-            }
-            if other_idx == candidate_idx
-                || rows_agree_on_dflash_batch_cross_row_predicates(
-                    states[candidate_idx],
-                    states[other_idx],
-                )
-            {
-                count += 1;
-            }
-        }
-        if count > best_count {
-            best_count = count;
-            best_anchor = Some(candidate_idx);
-        }
-    }
-
-    if let Some(anchor_idx) = best_anchor {
-        for (idx, flag) in ready_flags.iter_mut().enumerate() {
-            if !*flag || idx == anchor_idx {
-                continue;
-            }
-            if !rows_agree_on_dflash_batch_cross_row_predicates(states[anchor_idx], states[idx]) {
-                *flag = false;
-            }
-        }
-    } else {
-        ready_flags.fill(false);
-    }
-
-    let ready_indices: Vec<usize> = ready_flags
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &ready)| if ready { Some(idx) } else { None })
-        .collect();
+    let ready_indices = select_dflash_batch_ready_indices(&ready_flags, |anchor, candidate| {
+        rows_agree_on_dflash_batch_cross_row_predicates(states[anchor], states[candidate])
+    });
 
     if ready_indices.len() < 2 {
         return Ok(None);
@@ -2674,12 +2633,14 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
     // untouched for the caller to run scalar.
     let mut ready_states: Vec<&mut ResumableRequestState<Qwen35StepDriver<'a>>> =
         Vec::with_capacity(ready_indices.len());
+    let mut ready_cursor = 0usize;
     for (idx, state) in states.iter_mut().enumerate() {
-        if ready_flags[idx] {
+        if ready_indices.get(ready_cursor).copied() == Some(idx) {
             // Reborrow: `states[idx]` is `&mut &mut ResumableRequestState<_>`;
             // deref once, then reborrow mutably to produce a fresh
             // `&mut ResumableRequestState<_>` tied to this function's lifetime.
             ready_states.push(&mut **state);
+            ready_cursor += 1;
         }
     }
     let states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>] = &mut ready_states;
@@ -2901,6 +2862,46 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
         ready_indices,
         tokens: sampled_first_tokens,
     }))
+}
+
+fn select_dflash_batch_ready_indices(
+    ready_flags: &[bool],
+    mut rows_agree: impl FnMut(usize, usize) -> bool,
+) -> Vec<usize> {
+    let mut best_anchor: Option<usize> = None;
+    let mut best_count: usize = 0;
+    for (candidate_idx, &candidate_ready) in ready_flags.iter().enumerate() {
+        if !candidate_ready {
+            continue;
+        }
+        let mut count = 0usize;
+        for (other_idx, &other_ready) in ready_flags.iter().enumerate() {
+            if !other_ready {
+                continue;
+            }
+            if other_idx == candidate_idx || rows_agree(candidate_idx, other_idx) {
+                count += 1;
+            }
+        }
+        if count > best_count {
+            best_count = count;
+            best_anchor = Some(candidate_idx);
+        }
+    }
+
+    let Some(anchor_idx) = best_anchor else {
+        return Vec::new();
+    };
+    if best_count < 2 {
+        return Vec::new();
+    }
+    ready_flags
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &ready)| {
+            (ready && (idx == anchor_idx || rows_agree(anchor_idx, idx))).then_some(idx)
+        })
+        .collect()
 }
 
 /// Per-row predicate for `try_decode_qwen35_dflash_speculative_batch`. True iff
