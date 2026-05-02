@@ -648,6 +648,13 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn step_prefill_batch_sync(&mut self, batch: PreparedPrefillBatch) {
         let requests = batch.requests();
+        if batch.uses_paged {
+            self.reclaim_for_paged_appends(
+                requests
+                    .iter()
+                    .map(|request| (request.slot_idx, request.tokens.len())),
+            );
+        }
         let forward_result = self.model.forward_prefill_batch(
             &requests,
             &mut self.states,
@@ -680,6 +687,13 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let requests = batch.requests();
+        if batch.uses_paged {
+            self.reclaim_for_paged_appends(
+                requests
+                    .iter()
+                    .map(|request| (request.slot_idx, request.tokens.len())),
+            );
+        }
         let prefill_ctx = self
             .prefill_ctx
             .as_mut()

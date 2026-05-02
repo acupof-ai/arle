@@ -210,6 +210,14 @@ struct Args {
     #[arg(long)]
     t1_host_pinned_keepalive_ticks: Option<u64>,
 
+    /// Explicit host-pinned T1 pool capacity in MiB.
+    #[arg(long)]
+    t1_host_pinned_capacity_mb: Option<usize>,
+
+    /// Minimum prompt length before session prefixes are eligible for T1 swap.
+    #[arg(long)]
+    t1_host_pinned_min_prompt_tokens: Option<usize>,
+
     /// Root directory for the node-local T2 disk store.
     #[arg(long)]
     disk_store_root: Option<PathBuf>,
@@ -595,6 +603,12 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
     if let Some(keepalive_ticks) = args.t1_host_pinned_keepalive_ticks {
         config.t1_host_pinned_keepalive_ticks = keepalive_ticks;
     }
+    if let Some(capacity_mb) = args.t1_host_pinned_capacity_mb {
+        config.t1_host_pinned_capacity_bytes = Some(capacity_mb.saturating_mul(1024 * 1024));
+    }
+    if let Some(min_prompt_tokens) = args.t1_host_pinned_min_prompt_tokens {
+        config.t1_host_pinned_min_prompt_tokens = min_prompt_tokens;
+    }
     if let Some(root) = args.disk_store_root.as_ref() {
         config.disk_store_root = root.clone();
     }
@@ -630,6 +644,8 @@ fn log_tier_config_overrides(args: &Args) {
     if args.t1_host_pinned_high_water.is_none()
         && args.t1_host_pinned_low_water.is_none()
         && args.t1_host_pinned_keepalive_ticks.is_none()
+        && args.t1_host_pinned_capacity_mb.is_none()
+        && args.t1_host_pinned_min_prompt_tokens.is_none()
         && args.disk_store_root.is_none()
         && args.cluster_shared_root.is_none()
     {
@@ -637,7 +653,7 @@ fn log_tier_config_overrides(args: &Args) {
     }
 
     info!(
-        "Tier config: t1_high_water={}, t1_low_water={}, t1_keepalive_ticks={}, disk_store_root={}, cluster_shared_root={}",
+        "Tier config: t1_high_water={}, t1_low_water={}, t1_keepalive_ticks={}, t1_capacity_mb={}, t1_min_prompt_tokens={}, disk_store_root={}, cluster_shared_root={}",
         args.t1_host_pinned_high_water
             .map(|value| value.to_string())
             .unwrap_or_else(|| "default".to_string()),
@@ -645,6 +661,12 @@ fn log_tier_config_overrides(args: &Args) {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "default".to_string()),
         args.t1_host_pinned_keepalive_ticks
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        args.t1_host_pinned_capacity_mb
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        args.t1_host_pinned_min_prompt_tokens
             .map(|value| value.to_string())
             .unwrap_or_else(|| "default".to_string()),
         args.disk_store_root

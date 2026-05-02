@@ -72,14 +72,11 @@ pub struct Scheduler<M: ModelForward> {
     /// on which pool pages must survive a slot's `free_slot` call.
     /// Owned by the single-writer scheduler thread, no lock needed.
     ///
-    /// The `BlockId`s stored under each node are **real physical pool
-    /// page indices** pulled from `paged_kv_pool.token_indices(slot_idx)`
-    /// at publish time. The pool's `page_ref_count` tracks how many radix
-    /// nodes reference each page, and `free_slot` leaves pinned pages in
-    /// limbo instead of returning them to the free list. CUDA admission now
-    /// consults this radix-owned state to pick a reusable free slot, but
-    /// reuse is still limited to slots whose contiguous state remains
-    /// materialized; cross-slot page aliasing is intentionally unsupported.
+    /// T0 `BlockId`s are real physical pool page indices pulled from
+    /// `paged_kv_pool.token_indices(slot_idx)` at publish time. Once a block
+    /// demotes below T0 it is retagged to a scheduler-owned logical id so
+    /// released GPU pages can be reused without colliding with retained T1
+    /// radix entries.
     pub(super) prefix_cache: RadixCache,
     pub(super) disk_store: Arc<DiskStore>,
     pub(super) cluster_shared_backend: Option<ClusterSharedBackend>,
@@ -93,11 +90,15 @@ pub struct Scheduler<M: ModelForward> {
     /// non-contiguous ranges after a few alloc/free cycles. This map
     /// keeps the full span so eviction can release the right pages.
     ///
-    /// Invariant: every `BlockId` inserted into `prefix_cache` has
-    /// an entry here with exactly `prefix_cache.block_size()` pages,
-    /// and every page in the value appears in `page_ref_count > 0`.
-    /// Entries are removed when eviction releases the block.
+    /// Invariant: every T0 `BlockId` in `prefix_cache` has an entry here with
+    /// exactly `prefix_cache.block_size()` pages, and every page in the value
+    /// appears in `page_ref_count > 0`. Entries are removed when the block
+    /// demotes or is evicted.
     pub(super) block_to_pages: HashMap<BlockId, Vec<u32>>,
+    /// High-range logical ids for non-GPU cached blocks. GPU block ids are page
+    /// indices, so allocating host ids from the top of `u32` keeps the two
+    /// spaces disjoint in a single scheduler process.
+    pub(super) next_tier_block_id: u32,
     /// Best-effort mapping from a radix block to the free slot whose
     /// contiguous state still materializes that prefix. This is intentionally
     /// separate from `prefix_cache`: the radix owns reusable bytes / page pins,
@@ -326,6 +327,7 @@ impl<M: ModelForward> Scheduler<M> {
         session_id: Option<&crate::types::SessionId>,
         keepalive_ticks: u64,
         track_slot_owner: bool,
+        host_swap_eligible: bool,
     ) where
         I: IntoIterator<Item = (BlockId, Vec<u32>)>,
     {
@@ -345,6 +347,7 @@ impl<M: ModelForward> Scheduler<M> {
                     }),
                     byte_len: Some(block_byte_len),
                     session_id: Some(session_id.cloned()),
+                    host_swap_eligible: Some(host_swap_eligible),
                     soft_pin_until: Some(keepalive_deadline),
                     entry_state: None,
                     ..BlockMetadataUpdate::default()
@@ -363,6 +366,21 @@ impl<M: ModelForward> Scheduler<M> {
             }),
             _ => None,
         }
+    }
+
+    fn allocate_tier_block_id(&mut self) -> Result<BlockId> {
+        while self.next_tier_block_id > self.paged_kv_pool.max_total_pages as u32 {
+            let block_id = BlockId(self.next_tier_block_id);
+            self.next_tier_block_id = self.next_tier_block_id.saturating_sub(1);
+            if self.prefix_cache.block_metadata(block_id).is_none()
+                && !self.block_to_pages.contains_key(&block_id)
+            {
+                return Ok(block_id);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "exhausted logical block ids for tiered KV demotion"
+        ))
     }
 
     pub(super) fn build_staged_prefix_plan(
@@ -441,23 +459,45 @@ impl<M: ModelForward> Scheduler<M> {
         demote_high_water.saturating_sub(reserved_bytes)
     }
 
-    fn demote_block_budget(&self, candidates: &[BlockId]) -> usize {
-        let Some(first_block) = candidates.first().copied() else {
-            return 0;
-        };
-        let Some(metadata) = self.block_metadata(first_block) else {
-            return 0;
-        };
-        let block_bytes = metadata.byte_len as usize;
-        if block_bytes == 0 {
+    fn evict_host_blocks_for_demote_headroom(&mut self, required_bytes: usize) -> usize {
+        if required_bytes == 0 || self.host_pool_demote_headroom_bytes() >= required_bytes {
             return 0;
         }
-        let store_submit_headroom = coordinator_submit_headroom(
-            self.coordinator_queue_stats().capacity,
-            self.coordinator_queue_stats().active(),
-        );
-        let host_demote_headroom = self.host_pool_demote_headroom_bytes() / block_bytes;
-        store_submit_headroom.min(host_demote_headroom)
+
+        let mut released_bytes = 0usize;
+        let max_passes = self.prefix_cache.cached_block_count();
+        for _ in 0..max_passes {
+            if self.host_pool_demote_headroom_bytes() >= required_bytes {
+                break;
+            }
+            let evicted = self.prefix_cache.evict_with_policy_for_intent(
+                &SessionBiasedLru::default(),
+                self.eviction_signals(),
+                1,
+                Some(crate::kv_tier::Tier::HostPinned),
+                BlockSelectionIntent::Drain,
+            );
+            if evicted.is_empty() {
+                break;
+            }
+            released_bytes = released_bytes.saturating_add(
+                evicted
+                    .iter()
+                    .filter_map(|block_id| self.block_metadata(*block_id))
+                    .filter_map(|metadata| Self::host_region_from_metadata(&metadata))
+                    .map(|region| region.len)
+                    .sum::<usize>(),
+            );
+            self.drop_cached_blocks(&evicted);
+        }
+
+        if released_bytes > 0 {
+            info!(
+                "host tier retention eviction: released {:.1}MB of T1 leaf blocks for demotion headroom",
+                released_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+        released_bytes
     }
 
     pub(super) fn release_host_region(&self, region: crate::kv_tier::HostPinnedRegion) {
@@ -739,6 +779,24 @@ impl<M: ModelForward> Scheduler<M> {
     ) -> usize {
         self.paged_kv_pool
             .append_pages_needed(slot_idx, additional_tokens)
+    }
+
+    pub(super) fn reclaim_for_paged_appends<I>(&mut self, appends: I) -> usize
+    where
+        I: IntoIterator<Item = (usize, usize)>,
+    {
+        if !self.paged_kv_pool.is_active() {
+            return 0;
+        }
+        let required_pages = appends
+            .into_iter()
+            .map(|(slot_idx, tokens)| self.additional_pages_needed_for_slot(slot_idx, tokens))
+            .sum::<usize>();
+        if required_pages > self.pool_free_pages() {
+            self.evict_prefix_cache_for_allocation(required_pages)
+        } else {
+            0
+        }
     }
 
     pub(super) fn dispatch_emit(&mut self, slot_idx: usize) {
@@ -1086,6 +1144,8 @@ impl<M: ModelForward> Scheduler<M> {
             session_id,
             self.config.prefix_cache_keepalive_ticks,
             true,
+            session_id.is_some()
+                && prompt_tokens.len() >= self.config.t1_host_pinned_min_prompt_tokens,
         );
     }
 
@@ -1104,9 +1164,23 @@ impl<M: ModelForward> Scheduler<M> {
         if !matches!(metadata.location, Some(BlockLocation::Gpu { .. })) {
             return Ok(0);
         }
+        if !metadata.host_swap_eligible {
+            return Ok(0);
+        }
         let Some(pages) = self.block_to_pages.get(&block_id).cloned() else {
             return Ok(0);
         };
+        let block_bytes = metadata.byte_len as usize;
+        if self.host_pool_demote_headroom_bytes() < block_bytes {
+            self.evict_host_blocks_for_demote_headroom(block_bytes);
+        }
+        if self.host_pool_demote_headroom_bytes() < block_bytes {
+            return Err(anyhow::anyhow!(
+                "host pinned tier has no leaf eviction headroom for block {:?} ({} bytes)",
+                block_id,
+                block_bytes
+            ));
+        }
 
         let payload = self
             .paged_kv_pool
@@ -1126,10 +1200,25 @@ impl<M: ModelForward> Scheduler<M> {
             return Err(err);
         }
 
+        let host_block_id = match self.allocate_tier_block_id() {
+            Ok(host_block_id) => host_block_id,
+            Err(err) => {
+                self.release_host_region(region);
+                return Err(err);
+            }
+        };
+        if !self.prefix_cache.retag_block(block_id, host_block_id) {
+            self.release_host_region(region);
+            return Err(anyhow::anyhow!(
+                "failed to retag demoted block {:?} as logical host block {:?}",
+                block_id,
+                host_block_id
+            ));
+        }
         self.block_to_pages.remove(&block_id);
         self.block_owner_slots.remove(&block_id);
         let _ = self.prefix_cache.update_block_metadata(
-            block_id,
+            host_block_id,
             BlockMetadataUpdate {
                 location: Some(BlockLocation::HostPinned {
                     offset: region.offset,
@@ -1205,6 +1294,7 @@ impl<M: ModelForward> Scheduler<M> {
             self.prefix_cache.cached_block_count(),
             Some(crate::kv_tier::Tier::HostPinned),
             intent,
+            false,
         );
         for block_id in candidates {
             if self.store_waiting.values().any(|pending| {
@@ -1327,10 +1417,10 @@ impl<M: ModelForward> Scheduler<M> {
             blocks_to_evict,
             Some(crate::kv_tier::Tier::Gpu),
             BlockSelectionIntent::Evict,
+            true,
         );
         let mut reclaimed_pages = 0usize;
-        let demote_budget = self.demote_block_budget(&candidates);
-        for bid in candidates.iter().take(demote_budget).copied() {
+        for bid in candidates.iter().copied() {
             match self.demote_block_to_host(bid) {
                 Ok(freed_now) => {
                     reclaimed_pages += freed_now;
@@ -1355,7 +1445,7 @@ impl<M: ModelForward> Scheduler<M> {
             if !evicted.is_empty() {
                 let dropped_pages = self.drop_cached_blocks(&evicted);
                 reclaimed_pages += dropped_pages;
-                if demote_budget == 0 {
+                if reclaimed_pages == dropped_pages {
                     warn!(
                         "prefix cache pressure fallback: host tier full, dropped {} GPU blocks ({} pages) to reclaim immediate T0 headroom",
                         evicted.len(),
@@ -1409,13 +1499,13 @@ impl<M: ModelForward> Scheduler<M> {
                 blocks_to_move,
                 Some(crate::kv_tier::Tier::Gpu),
                 BlockSelectionIntent::Evict,
+                true,
             );
             if candidates.is_empty() {
                 break;
             }
             let before = reclaimed_pages;
-            let demote_budget = self.demote_block_budget(&candidates);
-            for bid in candidates.iter().take(demote_budget).copied() {
+            for bid in candidates.iter().copied() {
                 match self.demote_block_to_host(bid) {
                     Ok(freed_now) => {
                         reclaimed_pages += freed_now;

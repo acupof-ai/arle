@@ -516,6 +516,11 @@ impl<M: ModelForward> Scheduler<M> {
         for (slot_idx, _) in &prefill_chunks {
             self.dequeue_prefill(*slot_idx);
         }
+        self.reclaim_for_paged_appends(
+            prefill_chunks
+                .iter()
+                .map(|(slot_idx, tokens)| (*slot_idx, tokens.len())),
+        );
 
         let sampling_params: Vec<crate::sampler::SamplingParams> = decode_indices
             .iter()

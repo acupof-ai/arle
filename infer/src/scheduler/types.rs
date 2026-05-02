@@ -171,6 +171,14 @@ pub struct SchedulerConfig {
     /// Prevents a just-demoted host block from being spilled back out by
     /// the same cleanup tick. Default 128 radix logical clock ticks.
     pub t1_host_pinned_keepalive_ticks: u64,
+    /// Optional explicit T1 host-pinned pool capacity in bytes. `None` keeps
+    /// the constructor's conservative auto-size; operators can raise this for
+    /// long-session swap workloads such as W4 without changing GPU KV sizing.
+    pub t1_host_pinned_capacity_bytes: Option<usize>,
+    /// Minimum prompt length that marks a session-owned prefix as eligible for
+    /// T1 swap. Blocks from shorter session prompts can still be dropped under
+    /// T0 pressure, but they do not consume host-pinned retention budget.
+    pub t1_host_pinned_min_prompt_tokens: usize,
     /// Root directory used by the session snapshot disk store.
     pub disk_store_root: PathBuf,
     /// Optional cluster-shared slower-tier backend config. The current repo-local
@@ -218,6 +226,8 @@ impl Default for SchedulerConfig {
             t1_host_pinned_high_water: 0.85,
             t1_host_pinned_low_water: 0.70,
             t1_host_pinned_keepalive_ticks: 128,
+            t1_host_pinned_capacity_bytes: None,
+            t1_host_pinned_min_prompt_tokens: 4096,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
             cluster_shared_backend: None,
         }
@@ -411,6 +421,9 @@ impl SchedulerConfig {
         }
         if self.t1_host_pinned_keepalive_ticks == 0 {
             anyhow::bail!("t1_host_pinned_keepalive_ticks must be ≥ 1");
+        }
+        if matches!(self.t1_host_pinned_capacity_bytes, Some(0)) {
+            anyhow::bail!("t1_host_pinned_capacity_bytes must be ≥ 1 when provided");
         }
         Ok(())
     }
@@ -726,6 +739,8 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_high_water, 0.85);
         assert_eq!(cfg.t1_host_pinned_low_water, 0.70);
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
+        assert_eq!(cfg.t1_host_pinned_capacity_bytes, None);
+        assert_eq!(cfg.t1_host_pinned_min_prompt_tokens, 4096);
         assert_eq!(cfg.cluster_shared_backend, None);
         assert!(cfg.validate().is_ok());
     }
@@ -972,6 +987,13 @@ mod tests {
     fn scheduler_config_rejects_zero_t1_keepalive() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.t1_host_pinned_keepalive_ticks = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_t1_capacity_override() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.t1_host_pinned_capacity_bytes = Some(0);
         assert!(cfg.validate().is_err());
     }
 

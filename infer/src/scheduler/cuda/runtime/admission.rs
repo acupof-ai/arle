@@ -762,6 +762,15 @@ impl<M: ModelForward> Scheduler<M> {
             .collect();
 
         let pages_per_block = block_size.div_ceil(self.paged_kv_pool.page_size).max(1);
+        let staged_block_count = staged_prefix
+            .blocks
+            .iter()
+            .filter(|block| block.source.is_some())
+            .count();
+        let required_promote_pages = staged_block_count.saturating_mul(pages_per_block);
+        if required_promote_pages > self.pool_free_pages() {
+            self.evict_prefix_cache_for_allocation(required_promote_pages);
+        }
         let mut promoted_pages: Vec<(
             crate::prefix_cache::BlockId,
             crate::prefix_cache::BlockId,
@@ -769,16 +778,13 @@ impl<M: ModelForward> Scheduler<M> {
         )> = Vec::new();
         let mut final_block_ids = Vec::with_capacity(staged_prefix.blocks.len());
         let mut fingerprints = Vec::with_capacity(staged_prefix.blocks.len());
+        let mut consumed_host_regions = Vec::new();
 
         for block in &staged_prefix.blocks {
             fingerprints.push(block.fingerprint);
             match &block.source {
                 None => final_block_ids.push(block.block_id),
-                Some(
-                    ReadmissionSource::HostPinned { .. }
-                    | ReadmissionSource::Disk { .. }
-                    | ReadmissionSource::Remote { .. },
-                ) => {
+                Some(source) => {
                     let fetched = fetched_by_id.get(&block.block_id).copied().ok_or_else(|| {
                         anyhow::anyhow!(
                             "missing fetched host staging for staged prefix block {:?}",
@@ -813,6 +819,9 @@ impl<M: ModelForward> Scheduler<M> {
                     );
                     promoted_pages.push((block.block_id, new_block_id, pages));
                     final_block_ids.push(new_block_id);
+                    if let ReadmissionSource::HostPinned { region } = source {
+                        consumed_host_regions.push(*region);
+                    }
                 }
             }
         }
@@ -854,7 +863,12 @@ impl<M: ModelForward> Scheduler<M> {
             session_id.as_ref(),
             self.config.prefix_cache_keepalive_ticks,
             false,
+            session_id.is_some()
+                && prompt_tokens.len() >= self.config.t1_host_pinned_min_prompt_tokens,
         );
+        for region in consumed_host_regions {
+            self.release_host_region(region);
+        }
         let (host_blocks, disk_blocks, remote_blocks) = staged_prefix.source_counts();
         self.metrics
             .record_tier_fetch_promoted(host_blocks + disk_blocks + remote_blocks);

@@ -202,15 +202,19 @@ impl<M: ModelForward> Scheduler<M> {
             )?
         };
         let host_block_bytes = paged_kv_pool.storage_bytes_for_tokens(PREFIX_CACHE_BLOCK_SIZE);
-        let host_pool_capacity = host_block_bytes
+        let default_host_pool_capacity = host_block_bytes
             .saturating_mul(config.max_slots.saturating_mul(16).max(1))
             .max(64 * 1024 * 1024);
+        let host_pool_capacity = config
+            .t1_host_pinned_capacity_bytes
+            .unwrap_or(default_host_pool_capacity)
+            .max(host_block_bytes);
         let host_pinned_pool = crate::kv_tier::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(host_pool_capacity)?,
         );
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, schedule_policy={}, prefix_cache={}, short_prompt_bypass_tokens={}, stream_interval={}, host_pool={:.1}MB",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, schedule_policy={}, prefix_cache={}, short_prompt_bypass_tokens={}, stream_interval={}, host_pool={:.1}MB, t1_min_prompt_tokens={}",
             model_id,
             config.max_slots,
             seed,
@@ -231,6 +235,7 @@ impl<M: ModelForward> Scheduler<M> {
             config.short_prompt_bypass_tokens,
             config.stream_interval,
             host_pool_capacity as f64 / 1e6,
+            config.t1_host_pinned_min_prompt_tokens,
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
@@ -269,6 +274,7 @@ impl<M: ModelForward> Scheduler<M> {
             tier_policy: TieredKvPolicy::default(),
             host_pinned_pool,
             block_to_pages: HashMap::new(),
+            next_tier_block_id: u32::MAX,
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,
             coordinator_handle,
