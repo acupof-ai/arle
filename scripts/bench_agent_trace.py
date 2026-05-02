@@ -50,6 +50,7 @@ import argparse
 import asyncio
 import datetime as _dt
 import json
+import random
 import statistics
 import sys
 import time
@@ -64,6 +65,37 @@ except ImportError:
 
 
 DEFAULT_TRACE = Path(__file__).parent / "data" / "agent_trace_default.jsonl"
+WORKLOAD_TRACE = "trace"
+WORKLOAD_W3 = "agent-w3-short-multiturn"
+W3_SEED = 20260502
+W3_WARM_SESSIONS = 64
+W3_COLD_SESSIONS = 64
+W3_SCORED_WARM_TURNS_PER_SESSION = 4
+W3_CONCURRENCY = 16
+W3_MAX_TOKENS = 64
+W3_BASE_PROMPT_TOKENS = 1024
+W3_BASE_PROMPT_JITTER = 32
+W3_USER_TAIL_TOKENS = 64
+W3_USER_TAIL_JITTER = 8
+
+_TOKENISH_WORDS = (
+    "agent",
+    "plan",
+    "trace",
+    "state",
+    "cache",
+    "slot",
+    "query",
+    "reply",
+    "task",
+    "step",
+    "tool",
+    "result",
+    "memory",
+    "record",
+    "window",
+    "prefix",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -75,7 +107,8 @@ DEFAULT_TRACE = Path(__file__).parent / "data" / "agent_trace_default.jsonl"
 class Session:
     session_id: str
     system_prompt: str
-    turns: list[dict[str, str]]
+    turns: list[dict[str, Any]]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, obj: dict[str, Any]) -> "Session":
@@ -93,7 +126,15 @@ class Session:
                 raise ValueError(
                     f"session {session_id!r} turn {i} content must be a string"
                 )
-        return cls(session_id=session_id, system_prompt=system_prompt, turns=turns)
+        metadata = obj.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError(f"session {session_id!r} metadata must be an object")
+        return cls(
+            session_id=session_id,
+            system_prompt=system_prompt,
+            turns=turns,
+            metadata=metadata,
+        )
 
 
 @dataclass
@@ -106,13 +147,19 @@ class TurnResult:
     itl_ms: float | None
     tokens_out: int
     finish_reason: str | None
+    turn_kind: str = "trace"
+    scored: bool = True
+    expected_prompt_tokens: int | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
             "turn_idx": self.turn_idx,
+            "turn_kind": self.turn_kind,
+            "scored": self.scored,
             "prompt_messages": self.prompt_messages,
+            "expected_prompt_tokens": self.expected_prompt_tokens,
             "wall_ms": round(self.wall_ms, 2),
             "ttft_ms": round(self.ttft_ms, 2) if self.ttft_ms is not None else None,
             "itl_ms": round(self.itl_ms, 2) if self.itl_ms is not None else None,
@@ -167,6 +214,7 @@ class RunStats:
     server: str
     trace_path: str
     num_concurrent: int
+    workload: str
     timestamp: str
     turns: list[TurnResult] = field(default_factory=list)
     # Optional server-side probes taken before/after the run. `None`
@@ -180,6 +228,7 @@ class RunStats:
             "server": self.server,
             "trace": self.trace_path,
             "num_concurrent": self.num_concurrent,
+            "workload": self.workload,
             "timestamp": self.timestamp,
             "turns": [t.to_dict() for t in self.turns],
             "stats_before": self.stats_before.to_dict()
@@ -248,6 +297,244 @@ def load_trace(path: Path) -> list[Session]:
     return sessions
 
 
+def _tokenish_text(label: str, count: int, salt: int) -> str:
+    words: list[str] = []
+    if count >= 4:
+        words.extend(["session", label, "unique", str(salt)])
+    while len(words) < count:
+        idx = (len(words) + salt) % len(_TOKENISH_WORDS)
+        words.append(_TOKENISH_WORDS[idx])
+    return " ".join(words[:count])
+
+
+def _assistant_stub(session_idx: int, turn: int) -> str:
+    return (
+        f"Recorded session {session_idx:03d} turn {turn}. "
+        "I will preserve the prior context and continue concisely."
+    )
+
+
+def _w3_prompt_len(rng: random.Random, center: int, jitter: int) -> int:
+    return center + rng.randint(-jitter, jitter)
+
+
+def generate_w3_short_multiturn_trace() -> list[Session]:
+    """Build the W3 canonical trace from the agent-load bench spec.
+
+    The generated trace has 64 warm sessions with one unscored base turn plus
+    four scored same-session warm turns, and 64 scored cold distractor sessions.
+    Scored turns therefore split 256 warm / 64 cold = 80% warm.
+    """
+    rng = random.Random(W3_SEED)
+    warm_sessions: list[Session] = []
+    cold_sessions: list[Session] = []
+    system_prompt = (
+        "You are a concise agent runtime benchmark assistant. "
+        "Keep answers short and preserve session context exactly."
+    )
+
+    for session_idx in range(W3_WARM_SESSIONS):
+        turns: list[dict[str, Any]] = []
+        base_tokens = _w3_prompt_len(rng, W3_BASE_PROMPT_TOKENS, W3_BASE_PROMPT_JITTER)
+        turns.append(
+            {
+                "role": "user",
+                "content": _tokenish_text(
+                    f"warm-{session_idx:03d}-base", base_tokens, session_idx
+                ),
+                "bench_kind": "warmup",
+                "scored": False,
+                "expected_prompt_tokens": base_tokens,
+            }
+        )
+        turns.append(
+            {
+                "role": "assistant",
+                "content": _assistant_stub(session_idx, 0),
+                "bench_kind": "history",
+                "scored": False,
+            }
+        )
+
+        expected_prompt_tokens = base_tokens
+        for scored_turn in range(1, W3_SCORED_WARM_TURNS_PER_SESSION + 1):
+            tail_tokens = _w3_prompt_len(
+                rng, W3_USER_TAIL_TOKENS, W3_USER_TAIL_JITTER
+            )
+            expected_prompt_tokens += tail_tokens
+            turns.append(
+                {
+                    "role": "user",
+                    "content": _tokenish_text(
+                        f"warm-{session_idx:03d}-tail-{scored_turn}",
+                        tail_tokens,
+                        session_idx + scored_turn * 97,
+                    ),
+                    "bench_kind": "warm",
+                    "scored": True,
+                    "expected_prompt_tokens": expected_prompt_tokens,
+                    "shared_prefix_min_ratio": 0.8,
+                }
+            )
+            if scored_turn != W3_SCORED_WARM_TURNS_PER_SESSION:
+                turns.append(
+                    {
+                        "role": "assistant",
+                        "content": _assistant_stub(session_idx, scored_turn),
+                        "bench_kind": "history",
+                        "scored": False,
+                    }
+                )
+
+        warm_sessions.append(
+            Session(
+                session_id=f"w3-warm-{session_idx:03d}",
+                system_prompt=system_prompt,
+                turns=turns,
+                metadata={
+                    "workload": WORKLOAD_W3,
+                    "session_kind": "warm",
+                    "seed": W3_SEED,
+                    "scored_warm_turns": W3_SCORED_WARM_TURNS_PER_SESSION,
+                },
+            )
+        )
+
+    for session_idx in range(W3_COLD_SESSIONS):
+        cold_tokens = _w3_prompt_len(
+            rng, W3_BASE_PROMPT_TOKENS, W3_BASE_PROMPT_JITTER
+        )
+        cold_sessions.append(
+            Session(
+                session_id=f"w3-cold-{session_idx:03d}",
+                system_prompt=system_prompt,
+                turns=[
+                    {
+                        "role": "user",
+                        "content": _tokenish_text(
+                            f"cold-{session_idx:03d}",
+                            cold_tokens,
+                            10_000 + session_idx,
+                        ),
+                        "bench_kind": "cold",
+                        "scored": True,
+                        "expected_prompt_tokens": cold_tokens,
+                    }
+                ],
+                metadata={
+                    "workload": WORKLOAD_W3,
+                    "session_kind": "cold",
+                    "seed": W3_SEED,
+                },
+            )
+        )
+
+    sessions = []
+    for warm_session, cold_session in zip(warm_sessions, cold_sessions):
+        sessions.append(warm_session)
+        sessions.append(cold_session)
+
+    _validate_w3_shape(sessions)
+    return sessions
+
+
+def _validate_w3_shape(sessions: list[Session]) -> None:
+    warm_sessions = [s for s in sessions if s.metadata.get("session_kind") == "warm"]
+    cold_sessions = [s for s in sessions if s.metadata.get("session_kind") == "cold"]
+    warm_scored = sum(
+        1
+        for session in warm_sessions
+        for turn in session.turns
+        if turn.get("role") == "user"
+        and turn.get("bench_kind") == "warm"
+        and bool(turn.get("scored", True))
+    )
+    cold_scored = sum(
+        1
+        for session in cold_sessions
+        for turn in session.turns
+        if turn.get("role") == "user"
+        and turn.get("bench_kind") == "cold"
+        and bool(turn.get("scored", True))
+    )
+    if len(warm_sessions) != W3_WARM_SESSIONS:
+        raise RuntimeError(f"W3 warm session count mismatch: {len(warm_sessions)}")
+    if len(cold_sessions) != W3_COLD_SESSIONS:
+        raise RuntimeError(f"W3 cold session count mismatch: {len(cold_sessions)}")
+    if warm_scored != W3_WARM_SESSIONS * W3_SCORED_WARM_TURNS_PER_SESSION:
+        raise RuntimeError(f"W3 scored warm turn count mismatch: {warm_scored}")
+    if cold_scored != W3_COLD_SESSIONS:
+        raise RuntimeError(f"W3 scored cold turn count mismatch: {cold_scored}")
+    scored_total = warm_scored + cold_scored
+    if scored_total == 0 or warm_scored / scored_total < 0.8:
+        raise RuntimeError("W3 warm scored ratio fell below 80%")
+
+
+def _session_to_json_obj(session: Session) -> dict[str, Any]:
+    return {
+        "session_id": session.session_id,
+        "system_prompt": session.system_prompt,
+        "turns": session.turns,
+        "metadata": session.metadata,
+    }
+
+
+def write_trace_jsonl(sessions: list[Session], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for session in sessions:
+            json.dump(_session_to_json_obj(session), f, ensure_ascii=False)
+            f.write("\n")
+
+
+def _load_or_generate_sessions(args: argparse.Namespace) -> tuple[list[Session], str]:
+    if args.workload == WORKLOAD_W3:
+        sessions = generate_w3_short_multiturn_trace()
+        trace_ref = f"generated:{WORKLOAD_W3}"
+        if args.trace_out is not None:
+            trace_path = Path(args.trace_out).expanduser().resolve()
+            write_trace_jsonl(sessions, trace_path)
+            trace_ref = str(trace_path)
+        return sessions, trace_ref
+
+    trace_path = Path(args.trace).expanduser().resolve()
+    if not trace_path.is_file():
+        raise SystemExit(f"trace file not found: {trace_path}")
+    return load_trace(trace_path), str(trace_path)
+
+
+def print_trace_generation_summary(sessions: list[Session], trace_ref: str) -> None:
+    warm_scored = sum(
+        1
+        for session in sessions
+        for turn in session.turns
+        if turn.get("bench_kind") == "warm" and bool(turn.get("scored", True))
+    )
+    cold_scored = sum(
+        1
+        for session in sessions
+        for turn in session.turns
+        if turn.get("bench_kind") == "cold" and bool(turn.get("scored", True))
+    )
+    warmup = sum(
+        1
+        for session in sessions
+        for turn in session.turns
+        if turn.get("bench_kind") == "warmup"
+    )
+    scored_total = warm_scored + cold_scored
+    warm_ratio = warm_scored / scored_total if scored_total else 0.0
+    print(f"trace: {trace_ref}")
+    print(f"sessions: {len(sessions)}")
+    print(f"warmup turns: {warmup}")
+    print(f"scored warm turns: {warm_scored}")
+    print(f"scored cold turns: {cold_scored}")
+    print(f"scored warm ratio: {warm_ratio:.3f}")
+    if sessions:
+        print("sample session:")
+        print(json.dumps(_session_to_json_obj(sessions[0]), ensure_ascii=False)[:1200])
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Replayer core
 # ─────────────────────────────────────────────────────────────────────
@@ -268,6 +555,19 @@ def _build_messages(session: Session, up_to_turn: int) -> list[dict[str, str]]:
     return messages
 
 
+def _turn_kind(session: Session, turn_idx: int) -> str:
+    return str(session.turns[turn_idx].get("bench_kind", "trace"))
+
+
+def _turn_scored(session: Session, turn_idx: int) -> bool:
+    return bool(session.turns[turn_idx].get("scored", True))
+
+
+def _turn_expected_prompt_tokens(session: Session, turn_idx: int) -> int | None:
+    value = session.turns[turn_idx].get("expected_prompt_tokens")
+    return value if isinstance(value, int) else None
+
+
 async def _stream_one_turn(
     client: httpx.AsyncClient,
     server: str,
@@ -277,6 +577,9 @@ async def _stream_one_turn(
 ) -> TurnResult:
     """Send one turn's request and measure TTFT / ITL / wall."""
     messages = _build_messages(session, turn_idx)
+    turn_kind = _turn_kind(session, turn_idx)
+    scored = _turn_scored(session, turn_idx)
+    expected_prompt_tokens = _turn_expected_prompt_tokens(session, turn_idx)
     body = {
         "model": "default",
         "messages": messages,
@@ -311,6 +614,9 @@ async def _stream_one_turn(
                     itl_ms=None,
                     tokens_out=0,
                     finish_reason=None,
+                    turn_kind=turn_kind,
+                    scored=scored,
+                    expected_prompt_tokens=expected_prompt_tokens,
                     error=f"HTTP {resp.status_code}: {body_bytes.decode(errors='replace')[:200]}",
                 )
             async for line in resp.aiter_lines():
@@ -350,6 +656,9 @@ async def _stream_one_turn(
             itl_ms=None,
             tokens_out=tokens_out,
             finish_reason=None,
+            turn_kind=turn_kind,
+            scored=scored,
+            expected_prompt_tokens=expected_prompt_tokens,
             error=f"{type(e).__name__}: {e}",
         )
 
@@ -366,6 +675,9 @@ async def _stream_one_turn(
         itl_ms=itl,
         tokens_out=tokens_out,
         finish_reason=finish_reason,
+        turn_kind=turn_kind,
+        scored=scored,
+        expected_prompt_tokens=expected_prompt_tokens,
     )
 
 
@@ -404,20 +716,18 @@ async def _drive_session(
 
 
 async def run_benchmark(args: argparse.Namespace) -> RunStats:
-    trace_path = Path(args.trace).expanduser().resolve()
-    if not trace_path.is_file():
-        raise SystemExit(f"trace file not found: {trace_path}")
-    sessions = load_trace(trace_path)
+    sessions, trace_ref = _load_or_generate_sessions(args)
     print(
-        f"[bench_agent_trace] loaded {len(sessions)} sessions from {trace_path}",
+        f"[bench_agent_trace] loaded {len(sessions)} sessions from {trace_ref}",
         file=sys.stderr,
     )
 
     stats = RunStats(
         label=args.label,
         server=args.server,
-        trace_path=str(trace_path),
+        trace_path=trace_ref,
         num_concurrent=args.num_concurrent,
+        workload=args.workload,
         timestamp=_dt.datetime.now(_dt.timezone.utc).isoformat(),
     )
 
@@ -462,7 +772,7 @@ def _fmt_ms(v: float | None) -> str:
 
 def print_report(stats: RunStats) -> None:
     header = (
-        "session          turn  msgs   wall(ms)  ttft(ms)   itl(ms)  tokens  finish"
+        "session          kind      turn  msgs   wall(ms)  ttft(ms)   itl(ms)  tokens  finish"
     )
     sep = "─" * len(header)
     print()
@@ -476,6 +786,7 @@ def print_report(stats: RunStats) -> None:
     for t in stats.turns:
         tag = (
             f"{t.session_id:15s}  "
+            f"{t.turn_kind[:8]:8s}  "
             f"{t.turn_idx:4d}  "
             f"{t.prompt_messages:4d}  "
             f"{_fmt_ms(t.wall_ms):>9s}  "
@@ -497,10 +808,12 @@ def _print_aggregate(stats: RunStats) -> None:
         print("\nno successful turns — check server logs")
         _print_server_probe(stats)
         return
-    ttfts = [t.ttft_ms for t in ok_turns if t.ttft_ms is not None]
-    itls = [t.itl_ms for t in ok_turns if t.itl_ms is not None]
-    tokens_total = sum(t.tokens_out for t in ok_turns)
-    wall_total = sum(t.wall_ms for t in ok_turns)
+    scored_turns = [t for t in ok_turns if t.scored]
+    aggregate_turns = scored_turns or ok_turns
+    ttfts = [t.ttft_ms for t in aggregate_turns if t.ttft_ms is not None]
+    itls = [t.itl_ms for t in aggregate_turns if t.itl_ms is not None]
+    tokens_total = sum(t.tokens_out for t in aggregate_turns)
+    wall_total = sum(t.wall_ms for t in aggregate_turns)
 
     def pct(xs: list[float], p: float) -> float:
         if not xs:
@@ -511,14 +824,40 @@ def _print_aggregate(stats: RunStats) -> None:
 
     print()
     print(f"turns OK:        {len(ok_turns)} / {len(stats.turns)}")
+    if scored_turns:
+        print(f"scored turns OK: {len(scored_turns)}")
     print(f"tokens total:    {tokens_total}")
     print(f"wall total (s):  {wall_total / 1000:.2f}")
     if ttfts:
         print(f"TTFT p50/p99:    {pct(ttfts, 50):.1f} / {pct(ttfts, 99):.1f} ms")
     if itls:
         print(f"ITL  p50/p99:    {pct(itls, 50):.1f} / {pct(itls, 99):.1f} ms")
+    _print_w3_aggregate(aggregate_turns, pct)
 
     _print_server_probe(stats)
+
+
+def _print_w3_aggregate(
+    aggregate_turns: list[TurnResult],
+    pct: Any,
+) -> None:
+    warm = [t for t in aggregate_turns if t.turn_kind == "warm"]
+    cold = [t for t in aggregate_turns if t.turn_kind == "cold"]
+    if not warm and not cold:
+        return
+
+    def ttft_pair(turns: list[TurnResult]) -> tuple[str, str]:
+        ttfts = [t.ttft_ms for t in turns if t.ttft_ms is not None]
+        if not ttfts:
+            return "—", "—"
+        return f"{pct(ttfts, 50):.1f}", f"{pct(ttfts, 99):.1f}"
+
+    warm_p50, warm_p99 = ttft_pair(warm)
+    cold_p50, cold_p99 = ttft_pair(cold)
+    print()
+    print("W3 scored split:")
+    print(f"  warm turns: {len(warm)} TTFT p50/p99={warm_p50}/{warm_p99} ms")
+    print(f"  cold turns: {len(cold)} TTFT p50/p99={cold_p50}/{cold_p99} ms")
 
 
 def _print_server_probe(stats: RunStats) -> None:
@@ -584,6 +923,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Multi-turn agent trace replayer for Tiered KV Cache scoreboard",
     )
     p.add_argument(
+        "--workload",
+        choices=(WORKLOAD_TRACE, WORKLOAD_W3),
+        default=WORKLOAD_TRACE,
+        help=(
+            "Trace source. 'trace' replays --trace; "
+            f"'{WORKLOAD_W3}' generates the W3 canonical workload."
+        ),
+    )
+    p.add_argument(
         "--server",
         default="http://localhost:8000",
         help="OpenAI-compatible server URL (default: %(default)s)",
@@ -601,19 +949,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--num-concurrent",
         type=int,
-        default=4,
-        help="Max concurrent in-flight turns across all sessions (default: %(default)s)",
+        default=None,
+        help=(
+            "Max concurrent in-flight turns across all sessions. "
+            "Default: 4 for --workload trace, 16 for W3."
+        ),
     )
     p.add_argument(
         "--max-tokens",
         type=int,
-        default=256,
-        help="Per-turn generation cap (default: %(default)s)",
+        default=None,
+        help="Per-turn generation cap. Default: 256 for --workload trace, 64 for W3.",
     )
     p.add_argument(
         "--out",
         default=None,
         help="Optional JSON snapshot output path",
+    )
+    p.add_argument(
+        "--trace-out",
+        default=None,
+        help="Optional JSONL output path for generated workload traces.",
+    )
+    p.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="Generate the selected workload trace and exit without HTTP requests.",
     )
     p.add_argument(
         "--probe-stats",
@@ -625,11 +986,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "when running against servers that do not expose /v1/stats."
         ),
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    _resolve_workload_defaults(args)
+    return args
+
+
+def _resolve_workload_defaults(args: argparse.Namespace) -> None:
+    if args.workload == WORKLOAD_W3:
+        if args.num_concurrent is not None and args.num_concurrent != W3_CONCURRENCY:
+            raise SystemExit(
+                f"{WORKLOAD_W3} requires --num-concurrent {W3_CONCURRENCY}"
+            )
+        if args.max_tokens is not None and args.max_tokens != W3_MAX_TOKENS:
+            raise SystemExit(f"{WORKLOAD_W3} requires --max-tokens {W3_MAX_TOKENS}")
+        args.num_concurrent = W3_CONCURRENCY
+        args.max_tokens = W3_MAX_TOKENS
+        return
+
+    if args.num_concurrent is None:
+        args.num_concurrent = 4
+    if args.max_tokens is None:
+        args.max_tokens = 256
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.generate_only:
+        sessions, trace_ref = _load_or_generate_sessions(args)
+        print_trace_generation_summary(sessions, trace_ref)
+        return 0
     try:
         stats = asyncio.run(run_benchmark(args))
     except KeyboardInterrupt:
