@@ -67,6 +67,7 @@ except ImportError:
 DEFAULT_TRACE = Path(__file__).parent / "data" / "agent_trace_default.jsonl"
 WORKLOAD_TRACE = "trace"
 WORKLOAD_W3 = "agent-w3-short-multiturn"
+WORKLOAD_W4 = "agent-w4-tool-resume"
 W3_SEED = 20260502
 W3_WARM_SESSIONS = 64
 W3_COLD_SESSIONS = 64
@@ -77,6 +78,15 @@ W3_BASE_PROMPT_TOKENS = 1024
 W3_BASE_PROMPT_JITTER = 32
 W3_USER_TAIL_TOKENS = 64
 W3_USER_TAIL_JITTER = 8
+W4_SEED = 20260502
+W4_SESSIONS = 128
+W4_CONCURRENCY = 8
+W4_WARMUP_MAX_TOKENS = 64
+W4_RESUME_MAX_TOKENS = 256
+W4_BASE_PROMPT_TOKENS = 8192
+W4_BASE_PROMPT_JITTER = 64
+W4_TOOL_OUTPUT_TOKENS = 256
+W4_TOOL_OUTPUT_JITTER = 16
 
 _TOKENISH_WORDS = (
     "agent",
@@ -150,6 +160,7 @@ class TurnResult:
     turn_kind: str = "trace"
     scored: bool = True
     expected_prompt_tokens: int | None = None
+    request_max_tokens: int | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -160,6 +171,7 @@ class TurnResult:
             "scored": self.scored,
             "prompt_messages": self.prompt_messages,
             "expected_prompt_tokens": self.expected_prompt_tokens,
+            "request_max_tokens": self.request_max_tokens,
             "wall_ms": round(self.wall_ms, 2),
             "ttft_ms": round(self.ttft_ms, 2) if self.ttft_ms is not None else None,
             "itl_ms": round(self.itl_ms, 2) if self.itl_ms is not None else None,
@@ -438,6 +450,83 @@ def generate_w3_short_multiturn_trace() -> list[Session]:
     return sessions
 
 
+def generate_w4_tool_resume_trace() -> list[Session]:
+    """Build the W4 canonical tool-resume trace from the agent-load spec."""
+    rng = random.Random(W4_SEED)
+    sessions: list[Session] = []
+    system_prompt = (
+        "You are an agent runtime benchmark assistant. "
+        "Use tool results as authoritative context and resume directly."
+    )
+
+    for session_idx in range(W4_SESSIONS):
+        base_tokens = _w3_prompt_len(
+            rng, W4_BASE_PROMPT_TOKENS, W4_BASE_PROMPT_JITTER
+        )
+        tool_tokens = _w3_prompt_len(
+            rng, W4_TOOL_OUTPUT_TOKENS, W4_TOOL_OUTPUT_JITTER
+        )
+        tool_call_id = f"call_w4_{session_idx:03d}"
+        turns: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": _tokenish_text(
+                    f"w4-base-{session_idx:03d}", base_tokens, session_idx
+                ),
+                "bench_kind": "warmup",
+                "scored": False,
+                "expected_prompt_tokens": base_tokens,
+                "max_tokens": W4_WARMUP_MAX_TOKENS,
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "retrieve_context",
+                            "arguments": "{\"query\":\"session-context\"}",
+                        },
+                    }
+                ],
+                "bench_kind": "history",
+                "scored": False,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": _tokenish_text(
+                    f"w4-tool-{session_idx:03d}",
+                    tool_tokens,
+                    20_000 + session_idx,
+                ),
+                "bench_kind": "resume",
+                "scored": True,
+                "request_after": True,
+                "expected_prompt_tokens": base_tokens + tool_tokens,
+                "expected_tool_output_tokens": tool_tokens,
+                "max_tokens": W4_RESUME_MAX_TOKENS,
+            },
+        ]
+        sessions.append(
+            Session(
+                session_id=f"w4-session-{session_idx:03d}",
+                system_prompt=system_prompt,
+                turns=turns,
+                metadata={
+                    "workload": WORKLOAD_W4,
+                    "session_kind": "tool-resume",
+                    "seed": W4_SEED,
+                },
+            )
+        )
+
+    _validate_w4_shape(sessions)
+    return sessions
+
+
 def _validate_w3_shape(sessions: list[Session]) -> None:
     warm_sessions = [s for s in sessions if s.metadata.get("session_kind") == "warm"]
     cold_sessions = [s for s in sessions if s.metadata.get("session_kind") == "cold"]
@@ -470,6 +559,31 @@ def _validate_w3_shape(sessions: list[Session]) -> None:
         raise RuntimeError("W3 warm scored ratio fell below 80%")
 
 
+def _validate_w4_shape(sessions: list[Session]) -> None:
+    warmup = 0
+    resume = 0
+    for session in sessions:
+        for turn in session.turns:
+            if turn.get("bench_kind") == "warmup":
+                warmup += 1
+                if turn.get("max_tokens") != W4_WARMUP_MAX_TOKENS:
+                    raise RuntimeError("W4 warmup max_tokens mismatch")
+            if turn.get("bench_kind") == "resume":
+                resume += 1
+                if not turn.get("request_after"):
+                    raise RuntimeError("W4 resume turn must set request_after")
+                if not turn.get("scored", False):
+                    raise RuntimeError("W4 resume turn must be scored")
+                if turn.get("max_tokens") != W4_RESUME_MAX_TOKENS:
+                    raise RuntimeError("W4 resume max_tokens mismatch")
+    if len(sessions) != W4_SESSIONS:
+        raise RuntimeError(f"W4 session count mismatch: {len(sessions)}")
+    if warmup != W4_SESSIONS:
+        raise RuntimeError(f"W4 warmup count mismatch: {warmup}")
+    if resume != W4_SESSIONS:
+        raise RuntimeError(f"W4 resume count mismatch: {resume}")
+
+
 def _session_to_json_obj(session: Session) -> dict[str, Any]:
     return {
         "session_id": session.session_id,
@@ -491,6 +605,14 @@ def _load_or_generate_sessions(args: argparse.Namespace) -> tuple[list[Session],
     if args.workload == WORKLOAD_W3:
         sessions = generate_w3_short_multiturn_trace()
         trace_ref = f"generated:{WORKLOAD_W3}"
+        if args.trace_out is not None:
+            trace_path = Path(args.trace_out).expanduser().resolve()
+            write_trace_jsonl(sessions, trace_path)
+            trace_ref = str(trace_path)
+        return sessions, trace_ref
+    if args.workload == WORKLOAD_W4:
+        sessions = generate_w4_tool_resume_trace()
+        trace_ref = f"generated:{WORKLOAD_W4}"
         if args.trace_out is not None:
             trace_path = Path(args.trace_out).expanduser().resolve()
             write_trace_jsonl(sessions, trace_path)
@@ -522,14 +644,21 @@ def print_trace_generation_summary(sessions: list[Session], trace_ref: str) -> N
         for turn in session.turns
         if turn.get("bench_kind") == "warmup"
     )
+    resume = sum(
+        1
+        for session in sessions
+        for turn in session.turns
+        if turn.get("bench_kind") == "resume" and bool(turn.get("scored", True))
+    )
     scored_total = warm_scored + cold_scored
-    warm_ratio = warm_scored / scored_total if scored_total else 0.0
+    warm_ratio = f"{warm_scored / scored_total:.3f}" if scored_total else "n/a"
     print(f"trace: {trace_ref}")
     print(f"sessions: {len(sessions)}")
     print(f"warmup turns: {warmup}")
     print(f"scored warm turns: {warm_scored}")
     print(f"scored cold turns: {cold_scored}")
-    print(f"scored warm ratio: {warm_ratio:.3f}")
+    print(f"scored resume turns: {resume}")
+    print(f"scored warm ratio: {warm_ratio}")
     if sessions:
         print("sample session:")
         print(json.dumps(_session_to_json_obj(sessions[0]), ensure_ascii=False)[:1200])
@@ -540,19 +669,27 @@ def print_trace_generation_summary(sessions: list[Session], trace_ref: str) -> N
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _build_messages(session: Session, up_to_turn: int) -> list[dict[str, str]]:
+def _build_messages(session: Session, up_to_turn: int) -> list[dict[str, Any]]:
     """Build the `messages` array for the `up_to_turn`-th request.
 
     The request includes: system prompt + all turns 0..up_to_turn (inclusive
     of the final user turn). Assistant and tool turns in between are part
     of the growing history.
     """
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     if session.system_prompt:
         messages.append({"role": "system", "content": session.system_prompt})
     for turn in session.turns[: up_to_turn + 1]:
-        messages.append({"role": turn["role"], "content": turn["content"]})
+        message = {"role": turn["role"], "content": turn["content"]}
+        for key in ("tool_call_id", "tool_calls", "name"):
+            if key in turn:
+                message[key] = turn[key]
+        messages.append(message)
     return messages
+
+
+def _turn_requests_model(turn: dict[str, Any]) -> bool:
+    return turn.get("role") == "user" or bool(turn.get("request_after", False))
 
 
 def _turn_kind(session: Session, turn_idx: int) -> str:
@@ -568,6 +705,11 @@ def _turn_expected_prompt_tokens(session: Session, turn_idx: int) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _turn_max_tokens(session: Session, turn_idx: int, default_max_tokens: int) -> int:
+    value = session.turns[turn_idx].get("max_tokens")
+    return value if isinstance(value, int) else default_max_tokens
+
+
 async def _stream_one_turn(
     client: httpx.AsyncClient,
     server: str,
@@ -580,12 +722,13 @@ async def _stream_one_turn(
     turn_kind = _turn_kind(session, turn_idx)
     scored = _turn_scored(session, turn_idx)
     expected_prompt_tokens = _turn_expected_prompt_tokens(session, turn_idx)
+    request_max_tokens = _turn_max_tokens(session, turn_idx, max_tokens)
     body = {
         "model": "default",
         "messages": messages,
         "session_id": session.session_id,
         "stream": True,
-        "max_tokens": max_tokens,
+        "max_tokens": request_max_tokens,
         "temperature": 0.0,
     }
 
@@ -617,6 +760,7 @@ async def _stream_one_turn(
                     turn_kind=turn_kind,
                     scored=scored,
                     expected_prompt_tokens=expected_prompt_tokens,
+                    request_max_tokens=request_max_tokens,
                     error=f"HTTP {resp.status_code}: {body_bytes.decode(errors='replace')[:200]}",
                 )
             async for line in resp.aiter_lines():
@@ -659,6 +803,7 @@ async def _stream_one_turn(
             turn_kind=turn_kind,
             scored=scored,
             expected_prompt_tokens=expected_prompt_tokens,
+            request_max_tokens=request_max_tokens,
             error=f"{type(e).__name__}: {e}",
         )
 
@@ -678,6 +823,7 @@ async def _stream_one_turn(
         turn_kind=turn_kind,
         scored=scored,
         expected_prompt_tokens=expected_prompt_tokens,
+        request_max_tokens=request_max_tokens,
     )
 
 
@@ -701,7 +847,7 @@ async def _drive_session(
     """
     results: list[TurnResult] = []
     for turn_idx, turn in enumerate(session.turns):
-        if turn["role"] != "user":
+        if not _turn_requests_model(turn):
             continue
         async with semaphore:
             result = await _stream_one_turn(
@@ -833,6 +979,7 @@ def _print_aggregate(stats: RunStats) -> None:
     if itls:
         print(f"ITL  p50/p99:    {pct(itls, 50):.1f} / {pct(itls, 99):.1f} ms")
     _print_w3_aggregate(aggregate_turns, pct)
+    _print_w4_aggregate(aggregate_turns, pct)
 
     _print_server_probe(stats)
 
@@ -858,6 +1005,25 @@ def _print_w3_aggregate(
     print("W3 scored split:")
     print(f"  warm turns: {len(warm)} TTFT p50/p99={warm_p50}/{warm_p99} ms")
     print(f"  cold turns: {len(cold)} TTFT p50/p99={cold_p50}/{cold_p99} ms")
+
+
+def _print_w4_aggregate(
+    aggregate_turns: list[TurnResult],
+    pct: Any,
+) -> None:
+    resume = [t for t in aggregate_turns if t.turn_kind == "resume"]
+    if not resume:
+        return
+    ttfts = [t.ttft_ms for t in resume if t.ttft_ms is not None]
+    walls = [t.wall_ms for t in resume]
+    ttft_p50 = f"{pct(ttfts, 50):.1f}" if ttfts else "—"
+    ttft_p99 = f"{pct(ttfts, 99):.1f}" if ttfts else "—"
+    wall_p50 = f"{pct(walls, 50):.1f}" if walls else "—"
+    wall_p99 = f"{pct(walls, 99):.1f}" if walls else "—"
+    print()
+    print("W4 scored resume:")
+    print(f"  resume turns: {len(resume)} TTFT p50/p99={ttft_p50}/{ttft_p99} ms")
+    print(f"  resume E2E p50/p99={wall_p50}/{wall_p99} ms")
 
 
 def _print_server_probe(stats: RunStats) -> None:
@@ -924,11 +1090,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--workload",
-        choices=(WORKLOAD_TRACE, WORKLOAD_W3),
+        choices=(WORKLOAD_TRACE, WORKLOAD_W3, WORKLOAD_W4),
         default=WORKLOAD_TRACE,
         help=(
             "Trace source. 'trace' replays --trace; "
-            f"'{WORKLOAD_W3}' generates the W3 canonical workload."
+            f"'{WORKLOAD_W3}' and '{WORKLOAD_W4}' generate canonical workloads."
         ),
     )
     p.add_argument(
@@ -952,14 +1118,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Max concurrent in-flight turns across all sessions. "
-            "Default: 4 for --workload trace, 16 for W3."
+            "Default: 4 for --workload trace, 16 for W3, 8 for W4."
         ),
     )
     p.add_argument(
         "--max-tokens",
         type=int,
         default=None,
-        help="Per-turn generation cap. Default: 256 for --workload trace, 64 for W3.",
+        help=(
+            "Per-turn generation cap. Default: 256 for --workload trace, "
+            "64 for W3, 256 for W4 resume. W4 warmup uses 64."
+        ),
     )
     p.add_argument(
         "--out",
@@ -1001,6 +1170,18 @@ def _resolve_workload_defaults(args: argparse.Namespace) -> None:
             raise SystemExit(f"{WORKLOAD_W3} requires --max-tokens {W3_MAX_TOKENS}")
         args.num_concurrent = W3_CONCURRENCY
         args.max_tokens = W3_MAX_TOKENS
+        return
+    if args.workload == WORKLOAD_W4:
+        if args.num_concurrent is not None and args.num_concurrent != W4_CONCURRENCY:
+            raise SystemExit(
+                f"{WORKLOAD_W4} requires --num-concurrent {W4_CONCURRENCY}"
+            )
+        if args.max_tokens is not None and args.max_tokens != W4_RESUME_MAX_TOKENS:
+            raise SystemExit(
+                f"{WORKLOAD_W4} requires --max-tokens {W4_RESUME_MAX_TOKENS}"
+            )
+        args.num_concurrent = W4_CONCURRENCY
+        args.max_tokens = W4_RESUME_MAX_TOKENS
         return
 
     if args.num_concurrent is None:
