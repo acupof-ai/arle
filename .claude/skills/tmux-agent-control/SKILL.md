@@ -111,6 +111,10 @@ tmux send-keys -t <session>:<window> Enter Enter   # force submit
 
 **Long messages need more Enters.** For directives over ~200 chars / wrapping ≥3 visual lines, the original "Enter Enter" recipe is sometimes not enough — observed needing **4–6 Enters total** before Codex submits. If a recheck shows the message + multiple blank lines + footer (no `Working`, no `Create a plan?` hint), keep sending 2-Enter bursts and re-checking until `Working` appears or the input area clears to the `Implement {feature}` placeholder. Cap at ~10 total Enters before assuming the session is wedged and escalating (Escape + investigate).
 
+**The `Create a plan?  shift + tab use Plan mode   esc dismiss` hint.** For long directives, Codex sometimes interrupts with this hint instead of starting work. Two valid responses:
+- **Want plan-first execution** (codex drafts a plan, you review next tick before code lands): `tmux send-keys -t <s>:<w> "S-Tab"` (Shift+Tab) — enters Plan mode.
+- **Want direct execution** (the directive already has enough detail): `tmux send-keys -t <s>:<w> Escape` to dismiss the hint, then `Enter Enter Enter Enter` to actually submit (Escape only dismisses the offer; the directive stays in the input area until you Enter through it). Note: when dismissing, Escape here does NOT interrupt work because no work has started yet — different semantics from Escape during `Working`.
+
 ### 4. Verify (every send)
 
 ```bash
