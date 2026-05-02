@@ -1147,6 +1147,85 @@ fn lookup_or_stage_preserves_mixed_gpu_and_host_hits() {
 }
 
 #[test]
+fn session_lookup_uses_deep_session_block_when_shared_ancestor_was_overwritten() {
+    let mut cache = RadixCache::new(4);
+    let session_a = SessionId::from("session-a");
+    let session_b = SessionId::from("session-b");
+    let warmup: Vec<u32> = (1..=12).collect();
+    let resume: Vec<u32> = warmup.iter().copied().chain([13, 14, 15]).collect();
+    cache.insert(&warmup, &bids(&[10, 20, 30]));
+    assert!(cache.update_block_metadata(
+        BlockId(10),
+        BlockMetadataUpdate {
+            location: Some(BlockLocation::Gpu { slot: 1 }),
+            session_id: Some(Some(session_b)),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+    assert!(cache.update_block_metadata(
+        BlockId(20),
+        BlockMetadataUpdate {
+            location: Some(BlockLocation::Gpu { slot: 1 }),
+            session_id: Some(Some(session_a.clone())),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+    assert!(cache.update_block_metadata(
+        BlockId(30),
+        BlockMetadataUpdate {
+            location: Some(BlockLocation::Gpu { slot: 1 }),
+            session_id: Some(Some(session_a.clone())),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+
+    let outcome =
+        cache.lookup_session_prefix_or_stage(&session_a, &resume, LookupHeuristics::default());
+
+    assert_eq!(outcome.matched_len, 12);
+    assert_eq!(
+        outcome.blocks,
+        vec![
+            LookupBlock {
+                block_id: Some(BlockId(10)),
+                hit_kind: HitKind::ReadyOnGpu,
+            },
+            LookupBlock {
+                block_id: Some(BlockId(20)),
+                hit_kind: HitKind::ReadyOnGpu,
+            },
+            LookupBlock {
+                block_id: Some(BlockId(30)),
+                hit_kind: HitKind::ReadyOnGpu,
+            },
+        ]
+    );
+    assert_eq!(cache.block_metadata(BlockId(10)).unwrap().ref_count, 1);
+    assert_eq!(cache.block_metadata(BlockId(20)).unwrap().ref_count, 1);
+    assert_eq!(cache.block_metadata(BlockId(30)).unwrap().ref_count, 1);
+    cache.release(&[BlockId(10), BlockId(20), BlockId(30)]);
+}
+
+#[test]
+fn session_lookup_requires_a_matching_session_block_on_the_token_path() {
+    let mut cache = RadixCache::new(4);
+    let session_a = SessionId::from("session-a");
+    let session_b = SessionId::from("session-b");
+    let tokens: Vec<u32> = (1..=8).collect();
+    cache.insert(&tokens, &bids(&[10, 20]));
+    assert!(cache.set_block_session_id(BlockId(10), Some(session_a.clone())));
+    assert!(cache.set_block_session_id(BlockId(20), Some(session_a)));
+
+    let outcome =
+        cache.lookup_session_prefix_or_stage(&session_b, &tokens, LookupHeuristics::default());
+
+    assert_eq!(outcome.matched_len, 0);
+    assert!(outcome.blocks.is_empty());
+    assert_eq!(cache.block_metadata(BlockId(10)).unwrap().ref_count, 0);
+    assert_eq!(cache.block_metadata(BlockId(20)).unwrap().ref_count, 0);
+}
+
+#[test]
 fn release_before_remap_keeps_shared_prefix_reusable() {
     let mut cache = RadixCache::new(4);
     let tokens: Vec<u32> = (1..=8).collect();
