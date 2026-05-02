@@ -114,6 +114,7 @@ impl<M: ModelForward> Scheduler<M> {
         let raw_prefix_len = req.reusable_prefix_len;
         let cached_prompt_len = req.reusable_cached_prompt_len;
         let attached_prefix_blocks = req.attached_prefix_blocks.clone();
+        let session_id = req.session_id.clone();
         let si = slot_idx;
         let prefix_trace = req.begin_trace_span("prefix").map(|span| {
             span.with_properties(|| {
@@ -163,6 +164,13 @@ impl<M: ModelForward> Scheduler<M> {
                 req_id,
                 effective.len(),
                 default_chunk_size
+            );
+            let matched_prefix_tokens = prompt_len.saturating_sub(effective.len());
+            self.metrics.record_request_cache(
+                session_id.as_ref(),
+                matched_prefix_tokens,
+                prompt_len,
+                effective.len(),
             );
             if let Some(req) = self.request_mut(slot_idx) {
                 req.phase = Phase::Prefilling {
@@ -325,7 +333,12 @@ impl<M: ModelForward> Scheduler<M> {
             (effective, pool_prefix_len)
         };
         let reused_tokens = prompt_len.saturating_sub(effective.len());
-        self.metrics.record_prefix_lookup(reused_tokens, prompt_len);
+        self.metrics.record_request_cache(
+            session_id.as_ref(),
+            reused_tokens,
+            prompt_len,
+            effective.len(),
+        );
 
         if pool_prefix_len > 0 && self.paged_kv_pool.is_active() {
             match self.alloc_pool_tokens_with_retry(si, pool_prefix_len) {

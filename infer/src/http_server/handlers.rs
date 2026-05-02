@@ -23,6 +23,7 @@ use fastrace::future::FutureExt;
 use fastrace::local::LocalSpan;
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
+use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -53,6 +54,31 @@ fn request_parent_context(headers: &HeaderMap) -> SpanContext {
         .and_then(|value| value.to_str().ok())
         .and_then(SpanContext::decode_w3c_traceparent)
         .unwrap_or_else(SpanContext::random)
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StatsQuery {
+    #[serde(default)]
+    format: Option<String>,
+}
+
+fn wants_json_stats(headers: &HeaderMap, query: &StatsQuery) -> bool {
+    if query
+        .format
+        .as_deref()
+        .is_some_and(|format| format.eq_ignore_ascii_case("json"))
+    {
+        return true;
+    }
+
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept
+                .split(',')
+                .any(|part| part.trim().starts_with("application/json"))
+        })
 }
 
 fn http_request_span(
@@ -803,9 +829,13 @@ pub(super) async fn readyz_handler(State(state): State<Arc<AppState>>) -> Json<H
 pub(super) async fn stats_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
 ) -> Response {
     if let Err(err) = authorize_v1_request(&headers, state.as_ref()) {
         return err.into_response();
+    }
+    if wants_json_stats(&headers, &query) {
+        return Json(state.metrics.render_stats_json()).into_response();
     }
     let body = state.metrics.render_summary();
     (

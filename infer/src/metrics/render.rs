@@ -119,6 +119,72 @@ impl ServerMetrics {
         .unwrap();
 
         out.push_str(
+            "# HELP infer_prefix_request_hit_rate Prefix-cache hit rate for the most recent lookup [0,1].\n",
+        );
+        out.push_str("# TYPE infer_prefix_request_hit_rate gauge\n");
+        writeln!(
+            out,
+            "infer_prefix_request_hit_rate{{{labels}}} {:.4}",
+            self.prefix_request_hit_rate()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_prefix_request_skip_rate Prefix-token skip rate for the most recent lookup [0,1].\n",
+        );
+        out.push_str("# TYPE infer_prefix_request_skip_rate gauge\n");
+        writeln!(
+            out,
+            "infer_prefix_request_skip_rate{{{labels}}} {:.4}",
+            self.prefix_request_skip_rate()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_session_affinity_hit_total Session-tagged requests that reused a prefix.\n",
+        );
+        out.push_str("# TYPE infer_session_affinity_hit_total counter\n");
+        writeln!(
+            out,
+            "infer_session_affinity_hit_total{{{labels}}} {}",
+            self.session_affinity_hit_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_session_affinity_miss_total Session-tagged requests without prefix reuse.\n",
+        );
+        out.push_str("# TYPE infer_session_affinity_miss_total counter\n");
+        writeln!(
+            out,
+            "infer_session_affinity_miss_total{{{labels}}} {}",
+            self.session_affinity_miss_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_matched_prefix_tokens Matched prefix tokens for the most recent lookup.\n",
+        );
+        out.push_str("# TYPE infer_matched_prefix_tokens gauge\n");
+        writeln!(
+            out,
+            "infer_matched_prefix_tokens{{{labels}}} {}",
+            self.matched_prefix_tokens()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_resume_prefill_tokens Effective prefill tokens for the most recent lookup.\n",
+        );
+        out.push_str("# TYPE infer_resume_prefill_tokens gauge\n");
+        writeln!(
+            out,
+            "infer_resume_prefill_tokens{{{labels}}} {}",
+            self.resume_prefill_tokens()
+        )
+        .unwrap();
+
+        out.push_str(
             "# HELP infer_tier_fetch_staged_host_blocks_total Request-weighted staged blocks found in T1.\n",
         );
         out.push_str("# TYPE infer_tier_fetch_staged_host_blocks_total counter\n");
@@ -750,6 +816,73 @@ impl ServerMetrics {
         out
     }
 
+    /// Render structured stats for `/v1/stats?format=json`.
+    pub fn render_stats_json(&self) -> serde_json::Value {
+        let latest = self
+            .inner
+            .latest_request_cache
+            .lock()
+            .ok()
+            .map(|stats| stats.clone())
+            .unwrap_or_default();
+        let mut session_entries: Vec<(String, super::SessionCacheStats)> = self
+            .inner
+            .session_cache
+            .lock()
+            .ok()
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .map(|(session_id, stats)| (session_id.clone(), stats.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        session_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut sessions = serde_json::Map::new();
+        for (session_id, stats) in session_entries {
+            sessions.insert(
+                session_id,
+                serde_json::json!({
+                    "prefix_lookups_total": stats.prefix_lookups_total,
+                    "prefix_hits_total": stats.prefix_hits_total,
+                    "prefix_hit_rate": stats.prefix_hit_rate(),
+                    "prefix_skip_rate": stats.prefix_skip_rate(),
+                    "prefix_reused_tokens_total": stats.prefix_reused_tokens_total,
+                    "prefix_lookup_prompt_tokens_total": stats.prefix_lookup_prompt_tokens_total,
+                    "session_affinity_hit": stats.session_affinity_hit,
+                    "session_affinity_miss": stats.session_affinity_miss,
+                    "matched_prefix_tokens_total": stats.matched_prefix_tokens_total,
+                    "resume_prefill_tokens_total": stats.resume_prefill_tokens_total,
+                    "matched_prefix_tokens": stats.last_matched_prefix_tokens,
+                    "resume_prefill_tokens": stats.last_resume_prefill_tokens,
+                }),
+            );
+        }
+
+        serde_json::json!({
+            "requests": self.requests_total(),
+            "active": self.requests_active(),
+            "waiting": self.requests_waiting(),
+            "tokens_out": self.tokens_generated_total(),
+            "kv_util": self.kv_gpu_utilization(),
+            "prefix_hit_rate": self.prefix_hit_rate(),
+            "prefix_skip_rate": self.prefix_skip_rate(),
+            "session_affinity_hit": self.session_affinity_hit_total(),
+            "session_affinity_miss": self.session_affinity_miss_total(),
+            "matched_prefix_tokens": self.matched_prefix_tokens(),
+            "resume_prefill_tokens": self.resume_prefill_tokens(),
+            "last_request": {
+                "session_id": latest.session_id,
+                "prefix_hit_rate": latest.prefix_hit_rate(),
+                "prefix_skip_rate": latest.prefix_skip_rate(),
+                "prompt_tokens": latest.prompt_tokens,
+                "matched_prefix_tokens": latest.matched_prefix_tokens,
+                "resume_prefill_tokens": latest.resume_prefill_tokens,
+            },
+            "sessions": sessions,
+        })
+    }
+
     /// Render a simple human-readable summary (for `/v1/stats` or logging).
     pub fn render_summary(&self) -> String {
         let histograms = self.inner.histograms.lock().ok();
@@ -886,9 +1019,18 @@ impl ServerMetrics {
         } else {
             format!(" prefix_skip_rate={:.1}%", self.prefix_skip_rate() * 100.0)
         };
+        let agent_cache_suffix = format!(
+            " prefix_request_hit_rate={:.1}% prefix_request_skip_rate={:.1}% session_affinity_hit={} session_affinity_miss={} matched_prefix_tokens={} resume_prefill_tokens={}",
+            self.prefix_request_hit_rate() * 100.0,
+            self.prefix_request_skip_rate() * 100.0,
+            self.session_affinity_hit_total(),
+            self.session_affinity_miss_total(),
+            self.matched_prefix_tokens(),
+            self.resume_prefill_tokens(),
+        );
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -922,6 +1064,7 @@ impl ServerMetrics {
             metal_decode_suffix,
             dflash_suffix,
             tier_suffix,
+            agent_cache_suffix,
             coordinator_suffix,
         )
     }

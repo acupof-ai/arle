@@ -28,7 +28,7 @@ use crate::sampler::SamplingParams;
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
 use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
-use crate::types::{BlockFingerprint, InferenceMode, KvContentContext, RequestId};
+use crate::types::{BlockFingerprint, InferenceMode, KvContentContext, RequestId, SessionId};
 
 struct PendingMetalRequest {
     delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
@@ -36,6 +36,7 @@ struct PendingMetalRequest {
     max_tokens: usize,
     sampling: SamplingParams,
     stop: Option<Vec<String>>,
+    session_id: Option<SessionId>,
     enqueued_at: Instant,
 }
 
@@ -55,6 +56,7 @@ impl PendingMetalRequest {
                 max_tokens: incoming.max_tokens,
                 sampling: incoming.sampling,
                 stop: incoming.stop,
+                session_id: incoming.session_id,
                 enqueued_at: Instant::now(),
             },
             map_request_priority(incoming.priority),
@@ -80,6 +82,7 @@ struct ActiveMetalRequest {
     request_state: MetalRequestState<'static>,
     decoder: IncrementalDecoder<'static>,
     stop_processor: StopChunkProcessor,
+    session_id: Option<SessionId>,
     prompt_tokens: Vec<u32>,
     enqueued_at: Instant,
     admitted_at: Instant,
@@ -126,6 +129,7 @@ impl ActiveMetalRequest {
             request_state,
             decoder: tokenizer.incremental_decoder(),
             stop_processor: StopChunkProcessor::new(pending.stop.unwrap_or_default()),
+            session_id: pending.session_id,
             prompt_tokens,
             enqueued_at: pending.enqueued_at,
             admitted_at: Instant::now(),
@@ -426,15 +430,15 @@ impl MetalQwen35PrefixRuntime {
     ) -> Result<()> {
         let prompt_len = request.prompt_tokens.len();
         if prompt_len < self.block_size {
-            metrics.record_prefix_lookup(0, prompt_len);
+            metrics.record_request_cache(request.session_id.as_ref(), 0, prompt_len, prompt_len);
             return Ok(());
         }
         if request.request_state.is_dflash_enabled() {
-            metrics.record_prefix_lookup(0, prompt_len);
+            metrics.record_request_cache(request.session_id.as_ref(), 0, prompt_len, prompt_len);
             return Ok(());
         }
         if !request.request_state.can_import_qwen35_prefix_snapshot() {
-            metrics.record_prefix_lookup(0, prompt_len);
+            metrics.record_request_cache(request.session_id.as_ref(), 0, prompt_len, prompt_len);
             return Ok(());
         }
 
@@ -469,7 +473,12 @@ impl MetalQwen35PrefixRuntime {
                 reused_tokens = prefix_key.len();
             }
         }
-        metrics.record_prefix_lookup(reused_tokens, prompt_len);
+        metrics.record_request_cache(
+            request.session_id.as_ref(),
+            reused_tokens,
+            prompt_len,
+            prompt_len.saturating_sub(reused_tokens),
+        );
         Ok(())
     }
 

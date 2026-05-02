@@ -61,9 +61,16 @@
 //! | `infer_kv_gpu_blocks_total` | gauge | Total GPU KV blocks |
 //! | `infer_prefix_hits_total` | counter | Prefix-cache lookup hits |
 //! | `infer_prefix_lookups_total` | counter | Prefix-cache lookups |
+//! | `infer_prefix_hit_rate` | gauge | Fraction of prefix lookups with any reused tokens |
 //! | `infer_prefix_reused_tokens_total` | counter | Prefix tokens skipped by reuse |
 //! | `infer_prefix_lookup_prompt_tokens_total` | counter | Prompt tokens seen by prefix lookup |
 //! | `infer_prefix_skip_rate` | gauge | Fraction of prompt tokens skipped by prefix reuse |
+//! | `infer_prefix_request_hit_rate` | gauge | Prefix hit rate for the most recent lookup |
+//! | `infer_prefix_request_skip_rate` | gauge | Prompt-token skip rate for the most recent lookup |
+//! | `infer_session_affinity_hit_total` | counter | Session-tagged requests that reused a prefix |
+//! | `infer_session_affinity_miss_total` | counter | Session-tagged requests without prefix reuse |
+//! | `infer_matched_prefix_tokens` | gauge | Matched prefix tokens for the most recent prefix lookup |
+//! | `infer_resume_prefill_tokens` | gauge | Effective prefill tokens for the most recent prefix lookup |
 //! | `infer_tier_fetch_staged_host_blocks_total` | counter | Request-weighted staged blocks found in T1 |
 //! | `infer_tier_fetch_staged_disk_blocks_total` | counter | Request-weighted staged blocks found in T2 |
 //! | `infer_tier_fetch_staged_remote_blocks_total` | counter | Request-weighted staged blocks found in T3 |
@@ -74,6 +81,7 @@
 //! | `infer_memory_peak_bytes` | gauge | Peak MLX allocator memory |
 //! | `infer_memory_cache_bytes` | gauge | Cached MLX allocator memory |
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -105,6 +113,94 @@ pub struct ServerMetrics {
     inner: Arc<MetricsInner>,
 }
 
+fn ratio_ppm(numer: u64, denom: u64) -> u64 {
+    if denom == 0 {
+        return 0;
+    }
+    numer.saturating_mul(1_000_000) / denom
+}
+
+#[derive(Clone, Debug, Default)]
+struct RequestCacheStats {
+    session_id: Option<String>,
+    prefix_hit: bool,
+    prompt_tokens: u64,
+    matched_prefix_tokens: u64,
+    resume_prefill_tokens: u64,
+}
+
+impl RequestCacheStats {
+    fn prefix_hit_rate(&self) -> f64 {
+        if self.prefix_hit { 1.0 } else { 0.0 }
+    }
+
+    fn prefix_skip_rate(&self) -> f64 {
+        if self.prompt_tokens == 0 {
+            return 0.0;
+        }
+        self.matched_prefix_tokens as f64 / self.prompt_tokens as f64
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionCacheStats {
+    prefix_lookups_total: u64,
+    prefix_hits_total: u64,
+    prefix_lookup_prompt_tokens_total: u64,
+    prefix_reused_tokens_total: u64,
+    session_affinity_hit: u64,
+    session_affinity_miss: u64,
+    matched_prefix_tokens_total: u64,
+    resume_prefill_tokens_total: u64,
+    last_matched_prefix_tokens: u64,
+    last_resume_prefill_tokens: u64,
+}
+
+impl SessionCacheStats {
+    fn observe(
+        &mut self,
+        matched_prefix_tokens: u64,
+        prompt_tokens: u64,
+        resume_prefill_tokens: u64,
+    ) {
+        self.prefix_lookups_total = self.prefix_lookups_total.saturating_add(1);
+        self.prefix_lookup_prompt_tokens_total = self
+            .prefix_lookup_prompt_tokens_total
+            .saturating_add(prompt_tokens);
+        self.prefix_reused_tokens_total = self
+            .prefix_reused_tokens_total
+            .saturating_add(matched_prefix_tokens);
+        self.matched_prefix_tokens_total = self
+            .matched_prefix_tokens_total
+            .saturating_add(matched_prefix_tokens);
+        self.resume_prefill_tokens_total = self
+            .resume_prefill_tokens_total
+            .saturating_add(resume_prefill_tokens);
+        self.last_matched_prefix_tokens = matched_prefix_tokens;
+        self.last_resume_prefill_tokens = resume_prefill_tokens;
+        if matched_prefix_tokens > 0 {
+            self.prefix_hits_total = self.prefix_hits_total.saturating_add(1);
+            self.session_affinity_hit = self.session_affinity_hit.saturating_add(1);
+        } else {
+            self.session_affinity_miss = self.session_affinity_miss.saturating_add(1);
+        }
+    }
+
+    fn prefix_hit_rate(&self) -> f64 {
+        if self.prefix_lookups_total == 0 {
+            return 0.0;
+        }
+        self.prefix_hits_total as f64 / self.prefix_lookups_total as f64
+    }
+
+    fn prefix_skip_rate(&self) -> f64 {
+        if self.prefix_lookup_prompt_tokens_total == 0 {
+            return 0.0;
+        }
+        self.prefix_reused_tokens_total as f64 / self.prefix_lookup_prompt_tokens_total as f64
+    }
+}
+
 struct MetricsInner {
     // Counters (atomic for lock-free updates from scheduler thread).
     pub requests_total: AtomicU64,
@@ -115,6 +211,8 @@ struct MetricsInner {
     pub prefix_lookups_total: AtomicU64,
     pub prefix_reused_tokens_total: AtomicU64,
     pub prefix_lookup_prompt_tokens_total: AtomicU64,
+    pub session_affinity_hit_total: AtomicU64,
+    pub session_affinity_miss_total: AtomicU64,
     pub tier_fetch_staged_host_blocks_total: AtomicU64,
     pub tier_fetch_staged_disk_blocks_total: AtomicU64,
     pub tier_fetch_staged_remote_blocks_total: AtomicU64,
@@ -176,12 +274,18 @@ struct MetricsInner {
     pub tier_store_wait_us: AtomicU64,
     pub kv_gpu_blocks_free: AtomicU64,
     pub kv_gpu_blocks_total: AtomicU64,
+    pub matched_prefix_tokens: AtomicU64,
+    pub resume_prefill_tokens: AtomicU64,
+    pub prefix_request_hit_ppm: AtomicU64,
+    pub prefix_request_skip_ppm: AtomicU64,
     pub memory_active_bytes: AtomicU64,
     pub memory_peak_bytes: AtomicU64,
     pub memory_cache_bytes: AtomicU64,
 
     // Histograms (mutex-protected — infrequent writes per request).
     pub histograms: Mutex<HistogramSet>,
+    pub latest_request_cache: Mutex<RequestCacheStats>,
+    pub session_cache: Mutex<HashMap<String, SessionCacheStats>>,
 
     // Model metadata.
     pub model_id: String,
@@ -199,6 +303,8 @@ impl ServerMetrics {
                 prefix_lookups_total: AtomicU64::new(0),
                 prefix_reused_tokens_total: AtomicU64::new(0),
                 prefix_lookup_prompt_tokens_total: AtomicU64::new(0),
+                session_affinity_hit_total: AtomicU64::new(0),
+                session_affinity_miss_total: AtomicU64::new(0),
                 tier_fetch_staged_host_blocks_total: AtomicU64::new(0),
                 tier_fetch_staged_disk_blocks_total: AtomicU64::new(0),
                 tier_fetch_staged_remote_blocks_total: AtomicU64::new(0),
@@ -256,10 +362,16 @@ impl ServerMetrics {
                 tier_store_wait_us: AtomicU64::new(0),
                 kv_gpu_blocks_free: AtomicU64::new(0),
                 kv_gpu_blocks_total: AtomicU64::new(0),
+                matched_prefix_tokens: AtomicU64::new(0),
+                resume_prefill_tokens: AtomicU64::new(0),
+                prefix_request_hit_ppm: AtomicU64::new(0),
+                prefix_request_skip_ppm: AtomicU64::new(0),
                 memory_active_bytes: AtomicU64::new(0),
                 memory_peak_bytes: AtomicU64::new(0),
                 memory_cache_bytes: AtomicU64::new(0),
                 histograms: Mutex::new(HistogramSet::new()),
+                latest_request_cache: Mutex::new(RequestCacheStats::default()),
+                session_cache: Mutex::new(HashMap::new()),
                 model_id: model_id.to_string(),
             }),
         }
@@ -329,17 +441,86 @@ impl ServerMetrics {
 
     /// Record one prefix-cache lookup plus how many prompt tokens it skipped.
     pub fn record_prefix_lookup(&self, reused_tokens: usize, prompt_tokens: usize) {
+        self.record_request_cache(
+            None,
+            reused_tokens,
+            prompt_tokens,
+            prompt_tokens.saturating_sub(reused_tokens),
+        );
+    }
+
+    /// Record request-level prefix reuse and effective prefill accounting.
+    ///
+    /// `session_affinity_*` here is observational only: a session-tagged
+    /// request counts as a hit when the existing prefix path reused tokens.
+    /// It does not change admission policy.
+    pub fn record_request_cache(
+        &self,
+        session_id: Option<&crate::types::SessionId>,
+        matched_prefix_tokens: usize,
+        prompt_tokens: usize,
+        resume_prefill_tokens: usize,
+    ) {
+        let matched_prefix_tokens = matched_prefix_tokens.min(prompt_tokens);
+        let resume_prefill_tokens = resume_prefill_tokens.min(prompt_tokens);
         self.inner
             .prefix_lookups_total
             .fetch_add(1, Ordering::Relaxed);
         self.inner
             .prefix_reused_tokens_total
-            .fetch_add(reused_tokens as u64, Ordering::Relaxed);
+            .fetch_add(matched_prefix_tokens as u64, Ordering::Relaxed);
         self.inner
             .prefix_lookup_prompt_tokens_total
             .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
-        if reused_tokens > 0 {
+        if matched_prefix_tokens > 0 {
             self.inner.prefix_hits_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner
+            .matched_prefix_tokens
+            .store(matched_prefix_tokens as u64, Ordering::Relaxed);
+        self.inner
+            .resume_prefill_tokens
+            .store(resume_prefill_tokens as u64, Ordering::Relaxed);
+        self.inner.prefix_request_hit_ppm.store(
+            if matched_prefix_tokens > 0 {
+                1_000_000
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+        self.inner.prefix_request_skip_ppm.store(
+            ratio_ppm(matched_prefix_tokens as u64, prompt_tokens as u64),
+            Ordering::Relaxed,
+        );
+
+        let session_string = session_id.map(|id| id.as_str().to_string());
+        if let Ok(mut latest) = self.inner.latest_request_cache.lock() {
+            *latest = RequestCacheStats {
+                session_id: session_string.clone(),
+                prefix_hit: matched_prefix_tokens > 0,
+                prompt_tokens: prompt_tokens as u64,
+                matched_prefix_tokens: matched_prefix_tokens as u64,
+                resume_prefill_tokens: resume_prefill_tokens as u64,
+            };
+        }
+        if let Some(session_id) = session_string {
+            if matched_prefix_tokens > 0 {
+                self.inner
+                    .session_affinity_hit_total
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.inner
+                    .session_affinity_miss_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Ok(mut sessions) = self.inner.session_cache.lock() {
+                sessions.entry(session_id).or_default().observe(
+                    matched_prefix_tokens as u64,
+                    prompt_tokens as u64,
+                    resume_prefill_tokens as u64,
+                );
+            }
         }
     }
 
@@ -759,6 +940,34 @@ impl ServerMetrics {
             / prompt_tokens as f64
     }
 
+    pub fn prefix_request_hit_rate(&self) -> f64 {
+        self.inner.prefix_request_hit_ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    pub fn prefix_request_skip_rate(&self) -> f64 {
+        self.inner.prefix_request_skip_ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    pub fn session_affinity_hit_total(&self) -> u64 {
+        self.inner
+            .session_affinity_hit_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn session_affinity_miss_total(&self) -> u64 {
+        self.inner
+            .session_affinity_miss_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn matched_prefix_tokens(&self) -> u64 {
+        self.inner.matched_prefix_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn resume_prefill_tokens(&self) -> u64 {
+        self.inner.resume_prefill_tokens.load(Ordering::Relaxed)
+    }
+
     pub fn tier_fetch_staged_host_blocks_total(&self) -> u64 {
         self.inner
             .tier_fetch_staged_host_blocks_total
@@ -1013,7 +1222,12 @@ mod tests {
         m.set_kv_coordinator(16, 3, 5, 2, true, false, 7, 5, 1, 2);
         m.set_tier_wait_seconds(0.25, 0.5);
         m.set_kv_gpu_blocks(100, 200);
-        m.record_prefix_lookup(64, 128);
+        m.record_request_cache(
+            Some(&crate::types::SessionId::from("w3-warm-000")),
+            64,
+            128,
+            64,
+        );
         m.record_tier_fetch_plan(2, 3, 4);
         m.record_tier_fetch_promoted(6);
         m.record_tier_fetch_fallback();
@@ -1093,6 +1307,12 @@ mod tests {
             rendered.contains("infer_prefix_lookup_prompt_tokens_total{model=\"Qwen3-4B\",} 128")
         );
         assert!(rendered.contains("infer_prefix_skip_rate{model=\"Qwen3-4B\",} 0.5000"));
+        assert!(rendered.contains("infer_prefix_request_hit_rate{model=\"Qwen3-4B\",} 1.0000"));
+        assert!(rendered.contains("infer_prefix_request_skip_rate{model=\"Qwen3-4B\",} 0.5000"));
+        assert!(rendered.contains("infer_session_affinity_hit_total{model=\"Qwen3-4B\",} 1"));
+        assert!(rendered.contains("infer_session_affinity_miss_total{model=\"Qwen3-4B\",} 0"));
+        assert!(rendered.contains("infer_matched_prefix_tokens{model=\"Qwen3-4B\",} 64"));
+        assert!(rendered.contains("infer_resume_prefill_tokens{model=\"Qwen3-4B\",} 64"));
         assert!(
             rendered.contains("infer_tier_fetch_staged_host_blocks_total{model=\"Qwen3-4B\",} 2")
         );
@@ -1136,7 +1356,12 @@ mod tests {
     fn server_metrics_render_summary() {
         let m = ServerMetrics::new("Qwen3-8B");
         m.set_kv_coordinator(16, 0, 0, 0, false, false, 3, 2, 1, 4);
-        m.record_prefix_lookup(32, 128);
+        m.record_request_cache(
+            Some(&crate::types::SessionId::from("w3-warm-000")),
+            32,
+            128,
+            96,
+        );
         m.record_tier_fetch_plan(1, 2, 0);
         m.record_tier_fetch_promoted(2);
         m.record_tier_fetch_fallback();
@@ -1166,12 +1391,53 @@ mod tests {
         assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=100.0%"));
         assert!(s.contains("prefix_skip_rate=25.0%"));
+        assert!(s.contains("prefix_request_hit_rate=100.0%"));
+        assert!(s.contains("prefix_request_skip_rate=25.0%"));
+        assert!(s.contains("session_affinity_hit=1"));
+        assert!(s.contains("session_affinity_miss=0"));
+        assert!(s.contains("matched_prefix_tokens=32"));
+        assert!(s.contains("resume_prefill_tokens=96"));
         assert!(s.contains("tier_recall=66.7%"));
         assert!(s.contains("tier_src=h:1/d:2/r:0"));
         assert!(s.contains("tier_promoted=2"));
         assert!(s.contains("tier_fallback=1"));
         assert!(s.contains("metal_decode=batch:1/4,scalar:1,fallback:3,qwen35_packed:1/4"));
         assert!(s.contains("kv_store=sub:3,done:2,fail:1,rej:4"));
+    }
+
+    #[test]
+    fn server_metrics_render_stats_json_agent_cache_fields() {
+        let m = ServerMetrics::new("Qwen3-4B");
+        m.record_request_cache(
+            Some(&crate::types::SessionId::from("w3-warm-000")),
+            64,
+            128,
+            64,
+        );
+
+        let payload = m.render_stats_json();
+        assert_eq!(payload["prefix_hit_rate"], serde_json::json!(1.0));
+        assert_eq!(payload["prefix_skip_rate"], serde_json::json!(0.5));
+        assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));
+        assert_eq!(payload["session_affinity_miss"], serde_json::json!(0));
+        assert_eq!(payload["matched_prefix_tokens"], serde_json::json!(64));
+        assert_eq!(payload["resume_prefill_tokens"], serde_json::json!(64));
+        assert_eq!(
+            payload["last_request"]["session_id"],
+            serde_json::json!("w3-warm-000")
+        );
+        assert_eq!(
+            payload["last_request"]["prefix_skip_rate"],
+            serde_json::json!(0.5)
+        );
+        assert_eq!(
+            payload["sessions"]["w3-warm-000"]["prefix_hit_rate"],
+            serde_json::json!(1.0)
+        );
+        assert_eq!(
+            payload["sessions"]["w3-warm-000"]["prefix_skip_rate"],
+            serde_json::json!(0.5)
+        );
     }
 
     #[test]
