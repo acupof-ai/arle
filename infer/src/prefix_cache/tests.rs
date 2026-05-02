@@ -662,6 +662,7 @@ fn evict_cascade_respects_ref_count() {
 fn evict_with_policy_matches_lru_when_signals_are_cold() {
     let mut cache = RadixCache::new(4);
     cache.insert(&[1, 2, 3, 4], &bids(&[100]));
+    assert!(cache.set_block_location(BlockId(100), BlockLocation::Gpu { slot: 0 }));
     cache.insert(&[5, 6, 7, 8], &bids(&[200]));
 
     let _ = cache.lookup(&[5, 6, 7, 8]);
@@ -737,6 +738,30 @@ fn evict_with_policy_skips_soft_pinned_nodes() {
         None,
     );
     assert_eq!(freed, bids(&[200]));
+}
+
+#[test]
+fn drain_evict_with_policy_ignores_lookup_soft_pin() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[100]));
+    assert!(cache.set_block_location(BlockId(100), BlockLocation::Gpu { slot: 0 }));
+
+    let idx = cache
+        .nodes
+        .iter()
+        .position(|node| node.block_id == Some(BlockId(100)))
+        .unwrap();
+    cache.clock = 100;
+    cache.nodes[idx].soft_pin_until = Some(200);
+
+    let freed = cache.evict_with_policy_for_intent(
+        &crate::scheduler::policy::LruEviction,
+        SchedulerSignals::default(),
+        1,
+        Some(Tier::Gpu),
+        BlockSelectionIntent::Drain,
+    );
+    assert_eq!(freed, bids(&[100]));
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1430,6 +1455,7 @@ fn update_block_metadata_coalesces_session_and_soft_pin_updates() {
             location: Some(BlockLocation::Gpu { slot: 7 }),
             byte_len: Some(4096),
             session_id: Some(Some(SessionId::from("session-1"))),
+            host_swap_eligible: Some(true),
             soft_pin_until: Some(Some(42)),
             host_spill_pin_until: Some(Some(84)),
             entry_state: Some(IndexEntryState::Pending),
@@ -1450,6 +1476,7 @@ fn update_block_metadata_coalesces_session_and_soft_pin_updates() {
         cache.nodes[idx].session_id,
         Some(SessionId::from("session-1"))
     );
+    assert!(cache.nodes[idx].host_swap_eligible);
     assert_eq!(cache.nodes[idx].soft_pin_until, Some(42));
     assert_eq!(cache.nodes[idx].host_spill_pin_until, Some(84));
     assert_eq!(cache.nodes[idx].entry_state, IndexEntryState::Pending);
@@ -1461,6 +1488,7 @@ fn update_block_metadata_coalesces_session_and_soft_pin_updates() {
             location: None,
             byte_len: None,
             session_id: Some(None),
+            host_swap_eligible: Some(false),
             soft_pin_until: Some(None),
             host_spill_pin_until: Some(None),
             entry_state: Some(IndexEntryState::Ready),
@@ -1472,10 +1500,47 @@ fn update_block_metadata_coalesces_session_and_soft_pin_updates() {
     );
     assert_eq!(cache.nodes[idx].byte_len, 4096);
     assert_eq!(cache.nodes[idx].session_id, None);
+    assert!(!cache.nodes[idx].host_swap_eligible);
     assert_eq!(cache.nodes[idx].soft_pin_until, None);
     assert_eq!(cache.nodes[idx].host_spill_pin_until, None);
     assert_eq!(cache.nodes[idx].entry_state, IndexEntryState::Ready);
     assert_eq!(cache.nodes[idx].store_state, StoreState::Idle);
+}
+
+#[test]
+fn retag_block_preserves_metadata_and_lookup_path() {
+    let mut cache = RadixCache::new(4);
+    let tokens = [1, 2, 3, 4];
+    cache.insert(&tokens, &bids(&[10]));
+    assert!(cache.update_block_metadata(
+        BlockId(10),
+        BlockMetadataUpdate {
+            location: Some(BlockLocation::HostPinned { offset: 4096 }),
+            byte_len: Some(8192),
+            session_id: Some(Some(SessionId::from("session-1"))),
+            host_swap_eligible: Some(true),
+            soft_pin_until: Some(Some(42)),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+
+    assert!(cache.retag_block(BlockId(10), BlockId(u32::MAX)));
+    assert!(!cache.retag_block(BlockId(10), BlockId(u32::MAX - 1)));
+
+    let (len, blocks) = cache.lookup(&tokens);
+    assert_eq!(len, 4);
+    assert_eq!(blocks, vec![BlockId(u32::MAX)]);
+    assert!(cache.block_metadata(BlockId(10)).is_none());
+
+    let metadata = cache.block_metadata(BlockId(u32::MAX)).unwrap();
+    assert_eq!(
+        metadata.location,
+        Some(BlockLocation::HostPinned { offset: 4096 })
+    );
+    assert_eq!(metadata.byte_len, 8192);
+    assert_eq!(metadata.session_id, Some(SessionId::from("session-1")));
+    assert!(metadata.host_swap_eligible);
+    assert_eq!(metadata.soft_pin_until, Some(42));
 }
 
 #[test]
@@ -1492,6 +1557,7 @@ fn spill_selection_ignores_lookup_soft_pin_for_host_blocks() {
         1,
         Some(Tier::HostPinned),
         BlockSelectionIntent::Spill,
+        false,
     );
 
     assert_eq!(selected, vec![BlockId(10)]);
@@ -1511,6 +1577,7 @@ fn spill_selection_respects_host_spill_pin() {
         1,
         Some(Tier::HostPinned),
         BlockSelectionIntent::Spill,
+        false,
     );
     assert!(pinned.is_empty());
 
@@ -1521,6 +1588,7 @@ fn spill_selection_respects_host_spill_pin() {
         1,
         Some(Tier::HostPinned),
         BlockSelectionIntent::Spill,
+        false,
     );
     assert_eq!(released, vec![BlockId(10)]);
 }
@@ -1539,6 +1607,7 @@ fn drain_selection_ignores_host_spill_pin() {
         1,
         Some(Tier::HostPinned),
         BlockSelectionIntent::Drain,
+        false,
     );
 
     assert_eq!(selected, vec![BlockId(10)]);
@@ -1558,6 +1627,7 @@ fn spill_selection_skips_non_idle_store_states() {
         2,
         Some(Tier::HostPinned),
         BlockSelectionIntent::Spill,
+        false,
     );
 
     assert_eq!(selected, vec![BlockId(20)]);
@@ -1566,7 +1636,8 @@ fn spill_selection_skips_non_idle_store_states() {
 #[test]
 fn selection_sorts_lowest_score_first() {
     let mut cache = RadixCache::new(4);
-    cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    cache.insert(&[9, 10, 11, 12], &bids(&[20]));
     assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
     assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 1 }));
 
@@ -1589,9 +1660,75 @@ fn selection_sorts_lowest_score_first() {
         1,
         Some(Tier::Gpu),
         BlockSelectionIntent::Evict,
+        false,
     );
 
     assert_eq!(selected, vec![BlockId(10)]);
+}
+
+#[test]
+fn eviction_selection_requires_host_swap_eligibility_when_requested() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    cache.insert(&[9, 10, 11, 12], &bids(&[20]));
+    assert!(cache.update_block_metadata(
+        BlockId(10),
+        BlockMetadataUpdate {
+            location: Some(BlockLocation::Gpu { slot: 0 }),
+            host_swap_eligible: Some(true),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+    assert!(cache.update_block_metadata(
+        BlockId(20),
+        BlockMetadataUpdate {
+            location: Some(BlockLocation::Gpu { slot: 1 }),
+            host_swap_eligible: Some(false),
+            ..BlockMetadataUpdate::default()
+        }
+    ));
+
+    let selected = cache.select_blocks_with_policy(
+        &LruEviction,
+        SchedulerSignals::default(),
+        2,
+        Some(Tier::Gpu),
+        BlockSelectionIntent::Evict,
+        true,
+    );
+
+    assert_eq!(selected, vec![BlockId(10)]);
+}
+
+#[test]
+fn selection_treats_same_tier_descendants_as_leaf_blockers() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+    for block in [10, 20] {
+        assert!(cache.update_block_metadata(
+            BlockId(block),
+            BlockMetadataUpdate {
+                location: Some(BlockLocation::Gpu { slot: 0 }),
+                host_swap_eligible: Some(true),
+                ..BlockMetadataUpdate::default()
+            }
+        ));
+    }
+    let parent_idx = cache.block_index[&BlockId(10)];
+    let leaf_idx = cache.block_index[&BlockId(20)];
+    cache.nodes[parent_idx].last_access = 1;
+    cache.nodes[leaf_idx].last_access = 10;
+
+    let selected = cache.select_blocks_with_policy(
+        &LruEviction,
+        SchedulerSignals::default(),
+        2,
+        Some(Tier::Gpu),
+        BlockSelectionIntent::Evict,
+        true,
+    );
+
+    assert_eq!(selected, vec![BlockId(20), BlockId(10)]);
 }
 
 #[test]
