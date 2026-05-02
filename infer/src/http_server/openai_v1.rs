@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::server_engine::{CompletionOutput, CompletionStreamDelta};
+use crate::server_engine::{CompletionOutput, CompletionStreamDelta, EnginePoolModelSpec};
 use crate::types::SessionId;
 use chat::{
     OpenAiChatContent, OpenAiChatMessage, OpenAiToolCall, OpenAiToolDefinition, ToolCall,
@@ -444,6 +444,14 @@ struct ModelObject {
     object: &'static str,
     created: u64,
     owned_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loaded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned: Option<bool>,
     /// DFlash speculative-decode sub-object. Omitted entirely when the
     /// runtime was not started with a DFlash draft, so existing consumers
     /// of `/v1/models` keep the same shape.
@@ -483,9 +491,41 @@ impl ModelsListResponse {
                 object: "model",
                 created,
                 owned_by: "agent-infer",
+                model_type: None,
+                aliases: Vec::new(),
+                loaded: None,
+                pinned: None,
                 dflash,
             }],
         }
+    }
+
+    pub(super) fn from_pool_specs(
+        loaded_model_id: &str,
+        created: u64,
+        dflash: Option<DflashStatusPayload>,
+        pool_models: &[EnginePoolModelSpec],
+    ) -> Self {
+        let mut response = Self::single(loaded_model_id, created, dflash);
+        let loaded_key = canonical_model_id(loaded_model_id).to_ascii_lowercase();
+        for spec in pool_models {
+            let spec_key = canonical_model_id(&spec.id).to_ascii_lowercase();
+            if spec.id.eq_ignore_ascii_case(loaded_model_id) || spec_key == loaded_key {
+                continue;
+            }
+            response.data.push(ModelObject {
+                id: spec.id.clone(),
+                object: "model",
+                created,
+                owned_by: "agent-infer",
+                model_type: Some(spec.model_type.as_str()),
+                aliases: spec.aliases.clone(),
+                loaded: Some(false),
+                pinned: spec.pinned.then_some(true),
+                dflash: None,
+            });
+        }
+        response
     }
 }
 

@@ -327,6 +327,14 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub(crate) train_control_url: Option<String>,
 
+    /// Additional engine-pool model metadata to expose from the serving control plane.
+    ///
+    /// Format: `id=path[,type=text-generation|embedding|reranker][,aliases=a|b][,pinned=true][,memory_bytes=N][,ttl_secs=N]`.
+    /// The first implementation is metadata/control-plane only; non-primary
+    /// embedding and reranker entries are explicit stubs, not generation routes.
+    #[arg(long = "pool-model", value_name = "SPEC")]
+    pub(crate) pool_models: Vec<String>,
+
     /// Forward additional backend-specific flags after `--`.
     #[arg(last = true, allow_hyphen_values = true)]
     pub(crate) extra_args: Vec<String>,

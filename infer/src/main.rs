@@ -13,6 +13,7 @@ use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::scheduler::{DraftMode, SchedulePolicy, SchedulerConfig};
+use infer::server_engine::EnginePoolModelSpec;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
 
@@ -192,6 +193,10 @@ struct Args {
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
     train_control_url: Option<String>,
+
+    /// Additional engine-pool model metadata to expose from `/v1/models`.
+    #[arg(long = "pool-model", value_name = "SPEC")]
+    pool_models: Vec<String>,
 
     /// Host-pinned T1 high-water mark as a fraction of host-pool capacity.
     #[arg(long)]
@@ -408,6 +413,7 @@ async fn main() {
         metrics,
         HttpServerConfig {
             train_control_target,
+            pool_models: parse_pool_models(&args.pool_models),
             ..Default::default()
         },
     );
@@ -437,6 +443,15 @@ async fn main() {
         info!("Flushing pending traces...");
         fastrace::flush();
     }
+}
+
+fn parse_pool_models(raw: &[String]) -> Vec<EnginePoolModelSpec> {
+    raw.iter()
+        .map(|spec| {
+            EnginePoolModelSpec::parse_cli(spec)
+                .unwrap_or_else(|err| panic!("invalid --pool-model `{spec}`: {err}"))
+        })
+        .collect()
 }
 
 async fn shutdown_signal() {
