@@ -1064,6 +1064,7 @@ mod tests {
                 train_control_target: Some(
                     TrainControlTarget::parse("http://127.0.0.1:9123").expect("parse target"),
                 ),
+                pool_models: Vec::new(),
             },
         );
         let request = Request::builder()
@@ -1202,6 +1203,39 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["object"], "list");
         assert_eq!(payload["data"][0]["id"], "Qwen3-8B");
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_lists_configured_pool_models_as_unloaded_stubs() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-8B"),
+            crate::metrics::ServerMetrics::new(""),
+            HttpServerConfig {
+                pool_models: vec![
+                    crate::server_engine::EnginePoolModelSpec::parse_cli(
+                        "embed=/models/embed,type=embedding,aliases=vision-embed",
+                    )
+                    .expect("pool spec"),
+                ],
+                ..Default::default()
+            },
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["data"][0]["id"], "Qwen3-8B");
+        assert_eq!(payload["data"][1]["id"], "embed");
+        assert_eq!(payload["data"][1]["model_type"], "embedding");
+        assert_eq!(payload["data"][1]["loaded"], false);
+        assert_eq!(payload["data"][1]["aliases"][0], "vision-embed");
     }
 
     #[tokio::test]

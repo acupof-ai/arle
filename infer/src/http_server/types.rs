@@ -15,7 +15,9 @@ use crate::metrics::ServerMetrics;
 use crate::request_handle::RequestHandle;
 use crate::sampler::{SamplingParams, sampling_params_from_request};
 use crate::scheduler::{IncomingRequest, RequestPriority, RequestSpecConfig};
-use crate::server_engine::{CompletionOutput, CompletionStreamDelta, FinishReason, TokenUsage};
+use crate::server_engine::{
+    CompletionOutput, CompletionStreamDelta, EnginePoolModelSpec, FinishReason, TokenUsage,
+};
 use crate::tokenizer::Tokenizer;
 use fastrace::collector::SpanContext;
 
@@ -47,6 +49,7 @@ pub(super) struct ServingIdentity {
 pub struct HttpServerConfig {
     pub api_key: Option<Arc<str>>,
     pub train_control_target: Option<TrainControlTarget>,
+    pub pool_models: Vec<EnginePoolModelSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

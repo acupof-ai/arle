@@ -712,7 +712,12 @@ pub(super) async fn models_handler(
                 .dflash_acceptance_rate_opt()
                 .filter(|rate| rate.is_finite()),
         });
-    let response = ModelsListResponse::single(state.identity.model_id.as_str(), now_secs(), dflash);
+    let response = ModelsListResponse::from_pool_specs(
+        state.identity.model_id.as_str(),
+        now_secs(),
+        dflash,
+        &state.config.pool_models,
+    );
     Ok(Json(response).into_response())
 }
 

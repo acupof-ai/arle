@@ -10,6 +10,7 @@ use clap::Parser;
 use infer::backend::runtime::spawn_cpu_runtime_handle_from_path;
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::logging;
+use infer::server_engine::EnginePoolModelSpec;
 use log::info;
 
 #[derive(Parser)]
@@ -33,6 +34,10 @@ struct Args {
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
     train_control_url: Option<String>,
+
+    /// Additional engine-pool model metadata to expose from `/v1/models`.
+    #[arg(long = "pool-model", value_name = "SPEC")]
+    pool_models: Vec<String>,
 }
 
 #[tokio::main]
@@ -54,6 +59,7 @@ async fn main() {
         infer::metrics::ServerMetrics::new(&args.model_path),
         HttpServerConfig {
             train_control_target,
+            pool_models: parse_pool_models(&args.pool_models),
             ..Default::default()
         },
     );
@@ -67,6 +73,15 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+}
+
+fn parse_pool_models(raw: &[String]) -> Vec<EnginePoolModelSpec> {
+    raw.iter()
+        .map(|spec| {
+            EnginePoolModelSpec::parse_cli(spec)
+                .unwrap_or_else(|err| panic!("invalid --pool-model `{spec}`: {err}"))
+        })
+        .collect()
 }
 
 async fn shutdown_signal() {

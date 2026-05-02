@@ -122,6 +122,11 @@ fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvoca
         argv.push(url.to_string());
     }
 
+    for spec in &serve_args.pool_models {
+        argv.push("--pool-model".to_string());
+        argv.push(spec.clone());
+    }
+
     argv.extend(serve_args.extra_args.iter().cloned());
 
     Ok(ServeInvocation {
@@ -245,5 +250,27 @@ mod tests {
                 .windows(2)
                 .any(|item| item[0] == "--cuda-graph" && item[1] == "false")
         );
+    }
+
+    #[test]
+    fn serve_forwards_pool_model_specs() {
+        let mut args = Args::parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "main",
+            "--pool-model",
+            "embed=/models/embed,type=embedding",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let invocation = resolve_invocation(&args, &serve).expect("resolve");
+        assert!(invocation.argv.windows(2).any(
+            |item| item[0] == "--pool-model" && item[1] == "embed=/models/embed,type=embedding"
+        ));
     }
 }

@@ -9,6 +9,8 @@ mod backend_engine;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[path = "server_engine/loaded.rs"]
 mod loaded;
+#[path = "server_engine/pool.rs"]
+mod pool;
 #[path = "server_engine/request_handle_engine.rs"]
 mod request_handle_engine;
 #[path = "server_engine/stream.rs"]
@@ -20,6 +22,12 @@ mod types;
 pub use backend_engine::BackendInferenceEngine;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub use loaded::LoadedInferenceEngine;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+pub use pool::LoadedEnginePool;
+pub use pool::{
+    EngineLease, EnginePool, EnginePoolConfig, EnginePoolModelInfo, EnginePoolModelSpec,
+    EnginePoolModelType,
+};
 pub use request_handle_engine::RequestHandleInferenceEngine;
 pub use types::{
     CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,

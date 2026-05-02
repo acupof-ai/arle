@@ -22,7 +22,7 @@ use infer::metrics::ServerMetrics;
 use infer::request_handle::RequestHandle;
 use infer::sampler::SamplingParams;
 use infer::scheduler::{IncomingRequest, RequestPriority};
-use infer::server_engine::CompletionStreamDelta;
+use infer::server_engine::{CompletionStreamDelta, EnginePoolModelSpec};
 use log::info;
 
 const DEFAULT_WARMUP_PROMPT: &str = "Write one short sentence about Metal inference.";
@@ -123,6 +123,10 @@ struct Args {
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
     train_control_url: Option<String>,
+
+    /// Additional engine-pool model metadata to expose from `/v1/models`.
+    #[arg(long = "pool-model", value_name = "SPEC")]
+    pool_models: Vec<String>,
 }
 
 impl Args {
@@ -246,6 +250,7 @@ async fn main() -> Result<()> {
         HttpServerConfig {
             api_key: api_key.map(Arc::<str>::from),
             train_control_target,
+            pool_models: parse_pool_models(&args.pool_models)?,
         },
     );
     let listener = tokio::net::TcpListener::bind((args.bind.as_str(), args.port))
@@ -261,6 +266,15 @@ async fn main() -> Result<()> {
         .await
         .context("server error")?;
     Ok(())
+}
+
+fn parse_pool_models(raw: &[String]) -> Result<Vec<EnginePoolModelSpec>> {
+    raw.iter()
+        .map(|spec| {
+            EnginePoolModelSpec::parse_cli(spec)
+                .map_err(|err| anyhow::anyhow!("invalid --pool-model `{spec}`: {err}"))
+        })
+        .collect()
 }
 
 async fn shutdown_signal() {
