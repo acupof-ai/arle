@@ -2114,36 +2114,30 @@ fn execute_qwen35_dflash_packed_batch(
         tokens: sampled,
     } = outcome;
 
-    if sampled.len() != ready_indices.len() {
-        error!(
-            "Metal Qwen3.5 DFlash batched decode: expected {} sampled tokens, got {}",
-            ready_indices.len(),
-            sampled.len()
-        );
-        metrics.record_request_failed();
-        for (req_id, request) in rows {
-            cancel_detached_request(req_id, request, scheduler);
+    let dispatch_plan = match dflash_row_dispatch_plan(rows.len(), &ready_indices, sampled.len()) {
+        Ok(plan) => plan,
+        Err(err) => {
+            error!(
+                "Metal Qwen3.5 DFlash batched decode produced an invalid dispatch plan: {err:#}"
+            );
+            metrics.record_request_failed();
+            for (req_id, request) in rows {
+                cancel_detached_request(req_id, request, scheduler);
+            }
+            return;
         }
-        return;
-    }
+    };
     metrics.record_metal_decode_batch(ready_indices.len());
     let fallback_rows = rows.len().saturating_sub(ready_indices.len());
     if fallback_rows > 0 {
         metrics.record_metal_decode_batch_fallback(fallback_rows);
     }
 
-    // Commit ready-row tokens and dispatch stale rows in the original
-    // scheduler order (priority/arrival established by `build_decode_batch`).
-    // `ready_indices` is sorted ascending, so one linear pass suffices.
-    let mut sampled_iter = sampled.into_iter();
-    let mut ready_cursor = 0usize;
-    for (idx, (req_id, mut request)) in rows.into_iter().enumerate() {
-        let is_ready = ready_cursor < ready_indices.len() && idx == ready_indices[ready_cursor];
-        if is_ready {
-            ready_cursor += 1;
-            let sampled_token = sampled_iter
-                .next()
-                .expect("sampled.len() == ready_indices.len() validated above");
+    // Commit ready-row tokens and dispatch stale rows in the original scheduler
+    // order (priority/arrival established by `build_decode_batch`).
+    for ((req_id, mut request), dispatch) in rows.into_iter().zip(dispatch_plan) {
+        if let DflashRowDispatch::Batched { sampled_index } = dispatch {
+            let sampled_token = sampled[sampled_index];
             if let Err(err) = request.process_token(sampled_token) {
                 error!(
                     "Metal DFlash batched decode post-process failed for {:?}: {err:#}",
@@ -2158,6 +2152,44 @@ fn execute_qwen35_dflash_packed_batch(
             execute_decode_single(req_id, request, metrics, scheduler, active);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DflashRowDispatch {
+    Batched { sampled_index: usize },
+    ScalarFallback,
+}
+
+fn dflash_row_dispatch_plan(
+    row_count: usize,
+    ready_indices: &[usize],
+    sampled_len: usize,
+) -> Result<Vec<DflashRowDispatch>> {
+    ensure!(
+        sampled_len == ready_indices.len(),
+        "expected {} sampled tokens, got {}",
+        ready_indices.len(),
+        sampled_len
+    );
+
+    let mut plan = vec![DflashRowDispatch::ScalarFallback; row_count];
+    let mut previous = None;
+    for (sampled_index, &row_index) in ready_indices.iter().enumerate() {
+        ensure!(
+            row_index < row_count,
+            "ready row index {} out of range for {} rows",
+            row_index,
+            row_count
+        );
+        ensure!(
+            previous.is_none_or(|prev| prev < row_index),
+            "ready row indices must be sorted and unique: {:?}",
+            ready_indices
+        );
+        plan[row_index] = DflashRowDispatch::Batched { sampled_index };
+        previous = Some(row_index);
+    }
+    Ok(plan)
 }
 
 fn execute_qwen35_packed_decode_batch(
@@ -2653,6 +2685,33 @@ mod tests {
     use crate::backend::metal::mlx::MlxArray;
     use crate::test_support::metal_test_guard;
     use tempfile::tempdir;
+
+    #[test]
+    fn dflash_row_dispatch_plan_preserves_scheduler_order() {
+        let plan = dflash_row_dispatch_plan(8, &[0, 2, 5], 3).expect("plan");
+
+        assert_eq!(
+            plan,
+            vec![
+                DflashRowDispatch::Batched { sampled_index: 0 },
+                DflashRowDispatch::ScalarFallback,
+                DflashRowDispatch::Batched { sampled_index: 1 },
+                DflashRowDispatch::ScalarFallback,
+                DflashRowDispatch::ScalarFallback,
+                DflashRowDispatch::Batched { sampled_index: 2 },
+                DflashRowDispatch::ScalarFallback,
+                DflashRowDispatch::ScalarFallback,
+            ]
+        );
+    }
+
+    #[test]
+    fn dflash_row_dispatch_plan_rejects_invalid_outcome_shape() {
+        assert!(dflash_row_dispatch_plan(3, &[0, 2], 1).is_err());
+        assert!(dflash_row_dispatch_plan(3, &[0, 3], 2).is_err());
+        assert!(dflash_row_dispatch_plan(3, &[2, 1], 2).is_err());
+        assert!(dflash_row_dispatch_plan(3, &[1, 1], 2).is_err());
+    }
 
     #[test]
     fn qwen35_disk_prefix_runtime_reconciles_persisted_snapshot_headers() {
