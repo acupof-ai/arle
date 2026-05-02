@@ -19,6 +19,8 @@
 Server:
 
 ```bash
+python3 -m pip install -e '.[tilelang]'
+python3 -c "import tilelang; print(tilelang.__version__)"  # 0.1.9
 ln -sfn Qwen3-4B models/default
 CUDA_HOME=/usr/local/cuda \
 CARGO_HOME=/tmp/cargo-home-local \
@@ -26,7 +28,8 @@ PEGAINFER_CUDA_SM=89 \
 LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64 \
 ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 INFER_TILELANG_PYTHON=/usr/bin/python3 \
-./target/release/infer --model-path models/default --port 8000 \
+cargo run --release -p infer --no-default-features --features cuda -- \
+  --model-path models/default --port 8000 \
   --num-slots 16 --max-seq-len 4608 --mem-fraction-static 0.94 \
   --max-num-batched-tokens 16384 --max-prefill-tokens 16384 \
   --schedule-policy fcfs
@@ -38,9 +41,9 @@ Client:
 python3 scripts/bench_agent_trace.py \
   --workload agent-w3-short-multiturn \
   --server http://localhost:8000 \
-  --label a1-session-affinity-w3 \
-  --out bench-output/2026-05-02-agent-load-a1-session-affinity-w3/results.json \
-  --trace-out bench-output/2026-05-02-agent-load-a1-session-affinity-w3/trace.jsonl
+  --label a1-session-affinity-w3-tilelang-rerun \
+  --out bench-output/2026-05-02-agent-load-a1-session-affinity-w3-tilelang-rerun/results.json \
+  --trace-out bench-output/2026-05-02-agent-load-a1-session-affinity-w3-tilelang-rerun/trace.jsonl
 ```
 
 Local verification:
@@ -68,7 +71,7 @@ ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 - **Feature set:** release CUDA binary, `--no-default-features --features cuda`
 - **KV dtype / cache mode:** auto FP8E4M3 paged KV, RadixCache on
 - **Session / prefix flags:** HTTP `session_id`; A1 reads RadixCache block metadata directly
-- **Python tools:** `tilelang 0.1.9`
+- **Python tools:** `tilelang 0.1.9` installed via `pip install -e '.[tilelang]'`
 
 ## Workload Params
 
@@ -90,22 +93,20 @@ ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 |---|---:|
 | successful scored turns | 320 / 320 |
 | incomplete scored turns | 0 |
-| successful output tok/s | 154.7 |
-| TTFT p50 (ms) | 241.7 |
-| TTFT p99 (ms) | 4514.0 |
-| ITL p50 (ms) | 50.5 |
-| ITL p99 (ms) | 53.9 |
-| E2E p50 (ms) | 4128.0 |
-| E2E p99 (ms) | 12106.5 |
+| scored tokens | 18837 |
+| summed scored wall (s) | 1450.71 |
+| TTFT p50 (ms) | 233.0 |
+| TTFT p99 (ms) | 5049.6 |
+| ITL p50 (ms) | 50.7 |
+| ITL p99 (ms) | 53.7 |
 
 ## Results - W3 Warm/Cold
 
 | metric | warm | cold |
 |---|---:|---:|
 | scored turns | 256 | 64 |
-| TTFT p50 (ms) | 233.6 | 638.9 |
-| TTFT p99 (ms) | 887.2 | 6740.2 |
-| output tok/s (sum-wall) | 14.38 | 9.11 |
+| TTFT p50 (ms) | 226.1 | 637.2 |
+| TTFT p99 (ms) | 676.3 | 7181.0 |
 
 ## Results - W4 Resume
 
@@ -126,13 +127,13 @@ ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 | peak active | 16 |
 | peak waiting | 0 in final snapshot |
 | peak prefill_queue | final 0 |
-| peak kv_util | final 69.2% |
+| peak kv_util | final 69.0% |
 | `prefix_hit_rate` | 95.8% |
 | `prefix_skip_rate` | 57.9% |
 | `session_affinity_hit` | 368 |
 | `session_affinity_miss` | 16 |
-| `matched_prefix_tokens` | final request 1392 |
-| `resume_prefill_tokens` | final request 113 |
+| `matched_prefix_tokens` | final request 1408 |
+| `resume_prefill_tokens` | final request 124 |
 | `tool_resume_count` | n/a |
 | `tool_resume_prefill_tokens` | n/a |
 | `kv_fetch_q` | `0/16` |
@@ -149,7 +150,7 @@ ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 
 | engine | commit/tag | output tok/s | TTFT p99 (ms) | E2E p99 (ms) | cache report | raw artefact |
 |---|---|---:|---:|---:|---|---|
-| ARLE | `b1716819` | 154.7 | 4514.0 | 12106.5 | A1 + A2 fields | `bench-output/2026-05-02-agent-load-a1-session-affinity-w3/results.json` |
+| ARLE | `b1716819` | see artefact | 5049.6 | see artefact | A1 + A2 fields | `bench-output/2026-05-02-agent-load-a1-session-affinity-w3-tilelang-rerun/results.json` |
 | SGLang | pending | pending | pending | pending | pending | pending |
 | vLLM | pending | pending | pending | pending | pending | pending |
 | TensorRT-LLM | pending | pending | pending | pending | pending | pending |
@@ -159,7 +160,8 @@ Mission margin:
 
 ```text
 W3 competitor margin is not claimed in A1. A1 entrance signal is local ARLE
-warm TTFT p99 = 887.2 ms with 0 failed scored turns.
+warm TTFT p99 = 676.3 ms with 0 failed scored turns on the official TileLang
+CUDA path.
 ```
 
 ## Problems
@@ -187,15 +189,15 @@ warm TTFT p99 = 887.2 ms with 0 failed scored turns.
 
 | metric | baseline | now | delta |
 |---|---:|---:|---:|
-| output tok/s | n/a | 154.7 | n/a |
-| warm TTFT p99 | n/a | 887.2 ms | n/a |
-| cold TTFT p99 | n/a | 6740.2 ms | n/a |
+| warm TTFT p99 | 887.2 ms | 676.3 ms | -23.8% |
+| cold TTFT p99 | 6740.2 ms | 7181.0 ms | +6.5% |
+| overall TTFT p99 | 4514.0 ms | 5049.6 ms | +11.9% |
 
 ## Artefacts
 
-- Raw turns / client summary: `bench-output/2026-05-02-agent-load-a1-session-affinity-w3/results.json`
-- Generated trace: `bench-output/2026-05-02-agent-load-a1-session-affinity-w3/trace.jsonl`
-- Server launch log: `bench-output/server-logs/2026-05-02T07-26-42-port8000-a1-w3-default.log`
+- Raw turns / client summary: `bench-output/2026-05-02-agent-load-a1-session-affinity-w3-tilelang-rerun/results.json`
+- Generated trace: `bench-output/2026-05-02-agent-load-a1-session-affinity-w3-tilelang-rerun/trace.jsonl`
+- Server launch log: `bench-output/server-logs/2026-05-02T07-48-32-port8000-a1-w3-tilelang-cargo-run-default.log`
 
 ## Notes
 
