@@ -6,7 +6,7 @@
 mod tests {
     // Pull in the public surface and the internal items the test bodies
     // reference.
-    use super::super::router::{build_app, build_app_with_config};
+    use super::super::router::{build_app, build_app_with_config, build_app_with_metrics};
     use super::super::types::{
         HTTP_REQUEST_ID_HEADER, HealthResponse, HttpServerConfig, TrainControlTarget,
     };
@@ -857,6 +857,45 @@ mod tests {
         assert!(!payload.is_empty(), "stats body should not be empty");
         assert!(payload.contains("step_phase_us="));
         assert!(payload.contains("plan_label="));
+        assert!(payload.contains("matched_prefix_tokens="));
+        assert!(payload.contains("resume_prefill_tokens="));
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_returns_json_when_requested() {
+        let metrics = ServerMetrics::new("Qwen3-4B");
+        metrics.record_request_cache(
+            Some(&crate::types::SessionId::from("w3-warm-000")),
+            48,
+            120,
+            72,
+        );
+        let app = build_app_with_metrics(mock_scheduler("Qwen3-4B"), metrics);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/stats?format=json")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["prefix_hit_rate"], serde_json::json!(1.0));
+        assert_eq!(payload["prefix_skip_rate"], serde_json::json!(0.4));
+        assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));
+        assert_eq!(payload["session_affinity_miss"], serde_json::json!(0));
+        assert_eq!(payload["matched_prefix_tokens"], serde_json::json!(48));
+        assert_eq!(payload["resume_prefill_tokens"], serde_json::json!(72));
+        assert_eq!(
+            payload["last_request"]["session_id"],
+            serde_json::json!("w3-warm-000")
+        );
+        assert_eq!(
+            payload["sessions"]["w3-warm-000"]["matched_prefix_tokens"],
+            serde_json::json!(48)
+        );
     }
 
     #[tokio::test]
