@@ -778,9 +778,37 @@ mod tests {
         );
 
         assert!(prompt.contains("Checking."));
+        assert!(prompt.contains("Checking.\n<tool_call>\n"));
         assert!(prompt.contains("<tool_call>"));
         assert!(prompt.contains(r#""name":"shell""#));
         assert!(prompt.contains(r#""command":"pwd""#));
+    }
+
+    #[test]
+    fn empty_assistant_tool_call_matches_generation_prompt_continuation() {
+        let user = ChatMessage::user("session w4 base prefix");
+        let tool_call = ToolCall::new("retrieve_context", json!({ "query": "session-context" }));
+
+        let warmup_prompt = messages_to_prompt(std::slice::from_ref(&user), &[]);
+        let mut completed_warmup_prefix = warmup_prompt;
+        completed_warmup_prefix.push_str(TOOL_CALL_BLOCK.open);
+        completed_warmup_prefix.push('\n');
+        completed_warmup_prefix.push_str(&tool_call.prompt_payload());
+        completed_warmup_prefix.push('\n');
+        completed_warmup_prefix.push_str(TOOL_CALL_BLOCK.close);
+        completed_warmup_prefix.push_str("<|im_end|>\n");
+
+        let resume_prompt = messages_to_prompt(
+            &[
+                user,
+                ChatMessage::assistant("", vec![tool_call]),
+                ChatMessage::tool_result("retrieve_context", "tool result payload"),
+            ],
+            &[],
+        );
+
+        assert!(resume_prompt.starts_with(&completed_warmup_prefix));
+        assert!(!resume_prompt.contains("<|im_start|>assistant\n\n<tool_call>"));
     }
 
     #[test]
