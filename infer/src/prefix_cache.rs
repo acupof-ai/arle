@@ -79,6 +79,7 @@ pub struct BlockMetadataUpdate {
     pub location: Option<BlockLocation>,
     pub byte_len: Option<u32>,
     pub session_id: Option<Option<SessionId>>,
+    pub host_swap_eligible: Option<bool>,
     pub soft_pin_until: Option<Option<u64>>,
     pub host_spill_pin_until: Option<Option<u64>>,
     pub entry_state: Option<IndexEntryState>,
@@ -90,6 +91,7 @@ pub struct BlockMetadata {
     pub location: Option<BlockLocation>,
     pub byte_len: u32,
     pub session_id: Option<SessionId>,
+    pub host_swap_eligible: bool,
     pub fingerprint: Option<BlockFingerprint>,
     pub soft_pin_until: Option<u64>,
     pub host_spill_pin_until: Option<u64>,
@@ -139,6 +141,11 @@ struct Node {
     /// Serialized session affinity hint for future policy / persistence work.
     #[serde(default)]
     session_id: Option<SessionId>,
+    /// Runtime retention hint: true when the owning request was long enough
+    /// that T1 host-pinned demotion should preserve this block instead of
+    /// dropping it under GPU pressure.
+    #[serde(default, skip)]
+    host_swap_eligible: bool,
     /// Optional content fingerprint used by the M4/M5 persistence paths.
     #[serde(default)]
     fingerprint: Option<BlockFingerprint>,
@@ -180,6 +187,7 @@ impl Node {
             hit_count: 0,
             tier_location: None,
             session_id: None,
+            host_swap_eligible: false,
             fingerprint: None,
             byte_len: 0,
             soft_pin_until: None,
@@ -378,6 +386,31 @@ impl RadixCache {
     fn find_block_node_mut(&mut self, block: BlockId) -> Option<&mut Node> {
         let idx = *self.block_index.get(&block)?;
         self.nodes.get_mut(idx)
+    }
+
+    /// Retag one cached block while preserving its radix position and
+    /// metadata. T1/T2 blocks use logical ids that must not collide with T0
+    /// page ids after the original GPU pages are released.
+    pub fn retag_block(&mut self, old: BlockId, new: BlockId) -> bool {
+        if old == new {
+            return self.block_index.contains_key(&old);
+        }
+        if self.block_index.contains_key(&new) {
+            return false;
+        }
+        let Some(idx) = self.block_index.remove(&old) else {
+            return false;
+        };
+        let Some(node) = self.nodes.get_mut(idx) else {
+            return false;
+        };
+        if node.block_id != Some(old) {
+            self.block_index.insert(old, idx);
+            return false;
+        }
+        node.block_id = Some(new);
+        self.block_index.insert(new, idx);
+        true
     }
 
     // -------------------------------------------------------------------------
@@ -942,10 +975,7 @@ impl RadixCache {
                 if node.ref_count != 0 || node.block_id.is_none() {
                     continue;
                 }
-                let active_leaf = node
-                    .children
-                    .iter()
-                    .all(|(_, child_idx)| evicted_set.contains(child_idx));
+                let active_leaf = self.node_is_active_leaf_for_tier(idx, None, &evicted_set);
                 if !active_leaf {
                     continue;
                 }
@@ -995,6 +1025,29 @@ impl RadixCache {
         n: usize,
         tier_filter: Option<Tier>,
     ) -> Vec<BlockId> {
+        self.evict_with_policy_for_intent(
+            policy,
+            signals,
+            n,
+            tier_filter,
+            BlockSelectionIntent::Evict,
+        )
+    }
+
+    /// Evict up to `n` blocks using the provided policy and selection intent.
+    ///
+    /// `BlockSelectionIntent::Drain` is used by T1 demotion headroom: it still
+    /// keeps the active-leaf and ref-count invariants, but does not let a
+    /// lookup soft-pin on an old host leaf force the scheduler to drop a newer
+    /// GPU prefix block instead.
+    pub fn evict_with_policy_for_intent(
+        &mut self,
+        policy: &dyn EvictionPolicy,
+        signals: SchedulerSignals,
+        n: usize,
+        tier_filter: Option<Tier>,
+        intent: BlockSelectionIntent,
+    ) -> Vec<BlockId> {
         if n == 0 {
             return vec![];
         }
@@ -1015,16 +1068,29 @@ impl RadixCache {
                 if node.block_id.is_none() {
                     continue;
                 }
+                if node.ref_count != 0 {
+                    continue;
+                }
                 if let Some(tier) = tier_filter
                     && node.tier_location.as_ref().map(BlockLocation::tier) != Some(tier)
                 {
                     continue;
                 }
+                if Self::selection_pin_active(node, tier_filter, intent, now) {
+                    continue;
+                }
+                if node.entry_state != IndexEntryState::Ready {
+                    continue;
+                }
+                if matches!(
+                    intent,
+                    BlockSelectionIntent::Spill | BlockSelectionIntent::Drain
+                ) && !matches!(node.store_state, StoreState::Idle | StoreState::Failed)
+                {
+                    continue;
+                }
 
-                let active_leaf = node
-                    .children
-                    .iter()
-                    .all(|(_, child_idx)| evicted_set.contains(child_idx));
+                let active_leaf = self.node_is_active_leaf_for_tier(idx, tier_filter, &evicted_set);
                 if !active_leaf {
                     continue;
                 }
@@ -1033,14 +1099,13 @@ impl RadixCache {
                     Some(BlockLocation::Gpu { slot }) => slot,
                     _ => 0,
                 };
-                let soft_pinned = node.soft_pin_until.is_some_and(|deadline| deadline > now);
                 let candidate = EvictionCandidate {
                     slot,
                     tokens: self.block_size as u32,
                     last_access_step: node.last_access,
                     hit_count: node.hit_count,
                     prefix_depth: node.tokens.len() as u32,
-                    pinned: node.ref_count != 0 || soft_pinned,
+                    pinned: false,
                 };
                 let score = policy.score(candidate, signals);
                 if !score.is_finite() {
@@ -1093,63 +1158,90 @@ impl RadixCache {
         n: usize,
         tier_filter: Option<Tier>,
         intent: BlockSelectionIntent,
+        require_host_swap_eligible: bool,
     ) -> Vec<BlockId> {
         if n == 0 {
             return vec![];
         }
 
         let now = self.clock;
-        let mut candidates = Vec::new();
-        for node in &self.nodes[1..] {
-            let Some(block_id) = node.block_id else {
-                continue;
-            };
-            if node.ref_count != 0 {
-                continue;
-            }
-            if Self::selection_pin_active(node, tier_filter, intent, now) {
-                continue;
-            }
-            if node.entry_state != IndexEntryState::Ready {
-                continue;
-            }
-            if matches!(
-                intent,
-                BlockSelectionIntent::Spill | BlockSelectionIntent::Drain
-            ) && !matches!(node.store_state, StoreState::Idle | StoreState::Failed)
-            {
-                continue;
-            }
-            if let Some(tier) = tier_filter
-                && node.tier_location.as_ref().map(BlockLocation::tier) != Some(tier)
-            {
-                continue;
-            }
+        let mut selected = Vec::with_capacity(n);
+        let mut selected_nodes = std::collections::HashSet::with_capacity(n);
 
-            let slot = match node.tier_location {
-                Some(BlockLocation::Gpu { slot }) => slot,
-                _ => 0,
-            };
-            let candidate = EvictionCandidate {
-                slot,
-                tokens: self.block_size as u32,
-                last_access_step: node.last_access,
-                hit_count: node.hit_count,
-                prefix_depth: node.tokens.len() as u32,
-                pinned: false,
-            };
-            let score = policy.score(candidate, signals);
-            if score.is_finite() {
-                candidates.push((score, block_id));
+        while selected.len() < n {
+            let mut best: Option<(f32, usize, BlockId)> = None;
+            for idx in 1..self.nodes.len() {
+                if selected_nodes.contains(&idx) {
+                    continue;
+                }
+                let node = &self.nodes[idx];
+                let Some(block_id) = node.block_id else {
+                    continue;
+                };
+                if node.ref_count != 0 {
+                    continue;
+                }
+                if require_host_swap_eligible && !node.host_swap_eligible {
+                    continue;
+                }
+                if Self::selection_pin_active(node, tier_filter, intent, now) {
+                    continue;
+                }
+                if node.entry_state != IndexEntryState::Ready {
+                    continue;
+                }
+                if matches!(
+                    intent,
+                    BlockSelectionIntent::Spill | BlockSelectionIntent::Drain
+                ) && !matches!(node.store_state, StoreState::Idle | StoreState::Failed)
+                {
+                    continue;
+                }
+                if let Some(tier) = tier_filter
+                    && node.tier_location.as_ref().map(BlockLocation::tier) != Some(tier)
+                {
+                    continue;
+                }
+                if !self.node_is_active_leaf_for_tier(idx, tier_filter, &selected_nodes) {
+                    continue;
+                }
+
+                let slot = match node.tier_location {
+                    Some(BlockLocation::Gpu { slot }) => slot,
+                    _ => 0,
+                };
+                let candidate = EvictionCandidate {
+                    slot,
+                    tokens: self.block_size as u32,
+                    last_access_step: node.last_access,
+                    hit_count: node.hit_count,
+                    prefix_depth: node.tokens.len() as u32,
+                    pinned: false,
+                };
+                let score = policy.score(candidate, signals);
+                if !score.is_finite() {
+                    continue;
+                }
+                let keep_existing_best = match best {
+                    Some((best_score, best_idx, best_bid)) => {
+                        let ordering = best_score.total_cmp(&score);
+                        ordering.is_lt()
+                            || (ordering.is_eq() && (best_bid.0, best_idx) <= (block_id.0, idx))
+                    }
+                    None => false,
+                };
+                if !keep_existing_best {
+                    best = Some((score, idx, block_id));
+                }
             }
+            let Some((_, idx, block_id)) = best else {
+                break;
+            };
+            selected_nodes.insert(idx);
+            selected.push(block_id);
         }
 
-        candidates.sort_by(|(a_score, a_bid), (b_score, b_bid)| {
-            a_score
-                .total_cmp(b_score)
-                .then_with(|| a_bid.0.cmp(&b_bid.0))
-        });
-        candidates.into_iter().take(n).map(|(_, bid)| bid).collect()
+        selected
     }
 
     /// Select a read-only sparse KV page view for MagicDec-style drafting.
@@ -1397,6 +1489,48 @@ impl RadixCache {
         }
     }
 
+    fn node_matches_tier_filter(&self, idx: usize, tier_filter: Option<Tier>) -> bool {
+        let Some(node) = self.nodes.get(idx) else {
+            return false;
+        };
+        node.block_id.is_some()
+            && tier_filter.is_none_or(|tier| {
+                node.tier_location.as_ref().map(BlockLocation::tier) == Some(tier)
+            })
+    }
+
+    fn subtree_has_unselected_block_in_tier(
+        &self,
+        idx: usize,
+        tier_filter: Option<Tier>,
+        selected_nodes: &std::collections::HashSet<usize>,
+    ) -> bool {
+        if selected_nodes.contains(&idx) {
+            return false;
+        }
+        if self.node_matches_tier_filter(idx, tier_filter) {
+            return true;
+        }
+        self.nodes.get(idx).is_some_and(|node| {
+            node.children.values().any(|&child_idx| {
+                self.subtree_has_unselected_block_in_tier(child_idx, tier_filter, selected_nodes)
+            })
+        })
+    }
+
+    fn node_is_active_leaf_for_tier(
+        &self,
+        idx: usize,
+        tier_filter: Option<Tier>,
+        selected_nodes: &std::collections::HashSet<usize>,
+    ) -> bool {
+        self.nodes.get(idx).is_some_and(|node| {
+            node.children.values().all(|&child_idx| {
+                !self.subtree_has_unselected_block_in_tier(child_idx, tier_filter, selected_nodes)
+            })
+        })
+    }
+
     /// Reclaim orphaned tombstones after eviction.
     ///
     /// A node is reclaimable when it is:
@@ -1597,6 +1731,7 @@ impl RadixCache {
             location: node.tier_location.clone(),
             byte_len: node.byte_len,
             session_id: node.session_id.clone(),
+            host_swap_eligible: node.host_swap_eligible,
             fingerprint: node.fingerprint,
             soft_pin_until: node.soft_pin_until,
             host_spill_pin_until: node.host_spill_pin_until,
@@ -1666,6 +1801,9 @@ impl RadixCache {
                 }
                 if let Some(session_id) = update.session_id {
                     node.session_id = session_id;
+                }
+                if let Some(host_swap_eligible) = update.host_swap_eligible {
+                    node.host_swap_eligible = host_swap_eligible;
                 }
                 if let Some(soft_pin_until) = update.soft_pin_until {
                     node.soft_pin_until = soft_pin_until;
