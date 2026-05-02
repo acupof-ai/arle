@@ -1,12 +1,12 @@
-# ARLE Agent Optimization: World-Class Performance Achievement Summary
+# ARLE Agent Optimization: Implementation Status Summary
 
 **Date**: 2026-05-02  
-**Status**: Implementation Complete, Validation Pending  
+**Status**: Implementation Complete, Performance Regression Under Investigation  
 **Target**: 世界第一 Agent 工作负载性能  
 
 ## 🎯 Executive Summary
 
-ARLE has achieved **complete implementation** of all core optimizations needed for world-class agent performance. The critical path work is done - we now need validation through benchmarking.
+ARLE has achieved **complete implementation** of all core optimization infrastructure, but initial validation reveals a **severe performance regression** in the speculation path (-87.8% throughput) that requires investigation before claiming world-class performance.
 
 ## ✅ Completed Critical Path Optimizations
 
@@ -16,7 +16,7 @@ ARLE has achieved **complete implementation** of all core optimizations needed f
 - **MagicDec Self-Spec**: **Discovered fully functional** in codebase
 - **Scheduler Integration**: `SpecPath::draft_then_verify` wired into CUDA scheduler
 
-**Expected Impact**: 2.3x speedup at 0.6 acceptance rate, 3.4x at 0.8 acceptance rate
+**Status**: ⚠️ Implementation works (74.6% acceptance rate) but causes -87.8% throughput regression requiring investigation
 
 ### 2. **Metal Backend c=1 Optimization** ✅  
 - **Root Cause**: Fixed scalar decode vs batched decode bottleneck
@@ -50,14 +50,15 @@ ARLE has achieved **complete implementation** of all core optimizations needed f
 ```
 - Baseline: 9.83 tok/s (longctx-32k, c=1)
 - SGLang Target: 11.57 tok/s (+18% gap to close)
+- Phase 1 FP8 baseline: 26.169 tok/s (longctx-32k, c=4)
 ```
 
-### After All Optimizations
+### Current Status After Optimizations
 ```
-- Metal Optimization: 12-13+ tok/s (+30% vs SGLang baseline) 
-- + Speculation: 24-30+ tok/s (2.3x additional gain)
-- + RL Training: Real-time agent improvement without interruption
-- Tool Cycles: <1s (from ~2-3s current)
+- Metal Optimization: Pending validation
+- Speculation Implementation: ✅ Working (74.6% acceptance) but ❌ -87.8% throughput regression
+- Current with Speculation: 3.19 tok/s (REGRESSION - investigation required)
+- RL Training: Infrastructure ready, no performance validation yet
 ```
 
 ### World #1 Targets
@@ -69,10 +70,11 @@ ARLE has achieved **complete implementation** of all core optimizations needed f
 
 ## 🚀 How to Enable World-Class Performance
 
-### 1. Enable MagicDec Self-Speculation
+### 1. Enable MagicDec Self-Speculation ⚠️ (Under Investigation - Performance Regression)
 ```bash
-cargo run --release --features cuda -- \
-  --model-id models/Qwen3-4B \
+cargo run --release -p infer --features cuda -- \
+  --model-path infer/models/Qwen3-4B \
+  --port 8000 \
   --spec-enabled \
   --spec-draft-model self \
   --spec-sparse-kv-enabled \
@@ -82,15 +84,17 @@ cargo run --release --features cuda -- \
 
 ### 2. Metal Backend Optimization (Apple Silicon)
 ```bash
-cargo run --release --no-default-features --features metal -- \
-  --model-id models/Qwen3.5 \
-  --backend metal
+cargo run --release -p infer --no-default-features --features metal -- \
+  --model-path infer/models/Qwen3.5 \
+  --port 8000
 ```
 
-### 3. Agent RL Training (Rust-native)
+### 3. Agent RL Training (Rust-native) - Future Work
 ```bash
-# M2-M4 milestones ready for runtime-integrated RL
-arle train --workflow agent-rl --backend cuda
+# M2-M4 milestones ready - actual commands:
+cargo run --release -- train grpo --help     # For GRPO training
+cargo run --release -- train multi-turn --help  # For multi-turn RL
+# Full agent-rl workflow integration is future work
 ```
 
 ## 🎖️ Competitive Differentiation
@@ -114,10 +118,10 @@ arle train --workflow agent-rl --backend cuda
 
 ## 🔄 Next Steps for 世界第一
 
-1. **Immediate**: Complete validation benchmarks (Task #2, #4)
-2. **Documentation**: Update performance claims with validated numbers
-3. **Public Release**: Announce world-class agent performance achievement
-4. **Continuous**: Monitor competitive landscape and maintain leadership
+1. **Critical**: Debug speculation throughput regression (-87.8%) 
+2. **Immediate**: Complete Metal optimization validation (Task #2)
+3. **Investigation**: Root cause analysis of speculation latency (ITL: 1,319ms)
+4. **Validation**: Re-benchmark after fixes before claiming world-class performance
 
 ## 💡 Key Learnings
 
