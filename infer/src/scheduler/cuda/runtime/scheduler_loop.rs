@@ -7,7 +7,8 @@
 use super::super::budget::{PageBudget, estimated_request_target};
 use super::super::{ModelForward, Phase, STATS_LOG_INTERVAL, Scheduler, error, info};
 use super::helpers::{
-    DeferredWaitingRequest, WaitingInsertBias, WaitingRequestHint, insert_deferred_waiting_request,
+    DeferredWaitingRequest, WaitingInsertBias, choose_session_affinity_candidate,
+    insert_deferred_waiting_request,
 };
 
 impl<M: ModelForward> Scheduler<M> {
@@ -222,7 +223,7 @@ impl<M: ModelForward> Scheduler<M> {
             self.stats.prefill_oom_cooldown_until = None;
         }
 
-        let candidates = self.collect_admission_candidates(&available_free_slots);
+        let mut candidates = self.collect_admission_candidates(&available_free_slots);
         let mut deferred_waiting = std::collections::VecDeque::new();
         let mut admission_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
         for (slot_idx, req) in self.active.iter().enumerate() {
@@ -239,19 +240,21 @@ impl<M: ModelForward> Scheduler<M> {
                 req.reusable_prefix_len,
             ));
         }
-        for candidate in candidates {
+        while !candidates.is_empty() {
+            let candidate_idx = choose_session_affinity_candidate(&candidates)
+                .expect("candidate list is non-empty");
+            let candidate = candidates.remove(candidate_idx);
             let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) =
                 Self::choose_admission_slot(&candidate.plan, &available_free_slots)
             else {
                 self.maybe_prefetch_staged_prefix(&candidate.plan);
-                let hint = WaitingRequestHint::from_plan(&candidate.plan, 0);
                 self.release_admission_plan(&candidate.plan);
                 insert_deferred_waiting_request(
                     &mut deferred_waiting,
                     DeferredWaitingRequest {
                         incoming: candidate.incoming,
                         prompt_tokens: candidate.prompt_tokens,
-                        hint,
+                        hint: candidate.hint,
                     },
                     WaitingInsertBias::BeforeEqual,
                 );
@@ -267,14 +270,13 @@ impl<M: ModelForward> Scheduler<M> {
                 reserved_prefix_tokens,
             ) {
                 self.maybe_prefetch_staged_prefix(&candidate.plan);
-                let hint = WaitingRequestHint::from_plan(&candidate.plan, reusable_prefix_len);
                 self.release_admission_plan(&candidate.plan);
                 insert_deferred_waiting_request(
                     &mut deferred_waiting,
                     DeferredWaitingRequest {
                         incoming: candidate.incoming,
                         prompt_tokens: candidate.prompt_tokens,
-                        hint,
+                        hint: candidate.hint,
                     },
                     WaitingInsertBias::BeforeEqual,
                 );
