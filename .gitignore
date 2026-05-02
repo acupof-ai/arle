@@ -9,7 +9,10 @@ build/
 **/target/
 /target-off/
 .venv/
-.claude/
+.claude/.DS_Store
+.claude/**/.DS_Store
+.claude/scheduled_tasks.lock
+.claude/worktrees/
 release/
 .gstack/
 models/
