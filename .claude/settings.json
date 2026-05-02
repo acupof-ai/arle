@@ -1,4 +1,11 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(tmux ls*)",
+      "Bash(tmux capture-pane*)",
+      "Bash(tmux send-keys*)"
+    ]
+  },
   "hooks": {
     "PostToolUse": [
       {
