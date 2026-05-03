@@ -1257,11 +1257,12 @@ fn run_metal_scheduler_runtime(
 
         let scheduled_decode_rows =
             step.decode.as_ref().map_or(0, |batch| batch.req_ids.len()) as u64;
-        let scheduled_prefill_rows = u64::from(step.prefill.is_some());
+        let scheduled_prefill_rows = step.prefill.len() as u64;
         let scheduled_prefill_tokens = step
             .prefill
-            .as_ref()
-            .map_or(0, |prefill| prefill.input_tokens.len() as u64);
+            .iter()
+            .map(|prefill| prefill.input_tokens.len() as u64)
+            .sum();
         let scheduled_rows = scheduled_decode_rows + scheduled_prefill_rows;
         metrics.set_scheduler_step(
             scheduled_rows,
@@ -1353,7 +1354,16 @@ fn guard_schedule_step(
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
     qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
 ) {
-    match (step.decode, step.prefill) {
+    // The planner emits 0-or-1 prefill rows in B2 commit 1; commit 3 lifts
+    // this to up to `max_prefill_rows`. Until then, dispatch on the head row
+    // and assert the invariant so a planner regression fails loudly.
+    debug_assert!(
+        step.prefill.len() <= 1,
+        "B2 commit 1 dispatcher expects ≤1 prefill row; got {}",
+        step.prefill.len()
+    );
+    let prefill_head = step.prefill.into_iter().next();
+    match (step.decode, prefill_head) {
         (Some(batch), Some(prefill)) => {
             if !guard_mixed_batch(
                 batch.req_ids.clone(),

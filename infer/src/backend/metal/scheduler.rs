@@ -2,7 +2,8 @@
 //!
 //! This module stays self-contained so it can be tested on machines without
 //! Apple GPU access, but the runtime executes its output directly: one
-//! decode-first `MetalScheduleStep` per tick plus an optional prefill chunk.
+//! decode-first `MetalScheduleStep` per tick plus zero or more prefill chunks
+//! (the planner currently emits 0 or 1; the DTO supports N for B2/B3).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -137,10 +138,12 @@ pub struct MetalPrefillChunk {
 
 /// Scheduler work for one tick. Decode always runs before prefill when both
 /// are present so runtime priority stays explicit and single-sourced here.
+/// `prefill` is a Vec to admit ≥0 rows; the planner emits 0 or 1 today, with
+/// multi-row dispatch landing in B2 commit 3.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetalScheduleStep {
     pub decode: Option<MetalDecodeBatch>,
-    pub prefill: Option<MetalPrefillChunk>,
+    pub prefill: Vec<MetalPrefillChunk>,
     plan: MetalLogicalServePlan,
 }
 
@@ -158,21 +161,21 @@ impl MetalScheduleStep {
     }
 
     fn from_logical_plan(plan: MetalLogicalServePlan) -> Self {
-        debug_assert!(
-            plan.prefill_rows.len() <= 1,
-            "legacy MetalScheduleStep supports at most one prefill row"
-        );
         let decode = (!plan.decode_rows.is_empty()).then(|| MetalDecodeBatch {
             req_ids: plan.decode_rows.iter().map(|row| row.req_id).collect(),
             input_tokens: plan.decode_rows.iter().map(|row| row.input_token).collect(),
         });
-        let prefill = plan.prefill_rows.first().map(|row| MetalPrefillChunk {
-            req_id: row.req_id,
-            input_tokens: row.input_tokens.clone(),
-            prompt_start: row.prompt_start,
-            prompt_end: row.prompt_end,
-            prompt_len: row.prompt_len,
-        });
+        let prefill = plan
+            .prefill_rows
+            .iter()
+            .map(|row| MetalPrefillChunk {
+                req_id: row.req_id,
+                input_tokens: row.input_tokens.clone(),
+                prompt_start: row.prompt_start,
+                prompt_end: row.prompt_end,
+                prompt_len: row.prompt_len,
+            })
+            .collect();
         Self {
             decode,
             prefill,
@@ -326,10 +329,7 @@ impl MetalScheduler {
         runtime_states: &[MetalRuntimeRequestState],
     ) -> MetalLogicalServePlan {
         let decode_rows = self.build_decode_rows(runtime_states);
-        let prefill_rows = self
-            .build_prefill_row(runtime_states, decode_rows.len())
-            .into_iter()
-            .collect();
+        let prefill_rows = self.build_prefill_rows(runtime_states, decode_rows.len());
         MetalLogicalServePlan::new(decode_rows, prefill_rows)
     }
 
@@ -376,27 +376,35 @@ impl MetalScheduler {
             .collect::<Vec<_>>()
     }
 
-    fn build_prefill_row(
+    /// Build the prefill rows for a single tick. Returns 0-or-1 entries today;
+    /// commit 3 of B2 will allow up to `MetalSchedulerConfig::max_prefill_rows`
+    /// concurrent rows once the C++ packed-prefill primitive lands.
+    fn build_prefill_rows(
         &mut self,
         runtime_states: &[MetalRuntimeRequestState],
         row_index: usize,
-    ) -> Option<MetalLogicalPrefillRow> {
+    ) -> Vec<MetalLogicalPrefillRow> {
         let decode_count = Self::count_decode_runtime(runtime_states);
         let chunk_cap = self.prefill_chunk_budget(decode_count);
         if chunk_cap == 0 {
-            return None;
+            return Vec::new();
         }
         let (req_id, newly_admitted) =
             if let Some(req_id) = self.find_prefilling_request(runtime_states) {
                 (req_id, false)
             } else if self.running_len() < self.config.max_running_requests {
-                (self.admit_next_waiting_request()?, true)
+                let Some(admitted) = self.admit_next_waiting_request() else {
+                    return Vec::new();
+                };
+                (admitted, true)
             } else {
-                return None;
+                return Vec::new();
             };
 
-        let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = {
-            let state = self.requests.get_mut(&req_id)?;
+        let row_inputs = {
+            let Some(state) = self.requests.get_mut(&req_id) else {
+                return Vec::new();
+            };
             let prompt_len = state.prompt_len();
             let prompt_start = if newly_admitted {
                 0
@@ -422,6 +430,7 @@ impl MetalScheduler {
                 prompt_start == 0,
             )
         };
+        let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = row_inputs;
 
         if emit_prefill_started {
             self.emit_event(
@@ -431,14 +440,14 @@ impl MetalScheduler {
             );
         }
 
-        Some(MetalLogicalPrefillRow::new(
+        vec![MetalLogicalPrefillRow::new(
             row_index,
             req_id,
             input_tokens,
             prompt_start,
             prompt_end,
             prompt_len,
-        ))
+        )]
     }
 
     fn validate_runtime_snapshots(&self, runtime_states: &[MetalRuntimeRequestState]) {
@@ -616,12 +625,17 @@ mod tests {
             step.decode.is_none(),
             "expected no decode work, got {step:?}"
         );
-        step.prefill.expect("expected prefill work")
+        assert_eq!(
+            step.prefill.len(),
+            1,
+            "expected exactly one prefill row, got {step:?}"
+        );
+        step.prefill.into_iter().next().unwrap()
     }
 
     fn expect_decode_only(step: MetalScheduleStep) -> MetalDecodeBatch {
         assert!(
-            step.prefill.is_none(),
+            step.prefill.is_empty(),
             "expected no prefill work, got {step:?}"
         );
         step.decode.expect("expected decode work")
@@ -630,10 +644,14 @@ mod tests {
     fn expect_decode_then_prefill(
         step: MetalScheduleStep,
     ) -> (MetalDecodeBatch, MetalPrefillChunk) {
-        (
-            step.decode.expect("expected decode work"),
-            step.prefill.expect("expected prefill work"),
-        )
+        let decode = step.decode.expect("expected decode work");
+        assert_eq!(
+            step.prefill.len(),
+            1,
+            "expected exactly one prefill row, got {:?}",
+            step.prefill
+        );
+        (decode, step.prefill.into_iter().next().unwrap())
     }
 
     #[test]
