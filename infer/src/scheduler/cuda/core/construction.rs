@@ -277,6 +277,8 @@ impl<M: ModelForward> Scheduler<M> {
             next_tier_block_id: u32::MAX,
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,
+            session_slots: HashMap::new(),
+            session_block_refs: HashMap::new(),
             coordinator_handle,
             coordinator_events,
             coordinator_thread,

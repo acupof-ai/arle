@@ -9,6 +9,7 @@ pub(super) struct FetchWaiter {
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) session_id: Option<crate::types::SessionId>,
     pub(super) staged_prefix: crate::kv_tier::ReadmissionPlan,
+    pub(super) session_slot_hold: Option<super::super::core::SessionSlotHold>,
 }
 
 #[derive(Clone)]
@@ -20,6 +21,7 @@ pub(super) struct PrefixAdmissionPlan {
     pub(super) direct_gpu_attach: bool,
     pub(super) attached_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
     pub(super) staged_prefix_plan: Option<crate::kv_tier::ReadmissionPlan>,
+    pub(super) session_slot_hold: Option<super::super::core::SessionSlotHold>,
 }
 
 pub(super) struct QueuedAdmissionCandidate {

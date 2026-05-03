@@ -17,8 +17,17 @@ impl<M: ModelForward> Scheduler<M> {
         if staged_prefix.blocks.is_empty() {
             return Ok(false);
         }
-        let final_plan =
-            self.gpu_ready_staged_prefix_plan(request_id, prompt_tokens, &staged_prefix)?;
+        let final_plan = if let Some(hold) = waiter.session_slot_hold.as_ref() {
+            self.session_slot_gpu_ready_plan(&hold.session_id, staged_prefix.matched_len)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "session-slot staged prefix promotion did not become GPU-runnable (matched={})",
+                        staged_prefix.matched_len
+                    )
+                })?
+        } else {
+            self.gpu_ready_staged_prefix_plan(request_id, prompt_tokens, &staged_prefix)?
+        };
         let attached_prefix_blocks = final_plan.block_ids();
         if let Some(req) = self.request_mut(slot_idx) {
             if req.id != request_id {
@@ -65,6 +74,7 @@ impl<M: ModelForward> Scheduler<M> {
                 prompt_tokens: req.prompt_tokens.clone(),
                 session_id: req.session_id.clone(),
                 staged_prefix,
+                session_slot_hold: req.session_slot_hold.clone(),
             });
         }
         ready
@@ -81,7 +91,9 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
         for waiter in &ready_waiters {
-            self.prefix_cache.release(&waiter.staged_prefix.block_ids());
+            if waiter.session_slot_hold.is_none() {
+                self.prefix_cache.release(&waiter.staged_prefix.block_ids());
+            }
         }
         if let Err(err) = self.promote_fetched_prefix(&ready_waiters[0], blocks) {
             warn!(
@@ -147,6 +159,7 @@ impl<M: ModelForward> Scheduler<M> {
             prompt_tokens: req.prompt_tokens.clone(),
             session_id: req.session_id.clone(),
             staged_prefix: staged_prefix.clone(),
+            session_slot_hold: req.session_slot_hold.clone(),
         };
         let start = std::time::Instant::now();
         self.complete_ready_fetch_waiters(vec![waiter], &fetched_blocks, Some(start));

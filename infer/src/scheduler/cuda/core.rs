@@ -27,6 +27,9 @@ mod helpers;
 #[path = "core/state_types.rs"]
 mod state_types;
 
+#[path = "core/session_slots.rs"]
+mod session_slots;
+
 #[path = "core/emit_worker.rs"]
 mod emit_worker;
 
@@ -44,6 +47,7 @@ pub(in crate::scheduler::cuda) use helpers::{
     host_spill_target_bytes, is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages,
     sealed_block_token_count, select_sparse_pages_from_slot_pages,
 };
+pub(in crate::scheduler::cuda) use session_slots::{SessionSlot, SessionSlotHold};
 pub(in crate::scheduler::cuda) use state_types::{
     PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow, PrefetchTicketState,
     SchedulerRuntimeStats, StoreDedupKey,
@@ -107,6 +111,13 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) block_owner_slots: HashMap<BlockId, usize>,
     /// Reverse index for `block_owner_slots`, keyed by slot.
     pub(super) slot_owned_blocks: Vec<Vec<BlockId>>,
+    /// Session-keyed KV side index. This intentionally lives outside the
+    /// radix trie: chat-template/tokenization drift must not prevent a same
+    /// session resume from finding its committed KV blocks.
+    pub(super) session_slots: HashMap<crate::types::SessionId, SessionSlot>,
+    /// Independent block membership refs held by `session_slots`; separate
+    /// from radix node refs, which remain request-local token-walk refs.
+    pub(super) session_block_refs: HashMap<BlockId, u32>,
     pub(super) coordinator_handle: crate::kv_tier::CoordinatorHandle,
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
@@ -470,12 +481,14 @@ impl<M: ModelForward> Scheduler<M> {
             if self.host_pool_demote_headroom_bytes() >= required_bytes {
                 break;
             }
-            let evicted = self.prefix_cache.evict_with_policy_for_intent(
+            let protected = self.session_protected_blocks();
+            let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),
                 self.eviction_signals(),
                 1,
                 Some(crate::kv_tier::Tier::HostPinned),
                 BlockSelectionIntent::Drain,
+                Some(&protected),
             );
             if evicted.is_empty() {
                 break;
@@ -1140,13 +1153,16 @@ impl<M: ModelForward> Scheduler<M> {
         );
         self.record_sealed_gpu_blocks(
             slot_idx,
-            blocks.into_iter().zip(sealed_block_pages),
+            blocks.iter().copied().zip(sealed_block_pages),
             session_id,
             self.config.prefix_cache_keepalive_ticks,
             true,
             session_id.is_some()
                 && prompt_tokens.len() >= self.config.t1_host_pinned_min_prompt_tokens,
         );
+        if let Some(session_id) = session_id {
+            self.publish_session_slot(session_id, blocks, sealed_token_count);
+        }
     }
 
     /// Remove the transient "this free slot still owns a materialized prompt
@@ -1215,6 +1231,7 @@ impl<M: ModelForward> Scheduler<M> {
                 host_block_id
             ));
         }
+        self.retag_session_slot_block(block_id, host_block_id);
         self.block_to_pages.remove(&block_id);
         self.block_owner_slots.remove(&block_id);
         let _ = self.prefix_cache.update_block_metadata(
@@ -1259,6 +1276,9 @@ impl<M: ModelForward> Scheduler<M> {
     fn drop_cached_blocks(&mut self, blocks: &[BlockId]) -> usize {
         let mut reclaimed_pages = 0usize;
         for &block_id in blocks {
+            if self.session_block_refs.contains_key(&block_id) {
+                continue;
+            }
             let metadata = self.block_metadata(block_id);
             if let Some(pages) = self.block_to_pages.remove(&block_id) {
                 reclaimed_pages += self.paged_kv_pool.release_pages(&pages).len();
@@ -1297,6 +1317,9 @@ impl<M: ModelForward> Scheduler<M> {
             false,
         );
         for block_id in candidates {
+            if self.session_block_refs.contains_key(&block_id) {
+                continue;
+            }
             if self.store_waiting.values().any(|pending| {
                 pending
                     .iter()
@@ -1421,6 +1444,9 @@ impl<M: ModelForward> Scheduler<M> {
         );
         let mut reclaimed_pages = 0usize;
         for bid in candidates.iter().copied() {
+            if self.block_has_active_session_ref(bid) {
+                continue;
+            }
             match self.demote_block_to_host(bid) {
                 Ok(freed_now) => {
                     reclaimed_pages += freed_now;
@@ -1436,11 +1462,14 @@ impl<M: ModelForward> Scheduler<M> {
         if reclaimed_pages < want_free {
             let remaining_pages = want_free.saturating_sub(reclaimed_pages);
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
-            let evicted = self.prefix_cache.evict_with_policy(
+            let protected = self.session_protected_blocks();
+            let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),
                 self.eviction_signals(),
                 blocks_to_drop,
                 Some(crate::kv_tier::Tier::Gpu),
+                BlockSelectionIntent::Evict,
+                Some(&protected),
             );
             if !evicted.is_empty() {
                 let dropped_pages = self.drop_cached_blocks(&evicted);
@@ -1506,6 +1535,9 @@ impl<M: ModelForward> Scheduler<M> {
             }
             let before = reclaimed_pages;
             for bid in candidates.iter().copied() {
+                if self.block_has_active_session_ref(bid) {
+                    continue;
+                }
                 match self.demote_block_to_host(bid) {
                     Ok(freed_now) => {
                         reclaimed_pages += freed_now;
@@ -1527,11 +1559,14 @@ impl<M: ModelForward> Scheduler<M> {
 
         if reclaimed_pages < shortage_pages {
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
-            let evicted = self.prefix_cache.evict_with_policy(
+            let protected = self.session_protected_blocks();
+            let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),
                 self.eviction_signals(),
                 blocks_to_drop,
                 Some(crate::kv_tier::Tier::Gpu),
+                BlockSelectionIntent::Evict,
+                Some(&protected),
             );
             reclaimed_pages += self.drop_cached_blocks(&evicted);
         }

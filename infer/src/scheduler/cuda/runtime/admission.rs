@@ -28,6 +28,7 @@ impl<M: ModelForward> Scheduler<M> {
             direct_gpu_attach: false,
             attached_prefix_blocks: Vec::new(),
             staged_prefix_plan: None,
+            session_slot_hold: None,
         }
     }
 
@@ -175,9 +176,20 @@ impl<M: ModelForward> Scheduler<M> {
 
         let block_size = self.prefix_cache.block_size();
         let heuristics = LookupHeuristics::default();
-        let mut lookup = self.prefix_cache.lookup_or_stage(prompt_tokens, heuristics);
+        let mut session_slot_hold = None;
+        let mut lookup = if let Some(session_id) = session_id
+            && let Some(session_lookup) =
+                self.lookup_session_slot_or_stage(session_id, prompt_tokens.len(), heuristics)
+        {
+            session_slot_hold = Some(session_lookup.hold);
+            session_lookup.lookup
+        } else {
+            self.prefix_cache.lookup_or_stage(prompt_tokens, heuristics)
+        };
         let mut session_resume_tokens = 0;
-        if let Some(session_id) = session_id {
+        if session_slot_hold.is_some() {
+            session_resume_tokens = lookup.matched_len;
+        } else if let Some(session_id) = session_id {
             let session_lookup = self.prefix_cache.lookup_session_prefix_or_stage(
                 session_id,
                 prompt_tokens,
@@ -193,11 +205,15 @@ impl<M: ModelForward> Scheduler<M> {
                 self.release_lookup_blocks(&session_lookup);
             }
         }
-        let radix_blocks: Vec<_> = lookup
-            .blocks
-            .iter()
-            .filter_map(|block| block.block_id)
-            .collect();
+        let radix_blocks: Vec<_> = if session_slot_hold.is_some() {
+            Vec::new()
+        } else {
+            lookup
+                .blocks
+                .iter()
+                .filter_map(|block| block.block_id)
+                .collect()
+        };
         let matched_sealed_block_count = matched_sealed_lookup_blocks(&lookup.blocks);
         let lookup_is_full_sealed = lookup.matched_len == 0
             || is_full_sealed_prefix(lookup.matched_len, block_size, matched_sealed_block_count);
@@ -265,6 +281,7 @@ impl<M: ModelForward> Scheduler<M> {
                 Vec::new()
             },
             staged_prefix_plan,
+            session_slot_hold,
         }
     }
 
@@ -321,6 +338,7 @@ impl<M: ModelForward> Scheduler<M> {
 
     pub(super) fn release_admission_plan(&mut self, plan: &PrefixAdmissionPlan) {
         self.prefix_cache.release(&plan.radix_blocks);
+        self.release_session_slot_hold(plan.session_slot_hold.as_ref());
     }
 
     fn release_lookup_blocks(&mut self, lookup: &LookupOutcome) {
@@ -357,6 +375,7 @@ impl<M: ModelForward> Scheduler<M> {
             direct_gpu_attach,
             attached_prefix_blocks,
             staged_prefix_plan,
+            session_slot_hold,
             ..
         } = plan;
         let waiting_fetch = staged_prefix_plan.is_some();
@@ -464,6 +483,7 @@ impl<M: ModelForward> Scheduler<M> {
             reusable_cached_prompt_len,
             attached_prefix_blocks,
             staged_prefix: staged_prefix_plan,
+            session_slot_hold,
         });
         if incoming.max_tokens == 0 {
             self.finish_request(slot_idx, crate::server_engine::FinishReason::Length);
@@ -589,19 +609,30 @@ impl<M: ModelForward> Scheduler<M> {
         let held_blocks = self
             .request(slot_idx)
             .and_then(|req| {
-                req.staged_prefix
-                    .as_ref()
-                    .map(crate::kv_tier::ReadmissionPlan::block_ids)
+                if req.session_slot_hold.is_some() {
+                    None
+                } else {
+                    req.staged_prefix
+                        .as_ref()
+                        .map(crate::kv_tier::ReadmissionPlan::block_ids)
+                }
             })
             .unwrap_or_default();
         if release_held_blocks && !held_blocks.is_empty() {
             self.prefix_cache.release(&held_blocks);
+        }
+        let session_slot_hold = self
+            .request(slot_idx)
+            .and_then(|req| req.session_slot_hold.clone());
+        if release_held_blocks {
+            self.release_session_slot_hold(session_slot_hold.as_ref());
         }
         if let Some(req) = self.request_mut(slot_idx) {
             req.staged_prefix = None;
             req.reusable_prefix_len = 0;
             req.reusable_cached_prompt_len = 0;
             req.attached_prefix_blocks.clear();
+            req.session_slot_hold = None;
             req.phase = Phase::Prefilling {
                 effective_tokens: Vec::new(),
                 progress: 0,
@@ -748,6 +779,7 @@ impl<M: ModelForward> Scheduler<M> {
         let prompt_tokens = &waiter.prompt_tokens;
         let session_id = waiter.session_id.clone();
         let staged_prefix = waiter.staged_prefix.clone();
+        let session_slot_hold = waiter.session_slot_hold.clone();
         if staged_prefix.blocks.is_empty() {
             return Ok(());
         }
@@ -826,28 +858,44 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        let prefix_tokens = &prompt_tokens[..staged_prefix.matched_len];
-        let inserted = self.prefix_cache.insert_with_fingerprints(
-            prefix_tokens,
-            &final_block_ids,
-            &fingerprints,
-        );
-        if inserted != prefix_tokens.len() {
-            warn!(
-                "Request {}: staged prefix remap inserted {} / {} prefix tokens",
-                request_id,
-                inserted,
-                prefix_tokens.len()
-            );
-            for (_, _, pages) in promoted_pages {
-                let _ = self.paged_kv_pool.release_pages(&pages);
+        if session_slot_hold.is_some() {
+            for (old_block_id, new_block_id, _) in &promoted_pages {
+                if !self.prefix_cache.retag_block(*old_block_id, *new_block_id) {
+                    for (_, _, pages) in promoted_pages {
+                        let _ = self.paged_kv_pool.release_pages(&pages);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "session-slot staged prefix retag failed for {:?} -> {:?}",
+                        old_block_id,
+                        new_block_id
+                    ));
+                }
+                self.retag_session_slot_block(*old_block_id, *new_block_id);
             }
-            return Err(anyhow::anyhow!(
-                "staged prefix remap inserted {} / {} tokens for request {}",
-                inserted,
-                prefix_tokens.len(),
-                request_id
-            ));
+        } else {
+            let prefix_tokens = &prompt_tokens[..staged_prefix.matched_len];
+            let inserted = self.prefix_cache.insert_with_fingerprints(
+                prefix_tokens,
+                &final_block_ids,
+                &fingerprints,
+            );
+            if inserted != prefix_tokens.len() {
+                warn!(
+                    "Request {}: staged prefix remap inserted {} / {} prefix tokens",
+                    request_id,
+                    inserted,
+                    prefix_tokens.len()
+                );
+                for (_, _, pages) in promoted_pages {
+                    let _ = self.paged_kv_pool.release_pages(&pages);
+                }
+                return Err(anyhow::anyhow!(
+                    "staged prefix remap inserted {} / {} tokens for request {}",
+                    inserted,
+                    prefix_tokens.len(),
+                    request_id
+                ));
+            }
         }
 
         let promoted_blocks = promoted_pages

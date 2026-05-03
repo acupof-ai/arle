@@ -247,6 +247,7 @@ mod tests {
                 direct_gpu_attach,
                 attached_prefix_blocks: Vec::new(),
                 staged_prefix_plan,
+                session_slot_hold: None,
             },
             reusable_prefix_len,
         )
@@ -282,6 +283,7 @@ mod tests {
             direct_gpu_attach: true,
             attached_prefix_blocks: Vec::new(),
             staged_prefix_plan: None,
+            session_slot_hold: None,
         };
 
         let tokens =
@@ -314,6 +316,7 @@ mod tests {
             direct_gpu_attach: false,
             attached_prefix_blocks: Vec::new(),
             staged_prefix_plan: None,
+            session_slot_hold: None,
         };
 
         assert_eq!(
@@ -344,6 +347,7 @@ mod tests {
             direct_gpu_attach: true,
             attached_prefix_blocks: Vec::new(),
             staged_prefix_plan: None,
+            session_slot_hold: None,
         };
 
         let tokens =
@@ -377,6 +381,7 @@ mod tests {
                 direct_gpu_attach: false,
                 attached_prefix_blocks: Vec::new(),
                 staged_prefix_plan: None,
+                session_slot_hold: None,
             },
             hint,
         }

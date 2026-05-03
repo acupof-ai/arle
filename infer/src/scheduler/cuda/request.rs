@@ -302,6 +302,10 @@ pub(crate) struct ActiveRequest {
     /// being promoted back into T0. The scheduler thread owns the fetch queue;
     /// the request owns only its current plan and held radix refs.
     pub(crate) staged_prefix: Option<crate::kv_tier::ReadmissionPlan>,
+    /// Session side-index hold acquired at admission. When present, the
+    /// corresponding prefix blocks are pinned by the session-slot ref counter,
+    /// not by radix node refs.
+    pub(crate) session_slot_hold: Option<super::core::SessionSlotHold>,
 }
 
 impl ActiveRequest {
@@ -363,6 +367,14 @@ impl ActiveRequest {
             held.extend(plan.block_ids());
         }
         held
+    }
+
+    pub(crate) fn held_radix_prefix_blocks(&self) -> Vec<crate::prefix_cache::BlockId> {
+        if self.session_slot_hold.is_some() {
+            Vec::new()
+        } else {
+            self.held_prefix_blocks()
+        }
     }
 }
 
@@ -434,6 +446,7 @@ mod tests {
             reusable_cached_prompt_len: 0,
             attached_prefix_blocks: Vec::new(),
             staged_prefix: None,
+            session_slot_hold: None,
         }
     }
 

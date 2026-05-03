@@ -38,7 +38,7 @@
 //! leaf nodes that have `ref_count == 0`, freeing their block IDs back to the
 //! caller.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -1048,6 +1048,18 @@ impl RadixCache {
         tier_filter: Option<Tier>,
         intent: BlockSelectionIntent,
     ) -> Vec<BlockId> {
+        self.evict_with_policy_for_intent_excluding(policy, signals, n, tier_filter, intent, None)
+    }
+
+    pub fn evict_with_policy_for_intent_excluding(
+        &mut self,
+        policy: &dyn EvictionPolicy,
+        signals: SchedulerSignals,
+        n: usize,
+        tier_filter: Option<Tier>,
+        intent: BlockSelectionIntent,
+        excluded_blocks: Option<&HashSet<BlockId>>,
+    ) -> Vec<BlockId> {
         if n == 0 {
             return vec![];
         }
@@ -1065,7 +1077,10 @@ impl RadixCache {
                     continue;
                 }
 
-                if node.block_id.is_none() {
+                let Some(block_id) = node.block_id else {
+                    continue;
+                };
+                if excluded_blocks.is_some_and(|excluded| excluded.contains(&block_id)) {
                     continue;
                 }
                 if node.ref_count != 0 {

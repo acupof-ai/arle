@@ -334,7 +334,8 @@ impl<M: ModelForward> Scheduler<M> {
                     .take()
                     .expect("finished slot must hold a request");
                 let gen_tokens = req.generated_tokens.len() as u64;
-                self.release_attached_prefix_blocks(&req.held_prefix_blocks());
+                self.release_attached_prefix_blocks(&req.held_radix_prefix_blocks());
+                self.release_session_slot_hold(req.session_slot_hold.as_ref());
                 self.clear_fetch_waiting_for_slot(slot_idx, req.id);
                 self.dequeue_prefill(slot_idx);
                 self.dequeue_running(slot_idx);
