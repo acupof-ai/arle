@@ -249,7 +249,13 @@ impl ActiveMetalRequest {
 }
 
 const METAL_PREFIX_BLOCK_SIZE: usize = 16;
-const METAL_PREFIX_POOL_MULTIPLIER: usize = 4;
+// In-memory prefix pool sized so that high-session-count agent traffic (e.g.
+// the W3 64-warm-session workload) can keep the most-recently-published
+// snapshot per session, instead of LRU-evicting them within seconds. The
+// underlying KV+GDR arrays are MLX refcounts (no per-snapshot full copy), so
+// the dominant cost is the MLX buffer footprint of the cached requests'
+// resident state.
+const METAL_PREFIX_POOL_MULTIPLIER: usize = 64;
 const METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG: u8 = 0x35;
 const METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES: usize = 1024 * 1024;
 const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
@@ -272,6 +278,18 @@ enum MetalStreamError {
 
 enum MetalLivePrefixRuntime {
     Qwen35(MetalQwen35PrefixRuntime),
+}
+
+/// Eviction footprint for an in-memory cached snapshot, in token-equivalent
+/// units. The cache budget accounts the resident KV+GDR allocation, not just
+/// the reusable prefix length: the live driver pre-allocates KV to
+/// `prompt_len + max_new_tokens`, and the snapshot retains those full arrays
+/// via `kv_capacity`. Counting only `token_ids.len()` would let a few
+/// long-output requests pin many GB of KV while the cache thinks it has
+/// room for more.
+fn snapshot_footprint(snapshot: &Qwen35PrefixSnapshot) -> usize {
+    let kv_cap = usize::try_from(snapshot.kv_capacity).unwrap_or(0);
+    snapshot.token_ids.len().max(kv_cap)
 }
 
 struct MetalQwen35CachedPrefix {
@@ -508,11 +526,14 @@ impl MetalQwen35PrefixRuntime {
             return Ok(());
         }
 
-        let snapshots = request
+        // In-memory tier: snapshot the live C++ session at the largest
+        // block-aligned prompt prefix. Drains the session as a side effect; the
+        // next decode/prefill tick re-attaches via `begin_session`.
+        if let Some(snapshot) = request
             .request_state
-            .export_qwen35_prompt_prefixes(self.block_size)
-            .context("export Qwen3.5 prompt prefix snapshots")?;
-        for snapshot in snapshots {
+            .export_qwen35_live_prefix_snapshot(self.block_size)
+            .context("snapshot live Qwen3.5 prompt prefix")?
+        {
             self.insert_snapshot(snapshot);
         }
         Ok(())
@@ -591,21 +612,26 @@ impl MetalQwen35PrefixRuntime {
 
     fn insert_snapshot(&mut self, snapshot: Qwen35PrefixSnapshot) {
         let token_count = snapshot.token_ids.len();
-        if token_count < self.block_size || !token_count.is_multiple_of(self.block_size) {
+        if token_count < self.block_size {
             return;
         }
+        // In-memory entries hold the live drained KV+GDR at exactly
+        // `cache_len`, so block alignment is not required for correctness.
+        // The disk-tier `persist_snapshot` path keeps its own alignment guard
+        // because the on-disk format assumes block-aligned slices.
         let tick = self.bump_tick();
         if let Some(existing) = self.entries.get_mut(&snapshot.token_ids) {
             existing.last_used_tick = tick;
             return;
         }
-        if token_count > self.max_cached_tokens {
+        let footprint = snapshot_footprint(&snapshot);
+        if footprint > self.max_cached_tokens {
             return;
         }
 
-        self.ensure_capacity_for(token_count);
+        self.ensure_capacity_for(footprint);
         let key = snapshot.token_ids.clone();
-        self.cached_tokens += token_count;
+        self.cached_tokens += footprint;
         self.entries.insert(
             key,
             MetalQwen35CachedPrefix {
@@ -762,16 +788,16 @@ impl MetalQwen35PrefixRuntime {
 
     fn ensure_capacity_for(&mut self, needed_tokens: usize) {
         while self.cached_tokens.saturating_add(needed_tokens) > self.max_cached_tokens {
-            let Some((lru_key, lru_tokens)) = self
+            let Some((lru_key, lru_footprint)) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used_tick)
-                .map(|(tokens, entry)| (tokens.clone(), entry.snapshot.token_ids.len()))
+                .map(|(tokens, entry)| (tokens.clone(), snapshot_footprint(&entry.snapshot)))
             else {
                 break;
             };
             self.entries.remove(&lru_key);
-            self.cached_tokens = self.cached_tokens.saturating_sub(lru_tokens);
+            self.cached_tokens = self.cached_tokens.saturating_sub(lru_footprint);
         }
     }
 
