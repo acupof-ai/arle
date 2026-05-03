@@ -1791,6 +1791,92 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// Packed batched prefill — symmetric to `step_batch_packed` (decode
+    /// `seq_len = 1`) but with `seq_len = max_chunk_len` and
+    /// `last_logits_only = true`. Returns last-token logits per row,
+    /// shape `[B, 1, vocab]`. Commit-2 invariant: every
+    /// `prompt_len_arr[b]` must equal `max_chunk_len` — the C++ side
+    /// validates this. `cache_pos_arr` and `rope_offsets` are mandatory
+    /// (per-row physical KV write window + per-row starting RoPE
+    /// position; never the legacy scalar-cache-pos / scalar-rope path).
+    ///
+    /// No runtime consumer in B2 commit 2; the scheduler/dispatch wiring
+    /// lands in commit 3. Suppress dead-code in the meantime.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub(super) fn prefill_batch_packed(
+        &self,
+        tokens: &MlxArray,
+        batch_size: i32,
+        max_chunk_len: i32,
+        cache_pos_arr: &[i32],
+        prompt_len_arr: &[i32],
+        packed_kv_caches: &mut [MlxArray],
+        n_kv: i32,
+        packed_gdr_states: &mut [MlxArray],
+        n_gdr: i32,
+        attn_mask: Option<&MlxArray>,
+        rope_offsets: &MlxArray,
+    ) -> Result<MlxArray> {
+        assert_eq!(
+            cache_pos_arr.len(),
+            batch_size as usize,
+            "cache_pos_arr len must equal batch_size"
+        );
+        assert_eq!(
+            prompt_len_arr.len(),
+            batch_size as usize,
+            "prompt_len_arr len must equal batch_size"
+        );
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            packed_kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            packed_gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); packed_kv_caches.len()];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); packed_gdr_states.len()];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_prefill_batch_packed(
+                self.raw,
+                tokens.as_raw(),
+                batch_size,
+                max_chunk_len,
+                cache_pos_arr.as_ptr(),
+                prompt_len_arr.as_ptr(),
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                attn_mask.map_or(std::ptr::null_mut(), MlxArray::as_raw),
+                rope_offsets.as_raw(),
+                &raw mut out_logits,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old =
+                std::mem::replace(&mut packed_kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut packed_gdr_states[i], unsafe {
+                MlxArray::from_raw(ptr)
+            });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
     pub(super) fn step_batch_packed(
         &self,
         tokens: &MlxArray,

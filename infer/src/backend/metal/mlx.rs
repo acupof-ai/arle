@@ -885,6 +885,75 @@ pub fn build_varlen_decode_mask(left_padding: &[i32], batch_cache_len: i32) -> M
     mask
 }
 
+/// Build the additive `[B, 1, max_chunk_len, key_len]` SDPA mask for a packed
+/// prefill forward (B2 packed prefill). Each row may have a different
+/// left-pad; the `max_chunk_len` new query positions extend the packed cache.
+/// `key_len` is supplied explicitly (the caller already knows its
+/// `batch_cache_len + max_chunk_len` from the per-tick packing math).
+///
+/// Cell `[b, 0, q, k]` = `-inf` iff
+///   - `k < left_padding[b]` (left-pad column), OR
+///   - `(k - (key_len - max_chunk_len)) > q` (causal mask within the
+///     newly-added prefill positions — query `q` may attend to new-cols
+///     `0..=q` but not `q+1..`).
+///
+/// The `max_chunk_len = 1` degenerate case matches `build_varlen_decode_mask`
+/// in shape (`[B, 1, 1, key_len]`) and content (the causal term collapses
+/// because there are no future positions to mask).
+pub fn build_varlen_prefill_mask(
+    left_padding: &[i32],
+    max_chunk_len: i32,
+    key_len: i32,
+) -> MlxArray {
+    debug_assert!(!left_padding.is_empty());
+    debug_assert!(max_chunk_len > 0);
+    debug_assert!(key_len >= max_chunk_len);
+    debug_assert!(i32::try_from(left_padding.len()).is_ok());
+    let batch_cache_len = key_len - max_chunk_len;
+    debug_assert!(
+        left_padding
+            .iter()
+            .all(|&padding| (0..=batch_cache_len).contains(&padding))
+    );
+
+    let batch = left_padding.len() as i32;
+
+    // Broadcasted key-column index `[B, 1, max_chunk_len, key_len]`.
+    let cols_data: Vec<f32> = (0..key_len).map(|col| col as f32).collect();
+    let cols = MlxArray::from_slice_f32(&cols_data, &[1, 1, 1, key_len]);
+    let cols_b = broadcast_to(&cols, &[batch, 1, max_chunk_len, key_len]);
+
+    // Per-row left-pad threshold `[B, 1, max_chunk_len, key_len]`.
+    let pad_data: Vec<f32> = left_padding.iter().map(|&padding| padding as f32).collect();
+    let pad = MlxArray::from_slice_f32(&pad_data, &[batch, 1, 1, 1]);
+    let pad_b = broadcast_to(&pad, &[batch, 1, max_chunk_len, key_len]);
+    let cond_pad = greater(&pad_b, &cols_b);
+
+    // `delta = cols - batch_cache_len`; causal cond is `delta > q_idx`.
+    // For `cols < batch_cache_len`, `delta < 0` while `q_idx >= 0`, so the
+    // condition is automatically false — no separate `cols >= batch_cache_len`
+    // clause needed.
+    let bcl = MlxArray::from_slice_f32(&[batch_cache_len as f32], &[1, 1, 1, 1]);
+    let bcl_b = broadcast_to(&bcl, &[batch, 1, max_chunk_len, key_len]);
+    let delta = subtract(&cols_b, &bcl_b);
+
+    let q_data: Vec<f32> = (0..max_chunk_len).map(|q| q as f32).collect();
+    let q_idx = MlxArray::from_slice_f32(&q_data, &[1, 1, max_chunk_len, 1]);
+    let q_idx_b = broadcast_to(&q_idx, &[batch, 1, max_chunk_len, key_len]);
+    let cond_causal = greater(&delta, &q_idx_b);
+
+    let neg_inf = MlxArray::scalar_f32(f32::NEG_INFINITY);
+    let neg_inf_b = broadcast_to(&neg_inf, &[batch, 1, max_chunk_len, key_len]);
+    let zero_b = zeros(&[batch, 1, max_chunk_len, key_len], Dtype::Float32);
+    let pad_term = where_(&cond_pad, &neg_inf_b, &zero_b);
+    let causal_term = where_(&cond_causal, &neg_inf_b, &zero_b);
+    let mask = add(&pad_term, &causal_term);
+    // Cast to bf16 to match Q/K/V dtype (mirrors `build_varlen_decode_mask`).
+    let mask = as_dtype(&mask, Dtype::Bfloat16);
+    eval(&[&mask]);
+    mask
+}
+
 /// Build the additive `[B, 1, block_size, key_len]` SDPA mask for a packed
 /// DFlash verify forward where each row may have a different left-pad and the
 /// `block_size` verify positions extend the packed cache.

@@ -2327,6 +2327,139 @@ int32_t qwen35_compiled_step_batch_packed(
     }
 }
 
+// Packed batched prefill — one forward pass over `B × max_chunk_len` prompt
+// tokens against packed `[B, n_kv_heads, kv_capacity, head_dim]` KV and
+// `[B, ...]` GDR caches. Symmetric to `qwen35_compiled_step_batch_packed`
+// (decode `seq_len = 1`) but with `current_seq_len = max_chunk_len` and
+// `current_last_logits_only = true`, returning `[B, 1, vocab]` last-token
+// logits per row.
+//
+// Commit-2 invariant: every `prompt_len_arr[b]` must equal `max_chunk_len`
+// (equal-length rows). The B2 commit-3 scheduler enforces this by chunking
+// rows to a shared length per tick. Varlen rows would need a per-row last-
+// logit gather and per-row KV-write masking, both out of scope for the
+// no-consumer commit-2 entry point.
+//
+// `cache_pos_arr` follows the verify-batched pattern (host int32[B] of
+// per-row physical KV write positions); `rope_offsets` gives per-row
+// starting RoPE position. Both must be supplied — the entry never goes
+// through the legacy scalar-cache-pos / scalar-rope path.
+int32_t qwen35_compiled_prefill_batch_packed(
+    void* model,
+    mlx_array* token_ids,           // int32 [B, max_chunk_len]
+    int32_t batch_size,
+    int32_t max_chunk_len,
+    const int32_t* cache_pos_arr,   // host int32[B] per-row KV write position
+    const int32_t* prompt_len_arr,  // host int32[B] per-row valid prompt length
+    mlx_array** packed_kv_caches,
+    int32_t n_kv,
+    mlx_array** packed_gdr_states,
+    int32_t n_gdr,
+    mlx_array* attn_mask,           // additive [B, 1, max_chunk_len, key_len]
+    mlx_array* rope_offsets,        // int32[B] per-row starting RoPE position
+    mlx_array** out_logits,         // [B, 1, vocab]
+    mlx_array** out_packed_kv_caches,
+    mlx_array** out_packed_gdr_states
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (batch_size <= 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_prefill_batch_packed requires batch_size > 0");
+        }
+        if (max_chunk_len <= 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_prefill_batch_packed requires max_chunk_len > 0");
+        }
+        if (cache_pos_arr == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_prefill_batch_packed requires cache_pos_arr");
+        }
+        if (prompt_len_arr == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_prefill_batch_packed requires prompt_len_arr");
+        }
+        if (rope_offsets == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_prefill_batch_packed requires rope_offsets");
+        }
+        // Commit-2 invariant: rows must share max_chunk_len. Varlen rows
+        // would silently misroute the `last_logits_only` slice (which picks
+        // position max_chunk_len-1 for every row, regardless of valid len).
+        for (int32_t b = 0; b < batch_size; ++b) {
+            if (prompt_len_arr[b] != max_chunk_len) {
+                throw std::runtime_error(
+                    "qwen35_compiled_prefill_batch_packed requires every "
+                    "prompt_len_arr[b] == max_chunk_len in commit-2 entry; "
+                    "varlen rows land in a B2.5+ follow-up");
+            }
+        }
+
+        // Route 2: per-row physical KV write window via current_cache_pos_arr;
+        // scalar cache_pos stays 0 to keep the legacy code path inert.
+        m->current_cache_pos = 0;
+        m->current_batch_size = batch_size;
+        m->current_seq_len = max_chunk_len;
+        // Packed batched prefill is *unconditionally* last-logits-only — the
+        // singleton-prefill `AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY=0`
+        // debug toggle is intentionally ignored here. Packed rows left-pad by
+        // different amounts, so per-position logits would land at different
+        // absolute prompt positions across rows; full `[B, max_chunk_len, vocab]`
+        // is not a meaningful debug surface for a packed batch and would also
+        // break the FFI/Rust contract that promises `[B, 1, vocab]`.
+        m->current_last_logits_only = true;
+        m->current_has_attn_mask = attn_mask != nullptr;
+        if (m->current_has_attn_mask) {
+            m->current_attn_mask = *to_arr(attn_mask);
+        } else {
+            m->current_attn_mask = array(0);
+        }
+        m->current_has_cache_pos_arr = true;
+        m->current_cache_pos_arr = cache_pos_arr;
+        m->current_has_rope_offsets = true;
+        m->current_rope_offsets = *to_arr(rope_offsets);
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_ids));
+        for (int kv_idx = 0; kv_idx < n_kv; ++kv_idx) {
+            inputs.push_back(*to_arr(packed_kv_caches[kv_idx]));
+        }
+        for (int gdr_idx = 0; gdr_idx < n_gdr; ++gdr_idx) {
+            inputs.push_back(*to_arr(packed_gdr_states[gdr_idx]));
+        }
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        *out_logits = from_arr(std::move(outputs[0]));
+        for (int kv_idx = 0; kv_idx < n_kv; ++kv_idx) {
+            out_packed_kv_caches[kv_idx] = from_arr(std::move(outputs[1 + kv_idx]));
+        }
+        for (int gdr_idx = 0; gdr_idx < n_gdr; ++gdr_idx) {
+            out_packed_gdr_states[gdr_idx] =
+                from_arr(std::move(outputs[1 + n_kv + gdr_idx]));
+        }
+
+        m->current_cache_pos = 0;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_cache_pos = 0;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return -1;
+    }
+}
+
 int32_t qwen35_compiled_prefill(
     void* model,
     mlx_array* token_ids,    // int32 vector [prompt_len]

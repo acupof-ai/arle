@@ -7,8 +7,8 @@ use crate::backend::metal::{
     config::load_metal_config,
     gdr::MetalRecurrentState,
     mlx::{
-        Dtype, as_dtype, concatenate_axis, eval, gguf_quantized_matmul, reshape, slice,
-        slice_update, zeros,
+        Dtype, as_dtype, build_varlen_prefill_mask, concatenate_axis, eval, gguf_quantized_matmul,
+        reshape, slice, slice_update, zeros,
     },
     weights::load_qwen3_metal_weights,
 };
@@ -2837,6 +2837,145 @@ fn packed_decode_varlen_matches_independent_scalar_decode_for_b2() -> Result<()>
             );
         }
     }
+
+    Ok(())
+}
+
+/// B2 commit 2 fake-graph round-trip: drive `prefill_batch_packed` with B=2,
+/// max_chunk_len=4 and assert (a) the entry returns `[B, 1, vocab]` last-token
+/// logits, (b) per-row valid lengths must equal max_chunk_len in commit-2 (the
+/// C++ side rejects mismatches). No logit-value validation — graph parity is
+/// commit-3's W3 bench. Gated on `QWEN35_MODEL_PATH` like the rest of the
+/// compiled-model tests.
+#[test]
+fn prefill_batch_packed_b2_chunk4_returns_last_logits_shape() -> Result<()> {
+    let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
+        eprintln!(
+            "QWEN35_MODEL_PATH unset; skipping prefill_batch_packed B=2 chunk=4 round-trip test"
+        );
+        return Ok(());
+    };
+    let _guard = metal_test_guard();
+
+    let config = load_metal_config(&model_path)?;
+    let MetalModelArch::Qwen35(arch) = &config.arch else {
+        anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+    };
+    let weights = load_qwen35_metal_weights(&model_path, &config)?;
+    let cpp_model = weights
+        .cpp_model
+        .as_ref()
+        .context("Qwen3.5 compiled C++ model unavailable")?;
+
+    let batch_size: i32 = 2;
+    let max_chunk_len: i32 = 4;
+    let kv_capacity = max_chunk_len + KV_CACHE_CHUNK;
+    let cache_shape = [
+        1_i32,
+        config.num_key_value_heads as i32,
+        kv_capacity,
+        config.head_dim as i32,
+    ];
+
+    let num_full_layers = arch.num_full_attention_layers();
+    let mut per_row_kv = Vec::with_capacity(batch_size as usize);
+    let mut per_row_gdr = Vec::with_capacity(batch_size as usize);
+    for _ in 0..batch_size {
+        let kv_flat: Vec<MlxArray> = (0..num_full_layers)
+            .flat_map(|_| {
+                [
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                ]
+            })
+            .collect();
+        let recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+        let gdr_flat: Vec<MlxArray> = recurrent
+            .states
+            .iter()
+            .zip(recurrent.conv_states.iter())
+            .flat_map(|(state, conv)| [state.clone(), conv.clone()])
+            .collect();
+        per_row_kv.push(kv_flat);
+        per_row_gdr.push(gdr_flat);
+    }
+
+    let n_kv = per_row_kv[0].len();
+    let n_gdr = per_row_gdr[0].len();
+    let mut packed_kv = Vec::with_capacity(n_kv);
+    for kv_idx in 0..n_kv {
+        let stacked: Vec<MlxArray> = per_row_kv
+            .iter()
+            .map(|row_kv| row_kv[kv_idx].clone())
+            .collect();
+        packed_kv.push(concatenate_axis(&stacked, 0));
+    }
+    let mut packed_gdr = Vec::with_capacity(n_gdr);
+    for gdr_idx in 0..n_gdr {
+        let stacked: Vec<MlxArray> = per_row_gdr
+            .iter()
+            .map(|row_gdr| row_gdr[gdr_idx].clone())
+            .collect();
+        packed_gdr.push(concatenate_axis(&stacked, 0));
+    }
+
+    let prompt_tokens: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let token_ids = MlxArray::from_slice_i32(&prompt_tokens, &[batch_size, max_chunk_len]);
+    let cache_pos_arr: Vec<i32> = vec![0; batch_size as usize];
+    let prompt_len_arr: Vec<i32> = vec![max_chunk_len; batch_size as usize];
+
+    // Causal mask only — no left-padding (fresh prefill, batch_cache_len == 0
+    // → key_len == max_chunk_len).
+    let left_padding: Vec<i32> = vec![0; batch_size as usize];
+    let attn_mask = build_varlen_prefill_mask(&left_padding, max_chunk_len, max_chunk_len);
+    let rope_offsets = MlxArray::from_slice_i32(&cache_pos_arr, &[batch_size]);
+
+    let logits = cpp_model.prefill_batch_packed(
+        &token_ids,
+        batch_size,
+        max_chunk_len,
+        &cache_pos_arr,
+        &prompt_len_arr,
+        &mut packed_kv,
+        i32::try_from(n_kv).expect("n_kv fits in i32"),
+        &mut packed_gdr,
+        i32::try_from(n_gdr).expect("n_gdr fits in i32"),
+        Some(&attn_mask),
+        &rope_offsets,
+    )?;
+    let mut refs: Vec<&MlxArray> = Vec::with_capacity(1 + packed_kv.len() + packed_gdr.len());
+    refs.push(&logits);
+    refs.extend(packed_kv.iter());
+    refs.extend(packed_gdr.iter());
+    eval(&refs);
+
+    assert_eq!(
+        logits.shape(),
+        &[batch_size, 1, config.vocab_size as i32],
+        "prefill_batch_packed must return [B, 1, vocab] last-logits"
+    );
+
+    // Commit-2 invariant: a varlen prompt_len_arr (any element != max_chunk_len)
+    // must be rejected by the C++ entry rather than silently sliced at the
+    // wrong row offset.
+    let mismatched: Vec<i32> = vec![max_chunk_len, max_chunk_len - 1];
+    let mismatch = cpp_model.prefill_batch_packed(
+        &token_ids,
+        batch_size,
+        max_chunk_len,
+        &cache_pos_arr,
+        &mismatched,
+        &mut packed_kv,
+        i32::try_from(n_kv).expect("n_kv fits in i32"),
+        &mut packed_gdr,
+        i32::try_from(n_gdr).expect("n_gdr fits in i32"),
+        Some(&attn_mask),
+        &rope_offsets,
+    );
+    assert!(
+        mismatch.is_err(),
+        "commit-2 prefill_batch_packed must reject prompt_len_arr[b] != max_chunk_len"
+    );
 
     Ok(())
 }
