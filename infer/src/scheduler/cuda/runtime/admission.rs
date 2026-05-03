@@ -859,9 +859,11 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         if session_slot_hold.is_some() {
-            for (old_block_id, new_block_id, _) in &promoted_pages {
-                if !self.prefix_cache.retag_block(*old_block_id, *new_block_id) {
-                    for (_, _, pages) in promoted_pages {
+            for idx in 0..promoted_pages.len() {
+                let old_block_id = promoted_pages[idx].0;
+                let new_block_id = promoted_pages[idx].1;
+                if !self.prefix_cache.retag_block(old_block_id, new_block_id) {
+                    for (_, _, pages) in promoted_pages.drain(..) {
                         let _ = self.paged_kv_pool.release_pages(&pages);
                     }
                     return Err(anyhow::anyhow!(
@@ -870,7 +872,7 @@ impl<M: ModelForward> Scheduler<M> {
                         new_block_id
                     ));
                 }
-                self.retag_session_slot_block(*old_block_id, *new_block_id);
+                self.retag_session_slot_block(old_block_id, new_block_id);
             }
         } else {
             let prefix_tokens = &prompt_tokens[..staged_prefix.matched_len];

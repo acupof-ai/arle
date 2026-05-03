@@ -481,6 +481,10 @@ impl<M: ModelForward> Scheduler<M> {
             if self.host_pool_demote_headroom_bytes() >= required_bytes {
                 break;
             }
+            let released_slot_blocks = self.evict_inactive_session_slots_for_pressure(
+                1,
+                Some(crate::kv_tier::Tier::HostPinned),
+            );
             let protected = self.session_protected_blocks();
             let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),
@@ -491,6 +495,9 @@ impl<M: ModelForward> Scheduler<M> {
                 Some(&protected),
             );
             if evicted.is_empty() {
+                if released_slot_blocks > 0 {
+                    continue;
+                }
                 break;
             }
             released_bytes = released_bytes.saturating_add(
@@ -1462,6 +1469,8 @@ impl<M: ModelForward> Scheduler<M> {
         if reclaimed_pages < want_free {
             let remaining_pages = want_free.saturating_sub(reclaimed_pages);
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
+            let _ =
+                self.evict_inactive_session_slots_for_pressure(1, Some(crate::kv_tier::Tier::Gpu));
             let protected = self.session_protected_blocks();
             let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),
@@ -1559,6 +1568,8 @@ impl<M: ModelForward> Scheduler<M> {
 
         if reclaimed_pages < shortage_pages {
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
+            let _ =
+                self.evict_inactive_session_slots_for_pressure(1, Some(crate::kv_tier::Tier::Gpu));
             let protected = self.session_protected_blocks();
             let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),

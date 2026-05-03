@@ -1,4 +1,6 @@
-use crate::kv_tier::{BlockLocation, HitKind, LookupBlock, LookupHeuristics, LookupOutcome};
+use std::collections::HashMap;
+
+use crate::kv_tier::{BlockLocation, HitKind, LookupBlock, LookupHeuristics, LookupOutcome, Tier};
 use crate::prefix_cache::BlockId;
 use crate::scheduler::cuda::{ModelForward, Scheduler};
 use crate::types::SessionId;
@@ -12,7 +14,7 @@ pub(in crate::scheduler::cuda) struct SessionSlot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::scheduler::cuda) struct SessionSlotHold {
+pub(in crate::scheduler) struct SessionSlotHold {
     pub(in crate::scheduler::cuda) session_id: SessionId,
 }
 
@@ -46,7 +48,7 @@ impl<M: ModelForward> Scheduler<M> {
         );
     }
 
-    pub(super) fn lookup_session_slot_or_stage(
+    pub(in crate::scheduler::cuda) fn lookup_session_slot_or_stage(
         &mut self,
         session_id: &SessionId,
         prompt_len: usize,
@@ -83,7 +85,10 @@ impl<M: ModelForward> Scheduler<M> {
         })
     }
 
-    pub(super) fn release_session_slot_hold(&mut self, hold: Option<&SessionSlotHold>) {
+    pub(in crate::scheduler::cuda) fn release_session_slot_hold(
+        &mut self,
+        hold: Option<&SessionSlotHold>,
+    ) {
         let Some(hold) = hold else {
             return;
         };
@@ -92,7 +97,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    pub(super) fn session_slot_gpu_ready_plan(
+    pub(in crate::scheduler::cuda) fn session_slot_gpu_ready_plan(
         &self,
         session_id: &SessionId,
         matched_len: usize,
@@ -118,7 +123,11 @@ impl<M: ModelForward> Scheduler<M> {
         self.build_staged_prefix_plan(&lookup)
     }
 
-    pub(super) fn retag_session_slot_block(&mut self, old: BlockId, new: BlockId) {
+    pub(in crate::scheduler::cuda) fn retag_session_slot_block(
+        &mut self,
+        old: BlockId,
+        new: BlockId,
+    ) {
         let Some(count) = self.session_block_refs.remove(&old) else {
             return;
         };
@@ -142,6 +151,53 @@ impl<M: ModelForward> Scheduler<M> {
         &self,
     ) -> std::collections::HashSet<crate::prefix_cache::BlockId> {
         self.session_block_refs.keys().copied().collect()
+    }
+
+    pub(super) fn evict_inactive_session_slots_for_pressure(
+        &mut self,
+        max_slots: usize,
+        tier_filter: Option<Tier>,
+    ) -> usize {
+        let candidates = inactive_session_slot_eviction_candidates(
+            &self.session_slots,
+            self.prefix_cache.logical_clock(),
+            self.config.prefix_cache_keepalive_ticks,
+            max_slots,
+            |slot| self.session_slot_has_tier_blocks(slot, tier_filter),
+        );
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        let mut released_blocks = 0usize;
+        let mut released_slots = 0usize;
+        for session_id in candidates {
+            let Some(slot) = self.session_slots.remove(&session_id) else {
+                continue;
+            };
+            released_slots += 1;
+            released_blocks += slot.blocks.len();
+            self.remove_session_block_refs(&slot.blocks);
+        }
+
+        if released_slots > 0 {
+            log::info!(
+                "session slot pressure eviction: released {} inactive slots ({} block refs)",
+                released_slots,
+                released_blocks
+            );
+        }
+        released_blocks
+    }
+
+    fn session_slot_has_tier_blocks(&self, slot: &SessionSlot, tier_filter: Option<Tier>) -> bool {
+        tier_filter.is_none_or(|tier| {
+            slot.blocks.iter().any(|block_id| {
+                self.block_metadata(*block_id)
+                    .and_then(|metadata| metadata.location.map(|location| location.tier()))
+                    == Some(tier)
+            })
+        })
     }
 
     fn lookup_session_blocks(
@@ -229,6 +285,35 @@ impl<M: ModelForward> Scheduler<M> {
     }
 }
 
+fn inactive_session_slot_eviction_candidates(
+    slots: &HashMap<SessionId, SessionSlot>,
+    now: u64,
+    min_idle_ticks: u64,
+    max_slots: usize,
+    mut slot_matches_pressure: impl FnMut(&SessionSlot) -> bool,
+) -> Vec<SessionId> {
+    if max_slots == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates = slots
+        .iter()
+        .filter(|(_, slot)| {
+            slot.ref_count == 0 && slot.last_access_tick.saturating_add(min_idle_ticks) <= now
+        })
+        .filter(|(_, slot)| slot_matches_pressure(slot))
+        .map(|(session_id, slot)| (slot.last_access_tick, session_id.clone()))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(last_access_tick, session_id)| {
+        (*last_access_tick, session_id.as_str().to_owned())
+    });
+    candidates
+        .into_iter()
+        .take(max_slots)
+        .map(|(_, session_id)| session_id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +330,109 @@ mod tests {
         assert_eq!(slot.blocks, vec![BlockId(1), BlockId(2)]);
         assert_eq!(slot.committed_len, 32);
         assert_eq!(slot.ref_count, 0);
+    }
+
+    #[test]
+    fn inactive_session_slot_candidates_are_lru_and_skip_active_holds() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            SessionId::from("old"),
+            SessionSlot {
+                blocks: vec![BlockId(1)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 10,
+            },
+        );
+        slots.insert(
+            SessionId::from("active"),
+            SessionSlot {
+                blocks: vec![BlockId(2)],
+                committed_len: 16,
+                ref_count: 1,
+                last_access_tick: 5,
+            },
+        );
+        slots.insert(
+            SessionId::from("newer"),
+            SessionSlot {
+                blocks: vec![BlockId(3)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 20,
+            },
+        );
+
+        assert_eq!(
+            inactive_session_slot_eviction_candidates(&slots, 100, 64, 8, |_| true),
+            vec![SessionId::from("old"), SessionId::from("newer")]
+        );
+    }
+
+    #[test]
+    fn inactive_session_slot_candidates_respect_idle_threshold_and_limit() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            SessionId::from("oldest"),
+            SessionSlot {
+                blocks: vec![BlockId(1)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 1,
+            },
+        );
+        slots.insert(
+            SessionId::from("too-fresh"),
+            SessionSlot {
+                blocks: vec![BlockId(2)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 50,
+            },
+        );
+        slots.insert(
+            SessionId::from("middle"),
+            SessionSlot {
+                blocks: vec![BlockId(3)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 10,
+            },
+        );
+
+        assert_eq!(
+            inactive_session_slot_eviction_candidates(&slots, 70, 32, 1, |_| true),
+            vec![SessionId::from("oldest")]
+        );
+    }
+
+    #[test]
+    fn inactive_session_slot_candidates_can_filter_by_pressure_target() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            SessionId::from("old-wrong-tier"),
+            SessionSlot {
+                blocks: vec![BlockId(1)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 1,
+            },
+        );
+        slots.insert(
+            SessionId::from("newer-target-tier"),
+            SessionSlot {
+                blocks: vec![BlockId(2)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 10,
+            },
+        );
+
+        assert_eq!(
+            inactive_session_slot_eviction_candidates(&slots, 100, 64, 8, |slot| {
+                slot.blocks.contains(&BlockId(2))
+            }),
+            vec![SessionId::from("newer-target-tier")]
+        );
     }
 }
