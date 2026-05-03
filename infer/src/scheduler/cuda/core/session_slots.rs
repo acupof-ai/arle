@@ -194,7 +194,7 @@ impl<M: ModelForward> Scheduler<M> {
         tier_filter.is_none_or(|tier| {
             slot.blocks.iter().any(|block_id| {
                 self.block_metadata(*block_id)
-                    .and_then(|metadata| metadata.location.map(|location| location.tier()))
+                    .map(|metadata| block_metadata_tier(metadata.location.as_ref()))
                     == Some(tier)
             })
         })
@@ -283,6 +283,10 @@ impl<M: ModelForward> Scheduler<M> {
             self.remove_session_block_refs(&slot.blocks);
         }
     }
+}
+
+fn block_metadata_tier(location: Option<&BlockLocation>) -> Tier {
+    location.map(BlockLocation::tier).unwrap_or(Tier::Gpu)
 }
 
 fn inactive_session_slot_eviction_candidates(
@@ -433,6 +437,15 @@ mod tests {
                 slot.blocks.contains(&BlockId(2))
             }),
             vec![SessionId::from("newer-target-tier")]
+        );
+    }
+
+    #[test]
+    fn missing_block_location_counts_as_gpu_resident() {
+        assert_eq!(block_metadata_tier(None), Tier::Gpu);
+        assert_eq!(
+            block_metadata_tier(Some(&BlockLocation::HostPinned { offset: 4096 })),
+            Tier::HostPinned
         );
     }
 }
