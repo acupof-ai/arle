@@ -1618,41 +1618,33 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
-    pub(crate) fn export_qwen35_prompt_prefixes(
-        &self,
+    /// Snapshot the live Qwen3.5 C++ session's KV+GDR state at this request's
+    /// fully-prefilled prompt cursor. Returns `None` when the cursor is
+    /// shorter than one in-memory block. Snapshots at exactly `prompt_cursor`
+    /// (= `cache_len` post-terminal-prefill) so the recurrent GDR state in the
+    /// snapshot matches the KV state — Qwen3.5's linear-attention recurrent
+    /// state advances in stream and cannot be rewound to a shorter prefix
+    /// without replay, so any truncated snapshot would import stale state on a
+    /// future hit. Drains the C++ session as a side effect; the next
+    /// decode/prefill tick will re-attach via `begin_session`. In-memory tier
+    /// publish uses this to reuse the work the live request already paid for,
+    /// without paying a second replay-prefill.
+    pub(crate) fn export_qwen35_live_prefix_snapshot(
+        &mut self,
         block_size: usize,
-    ) -> Result<Vec<Qwen35PrefixSnapshot>> {
-        let mut snapshots = Vec::new();
-        self.visit_qwen35_prompt_prefixes(block_size, |snapshot| {
-            snapshots.push(snapshot);
-            Ok(())
-        })?;
-        Ok(snapshots)
-    }
-
-    pub(crate) fn visit_qwen35_prompt_prefixes(
-        &self,
-        block_size: usize,
-        visit: impl FnMut(Qwen35PrefixSnapshot) -> Result<()>,
-    ) -> Result<()> {
-        match &self.inner {
-            MetalRequestStateInner::Qwen35(state) => {
-                let aligned_len = longest_reusable_aligned_prefix_len(
-                    state.prompt_cursor,
-                    state.prompt_tokens.len(),
-                    block_size,
-                );
-                if aligned_len == 0 {
-                    return Ok(());
-                }
-                state.driver.stream_prefix_snapshots(
-                    &state.prompt_tokens[..aligned_len],
-                    block_size,
-                    visit,
-                )
-            }
-            MetalRequestStateInner::Qwen3(_) => Ok(()),
+    ) -> Result<Option<Qwen35PrefixSnapshot>> {
+        let MetalRequestStateInner::Qwen35(state) = &mut self.inner else {
+            return Ok(None);
+        };
+        let live_len = state.prompt_cursor;
+        if live_len < block_size {
+            return Ok(None);
         }
+        let token_ids = state.prompt_tokens[..live_len].to_vec();
+        let snapshot = state
+            .driver
+            .export_drained_prefix_snapshot(token_ids, live_len)?;
+        Ok(Some(snapshot))
     }
 
     pub(crate) fn export_qwen35_disk_prompt_prefixes(
@@ -4110,20 +4102,47 @@ impl<'a> Qwen35StepDriver<'a> {
         }
     }
 
-    fn stream_prefix_snapshots(
-        &self,
-        prompt_tokens: &[u32],
-        block_size: usize,
-        visit: impl FnMut(Qwen35PrefixSnapshot) -> Result<()>,
-    ) -> Result<()> {
-        let target_lens: Vec<_> = if block_size == 0 {
-            Vec::new()
-        } else {
-            (block_size..=prompt_tokens.len())
-                .step_by(block_size)
-                .collect()
-        };
-        self.stream_prefix_snapshots_at_lengths(prompt_tokens, block_size, &target_lens, visit)
+    /// Snapshot the live C++ session in place at the requested cache length
+    /// without spinning up a second `Qwen35StepDriver`. The caller must have
+    /// established that `target_cache_len == self.cache_len` — Qwen3.5's GDR
+    /// recurrent state is processed in stream and cannot be rewound to a
+    /// shorter prefix without replay. The session is drained (`end_session`)
+    /// so the caller can clone the resident KV+GDR arrays; the next
+    /// `prefill_chunk` / `decode_step` re-attaches via `begin_session`.
+    fn export_drained_prefix_snapshot(
+        &mut self,
+        token_ids: Vec<u32>,
+        target_cache_len: usize,
+    ) -> Result<Qwen35PrefixSnapshot> {
+        ensure!(
+            !token_ids.is_empty(),
+            "Qwen3.5 live prefix snapshot requires at least one token"
+        );
+        ensure!(
+            token_ids.len() == target_cache_len,
+            "Qwen3.5 live prefix snapshot token_ids ({}) must match target_cache_len ({target_cache_len})",
+            token_ids.len()
+        );
+        let cache_len = i32::try_from(target_cache_len)
+            .context("Qwen3.5 live prefix snapshot cache_len overflow")?;
+        ensure!(
+            cache_len == self.cache_len,
+            "Qwen3.5 live prefix snapshot target cache_len {cache_len} must equal live cache_len {}; recurrent GDR state cannot be truncated",
+            self.cache_len
+        );
+        self.ensure_cpp_session_drained()?;
+        match &self.mode {
+            Qwen35StepMode::Cpp(state) => Ok(Qwen35PrefixSnapshot {
+                token_ids,
+                kv_flat: state.kv_flat.clone(),
+                gdr_flat: state.gdr_flat.clone(),
+                cache_len,
+                kv_capacity: self.kv_capacity,
+            }),
+            Qwen35StepMode::Rust(_) => {
+                bail!("Qwen3.5 live prefix snapshot requires the compiled C++ step path")
+            }
+        }
     }
 
     fn stream_prefix_snapshots_at_lengths(
