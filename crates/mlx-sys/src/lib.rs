@@ -753,6 +753,30 @@ unsafe extern "C" {
         out_kv_caches: *mut *mut mlx_array,
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
+    /// Packed batched prefill — one forward over `B × max_chunk_len` prompt
+    /// tokens against packed KV/GDR. Symmetric to
+    /// `qwen35_compiled_step_batch_packed` (decode `seq_len = 1`) with
+    /// `seq_len = max_chunk_len` and `last_logits_only = true`. Returns
+    /// `[B, 1, vocab]`. Commit-2 invariant: every `prompt_len_arr[b]` must
+    /// equal `max_chunk_len` (varlen rows are a B2.5+ follow-up).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_prefill_batch_packed(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        batch_size: i32,
+        max_chunk_len: i32,
+        cache_pos_arr: *const i32,
+        prompt_len_arr: *const i32,
+        packed_kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        packed_gdr_states: *mut *mut mlx_array,
+        n_gdr: i32,
+        attn_mask: *mut mlx_array,
+        rope_offsets: *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+        out_packed_kv_caches: *mut *mut mlx_array,
+        out_packed_gdr_states: *mut *mut mlx_array,
+    ) -> i32;
     /// DFlash verify: parallel forward over a draft block, returning all-position
     /// logits [1, block_size, vocab]. Respects model-level tape_mode and capture
     /// layers — one call emits per-step GDR tapes and captured hidden for the
