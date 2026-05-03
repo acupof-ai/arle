@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::kv_tier::LookupHeuristics;
@@ -1664,6 +1664,29 @@ fn selection_sorts_lowest_score_first() {
     );
 
     assert_eq!(selected, vec![BlockId(10)]);
+}
+
+#[test]
+fn policy_eviction_can_exclude_session_slot_blocks() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    cache.insert(&[9, 10, 11, 12], &bids(&[20]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+    assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 1 }));
+
+    let excluded = HashSet::from([BlockId(10)]);
+    let evicted = cache.evict_with_policy_for_intent_excluding(
+        &LruEviction,
+        SchedulerSignals::default(),
+        2,
+        Some(Tier::Gpu),
+        BlockSelectionIntent::Evict,
+        Some(&excluded),
+    );
+
+    assert_eq!(evicted, vec![BlockId(20)]);
+    assert!(cache.block_metadata(BlockId(10)).is_some());
+    assert!(cache.block_metadata(BlockId(20)).is_none());
 }
 
 #[test]
