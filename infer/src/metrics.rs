@@ -69,6 +69,7 @@
 //! | `infer_prefix_request_skip_rate` | gauge | Prompt-token skip rate for the most recent lookup |
 //! | `infer_session_affinity_hit_total` | counter | Session-tagged requests that reused a prefix |
 //! | `infer_session_affinity_miss_total` | counter | Session-tagged requests without prefix reuse |
+//! | `infer_session_slot_pressure_evictions_hard_total` | counter | Inactive session slots evicted under hard pressure |
 //! | `infer_matched_prefix_tokens` | gauge | Matched prefix tokens for the most recent prefix lookup |
 //! | `infer_resume_prefill_tokens` | gauge | Effective prefill tokens for the most recent prefix lookup |
 //! | `infer_tier_fetch_staged_host_blocks_total` | counter | Request-weighted staged blocks found in T1 |
@@ -213,6 +214,7 @@ struct MetricsInner {
     pub prefix_lookup_prompt_tokens_total: AtomicU64,
     pub session_affinity_hit_total: AtomicU64,
     pub session_affinity_miss_total: AtomicU64,
+    pub session_slot_pressure_evictions_hard_total: AtomicU64,
     pub tier_fetch_staged_host_blocks_total: AtomicU64,
     pub tier_fetch_staged_disk_blocks_total: AtomicU64,
     pub tier_fetch_staged_remote_blocks_total: AtomicU64,
@@ -305,6 +307,7 @@ impl ServerMetrics {
                 prefix_lookup_prompt_tokens_total: AtomicU64::new(0),
                 session_affinity_hit_total: AtomicU64::new(0),
                 session_affinity_miss_total: AtomicU64::new(0),
+                session_slot_pressure_evictions_hard_total: AtomicU64::new(0),
                 tier_fetch_staged_host_blocks_total: AtomicU64::new(0),
                 tier_fetch_staged_disk_blocks_total: AtomicU64::new(0),
                 tier_fetch_staged_remote_blocks_total: AtomicU64::new(0),
@@ -554,6 +557,13 @@ impl ServerMetrics {
         self.inner
             .tier_fetch_fallback_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record inactive session slots evicted by hard pressure reclamation.
+    pub fn record_session_slot_pressure_evictions_hard(&self, slots: usize) {
+        self.inner
+            .session_slot_pressure_evictions_hard_total
+            .fetch_add(slots as u64, Ordering::Relaxed);
     }
 
     /// Set the number of currently-active requests.
@@ -966,6 +976,12 @@ impl ServerMetrics {
 
     pub fn resume_prefill_tokens(&self) -> u64 {
         self.inner.resume_prefill_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn session_slot_pressure_evictions_hard(&self) -> u64 {
+        self.inner
+            .session_slot_pressure_evictions_hard_total
+            .load(Ordering::Relaxed)
     }
 
     pub fn tier_fetch_staged_host_blocks_total(&self) -> u64 {

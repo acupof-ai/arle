@@ -47,7 +47,7 @@ pub(in crate::scheduler::cuda) use helpers::{
     host_spill_target_bytes, is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages,
     sealed_block_token_count, select_sparse_pages_from_slot_pages,
 };
-pub(in crate::scheduler::cuda) use session_slots::{SessionSlot, SessionSlotHold};
+pub(in crate::scheduler::cuda) use session_slots::{PressureMode, SessionSlot, SessionSlotHold};
 pub(in crate::scheduler::cuda) use state_types::{
     PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow, PrefetchTicketState,
     SchedulerRuntimeStats, StoreDedupKey,
@@ -482,6 +482,7 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
             let released_slot_blocks = self.evict_inactive_session_slots_for_pressure(
+                PressureMode::Soft,
                 1,
                 Some(crate::kv_tier::Tier::HostPinned),
             );
@@ -1466,8 +1467,11 @@ impl<M: ModelForward> Scheduler<M> {
         if reclaimed_pages < want_free {
             let remaining_pages = want_free.saturating_sub(reclaimed_pages);
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
-            let _ =
-                self.evict_inactive_session_slots_for_pressure(1, Some(crate::kv_tier::Tier::Gpu));
+            let _ = self.evict_inactive_session_slots_for_pressure(
+                PressureMode::Soft,
+                1,
+                Some(crate::kv_tier::Tier::Gpu),
+            );
             let protected = self.session_protected_blocks();
             let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),
@@ -1565,8 +1569,11 @@ impl<M: ModelForward> Scheduler<M> {
 
         if reclaimed_pages < shortage_pages {
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
-            let _ =
-                self.evict_inactive_session_slots_for_pressure(1, Some(crate::kv_tier::Tier::Gpu));
+            let _ = self.evict_inactive_session_slots_for_pressure(
+                PressureMode::Soft,
+                1,
+                Some(crate::kv_tier::Tier::Gpu),
+            );
             let protected = self.session_protected_blocks();
             let evicted = self.prefix_cache.evict_with_policy_for_intent_excluding(
                 &SessionBiasedLru::default(),
