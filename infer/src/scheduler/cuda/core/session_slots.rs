@@ -469,4 +469,86 @@ mod tests {
             Tier::HostPinned
         );
     }
+
+    #[test]
+    fn pressure_mode_soft_preserves_keepalive_hard_drops_idle_threshold() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            SessionId::from("fresh-inactive"),
+            SessionSlot {
+                blocks: vec![BlockId(1)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 69,
+            },
+        );
+
+        let now = 70;
+        let keepalive_ticks = 64;
+        assert!(
+            inactive_session_slot_eviction_candidates(
+                &slots,
+                now,
+                PressureMode::Soft.min_idle_ticks(keepalive_ticks),
+                1,
+                |_| true,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            inactive_session_slot_eviction_candidates(
+                &slots,
+                now,
+                PressureMode::Hard.min_idle_ticks(keepalive_ticks),
+                1,
+                |_| true,
+            ),
+            vec![SessionId::from("fresh-inactive")]
+        );
+    }
+
+    #[test]
+    fn pressure_modes_respect_ref_count_and_tier_filter() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            SessionId::from("active-target-tier"),
+            SessionSlot {
+                blocks: vec![BlockId(1)],
+                committed_len: 16,
+                ref_count: 1,
+                last_access_tick: 1,
+            },
+        );
+        slots.insert(
+            SessionId::from("inactive-wrong-tier"),
+            SessionSlot {
+                blocks: vec![BlockId(2)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 1,
+            },
+        );
+        slots.insert(
+            SessionId::from("inactive-target-tier"),
+            SessionSlot {
+                blocks: vec![BlockId(3)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 2,
+            },
+        );
+
+        for mode in [PressureMode::Soft, PressureMode::Hard] {
+            assert_eq!(
+                inactive_session_slot_eviction_candidates(
+                    &slots,
+                    100,
+                    mode.min_idle_ticks(64),
+                    8,
+                    |slot| slot.blocks.contains(&BlockId(3)),
+                ),
+                vec![SessionId::from("inactive-target-tier")]
+            );
+        }
+    }
 }

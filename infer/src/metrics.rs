@@ -1327,6 +1327,11 @@ mod tests {
         assert!(rendered.contains("infer_prefix_request_skip_rate{model=\"Qwen3-4B\",} 0.5000"));
         assert!(rendered.contains("infer_session_affinity_hit_total{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_session_affinity_miss_total{model=\"Qwen3-4B\",} 0"));
+        assert!(
+            rendered.contains(
+                "infer_session_slot_pressure_evictions_hard_total{model=\"Qwen3-4B\",} 0"
+            )
+        );
         assert!(rendered.contains("infer_matched_prefix_tokens{model=\"Qwen3-4B\",} 64"));
         assert!(rendered.contains("infer_resume_prefill_tokens{model=\"Qwen3-4B\",} 64"));
         assert!(
@@ -1381,6 +1386,7 @@ mod tests {
         m.record_tier_fetch_plan(1, 2, 0);
         m.record_tier_fetch_promoted(2);
         m.record_tier_fetch_fallback();
+        m.record_session_slot_pressure_evictions_hard(3);
         m.record_metal_decode_batch(4);
         m.record_metal_decode_scalar_row();
         m.record_metal_decode_batch_fallback(3);
@@ -1411,6 +1417,7 @@ mod tests {
         assert!(s.contains("prefix_request_skip_rate=25.0%"));
         assert!(s.contains("session_affinity_hit=1"));
         assert!(s.contains("session_affinity_miss=0"));
+        assert!(s.contains("session_slot_pressure_evictions_hard=3"));
         assert!(s.contains("matched_prefix_tokens=32"));
         assert!(s.contains("resume_prefill_tokens=96"));
         assert!(s.contains("tier_recall=66.7%"));
@@ -1436,6 +1443,10 @@ mod tests {
         assert_eq!(payload["prefix_skip_rate"], serde_json::json!(0.5));
         assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));
         assert_eq!(payload["session_affinity_miss"], serde_json::json!(0));
+        assert_eq!(
+            payload["session_slot_pressure_evictions_hard"],
+            serde_json::json!(0)
+        );
         assert_eq!(payload["matched_prefix_tokens"], serde_json::json!(64));
         assert_eq!(payload["resume_prefill_tokens"], serde_json::json!(64));
         assert_eq!(
