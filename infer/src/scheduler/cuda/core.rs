@@ -1270,10 +1270,7 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         };
         let location = crate::kv_tier::transport::disk::DiskBlockLocation {
-            path: match self.disk_store.block_path_for(*fingerprint) {
-                Ok(path) => path,
-                Err(_) => return,
-            },
+            path: self.disk_store.block_path_for(*fingerprint),
             payload_len: *payload_len,
             fingerprint: *fingerprint,
         };

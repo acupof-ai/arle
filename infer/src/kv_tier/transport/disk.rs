@@ -166,6 +166,12 @@ fn disk_location_error(message: impl Into<String>) -> TransportError {
 #[derive(Debug)]
 pub struct DiskStore {
     root: PathBuf,
+    // Tracks whether `create_root()` has succeeded at least once, so the
+    // hot put_block path can skip the per-write `create_dir_all` syscall
+    // (an idempotent but still-stat-ing call). The first put pays the
+    // cost, every subsequent put on the same DiskStore instance reads
+    // the atomic and skips.
+    root_created: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -184,7 +190,10 @@ impl DiskStore {
     /// directory — call [`DiskStore::create_root`] if it might not
     /// exist yet.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            root_created: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// Root directory used by this store.
@@ -220,7 +229,20 @@ impl DiskStore {
 
     /// Ensures the store root exists.
     pub fn create_root(&self) -> io::Result<()> {
-        std::fs::create_dir_all(&self.root)
+        std::fs::create_dir_all(&self.root)?;
+        self.root_created
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Like [`create_root`] but a no-op if a previous call succeeded on
+    /// this `DiskStore` instance. Used by the hot write path to skip the
+    /// per-write `create_dir_all` stat syscall after the first success.
+    fn ensure_root_created(&self) -> io::Result<()> {
+        if self.root_created.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        self.create_root()
     }
 
     // ── Keyed API ────────────────────────────────────────────────────
@@ -253,12 +275,37 @@ impl DiskStore {
     /// **cannot** influence the final path by tampering with a stored
     /// `DiskBlockLocation`. This is the defense against session
     /// snapshot–driven path traversal (M4 review finding B2).
-    pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> io::Result<PathBuf> {
-        kv_native_sys::block_path(self.root(), fingerprint.0)
+    ///
+    /// Formats the 32-hex-char + ".kv" filename in Rust directly (no
+    /// FFI/alloc trip into the Zig substrate) — this is the per-write
+    /// and per-read hot path. The byte-for-byte output matches Zig's
+    /// `blockFilenameAlloc` (same nibble→hex table, lowercase, same
+    /// suffix), so blocks written via either path are mutually
+    /// readable.
+    pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> PathBuf {
+        // Defence: the 35-byte stack buffer below assumes a 16-byte
+        // fingerprint (32 hex chars + ".kv"). If `BlockFingerprint`
+        // ever widens, fail at compile time instead of silently
+        // truncating the filename.
+        const _: () = assert!(std::mem::size_of::<BlockFingerprint>() == 16);
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut filename = [0u8; 35];
+        for (idx, byte) in fingerprint.0.iter().enumerate() {
+            filename[idx * 2] = HEX[(byte >> 4) as usize];
+            filename[idx * 2 + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        filename[32] = b'.';
+        filename[33] = b'k';
+        filename[34] = b'v';
+        // Safety: HEX table only emits ASCII digits/letters and the suffix
+        // is ASCII; the result is valid UTF-8.
+        let filename_str = unsafe { std::str::from_utf8_unchecked(&filename) };
+        self.root.join(filename_str)
     }
 
     pub fn contains_block(&self, fingerprint: BlockFingerprint) -> io::Result<bool> {
-        self.block_path_for(fingerprint)?.try_exists()
+        self.block_path_for(fingerprint).try_exists()
     }
 
     /// Visits every valid fingerprint-named block file currently under
@@ -288,7 +335,7 @@ impl DiskStore {
                 continue;
             };
 
-            let canonical = self.block_path_for(fingerprint)?;
+            let canonical = self.block_path_for(fingerprint);
             if !same_existing_path(&path, &canonical) {
                 return Err(invalid_data(
                     "disk store: discovered block path outside canonical root",
@@ -363,7 +410,7 @@ impl DiskStore {
                 continue;
             };
 
-            let canonical = self.block_path_for(fingerprint)?;
+            let canonical = self.block_path_for(fingerprint);
             if !same_existing_path(&path, &canonical) {
                 return Err(invalid_data(
                     "disk store: discovered block path outside canonical root",
@@ -467,7 +514,7 @@ impl DiskStore {
         payload: &[u8],
         fsync_each_block: bool,
     ) -> io::Result<DiskBlockLocation> {
-        self.create_root()?;
+        self.ensure_root_created()?;
 
         let payload_len = u64::try_from(payload.len())
             .map_err(|_| invalid_data("disk store: payload too large"))?;
@@ -478,17 +525,33 @@ impl DiskStore {
         file_bytes.extend_from_slice(&header_bytes);
         file_bytes.extend_from_slice(payload);
 
-        let path = self.block_path_for(fingerprint)?;
-        if fsync_each_block {
-            kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)?;
-        } else {
-            let tmp_path = path.with_extension("kv.tmp");
-            let write_result = std::fs::write(&tmp_path, &file_bytes)
-                .and_then(|()| std::fs::rename(&tmp_path, &path));
-            if let Err(err) = write_result {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(err);
+        let path = self.block_path_for(fingerprint);
+        let do_write = || -> io::Result<()> {
+            if fsync_each_block {
+                kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)
+            } else {
+                let tmp_path = path.with_extension("kv.tmp");
+                let result = std::fs::write(&tmp_path, &file_bytes)
+                    .and_then(|()| std::fs::rename(&tmp_path, &path));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                result
             }
+        };
+
+        match do_write() {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Self-heal: the cache root may have been deleted while the
+                // process was running (operator purge, tmp cleanup, remount).
+                // Force-recreate and retry once. The hot path stays fast
+                // because the AtomicBool short-circuit keeps every successful
+                // subsequent write at zero syscalls.
+                self.create_root()?;
+                do_write()?;
+            }
+            Err(err) => return Err(err),
         }
 
         Ok(DiskBlockLocation {
@@ -520,15 +583,21 @@ impl DiskStore {
                 "disk store: fingerprint mismatch (location vs expected)",
             ));
         }
-        let canonical = self.block_path_for(location.fingerprint)?;
+        let canonical = self.block_path_for(location.fingerprint);
         if location.path != canonical {
             return Err(invalid_data(
                 "disk store: refused location.path outside canonical root",
             ));
         }
 
-        let bytes = kv_native_sys::read_block(self.root(), location.fingerprint.0)?;
-        let (header, payload) = DiskBlockHeader::decode(&bytes)?;
+        // Read directly into a Zig-owned guard, decode the header against
+        // the borrowed slice, then copy only the payload into the returned
+        // Vec. This eliminates the Zig→Vec(header+payload) memcpy that
+        // `kv_native_sys::read_block` would have done in `read_buffer`,
+        // saving one allocation + one full-block memcpy per fetch on the
+        // T2→T1 path. Net cost: 1 alloc + 1 memcpy (vs prior 2 + 2).
+        let owned = kv_native_sys::read_block_owned(self.root(), location.fingerprint.0)?;
+        let (header, payload) = DiskBlockHeader::decode(owned.as_slice())?;
 
         if header.fingerprint != location.fingerprint.0 {
             return Err(invalid_data(
@@ -547,7 +616,7 @@ impl DiskStore {
     /// advisory `location.path` is not trusted (same reasoning as
     /// [`DiskStore::get_block`]).
     pub fn delete_block(&self, location: &DiskBlockLocation) -> io::Result<()> {
-        let canonical = self.block_path_for(location.fingerprint)?;
+        let canonical = self.block_path_for(location.fingerprint);
         if location.path != canonical {
             return Err(invalid_data(
                 "disk store: refused location.path outside canonical root",
@@ -571,9 +640,7 @@ impl DiskStore {
                 fingerprint,
                 payload_len,
             } => {
-                let path = self
-                    .block_path_for(*fingerprint)
-                    .map_err(|err| disk_error(&err))?;
+                let path = self.block_path_for(*fingerprint);
                 Ok(DiskBlockLocation {
                     path,
                     payload_len: *payload_len,
@@ -806,6 +873,51 @@ mod tests {
     }
 
     #[test]
+    fn put_block_self_heals_when_root_deleted_externally() {
+        // Regression test for the create_root AtomicBool cache (commit
+        // 701c76a). After a successful first write, the cache short-
+        // circuits create_dir_all on every subsequent put. If the cache
+        // root gets deleted externally (operator purge / tmp cleanup /
+        // remount), the next put would fail with NotFound and stall
+        // T1→T2 spill until restart. The put path must self-heal:
+        // detect NotFound from the inner write, force-recreate the
+        // root, retry once.
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("kv-store-root");
+        let store = DiskStore::new(&root);
+        let kv_format_tag = 9;
+
+        // First write — exercises the create_root path; flips the
+        // AtomicBool to true.
+        let payload_a = b"first-write-creates-root".to_vec(); // len 24
+        let fp_a = fingerprint_for_payload(&payload_a, kv_format_tag);
+        store
+            .put_block_with_fsync(fp_a, kv_format_tag, &payload_a, false)
+            .expect("first put creates root");
+        assert!(root.exists());
+
+        // External purge: blow away the cache root completely. After
+        // this, the AtomicBool still says true but the directory is
+        // gone — the next put MUST recreate it instead of failing.
+        std::fs::remove_dir_all(&root).expect("remove root");
+        assert!(!root.exists());
+
+        // Second write — should self-heal and succeed. Length 32 (div 4).
+        let payload_b = b"second-write-must-self-heal-OKOK".to_vec();
+        let fp_b = fingerprint_for_payload(&payload_b, kv_format_tag);
+        let location = store
+            .put_block_with_fsync(fp_b, kv_format_tag, &payload_b, false)
+            .expect("self-heal recreates the root and succeeds");
+        assert!(root.exists());
+        assert_eq!(
+            store
+                .get_block(&location, Some(fp_b))
+                .expect("get after self-heal"),
+            payload_b
+        );
+    }
+
+    #[test]
     fn contains_block_tracks_fingerprint_presence() {
         let dir = tempdir().unwrap();
         let store = DiskStore::new(dir.path());
@@ -913,11 +1025,7 @@ mod tests {
             kv_format_tag: 1,
             payload_len: 1024,
         };
-        write_raw_block(
-            &store.block_path_for(fingerprint).unwrap(),
-            &header,
-            &payload,
-        );
+        write_raw_block(&store.block_path_for(fingerprint), &header, &payload);
 
         let mut visited = 0usize;
         store
@@ -954,7 +1062,7 @@ mod tests {
 
         let malformed_fingerprint = BlockFingerprint([0x11; 16]);
         store.create_root().unwrap();
-        let malformed_path = store.block_path_for(malformed_fingerprint).unwrap();
+        let malformed_path = store.block_path_for(malformed_fingerprint);
         fs::write(malformed_path, b"not a disk block").unwrap();
 
         let mut visited = Vec::new();

@@ -1,29 +1,22 @@
 //! Minimal policy layer for tiered-KV prefetch and write-back decisions.
+//!
+//! The policy enums themselves (`PrefetchPolicy`, `WritePolicy`) live in
+//! `crate::kv_tier::policy` since they describe coordinator-owned
+//! tier-movement decisions, not scheduler-only concerns. This module
+//! holds the scheduler's wiring of those policies into the tiered-KV
+//! decision points.
 
 use crate::kv_tier::coordinator::{CoordinatorQueueStats, QueueControlStats, StoreTarget};
+use crate::kv_tier::policy::{PrefetchPolicy, WritePolicy};
 use crate::prefix_cache::BlockMetadata;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // `WaitComplete` reserved for future policy mode.
-pub(super) enum PrefetchMode {
-    BestEffort,
-    WaitComplete,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // `WriteThrough` reserved for future policy mode.
-pub(super) enum WriteBackMode {
-    WriteThrough,
-    WriteThroughSelective,
-}
 
 #[derive(Clone, Debug)]
 pub(super) struct TieredKvPolicy {
     fetch_soft_limit: f64,
     store_soft_limit: f64,
     remote_store_min_hits: u32,
-    prefetch_mode: PrefetchMode,
-    write_back_mode: WriteBackMode,
+    prefetch_policy: PrefetchPolicy,
+    write_policy: WritePolicy,
 }
 
 impl Default for TieredKvPolicy {
@@ -32,17 +25,17 @@ impl Default for TieredKvPolicy {
             fetch_soft_limit: 0.75,
             store_soft_limit: 0.75,
             remote_store_min_hits: 2,
-            prefetch_mode: PrefetchMode::BestEffort,
-            write_back_mode: WriteBackMode::WriteThroughSelective,
+            prefetch_policy: PrefetchPolicy::BestEffort,
+            write_policy: WritePolicy::WriteThroughSelective,
         }
     }
 }
 
 impl TieredKvPolicy {
     pub(super) fn allow_prefetch(&self, queue: QueueControlStats) -> bool {
-        match self.prefetch_mode {
-            PrefetchMode::BestEffort => !queue.soft_saturated(self.fetch_soft_limit),
-            PrefetchMode::WaitComplete => true,
+        match self.prefetch_policy {
+            PrefetchPolicy::BestEffort => !queue.soft_saturated(self.fetch_soft_limit),
+            PrefetchPolicy::WaitComplete => true,
         }
     }
 
@@ -59,9 +52,9 @@ impl TieredKvPolicy {
         if !cluster_backend_ready {
             return StoreTarget::Disk;
         }
-        match self.write_back_mode {
-            WriteBackMode::WriteThrough => StoreTarget::Remote,
-            WriteBackMode::WriteThroughSelective => {
+        match self.write_policy {
+            WritePolicy::WriteThrough => StoreTarget::Remote,
+            WritePolicy::WriteThroughSelective => {
                 if metadata.hit_count >= self.remote_store_min_hits && self.allow_store(stats.store)
                 {
                     StoreTarget::Remote

@@ -120,7 +120,7 @@ impl SharedFsStore {
         self.inner.create_root()
     }
 
-    pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> io::Result<PathBuf> {
+    pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> PathBuf {
         self.inner.block_path_for(fingerprint)
     }
 
@@ -147,7 +147,7 @@ impl SharedFsStore {
         expected_fingerprint: Option<BlockFingerprint>,
     ) -> io::Result<Vec<u8>> {
         let disk_location = DiskBlockLocation {
-            path: self.block_path_for(location.fingerprint)?,
+            path: self.block_path_for(location.fingerprint),
             payload_len: location.payload_len,
             fingerprint: location.fingerprint,
         };
@@ -156,7 +156,7 @@ impl SharedFsStore {
 
     pub fn delete_block(&self, location: SharedFsBlockLocation) -> io::Result<()> {
         let disk_location = DiskBlockLocation {
-            path: self.block_path_for(location.fingerprint)?,
+            path: self.block_path_for(location.fingerprint),
             payload_len: location.payload_len,
             fingerprint: location.fingerprint,
         };

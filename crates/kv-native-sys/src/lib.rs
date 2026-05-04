@@ -311,6 +311,33 @@ pub fn read_block(root: &Path, fingerprint: [u8; 16]) -> io::Result<Vec<u8>> {
     )
 }
 
+/// Like [`read_block`] but returns a guard owning the Zig-allocated
+/// buffer directly, skipping the intermediate `Vec<u8>` copy that
+/// [`read_block`] performs in [`read_buffer`]. Use this when the caller
+/// can decode/copy the payload from a borrowed slice without needing a
+/// `Vec`-shaped owner — for example, [`crate::DiskStore::get_block`]
+/// followed by a single memcpy into a host-pinned region eliminates
+/// one allocation + one memcpy per fetch on the T2→T1 path.
+///
+/// The returned guard derefs to `&[u8]`. The buffer is freed (via
+/// `kv_native_buffer_free`) when the guard is dropped.
+pub fn read_block_owned(root: &Path, fingerprint: [u8; 16]) -> io::Result<KvNativeOwnedBytes> {
+    let root = path_bytes(root);
+    let fingerprint = fingerprint_bytes(fingerprint);
+    read_buffer_owned(
+        |out| unsafe {
+            kv_native_read_block(
+                root.as_ptr(),
+                root.len(),
+                fingerprint.as_ptr(),
+                fingerprint.len(),
+                out,
+            )
+        },
+        "kv_native_read_block_owned",
+    )
+}
+
 pub fn remove_block(root: &Path, fingerprint: [u8; 16], ignore_not_found: bool) -> io::Result<()> {
     let root = path_bytes(root);
     let fingerprint = fingerprint_bytes(fingerprint);
@@ -558,6 +585,86 @@ fn read_buffer(
     let bytes = unsafe { std::slice::from_raw_parts(out.data.cast_const(), out.len) }.to_vec();
     unsafe { kv_native_buffer_free(out.data) };
     Ok(bytes)
+}
+
+/// Owning guard over a Zig-allocated buffer. Drops via
+/// [`kv_native_buffer_free`]. The bytes are valid for as long as the
+/// guard lives; the caller must not retain a slice past `Drop`.
+pub struct KvNativeOwnedBytes {
+    data: *mut u8,
+    len: usize,
+}
+
+// Safety: `data` is a heap allocation owned exclusively by this guard.
+// The pointee is plain bytes with no interior mutability and no thread
+// affinity, so it is safe to send and share across threads as long as
+// the borrow rules on `&[u8]` are observed (compiler-enforced).
+unsafe impl Send for KvNativeOwnedBytes {}
+unsafe impl Sync for KvNativeOwnedBytes {}
+
+impl KvNativeOwnedBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        if self.data.is_null() || self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.data.cast_const(), self.len) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::ops::Deref for KvNativeOwnedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Drop for KvNativeOwnedBytes {
+    fn drop(&mut self) {
+        if !self.data.is_null() {
+            unsafe { kv_native_buffer_free(self.data) };
+        }
+    }
+}
+
+fn read_buffer_owned(
+    call: impl FnOnce(*mut KvNativeBuffer) -> c_int,
+    context: &'static str,
+) -> io::Result<KvNativeOwnedBytes> {
+    let mut out = KvNativeBuffer {
+        data: std::ptr::null_mut(),
+        len: 0,
+    };
+    let status = call(&mut out);
+    if status_from_code(status) != Some(KvNativeStatus::Ok) {
+        return Err(status_to_error(status, context));
+    }
+    if out.len == 0 {
+        if !out.data.is_null() {
+            unsafe { kv_native_buffer_free(out.data) };
+        }
+        return Ok(KvNativeOwnedBytes {
+            data: std::ptr::null_mut(),
+            len: 0,
+        });
+    }
+    if out.data.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context}: native layer returned null data for non-empty buffer"),
+        ));
+    }
+    Ok(KvNativeOwnedBytes {
+        data: out.data,
+        len: out.len,
+    })
 }
 
 fn decode_wal_records(bytes: &[u8]) -> io::Result<Vec<KvWalRecord>> {
@@ -830,6 +937,44 @@ mod tests {
         assert_eq!(stitched_tail.offset, 64);
         assert_eq!(stitched_tail.len, 192);
         assert_eq!(arena.reserved_bytes(), 256);
+    }
+
+    #[test]
+    fn read_block_owned_roundtrips_payload_via_zig_owned_buffer() {
+        let dir = tempdir().unwrap();
+        let fp = [0xC7u8; 16];
+        let payload = b"payload-bytes-for-owned-roundtrip-test";
+        write_block_atomic(dir.path(), fp, payload).unwrap();
+
+        // The owning guard should expose the same bytes as `read_block` and
+        // free the Zig-allocated buffer on Drop without panicking.
+        let owned = read_block_owned(dir.path(), fp).unwrap();
+        assert_eq!(owned.as_slice(), payload);
+        assert_eq!(owned.len(), payload.len());
+        assert!(!owned.is_empty());
+        let slice: &[u8] = &owned;
+        assert_eq!(slice, payload);
+        drop(owned);
+
+        // After dropping the guard, a fresh `read_block` call must still
+        // succeed against the same on-disk file (verifies guard owns the
+        // buffer and doesn't disturb the underlying storage).
+        let again = read_block(dir.path(), fp).unwrap();
+        assert_eq!(again, payload);
+    }
+
+    #[test]
+    fn read_block_owned_returns_empty_for_empty_payload() {
+        let dir = tempdir().unwrap();
+        let fp = [0x9Fu8; 16];
+        write_block_atomic(dir.path(), fp, b"").unwrap();
+
+        let owned = read_block_owned(dir.path(), fp).unwrap();
+        assert!(owned.is_empty());
+        assert_eq!(owned.len(), 0);
+        assert_eq!(owned.as_slice(), &[] as &[u8]);
+        let slice: &[u8] = &owned;
+        assert!(slice.is_empty());
     }
 
     #[test]
