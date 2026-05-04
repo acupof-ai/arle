@@ -163,6 +163,17 @@ impl ServerMetrics {
         .unwrap();
 
         out.push_str(
+            "# HELP infer_session_slot_pressure_evictions_hard_total Inactive session slots evicted under hard pressure.\n",
+        );
+        out.push_str("# TYPE infer_session_slot_pressure_evictions_hard_total counter\n");
+        writeln!(
+            out,
+            "infer_session_slot_pressure_evictions_hard_total{{{labels}}} {}",
+            self.session_slot_pressure_evictions_hard()
+        )
+        .unwrap();
+
+        out.push_str(
             "# HELP infer_matched_prefix_tokens Matched prefix tokens for the most recent lookup.\n",
         );
         out.push_str("# TYPE infer_matched_prefix_tokens gauge\n");
@@ -869,6 +880,7 @@ impl ServerMetrics {
             "prefix_skip_rate": self.prefix_skip_rate(),
             "session_affinity_hit": self.session_affinity_hit_total(),
             "session_affinity_miss": self.session_affinity_miss_total(),
+            "session_slot_pressure_evictions_hard": self.session_slot_pressure_evictions_hard(),
             "matched_prefix_tokens": self.matched_prefix_tokens(),
             "resume_prefill_tokens": self.resume_prefill_tokens(),
             "last_request": {
@@ -1020,11 +1032,12 @@ impl ServerMetrics {
             format!(" prefix_skip_rate={:.1}%", self.prefix_skip_rate() * 100.0)
         };
         let agent_cache_suffix = format!(
-            " prefix_request_hit_rate={:.1}% prefix_request_skip_rate={:.1}% session_affinity_hit={} session_affinity_miss={} matched_prefix_tokens={} resume_prefill_tokens={}",
+            " prefix_request_hit_rate={:.1}% prefix_request_skip_rate={:.1}% session_affinity_hit={} session_affinity_miss={} session_slot_pressure_evictions_hard={} matched_prefix_tokens={} resume_prefill_tokens={}",
             self.prefix_request_hit_rate() * 100.0,
             self.prefix_request_skip_rate() * 100.0,
             self.session_affinity_hit_total(),
             self.session_affinity_miss_total(),
+            self.session_slot_pressure_evictions_hard(),
             self.matched_prefix_tokens(),
             self.resume_prefill_tokens(),
         );

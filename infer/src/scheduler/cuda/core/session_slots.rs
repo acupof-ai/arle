@@ -23,6 +23,21 @@ pub(in crate::scheduler::cuda) struct SessionSlotLookup {
     pub(in crate::scheduler::cuda) hold: SessionSlotHold,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::scheduler::cuda) enum PressureMode {
+    Soft,
+    Hard,
+}
+
+impl PressureMode {
+    fn min_idle_ticks(self, keepalive_ticks: u64) -> u64 {
+        match self {
+            Self::Soft => keepalive_ticks,
+            Self::Hard => 0,
+        }
+    }
+}
+
 impl<M: ModelForward> Scheduler<M> {
     pub(super) fn publish_session_slot(
         &mut self,
@@ -155,13 +170,14 @@ impl<M: ModelForward> Scheduler<M> {
 
     pub(super) fn evict_inactive_session_slots_for_pressure(
         &mut self,
+        mode: PressureMode,
         max_slots: usize,
         tier_filter: Option<Tier>,
     ) -> usize {
         let candidates = inactive_session_slot_eviction_candidates(
             &self.session_slots,
             self.prefix_cache.logical_clock(),
-            self.config.prefix_cache_keepalive_ticks,
+            mode.min_idle_ticks(self.config.prefix_cache_keepalive_ticks),
             max_slots,
             |slot| self.session_slot_has_tier_blocks(slot, tier_filter),
         );
@@ -181,8 +197,13 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         if released_slots > 0 {
+            if mode == PressureMode::Hard {
+                self.metrics
+                    .record_session_slot_pressure_evictions_hard(released_slots);
+            }
             log::info!(
-                "session slot pressure eviction: released {} inactive slots ({} block refs)",
+                "session slot pressure eviction: mode={:?} released {} inactive slots ({} block refs)",
+                mode,
                 released_slots,
                 released_blocks
             );
