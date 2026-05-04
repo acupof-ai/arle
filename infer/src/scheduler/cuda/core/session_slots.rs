@@ -307,7 +307,7 @@ impl<M: ModelForward> Scheduler<M> {
 }
 
 fn block_metadata_tier(location: Option<&BlockLocation>) -> Tier {
-    location.map(BlockLocation::tier).unwrap_or(Tier::Gpu)
+    location.map_or(Tier::Gpu, BlockLocation::tier)
 }
 
 fn inactive_session_slot_eviction_candidates(
