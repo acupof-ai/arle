@@ -90,7 +90,7 @@ fn store_roundtrip_through_disk_store() {
                     fingerprint,
                     payload_len,
                 } => crate::kv_tier::transport::disk::DiskBlockLocation {
-                    path: disk_store.block_path_for(fingerprint).unwrap(),
+                    path: disk_store.block_path_for(fingerprint),
                     fingerprint,
                     payload_len,
                 },
@@ -846,4 +846,134 @@ fn allocated_regions_no_release_when_committed() {
     );
     // Cleanup — release the original region so the pool is tidy.
     pool.release(region).unwrap();
+}
+
+#[test]
+fn t1_t2_full_swap_cycle_release_then_readmit() {
+    // End-to-end T1→T2→release→T1 byte-equality. The existing
+    // store_roundtrip_through_disk_store and fetch_from_disk_*
+    // tests cover only the legs in isolation; this one closes
+    // the full eviction-then-readmission cycle that production
+    // session-resume depends on. Bytes must survive the host
+    // region being released between persist and readmit AND
+    // appear at a different host-pool offset than they
+    // originally occupied (otherwise a regression that read
+    // stale aliased bytes from the pool — without going through
+    // disk at all — would still pass byte-equality).
+    let dir = tempdir().unwrap();
+    let disk_store = Arc::new(DiskStore::new(dir.path()));
+    let (coordinator, handle, events) = CoordinatorBuilder::new(4)
+        .disk_store(disk_store.clone())
+        .build();
+    // Pool sized large enough to hold the original region + a
+    // pinning region simultaneously. The pinning region forces
+    // the fetch-leg's reservation to a different offset, so a
+    // regression that returned stale aliased bytes from the
+    // initial offset would surface as a byte-mismatch.
+    let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+        crate::kv_tier::HostPinnedPool::new(4096).unwrap(),
+    );
+
+    let original: &[u8] = b"layer-block-payload-bytes";
+    let initial_region = {
+        let mut pool = host_pool.lock().unwrap();
+        let region = pool.reserve(original.len()).unwrap().unwrap();
+        pool.as_mut_slice(region).copy_from_slice(original);
+        region
+    };
+    let initial_offset = initial_region.offset;
+    let fingerprint = BlockFingerprint([0xCD; 16]);
+
+    let store_ticket = handle
+        .submit_store(vec![StoreRequest {
+            block_id: BlockId(101),
+            fingerprint,
+            kv_format_tag: 7,
+            host_pool: host_pool.clone(),
+            host_region: initial_region,
+            target: StoreTarget::Disk,
+        }])
+        .unwrap();
+    assert!(coordinator.run_once().unwrap());
+    match events.recv().unwrap() {
+        CoordinatorEvent::StoreQueued { ticket, .. } => assert_eq!(ticket, store_ticket),
+        other => panic!("unexpected store-queued event: {other:?}"),
+    }
+    let payload_len = match events.recv().unwrap() {
+        CoordinatorEvent::StoreCompleted { locations, .. } => match &locations[0].1 {
+            BlockLocation::Disk { payload_len, .. } => *payload_len,
+            other => panic!("expected disk location, got {other:?}"),
+        },
+        other => panic!("unexpected store-completed event: {other:?}"),
+    };
+
+    host_pool.release_region(initial_region).unwrap();
+
+    // Pin the initial offset so the fetch-leg cannot reuse it.
+    // Fill with a deterministic non-payload pattern; if the fetch
+    // path silently aliased back to this offset, the assert below
+    // would catch it (we'd read the pin pattern, not the original).
+    let pin_region = {
+        let mut pool = host_pool.lock().unwrap();
+        let region = pool
+            .reserve(original.len())
+            .unwrap()
+            .expect("pool has room for the pin region");
+        pool.as_mut_slice(region).fill(0xAB);
+        region
+    };
+    assert_eq!(
+        pin_region.offset, initial_offset,
+        "pin region should occupy the slot the original region just released",
+    );
+
+    let fetch_ticket = handle
+        .submit_fetch(vec![FetchRequest {
+            block_id: BlockId(101),
+            source: BlockLocation::Disk {
+                fingerprint,
+                payload_len,
+            },
+            byte_len: usize::try_from(payload_len).unwrap(),
+            host_pool: host_pool.clone(),
+        }])
+        .unwrap();
+    assert!(coordinator.run_once().unwrap());
+    match events.recv().unwrap() {
+        CoordinatorEvent::FetchQueued { ticket, .. } => assert_eq!(ticket, fetch_ticket),
+        other => panic!("unexpected fetch-queued event: {other:?}"),
+    }
+    let fetched = match events.recv().unwrap() {
+        CoordinatorEvent::FetchCompleted { blocks, .. } => blocks,
+        other => panic!("unexpected fetch-completed event: {other:?}"),
+    };
+
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].block_id, BlockId(101));
+    assert!(
+        fetched[0].release_after_promote,
+        "disk-readmitted regions must be marked temporary by contract",
+    );
+    // The fetched region MUST land at a different offset than the
+    // original — proves the bytes traveled through disk and back
+    // rather than aliasing the same pool slot.
+    assert_ne!(
+        fetched[0].host_region.offset, initial_offset,
+        "fetch-leg must allocate a fresh region (initial offset is pinned)",
+    );
+    assert_eq!(
+        host_pool.read_region(fetched[0].host_region).unwrap(),
+        original,
+        "T1→T2→release→T1 round-trip must preserve bytes byte-equal",
+    );
+    // Also: the pin region MUST still hold the 0xAB fill — the
+    // fetch path cannot have written into the wrong slot.
+    assert_eq!(
+        host_pool.read_region(pin_region).unwrap(),
+        vec![0xABu8; original.len()],
+        "fetch must not have written into the pinned region",
+    );
+
+    host_pool.release_region(fetched[0].host_region).unwrap();
+    host_pool.release_region(pin_region).unwrap();
 }

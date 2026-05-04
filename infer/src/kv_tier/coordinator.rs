@@ -265,7 +265,22 @@ impl Coordinator {
                             "coordinator disk store not configured",
                         );
                     };
-                    match disk_store.put_block(block.fingerprint, block.kv_format_tag, &payload) {
+                    // Cache writes: KV blocks are recomputable on miss, so we
+                    // skip the per-block fsync (data + parent dir). The write
+                    // remains atomic via temp-file + rename, so readers never
+                    // observe a partial file. Bench measurement (2026-05-04
+                    // wins entry) shows fsync is the dominant cost for small
+                    // blocks: a 4 KiB roundtrip is 19 MiB/s with fsync vs
+                    // 361 MiB/s without (≈19× speedup), and even at 256 MiB
+                    // the no-fsync path is 1.6× faster. Production durability-
+                    // sensitive callers can still reach the fsync variant
+                    // through `DiskStore::put_block_with_fsync` directly.
+                    match disk_store.put_block_with_fsync(
+                        block.fingerprint,
+                        block.kv_format_tag,
+                        &payload,
+                        false,
+                    ) {
                         Ok(location) => locations.push((
                             block.block_id,
                             BlockLocation::Disk {
@@ -534,9 +549,7 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| "coordinator disk store not configured".to_string())?;
         let location = DiskBlockLocation {
-            path: disk_store
-                .block_path_for(fingerprint)
-                .map_err(|e| e.to_string())?,
+            path: disk_store.block_path_for(fingerprint),
             payload_len,
             fingerprint,
         };
@@ -636,3 +649,7 @@ impl Coordinator {
 #[cfg(test)]
 #[path = "coordinator/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "coordinator/bench.rs"]
+mod bench;

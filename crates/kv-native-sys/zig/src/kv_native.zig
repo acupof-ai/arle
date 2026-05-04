@@ -606,6 +606,22 @@ fn hostArenaCreateInternal(
     if (mapping == c.MAP_FAILED) return .io;
     errdefer _ = c.munmap(mapping, capacity_bytes);
 
+    // Best-effort: ask the kernel to back this arena with transparent huge
+    // pages. On Linux with `transparent_hugepage=madvise` (the common
+    // distro default) this materially reduces TLB pressure on large
+    // sequential KV memcpys. Failure is silently OK — the kernel falls
+    // back to 4 KiB pages and the arena still works.
+    //
+    // Note: a 2026-05-04 A/B on a Sapphire Rapids 4-core VM showed no
+    // measurable improvement (kernel did not actually promote — the
+    // host's THP support may be disabled). The call is kept as a
+    // defensive optimization for production Linux hosts where THP is
+    // properly configured. See the wins entry of that date for the
+    // measured numbers.
+    if (@hasDecl(c, "MADV_HUGEPAGE")) {
+        _ = c.madvise(mapping, capacity_bytes, c.MADV_HUGEPAGE);
+    }
+
     const arena = std.heap.c_allocator.create(KvHostArena) catch return .oom;
     arena.* = .{
         .mapping = mapping,
