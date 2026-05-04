@@ -470,7 +470,11 @@ impl<M: ModelForward> Scheduler<M> {
         demote_high_water.saturating_sub(reserved_bytes)
     }
 
-    fn evict_host_blocks_for_demote_headroom(&mut self, required_bytes: usize) -> usize {
+    fn evict_host_blocks_for_demote_headroom(
+        &mut self,
+        required_bytes: usize,
+        mode: PressureMode,
+    ) -> usize {
         if required_bytes == 0 || self.host_pool_demote_headroom_bytes() >= required_bytes {
             return 0;
         }
@@ -482,7 +486,7 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
             let released_slot_blocks = self.evict_inactive_session_slots_for_pressure(
-                PressureMode::Soft,
+                mode,
                 1,
                 Some(crate::kv_tier::Tier::HostPinned),
             );
@@ -1196,7 +1200,10 @@ impl<M: ModelForward> Scheduler<M> {
         };
         let block_bytes = metadata.byte_len as usize;
         if self.host_pool_demote_headroom_bytes() < block_bytes {
-            self.evict_host_blocks_for_demote_headroom(block_bytes);
+            self.evict_host_blocks_for_demote_headroom(block_bytes, PressureMode::Soft);
+        }
+        if self.host_pool_demote_headroom_bytes() < block_bytes {
+            self.evict_host_blocks_for_demote_headroom(block_bytes, PressureMode::Hard);
         }
         if self.host_pool_demote_headroom_bytes() < block_bytes {
             return Err(anyhow::anyhow!(
