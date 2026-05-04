@@ -5,12 +5,10 @@ use anyhow::{Result, bail};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use super::{DraftModel, TokenProposal, verify_tokens_greedy};
+use super::{DraftModel, TokenProposal};
 use crate::backend::cuda::bootstrap::{InferenceEngineOptions, load_qwen3_components};
 use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
-use crate::model::{
-    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen3State, SpecVerifyRequest,
-};
+use crate::model::{GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen3State};
 use crate::sampler::SamplingParams;
 use cuda_kernels::prelude::PagedKVPool;
 
