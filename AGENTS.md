@@ -33,13 +33,14 @@ batched decode HD128+HD256. Tests compare against JSON baselines in
 ```
 ARLE/
 ├── src/                       ← thin `arle` binary
-├── infer/                     ← primary runtime crate (scheduler/model/ops/backends/HTTP)
+├── infer/                     ← primary runtime crate (scheduler/model/ops/backends/HTTP/distributed)
 ├── crates/
 │   ├── agent/chat/cli/tools   ← runtime-facing control-plane crates
-│   ├── autograd/              ← from-scratch autograd + optimizer core
-│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
+│   ├── autograd/              ← from-scratch autograd + optimizer + lr-schedule + AdamW codec
+│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/, collective.rs (NCCL)
+│   ├── deepseek-spec/         ← DeepSeek V4 readiness scaffold (DS0 config + tensor names + Shard)
 │   ├── kv-native-sys/         ← local persistence substrate for KV tier transports
-│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
+│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc), Qwen3.5 step / MoE / DFlash draft / Metal capture hook
 │   ├── qwen3-spec/            ← shared Qwen3 config + tensor-name contract
 │   ├── qwen35-spec/           ← shared Qwen3.5 config + tensor-name contract
 │   └── train/                 ← train-side control plane + runtime-integrated RL stack

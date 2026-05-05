@@ -21,9 +21,17 @@ crates/mlx-sys/
 └── src/
     ├── lib.rs           — extern "C" declarations (no mlx-c intermediate)
     ├── mlx_bridge.cpp   — C++ wrappers for mlx::core API
-    ├── mlx_qwen35_model.cpp — dedicated C++ Qwen3.5 step model
-    └── mlx_common.h     — shared C header (dtype constants, struct layouts)
+    ├── mlx_qwen35_model.cpp     — dedicated C++ Qwen3.5 step model (per-layer hot path)
+    ├── mlx_qwen35_moe_block.cpp — Qwen3.5 / Qwen3.6 SparseMoeBlock forward composed in C++; wired from `mlx_qwen35_model.cpp` and exposed as `qwen35_moe_block_forward` FFI
+    ├── mlx_dflash_draft_model.cpp — Metal DFlash draft-model step (the C++ side of the speculative-draft path consumed by `infer::backend::metal::dflash`)
+    ├── mlx_metal_capture.mm     — env-gated `MTLCaptureManager` hook around `qwen35_compiled_step_session` (default OFF; see Debugging hooks)
+    └── mlx_common.h             — shared C header (dtype constants, struct layouts)
 ```
+
+All four `.cpp`/`.mm` translation units are explicitly listed in
+`build.rs` (`cc::Build::new().file(...)`) and registered with
+`cargo:rerun-if-changed`. Adding a new C++ file requires updating both
+lists — there is no glob.
 
 ## Invariants (violating these breaks the Metal path)
 
@@ -51,6 +59,12 @@ crates/mlx-sys/
    not a generic MLX composition. It exists because Qwen3.5 hybrid attention
    benefits from a fused C++ step path; Qwen3 still goes through the Rust
    `rust_transformer_layer`. Don't merge the two without a bench snapshot.
+7. **Specialized C++ helpers for Qwen3.5 sub-layers compose the C++ side
+   of the bridge.** `mlx_qwen35_moe_block.cpp` is the canonical SparseMoE
+   forward; `mlx_dflash_draft_model.cpp` is the canonical draft-model
+   step. Both are reachable from Rust via dedicated FFI entry points and
+   are also called from `mlx_qwen35_model.cpp`'s per-layer dispatch.
+   Adding a new fused sub-layer goes here, not into `mlx_bridge.cpp`.
 
 ## Build chain (`build.rs`)
 
@@ -59,8 +73,11 @@ crates/mlx-sys/
    `vendor/` and the build running with `FETCHCONTENT_FULLY_DISCONNECTED=ON`.
    Flags: `MLX_BUILD_METAL=ON`, `MLX_BUILD_ACCELERATE=ON`, tests/examples/
    benchmarks/python OFF, `BUILD_SHARED_LIBS=OFF`, `CMAKE_CXX_STANDARD=17`.
-2. **cc** compiles `mlx_bridge.cpp` + `mlx_qwen35_model.cpp` as `libmlx_ffi.a`
-   with `-std=c++17 -Wno-deprecated-copy -Wno-unused-parameter -Wno-sign-compare`.
+2. **cc** compiles all bridge translation units (`mlx_bridge.cpp`,
+   `mlx_qwen35_model.cpp`, `mlx_qwen35_moe_block.cpp`,
+   `mlx_dflash_draft_model.cpp`, `mlx_metal_capture.mm`) as
+   `libmlx_ffi.a` with `-std=c++17 -Wno-deprecated-copy
+   -Wno-unused-parameter -Wno-sign-compare`.
 3. **Link order (strict):**
    - `static=mlx_ffi` (our bridge)
    - `static=mlx` (the fetched library)
@@ -126,6 +143,15 @@ INFER_CAPTURE_STEP=5 \
   cache advance and no leaked output handle.
 
 Open the resulting `.gputrace` in Xcode for inspection.
+
+## Active priority — P3 Metal serving-grade closure
+
+This crate is the bridge layer beneath P3. The current Qwen3.5 step
+model (Rust path 305.5 tok/s on M4 Pro for `1024/256`) and the DFlash
+draft path (5.9× decode reference win) both depend on the dedicated
+C++ files staying separate from `mlx_bridge.cpp`. New Metal-only fused
+ops should land here, not in `infer`. See
+[`docs/projects/mlx-backend-roadmap.md`](../../docs/projects/mlx-backend-roadmap.md).
 
 ## Pointers
 

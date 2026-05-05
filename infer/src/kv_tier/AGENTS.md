@@ -39,14 +39,17 @@ kv_tier/backend.rs      — KVBackend trait (node-local / cluster-shared slower-
 kv_tier/chunk.rs        — KVBlock / KVSpan / KVHandle + index/store/request state enums
 kv_tier/id.rs           — re-export of crate::types::BlockId (u32)
 kv_tier/io.rs           — KVPayload / KVPayloadRef / backend request-response payloads
+kv_tier/lookup.rs       — HitKind / LookupBlock / LookupOutcome / LookupHeuristics: prefix-classification structs that scheduler ingress uses to score radix vs host vs disk hits
+kv_tier/policy.rs       — PrefetchPolicy / WritePolicy enums (BestEffort vs WaitComplete; WriteThroughSelective vs WriteBack). The scheduler-side wiring lives in `scheduler/cuda/policy.rs`; this file owns the policy enums themselves so coordinator + scheduler agree on shape.
 kv_tier/readmission.rs  — ReadmissionPlan / ReadmissionSource / dedupe keys
 kv_tier/tier.rs         — Tier enum, BlockLocation, RemoteBlockDesc, TransportId, MemKind
 kv_tier/host_pool.rs    — HostPinnedPool, HostPinnedRegion (thin Rust wrapper over the Zig host arena)
 kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
 kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store + future descriptor substrate)
-kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing)
+kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing; future P0' NVLink peer hop)
 kv_tier/transport/nixl.rs       — NixlTransport remote-tier surface, compiled via `rdma-nixl` (stub) or `rdma-nixl-real`
-kv_tier/coordinator.rs  — Coordinator, command/event channel for plan/fetch/store queues on the local spill/readmission path; queue stats/cancellation/backpressure and shared-fs remote fetch/store live here
+kv_tier/transport/shared_fs.rs  — SharedFsStore: shared-filesystem remote backend (POSIX-visible mount), used as the M4-era cluster-shared transport while RDMA work lands
+kv_tier/coordinator.rs + kv_tier/coordinator/  — Coordinator entry surface plus internal split: `builder.rs` (engine-init wiring), `control.rs` (command channel + queue stats / cancellation / backpressure), `events.rs` (completion event fanout), `types.rs` (StoreTarget / QueueControlStats / CoordinatorQueueStats), `bench.rs` (in-tree micro-bench), `tests.rs`. The coordinator owns plan/fetch/store queues, including shared-fs remote fetch/store.
 ```
 
 **Do not reintroduce `directory.rs`.** The former `TierDirectory` /
@@ -79,6 +82,38 @@ kv_tier/coordinator.rs  — Coordinator, command/event channel for plan/fetch/st
 6. **`Tier` ordering is load-bearing.** `Gpu < HostPinned < Disk < Remote`
    is the distance-from-compute order; eviction policies compare tiers with
    this ordering.
+7. **Policy enums vs scheduler wiring split.** `kv_tier::policy` owns
+   `PrefetchPolicy` / `WritePolicy` so the coordinator and scheduler share
+   one shape. The scheduler-side gate (soft-saturation thresholds,
+   prefetch/store decisions) lives in `infer::scheduler::cuda::policy`;
+   it must not branch on tier-movement state directly. Add a knob here,
+   wire it on the scheduler side, never the reverse.
+8. **Lookup classification is centralized in `lookup.rs`.** `HitKind`
+   discriminates radix-only / host-staged / disk-staged / remote-staged
+   prefix hits; the scheduler calls into `LookupHeuristics` from
+   `cuda/runtime/admission.rs`. New tier or staging tier ⇒ extend
+   `HitKind` here, not by adding a parallel enum elsewhere.
+
+## Active priority — P2 staged readmission
+
+This module is the live focus of P2 (tiered KV cache validated staged
+readmission and remote/shared backends). Current truth:
+
+- M0–M2b local CUDA path live (radix-backed shared pages, tombstone GC,
+  retain hard cap). Status snapshot:
+  [`docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md`](../../../docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md).
+- T1 host pinned + T2 disk + shared-fs remote all wired through the
+  coordinator with queue stats / cancellation / backpressure.
+- M5 RDMA-class remote transports (`transport/nixl.rs`) remain
+  skeletal — design-ready, blocked on M4 stabilization.
+- Apple Silicon still skips T1 (unified memory). Metal joins at M4 for
+  T2 disk only.
+
+When extending this module, re-read
+[`docs/projects/tiered-kv-cache.md`](../../../docs/projects/tiered-kv-cache.md)
+and [`docs/plans/tiered-kv-hicache-readmission.md`](../../../docs/plans/tiered-kv-hicache-readmission.md)
+first — the milestone ledger and current staged-readmission plan
+take precedence over this file when they disagree.
 
 ## Remote payload opacity
 

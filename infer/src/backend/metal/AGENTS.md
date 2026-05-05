@@ -19,16 +19,19 @@ metal/config.rs         — MetalModelConfig, quant config parsing (serde)
 metal/loader.rs         — safetensors → MLX unified memory
 metal/weights.rs        — MetalWeights, projection fusion, tensor merging
 metal/forward.rs        — rust_transformer_layer (Qwen3 path)
-metal/qwen35.rs         — Qwen3.5 path (delegates to mlx-sys C++ step model)
+metal/qwen35.rs + metal/qwen35/   — Qwen3.5 path (delegates to mlx-sys C++ step model). Sub-dir currently holds the qwen35 test split (`tests.rs`); add Qwen3.5-only Rust glue here, never inside `forward.rs`.
 metal/ops.rs            — MLX-backed linear, extend_kv_cache, clear_metal_cache
-metal/mlx.rs            — thin mlx-sys wrappers (MlxArray, slice, take_axis, eval, rms_norm, …)
+metal/mlx.rs            — thin mlx-sys wrappers (MlxArray, slice, take_axis, eval, rms_norm, build_varlen_decode_mask, …)
 metal/generate.rs       — top-level generate loop, KV_CACHE_CHUNK, MetalGenerateOutput
 metal/sampling.rs       — gpu_sample_token
-metal/dflash.rs         — Metal DFlash speculative draft runtime
-metal/kv_pool.rs        — KV pool accounting (not yet on the hot path)
-metal/prefix_cache.rs   — Metal prefix cache accounting
-metal/gdr.rs            — Metal draft runtime glue
-metal/scheduler.rs      — MetalScheduler policy (decode-first step + optional prefill chunk)
+metal/dflash.rs + metal/dflash/   — Metal DFlash speculative draft runtime; sub-dir currently holds `tests.rs` only.
+metal/kv_pool.rs        — KV pool accounting (always-on, not yet on the hot path)
+metal/prefix_cache.rs   — Metal prefix cache accounting (always-on)
+metal/gdr.rs            — Metal draft runtime glue (always-on)
+metal/scheduler.rs      — MetalScheduler policy (decode-first step + optional prefill chunk; always-on)
+metal/plan.rs           — `MetalLogicalDecodeRow`: backend-local CPU-only logical row description used by the scheduler runtime to record selected decode work without re-deriving batch structure from legacy DTO fields. Runtime-owned request state remains the authority for MLX cache objects.
+metal/runtime.rs        — `run_metal_scheduler_runtime`: the live hot path (decode-first continuous batching, prefill chunks, packed-decode admission/retire, DFlash dispatch).
+metal/request_state.rs + metal/request_state/  — `MetalRequestState` per-request mutable state plus split helpers (`helpers.rs` for left-pad/strip-padding utilities, `tests.rs` for varlen + admit/retain regressions).
 ```
 
 ## Feature gating
@@ -141,6 +144,28 @@ metal/scheduler.rs      — MetalScheduler policy (decode-first step + optional 
   quantization, and batching implementations differ. After changing a
   Metal hot path, rerun the Metal baseline instead of trusting CUDA-era
   intuition or numerical equivalence by inspection.
+
+## Active priority — P3 Metal serving-grade closure
+
+This module is the live focus of P3 (serving-grade Metal batching and
+long-context closure without forking runtime truth away from CUDA). Truth
+snapshot:
+
+- Scheduler-backed serving + live prefix reuse + Beta DFlash all wired
+  through `runtime.rs`.
+- Qwen3.5-0.8B MLX 4bit single-request step-driver = 305.5 tok/s on M4
+  Pro 20c for `1024/256` (2026-04 baseline). GGUF Q4_K_M exact default
+  = 202.1 tok/s direct; opt-in native-q4 load path = 236.7 tok/s
+  direct / 239.8 tok/s step-driver and remains a separate
+  exact-K-quant kernel/format target.
+- Variable-length packed decode via `Qwen35PackedDecodeBatch` is the
+  current correctness-critical surface; `plan.rs` is the new logical
+  row contract that future decode-batch refactors should extend
+  instead of re-deriving batch shape from legacy DTO fields.
+
+When extending this module, re-read
+[`docs/projects/mlx-backend-roadmap.md`](../../../../docs/projects/mlx-backend-roadmap.md)
+first; it carries the prioritized backlog and acceptance gates.
 
 ## Build requirements
 

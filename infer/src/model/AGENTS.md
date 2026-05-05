@@ -53,16 +53,21 @@ Flat layout with `#[path = "model/<name>.rs"]`. Each model has a **directory**
 of peers next to its root file:
 
 ```
-model/qwen3.rs   + model/qwen3/{config, weights, forward, prefill, decode, batch_decode, decode_buffers}.rs
-model/qwen35.rs  + model/qwen35/{..., recurrent_state, prefill_buffers, single_token_buffers}.rs
+model/qwen3.rs   + model/qwen3/{config, weights, forward, prefill, decode, batch_decode, decode_buffers, lora}.rs
+model/qwen35.rs  + model/qwen35/{config, weights, forward, prefill, decode_buffers, batch_decode, recurrent_state, prefill_buffers, single_token_buffers, gguf_host}.rs
 model/common.rs  — cross-model CUDA graph glue
+model/cuda_graph.rs — CudaGraphState (capture-on-first-call, replay-thereafter) for decode-path graph reuse
 model/generation_state.rs — GenerationStateBase shared scaffolding
-model/kv_cache.rs — KVCacheDtype, KVFormat (re-exports from infer_cuda_kernels)
+model/kv_cache.rs — KVCacheDtype, KVFormat (re-exports from cuda_kernels)
+model/layer_communicator.rs — F0.8 inert TP/DP/CP `LayerCollective` surface; defines the method shape F1+ forward paths will call, with exact single-rank pass-through. Not yet wired into Qwen forward call sites.
 ```
 
 Hybrid models (Qwen3.5) add `recurrent_state`, `prefill_buffers`,
 `single_token_buffers` because linear-attention layers need separate
-O(1) recurrent state.
+O(1) recurrent state. `qwen35/gguf_host.rs` carries the GGUF tensor
+layout helpers used by the host-side load path. `qwen3/lora.rs` is a
+forward-only HuggingFace PEFT loader (M2b Phase 1: types + loader; the
+hot-path wiring through `ops/linear.rs` is M2b Phase 2 and not yet in).
 
 ## Invariants
 
@@ -81,6 +86,32 @@ O(1) recurrent state.
    falling back to contiguous decode.
 5. **`DecodeContext` lives on the scheduler for the lifetime of the run.**
    Don't allocate GPU buffers inside `forward_decode_batch` — use the context.
+6. **`layer_communicator.rs` is inert until F2.** TP=1 collectives are
+   strictly no-ops; TP>1 currently fails fast. Do not stub out the method
+   bodies into something other than the documented pass-through, and do
+   not call them from production forward paths until the F2 NCCL
+   forward-collective wiring lands. The plan lives at
+   [`docs/plans/2026-04-28-single-node-multi-gpu.md`](../../../docs/plans/2026-04-28-single-node-multi-gpu.md).
+7. **`cuda_graph.rs` is capture-on-first-call.** A second decode tick
+   replays the graph; metadata changes that invalidate the captured graph
+   must clear `CudaGraphState` (the `update_metadata` true return on
+   `DecodeContext` is the existing signal). Do not introduce a
+   per-step capture loop — that defeats the cost amortization.
+
+## Active priorities touching this module
+
+- **P0 long-context.** Varlen FP8 KV path + mixed-batch attention go
+  through `qwen3/forward.rs` + `qwen35/forward.rs`. Phase 2 spec-decode
+  hooks (sparse-KV draft views) consume `SparseKvDraftView` /
+  `SpecVerifyRequest` exposed via `model.rs`.
+- **P0' multi-GPU F0–F4.** TP-aware weight sharding lands in
+  `qwen3/weights.rs` + `qwen35/weights.rs` via `TpLoadContext`;
+  forward wiring stages through `layer_communicator.rs`. Production
+  TP>1 forward gates on F2 collective integration.
+- **P0'' DeepSeek V4 prep.** DS3 MLA cache + kernels are designed
+  (`docs/plans/2026-05-01-mla-kernel-design.md`); no model file in this
+  tree implements them yet — they will land alongside DS1 registry +
+  DS2 block-FP8 metadata once F2 collectives are real.
 
 ## Adding a new model
 
