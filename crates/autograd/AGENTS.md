@@ -19,14 +19,20 @@ needs a GPU box to execute. Load this file before editing anything under
 crates/autograd/
 ├── Cargo.toml          — features: default=[] / metal / cuda / no-cuda / safetensors
 ├── src/
-│   ├── lib.rs          — module decls + AutogradError + Result
+│   ├── lib.rs          — module decls + AutogradError + Result + public re-exports
 │   ├── tensor.rs       — Tensor, TensorId, TensorStore (dirty + device_handle fields)
 │   ├── tape.rs         — Tape, TapeEntry, BackwardOp, SavedContext
 │   ├── backend.rs      — Backend trait, CpuBackend, DeviceHandle, CPU reference impls
 │   ├── backend_metal.rs — MetalBackend: MLX FFI + eval counter
-│   ├── backend_cuda.rs  — CudaBackend: cuBLAS + NVRTC (no-cuda stub on Mac)
+│   ├── backend_cuda.rs + backend_cuda/ — CudaBackend: cuBLAS + NVRTC (no-cuda stub on Mac)
 │   ├── ops.rs + ops/   — high-level op entry points, one file per op family
+│   │                     (activation, attention, broadcast, elementwise, embed, gather,
+│   │                      layout, linear_attention, matmul, norm, reduce, rope, softmax)
 │   ├── optim.rs        — SGD, AdamW
+│   ├── adamw_state.rs  — opaque serializable AdamW moment codec for checkpointing
+│   ├── lr_schedule.rs  — `LrSchedule` trait + `ConstantLr`, `LinearWarmup`,
+│   │                     `CosineWithWarmup`, `parse_lr_schedule`. Pure step→f32
+│   │                     functions (no persisted state).
 │   ├── module.rs       — parameter iteration for optimizers
 │   └── safetensors_io.rs (feature = "safetensors")
 ├── tests/
@@ -36,6 +42,11 @@ crates/autograd/
 │   └── helpers.rs              — num_grad, seeded RNG
 └── AGENTS.md           — this file
 ```
+
+The `ops/` directory is intentionally granular. Adding a new op means a
+new file in this list — do not stack ops into existing modules to keep
+the file count down. Each op file pairs with a `cpu_*_forward` /
+`cpu_*_backward` reference under `backend.rs`.
 
 ## Invariants (violating these breaks training)
 
@@ -156,6 +167,29 @@ the device is an M5.3b follow-up (see §7.2 M5.3 in
 `y = x @ w; loss = y.sum(); backward` tape. Strict 1 is the M5.3b-era
 goal. Acquire `METAL_TEST_LOCK` if your test uses the counter and runs
 alongside other Metal tests in the same binary.
+
+## Active priority — P4 runtime-led train/agent stack
+
+This crate is the autograd substrate underneath P4 (agent/RL/train work
+that strengthens the runtime spine). It must stay narrow:
+
+- **Engine + ops + optimizer + LR schedule + checkpoint.** Higher-level
+  training surfaces (causal LM heads, GRPO policy, trainers, multi-turn
+  eval) live in [`crates/train/`](../train/) and consume this crate, not
+  the other way around.
+- `adamw_state.rs` is the canonical AdamW checkpoint codec — train-side
+  trainers serialize/restore through it, never by reaching into AdamW
+  internals directly.
+- `lr_schedule.rs` is parse-driven (`parse_lr_schedule`) so train
+  binaries can plumb schedules from CLI args without re-implementing the
+  curve. New schedules go here.
+- M5.3a Metal device-resident port done; M5.3b backend op coverage
+  (porting CPU-only ops to lazy device paths) is the next milestone.
+- See
+  [`docs/projects/agent-rl-self-evolving.md`](../../docs/projects/agent-rl-self-evolving.md)
+  §M5 for the device-resident tensor scope and
+  [`docs/plans/rust-agent-rl-single-node.md`](../../docs/plans/rust-agent-rl-single-node.md)
+  §7.2 for the M5.3b op-coverage plan.
 
 ## Tests and benches
 

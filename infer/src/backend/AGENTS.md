@@ -14,7 +14,7 @@ Load this file before editing anything under `infer/src/backend/`.
 | File | Role |
 |------|------|
 | `backend.rs` | `InferenceBackend` trait + `GenerateResult` + `StreamingInferenceBackend` (the default blanket impl forwards `generate_stream` → `generate`). Single-request, `Send` (not `Sync`) — runtime owns threading. |
-| `backend/cuda.rs` | **Thin re-export shim** for `infer_cuda_kernels::{ffi, flashinfer, paged_kv, prelude, tensor, ...}`. ~15 lines. Historical `crate::backend::cuda::...` paths still resolve through this. Only `bootstrap.rs` is a real module, and it only exists with `#[cfg(feature = "cuda")]`. |
+| `backend/cuda.rs` | **Thin re-export shim** for `cuda_kernels::{ffi, flashinfer, paged_kv, prelude, tensor, turboquant_state}` plus the always-on `KVCacheDtype` / `KVFormat`. ~15 lines. Historical `crate::backend::cuda::...` paths still resolve through this. The collective surface (`cuda_kernels::collective`) is intentionally **not** re-exported — `bootstrap.rs` imports it directly so the shim stays narrow. Only `bootstrap.rs` is a real module, and it only exists with `#[cfg(feature = "cuda")]`; the bootstrap path also owns multi-rank NCCL init / device selection for the P0' single-node multi-GPU scaffold. |
 | `backend/metal.rs` + `metal/` | Real Metal backend. See [`metal/AGENTS.md`](metal/AGENTS.md). |
 | `backend/cpu.rs` | Dev-only synthetic backend (feature `cpu`, ~309 lines, generates fake tokens). Intentionally unextracted — zero independence benefit. |
 | `backend/runtime.rs` | `BackendRuntimeHandle`: serial-runtime `RequestHandle` shared by Metal + CPU paths. CAS-loop admission for `max_waiting`; drops waiting count on channel-send failure. |
