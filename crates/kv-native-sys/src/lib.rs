@@ -187,7 +187,6 @@ pub fn wal_append(path: &Path, kind: u8, key: &[u8], value: &[u8]) -> io::Result
         ));
     }
     let mut file = OpenOptions::new()
-        .write(true)
         .append(true)
         .create(true)
         .mode(0o644)
