@@ -1,10 +1,8 @@
 //! Pure-Rust persistence substrate for the KV tier.
 //!
-//! This crate is POSIX-only (Linux + macOS); it uses `nix`, `memmap2`, and
-//! `libc` directly with no FFI of its own. The exported surface — file/block
-//! I/O, the WAL, file mmap, POSIX shm, and a host arena — was historically
-//! a Zig FFI layer; the migration to native Rust landed in tranches on
-//! 2026-05-05 (see `docs/experience/wins/`).
+//! POSIX-only (Linux + macOS); uses `nix`, `memmap2`, and `libc` directly
+//! with no FFI of its own. Surface: file/block I/O, WAL, file mmap, POSIX
+//! shm, and a host arena (anonymous mmap + bump pointer + free-list).
 
 use std::fs::OpenOptions;
 use std::io;
@@ -85,9 +83,9 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             "write_file_atomic: empty path",
         ));
     }
-    // Compose `<path>.tmp` by appending bytes to the OsString — matches the Zig
-    // implementation which used `std.fmt.allocPrint("{s}.tmp", .{path})` on the
-    // raw byte slice (no extension semantics).
+    // Compose `<path>.tmp` by appending bytes to the OsString (no extension
+    // semantics — the suffix is literal, matching what the on-disk layout
+    // expects).
     let mut tmp_os = path.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp_path = PathBuf::from(tmp_os);
@@ -129,10 +127,8 @@ pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
             "read_file: empty path",
         ));
     }
-    // Match the Zig semantics: a 0-byte file returns Ok(empty), but a missing
-    // file surfaces as NotFound. `std::fs::read` already does the right thing
-    // for both — it does NOT raise NotFound on a 0-byte existing file, and it
-    // does on a missing one.
+    // 0-byte file returns Ok(empty); missing file surfaces as NotFound.
+    // `std::fs::read` already handles both correctly.
     std::fs::read(path)
 }
 
@@ -173,10 +169,6 @@ pub fn read_block(root: &Path, fingerprint: [u8; 16]) -> io::Result<Vec<u8>> {
 
 /// Like [`read_block`] but returns an owning guard over the heap-allocated
 /// payload. The guard derefs to `&[u8]` and frees its buffer on `Drop`.
-///
-/// Historically this skipped a Zig→Rust copy; with the pure-Rust substrate
-/// the payload is a `Vec<u8>` directly, so this is now a thin wrapper that
-/// preserves the public API for callers like `DiskStore::get_block`.
 pub fn read_block_owned(root: &Path, fingerprint: [u8; 16]) -> io::Result<KvNativeOwnedBytes> {
     let bytes = read_block(root, fingerprint)?;
     Ok(KvNativeOwnedBytes::from_vec(bytes))
@@ -280,8 +272,8 @@ pub fn mmap_write(desc: &KvMmapDescriptor, offset: usize, bytes: &[u8]) -> io::R
         ));
     }
     mapping[offset..offset + bytes.len()].copy_from_slice(bytes);
-    // `MmapMut::flush` calls msync(MS_SYNC) under the hood, matching the
-    // previous Zig path which used `c.msync(mapping, desc.len, c.MS_SYNC)`.
+    // `MmapMut::flush` calls msync(MS_SYNC) under the hood — required for
+    // durability against power loss / crash before unmap.
     mapping.flush()?;
     Ok(())
 }
@@ -307,11 +299,9 @@ pub fn mmap_read(desc: &KvMmapDescriptor, offset: usize, len: usize) -> io::Resu
     Ok(mapping[offset..offset + len].to_vec())
 }
 
-// Layout of the in-band shm header that every mapping carries. Mirrors the Zig
-// `ShmHeader` struct verbatim (8-byte magic + u64 generation + u64 payload_len),
-// so a Rust-side rewrite here is wire-compatible with any pre-port persisted
-// segment (none should exist — these segments are ephemeral — but we keep the
-// invariant explicit).
+// In-band shm header carried by every mapping: 8-byte magic, u64 generation,
+// u64 payload_len. Validated on every read to detect stale descriptors after
+// recreate.
 const SHM_MAGIC: &[u8; 8] = b"KVSHM001";
 const SHM_HEADER_BYTES: usize = 24;
 const SHM_CREATE_RETRY_LIMIT: usize = 64;
@@ -323,7 +313,7 @@ fn next_shm_generation() -> u64 {
     use std::sync::atomic::Ordering;
     let g = SHM_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
     if g == 0 {
-        // The Zig path retried once on overflow-to-zero; do the same.
+        // Skip generation 0: it is the sentinel for "no header written yet".
         SHM_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
     } else {
         g
@@ -522,10 +512,9 @@ pub fn shm_unlink(desc: &KvSharedMemoryDescriptor) -> io::Result<()> {
         )
     })?;
     // First validate via a read-only mapping that the live segment matches our
-    // descriptor — preserves the Zig behavior of returning InvalidData when a
-    // stale descriptor tries to unlink a segment that was already recreated by
-    // a different generation. This is what `shm_stale_descriptor_is_rejected_after_recreate`
-    // pins.
+    // descriptor: returns InvalidData when a stale descriptor tries to unlink a
+    // segment that was already recreated by a different generation. Pinned by
+    // the `shm_stale_descriptor_is_rejected_after_recreate` test.
     let fd = shm_open_existing(&name_c, false)?;
     let file = std::fs::File::from(fd);
     let mapping = unsafe { memmap2::MmapOptions::new().len(total_len).map(&file)? };
@@ -554,8 +543,7 @@ fn region_end(region: KvHostArenaRegion) -> Option<usize> {
 
 fn host_arena_rewind_tail(arena: &mut KvHostArena) {
     // Iteratively drain any free-list entry whose end == next_offset, popping
-    // next_offset back to that entry's offset. Mirrors the Zig
-    // `hostArenaRewindTail` loop verbatim.
+    // next_offset back to that entry's offset.
     loop {
         let mut found: Option<usize> = None;
         for (idx, free) in arena.free_list.iter().enumerate() {
@@ -600,9 +588,8 @@ pub fn host_arena_create(capacity_bytes: usize) -> io::Result<(*mut KvHostArenaH
 
     // Best-effort: ask the kernel to back the arena with transparent huge
     // pages on Linux. Failure is silently ignored — the arena still works
-    // with 4 KiB pages. Matches the Zig substrate's `madvise(MADV_HUGEPAGE)`
-    // call (see kv_native.zig L621-L623 + the 2026-05-04 wins-entry note
-    // about the call being a no-op on hosts where THP is disabled).
+    // with 4 KiB pages. The 2026-05-04 wins entry observed this is a no-op
+    // on hosts where THP is disabled or set to non-`always`.
     #[cfg(target_os = "linux")]
     {
         // Safety: we just received `mapping` from mmap_anonymous and have not
@@ -692,8 +679,8 @@ pub unsafe fn host_arena_reserve(
     // Safety: caller contract.
     let arena = unsafe { &mut *(handle.cast::<KvHostArena>()) };
 
-    // Free-list first-fit. Mirrors the Zig path: linear scan, swap_remove, push
-    // remainder. Both branches bump `reserved_bytes`.
+    // Free-list first-fit: linear scan, swap_remove, push remainder.
+    // Both branches bump `reserved_bytes`.
     let mut idx = 0usize;
     while idx < arena.free_list.len() {
         let free = arena.free_list[idx];
@@ -845,10 +832,8 @@ impl KvSharedMemoryDescriptor {
 /// allocator. The bytes are valid for as long as the guard lives; the caller
 /// must not retain a slice past `Drop`.
 ///
-/// Storage is a `Box<[u8]>`. The struct keeps `Send + Sync` and the same
-/// public surface (`as_slice`, `len`, `is_empty`, `Deref<Target = [u8]>`)
-/// it had under the Zig-FFI substrate, so call sites in
-/// `infer/src/kv_tier/transport/disk.rs` continue to compile unchanged.
+/// Storage is a `Box<[u8]>`. The struct is `Send + Sync` and exposes
+/// `as_slice`, `len`, `is_empty`, and `Deref<Target = [u8]>`.
 pub struct KvNativeOwnedBytes {
     data: Box<[u8]>,
 }
