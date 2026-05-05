@@ -65,25 +65,6 @@ pub struct KvWalRecord {
 }
 
 unsafe extern "C" {
-    fn kv_native_shm_create(
-        name_ptr: *const u8,
-        name_len: usize,
-        len: usize,
-        out: *mut KvSharedMemoryDescriptor,
-    ) -> c_int;
-    fn kv_native_shm_write(
-        desc: *const KvSharedMemoryDescriptor,
-        offset: usize,
-        bytes_ptr: *const u8,
-        bytes_len: usize,
-    ) -> c_int;
-    fn kv_native_shm_read(
-        desc: *const KvSharedMemoryDescriptor,
-        offset: usize,
-        bytes_len: usize,
-        out: *mut KvNativeBuffer,
-    ) -> c_int;
-    fn kv_native_shm_unlink(desc: *const KvSharedMemoryDescriptor) -> c_int;
     fn kv_native_host_arena_create(
         capacity_bytes: usize,
         out_handle: *mut *mut KvHostArenaHandle,
@@ -402,33 +383,233 @@ pub fn mmap_read(desc: &KvMmapDescriptor, offset: usize, len: usize) -> io::Resu
     Ok(mapping[offset..offset + len].to_vec())
 }
 
+// Layout of the in-band shm header that every mapping carries. Mirrors the Zig
+// `ShmHeader` struct verbatim (8-byte magic + u64 generation + u64 payload_len),
+// so a Rust-side rewrite here is wire-compatible with any pre-port persisted
+// segment (none should exist — these segments are ephemeral — but we keep the
+// invariant explicit).
+const SHM_MAGIC: &[u8; 8] = b"KVSHM001";
+const SHM_HEADER_BYTES: usize = 24;
+const SHM_CREATE_RETRY_LIMIT: usize = 64;
+const SHM_CREATE_RETRY_SLEEP_US: u64 = 1_000;
+
+static SHM_GENERATION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_shm_generation() -> u64 {
+    use std::sync::atomic::Ordering;
+    let g = SHM_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if g == 0 {
+        // The Zig path retried once on overflow-to-zero; do the same.
+        SHM_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    } else {
+        g
+    }
+}
+
+fn shm_total_len(payload_len: usize) -> io::Result<usize> {
+    SHM_HEADER_BYTES.checked_add(payload_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shm: header + payload_len overflows usize",
+        )
+    })
+}
+
+fn write_shm_header(mapping: &mut memmap2::MmapMut, generation: u64, payload_len: usize) {
+    mapping[0..8].copy_from_slice(SHM_MAGIC);
+    mapping[8..16].copy_from_slice(&u64::to_le_bytes(generation));
+    mapping[16..24].copy_from_slice(&u64::to_le_bytes(payload_len as u64));
+}
+
+fn validate_shm_header(mapping: &[u8], desc: &KvSharedMemoryDescriptor) -> io::Result<()> {
+    if mapping.len() < SHM_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shm: mapping smaller than header",
+        ));
+    }
+    if &mapping[0..8] != SHM_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shm: header magic mismatch",
+        ));
+    }
+    let mut buf = [0_u8; 8];
+    buf.copy_from_slice(&mapping[8..16]);
+    if u64::from_le_bytes(buf) != desc.generation {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shm: descriptor generation does not match header",
+        ));
+    }
+    buf.copy_from_slice(&mapping[16..24]);
+    if u64::from_le_bytes(buf) != desc.len as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shm: descriptor payload_len does not match header",
+        ));
+    }
+    Ok(())
+}
+
+fn shm_open_create_exclusive_retrying(
+    name_c: &std::ffi::CString,
+) -> io::Result<std::os::fd::OwnedFd> {
+    use nix::errno::Errno;
+    use nix::fcntl::OFlag;
+    use nix::sys::mman::shm_open;
+    use nix::sys::stat::Mode;
+    let mut retries = 0_usize;
+    loop {
+        match shm_open(
+            name_c.as_c_str(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(fd) => return Ok(fd),
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EEXIST) => {
+                if retries >= SHM_CREATE_RETRY_LIMIT {
+                    return Err(io::Error::from_raw_os_error(libc::EEXIST));
+                }
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_micros(SHM_CREATE_RETRY_SLEEP_US));
+            }
+            Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+}
+
+fn shm_open_existing(name_c: &std::ffi::CString, write: bool) -> io::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::OFlag;
+    use nix::sys::mman::shm_open;
+    use nix::sys::stat::Mode;
+    let flag = if write {
+        OFlag::O_RDWR
+    } else {
+        OFlag::O_RDONLY
+    };
+    shm_open(name_c.as_c_str(), flag, Mode::from_bits_truncate(0o600))
+        .map_err(|e| io::Error::from_raw_os_error(e as i32))
+}
+
 pub fn shm_create(name: &str, len: usize) -> io::Result<KvSharedMemoryDescriptor> {
+    if name.is_empty() || !name.starts_with('/') || name.len() > KV_SHM_NAME_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shm_create: name must start with '/' and fit KV_SHM_NAME_CAP",
+        ));
+    }
+    let total_len = shm_total_len(len)?;
+    let name_c = std::ffi::CString::new(name).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shm_create: name has interior NUL: {err}"),
+        )
+    })?;
+
+    let fd = shm_open_create_exclusive_retrying(&name_c)?;
+    let file = std::fs::File::from(fd);
+    if let Err(err) = file.set_len(total_len as u64) {
+        let _ = nix::sys::mman::shm_unlink(name_c.as_c_str());
+        return Err(err);
+    }
+    // Safety: we just created and sized this fd; map_mut ties the mapping to
+    // the file's lifetime which we hold for the duration of this call.
+    let mut mapping = match unsafe { memmap2::MmapOptions::new().len(total_len).map_mut(&file) } {
+        Ok(m) => m,
+        Err(err) => {
+            let _ = nix::sys::mman::shm_unlink(name_c.as_c_str());
+            return Err(err);
+        }
+    };
+
+    let generation = next_shm_generation();
+    write_shm_header(&mut mapping, generation, len);
+
     let mut out = KvSharedMemoryDescriptor {
-        len: 0,
-        generation: 0,
-        name_len: 0,
+        len,
+        generation,
+        name_len: name.len(),
         name: [0; KV_SHM_NAME_CAP],
     };
-    let status = unsafe { kv_native_shm_create(name.as_ptr(), name.len(), len, &mut out) };
-    status_to_result(status, "kv_native_shm_create")?;
+    out.name[..name.len()].copy_from_slice(name.as_bytes());
     Ok(out)
 }
 
 pub fn shm_write(desc: &KvSharedMemoryDescriptor, offset: usize, bytes: &[u8]) -> io::Result<()> {
-    let status = unsafe { kv_native_shm_write(desc, offset, bytes.as_ptr(), bytes.len()) };
-    status_to_result(status, "kv_native_shm_write")
+    if offset
+        .checked_add(bytes.len())
+        .is_none_or(|end| end > desc.len)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shm_write: offset+bytes_len exceeds descriptor len",
+        ));
+    }
+    let name = desc.name()?;
+    let total_len = shm_total_len(desc.len)?;
+    let name_c = std::ffi::CString::new(name).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shm_write: name has interior NUL: {err}"),
+        )
+    })?;
+    let fd = shm_open_existing(&name_c, true)?;
+    let file = std::fs::File::from(fd);
+    let mut mapping = unsafe { memmap2::MmapOptions::new().len(total_len).map_mut(&file)? };
+    validate_shm_header(&mapping, desc)?;
+    let payload = &mut mapping[SHM_HEADER_BYTES..];
+    payload[offset..offset + bytes.len()].copy_from_slice(bytes);
+    mapping.flush()?;
+    Ok(())
 }
 
 pub fn shm_read(desc: &KvSharedMemoryDescriptor, offset: usize, len: usize) -> io::Result<Vec<u8>> {
-    read_buffer(
-        |out| unsafe { kv_native_shm_read(desc, offset, len, out) },
-        "kv_native_shm_read",
-    )
+    if offset.checked_add(len).is_none_or(|end| end > desc.len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shm_read: offset+len exceeds descriptor len",
+        ));
+    }
+    let name = desc.name()?;
+    let total_len = shm_total_len(desc.len)?;
+    let name_c = std::ffi::CString::new(name).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shm_read: name has interior NUL: {err}"),
+        )
+    })?;
+    let fd = shm_open_existing(&name_c, false)?;
+    let file = std::fs::File::from(fd);
+    let mapping = unsafe { memmap2::MmapOptions::new().len(total_len).map(&file)? };
+    validate_shm_header(&mapping, desc)?;
+    let payload = &mapping[SHM_HEADER_BYTES..];
+    Ok(payload[offset..offset + len].to_vec())
 }
 
 pub fn shm_unlink(desc: &KvSharedMemoryDescriptor) -> io::Result<()> {
-    let status = unsafe { kv_native_shm_unlink(desc) };
-    status_to_result(status, "kv_native_shm_unlink")
+    let name = desc.name()?;
+    let total_len = shm_total_len(desc.len)?;
+    let name_c = std::ffi::CString::new(name).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shm_unlink: name has interior NUL: {err}"),
+        )
+    })?;
+    // First validate via a read-only mapping that the live segment matches our
+    // descriptor — preserves the Zig behavior of returning InvalidData when a
+    // stale descriptor tries to unlink a segment that was already recreated by
+    // a different generation. This is what `shm_stale_descriptor_is_rejected_after_recreate`
+    // pins.
+    let fd = shm_open_existing(&name_c, false)?;
+    let file = std::fs::File::from(fd);
+    let mapping = unsafe { memmap2::MmapOptions::new().len(total_len).map(&file)? };
+    validate_shm_header(&mapping, desc)?;
+    drop(mapping);
+    drop(file);
+    nix::sys::mman::shm_unlink(name_c.as_c_str())
+        .map_err(|e| io::Error::from_raw_os_error(e as i32))
 }
 
 pub fn host_arena_create(capacity_bytes: usize) -> io::Result<(*mut KvHostArenaHandle, *mut u8)> {
