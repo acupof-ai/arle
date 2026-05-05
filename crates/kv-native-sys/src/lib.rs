@@ -1,4 +1,11 @@
-use std::ffi::c_int;
+//! Pure-Rust persistence substrate for the KV tier.
+//!
+//! This crate is POSIX-only (Linux + macOS); it uses `nix`, `memmap2`, and
+//! `libc` directly with no FFI of its own. The exported surface — file/block
+//! I/O, the WAL, file mmap, POSIX shm, and a host arena — was historically
+//! a Zig FFI layer; the migration to native Rust landed in tranches on
+//! 2026-05-05 (see `docs/experience/wins/`).
+
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
@@ -7,26 +14,10 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 
 pub const KV_MMAP_PATH_CAP: usize = 512;
 pub const KV_SHM_NAME_CAP: usize = 128;
-
-#[repr(C)]
-struct KvNativeBuffer {
-    data: *mut u8,
-    len: usize,
-}
-
-#[repr(i32)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum KvNativeStatus {
-    Ok = 0,
-    InvalidInput = 1,
-    InvalidData = 2,
-    NotFound = 3,
-    Io = 4,
-    Oom = 5,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +43,9 @@ pub struct KvHostArenaRegion {
     pub len: usize,
 }
 
+/// Opaque pointer type returned by [`host_arena_create`]. Internally a
+/// pointer to a boxed [`KvHostArena`]; the `_private` field keeps the
+/// shape stable for any caller that may have stored the bare pointer.
 #[repr(C)]
 pub struct KvHostArenaHandle {
     _private: [u8; 0],
@@ -64,78 +58,12 @@ pub struct KvWalRecord {
     pub value: Vec<u8>,
 }
 
-unsafe extern "C" {
-    fn kv_native_host_arena_create(
-        capacity_bytes: usize,
-        out_handle: *mut *mut KvHostArenaHandle,
-        out_base_ptr: *mut *mut u8,
-    ) -> c_int;
-    fn kv_native_host_arena_destroy(handle: *mut KvHostArenaHandle) -> c_int;
-    fn kv_native_host_arena_reserved_bytes(
-        handle: *const KvHostArenaHandle,
-        out_reserved_bytes: *mut usize,
-    ) -> c_int;
-    fn kv_native_host_arena_reserve(
-        handle: *mut KvHostArenaHandle,
-        len: usize,
-        out_region: *mut KvHostArenaRegion,
-    ) -> c_int;
-    fn kv_native_host_arena_release(
-        handle: *mut KvHostArenaHandle,
-        region: KvHostArenaRegion,
-    ) -> c_int;
-    fn kv_native_host_arena_reset(handle: *mut KvHostArenaHandle) -> c_int;
-    fn kv_native_buffer_free(data: *mut u8);
-}
-
 fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
 fn fingerprint_bytes(fingerprint: [u8; 16]) -> [u8; 16] {
     fingerprint
-}
-
-fn status_from_code(code: c_int) -> Option<KvNativeStatus> {
-    match code {
-        0 => Some(KvNativeStatus::Ok),
-        1 => Some(KvNativeStatus::InvalidInput),
-        2 => Some(KvNativeStatus::InvalidData),
-        3 => Some(KvNativeStatus::NotFound),
-        4 => Some(KvNativeStatus::Io),
-        5 => Some(KvNativeStatus::Oom),
-        _ => None,
-    }
-}
-
-fn status_to_error(status: c_int, context: &'static str) -> io::Error {
-    match status_from_code(status) {
-        Some(KvNativeStatus::InvalidInput) => io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{context}: invalid input"),
-        ),
-        Some(KvNativeStatus::InvalidData) => io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{context}: invalid data"),
-        ),
-        Some(KvNativeStatus::NotFound) => io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{context}: file not found"),
-        ),
-        Some(KvNativeStatus::Io) => io::Error::other(format!("{context}: native file I/O failure")),
-        Some(KvNativeStatus::Oom) => {
-            io::Error::other(format!("{context}: native allocator exhausted"))
-        }
-        Some(KvNativeStatus::Ok) => unreachable!("Ok should not be converted into io::Error"),
-        None => io::Error::other(format!("{context}: unknown native status {status}")),
-    }
-}
-
-fn status_to_result(status: c_int, context: &'static str) -> io::Result<()> {
-    match status_from_code(status) {
-        Some(KvNativeStatus::Ok) => Ok(()),
-        _ => Err(status_to_error(status, context)),
-    }
 }
 
 pub fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -612,17 +540,96 @@ pub fn shm_unlink(desc: &KvSharedMemoryDescriptor) -> io::Result<()> {
         .map_err(|e| io::Error::from_raw_os_error(e as i32))
 }
 
+/// Internal arena state. Anonymous mmap + bump pointer + Vec free-list.
+/// Held behind a `Box`; the leaked `Box::into_raw` pointer is what
+/// [`host_arena_create`] hands back as a `*mut KvHostArenaHandle`.
+struct KvHostArena {
+    mapping: NonNull<u8>,
+    capacity_bytes: usize,
+    next_offset: usize,
+    reserved_bytes: usize,
+    free_list: Vec<KvHostArenaRegion>,
+}
+
+fn region_end(region: KvHostArenaRegion) -> Option<usize> {
+    let offset: usize = region.offset.try_into().ok()?;
+    offset.checked_add(region.len)
+}
+
+fn host_arena_rewind_tail(arena: &mut KvHostArena) {
+    // Iteratively drain any free-list entry whose end == next_offset, popping
+    // next_offset back to that entry's offset. Mirrors the Zig
+    // `hostArenaRewindTail` loop verbatim.
+    loop {
+        let mut found: Option<usize> = None;
+        for (idx, free) in arena.free_list.iter().enumerate() {
+            let Some(end) = region_end(*free) else {
+                continue;
+            };
+            if end == arena.next_offset {
+                found = Some(idx);
+                break;
+            }
+        }
+        match found {
+            Some(idx) => {
+                let free = arena.free_list.swap_remove(idx);
+                arena.next_offset = free.offset as usize;
+            }
+            None => return,
+        }
+    }
+}
+
 pub fn host_arena_create(capacity_bytes: usize) -> io::Result<(*mut KvHostArenaHandle, *mut u8)> {
-    let mut handle = std::ptr::null_mut();
-    let mut base_ptr = std::ptr::null_mut();
-    let status = unsafe { kv_native_host_arena_create(capacity_bytes, &mut handle, &mut base_ptr) };
-    status_to_result(status, "kv_native_host_arena_create")?;
-    if handle.is_null() || base_ptr.is_null() {
-        return Err(io::Error::other(
-            "kv_native_host_arena_create: native layer returned null handle/base_ptr",
+    if capacity_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host_arena_create: capacity_bytes must be > 0",
         ));
     }
-    Ok((handle, base_ptr))
+    let nz =
+        std::num::NonZeroUsize::new(capacity_bytes).expect("capacity_bytes != 0 checked above");
+    // Safety: anonymous mapping with no fd; nix::mmap_anonymous is the
+    // documented entry for this exact pattern.
+    let mapping = unsafe {
+        nix::sys::mman::mmap_anonymous(
+            None,
+            nz,
+            nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+            nix::sys::mman::MapFlags::MAP_PRIVATE,
+        )
+    }
+    .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+
+    // Best-effort: ask the kernel to back the arena with transparent huge
+    // pages on Linux. Failure is silently ignored — the arena still works
+    // with 4 KiB pages. Matches the Zig substrate's `madvise(MADV_HUGEPAGE)`
+    // call (see kv_native.zig L621-L623 + the 2026-05-04 wins-entry note
+    // about the call being a no-op on hosts where THP is disabled).
+    #[cfg(target_os = "linux")]
+    {
+        // Safety: we just received `mapping` from mmap_anonymous and have not
+        // shared it; this advisory call is sound regardless of return value.
+        let _ = unsafe {
+            nix::sys::mman::madvise(
+                mapping,
+                capacity_bytes,
+                nix::sys::mman::MmapAdvise::MADV_HUGEPAGE,
+            )
+        };
+    }
+
+    let base: NonNull<u8> = mapping.cast();
+    let arena = Box::new(KvHostArena {
+        mapping: base,
+        capacity_bytes,
+        next_offset: 0,
+        reserved_bytes: 0,
+        free_list: Vec::new(),
+    });
+    let handle = Box::into_raw(arena).cast::<KvHostArenaHandle>();
+    Ok((handle, base.as_ptr()))
 }
 
 /// Destroy a host arena created by [`host_arena_create`].
@@ -634,8 +641,19 @@ pub unsafe fn host_arena_destroy(handle: *mut KvHostArenaHandle) -> io::Result<(
     if handle.is_null() {
         return Ok(());
     }
-    let status = unsafe { kv_native_host_arena_destroy(handle) };
-    status_to_result(status, "kv_native_host_arena_destroy")
+    // Safety: caller contract — `handle` came from `Box::into_raw` in
+    // `host_arena_create` and is still live.
+    let arena: Box<KvHostArena> = unsafe { Box::from_raw(handle.cast::<KvHostArena>()) };
+    let mapping = arena.mapping.cast::<core::ffi::c_void>();
+    let capacity = arena.capacity_bytes;
+    drop(arena); // free Vec<KvHostArenaRegion> before munmap
+    // Safety: the mapping pointer + length match the pair returned by
+    // mmap_anonymous in `host_arena_create`.
+    unsafe {
+        nix::sys::mman::munmap(mapping, capacity)
+            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    }
+    Ok(())
 }
 
 /// Query the number of bytes currently reserved inside a live host arena.
@@ -644,10 +662,15 @@ pub unsafe fn host_arena_destroy(handle: *mut KvHostArenaHandle) -> io::Result<(
 /// The caller must ensure `handle` points to a live arena created by
 /// [`host_arena_create`] and remains valid for the duration of this call.
 pub unsafe fn host_arena_reserved_bytes(handle: *const KvHostArenaHandle) -> io::Result<usize> {
-    let mut reserved_bytes = 0usize;
-    let status = unsafe { kv_native_host_arena_reserved_bytes(handle, &mut reserved_bytes) };
-    status_to_result(status, "kv_native_host_arena_reserved_bytes")?;
-    Ok(reserved_bytes)
+    if handle.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host_arena_reserved_bytes: null handle",
+        ));
+    }
+    // Safety: caller contract.
+    let arena = unsafe { &*(handle.cast::<KvHostArena>()) };
+    Ok(arena.reserved_bytes)
 }
 
 /// Reserve a contiguous region from a live host arena.
@@ -664,13 +687,59 @@ pub unsafe fn host_arena_reserve(
     if len == 0 {
         return Ok(None);
     }
-    let mut region = KvHostArenaRegion { offset: 0, len: 0 };
-    let status = unsafe { kv_native_host_arena_reserve(handle, len, &mut region) };
-    match status_from_code(status) {
-        Some(KvNativeStatus::Ok) => Ok(Some(region)),
-        Some(KvNativeStatus::Oom) => Ok(None),
-        _ => Err(status_to_error(status, "kv_native_host_arena_reserve")),
+    if handle.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host_arena_reserve: null handle",
+        ));
     }
+    // Safety: caller contract.
+    let arena = unsafe { &mut *(handle.cast::<KvHostArena>()) };
+
+    // Free-list first-fit. Mirrors the Zig path: linear scan, swap_remove, push
+    // remainder. Both branches bump `reserved_bytes`.
+    let mut idx = 0usize;
+    while idx < arena.free_list.len() {
+        let free = arena.free_list[idx];
+        if free.len < len {
+            idx += 1;
+            continue;
+        }
+        arena.free_list.swap_remove(idx);
+        if free.len > len {
+            arena.free_list.push(KvHostArenaRegion {
+                offset: free.offset + len as u64,
+                len: free.len - len,
+            });
+        }
+        let region = KvHostArenaRegion {
+            offset: free.offset,
+            len,
+        };
+        arena.reserved_bytes = arena
+            .reserved_bytes
+            .checked_add(len)
+            .ok_or_else(|| io::Error::other("host_arena_reserve: reserved_bytes overflow"))?;
+        return Ok(Some(region));
+    }
+
+    // Bump path. OOM = Ok(None), per the existing Rust shim contract.
+    let Some(end) = arena.next_offset.checked_add(len) else {
+        return Ok(None);
+    };
+    if end > arena.capacity_bytes {
+        return Ok(None);
+    }
+    let region = KvHostArenaRegion {
+        offset: arena.next_offset as u64,
+        len,
+    };
+    arena.next_offset = end;
+    arena.reserved_bytes = arena
+        .reserved_bytes
+        .checked_add(len)
+        .ok_or_else(|| io::Error::other("host_arena_reserve: reserved_bytes overflow"))?;
+    Ok(Some(region))
 }
 
 /// Release a previously reserved region back to the same host arena.
@@ -682,8 +751,42 @@ pub unsafe fn host_arena_release(
     handle: *mut KvHostArenaHandle,
     region: KvHostArenaRegion,
 ) -> io::Result<()> {
-    let status = unsafe { kv_native_host_arena_release(handle, region) };
-    status_to_result(status, "kv_native_host_arena_release")
+    if handle.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host_arena_release: null handle",
+        ));
+    }
+    let end = region_end(region).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host_arena_release: region offset/len overflows",
+        )
+    })?;
+    // Safety: caller contract.
+    let arena = unsafe { &mut *(handle.cast::<KvHostArena>()) };
+    if region.len == 0 || end > arena.capacity_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host_arena_release: region out of bounds or empty",
+        ));
+    }
+    arena.reserved_bytes = arena
+        .reserved_bytes
+        .checked_sub(region.len)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "host_arena_release: reserved_bytes underflow",
+            )
+        })?;
+    if end == arena.next_offset {
+        arena.next_offset = region.offset as usize;
+        host_arena_rewind_tail(arena);
+        return Ok(());
+    }
+    arena.free_list.push(region);
+    Ok(())
 }
 
 /// Reset a live host arena to its empty state.
@@ -693,8 +796,18 @@ pub unsafe fn host_arena_release(
 /// [`host_arena_create`] and that no outstanding borrowers continue using
 /// regions after the reset.
 pub unsafe fn host_arena_reset(handle: *mut KvHostArenaHandle) -> io::Result<()> {
-    let status = unsafe { kv_native_host_arena_reset(handle) };
-    status_to_result(status, "kv_native_host_arena_reset")
+    if handle.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host_arena_reset: null handle",
+        ));
+    }
+    // Safety: caller contract.
+    let arena = unsafe { &mut *(handle.cast::<KvHostArena>()) };
+    arena.next_offset = 0;
+    arena.reserved_bytes = 0;
+    arena.free_list.clear();
+    Ok(())
 }
 
 impl KvMmapDescriptor {
@@ -730,35 +843,6 @@ impl KvSharedMemoryDescriptor {
     pub fn generation(&self) -> u64 {
         self.generation
     }
-}
-
-fn read_buffer(
-    call: impl FnOnce(*mut KvNativeBuffer) -> c_int,
-    context: &'static str,
-) -> io::Result<Vec<u8>> {
-    let mut out = KvNativeBuffer {
-        data: std::ptr::null_mut(),
-        len: 0,
-    };
-    let status = call(&mut out);
-    if status_from_code(status) != Some(KvNativeStatus::Ok) {
-        return Err(status_to_error(status, context));
-    }
-    if out.len == 0 {
-        if !out.data.is_null() {
-            unsafe { kv_native_buffer_free(out.data) };
-        }
-        return Ok(Vec::new());
-    }
-    if out.data.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{context}: native layer returned null data for non-empty buffer"),
-        ));
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(out.data.cast_const(), out.len) }.to_vec();
-    unsafe { kv_native_buffer_free(out.data) };
-    Ok(bytes)
 }
 
 /// Owning guard over a heap-allocated payload buffer. Drops via the Rust
