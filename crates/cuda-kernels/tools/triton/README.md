@@ -13,7 +13,6 @@
 - Generated C wrappers linked into the normal Rust build
 - Default runtime routing of the corresponding ops onto Triton-generated launchers
 - `extract_vec` / `write_vec` now using `cudarc` device-to-device memcpy instead of a custom CUDA copy kernel
-- A focused `triton_silu_smoke` binary that compares the Triton path against a CPU reference
 
 `build.rs` now skips compiling the replaced legacy CUDA translation units `csrc/activation.cu`, `csrc/elementwise.cu`, and `csrc/embedding.cu`.
 
@@ -78,12 +77,6 @@ target/release/build/infer-*/out/triton_aot/
 ```
 
 ## Validation
-
-Sanity-check the default `silu_mul` path against a host-side reference:
-
-```bash
-cargo run --release --bin triton_silu_smoke -- --seq-len 32 --hidden-dim 4096 --iters 20
-```
 
 Run the focused GPU tests for the newly replaced paths:
 

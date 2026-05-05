@@ -112,11 +112,6 @@ path = "src/main.rs"
 required-features = ["cuda"]
 
 [[bin]]
-name = "triton_silu_smoke"
-path = "src/bin/triton_silu_smoke.rs"
-required-features = ["cuda"]
-
-[[bin]]
 name = "bench_serving"
 path = "src/bin/bench_serving.rs"
 required-features = ["cuda"]
