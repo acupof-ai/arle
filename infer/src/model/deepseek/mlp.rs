@@ -12,6 +12,7 @@ use cuda_kernels::prelude::{DeviceMatrix, HiddenStates};
 
 /// Standard SwiGLU MLP: `down(silu(gate(x)) * up(x))`.
 #[cfg(feature = "cuda")]
+#[allow(dead_code)] // fields populated by the safetensors loader once MLA kernel lands
 pub(super) struct DenseMlp {
     pub(super) gate_proj: DeviceMatrix,
     pub(super) up_proj: DeviceMatrix,
@@ -19,6 +20,7 @@ pub(super) struct DenseMlp {
 }
 
 #[cfg(feature = "cuda")]
+#[allow(dead_code)] // method called from forward.rs once MLA kernel lands
 impl DenseMlp {
     /// Run the MLP for a packed `[tokens, hidden]` row block.
     ///

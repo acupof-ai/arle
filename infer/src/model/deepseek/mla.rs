@@ -27,6 +27,7 @@ use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
 /// loader enforces "exactly one of those two paths" — there is no silent
 /// fallback. See substrate plan §6.1.
 #[cfg(feature = "cuda")]
+#[allow(dead_code)] // fields populated by the safetensors loader once MLA kernel lands
 pub(super) struct MlaAttention {
     /// Direct Q projection (used when `q_lora_rank` is `None`).
     pub(super) q_proj: Option<DeviceMatrix>,
@@ -47,6 +48,7 @@ pub(super) struct MlaAttention {
 }
 
 #[cfg(feature = "cuda")]
+#[allow(dead_code)] // methods called from forward.rs once MLA kernel lands
 impl MlaAttention {
     /// True when the loader chose the direct-Q path (`q_lora_rank == None`).
     pub(super) fn uses_direct_q(&self) -> bool {

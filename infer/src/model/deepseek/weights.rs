@@ -23,6 +23,7 @@ use deepseek_spec::DeepSeekConfig;
 /// `DeepSeekConfig::layer_tensor_names`) is deferred until SKU-B; the nano
 /// fixture stays on the dense MLP path on every layer.
 #[cfg(feature = "cuda")]
+#[allow(dead_code)] // fields populated by the safetensors loader once MLA kernel lands
 pub(super) struct DeepseekLayer {
     pub(super) input_layernorm: DeviceVec,
     pub(super) attention: MlaAttention,
@@ -32,6 +33,7 @@ pub(super) struct DeepseekLayer {
 
 /// DeepSeek model — weights and config only. Mutable per-slot state lives in
 /// [`super::state::DeepseekState`].
+#[allow(dead_code)] // fields populated by the safetensors loader once MLA kernel lands
 pub struct DeepseekModel {
     pub(super) config: DeepseekRuntimeConfig,
     #[cfg(feature = "cuda")]

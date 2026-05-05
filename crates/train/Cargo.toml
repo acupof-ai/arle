@@ -34,6 +34,7 @@ tokenizers = { workspace = true }
 ureq = { version = "2.12", features = ["json"] }
 qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
+deepseek-spec = { path = "../deepseek-spec" }
 chat = { path = "../chat" }
 
 [dev-dependencies]

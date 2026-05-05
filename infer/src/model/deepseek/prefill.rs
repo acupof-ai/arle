@@ -15,8 +15,11 @@ use super::weights::DeepseekModel;
 /// Pre-allocated scratch for a batched prefill launch. Empty until the kernel
 /// surface is real; the scheduler wires `Qwen3PrefillContext` for the same
 /// purpose on the Qwen3 path.
+///
+/// Public so the `ModelForward::PrefillContext` associated type (a `pub`
+/// surface on the trait) does not leak a private name.
 #[cfg(feature = "cuda")]
-pub(super) struct DeepseekPrefillContext;
+pub struct DeepseekPrefillContext;
 
 #[cfg(feature = "cuda")]
 impl DeepseekPrefillContext {
