@@ -1743,6 +1743,7 @@ dependencies = [
  "crossbeam-queue",
  "cuda-kernels",
  "cudarc",
+ "deepseek-spec",
  "fastrace",
  "futures",
  "futures-util",
