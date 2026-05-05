@@ -62,10 +62,6 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
-fn fingerprint_bytes(fingerprint: [u8; 16]) -> [u8; 16] {
-    fingerprint
-}
-
 pub fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
