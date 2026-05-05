@@ -216,13 +216,40 @@ match; guidellm c=16 / Qwen3-4B / L4 — Δ ≤ 2% out tok/s.
 
 ### Phase 2 — gated_delta_rule_chunkwise Triton → TileLang
 
-**Files (~14):** new `tools/tilelang/gated_delta_rule.py`; `build.rs`
-swap 7 specs; `ffi/recurrent.rs` extern rename ×7; delete
-`tools/triton/gated_delta_rule_chunkwise_kernels.py`; port 7 call
-sites in `infer/src/ops/recurrent.rs:353-579`.
+Split into 2a (kernel skeleton, no GPU required) and 2b (AOT generator
+generalization + build swap + Triton deletion, GPU required) after the
+upstream survey on 2026-05-05 turned up two pipeline blockers — see
+`docs/experience/wins/2026-05-05-bench-tilelang-phase2-pending-remote.md`
+"Why scope-reduced" for the analysis.
 
-**Decision D2 below** — single fused kernel or literal 7-stage 1:1
-port?
+#### Phase 2a — kernel skeleton (build-only) **— LANDED 2026-05-05**
+
+**Files (1 new + 2 doc):** `crates/cuda-kernels/tools/tilelang/gated_delta_rule.py`
+(new, ~600 LoC, 7-stage literal port from the existing Triton source +
+algorithmic structure borrowed from FlashQLA's solve_tril 4-block
+decomposition); `docs/plans/2026-05-05-cuda-kernel-tilelang-unification.md`
+(this entry); `docs/experience/wins/2026-05-05-bench-tilelang-phase2-pending-remote.md`
+(pending-remote stub).
+
+The `.py` is parked artifact: `build.rs` does not reference it yet, so the
+Triton AOT pipeline remains the active runtime path. **Bench: exempt
+(build-only, runtime unchanged).**
+
+#### Phase 2b — AOT swap + Triton deletion (GPU required)
+
+**Files (~12):** generalize
+`crates/cuda-kernels/tools/tilelang/gen_tilelang_aot.py` to dispatch
+wrapper emission by kernel family (instead of the hard-coded 18-arg
+attention shape); `build.rs` swap 7 Triton specs to TileLang; rename
+7 extern decls in `crates/cuda-kernels/src/ffi/recurrent.rs`; rename
+7 call sites in `infer/src/ops/recurrent.rs`; delete
+`crates/cuda-kernels/tools/triton/gated_delta_rule_chunkwise_kernels.py`;
+delete the entire `crates/cuda-kernels/tools/triton/` directory if no
+`.py` kernels remain.
+
+**Decision D2 (option A) — literal 7-stage port** — preserved through
+Phase 2a; Phase 2b stays on option A unless the AOT-generator
+generalization makes a fused single-kernel variant cheaper to author.
 
 **Gate:** `cargo test --release --test e2e_qwen35` green;
 Qwen3.5-4B JSON substring match; guidellm Qwen3.5-4B c=16 — Δ ≤ 5%
