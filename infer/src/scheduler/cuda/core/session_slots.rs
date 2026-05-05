@@ -168,6 +168,10 @@ impl<M: ModelForward> Scheduler<M> {
         self.session_block_refs.keys().copied().collect()
     }
 
+    pub(in crate::scheduler::cuda) fn consume_host_leaf_pressure_mode(&mut self) -> PressureMode {
+        consume_host_leaf_pressure_mode(&mut self.host_leaf_headroom_exhausted)
+    }
+
     pub(super) fn evict_inactive_session_slots_for_pressure(
         &mut self,
         mode: PressureMode,
@@ -308,6 +312,15 @@ impl<M: ModelForward> Scheduler<M> {
 
 fn block_metadata_tier(location: Option<&BlockLocation>) -> Tier {
     location.map_or(Tier::Gpu, BlockLocation::tier)
+}
+
+fn consume_host_leaf_pressure_mode(host_leaf_headroom_exhausted: &mut bool) -> PressureMode {
+    if *host_leaf_headroom_exhausted {
+        *host_leaf_headroom_exhausted = false;
+        PressureMode::Hard
+    } else {
+        PressureMode::Soft
+    }
 }
 
 fn inactive_session_slot_eviction_candidates(
@@ -550,5 +563,58 @@ mod tests {
                 vec![SessionId::from("inactive-target-tier")]
             );
         }
+    }
+
+    #[test]
+    fn host_leaf_headroom_signal_escalates_pressure_to_hard_once() {
+        let mut exhausted = false;
+        assert_eq!(
+            consume_host_leaf_pressure_mode(&mut exhausted),
+            PressureMode::Soft
+        );
+        assert!(!exhausted);
+
+        exhausted = true;
+        let mode = consume_host_leaf_pressure_mode(&mut exhausted);
+        assert_eq!(mode, PressureMode::Hard);
+        assert!(!exhausted);
+        assert_eq!(
+            consume_host_leaf_pressure_mode(&mut exhausted),
+            PressureMode::Soft
+        );
+
+        let keepalive_ticks = 64;
+        let now = 70;
+        let mut slots = HashMap::new();
+        slots.insert(
+            SessionId::from("fresh-inactive"),
+            SessionSlot {
+                blocks: vec![BlockId(1)],
+                committed_len: 16,
+                ref_count: 0,
+                last_access_tick: 69,
+            },
+        );
+
+        assert!(
+            inactive_session_slot_eviction_candidates(
+                &slots,
+                now,
+                PressureMode::Soft.min_idle_ticks(keepalive_ticks),
+                1,
+                |_| true,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            inactive_session_slot_eviction_candidates(
+                &slots,
+                now,
+                mode.min_idle_ticks(keepalive_ticks),
+                1,
+                |_| true,
+            ),
+            vec![SessionId::from("fresh-inactive")]
+        );
     }
 }

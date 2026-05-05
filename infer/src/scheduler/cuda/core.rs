@@ -162,6 +162,8 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) pending_decode: Option<PendingDecode>,
     /// Pending prefill state for GPU/CPU overlap.
     pub(super) pending_prefill: Option<PendingPrefill>,
+    /// Set when T1 cannot make leaf eviction headroom for a GPU demotion.
+    pub(super) host_leaf_headroom_exhausted: bool,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -523,6 +525,23 @@ impl<M: ModelForward> Scheduler<M> {
             );
         }
         released_bytes
+    }
+
+    fn ensure_host_demote_headroom(&mut self, required_bytes: usize) -> bool {
+        if required_bytes == 0 {
+            return true;
+        }
+        if self.host_pool_demote_headroom_bytes() < required_bytes {
+            self.evict_host_blocks_for_demote_headroom(required_bytes, PressureMode::Soft);
+        }
+        if self.host_pool_demote_headroom_bytes() < required_bytes {
+            self.evict_host_blocks_for_demote_headroom(required_bytes, PressureMode::Hard);
+        }
+        let has_headroom = self.host_pool_demote_headroom_bytes() >= required_bytes;
+        if !has_headroom {
+            self.host_leaf_headroom_exhausted = true;
+        }
+        has_headroom
     }
 
     pub(super) fn release_host_region(&self, region: crate::kv_tier::HostPinnedRegion) {
@@ -1199,13 +1218,7 @@ impl<M: ModelForward> Scheduler<M> {
             return Ok(0);
         };
         let block_bytes = metadata.byte_len as usize;
-        if self.host_pool_demote_headroom_bytes() < block_bytes {
-            self.evict_host_blocks_for_demote_headroom(block_bytes, PressureMode::Soft);
-        }
-        if self.host_pool_demote_headroom_bytes() < block_bytes {
-            self.evict_host_blocks_for_demote_headroom(block_bytes, PressureMode::Hard);
-        }
-        if self.host_pool_demote_headroom_bytes() < block_bytes {
+        if !self.ensure_host_demote_headroom(block_bytes) {
             return Err(anyhow::anyhow!(
                 "host pinned tier has no leaf eviction headroom for block {:?} ({} bytes)",
                 block_id,
@@ -1455,27 +1468,35 @@ impl<M: ModelForward> Scheduler<M> {
             true,
         );
         let mut reclaimed_pages = 0usize;
-        for bid in candidates.iter().copied() {
-            if self.block_has_active_session_ref(bid) {
-                continue;
-            }
-            match self.demote_block_to_host(bid) {
-                Ok(freed_now) => {
-                    reclaimed_pages += freed_now;
-                    if reclaimed_pages >= want_free {
-                        break;
-                    }
+        if !candidates.is_empty()
+            && self.ensure_host_demote_headroom(self.sealed_block_byte_len() as usize)
+        {
+            for bid in candidates.iter().copied() {
+                if self.block_has_active_session_ref(bid) {
+                    continue;
                 }
-                Err(err) => {
-                    warn!("failed to demote block {:?} to host tier: {}", bid, err);
+                match self.demote_block_to_host(bid) {
+                    Ok(freed_now) => {
+                        reclaimed_pages += freed_now;
+                        if reclaimed_pages >= want_free {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if self.host_leaf_headroom_exhausted {
+                            break;
+                        }
+                        warn!("failed to demote block {:?} to host tier: {}", bid, err);
+                    }
                 }
             }
         }
         if reclaimed_pages < want_free {
             let remaining_pages = want_free.saturating_sub(reclaimed_pages);
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
+            let mode = self.consume_host_leaf_pressure_mode();
             let _ = self.evict_inactive_session_slots_for_pressure(
-                PressureMode::Soft,
+                mode,
                 1,
                 Some(crate::kv_tier::Tier::Gpu),
             );
@@ -1551,6 +1572,9 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
             let before = reclaimed_pages;
+            if !self.ensure_host_demote_headroom(self.sealed_block_byte_len() as usize) {
+                break;
+            }
             for bid in candidates.iter().copied() {
                 if self.block_has_active_session_ref(bid) {
                     continue;
@@ -1560,6 +1584,9 @@ impl<M: ModelForward> Scheduler<M> {
                         reclaimed_pages += freed_now;
                     }
                     Err(err) => {
+                        if self.host_leaf_headroom_exhausted {
+                            break;
+                        }
                         warn!(
                             "failed to demote block {:?} during alloc reclaim: {}",
                             bid, err
@@ -1576,8 +1603,9 @@ impl<M: ModelForward> Scheduler<M> {
 
         if reclaimed_pages < shortage_pages {
             let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
+            let mode = self.consume_host_leaf_pressure_mode();
             let _ = self.evict_inactive_session_slots_for_pressure(
-                PressureMode::Soft,
+                mode,
                 1,
                 Some(crate::kv_tier::Tier::Gpu),
             );

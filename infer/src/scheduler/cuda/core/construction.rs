@@ -313,6 +313,7 @@ impl<M: ModelForward> Scheduler<M> {
             stats: SchedulerRuntimeStats::new(),
             pending_decode: None,
             pending_prefill: None,
+            host_leaf_headroom_exhausted: false,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count_and_wakeup(
