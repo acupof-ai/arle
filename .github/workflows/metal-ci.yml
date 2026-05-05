@@ -99,6 +99,13 @@ jobs:
           cargo check -p autograd --release --features metal --lib
           cargo check -p train --release --features metal --lib
 
+      - name: cargo test + clippy (kv-native-sys POSIX substrate)
+        # POSIX-only persistence substrate (no Metal feature). macOS is the
+        # canonical second POSIX target alongside Linux, so test + clippy here.
+        run: |
+          cargo test -p kv-native-sys --release
+          cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
+
       - name: cargo test (metal + no-cuda)
         working-directory: infer
         run: >

@@ -56,6 +56,12 @@ jobs:
           cargo check -p autograd --release --features metal --lib
           cargo check -p train --release --features metal --lib
 
+      - name: cargo test (kv-native-sys POSIX substrate)
+        # kv-native-sys is the pure-Rust persistence substrate (file/block I/O,
+        # WAL, mmap, POSIX shm, host arena). Linux coverage lives in the `test`
+        # job; this step is the canonical macOS POSIX gate.
+        run: cargo test -p kv-native-sys --release
+
       - name: cargo test (Metal CLI unit tests)
         run: cargo test -p cli --release --no-default-features --features metal,no-cuda
 
@@ -174,6 +180,7 @@ jobs:
         run: |
           cargo clippy -p autograd --release --features no-cuda --lib -- -D warnings
           cargo clippy -p train --release --features no-cuda --lib -- -D warnings
+          cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
 
   fmt:
     name: Format
