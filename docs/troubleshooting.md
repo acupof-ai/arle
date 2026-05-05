@@ -44,12 +44,6 @@ CUDA 12.x and a matching Triton wheel. The repo pins both in
 verify `nvidia-smi` reports a GPU and that `$CUDA_HOME/bin/nvcc --version`
 matches the pinned major (12.8 today).
 
-### Zig toolchain missing for `crates/kv-native-sys`
-
-Run `./scripts/setup_zig_toolchain.sh` — it installs Zig 0.16.0 into a
-repo-local `.toolchains/zig/` directory and exports `ZIG=` so `cargo build`
-picks it up. `setup.sh` invokes this automatically.
-
 ### `pip install -e ".[bench|dev|observe|serve]"` fails with "no such package"
 
 Run from the repo root. The `.` resolves to the local

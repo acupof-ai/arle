@@ -30,10 +30,6 @@ info "exporting HEAD snapshot to ${SNAPSHOT_ROOT}"
 git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${SNAPSHOT_ROOT}"
 cd "${SNAPSHOT_ROOT}"
 
-export ZIG
-ZIG="$(./scripts/setup_zig_toolchain.sh --print-zig)"
-info "using ZIG=${ZIG}"
-
 export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-D warnings"
 export CARGO_TARGET_DIR="${REPO_ROOT}/target/pre-push-quick"

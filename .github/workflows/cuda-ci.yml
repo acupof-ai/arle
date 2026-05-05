@@ -35,19 +35,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            .toolchains/zig
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cuda-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cuda-
-
-      - name: Set up Zig toolchain
-        run: echo "ZIG=$(./scripts/setup_zig_toolchain.sh --print-zig)" >> "$GITHUB_ENV"
-
-      - name: Run kv Zig validation
-        run: ./scripts/check_kv_zig.sh
 
       - name: cargo check (cuda + no-cuda infer lib)
         run: cargo check -p infer --release --no-default-features --features cuda,no-cuda --lib

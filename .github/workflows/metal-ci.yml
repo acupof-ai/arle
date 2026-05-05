@@ -16,8 +16,6 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/start_agent.sh'
-      - 'scripts/setup_zig_toolchain.sh'
-      - 'scripts/check_kv_zig.sh'
       - 'setup.sh'
       - 'Makefile'
       - 'README.md'
@@ -45,8 +43,6 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/start_agent.sh'
-      - 'scripts/setup_zig_toolchain.sh'
-      - 'scripts/check_kv_zig.sh'
       - 'setup.sh'
       - 'Makefile'
       - 'README.md'
@@ -83,19 +79,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            .toolchains/zig
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-metal-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-metal-
-
-      - name: Set up Zig toolchain
-        run: echo "ZIG=$(./scripts/setup_zig_toolchain.sh --print-zig)" >> "$GITHUB_ENV"
-
-      - name: Run kv Zig validation
-        run: ./scripts/check_kv_zig.sh
 
       # Verify Metal C++ shim compiles and Rust type-checks cleanly.
       - name: cargo check (metal + no-cuda infer lib)
