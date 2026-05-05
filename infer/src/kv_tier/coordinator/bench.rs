@@ -263,7 +263,7 @@ fn bench_kv_tier_copy_throughput() {
     println!("# T1↔T2 copy-throughput micro-benchmark");
     println!();
     println!(
-        "Backing: HostPinnedPool (Zig arena, kv-native-sys), DiskStore (tmpfs/disk under tempdir)."
+        "Backing: HostPinnedPool (kv-native-sys arena), DiskStore (tmpfs/disk under tempdir)."
     );
     println!("All paths exercised through actual ARLE types — no mock substrate.");
     println!();

@@ -13,7 +13,7 @@
 //! | Tier | Medium             | Latency class | Status in this module |
 //! |------|--------------------|---------------|------------------------|
 //! | T0   | GPU HBM            | ~0 (kernel)   | owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`, not represented here |
-//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via Zig-backed `HostPinnedPool`; staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
+//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via `HostPinnedPool` (kv-native-sys arena); staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
 //! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator store / persist and local staged readmission (`disk -> host -> T0`) |
 //! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` builds under `rdma-nixl` (stub) or `rdma-nixl-real` |
 //!
@@ -33,7 +33,7 @@
 //! unified local KV path:
 //! - radix metadata in `prefix_cache`
 //! - T0 page ownership plus direct GPU prefix attachment / decode-time COW in `paged_kv`
-//! - T1 demotion buffering in Zig-backed `HostPinnedPool`
+//! - T1 demotion buffering in `HostPinnedPool` (kv-native-sys arena)
 //! - T1/T2 staged readmission planning in `lookup.rs` + `readmission.rs`
 //! - T1/T2 fetch/store queueing in `Coordinator`
 //! - T1→T2 store and disk persistence in `Coordinator` + `DiskStore`
@@ -73,7 +73,7 @@
 //!
 //! 4. **MR registration stability.** The NIXL transport requires
 //!    registered memory regions to be allocation-stable. The T1
-//!    `HostPinnedPool` is backed by one Zig-managed arena that is
+//!    `HostPinnedPool` is backed by one `kv-native-sys` arena that is
 //!    allocated once at engine init and never reallocated; see project doc
 //!    §4.2 invariant 5 and §8
 //!    pitfall 2.

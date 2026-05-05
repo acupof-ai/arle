@@ -25,9 +25,9 @@
 //!     [`DiskBlockLocation`] for later reads/deletes.
 //! - One file per block. The payload is still an opaque raw byte blob
 //!   owned by the caller; only the header is interpreted here.
-//! - Synchronous I/O via the `kv-native-sys` Zig file engine. The
-//!   `KVTransport` trait is sync too, so this remains the natural fit;
-//!   the coordinator does its own thread management.
+//! - Synchronous I/O via the `kv-native-sys` file engine. The `KVTransport`
+//!   trait is sync too, so this remains the natural fit; the coordinator does
+//!   its own thread management.
 //! - Header validation on read: magic, version, payload length, and
 //!   optional fingerprint match.
 //!
@@ -276,12 +276,8 @@ impl DiskStore {
     /// `DiskBlockLocation`. This is the defense against session
     /// snapshot–driven path traversal (M4 review finding B2).
     ///
-    /// Formats the 32-hex-char + ".kv" filename in Rust directly (no
-    /// FFI/alloc trip into the Zig substrate) — this is the per-write
-    /// and per-read hot path. The byte-for-byte output matches Zig's
-    /// `blockFilenameAlloc` (same nibble→hex table, lowercase, same
-    /// suffix), so blocks written via either path are mutually
-    /// readable.
+    /// Formats the 32-hex-char + ".kv" filename on the stack (no heap
+    /// allocation) — this is the per-write and per-read hot path.
     pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> PathBuf {
         // Defence: the 35-byte stack buffer below assumes a 16-byte
         // fingerprint (32 hex chars + ".kv"). If `BlockFingerprint`
@@ -590,9 +586,9 @@ impl DiskStore {
             ));
         }
 
-        // Read directly into a Zig-owned guard, decode the header against
+        // Read directly into an owning byte guard, decode the header against
         // the borrowed slice, then copy only the payload into the returned
-        // Vec. This eliminates the Zig→Vec(header+payload) memcpy that
+        // Vec. This eliminates the read→Vec(header+payload) memcpy that
         // `kv_native_sys::read_block` would have done in `read_buffer`,
         // saving one allocation + one full-block memcpy per fetch on the
         // T2→T1 path. Net cost: 1 alloc + 1 memcpy (vs prior 2 + 2).
