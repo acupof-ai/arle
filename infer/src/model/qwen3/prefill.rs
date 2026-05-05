@@ -3,11 +3,12 @@ use cudarc::driver::CudaSlice;
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::model::kv_cache::KVCache;
+use crate::model::kv_cache::{KVCache, KVFormat};
 use crate::ops;
 use cuda_kernels::TokenKVPool;
 #[cfg(not(feature = "tilelang-attn"))]
 use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
+use cuda_kernels::kv_quant;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -81,10 +82,19 @@ pub(super) struct Qwen3PagedPrefillRequest<'a> {
     pub state_idx: usize,
 }
 
+pub(super) struct Qwen3PagedPrefillLayout {
+    sequences: Vec<ops::PagedPrefillSequence>,
+    page_indices: Vec<i32>,
+    prefix_token_rows: Vec<i32>,
+    prefill_token_rows: Vec<i32>,
+}
+
 struct PendingPagedPrefill {
     _hidden: HiddenStates,
     _bufs: PrefillBuffers,
     _page_indices_dev: CudaSlice<i32>,
+    _prefix_token_rows_dev: CudaSlice<i32>,
+    _prefill_token_rows_dev: CudaSlice<i32>,
     _fwd: crate::ops::PagedPrefillForward,
 }
 
@@ -211,7 +221,7 @@ impl Qwen3Model {
         &self,
         requests: &[Qwen3PagedPrefillRequest<'_>],
         pool: &TokenKVPool,
-    ) -> Result<(Vec<ops::PagedPrefillSequence>, Vec<i32>)> {
+    ) -> Result<Qwen3PagedPrefillLayout> {
         anyhow::ensure!(
             !requests.is_empty(),
             "paged prefill batch requires at least one request"
@@ -221,6 +231,9 @@ impl Qwen3Model {
         let mut page_table_offset = 0usize;
         let mut sequences = Vec::with_capacity(requests.len());
         let mut page_indices = Vec::new();
+        let mut prefix_token_rows = Vec::new();
+        let mut prefill_token_rows =
+            Vec::with_capacity(requests.iter().map(|req| req.tokens.len()).sum());
 
         for req in requests {
             let seq_len = req.tokens.len();
@@ -247,6 +260,16 @@ impl Qwen3Model {
             );
 
             page_indices.extend(all_pages[..num_pages].iter().map(|&page| page as i32));
+            for pos in 0..start_pos {
+                let page = all_pages[pos / pool.page_size] as usize;
+                let in_page = pos % pool.page_size;
+                prefix_token_rows.push((page * pool.page_size + in_page) as i32);
+            }
+            for pos in start_pos..start_pos + seq_len {
+                let page = all_pages[pos / pool.page_size] as usize;
+                let in_page = pos % pool.page_size;
+                prefill_token_rows.push((page * pool.page_size + in_page) as i32);
+            }
             sequences.push(ops::PagedPrefillSequence {
                 token_offset,
                 seq_len,
@@ -258,7 +281,12 @@ impl Qwen3Model {
             page_table_offset += num_pages;
         }
 
-        Ok((sequences, page_indices))
+        Ok(Qwen3PagedPrefillLayout {
+            sequences,
+            page_indices,
+            prefix_token_rows,
+            prefill_token_rows,
+        })
     }
 
     fn compute_logits_batch_packed(
@@ -332,13 +360,34 @@ impl Qwen3Model {
             packed_tokens.extend_from_slice(req.tokens);
         }
 
-        let (sequences, page_indices) = self.build_paged_prefill_sequences(requests, pool)?;
+        let layout = self.build_paged_prefill_sequences(requests, pool)?;
+        anyhow::ensure!(
+            layout.prefill_token_rows.len() == packed_tokens.len(),
+            "paged prefill token rows cover {} rows, expected {}",
+            layout.prefill_token_rows.len(),
+            packed_tokens.len()
+        );
         let mut bufs = self.prefill_buffers(packed_tokens.len())?;
         let page_indices_dev: CudaSlice<i32> = self
             .ctx
             .stream
-            .clone_htod(&page_indices)
+            .clone_htod(&layout.page_indices)
             .map_err(|e| anyhow::anyhow!("page_indices H2D failed: {e}"))?;
+        let prefix_token_rows_upload: &[i32] = if layout.prefix_token_rows.is_empty() {
+            &[0]
+        } else {
+            &layout.prefix_token_rows
+        };
+        let prefix_token_rows_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(prefix_token_rows_upload)
+            .map_err(|e| anyhow::anyhow!("prefix token rows H2D failed: {e}"))?;
+        let prefill_token_rows_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&layout.prefill_token_rows)
+            .map_err(|e| anyhow::anyhow!("prefill token rows H2D failed: {e}"))?;
         #[cfg(not(feature = "tilelang-attn"))]
         let mut fwd = {
             let plan = prefill_ctx.plan_mut(
@@ -349,15 +398,18 @@ impl Qwen3Model {
             crate::ops::PagedPrefillForward::new_hd128(
                 &self.ctx,
                 plan,
-                &sequences,
+                &layout.sequences,
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
                 pool.page_size,
             )?
         };
         #[cfg(feature = "tilelang-attn")]
-        let mut fwd =
-            crate::ops::PagedPrefillForward::new_hd128(&self.ctx, &sequences, pool.page_size)?;
+        let mut fwd = crate::ops::PagedPrefillForward::new_hd128(
+            &self.ctx,
+            &layout.sequences,
+            pool.page_size,
+        )?;
         let hidden = self.get_embeddings_batch(&packed_tokens)?;
         #[cfg(not(feature = "tilelang-attn"))]
         let hidden_result = {
@@ -370,8 +422,11 @@ impl Qwen3Model {
                 hidden,
                 &mut bufs,
                 pool,
-                &sequences,
+                &layout.sequences,
                 &page_indices_dev,
+                &prefix_token_rows_dev,
+                layout.prefix_token_rows.len(),
+                &prefill_token_rows_dev,
                 plan,
                 &mut fwd,
             )
@@ -381,8 +436,11 @@ impl Qwen3Model {
             hidden,
             &mut bufs,
             pool,
-            &sequences,
+            &layout.sequences,
             &page_indices_dev,
+            &prefix_token_rows_dev,
+            layout.prefix_token_rows.len(),
+            &prefill_token_rows_dev,
             &mut fwd,
         );
         let hidden = match hidden_result {
@@ -392,9 +450,13 @@ impl Qwen3Model {
                 return Err(err);
             }
         };
-        if let Err(err) =
-            self.compute_logits_batch_packed(&hidden, requests, states, &sequences, &mut bufs)
-        {
+        if let Err(err) = self.compute_logits_batch_packed(
+            &hidden,
+            requests,
+            states,
+            &layout.sequences,
+            &mut bufs,
+        ) {
             self.ctx.sync()?;
             return Err(err);
         }
@@ -402,6 +464,8 @@ impl Qwen3Model {
             _hidden: hidden,
             _bufs: bufs,
             _page_indices_dev: page_indices_dev,
+            _prefix_token_rows_dev: prefix_token_rows_dev,
+            _prefill_token_rows_dev: prefill_token_rows_dev,
             _fwd: fwd,
         })?;
         Ok(())
@@ -431,6 +495,9 @@ impl Qwen3Model {
         pool: &TokenKVPool,
         sequences: &[ops::PagedPrefillSequence],
         page_indices: &CudaSlice<i32>,
+        prefix_token_rows: &CudaSlice<i32>,
+        prefix_token_count: usize,
+        prefill_token_rows: &CudaSlice<i32>,
         #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
         fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<HiddenStates> {
@@ -458,6 +525,9 @@ impl Qwen3Model {
                 pool,
                 sequences,
                 page_indices,
+                prefix_token_rows,
+                prefix_token_count,
+                prefill_token_rows,
                 plan,
                 fwd,
             )?;
@@ -470,6 +540,9 @@ impl Qwen3Model {
                 pool,
                 sequences,
                 page_indices,
+                prefix_token_rows,
+                prefix_token_count,
+                prefill_token_rows,
                 fwd,
             )?;
         }
@@ -493,6 +566,9 @@ impl Qwen3Model {
         pool: &TokenKVPool,
         sequences: &[ops::PagedPrefillSequence],
         page_indices: &CudaSlice<i32>,
+        prefix_token_rows: &CudaSlice<i32>,
+        prefix_token_count: usize,
+        prefill_token_rows: &CudaSlice<i32>,
         #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
         fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<()> {
@@ -567,6 +643,14 @@ impl Qwen3Model {
             sequences,
             page_size: pool.page_size,
         };
+        self.refill_paged_prefill_prefix_if_needed(
+            pool,
+            layer_idx,
+            prefix_token_rows,
+            prefix_token_count,
+            num_kv_heads,
+            head_dim,
+        )?;
         #[cfg(not(feature = "tilelang-attn"))]
         ops::prefill_attention_paged_batch(
             &self.ctx,
@@ -591,6 +675,15 @@ impl Qwen3Model {
             fwd,
             &mut bufs.attn_output,
             &heads,
+        )?;
+
+        self.finalize_paged_prefill_kv_layer(
+            pool,
+            layer_idx,
+            prefill_token_rows,
+            hidden.seq_len,
+            num_kv_heads,
+            head_dim,
         )?;
 
         // 4-8: Same as forward_layer_batch (O proj, residual, MLP)
@@ -682,6 +775,143 @@ impl Qwen3Model {
         );
 
         Ok(())
+    }
+
+    fn refill_paged_prefill_prefix_if_needed(
+        &self,
+        pool: &TokenKVPool,
+        layer_idx: usize,
+        prefix_token_rows: &CudaSlice<i32>,
+        prefix_token_count: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if prefix_token_count == 0 {
+            return Ok(());
+        }
+        match pool.format {
+            KVFormat::BF16 => Ok(()),
+            KVFormat::FP8E4M3 => {
+                let stream = &self.ctx.stream;
+                kv_quant::dequantize_paged_kv_fp8_to_hnd(
+                    &self.ctx,
+                    pool.k_data_ptr(layer_idx, stream),
+                    pool.k_scales_ptr(layer_idx, stream),
+                    pool.k_work_ptr(stream),
+                    prefix_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    prefix_token_count,
+                )?;
+                kv_quant::dequantize_paged_kv_fp8_to_hnd(
+                    &self.ctx,
+                    pool.v_data_ptr(layer_idx, stream),
+                    pool.v_scales_ptr(layer_idx, stream),
+                    pool.v_work_ptr(stream),
+                    prefix_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    prefix_token_count,
+                )
+            }
+            KVFormat::INT8 => {
+                let stream = &self.ctx.stream;
+                kv_quant::dequantize_paged_kv_int8_to_hnd(
+                    &self.ctx,
+                    pool.k_data_ptr(layer_idx, stream),
+                    pool.k_scales_ptr(layer_idx, stream),
+                    pool.k_work_ptr(stream),
+                    prefix_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    prefix_token_count,
+                )?;
+                kv_quant::dequantize_paged_kv_int8_to_hnd(
+                    &self.ctx,
+                    pool.v_data_ptr(layer_idx, stream),
+                    pool.v_scales_ptr(layer_idx, stream),
+                    pool.v_work_ptr(stream),
+                    prefix_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    prefix_token_count,
+                )
+            }
+            KVFormat::TurboQuant { .. } => {
+                anyhow::bail!("Qwen3 paged prefill does not support TurboQuant KV prefix refill")
+            }
+        }
+    }
+
+    fn finalize_paged_prefill_kv_layer(
+        &self,
+        pool: &TokenKVPool,
+        layer_idx: usize,
+        prefill_token_rows: &CudaSlice<i32>,
+        token_count: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        match pool.format {
+            KVFormat::BF16 => Ok(()),
+            KVFormat::FP8E4M3 => {
+                let stream = &self.ctx.stream;
+                kv_quant::quantize_paged_kv_fp8(
+                    &self.ctx,
+                    pool.k_work_ptr(stream),
+                    pool.k_data_ptr(layer_idx, stream),
+                    pool.k_scales_ptr(layer_idx, stream),
+                    prefill_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                kv_quant::quantize_paged_kv_fp8(
+                    &self.ctx,
+                    pool.v_work_ptr(stream),
+                    pool.v_data_ptr(layer_idx, stream),
+                    pool.v_scales_ptr(layer_idx, stream),
+                    prefill_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )
+            }
+            KVFormat::INT8 => {
+                let stream = &self.ctx.stream;
+                kv_quant::quantize_paged_kv_single(
+                    &self.ctx,
+                    pool.k_work_ptr(stream),
+                    pool.k_data_ptr(layer_idx, stream),
+                    pool.k_scales_ptr(layer_idx, stream),
+                    prefill_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                kv_quant::quantize_paged_kv_single(
+                    &self.ctx,
+                    pool.v_work_ptr(stream),
+                    pool.v_data_ptr(layer_idx, stream),
+                    pool.v_scales_ptr(layer_idx, stream),
+                    prefill_token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )
+            }
+            KVFormat::TurboQuant { .. } => {
+                anyhow::bail!("Qwen3 paged prefill does not support TurboQuant KV finalization")
+            }
+        }
     }
 
     pub(super) fn compute_logits_batch(&self, hidden: &HiddenStates) -> Result<DeviceVec> {

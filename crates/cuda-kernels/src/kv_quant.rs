@@ -9,6 +9,8 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
+const MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH: usize = 65_535;
+
 /// Quantize bf16 KV data → INT8 + f32 scales for tokens `[start_pos..start_pos+token_count)`.
 ///
 /// `kv_bf16`:  bf16 working buffer, HND layout `[num_kv_heads, max_seq_len, head_dim]`
@@ -152,20 +154,26 @@ pub fn quantize_paged_kv_fp8(
     if batch_size == 0 {
         return Ok(());
     }
-    let (nti_ptr, _g) = new_token_indices_gpu.device_ptr(&ctx.stream);
-    unsafe {
-        ffi::quantize_paged_kv_fp8_cuda(
-            kv_bf16_ptr as *const ffi::Half,
-            kv_fp8_ptr as *mut u8,
-            scales_ptr as *mut f32,
-            nti_ptr as *const i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            kv_dim as i32,
-            batch_size as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
+    let mut offset = 0usize;
+    while offset < batch_size {
+        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
+        let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::quantize_paged_kv_fp8_cuda(
+                kv_bf16_ptr as *const ffi::Half,
+                kv_fp8_ptr as *mut u8,
+                scales_ptr as *mut f32,
+                nti_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
     }
     Ok(())
 }
@@ -262,20 +270,66 @@ pub fn dequantize_paged_kv_fp8_to_hnd(
     if total_tokens == 0 {
         return Ok(());
     }
-    let (rows_ptr, _g) = token_rows_gpu.device_ptr(&ctx.stream);
-    unsafe {
-        ffi::dequantize_paged_kv_fp8_to_hnd_cuda(
-            kv_fp8_ptr as *const u8,
-            scales_ptr as *const f32,
-            kv_bf16_hnd_ptr as *mut ffi::Half,
-            rows_ptr as *const i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            kv_dim as i32,
-            total_tokens as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
+    let mut offset = 0usize;
+    while offset < total_tokens {
+        let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
+        let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dequantize_paged_kv_fp8_to_hnd_cuda(
+                kv_fp8_ptr as *const u8,
+                scales_ptr as *const f32,
+                kv_bf16_hnd_ptr as *mut ffi::Half,
+                rows_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
+    }
+    Ok(())
+}
+
+/// Dequantize durable INT8 NHD token rows into the BF16 HND paged work buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn dequantize_paged_kv_int8_to_hnd(
+    ctx: &DeviceContext,
+    kv_int8_ptr: u64,
+    scales_ptr: u64,
+    kv_bf16_hnd_ptr: u64,
+    token_rows_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    total_tokens: usize,
+) -> Result<()> {
+    if total_tokens == 0 {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < total_tokens {
+        let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
+        let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dequantize_paged_kv_int8_to_hnd_cuda(
+                kv_int8_ptr as *const i8,
+                scales_ptr as *const f32,
+                kv_bf16_hnd_ptr as *mut ffi::Half,
+                rows_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
     }
     Ok(())
 }
@@ -524,22 +578,26 @@ pub fn quantize_paged_kv_single(
     if batch_size == 0 {
         return Ok(());
     }
-
-    let (nti_ptr, _gnti) = new_token_indices_gpu.device_ptr(&ctx.stream);
-
-    unsafe {
-        ffi::quantize_paged_kv_single_cuda(
-            kv_bf16_ptr as *const ffi::Half,
-            kv_int8_ptr as *mut i8,
-            kv_scales_ptr as *mut f32,
-            nti_ptr as *const i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            kv_dim as i32,
-            batch_size as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
+    let mut offset = 0usize;
+    while offset < batch_size {
+        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
+        let (nti_ptr, _gnti) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::quantize_paged_kv_single_cuda(
+                kv_bf16_ptr as *const ffi::Half,
+                kv_int8_ptr as *mut i8,
+                kv_scales_ptr as *mut f32,
+                nti_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
     }
 
     Ok(())

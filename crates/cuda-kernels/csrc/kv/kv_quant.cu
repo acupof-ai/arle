@@ -381,6 +381,54 @@ cudaError_t dequantize_paged_kv_fp8_to_hnd_cuda(
     return cudaGetLastError();
 }
 
+// Durable INT8 NHD → BF16 HND work-buffer refill for paged prefill.
+__global__ void dequantize_paged_kv_int8_to_hnd_kernel(
+    const int8_t* __restrict__ kv_int8,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ kv_bf16_hnd,
+    const int32_t* __restrict__ token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)
+{
+    int kv_head = blockIdx.x;
+    int tok_flat = blockIdx.y;
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    int token_row = token_rows[tok_flat];
+    constexpr int kPageSize = 16;
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int src_offset = token_row * kv_dim + kv_head * head_dim + d;
+    int scale_offset = token_row * num_kv_heads + kv_head;
+    int dst_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+    float val = static_cast<float>(kv_int8[src_offset]) * scales[scale_offset];
+    kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+}
+
+cudaError_t dequantize_paged_kv_int8_to_hnd_cuda(
+    const int8_t* kv_int8,
+    const float* scales,
+    __nv_bfloat16* kv_bf16_hnd,
+    const int32_t* token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim,
+    int total_tokens,
+    cudaStream_t stream)
+{
+    if (total_tokens <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, total_tokens);
+    dim3 block(head_dim);
+    dequantize_paged_kv_int8_to_hnd_kernel<<<grid, block, 0, stream>>>(
+        kv_int8, scales, kv_bf16_hnd, token_rows, num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
 // ============================================================================
 // Dequantize paged INT8 KV → bf16 working buffer (NHD paged layout).
 //
