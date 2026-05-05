@@ -19,7 +19,7 @@ use crate::{
         BackendArg, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs, DatasetFormatArg,
         ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg, TrainArgs, TrainCommand,
         TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs, TrainMultiTurnArgs,
-        TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
+        TrainPretrainArgs, TrainPretrainDsv4Args, TrainSftArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
 };
@@ -29,6 +29,7 @@ const TRAIN_ENV_COMMANDS: &[&str] = &[
     "train test",
     "train estimate-memory",
     "train pretrain",
+    "train pretrain-dsv4",
     "train sft",
     "train grpo",
     "train multi-turn",
@@ -43,6 +44,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::Test(args) => run_train_test(args),
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
         TrainCommand::Pretrain(args) => run_pretrain(args),
+        TrainCommand::PretrainDsv4(args) => run_pretrain_dsv4(args),
         TrainCommand::Sft(args) => run_sft(args),
         TrainCommand::Grpo(args) => run_grpo(args),
         TrainCommand::MultiTurn(args) => run_multi_turn(args),
@@ -210,6 +212,57 @@ fn run_pretrain(args: TrainPretrainArgs) -> ExitCode {
         &args.render,
         train::commands::pretrain::dispatch_from_args,
     )
+}
+
+fn run_pretrain_dsv4(args: TrainPretrainDsv4Args) -> ExitCode {
+    run_train_command(
+        "train pretrain-dsv4",
+        resolve_pretrain_dsv4_invocation(&args),
+        &args.render,
+        train::commands::pretrain_dsv4::dispatch_from_args,
+    )
+}
+
+fn resolve_pretrain_dsv4_invocation(args: &TrainPretrainDsv4Args) -> Result<ResolvedInvocation> {
+    let tokenizer_path = resolve_local_tokenizer_path(&args.tokenizer)?;
+    let out_dir = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_job_output("pretrain-dsv4", &args.corpus));
+
+    let mut argv = vec![
+        "--corpus".to_string(),
+        args.corpus.display().to_string(),
+        "--tokenizer".to_string(),
+        tokenizer_path.display().to_string(),
+        "--out".to_string(),
+        out_dir.display().to_string(),
+        "--deepseek-config".to_string(),
+        args.deepseek_config.clone(),
+    ];
+    if let Some(seed) = args.seed {
+        argv.push("--seed".to_string());
+        argv.push(seed.to_string());
+    }
+    argv.extend(args.extra.extra_args.iter().cloned());
+
+    let mut notes = Vec::new();
+    if args.out.is_none() {
+        notes.push("out omitted; defaulted under runs/pretrain-dsv4".to_string());
+    }
+    notes.push(format!("resolved tokenizer {}", tokenizer_path.display()));
+    notes.push(
+        "scaffold: train-side autograd DeepseekModel pending — see substrate plan §6".to_string(),
+    );
+
+    Ok(ResolvedInvocation {
+        command: "train pretrain-dsv4",
+        argv,
+        backend: None,
+        output_dir: Some(out_dir.display().to_string()),
+        model: None,
+        notes,
+    })
 }
 
 fn run_sft(args: TrainSftArgs) -> ExitCode {

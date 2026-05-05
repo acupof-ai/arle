@@ -10,6 +10,8 @@ pub mod download_dataset;
 pub mod eval_lm;
 #[path = "commands/pretrain.rs"]
 pub mod pretrain;
+#[path = "commands/pretrain_dsv4.rs"]
+pub mod pretrain_dsv4;
 #[path = "commands/train_grpo.rs"]
 pub mod train_grpo;
 #[path = "commands/train_multi_turn.rs"]

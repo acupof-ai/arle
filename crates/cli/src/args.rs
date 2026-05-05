@@ -360,6 +360,9 @@ pub(crate) enum TrainCommand {
     EstimateMemory(TrainEstimateMemoryArgs),
     /// Scratch pretraining from a plain-text corpus.
     Pretrain(TrainPretrainArgs),
+    /// Scratch DSV4-nano pretraining (scaffold; autograd model pending).
+    /// See docs/plans/2026-05-05-deepseek-v4-small-substrate.md §6.
+    PretrainDsv4(TrainPretrainDsv4Args),
     /// Supervised fine-tuning from canonical chat JSONL.
     Sft(TrainSftArgs),
     /// Group-relative policy optimization.
@@ -655,6 +658,45 @@ pub(crate) struct TrainPretrainArgs {
     /// Expose a small HTTP status endpoint on this port during training.
     #[arg(long)]
     pub(crate) serve: Option<u16>,
+
+    #[command(flatten)]
+    pub(crate) render: RenderArgs,
+
+    #[command(flatten)]
+    pub(crate) extra: ExtraArgs,
+}
+
+/// CLI args for `arle train pretrain-dsv4` — the DSV4 nano scaffold driver.
+///
+/// Scope intentionally narrow: only the arguments
+/// `train::commands::pretrain_dsv4::parse_args_from` consumes today. Once the
+/// train-side autograd `DeepseekModel` lands this struct grows to mirror
+/// `TrainPretrainArgs` (LR schedule, eval cadence, resume, etc.). See
+/// docs/plans/2026-05-05-deepseek-v4-small-substrate.md §6.
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Scaffold notice: the train-side autograd `DeepseekModel` is not yet wired. \nThis subcommand validates CLI parsing today and will execute training once the MLA prefill+decode kernels stabilize. See docs/plans/2026-05-05-deepseek-v4-small-substrate.md §6."
+)]
+pub(crate) struct TrainPretrainDsv4Args {
+    /// Plain-text training corpus.
+    #[arg(long)]
+    pub(crate) corpus: PathBuf,
+
+    /// Tokenizer source (`tokenizer.json` or a local model dir containing it).
+    #[arg(long)]
+    pub(crate) tokenizer: PathBuf,
+
+    /// Output checkpoint directory. Defaults to `runs/pretrain-dsv4/<corpus-stem>`.
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+
+    /// DSV4 SKU. Only `nano` is wired today.
+    #[arg(long, default_value = "nano")]
+    pub(crate) deepseek_config: String,
+
+    /// Random seed for the (eventual) trainer.
+    #[arg(long)]
+    pub(crate) seed: Option<u64>,
 
     #[command(flatten)]
     pub(crate) render: RenderArgs,

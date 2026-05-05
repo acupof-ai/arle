@@ -12,7 +12,11 @@ use cuda_kernels::prelude::{DeviceContext, PagedKVPool};
 
 /// Pre-allocated buffers for batched decode. Stub: kernel-shaped fields land
 /// alongside the MLA decode kernel.
-pub(super) struct DeepseekBatchDecodeBuffers;
+///
+/// Public so the `ModelForward::DecodeContext` associated type (a `pub`
+/// surface on the trait) does not leak a private name. Mirrors
+/// `qwen3::batch_decode::BatchDecodeBuffers` once kernels land.
+pub struct DeepseekBatchDecodeBuffers;
 
 impl DeepseekBatchDecodeBuffers {
     /// Allocate the decode context. Returns an empty marker until the MLA
