@@ -82,11 +82,12 @@ follow Triton's `out_name = triton_<kernel>_sm{sm}` and TileLang's
 `crates/cuda-kernels/build.rs`):
 
 ```bash
-# Triton: each public _aot_cuda symbol has 4 per-SM siblings (one extern per SM).
-nm target/release/infer | grep -E '\b(silu_mul_triton_aot_cuda|add_cuda)\b' | wc -l   # expect 2
-nm target/release/infer | grep triton_silu_mul_sm | sort                              # expect 4: sm80/86/89/90
-nm target/release/infer | grep triton_add_sm | sort                                   # expect 4
-nm target/release/infer | grep triton_flash_attention_prefill_hd256_sm | sort         # expect 4
+# Triton: only the 7-stage gated_delta_rule_chunkwise pipeline remains as live
+# Triton AOT post-Phase-0 (silu_mul / add / embedding / flash_attention_prefill_hd256
+# moved to native csrc or were dead — see commit 38d4d773).
+nm target/release/infer | grep -E '\b(silu_mul_triton_aot_cuda|add_cuda)\b' | wc -l                # expect 2 (csrc native symbols)
+nm target/release/infer | grep triton_gated_delta_rule_chunk_prepare_sm | sort                     # expect 4: sm80/86/89/90
+nm target/release/infer | grep -c triton_gated_delta_rule_                                         # expect 35: 7 dispatch + 28 per-SM
 
 # TileLang (canonical `cuda,tilelang-attn` build — HD256 decode is GATED behind
 # the separate `tilelang-decode-hd256` feature and not part of this expansion):

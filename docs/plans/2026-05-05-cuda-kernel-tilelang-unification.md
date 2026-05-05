@@ -173,16 +173,30 @@ the live path; only Triton scaffolding is dead).
 
 ## Section 3 — Phased plan (risk-ascending)
 
-### Phase 0 — Triton scaffolding deletion (zero-risk)
+### Phase 0 — Triton scaffolding deletion (zero-risk) **— LANDED `38d4d773` (2026-05-05)**
 
-**Scope:** delete the 4 dead Triton entries from build.rs + corresponding `.py` files + the `flash_attention_prefill_hd256_cuda` extern decl.
+**Final scope (extended after Round 3 codex review):** delete 5 dead Triton spec
+blocks from build.rs (`silu_mul`, `add`, `embedding_decode`, `embedding_batched`,
+`flash_attn_prefill_hd256`) — all 5 had csrc native replacements at
+`csrc/misc/elementwise_basic.cu` keeping the same C ABI symbols, OR had zero
+runtime callers. The original 4-spec scope exposed a multiple-definition link
+error on `silu_mul_triton_aot_cuda` (Round 3 verdict); silu was added to scope
+to resolve. Live Triton AOT pipeline reduces to the 7-stage
+`gated_delta_rule_chunkwise` Qwen3.5 hybrid kernels.
 
-**Files (~8):** `build.rs`, `tools/triton/basic_kernels.py`,
-`tools/triton/flash_attention_prefill_hd256_kernel.py`,
-`ffi/attention.rs`, `crates/cuda-kernels/AGENTS.md`.
+**Files actually changed (8):** `crates/cuda-kernels/build.rs` (-104 lines),
+`crates/cuda-kernels/src/ffi/attention.rs` (-14), `csrc/attention/prefill_attention.cu`
+(prose), `crates/cuda-kernels/AGENTS.md` (prose), and 4 `.py` deletes in
+`tools/triton/`: `basic_kernels.py`, `silu_mul_kernel.py`,
+`gen_silu_mul_aot.py`, `flash_attention_prefill_hd256_kernel.py`.
 
-**Gate:** `cargo test --release` (CPU) green; one regression-check
-guidellm run vs Qwen3-4B baseline within noise.
+**Verification:** Round 1 self-review PASS, Round 2 `cargo check
+--no-default-features --features no-cuda` PASS in 30s, Round 3 `codex review
+--uncommitted` (with full release CUDA cargo build) initially CAUGHT the silu
+collision; post-fix re-review PASS on no-cuda check; Round 4 codex@0 peer
+review PASS on code structure (REQUEST_CHANGES on stale docs only — addressed
+in follow-up commit). Bench: marked `pending-remote` regression-check at
+`docs/experience/wins/2026-05-05-bench-tilelang-phase0-pending-remote.md`.
 
 **Sequencing:** independent — runs in parallel with codex@2:0 W4 H5 work.
 

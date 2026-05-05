@@ -47,7 +47,7 @@
 - `csrc/attention/fused_attention.cu`
 - `csrc/misc/fused_mlp.cu`
 - `csrc/misc/conv1d.cu`
-- `tools/triton/flash_attention_prefill_hd256_kernel.py`
+- `tools/triton/flash_attention_prefill_hd256_kernel.py` *(historical — deleted in Phase 0, commit 38d4d773; superseded by FlashInfer + TileLang HD256 paths)*
 - `tools/triton/gated_delta_rule_chunkwise_kernels.py`
 
 这些 kernel 对 TTFT 和长 prompt 更敏感，但不是当前 decode 吞吐的第一瓶颈。
