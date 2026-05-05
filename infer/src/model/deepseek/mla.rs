@@ -48,6 +48,16 @@ pub(super) struct MlaAttention {
 
 #[cfg(feature = "cuda")]
 impl MlaAttention {
+    /// True when the loader chose the direct-Q path (`q_lora_rank == None`).
+    pub(super) fn uses_direct_q(&self) -> bool {
+        self.q_proj.is_some()
+    }
+
+    /// True when the loader chose the LoRA-Q path (`q_lora_rank == Some(_)`).
+    pub(super) fn uses_lora_q(&self) -> bool {
+        self.q_a_proj.is_some()
+    }
+
     /// Run MLA prefill for a packed `[seq, hidden]` row block.
     ///
     /// Stub until the MLA prefill kernel lands. The `_` prefixes silence
