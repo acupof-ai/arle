@@ -11,6 +11,13 @@ use super::ffi;
 use super::paged_kv::PagedKVPool;
 use super::tensor::DeviceContext;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeMetaUpdate {
+    Full,
+    SamePages,
+    AppendedPages,
+}
+
 /// GPU-side metadata buffers for FlashInfer batched decode attention.
 ///
 /// Manages positions, KV indptr/indices/last_page_len arrays, the FlashInfer
@@ -20,6 +27,9 @@ pub struct FlashInferDecodeMetadata {
     pub kv_indices: CudaSlice<i32>,
     pub kv_indptr: CudaSlice<i32>,
     pub kv_last_page_len: CudaSlice<i32>,
+    prev_kv_indptr: CudaSlice<i32>,
+    append_indptr: CudaSlice<i32>,
+    appended_page_indices: CudaSlice<i32>,
     /// Q indptr for tensor-core paged attention.
     ///
     /// Decode-only steps use `[0, 1, 2, ..., B]` (1 Q row per request).
@@ -32,6 +42,10 @@ pub struct FlashInferDecodeMetadata {
     positions_scratch: Vec<i32>,
     /// Scratch buffer for KV index H2D.
     indices_scratch: Vec<i32>,
+    indptr_build_scratch: Vec<i32>,
+    last_page_lens_scratch: Vec<i32>,
+    append_indptr_h: Vec<i32>,
+    appended_page_scratch: Vec<i32>,
     /// Cached host-side indptr from last `update()`, reused by `plan()`.
     /// Public so callers (e.g. TileLang TC decode dispatch) can read the
     /// total page count from the last entry without round-tripping through
@@ -54,6 +68,7 @@ pub struct FlashInferDecodeMetadata {
     plan_batch_size: usize,
     /// Whether the plan needs to be re-run (batch composition changed).
     plan_dirty: bool,
+    fast_page16_metadata: bool,
 }
 
 /// Workspace buffers for FlashInfer batch decode, allocated once and reused.
@@ -109,6 +124,13 @@ fn free_host_buffer(ptr: &mut *mut u8) {
         }
         *ptr = std::ptr::null_mut();
     }
+}
+
+fn decode_metadata_fast_page16_enabled() -> bool {
+    matches!(
+        std::env::var("INFER_DECODE_METADATA_FAST_PAGE16").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on")
+    )
 }
 
 pub struct PlanBuf {
@@ -718,6 +740,9 @@ impl FlashInferDecodeMetadata {
             .saturating_add(max_total_pages.max(1).saturating_mul(i32_bytes)) // kv_indices
             .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // kv_indptr
             .saturating_add(max_batch_size.saturating_mul(i32_bytes)) // kv_last_page_len
+            .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // prev_kv_indptr
+            .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // append_indptr
+            .saturating_add(max_batch_size.max(1).saturating_mul(i32_bytes)) // appended_page_indices
             .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // qo_indptr
             .saturating_add(max_batch_size.saturating_mul(i32_bytes)) // last_token_indices
     }
@@ -751,6 +776,18 @@ impl FlashInferDecodeMetadata {
                 .stream
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc kv_last_page_len failed: {e}"))?,
+            prev_kv_indptr: ctx
+                .stream
+                .alloc_zeros(max_batch_size + 1)
+                .map_err(|e| anyhow::anyhow!("Alloc prev_kv_indptr failed: {e}"))?,
+            append_indptr: ctx
+                .stream
+                .alloc_zeros(max_batch_size + 1)
+                .map_err(|e| anyhow::anyhow!("Alloc append_indptr failed: {e}"))?,
+            appended_page_indices: ctx
+                .stream
+                .alloc_zeros(max_batch_size.max(1))
+                .map_err(|e| anyhow::anyhow!("Alloc appended_page_indices failed: {e}"))?,
             qo_indptr,
             flashinfer_ws: FlashInferWorkspace::new_with_float_bytes(
                 ctx,
@@ -761,6 +798,10 @@ impl FlashInferDecodeMetadata {
             max_total_pages,
             positions_scratch: Vec::with_capacity(max_batch_size),
             indices_scratch: Vec::with_capacity(max_total_pages.max(1)),
+            indptr_build_scratch: Vec::with_capacity(max_batch_size + 1),
+            last_page_lens_scratch: Vec::with_capacity(max_batch_size),
+            append_indptr_h: Vec::with_capacity(max_batch_size + 1),
+            appended_page_scratch: Vec::with_capacity(max_batch_size),
             indptr_h: Vec::with_capacity(max_batch_size + 1),
             prev_slot_indices: Vec::with_capacity(max_batch_size),
             prev_slot_epochs: Vec::with_capacity(max_batch_size),
@@ -773,24 +814,26 @@ impl FlashInferDecodeMetadata {
             total_tokens: 0,
             plan_batch_size: 0,
             plan_dirty: true,
+            fast_page16_metadata: decode_metadata_fast_page16_enabled(),
         })
     }
 
     /// Upload metadata (positions, indptr, last_page_len, KV indices) to GPU.
     ///
-    /// Returns `true` if the kv_indices GPU buffer was reallocated (caller
-    /// should invalidate any CUDA graph that captured the old pointer).
+    /// Returns whether the kv_indices GPU buffer was reallocated and which
+    /// metadata path was used.
     pub fn update(
         &mut self,
         ctx: &DeviceContext,
         pool: &PagedKVPool,
         slot_indices: &[usize],
-    ) -> Result<bool> {
+    ) -> Result<(bool, DecodeMetaUpdate)> {
         let slot_epochs: Vec<u64> = slot_indices
             .iter()
             .map(|&slot| pool.slot_epoch(slot))
             .collect();
-        let next_indptr_h = pool.build_indptr(slot_indices);
+        let mut next_indptr_h = std::mem::take(&mut self.indptr_build_scratch);
+        pool.fill_indptr(slot_indices, &mut next_indptr_h);
         let page_size = pool.page_size;
         let same_batch_identity =
             self.prev_slot_indices == slot_indices && self.prev_slot_epochs == slot_epochs;
@@ -807,7 +850,7 @@ impl FlashInferDecodeMetadata {
                 && self.plan_batch_size == slot_indices.len()
                 && self.indptr_h == next_indptr_h
         };
-        let last_page_lens_h = pool.build_last_page_lens(slot_indices);
+        pool.fill_last_page_lens(slot_indices, &mut self.last_page_lens_scratch);
 
         // Build positions (each request's current sequence position).
         self.positions_scratch.clear();
@@ -823,7 +866,7 @@ impl FlashInferDecodeMetadata {
             .memcpy_htod(&self.indptr_h, &mut self.kv_indptr)
             .map_err(|e| anyhow::anyhow!("H2D indptr: {e}"))?;
         ctx.stream
-            .memcpy_htod(&last_page_lens_h, &mut self.kv_last_page_len)
+            .memcpy_htod(&self.last_page_lens_scratch, &mut self.kv_last_page_len)
             .map_err(|e| anyhow::anyhow!("H2D last_page_len: {e}"))?;
         self.qo_indptr_h.clear();
         self.qo_indptr_h.extend(0..=slot_indices.len() as i32);
@@ -842,20 +885,63 @@ impl FlashInferDecodeMetadata {
         self.last_token_scratch
             .extend(pool.build_last_indices(slot_indices));
 
-        let use_gpu_incremental_update =
-            can_incremental_update && new_total <= self.max_total_pages;
-        if can_incremental_update {
-            append_last_token_indices_in_place(
-                &mut self.indices_scratch,
-                &prev_indptr_h,
-                &self.indptr_h,
-                &self.last_token_scratch,
-            );
-        } else {
-            self.indices_scratch.clear();
-            self.indices_scratch.extend(flatten_page_indices(
-                slot_indices.iter().map(|&slot| pool.page_indices(slot)),
-            ));
+        let mut mode = DecodeMetaUpdate::Full;
+        if self.fast_page16_metadata
+            && page_size == 16
+            && same_batch_identity
+            && self.indices_scratch.len() == self.total_tokens
+            && prev_indptr_h.last().copied().unwrap_or_default() as usize == self.total_tokens
+        {
+            if self.indptr_h == prev_indptr_h
+                && page_tables_match_cached(
+                    pool,
+                    slot_indices,
+                    &prev_indptr_h,
+                    &self.indices_scratch,
+                )
+            {
+                mode = DecodeMetaUpdate::SamePages;
+            } else if can_append_pages_step(&prev_indptr_h, &self.indptr_h)
+                && collect_appended_page_indices(
+                    pool,
+                    slot_indices,
+                    &prev_indptr_h,
+                    &self.indptr_h,
+                    &self.indices_scratch,
+                    &mut self.append_indptr_h,
+                    &mut self.appended_page_scratch,
+                )
+            {
+                mode = DecodeMetaUpdate::AppendedPages;
+            }
+        }
+
+        match mode {
+            DecodeMetaUpdate::SamePages => {}
+            DecodeMetaUpdate::AppendedPages => {
+                append_new_page_indices_in_place(
+                    &mut self.indices_scratch,
+                    &prev_indptr_h,
+                    &self.indptr_h,
+                    &self.append_indptr_h,
+                    &self.appended_page_scratch,
+                );
+            }
+            DecodeMetaUpdate::Full => {
+                if can_incremental_update {
+                    append_last_token_indices_in_place(
+                        &mut self.indices_scratch,
+                        &prev_indptr_h,
+                        &self.indptr_h,
+                        &self.last_token_scratch,
+                    );
+                } else {
+                    self.indices_scratch.clear();
+                    self.indices_scratch.extend(flatten_page_indices(
+                        slot_indices.iter().map(|&slot| pool.page_indices(slot)),
+                    ));
+                }
+            }
         }
         if self.indices_scratch.len() > self.max_total_pages {
             self.kv_indices = ctx
@@ -870,24 +956,45 @@ impl FlashInferDecodeMetadata {
         ctx.stream
             .memcpy_htod(&self.last_token_scratch, &mut self.last_token_indices)
             .map_err(|e| anyhow::anyhow!("H2D last_token_indices: {e}"))?;
-        if use_gpu_incremental_update && !reallocated {
-            let (indices_ptr, _gidx) = self.kv_indices.device_ptr_mut(&ctx.stream);
-            let (indptr_ptr, _gindptr) = self.kv_indptr.device_ptr(&ctx.stream);
-            let (last_ptr, _glast) = self.last_token_indices.device_ptr(&ctx.stream);
-            unsafe {
-                ffi::flashinfer_append_last_token_indices_cuda(
-                    indices_ptr as *mut i32,
-                    indptr_ptr as *const i32,
-                    last_ptr as *const i32,
-                    slot_indices.len() as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+        match mode {
+            DecodeMetaUpdate::SamePages => {}
+            DecodeMetaUpdate::AppendedPages if !reallocated => {
+                append_new_page_indices_kernel(
+                    ctx,
+                    &mut self.kv_indices,
+                    &mut self.prev_kv_indptr,
+                    &self.kv_indptr,
+                    &mut self.append_indptr,
+                    &mut self.appended_page_indices,
+                    &prev_indptr_h,
+                    &self.append_indptr_h,
+                    &self.appended_page_scratch,
+                    slot_indices.len(),
+                )?;
             }
-        } else {
-            ctx.stream
-                .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
-                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+            _ => {
+                let use_gpu_incremental_update =
+                    can_incremental_update && new_total <= self.max_total_pages;
+                if use_gpu_incremental_update && !reallocated {
+                    let (indices_ptr, _gidx) = self.kv_indices.device_ptr_mut(&ctx.stream);
+                    let (indptr_ptr, _gindptr) = self.kv_indptr.device_ptr(&ctx.stream);
+                    let (last_ptr, _glast) = self.last_token_indices.device_ptr(&ctx.stream);
+                    unsafe {
+                        ffi::flashinfer_append_last_token_indices_cuda(
+                            indices_ptr as *mut i32,
+                            indptr_ptr as *const i32,
+                            last_ptr as *const i32,
+                            slot_indices.len() as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                } else {
+                    ctx.stream
+                        .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
+                        .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+                }
+            }
         }
         self.total_tokens = new_total;
 
@@ -900,8 +1007,9 @@ impl FlashInferDecodeMetadata {
         self.prev_slot_indices.extend_from_slice(slot_indices);
         self.prev_slot_epochs.clear();
         self.prev_slot_epochs.extend_from_slice(&slot_epochs);
+        self.indptr_build_scratch = prev_indptr_h;
 
-        Ok(reallocated)
+        Ok((reallocated, mode))
     }
 
     /// Upload metadata for one sparse-KV decode row.
@@ -1232,6 +1340,100 @@ fn can_append_decode_step(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {
         .all(|(prev, next)| (next[1] - next[0]) == (prev[1] - prev[0]) + 1)
 }
 
+fn can_append_pages_step(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {
+    if prev_indptr.len() != next_indptr.len() || prev_indptr.len() < 2 {
+        return false;
+    }
+
+    let mut appended_any = false;
+    for (prev, next) in prev_indptr.windows(2).zip(next_indptr.windows(2)) {
+        let prev_len = prev[1] - prev[0];
+        let next_len = next[1] - next[0];
+        if next_len < prev_len || next_len > prev_len + 1 {
+            return false;
+        }
+        appended_any |= next_len > prev_len;
+    }
+    appended_any
+}
+
+fn page_tables_match_cached(
+    pool: &PagedKVPool,
+    slots: &[usize],
+    indptr: &[i32],
+    cached_indices: &[i32],
+) -> bool {
+    if indptr.len() != slots.len() + 1 {
+        return false;
+    }
+    for (i, &slot) in slots.iter().enumerate() {
+        let start = indptr[i] as usize;
+        let end = indptr[i + 1] as usize;
+        let pages = pool.page_indices(slot);
+        if end < start || pages.len() != end - start || cached_indices.len() < end {
+            return false;
+        }
+        if pages
+            .iter()
+            .zip(&cached_indices[start..end])
+            .any(|(&page, &cached)| page as i32 != cached)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_appended_page_indices(
+    pool: &PagedKVPool,
+    slots: &[usize],
+    prev_indptr: &[i32],
+    next_indptr: &[i32],
+    cached_indices: &[i32],
+    append_indptr: &mut Vec<i32>,
+    appended_pages: &mut Vec<i32>,
+) -> bool {
+    if prev_indptr.len() != slots.len() + 1 || next_indptr.len() != slots.len() + 1 {
+        return false;
+    }
+
+    append_indptr.clear();
+    append_indptr.push(0);
+    appended_pages.clear();
+    for (i, &slot) in slots.iter().enumerate() {
+        let old_start = prev_indptr[i] as usize;
+        let old_end = prev_indptr[i + 1] as usize;
+        let new_start = next_indptr[i] as usize;
+        let new_end = next_indptr[i + 1] as usize;
+        if old_end < old_start || new_end < new_start || cached_indices.len() < old_end {
+            return false;
+        }
+
+        let old_len = old_end - old_start;
+        let new_len = new_end - new_start;
+        if new_len < old_len || new_len > old_len + 1 {
+            return false;
+        }
+
+        let pages = pool.page_indices(slot);
+        if pages.len() != new_len {
+            return false;
+        }
+        if pages[..old_len]
+            .iter()
+            .zip(&cached_indices[old_start..old_end])
+            .any(|(&page, &cached)| page as i32 != cached)
+        {
+            return false;
+        }
+        if new_len > old_len {
+            appended_pages.push(pages[new_len - 1] as i32);
+        }
+        append_indptr.push(appended_pages.len() as i32);
+    }
+    !appended_pages.is_empty()
+}
+
 fn append_last_token_indices_in_place(
     indices_scratch: &mut Vec<i32>,
     prev_indptr: &[i32],
@@ -1259,6 +1461,88 @@ fn append_last_token_indices_in_place(
     }
 }
 
+fn append_new_page_indices_in_place(
+    indices_scratch: &mut Vec<i32>,
+    prev_indptr: &[i32],
+    next_indptr: &[i32],
+    append_indptr: &[i32],
+    appended_page_indices: &[i32],
+) {
+    if next_indptr.is_empty() {
+        indices_scratch.clear();
+        return;
+    }
+
+    let new_total = *next_indptr
+        .last()
+        .expect("invariant: next_indptr always has at least one element")
+        as usize;
+    indices_scratch.resize(new_total, 0);
+
+    for i in (0..append_indptr.len().saturating_sub(1)).rev() {
+        let old_start = prev_indptr[i] as usize;
+        let old_end = prev_indptr[i + 1] as usize;
+        let new_start = next_indptr[i] as usize;
+        let new_end = next_indptr[i + 1] as usize;
+        let append_start = append_indptr[i] as usize;
+        let append_end = append_indptr[i + 1] as usize;
+        let append_count = append_end - append_start;
+
+        indices_scratch.copy_within(old_start..old_end, new_start);
+        if append_count > 0 {
+            let dst_start = new_end - append_count;
+            indices_scratch[dst_start..new_end]
+                .copy_from_slice(&appended_page_indices[append_start..append_end]);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_new_page_indices_kernel(
+    ctx: &DeviceContext,
+    kv_indices: &mut CudaSlice<i32>,
+    prev_kv_indptr: &mut CudaSlice<i32>,
+    next_kv_indptr: &CudaSlice<i32>,
+    append_indptr: &mut CudaSlice<i32>,
+    appended_page_indices: &mut CudaSlice<i32>,
+    prev_indptr_h: &[i32],
+    append_indptr_h: &[i32],
+    appended_pages_h: &[i32],
+    batch_size: usize,
+) -> Result<()> {
+    ctx.stream
+        .memcpy_htod(prev_indptr_h, prev_kv_indptr)
+        .map_err(|e| anyhow::anyhow!("H2D prev_kv_indptr: {e}"))?;
+    ctx.stream
+        .memcpy_htod(append_indptr_h, append_indptr)
+        .map_err(|e| anyhow::anyhow!("H2D append_indptr: {e}"))?;
+    if !appended_pages_h.is_empty() {
+        let mut appended_view = appended_page_indices.slice_mut(..appended_pages_h.len());
+        ctx.stream
+            .memcpy_htod(appended_pages_h, &mut appended_view)
+            .map_err(|e| anyhow::anyhow!("H2D appended_page_indices: {e}"))?;
+    }
+
+    let (indices_ptr, _gidx) = kv_indices.device_ptr_mut(&ctx.stream);
+    let (prev_indptr_ptr, _gprev) = prev_kv_indptr.device_ptr(&ctx.stream);
+    let (next_indptr_ptr, _gnext) = next_kv_indptr.device_ptr(&ctx.stream);
+    let (append_indptr_ptr, _gappend) = append_indptr.device_ptr(&ctx.stream);
+    let (appended_ptr, _gappended) = appended_page_indices.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::flashinfer_append_new_page_indices_cuda(
+            indices_ptr as *mut i32,
+            prev_indptr_ptr as *const i32,
+            next_indptr_ptr as *const i32,
+            append_indptr_ptr as *const i32,
+            appended_ptr as *const i32,
+            batch_size as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 fn can_reuse_decode_plan(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {
     can_append_decode_step(prev_indptr, next_indptr)
 }
@@ -1266,8 +1550,8 @@ fn can_reuse_decode_plan(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_last_token_indices_in_place, can_append_decode_step, can_reuse_decode_plan,
-        flatten_page_indices,
+        append_last_token_indices_in_place, append_new_page_indices_in_place,
+        can_append_decode_step, can_append_pages_step, can_reuse_decode_plan, flatten_page_indices,
     };
 
     #[test]
@@ -1307,5 +1591,26 @@ mod tests {
         assert!(can_append_decode_step(&[0, 2, 5], &[0, 3, 7]));
         assert!(!can_append_decode_step(&[0, 2, 5], &[0, 2, 6]));
         assert!(!can_append_decode_step(&[0, 2, 5], &[0, 4, 6]));
+    }
+
+    #[test]
+    fn append_pages_step_allows_sparse_page_growth() {
+        assert!(can_append_pages_step(&[0, 2, 5, 6], &[0, 2, 6, 7]));
+        assert!(can_append_pages_step(&[0, 2, 5, 6], &[0, 3, 6, 7]));
+        assert!(!can_append_pages_step(&[0, 2, 5, 6], &[0, 2, 5, 6]));
+        assert!(!can_append_pages_step(&[0, 2, 5, 6], &[0, 4, 7, 8]));
+    }
+
+    #[test]
+    fn appended_page_indices_shift_suffixes_in_place() {
+        let mut scratch = vec![10, 11, 20, 21, 22, 30];
+        append_new_page_indices_in_place(
+            &mut scratch,
+            &[0, 2, 5, 6],
+            &[0, 2, 6, 8],
+            &[0, 0, 1, 2],
+            &[23, 31],
+        );
+        assert_eq!(scratch, vec![10, 11, 20, 21, 22, 23, 30, 31]);
     }
 }
