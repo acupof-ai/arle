@@ -1,10 +1,10 @@
 //! Host pinned pool for the tiered KV cache T1 tier.
 //!
-//! The backing storage now lives in `kv-native-sys` as a Zig-managed,
-//! allocation-stable host arena. Rust keeps the existing safe wrapper shape
-//! (`HostPinnedRegion`, `SharedHostPinnedPool`) and, on the CUDA lane, pins the
-//! arena once with `cuMemHostRegister_v2` so scheduler/coordinator call sites do
-//! not need to change.
+//! The backing storage lives in `kv-native-sys` as an allocation-stable host
+//! arena. Rust keeps the existing safe wrapper shape (`HostPinnedRegion`,
+//! `SharedHostPinnedPool`) and, on the CUDA lane, pins the arena once with
+//! `cuMemHostRegister_v2` so scheduler/coordinator call sites do not need to
+//! change.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -45,7 +45,7 @@ impl SharedHostPinnedPool {
     /// **Poison policy: propagate as `anyhow!`, do not auto-recover.**
     ///
     /// A poisoned mutex means a previous holder panicked mid-operation, which
-    /// for the host pinned pool can leave the Zig arena's free-list / live-set
+    /// for the host pinned pool can leave the arena's free-list / live-set
     /// in an inconsistent state (e.g. a `reserve` that bumped the bump pointer
     /// but never inserted into `live_regions`, or a `release` that ran the
     /// native call but never updated the Rust-side mirror). Continuing past
@@ -138,8 +138,8 @@ struct NativeArena {
 /// Allocation-stable host pool.
 ///
 /// The arena is created once, never moves, and is internally sub-allocated by
-/// the Zig substrate. Rust exposes typed regions and slice views over that
-/// single stable base pointer.
+/// `kv-native-sys`. Rust exposes typed regions and slice views over that single
+/// stable base pointer.
 #[derive(Debug)]
 pub struct HostPinnedPool {
     capacity_bytes: usize,

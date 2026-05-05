@@ -1153,14 +1153,14 @@ mod tests {
     }
 
     #[test]
-    fn read_block_owned_roundtrips_payload_via_zig_owned_buffer() {
+    fn read_block_owned_roundtrips_payload_via_owning_guard() {
         let dir = tempdir().unwrap();
         let fp = [0xC7u8; 16];
         let payload = b"payload-bytes-for-owned-roundtrip-test";
         write_block_atomic(dir.path(), fp, payload).unwrap();
 
         // The owning guard should expose the same bytes as `read_block` and
-        // free the Zig-allocated buffer on Drop without panicking.
+        // drop its backing buffer cleanly without panicking.
         let owned = read_block_owned(dir.path(), fp).unwrap();
         assert_eq!(owned.as_slice(), payload);
         assert_eq!(owned.len(), payload.len());
