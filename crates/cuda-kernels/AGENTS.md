@@ -32,7 +32,7 @@ crates/cuda-kernels/
 ├── build.rs             — SM auto-detection, Triton AOT, CUDA C compile, FlashInfer link
 ├── csrc/                — CUDA C sources, grouped by concern
 │   ├── common.cuh       — shared header (include with `#include "common.cuh"`)
-│   ├── attention/       — FlashInfer prefill/decode, Triton decode, turboquant decode, varlen FP8 split-KV (P0)
+│   ├── attention/       — FlashInfer prefill/decode, turboquant decode, varlen FP8 split-KV (P0)
 │   ├── gemm/            — gemv, Marlin W4, quantized gemv, turboquant weight gemv
 │   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_append, scatter_kv
 │   ├── quant/           — weight quant kernels

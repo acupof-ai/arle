@@ -73,21 +73,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub fn flash_attention_prefill_hd256_cuda(
-        Q: *const Half,
-        K_cache: *const Half,
-        V_cache: *const Half,
-        Output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        gqa_ratio: i32,
-        seq_len: i32,
-        start_pos_ptr: *const i32,
-        max_seq_len: i32,
-        q_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn prefill_attention_hd256_prep_cuda(
         q_full_batch: *const Half,
         k_batch: *const Half,
