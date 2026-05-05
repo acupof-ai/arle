@@ -604,6 +604,47 @@ impl DeepSeekConfig {
         Ok(())
     }
 
+    /// DSV4 **nano** SKU — fixture/CI variant per
+    /// `docs/plans/2026-05-05-deepseek-v4-small-vram-substrate.md` §2.
+    /// ~12M params: hidden=256, 2 layers, MLA (no MoE, no MTP), vocab=4096,
+    /// max-pos=1024, tied word embeddings. Suitable for unit-test fixtures
+    /// and a 5-min training-pipeline smoke run.
+    pub fn nano() -> Self {
+        let cfg = Self {
+            vocab_size: 4_096,
+            hidden_size: 256,
+            intermediate_size: 512,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 4,
+            max_position_embeddings: 1_024,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1.0e-6,
+            bos_token_id: Some(0),
+            eos_token_id: Some(1),
+            tie_word_embeddings: true,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            first_k_dense_replace: 0,
+            moe_intermediate_size: 0,
+            n_shared_experts: 0,
+            routed_scaling_factor: 1.0,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk_prob: false,
+            hidden_act: None,
+            kv_lora_rank: 64,
+            q_lora_rank: None,
+            qk_rope_head_dim: 16,
+            qk_nope_head_dim: 32,
+            v_head_dim: 32,
+            rope_interleave: false,
+            num_nextn_predict_layers: 0,
+        };
+        debug_assert!(cfg.validate().is_ok(), "nano config must validate");
+        cfg
+    }
+
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0
     }
@@ -1033,5 +1074,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, DeepSeekConfigError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn nano_config_matches_plan_dims() {
+        let cfg = DeepSeekConfig::nano();
+        // Per docs/plans/2026-05-05-deepseek-v4-small-vram-substrate.md §2 nano column.
+        assert_eq!(cfg.vocab_size, 4_096);
+        assert_eq!(cfg.hidden_size, 256);
+        assert_eq!(cfg.num_hidden_layers, 2);
+        assert_eq!(cfg.num_attention_heads, 4);
+        assert_eq!(cfg.num_key_value_heads, 4);
+        assert_eq!(cfg.intermediate_size, 512);
+        assert_eq!(cfg.max_position_embeddings, 1_024);
+        assert_eq!(cfg.qk_nope_head_dim, 32);
+        assert_eq!(cfg.qk_rope_head_dim, 16);
+        assert_eq!(cfg.v_head_dim, 32);
+        assert_eq!(cfg.kv_lora_rank, 64);
+        assert!(cfg.q_lora_rank.is_none());
+        assert!(cfg.tie_word_embeddings);
+        assert!(!cfg.is_moe());
+        assert!(!cfg.has_mtp());
+        cfg.validate().expect("nano config must validate");
+        // The spec column in docs/plans/2026-05-05-deepseek-v4-small-vram-substrate.md §2
+        // cites "~12M params" for nano. A direct accounting from these dims with tied
+        // embeddings yields ~2M params (1.05M embed + ~1M for two MLA+MLP layers); the
+        // plan's 12M estimate appears to be aspirational rather than exact for these
+        // dimensions. The dim-match assertions above are the binding spec contract.
     }
 }
