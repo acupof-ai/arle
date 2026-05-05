@@ -4,7 +4,7 @@ Hierarchical KV cache shape: T0 GPU HBM → T1 host pinned DRAM → T2 NVMe →
 T3 remote (shared-fs today; NIXL/Mooncake/UCX later). **Status: partially
 live on the CUDA lane** — the scheduler now uses `prefix_cache + paged_kv +
 HostPinnedPool + Coordinator + DiskStore/SharedFsStore` for one unified local
-path: direct GPU prefix attachment and decode-time COW on T0, Zig-backed spill
+path: direct GPU prefix attachment and decode-time COW on T0, host-arena spill
 buffering on T1, staged readmission (`host/disk/shared-fs -> host -> T0`),
 T1→T2 persistence, and a live `ServerMetrics` surface for coordinator
 fetch/store queue depth, waiters, backpressure, and cancellation. Only the
@@ -24,7 +24,7 @@ Load this file before editing anything under `kv_tier/`, and re-read
 | Tier | Medium            | Latency  | Status in this module |
 |------|-------------------|----------|-----------------------|
 | T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/cuda-kernels/src/paged_kv.rs`. |
-| T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into Zig-backed `host_pool.rs`, and staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
+| T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into the `kv-native-sys` host arena via `host_pool.rs`, and staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
 | T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill/persist, session restore plumbing, and local staged readmission (`disk -> host -> T0`) |
 | T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` via `rdma-nixl` (stub) or `rdma-nixl-real`. |
 
@@ -43,9 +43,9 @@ kv_tier/lookup.rs       — HitKind / LookupBlock / LookupOutcome / LookupHeuris
 kv_tier/policy.rs       — PrefetchPolicy / WritePolicy enums (BestEffort vs WaitComplete; WriteThroughSelective vs WriteBack). The scheduler-side wiring lives in `scheduler/cuda/policy.rs`; this file owns the policy enums themselves so coordinator + scheduler agree on shape.
 kv_tier/readmission.rs  — ReadmissionPlan / ReadmissionSource / dedupe keys
 kv_tier/tier.rs         — Tier enum, BlockLocation, RemoteBlockDesc, TransportId, MemKind
-kv_tier/host_pool.rs    — HostPinnedPool, HostPinnedRegion (thin Rust wrapper over the Zig host arena)
+kv_tier/host_pool.rs    — HostPinnedPool, HostPinnedRegion (Rust wrapper over the `kv-native-sys` native host arena)
 kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
-kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store + future descriptor substrate)
+kv_tier/transport/disk.rs       — DiskStore (Rust adapter over the `kv-native-sys` native object store + descriptor substrate)
 kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing; future P0' NVLink peer hop)
 kv_tier/transport/nixl.rs       — NixlTransport remote-tier surface, compiled via `rdma-nixl` (stub) or `rdma-nixl-real`
 kv_tier/transport/shared_fs.rs  — SharedFsStore: shared-filesystem remote backend (POSIX-visible mount), used as the M4-era cluster-shared transport while RDMA work lands

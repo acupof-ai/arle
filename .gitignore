@@ -26,7 +26,8 @@ web/node_modules/
 web/dist/
 web/.astro/
 
-# repo-local toolchains (zig managed by setup.sh / scripts/setup_zig_toolchain.sh)
+# repo-local toolchains (legacy slot — kept ignored even though no toolchain
+# currently lands here, so a stray repo-local install never trips git status).
 /.toolchains/
 
 # codex CLI per-session artifact (codex review --uncommitted writes a 0-byte .codex)

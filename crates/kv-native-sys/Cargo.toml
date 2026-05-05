@@ -10,8 +10,6 @@ libc = "0.2"
 memmap2 = { workspace = true }
 nix = { version = "0.31", features = ["fs", "mman"] }
 
-[build-dependencies]
-
 [dev-dependencies]
 tempfile = "3"
 

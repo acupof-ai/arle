@@ -22,7 +22,7 @@ Backend bridges and kernel layer:
   for the proto-API / prelude discipline.
 - `mlx-sys`: MLX C++ bridge and vendored MLX Metal qmv kernels used by the
   Metal backend
-- `kv-native-sys`: local persistence substrate (Zig) for the `infer/src/kv_tier/`
+- `kv-native-sys`: pure-Rust persistence substrate for the `infer/src/kv_tier/`
   disk and shared-memory transport paths
 
 Shared model contract:

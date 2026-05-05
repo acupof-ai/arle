@@ -3,7 +3,7 @@
 # ARLE — reproducible dev environment setup
 #
 # Usage:
-#   ./setup.sh              # Full setup: Linux/CUDA toolchain + Zig + venv + build + model
+#   ./setup.sh              # Full setup: Linux/CUDA toolchain + venv + build + model
 #   ./setup.sh --full       # Alias for the default full setup
 #   ./setup.sh --deps-only  # Toolchains + venv only, no build/model
 #   ./setup.sh --build-only # Build only (assumes venv exists)
@@ -19,14 +19,13 @@
 #   SKIP_MODEL    — Set to 1 to skip model download
 #   ARLE_SKIP_WEB — Set to 1 to skip the web/ frontend (bun + Astro) bootstrap
 #   PYTHON        — Python interpreter     (default: python3)
-#   KV_ZIG_VERSION      — Zig version override for kv-native-sys (default: 0.16.0)
-#   KV_ZIG_INSTALL_ROOT — Repo-local Zig install root (default: .toolchains/zig)
 #
 # Cross-platform: Linux/CUDA + macOS/Metal. Auto-detects host and routes
 # CUDA-only steps (nvcc validation, nsjail build, CUDA cargo features) to
 # the Linux path; on macOS those are skipped and `cargo build` uses
-# `metal,no-cuda`. Bootstraps the Zig toolchain used by `crates/kv-native-sys`
-# on both platforms. All Python deps install into .venv/.
+# `metal,no-cuda`. The KV-tier persistence substrate (`crates/kv-native-sys`)
+# is now pure Rust — no external toolchain is required. All Python deps
+# install into .venv/.
 # Activate manually:  source .venv/bin/activate
 # ============================================================================
 set -euo pipefail
@@ -59,23 +58,6 @@ check_cmd() {
         fail "$1 not found"
         return 1
     fi
-}
-
-ensure_zig() {
-    local check_only="${1:-0}"
-    local zig_args=(--print-zig)
-    if [ "$check_only" = "1" ]; then
-        zig_args+=(--check-only)
-    fi
-
-    local zig_bin
-    if ! zig_bin="$("$SCRIPT_DIR/scripts/setup_zig_toolchain.sh" "${zig_args[@]}")" || [ -z "$zig_bin" ]; then
-        fail "zig toolchain not ready"
-        return 1
-    fi
-    export ZIG="$zig_bin"
-    ok "zig: $ZIG"
-    info "  zig $("${ZIG}" version)"
 }
 
 # ---------------------------------------------------------------------------
@@ -147,14 +129,6 @@ do_check() {
         info "  rustc $(rustc --version 2>/dev/null | awk '{print $2}')"
     else errors=$((errors + 1)); fi
     check_cmd cargo || errors=$((errors + 1))
-
-    # Zig
-    if ensure_zig 1; then
-        :
-    else
-        fail "zig not ready — run ./setup.sh --deps-only"
-        errors=$((errors + 1))
-    fi
 
     if [ "$PLATFORM" = "linux" ]; then
         if [ -x "$CUDA_HOME/bin/nvcc" ]; then
@@ -294,10 +268,6 @@ do_deps() {
         source "$HOME/.cargo/env"
         ok "Rust installed: $(rustc --version)"
     fi
-
-    # --- Zig ---
-    step "Zig toolchain"
-    ensure_zig
 
     # --- CUDA / Metal ---
     if [ "$PLATFORM" = "linux" ]; then
@@ -457,8 +427,6 @@ do_build() {
     # Ensure cargo is on PATH
     # shellcheck disable=SC1091
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
-
-    ensure_zig
 
     local arle_features infer_features
     if [ "$PLATFORM" = "linux" ]; then
