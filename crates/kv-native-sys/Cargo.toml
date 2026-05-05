@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 publish = false
 
+[dependencies]
+libc = "0.2"
+nix = { version = "0.31", features = ["fs", "mman"] }
+
 [build-dependencies]
 
 [dev-dependencies]

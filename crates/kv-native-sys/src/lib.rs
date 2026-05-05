@@ -1,7 +1,10 @@
 use std::ffi::c_int;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -62,51 +65,6 @@ pub struct KvWalRecord {
 }
 
 unsafe extern "C" {
-    fn kv_native_write_file(
-        path_ptr: *const u8,
-        path_len: usize,
-        bytes_ptr: *const u8,
-        bytes_len: usize,
-    ) -> c_int;
-    fn kv_native_write_file_atomic(
-        path_ptr: *const u8,
-        path_len: usize,
-        bytes_ptr: *const u8,
-        bytes_len: usize,
-    ) -> c_int;
-    fn kv_native_read_file(path_ptr: *const u8, path_len: usize, out: *mut KvNativeBuffer)
-    -> c_int;
-    fn kv_native_remove_file(path_ptr: *const u8, path_len: usize, ignore_not_found: bool)
-    -> c_int;
-    fn kv_native_block_path(
-        root_ptr: *const u8,
-        root_len: usize,
-        fingerprint_ptr: *const u8,
-        fingerprint_len: usize,
-        out: *mut KvNativeBuffer,
-    ) -> c_int;
-    fn kv_native_write_block_atomic(
-        root_ptr: *const u8,
-        root_len: usize,
-        fingerprint_ptr: *const u8,
-        fingerprint_len: usize,
-        bytes_ptr: *const u8,
-        bytes_len: usize,
-    ) -> c_int;
-    fn kv_native_read_block(
-        root_ptr: *const u8,
-        root_len: usize,
-        fingerprint_ptr: *const u8,
-        fingerprint_len: usize,
-        out: *mut KvNativeBuffer,
-    ) -> c_int;
-    fn kv_native_remove_block(
-        root_ptr: *const u8,
-        root_len: usize,
-        fingerprint_ptr: *const u8,
-        fingerprint_len: usize,
-        ignore_not_found: bool,
-    ) -> c_int;
     fn kv_native_wal_append(
         path_ptr: *const u8,
         path_len: usize,
@@ -232,125 +190,128 @@ fn status_to_result(status: c_int, context: &'static str) -> io::Result<()> {
 }
 
 pub fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let path = path_bytes(path);
-    let status =
-        unsafe { kv_native_write_file(path.as_ptr(), path.len(), bytes.as_ptr(), bytes.len()) };
-    status_to_result(status, "kv_native_write_file")
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "write_file: empty path",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)?;
+    file.write_all(bytes)
 }
 
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let path = path_bytes(path);
-    let status = unsafe {
-        kv_native_write_file_atomic(path.as_ptr(), path.len(), bytes.as_ptr(), bytes.len())
-    };
-    status_to_result(status, "kv_native_write_file_atomic")
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "write_file_atomic: empty path",
+        ));
+    }
+    // Compose `<path>.tmp` by appending bytes to the OsString — matches the Zig
+    // implementation which used `std.fmt.allocPrint("{s}.tmp", .{path})` on the
+    // raw byte slice (no extension semantics).
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_os);
+
+    let result = (|| -> io::Result<()> {
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o644)
+                .open(&tmp_path)?;
+            tmp.write_all(bytes)?;
+            tmp.sync_data()?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+        // fsync the parent directory so the rename is durable on power loss.
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let parent = parent.unwrap_or_else(|| Path::new("."));
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(parent)?;
+        dir.sync_all()?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Best-effort cleanup of the staging file; ignore secondary errors.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
-    let path = path_bytes(path);
-    read_buffer(
-        |out| unsafe { kv_native_read_file(path.as_ptr(), path.len(), out) },
-        "kv_native_read_file",
-    )
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "read_file: empty path",
+        ));
+    }
+    // Match the Zig semantics: a 0-byte file returns Ok(empty), but a missing
+    // file surfaces as NotFound. `std::fs::read` already does the right thing
+    // for both — it does NOT raise NotFound on a 0-byte existing file, and it
+    // does on a missing one.
+    std::fs::read(path)
 }
 
 pub fn remove_file(path: &Path, ignore_not_found: bool) -> io::Result<()> {
-    let path = path_bytes(path);
-    let status = unsafe { kv_native_remove_file(path.as_ptr(), path.len(), ignore_not_found) };
-    status_to_result(status, "kv_native_remove_file")
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remove_file: empty path",
+        ));
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && ignore_not_found => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 pub fn block_path(root: &Path, fingerprint: [u8; 16]) -> io::Result<PathBuf> {
-    let root = path_bytes(root);
-    let fingerprint = fingerprint_bytes(fingerprint);
-    let bytes = read_buffer(
-        |out| unsafe {
-            kv_native_block_path(
-                root.as_ptr(),
-                root.len(),
-                fingerprint.as_ptr(),
-                fingerprint.len(),
-                out,
-            )
-        },
-        "kv_native_block_path",
-    )?;
-    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    let mut filename = String::with_capacity(35);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in fingerprint.iter() {
+        filename.push(HEX[(byte >> 4) as usize] as char);
+        filename.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    filename.push_str(".kv");
+    Ok(root.join(filename))
 }
 
 pub fn write_block_atomic(root: &Path, fingerprint: [u8; 16], bytes: &[u8]) -> io::Result<()> {
-    let root = path_bytes(root);
-    let fingerprint = fingerprint_bytes(fingerprint);
-    let status = unsafe {
-        kv_native_write_block_atomic(
-            root.as_ptr(),
-            root.len(),
-            fingerprint.as_ptr(),
-            fingerprint.len(),
-            bytes.as_ptr(),
-            bytes.len(),
-        )
-    };
-    status_to_result(status, "kv_native_write_block_atomic")
+    let path = block_path(root, fingerprint)?;
+    write_file_atomic(&path, bytes)
 }
 
 pub fn read_block(root: &Path, fingerprint: [u8; 16]) -> io::Result<Vec<u8>> {
-    let root = path_bytes(root);
-    let fingerprint = fingerprint_bytes(fingerprint);
-    read_buffer(
-        |out| unsafe {
-            kv_native_read_block(
-                root.as_ptr(),
-                root.len(),
-                fingerprint.as_ptr(),
-                fingerprint.len(),
-                out,
-            )
-        },
-        "kv_native_read_block",
-    )
+    let path = block_path(root, fingerprint)?;
+    read_file(&path)
 }
 
-/// Like [`read_block`] but returns a guard owning the Zig-allocated
-/// buffer directly, skipping the intermediate `Vec<u8>` copy that
-/// [`read_block`] performs in [`read_buffer`]. Use this when the caller
-/// can decode/copy the payload from a borrowed slice without needing a
-/// `Vec`-shaped owner — for example, [`crate::DiskStore::get_block`]
-/// followed by a single memcpy into a host-pinned region eliminates
-/// one allocation + one memcpy per fetch on the T2→T1 path.
+/// Like [`read_block`] but returns an owning guard over the heap-allocated
+/// payload. The guard derefs to `&[u8]` and frees its buffer on `Drop`.
 ///
-/// The returned guard derefs to `&[u8]`. The buffer is freed (via
-/// `kv_native_buffer_free`) when the guard is dropped.
+/// Historically this skipped a Zig→Rust copy; with the pure-Rust substrate
+/// the payload is a `Vec<u8>` directly, so this is now a thin wrapper that
+/// preserves the public API for callers like `DiskStore::get_block`.
 pub fn read_block_owned(root: &Path, fingerprint: [u8; 16]) -> io::Result<KvNativeOwnedBytes> {
-    let root = path_bytes(root);
-    let fingerprint = fingerprint_bytes(fingerprint);
-    read_buffer_owned(
-        |out| unsafe {
-            kv_native_read_block(
-                root.as_ptr(),
-                root.len(),
-                fingerprint.as_ptr(),
-                fingerprint.len(),
-                out,
-            )
-        },
-        "kv_native_read_block_owned",
-    )
+    let bytes = read_block(root, fingerprint)?;
+    Ok(KvNativeOwnedBytes::from_vec(bytes))
 }
 
 pub fn remove_block(root: &Path, fingerprint: [u8; 16], ignore_not_found: bool) -> io::Result<()> {
-    let root = path_bytes(root);
-    let fingerprint = fingerprint_bytes(fingerprint);
-    let status = unsafe {
-        kv_native_remove_block(
-            root.as_ptr(),
-            root.len(),
-            fingerprint.as_ptr(),
-            fingerprint.len(),
-            ignore_not_found,
-        )
-    };
-    status_to_result(status, "kv_native_remove_block")
+    let path = block_path(root, fingerprint)?;
+    remove_file(&path, ignore_not_found)
 }
 
 pub fn wal_append(path: &Path, kind: u8, key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -587,35 +548,35 @@ fn read_buffer(
     Ok(bytes)
 }
 
-/// Owning guard over a Zig-allocated buffer. Drops via
-/// [`kv_native_buffer_free`]. The bytes are valid for as long as the
-/// guard lives; the caller must not retain a slice past `Drop`.
+/// Owning guard over a heap-allocated payload buffer. Drops via the Rust
+/// allocator. The bytes are valid for as long as the guard lives; the caller
+/// must not retain a slice past `Drop`.
+///
+/// Storage is a `Box<[u8]>`. The struct keeps `Send + Sync` and the same
+/// public surface (`as_slice`, `len`, `is_empty`, `Deref<Target = [u8]>`)
+/// it had under the Zig-FFI substrate, so call sites in
+/// `infer/src/kv_tier/transport/disk.rs` continue to compile unchanged.
 pub struct KvNativeOwnedBytes {
-    data: *mut u8,
-    len: usize,
+    data: Box<[u8]>,
 }
 
-// Safety: `data` is a heap allocation owned exclusively by this guard.
-// The pointee is plain bytes with no interior mutability and no thread
-// affinity, so it is safe to send and share across threads as long as
-// the borrow rules on `&[u8]` are observed (compiler-enforced).
-unsafe impl Send for KvNativeOwnedBytes {}
-unsafe impl Sync for KvNativeOwnedBytes {}
-
 impl KvNativeOwnedBytes {
-    pub fn as_slice(&self) -> &[u8] {
-        if self.data.is_null() || self.len == 0 {
-            return &[];
+    pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
+        Self {
+            data: bytes.into_boxed_slice(),
         }
-        unsafe { std::slice::from_raw_parts(self.data.cast_const(), self.len) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.data.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.data.is_empty()
     }
 }
 
@@ -624,47 +585,6 @@ impl std::ops::Deref for KvNativeOwnedBytes {
     fn deref(&self) -> &[u8] {
         self.as_slice()
     }
-}
-
-impl Drop for KvNativeOwnedBytes {
-    fn drop(&mut self) {
-        if !self.data.is_null() {
-            unsafe { kv_native_buffer_free(self.data) };
-        }
-    }
-}
-
-fn read_buffer_owned(
-    call: impl FnOnce(*mut KvNativeBuffer) -> c_int,
-    context: &'static str,
-) -> io::Result<KvNativeOwnedBytes> {
-    let mut out = KvNativeBuffer {
-        data: std::ptr::null_mut(),
-        len: 0,
-    };
-    let status = call(&mut out);
-    if status_from_code(status) != Some(KvNativeStatus::Ok) {
-        return Err(status_to_error(status, context));
-    }
-    if out.len == 0 {
-        if !out.data.is_null() {
-            unsafe { kv_native_buffer_free(out.data) };
-        }
-        return Ok(KvNativeOwnedBytes {
-            data: std::ptr::null_mut(),
-            len: 0,
-        });
-    }
-    if out.data.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{context}: native layer returned null data for non-empty buffer"),
-        ));
-    }
-    Ok(KvNativeOwnedBytes {
-        data: out.data,
-        len: out.len,
-    })
 }
 
 fn decode_wal_records(bytes: &[u8]) -> io::Result<Vec<KvWalRecord>> {
