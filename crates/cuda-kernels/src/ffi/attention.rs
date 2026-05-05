@@ -284,6 +284,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn flashinfer_append_new_page_indices_cuda(
+        kv_indices: *mut i32,
+        prev_kv_indptr: *const i32,
+        next_kv_indptr: *const i32,
+        append_indptr: *const i32,
+        appended_page_indices: *const i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn flashinfer_batch_decode_hd256_plan(
         float_workspace: *mut u8,
         float_workspace_bytes: usize,

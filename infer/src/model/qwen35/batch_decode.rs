@@ -317,7 +317,8 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         pool: &PagedKVPool,
         slot_indices: &[usize],
     ) -> Result<bool> {
-        self.metadata.update(ctx, pool, slot_indices)
+        let (reallocated, _mode) = self.metadata.update(ctx, pool, slot_indices)?;
+        Ok(reallocated)
     }
 
     fn plan_attention(

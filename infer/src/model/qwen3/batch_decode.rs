@@ -18,7 +18,7 @@ use crate::model::kv_cache::KVFormat;
 use crate::model::{MixedBatchRequest, ModelForward};
 use crate::ops;
 use cuda_kernels::ffi;
-use cuda_kernels::flashinfer::FlashInferWorkspace;
+use cuda_kernels::flashinfer::{DecodeMetaUpdate, FlashInferWorkspace};
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
 use cuda_kernels::prelude::{
@@ -90,6 +90,9 @@ pub struct BatchDecodeBuffers {
     /// One-shot marker for sparse decode calls whose quantized metadata was
     /// uploaded by `prepare_sparse_decode_context`.
     sparse_quantized_meta_once: bool,
+    decode_meta_update: DecodeMetaUpdate,
+    quantized_last_page_lens_scratch: Vec<i32>,
+    quantized_indptr_scratch: Vec<i32>,
 
     /// Max batch size this buffer set was allocated for.
     max_batch_size: usize,
@@ -391,6 +394,9 @@ impl BatchDecodeBuffers {
                 .alloc_zeros(2 * max_batch_size + 1)
                 .map_err(|e| anyhow::anyhow!("Alloc quantized_kv_meta failed: {e}"))?,
             sparse_quantized_meta_once: false,
+            decode_meta_update: DecodeMetaUpdate::Full,
+            quantized_last_page_lens_scratch: Vec::with_capacity(max_batch_size),
+            quantized_indptr_scratch: Vec::with_capacity(max_batch_size + 1),
 
             max_batch_size,
             max_total_pages,
@@ -439,6 +445,42 @@ impl BatchDecodeBuffers {
         Ok(())
     }
 
+    fn upload_quantized_last_page_lens(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        pool.fill_last_page_lens(slot_indices, &mut self.quantized_last_page_lens_scratch);
+        let offset = slot_indices.len() + 1;
+        let mut last_page_len_view = self
+            .quantized_kv_meta
+            .slice_mut(offset..offset + slot_indices.len());
+        ctx.stream
+            .memcpy_htod(
+                &self.quantized_last_page_lens_scratch,
+                &mut last_page_len_view,
+            )
+            .map_err(|e| anyhow::anyhow!("H2D quantized last_page_len: {e}"))?;
+        Ok(())
+    }
+
+    fn upload_quantized_indptr_and_last_page_lens(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        pool.fill_indptr(slot_indices, &mut self.quantized_indptr_scratch);
+        let mut indptr_view = self
+            .quantized_kv_meta
+            .slice_mut(..self.quantized_indptr_scratch.len());
+        ctx.stream
+            .memcpy_htod(&self.quantized_indptr_scratch, &mut indptr_view)
+            .map_err(|e| anyhow::anyhow!("H2D quantized indptr: {e}"))?;
+        self.upload_quantized_last_page_lens(ctx, pool, slot_indices)
+    }
+
     fn ensure_mixed_buffers(
         &mut self,
         model: &Qwen3Model,
@@ -475,6 +517,17 @@ fn upload_decode_quantized_meta(
     if std::mem::take(&mut bufs.sparse_quantized_meta_once) {
         return Ok(());
     }
+    if pool.format == KVFormat::FP8E4M3 {
+        match bufs.decode_meta_update {
+            DecodeMetaUpdate::SamePages => {
+                return bufs.upload_quantized_last_page_lens(ctx, pool, slot_indices);
+            }
+            DecodeMetaUpdate::AppendedPages => {
+                return bufs.upload_quantized_indptr_and_last_page_lens(ctx, pool, slot_indices);
+            }
+            DecodeMetaUpdate::Full => {}
+        }
+    }
     let packed = pool.build_quantized_decode_indptr(slot_indices);
     ctx.stream
         .memcpy_htod(&packed, &mut bufs.quantized_kv_meta)
@@ -500,7 +553,9 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         slot_indices: &[usize],
     ) -> Result<bool> {
         self.sparse_quantized_meta_once = false;
-        self.metadata.update(ctx, pool, slot_indices)
+        let (reallocated, mode) = self.metadata.update(ctx, pool, slot_indices)?;
+        self.decode_meta_update = mode;
+        Ok(reallocated)
     }
 
     fn plan_attention(

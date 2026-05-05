@@ -1326,14 +1326,21 @@ impl TokenKVPool {
     /// `indptr[i+1] - indptr[i]` = page count for request `i`.
     pub fn build_indptr(&self, slots: &[usize]) -> Vec<i32> {
         let mut indptr = Vec::with_capacity(slots.len() + 1);
-        indptr.push(0);
+        self.fill_indptr(slots, &mut indptr);
+        indptr
+    }
+
+    pub fn fill_indptr<'a>(&self, slots: &[usize], scratch: &'a mut Vec<i32>) -> &'a [i32] {
+        scratch.clear();
+        scratch.reserve(slots.len() + 1);
+        scratch.push(0);
         for &slot in slots {
-            let last = *indptr
+            let last = *scratch
                 .last()
                 .expect("invariant: indptr always has at least one element (initialized with 0)");
-            indptr.push(last + self.page_indices[slot].len() as i32);
+            scratch.push(last + self.page_indices[slot].len() as i32);
         }
-        indptr
+        scratch.as_slice()
     }
 
     /// Build FlashInfer page-indices array (concatenated physical page ids).
@@ -1367,10 +1374,20 @@ impl TokenKVPool {
 
     /// Build FlashInfer last_page_len array.
     pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
-        slots
-            .iter()
-            .map(|&slot| self.slot_last_page_len(slot) as i32)
-            .collect()
+        let mut last_page_lens = Vec::with_capacity(slots.len());
+        self.fill_last_page_lens(slots, &mut last_page_lens);
+        last_page_lens
+    }
+
+    pub fn fill_last_page_lens<'a>(&self, slots: &[usize], scratch: &'a mut Vec<i32>) -> &'a [i32] {
+        scratch.clear();
+        scratch.reserve(slots.len());
+        scratch.extend(
+            slots
+                .iter()
+                .map(|&slot| self.slot_last_page_len(slot) as i32),
+        );
+        scratch.as_slice()
     }
 
     /// Build packed decode metadata for quantized page-aware kernels:
