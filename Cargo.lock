@@ -1891,6 +1891,7 @@ name = "kv-native-sys"
 version = "0.1.5"
 dependencies = [
  "libc",
+ "memmap2",
  "nix 0.31.2",
  "tempfile",
 ]
