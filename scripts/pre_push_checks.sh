@@ -40,6 +40,7 @@ run cargo check --manifest-path infer/Cargo.toml --no-default-features --feature
 run cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle
 run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --release
 run cargo clippy --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib -- -D warnings
+run cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
 
 METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 
