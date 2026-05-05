@@ -162,6 +162,12 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
   FlashInfer wrapper (`PrefillPlan` + `BatchPrefillWithPagedKVCacheDispatched`).
 - `csrc/attention/flashinfer_prefill_paged_hd256.cu` is the HD256 paged-prefill
   FlashInfer wrapper used for Qwen3.5 full-attention parity.
+- `csrc/attention/flashinfer_mla.cu` is the FlashInfer MLA paged-attention
+  wrapper (`MLAPlan` + `mla::BatchMLAPagedAttention`) for DeepSeek V2 / V3 /
+  V4 BF16 q_nope / q_pe / ckv / kpe. Currently dispatches only the
+  `(HEAD_DIM_CKV=512, HEAD_DIM_KPE=64)` pair upstream supports — see the
+  in-file constraint comment for why smaller DSV4 substrate dims need a
+  different kernel.
 - `csrc/attention/prefill_attention_paged_prep.cu` holds the paged-only
   prefill prep kernels that do QK norm + RoPE and write K/V directly into HND pages.
 - When optimizing, check the heat map in
@@ -186,12 +192,16 @@ With `--features cuda,no-cuda`:
   multi-GPU primitive surface. F2 production NCCL forward collectives
   block both P0' (TP=2 throughput bench) and P0'' (DeepSeek V4 DS5
   collectives in forward).
-- **P0'' DeepSeek V4.** `ffi/mla.rs` carries the planned MLA decode/prep
-  declarations. The kernel implementation under `csrc/attention/` is
-  design-ready
-  ([`docs/plans/2026-05-01-mla-kernel-design.md`](../../docs/plans/2026-05-01-mla-kernel-design.md))
-  but waits on DS2 block-FP8 layout and DS3 cache-format wiring before
-  shipping.
+- **P0'' DeepSeek V4.** `ffi/mla.rs` carries the legacy `mla_decode_paged_bf16`
+  ABI scaffold; the live BF16 forward path is `flashinfer_mla_paged_attention_
+  {plan,run}` declared at the bottom of `ffi/attention.rs` and implemented in
+  `csrc/attention/flashinfer_mla.cu` (FlashInfer 0.6.x `MLAPlan` +
+  `mla::BatchMLAPagedAttention` wrapper, Apache-2.0). Currently covers the
+  DeepSeek V2/V3 reference shape `(HEAD_DIM_CKV=512, HEAD_DIM_KPE=64)`. The
+  DSV4 small-substrate SKUs in
+  [`docs/plans/2026-05-05-deepseek-v4-small-substrate.md`](../../docs/plans/2026-05-05-deepseek-v4-small-substrate.md)
+  §6.1.1 use smaller dims and need a different kernel (cute-DSL or hand-port);
+  tracked as future work in that plan.
 
 ## Pointers
 

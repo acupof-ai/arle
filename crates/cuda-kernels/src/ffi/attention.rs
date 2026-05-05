@@ -566,6 +566,67 @@ unsafe extern "C" {
         workspace: *mut u8,
         workspace_bytes: usize,
     ) -> CUresult;
+
+    /// FlashInfer MLA paged-attention plan (CPU-side scheduling).
+    ///
+    /// Wraps `flashinfer::MLAPlan` for BF16 q_nope / q_pe / ckv / kpe paged
+    /// caches. See `csrc/attention/flashinfer_mla.cu` for the C++ side and
+    /// `docs/plans/2026-05-01-mla-kernel-design.md` for the surrounding
+    /// design.
+    ///
+    /// Cache layout (matches FlashInfer's `BatchMLAPagedAttentionWrapper`):
+    ///   q_nope:  `[total_q, num_heads, head_dim_ckv]`
+    ///   q_pe:    `[total_q, num_heads, head_dim_kpe]`
+    ///   ckv:     `[num_pages, page_size, head_dim_ckv]`
+    ///   kpe:     `[num_pages, page_size, head_dim_kpe]`
+    ///   o:       `[total_q, num_heads, head_dim_ckv]`
+    ///
+    /// `qo_indptr_h`, `kv_indptr_h`, `kv_len_h` are HOST arrays.
+    /// `causal` is treated as bool (0 = none, !=0 = causal mask).
+    pub fn flashinfer_mla_paged_attention_plan(
+        float_workspace: *mut u8,
+        float_workspace_bytes: usize,
+        int_workspace: *mut u8,
+        page_locked_workspace: *mut u8,
+        int_workspace_bytes: usize,
+        qo_indptr_h: *const i32,
+        kv_indptr_h: *const i32,
+        kv_len_h: *const i32,
+        batch_size: i32,
+        num_heads: i32,
+        head_dim_ckv: i32,
+        head_dim_kpe: i32,
+        causal: i32,
+        plan_info_out: *mut u8,
+        stream: CUstream,
+    ) -> i32;
+
+    /// FlashInfer MLA paged-attention run (GPU launch).
+    ///
+    /// Consumes the opaque plan buffer produced by
+    /// [`flashinfer_mla_paged_attention_plan`] and launches
+    /// `flashinfer::mla::BatchMLAPagedAttention` over the supplied caches.
+    ///
+    /// `lse` may be null when log-sum-exp output is not required.
+    pub fn flashinfer_mla_paged_attention_run(
+        float_workspace: *mut u8,
+        int_workspace: *mut u8,
+        plan_info: *const u8,
+        q_nope: *mut Half,
+        q_pe: *mut Half,
+        ckv: *mut Half,
+        kpe: *mut Half,
+        kv_indices: *const i32,
+        o: *mut Half,
+        lse: *mut f32,
+        num_heads: i32,
+        page_size: i32,
+        head_dim_ckv: i32,
+        head_dim_kpe: i32,
+        causal: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
 }
 
 // One AOT-specialized symbol per (num_q_heads, num_kv_heads). The matching
