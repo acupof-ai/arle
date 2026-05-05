@@ -115,9 +115,8 @@ __global__ void prefill_kv_cache_write_kernel(
 //   1. Per-head QK norm + RoPE (custom kernel)
 //   2. KV cache batch write (custom kernel)
 //
-// Step 3 (attention computation) is handled by `flashinfer_single_prefill`
-// (FlashInfer C++) for HEAD_DIM=128 and by `flash_attention_prefill_hd256_cuda`
-// (Triton AOT) for the Qwen3.5 HEAD_DIM=256 path.
+// Step 3 (attention computation) is handled by FlashInfer single-prefill wrappers
+// for HD128/HD256, or by paged-prefill paths outside this helper.
 // ============================================================================
 extern "C" {
 
