@@ -41,7 +41,7 @@ If both (1) and (2) hold, A8 becomes the next world-first lever.
 | `infer/src/kv_tier/transport.rs` | `KVTransport` trait — the boundary where kernel-vs-DMA dispatch happens. |
 | `infer/src/kv_tier/transport/local_cuda.rs` | Existing `LocalCudaTransport` (cudarc / `cudaMemcpyAsync`); the new kernel path lives next to it as a sibling impl, not a replacement. |
 | `infer/src/kv_tier/coordinator.rs` | Async promote/demote command/event channel; bandwidth path runs through here. |
-| `infer/src/kv_tier/host_pool.rs` | `HostPinnedPool` Zig-backed arena — the destination/source on the T1 side. Pinned memory is required for SM-driven copy correctness. |
+| `infer/src/kv_tier/host_pool.rs` | `HostPinnedPool` (kv-native-sys arena) — the destination/source on the T1 side. Pinned memory is required for SM-driven copy correctness. |
 
 ## 6. Industry References
 

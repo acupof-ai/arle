@@ -20,7 +20,7 @@ originSessionId: d301e8fb-4674-4ac9-a73e-639200c55d56
 - LMSYS official benchmark: **3× throughput vs cudaMemcpyAsync**
 
 **Relevance to current ARLE work:**
-- A6 (commits `7b9ffb2f`/`f83a8e05`, post-rewrite SHAs differ): T1 host-pinned retention. Uses `HostPinnedPool` Zig-backed arena. Promote/demote currently goes through standard CUDA APIs (likely `cudaMemcpyAsync`).
+- A6 (commits `7b9ffb2f`/`f83a8e05`, post-rewrite SHAs differ): T1 host-pinned retention. Uses `HostPinnedPool` (kv-native-sys arena). Promote/demote currently goes through standard CUDA APIs (likely `cudaMemcpyAsync`).
 - (A) SessionSlot eviction policy in flight: doesn't need this yet (eviction is bookkeeping; the actual block freeing is policy not bandwidth).
 - **Likely deferred deliverable**: A8 GPU-assisted KV transfer kernel — to be considered AFTER (A) closes W4 mission gate. If (A) succeeds and W4 baseline shows promote/demote latency dominating tail TTFT, A8 becomes the next world-first lever.
 
@@ -28,7 +28,7 @@ originSessionId: d301e8fb-4674-4ac9-a73e-639200c55d56
 - `crates/cuda-kernels/csrc/kv/` — CUDA kernel home for KV ops
 - `infer/src/kv_tier/transport/local_cuda.rs` — current LocalCudaTransport plumbing (uses cudarc / cudaMemcpyAsync analogs)
 - `infer/src/kv_tier/coordinator.rs` — async promote/demote command/event channel; bandwidth-relevant call site
-- `infer/src/kv_tier/host_pool.rs` — HostPinnedPool (Zig arena), the destination buffer for demote
+- `infer/src/kv_tier/host_pool.rs` — HostPinnedPool (kv-native-sys arena), the destination buffer for demote
 - `infer/src/kv_tier/transport.rs` — KVTransport trait (where the kernel-vs-DMA choice would land)
 
 **Industry references** (when implementing):

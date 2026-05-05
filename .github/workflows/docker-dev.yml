@@ -57,10 +57,10 @@ jobs:
         if: ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
         run: |
           docker run --rm "${{ steps.tags.outputs.image }}" bash -lc \
-            'cargo --version && nvcc --version && zig version'
+            'cargo --version && nvcc --version'
 
       - name: Sanity check pushed image
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         run: |
           docker run --rm "${{ steps.tags.outputs.image }}" bash -lc \
-            'cargo --version && nvcc --version && zig version'
+            'cargo --version && nvcc --version'

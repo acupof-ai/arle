@@ -1,6 +1,6 @@
 # Development Container
 
-ARLE's `dev` Docker target is a CUDA/Rust/Zig/Python toolchain container for
+ARLE's `dev` Docker target is a CUDA/Rust/Python toolchain container for
 building and checking the CUDA backend. The default final Dockerfile stage
 remains the release runtime image used by `ghcr.io/cklxx/arle:latest`.
 
@@ -20,7 +20,6 @@ The image contains:
 
 - CUDA 12.8 devel toolkit and `nvcc`
 - Rust `1.95.0` with `rustfmt` and `clippy`
-- Zig `0.16.0` at `/usr/local/bin/zig`
 - Python packages for CUDA build and benchmark workflows: Torch, FlashInfer,
   TileLang, GuideLLM, and Hugging Face Hub
 
@@ -29,7 +28,6 @@ Useful checks inside the image:
 ```bash
 cargo --version
 nvcc --version
-zig version
 CUDA_HOME=/usr/local/cuda cargo build --release -p infer --features cuda
 ```
 

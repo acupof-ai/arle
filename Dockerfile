@@ -2,7 +2,6 @@
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.0-devel-ubuntu22.04
 ARG RUST_TOOLCHAIN=1.95.0
-ARG ZIG_VERSION=0.16.0
 
 FROM ${CUDA_IMAGE} AS base
 ARG RUST_TOOLCHAIN
@@ -44,21 +43,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
       "guidellm[recommended]==0.6.0" \
       huggingface_hub==0.36.2
 
-FROM base AS zig-toolchain
-ARG ZIG_VERSION
-
-RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-    | tar -xJ -C /opt \
-    && mv "/opt/zig-x86_64-linux-${ZIG_VERSION}" /opt/zig
-
 FROM python-deps AS dev
 
 WORKDIR /workspace
 
-COPY --from=zig-toolchain /opt/zig /opt/zig
-RUN ln -s /opt/zig/zig /usr/local/bin/zig && zig version
-
-ENV ZIG=/opt/zig/zig
 ENV INFER_TRITON_PYTHON=/usr/bin/python3
 ENV INFER_TILELANG_PYTHON=/usr/bin/python3
 

@@ -2,7 +2,7 @@
 
 **Status**: active — Phases A/B/C/D landed locally on the CUDA lane, and Phase E now has a minimal shared-filesystem cluster-shared backend wired through the same coordinator fetch/store path; remote CUDA validation still pending  
 **Scope**: implementation SSOT for the current local readmission tranche plus the remaining design for remote/shared backends  
-**Purpose**: keep the local path (`RadixCache + paged_kv + Zig T1 arena + readmission + T1→T2 spill`) on one clean architecture while the remaining queue/backpressure/cluster-L3 work lands without reviving parallel side paths.
+**Purpose**: keep the local path (`RadixCache + paged_kv + kv-native-sys T1 arena + readmission + T1→T2 spill`) on one clean architecture while the remaining queue/backpressure/cluster-L3 work lands without reviving parallel side paths.
 
 This doc records the target shape for:
 
@@ -26,7 +26,7 @@ The current local path is honest but incomplete:
 
 - `RadixCache` already owns prefix metadata and tier metadata
 - `paged_kv` already owns T0 page attachment and tail-page COW
-- `HostPinnedPool` is already Zig-backed for T1 storage
+- `HostPinnedPool` is already backed by the `kv-native-sys` arena for T1 storage
 - `Coordinator + DiskStore` already own T1→T2 persistence and local staged fetch preparation
 
 The missing half is the rest of the HiCache loop:
