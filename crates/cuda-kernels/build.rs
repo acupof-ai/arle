@@ -495,111 +495,6 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
     let mut generated_sources = Vec::new();
     let chunkwise_kernel_path = Path::new("tools/triton/gated_delta_rule_chunkwise_kernels.py");
 
-    let silu_spec = TritonKernelSpec {
-        artifact_dir: "silu_mul",
-        kernel_path: "tools/triton/silu_mul_kernel.py",
-        kernel_name: "silu_mul_kernel",
-        signature: "*bf16,*bf16,*bf16,i32,256",
-        grid: "(n_elements + 255) / 256,1,1",
-        out_name: "triton_silu_mul",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    build_triton_kernel(
-        &python,
-        out_dir,
-        sm_targets,
-        &silu_spec,
-        "silu_mul_triton_aot_cuda(const uint16_t* gate, const uint16_t* up, uint16_t* out, int n, CUstream stream)",
-        "CUstream stream, CUdeviceptr gate, CUdeviceptr up, CUdeviceptr out, int32_t n_elements",
-        "stream, (CUdeviceptr)gate, (CUdeviceptr)up, (CUdeviceptr)out, (int32_t)n",
-        &mut generated_sources,
-    );
-
-    let add_spec = TritonKernelSpec {
-        artifact_dir: "add",
-        kernel_path: "tools/triton/basic_kernels.py",
-        kernel_name: "add_kernel",
-        signature: "*bf16,*bf16,*bf16,i32,256",
-        grid: "(n_elements + 255) / 256,1,1",
-        out_name: "triton_add",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    build_triton_kernel(
-        &python,
-        out_dir,
-        sm_targets,
-        &add_spec,
-        "add_cuda(const uint16_t* a, const uint16_t* b, uint16_t* out, int n, CUstream stream)",
-        "CUstream stream, CUdeviceptr a, CUdeviceptr b, CUdeviceptr out, int32_t n_elements",
-        "stream, (CUdeviceptr)a, (CUdeviceptr)b, (CUdeviceptr)out, (int32_t)n",
-        &mut generated_sources,
-    );
-
-    let embedding_decode_spec = TritonKernelSpec {
-        artifact_dir: "embedding_decode",
-        kernel_path: "tools/triton/basic_kernels.py",
-        kernel_name: "embedding_decode_kernel",
-        signature: "*bf16,*i32,*bf16,i32,256",
-        grid: "(hidden_size + 255) / 256,1,1",
-        out_name: "triton_embedding_decode",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    build_triton_kernel(
-        &python,
-        out_dir,
-        sm_targets,
-        &embedding_decode_spec,
-        "embedding_decode_cuda(const uint16_t* embed, const int* decode_meta, uint16_t* out, int hidden_size, CUstream stream)",
-        "CUstream stream, CUdeviceptr embed, CUdeviceptr decode_meta, CUdeviceptr out, int32_t hidden_size",
-        "stream, (CUdeviceptr)embed, (CUdeviceptr)decode_meta, (CUdeviceptr)out, (int32_t)hidden_size",
-        &mut generated_sources,
-    );
-
-    let embedding_batched_spec = TritonKernelSpec {
-        artifact_dir: "embedding_batched",
-        kernel_path: "tools/triton/basic_kernels.py",
-        kernel_name: "embedding_batched_kernel",
-        signature: "*bf16,*i32,*bf16,i32,i32,256",
-        grid: "(hidden_size * seq_len + 255) / 256,1,1",
-        out_name: "triton_embedding_batched",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    build_triton_kernel(
-        &python,
-        out_dir,
-        sm_targets,
-        &embedding_batched_spec,
-        "embedding_batched_cuda(const uint16_t* embed, const int* token_ids, uint16_t* out, int hidden_size, int seq_len, CUstream stream)",
-        "CUstream stream, CUdeviceptr embed, CUdeviceptr token_ids, CUdeviceptr out, int32_t hidden_size, int32_t seq_len",
-        "stream, (CUdeviceptr)embed, (CUdeviceptr)token_ids, (CUdeviceptr)out, (int32_t)hidden_size, (int32_t)seq_len",
-        &mut generated_sources,
-    );
-
-    let flash_attn_prefill_hd256_spec = TritonKernelSpec {
-        artifact_dir: "flash_attention_prefill_hd256",
-        kernel_path: "tools/triton/flash_attention_prefill_hd256_kernel.py",
-        kernel_name: "flash_attention_prefill_hd256_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,*i32,i32,i32,64,64,256",
-        grid: "(seq_len + 63) / 64,num_q_heads,1",
-        out_name: "triton_flash_attention_prefill_hd256",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    build_triton_kernel(
-        &python,
-        out_dir,
-        sm_targets,
-        &flash_attn_prefill_hd256_spec,
-        "flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, const int32_t* start_pos_ptr, int32_t max_seq_len, int32_t q_dim, CUstream stream)",
-        "CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, CUdeviceptr start_pos_ptr, int32_t max_seq_len, int32_t q_dim",
-        "stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, (CUdeviceptr)start_pos_ptr, max_seq_len, q_dim",
-        &mut generated_sources,
-    );
-
     if chunkwise_kernel_path.exists() {
         let gdr_prepare_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_prepare",
@@ -1202,12 +1097,6 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
     println!("cargo:rerun-if-env-changed=INFER_TILELANG_PYTHON");
 }
 
-/// Find FlashInfer C++ include directory.
-///
-/// Search order:
-///   1. FLASHINFER_INCLUDE_DIR env var (explicit override)
-///   2. `pip show flashinfer-python` → Location + /flashinfer/data/include
-///   3. `python3 -c "import flashinfer; ..."` (legacy, needs working import)
 // Recursively collect every `.cu` file under `dir` so domain subdirs
 // (attention/, gemm/, kv/, quant/, misc/) are picked up automatically.
 fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1227,6 +1116,12 @@ fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Find FlashInfer C++ include directory.
+///
+/// Search order:
+///   1. FLASHINFER_INCLUDE_DIR env var (explicit override)
+///   2. `pip show flashinfer-python` → Location + /flashinfer/data/include
+///   3. `python3 -c "import flashinfer; ..."` (legacy, needs working import)
 fn find_flashinfer_include() -> Option<String> {
     // 1. Explicit override
     if let Ok(dir) = std::env::var("FLASHINFER_INCLUDE_DIR") {
