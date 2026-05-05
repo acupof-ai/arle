@@ -18,6 +18,8 @@ pub(crate) mod kv_cache;
 #[path = "model/layer_communicator.rs"]
 pub mod layer_communicator;
 
+#[path = "model/deepseek.rs"]
+pub mod deepseek;
 #[path = "model/qwen3.rs"]
 pub mod qwen3;
 #[path = "model/qwen35.rs"]
