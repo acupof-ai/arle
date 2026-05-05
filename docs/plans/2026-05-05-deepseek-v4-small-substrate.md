@@ -119,6 +119,52 @@
 - KV cache 形态: `(B, S_total, kv_lora_rank + qk_rope_head_dim)` 单 head —— SKU-A=160, SKU-B=224。**注意 page size 要按 latent dim 重算**, 写入 [`docs/plans/2026-05-01-mla-kernel-design.md`](2026-05-01-mla-kernel-design.md) 的扩展条目, 并与 [`infer/src/kv_tier/AGENTS.md`](../../infer/src/kv_tier/AGENTS.md) 的 page 体系对齐 —— RadixCache 不变, page size 是 backend-side 参数。
 - `q_lora_rank=None` 与 `Some(rank)` 两种 q-projection 形态在 `Model::load_weights()` 阶段按 config 字段二选一; 选错即报错, 不做 silent fallback。
 
+#### 6.1.1 Kernel substrate (CUDA, BF16)
+
+CUDA 上 BF16 MLA forward 复用 FlashInfer 0.6.x 的 MLA kernel family
+(Apache-2.0, build-time 已 vendored 在 `crates/cuda-kernels/build.rs`
+`find_flashinfer_include` 路径)。包装层落在
+[`crates/cuda-kernels/csrc/attention/flashinfer_mla.cu`](../../crates/cuda-kernels/csrc/attention/flashinfer_mla.cu),
+对外 `extern "C"` 接口在
+[`crates/cuda-kernels/src/ffi/attention.rs`](../../crates/cuda-kernels/src/ffi/attention.rs)
+最末尾两条 `flashinfer_mla_paged_attention_{plan,run}` 声明:
+
+- `_plan` 包 `flashinfer::MLAPlan` (CPU scheduler) → 写 `MLAPlanInfo`
+  (18 × i64 = 144 字节) 到调用方提供的 256-byte 不透明 buffer; 与 ARLE
+  现有 FlashInfer prefill/decode wrappers 共用 `FlashInferWorkspace`
+  (`crates/cuda-kernels/src/flashinfer.rs`) 的 float / int / page-locked
+  workspace 约定。
+- `_run` 包 `flashinfer::mla::BatchMLAPagedAttention` (`flashinfer/
+  attention/mla.cuh`, SM80 FA2 path) → 调用方传 q_nope / q_pe / ckv /
+  kpe / kv_indices + plan buffer + sm_scale + 因果开关。
+
+**当前 dim 覆盖**: 只有 DeepSeek V2 / V3 reference `(HEAD_DIM_CKV,
+HEAD_DIM_KPE) = (512, 64)` 一对; 这是 FlashInfer 上游 AOT-supported 的
+唯一稳定 pair。FA2 MLA kernel 内部 loop bound 用 `NUM_MMA_D_CKV / 8`
+(output store) 和 `NUM_MMA_D_KPE / 4` (PE load), 当 CKV < 128 或
+KPE < 64 时会静默截到 0 次循环、丢写, 因此 wrapper 对其它 (CKV, KPE)
+返回 `cudaErrorInvalidConfiguration` 而非 silent wrong output。
+
+**SKU-A / SKU-B / nano 的 dim 阻塞**: 上面 §2 表里 nano = (32, 16, 32),
+SKU-A = (64, 32, 64), SKU-B = (64, 32, 64), 加上 `kv_lora_rank`
+nano=64 / A=128 / B=192 → 都不满足 ≥(128, 64) 的 FA2 约束。三条
+出路:
+
+1. **接 cute_dsl SM80 MLA path** (`flashinfer/cute_dsl/attention/
+   mla_decode.py`) —— 上游有支持小 dim 的 cute-DSL 内核, 但是 Python
+   AOT-only, 落地到 `flashinfer_*.cu` wrapper 需要把 cubin 路径接进
+   build.rs 的 Triton AOT 那条线 (类似 `compile_triton_aot_kernels`,
+   但目标是 cute-DSL)。
+2. **Pad CKV/KPE 到上面的最小值** —— SKU-A/B 改到 `kv_lora_rank>=128`
+   `qk_rope_head_dim>=64` 重训 (代价高)。
+3. **手写 small-dim MLA kernel** —— 参考 SGLang FlashMLA
+   port (P0'' 设计文档 §"first kernel ABI sketch"), 这是后续单独 commit。
+
+第一里程碑选 (1): cute-DSL cubin 加进 build.rs, 同 wrapper 把 dim 表扩到 SKU-A/B。
+
+`mla_decode.cu` 的早期 P0'' BF16 stub (`mla_decode_paged_bf16_cuda`)
+保留作为 ABI placeholder, 实际 forward 一律走 `flashinfer_mla_paged_attention_*`。
+
 ### 6.2 DeepSeekMoE Op (SKU-B only)
 
 - 复用 spec crate 已有的 `DeepSeekMoeForwardBatch::expert_inputs() / ep_forward_plan()` —— 单卡推理 `world_size=1`, `local_experts = 0..32`, 全部本地。
