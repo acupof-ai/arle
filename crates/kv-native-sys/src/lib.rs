@@ -65,24 +65,6 @@ pub struct KvWalRecord {
 }
 
 unsafe extern "C" {
-    fn kv_native_mmap_create(
-        path_ptr: *const u8,
-        path_len: usize,
-        len: usize,
-        out: *mut KvMmapDescriptor,
-    ) -> c_int;
-    fn kv_native_mmap_write(
-        desc: *const KvMmapDescriptor,
-        offset: usize,
-        bytes_ptr: *const u8,
-        bytes_len: usize,
-    ) -> c_int;
-    fn kv_native_mmap_read(
-        desc: *const KvMmapDescriptor,
-        offset: usize,
-        bytes_len: usize,
-        out: *mut KvNativeBuffer,
-    ) -> c_int;
     fn kv_native_shm_create(
         name_ptr: *const u8,
         name_len: usize,
@@ -346,27 +328,78 @@ pub fn mmap_create(path: &Path, len: usize) -> io::Result<KvMmapDescriptor> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let path = path_bytes(path);
+    let path_raw = path_bytes(path);
+    if path_raw.len() > KV_MMAP_PATH_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mmap_create: path exceeds KV_MMAP_PATH_CAP",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)?;
+    file.set_len(len as u64)?;
+
     let mut out = KvMmapDescriptor {
-        len: 0,
-        path_len: 0,
+        len,
+        path_len: path_raw.len(),
         path: [0; KV_MMAP_PATH_CAP],
     };
-    let status = unsafe { kv_native_mmap_create(path.as_ptr(), path.len(), len, &mut out) };
-    status_to_result(status, "kv_native_mmap_create")?;
+    out.path[..path_raw.len()].copy_from_slice(path_raw);
     Ok(out)
 }
 
 pub fn mmap_write(desc: &KvMmapDescriptor, offset: usize, bytes: &[u8]) -> io::Result<()> {
-    let status = unsafe { kv_native_mmap_write(desc, offset, bytes.as_ptr(), bytes.len()) };
-    status_to_result(status, "kv_native_mmap_write")
+    if offset
+        .checked_add(bytes.len())
+        .is_none_or(|end| end > desc.len)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mmap_write: offset+bytes_len exceeds descriptor len",
+        ));
+    }
+    let path = desc.path_buf()?;
+    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+    // Safety: `MmapMut` over a non-shared file. We only borrow the mapping
+    // for the duration of this call; no aliasing with other Rust references.
+    let mut mapping = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    if mapping.len() < desc.len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mmap_write: backing file shorter than descriptor len",
+        ));
+    }
+    mapping[offset..offset + bytes.len()].copy_from_slice(bytes);
+    // `MmapMut::flush` calls msync(MS_SYNC) under the hood, matching the
+    // previous Zig path which used `c.msync(mapping, desc.len, c.MS_SYNC)`.
+    mapping.flush()?;
+    Ok(())
 }
 
 pub fn mmap_read(desc: &KvMmapDescriptor, offset: usize, len: usize) -> io::Result<Vec<u8>> {
-    read_buffer(
-        |out| unsafe { kv_native_mmap_read(desc, offset, len, out) },
-        "kv_native_mmap_read",
-    )
+    if offset.checked_add(len).is_none_or(|end| end > desc.len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mmap_read: offset+len exceeds descriptor len",
+        ));
+    }
+    let path = desc.path_buf()?;
+    let file = OpenOptions::new().read(true).open(&path)?;
+    // Safety: read-only mapping over a regular file; bytes are immutable for
+    // the lifetime of the borrow, which ends before the function returns.
+    let mapping = unsafe { memmap2::Mmap::map(&file)? };
+    if mapping.len() < desc.len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mmap_read: backing file shorter than descriptor len",
+        ));
+    }
+    Ok(mapping[offset..offset + len].to_vec())
 }
 
 pub fn shm_create(name: &str, len: usize) -> io::Result<KvSharedMemoryDescriptor> {
