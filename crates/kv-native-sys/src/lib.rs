@@ -65,20 +65,6 @@ pub struct KvWalRecord {
 }
 
 unsafe extern "C" {
-    fn kv_native_wal_append(
-        path_ptr: *const u8,
-        path_len: usize,
-        kind: u8,
-        key_ptr: *const u8,
-        key_len: usize,
-        value_ptr: *const u8,
-        value_len: usize,
-    ) -> c_int;
-    fn kv_native_wal_replay(
-        path_ptr: *const u8,
-        path_len: usize,
-        out: *mut KvNativeBuffer,
-    ) -> c_int;
     fn kv_native_mmap_create(
         path_ptr: *const u8,
         path_len: usize,
@@ -315,31 +301,44 @@ pub fn remove_block(root: &Path, fingerprint: [u8; 16], ignore_not_found: bool) 
 }
 
 pub fn wal_append(path: &Path, kind: u8, key: &[u8], value: &[u8]) -> io::Result<()> {
-    let path = path_bytes(path);
-    let status = unsafe {
-        kv_native_wal_append(
-            path.as_ptr(),
-            path.len(),
-            kind,
-            key.as_ptr(),
-            key.len(),
-            value.as_ptr(),
-            value.len(),
-        )
-    };
-    status_to_result(status, "kv_native_wal_append")
+    if key.len() > u32::MAX as usize || value.len() > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wal_append: key/value exceeds u32::MAX",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .create(true)
+        .mode(0o644)
+        .open(path)?;
+    // If the file is fresh (size 0), prepend the WAL magic so that replay can
+    // distinguish a valid empty log from a corrupted prefix.
+    let metadata = file.metadata()?;
+    if metadata.len() == 0 {
+        file.write_all(WAL_MAGIC)?;
+    }
+    let mut header = [0_u8; 9];
+    header[0] = kind;
+    header[1..5].copy_from_slice(&u32::to_le_bytes(key.len() as u32));
+    header[5..9].copy_from_slice(&u32::to_le_bytes(value.len() as u32));
+    file.write_all(&header)?;
+    file.write_all(key)?;
+    file.write_all(value)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 pub fn wal_replay(path: &Path) -> io::Result<Vec<KvWalRecord>> {
-    let path = path_bytes(path);
-    let bytes = match read_buffer(
-        |out| unsafe { kv_native_wal_replay(path.as_ptr(), path.len(), out) },
-        "kv_native_wal_replay",
-    ) {
+    let bytes = match read_file(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
     decode_wal_records(&bytes)
 }
 
@@ -587,9 +586,9 @@ impl std::ops::Deref for KvNativeOwnedBytes {
     }
 }
 
-fn decode_wal_records(bytes: &[u8]) -> io::Result<Vec<KvWalRecord>> {
-    const WAL_MAGIC: &[u8; 8] = b"KVWAL001";
+const WAL_MAGIC: &[u8; 8] = b"KVWAL001";
 
+fn decode_wal_records(bytes: &[u8]) -> io::Result<Vec<KvWalRecord>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
