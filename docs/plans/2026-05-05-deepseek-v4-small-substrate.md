@@ -8,7 +8,53 @@
 [`infer/src/model/AGENTS.md`](../../infer/src/model/AGENTS.md) ·
 [`infer/src/backend/AGENTS.md`](../../infer/src/backend/AGENTS.md)
 **Owner:** unassigned
-**Status:** drafted, not yet started
+**Status:** scaffold landed 2026-05-05; MLA prefill+decode kernels pending
+
+---
+
+## 0a. Status (2026-05-05 — scaffold landed)
+
+The runtime scaffold + train CLI surface for the DSV4 substrate landed in
+three commits, all CPU-typecheck clean under both
+`--no-default-features --features no-cuda` and
+`--no-default-features --features cuda,no-cuda`:
+
+- **`09d22a49`** `feat(deepseek): scaffold infer/src/model/deepseek module skeleton`
+  — `infer/src/model/deepseek.rs` + `infer/src/model/deepseek/{config,
+  forward, mla, mlp, prefill, state, weights, batch_decode}.rs`,
+  `DeepseekRuntimeConfig` wrapping `DeepSeekConfig`, `DeepseekModel`
+  weights container with `MlaAttention` + `DenseMlp` + `DeepseekLayer`
+  fields, `DeepseekState` per-request mutable state delegating to
+  `GenerationStateBase`, `ModelForward` impl with concrete `State` /
+  `DecodeContext` / `PrefillContext` associated types. Every kernel-
+  touching body is `todo!("MLA kernel — see
+  docs/plans/2026-05-01-mla-kernel-design.md")`.
+- **`5f46c367`** `feat(deepseek): tensor-name coverage test + MLA q-path branch helpers`
+  — `validate_tensor_name_coverage(config)` walks every spec-emitted tensor
+  name (per-layer + MoE expert + MTP + global) and asserts each is
+  covered by exactly one shard rule. Two new unit tests; MLA gains
+  `uses_direct_q()` / `uses_lora_q()` introspection so the forward path
+  can branch on q-projection layout without re-reading the spec config.
+- **`06d86fee`** `feat(deepseek): pretrain-dsv4 driver fork + arle CLI wiring`
+  — `crates/train/src/commands/pretrain_dsv4.rs` (CPU stub mirroring
+  `pretrain::dispatch_from_args` shape; surfaces a clear
+  `AutogradModelPending` error citing this plan's §6); `TrainCommand::
+  PretrainDsv4(TrainPretrainDsv4Args)` in args.rs + `run_pretrain_dsv4`
+  + `resolve_pretrain_dsv4_invocation` in train_cli.rs. 5/5 unit tests
+  green; cli regression tests still 66/66.
+
+The smoke test
+[`infer/tests/dsv4_nano_smoke.rs`](../../infer/tests/dsv4_nano_smoke.rs)
+constructs the nano model and runs `forward_prefill` on tiny synthetic
+input, asserting the logits shape. It is `#[ignore]`'d today because
+every entry point is `todo!()`; remove the `#[ignore]` as part of the
+diff that lands MLA forward.
+
+**Next phase:** implement MLA prefill + decode CUDA kernels per
+[`docs/plans/2026-05-01-mla-kernel-design.md`](2026-05-01-mla-kernel-design.md)
+(multi-day). The matching Metal kernel (P4 in §8) follows; safetensors
+loader + nano CPU-reference forward + e2e numerical alignment land
+alongside the kernel work.
 
 ---
 
