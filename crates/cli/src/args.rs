@@ -694,9 +694,41 @@ pub(crate) struct TrainPretrainDsv4Args {
     #[arg(long, default_value = "nano")]
     pub(crate) deepseek_config: String,
 
-    /// Random seed for the (eventual) trainer.
+    /// Random seed for corpus-window sampling.
     #[arg(long)]
     pub(crate) seed: Option<u64>,
+
+    /// Total optimizer steps.
+    #[arg(long)]
+    pub(crate) steps: Option<usize>,
+
+    /// Micro-batch size in sequences per step.
+    #[arg(long)]
+    pub(crate) batch: Option<usize>,
+
+    /// Sequence length per sampled corpus window.
+    #[arg(long)]
+    pub(crate) seq: Option<usize>,
+
+    /// AdamW learning rate.
+    #[arg(long)]
+    pub(crate) lr: Option<f32>,
+
+    /// Emit progress every N optimizer steps.
+    #[arg(long)]
+    pub(crate) log_every: Option<usize>,
+
+    /// Save checkpoint every N optimizer steps.
+    #[arg(long)]
+    pub(crate) save_every: Option<usize>,
+
+    /// Autograd backend for training.
+    #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+    pub(crate) backend: BackendArg,
+
+    /// Checkpoint tensor dtype.
+    #[arg(long, value_enum)]
+    pub(crate) save_dtype: Option<SaveDtypeArg>,
 
     #[command(flatten)]
     pub(crate) render: RenderArgs,

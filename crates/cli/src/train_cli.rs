@@ -244,6 +244,17 @@ fn resolve_pretrain_dsv4_invocation(args: &TrainPretrainDsv4Args) -> Result<Reso
         argv.push("--seed".to_string());
         argv.push(seed.to_string());
     }
+    push_opt_value(&mut argv, "--steps", args.steps);
+    push_opt_value(&mut argv, "--batch", args.batch);
+    push_opt_value(&mut argv, "--seq", args.seq);
+    push_opt_value(&mut argv, "--lr", args.lr);
+    push_opt_value(&mut argv, "--log-every", args.log_every);
+    push_opt_value(&mut argv, "--save-every", args.save_every);
+    if let Some(backend) = args.backend.as_train_backend() {
+        argv.push("--backend".to_string());
+        argv.push(backend.to_string());
+    }
+    push_opt_save_dtype(&mut argv, args.save_dtype);
     argv.extend(args.extra.extra_args.iter().cloned());
 
     let mut notes = Vec::new();
@@ -252,7 +263,8 @@ fn resolve_pretrain_dsv4_invocation(args: &TrainPretrainDsv4Args) -> Result<Reso
     }
     notes.push(format!("resolved tokenizer {}", tokenizer_path.display()));
     notes.push(
-        "scaffold: train-side autograd DeepseekModel pending — see substrate plan §6".to_string(),
+        "train-side DeepSeek nano autograd model active; SKU-A/B remain external cold-path"
+            .to_string(),
     );
 
     Ok(ResolvedInvocation {

@@ -58,6 +58,27 @@ alongside the kernel work.
 
 ---
 
+
+## 0b. Status (2026-05-05 — nano autograd training landed)
+
+`arle train pretrain-dsv4 --deepseek-config nano` now runs an in-tree
+train-side autograd path instead of returning the scaffold-only pending error:
+
+- `crates/train/src/deepseek.rs` defines `DeepseekNanoModel`, a dense MLA
+  causal-LM fixture that consumes `DeepSeekConfig::nano()`, uses the
+  canonical DeepSeek tensor names, and exposes the existing `CausalLm` /
+  `GrpoPolicy` contracts for the generic trainer.
+- `crates/train/src/commands/pretrain_dsv4.rs` samples corpus windows, trains
+  with AdamW, writes trainer state plus `model.safetensors`, `config.json`,
+  `generation_config.json`, `tokenizer.json`, and publishes `latest`.
+- `crates/cli/src/args.rs` and `crates/cli/src/train_cli.rs` forward nano
+  training knobs (`--steps`, `--batch`, `--seq`, `--lr`, `--backend`,
+  `--save-dtype`, etc.) through the runtime-led CLI front door.
+
+This closes the in-tree **nano** training smoke path. SKU-A / SKU-B pretrain
+remain external cold-path work per §4; runtime MLA CUDA/Metal serving kernels
+remain the next runtime blocker.
+
 ## 0. Premise
 
 - **架构 ground truth = `crates/deepseek-spec/`** (MLA + DeepSeekMoE + MTP)。spec crate 当前以 V3 reference config 作为 known-good fixture, AGENTS.md 中定位为 *DeepSeek V4 readiness scaffold*。**V4 正式公开后的增量** (预计在 FP8 scaling 元数据形态、router 正则、context 长度三处) 通过补 spec hook 收敛, 不改本计划路线。
@@ -275,10 +296,10 @@ nano=64 / A=128 / B=192 → 都不满足 ≥(128, 64) 的 FA2 约束。三条
 
 ## 10. Definition of Done
 
-- [ ] `crates/deepseek-spec/`: `presets::{nano, tiny_dense, mini_moe}` 构造器 + 对应 JSON 模板 + `q_lora_rank=None` 测试
+- [x] `crates/deepseek-spec/`: `DeepSeekConfig::nano()` fixture + `q_lora_rank=None` tests; `tiny_dense` / `mini_moe` remain pending
 - [ ] `infer/src/model/deepseek.rs` 在 CUDA + Metal 双 backend 跑通 generation; `infer/tests/e2e_deepseek.rs` 全绿
 - [ ] `infer/src/ops/attention/mla.rs` (CUDA + Metal kernel)
 - [ ] `infer/src/model/deepseek/moe.rs` (DeepSeekMoE forward) —— 仅 SKU-B 必须
-- [ ] 三个 safetensors checkpoint + tokenizer 落 `models/deepseek-{nano,tiny-dense,mini-moe}/`
+- [x] nano safetensors + tokenizer export path via `arle train pretrain-dsv4`; `models/deepseek-{tiny-dense,mini-moe}/` remain pending external runs
 - [ ] `docs/experience/wins/` 至少 5 篇 bench: tiny-dense (CUDA / Metal)、mini-moe (CUDA / Metal)、MLA-vs-GQA 对比
 - [ ] V4 公开后的迁移指南一页 (`docs/plans/` 下, 含字段 diff + kernel 影响矩阵)
