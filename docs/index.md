@@ -6,7 +6,7 @@
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
 
-Last refreshed: 2026-05-01 (longctx Phase 1 SGLang-row close, F0–F4 multi-GPU scaffold, DeepSeek V4 readiness + DS0 spec crate).
+Last refreshed: 2026-05-06 (next-model priority order set: **DeepSeek V4 #1, Qwen 3.6 #2**; DSV4 runtime substrate + nano autograd training landed 2026-05-05; longctx Phase 1 SGLang-row close, F0–F4 multi-GPU scaffold, DS0 spec crate). Priority order is canonical in [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order).
 
 ## Canonical Truth Surfaces
 

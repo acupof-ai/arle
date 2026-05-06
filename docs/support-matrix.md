@@ -59,10 +59,18 @@ Notes:
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
 | Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. Metal DFlash is Beta; see §4a for the current validation note. |
-| Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. |
+| Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. Full Qwen 3.6 serving coverage is the **#2 next-model priority** — see roadmap note below. |
+| DeepSeek V4 | In progress — substrate landing | DS0 spec crate (`crates/deepseek-spec/`) ships config + tensor-name + `Shard` annotations; runtime model skeleton (`infer/src/model/deepseek/*`) + nano autograd training (`arle train pretrain-dsv4 --deepseek-config nano`) landed 2026-05-05. MLA forward kernels, DS4 CUDA MoE forward, DS5 NCCL collectives in forward are the active blockers. Not a serving target yet. **#1 next-model priority.** |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
+
+**Next-model roadmap priority** (canonical in [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order)):
+
+1. **DeepSeek V4 (DS4)** — substrate landing; DS3 MLA + DS4 CUDA MoE + DS5 collectives are the active runtime blockers.
+2. **Qwen 3.6** — planned / scoping; CUDA serving and kernel coverage land after the DS4 runtime substrate is producing benches. Metal load path already exists for diagnostic use.
+
+Other "Planned" families above sit behind these two and are not actively scheduled.
 
 ---
 

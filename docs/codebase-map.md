@@ -1,7 +1,11 @@
 # ARLE Codebase Map
 
-Updated 2026-05-01 after the F0–F4 multi-GPU scaffold, Phase 2 spec-decode
-plumbing, and `crates/deepseek-spec/` DS0 scaffold landed.
+Updated 2026-05-06 after the DSV4 runtime substrate scaffold + nano autograd
+training landed (2026-05-05). DSV4 is the **#1 next-model priority** and Qwen 3.6
+the **#2** — see
+[`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order).
+Earlier landings still in scope: F0–F4 multi-GPU scaffold, Phase 2 spec-decode
+plumbing, and `crates/deepseek-spec/` DS0 scaffold.
 
 This document is the canonical workspace-topology truth: where files live,
 what each crate owns, and where to start reading. For ownership boundaries
@@ -224,7 +228,7 @@ These crates remain independent after Route A:
   MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/kv-native-sys`: local persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors
 - `crates/qwen3-spec`, `crates/qwen35-spec`: shared train↔infer Qwen3 / Qwen3.5 config + canonical tensor-name contracts + `Shard` annotations consumed by the F1 sharded loader path
-- `crates/deepseek-spec`: DS0 scaffold crate landed 2026-05-01 — DeepSeek V3 / V4 config parsing, tensor-name builders, MLA/MoE/MTP `Shard` annotations. Implementation gating lives in [`docs/projects/2026-05-01-deepseek-v4-readiness.md`](projects/2026-05-01-deepseek-v4-readiness.md). No CUDA model module, MLA kernel, or MoE forward consumer yet
+- `crates/deepseek-spec`: DS0 scaffold crate landed 2026-05-01 — DeepSeek V3 / V4 config parsing, tensor-name builders, MLA/MoE/MTP `Shard` annotations. Runtime model skeleton (`infer/src/model/deepseek/*`) + nano autograd training (`arle train pretrain-dsv4 --deepseek-config nano`) landed 2026-05-05; MLA forward kernels, DS4 CUDA MoE forward, and DS5 NCCL collectives in forward remain the active runtime blockers. Implementation gating lives in [`docs/projects/2026-05-01-deepseek-v4-readiness.md`](projects/2026-05-01-deepseek-v4-readiness.md) and [`docs/plans/2026-05-05-deepseek-v4-small-substrate.md`](plans/2026-05-05-deepseek-v4-small-substrate.md). DS4 is the **#1 next-model priority** ([ROADMAP §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order))
 
 Current dependency direction:
 
