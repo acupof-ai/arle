@@ -25,6 +25,7 @@ use crate::backend::runtime::StopChunkProcessor;
 use crate::kv_tier::transport::disk::{DiskBlockLocation, DiskStore};
 use crate::kv_tier::{BlockId, KvTierAdapter, Tier};
 use crate::metrics::ServerMetrics;
+use crate::model_arch::ModelArchInfo;
 use crate::sampler::SamplingParams;
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
 use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
@@ -1232,6 +1233,9 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
     // speculative blocks inside decode_token, transparent to the scheduler.
     let mut backend = MetalBackend::with_options(options);
     backend.load(Path::new(model_path))?;
+    if let Some(config) = backend.config.as_ref() {
+        metrics.set_model_arch(config.arch_summary());
+    }
 
     // Snapshot DFlash metadata BEFORE the backend is leaked into the
     // scheduler thread. When DFlash is disabled at load time (either no

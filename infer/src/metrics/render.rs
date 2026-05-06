@@ -878,6 +878,12 @@ impl ServerMetrics {
         // backends populate `kv_gpu_blocks_{free,total}` from their own
         // pool views — `kv_gpu_utilization()` is the canonical fraction.
         let batch_occupancy = self.kv_gpu_utilization().clamp(0.0, 1.0);
+        let model_arch = self
+            .inner
+            .model_arch
+            .lock()
+            .ok()
+            .and_then(|summary| summary.clone());
 
         // KV-tier hit rates by canonical label. T0 = active GPU pool,
         // T1 = host pinned, T2 = local disk, T3 = remote. Backends
@@ -917,6 +923,7 @@ impl ServerMetrics {
             queue_depth: u32::try_from(waiting).unwrap_or(u32::MAX),
             active_requests: u32::try_from(active).unwrap_or(u32::MAX),
             batch_occupancy,
+            model_arch,
             kv_tier_hit_rates,
             spec_acceptance_rate,
             timestamp_ms,
@@ -1008,6 +1015,7 @@ impl ServerMetrics {
             "engine_queue_depth": telemetry.queue_depth,
             "engine_active_requests": telemetry.active_requests,
             "engine_batch_occupancy": telemetry.batch_occupancy,
+            "engine_model_arch": telemetry.model_arch,
             "engine_kv_tier_hit_rates": engine_kv_tier_hit_rates,
             "engine_spec_acceptance_rate": telemetry.spec_acceptance_rate,
             "engine_timestamp_ms": telemetry.timestamp_ms,

@@ -94,6 +94,8 @@ mod render;
 pub use histogram::{Histogram, HistogramSet, LATENCY_BUCKETS};
 use histogram::{micros_to_secs, secs_to_micros};
 
+use crate::model_arch::ModelArchSummary;
+
 // ============================================================================
 // ServerMetrics
 // ============================================================================
@@ -291,6 +293,7 @@ struct MetricsInner {
 
     // Model metadata.
     pub model_id: String,
+    pub model_arch: Mutex<Option<ModelArchSummary>>,
 }
 
 impl ServerMetrics {
@@ -376,6 +379,7 @@ impl ServerMetrics {
                 latest_request_cache: Mutex::new(RequestCacheStats::default()),
                 session_cache: Mutex::new(HashMap::new()),
                 model_id: model_id.to_string(),
+                model_arch: Mutex::new(None),
             }),
         }
     }
@@ -383,6 +387,13 @@ impl ServerMetrics {
     // -----------------------------------------------------------------------
     // Update helpers (called by scheduler)
     // -----------------------------------------------------------------------
+
+    /// Publish backend-neutral model architecture metadata after load.
+    pub fn set_model_arch(&self, summary: ModelArchSummary) {
+        if let Ok(mut model_arch) = self.inner.model_arch.lock() {
+            *model_arch = Some(summary);
+        }
+    }
 
     /// Record a completed request: update counters and observe latency histograms.
     pub fn record_request_completed(
@@ -1431,6 +1442,17 @@ mod tests {
     #[test]
     fn server_metrics_render_stats_json_agent_cache_fields() {
         let m = ServerMetrics::new("Qwen3-4B");
+        m.set_model_arch(crate::model_arch::ModelArchSummary {
+            arch: crate::model_registry::ModelArch::Qwen3,
+            hidden_size: 2560,
+            vocab_size: 151_936,
+            num_hidden_layers: 36,
+            num_kv_layers: 36,
+            num_kv_heads: 8,
+            num_q_heads: 32,
+            head_dim: 128,
+            kv_cache_bytes_per_token: 147_456,
+        });
         m.record_request_cache(
             Some(&crate::types::SessionId::from("w3-warm-000")),
             64,
@@ -1441,6 +1463,21 @@ mod tests {
         let payload = m.render_stats_json();
         assert_eq!(payload["prefix_hit_rate"], serde_json::json!(1.0));
         assert_eq!(payload["prefix_skip_rate"], serde_json::json!(0.5));
+        assert_eq!(
+            payload["engine_model_arch"]["arch"],
+            serde_json::json!("Qwen3")
+        );
+        assert_eq!(
+            payload["engine_model_arch"]["num_kv_layers"],
+            serde_json::json!(36)
+        );
+        assert_eq!(
+            m.snapshot_engine_telemetry()
+                .model_arch
+                .as_ref()
+                .map(crate::model_arch::ModelArchSummary::arch_label),
+            Some("Qwen3")
+        );
         assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));
         assert_eq!(payload["session_affinity_miss"], serde_json::json!(0));
         assert_eq!(
