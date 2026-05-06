@@ -141,7 +141,11 @@ changes.
   [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md) — mandatory
   report sections (Goal · Hypothesis · Params · Env · Results · Problems ·
   Learnings), goal taxonomy, watch-list during runs, and **auto-iteration
-  rules** (§7: when to loop, when to stop, information-volume triggers).
+  rules** (§6: when to loop, when to stop, information-volume triggers),
+  and **§7 hard-won protocol rules** (correctness gate, sweep≠fixed-c,
+  duration adequacy, param-alignment via the §3.2 envelope log, server
+  lifecycle hygiene). Internal info sources (§3: `/v1/stats` service trace,
+  scheduling envelope, K6 OOM detector) are first-class report content.
   Applies to both benchmarks and traces.
 - **MANDATORY — every runtime change produces a bench entry.** A change is
   not "done" until a dated entry lands under `docs/experience/wins/` (or
