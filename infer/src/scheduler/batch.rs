@@ -6,6 +6,7 @@ use std::{
 use crate::block_manager::{BlockId, BlockManager};
 use crate::events::{EngineEvent, EventSink, NoopEventSink};
 use crate::scheduler::policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
+use crate::scheduler::{LogicalDecodeRow, LogicalPrefillRow, LogicalServePlan};
 use crate::types::{InferenceMode, RequestEventKind, RequestId};
 
 use super::RequestPriority;
@@ -42,38 +43,6 @@ impl RunningRequest {
     }
 }
 
-/// Decode-only sub-batch.
-pub struct DecodeBatch {
-    pub req_ids: Vec<RequestId>,
-    /// Last generated token ID per request (caller fills from its own state).
-    pub input_ids: Vec<u32>,
-    /// KV block table per request.
-    pub block_tables: Vec<Vec<BlockId>>,
-}
-
-/// Prefill sub-batch (may be a chunk of a larger prompt).
-pub struct PrefillBatch {
-    pub req_ids: Vec<RequestId>,
-    /// Token IDs to process (the chunk).
-    pub input_ids: Vec<u32>,
-    /// Full sequence length after this chunk (prefix + chunk).
-    pub seq_lens: Vec<usize>,
-    /// KV block table per request (blocks for the full KV so far).
-    pub block_tables: Vec<Vec<BlockId>>,
-}
-
-/// Output of `BatchScheduler::schedule_step`.
-pub enum ScheduleDecision {
-    DecodeBatch(DecodeBatch),
-    PrefillBatch(PrefillBatch),
-    /// Chunked-prefill interleaved with decode in the same step.
-    Mixed {
-        decode: DecodeBatch,
-        prefill: PrefillBatch,
-    },
-    Idle,
-}
-
 /// Configuration for `BatchScheduler`.
 #[derive(Clone, Debug)]
 pub struct BatchSchedulerConfig {
@@ -104,7 +73,7 @@ impl Default for BatchSchedulerConfig {
 /// (decode + optional prefill chunk) using block-level KV accounting, but does
 /// not touch GPU memory. The caller is responsible for:
 /// - Tokenizing prompts before calling `add_request`.
-/// - Running the model forward pass with the returned `ScheduleDecision`.
+/// - Running the model forward pass with the returned `LogicalServePlan`.
 /// - Calling `advance_decode` after each successful decode step.
 /// - Calling `finish_request` when a request reaches EOS or max_tokens.
 pub struct BatchScheduler {
@@ -213,36 +182,34 @@ impl BatchScheduler {
 
     /// Schedule the next forward pass.
     ///
-    /// Returns `ScheduleDecision::Idle` when there is no work to do.
-    pub fn schedule_step(&mut self) -> ScheduleDecision {
+    /// Returns an idle `LogicalServePlan` when there is no work to do.
+    pub fn schedule_step(&mut self) -> LogicalServePlan {
         let preempted = self.ensure_decode_memory();
 
         let has_decode = !self.running.is_empty();
         let has_waiting = !self.waiting.is_empty();
 
         if !has_decode && !has_waiting {
-            return ScheduleDecision::Idle;
+            return LogicalServePlan::idle();
         }
 
-        let decode_batch = has_decode.then(|| self.build_decode_batch());
+        let decode_rows = if has_decode {
+            self.build_decode_rows()
+        } else {
+            Vec::new()
+        };
         let decode_tokens = self.running.len();
         let budget = self
             .config
             .max_tokens_per_step
             .saturating_sub(decode_tokens);
-        let prefill_batch = (!preempted && has_waiting && budget > 0)
-            .then(|| self.try_admit_prefill_chunk(budget))
-            .flatten();
+        let prefill_rows = (!preempted && has_waiting && budget > 0)
+            .then(|| self.try_admit_prefill_chunk(budget, decode_rows.len()))
+            .flatten()
+            .into_iter()
+            .collect();
 
-        match (decode_batch, prefill_batch) {
-            (Some(d), Some(p)) => ScheduleDecision::Mixed {
-                decode: d,
-                prefill: p,
-            },
-            (Some(d), None) => ScheduleDecision::DecodeBatch(d),
-            (None, Some(p)) => ScheduleDecision::PrefillBatch(p),
-            (None, None) => ScheduleDecision::Idle,
-        }
+        LogicalServePlan::new(decode_rows, prefill_rows)
     }
 
     pub fn waiting_len(&self) -> usize {
@@ -315,27 +282,25 @@ impl BatchScheduler {
         preempted
     }
 
-    fn build_decode_batch(&self) -> DecodeBatch {
+    fn build_decode_rows(&self) -> Vec<LogicalDecodeRow> {
         let n = self.running.len();
-        let mut req_ids = Vec::with_capacity(n);
-        let mut input_ids = Vec::with_capacity(n);
-        let mut block_tables = Vec::with_capacity(n);
+        let mut rows = Vec::with_capacity(n);
 
         let mut ids: Vec<RequestId> = self.running.keys().copied().collect();
         ids.sort_unstable();
 
         for id in ids {
             let req = &self.running[&id];
-            req_ids.push(req.req_id);
-            input_ids.push(0u32);
-            block_tables.push(req.blocks.clone());
+            let logical_kv_offset = req.prompt_len() + req.generated_tokens.saturating_sub(1);
+            rows.push(LogicalDecodeRow::new(
+                rows.len(),
+                req.req_id,
+                0,
+                logical_kv_offset,
+            ));
         }
 
-        DecodeBatch {
-            req_ids,
-            input_ids,
-            block_tables,
-        }
+        rows
     }
 
     fn prefill_chunk_budget(&self) -> usize {
@@ -351,7 +316,11 @@ impl BatchScheduler {
     ///
     /// Allocates new KV blocks for the chunk. Returns `None` if the queue is
     /// empty or KV memory is too full to admit even one token.
-    fn try_admit_prefill_chunk(&mut self, token_budget: usize) -> Option<PrefillBatch> {
+    fn try_admit_prefill_chunk(
+        &mut self,
+        token_budget: usize,
+        row_index: usize,
+    ) -> Option<LogicalPrefillRow> {
         let policy_chunk_budget = self.prefill_chunk_budget();
         let should_drop_empty = self
             .waiting
@@ -364,9 +333,9 @@ impl BatchScheduler {
 
         let (
             chunk,
-            block_table,
             req_id,
-            seq_len,
+            prompt_start,
+            prompt_end,
             is_last_chunk,
             total_tokens,
             emit_prefill_started,
@@ -374,15 +343,15 @@ impl BatchScheduler {
             let pending = self.waiting.front_mut()?;
 
             let total_tokens = pending.prompt_tokens.len();
-            let progress = pending.prefill_progress;
-            let is_first_chunk = progress == 0;
-            let remaining = total_tokens.saturating_sub(progress);
+            let prompt_start = pending.prefill_progress;
+            let is_first_chunk = prompt_start == 0;
+            let remaining = total_tokens.saturating_sub(prompt_start);
             let chunk_tokens = remaining.min(policy_chunk_budget).min(token_budget);
             if chunk_tokens == 0 {
                 return None;
             }
-            let chunk_end = progress + chunk_tokens;
-            let blocks_needed = self.block_manager.blocks_for_tokens(chunk_end);
+            let prompt_end = prompt_start + chunk_tokens;
+            let blocks_needed = self.block_manager.blocks_for_tokens(prompt_end);
             let have = pending.allocated_blocks.len();
             let extra_needed = blocks_needed.saturating_sub(have);
 
@@ -393,21 +362,19 @@ impl BatchScheduler {
                 }
             }
 
-            let chunk = pending.prompt_tokens[progress..chunk_end].to_vec();
-            let block_table = pending.allocated_blocks.clone();
+            let chunk = pending.prompt_tokens[prompt_start..prompt_end].to_vec();
             let req_id = pending.req_id;
-            let seq_len = chunk_end;
-            let is_last_chunk = chunk_end >= total_tokens;
+            let is_last_chunk = prompt_end >= total_tokens;
 
             if !is_last_chunk {
-                pending.prefill_progress = chunk_end;
+                pending.prefill_progress = prompt_end;
             }
 
             (
                 chunk,
-                block_table,
                 req_id,
-                seq_len,
+                prompt_start,
+                prompt_end,
                 is_last_chunk,
                 total_tokens,
                 is_first_chunk,
@@ -438,11 +405,13 @@ impl BatchScheduler {
             );
         }
 
-        Some(PrefillBatch {
-            req_ids: vec![req_id],
-            input_ids: chunk,
-            seq_lens: vec![seq_len],
-            block_tables: vec![block_table],
-        })
+        Some(LogicalPrefillRow::new(
+            row_index,
+            req_id,
+            chunk,
+            prompt_start,
+            prompt_end,
+            total_tokens,
+        ))
     }
 }
