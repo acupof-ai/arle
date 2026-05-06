@@ -106,8 +106,10 @@ fn build_scheduler(
     config.spec_acceptance_threshold = 0.0; // never auto-disable; we want the test to exercise the path
     if spec_enabled {
         config.spec_draft_model = DraftMode::SelfSpec;
+        config.spec_sparse_kv_enabled = true;
     }
     config.prefix_cache_enabled = true;
+    config.short_prompt_bypass_tokens = 0;
     Scheduler::with_config(
         model,
         tokenizer,
@@ -179,15 +181,16 @@ fn spec_decode_does_not_pollute_radix_for_subsequent_request_with_shared_prefix(
         return;
     }
 
-    // A and B share a 6-token prompt prefix. The divergent suffix forces
-    // the radix lookup to attach to the shared blocks on B's prefill.
-    let prompt_a = "The quick brown fox jumps over the lazy";
-    let prompt_b = "The quick brown fox jumps over the slow";
+    // A and B share more than one 16-token cache block. The divergent suffix
+    // forces B to attach to blocks published by A's prefill.
+    let shared_prefix = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega repeated stable scheduler prefix ";
+    let prompt_a = format!("{shared_prefix}branch A asks for a lazy draft continuation.");
+    let prompt_b = format!("{shared_prefix}branch B asks for a slow baseline continuation.");
     let max_tokens = 16;
 
-    let baseline_b = run_clean(&path, prompt_b, max_tokens);
+    let baseline_b = run_clean(&path, &prompt_b, max_tokens);
     let after_spec_b =
-        run_pair_spec_then_vanilla(&path, prompt_a, max_tokens, prompt_b, max_tokens);
+        run_pair_spec_then_vanilla(&path, &prompt_a, max_tokens, &prompt_b, max_tokens);
 
     assert_eq!(
         baseline_b, after_spec_b,
