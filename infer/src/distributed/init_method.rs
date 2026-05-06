@@ -380,8 +380,7 @@ mod tests {
     #[test]
     fn env_rendezvous_rejects_rank_out_of_world() {
         let err = EnvRendezvousConfig::from_lookup(|key| match key {
-            "RANK" => Some("2".to_string()),
-            "WORLD_SIZE" => Some("2".to_string()),
+            "RANK" | "WORLD_SIZE" => Some("2".to_string()),
             _ => None,
         })
         .expect_err("rank equal to world size must reject");

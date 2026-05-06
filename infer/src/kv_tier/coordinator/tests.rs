@@ -862,9 +862,7 @@ fn t1_t2_full_swap_cycle_release_then_readmit() {
     // disk at all — would still pass byte-equality).
     let dir = tempdir().unwrap();
     let disk_store = Arc::new(DiskStore::new(dir.path()));
-    let (coordinator, handle, events) = CoordinatorBuilder::new(4)
-        .disk_store(disk_store.clone())
-        .build();
+    let (coordinator, handle, events) = CoordinatorBuilder::new(4).disk_store(disk_store).build();
     // Pool sized large enough to hold the original region + a
     // pinning region simultaneously. The pinning region forces
     // the fetch-leg's reservation to a different offset, so a

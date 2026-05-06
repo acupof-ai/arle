@@ -1,23 +1,28 @@
-# TileLang AOT Integration (Phase 0)
+# TileLang AOT Integration
 
-Build-time AOT for the prefill HD128 paged attention kernel, gated behind
-`--features tilelang-attn`. Mirrors the Triton AOT track in
-`tools/triton/`. See `docs/plans/tilelang-integration.md` for the full plan.
+Build-time AOT for CUDA kernels generated from TileLang. The CUDA feature
+enables the TileLang paged-attention path through `tilelang-attn`; Qwen3.5
+chunk-wise GDR remains on the validated Triton AOT path until the TileLang GDR
+scaffold has a CUDA parity bench. See `docs/plans/tilelang-integration.md` and
+`docs/plans/2026-05-05-cuda-kernel-tilelang-unification.md` for the full plan.
 
 ## What this covers
 
-- TileLang kernel: `batch_prefill_paged_hd128.py` (BF16, causal, page_size=16).
-- AOT-specialized per Qwen3 head config in `SUPPORTED_HEADS`. Today:
-  `(16,8)` 0.6B/1.7B, `(32,8)` 4B/8B, `(40,8)` 14B, `(64,8)` 32B.
-  Build emits one cubin + C wrapper per config; Rust dispatches by
-  `(num_q_heads, num_kv_heads)`. Add a new size by extending the lockstep
-  lists in this kernel module, `build.rs`, `ffi/attention.rs`, and
-  `infer/src/ops/attention.rs`.
+- TileLang attention kernels: `batch_prefill_paged_hd128.py`,
+  `batch_prefill_paged_hd256.py`, and optional
+  `batch_decode_paged_hd256.py`.
+- AOT-specialized per Qwen head config. Build emits one cubin + C wrapper per
+  config; Rust dispatches by `(num_q_heads, num_kv_heads)`. Add a new size by
+  extending the lockstep lists in the kernel module, `build.rs`,
+  `ffi/attention.rs`, and `infer/src/ops/attention.rs`.
+- TileLang GDR scaffold: `gated_delta_rule.py` mirrors the seven Qwen3.5
+  chunk-wise stages, but `build.rs` does not link it into the runtime ABI yet.
+  Production GDR symbols are still generated from `tools/triton/`.
 - Build-time CUBIN generation under `OUT_DIR/tilelang_aot/<artifact>/`.
 - Generated C wrappers compiled into `libtilelang_kernels_aot.a` and
   linked alongside the Triton AOT artifacts.
-- Compile-time dispatch: `--features tilelang-attn` swaps the FlashInfer
-  `_run` call for the TileLang one. Default builds are unchanged.
+- Compile-time dispatch: `cuda` enables `tilelang-attn` by default;
+  `tilelang-decode-hd256` opts into the experimental HD256 decode tranche.
 
 ## Prerequisites
 
@@ -60,17 +65,17 @@ See [`docs/plans/sm-coverage.md`](../../../../docs/plans/sm-coverage.md) for tie
 Build through the workspace root when you want the `arle`/`cli` binaries:
 
 ```bash
-cargo build --release --features cuda,tilelang-attn
+cargo build --release --features cuda
 ```
 
 Build the runtime crate directly when you only need `infer`:
 
 ```bash
-cargo build --release -p infer --features cuda,tilelang-attn
+cargo build --release -p infer --features cuda
 ```
 
-For scripted server launches, set `INFER_FEATURES=cuda,tilelang-attn` before
-calling `scripts/start_infer.sh`.
+For scripted server launches, set `INFER_FEATURES=cuda` before calling
+`scripts/start_infer.sh`.
 
 Artifacts land under `target/release/build/cuda-kernels-*/out/tilelang_aot/`.
 The generated C wrapper embeds the cubin bytes via `cuModuleLoadData`, so
@@ -78,12 +83,15 @@ the produced binary is self-contained and survives `cargo clean` /
 relocation. Compare against the Triton AOT track which links the cubin
 through Triton's own runtime.
 
-## Phase 0 status
+## Current status
 
 - TileLang version pinned during the H100 spike; see
   `docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md`.
-- Default build (no `tilelang-attn`) is byte-identical to before this track
-  landed.
+- Triton AOT remains the production owner for Qwen3.5 GDR. Removing it before
+  a GPU-validated TileLang swap leaves unresolved GDR symbols or silently
+  changes an unbenchmarked hot path.
+- TileLang GDR is kept as source-level scaffold only; the runtime ABI swap is
+  a separate Phase 2b change with e2e_qwen35 + guidellm gates.
 
 ## macOS Metal dev checkout
 

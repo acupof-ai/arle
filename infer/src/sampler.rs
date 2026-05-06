@@ -328,11 +328,12 @@ mod tests {
 
         // All entries got the same treatment; deterministic argmax tie-break
         // must remain stable (first-index wins for any greedy implementation).
-        let max = logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
-        let argmax = logits.iter().position(|&l| l == max).unwrap();
+        let (argmax, _) = logits.iter().copied().enumerate().fold(
+            (0usize, f32::NEG_INFINITY),
+            |best, current| {
+                if current.1 > best.1 { current } else { best }
+            },
+        );
         assert_eq!(argmax, 0, "first index must win the all-equal tie");
     }
 

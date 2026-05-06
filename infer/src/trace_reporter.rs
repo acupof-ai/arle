@@ -723,7 +723,7 @@ mod tests {
     fn tracing_config_defaults_to_off_without_sinks() {
         let config = TracingConfig::resolve(TraceStartupConfig::default()).unwrap();
         assert_eq!(config.level, TraceLevel::Off);
-        assert_eq!(config.sample_rate, 0.0);
+        assert!(config.sample_rate.abs() < f64::EPSILON);
         assert!(!config.has_sink());
     }
 
@@ -735,7 +735,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(config.level, TraceLevel::Basic);
-        assert_eq!(config.sample_rate, 1.0);
+        assert!((config.sample_rate - 1.0).abs() < f64::EPSILON);
         assert!(config.has_sink());
     }
 

@@ -537,7 +537,9 @@ mod tests {
                 assert_eq!(requested, 1);
                 assert_eq!(available, 0);
             }
-            other => panic!("expected InsufficientGpuBlocks, got {other:?}"),
+            other @ AllocationError::InsufficientCpuBlocks { .. } => {
+                panic!("expected InsufficientGpuBlocks, got {other:?}")
+            }
         }
 
         // Pool is still drained, no phantom blocks appeared.

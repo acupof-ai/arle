@@ -315,7 +315,7 @@ mod tests {
                 Ok(())
             }
 
-            fn model_id(&self) -> &str {
+            fn model_id(&self) -> &'static str {
                 "mock-handle"
             }
         }

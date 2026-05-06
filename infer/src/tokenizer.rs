@@ -261,7 +261,7 @@ mod tests {
     /// pins two facts that together form the ChatML-injection threat model:
     ///
     /// 1. `Tokenizer::encode` IS content-blind — it WILL emit the special
-    ///    token IDs for `<|im_start|>` (151644) and `<|im_end|>` (151645)
+    ///    token IDs for `<|im_start|>` (151_644) and `<|im_end|>` (151_645)
     ///    when it sees those literal strings, regardless of envelope. The
     ///    safety boundary therefore lives upstream (chat protocol /
     ///    prompt-builder), NOT in the tokenizer.
@@ -272,6 +272,12 @@ mod tests {
     #[test]
     #[ignore = "requires model weights at models/Qwen3-4B"]
     fn test_encode_chatml_role_injection_is_envelope_blind() {
+        // These constants are pinned from Qwen3 tokenizer.json. If a future
+        // refactor decides to escape special tokens in user content, this
+        // test must change deliberately.
+        const IM_START_ID: u32 = 151_644;
+        const IM_END_ID: u32 = 151_645;
+
         let tokenizer = Tokenizer::from_file(MODEL_PATH).unwrap();
 
         // Injection payload: user content that pretends to open a system role.
@@ -287,11 +293,6 @@ mod tests {
         assert_eq!(ids, ids2, "encode must be deterministic");
 
         // Property (1): the encoder DID emit the ChatML special-token IDs.
-        // These constants are pinned from Qwen3 tokenizer.json. If a future
-        // refactor decides to escape special tokens in user content, this
-        // test must change deliberately.
-        const IM_START_ID: u32 = 151644;
-        const IM_END_ID: u32 = 151645;
         assert!(
             ids.contains(&IM_START_ID),
             "encoder must emit <|im_start|> id for literal marker in user content; \

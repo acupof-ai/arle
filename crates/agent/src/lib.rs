@@ -1360,12 +1360,6 @@ mod tests {
         /// `response_token_ids` regardless of the canned output. Drives
         /// the `tokens_is_none_when_engine_returns_empty_token_ids` test.
         force_empty_response_token_ids: bool,
-        /// When set, `tokenize()` errors. Kept for the (rare) call site
-        /// where a caller invokes the trait method directly; the agent
-        /// loop itself no longer calls tokenize() in the tool-result
-        /// path (codex Phase-2 P1: prompt deltas now cover that
-        /// territory honestly).
-        tokenize_fails: bool,
         /// When set, the SECOND and later sub-turns return a
         /// `prompt_token_ids` that does NOT prefix-match prior
         /// `prompt_ids + response_ids`. Drives the
@@ -1381,7 +1375,6 @@ mod tests {
                 prompts: Vec::new(),
                 max_tokens: Vec::new(),
                 force_empty_response_token_ids: false,
-                tokenize_fails: false,
                 break_prompt_extension: false,
             }
         }
@@ -1477,9 +1470,6 @@ mod tests {
         }
 
         fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-            if self.tokenize_fails {
-                anyhow::bail!("fake tokenize() failure");
-            }
             let mut token_ids = fake_token_ids(text);
             // Match the behavior in complete() — truncate when
             // break_prompt_extension is set and we've seen prior prompts.
