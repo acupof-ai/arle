@@ -14,7 +14,9 @@ use super::BackendInferenceEngine;
 use super::RequestHandleInferenceEngine;
 #[cfg(feature = "metal")]
 use super::stream::model_id_from_path;
-use super::{CompletionOutput, CompletionRequest, CompletionStreamDelta, InferenceEngine};
+use super::{
+    CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry, InferenceEngine,
+};
 
 #[cfg(feature = "metal")]
 impl RequestHandleInferenceEngine<MetalSchedulerHandle> {
@@ -152,6 +154,17 @@ impl InferenceEngine for LoadedInferenceEngine {
             Self::Metal(engine) => engine.tokenize(text),
             #[cfg(feature = "cpu")]
             Self::Cpu(engine) => engine.tokenize(text),
+        }
+    }
+
+    fn telemetry(&self) -> EngineTelemetry {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda { engine, .. } => engine.telemetry(),
+            #[cfg(feature = "metal")]
+            Self::Metal(engine) => engine.telemetry(),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.telemetry(),
         }
     }
 }

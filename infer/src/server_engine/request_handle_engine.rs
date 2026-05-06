@@ -4,7 +4,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::request_handle::RequestHandle;
 use crate::scheduler::{IncomingRequest, RequestPriority};
 
-use super::{CompletionOutput, CompletionRequest, CompletionStreamDelta, InferenceEngine};
+use super::{
+    CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry, InferenceEngine,
+};
 
 pub struct RequestHandleInferenceEngine<H: RequestHandle> {
     pub(super) model_id: String,
@@ -119,5 +121,16 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
             .tokenizer_clone()
             .ok_or_else(|| anyhow::anyhow!("backend has no tokenizer to tokenize() with"))?;
         tokenizer.encode(text)
+    }
+
+    fn telemetry(&self) -> EngineTelemetry {
+        // Both CUDA `SchedulerHandle` and Metal `MetalSchedulerHandle`
+        // expose a clone of the shared `ServerMetrics` instance via
+        // `RequestHandle::server_metrics()`. Empty default for handles
+        // that don't carry one (mocks/tests).
+        self.handle
+            .server_metrics()
+            .map(crate::metrics::ServerMetrics::snapshot_engine_telemetry)
+            .unwrap_or_default()
     }
 }

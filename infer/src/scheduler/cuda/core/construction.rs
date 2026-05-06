@@ -239,6 +239,7 @@ impl<M: ModelForward> Scheduler<M> {
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
+        let metrics_for_handle = metrics.clone();
         let disk_store = Arc::new(DiskStore::new(config.disk_store_root.clone()));
         let cluster_shared_backend = config
             .cluster_shared_backend
@@ -323,7 +324,8 @@ impl<M: ModelForward> Scheduler<M> {
             max_waiting_requests,
             Arc::clone(&waiting_count),
         )
-        .with_tokenizer(scheduler.tokenizer.clone());
+        .with_tokenizer(scheduler.tokenizer.clone())
+        .with_server_metrics(metrics_for_handle);
         debug_assert_eq!(handle.waiting_count(), 0);
 
         Ok((scheduler, handle))

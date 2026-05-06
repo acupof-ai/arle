@@ -30,8 +30,8 @@ pub use pool::{
 };
 pub use request_handle_engine::RequestHandleInferenceEngine;
 pub use types::{
-    CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
-    TokenUsage,
+    CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry, FinishReason,
+    InferenceEngine, TokenUsage,
 };
 
 #[cfg(test)]

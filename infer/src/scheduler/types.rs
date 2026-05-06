@@ -572,6 +572,12 @@ pub struct SchedulerHandle {
     waiting_count: Arc<AtomicUsize>,
     /// Maximum allowed waiting requests (0 = unlimited).
     max_waiting: usize,
+    /// Optional shared `ServerMetrics` clone — both CUDA and Metal
+    /// backends populate this from `with_server_metrics(...)` so the
+    /// HTTP layer can read unified `EngineTelemetry` via
+    /// `RequestHandle::server_metrics()`. `None` in legacy / test paths
+    /// that build the handle without metrics wiring.
+    server_metrics: Option<crate::metrics::ServerMetrics>,
 }
 
 impl SchedulerHandle {
@@ -596,6 +602,7 @@ impl SchedulerHandle {
             tokenizer: None,
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting: 0,
+            server_metrics: None,
         }
     }
 
@@ -613,6 +620,7 @@ impl SchedulerHandle {
             tokenizer: None,
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting,
+            server_metrics: None,
         }
     }
 
@@ -631,6 +639,7 @@ impl SchedulerHandle {
             tokenizer: None,
             waiting_count,
             max_waiting,
+            server_metrics: None,
         }
     }
 
@@ -648,6 +657,7 @@ impl SchedulerHandle {
             tokenizer: None,
             waiting_count,
             max_waiting,
+            server_metrics: None,
         }
     }
 
@@ -655,6 +665,22 @@ impl SchedulerHandle {
     pub fn with_tokenizer(mut self, tokenizer: Tokenizer) -> Self {
         self.tokenizer = Some(tokenizer);
         self
+    }
+
+    /// Attach a clone of the rolling `ServerMetrics` instance the
+    /// scheduler thread is writing into. The HTTP layer reads this back
+    /// through `RequestHandle::server_metrics()` to build the unified
+    /// `EngineTelemetry` snapshot.
+    #[must_use]
+    pub fn with_server_metrics(mut self, metrics: crate::metrics::ServerMetrics) -> Self {
+        self.server_metrics = Some(metrics);
+        self
+    }
+
+    /// Borrow the attached `ServerMetrics` if `with_server_metrics` was
+    /// called when the handle was built.
+    pub fn server_metrics(&self) -> Option<&crate::metrics::ServerMetrics> {
+        self.server_metrics.as_ref()
     }
 
     /// Submit a request to the scheduler.
