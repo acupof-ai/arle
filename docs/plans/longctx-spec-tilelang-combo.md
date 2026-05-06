@@ -59,13 +59,25 @@ ARLE 已有四条独立强项:
 
 每个 milestone 假设 backend-unification 已经到 M3(统一 schedule IR)。在那之前本计划只能做 §M_a 的 prep work(API + benchmark harness),不能做核心 fuse。
 
-### M_a — Spec-decode benchmark harness(独立可做,与 unification 并行)
+### M_a — Spec-decode bench + runtime knob(独立可做,与 unification 并行)
 
-不依赖 unification。给现有 CUDA 路径加一个最简 EAGLE-1 draft head(单层 Transformer)+ greedy verify,landing 在 `infer/src/speculative.rs`(已存在 stub)和 `crates/cuda-kernels/csrc/spec/`(新)。
+**Reality check (2026-05-07)**:`infer/src/speculative.rs` 已有 721 行框架,
+`spec_decode_correctness` + `magicdec_self_spec_integration` 共 9 个测试
+全部 ok(self-spec / external-draft / sparse self-spec / persistent state)。
+真正缺的是**生产路径 + bench harness**:
+
+1. **`arle serve` CLI 缺 `--num-speculative-tokens K` / `--spec-mode {self,external,sparse}`**
+   开关。现在 spec-decode 框架只在测试里挂得上,CLI/HTTP 跑不进去。
+2. **`scripts/bench_spec_decode.sh`**(新,wrap `bench_guidellm.sh`),先开
+   `INFER_DETERMINISTIC=0`(production fast path)跑 vanilla baseline,再
+   开 spec-decode 同 prompt set 跑一次,出 throughput / TTFT / acceptance-rate
+   对比表。
+3. **acceptance rate metric**:`SpecMetrics` 已存在但是没接到 `ServerMetrics::snapshot_engine_telemetry`(M1 的 EngineTelemetry);加一行让 acceptance rate 走 telemetry,bench 脚本可以 scrape。
 
 **Acceptance**:
-- `cargo test --release -p infer --features cuda --test spec_decode_correctness` 通过(已存在测试文件)。
-- `scripts/bench_guidellm.sh spec-baseline` 出 1.5×~2× 上 Qwen3-4B + EAGLE-S 的 throughput(对比无 spec-decode)。
+- `arle serve --num-speculative-tokens 4 --spec-mode self` 端到端跑通,Qwen3-4B 上 acceptance ≥ 0.6。
+- `scripts/bench_spec_decode.sh self-spec-baseline` 产出 wins entry,vanilla vs spec-decode 矩阵 ≥ 1.4× decode-heavy throughput。
+- `EngineTelemetry::spec_acceptance_rate` 字段 + `/v1/stats` JSON 渲染。
 
 ### M_b — TileLang fused draft+verify kernel
 
