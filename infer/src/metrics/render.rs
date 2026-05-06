@@ -902,6 +902,14 @@ impl ServerMetrics {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        // None until any draft tokens have been verified — the accumulator
+        // starts at 0 and would otherwise emit a misleading 1.0 (the
+        // optimistic-start convention used by `AcceptanceTracker::current_rate`,
+        // which is per-request and resets, vs the global ppm gauge which is
+        // monotonic across all requests).
+        let spec_acceptance_rate =
+            (self.spec_verified_tokens_total() > 0).then(|| self.spec_acceptance_rate());
+
         crate::server_engine::EngineTelemetry {
             ttft_us,
             itl_p50_us,
@@ -910,6 +918,7 @@ impl ServerMetrics {
             active_requests: u32::try_from(active).unwrap_or(u32::MAX),
             batch_occupancy,
             kv_tier_hit_rates,
+            spec_acceptance_rate,
             timestamp_ms,
         }
     }
@@ -1000,6 +1009,7 @@ impl ServerMetrics {
             "engine_active_requests": telemetry.active_requests,
             "engine_batch_occupancy": telemetry.batch_occupancy,
             "engine_kv_tier_hit_rates": engine_kv_tier_hit_rates,
+            "engine_spec_acceptance_rate": telemetry.spec_acceptance_rate,
             "engine_timestamp_ms": telemetry.timestamp_ms,
         })
     }

@@ -121,6 +121,11 @@ pub struct EngineTelemetry {
     pub batch_occupancy: f64,
     /// Per-tier hit rates keyed by `"T0"` / `"T1"` / `"T2"` / `"T3"`.
     pub kv_tier_hit_rates: HashMap<String, f64>,
+    /// Aggregate speculative-decode acceptance rate (accepted / verified
+    /// draft tokens), 0.0..=1.0. `None` until at least one verified
+    /// speculation step has landed; matches the `infer_spec_acceptance_rate`
+    /// Prometheus gauge.
+    pub spec_acceptance_rate: Option<f64>,
     /// Wall-clock timestamp of the snapshot (millis since UNIX epoch).
     pub timestamp_ms: u64,
 }
