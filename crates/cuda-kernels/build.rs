@@ -924,6 +924,9 @@ fn main() {
     // Keep a stable compile order independent of filesystem iteration order.
     cu_files.sort();
 
+    println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
+    let ccbin = std::env::var("NVCC_CCBIN").ok();
+
     let mut obj_files = Vec::new();
     for cu_file in &cu_files {
         let stem = cu_file.file_stem().unwrap().to_str().unwrap();
@@ -936,6 +939,9 @@ fn main() {
             obj_file.to_string_lossy().to_string(),
             "-O3".to_string(),
         ];
+        if let Some(bin) = ccbin.as_deref() {
+            nvcc_args.push(format!("-ccbin={bin}"));
+        }
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
         // Ensure `#include "common.cuh"` resolves from any domain subdir
