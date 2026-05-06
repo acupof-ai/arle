@@ -11,7 +11,7 @@ use crate::model::{
     SchedulerRuntimeWorkspaceBudget, SparseKvDraftView, SpecVerifyOutput, SpecVerifyRequest,
     decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
-use crate::ops;
+use crate::ops::{self, OpsBackend};
 use crate::sampler::SamplingParams;
 use cuda_kernels::TokenKVPool;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
@@ -610,9 +610,10 @@ impl ModelForward for Qwen3Model {
             Some(logits) if logits.seq_len >= slot_indices.len() => logits,
             _ => return Ok(()),
         };
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         for (b, &si) in slot_indices.iter().enumerate() {
-            ops::extract_vec_into(&self.ctx, logits, b, &mut states[si].decode_bufs.logits)?;
+            ops_backend.extract_vec_into(logits, b, &mut states[si].decode_bufs.logits)?;
             states[si].base.prefill_logits = None;
         }
 

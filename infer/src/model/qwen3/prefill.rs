@@ -280,7 +280,7 @@ impl Qwen3Model {
         let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
         for (request, seq) in requests.iter().zip(sequences) {
             let last_token = seq.token_offset + seq.seq_len - 1;
-            ops::extract_vec_into(&self.ctx, hidden, last_token, &mut bufs.last_hidden)?;
+            ops_backend.extract_vec_into(hidden, last_token, &mut bufs.last_hidden)?;
             ops_backend.rms_norm_into(
                 &bufs.last_hidden,
                 &self.norm,
@@ -590,7 +590,7 @@ impl Qwen3Model {
         self.layer_communicator
             .post_attn_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
-        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+        ops_backend.add_batch_into(hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
         crate::model::common::debug_dump_hidden(
             &self.ctx,
@@ -622,7 +622,7 @@ impl Qwen3Model {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
             }
         }
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.down_proj.as_ref() {
@@ -632,7 +632,7 @@ impl Qwen3Model {
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
-        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+        ops_backend.add_batch_into(hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
         crate::model::common::debug_dump_hidden(
             &self.ctx,
@@ -949,7 +949,7 @@ impl Qwen3Model {
             ops::add_bf16_into_f32(&self.ctx, r, &bufs.o_buf)?;
             ops::cast_f32_to_bf16(&self.ctx, r, hidden)?;
         } else {
-            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            ops_backend.add_batch_into(hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
             std::mem::swap(hidden, &mut bufs.hidden_out);
         }
         crate::model::common::debug_dump_hidden(
@@ -995,7 +995,7 @@ impl Qwen3Model {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
             }
         }
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.down_proj.as_ref() {
@@ -1010,7 +1010,7 @@ impl Qwen3Model {
             ops::add_bf16_into_f32(&self.ctx, r, &bufs.o_buf)?;
             ops::cast_f32_to_bf16(&self.ctx, r, hidden)?;
         } else {
-            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            ops_backend.add_batch_into(hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
             std::mem::swap(hidden, &mut bufs.hidden_out);
         }
         crate::model::common::debug_dump_hidden(
