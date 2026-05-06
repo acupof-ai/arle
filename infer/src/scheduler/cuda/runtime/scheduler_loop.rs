@@ -325,6 +325,12 @@ impl<M: ModelForward> Scheduler<M> {
             if self.slot_has_pending_gpu_work(slot_idx) {
                 continue;
             }
+            if self
+                .request(slot_idx)
+                .is_some_and(|req| req.delta_tx.is_closed())
+            {
+                self.finish_slot(slot_idx);
+            }
             let finished = matches!(
                 self.request(slot_idx).map(|req| &req.phase),
                 Some(Phase::Finished)
