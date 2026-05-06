@@ -764,7 +764,7 @@ impl MetalQwen35PrefixRuntime {
     fn persist_snapshot(&mut self, snapshot: &Qwen35PrefixSnapshot) -> Result<()> {
         if !self.tier_adapter.has_disk_tier() {
             return Ok(());
-        };
+        }
         let token_count = snapshot.token_ids.len();
         if token_count < self.block_size || !token_count.is_multiple_of(self.block_size) {
             return Ok(());
@@ -821,7 +821,7 @@ impl MetalQwen35PrefixRuntime {
     ) -> Result<bool> {
         if !self.tier_adapter.has_disk_tier() {
             return Ok(false);
-        };
+        }
         let Some(location) = self
             .disk_entries
             .get(prefix_key)
@@ -855,7 +855,7 @@ impl MetalQwen35PrefixRuntime {
     fn reconcile_disk_entries(&mut self) -> Result<()> {
         if !self.tier_adapter.has_disk_tier() {
             return Ok(());
-        };
+        }
         let adapter = self.tier_adapter.clone();
         adapter
             .visit_disk_payload_prefixes(
