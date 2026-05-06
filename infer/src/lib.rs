@@ -18,6 +18,7 @@ pub mod http_server;
 pub mod kv_tier;
 pub mod logging;
 pub mod metrics;
+pub mod model_arch;
 pub mod model_registry;
 pub mod model_source;
 pub mod prefix_cache;
