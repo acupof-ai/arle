@@ -93,7 +93,24 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
         req: CompletionRequest,
         tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()> {
-        self.submit_request(req, tx)
+        // Backend contract (matches BackendInferenceEngine): complete_stream
+        // blocks until the request finishes, with all deltas already on `tx`.
+        // Forward via an internal channel so we can wait for the finish
+        // marker before returning.
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.submit_request(req, inner_tx)?;
+        while let Some(delta) = inner_rx.blocking_recv() {
+            let finished = delta.finish_reason.is_some();
+            if tx.send(delta).is_err() {
+                // Consumer dropped — drain remaining deltas silently.
+                while inner_rx.blocking_recv().is_some() {}
+                return Ok(());
+            }
+            if finished {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
