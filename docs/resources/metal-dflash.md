@@ -56,7 +56,7 @@ Not supported:
 |---|---|---|
 | `mlx-community/Qwen3.5-4B-MLX-4bit` | `z-lab/Qwen3.5-4B-DFlash` | [2026-04-19 default-on ship](../experience/wins/2026-04-19-metal-qwen35-concurrent-dflash-default-on.md), [2026-04-20 prefill fast-forward](../experience/wins/2026-04-20-dflash-prefill-fastforward.md), [2026-04-20 batched `async_eval`](../experience/wins/2026-04-20-dflash-batched-async-eval.md) |
 | `mlx-community/Qwen3.6-35B-A3B-4bit` | `z-lab/Qwen3.6-35B-A3B-DFlash` | local smoke + single-request DFlash landing in `feat(metal): support qwen36 dflash draft` |
-| `mlx-community/Qwen3-4B-bf16` | `z-lab/Qwen3-4B-DFlash-b16` | [2026-04-14 Qwen3 5.9× decode bench](../experience/wins/2026-04-14-metal-dflash-qwen3.md) |
+| `mlx-community/Qwen3-4B-bf16` | `z-lab/Qwen3-4B-DFlash-b16` | 2026-04-14 Qwen3 5.9× decode bench (entry retired 2026-04-25 truth-surface cleanup) |
 
 ## Runtime map
 
@@ -271,8 +271,8 @@ see this on a build older than `3bc8802`, rebuild.
 2. Remove `--speculative-tokens` if set.
 3. Compare `generation_tps`, not total wall time.
 4. For small effects (<10%): run matched-A/B in two separate sessions per
-   [`feedback_matched_ab_for_small_bench_effects.md`](../../memory/feedback_matched_ab_for_small_bench_effects.md)
-   before concluding either way.
+   `feedback_matched_ab_for_small_bench_effects.md` before concluding
+   either way.
 
 **No tokenizer in draft repo**
 Expected. The target tokenizer is the source of truth; the draft checkpoint
