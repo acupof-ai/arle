@@ -11,6 +11,8 @@ use crate::model::{
     SchedulerRuntimeWorkspaceBudget, SparseKvDraftView, SpecVerifyOutput, SpecVerifyRequest,
     decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
+use crate::model_arch::ModelArchInfo;
+use crate::model_registry::ModelArch;
 use crate::ops::{self, OpsBackend};
 use crate::sampler::SamplingParams;
 use cuda_kernels::TokenKVPool;
@@ -286,30 +288,6 @@ impl ModelForward for Qwen3Model {
             .saturating_add(prefill_workspace)
             .saturating_add(mixed_workspace)
             .saturating_add(128 * 1024 * 1024)
-    }
-
-    fn kv_cache_bytes_per_token(&self) -> usize {
-        // 2 (K+V) * num_layers * num_kv_heads * head_dim * 2 (bf16 = 2 bytes)
-        2 * self.config.num_hidden_layers
-            * self.config.num_key_value_heads
-            * self.config.head_dim
-            * 2
-    }
-
-    fn num_kv_layers(&self) -> usize {
-        self.config.num_hidden_layers
-    }
-
-    fn num_kv_heads(&self) -> usize {
-        self.config.num_key_value_heads
-    }
-
-    fn head_dim(&self) -> usize {
-        self.config.head_dim
-    }
-
-    fn num_q_heads(&self) -> usize {
-        self.config.num_attention_heads
     }
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
@@ -751,6 +729,49 @@ impl ModelForward for Qwen3Model {
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
         // The LoRA-aware batched decode runs eagerly, so skip warmup.
         self.enable_cuda_graph && self.lora.is_none()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ModelArchInfo for Qwen3Model {
+    fn arch_kind(&self) -> ModelArch {
+        ModelArch::Qwen3
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn num_hidden_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn num_kv_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.config.num_key_value_heads
+    }
+
+    fn num_q_heads(&self) -> usize {
+        self.config.num_attention_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.config.head_dim
+    }
+
+    fn kv_cache_bytes_per_token(&self) -> usize {
+        // 2 (K+V) * num_layers * num_kv_heads * head_dim * 2 (bf16 = 2 bytes)
+        2 * self.config.num_hidden_layers
+            * self.config.num_key_value_heads
+            * self.config.head_dim
+            * 2
     }
 }
 

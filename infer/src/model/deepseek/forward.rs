@@ -22,6 +22,10 @@ use crate::model::generation_state::GenerationStateBase;
 #[cfg(feature = "cuda")]
 use crate::model::{MixedBatchRequest, ModelForward};
 #[cfg(feature = "cuda")]
+use crate::model_arch::ModelArchInfo;
+#[cfg(feature = "cuda")]
+use crate::model_registry::ModelArch;
+#[cfg(feature = "cuda")]
 use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, PagedKVPool};
@@ -57,34 +61,6 @@ impl ModelForward for DeepseekModel {
         _pool: &PagedKVPool,
     ) -> Result<Self::PrefillContext> {
         Ok(DeepseekPrefillContext::new())
-    }
-
-    fn kv_cache_bytes_per_token(&self) -> usize {
-        // MLA stores a single latent vector per token of width
-        // `kv_lora_rank + qk_rope_head_dim`, in bf16 (2 bytes), across all
-        // layers. KV cache budgeting in `infer/src/scheduler/` reads this to
-        // size the paged pool — the static formula is kernel-independent.
-        let latent_dim = self.config.kv_lora_rank + self.config.qk_rope_head_dim;
-        2 * self.config.num_hidden_layers * latent_dim
-    }
-
-    fn num_kv_layers(&self) -> usize {
-        self.config.num_hidden_layers
-    }
-
-    fn num_kv_heads(&self) -> usize {
-        // MLA latent KV is single-head per token (the per-head split happens
-        // inside `kv_b_proj`); the page-pool API still expects an integer.
-        1
-    }
-
-    fn head_dim(&self) -> usize {
-        // Latent dim used by the paged-KV layout — see substrate plan §6.1.
-        self.config.kv_lora_rank + self.config.qk_rope_head_dim
-    }
-
-    fn num_q_heads(&self) -> usize {
-        self.config.num_attention_heads
     }
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
@@ -137,5 +113,52 @@ impl ModelForward for DeepseekModel {
 
     fn device_context(&self) -> &DeviceContext {
         &self.ctx
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ModelArchInfo for DeepseekModel {
+    fn arch_kind(&self) -> ModelArch {
+        ModelArch::DeepSeekV4
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn num_hidden_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn num_kv_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        // MLA latent KV is single-head per token (the per-head split happens
+        // inside `kv_b_proj`); the page-pool API still expects an integer.
+        1
+    }
+
+    fn num_q_heads(&self) -> usize {
+        self.config.num_attention_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        // Latent dim used by the paged-KV layout — see substrate plan §6.1.
+        self.config.kv_lora_rank + self.config.qk_rope_head_dim
+    }
+
+    fn kv_cache_bytes_per_token(&self) -> usize {
+        // MLA stores a single latent vector per token of width
+        // `kv_lora_rank + qk_rope_head_dim`, in bf16 (2 bytes), across all
+        // layers. KV cache budgeting in `infer/src/scheduler/` reads this to
+        // size the paged pool; the static formula is kernel-independent.
+        let latent_dim = self.config.kv_lora_rank + self.config.qk_rope_head_dim;
+        2 * self.config.num_hidden_layers * latent_dim
     }
 }
