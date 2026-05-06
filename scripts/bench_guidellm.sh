@@ -51,6 +51,12 @@
 #   * guidellm, curl, jq on PATH
 #   * infer HTTP server is already running at --target
 #     (start it with: scripts/start_infer.sh)
+#   * server --max-seq-len ≥ canonical prompt + canonical output + slack
+#     (canonical 4096 + 256, but synthetic tokenizer adds BOS / EOS / chat-template
+#     overhead — observed actual prompts at 4097 tokens vs server max_input 4090
+#     when launched with --max-seq-len 4096. Bump to ≥ 5120 to absorb the
+#     overhead, or to 8192 for the longctx-32k preset. See
+#     docs/experience/errors/2026-05-07-m3-guidellm-bench-stuck.md.)
 #
 # Side effects:
 #   * Writes raw artefacts to bench-output/<date>-<label>[-runN]/
