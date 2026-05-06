@@ -12,6 +12,8 @@ use crate::model::{
     GenerationState, ModelForward, PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget,
     decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
+use crate::model_arch::ModelArchInfo;
+use crate::model_registry::ModelArch;
 use crate::ops;
 use crate::sampler::SamplingParams;
 use cuda_kernels::TokenKVPool;
@@ -364,31 +366,6 @@ impl ModelForward for Qwen35Model {
 
     fn max_concurrent_prefill_requests(&self) -> Option<usize> {
         Some(1)
-    }
-
-    fn kv_cache_bytes_per_token(&self) -> usize {
-        // Only full-attention layers have KV cache (linear layers use recurrent state).
-        // 2 (K+V) * num_full_attn_layers * num_kv_heads * head_dim * 2 (bf16 = 2 bytes)
-        2 * self.config.num_full_attention_layers()
-            * self.config.num_key_value_heads
-            * self.config.head_dim
-            * 2
-    }
-
-    fn num_kv_layers(&self) -> usize {
-        self.config.num_full_attention_layers()
-    }
-
-    fn num_kv_heads(&self) -> usize {
-        self.config.num_key_value_heads
-    }
-
-    fn head_dim(&self) -> usize {
-        self.config.head_dim
-    }
-
-    fn num_q_heads(&self) -> usize {
-        self.config.num_attention_heads
     }
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
@@ -758,5 +735,49 @@ impl ModelForward for Qwen35Model {
             )?);
         }
         Ok(tokens)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ModelArchInfo for Qwen35Model {
+    fn arch_kind(&self) -> ModelArch {
+        ModelArch::Qwen35
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn num_hidden_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+
+    fn num_kv_layers(&self) -> usize {
+        self.config.num_full_attention_layers()
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.config.num_key_value_heads
+    }
+
+    fn num_q_heads(&self) -> usize {
+        self.config.num_attention_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.config.head_dim
+    }
+
+    fn kv_cache_bytes_per_token(&self) -> usize {
+        // Only full-attention layers have KV cache (linear layers use recurrent state).
+        // 2 (K+V) * num_full_attn_layers * num_kv_heads * head_dim * 2 (bf16 = 2 bytes)
+        2 * self.config.num_full_attention_layers()
+            * self.config.num_key_value_heads
+            * self.config.head_dim
+            * 2
     }
 }

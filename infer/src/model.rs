@@ -268,7 +268,7 @@ pub trait GenerationState {
 /// - `forward_prefill`: process multiple tokens, populate KV cache
 /// - `forward_decode`: process exactly one token, use existing KV cache
 /// - `forward_decode_batch`: process B tokens from B requests in one pass
-pub trait ModelForward: Send {
+pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
     type State: GenerationState + Send;
 
     /// Pre-allocated buffers for batched decode, owned by the scheduler.
@@ -301,22 +301,6 @@ pub trait ModelForward: Send {
         _prefill_budget_tokens: usize,
         _pool: &PagedKVPool,
     ) -> Result<Self::PrefillContext>;
-
-    /// KV cache memory cost per token in bytes (across all layers, K+V, bf16).
-    fn kv_cache_bytes_per_token(&self) -> usize;
-
-    /// Number of KV cache layers (for paged KV pool sizing).
-    /// For hybrid models, this is the number of full-attention layers only.
-    fn num_kv_layers(&self) -> usize;
-
-    /// Number of KV heads per layer (for paged KV pool sizing).
-    fn num_kv_heads(&self) -> usize;
-
-    /// Head dimension (for paged KV pool sizing).
-    fn head_dim(&self) -> usize;
-
-    /// Number of query attention heads (for TileLang dispatch).
-    fn num_q_heads(&self) -> usize;
 
     /// Prefill: process multiple tokens, populate KV cache and produce logits.
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()>;
