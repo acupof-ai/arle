@@ -18,6 +18,7 @@
 mod batch;
 pub mod forward_batch;
 pub mod metrics;
+pub mod plan;
 pub mod policy;
 mod types;
 
@@ -35,6 +36,10 @@ pub use batch::{
 pub use cuda::Scheduler;
 pub use forward_batch::{
     ForwardBatch, ForwardBatchKind, IntermediateTensorMeta, IntermediateTensors, TensorPayload,
+};
+pub use plan::{
+    GeneratedToken, LogicalBatchShape, LogicalDecodeRow, LogicalPlanLowering, LogicalPrefillRow,
+    LogicalServePlan, LogicalSparseDraftView, LogicalSpecDecodeRow, LogicalStepOutput,
 };
 pub use types::{
     DraftMode, IncomingRequest, RequestPriority, RequestSpecConfig, RuntimeEnvelopeOverrides,
