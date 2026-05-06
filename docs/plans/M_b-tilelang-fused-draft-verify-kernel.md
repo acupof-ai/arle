@@ -4,6 +4,47 @@
 > 前置:M_a 已完成(`d58e274`,acceptance-rate 接 EngineTelemetry),
 > backend-unification M3 不强依赖(M_b 在 kernel 层,不动 scheduler IR)。
 
+## P0 finding (2026-05-07) — caller-side reality differs from §1.1 assumption
+
+**Survey trigger**: Task #12 (caller interface survey) exposed two facts the
+original draft assumed away:
+
+1. **`infer/src/speculative/cuda.rs::DraftEngine` is a full Qwen3Model**
+   (`model: Mutex<Qwen3Model>`). When `--spec-draft-model external:<path>` is
+   used, the "draft model" is a separate complete Qwen3 inference. Its
+   weights are GiBs, **not** the ~32 KB tile that §1.3 shmem budget requires.
+   The fused-shmem-draft path in §1.1 therefore needs a NEW tiny EAGLE-1
+   / Medusa head — that does not currently exist in the codebase.
+
+2. **The verify caller surface is `SpecVerifyRequest`** at `infer/src/model.rs:56`,
+   carrying `input_tokens = [last_committed] ++ draft_tokens` (K+1 tokens),
+   `draft_tokens` (K), and `slot_idx`. The verify path runs that K+1-token
+   row through the existing **prefill** kernels (Qwen3
+   `forward_prefill` for K+1 multi-Q rows, paged KV is already in pool).
+   So the "verify" is structurally already a one-launch operation on the
+   target side. **The two-launch overhead lives entirely on the draft
+   side**, not between draft and verify.
+
+This re-frames M_b. The actual fusion opportunity splits into two distinct
+sub-tracks:
+
+- **M_b.1 (fast)**: a tiny EAGLE-1-style head (draft_dim ≤ 1024,
+  single-layer single-head MLA-like attention, ≤ 32 KB shmem-resident
+  weights). The fused kernel becomes "draft head pass + verify-prefill" in
+  one launch. **Requires draft-head training** — not free; pre-trained
+  EAGLE-1 heads exist for Llama / Vicuna only, not Qwen3 (verify with
+  `huggingface.co/eagle3-qwen3` lookup before commit).
+- **M_b.2 (no-train)**: keep the existing `DraftMode::SelfSpec` (target
+  reuses its own scoring) and fuse only the **draft-attention sparse pass +
+  verify-attention dense pass** into one launch by sharing prefix K/V shmem
+  load. This matches MagicDec architecture (already wired through the
+  `spec_sparse_kv_enabled` flag). No new training. Ceiling speed-up is
+  smaller (the pure sparse-vs-dense pass overlap is ≤ ~15%, not ~30%).
+
+**Recommendation for the manager review (this entry)**: do M_b.2 first
+because it is no-train and uses already-shipped `SparseKvDraftView` IR;
+defer M_b.1 to v2 unless an EAGLE-Qwen3 head is publicly available.
+
 ## 0. Why fuse
 
 现有 spec-decode 路径:每个 spec step 是 **2 次独立 launch** —— 先一次 draft model forward 产 K 个候选 token,再一次 target model verify(把 K+1 个位置的 K/V 都跑一遍 attention)。
