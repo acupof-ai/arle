@@ -306,12 +306,7 @@ impl Qwen3Model {
                 .prefill_logits
                 .as_mut()
                 .expect("prefill logits allocated");
-            ops::gemv(
-                &self.ctx,
-                self.output_projection(),
-                &bufs.last_normed,
-                seq_logits,
-            )?;
+            ops_backend.linear_vec_into(self.output_projection(), &bufs.last_normed, seq_logits)?;
         }
         Ok(())
     }
@@ -510,24 +505,9 @@ impl Qwen3Model {
         )?;
 
         // 2. QKV projections
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.q_proj,
-            &bufs.normed,
-            &mut bufs.q_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.k_proj,
-            &bufs.normed,
-            &mut bufs.k_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.v_proj,
-            &bufs.normed,
-            &mut bufs.v_batch,
-        );
+        ops_backend.linear_batch_into(&layer.attention.q_proj, &bufs.normed, &mut bufs.q_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.k_proj, &bufs.normed, &mut bufs.k_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.v_proj, &bufs.normed, &mut bufs.v_batch)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.q_proj.as_ref() {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q_batch)?;
@@ -591,12 +571,11 @@ impl Qwen3Model {
         )?;
 
         // 4-8: Same as forward_layer_batch (O proj, residual, MLP)
-        ops::gemm_into(
-            &self.ctx,
+        ops_backend.linear_batch_into(
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
-        );
+        )?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.o_proj.as_ref() {
                 ops::apply_lora_gemm_add(
@@ -627,18 +606,8 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.gate_proj,
-            &bufs.normed,
-            &mut bufs.gate_out,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
+        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.gate_proj.as_ref() {
                 ops::apply_lora_gemm_add(
@@ -654,12 +623,7 @@ impl Qwen3Model {
             }
         }
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.down_proj,
-            &bufs.act_out,
-            &mut bufs.o_buf,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.down_proj.as_ref() {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
@@ -877,24 +841,9 @@ impl Qwen3Model {
         );
 
         // 2. QKV projections → bufs.q_batch, bufs.k_batch, bufs.v_batch
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.q_proj,
-            &bufs.normed,
-            &mut bufs.q_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.k_proj,
-            &bufs.normed,
-            &mut bufs.k_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.v_proj,
-            &bufs.normed,
-            &mut bufs.v_batch,
-        );
+        ops_backend.linear_batch_into(&layer.attention.q_proj, &bufs.normed, &mut bufs.q_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.k_proj, &bufs.normed, &mut bufs.k_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.v_proj, &bufs.normed, &mut bufs.v_batch)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.q_proj.as_ref() {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q_batch)?;
@@ -967,12 +916,11 @@ impl Qwen3Model {
         kv_cache.commit_layer(&self.ctx, layer_idx, start_pos, hidden.seq_len)?;
 
         // 4. O projection → bufs.o_buf (as o_batch)
-        ops::gemm_into(
-            &self.ctx,
+        ops_backend.linear_batch_into(
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
-        );
+        )?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.o_proj.as_ref() {
                 ops::apply_lora_gemm_add(
@@ -1031,18 +979,8 @@ impl Qwen3Model {
         }
 
         // 7. MLP: gate + up → act → down → bufs.o_buf (reused for mlp_out; step 5 is done)
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.gate_proj,
-            &bufs.normed,
-            &mut bufs.gate_out,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
+        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.gate_proj.as_ref() {
                 ops::apply_lora_gemm_add(
@@ -1058,12 +996,7 @@ impl Qwen3Model {
             }
         }
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.down_proj,
-            &bufs.act_out,
-            &mut bufs.o_buf,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.down_proj.as_ref() {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
