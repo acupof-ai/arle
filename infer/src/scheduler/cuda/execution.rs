@@ -2,6 +2,21 @@ use super::budget::{PageBudget, PageGrowth, StepTokenBudget, clipped_max_new_tok
 use super::spec_path::SpecPath;
 use super::{ModelForward, Phase, Scheduler, info};
 use crate::metrics::SchedulerPlanLabel;
+use crate::scheduler::{LogicalDecodeRow, LogicalPrefillRow, LogicalServePlan};
+use crate::types::RequestId;
+
+fn logical_scheduler_shadow_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("INFER_LOGICAL_SCHEDULER_SHADOW")
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Ok("1" | "true" | "yes" | "on")
+        )
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PrefillReservation {
@@ -396,6 +411,130 @@ impl<M: ModelForward> Scheduler<M> {
         route_spec_plan(self.config.spec_enabled, self.config.spec_draft_k, plan)
     }
 
+    fn logical_decode_rows_for_current_batch(&self) -> Vec<LogicalDecodeRow> {
+        let mut rows = Vec::with_capacity(self.running_batch.len());
+        for &slot_idx in &self.running_batch {
+            if !self.slot_is_runnable_decode(slot_idx) {
+                continue;
+            }
+            let Some(req) = self.request(slot_idx) else {
+                continue;
+            };
+            let Some(&input_token) = req.generated_tokens.last() else {
+                continue;
+            };
+            let logical_kv_offset = req
+                .prompt_tokens
+                .len()
+                .saturating_add(req.generated_tokens.len().saturating_sub(1));
+            rows.push(LogicalDecodeRow::new(
+                rows.len(),
+                RequestId(req.id),
+                input_token,
+                logical_kv_offset,
+            ));
+        }
+        rows
+    }
+
+    fn logical_prefill_rows_for_candidates(
+        &self,
+        candidates: &[PrefillCandidate],
+        row_index_start: usize,
+    ) -> Vec<LogicalPrefillRow> {
+        let mut rows = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(req) = self.request(candidate.slot_idx) else {
+                continue;
+            };
+            let Phase::Prefilling {
+                effective_tokens,
+                progress,
+            } = &req.phase
+            else {
+                continue;
+            };
+            let total_effective_tokens = effective_tokens.len();
+            let chunk_end =
+                (*progress + candidate.reservation.prefill_tokens).min(total_effective_tokens);
+            if chunk_end <= *progress {
+                continue;
+            }
+
+            let prompt_base = req
+                .prompt_tokens
+                .len()
+                .saturating_sub(total_effective_tokens);
+            let prompt_start = prompt_base + *progress;
+            let prompt_end = prompt_base + chunk_end;
+            rows.push(LogicalPrefillRow::with_logical_kv_span(
+                row_index_start + rows.len(),
+                RequestId(req.id),
+                effective_tokens[*progress..chunk_end].to_vec(),
+                prompt_start,
+                prompt_end,
+                req.prompt_tokens.len(),
+                prompt_start,
+                prompt_end,
+            ));
+        }
+        rows
+    }
+
+    fn logical_shadow_plan_from_step_plan(&self, plan: &StepPlan) -> Option<LogicalServePlan> {
+        match plan {
+            StepPlan::SpecDecode => None,
+            StepPlan::Idle => Some(LogicalServePlan::idle()),
+            StepPlan::Decode => Some(LogicalServePlan::new(
+                self.logical_decode_rows_for_current_batch(),
+                Vec::new(),
+            )),
+            StepPlan::Prefill(candidates) => Some(LogicalServePlan::new(
+                Vec::new(),
+                self.logical_prefill_rows_for_candidates(candidates, 0),
+            )),
+            StepPlan::Split(candidates) | StepPlan::Mixed(candidates) => {
+                let decode_rows = self.logical_decode_rows_for_current_batch();
+                let prefill_rows =
+                    self.logical_prefill_rows_for_candidates(candidates, decode_rows.len());
+                Some(LogicalServePlan::new(decode_rows, prefill_rows))
+            }
+        }
+    }
+
+    fn maybe_log_logical_shadow_plan(&self, plan: &StepPlan) {
+        if !logical_scheduler_shadow_enabled() {
+            return;
+        }
+        let Some(logical_plan) = self.logical_shadow_plan_from_step_plan(plan) else {
+            log::debug!(
+                "cuda logical scheduler shadow skipped: plan={} spec_enabled={} sparse_kv={}",
+                plan.label(),
+                self.config.spec_enabled,
+                self.config.spec_sparse_kv_enabled
+            );
+            return;
+        };
+
+        let decode_req_ids: Vec<RequestId> = logical_plan
+            .decode_rows
+            .iter()
+            .map(|row| row.req_id)
+            .collect();
+        let prefill_req_ids: Vec<RequestId> = logical_plan
+            .prefill_rows
+            .iter()
+            .map(|row| row.req_id)
+            .collect();
+        log::debug!(
+            "cuda logical scheduler shadow: plan={} shape={:?} decode_req_ids={:?} prefill_req_ids={:?}",
+            plan.label(),
+            logical_plan.batch_shape,
+            decode_req_ids,
+            prefill_req_ids
+        );
+    }
+
     pub(super) fn step(&mut self, assign_us: u128) {
         let num = self.active_len();
         if num == 0 && self.waiting.is_empty() && !self.has_pending_gpu_work() {
@@ -429,6 +568,7 @@ impl<M: ModelForward> Scheduler<M> {
         let scheduled_prefill_rows = plan.scheduled_prefill_rows();
         let scheduled_prefill_tokens = plan.scheduled_prefill_tokens();
         self.metrics.record_scheduler_plan(plan.metrics_label());
+        self.maybe_log_logical_shadow_plan(&plan);
 
         assert!(
             self.pending_decode.is_none(),
