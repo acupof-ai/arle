@@ -535,6 +535,119 @@ impl<M: ModelForward> Scheduler<M> {
         );
     }
 
+    fn slot_for_request_id(&self, req_id: RequestId) -> Option<usize> {
+        self.active.iter().enumerate().find_map(|(slot_idx, req)| {
+            req.as_ref()
+                .is_some_and(|active| RequestId(active.id) == req_id)
+                .then_some(slot_idx)
+        })
+    }
+
+    fn prefill_candidates_from_logical_plan(
+        &self,
+        logical_plan: &LogicalServePlan,
+    ) -> Vec<PrefillCandidate> {
+        let mut candidates = Vec::with_capacity(logical_plan.prefill_rows.len());
+        for row in &logical_plan.prefill_rows {
+            let Some(slot_idx) = self.slot_for_request_id(row.req_id) else {
+                log::debug!(
+                    "unified scheduler lowering skipped prefill row for missing request {:?}",
+                    row.req_id
+                );
+                continue;
+            };
+            let Some(reservation) =
+                self.capped_prefill_reservation(slot_idx, row.input_tokens.len())
+            else {
+                log::debug!(
+                    "unified scheduler lowering skipped unschedulable prefill row for request {:?}",
+                    row.req_id
+                );
+                continue;
+            };
+            candidates.push(PrefillCandidate {
+                slot_idx,
+                reservation,
+            });
+        }
+        candidates
+    }
+
+    fn launch_legacy_step_plan(&mut self, plan: &StepPlan) -> (u128, u128) {
+        match plan {
+            StepPlan::Idle => (0, 0),
+            StepPlan::Decode => {
+                let t = std::time::Instant::now();
+                self.step_decode_launch();
+                (0, t.elapsed().as_micros())
+            }
+            StepPlan::SpecDecode => {
+                let t = std::time::Instant::now();
+                SpecPath::draft_then_verify(self, None);
+                (0, t.elapsed().as_micros())
+            }
+            StepPlan::Prefill(candidates) => {
+                let t = std::time::Instant::now();
+                self.step_prefill_batch(candidates);
+                (t.elapsed().as_micros(), 0)
+            }
+            StepPlan::Split(candidates) => {
+                let prefill_t = std::time::Instant::now();
+                self.step_prefill_batch(candidates);
+                let prefill_us = prefill_t.elapsed().as_micros();
+                let decode_t = std::time::Instant::now();
+                self.step_decode_launch();
+                (prefill_us, decode_t.elapsed().as_micros())
+            }
+            StepPlan::Mixed(candidates) => {
+                let t = std::time::Instant::now();
+                self.step_mixed_launch(candidates);
+                (0, t.elapsed().as_micros())
+            }
+        }
+    }
+
+    fn launch_logical_serve_plan(&mut self, logical_plan: &LogicalServePlan) -> (u128, u128) {
+        let has_decode = !logical_plan.decode_rows.is_empty();
+        let prefill_candidates = self.prefill_candidates_from_logical_plan(logical_plan);
+        match (has_decode, prefill_candidates.is_empty()) {
+            (false, true) => (0, 0),
+            (true, true) => {
+                let t = std::time::Instant::now();
+                self.step_decode_launch();
+                (0, t.elapsed().as_micros())
+            }
+            (false, false) => {
+                let t = std::time::Instant::now();
+                self.step_prefill_batch(&prefill_candidates);
+                (t.elapsed().as_micros(), 0)
+            }
+            (true, false) if self.model.supports_mixed_batch(self.paged_kv_pool.format) => {
+                let t = std::time::Instant::now();
+                self.step_mixed_launch(&prefill_candidates);
+                (0, t.elapsed().as_micros())
+            }
+            (true, false) => {
+                let prefill_t = std::time::Instant::now();
+                self.step_prefill_batch(&prefill_candidates);
+                let prefill_us = prefill_t.elapsed().as_micros();
+                let decode_t = std::time::Instant::now();
+                self.step_decode_launch();
+                (prefill_us, decode_t.elapsed().as_micros())
+            }
+        }
+    }
+
+    fn launch_planned_step(&mut self, plan: &StepPlan) -> (u128, u128) {
+        if cfg!(feature = "unified_scheduler")
+            && let Some(logical_plan) = self.logical_shadow_plan_from_step_plan(plan)
+        {
+            self.launch_logical_serve_plan(&logical_plan)
+        } else {
+            self.launch_legacy_step_plan(plan)
+        }
+    }
+
     pub(super) fn step(&mut self, assign_us: u128) {
         let num = self.active_len();
         if num == 0 && self.waiting.is_empty() && !self.has_pending_gpu_work() {
@@ -579,37 +692,7 @@ impl<M: ModelForward> Scheduler<M> {
             "pending prefill must be cleared before the next launch"
         );
 
-        let (mut prefill_us, mut decode_launch_us) = match &plan {
-            StepPlan::Idle => (0, 0),
-            StepPlan::Decode => {
-                let t = std::time::Instant::now();
-                self.step_decode_launch();
-                (0, t.elapsed().as_micros())
-            }
-            StepPlan::SpecDecode => {
-                let t = std::time::Instant::now();
-                SpecPath::draft_then_verify(self, None);
-                (0, t.elapsed().as_micros())
-            }
-            StepPlan::Prefill(candidates) => {
-                let t = std::time::Instant::now();
-                self.step_prefill_batch(candidates);
-                (t.elapsed().as_micros(), 0)
-            }
-            StepPlan::Split(candidates) => {
-                let prefill_t = std::time::Instant::now();
-                self.step_prefill_batch(candidates);
-                let prefill_us = prefill_t.elapsed().as_micros();
-                let decode_t = std::time::Instant::now();
-                self.step_decode_launch();
-                (prefill_us, decode_t.elapsed().as_micros())
-            }
-            StepPlan::Mixed(candidates) => {
-                let t = std::time::Instant::now();
-                self.step_mixed_launch(candidates);
-                (0, t.elapsed().as_micros())
-            }
-        };
+        let (mut prefill_us, mut decode_launch_us) = self.launch_planned_step(&plan);
         let scheduled_decode_rows = self
             .pending_decode
             .as_ref()
