@@ -4,7 +4,7 @@ use cudarc::driver::CudaSlice;
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::{KVCache, KVFormat};
-use crate::ops;
+use crate::ops::{self, OpsBackend};
 use cuda_kernels::TokenKVPool;
 use cuda_kernels::kv_quant;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
@@ -277,11 +277,11 @@ impl Qwen3Model {
             requests.len(),
             sequences.len()
         );
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
         for (request, seq) in requests.iter().zip(sequences) {
             let last_token = seq.token_offset + seq.seq_len - 1;
             ops::extract_vec_into(&self.ctx, hidden, last_token, &mut bufs.last_hidden)?;
-            ops::rms_norm_into(
-                &self.ctx,
+            ops_backend.rms_norm_into(
                 &bufs.last_hidden,
                 &self.norm,
                 self.config.rms_norm_eps,
@@ -500,14 +500,14 @@ impl Qwen3Model {
             &format!("L{layer_idx} pre-norm hidden"),
             self.config.hidden_size,
         );
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
         // 1. RMSNorm
-        ops::rms_norm_batch_into(
-            &self.ctx,
+        ops_backend.rms_norm_batch_into(
             hidden,
             &layer.input_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        );
+        )?;
 
         // 2. QKV projections
         ops::gemm_into(
@@ -620,13 +620,12 @@ impl Qwen3Model {
             self.config.hidden_size,
         );
 
-        ops::rms_norm_batch_into(
-            &self.ctx,
+        ops_backend.rms_norm_batch_into(
             hidden,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        );
+        )?;
 
         ops::gemm_into(
             &self.ctx,
@@ -843,6 +842,7 @@ impl Qwen3Model {
         let head_dim = self.config.head_dim;
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         crate::model::common::debug_dump_hidden(
             &self.ctx,
@@ -862,13 +862,12 @@ impl Qwen3Model {
                 self.config.rms_norm_eps,
             )?;
         } else {
-            ops::rms_norm_batch_into(
-                &self.ctx,
+            ops_backend.rms_norm_batch_into(
                 hidden,
                 &layer.input_layernorm,
                 self.config.rms_norm_eps,
                 &mut bufs.normed,
-            );
+            )?;
         }
         crate::model::common::debug_dump_hidden(
             &self.ctx,
@@ -1023,13 +1022,12 @@ impl Qwen3Model {
                 self.config.rms_norm_eps,
             )?;
         } else {
-            ops::rms_norm_batch_into(
-                &self.ctx,
+            ops_backend.rms_norm_batch_into(
                 hidden,
                 &layer.post_attention_layernorm,
                 self.config.rms_norm_eps,
                 &mut bufs.normed,
-            );
+            )?;
         }
 
         // 7. MLP: gate + up → act → down → bufs.o_buf (reused for mlp_out; step 5 is done)

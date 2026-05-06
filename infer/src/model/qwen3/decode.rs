@@ -4,7 +4,7 @@ use super::decode_buffers::DecodeBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
-use crate::ops;
+use crate::ops::{self, OpsBackend};
 
 impl Qwen3Model {
     /// Single decode step using pre-allocated buffers. Zero GPU allocation.
@@ -44,6 +44,7 @@ impl Qwen3Model {
     fn decode_kernels(&self, kv_cache: &mut KVCache, bufs: &mut DecodeBuffers) -> Result<()> {
         let eps = self.config.rms_norm_eps;
         let num_layers = self.layers.len();
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         ops::embedding_decode_into(
             &self.ctx,
@@ -52,8 +53,7 @@ impl Qwen3Model {
             &mut bufs.hidden,
         )?;
 
-        ops::rms_norm_into(
-            &self.ctx,
+        ops_backend.rms_norm_into(
             &bufs.hidden,
             &self.layers[0].input_layernorm,
             eps,
@@ -68,8 +68,7 @@ impl Qwen3Model {
             } else {
                 &self.norm
             };
-            ops::fused_add_rms_norm_into(
-                &self.ctx,
+            ops_backend.fused_add_rms_norm_into(
                 &mut bufs.hidden,
                 &bufs.mlp_out,
                 next_weight,
@@ -96,6 +95,7 @@ impl Qwen3Model {
         bufs: &mut DecodeBuffers,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
@@ -173,8 +173,7 @@ impl Qwen3Model {
         self.layer_communicator
             .post_attn_all_reduce_device_vec(&mut bufs.attn_proj)?;
 
-        ops::fused_add_rms_norm_into(
-            &self.ctx,
+        ops_backend.fused_add_rms_norm_into(
             &mut bufs.hidden,
             &bufs.attn_proj,
             &layer.post_attention_layernorm,

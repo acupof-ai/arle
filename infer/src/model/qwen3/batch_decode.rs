@@ -16,7 +16,7 @@ use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVFormat;
 use crate::model::{MixedBatchRequest, ModelForward};
-use crate::ops;
+use crate::ops::{self, OpsBackend};
 use cuda_kernels::ffi;
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
@@ -804,6 +804,7 @@ impl Qwen3Model {
 
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
@@ -821,13 +822,12 @@ impl Qwen3Model {
                 .map(|next_layer| &next_layer.input_layernorm);
 
             if !skip_input_norm {
-                ops::rms_norm_batch_into(
-                    &self.ctx,
+                ops_backend.rms_norm_batch_into(
                     hidden,
                     &layer.input_layernorm,
                     eps,
                     &mut mixed.normed,
-                );
+                )?;
             }
 
             ops::gemm_into(
@@ -1077,14 +1077,13 @@ impl Qwen3Model {
             );
             self.layer_communicator
                 .post_attn_all_reduce_hidden_states(&mut mixed.o_buf)?;
-            ops::fused_add_rms_norm_batch_into(
-                &self.ctx,
+            ops_backend.fused_add_rms_norm_batch_into(
                 hidden,
                 &mixed.o_buf,
                 &layer.post_attention_layernorm,
                 eps,
                 &mut mixed.normed,
-            );
+            )?;
 
             ops::gemm_into(
                 &self.ctx,
@@ -1115,14 +1114,13 @@ impl Qwen3Model {
                 .post_mlp_all_reduce_hidden_states(&mut mixed.o_buf)?;
 
             if let Some(next_input_norm) = next_input_norm {
-                ops::fused_add_rms_norm_batch_into(
-                    &self.ctx,
+                ops_backend.fused_add_rms_norm_batch_into(
                     hidden,
                     &mixed.o_buf,
                     next_input_norm,
                     eps,
                     &mut mixed.normed,
-                );
+                )?;
             } else {
                 ops::add_batch_into(&self.ctx, hidden, &mixed.o_buf, &mut mixed.hidden_out)?;
                 std::mem::swap(hidden, &mut mixed.hidden_out);
@@ -1137,7 +1135,7 @@ impl Qwen3Model {
         }
 
         let hidden = unsafe { &*hidden_ptr };
-        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut mixed.normed);
+        ops_backend.rms_norm_batch_into(hidden, &self.norm, eps, &mut mixed.normed)?;
 
         // Gather only the rows we will need vocab logits for: every decode
         // row (rows 0..b are already in place) and the *last* token of each
@@ -1381,6 +1379,7 @@ impl Qwen3Model {
         batch_size: usize,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         ops::embedding_batch(
             &self.ctx,
@@ -1410,7 +1409,7 @@ impl Qwen3Model {
         }
 
         let hidden = unsafe { &*hidden_ptr };
-        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut bufs.normed);
+        ops_backend.rms_norm_batch_into(hidden, &self.norm, eps, &mut bufs.normed)?;
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
         ops::gemm_into(
@@ -1438,19 +1437,19 @@ impl Qwen3Model {
         next_input_norm: Option<&DeviceVec>,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
         let page_size = kv_pool.page_size;
 
         if !skip_input_norm {
-            ops::rms_norm_batch_into(
-                &self.ctx,
+            ops_backend.rms_norm_batch_into(
                 hidden,
                 &layer.input_layernorm,
                 eps,
                 &mut bufs.normed,
-            );
+            )?;
         }
 
         // Split QKV projections so LoRA adds can compose.
@@ -1664,14 +1663,13 @@ impl Qwen3Model {
         self.layer_communicator
             .post_attn_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
-        ops::fused_add_rms_norm_batch_into(
-            &self.ctx,
+        ops_backend.fused_add_rms_norm_batch_into(
             hidden,
             &bufs.o_buf,
             &layer.post_attention_layernorm,
             eps,
             &mut bufs.normed,
-        );
+        )?;
 
         // Split gate + up MLP + LoRA + silu_mul + down + LoRA.
         ops::gemm_into(
@@ -1716,14 +1714,13 @@ impl Qwen3Model {
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
         if let Some(next_input_norm) = next_input_norm {
-            ops::fused_add_rms_norm_batch_into(
-                &self.ctx,
+            ops_backend.fused_add_rms_norm_batch_into(
                 hidden,
                 &bufs.o_buf,
                 next_input_norm,
                 eps,
                 &mut bufs.normed,
-            );
+            )?;
         } else {
             ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
             std::mem::swap(hidden, &mut bufs.hidden_out);
@@ -1742,6 +1739,7 @@ impl Qwen3Model {
         batch_size: usize,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         // Embedding (reads from pre-allocated token_ids_gpu, written by H2D before graph)
         ops::embedding_batch(
@@ -1779,7 +1777,7 @@ impl Qwen3Model {
 
         // Final norm + logits. hidden is whichever buffer was last written.
         let hidden = unsafe { &*hidden_ptr };
-        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut bufs.normed);
+        ops_backend.rms_norm_batch_into(hidden, &self.norm, eps, &mut bufs.normed)?;
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
         ops::gemm_into(
@@ -1803,6 +1801,7 @@ impl Qwen3Model {
         next_input_norm: Option<&DeviceVec>,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
@@ -1810,13 +1809,12 @@ impl Qwen3Model {
 
         // 1. Batched RMSNorm → bufs.normed [B, hidden_dim]
         if !skip_input_norm {
-            ops::rms_norm_batch_into(
-                &self.ctx,
+            ops_backend.rms_norm_batch_into(
                 hidden,
                 &layer.input_layernorm,
                 eps,
                 &mut bufs.normed,
-            );
+            )?;
         }
 
         // 2. QKV projection
@@ -2115,14 +2113,13 @@ impl Qwen3Model {
         // 6+7. Fused residual add + MLP RMSNorm:
         //   hidden += o_buf (in-place), normed = rms_norm(hidden, weight)
         //   Saves one global read of hidden vs separate add + swap + norm.
-        ops::fused_add_rms_norm_batch_into(
-            &self.ctx,
+        ops_backend.fused_add_rms_norm_batch_into(
             hidden,
             &bufs.o_buf,
             &layer.post_attention_layernorm,
             eps,
             &mut bufs.normed,
-        );
+        )?;
 
         // 8. Batched MLP: gate + up projections → fused silu_mul → down
         ops::gemm_into(
@@ -2149,14 +2146,13 @@ impl Qwen3Model {
 
         // 9. Batched residual add, optionally fused with the next layer's input RMSNorm.
         if let Some(next_input_norm) = next_input_norm {
-            ops::fused_add_rms_norm_batch_into(
-                &self.ctx,
+            ops_backend.fused_add_rms_norm_batch_into(
                 hidden,
                 &bufs.o_buf,
                 next_input_norm,
                 eps,
                 &mut bufs.normed,
-            );
+            )?;
         } else {
             ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
             std::mem::swap(hidden, &mut bufs.hidden_out);

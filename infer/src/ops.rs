@@ -477,6 +477,7 @@ pub(crate) use elementwise::{add_batch_into, extract_vec, extract_vec_into, silu
 #[cfg(feature = "cuda")]
 pub(crate) use linear::{gemm_graphsafe_batched_into, gemm_into, linear};
 #[cfg(feature = "cuda")]
+#[allow(unused_imports)]
 pub(crate) use norm::{
     add_bf16_into_f32, cast_bf16_to_f32, cast_f32_to_bf16, fused_add_rms_norm_batch_into, rms_norm,
     rms_norm_batch_f32_in_into, rms_norm_batch_into, rms_norm_gated_batch_into,
