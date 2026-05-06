@@ -5,6 +5,13 @@
 > [`feedback_p0_survey_before_plan_body`](../../.claude/projects/-home-ckl-projects-arle/memory/feedback_p0_survey_before_plan_body.md)
 > rule, do the file survey before drafting milestones — this entry IS the
 > survey output, not a milestone plan.
+>
+> **Implementation directive**: [`m5-modelarch-trait.md`](m5-modelarch-trait.md)
+> (drafted 2026-05-07 by Codex; refines this P0's Option B with
+> codebase-grounded specifics — the new module is `infer/src/model_arch.rs`
+> not `infer/src/model.rs` because Metal-only builds don't compile
+> `model.rs`; the trait is `ModelArchInfo` not `ModelArch` because the
+> latter name is taken by `model_registry.rs`'s arch enum).
 
 ## P0 finding
 
