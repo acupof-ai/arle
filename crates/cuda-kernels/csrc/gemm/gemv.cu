@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <memory>
@@ -256,12 +258,41 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
   return cudaGetLastError();
 }
 
+static bool deterministic_gemm_enabled() {
+  // INFER_DETERMINISTIC=1 forces every BF16 GEMM through the cublasGemmEx
+  // fallback so B=1 (graphsafe path) and B>=2 (cublasLt path) hit the same
+  // cuBLAS API. Without this, B=1 falls back to cublasGemmEx (cache miss
+  // on graph capture) while B>=2 uses cublasLtMatmul, and the two
+  // numerical paths diverge per-row even in greedy decoding (the deferred
+  // bug tracked in 2026-04-13-batched-decode-high-concurrency.md).
+  // Cached on first read; no perf impact on the fast path.
+  static const bool enabled = []() {
+    const char *env = std::getenv("INFER_DETERMINISTIC");
+    if (env == nullptr) return false;
+    // Match the explicit truthy spellings; reject "off"/"OFF"/empty.
+    return std::strcmp(env, "1") == 0 ||
+           std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0 ||
+           std::strcmp(env, "on") == 0 || std::strcmp(env, "ON") == 0;
+  }();
+  return enabled;
+}
+
 static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                       __nv_bfloat16 *Y, int M, int N, int K,
                                       cudaStream_t stream, bool graphsafe) {
   CublasDeviceState *state = current_device_state();
   if (state == nullptr) {
     return cudaErrorNotReady;
+  }
+
+  if (deterministic_gemm_enabled()) {
+    // Bypass cublasLt entirely. Graph-safe callers keep using the
+    // workspace-free handle for CUDA Graph capture; eager callers use the
+    // workspace-backed prefill handle. In deterministic decode, Rust splits
+    // BF16 batched GEMM into per-row graph-safe N=1 calls, so every row hits
+    // this same cublasGemmEx path.
+    return gemm_cublas_fallback(W, X, Y, M, N, K, stream,
+                                graphsafe ? state->handle : state->prefill_handle);
   }
 
   cublasLtMatmulDesc_t operation_desc = nullptr;

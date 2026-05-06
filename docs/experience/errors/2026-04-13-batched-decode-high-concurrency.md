@@ -201,3 +201,57 @@ candidates:
   and the bench summary underreports throughput silently.
 - Until this is fixed, every benchmark that needs C≥8 data must carry
   a banner pointing at this file.
+
+## Findings - 2026-05-07 Track A first-divergence and deterministic GEMM fix
+
+Environment: RTX 4070 Ti SUPER (`sm_89`), CUDA 13.2,
+`NVCC_CCBIN=/usr/bin/g++-14`,
+`INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python`,
+Qwen3-4B BF16 (`head_dim=128`, 32 Q heads, 8 KV heads, page size 16).
+
+The requested memcheck probe:
+
+```bash
+compute-sanitizer --tool memcheck cargo test --release -p infer --features cuda --test greedy_consistency 2>&1 | head -200
+```
+
+did not show an illegal address or uninitialized-read report in the captured
+first 200 lines. It only reached graph warmup / early decode logging before
+`head` closed the pipe, so this was not a full-test sanitizer pass.
+
+First-divergence dump with CUDA Graph disabled and deterministic GEMM enabled:
+
+- Generated token divergence: index 4, solo token `879`, concurrent token
+  `6941`.
+- Layer trace: position 4, layer 0 Q projection output already differed by
+  one BF16 LSB (`max_abs=0.00012207`, index 2638: solo `0.02282715`,
+  concurrent `0.02270508`).
+- The QK-norm/RoPE prep amplified that to `max_abs=0.00781250`; layer-0
+  attention output differed by `0.00024414`; logits at position 4 differed by
+  `0.125`.
+
+Root cause: the remaining graph-off B=1/B=3 split was not TileLang attention
+reduction and not CUDA Graph replay. It came from BF16 dense GEMM shape
+dependence: B=1 uses an N=1 graph-safe GEMM path while B=3 used an N=3 batched
+GEMM path. Even with cublasLt autotune skipped, cuBLAS produced a one-BF16-LSB
+per-row difference in the Q projection, enough for greedy argmax to diverge a
+few tokens later.
+
+Fix: `INFER_DETERMINISTIC=1` now routes BF16 batched dense GEMM through
+per-row graph-safe N=1 GEMM calls in Rust, so every active row uses the same
+numeric path as solo decode. The C++ GEMM layer also bypasses cublasLt in
+deterministic mode and falls back to cublasGemmEx. `greedy_consistency` sets
+`INFER_DETERMINISTIC=1` before spawning scheduler threads and keeps CUDA Graph
+enabled by default.
+
+Validation:
+
+```bash
+CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+cargo test --release -p infer --features cuda --test greedy_consistency -- --nocapture
+```
+
+passed with CUDA Graph enabled. The logs show graph capture for B=1..4 in the
+solo scheduler and B=1..3 in the concurrent scheduler; solo and concurrent
+generated token IDs were identical.
