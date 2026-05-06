@@ -36,7 +36,9 @@ use tokio::sync::mpsc;
 use infer::metrics::ServerMetrics;
 use infer::model::{KVCacheDtype, KVFormat, ModelRuntimeConfig, Qwen3Model};
 use infer::sampler::SamplingParams;
-use infer::scheduler::{DraftMode, IncomingRequest, RequestPriority, Scheduler, SchedulerConfig};
+use infer::scheduler::{
+    DraftMode, IncomingRequest, RequestPriority, RequestSpecConfig, Scheduler, SchedulerConfig,
+};
 use infer::server_engine::CompletionStreamDelta;
 use infer::tokenizer::Tokenizer;
 
@@ -162,7 +164,11 @@ fn run_pair_spec_then_vanilla(
     // Request B — vanilla, sharing some prompt prefix with A so the
     // RadixCache lookup hits whatever A's prefill (and any spec-tentative
     // pages that may have been mistakenly published) left behind.
-    let (req_b, mut rx_b) = make_request(prompt_b, max_tokens_b);
+    let (mut req_b, mut rx_b) = make_request(prompt_b, max_tokens_b);
+    req_b.speculative = Some(RequestSpecConfig {
+        enabled: Some(false),
+        ..RequestSpecConfig::default()
+    });
     handle.submit(req_b).expect("submit B");
     let output_b = collect_output(&mut rx_b);
 
