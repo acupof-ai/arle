@@ -1,7 +1,7 @@
 // CUDA-only modules — excluded when `no-cuda` feature is active.
 #[cfg(feature = "cuda")]
 pub mod model;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod ops;
 #[cfg(feature = "cuda")]
 pub mod weight_loader;
