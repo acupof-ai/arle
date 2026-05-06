@@ -398,6 +398,8 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     // exactly.
     scheduler.pre_model_free_bytes = pre_model_free_bytes;
 
+    metrics.set_model_arch(model.arch_summary());
+
     let gpu_total_bytes = crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
         .map(|(_free, total)| total)
         .unwrap_or(0);

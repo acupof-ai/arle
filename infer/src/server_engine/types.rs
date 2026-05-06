@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::model_arch::ModelArchSummary;
 use crate::sampler::SamplingParams;
 
 #[derive(Debug)]
@@ -119,6 +120,9 @@ pub struct EngineTelemetry {
     pub active_requests: u32,
     /// Fraction of allocated KV slots currently in use (0.0..=1.0).
     pub batch_occupancy: f64,
+    /// Backend-neutral model architecture summary. `None` for legacy/mock
+    /// engines that have not wired the M5 architecture contract.
+    pub model_arch: Option<ModelArchSummary>,
     /// Per-tier hit rates keyed by `"T0"` / `"T1"` / `"T2"` / `"T3"`.
     pub kv_tier_hit_rates: HashMap<String, f64>,
     /// Aggregate speculative-decode acceptance rate (accepted / verified
