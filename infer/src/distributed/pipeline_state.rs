@@ -159,7 +159,7 @@ mod tests {
         let boundary = IntermediateTensors::new(0, 1, 7)
             .with_hidden_states(vec![1, stage0_hidden.len()], stage0_hidden)
             .with_residual(vec![1, stage0_residual.len()], stage0_residual)
-            .with_position_ids(vec![1, positions.len()], positions.clone());
+            .with_position_ids(vec![1, positions.len()], positions);
         let sent = stage0.inter_stage_send(boundary).unwrap();
         let received = stage1.inter_stage_recv(sent).unwrap();
 

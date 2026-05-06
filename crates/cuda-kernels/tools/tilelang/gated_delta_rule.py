@@ -51,34 +51,16 @@ ARLE-specific deltas vs both upstream sources:
   - Per-token v_new staging tensor for the chunk-state → chunk-o
     handoff (matches the existing ARLE Triton v_new contract).
 
-Phase 2 status — AOT pipeline blocker
--------------------------------------
+Phase 2b status — AOT swap wired
+---------------------------------
 
-These 7 functions are authored to be drop-in for the existing
-`infer/src/ops/recurrent.rs` call sites once the AOT generator
-(`tools/tilelang/gen_tilelang_aot.py`) is generalized to handle kernel
-families beyond the 18-arg attention wrapper. The current generator
-hard-codes:
-
-  - `TENSOR_NAME_TO_USER_INPUT` — only the 8 attention tensor names
-    (Q, Q_indptr, K_pool, V_pool, KV_indptr, KV_indices,
-     KV_last_page_len, Output).
-  - `WRAPPER_FILL_RULES` — only the attention symbolic scalars
-    (batch_size, max_qlen, num_pages, total_pages, total_q_tokens).
-  - `write_c_wrapper` — emits one fixed 18-arg public C signature.
-
-Generalizing the AOT generator + writing 7 new dispatch C wrappers +
-swapping the 7 build.rs spec blocks + renaming the 7 FFI extern decls
-+ updating the 7 call sites in `infer/src/ops/recurrent.rs` is the
-remainder of Phase 2 ("Phase 2b — AOT swap"). It is gated on GPU
-access for numerical-parity validation against Triton via the
-existing Qwen3.5 e2e tests + JSON baselines. Phase 2a (this file)
-intentionally does not touch the build glue or FFI surface to keep
-the Triton path live until 2b can land cleanly.
-
-This separation matches the pending-remote pattern from Phase 0
-(`docs/experience/wins/2026-05-05-bench-tilelang-phase0-pending-remote.md`):
-land the safe artifact, log the GPU-bound follow-up.
+`tools/tilelang/gen_tilelang_aot.py` now has a `gdr` kernel family beside the
+paged-attention family. `build.rs` emits the seven existing public C symbols
+(`gated_delta_rule_prefill_chunk_*_cuda`) from these TileLang stages, so the
+Rust FFI and `infer/src/ops/recurrent.rs` call sites remain stable while the
+Triton AOT directory is gone. GPU numerical validation still compares this
+literal port against the historical Triton behavior via the existing Qwen3.5
+e2e tests and JSON baselines.
 """
 
 import tilelang  # noqa: F401  (imported for side-effect-free version probe)
@@ -941,8 +923,7 @@ def _gdr_chunk_o_kernel():
     return kernel
 
 
-# Public registry — `gen_tilelang_aot.py` (once generalized in Phase 2b)
-# will look these up by name and emit one AOT specialization per entry.
+# Public registry consumed by `gen_tilelang_aot.py --kernel-family gdr`.
 KERNELS = {
     "gdr_chunk_prepare":   _gdr_chunk_prepare_kernel,
     "gdr_chunk_cumsum":    _gdr_chunk_local_cumsum_kernel,
@@ -955,15 +936,11 @@ KERNELS = {
 
 
 def get_kernel(name: str):
-    """Entry point for the (yet-to-be-generalized) AOT generator.
+    """Return the TileLang stage selected by `--kernel-key`.
 
-    Differs from `batch_prefill_paged_hd128.get_kernel(num_q_heads,
-    num_kv_heads)` because the GDR family does not parameterize on
-    head config — Qwen3.5 fixes (num_value_heads, num_key_heads,
-    KEY_DIM, VALUE_DIM, BLOCK_T) at the constants above and ships a
-    single specialization per stage. Phase 2b's generalized
-    `gen_tilelang_aot.py` is expected to dispatch by stage name
-    instead of by (Q,KV) tuple.
+    The GDR family does not parameterize on head config: Qwen3.5 fixes
+    (num_value_heads, num_key_heads, KEY_DIM, VALUE_DIM, BLOCK_T) at the
+    constants above and ships one specialization per stage.
     """
     factory = KERNELS.get(name)
     if factory is None:

@@ -517,10 +517,7 @@ mod tests {
         assert_eq!(lease_b.model_id(), "b");
         drop(lease_b);
         let info = pool.configured_models();
-        assert_eq!(
-            info.iter().find(|model| model.id == "a").expect("a").loaded,
-            false
-        );
+        assert!(!info.iter().find(|model| model.id == "a").expect("a").loaded);
         assert!(info.iter().find(|model| model.id == "b").expect("b").loaded);
     }
 

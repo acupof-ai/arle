@@ -886,7 +886,7 @@ mod tests {
         let mut sched = make_scheduler(1, 4);
         let prompt = vec![1u32, 2, 3, 4];
         let req = sched
-            .submit(prompt.clone(), 3, MetalRequestPriority::Normal)
+            .submit(prompt, 3, MetalRequestPriority::Normal)
             .expect("submit");
 
         let prefill = expect_prefill_only(sched.step(&[]));

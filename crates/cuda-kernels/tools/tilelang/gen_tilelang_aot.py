@@ -1,40 +1,19 @@
 """TileLang AOT generator (TileLang 0.1.9-compatible).
 
-TileLang 0.1.9 emits a TVM-FFI shared object instead of a raw cubin, so
-the previous "lift `compiled.cubin_path` then embed" recipe no longer
-applies. The new pipeline:
+The generator compiles a TileLang ``T.prim_func`` into a raw cubin and emits a
+small C wrapper with ARLE's stable CUDA FFI ABI.  It supports two kernel
+families:
 
-  1. Run `tilelang.compile()` — TileLang writes the codegen'd
-     `device_kernel.cu` into its `~/.tilelang/cache/...` directory.
-  2. Locate that .cu, parse the `kernel_kernel(...)` signature so we
-     know the exact arg list TileLang baked in (8 tensors + N
-     auto-promoted int32 shape params).
-  3. nvcc-compile the .cu into a raw cubin against TileLang's own
-     `tl_templates/cuda` and the bundled cutlass headers.
-  4. Generate a C wrapper that exposes a stable signature to Rust
-     (`<name>_cuda(q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices,
-     kv_last_page_len, o, batch_size, total_q_tokens, max_qlen,
-     num_pages, total_pages, num_q_heads, num_kv_heads, page_size,
-     sm_scale, stream)`) and drives `cuLaunchKernel` with the parsed
-     argument order — duplicating user inputs into TileLang's
-     `<name>_1` / `<name>_plus_one` slots as needed.
+* ``attention``: paged prefill/decode kernels specialized by
+  ``(num_q_heads, num_kv_heads)``.
+* ``gdr``: the seven Qwen3.5 chunk-wise Gated Delta Rule stages, selected by
+  ``--kernel-key``.
 
-Inputs (CLI flags):
-  --kernel-path    : .py module exposing get_kernel(num_q_heads, num_kv_heads)
-  --kernel-name    : C function name (the wrapper exports `<name>_cuda`)
-  --out-dir        : directory to write CUBIN + C wrapper into
-  --target         : "cuda -arch=sm_<sm>" (e.g. "cuda -arch=sm_90")
-  --out-name       : basename for the generated artifacts
-  --num-q-heads    : Q-head count this AOT specialization is for
-  --num-kv-heads   : KV-head count this AOT specialization is for
-  --cuda-arch      : SM arch number (e.g. 89, 90) for the nvcc -gencode flag
-  --tilelang-src   : tilelang/src directory (for tl_templates includes)
-  --cutlass-include: cutlass/include directory bundled with TileLang
-  --cuda-include   : CUDA toolkit include dir
-
-Outputs (stdout, one per line, parsed by build.rs):
-  FUNC_NAME=<exported C function>
-  C_PATH=<absolute path to generated .c wrapper>
+TileLang 0.1.9 emits TVM-FFI host/device source instead of a directly reusable
+cubin.  We intentionally keep the pipeline explicit: compile with TileLang,
+extract the codegen'd device source and launch metadata, nvcc it to cubin, then
+embed that cubin in a stable C wrapper.  The wrapper maps TileLang's generated
+argument order back to ARLE's C ABI by parsing the generated device signature.
 """
 
 import argparse
@@ -43,55 +22,245 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-# TileLang 0.1.9 emits one int32 arg per (symbolic shape var × use site).
-# The user-facing wrapper takes a small fixed signature; this map carries
-# the user input → kernel arg name → expression so we can fill the args[]
-# array in whatever order TileLang chose. Names that don't appear in the
-# kernel signature are silently skipped — the kernel may have specialized
-# them away if they were not load-bearing.
-WRAPPER_FILL_RULES = {
-    # name in kernel sig          C expression in the generated wrapper
-    "batch_size": "batch_size",
-    "batch_size_1": "batch_size",
-    "batch_size_plus_one": "(batch_size + 1)",
-    "batch_size_plus_one_1": "(batch_size + 1)",
-    "max_qlen": "max_qlen",
-    "max_qlen_1": "max_qlen",
-    "num_pages": "num_pages",
-    "num_pages_1": "num_pages",
-    "total_pages": "total_pages",
-    "total_pages_1": "total_pages",
-    "total_q_tokens": "total_q_tokens",
-    "total_q_tokens_1": "total_q_tokens",
+
+@dataclass(frozen=True)
+class WrapperSpec:
+    public_params: str
+    tensor_inputs: dict[str, str]
+    scalar_inputs: dict[str, tuple[str, str]]
+    prelude: str
+    grid: str
+    block: str = "128, 1, 1"
+
+
+ATTENTION_PUBLIC_PARAMS = """    uint16_t *q,
+    const int32_t *q_indptr,
+    uint16_t *k_pool,
+    uint16_t *v_pool,
+    const int32_t *kv_indptr,
+    const int32_t *kv_indices,
+    const int32_t *kv_last_page_len,
+    uint16_t *o,
+    int32_t batch_size,
+    int32_t total_q_tokens,
+    int32_t max_qlen,
+    int32_t num_pages,
+    int32_t total_pages,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t page_size,
+    float sm_scale,
+    CUstream stream"""
+
+ATTENTION_SPEC = WrapperSpec(
+    public_params=ATTENTION_PUBLIC_PARAMS,
+    tensor_inputs={
+        "KV_indices": "kv_indices",
+        "KV_indptr": "kv_indptr",
+        "KV_last_page_len": "kv_last_page_len",
+        "K_pool": "k_pool",
+        "Output": "o",
+        "Q": "q",
+        "Q_indptr": "q_indptr",
+        "V_pool": "v_pool",
+    },
+    scalar_inputs={
+        "batch_size": ("int32_t", "batch_size"),
+        "max_qlen": ("int32_t", "max_qlen"),
+        "num_pages": ("int32_t", "num_pages"),
+        "total_pages": ("int32_t", "total_pages"),
+        "total_q_tokens": ("int32_t", "total_q_tokens"),
+    },
+    prelude="""    (void)num_kv_heads;
+    (void)page_size;
+    (void)sm_scale;""",
+    grid="""    const int block_m = 64;
+    int qlen = max_qlen > 0 ? max_qlen : 1;
+    int grid_x = (qlen + block_m - 1) / block_m;
+    int grid_y = num_q_heads;
+    int grid_z = batch_size;""",
+)
+
+GDR_SCALAR_INPUTS = {
+    "hv": ("int32_t", "num_value_heads"),
+    "num_chunks": ("int32_t", "ceildiv_i32(seq_len, 64)"),
+    "num_key_heads": ("int32_t", "num_key_heads"),
+    "num_value_heads": ("int32_t", "num_value_heads"),
+    "qkv_dim": ("int32_t", "qkv_dim"),
+    "seq_len": ("int32_t", "seq_len"),
+    "scale": ("float", "scale"),
 }
 
-# The 8 tensor-pointer parameter names TileLang generates for
-# batch_prefill_paged_hd128 (alphabetical, matches the .cu order).
-TENSOR_NAME_TO_USER_INPUT = {
-    "KV_indices": "kv_indices",
-    "KV_indptr": "kv_indptr",
-    "KV_last_page_len": "kv_last_page_len",
-    "K_pool": "k_pool",
-    "Output": "o",
-    "Q": "q",
-    "Q_indptr": "q_indptr",
-    "V_pool": "v_pool",
+GDR_SPECS = {
+    "gdr_chunk_prepare": WrapperSpec(
+        public_params="""    const uint16_t *qkv,
+    const uint16_t *b_proj,
+    const uint16_t *a_proj,
+    const uint16_t *dt_bias,
+    const float *a_log,
+    uint16_t *q_out,
+    uint16_t *k_out,
+    uint16_t *v_out,
+    float *g_out,
+    float *beta_out,
+    int32_t num_key_heads,
+    int32_t num_value_heads,
+    int32_t qkv_dim,
+    int32_t seq_len,
+    CUstream stream""",
+        tensor_inputs={
+            "qkv": "qkv",
+            "b_proj": "b_proj",
+            "a_proj": "a_proj",
+            "dt_bias": "dt_bias",
+            "a_log": "a_log",
+            "q_out": "q_out",
+            "k_out": "k_out",
+            "v_out": "v_out",
+            "g_out": "g_out",
+            "beta_out": "beta_out",
+        },
+        scalar_inputs=GDR_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = seq_len;
+    int grid_y = num_value_heads;
+    int grid_z = 1;""",
+    ),
+    "gdr_chunk_cumsum": WrapperSpec(
+        public_params="""    const float *g_in,
+    float *g_out,
+    int32_t seq_len,
+    int32_t num_value_heads,
+    CUstream stream""",
+        tensor_inputs={"g_in": "g_in", "g_out": "g_out"},
+        scalar_inputs=GDR_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
+    int grid_y = num_value_heads;
+    int grid_z = 1;""",
+    ),
+    "gdr_chunk_a": WrapperSpec(
+        public_params="""    const uint16_t *k,
+    const float *g_cumsum,
+    const float *beta,
+    float *a_tril,
+    int32_t seq_len,
+    int32_t num_value_heads,
+    CUstream stream""",
+        tensor_inputs={"k": "k", "g_cumsum": "g_cumsum", "beta": "beta", "a_tril": "a_tril"},
+        scalar_inputs=GDR_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
+    int grid_y = num_value_heads;
+    int grid_z = 1;""",
+    ),
+    "gdr_chunk_solve": WrapperSpec(
+        public_params="""    const float *a_tril,
+    uint16_t *a_inv,
+    int32_t seq_len,
+    int32_t num_value_heads,
+    CUstream stream""",
+        tensor_inputs={"a_tril": "a_tril", "a_inv": "a_inv"},
+        scalar_inputs=GDR_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
+    int grid_y = num_value_heads;
+    int grid_z = 1;""",
+    ),
+    "gdr_chunk_recompute": WrapperSpec(
+        public_params="""    const uint16_t *k,
+    const uint16_t *v,
+    const float *beta,
+    uint16_t *w,
+    uint16_t *u,
+    const uint16_t *a_inv,
+    const float *g_cumsum,
+    int32_t seq_len,
+    int32_t num_value_heads,
+    CUstream stream""",
+        tensor_inputs={"k": "k", "v": "v", "beta": "beta", "w": "w", "u": "u", "a_inv": "a_inv", "g_cumsum": "g_cumsum"},
+        scalar_inputs=GDR_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
+    int grid_y = num_value_heads;
+    int grid_z = 1;""",
+    ),
+    "gdr_chunk_state": WrapperSpec(
+        public_params="""    const uint16_t *k,
+    const uint16_t *w,
+    const uint16_t *u,
+    const float *g_cumsum,
+    const float *initial_state,
+    float *chunk_state,
+    uint16_t *v_new,
+    float *final_state,
+    int32_t seq_len,
+    int32_t num_value_heads,
+    CUstream stream""",
+        tensor_inputs={
+            "k": "k",
+            "w": "w",
+            "u": "u",
+            "g_cumsum": "g_cumsum",
+            "initial_state": "initial_state",
+            "chunk_state": "chunk_state",
+            "v_new": "v_new",
+            "final_state": "final_state",
+        },
+        scalar_inputs=GDR_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = 4;
+    int grid_y = num_value_heads;
+    int grid_z = 1;""",
+    ),
+    "gdr_chunk_o": WrapperSpec(
+        public_params="""    const uint16_t *q,
+    const uint16_t *k,
+    const uint16_t *v_new,
+    const float *chunk_state,
+    const float *g_cumsum,
+    uint16_t *output,
+    int32_t seq_len,
+    int32_t num_value_heads,
+    float scale,
+    CUstream stream""",
+        tensor_inputs={"q": "q", "k": "k", "v_new": "v_new", "chunk_state": "chunk_state", "g_cumsum": "g_cumsum", "output": "output"},
+        scalar_inputs=GDR_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = 4;
+    int grid_y = ceildiv_i32(seq_len, 64);
+    int grid_z = num_value_heads;""",
+    ),
 }
 
 
-def load_kernel(kernel_path: str, num_q_heads: int, num_kv_heads: int):
+def load_module(kernel_path: str):
     spec = importlib.util.spec_from_file_location("tilelang_kernel_module", kernel_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load kernel module from {kernel_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def load_attention_kernel(kernel_path: str, num_q_heads: int, num_kv_heads: int):
+    module = load_module(kernel_path)
     if not hasattr(module, "get_kernel"):
         raise RuntimeError(
             f"{kernel_path} must expose get_kernel(num_q_heads, num_kv_heads)"
         )
     return module.get_kernel(num_q_heads, num_kv_heads)
+
+
+def load_gdr_kernel(kernel_path: str, kernel_key: str):
+    module = load_module(kernel_path)
+    if not hasattr(module, "get_kernel"):
+        raise RuntimeError(f"{kernel_path} must expose get_kernel(name)")
+    return module.get_kernel(kernel_key)
 
 
 def parse_target(target: str) -> str:
@@ -101,18 +270,6 @@ def parse_target(target: str) -> str:
 
 
 def compile_kernel(prim_func, target: str):
-    """Run TileLang compile() and return (device_source, kernel_func_name, parsed_args).
-
-    `device_source` is the codegen'd CUDA source (the body of
-    `device_kernel.cu` in TileLang's cache layout). We pull it from
-    `adapter.device_kernel_source` because TileLang 0.1.9 only writes
-    the cache file once the kernel has been *executed*; right after
-    `compile()` the source lives in memory only and `adapter.libpath`
-    is `None`.
-
-    `parsed_args` is the ordered list of (kind, name) tuples extracted
-    from the kernel signature, where kind is "tensor" or "scalar".
-    """
     try:
         import tilelang
     except ImportError as exc:
@@ -124,9 +281,6 @@ def compile_kernel(prim_func, target: str):
 
     compiled = tilelang.compile(prim_func, target=target)
     adapter = getattr(compiled, "adapter", None)
-    # On a cold-cache compile the attribute-style accessors return None;
-    # only the `get_*()` getter methods materialize the source. On a
-    # warm cache both work. Use the methods for both.
     if adapter is not None and hasattr(adapter, "get_device_source"):
         device_source = adapter.get_device_source()
     else:
@@ -136,7 +290,7 @@ def compile_kernel(prim_func, target: str):
     else:
         host_source = getattr(adapter, "host_kernel_source", None) if adapter is not None else None
     if not device_source:
-        adapter_attrs = sorted(a for a in dir(adapter) if not a.startswith("_")) if adapter is not None else []
+        adapter_attrs = sorted(dir(adapter)) if adapter is not None else []
         raise RuntimeError(
             "TileLang JITKernel did not expose adapter.device_kernel_source. "
             f"compiled type={type(compiled).__name__!r}, "
@@ -145,25 +299,6 @@ def compile_kernel(prim_func, target: str):
             "TileLang ABI changed — update gen_tilelang_aot.py."
         )
 
-    # Extract the dynamic-shared-memory size TileLang baked into the
-    # kernel launch. TVM FFI's call sequence builds a `stack_ffi_any[]`
-    # array of the form
-    #   ...
-    #   [k+0].v_int64 = grid_x      [k+1].v_int64 = grid_y
-    #   [k+2].v_int64 = grid_z      [k+3].v_int64 = block_x
-    #   [k+4].v_int64 = block_y     [k+5].v_int64 = block_z
-    #   [k+6].v_int64 = <dyn shmem bytes>
-    #   [k+7].v_int64 = (int64_t)0  // stream handle, set later
-    # so the dyn-shmem entry is the int64 literal immediately preceding
-    # the stream-handle slot. Pull both lines and confirm the pairing
-    # before trusting the value.
-    # Find every `[idx].v_int64 = ((int64_t)<literal>);` assignment in
-    # the kernel-launch packing block, then pick the one whose slot
-    # index is immediately followed by another `[idx+1].v_int64` slot
-    # set to literal `(int64_t)0` (that's the stream handle, always
-    # 0 at packing time and filled in later). The dyn-shmem entry is
-    # always one slot before the stream slot, regardless of how many
-    # type_index / zero_padding helper assignments TileLang interleaves.
     src = host_source or ""
     int_assign_re = re.compile(
         r'\(\(\(TVMFFIAny\*\)stack_ffi_any\)\[(\d+)\]\.v_int64\)\s*=\s*'
@@ -182,19 +317,13 @@ def compile_kernel(prim_func, target: str):
         if (slot + 1) in zero_slots and pos < launch_call_pos
     ]
     if not candidates:
-        # Diagnostic dump so the next person knows what shifted.
-        all_int_slots = sorted(int_by_slot.keys())
-        all_zero_slots = sorted(zero_slots)
-        host_len = len(src)
         raise RuntimeError(
-            "Could not extract dynamic shared-memory size from "
-            "host_kernel_source. TileLang ABI changed — update "
-            f"gen_tilelang_aot.py. Diagnostics: host_source_len={host_len}, "
-            f"int_slots={all_int_slots}, zero_slots={all_zero_slots}, "
-            f"launch_call_pos={launch_call_pos}, "
-            f"int_int_pairs_total={len(int_by_slot)}"
+            "Could not extract dynamic shared-memory size from host_kernel_source. "
+            "TileLang ABI changed — update gen_tilelang_aot.py. "
+            f"Diagnostics: host_source_len={len(src)}, "
+            f"int_slots={sorted(int_by_slot)}, zero_slots={sorted(zero_slots)}, "
+            f"launch_call_pos={launch_call_pos}, int_int_pairs_total={len(int_by_slot)}"
         )
-    # The kernel-launch packing is the highest-slot pair that fits.
     candidates.sort()
     dyn_shmem_bytes = candidates[-1][1]
 
@@ -210,27 +339,18 @@ def compile_kernel(prim_func, target: str):
             re.DOTALL,
         )
     if match is None:
-        raise RuntimeError(
-            "Could not find __global__ kernel declaration in device source"
-        )
+        raise RuntimeError("Could not find __global__ kernel declaration in device source")
 
-    kernel_func_name = match.group(1)
-    raw_args = match.group(2)
     parsed = []
-    for chunk in raw_args.split(","):
+    for chunk in match.group(2).split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
-        # Strip __restrict__, qualifiers, etc. The interesting bits are
-        # the trailing identifier and whether it has a `*`.
         is_pointer = "*" in chunk
         ident = chunk.rsplit(maxsplit=1)[-1].lstrip("*")
-        if is_pointer:
-            parsed.append(("tensor", ident))
-        else:
-            parsed.append(("scalar", ident))
+        parsed.append(("tensor" if is_pointer else "scalar", ident))
 
-    return device_source, kernel_func_name, parsed, dyn_shmem_bytes
+    return device_source, match.group(1), parsed, dyn_shmem_bytes
 
 
 def nvcc_compile_cubin(
@@ -241,7 +361,6 @@ def nvcc_compile_cubin(
     cutlass_include: Path,
     cuda_include: Path,
 ) -> None:
-    """Compile a device_kernel.cu source file to a raw cubin via nvcc."""
     nvcc_bin = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
     cmd = [
         nvcc_bin,
@@ -270,54 +389,57 @@ def nvcc_compile_cubin(
 
 
 def _format_cubin_bytes(data: bytes) -> str:
-    lines = []
-    for i in range(0, len(data), 16):
-        chunk = data[i:i + 16]
-        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
-    return "\n".join(lines)
+    return "\n".join(
+        "    " + ", ".join(f"0x{b:02x}" for b in data[i:i + 16]) + ","
+        for i in range(0, len(data), 16)
+    )
 
 
-def _build_args_array(parsed_args):
-    """Map TileLang's parsed arg list to user-input expressions.
+def _canonical_scalar_name(name: str) -> tuple[str, Callable[[str], str]]:
+    stem = re.sub(r"_\d+$", "", name)
+    if stem.endswith("_plus_one"):
+        base = stem[: -len("_plus_one")]
+        return base, lambda expr: f"({expr} + 1)"
+    return stem, lambda expr: expr
 
-    For tensor pointers, look up the user-facing input name. For scalars,
-    use the WRAPPER_FILL_RULES table. Anything missing means the kernel
-    needs a value the wrapper doesn't currently take — fail loudly.
-    """
+
+def _scalar_expr(spec: WrapperSpec, name: str) -> tuple[str, str]:
+    canonical, transform = _canonical_scalar_name(name)
+    if canonical not in spec.scalar_inputs:
+        raise RuntimeError(
+            f"unknown scalar parameter {name!r} in TileLang kernel — "
+            "extend the family WrapperSpec in gen_tilelang_aot.py."
+        )
+    ctype, expr = spec.scalar_inputs[canonical]
+    return ctype, transform(expr)
+
+
+def _build_args_array(parsed_args, spec: WrapperSpec) -> str:
     lines = []
     for kind, name in parsed_args:
         if kind == "tensor":
-            user = TENSOR_NAME_TO_USER_INPUT.get(name)
+            user = spec.tensor_inputs.get(name)
             if user is None:
                 raise RuntimeError(
                     f"unknown tensor parameter {name!r} in TileLang kernel — "
-                    "extend TENSOR_NAME_TO_USER_INPUT in gen_tilelang_aot.py."
+                    "extend the family WrapperSpec in gen_tilelang_aot.py."
                 )
             lines.append(f"        &{user},")
-        else:  # scalar
-            expr = WRAPPER_FILL_RULES.get(name)
-            if expr is None:
-                raise RuntimeError(
-                    f"unknown scalar parameter {name!r} in TileLang kernel — "
-                    "extend WRAPPER_FILL_RULES in gen_tilelang_aot.py."
-                )
-            lines.append(f"        &args_{name},  // {expr}")
+        else:
+            _scalar_expr(spec, name)
+            lines.append(f"        &args_{name},")
     return "\n".join(lines)
 
 
-def _build_scalar_locals(parsed_args):
-    """Emit `int args_<name> = <expr>;` for each scalar arg the kernel needs.
-
-    Scalars must be addressable for `cuLaunchKernel`; storing each in a
-    local variable gives a stable address regardless of whether the
-    expression came from an arithmetic op (e.g. batch_size + 1).
-    """
+def _build_scalar_locals(parsed_args, spec: WrapperSpec) -> str:
     lines = []
+    seen = set()
     for kind, name in parsed_args:
-        if kind != "scalar":
+        if kind != "scalar" or name in seen:
             continue
-        expr = WRAPPER_FILL_RULES[name]
-        lines.append(f"    int args_{name} = {expr};")
+        seen.add(name)
+        ctype, expr = _scalar_expr(spec, name)
+        lines.append(f"    {ctype} args_{name} = {expr};")
     return "\n".join(lines)
 
 
@@ -328,12 +450,11 @@ def write_c_wrapper(
     kernel_symbol: str,
     parsed_args,
     dyn_shmem_bytes: int,
+    spec: WrapperSpec,
 ) -> None:
-    """Emit the C wrapper that exposes <kernel_name>_cuda to Rust."""
-    cubin_bytes = Path(cubin_path).read_bytes()
-    cubin_array = _format_cubin_bytes(cubin_bytes)
-    args_lines = _build_args_array(parsed_args)
-    scalar_locals = _build_scalar_locals(parsed_args)
+    cubin_array = _format_cubin_bytes(Path(cubin_path).read_bytes())
+    args_lines = _build_args_array(parsed_args, spec)
+    scalar_locals = _build_scalar_locals(parsed_args, spec)
     src = f"""#include <cuda.h>
 #include <stdint.h>
 
@@ -346,6 +467,10 @@ static const unsigned char kCubinData[] = {{
 }};
 static const unsigned int kCubinSize = (unsigned int)sizeof(kCubinData);
 
+static int32_t ceildiv_i32(int32_t n, int32_t d) {{
+    return (n + d - 1) / d;
+}}
+
 static CUresult ensure_loaded(void) {{
     if (g_function != NULL) return CUDA_SUCCESS;
     (void)kCubinSize;
@@ -353,9 +478,6 @@ static CUresult ensure_loaded(void) {{
     if (r != CUDA_SUCCESS) return r;
     r = cuModuleGetFunction(&g_function, g_module, kFuncSymbol);
     if (r != CUDA_SUCCESS) return r;
-    // Lift the dynamic-shared-memory cap so >48KB launches are accepted on
-    // sm_75+ — TileLang's prefill HD128 needs ~48KB, exactly at the
-    // default per-block limit on Ada/Hopper.
     return cuFuncSetAttribute(
         g_function,
         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -364,53 +486,24 @@ static CUresult ensure_loaded(void) {{
 }}
 
 CUresult {kernel_name}_cuda(
-    uint16_t *q,
-    const int32_t *q_indptr,
-    uint16_t *k_pool,
-    uint16_t *v_pool,
-    const int32_t *kv_indptr,
-    const int32_t *kv_indices,
-    const int32_t *kv_last_page_len,
-    uint16_t *o,
-    int32_t batch_size,
-    int32_t total_q_tokens,
-    int32_t max_qlen,
-    int32_t num_pages,
-    int32_t total_pages,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t page_size,
-    float sm_scale,
-    CUstream stream
+{spec.public_params}
 ) {{
-    (void)num_kv_heads;
-    (void)page_size;
-    (void)sm_scale;
+{spec.prelude}
     CUresult r = ensure_loaded();
     if (r != CUDA_SUCCESS) return r;
 
-    // Per-arg locals so cuLaunchKernel has stable addresses for the
-    // scalar parameters TileLang baked into the kernel signature.
 {scalar_locals}
 
-    // Argument order is parsed from TileLang-codegen'd device_kernel.cu
-    // — TileLang emits tensors then auto-promoted symbolic scalars in a
-    // deterministic order; the parser table keeps us in lockstep.
     void *args[] = {{
 {args_lines}
     }};
 
-    // Grid dims: (per-request q-tile blocks, num_q_heads, batch_size).
-    const int block_m = 64;
-    int qlen = max_qlen > 0 ? max_qlen : 1;
-    int grid_x = (qlen + block_m - 1) / block_m;
-    int grid_y = num_q_heads;
-    int grid_z = batch_size;
+{spec.grid}
 
     return cuLaunchKernel(
         g_function,
         grid_x, grid_y, grid_z,
-        128, 1, 1,
+        {spec.block},
         {dyn_shmem_bytes}, stream, args, NULL
     );
 }}
@@ -425,8 +518,10 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--out-name", required=True)
-    parser.add_argument("--num-q-heads", type=int, required=True)
-    parser.add_argument("--num-kv-heads", type=int, required=True)
+    parser.add_argument("--kernel-family", choices=["attention", "gdr"], default="attention")
+    parser.add_argument("--kernel-key")
+    parser.add_argument("--num-q-heads", type=int)
+    parser.add_argument("--num-kv-heads", type=int)
     parser.add_argument("--cuda-arch", type=int, required=True,
                         help="SM arch number (e.g. 89 for L4, 90 for H100).")
     parser.add_argument("--tilelang-src", required=True,
@@ -438,14 +533,23 @@ def main() -> int:
     args = parser.parse_args()
 
     target = parse_target(args.target)
-    prim_func = load_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
+    if args.kernel_family == "attention":
+        if args.num_q_heads is None or args.num_kv_heads is None:
+            raise RuntimeError("attention kernels require --num-q-heads and --num-kv-heads")
+        prim_func = load_attention_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
+        wrapper_spec = ATTENTION_SPEC
+    else:
+        if not args.kernel_key:
+            raise RuntimeError("gdr kernels require --kernel-key")
+        if args.kernel_key not in GDR_SPECS:
+            raise RuntimeError(f"unknown GDR kernel key {args.kernel_key!r}; valid keys: {sorted(GDR_SPECS)}")
+        prim_func = load_gdr_kernel(args.kernel_path, args.kernel_key)
+        wrapper_spec = GDR_SPECS[args.kernel_key]
+
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device_source, kernel_func_name, parsed_args, dyn_shmem_bytes = compile_kernel(prim_func, target)
-
-    # Stage the in-memory device source into out_dir so build.rs's
-    # rerun-if-changed sees a stable file path. Then nvcc-compile it.
     device_cu_staged = out_dir / f"{args.out_name}_device_kernel.cu"
     device_cu_staged.write_text(device_source)
     cubin_path = out_dir / f"{args.out_name}.cubin"
@@ -466,6 +570,7 @@ def main() -> int:
         kernel_func_name,
         parsed_args,
         dyn_shmem_bytes,
+        wrapper_spec,
     )
 
     print(f"FUNC_NAME={args.kernel_name}_cuda")

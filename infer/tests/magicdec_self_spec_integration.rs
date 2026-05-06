@@ -146,5 +146,5 @@ fn magicdec_configuration_example() {
     assert_eq!(config.spec_draft_model, DraftMode::SelfSpec);
     assert!(config.spec_sparse_kv_enabled);
     assert_eq!(config.spec_draft_k, 5);
-    assert_eq!(config.spec_acceptance_threshold, 0.6);
+    assert!((config.spec_acceptance_threshold - 0.6).abs() < f32::EPSILON);
 }

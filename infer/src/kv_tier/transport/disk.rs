@@ -1271,8 +1271,8 @@ mod tests {
 
         let mut store_op = store
             .store(KVBackendStore {
-                handle: host_handle.clone(),
-                block: block.clone(),
+                handle: host_handle,
+                block,
                 kv_format_tag,
                 payload: KVPayload::from_vec(payload.clone()),
             })

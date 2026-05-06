@@ -1434,7 +1434,7 @@ mod tests {
             fn submit(&self, _req: IncomingRequest) -> Result<(), SubmitError> {
                 Ok(())
             }
-            fn model_id(&self) -> &str {
+            fn model_id(&self) -> &'static str {
                 "Qwen3.5-4B-MLX-4bit"
             }
             fn dflash_status(&self) -> Option<DflashStatus> {
