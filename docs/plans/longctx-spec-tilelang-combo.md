@@ -3,6 +3,12 @@
 > Drafted 2026-05-07 by Claude (manager track). Companion to:
 > - [`backend-unification.md`](backend-unification.md) — Codex's CUDA↔Metal收敛主线
 > - [`dsv4-small-repro.md`](dsv4-small-repro.md) — Codex的从零预训 substrate
+>
+> **Mission alignment:** This plan is the **Phase 2 implementation kit**
+> for the [`32k-128k longctx leadership`](../projects/2026-04-30-longctx-32k-128k-leadership.md)
+> project (§8 of that doc). M_b + M_c + M_d collectively unblock the W2
+> long-decode 2.0-2.5× target (MagicDec / TriForce class); M_e is the
+> world-rank gauntlet that pairs with the project's §2.1 W1+W2 panel.
 
 ## 0. Why this plan — the combinatorial gap
 
