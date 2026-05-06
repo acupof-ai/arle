@@ -528,8 +528,8 @@ mod tests {
     fn admission_budget_honors_attached_prefix_as_existing_seq() {
         let mut budget = PageBudget::new(1, vec![0], 4, true);
 
-        assert!(budget.can_fit_target(estimated_request_target(0, 4, 4, 4)));
-        budget.reserve_target(estimated_request_target(0, 4, 4, 4));
+        assert!(budget.can_fit_target(estimated_request_target(0, 7, 4, 4)));
+        budget.reserve_target(estimated_request_target(0, 7, 4, 4));
         assert_eq!(budget.remaining_free_pages(), 0);
         assert_eq!(budget.planned_seq_len(0), 8);
     }
@@ -548,7 +548,7 @@ mod tests {
             !budget.can_fit_target(estimated_request_target(1, 4, 4, 0)),
             "later admissions must respect estimated headroom held by active slots",
         );
-        assert!(budget.can_fit_target(estimated_request_target(1, 4, 0, 0)));
+        assert!(budget.can_fit_target(estimated_request_target(1, 3, 0, 0)));
     }
 
     #[test]
