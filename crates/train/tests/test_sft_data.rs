@@ -2,7 +2,10 @@ use std::{error::Error, fs, path::Path};
 
 use tempfile::tempdir;
 use train::{
-    sft_data::{ChatMessage, SftExample, ToolCall, load_jsonl, tokenize_example},
+    sft_data::{
+        ChatMessage, SftExample, ToolCall, load_jsonl, render_structured_chatml_with_spans,
+        tokenize_example,
+    },
     tokenizer::{ChatTokenizer, write_chatml_wordlevel_tokenizer, write_wordlevel_tokenizer},
 };
 
@@ -133,21 +136,6 @@ fn parse_jsonl_tool_calls_and_tool_results() -> TestResult {
 #[test]
 fn tokenize_masks_tool_turns_and_labels_assistant_tool_calls() -> TestResult {
     let dir = tempdir()?;
-    let tokenizer_path = dir.path().join("tokenizer.json");
-    write_tool_turn_tokenizer(&tokenizer_path)?;
-    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
-
-    let assistant_payload = serde_json::to_string(&serde_json::json!({
-        "name": "shell",
-        "arguments": { "command": "pwd" }
-    }))?;
-    let user_turn = "<|im_start|>user\nask<|im_end|>\n";
-    let assistant_tool_turn = format!(
-        "<|im_start|>assistant\n\n<tool_call>\n{assistant_payload}\n</tool_call><|im_end|>\n"
-    );
-    let tool_turn = "<|im_start|>tool\n<tool_response>\ncwd\n</tool_response><|im_end|>\n";
-    let final_turn = "<|im_start|>assistant\ndone<|im_end|>\n";
-
     let example = SftExample {
         messages: vec![
             ChatMessage::user("ask"),
@@ -162,12 +150,28 @@ fn tokenize_masks_tool_turns_and_labels_assistant_tool_calls() -> TestResult {
             ChatMessage::assistant("done", vec![]),
         ],
     };
+    let user_turn = render_single_turn(&example.messages[0]);
+    let assistant_tool_turn = render_single_turn(&example.messages[1]);
+    let tool_turn = render_single_turn(&example.messages[2]);
+    let final_turn = render_single_turn(&example.messages[3]);
+
+    let tokenizer_path = dir.path().join("tokenizer.json");
+    write_tool_turn_tokenizer(
+        &tokenizer_path,
+        &[
+            user_turn.clone(),
+            assistant_tool_turn.clone(),
+            tool_turn.clone(),
+            final_turn.clone(),
+        ],
+    )?;
+    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
 
     let tokenized = tokenize_example(&example, &tokenizer, 128)?;
-    let user_len = tokenizer.encode(user_turn, false)?.len();
+    let user_len = tokenizer.encode(&user_turn, false)?.len();
     let assistant_len = tokenizer.encode(&assistant_tool_turn, false)?.len();
-    let tool_len = tokenizer.encode(tool_turn, false)?.len();
-    let final_len = tokenizer.encode(final_turn, false)?.len();
+    let tool_len = tokenizer.encode(&tool_turn, false)?.len();
+    let final_len = tokenizer.encode(&final_turn, false)?.len();
 
     let user_range = 0..user_len;
     let assistant_range = user_len..user_len + assistant_len;
@@ -207,22 +211,11 @@ fn write_test_tokenizer(path: &Path) -> TestResult {
     Ok(())
 }
 
-fn write_tool_turn_tokenizer(path: &Path) -> TestResult {
-    let assistant_payload = serde_json::to_string(&serde_json::json!({
-        "name": "shell",
-        "arguments": { "command": "pwd" }
-    }))?;
-    write_wordlevel_tokenizer(
-        path,
-        std::iter::empty::<String>(),
-        [
-            "<|im_start|>user\nask<|im_end|>\n".to_string(),
-            format!(
-                "<|im_start|>assistant\n\n<tool_call>\n{assistant_payload}\n</tool_call><|im_end|>\n"
-            ),
-            "<|im_start|>tool\n<tool_response>\ncwd\n</tool_response><|im_end|>\n".to_string(),
-            "<|im_start|>assistant\ndone<|im_end|>\n".to_string(),
-        ],
-    )?;
+fn render_single_turn(message: &ChatMessage) -> String {
+    render_structured_chatml_with_spans(std::slice::from_ref(message), false).prompt
+}
+
+fn write_tool_turn_tokenizer(path: &Path, turns: &[String]) -> TestResult {
+    write_wordlevel_tokenizer(path, std::iter::empty::<String>(), turns.iter().cloned())?;
     Ok(())
 }
