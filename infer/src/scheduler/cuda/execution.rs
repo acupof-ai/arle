@@ -76,6 +76,13 @@ impl StepPlan {
         matches!(self, Self::Idle)
     }
 
+    fn expects_decode(&self) -> bool {
+        matches!(
+            self,
+            Self::Decode | Self::SpecDecode | Self::Split(_) | Self::Mixed(_)
+        )
+    }
+
     fn scheduled_prefill_rows(&self) -> u64 {
         match self {
             Self::Prefill(candidates) | Self::Split(candidates) | Self::Mixed(candidates) => {
@@ -642,6 +649,9 @@ impl<M: ModelForward> Scheduler<M> {
         if cfg!(feature = "unified_scheduler")
             && let Some(logical_plan) = self.logical_shadow_plan_from_step_plan(plan)
         {
+            if plan.expects_decode() && logical_plan.decode_rows.is_empty() {
+                return self.launch_legacy_step_plan(plan);
+            }
             self.launch_logical_serve_plan(&logical_plan)
         } else {
             self.launch_legacy_step_plan(plan)
