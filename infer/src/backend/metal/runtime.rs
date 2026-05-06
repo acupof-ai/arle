@@ -1088,6 +1088,15 @@ impl crate::request_handle::RequestHandle for MetalSchedulerHandle {
     fn dflash_status(&self) -> Option<crate::request_handle::DflashStatus> {
         self.dflash_status.clone()
     }
+
+    /// Forward the inner `SchedulerHandle`'s server-metrics handle so
+    /// `InferenceEngine::telemetry()` can project the unified
+    /// `EngineTelemetry` snapshot for the Metal backend. Without this
+    /// the trait default returned `None` and Metal silently lost its
+    /// engine telemetry projection. (M1 unification)
+    fn server_metrics(&self) -> Option<&crate::metrics::ServerMetrics> {
+        SchedulerHandle::server_metrics(&self.inner)
+    }
 }
 
 pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
@@ -1129,7 +1138,8 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
     // every Metal agent turn silently downgraded to `tokens: null`.
     // (codex Phase-2 P1)
     let mut handle =
-        SchedulerHandle::with_shared_waiting_count(tx, &model_id, max_waiting, waiting_count);
+        SchedulerHandle::with_shared_waiting_count(tx, &model_id, max_waiting, waiting_count)
+            .with_server_metrics(metrics.clone());
     if let Some(tokenizer) = backend.tokenizer.as_ref() {
         handle = handle.with_tokenizer(tokenizer.clone());
     }

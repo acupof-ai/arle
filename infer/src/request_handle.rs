@@ -43,6 +43,15 @@ pub trait RequestHandle: Send + Sync {
     fn dflash_status(&self) -> Option<DflashStatus> {
         None
     }
+
+    /// Borrow the rolling `ServerMetrics` instance that the scheduler
+    /// thread is writing into, if the handle owns one. Used by
+    /// `InferenceEngine::telemetry()` to project the unified
+    /// `EngineTelemetry` snapshot. Default `None` for handles that do
+    /// not run through a scheduler thread (mocks, tests).
+    fn server_metrics(&self) -> Option<&crate::metrics::ServerMetrics> {
+        None
+    }
 }
 
 impl RequestHandle for SchedulerHandle {
@@ -56,6 +65,10 @@ impl RequestHandle for SchedulerHandle {
 
     fn tokenizer_clone(&self) -> Option<crate::tokenizer::Tokenizer> {
         SchedulerHandle::tokenizer_clone(self)
+    }
+
+    fn server_metrics(&self) -> Option<&crate::metrics::ServerMetrics> {
+        SchedulerHandle::server_metrics(self)
     }
 }
 
@@ -77,5 +90,9 @@ where
 
     fn dflash_status(&self) -> Option<DflashStatus> {
         (**self).dflash_status()
+    }
+
+    fn server_metrics(&self) -> Option<&crate::metrics::ServerMetrics> {
+        (**self).server_metrics()
     }
 }

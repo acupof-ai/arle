@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
+use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::sampler::SamplingParams;
@@ -89,6 +92,39 @@ impl CompletionStreamDelta {
     }
 }
 
+/// Backend-agnostic snapshot of engine-level telemetry (`InferenceEngine::telemetry()`).
+///
+/// M1 unification surface (see `docs/plans/backend-unification.md` §M1):
+/// CUDA and Metal both project from their respective scheduler-side metrics
+/// into this struct so HTTP / bench / observability code can read one shape
+/// regardless of which backend is loaded. Fields a backend cannot supply stay
+/// `None` / `0` — callers must treat empty as "unavailable", never as zero.
+///
+/// `kv_tier_hit_rates` is keyed by tier label (`"T0"`, `"T1"`, `"T2"`, `"T3"`).
+/// Backends without a particular tier omit that key rather than reporting `0.0`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct EngineTelemetry {
+    /// Time-to-first-token (microseconds, p50). `None` when no requests
+    /// have completed since boot.
+    pub ttft_us: Option<f64>,
+    /// Inter-token latency p50 in microseconds (TPOT-style: time per
+    /// output token after the first). `None` until at least one request
+    /// generated >1 token.
+    pub itl_p50_us: Option<f64>,
+    /// Inter-token latency p99 in microseconds.
+    pub itl_p99_us: Option<f64>,
+    /// Requests currently waiting in the scheduler queue.
+    pub queue_depth: u32,
+    /// Requests currently active in scheduler slots.
+    pub active_requests: u32,
+    /// Fraction of allocated KV slots currently in use (0.0..=1.0).
+    pub batch_occupancy: f64,
+    /// Per-tier hit rates keyed by `"T0"` / `"T1"` / `"T2"` / `"T3"`.
+    pub kv_tier_hit_rates: HashMap<String, f64>,
+    /// Wall-clock timestamp of the snapshot (millis since UNIX epoch).
+    pub timestamp_ms: u64,
+}
+
 pub trait InferenceEngine: Send {
     /// Returns the model identifier (e.g. `"Qwen3-8B"`).
     fn model_id(&self) -> &str;
@@ -115,5 +151,13 @@ pub trait InferenceEngine: Send {
     /// substitute an empty Vec.
     fn tokenize(&self, _text: &str) -> Result<Vec<u32>> {
         Err(anyhow!("backend does not expose tokenize()"))
+    }
+
+    /// Backend-agnostic engine-level telemetry snapshot. Default returns
+    /// the empty/zero shape so legacy backends keep compiling. Backends
+    /// that drive a `SchedulerHandle` / `MetalSchedulerHandle` override
+    /// this to project from their `ServerMetrics`.
+    fn telemetry(&self) -> EngineTelemetry {
+        EngineTelemetry::default()
     }
 }
