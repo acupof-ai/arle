@@ -79,18 +79,22 @@ nccl = ["cuda", "cuda-kernels/nccl", "cudarc/nccl"]
 cpu = []
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).
 metal = ["dep:mlx-sys", "dep:libc"]
+# Default-on rollback gate for the shared scheduler decision IR lowering.
+unified_scheduler = []
 # Tiered KV cache §P5:
 # - `rdma-nixl` = compile against `nixl-sys` stub-api for Mac/dev CI
 # - `rdma-nixl-real` = compile against the real native link surface
 rdma-nixl = ["dep:nixl-sys-stub"]
 rdma-nixl-real = ["dep:nixl-sys-real"]
-# No backend default. macOS users (where cudarc cannot link without nvcc) used
-# to have to pass `--no-default-features` for every command; that footgun is
-# gone. Pick a backend explicitly:
+# No backend default. The default feature set may enable backend-neutral
+# runtime gates, but it must not pull in CUDA/Metal link dependencies. macOS
+# users (where cudarc cannot link without nvcc) used to have to pass
+# `--no-default-features` for every command; that backend footgun is gone. Pick
+# a backend explicitly:
 #   --features cuda       Linux + NVIDIA
 #   --features metal,no-cuda    Apple Silicon
 #   --features cpu,no-cuda      portable smoke
-default = []
+default = ["unified_scheduler"]
 reference = []
 
 # CUDA-only binaries — skipped under --features metal,no-cuda
