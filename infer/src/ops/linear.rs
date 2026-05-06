@@ -905,10 +905,13 @@ fn run_bf16_linear(
 }
 
 fn deterministic_gemm_enabled() -> bool {
-    matches!(
-        std::env::var("INFER_DETERMINISTIC").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("INFER_DETERMINISTIC").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
 }
 
 fn run_bf16_graphsafe_per_row(
