@@ -115,7 +115,7 @@ __global__ void prefill_kv_cache_write_kernel(
 //   1. Per-head QK norm + RoPE (custom kernel)
 //   2. KV cache batch write (custom kernel)
 //
-// Step 3 (attention computation) is handled by FlashInfer single-prefill wrappers
+// Step 3 (attention computation) is handled by TileLang paged prefill wrappers
 // for HD128/HD256, or by paged-prefill paths outside this helper.
 // ============================================================================
 extern "C" {

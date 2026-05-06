@@ -17,7 +17,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn silu_mul_triton_aot_cuda(
+    pub fn silu_mul_cuda(
         gate: *const Half,
         up: *const Half,
         out: *mut Half,

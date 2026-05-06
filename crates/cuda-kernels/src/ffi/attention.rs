@@ -43,36 +43,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn flashinfer_single_prefill(
-        q: *mut Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        tmp_buffer: *mut u8,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_single_prefill_hd256(
-        q: *mut Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        tmp_buffer: *mut Half,
-        stream: CUstream,
-    ) -> i32;
-
     pub fn prefill_attention_hd256_prep_cuda(
         q_full_batch: *const Half,
         k_batch: *const Half,
@@ -190,6 +160,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn nonpaged_prefill_attention_cuda(
+        q: *const Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn decode_prep_paged_cuda(
         q_batch: *mut Half,
         k_batch: *const Half,
@@ -239,44 +224,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn flashinfer_batch_decode_plan(
-        float_workspace: *mut u8,
-        float_workspace_bytes: usize,
-        int_workspace: *mut u8,
-        page_locked_workspace: *mut u8,
-        int_workspace_bytes: usize,
-        indptr_h: *const i32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        plan_info_out: *mut u8,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_batch_decode_run(
-        float_workspace: *mut u8,
-        int_workspace: *mut u8,
-        plan_info: *const u8,
-        q: *const Half,
-        k_data: *const Half,
-        v_data: *const Half,
-        kv_indptr: *const i32,
-        kv_indices: *const i32,
-        kv_last_page_len: *const i32,
-        o: *mut Half,
-        lse: *mut f32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_append_last_token_indices_cuda(
+    pub fn paged_kv_append_last_token_indices_cuda(
         kv_indices: *mut i32,
         kv_indptr: *const i32,
         last_token_indices: *const i32,
@@ -284,7 +232,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn flashinfer_append_new_page_indices_cuda(
+    pub fn paged_kv_append_new_page_indices_cuda(
         kv_indices: *mut i32,
         prev_kv_indptr: *const i32,
         next_kv_indptr: *const i32,
@@ -293,43 +241,6 @@ unsafe extern "C" {
         batch_size: i32,
         stream: CUstream,
     ) -> CUresult;
-
-    pub fn flashinfer_batch_decode_hd256_plan(
-        float_workspace: *mut u8,
-        float_workspace_bytes: usize,
-        int_workspace: *mut u8,
-        page_locked_workspace: *mut u8,
-        int_workspace_bytes: usize,
-        indptr_h: *const i32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        plan_info_out: *mut u8,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_batch_decode_hd256_run(
-        float_workspace: *mut u8,
-        int_workspace: *mut u8,
-        plan_info: *const u8,
-        q: *const Half,
-        k_data: *const Half,
-        v_data: *const Half,
-        kv_indptr: *const i32,
-        kv_indices: *const i32,
-        kv_last_page_len: *const i32,
-        o: *mut Half,
-        lse: *mut f32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
 
     pub fn decode_prep_paged_hd256_cuda(
         q_full_batch: *const Half,
@@ -363,120 +274,6 @@ unsafe extern "C" {
         batch_size: i32,
         stream: CUstream,
     ) -> CUresult;
-
-    pub fn flashinfer_tc_decode_plan(
-        float_workspace: *mut u8,
-        float_workspace_bytes: usize,
-        int_workspace: *mut u8,
-        page_locked_workspace: *mut u8,
-        int_workspace_bytes: usize,
-        qo_indptr_h: *const i32,
-        kv_indptr_h: *const i32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        plan_info_out: *mut u8,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_tc_decode_run(
-        float_workspace: *mut u8,
-        int_workspace: *mut u8,
-        plan_info: *const u8,
-        q: *const Half,
-        q_indptr: *const i32,
-        k_data: *const Half,
-        v_data: *const Half,
-        kv_indptr: *const i32,
-        kv_indices: *const i32,
-        kv_last_page_len: *const i32,
-        o: *mut Half,
-        lse: *mut f32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_batch_prefill_paged_hd128_plan(
-        float_workspace: *mut u8,
-        float_workspace_bytes: usize,
-        int_workspace: *mut u8,
-        page_locked_workspace: *mut u8,
-        int_workspace_bytes: usize,
-        qo_indptr_h: *const i32,
-        kv_indptr_h: *const i32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        plan_info_out: *mut u8,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_batch_prefill_paged_hd128_run(
-        float_workspace: *mut u8,
-        int_workspace: *mut u8,
-        plan_info: *const u8,
-        q: *mut Half,
-        q_indptr: *const i32,
-        k_data: *mut Half,
-        v_data: *mut Half,
-        kv_indptr: *const i32,
-        kv_indices: *const i32,
-        kv_last_page_len: *const i32,
-        o: *mut Half,
-        lse: *mut f32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_batch_prefill_paged_hd256_plan(
-        float_workspace: *mut u8,
-        float_workspace_bytes: usize,
-        int_workspace: *mut u8,
-        page_locked_workspace: *mut u8,
-        int_workspace_bytes: usize,
-        qo_indptr_h: *const i32,
-        kv_indptr_h: *const i32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        plan_info_out: *mut u8,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn flashinfer_batch_prefill_paged_hd256_run(
-        float_workspace: *mut u8,
-        int_workspace: *mut u8,
-        plan_info: *const u8,
-        q: *mut Half,
-        q_indptr: *const i32,
-        k_data: *mut Half,
-        v_data: *mut Half,
-        kv_indptr: *const i32,
-        kv_indices: *const i32,
-        kv_last_page_len: *const i32,
-        o: *mut Half,
-        lse: *mut f32,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
 
     pub fn decode_attention_int8_workspace_bytes(
         batch_size: i32,
@@ -527,13 +324,13 @@ unsafe extern "C" {
 
     /// Variable-length Q + paged FP8 E4M3 KV attention.
     ///
-    /// Mirrors `flashinfer_tc_run_layer` but reads FP8 KV directly (no bf16
+    /// Mirrors the TileLang TC decode shape but reads FP8 KV directly (no bf16
     /// shadow). Used by the mixed prefill+decode path when KV format is FP8.
     /// HD128 + page_size=16 only for now.
     ///
     /// Q packing: `[total_q_tokens, num_q_heads * HEAD_DIM]` in bf16, where
     /// `total_q_tokens = qo_indptr[batch_size]`. Output has the same shape.
-    /// `causal=true` enables FlashAttention causal mask for prefill rows
+    /// `causal=true` enables the causal mask for prefill rows
     /// (qlen > 1); decode rows (qlen=1) ignore the mask.
     pub fn decode_attention_varlen_fp8_workspace_bytes(
         total_q_tokens: i32,
@@ -567,66 +364,6 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
-    /// FlashInfer MLA paged-attention plan (CPU-side scheduling).
-    ///
-    /// Wraps `flashinfer::MLAPlan` for BF16 q_nope / q_pe / ckv / kpe paged
-    /// caches. See `csrc/attention/flashinfer_mla.cu` for the C++ side and
-    /// `docs/plans/2026-05-01-mla-kernel-design.md` for the surrounding
-    /// design.
-    ///
-    /// Cache layout (matches FlashInfer's `BatchMLAPagedAttentionWrapper`):
-    ///   q_nope:  `[total_q, num_heads, head_dim_ckv]`
-    ///   q_pe:    `[total_q, num_heads, head_dim_kpe]`
-    ///   ckv:     `[num_pages, page_size, head_dim_ckv]`
-    ///   kpe:     `[num_pages, page_size, head_dim_kpe]`
-    ///   o:       `[total_q, num_heads, head_dim_ckv]`
-    ///
-    /// `qo_indptr_h`, `kv_indptr_h`, `kv_len_h` are HOST arrays.
-    /// `causal` is treated as bool (0 = none, !=0 = causal mask).
-    pub fn flashinfer_mla_paged_attention_plan(
-        float_workspace: *mut u8,
-        float_workspace_bytes: usize,
-        int_workspace: *mut u8,
-        page_locked_workspace: *mut u8,
-        int_workspace_bytes: usize,
-        qo_indptr_h: *const i32,
-        kv_indptr_h: *const i32,
-        kv_len_h: *const i32,
-        batch_size: i32,
-        num_heads: i32,
-        head_dim_ckv: i32,
-        head_dim_kpe: i32,
-        causal: i32,
-        plan_info_out: *mut u8,
-        stream: CUstream,
-    ) -> i32;
-
-    /// FlashInfer MLA paged-attention run (GPU launch).
-    ///
-    /// Consumes the opaque plan buffer produced by
-    /// [`flashinfer_mla_paged_attention_plan`] and launches
-    /// `flashinfer::mla::BatchMLAPagedAttention` over the supplied caches.
-    ///
-    /// `lse` may be null when log-sum-exp output is not required.
-    pub fn flashinfer_mla_paged_attention_run(
-        float_workspace: *mut u8,
-        int_workspace: *mut u8,
-        plan_info: *const u8,
-        q_nope: *mut Half,
-        q_pe: *mut Half,
-        ckv: *mut Half,
-        kpe: *mut Half,
-        kv_indices: *const i32,
-        o: *mut Half,
-        lse: *mut f32,
-        num_heads: i32,
-        page_size: i32,
-        head_dim_ckv: i32,
-        head_dim_kpe: i32,
-        causal: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
 }
 
 // One AOT-specialized symbol per (num_q_heads, num_kv_heads). The matching
@@ -635,7 +372,6 @@ unsafe extern "C" {
 //   - SUPPORTED_HEADS in tools/tilelang/batch_prefill_paged_hd128.py
 //   - TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs
 //   - the macro invocation below + the dispatch arm in attention.rs
-#[cfg(feature = "tilelang-attn")]
 macro_rules! tilelang_prefill_hd128_decl {
     ($($name:ident),+ $(,)?) => {
         unsafe extern "C" {
@@ -666,7 +402,6 @@ macro_rules! tilelang_prefill_hd128_decl {
     };
 }
 
-#[cfg(feature = "tilelang-attn")]
 tilelang_prefill_hd128_decl!(
     tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
     tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
@@ -681,7 +416,6 @@ tilelang_prefill_hd128_decl!(
 //   - SUPPORTED_HEADS in tools/tilelang/batch_prefill_paged_hd256.py
 //   - TILELANG_PREFILL_HD256_HEAD_CONFIGS in cuda-kernels/build.rs
 //   - the macro invocation below + the dispatch arm in attention.rs
-#[cfg(feature = "tilelang-attn")]
 macro_rules! tilelang_prefill_hd256_decl {
     ($($name:ident),+ $(,)?) => {
         unsafe extern "C" {
@@ -712,7 +446,6 @@ macro_rules! tilelang_prefill_hd256_decl {
     };
 }
 
-#[cfg(feature = "tilelang-attn")]
 tilelang_prefill_hd256_decl!(
     tilelang_batch_prefill_paged_hd256_q8_kv2_run_cuda,
     tilelang_batch_prefill_paged_hd256_q16_kv2_run_cuda,
@@ -727,7 +460,6 @@ tilelang_prefill_hd256_decl!(
 //   - SUPPORTED_HEADS in tools/tilelang/batch_decode_paged_hd256.py
 //   - TILELANG_DECODE_HD256_HEAD_CONFIGS in cuda-kernels/build.rs
 //   - the macro invocation below + the dispatch arm in attention.rs
-#[cfg(feature = "tilelang-decode-hd256")]
 macro_rules! tilelang_decode_hd256_decl {
     ($($name:ident),+ $(,)?) => {
         unsafe extern "C" {
@@ -758,7 +490,6 @@ macro_rules! tilelang_decode_hd256_decl {
     };
 }
 
-#[cfg(feature = "tilelang-decode-hd256")]
 tilelang_decode_hd256_decl!(
     tilelang_batch_decode_paged_hd256_q8_kv2_run_cuda,
     tilelang_batch_decode_paged_hd256_q16_kv2_run_cuda,

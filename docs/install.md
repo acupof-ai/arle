@@ -95,7 +95,7 @@ The `:latest` tag tracks `main`. Tagged releases are published as
 
 ## 4. From source
 
-Required for the `cpu` backend, `tilelang-attn`, or hacking on the runtime.
+Required for the `cpu` backend, CUDA/TileLang, or hacking on the runtime.
 See the [README Quick Start](../README.md#quick-start) for the canonical
 `cargo build` invocations per backend, and [environment.md](environment.md)
 for the env-var knobs that affect the build.

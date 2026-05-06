@@ -21,7 +21,7 @@ rather than defining a second equal architecture.
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
 | `chat` | Shared protocol formatting/parsing, OpenAI chat surface types | Runtime scheduling and backend logic |
 | `infer` | Scheduler, HTTP server, backend runtime, model/kernel integration, `server_engine::InferenceEngine` contract | Terminal UX and agent-session orchestration |
-| `cuda-kernels` | CUDA kernel layer (`csrc/`, Triton AOT, Rust FFI, paged-KV / FlashInfer / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
+| `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
 | `kv-native-sys` | Local persistence substrate (file/block ABI, mmap, WAL, shm descriptors) for the KV-tier disk/shared transport path | Tier policy, scheduler, GPU code |
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
@@ -55,7 +55,7 @@ Reverse dependencies from `runtime-*` (or any `infer`-internal layer) into
 ## Backend Split
 
 - `cuda`: full scheduler path with chunked prefill, decode-priority batching,
-  paged KV, FlashInfer/Triton/CUDA kernels.
+  paged KV, TileLang AOT, and native CUDA C kernels.
 - `metal`: serial backend path for Apple Silicon via `mlx-sys`.
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
   end-to-end validation on non-GPU machines.
@@ -159,7 +159,7 @@ forces them.
 
 - **No `infer-ops` crate.** Ops are tightly coupled to model data layouts.
 - **No `infer-scheduler-core` crate.** The CUDA scheduler reaches into
-  `PagedKVPool`, `FlashInferDecodeMetadata`, and model-specific types in
+  `PagedKVPool`, `TileLangDecodeMetadata`, and model-specific types in
   `bootstrap`.
 - **No `infer-runtime-api` trait crate.** Already covered by
   `infer::server_engine::InferenceEngine`.

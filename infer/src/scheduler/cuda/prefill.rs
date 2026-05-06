@@ -6,11 +6,11 @@ use crate::sampler::SamplingParams;
 use super::execution::PrefillCandidate;
 
 /// How long to gate new prefill admits after a workspace OOM. Long enough
-/// for the FlashInfer plan + activation buffers from the failed batch to
+/// for TileLang metadata + activation buffers from the failed batch to
 /// drop and for in-flight decode rows to free their growth reservations.
 const PREFILL_OOM_COOLDOWN_MS: u64 = 5_000;
 
-/// Recognise the OOM signature surfaced by `cudarc` / FlashInfer through
+/// Recognise the OOM signature surfaced by `cudarc` / CUDA kernels through
 /// `anyhow`. Matches both `DriverError(CUDA_ERROR_OUT_OF_MEMORY, ...)` and
 /// the bare "out of memory" string the kernel-side allocator emits.
 fn prefill_error_is_oom(err: &anyhow::Error) -> bool {

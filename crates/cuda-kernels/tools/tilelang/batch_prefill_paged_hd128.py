@@ -110,7 +110,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             # qlen-1, so the tighter bound is `kv_offset + qlen = kv_total_len`.
             # Pick the tighter of the two — `min(row0+BLOCK_M, qlen)`. The
             # outer `min(_, kv_total_len)` then clamps to the cache extent.
-            # Mirrors FlashInfer's `mask_iteration` pattern in `prefill.cuh`.
+            # Mirrors the standard causal tiled-attention visible-window bound.
             # For 4096-in cold prefill this drops ~35-50% of the per-tile
             # QK + softmax + PV work the unbounded loop wasted.
             q_rows_in_tile = T.if_then_else(
@@ -137,8 +137,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             # Per-tile page-index precomputes — only depend on j, not on
             # the head-dim d. Hoisting these into a 1D fragment kills the
             # ~128x duplicate divmod + KV_indices gather the original
-            # (j, d) loop incurred. Mirrors FlashInfer's per-thread
-            # `thr_local_kv_offset[]` cache in `prefill.cuh:2192-2287`.
+            # (j, d) loop incurred in the straightforward implementation.
             page_idx_j = T.alloc_fragment((BLOCK_N,), index_dtype)
             in_page_j = T.alloc_fragment((BLOCK_N,), index_dtype)
             valid_j = T.alloc_fragment((BLOCK_N,), index_dtype)

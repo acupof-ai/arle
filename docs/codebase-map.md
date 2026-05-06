@@ -77,7 +77,7 @@ infer/src/main.rs
   -> scheduler/cuda/*
   -> model.rs + model/*
   -> ops.rs + ops/*
-  -> crates/cuda-kernels kernels / FlashInfer / CUDA graph path
+  -> crates/cuda-kernels kernels / TileLang / CUDA graph path
 ```
 
 Key files:
@@ -184,7 +184,7 @@ For the Route-A folding rationale see
 - `infer/src/kv_tier.rs` + `infer/src/kv_tier/{backend,chunk,io,lookup,readmission,coordinator,host_pool,transport,tier,id,policy}.rs`: tiered KV cache module (T0 GPU → T1 host pinned → T2 NVMe → T3 remote); local path now combines radix metadata, direct GPU prefix attachment + decode-time COW in `paged_kv`, `HostPinnedPool` (kv-native-sys arena) for T1 demotion, `ReadmissionPlan + WaitingFetch + promote_fetched_prefix` for staged readmission, `Coordinator`-driven fetch/store queues, `transport/disk.rs` for node-local T2, `transport/shared_fs.rs` for a minimal cluster-shared backend, and `ServerMetrics` queue/backpressure gauges for the live fetch/store path. NIXL remains stub-only.
 - `infer/src/memory_planner.rs`: memory planning helpers
 - `crates/cuda-kernels/src/graph_pool.rs`: CUDA graph capture/reuse support
-- `crates/cuda-kernels/src/flashinfer.rs`: paged-KV metadata staging for FlashInfer
+- `crates/cuda-kernels/src/tilelang.rs`: paged-KV metadata staging for TileLang
 - `infer/src/backend/metal/kv_pool.rs`
 - `infer/src/backend/metal/prefix_cache.rs`
 - `infer/src/backend/metal/gdr.rs`
@@ -223,7 +223,7 @@ These crates remain independent after Route A:
 - `crates/chat`: shared protocol parsing/formatting and OpenAI chat types
 - `crates/cli`: CLI entry, arg parsing, REPL UX
 - `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
-- `crates/cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/triton/`, Rust FFI, `paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
+- `crates/cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tilelang`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored
   MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/kv-native-sys`: local persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors

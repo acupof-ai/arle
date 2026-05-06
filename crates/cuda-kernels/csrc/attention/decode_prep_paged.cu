@@ -1,4 +1,4 @@
-// Batched decode prep for FlashInfer paged attention:
+// Batched decode prep for TileLang paged attention:
 //   1. Per-head RMSNorm on Q and K
 //   2. Half-split RoPE on Q and K (Qwen3/Llama style)
 //   3. Write K (normed+roped) and V (raw) to paged KV cache

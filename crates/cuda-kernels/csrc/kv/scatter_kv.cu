@@ -2,7 +2,7 @@
 //
 // After QKV projection produces contiguous K [seq_len, kv_dim] and V [seq_len, kv_dim],
 // this kernel copies each token's K and V to the pool at a specified token index.
-// No norm or RoPE is applied — the Triton prefill attention kernel handles those internally.
+// No norm or RoPE is applied; downstream attention handles those internally.
 //
 // Input layout  (row-major): K/V_batch[pos * kv_dim + kv_head * head_dim + dim]
 // Output layout (row-major): K/V_pool [token_idx * kv_dim + kv_head * head_dim + dim]

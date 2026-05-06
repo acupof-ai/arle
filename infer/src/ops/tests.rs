@@ -274,8 +274,8 @@ fn test_gpu_sample() -> Result<()> {
 }
 
 #[test]
-#[ignore = "slow reference comparison"]
-fn test_flash_attention_prefill_hd256_matches_cpu_reference() -> Result<()> {
+#[ignore = "GPU-only regression for native non-paged HD256 fallback"]
+fn test_nonpaged_prefill_hd256_matches_cpu_reference() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let num_qheads = 4;
     let num_kvheads = 1;
@@ -319,7 +319,7 @@ fn test_flash_attention_prefill_hd256_matches_cpu_reference() -> Result<()> {
         let v_cache = DeviceVec::from_host(&ctx, &v_cache_host_bf16)?;
         let mut out = HiddenStates::zeros(&ctx, q_dim, seq_len)?;
 
-        flash_attention_prefill_hd256_into(
+        nonpaged_prefill_hd256_into(
             &ctx,
             &q_batch,
             &k_cache,
@@ -959,7 +959,7 @@ fn test_conv1d_prefill_handoff_matches_single_prefill() -> Result<()> {
 
 #[test]
 #[ignore = "slow reference comparison"]
-fn test_triton_decode_attention_matches_cpu_reference() -> Result<()> {
+fn test_cuda_decode_attention_matches_cpu_reference() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let num_qheads = 8;
     let num_kvheads = 2;

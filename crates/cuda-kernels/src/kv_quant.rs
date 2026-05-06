@@ -1,7 +1,7 @@
 //! KV cache quantization ops: bf16 ↔ INT8/FP8 per-head per-token symmetric.
 //!
 //! Also includes fused-dequant decode attention for quantized KV formats
-//! that FlashInfer doesn't support natively (INT8+scale, INT4+scale, etc.).
+//! that TileLang BF16 attention doesn't support natively (INT8+scale, INT4+scale, etc.).
 
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};

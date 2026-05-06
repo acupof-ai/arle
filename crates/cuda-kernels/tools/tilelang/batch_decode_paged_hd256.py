@@ -1,8 +1,7 @@
 """TileLang batch decode HD256 paged attention.
 
-Replaces FlashInfer's `flashinfer_batch_decode_hd256_run` for the HD256
-paged decode path used by Qwen3.5 full-attention layers (the families
-listed in SUPPORTED_HEADS below). Decode = single-token Q per request
+TileLang HD256 paged decode path used by Qwen3.5 full-attention layers
+(the families listed in SUPPORTED_HEADS below). Decode = single-token Q per request
 (qo_len == 1), so the kernel reads paged K/V, runs one row of Q against
 the full kv_total_len for that request, and writes one output row.
 
@@ -19,9 +18,10 @@ template (decode shape):
   * No causal mask within Q. With qlen == 1, the single Q row legally
     attends to every KV position in `[0, kv_total_len_for_request_i)`,
     so we keep only the `col < kv_total_len` bounds clause.
-  * `BLOCK_M = 1` (one Q row per tile).
-  * `BLOCK_N = 64` (= 4 × PAGE_SIZE, same as HD128 prefill — decode
-    tiles are KV-bound, not Q-bound).
+  * `BLOCK_M = 64`. Only row 0 is real; rows 1..63 are masked out. This
+    mirrors the prefill layout that TileLang 0.1.9 can lower reliably.
+  * `BLOCK_N = 16` (= PAGE_SIZE) so BLOCK_M=64 remains under the L4
+    dynamic shared-memory cap.
   * Grid is `(1, num_q_heads, batch_size)` — drop the
     `T.ceildiv(max_qlen, BLOCK_M)` outer extent since there is no
     varlen Q.
@@ -43,8 +43,8 @@ Tile / pipeline tunables (mirrors the HD128 prefill choices and the
 upstream `tile-ai/tilelang/examples/flash_attention/example_gqa_decode*`
 pattern):
 
-  BLOCK_M = 1
-  BLOCK_N = 64        (= PAGE_SIZE * 4)
+  BLOCK_M = 64
+  BLOCK_N = 16        (= PAGE_SIZE)
   NUM_STAGES = 2
   NUM_THREADS = 128   (4 warps)
 
@@ -52,18 +52,17 @@ Shared-memory budget (static; TileLang's launcher will lift
 `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` to whatever total
 the host source records):
 
-  Q tile : BLOCK_M * HEAD_DIM * 2 B   = 1  * 256 * 2 =     512 B
-  K tile : BLOCK_N * HEAD_DIM * 2 B   = 64 * 256 * 2 =  32_768 B
-  V tile : BLOCK_N * HEAD_DIM * 2 B   = 64 * 256 * 2 =  32_768 B
-  Sum (single-buffered)                              =  66_048 B (~64 KB)
+  Q tile : BLOCK_M * HEAD_DIM * 2 B   = 64 * 256 * 2 =  32_768 B
+  K tile : BLOCK_N * HEAD_DIM * 2 B   = 16 * 256 * 2 =   8_192 B
+  V tile : BLOCK_N * HEAD_DIM * 2 B   = 16 * 256 * 2 =   8_192 B
+  Sum (single-buffered)                              =  49_152 B (~48 KB)
   K/V are reused inside the `T.Pipelined(..., num_stages=2)` loop, so
-  TileLang will double-buffer them. With BLOCK_N=32 + NUM_STAGES=2:
-    Q(512) + 2 * (32 * 256 * 2 + 32 * 256 * 2) = 65_536 + 512 ≈ 64.5 KB.
+  TileLang will double-buffer them:
+    Q(32 KB) + 2 * (K 8 KB + V 8 KB) = 64 KB.
   Fits both H100 (228 KB after lift) AND L4 / sm_89 (99 KB cap), so the
   cubin runs on the same hardware as the HD256 prefill twin (T2). The
-  earlier BLOCK_N=64 spec hit 128 KB and would not load on L4 — codex
-  review on commit 02d0333 caught this; align with the prefill HD256
-  pattern instead of specializing by SM.
+  earlier BLOCK_N=64 spec hit 128 KB and would not load on L4; keep one
+  page per KV tile instead of specializing by SM.
 """
 
 import math
@@ -73,11 +72,10 @@ import tilelang.language as T
 
 HEAD_DIM = 256
 PAGE_SIZE = 16
-BLOCK_M = 1
-# Mirrors batch_prefill_paged_hd256.py: halve BLOCK_N vs HD128 to keep
-# total dynamic shared memory ≤ 64 KB so the cubin loads on sm_89 / L4
-# (per-block cap ~99 KB) as well as H100 (cap ~228 KB).
-BLOCK_N = 32
+BLOCK_M = 64
+# Decode keeps the prefill-compatible BLOCK_M=64 fragment layout, then lowers
+# BLOCK_N to one page so dynamic shared memory remains L4-safe.
+BLOCK_N = 16
 NUM_STAGES = 2
 NUM_THREADS = 128
 
@@ -156,9 +154,16 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             T.fill(m_i, -T.infinity(accum_dtype))
             T.fill(l_i, 0)
 
-            # Load the single Q row for (request bz, head by) into q_tile[0, :].
+            # Load the single real Q row for (request bz, head by) into
+            # q_tile[0, :]. Rows 1..63 are padding to satisfy TileLang's
+            # tensor-core M-divisibility constraint; they are masked out below
+            # and never written to Output.
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
-                q_tile[i, d] = Q[bz + i, by * HEAD_DIM + d]
+                q_tile[i, d] = T.if_then_else(
+                    i == 0,
+                    Q[bz, by * HEAD_DIM + d],
+                    T.cast(0, dtype),
+                )
 
             for kn in T.Pipelined(T.ceildiv(kv_total_len, BLOCK_N), num_stages=NUM_STAGES):
                 col0 = kn * BLOCK_N
@@ -190,7 +195,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 # [0, kv_total_len). Keep only the bounds clause.
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     col = col0 + j
-                    in_bounds = col < kv_total_len
+                    in_bounds = (i == 0) and (col < kv_total_len)
                     scores[i, j] = T.if_then_else(
                         in_bounds,
                         scores[i, j] * sm_scale,
@@ -201,15 +206,19 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 m_new = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 p = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
                 T.copy(m_i, m_prev)
-                T.reduce_max(scores, m_new, dim=1, clear=False)
+                T.reduce_max(scores, m_new, dim=1, clear=True)
                 for i in T.Parallel(BLOCK_M):
                     m_new[i] = T.max(m_prev[i], m_new[i])
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
-                    p[i, j] = T.exp2((scores[i, j] - m_new[i]) * log2e)
+                    col = col0 + j
+                    p[i, j] = T.if_then_else(
+                        (i == 0) and (col < kv_total_len),
+                        T.exp2((scores[i, j] - m_new[i]) * log2e),
+                        T.cast(0, accum_dtype),
+                    )
                 # Hoist the per-row alpha into its own fragment then drive
-                # the acc_o rescale as a 2D T.Parallel — same pattern as
-                # the HD128 prefill kernel, required by TileLang 0.1.9's
-                # LayoutInferencer.
+                # the acc_o rescale as a 2D T.Parallel — same layout pattern
+                # as the HD256 prefill kernel.
                 scale_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 for i in T.Parallel(BLOCK_M):
                     scale_i[i] = T.exp2((m_prev[i] - m_new[i]) * log2e)
@@ -222,18 +231,19 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
                 # Narrow the f32 softmax output to bf16 to match v_tile
-                # before the P @ V matmul (FlashAttention-2 pattern).
-                # TileLang 0.1.9's gemm asserts A.dtype == B.dtype.
+                # before the P @ V matmul. TileLang 0.1.9's gemm asserts
+                # A.dtype == B.dtype.
                 p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
                 T.copy(p, p_bf16)
                 T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
-            # Single output row per (request, head). bz indexes the
-            # request directly.
+            # Single output row per (request, head). bz indexes the request
+            # directly; padded rows are intentionally dropped.
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
-                Output[bz + i, by * HEAD_DIM + d] = T.cast(
-                    acc_o[i, d] / l_i[i], dtype
-                )
+                if i == 0:
+                    Output[bz, by * HEAD_DIM + d] = T.cast(
+                        acc_o[i, d] / l_i[i], dtype
+                    )
 
     # Pin the kernel name so the generated symbol matches what the AOT
     # build.rs / FFI side will look up: batch_decode_paged_hd256_q{Q}_kv{K}_run.

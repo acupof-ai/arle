@@ -240,7 +240,7 @@ __global__ void turboquant_fast_dequantize_kernel(
 }
 
 // ============================================================================
-// Kernel: Fast Dequant Pool → Working Buffer (in-place NHD for FlashInfer)
+// Kernel: Fast Dequant Pool -> Working Buffer (in-place NHD for TileLang)
 // ============================================================================
 __global__ void turboquant_fast_dequantize_inplace_kernel(
     const uint8_t* __restrict__ pool_data,

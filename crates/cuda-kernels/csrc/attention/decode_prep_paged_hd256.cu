@@ -1,4 +1,4 @@
-// Batched decode prep for FlashInfer paged attention — HD256 variant (Qwen3.5).
+// Batched decode prep for TileLang paged attention - HD256 variant (Qwen3.5).
 //
 // Differences from decode_prep_paged.cu (HD128):
 //   1. HEAD_DIM = 256 (256 threads per block)
@@ -164,7 +164,7 @@ __global__ void decode_prep_paged_hd256_kernel(
 }
 
 // Gate kernel: apply sigmoid gate from q_full to attention output.
-// After FlashInfer attention writes to attn_out, this kernel reads the gate
+// After TileLang attention writes to attn_out, this kernel reads the gate
 // portion of q_full and multiplies: attn_out[i] *= sigmoid(gate[i])
 __global__ void attention_gate_paged_hd256_kernel(
     const __nv_bfloat16* __restrict__ q_full_batch,  // [B, num_q_heads * HD256 * 2]

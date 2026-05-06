@@ -1,4 +1,4 @@
-// Copy KV cache from contiguous layout to FlashInfer paged layout.
+// Copy KV cache from contiguous layout to TileLang paged layout.
 //
 // Contiguous layout: [num_kv_heads, max_seq_len, head_dim] (per layer)
 //   offset = kv_head * max_seq_len * head_dim + pos * head_dim + dim

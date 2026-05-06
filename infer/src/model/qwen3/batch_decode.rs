@@ -1,9 +1,9 @@
 //! Batched decode: process multiple requests' decode tokens in one forward pass.
 //!
 //! Uses GEMM (matrix multiply) for all linear projections (QKV, O, MLP),
-//! batching B requests together. Attention uses FlashInfer with a shared
+//! batching B requests together. Attention uses TileLang with a shared
 //! paged KV cache: QK-norm + RoPE + paged KV write are done in a prep kernel,
-//! then FlashInfer's batch decode handles attention in a single launch.
+//! then TileLang batch decode handles attention in a single launch.
 
 use anyhow::Result;
 use cudarc::driver::safe::CudaGraph;
@@ -18,26 +18,20 @@ use crate::model::kv_cache::KVFormat;
 use crate::model::{MixedBatchRequest, ModelForward};
 use crate::ops;
 use cuda_kernels::ffi;
-use cuda_kernels::flashinfer::{DecodeMetaUpdate, FlashInferWorkspace};
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
 use cuda_kernels::prelude::{
-    DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
+    DeviceContext, DeviceVec, HiddenStates, PagedKVPool, TileLangDecodeMetadata,
 };
+use cuda_kernels::tilelang::{DecodeMetaUpdate, TileLangWorkspace};
 
 const BF16_BYTES: usize = 2;
 
-/// Mixed-batch FlashInfer float workspace.
+/// Mixed-batch TileLang workspace budget.
 ///
-/// Packed mixed batches can have thousands of QO rows. FlashInfer's
-/// internal `batch_prefill_tmp_v` allocation grows with
-/// `max_total_tokens × num_kv_heads × head_dim`; on Qwen3-4B at
-/// max_total_tokens≈4112 and num_kv_heads=8, head_dim=128 it needs
-/// ~270 MiB, so the 256 MiB DEFAULT_FLOAT_WORKSPACE_BYTES tier is too
-/// tight even for HD128. Stay on the 640 MiB tier for all head_dims —
-/// the activation-side wins from removing vocab_size and the
-/// prefill_activation chunk-size fix already free more than this 384 MiB.
-const MIXED_FLOAT_WORKSPACE_BYTES: usize = FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES;
+/// TileLang attention is planless in Rust now, so this stays zero-sized while
+/// preserving the older call shape.
+const MIXED_FLOAT_WORKSPACE_BYTES: usize = TileLangWorkspace::HD256_FLOAT_WORKSPACE_BYTES;
 
 fn bf16_matrix_bytes(rows: usize, cols: usize) -> usize {
     rows.saturating_mul(cols).saturating_mul(BF16_BYTES)
@@ -82,8 +76,8 @@ pub struct BatchDecodeBuffers {
     /// Reusable host-side scratch vector to avoid per-step heap allocation.
     token_ids_scratch: Vec<i32>,
 
-    /// FlashInfer paged attention metadata (positions, indptr, indices, workspace).
-    pub(crate) metadata: FlashInferDecodeMetadata,
+    /// TileLang paged attention metadata (positions, indptr, indices).
+    pub(crate) metadata: TileLangDecodeMetadata,
     /// Packed page-aware metadata for quantized decode kernels:
     /// `[page_indptr..., last_page_len...]`.
     quantized_kv_meta: CudaSlice<i32>,
@@ -133,7 +127,7 @@ pub(crate) struct MixedBatchBuffers {
     logits: HiddenStates,
     token_ids_gpu: CudaSlice<i32>,
     quantized: Option<QuantizedMixedBatchBuffers>,
-    metadata: FlashInferDecodeMetadata,
+    metadata: TileLangDecodeMetadata,
     max_tokens: usize,
     max_logit_rows: usize,
     max_total_pages: usize,
@@ -219,7 +213,7 @@ impl MixedBatchBuffers {
                     )
                 })
                 .transpose()?,
-            metadata: FlashInferDecodeMetadata::new_with_float_workspace_bytes(
+            metadata: TileLangDecodeMetadata::new_with_float_workspace_bytes(
                 ctx,
                 max_tokens,
                 max_total_pages,
@@ -278,7 +272,7 @@ impl BatchDecodeBuffers {
             .saturating_add(bytes_for::<f32>(max_batch_size)) // logprobs_gpu
             .saturating_add(bytes_for::<i32>(max_batch_size)) // token_ids_gpu
             .saturating_add(bytes_for::<i32>(2 * max_batch_size + 1)) // quantized_kv_meta
-            .saturating_add(FlashInferDecodeMetadata::device_bytes(
+            .saturating_add(TileLangDecodeMetadata::device_bytes(
                 max_batch_size,
                 max_total_pages,
                 num_qheads,
@@ -318,7 +312,7 @@ impl BatchDecodeBuffers {
             // one final-token row per prefill), not every prefill token.
             .saturating_add(bf16_matrix_bytes(vocab_size, max_logit_rows))
             .saturating_add(bytes_for::<i32>(max_total_tokens))
-            .saturating_add(FlashInferDecodeMetadata::device_bytes_with_float_workspace(
+            .saturating_add(TileLangDecodeMetadata::device_bytes_with_float_workspace(
                 max_total_tokens,
                 max_total_pages,
                 num_qheads,
@@ -383,7 +377,7 @@ impl BatchDecodeBuffers {
 
             token_ids_scratch: Vec::with_capacity(max_batch_size),
 
-            metadata: FlashInferDecodeMetadata::new(
+            metadata: TileLangDecodeMetadata::new(
                 ctx,
                 max_batch_size,
                 max_total_pages,
@@ -568,22 +562,6 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         head_dim: usize,
         kv_format: crate::model::kv_cache::KVFormat,
     ) -> Result<()> {
-        // Only BF16 uses FlashInfer plan. FP8/INT8 use our fused-dequant kernel
-        // which doesn't need FlashInfer's work estimation.
-        // Under `tilelang-attn`, the TC decode path is aliased onto the
-        // TileLang prefill HD128 cubins, which are plan-less — skip the plan.
-        #[cfg(not(feature = "tilelang-attn"))]
-        if kv_format == KVFormat::BF16 {
-            self.metadata.tc_plan(
-                ctx,
-                batch_size,
-                num_q_heads,
-                num_kv_heads,
-                page_size,
-                head_dim,
-            )?;
-        }
-        #[cfg(feature = "tilelang-attn")]
         let _ = (
             ctx,
             batch_size,
@@ -802,17 +780,6 @@ impl Qwen3Model {
                 .memcpy_htod(&quantized.token_rows_host, &mut quantized.token_rows_gpu)
                 .map_err(|e| anyhow::anyhow!("H2D mixed quantized token rows: {e}"))?;
         }
-        // TileLang TC decode alias is plan-less; skip FlashInfer planning.
-        #[cfg(not(feature = "tilelang-attn"))]
-        mixed.metadata.tc_plan(
-            &self.ctx,
-            b + prefill_count,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
-            paged_kv_pool.page_size,
-            self.config.head_dim,
-        )?;
-
         ops::embedding_batch(
             &self.ctx,
             &self.embed_tokens,
@@ -1045,7 +1012,7 @@ impl Qwen3Model {
                             .max()
                             .unwrap_or(0);
                         let total_pages = mixed.metadata.indptr_h.last().copied().unwrap_or(0);
-                        ops::flashinfer_tc_run_layer(
+                        ops::tilelang_tc_run_layer(
                             &self.ctx,
                             &mixed.q_batch,
                             &mixed.metadata.qo_indptr,
@@ -1055,8 +1022,8 @@ impl Qwen3Model {
                             &mixed.metadata.kv_indices,
                             &mixed.metadata.kv_last_page_len,
                             &mut mixed.attn_output,
-                            &mut mixed.metadata.flashinfer_ws,
-                            &ops::FlashInferHeadConfig {
+                            &mut mixed.metadata.tilelang_ws,
+                            &ops::TileLangHeadConfig {
                                 num_qo_heads: num_heads,
                                 num_kv_heads,
                                 page_size,
@@ -1279,7 +1246,7 @@ impl Qwen3Model {
 
     /// `tokens[b]` is the next token for request `b`, whose state is
     /// `states[slot_indices[b]]`. All linear projections are batched via GEMM;
-    /// attention uses FlashInfer with a shared paged KV cache.
+    /// attention uses TileLang with a shared paged KV cache.
     pub fn decode_batch(
         &self,
         tokens: &[u32],
@@ -1646,7 +1613,7 @@ impl Qwen3Model {
                         .max()
                         .unwrap_or(0);
                     let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
-                    ops::flashinfer_tc_run_layer(
+                    ops::tilelang_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,
                         &bufs.metadata.qo_indptr,
@@ -1656,8 +1623,8 @@ impl Qwen3Model {
                         &bufs.metadata.kv_indices,
                         &bufs.metadata.kv_last_page_len,
                         &mut bufs.attn_output,
-                        &mut bufs.metadata.flashinfer_ws,
-                        &ops::FlashInferHeadConfig {
+                        &mut bufs.metadata.tilelang_ws,
+                        &ops::TileLangHeadConfig {
                             num_qo_heads: num_heads,
                             num_kv_heads,
                             page_size,
@@ -1905,7 +1872,7 @@ impl Qwen3Model {
         //
         // FP8/INT8: quantize new token from bf16 working → pool, then attention
         //   reads directly from quantized pool (zero full-dequant).
-        // BF16: FlashInfer reads bf16 pool directly (decode_prep already wrote there).
+        // BF16: TileLang reads bf16 pool directly (decode_prep already wrote there).
         {
             let batch_size = bufs.q_batch.seq_len;
             let stream = &self.ctx.stream;
@@ -2050,7 +2017,7 @@ impl Qwen3Model {
                         .max()
                         .unwrap_or(0);
                     let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
-                    ops::flashinfer_tc_run_layer(
+                    ops::tilelang_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,
                         &bufs.metadata.qo_indptr,
@@ -2060,8 +2027,8 @@ impl Qwen3Model {
                         &bufs.metadata.kv_indices,
                         &bufs.metadata.kv_last_page_len,
                         &mut bufs.attn_output,
-                        &mut bufs.metadata.flashinfer_ws,
-                        &ops::FlashInferHeadConfig {
+                        &mut bufs.metadata.tilelang_ws,
+                        &ops::TileLangHeadConfig {
                             num_qo_heads: num_heads,
                             num_kv_heads,
                             page_size,

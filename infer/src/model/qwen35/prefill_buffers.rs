@@ -7,7 +7,6 @@ use half::bf16;
 use super::config::Config35;
 use crate::model::cuda_graph::CudaGraphState;
 use crate::ops::PagedPrefillSequence;
-use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Scratch buffers for a single Qwen3.5 linear-attention chunk-wise GDR prefill call.
@@ -441,12 +440,6 @@ pub(super) struct PagedPrefillBuffers35 {
     pub gdr_batch_seq_lens: Vec<usize>,
     pub gdr_launch: PackedGdrLaunch35,
     pub metadata: PagedPrefillMetadata35,
-    // Allocated under both cfg arms — TileLang is plan-less but the buffers
-    // struct stays uniform across builds while FlashInfer remains the default
-    // path (Tranche 2: "不着急删除"). Re-evaluate when the H100 sweep retires
-    // FlashInfer HD256 prefill.
-    #[cfg_attr(feature = "tilelang-attn", allow(dead_code))]
-    pub plan: BatchPrefillPagedPlan,
     pub graph_state: CudaGraphState,
 }
 
@@ -499,11 +492,6 @@ impl PagedPrefillBuffers35 {
             gdr_batch_seq_lens: Vec::new(),
             gdr_launch: PackedGdrLaunch35::new(0),
             metadata: PagedPrefillMetadata35::new(ctx, seq_len, num_pages)?,
-            plan: BatchPrefillPagedPlan::new_hd256(
-                ctx,
-                seq_len.max(4096),
-                config.num_attention_heads,
-            )?,
             graph_state: CudaGraphState::new(),
         })
     }

@@ -11,8 +11,8 @@ use super::common::{
     zero_f32_slice,
 };
 
-pub(crate) fn bench_triton_ops(c: &mut Criterion) {
-    let mut group = c.benchmark_group("ops_triton");
+pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ops_cuda");
     configure_group(&mut group);
 
     group.throughput(Throughput::Elements((VECTOR_DIM * BATCH_SEQ_LEN) as u64));

@@ -274,7 +274,7 @@ impl ModelForward for Qwen3Model {
         let prefill_activation = prefill_activation_dims
             .saturating_mul(prefill_budget_tokens)
             .saturating_mul(2);
-        let prefill_plan = cuda_kernels::flashinfer::FlashInferWorkspace::default_device_bytes(
+        let prefill_plan = cuda_kernels::tilelang::TileLangWorkspace::default_device_bytes(
             prefill_budget_tokens.max(4096),
             num_heads,
         );
@@ -631,11 +631,11 @@ impl ModelForward for Qwen3Model {
         if tokens.is_empty() {
             return Ok(());
         }
-        // Always use the FlashInfer paged path when the pool is active, even for
-        // batch_size=1. Routing B=1 through the contiguous/Triton decode path
+        // Always use the TileLang paged path when the pool is active, even for
+        // batch_size=1. Routing B=1 through the contiguous decode path
         // causes greedy output divergence: (1) K/V is written only to the
         // contiguous cache, not the pool, so later batches read stale pool data;
-        // (2) Triton and FlashInfer attention produce numerically different bf16
+        // (2) contiguous and paged attention produce numerically different bf16
         // results, making greedy (argmax) output depend on batch composition.
         match paged_kv_pool {
             Some(pool) if pool.is_active() => {

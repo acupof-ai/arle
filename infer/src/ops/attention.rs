@@ -1,26 +1,16 @@
-//! Attention ops: prefill (FlashInfer) and decode (Triton AOT / custom CUDA).
+//! Attention ops: TileLang paged prefill/decode plus custom CUDA prep/quantized decode.
 //!
 //! Three paged decode attention paths (selected by KV pool format):
-//!   - **BF16**: FlashInfer native `BatchDecodeWithPagedKVCacheRun`
+//!   - **BF16**: TileLang AOT paged attention
 //!   - **INT8**: Custom split-KV kernel with fused INT8 dequant (`decode_attention_int8`)
 //!   - **FP8**: Custom split-KV kernel with FP8→FP32 cast (`decode_attention_fp8`)
-//!
-//! Prefill uses FlashInfer batch-forward with layout dispatch by default:
-//!   - HD128: `flashinfer_batch_forward_with_layout` (Qwen3)
-//!   - HD256: `flashinfer_batch_forward_hd256` (Qwen3.5 full-attention layers)
-//!   - `tilelang-attn` swaps Qwen3 paged-prefill HD128 run dispatch to TileLang.
-//!
-//! Single-token decode uses Triton AOT kernel: fused QK-norm + RoPE + split-KV
-//! attention + online softmax + merge in one kernel launch.
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use cuda_kernels::ffi;
-#[cfg(not(feature = "tilelang-attn"))]
-use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
-use cuda_kernels::flashinfer::FlashInferWorkspace;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
+use cuda_kernels::tilelang::TileLangWorkspace;
 
 // ============================================================================
 // Parameter structs — group related config/weight params for high-arity ops.
@@ -42,9 +32,8 @@ pub(crate) struct HeadConfig {
     pub head_dim: usize,
 }
 
-/// FlashInfer paged-decode head configuration (HD128, HD256, tensor-core prefill).
-/// Groups the 4-tuple shared by every `flashinfer_*_run_layer` wrapper.
-pub struct FlashInferHeadConfig {
+/// TileLang paged-decode head configuration (HD128, HD256, tensor-core prefill).
+pub struct TileLangHeadConfig {
     pub num_qo_heads: usize,
     pub num_kv_heads: usize,
     pub page_size: usize,
@@ -61,14 +50,72 @@ pub(crate) struct PagedKVMeta<'a> {
     pub page_size: usize,
 }
 
-/// Batched prefill attention with FlashAttention-2.
+#[allow(clippy::too_many_arguments)]
+fn nonpaged_prefill_attention_into(
+    ctx: &DeviceContext,
+    q_batch: &HiddenStates,
+    k_cache: &DeviceVec,
+    v_cache: &DeviceVec,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+) -> Result<()> {
+    let seq_len = q_batch.seq_len;
+    let q_dim = num_q_heads * head_dim;
+    ensure!(num_kv_heads > 0, "num_kv_heads must be > 0");
+    ensure!(
+        head_dim == 128 || head_dim == 256,
+        "non-paged prefill supports head_dim 128 or 256, got {head_dim}"
+    );
+    ensure!(
+        q_batch.hidden_dim == q_dim,
+        "q hidden_dim mismatch: got {}, expected {q_dim}",
+        q_batch.hidden_dim
+    );
+    ensure!(
+        output.hidden_dim == q_dim && output.seq_len == seq_len,
+        "output shape mismatch for non-paged prefill"
+    );
+    let max_seq_len = k_cache.len / (num_kv_heads * head_dim);
+    let kv_len = start_pos + seq_len;
+    ensure!(
+        kv_len <= max_seq_len,
+        "non-paged prefill kv_len {kv_len} exceeds max_seq_len {max_seq_len}"
+    );
+
+    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
+    let (kc_ptr, _gkc) = k_cache.data.device_ptr(&ctx.stream);
+    let (vc_ptr, _gvc) = v_cache.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    unsafe {
+        ffi::nonpaged_prefill_attention_cuda(
+            q_ptr as *const ffi::Half,
+            kc_ptr as *const ffi::Half,
+            vc_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            seq_len as i32,
+            kv_len as i32,
+            max_seq_len as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
+}
+
+/// Legacy non-paged HD128 prefill entrypoint.
 ///
-/// Pipeline:
-///   1. QK norm + RoPE (CUDA kernel, in-place on q_batch/k_batch)
-///   2. KV cache write (CUDA kernel)
-///   3. FlashAttention-2 (Triton kernel — fused QK + causal softmax + V)
-///
-/// No O(n²) scratch buffers needed — FlashAttention uses online softmax.
+/// The serving path uses TileLang paged prefill. This native CUDA fallback keeps
+/// direct/no-pool model entrypoints working without external attention runtimes.
 pub(crate) fn prefill_attention_batch(
     ctx: &DeviceContext,
     q_batch: &mut HiddenStates,
@@ -86,10 +133,8 @@ pub(crate) fn prefill_attention_batch(
     let num_kv_heads = heads.num_kv_heads;
     let head_dim = heads.head_dim;
     let rms_eps = nrp.rms_eps;
-    assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
+    ensure!(num_kv_heads > 0, "num_kv_heads must be > 0");
 
-    // Derive max_seq_len from KV cache buffer size.
-    // Buffer layout: [num_kv_heads * max_seq_len * head_dim] u16 elements.
     let kv_elements = k_cache.len;
     let max_seq_len = kv_elements / (num_kv_heads * head_dim);
 
@@ -103,10 +148,8 @@ pub(crate) fn prefill_attention_batch(
         let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
         let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
         let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
-        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
 
         unsafe {
-            // Steps 1-2: QK norm + RoPE, KV cache write
             ffi::prefill_attention_prep_cuda(
                 q_ptr as *mut ffi::Half,
                 k_ptr as *mut ffi::Half,
@@ -127,40 +170,25 @@ pub(crate) fn prefill_attention_batch(
                 ctx.stream.cu_stream(),
             )
             .result()?;
-
-            // Step 3: FlashInfer single prefill — reads normed Q and KV cache
-            let kv_len = start_pos + seq_len;
-            let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-            let ret = ffi::flashinfer_single_prefill(
-                q_ptr as *mut ffi::Half,
-                kc_ptr as *mut ffi::Half,
-                vc_ptr as *mut ffi::Half,
-                o_ptr as *mut ffi::Half,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                seq_len as i32,
-                kv_len as i32,
-                max_seq_len as i32,
-                sm_scale,
-                std::ptr::null_mut(),
-                ctx.stream.cu_stream(),
-            );
-            if ret != 0 {
-                return Err(anyhow!(
-                    "flashinfer_single_prefill failed: CUDA error {}",
-                    ret
-                ));
-            }
         }
     }
 
-    Ok(())
+    nonpaged_prefill_attention_into(
+        ctx,
+        q_batch,
+        k_cache,
+        v_cache,
+        output,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        start_pos,
+    )
 }
 
-/// FlashAttention-2 prefill for HEAD_DIM=256 with precomputed Q and KV cache.
-/// Q / output layout: HiddenStates [q_dim, seq_len] in column-major token-major storage.
+/// Legacy non-paged HD256 prefill entrypoint.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn flash_attention_prefill_hd256_into(
+pub(crate) fn nonpaged_prefill_hd256_into(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
     k_cache: &DeviceVec,
@@ -170,51 +198,20 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     num_kv_heads: usize,
     start_pos: usize,
 ) -> Result<()> {
-    let seq_len = q_batch.seq_len;
-    let q_dim = q_batch.hidden_dim;
-    let head_dim = q_dim / num_q_heads;
-    assert_eq!(head_dim, 256, "HD256 kernel requires head_dim=256");
-    assert_eq!(q_dim, output.hidden_dim, "output hidden_dim mismatch");
-    assert_eq!(seq_len, output.seq_len, "output seq_len mismatch");
-    assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
-
-    // Derive max_seq_len from KV cache buffer size.
-    let max_seq_len = k_cache.len / (num_kv_heads * head_dim);
-
-    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
-    let (kc_ptr, _gkc) = k_cache.data.device_ptr(&ctx.stream);
-    let (vc_ptr, _gvc) = v_cache.data.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-    let kv_len = start_pos + seq_len;
-    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-    let ret = unsafe {
-        ffi::flashinfer_single_prefill_hd256(
-            q_ptr as *mut ffi::Half,
-            kc_ptr as *mut ffi::Half,
-            vc_ptr as *mut ffi::Half,
-            o_ptr as *mut ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            seq_len as i32,
-            kv_len as i32,
-            max_seq_len as i32,
-            sm_scale,
-            std::ptr::null_mut(),
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_single_prefill_hd256 failed: CUDA error {}",
-            ret
-        ));
-    }
-
-    Ok(())
+    nonpaged_prefill_attention_into(
+        ctx,
+        q_batch,
+        k_cache,
+        v_cache,
+        output,
+        num_q_heads,
+        num_kv_heads,
+        256,
+        start_pos,
+    )
 }
 
-/// Qwen3.5 full-attention prefill: prep Q/K/cache, run HD256 FlashAttention-2, then apply gate.
+/// Legacy Qwen3.5 full-attention prefill without a paged KV pool.
 pub(crate) fn prefill_attention_hd256_batch(
     ctx: &DeviceContext,
     q_full_batch: &HiddenStates,
@@ -327,7 +324,7 @@ pub(crate) fn prefill_attention_hd256_batch_with_scratch(
         .result()?;
     }
 
-    flash_attention_prefill_hd256_into(
+    nonpaged_prefill_hd256_into(
         ctx,
         q_prepped,
         k_cache,
@@ -370,7 +367,7 @@ pub(crate) fn prefill_attention_hd256_batch_with_scratch(
 /// `token_offset` and `page_table_offset` are offsets into the packed token and
 /// page-table buffers for this forward. Callers must pack both contiguously in
 /// request order — `PagedPrefillForward` validates that contract when it builds
-/// the FlashInfer indptr metadata.
+/// the TileLang indptr metadata.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PagedPrefillSequence {
     pub token_offset: usize,
@@ -401,20 +398,8 @@ fn paged_prefill_last_page_len(kv_len: usize, page_size: usize) -> i32 {
 /// buffers. Built once before the per-layer loop and passed by `&mut` to each
 /// layer's attention call.
 ///
-/// In FlashInfer builds, the caller also keeps one `BatchPrefillPagedPlan`
-/// planned once for the same metadata. In TileLang builds there is no
-/// FlashInfer plan object or workspace on this path.
-///
-/// This type exists to close an async-memcpy race: FlashInfer's `PrefillPlan`
-/// writes metadata into the plan's `page_locked_workspace` (host pinned) and
-/// enqueues a `cudaMemcpyAsync` into `int_workspace` on the compute stream.
-/// If the same plan object is re-planned before the stream consumes the
-/// previous copy, the source host buffer is overwritten and the enqueued
-/// copy reads the wrong data — poisoning the subsequent kernel's
-/// `int_workspace` offsets. Qwen3 calls prefill-paged 36× per forward (one
-/// per layer) and under bench stream backlog this race reliably corrupts
-/// the CUDA context. sglang avoids it by calling plan once per forward and
-/// we do the same now.
+/// TileLang consumes these device buffers directly and does not require a
+/// CPU-side attention plan.
 pub(crate) struct PagedPrefillForward {
     pub qo_indptr_dev: CudaSlice<i32>,
     pub kv_indptr_dev: CudaSlice<i32>,
@@ -425,21 +410,7 @@ pub(crate) struct PagedPrefillForward {
 }
 
 impl PagedPrefillForward {
-    /// Plan and upload indptrs ONCE for the whole forward. HD128 flavour.
-    #[cfg(not(feature = "tilelang-attn"))]
-    pub(crate) fn new_hd128(
-        ctx: &DeviceContext,
-        plan: &mut BatchPrefillPagedPlan,
-        sequences: &[PagedPrefillSequence],
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-    ) -> Result<Self> {
-        Self::new_inner(ctx, plan, sequences, num_q_heads, num_kv_heads, page_size)
-    }
-
     /// Upload indptrs ONCE for the whole TileLang forward. HD128 flavour.
-    #[cfg(feature = "tilelang-attn")]
     pub(crate) fn new_hd128(
         ctx: &DeviceContext,
         sequences: &[PagedPrefillSequence],
@@ -451,10 +422,7 @@ impl PagedPrefillForward {
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
         ctx: &DeviceContext,
-        #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
         sequences: &[PagedPrefillSequence],
-        #[cfg(not(feature = "tilelang-attn"))] num_q_heads: usize,
-        #[cfg(not(feature = "tilelang-attn"))] num_kv_heads: usize,
         page_size: usize,
     ) -> Result<Self> {
         ensure!(
@@ -501,20 +469,6 @@ impl PagedPrefillForward {
             kv_last_page_len.push(paged_prefill_last_page_len(kv_len, page_size));
         }
 
-        // Single FlashInfer plan call for the whole forward. All layers share
-        // the same (batch_size, qo_len, kv_len, page_size, num_heads) shape,
-        // so one plan covers them all.
-        #[cfg(not(feature = "tilelang-attn"))]
-        plan.plan_hd128(
-            ctx,
-            &qo_indptr,
-            &kv_indptr,
-            sequences.len(),
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-        )?;
-
         let qo_indptr_dev: CudaSlice<i32> = ctx
             .stream
             .clone_htod(&qo_indptr)
@@ -544,17 +498,10 @@ impl PagedPrefillForward {
 /// Structural contract: the caller MUST have built a `PagedPrefillForward`
 /// via `PagedPrefillForward::new_hd128` BEFORE the per-layer loop and
 /// passes it by `&mut` into each layer. That struct holds the pre-uploaded
-/// qo/kv indptrs. FlashInfer builds also pass a separately planned
-/// `BatchPrefillPagedPlan`. This function only runs:
+/// qo/kv indptrs. This function only runs:
 ///  1. QK norm + RoPE + paged K/V write (per-layer, touches per-layer K/V
 ///     pool pointers).
-///  2. FlashInfer or TileLang paged-prefill HD128 `_run`.
-///
-/// Do NOT call `plan.plan_hd128` here. Calling plan per layer overwrites
-/// the plan's `page_locked_workspace` while a prior layer's
-/// `cudaMemcpyAsync` is still stream-queued, which reads the wrong source
-/// at execution time and poisons `int_workspace` → OOB reads in the next
-/// kernel → CUDA context corruption. See `PagedPrefillForward` docs.
+///  2. TileLang paged-prefill HD128 `_run`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_attention_paged_batch(
     ctx: &DeviceContext,
@@ -563,7 +510,6 @@ pub(crate) fn prefill_attention_paged_batch(
     v_batch: &HiddenStates,
     nrp: &NormRopeParams,
     meta: &PagedPrefillMeta,
-    #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
     fwd: &mut PagedPrefillForward,
     output: &mut HiddenStates,
     heads: &HeadConfig,
@@ -583,11 +529,10 @@ pub(crate) fn prefill_attention_paged_batch(
     );
     let page_size = meta.page_size;
 
-    #[cfg(feature = "tilelang-attn")]
     let tilelang_kernel = {
         ensure!(
             page_size == 16,
-            "tilelang-attn: prefill HD128 kernel requires page_size=16, got {page_size}"
+            "TileLang prefill HD128 kernel requires page_size=16, got {page_size}"
         );
         match (num_q_heads, num_kv_heads) {
             (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
@@ -596,7 +541,7 @@ pub(crate) fn prefill_attention_paged_batch(
             (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
             other => {
                 return Err(anyhow!(
-                    "tilelang-attn: no specialized prefill HD128 kernel for \
+                    "TileLang: no specialized prefill HD128 kernel for \
                      (num_q_heads, num_kv_heads) = {other:?}; supported configs \
                      are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
                      in tools/tilelang/batch_prefill_paged_hd128.py, \
@@ -660,8 +605,7 @@ pub(crate) fn prefill_attention_paged_batch(
         }
     }
 
-    // Step 2: run FlashInfer paged prefill. Plan was done ONCE outside the
-    // layer loop; only run per layer.
+    // Step 2: run TileLang paged prefill.
     let (q_u64, _gq) = q_batch.data.device_ptr(&ctx.stream);
     let (o_u64, _go) = output.data.device_ptr_mut(&ctx.stream);
     let kp_u64 = meta.pool.k_ptr(meta.layer_idx, &ctx.stream);
@@ -671,27 +615,6 @@ pub(crate) fn prefill_attention_paged_batch(
     let (kvidx_u64, _gkvidx) = meta.page_indices.device_ptr(&ctx.stream);
     let (kvlpl_u64, _gkvlpl) = fwd.kv_last_page_len_dev.device_ptr(&ctx.stream);
 
-    #[cfg(not(feature = "tilelang-attn"))]
-    {
-        plan.run_hd128(
-            ctx,
-            q_u64,
-            qoi_u64,
-            kp_u64,
-            vp_u64,
-            kvi_u64,
-            kvidx_u64,
-            kvlpl_u64,
-            o_u64,
-            /* lse_ptr */ None,
-            fwd.batch_size,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-        )?;
-    }
-
-    #[cfg(feature = "tilelang-attn")]
     {
         let max_qlen = meta.sequences.iter().map(|s| s.seq_len).max().unwrap_or(0) as i32;
         let sm_scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -729,30 +652,23 @@ pub(crate) fn prefill_attention_paged_batch(
     Ok(())
 }
 
-/// HD256 paged-prefill run step — sibling of `BatchPrefillPagedPlan::run_hd256`
-/// that adds a `tilelang-attn` arm. The Qwen3.5 callers do their HD256 prep
+/// HD256 paged-prefill TileLang run step. The Qwen3.5 callers do their HD256 prep
 /// kernel inline (it's distinct from the HD128 prep contract used by
 /// `prefill_attention_paged_batch`), so this helper covers the run step
 /// only — qwen35/prefill.rs keeps prep + this run alongside each other.
 ///
-/// Default builds dispatch to FlashInfer's `flashinfer_batch_prefill_paged_hd256_run`.
-/// Under `--features tilelang-attn` the same call is routed to the
-/// AOT-specialized TileLang HD256 cubin family
+/// Dispatches to the AOT-specialized TileLang HD256 cubin family
 /// `tilelang_batch_prefill_paged_hd256_q{Q}_kv{KV}_run_cuda`. The kernel
 /// signature and varlen Q / paged-KV semantics are identical to the HD128
 /// twin — only the baked `head_dim` differs.
 ///
-/// `max_qlen` and `total_pages` are TileLang-only (TileLang 0.1.9
-/// auto-promotes `T.symbolic` shape vars into kernel arguments). FlashInfer
-/// ignores them and pulls the values from its plan_info.
+/// `max_qlen` and `total_pages` feed TileLang 0.1.9 symbolic shape arguments.
 ///
 /// Caller responsibility:
 ///   - Pre-prepped Q lives in `q_ptr` (HD256 RoPE/QK-norm/KV-write done).
 ///   - `qo_indptr_ptr` / `kv_indptr_ptr` / `kv_indices_ptr` / `kv_last_page_len_ptr`
 ///     are GPU-resident, indexable by `batch_size` requests.
 ///   - `k_pool_ptr` / `v_pool_ptr` are the per-layer paged-KV base pointers.
-///   - On FlashInfer builds the caller has already called `plan.plan_hd256(...)`
-///     for the same metadata.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_attention_paged_run_hd256(
     ctx: &DeviceContext,
@@ -764,42 +680,19 @@ pub(crate) fn prefill_attention_paged_run_hd256(
     kv_indices_ptr: u64,
     kv_last_page_len_ptr: u64,
     output_ptr: u64,
-    #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
-    #[cfg(feature = "tilelang-attn")] kv_pool: &cuda_kernels::TokenKVPool,
+    kv_pool: &cuda_kernels::TokenKVPool,
     batch_size: usize,
     total_q_tokens: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     page_size: usize,
-    #[cfg(feature = "tilelang-attn")] max_qlen: i32,
-    #[cfg(feature = "tilelang-attn")] total_pages: i32,
+    max_qlen: i32,
+    total_pages: i32,
 ) -> Result<()> {
-    #[cfg(not(feature = "tilelang-attn"))]
-    {
-        let _ = total_q_tokens;
-        plan.run_hd256(
-            ctx,
-            q_ptr,
-            qo_indptr_ptr,
-            k_pool_ptr,
-            v_pool_ptr,
-            kv_indptr_ptr,
-            kv_indices_ptr,
-            kv_last_page_len_ptr,
-            output_ptr,
-            /* lse_ptr */ None,
-            batch_size,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-        )
-    }
-
-    #[cfg(feature = "tilelang-attn")]
     {
         ensure!(
             page_size == 16,
-            "tilelang-attn: prefill HD256 kernel requires page_size=16, got {page_size}"
+            "TileLang prefill HD256 kernel requires page_size=16, got {page_size}"
         );
         let tilelang_kernel = match (num_q_heads, num_kv_heads) {
             (8, 2) => ffi::tilelang_batch_prefill_paged_hd256_q8_kv2_run_cuda,
@@ -807,7 +700,7 @@ pub(crate) fn prefill_attention_paged_run_hd256(
             (16, 4) => ffi::tilelang_batch_prefill_paged_hd256_q16_kv4_run_cuda,
             other => {
                 return Err(anyhow!(
-                    "tilelang-attn: no specialized prefill HD256 kernel for \
+                    "TileLang: no specialized prefill HD256 kernel for \
                      (num_q_heads, num_kv_heads) = {other:?}; supported configs \
                      are (8,2), (16,2), (16,4). Extend SUPPORTED_HEADS \
                      in tools/tilelang/batch_prefill_paged_hd256.py, \
@@ -954,7 +847,7 @@ pub fn fused_attention_decode_batched_into(
     Ok(())
 }
 
-/// Fused GQA Attention for decode (Triton AOT, split-KV, HEAD_DIM=128).
+/// Fused GQA Attention for legacy decode (custom CUDA split-KV, HEAD_DIM=128).
 /// Reads pos/seq_len from decode_meta — CUDA Graph safe.
 /// cos_cache_base/sin_cache_base: full RoPE buffers [max_seq_len * head_dim].
 /// decode_meta: [token_id, current_pos, seq_len] on GPU.
@@ -1109,83 +1002,15 @@ pub(crate) fn decode_prep_paged(
     Ok(())
 }
 
-/// FlashInfer run step only (GPU kernel). Call once per layer after a single plan call.
-pub fn flashinfer_run_layer(
-    ctx: &DeviceContext,
-    q_batch: &HiddenStates,
-    kv_pool: &PagedKVPool,
-    layer_idx: usize,
-    kv_indptr_gpu: &CudaSlice<i32>,
-    kv_indices_gpu: &CudaSlice<i32>,
-    kv_last_page_len_gpu: &CudaSlice<i32>,
-    output: &mut HiddenStates,
-    workspace: &mut FlashInferWorkspace,
-    heads: &FlashInferHeadConfig,
-) -> Result<()> {
-    let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
-
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
-    let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
-    let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
-    let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
-
-    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
-    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_batch_decode_run(
-            fw_ptr as *mut u8,
-            iw_ptr as *mut u8,
-            workspace.plan_info.cast_const(),
-            q_ptr as *const ffi::Half,
-            k_pool_ptr as *const ffi::Half,
-            v_pool_ptr as *const ffi::Half,
-            ind_ptr as *const i32,
-            idx_ptr as *const i32,
-            lp_ptr as *const i32,
-            o_ptr as *mut ffi::Half,
-            lse_ptr as *mut f32,
-            batch_size as i32,
-            heads.num_qo_heads as i32,
-            heads.num_kv_heads as i32,
-            heads.page_size as i32,
-            heads.head_dim as i32,
-            sm_scale,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_batch_decode_run failed with CUDA error {}",
-            ret
-        ));
-    }
-    Ok(())
-}
-
-/// FlashInfer tensor-core (TC) batched paged-attention run step.
-///
-/// Default builds dispatch to FlashInfer's `flashinfer_tc_decode_run` (which
-/// reuses the prefill kernel for decode-shaped inputs to get tensor-core
-/// utilization). Under `--features tilelang-attn` the same call is aliased
-/// onto the Phase 0 TileLang prefill HD128 cubin family — the kernel
-/// signatures and varlen Q / paged-KV semantics are identical, so no new
-/// kernel is needed.
+/// TileLang tensor-core-shaped batched paged-attention run step.
 ///
 /// `batch_size` is the number of requests (qo_indptr length minus 1), which
 /// in mixed decode+prefill batches differs from `q_batch.seq_len` (the total
 /// Q row count).
 ///
-/// `max_qlen` and `total_pages` are TileLang-only parameters (TileLang 0.1.9
-/// auto-promotes `T.symbolic` shape vars into kernel arguments). FlashInfer
-/// ignores them.
+/// `max_qlen` and `total_pages` feed TileLang 0.1.9 symbolic shape arguments.
 #[allow(clippy::too_many_arguments)]
-pub fn flashinfer_tc_run_layer(
+pub fn tilelang_tc_run_layer(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
     qo_indptr_gpu: &CudaSlice<i32>,
@@ -1195,24 +1020,23 @@ pub fn flashinfer_tc_run_layer(
     kv_indices_gpu: &CudaSlice<i32>,
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
-    workspace: &mut FlashInferWorkspace,
-    heads: &FlashInferHeadConfig,
+    workspace: &mut TileLangWorkspace,
+    heads: &TileLangHeadConfig,
     batch_size: i32,
     max_qlen: i32,
     total_pages: i32,
 ) -> Result<()> {
     let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
-    #[cfg(feature = "tilelang-attn")]
     let tilelang_kernel = {
         ensure!(
             heads.head_dim == 128,
-            "tilelang-attn: TC decode alias requires head_dim=128, got {}",
+            "TileLang TC decode alias requires head_dim=128, got {}",
             heads.head_dim
         );
         ensure!(
             heads.page_size == 16,
-            "tilelang-attn: TC decode alias requires page_size=16, got {}",
+            "TileLang TC decode alias requires page_size=16, got {}",
             heads.page_size
         );
         match (heads.num_qo_heads, heads.num_kv_heads) {
@@ -1222,7 +1046,7 @@ pub fn flashinfer_tc_run_layer(
             (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
             other => {
                 return Err(anyhow!(
-                    "tilelang-attn: no specialized TC-decode HD128 kernel for \
+                    "TileLang: no specialized TC-decode HD128 kernel for \
                      (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
                      are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
                      in tools/tilelang/batch_prefill_paged_hd128.py, \
@@ -1243,43 +1067,6 @@ pub fn flashinfer_tc_run_layer(
     let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
     let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
 
-    #[cfg(not(feature = "tilelang-attn"))]
-    {
-        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-        let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
-        let _ = (max_qlen, total_pages); // FlashInfer path does not consume these.
-        let ret = unsafe {
-            ffi::flashinfer_tc_decode_run(
-                fw_ptr as *mut u8,
-                iw_ptr as *mut u8,
-                workspace.plan_info.cast_const(),
-                q_ptr as *mut ffi::Half,
-                qoi_ptr as *mut i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                ind_ptr as *mut i32,
-                idx_ptr as *mut i32,
-                lp_ptr as *mut i32,
-                o_ptr as *mut ffi::Half,
-                lse_ptr as *mut f32,
-                batch_size,
-                heads.num_qo_heads as i32,
-                heads.num_kv_heads as i32,
-                heads.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-        };
-        if ret != 0 {
-            return Err(anyhow!(
-                "flashinfer_tc_decode_run failed with CUDA error {}",
-                ret
-            ));
-        }
-    }
-
-    #[cfg(feature = "tilelang-attn")]
     {
         let _ = workspace; // TileLang is plan-less; workspace is unused here.
         let num_pages = kv_pool.max_total_pages as i32;
@@ -1417,12 +1204,9 @@ pub(crate) fn attention_gate_paged_hd256(
     }
 }
 
-/// FlashInfer HD256 batched paged-decode run step.
+/// TileLang HD256 batched paged-decode run step for Qwen3.5 full-attention layers.
 ///
-/// Default builds dispatch to FlashInfer's `flashinfer_batch_decode_hd256_run`
-/// for the Qwen3.5 full-attention layers (head_dim=256). Under
-/// `--features tilelang-attn` the same call is routed to the
-/// AOT-specialized TileLang HD256 cubin family
+/// Dispatches to the AOT-specialized TileLang HD256 cubin family
 /// `tilelang_batch_decode_paged_hd256_q{Q}_kv{KV}_run_cuda`. The kernel
 /// signature matches the HD256 prefill twin — only the cubin internals
 /// differ (decode uses qlen=1 per request, no causal mask).
@@ -1430,11 +1214,9 @@ pub(crate) fn attention_gate_paged_hd256(
 /// `batch_size` is the number of requests (qo_indptr length minus 1).
 /// For decode, `total_q_tokens == batch_size` (one Q row per request).
 ///
-/// `max_qlen` and `total_pages` are TileLang-only parameters (TileLang 0.1.9
-/// auto-promotes `T.symbolic` shape vars into kernel arguments). FlashInfer
-/// ignores them and pulls the values from its plan_info.
+/// `max_qlen` and `total_pages` feed TileLang 0.1.9 symbolic shape arguments.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn flashinfer_run_layer_hd256(
+pub(crate) fn tilelang_run_layer_hd256(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
     kv_pool: &PagedKVPool,
@@ -1444,29 +1226,23 @@ pub(crate) fn flashinfer_run_layer_hd256(
     kv_indices_gpu: &CudaSlice<i32>,
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
-    workspace: &mut FlashInferWorkspace,
-    heads: &FlashInferHeadConfig,
+    workspace: &mut TileLangWorkspace,
+    heads: &TileLangHeadConfig,
     batch_size: i32,
     max_qlen: i32,
     total_pages: i32,
 ) -> Result<()> {
     let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
-    // HD256 decode TileLang dispatch is gated by `tilelang-decode-hd256`,
-    // not the broader `tilelang-attn` feature, because the AOT codegen for
-    // HD256 decode currently fails on TileLang 0.1.9. The HD128 prefill /
-    // TC-decode path under `tilelang-attn` is unaffected. See
-    // docs/experience/errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md.
-    #[cfg(feature = "tilelang-decode-hd256")]
     let tilelang_kernel = {
         ensure!(
             heads.head_dim == 256,
-            "tilelang-decode-hd256: decode HD256 kernel requires head_dim=256, got {}",
+            "TileLang decode HD256 kernel requires head_dim=256, got {}",
             heads.head_dim
         );
         ensure!(
             heads.page_size == 16,
-            "tilelang-decode-hd256: decode HD256 kernel requires page_size=16, got {}",
+            "TileLang decode HD256 kernel requires page_size=16, got {}",
             heads.page_size
         );
         match (heads.num_qo_heads, heads.num_kv_heads) {
@@ -1475,7 +1251,7 @@ pub(crate) fn flashinfer_run_layer_hd256(
             (16, 4) => ffi::tilelang_batch_decode_paged_hd256_q16_kv4_run_cuda,
             other => {
                 return Err(anyhow!(
-                    "tilelang-decode-hd256: no specialized decode HD256 kernel for \
+                    "TileLang: no specialized decode HD256 kernel for \
                      (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
                      are (8,2), (16,2), (16,4). Extend SUPPORTED_HEADS \
                      in tools/tilelang/batch_decode_paged_hd256.py, \
@@ -1496,45 +1272,6 @@ pub(crate) fn flashinfer_run_layer_hd256(
     let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
     let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
 
-    #[cfg(not(feature = "tilelang-decode-hd256"))]
-    {
-        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-        let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
-        // FlashInfer decode does not consume qo_indptr / max_qlen / total_pages —
-        // it pulls those values from plan_info instead.
-        let _ = (qoi_ptr, max_qlen, total_pages);
-        let ret = unsafe {
-            ffi::flashinfer_batch_decode_hd256_run(
-                fw_ptr as *mut u8,
-                iw_ptr as *mut u8,
-                workspace.plan_info.cast_const(),
-                q_ptr as *const ffi::Half,
-                k_pool_ptr as *const ffi::Half,
-                v_pool_ptr as *const ffi::Half,
-                ind_ptr as *const i32,
-                idx_ptr as *const i32,
-                lp_ptr as *const i32,
-                o_ptr as *mut ffi::Half,
-                lse_ptr as *mut f32,
-                batch_size,
-                heads.num_qo_heads as i32,
-                heads.num_kv_heads as i32,
-                heads.page_size as i32,
-                heads.head_dim as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-        };
-        if ret != 0 {
-            return Err(anyhow!(
-                "flashinfer_batch_decode_hd256_run failed with CUDA error {}",
-                ret
-            ));
-        }
-    }
-
-    #[cfg(feature = "tilelang-decode-hd256")]
     {
         let _ = workspace; // TileLang is plan-less; workspace is unused here.
         // Decode: qlen=1 per request, so total_q_tokens == batch_size.

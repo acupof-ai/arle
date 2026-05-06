@@ -1,9 +1,9 @@
-//! Paged KV cache pool — FlashInfer-compatible KV storage with runtime
+//! Paged KV cache pool — TileLang-compatible KV storage with runtime
 //! `page_size`.
 //!
 //! The pool keeps **token-level sequence accounting** (`seq_len(slot)` is always
 //! in logical tokens) while allocating and retaining storage in **physical
-//! pages**. This matches FlashInfer's HND paged layout:
+//! pages**. This matches TileLang's HND paged layout:
 //!   `[max_pages, num_kv_heads, page_size, head_dim]`.
 //!
 //! BF16 / INT8 / FP8 E4M3 now all use `page_size = 16`. TurboQuant remains
@@ -101,13 +101,13 @@ pub struct TokenKVPool {
     pub kv_dim: usize,
 }
 
-/// FlashInfer-compatible metadata for a batch of requests.
+/// TileLang-compatible metadata for a batch of requests.
 ///
 /// With `page_size = 16`:
 /// - `indptr[i+1] - indptr[i]` = number of pages for request `i`
 /// - `indices` = concatenated physical pool indices for all requests
 /// - `last_page_len` = tokens used in the final page for each request
-pub struct FlashInferMeta {
+pub struct PagedKVBatchMeta {
     /// Cumulative token counts: `[batch_size + 1]`
     pub indptr: Vec<i32>,
     /// Concatenated physical pool indices for the batch.
@@ -1197,11 +1197,11 @@ impl TokenKVPool {
     // ── Pointer accessors ──
     //
     // `k_ptr` / `v_ptr` = the "write target" for decode_prep_paged:
-    //   BF16 → per-layer data buffer (also read by FlashInfer)
+    //   BF16 -> per-layer data buffer (also read by TileLang)
     //   FP8/INT8 → shared bf16 working buffer (quantized to pool after write)
     //
     // `k_data_ptr` / `v_data_ptr` = the quantized data buffer (read by attention):
-    //   Used by FlashInfer FP8 and fused-dequant INT8 attention.
+    //   Used by fused-dequant INT8/FP8 attention.
 
     /// Write-target pointer for decode_prep_paged (bf16 for all formats).
     pub fn k_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
@@ -1293,8 +1293,8 @@ impl TokenKVPool {
         ptr
     }
 
-    /// Build FlashInfer-compatible metadata for a batch of slots.
-    pub fn build_flashinfer_metadata(&self, slots: &[usize]) -> FlashInferMeta {
+    /// Build TileLang-compatible metadata for a batch of slots.
+    pub fn build_paged_kv_metadata(&self, slots: &[usize]) -> PagedKVBatchMeta {
         let mut indptr = Vec::with_capacity(slots.len() + 1);
         let mut indices = Vec::new();
         let mut last_page_len = Vec::with_capacity(slots.len());
@@ -1312,7 +1312,7 @@ impl TokenKVPool {
             last_page_len.push(self.slot_last_page_len(slot) as i32);
         }
 
-        FlashInferMeta {
+        PagedKVBatchMeta {
             indptr,
             indices,
             last_page_len,
@@ -1322,7 +1322,7 @@ impl TokenKVPool {
     // ── Convenience accessors that mirror the old PagedKVPool API so callers ──
     // ── can transition incrementally.                                         ──
 
-    /// Build FlashInfer indptr array for a batch of slots.
+    /// Build TileLang paged-KV indptr array for a batch of slots.
     /// `indptr[i+1] - indptr[i]` = page count for request `i`.
     pub fn build_indptr(&self, slots: &[usize]) -> Vec<i32> {
         let mut indptr = Vec::with_capacity(slots.len() + 1);
@@ -1343,7 +1343,7 @@ impl TokenKVPool {
         scratch.as_slice()
     }
 
-    /// Build FlashInfer page-indices array (concatenated physical page ids).
+    /// Build TileLang page-indices array (concatenated physical page ids).
     pub fn build_indices(&self, slots: &[usize]) -> Vec<i32> {
         let mut indices = Vec::new();
         for &slot in slots {
@@ -1372,7 +1372,7 @@ impl TokenKVPool {
             .collect()
     }
 
-    /// Build FlashInfer last_page_len array.
+    /// Build TileLang last_page_len array.
     pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
         let mut last_page_lens = Vec::with_capacity(slots.len());
         self.fill_last_page_lens(slots, &mut last_page_lens);

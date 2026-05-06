@@ -19,13 +19,14 @@ agent/train/self-evolution workflows. The runtime remains primary:
 
 No PyTorch and no Python on the hot path. Two backends plug into one contract
 (`server_engine::InferenceEngine`): the CUDA continuous-batching scheduler
-(Linux/NVIDIA, `cudarc` + FlashInfer + Triton AOT) and the Metal scheduler
+(Linux/NVIDIA, `cudarc` + TileLang AOT + native CUDA C) and the Metal scheduler
 runtime (Apple Silicon, `crates/mlx-sys` C++ bridge — continuous batching with
 variable-length packed decode via mlx-lm `BatchKVCache` pattern: left-padding +
 additive mask + per-row RoPE offsets, see
 [`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7).
-Models: Qwen3 and Qwen3.5-family. FlashInfer drives CUDA prefill HD128 and
-batched decode HD128+HD256. Tests compare against JSON baselines in
+Models: Qwen3 and Qwen3.5-family. TileLang drives CUDA paged prefill/decode
+for BF16 attention; custom CUDA C handles quantized decode and supporting ops.
+Tests compare against JSON baselines in
 `infer/test_data/` — regenerate after any change affecting numerical output.
 
 **Workspace (current):**
@@ -37,7 +38,7 @@ ARLE/
 ├── crates/
 │   ├── agent/chat/cli/tools   ← runtime-facing control-plane crates
 │   ├── autograd/              ← from-scratch autograd + optimizer + lr-schedule + AdamW codec
-│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/, collective.rs (NCCL)
+│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/tilelang/, ffi/, collective.rs (NCCL)
 │   ├── deepseek-spec/         ← DeepSeek V4 readiness scaffold (DS0 config + tensor names + Shard)
 │   ├── kv-native-sys/         ← local persistence substrate for KV tier transports
 │   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc), Qwen3.5 step / MoE / DFlash draft / Metal capture hook
@@ -247,7 +248,7 @@ cargo test --release --no-default-features --features metal
 ```
 
 Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),
-`INFER_TRITON_PYTHON` (Triton AOT Python), `INFER_TEST_MODEL_PATH`
+`INFER_TILELANG_PYTHON` (TileLang AOT Python), `INFER_TEST_MODEL_PATH`
 (default `models/Qwen3-4B`). Full list: [`docs/environment.md`](docs/environment.md).
 SM tier policy: [`docs/plans/sm-coverage.md`](docs/plans/sm-coverage.md).
 
@@ -270,7 +271,7 @@ Load the relevant `AGENTS.md` **before** editing inside a module.
 | `infer/src/ops/` | [AGENTS.md](infer/src/ops/AGENTS.md) — visibility policy, `_into` variants, batched conventions |
 | `infer/src/kv_tier/` | [AGENTS.md](infer/src/kv_tier/AGENTS.md) — tier model, RadixCache invariant, MR stability |
 | `infer/src/http_server/` | [AGENTS.md](infer/src/http_server/AGENTS.md) — OpenAI v1 compat, `session_id`, streaming |
-| `crates/cuda-kernels/` | [AGENTS.md](crates/cuda-kernels/AGENTS.md) — prelude discipline, csrc layout, Triton AOT |
+| `crates/cuda-kernels/` | [AGENTS.md](crates/cuda-kernels/AGENTS.md) — prelude discipline, csrc layout, TileLang AOT |
 | `crates/mlx-sys/` | [AGENTS.md](crates/mlx-sys/AGENTS.md) — single Metal bridge, cmake+cc build, no repo `.metal` |
 
 ---

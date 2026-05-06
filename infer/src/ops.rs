@@ -23,8 +23,8 @@ mod tests;
 
 // pub re-exports
 pub use attention::{
-    FlashInferHeadConfig, flashinfer_run_layer, flashinfer_tc_run_layer,
-    fused_attention_decode_batched_into, fused_attention_decode_into,
+    TileLangHeadConfig, fused_attention_decode_batched_into, fused_attention_decode_into,
+    tilelang_tc_run_layer,
 };
 pub(crate) use attention::{
     decode_prep_paged, prefill_attention_batch, prefill_attention_hd256_batch,
@@ -49,11 +49,11 @@ pub use sampling::{
 
 // pub(crate) re-exports
 #[cfg(test)]
-pub(crate) use attention::flash_attention_prefill_hd256_into;
+pub(crate) use attention::nonpaged_prefill_hd256_into;
 pub(crate) use attention::{
     HeadConfig, NormRopeParams, PagedKVMeta, PagedPrefillForward, PagedPrefillMeta,
     PagedPrefillSequence, attention_gate_paged_hd256, decode_prep_paged_hd256,
-    flashinfer_run_layer_hd256,
+    tilelang_run_layer_hd256,
 };
 pub(crate) use elementwise::{add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into};
 pub(crate) use linear::{gemm_graphsafe_batched_into, gemm_into, linear};

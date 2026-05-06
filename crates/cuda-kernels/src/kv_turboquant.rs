@@ -98,7 +98,7 @@ pub fn turboquant_quantize_paged_single(
 ///
 /// For each pool index in `pool_indices`, reads packed data from `pool_data`,
 /// dequantizes, and writes bf16 to `work_bf16` at the **same** physical pool
-/// index position. This allows FlashInfer to read from the working buffer
+/// index position. This allows TileLang to read from the working buffer
 /// using its existing page table.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]

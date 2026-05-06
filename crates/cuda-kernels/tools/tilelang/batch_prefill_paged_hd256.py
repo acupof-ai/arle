@@ -8,9 +8,8 @@ Qwen3.5 size by extending the lockstep lists in this module,
 cuda-kernels/build.rs, cuda-kernels/src/ffi/attention.rs, and
 infer/src/ops/attention.rs.
 
-Replaces the FlashInfer `flashinfer_batch_prefill_paged_hd256_run` path
-when the workspace is built with `--features cuda,tilelang-attn`. Mirror
-twin of `batch_prefill_paged_hd128.py`; the deltas vs HD128 are:
+Runs under the canonical `--features cuda` TileLang path. Mirror twin of
+`batch_prefill_paged_hd128.py`; the deltas vs HD128 are:
 
   1. `HEAD_DIM = 256` (was 128).
   2. `SM_SCALE = 1.0 / sqrt(256)` (folded into the kernel via
@@ -189,7 +188,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 m_new = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 p = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
                 T.copy(m_i, m_prev)
-                T.reduce_max(scores, m_new, dim=1, clear=False)
+                T.reduce_max(scores, m_new, dim=1, clear=True)
                 for i in T.Parallel(BLOCK_M):
                     m_new[i] = T.max(m_prev[i], m_new[i])
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):

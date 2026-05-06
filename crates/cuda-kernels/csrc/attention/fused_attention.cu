@@ -337,8 +337,7 @@ __global__ void fused_gqa_attention_single_token_kernel(
 // Batched decode attention — split-KV variant
 //
 // Processes B requests in a single launch. Each request has its own KV cache
-// (accessed via pointer arrays). Uses the same split-KV + online softmax
-// approach as the Triton AOT decode kernel.
+// (accessed via pointer arrays). Uses split-KV + online softmax.
 //
 // Grid: (num_qheads, NUM_KV_SPLITS, batch_size)
 //   blockIdx.x = q_head_idx
@@ -626,12 +625,10 @@ __global__ void attention_decode_reduce_batched_kernel(
 // Specialization of `fused_gqa_attention_decode_batched_kernel` with the
 // batch dim dropped and `current_pos` read from the on-device `decode_meta`
 // buffer (`[token_id, current_pos, seq_len]`), matching the CUDA-Graph-safe
-// contract the original Triton AOT kernel exposed before
-// `chore(cuda): drop dead Triton kernels` removed it. Online-softmax
-// numerics and tile layout are copied verbatim from the batched kernel so
-// there is no numerical drift. HEAD_DIM / rms_eps / NUM_KV_SPLITS are
-// hardcoded to match the Rust FFI signature that does not plumb them
-// through.
+// contract used by CUDA Graph capture. Online-softmax numerics and tile layout
+// are copied verbatim from the batched kernel so there is no numerical drift.
+// HEAD_DIM / rms_eps / NUM_KV_SPLITS are hardcoded to match the Rust FFI
+// signature that does not plumb them through.
 //
 // Grid: (num_qheads, NUM_KV_SPLITS)
 //   blockIdx.x = q_head_idx
@@ -951,9 +948,8 @@ cudaError_t attention_decode_reduce_batched(
     return cudaGetLastError();
 }
 
-// Single-request (batch=1) decode attention — CUDA-Graph-safe because
-// `decode_meta` lives on device. Replaces the Triton AOT `fused_gqa_attention_decode`
-// wrapper that was dropped in the `chore(cuda): drop dead Triton kernels` sweep.
+// Single-request (batch=1) decode attention - CUDA-Graph-safe because
+// `decode_meta` lives on device.
 cudaError_t fused_gqa_attention_decode(
     const __nv_bfloat16* q_full,
     const __nv_bfloat16* k_full,

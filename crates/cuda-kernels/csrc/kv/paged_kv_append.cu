@@ -1,4 +1,4 @@
-// Append K/V tokens to a paged KV cache (FlashInfer HND layout).
+// Append K/V tokens to a paged KV cache (TileLang HND layout).
 //
 // For each request in a batch, writes one new token's K and V values
 // to the correct position in the paged cache.

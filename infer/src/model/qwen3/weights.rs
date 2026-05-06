@@ -310,8 +310,8 @@ impl Qwen3Model {
         };
 
         if model.enable_cuda_graph {
-            debug!("Preloading decode-path Triton kernels before CUDA Graph capture");
-            model.preload_decode_triton_kernels()?;
+            debug!("Preloading decode-path CUDA kernels before CUDA Graph capture");
+            model.preload_decode_cuda_kernels()?;
             debug!("Decode path CUDA Graph is enabled");
         } else {
             debug!("Decode path CUDA Graph is disabled");
@@ -320,7 +320,7 @@ impl Qwen3Model {
         Ok(model)
     }
 
-    fn preload_decode_triton_kernels(&self) -> Result<()> {
+    fn preload_decode_cuda_kernels(&self) -> Result<()> {
         let hidden_size = self.config.hidden_size;
         let q_dim = self.config.num_attention_heads * self.config.head_dim;
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
@@ -534,7 +534,7 @@ impl Qwen3Model {
         };
 
         if model.enable_cuda_graph {
-            model.preload_decode_triton_kernels()?;
+            model.preload_decode_cuda_kernels()?;
         }
         Ok(model)
     }

@@ -63,14 +63,14 @@ The `:latest` tag tracks `main`; tagged releases are published as
 `ghcr.io/cklxx/arle:X.Y.Z` (note: no `v` prefix — the docker metadata-action
 strips it). For the current release: `ghcr.io/cklxx/arle:0.1.5`.
 
-**From source** (any backend; needed for `cpu`, `tilelang-attn`, or local hacking):
+**From source** (any backend; needed for `cpu`, CUDA/TileLang, or local hacking):
 
 ```bash
 git clone https://github.com/cklxx/arle && cd arle
 # Apple Silicon:
 cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
 # Linux + NVIDIA:
-cargo build --release --features cli --bin arle
+cargo build --release --features cuda --bin arle
 ```
 
 ### 2. Serve a model
@@ -119,7 +119,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 
 | Backend | Platform | Status | Notes |
 |---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, FlashInfer, CUDA Graph decode, packed paged-prefill for Qwen3 / Qwen3.5. **L4 / Qwen3-4B BF16 + FP8 paged KV (auto): 197 tok/s @ c=16 / 4096-in, peak_active=16 saturated.** |
+| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, custom CUDA quantized decode, CUDA Graph decode, packed paged-prefill for Qwen3 / Qwen3.5. **L4 / Qwen3-4B BF16 + FP8 paged KV (auto): 197 tok/s @ c=16 / 4096-in, peak_active=16 saturated.** |
 | **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse. Qwen3.5-0.8B MLX 4bit single-request step-driver reaches 305.5 tok/s on M4 Pro 20c; GGUF Q4_K_M exact default is 202.1 tok/s direct, with an opt-in native-q4 Metal load path at 236.7 tok/s direct / 239.8 tok/s step-driver on the matched 1024/256 profile. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 achieves 5.9× decode speedup, Qwen3.5-4B-4bit maintains bit-identical parity, validated for c=1..8. |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a serving target. |

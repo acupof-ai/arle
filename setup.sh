@@ -165,21 +165,12 @@ do_check() {
         info "  python $(python --version 2>/dev/null | awk '{print $2}')"
     else errors=$((errors + 1)); fi
 
-    # Pinned packages — flashinfer + triton are CUDA-only and intentionally
-    # skipped on macOS (see do_deps).
+    # Pinned packages from requirements-build.txt.
     local pkg_errors=0
-    local skip_re=
-    if [ "$PLATFORM" = "macos" ]; then
-        skip_re='^(flashinfer|triton)'
-    fi
     while IFS= read -r line; do
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
         local pkg ver
         pkg="${line%%==*}"; ver="${line##*==}"
-        if [ -n "$skip_re" ] && [[ "$pkg" =~ $skip_re ]]; then
-            info "  $pkg (CUDA-only; skipped on macOS)"
-            continue
-        fi
         local actual
         actual=$(pip show "$pkg" 2>/dev/null | grep "^Version:" | awk '{print $2}')
         actual="${actual:-MISSING}"
@@ -335,28 +326,17 @@ do_deps() {
     fi
     python -m pip install --upgrade pip -q
 
-    # --- Pinned build deps ---
-    # `flashinfer-python` and `triton` are CUDA-only (nvcc-bound), so on macOS
-    # we install only the platform-neutral entries (currently just
-    # `huggingface_hub`, used by `do_model`). Linux installs the full set,
-    # with flashinfer pulled --no-deps because we only consume its headers.
+    # --- Build deps ---
+    # TileLang is the only Python AOT dependency for CUDA kernels; the rest is
+    # platform-neutral utility support.
     step "Python build dependencies (from requirements-build.txt)"
     if [ "$PLATFORM" = "linux" ]; then
-        info "FlashInfer is installed --no-deps (we only need C++ headers)"
-        local fi_line
-        fi_line=$(grep -E '^flashinfer' requirements-build.txt | head -1)
-        pip install "$fi_line" --no-deps -q
-        ok "$fi_line (headers only)"
-
-        grep -E '^[a-zA-Z]' requirements-build.txt | grep -v 'flashinfer' | \
-            pip install -r /dev/stdin -q
-        ok "Build deps installed"
+        grep -E '^[a-zA-Z]' requirements-build.txt | pip install -r /dev/stdin -q
+        ok "CUDA build deps installed"
     else
-        # macOS: install only entries unrelated to CUDA/Triton.
-        local cuda_only_re='^(flashinfer|triton)'
-        grep -E '^[a-zA-Z]' requirements-build.txt | grep -Ev "$cuda_only_re" | \
+        grep -E '^[a-zA-Z]' requirements-build.txt | grep -Ev '^tilelang($|[<=>])' | \
             pip install -r /dev/stdin -q
-        ok "Platform-neutral build deps installed (flashinfer/triton skipped)"
+        ok "Platform-neutral build deps installed (TileLang skipped)"
     fi
 
     # --- Bench/test deps ---
@@ -364,9 +344,9 @@ do_deps() {
     pip install -r requirements-bench.txt -q
     ok "Bench deps installed"
 
-    # --- TileLang (Linux/CUDA only — AOT codegen for tilelang-attn cubins) ---
+    # --- TileLang (Linux/CUDA only - AOT codegen for CUDA cubins) ---
     if [ "$PLATFORM" = "linux" ]; then
-        step "TileLang (AOT codegen for --features tilelang-attn)"
+        step "TileLang (AOT codegen for --features cuda)"
         if python -c "import tilelang" 2>/dev/null; then
             ok "tilelang already installed: $(python -c 'import tilelang; print(tilelang.__version__)')"
         else
@@ -392,7 +372,6 @@ do_deps() {
         ver="${line##*==}"
         local pkg_name="${pkg//-/_}"
         local actual
-        # flashinfer can't be imported without torch — check pip metadata instead
         actual=$(pip show "$pkg" 2>/dev/null | grep "^Version:" | awk '{print $2}')
         actual="${actual:-MISSING}"
         if [ "$actual" = "$ver" ]; then
@@ -433,11 +412,11 @@ do_build() {
         export CUDA_HOME
         export PATH="$CUDA_HOME/bin:$PATH"
         export LIBRARY_PATH="$CUDA_HOME/lib64/stubs:${LIBRARY_PATH:-}"
-        # Triton AOT needs Python from venv
-        export INFER_TRITON_PYTHON="$(which python)"
+        # TileLang AOT needs Python from venv
+        export INFER_TILELANG_PYTHON="$(which python)"
 
         info "CUDA_HOME=$CUDA_HOME"
-        info "TRITON_PYTHON=$INFER_TRITON_PYTHON"
+        info "TILELANG_PYTHON=$INFER_TILELANG_PYTHON"
         if [ -n "${TORCH_CUDA_ARCH_LIST:-}" ]; then
             info "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST (override)"
         elif [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
