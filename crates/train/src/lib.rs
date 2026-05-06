@@ -14,6 +14,8 @@ pub mod curriculum;
 pub mod data_adapter;
 #[path = "dataset.rs"]
 pub mod dataset;
+#[path = "deepseek.rs"]
+pub mod deepseek;
 #[path = "eval_lm.rs"]
 pub mod eval_lm;
 #[path = "grad_accum.rs"]
