@@ -124,7 +124,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 achieves 5.9× decode speedup, Qwen3.5-4B-4bit maintains bit-identical parity, validated for c=1..8. |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a serving target. |
 
-Models: **Qwen3 (0.6B – 72B)** and the **Qwen3.5 family** (including 0.8B GGUF Q4_K_M and 4B hybrid linear + full attention) are supported on CUDA and Metal according to the current matrix. **DeepSeek V3 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA remains stubbed. Llama 3 / 4 and DeepSeek V3 / R1 are planned — see [ROADMAP.md](ROADMAP.md).
+Models: **Qwen3 (0.6B – 72B)** and the **Qwen3.5 family** (including 0.8B GGUF Q4_K_M and 4B hybrid linear + full attention) are supported on CUDA and Metal according to the current matrix. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA remains stubbed. Next-model priority queue: **DeepSeek V4 (#1, substrate landing)** then **Qwen 3.6 (#2, planned)**; see [ROADMAP.md §Next-Model Priority Order](ROADMAP.md#next-model-priority-order). Llama 3 / 4 and DeepSeek V3 / R1 are further back on the planned list.
 
 Authoritative matrix (HTTP API tiers, quantization, agent / train / eval surfaces): [docs/support-matrix.md](docs/support-matrix.md).
 Stability tiers: [docs/stability-policy.md](docs/stability-policy.md).

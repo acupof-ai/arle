@@ -91,6 +91,12 @@ These axes are the dependency floor for both the longctx Phase 3
 collectives in forward). They must complete real collectives in forward
 before either downstream consumer can claim multi-rank serving.
 
+DeepSeek V4 is the #1 next-model priority and Qwen 3.6 is #2; the canonical
+ranking and rationale live in
+[`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order),
+with current support status in
+[`docs/support-matrix.md` §3](support-matrix.md#3-model-family-matrix).
+
 ## Speculative Decode Framework
 
 The Phase 2 spec-decode plumbing landed but does not yet produce a

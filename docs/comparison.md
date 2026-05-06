@@ -61,9 +61,11 @@ shows. Read each project's own docs before committing.
 
 ## What ARLE is intentionally not racing
 
-- **Model coverage.** Adding Llama 3 / 4 and DeepSeek V3 / R1 is on the
-  [ROADMAP](../ROADMAP.md), not shipped. vLLM / SGLang / mistral.rs / llama.cpp
-  all have far broader coverage today.
+- **Model coverage.** The ranked next-model queue on the
+  [ROADMAP](../ROADMAP.md#next-model-priority-order) is **DeepSeek V4 #1**
+  (substrate landing) and **Qwen 3.6 #2** (planned / scoping); Llama 3 / 4
+  and DeepSeek V3 / R1 sit further back. None are shipped today.
+  vLLM / SGLang / mistral.rs / llama.cpp all have far broader coverage now.
 - **Multi-GPU tensor parallel.** Not in scope as of 2026-04-26. Single-GPU
   serving is the supported path.
 - **Quantization breadth.** GPTQ W4 / AWQ W4 / FP8 / INT8 / Q4_K GGUF / MLX

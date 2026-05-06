@@ -145,8 +145,16 @@ Metal 这条线现在要把“量化 KV 是否需要做”说清楚，不再和 
 - Qwen3
 - Qwen3.5
 
-后续扩展优先级：
+后续扩展优先级（与全项目 next-model 队列对齐 —— 见
+[`../../ROADMAP.md` §Next-Model Priority Order](../../ROADMAP.md#next-model-priority-order)）：
 
-1. Gemma 4 text path
+1. **DeepSeek V4 (DS4) Metal 跟进** — CUDA 是 DS4 的 leading runtime；spec crate 与
+   runtime 模型骨架已就位 (`infer/src/model/deepseek/*`，2026-05-05 落地)。Metal 端等
+   MLA forward kernel 通过 MLX bridge 收敛后再开 serving 路径。
+2. **Qwen 3.6 / Qwen3.5-MoE 完整 serving** — 当前 Metal 可加载
+   `mlx-community/Qwen3.6-35B-A3B-4bit` 做诊断；DFlash 性能结论仍要走 long-context /
+   超长序列 workload。完整 batched decode + prefix lifecycle 接入在 DS4 substrate 跑出
+   bench 之后落。
+3. Gemma 4 text path —— 排在 DS4 / Qwen 3.6 之后。
 
 Llama 不在这条近期路线的优先级里。

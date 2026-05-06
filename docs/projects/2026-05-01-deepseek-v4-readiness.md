@@ -1,8 +1,12 @@
 # DeepSeek V4 readiness assessment
 
-Date: 2026-05-01
-Status: Readiness assessment only; no implementation.
-Scope: CUDA/runtime readiness for a future DeepSeek V4-family serving path.
+Date: 2026-05-01 (assessment); 2026-05-06 priority refresh.
+Status: **#1 next-model priority** (per
+[`ROADMAP.md` §Next-Model Priority Order](../../ROADMAP.md#next-model-priority-order)).
+Substrate landing: DS0 spec crate, runtime model skeleton, and nano autograd
+training shipped 2026-05-05; MLA forward kernels + DS4 CUDA MoE forward + DS5
+NCCL collectives in forward are the active runtime blockers. Scope:
+CUDA/runtime readiness for the DeepSeek V4-family serving path.
 
 This document treats the public V4 information as a readiness input, not a
 frozen implementation contract. The stable architectural baseline remains the
@@ -131,8 +135,11 @@ Responsibilities:
 
 ## Readiness Verdict
 
-ARLE is not ready to implement DeepSeek V4 serving immediately. It is ready for
-a staged prep sequence:
+DS4 is now the #1 next-model priority (canonical in
+[`ROADMAP.md` §Next-Model Priority Order](../../ROADMAP.md#next-model-priority-order)).
+Substrate landed 2026-05-05; full serving is not ready immediately, but the
+staged prep sequence below is the active execution path, not a hypothetical
+plan:
 
 1. Keep `crates/deepseek-spec/` and registry detection as the single source of
    truth for checkpoint family routing.
