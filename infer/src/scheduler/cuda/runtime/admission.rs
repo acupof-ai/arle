@@ -295,6 +295,9 @@ impl<M: ModelForward> Scheduler<M> {
             let Some(mut incoming) = self.waiting.pop_front() else {
                 break;
             };
+            if incoming.delta_tx.is_closed() {
+                continue;
+            }
             let Some(prompt_tokens) = incoming.prompt_tokens.take() else {
                 error!("Waiting request missing normalized prompt tokens, rejecting");
                 finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
