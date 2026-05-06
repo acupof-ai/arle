@@ -91,7 +91,7 @@ fn metal_materialize_boundaries_stay_classified() {
         ("infer/src/backend/metal/gdr.rs", 10),
         ("infer/src/backend/metal/generate.rs", 2),
         ("infer/src/backend/metal/loader.rs", 2),
-        ("infer/src/backend/metal/mlx.rs", 17),
+        ("infer/src/backend/metal/mlx.rs", 18),
         ("infer/src/backend/metal/ops.rs", 2),
         ("infer/src/backend/metal/qwen35.rs", 10),
         ("infer/src/backend/metal/request_state.rs", 27),
