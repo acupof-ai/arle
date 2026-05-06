@@ -211,7 +211,20 @@ W2 (long-decode) 上 ARLE/SGLang ≥ 2.0×（保守预期），stretch ≥ 2.5×
 
 ### 8.4 Phase 2 工程切片（高阶）
 
-完整 plan 在 Phase 1 完成时 spawn `docs/plans/YYYY-MM-DD-longctx-spec-decode.md`。本节只列骨架：
+**完整 plan**: [`docs/plans/longctx-spec-tilelang-combo.md`](../plans/longctx-spec-tilelang-combo.md)
+(drafted 2026-05-07,M_a..M_e 五个 sub-plan + P0-grounded survey)。
+
+本节列骨架,与 combo plan 的对齐表:
+
+| 本节项 | combo plan 子计划 | 状态 (2026-05-07) |
+|---|---|---|
+| 1. CUDA verifier kernel 接 mixed batch | M_b.2 (sparse-self-spec shmem fusion) | brief done,待 codex 实施 |
+| 2. MagicDec 风格 self-spec + sparse KV | M_c (Qwen3.5 hybrid spec rollback) + M_d (Tier-KV × spec coordination) | M_c 用 RecurrentState snapshot 已就位;M_d Q1 repro test landed (`6c81fed`) |
+| 3. SpecConfig 进 HTTP + 接受率自适应 | M_a | **landed** — `arle serve -- --spec-enabled --spec-draft-k K --spec-draft-model self`; acceptance_rate 接 EngineTelemetry (`d58e274`) |
+| 4. 数值正确性 (bit-identical 分布) | `infer/tests/spec_decode_correctness.rs` (4 tests pass) + M_d Q1 repro test | landed |
+| 5. W2 wins on H1+H2 | M_e (world-first bench gauntlet) | brief done,远端硬件 gated |
+
+骨架原文(供回顾):
 
 1. CUDA verifier kernel 接进 mixed batch（复用 Phase 1 的 split-KV varlen kernel）
 2. Draft model 路径：选 MagicDec 风格的 self-speculation + sparse KV，不引入第二个 model
