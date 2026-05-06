@@ -2016,7 +2016,17 @@ impl Qwen3Model {
                         .map(|w| w[1] - w[0])
                         .max()
                         .unwrap_or(0);
-                    let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
+                    // Pass the static pool capacity, not the per-batch
+                    // sum: this scalar is captured-by-value into CUDA
+                    // graphs, and the per-batch value at warmup time
+                    // (e.g. 1 page for B=1×1 dummy token) is smaller than
+                    // any real decode that has filled more than one page,
+                    // so the kernel's `idx < total_pages` bound rejects
+                    // every KV_indices read past warmup-time, producing
+                    // gibberish ~14 tokens in. KV_indices is allocated
+                    // to `max_total_pages`; the per-request walk is
+                    // already clamped via KV_indptr.
+                    let total_pages = kv_pool.max_total_pages as i32;
                     ops::tilelang_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,

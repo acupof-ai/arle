@@ -998,7 +998,13 @@ impl Qwen35Model {
                         .map(|w| w[1] - w[0])
                         .max()
                         .unwrap_or(0);
-                    let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
+                    // Static pool capacity, not the per-batch sum: this scalar is
+                    // captured-by-value into CUDA graphs; using the dynamic per-batch
+                    // value would freeze the warmup-time bound and reject KV_indices
+                    // reads past it. KV_indices is allocated to `max_total_pages`;
+                    // per-request bounds via KV_indptr already clamp the walk.
+                    // See qwen3/batch_decode.rs for the matching fix.
+                    let total_pages = kv_pool.max_total_pages as i32;
                     ops::tilelang_run_layer_hd256(
                         &self.ctx,
                         &bufs.attn.q_batch,
