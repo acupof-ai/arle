@@ -904,6 +904,42 @@ fn run_bf16_linear(
     }
 }
 
+fn deterministic_gemm_enabled() -> bool {
+    matches!(
+        std::env::var("INFER_DETERMINISTIC").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+fn run_bf16_graphsafe_per_row(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) {
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+    let x_base = x_ptr as *const ffi::Half;
+    let y_base = y_ptr as *mut ffi::Half;
+
+    unsafe {
+        for b in 0..x.seq_len {
+            ffi::gemm_graphsafe_cuda(
+                w_ptr as *const ffi::Half,
+                x_base.add(b * weight.cols),
+                y_base.add(b * weight.rows),
+                weight.rows as i32,
+                1,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("deterministic per-row gemm_graphsafe_cuda failed");
+        }
+    }
+}
+
 /// GEMM into pre-allocated output buffer (zero allocation).
 /// For seq_len=1, uses the graph-safe cuBLAS handle (no workspace) for lower
 /// latency while preserving numerical parity with the prefill path.
@@ -934,6 +970,9 @@ pub(crate) fn gemm_into(
         LinearKernelPlan::MarlinW4Gemm => run_marlin_w4_gemm(ctx, weight, x, out),
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);
+        }
+        LinearKernelPlan::Bf16CublasGemm if deterministic_gemm_enabled() => {
+            run_bf16_graphsafe_per_row(ctx, weight, x, out);
         }
         LinearKernelPlan::Bf16GraphsafeGemm | LinearKernelPlan::Bf16CublasGemm => {
             run_bf16_linear(ctx, weight, x, out, plan);

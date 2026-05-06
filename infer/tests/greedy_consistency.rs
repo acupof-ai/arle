@@ -34,13 +34,26 @@ fn cuda_graph_enabled() -> bool {
     )
 }
 
+fn enable_deterministic_gemm_for_test() {
+    // SAFETY: set before any scheduler worker thread is spawned. The test
+    // validates batch-invariant greedy numerics, so it must use the runtime's
+    // deterministic GEMM path rather than throughput-oriented batched GEMM.
+    unsafe {
+        std::env::set_var("INFER_DETERMINISTIC", "1");
+    }
+}
+
 /// Collect the full text output from a stream of deltas.
-fn collect_output(rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>) -> String {
+fn collect_output(rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>) -> (String, Vec<u32>) {
     let mut text = String::new();
+    let mut token_ids = Vec::new();
     loop {
         match rx.blocking_recv() {
             Some(delta) => {
                 text.push_str(&delta.text_delta);
+                if !delta.token_ids.is_empty() {
+                    token_ids.extend(delta.token_ids);
+                }
                 if delta.finish_reason.is_some() {
                     break;
                 }
@@ -48,7 +61,7 @@ fn collect_output(rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>) -> St
             None => break,
         }
     }
-    text
+    (text, token_ids)
 }
 
 fn make_request(
@@ -75,7 +88,7 @@ fn make_request(
 }
 
 /// Run a single request through the scheduler (solo = batch_size=1 during decode).
-fn run_solo(prompt: &str, max_tokens: usize, model_path: &str) -> String {
+fn run_solo(prompt: &str, max_tokens: usize, model_path: &str) -> (String, Vec<u32>) {
     let enable_cuda_graph = cuda_graph_enabled();
     let model = Qwen3Model::from_safetensors_with_runtime(
         model_path,
@@ -116,7 +129,7 @@ fn run_concurrent(
     max_tokens: usize,
     filler_prompts: &[&str],
     model_path: &str,
-) -> String {
+) -> (String, Vec<u32>) {
     let enable_cuda_graph = cuda_graph_enabled();
     let model = Qwen3Model::from_safetensors_with_runtime(
         model_path,
@@ -157,7 +170,7 @@ fn run_concurrent(
     // Drain all outputs.
     let target_output = collect_output(&mut target_rx);
     for rx in &mut filler_rxs {
-        collect_output(rx);
+        let _ = collect_output(rx);
     }
 
     drop(handle);
@@ -166,9 +179,19 @@ fn run_concurrent(
     target_output
 }
 
+fn first_token_divergence(lhs: &[u32], rhs: &[u32]) -> Option<(usize, Option<u32>, Option<u32>)> {
+    let n = lhs.len().max(rhs.len());
+    (0..n).find_map(|idx| {
+        let a = lhs.get(idx).copied();
+        let b = rhs.get(idx).copied();
+        (a != b).then_some((idx, a, b))
+    })
+}
+
 #[test]
 fn test_greedy_solo_vs_concurrent() {
     init_logging();
+    enable_deterministic_gemm_for_test();
     let model_path = get_model_path();
 
     if !Path::new(&model_path).exists() {
@@ -182,12 +205,13 @@ fn test_greedy_solo_vs_concurrent() {
 
     info!("=== Solo run (B=1 decode) ===");
     let t0 = Instant::now();
-    let solo_output = run_solo(prompt, max_tokens, &model_path);
+    let (solo_output, solo_tokens) = run_solo(prompt, max_tokens, &model_path);
     info!("Solo output ({:.1?}): {:?}", t0.elapsed(), solo_output);
+    info!("Solo generated token ids: {:?}", solo_tokens);
 
     info!("=== Concurrent run (B=3 decode) ===");
     let t0 = Instant::now();
-    let concurrent_output = run_concurrent(
+    let (concurrent_output, concurrent_tokens) = run_concurrent(
         prompt,
         max_tokens,
         &["My name is", "What is 2 + 2?"],
@@ -198,6 +222,14 @@ fn test_greedy_solo_vs_concurrent() {
         t0.elapsed(),
         concurrent_output
     );
+    info!("Concurrent generated token ids: {:?}", concurrent_tokens);
+    if let Some((idx, solo, concurrent)) = first_token_divergence(&solo_tokens, &concurrent_tokens)
+    {
+        info!(
+            "First generated-token divergence: idx={} solo={:?} concurrent={:?}",
+            idx, solo, concurrent
+        );
+    }
 
     assert_eq!(
         solo_output, concurrent_output,
