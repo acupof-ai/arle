@@ -227,6 +227,109 @@ fn test_embedding_variants() -> Result<()> {
 }
 
 #[test]
+fn test_add_batch_tail() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let hidden_dim = 7;
+    let seq_len = 2;
+    let a_host = bf16_vec(&[
+        -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, -3.0, 4.0, -4.0, 5.0, -5.0, 6.0,
+    ]);
+    let b_host = bf16_vec(&[
+        0.25, 0.5, -0.25, 1.0, -1.5, 2.0, -2.5, 0.5, 1.5, -2.0, 2.5, -3.0, 3.5, -4.0,
+    ]);
+    let a = HiddenStates {
+        data: ctx.stream.clone_htod(&a_host)?,
+        hidden_dim,
+        seq_len,
+    };
+    let b = HiddenStates {
+        data: ctx.stream.clone_htod(&b_host)?,
+        hidden_dim,
+        seq_len,
+    };
+    let mut out = HiddenStates::zeros(&ctx, hidden_dim, seq_len)?;
+
+    add_batch_into(&ctx, &a, &b, &mut out)?;
+    let out_host = ctx.stream.clone_dtoh(&out.data)?;
+    ctx.sync()?;
+
+    for (idx, got) in out_host.iter().enumerate() {
+        let expected = bf16::from_f32(a_host[idx].to_f32() + b_host[idx].to_f32()).to_f32();
+        assert!(
+            (got.to_f32() - expected).abs() < 0.01,
+            "index {idx} expected {expected} got {}",
+            got.to_f32()
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_silu_mul_batch_tail_and_in_place() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let hidden_dim = 7;
+    let seq_len = 2;
+    let gate_host = bf16_vec(&[
+        -4.0, -2.0, -1.0, -0.25, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, -3.0, 4.0, -0.5, 0.25,
+    ]);
+    let up_host = bf16_vec(&[
+        0.5, -1.0, 1.5, -2.0, 2.5, -3.0, 3.5, -4.0, 4.5, -5.0, 5.5, -6.0, 6.5, -7.0,
+    ]);
+    let gate = HiddenStates {
+        data: ctx.stream.clone_htod(&gate_host)?,
+        hidden_dim,
+        seq_len,
+    };
+    let up = HiddenStates {
+        data: ctx.stream.clone_htod(&up_host)?,
+        hidden_dim,
+        seq_len,
+    };
+    let mut out = HiddenStates::zeros(&ctx, hidden_dim, seq_len)?;
+
+    silu_mul_batch_into(&ctx, &gate, &up, &mut out)?;
+    let out_host = ctx.stream.clone_dtoh(&out.data)?;
+    ctx.sync()?;
+
+    for (idx, got) in out_host.iter().enumerate() {
+        let g = gate_host[idx].to_f32();
+        let u = up_host[idx].to_f32();
+        let expected = bf16::from_f32((g / (1.0 + (-g).exp())) * u).to_f32();
+        assert!(
+            (got.to_f32() - expected).abs() < 0.01,
+            "index {idx} expected {expected} got {}",
+            got.to_f32()
+        );
+    }
+
+    let mut gate_in_place = HiddenStates {
+        data: ctx.stream.clone_htod(&gate_host)?,
+        hidden_dim,
+        seq_len,
+    };
+    {
+        let (gate_ptr, _gate_guard) = gate_in_place.data.device_ptr_mut(&ctx.stream);
+        let (up_ptr, _up_guard) = up.data.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::silu_mul_cuda(
+                gate_ptr as *const ffi::Half,
+                up_ptr as *const ffi::Half,
+                gate_ptr as *mut ffi::Half,
+                (hidden_dim * seq_len) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    let in_place_host = ctx.stream.clone_dtoh(&gate_in_place.data)?;
+    ctx.sync()?;
+    assert_eq!(in_place_host, out_host);
+
+    Ok(())
+}
+
+#[test]
 fn test_gpu_sample() -> Result<()> {
     let ctx = DeviceContext::new()?;
 
