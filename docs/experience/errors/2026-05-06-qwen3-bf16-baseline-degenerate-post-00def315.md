@@ -79,7 +79,54 @@ step — a degenerate fixed point. At the time it was glossed as "path runs";
 in light of the present finding it is the **same regression**, not a benign
 echo.
 
-## Root Cause (suspected)
+## Resolution Update (2026-05-06 tick 6 — codex 3-way probe)
+
+**True root cause is NOT `00def315`. It is TileLang-attn defaulting into
+the Qwen3 HD128 paged-prefill path** (introduced in PR #46
+`5a3c0a89 feat(cuda): TileLang AOT generator supports attention + GDR
+families`). Disabling TileLang-attn (FlashInfer-only) restores BF16 output
+to coherent English without touching `00def315`.
+
+Codex ran the 3-way probe under `bench-output/2026-05-06-bf16-baseline-reprobe/`:
+
+| Probe variant | Probe A output | Probe B output | Verdict |
+|---|---|---|---|
+| `probe-A-current-head.json` (HEAD, TileLang-attn default-on) | degenerate `walkedived What't0...` | degenerate `thesh so so...` | reproduces my finding |
+| `probe-A-revert-00def315.json` (revert `00def315`) | still degenerate | still degenerate | **falsifies H1** |
+| `probe-A-flashinfer-only.json` (TileLang disabled, FlashInfer attn) | "ran into the room. The cat jumped off the mat and chased the dog…" coherent | normal photosynthesis / cellular respiration text | **isolates true cause** |
+
+GPU util 100% / mem 19858 MiB across all three — kernels run; only the
+TileLang attention path produces broken numerics for Qwen3 HD128
+paged-prefill.
+
+**My original H1 (`00def315` BF16 leak) is FALSIFIED.** H2 (stale binary)
+also falsified by codex's fresh HEAD build behaving identically to the
+05:29 binary on the same TileLang default. H3 (shared prefill→decode KV
+write/readback bug) was directionally close — the bug IS at the
+prefill→decode boundary — but the specific layer is the new TileLang-attn
+prefill kernel, not `decode_prep_paged` shared code or the `00def315`
+durable-KV finalization.
+
+The fix lane is now: gate TileLang-attn off-by-default for Qwen3 HD128
+paged-prefill (or remove the default entirely until the kernel is
+numerically validated against a 32×256 trajectory gate). Codex is landing
+the fix as a Cargo.toml feature/default flip across `crates/cuda-kernels/`
+and `infer/`. Cross-link the codex writeup once it lands.
+
+Implication for FP8 KV Tier 1 (`2026-05-02-...-fail.md` 0.43% / `2026-05-05-...-still-fail.md`
+1.22%): both prior runs were on the same TileLang-attn-default binaries.
+Once TileLang-attn is gated, the FP8 vs BF16 trajectory comparison must be
+re-run from scratch to see what FP8 KV's true gap is — the published
+0.43% / 1.22% numbers may be substantially better when measured against a
+non-degenerate BF16 reference.
+
+The "do not stack FP8 patches" rule still holds; it now extends to "do not
+stack FP8 OR BF16 numerics analysis on a binary with TileLang-attn
+default-on".
+
+---
+
+## Root Cause (original hypothesis — superseded by Resolution Update above)
 
 `00def315 fix(cuda): finalize qwen3 fp8 paged prefill kv` advertises itself
 as an FP8-only fix. Stat: it adds 243 / removes 13 lines in
