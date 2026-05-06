@@ -59,25 +59,35 @@ ARLE 已有四条独立强项:
 
 每个 milestone 假设 backend-unification 已经到 M3(统一 schedule IR)。在那之前本计划只能做 §M_a 的 prep work(API + benchmark harness),不能做核心 fuse。
 
-### M_a — Spec-decode bench + runtime knob(独立可做,与 unification 并行)
+### M_a — Spec-decode bench + telemetry plumb(独立可做,与 unification 并行)
 
-**Reality check (2026-05-07)**:`infer/src/speculative.rs` 已有 721 行框架,
-`spec_decode_correctness` + `magicdec_self_spec_integration` 共 9 个测试
-全部 ok(self-spec / external-draft / sparse self-spec / persistent state)。
-真正缺的是**生产路径 + bench harness**:
+**Reality check (2026-05-07)**:框架 + CLI flag + scheduler wiring 全已就位:
 
-1. **`arle serve` CLI 缺 `--num-speculative-tokens K` / `--spec-mode {self,external,sparse}`**
-   开关。现在 spec-decode 框架只在测试里挂得上,CLI/HTTP 跑不进去。
-2. **`scripts/bench_spec_decode.sh`**(新,wrap `bench_guidellm.sh`),先开
-   `INFER_DETERMINISTIC=0`(production fast path)跑 vanilla baseline,再
-   开 spec-decode 同 prompt set 跑一次,出 throughput / TTFT / acceptance-rate
-   对比表。
-3. **acceptance rate metric**:`SpecMetrics` 已存在但是没接到 `ServerMetrics::snapshot_engine_telemetry`(M1 的 EngineTelemetry);加一行让 acceptance rate 走 telemetry,bench 脚本可以 scrape。
+- `infer/src/speculative.rs` 721 行框架,9 个测试 ok(self-spec / external-draft / sparse self-spec / persistent state)。
+- `infer/src/main.rs` 已有 `--spec-enabled / --spec-draft-k / --spec-acceptance-threshold / --spec-draft-model {none,self,self-spec,external:<path>} / --spec-sparse-kv-enabled / --spec-sparse-recent-tokens / --spec-sparse-top-k-pages`。
+- `arle serve` 通过 `-- <extra-args>` passthrough 给 `infer` binary 也能用。
+- `scripts/bench_ab.sh` 已是通用 A/B harness。
+
+剩下的 M_a 只剩两件:
+
+1. **canonical bench invocation**(无需新代码,只需把例子锁进文档):
+    ```bash
+    scripts/bench_ab.sh vanilla-bf16 self-spec-k4 \
+        --quick --model Qwen/Qwen3-4B \
+        --cmd-a "scripts/start_infer.sh models/Qwen3-4B 8000 \
+                  > /tmp/spec-a.log 2>&1 &" \
+        --cmd-b "scripts/start_infer.sh models/Qwen3-4B 8000 \
+                  -- --spec-enabled --spec-draft-k 4 \
+                  --spec-draft-model self \
+                  > /tmp/spec-b.log 2>&1 &"
+    # 期望:b 的 decode-heavy throughput ≥ 1.4× a。
+    ```
+2. **acceptance rate plumb**:`SpecMetrics` 已存在但是没接到 `ServerMetrics::snapshot_engine_telemetry`(M1 的 `EngineTelemetry`);加 `spec_acceptance_rate: Option<f32>` 字段 + 对应 render 一行。bench harness 可以 scrape `/v1/stats` 出 acceptance 时间序列。
 
 **Acceptance**:
-- `arle serve --num-speculative-tokens 4 --spec-mode self` 端到端跑通,Qwen3-4B 上 acceptance ≥ 0.6。
-- `scripts/bench_spec_decode.sh self-spec-baseline` 产出 wins entry,vanilla vs spec-decode 矩阵 ≥ 1.4× decode-heavy throughput。
-- `EngineTelemetry::spec_acceptance_rate` 字段 + `/v1/stats` JSON 渲染。
+- 上面那条 `bench_ab.sh` 落地一个 `wins/<date>-bench-spec-decode-self-k4.md` 条目,vanilla vs spec-decode 对比矩阵 ≥ 1.4× decode-heavy throughput。
+- `EngineTelemetry::spec_acceptance_rate` 字段 + `/v1/stats` JSON 渲染,scheduler tests 加一个 telemetry round-trip 检查。
+- `start_infer.sh` 文档段说明 `-- --spec-enabled --spec-draft-k K --spec-draft-model self|external:<path>` 用法。
 
 ### M_b — TileLang fused draft+verify kernel
 
