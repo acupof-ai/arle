@@ -46,8 +46,7 @@ impl Qwen3Model {
         let num_layers = self.layers.len();
         let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
-        ops::embedding_decode_into(
-            &self.ctx,
+        ops_backend.embedding_decode_into(
             &self.embed_tokens,
             &bufs.decode_meta,
             &mut bufs.hidden,

@@ -780,8 +780,8 @@ impl Qwen3Model {
                 .memcpy_htod(&quantized.token_rows_host, &mut quantized.token_rows_gpu)
                 .map_err(|e| anyhow::anyhow!("H2D mixed quantized token rows: {e}"))?;
         }
-        ops::embedding_batch(
-            &self.ctx,
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        ops_backend.embedding_batch_into(
             &self.embed_tokens,
             &mixed.token_ids_gpu,
             &mut mixed.embedding_out,
@@ -804,7 +804,6 @@ impl Qwen3Model {
 
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
@@ -1087,12 +1086,7 @@ impl Qwen3Model {
                 &mut mixed.gate_out,
             )?;
             ops_backend.linear_batch_into(&layer.mlp.up_proj, &mixed.normed, &mut mixed.up_out)?;
-            ops::silu_mul_batch_into(
-                &self.ctx,
-                &mixed.gate_out,
-                &mixed.up_out,
-                &mut mixed.act_out,
-            )?;
+            ops_backend.silu_mul_batch_into(&mixed.gate_out, &mixed.up_out, &mut mixed.act_out)?;
 
             ops_backend.linear_batch_into(
                 &layer.mlp.down_proj,
@@ -1111,7 +1105,7 @@ impl Qwen3Model {
                     &mut mixed.normed,
                 )?;
             } else {
-                ops::add_batch_into(&self.ctx, hidden, &mixed.o_buf, &mut mixed.hidden_out)?;
+                ops_backend.add_batch_into(hidden, &mixed.o_buf, &mut mixed.hidden_out)?;
                 std::mem::swap(hidden, &mut mixed.hidden_out);
             }
         }
@@ -1199,8 +1193,7 @@ impl Qwen3Model {
             }
             // After the in-place compaction above, the final-token row for
             // prefill i lives at row `b + i` in mixed.logits.
-            ops::extract_vec_into(
-                &self.ctx,
+            ops_backend.extract_vec_into(
                 &mixed.logits,
                 b + i,
                 prefill_state
@@ -1246,6 +1239,7 @@ impl Qwen3Model {
         debug_assert_eq!(batch_size, slot_indices.len());
         debug_assert!(batch_size >= 1);
         debug_assert!(batch_size <= bufs.max_batch_size);
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         // LoRA path: keep the paged KV pool, but run eagerly (no graph
         // capture) with split QKV and split gate/up GEMMs so adapters can
@@ -1268,12 +1262,7 @@ impl Qwen3Model {
             if !skip_logit_scatter {
                 let logits = bufs.logits_batch.as_ref().unwrap();
                 for (b, &si) in slot_indices.iter().enumerate() {
-                    ops::extract_vec_into(
-                        &self.ctx,
-                        logits,
-                        b,
-                        &mut states[si].decode_bufs.logits,
-                    )?;
+                    ops_backend.extract_vec_into(logits, b, &mut states[si].decode_bufs.logits)?;
                     states[si].base.prefill_logits = None;
                 }
             }
@@ -1348,7 +1337,7 @@ impl Qwen3Model {
         if !skip_logit_scatter {
             let logits = bufs.logits_batch.as_ref().unwrap();
             for (b, &si) in slot_indices.iter().enumerate() {
-                ops::extract_vec_into(&self.ctx, logits, b, &mut states[si].decode_bufs.logits)?;
+                ops_backend.extract_vec_into(logits, b, &mut states[si].decode_bufs.logits)?;
                 states[si].base.prefill_logits = None;
             }
         }
@@ -1369,8 +1358,7 @@ impl Qwen3Model {
         let eps = self.config.rms_norm_eps;
         let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
-        ops::embedding_batch(
-            &self.ctx,
+        ops_backend.embedding_batch_into(
             &self.embed_tokens,
             &bufs.token_ids_gpu,
             &mut bufs.embedding_out,
@@ -1655,7 +1643,7 @@ impl Qwen3Model {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
             }
         }
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.down_proj.as_ref() {
@@ -1674,7 +1662,7 @@ impl Qwen3Model {
                 &mut bufs.normed,
             )?;
         } else {
-            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            ops_backend.add_batch_into(hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
             std::mem::swap(hidden, &mut bufs.hidden_out);
         }
 
@@ -1694,8 +1682,7 @@ impl Qwen3Model {
         let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         // Embedding (reads from pre-allocated token_ids_gpu, written by H2D before graph)
-        ops::embedding_batch(
-            &self.ctx,
+        ops_backend.embedding_batch_into(
             &self.embed_tokens,
             &bufs.token_ids_gpu,
             &mut bufs.embedding_out,
@@ -2055,7 +2042,7 @@ impl Qwen3Model {
         // 8. Batched MLP: gate + up projections → fused silu_mul → down
         ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
         ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
@@ -2070,7 +2057,7 @@ impl Qwen3Model {
                 &mut bufs.normed,
             )?;
         } else {
-            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            ops_backend.add_batch_into(hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
             std::mem::swap(hidden, &mut bufs.hidden_out);
         }
 
