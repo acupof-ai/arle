@@ -159,8 +159,10 @@ impl MetalScheduleStep {
     pub fn batch_shape(&self) -> MetalLogicalBatchShape {
         self.plan.batch_shape
     }
+}
 
-    fn from_logical_plan(plan: MetalLogicalServePlan) -> Self {
+impl From<MetalLogicalServePlan> for MetalScheduleStep {
+    fn from(plan: MetalLogicalServePlan) -> Self {
         let decode = (!plan.decode_rows.is_empty()).then(|| MetalDecodeBatch {
             req_ids: plan.decode_rows.iter().map(|row| row.req_id).collect(),
             input_tokens: plan.decode_rows.iter().map(|row| row.input_token).collect(),
@@ -272,7 +274,7 @@ impl MetalScheduler {
     pub fn step(&mut self, runtime_states: &[MetalRuntimeRequestState]) -> MetalScheduleStep {
         self.validate_runtime_snapshots(runtime_states);
         let plan = self.build_logical_plan(runtime_states);
-        MetalScheduleStep::from_logical_plan(plan)
+        MetalScheduleStep::from(plan)
     }
 
     /// Explicitly finish a request, releasing all scheduler bookkeeping.
