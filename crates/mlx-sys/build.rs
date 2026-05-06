@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    let on_macos = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
+    if !on_macos {
+        println!("cargo:warning=mlx-sys: skipping MLX/Metal bridge build on non-macOS target");
+        return;
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendor_dir = manifest_dir.join("vendor");
@@ -41,19 +47,16 @@ fn main() {
     //      of which @available macro version mlx uses.
     let macos_deployment_target =
         env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "14.0".to_string());
-    let on_macos = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
-    if on_macos {
-        if let Some(rt) = clang_compiler_rt() {
-            println!(
-                "cargo:rustc-link-search=native={}",
-                rt.parent().unwrap().display()
-            );
-            println!("cargo:rustc-link-lib=static=clang_rt.osx");
-        } else {
-            println!(
-                "cargo:warning=mlx-sys: could not locate libclang_rt.osx.a — Metal link may fail with `__isPlatformVersionAtLeast` undefined symbol"
-            );
-        }
+    if let Some(rt) = clang_compiler_rt() {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            rt.parent().unwrap().display()
+        );
+        println!("cargo:rustc-link-lib=static=clang_rt.osx");
+    } else {
+        println!(
+            "cargo:warning=mlx-sys: could not locate libclang_rt.osx.a — Metal link may fail with `__isPlatformVersionAtLeast` undefined symbol"
+        );
     }
 
     // Step 1: Build MLX from the vendored source tree using cmake.
@@ -142,9 +145,7 @@ fn main() {
         .flag("-Wno-deprecated-copy")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-sign-compare");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        bridge.flag(format!("-mmacosx-version-min={macos_deployment_target}"));
-    }
+    bridge.flag(format!("-mmacosx-version-min={macos_deployment_target}"));
     bridge.compile("mlx_ffi");
 
     // Step 2b: Compile the Objective-C++ Metal capture hook separately as its
@@ -158,9 +159,7 @@ fn main() {
         .flag("-fobjc-arc")
         .flag("-std=c++17")
         .flag("-Wno-unused-parameter");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        capture.flag(format!("-mmacosx-version-min={macos_deployment_target}"));
-    }
+    capture.flag(format!("-mmacosx-version-min={macos_deployment_target}"));
     capture.compile("mlx_metal_capture");
 
     // Step 3: Link MLX static library.

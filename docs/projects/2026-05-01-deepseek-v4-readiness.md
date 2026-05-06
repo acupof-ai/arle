@@ -58,17 +58,17 @@ Ready or partially ready:
 - KV FP8 exists through `KVFormat::FP8E4M3` and kernels under
   `crates/cuda-kernels/csrc/kv/kv_quant.cu`; this is useful prior art for scale
   handling and dispatch, not block-FP8 coverage.
-- Architecture detection already names DeepSeek V2/V3 and MLA in
-  `infer/src/model_registry.rs`, but they are marked unimplemented.
+- Architecture detection now names DeepSeek V2/V3, DeepSeek V4, and the V4 MTP
+  draft surface in `infer/src/model_registry.rs`; all DeepSeek variants remain
+  marked unimplemented until model/kernel work lands.
 - Metal has Qwen3.5/Qwen3.6 MoE prior art under `infer/src/backend/metal/` and
   `crates/mlx-sys/src/mlx_qwen35_moe_block.cpp`; this is not a CUDA DeepSeek
   implementation but helps reason about router/expert tensor shapes.
 
 Missing:
 
-- No `crates/deepseek-spec/` crate and no DeepSeek tensor-name contract.
-- No CUDA DeepSeek model module, state type, loader, scheduler registration, or
-  HTTP/runtime dispatch arm.
+- No CUDA DeepSeek safetensors loader, scheduler registration, or HTTP/runtime
+  dispatch arm.
 - No MLA KV cache layout, prefill kernel, decode kernel, or paged-cache planner.
 - No CUDA sparse MoE expert forward, router top-k, expert batching, all-to-all
   dispatch, or EP runtime.
@@ -100,8 +100,8 @@ Responsibilities:
 
 | Gap | Description | Current state | Required commit sequence | Est. size/time |
 |---|---|---|---|---:|
-| DS0 spec crate | DeepSeek V4 needs a canonical config and tensor-name contract before any loader or kernel work. | DeepSeek V2/V3 are only registry enum variants; no spec crate exists. | 1. Add `crates/deepseek-spec`. 2. Parse V3/R1 plus V4 candidate configs. 3. Add tensor-name builders and shard annotations. 4. Add config fixture tests. | 600-900 LoC, 1-2 days |
-| DS1 model registry | Runtime must detect DeepSeek V4/MTP configs and route them to an explicit unsupported or experimental path. | `model_registry.rs` recognizes DeepSeek V2/V3 as MLA but unimplemented. | 1. Add `DeepSeekV4` and `DeepSeekV4Mtp` variants. 2. Map architecture strings once verified. 3. Keep `is_implemented=false` until DS4/DS5 land. | 80-140 LoC, 0.5 day |
+| DS0 spec crate | DeepSeek V4 needs a canonical config and tensor-name contract before any loader or kernel work. | Landed: `crates/deepseek-spec` owns config parsing, tensor names, shard annotations, MTP names, and MoE forward planning. | Keep extending it as V4 checkpoint metadata stabilizes; do not fork tensor-name truth into the runtime. | landed |
+| DS1 model registry | Runtime must detect DeepSeek V4/MTP configs and route them to an explicit unsupported or experimental path. | Landed: `model_registry.rs` has `DeepSeekV4` and `DeepSeekV4Mtp`, maps verified architecture strings, exposes a V4-specific attention variant, and keeps `is_implemented=false`. | Wire runtime loading only after DS3/DS4/DS5 produce a real serving path. | landed |
 | DS2 Block-FP8 format | V4 serving requires block-wise FP8 weights/activations, not only per-token FP8 KV. | ARLE has `KVFormat::FP8E4M3` and KV quant kernels; weight loader has non-block quant paths. | 1. Add block-FP8 metadata structs in loader/spec. 2. Parse safetensors quant metadata. 3. Add CPU decode/dequant tests. 4. Add CUDA dequant-GEMM kernel entry points. | 800-1600 LoC, 3-5 days |
 | DS3 MLA cache and kernels | MLA changes K/V cache contents and attention math. GQA kernels cannot be reused as-is. | `AttentionVariant::Mla` exists only as registry metadata. Qwen kernels cover GQA/hybrid GQA. | 1. Define MLA state/cache layout. 2. Add BF16 MLA prefill reference path. 3. Add paged MLA decode kernel. 4. Add FP8/block-FP8 variants. 5. Add numerical baselines. | 1800-3500 LoC, 1-2 weeks |
 | DS4 CUDA MoE forward | Sparse routed experts are the core DeepSeek throughput path. | CUDA Qwen3.5 MoE is a stub; Metal has separate Qwen MoE prior art. Distributed MoE groups exist as metadata. | 1. Add router top-k CPU/GPU tests. 2. Add single-GPU expert batching and combine. 3. Add shared expert support. 4. Add EP dispatch using group metadata. 5. Add MoE-TP/MoE-DP collectives. | 2000-4500 LoC, 1-2 weeks |
@@ -112,8 +112,9 @@ Responsibilities:
 
 ## Recommended Priority
 
-1. **DS0 `crates/deepseek-spec/` first.** It is the lowest-risk commit and
-   unlocks shape names, shard annotations, and explicit unsupported routing.
+1. **DS2 block-FP8 metadata next.** DS0/DS1 now give shape/routing truth; the
+   next low-risk code tranche is CPU-side quant metadata parsing before any
+   CUDA kernel ABI is committed.
 2. **DS5 collectives before claiming DeepSeek multi-GPU serving.** F2 now
    correctly refuses TP>1 production load until collectives are real. DeepSeek
    MoE/MLA work should not bypass that guard.
@@ -133,7 +134,8 @@ Responsibilities:
 ARLE is not ready to implement DeepSeek V4 serving immediately. It is ready for
 a staged prep sequence:
 
-1. Land `crates/deepseek-spec/` and registry detection.
+1. Keep `crates/deepseek-spec/` and registry detection as the single source of
+   truth for checkpoint family routing.
 2. Finish F2 collectives so TP/EP paths can run instead of fail-fast.
 3. Prototype MLA BF16 prefill/decode correctness.
 4. Prototype single-GPU MoE forward correctness.
