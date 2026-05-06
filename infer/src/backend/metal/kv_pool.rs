@@ -66,6 +66,13 @@ impl SlotLedger {
         self.max_total_tokens - self.free_slots.len()
     }
 
+    fn paged_pool_pressure(&self) -> f64 {
+        if self.max_total_tokens == 0 {
+            return 0.0;
+        }
+        self.total_tokens_used() as f64 / self.max_total_tokens as f64
+    }
+
     fn token_indices(&self, request_id: usize) -> Option<&[u32]> {
         self.request_slots.get(&request_id).map(Vec::as_slice)
     }
@@ -596,6 +603,11 @@ impl MetalKVPool {
         self.ledger.total_tokens_used()
     }
 
+    /// Fraction of token slots currently occupied, in `[0, 1]`.
+    pub fn paged_pool_pressure(&self) -> f64 {
+        self.ledger.paged_pool_pressure()
+    }
+
     /// Number of free token slots remaining in the pool.
     pub fn available_tokens(&self) -> usize {
         self.ledger.available_tokens()
@@ -780,6 +792,21 @@ mod tests {
         ledger.alloc_detached_slots(10).expect("alloc");
 
         assert_eq!(ledger.reclaim_target_tokens(0.95, 0.8).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn paged_pool_pressure_tracks_occupancy() {
+        let mut ledger = SlotLedger::new(8);
+        assert_eq!(ledger.paged_pool_pressure(), 0.0);
+
+        ledger.alloc_detached_slots(2).expect("alloc");
+        assert_eq!(ledger.paged_pool_pressure(), 0.25);
+
+        let rest = ledger.alloc_detached_slots(6).expect("alloc rest");
+        assert_eq!(ledger.paged_pool_pressure(), 1.0);
+
+        ledger.release_slots(&rest).expect("release rest");
+        assert_eq!(ledger.paged_pool_pressure(), 0.25);
     }
 
     #[test]

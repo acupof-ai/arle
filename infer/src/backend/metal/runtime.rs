@@ -23,6 +23,7 @@ use super::{MetalBackend, MetalBackendOptions};
 use crate::backend::InferenceBackend;
 use crate::backend::runtime::StopChunkProcessor;
 use crate::kv_tier::transport::disk::{DiskBlockLocation, DiskStore};
+use crate::kv_tier::{BlockId, KvTierAdapter, Tier};
 use crate::metrics::ServerMetrics;
 use crate::sampler::SamplingParams;
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
@@ -302,10 +303,119 @@ struct MetalQwen35DiskPrefix {
     last_used_tick: u64,
 }
 
+#[derive(Clone)]
+struct MetalTierAdapter {
+    disk_store: Option<Arc<DiskStore>>,
+    paged_pool_pressure: f64,
+}
+
+impl MetalTierAdapter {
+    fn new(disk_store: Option<Arc<DiskStore>>) -> Self {
+        Self {
+            disk_store,
+            paged_pool_pressure: 0.0,
+        }
+    }
+
+    fn with_paged_pool_pressure(mut self, pressure: f64) -> Self {
+        self.set_paged_pool_pressure(pressure);
+        self
+    }
+
+    fn set_paged_pool_pressure(&mut self, pressure: f64) {
+        self.paged_pool_pressure = normalize_paged_pool_pressure(pressure);
+    }
+
+    fn has_disk_tier(&self) -> bool {
+        self.disk_store.is_some()
+    }
+
+    fn put_disk_block_with_fsync(
+        &self,
+        fingerprint: BlockFingerprint,
+        kv_format_tag: u8,
+        payload: &[u8],
+        fsync_each_block: bool,
+    ) -> Result<DiskBlockLocation> {
+        let store = self
+            .disk_store
+            .as_ref()
+            .context("Metal T2 disk tier not configured")?;
+        store
+            .put_block_with_fsync(fingerprint, kv_format_tag, payload, fsync_each_block)
+            .context("write block through Metal T2 adapter")
+    }
+
+    fn get_disk_block(
+        &self,
+        location: &DiskBlockLocation,
+        expected_fingerprint: Option<BlockFingerprint>,
+    ) -> Result<Vec<u8>> {
+        let store = self
+            .disk_store
+            .as_ref()
+            .context("Metal T2 disk tier not configured")?;
+        store
+            .get_block(location, expected_fingerprint)
+            .context("read block through Metal T2 adapter")
+    }
+
+    fn visit_disk_payload_prefixes(
+        &self,
+        max_payload_prefix_len: usize,
+        visit: impl FnMut(DiskBlockLocation, &[u8]) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let Some(store) = self.disk_store.as_ref() else {
+            return Ok(());
+        };
+        store
+            .visit_block_payload_prefixes(max_payload_prefix_len, visit)
+            .context("scan Metal T2 adapter block prefixes")
+    }
+
+    fn delete_disk_block(&self, location: &DiskBlockLocation) -> Result<()> {
+        let store = self
+            .disk_store
+            .as_ref()
+            .context("Metal T2 disk tier not configured")?;
+        store
+            .delete_block(location)
+            .context("delete block through Metal T2 adapter")
+    }
+}
+
+impl KvTierAdapter for MetalTierAdapter {
+    fn paged_pool_pressure(&self) -> f64 {
+        self.paged_pool_pressure
+    }
+
+    fn submit_demote(&self, _block_id: BlockId) -> Result<()> {
+        // Metal T2 is opt-in. With no disk store configured, demotion is a
+        // no-op so the default backend behavior stays unchanged.
+        Ok(())
+    }
+
+    fn submit_promote(&self, _block_id: BlockId, tier: Tier) -> Result<()> {
+        match tier {
+            Tier::Gpu | Tier::Disk => Ok(()),
+            Tier::HostPinned => anyhow::bail!("Metal skips T1 HostPinned tier"),
+            Tier::Remote => anyhow::bail!("Metal remote KV tier is not wired"),
+        }
+    }
+}
+
+fn normalize_paged_pool_pressure(pressure: f64) -> f64 {
+    if pressure.is_finite() {
+        pressure.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 struct MetalQwen35PrefixRuntime {
     entries: HashMap<Vec<u32>, MetalQwen35CachedPrefix>,
     disk_entries: HashMap<Vec<u32>, MetalQwen35DiskPrefix>,
-    disk_store: Option<Arc<DiskStore>>,
+    tier_adapter: MetalTierAdapter,
     model_fingerprint: Vec<u8>,
     max_disk_bytes: Option<u64>,
     disk_high_watermark: f64,
@@ -402,6 +512,12 @@ impl MetalLivePrefixRuntime {
             MetalLivePrefixRuntime::Qwen35(runtime) => runtime.publish_prompt_prefix(request),
         }
     }
+
+    fn set_paged_pool_pressure(&mut self, pressure: f64) {
+        match self {
+            MetalLivePrefixRuntime::Qwen35(runtime) => runtime.set_paged_pool_pressure(pressure),
+        }
+    }
 }
 
 impl MetalQwen35PrefixRuntime {
@@ -418,7 +534,7 @@ impl MetalQwen35PrefixRuntime {
         let mut runtime = Self {
             entries: HashMap::new(),
             disk_entries: HashMap::new(),
-            disk_store,
+            tier_adapter: MetalTierAdapter::new(disk_store).with_paged_pool_pressure(0.0),
             model_fingerprint,
             max_disk_bytes,
             disk_high_watermark,
@@ -431,7 +547,7 @@ impl MetalQwen35PrefixRuntime {
             block_size,
         };
         runtime.reconcile_disk_entries()?;
-        if runtime.disk_store.is_some() {
+        if runtime.tier_adapter.has_disk_tier() {
             info!(
                 "Metal Qwen3.5 SSD prefix cache indexed {} entries ({} bytes)",
                 runtime.disk_entries.len(),
@@ -505,7 +621,7 @@ impl MetalQwen35PrefixRuntime {
             return Ok(());
         }
 
-        if self.disk_store.is_some() {
+        if self.tier_adapter.has_disk_tier() {
             request
                 .request_state
                 .drain_qwen35_cpp_session()
@@ -537,6 +653,10 @@ impl MetalQwen35PrefixRuntime {
             self.insert_snapshot(snapshot);
         }
         Ok(())
+    }
+
+    fn set_paged_pool_pressure(&mut self, pressure: f64) {
+        self.tier_adapter.set_paged_pool_pressure(pressure);
     }
 
     fn lookup_longest_prefix(&self, prompt_tokens: &[u32]) -> Option<Vec<u32>> {
@@ -642,7 +762,7 @@ impl MetalQwen35PrefixRuntime {
     }
 
     fn persist_snapshot(&mut self, snapshot: &Qwen35PrefixSnapshot) -> Result<()> {
-        let Some(store) = self.disk_store.clone() else {
+        if !self.tier_adapter.has_disk_tier() {
             return Ok(());
         };
         let token_count = snapshot.token_ids.len();
@@ -673,8 +793,9 @@ impl MetalQwen35PrefixRuntime {
         }
 
         let fingerprint = self.fingerprint_for_tokens(&key);
-        let location = store
-            .put_block_with_fsync(
+        let location = self
+            .tier_adapter
+            .put_disk_block_with_fsync(
                 fingerprint,
                 METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
                 &payload,
@@ -698,7 +819,7 @@ impl MetalQwen35PrefixRuntime {
         prefix_key: &[u32],
         request: &mut ActiveMetalRequest,
     ) -> Result<bool> {
-        let Some(store) = self.disk_store.clone() else {
+        if !self.tier_adapter.has_disk_tier() {
             return Ok(false);
         };
         let Some(location) = self
@@ -709,8 +830,9 @@ impl MetalQwen35PrefixRuntime {
             return Ok(false);
         };
         let expected = self.fingerprint_for_tokens(prefix_key);
-        let payload = store
-            .get_block(&location, Some(expected))
+        let payload = self
+            .tier_adapter
+            .get_disk_block(&location, Some(expected))
             .context("read Qwen3.5 prefix snapshot from DiskStore")?;
         let snapshot = Qwen35PrefixSnapshot::decode_from_disk(&payload, &self.model_fingerprint)
             .context("decode Qwen3.5 prefix snapshot from DiskStore")?;
@@ -731,11 +853,12 @@ impl MetalQwen35PrefixRuntime {
     }
 
     fn reconcile_disk_entries(&mut self) -> Result<()> {
-        let Some(store) = self.disk_store.clone() else {
+        if !self.tier_adapter.has_disk_tier() {
             return Ok(());
         };
-        store
-            .visit_block_payload_prefixes(
+        let adapter = self.tier_adapter.clone();
+        adapter
+            .visit_disk_payload_prefixes(
                 METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES,
                 |location, payload| {
                     let token_ids = match Qwen35PrefixSnapshot::peek_disk_token_ids(
@@ -749,7 +872,7 @@ impl MetalQwen35PrefixRuntime {
                                 location.path.display()
                             );
                             if Qwen35PrefixSnapshot::looks_like_disk_payload(payload) {
-                                delete_rejected_qwen35_disk_block(&store, &location);
+                                delete_rejected_qwen35_disk_block(&adapter, &location);
                             }
                             return Ok(());
                         }
@@ -757,7 +880,7 @@ impl MetalQwen35PrefixRuntime {
                     if token_ids.len() < self.block_size
                         || !token_ids.len().is_multiple_of(self.block_size)
                     {
-                        delete_rejected_qwen35_disk_block(&store, &location);
+                        delete_rejected_qwen35_disk_block(&adapter, &location);
                         return Ok(());
                     }
                     let expected = self.fingerprint_for_tokens(&token_ids);
@@ -766,7 +889,7 @@ impl MetalQwen35PrefixRuntime {
                             "Metal Qwen3.5 SSD prefix cache ignored {}: fingerprint/token mismatch",
                             location.path.display()
                         );
-                        delete_rejected_qwen35_disk_block(&store, &location);
+                        delete_rejected_qwen35_disk_block(&adapter, &location);
                         return Ok(());
                     }
                     let tick = self.bump_tick();
@@ -849,8 +972,8 @@ impl MetalQwen35PrefixRuntime {
             return;
         };
         self.disk_bytes = self.disk_bytes.saturating_sub(entry.location.payload_len);
-        if let Some(store) = self.disk_store.as_ref()
-            && let Err(err) = store.delete_block(&entry.location)
+        if self.tier_adapter.has_disk_tier()
+            && let Err(err) = self.tier_adapter.delete_disk_block(&entry.location)
         {
             warn!(
                 "Metal Qwen3.5 SSD prefix cache failed to delete {}: {err:#}",
@@ -881,8 +1004,8 @@ fn watermark_bytes(max_bytes: u64, watermark: f64) -> u64 {
     ((max_bytes as f64) * watermark).ceil() as u64
 }
 
-fn delete_rejected_qwen35_disk_block(store: &DiskStore, location: &DiskBlockLocation) {
-    if let Err(err) = store.delete_block(location) {
+fn delete_rejected_qwen35_disk_block(adapter: &MetalTierAdapter, location: &DiskBlockLocation) {
+    if let Err(err) = adapter.delete_disk_block(location) {
         warn!(
             "Metal Qwen3.5 SSD prefix cache failed to delete rejected block {}: {err}",
             location.path.display()
@@ -1229,6 +1352,7 @@ fn run_metal_scheduler_runtime(
             &scheduler,
             &pending,
             &active,
+            &mut prefix_runtime,
             &mut last_metrics_refresh,
             METRICS_REFRESH_INTERVAL,
         );
@@ -1250,7 +1374,14 @@ fn run_metal_scheduler_runtime(
                 );
                 // Admission is rare enough that an unconditional refresh
                 // is fine — helps the first metrics scrape after idle.
-                refresh_runtime_metrics(metrics, handle, &scheduler, &pending, &active);
+                refresh_runtime_metrics(
+                    metrics,
+                    handle,
+                    &scheduler,
+                    &pending,
+                    &active,
+                    &mut prefix_runtime,
+                );
                 last_metrics_refresh = Some(Instant::now());
             } else {
                 request_rx_closed = true;
@@ -1304,6 +1435,7 @@ fn run_metal_scheduler_runtime(
             &scheduler,
             &pending,
             &active,
+            &mut prefix_runtime,
             &mut last_metrics_refresh,
             METRICS_REFRESH_INTERVAL,
         );
@@ -1708,6 +1840,7 @@ fn maybe_refresh_runtime_metrics(
     scheduler: &MetalScheduler,
     pending: &HashMap<RequestId, PendingMetalRequest>,
     active: &HashMap<RequestId, ActiveMetalRequest>,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     last: &mut Option<Instant>,
     interval: Duration,
 ) {
@@ -1717,7 +1850,7 @@ fn maybe_refresh_runtime_metrics(
             return;
         }
     }
-    refresh_runtime_metrics(metrics, handle, scheduler, pending, active);
+    refresh_runtime_metrics(metrics, handle, scheduler, pending, active, prefix_runtime);
     *last = Some(now);
 }
 
@@ -2704,6 +2837,7 @@ fn refresh_runtime_metrics(
     _scheduler: &MetalScheduler,
     _pending: &HashMap<RequestId, PendingMetalRequest>,
     active: &HashMap<RequestId, ActiveMetalRequest>,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
 ) {
     metrics.set_active(active.len() as u64);
     metrics.set_waiting(handle.waiting_count() as u64);
@@ -2726,6 +2860,14 @@ fn refresh_runtime_metrics(
             acc
         }
     });
+    let pressure = if kv_total == 0 {
+        0.0
+    } else {
+        kv_used as f64 / kv_total as f64
+    };
+    if let Some(prefix_runtime) = prefix_runtime.as_mut() {
+        prefix_runtime.set_paged_pool_pressure(pressure);
+    }
     metrics.set_kv_gpu_blocks(kv_total.saturating_sub(kv_used), kv_total);
     metrics.set_memory_bytes(
         super::mlx::active_memory_bytes(),
@@ -2814,6 +2956,65 @@ mod tests {
 
         let other = anyhow::anyhow!("stream consumer dropped");
         assert!(!is_stream_consumer_dropped(&other));
+    }
+
+    #[test]
+    fn metal_tier_adapter_rejects_t1_and_allows_t2_noop() {
+        let adapter = MetalTierAdapter::new(None).with_paged_pool_pressure(1.5);
+        assert_eq!(adapter.paged_pool_pressure(), 1.0);
+        assert!(adapter.submit_demote(BlockId(7)).is_ok());
+        assert!(adapter.submit_promote(BlockId(7), Tier::Disk).is_ok());
+        assert!(
+            adapter
+                .submit_promote(BlockId(7), Tier::HostPinned)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metal_tier_adapter_disk_snapshot_roundtrip_survives_restart() {
+        let _guard = metal_test_guard();
+        let dir = tempdir().expect("tempdir");
+        let store = Arc::new(DiskStore::new(dir.path()));
+        let adapter = MetalTierAdapter::new(Some(store));
+        let model_fingerprint = b"qwen35-adapter-test-model".to_vec();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![21, 22],
+            kv_flat: vec![MlxArray::from_slice_i32(&[3, 4], &[2])],
+            gdr_flat: Vec::new(),
+            cache_len: 2,
+            kv_capacity: 2,
+        };
+        let payload = snapshot
+            .encode_for_disk(&model_fingerprint)
+            .expect("encode snapshot");
+        let fingerprint = BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: &model_fingerprint,
+                kv_format_tag: METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
+                parent: None,
+            },
+            &snapshot.token_ids,
+        );
+        let location = adapter
+            .put_disk_block_with_fsync(
+                fingerprint,
+                METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
+                &payload,
+                false,
+            )
+            .expect("persist via adapter");
+
+        let restarted_store = Arc::new(DiskStore::new(dir.path()));
+        let restarted = MetalTierAdapter::new(Some(restarted_store));
+        let reloaded = restarted
+            .get_disk_block(&location, Some(fingerprint))
+            .expect("reload via adapter");
+        let decoded = Qwen35PrefixSnapshot::decode_from_disk(&reloaded, &model_fingerprint)
+            .expect("decode reloaded snapshot");
+        assert_eq!(decoded.token_ids, vec![21, 22]);
+        assert_eq!(decoded.cache_len, 2);
+        assert_eq!(decoded.kv_capacity, 2);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use crate::kv_tier::coordinator::{CoordinatorQueueStats, QueueControlStats, StoreTarget};
 use crate::kv_tier::policy::{PrefetchPolicy, WritePolicy};
+use crate::kv_tier::{BlockId, KvTierAdapter, Tier};
 use crate::prefix_cache::BlockMetadata;
 
 #[derive(Clone, Debug)]
@@ -63,5 +64,19 @@ impl TieredKvPolicy {
                 }
             }
         }
+    }
+}
+
+impl KvTierAdapter for TieredKvPolicy {
+    fn paged_pool_pressure(&self) -> f64 {
+        0.0
+    }
+
+    fn submit_demote(&self, _block_id: BlockId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn submit_promote(&self, _block_id: BlockId, _tier: Tier) -> anyhow::Result<()> {
+        Ok(())
     }
 }

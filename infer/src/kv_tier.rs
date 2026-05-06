@@ -140,6 +140,23 @@ pub mod readmission;
 pub mod tier;
 pub mod transport;
 
+/// Backend-neutral policy adapter for tier movement requests.
+///
+/// The trait intentionally uses only KV-tier value types. Backend-specific
+/// implementations keep their own state behind the adapter boundary: CUDA can
+/// route through the coordinator-backed T1/T2 path, while Metal can skip T1 and
+/// admit only the disk tier supported by unified memory.
+pub trait KvTierAdapter {
+    /// Current pressure of the backend's pageable KV pool, in `[0, 1]`.
+    fn paged_pool_pressure(&self) -> f64;
+
+    /// Request demotion of a cached block to the backend's next supported tier.
+    fn submit_demote(&self, block_id: BlockId) -> anyhow::Result<()>;
+
+    /// Request promotion/readmission of a block from `tier`.
+    fn submit_promote(&self, block_id: BlockId, tier: Tier) -> anyhow::Result<()>;
+}
+
 pub use backend::{
     ClusterSharedBackend, ClusterSharedBackendConfig, ClusterSharedBackendOp, KVBackend,
     KVBackendScope,
