@@ -4,7 +4,7 @@
 pub use cuda_kernels::{KVCacheDtype, KVFormat};
 
 #[cfg(feature = "cuda")]
-pub use cuda_kernels::{ffi, flashinfer, paged_kv, prelude, tensor, turboquant_state};
+pub use cuda_kernels::{ffi, paged_kv, prelude, tensor, tilelang, turboquant_state};
 
 #[cfg(feature = "cuda")]
 #[path = "cuda/bootstrap.rs"]

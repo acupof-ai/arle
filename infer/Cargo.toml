@@ -69,23 +69,10 @@ deepseek-spec = { path = "../crates/deepseek-spec" }
 [features]
 # Enable CUDA kernel compilation and GPU inference (default on Linux/GPU machines).
 #
-# 2026-04-28: `tilelang-attn` was re-added to the default `cuda` feature in
-# 47bad713 after the short-qlen NaN regression was fixed with
-# `reduce_max(clear=True)`. The original bug produced `"!!!!!!!"` on prompts
-# where `qlen < BLOCK_M=64`; keep
-# `docs/experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md`
-# as the historical root-cause pointer.
-cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda", "tilelang-attn"]
+# CUDA builds use TileLang as the only AOT attention/GDR compiler surface.
+cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda"]
 # Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = ["cuda-kernels/no-cuda"]
-# TileLang prefill HD128 attention path. Always-on under `cuda`; this
-# feature is kept as a forwarding alias for the cuda-kernels crate gate.
-tilelang-attn = ["cuda-kernels/tilelang-attn"]
-# Opt-in extension that pulls in the broken HD256 decode tranche too —
-# only enable when validating the Qwen3.5 full-attn TileLang path.
-# `cargo build --features cuda,tilelang-attn` (the canonical Qwen3-4B
-# path) should not require this.
-tilelang-decode-hd256 = ["tilelang-attn", "cuda-kernels/tilelang-decode-hd256"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda` (NCCL needs CUDA).
 nccl = ["cuda", "cuda-kernels/nccl", "cudarc/nccl"]
 # Development-oriented CPU backend for serial smoke tests and local validation.

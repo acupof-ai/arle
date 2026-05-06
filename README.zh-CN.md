@@ -62,14 +62,14 @@ docker run --rm --gpus all -p 8000:8000 \
 `ghcr.io/cklxx/arle:X.Y.Z`(注意：没有 `v` 前缀)。当前 v0.1.0 对应
 `ghcr.io/cklxx/arle:0.1.0`。
 
-**从源码构建**(任意后端;`cpu`、`tilelang-attn`、本地开发需要)：
+**从源码构建**(任意后端;`cpu`、CUDA/TileLang、本地开发需要)：
 
 ```bash
 git clone https://github.com/cklxx/arle && cd arle
 # Apple Silicon:
 cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
 # Linux + NVIDIA:
-cargo build --release --features cli --bin arle
+cargo build --release --features cuda --bin arle
 ```
 
 ### 2. 启动服务
@@ -117,7 +117,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 
 | 后端 | 平台 | 状态 | 已交付 |
 |---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | 持续批处理、paged KV、radix 复用、FlashInfer、CUDA Graph decode、Qwen3 / Qwen3.5 packed paged-prefill。**L4 / Qwen3-4B BF16 + FP8 paged KV（auto）：c=16 / 4096-in 输出 197 tok/s，peak_active=16 满槽。** |
+| **CUDA** | Linux + NVIDIA | **Stable** | 持续批处理、paged KV、radix 复用、TileLang BF16 attention、自定义 CUDA 量化 decode、CUDA Graph decode、Qwen3 / Qwen3.5 packed paged-prefill。**L4 / Qwen3-4B BF16 + FP8 paged KV（auto）：c=16 / 4096-in 输出 197 tok/s，peak_active=16 满槽。** |
 | **Metal** | Apple Silicon | **Beta** | 调度器驱动的实时服务、chunked prefill、replay-based prefix 复用。Qwen3.5-0.8B MLX 4bit 单请求 step-driver 在 M4 Pro 20c 上达到 305.5 tok/s；GGUF Q4_K_M 在匹配的 1024/256 profile 上是 202.1 tok/s，仍作为独立 kernel/权重格式 gap 继续追。 |
 | **Metal DFlash** | Apple Silicon | **Beta — 默认开启** | Qwen3 / Qwen3.5 推测解码。Qwen3-4B bf16 5.9× decode，Qwen3.5-4B-4bit 比特一致，c=1..8 已验证。 |
 | **CPU** | 通用 | **仅开发用** | 冒烟测试与请求路径校验，不作为服务目标。 |

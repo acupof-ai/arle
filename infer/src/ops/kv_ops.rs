@@ -10,8 +10,8 @@ use cuda_kernels::prelude::{DeviceContext, HiddenStates};
 /// `[seq_len, num_kv_heads * head_dim]`), this copies each token's K and V to
 /// `k_pool`/`v_pool` at the positions specified by `token_indices`.
 ///
-/// No norm or RoPE is applied — the downstream attention kernel (Triton prefill
-/// or FlashInfer) handles those internally.
+/// No norm or RoPE is applied; the downstream attention kernel handles those
+/// internally.
 ///
 /// # Arguments
 /// * `k_batch`, `v_batch` — contiguous GEMM outputs, shape `[seq_len, kv_dim]`

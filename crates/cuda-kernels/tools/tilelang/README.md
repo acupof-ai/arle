@@ -1,28 +1,26 @@
 # TileLang AOT Integration
 
 Build-time AOT for CUDA kernels generated from TileLang. The CUDA feature
-enables the TileLang paged-attention path through `tilelang-attn`; Qwen3.5
-chunk-wise GDR remains on the validated Triton AOT path until the TileLang GDR
-scaffold has a CUDA parity bench. See `docs/plans/tilelang-integration.md` and
+uses TileLang as the only AOT compiler surface for paged attention and Qwen3.5
+chunk-wise GDR. See `docs/plans/tilelang-integration.md` and
 `docs/plans/2026-05-05-cuda-kernel-tilelang-unification.md` for the full plan.
 
 ## What this covers
 
 - TileLang attention kernels: `batch_prefill_paged_hd128.py`,
-  `batch_prefill_paged_hd256.py`, and optional
+  `batch_prefill_paged_hd256.py`, and
   `batch_decode_paged_hd256.py`.
 - AOT-specialized per Qwen head config. Build emits one cubin + C wrapper per
   config; Rust dispatches by `(num_q_heads, num_kv_heads)`. Add a new size by
   extending the lockstep lists in the kernel module, `build.rs`,
   `ffi/attention.rs`, and `infer/src/ops/attention.rs`.
-- TileLang GDR scaffold: `gated_delta_rule.py` mirrors the seven Qwen3.5
-  chunk-wise stages, but `build.rs` does not link it into the runtime ABI yet.
-  Production GDR symbols are still generated from `tools/triton/`.
+- TileLang GDR scaffold: `gated_delta_rule.py` mirrors the Qwen3.5 chunk-wise
+  stages that TileLang 0.1.9 can lower on sm_89; the strict-lower triangular
+  solve symbol is native CUDA C in `csrc/misc/gdr_prefill_solve.cu`.
 - Build-time CUBIN generation under `OUT_DIR/tilelang_aot/<artifact>/`.
 - Generated C wrappers compiled into `libtilelang_kernels_aot.a` and
-  linked alongside the Triton AOT artifacts.
-- Compile-time dispatch: `cuda` enables `tilelang-attn` by default;
-  `tilelang-decode-hd256` opts into the experimental HD256 decode tranche.
+  linked with the native CUDA C kernels.
+- Compile-time dispatch: `cuda` enables the complete TileLang CUDA backend.
 
 ## Prerequisites
 
@@ -31,8 +29,7 @@ export CUDA_HOME=/usr/local/cuda
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 ```
 
-Bootstrap a repo-local TileLang Python (separate from the Triton venv —
-TileLang and Triton may want different Python envs):
+Bootstrap a repo-local TileLang Python:
 
 ```bash
 uv venv crates/cuda-kernels/tools/tilelang/.venv
@@ -80,18 +77,17 @@ For scripted server launches, set `INFER_FEATURES=cuda` before calling
 Artifacts land under `target/release/build/cuda-kernels-*/out/tilelang_aot/`.
 The generated C wrapper embeds the cubin bytes via `cuModuleLoadData`, so
 the produced binary is self-contained and survives `cargo clean` /
-relocation. Compare against the Triton AOT track which links the cubin
-through Triton's own runtime.
+relocation.
 
 ## Current status
 
 - TileLang version pinned during the H100 spike; see
   `docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md`.
-- Triton AOT remains the production owner for Qwen3.5 GDR. Removing it before
-  a GPU-validated TileLang swap leaves unresolved GDR symbols or silently
-  changes an unbenchmarked hot path.
-- TileLang GDR is kept as source-level scaffold only; the runtime ABI swap is
-  a separate Phase 2b change with e2e_qwen35 + guidellm gates.
+- TileLang paged prefill HD128/HD256, HD256 decode, and the AOT-compatible
+  Qwen3.5 GDR stages are linked under `--features cuda`.
+- The old external AOT and wrapper surfaces have been removed from the
+  CUDA runtime. New attention/GDR kernels should be added through
+  `tools/tilelang/` or native CUDA C only.
 
 ## macOS Metal dev checkout
 
@@ -119,7 +115,7 @@ kernels requires a separate runtime integration.
 
 ## Risk gates
 
-If `tilelang.compile(...)` cannot AOT-export for `sm_90`, or if the prefill
+If `tilelang.compile(...)` cannot AOT-export for a target SM, or if the prefill
 kernel cannot express paged-KV BatchPrefill in the version pinned, the
 generator exits non-zero and the build fails loudly. See
 `docs/plans/tilelang-integration.md` §5 for the recorded error path.

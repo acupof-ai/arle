@@ -35,7 +35,7 @@ DRY_RUN=false
 kernel_family_regex() {
     case "$1" in
         attention)
-            printf '%s\n' 'regex:(attention|flashinfer|fmha|paged_attention|decode_attention)'
+            printf '%s\n' 'regex:(attention|tilelang|fmha|paged_attention|decode_attention|nonpaged_prefill)'
             ;;
         sampling)
             printf '%s\n' 'regex:(sample|sampling|topk|top_p|temperature|argmax)'

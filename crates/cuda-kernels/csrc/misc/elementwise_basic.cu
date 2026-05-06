@@ -1,6 +1,5 @@
-// Native CUDA C replacements for trivial Triton AOT kernels.
+// Native CUDA C element-wise kernels.
 // These are pure element-wise / lookup ops — bandwidth-bound, no SM-specific tuning.
-// Replaces: silu_mul_kernel.py, basic_kernels.py (add, embedding_decode, embedding_batched)
 
 #include "common.cuh"
 #include <cuda.h>
@@ -10,7 +9,7 @@
 
 // ============================================================================
 // SiLU(gate) * up — element-wise, BF16 in, FP32 compute, BF16 out
-// Must compute sigmoid in FP32 to avoid precision loss (matches Triton version).
+// Must compute sigmoid in FP32 to avoid precision loss.
 // ============================================================================
 __global__ void silu_mul_native_kernel(
     const __nv_bfloat16 *__restrict__ gate,
@@ -26,8 +25,7 @@ __global__ void silu_mul_native_kernel(
   }
 }
 
-// Keep the same symbol name so existing FFI declarations work without changes.
-extern "C" CUresult silu_mul_triton_aot_cuda(
+extern "C" CUresult silu_mul_cuda(
     const uint16_t *gate, const uint16_t *up, uint16_t *out, int n,
     CUstream stream) {
   int grid = (n + BASIC_BLOCK - 1) / BASIC_BLOCK;

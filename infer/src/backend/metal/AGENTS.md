@@ -110,7 +110,7 @@ metal/request_state.rs + metal/request_state/  — `MetalRequestState` per-reque
 
 - **Metal is not "CUDA with different syntax".** This backend rides on
   MLX lazy graphs plus the `mlx-sys` C++ bridge; CUDA uses explicit
-  kernels (`cudarc` + FlashInfer + Triton AOT). Porting an optimization
+  kernels (`cudarc` + TileLang AOT + native CUDA C). Porting an optimization
   from CUDA to Metal verbatim is usually wrong.
 - **In Metal, `.item()` / `eval()` / `async_eval()` are scheduling
   boundaries.** A stray scalar materialization can turn an overlapped
@@ -124,7 +124,7 @@ metal/request_state.rs + metal/request_state/  — `MetalRequestState` per-reque
   resource count (`MTLBuffer` count) before resident memory looks scary.
   Many small temporaries can be worse than one large buffer. Reuse-first
   beats allocator-cache optimism.
-- **Batching strategy is different.** CUDA/FlashInfer already has a
+- **Batching strategy is different.** CUDA/TileLang already has a
   strong varlen story; Metal often needs explicit left-padding,
   additive masks, and per-row RoPE offsets to make packed decode
   correct. Same-length assumptions are not portable.

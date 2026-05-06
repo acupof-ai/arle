@@ -64,7 +64,7 @@ pub(crate) struct DecodeBuffers {
 }
 
 impl DecodeBuffers {
-    /// NUM_KV_SPLITS must match the Triton AOT compile-time constant.
+    /// NUM_KV_SPLITS must match the CUDA decode kernel compile-time constant.
     const NUM_KV_SPLITS: usize = 4;
 
     pub(crate) fn new(ctx: &DeviceContext, config: &Config) -> Result<Self> {

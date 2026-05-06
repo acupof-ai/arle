@@ -6,8 +6,6 @@ use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::{KVCache, KVFormat};
 use crate::ops;
 use cuda_kernels::TokenKVPool;
-#[cfg(not(feature = "tilelang-attn"))]
-use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
 use cuda_kernels::kv_quant;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -99,36 +97,12 @@ struct PendingPagedPrefill {
 }
 
 pub struct Qwen3PrefillContext {
-    #[cfg(not(feature = "tilelang-attn"))]
-    plan_capacity_rows: usize,
-    #[cfg(not(feature = "tilelang-attn"))]
-    plan: Option<BatchPrefillPagedPlan>,
     pending: Option<PendingPagedPrefill>,
 }
 
 impl Qwen3PrefillContext {
     pub(super) fn new() -> Self {
-        Self {
-            #[cfg(not(feature = "tilelang-attn"))]
-            plan_capacity_rows: 0,
-            #[cfg(not(feature = "tilelang-attn"))]
-            plan: None,
-            pending: None,
-        }
-    }
-
-    #[cfg(not(feature = "tilelang-attn"))]
-    fn plan_mut(
-        &mut self,
-        ctx: &DeviceContext,
-        required_rows: usize,
-        num_heads: usize,
-    ) -> Result<&mut BatchPrefillPagedPlan> {
-        if self.plan_capacity_rows < required_rows || self.plan.is_none() {
-            self.plan = Some(BatchPrefillPagedPlan::new(ctx, required_rows, num_heads)?);
-            self.plan_capacity_rows = required_rows;
-        }
-        Ok(self.plan.as_mut().expect("prefill plan initialized"))
+        Self { pending: None }
     }
 
     fn set_pending(&mut self, pending: PendingPagedPrefill) -> Result<()> {
@@ -388,50 +362,12 @@ impl Qwen3Model {
             .stream
             .clone_htod(&layout.prefill_token_rows)
             .map_err(|e| anyhow::anyhow!("prefill token rows H2D failed: {e}"))?;
-        #[cfg(not(feature = "tilelang-attn"))]
-        let mut fwd = {
-            let plan = prefill_ctx.plan_mut(
-                &self.ctx,
-                packed_tokens.len(),
-                self.config.num_attention_heads,
-            )?;
-            crate::ops::PagedPrefillForward::new_hd128(
-                &self.ctx,
-                plan,
-                &layout.sequences,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                pool.page_size,
-            )?
-        };
-        #[cfg(feature = "tilelang-attn")]
         let mut fwd = crate::ops::PagedPrefillForward::new_hd128(
             &self.ctx,
             &layout.sequences,
             pool.page_size,
         )?;
         let hidden = self.get_embeddings_batch(&packed_tokens)?;
-        #[cfg(not(feature = "tilelang-attn"))]
-        let hidden_result = {
-            let plan = prefill_ctx.plan_mut(
-                &self.ctx,
-                packed_tokens.len(),
-                self.config.num_attention_heads,
-            )?;
-            self.process_all_layers_batch_paged(
-                hidden,
-                &mut bufs,
-                pool,
-                &layout.sequences,
-                &page_indices_dev,
-                &prefix_token_rows_dev,
-                layout.prefix_token_rows.len(),
-                &prefill_token_rows_dev,
-                plan,
-                &mut fwd,
-            )
-        };
-        #[cfg(feature = "tilelang-attn")]
         let hidden_result = self.process_all_layers_batch_paged(
             hidden,
             &mut bufs,
@@ -498,7 +434,6 @@ impl Qwen3Model {
         prefix_token_rows: &CudaSlice<i32>,
         prefix_token_count: usize,
         prefill_token_rows: &CudaSlice<i32>,
-        #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
         fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
@@ -516,22 +451,6 @@ impl Qwen3Model {
         );
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            #[cfg(not(feature = "tilelang-attn"))]
-            self.forward_layer_batch_paged(
-                layer_idx,
-                layer,
-                &mut hidden,
-                bufs,
-                pool,
-                sequences,
-                page_indices,
-                prefix_token_rows,
-                prefix_token_count,
-                prefill_token_rows,
-                plan,
-                fwd,
-            )?;
-            #[cfg(feature = "tilelang-attn")]
             self.forward_layer_batch_paged(
                 layer_idx,
                 layer,
@@ -569,7 +488,6 @@ impl Qwen3Model {
         prefix_token_rows: &CudaSlice<i32>,
         prefix_token_count: usize,
         prefill_token_rows: &CudaSlice<i32>,
-        #[cfg(not(feature = "tilelang-attn"))] plan: &mut BatchPrefillPagedPlan,
         fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<()> {
         let num_heads = self.config.num_attention_heads;
@@ -623,7 +541,7 @@ impl Qwen3Model {
         }
 
         // 3. Paged-KV attention: QK norm + RoPE + paged K/V write (page-table
-        //    indirection) + FlashInfer BatchPrefillWithPagedKVCache.
+        //    indirection) + TileLang paged prefill.
         let nrp = ops::NormRopeParams {
             q_norm: &layer.attention.q_norm,
             k_norm: &layer.attention.k_norm,
@@ -651,20 +569,6 @@ impl Qwen3Model {
             num_kv_heads,
             head_dim,
         )?;
-        #[cfg(not(feature = "tilelang-attn"))]
-        ops::prefill_attention_paged_batch(
-            &self.ctx,
-            &mut bufs.q_batch,
-            &mut bufs.k_batch,
-            &bufs.v_batch,
-            &nrp,
-            &meta,
-            plan,
-            fwd,
-            &mut bufs.attn_output,
-            &heads,
-        )?;
-        #[cfg(feature = "tilelang-attn")]
         ops::prefill_attention_paged_batch(
             &self.ctx,
             &mut bufs.q_batch,
@@ -1022,7 +926,7 @@ impl Qwen3Model {
             bufs.v_batch.hidden_dim,
         );
 
-        // 3. FlashAttention-2 (Triton) → bufs.attn_output
+        // 3. Prefill attention -> bufs.attn_output
         let (k_cache_layer, v_cache_layer) = kv_cache.prepare_layer(&self.ctx, layer_idx)?;
         let nrp = ops::NormRopeParams {
             q_norm: &layer.attention.q_norm,

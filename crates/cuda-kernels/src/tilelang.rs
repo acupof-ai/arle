@@ -1,7 +1,7 @@
-//! FlashInfer decode metadata management.
+//! TileLang decode metadata management.
 //!
 //! Owns the GPU-side paged KV metadata buffers (positions, indptr, indices,
-//! last_page_len) and the FlashInfer workspace. Extracted from
+//! last_page_len). Extracted from
 //! `model::qwen3::batch_decode` so multiple model implementations can share it.
 
 use anyhow::{Result, ensure};
@@ -18,11 +18,11 @@ pub enum DecodeMetaUpdate {
     AppendedPages,
 }
 
-/// GPU-side metadata buffers for FlashInfer batched decode attention.
+/// GPU-side metadata buffers for TileLang batched paged attention.
 ///
-/// Manages positions, KV indptr/indices/last_page_len arrays, the FlashInfer
-/// workspace, and host-side scratch buffers for incremental index updates.
-pub struct FlashInferDecodeMetadata {
+/// Manages positions, KV indptr/indices/last_page_len arrays and host-side
+/// scratch buffers for incremental index updates.
+pub struct TileLangDecodeMetadata {
     pub positions: CudaSlice<i32>,
     pub kv_indices: CudaSlice<i32>,
     pub kv_indptr: CudaSlice<i32>,
@@ -36,7 +36,7 @@ pub struct FlashInferDecodeMetadata {
     /// Mixed decode+prefill steps append packed varlen prefill rows in request
     /// order, e.g. `[0, 1, 2, 2 + len(prefill_0), ...]`.
     pub qo_indptr: CudaSlice<i32>,
-    pub flashinfer_ws: FlashInferWorkspace,
+    pub tilelang_ws: TileLangWorkspace,
     pub max_total_pages: usize,
     /// Scratch buffer for building positions on the host side.
     positions_scratch: Vec<i32>,
@@ -71,60 +71,13 @@ pub struct FlashInferDecodeMetadata {
     fast_page16_metadata: bool,
 }
 
-/// Workspace buffers for FlashInfer batch decode, allocated once and reused.
-///
-/// FlashInfer's plan/run API needs:
-/// - `float_workspace`: ~128MB GPU buffer for split-KV temp storage
-/// - `int_workspace`: ~8MB GPU buffer for plan metadata
-/// - `page_locked_workspace`: ~8MB CPU pinned buffer for plan H2D copy
-/// - `plan_info`: ~256 bytes opaque buffer for plan output
-pub struct FlashInferWorkspace {
-    /// GPU scratch for split-KV temporaries (~128MB)
-    pub float_workspace: CudaSlice<u8>,
-    pub float_workspace_bytes: usize,
-    /// GPU scratch for plan metadata (~8MB)
-    pub int_workspace: CudaSlice<u8>,
-    pub int_workspace_bytes: usize,
-    /// CPU pinned buffer for plan H2D copy (~8MB)
-    page_locked_workspace: *mut u8,
-    #[allow(dead_code)]
-    page_locked_workspace_bytes: usize,
-    /// Opaque plan info buffer (256 bytes, HOST pinned — used by CPU memcpy in FlashInfer)
-    pub plan_info: *mut u8,
-    /// LSE output buffer (log-sum-exp), nullable but we allocate for max batch
-    pub lse: CudaSlice<f32>,
-}
+/// Zero-sized compatibility object for call sites that still pass a workspace
+/// handle. TileLang attention is plan-less and does not allocate per-plan GPU
+/// scratch here; the real buffers live in the TileLang AOT kernels and regular
+/// model scratch.
+pub struct TileLangWorkspace;
 
-// SAFETY: The page_locked_workspace is a pinned CPU allocation that is only accessed
-// from the single inference thread (same thread that calls plan/run). No concurrent access.
-unsafe impl Send for FlashInferWorkspace {}
-
-fn alloc_host_buffer(bytes: usize, label: &str) -> Result<*mut u8> {
-    unsafe {
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let err = cudarc::driver::sys::cuMemAllocHost_v2(
-            &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
-            bytes,
-        );
-        if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(anyhow::anyhow!(
-                "cuMemAllocHost failed for {label}: {:?}",
-                err
-            ));
-        }
-        std::ptr::write_bytes(ptr, 0, bytes);
-        Ok(ptr)
-    }
-}
-
-fn free_host_buffer(ptr: &mut *mut u8) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = cudarc::driver::sys::cuMemFreeHost((*ptr).cast::<std::ffi::c_void>());
-        }
-        *ptr = std::ptr::null_mut();
-    }
-}
+unsafe impl Send for TileLangWorkspace {}
 
 fn decode_metadata_fast_page16_enabled() -> bool {
     matches!(
@@ -133,386 +86,20 @@ fn decode_metadata_fast_page16_enabled() -> bool {
     )
 }
 
-pub struct PlanBuf {
-    plan_info: *mut u8,
-}
+impl TileLangWorkspace {
+    pub const DEFAULT_FLOAT_WORKSPACE_BYTES: usize = 0;
+    pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 0;
 
-// SAFETY: plan_info is pinned host memory used from the same inference thread.
-unsafe impl Send for PlanBuf {}
-
-impl PlanBuf {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            plan_info: alloc_host_buffer(
-                FlashInferWorkspace::PLAN_INFO_BYTES,
-                "paged_prefill plan_info",
-            )?,
-        })
-    }
-
-    fn as_ptr(&self) -> *mut u8 {
-        self.plan_info
-    }
-}
-
-impl Drop for PlanBuf {
-    fn drop(&mut self) {
-        free_host_buffer(&mut self.plan_info);
-    }
-}
-
-pub struct BatchPrefillPagedPlan {
-    workspace: FlashInferWorkspace,
-    pub hd128: PlanBuf,
-    pub hd256: PlanBuf,
-}
-
-impl BatchPrefillPagedPlan {
-    /// HD128 paged prefill plan. Uses the default 256 MiB float workspace —
-    /// sufficient now that `enable_cuda_graph=false` keeps FlashInfer's
-    /// `padded_batch_size` at ~`total_num_tiles_q` (no graph-capture pad).
-    /// See `flashinfer_prefill_paged.cu` for the sizing rationale.
-    pub fn new(ctx: &DeviceContext, max_total_qo_rows: usize, num_qo_heads: usize) -> Result<Self> {
-        Ok(Self {
-            workspace: FlashInferWorkspace::new(ctx, max_total_qo_rows, num_qo_heads)?,
-            hd128: PlanBuf::new()?,
-            hd256: PlanBuf::new()?,
-        })
-    }
-
-    /// HD256 paged prefill plan — 4096-row split-KV needs 512 MiB float
-    /// workspace on Ampere. Used by Qwen3.5's full-attn layers.
-    pub fn new_hd256(
-        ctx: &DeviceContext,
-        max_total_qo_rows: usize,
-        num_qo_heads: usize,
-    ) -> Result<Self> {
-        Ok(Self {
-            workspace: FlashInferWorkspace::new_with_float_bytes(
-                ctx,
-                max_total_qo_rows,
-                num_qo_heads,
-                FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
-            )?,
-            hd128: PlanBuf::new()?,
-            hd256: PlanBuf::new()?,
-        })
-    }
-
-    fn plan_impl(
-        &mut self,
-        ctx: &DeviceContext,
-        plan_info: *mut u8,
-        qo_indptr: &[i32],
-        kv_indptr: &[i32],
-        batch_size: usize,
-        num_qo_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-        head_dim: usize,
-        plan_fn: unsafe extern "C" fn(
-            *mut u8,
-            usize,
-            *mut u8,
-            *mut u8,
-            usize,
-            *const i32,
-            *const i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            *mut u8,
-            cudarc::driver::sys::CUstream,
-        ) -> i32,
-        plan_name: &str,
-    ) -> Result<()> {
-        ensure!(
-            qo_indptr.len() == batch_size + 1,
-            "{plan_name}: qo_indptr len {} does not match batch_size {}",
-            qo_indptr.len(),
-            batch_size
-        );
-        ensure!(
-            kv_indptr.len() == batch_size + 1,
-            "{plan_name}: kv_indptr len {} does not match batch_size {}",
-            kv_indptr.len(),
-            batch_size
-        );
-        ensure!(qo_indptr[0] == 0, "{plan_name}: qo_indptr must start at 0");
-        ensure!(kv_indptr[0] == 0, "{plan_name}: kv_indptr must start at 0");
-
-        let (fw_ptr, _gfw) = self.workspace.float_workspace.device_ptr_mut(&ctx.stream);
-        let (iw_ptr, _giw) = self.workspace.int_workspace.device_ptr_mut(&ctx.stream);
-        let ret = unsafe {
-            plan_fn(
-                fw_ptr as *mut u8,
-                self.workspace.float_workspace_bytes,
-                iw_ptr as *mut u8,
-                self.workspace.page_locked_workspace,
-                self.workspace.int_workspace_bytes,
-                qo_indptr.as_ptr(),
-                kv_indptr.as_ptr(),
-                batch_size as i32,
-                num_qo_heads as i32,
-                num_kv_heads as i32,
-                page_size as i32,
-                head_dim as i32,
-                plan_info,
-                ctx.stream.cu_stream(),
-            )
-        };
-        if ret != 0 {
-            return Err(anyhow::anyhow!("{plan_name} failed with CUDA error {ret}"));
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_impl(
-        &mut self,
-        ctx: &DeviceContext,
-        plan_info: *mut u8,
-        q_ptr: u64,
-        q_indptr_ptr: u64,
-        k_data_ptr: u64,
-        v_data_ptr: u64,
-        kv_indptr_ptr: u64,
-        kv_indices_ptr: u64,
-        kv_last_page_len_ptr: u64,
-        output_ptr: u64,
-        lse_ptr: Option<u64>,
-        batch_size: usize,
-        num_qo_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-        head_dim: usize,
-        run_fn: unsafe extern "C" fn(
-            *mut u8,
-            *mut u8,
-            *const u8,
-            *mut ffi::Half,
-            *const i32,
-            *mut ffi::Half,
-            *mut ffi::Half,
-            *const i32,
-            *const i32,
-            *const i32,
-            *mut ffi::Half,
-            *mut f32,
-            i32,
-            i32,
-            i32,
-            i32,
-            f32,
-            cudarc::driver::sys::CUstream,
-        ) -> i32,
-        run_name: &str,
-    ) -> Result<()> {
-        let (fw_ptr, _gfw) = self.workspace.float_workspace.device_ptr_mut(&ctx.stream);
-        let (iw_ptr, _giw) = self.workspace.int_workspace.device_ptr_mut(&ctx.stream);
-        let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-        let ret = unsafe {
-            run_fn(
-                fw_ptr as *mut u8,
-                iw_ptr as *mut u8,
-                plan_info.cast_const(),
-                q_ptr as *mut ffi::Half,
-                q_indptr_ptr as *const i32,
-                k_data_ptr as *mut ffi::Half,
-                v_data_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                kv_last_page_len_ptr as *const i32,
-                output_ptr as *mut ffi::Half,
-                lse_ptr.map_or(std::ptr::null_mut(), |ptr| ptr as *mut f32),
-                batch_size as i32,
-                num_qo_heads as i32,
-                num_kv_heads as i32,
-                page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-        };
-        if ret != 0 {
-            return Err(anyhow::anyhow!("{run_name} failed with CUDA error {ret}"));
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn plan_hd128(
-        &mut self,
-        ctx: &DeviceContext,
-        qo_indptr: &[i32],
-        kv_indptr: &[i32],
-        batch_size: usize,
-        num_qo_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-    ) -> Result<()> {
-        let plan_info = self.hd128.as_ptr();
-        self.plan_impl(
-            ctx,
-            plan_info,
-            qo_indptr,
-            kv_indptr,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            128,
-            ffi::flashinfer_batch_prefill_paged_hd128_plan,
-            "flashinfer_batch_prefill_paged_hd128_plan",
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn plan_hd256(
-        &mut self,
-        ctx: &DeviceContext,
-        qo_indptr: &[i32],
-        kv_indptr: &[i32],
-        batch_size: usize,
-        num_qo_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-    ) -> Result<()> {
-        let plan_info = self.hd256.as_ptr();
-        self.plan_impl(
-            ctx,
-            plan_info,
-            qo_indptr,
-            kv_indptr,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            256,
-            ffi::flashinfer_batch_prefill_paged_hd256_plan,
-            "flashinfer_batch_prefill_paged_hd256_plan",
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_hd128(
-        &mut self,
-        ctx: &DeviceContext,
-        q_ptr: u64,
-        q_indptr_ptr: u64,
-        k_data_ptr: u64,
-        v_data_ptr: u64,
-        kv_indptr_ptr: u64,
-        kv_indices_ptr: u64,
-        kv_last_page_len_ptr: u64,
-        output_ptr: u64,
-        lse_ptr: Option<u64>,
-        batch_size: usize,
-        num_qo_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-    ) -> Result<()> {
-        let plan_info = self.hd128.as_ptr();
-        self.run_impl(
-            ctx,
-            plan_info,
-            q_ptr,
-            q_indptr_ptr,
-            k_data_ptr,
-            v_data_ptr,
-            kv_indptr_ptr,
-            kv_indices_ptr,
-            kv_last_page_len_ptr,
-            output_ptr,
-            lse_ptr,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            128,
-            ffi::flashinfer_batch_prefill_paged_hd128_run,
-            "flashinfer_batch_prefill_paged_hd128_run",
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_hd256(
-        &mut self,
-        ctx: &DeviceContext,
-        q_ptr: u64,
-        q_indptr_ptr: u64,
-        k_data_ptr: u64,
-        v_data_ptr: u64,
-        kv_indptr_ptr: u64,
-        kv_indices_ptr: u64,
-        kv_last_page_len_ptr: u64,
-        output_ptr: u64,
-        lse_ptr: Option<u64>,
-        batch_size: usize,
-        num_qo_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-    ) -> Result<()> {
-        let plan_info = self.hd256.as_ptr();
-        self.run_impl(
-            ctx,
-            plan_info,
-            q_ptr,
-            q_indptr_ptr,
-            k_data_ptr,
-            v_data_ptr,
-            kv_indptr_ptr,
-            kv_indices_ptr,
-            kv_last_page_len_ptr,
-            output_ptr,
-            lse_ptr,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            256,
-            ffi::flashinfer_batch_prefill_paged_hd256_run,
-            "flashinfer_batch_prefill_paged_hd256_run",
-        )
-    }
-}
-
-impl FlashInferWorkspace {
-    /// Default float workspace. Sized for HD128 prefill/decode on L4 — the
-    /// size we originally shipped. HD256 paged prefill split-KV on c16 /
-    /// 4096-token mixed chunks can exceed 512 MiB on Ampere
-    /// (`batch_prefill_tmp_v` alone reached ~518 MiB in the 2026-04-21 trace),
-    /// so the HD256 callers keep a larger dedicated workspace.
-    pub const DEFAULT_FLOAT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
-    pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 640 * 1024 * 1024; // 640 MiB
-    pub const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
-    const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
-    const PLAN_INFO_BYTES: usize = 256;
-
-    /// Allocate FlashInfer workspace buffers with the default 256 MiB float
-    /// workspace. Use `new_with_float_bytes` for HD256 paths.
-    pub fn new(ctx: &DeviceContext, max_batch_size: usize, num_qo_heads: usize) -> Result<Self> {
-        Self::new_with_float_bytes(
-            ctx,
-            max_batch_size,
-            num_qo_heads,
-            Self::DEFAULT_FLOAT_WORKSPACE_BYTES,
-        )
+    pub fn new(_ctx: &DeviceContext, _max_batch_size: usize, _num_qo_heads: usize) -> Result<Self> {
+        Ok(Self)
     }
 
     pub fn device_bytes(
-        max_batch_size: usize,
-        num_qo_heads: usize,
-        float_workspace_bytes: usize,
+        _max_batch_size: usize,
+        _num_qo_heads: usize,
+        _float_workspace_bytes: usize,
     ) -> usize {
-        float_workspace_bytes
-            .saturating_add(Self::INT_WORKSPACE_BYTES)
-            .saturating_add(
-                max_batch_size
-                    .saturating_mul(num_qo_heads)
-                    .saturating_mul(std::mem::size_of::<f32>()),
-            )
+        0
     }
 
     pub fn default_device_bytes(max_batch_size: usize, num_qo_heads: usize) -> usize {
@@ -523,185 +110,17 @@ impl FlashInferWorkspace {
         )
     }
 
-    /// Allocate FlashInfer workspace buffers with a caller-chosen float
-    /// workspace size. HD256 paged prefill needs 512 MiB; HD128 callers can
-    /// stay on `DEFAULT_FLOAT_WORKSPACE_BYTES`.
     pub fn new_with_float_bytes(
-        ctx: &DeviceContext,
-        max_batch_size: usize,
-        num_qo_heads: usize,
-        float_workspace_bytes: usize,
+        _ctx: &DeviceContext,
+        _max_batch_size: usize,
+        _num_qo_heads: usize,
+        _float_workspace_bytes: usize,
     ) -> Result<Self> {
-        let float_workspace: CudaSlice<u8> = ctx
-            .stream
-            .alloc_zeros(float_workspace_bytes)
-            .map_err(|e| anyhow::anyhow!("FlashInfer float_workspace alloc failed: {e}"))?;
-
-        let int_workspace: CudaSlice<u8> = ctx
-            .stream
-            .alloc_zeros(Self::INT_WORKSPACE_BYTES)
-            .map_err(|e| anyhow::anyhow!("FlashInfer int_workspace alloc failed: {e}"))?;
-
-        let plan_info = alloc_host_buffer(Self::PLAN_INFO_BYTES, "plan_info")?;
-
-        let lse: CudaSlice<f32> = ctx
-            .stream
-            .alloc_zeros(max_batch_size * num_qo_heads)
-            .map_err(|e| anyhow::anyhow!("FlashInfer lse alloc failed: {e}"))?;
-
-        let page_locked_workspace =
-            alloc_host_buffer(Self::PAGE_LOCKED_WORKSPACE_BYTES, "page_locked_workspace")?;
-
-        Ok(Self {
-            float_workspace,
-            float_workspace_bytes,
-            int_workspace,
-            int_workspace_bytes: Self::INT_WORKSPACE_BYTES,
-            page_locked_workspace,
-            page_locked_workspace_bytes: Self::PAGE_LOCKED_WORKSPACE_BYTES,
-            plan_info,
-            lse,
-        })
+        Ok(Self)
     }
 }
 
-impl Drop for FlashInferWorkspace {
-    fn drop(&mut self) {
-        free_host_buffer(&mut self.page_locked_workspace);
-        free_host_buffer(&mut self.plan_info);
-    }
-}
-
-/// FlashInfer plan step only (CPU-side scheduling). Call once per decode step,
-/// not per layer — the plan result works for all layers since KV layout is the same.
-#[allow(clippy::too_many_arguments)]
-pub fn flashinfer_plan(
-    ctx: &DeviceContext,
-    indptr_h: &[i32],
-    workspace: &mut FlashInferWorkspace,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_batch_decode_plan(
-            fw_ptr as *mut u8,
-            workspace.float_workspace_bytes,
-            iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
-            workspace.int_workspace_bytes,
-            indptr_h.as_ptr(),
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
-            workspace.plan_info,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow::anyhow!(
-            "flashinfer_batch_decode_plan failed with CUDA error {}",
-            ret
-        ));
-    }
-    Ok(())
-}
-
-/// FlashInfer tensor-core decode plan (uses prefill kernel for flat ITL).
-///
-/// Uses `PrefillPlan` instead of `DecodePlan`. For decode, each request has
-/// `qo_len=1`, so `qo_indptr = [0, 1, 2, ..., B]`.
-#[allow(clippy::too_many_arguments)]
-pub fn flashinfer_tc_plan(
-    ctx: &DeviceContext,
-    qo_indptr_h: &[i32],
-    kv_indptr_h: &[i32],
-    workspace: &mut FlashInferWorkspace,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_tc_decode_plan(
-            fw_ptr as *mut u8,
-            workspace.float_workspace_bytes,
-            iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
-            workspace.int_workspace_bytes,
-            qo_indptr_h.as_ptr(),
-            kv_indptr_h.as_ptr(),
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
-            workspace.plan_info,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow::anyhow!(
-            "flashinfer_tc_decode_plan failed with CUDA error {}",
-            ret
-        ));
-    }
-    Ok(())
-}
-
-/// FlashInfer HD256 decode plan (Qwen3.5 full attention).
-#[allow(clippy::too_many_arguments)]
-pub fn flashinfer_plan_hd256(
-    ctx: &DeviceContext,
-    indptr_h: &[i32],
-    workspace: &mut FlashInferWorkspace,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_batch_decode_hd256_plan(
-            fw_ptr as *mut u8,
-            workspace.float_workspace_bytes,
-            iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
-            workspace.int_workspace_bytes,
-            indptr_h.as_ptr(),
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
-            workspace.plan_info,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow::anyhow!(
-            "flashinfer_batch_decode_hd256_plan failed with CUDA error {}",
-            ret
-        ));
-    }
-    Ok(())
-}
-
-impl FlashInferDecodeMetadata {
+impl TileLangDecodeMetadata {
     /// Allocate metadata buffers for up to `max_batch_size` requests.
     /// `max_total_pages` should be large enough for the worst-case total KV pages.
     pub fn new(
@@ -715,7 +134,7 @@ impl FlashInferDecodeMetadata {
             max_batch_size,
             max_total_pages,
             num_qheads,
-            FlashInferWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
+            TileLangWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
         )
     }
 
@@ -724,7 +143,7 @@ impl FlashInferDecodeMetadata {
             max_batch_size,
             max_total_pages,
             num_qheads,
-            FlashInferWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
+            TileLangWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
         )
     }
 
@@ -735,7 +154,7 @@ impl FlashInferDecodeMetadata {
         float_workspace_bytes: usize,
     ) -> usize {
         let i32_bytes = std::mem::size_of::<i32>();
-        FlashInferWorkspace::device_bytes(max_batch_size, num_qheads, float_workspace_bytes)
+        TileLangWorkspace::device_bytes(max_batch_size, num_qheads, float_workspace_bytes)
             .saturating_add(max_batch_size.saturating_mul(i32_bytes)) // positions
             .saturating_add(max_total_pages.max(1).saturating_mul(i32_bytes)) // kv_indices
             .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // kv_indptr
@@ -789,7 +208,7 @@ impl FlashInferDecodeMetadata {
                 .alloc_zeros(max_batch_size.max(1))
                 .map_err(|e| anyhow::anyhow!("Alloc appended_page_indices failed: {e}"))?,
             qo_indptr,
-            flashinfer_ws: FlashInferWorkspace::new_with_float_bytes(
+            tilelang_ws: TileLangWorkspace::new_with_float_bytes(
                 ctx,
                 max_batch_size,
                 num_qheads,
@@ -980,7 +399,7 @@ impl FlashInferDecodeMetadata {
                     let (indptr_ptr, _gindptr) = self.kv_indptr.device_ptr(&ctx.stream);
                     let (last_ptr, _glast) = self.last_token_indices.device_ptr(&ctx.stream);
                     unsafe {
-                        ffi::flashinfer_append_last_token_indices_cuda(
+                        ffi::paged_kv_append_last_token_indices_cuda(
                             indices_ptr as *mut i32,
                             indptr_ptr as *const i32,
                             last_ptr as *const i32,
@@ -1218,14 +637,8 @@ impl FlashInferDecodeMetadata {
         Ok(reallocated)
     }
 
-    /// Call FlashInfer's plan step (CPU-side scheduling).
-    ///
-    /// Must be called once per decode step after `update()`, before any layer
-    /// runs. The plan result works for all layers since KV layout is the same.
-    ///
-    /// Skips re-planning when batch composition is unchanged (steady-state decode),
-    /// since the work partitioning across CUDA blocks is stable when only KV lengths
-    /// grow by 1 each step.
+    /// TileLang attention is plan-less. This method is retained as a no-op
+    /// while shared decode orchestration still calls a backend planning hook.
     #[allow(clippy::too_many_arguments)]
     pub fn plan(
         &mut self,
@@ -1236,25 +649,13 @@ impl FlashInferDecodeMetadata {
         page_size: usize,
         head_dim: usize,
     ) -> Result<()> {
-        if !self.plan_dirty && self.plan_batch_size == batch_size {
-            return Ok(());
-        }
-        flashinfer_plan(
-            ctx,
-            &self.indptr_h,
-            &mut self.flashinfer_ws,
-            batch_size,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        let _ = (ctx, num_heads, num_kv_heads, page_size, head_dim);
         self.plan_batch_size = batch_size;
         self.plan_dirty = false;
         Ok(())
     }
 
-    /// HD256 decode plan (Qwen3.5 full attention, head_dim=256).
+    /// TileLang HD256 decode is plan-less.
     #[allow(clippy::too_many_arguments)]
     pub fn plan_hd256(
         &mut self,
@@ -1265,28 +666,13 @@ impl FlashInferDecodeMetadata {
         page_size: usize,
         head_dim: usize,
     ) -> Result<()> {
-        if !self.plan_dirty && self.plan_batch_size == batch_size {
-            return Ok(());
-        }
-        flashinfer_plan_hd256(
-            ctx,
-            &self.indptr_h,
-            &mut self.flashinfer_ws,
-            batch_size,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        let _ = (ctx, num_heads, num_kv_heads, page_size, head_dim);
         self.plan_batch_size = batch_size;
         self.plan_dirty = false;
         Ok(())
     }
 
-    /// Tensor-core decode plan (uses PrefillPlan for flat ITL at long contexts).
-    ///
-    /// For GQA group_size >= 4, this provides better performance than the standard
-    /// decode kernel by tiling across KV chunks with tensor cores.
+    /// TileLang TC decode is plan-less.
     #[allow(clippy::too_many_arguments)]
     pub fn tc_plan(
         &mut self,
@@ -1297,19 +683,7 @@ impl FlashInferDecodeMetadata {
         page_size: usize,
         head_dim: usize,
     ) -> Result<()> {
-        // TC decode always re-plans (PrefillPlan depends on KV lengths for split-KV).
-        let qo_indptr = &self.qo_indptr_h[..batch_size + 1];
-        flashinfer_tc_plan(
-            ctx,
-            qo_indptr,
-            &self.indptr_h,
-            &mut self.flashinfer_ws,
-            batch_size,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        let _ = (ctx, num_heads, num_kv_heads, page_size, head_dim);
         self.plan_batch_size = batch_size;
         self.plan_dirty = false;
         Ok(())
@@ -1529,7 +903,7 @@ fn append_new_page_indices_kernel(
     let (append_indptr_ptr, _gappend) = append_indptr.device_ptr(&ctx.stream);
     let (appended_ptr, _gappended) = appended_page_indices.device_ptr(&ctx.stream);
     unsafe {
-        ffi::flashinfer_append_new_page_indices_cuda(
+        ffi::paged_kv_append_new_page_indices_cuda(
             indices_ptr as *mut i32,
             prev_indptr_ptr as *const i32,
             next_indptr_ptr as *const i32,

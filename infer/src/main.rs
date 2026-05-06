@@ -162,7 +162,7 @@ struct Args {
 
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom for activations, CUDA graphs,
-    /// FlashInfer workspace, and OS. Default 0.85 matches SGLang's
+    /// TileLang/native CUDA workspaces, and OS. Default 0.85 matches SGLang's
     /// `mem_fraction_static` default in `server_args.py`. K3 follow-up
     /// 2026-04-29 — bumped from 0.88 → 0.85 so the workspace estimate at
     /// the new `max_prefill_tokens=16384` default fits headroom without

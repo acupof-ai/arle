@@ -158,7 +158,7 @@ fn test_e2e_generation() {
         }
 
         // Non-degeneracy gate (replaces byte-exact HF match, K5 2026-04-29):
-        // FlashInfer/TileLang attention drifts numerically from HF reference
+        // CUDA attention drifts numerically from HF reference
         // after ~5-15 tokens, so a strict equality check fails even when
         // output is correct. The useful signal is "model produces real
         // text" — catches the token-0 / NaN regression (F2: "!!!!!" forever)

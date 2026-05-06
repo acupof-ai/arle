@@ -7,7 +7,7 @@
 //! 1. **Stable consumer surface.** Model code says
 //!    `use cuda_kernels::prelude::{DeviceContext, DeviceVec, …};`
 //!    instead of three separate `use cuda_kernels::{tensor::…,
-//!    paged_kv::…, flashinfer::…}` lines. The consumer's import block is
+//!    paged_kv::…, tilelang::…}` lines. The consumer's import block is
 //!    insulated from the underlying module layout.
 //!
 //! 2. **Proto-API for the eventual `cuda-kernels` crate extraction.**
@@ -53,6 +53,6 @@
 //! - Any model-specific state (`Qwen3Model`, etc.) — those are application
 //!   types and stay inside `infer::model::*`.
 
-pub use super::flashinfer::FlashInferDecodeMetadata;
 pub use super::paged_kv::PagedKVPool;
 pub use super::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, RawDevicePtr};
+pub use super::tilelang::TileLangDecodeMetadata;

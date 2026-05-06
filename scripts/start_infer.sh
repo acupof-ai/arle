@@ -31,9 +31,8 @@ echo ""
 
 cd "$(dirname "$0")/../infer"
 
-# `infer` has no default backend; the caller picks one. `cuda` now implies
-# `tilelang-attn` (TileLang prefill HD128 is the new default; see
-# docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md).
+# `infer` has no default backend; the caller picks one. `cuda` uses TileLang
+# AOT plus native CUDA C kernels.
 INFER_FEATURES="${INFER_FEATURES:-cuda}"
 
 cargo run --release \

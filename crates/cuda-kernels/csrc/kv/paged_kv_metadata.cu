@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-__global__ void flashinfer_append_last_token_indices_kernel(
+__global__ void paged_kv_append_last_token_indices_kernel(
     int32_t* __restrict__ kv_indices,
     const int32_t* __restrict__ kv_indptr,
     const int32_t* __restrict__ last_token_indices,
@@ -24,7 +24,7 @@ __global__ void flashinfer_append_last_token_indices_kernel(
     }
 }
 
-__global__ void flashinfer_append_new_page_indices_kernel(
+__global__ void paged_kv_append_new_page_indices_kernel(
     int32_t* __restrict__ kv_indices,
     const int32_t* __restrict__ prev_kv_indptr,
     const int32_t* __restrict__ next_kv_indptr,
@@ -55,7 +55,7 @@ __global__ void flashinfer_append_new_page_indices_kernel(
 
 extern "C" {
 
-cudaError_t flashinfer_append_last_token_indices_cuda(
+cudaError_t paged_kv_append_last_token_indices_cuda(
     int32_t* kv_indices,
     const int32_t* kv_indptr,
     const int32_t* last_token_indices,
@@ -64,13 +64,13 @@ cudaError_t flashinfer_append_last_token_indices_cuda(
 {
     if (batch_size <= 0) return cudaSuccess;
 
-    flashinfer_append_last_token_indices_kernel<<<1, 1, 0, stream>>>(
+    paged_kv_append_last_token_indices_kernel<<<1, 1, 0, stream>>>(
         kv_indices, kv_indptr, last_token_indices, batch_size
     );
     return cudaGetLastError();
 }
 
-cudaError_t flashinfer_append_new_page_indices_cuda(
+cudaError_t paged_kv_append_new_page_indices_cuda(
     int32_t* kv_indices,
     const int32_t* prev_kv_indptr,
     const int32_t* next_kv_indptr,
@@ -81,7 +81,7 @@ cudaError_t flashinfer_append_new_page_indices_cuda(
 {
     if (batch_size <= 0) return cudaSuccess;
 
-    flashinfer_append_new_page_indices_kernel<<<1, 1, 0, stream>>>(
+    paged_kv_append_new_page_indices_kernel<<<1, 1, 0, stream>>>(
         kv_indices,
         prev_kv_indptr,
         next_kv_indptr,

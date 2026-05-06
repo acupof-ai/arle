@@ -2,8 +2,6 @@ pub mod collective;
 #[cfg(feature = "cuda")]
 pub mod ffi;
 #[cfg(feature = "cuda")]
-pub mod flashinfer;
-#[cfg(feature = "cuda")]
 pub mod kv_quant;
 #[cfg(feature = "cuda")]
 pub mod kv_turboquant;
@@ -14,6 +12,8 @@ pub mod paged_kv;
 pub mod prelude;
 #[cfg(feature = "cuda")]
 pub mod tensor;
+#[cfg(feature = "cuda")]
+pub mod tilelang;
 #[cfg(feature = "cuda")]
 pub mod turboquant_state;
 

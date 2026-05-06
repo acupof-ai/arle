@@ -13,9 +13,9 @@ Runtime-facing control plane:
 
 Backend bridges and kernel layer:
 
-- `cuda-kernels`: extracted CUDA kernel layer (CUDA C / Triton sources, Rust
+- `cuda-kernels`: extracted CUDA kernel layer (CUDA C / TileLang sources, Rust
   FFI, `DeviceContext` / `DeviceVec` / `HiddenStates`, `PagedKVPool` /
-  `FlashInferDecodeMetadata`, `graph_pool`). Extracted 2026-04-15 by commit
+  `TileLangDecodeMetadata`, `graph_pool`). Extracted 2026-04-15 by commit
   `a4e12f5`; the dependency edge is one-way: `infer → cuda-kernels`, never
   the reverse. See [`cuda-kernels/AGENTS.md`](cuda-kernels/AGENTS.md) and
   [`../docs/plans/cuda-kernel-crate-extraction.md`](../docs/plans/cuda-kernel-crate-extraction.md)

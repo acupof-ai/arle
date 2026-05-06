@@ -283,7 +283,7 @@ impl ModelForward for Qwen35Model {
                     .saturating_mul(u64_bytes),
             )
             .saturating_add(
-                cuda_kernels::flashinfer::FlashInferDecodeMetadata::device_bytes(
+                cuda_kernels::tilelang::TileLangDecodeMetadata::device_bytes(
                     max_batch_size,
                     metadata_max_pages,
                     c.num_attention_heads,
@@ -347,10 +347,10 @@ impl ModelForward for Qwen35Model {
                     .saturating_mul(i32_bytes),
             )
             .saturating_add(max_batch_size.saturating_mul(2).saturating_mul(i32_bytes));
-        let prefill_plan = cuda_kernels::flashinfer::FlashInferWorkspace::device_bytes(
+        let prefill_plan = cuda_kernels::tilelang::TileLangWorkspace::device_bytes(
             prefill_tokens.max(4096),
             c.num_attention_heads,
-            cuda_kernels::flashinfer::FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
+            cuda_kernels::tilelang::TileLangWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
         );
         let prefill_workspace = prefill_core
             .saturating_add(gdr_scratch)

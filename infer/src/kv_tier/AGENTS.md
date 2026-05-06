@@ -73,7 +73,7 @@ kv_tier/coordinator.rs + kv_tier/coordinator/  — Coordinator entry surface plu
    and §8 pitfall 2.
 4. **No `#[cfg(feature = "cuda")]` in this module.** The skeleton is
    always-on so `cargo check --features no-cuda` and `--features metal`
-   both validate it. CUDA types (cudarc handles, FlashInfer metadata) live
+   both validate it. CUDA types (cudarc handles, TileLang metadata) live
    in `backend/cuda/` and `crates/cuda-kernels/`.
 5. **Coordinator locking.** `RadixCache` is scheduler-thread-owned today.
    It will grow a reader lock only when the M3 coordinator thread starts

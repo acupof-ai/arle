@@ -433,7 +433,7 @@ pub fn fused_mlp_into(
             let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
             let (up_ptr, _gu) = up_out.data.device_ptr(&ctx.stream);
             unsafe {
-                ffi::silu_mul_triton_aot_cuda(
+                ffi::silu_mul_cuda(
                     act_ptr as *const ffi::Half,
                     up_ptr as *const ffi::Half,
                     act_ptr as *mut ffi::Half,
@@ -524,7 +524,7 @@ pub fn mlp_decode_with_lora_into(
         let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
         let (up_ptr, _gu) = up_scratch.data.device_ptr(&ctx.stream);
         unsafe {
-            ffi::silu_mul_triton_aot_cuda(
+            ffi::silu_mul_cuda(
                 act_ptr as *const ffi::Half,
                 up_ptr as *const ffi::Half,
                 act_ptr as *mut ffi::Half,

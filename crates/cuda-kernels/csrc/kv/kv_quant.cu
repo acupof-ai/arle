@@ -330,7 +330,7 @@ cudaError_t quantize_scatter_kv_fp8_range_cuda(
 //
 // The quantized decode kernels read durable FP8 as NHD token rows:
 //   [page, token, head, dim].
-// TileLang/FlashInfer paged prefill reads BF16 work as HND pages:
+// TileLang paged prefill reads BF16 work as HND pages:
 //   [page, head, token, dim].
 // Refill only the historical prefix rows before the prefill prep kernel
 // overwrites the current chunk rows in the same BF16 work buffer.

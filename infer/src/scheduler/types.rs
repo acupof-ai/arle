@@ -332,7 +332,7 @@ impl SchedulerConfig {
 
     /// Total prefill rows allowed inside a mixed decode+prefill launch.
     ///
-    /// Mixed uses one packed FlashInfer plan for decode rows plus prefill rows,
+    /// Mixed uses one packed TileLang launch for decode rows plus prefill rows,
     /// so it follows the decode-active long-prefill cap instead of the full
     /// standalone prefill budget.
     pub fn mixed_prefill_token_budget(&self) -> usize {

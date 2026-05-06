@@ -142,14 +142,14 @@ pub(crate) fn prepare_paged_prefill_batch(
 /// Operations the scheduler can perform on a model's decode context,
 /// independent of the model architecture.
 ///
-/// This decouples scheduler-level work (H2D copies, FlashInfer metadata
+/// This decouples scheduler-level work (H2D copies, TileLang metadata
 /// management) from model-level computation, so new models don't need to
 /// duplicate this boilerplate in their `decode_batch()` implementations.
 pub trait DecodeContextOps {
     /// Upload token IDs from host to GPU. Called before `forward_decode_batch`.
     fn upload_token_ids(&mut self, ctx: &DeviceContext, tokens: &[u32]) -> Result<()>;
 
-    /// Update FlashInfer paged KV metadata (positions, indptr, indices,
+    /// Update TileLang paged KV metadata (positions, indptr, indices,
     /// last_page_len) for the given slots.
     ///
     /// Returns `true` if the kv_indices GPU buffer was reallocated (caller
@@ -161,9 +161,9 @@ pub trait DecodeContextOps {
         slot_indices: &[usize],
     ) -> Result<bool>;
 
-    /// Plan FlashInfer attention for the current batch.
+    /// Mark TileLang attention metadata ready for the current batch.
     /// Must be called once per decode step after `update_metadata()`.
-    /// `kv_format` dispatches between BF16/FP8 FlashInfer plans.
+    /// TileLang attention is planless; quantized pools use custom decode kernels.
     fn plan_attention(
         &mut self,
         ctx: &DeviceContext,
@@ -275,7 +275,7 @@ pub trait ModelForward: Send {
     /// Replaces `Box<dyn Any + Send>` with compile-time type safety.
     ///
     /// Must implement `DecodeContextOps` so the scheduler can perform
-    /// model-agnostic pre/post work (H2D copies, FlashInfer metadata).
+    /// model-agnostic pre/post work (H2D copies, TileLang metadata).
     type DecodeContext: DecodeContextOps + Send;
     /// Pre-allocated buffers for batched prefill that must outlive queued GPU
     /// work when the scheduler keeps a prefill batch pending across loop turns.
@@ -315,7 +315,7 @@ pub trait ModelForward: Send {
     /// Head dimension (for paged KV pool sizing).
     fn head_dim(&self) -> usize;
 
-    /// Number of query attention heads (for FlashInfer plan scheduling).
+    /// Number of query attention heads (for TileLang dispatch).
     fn num_q_heads(&self) -> usize;
 
     /// Prefill: process multiple tokens, populate KV cache and produce logits.

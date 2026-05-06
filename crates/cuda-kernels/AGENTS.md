@@ -1,6 +1,6 @@
 # `cuda-kernels` — Agent Guide
 
-Extracted CUDA kernel crate: CUDA C kernels + Triton AOT + FFI + the seven
+Extracted CUDA kernel crate: CUDA C kernels + TileLang AOT + FFI + the seven
 tensor/pool/metadata types that `infer` proper consumes. **This is the
 proto-public API for the eventual Option-B split.** Load this file before
 touching anything under `crates/cuda-kernels/`.
@@ -29,10 +29,10 @@ no scheduler, no model-specific weight struct, no `EngineOptions`.
 ```
 crates/cuda-kernels/
 ├── Cargo.toml           — features: `cuda` (enables cudarc), `no-cuda` (compile-without-nvcc)
-├── build.rs             — SM auto-detection, Triton AOT, CUDA C compile, FlashInfer link
+├── build.rs             — SM auto-detection, TileLang AOT, CUDA C compile
 ├── csrc/                — CUDA C sources, grouped by concern
 │   ├── common.cuh       — shared header (include with `#include "common.cuh"`)
-│   ├── attention/       — FlashInfer prefill/decode, turboquant decode, varlen FP8 split-KV (P0)
+│   ├── attention/       — TileLang prep/dispatch helpers, turboquant decode, varlen FP8 split-KV (P0)
 │   ├── gemm/            — gemv, Marlin W4, quantized gemv, turboquant weight gemv
 │   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_append, scatter_kv
 │   ├── quant/           — weight quant kernels
@@ -41,7 +41,7 @@ crates/cuda-kernels/
 │   ├── lib.rs           — pub module declarations, feature gating
 │   ├── prelude.rs       — **the proto-API contract** (7 types; see Prelude discipline)
 │   ├── ffi.rs + ffi/    — extern "C" declarations, grouped by domain (see FFI domain layout below)
-│   ├── flashinfer.rs    — FlashInferWorkspace + metadata staging
+│   ├── tilelang.rs      — TileLang metadata staging
 │   ├── paged_kv.rs      — PagedKVPool, TokenKVPool
 │   ├── tensor.rs        — DeviceContext, DeviceVec, DeviceMatrix, HiddenStates, RawDevicePtr
 │   ├── collective.rs    — `CollectiveBackend` trait + `NcclBackend` skeleton (F0 multi-GPU). F7 adds CustomAR / mscclpp / quick_ar / symm_mem behind the same trait. Method set is taken from actual F1+ callers (LayerCommunicator AR, PP send/recv, MoE all-to-all via group_start/end).
@@ -49,7 +49,7 @@ crates/cuda-kernels/
 │   ├── kv_turboquant.rs — TurboQuant-specific KV state
 │   ├── kv_types.rs      — KVCacheDtype, KVFormat (always-on enum)
 │   └── turboquant_state.rs — TurboQuant calibration state
-└── tools/triton/        — Triton Python kernels (AOT compiled by build.rs)
+└── tools/tilelang/      — TileLang Python kernels (AOT compiled by build.rs)
 ```
 
 ### FFI domain layout
@@ -60,7 +60,7 @@ than ~3 functions.
 
 | File | Domain |
 |------|--------|
-| `attention.rs` | FlashInfer + custom decode/prefill kernels |
+| `attention.rs` | TileLang + custom decode/prefill kernels |
 | `elementwise.rs` | add/silu_mul/extract_vec/etc. batched scalars |
 | `embedding.rs` | embedding_batch / embedding_decode |
 | `gemm.rs` | gemv, gemm, fused_mlp, Marlin W4 |
@@ -78,7 +78,7 @@ than ~3 functions.
 `src/prelude.rs` currently exports exactly 7 symbols:
 
 ```rust
-FlashInferDecodeMetadata
+TileLangDecodeMetadata
 PagedKVPool
 DeviceContext
 DeviceMatrix
@@ -124,25 +124,23 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 - **AOT failure policy:** any (SM, kernel) combination that fails to emit
   cubin → `panic!`. No warn-skip. Error message must suggest a
   `TORCH_CUDA_ARCH_LIST=...` value that excludes the failing SM.
-- **Multi-cubin AOT + runtime SM dispatch.** Both Triton AOT
-  (`build_triton_kernel`) and TileLang AOT (`build_tilelang_kernel`) loop
-  over `sm_targets` and emit one cubin per (kernel, SM) tuple. Per-SM
-  symbol uniqueness comes from a `_sm{sm}` suffix on `out_name` (Triton:
-  the public C symbol the generator writes) and on **both** `kernel_name`
-  and `out_name` for TileLang (TileLang's gen script appends `_cuda` to
-  `kernel_name`, so varying it gives a unique exported symbol per SM).
+- **Multi-cubin AOT + runtime SM dispatch.** TileLang AOT
+  (`build_tilelang_kernel`) loops over `sm_targets` and emits one cubin per
+  (kernel, SM) tuple. Per-SM symbol uniqueness comes from a `_sm{sm}` suffix
+  on **both** `kernel_name` and `out_name` (TileLang's gen script appends
+  `_cuda` to `kernel_name`, so varying it gives a unique exported symbol per SM).
   A C dispatch wrapper (`format_dispatch_wrapper`) extern-declares every
   per-SM symbol, caches `compute_capability_major*10 + minor` in a
   `static __thread` slot via `cuCtxGetDevice` + `cuDeviceGetAttribute`,
-  and `switch`es to the matching cubin. Public FFI entry names (e.g.
-  `silu_mul_triton_aot_cuda`, `tilelang_*_run_cuda`) are unchanged from
-  the single-SM era — only the wrapper internals dispatch. **TLS, not
+  and `switch`es to the matching cubin. Public TileLang FFI entry names
+  (`tilelang_*_run_cuda`) remain stable — only the wrapper internals dispatch. **TLS, not
   pthread_once + global static**: multi-GPU runtimes may bind different
   threads to different devices, and a process-global cache would race
   + silently dispatch the wrong cubin.
-- **Triton AOT** is driven by `find_triton_python()` — order: `INFER_TRITON_PYTHON`
-  → `tools/triton/.venv/bin/python` → `./.venv/bin/python` → `python3` → `python`.
-  Generated artifacts land under `OUT_DIR/triton/...`.
+- **TileLang AOT** is driven by `find_tilelang_python()` — order:
+  `INFER_TILELANG_PYTHON` -> `tools/tilelang/.venv/bin/python` ->
+  `./.venv/bin/python` -> `python3` -> `python`.
+  Generated artifacts land under `OUT_DIR/tilelang_aot/...`.
 - **Recursive `.cu` walk under `csrc/`.** nvcc is invoked with `-I csrc/` so
   `#include "common.cuh"` works from any subdir. Don't hand-list files — the
   walk is the rerun-if-changed contract.
@@ -150,7 +148,8 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
   cudarc-using module is gated. This is what makes
   `cargo check --features cuda,no-cuda` work on a Mac. Never add unconditional
   cudarc imports.
-- **FlashInfer link** comes from the vendored tree; don't add system `-lflashinfer`.
+- **No legacy external-kernel link path.** New attention/GDR work goes through
+  TileLang AOT or native CUDA C.
 
 ## csrc conventions
 
@@ -158,16 +157,9 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
   (`common.cuh`) at `csrc/common.cuh`, included by every subdir.
 - Group new kernels by the closest existing subdir (`attention/`, `gemm/`,
   `kv/`, `quant/`, `misc/`). Don't create a new subdir for fewer than 3 files.
-- `csrc/attention/flashinfer_prefill_paged.cu` is the HD128 paged-prefill
-  FlashInfer wrapper (`PrefillPlan` + `BatchPrefillWithPagedKVCacheDispatched`).
-- `csrc/attention/flashinfer_prefill_paged_hd256.cu` is the HD256 paged-prefill
-  FlashInfer wrapper used for Qwen3.5 full-attention parity.
-- `csrc/attention/flashinfer_mla.cu` is the FlashInfer MLA paged-attention
-  wrapper (`MLAPlan` + `mla::BatchMLAPagedAttention`) for DeepSeek V2 / V3 /
-  V4 BF16 q_nope / q_pe / ckv / kpe. Currently dispatches only the
-  `(HEAD_DIM_CKV=512, HEAD_DIM_KPE=64)` pair upstream supports — see the
-  in-file constraint comment for why smaller DSV4 substrate dims need a
-  different kernel.
+- TileLang paged prefill/decode kernels are generated from
+  `tools/tilelang/` and linked by `build.rs`.
+- Historical external attention wrappers are removed; do not recreate them.
 - `csrc/attention/prefill_attention_paged_prep.cu` holds the paged-only
   prefill prep kernels that do QK norm + RoPE and write K/V directly into HND pages.
 - When optimizing, check the heat map in
@@ -193,12 +185,9 @@ With `--features cuda,no-cuda`:
   block both P0' (TP=2 throughput bench) and P0'' (DeepSeek V4 DS5
   collectives in forward).
 - **P0'' DeepSeek V4.** `ffi/mla.rs` carries the legacy `mla_decode_paged_bf16`
-  ABI scaffold; the live BF16 forward path is `flashinfer_mla_paged_attention_
-  {plan,run}` declared at the bottom of `ffi/attention.rs` and implemented in
-  `csrc/attention/flashinfer_mla.cu` (FlashInfer 0.6.x `MLAPlan` +
-  `mla::BatchMLAPagedAttention` wrapper, Apache-2.0). Currently covers the
-  DeepSeek V2/V3 reference shape `(HEAD_DIM_CKV=512, HEAD_DIM_KPE=64)`. The
-  DSV4 small-substrate SKUs in
+  ABI scaffold. New MLA attention should use TileLang AOT, cute-DSL, or a
+  hand CUDA kernel; do not reintroduce external attention wrappers. The DSV4
+  small-substrate SKUs in
   [`docs/plans/2026-05-05-deepseek-v4-small-substrate.md`](../../docs/plans/2026-05-05-deepseek-v4-small-substrate.md)
   §6.1.1 use smaller dims and need a different kernel (cute-DSL or hand-port);
   tracked as future work in that plan.

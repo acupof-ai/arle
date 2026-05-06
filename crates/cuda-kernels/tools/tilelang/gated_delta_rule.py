@@ -1,9 +1,9 @@
 """TileLang chunk-wise Gated Delta Rule (GDR) kernels for Qwen3.5 hybrid.
 
-Phase 2 of `docs/plans/2026-05-05-cuda-kernel-tilelang-unification.md` —
-literal 7-stage 1:1 port of the Triton chunk-wise GDR pipeline at
-`crates/cuda-kernels/tools/triton/gated_delta_rule_chunkwise_kernels.py`
-(decision D2 option A) into TileLang.
+Phase 2 of `docs/plans/2026-05-05-cuda-kernel-tilelang-unification.md`:
+the canonical chunk-wise GDR pipeline with TileLang AOT stages. The
+strict-lower triangular solve is kept as native CUDA C because TileLang 0.1.9
+cannot lower that stage's mixed-index fragment layout on sm_89.
 
 Upstream references this file is adapted from (per user direction
 2026-05-05 "可以直接抄过来用"):
@@ -15,9 +15,8 @@ Upstream references this file is adapted from (per user direction
        - fla/ops/common/chunk_delta_h.py
        - fla/ops/common/chunk_o.py
        - fla/ops/gated_delta_rule/wy_fast.py
-     The existing Triton implementation in this repo is itself a port
-     from FLA; this TileLang version mirrors the Triton kernel
-     structure 1:1 to keep the kernel-substrate swap mechanical.
+     ARLE's implementation keeps the FLA stage structure while using the
+     TileLang kernel substrate.
 
   2. FlashQLA (Qwen team / Alibaba) — MIT, commit e88d71a1
      https://github.com/QwenLM/FlashQLA
@@ -46,43 +45,39 @@ ARLE-specific deltas vs both upstream sources:
     the operator level — multi-sequence batches are scheduled by the
     surrounding scheduler, not the kernel).
   - Decode-compatible final-state layout `[H, K, V]` with V contiguous
-    (matches the FLA decode convention the Triton port already
-    standardized on).
-  - Per-token v_new staging tensor for the chunk-state → chunk-o
-    handoff (matches the existing ARLE Triton v_new contract).
+    (matches the FLA decode convention ARLE standardized on).
+  - Per-token v_new staging tensor for the chunk-state -> chunk-o handoff.
 
 Phase 2b status — AOT swap wired
 ---------------------------------
 
 `tools/tilelang/gen_tilelang_aot.py` now has a `gdr` kernel family beside the
-paged-attention family. `build.rs` emits the seven existing public C symbols
-(`gated_delta_rule_prefill_chunk_*_cuda`) from these TileLang stages, so the
-Rust FFI and `infer/src/ops/recurrent.rs` call sites remain stable while the
-Triton AOT directory is gone. GPU numerical validation still compares this
-literal port against the historical Triton behavior via the existing Qwen3.5
-e2e tests and JSON baselines.
+paged-attention family. `build.rs` emits the TileLang-backed public C symbols
+(`gated_delta_rule_prefill_chunk_*_cuda`) for the AOT-compatible stages, while
+`csrc/misc/gdr_prefill_solve.cu` owns the solve symbol. Rust FFI and
+`infer/src/ops/recurrent.rs` call sites remain stable. The old external AOT
+directory is gone. GPU numerical validation compares this path via the
+existing Qwen3.5 e2e tests and JSON baselines.
 """
 
 import tilelang  # noqa: F401  (imported for side-effect-free version probe)
 import tilelang.language as T
 
-# Fixed Qwen3.5 GDR runtime shape. Matches the Triton constants in
-# tools/triton/gated_delta_rule_chunkwise_kernels.py and is the only
-# combination ARLE ships today.
+# Fixed Qwen3.5 GDR runtime shape. This is the only combination ARLE ships today.
 QWEN35_GDR_HEADS = 32
 QWEN35_GDR_CHUNK_SIZE = 64
 QWEN35_GDR_KEY_DIM = 128
 QWEN35_GDR_VALUE_DIM = 128
 QWEN35_GDR_KEY_BLOCK = 64
 
-# Tile / pipeline tunables. Mirror the Triton AOT defaults
+# Tile / pipeline tunables.
 # (num_warps=4 → ~128 threads, num_stages=2). The AOT generator's
 # nvcc -O3 + cuFuncSetAttribute already lifts the dyn-shmem cap, so
 # the per-kernel choices below stay portable across sm_75..sm_90.
 NUM_THREADS = 128
 NUM_STAGES = 2
 
-# Internal block sizes that match the Triton kernel decomposition.
+# Internal block sizes for the chunk-wise decomposition.
 BLOCK_T = 64       # chunk size in tokens
 BLOCK_K = 64       # key tile width (= KEY_DIM // 2 partitioning for state)
 BLOCK_V = 32       # value tile width for chunk-state / chunk-o sweeps
@@ -93,8 +88,7 @@ KEY_BLOCK = QWEN35_GDR_KEY_BLOCK
 def _gdr_chunk_prepare_kernel():
     """Stage 1 — prepare normalized q/k, raw v, raw g/beta from packed QKV.
 
-    Translation of `gdr_prepare_qkv_gbeta_qwen35_kernel` from the
-    Triton source. One thread block per (token, value_head); inside
+    One thread block per (token, value_head); inside
     the block we read one q row, one k row, one v row, normalize q/k
     (RMSNorm-style L2), and emit the per-token gate / beta scalars.
     """
@@ -142,7 +136,7 @@ def _gdr_chunk_prepare_kernel():
             for d in T.Parallel(VALUE_DIM):
                 v_frag[d] = qkv[token_idx, v_offset + d]
 
-            # L2 normalize q and k. Triton: q *= rsqrt(sum(q*q) + 1e-12).
+            # L2 normalize q and k: q *= rsqrt(sum(q*q) + 1e-12).
             T.clear(qq_sum)
             T.clear(kk_sum)
             for d in T.serial(KEY_DIM):
@@ -217,7 +211,7 @@ def _gdr_chunk_scaled_dot_kkt_kernel():
     """Stage 3 — build the chunk-local strict lower-triangular A block.
 
     Translation of `gdr_chunk_scaled_dot_kkt_qwen35_kernel`. The
-    Triton kernel walks `KEY_DIM // BLOCK_K` k-slabs and accumulates
+    kernel walks `KEY_DIM // BLOCK_K` k-slabs and accumulates
     `K @ K^T` into a `[BT, BT]` accumulator, then applies the gate
     decay and beta scaling and zeroes the upper-triangular + diagonal
     via a causal mask.
@@ -246,9 +240,9 @@ def _gdr_chunk_scaled_dot_kkt_kernel():
             T.ceildiv(seq_len, BT), num_value_heads, threads=NUM_THREADS
         ) as (chunk_idx, v_head):
             k_tile = T.alloc_shared((BT, KEY_DIM), dtype)
+            g_shared = T.alloc_shared((BT,), accum_dtype)
+            beta_shared = T.alloc_shared((BT,), accum_dtype)
             acc = T.alloc_fragment((BT, BT), accum_dtype)
-            g_frag = T.alloc_fragment((BT,), accum_dtype)
-            beta_frag = T.alloc_fragment((BT,), accum_dtype)
 
             base = chunk_idx * BT
             # Load K[base:base+BT, v_head, :] — boundary-safe.
@@ -264,12 +258,12 @@ def _gdr_chunk_scaled_dot_kkt_kernel():
 
             # Load g and beta for this chunk's tokens.
             for t in T.Parallel(BT):
-                g_frag[t] = T.if_then_else(
+                g_shared[t] = T.if_then_else(
                     base + t < seq_len,
                     g_cumsum[base + t, v_head],
                     T.cast(0.0, accum_dtype),
                 )
-                beta_frag[t] = T.if_then_else(
+                beta_shared[t] = T.if_then_else(
                     base + t < seq_len,
                     beta[base + t, v_head],
                     T.cast(0.0, accum_dtype),
@@ -282,7 +276,7 @@ def _gdr_chunk_scaled_dot_kkt_kernel():
                 masked = (i > j) and row_in and col_in
                 acc[i, j] = T.if_then_else(
                     masked,
-                    acc[i, j] * beta_frag[i] * T.exp(g_frag[i] - g_frag[j]),
+                    acc[i, j] * beta_shared[i] * T.exp(g_shared[i] - g_shared[j]),
                     T.cast(0.0, accum_dtype),
                 )
 
@@ -297,7 +291,7 @@ def _gdr_solve_tril_64_kernel():
     """Stage 4 — fixed-size BT=64 strict-lower-triangular solve.
 
     Translation of `gdr_solve_tril_64_qwen35_kernel`. This is the
-    HARDEST stage: the Triton implementation manually decomposes the
+    HARDEST stage: the implementation decomposes the
     64x64 strict-lower-triangular inverse into 4 diagonal 16x16 blocks
     + 6 off-diagonal 16x16 blocks, then composes them via 9 GEMMs
     (one per 16x16 piece of the lower triangle).
@@ -309,14 +303,13 @@ def _gdr_solve_tril_64_kernel():
     Hopper-specific `T.gemm_v1` + `T.alloc_barrier`. This keeps the
     cubin loadable on sm_75 through sm_90.
 
-    Phase 2b note: this stage needs the most validation-against-Triton
-    on GPU before swap. The 4-level block decomposition is identical
+    Phase 2b note: this stage needs the most GPU validation. The
+    4-level block decomposition is identical
     in structure to both upstream sources, but the exact T.Parallel
     layout choices interact with TileLang's LayoutInferencer and may
     need tuning per docs/experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md
     style adjustments. Author's intent: keep the *algorithm* faithful
-    to the Triton reference; trust GPU validation to pin down the
-    layout details.
+    to the FLA reference and use GPU validation to pin down layout details.
     """
     dtype = "bfloat16"
     accum_dtype = "float32"
@@ -343,8 +336,7 @@ def _gdr_solve_tril_64_kernel():
                 )
 
             # 4 diagonal 16x16 blocks initialized as -StrictLower(A) + I.
-            # Triton names them b_ai_11, b_ai_22, b_ai_33, b_ai_44.
-            ai_diag = T.alloc_fragment((4, 16, 16), accum_dtype)
+            ai_diag = T.alloc_shared((4, 16, 16), accum_dtype)
             for blk, i, j in T.Parallel(4, 16, 16):
                 row = blk * 16 + i
                 col = blk * 16 + j
@@ -357,10 +349,8 @@ def _gdr_solve_tril_64_kernel():
                 )
 
             # Forward-substitution on each diagonal block: rows 2..15.
-            # This loop matches the Triton `for i in range(2, 16)` four
-            # times, one per diagonal block. We unroll over `blk` to
-            # keep the inner reduction shape regular.
-            row_buf = T.alloc_fragment((4, 16), accum_dtype)
+            # We unroll over `blk` to keep the inner reduction shape regular.
+            row_buf = T.alloc_shared((4, 16), accum_dtype)
             for i in T.serial(2, 16):
                 for blk, k_t in T.Parallel(4, 16):
                     base_i = chunk_idx * BT + blk * 16 + i
@@ -374,19 +364,18 @@ def _gdr_solve_tril_64_kernel():
                 # Accumulate row_buf @ ai_diag[blk] into row i of ai_diag[blk].
                 for blk, k_t in T.Parallel(4, 16):
                     accum = T.alloc_fragment((1,), accum_dtype)
-                    T.clear(accum)
+                    accum[0] = T.cast(0.0, accum_dtype)
                     for r in T.serial(16):
                         accum[0] += row_buf[blk, r] * ai_diag[blk, r, k_t]
                     if k_t < i:
                         ai_diag[blk, i, k_t] = row_buf[blk, k_t] + accum[0]
 
-            # Add identity on the diagonal (Triton: b_ai_11 += eye etc.
-            # — except this is already captured by the eye initialization
-            # above, so this is a no-op in the TileLang version).
+            # Identity on the diagonal is already captured by the eye
+            # initialization above, so this is a no-op.
 
             # Six off-diagonal 16x16 blocks of A: A21, A31, A32, A41, A42, A43.
             # Loaded into a single (6, 16, 16) fragment for the composition.
-            a_off = T.alloc_fragment((6, 16, 16), accum_dtype)
+            a_off = T.alloc_shared((6, 16, 16), accum_dtype)
             # Block index → (row_block, col_block) of A:
             #   0: (1, 0)  A21
             #   1: (2, 0)  A31
@@ -410,8 +399,7 @@ def _gdr_solve_tril_64_kernel():
                     T.if_then_else(slot == 4, 1, 2)))))
                 a_off[slot, i, j] = a_full[row_block * 16 + i, col_block * 16 + j]
 
-            # Compose the off-diagonal pieces of the inverse.
-            # Triton:
+            # Compose the off-diagonal pieces of the inverse:
             #   b_ai_21 = -ai22 @ A21 @ ai11
             #   b_ai_32 = -ai33 @ A32 @ ai22
             #   b_ai_43 = -ai44 @ A43 @ ai33
@@ -422,20 +410,20 @@ def _gdr_solve_tril_64_kernel():
             # Implemented as a sequence of 16x16 matmuls expressed as
             # T.Parallel reductions. Each output is stored back into a
             # dedicated (6, 16, 16) `ai_off` fragment.
-            ai_off = T.alloc_fragment((6, 16, 16), accum_dtype)
+            ai_off = T.alloc_shared((6, 16, 16), accum_dtype)
 
             # ai_21 = -ai_22 @ A21 @ ai_11
-            tmp_a = T.alloc_fragment((16, 16), accum_dtype)
-            tmp_b = T.alloc_fragment((16, 16), accum_dtype)
+            tmp_a = T.alloc_shared((16, 16), accum_dtype)
+            tmp_b = T.alloc_shared((16, 16), accum_dtype)
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += ai_diag[1, i, r] * a_off[0, r, j]
                 tmp_a[i, j] = acc[0]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += tmp_a[i, r] * ai_diag[0, r, j]
                 ai_off[0, i, j] = -acc[0]
@@ -443,13 +431,13 @@ def _gdr_solve_tril_64_kernel():
             # ai_32 = -ai_33 @ A32 @ ai_22
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += ai_diag[2, i, r] * a_off[2, r, j]
                 tmp_a[i, j] = acc[0]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += tmp_a[i, r] * ai_diag[1, r, j]
                 ai_off[2, i, j] = -acc[0]
@@ -457,13 +445,13 @@ def _gdr_solve_tril_64_kernel():
             # ai_43 = -ai_44 @ A43 @ ai_33
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += ai_diag[3, i, r] * a_off[5, r, j]
                 tmp_a[i, j] = acc[0]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += tmp_a[i, r] * ai_diag[2, r, j]
                 ai_off[5, i, j] = -acc[0]
@@ -471,13 +459,13 @@ def _gdr_solve_tril_64_kernel():
             # ai_31 = -ai_33 @ (A31 @ ai_11 + A32 @ ai_21)
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += a_off[1, i, r] * ai_diag[0, r, j]  # A31 @ ai_11
                 tmp_a[i, j] = acc[0]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += a_off[2, i, r] * ai_off[0, r, j]   # A32 @ ai_21
                 tmp_b[i, j] = acc[0]
@@ -485,7 +473,7 @@ def _gdr_solve_tril_64_kernel():
                 tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += ai_diag[2, i, r] * tmp_a[r, j]
                 ai_off[1, i, j] = -acc[0]
@@ -493,13 +481,13 @@ def _gdr_solve_tril_64_kernel():
             # ai_42 = -ai_44 @ (A42 @ ai_22 + A43 @ ai_32)
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += a_off[4, i, r] * ai_diag[1, r, j]  # A42 @ ai_22
                 tmp_a[i, j] = acc[0]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += a_off[5, i, r] * ai_off[2, r, j]   # A43 @ ai_32
                 tmp_b[i, j] = acc[0]
@@ -507,7 +495,7 @@ def _gdr_solve_tril_64_kernel():
                 tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += ai_diag[3, i, r] * tmp_a[r, j]
                 ai_off[4, i, j] = -acc[0]
@@ -515,13 +503,13 @@ def _gdr_solve_tril_64_kernel():
             # ai_41 = -ai_44 @ (A41 @ ai_11 + A42 @ ai_21 + A43 @ ai_31)
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += a_off[3, i, r] * ai_diag[0, r, j]  # A41 @ ai_11
                 tmp_a[i, j] = acc[0]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += a_off[4, i, r] * ai_off[0, r, j]   # A42 @ ai_21
                 tmp_b[i, j] = acc[0]
@@ -529,7 +517,7 @@ def _gdr_solve_tril_64_kernel():
                 tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += a_off[5, i, r] * ai_off[1, r, j]   # A43 @ ai_31
                 tmp_b[i, j] = acc[0]
@@ -537,15 +525,14 @@ def _gdr_solve_tril_64_kernel():
                 tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
             for i, j in T.Parallel(16, 16):
                 acc = T.alloc_fragment((1,), accum_dtype)
-                T.clear(acc)
+                acc[0] = T.cast(0.0, accum_dtype)
                 for r in T.serial(16):
                     acc[0] += ai_diag[3, i, r] * tmp_a[r, j]
                 ai_off[3, i, j] = -acc[0]
 
             # Write all 10 16x16 blocks back to a_inv (4 diagonal + 6
-            # off-diagonal). Upper triangle stays zero (Triton stores
-            # only the lower-triangular layout that matches the chunk-A
-            # contract).
+            # off-diagonal). Upper triangle stays zero because the chunk-A
+            # contract stores only the lower-triangular layout.
             for blk, i, j in T.Parallel(4, 16, 16):
                 row = base + blk * 16 + i
                 col = blk * 16 + j
@@ -577,9 +564,8 @@ def _gdr_recompute_w_u_kernel():
 
     Translation of `gdr_recompute_w_u_qwen35_kernel`. Two GEMMs per
     chunk: u = a_inv @ (v * beta), w = a_inv @ (k * beta * exp(g)).
-    The Triton kernel walks v_tile and k_tile in BLOCK_V / BLOCK_K
-    sweeps; the TileLang kernel issues one full-shape GEMM per output
-    since KEY_DIM=128 / VALUE_DIM=128 fit comfortably in registers.
+    The TileLang kernel issues one full-shape GEMM per output since
+    KEY_DIM=128 / VALUE_DIM=128 fit comfortably in registers.
     """
     dtype = "bfloat16"
     accum_dtype = "float32"
@@ -864,7 +850,7 @@ def _gdr_chunk_o_kernel():
             v_new_tile = T.alloc_shared((BT, BV), dtype)
             acc_o = T.alloc_fragment((BT, BV), accum_dtype)
             acc_a = T.alloc_fragment((BT, BT), accum_dtype)
-            g_frag = T.alloc_fragment((BT,), accum_dtype)
+            g_shared = T.alloc_shared((BT,), accum_dtype)
 
             base = chunk_idx * BT
             v_off = v_tile * BV
@@ -892,7 +878,7 @@ def _gdr_chunk_o_kernel():
             T.gemm(q_tile, k_tile, acc_a, policy=T.GemmWarpPolicy.FullRow)
 
             for t in T.Parallel(BT):
-                g_frag[t] = T.if_then_else(
+                g_shared[t] = T.if_then_else(
                     base + t < seq_len,
                     g_cumsum[base + t, v_head],
                     T.cast(0.0, accum_dtype),
@@ -900,14 +886,14 @@ def _gdr_chunk_o_kernel():
 
             # acc_o *= exp(g[t]) ; acc_a[i,j] *= exp(g[i] - g[j]) (causal).
             for t, c in T.Parallel(BT, BV):
-                acc_o[t, c] = acc_o[t, c] * T.exp(g_frag[t])
+                acc_o[t, c] = acc_o[t, c] * T.exp(g_shared[t])
             for i, j in T.Parallel(BT, BT):
                 row_in = base + i < seq_len
                 col_in = base + j < seq_len
                 causal = (i >= j) and row_in and col_in
                 acc_a[i, j] = T.if_then_else(
                     causal,
-                    acc_a[i, j] * T.exp(g_frag[i] - g_frag[j]),
+                    acc_a[i, j] * T.exp(g_shared[i] - g_shared[j]),
                     T.cast(0.0, accum_dtype),
                 )
 

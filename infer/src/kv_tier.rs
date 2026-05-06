@@ -81,7 +81,7 @@
 //! 5. **No cuda dependencies here.** This skeleton is always-on — not
 //!    gated behind `#[cfg(feature = "cuda")]` — so `cargo check
 //!    --features no-cuda` and `cargo check --features metal` both
-//!    validate it. Cuda-specific types (cudarc handles, FlashInfer
+//!    validate it. Cuda-specific types (cudarc handles, TileLang
 //!    metadata) live in `infer/src/backend/cuda/` and in
 //!    `crates/cuda-kernels`.
 //!

@@ -236,20 +236,20 @@ multi_gpu_config:
   world_size=1 status=single-rank
 ```
 
-### `INFER_TRITON_PYTHON`
+### `INFER_TILELANG_PYTHON`
 
-Python interpreter with Triton installed for build-time AOT kernel generation.
+Python interpreter with TileLang installed for build-time AOT kernel generation.
 
 Typical value:
 
 ```bash
-export INFER_TRITON_PYTHON=.venv/bin/python
+export INFER_TILELANG_PYTHON=.venv/bin/python
 ```
 
 ### `TORCH_CUDA_ARCH_LIST` (alt: `CMAKE_CUDA_ARCHITECTURES`)
 
 Override the CUDA SM compile targets. Uses the standard PyTorch / vLLM /
-SGLang / FlashInfer convention. Consumed by
+SGLang convention. Consumed by
 `crates/cuda-kernels/build.rs::detect_sm_targets`. Resolution order:
 
 1. `TORCH_CUDA_ARCH_LIST`
@@ -279,14 +279,6 @@ export CMAKE_CUDA_ARCHITECTURES="80;86;89;90"          # CMake alias
 a kernel can't compile for a target SM). ARLE is hard-fail: every target
 SM must succeed for every AOT kernel, otherwise build panics with a
 suggested `TORCH_CUDA_ARCH_LIST` value that excludes the failing SM.
-
-### `FLASHINFER_INCLUDE_DIR`
-
-Explicit include path override for FlashInfer headers.
-
-Status: advanced build override.
-
----
 
 ## 4. Setup Script Variables
 
@@ -413,7 +405,7 @@ export ARLE_MODEL=models/Qwen3-4B
 
 ```bash
 export CUDA_HOME=/usr/local/cuda
-export INFER_TRITON_PYTHON=.venv/bin/python
+export INFER_TILELANG_PYTHON=.venv/bin/python
 ```
 
 ### GPU tests
@@ -439,7 +431,6 @@ docs promote them more clearly:
 - `AGENT_INFER_METAL_KV_POOL`
 - `AGENT_INFER_GDR_METAL_KERNEL`
 - `INFER_E2E_MODEL_PATH`
-- `FLASHINFER_INCLUDE_DIR`
 - `INFER_ROPE_CACHE_LEN` — override RoPE cache allocation length in `weight_loader.rs`
 - `INFER_FORCE_BF16_QUANT` — skip all packed-quant fast paths in
   `weight_loader.rs` and force BF16 tensor load (debug aid for quant-format issues)

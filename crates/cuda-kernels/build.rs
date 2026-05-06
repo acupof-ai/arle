@@ -2,17 +2,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-struct TritonKernelSpec {
-    artifact_dir: &'static str,
-    kernel_path: &'static str,
-    kernel_name: &'static str,
-    signature: &'static str,
-    grid: &'static str,
-    out_name: &'static str,
-    num_warps: u32,
-    num_stages: u32,
-}
-
 /// Tier-1 SMs: default-compiled fat-binary set. A100 / A10·3090 / L4·4090 / H100.
 const T1_SMS: &[&str] = &["80", "86", "89", "90"];
 
@@ -222,65 +211,6 @@ fn nvcc_arch_args(sm_targets: &[SmSpec]) -> Vec<String> {
     args
 }
 
-fn probe_triton_python(candidate: &str) -> Result<String, String> {
-    let output = Command::new(candidate)
-        .args(["-c", "import triton"])
-        .output()
-        .map_err(|err| format!("{candidate}: {err}"))?;
-
-    if output.status.success() {
-        Ok(candidate.to_string())
-    } else {
-        Err(format!(
-            "{candidate}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn find_triton_python() -> Result<String, String> {
-    if let Ok(candidate) = std::env::var("INFER_TRITON_PYTHON") {
-        let candidate = candidate.trim();
-        if candidate.is_empty() {
-            return Err(
-                "INFER_TRITON_PYTHON is set but empty. See tools/triton/README.md.".to_string(),
-            );
-        }
-        return probe_triton_python(candidate).map_err(|message| {
-            format!(
-                "INFER_TRITON_PYTHON=`{candidate}` could not import Triton. {message}. See tools/triton/README.md."
-            )
-        });
-    }
-
-    let tool_venv = PathBuf::from("tools/triton/.venv/bin/python");
-    let local_venv = PathBuf::from(".venv/bin/python");
-    let mut diagnostics = Vec::new();
-    let mut candidates = Vec::new();
-    if tool_venv.exists() {
-        candidates.push(tool_venv.to_string_lossy().to_string());
-    }
-    if local_venv.exists() {
-        candidates.push(local_venv.to_string_lossy().to_string());
-    }
-    candidates.extend(["python3".to_string(), "python".to_string()]);
-
-    for candidate in candidates {
-        match probe_triton_python(&candidate) {
-            Ok(path) => return Ok(path),
-            Err(message) => diagnostics.push(message),
-        }
-    }
-
-    Err(format!(
-        "Could not find a Python interpreter with Triton installed. Set INFER_TRITON_PYTHON, bootstrap .venv, or ensure `python3 -c 'import triton'` works. Probe results: {}.",
-        diagnostics.join(" | ")
-    ))
-}
-
-/// Per-SM Triton AOT artifact: (sm token, mangled func name, generated .c path).
-type TritonPerSmArtifact = (String, String, PathBuf);
-
 /// Convert "80" -> "8.0", "120" -> "12.0", for inclusion in TORCH_CUDA_ARCH_LIST hint strings.
 fn sm_to_arch_list_token(sm: &str) -> String {
     let len = sm.len();
@@ -289,99 +219,6 @@ fn sm_to_arch_list_token(sm: &str) -> String {
     }
     let (head, tail) = sm.split_at(len - 1);
     format!("{head}.{tail}")
-}
-
-/// Run gen_triton_aot.py once per SM target; return (sm, func_name, c_path) per success.
-/// Hard-fail with a `TORCH_CUDA_ARCH_LIST=...` hint when any (kernel, SM) pair fails to compile.
-fn generate_triton_artifacts_per_sm(
-    python: &str,
-    out_dir: &Path,
-    sm_targets: &[SmSpec],
-    base_spec: &TritonKernelSpec,
-) -> Vec<TritonPerSmArtifact> {
-    let generator_path = PathBuf::from("tools/triton/gen_triton_aot.py");
-    let mut results = Vec::new();
-
-    for sm in sm_targets {
-        let sm_token = &sm.sm;
-        let artifact_dir = out_dir
-            .join("triton_aot")
-            .join(format!("{}_sm{sm_token}", base_spec.artifact_dir));
-        let out_name = format!("{}_sm{sm_token}", base_spec.out_name);
-        let target = format!("cuda:{sm_token}:32");
-
-        let output = Command::new(python)
-            .arg(&generator_path)
-            .arg("--kernel-path")
-            .arg(base_spec.kernel_path)
-            .arg("--kernel-name")
-            .arg(base_spec.kernel_name)
-            .arg("--signature")
-            .arg(base_spec.signature)
-            .arg("--grid")
-            .arg(base_spec.grid)
-            .arg("--out-name")
-            .arg(&out_name)
-            .arg("--out-dir")
-            .arg(&artifact_dir)
-            .arg("--target")
-            .arg(&target)
-            .arg("--num-warps")
-            .arg(base_spec.num_warps.to_string())
-            .arg("--num-stages")
-            .arg(base_spec.num_stages.to_string())
-            .output()
-            .unwrap_or_else(|err| {
-                panic!(
-                    "failed to spawn Triton AOT generator for {} on sm_{sm_token}: {err}",
-                    base_spec.kernel_name
-                )
-            });
-
-        if !output.status.success() {
-            let other_sms: Vec<String> = sm_targets
-                .iter()
-                .filter(|s| s.sm != *sm_token)
-                .map(|s| sm_to_arch_list_token(&s.sm))
-                .collect();
-            let suggestion = if other_sms.is_empty() {
-                "all targets failed; bump triton in requirements-build.txt or pin a working version"
-                    .to_string()
-            } else {
-                format!("TORCH_CUDA_ARCH_LIST=\"{}\"", other_sms.join(";"))
-            };
-            panic!(
-                "Triton AOT failed to compile {} for sm_{sm_token}.\n\
-                 stdout: {}\n\
-                 stderr: {}\n\n\
-                 Hint: bump triton (pin lives in requirements-build.txt) OR exclude sm_{sm_token} via:\n  \
-                 {suggestion}\n\
-                 See docs/plans/sm-coverage.md.",
-                base_spec.kernel_name,
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim(),
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut func_name = None;
-        let mut c_path = None;
-        for line in stdout.lines() {
-            if let Some(value) = line.strip_prefix("FUNC_NAME=") {
-                func_name = Some(value.trim().to_string());
-            } else if let Some(value) = line.strip_prefix("C_PATH=") {
-                c_path = Some(PathBuf::from(value.trim()));
-            }
-        }
-
-        results.push((
-            sm_token.clone(),
-            func_name.expect("Triton generator did not print FUNC_NAME"),
-            c_path.expect("Triton generator did not print C_PATH"),
-        ));
-    }
-
-    results
 }
 
 /// Format a SM-dispatching C wrapper. The generated wrapper:
@@ -457,228 +294,6 @@ fn format_dispatch_wrapper(
     )
 }
 
-/// Build one Triton kernel for every SM target: generate per-SM artifacts,
-/// write a single dispatch wrapper exposing `public_decl`, and append all
-/// sources to `generated_sources` for cc::Build to compile.
-fn build_triton_kernel(
-    python: &str,
-    out_dir: &Path,
-    sm_targets: &[SmSpec],
-    base_spec: &TritonKernelSpec,
-    public_decl: &str,
-    extern_signature: &str,
-    call_args: &str,
-    generated_sources: &mut Vec<PathBuf>,
-) {
-    let per_sm = generate_triton_artifacts_per_sm(python, out_dir, sm_targets, base_spec);
-    let pairs: Vec<(String, String)> = per_sm
-        .iter()
-        .map(|(sm, func, _)| (sm.clone(), func.clone()))
-        .collect();
-    let wrapper_src = format_dispatch_wrapper(public_decl, extern_signature, call_args, &pairs);
-
-    let dispatch_dir = out_dir
-        .join("triton_aot")
-        .join(format!("{}_dispatch", base_spec.artifact_dir));
-    std::fs::create_dir_all(&dispatch_dir).expect("create Triton dispatch directory");
-    let wrapper_path = dispatch_dir.join(format!("triton_{}_dispatch.c", base_spec.artifact_dir));
-    std::fs::write(&wrapper_path, wrapper_src).expect("write Triton dispatch wrapper");
-
-    for (_, _, c) in per_sm {
-        generated_sources.push(c);
-    }
-    generated_sources.push(wrapper_path);
-}
-
-fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
-    let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
-    let mut generated_sources = Vec::new();
-    let chunkwise_kernel_path = Path::new("tools/triton/gated_delta_rule_chunkwise_kernels.py");
-
-    if chunkwise_kernel_path.exists() {
-        let gdr_prepare_spec = TritonKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_prepare",
-            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
-            kernel_name: "gdr_prepare_qkv_gbeta_qwen35_kernel",
-            signature: "*bf16,*bf16,*bf16,*bf16,*fp32,*bf16,*bf16,*bf16,*fp32,*fp32,i32,i32,i32,i32,128,128",
-            grid: "seq_len,num_value_heads,1",
-            out_name: "triton_gated_delta_rule_chunk_prepare",
-            num_warps: 4,
-            num_stages: 2,
-        };
-        build_triton_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            &gdr_prepare_spec,
-            "gated_delta_rule_prefill_chunk_prepare_cuda(const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream)",
-            "CUstream stream, CUdeviceptr qkv, CUdeviceptr b_proj, CUdeviceptr a_proj, CUdeviceptr dt_bias, CUdeviceptr a_log, CUdeviceptr q_out, CUdeviceptr k_out, CUdeviceptr v_out, CUdeviceptr g_out, CUdeviceptr beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len",
-            "stream, (CUdeviceptr)qkv, (CUdeviceptr)b_proj, (CUdeviceptr)a_proj, (CUdeviceptr)dt_bias, (CUdeviceptr)a_log, (CUdeviceptr)q_out, (CUdeviceptr)k_out, (CUdeviceptr)v_out, (CUdeviceptr)g_out, (CUdeviceptr)beta_out, num_key_heads, num_value_heads, qkv_dim, seq_len",
-            &mut generated_sources,
-        );
-
-        let gdr_cumsum_spec = TritonKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_cumsum",
-            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
-            kernel_name: "gdr_chunk_local_cumsum_qwen35_kernel",
-            signature: "*fp32,*fp32,i32,i32,64",
-            grid: "(seq_len + 63) / 64,num_value_heads,1",
-            out_name: "triton_gated_delta_rule_chunk_cumsum",
-            num_warps: 1,
-            num_stages: 1,
-        };
-        build_triton_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            &gdr_cumsum_spec,
-            "gated_delta_rule_prefill_chunk_cumsum_cuda(const float* g_in, float* g_out, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
-            "CUstream stream, CUdeviceptr g_in, CUdeviceptr g_out, int32_t seq_len, int32_t num_value_heads",
-            "stream, (CUdeviceptr)g_in, (CUdeviceptr)g_out, seq_len, num_value_heads",
-            &mut generated_sources,
-        );
-
-        let gdr_a_spec = TritonKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_a",
-            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
-            kernel_name: "gdr_chunk_scaled_dot_kkt_qwen35_kernel",
-            signature: "*bf16,*fp32,*fp32,*fp32,i32,i32,64,64,128",
-            grid: "(seq_len + 63) / 64,num_value_heads,1",
-            out_name: "triton_gated_delta_rule_chunk_a",
-            num_warps: 4,
-            num_stages: 2,
-        };
-        build_triton_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            &gdr_a_spec,
-            "gated_delta_rule_prefill_chunk_a_cuda(const uint16_t* k, const float* g_cumsum, const float* beta, float* a_tril, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
-            "CUstream stream, CUdeviceptr k, CUdeviceptr g_cumsum, CUdeviceptr beta, CUdeviceptr a_tril, int32_t seq_len, int32_t num_value_heads",
-            "stream, (CUdeviceptr)k, (CUdeviceptr)g_cumsum, (CUdeviceptr)beta, (CUdeviceptr)a_tril, seq_len, num_value_heads",
-            &mut generated_sources,
-        );
-
-        let gdr_solve_spec = TritonKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_solve",
-            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
-            kernel_name: "gdr_solve_tril_64_qwen35_kernel",
-            signature: "*fp32,*bf16,i32,i32",
-            grid: "(seq_len + 63) / 64,num_value_heads,1",
-            out_name: "triton_gated_delta_rule_chunk_solve",
-            num_warps: 4,
-            num_stages: 2,
-        };
-        build_triton_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            &gdr_solve_spec,
-            "gated_delta_rule_prefill_chunk_solve_cuda(const float* a_tril, uint16_t* a_inv, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
-            "CUstream stream, CUdeviceptr a_tril, CUdeviceptr a_inv, int32_t seq_len, int32_t num_value_heads",
-            "stream, (CUdeviceptr)a_tril, (CUdeviceptr)a_inv, seq_len, num_value_heads",
-            &mut generated_sources,
-        );
-
-        let gdr_recompute_spec = TritonKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_recompute",
-            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
-            kernel_name: "gdr_recompute_w_u_qwen35_kernel",
-            signature: "*bf16,*bf16,*fp32,*bf16,*bf16,*bf16,*fp32,i32,i32,128,128,64,64,64",
-            grid: "(seq_len + 63) / 64,num_value_heads,1",
-            out_name: "triton_gated_delta_rule_chunk_recompute",
-            num_warps: 4,
-            num_stages: 2,
-        };
-        build_triton_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            &gdr_recompute_spec,
-            "gated_delta_rule_prefill_chunk_recompute_cuda(const uint16_t* k, const uint16_t* v, const float* beta, uint16_t* w, uint16_t* u, const uint16_t* a_inv, const float* g_cumsum, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
-            "CUstream stream, CUdeviceptr k, CUdeviceptr v, CUdeviceptr beta, CUdeviceptr w, CUdeviceptr u, CUdeviceptr a_inv, CUdeviceptr g_cumsum, int32_t seq_len, int32_t num_value_heads",
-            "stream, (CUdeviceptr)k, (CUdeviceptr)v, (CUdeviceptr)beta, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)a_inv, (CUdeviceptr)g_cumsum, seq_len, num_value_heads",
-            &mut generated_sources,
-        );
-
-        let gdr_chunk_state_spec = TritonKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_state",
-            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
-            kernel_name: "gdr_chunk_state_qwen35_kernel",
-            signature: "*bf16,*bf16,*bf16,*fp32,*fp32,*fp32,*bf16,*fp32,i32,i32,32,64,128,128,64",
-            grid: "4,num_value_heads,1",
-            out_name: "triton_gated_delta_rule_chunk_state",
-            num_warps: 4,
-            num_stages: 2,
-        };
-        build_triton_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            &gdr_chunk_state_spec,
-            "gated_delta_rule_prefill_chunk_state_cuda(const uint16_t* k, const uint16_t* w, const uint16_t* u, const float* g_cumsum, const float* initial_state, float* chunk_state, uint16_t* v_new, float* final_state, int32_t seq_len, int32_t num_value_heads, CUstream stream)",
-            "CUstream stream, CUdeviceptr k, CUdeviceptr w, CUdeviceptr u, CUdeviceptr g_cumsum, CUdeviceptr initial_state, CUdeviceptr chunk_state, CUdeviceptr v_new, CUdeviceptr final_state, int32_t seq_len, int32_t num_value_heads",
-            "stream, (CUdeviceptr)k, (CUdeviceptr)w, (CUdeviceptr)u, (CUdeviceptr)g_cumsum, (CUdeviceptr)initial_state, (CUdeviceptr)chunk_state, (CUdeviceptr)v_new, (CUdeviceptr)final_state, seq_len, num_value_heads",
-            &mut generated_sources,
-        );
-
-        let gdr_chunk_o_spec = TritonKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_o",
-            kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
-            kernel_name: "gdr_chunk_o_qwen35_kernel",
-            signature: "*bf16,*bf16,*bf16,*fp32,*fp32,*bf16,i32,i32,fp32,64,32,64,128,128",
-            grid: "4,(seq_len + 63) / 64,num_value_heads",
-            out_name: "triton_gated_delta_rule_chunk_o",
-            num_warps: 4,
-            num_stages: 2,
-        };
-        build_triton_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            &gdr_chunk_o_spec,
-            "gated_delta_rule_prefill_chunk_o_cuda(const uint16_t* q, const uint16_t* k, const uint16_t* v_new, const float* chunk_state, const float* g_cumsum, uint16_t* output, int32_t seq_len, int32_t num_value_heads, float scale, CUstream stream)",
-            "CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v_new, CUdeviceptr chunk_state, CUdeviceptr g_cumsum, CUdeviceptr output, int32_t seq_len, int32_t num_value_heads, float scale",
-            "stream, (CUdeviceptr)q, (CUdeviceptr)k, (CUdeviceptr)v_new, (CUdeviceptr)chunk_state, (CUdeviceptr)g_cumsum, (CUdeviceptr)output, seq_len, num_value_heads, scale",
-            &mut generated_sources,
-        );
-    } else {
-        println!(
-            "cargo:warning=Skipping chunk-wise GDR Triton AOT scaffolding because {} is not present yet.",
-            chunkwise_kernel_path.display()
-        );
-    }
-
-    let mut build = cc::Build::new();
-    build
-        .cuda(false)
-        .include(format!("{}/include", cuda_path))
-        .flag("-std=c11")
-        .warnings(false);
-    for source in &generated_sources {
-        build.file(source);
-    }
-    build.compile("triton_kernels_aot");
-
-    println!("cargo:rustc-link-lib=cuda");
-    println!(
-        "cargo:warning=Triton AOT: built per-SM cubins for {} target(s); SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
-        sm_targets.len()
-    );
-    // Triton kernel sources: invalidate AOT cache if any kernel .py changes.
-    for entry in std::fs::read_dir("tools/triton")
-        .expect("tools/triton directory must exist")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("py") {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-    }
-    println!("cargo:rerun-if-changed=tools/triton");
-    println!("cargo:rerun-if-env-changed=INFER_TRITON_PYTHON");
-}
-
 /// One AOT-specialized prefill HD128 kernel per (num_q_heads, num_kv_heads).
 /// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_prefill_paged_hd128.py`
 /// — when adding a new Qwen3 head config, extend both lists in lockstep
@@ -708,8 +323,13 @@ struct TileLangKernelSpec {
     kernel_path: &'static str,
     kernel_name: String,
     out_name: String,
-    num_q_heads: u32,
-    num_kv_heads: u32,
+    kernel_family: &'static str,
+    kernel_key: Option<&'static str>,
+    num_q_heads: Option<u32>,
+    num_kv_heads: Option<u32>,
+    public_decl: &'static str,
+    extern_decl: &'static str,
+    call_args: &'static str,
 }
 
 fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
@@ -783,6 +403,33 @@ const TILELANG_DISPATCH_EXTERN_DECL: &str = TILELANG_DISPATCH_PUBLIC_DECL;
 const TILELANG_DISPATCH_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices, kv_last_page_len, o, \
      batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
      num_kv_heads, page_size, sm_scale, stream";
+
+const GDR_PREPARE_PUBLIC_DECL: &str = "const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream";
+const GDR_PREPARE_EXTERN_DECL: &str = GDR_PREPARE_PUBLIC_DECL;
+const GDR_PREPARE_CALL_ARGS: &str = "qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, g_out, beta_out, num_key_heads, num_value_heads, qkv_dim, seq_len, stream";
+
+const GDR_CUMSUM_PUBLIC_DECL: &str =
+    "const float* g_in, float* g_out, int32_t seq_len, int32_t num_value_heads, CUstream stream";
+const GDR_CUMSUM_EXTERN_DECL: &str = GDR_CUMSUM_PUBLIC_DECL;
+const GDR_CUMSUM_CALL_ARGS: &str = "g_in, g_out, seq_len, num_value_heads, stream";
+
+const GDR_A_PUBLIC_DECL: &str = "const uint16_t* k, const float* g_cumsum, const float* beta, float* a_tril, int32_t seq_len, int32_t num_value_heads, CUstream stream";
+const GDR_A_EXTERN_DECL: &str = GDR_A_PUBLIC_DECL;
+const GDR_A_CALL_ARGS: &str = "k, g_cumsum, beta, a_tril, seq_len, num_value_heads, stream";
+
+const GDR_RECOMPUTE_PUBLIC_DECL: &str = "const uint16_t* k, const uint16_t* v, const float* beta, uint16_t* w, uint16_t* u, const uint16_t* a_inv, const float* g_cumsum, int32_t seq_len, int32_t num_value_heads, CUstream stream";
+const GDR_RECOMPUTE_EXTERN_DECL: &str = GDR_RECOMPUTE_PUBLIC_DECL;
+const GDR_RECOMPUTE_CALL_ARGS: &str =
+    "k, v, beta, w, u, a_inv, g_cumsum, seq_len, num_value_heads, stream";
+
+const GDR_STATE_PUBLIC_DECL: &str = "const uint16_t* k, const uint16_t* w, const uint16_t* u, const float* g_cumsum, const float* initial_state, float* chunk_state, uint16_t* v_new, float* final_state, int32_t seq_len, int32_t num_value_heads, CUstream stream";
+const GDR_STATE_EXTERN_DECL: &str = GDR_STATE_PUBLIC_DECL;
+const GDR_STATE_CALL_ARGS: &str = "k, w, u, g_cumsum, initial_state, chunk_state, v_new, final_state, seq_len, num_value_heads, stream";
+
+const GDR_O_PUBLIC_DECL: &str = "const uint16_t* q, const uint16_t* k, const uint16_t* v_new, const float* chunk_state, const float* g_cumsum, uint16_t* output, int32_t seq_len, int32_t num_value_heads, float scale, CUstream stream";
+const GDR_O_EXTERN_DECL: &str = GDR_O_PUBLIC_DECL;
+const GDR_O_CALL_ARGS: &str =
+    "q, k, v_new, chunk_state, g_cumsum, output, seq_len, num_value_heads, scale, stream";
 
 /// Locate the directories the TileLang AOT generator needs for nvcc to
 /// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
@@ -870,10 +517,8 @@ fn generate_tilelang_artifacts_per_sm(
             .arg(&artifact_dir)
             .arg("--target")
             .arg(&target)
-            .arg("--num-q-heads")
-            .arg(base_spec.num_q_heads.to_string())
-            .arg("--num-kv-heads")
-            .arg(base_spec.num_kv_heads.to_string())
+            .arg("--kernel-family")
+            .arg(base_spec.kernel_family)
             .arg("--cuda-arch")
             .arg(cuda_arch.to_string())
             .arg("--tilelang-src")
@@ -882,6 +527,24 @@ fn generate_tilelang_artifacts_per_sm(
             .arg(cutlass_include)
             .arg("--cuda-include")
             .arg(format!("{cuda_path}/include"))
+            .args(
+                base_spec
+                    .kernel_key
+                    .into_iter()
+                    .flat_map(|key| ["--kernel-key".to_string(), key.to_string()]),
+            )
+            .args(
+                base_spec
+                    .num_q_heads
+                    .into_iter()
+                    .flat_map(|heads| ["--num-q-heads".to_string(), heads.to_string()]),
+            )
+            .args(
+                base_spec
+                    .num_kv_heads
+                    .into_iter()
+                    .flat_map(|heads| ["--num-kv-heads".to_string(), heads.to_string()]),
+            )
             .output()
             .unwrap_or_else(|err| {
                 panic!(
@@ -965,11 +628,11 @@ fn build_tilelang_kernel(
         .collect();
 
     let public_name = format!("{}_cuda", base_spec.kernel_name);
-    let public_decl = format!("{public_name}({TILELANG_DISPATCH_PUBLIC_DECL})");
+    let public_decl = format!("{public_name}({})", base_spec.public_decl);
     let wrapper_src = format_dispatch_wrapper(
         &public_decl,
-        TILELANG_DISPATCH_EXTERN_DECL,
-        TILELANG_DISPATCH_CALL_ARGS,
+        base_spec.extern_decl,
+        base_spec.call_args,
         &pairs,
     );
 
@@ -998,8 +661,13 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             kernel_path: "tools/tilelang/batch_prefill_paged_hd128.py",
             kernel_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
             out_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
-            num_q_heads: q,
-            num_kv_heads: kv,
+            kernel_family: "attention",
+            kernel_key: None,
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_CALL_ARGS,
         };
         build_tilelang_kernel(
             &python,
@@ -1020,8 +688,13 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             kernel_path: "tools/tilelang/batch_prefill_paged_hd256.py",
             kernel_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
             out_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
-            num_q_heads: q,
-            num_kv_heads: kv,
+            kernel_family: "attention",
+            kernel_key: None,
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_CALL_ARGS,
         };
         build_tilelang_kernel(
             &python,
@@ -1035,32 +708,124 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         );
     }
 
-    // HD256 decode AOT codegen currently fails with `M must be divisible by 16,
-    // but got 1` under TileLang 0.1.9 (BLOCK_M=1 violates GemmWarpPolicy). Gated
-    // behind an opt-in feature so the canonical Qwen3-4B HD128 build is unaffected.
-    // See docs/experience/errors/2026-04-28-tilelang-hd256-decode-m1-codegen-failure.md.
-    if std::env::var("CARGO_FEATURE_TILELANG_DECODE_HD256").is_ok() {
-        for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
-                kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
-                kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
-                out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
-                num_q_heads: q,
-                num_kv_heads: kv,
-            };
-            build_tilelang_kernel(
-                &python,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &tilelang_src,
-                &cutlass_include,
-                &spec,
-                &mut generated_sources,
-            );
-        }
+    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
+            kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
+            kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
+            out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
+            kernel_family: "attention",
+            kernel_key: None,
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_CALL_ARGS,
+        };
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &spec,
+            &mut generated_sources,
+        );
+    }
+
+    let gdr_specs = [
+        TileLangKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_prepare".to_string(),
+            kernel_path: "tools/tilelang/gated_delta_rule.py",
+            kernel_name: "gated_delta_rule_prefill_chunk_prepare".to_string(),
+            out_name: "tilelang_gated_delta_rule_chunk_prepare".to_string(),
+            kernel_family: "gdr",
+            kernel_key: Some("gdr_chunk_prepare"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: GDR_PREPARE_PUBLIC_DECL,
+            extern_decl: GDR_PREPARE_EXTERN_DECL,
+            call_args: GDR_PREPARE_CALL_ARGS,
+        },
+        TileLangKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_cumsum".to_string(),
+            kernel_path: "tools/tilelang/gated_delta_rule.py",
+            kernel_name: "gated_delta_rule_prefill_chunk_cumsum".to_string(),
+            out_name: "tilelang_gated_delta_rule_chunk_cumsum".to_string(),
+            kernel_family: "gdr",
+            kernel_key: Some("gdr_chunk_cumsum"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: GDR_CUMSUM_PUBLIC_DECL,
+            extern_decl: GDR_CUMSUM_EXTERN_DECL,
+            call_args: GDR_CUMSUM_CALL_ARGS,
+        },
+        TileLangKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_a".to_string(),
+            kernel_path: "tools/tilelang/gated_delta_rule.py",
+            kernel_name: "gated_delta_rule_prefill_chunk_a".to_string(),
+            out_name: "tilelang_gated_delta_rule_chunk_a".to_string(),
+            kernel_family: "gdr",
+            kernel_key: Some("gdr_chunk_a"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: GDR_A_PUBLIC_DECL,
+            extern_decl: GDR_A_EXTERN_DECL,
+            call_args: GDR_A_CALL_ARGS,
+        },
+        TileLangKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_recompute".to_string(),
+            kernel_path: "tools/tilelang/gated_delta_rule.py",
+            kernel_name: "gated_delta_rule_prefill_chunk_recompute".to_string(),
+            out_name: "tilelang_gated_delta_rule_chunk_recompute".to_string(),
+            kernel_family: "gdr",
+            kernel_key: Some("gdr_chunk_recompute"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: GDR_RECOMPUTE_PUBLIC_DECL,
+            extern_decl: GDR_RECOMPUTE_EXTERN_DECL,
+            call_args: GDR_RECOMPUTE_CALL_ARGS,
+        },
+        TileLangKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_state".to_string(),
+            kernel_path: "tools/tilelang/gated_delta_rule.py",
+            kernel_name: "gated_delta_rule_prefill_chunk_state".to_string(),
+            out_name: "tilelang_gated_delta_rule_chunk_state".to_string(),
+            kernel_family: "gdr",
+            kernel_key: Some("gdr_chunk_state"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: GDR_STATE_PUBLIC_DECL,
+            extern_decl: GDR_STATE_EXTERN_DECL,
+            call_args: GDR_STATE_CALL_ARGS,
+        },
+        TileLangKernelSpec {
+            artifact_dir: "gated_delta_rule_chunk_o".to_string(),
+            kernel_path: "tools/tilelang/gated_delta_rule.py",
+            kernel_name: "gated_delta_rule_prefill_chunk_o".to_string(),
+            out_name: "tilelang_gated_delta_rule_chunk_o".to_string(),
+            kernel_family: "gdr",
+            kernel_key: Some("gdr_chunk_o"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: GDR_O_PUBLIC_DECL,
+            extern_decl: GDR_O_EXTERN_DECL,
+            call_args: GDR_O_CALL_ARGS,
+        },
+    ];
+    for spec in &gdr_specs {
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            spec,
+            &mut generated_sources,
+        );
     }
 
     let mut build = cc::Build::new();
@@ -1075,13 +840,8 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
     build.compile("tilelang_kernels_aot");
 
     println!("cargo:rustc-link-lib=cuda");
-    let decode_hd256_msg = if std::env::var("CARGO_FEATURE_TILELANG_DECODE_HD256").is_ok() {
-        " + HD256 decode"
-    } else {
-        " (HD256 decode gated behind --features tilelang-decode-hd256; falls back to FlashInfer)"
-    };
     println!(
-        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill{decode_hd256_msg}; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill, HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
         sm_targets.len()
     );
     for entry in std::fs::read_dir("tools/tilelang")
@@ -1116,70 +876,23 @@ fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Find FlashInfer C++ include directory.
-///
-/// Search order:
-///   1. FLASHINFER_INCLUDE_DIR env var (explicit override)
-///   2. `pip show flashinfer-python` → Location + /flashinfer/data/include
-///   3. `python3 -c "import flashinfer; ..."` (legacy, needs working import)
-fn find_flashinfer_include() -> Option<String> {
-    // 1. Explicit override
-    if let Ok(dir) = std::env::var("FLASHINFER_INCLUDE_DIR") {
-        if Path::new(&dir).join("flashinfer").exists() {
-            return Some(dir);
-        }
-    }
-
-    // 2. pip show (works even when flashinfer can't be imported)
-    let python = std::env::var("INFER_TRITON_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    if let Ok(output) = Command::new(&python)
-        .args(["-m", "pip", "show", "flashinfer-python"])
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(loc) = line.strip_prefix("Location: ") {
-                    let candidate = format!("{}/flashinfer/data/include", loc.trim());
-                    if Path::new(&candidate).join("flashinfer").exists() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Legacy: import flashinfer
-    if let Ok(output) = Command::new(&python)
-        .args(["-c", "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data', 'include'))"])
-        .output()
-    {
-        if output.status.success() {
-            let inc = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if Path::new(&inc).join("flashinfer").exists() {
-                return Some(inc);
-            }
-        }
-    }
-
-    None
-}
-
 fn main() {
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
         println!("cargo:warning=metal feature active: relying on mlx-sys bridge only.");
     }
 
     if std::env::var("CARGO_FEATURE_CUDA").is_err() {
-        println!("cargo:warning=cuda feature inactive: skipping CUDA/Triton kernel compilation.");
+        println!("cargo:warning=cuda feature inactive: skipping CUDA/TileLang kernel compilation.");
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
         return;
     }
 
     // When the `no-cuda` feature is active (e.g. macOS dev machines without a GPU),
-    // skip all CUDA/Triton compilation. GPU ops will panic at runtime.
+    // skip all CUDA/TileLang compilation. GPU ops will panic at runtime.
     if std::env::var("CARGO_FEATURE_NO_CUDA").is_ok() {
-        println!("cargo:warning=no-cuda feature active: skipping CUDA/Triton kernel compilation.");
+        println!(
+            "cargo:warning=no-cuda feature active: skipping CUDA/TileLang kernel compilation."
+        );
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_CUDA");
         return;
     }
@@ -1237,20 +950,6 @@ fn main() {
             ]);
         }
 
-        // FlashInfer headers for flashinfer_*.cu files
-        if stem.starts_with("flashinfer_") {
-            let fi_include = find_flashinfer_include();
-            if let Some(ref inc) = fi_include {
-                nvcc_args.extend([
-                    format!("-I{}", inc),
-                    format!("-I{}/flashinfer", inc),
-                    "-std=c++17".to_string(),
-                    "--expt-relaxed-constexpr".to_string(),
-                ]);
-                println!("cargo:warning=FlashInfer include: {}", inc);
-            }
-        }
-
         let status = Command::new(&nvcc)
             .args(&nvcc_args)
             .status()
@@ -1280,12 +979,7 @@ fn main() {
 
     assert!(status.success(), "ar failed");
 
-    compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
-
-    if std::env::var("CARGO_FEATURE_TILELANG_ATTN").is_ok() {
-        compile_tilelang_aot_kernels(&cuda_path, &out_dir, &sm_targets);
-    }
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TILELANG_ATTN");
+    compile_tilelang_aot_kernels(&cuda_path, &out_dir, &sm_targets);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     if cfg!(target_os = "windows") {

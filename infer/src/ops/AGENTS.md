@@ -14,7 +14,7 @@ Load before adding or modifying any op.
 
 ```
 ops.rs                — module root, submodule #[path] decls, pub surface
-ops/attention.rs      — prefill (FlashInfer HD128/HD256) + decode (Triton AOT / custom CUDA)
+ops/attention.rs      — TileLang paged prefill/decode + quantized custom CUDA decode
 ops/linear.rs         — gemm, gemv, fused_mlp
 ops/norm.rs           — rms_norm, fused_add_rms_norm (batched + offset variants)
 ops/embedding.rs      — embedding_batch, embedding_decode_into
@@ -28,10 +28,10 @@ ops/tests.rs          — unit tests (CPU can run with `no-cuda`)
 ## Visibility policy
 
 - **`pub`** — ops used outside this crate's `model/` + `backend/` (today:
-  `flashinfer_run_layer`, `gemm`, `gemv`, `fused_mlp_into`, the non-batched
+  `tilelang_tc_run_layer`, `gemm`, `gemv`, `fused_mlp_into`, the non-batched
   `rms_norm_into`, sampling entry points, `scatter_write_kv`).
 - **`pub(crate)`** — batched `_batched_into` variants, anything with a
-  `_batch` suffix, and model-internal fused paths (`flash_attention_prefill_hd256_into`,
+  `_batch` suffix, and model-internal fused paths (`nonpaged_prefill_hd256_into`,
   `attention_gate_paged_hd256`, `fused_add_rms_norm_batch_into`).
 
 Keep the `pub` surface small: the `_batched_into` + scheduler paths are
@@ -64,24 +64,23 @@ there's an existing caller that can't hold the buffer.
 4. **Parameter structs for high-arity ops.** See `attention.rs::NormRopeParams`,
    `HeadConfig`, `PagedKVMeta`. ≥4 related params → make a struct.
 5. **Attention decode has three paged paths** (`attention.rs`): BF16 via
-   FlashInfer, INT8 via custom split-KV kernel with fused dequant, FP8 via
-   custom split-KV kernel with FP32 cast. The selector is `KVFormat`, not
+   TileLang paged attention, INT8 via custom split-KV kernel with fused
+   dequant, FP8 via custom split-KV kernel with FP32 cast. The selector is `KVFormat`, not
    the model — adding a fourth format means a fourth path.
-6. **Prefill dispatches on head dim:** HD128 → `flashinfer_batch_forward_with_layout`,
-   HD256 → `flashinfer_batch_forward_hd256`. Qwen3 = HD128;
+6. **Prefill dispatches on head dim:** HD128 -> TileLang paged prefill HD128,
+   HD256 -> TileLang paged prefill HD256. Qwen3 = HD128;
    Qwen3.5 full-attention = HD256.
-7. **Single-token decode** uses the Triton AOT kernel that fuses QK-norm +
-   RoPE + split-KV attention + online softmax + merge in one launch. Don't
-   split it without a bench snapshot.
+7. **Single-token BF16 decode** uses the TileLang paged decode path. Don't
+   split or add a second BF16 path without a bench snapshot.
 
 ## Pointers
 
 - `crates/cuda-kernels/src/prelude.rs` — the types you're allowed to
   take as arguments across the crate boundary.
 - `crates/cuda-kernels/csrc/` — the underlying CUDA C source.
-- `crates/cuda-kernels/tools/triton/` — Triton AOT kernel definitions.
+- `crates/cuda-kernels/tools/tilelang/` — TileLang AOT kernel definitions.
 - `docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md` — the
   audited kernel heat map; don't add a new op without checking where it
   lands on this list.
 - `docs/experience/wins/2026-04-14-bench-single-token-kernel-port.md` —
-  why the Triton→CUDA C port for Qwen3-4B decode was worth it.
+  historical context for the single-token CUDA C decode port.

@@ -71,7 +71,7 @@ pub(crate) fn silu_mul_batch_into(
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
     let result = unsafe {
-        ffi::silu_mul_triton_aot_cuda(
+        ffi::silu_mul_cuda(
             g_ptr as *const ffi::Half,
             u_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,

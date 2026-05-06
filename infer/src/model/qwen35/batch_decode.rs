@@ -1,7 +1,7 @@
 //! Batched decode for Qwen3.5: process multiple requests in one forward pass.
 //!
 //! Hybrid architecture: 8 full attention layers use HD256 paged decode
-//! (FlashInfer for BF16 pools, custom quantized kernels otherwise), and
+//! (TileLang for BF16 pools, custom quantized kernels otherwise), and
 //! 24 linear attention layers use batched recurrent kernels (conv1d + GDR)
 //! via pointer arrays.
 
@@ -21,7 +21,7 @@ use crate::model::kv_cache::KVFormat;
 use crate::ops;
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
-use cuda_kernels::prelude::{DeviceContext, FlashInferDecodeMetadata, HiddenStates, PagedKVPool};
+use cuda_kernels::prelude::{DeviceContext, HiddenStates, PagedKVPool, TileLangDecodeMetadata};
 
 // ── Sub-structs ─────────────────────────────────────────────────────────────
 
@@ -145,8 +145,8 @@ pub struct BatchDecodeBuffers35 {
     token_ids_gpu: CudaSlice<i32>,
     token_ids_scratch: Vec<i32>,
 
-    // ── FlashInfer metadata (for full attention layers) ──
-    pub(crate) metadata: FlashInferDecodeMetadata,
+    // ── TileLang metadata (for full attention layers) ──
+    pub(crate) metadata: TileLangDecodeMetadata,
     /// Packed page-aware metadata for quantized decode kernels:
     /// `[page_indptr..., last_page_len...]`.
     quantized_kv_meta: CudaSlice<i32>,
@@ -260,7 +260,7 @@ impl BatchDecodeBuffers35 {
                 .map_err(|e| anyhow::anyhow!("Alloc token_ids_gpu: {e}"))?,
             token_ids_scratch: Vec::with_capacity(max_batch_size),
 
-            metadata: FlashInferDecodeMetadata::new(
+            metadata: TileLangDecodeMetadata::new(
                 ctx,
                 max_batch_size,
                 max_total_pages,
@@ -331,38 +331,15 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         head_dim: usize,
         kv_format: crate::model::kv_cache::KVFormat,
     ) -> Result<()> {
-        // Only BF16 full-attention layers run through FlashInfer HD256.
-        // FP8/INT8/TurboQuant decode uses quantized kernels instead.
-        // FlashInfer plans once per forward; the TileLang HD256 decode kernel
-        // is plan-less, so this gate must match the actual decode-kernel
-        // selector. The broader `tilelang-attn` feature only covers HD128
-        // prefill/TC-decode paths and still needs FlashInfer's HD256 plan.
-        // Metadata uploads (positions, kv_indptr, kv_indices,
-        // kv_last_page_len, qo_indptr) above in `update_metadata` are needed
-        // by both paths and stay unconditional.
-        #[cfg(not(feature = "tilelang-decode-hd256"))]
-        if kv_format == KVFormat::BF16 {
-            self.metadata.plan_hd256(
-                ctx,
-                batch_size,
-                num_q_heads,
-                num_kv_heads,
-                page_size,
-                head_dim,
-            )?;
-        }
-        #[cfg(feature = "tilelang-decode-hd256")]
-        {
-            let _ = (
-                ctx,
-                batch_size,
-                num_q_heads,
-                num_kv_heads,
-                page_size,
-                head_dim,
-                kv_format,
-            );
-        }
+        let _ = (
+            ctx,
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            kv_format,
+        );
         Ok(())
     }
 
@@ -576,7 +553,7 @@ impl Qwen35Model {
                         group_idx += 1;
                     }
 
-                    // Full attention: always eager (FlashInfer metadata changes)
+                    // Full attention: always eager while metadata changes between batches.
                     let hidden = unsafe { &mut *hidden_ptr };
                     self.decode_batch_full_attn_layer(
                         layer, attn, hidden, bufs, kv_pool, full_idx, batch_size,
@@ -1011,11 +988,8 @@ impl Qwen35Model {
                     )?;
                 }
                 KVFormat::BF16 => {
-                    // qo_indptr / max_qlen / total_pages are TileLang-only
-                    // (FlashInfer pulls them from plan_info), but we compute
-                    // them unconditionally so the call shape is uniform across
-                    // cfg arms. Decode = 1 Q row per request → max_qlen=1 and
-                    // total_q_tokens=batch_size. Mirrors the T4 TC-decode
+                    // Decode = 1 Q row per request -> max_qlen=1 and
+                    // total_q_tokens=batch_size. Mirrors the TC-decode
                     // pattern in qwen3/batch_decode.rs.
                     let max_qlen = bufs
                         .metadata
@@ -1025,7 +999,7 @@ impl Qwen35Model {
                         .max()
                         .unwrap_or(0);
                     let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
-                    ops::flashinfer_run_layer_hd256(
+                    ops::tilelang_run_layer_hd256(
                         &self.ctx,
                         &bufs.attn.q_batch,
                         kv_pool,
@@ -1035,8 +1009,8 @@ impl Qwen35Model {
                         &bufs.metadata.kv_indices,
                         &bufs.metadata.kv_last_page_len,
                         &mut bufs.attn.attn_output,
-                        &mut bufs.metadata.flashinfer_ws,
-                        &ops::FlashInferHeadConfig {
+                        &mut bufs.metadata.tilelang_ws,
+                        &ops::TileLangHeadConfig {
                             num_qo_heads: num_heads,
                             num_kv_heads,
                             page_size,
