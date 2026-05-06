@@ -87,8 +87,42 @@ Evidence so far:
 Not bisected further in this session; the remote validation task was
 to verify A–I, and those are clean.
 
+## 2026-05-06 update — CUDA Graph gibberish fixed, B=3 divergence remains
+
+Re-tested on RTX 4070 Ti SUPER (`sm_89`, CUDA 13.2,
+`NVCC_CCBIN=/usr/bin/g++-14`) after the Qwen3 BF16 TileLang decode path was
+made default. Two distinct failures were present:
+
+1. With CUDA Graph enabled, B=1 decode became gibberish after roughly the
+   first page boundary. Root cause: the TileLang paged attention launch passed
+   the current per-batch `total_pages` as a host scalar. CUDA Graph captures
+   kernel launch scalars by value, so warmup/capture froze the bound at the
+   dummy one-page shape; later replay rejected reads past that captured bound.
+   Fix: pass the static KV-pool page capacity and rely on `kv_indptr` for
+   per-request bounds.
+2. With CUDA Graph disabled, B=1 and B=3 both produce coherent text, but still
+   follow different greedy trajectories. Forcing the target request into row 0
+   and serializing concurrent prefill did not remove the divergence, pointing
+   at batch-size-sensitive decode numerics rather than a row-index or batched
+   prefill bookkeeping bug. This matches the numerical-consistency lesson in
+   `2026-04-15-e2e-phase3-replay-drift.md`; the exact-equality assertion in
+   `greedy_consistency` is still not a valid proof target for the current
+   batched TileLang path.
+
+Validation after the graph fix:
+
+- `cargo test --release -p infer --features cuda --test e2e -- --nocapture`
+  passes on Qwen3-4B with CUDA Graph enabled.
+- `cargo test --release -p infer --features cuda --test greedy_consistency -- --nocapture`
+  still fails, but the outputs are coherent B=1/B=3 trajectories rather than
+  the previous graph replay gibberish.
+
 ## Fix
-Open. Candidate investigation steps, in order of cost:
+Partially fixed. The CUDA Graph replay bug is fixed by using a graph-stable
+TileLang page-capacity launch scalar. The B=3 exact greedy divergence remains
+open as a separate numerical-consistency/test-contract issue.
+
+Candidate investigation steps for the remaining B=3 lane, in order of cost:
 
 1. Re-read `decode.rs:256` batched sampling buffer bookkeeping —
    look for stride mismatch introduced by the

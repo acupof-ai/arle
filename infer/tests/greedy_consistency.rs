@@ -27,6 +27,13 @@ fn init_logging() {
     infer::logging::init_stderr("info");
 }
 
+fn cuda_graph_enabled() -> bool {
+    !matches!(
+        std::env::var("INFER_TEST_CUDA_GRAPH").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF")
+    )
+}
+
 /// Collect the full text output from a stream of deltas.
 fn collect_output(rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>) -> String {
     let mut text = String::new();
@@ -69,10 +76,11 @@ fn make_request(
 
 /// Run a single request through the scheduler (solo = batch_size=1 during decode).
 fn run_solo(prompt: &str, max_tokens: usize, model_path: &str) -> String {
+    let enable_cuda_graph = cuda_graph_enabled();
     let model = Qwen3Model::from_safetensors_with_runtime(
         model_path,
         ModelRuntimeConfig {
-            enable_cuda_graph: true,
+            enable_cuda_graph,
             ..ModelRuntimeConfig::default()
         },
     )
@@ -109,10 +117,11 @@ fn run_concurrent(
     filler_prompts: &[&str],
     model_path: &str,
 ) -> String {
+    let enable_cuda_graph = cuda_graph_enabled();
     let model = Qwen3Model::from_safetensors_with_runtime(
         model_path,
         ModelRuntimeConfig {
-            enable_cuda_graph: true,
+            enable_cuda_graph,
             ..ModelRuntimeConfig::default()
         },
     )
@@ -169,6 +178,7 @@ fn test_greedy_solo_vs_concurrent() {
 
     let prompt = "Tell me a story";
     let max_tokens = 30;
+    info!("CUDA graph enabled: {}", cuda_graph_enabled());
 
     info!("=== Solo run (B=1 decode) ===");
     let t0 = Instant::now();
