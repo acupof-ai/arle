@@ -137,6 +137,54 @@ Candidate investigation steps for the remaining B=3 lane, in order of cost:
 4. Bisect the 6 suspect commits in order (all compile independently
    because none overlap in the scheduler file set).
 
+## Update — 2026-05-07 — `INFER_DETERMINISTIC=1` fixes B=1, B=3 still wrong
+
+After the graph-bounds fix, the next layer of the bug is the warmup
+cublasLt autotune. `autotune_all_cached_gemms_cuda` keys the algo cache
+by `(M, N, K)`; B=1 and B=3 GEMMs land on different M and pick different
+fp accumulation paths, which is enough to flip greedy argmax across
+batch sizes.
+
+`infer/src/scheduler/cuda/core/warmup.rs` now reads `INFER_DETERMINISTIC`;
+when set, it skips the autotune step and lets cublasLtMatmulAlgoGetHeuristic
+return its default top-1 candidate. With `INFER_DETERMINISTIC=1` the
+solo (B=1) `greedy_consistency` output recovers to the HF baseline in
+`infer/test_data/Qwen3-4B.json`:
+
+```
+" about a young girl who is a talented artist, but she is not allowed
+to paint because of her gender. What happens next? Please write in a"
+```
+
+This is byte-exact against the `tell_story` baseline. So the autotune
+algo selection was the dominant numerical drift source for solo decode.
+
+The concurrent (B=3) trajectory still diverges into the
+`" about a young girl named Lila who is a talented painter, …"` lane
+(the same wrong-path string also recorded under
+[`2026-04-15-e2e-phase3-replay-drift.md`](2026-04-15-e2e-phase3-replay-drift.md)).
+That residue is **not** in the autotune step (heuristic-only is in
+effect for both runs); it must be in a kernel whose computation is
+batch-shape sensitive even with a fixed cublasLt algo — most likely
+candidates:
+
+- `decode_prep_paged` batched fused QK-norm + RoPE + paged write —
+  per-row in principle, but worth a memcheck pass with B=3 to verify
+  no cross-row spill.
+- TileLang prefill-as-decode alias kernel
+  (`tilelang_batch_prefill_paged_hd128_q32_kv8`) — grid `(1, num_q_heads, B)`,
+  per-block independent in the kernel source, but `total_q_tokens` /
+  `qo_indptr` change with B and feed the kernel scalar args; if any
+  block-shared shmem region or atomic counter is keyed on those, the
+  per-row arithmetic could subtly differ.
+- The `cublasLtMatmulAlgoGetHeuristic` top-1 itself is M-dependent —
+  for `(N=2560, K=2560)` it may choose a different algo for M=1 vs
+  M=3 even with autotune off. Pinning a single algo across M (e.g.
+  via a custom shape-key normalizer in
+  `crates/cuda-kernels/csrc/gemm/gemv.cu::GemmKey`) is the next concrete
+  knob to try if `decode_prep_paged` and the TileLang alias come up
+  clean under compute-sanitizer.
+
 ## Rule
 - Never run `cargo test --release --test greedy_consistency` on L4 in
   isolation and trust "it passes" from an older win doc; the test was

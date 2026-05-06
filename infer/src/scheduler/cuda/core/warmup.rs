@@ -97,7 +97,22 @@ impl<M: ModelForward> Scheduler<M> {
             // Autotune: benchmark all heuristic candidates, replace with measured best.
             // Runs regardless of graph mode so eager LoRA decode lands on the same
             // tuned algorithms as graph-mode decode.
-            if warmed > 0 {
+            //
+            // INFER_DETERMINISTIC=1 skips autotune. Reason: autotune keys the algo
+            // cache by (M,N,K); B=1 vs B=3 GEMMs land on different M and may pick
+            // different cublasLt algorithms with different fp accumulation order,
+            // which cascades into per-batch greedy divergence (the deferred
+            // greedy_consistency failure tracked in
+            // docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md).
+            // With autotune off, cublasLtMatmulAlgoGetHeuristic returns the same
+            // top-ranked candidate for similar shapes regardless of M, restoring
+            // batch-invariant numerics at a small perf cost. Production keeps the
+            // default (autotune on) for max throughput.
+            let deterministic = matches!(
+                std::env::var("INFER_DETERMINISTIC").as_deref(),
+                Ok("1" | "true" | "TRUE" | "on" | "ON")
+            );
+            if warmed > 0 && !deterministic {
                 info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
                 let t_at = std::time::Instant::now();
                 unsafe {
@@ -109,7 +124,13 @@ impl<M: ModelForward> Scheduler<M> {
                     "cublasLt autotune done in {:.0}ms",
                     t_at.elapsed().as_secs_f64() * 1e3,
                 );
-
+            } else if deterministic {
+                info!(
+                    "INFER_DETERMINISTIC=1 — skipping cublasLt autotune; \
+                     using heuristic top-1 for batch-invariant numerics"
+                );
+            }
+            if warmed > 0 && !deterministic {
                 if graph_capture_enabled {
                     // Invalidate graphs captured with heuristic algos.
                     {
