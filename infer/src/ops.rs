@@ -128,6 +128,7 @@ pub trait OpsBackend {
     type Tensor;
     type TensorBatch;
     type Matrix;
+    type Embedding;
     type TokenIds;
     type SamplingScratch;
     type SamplingOutput;
@@ -215,14 +216,14 @@ pub trait OpsBackend {
 
     fn embedding_decode_into(
         &self,
-        embed: &Self::Matrix,
+        embed: &Self::Embedding,
         token_ids: &Self::TokenIds,
         out: &mut Self::Tensor,
     ) -> Result<()>;
 
     fn embedding_batch_into(
         &self,
-        embed: &Self::Matrix,
+        embed: &Self::Embedding,
         token_ids: &Self::TokenIds,
         out: &mut Self::TensorBatch,
     ) -> Result<()>;
@@ -281,6 +282,7 @@ impl OpsBackend for CudaOpsBackend<'_> {
     type Tensor = cuda_kernels::prelude::DeviceVec;
     type TensorBatch = cuda_kernels::prelude::HiddenStates;
     type Matrix = cuda_kernels::prelude::DeviceMatrix;
+    type Embedding = cuda_kernels::prelude::DeviceMatrix;
     type TokenIds = cudarc::driver::CudaSlice<i32>;
     type SamplingScratch = cudarc::driver::CudaSlice<f32>;
     type SamplingOutput = cudarc::driver::CudaSlice<i32>;
@@ -393,7 +395,7 @@ impl OpsBackend for CudaOpsBackend<'_> {
 
     fn embedding_decode_into(
         &self,
-        embed: &Self::Matrix,
+        embed: &Self::Embedding,
         token_ids: &Self::TokenIds,
         out: &mut Self::Tensor,
     ) -> Result<()> {
@@ -402,7 +404,7 @@ impl OpsBackend for CudaOpsBackend<'_> {
 
     fn embedding_batch_into(
         &self,
-        embed: &Self::Matrix,
+        embed: &Self::Embedding,
         token_ids: &Self::TokenIds,
         out: &mut Self::TensorBatch,
     ) -> Result<()> {
