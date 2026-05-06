@@ -28,10 +28,7 @@ mod cuda;
 #[cfg(test)]
 mod tests;
 
-pub use batch::{
-    BatchScheduler, BatchSchedulerConfig, DecodeBatch, PendingRequest, PrefillBatch,
-    RunningRequest, ScheduleDecision,
-};
+pub use batch::{BatchScheduler, BatchSchedulerConfig, PendingRequest, RunningRequest};
 #[cfg(feature = "cuda")]
 pub use cuda::Scheduler;
 pub use forward_batch::{
