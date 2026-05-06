@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::{
     gguf::GgufFile,
+    model_arch::ModelArchInfo,
     model_registry::{ModelArch, detect_arch_from_json},
 };
 
@@ -121,6 +122,52 @@ pub(crate) struct MetalModelConfig {
 impl MetalModelConfig {
     pub(super) fn is_stop_token(&self, token_id: u32) -> bool {
         self.stop_token_ids.contains(&token_id)
+    }
+}
+
+impl ModelArchInfo for MetalModelConfig {
+    fn arch_kind(&self) -> ModelArch {
+        match &self.arch {
+            MetalModelArch::Qwen3 => ModelArch::Qwen3,
+            MetalModelArch::Qwen35(arch) if arch.moe.is_some() => ModelArch::Qwen3_5_Moe,
+            MetalModelArch::Qwen35(_) => ModelArch::Qwen35,
+        }
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    fn num_hidden_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+
+    fn num_kv_layers(&self) -> usize {
+        match &self.arch {
+            MetalModelArch::Qwen3 => self.num_hidden_layers,
+            MetalModelArch::Qwen35(arch) => arch.num_full_attention_layers(),
+        }
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.num_key_value_heads
+    }
+
+    fn num_q_heads(&self) -> usize {
+        self.num_attention_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    fn kv_cache_bytes_per_token(&self) -> usize {
+        // 2 (K+V) * full-KV layers * num_kv_heads * head_dim * 2 (bf16 = 2 bytes).
+        2 * self.num_kv_layers() * self.num_key_value_heads * self.head_dim * 2
     }
 }
 
@@ -506,12 +553,41 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::model_arch::ModelArchInfo;
+
     use super::{MetalModelArch, MetalNormWeightMode, load_metal_config};
 
     fn write_config_file(contents: &str) -> tempfile::TempDir {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("config.json"), contents).unwrap();
         dir
+    }
+
+    #[test]
+    fn qwen3_arch_summary_counts_all_layers() {
+        let dir = write_config_file(
+            r#"{
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 2560,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 36,
+                "head_dim": 128,
+                "vocab_size": 151936
+            }"#,
+        );
+
+        let config = load_metal_config(dir.path()).unwrap();
+        let summary = config.arch_summary();
+        assert_eq!(summary.arch, crate::model_registry::ModelArch::Qwen3);
+        assert_eq!(summary.hidden_size, 2560);
+        assert_eq!(summary.vocab_size, 151_936);
+        assert_eq!(summary.num_hidden_layers, 36);
+        assert_eq!(summary.num_kv_layers, 36);
+        assert_eq!(summary.num_kv_heads, 8);
+        assert_eq!(summary.num_q_heads, 32);
+        assert_eq!(summary.head_dim, 128);
+        assert_eq!(summary.kv_cache_bytes_per_token, 2 * 36 * 8 * 128 * 2);
     }
 
     #[test]
@@ -531,6 +607,14 @@ mod tests {
         );
 
         let config = load_metal_config(dir.path()).unwrap();
+        let summary = config.arch_summary();
+        assert_eq!(summary.arch, crate::model_registry::ModelArch::Qwen35);
+        assert_eq!(summary.num_hidden_layers, 2);
+        assert_eq!(summary.num_kv_layers, 1);
+        assert_eq!(summary.num_kv_heads, 8);
+        assert_eq!(summary.num_q_heads, 32);
+        assert_eq!(summary.head_dim, 80);
+        assert_eq!(summary.kv_cache_bytes_per_token, 2 * 1 * 8 * 80 * 2);
         assert_eq!(config.norm_weight_mode, MetalNormWeightMode::Direct);
         match config.arch {
             MetalModelArch::Qwen35(arch) => {
@@ -601,6 +685,11 @@ mod tests {
         );
 
         let config = load_metal_config(dir.path()).unwrap();
+        let summary = config.arch_summary();
+        assert_eq!(summary.arch, crate::model_registry::ModelArch::Qwen3_5_Moe);
+        assert_eq!(summary.num_hidden_layers, 4);
+        assert_eq!(summary.num_kv_layers, 2);
+        assert_eq!(summary.kv_cache_bytes_per_token, 2 * 2 * 2 * 128 * 2);
         match config.arch {
             MetalModelArch::Qwen35(arch) => {
                 let moe = arch.moe.expect("expected nested moe_config to be loaded");
