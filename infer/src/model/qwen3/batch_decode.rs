@@ -830,24 +830,21 @@ impl Qwen3Model {
                 )?;
             }
 
-            ops::gemm_into(
-                &self.ctx,
+            ops_backend.linear_batch_into(
                 &layer.attention.q_proj,
                 &mixed.normed,
                 &mut mixed.q_batch,
-            );
-            ops::gemm_into(
-                &self.ctx,
+            )?;
+            ops_backend.linear_batch_into(
                 &layer.attention.k_proj,
                 &mixed.normed,
                 &mut mixed.k_batch,
-            );
-            ops::gemm_into(
-                &self.ctx,
+            )?;
+            ops_backend.linear_batch_into(
                 &layer.attention.v_proj,
                 &mixed.normed,
                 &mut mixed.v_batch,
-            );
+            )?;
 
             let nrp = ops::NormRopeParams {
                 q_norm: &layer.attention.q_norm,
@@ -1069,12 +1066,11 @@ impl Qwen3Model {
                 }
             }
 
-            ops::gemm_into(
-                &self.ctx,
+            ops_backend.linear_batch_into(
                 &layer.attention.o_proj,
                 &mixed.attn_output,
                 &mut mixed.o_buf,
-            );
+            )?;
             self.layer_communicator
                 .post_attn_all_reduce_hidden_states(&mut mixed.o_buf)?;
             ops_backend.fused_add_rms_norm_batch_into(
@@ -1085,18 +1081,12 @@ impl Qwen3Model {
                 &mut mixed.normed,
             )?;
 
-            ops::gemm_into(
-                &self.ctx,
+            ops_backend.linear_batch_into(
                 &layer.mlp.gate_proj,
                 &mixed.normed,
                 &mut mixed.gate_out,
-            );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.up_proj,
-                &mixed.normed,
-                &mut mixed.up_out,
-            );
+            )?;
+            ops_backend.linear_batch_into(&layer.mlp.up_proj, &mixed.normed, &mut mixed.up_out)?;
             ops::silu_mul_batch_into(
                 &self.ctx,
                 &mixed.gate_out,
@@ -1104,12 +1094,11 @@ impl Qwen3Model {
                 &mut mixed.act_out,
             )?;
 
-            ops::gemm_into(
-                &self.ctx,
+            ops_backend.linear_batch_into(
                 &layer.mlp.down_proj,
                 &mixed.act_out,
                 &mut mixed.o_buf,
-            );
+            )?;
             self.layer_communicator
                 .post_mlp_all_reduce_hidden_states(&mut mixed.o_buf)?;
 
@@ -1183,12 +1172,11 @@ impl Qwen3Model {
         // sized for max_batch_size only.
         mixed.normed.seq_len = kept_rows;
         mixed.logits.seq_len = kept_rows;
-        ops::gemm_into(
-            &self.ctx,
+        ops_backend.linear_batch_into(
             self.output_projection(),
             &mixed.normed,
             &mut mixed.logits,
-        );
+        )?;
 
         let decode_logits = unsafe { &mut *logits_batch_ptr };
         decode_logits.seq_len = b;
@@ -1412,12 +1400,7 @@ impl Qwen3Model {
         ops_backend.rms_norm_batch_into(hidden, &self.norm, eps, &mut bufs.normed)?;
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
-        ops::gemm_into(
-            &self.ctx,
-            self.output_projection(),
-            &bufs.normed,
-            logits_buf,
-        );
+        ops_backend.linear_batch_into(self.output_projection(), &bufs.normed, logits_buf)?;
         Ok(())
     }
 
@@ -1453,24 +1436,9 @@ impl Qwen3Model {
         }
 
         // Split QKV projections so LoRA adds can compose.
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.q_proj,
-            &bufs.normed,
-            &mut bufs.q_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.k_proj,
-            &bufs.normed,
-            &mut bufs.k_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.v_proj,
-            &bufs.normed,
-            &mut bufs.v_batch,
-        );
+        ops_backend.linear_batch_into(&layer.attention.q_proj, &bufs.normed, &mut bufs.q_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.k_proj, &bufs.normed, &mut bufs.k_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.v_proj, &bufs.normed, &mut bufs.v_batch)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.q_proj.as_ref() {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q_batch)?;
@@ -1643,12 +1611,11 @@ impl Qwen3Model {
         }
 
         // O projection + LoRA.
-        ops::gemm_into(
-            &self.ctx,
+        ops_backend.linear_batch_into(
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
-        );
+        )?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.o_proj.as_ref() {
                 ops::apply_lora_gemm_add(
@@ -1672,18 +1639,8 @@ impl Qwen3Model {
         )?;
 
         // Split gate + up MLP + LoRA + silu_mul + down + LoRA.
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.gate_proj,
-            &bufs.normed,
-            &mut bufs.gate_out,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
+        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.gate_proj.as_ref() {
                 ops::apply_lora_gemm_add(
@@ -1699,12 +1656,7 @@ impl Qwen3Model {
             }
         }
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.down_proj,
-            &bufs.act_out,
-            &mut bufs.o_buf,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.down_proj.as_ref() {
                 ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
@@ -1780,12 +1732,7 @@ impl Qwen3Model {
         ops_backend.rms_norm_batch_into(hidden, &self.norm, eps, &mut bufs.normed)?;
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
-        ops::gemm_into(
-            &self.ctx,
-            self.output_projection(),
-            &bufs.normed,
-            logits_buf,
-        );
+        ops_backend.linear_batch_into(self.output_projection(), &bufs.normed, logits_buf)?;
 
         Ok(())
     }
@@ -1836,24 +1783,9 @@ impl Qwen3Model {
         };
 
         // 3 separate Q/K/V GEMMs → decode_prep_paged (qk-norm + RoPE + paged write).
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.q_proj,
-            &bufs.normed,
-            &mut bufs.q_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.k_proj,
-            &bufs.normed,
-            &mut bufs.k_batch,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.v_proj,
-            &bufs.normed,
-            &mut bufs.v_batch,
-        );
+        ops_backend.linear_batch_into(&layer.attention.q_proj, &bufs.normed, &mut bufs.q_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.k_proj, &bufs.normed, &mut bufs.k_batch)?;
+        ops_backend.linear_batch_into(&layer.attention.v_proj, &bufs.normed, &mut bufs.v_batch)?;
         ops::decode_prep_paged(
             &self.ctx,
             &mut bufs.q_batch,
@@ -2101,12 +2033,11 @@ impl Qwen3Model {
         }
 
         // 5. Batched O projection → bufs.o_buf [B, hidden_dim]
-        ops::gemm_into(
-            &self.ctx,
+        ops_backend.linear_batch_into(
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
-        );
+        )?;
         self.layer_communicator
             .post_attn_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
@@ -2122,25 +2053,10 @@ impl Qwen3Model {
         )?;
 
         // 8. Batched MLP: gate + up projections → fused silu_mul → down
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.gate_proj,
-            &bufs.normed,
-            &mut bufs.gate_out,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
+        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.down_proj,
-            &bufs.act_out,
-            &mut bufs.o_buf,
-        );
+        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 

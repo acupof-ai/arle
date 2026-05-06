@@ -77,12 +77,7 @@ impl Qwen3Model {
             )?;
         }
 
-        ops::gemv(
-            &self.ctx,
-            self.output_projection(),
-            &bufs.normed,
-            &mut bufs.logits,
-        )?;
+        ops_backend.linear_vec_into(self.output_projection(), &bufs.normed, &mut bufs.logits)?;
 
         Ok(())
     }
@@ -99,24 +94,9 @@ impl Qwen3Model {
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
-        ops::gemv(
-            &self.ctx,
-            &layer.attention.q_proj,
-            &bufs.normed,
-            &mut bufs.q,
-        )?;
-        ops::gemv(
-            &self.ctx,
-            &layer.attention.k_proj,
-            &bufs.normed,
-            &mut bufs.k,
-        )?;
-        ops::gemv(
-            &self.ctx,
-            &layer.attention.v_proj,
-            &bufs.normed,
-            &mut bufs.v,
-        )?;
+        ops_backend.linear_vec_into(&layer.attention.q_proj, &bufs.normed, &mut bufs.q)?;
+        ops_backend.linear_vec_into(&layer.attention.k_proj, &bufs.normed, &mut bufs.k)?;
+        ops_backend.linear_vec_into(&layer.attention.v_proj, &bufs.normed, &mut bufs.v)?;
         if let Some(ll) = self.layer_lora(layer_idx) {
             if let Some(ad) = ll.q_proj.as_ref() {
                 ops::apply_lora_gemv_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q)?;
@@ -153,8 +133,7 @@ impl Qwen3Model {
         // Quantize the newly written decode token → INT8 (no-op for BF16)
         kv_cache.commit_layer(&self.ctx, layer_idx, pos, 1)?;
 
-        ops::gemv(
-            &self.ctx,
+        ops_backend.linear_vec_into(
             &layer.attention.o_proj,
             &bufs.attn_out,
             &mut bufs.attn_proj,
@@ -201,8 +180,7 @@ impl Qwen3Model {
                 &mut bufs.mlp_out,
             )?;
         } else {
-            ops::fused_mlp_into(
-                &self.ctx,
+            ops_backend.fused_mlp_into(
                 &bufs.normed,
                 &layer.mlp.gate_proj,
                 &layer.mlp.up_proj,
