@@ -144,16 +144,15 @@ impl ModelForward for Qwen3Model {
             .logits_batch
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sparse draft decode did not produce logits"))?;
-        crate::ops::argmax_batch_logprob_launch(
-            &self.ctx,
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        ops_backend.argmax_batch_logprob_launch(
             logits,
             &mut decode_ctx.argmax_out,
             &mut decode_ctx.logprobs_gpu,
             1,
         )?;
         self.ctx.sync()?;
-        crate::ops::argmax_batch_readback_into(
-            &self.ctx,
+        ops_backend.argmax_batch_readback_into(
             &decode_ctx.argmax_out,
             &mut decode_ctx.argmax_host,
             1,
@@ -421,8 +420,8 @@ impl ModelForward for Qwen3Model {
     ) -> Result<u32> {
         let random_val: f32 = rng.random();
         let logits = state.base.logits_or(&state.decode_bufs.logits);
-        ops::gpu_sample_into(
-            &self.ctx,
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        ops_backend.sample_token_into(
             logits,
             &mut state.decode_bufs.sample_probs,
             &mut state.decode_bufs.sample_out,
@@ -439,8 +438,8 @@ impl ModelForward for Qwen3Model {
     ) -> Result<(u32, Option<f32>)> {
         if params.is_greedy() {
             let logits = state.base.logits_or(&state.decode_bufs.logits);
-            let (token, logprob) = ops::argmax_with_logprob(
-                &self.ctx,
+            let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+            let (token, logprob) = ops_backend.argmax_with_logprob(
                 logits,
                 &mut state.decode_bufs.sample_out,
                 &mut state.decode_bufs.sample_probs, // reuse as f32 scratch
@@ -523,16 +522,15 @@ impl ModelForward for Qwen3Model {
         };
         let batch_size = slot_indices.len();
         // Use logprob variant — computes argmax + logprob in one kernel (negligible overhead)
-        crate::ops::argmax_batch_logprob_launch(
-            &self.ctx,
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        ops_backend.argmax_batch_logprob_launch(
             logits,
             &mut decode_ctx.argmax_out,
             &mut decode_ctx.logprobs_gpu,
             batch_size,
         )?;
         self.ctx.sync()?;
-        crate::ops::argmax_batch_readback_into(
-            &self.ctx,
+        ops_backend.argmax_batch_readback_into(
             &decode_ctx.argmax_out,
             &mut decode_ctx.argmax_host,
             batch_size,
@@ -562,8 +560,8 @@ impl ModelForward for Qwen3Model {
             _ => return Ok(false),
         };
         let batch_size = slot_indices.len();
-        crate::ops::argmax_batch_logprob_launch(
-            &self.ctx,
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        ops_backend.argmax_batch_logprob_launch(
             logits,
             &mut decode_ctx.argmax_out,
             &mut decode_ctx.logprobs_gpu,
@@ -579,8 +577,8 @@ impl ModelForward for Qwen3Model {
     ) -> Result<Option<Vec<u32>>> {
         let batch_size = slot_indices.len();
         self.ctx.sync()?;
-        crate::ops::argmax_batch_readback_into(
-            &self.ctx,
+        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        ops_backend.argmax_batch_readback_into(
             &decode_ctx.argmax_out,
             &mut decode_ctx.argmax_host,
             batch_size,

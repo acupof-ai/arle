@@ -235,6 +235,28 @@ pub trait OpsBackend {
         params: &SamplingParams,
         random_val: f32,
     ) -> Result<u32>;
+
+    fn argmax_with_logprob(
+        &self,
+        logits: &Self::Tensor,
+        out_idx: &mut Self::SamplingOutput,
+        out_logprob: &mut Self::SamplingScratch,
+    ) -> Result<(u32, f32)>;
+
+    fn argmax_batch_logprob_launch(
+        &self,
+        logits: &Self::TensorBatch,
+        out_ids: &mut Self::SamplingOutput,
+        out_logprobs: &mut Self::SamplingScratch,
+        batch_size: usize,
+    ) -> Result<()>;
+
+    fn argmax_batch_readback_into(
+        &self,
+        out: &Self::SamplingOutput,
+        dst: &mut [i32],
+        batch_size: usize,
+    ) -> Result<()>;
 }
 
 #[cfg(feature = "cuda")]
@@ -396,6 +418,34 @@ impl OpsBackend for CudaOpsBackend<'_> {
         random_val: f32,
     ) -> Result<u32> {
         sampling::gpu_sample_into(self.ctx, logits, scratch, out, params, random_val)
+    }
+
+    fn argmax_with_logprob(
+        &self,
+        logits: &Self::Tensor,
+        out_idx: &mut Self::SamplingOutput,
+        out_logprob: &mut Self::SamplingScratch,
+    ) -> Result<(u32, f32)> {
+        sampling::argmax_with_logprob(self.ctx, logits, out_idx, out_logprob)
+    }
+
+    fn argmax_batch_logprob_launch(
+        &self,
+        logits: &Self::TensorBatch,
+        out_ids: &mut Self::SamplingOutput,
+        out_logprobs: &mut Self::SamplingScratch,
+        batch_size: usize,
+    ) -> Result<()> {
+        sampling::argmax_batch_logprob_launch(self.ctx, logits, out_ids, out_logprobs, batch_size)
+    }
+
+    fn argmax_batch_readback_into(
+        &self,
+        out: &Self::SamplingOutput,
+        dst: &mut [i32],
+        batch_size: usize,
+    ) -> Result<()> {
+        sampling::argmax_batch_readback_into(self.ctx, out, dst, batch_size)
     }
 }
 
