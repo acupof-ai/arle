@@ -73,6 +73,44 @@ there's an existing caller that can't hold the buffer.
 7. **Single-token BF16 decode** uses the TileLang paged decode path. Don't
    split or add a second BF16 path without a bench snapshot.
 
+## `OpsBackend` trait (M4 unification surface)
+
+`infer/src/ops.rs` defines `OpsBackend` + `Tensor` (M4 of
+`docs/plans/backend-unification.md`). The trait is the cross-backend
+contract for the 5 hot ops (norm + linear + sampling + elementwise +
+embedding); attention / recurrent / kv_ops are deliberately NOT in the
+trait yet (M5+ scope).
+
+**When adding a method:**
+- Mirror the existing `_into` convention (caller-supplied output).
+- Pass `&DeviceContext` even when the backend doesn't need it — the
+  trait stays backend-neutral.
+- CUDA impl in `CudaOpsBackend` (`infer/src/ops.rs`) — must be a thin
+  forward to the existing free fn, **not** a re-implementation. The
+  free fn stays the canonical kernel entry; the trait method just
+  routes.
+- Metal impl in `MetalOpsBackend` (`infer/src/backend/metal/ops.rs`)
+  goes through MLX. Lazy-graph `eval()` is the impl's responsibility,
+  not the caller's.
+- New methods land `pub(crate)` first; promote only when a cross-crate
+  consumer appears.
+
+**When migrating a callsite:**
+- Model code (`infer/src/model/qwen3/*.rs`) takes `&dyn OpsBackend` (or
+  generics) and calls the method instead of the free fn directly.
+- The CUDA-graph capture path may stay on the free fn for now —
+  raw-pointer launches with cached pointers are still on the legacy
+  free-fn ABI per `5f209d2`'s commit body.
+- Migrate every callsite of one op family in one commit; do NOT
+  partial-migrate (`961ac13` / `477b761` / `c70ad34` / `5f209d2` are
+  the precedent — one op family per commit).
+
+**Don't:**
+- Don't dual-route a callsite (one branch calls the free fn, another
+  calls the trait method) — pick one.
+- Don't add backend-specific methods (`fn cuda_only_xxx`) to the trait;
+  put those on a backend extension trait or keep them on the free fn.
+
 ## Pointers
 
 - `crates/cuda-kernels/src/prelude.rs` — the types you're allowed to
