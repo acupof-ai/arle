@@ -65,6 +65,8 @@ impl Tensor {
         match &self.repr {
             TensorRepr::Cuda(CudaTensor::Vector(value)) => Some(value),
             TensorRepr::Cuda(CudaTensor::Batch(_)) => None,
+            #[cfg(feature = "metal")]
+            TensorRepr::Metal(_) => None,
         }
     }
 
@@ -73,6 +75,8 @@ impl Tensor {
         match &mut self.repr {
             TensorRepr::Cuda(CudaTensor::Vector(value)) => Some(value),
             TensorRepr::Cuda(CudaTensor::Batch(_)) => None,
+            #[cfg(feature = "metal")]
+            TensorRepr::Metal(_) => None,
         }
     }
 
@@ -81,6 +85,8 @@ impl Tensor {
         match &self.repr {
             TensorRepr::Cuda(CudaTensor::Batch(value)) => Some(value),
             TensorRepr::Cuda(CudaTensor::Vector(_)) => None,
+            #[cfg(feature = "metal")]
+            TensorRepr::Metal(_) => None,
         }
     }
 
@@ -89,6 +95,8 @@ impl Tensor {
         match &mut self.repr {
             TensorRepr::Cuda(CudaTensor::Batch(value)) => Some(value),
             TensorRepr::Cuda(CudaTensor::Vector(_)) => None,
+            #[cfg(feature = "metal")]
+            TensorRepr::Metal(_) => None,
         }
     }
 
