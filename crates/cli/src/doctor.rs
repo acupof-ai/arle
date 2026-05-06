@@ -871,8 +871,7 @@ mod tests {
     #[test]
     fn errors_when_no_model_source_is_available() {
         let err = select_model_source(None, Some(" "), None)
-            .err()
-            .expect("missing model source should fail");
+            .expect_err("missing model source should fail");
         assert!(
             err.to_string()
                 .contains("no model selected; pass --model-path")

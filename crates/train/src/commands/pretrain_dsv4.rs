@@ -25,7 +25,7 @@ pub enum DeepseekSku {
 }
 
 impl DeepseekSku {
-    pub fn from_str(input: &str) -> Result<Self, DsV4PretrainError> {
+    pub fn parse(input: &str) -> Result<Self, DsV4PretrainError> {
         match input {
             "nano" => Ok(Self::Nano),
             other => Err(DsV4PretrainError::UnknownSku(other.to_string())),
@@ -99,7 +99,7 @@ where
                 let value = iter.next().ok_or_else(|| DsV4PretrainError::MissingValue {
                     flag: arg.to_string(),
                 })?;
-                sku = Some(DeepseekSku::from_str(&value)?);
+                sku = Some(DeepseekSku::parse(&value)?);
             }
             "--corpus" => {
                 corpus = Some(PathBuf::from(iter.next().ok_or_else(|| {

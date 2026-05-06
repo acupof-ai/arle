@@ -1391,11 +1391,6 @@ mod tests {
             self
         }
 
-        fn with_tokenize_failure(mut self) -> Self {
-            self.tokenize_fails = true;
-            self
-        }
-
         fn with_broken_prompt_extension(mut self) -> Self {
             self.break_prompt_extension = true;
             self
@@ -2089,7 +2084,7 @@ mod tests {
             id_a, id_b,
             "tool_use_id base must differ across iterations 0 and 1"
         );
-        let mut ids = vec![id_a, id_b];
+        let mut ids = [id_a, id_b];
         ids.sort();
         let unique = ids.iter().collect::<std::collections::HashSet<_>>().len();
         assert_eq!(unique, 2, "tool_use IDs must be unique across iterations");
@@ -2536,11 +2531,11 @@ mod tests {
             "len(ids) == len(mask)"
         );
         assert!(
-            tokens.response_mask.iter().any(|&m| m == 1),
+            tokens.response_mask.contains(&1),
             "expected at least one mask=1 (LLM token)"
         );
         assert!(
-            tokens.response_mask.iter().any(|&m| m == 0),
+            tokens.response_mask.contains(&0),
             "expected at least one mask=0 (env/tool token)"
         );
         assert!(
@@ -2599,8 +2594,8 @@ mod tests {
         assert_eq!(result.sub_turns.len(), 3);
         assert_eq!(tokens.response_ids.len(), tokens.response_mask.len());
         assert!(tokens.response_mask.iter().all(|&m| m == 0 || m == 1));
-        assert!(tokens.response_mask.iter().any(|&m| m == 1));
-        assert!(tokens.response_mask.iter().any(|&m| m == 0));
+        assert!(tokens.response_mask.contains(&1));
+        assert!(tokens.response_mask.contains(&0));
         let llm_token_count: usize = tokens.response_mask.iter().filter(|&&m| m == 1).count();
         let last_sub_turn_len = result
             .sub_turns

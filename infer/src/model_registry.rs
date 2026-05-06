@@ -15,6 +15,8 @@
 //! | `MixtralForCausalLM`                  | `Mixtral`                |
 //! | `DeepseekV2ForCausalLM`               | `DeepSeekV2`             |
 //! | `DeepseekV3ForCausalLM`               | `DeepSeekV3`             |
+//! | `DeepseekV4ForCausalLM`               | `DeepSeekV4`             |
+//! | `DeepseekV4MTP`                       | `DeepSeekV4Mtp`          |
 //! | `GemmaForCausalLM` / `Gemma2ForCausalLM` | `Gemma`               |
 //! | `PhiForCausalLM` / `Phi3ForCausalLM`  | `Phi`                    |
 
@@ -46,6 +48,8 @@ pub enum ModelArch {
     Mixtral,
     DeepSeekV2,
     DeepSeekV3,
+    DeepSeekV4,
+    DeepSeekV4Mtp,
     Gemma,
     Phi,
 }
@@ -62,6 +66,8 @@ impl ModelArch {
             Self::Mixtral => "Mixtral",
             Self::DeepSeekV2 => "DeepSeek-V2",
             Self::DeepSeekV3 => "DeepSeek-V3",
+            Self::DeepSeekV4 => "DeepSeek-V4",
+            Self::DeepSeekV4Mtp => "DeepSeek-V4-MTP",
             Self::Gemma => "Gemma",
             Self::Phi => "Phi",
         }
@@ -72,6 +78,7 @@ impl ModelArch {
         match self {
             Self::Qwen35 | Self::Qwen3_5_Moe => AttentionVariant::HybridGqa,
             Self::DeepSeekV2 | Self::DeepSeekV3 => AttentionVariant::Mla,
+            Self::DeepSeekV4 | Self::DeepSeekV4Mtp => AttentionVariant::DeepSeekV4Hybrid,
             Self::Gemma => AttentionVariant::Mha,
             Self::Qwen3 | Self::Llama | Self::Mistral | Self::Mixtral | Self::Phi => {
                 AttentionVariant::Gqa
@@ -92,6 +99,8 @@ impl ModelArch {
             | Self::Mixtral
             | Self::DeepSeekV2
             | Self::DeepSeekV3
+            | Self::DeepSeekV4
+            | Self::DeepSeekV4Mtp
             | Self::Gemma
             | Self::Phi => false,
         }
@@ -116,6 +125,8 @@ pub enum AttentionVariant {
     Gqa,
     /// Multi-head latent attention (DeepSeek MLA).
     Mla,
+    /// DeepSeek-V4 hybrid local + long-range sparse attention.
+    DeepSeekV4Hybrid,
     /// Hybrid: alternates linear recurrent layers with full attention (Qwen3.5).
     HybridGqa,
 }
@@ -148,6 +159,8 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
         // DeepSeek
         m.insert("DeepseekV2ForCausalLM", ModelArch::DeepSeekV2);
         m.insert("DeepseekV3ForCausalLM", ModelArch::DeepSeekV3);
+        m.insert("DeepseekV4ForCausalLM", ModelArch::DeepSeekV4);
+        m.insert("DeepseekV4MTP", ModelArch::DeepSeekV4Mtp);
         // Gemma
         m.insert("GemmaForCausalLM", ModelArch::Gemma);
         m.insert("Gemma2ForCausalLM", ModelArch::Gemma);
@@ -275,6 +288,14 @@ mod tests {
         r#"{"architectures":["DeepseekV3ForCausalLM"],"hidden_size":7168}"#
     }
 
+    fn deepseek_v4_config() -> &'static str {
+        r#"{"architectures":["DeepseekV4ForCausalLM"],"hidden_size":8192,"layer_types":["compressed_sparse_attention"]}"#
+    }
+
+    fn deepseek_v4_mtp_config() -> &'static str {
+        r#"{"architectures":["DeepseekV4MTP"],"hidden_size":8192,"num_nextn_predict_layers":1}"#
+    }
+
     fn gemma_config() -> &'static str {
         r#"{"architectures":["Gemma2ForCausalLM"],"hidden_size":3584}"#
     }
@@ -336,6 +357,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_deepseek_v4() {
+        assert_eq!(
+            detect_arch_from_json(deepseek_v4_config()).unwrap(),
+            ModelArch::DeepSeekV4
+        );
+    }
+
+    #[test]
+    fn detects_deepseek_v4_mtp() {
+        assert_eq!(
+            detect_arch_from_json(deepseek_v4_mtp_config()).unwrap(),
+            ModelArch::DeepSeekV4Mtp
+        );
+    }
+
+    #[test]
     fn detects_gemma() {
         assert_eq!(
             detect_arch_from_json(gemma_config()).unwrap(),
@@ -389,6 +426,14 @@ mod tests {
             AttentionVariant::Mla
         );
         assert_eq!(
+            ModelArch::DeepSeekV4.attention_variant(),
+            AttentionVariant::DeepSeekV4Hybrid
+        );
+        assert_eq!(
+            ModelArch::DeepSeekV4Mtp.attention_variant(),
+            AttentionVariant::DeepSeekV4Hybrid
+        );
+        assert_eq!(
             ModelArch::Qwen35.attention_variant(),
             AttentionVariant::HybridGqa
         );
@@ -411,6 +456,8 @@ mod tests {
             ModelArch::Mixtral,
             ModelArch::DeepSeekV2,
             ModelArch::DeepSeekV3,
+            ModelArch::DeepSeekV4,
+            ModelArch::DeepSeekV4Mtp,
             ModelArch::Gemma,
             ModelArch::Phi,
         ] {
