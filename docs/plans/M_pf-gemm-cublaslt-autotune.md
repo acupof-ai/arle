@@ -187,6 +187,51 @@ Author `crates/cuda-kernels/tools/tilelang/batch_prefill_bf16_gemm.py`:
 SGLang/TRT-LLM use a TileLang-or-equivalent prefill GEMM that
 explains their lead, AND Phase 1 ROI plateaus.
 
+### 2026-05-07 EOD+8 evidence escalation — cuBLAS large-N blind spot
+
+[M_pf-fuse Phase 0 KILL](../experience/wins/2026-05-07-m_pf-fuse-phase0-gateup-killed.md)
+delivered a counter-intuitive datapoint:
+- Predicted: fused 22k-output gate_up GEMM beats 2× separate 11k
+  GEMMs by ~8% TTFT (call-count + tensor-core util math).
+- Measured: fused 22k GEMM is **+1.5% slower** at long-ctx 4k/c=4.
+- Implication: cuBLAS heuristic + algo space is **non-monotonic
+  in N**. Selecting a single fat GEMM at N=22016 lands on a
+  worse kernel/tile than two N=11008 calls.
+
+This is independent evidence that **cuBLAS leaves real performance
+on the table at large N** — exactly the regime a hand-rolled
+TileLang kernel can target. Combined with H_LP3's finding (cutlass
+`Kernel2` 16×16 wmma at 56.7% of TTFT window), Phase 2 now has TWO
+trace-grounded reasons:
+1. Per-launch tile is small (16×16); a large-tile TileLang variant
+   (256×128) at large M could amortize launches.
+2. cuBLAS algo selector is suboptimal at large N (M_pf-fuse data);
+   a shape-tuned TileLang kernel can pick the right tile per
+   (M, N, K) without the heuristic's averaging.
+
+### Phase 2.5 candidate — Hybrid TileLang + cuBLAS dispatch (P2 alt)
+
+Lateral idea inspired by the M_pf-fuse blind spot: instead of
+porting **all** prefill GEMMs to TileLang, dispatch by shape:
+
+```
+if (N >= N_threshold && M >= M_threshold) {
+    tilelang_prefill_gemm(...);  // hand-tuned 256×128
+} else {
+    cublasLt_gemm(...);           // existing path
+}
+```
+
+- Smaller scope than full Phase 2 (~150 LOC vs 250-300)
+- Targets exactly the regime M_pf-fuse exposed
+- Falls back to cuBLAS for shapes where it IS optimal
+- Risk: lower (existing decode/small-prefill paths untouched)
+
+Phase 2.5 is gated on the SAME trigger as Phase 2 (M_world1 P0
+baseline confirms kernel-impl gap). If SGLang lead at long-ctx 4k
+turns out to be scheduler/attention rather than GEMM, BOTH 2 and
+2.5 demote to P3.
+
 ## Acceptance criteria
 
 - Long-ctx 4k/c=4: ARLE TTFT ≥ 30% lower than current 1976 ms
