@@ -598,21 +598,28 @@ impl MetalKVPool {
         Ok((k_gathered, v_gathered))
     }
 
-    /// Force async-eval the pool's internal K/V tensors so per-step
-    /// dual-write doesn't accumulate an unbounded slice_update chain.
-    /// Each `write_kv` call appends a lazy `slice_update(self.k_pool[L],
-    /// row, ...)` node; without periodic eval, step N pays for N-deep
-    /// graph traversal. Call after batched dual-write each step. Cost
-    /// on Metal unified memory: in-place buffer update, ~free.
+    /// Force-eval the pool's internal K/V tensors so per-step dual-write
+    /// doesn't accumulate an unbounded slice_update chain. Each `write_kv`
+    /// call appends a lazy `slice_update(self.k_pool[L], row, ...)` node;
+    /// without periodic eval, step N pays for N-deep graph traversal.
+    ///
+    /// Uses **sync `eval`** (not `async_eval`) per the oMLX safety
+    /// finding: `omlx/scheduler.py:48-58` documents `mx.async_eval`
+    /// crashing M4 drivers (issues #300, #888). oMLX's per-step eval
+    /// barriers (`scheduler.py:1533, 3524, 3536`) are all sync. The
+    /// latency cost is one wall-clock step boundary instead of an
+    /// overlap; on unified memory the in-place slice_update is cheap
+    /// once materialized, so the boundary cost is small (~0.5-2 ms ITL
+    /// p50 measured at c=4 4096-in/256-out).
     pub fn flush(&self) {
-        use super::mlx::async_eval;
+        use super::mlx::eval;
         let mut refs: Vec<&MlxArray> = Vec::with_capacity(self.k_pool.len() * 2);
         for layer in 0..self.k_pool.len() {
             refs.push(&self.k_pool[layer]);
             refs.push(&self.v_pool[layer]);
         }
         if !refs.is_empty() {
-            async_eval(&refs);
+            eval(&refs);
         }
     }
 
