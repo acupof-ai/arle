@@ -1,4 +1,5 @@
 use super::core::{PendingPrefill, PendingPrefillRow};
+use super::nvtx_scopes::nvtx_scope;
 use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, info, warn};
 use crate::model::PrefillBatchRequest;
 use crate::sampler::SamplingParams;
@@ -749,6 +750,7 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
+        nvtx_scope!("step_prefill_kernel_launch");
         if self.model.supports_async_prefill_batch() {
             self.step_prefill_batch_async(batch);
         } else {

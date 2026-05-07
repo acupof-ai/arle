@@ -1,3 +1,4 @@
+use super::nvtx_scopes::nvtx_scope;
 use super::{
     FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, warn,
 };
@@ -227,6 +228,7 @@ impl<M: ModelForward> Scheduler<M> {
         if decode_indices.is_empty() {
             return;
         }
+        nvtx_scope!("step_decode_kernel_launch");
 
         let token_ids = if decode_tokens_already_allocated {
             token_ids
@@ -384,32 +386,42 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let mut launch_candidates;
-        loop {
-            launch_candidates =
-                self.select_mixed_launch_prefill_candidates(candidates, &decode_indices);
-            if launch_candidates.is_empty() {
-                self.launch_decode_batch_from_tokens(decode_indices, token_ids, false, false);
-                return;
-            }
+        {
+            nvtx_scope!("step_mixed_launch_retract");
+            loop {
+                launch_candidates =
+                    self.select_mixed_launch_prefill_candidates(candidates, &decode_indices);
+                if launch_candidates.is_empty() {
+                    break;
+                }
 
-            let extra_pages = launch_candidates
-                .iter()
-                .map(|candidate| {
-                    self.additional_pages_needed_for_slot(
-                        candidate.slot_idx,
-                        candidate.reservation.prefill_tokens,
-                    )
-                })
-                .sum();
-            let before_retract = decode_indices.len();
-            self.retract_decode_to_fit(&mut decode_indices, &mut token_ids, extra_pages);
-            if decode_indices.is_empty() {
-                self.step_prefill_batch(&launch_candidates);
-                return;
+                let extra_pages = launch_candidates
+                    .iter()
+                    .map(|candidate| {
+                        self.additional_pages_needed_for_slot(
+                            candidate.slot_idx,
+                            candidate.reservation.prefill_tokens,
+                        )
+                    })
+                    .sum();
+                let before_retract = decode_indices.len();
+                self.retract_decode_to_fit(&mut decode_indices, &mut token_ids, extra_pages);
+                if decode_indices.is_empty() {
+                    break;
+                }
+                if decode_indices.len() == before_retract {
+                    break;
+                }
             }
-            if decode_indices.len() == before_retract {
-                break;
-            }
+        }
+
+        if launch_candidates.is_empty() {
+            self.launch_decode_batch_from_tokens(decode_indices, token_ids, false, false);
+            return;
+        }
+        if decode_indices.is_empty() {
+            self.step_prefill_batch(&launch_candidates);
+            return;
         }
 
         let (alloc_ok_indices, alloc_ok_tokens) =
@@ -546,12 +558,16 @@ impl<M: ModelForward> Scheduler<M> {
             prefills: &prefills,
             prefill_start_positions: &prefill_start_positions,
         };
-        match self.model.forward_mixed_batch(
-            mixed_batch,
-            &mut self.states,
-            Some(&mut self.paged_kv_pool),
-            decode_ctx,
-        ) {
+        let mixed_forward = {
+            nvtx_scope!("step_mixed_kernel_launch");
+            self.model.forward_mixed_batch(
+                mixed_batch,
+                &mut self.states,
+                Some(&mut self.paged_kv_pool),
+                decode_ctx,
+            )
+        };
+        match mixed_forward {
             Ok(true) => {}
             Ok(false) => {
                 self.step_prefill_batch(&launch_candidates);
