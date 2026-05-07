@@ -564,6 +564,31 @@ impl MetalQwen35PrefixRuntime {
         metrics: &ServerMetrics,
     ) -> Result<()> {
         let prompt_len = request.prompt_tokens.len();
+        // M_e.10 trace probe — env-gated diagnostic to localize why
+        // session_affinity_hit stays at 0 across multi-turn requests.
+        // Set INFER_M_E10_TRACE=1 to log gate decisions + cache state.
+        let trace = std::env::var("INFER_M_E10_TRACE").is_ok();
+        if trace {
+            let prompt_head: Vec<u32> = request.prompt_tokens.iter().take(8).copied().collect();
+            log::info!(
+                "m_e10_trace prepare_request: session={:?} \
+                 prompt_len={} block_size={} dflash_enabled={} \
+                 can_import_snapshot={} entries_len={} \
+                 entries_keys_len_sample={:?} prompt_head={:?}",
+                &request.session_id,
+                prompt_len,
+                self.block_size,
+                request.request_state.is_dflash_enabled(),
+                request.request_state.can_import_qwen35_prefix_snapshot(),
+                self.entries.len(),
+                self.entries
+                    .keys()
+                    .take(5)
+                    .map(Vec::len)
+                    .collect::<Vec<_>>(),
+                prompt_head,
+            );
+        }
         if prompt_len < self.block_size {
             metrics.record_request_cache(request.session_id.as_ref(), 0, prompt_len, prompt_len);
             return Ok(());
@@ -579,6 +604,14 @@ impl MetalQwen35PrefixRuntime {
 
         let memory_key = self.lookup_longest_prefix(&request.prompt_tokens);
         let disk_key = self.lookup_longest_disk_prefix(&request.prompt_tokens);
+        if trace {
+            log::info!(
+                "m_e10_trace lookup: session={:?} memory_match_len={:?} disk_match_len={:?}",
+                &request.session_id,
+                memory_key.as_ref().map(Vec::len),
+                disk_key.as_ref().map(Vec::len),
+            );
+        }
         let memory_len = memory_key.as_ref().map_or(0, Vec::len);
         let disk_len = disk_key.as_ref().map_or(0, Vec::len);
 
@@ -618,7 +651,14 @@ impl MetalQwen35PrefixRuntime {
     }
 
     fn publish_prompt_prefix(&mut self, request: &mut ActiveMetalRequest) -> Result<()> {
+        let trace = std::env::var("INFER_M_E10_TRACE").is_ok();
         if !request.request_state.can_import_qwen35_prefix_snapshot() {
+            if trace {
+                log::info!(
+                    "m_e10_trace publish: SKIP can_import=false session={:?}",
+                    &request.session_id,
+                );
+            }
             return Ok(());
         }
 
@@ -631,6 +671,18 @@ impl MetalQwen35PrefixRuntime {
                 .request_state
                 .export_qwen35_disk_prompt_prefixes(self.block_size)
                 .context("export Qwen3.5 prompt prefix snapshots for SSD")?;
+            if trace {
+                log::info!(
+                    "m_e10_trace publish: disk-tier session={:?} snapshots={} \
+                     snapshot_lens={:?}",
+                    &request.session_id,
+                    snapshots.len(),
+                    snapshots
+                        .iter()
+                        .map(|s| s.token_ids.len())
+                        .collect::<Vec<_>>(),
+                );
+            }
             for snapshot in snapshots {
                 if let Err(err) = self.persist_snapshot(&snapshot) {
                     warn!(
