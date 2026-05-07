@@ -1028,6 +1028,12 @@ pub fn tilelang_tc_run_layer(
 ) -> Result<()> {
     let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
+    // M_b.1 Phase B: route pure-decode (max_qlen==1) to the dedicated HD128
+    // decode kernel; fall back to the prefill kernel as a TC alias for mixed
+    // batches with varlen Q. Decode kernel shares the same FFI shape as the
+    // prefill kernel (gen_tilelang_aot.py wrapper fill rules) but drops the
+    // unused causal-mask + Q_indptr indirection internally.
+    let is_pure_decode = max_qlen == 1;
     let tilelang_kernel = {
         ensure!(
             heads.head_dim == 128,
@@ -1039,20 +1045,39 @@ pub fn tilelang_tc_run_layer(
             "TileLang TC decode alias requires page_size=16, got {}",
             heads.page_size
         );
-        match (heads.num_qo_heads, heads.num_kv_heads) {
-            (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
-            (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
-            (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
-            (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
-            other => {
-                return Err(anyhow!(
-                    "TileLang: no specialized TC-decode HD128 kernel for \
-                     (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
-                     are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
-                     in tools/tilelang/batch_prefill_paged_hd128.py, \
-                     TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
-                     and the FFI macro + this match in lockstep, then rebuild."
-                ));
+        if is_pure_decode {
+            match (heads.num_qo_heads, heads.num_kv_heads) {
+                (16, 8) => ffi::tilelang_batch_decode_paged_hd128_q16_kv8_run_cuda,
+                (32, 8) => ffi::tilelang_batch_decode_paged_hd128_q32_kv8_run_cuda,
+                (40, 8) => ffi::tilelang_batch_decode_paged_hd128_q40_kv8_run_cuda,
+                (64, 8) => ffi::tilelang_batch_decode_paged_hd128_q64_kv8_run_cuda,
+                other => {
+                    return Err(anyhow!(
+                        "TileLang: no specialized HD128 decode kernel for \
+                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
+                         are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
+                         in tools/tilelang/batch_decode_paged_hd128.py, \
+                         TILELANG_DECODE_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
+                         and the FFI macro + this match in lockstep, then rebuild."
+                    ));
+                }
+            }
+        } else {
+            match (heads.num_qo_heads, heads.num_kv_heads) {
+                (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
+                (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
+                (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
+                (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
+                other => {
+                    return Err(anyhow!(
+                        "TileLang: no specialized TC-decode HD128 kernel for \
+                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
+                         are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
+                         in tools/tilelang/batch_prefill_paged_hd128.py, \
+                         TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
+                         and the FFI macro + this match in lockstep, then rebuild."
+                    ));
+                }
             }
         }
     };
@@ -1093,8 +1118,14 @@ pub fn tilelang_tc_run_layer(
             )
             .result()
             .map_err(|e| {
+                let kind = if is_pure_decode {
+                    "decode"
+                } else {
+                    "TC decode alias"
+                };
                 anyhow!(
-                    "tilelang_batch_prefill_paged_hd128 (TC decode alias, q{}_kv{}) failed: {e}",
+                    "tilelang_batch_{}_paged_hd128 ({kind}, q{}_kv{}) failed: {e}",
+                    if is_pure_decode { "decode" } else { "prefill" },
                     heads.num_qo_heads,
                     heads.num_kv_heads
                 )
