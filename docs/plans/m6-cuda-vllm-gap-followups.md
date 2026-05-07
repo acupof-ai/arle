@@ -42,7 +42,140 @@ Primary snapshot:
    - Profile scheduler admission and decode batch width under c=64; the first
      goal is to increase output tok/s while preserving ARLE's TTFT p50 lead.
 
-## **Priority 0: re-run with T1 host-pinned KV overflow enabled**
+## High-conc Phase 1 investigation (2026-05-07)
+
+Scope: evidence-only. No ARLE code changes. `nsys`, `perf`, and `pidstat` were
+not installed on this host, so the profile used GuideLLM, ARLE `/v1/stats`,
+`nvidia-smi dmon/pmon`, `top -H`, and `ps -L` samples.
+
+### Server config diff
+
+| field | ARLE-CUDA | vLLM |
+|---|---|---|
+| launch shape | `--max-seq-len 5120` shared with prefill/decode M6 runs | `--max-model-len 2048` for high-conc |
+| high-conc request shape | 1024 in / 256 out, c=64 | 1024 in / 256 out, c=64 |
+| max active sequences | `max_slots=14` auto | `--max-num-seqs 64` |
+| max batched tokens | `max_num_batched_tokens=16384` | internal; not exposed in OpenAI API logs |
+| chunked prefill | `chunked_prefill_size=2048`, `max_prefill_tokens=16384` | `enable_chunked_prefill=True` |
+| KV cache | FP8E4M3 paged pool, 51,520 tokens / 3,220 pages | `--kv-cache-dtype fp8`, GPU KV cache 75,968 tokens in the Phase 1 profile run |
+| capacity log | `max_slots=14`, `TokenKVPool: 51520 max tokens`, `mem_fraction_static=0.85` | `Maximum concurrency for 2,048 tokens per request: 37.09x`, `max_num_seqs=64` |
+| CUDA graph | ARLE captures B=1..14 | vLLM captures up to 128, including FULL decode largest=64 |
+| attention backend | ARLE TileLang/custom CUDA Qwen3 path | vLLM `TRITON_ATTN` |
+
+Important mismatch: the M6 high-conc ARLE server was still sized for 5120-token
+contexts, while vLLM was sized for 2048-token contexts. The workload itself
+needs only 1280 tokens/request. That makes ARLE's auto slot count a likely
+first-order limiter before any kernel tuning.
+
+### Short profile results
+
+Short runs used the same 1024-in / 256-out c=64 shape with `--max-seconds`
+30-35 and `--warmup 3`.
+
+| backend | run label | TTFT p50 | ITL p50 | out tok/s | req/s | conc p50 |
+|---|---|---:|---:|---:|---:|---:|
+| ARLE | `m6-highconc-phase1-arle` | 1051.5 ms | 30.69 ms | 363.80 | 1.531 | 16 |
+| ARLE | `m6-highconc-phase1-arle-cpu` | 1051.3 ms | 30.67 ms | 332.86 | 1.556 | 16 |
+| vLLM | `m6-highconc-phase1-vllm` | 7927.4 ms | 45.50 ms | 792.98 | 3.281 | 64 |
+| vLLM | `m6-highconc-phase1-vllm-cpu` | 1201.7 ms | 45.66 ms | 1019.44 | 4.296 | 64 |
+| ARLE full M6 reference | `m6-arle-high-conc-r2` | 1059.0 ms | 30.81 ms | 414.66 | 1.678 | 16 |
+| vLLM full M6 reference | `m6-vllm-high-conc-r2` | 1606.2 ms | 44.65 ms | 1114.71 | 4.530 | 64 |
+
+The warmed short vLLM CPU-profile run is close enough to the full M6 baseline
+to use for qualitative comparison. The first short vLLM profile had a high
+TTFT tail because it was immediately after server start.
+
+### ARLE telemetry during high-conc
+
+Parsed from `bench-output/2026-05-07-m6-highconc-phase1-arle-profile/`.
+
+| metric | median | peak | mean |
+|---|---:|---:|---:|
+| active | 13 | 14 | 10.6 |
+| waiting | 49 | 50 | 38.6 |
+| batch_width | 13 | 14 | 10.6 |
+| decode_tokens | 12 | 14 | 9.8 |
+| prefill_tokens | 0 | 11275 | 842.8 |
+| engine_batch_occupancy | 0.2895 | 0.3431 | 0.2254 |
+| kv_util | 29.0% | 34.3% | 22.5% |
+
+Step phase samples:
+
+| phase | median | peak | mean |
+|---|---:|---:|---:|
+| decode | 19.5 ms | 198.7 ms | 57.2 ms |
+| prefill | 1.0 ms | 100.4 ms | 26.2 ms |
+| loop total | 94.5 ms | 211.0 ms | 83.6 ms |
+
+Interpretation: under c=64, ARLE quickly fills all 14 slots and leaves roughly
+50 requests waiting. The scheduler is not stuck, but the effective decode batch
+width is capped at 14. `kv_util` is low for this workload, so the cap is not a
+KV pool exhaustion signal.
+
+### Hot-path proxy profile
+
+`nsys` / `perf` were unavailable, so this is a proxy profile rather than kernel
+symbol attribution.
+
+| backend | GPU evidence | CPU evidence | read |
+|---|---|---|---|
+| ARLE | `nvidia-smi dmon`: active samples SM median 100%, mean 98.2%; memory-util median 93%, mean 59.3%; power mean 270 W | `top -H`: one `infer` thread median 99.8% CPU across 33 active samples; Tokio threads near idle | GPU is saturated, but each step only carries up to 14 decode rows. CPU has one hot scheduler/driver thread, not broad runtime contention. |
+| vLLM | `nvidia-smi dmon`: active samples SM median 100%, mean 98.8%; memory-util median 30.5%, mean 52.8%; power mean 243 W. `pmon` showed `VLLM::EngineCore` at 98% SM / 29% mem in an active sample | `top -H`: one `VLLM::EngineCore` worker thread median 98.4% CPU; EngineCore main median 17.9%; API Python thread median 5.0% | vLLM is also GPU-saturated, but keeps c=64 concurrency in the benchmark. Python/GIL is not the observed limiter. |
+
+The visible gap is therefore not "ARLE has idle GPU"; both backends can hit
+near-100% SM. The gap is more likely "vLLM does more useful decode rows per
+GPU-saturated step".
+
+### Root-cause hypotheses
+
+1. **Most likely / highest impact: ARLE slot sizing is mismatched for high-conc.**
+   - Evidence: ARLE high-conc uses `--max-seq-len 5120` and auto-sizes to
+     14 slots; vLLM high-conc uses `--max-model-len 2048` and admits
+     `--max-num-seqs 64`. ARLE telemetry shows active/batch_width peaks at 14
+     while waiting stays near 50. The workload only needs 1280 tokens/request.
+   - Falsification experiment: rerun ARLE high-conc with a dedicated
+     high-conc server envelope, starting with `--max-seq-len 2048` and then a
+     `--num-slots` sweep (`14`, `28`, `42`, `56`) if memory allows. If out
+     tok/s scales mainly with slots, this is the primary root cause.
+
+2. **Likely / high impact: ARLE per-step useful work is capped by one-token
+   decode over too few rows.**
+   - Evidence: ARLE `decode_tokens` median is 12 and peak 14; vLLM maintains
+     GuideLLM concurrency p50=64. ARLE has lower ITL per request, but total
+     output tok/s is lower because fewer rows are decoded per step.
+   - Falsification experiment: run an equal-slot vLLM baseline with
+     `--max-num-seqs 14` and the same 2048 max model length. If vLLM throughput
+     drops near ARLE, admission width dominates; if vLLM remains far ahead,
+     kernel/graph lowering dominates.
+
+3. **Possible / medium impact: ARLE mixed prefill/decode steps are too costly
+   during high-conc admission.**
+   - Evidence: ARLE phase samples show loop-total median 94.5 ms and prefill
+     peaks at 100.4 ms while filling the 64-request queue. Full-run ITL is
+     stable after admission, but high-conc throughput includes continuous
+     admission as requests complete.
+   - Falsification experiment: replay c=64 with a prefilled/prefix-hit workload
+     or a two-phase bench that admits all requests then measures decode-only
+     steady state. If output tok/s jumps only after removing admission, tune
+     mixed prefill/decode scheduling; otherwise focus on slot count and decode
+     width.
+
+### Next smallest validation actions
+
+1. **Config-only bench commit / doc entry:** add a `high-conc-2048` bench
+   variant that launches ARLE with `--max-seq-len 2048` and sweeps
+   `--num-slots`. This validates hypothesis 1 without touching runtime code.
+
+2. **Equal-width control:** run vLLM with `--max-num-seqs 14` against the same
+   high-conc shape. This isolates scheduler width from kernel implementation
+   and gives an apples-to-apples per-row efficiency baseline.
+
+3. **If slot-width wins:** implement the smallest runtime change that decouples
+   high-conc admission capacity from the conservative 5120-token server
+   envelope. The first code change should be a guarded scheduler/config path,
+   not kernel work.
+
+## **Priority 0A: re-run longctx with T1 host-pinned KV overflow enabled**
 
 The M6 baseline run did NOT explicitly enable the T1 host-pinned tier.
 `SchedulerConfig::t1_host_pinned_capacity_bytes` defaulted to `None`
@@ -58,10 +191,16 @@ and the `infer` binary already exposes the CLI flags
 - `--t1-host-pinned-low-water <FRAC>` (default 0.70)
 
 Re-run the M6 canonical sweep with explicit T1 sizing **before** going
-deep on combo plan implementation. Hypothesis: longctx-32k -34.9% and
-high-conc -62.9% gaps shrink materially because kv_util-100% scenarios
-spill to host instead of stalling at `active=2 waiting=2` (longctx) or
-`active=14 waiting=∞` (high-conc).
+deep on long-context combo plan implementation. Hypothesis: longctx-32k
+-34.9% shrinks materially because kv_util-100% scenarios spill to host instead
+of stalling at `active=2 waiting=2`.
+
+Update after the high-conc Phase 1 investigation: do not treat T1 as the
+primary high-conc fix. The high-conc profile showed `kv_util` peaking at only
+34.3% while active slots were capped at 14 and waiting stayed near 50, so
+high-conc is currently a slot-envelope / useful-decode-width problem before it
+is a KV overflow problem. Keep T1 as a cheap control run, but prioritize
+`high-conc-2048` and equal-slot vLLM controls for the 2.7x throughput gap.
 
 ```bash
 RUST_LOG=info NVCC_CCBIN=/usr/bin/g++-14 \
@@ -82,17 +221,16 @@ scripts/bench_guidellm.sh cuda-m6-with-t1 \
 
 Expected delta:
 - longctx-32k: gap closes (host-pinned absorbs the prefix overflow that currently stalls at 2 active).
-- high-conc: gap shrinks (host-pinned increases the effective active concurrency ceiling without changing `max_slots`).
+- high-conc: likely small or no change unless the server envelope also raises
+  `max_slots`; current evidence says `kv_util` is not the limiter.
 - prefill-heavy / decode-heavy: unchanged (no overflow happening in baseline).
 
-If these expected deltas land, the headline "ARLE 1/8 → ARLE ≥3/8 on
-local 16 GB" without writing a single line of code. That's the
-*configuration-only* win to publish before chasing kernel-level optimizations.
+If the longctx expected delta lands, publish it as the first configuration-only
+win. Do not claim high-conc closure until the slot-width controls land.
 
 **Acceptance**: re-run produces a `cuda-m6-with-t1` wins entry with
-direct delta-vs-baseline rows. Closes longctx-32k or high-conc cell
-even on local hardware → counts as a gap closed for this plan's
-acceptance criterion.
+direct delta-vs-baseline rows. Closing longctx-32k on local hardware counts as
+a gap closed for this plan's acceptance criterion.
 
 ## Strategic alignment with combo plan (manager note 2026-05-07)
 
@@ -107,10 +245,11 @@ already in flight:
 | high-conc out tok/s -62.9% | [`M3.5`](M3.5-collapse-scheduler-loops.md) shared CPU policy + [`M_b`](M_b-tilelang-fused-draft-verify-kernel.md) batched verify | High-conc throughput is gated by scheduler decisions per tick + per-row verify cost. M3.5 unifies decisions; M_b/M_c add multi-token-per-step credit on the verify path. |
 | prefill-heavy out tok/s -5.4% | (no combo plan; isolated tile-shape tuning) | The only gap that's a pure single-shape prefill tuning question. Worth its own focused micro-optimization. |
 
-So the priority order for gap-closing is **M_b.2 first, then M3.5, then M_d**;
-prefill-heavy is the only follow-up that needs to be attacked in this
-gap-followup plan as a standalone item. Don't burn a sprint reproducing
-spec-decode work that the combo plan already specs.
+Update after high-conc Phase 1: for the high-conc 2.7x gap, run the
+configuration controls first (`high-conc-2048` ARLE slot sweep and equal-slot
+vLLM). If those controls show the gap is mostly admission width, fix the server
+envelope before spending a sprint on M3.5/M_b implementation work. For the
+decode-heavy and longctx gaps, the combo-plan mapping still stands.
 
 ## Acceptance
 
