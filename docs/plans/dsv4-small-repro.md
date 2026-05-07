@@ -1,246 +1,61 @@
 # DSv4 Small-Scale Full-Method Repro Plan (Single 4070 Ti SUPER 16 GiB)
 
-> ⚠️ **Architecture truth source: [`../projects/2026-05-07-dsv4-truth.md`](../projects/2026-05-07-dsv4-truth.md)**
-> 本 plan 的 architecture / config sections(§1-§2)曾基于 DeepSeek-V4-Pro/Flash
-> 官方 config + 我们的手工缩放。2026-05-07 引入 HF replica
-> [`kshitijthakkar/deepseek-v4-mini-1B-init`](https://huggingface.co/kshitijthakkar/deepseek-v4-mini-1B-init)
-> 作为"唯一真理":**架构维度全部以 truth doc §1 为准**。本 plan 旧 §1.1-§2
-> 部分内容与 truth doc 不一致(vocab 49152 vs 129280 / experts 32 vs 16 /
-> head_dim 128 vs 64 等),**rewriting 进行中**;在完成前以 truth doc 优先。
->
-> 本 plan 保留的部分:**训练方法论**(§3 数据源 / §4 训练 pipeline / §5 评估 /
-> §6 后续工作)— 这些与具体 config size 解耦,继续有效。
+> ⚠️ **Architecture truth source: [`../projects/2026-05-07-arle-master-strategy.md`](../projects/2026-05-07-arle-master-strategy.md) §5.1**
+> 架构维度全部以 master §5.1 为准(HF replica `kshitijthakkar/deepseek-v4-mini-1B-init`
+> config)。本 plan 关注**训练方法论**(数据源 / pipeline / curriculum / eval /
+> 后续工作)— 与具体 config size 解耦,跨 HF replica 变体仍有效。
 
-**Status:** rewriting in progress(2026-05-07,truth doc 引入后部分超 deprecated)
+**Status:** training methodology(架构规模详 master §5.1)
 **Owner:** ckl
 **Hardware:** 1 × RTX 4070 Ti SUPER 16 GiB · CUDA 13.2 · cuDNN 9.21 · Linux · `.venv` at `/home/ckl/projects/arle/.venv`
-**Goal:** **From-scratch pre-train** of the architecture defined in
-[truth doc §1](../projects/2026-05-07-dsv4-truth.md#1-权威架构hf-replica-deepseek-v4-mini-1b-init)
-on one 16 GiB consumer GPU. **Not** distill, **not** SFT, **not** LoRA — a real
-cold-path pre-train using HF replica `deepseek-v4-mini-1B-init` config as canonical.
-**Companion plan:** [`2026-05-05-deepseek-v4-small-substrate.md`](2026-05-05-deepseek-v4-small-substrate.md) covers the runtime substrate (MLA-era V3 fixtures + nano training driver) — also being rewritten to reference truth doc.
+**Goal:** **From-scratch pre-train** of the architecture defined in master §5.1
+(HF replica `deepseek-v4-mini-1B-init`) on one 16 GiB consumer GPU.
+**Not** distill, **not** SFT, **not** LoRA — real cold-path pre-train.
+**Companion plan:** [`2026-05-05-deepseek-v4-small-substrate.md`](2026-05-05-deepseek-v4-small-substrate.md)
+covers runtime substrate + nano training driver。
 
 ---
 
-## 0. TL;DR — chosen target
+## 0. TL;DR
 
-| | DSv4-Pro reference | **dsv4-mini** (this plan) |
-|---|---|---|
-| total params | 1.6 T | **~1.05 B** |
-| activated params | 49 B | **~330 M** |
-| `hidden_size` | 7168 | **1024** |
-| `num_hidden_layers` | 61 | **24** |
-| `num_attention_heads` | 128 | **16** |
-| `num_key_value_heads` (GQA) | 1 | **1** |
-| `head_dim` (V4 unified) | 512 | **128** |
-| `q_lora_rank` | 1536 | **512** |
-| `o_lora_rank` / `o_groups` | 1024 / 16 | **512 / 8** |
-| `qk_rope_head_dim` | 64 | **32** |
-| `n_routed_experts` / per-tok | 384 / 6 | **32 / 4** |
-| `n_shared_experts` | 1 | **1** |
-| `moe_intermediate_size` | 3072 | **1408** |
-| `num_nextn_predict_layers` (MTP) | 1 | **1** |
-| `index_n_heads` / `index_topk` / `index_head_dim` | 64 / 1024 / 128 | **8 / 256 / 64** |
-| `num_hash_layers` | 3 | **3** |
-| `sliding_window` | 128 | **128** |
-| `compress_ratios` (CSA=4, HCA=128, SWA=0) | 61 entries | **24 entries** (P0/P1=HCA, then alternate CSA/HCA) |
-| `vocab_size` | 129 280 | **49 152** (3-byte BPE; smaller, see §3.1) |
-| `max_position_embeddings` (YaRN base 65k → ×16) | 1 048 576 | **65 536** (YaRN base 8 192 → ×8 = 65 k) |
-| pretrain tokens | 32 T | **40 B** (~38× Chinchilla under-trained, per "method ≠ score" goal) |
-| precision | FP4 expert / FP8 dense | **BF16 master + FP8 dense matmuls (TE)** — FP4 deferred (see §6.3) |
-| optimizer | Muon (hidden 2D) + AdamW (norm/embed) | **same** |
+**架构与参数量** → master §5.1(HF replica config + ~836M params / ~280M activated)。
 
-**Memory accounting** for `dsv4-mini` at `seq=4096`, `micro-batch=1`, BF16 master + FP8 fwd, ZeRO-1, gradient checkpointing on every transformer block:
+**Memory accounting**(at `seq=4096`, `micro-batch=1`, BF16 master + FP8 fwd,
+ZeRO-1 + gradient checkpointing,based on HF replica ~836M params):
 
 ```
-weights (BF16, 1.05 B × 2 B)         ~ 2.10 GiB
-master fp32 weights (Muon hidden)    ~ 4.20 GiB
-optimizer state (Muon momentum fp32) ~ 4.20 GiB
-gradients (BF16)                     ~ 2.10 GiB
+weights (BF16, 0.84 B × 2 B)         ~ 1.68 GiB
+master fp32 weights (Muon hidden)    ~ 3.36 GiB
+optimizer state (Muon momentum fp32) ~ 3.36 GiB
+gradients (BF16)                     ~ 1.68 GiB
 activations (ckpt: 1 layer worth)    ~ 0.80 GiB  (4096 × 1024 × 24 × 2 B / 24 stored)
 KV + attention scratch (CSA index)   ~ 0.50 GiB
 TE / cuBLAS workspace + framework    ~ 1.00 GiB
 ─────────────────────────────────────────────
-≈ 14.9 GiB                            margin ≈ 1.1 GiB
+≈ 12.4 GiB                            margin ≈ 3.6 GiB
 ```
 
-If `Muon master + momentum` is moved to **CPU offload** (DeepSpeed ZeRO-Offload, the only way Muon-on-1B-on-16GB is actually safe), the on-GPU state drops by ~8.4 GiB and we have **~7 GiB headroom**, enough to push `seq=8192` or `micro-batch=2`. **Decision: use ZeRO-2 + optimizer offload** (see §4.3).
+如 `Muon master + momentum` CPU offload(DeepSpeed ZeRO-Offload),on-GPU state
+再 −6.7 GiB,headroom ≥ 10 GiB,足以 `seq=8192` 或 `micro-batch=2`。
+**Decision: ZeRO-2 + optimizer offload**(见 §4.3)。
 
 ---
 
-## 1. DSv4 architectural ground truth
+## 1-2. DSv4 架构 + dsv4-mini config(已迁移到 master §5.1)
 
-> ⚠️ **DEPRECATED in favor of [truth doc §1](../projects/2026-05-07-dsv4-truth.md#1-权威架构hf-replica-deepseek-v4-mini-1b-init)**.
-> 下方 §1.1-§1.6 描述的是 DSv4-Pro / DSv4-Flash 完整版架构,作为**背景资料**
-> 保留;具体的 dsv4-mini 数值以 truth doc 为准(基于 HF replica 1B-init config)。
-> 数值不一致点(plan vs truth):vocab 49152 vs 129280;head_dim 128 vs 64;
-> q_lora_rank 512 vs 384;experts 32/4 vs 16/2;moe_intermediate_size 1408 vs
-> 512;sliding_window 128 vs 64;index_topk 256 vs 128;num_hash_layers 3 vs 2;
-> compress_ratios pattern 不同;YaRN factor 8 vs 16;max_position 65k vs 1M。
+完整 DSv4 架构特征(混合 SWA/CSA/HCA + Q-LoRA + O-LoRA grouping + Lightning
+Indexer + mHC + MTP + dual RoPE + MoE sqrtsoftplus + noaux_tc)、dsv4-mini
+权威 config JSON(HF replica `deepseek-v4-mini-1B-init`)、参数估算
+(~836M / ~280M activated)**全部见 [master strategy doc §5.1](../projects/2026-05-07-arle-master-strategy.md#51-dsv4-唯一架构真理hf-replica)**。
 
-All numbers below are from the official `config.json` of `deepseek-ai/DeepSeek-V4-Pro` and `DeepSeek-V4-Flash-Base` (released 2026-04-24), the Hugging Face DSv4 blog post, the technical report PDF (`deepseek-V4-model-card-EN.pdf`), and the Muon scalability paper. Items the public docs do not pin down are tagged **[假设]**.
-
-### 1.1 Hybrid attention — **the V4 delta**
-
-DSv4 **abandons MLA**. The V3-era `kv_a_proj_with_mqa` / `kv_b_proj` / `kv_lora_rank` triplet is gone from the V4 config. The new shape:
-
-- **Single-KV-head GQA**: `num_key_value_heads = 1`. All KV is shared across all Q heads — radical KV compression at the head-count axis.
-- **Q-LoRA**: `q_lora_rank = 1536` (Pro) / 1024 (Flash). Q is `hidden → q_lora_rank → q_proj_dim` two-stage. Same trick V3 used for q only.
-- **O-LoRA with grouping** (NEW in V4): `o_lora_rank = 1024`, `o_groups = 16` (Pro) / 8 (Flash). Output projection is split into `o_groups` parallel rank-`o_lora_rank` factorisations, then summed. Saves params on the largest projection.
-- **Unified `head_dim = 512`** (huge): each attention head writes a 512-wide value. Combined with `num_key_value_heads = 1` and `o_groups`, V4's per-head FLOP profile is unlike V3.
-- **Per-layer attention type via `compress_ratios[L]`**:
-  - `0` → **Sliding-Window Attention (SWA)** with window=128, used only on layer 0/1 of Flash (warm-up layers).
-  - `4` → **Compressed Sparse Attention (CSA)**: stride-4 compressor (overlap pool of 8 raw KV → 1 compressed entry) + a **Lightning Indexer** that selects top-`index_topk` compressed positions per query, giving sparse-but-dense-quality attention.
-  - `128` → **Heavily Compressed Attention (HCA)**: stride-128 non-overlap compressor, dense attention over the highly compressed stream. Used on layer 0/1 of Pro and on alternating layers of both Pro and Flash.
-- **Lightning Indexer config**: `index_n_heads=64`, `index_head_dim=128`, `index_topk=1024` (Pro) / 512 (Flash). The indexer is a small attention-like network that scores each compressed KV vs each query and picks top-k.
-- **Rotary**: `rope_theta=10_000` for the dense path; `compress_rope_theta=160_000` for the compressed/HCA path (different base because compressed positions span very different stride). YaRN scaling: `factor=16`, `original_max_position_embeddings=65_536`, `beta_fast=32`, `beta_slow=1`. Effective ctx = `65_536 × 16 = 1_048_576`.
-- **Hashed positions**: `num_hash_layers=3`. **[假设]** Used inside the Lightning Indexer for stable long-range positional encoding; the report describes it as "hashed compressor positions" but exact hashing scheme is not in the public model card.
-- **Sliding window everywhere**: `sliding_window=128` is layered *on top* of the compressed paths to preserve local detail.
-
-KV-cache savings vs V3 at 1 M context: 10% of V3's KV, 27% of V3's per-token FLOPs.
-
-### 1.2 MoE — minor delta from V3
-
-- `n_routed_experts = 384` (Pro) / 256 (Flash); V3 was 256.
-- `num_experts_per_tok = 6` (V3 used 8). Top-k drop is part of the V4 efficiency push.
-- `n_shared_experts = 1` (unchanged).
-- `moe_intermediate_size = 3072` (Pro) / 2048 (Flash); V3 was 2048.
-- `routed_scaling_factor = 2.5` (Pro) / 1.5 (Flash) — applied to weighted sum of routed experts, V3 also used 2.5.
-- `topk_method = "noaux_tc"` — **auxiliary-loss-free** load balancing with router-bias adjustment, identical mechanism to V3.
-- `scoring_func = "sqrtsoftplus"` (NEW in V4). Replaces V3's plain `sigmoid` gate with `sqrt(softplus(score))`, which is positive, monotone, and grows like `√x` for large positive `x`. **[假设, 高置信度]** This dampens runaway router scores and pairs with the no-aux-loss bias adjustment to keep utilisation flat without loss term pressure.
-- `norm_topk_prob = true` — top-k weights re-normalised to sum to 1.
-- **No expert grouping in V4** — V3 had `n_group=8 / topk_group=4`; V4 drops it (router bias keeps routing balanced without group-limited pre-selection).
-
-### 1.3 Manifold-Constrained Hyper-Connections (mHC)
-
-DSv4 replaces plain residual `x + f(x)` with a learned **Birkhoff-polytope-projected mixing matrix** between `n_hc=4` parallel residual streams. Knobs from config:
-
-- `hc_mult = 4` — number of hyper-connection streams per layer.
-- `hc_sinkhorn_iters = 20` — Sinkhorn iterations to project the mixing matrix onto the Birkhoff polytope (doubly-stochastic non-negative matrices) at each forward pass.
-- `hc_eps = 1e-6` — Sinkhorn numerical eps.
-
-Per the technical report blog: mHC strengthens signal propagation and "preserves expressivity" vs vanilla residual. **Implementation cost on 1 B-scale: negligible** (Sinkhorn on a 4×4 matrix per layer per forward).
-
-### 1.4 MTP
-
-- `num_nextn_predict_layers = 1` (Pro and Flash). V4 keeps a single MTP head — exactly like V3-style MTP. The head is a full transformer block plus `eh_proj` cross-projection from token-`t` hidden into token-`t+1` predictor stream.
-- Used during pre-training as an auxiliary loss (predict `t+1` and `t+2` jointly), discarded at inference unless used as a speculative-decoding proposer.
-
-### 1.5 Quantisation layout
-
-- **Expert weights**: FP4 (`expert_dtype = "fp4"` on Pro, `fp8` on Flash). Block-wise scale (`weight_block_size = [128, 128]`), `scale_fmt = "ue8m0"` (8-bit unsigned exponent — power-of-two scales).
-- **Non-expert weights**: FP8 E4M3 forward (`fmt = "e4m3"`), with **dynamic per-tensor activation scaling** (`activation_scheme = "dynamic"`).
-- The `quantization_config` block in `config.json` is the source of truth.
-
-### 1.6 Optimizer & training procedure
-
-- **Muon** for all 2-D hidden weights (attention/MLP/MoE projections). Reference Muon hyperparams (Moonlight paper): hidden lr ≈ 0.02, weight_decay = 0.1, momentum = 0.95, Nesterov, ns_steps = 5.
-- **AdamW** for embedding, LayerNorm/RMSNorm scales, biases, router gate. lr ≈ 3e-4 typical.
-- LR schedule: linear warmup (~2 k steps) → cosine decay to 0.1× peak.
-- **Sequence-length curriculum**: `4 K → 16 K → 64 K → 1 M`. Dense attention for the **first 1 T tokens at 4 K/16 K**, then sparse attention (CSA/HCA) is enabled at the 64 K extension. We mirror this curriculum at small scale (§4.4).
-- Total tokens: 32 T (Flash) / 33 T (Pro). Composition: math, code, web, long documents, scientific papers, multilingual. Auto-generated/templated content removed.
-- Post-training:
-  1. **Specialist Training**: SFT on domain data → GRPO RL.
-  2. **On-policy distillation**: student matches per-expert teacher distribution.
-
-For the small-scale repro, **we ship pre-train + a token-budget GRPO pass on math/code only** (post-training optional, see §6).
+本 plan 旧 §1.1-§2 内容(基于 DSv4-Pro / Flash 完整版 + 我们的手工缩放
+dsv4-mini config)与 HF replica 不一致(vocab 49152 vs 129280 / experts
+32-per4 vs 16-per2 / head_dim 128 vs 64 等),已删除。任何需要 V3 → V4
+架构演进的历史 reasoning,见 git history `dsv4-small-repro.md` 在 commit
+`971eec7` 之前的版本(2026-05-07 truth doc 引入前)。
 
 ---
 
-## 2. dsv4-mini — exact config
-
-> ⚠️ **DEPRECATED — see [truth doc §1](../projects/2026-05-07-dsv4-truth.md#1-权威架构hf-replica-deepseek-v4-mini-1b-init)
-> for canonical `config.json`**(HF replica `deepseek-v4-mini-1B-init`).
-> 下方 JSON 是早期手工缩放设计,与 HF replica 不一致;**不要用于实际训练**。
-> 保留作为 reasoning/scaling 思路的历史记录。后续 rewrite 会删除整段。
-
-```json
-{
-  "architectures": ["DeepseekV4ForCausalLM"],
-  "model_type": "deepseek_v4",
-  "torch_dtype": "bfloat16",
-
-  "vocab_size": 49152,
-  "hidden_size": 1024,
-  "num_hidden_layers": 24,
-  "num_attention_heads": 16,
-  "num_key_value_heads": 1,
-  "head_dim": 128,
-  "hidden_act": "silu",
-  "swiglu_limit": 10.0,
-
-  "q_lora_rank": 512,
-  "o_lora_rank": 512,
-  "o_groups": 8,
-  "qk_rope_head_dim": 32,
-
-  "n_routed_experts": 32,
-  "n_shared_experts": 1,
-  "num_experts_per_tok": 4,
-  "moe_intermediate_size": 1408,
-  "routed_scaling_factor": 1.5,
-  "norm_topk_prob": true,
-  "scoring_func": "sqrtsoftplus",
-  "topk_method": "noaux_tc",
-
-  "index_n_heads": 8,
-  "index_head_dim": 64,
-  "index_topk": 256,
-  "num_hash_layers": 3,
-  "sliding_window": 128,
-  "compress_ratios": [128, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0],
-
-  "hc_mult": 4,
-  "hc_sinkhorn_iters": 20,
-  "hc_eps": 1.0e-6,
-
-  "num_nextn_predict_layers": 1,
-
-  "max_position_embeddings": 65536,
-  "rope_theta": 10000,
-  "compress_rope_theta": 160000,
-  "rope_scaling": {
-    "type": "yarn",
-    "factor": 8,
-    "original_max_position_embeddings": 8192,
-    "beta_fast": 32,
-    "beta_slow": 1
-  },
-
-  "rms_norm_eps": 1.0e-6,
-  "initializer_range": 0.02,
-  "tie_word_embeddings": true,
-  "attention_bias": false,
-  "attention_dropout": 0.0,
-  "bos_token_id": 0,
-  "eos_token_id": 1,
-
-  "expert_dtype": "fp8",
-  "quantization_config": {
-    "quant_method": "fp8",
-    "fmt": "e4m3",
-    "scale_fmt": "ue8m0",
-    "activation_scheme": "dynamic",
-    "weight_block_size": [128, 128]
-  }
-}
-```
-
-**Param count breakdown** (BF16, tied embeddings):
-
-| Block | Per-layer | Layers | Subtotal |
-|---|---|---|---|
-| Embedding (tied) | `49 152 × 1024` | 1 | 50 M |
-| Per-layer attention (q-LoRA + 1 KV head + o-LoRA × 8 groups + RMSNorms + indexer share) | ~7.5 M | 24 | 180 M |
-| Per-layer MoE: 32 routed × `2 × 1024 × 1408 + 1024` + 1 shared × same + router | ~33 M routed-only-counted-once | 24 | 790 M |
-| MTP head (1 transformer block + eh_proj) | ~33 M | 1 | 33 M |
-| Final RMSNorm + tied LM head | – | – | 0 |
-| **Total** | | | **≈ 1.05 B** |
-| **Activated per token** (top-4 of 32 + shared + dense) | | | **≈ 330 M** |
-
-Activated-param ratio matches DSv4-Flash's 13/284 ≈ 4.6%; ours is 330/1050 ≈ 31% because at small scale `n_routed_experts` collapses faster than `top-k`. Not 1:1 in ratio but **architecturally identical** in the routing/sharing scheme — that is the goal.
-
----
 
 ## 3. Training data — China-accessible sources only
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-- Truth source: `docs/projects/2026-05-07-dsv4-truth.md` section 1.
+- Truth source: `docs/projects/2026-05-07-arle-master-strategy.md` section 5.1 (DSV4 architecture).
 - Code audited: `crates/deepseek-spec/src/lib.rs`.
 - Local HF replica checked: `infer/models/dsv4-mini-1B-init/config.json`.
 - Local HF model code checked:

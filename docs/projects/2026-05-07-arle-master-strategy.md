@@ -4,10 +4,6 @@
 > 无不确定性 + **唯一的文档**。本文是 ARLE 项目的唯一战略主文档,**任何与本
 > 文冲突的旧 doc 以本文为准**。
 >
-> **被本文 supersede 的旧 doc**:
-> - `2026-05-07-arle-as-coding-agent-runtime-strategic-pivot.md`(推理侧 pivot 草版)
-> - `2026-05-07-dsv4-truth.md`(DSV4 config 详图,作为 §5 技术 appendix 保留)
->
 > **本文 3 遍 review 履历**:
 > 1. 事实/逻辑(数据精确,引用准确,因果链合理)
 > 2. 完整性(blind spots 覆盖,multi-dim,部署模式)
@@ -554,7 +550,6 @@ per R2 audit(commit fa6a5ea):
 ## §11 Cross-references(本文 supersede 一切冲突)
 
 ### 推理侧
-- 战略 pivot 早版(已 supersede):[`2026-05-07-arle-as-coding-agent-runtime-strategic-pivot.md`](./2026-05-07-arle-as-coding-agent-runtime-strategic-pivot.md)
 - M_world1 roadmap:[`docs/plans/M_world1-30-percent-lead-roadmap.md`](../plans/M_world1-30-percent-lead-roadmap.md)
 - W3/W4 bench spec:[`docs/plans/2026-05-02-agent-load-bench-spec.md`](../plans/2026-05-02-agent-load-bench-spec.md)
 - W3/W4 mission:[`docs/projects/2026-05-02-agent-load-mission-expansion.md`](./2026-05-02-agent-load-mission-expansion.md)
@@ -566,7 +561,6 @@ per R2 audit(commit fa6a5ea):
 - 4-shape baseline P0.2 wins:`docs/experience/wins/2026-05-07-m_world1-p0-sglang-baseline-extended.md`
 
 ### 训练侧
-- DSV4 truth doc(已 supersede,§5 集成):[`2026-05-07-dsv4-truth.md`](./2026-05-07-dsv4-truth.md)
 - DSV4 small-scale repro(rewriting 中):[`docs/plans/dsv4-small-repro.md`](../plans/dsv4-small-repro.md)
 - DSV4 small-VRAM substrate:[`docs/plans/2026-05-05-deepseek-v4-small-substrate.md`](../plans/2026-05-05-deepseek-v4-small-substrate.md)
 - deepseek-spec truth audit(R2):[`docs/research/2026-05-07-deepseek-spec-truth-audit.md`](../research/2026-05-07-deepseek-spec-truth-audit.md)
