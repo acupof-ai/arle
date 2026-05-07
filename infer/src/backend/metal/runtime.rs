@@ -3130,4 +3130,33 @@ mod tests {
         let fp_b = metal_prefix_model_fingerprint(&backend).expect("fingerprint b");
         assert_ne!(fp_a, fp_b);
     }
+
+    /// M_d.1 §3c — closes the documented silent-corruption hole for the
+    /// Qwen3.5 SSD prefix cache. The existing model-tree walk already
+    /// folds every `.json` file's bytes into the fingerprint, so a
+    /// `tokenizer.json` content change MUST flip `fp` and a stale disk
+    /// snapshot MUST then be rejected by `reconcile_disk_entries`.
+    /// Pre-M_d.1 there was no test for this case, only for mtime-without-
+    /// content invariance.
+    #[test]
+    fn metal_prefix_model_fingerprint_flips_on_tokenizer_content_change() {
+        let dir = tempdir().expect("tempdir");
+        let gguf = dir.path().join("model.gguf");
+        let tokenizer = dir.path().join("_gguf_tokenizer.json");
+        std::fs::write(&gguf, b"weights").expect("write gguf");
+        std::fs::write(&tokenizer, br#"{"vocab":"v1"}"#).expect("write tokenizer v1");
+
+        let mut backend = MetalBackend::with_options(MetalBackendOptions::default());
+        backend.model_dir = Some(dir.path().to_path_buf());
+        backend.model_source_path = Some(gguf.clone());
+        let fp_v1 = metal_prefix_model_fingerprint(&backend).expect("fingerprint v1");
+
+        std::fs::write(&tokenizer, br#"{"vocab":"v2"}"#).expect("rewrite tokenizer v2");
+        let fp_v2 = metal_prefix_model_fingerprint(&backend).expect("fingerprint v2");
+        assert_ne!(
+            fp_v1, fp_v2,
+            "tokenizer.json byte change must flip the model fingerprint so disk \
+             reconcile drops stale prefix snapshots indexed under the old vocab"
+        );
+    }
 }
