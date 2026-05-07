@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaEvent, CudaSlice};
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
@@ -94,34 +94,123 @@ struct PendingPagedPrefill {
     _prefix_token_rows_dev: CudaSlice<i32>,
     _prefill_token_rows_dev: CudaSlice<i32>,
     _fwd: crate::ops::PagedPrefillForward,
+    owners: Vec<PendingPagedPrefillOwner>,
+    completion_error: Option<anyhow::Error>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPagedPrefillOwner {
+    slot: usize,
+    state_idx: usize,
+    token_count: usize,
 }
 
 pub struct Qwen3PrefillContext {
     pending: Option<PendingPagedPrefill>,
+    completion_event: CudaEvent,
 }
 
 impl Qwen3PrefillContext {
-    pub(super) fn new() -> Self {
-        Self { pending: None }
+    pub(super) fn new(ctx: &DeviceContext) -> Result<Self> {
+        Ok(Self {
+            pending: None,
+            completion_event: ctx
+                .ctx
+                .new_event(None)
+                .map_err(|e| anyhow::anyhow!("Alloc async prefill completion event failed: {e}"))?,
+        })
     }
 
-    fn set_pending(&mut self, pending: PendingPagedPrefill) -> Result<()> {
+    fn set_pending(&mut self, ctx: &DeviceContext, pending: PendingPagedPrefill) -> Result<()> {
         anyhow::ensure!(
             self.pending.is_none(),
             "qwen3 prefill context already has a pending batch"
         );
+        self.completion_event
+            .record(&ctx.stream)
+            .map_err(|e| anyhow::anyhow!("record async prefill completion event: {e}"))?;
         self.pending = Some(pending);
         Ok(())
     }
 
-    pub(super) fn complete(&mut self, ctx: &DeviceContext) -> Result<()> {
-        if self.pending.is_none() {
-            return Ok(());
+    pub(super) fn complete(&mut self, expected_slots: &[usize]) -> Result<bool> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(true);
+        };
+        pending.validate_slots(expected_slots)?;
+        match unsafe { cudarc::driver::result::event::query(self.completion_event.cu_event()) } {
+            Ok(()) => {}
+            Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
+                return Ok(false);
+            }
+            Err(err) => {
+                self.pending = None;
+                return Err(anyhow::anyhow!(
+                    "async prefill completion event failed: {err}"
+                ));
+            }
         }
-        ctx.sync()?;
-        self.pending = None;
+        let pending = self
+            .pending
+            .take()
+            .expect("pending prefill existed before completion event");
+        if let Some(err) = pending.completion_error {
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    pub(super) fn wait(&mut self, expected_slots: &[usize]) -> Result<()> {
+        while !self.complete(expected_slots)? {
+            std::thread::yield_now();
+        }
         Ok(())
     }
+}
+
+impl PendingPagedPrefill {
+    fn validate_slots(&self, expected_slots: &[usize]) -> Result<()> {
+        if expected_slots.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.owners.len() == expected_slots.len(),
+            "async prefill owner count mismatch: pending={} expected={}",
+            self.owners.len(),
+            expected_slots.len()
+        );
+        for (row, (owner, &expected_slot)) in self.owners.iter().zip(expected_slots).enumerate() {
+            anyhow::ensure!(
+                owner.slot == expected_slot,
+                "async prefill owner mismatch at row {row}: pending slot {} expected slot {}",
+                owner.slot,
+                expected_slot
+            );
+            anyhow::ensure!(
+                owner.token_count > 0,
+                "async prefill owner for slot {} has empty chunk",
+                owner.slot
+            );
+            anyhow::ensure!(
+                owner.state_idx == owner.slot,
+                "async scheduler prefill owner slot/state mismatch: slot {} state {}",
+                owner.slot,
+                owner.state_idx
+            );
+        }
+        Ok(())
+    }
+}
+
+fn prefill_owners(requests: &[Qwen3PagedPrefillRequest<'_>]) -> Vec<PendingPagedPrefillOwner> {
+    requests
+        .iter()
+        .map(|request| PendingPagedPrefillOwner {
+            slot: request.slot,
+            state_idx: request.state_idx,
+            token_count: request.tokens.len(),
+        })
+        .collect()
 }
 
 impl Qwen3Model {
@@ -362,9 +451,9 @@ impl Qwen3Model {
             &layout.sequences,
             pool.page_size,
         )?;
-        let hidden = self.get_embeddings_batch(&packed_tokens)?;
-        let hidden_result = self.process_all_layers_batch_paged(
-            hidden,
+        let mut hidden = self.get_embeddings_batch(&packed_tokens)?;
+        let completion_error = match self.process_all_layers_batch_paged(
+            &mut hidden,
             &mut bufs,
             pool,
             &layout.sequences,
@@ -373,32 +462,31 @@ impl Qwen3Model {
             layout.prefix_token_rows.len(),
             &prefill_token_rows_dev,
             &mut fwd,
-        );
-        let hidden = match hidden_result {
-            Ok(hidden) => hidden,
-            Err(err) => {
-                self.ctx.sync()?;
-                return Err(err);
-            }
-        };
-        if let Err(err) = self.compute_logits_batch_packed(
-            &hidden,
-            requests,
-            states,
-            &layout.sequences,
-            &mut bufs,
         ) {
-            self.ctx.sync()?;
-            return Err(err);
-        }
-        prefill_ctx.set_pending(PendingPagedPrefill {
-            _hidden: hidden,
-            _bufs: bufs,
-            _page_indices_dev: page_indices_dev,
-            _prefix_token_rows_dev: prefix_token_rows_dev,
-            _prefill_token_rows_dev: prefill_token_rows_dev,
-            _fwd: fwd,
-        })?;
+            Ok(()) => self
+                .compute_logits_batch_packed(
+                    &hidden,
+                    requests,
+                    states,
+                    &layout.sequences,
+                    &mut bufs,
+                )
+                .err(),
+            Err(err) => Some(err),
+        };
+        prefill_ctx.set_pending(
+            &self.ctx,
+            PendingPagedPrefill {
+                _hidden: hidden,
+                _bufs: bufs,
+                _page_indices_dev: page_indices_dev,
+                _prefix_token_rows_dev: prefix_token_rows_dev,
+                _prefill_token_rows_dev: prefill_token_rows_dev,
+                _fwd: fwd,
+                owners: prefill_owners(requests),
+                completion_error,
+            },
+        )?;
         Ok(())
     }
 
@@ -408,9 +496,9 @@ impl Qwen3Model {
         states: &mut [Qwen3State],
         pool: &TokenKVPool,
     ) -> Result<()> {
-        let mut prefill_ctx = Qwen3PrefillContext::new();
+        let mut prefill_ctx = Qwen3PrefillContext::new(&self.ctx)?;
         self.launch_prefill_paged_batch(requests, states, pool, &mut prefill_ctx)?;
-        prefill_ctx.complete(&self.ctx)
+        prefill_ctx.wait(&[])
     }
 
     /// Paged-KV prefill over one or more packed requests. Writes K/V directly
@@ -421,7 +509,7 @@ impl Qwen3Model {
     #[fastrace::trace(name = "process_all_layers_batch_paged")]
     fn process_all_layers_batch_paged(
         &self,
-        mut hidden: HiddenStates,
+        hidden: &mut HiddenStates,
         bufs: &mut PrefillBuffers,
         pool: &TokenKVPool,
         sequences: &[ops::PagedPrefillSequence],
@@ -430,7 +518,7 @@ impl Qwen3Model {
         prefix_token_count: usize,
         prefill_token_rows: &CudaSlice<i32>,
         fwd: &mut crate::ops::PagedPrefillForward,
-    ) -> Result<HiddenStates> {
+    ) -> Result<()> {
         let seq_len = hidden.seq_len;
 
         anyhow::ensure!(
@@ -449,7 +537,7 @@ impl Qwen3Model {
             self.forward_layer_batch_paged(
                 layer_idx,
                 layer,
-                &mut hidden,
+                hidden,
                 bufs,
                 pool,
                 sequences,
@@ -461,7 +549,7 @@ impl Qwen3Model {
             )?;
         }
 
-        Ok(hidden)
+        Ok(())
     }
 
     /// Paged-KV variant of `forward_layer_batch`. Differences vs the contiguous

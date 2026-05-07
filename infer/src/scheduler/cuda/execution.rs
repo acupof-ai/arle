@@ -674,13 +674,21 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
+        let mut prefill_readback_pending = false;
         let prefill_readback_us = if self.pending_prefill.is_some() {
             let t = std::time::Instant::now();
-            self.step_prefill_readback();
+            prefill_readback_pending = !self.step_prefill_readback();
             t.elapsed().as_micros()
         } else {
             0
         };
+        if prefill_readback_pending {
+            self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
+            self.metrics
+                .observe_scheduler_step(prefill_readback_us as f64 / 1_000_000.0);
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            return;
+        }
 
         // Read back the previous iteration's in-flight GPU work first.
         // `pending_prefill` / `pending_decode` live across loop turns so

@@ -717,27 +717,36 @@ impl<M: ModelForward> Scheduler<M> {
         });
     }
 
-    pub(super) fn step_prefill_readback(&mut self) {
+    pub(super) fn step_prefill_readback(&mut self) -> bool {
         let Some(pending) = self.pending_prefill.take() else {
-            return;
+            return true;
         };
         let Some(prefill_ctx) = self.prefill_ctx.as_mut() else {
             self.finish_prefill_batch_error(
                 &pending.rows,
                 &anyhow::anyhow!("missing prefill context for async completion"),
             );
-            return;
+            return true;
         };
+        let pending_slots: Vec<usize> = pending.rows.iter().map(|row| row.slot_idx).collect();
 
-        if let Err(e) = self
+        match self
             .model
-            .complete_prefill_batch(&mut self.states, prefill_ctx)
+            .complete_prefill_batch(&mut self.states, prefill_ctx, &pending_slots)
         {
-            self.finish_prefill_batch_error(&pending.rows, &e);
-            return;
+            Ok(true) => {}
+            Ok(false) => {
+                self.pending_prefill = Some(pending);
+                return false;
+            }
+            Err(e) => {
+                self.finish_prefill_batch_error(&pending.rows, &e);
+                return true;
+            }
         }
 
         self.finish_prefill_batch(pending);
+        true
     }
 
     /// Process one scheduler-planned prefill batch. Single-request prefill is
