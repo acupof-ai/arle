@@ -92,9 +92,8 @@ fn sum_weight_files(dir: &std::path::Path) -> std::io::Result<u64> {
         // blobs/ directory, so `entry.metadata()` (which doesn't traverse on
         // Unix) reports the symlink's own ~12-byte size and undercounts
         // catastrophically. `std::fs::metadata` follows the link.
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
         };
         if !meta.is_file() {
             continue;

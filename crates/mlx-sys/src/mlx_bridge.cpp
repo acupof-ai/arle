@@ -1,8 +1,12 @@
 #include "mlx_common.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/version.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -2069,15 +2073,39 @@ void mlx_eval(mlx_array** arrays, size_t count) {
     }
 }
 
+// INFER_CPP_PHASE_TIMING=1 enables stderr per-call timing of the
+// MLX FFI hot path (async_eval, eval, forward). Cached env probe
+// keeps the prod path at one atomic read after first call.
+static bool cpp_phase_timing_enabled() {
+    static int flag = -1;
+    if (flag == -1) {
+        const char* v = std::getenv("INFER_CPP_PHASE_TIMING");
+        flag = (v && *v && v[0] != '0' && std::string(v) != "false") ? 1 : 0;
+    }
+    return flag == 1;
+}
+
 void mlx_async_eval(mlx_array** arrays, size_t count) {
     try {
         mlx_clear_error();
+        bool tracing = cpp_phase_timing_enabled();
+        auto t0 = tracing ? std::chrono::high_resolution_clock::now()
+                          : std::chrono::high_resolution_clock::time_point{};
         std::vector<array> arrs;
         arrs.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             arrs.push_back(*to_arr(arrays[i]));
         }
+        auto t_setup = tracing ? std::chrono::high_resolution_clock::now() : t0;
         async_eval(arrs);
+        if (tracing) {
+            auto t_end = std::chrono::high_resolution_clock::now();
+            auto setup_us = std::chrono::duration_cast<std::chrono::microseconds>(t_setup - t0).count();
+            auto async_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_setup).count();
+            std::fprintf(stderr,
+                "cpp_phase_timing mlx_async_eval count=%zu setup_us=%lld async_eval_call_us=%lld\n",
+                count, (long long)setup_us, (long long)async_us);
+        }
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
     }
