@@ -278,6 +278,89 @@ Next validation actions:
 3. Do **not** implement a server-envelope-only change as the Phase 1 fix. It
    increases active rows but does not close the 2.7x throughput gap.
 
+### Phase 1 step 3: prefill admission controls
+
+Scope: evidence-only scout runs. No ARLE code changes. The fixed workload
+remained `1024 in / 256 out, c=64`, one run per point, `--max-seconds 45`,
+`--warmup 5`. ARLE was held at the best previous scout envelope:
+`--max-seq-len 2048 --num-slots 48`.
+
+Default server command:
+
+```bash
+RUST_LOG=info RUST_BACKTRACE=full \
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+TORCH_CUDA_ARCH_LIST=8.9 \
+target/release/infer \
+  --model-path /home/ckl/projects/arle/infer/models/Qwen3-4B \
+  --port 8000 \
+  --max-seq-len 2048 \
+  --num-slots 48
+```
+
+Throttled points added:
+
+```bash
+  --max-prefill-tokens 2048 --prefill-max-requests <1|2|4>
+```
+
+The default point resolved `max_prefill_tokens=16384,
+prefill_max_requests=none`; the three throttled points resolved
+`max_prefill_tokens=2048` and `prefill_max_requests=<N>`. Raw server logs are
+under
+`bench-output/2026-05-07-m6-highconc-phase1-step3-prefill-sweep/`.
+
+`prefill_rows share` below is computed from sampled `/v1/stats` rows as
+`sum(prefill_rows) / sum(prefill_rows + decode_rows)` over scheduled samples.
+It is a row-count share; each prefill row can still carry a 1025-token prompt
+chunk in this workload.
+
+| ARLE s48 config | TTFT p50 | ITL p50 | out tok/s | req/s | plan labels | prefill_rows share | active peak | running_batch peak | avg running/active | kv_util peak | artifact |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---|
+| default (`max_prefill_tokens=16384`, no request cap) | 4204.1 ms | 72.13 ms | 402.33 | 1.750 | `idle=2 decode=435 prefill=2 split=0 mixed=112` | 9.2% | 48 | 43 | 78.5% | 96.5% | `m6-highconc-phase1-step3-arle-s48-default` |
+| `--max-prefill-tokens 2048 --prefill-max-requests 1` | 5132.4 ms | 77.05 ms | 374.29 | 1.625 | `idle=2 decode=8 prefill=2 split=0 mixed=531` | 2.5% | 48 | 47 | 83.5% | 94.5% | `m6-highconc-phase1-step3-arle-s48-prefill1` |
+| `--max-prefill-tokens 2048 --prefill-max-requests 2` | 4169.2 ms | 72.24 ms | 408.37 | 1.775 | `idle=2 decode=7 prefill=2 split=0 mixed=540` | 2.6% | 48 | 44 | 79.6% | 94.9% | `m6-highconc-phase1-step3-arle-s48-prefill2` |
+| `--max-prefill-tokens 2048 --prefill-max-requests 4` | 4057.9 ms | 72.24 ms | 408.74 | 1.775 | `idle=2 decode=8 prefill=2 split=0 mixed=540` | 2.6% | 48 | 44 | 78.3% | 95.9% | `m6-highconc-phase1-step3-arle-s48-prefill4` |
+
+Comparison against equal-width control:
+
+| backend / envelope | TTFT p50 | ITL p50 | out tok/s | read |
+|---|---:|---:|---:|---|
+| ARLE 5120 / auto 14 ref | 1059.0 ms | 30.81 ms | 414.66 | Lower TTFT, but only 14 useful decode rows. |
+| vLLM 2048 / `--max-num-seqs 14` | 17608.6 ms | 20.24 ms | 614.55 | Same nominal max seq count still 1.48x ARLE throughput. |
+| ARLE 2048 / s48 best Step 3 point | 4057.9 ms | 72.24 ms | 408.74 | Wider admission worsens ITL and does not approach vLLM s14. |
+
+Conclusion: this **does not confirm simple mixed prefill/decode admission as
+the throughput unlock**.
+
+- The throttle works mechanically: `prefill_rows share` drops from 9.2% to
+  about 2.5-2.6%.
+- Throughput does not improve. `prefill-max-requests=1` regresses to 374 out
+  tok/s; `2` and `4` sit around 408 out tok/s, which is scout-noise distance
+  from the default 402 out tok/s and below the previous s48 scout at 442 out
+  tok/s.
+- `running_batch` peak improves for `prefill=1` (47/48) but useful output
+  throughput still drops, so filling rows is not sufficient if the step shape
+  is mostly tiny mixed work.
+- Throttled runs shift almost every scheduler step into `mixed` labels
+  (`~98% mixed`) while carrying only one or two prefill rows. That is a useful
+  scheduler-policy signal, but not a validated performance fix.
+- The equal-width vLLM control remains the stronger bottleneck evidence:
+  vLLM at 14 max sequences is still 1.48x faster than ARLE's high-conc M6
+  reference and 1.50x faster than this Step 3 best point.
+
+Updated next action:
+
+1. Move to Nsight kernel / CUDA graph profiling for decode-heavy effective
+   widths (`ARLE s32/s48` vs `vLLM --max-num-seqs 14`). This is the next
+   falsification point for decode kernel, graph replay, and launch/driver
+   overhead.
+2. Do not land a prefill admission rate-limit as the Phase 1 fix from this
+   evidence. A future scheduler policy change should be tested as
+   decode-priority / mixed-step collapse, not as a static
+   `prefill-max-requests` cap alone.
+
 ## **Priority 0A: re-run longctx with T1 host-pinned KV overflow enabled**
 
 The M6 baseline run did NOT explicitly enable the T1 host-pinned tier.
