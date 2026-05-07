@@ -258,6 +258,24 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
   return cudaGetLastError();
 }
 
+// M_pf-gemm Phase 0: at first miss for a given (M,N,K), benchmark
+// all heuristic-returned algos (5 iters each) and cache the fastest.
+// cuBLAS heuristic top-1 is optimized for "average cost across many
+// shapes"; for a specific shape the best algo is often at index
+// 1-3. Off by default; opt in with INFER_GEMM_AUTOTUNE=1.
+// See docs/plans/M_pf-gemm-cublaslt-autotune.md, H_LP3 finding
+// docs/experience/wins/2026-05-07-h_lp3-diagnosed-cutlass-small-tile-gemm-bottleneck.md.
+static bool gemm_autotune_enabled() {
+  static const bool enabled = []() {
+    const char *env = std::getenv("INFER_GEMM_AUTOTUNE");
+    if (env == nullptr) return false;
+    return std::strcmp(env, "1") == 0 ||
+           std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0 ||
+           std::strcmp(env, "on") == 0 || std::strcmp(env, "ON") == 0;
+  }();
+  return enabled;
+}
+
 static bool deterministic_gemm_enabled() {
   // INFER_DETERMINISTIC=1 forces every BF16 GEMM through the cublasGemmEx
   // fallback so B=1 (graphsafe path) and B>=2 (cublasLt path) hit the same
@@ -368,7 +386,58 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
     preference = nullptr;
 
     if (heuristic_status == CUBLAS_STATUS_SUCCESS && returned_algo_count > 0) {
-      algo_it = state->algo_cache.emplace(key, heuristic_results[0].algo).first;
+      cublasLtMatmulAlgo_t selected_algo = heuristic_results[0].algo;
+      // M_pf-gemm Phase 0: when INFER_GEMM_AUTOTUNE=1, benchmark all
+      // returned algos at this (M,N,K) and keep the fastest. One-time
+      // cost amortized across all subsequent calls of this shape.
+      if (gemm_autotune_enabled() && returned_algo_count > 1) {
+        cudaEvent_t e_start = nullptr;
+        cudaEvent_t e_stop = nullptr;
+        if (cudaEventCreate(&e_start) == cudaSuccess &&
+            cudaEventCreate(&e_stop) == cudaSuccess) {
+          float best_ms = 0.0f;
+          bool have_best = false;
+          for (int i = 0; i < returned_algo_count; ++i) {
+            cublasLtMatmulAlgo_t &candidate = heuristic_results[i].algo;
+            // Warmup once
+            if (cublasLtMatmul(state->lt_handle, operation_desc,
+                               &h_alpha, W, w_desc, X, x_desc, &h_beta,
+                               Y, y_desc, Y, y_desc, &candidate,
+                               state->cublaslt_workspace, kWorkspaceBytes,
+                               stream) != CUBLAS_STATUS_SUCCESS) {
+              continue;
+            }
+            // Measure 5 iters
+            cudaEventRecord(e_start, stream);
+            bool failed = false;
+            for (int it = 0; it < 5; ++it) {
+              if (cublasLtMatmul(state->lt_handle, operation_desc,
+                                 &h_alpha, W, w_desc, X, x_desc, &h_beta,
+                                 Y, y_desc, Y, y_desc, &candidate,
+                                 state->cublaslt_workspace, kWorkspaceBytes,
+                                 stream) != CUBLAS_STATUS_SUCCESS) {
+                failed = true;
+                break;
+              }
+            }
+            if (failed) continue;
+            cudaEventRecord(e_stop, stream);
+            if (cudaEventSynchronize(e_stop) != cudaSuccess) continue;
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, e_start, e_stop) != cudaSuccess) {
+              continue;
+            }
+            if (!have_best || ms < best_ms) {
+              best_ms = ms;
+              selected_algo = candidate;
+              have_best = true;
+            }
+          }
+          cudaEventDestroy(e_start);
+          cudaEventDestroy(e_stop);
+        }
+      }
+      algo_it = state->algo_cache.emplace(key, selected_algo).first;
     } else {
       cublasLtMatrixLayoutDestroy(y_desc);
       cublasLtMatrixLayoutDestroy(x_desc);
