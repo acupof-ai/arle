@@ -42,6 +42,58 @@ Primary snapshot:
    - Profile scheduler admission and decode batch width under c=64; the first
      goal is to increase output tok/s while preserving ARLE's TTFT p50 lead.
 
+## **Priority 0: re-run with T1 host-pinned KV overflow enabled**
+
+The M6 baseline run did NOT explicitly enable the T1 host-pinned tier.
+`SchedulerConfig::t1_host_pinned_capacity_bytes` defaulted to `None`
+(the constructor's conservative auto-size, see `scheduler/types.rs:177`).
+The local box has **31.3 GB system RAM** vs the **16 GB GPU**; the
+infrastructure to spill GPU KV to host-pinned RAM **already exists**
+(`infer/src/kv_tier/host_pool.rs` + `KvTierAdapter`, M2 of unification)
+and the `infer` binary already exposes the CLI flags
+(`infer/src/main.rs:203-219`):
+
+- `--t1-host-pinned-capacity-mb <N>` (target ≈ 16384 — leaves ~10 GB for OS / build / driver)
+- `--t1-host-pinned-high-water <FRAC>` (default 0.85)
+- `--t1-host-pinned-low-water <FRAC>` (default 0.70)
+
+Re-run the M6 canonical sweep with explicit T1 sizing **before** going
+deep on combo plan implementation. Hypothesis: longctx-32k -34.9% and
+high-conc -62.9% gaps shrink materially because kv_util-100% scenarios
+spill to host instead of stalling at `active=2 waiting=2` (longctx) or
+`active=14 waiting=∞` (high-conc).
+
+```bash
+RUST_LOG=info NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo run --release -p infer --no-default-features --features cuda -- \
+  --model-path /home/ckl/projects/arle/infer/models/Qwen3-4B \
+  --port 8000 \
+  --max-seq-len 5120 \
+  --t1-host-pinned-capacity-mb 16384
+
+PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
+scripts/bench_guidellm.sh cuda-m6-with-t1 \
+  --target http://localhost:8000 \
+  --model Qwen/Qwen3-4B \
+  --processor /home/ckl/projects/arle/infer/models/Qwen3-4B
+```
+
+Expected delta:
+- longctx-32k: gap closes (host-pinned absorbs the prefix overflow that currently stalls at 2 active).
+- high-conc: gap shrinks (host-pinned increases the effective active concurrency ceiling without changing `max_slots`).
+- prefill-heavy / decode-heavy: unchanged (no overflow happening in baseline).
+
+If these expected deltas land, the headline "ARLE 1/8 → ARLE ≥3/8 on
+local 16 GB" without writing a single line of code. That's the
+*configuration-only* win to publish before chasing kernel-level optimizations.
+
+**Acceptance**: re-run produces a `cuda-m6-with-t1` wins entry with
+direct delta-vs-baseline rows. Closes longctx-32k or high-conc cell
+even on local hardware → counts as a gap closed for this plan's
+acceptance criterion.
+
 ## Strategic alignment with combo plan (manager note 2026-05-07)
 
 Three of the four gaps overlap directly with already-spec'd combo plan
