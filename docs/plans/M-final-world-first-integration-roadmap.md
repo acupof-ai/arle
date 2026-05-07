@@ -7,41 +7,53 @@
 
 ## Priority & ROI
 
-| Track | Priority | ROI basis | Negative case | Kill criteria |
+> **2026-05-07 EOD update**: M_world1 strategic redirect — target
+> = world #1 (lead #2 by 30%+), not just beat vLLM. See
+> [`M_world1-30-percent-lead-roadmap.md`](M_world1-30-percent-lead-roadmap.md).
+> Phase 0 (bench SGLang + TRT-LLM locally) is now the gating
+> step; per-shape priorities below are derived from vLLM-only
+> data and will be re-anchored after Phase 0 baseline lands.
+
+| Track | Status | Priority | ROI basis | Kill criteria |
 |---|---|---|---|---|
-| **M3.9 Phase 1A v3** (multi-slot async readback) | **P0** | Long-ctx 8k TTFT 4961→~2500 ms (50% reduction) — measured against 4961 ms F4-Small baseline + 2367 ms vLLM control. Blocker chain: F4-Small precondition `deferred_decode_emit.is_none()` (verified `2a534c4` git-blame) blocks Mixed at long-ctx steady-state, forces Split (10× tax measured `4a3612b`). | If ARLE long-ctx workloads stop being a target (project pivot to high-conc only). High-conc bench unchanged → no regression. | Phase 0 metrics show `mixed_ok_false_count / total < 5%` after F4-Small. Means deferred event resolves quickly enough that Mixed is rarely blocked → Phase 1A v3 has nothing to fix. |
-| **M_pf** (prefetch wiring) | **P1** | Long-ctx multi-tenant TTFT cliff: 6k cached prefix → ~144 ms H2D. Overlap with prefill removes that wait. **Confirmed substrate**: `submit_prefetch_plan` exists, zero call sites (`50ae808`). | Single-tenant or no-cache workloads see no benefit. May regress if prefetch evicts useful T0 blocks. | Phase 1 bench at multi-tenant shared-prefix shape shows < 20% TTFT improvement → revert. |
-| **M_b.2 Phase 1** (TileLang FP8 attn full integration) | **P1 / P2 conditional** | Phase 1 trace showed `decode_attention_varlen_quantized_partial_kernel` 41.6% GPU. But F4-Small + Phase 1A v3 likely move bottleneck off attention (per `2e60844` data showing kernel is fast at batched mode). Re-evaluate after P1A v3 lands. | M3.9 Phase 1A v3 closes long-ctx gap → kernel work no longer needed for parity. | After P1A v3 lands, if kernel still > 30% GPU AND ARLE < vLLM at 2 of 4 standard shapes → proceed. Else demote. |
-| **Spec-decode + F4-Small compound** | **P2** | Speculation theoretical 1.5-2× decode throughput. ARLE spec infrastructure exists (`scheduler/cuda/spec_path.rs`). | Acceptance rate < 0.6 → speculation negative. Long-ctx KV size scaling makes draft/verify per-token cost equal → no compound gain. | A0 smoke at high-conc shows `spec_acceptance_rate < 0.6` after 30s warmup → revert. |
-| **INT4 KV compression** | **P3** | 30% memory bandwidth reduction. Long-ctx attention is bandwidth-bound. | Numerical regression > 1% PPL on Qwen-class. ~400 LOC, deep code change. | Pre-merge eval at MMLU shows > 0.5% drop → abandon. |
+| F4-Small (decode async sync) | **✓ shipped** (`2a534c4`) | done | High-conc +82.5% out tok/s vs F4-Small-pre baseline. ARLE 843 vs vLLM 647 = +30.3%. | n/a (shipped) |
+| **M3.9 Phase 1A v3** (multi-slot async readback) | **✓ shipped, default Split** (codex `5cacdcb`) | done | Substrate kept under `--scheduler-mixed-policy mixed`. Default Split+ring incidentally gave **+25.6%** vs F4-Small longctx baseline (153.9 vs 122.5). Mixed opt-in still has secondary bugs (workspace + per-prefill prep loop) — flagged experimental. | Mixed opt-in re-bench post-future fix; if no improvement → defer indefinitely. |
+| **M_pf** (prefetch wiring) | plan; P0 done (`699002f` peek_prefix_classify) | **P3** *(deprioritized)* | Honest ROI re-estimate: 5–15% TTFT improvement at multi-tenant shared-prefix only. Substrate exists (`submit_prefetch_plan`). | < 5% TTFT improvement at multi-tenant bench → revert wiring. |
+| **M_b.2 Phase 1** (TileLang FP8 prefill TileLang) | A0 smoke landed (`c865f4b`); full integration pending | **P1 (conditional, post-Phase 0)** | Long-ctx 4k TTFT gap remaining (ARLE 1976 vs vLLM 1177 ms = vLLM 1.68× faster). Likely scheduler-side first (codex investigating chunk policy); kernel-axis only if scheduler fix insufficient. | After scheduler-side longctx fix: if ARLE TTFT < 1.5× #2 → demote. |
+| Spec-decode + F4-Small compound | future | **P2** | Speculation theoretical 1.5-2× decode throughput. Substrate at `scheduler/cuda/spec_path.rs`. Compound with F4-Small async pattern. | Spec acceptance < 0.6 in A0 smoke → revert. |
+| **M_world1 Phase 0** (bench SGLang + TRT-LLM locally) | not started | **P0** | Without #2 baseline measurement, all "30% lead" priorities are unanchored guesses. Mandatory for Strategy. | If SGLang + TRT-LLM > ARLE by > 50% at 2+ shapes on RTX 4080S → reframe to "competitive niche". |
+| **M_nsys P1** (defer first graph capture until cuProfilerStart) | P0 substrate done (`9b1fb8c`); P1 pending | **P0 diagnostic infra** | Required for proper long-ctx trace; nsys 2025.6 silently drops kernel data when graph captured before profile window. Without it, optimization at long-ctx is blind. | If NVIDIA fixes nsys upstream → redundant. |
+| INT4 KV compression | future | P3 | 30% memory bandwidth reduction. Long-ctx attention bandwidth-bound. ~400 LOC. | MMLU drop > 0.5% → abandon. |
+| ~~M_ibp~~ (in-batch prefix dedup) | **ABANDONED** (`9432289`) | n/a | Phase 0 license-or-kill: ARLE already 1.80× past vLLM at multi-tenant shared-prefix. Cascade pattern adequate. | (Already killed.) |
 
-**Tier ordering**: P0 → P1 → P2 → P3, gated by per-tier ROI evidence.
-P1 tracks are run AFTER P0 lands and bench data refreshed.
+**Tier ordering**: P0 (Phase 0 baseline + M_nsys P1) → P1 (per-shape gap fixes) → P2 → P3, gated by per-tier ROI evidence.
 
-**Why P0 = M3.9 Phase 1A v3 (not M_pf)**: Phase 1A v3 closes a
-known production-blocking 10× tax with high-confidence path
-(infrastructure-level fix); M_pf is opportunistic gain that only
-materializes for shared-prefix workloads. Plus Phase 1A v3 is in
-codex's active pipeline.
-
-**Retroactive update note**: this section was added on
-[next-visit-after-rule] per the new memory rule
-`feedback_docs_priority_roi_evidence.md`. Original draft (commit
-`d16effe`) lacked explicit ROI/kill criteria.
+**2026-05-07 EOD note**: original "P0 = M3.9 Phase 1A v3" framing
+proved wrong — Phase 1A v3 implementation REGRESSED long-ctx
+(TTFT +132%) before fix landed. The fix (default Split, multi-slot
+ring as substrate) ended up being NET POSITIVE +25.6% via incidental
+gain. Lesson recorded in
+[`feedback_docs_priority_roi_evidence.md`](../../../.claude/projects/-home-ckl-projects-arle/memory/feedback_docs_priority_roi_evidence.md).
 
 ## Current state (2026-05-07 EOD)
 
-### Confirmed bench numbers
+### Confirmed bench numbers (2026-05-07 EOD, post-Phase-1A-v3-fix)
 
 | Workload | ARLE | vLLM | Δ |
 |---|---:|---:|---|
 | **High-conc 1k/256/c=64 out tok/s** | **843** | 647 | **ARLE +30.3% ✓** |
 | High-conc per-row ITL | **0.99 ms** | 1.43 ms | **ARLE 1.45× faster ✓** |
-| Long-ctx 4k/c=4 TTFT | 3403 ms | unmeasured | TBD |
-| Long-ctx 8k/c=4 TTFT | 4961 ms | 2367 ms | **vLLM 2.10× faster ✗** |
+| **Long-ctx 4k/c=4 out tok/s** (post-fix default Split) | **153.9** | 159.1 | vLLM +3.4% |
+| Long-ctx 4k/c=4 TTFT mdn | 1976 ms | **1177 ms** | **vLLM 1.68× faster (remaining gap)** |
+| Long-ctx 4k/c=4 ITL | 19.3 ms | 18.8 ms | ~equal |
+| Long-ctx 8k/c=4 out tok/s (pre-fix) | 92.2 | 105.6 | vLLM +14.5% (need re-bench post-fix) |
 | Long-ctx 8k/c=4 ITL | 23.9 ms | 26.7 ms | ARLE 1.12× faster |
-| Long-ctx 8k/c=4 out tok/s | 92.2 | 105.6 | vLLM +14.5% |
+| **Multi-tenant shared-prefix TTFT mdn** | **318 ms** | 573 ms | **ARLE 1.80× faster ✓** |
 | c=1 latency 512/128 ITL | 14.0 ms | unmeasured | (single-row baseline) |
+
+**For "world #1 (lead #2 by 30%)"**: vLLM may not be #2.
+SGLang + TRT-LLM bench pending (M_world1 Phase 0). Above table
+is vs vLLM only; the canonical comparison shifts post-Phase-0.
 
 ### Architecture state
 
@@ -56,10 +68,19 @@ codex's active pipeline.
 - ✓ B.1.2 (`14a48e9`): prefill async chunk completion. Failed to
   move TTFT (-28 ms vs -800 ms target). Root cause analysis
   surfaced the actual TTFT bottleneck.
-- ⏳ **M3.9 Phase 0** (in flight): instrumentation to measure
+- ✓ **M3.9 Phase 0** (`786a20a`): instrumentation to measure
   Mixed/Split routing + Ok(false) reasons.
-- 🔜 **M3.9 Phase 1A v3** (designed, not yet briefed): multi-slot
-  async readback buffers → unblocks Mixed path at long-ctx.
+- ✓ **M3.9 Phase 1A v3** (codex `5cacdcb`, shipped 2026-05-07):
+  multi-slot async readback substrate kept; default policy = Split
+  (Mixed flagged experimental due to workspace + per-prefill prep
+  loop residual bugs). Default Split + ring substrate gave +25.6%
+  vs F4-Small longctx baseline (153.9 vs 122.5 out tok/s).
+- ⏳ **Long-ctx 4k/c=4 prefill TTFT 800 ms gap**: codex license-
+  or-kill bench (`c219434`) ruled out H_LP1 (full-row packing →
+  TTFT -21.5% but out tok/s -12.1%, net negative tradeoff) and
+  H_LP2 (chunk-size 4096 → TTFT +0.4%, kill criteria fired).
+  Remaining: **H_LP3 (per-chunk launch overhead)** needs nsys
+  trace — gated on M_nsys P1 (graph capture timing fix).
 
 **Kernel-axis future**:
 - ⏳ M_b.2 A0 (`c865f4b`): TileLang HD128 FP8 decode kernel A0
@@ -77,18 +98,19 @@ codex's active pipeline.
 
 Assuming each pending milestone hits its expected gain:
 
-| Cumulative state | High-conc out tok/s | Long-ctx 8k TTFT | Long-ctx 8k out tok/s |
+| Cumulative state | High-conc out tok/s | Long-ctx 4k/c=4 TTFT | Long-ctx 4k/c=4 out tok/s |
 |---|---:|---:|---:|
-| Baseline (Phase 1 trace) | 462 | 4961 ms | 92 |
-| **+ F4-Small** (landed) | **843** | 4961 ms | 92 |
-| + B.1.2 (landed, marginal) | 843 | 4933 ms | 92 |
-| + M_b.1 Phase B (landed, marginal) | 843 | 4933 ms | 92 |
-| **+ M3.9 Phase 1A v3** (pending) | 850 (no change) | **~2500 ms** | ~150 |
-| + M_b.2 Phase 1 (TileLang FP8 attn) | 900 (kernel speedup) | ~2200 ms | ~170 |
-| **+ M_b.2 Phase 2** (kernel+autotune) | **1000+** | ~1900 ms | ~200 |
+| Baseline (Phase 1 trace) | 462 | (n/a) | 122.5 |
+| ✓ F4-Small (landed) | 843 | (n/a) | 122.5 |
+| ✓ M_b.1 Phase B (landed) | 843 | (n/a) | 122.5 |
+| ✓ M3.9 Phase 1A v3 default Split (`5cacdcb`) | 843 | 1976 ms | **153.9** (+25.6%) |
+| vLLM s8 same shape (control) | 647 | 1177 ms | 159.1 |
+| **Remaining gap to vLLM** | ARLE +30.3% ✓ | vLLM 1.68× ✗ | -3.4% ✗ |
 
-**Stretch goal**: ARLE 1000+ tok/s high-conc + ARLE long-ctx
-faster than vLLM = "**world-first**" at this hardware tier.
+**Real target: lead #2 by 30%+** (per `M_world1-30-percent-lead-roadmap.md`).
+vLLM may not be #2 — Phase 0 baseline (SGLang + TRT-LLM bench) is
+mandatory before further optimization investment. See
+[`M_world1-30-percent-lead-roadmap.md`](M_world1-30-percent-lead-roadmap.md).
 
 ## What's missing for "world-first" beyond known plans
 

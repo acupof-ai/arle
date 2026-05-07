@@ -8,9 +8,12 @@
 
 ## Priority & ROI
 
-**Priority**: **P1 license-or-kill** (after Phase 1A v3 fix
-lands). Higher priority than M_pf P1 because the gain is larger
-for ARLE's "world-first long-sequence" project goal.
+**Priority**: **P1 license-or-kill** (Phase 1A v3 fix has now
+shipped — codex `5cacdcb` default Split. M_sr is no longer
+gated on it). Higher priority than M_pf P3 because the gain
+is much larger for ARLE's "world-first long-sequence" project
+goal: deterministic 58× TTFT savings on agentic resume vs M_pf's
+5-15% TTFT.
 
 **ROI basis**:
 
@@ -137,7 +140,7 @@ vs M_sr (D2H restore). Expect 30s+ latency savings per turn.
 
 | # | Task | File | LOC | Owner | Trigger |
 |---|---|---|---|---|---|
-| Phase 0.1 | Construct session-resume bench script | `scripts/bench_session_resume.py` (new) | ~80 | Claude | Phase 1A v3 fix lands |
+| Phase 0.1 | Construct session-resume bench script | `scripts/bench_session_resume.py` (new) | ~80 | Claude | Now (Phase 1A v3 already shipped) |
 | Phase 0.2 | Bench scenario, measure resume TTFT | bench | 0 | Claude | Phase 0.1 done |
 | Phase 0.3 | License decision (PROCEED if > 10× expected D2H, else ABANDON) | analysis | 0 | Claude | 0.2 done |
 | P1.1 | Idle-session save hook | `infer/src/scheduler/cuda/runtime/admission.rs` (or session_slots.rs) | ~80 | Codex | License fires |

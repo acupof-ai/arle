@@ -1,50 +1,48 @@
 # 2026-05-07 · Opportunity D pre-survey — submit_prefetch_plan exists but is dead code
 
-## Priority & ROI
+> **2026-05-07 EOD update**: original ROI projection corrected
+> in [`544d00d`](../../plans/M_pf-radix-prefetch-wiring.md). Plus
+> M_ibp Phase 0 license-or-kill (`9432289`) showed ARLE already
+> 1.80× past vLLM at the multi-tenant shared-prefix workload —
+> the niche M_pf would help is one ARLE is already winning. M_pf
+> formal ROI now 5-15% TTFT improvement at HIT cases, NOT the
+> 4× faster originally projected. M_pf demoted to **P3** in
+> M-final roadmap.
 
-**Priority**: P1 (after P0 = M3.9 Phase 1A v3 lands; not parallel to P0).
+## Priority & ROI (corrected 2026-05-07 EOD)
 
-**ROI basis**:
-- Substrate cost-reduction: zero (`submit_prefetch_plan` already
-  built with backpressure + queue-depth + PlanTicket). Implementation
-  is wiring + 1 helper, ~80 LOC — codex-sized.
-- Expected gain at long-ctx multi-tenant shared-prefix workloads:
-  - Cache HIT bytes (e.g. 6k prefix × 36 layers × hidden × FP8) ≈
-    135 MB H2D
-  - PCIe 4.0 ~32 GB/s → ~144 ms total H2D wait if synchronous
-  - Overlap with prefill of unmatched suffix → ~0 ms wait
-  - **TTFT reduction = ~144 ms per request** in this regime
-- Stacks with M3.9 Phase 1A v3:
-  - 1A v3 alone: long-ctx 8k TTFT 4961 → ~2500 ms
-  - + M_pf (shared-prefix only): TTFT 2500 → ~600 ms
-  - 4× faster than vLLM 2367 ms at this shape
+**Priority**: **P3** (deprioritized post-M_ibp ABANDONED finding).
+ARLE's existing chunk-boundary cascade pattern already covers most
+of the multi-tenant shared-prefix scenario without M_pf wiring.
+
+**ROI basis (corrected)**:
+- Substrate cost: zero (`submit_prefetch_plan` already built with
+  backpressure + queue-depth + PlanTicket). Implementation is
+  wiring + 1 helper, ~80 LOC.
+- Expected gain at multi-tenant shared-prefix:
+  - Cache HIT bytes (6k prefix × 36 layers × FP8) ≈ 135 MB
+  - PCIe 4.0 ~32 GB/s → ~14 ms (CONTIGUOUS) H2D, NOT 144 ms as
+    originally claimed (per-layer-serial overestimate corrected
+    in `544d00d`)
+  - 5–15% TTFT improvement at HIT cases (small, not 4×)
+- M_ibp ABANDONED finding (`9432289`) shows ARLE already 1.80×
+  past vLLM at the very workload M_pf would target.
 
 **Negative case**:
-- Single-tenant workloads or no-prefix-share workloads see ZERO
-  benefit (no shared cache to prefetch).
-- Risk of speculative prefetch evicting useful T0 blocks at high
-  pool utilization → degrades non-prefetched requests.
-- Wasted bandwidth if request is cancelled before reaching
-  prefill.
+- Single-tenant / no-prefix-share workloads: zero benefit.
+- Speculative prefetch evicts useful T0 blocks under pressure.
+- Wasted bandwidth on cancelled requests.
 
 **Kill criteria**:
-- After implementation, bench at the canonical multi-tenant
-  shared-prefix shape (e.g., 4k system prompt + 4 different
-  user queries c=4) shows `< 20% TTFT improvement` → revert
-  the wiring; the cost (extra GPU memory pressure, scheduler
-  complexity) is not worth it.
-- If pool utilization metric shows prefetch routinely evicts
-  T0 blocks within 1 tick of placement → also revert.
+- < 5% TTFT improvement at multi-tenant shared-prefix bench → revert.
+- Eviction storm metric increase → revert + add backpressure.
 
-**Why this rank vs alternatives**:
-- vs M3.9 Phase 1A v3 (P0): P0 closes a measured 10× tax in a
-  shape ARLE is currently losing. M_pf is opportunistic gain in
-  a niche shape.
-- vs M_b.2 Phase 1 (kernel-axis): bench evidence in `2e60844`
-  shows attention kernel is already fast at batched mode; M_pf
-  addresses a DIFFERENT axis (memory tier transition cost).
-- vs Spec-decode (P2): spec-decode is speculative on acceptance
-  rate; M_pf has deterministic gain for HIT cases.
+**Why P3 vs original P1**:
+- M_ibp Phase 0 showed ARLE already wins at the M_pf target shape.
+- Original "4× faster than vLLM" projection was math error;
+  corrected to 5-15%.
+- Higher-priority items (M_world1 Phase 0 baseline + long-ctx
+  4k TTFT gap) crowd out M_pf.
 
 ## Discovery
 

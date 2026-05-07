@@ -8,15 +8,26 @@
 
 ## Priority & ROI
 
-**Priority**: **P1** (after P0 = M3.9 Phase 1A v3 lands; not parallel
-to P0).
+> **2026-05-07 EOD update**: Phase 1A v3 shipped (codex `5cacdcb`,
+> default Split — multi-slot ring substrate kept; production
+> +25.6% incidental at long-ctx 4k/c=4). M_ibp Phase 0 license-
+> or-kill (`9432289`) showed ARLE already 1.80× past vLLM at the
+> multi-tenant shared-prefix workload M_pf would target. M_pf is
+> demoted to **P3** in M-final roadmap; the ROI math below stands
+> (5-15% TTFT at HIT cases) but priority drops because the target
+> shape is no longer a gap.
 
-**Why P1 not P0**:
-- P0 (Phase 1A v3) closes a measured 10× tax in shape ARLE is
-  CURRENTLY losing. Highest confidence path.
-- M_pf is opportunistic: only HIT cases benefit. Workload-shape
-  dependent (helps multi-tenant shared-prefix; doesn't help
-  single-tenant or cold-cache).
+**Priority**: **P3** (deprioritized post-M_ibp ABANDONED finding;
+historical P1 framing kept below for context).
+
+**Why now P3**:
+- ARLE leads vLLM at the M_pf target shape already (multi-tenant
+  shared-prefix: 318 ms vs 573 ms TTFT, 1.80×).
+- Higher-priority work: M_world1 Phase 0 baseline measurement +
+  long-ctx 4k/c=4 prefill TTFT 800 ms gap (codex actively
+  investigating).
+- Original "P1 after P0 = Phase 1A v3" framing is stale — Phase
+  1A v3 is now shipped.
 
 **ROI basis (deterministic for HIT cases)**:
 
