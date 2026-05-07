@@ -59,6 +59,24 @@ impl Tokenizer {
         &self.fingerprint
     }
 
+    /// Derive the RadixCache namespace per M_d.1 §3:
+    /// `sha256(fingerprint ++ CARGO_PKG_VERSION ++ BUILD_GIT_SHA)`.
+    /// This is the **single source of truth** every cache surface
+    /// (CUDA scheduler RadixCache, Metal Qwen3 RadixCache, Metal Qwen3.5
+    /// disk-prefix runtime) constructs its namespace from. Two ARLE
+    /// processes whose tokenizer bytes, package version, or build SHA
+    /// differ produce different namespaces and therefore cannot share
+    /// or merge cache state via snapshot persistence.
+    pub fn derive_radix_namespace(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.fingerprint);
+        hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+        // `BUILD_GIT_SHA` is emitted by `infer/build.rs`; falls back to
+        // "unknown" outside a git checkout. See `emit_build_git_sha`.
+        hasher.update(env!("BUILD_GIT_SHA").as_bytes());
+        hasher.finalize().into()
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .inner

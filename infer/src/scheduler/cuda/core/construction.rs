@@ -258,6 +258,11 @@ impl<M: ModelForward> Scheduler<M> {
         let max_slots = config.max_slots;
         let max_waiting_requests = config.max_waiting_requests;
         let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;
+        // M_d.1 §3: namespace the RadixCache by tokenizer fingerprint +
+        // build version so a tokenizer swap or version bump cannot reuse
+        // a stale on-disk snapshot. `derive_radix_namespace` is the
+        // single source of truth shared across CUDA + Metal paths.
+        let prefix_cache_namespace = tokenizer.derive_radix_namespace();
         let scheduler = Self {
             config,
             metrics,
@@ -266,9 +271,10 @@ impl<M: ModelForward> Scheduler<M> {
             model_fingerprint: blake3::hash(model_id.as_bytes()).as_bytes().to_vec(),
             states,
             slot_materialized_prompt_lens,
-            prefix_cache: RadixCache::with_soft_pin_keepalive(
+            prefix_cache: RadixCache::with_soft_pin_keepalive_namespaced(
                 PREFIX_CACHE_BLOCK_SIZE,
                 prefix_cache_keepalive_ticks,
+                prefix_cache_namespace,
             ),
             disk_store,
             cluster_shared_backend,
