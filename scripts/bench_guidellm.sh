@@ -49,6 +49,11 @@
 #
 # Preconditions:
 #   * guidellm, curl, jq on PATH
+#     (canonical install: `pip install -e '.[bench]'` into the project
+#     `.venv`. Then `PATH=.venv/bin:$PATH` in the call so the wrapper
+#     finds the same `guidellm` it just installed — observed 2026-05-07
+#     M_e gauntlet pass: missing `.venv/bin` PATH made the wrapper pick
+#     up a stale system guidellm and the canonical run silently aborted.)
 #   * infer HTTP server is already running at --target
 #     (start it with: scripts/start_infer.sh)
 #   * server --max-seq-len ≥ canonical prompt + canonical output + slack
