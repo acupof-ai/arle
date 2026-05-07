@@ -70,6 +70,22 @@ struct SparseDraftCandidate {
 /// `docs/projects/tiered-kv-cache.md` §5.1 for the rationale.
 pub use crate::types::BlockId;
 
+/// Outcome of a read-only prefix classification (M_pf P0).
+///
+/// Returned by [`RadixCache::peek_prefix_classify`]. Unlike
+/// [`LookupOutcome`] this carries NO mutation side effects on the
+/// cache; callers may discard the result without releasing any
+/// reference. Used by the prefetch wiring to fire
+/// `submit_prefetch_plan` at HTTP request entry before the request
+/// reaches admission.
+#[derive(Debug, Clone, Default)]
+pub struct PeekPrefixOutcome {
+    /// Number of tokens of `tokens` matched along the radix path.
+    pub matched_len: usize,
+    /// Matched blocks with classified `HitKind`. In path order.
+    pub blocks: Vec<(BlockId, HitKind)>,
+}
+
 /// Coalesced metadata update for one cached block.
 ///
 /// `session_id` / `soft_pin_until` / `host_spill_pin_until` use
@@ -575,6 +591,82 @@ impl RadixCache {
         }
 
         (rounded, matched_blocks)
+    }
+
+    /// Read-only prefix classification for the prefetch wiring (M_pf P0).
+    ///
+    /// Walks the radix tree like `lookup_or_stage` but performs zero
+    /// mutation:
+    ///
+    /// - Does NOT advance the logical clock (`tick`)
+    /// - Does NOT update `last_access` on visited nodes
+    /// - Does NOT bump `ref_count` or `hit_count` on matched blocks
+    /// - Does NOT refresh soft-pin keepalive
+    ///
+    /// Returns the matched-block-id + classified `HitKind` pairs in
+    /// path order, plus the matched token-prefix length. Callers
+    /// (HTTP request entry → prefetch trigger) use the
+    /// `StagingFromHost` entries to fire `submit_prefetch_plan`
+    /// before the request reaches admission.
+    ///
+    /// Safe to call concurrently with reads but NOT with concurrent
+    /// `lookup_or_stage` / mutating writes (takes `&self`).
+    ///
+    /// `Miss` and `StagingFromDisk` entries are reported faithfully
+    /// — caller decides whether to skip them (typical: skip Miss,
+    /// optionally prefetch StagingFromDisk if T2 prefetch is wired
+    /// later).
+    pub fn peek_prefix_classify(&self, tokens: &[u32]) -> PeekPrefixOutcome {
+        let mut node_idx = Self::root();
+        let mut pos = 0;
+        let mut blocks = Vec::new();
+
+        loop {
+            if pos >= tokens.len() {
+                break;
+            }
+
+            let next_token = tokens[pos];
+            let Some(&child_idx) = self.nodes[node_idx].children.get(&next_token) else {
+                break;
+            };
+
+            let remaining = &tokens[pos..];
+            let (match_len, edge_len) = self.child_edge_match(child_idx, remaining);
+
+            if match_len < edge_len {
+                break;
+            }
+
+            pos += match_len;
+
+            let child = &self.nodes[child_idx];
+
+            if let Some(block_id) = child.block_id {
+                let hit_kind = match child.tier_location {
+                    Some(BlockLocation::HostPinned { .. }) => HitKind::StagingFromHost,
+                    Some(BlockLocation::Disk { .. } | BlockLocation::Remote { .. }) => {
+                        HitKind::StagingFromDisk
+                    }
+                    Some(BlockLocation::Gpu { .. }) | None => HitKind::ReadyOnGpu,
+                };
+                let hit_kind = if child.entry_state == IndexEntryState::Ready {
+                    hit_kind
+                } else {
+                    HitKind::Miss
+                };
+                blocks.push((block_id, hit_kind));
+            } else if child.is_tombstone() {
+                break;
+            }
+
+            node_idx = child_idx;
+        }
+
+        PeekPrefixOutcome {
+            matched_len: pos,
+            blocks,
+        }
     }
 
     /// Lookup cached blocks and classify whether they are ready in T0, need

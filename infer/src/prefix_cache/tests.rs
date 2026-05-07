@@ -2144,3 +2144,62 @@ fn lookup_refreshes_existing_soft_pin_without_starting_new_pins() {
     assert_eq!(cache.nodes[idx].soft_pin_until, Some(76));
     cache.release(&[BlockId(10)]);
 }
+
+#[test]
+fn peek_prefix_classify_is_read_only() {
+    // M_pf P0: peek must NOT bump ref_count, hit_count, last_access,
+    // or advance the logical clock.
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 4096 }));
+
+    // Snapshot pre-peek state.
+    let clock_before = cache.clock;
+    let last_access_before = cache.nodes[1].last_access;
+    let ref_count_before = cache.nodes[1].ref_count;
+    let hit_count_before = cache.nodes[1].hit_count;
+
+    let outcome = cache.peek_prefix_classify(&[1, 2, 3, 4]);
+
+    // Functional correctness: classify HostPinned as StagingFromHost.
+    assert_eq!(outcome.matched_len, 4);
+    assert_eq!(outcome.blocks.len(), 1);
+    assert_eq!(outcome.blocks[0].0, BlockId(10));
+    assert!(matches!(outcome.blocks[0].1, HitKind::StagingFromHost));
+
+    // Read-only invariants.
+    assert_eq!(cache.clock, clock_before, "peek must not advance clock");
+    assert_eq!(
+        cache.nodes[1].last_access, last_access_before,
+        "peek must not update last_access"
+    );
+    assert_eq!(
+        cache.nodes[1].ref_count, ref_count_before,
+        "peek must not bump ref_count"
+    );
+    assert_eq!(
+        cache.nodes[1].hit_count, hit_count_before,
+        "peek must not bump hit_count"
+    );
+}
+
+#[test]
+fn peek_prefix_classify_returns_empty_on_miss() {
+    let cache = RadixCache::new(4);
+    let outcome = cache.peek_prefix_classify(&[42, 99, 7]);
+    assert_eq!(outcome.matched_len, 0);
+    assert!(outcome.blocks.is_empty());
+}
+
+#[test]
+fn peek_prefix_classify_classifies_gpu_as_ready() {
+    let mut cache = RadixCache::new(4);
+    cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+    assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+
+    let outcome = cache.peek_prefix_classify(&[1, 2, 3, 4]);
+
+    assert_eq!(outcome.matched_len, 4);
+    assert_eq!(outcome.blocks.len(), 1);
+    assert!(matches!(outcome.blocks[0].1, HitKind::ReadyOnGpu));
+}
