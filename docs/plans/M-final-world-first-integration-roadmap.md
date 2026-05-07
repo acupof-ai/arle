@@ -1,5 +1,10 @@
 # M-final — Integration roadmap to "world-first long-sequence inference engine"
 
+> ⚠️ **Strategic master**: [`../projects/2026-05-07-arle-master-strategy.md`](../projects/2026-05-07-arle-master-strategy.md)
+> 是 ARLE 战略唯一信息源(双线产品 + 5-cap moat + P0/P1/P2 序列)。本 M-final
+> 是早期 manager-level synthesis;**部分内容已 supersede**(尤其"long-sequence"
+> 单维框架已扩展为 coding/agent + DSV4 双线)。冲突以 master 为准。
+
 > Manager-level synthesis. Captures all in-flight + pending
 > milestones from M3.6 onward, projects combined throughput
 > trajectory, identifies what's needed BEYOND known plans to hit
@@ -7,12 +12,13 @@
 
 ## Priority & ROI
 
-> **2026-05-07 EOD update**: M_world1 strategic redirect — target
-> = world #1 (lead #2 by 30%+), not just beat vLLM. See
-> [`M_world1-30-percent-lead-roadmap.md`](M_world1-30-percent-lead-roadmap.md).
-> Phase 0 (bench SGLang + TRT-LLM locally) is now the gating
-> step; per-shape priorities below are derived from vLLM-only
-> data and will be re-anchored after Phase 0 baseline lands.
+> **2026-05-08 update**:战略框架升级为 **ARLE 双线产品**(per master):
+> 推理侧 = coding/agent runtime(W3/W4 mission ≥1.30×),训练侧 = DSV4
+> from-scratch repro。本节"long-sequence"维度仍有效作为推理侧 long-ctx shape 细化。
+
+> **2026-05-07 EOD update**: M_world1 strategic redirect → world #1 lead #2
+> by 30%+. P0.1 baseline LANDED(`12c4c86` + `4ae3b7b`):SGLang #2 confirmed,
+> ARLE 4k/8k TTFT gap 50%。见 master strategy doc §3-§7。
 
 | Track | Status | Priority | ROI basis | Kill criteria |
 |---|---|---|---|---|
