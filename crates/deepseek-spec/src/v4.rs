@@ -139,7 +139,7 @@ impl DeepSeekV4Config {
     }
 
     pub fn tensor_names(&self) -> DeepSeekV4TensorNames {
-        DeepSeekV4TensorNames::default()
+        DeepSeekV4TensorNames
     }
 
     pub fn layer_tensor_names(&self, layer_idx: usize) -> DeepSeekV4LayerTensorNames {
