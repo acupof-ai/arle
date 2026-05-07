@@ -881,7 +881,13 @@ pub fn build_varlen_decode_mask(left_padding: &[i32], batch_cache_len: i32) -> M
     // SDPA output dtype. Q/K/V are bf16 here, so f32 no longer auto-promotes
     // — cast explicitly.
     let mask = as_dtype(&mask, Dtype::Bfloat16);
-    eval(&[&mask]);
+    // Intentionally NOT calling `eval(&[&mask])` here — keep the mask lazy
+    // so it merges into the downstream `step_batch_packed` graph that the
+    // caller submits via `async_eval`. Forcing a sync eval here serialised
+    // every decode step against any prior async_eval-pending GPU work,
+    // wiping out oMLX-C v1's pipelining win. See
+    // docs/experience/wins/2026-05-07-bench-c4-omlx-c-v2.md. Tests that
+    // need host values call `eval(&[&mask])` themselves.
     mask
 }
 
