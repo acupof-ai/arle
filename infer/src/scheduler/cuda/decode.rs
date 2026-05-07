@@ -188,6 +188,7 @@ impl<M: ModelForward> Scheduler<M> {
         decode_indices: Vec<usize>,
         slot_indices: Vec<usize>,
         greedy_launched: bool,
+        async_slot_idx: Option<usize>,
         speculative: bool,
         mixed_prefill: Option<PendingMixedPrefill>,
     ) {
@@ -215,6 +216,7 @@ impl<M: ModelForward> Scheduler<M> {
             decode_indices,
             slot_indices,
             greedy_launched,
+            async_slot_idx,
             speculative,
             decode_spans,
             mixed_prefill,
@@ -293,13 +295,17 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
+        let mut async_slot_idx = None;
         let greedy_launched = if all_greedy {
             match self
                 .model
                 .sample_batch_greedy_launch(&slot_indices, decode_ctx)
             {
-                Ok(true) => true,
-                Ok(false) => {
+                Ok(Some(slot_idx)) => {
+                    async_slot_idx = Some(slot_idx);
+                    true
+                }
+                Ok(None) => {
                     if let Err(e) = self.model.prepare_batch_sampling_fallback(
                         &mut self.states,
                         &slot_indices,
@@ -329,6 +335,7 @@ impl<M: ModelForward> Scheduler<M> {
             decode_indices,
             slot_indices,
             greedy_launched,
+            async_slot_idx,
             speculative,
             None,
         );
@@ -616,13 +623,17 @@ impl<M: ModelForward> Scheduler<M> {
                 return;
             }
         }
+        let mut async_slot_idx = None;
         let greedy_launched = if all_greedy {
             match self
                 .model
                 .sample_batch_greedy_launch(&slot_indices, decode_ctx)
             {
-                Ok(true) => true,
-                Ok(false) => {
+                Ok(Some(slot_idx)) => {
+                    async_slot_idx = Some(slot_idx);
+                    true
+                }
+                Ok(None) => {
                     if let Err(e) = self.model.prepare_batch_sampling_fallback(
                         &mut self.states,
                         &slot_indices,
@@ -672,6 +683,7 @@ impl<M: ModelForward> Scheduler<M> {
             decode_indices,
             slot_indices,
             greedy_launched,
+            async_slot_idx,
             false,
             Some(PendingMixedPrefill {
                 rows: pending_rows,
@@ -808,10 +820,11 @@ impl<M: ModelForward> Scheduler<M> {
         if let Some(pending) = self.deferred_decode_emit.take() {
             let spec_readback_started = pending.speculative.then(std::time::Instant::now);
             let decode_ctx = self.decode_bufs.as_mut().unwrap();
-            match self
-                .model
-                .sample_batch_greedy_readback(&pending.slot_indices, decode_ctx)
-            {
+            match self.model.sample_batch_greedy_readback(
+                &pending.slot_indices,
+                decode_ctx,
+                pending.async_slot_idx,
+            ) {
                 Ok(Some(tokens)) => {
                     let logprobs_host =
                         Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx).to_vec());
@@ -836,10 +849,11 @@ impl<M: ModelForward> Scheduler<M> {
         let spec_readback_started = pending.speculative.then(std::time::Instant::now);
         if pending.greedy_launched {
             let decode_ctx = self.decode_bufs.as_mut().unwrap();
-            match self
-                .model
-                .sample_batch_greedy_readback(&pending.slot_indices, decode_ctx)
-            {
+            match self.model.sample_batch_greedy_readback(
+                &pending.slot_indices,
+                decode_ctx,
+                pending.async_slot_idx,
+            ) {
                 Ok(Some(tokens)) => {
                     let logprobs_host =
                         Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx).to_vec());
@@ -880,6 +894,7 @@ impl<M: ModelForward> Scheduler<M> {
                 decode_indices: live_decode_indices,
                 slot_indices: live_slot_indices,
                 greedy_launched: false,
+                async_slot_idx: None,
                 speculative: pending.speculative,
                 decode_spans: live_decode_spans,
                 mixed_prefill: pending.mixed_prefill,

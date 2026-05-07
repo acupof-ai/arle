@@ -17,6 +17,7 @@ use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVFormat;
 use crate::model::{
     DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
+    PrefillBatchRequest,
 };
 use crate::ops::{self, OpsBackend};
 use cuda_kernels::ffi;
@@ -28,6 +29,7 @@ use cuda_kernels::prelude::{
 use cuda_kernels::tilelang::{DecodeMetaUpdate, TileLangWorkspace};
 
 const BF16_BYTES: usize = 2;
+const ASYNC_READBACK_SLOTS: usize = 4;
 
 /// Mixed-batch TileLang workspace budget.
 ///
@@ -41,6 +43,51 @@ fn bf16_matrix_bytes(rows: usize, cols: usize) -> usize {
 
 fn bytes_for<T>(count: usize) -> usize {
     count.saturating_mul(std::mem::size_of::<T>())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_mixed_token_ids_with_handoff(
+    ctx: &DeviceContext,
+    token_ids_scratch: &mut Vec<i32>,
+    sampled_tokens_owner: &[Option<usize>],
+    sampled_tokens_len: usize,
+    sampled_tokens_valid: bool,
+    argmax_out: &CudaSlice<i32>,
+    token_ids_gpu: &mut CudaSlice<i32>,
+    decode_tokens: &[u32],
+    decode_slot_indices: &[usize],
+    prefills: &[PrefillBatchRequest<'_>],
+) -> Result<bool> {
+    token_ids_scratch.clear();
+    token_ids_scratch.extend(decode_tokens.iter().map(|&tok| tok as i32));
+    for prefill in prefills {
+        token_ids_scratch.extend(prefill.tokens.iter().map(|&tok| tok as i32));
+    }
+    ctx.stream
+        .memcpy_htod(token_ids_scratch.as_slice(), token_ids_gpu)
+        .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
+
+    if !sampled_tokens_valid || sampled_tokens_len == 0 {
+        return Ok(false);
+    }
+
+    let owner_len = sampled_tokens_len.min(sampled_tokens_owner.len());
+    let mut used_handoff = false;
+    for (dst_row, &slot_idx) in decode_slot_indices.iter().enumerate() {
+        let Some(src_row) = sampled_tokens_owner[..owner_len]
+            .iter()
+            .position(|owner| *owner == Some(slot_idx))
+        else {
+            continue;
+        };
+        let src = argmax_out.slice(src_row..=src_row);
+        let mut dst = token_ids_gpu.slice_mut(dst_row..=dst_row);
+        ctx.stream
+            .memcpy_dtod(&src, &mut dst)
+            .map_err(|e| anyhow::anyhow!("D2D mixed sampled token handoff failed: {e}"))?;
+        used_handoff = true;
+    }
+    Ok(used_handoff)
 }
 
 /// Pre-allocated buffers for batched decode, reused across steps.
@@ -84,13 +131,14 @@ pub struct BatchDecodeBuffers {
     sampled_tokens_owner: Vec<Option<usize>>,
     sampled_tokens_len: usize,
     sampled_tokens_valid: bool,
-    async_argmax_gpu: CudaSlice<i32>,
-    async_logprobs_gpu: CudaSlice<f32>,
-    async_argmax_host: PinnedHostSlice<i32>,
-    async_logprobs_host: PinnedHostSlice<f32>,
-    async_readback_event: CudaEvent,
-    async_readback_in_flight: bool,
-    async_readback_batch_size: usize,
+    async_argmax_gpu_slots: Vec<CudaSlice<i32>>,
+    async_logprobs_gpu_slots: Vec<CudaSlice<f32>>,
+    async_argmax_host_slots: Vec<PinnedHostSlice<i32>>,
+    async_logprobs_host_slots: Vec<PinnedHostSlice<f32>>,
+    async_readback_event_slots: Vec<CudaEvent>,
+    async_readback_in_flight_slots: Vec<bool>,
+    async_readback_batch_sizes: Vec<usize>,
+    next_async_slot: usize,
 
     /// TileLang paged attention metadata (positions, indptr, indices).
     pub(crate) metadata: TileLangDecodeMetadata,
@@ -287,8 +335,12 @@ impl BatchDecodeBuffers {
             .saturating_add(bytes_for::<i32>(max_batch_size)) // argmax_out
             .saturating_add(bytes_for::<f32>(max_batch_size)) // logprobs_gpu
             .saturating_add(bytes_for::<i32>(max_batch_size)) // next_decode_meta_gpu
-            .saturating_add(bytes_for::<i32>(max_batch_size)) // async_argmax_gpu
-            .saturating_add(bytes_for::<f32>(max_batch_size)) // async_logprobs_gpu
+            .saturating_add(bytes_for::<i32>(
+                ASYNC_READBACK_SLOTS.saturating_mul(max_batch_size),
+            )) // async_argmax_gpu_slots
+            .saturating_add(bytes_for::<f32>(
+                ASYNC_READBACK_SLOTS.saturating_mul(max_batch_size),
+            )) // async_logprobs_gpu_slots
             .saturating_add(bytes_for::<i32>(2 * max_batch_size + 1)) // quantized_kv_meta
             .saturating_add(TileLangDecodeMetadata::device_bytes(
                 max_batch_size,
@@ -362,6 +414,35 @@ impl BatchDecodeBuffers {
         num_qheads: usize,
         max_total_pages: usize,
     ) -> Result<Self> {
+        let mut async_argmax_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_logprobs_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_argmax_host_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_logprobs_host_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_readback_event_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        for slot_idx in 0..ASYNC_READBACK_SLOTS {
+            async_argmax_gpu_slots.push(
+                ctx.stream.alloc_zeros(max_batch_size).map_err(|e| {
+                    anyhow::anyhow!("Alloc async_argmax_gpu[{slot_idx}] failed: {e}")
+                })?,
+            );
+            async_logprobs_gpu_slots.push(ctx.stream.alloc_zeros(max_batch_size).map_err(|e| {
+                anyhow::anyhow!("Alloc async_logprobs_gpu[{slot_idx}] failed: {e}")
+            })?);
+            async_argmax_host_slots.push(unsafe {
+                ctx.ctx.alloc_pinned(max_batch_size).map_err(|e| {
+                    anyhow::anyhow!("Alloc pinned argmax_host[{slot_idx}] failed: {e}")
+                })?
+            });
+            async_logprobs_host_slots.push(unsafe {
+                ctx.ctx.alloc_pinned(max_batch_size).map_err(|e| {
+                    anyhow::anyhow!("Alloc pinned logprobs_host[{slot_idx}] failed: {e}")
+                })?
+            });
+            async_readback_event_slots.push(ctx.ctx.new_event(None).map_err(|e| {
+                anyhow::anyhow!("Alloc async readback event[{slot_idx}] failed: {e}")
+            })?);
+        }
+
         Ok(Self {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             normed: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
@@ -397,30 +478,14 @@ impl BatchDecodeBuffers {
             sampled_tokens_owner: vec![None; max_batch_size],
             sampled_tokens_len: 0,
             sampled_tokens_valid: false,
-            async_argmax_gpu: ctx
-                .stream
-                .alloc_zeros(max_batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc async_argmax_gpu failed: {e}"))?,
-            async_logprobs_gpu: ctx
-                .stream
-                .alloc_zeros(max_batch_size)
-                .map_err(|e| anyhow::anyhow!("Alloc async_logprobs_gpu failed: {e}"))?,
-            async_argmax_host: unsafe {
-                ctx.ctx
-                    .alloc_pinned(max_batch_size)
-                    .map_err(|e| anyhow::anyhow!("Alloc pinned argmax_host failed: {e}"))?
-            },
-            async_logprobs_host: unsafe {
-                ctx.ctx
-                    .alloc_pinned(max_batch_size)
-                    .map_err(|e| anyhow::anyhow!("Alloc pinned logprobs_host failed: {e}"))?
-            },
-            async_readback_event: ctx
-                .ctx
-                .new_event(None)
-                .map_err(|e| anyhow::anyhow!("Alloc async readback event failed: {e}"))?,
-            async_readback_in_flight: false,
-            async_readback_batch_size: 0,
+            async_argmax_gpu_slots,
+            async_logprobs_gpu_slots,
+            async_argmax_host_slots,
+            async_logprobs_host_slots,
+            async_readback_event_slots,
+            async_readback_in_flight_slots: vec![false; ASYNC_READBACK_SLOTS],
+            async_readback_batch_sizes: vec![0; ASYNC_READBACK_SLOTS],
+            next_async_slot: 0,
 
             metadata: TileLangDecodeMetadata::new(
                 ctx,
@@ -625,70 +690,87 @@ impl BatchDecodeBuffers {
         &mut self,
         ctx: &DeviceContext,
         batch_size: usize,
-    ) -> Result<()> {
-        if self.async_readback_in_flight {
-            return Ok(());
+    ) -> Result<usize> {
+        if batch_size > self.max_batch_size {
+            anyhow::bail!(
+                "async greedy readback batch {} exceeds max batch {}",
+                batch_size,
+                self.max_batch_size
+            );
+        }
+        let slot_idx = self.next_async_slot;
+        if self.async_readback_in_flight_slots[slot_idx] {
+            anyhow::bail!("async greedy readback slot {slot_idx} still in flight; ring exhausted");
         }
         let ids_src = self.argmax_out.slice(0..batch_size);
-        let mut ids_dst = self.async_argmax_gpu.slice_mut(0..batch_size);
+        let mut ids_dst = self.async_argmax_gpu_slots[slot_idx].slice_mut(0..batch_size);
         ctx.stream
             .memcpy_dtod(&ids_src, &mut ids_dst)
             .map_err(|e| anyhow::anyhow!("D2D async argmax snapshot failed: {e}"))?;
         let logprobs_src = self.logprobs_gpu.slice(0..batch_size);
-        let mut logprobs_dst = self.async_logprobs_gpu.slice_mut(0..batch_size);
+        let mut logprobs_dst = self.async_logprobs_gpu_slots[slot_idx].slice_mut(0..batch_size);
         ctx.stream
             .memcpy_dtod(&logprobs_src, &mut logprobs_dst)
             .map_err(|e| anyhow::anyhow!("D2D async logprobs snapshot failed: {e}"))?;
         ctx.copy_waits_for_compute()?;
         ctx.copy_stream
             .memcpy_dtoh(
-                &self.async_argmax_gpu.slice(0..batch_size),
-                &mut self.async_argmax_host,
+                &self.async_argmax_gpu_slots[slot_idx].slice(0..batch_size),
+                &mut self.async_argmax_host_slots[slot_idx],
             )
             .map_err(|e| anyhow::anyhow!("async D2H argmax readback: {e}"))?;
         ctx.copy_stream
             .memcpy_dtoh(
-                &self.async_logprobs_gpu.slice(0..batch_size),
-                &mut self.async_logprobs_host,
+                &self.async_logprobs_gpu_slots[slot_idx].slice(0..batch_size),
+                &mut self.async_logprobs_host_slots[slot_idx],
             )
             .map_err(|e| anyhow::anyhow!("async D2H logprobs readback: {e}"))?;
-        self.async_readback_event
+        self.async_readback_event_slots[slot_idx]
             .record(&ctx.copy_stream)
             .map_err(|e| anyhow::anyhow!("record async greedy readback event: {e}"))?;
-        self.async_readback_in_flight = true;
-        self.async_readback_batch_size = batch_size;
-        Ok(())
+        self.async_readback_in_flight_slots[slot_idx] = true;
+        self.async_readback_batch_sizes[slot_idx] = batch_size;
+        self.next_async_slot = (self.next_async_slot + 1) % ASYNC_READBACK_SLOTS;
+        Ok(slot_idx)
     }
 
-    fn finish_greedy_readback(&mut self, batch_size: usize) -> Result<Option<Vec<u32>>> {
-        if !self.async_readback_in_flight {
+    fn finish_greedy_readback(
+        &mut self,
+        slot_idx: usize,
+        batch_size: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        if slot_idx >= self.async_readback_in_flight_slots.len() {
+            anyhow::bail!("async greedy readback slot {slot_idx} out of range");
+        }
+        if !self.async_readback_in_flight_slots[slot_idx] {
             return Ok(None);
         }
-        match unsafe { cudarc::driver::result::event::query(self.async_readback_event.cu_event()) }
-        {
+        match unsafe {
+            cudarc::driver::result::event::query(
+                self.async_readback_event_slots[slot_idx].cu_event(),
+            )
+        } {
             Ok(()) => {}
             Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
                 return Ok(None);
             }
             Err(err) => {
-                self.async_readback_in_flight = false;
-                self.async_readback_batch_size = 0;
+                self.async_readback_in_flight_slots[slot_idx] = false;
+                self.async_readback_batch_sizes[slot_idx] = 0;
                 return Err(anyhow::anyhow!("async greedy readback event failed: {err}"));
             }
         }
-        let batch_size = batch_size.min(self.async_readback_batch_size);
-        let ids = self
-            .async_argmax_host
+        let batch_size = batch_size.min(self.async_readback_batch_sizes[slot_idx]);
+        let ids = self.async_argmax_host_slots[slot_idx]
             .as_slice()
             .map_err(|e| anyhow::anyhow!("read pinned argmax_host: {e}"))?;
         self.argmax_host[..batch_size].copy_from_slice(&ids[..batch_size]);
-        let logprobs = self
-            .async_logprobs_host
+        let logprobs = self.async_logprobs_host_slots[slot_idx]
             .as_slice()
             .map_err(|e| anyhow::anyhow!("read pinned logprobs_host: {e}"))?;
         self.logprobs_host[..batch_size].copy_from_slice(&logprobs[..batch_size]);
-        self.async_readback_in_flight = false;
-        self.async_readback_batch_size = 0;
+        self.async_readback_in_flight_slots[slot_idx] = false;
+        self.async_readback_batch_sizes[slot_idx] = 0;
         Ok(Some(
             self.argmax_host[..batch_size]
                 .iter()
@@ -697,8 +779,12 @@ impl BatchDecodeBuffers {
         ))
     }
 
-    pub(crate) fn poll_greedy_readback(&mut self, batch_size: usize) -> Result<Option<Vec<u32>>> {
-        self.finish_greedy_readback(batch_size)
+    pub(crate) fn poll_greedy_readback(
+        &mut self,
+        slot_idx: usize,
+        batch_size: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        self.finish_greedy_readback(slot_idx, batch_size)
     }
 
     fn ensure_mixed_buffers(
@@ -976,23 +1062,38 @@ impl Qwen3Model {
         );
 
         let total_tokens = b + total_prefill_tokens;
-        let mixed = bufs.ensure_mixed_buffers(self, kv_format, total_tokens)?;
-        mixed.set_seq_len(total_tokens);
+        {
+            let mixed = bufs.ensure_mixed_buffers(self, kv_format, total_tokens)?;
+            mixed.set_seq_len(total_tokens);
+        }
 
         for prefill in batch.prefills {
             paged_kv_pool.cow_tail_page_for_append(&self.ctx, prefill.slot_idx)?;
             paged_kv_pool.alloc_tokens(prefill.slot_idx, prefill.tokens.len())?;
         }
 
-        let mut combined_tokens = Vec::with_capacity(total_tokens);
-        combined_tokens.extend(batch.decode_tokens.iter().map(|&tok| tok as i32));
-        for prefill in batch.prefills {
-            combined_tokens.extend(prefill.tokens.iter().map(|&tok| tok as i32));
+        {
+            let mixed = bufs
+                .mixed
+                .as_mut()
+                .expect("mixed buffers initialized before token upload");
+            let _used_sampled_handoff = upload_mixed_token_ids_with_handoff(
+                &self.ctx,
+                &mut bufs.token_ids_scratch,
+                &bufs.sampled_tokens_owner,
+                bufs.sampled_tokens_len,
+                bufs.sampled_tokens_valid,
+                &bufs.argmax_out,
+                &mut mixed.token_ids_gpu,
+                batch.decode_tokens,
+                batch.decode_slot_indices,
+                batch.prefills,
+            )?;
         }
-        self.ctx
-            .stream
-            .memcpy_htod(&combined_tokens, &mut mixed.token_ids_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
+        let mixed = bufs
+            .mixed
+            .as_mut()
+            .expect("mixed buffers initialized before forward");
 
         mixed.metadata.update_mixed_batch(
             &self.ctx,
@@ -2316,6 +2417,87 @@ impl Qwen3Model {
             ops_backend.add_batch_into(hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
             std::mem::swap(hidden, &mut bufs.hidden_out);
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_readback_multi_slot_no_loss() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16)?;
+        let mut slots = Vec::new();
+
+        for i in 0..ASYNC_READBACK_SLOTS {
+            let token = 100 + i as i32;
+            let logprob = i as f32 + 0.25;
+            {
+                let mut token_dst = bufs.argmax_out.slice_mut(0..1);
+                ctx.stream.memcpy_htod(&[token], &mut token_dst)?;
+            }
+            {
+                let mut logprob_dst = bufs.logprobs_gpu.slice_mut(0..1);
+                ctx.stream.memcpy_htod(&[logprob], &mut logprob_dst)?;
+            }
+            slots.push((bufs.start_greedy_readback_async(&ctx, 1)?, token, logprob));
+        }
+
+        let err = bufs.start_greedy_readback_async(&ctx, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("ring exhausted"),
+            "unexpected overflow error: {err}"
+        );
+
+        ctx.sync_copy()?;
+        for (slot_idx, token, logprob) in slots {
+            let got = bufs
+                .poll_greedy_readback(slot_idx, 1)?
+                .expect("readback should be ready after copy-stream sync");
+            assert_eq!(got, vec![token as u32]);
+            assert_eq!(bufs.logprobs_host[0], logprob);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_token_upload_uses_sampled_handoff_for_decode_rows() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16)?;
+        {
+            let mut sampled_dst = bufs.argmax_out.slice_mut(0..2);
+            ctx.stream
+                .memcpy_htod(&[501_i32, 502_i32], &mut sampled_dst)?;
+        }
+        bufs.stage_sampled_tokens_for_next_step(&ctx, &[10, 20])?;
+
+        let mut token_ids_gpu: CudaSlice<i32> = ctx.stream.alloc_zeros(4)?;
+        let prefill_tokens = [77_u32, 88_u32];
+        let prefills = [PrefillBatchRequest {
+            slot_idx: 30,
+            tokens: &prefill_tokens,
+        }];
+        let used_handoff = upload_mixed_token_ids_with_handoff(
+            &ctx,
+            &mut bufs.token_ids_scratch,
+            &bufs.sampled_tokens_owner,
+            bufs.sampled_tokens_len,
+            bufs.sampled_tokens_valid,
+            &bufs.argmax_out,
+            &mut token_ids_gpu,
+            &[1, 2],
+            &[20, 10],
+            &prefills,
+        )?;
+        assert!(used_handoff);
+
+        ctx.sync()?;
+        let got = ctx.stream.clone_dtoh(&token_ids_gpu)?;
+        assert_eq!(got, vec![502, 501, 77, 88]);
 
         Ok(())
     }

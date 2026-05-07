@@ -393,9 +393,7 @@ impl<M: ModelForward> Scheduler<M> {
         if has_decode {
             let plan = if candidates.is_empty() {
                 StepPlan::Decode
-            } else if self.deferred_decode_emit.is_none()
-                && self.model.supports_mixed_batch(self.paged_kv_pool.format)
-            {
+            } else if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
                 StepPlan::Mixed(candidates)
             } else if self.config.short_prompt_bypass_tokens > 0
                 && candidates.iter().all(|candidate| {
@@ -635,10 +633,7 @@ impl<M: ModelForward> Scheduler<M> {
                 self.step_prefill_batch(&prefill_candidates);
                 (t.elapsed().as_micros(), 0)
             }
-            (true, false)
-                if self.deferred_decode_emit.is_none()
-                    && self.model.supports_mixed_batch(self.paged_kv_pool.format) =>
-            {
+            (true, false) if self.model.supports_mixed_batch(self.paged_kv_pool.format) => {
                 let t = std::time::Instant::now();
                 self.step_mixed_launch(&prefill_candidates);
                 (0, t.elapsed().as_micros())

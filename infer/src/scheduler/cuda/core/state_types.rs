@@ -12,6 +12,8 @@ pub(in crate::scheduler::cuda) struct PendingDecode {
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
+    /// Model-owned async readback ring slot for the in-flight greedy sample.
+    pub async_slot_idx: Option<usize>,
     /// True when the launch was routed through the Phase 2 speculative decode
     /// verifier path. P2.3 is restricted to a single-token greedy canary; K-token
     /// speculation must use separate pending verifier metadata.
