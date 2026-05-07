@@ -175,6 +175,109 @@ GPU-saturated step".
    envelope. The first code change should be a guarded scheduler/config path,
    not kernel work.
 
+### Phase 1 verify: slot sweep and equal-width vLLM control
+
+Scope: evidence-only scout runs. No ARLE code changes. All runs used the
+high-conc shape `1024 in / 256 out, c=64`, one run per point,
+`--max-seconds 45`, `--warmup 5`.
+
+ARLE command shape:
+
+```bash
+RUST_LOG=info RUST_BACKTRACE=full \
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+TORCH_CUDA_ARCH_LIST=8.9 \
+target/release/infer \
+  --model-path /home/ckl/projects/arle/infer/models/Qwen3-4B \
+  --port 8000 \
+  --max-seq-len 2048 \
+  --num-slots <16|32|48|64>
+```
+
+One initial `--num-slots 16` launch immediately after stopping a stale longctx
+T1 run failed with `CUDA_ERROR_OUT_OF_MEMORY`; the later s16 rerun below
+started cleanly and is the valid datapoint.
+
+| ARLE config | KV pool tokens | active peak | running_batch peak | decode peak | kv_util peak | TTFT p50 | ITL p50 | out tok/s | req/s | client conc p50 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 5120 / auto 14 ref (`m6-arle-high-conc-r2`) | 51,520 | 14 | 14 | 14 | 35.4% | 1059.0 ms | 30.81 ms | 414.66 | 1.678 | 16 |
+| 2048 / 16 (`m6-highconc-phase1-arle-2048-s16-rerun`) | 51,440 | 16 | 16 | 16 | 38.6% | 1058.5 ms | 33.84 ms | 365.53 | 1.600 | 18 |
+| 2048 / 32 (`m6-highconc-phase1-arle-2048-s32`) | 50,336 | 32 | 32 | 32 | 80.0% | 1088.9 ms | 54.65 ms | 408.86 | 1.775 | 34 |
+| 2048 / 48 (`m6-highconc-phase1-arle-2048-s48`) | 49,648 | 47 | 38 | 38 | 95.4% | 3877.6 ms | 65.43 ms | 442.09 | 1.900 | 47 |
+| 2048 / 64 (`m6-highconc-phase1-arle-2048-s64`) | 48,544 | 46 | 37 | 37 | 94.5% | 3881.8 ms | 62.16 ms | 393.82 | 1.850 | 42 |
+
+vLLM equal-width control:
+
+```bash
+PATH=/tmp/arle-vllm-venv/bin:$PATH \
+NVCC_PREPEND_FLAGS='-ccbin /usr/bin/g++-14' \
+CC=/usr/bin/gcc-14 \
+CXX=/usr/bin/g++-14 \
+CUDAHOSTCXX=/usr/bin/g++-14 \
+CUDA_VISIBLE_DEVICES=0 \
+/tmp/arle-vllm-venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model /home/ckl/projects/arle/infer/models/Qwen3-4B \
+  --served-model-name Qwen/Qwen3-4B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype bfloat16 \
+  --max-model-len 2048 \
+  --max-num-seqs 14 \
+  --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype fp8 \
+  --attention-backend TRITON_ATTN \
+  --trust-remote-code \
+  --no-enable-log-requests \
+  --uvicorn-log-level warning
+```
+
+vLLM s14 logs: `max_num_seqs=14`, GPU KV cache 69,440 tokens, maximum
+concurrency for 2,048-token requests 33.91x, CUDA graph capture sizes up to 24.
+
+| vLLM config | TTFT p50 | ITL p50 | out tok/s | req/s | client conc p50 | note |
+|---|---:|---:|---:|---:|---:|---|
+| 2048 / max-num-seqs 14 (`m6-highconc-phase1-vllm-s14`) | 17608.6 ms | 20.24 ms | 614.55 | 2.650 | 51 | server-side active seq telemetry unavailable |
+| 2048 / max-num-seqs 64 ref (`m6-vllm-high-conc-r2`) | 1606.2 ms | 44.65 ms | 1114.71 | 4.530 | 64 | full M6 reference |
+
+Conclusion: the slot-width hypothesis is **only partially true**.
+
+- Raising ARLE slots from 16 to 48 raises active rows and reduces waiting, so
+  the original `max_slots=14` envelope was indeed too narrow for high-conc.
+- Throughput does **not** scale with slot count: best scout was only 442 out
+  tok/s at s48, and s64 regressed to 394 out tok/s. This is still far from
+  vLLM s64 at 1115 out tok/s.
+- At s48/s64, ARLE hits `kv_util` around 95%, but effective `running_batch`
+  tops out at 38/37 instead of 48/64. More slots mostly turn into higher TTFT
+  and ITL rather than useful decode throughput.
+- vLLM constrained to `--max-num-seqs 14` still reaches 615 out tok/s, faster
+  than every ARLE scout point. Therefore equal-width control rejects the
+  "admission width alone explains the gap" hypothesis.
+
+Updated root-cause read:
+
+1. **Confirmed partial:** the default 5120-token envelope leaves high-conc too
+   narrow, but a high-conc-specific 2048 envelope is not sufficient by itself.
+2. **Likely primary next bottleneck:** ARLE mixed prefill/decode scheduling at
+   high slot counts. The service trace shifts toward `mixed` plans, prefill
+   queues reach 40+, and decode rows cap around 37-38 while the token budget is
+   shared with 1025-token prompt chunks.
+3. **Still possible:** decode kernel / graph lowering is less efficient than
+   vLLM at the same effective width; vLLM s14 outperforms ARLE best scout by
+   39%.
+
+Next validation actions:
+
+1. Run ARLE s32/s48 controls with prefill throttled:
+   `--max-prefill-tokens 2048` and/or `--prefill-max-requests 1|2`. If out
+   tok/s rises while TTFT remains acceptable, the fix belongs in high-conc
+   scheduler policy rather than attention kernels.
+2. If prefill throttling does not move throughput, profile decode kernels with
+   Nsight on a machine that has `nsys`/`ncu`, comparing ARLE s32/s48 against
+   vLLM s14. That is the point to enter the M3.5 / M_b path.
+3. Do **not** implement a server-envelope-only change as the Phase 1 fix. It
+   increases active rows but does not close the 2.7x throughput gap.
+
 ## **Priority 0A: re-run longctx with T1 host-pinned KV overflow enabled**
 
 The M6 baseline run did NOT explicitly enable the T1 host-pinned tier.
