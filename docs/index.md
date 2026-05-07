@@ -52,7 +52,6 @@ marked as the current source of truth, treat it as historical context.
 
 | Path | Status | Use this when |
 | --- | --- | --- |
-| [plans/2026-04-23-cuda-decode-sglang-alignment.md](plans/2026-04-23-cuda-decode-sglang-alignment.md) | Active — current decode truth | The question is CUDA decode alignment vs SGLang `main`. |
 | [plans/2026-04-28-single-node-multi-gpu.md](plans/2026-04-28-single-node-multi-gpu.md) | Active | The question is the single-node multi-GPU plan (F0–F8 phases) for TP/PP/EP scaffolding and forward collectives. |
 | [plans/2026-04-28-multi-gpu-f0-verification.md](plans/2026-04-28-multi-gpu-f0-verification.md) | Active | The question is the F0 verification protocol (NCCL link, rendezvous, all-reduce smoke, single-rank no-regression gate). |
 | [plans/2026-05-01-longctx-spec-decode-phase2.md](plans/2026-05-01-longctx-spec-decode-phase2.md) | Active | The question is Phase 2 long-context speculative decode integration on top of the closed Phase 1 W1 c=4 SGLang row. |
