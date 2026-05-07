@@ -14,11 +14,13 @@
 //!   qwen35_compiled_free(model)
 
 #include "mlx_common.h"
+#include "mlx/utils.h"
 #include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 
 namespace {
@@ -32,6 +34,45 @@ bool cpp_phase_timing_enabled() {
     }
     return flag == 1;
 }
+
+// M_e.5 — INFER_METAL_DUAL_STREAM=1 enables alternating-stream encoder
+// pipelining for the c≥2 packed-batch step. Even/odd parity calls bind
+// the per-thread default stream to s_a / s_b respectively before
+// `m->forward(inputs)` builds the lazy graph. MLX schedules per-stream
+// `StreamThread` workers; cross-stream array consumers (e.g. KV reads
+// from the prev step on s_a, consumed by this step on s_b) get
+// automatic event-fence inserts (mlx/transforms.cpp eval_impl).
+// The win: this step's encoder work runs on its own StreamThread while
+// prev step's GPU exec drains on the other stream.
+// See docs/plans/M_e5-mlx-multi-stream-pipelining.md.
+bool cpp_dual_stream_enabled() {
+    static int flag = -1;
+    if (flag == -1) {
+        const char* v = std::getenv("INFER_METAL_DUAL_STREAM");
+        flag = (v && *v && v[0] != '0' && std::string(v) != "false") ? 1 : 0;
+    }
+    return flag == 1;
+}
+
+// Per-thread alternating GPU streams for M_e.5. `init_dual_streams()`
+// is called lazily on first dual-stream entry — not at static-init,
+// because `mx::new_stream(...)` requires the MLX device to be ready.
+struct DualStreams {
+    mlx::core::Stream a;
+    mlx::core::Stream b;
+    int parity{0};
+};
+DualStreams& dual_streams() {
+    static thread_local DualStreams s{
+        mlx::core::new_stream(mlx::core::Device::gpu),
+        mlx::core::new_stream(mlx::core::Device::gpu),
+        0,
+    };
+    return s;
+}
+
+// Path probe — fires once when dual-stream path is first taken.
+std::once_flag g_dual_stream_probe;
 }  // namespace
 
 extern "C" mlx_array* qwen35_moe_block_forward(
@@ -2557,7 +2598,26 @@ int32_t qwen35_compiled_step_batch_packed(
         bool tracing = cpp_phase_timing_enabled();
         auto t_fwd0 = tracing ? std::chrono::high_resolution_clock::now()
                               : std::chrono::high_resolution_clock::time_point{};
-        m->prev_outputs = m->forward(inputs);
+        // M_e.5 — alternating-stream encoder pipelining (env-gated).
+        // Even/odd parity calls bind the per-thread default stream to s_a / s_b
+        // so the new step's encoder runs on a fresh StreamThread worker while
+        // the prior step's GPU exec drains on the other stream. MLX inserts
+        // automatic event-fences on cross-stream array consumers (KV reads,
+        // prev-step sample) — no memory copy, just queue-side sync.
+        if (cpp_dual_stream_enabled()) {
+            auto& ds = dual_streams();
+            ds.parity ^= 1;
+            const auto& cur = ds.parity ? ds.b : ds.a;
+            std::call_once(g_dual_stream_probe, [&]() {
+                std::fprintf(stderr,
+                    "metal_path_probe: M_e.5 dual-stream FIRED (initial parity=%d)\n",
+                    ds.parity);
+            });
+            mlx::core::StreamContext ctx(cur);
+            m->prev_outputs = m->forward(inputs);
+        } else {
+            m->prev_outputs = m->forward(inputs);
+        }
         auto& outputs = m->prev_outputs;
         if (tracing) {
             auto t_fwd1 = std::chrono::high_resolution_clock::now();
