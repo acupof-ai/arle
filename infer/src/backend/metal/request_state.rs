@@ -3144,6 +3144,50 @@ fn decode_qwen35_batch(
         "decode_qwen35_batch produced unexpected extra state outputs"
     );
 
+    // M_e.1 P3.1c.3a — when --kv-pool is on, dual-write each state's
+    // just-written K/V column from its updated cpp.kv_flat into the
+    // state's own pool. This closes the dead-code hole the audit found
+    // (P2.0–P3.1c.2 dual-write only fired on Qwen35StepDriver::run_step,
+    // never on this c≥2 batched path). C++ side unchanged this commit;
+    // the actual c=4 unlock is P3.1c.3b/c (paged step_batch FFI + SDPA
+    // flip). State.driver.cache_len has already been incremented above,
+    // so the column we just wrote sits at cache_len - 1.
+    for state in states.iter_mut() {
+        let n_full = state.driver.arch.num_full_attention_layers();
+        let n_kv_heads = state.driver.config.num_key_value_heads as i32;
+        let head_dim = state.driver.config.head_dim as i32;
+        let kv_dim = n_kv_heads * head_dim;
+        let new_col = state.driver.cache_len - 1; // post-increment column
+        let Some(pool) = state.driver.kv_pool.as_mut() else {
+            continue;
+        };
+        let Qwen35StepMode::Cpp(cpp) = &state.driver.mode else {
+            continue;
+        };
+        pool.alloc_tokens(METAL_REQUEST_STATE_ID, 1)
+            .context("M_e.1 P3.1c.3a alloc_tokens (batched decode)")?;
+        for layer_idx in 0..n_full {
+            let k_full = &cpp.kv_flat[2 * layer_idx];
+            let v_full = &cpp.kv_flat[2 * layer_idx + 1];
+            let k_col = super::mlx::slice(
+                k_full,
+                &[0, 0, new_col, 0],
+                &[1, n_kv_heads, new_col + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let v_col = super::mlx::slice(
+                v_full,
+                &[0, 0, new_col, 0],
+                &[1, n_kv_heads, new_col + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let k_flat = super::mlx::reshape(&k_col, &[1, kv_dim]);
+            let v_flat = super::mlx::reshape(&v_col, &[1, kv_dim]);
+            pool.write_kv(layer_idx, METAL_REQUEST_STATE_ID, &k_flat, &v_flat)
+                .context("M_e.1 P3.1c.3a pool.write_kv (batched decode)")?;
+        }
+    }
+
     Ok(sampled_tokens)
 }
 
