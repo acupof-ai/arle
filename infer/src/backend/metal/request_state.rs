@@ -3774,7 +3774,16 @@ impl<'a> Qwen35StepDriver<'a> {
             .collect();
         let recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
 
-        let mode = if weights.cpp_model.is_some() {
+        // Diagnostic override (M_e.1 P2.1 §7.5 alternative path): force the
+        // Rust step path even when a compiled C++ model is loaded. Lets us
+        // measure the Rust-vs-CPP step ITL gap and unblock paged-KV
+        // exploration without C++ FFI changes. Production stays on CPP
+        // (cpp_model.is_some()) by default.
+        let force_rust = std::env::var_os("AGENT_INFER_QWEN35_FORCE_RUST").is_some_and(|v| {
+            let s = v.to_string_lossy();
+            matches!(s.as_ref(), "1" | "true" | "yes" | "on")
+        });
+        let mode = if weights.cpp_model.is_some() && !force_rust {
             let kv_flat: Vec<MlxArray> = k_caches
                 .iter()
                 .zip(v_caches.iter())
