@@ -161,15 +161,21 @@ contract, not code.
    case asserts `serde_json::from_str::<RadixCache>(_)` no longer
    compiles after the derive removal. This is the structural guarantee
    that the bypass cannot regress.
-7. Metal Qwen3.5 SSD case: write a fake disk entry with namespace
-   header `[0xAA; 32]`, instantiate `MetalQwen35PrefixRuntime` with
-   namespace `[0xBB; 32]`, call `reconcile_disk_entries`, assert the
-   `[0xAA]` disk entry is rejected (logged + dropped) and not surfaced
-   in `disk_entries`.
+7. Metal Qwen3.5 SSD case lives as a `#[cfg(feature = "metal")] mod tests`
+   inline in `infer/src/backend/metal/runtime.rs` (NOT in
+   `infer/tests/`) — `MetalQwen35PrefixRuntime` is private + cfg-gated
+   to `metal`, so it can only be tested intra-module. Test:
+   write a fake disk entry with namespace header `[0xAA; 32]`,
+   instantiate `MetalQwen35PrefixRuntime` with namespace `[0xBB; 32]`,
+   call `reconcile_disk_entries`, assert the `[0xAA]` disk entry is
+   rejected (logged + dropped) and not surfaced in `disk_entries`.
+   Runs only under `cargo test --release --no-default-features --features metal`.
 
-This is a CPU-only test (~50 ms, includes a tempdir for the SSD case),
-runs in `cargo test --release`. Catches future refactors that bypass
-the namespace check on either the in-memory or on-disk surface.
+The default-feature CPU-only portion (steps 1-6) lives in
+`infer/tests/tokenizer_fingerprint_radix_isolation.rs` and runs in
+`cargo test --release` with no extra features (~30 ms). The Metal SSD
+test (step 7) gates on the `metal` feature and is exercised on
+Apple-Silicon CI.
 
 ## Tasks
 
@@ -177,7 +183,7 @@ the namespace check on either the in-memory or on-disk surface.
 |---|---|---|---|---|
 | 1 | Add `fingerprint: [u8; 32]` to `Tokenizer`, compute in `from_file`, expose `fingerprint()` | `infer/src/tokenizer.rs` | ~15 | Claude |
 | 2 | Add `namespace` to `RadixCache`; remove public `#[derive(Serialize, Deserialize)]`; custom `save_snapshot` / `load_snapshot(json, &expected_namespace)` API; add `with_soft_pin_keepalive_namespaced` constructor | `infer/src/prefix_cache.rs` | ~80 | Claude |
-| 2b | Migrate 4 in-tree `serde_json::from_str::<RadixCache>` call sites to `load_snapshot` | `infer/src/prefix_cache/tests.rs` (lines 800, 837, 861, 910) | ~20 | Claude |
+| 2b | Migrate **5** in-tree `serde_json::from_str::<RadixCache>` (and the type-annotated form on `:198`) call sites to `load_snapshot` so the type-system bypass-guard actually compiles | `infer/src/prefix_cache/tests.rs` (lines 198, 800, 837, 861, 910) | ~25 | Claude |
 | 3 | Server boot wiring — CUDA `with_soft_pin_keepalive_namespaced` + Metal Qwen3 `new_with_namespace` + Metal Qwen3.5 runtime namespace field | `scheduler/cuda/core/construction.rs:269`, `backend/metal/prefix_cache.rs:38`, `backend/metal/runtime.rs:416-554` (incl. `reconcile_disk_entries` mismatch reject), `main.rs` boot log | ~70 | Claude |
 | 4 | Test: namespace isolation (in-memory + snapshot-mismatch + SSD-mismatch + compile-fail bypass-guard) | `infer/tests/tokenizer_fingerprint_radix_isolation.rs` (new) | ~150 | Claude |
 
@@ -194,8 +200,10 @@ hold.
 - `cargo test --release --no-default-features --features metal` still
   passes (Metal RadixCache instantiation goes through the same
   `new_with_namespace` path).
-- Server boot log line `"radix-cache namespace: tokenizer=<hex16> build=<hex8>"`
-  appears once per backend.
+- Server boot log line `"prefix-cache namespace: surface=<cuda|metal-qwen3|metal-qwen35> tokenizer=<hex16> build=<hex8>"`
+  appears once per active backend surface (so a CUDA boot prints one
+  line; a Metal Qwen3.5 boot prints two — one for the bridge RadixCache
+  if instantiated, one for the runtime).
 - Manual smoke: change `models/Qwen3-4B/tokenizer.json` by one byte,
   restart server, confirm logged namespace tokenizer prefix differs.
 
