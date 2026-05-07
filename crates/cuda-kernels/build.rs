@@ -326,6 +326,12 @@ const TILELANG_DECODE_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16
 /// `infer/src/ops/attention.rs`.
 const TILELANG_DECODE_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (40, 8), (64, 8)];
 
+/// M_b.2 Phase A0 — FP8 KV variant of HD128 paged decode. A0 scope is
+/// single-config (32, 8) = Qwen3-4B; A1 will extend to all four head
+/// shapes once codegen + numerical correctness are proven. Mirrors
+/// `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd128_fp8.py`.
+const TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS: &[(u32, u32)] = &[(32, 8)];
+
 struct TileLangKernelSpec {
     artifact_dir: String,
     kernel_path: &'static str,
@@ -399,9 +405,9 @@ fn find_tilelang_python() -> Result<String, String> {
 /// Per-SM TileLang AOT artifact: (sm token, exported func name, generated .c path).
 type TileLangPerSmArtifact = (String, String, PathBuf);
 
-/// 18-arg public C signature shared by all three TileLang families
-/// (HD128 prefill / HD256 prefill / HD256 decode). Matches the FFI
-/// macros in `crates/cuda-kernels/src/ffi/attention.rs`.
+/// 18-arg public C signature shared by the BF16 TileLang families
+/// (HD128 prefill / HD256 prefill / HD128 decode / HD256 decode). Matches
+/// the FFI macros in `crates/cuda-kernels/src/ffi/attention.rs`.
 const TILELANG_DISPATCH_PUBLIC_DECL: &str = "uint16_t *q, const int32_t *q_indptr, uint16_t *k_pool, uint16_t *v_pool, \
      const int32_t *kv_indptr, const int32_t *kv_indices, const int32_t *kv_last_page_len, \
      uint16_t *o, int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, \
@@ -411,6 +417,22 @@ const TILELANG_DISPATCH_EXTERN_DECL: &str = TILELANG_DISPATCH_PUBLIC_DECL;
 const TILELANG_DISPATCH_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices, kv_last_page_len, o, \
      batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
      num_kv_heads, page_size, sm_scale, stream";
+
+/// 20-arg public C signature for the FP8 KV TileLang family (M_b.2 —
+/// HD128 FP8 paged decode). Adds `k_scales` / `v_scales` and switches
+/// `k_pool` / `v_pool` from `uint16_t*` (BF16) to `const uint8_t*`
+/// (FP8 E4M3 bytes). Matches `tilelang_decode_hd128_fp8_decl!` in
+/// `crates/cuda-kernels/src/ffi/attention.rs`.
+const TILELANG_DISPATCH_FP8_PUBLIC_DECL: &str = "uint16_t *q, const int32_t *q_indptr, \
+     const uint8_t *k_pool, const uint8_t *v_pool, const float *k_scales, const float *v_scales, \
+     const int32_t *kv_indptr, const int32_t *kv_indices, const int32_t *kv_last_page_len, \
+     uint16_t *o, int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, \
+     int32_t num_pages, int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, \
+     int32_t page_size, float sm_scale, CUstream stream";
+const TILELANG_DISPATCH_FP8_EXTERN_DECL: &str = TILELANG_DISPATCH_FP8_PUBLIC_DECL;
+const TILELANG_DISPATCH_FP8_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, k_scales, v_scales, \
+     kv_indptr, kv_indices, kv_last_page_len, o, batch_size, total_q_tokens, max_qlen, \
+     num_pages, total_pages, num_q_heads, num_kv_heads, page_size, sm_scale, stream";
 
 const GDR_PREPARE_PUBLIC_DECL: &str = "const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream";
 const GDR_PREPARE_EXTERN_DECL: &str = GDR_PREPARE_PUBLIC_DECL;
@@ -757,6 +779,34 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_CALL_ARGS,
+        };
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &spec,
+            &mut generated_sources,
+        );
+    }
+
+    // M_b.2 Phase A0 — FP8 KV decode (single config (32,8) = Qwen3-4B).
+    for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_decode_paged_hd128_fp8_{suffix}"),
+            kernel_path: "tools/tilelang/batch_decode_paged_hd128_fp8.py",
+            kernel_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
+            out_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
+            kernel_family: "attention_fp8",
+            kernel_key: None,
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_FP8_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_FP8_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_FP8_CALL_ARGS,
         };
         build_tilelang_kernel(
             &python,

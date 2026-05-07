@@ -85,6 +85,62 @@ ATTENTION_SPEC = WrapperSpec(
     int grid_z = batch_size;""",
 )
 
+# M_b.2 — FP8 E4M3 KV variant. K_pool / V_pool come in as `uint8_t*` (FP8
+# bytes), and per-token / per-kv-head scales come in as `float*`. The kernel
+# dequantizes inline before the GEMM (TileLang 0.1.9 disallows mixed-dtype
+# GEMM). All other shape symbols + grid extents mirror ATTENTION_SPEC.
+ATTENTION_FP8_PUBLIC_PARAMS = """    uint16_t *q,
+    const int32_t *q_indptr,
+    const uint8_t *k_pool,
+    const uint8_t *v_pool,
+    const float *k_scales,
+    const float *v_scales,
+    const int32_t *kv_indptr,
+    const int32_t *kv_indices,
+    const int32_t *kv_last_page_len,
+    uint16_t *o,
+    int32_t batch_size,
+    int32_t total_q_tokens,
+    int32_t max_qlen,
+    int32_t num_pages,
+    int32_t total_pages,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t page_size,
+    float sm_scale,
+    CUstream stream"""
+
+ATTENTION_FP8_SPEC = WrapperSpec(
+    public_params=ATTENTION_FP8_PUBLIC_PARAMS,
+    tensor_inputs={
+        "KV_indices": "kv_indices",
+        "KV_indptr": "kv_indptr",
+        "KV_last_page_len": "kv_last_page_len",
+        "K_pool": "k_pool",
+        "K_scales": "k_scales",
+        "Output": "o",
+        "Q": "q",
+        "Q_indptr": "q_indptr",
+        "V_pool": "v_pool",
+        "V_scales": "v_scales",
+    },
+    scalar_inputs={
+        "batch_size": ("int32_t", "batch_size"),
+        "max_qlen": ("int32_t", "max_qlen"),
+        "num_pages": ("int32_t", "num_pages"),
+        "total_pages": ("int32_t", "total_pages"),
+        "total_q_tokens": ("int32_t", "total_q_tokens"),
+    },
+    prelude="""    (void)num_kv_heads;
+    (void)page_size;
+    (void)sm_scale;""",
+    grid="""    const int block_m = 64;
+    int qlen = max_qlen > 0 ? max_qlen : 1;
+    int grid_x = (qlen + block_m - 1) / block_m;
+    int grid_y = num_q_heads;
+    int grid_z = batch_size;""",
+)
+
 GDR_SCALAR_INPUTS = {
     "hv": ("int32_t", "num_value_heads"),
     "num_chunks": ("int32_t", "ceildiv_i32(seq_len, 64)"),
@@ -518,7 +574,11 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--out-name", required=True)
-    parser.add_argument("--kernel-family", choices=["attention", "gdr"], default="attention")
+    parser.add_argument(
+        "--kernel-family",
+        choices=["attention", "attention_fp8", "gdr"],
+        default="attention",
+    )
     parser.add_argument("--kernel-key")
     parser.add_argument("--num-q-heads", type=int)
     parser.add_argument("--num-kv-heads", type=int)
@@ -538,6 +598,11 @@ def main() -> int:
             raise RuntimeError("attention kernels require --num-q-heads and --num-kv-heads")
         prim_func = load_attention_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
         wrapper_spec = ATTENTION_SPEC
+    elif args.kernel_family == "attention_fp8":
+        if args.num_q_heads is None or args.num_kv_heads is None:
+            raise RuntimeError("attention_fp8 kernels require --num-q-heads and --num-kv-heads")
+        prim_func = load_attention_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
+        wrapper_spec = ATTENTION_FP8_SPEC
     else:
         if not args.kernel_key:
             raise RuntimeError("gdr kernels require --kernel-key")
