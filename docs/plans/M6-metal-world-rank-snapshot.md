@@ -88,26 +88,40 @@ ARLE build:
 cargo build --release -p infer --no-default-features --features metal
 ```
 
+The Metal serving binary is `target/release/metal_serve` (gated on
+`--features metal` per `infer/Cargo.toml`). On Mac the CUDA-only
+`target/release/infer` from the M6 CUDA snapshot **does not exist**;
+the cited M6 CUDA commands are not portable here. The workspace also
+ships `target/release/arle` (CLI front door) which can invoke
+`metal_serve` for you via `arle serve --backend metal`. Either entry
+works; the snapshot uses `metal_serve` directly to keep the command
+shape close to the CUDA `infer` snapshot.
+
 ARLE server (W1 / W2 / W3 — short-context):
 
 ```bash
 RUST_LOG=info \
-target/release/infer \
+target/release/metal_serve \
   --model-path models/Qwen3.5-0.8B-MLX-4bit \
-  --port 8000 \
-  --max-seq-len 5120
+  --port 8000
 ```
 
 ARLE server (W6 — longctx-32k):
 
 ```bash
 RUST_LOG=info \
-target/release/infer \
+target/release/metal_serve \
   --model-path models/Qwen3-4B-MLX-4bit \
-  --port 8000 \
-  --num-slots 4 \
-  --max-seq-len 33792
+  --port 8000
 ```
+
+`metal_serve` does not expose `--max-seq-len` / `--num-slots` /
+`--chunked-prefill-size` / `--mem-fraction-static` flags — those are
+CUDA scheduler knobs. Metal context length is auto-resolved from the
+model config; concurrency is governed by the scheduler runtime defaults
+(see `MetalSchedulerConfig::default()`). If a future Metal scheduler
+exposes equivalent knobs, update this section in the same commit that
+adds them.
 
 mlx-lm server (W1 / W2 / W3):
 
