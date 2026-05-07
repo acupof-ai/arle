@@ -5,6 +5,30 @@
 > trajectory, identifies what's needed BEYOND known plans to hit
 > "world-first" status.
 
+## Priority & ROI
+
+| Track | Priority | ROI basis | Negative case | Kill criteria |
+|---|---|---|---|---|
+| **M3.9 Phase 1A v3** (multi-slot async readback) | **P0** | Long-ctx 8k TTFT 4961→~2500 ms (50% reduction) — measured against 4961 ms F4-Small baseline + 2367 ms vLLM control. Blocker chain: F4-Small precondition `deferred_decode_emit.is_none()` (verified `2a534c4` git-blame) blocks Mixed at long-ctx steady-state, forces Split (10× tax measured `4a3612b`). | If ARLE long-ctx workloads stop being a target (project pivot to high-conc only). High-conc bench unchanged → no regression. | Phase 0 metrics show `mixed_ok_false_count / total < 5%` after F4-Small. Means deferred event resolves quickly enough that Mixed is rarely blocked → Phase 1A v3 has nothing to fix. |
+| **M_pf** (prefetch wiring) | **P1** | Long-ctx multi-tenant TTFT cliff: 6k cached prefix → ~144 ms H2D. Overlap with prefill removes that wait. **Confirmed substrate**: `submit_prefetch_plan` exists, zero call sites (`50ae808`). | Single-tenant or no-cache workloads see no benefit. May regress if prefetch evicts useful T0 blocks. | Phase 1 bench at multi-tenant shared-prefix shape shows < 20% TTFT improvement → revert. |
+| **M_b.2 Phase 1** (TileLang FP8 attn full integration) | **P1 / P2 conditional** | Phase 1 trace showed `decode_attention_varlen_quantized_partial_kernel` 41.6% GPU. But F4-Small + Phase 1A v3 likely move bottleneck off attention (per `2e60844` data showing kernel is fast at batched mode). Re-evaluate after P1A v3 lands. | M3.9 Phase 1A v3 closes long-ctx gap → kernel work no longer needed for parity. | After P1A v3 lands, if kernel still > 30% GPU AND ARLE < vLLM at 2 of 4 standard shapes → proceed. Else demote. |
+| **Spec-decode + F4-Small compound** | **P2** | Speculation theoretical 1.5-2× decode throughput. ARLE spec infrastructure exists (`scheduler/cuda/spec_path.rs`). | Acceptance rate < 0.6 → speculation negative. Long-ctx KV size scaling makes draft/verify per-token cost equal → no compound gain. | A0 smoke at high-conc shows `spec_acceptance_rate < 0.6` after 30s warmup → revert. |
+| **INT4 KV compression** | **P3** | 30% memory bandwidth reduction. Long-ctx attention is bandwidth-bound. | Numerical regression > 1% PPL on Qwen-class. ~400 LOC, deep code change. | Pre-merge eval at MMLU shows > 0.5% drop → abandon. |
+
+**Tier ordering**: P0 → P1 → P2 → P3, gated by per-tier ROI evidence.
+P1 tracks are run AFTER P0 lands and bench data refreshed.
+
+**Why P0 = M3.9 Phase 1A v3 (not M_pf)**: Phase 1A v3 closes a
+known production-blocking 10× tax with high-confidence path
+(infrastructure-level fix); M_pf is opportunistic gain that only
+materializes for shared-prefix workloads. Plus Phase 1A v3 is in
+codex's active pipeline.
+
+**Retroactive update note**: this section was added on
+[next-visit-after-rule] per the new memory rule
+`feedback_docs_priority_roi_evidence.md`. Original draft (commit
+`d16effe`) lacked explicit ROI/kill criteria.
+
 ## Current state (2026-05-07 EOD)
 
 ### Confirmed bench numbers
