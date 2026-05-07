@@ -258,7 +258,64 @@ Commits 4 and 5 stay as written. Commits 1–3 are reshaped:
   path retirement (commit 6) all still apply. The acceptance numbers
   in §3 (output tok/s c=16 ≥ 300, ITL p95 c=16 ≤ 35 ms) still hold.
 
-### 7.4 Lesson for future audits
+### 7.4 Second errata — CPP session owns K/V opaquely
+
+A third audit pass during P2.1 implementation surfaced another
+substrate constraint that further reshapes the plan. After P2.0
+landed (`e25d617` — `Qwen35StepDriver` allocates the pool when
+`--kv-pool` is on), reading the C++ step path revealed:
+
+- `Qwen35StepMode::Cpp(Qwen35CppState)` owns `kv_flat: Vec<MlxArray>`
+  which is the K/V cache storage.
+- `Qwen35CppState::ensure_session_active` (`request_state.rs:3699`)
+  calls `cpp_model.begin_session(&self.kv_flat, &self.gdr_flat)`
+  THEN immediately `self.kv_flat.clear()`. **The Rust side has
+  no access to K/V data while the C++ session is active.**
+- K/V data only returns to Rust at `end_session(...)` boundaries
+  (between requests / between distinct decode passes), not per
+  step.
+- The smoke log line in P2.0
+  ("`C++ forward model ready (all 24 layers wired through one step
+  call; gdr_kernel=metal)`") confirms the production hot path runs
+  in CPP mode.
+
+So **P2.1 as conceived (per-step dual-write in `Qwen35StepDriver`) is
+structurally impossible without C++ bridge changes.** The pool can be
+allocated (P2.0 ✓) but cannot be written from Rust during a CPP
+session because the K/V doesn't live there.
+
+### 7.5 Re-scoped commit sequence for Qwen3.5 CPP path
+
+The plan now requires C++ bridge work before any pool integration on
+the production hot path. The new sequence:
+
+- **P2.1 (re-scoped) — C++ session per-step KV readback API.**
+  Add a `cpp_model.read_step_kv(layer, dst_buffer)` (or similar) FFI
+  to `crates/mlx-sys/src/mlx_qwen35_model.cpp` that copies the latest
+  appended K/V row out of the session's internal cache into a
+  Rust-side MlxArray. Used in P2.2 to feed the pool. Effort: M.
+  Files: `crates/mlx-sys/src/mlx_qwen35_model.cpp` + the C-API
+  surface; no Rust hot-path change.
+- **P2.2 — Qwen3.5 dual-write under flag.** With the new readback,
+  per-step: call `read_step_kv` per layer, write to pool via
+  `pool.write_kv_slots`. Property test: `pool.gather_kv(layer, req_id)`
+  matches the readback bytes. Effort: M.
+- **P3.1 (unchanged in shape, larger in C++ scope) — kernel cutover.**
+  Now requires C++ to read K/V from the pool slots and feed SDPA in
+  place of the session-internal KV. This is the real paged-attention
+  rewrite on the C++ side. Effort: L.
+- **Alternative path** if C++ readback is too invasive: switch
+  Qwen3.5 to `Qwen35StepMode::Rust` for the production hot path,
+  giving Rust direct access to `state.k_caches/v_caches`. This
+  trades C++ optimizations (compiled session, fused step) for
+  Rust-side dual-write feasibility. Likely worse perf in P2.x,
+  better at P3.x. Decision deferred until C++ readback effort is
+  estimated.
+
+P4.1 / P4.2 (default flip + concat retire) and P5.1 (per-token
+profile) are unaffected. Acceptance numbers in §3 / §4 unchanged.
+
+### 7.6 Lesson for future audits
 
 `grep <Type>` against a single subtree is insufficient for "is this
 type wired?" questions. The audit should grep across `infer/src/` and
@@ -266,6 +323,14 @@ all `crates/` for the type, AND grep for any singleton/magic constants
 that might indicate scoped-but-not-shared usage (e.g.
 `METAL_REQUEST_STATE_ID` here). Logged as a lesson under the next
 session's feedback memory if the pattern recurs.
+
+The §7.4 finding adds a second class of audit pitfall: when a hot
+path crosses an FFI boundary, **read the FFI ownership transfer
+points** (begin/end session, alloc/free, take/return). Cached
+substrate (`kv_flat: Vec<MlxArray>`) can be present in Rust but
+*emptied* during sessions — the field exists but the data lives on
+the other side of the bridge. Logged as a separate feedback memory
+in this session.
 
 ## 6. References
 
