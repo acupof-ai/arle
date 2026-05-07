@@ -2747,8 +2747,10 @@ fn decode_qwen35_packed_batch_pipelined<'a>(
     if batch.batch_cache_len > 0 && batch.batch_cache_len % KV_CACHE_CHUNK == 0 {
         clear_metal_cache();
     }
+    let t_after_clear = phase_timing.then(std::time::Instant::now);
 
     batch.ensure_capacity_for_states(states, batch.batch_cache_len + 1);
+    let t_after_ensure = phase_timing.then(std::time::Instant::now);
 
     // Use prev_sampled as forward input. Take ownership; new sampled will
     // replace it before return so this is safe to take().
@@ -2756,6 +2758,7 @@ fn decode_qwen35_packed_batch_pipelined<'a>(
         .prev_sampled
         .take()
         .context("oMLX-C pipelined path requires prev_sampled to be set")?;
+    let t_after_take = phase_timing.then(std::time::Instant::now);
 
     debug_assert_eq!(
         token_arr.shape().first().copied().unwrap_or(0),
@@ -2772,6 +2775,7 @@ fn decode_qwen35_packed_batch_pipelined<'a>(
     } else {
         None
     };
+    let t_after_mask = phase_timing.then(std::time::Instant::now);
 
     let rope_offsets_data: Vec<i32> = batch
         .left_padding
@@ -2783,6 +2787,7 @@ fn decode_qwen35_packed_batch_pipelined<'a>(
         &[i32::try_from(rope_offsets_data.len())
             .context("oMLX-C pipelined rope offsets overflow")?],
     );
+    let t_after_rope = phase_timing.then(std::time::Instant::now);
 
     let cpp_model = batch
         .weights
@@ -2790,6 +2795,26 @@ fn decode_qwen35_packed_batch_pipelined<'a>(
         .as_ref()
         .context("oMLX-C pipelined path requires the compiled Qwen3.5 path")?;
     let t_prep = phase_timing.then(std::time::Instant::now);
+
+    if phase_timing
+        && let (Some(t0), Some(t_clear), Some(t_ensure), Some(t_take), Some(t_mask), Some(t_rope)) = (
+            t0,
+            t_after_clear,
+            t_after_ensure,
+            t_after_take,
+            t_after_mask,
+            t_after_rope,
+        )
+    {
+        log::info!(
+            "metal_phase_timing_pipelined_prep_breakdown clear_us={} ensure_us={} take_us={} mask_us={} rope_us={}",
+            t_clear.duration_since(t0).as_micros(),
+            t_ensure.duration_since(t_clear).as_micros(),
+            t_take.duration_since(t_ensure).as_micros(),
+            t_mask.duration_since(t_take).as_micros(),
+            t_rope.duration_since(t_mask).as_micros(),
+        );
+    }
 
     let logits = cpp_model.step_batch_packed(
         &token_arr,
