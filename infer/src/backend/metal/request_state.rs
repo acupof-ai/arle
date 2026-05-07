@@ -3917,6 +3917,73 @@ impl<'a> Qwen35StepDriver<'a> {
         Ok(logits)
     }
 
+    /// M_e.1 P3.1c.1 — after a prefill chunk, batch-write the just-
+    /// populated prompt K/V columns into the pool. Without this the pool
+    /// would only carry decode K/V; P3.1c needs the full history when
+    /// it flips SDPA to read from the pool (otherwise attention misses
+    /// the prompt prefix). Single per-layer slice + batch
+    /// pool.write_kv_slots — cheaper than the per-token loop in
+    /// dual_write_pool_after_step.
+    fn dual_write_pool_after_prefill(&mut self, tokens_just_written: i32) -> Result<()> {
+        if !matches!(&self.mode, Qwen35StepMode::Cpp(_)) {
+            return Ok(());
+        }
+        if tokens_just_written <= 0 {
+            return Ok(());
+        }
+        let Some(pool) = self.kv_pool.as_mut() else {
+            return Ok(());
+        };
+        let Some(cpp_model) = self.weights.cpp_model.as_ref() else {
+            return Ok(());
+        };
+
+        let n_layers = self.arch.num_full_attention_layers();
+        let n_kv_heads = self.config.num_key_value_heads as i32;
+        let head_dim = self.config.head_dim as i32;
+        let kv_dim = n_kv_heads * head_dim;
+        let cache_pos = self.cache_len; // OLD value: prefill_session wrote columns [cache_pos, cache_pos + N).
+
+        // Reserve N consecutive slots in one call.
+        let slots = pool
+            .alloc_tokens(METAL_REQUEST_STATE_ID, tokens_just_written as usize)
+            .context("M_e.1 P3.1c.1 alloc_tokens for prefill chunk")?;
+
+        let end = cache_pos + tokens_just_written;
+        for layer_idx in 0..n_layers {
+            let k_full = cpp_model
+                .clone_session_kv(layer_idx as i32, 0)
+                .context("M_e.1 P3.1c.1 clone K (prefill)")?;
+            let v_full = cpp_model
+                .clone_session_kv(layer_idx as i32, 1)
+                .context("M_e.1 P3.1c.1 clone V (prefill)")?;
+
+            // Slice columns [cache_pos, end) from the [1, n_kv_heads, kv_cap, head_dim] cache.
+            let k_range = super::mlx::slice(
+                &k_full,
+                &[0, 0, cache_pos, 0],
+                &[1, n_kv_heads, end, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let v_range = super::mlx::slice(
+                &v_full,
+                &[0, 0, cache_pos, 0],
+                &[1, n_kv_heads, end, head_dim],
+                &[1, 1, 1, 1],
+            );
+            // Transpose [1, n_kv_heads, N, head_dim] -> [1, N, n_kv_heads, head_dim]
+            // then reshape to [N, kv_dim] for pool.write_kv_slots.
+            let k_t = super::mlx::transpose_axes(&k_range, &[0, 2, 1, 3]);
+            let v_t = super::mlx::transpose_axes(&v_range, &[0, 2, 1, 3]);
+            let k_flat = super::mlx::reshape(&k_t, &[tokens_just_written, kv_dim]);
+            let v_flat = super::mlx::reshape(&v_t, &[tokens_just_written, kv_dim]);
+
+            pool.write_kv_slots(layer_idx, &slots, &k_flat, &v_flat)
+                .context("M_e.1 P3.1c.1 pool.write_kv_slots (prefill)")?;
+        }
+        Ok(())
+    }
+
     /// Per-step dual-write hook. No-op when kv_pool is None or the mode
     /// is not Cpp (Rust mode would dual-write differently — see §7.5
     /// alternative path notes; that path is currently classified as
@@ -4516,6 +4583,10 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     cpp_model.prefill_session(&token_arr, tokens.len() as i32, self.cache_len)?
                 };
                 async_eval(&[&logits]);
+                // M_e.1 P3.1c.1 — write the just-prefilled K/V columns
+                // into the pool BEFORE incrementing cache_len so the
+                // hook sees the OLD cache_pos as the slice base.
+                self.dual_write_pool_after_prefill(tokens.len() as i32)?;
                 self.cache_len += tokens.len() as i32;
                 if let Some(dflash) = self.dflash.as_mut() {
                     let captured = super::qwen35::capture_qwen35_hidden_from_cpp_outputs(
