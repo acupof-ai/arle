@@ -4057,10 +4057,23 @@ impl<'a> Qwen35StepDriver<'a> {
         // surface so P3.1c can flip the SDPA read source without further
         // call-site churn.
         let use_paged = self.kv_pool.is_some();
+        let n_full_layers = arch.num_full_attention_layers();
+        // Disjoint-field borrow: kv_pool and mode are different struct
+        // fields of `self`, so Rust 2021+ lets us borrow them
+        // simultaneously without going through self.
+        let kv_pool_ref = self.kv_pool.as_mut();
         let logits = match &mut self.mode {
             Qwen35StepMode::Cpp(state) => {
                 if use_paged {
-                    Self::run_cpp_step_paged(weights, cache_len, token_arr, state)?
+                    let pool = kv_pool_ref.expect("use_paged ⇒ kv_pool is Some");
+                    Self::run_cpp_step_paged(
+                        weights,
+                        n_full_layers,
+                        cache_len,
+                        token_arr,
+                        state,
+                        pool,
+                    )?
                 } else {
                     Self::run_cpp_step(weights, cache_len, token_arr, state)?
                 }
@@ -4124,27 +4137,44 @@ impl<'a> Qwen35StepDriver<'a> {
         Ok(logits)
     }
 
-    /// M_e.1 P3.1b — paged variant. P3.1c will fill k_full/v_full with
-    /// `pool.gather_kv_rows` data and the C++ side will switch SDPA to
-    /// read from those tensors. For now we pass empty slices (n=0); the
-    /// P3.1a entry point ignores them and falls through to the legacy
-    /// session-internal cache path. This commit exists only to land the
-    /// call-site change so P3.1c is a body-only edit on the C++ side.
+    /// M_e.1 P3.1c.2 — paged variant: gather K/V from MetalKVPool for
+    /// each full attention layer and pass the resulting `[1, n_kv_heads,
+    /// seq_len, head_dim]` arrays to step_session_paged. P3.1a's C++ body
+    /// still ignores these inputs (behavior bit-equal to step_session);
+    /// P3.1c.3 will flip the C++ SDPA read source over.
     fn run_cpp_step_paged(
         weights: &Qwen35MetalWeights,
+        n_full_layers: usize,
         cache_len: i32,
         token_arr: &MlxArray,
         state: &mut Qwen35CppState,
+        pool: &mut MetalKVPool,
     ) -> Result<MlxArray> {
         let cpp_model: &CppQwen35Model = weights
             .cpp_model
             .as_ref()
             .context("Qwen3.5 C++ paged step path missing compiled model")?;
         state.ensure_session_active(cpp_model)?;
-        let mut k_full: Vec<*mut mlx_sys::mlx_array> = Vec::new();
-        let mut v_full: Vec<*mut mlx_sys::mlx_array> = Vec::new();
-        let logits =
-            cpp_model.step_session_paged(token_arr, cache_len, &mut k_full, &mut v_full)?;
+
+        // Gather K/V from pool for each full attention layer. After
+        // P3.1c.1, prefill chunks have populated columns
+        // [0, prompt_len) and per-step dual-write covers the
+        // [prompt_len, cache_len) decode tail. So gather covers the
+        // FULL history with shape [1, n_kv_heads, cache_len, head_dim].
+        let mut k_arrays: Vec<MlxArray> = Vec::with_capacity(n_full_layers);
+        let mut v_arrays: Vec<MlxArray> = Vec::with_capacity(n_full_layers);
+        for layer_idx in 0..n_full_layers {
+            let (k, v) = pool
+                .gather_kv(layer_idx, METAL_REQUEST_STATE_ID)
+                .context("M_e.1 P3.1c.2 pool.gather_kv")?;
+            k_arrays.push(k);
+            v_arrays.push(v);
+        }
+
+        let mut k_raw: Vec<*mut mlx_sys::mlx_array> = k_arrays.iter().map(|a| a.as_raw()).collect();
+        let mut v_raw: Vec<*mut mlx_sys::mlx_array> = v_arrays.iter().map(|a| a.as_raw()).collect();
+
+        let logits = cpp_model.step_session_paged(token_arr, cache_len, &mut k_raw, &mut v_raw)?;
         async_eval(&[&logits]);
         Ok(logits)
     }
