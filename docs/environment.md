@@ -133,6 +133,30 @@ Current use:
 These are applied before model load and affect the whole process-local MLX
 allocator state.
 
+### `INFER_MOE_TOP_K`
+
+Override the MoE block's active-expert count below the model's
+configured top_k. Optional; clamped to `(0, model_top_k]` so passing
+a value larger than the model's default is a no-op. Logs once on
+override.
+
+For `mlx-community/Qwen3.6-35B-A3B-4bit` (default top_k=8):
+- `INFER_MOE_TOP_K=6` cut c=4 ITL p50 by **−21.4%** (28880 → 22694
+  μs) and c=8 by **−9.9%** (41108 → 37044 μs). Quality cost ~3%
+  MMLU drop per upstream `vllm-mlx` reports on Qwen3-30B-A3B; not
+  validated for Qwen3.6 specifically.
+
+Mirrors `vllm-mlx`'s `--moe-top-k` flag. Use for latency-critical
+chat / code workloads; keep the default for evaluation /
+quality-sensitive paths. See
+[`docs/experience/wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md`](experience/wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md).
+
+```bash
+INFER_MOE_TOP_K=6 ./target/release/metal_serve \
+  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
+  --port 8765 --max-running-requests 16
+```
+
 ### `MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` (MLX upstream)
 
 Tune MLX's per-command-buffer commit cadence. Defaults vary by Apple
