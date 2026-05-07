@@ -120,7 +120,15 @@ array switch_glu_forward(
     int group_size, int bits) {
     // expand_dims accepts a vector of axes; add 1 at both -2 and -3.
     auto x5 = mlx::core::expand_dims(x, std::vector<int>{-2, -3});
-    const bool do_sort = inds.size() >= 64;
+    // gather_qmm sorted-indices fast path threshold. mlx-lm uses 64 (no comment
+    // explaining the choice — see mlx_lm/models/switch_layers.py:178). At 32
+    // we cover c=4 decode on Qwen3.6 35B-A3B-4bit (c=4 × top_k=8 = 32 indices),
+    // routing the c=4 decode hot path through the coalesced expert-row reads.
+    // Apple Silicon's narrower memory bandwidth makes the sort overhead worth
+    // it for fewer indices than NVIDIA. See
+    // docs/experience/wins/2026-05-07-bench-qwen36-baseline.md and the MoE
+    // research subagent report at the same date — technique #2.
+    const bool do_sort = inds.size() >= 32;
     auto idx = inds;
     array inv_order(0);
     if (do_sort) {
