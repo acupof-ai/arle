@@ -956,7 +956,11 @@ pub fn build_varlen_prefill_mask(
     let mask = add(&pad_term, &causal_term);
     // Cast to bf16 to match Q/K/V dtype (mirrors `build_varlen_decode_mask`).
     let mask = as_dtype(&mask, Dtype::Bfloat16);
-    eval(&[&mask]);
+    // Mirrors the oMLX-C v2 fix in `build_varlen_decode_mask`: keep the mask
+    // lazy so it merges into the downstream forward graph that the caller
+    // submits via `async_eval`. A defensive `eval(&[&mask])` here serialises
+    // the call against any prior async_eval-pending GPU work — see
+    // docs/experience/wins/2026-05-07-bench-c4-omlx-c-v2.md for the cost.
     mask
 }
 
@@ -1022,7 +1026,10 @@ pub fn build_varlen_verify_mask(
     let causal_term = where_(&cond_causal, &neg_inf_b, &zero_b);
     let mask = add(&pad_term, &causal_term);
     let mask = as_dtype(&mask, Dtype::Bfloat16);
-    eval(&[&mask]);
+    // Lazy mask — see oMLX-C v2 commit a69740d / docs/experience/wins/
+    // 2026-05-07-bench-c4-omlx-c-v2.md. A defensive eval here would
+    // serialise the verify path against any prior async_eval-pending GPU
+    // work. Tests that need host values eval explicitly.
     mask
 }
 pub fn scaled_dot_product_attention(

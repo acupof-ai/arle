@@ -2451,15 +2451,20 @@ fn phase_timing_enabled() -> bool {
 }
 
 // oMLX-C — multi-step async pipelining feature flag.
-// Set INFER_OMLX_C=1 to enable the pipelined c≥2 decode path that
-// overlaps prev-step host readback with current-step forward+sample
-// kernels. Default off — falls back to today's sync-per-step path.
-// See docs/plans/M_e1-omlx-c-multi-step-pipelining.md.
+// Default ON as of v3 (2026-05-07) after matched-A/B across 2 sessions
+// reproduced a 15.3% p50 ITL reduction at c=4 (5336μs vs 6296μs avg).
+// See docs/experience/wins/2026-05-07-bench-c4-omlx-c-v3.md.
+// Set INFER_OMLX_C=0 to fall back to the legacy sync-per-step path
+// (e.g. for A/B comparisons or to isolate regressions).
 #[inline(always)]
 fn omlx_c_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("INFER_OMLX_C").is_ok())
+    *FLAG.get_or_init(|| {
+        std::env::var("INFER_OMLX_C")
+            .map(|v| v != "0" && v != "false")
+            .unwrap_or(true)
+    })
 }
 
 // oMLX-C path probe — fires once when the pipelined branch (prev_sampled
