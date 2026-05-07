@@ -1014,4 +1014,142 @@ mod tests {
         assert_eq!(prefill.prompt_start, 4);
         assert_eq!(prefill.prompt_end, 8);
     }
+
+    /// Drive the scheduler so that requests `r0..rN-1` (each a 1-token prompt)
+    /// land in `Decoding` phase, returning the runtime-state vector for the
+    /// next tick. `prompt_token` is the prompt+last-token used for every
+    /// request, kept simple so callers can focus on the decode-priority
+    /// invariant they want to assert.
+    fn drive_to_c_decoders(
+        sched: &mut MetalScheduler,
+        n_decoders: usize,
+    ) -> (Vec<RequestId>, Vec<MetalRuntimeRequestState>) {
+        let mut req_ids = Vec::with_capacity(n_decoders);
+        for i in 0..n_decoders {
+            let req = sched
+                .submit(vec![(i + 1) as u32], 4, MetalRequestPriority::Normal)
+                .expect("submit short-prompt request");
+            req_ids.push(req);
+        }
+
+        // Tick 1: admit r0 + prefill r0 (no decoders yet).
+        let _ = expect_prefill_only(sched.step(&[]));
+
+        // Subsequent ticks: each one decodes the previously-admitted requests
+        // and admits the next waiting one. After `n_decoders - 1` more ticks
+        // the last admitted request has been prefilled and is ready to decode.
+        for k in 1..n_decoders {
+            let runtime: Vec<MetalRuntimeRequestState> = (0..k)
+                .map(|j| {
+                    rt(
+                        req_ids[j],
+                        MetalRequestPhase::Decoding,
+                        1,
+                        Some(100 + j as u32),
+                    )
+                })
+                .collect();
+            let _ = expect_decode_then_prefill(sched.step(&runtime));
+        }
+
+        let runtime: Vec<MetalRuntimeRequestState> = (0..n_decoders)
+            .map(|j| {
+                rt(
+                    req_ids[j],
+                    MetalRequestPhase::Decoding,
+                    1,
+                    Some(200 + j as u32),
+                )
+            })
+            .collect();
+
+        (req_ids, runtime)
+    }
+
+    /// Tier A#3 (see docs/projects/2026-05-07-metal-world-first-gap-analysis.md):
+    /// under c=4 active decoders with a sizable waiting prompt, the scheduler
+    /// must dispatch all 4 decode rows and only consume the leftover budget
+    /// for prefill — proving prefill yields to decode and prefill never
+    /// squeezes the active batch.
+    #[test]
+    fn decode_priority_holds_under_c4_mixed_traffic() {
+        let mut sched = make_scheduler(5, 8);
+        let (req_ids, runtime) = drive_to_c_decoders(&mut sched, 4);
+        let r_big = sched
+            .submit(
+                vec![10, 11, 12, 13, 14, 15, 16, 17],
+                1,
+                MetalRequestPriority::Normal,
+            )
+            .expect("submit big waiting request");
+
+        let (decode, prefill) = expect_decode_then_prefill(sched.step(&runtime));
+
+        assert_eq!(
+            decode.req_ids, req_ids,
+            "decode-priority must dispatch all 4 active decode rows"
+        );
+        assert_eq!(decode.input_tokens, vec![200, 201, 202, 203]);
+
+        assert_eq!(prefill.req_id, r_big);
+        assert_eq!(
+            prefill.input_tokens.len(),
+            4,
+            "prefill chunk must be exactly max_batch_tokens(8) - decode_count(4) = 4 tokens"
+        );
+        assert_eq!(prefill.prompt_start, 0);
+        assert_eq!(prefill.prompt_end, 4);
+        assert_eq!(prefill.prompt_len, 8);
+    }
+
+    /// Tier A#3 saturation edge: when the per-tick token budget equals the
+    /// active decoder count, prefill must be empty so the next tick's decode
+    /// is never delayed by prefill spillover. This locks in the
+    /// `prefill_chunk_budget = 0 → empty` branch.
+    #[test]
+    fn decode_saturation_at_c4_emits_no_prefill() {
+        let mut sched = make_scheduler(5, 4);
+        let (req_ids, runtime) = drive_to_c_decoders(&mut sched, 4);
+        let _r_big = sched
+            .submit(vec![10, 11, 12, 13], 1, MetalRequestPriority::Normal)
+            .expect("submit waiting request");
+
+        let decode = expect_decode_only(sched.step(&runtime));
+
+        assert_eq!(
+            decode.req_ids, req_ids,
+            "saturation must still dispatch all 4 decoders"
+        );
+        assert_eq!(decode.input_tokens, vec![200, 201, 202, 203]);
+    }
+
+    /// Tier A#3 head-of-line guard: a long waiting prompt (1024 tokens) must
+    /// never starve the running c=4 decode batch — prefill emits at most the
+    /// leftover budget per tick and chunks across many ticks rather than
+    /// blocking decode.
+    #[test]
+    fn large_waiting_prompt_yields_bounded_chunk_under_c4_decode() {
+        let mut sched = make_scheduler(5, 16);
+        let (req_ids, runtime) = drive_to_c_decoders(&mut sched, 4);
+        let huge: Vec<u32> = (0..1024).map(|i| i as u32 + 1000).collect();
+        let r_big = sched
+            .submit(huge.clone(), 1, MetalRequestPriority::Normal)
+            .expect("submit huge waiting prompt");
+
+        let (decode, prefill) = expect_decode_then_prefill(sched.step(&runtime));
+
+        assert_eq!(decode.req_ids, req_ids);
+        assert_eq!(decode.req_ids.len(), 4);
+
+        assert_eq!(prefill.req_id, r_big);
+        assert_eq!(
+            prefill.input_tokens.len(),
+            12,
+            "prefill chunk = max_batch_tokens(16) - decode_count(4) = 12; not the full 1024-token prompt"
+        );
+        assert_eq!(prefill.prompt_start, 0);
+        assert_eq!(prefill.prompt_end, 12);
+        assert_eq!(prefill.prompt_len, 1024);
+        assert_eq!(prefill.input_tokens, huge[..12].to_vec());
+    }
 }
