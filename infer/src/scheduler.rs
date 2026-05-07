@@ -40,6 +40,6 @@ pub use plan::{
 };
 pub use types::{
     DraftMode, IncomingRequest, RequestPriority, RequestSpecConfig, RuntimeEnvelopeOverrides,
-    SchedulePolicy, SchedulerConfig, SchedulerFull, SchedulerHandle,
+    SchedulePolicy, SchedulerConfig, SchedulerFull, SchedulerHandle, SchedulerMixedPolicy,
     pick_chunked_prefill_size_for_hbm,
 };

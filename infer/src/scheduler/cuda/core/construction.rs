@@ -93,7 +93,7 @@ impl<M: ModelForward> Scheduler<M> {
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
         let effective_prefill_token_budget = config.max_prefill_tokens;
-        let effective_mixed_prefill_token_budget = config.mixed_prefill_token_budget();
+        let effective_mixed_prefill_token_budget = config.mixed_prefill_workspace_token_budget();
 
         // When the model writes prefill K/V directly to the paged pool, the
         // per-slot contiguous scratch buffer is unused by prefill. Shrink it

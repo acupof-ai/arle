@@ -214,7 +214,7 @@ impl ModelForward for Qwen3Model {
     fn scheduler_runtime_workspace_bytes(&self, budget: SchedulerRuntimeWorkspaceBudget) -> usize {
         let max_batch_size = budget.max_batch_size;
         let prefill_budget_tokens = budget.prefill_tokens.max(1);
-        let mixed_prefill_tokens = budget.mixed_prefill_tokens.max(1);
+        let mixed_prefill_tokens = budget.mixed_prefill_tokens;
         let max_seq_len = budget.max_seq_len;
         let kv_pool_format = budget.kv_pool_format;
         let num_heads = self.config.num_attention_heads;
@@ -243,23 +243,24 @@ impl ModelForward for Qwen3Model {
             self.config.vocab_size,
             max_batch_size,
         );
-        let mixed_workspace = if self.supports_mixed_batch(kv_pool_format) {
-            let mixed_total_tokens = max_batch_size.saturating_add(mixed_prefill_tokens);
-            super::batch_decode::BatchDecodeBuffers::mixed_device_bytes(
-                self.config.hidden_size,
-                q_dim,
-                kv_dim,
-                self.config.intermediate_size,
-                self.config.vocab_size,
-                kv_pool_format,
-                mixed_total_tokens.max(1),
-                max_batch_size,
-                num_heads,
-                metadata_max_pages,
-            )
-        } else {
-            0
-        };
+        let mixed_workspace =
+            if mixed_prefill_tokens > 0 && self.supports_mixed_batch(kv_pool_format) {
+                let mixed_total_tokens = max_batch_size.saturating_add(mixed_prefill_tokens);
+                super::batch_decode::BatchDecodeBuffers::mixed_device_bytes(
+                    self.config.hidden_size,
+                    q_dim,
+                    kv_dim,
+                    self.config.intermediate_size,
+                    self.config.vocab_size,
+                    kv_pool_format,
+                    mixed_total_tokens.max(1),
+                    max_batch_size,
+                    num_heads,
+                    metadata_max_pages,
+                )
+            } else {
+                0
+            };
 
         let prefill_activation_dims = 4usize
             .saturating_mul(self.config.hidden_size)

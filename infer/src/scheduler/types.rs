@@ -102,6 +102,9 @@ pub struct SchedulerConfig {
     /// Operator-facing schedule policy name. The CUDA scheduler currently
     /// implements SGLang-compatible `fcfs`; other names are rejected at CLI.
     pub schedule_policy: SchedulePolicy,
+    /// Whether CUDA decode-active prefill rows use the mixed decode+prefill
+    /// path or the production split prefill-then-decode path.
+    pub mixed_policy: SchedulerMixedPolicy,
     /// Stream chunking interval in generated tokens. 1 matches SGLang's
     /// default and flushes every token.
     pub stream_interval: usize,
@@ -198,6 +201,7 @@ impl Default for SchedulerConfig {
             short_prompt_bypass_tokens: 256,
             prefix_cache_enabled: true,
             schedule_policy: SchedulePolicy::Fcfs,
+            mixed_policy: SchedulerMixedPolicy::Split,
             stream_interval: 1,
             spec_enabled: false,
             spec_draft_k: 5,
@@ -330,15 +334,25 @@ impl SchedulerConfig {
         }
     }
 
-    /// Total prefill rows allowed inside a mixed decode+prefill launch.
+    /// Total prefill tokens allowed inside a mixed decode+prefill launch.
     ///
-    /// Mixed uses one packed TileLang launch for decode rows plus prefill rows,
-    /// so it follows the decode-active long-prefill cap instead of the full
-    /// standalone prefill budget.
+    /// Per-request decode-active chunks are already capped by
+    /// [`Self::long_prefill_token_threshold`] when candidates are created.
+    /// This method must therefore return the whole-step prefill budget, or
+    /// c=4 long-context traffic gets collapsed to one 4096-token row per mixed
+    /// tick while split can pack four rows.
     pub fn mixed_prefill_token_budget(&self) -> usize {
-        self.max_prefill_tokens
-            .min(self.long_prefill_token_threshold)
-            .max(1)
+        self.max_prefill_tokens.max(1)
+    }
+
+    /// Mixed workspace budget. Zero means the runtime must not reserve mixed
+    /// buffers because the policy cannot launch that path.
+    pub fn mixed_prefill_workspace_token_budget(&self) -> usize {
+        if self.mixed_policy.allows_mixed() {
+            self.mixed_prefill_token_budget()
+        } else {
+            0
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -433,6 +447,36 @@ impl SchedulerConfig {
 pub enum SchedulePolicy {
     #[default]
     Fcfs,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SchedulerMixedPolicy {
+    #[default]
+    Split,
+    Mixed,
+}
+
+impl SchedulerMixedPolicy {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "split" => Ok(Self::Split),
+            "mixed" => Ok(Self::Mixed),
+            other => anyhow::bail!(
+                "unsupported --scheduler-mixed-policy '{other}': expected 'split' or 'mixed'"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    pub fn allows_mixed(self) -> bool {
+        matches!(self, Self::Mixed)
+    }
 }
 
 impl SchedulePolicy {
@@ -749,8 +793,9 @@ mod tests {
         assert_eq!(cfg.max_num_batched_tokens, 16384);
         assert_eq!(cfg.max_prefill_tokens, 16384);
         assert_eq!(cfg.long_prefill_token_threshold, 4096);
-        assert_eq!(cfg.mixed_prefill_token_budget(), 4096);
+        assert_eq!(cfg.mixed_prefill_token_budget(), 16384);
         assert_eq!(cfg.prefill_max_requests, None);
+        assert_eq!(cfg.mixed_policy, SchedulerMixedPolicy::Split);
         assert!(!cfg.spec_enabled);
         assert_eq!(cfg.spec_draft_k, 5);
         assert_eq!(cfg.spec_acceptance_threshold, 0.6);
@@ -983,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_prefill_token_budget_tracks_smaller_runtime_cap() {
+    fn mixed_prefill_token_budget_uses_full_step_cap_not_long_row_cap() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.max_prefill_tokens = 2048;
         cfg.long_prefill_token_threshold = 4096;
@@ -991,7 +1036,31 @@ mod tests {
 
         cfg.max_prefill_tokens = 16384;
         cfg.long_prefill_token_threshold = 1024;
-        assert_eq!(cfg.mixed_prefill_token_budget(), 1024);
+        assert_eq!(cfg.mixed_prefill_token_budget(), 16384);
+    }
+
+    #[test]
+    fn mixed_prefill_workspace_budget_respects_policy_gate() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.max_prefill_tokens = 16384;
+        cfg.long_prefill_token_threshold = 1024;
+        assert_eq!(cfg.mixed_prefill_workspace_token_budget(), 0);
+
+        cfg.mixed_policy = SchedulerMixedPolicy::Mixed;
+        assert_eq!(cfg.mixed_prefill_workspace_token_budget(), 16384);
+    }
+
+    #[test]
+    fn scheduler_mixed_policy_parse_rejects_unknown_values() {
+        assert_eq!(
+            SchedulerMixedPolicy::parse("split").unwrap(),
+            SchedulerMixedPolicy::Split
+        );
+        assert_eq!(
+            SchedulerMixedPolicy::parse("mixed").unwrap(),
+            SchedulerMixedPolicy::Mixed
+        );
+        assert!(SchedulerMixedPolicy::parse("auto").is_err());
     }
 
     #[test]
