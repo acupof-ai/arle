@@ -29,13 +29,13 @@ F4-Small substrate; SGLang is the new #2 unknown.
 
 Samples: 16 OK / 0 failed.
 
-### 8k/c=4 three-way comparison
+### 8k/c=4 three-way comparison (COMPLETE)
 
-| Engine | TTFT p50 | out tok/s | rank |
-|---|---:|---:|---:|
-| **vLLM (m_b22 baseline)** | **2361.5 ms** ⭐ | **104.74** | #1 |
-| SGLang 0.5.11 | 8054.5 ms | 78.05 | #3 |
-| ARLE | TBD | TBD | TBD |
+| Engine | TTFT p50 | TTFT mean | out tok/s | E2E mean | rank by TTFT | rank by tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| **vLLM (m_b22)** | **2361.5 ms** ⭐ | n/a | **104.74** ⭐ | n/a | #1 | #1 |
+| **ARLE** | **4574.3 ms** | 4679.8 ms | **103.07** | 10.76 s | #2 | #2 (−1.6%) |
+| SGLang 0.5.11 | 8054.5 ms | 8293.7 ms | 78.05 | 13.43 s | #3 | #3 |
 
 **Surprising finding**: **vLLM is faster than SGLang at 8k**
 (2361 vs 8054 ms TTFT, 3.41× ratio). Likely cause: SGLang's
@@ -45,13 +45,14 @@ prefill or different chunking. SGLang's lead at 4k (where input
 fits in 2 chunks) does not generalize to 8k (where 4 chunks
 serialize).
 
-This is a **second-order finding**: the "ARLE 2.03× behind #2"
-narrative at 4k may NOT scale to 8k. At 8k, ARLE may already be
-competitive or leading depending on actual ARLE 8k bench.
-
-ARLE 8k/c=4 self-bench needed to complete the table. (Not run in
-this tick — codex M_b.2.2 just released the GPU and time is
-budgeted to high-conc.)
+**ARLE positioning at 8k/c=4** (now measured):
+- ARLE is **#2 by both TTFT and throughput**.
+- vLLM TTFT p50 2362 ms ≈ ARLE 4574 ms / 1.94 → ARLE is 1.94× slower TTFT.
+- vLLM out tok/s 104.74 ≈ ARLE 103.07 × 1.016 → essentially tied
+  on throughput (−1.6%).
+- M_world1 +30% lead target at 8k: TTFT ≤ 1816 ms (vs ARLE 4574 = need 60% faster);
+  out tok/s ≥ 136 (vs ARLE 103 = need +32% throughput). Both
+  achievable IF prefill GEMM/graph improvements land.
 
 ## Results — high-conc 1k/256/c=64
 
@@ -162,11 +163,23 @@ but not all 3.
 |---|---:|---:|---:|---:|---|
 | 1k/256/c=64 (high-conc, tok/s) | **843** | SGLang 499 | **+69%** | +30% | ✓✓ EXCEEDS |
 | 4k/c=4 (long-ctx, TTFT lower=better) | 1976 ms | SGLang 973 ms | **−51% (slower)** | TTFT ≤ 748 ms | ✗ NEEDS WORK |
-| 8k/c=4 (long-ctx, TTFT) | TBD | vLLM 2362 ms | TBD | TTFT ≤ 1817 ms | ⏳ NEED ARLE 8K BENCH |
+| 8k/c=4 (long-ctx, TTFT) | **4574 ms** | vLLM 2362 ms | **−48% (slower)** | TTFT ≤ 1816 ms | ✗ NEEDS WORK |
+| 8k/c=4 (long-ctx, tok/s) | **103.07** | vLLM 104.74 | **−1.6% (close tie)** | tok/s ≥ 136 | ⚠ SLIGHT BEHIND |
 | multi-tenant shared-prefix | 318 ms TTFT | (not benched here) | n/a | n/a | ⏳ NEED SGLANG MULTI-TENANT |
 
-ARLE confirmed world #1 at 1 of 4 shapes; needs major TTFT
-improvement at 1 shape; needs measurement at 2 shapes.
+**ARLE confirmed world #1 at 1 of 4 canonical shapes**
+(high-conc by +69%); **needs major TTFT improvement at 2 shapes**
+(4k −51%, 8k −48%); **throughput basically tied at 8k**;
+**multi-tenant pending separate benchmark**.
+
+The TTFT gaps at 4k AND 8k are similar magnitude (~50% slower
+than respective #2). Same root cause likely: prefill kernel
+launch path. R1 research
+([`docs/research/2026-05-07-sglang-prefill-stack-survey.md`](../../research/2026-05-07-sglang-prefill-stack-survey.md))
+strongly suggests piecewise prefill graph capture is the
+differentiator, since SGLang's BF16 prefill GEMM uses cuBLAS
+(same as ARLE) — meaning the win is at the dispatch/launch
+level, not the kernel level.
 
 ## What's next (P-priority order)
 
