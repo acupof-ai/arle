@@ -71,11 +71,21 @@ pub struct TileLangDecodeMetadata {
     fast_page16_metadata: bool,
 }
 
-/// Zero-sized compatibility object for call sites that still pass a workspace
-/// handle. TileLang attention is plan-less and does not allocate per-plan GPU
-/// scratch here; the real buffers live in the TileLang AOT kernels and regular
-/// model scratch.
-pub struct TileLangWorkspace;
+/// Workspace for TileLang attention phase kernels.
+///
+/// The HD128 BF16 split-KV decode path stores FlashDecoding partial outputs in
+/// persistent scheduler-owned buffers so runtime launches never allocate. Mixed
+/// and prefill metadata can still request a zero-sized workspace via
+/// `new_with_float_bytes`.
+pub struct TileLangWorkspace {
+    partial_out: Option<CudaSlice<f32>>,
+    partial_m: Option<CudaSlice<f32>>,
+    partial_l: Option<CudaSlice<f32>>,
+    max_batch_size: usize,
+    num_qo_heads: usize,
+    max_splits: usize,
+    _extra_float_workspace: Option<CudaSlice<f32>>,
+}
 
 unsafe impl Send for TileLangWorkspace {}
 
@@ -89,17 +99,19 @@ fn decode_metadata_fast_page16_enabled() -> bool {
 impl TileLangWorkspace {
     pub const DEFAULT_FLOAT_WORKSPACE_BYTES: usize = 0;
     pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 0;
+    pub const HD128_DECODE_MAX_SPLITS: usize = 16;
+    pub const HD128_DECODE_SPLIT_MIN_TOKENS: usize = 2048;
 
-    pub fn new(_ctx: &DeviceContext, _max_batch_size: usize, _num_qo_heads: usize) -> Result<Self> {
-        Ok(Self)
+    pub fn new(ctx: &DeviceContext, max_batch_size: usize, num_qo_heads: usize) -> Result<Self> {
+        Self::new_hd128_decode(ctx, max_batch_size, num_qo_heads)
     }
 
     pub fn device_bytes(
         _max_batch_size: usize,
         _num_qo_heads: usize,
-        _float_workspace_bytes: usize,
+        float_workspace_bytes: usize,
     ) -> usize {
-        0
+        align_float_bytes(float_workspace_bytes)
     }
 
     pub fn default_device_bytes(max_batch_size: usize, num_qo_heads: usize) -> usize {
@@ -111,13 +123,131 @@ impl TileLangWorkspace {
     }
 
     pub fn new_with_float_bytes(
-        _ctx: &DeviceContext,
-        _max_batch_size: usize,
-        _num_qo_heads: usize,
-        _float_workspace_bytes: usize,
+        ctx: &DeviceContext,
+        max_batch_size: usize,
+        num_qo_heads: usize,
+        float_workspace_bytes: usize,
     ) -> Result<Self> {
-        Ok(Self)
+        let extra_elems = align_float_bytes(float_workspace_bytes) / std::mem::size_of::<f32>();
+        let extra_float_workspace =
+            if extra_elems > 0 {
+                Some(ctx.stream.alloc_zeros(extra_elems).map_err(|e| {
+                    anyhow::anyhow!("Alloc TileLang extra float workspace failed: {e}")
+                })?)
+            } else {
+                None
+            };
+        Ok(Self {
+            partial_out: None,
+            partial_m: None,
+            partial_l: None,
+            max_batch_size,
+            num_qo_heads,
+            max_splits: 0,
+            _extra_float_workspace: extra_float_workspace,
+        })
     }
+
+    pub fn hd128_decode_device_bytes(max_batch_size: usize, num_qo_heads: usize) -> usize {
+        hd128_split_partial_out_elems(max_batch_size, num_qo_heads, Self::HD128_DECODE_MAX_SPLITS)
+            .saturating_add(hd128_split_stat_elems(
+                max_batch_size,
+                num_qo_heads,
+                Self::HD128_DECODE_MAX_SPLITS,
+            ))
+            .saturating_add(hd128_split_stat_elems(
+                max_batch_size,
+                num_qo_heads,
+                Self::HD128_DECODE_MAX_SPLITS,
+            ))
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
+
+    fn new_hd128_decode(
+        ctx: &DeviceContext,
+        max_batch_size: usize,
+        num_qo_heads: usize,
+    ) -> Result<Self> {
+        let max_splits = Self::HD128_DECODE_MAX_SPLITS;
+        let partial_out_elems =
+            hd128_split_partial_out_elems(max_batch_size, num_qo_heads, max_splits);
+        let stat_elems = hd128_split_stat_elems(max_batch_size, num_qo_heads, max_splits);
+        Ok(Self {
+            partial_out: Some(
+                ctx.stream
+                    .alloc_zeros(partial_out_elems.max(1))
+                    .map_err(|e| anyhow::anyhow!("Alloc TileLang split partial_out failed: {e}"))?,
+            ),
+            partial_m: Some(
+                ctx.stream
+                    .alloc_zeros(stat_elems.max(1))
+                    .map_err(|e| anyhow::anyhow!("Alloc TileLang split partial_m failed: {e}"))?,
+            ),
+            partial_l: Some(
+                ctx.stream
+                    .alloc_zeros(stat_elems.max(1))
+                    .map_err(|e| anyhow::anyhow!("Alloc TileLang split partial_l failed: {e}"))?,
+            ),
+            max_batch_size,
+            num_qo_heads,
+            max_splits,
+            _extra_float_workspace: None,
+        })
+    }
+
+    pub fn hd128_decode_num_splits(&self) -> i32 {
+        self.max_splits as i32
+    }
+
+    pub fn hd128_decode_split_workspace_mut(
+        &mut self,
+        batch_size: usize,
+        num_qo_heads: usize,
+    ) -> Option<(
+        &mut CudaSlice<f32>,
+        &mut CudaSlice<f32>,
+        &mut CudaSlice<f32>,
+    )> {
+        if self.max_splits == 0
+            || batch_size > self.max_batch_size
+            || num_qo_heads != self.num_qo_heads
+        {
+            return None;
+        }
+        match (
+            &mut self.partial_out,
+            &mut self.partial_m,
+            &mut self.partial_l,
+        ) {
+            (Some(partial_out), Some(partial_m), Some(partial_l)) => {
+                Some((partial_out, partial_m, partial_l))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn align_float_bytes(bytes: usize) -> usize {
+    bytes
+        .div_ceil(std::mem::size_of::<f32>())
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+fn hd128_split_partial_out_elems(
+    max_batch_size: usize,
+    num_qo_heads: usize,
+    max_splits: usize,
+) -> usize {
+    max_splits
+        .saturating_mul(max_batch_size)
+        .saturating_mul(num_qo_heads)
+        .saturating_mul(128)
+}
+
+fn hd128_split_stat_elems(max_batch_size: usize, num_qo_heads: usize, max_splits: usize) -> usize {
+    max_splits
+        .saturating_mul(max_batch_size)
+        .saturating_mul(num_qo_heads)
 }
 
 impl TileLangDecodeMetadata {
@@ -129,22 +259,28 @@ impl TileLangDecodeMetadata {
         max_total_pages: usize,
         num_qheads: usize,
     ) -> Result<Self> {
-        Self::new_with_float_workspace_bytes(
-            ctx,
-            max_batch_size,
-            max_total_pages,
-            num_qheads,
-            TileLangWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
-        )
+        Self::new_impl(ctx, max_batch_size, max_total_pages, num_qheads, false, 0)
     }
 
     pub fn device_bytes(max_batch_size: usize, max_total_pages: usize, num_qheads: usize) -> usize {
-        Self::device_bytes_with_float_workspace(
-            max_batch_size,
-            max_total_pages,
-            num_qheads,
-            TileLangWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
-        )
+        Self::device_bytes_impl(max_batch_size, max_total_pages, num_qheads, false, 0)
+    }
+
+    pub fn new_with_hd128_decode_workspace(
+        ctx: &DeviceContext,
+        max_batch_size: usize,
+        max_total_pages: usize,
+        num_qheads: usize,
+    ) -> Result<Self> {
+        Self::new_impl(ctx, max_batch_size, max_total_pages, num_qheads, true, 0)
+    }
+
+    pub fn device_bytes_with_hd128_decode_workspace(
+        max_batch_size: usize,
+        max_total_pages: usize,
+        num_qheads: usize,
+    ) -> usize {
+        Self::device_bytes_impl(max_batch_size, max_total_pages, num_qheads, true, 0)
     }
 
     pub fn device_bytes_with_float_workspace(
@@ -153,8 +289,29 @@ impl TileLangDecodeMetadata {
         num_qheads: usize,
         float_workspace_bytes: usize,
     ) -> usize {
+        Self::device_bytes_impl(
+            max_batch_size,
+            max_total_pages,
+            num_qheads,
+            false,
+            float_workspace_bytes,
+        )
+    }
+
+    fn device_bytes_impl(
+        max_batch_size: usize,
+        max_total_pages: usize,
+        num_qheads: usize,
+        include_decode_workspace: bool,
+        float_workspace_bytes: usize,
+    ) -> usize {
         let i32_bytes = std::mem::size_of::<i32>();
-        TileLangWorkspace::device_bytes(max_batch_size, num_qheads, float_workspace_bytes)
+        let workspace_bytes = if include_decode_workspace {
+            TileLangWorkspace::hd128_decode_device_bytes(max_batch_size, num_qheads)
+        } else {
+            TileLangWorkspace::device_bytes(max_batch_size, num_qheads, float_workspace_bytes)
+        };
+        workspace_bytes
             .saturating_add(max_batch_size.saturating_mul(i32_bytes)) // positions
             .saturating_add(max_total_pages.max(1).saturating_mul(i32_bytes)) // kv_indices
             .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // kv_indptr
@@ -173,10 +330,38 @@ impl TileLangDecodeMetadata {
         num_qheads: usize,
         float_workspace_bytes: usize,
     ) -> Result<Self> {
+        Self::new_impl(
+            ctx,
+            max_batch_size,
+            max_total_pages,
+            num_qheads,
+            false,
+            float_workspace_bytes,
+        )
+    }
+
+    fn new_impl(
+        ctx: &DeviceContext,
+        max_batch_size: usize,
+        max_total_pages: usize,
+        num_qheads: usize,
+        include_decode_workspace: bool,
+        float_workspace_bytes: usize,
+    ) -> Result<Self> {
         let qo_indptr: CudaSlice<i32> = ctx
             .stream
             .alloc_zeros(max_batch_size + 1)
             .map_err(|e| anyhow::anyhow!("Alloc qo_indptr failed: {e}"))?;
+        let tilelang_ws = if include_decode_workspace {
+            TileLangWorkspace::new(ctx, max_batch_size, num_qheads)?
+        } else {
+            TileLangWorkspace::new_with_float_bytes(
+                ctx,
+                max_batch_size,
+                num_qheads,
+                float_workspace_bytes,
+            )?
+        };
 
         Ok(Self {
             positions: ctx
@@ -208,12 +393,7 @@ impl TileLangDecodeMetadata {
                 .alloc_zeros(max_batch_size.max(1))
                 .map_err(|e| anyhow::anyhow!("Alloc appended_page_indices failed: {e}"))?,
             qo_indptr,
-            tilelang_ws: TileLangWorkspace::new_with_float_bytes(
-                ctx,
-                max_batch_size,
-                num_qheads,
-                float_workspace_bytes,
-            )?,
+            tilelang_ws,
             max_total_pages,
             positions_scratch: Vec::with_capacity(max_batch_size),
             indices_scratch: Vec::with_capacity(max_total_pages.max(1)),

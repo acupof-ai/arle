@@ -7,6 +7,7 @@
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use std::sync::OnceLock;
 
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
@@ -48,6 +49,21 @@ pub(crate) struct PagedKVMeta<'a> {
     pub kv_indptr: &'a CudaSlice<i32>,
     pub kv_last_page_len: &'a CudaSlice<i32>,
     pub page_size: usize,
+}
+
+pub(crate) fn tilelang_bf16_split_kv_requested() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("INFER_TILELANG_BF16_SPLIT_KV").as_deref(),
+            Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
+fn tilelang_bf16_split_kv_enabled(max_kv_tokens: usize) -> bool {
+    tilelang_bf16_split_kv_requested()
+        && max_kv_tokens >= TileLangWorkspace::HD128_DECODE_SPLIT_MIN_TOKENS
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1025,6 +1041,7 @@ pub fn tilelang_tc_run_layer(
     batch_size: i32,
     max_qlen: i32,
     total_pages: i32,
+    max_kv_tokens: usize,
 ) -> Result<()> {
     let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
@@ -1091,6 +1108,105 @@ pub fn tilelang_tc_run_layer(
 
     let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
     let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
+
+    if is_pure_decode && tilelang_bf16_split_kv_enabled(max_kv_tokens) {
+        let num_splits = workspace.hd128_decode_num_splits();
+        if num_splits > 1
+            && let Some((partial_out, partial_m, partial_l)) =
+                workspace.hd128_decode_split_workspace_mut(batch_size as usize, heads.num_qo_heads)
+        {
+            let partial_kernel = match (heads.num_qo_heads, heads.num_kv_heads) {
+                (16, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q16_kv8_run_cuda,
+                (32, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q32_kv8_run_cuda,
+                (40, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q40_kv8_run_cuda,
+                (64, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q64_kv8_run_cuda,
+                other => {
+                    return Err(anyhow!(
+                        "TileLang: no specialized HD128 split partial kernel for \
+                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
+                         are (16,8), (32,8), (40,8), (64,8)."
+                    ));
+                }
+            };
+            let merge_kernel = match (heads.num_qo_heads, heads.num_kv_heads) {
+                (16, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q16_kv8_run_cuda,
+                (32, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q32_kv8_run_cuda,
+                (40, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q40_kv8_run_cuda,
+                (64, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q64_kv8_run_cuda,
+                other => {
+                    return Err(anyhow!(
+                        "TileLang: no specialized HD128 split merge kernel for \
+                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
+                         are (16,8), (32,8), (40,8), (64,8)."
+                    ));
+                }
+            };
+            let (partial_out_ptr, _gpo) = partial_out.device_ptr_mut(&ctx.stream);
+            let (partial_m_ptr, _gpm) = partial_m.device_ptr_mut(&ctx.stream);
+            let (partial_l_ptr, _gpl) = partial_l.device_ptr_mut(&ctx.stream);
+            let num_pages = kv_pool.max_total_pages as i32;
+            let total_q_tokens = q_batch.seq_len as i32;
+            unsafe {
+                partial_kernel(
+                    q_ptr as *mut ffi::Half,
+                    qoi_ptr as *const i32,
+                    k_pool_ptr as *mut ffi::Half,
+                    v_pool_ptr as *mut ffi::Half,
+                    ind_ptr as *const i32,
+                    idx_ptr as *const i32,
+                    lp_ptr as *const i32,
+                    partial_out_ptr as *mut f32,
+                    partial_m_ptr as *mut f32,
+                    partial_l_ptr as *mut f32,
+                    batch_size,
+                    total_q_tokens,
+                    max_qlen,
+                    num_pages,
+                    total_pages,
+                    heads.num_qo_heads as i32,
+                    heads.num_kv_heads as i32,
+                    heads.page_size as i32,
+                    sm_scale,
+                    num_splits,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| {
+                    anyhow!(
+                        "tilelang_batch_decode_paged_hd128_split_partial (q{}_kv{}) failed: {e}",
+                        heads.num_qo_heads,
+                        heads.num_kv_heads
+                    )
+                })?;
+                merge_kernel(
+                    partial_out_ptr as *const f32,
+                    partial_m_ptr as *const f32,
+                    partial_l_ptr as *const f32,
+                    o_ptr as *mut ffi::Half,
+                    batch_size,
+                    total_q_tokens,
+                    max_qlen,
+                    num_pages,
+                    total_pages,
+                    heads.num_qo_heads as i32,
+                    heads.num_kv_heads as i32,
+                    heads.page_size as i32,
+                    sm_scale,
+                    num_splits,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| {
+                    anyhow!(
+                        "tilelang_batch_decode_paged_hd128_split_merge (q{}_kv{}) failed: {e}",
+                        heads.num_qo_heads,
+                        heads.num_kv_heads
+                    )
+                })?;
+            }
+            return Ok(());
+        }
+    }
 
     {
         let _ = workspace; // TileLang is plan-less; workspace is unused here.

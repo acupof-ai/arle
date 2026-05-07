@@ -498,7 +498,7 @@ pub use attention::{
 pub(crate) use attention::{
     decode_prep_paged, prefill_attention_batch, prefill_attention_hd256_batch,
     prefill_attention_hd256_batch_with_scratch, prefill_attention_paged_batch,
-    prefill_attention_paged_run_hd256,
+    prefill_attention_paged_run_hd256, tilelang_bf16_split_kv_requested,
 };
 #[cfg(feature = "cuda")]
 pub use elementwise::{add_batch, silu_mul_batch};
