@@ -1489,6 +1489,39 @@ fn guard_prefill_chunk(
     }
 }
 
+// M_e.9 precondition counter — env-gated, accumulates mixed-batch
+// dispatch outcomes across the run and emits a periodic summary so
+// the bench can decide whether the M_e.9 generalize-to-Qwen3.5
+// effort is on the hot path. Counters are atomic so the periodic
+// dump is lock-free.
+fn m_e9_precondition_record(succeeded: bool) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    static MIXED_TICK_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static MIXED_TICK_FUSED: AtomicU64 = AtomicU64::new(0);
+    let enabled = *FLAG.get_or_init(|| std::env::var("INFER_M_E9_PRECONDITION").is_ok());
+    if !enabled {
+        return;
+    }
+    let total = MIXED_TICK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if succeeded {
+        MIXED_TICK_FUSED.fetch_add(1, Ordering::Relaxed);
+    }
+    if total.is_multiple_of(50) {
+        let fused = MIXED_TICK_FUSED.load(Ordering::Relaxed);
+        let fallback = total - fused;
+        let fallback_pct = (fallback as f64 / total as f64) * 100.0;
+        log::info!(
+            "m_e9_precondition: mixed_dispatch_ticks={} fused={} fallback={} fallback_pct={:.1}% (≥30% means M_e.9 is on hot path)",
+            total,
+            fused,
+            fallback,
+            fallback_pct
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn guard_schedule_step(
     step: MetalScheduleStep,
@@ -1513,7 +1546,23 @@ fn guard_schedule_step(
     let prefill_head = step.prefill.into_iter().next();
     match (step.decode, prefill_head) {
         (Some(batch), Some(prefill)) => {
-            if !guard_mixed_batch(
+            // M_e.9 precondition counters — measure how often the
+            // dispatcher hits the (decode + prefill) case AND how
+            // often it falls back to two sequential async_evals
+            // because the model isn't Qwen3 (i.e. Qwen3.5/3.6 today).
+            // Plan threshold: if Qwen3.5 fallback >= 30% of ticks
+            // where (decode, prefill) coexist, M_e.9 is on the hot
+            // path; <30% means deprioritize. Env-gated to keep
+            // production output clean; turn on with
+            // INFER_M_E9_PRECONDITION=1 during the bench tick.
+            //
+            // The is_qwen3() check at execute_mixed_batch:1685, :1693
+            // is what actually drives the Qwen3.5 fallback rate; we
+            // could short-circuit here with the same check, but
+            // attributing the fallback only after guard_mixed_batch
+            // returns false keeps the metric semantically correct
+            // (any fallback reason — not just non-Qwen3 — increments).
+            let succeeded = guard_mixed_batch(
                 batch.req_ids.clone(),
                 prefill.req_id,
                 prefill.input_tokens.len(),
@@ -1525,7 +1574,9 @@ fn guard_schedule_step(
                 scheduler,
                 pending,
                 active,
-            ) {
+            );
+            m_e9_precondition_record(succeeded);
+            if !succeeded {
                 guard_decode_batch(
                     batch.req_ids,
                     metrics,
