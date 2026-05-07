@@ -326,6 +326,11 @@ const TILELANG_DECODE_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16
 /// `infer/src/ops/attention.rs`.
 const TILELANG_DECODE_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (40, 8), (64, 8)];
 
+/// M_b.1 — BF16 split-KV decode phase kernels. Mirrors
+/// `TILELANG_DECODE_HD128_HEAD_CONFIGS`; each config emits a partial kernel and
+/// a merge kernel.
+const TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS: &[(u32, u32)] = TILELANG_DECODE_HD128_HEAD_CONFIGS;
+
 /// M_b.2 Phase A0 — FP8 KV variant of HD128 paged decode. A0 scope is
 /// single-config (32, 8) = Qwen3-4B; A1 will extend to all four head
 /// shapes once codegen + numerical correctness are proven. Mirrors
@@ -417,6 +422,32 @@ const TILELANG_DISPATCH_EXTERN_DECL: &str = TILELANG_DISPATCH_PUBLIC_DECL;
 const TILELANG_DISPATCH_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices, kv_last_page_len, o, \
      batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
      num_kv_heads, page_size, sm_scale, stream";
+
+/// 21-arg public C signature for the BF16 HD128 split-KV partial phase.
+const TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL: &str = "uint16_t *q, const int32_t *q_indptr, \
+     uint16_t *k_pool, uint16_t *v_pool, const int32_t *kv_indptr, const int32_t *kv_indices, \
+     const int32_t *kv_last_page_len, float *partial_out, float *partial_m, float *partial_l, \
+     int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, int32_t num_pages, \
+     int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, int32_t page_size, \
+     float sm_scale, int32_t num_splits, CUstream stream";
+const TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_EXTERN_DECL: &str =
+    TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL;
+const TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, \
+     kv_indptr, kv_indices, kv_last_page_len, partial_out, partial_m, partial_l, \
+     batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
+     num_kv_heads, page_size, sm_scale, num_splits, stream";
+
+/// 15-arg public C signature for the BF16 HD128 split-KV merge phase.
+const TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL: &str = "const float *partial_out, \
+     const float *partial_m, const float *partial_l, uint16_t *o, int32_t batch_size, \
+     int32_t total_q_tokens, int32_t max_qlen, int32_t num_pages, int32_t total_pages, \
+     int32_t num_q_heads, int32_t num_kv_heads, int32_t page_size, float sm_scale, \
+     int32_t num_splits, CUstream stream";
+const TILELANG_DISPATCH_BF16_SPLIT_MERGE_EXTERN_DECL: &str =
+    TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL;
+const TILELANG_DISPATCH_BF16_SPLIT_MERGE_CALL_ARGS: &str = "partial_out, partial_m, partial_l, o, \
+     batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
+     num_kv_heads, page_size, sm_scale, num_splits, stream";
 
 /// 20-arg public C signature for the FP8 KV TileLang family (M_b.2 —
 /// HD128 FP8 paged decode). Adds `k_scales` / `v_scales` and switches
@@ -788,6 +819,57 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             &tilelang_src,
             &cutlass_include,
             &spec,
+            &mut generated_sources,
+        );
+    }
+
+    for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let partial_spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_decode_paged_hd128_split_partial_{suffix}"),
+            kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
+            kernel_name: format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"),
+            out_name: format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
+            kernel_family: "attention_bf16_split_partial",
+            kernel_key: Some("split_partial"),
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_CALL_ARGS,
+        };
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &partial_spec,
+            &mut generated_sources,
+        );
+
+        let merge_spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_decode_paged_hd128_split_merge_{suffix}"),
+            kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
+            kernel_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
+            out_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
+            kernel_family: "attention_bf16_split_merge",
+            kernel_key: Some("split_merge"),
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_BF16_SPLIT_MERGE_CALL_ARGS,
+        };
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &merge_spec,
             &mut generated_sources,
         );
     }

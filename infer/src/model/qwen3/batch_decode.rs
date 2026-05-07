@@ -45,6 +45,16 @@ fn bytes_for<T>(count: usize) -> usize {
     count.saturating_mul(std::mem::size_of::<T>())
 }
 
+fn max_kv_tokens_from_indptr(indptr_h: &[i32], page_size: usize) -> usize {
+    indptr_h
+        .windows(2)
+        .filter_map(|w| w[1].checked_sub(w[0]))
+        .map(|pages| pages.max(0) as usize)
+        .max()
+        .unwrap_or(0)
+        .saturating_mul(page_size)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_mixed_token_ids_with_handoff(
     ctx: &DeviceContext,
@@ -319,6 +329,7 @@ impl BatchDecodeBuffers {
         max_batch_size: usize,
         num_qheads: usize,
         max_total_pages: usize,
+        include_hd128_split_workspace: bool,
     ) -> usize {
         // Buffers in BatchDecodeBuffers::new:
         //   4×hidden_dim (hidden_out, normed, embedding_out, o_buf)
@@ -331,6 +342,16 @@ impl BatchDecodeBuffers {
             .saturating_add(2usize.saturating_mul(kv_dim))
             .saturating_add(3usize.saturating_mul(inter_dim));
 
+        let metadata_bytes = if include_hd128_split_workspace {
+            TileLangDecodeMetadata::device_bytes_with_hd128_decode_workspace(
+                max_batch_size,
+                max_total_pages,
+                num_qheads,
+            )
+        } else {
+            TileLangDecodeMetadata::device_bytes(max_batch_size, max_total_pages, num_qheads)
+        };
+
         bf16_matrix_bytes(activation_dims, max_batch_size)
             .saturating_add(bytes_for::<i32>(max_batch_size)) // argmax_out
             .saturating_add(bytes_for::<f32>(max_batch_size)) // logprobs_gpu
@@ -342,11 +363,7 @@ impl BatchDecodeBuffers {
                 ASYNC_READBACK_SLOTS.saturating_mul(max_batch_size),
             )) // async_logprobs_gpu_slots
             .saturating_add(bytes_for::<i32>(2 * max_batch_size + 1)) // quantized_kv_meta
-            .saturating_add(TileLangDecodeMetadata::device_bytes(
-                max_batch_size,
-                max_total_pages,
-                num_qheads,
-            ))
+            .saturating_add(metadata_bytes)
     }
 
     pub(crate) fn logits_device_bytes(vocab_size: usize, max_batch_size: usize) -> usize {
@@ -413,6 +430,7 @@ impl BatchDecodeBuffers {
         max_batch_size: usize,
         num_qheads: usize,
         max_total_pages: usize,
+        include_hd128_split_workspace: bool,
     ) -> Result<Self> {
         let mut async_argmax_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
         let mut async_logprobs_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
@@ -487,12 +505,16 @@ impl BatchDecodeBuffers {
             async_readback_batch_sizes: vec![0; ASYNC_READBACK_SLOTS],
             next_async_slot: 0,
 
-            metadata: TileLangDecodeMetadata::new(
-                ctx,
-                max_batch_size,
-                max_total_pages,
-                num_qheads,
-            )?,
+            metadata: if include_hd128_split_workspace {
+                TileLangDecodeMetadata::new_with_hd128_decode_workspace(
+                    ctx,
+                    max_batch_size,
+                    max_total_pages,
+                    num_qheads,
+                )?
+            } else {
+                TileLangDecodeMetadata::new(ctx, max_batch_size, max_total_pages, num_qheads)?
+            },
             quantized_kv_meta: ctx
                 .stream
                 .alloc_zeros(2 * max_batch_size + 1)
@@ -1365,6 +1387,8 @@ impl Qwen3Model {
                             .max()
                             .unwrap_or(0);
                         let total_pages = mixed.metadata.indptr_h.last().copied().unwrap_or(0);
+                        let max_kv_tokens =
+                            max_kv_tokens_from_indptr(&mixed.metadata.indptr_h, page_size);
                         ops::tilelang_tc_run_layer(
                             &self.ctx,
                             &mixed.q_batch,
@@ -1385,6 +1409,7 @@ impl Qwen3Model {
                             (b + prefill_count) as i32,
                             max_qlen,
                             total_pages,
+                            max_kv_tokens,
                         )?;
                     }
                     KVFormat::FP8E4M3 | KVFormat::INT8 => {
@@ -1925,6 +1950,8 @@ impl Qwen3Model {
                         .max()
                         .unwrap_or(0);
                     let total_pages = bufs.metadata.indptr_h.last().copied().unwrap_or(0);
+                    let max_kv_tokens =
+                        max_kv_tokens_from_indptr(&bufs.metadata.indptr_h, page_size);
                     ops::tilelang_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,
@@ -1945,6 +1972,7 @@ impl Qwen3Model {
                         batch_size as i32,
                         max_qlen,
                         total_pages,
+                        max_kv_tokens,
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
@@ -2301,6 +2329,8 @@ impl Qwen3Model {
                     // to `max_total_pages`; the per-request walk is
                     // already clamped via KV_indptr.
                     let total_pages = kv_pool.max_total_pages as i32;
+                    let max_kv_tokens =
+                        max_kv_tokens_from_indptr(&bufs.metadata.indptr_h, page_size);
                     ops::tilelang_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,
@@ -2321,6 +2351,7 @@ impl Qwen3Model {
                         batch_size as i32,
                         max_qlen,
                         total_pages,
+                        max_kv_tokens,
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
@@ -2429,7 +2460,7 @@ mod tests {
     #[test]
     fn async_readback_multi_slot_no_loss() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16)?;
+        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false)?;
         let mut slots = Vec::new();
 
         for i in 0..ASYNC_READBACK_SLOTS {
@@ -2467,7 +2498,7 @@ mod tests {
     #[test]
     fn mixed_token_upload_uses_sampled_handoff_for_decode_rows() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16)?;
+        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false)?;
         {
             let mut sampled_dst = bufs.argmax_out.slice_mut(0..2);
             ctx.stream

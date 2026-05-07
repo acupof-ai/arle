@@ -190,6 +190,9 @@ impl ModelForward for Qwen3Model {
             pool.page_size,
             pool.max_total_pages,
         );
+        let include_hd128_split_workspace = ops::tilelang_bf16_split_kv_requested()
+            && pool.format == crate::model::kv_cache::KVFormat::BF16
+            && head_dim == 128;
         super::batch_decode::BatchDecodeBuffers::new(
             &self.ctx,
             self.config.hidden_size,
@@ -199,6 +202,7 @@ impl ModelForward for Qwen3Model {
             max_batch_size,
             num_heads,
             max_pages,
+            include_hd128_split_workspace,
         )
     }
 
@@ -230,6 +234,9 @@ impl ModelForward for Qwen3Model {
             page_size,
             fallback_max_total_pages,
         );
+        let include_hd128_split_workspace = ops::tilelang_bf16_split_kv_requested()
+            && kv_pool_format == crate::model::kv_cache::KVFormat::BF16
+            && self.config.head_dim == 128;
         let decode_context = super::batch_decode::BatchDecodeBuffers::device_bytes(
             self.config.hidden_size,
             q_dim,
@@ -238,6 +245,7 @@ impl ModelForward for Qwen3Model {
             max_batch_size,
             num_heads,
             metadata_max_pages,
+            include_hd128_split_workspace,
         );
         let decode_logits = super::batch_decode::BatchDecodeBuffers::logits_device_bytes(
             self.config.vocab_size,
