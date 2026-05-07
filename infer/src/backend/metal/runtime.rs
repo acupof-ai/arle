@@ -743,14 +743,40 @@ impl MetalQwen35PrefixRuntime {
         prefix_key: &[u32],
         request: &mut ActiveMetalRequest,
     ) -> Result<bool> {
+        let trace = std::env::var("INFER_M_E10_TRACE").is_ok();
         let imported = {
             let Some(snapshot) = self.entries.get(prefix_key).map(|entry| &entry.snapshot) else {
+                if trace {
+                    log::info!(
+                        "m_e10_trace try_import: SKIP entries.get returned None for key.len={} session={:?}",
+                        prefix_key.len(),
+                        &request.session_id,
+                    );
+                }
                 return Ok(false);
             };
-            request
+            if trace {
+                log::info!(
+                    "m_e10_trace try_import: snapshot found key.len={} snapshot.cache_len={} session={:?}",
+                    prefix_key.len(),
+                    snapshot.cache_len,
+                    &request.session_id,
+                );
+            }
+            let result = request
                 .request_state
-                .import_qwen35_prefix_snapshot(snapshot, prefix_key.len())
-                .context("import matched Qwen3.5 prefix snapshot into request state")?
+                .import_qwen35_prefix_snapshot(snapshot, prefix_key.len());
+            match &result {
+                Ok(b) if trace => log::info!(
+                    "m_e10_trace import_qwen35_prefix_snapshot returned Ok({})",
+                    b
+                ),
+                Err(e) if trace => {
+                    log::info!("m_e10_trace import_qwen35_prefix_snapshot returned Err: {e:#}")
+                }
+                _ => {}
+            }
+            result.context("import matched Qwen3.5 prefix snapshot into request state")?
         };
         if imported {
             self.touch(prefix_key);
