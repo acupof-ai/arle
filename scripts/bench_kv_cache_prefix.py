@@ -213,10 +213,20 @@ EVICTION_PROMPTS = [
 
 _PORT = 8200
 _MODEL_PATH = "models/Qwen3-4B"
+_SERVER_URL: str | None = None  # If set, skip subprocess launch; bench against external server (vLLM/SGLang).
+_MODEL_NAME = "default"  # OpenAI v1 'model' field; vLLM/SGLang need actual model path.
 
 
 def _base_url():
+    if _SERVER_URL is not None:
+        return f"{_SERVER_URL.rstrip('/')}/v1/completions"
     return f"http://localhost:{_PORT}/v1/completions"
+
+
+def _stats_url():
+    if _SERVER_URL is not None:
+        return f"{_SERVER_URL.rstrip('/')}/v1/stats"
+    return f"http://localhost:{_PORT}/v1/stats"
 
 
 def send_completion(client: httpx.Client, prompt: str, max_tokens: int = 32) -> tuple[str, float]:
@@ -225,7 +235,7 @@ def send_completion(client: httpx.Client, prompt: str, max_tokens: int = 32) -> 
     resp = client.post(
         _base_url(),
         json={
-            "model": "default",
+            "model": _MODEL_NAME,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -240,8 +250,9 @@ def send_completion(client: httpx.Client, prompt: str, max_tokens: int = 32) -> 
 
 
 def fetch_stats() -> dict | None:
+    """ARLE-only /v1/stats; vLLM/SGLang return 404 — fail silently (caller checks None)."""
     try:
-        resp = httpx.get(f"http://localhost:{_PORT}/v1/stats", timeout=5)
+        resp = httpx.get(_stats_url(), timeout=5)
         if resp.status_code != 200:
             return None
         return {k: v for tok in resp.text.split() if "=" in tok for k, v in [tok.split("=", 1)]}
@@ -251,13 +262,20 @@ def fetch_stats() -> dict | None:
 
 def main():
     import argparse
-    global _PORT, _MODEL_PATH
-    p = argparse.ArgumentParser(description="KV cache long-prefix benchmark")
+    global _PORT, _MODEL_PATH, _SERVER_URL, _MODEL_NAME
+    p = argparse.ArgumentParser(description="KV cache long-prefix benchmark (3-engine: ARLE/vLLM/SGLang)")
     p.add_argument("--model-path", default=_MODEL_PATH)
     p.add_argument("--port", type=int, default=_PORT)
+    p.add_argument("--server-url", default=None,
+                   help="If set, skip ARLE subprocess launch and bench external server "
+                        "(e.g. http://localhost:8000 for vLLM, :8001 for SGLang)")
+    p.add_argument("--model-name", default=_MODEL_NAME,
+                   help="OpenAI v1 'model' field; vLLM/SGLang need actual model path, ARLE uses 'default'")
     args = p.parse_args()
     _PORT = args.port
     _MODEL_PATH = args.model_path
+    _SERVER_URL = args.server_url
+    _MODEL_NAME = args.model_name
 
     print("=" * 70)
     print("KV CACHE PREFIX BENCHMARK")
@@ -265,13 +283,34 @@ def main():
 
     prefix_chars = len(PREFIX)
     est_tokens = prefix_chars // 4
-    print(f"\nModel: {_MODEL_PATH}  Port: {_PORT}")
+    target = _SERVER_URL if _SERVER_URL else f"http://localhost:{_PORT} (ARLE,自启)"
+    print(f"\nModel: {_MODEL_PATH}  Target: {target}  Model name: {_MODEL_NAME}")
     print(f"Prefix length: {prefix_chars} chars (~{est_tokens} estimated tokens)")
     print(f"Number of queries: {len(USER_QUERIES)}")
     print(f"Max tokens per response: 32")
     print()
 
-    print("Starting infer server...")
+    if _SERVER_URL is not None:
+        print(f"--server-url set → skipping ARLE subprocess launch, bench external server")
+        client = httpx.Client()
+        # Health check against external server
+        for attempt in range(15):
+            try:
+                resp = client.post(_base_url(),
+                                   json={"model": _MODEL_NAME, "prompt": "Hi", "max_tokens": 1, "temperature": 0},
+                                   timeout=10.0)
+                if resp.status_code == 200:
+                    print(f"External server ready after {attempt+1}s")
+                    break
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout):
+                pass
+            time.sleep(1)
+        else:
+            print(f"ERROR: External server at {_SERVER_URL} not reachable in 15s")
+            sys.exit(1)
+        server = None
+    else:
+        print("Starting infer server...")
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = "/usr/lib64-nvidia:/usr/local/cuda/lib64"
     server = subprocess.Popen(
@@ -392,9 +431,10 @@ def main():
               f"ttft_p50={stats.get('ttft_p50','?')} tpot_p50={stats.get('tpot_p50','?')}")
 
     print()
-    print("Shutting down server...")
-    server.terminate()
-    server.wait(timeout=10)
+    if server is not None:
+        print("Shutting down server...")
+        server.terminate()
+        server.wait(timeout=10)
     print("Done.")
 
 
