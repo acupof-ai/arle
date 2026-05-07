@@ -1075,6 +1075,7 @@ impl<'a> MetalRequestState<'a> {
                     weights,
                     config,
                     params,
+                    use_kv_pool,
                     &prompt_tokens,
                     max_new_tokens,
                     dflash_runtime,
@@ -3743,6 +3744,7 @@ impl<'a> Qwen35StepDriver<'a> {
         weights: &'a Qwen35MetalWeights,
         config: &'a MetalModelConfig,
         params: &SamplingParams,
+        use_kv_pool: bool,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
         dflash_runtime: Option<(&'static MetalDflashRuntime, &'static MetalModelConfig)>,
@@ -3821,6 +3823,32 @@ impl<'a> Qwen35StepDriver<'a> {
             None
         };
 
+        // M_e.1 P2.0 — when --kv-pool is on, also pre-allocate a
+        // MetalKVPool sized to this request's lifetime token budget.
+        // Pool is constructed but NOT read or written this commit; the
+        // dual-write (P2.1) and kernel cutover (P3.1) wire its
+        // consumers in subsequent commits. DFlash disables the pool
+        // for the same reason Qwen3StepDriver does (its target_state
+        // owns KV directly).
+        let effective_kv_pool = use_kv_pool && dflash_runtime.is_none();
+        let kv_pool = if effective_kv_pool {
+            let n_layers = arch.num_full_attention_layers();
+            let n_kv_heads = config.num_key_value_heads;
+            let head_dim = config.head_dim;
+            Some(
+                MetalKVPool::new(
+                    n_layers,
+                    n_kv_heads,
+                    head_dim,
+                    total_tokens_needed,
+                    super::mlx::Dtype::Bfloat16,
+                )
+                .context("pre-alloc MetalKVPool for Qwen3.5 request state")?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             weights,
             config,
@@ -3831,7 +3859,7 @@ impl<'a> Qwen35StepDriver<'a> {
             mode,
             dflash,
             pending_sampled: None,
-            kv_pool: None,
+            kv_pool,
         })
     }
 
@@ -4201,6 +4229,7 @@ impl<'a> Qwen35StepDriver<'a> {
             self.weights,
             self.config,
             &self.params,
+            false, // replay path doesn't need pool — it just rebuilds prefix state
             prompt_tokens,
             1,
             None,
