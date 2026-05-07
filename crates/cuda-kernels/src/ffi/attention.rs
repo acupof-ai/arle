@@ -538,3 +538,42 @@ tilelang_decode_hd128_decl!(
     tilelang_batch_decode_paged_hd128_q40_kv8_run_cuda,
     tilelang_batch_decode_paged_hd128_q64_kv8_run_cuda,
 );
+
+// M_b.2 — HD128 FP8 KV decode. Different ABI from the BF16 decl: K/V pools
+// come in as `*const u8` (FP8 E4M3 bytes) rather than `*mut Half`, and an
+// extra pair of `*const f32` scale pointers feed per-token / per-kv-head
+// dequant. Keep the macro / spec / build.rs / `.py` `SUPPORTED_HEADS` lists
+// in lockstep — see the BF16 macro comment block above for the contract.
+macro_rules! tilelang_decode_hd128_fp8_decl {
+    ($($name:ident),+ $(,)?) => {
+        unsafe extern "C" {
+            $(
+                #[allow(dead_code)]
+                pub fn $name(
+                    q: *mut Half,
+                    q_indptr: *const i32,
+                    k_pool: *const u8,
+                    v_pool: *const u8,
+                    k_scales: *const f32,
+                    v_scales: *const f32,
+                    kv_indptr: *const i32,
+                    kv_indices: *const i32,
+                    kv_last_page_len: *const i32,
+                    o: *mut Half,
+                    batch_size: i32,
+                    total_q_tokens: i32,
+                    max_qlen: i32,
+                    num_pages: i32,
+                    total_pages: i32,
+                    num_q_heads: i32,
+                    num_kv_heads: i32,
+                    page_size: i32,
+                    sm_scale: f32,
+                    stream: CUstream,
+                ) -> CUresult;
+            )+
+        }
+    };
+}
+
+tilelang_decode_hd128_fp8_decl!(tilelang_batch_decode_paged_hd128_fp8_q32_kv8_run_cuda,);
