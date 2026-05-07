@@ -471,3 +471,93 @@ fn completion_response_exposes_token_ids_when_requested() {
         serde_json::json!([11, 22])
     );
 }
+
+// ============================================================================
+// ELI/nexil compatibility — tool_choice / response_format permissive parsing
+// ============================================================================
+//
+// These hints are accepted as no-ops today (model picks; output is whatever
+// generated). They exist so ELI/nexil chat turns do not 400 on every request.
+// Tests below pin the deserialization surface that downstream G3 wiring will
+// build on.
+
+#[test]
+fn chat_completion_accepts_tool_choice_string_modes() {
+    for mode in ["none", "auto", "required"] {
+        let raw =
+            format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tool_choice":"{mode}"}}"#);
+        let req: ChatCompletionRequest = serde_json::from_str(&raw).unwrap();
+        match req.tool_choice.as_ref() {
+            Some(ToolChoice::Mode(m)) => assert_eq!(m, mode),
+            other => panic!("tool_choice {mode:?} should parse to ToolChoice::Mode, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn chat_completion_accepts_tool_choice_function_form() {
+    let raw = r#"{
+        "messages":[{"role":"user","content":"hi"}],
+        "tool_choice":{"type":"function","function":{"name":"my_tool"}}
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    match req.tool_choice.as_ref() {
+        Some(ToolChoice::Function { kind, function }) => {
+            assert_eq!(kind, "function");
+            assert_eq!(function.name, "my_tool");
+        }
+        other => panic!("expected ToolChoice::Function, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_completion_accepts_response_format_json_object() {
+    let raw = r#"{
+        "messages":[{"role":"user","content":"hi"}],
+        "response_format":{"type":"json_object"}
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    let format = req.response_format.as_ref().unwrap();
+    assert_eq!(format.kind, "json_object");
+    assert!(format.json_schema.is_none());
+}
+
+#[test]
+fn chat_completion_accepts_response_format_json_schema() {
+    let raw = r#"{
+        "messages":[{"role":"user","content":"hi"}],
+        "response_format":{
+            "type":"json_schema",
+            "json_schema":{"name":"x","schema":{"type":"object"}}
+        }
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    let format = req.response_format.as_ref().unwrap();
+    assert_eq!(format.kind, "json_schema");
+    let schema = format.json_schema.as_ref().unwrap();
+    assert_eq!(schema["name"], "x");
+    assert_eq!(schema["schema"]["type"], "object");
+}
+
+#[test]
+fn chat_completion_missing_tool_choice_and_response_format_is_none() {
+    let raw = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    assert!(req.tool_choice.is_none());
+    assert!(req.response_format.is_none());
+}
+
+#[test]
+fn responses_request_accepts_tool_choice_and_response_format() {
+    let raw = r#"{
+        "input":"hi",
+        "tool_choice":"auto",
+        "response_format":{"type":"json_object"}
+    }"#;
+    let req: ResponsesRequest = serde_json::from_str(raw).unwrap();
+    match req.tool_choice.as_ref() {
+        Some(ToolChoice::Mode(m)) => assert_eq!(m, "auto"),
+        other => panic!("expected ToolChoice::Mode(\"auto\"), got {other:?}"),
+    }
+    assert_eq!(req.response_format.as_ref().unwrap().kind, "json_object");
+}
