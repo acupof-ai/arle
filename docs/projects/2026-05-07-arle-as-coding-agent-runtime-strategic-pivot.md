@@ -5,13 +5,26 @@
 
 ## 0. 核心论断(一句话)
 
-**ARLE 不是 generic LLM 服务,是 Rust-native AI 开发工具推理 runtime**(支持
-Cursor / Claude Code / Aider / Continue 这类 coding agent 在 Linux 服务器
-和 Apple Silicon Mac 上跑)。**Defensible moat 是 5 项 capability 的组合**(其中
-2 项已具备,3 项待 land);**单点最强**不是策略目标。**Long-ctx prefill TTFT
-是当前 binding constraint**(agent multi-turn loop 复合受影响);**Prefill CUDA
-Graph capture 必要但不充分**,需与 TileLang HD128 / FP8 paged KV 组合才能闭
-合 4k 缺口。
+**ARLE 是双产品双第一要义**:
+- **推理侧 = Rust-native coding/agent runtime**(支持 Cursor / Claude Code /
+  Aider / Continue),**moat = 5 项 capability 组合**(2 ✓ + 3 plan)。
+- **训练侧 = DSV4 架构 from-scratch repro**(`dsv4-small-repro.md`,~1.05B
+  param dsv4-mini,16GiB 单卡,Muon+AdamW,FP8 dense + BF16 master)。
+
+**两侧战略独立,工程互补**:推理侧 MoE 服务(Qwen3.5-MoE / DeepSeek)和训练侧
+DSV4 共用 mlx-sys / cuda-kernels MoE 路径。
+
+**本文档专注推理侧**;训练侧详见 [`dsv4-small-repro.md`](../plans/dsv4-small-repro.md)。
+
+---
+
+**推理侧核心论断**:**ARLE 不是 generic LLM 服务,是 Rust-native AI 开发工具推
+理 runtime**(支持 Cursor / Claude Code / Aider / Continue 这类 coding agent
+在 Linux 服务器和 Apple Silicon Mac 上跑)。**Defensible moat 是 5 项 capability
+的组合**(其中 2 项已具备,3 项待 land);**单点最强**不是策略目标。**Long-ctx
+prefill TTFT 是当前 binding constraint**(agent multi-turn loop 复合受影响);
+**Prefill CUDA Graph capture 必要但不充分**,需与 TileLang HD128 / FP8 paged KV
+组合才能闭合 4k 缺口。
 
 ## 1. Workload reframing — 谁是真用户
 
