@@ -477,6 +477,60 @@ pub fn fused_mlp_into(
     Ok(())
 }
 
+/// Fully fused single-token MLP for a row-concatenated gate+up projection.
+pub fn fused_mlp_gate_up_into(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    gate_up_proj: &DeviceMatrix,
+    down_proj: &DeviceMatrix,
+    act: &mut DeviceVec,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(gate_up_proj.cols, x.len, "gate_up_proj cols != x len");
+    assert_eq!(
+        gate_up_proj.rows % 2,
+        0,
+        "gate_up_proj rows must be 2 * intermediate_size"
+    );
+    let intermediate_size = gate_up_proj.rows / 2;
+    assert_eq!(
+        down_proj.cols, intermediate_size,
+        "down_proj cols != intermediate_size"
+    );
+    assert_eq!(down_proj.rows, out.len, "down_proj rows != out len");
+    assert_eq!(act.len, intermediate_size, "act len != intermediate_size");
+    anyhow::ensure!(
+        gate_up_proj.is_dense_bf16(),
+        "fused gate_up MLP requires plain BF16 gate_up weights"
+    );
+
+    let hidden_size = x.len;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (gate_up_ptr, _ggu) = gate_up_proj.data.device_ptr(&ctx.stream);
+    let (down_ptr, _gd) = down_proj.data.device_ptr(&ctx.stream);
+    let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let gate_ptr = gate_up_ptr as *const ffi::Half;
+    let up_ptr = unsafe { gate_ptr.add(intermediate_size * hidden_size) };
+
+    unsafe {
+        ffi::fused_mlp_cuda(
+            x_ptr as *const ffi::Half,
+            gate_ptr,
+            up_ptr,
+            down_ptr as *const ffi::Half,
+            act_ptr as *mut ffi::Half,
+            out_ptr as *mut ffi::Half,
+            hidden_size as i32,
+            intermediate_size as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
+}
+
 /// Unfused decode-path MLP with optional LoRA adapters on any of gate/up/down.
 ///
 /// Used when LoRA is active on one or more of gate_proj / up_proj / down_proj,

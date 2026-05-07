@@ -3,7 +3,7 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::Config;
-use crate::model::common::{self, MLP};
+use crate::model::common::{self, MLP as CommonMLP};
 use crate::model::layer_communicator::LayerCommunicator;
 use crate::model_source::ResolvedModelSource;
 use crate::ops;
@@ -12,8 +12,9 @@ use crate::tensor_parallel::ShardingSpec;
 use crate::tensor_parallel::{TpConfig, column_shard};
 use crate::tp::TpLoadContext;
 use crate::weight_loader::{
-    QuantLoadConfig, load_tensor_1d, load_tensor_2d, load_tensor_2d_maybe_quantized_with_config,
-    load_tensor_2d_sharded, precompute_rope, resolve_rope_cache_len,
+    QuantLoadConfig, load_tensor_1d, load_tensor_2d, load_tensor_2d_concat_rows,
+    load_tensor_2d_maybe_quantized_with_config, load_tensor_2d_sharded, precompute_rope,
+    resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -47,7 +48,112 @@ pub(super) struct TransformerBlock {
     pub(super) input_layernorm: DeviceVec,
     pub(super) attention: Attention,
     pub(super) post_attention_layernorm: DeviceVec,
-    pub(super) mlp: common::MLP,
+    pub(super) mlp: Qwen3Mlp,
+}
+
+pub(super) enum Qwen3GateUp {
+    Separate {
+        gate_proj: DeviceMatrix,
+        up_proj: DeviceMatrix,
+    },
+    Fused {
+        gate_up_proj: DeviceMatrix,
+    },
+}
+
+pub(super) struct Qwen3Mlp {
+    pub(super) gate_up: Qwen3GateUp,
+    pub(super) down_proj: DeviceMatrix,
+}
+
+impl Qwen3Mlp {
+    fn from_common(mlp: CommonMLP) -> Self {
+        Self {
+            gate_up: Qwen3GateUp::Separate {
+                gate_proj: mlp.gate_proj,
+                up_proj: mlp.up_proj,
+            },
+            down_proj: mlp.down_proj,
+        }
+    }
+
+    fn from_separate(
+        gate_proj: DeviceMatrix,
+        up_proj: DeviceMatrix,
+        down_proj: DeviceMatrix,
+    ) -> Self {
+        Self {
+            gate_up: Qwen3GateUp::Separate { gate_proj, up_proj },
+            down_proj,
+        }
+    }
+
+    fn from_fused(gate_up_proj: DeviceMatrix, down_proj: DeviceMatrix) -> Self {
+        Self {
+            gate_up: Qwen3GateUp::Fused { gate_up_proj },
+            down_proj,
+        }
+    }
+
+    fn load_with_quant_config(
+        ctx: &DeviceContext,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        prefix: &str,
+        quant: QuantLoadConfig,
+    ) -> Result<Self> {
+        if quant.enabled() || !qwen3_fused_gate_up_enabled() {
+            return Ok(Self::from_common(CommonMLP::load_with_quant_config(
+                ctx, shards, weight_map, prefix, quant,
+            )?));
+        }
+
+        let gate_name = format!("{prefix}.gate_proj.weight");
+        let up_name = format!("{prefix}.up_proj.weight");
+        let down_proj = load_tensor_2d(
+            ctx,
+            shards,
+            weight_map,
+            &format!("{prefix}.down_proj.weight"),
+        )?;
+        let gate_up_proj =
+            load_tensor_2d_concat_rows(ctx, shards, weight_map, &[&gate_name, &up_name])?;
+        Ok(Self::from_fused(gate_up_proj, down_proj))
+    }
+
+    pub(super) fn fused_gate_up(&self) -> Option<&DeviceMatrix> {
+        match &self.gate_up {
+            Qwen3GateUp::Fused { gate_up_proj } => Some(gate_up_proj),
+            Qwen3GateUp::Separate { .. } => None,
+        }
+    }
+
+    pub(super) fn separate_gate_up(&self) -> Option<(&DeviceMatrix, &DeviceMatrix)> {
+        match &self.gate_up {
+            Qwen3GateUp::Separate { gate_proj, up_proj } => Some((gate_proj, up_proj)),
+            Qwen3GateUp::Fused { .. } => None,
+        }
+    }
+
+    pub(super) fn uses_fused_gate_up(&self) -> bool {
+        matches!(self.gate_up, Qwen3GateUp::Fused { .. })
+    }
+}
+
+fn qwen3_fused_gate_up_enabled() -> bool {
+    if std::env::var("INFER_LORA_PATH")
+        .ok()
+        .is_some_and(|path| !path.trim().is_empty())
+    {
+        return false;
+    }
+    match std::env::var("INFER_QWEN3_FUSED_GATE_UP") {
+        Ok(value) => matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// Qwen3 model — weights and config only. Mutable state lives in `Qwen3State`.
@@ -256,7 +362,7 @@ impl Qwen3Model {
                     &names.post_attention_layernorm,
                 )?,
                 mlp: if runtime.tp.is_single() {
-                    MLP::load_with_quant_config(
+                    Qwen3Mlp::load_with_quant_config(
                         &ctx,
                         &shards,
                         &weight_map,
@@ -264,11 +370,10 @@ impl Qwen3Model {
                         quant,
                     )?
                 } else {
-                    MLP {
-                        gate_proj: load_tp_column(&names.mlp_gate_proj, config.intermediate_size)?,
-                        up_proj: load_tp_column(&names.mlp_up_proj, config.intermediate_size)?,
-                        down_proj: load_tp_row(&names.mlp_down_proj, config.intermediate_size)?,
-                    }
+                    let gate_proj = load_tp_column(&names.mlp_gate_proj, config.intermediate_size)?;
+                    let up_proj = load_tp_column(&names.mlp_up_proj, config.intermediate_size)?;
+                    let down_proj = load_tp_row(&names.mlp_down_proj, config.intermediate_size)?;
+                    Qwen3Mlp::from_separate(gate_proj, up_proj, down_proj)
                 },
             };
             layers.push(block);
@@ -420,6 +525,20 @@ impl Qwen3Model {
         }
         let num_layers = self.config.num_hidden_layers;
         let lora = super::lora::load_peft_lora(&self.ctx, lora_path, num_layers)?;
+        if self
+            .layers
+            .iter()
+            .any(|layer| layer.mlp.uses_fused_gate_up())
+            && lora
+                .layers
+                .iter()
+                .any(|layer| layer.gate_proj.is_some() || layer.up_proj.is_some())
+        {
+            anyhow::bail!(
+                "LoRA refuses to attach: fused Qwen3 gate_up MLP weights cannot apply gate/up \
+                 adapters. Set INFER_QWEN3_FUSED_GATE_UP=0 before loading the model."
+            );
+        }
         Ok(self.with_lora(lora))
     }
 
@@ -427,6 +546,12 @@ impl Qwen3Model {
     /// attached or when `layer_idx` is beyond the adapter's coverage.
     pub(super) fn layer_lora(&self, layer_idx: usize) -> Option<&super::lora::LayerLoRA> {
         self.lora.as_ref().and_then(|l| l.layers.get(layer_idx))
+    }
+
+    pub(super) fn uses_fused_gate_up(&self) -> bool {
+        self.layers
+            .first()
+            .is_some_and(|layer| layer.mlp.uses_fused_gate_up())
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
@@ -487,11 +612,7 @@ impl Qwen3Model {
                     let gate = load_tensor_2d_gguf(ctx, gguf, &names.mlp_gate_proj)?;
                     let up = load_tensor_2d_gguf(ctx, gguf, &names.mlp_up_proj)?;
                     let down = load_tensor_2d_gguf(ctx, gguf, &names.mlp_down_proj)?;
-                    MLP {
-                        gate_proj: gate,
-                        up_proj: up,
-                        down_proj: down,
-                    }
+                    Qwen3Mlp::from_separate(gate, up, down)
                 },
             });
 
