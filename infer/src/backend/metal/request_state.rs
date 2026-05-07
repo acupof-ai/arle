@@ -3906,8 +3906,77 @@ impl<'a> Qwen35StepDriver<'a> {
         self.ensure_capacity(self.cache_len + 1)?;
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
         let logits = self.run_step_with_token(&token_arr)?;
+        // M_e.1 P2.2 — when --kv-pool is on, dual-write the just-written
+        // K/V row from the C++ session into the MetalKVPool. This runs
+        // BEFORE cache_len += 1 so we slice column `self.cache_len`
+        // (the column the C++ step just populated). Attention still
+        // reads from the C++ session for correctness; the pool is
+        // populated in parallel and parity-checked in tests.
+        self.dual_write_pool_after_step()?;
         self.cache_len += 1;
         Ok(logits)
+    }
+
+    /// Per-step dual-write hook. No-op when kv_pool is None or the mode
+    /// is not Cpp (Rust mode would dual-write differently — see §7.5
+    /// alternative path notes; that path is currently classified as
+    /// unviable per docs/experience/errors/2026-05-07-qwen35-rust-mode-
+    /// too-slow-for-production.md).
+    fn dual_write_pool_after_step(&mut self) -> Result<()> {
+        if !matches!(&self.mode, Qwen35StepMode::Cpp(_)) {
+            return Ok(());
+        }
+        let Some(pool) = self.kv_pool.as_mut() else {
+            return Ok(());
+        };
+        let Some(cpp_model) = self.weights.cpp_model.as_ref() else {
+            return Ok(());
+        };
+
+        let n_layers = self.arch.num_full_attention_layers();
+        let n_kv_heads = self.config.num_key_value_heads as i32;
+        let head_dim = self.config.head_dim as i32;
+        let kv_dim = n_kv_heads * head_dim;
+        let cache_len = self.cache_len;
+
+        // Reserve one slot for this step before per-layer writes — mirrors
+        // the Qwen3 plain dual-write pattern at request_state.rs ~1789.
+        // pool.write_kv looks up the request_id and writes into the
+        // request's most recently allocated slot, so the alloc must
+        // happen first.
+        pool.alloc_tokens(METAL_REQUEST_STATE_ID, 1)
+            .context("M_e.1 P2.2 pool.alloc_tokens")?;
+
+        for layer_idx in 0..n_layers {
+            let k_full = cpp_model
+                .clone_session_kv(layer_idx as i32, 0)
+                .context("M_e.1 P2.2 clone_session_kv K")?;
+            let v_full = cpp_model
+                .clone_session_kv(layer_idx as i32, 1)
+                .context("M_e.1 P2.2 clone_session_kv V")?;
+
+            // Slice the column the C++ step just wrote (shape
+            // [1, n_kv_heads, 1, head_dim]) and reshape to the flat
+            // `[1, kv_dim]` layout `pool.write_kv` expects.
+            let k_col = super::mlx::slice(
+                &k_full,
+                &[0, 0, cache_len, 0],
+                &[1, n_kv_heads, cache_len + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let v_col = super::mlx::slice(
+                &v_full,
+                &[0, 0, cache_len, 0],
+                &[1, n_kv_heads, cache_len + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let k_flat = super::mlx::reshape(&k_col, &[1, kv_dim]);
+            let v_flat = super::mlx::reshape(&v_col, &[1, kv_dim]);
+
+            pool.write_kv(layer_idx, METAL_REQUEST_STATE_ID, &k_flat, &v_flat)
+                .context("M_e.1 P2.2 pool.write_kv")?;
+        }
+        Ok(())
     }
 
     fn run_step_with_token(&mut self, token_arr: &MlxArray) -> Result<MlxArray> {
