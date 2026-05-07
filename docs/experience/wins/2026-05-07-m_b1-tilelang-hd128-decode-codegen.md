@@ -1,4 +1,4 @@
-# 2026-05-07 · M_b.1 Phase A — TileLang HD128 paged decode kernel codegen
+# 2026-05-07 · M_b.1 — TileLang HD128 paged decode kernel (Phase A + B)
 
 ## Context
 
@@ -60,20 +60,42 @@ Build/typecheck gates:
 - `cargo check --release -p infer --features cuda` ✅ 3m03s (full TileLang regen, all 4 kernels lowered + nvcc-compiled successfully)
 - (gauntlet pending: `cargo clippy --features cuda -- -D warnings`, `cargo check --features cuda,no-cuda`, `cargo check --features metal,no-cuda`, `cargo fmt --all --check`)
 
+## Phase B — dispatch routing (`5004912` → rebased to `45e1d0c`)
+
+`infer/src/ops/attention.rs::tilelang_tc_run_layer` now branches on
+`max_qlen == 1`:
+- pure decode (no varlen Q) → new `tilelang_batch_decode_paged_hd128_q*_kv8_run_cuda`
+- mixed batches (max_qlen > 1) → keep prefill kernel as TC decode alias (the
+  decode kernel's grid drops the Q-tile sweep that mixed batches need)
+
+Verification (Phase B):
+
+- cargo check --release -p infer --features cuda: 2m40s ✅
+- cargo test e2e --features cuda: 18.75s, 1 passed ✅
+- cargo test greedy_consistency --features cuda: 0.00s, 1 passed ✅
+- cargo clippy --release -p infer --features cuda: 2m48s, 0 warnings ✅
+- cargo fmt --all --check ✅
+
+**Track A correctness preserved**: greedy_consistency tests Track A's
+B=1 vs B=3 invariant. The dispatch switch keeps it green; the new
+decode kernel produces bitwise-equivalent outputs to the prefill alias
+for the qlen=1 case (both run the same softmax + page-iter math, just
+the decode kernel's grid drops the unused Q-tile sweep).
+
 ## Bench Status
 
-**`pending-phase-B`** — Phase A is purely additive (new kernels available, no
-runtime dispatch wired). No runtime path changes, so no bench delta is
-expected vs `2a534c4`. Phase B will switch
-`tilelang_tc_run_layer` to dispatch the new HD128 decode kernel when
-`max_qlen == 1` (pure decode, no varlen Q), then run:
+**`pending-bf16-bench`** — code landed for both phases; bench not run yet.
+Run:
 
 ```
 scripts/bench_guidellm.sh m_b1-arle-s48-bf16
 ```
 
-against the BF16 KV path (Phase 1 baseline used FP8 KV; the hand-CUDA
-FP8 hot path will only move with M_b.2).
+against the BF16 KV path. Phase 1 nsys trace used FP8 KV (the production
+hot path), so the BF16 numbers move only the BF16 codepath — expected
+~10-15% per-row decode reduction on that path. The hand-CUDA FP8 decode
+kernel (the 41.6% Phase 1 finding) is M_b.2 territory and will not move
+from this commit.
 
 ## Rule
 
