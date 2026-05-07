@@ -159,17 +159,44 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        let mlp_lora = self.layer_lora(layer_idx).and_then(|ll| {
-            let touches_mlp =
-                ll.gate_proj.is_some() || ll.up_proj.is_some() || ll.down_proj.is_some();
-            if touches_mlp { Some(ll) } else { None }
-        });
-        if let Some(ll) = mlp_lora {
+        let mlp_lora = self.layer_lora(layer_idx);
+        let has_gate_up_lora =
+            mlp_lora.is_some_and(|ll| ll.gate_proj.is_some() || ll.up_proj.is_some());
+        if let Some(gate_up_proj) = layer.mlp.fused_gate_up() {
+            anyhow::ensure!(
+                !has_gate_up_lora,
+                "Qwen3 fused gate_up MLP cannot apply gate/up LoRA in decode; \
+                 set INFER_QWEN3_FUSED_GATE_UP=0 before loading the model"
+            );
+            ops::fused_mlp_gate_up_into(
+                &self.ctx,
+                &bufs.normed,
+                gate_up_proj,
+                &layer.mlp.down_proj,
+                &mut bufs.mlp_act,
+                &mut bufs.mlp_out,
+            )?;
+            if let Some(ad) = mlp_lora.and_then(|ll| ll.down_proj.as_ref()) {
+                ops::apply_lora_gemv_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.mlp_act,
+                    &mut bufs.mlp_out,
+                )?;
+            }
+        } else if let Some(ll) = mlp_lora
+            .filter(|ll| ll.gate_proj.is_some() || ll.up_proj.is_some() || ll.down_proj.is_some())
+        {
+            let (gate_proj, up_proj) = layer
+                .mlp
+                .separate_gate_up()
+                .expect("separate Qwen3 MLP must carry gate/up weights");
             ops::mlp_decode_with_lora_into(
                 &self.ctx,
                 &bufs.normed,
-                &layer.mlp.gate_proj,
-                &layer.mlp.up_proj,
+                gate_proj,
+                up_proj,
                 &layer.mlp.down_proj,
                 ll.gate_proj.as_ref().map(|ad| (&ad.a, &ad.b)),
                 ll.up_proj.as_ref().map(|ad| (&ad.a, &ad.b)),
@@ -179,10 +206,14 @@ impl Qwen3Model {
                 &mut bufs.mlp_out,
             )?;
         } else {
+            let (gate_proj, up_proj) = layer
+                .mlp
+                .separate_gate_up()
+                .expect("non-fused Qwen3 MLP must carry separate gate/up weights");
             ops_backend.fused_mlp_into(
                 &bufs.normed,
-                &layer.mlp.gate_proj,
-                &layer.mlp.up_proj,
+                gate_proj,
+                up_proj,
                 &layer.mlp.down_proj,
                 &mut bufs.mlp_act,
                 &mut bufs.mlp_out,

@@ -175,6 +175,50 @@ pub(crate) fn load_tensor_2d(
     DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
 }
 
+pub(crate) fn load_tensor_2d_concat_rows(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    names: &[&str],
+) -> Result<DeviceMatrix> {
+    anyhow::ensure!(
+        !names.is_empty(),
+        "concat_rows load requires at least one tensor"
+    );
+    let mut rows = 0usize;
+    let mut cols = None;
+    let mut host = Vec::new();
+    for name in names {
+        let tensor = find_tensor(shards, weight_map, name)?;
+        let shape = tensor.shape();
+        anyhow::ensure!(
+            shape.len() == 2,
+            "{name}: expected 2D tensor for concat_rows load, got shape {:?}",
+            shape
+        );
+        let tensor_cols = shape[1];
+        if let Some(expected_cols) = cols {
+            anyhow::ensure!(
+                tensor_cols == expected_cols,
+                "{name}: concat_rows cols mismatch: expected {expected_cols}, got {tensor_cols}"
+            );
+        } else {
+            cols = Some(tensor_cols);
+        }
+        let tensor_rows = shape[0];
+        anyhow::ensure!(
+            tensor.data().len() == tensor_rows * tensor_cols * std::mem::size_of::<bf16>(),
+            "{name}: bf16 matrix byte length mismatch: expected {}, got {}",
+            tensor_rows * tensor_cols * std::mem::size_of::<bf16>(),
+            tensor.data().len()
+        );
+        host.reserve(tensor_rows * tensor_cols);
+        push_bf16_range(tensor.data(), 0, tensor_rows * tensor_cols, &mut host);
+        rows += tensor_rows;
+    }
+    DeviceMatrix::from_host(ctx, &host, rows, cols.unwrap_or(0))
+}
+
 #[allow(dead_code)]
 pub(crate) fn load_tensor_1d_f32_sharded(
     ctx: &DeviceContext,

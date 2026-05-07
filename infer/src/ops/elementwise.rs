@@ -84,6 +84,35 @@ pub(crate) fn silu_mul_batch_into(
     Ok(())
 }
 
+/// Batched SiLU+mul from a fused gate-up buffer.
+///
+/// `gate_up` stores each token row as `[gate, up]`, with
+/// `gate_up.hidden_dim == 2 * out.hidden_dim`.
+pub(crate) fn silu_mul_split_batch_into(
+    ctx: &DeviceContext,
+    gate_up: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(gate_up.hidden_dim, out.hidden_dim * 2);
+    assert_eq!(gate_up.seq_len, out.seq_len);
+
+    let (gate_up_ptr, _ggu) = gate_up.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::silu_mul_fused_cuda(
+            gate_up_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            gate_up.seq_len as i32,
+            out.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
 pub(crate) fn extract_vec(
     ctx: &DeviceContext,

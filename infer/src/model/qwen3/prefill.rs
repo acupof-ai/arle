@@ -30,8 +30,8 @@ struct PrefillBuffers {
     k_batch: HiddenStates,     // kv_dim × seq_len
     v_batch: HiddenStates,     // kv_dim × seq_len
     o_buf: HiddenStates,       // hidden_dim × seq_len (reused for mlp_out)
-    gate_out: HiddenStates,    // inter_dim × seq_len
-    up_out: HiddenStates,      // inter_dim × seq_len
+    gate_out: HiddenStates,    // inter_dim × seq_len, or fused 2×inter_dim × seq_len
+    up_out: HiddenStates,      // inter_dim × seq_len; unused when fused gate/up is active
     act_out: HiddenStates,     // inter_dim × seq_len
     attn_output: HiddenStates, // q_dim × seq_len
     last_hidden: DeviceVec,    // hidden_dim
@@ -46,6 +46,7 @@ impl PrefillBuffers {
         kv_dim: usize,
         inter_dim: usize,
         seq_len: usize,
+        fused_gate_up: bool,
     ) -> Result<Self> {
         let residual_f32 = if std::env::var("INFER_QWEN3_FP32_RESIDUAL").is_ok() {
             Some(
@@ -56,6 +57,11 @@ impl PrefillBuffers {
         } else {
             None
         };
+        let gate_out_dim = if fused_gate_up {
+            inter_dim * 2
+        } else {
+            inter_dim
+        };
         Ok(Self {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
             residual_f32,
@@ -64,7 +70,7 @@ impl PrefillBuffers {
             k_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
             v_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
             o_buf: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            gate_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
+            gate_out: HiddenStates::zeros(ctx, gate_out_dim, seq_len)?,
             up_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, seq_len)?,
@@ -277,7 +283,57 @@ impl Qwen3Model {
             kv_dim,
             self.config.intermediate_size,
             seq_len,
+            self.uses_fused_gate_up(),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_mlp_batch_into(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock,
+        normed: &HiddenStates,
+        gate_out: &mut HiddenStates,
+        up_out: &mut HiddenStates,
+        act_out: &mut HiddenStates,
+        out: &mut HiddenStates,
+        ops_backend: ops::CudaOpsBackend<'_>,
+    ) -> Result<()> {
+        if let Some(gate_up_proj) = layer.mlp.fused_gate_up() {
+            if let Some(ll) = self.layer_lora(layer_idx) {
+                anyhow::ensure!(
+                    ll.gate_proj.is_none() && ll.up_proj.is_none(),
+                    "Qwen3 fused gate_up MLP cannot apply gate/up LoRA; \
+                     set INFER_QWEN3_FUSED_GATE_UP=0 before loading the model"
+                );
+            }
+            ops_backend.linear_batch_into(gate_up_proj, normed, gate_out)?;
+            ops::silu_mul_split_batch_into(&self.ctx, gate_out, act_out)?;
+        } else {
+            let (gate_proj, up_proj) = layer
+                .mlp
+                .separate_gate_up()
+                .expect("separate Qwen3 MLP must carry gate/up weights");
+            ops_backend.linear_batch_into(gate_proj, normed, gate_out)?;
+            ops_backend.linear_batch_into(up_proj, normed, up_out)?;
+            if let Some(ll) = self.layer_lora(layer_idx) {
+                if let Some(ad) = ll.gate_proj.as_ref() {
+                    ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, normed, gate_out)?;
+                }
+                if let Some(ad) = ll.up_proj.as_ref() {
+                    ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, normed, up_out)?;
+                }
+            }
+            ops_backend.silu_mul_batch_into(gate_out, up_out, act_out)?;
+        }
+
+        ops_backend.linear_batch_into(&layer.mlp.down_proj, act_out, out)?;
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.down_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, act_out, out)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn build_paged_prefill_sequences(
@@ -694,29 +750,16 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
-        if let Some(ll) = self.layer_lora(layer_idx) {
-            if let Some(ad) = ll.gate_proj.as_ref() {
-                ops::apply_lora_gemm_add(
-                    &self.ctx,
-                    &ad.a,
-                    &ad.b,
-                    &bufs.normed,
-                    &mut bufs.gate_out,
-                )?;
-            }
-            if let Some(ad) = ll.up_proj.as_ref() {
-                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
-            }
-        }
-        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
-        if let Some(ll) = self.layer_lora(layer_idx) {
-            if let Some(ad) = ll.down_proj.as_ref() {
-                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
-            }
-        }
+        self.forward_mlp_batch_into(
+            layer_idx,
+            layer,
+            &bufs.normed,
+            &mut bufs.gate_out,
+            &mut bufs.up_out,
+            &mut bufs.act_out,
+            &mut bufs.o_buf,
+            ops_backend,
+        )?;
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
@@ -1066,30 +1109,17 @@ impl Qwen3Model {
             )?;
         }
 
-        // 7. MLP: gate + up → act → down → bufs.o_buf (reused for mlp_out; step 5 is done)
-        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
-        if let Some(ll) = self.layer_lora(layer_idx) {
-            if let Some(ad) = ll.gate_proj.as_ref() {
-                ops::apply_lora_gemm_add(
-                    &self.ctx,
-                    &ad.a,
-                    &ad.b,
-                    &bufs.normed,
-                    &mut bufs.gate_out,
-                )?;
-            }
-            if let Some(ad) = ll.up_proj.as_ref() {
-                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
-            }
-        }
-        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
-        if let Some(ll) = self.layer_lora(layer_idx) {
-            if let Some(ad) = ll.down_proj.as_ref() {
-                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
-            }
-        }
+        // 7. MLP: gate/up → act → down → bufs.o_buf (reused for mlp_out; step 5 is done)
+        self.forward_mlp_batch_into(
+            layer_idx,
+            layer,
+            &bufs.normed,
+            &mut bufs.gate_out,
+            &mut bufs.up_out,
+            &mut bufs.act_out,
+            &mut bufs.o_buf,
+            ops_backend,
+        )?;
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 

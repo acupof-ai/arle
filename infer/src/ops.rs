@@ -508,7 +508,8 @@ pub use embedding::{embedding_batch, embedding_decode_into};
 pub use kv_ops::scatter_write_kv;
 #[cfg(feature = "cuda")]
 pub use linear::{
-    apply_lora_gemm_add, apply_lora_gemv_add, fused_mlp_into, gemm, gemv, mlp_decode_with_lora_into,
+    apply_lora_gemm_add, apply_lora_gemv_add, fused_mlp_gate_up_into, fused_mlp_into, gemm, gemv,
+    mlp_decode_with_lora_into,
 };
 #[cfg(feature = "cuda")]
 pub use norm::{
@@ -533,7 +534,9 @@ pub(crate) use attention::{
     tilelang_run_layer_hd256,
 };
 #[cfg(feature = "cuda")]
-pub(crate) use elementwise::{add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into};
+pub(crate) use elementwise::{
+    add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into, silu_mul_split_batch_into,
+};
 #[cfg(feature = "cuda")]
 pub(crate) use linear::{gemm_graphsafe_batched_into, gemm_into, linear};
 #[cfg(feature = "cuda")]

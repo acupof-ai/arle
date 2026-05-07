@@ -203,6 +203,7 @@ impl ModelForward for Qwen3Model {
             num_heads,
             max_pages,
             include_hd128_split_workspace,
+            self.uses_fused_gate_up(),
         )
     }
 
@@ -246,6 +247,7 @@ impl ModelForward for Qwen3Model {
             num_heads,
             metadata_max_pages,
             include_hd128_split_workspace,
+            self.uses_fused_gate_up(),
         );
         let decode_logits = super::batch_decode::BatchDecodeBuffers::logits_device_bytes(
             self.config.vocab_size,
@@ -265,16 +267,22 @@ impl ModelForward for Qwen3Model {
                     max_batch_size,
                     num_heads,
                     metadata_max_pages,
+                    self.uses_fused_gate_up(),
                 )
             } else {
                 0
             };
 
+        let mlp_scratch_factor = if self.uses_fused_gate_up() {
+            4usize
+        } else {
+            3usize
+        };
         let prefill_activation_dims = 4usize
             .saturating_mul(self.config.hidden_size)
             .saturating_add(2usize.saturating_mul(q_dim))
             .saturating_add(2usize.saturating_mul(kv_dim))
-            .saturating_add(3usize.saturating_mul(self.config.intermediate_size));
+            .saturating_add(mlp_scratch_factor.saturating_mul(self.config.intermediate_size));
         // Activation holds the SUM of all packed prefill rows in one step.
         // `step_mixed_launch` / `step_prefill_batch` build a single
         // `PrefillBuffers` whose row count = Σ per-row chunk sizes, capped

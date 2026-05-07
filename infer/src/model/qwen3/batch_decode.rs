@@ -258,6 +258,11 @@ impl MixedBatchBuffers {
         let q_dim = model.config.num_attention_heads * model.config.head_dim;
         let kv_dim = model.config.num_key_value_heads * model.config.head_dim;
         let max_logit_rows = max_logit_rows.max(1);
+        let gate_out_dim = if model.uses_fused_gate_up() {
+            model.config.intermediate_size * 2
+        } else {
+            model.config.intermediate_size
+        };
 
         Ok(Self {
             embedding_out: HiddenStates::zeros(ctx, model.config.hidden_size, max_tokens)?,
@@ -268,7 +273,7 @@ impl MixedBatchBuffers {
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_tokens)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_tokens)?,
             o_buf: HiddenStates::zeros(ctx, model.config.hidden_size, max_tokens)?,
-            gate_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
+            gate_out: HiddenStates::zeros(ctx, gate_out_dim, max_tokens)?,
             up_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
             act_out: HiddenStates::zeros(ctx, model.config.intermediate_size, max_tokens)?,
             // Sized for kept output rows only — see field doc above.
@@ -330,17 +335,20 @@ impl BatchDecodeBuffers {
         num_qheads: usize,
         max_total_pages: usize,
         include_hd128_split_workspace: bool,
+        fused_gate_up: bool,
     ) -> usize {
+        let mlp_scratch_factor = if fused_gate_up { 4usize } else { 3usize };
         // Buffers in BatchDecodeBuffers::new:
         //   4×hidden_dim (hidden_out, normed, embedding_out, o_buf)
         //   3×q_dim      (q_batch, attn_output, q_rot)
         //   2×kv_dim     (k_batch, v_batch)
-        //   3×inter_dim  (gate_out, up_out, act_out)
+        //   3×inter_dim  (gate_out, up_out, act_out), or 4× when fused
+        //                 gate_up keeps a double-width gate_out.
         let activation_dims = 4usize
             .saturating_mul(hidden_dim)
             .saturating_add(3usize.saturating_mul(q_dim))
             .saturating_add(2usize.saturating_mul(kv_dim))
-            .saturating_add(3usize.saturating_mul(inter_dim));
+            .saturating_add(mlp_scratch_factor.saturating_mul(inter_dim));
 
         let metadata_bytes = if include_hd128_split_workspace {
             TileLangDecodeMetadata::device_bytes_with_hd128_decode_workspace(
@@ -382,17 +390,20 @@ impl BatchDecodeBuffers {
         max_logit_rows: usize,
         num_qheads: usize,
         max_total_pages: usize,
+        fused_gate_up: bool,
     ) -> usize {
+        let mlp_scratch_factor = if fused_gate_up { 4usize } else { 3usize };
         // Per-token activation buffers (every row in the mixed batch):
         //   4×hidden_dim (embedding_out, hidden_out, normed, o_buf)
         //   2×q_dim      (q_batch, attn_output)
         //   2×kv_dim     (k_batch, v_batch)
-        //   3×inter_dim  (gate_out, up_out, act_out)
+        //   3×inter_dim  (gate_out, up_out, act_out), or 4× when fused
+        //                 gate_up keeps a double-width gate_out.
         let activation_dims = 4usize
             .saturating_mul(hidden_dim)
             .saturating_add(2usize.saturating_mul(q_dim))
             .saturating_add(2usize.saturating_mul(kv_dim))
-            .saturating_add(3usize.saturating_mul(inter_dim));
+            .saturating_add(mlp_scratch_factor.saturating_mul(inter_dim));
 
         let mut total = bf16_matrix_bytes(activation_dims, max_total_tokens)
             // Logits buffer — sized for kept output rows only (decode rows +
@@ -431,7 +442,13 @@ impl BatchDecodeBuffers {
         num_qheads: usize,
         max_total_pages: usize,
         include_hd128_split_workspace: bool,
+        fused_gate_up: bool,
     ) -> Result<Self> {
+        let gate_out_dim = if fused_gate_up {
+            inter_dim * 2
+        } else {
+            inter_dim
+        };
         let mut async_argmax_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
         let mut async_logprobs_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
         let mut async_argmax_host_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
@@ -470,7 +487,7 @@ impl BatchDecodeBuffers {
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             q_rot: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             o_buf: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
-            gate_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            gate_out: HiddenStates::zeros(ctx, gate_out_dim, max_batch_size)?,
             up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
 
@@ -1462,18 +1479,15 @@ impl Qwen3Model {
                 &mut mixed.normed,
             )?;
 
-            ops_backend.linear_batch_into(
-                &layer.mlp.gate_proj,
+            self.forward_mlp_batch_into(
+                layer_idx,
+                layer,
                 &mixed.normed,
                 &mut mixed.gate_out,
-            )?;
-            ops_backend.linear_batch_into(&layer.mlp.up_proj, &mixed.normed, &mut mixed.up_out)?;
-            ops_backend.silu_mul_batch_into(&mixed.gate_out, &mixed.up_out, &mut mixed.act_out)?;
-
-            ops_backend.linear_batch_into(
-                &layer.mlp.down_proj,
-                &mixed.act_out,
+                &mut mixed.up_out,
+                &mut mixed.act_out,
                 &mut mixed.o_buf,
+                ops_backend,
             )?;
             self.layer_communicator
                 .post_mlp_all_reduce_hidden_states(&mut mixed.o_buf)?;
@@ -2011,30 +2025,16 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // Split gate + up MLP + LoRA + silu_mul + down + LoRA.
-        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
-        if let Some(ll) = self.layer_lora(layer_idx) {
-            if let Some(ad) = ll.gate_proj.as_ref() {
-                ops::apply_lora_gemm_add(
-                    &self.ctx,
-                    &ad.a,
-                    &ad.b,
-                    &bufs.normed,
-                    &mut bufs.gate_out,
-                )?;
-            }
-            if let Some(ad) = ll.up_proj.as_ref() {
-                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
-            }
-        }
-        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
-        if let Some(ll) = self.layer_lora(layer_idx) {
-            if let Some(ad) = ll.down_proj.as_ref() {
-                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
-            }
-        }
+        self.forward_mlp_batch_into(
+            layer_idx,
+            layer,
+            &bufs.normed,
+            &mut bufs.gate_out,
+            &mut bufs.up_out,
+            &mut bufs.act_out,
+            &mut bufs.o_buf,
+            ops_backend,
+        )?;
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
@@ -2427,11 +2427,17 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // 8. Batched MLP: gate + up projections → fused silu_mul → down
-        ops_backend.linear_batch_into(&layer.mlp.gate_proj, &bufs.normed, &mut bufs.gate_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.up_proj, &bufs.normed, &mut bufs.up_out)?;
-        ops_backend.silu_mul_batch_into(&bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops_backend.linear_batch_into(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
+        // 8. Batched MLP: gate/up projections → silu_mul → down
+        self.forward_mlp_batch_into(
+            layer_idx,
+            layer,
+            &bufs.normed,
+            &mut bufs.gate_out,
+            &mut bufs.up_out,
+            &mut bufs.act_out,
+            &mut bufs.o_buf,
+            ops_backend,
+        )?;
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.o_buf)?;
 
@@ -2460,7 +2466,7 @@ mod tests {
     #[test]
     fn async_readback_multi_slot_no_loss() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false)?;
+        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false, false)?;
         let mut slots = Vec::new();
 
         for i in 0..ASYNC_READBACK_SLOTS {
@@ -2498,7 +2504,7 @@ mod tests {
     #[test]
     fn mixed_token_upload_uses_sampled_handoff_for_decode_rows() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false)?;
+        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false, false)?;
         {
             let mut sampled_dst = bufs.argmax_out.slice_mut(0..2);
             ctx.stream
