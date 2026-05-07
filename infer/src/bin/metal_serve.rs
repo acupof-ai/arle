@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
+use infer::backend::metal::scheduler::MetalSchedulerConfig;
 use infer::backend::metal::{
     MetalBackendOptions, MetalDflashOptions, MetalKvDiskOptions, MetalRuntimeLimits,
     spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
@@ -58,6 +59,21 @@ struct Args {
     /// draining an unbounded queue for minutes after the measurement window.
     #[arg(long, default_value_t = 256)]
     max_waiting: usize,
+
+    /// Maximum concurrent requests admitted into the scheduler running set.
+    /// Default 4 historically capped Metal at 4 active slots; raising this
+    /// is the cheapest way to close the throughput gap vs Apple-Silicon
+    /// baselines (mlx-lm continuous batching tolerates the full c=N stream).
+    /// Empirically: c=16 with default cap = 4 leaves 12 requests waiting.
+    #[arg(long, default_value_t = 4)]
+    max_running_requests: usize,
+
+    /// Token budget shared per scheduler tick across decode and prefill.
+    /// Default 512 matches `MetalSchedulerConfig::default()`. Raise for
+    /// long-prompt prefill workloads; lower under tight unified-memory
+    /// pressure.
+    #[arg(long, default_value_t = 512)]
+    max_batch_tokens: usize,
 
     /// Enable Metal DFlash with the given draft model path or HuggingFace repo.
     #[arg(long, value_name = "PATH_OR_REPO")]
@@ -201,12 +217,17 @@ async fn main() -> Result<()> {
     // Both DFlash and non-DFlash traffic now goes through the scheduler
     // runtime. DFlash uses the token-buffer pattern inside Qwen3StepDriver
     // (speculative blocks are transparent to the scheduler).
+    let scheduler_config = MetalSchedulerConfig {
+        max_running_requests: args.max_running_requests,
+        max_batch_tokens: args.max_batch_tokens,
+    };
     let handle: Arc<dyn RequestHandle> = Arc::new(
         spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
             &args.model_path,
             backend_options,
             args.max_waiting,
             metrics.clone(),
+            scheduler_config,
         )
         .with_context(|| {
             format!(
