@@ -393,7 +393,9 @@ impl<M: ModelForward> Scheduler<M> {
         if has_decode {
             let plan = if candidates.is_empty() {
                 StepPlan::Decode
-            } else if self.model.supports_mixed_batch(self.paged_kv_pool.format) {
+            } else if self.deferred_decode_emit.is_none()
+                && self.model.supports_mixed_batch(self.paged_kv_pool.format)
+            {
                 StepPlan::Mixed(candidates)
             } else if self.config.short_prompt_bypass_tokens > 0
                 && candidates.iter().all(|candidate| {
@@ -410,14 +412,16 @@ impl<M: ModelForward> Scheduler<M> {
                 // real single-launch mixed lowering yet.
                 StepPlan::Split(candidates)
             };
-            return route_spec_plan(self.config.spec_enabled, self.config.spec_draft_k, plan);
+            let spec_allowed = self.config.spec_enabled && self.deferred_decode_emit.is_none();
+            return route_spec_plan(spec_allowed, self.config.spec_draft_k, plan);
         }
         let plan = if candidates.is_empty() {
             StepPlan::Idle
         } else {
             StepPlan::Prefill(candidates)
         };
-        route_spec_plan(self.config.spec_enabled, self.config.spec_draft_k, plan)
+        let spec_allowed = self.config.spec_enabled && self.deferred_decode_emit.is_none();
+        route_spec_plan(spec_allowed, self.config.spec_draft_k, plan)
     }
 
     fn logical_decode_rows_for_current_batch(&self) -> Vec<LogicalDecodeRow> {
@@ -631,7 +635,10 @@ impl<M: ModelForward> Scheduler<M> {
                 self.step_prefill_batch(&prefill_candidates);
                 (t.elapsed().as_micros(), 0)
             }
-            (true, false) if self.model.supports_mixed_batch(self.paged_kv_pool.format) => {
+            (true, false)
+                if self.deferred_decode_emit.is_none()
+                    && self.model.supports_mixed_batch(self.paged_kv_pool.format) =>
+            {
                 let t = std::time::Instant::now();
                 self.step_mixed_launch(&prefill_candidates);
                 (0, t.elapsed().as_micros())
@@ -679,13 +686,19 @@ impl<M: ModelForward> Scheduler<M> {
         // `pending_prefill` / `pending_decode` live across loop turns so
         // `run()` can overlap the next round of intake/admission work with GPU
         // compute instead of launching and synchronizing in the same iteration.
-        let readback_us = if self.pending_decode.is_some() {
+        let readback_us = if self.pending_decode.is_some() || self.deferred_decode_emit.is_some() {
             let t = std::time::Instant::now();
             self.step_decode_readback();
             t.elapsed().as_micros()
         } else {
             0
         };
+        if self.pending_decode.is_some() {
+            self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
+            self.metrics
+                .observe_scheduler_step(readback_us as f64 / 1_000_000.0);
+            return;
+        }
 
         let (plan, plan_us) = {
             nvtx_scope!("step_plan");

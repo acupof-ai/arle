@@ -189,6 +189,10 @@ pub trait DecodeContextOps {
     /// enabled for the normal decode path.
     fn force_eager_once(&mut self) {}
 
+    /// Drop model-side GPU sampled-token handoff state for one slot lifecycle
+    /// boundary. Default contexts do not pipeline greedy token IDs on device.
+    fn invalidate_sampled_token_handoff_for_slot(&mut self, _slot_idx: usize) {}
+
     /// Access per-request logprobs computed by the last `sample_batch_greedy` call.
     fn logprobs_host(&self) -> &[f32] {
         &[]

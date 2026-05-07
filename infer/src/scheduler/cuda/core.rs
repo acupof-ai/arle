@@ -14,6 +14,7 @@ use crate::kv_tier::{
     BlockLocation, ClusterSharedBackend, CoordinatorQueueStats, ReadmissionBlock, ReadmissionKey,
     ReadmissionPlan, ReadmissionSource,
 };
+use crate::model::DecodeContextOps;
 use crate::prefix_cache::{
     BlockId, BlockMetadata, BlockMetadataUpdate, BlockSelectionIntent, RadixCache,
 };
@@ -160,6 +161,8 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) stats: SchedulerRuntimeStats,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
+    /// Greedy decode metadata waiting for copy-stream token readback.
+    pub(super) deferred_decode_emit: Option<PendingDecode>,
     /// Pending prefill state for GPU/CPU overlap.
     pub(super) pending_prefill: Option<PendingPrefill>,
     /// Set when T1 cannot make leaf eviction headroom for a GPU demotion.
@@ -734,6 +737,19 @@ impl<M: ModelForward> Scheduler<M> {
         self.request(slot_idx)
             .is_some_and(|req| matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed())
             && !self.slot_is_emit_gated(slot_idx)
+            && !self.deferred_decode_would_reach_max(slot_idx)
+    }
+
+    fn deferred_decode_would_reach_max(&self, slot_idx: usize) -> bool {
+        if !self
+            .deferred_decode_emit
+            .as_ref()
+            .is_some_and(|pending| pending.decode_indices.contains(&slot_idx))
+        {
+            return false;
+        }
+        self.request(slot_idx)
+            .is_some_and(|req| req.generated_tokens.len().saturating_add(1) >= req.max_tokens)
     }
 
     pub(super) fn has_runnable_decode_work(&self) -> bool {
@@ -756,11 +772,19 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn has_pending_gpu_work(&self) -> bool {
-        self.pending_decode.is_some() || self.pending_prefill.is_some()
+        self.pending_decode.is_some()
+            || self.deferred_decode_emit.is_some()
+            || self.pending_prefill.is_some()
     }
 
     pub(super) fn slot_has_pending_gpu_work(&self, slot_idx: usize) -> bool {
         self.pending_decode.as_ref().is_some_and(|pending| {
+            pending.decode_indices.contains(&slot_idx)
+                || pending
+                    .mixed_prefill
+                    .as_ref()
+                    .is_some_and(|mixed| mixed.rows.iter().any(|row| row.slot_idx == slot_idx))
+        }) || self.deferred_decode_emit.as_ref().is_some_and(|pending| {
             pending.decode_indices.contains(&slot_idx)
                 || pending
                     .mixed_prefill
@@ -943,6 +967,9 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn finish_slot(&mut self, slot_idx: usize) {
+        if let Some(decode_ctx) = self.decode_bufs.as_mut() {
+            decode_ctx.invalidate_sampled_token_handoff_for_slot(slot_idx);
+        }
         let request_id = self.request(slot_idx).map(|req| req.id);
         if let Some(req) = self.request_mut(slot_idx) {
             req.pending_finish_reason = None;
