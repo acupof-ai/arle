@@ -263,6 +263,36 @@ array qwen35_moe_block_forward_cpp(
             "qwen35_moe_block_forward: invalid num_experts/top_k");
     }
 
+    // INFER_MOE_TOP_K=N (1..top_k) — runtime knob to reduce active-expert
+    // count below the model's configured top_k. Per the parallel research
+    // subagent (2026-05-07): vllm-mlx ships this as `--moe-top-k` and reports
+    // +7-16% throughput on Qwen3-30B-A3B with ~3% MMLU drop at top_k=6 vs 8.
+    // Cached env probe; clamps to valid range. Env unset = passthrough.
+    {
+        static int env_top_k = -2;
+        if (env_top_k == -2) {
+            const char* v = std::getenv("INFER_MOE_TOP_K");
+            if (v && *v) {
+                int parsed = 0;
+                for (const char* p = v; *p; ++p) {
+                    if (*p < '0' || *p > '9') { parsed = 0; break; }
+                    parsed = parsed * 10 + (*p - '0');
+                }
+                env_top_k = (parsed > 0 && parsed <= top_k) ? parsed : -1;
+                if (env_top_k > 0) {
+                    std::fprintf(stderr,
+                        "INFO MoE top_k overridden to %d via INFER_MOE_TOP_K (model default=%d)\n",
+                        env_top_k, top_k);
+                }
+            } else {
+                env_top_k = -1;
+            }
+        }
+        if (env_top_k > 0) {
+            top_k = env_top_k;
+        }
+    }
+
     const int rank = static_cast<int>(x.ndim());
     if (rank < 2) {
         throw std::invalid_argument(
