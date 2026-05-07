@@ -815,6 +815,7 @@ impl StreamUsageChunk {
 #[serde(untagged)]
 pub(super) enum ToolChoice {
     /// String form: `"none" | "auto" | "required"`.
+    #[allow(dead_code)]
     Mode(String),
     /// Forced function call: `{"type":"function","function":{"name":"..."}}`.
     #[allow(dead_code)]
