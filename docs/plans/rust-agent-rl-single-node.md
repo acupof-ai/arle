@@ -13,7 +13,7 @@ instead of creating a second product boundary.
 
 1. 本文件（任务 + 验收门槛 + 每日颗粒度）
 2. [`docs/projects/agent-rl-self-evolving.md`](../projects/agent-rl-self-evolving.md) — 架构 + Why + 风险
-3. [`docs/research/mni-ml-framework-notes.md`](../research/mni-ml-framework-notes.md) — 参考分析 + 裁剪清单
+3. 上游参考:<https://github.com/mni-ml/framework>(read-only,不 vendor)
 
 > **Current implementation note**
 > 本计划主要描述 Phase 6 的执行路径和目标收敛方向。
@@ -44,7 +44,6 @@ git clone https://github.com/mni-ml/framework /tmp/mni-ml-framework
 
 - **纯只读**参考，不 vendor。
 - 读取顺序：`src/native/src/autograd.rs` → `tensor.rs` → `ops/matmul.rs` → `ops/elementwise.rs` → `ops/reduce.rs` → `ops/norm.rs` → `ops/optimizer.rs`。
-- 每读一个文件，在 `docs/research/mni-ml-framework-notes.md` 对应节里补笔记（本次已完成初版）。
 
 ### 1.3 Feature flag 设计（workspace 级）
 

@@ -29,7 +29,7 @@ identity
 Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on LoRA  →  热切 adapter  →  下一轮 rollout
 ```
 
-**训练端从零写**（参考 [mni-ml/framework](https://github.com/mni-ml/framework)，分析见 [`docs/research/mni-ml-framework-notes.md`](../research/mni-ml-framework-notes.md)），**推理端复用** agent-infer 现有栈（FlashInfer / Triton AOT / Paged KV / Metal runtime）。这是一次 runtime-led 的认知提升 + 产品化工作。
+**训练端从零写**（参考 [mni-ml/framework](https://github.com/mni-ml/framework) 只读,不 vendor），**推理端复用** agent-infer 现有栈（FlashInfer / Triton AOT / Paged KV / Metal runtime）。这是一次 runtime-led 的认知提升 + 产品化工作。
 
 > **Current implementation note**
 > 下文的 workspace / 数据流 / `/v1/train/*` 更多是在定义 **目标架构**。
@@ -273,7 +273,6 @@ crates/
 ## 9. 相关文档
 
 - **执行计划**：[`docs/plans/rust-agent-rl-single-node.md`](../plans/rust-agent-rl-single-node.md)
-- **参考分析**：[`docs/research/mni-ml-framework-notes.md`](../research/mni-ml-framework-notes.md)
 - **Roadmap 入口**：[`ROADMAP.md`](../../ROADMAP.md) → Phase 6
 - **现状（推理侧）**：[`docs/architecture.md`](../architecture.md)、[`docs/codebase-map.md`](../codebase-map.md)
 - **Metal 支线对齐**：[`docs/projects/mlx-backend-roadmap.md`](mlx-backend-roadmap.md)

@@ -420,7 +420,6 @@ Phase 1 SGLang-row close 结论：
 - 父框架：本 ROADMAP P0
 - 父审计：[`2026-04-29-throughput-gap-analysis.md`](2026-04-29-throughput-gap-analysis.md) — K2 (50 tok/s lever)
 - Pipeline map：[`2026-04-29-scheduler-pipeline-map.md`](2026-04-29-scheduler-pipeline-map.md)
-- 父对齐计划：[`../plans/2026-04-23-cuda-decode-sglang-alignment.md`](../plans/2026-04-23-cuda-decode-sglang-alignment.md)
 - 多 GPU 计划：[`../plans/2026-04-28-single-node-multi-gpu.md`](../plans/2026-04-28-single-node-multi-gpu.md) — Phase 3 disagg 的 TP/PP/CP 骨架
 - Tiered KV：[`tiered-kv-cache.md`](tiered-kv-cache.md) — Phase 3 数据通路
 - Bench 协议：[`../bench-and-trace-spec.md`](../bench-and-trace-spec.md)

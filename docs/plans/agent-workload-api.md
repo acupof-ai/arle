@@ -48,8 +48,7 @@ Required properties for every extension:
 Non-goals for this plan:
 
 - No model / scheduler change — admission and retention work belong in
-  follow-up plans (`tiered-kv-hicache-readmission.md`,
-  `runtime-resource-architecture.md`).
+  follow-up plans (`tiered-kv-hicache-readmission.md`).
 - No new transport (no gRPC, no WebSocket).
 - No auth / tenancy model — the bearer-token check stays as-is.
 - No multi-model routing — `served_model_id` validation stays as-is.
