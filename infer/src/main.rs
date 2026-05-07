@@ -272,6 +272,15 @@ async fn main() {
         info!("Tracing configured: {}", tracing.config().summary());
     }
 
+    // Install CUDA Profiler API signal handlers (SIGUSR1=start,
+    // SIGUSR2=stop) so `nsys profile --capture-range=cudaProfilerApi
+    // --capture-range-end=stop` can delimit trace windows reliably.
+    // Per docs/plans/M_nsys-cuda-profiler-api-integration.md.
+    #[cfg(feature = "cuda")]
+    if let Err(e) = install_cuda_profiler_signal_handlers() {
+        log::warn!("install_cuda_profiler_signal_handlers failed: {e}");
+    }
+
     let model_path = args
         .model_path
         .to_str()
@@ -472,6 +481,88 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install CTRL+C handler");
     info!("Shutdown signal received");
+}
+
+/// Install SIGUSR1/SIGUSR2 handlers that drive the CUDA Profiler API
+/// (`cuProfilerStart` / `cuProfilerStop`). Used by `nsys profile
+/// --capture-range=cudaProfilerApi --capture-range-end=stop` to
+/// delimit trace capture exactly to a benchmark window — works
+/// reliably across all workload shapes, where the legacy
+/// `--delay`/`--duration` timing fails on low-density CUDA-Graph
+/// long-context workloads.
+///
+/// Usage:
+/// ```bash
+/// nsys profile --output trace --trace cuda,nvtx,osrt \
+///   --capture-range=cudaProfilerApi --capture-range-end=stop \
+///   target/release/infer ...
+///
+/// # In another shell, after server is ready:
+/// kill -USR1 $(pgrep -f 'target/release/infer')   # start capture
+/// # ... run bench ...
+/// kill -USR2 $(pgrep -f 'target/release/infer')   # stop capture
+/// ```
+///
+/// Per `docs/plans/M_nsys-cuda-profiler-api-integration.md`. The
+/// signal handler is dormant until SIGUSR1 fires, so production
+/// deployments pay zero runtime cost.
+#[cfg(feature = "cuda")]
+fn install_cuda_profiler_signal_handlers() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
+    let mut sigusr2 = signal(SignalKind::user_defined2())?;
+
+    tokio::spawn(async move {
+        // The signal handler runs on a tokio worker thread that does NOT
+        // have a CUDA context bound by default. cuProfilerStart/Stop
+        // require a current context, so acquire the device-0 primary
+        // context handle and bind it to this thread before calling.
+        // This handle increments the primary context refcount which
+        // CUDA already maintains for the main scheduler thread, so it
+        // is safe to bind concurrently.
+        let ctx_for_handler = match cudarc::driver::CudaContext::new(0) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log::warn!(
+                    "CUDA profiler signal handler could not acquire context: {e} \
+                     — SIGUSR1/SIGUSR2 disabled this run"
+                );
+                return;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                _ = sigusr1.recv() => {
+                    if let Some(ref ctx) = ctx_for_handler
+                        && let Err(e) = ctx.bind_to_thread()
+                    {
+                        log::warn!("CUDA profiler bind_to_thread (start) failed: {e}");
+                        continue;
+                    }
+                    match cudarc::driver::profiler_start() {
+                        Ok(()) => info!("cuProfilerStart fired (nsys capture begin)"),
+                        Err(e) => log::warn!("cuProfilerStart failed: {e}"),
+                    }
+                }
+                _ = sigusr2.recv() => {
+                    if let Some(ref ctx) = ctx_for_handler
+                        && let Err(e) = ctx.bind_to_thread()
+                    {
+                        log::warn!("CUDA profiler bind_to_thread (stop) failed: {e}");
+                        continue;
+                    }
+                    match cudarc::driver::profiler_stop() {
+                        Ok(()) => info!("cuProfilerStop fired (nsys capture end)"),
+                        Err(e) => log::warn!("cuProfilerStop failed: {e}"),
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
