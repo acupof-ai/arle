@@ -466,15 +466,16 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         self.forward_prefill_batch(requests, states, paged_kv_pool)
     }
 
-    /// Complete a previously launched async batched prefill and release any
-    /// temporary buffers that had to stay alive until the queued GPU work
-    /// finished.
+    /// Complete a previously launched async batched prefill if its device work
+    /// is ready. Returns `false` when the batch is still in flight, leaving the
+    /// context-owned temporary buffers alive for a later poll.
     fn complete_prefill_batch(
         &self,
         _states: &mut [Self::State],
         _prefill_ctx: &mut Self::PrefillContext,
-    ) -> Result<()> {
-        Ok(())
+        _slot_indices: &[usize],
+    ) -> Result<bool> {
+        Ok(true)
     }
 
     /// Batched paged prefill: process multiple prefill requests in one scheduler step.

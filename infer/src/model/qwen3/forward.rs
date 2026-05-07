@@ -208,7 +208,7 @@ impl ModelForward for Qwen3Model {
         _prefill_budget_tokens: usize,
         _pool: &PagedKVPool,
     ) -> Result<Self::PrefillContext> {
-        Ok(Qwen3PrefillContext::new())
+        Qwen3PrefillContext::new(&self.ctx)
     }
 
     fn scheduler_runtime_workspace_bytes(&self, budget: SchedulerRuntimeWorkspaceBudget) -> usize {
@@ -386,8 +386,9 @@ impl ModelForward for Qwen3Model {
         &self,
         _states: &mut [Self::State],
         prefill_ctx: &mut Self::PrefillContext,
-    ) -> Result<()> {
-        prefill_ctx.complete(&self.ctx)
+        slot_indices: &[usize],
+    ) -> Result<bool> {
+        prefill_ctx.complete(slot_indices)
     }
 
     fn select_token(
