@@ -803,6 +803,48 @@ impl StreamUsageChunk {
 }
 
 // ============================================================================
+// Shared OpenAI-compatible request hints
+// ============================================================================
+
+/// OpenAI `tool_choice`. Accepted permissively to unblock client tool-loops
+/// (ELI/nexil send this on every chat turn). Current runtime behavior is to
+/// ignore the hint — the model picks. Wiring this into admission / sampler
+/// (e.g. honoring `"none"` to suppress tool emission, or forcing a specific
+/// function) is tracked as agent-workload-api.md G3 follow-up.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub(super) enum ToolChoice {
+    /// String form: `"none" | "auto" | "required"`.
+    Mode(String),
+    /// Forced function call: `{"type":"function","function":{"name":"..."}}`.
+    #[allow(dead_code)]
+    Function {
+        #[serde(rename = "type")]
+        kind: String,
+        function: ToolChoiceFunction,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct ToolChoiceFunction {
+    #[allow(dead_code)]
+    pub(super) name: String,
+}
+
+/// OpenAI `response_format`. Accepted permissively; the hint is currently a
+/// no-op (the model returns whatever it generates). Constrained decoding for
+/// `json_object` / `json_schema` is tracked as G3 follow-up.
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct ResponseFormat {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub(super) kind: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(super) json_schema: Option<serde_json::Value>,
+}
+
+// ============================================================================
 // /v1/chat/completions — request
 // ============================================================================
 
@@ -832,6 +874,14 @@ pub(super) struct ChatCompletionRequest {
     /// Tool definitions (OpenAI format).
     #[serde(default)]
     pub(super) tools: Vec<OpenAiToolDefinition>,
+    /// Tool selection hint. Accepted but currently a no-op — see [`ToolChoice`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(super) tool_choice: Option<ToolChoice>,
+    /// Output format hint. Accepted but currently a no-op — see [`ResponseFormat`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(super) response_format: Option<ResponseFormat>,
     /// Optional client-supplied session/conversation identifier.
     ///
     /// See [`CompletionRequest::session_id`] for the routing contract.
@@ -1139,6 +1189,14 @@ pub(super) struct ResponsesRequest {
     pub(super) seed: Option<u64>,
     #[serde(default)]
     pub(super) tools: Vec<OpenAiToolDefinition>,
+    /// Tool selection hint. Accepted but currently a no-op — see [`ToolChoice`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(super) tool_choice: Option<ToolChoice>,
+    /// Output format hint. Accepted but currently a no-op — see [`ResponseFormat`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(super) response_format: Option<ResponseFormat>,
     #[serde(default, alias = "user")]
     pub(super) session_id: Option<String>,
     /// Optional Phase 2 speculative decode override. P2.2 parses and carries

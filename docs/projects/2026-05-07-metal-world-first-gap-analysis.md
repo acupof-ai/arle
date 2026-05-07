@@ -151,6 +151,24 @@ Our current single-request Qwen3.5-0.8B MLX 4bit on M4 Pro 20c is
 **305.5 tok/s** at `1024/256` step-driver
 ([`mlx-backend-roadmap.md`](mlx-backend-roadmap.md)).
 
+## Delta footnote — 2026-05-07 (later same day)
+
+A second research pass narrowed to the past 7 days surfaced one
+release that changes flavor (not order) of the Tier B priorities:
+
+- **oMLX v0.3.9.dev1** (2026-05-06) shipped DeepSeek V4 plumbing,
+  **native MTP for Qwen 3.5 / 3.6 on Apple Silicon**, and an SSD
+  prefix-cache tier. Source:
+  <https://github.com/jundot/omlx/releases>.
+- Implication: Tier B #2 (MTP / EAGLE spec-decode default for Qwen3.5)
+  now has a public Apple-Silicon reference implementation with native
+  MTP, not just MTPLX's prototype. The bar for "world #1 on Metal MTP"
+  rose; the priority order does not change but the reference target
+  for our verifier integration is now oMLX, not the older MTPLX repo.
+
+mlx, mlx-lm, mistral.rs, llama.cpp Metal, vllm-mlx kernel surfaces had
+no new releases in the 7-day window. Tier-A ranking stands.
+
 ## Sources
 
 Kernel track: `ml-explore/mlx#2228`, `MTPLX`, `ddtree-mlx`,
