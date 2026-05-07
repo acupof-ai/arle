@@ -49,9 +49,12 @@ Codex authored the scaffolding in `998bfee` (bundled commit — see
 NVTX call sites placed at the 7 anchors named in the M3.6 plan:
 `step_total`, `step_admission`, `step_plan`,
 `step_mixed_launch_retract`, `step_decode_kernel_launch`,
-`step_prefill_kernel_launch`, `step_dispatch_emits`. These match
-the runbook's "Step 2" expected-share table verbatim, so trace
-reading needs no translation step.
+`step_prefill_kernel_launch`, `step_dispatch_emits`. Codex review
+then caught one missing high-conc path: direct mixed launches call
+`forward_mixed_batch` and bypass both `launch_decode_batch_from_tokens`
+and `step_prefill_batch`, so `step_mixed_kernel_launch` was added
+before the scaffold shipped. The runbook now treats that as an
+explicit range.
 
 ## Note on commit attribution
 
@@ -77,7 +80,10 @@ the link from M3.6 Phase 1 → this entry → `998bfee` files.
 - `cargo check --release -p infer --no-default-features --features cuda,metal,no-cuda` — clean.
 - `NVCC_CCBIN=/usr/bin/g++-14 ... cargo check --release -p infer --features cuda` — clean.
 - `cargo clippy --release ... -- -D warnings` (cuda + no-cuda + metal,no-cuda variants) — clean.
-- `codex review --uncommitted` — "No staged, unstaged, or untracked changes are present in the workspace, so there is no patch to review and no introduced issues to flag" (review fired post-commit so saw an empty diff).
+- `codex review --uncommitted` — first pass found P2 missing mixed-launch
+  coverage; fixed with `step_mixed_kernel_launch` before `998bfee` shipped.
+  A later post-commit review saw an empty diff because the commit had already
+  landed.
 
 ## Bench Status
 
