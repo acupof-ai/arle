@@ -34,6 +34,28 @@ namespace {
 
 using mlx::core::array;
 
+// M_e.4 — Compiled SwiGLU: `silu(gate) * up = (gate * sigmoid(gate)) * up`.
+// Replaces the per-call 3-op {sigmoid, multiply, multiply} chain with one
+// shapeless-compiled kernel, dropping the encoder primitive count by 2 per
+// SwiGLU invocation. With 40 layers × 2 SwiGLU sites/layer (switch experts +
+// shared expert) that's ~160 fewer primitives encoded per Qwen3.6 step.
+// Mirrors the analogous helper in `mlx_qwen35_model.cpp:compiled_swiglu` —
+// kept file-local here so this TU doesn't depend on Qwen3.5 internals.
+std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
+    auto gate = inputs[0];
+    auto up = inputs[1];
+    return {(gate * mlx::core::sigmoid(gate)) * up};
+}
+
+auto& compiled_swiglu() {
+    static auto fn = mlx::core::compile(swiglu_impl, /*shapeless=*/true);
+    return fn;
+}
+
+inline array swiglu(const array& gate, const array& up) {
+    return compiled_swiglu()({gate, up})[0];
+}
+
 struct SortedSwitchInputs {
     array x;
     array indices;
@@ -65,8 +87,9 @@ array quantized_swiglu(const array& x,
                        int group_size, int bits) {
     auto gate = qmm(x, gate_w, gate_s, gate_b, group_size, bits);
     auto up   = qmm(x, up_w,   up_s,   up_b,   group_size, bits);
-    // silu(gate) * up
-    auto h = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate)), up);
+    // M_e.4: silu(gate) * up via compiled-shapeless kernel — saves 2
+    // encoded primitives vs the manual {sigmoid, multiply, multiply} chain.
+    auto h = swiglu(gate, up);
     return qmm(h, down_w, down_s, down_b, group_size, bits);
 }
 
@@ -151,10 +174,10 @@ array switch_glu_forward(
         x5, up_w, up_s, /*biases=*/up_b,
         std::nullopt, idx, true, group_size, bits, "affine", do_sort);
 
-    // silu(gate) * up
-    auto h = mlx::core::multiply(
-        mlx::core::multiply(x_gate, mlx::core::sigmoid(x_gate)),
-        x_up);
+    // M_e.4: silu(gate) * up via compiled-shapeless kernel — saves 2
+    // encoded primitives per call (this is the per-layer SwitchGLU site,
+    // hit 40 times per Qwen3.6 step).
+    auto h = swiglu(x_gate, x_up);
 
     auto y = mlx::core::gather_qmm(
         h, down_w, down_s, /*biases=*/down_b,
