@@ -133,6 +133,26 @@ Current use:
 These are applied before model load and affect the whole process-local MLX
 allocator state.
 
+### `MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` (MLX upstream)
+
+Tune MLX's per-command-buffer commit cadence. Defaults vary by Apple
+Silicon tier (40/40 on base/pro, 50/50 on Max/Ultra) — see
+`mlx/backend/metal/device.cpp:498-522`. **Recommended for any Metal
+bench at c≥8**: export `MLX_MAX_OPS_PER_BUFFER=200
+MLX_MAX_MB_PER_BUFFER=200`. With Qwen3.6 MoE forward at c≥8, the MLX
+defaults force 4–5 implicit `commandBuffer.commit()` per decode step;
+boosting them collapses the cliff at c=8→c=10. Per
+[`docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md`](research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md)
+technique #2.
+
+```bash
+MLX_MAX_OPS_PER_BUFFER=200 \
+MLX_MAX_MB_PER_BUFFER=200 \
+./target/release/metal_serve \
+  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
+  --port 8765 --max-running-requests 16
+```
+
 ### `AGENT_INFER_GDR_METAL_KERNEL`
 
 Influence Metal GDR kernel path selection.
@@ -314,10 +334,23 @@ Default: `python3`
 
 Override model path for infer-side GPU tests.
 
+**Backend defaults**:
+- **Metal**: `mlx-community/Qwen3.6-35B-A3B-4bit` (canonical, see
+  `AGENTS.md` §"Metal canonical model"). Use `INFER_TEST_MODEL_PATH`
+  to opt down to a smaller model for fast iteration on dense-only
+  paths.
+- **CUDA**: `models/Qwen3-4B` (canonical for CUDA bench/test scripts).
+
 Example:
 
 ```bash
+# CUDA — use a smaller model for a quick e2e test:
 INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+
+# Metal — bench the canonical Qwen3.6 35B-A3B MoE:
+./target/release/metal_serve \
+  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
+  --port 8765 --max-running-requests 16
 ```
 
 ### `INFER_E2E_MODEL_PATH`

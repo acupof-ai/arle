@@ -197,7 +197,11 @@ class DirectHttpBenchmark:
 async def main():
     parser = argparse.ArgumentParser(description="Direct HTTP benchmark for ARLE")
     parser.add_argument("--url", default="http://localhost:8080", help="Server base URL")
-    parser.add_argument("--model", default="Qwen3.5-0.8B", help="Model name")
+    parser.add_argument(
+        "--model",
+        default="Qwen3.6-35B-A3B-4bit",
+        help="Model name (Metal canonical per AGENTS.md)",
+    )
     parser.add_argument("--concurrency", type=int, default=4, help="Concurrent requests")
     parser.add_argument("--duration", type=int, default=60, help="Duration in seconds")
     parser.add_argument("--output", help="Output JSON file")

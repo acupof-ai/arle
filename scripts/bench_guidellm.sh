@@ -111,6 +111,10 @@ BACKEND_KWARGS='{"validate_backend": "/v1/models", "request_format": "/v1/comple
 # ------------------------------------------------------------------------------
 
 TARGET="http://localhost:8000"
+# Default model is CUDA-canonical (Qwen3-4B). On Metal, AGENTS.md
+# "Metal canonical model" requires Qwen3.6 globally — pass
+# `--model mlx-community/Qwen3.6-35B-A3B-4bit
+#  --processor mlx-community/Qwen3.6-35B-A3B-4bit` for any Metal run.
 MODEL="Qwen/Qwen3-4B"
 # Local path used for tokenizer lookup during synthetic prompt generation.
 # If the HF name isn't in the local HF cache, the synthetic_text dataset

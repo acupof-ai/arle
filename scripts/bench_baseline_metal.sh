@@ -9,7 +9,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Default parameters
 LABEL="${1:-baseline-$(date +%Y%m%d-%H%M%S)}"
-MODEL="${MODEL:-models/Qwen3.5-0.8B}"
+# Metal canonical model — see AGENTS.md "Metal canonical model".
+MODEL="${MODEL:-mlx-community/Qwen3.6-35B-A3B-4bit}"
 CONCURRENCY="${CONCURRENCY:-16}"
 DURATION="${DURATION:-300}"
 WARMUP="${WARMUP:-30}"

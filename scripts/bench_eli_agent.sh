@@ -21,7 +21,7 @@
 # Usage:
 #   ./scripts/bench_eli_agent.sh <label>
 #   ./scripts/bench_eli_agent.sh <label> --mode openai-direct
-#   ./scripts/bench_eli_agent.sh <label> --port 8000 --model models/Qwen3.5-0.8B
+#   ./scripts/bench_eli_agent.sh <label> --port 8000 --model mlx-community/Qwen3.6-35B-A3B-4bit
 #   ./scripts/bench_eli_agent.sh <label> --keep-server   # leave infer running on exit
 #   ./scripts/bench_eli_agent.sh <label> --no-server     # use an already-running infer
 #
@@ -102,7 +102,8 @@ set -euo pipefail
 LABEL=""
 MODE="eli"
 PORT="8765"
-MODEL_PATH="models/default"
+# Default Metal canonical model — see AGENTS.md "Metal canonical model".
+MODEL_PATH="mlx-community/Qwen3.6-35B-A3B-4bit"
 MODEL_ID=""
 SERVER_BIN_OVERRIDE=""
 TRACE_PATH=""

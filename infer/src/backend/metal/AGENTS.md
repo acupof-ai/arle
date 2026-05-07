@@ -5,6 +5,16 @@ live hot path: decode-first continuous batching, chunked prefill, Qwen3.5
 packed decode, and optional DFlash all execute through `runtime.rs`. Load
 before touching any Metal code.
 
+## Canonical model (globally unified, 2026-05-07)
+
+All Metal backend development, benchmarking, and testing uses
+**`mlx-community/Qwen3.6-35B-A3B-4bit`** (MoE). See the project root
+[`AGENTS.md`](../../../AGENTS.md) §"Metal canonical model" for the
+full rationale and opt-out via `INFER_TEST_MODEL_PATH`. Bench helpers
+default to this model; pass `--model
+mlx-community/Qwen3.6-35B-A3B-4bit` explicitly to any bench that
+doesn't (e.g. `bench_guidellm.sh`, which is CUDA-canonical).
+
 ## Refactor posture
 
 - Keep the Metal path simple and uniform. Prefer deletion-style refactors:
