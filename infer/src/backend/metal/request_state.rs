@@ -3065,17 +3065,49 @@ fn decode_qwen35_batch(
     let rope_offsets_data: Vec<i32> = vec![cache_len; states.len()];
     let rope_offsets = MlxArray::from_slice_i32(&rope_offsets_data, &[batch]);
 
-    let logits = cpp_model.step_batch(
-        &token_arr,
-        batch,
-        cache_len,
-        &mut flat_kv,
-        n_kv_per_request,
-        &mut flat_gdr,
-        n_gdr_per_request,
-        None,
-        Some(&rope_offsets),
-    )?;
+    // M_e.1 P3.1c.3c — when --kv-pool is on for ALL states, route
+    // through step_batch_paged. P3.1c.3b's C++ body is identical to
+    // step_batch (new args ignored) so logits stay bit-equal. We pass
+    // EMPTY k_full/v_full arrays here because materializing the
+    // gather_kv call tree per step adds ~24 MLX ops × 256 steps × 4
+    // requests of work (measured: +4 ms ITL, -13% out tok/s) that the
+    // C++ side discards. The atomic commit P3.1c.3d will introduce the
+    // gather + the C++ SDPA flip together so the gather work is paid
+    // only when it's actually consumed.
+    let all_pool = states.iter().all(|s| s.driver.kv_pool.is_some());
+    let any_pool = states.iter().any(|s| s.driver.kv_pool.is_some());
+    if any_pool && !all_pool {
+        bail!("decode_qwen35_batch: mixed --kv-pool ON/OFF states are not supported");
+    }
+    let logits = if all_pool {
+        let mut k_raw: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        let mut v_raw: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        cpp_model.step_batch_paged(
+            &token_arr,
+            batch,
+            cache_len,
+            &mut flat_kv,
+            n_kv_per_request,
+            &mut flat_gdr,
+            n_gdr_per_request,
+            &mut k_raw,
+            &mut v_raw,
+            None,
+            Some(&rope_offsets),
+        )?
+    } else {
+        cpp_model.step_batch(
+            &token_arr,
+            batch,
+            cache_len,
+            &mut flat_kv,
+            n_kv_per_request,
+            &mut flat_gdr,
+            n_gdr_per_request,
+            None,
+            Some(&rope_offsets),
+        )?
+    };
 
     let mut step_outputs: Vec<&MlxArray> = Vec::with_capacity(1 + flat_kv.len() + flat_gdr.len());
     step_outputs.push(&logits);
