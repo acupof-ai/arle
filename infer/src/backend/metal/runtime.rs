@@ -1172,6 +1172,7 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options(
         options,
         max_waiting,
         ServerMetrics::new(&model_id),
+        MetalSchedulerConfig::default(),
     )
 }
 
@@ -1228,6 +1229,7 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
     options: MetalBackendOptions,
     max_waiting: usize,
     metrics: ServerMetrics,
+    scheduler_config: MetalSchedulerConfig,
 ) -> Result<MetalSchedulerHandle> {
     // DFlash is now supported: Qwen3StepDriver's token-buffer pattern runs
     // speculative blocks inside decode_token, transparent to the scheduler.
@@ -1290,7 +1292,7 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
                 rx,
                 &runtime_handle,
                 &metrics,
-                MetalSchedulerConfig::default(),
+                scheduler_config,
             )
         }));
 
