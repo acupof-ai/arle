@@ -1,5 +1,9 @@
 # ARLE 战略 pivot — Rust-native Coding/Agent 推理 runtime
 
+> ⚠️ **SUPERSEDED by [`2026-05-07-arle-master-strategy.md`](./2026-05-07-arle-master-strategy.md)**
+> 本文是早期 pivot 草版,内容已合并到主文档 §1-§7 +§9-§13。**保留作历史**
+> reasoning,任何冲突以主文档为准。
+
 > 2026-05-07 战略全局分析(3 pass review 后定稿)。用户提示:服务核心目标是
 > coding & 通用 agent。重新定义 ARLE 的 product / market / moat / 优先级。
 
