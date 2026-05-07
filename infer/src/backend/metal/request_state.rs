@@ -781,6 +781,15 @@ pub(crate) struct Qwen35PackedDecodeBatch<'a> {
     n_gdr_per_request: i32,
     packed_kv_flat: Vec<MlxArray>,
     packed_gdr_flat: Vec<MlxArray>,
+    /// oMLX-C — multi-step async pipelining. Holds the previous decode
+    /// step's sampled-token MlxArray (kicked off via `async_eval` at the
+    /// end of the previous call). On the next call, this array is used
+    /// directly as the input to `step_batch_packed` (skipping host-side
+    /// `from_slice_i32`) AND its host integers are extracted via `eval`
+    /// AFTER the new step's forward+sample has been async_eval'd —
+    /// overlapping host readback with new-step GPU work.
+    /// `None` until the first decode step has completed.
+    prev_sampled: Option<MlxArray>,
 }
 
 impl<'a> Qwen35PackedDecodeBatch<'a> {
@@ -856,15 +865,24 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
             let old = std::mem::replace(tensor, take_axis(tensor, &index_arr, 0));
             drop(old);
         }
+        // oMLX-C: gather prev_sampled along axis 0 so its shape stays
+        // aligned with the shrunken batch on the next decode step.
+        if let Some(prev) = self.prev_sampled.as_mut() {
+            let old = std::mem::replace(prev, take_axis(prev, &index_arr, 0));
+            drop(old);
+        }
         self.left_padding = row_indices
             .iter()
             .map(|&row| self.left_padding[row])
             .collect();
 
         let mut eval_refs =
-            Vec::with_capacity(self.packed_kv_flat.len() + self.packed_gdr_flat.len());
+            Vec::with_capacity(self.packed_kv_flat.len() + self.packed_gdr_flat.len() + 1);
         eval_refs.extend(self.packed_kv_flat.iter());
         eval_refs.extend(self.packed_gdr_flat.iter());
+        if let Some(prev) = self.prev_sampled.as_ref() {
+            eval_refs.push(prev);
+        }
         let eval_refs: Vec<&MlxArray> = eval_refs.into_iter().collect();
         eval(&eval_refs);
         Ok(())
@@ -1005,6 +1023,12 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
             drop(old);
         }
         self.left_padding.extend(new_left_padding);
+
+        // oMLX-C: admitting new rows changes batch_size; the cached
+        // prev_sampled has the old shape and would mismatch on the
+        // next decode step. Drop it so the next call re-bootstraps
+        // the pipeline at the new shape.
+        self.prev_sampled = None;
 
         let mut eval_refs =
             Vec::with_capacity(self.packed_kv_flat.len() + self.packed_gdr_flat.len());
@@ -2350,6 +2374,7 @@ fn try_build_qwen35_packed_decode_batch<'a>(
         n_gdr_per_request,
         packed_kv_flat,
         packed_gdr_flat,
+        prev_sampled: None,
     }))
 }
 
@@ -2425,6 +2450,23 @@ fn phase_timing_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("INFER_PHASE_TIMING").is_ok())
 }
 
+// oMLX-C — multi-step async pipelining feature flag.
+// Set INFER_OMLX_C=1 to enable the pipelined c≥2 decode path that
+// overlaps prev-step host readback with current-step forward+sample
+// kernels. Default off — falls back to today's sync-per-step path.
+// See docs/plans/M_e1-omlx-c-multi-step-pipelining.md.
+#[inline(always)]
+fn omlx_c_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("INFER_OMLX_C").is_ok())
+}
+
+// oMLX-C path probe — fires once when the pipelined branch (prev_sampled
+// is Some) is first taken. Confirms via log that the flag is wired AND
+// the pipeline path is actually exercised.
+static OMLX_C_PIPELINE_PROBE: std::sync::Once = std::sync::Once::new();
+
 fn decode_qwen35_packed_batch<'a>(
     states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
     batch: &mut Qwen35PackedDecodeBatch<'a>,
@@ -2442,6 +2484,16 @@ fn decode_qwen35_packed_batch<'a>(
 
     let phase_timing = phase_timing_enabled();
     let t0 = phase_timing.then(std::time::Instant::now);
+
+    // oMLX-C — pipelined c≥2 path (env-gated).
+    // Diverts to the pipelined helper when (a) the flag is set AND
+    // (b) we have a stashed `prev_sampled` from a previous call.
+    // The first call after batch construction always falls through
+    // to the legacy path, which now also stashes `new_sampled` so the
+    // second call can pipeline.
+    if omlx_c_enabled() && batch.prev_sampled.is_some() {
+        return decode_qwen35_packed_batch_pipelined(states, batch, phase_timing, t0);
+    }
 
     if batch.batch_cache_len > 0 && batch.batch_cache_len % KV_CACHE_CHUNK == 0 {
         clear_metal_cache();
@@ -2546,6 +2598,7 @@ fn decode_qwen35_packed_batch<'a>(
 
     batch.batch_cache_len += 1;
 
+    let stash_for_pipeline = omlx_c_enabled();
     let sampled_tokens = if qwen35_can_batch_sample(states) {
         let sampled = gpu_sample_token_batched(&logits, &states[0].driver.params);
         eval(&[&sampled]);
@@ -2556,7 +2609,14 @@ fn decode_qwen35_packed_batch<'a>(
             states.len(),
             sampled_i32.len()
         );
-        sampled_i32.into_iter().map(|token| token as u32).collect()
+        let tokens: Vec<u32> = sampled_i32.into_iter().map(|token| token as u32).collect();
+        // oMLX-C: stash sampled MlxArray for next call's pipelined path.
+        // Only the batch_sample fast path supports pipelining; the per-row
+        // fallback below would require concatenating per-row arrays first.
+        if stash_for_pipeline {
+            batch.prev_sampled = Some(sampled);
+        }
+        tokens
     } else {
         let mut sampled_arrays = Vec::with_capacity(states.len());
         for (row_idx, state) in states.iter().enumerate() {
@@ -2639,6 +2699,213 @@ fn decode_qwen35_packed_batch<'a>(
         let t_end = std::time::Instant::now();
         log::info!(
             "metal_phase_timing batch={} cache_len={} prep_us={} build_graph_us={} async_eval_kickoff_us={} sample_us={} pool_dual_write_us={} total_us={}",
+            states.len(),
+            batch.batch_cache_len,
+            t_prep.duration_since(t0).as_micros(),
+            t_built.duration_since(t_prep).as_micros(),
+            t_async.duration_since(t_built).as_micros(),
+            t_sampled.duration_since(t_async).as_micros(),
+            t_end.duration_since(t_sampled).as_micros(),
+            t_end.duration_since(t0).as_micros(),
+        );
+    }
+
+    Ok(sampled_tokens_out)
+}
+
+/// oMLX-C — pipelined c≥2 decode step.
+///
+/// Mirrors mlx-lm's `GenerationBatch._step` (mlx_lm/generate.py:1320-1378):
+/// uses the previous step's sampled-token MlxArray as the forward input
+/// (skipping host-side `from_slice_i32`), kicks off the new step's
+/// forward+sample via `async_eval`, then `eval`s the previous step's
+/// sample to extract host integers — overlapping the host readback with
+/// the new step's GPU kernels.
+///
+/// Returns the previous step's sampled tokens (which mlx-lm calls
+/// `inputs.tolist()`). Each scheduler call thus receives one new token
+/// per state, matching the legacy contract — the off-by-one is hidden
+/// inside `decode_qwen35_packed_batch`'s bootstrap fallthrough on the
+/// first call.
+///
+/// Caller invariants (verified by `decode_qwen35_packed_batch`):
+/// - `omlx_c_enabled() == true`
+/// - `batch.prev_sampled.is_some()`
+/// - `batch.prev_sampled.shape() == [batch.batch_size()]`
+fn decode_qwen35_packed_batch_pipelined<'a>(
+    states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
+    batch: &mut Qwen35PackedDecodeBatch<'a>,
+    phase_timing: bool,
+    t0: Option<std::time::Instant>,
+) -> Result<Vec<u32>> {
+    OMLX_C_PIPELINE_PROBE.call_once(|| {
+        log::info!(
+            "metal_path_probe: oMLX-C pipelined step FIRED (decode_qwen35_packed_batch_pipelined)"
+        );
+    });
+
+    if batch.batch_cache_len > 0 && batch.batch_cache_len % KV_CACHE_CHUNK == 0 {
+        clear_metal_cache();
+    }
+
+    batch.ensure_capacity_for_states(states, batch.batch_cache_len + 1);
+
+    // Use prev_sampled as forward input. Take ownership; new sampled will
+    // replace it before return so this is safe to take().
+    let token_arr = batch
+        .prev_sampled
+        .take()
+        .context("oMLX-C pipelined path requires prev_sampled to be set")?;
+
+    debug_assert_eq!(
+        token_arr.shape().first().copied().unwrap_or(0),
+        i32::try_from(states.len()).unwrap_or(-1),
+        "oMLX-C prev_sampled shape mismatch with batch size",
+    );
+
+    let needs_mask = batch.left_padding.iter().any(|&pad| pad != 0);
+    let mask_opt: Option<MlxArray> = if needs_mask {
+        Some(super::mlx::build_varlen_decode_mask(
+            &batch.left_padding,
+            batch.batch_cache_len,
+        ))
+    } else {
+        None
+    };
+
+    let rope_offsets_data: Vec<i32> = batch
+        .left_padding
+        .iter()
+        .map(|&pad| batch.batch_cache_len - pad)
+        .collect();
+    let rope_offsets = MlxArray::from_slice_i32(
+        &rope_offsets_data,
+        &[i32::try_from(rope_offsets_data.len())
+            .context("oMLX-C pipelined rope offsets overflow")?],
+    );
+
+    let cpp_model = batch
+        .weights
+        .cpp_model
+        .as_ref()
+        .context("oMLX-C pipelined path requires the compiled Qwen3.5 path")?;
+    let t_prep = phase_timing.then(std::time::Instant::now);
+
+    let logits = cpp_model.step_batch_packed(
+        &token_arr,
+        i32::try_from(states.len()).context("oMLX-C pipelined batch size overflow")?,
+        batch.batch_cache_len,
+        &mut batch.packed_kv_flat,
+        batch.n_kv_per_request,
+        &mut batch.packed_gdr_flat,
+        batch.n_gdr_per_request,
+        mask_opt.as_ref(),
+        Some(&rope_offsets),
+    )?;
+    let t_step_built = phase_timing.then(std::time::Instant::now);
+
+    // Build new sampled MlxArray BEFORE async_eval so we can include
+    // it in the same kickoff as logits + KV.
+    if !qwen35_can_batch_sample(states) {
+        // Per-row fallback doesn't pipeline today; reseat prev_sampled
+        // and fall back to the legacy sync path. The caller (legacy path)
+        // will then run with prev_sampled = None on next call.
+        batch.prev_sampled = None;
+        return Err(anyhow::anyhow!(
+            "oMLX-C pipelined path requires batch-sample mode; fell back"
+        ));
+    }
+    let new_sampled = gpu_sample_token_batched(&logits, &states[0].driver.params);
+
+    let mut eval_refs: Vec<&MlxArray> =
+        Vec::with_capacity(2 + batch.packed_kv_flat.len() + batch.packed_gdr_flat.len());
+    eval_refs.push(&new_sampled);
+    eval_refs.push(&logits);
+    eval_refs.extend(batch.packed_kv_flat.iter());
+    eval_refs.extend(batch.packed_gdr_flat.iter());
+    async_eval(&eval_refs);
+    let t_async_eval = phase_timing.then(std::time::Instant::now);
+
+    // Eval prev step's sampled (= our token_arr). It was async_eval'd at
+    // the end of the previous decode call; while host built this step's
+    // graph + dispatched the new async_eval, GPU has been running the
+    // prev step's forward+sample. eval() blocks for whatever's left.
+    eval(&[&token_arr]);
+    let extracted_i32 = token_arr.as_slice_i32();
+    ensure!(
+        extracted_i32.len() == states.len(),
+        "oMLX-C pipelined expected {} extracted tokens, got {}",
+        states.len(),
+        extracted_i32.len()
+    );
+    let extracted: Vec<u32> = extracted_i32.into_iter().map(|t| t as u32).collect();
+
+    let logits_shape = logits.shape().to_vec();
+    ensure!(
+        !logits_shape.is_empty()
+            && logits_shape[0]
+                == i32::try_from(states.len()).context("oMLX-C pipelined batch shape overflow")?,
+        "oMLX-C pipelined expected batched logits, got shape {:?}",
+        logits_shape
+    );
+
+    batch.batch_cache_len += 1;
+
+    let mut sampled_tokens_out = Vec::with_capacity(states.len());
+    for (row_idx, (state, token)) in states.iter_mut().zip(&extracted).enumerate() {
+        state.driver.cache_len = batch.batch_cache_len - batch.left_padding[row_idx];
+        state.driver.kv_capacity = batch.kv_capacity;
+        state.record_sampled_token(*token)?;
+        sampled_tokens_out.push(*token);
+    }
+    let t_sampled = phase_timing.then(std::time::Instant::now);
+
+    // Stash new_sampled for next call's pipeline.
+    batch.prev_sampled = Some(new_sampled);
+
+    // Pool dual-write — same logic as the legacy path.
+    let new_col = batch.batch_cache_len - 1;
+    for (row_idx, state) in states.iter_mut().enumerate() {
+        let n_full = state.driver.arch.num_full_attention_layers();
+        let n_kv_heads = state.driver.config.num_key_value_heads as i32;
+        let head_dim = state.driver.config.head_dim as i32;
+        let kv_dim = n_kv_heads * head_dim;
+        let row_i32 = i32::try_from(row_idx).context("oMLX-C pipelined row idx overflow")?;
+        let Some(pool) = state.driver.kv_pool.as_mut() else {
+            continue;
+        };
+        pool.alloc_tokens(METAL_REQUEST_STATE_ID, 1)
+            .context("oMLX-C pool.alloc_tokens")?;
+        for layer_idx in 0..n_full {
+            let k_full = &batch.packed_kv_flat[2 * layer_idx];
+            let v_full = &batch.packed_kv_flat[2 * layer_idx + 1];
+            let k_col = super::mlx::slice(
+                k_full,
+                &[row_i32, 0, new_col, 0],
+                &[row_i32 + 1, n_kv_heads, new_col + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let v_col = super::mlx::slice(
+                v_full,
+                &[row_i32, 0, new_col, 0],
+                &[row_i32 + 1, n_kv_heads, new_col + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let k_flat = super::mlx::reshape(&k_col, &[1, kv_dim]);
+            let v_flat = super::mlx::reshape(&v_col, &[1, kv_dim]);
+            pool.write_kv(layer_idx, METAL_REQUEST_STATE_ID, &k_flat, &v_flat)
+                .context("oMLX-C pool.write_kv")?;
+        }
+        pool.flush();
+    }
+
+    if phase_timing
+        && let (Some(t0), Some(t_prep), Some(t_built), Some(t_async), Some(t_sampled)) =
+            (t0, t_prep, t_step_built, t_async_eval, t_sampled)
+    {
+        let t_end = std::time::Instant::now();
+        log::info!(
+            "metal_phase_timing_pipelined batch={} cache_len={} prep_us={} build_graph_us={} async_eval_kickoff_us={} sample_us={} pool_dual_write_us={} total_us={}",
             states.len(),
             batch.batch_cache_len,
             t_prep.duration_since(t0).as_micros(),
