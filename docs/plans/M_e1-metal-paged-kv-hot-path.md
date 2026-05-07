@@ -102,10 +102,25 @@ default of 4 stays until commit 5 lands.
 - Concat path stays as the `--kv-pool=false` fallback for one release.
 - Effort: **L**. Touches: `metal/qwen35.rs`, `metal/runtime.rs`,
   possibly `crates/mlx-sys/src/mlx_qwen35_model.cpp`.
-- Bench: this is the unlock. Expect c=8 ITL ≤ 25 ms (vs current 40
-  ms), c=16 ITL ≤ 30 ms (vs current 82 ms), output tok/s at c=16
-  ≥ 300 (vs current 78). Acceptance: ≥ 2× output tok/s vs c=4
-  baseline at c=16 same workload.
+- Bench acceptance — **tightened 2026-05-07** per c=1 isolation
+  decomposition
+  ([`2026-05-07-bench-guidellm-metal-c1-isolation-decomposition.md`](../experience/wins/2026-05-07-bench-guidellm-metal-c1-isolation-decomposition.md)):
+  the c=4 long-context ITL gap algebraically decomposes into 1.29×
+  per-token kernel × 2.09× ARLE-specific batching multiplier; this
+  commit kills the 2.09× factor. Targets:
+  - **c=4 ITL p50 ≤ 9.3 ms** (was 19.34 ms; target = ARLE c=1 long
+    ITL of 4.37 ms × mlx-lm-style 2.12 batching multiplier).
+  - **c=16 ITL p50 ≤ 12 ms** (was 82.49 ms; target = ARLE c=1 long
+    ITL × extrapolated mlx-lm ~2.7 multiplier).
+  - **c=16 output tok/s ≥ 350** (was 78; target ≥ 75% of mlx-lm
+    c=16's 467 tok/s).
+  - c=1 baseline must NOT regress: ITL p50 stays within 1.05× of
+    today's 4.37 ms (paged-KV write/read overhead must be sub-5%
+    on single-stream).
+  - Original conservative numbers (35 ms / 300 tok/s) baked in the
+    wrong "2.7× per-token kernel" assumption that the morning's
+    apples-to-apples wins entry surfaced and the c=1 isolation
+    entry refuted.
 
 ### Commit 5 — flip default `max_running_requests` from 4 to 16
 
@@ -135,10 +150,16 @@ default of 4 stays until commit 5 lands.
 - `cargo test -p infer --lib` continues at 556+ passing post-each-
   commit (no scheduler regressions).
 - `--fast` bench `metal-m-paged-kv-c16` after commit 4 vs the recorded
-  c-sweep baseline:
-  - output tok/s c=16 ≥ 300 (was 78)
-  - ITL p95 c=16 ≤ 35 ms (was 84 ms)
-  - peer with mlx-lm c=16 within ±10% on output tok/s
+  c-sweep baseline (numbers tightened 2026-05-07 evening per c=1
+  isolation decomposition):
+  - output tok/s c=16 ≥ **350** (was 78; ≥ 75% of mlx-lm c=16 467)
+  - ITL p50 c=16 ≤ **12 ms** (was 82.49 ms)
+  - ITL p95 c=16 ≤ **15 ms** (was 84 ms)
+  - peer with mlx-lm c=16 within ±25% on output tok/s
+- c=1 isolation regression gate (matched-A/B against pre-commit
+  baseline): c=1 long-context ITL p50 stays ≤ 1.05× of pre-commit
+  4.37 ms — paged-KV write/read overhead must not show up on
+  single-stream.
 - `cargo check -p infer --no-default-features --features cuda,no-cuda`
   remains green throughout (CUDA-Rust drift gate; no CUDA hot-path
   changes are introduced by this plan).
