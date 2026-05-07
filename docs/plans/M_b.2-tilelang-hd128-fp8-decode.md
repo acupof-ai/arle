@@ -9,6 +9,29 @@
 > avg 4.55 ms × 4 104 calls,
 > [`fdb531b`](../experience/wins/2026-05-07-m3.6-phase1-nsys-arle-s48-highconc.md)).
 
+## Priority & ROI(retroactive per memory rule 2026-05-07)
+
+**Current rank: P2** (was implicitly P1 in earlier draft; demoted after honest comparison).
+
+| Track | Cost | ROI evidence | Negative case |
+|---|---|---|---|
+| **P0 Mixed-path race fix** (codex M3.9 follow-up) | est 6-10h | Re-enable Mixed at long-ctx kills the 2-launch fallback that was driving most of the 10× tax (`28056b9` finding). H2 attention KV scaling explains ~3× of the 10× ([`f5d0fd8`](../experience/wins/2026-05-07-split-tax-h2-attention-kv-scaling.md)). The remaining 3.34× residual is what Mixed re-enable should reclaim. **Predicted long-ctx TTFT 4961→~1900ms = -60%**, ground-truthed against `4a3612b` measurement. | Race re-fix introduces a new token-loss path that escapes greedy_consistency. |
+| **P1 M3.9 instrumentation** (codex active) | landing | Dispatches the race fix — without `engine_prefill_path_stats` we don't know which fallback condition is firing in production traffic. | Pure observability; only ROI is unblocking P0. |
+| **P2 M_b.2 A1 numerical diff + B dispatch** (this plan) | 8-13h | Targets 41.6% Phase 1 GPU time. ARLE hand-CUDA path uses `__nv_fp8_e4m3` PTX (1-cycle cast); TileLang `T.cast(fp8_e4m3fn, "float32")` lowering is unverified and **may be slower**. Per-row decode upside is unknown; lifted from `~10-15% on BF16 path` extrapolation, which is a weak basis. | TileLang FP8 cast lowers to a longer instruction sequence than hand-CUDA → kernel regresses. Net wall-clock could go from -8% (best) to **+4%** (worst, regression). |
+| **P3 M_b.2 A2 multi-split** | +8-12h | Required for KV>4096 long-ctx FP8 dispatch (single-split overflows shared mem). Without A2, A1+B can only ship for short-ctx. | Same kernel-perf risk as A1; multiplies code surface. |
+| **P3 M_e.1 Metal KV pool** | est 4-6h | Metal-only ROI; current Metal bench shows ARLE wins TTFT, loses ITL ([`6afa417`](../experience/wins/...)). KV pool wiring affects ITL. | Metal is not the production main battleground (RTX 4070Ti is). |
+
+**Evaluation basis** (the numbers above are not hand-waved):
+
+- Phase 1 nsys trace `fdb531b`:`decode_attention_varlen_quantized_partial<128, 1, 0>` = 41.6% wall, 4.55 ms × 4104 calls.
+- split-step pure-prefill 15.4 µs/token vs split 154 µs/token (`4a3612b`) → 10× tax.
+- H2 math:avg attended KV 1024 (chunk-1) vs 3071 (chunk-2) → 3× attention work explains ~3× of 10×, residual 3.34× was the Mixed-disable fallback (per `28056b9`).
+- vLLM s14 control 614 tok/s vs ARLE 462 tok/s @ s48 = 75.1% of vLLM (gap = 33%).
+
+**Kill criteria for M_b.2 A1**:if numerical diff vs hand-CUDA passes (which it should, by construction) but a-b microbench shows the TileLang FP8 kernel is ≥ hand-CUDA wall time, **abandon A2/B and document why**. M_b.2 A0 (`c865f4b`) stays in repo as research artifact.
+
+**Trigger to start A1**:Mixed-path race fix + M3.9 instrumentation has landed AND `engine_prefill_path_stats` shows the FP8 path is still on hand-CUDA hot path (i.e., the 41.6% target hasn't been displaced by a different fix). Don't bench against an unstable baseline.
+
 ## P0 — what currently runs
 
 `crates/cuda-kernels/csrc/attention/decode_attention_varlen_fp8.cu`
