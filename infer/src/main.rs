@@ -12,7 +12,7 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
-use infer::scheduler::{DraftMode, SchedulePolicy, SchedulerConfig};
+use infer::scheduler::{DraftMode, SchedulePolicy, SchedulerConfig, SchedulerMixedPolicy};
 use infer::server_engine::EnginePoolModelSpec;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
@@ -114,6 +114,11 @@ struct Args {
     /// no-ops.
     #[arg(long, default_value = "fcfs")]
     schedule_policy: String,
+
+    /// Decode-active prefill policy: `split` keeps production prefill+decode
+    /// launches separate; `mixed` opts into the experimental single mixed launch.
+    #[arg(long, default_value = "split")]
+    scheduler_mixed_policy: String,
 
     /// SGLang-compatible streaming interval in generated tokens.
     #[arg(long, default_value_t = 1)]
@@ -565,6 +570,8 @@ fn kv_mode_candidates(
 fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig {
     let schedule_policy =
         SchedulePolicy::parse(&args.schedule_policy).unwrap_or_else(|err| panic!("{err}"));
+    let mixed_policy = SchedulerMixedPolicy::parse(&args.scheduler_mixed_policy)
+        .unwrap_or_else(|err| panic!("{err}"));
     let spec_draft_model =
         parse_draft_mode(&args.spec_draft_model).unwrap_or_else(|err| panic!("{err}"));
     // `chunked_prefill_size` / `max_prefill_tokens` are not plugged into the
@@ -581,6 +588,7 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
         },
         prefix_cache_enabled: !args.disable_radix_cache,
         schedule_policy,
+        mixed_policy,
         stream_interval: args.stream_interval,
         spec_enabled: args.spec_enabled,
         spec_draft_k: args.spec_draft_k,
