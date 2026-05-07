@@ -598,6 +598,24 @@ impl MetalKVPool {
         Ok((k_gathered, v_gathered))
     }
 
+    /// Force async-eval the pool's internal K/V tensors so per-step
+    /// dual-write doesn't accumulate an unbounded slice_update chain.
+    /// Each `write_kv` call appends a lazy `slice_update(self.k_pool[L],
+    /// row, ...)` node; without periodic eval, step N pays for N-deep
+    /// graph traversal. Call after batched dual-write each step. Cost
+    /// on Metal unified memory: in-place buffer update, ~free.
+    pub fn flush(&self) {
+        use super::mlx::async_eval;
+        let mut refs: Vec<&MlxArray> = Vec::with_capacity(self.k_pool.len() * 2);
+        for layer in 0..self.k_pool.len() {
+            refs.push(&self.k_pool[layer]);
+            refs.push(&self.v_pool[layer]);
+        }
+        if !refs.is_empty() {
+            async_eval(&refs);
+        }
+    }
+
     /// Number of token slots currently in use across all requests.
     pub fn total_tokens_used(&self) -> usize {
         self.ledger.total_tokens_used()

@@ -2567,6 +2567,53 @@ fn decode_qwen35_packed_batch<'a>(
         sampled_tokens_out.push(token);
     }
 
+    // M_e.1 P3.1c.3a' — per-row pool dual-write on the REAL c≥2 path.
+    // This is decode_qwen35_packed_batch (varlen-aware), the function the
+    // Metal scheduler runtime actually invokes at c≥2. The earlier
+    // P3.1c.3a in decode_qwen35_batch landed on a function the
+    // scheduler never calls — see audit
+    // 2026-05-07-three-layer-audit-miss-c4-real-path-is-packed-batch.md.
+    //
+    // After all writes for this step, pool.flush() forces the lazy
+    // slice_update chain to async-eval; without this, step N pays
+    // for N-deep graph traversal (observed: 4.3× ITL regression
+    // before the flush was added).
+    let new_col = batch.batch_cache_len - 1;
+    for (row_idx, state) in states.iter_mut().enumerate() {
+        let n_full = state.driver.arch.num_full_attention_layers();
+        let n_kv_heads = state.driver.config.num_key_value_heads as i32;
+        let head_dim = state.driver.config.head_dim as i32;
+        let kv_dim = n_kv_heads * head_dim;
+        let row_i32 =
+            i32::try_from(row_idx).context("decode_qwen35_packed_batch row idx overflow")?;
+        let Some(pool) = state.driver.kv_pool.as_mut() else {
+            continue;
+        };
+        pool.alloc_tokens(METAL_REQUEST_STATE_ID, 1)
+            .context("M_e.1 P3.1c.3a' alloc_tokens (packed decode)")?;
+        for layer_idx in 0..n_full {
+            let k_full = &batch.packed_kv_flat[2 * layer_idx];
+            let v_full = &batch.packed_kv_flat[2 * layer_idx + 1];
+            let k_col = super::mlx::slice(
+                k_full,
+                &[row_i32, 0, new_col, 0],
+                &[row_i32 + 1, n_kv_heads, new_col + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let v_col = super::mlx::slice(
+                v_full,
+                &[row_i32, 0, new_col, 0],
+                &[row_i32 + 1, n_kv_heads, new_col + 1, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let k_flat = super::mlx::reshape(&k_col, &[1, kv_dim]);
+            let v_flat = super::mlx::reshape(&v_col, &[1, kv_dim]);
+            pool.write_kv(layer_idx, METAL_REQUEST_STATE_ID, &k_flat, &v_flat)
+                .context("M_e.1 P3.1c.3a' pool.write_kv (packed decode)")?;
+        }
+        pool.flush();
+    }
+
     Ok(sampled_tokens_out)
 }
 
