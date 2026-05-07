@@ -21,6 +21,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Prepend repo .venv/bin to PATH so bench_guidellm.sh finds guidellm
+# (parity with bench_guidellm.sh's documented "PATH=.venv/bin:$PATH"
+# requirement, see docs/experience/errors/...m3-guidellm-bench-stuck.md).
+if [[ -x "${REPO_ROOT}/.venv/bin/guidellm" ]]; then
+    export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+fi
+
+# nsys CUPTI injection files default to /tmp/nvidia/nsight_systems/...
+# These can grow to 5GB+ during long-ctx captures and exhaust the
+# /tmp tmpfs (16G on this host). Redirect to ${REPO_ROOT}/.nsys-tmp
+# so injection storage lands on the larger /home filesystem.
+NSYS_TMPDIR="${REPO_ROOT}/.nsys-tmp"
+mkdir -p "$NSYS_TMPDIR"
+export TMPDIR="$NSYS_TMPDIR"
+
 LABEL=""
 TARGET="http://localhost:8000"
 MODEL="Qwen/Qwen3-4B"
@@ -179,9 +194,31 @@ until curl -sm 1 "${TARGET}/v1/stats" >/dev/null 2>&1; do
 done
 echo "    ready"
 
-ARLE_PID="$(pgrep -P "$NSYS_PID" -f infer 2>/dev/null | head -1)"
+# nsys may fork-exec the target; PPID isn't always NSYS_PID. Walk
+# the process tree from nsys downward.
+resolve_arle_pid() {
+    local nsys_pid="$1"
+    # Direct children
+    local pid
+    pid="$(pgrep -P "$nsys_pid" -f infer 2>/dev/null | head -1)"
+    if [[ -n "$pid" ]]; then echo "$pid"; return; fi
+    # Grand-children (nsys → launcher → infer)
+    local child
+    for child in $(pgrep -P "$nsys_pid" 2>/dev/null); do
+        pid="$(pgrep -P "$child" -f infer 2>/dev/null | head -1)"
+        if [[ -n "$pid" ]]; then echo "$pid"; return; fi
+    done
+    # Fallback: any infer process listening on our port
+    pid="$(pgrep -af "target/release/infer" 2>/dev/null | grep -v grep | awk '{print $1}' | head -1)"
+    if [[ -n "$pid" ]]; then echo "$pid"; return; fi
+    echo ""
+}
+
+ARLE_PID="$(resolve_arle_pid "$NSYS_PID")"
 if [[ -z "$ARLE_PID" ]]; then
     echo "error: cannot resolve ARLE child PID under nsys $NSYS_PID" >&2
+    echo "       process tree:" >&2
+    pstree -p "$NSYS_PID" 2>&1 | head -10 >&2 || ps -ef | grep -E "nsys|infer" | grep -v grep >&2
     exit 4
 fi
 echo "    ARLE PID: ${ARLE_PID}"

@@ -33,3 +33,4 @@ web/.astro/
 # codex CLI per-session artifact (codex review --uncommitted writes a 0-byte .codex)
 /.codex
 traces/
+.nsys-tmp/
