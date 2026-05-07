@@ -195,7 +195,7 @@ fn rebuild_block_index_round_trips_after_serde() {
     cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
 
     let snapshot = serde_json::to_string(&cache).expect("serialize");
-    let mut restored: RadixCache = serde_json::from_str(&snapshot).expect("deserialize");
+    let mut restored = RadixCache::load_snapshot(&snapshot, &[0; 32]).expect("deserialize");
 
     // Right after deserialize, the index is empty (skip+default).
     assert!(!restored.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
@@ -797,7 +797,7 @@ fn radix_cache_serde_roundtrip_preserves_lookups() {
         "compact + pretty JSON must decode to the same value tree",
     );
 
-    let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+    let mut restored = RadixCache::load_snapshot(&json, &[0; 32]).expect("deserialize RadixCache");
 
     assert_eq!(restored.node_count(), before_node_count);
     assert_eq!(restored.cached_block_count(), before_cached);
@@ -834,7 +834,7 @@ fn reconcile_remaps_known_fingerprints_into_new_pool() {
     );
 
     let json = serde_json::to_string(&cache).expect("serialize RadixCache");
-    let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+    let mut restored = RadixCache::load_snapshot(&json, &[0; 32]).expect("deserialize RadixCache");
     let known = HashMap::from([(fp_a, BlockId(100)), (fp_b, BlockId(200))]);
 
     let report = restored.reconcile(&known);
@@ -858,7 +858,7 @@ fn reconcile_tombstones_fingerprints_missing_in_new_pool() {
     );
 
     let json = serde_json::to_string(&cache).expect("serialize RadixCache");
-    let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+    let mut restored = RadixCache::load_snapshot(&json, &[0; 32]).expect("deserialize RadixCache");
 
     let report = restored.reconcile(&HashMap::from([(fp_a, BlockId(100))]));
 
@@ -907,7 +907,7 @@ fn serde_round_trip_then_reconcile_end_to_end() {
     let json = serde_json::to_string(&cache).expect("serialize RadixCache");
     drop(cache);
 
-    let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+    let mut restored = RadixCache::load_snapshot(&json, &[0; 32]).expect("deserialize RadixCache");
     assert_eq!(restored.logical_clock(), 0);
     assert!(restored.nodes.iter().all(|node| node.ref_count == 0));
     assert!(restored.nodes.iter().all(|node| node.last_access == 0));
