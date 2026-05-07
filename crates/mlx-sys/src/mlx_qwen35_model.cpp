@@ -2006,6 +2006,44 @@ int32_t qwen35_session_end(
 extern "C" int32_t maybe_capture_qwen35_step_begin(void);
 extern "C" void maybe_capture_qwen35_step_end(int32_t started);
 
+// M_e.1 P2.1 — read-only clone accessor for session-owned K/V caches.
+// Used by the Rust side to populate MetalKVPool from the live session
+// without disturbing the existing kv_flat handoff. The mlx::array copy
+// is reference-counted so the clone is O(1) — it shares the underlying
+// buffer with the session until either side mutates.
+int32_t qwen35_compiled_session_kv_clone(
+    void* model,
+    int32_t layer_idx,
+    int32_t kv_axis,
+    mlx_array** out_array
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        if (!m->session_active) {
+            throw std::runtime_error(
+                "qwen35_compiled_session_kv_clone requires an active session");
+        }
+        if (kv_axis != 0 && kv_axis != 1) {
+            throw std::runtime_error(
+                "qwen35_compiled_session_kv_clone: kv_axis must be 0 (K) or 1 (V)");
+        }
+        const int32_t n_kv = static_cast<int32_t>(m->session_kv_caches.size());
+        const int32_t flat_idx = 2 * layer_idx + kv_axis;
+        if (layer_idx < 0 || flat_idx >= n_kv) {
+            throw std::runtime_error(
+                "qwen35_compiled_session_kv_clone: layer_idx out of bounds");
+        }
+        // Shared-buffer copy; cheap.
+        array cloned = m->session_kv_caches[flat_idx];
+        *out_array = from_arr(std::move(cloned));
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
 int32_t qwen35_compiled_step_session(
     void* model,
     mlx_array* token_id,

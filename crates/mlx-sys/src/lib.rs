@@ -700,6 +700,17 @@ unsafe extern "C" {
         cache_pos: i32,
         out_logits: *mut *mut mlx_array,
     ) -> i32;
+    /// M_e.1 P2.1 — clone a layer's session-owned K or V cache out of the
+    /// C++ session for the Rust side. `kv_axis` 0 = K, 1 = V. Returns
+    /// the full cache shape `[1, n_kv_heads, kv_capacity, head_dim]`;
+    /// caller slices the live region. Errors with -1 if no session is
+    /// active or `layer_idx`/`kv_axis` are out of range.
+    pub fn qwen35_compiled_session_kv_clone(
+        model: *mut std::ffi::c_void,
+        layer_idx: i32,
+        kv_axis: i32,
+        out_array: *mut *mut mlx_array,
+    ) -> i32;
     pub fn qwen35_compiled_prefill_session(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,
