@@ -1,5 +1,51 @@
 # 2026-05-07 · Opportunity D pre-survey — submit_prefetch_plan exists but is dead code
 
+## Priority & ROI
+
+**Priority**: P1 (after P0 = M3.9 Phase 1A v3 lands; not parallel to P0).
+
+**ROI basis**:
+- Substrate cost-reduction: zero (`submit_prefetch_plan` already
+  built with backpressure + queue-depth + PlanTicket). Implementation
+  is wiring + 1 helper, ~80 LOC — codex-sized.
+- Expected gain at long-ctx multi-tenant shared-prefix workloads:
+  - Cache HIT bytes (e.g. 6k prefix × 36 layers × hidden × FP8) ≈
+    135 MB H2D
+  - PCIe 4.0 ~32 GB/s → ~144 ms total H2D wait if synchronous
+  - Overlap with prefill of unmatched suffix → ~0 ms wait
+  - **TTFT reduction = ~144 ms per request** in this regime
+- Stacks with M3.9 Phase 1A v3:
+  - 1A v3 alone: long-ctx 8k TTFT 4961 → ~2500 ms
+  - + M_pf (shared-prefix only): TTFT 2500 → ~600 ms
+  - 4× faster than vLLM 2367 ms at this shape
+
+**Negative case**:
+- Single-tenant workloads or no-prefix-share workloads see ZERO
+  benefit (no shared cache to prefetch).
+- Risk of speculative prefetch evicting useful T0 blocks at high
+  pool utilization → degrades non-prefetched requests.
+- Wasted bandwidth if request is cancelled before reaching
+  prefill.
+
+**Kill criteria**:
+- After implementation, bench at the canonical multi-tenant
+  shared-prefix shape (e.g., 4k system prompt + 4 different
+  user queries c=4) shows `< 20% TTFT improvement` → revert
+  the wiring; the cost (extra GPU memory pressure, scheduler
+  complexity) is not worth it.
+- If pool utilization metric shows prefetch routinely evicts
+  T0 blocks within 1 tick of placement → also revert.
+
+**Why this rank vs alternatives**:
+- vs M3.9 Phase 1A v3 (P0): P0 closes a measured 10× tax in a
+  shape ARLE is currently losing. M_pf is opportunistic gain in
+  a niche shape.
+- vs M_b.2 Phase 1 (kernel-axis): bench evidence in `2e60844`
+  shows attention kernel is already fast at batched mode; M_pf
+  addresses a DIFFERENT axis (memory tier transition cost).
+- vs Spec-decode (P2): spec-decode is speculative on acceptance
+  rate; M_pf has deterministic gain for HIT cases.
+
 ## Discovery
 
 While codex implements M3.9 Phase 0 instrumentation, parallel
