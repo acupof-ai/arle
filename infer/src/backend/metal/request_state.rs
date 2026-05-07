@@ -3729,6 +3729,13 @@ struct Qwen35StepDriver<'a> {
     dflash: Option<Qwen35DFlashState>,
     /// Pre-queued sampled token (lazy MlxArray) from the step ahead.
     pending_sampled: Option<MlxArray>,
+    /// M_e.1 P1 plumbing — placeholder for the paged-KV pool. Always
+    /// `None` today (no flag wired); the field exists so subsequent
+    /// commits can land Qwen3.5 dual-write (P2.1) and the kernel
+    /// cutover (P3.1) without churning the struct shape under live
+    /// callers. Mirrors `Qwen3StepDriver.kv_pool`.
+    #[allow(dead_code)]
+    kv_pool: Option<MetalKVPool>,
 }
 
 impl<'a> Qwen35StepDriver<'a> {
@@ -3824,6 +3831,7 @@ impl<'a> Qwen35StepDriver<'a> {
             mode,
             dflash,
             pending_sampled: None,
+            kv_pool: None,
         })
     }
 
