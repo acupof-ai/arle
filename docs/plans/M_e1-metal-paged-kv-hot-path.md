@@ -165,6 +165,87 @@ default of 4 stays until commit 5 lands.
   `cuda_kernels::PagedKVPool`; this plan is the Metal sibling, not a
   unification.
 
+## 7. Errata — 2026-05-07 (post-audit, same day)
+
+A second audit pass after this plan was first committed surfaced two
+substrate-state errors that re-shape commits 1–3. The corrected
+picture is below; commits 4–6 (the actual unlock + cleanup) still
+hold.
+
+### 7.1 What §1 got wrong
+
+§1 claimed `MetalKVPool` is "fully built but unused on the hot path"
+based on a `grep MetalKVPool` of `infer/src/backend/metal/` that
+**missed `request_state.rs`**, where the pool actually IS wired. The
+correct picture:
+
+- `Qwen3StepDriver` (`request_state.rs:3270-3290`) carries
+  `kv_pool: Option<MetalKVPool>`; populated when `use_kv_pool=true`
+  (currently driven by the experimental `--kv-pool` flag for the
+  Qwen3 fallback path per `metal_serve --help`).
+- `decode_qwen3_batch` (`request_state.rs:1787-1856`) ALREADY routes
+  per-step K/V through `pool.write_kv` + `pool.gather_kv` when the
+  pool is present; otherwise falls back to slice-style accumulation.
+- Production default keeps `kv_pool=None` — the pool path exists but
+  is opt-in per `--kv-pool` flag and Qwen3-only.
+
+**§1 of this plan is therefore wrong about the substrate state.** The
+substrate is partially live; the gap is not "wire it up at all" but
+"promote it to the right scope and reach Qwen3.5".
+
+### 7.2 What §3 got wrong
+
+The runtime-level pool allocation (commit 1) and slot-lifecycle plumbing
+(commit 2) were both written assuming greenfield. They aren't:
+
+- **Per-request, not runtime-shared.** `Qwen3StepDriver` constructs
+  its OWN `MetalKVPool::new(...)` (`request_state.rs:3358-3371`).
+  Different drivers don't share the pool — each request pre-allocates
+  its private slot range, and writes use the singleton key
+  `METAL_REQUEST_STATE_ID` (line 1790). This is functionally a
+  per-request linear cache that avoids `concat`-style realloc; it is
+  NOT cross-request paged attention.
+- **`MetalKVPool` API is ALREADY cross-request capable.** Methods
+  take `request_id: usize` as the slot owner. The current per-driver
+  pattern just doesn't use the dimension.
+- **Qwen3.5 packed decode is the actual left-pad source.** The hot
+  path that benches at 82 ms ITL@c=16 is `Qwen35PackedDecodeBatch`
+  (a different code path inside `request_state.rs` and `qwen35.rs`),
+  not `decode_qwen3_batch`.
+
+### 7.3 Corrected commit sequence
+
+Commits 4 and 5 stay as written. Commits 1–3 are reshaped:
+
+- **Commit 1 (revised) — promote `MetalKVPool` from per-driver to
+  runtime-shared.** Move ownership from `Qwen3StepDriver` to the
+  scheduler runtime; each driver borrows the shared pool. Each
+  request gets a real unique `request_id` instead of the singleton
+  `METAL_REQUEST_STATE_ID`. Behavior under `--kv-pool` continues to
+  match Qwen3 today (just with shared backing). Effort: M (was S).
+- **Commit 2 (revised) — slot-lifecycle hooks at scheduler admit /
+  finish.** Same intent as before, but reading from a shared pool
+  using the unique request_id from commit 1. Effort: S (unchanged).
+- **Commit 3 (revised) — Qwen3.5 packed decode dual-write under a
+  new `--kv-pool=qwen35` mode.** This is the real new slice. Make
+  `Qwen35PackedDecodeBatch` write per-step K/V to the shared pool in
+  parallel with the legacy left-pad concat, with a property test
+  that gathered values match the concat slice. Effort: M (was M; same
+  effort, different file).
+- **Commits 4–6 unchanged.** The `gather_kv_rows`-as-attention-input
+  cutover (commit 4), the default flip (commit 5), and the legacy-
+  path retirement (commit 6) all still apply. The acceptance numbers
+  in §3 (output tok/s c=16 ≥ 300, ITL p95 c=16 ≤ 35 ms) still hold.
+
+### 7.4 Lesson for future audits
+
+`grep <Type>` against a single subtree is insufficient for "is this
+type wired?" questions. The audit should grep across `infer/src/` and
+all `crates/` for the type, AND grep for any singleton/magic constants
+that might indicate scoped-but-not-shared usage (e.g.
+`METAL_REQUEST_STATE_ID` here). Logged as a lesson under the next
+session's feedback memory if the pattern recurs.
+
 ## 6. References
 
 - Bench evidence:
