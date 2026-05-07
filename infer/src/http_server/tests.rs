@@ -666,7 +666,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completion_rejects_unsupported_parameter_with_structured_error() {
+    async fn chat_completion_accepts_tool_choice_permissively() {
+        // ELI/nexil sends tool_choice on every chat turn; ARLE accepts it
+        // permissively (no-op for now — see ToolChoice in openai_v1.rs and
+        // agent-workload-api.md G3 for the wiring follow-up). The previous
+        // contract (reject with 400 / invalid_parameter) is reversed here.
         let app = build_app(mock_scheduler("Qwen3-4B"));
         let request = Request::builder()
             .method("POST")
@@ -678,16 +682,17 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "tool_choice must be accepted permissively to unblock ELI/nexil clients"
+        );
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"]["code"], "invalid_parameter");
         assert!(
-            payload["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("tool_choice")),
-            "payload={payload}"
+            payload.get("error").is_none(),
+            "successful response must not carry an error envelope, got {payload}"
         );
     }
 
