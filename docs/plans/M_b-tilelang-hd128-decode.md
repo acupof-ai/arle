@@ -86,14 +86,25 @@ Key design:
 **Replaces**: `decode_attention_varlen_fp8.cu` (the 41.6%-of-GPU
 hot path).
 
-**Expected gain**: closes 51% per-row gap to vLLM. With F4-Big
-(scheduling) AND M_b.2 (kernel) both landed:
-- ARLE per-row: 2.16 ms → 2.16 × (1 - 0.30) × (1 - 0.10) ≈ 1.36 ms
-- ARLE step at batch 38: 1.36 × 38 ≈ 52 ms
-- ARLE out tok/s at s48: 38 / 0.052 = **730 tok/s, ~13% past vLLM 647**
+**Expected gain**: closes per-row gap to vLLM at FP8 production
+shape. **Bench math (corrected 2026-05-07)**:
+- ARLE current high-conc 1k/256/c=64: 843 out tok/s vs vLLM 647 =
+  **+30.3% ALREADY** (post F4-Small + Phase 1A v3 multi-slot ring)
+- High-conc shape is no longer the bottleneck; M_b.2 ROI here is
+  diminishing returns on a leading shape
+- Real M_b.2 ROI candidate: long-ctx 4k/c=4 where ARLE -3.4% vs
+  vLLM out tok/s and TTFT 1.68× slower — but that is a prefill
+  TTFT problem, not decode. M_b.2 (decode kernel) does NOT help
+  TTFT.
+- **Conclusion**: M_b.2 demoted from "world-first parity blocker"
+  to **conditional optimization** post-Phase 0 baseline. Run only
+  if SGLang/TRT-LLM beat ARLE high-conc by more than the F4-Small
+  + Phase 1A v3 substrate margin.
 
-That is the "world-first parity" target; M_b.2 + F4-Big together
-crosses it.
+(Original projection of "730 tok/s" assumed 30% F4-Big + 10% kernel
+multiplicative. F4-Small + Phase 1A v3 already captured most of the
+F4-Big budget and ARLE is now leading vLLM at this shape; M_b.2's
+incremental value depends on actual #2 (likely SGLang/TRT-LLM) gap.)
 
 ## Tasks
 

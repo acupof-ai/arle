@@ -1,4 +1,25 @@
-# M_ibp — In-batch prefix caching (simultaneous-request prefill dedup)
+# M_ibp — In-batch prefix caching (simultaneous-request prefill dedup) — ⛔ ABANDONED
+
+> **2026-05-07 EOD: ABANDONED.** Phase 0 license-or-kill bench
+> (`9432289`) showed ARLE already beats vLLM by **1.80×** at the
+> very multi-tenant shared-prefix workload M_ibp targets:
+>
+> | Engine | TTFT mdn | Out tok/s |
+> |---|---:|---:|
+> | ARLE | 318 ms | 124.0 |
+> | vLLM s8 | 573 ms | 56.6 |
+>
+> The chunk-boundary cascade pattern (sealed-block publish via
+> RadixCache) already covers 80%+ of the in-batch dedup benefit
+> M_ibp would deliver. Adding admission-side simultaneous-request
+> dedup is **+30:1 implementation cost vs marginal benefit** at a
+> shape where ARLE already leads. Per kill-criteria-fired-early
+> rule, M_ibp is closed without coding. Revisit only if a future
+> bench (post-M_world1 Phase 0) shows SGLang/TRT-LLM beat ARLE at
+> this specific multi-tenant shape.
+>
+> Original priority/ROI/design analysis below kept for historical
+> reference; do NOT implement.
 
 > Identified 2026-05-07 from user question "In-batch Prefix Caching
 > has done?". ARLE has cross-request RadixCache (sequential cascade
