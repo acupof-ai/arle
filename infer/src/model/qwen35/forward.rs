@@ -610,10 +610,10 @@ impl ModelForward for Qwen35Model {
         &self,
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
+    ) -> Result<Option<usize>> {
         let logits = match decode_ctx.logits_batch.as_ref() {
             Some(l) if l.seq_len > 0 => l,
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         let batch_size = slot_indices.len();
         crate::ops::argmax_batch_logprob_launch(
@@ -623,13 +623,14 @@ impl ModelForward for Qwen35Model {
             &mut decode_ctx.logprobs_gpu,
             batch_size,
         )?;
-        Ok(true)
+        Ok(Some(0))
     }
 
     fn sample_batch_greedy_readback(
         &self,
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
+        _async_slot_idx: Option<usize>,
     ) -> Result<Option<Vec<u32>>> {
         let batch_size = slot_indices.len();
         self.ctx.sync()?;

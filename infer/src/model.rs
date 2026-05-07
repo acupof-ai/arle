@@ -623,16 +623,17 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         &self,
         _slot_indices: &[usize],
         _decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<Option<usize>> {
+        Ok(None)
     }
 
-    /// Sync + readback after `sample_batch_greedy_launch()`.
-    /// Must only be called after launch returned `true`.
+    /// Poll/read back after `sample_batch_greedy_launch()`.
+    /// Must only be called after launch returned an async slot.
     fn sample_batch_greedy_readback(
         &self,
         _slot_indices: &[usize],
         _decode_ctx: &mut Self::DecodeContext,
+        _async_slot_idx: Option<usize>,
     ) -> Result<Option<Vec<u32>>> {
         Ok(None)
     }

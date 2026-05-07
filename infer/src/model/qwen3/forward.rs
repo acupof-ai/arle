@@ -533,10 +533,10 @@ impl ModelForward for Qwen3Model {
         &self,
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
+    ) -> Result<Option<usize>> {
         let logits = match decode_ctx.logits_batch.as_ref() {
             Some(l) if l.seq_len > 0 => l,
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         let batch_size = slot_indices.len();
         let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
@@ -547,17 +547,21 @@ impl ModelForward for Qwen3Model {
             batch_size,
         )?;
         decode_ctx.stage_sampled_tokens_for_next_step(&self.ctx, slot_indices)?;
-        Ok(true)
+        let async_slot_idx = decode_ctx.start_greedy_readback_async(&self.ctx, batch_size)?;
+        Ok(Some(async_slot_idx))
     }
 
     fn sample_batch_greedy_readback(
         &self,
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
+        async_slot_idx: Option<usize>,
     ) -> Result<Option<Vec<u32>>> {
         let batch_size = slot_indices.len();
-        decode_ctx.start_greedy_readback_async(&self.ctx, batch_size)?;
-        decode_ctx.poll_greedy_readback(batch_size)
+        let Some(async_slot_idx) = async_slot_idx else {
+            anyhow::bail!("Qwen3 greedy readback missing async slot");
+        };
+        decode_ctx.poll_greedy_readback(async_slot_idx, batch_size)
     }
 
     fn prepare_batch_sampling_fallback(
