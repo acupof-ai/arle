@@ -728,6 +728,31 @@ unsafe extern "C" {
         n_full_layers: i32,
         out_logits: *mut *mut mlx_array,
     ) -> i32;
+    /// M_e.1 P3.1c.3b — paged variant of step_batch. Accepts per-state
+    /// per-layer pre-gathered K and V arrays. In P3.1c.3b the new args
+    /// are accepted but ignored; body is identical to step_batch. P3.1c.3c
+    /// will flip C++ SDPA read source on the batched path. The k/v arrays
+    /// are flat `batch_size * n_full_layers` indexed by `b * n_full_layers
+    /// + layer_idx`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_step_batch_paged(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        batch_size: i32,
+        cache_pos: i32,
+        kv_caches: *mut *mut mlx_array,
+        n_kv_per_request: i32,
+        gdr_states: *mut *mut mlx_array,
+        n_gdr_per_request: i32,
+        k_full_per_state: *mut *mut mlx_array,
+        v_full_per_state: *mut *mut mlx_array,
+        n_full_layers: i32,
+        attn_mask: *mut mlx_array,
+        rope_offsets: *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+        out_kv_caches: *mut *mut mlx_array,
+        out_gdr_states: *mut *mut mlx_array,
+    ) -> i32;
     pub fn qwen35_compiled_prefill_session(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,

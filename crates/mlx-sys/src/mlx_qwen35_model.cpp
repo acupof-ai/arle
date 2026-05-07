@@ -2369,6 +2369,122 @@ int32_t qwen35_compiled_step_batch(
     }
 }
 
+// M_e.1 P3.1c.3b — paged-KV variant of step_batch. Accepts per-state
+// per-layer pre-gathered K and V arrays; in P3.1c.3b the new arguments
+// are accepted but ignored (body is identical to step_batch). P3.1c.3c
+// will flip the C++ SDPA read source on the batched path. Symmetric to
+// step_session_paged for c=1.
+int32_t qwen35_compiled_step_batch_paged(
+    void* model,
+    mlx_array* token_ids,
+    int32_t batch_size,
+    int32_t cache_pos,
+    mlx_array** kv_caches,
+    int32_t n_kv_per_request,
+    mlx_array** gdr_states,
+    int32_t n_gdr_per_request,
+    mlx_array** k_full_per_state, // batch_size * n_full_layers entries; nullable
+    mlx_array** v_full_per_state, // batch_size * n_full_layers entries; nullable
+    int32_t n_full_layers,
+    mlx_array* attn_mask,
+    mlx_array* rope_offsets,
+    mlx_array** out_logits,
+    mlx_array** out_kv_caches,
+    mlx_array** out_gdr_states
+) {
+    (void)k_full_per_state; // P3.1c.3c will consume these
+    (void)v_full_per_state;
+    (void)n_full_layers;
+
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (batch_size <= 0) {
+            throw std::runtime_error("qwen35_compiled_step_batch_paged requires batch_size > 0");
+        }
+
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = batch_size;
+        m->current_seq_len = 1;
+        m->current_has_attn_mask = attn_mask != nullptr;
+        if (m->current_has_attn_mask) {
+            m->current_attn_mask = *to_arr(attn_mask);
+        } else {
+            m->current_attn_mask = array(0);
+        }
+        m->current_has_cache_pos_arr = false;
+        m->current_cache_pos_arr = nullptr;
+        m->current_has_rope_offsets = rope_offsets != nullptr;
+        if (m->current_has_rope_offsets) {
+            m->current_rope_offsets = *to_arr(rope_offsets);
+        } else {
+            m->current_rope_offsets = array(0);
+        }
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv_per_request + n_gdr_per_request);
+        inputs.push_back(*to_arr(token_ids));
+
+        for (int kv_idx = 0; kv_idx < n_kv_per_request; ++kv_idx) {
+            std::vector<array> per_request;
+            per_request.reserve(batch_size);
+            for (int b = 0; b < batch_size; ++b) {
+                per_request.push_back(*to_arr(kv_caches[b * n_kv_per_request + kv_idx]));
+            }
+            inputs.push_back(concatenate(per_request, 0));
+        }
+
+        for (int gdr_idx = 0; gdr_idx < n_gdr_per_request; ++gdr_idx) {
+            std::vector<array> per_request;
+            per_request.reserve(batch_size);
+            for (int b = 0; b < batch_size; ++b) {
+                per_request.push_back(*to_arr(gdr_states[b * n_gdr_per_request + gdr_idx]));
+            }
+            inputs.push_back(concatenate(per_request, 0));
+        }
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        *out_logits = from_arr(std::move(outputs[0]));
+
+        auto slice_batch_row = [](const array& arr, int row) {
+            Shape start = arr.shape();
+            Shape end = arr.shape();
+            std::fill(start.begin(), start.end(), 0);
+            start[0] = row;
+            end[0] = row + 1;
+            return slice(arr, start, end);
+        };
+
+        for (int kv_idx = 0; kv_idx < n_kv_per_request; ++kv_idx) {
+            const auto& batched = outputs[1 + kv_idx];
+            for (int b = 0; b < batch_size; ++b) {
+                out_kv_caches[b * n_kv_per_request + kv_idx] =
+                    from_arr(slice_batch_row(batched, b));
+            }
+        }
+
+        for (int gdr_idx = 0; gdr_idx < n_gdr_per_request; ++gdr_idx) {
+            const auto& batched = outputs[1 + n_kv_per_request + gdr_idx];
+            for (int b = 0; b < batch_size; ++b) {
+                out_gdr_states[b * n_gdr_per_request + gdr_idx] =
+                    from_arr(slice_batch_row(batched, b));
+            }
+        }
+
+        m->clear_optional_batch_inputs();
+        m->current_batch_size = 1;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->clear_optional_batch_inputs();
+        m->current_batch_size = 1;
+        return -1;
+    }
+}
+
 int32_t qwen35_compiled_step_batch_packed(
     void* model,
     mlx_array* token_ids,    // int32 vector [batch]

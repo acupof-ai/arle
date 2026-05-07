@@ -1800,6 +1800,84 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// M_e.1 P3.1c.3b — paged variant of step_batch. Accepts per-state
+    /// per-layer pre-gathered K and V arrays. P3.1c.3b's C++ body is
+    /// identical to step_batch (new args ignored); P3.1c.3c will flip
+    /// the SDPA read source on the batched path. The k/v slices are
+    /// flat batch_size * n_full_layers — index `b * n_full_layers + L`.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub(super) fn step_batch_paged(
+        &self,
+        tokens: &MlxArray,
+        batch_size: i32,
+        cache_pos: i32,
+        kv_caches: &mut [MlxArray],
+        n_kv_per_request: i32,
+        gdr_states: &mut [MlxArray],
+        n_gdr_per_request: i32,
+        k_full_per_state: &mut [*mut mlx_sys::mlx_array],
+        v_full_per_state: &mut [*mut mlx_sys::mlx_array],
+        attn_mask: Option<&MlxArray>,
+        rope_offsets: Option<&MlxArray>,
+    ) -> Result<MlxArray> {
+        assert_eq!(
+            k_full_per_state.len(),
+            v_full_per_state.len(),
+            "step_batch_paged: K and V slices must have the same length"
+        );
+        let n_full_layers = if batch_size > 0 {
+            (k_full_per_state.len() as i32) / batch_size
+        } else {
+            0
+        };
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); kv_caches.len()];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); gdr_states.len()];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_step_batch_paged(
+                self.raw,
+                tokens.as_raw(),
+                batch_size,
+                cache_pos,
+                kv_ptrs.as_mut_ptr(),
+                n_kv_per_request,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr_per_request,
+                k_full_per_state.as_mut_ptr(),
+                v_full_per_state.as_mut_ptr(),
+                n_full_layers,
+                attn_mask.map_or(std::ptr::null_mut(), MlxArray::as_raw),
+                rope_offsets.map_or(std::ptr::null_mut(), MlxArray::as_raw),
+                &raw mut out_logits,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
     pub(super) fn step_batch(
         &self,
         tokens: &MlxArray,
