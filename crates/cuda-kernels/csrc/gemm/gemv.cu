@@ -390,7 +390,16 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
       // M_pf-gemm Phase 0: when INFER_GEMM_AUTOTUNE=1, benchmark all
       // returned algos at this (M,N,K) and keep the fastest. One-time
       // cost amortized across all subsequent calls of this shape.
-      if (gemm_autotune_enabled() && returned_algo_count > 1) {
+      // Suppressed during CUDA Graph capture: cudaEventRecord on the
+      // capture stream is not legal there, and graphsafe=false can be
+      // active inside graph capture (e.g. batched-decode N>=2 path
+      // routed through Bf16CublasGemm — observed crash 2026-05-07).
+      cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+      cudaStreamIsCapturing(stream, &capture_status);
+      bool inside_graph_capture =
+          capture_status != cudaStreamCaptureStatusNone;
+      if (gemm_autotune_enabled() && returned_algo_count > 1 &&
+          !inside_graph_capture) {
         cudaEvent_t e_start = nullptr;
         cudaEvent_t e_stop = nullptr;
         if (cudaEventCreate(&e_start) == cudaSuccess &&

@@ -1,4 +1,19 @@
-# M_pf-gemm — cuBLASLt prefill GEMM auto-tune (algo benchmarking instead of heuristic top-1)
+# M_pf-gemm — cuBLASLt prefill GEMM auto-tune (algo benchmarking instead of heuristic top-1) — ⛔ Phase 0 KILLED
+
+> **2026-05-07 EOD+2 update — Phase 0 KILLED.**
+> [Bench evidence](../experience/wins/2026-05-07-m_pf-gemm-phase0-killed-cublas-heuristic-already-optimal.md)
+> shows `INFER_GEMM_AUTOTUNE=1` yields ~1% TTFT improvement at
+> long-ctx 4k/c=4 — within bench noise (3% intrinsic). cuBLAS
+> heuristic top-1 IS the best cuBLAS algo for ARLE's prefill
+> shapes; the 1.65× gap to vLLM is at a level cuBLAS algo
+> selection cannot reach. Substrate stays committed (env-gated,
+> default off) for future Phase 0.5 experiments.
+>
+> **Phase 2 still on the table**: TileLang prefill GEMM port,
+> gated on M_world1 Phase 0 baseline (SGLang + TRT-LLM at
+> long-ctx 4k/c=4). If vLLM/SGLang prefill GEMM beats cuBLAS
+> top-1 by >20%, the gap is in kernel implementation, not
+> dispatch — TileLang port becomes the right move.
 
 > Created 2026-05-07 EOD+2 from H_LP3 finding
 > ([`cae08b7`](../experience/wins/2026-05-07-h_lp3-diagnosed-cutlass-small-tile-gemm-bottleneck.md)):
