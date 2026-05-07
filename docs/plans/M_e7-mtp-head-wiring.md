@@ -1,7 +1,33 @@
 # M_e.7 — Native Multi-Token Prediction (MTP) head wiring for Qwen3.5/3.6
 
-**Owner:** ckl · **Status:** designed 2026-05-07 (subagent), awaiting impl tick
+**Owner:** ckl · **Status:** ⚠️ blocked on canonical model 2026-05-07
 **Track:** Metal scheduler / qwen35 spec · **Predecessor:** M_e.4 SwiGLU compile-fusion
+
+## ⚠️ Blocker — current Metal canonical model has no MTP tensors
+
+Inspected `mlx-community/Qwen3.6-35B-A3B-4bit` checkpoint (the canonical
+Metal model per `AGENTS.md`):
+- 2090 tensors total
+- **0 tensors named `mtp.*`**
+- `model_type=qwen3_5_moe`, architecture `Qwen3_5MoeForConditionalGeneration`
+- Multimodal: `vision_tower.*` keys present, `image_token_id`,
+  `video_token_id` set
+- `text_config.mtp_layers` and `num_mtp_layers` both **absent**
+
+→ **The MTP head wiring plan can't run against this model.** Either:
+
+1. **Switch canonical model** to a Qwen3.5-MoE text-only checkpoint
+   that ships MTP heads (e.g. the upstream `Qwen/Qwen3.5-30B-A3B`
+   or whatever mlx-community quantizes that ships `mtp.*`).
+2. **Add a second canonical model** for "text-only with MTP" alongside
+   the multimodal Qwen3.6-VL canonical.
+3. **Defer M_e.7** until checkpoint availability is sorted.
+
+This is a **prerequisite check** — landing the implementation against
+the current canonical would have failed at weight load. Catching it
+during planning prevents an L-effort waste.
+
+Original design retained below for the eventual implementation tick.
 
 ## Goal
 
