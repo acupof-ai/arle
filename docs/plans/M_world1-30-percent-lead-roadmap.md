@@ -1,5 +1,13 @@
 # M_world1 — World #1 inference engine (lead #2 by 30%+)
 
+> ⚠️ **Strategic master**: [`../projects/2026-05-07-arle-master-strategy.md`](../projects/2026-05-07-arle-master-strategy.md)
+> 重定义产品 = **Rust-native coding/agent runtime**(非 generic LLM serving)。
+> 本 M_world1 plan 的 4 canonical shapes 框架在 master §2.3 重排为 agent
+> 相关度;**真正 mission threshold 用 W3/W4 1.30× margin**(per
+> [`2026-05-02-agent-load-bench-spec.md`](2026-05-02-agent-load-bench-spec.md))。
+> 本 plan 的 P0.1 baseline 完成(`12c4c86` + `4ae3b7b` SGLang/ARLE 4k/8k 跨引擎),
+> 后续 P1/P2 行动以 master §7 为准。
+
 > User directive 2026-05-07: target = world #1 inference engine,
 > 领先第二 30%+. NOT just "beat vLLM". Reframes priority stack
 > from competitive parity to commanding lead.

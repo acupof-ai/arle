@@ -1,9 +1,16 @@
 # ARLE Roadmap
 
-Updated 2026-05-01.
+Updated 2026-05-08.
+
+> ⚠️ **Strategic master:** [`docs/projects/2026-05-07-arle-master-strategy.md`](docs/projects/2026-05-07-arle-master-strategy.md)
+> defines ARLE 双线产品(coding/agent runtime + DSV4 from-scratch training)
+> + 5-cap moat + P0/P1/P2 sequence。本 ROADMAP 是 derived planning surface,
+> 与 master 冲突以 master 为准。
 
 This file is a derived planning surface. If it conflicts with a canonical
 document, the canonical document wins:
+
+- **战略主文档**: [`docs/projects/2026-05-07-arle-master-strategy.md`](docs/projects/2026-05-07-arle-master-strategy.md)
 
 - support status: [`docs/support-matrix.md`](docs/support-matrix.md)
 - workspace topology: [`docs/codebase-map.md`](docs/codebase-map.md)
