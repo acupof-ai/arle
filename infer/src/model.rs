@@ -48,6 +48,49 @@ pub struct MixedBatchRequest<'a> {
     pub prefill_start_positions: &'a [usize],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum MixedBatchFallbackReason {
+    UnsupportedModel,
+    InactivePagedPool,
+    LoraEnabled,
+    UnsupportedKvFormat,
+    EmptyDecodeBatch,
+    DecodeSlotCountMismatch,
+    EmptyPrefillBatch,
+    PrefillStartPositionCountMismatch,
+    EmptyPrefillTokens,
+    PrefillSlotInDecodeBatch,
+    DuplicatePrefillSlot,
+    PrefillSeqLenMismatch,
+    SchedulerPreDispatchFallback,
+}
+
+impl MixedBatchFallbackReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedModel => "unsupported_model",
+            Self::InactivePagedPool => "inactive_paged_pool",
+            Self::LoraEnabled => "lora_enabled",
+            Self::UnsupportedKvFormat => "unsupported_kv_format",
+            Self::EmptyDecodeBatch => "empty_decode_batch",
+            Self::DecodeSlotCountMismatch => "decode_slot_count_mismatch",
+            Self::EmptyPrefillBatch => "empty_prefill_batch",
+            Self::PrefillStartPositionCountMismatch => "prefill_start_position_count_mismatch",
+            Self::EmptyPrefillTokens => "empty_prefill_tokens",
+            Self::PrefillSlotInDecodeBatch => "prefill_slot_in_decode_batch",
+            Self::DuplicatePrefillSlot => "duplicate_prefill_slot",
+            Self::PrefillSeqLenMismatch => "prefill_seq_len_mismatch",
+            Self::SchedulerPreDispatchFallback => "scheduler_pre_dispatch_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixedBatchOutcome {
+    Executed,
+    Fallback(MixedBatchFallbackReason),
+}
+
 /// One scheduler-planned speculative verifier row.
 ///
 /// `input_tokens` is `[last_committed_token] + draft_tokens`. Logits row `i`
@@ -642,16 +685,18 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
     /// Mixed-batch forward: decode rows plus packed prefill rows in a single
     /// scheduler-lowered execution unit.
     ///
-    /// Returns `Ok(true)` when the model consumed the mixed batch,
-    /// `Ok(false)` when the caller should fall back to a non-mixed plan.
+    /// Returns `Executed` when the model consumed the mixed batch, or
+    /// `Fallback(reason)` when the caller should use a non-mixed plan.
     fn forward_mixed_batch(
         &self,
         _batch: MixedBatchRequest<'_>,
         _states: &mut [Self::State],
         _paged_kv_pool: Option<&mut PagedKVPool>,
         _decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<MixedBatchOutcome> {
+        Ok(MixedBatchOutcome::Fallback(
+            MixedBatchFallbackReason::UnsupportedModel,
+        ))
     }
 
     /// Batched speculative verifier: append verifier input to paged KV and

@@ -7,9 +7,9 @@ use super::prefill::{Qwen3PagedPrefillRequest, Qwen3PrefillContext};
 use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
-    GenerationState, MixedBatchRequest, ModelForward, PrefillBatchRequest,
-    SchedulerRuntimeWorkspaceBudget, SparseKvDraftView, SpecVerifyOutput, SpecVerifyRequest,
-    decode_metadata_page_capacity, prepare_paged_prefill_batch,
+    GenerationState, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
+    PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget, SparseKvDraftView, SpecVerifyOutput,
+    SpecVerifyRequest, decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
 use crate::model_arch::ModelArchInfo;
 use crate::model_registry::ModelArch;
@@ -632,12 +632,14 @@ impl ModelForward for Qwen3Model {
         states: &mut [Self::State],
         paged_kv_pool: Option<&mut PagedKVPool>,
         decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
+    ) -> Result<MixedBatchOutcome> {
         match paged_kv_pool {
             Some(pool) if pool.is_active() => {
                 self.decode_batch_with_prefill(batch, states, pool, decode_ctx)
             }
-            _ => Ok(false),
+            _ => Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::InactivePagedPool,
+            )),
         }
     }
 

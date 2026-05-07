@@ -20,7 +20,7 @@ use super::weights::DeepseekModel;
 #[cfg(feature = "cuda")]
 use crate::model::generation_state::GenerationStateBase;
 #[cfg(feature = "cuda")]
-use crate::model::{MixedBatchRequest, ModelForward};
+use crate::model::{MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward};
 #[cfg(feature = "cuda")]
 use crate::model_arch::ModelArchInfo;
 #[cfg(feature = "cuda")]
@@ -89,10 +89,12 @@ impl ModelForward for DeepseekModel {
         _states: &mut [Self::State],
         _paged_kv_pool: Option<&mut PagedKVPool>,
         _decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
+    ) -> Result<MixedBatchOutcome> {
         // No mixed-batch support until the MLA prefill + decode kernels share
         // a single varlen launch path. Mirrors qwen3 default.
-        Ok(false)
+        Ok(MixedBatchOutcome::Fallback(
+            MixedBatchFallbackReason::UnsupportedModel,
+        ))
     }
 
     fn select_token(

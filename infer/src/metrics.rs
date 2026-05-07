@@ -23,6 +23,8 @@
 //! | `infer_scheduler_step_cleanup_microseconds` | gauge | EMA scheduler cleanup duration |
 //! | `infer_scheduler_loop_total_microseconds` | gauge | EMA full scheduler loop duration |
 //! | `infer_scheduler_plan_total` | counter | Scheduler ticks by selected plan label |
+//! | `infer_prefill_path_mixed_batch_total` | counter | Mixed decode+prefill path outcomes |
+//! | `infer_prefill_path_mixed_batch_fallback_total` | counter | Mixed decode+prefill fallback reasons |
 //! | `infer_spec_draft_tokens_total` | counter | Draft tokens proposed by Phase 2 speculative decode |
 //! | `infer_spec_verified_tokens_total` | counter | Draft tokens checked by the target verifier |
 //! | `infer_spec_accepted_tokens_total` | counter | Draft tokens accepted by the verifier |
@@ -95,6 +97,7 @@ pub use histogram::{Histogram, HistogramSet, LATENCY_BUCKETS};
 use histogram::{micros_to_secs, secs_to_micros};
 
 use crate::model_arch::ModelArchSummary;
+use crate::server_engine::PrefillPathStats;
 
 // ============================================================================
 // ServerMetrics
@@ -109,6 +112,22 @@ pub enum SchedulerPlanLabel {
     Split,
     Mixed,
 }
+
+const MIXED_BATCH_FALLBACK_REASONS: [&str; 13] = [
+    "unsupported_model",
+    "inactive_paged_pool",
+    "lora_enabled",
+    "unsupported_kv_format",
+    "empty_decode_batch",
+    "decode_slot_count_mismatch",
+    "empty_prefill_batch",
+    "prefill_start_position_count_mismatch",
+    "empty_prefill_tokens",
+    "prefill_slot_in_decode_batch",
+    "duplicate_prefill_slot",
+    "prefill_seq_len_mismatch",
+    "scheduler_pre_dispatch_fallback",
+];
 
 /// Shared server metrics — cheap to clone (Arc internals).
 #[derive(Clone)]
@@ -263,6 +282,21 @@ struct MetricsInner {
     pub scheduler_plan_prefill_total: AtomicU64,
     pub scheduler_plan_split_total: AtomicU64,
     pub scheduler_plan_mixed_total: AtomicU64,
+    pub prefill_path_mixed_ok_true_total: AtomicU64,
+    pub prefill_path_mixed_ok_false_total: AtomicU64,
+    pub prefill_path_mixed_unsupported_model_total: AtomicU64,
+    pub prefill_path_mixed_inactive_paged_pool_total: AtomicU64,
+    pub prefill_path_mixed_lora_enabled_total: AtomicU64,
+    pub prefill_path_mixed_unsupported_kv_format_total: AtomicU64,
+    pub prefill_path_mixed_empty_decode_batch_total: AtomicU64,
+    pub prefill_path_mixed_decode_slot_count_mismatch_total: AtomicU64,
+    pub prefill_path_mixed_empty_prefill_batch_total: AtomicU64,
+    pub prefill_path_mixed_prefill_start_position_count_mismatch_total: AtomicU64,
+    pub prefill_path_mixed_empty_prefill_tokens_total: AtomicU64,
+    pub prefill_path_mixed_prefill_slot_in_decode_batch_total: AtomicU64,
+    pub prefill_path_mixed_duplicate_prefill_slot_total: AtomicU64,
+    pub prefill_path_mixed_prefill_seq_len_mismatch_total: AtomicU64,
+    pub prefill_path_mixed_scheduler_pre_dispatch_fallback_total: AtomicU64,
     pub spec_acceptance_rate_ppm: AtomicU64,
     pub kv_coordinator_queue_capacity: AtomicU64,
     pub kv_fetch_queue_depth: AtomicU64,
@@ -353,6 +387,21 @@ impl ServerMetrics {
                 scheduler_plan_prefill_total: AtomicU64::new(0),
                 scheduler_plan_split_total: AtomicU64::new(0),
                 scheduler_plan_mixed_total: AtomicU64::new(0),
+                prefill_path_mixed_ok_true_total: AtomicU64::new(0),
+                prefill_path_mixed_ok_false_total: AtomicU64::new(0),
+                prefill_path_mixed_unsupported_model_total: AtomicU64::new(0),
+                prefill_path_mixed_inactive_paged_pool_total: AtomicU64::new(0),
+                prefill_path_mixed_lora_enabled_total: AtomicU64::new(0),
+                prefill_path_mixed_unsupported_kv_format_total: AtomicU64::new(0),
+                prefill_path_mixed_empty_decode_batch_total: AtomicU64::new(0),
+                prefill_path_mixed_decode_slot_count_mismatch_total: AtomicU64::new(0),
+                prefill_path_mixed_empty_prefill_batch_total: AtomicU64::new(0),
+                prefill_path_mixed_prefill_start_position_count_mismatch_total: AtomicU64::new(0),
+                prefill_path_mixed_empty_prefill_tokens_total: AtomicU64::new(0),
+                prefill_path_mixed_prefill_slot_in_decode_batch_total: AtomicU64::new(0),
+                prefill_path_mixed_duplicate_prefill_slot_total: AtomicU64::new(0),
+                prefill_path_mixed_prefill_seq_len_mismatch_total: AtomicU64::new(0),
+                prefill_path_mixed_scheduler_pre_dispatch_fallback_total: AtomicU64::new(0),
                 spec_acceptance_rate_ppm: AtomicU64::new(0),
                 kv_coordinator_queue_capacity: AtomicU64::new(0),
                 kv_fetch_queue_depth: AtomicU64::new(0),
@@ -688,6 +737,58 @@ impl ServerMetrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn mixed_batch_fallback_counter(&self, reason: &str) -> &AtomicU64 {
+        match reason {
+            "inactive_paged_pool" => &self.inner.prefill_path_mixed_inactive_paged_pool_total,
+            "lora_enabled" => &self.inner.prefill_path_mixed_lora_enabled_total,
+            "unsupported_kv_format" => &self.inner.prefill_path_mixed_unsupported_kv_format_total,
+            "empty_decode_batch" => &self.inner.prefill_path_mixed_empty_decode_batch_total,
+            "decode_slot_count_mismatch" => {
+                &self
+                    .inner
+                    .prefill_path_mixed_decode_slot_count_mismatch_total
+            }
+            "empty_prefill_batch" => &self.inner.prefill_path_mixed_empty_prefill_batch_total,
+            "prefill_start_position_count_mismatch" => {
+                &self
+                    .inner
+                    .prefill_path_mixed_prefill_start_position_count_mismatch_total
+            }
+            "empty_prefill_tokens" => &self.inner.prefill_path_mixed_empty_prefill_tokens_total,
+            "prefill_slot_in_decode_batch" => {
+                &self
+                    .inner
+                    .prefill_path_mixed_prefill_slot_in_decode_batch_total
+            }
+            "duplicate_prefill_slot" => &self.inner.prefill_path_mixed_duplicate_prefill_slot_total,
+            "prefill_seq_len_mismatch" => {
+                &self.inner.prefill_path_mixed_prefill_seq_len_mismatch_total
+            }
+            "scheduler_pre_dispatch_fallback" => {
+                &self
+                    .inner
+                    .prefill_path_mixed_scheduler_pre_dispatch_fallback_total
+            }
+            _ => &self.inner.prefill_path_mixed_unsupported_model_total,
+        }
+    }
+
+    /// Record one mixed decode+prefill path execution.
+    pub fn record_prefill_path_mixed_ok_true(&self) {
+        self.inner
+            .prefill_path_mixed_ok_true_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one mixed decode+prefill fallback and its model-reported reason.
+    pub fn record_prefill_path_mixed_ok_false(&self, reason: &str) {
+        self.inner
+            .prefill_path_mixed_ok_false_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.mixed_batch_fallback_counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Update the staged KV coordinator queue gauges and cumulative store counters.
     pub fn set_kv_coordinator(
         &self,
@@ -878,6 +979,29 @@ impl ServerMetrics {
                 .scheduler_plan_mixed_total
                 .load(Ordering::Relaxed),
         )
+    }
+
+    pub fn prefill_path_stats(&self) -> PrefillPathStats {
+        PrefillPathStats {
+            ok_true_count: self
+                .inner
+                .prefill_path_mixed_ok_true_total
+                .load(Ordering::Relaxed),
+            ok_false_count: self
+                .inner
+                .prefill_path_mixed_ok_false_total
+                .load(Ordering::Relaxed),
+            ok_false_reasons: MIXED_BATCH_FALLBACK_REASONS
+                .iter()
+                .map(|reason| {
+                    (
+                        (*reason).to_string(),
+                        self.mixed_batch_fallback_counter(reason)
+                            .load(Ordering::Relaxed),
+                    )
+                })
+                .collect(),
+        }
     }
 
     pub fn kv_coordinator_queue_capacity(&self) -> u64 {
@@ -1246,6 +1370,9 @@ mod tests {
         m.record_scheduler_plan(SchedulerPlanLabel::Decode);
         m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
         m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
+        m.record_prefill_path_mixed_ok_true();
+        m.record_prefill_path_mixed_ok_false("prefill_seq_len_mismatch");
+        m.record_prefill_path_mixed_ok_false("scheduler_pre_dispatch_fallback");
         m.set_kv_coordinator(16, 3, 5, 2, true, false, 7, 5, 1, 2);
         m.set_tier_wait_seconds(0.25, 0.5);
         m.set_kv_gpu_blocks(100, 200);
@@ -1310,6 +1437,22 @@ mod tests {
         );
         assert!(
             rendered.contains("infer_scheduler_plan_total{model=\"Qwen3-4B\",plan=\"mixed\",} 2")
+        );
+        assert!(rendered.contains(
+            "infer_prefill_path_mixed_batch_total{model=\"Qwen3-4B\",outcome=\"ok_true\",} 1"
+        ));
+        assert!(rendered.contains(
+            "infer_prefill_path_mixed_batch_total{model=\"Qwen3-4B\",outcome=\"ok_false\",} 2"
+        ));
+        assert!(
+            rendered.contains(
+                "infer_prefill_path_mixed_batch_fallback_total{model=\"Qwen3-4B\",reason=\"prefill_seq_len_mismatch\",} 1"
+            )
+        );
+        assert!(
+            rendered.contains(
+                "infer_prefill_path_mixed_batch_fallback_total{model=\"Qwen3-4B\",reason=\"scheduler_pre_dispatch_fallback\",} 1"
+            )
         );
         assert!(rendered.contains("infer_spec_draft_tokens_total{model=\"Qwen3-4B\",} 0"));
         assert!(rendered.contains("infer_spec_verified_tokens_total{model=\"Qwen3-4B\",} 0"));
@@ -1408,6 +1551,9 @@ mod tests {
         m.record_scheduler_plan(SchedulerPlanLabel::Split);
         m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
         m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
+        m.record_prefill_path_mixed_ok_true();
+        m.record_prefill_path_mixed_ok_false("prefill_seq_len_mismatch");
+        m.record_prefill_path_mixed_ok_false("scheduler_pre_dispatch_fallback");
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
@@ -1416,6 +1562,9 @@ mod tests {
             "step_phase_us=adm:11,prefill:22,decode:33,emit:44,total:110,cleanup:55,loop_total:165"
         ));
         assert!(s.contains("plan_label=idle:0,decode:0,prefill:1,split:1,mixed:2"));
+        assert!(s.contains(
+            "prefill_path=ok_true:1,ok_false:2,prefill_seq_len_mismatch:1,scheduler_pre_dispatch_fallback:1"
+        ));
         assert!(
             s.contains(
                 "spec=draft:0,verified:0,accepted:0,empty_sparse_views:0,accept_rate:0.0%,step_latency_count:0"
@@ -1459,6 +1608,9 @@ mod tests {
             128,
             64,
         );
+        m.record_prefill_path_mixed_ok_true();
+        m.record_prefill_path_mixed_ok_false("prefill_seq_len_mismatch");
+        m.record_prefill_path_mixed_ok_false("scheduler_pre_dispatch_fallback");
 
         let payload = m.render_stats_json();
         assert_eq!(payload["prefix_hit_rate"], serde_json::json!(1.0));
@@ -1477,6 +1629,22 @@ mod tests {
                 .as_ref()
                 .map(crate::model_arch::ModelArchSummary::arch_label),
             Some("Qwen3")
+        );
+        assert_eq!(
+            payload["engine_prefill_path_stats"]["ok_true_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["engine_prefill_path_stats"]["ok_false_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            payload["engine_prefill_path_stats"]["ok_false_reasons"]["prefill_seq_len_mismatch"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["engine_prefill_path_stats"]["ok_false_reasons"]["scheduler_pre_dispatch_fallback"],
+            serde_json::json!(1)
         );
         assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));
         assert_eq!(payload["session_affinity_miss"], serde_json::json!(0));

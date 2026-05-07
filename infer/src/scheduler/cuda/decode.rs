@@ -2,7 +2,10 @@ use super::nvtx_scopes::nvtx_scope;
 use super::{
     FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, warn,
 };
-use crate::model::{DecodeContextOps, MixedBatchRequest, PrefillBatchRequest};
+use crate::model::{
+    DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
+    PrefillBatchRequest,
+};
 use crate::scheduler::DraftMode;
 use crate::scheduler::cuda::core::{
     PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow,
@@ -374,13 +377,18 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn step_mixed_launch(&mut self, candidates: &[PrefillCandidate]) {
+        let pre_dispatch_fallback = MixedBatchFallbackReason::SchedulerPreDispatchFallback.as_str();
         if candidates.is_empty() {
+            self.metrics
+                .record_prefill_path_mixed_ok_false(pre_dispatch_fallback);
             self.step_decode_launch();
             return;
         }
 
         let (mut decode_indices, mut token_ids) = self.collect_decode_batch_inputs();
         if decode_indices.is_empty() {
+            self.metrics
+                .record_prefill_path_mixed_ok_false(pre_dispatch_fallback);
             self.step_prefill_batch(candidates);
             return;
         }
@@ -416,10 +424,14 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         if launch_candidates.is_empty() {
+            self.metrics
+                .record_prefill_path_mixed_ok_false(pre_dispatch_fallback);
             self.launch_decode_batch_from_tokens(decode_indices, token_ids, false, false);
             return;
         }
         if decode_indices.is_empty() {
+            self.metrics
+                .record_prefill_path_mixed_ok_false(pre_dispatch_fallback);
             self.step_prefill_batch(&launch_candidates);
             return;
         }
@@ -429,6 +441,8 @@ impl<M: ModelForward> Scheduler<M> {
         let decode_indices = alloc_ok_indices;
         let token_ids = alloc_ok_tokens;
         if decode_indices.is_empty() {
+            self.metrics
+                .record_prefill_path_mixed_ok_false(pre_dispatch_fallback);
             self.step_prefill_batch(&launch_candidates);
             return;
         }
@@ -436,6 +450,8 @@ impl<M: ModelForward> Scheduler<M> {
         launch_candidates =
             self.select_mixed_launch_prefill_candidates(candidates, &decode_indices);
         if launch_candidates.is_empty() {
+            self.metrics
+                .record_prefill_path_mixed_ok_false(pre_dispatch_fallback);
             self.launch_decode_batch_from_tokens(decode_indices, token_ids, true, false);
             return;
         }
@@ -480,6 +496,8 @@ impl<M: ModelForward> Scheduler<M> {
             prefill_chunks.push((slot_idx, prefill_tokens));
         }
         if prefill_chunks.is_empty() {
+            self.metrics
+                .record_prefill_path_mixed_ok_false(pre_dispatch_fallback);
             self.launch_decode_batch_from_tokens(decode_indices, token_ids, true, false);
             return;
         }
@@ -568,8 +586,12 @@ impl<M: ModelForward> Scheduler<M> {
             )
         };
         match mixed_forward {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(MixedBatchOutcome::Executed) => {
+                self.metrics.record_prefill_path_mixed_ok_true();
+            }
+            Ok(MixedBatchOutcome::Fallback(reason)) => {
+                self.metrics
+                    .record_prefill_path_mixed_ok_false(reason.as_str());
                 self.step_prefill_batch(&launch_candidates);
                 for row in &pending_rows {
                     if self
