@@ -313,6 +313,7 @@ impl<M: ModelForward> Scheduler<M> {
             prefill_ctx: None,
             stats: SchedulerRuntimeStats::new(),
             pending_decode: None,
+            deferred_decode_emit: None,
             pending_prefill: None,
             host_leaf_headroom_exhausted: false,
         };

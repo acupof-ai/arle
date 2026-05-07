@@ -659,11 +659,25 @@ impl<M: ModelForward> Scheduler<M> {
         );
     }
 
-    pub(super) fn step_decode_readback(&mut self) {
-        let Some(pending) = self.pending_decode.take() else {
-            return;
-        };
-        let spec_readback_started = pending.speculative.then(std::time::Instant::now);
+    fn finish_pending_decode_with_error(&mut self, pending: PendingDecode, err: anyhow::Error) {
+        error!("Batched sampling failed: {}", err);
+        for &slot_idx in &pending.decode_indices {
+            self.finish_slot(slot_idx);
+        }
+        if let Some(mixed_prefill) = pending.mixed_prefill {
+            for row in mixed_prefill.rows {
+                self.finish_slot(row.slot_idx);
+            }
+        }
+    }
+
+    fn apply_sampled_decode_tokens(
+        &mut self,
+        pending: PendingDecode,
+        sampled_tokens: Vec<u32>,
+        logprobs_host: Option<Vec<f32>>,
+        spec_readback_started: Option<std::time::Instant>,
+    ) {
         let decode_trace_contexts: std::collections::HashMap<
             usize,
             fastrace::collector::SpanContext,
@@ -675,146 +689,206 @@ impl<M: ModelForward> Scheduler<M> {
                     .map(|context| (*slot_idx, context))
             })
             .collect();
-        let sampling_params: Vec<crate::sampler::SamplingParams> = pending
-            .decode_indices
-            .iter()
-            .filter_map(|&slot_idx| self.request(slot_idx).map(|req| req.sampling.clone()))
-            .collect();
-        let sampling_refs: Vec<&crate::sampler::SamplingParams> = sampling_params.iter().collect();
+        if pending.speculative {
+            let mut verified_tokens = 0usize;
+            let mut accepted_tokens = 0usize;
+            for (pos, &slot_idx) in pending.decode_indices.iter().enumerate() {
+                if sampled_tokens.get(pos).is_none() {
+                    continue;
+                }
+                let Some(req) = self.request(slot_idx) else {
+                    continue;
+                };
+                if req.spec_decode_disabled
+                    || req.speculative.as_ref().and_then(|spec| spec.enabled) == Some(false)
+                    || !req.sampling.is_greedy()
+                    || req.sampling.has_penalties()
+                {
+                    continue;
+                }
+                verified_tokens = verified_tokens.saturating_add(1);
+                // P2.3 is greedy-only: `sampled` is the current batch argmax
+                // read back from `decode_ctx`, so it is the target-verified
+                // draft token for this canary.
+                let row_accepted = 1usize;
+                accepted_tokens = accepted_tokens.saturating_add(row_accepted);
+                let threshold = self.config.spec_acceptance_threshold;
+                if let Some(req) = self.request_mut(slot_idx) {
+                    let tracker = req
+                        .spec_acceptance_tracker
+                        .get_or_insert_with(crate::speculative::AcceptanceTracker::default_window);
+                    tracker.observe_step(row_accepted, 1);
+                    if tracker.should_disable(threshold) {
+                        req.spec_decode_disabled = true;
+                    }
+                }
+            }
+            self.metrics.record_spec_step(
+                verified_tokens,
+                verified_tokens,
+                accepted_tokens,
+                spec_readback_started.map_or(0, |start| start.elapsed().as_micros() as u64),
+            );
+        }
 
-        let (sampled_result, logprobs_host) = if pending.greedy_launched {
-            // Argmax kernel was launched — sync + readback.
+        for (j, &slot_idx) in pending.decode_indices.iter().enumerate() {
+            let Some(&token) = sampled_tokens.get(j) else {
+                continue;
+            };
+            if !matches!(
+                self.request(slot_idx).map(|req| &req.phase),
+                Some(Phase::Decoding)
+            ) {
+                continue;
+            }
+            if let Some(req) = self.request_mut(slot_idx) {
+                req.trace_context = decode_trace_contexts
+                    .get(&slot_idx)
+                    .copied()
+                    .or(req.trace_context);
+                req.latest_logprob = logprobs_host.as_ref().and_then(|lps| lps.get(j).copied());
+            }
+            let ignore_eos = self
+                .request(slot_idx)
+                .is_some_and(|req| req.sampling.ignore_eos);
+            if !ignore_eos && self.model.is_stop_token(token) {
+                self.finish_request(slot_idx, FinishReason::Stop);
+                continue;
+            }
+            if let Some(req) = self.request_mut(slot_idx) {
+                req.generated_tokens.push(token);
+            }
+            if matches!(
+                self.request(slot_idx).map(|req| &req.phase),
+                Some(Phase::Finished)
+            ) {
+                self.finish_slot(slot_idx);
+                continue;
+            }
+            let reached_max = self
+                .request(slot_idx)
+                .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
+            if reached_max && !self.defer_finish_until_emit_gate(slot_idx, FinishReason::Length) {
+                self.finish_request(slot_idx, FinishReason::Length);
+            }
+        }
+
+        if let Some(mixed_prefill) = pending.mixed_prefill {
+            self.finish_prefill_batch(PendingPrefill {
+                rows: mixed_prefill.rows,
+                uses_paged: mixed_prefill.uses_paged,
+                prefill_spans: mixed_prefill.prefill_spans,
+            });
+        }
+    }
+
+    pub(super) fn step_decode_readback(&mut self) {
+        if let Some(pending) = self.deferred_decode_emit.take() {
+            let spec_readback_started = pending.speculative.then(std::time::Instant::now);
             let decode_ctx = self.decode_bufs.as_mut().unwrap();
             match self
                 .model
                 .sample_batch_greedy_readback(&pending.slot_indices, decode_ctx)
             {
-                Ok(Some(tokens)) => (
-                    Ok(tokens),
-                    Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx).to_vec()),
-                ),
-                Ok(None) => (
-                    self.model.select_tokens_batch(
-                        &mut self.states,
-                        &pending.slot_indices,
-                        &sampling_refs,
-                        &mut self.rng,
-                    ),
-                    None,
-                ),
-                Err(e) => (Err(e), None),
-            }
-        } else {
-            (
-                self.model.select_tokens_batch(
-                    &mut self.states,
-                    &pending.slot_indices,
-                    &sampling_refs,
-                    &mut self.rng,
-                ),
-                None,
-            )
-        };
-
-        match sampled_result {
-            Ok(sampled_tokens) => {
-                if pending.speculative {
-                    let mut verified_tokens = 0usize;
-                    let mut accepted_tokens = 0usize;
-                    for (pos, &slot_idx) in pending.decode_indices.iter().enumerate() {
-                        if sampled_tokens.get(pos).is_none() {
-                            continue;
-                        }
-                        let Some(req) = self.request(slot_idx) else {
-                            continue;
-                        };
-                        if req.spec_decode_disabled
-                            || req.speculative.as_ref().and_then(|spec| spec.enabled) == Some(false)
-                            || !req.sampling.is_greedy()
-                            || req.sampling.has_penalties()
-                        {
-                            continue;
-                        }
-                        verified_tokens = verified_tokens.saturating_add(1);
-                        // P2.3 is greedy-only: `sampled` is the current
-                        // batch argmax read back from `decode_ctx`, so it is
-                        // the target-verified draft token for this canary.
-                        let row_accepted = 1usize;
-                        accepted_tokens = accepted_tokens.saturating_add(row_accepted);
-                        let threshold = self.config.spec_acceptance_threshold;
-                        if let Some(req) = self.request_mut(slot_idx) {
-                            let tracker = req.spec_acceptance_tracker.get_or_insert_with(
-                                crate::speculative::AcceptanceTracker::default_window,
-                            );
-                            tracker.observe_step(row_accepted, 1);
-                            if tracker.should_disable(threshold) {
-                                req.spec_decode_disabled = true;
-                            }
-                        }
-                    }
-                    self.metrics.record_spec_step(
-                        verified_tokens,
-                        verified_tokens,
-                        accepted_tokens,
-                        spec_readback_started.map_or(0, |start| start.elapsed().as_micros() as u64),
+                Ok(Some(tokens)) => {
+                    let logprobs_host =
+                        Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx).to_vec());
+                    self.apply_sampled_decode_tokens(
+                        pending,
+                        tokens,
+                        logprobs_host,
+                        spec_readback_started,
                     );
                 }
-                for (j, &slot_idx) in pending.decode_indices.iter().enumerate() {
-                    if let Some(req) = self.request_mut(slot_idx) {
-                        req.trace_context = decode_trace_contexts
-                            .get(&slot_idx)
-                            .copied()
-                            .or(req.trace_context);
-                    }
-                    let token = sampled_tokens[j];
-                    if let Some(req) = self.request_mut(slot_idx) {
-                        req.latest_logprob =
-                            logprobs_host.as_ref().and_then(|lps| lps.get(j).copied());
-                    }
-                    let ignore_eos = self
-                        .request(slot_idx)
-                        .is_some_and(|req| req.sampling.ignore_eos);
-                    if !ignore_eos && self.model.is_stop_token(token) {
-                        self.finish_request(slot_idx, FinishReason::Stop);
-                        continue;
-                    }
-                    if let Some(req) = self.request_mut(slot_idx) {
-                        req.generated_tokens.push(token);
-                    }
-                    if matches!(
-                        self.request(slot_idx).map(|req| &req.phase),
-                        Some(Phase::Finished)
-                    ) {
-                        self.finish_slot(slot_idx);
-                        continue;
-                    }
-                    let reached_max = self
-                        .request(slot_idx)
-                        .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
-                    if reached_max {
-                        if !self.defer_finish_until_emit_gate(slot_idx, FinishReason::Length) {
-                            self.finish_request(slot_idx, FinishReason::Length);
-                        }
-                    }
+                Ok(None) => {
+                    self.deferred_decode_emit = Some(pending);
+                    return;
                 }
-
-                if let Some(mixed_prefill) = pending.mixed_prefill {
-                    self.finish_prefill_batch(PendingPrefill {
-                        rows: mixed_prefill.rows,
-                        uses_paged: mixed_prefill.uses_paged,
-                        prefill_spans: mixed_prefill.prefill_spans,
-                    });
-                }
+                Err(e) => self.finish_pending_decode_with_error(pending, e),
             }
-            Err(e) => {
-                error!("Batched sampling failed: {}", e);
-                for &slot_idx in &pending.decode_indices {
-                    self.finish_slot(slot_idx);
+        }
+
+        let Some(pending) = self.pending_decode.take() else {
+            return;
+        };
+        let spec_readback_started = pending.speculative.then(std::time::Instant::now);
+        if pending.greedy_launched {
+            let decode_ctx = self.decode_bufs.as_mut().unwrap();
+            match self
+                .model
+                .sample_batch_greedy_readback(&pending.slot_indices, decode_ctx)
+            {
+                Ok(Some(tokens)) => {
+                    let logprobs_host =
+                        Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx).to_vec());
+                    self.apply_sampled_decode_tokens(
+                        pending,
+                        tokens,
+                        logprobs_host,
+                        spec_readback_started,
+                    );
                 }
-                if let Some(mixed_prefill) = pending.mixed_prefill {
-                    for row in mixed_prefill.rows {
-                        self.finish_slot(row.slot_idx);
-                    }
+                Ok(None) => {
+                    self.deferred_decode_emit = Some(pending);
+                }
+                Err(e) => self.finish_pending_decode_with_error(pending, e),
+            }
+        } else {
+            let mut live_decode_indices = Vec::with_capacity(pending.decode_indices.len());
+            let mut live_slot_indices = Vec::with_capacity(pending.slot_indices.len());
+            let mut live_sampling_params = Vec::with_capacity(pending.slot_indices.len());
+            for (&decode_idx, &slot_idx) in pending.decode_indices.iter().zip(&pending.slot_indices)
+            {
+                let Some(req) = self.request(slot_idx) else {
+                    continue;
+                };
+                if !matches!(req.phase, Phase::Decoding) {
+                    continue;
+                }
+                live_decode_indices.push(decode_idx);
+                live_slot_indices.push(slot_idx);
+                live_sampling_params.push(req.sampling.clone());
+            }
+            let live_decode_spans = pending
+                .decode_spans
+                .into_iter()
+                .filter(|(slot_idx, _)| live_slot_indices.contains(slot_idx))
+                .collect();
+            let live_pending = PendingDecode {
+                decode_indices: live_decode_indices,
+                slot_indices: live_slot_indices,
+                greedy_launched: false,
+                speculative: pending.speculative,
+                decode_spans: live_decode_spans,
+                mixed_prefill: pending.mixed_prefill,
+            };
+            if live_pending.decode_indices.is_empty() {
+                self.apply_sampled_decode_tokens(
+                    live_pending,
+                    Vec::new(),
+                    None,
+                    spec_readback_started,
+                );
+                return;
+            }
+            let sampling_refs: Vec<&crate::sampler::SamplingParams> =
+                live_sampling_params.iter().collect();
+            match self.model.select_tokens_batch(
+                &mut self.states,
+                &live_pending.slot_indices,
+                &sampling_refs,
+                &mut self.rng,
+            ) {
+                Ok(sampled_tokens) => {
+                    self.apply_sampled_decode_tokens(
+                        live_pending,
+                        sampled_tokens,
+                        None,
+                        spec_readback_started,
+                    );
+                }
+                Err(e) => {
+                    self.finish_pending_decode_with_error(live_pending, e);
                 }
             }
         }

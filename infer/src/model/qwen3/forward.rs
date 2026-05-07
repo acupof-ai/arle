@@ -545,6 +545,7 @@ impl ModelForward for Qwen3Model {
             &mut decode_ctx.logprobs_gpu,
             batch_size,
         )?;
+        decode_ctx.stage_sampled_tokens_for_next_step(&self.ctx, slot_indices)?;
         Ok(true)
     }
 
@@ -554,26 +555,8 @@ impl ModelForward for Qwen3Model {
         decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Option<Vec<u32>>> {
         let batch_size = slot_indices.len();
-        self.ctx.sync()?;
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
-        ops_backend.argmax_batch_readback_into(
-            &decode_ctx.argmax_out,
-            &mut decode_ctx.argmax_host,
-            batch_size,
-        )?;
-        let lp_tmp = self
-            .ctx
-            .stream
-            .clone_dtoh(&decode_ctx.logprobs_gpu)
-            .map_err(|e| anyhow::anyhow!("D2H logprobs: {e}"))?;
-        decode_ctx.logprobs_host[..batch_size].copy_from_slice(&lp_tmp[..batch_size]);
-
-        Ok(Some(
-            decode_ctx.argmax_host[..batch_size]
-                .iter()
-                .map(|&x| x as u32)
-                .collect(),
-        ))
+        decode_ctx.start_greedy_readback_async(&self.ctx, batch_size)?;
+        decode_ctx.poll_greedy_readback(batch_size)
     }
 
     fn prepare_batch_sampling_fallback(
@@ -582,6 +565,7 @@ impl ModelForward for Qwen3Model {
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
     ) -> Result<()> {
+        decode_ctx.invalidate_sampled_token_handoff();
         let logits = match decode_ctx.logits_batch.as_ref() {
             Some(logits) if logits.seq_len >= slot_indices.len() => logits,
             _ => return Ok(()),
