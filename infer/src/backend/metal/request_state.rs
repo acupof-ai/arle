@@ -2414,6 +2414,17 @@ static DECODE_QWEN35_PACKED_PROBE: std::sync::Once = std::sync::Once::new();
 #[allow(dead_code)]
 static DECODE_QWEN35_BATCH_PROBE: std::sync::Once = std::sync::Once::new();
 
+// Task #16 — env-gated per-phase wall-time logger for c≥2 hot path.
+// Set INFER_PHASE_TIMING=1 to emit one log line per decode step with
+// host-prep / step_batch_packed / sample / pool-dual-write deltas.
+// Caches the env probe so we don't pay the var lookup per step.
+#[inline(always)]
+fn phase_timing_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("INFER_PHASE_TIMING").is_ok())
+}
+
 fn decode_qwen35_packed_batch<'a>(
     states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
     batch: &mut Qwen35PackedDecodeBatch<'a>,
@@ -2428,6 +2439,9 @@ fn decode_qwen35_packed_batch<'a>(
         batch.batch_size(),
         states.len()
     );
+
+    let phase_timing = phase_timing_enabled();
+    let t0 = phase_timing.then(std::time::Instant::now);
 
     if batch.batch_cache_len > 0 && batch.batch_cache_len % KV_CACHE_CHUNK == 0 {
         clear_metal_cache();
@@ -2498,6 +2512,7 @@ fn decode_qwen35_packed_batch<'a>(
         .cpp_model
         .as_ref()
         .context("decode_qwen35_packed_batch requires the compiled Qwen3.5 path")?;
+    let t_prep = phase_timing.then(std::time::Instant::now);
     let logits = cpp_model.step_batch_packed(
         &token_arr,
         i32::try_from(states.len()).context("decode_qwen35_packed_batch batch size overflow")?,
@@ -2509,6 +2524,7 @@ fn decode_qwen35_packed_batch<'a>(
         mask_opt.as_ref(),
         Some(&rope_offsets),
     )?;
+    let t_step_built = phase_timing.then(std::time::Instant::now);
 
     let mut eval_refs: Vec<&MlxArray> =
         Vec::with_capacity(1 + batch.packed_kv_flat.len() + batch.packed_gdr_flat.len());
@@ -2516,6 +2532,7 @@ fn decode_qwen35_packed_batch<'a>(
     eval_refs.extend(batch.packed_kv_flat.iter());
     eval_refs.extend(batch.packed_gdr_flat.iter());
     async_eval(&eval_refs);
+    let t_async_eval = phase_timing.then(std::time::Instant::now);
 
     let logits_shape = logits.shape().to_vec();
     ensure!(
@@ -2566,6 +2583,7 @@ fn decode_qwen35_packed_batch<'a>(
         state.record_sampled_token(token)?;
         sampled_tokens_out.push(token);
     }
+    let t_sampled = phase_timing.then(std::time::Instant::now);
 
     // M_e.1 P3.1c.3a' — per-row pool dual-write on the REAL c≥2 path.
     // This is decode_qwen35_packed_batch (varlen-aware), the function the
@@ -2612,6 +2630,24 @@ fn decode_qwen35_packed_batch<'a>(
                 .context("M_e.1 P3.1c.3a' pool.write_kv (packed decode)")?;
         }
         pool.flush();
+    }
+
+    if phase_timing
+        && let (Some(t0), Some(t_prep), Some(t_built), Some(t_async), Some(t_sampled)) =
+            (t0, t_prep, t_step_built, t_async_eval, t_sampled)
+    {
+        let t_end = std::time::Instant::now();
+        log::info!(
+            "metal_phase_timing batch={} cache_len={} prep_us={} build_graph_us={} async_eval_kickoff_us={} sample_us={} pool_dual_write_us={} total_us={}",
+            states.len(),
+            batch.batch_cache_len,
+            t_prep.duration_since(t0).as_micros(),
+            t_built.duration_since(t_prep).as_micros(),
+            t_async.duration_since(t_built).as_micros(),
+            t_sampled.duration_since(t_async).as_micros(),
+            t_end.duration_since(t_sampled).as_micros(),
+            t_end.duration_since(t0).as_micros(),
+        );
     }
 
     Ok(sampled_tokens_out)
@@ -3332,7 +3368,7 @@ fn log_qwen35_phase_timing(
     SUM_STEP_US.fetch_add(step_us, Ordering::Relaxed);
     SUM_SPLIT_US.fetch_add(split_us, Ordering::Relaxed);
 
-    if n % 32 == 0 {
+    if n.is_multiple_of(32) {
         let total_avg = SUM_TOTAL_US.load(Ordering::Relaxed) / n;
         let step_avg = SUM_STEP_US.load(Ordering::Relaxed) / n;
         let split_avg = SUM_SPLIT_US.load(Ordering::Relaxed) / n;
@@ -4368,8 +4404,10 @@ impl<'a> Qwen35StepDriver<'a> {
             v_arrays.push(v);
         }
 
-        let mut k_raw: Vec<*mut mlx_sys::mlx_array> = k_arrays.iter().map(|a| a.as_raw()).collect();
-        let mut v_raw: Vec<*mut mlx_sys::mlx_array> = v_arrays.iter().map(|a| a.as_raw()).collect();
+        let mut k_raw: Vec<*mut mlx_sys::mlx_array> =
+            k_arrays.iter().map(super::mlx::MlxArray::as_raw).collect();
+        let mut v_raw: Vec<*mut mlx_sys::mlx_array> =
+            v_arrays.iter().map(super::mlx::MlxArray::as_raw).collect();
 
         let logits = cpp_model.step_session_paged(token_arr, cache_len, &mut k_raw, &mut v_raw)?;
         async_eval(&[&logits]);
