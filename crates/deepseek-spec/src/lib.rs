@@ -4,6 +4,15 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod v4;
+
+pub use v4::{
+    DeepSeekV4AttentionTensorNames, DeepSeekV4CompressorTensorNames, DeepSeekV4Config,
+    DeepSeekV4ExpertTensorNames, DeepSeekV4HyperConnectionTensorNames,
+    DeepSeekV4IndexerTensorNames, DeepSeekV4LayerTensorNames, DeepSeekV4MoeTensorNames,
+    DeepSeekV4MtpTensorNames, DeepSeekV4RopeParameters, DeepSeekV4TensorNames,
+};
+
 #[derive(Debug, Error)]
 pub enum DeepSeekConfigError {
     #[error("invalid deepseek config: {0}")]
@@ -33,6 +42,12 @@ pub enum Shard {
     ExpertParallel { dim: usize },
 }
 
+/// V3-only MLA tensor names.
+///
+/// Deprecated for DSV4: V4 abandons `kv_lora_rank` / `kv_a_proj_with_mqa` /
+/// `kv_b_proj` MLA and uses Q-LoRA, single-KV-head GQA, O-LoRA grouping,
+/// mHC streams, and CSA/HCA/indexer tensors instead. New V4 code should use
+/// [`DeepSeekV4TensorNames`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepSeekMlaTensorNames {
     pub attention_prefix: String,
@@ -40,8 +55,10 @@ pub struct DeepSeekMlaTensorNames {
     pub q_a_proj: String,
     pub q_a_layernorm: String,
     pub q_b_proj: String,
+    /// V3-only MLA latent-KV projection; deprecated for DSV4.
     pub kv_a_proj_with_mqa: String,
     pub kv_a_layernorm: String,
+    /// V3-only MLA latent-KV expansion; deprecated for DSV4.
     pub kv_b_proj: String,
     pub o_proj: String,
 }
@@ -444,6 +461,7 @@ struct RawDeepSeekConfig {
     num_experts: usize,
     #[serde(default)]
     routed_scaling_factor: f32,
+    /// V3-only MLA latent-KV rank; deprecated for DSV4 configs.
     kv_lora_rank: usize,
     #[serde(default)]
     q_lora_rank: Option<usize>,
@@ -508,6 +526,7 @@ pub struct DeepSeekConfig {
     pub topk_group: usize,
     pub norm_topk_prob: bool,
     pub hidden_act: Option<String>,
+    /// V3-only MLA latent-KV rank; deprecated for DSV4 configs.
     pub kv_lora_rank: usize,
     pub q_lora_rank: Option<usize>,
     pub qk_rope_head_dim: usize,
