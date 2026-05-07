@@ -42,6 +42,24 @@ Primary snapshot:
    - Profile scheduler admission and decode batch width under c=64; the first
      goal is to increase output tok/s while preserving ARLE's TTFT p50 lead.
 
+## Strategic alignment with combo plan (manager note 2026-05-07)
+
+Three of the four gaps overlap directly with already-spec'd combo plan
+sub-plans. Do NOT attack them in isolation — they are downstream of work
+already in flight:
+
+| M6 gap | Combo plan that addresses it | Relationship |
+|---|---|---|
+| decode-heavy out tok/s -4.9% | [`M_b.2`](longctx-spec-tilelang-combo.md) sparse-self-spec fusion | spec-decode is the canonical decode-throughput multiplier; M_b.2 targets +10-15% on top of vanilla decode without retraining. Likely closes this gap on its own. |
+| longctx-32k out tok/s -34.9% | [`M_d`](M_d-tier-kv-spec-decode-coordination.md) Tier-KV × spec coordination | Long-context throughput is gated by KV residency, exactly what M_d's eager-prefetch + scratch-page commit barrier address. Plus the 16 GB pool ceiling means H100/L4 retest is the right path before architecture changes. |
+| high-conc out tok/s -62.9% | [`M3.5`](M3.5-collapse-scheduler-loops.md) shared CPU policy + [`M_b`](M_b-tilelang-fused-draft-verify-kernel.md) batched verify | High-conc throughput is gated by scheduler decisions per tick + per-row verify cost. M3.5 unifies decisions; M_b/M_c add multi-token-per-step credit on the verify path. |
+| prefill-heavy out tok/s -5.4% | (no combo plan; isolated tile-shape tuning) | The only gap that's a pure single-shape prefill tuning question. Worth its own focused micro-optimization. |
+
+So the priority order for gap-closing is **M_b.2 first, then M3.5, then M_d**;
+prefill-heavy is the only follow-up that needs to be attacked in this
+gap-followup plan as a standalone item. Don't burn a sprint reproducing
+spec-decode work that the combo plan already specs.
+
 ## Acceptance
 
 - Publish a follow-up wins or errors entry with at least one closed gap.
@@ -49,3 +67,6 @@ Primary snapshot:
   CUDA runner repeats the workload.
 - Keep the M6 raw command shapes unchanged unless the change is explicitly
   documented as a new benchmark variant.
+- For the three gaps that map to combo plan sub-plans, gap closure happens
+  when the combo plan sub-plan lands — this plan tracks the bench delta
+  per sub-plan, not duplicate implementations.
