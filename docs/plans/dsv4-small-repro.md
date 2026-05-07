@@ -1,10 +1,24 @@
 # DSv4 Small-Scale Full-Method Repro Plan (Single 4070 Ti SUPER 16 GiB)
 
-**Status:** scoping (2026-05-07)
+> ⚠️ **Architecture truth source: [`../projects/2026-05-07-dsv4-truth.md`](../projects/2026-05-07-dsv4-truth.md)**
+> 本 plan 的 architecture / config sections(§1-§2)曾基于 DeepSeek-V4-Pro/Flash
+> 官方 config + 我们的手工缩放。2026-05-07 引入 HF replica
+> [`kshitijthakkar/deepseek-v4-mini-1B-init`](https://huggingface.co/kshitijthakkar/deepseek-v4-mini-1B-init)
+> 作为"唯一真理":**架构维度全部以 truth doc §1 为准**。本 plan 旧 §1.1-§2
+> 部分内容与 truth doc 不一致(vocab 49152 vs 129280 / experts 32 vs 16 /
+> head_dim 128 vs 64 等),**rewriting 进行中**;在完成前以 truth doc 优先。
+>
+> 本 plan 保留的部分:**训练方法论**(§3 数据源 / §4 训练 pipeline / §5 评估 /
+> §6 后续工作)— 这些与具体 config size 解耦,继续有效。
+
+**Status:** rewriting in progress(2026-05-07,truth doc 引入后部分超 deprecated)
 **Owner:** ckl
 **Hardware:** 1 × RTX 4070 Ti SUPER 16 GiB · CUDA 13.2 · cuDNN 9.21 · Linux · `.venv` at `/home/ckl/projects/arle/.venv`
-**Goal:** **From-scratch pre-train** of a ~1 B-parameter model that is a 1:1 architectural / methodological copy of DeepSeek-V4 (Apr 24, 2026 release), shrunk to fit on one 16 GiB consumer GPU. **Not** distill, **not** SFT, **not** LoRA — a real cold-path pre-train.
-**Companion plan:** [`2026-05-05-deepseek-v4-small-substrate.md`](2026-05-05-deepseek-v4-small-substrate.md) covers the runtime substrate (MLA-era V3 fixtures + nano training driver). This plan is scoped narrower (one SKU, V4-era) and deeper (full method, all data sources, all hyper-params).
+**Goal:** **From-scratch pre-train** of the architecture defined in
+[truth doc §1](../projects/2026-05-07-dsv4-truth.md#1-权威架构hf-replica-deepseek-v4-mini-1b-init)
+on one 16 GiB consumer GPU. **Not** distill, **not** SFT, **not** LoRA — a real
+cold-path pre-train using HF replica `deepseek-v4-mini-1B-init` config as canonical.
+**Companion plan:** [`2026-05-05-deepseek-v4-small-substrate.md`](2026-05-05-deepseek-v4-small-substrate.md) covers the runtime substrate (MLA-era V3 fixtures + nano training driver) — also being rewritten to reference truth doc.
 
 ---
 
@@ -55,6 +69,14 @@ If `Muon master + momentum` is moved to **CPU offload** (DeepSpeed ZeRO-Offload,
 ---
 
 ## 1. DSv4 architectural ground truth
+
+> ⚠️ **DEPRECATED in favor of [truth doc §1](../projects/2026-05-07-dsv4-truth.md#1-权威架构hf-replica-deepseek-v4-mini-1b-init)**.
+> 下方 §1.1-§1.6 描述的是 DSv4-Pro / DSv4-Flash 完整版架构,作为**背景资料**
+> 保留;具体的 dsv4-mini 数值以 truth doc 为准(基于 HF replica 1B-init config)。
+> 数值不一致点(plan vs truth):vocab 49152 vs 129280;head_dim 128 vs 64;
+> q_lora_rank 512 vs 384;experts 32/4 vs 16/2;moe_intermediate_size 1408 vs
+> 512;sliding_window 128 vs 64;index_topk 256 vs 128;num_hash_layers 3 vs 2;
+> compress_ratios pattern 不同;YaRN factor 8 vs 16;max_position 65k vs 1M。
 
 All numbers below are from the official `config.json` of `deepseek-ai/DeepSeek-V4-Pro` and `DeepSeek-V4-Flash-Base` (released 2026-04-24), the Hugging Face DSv4 blog post, the technical report PDF (`deepseek-V4-model-card-EN.pdf`), and the Muon scalability paper. Items the public docs do not pin down are tagged **[假设]**.
 
@@ -127,7 +149,10 @@ For the small-scale repro, **we ship pre-train + a token-budget GRPO pass on mat
 
 ## 2. dsv4-mini — exact config
 
-Single `config.json` (compatible with `transformers` ≥ 4.57.1; same loader path that V4-Pro/Flash use):
+> ⚠️ **DEPRECATED — see [truth doc §1](../projects/2026-05-07-dsv4-truth.md#1-权威架构hf-replica-deepseek-v4-mini-1b-init)
+> for canonical `config.json`**(HF replica `deepseek-v4-mini-1B-init`).
+> 下方 JSON 是早期手工缩放设计,与 HF replica 不一致;**不要用于实际训练**。
+> 保留作为 reasoning/scaling 思路的历史记录。后续 rewrite 会删除整段。
 
 ```json
 {
