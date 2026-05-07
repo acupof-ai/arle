@@ -1658,6 +1658,31 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// M_e.1 P2.1 — clone the live K (axis=0) or V (axis=1) cache for
+    /// `layer_idx` out of the active C++ session. Returns the full cache
+    /// shape `[1, n_kv_heads, kv_capacity, head_dim]`; callers slice
+    /// the live region via `cache_len`. Errors if no session is active
+    /// or the indices are out of range.
+    #[allow(dead_code)]
+    pub(super) fn clone_session_kv(&self, layer_idx: i32, kv_axis: i32) -> Result<MlxArray> {
+        let mut out_array: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_session_kv_clone(
+                self.raw,
+                layer_idx,
+                kv_axis,
+                &raw mut out_array,
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_array) })
+    }
+
     pub(super) fn prefill_session(
         &self,
         tokens: &MlxArray,
