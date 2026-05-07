@@ -1658,6 +1658,46 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// M_e.1 P3.1a — paged variant of step_session. The new entry point
+    /// accepts gathered per-layer K/V tensors but ignores them in P3.1a
+    /// (behavior is identical to step_session). Wired now so that P3.1b
+    /// can switch Qwen35StepDriver::run_step over without further FFI
+    /// changes; P3.1c flips the SDPA read source on the C++ side.
+    #[allow(dead_code)]
+    pub(super) fn step_session_paged(
+        &self,
+        token: &MlxArray,
+        cache_pos: i32,
+        k_full_per_layer: &mut [*mut mlx_sys::mlx_array],
+        v_full_per_layer: &mut [*mut mlx_sys::mlx_array],
+    ) -> Result<MlxArray> {
+        assert_eq!(
+            k_full_per_layer.len(),
+            v_full_per_layer.len(),
+            "step_session_paged: K and V arrays must have the same length"
+        );
+        let n_full_layers = k_full_per_layer.len() as i32;
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_step_session_paged(
+                self.raw,
+                token.as_raw(),
+                cache_pos,
+                k_full_per_layer.as_mut_ptr(),
+                v_full_per_layer.as_mut_ptr(),
+                n_full_layers,
+                &raw mut out_logits,
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
     /// M_e.1 P2.1 — clone the live K (axis=0) or V (axis=1) cache for
     /// `layer_idx` out of the active C++ session. Returns the full cache
     /// shape `[1, n_kv_heads, kv_capacity, head_dim]`; callers slice
