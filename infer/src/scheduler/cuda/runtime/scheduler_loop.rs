@@ -5,6 +5,7 @@
 //! prefix-cache eviction tick, wakeup-channel orchestration, and `free_slots`.
 
 use super::super::budget::{PageBudget, estimated_request_target};
+use super::super::nvtx_scopes::nvtx_scope;
 use super::super::{ModelForward, Phase, STATS_LOG_INTERVAL, Scheduler, error, info};
 use super::helpers::{
     DeferredWaitingRequest, WaitingInsertBias, choose_session_affinity_candidate,
@@ -120,6 +121,7 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
 
+            nvtx_scope!("step_total");
             let step_start = std::time::Instant::now();
             self.assign_slots();
             let assign_us = step_start.elapsed().as_micros();
@@ -198,6 +200,7 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn assign_slots(&mut self) {
+        nvtx_scope!("step_admission");
         if self.waiting.is_empty() {
             return;
         }

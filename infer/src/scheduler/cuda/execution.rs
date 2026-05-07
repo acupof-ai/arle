@@ -1,4 +1,5 @@
 use super::budget::{PageBudget, PageGrowth, StepTokenBudget, clipped_max_new_tokens_estimate};
+use super::nvtx_scopes::nvtx_scope;
 use super::spec_path::SpecPath;
 use super::{ModelForward, Phase, Scheduler, info};
 use crate::metrics::SchedulerPlanLabel;
@@ -231,6 +232,7 @@ fn cap_prefill_candidates_by_tokens(
 
 impl<M: ModelForward> Scheduler<M> {
     fn dispatch_decode_emits(&mut self) -> u128 {
+        nvtx_scope!("step_dispatch_emits");
         let emit_t = std::time::Instant::now();
         let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
         for slot_idx in decode_slots {
@@ -685,9 +687,13 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
 
-        let plan_t = std::time::Instant::now();
-        let plan = self.plan_step();
-        let admission_us = assign_us + plan_t.elapsed().as_micros();
+        let (plan, plan_us) = {
+            nvtx_scope!("step_plan");
+            let plan_t = std::time::Instant::now();
+            let plan = self.plan_step();
+            (plan, plan_t.elapsed().as_micros())
+        };
+        let admission_us = assign_us + plan_us;
         let scheduled_prefill_rows = plan.scheduled_prefill_rows();
         let scheduled_prefill_tokens = plan.scheduled_prefill_tokens();
         self.metrics.record_scheduler_plan(plan.metrics_label());
