@@ -318,6 +318,14 @@ const TILELANG_PREFILL_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (1
 /// `infer/src/ops/attention.rs`.
 const TILELANG_DECODE_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16, 4)];
 
+/// One AOT-specialized decode HD128 kernel per (num_q_heads, num_kv_heads).
+/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd128.py`
+/// — when adding a new Qwen3 full-attn head config, extend both lists in
+/// lockstep AND add the matching FFI extern + dispatch arm in
+/// `crates/cuda-kernels/src/ffi/attention.rs` and
+/// `infer/src/ops/attention.rs`.
+const TILELANG_DECODE_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (40, 8), (64, 8)];
+
 struct TileLangKernelSpec {
     artifact_dir: String,
     kernel_path: &'static str,
@@ -735,6 +743,33 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         );
     }
 
+    for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_decode_paged_hd128_{suffix}"),
+            kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
+            kernel_name: format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
+            out_name: format!("tilelang_batch_decode_paged_hd128_{suffix}"),
+            kernel_family: "attention",
+            kernel_key: None,
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_CALL_ARGS,
+        };
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &spec,
+            &mut generated_sources,
+        );
+    }
+
     let gdr_specs = [
         TileLangKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_prepare".to_string(),
@@ -841,7 +876,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill, HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill, HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
         sm_targets.len()
     );
     for entry in std::fs::read_dir("tools/tilelang")
