@@ -79,7 +79,9 @@ struct Args {
     #[arg(long, value_name = "PATH_OR_REPO")]
     dflash_draft_model: Option<String>,
 
-    /// Enable the experimental Metal KV pool for the Qwen3 fallback path.
+    /// Enable the experimental Metal KV pool for Qwen3 (production) and
+    /// Qwen3.5 (M_e.1 P2.0: pool is allocated but not yet read/written —
+    /// dual-write lands in P2.1 and the kernel cutover in P3.1).
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_kv_pool")]
     kv_pool: bool,
 
