@@ -1,5 +1,13 @@
 # ARLE Codebase Map
 
+> **2026-05-08 — see [`architecture-snapshot-2026-05-07-eod.md`](architecture-snapshot-2026-05-07-eod.md)**
+> for today's incremental ground-truth audit covering 41+ commits since this
+> doc's last edit:M_pf-fuse / M_pf-gemm / M_b.2.2 split-KV all KILLED;
+> M_pf-graph-prefill-capture promoted P0 #1 by SGLang+ARLE callgraph dual
+> evidence;ARLE 4-shape verdict completed(high-conc +69% past SGLang ⭐;
+> longctx 4k −51% TTFT;longctx 8k throughput tied with vLLM −1.6%);M_world1
+> P0.1+P0.2 baselines logged。本 doc 仍是结构性 truth 的来源,但今日变化点请先看 snapshot。
+
 Updated 2026-05-06 after the DSV4 runtime substrate scaffold + nano autograd
 training landed (2026-05-05). DSV4 is the **#1 next-model priority** and Qwen 3.6
 the **#2** — see
