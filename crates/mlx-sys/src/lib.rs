@@ -711,6 +711,23 @@ unsafe extern "C" {
         kv_axis: i32,
         out_array: *mut *mut mlx_array,
     ) -> i32;
+    /// M_e.1 P3.1a — paged variant of step_session. Accepts pre-gathered
+    /// per-layer K/V tensors (one per full attention layer for K and V).
+    /// In P3.1a the new arguments are accepted but ignored; behavior is
+    /// identical to step_session. P3.1b makes Rust call this with the
+    /// pool's gathered K/V; P3.1c flips the C++ side to read attention
+    /// K/V from these inputs (eliminating the left-pad slice_update
+    /// path); P3.1d removes the legacy step_session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_step_session_paged(
+        model: *mut std::ffi::c_void,
+        token_id: *mut mlx_array,
+        cache_pos: i32,
+        k_full_per_layer: *mut *mut mlx_array,
+        v_full_per_layer: *mut *mut mlx_array,
+        n_full_layers: i32,
+        out_logits: *mut *mut mlx_array,
+    ) -> i32;
     pub fn qwen35_compiled_prefill_session(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,

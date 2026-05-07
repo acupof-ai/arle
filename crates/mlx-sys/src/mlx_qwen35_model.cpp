@@ -2044,6 +2044,87 @@ int32_t qwen35_compiled_session_kv_clone(
     }
 }
 
+// M_e.1 P3.1a — paged-KV variant of step_session. Accepts pre-gathered
+// per-layer K/V tensors so the kernel can (in P3.1c) read attention K/V
+// directly from MetalKVPool's slot layout instead of slice_update'ing the
+// session's left-pad cache. For now (P3.1a) the body is identical to
+// step_session — the new arguments are accepted but not yet consumed.
+// P3.1b will call this entry point (with parity-checked gathered K/V),
+// P3.1c will switch SDPA to read from those inputs, P3.1d will retire the
+// legacy step_session entry point.
+int32_t qwen35_compiled_step_session_paged(
+    void* model,
+    mlx_array* token_id,
+    int32_t cache_pos,
+    mlx_array** k_full_per_layer, // n_full_layers entries, nullable for legacy fallthrough
+    mlx_array** v_full_per_layer, // n_full_layers entries, nullable for legacy fallthrough
+    int32_t n_full_layers,
+    mlx_array** out_logits
+) {
+    (void)k_full_per_layer; // P3.1c will consume these
+    (void)v_full_per_layer;
+    (void)n_full_layers;
+
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    const int32_t capture_started = maybe_capture_qwen35_step_begin();
+    try {
+        mlx_clear_error();
+
+        if (!m->session_active) {
+            throw std::runtime_error(
+                "qwen35_compiled_step_session_paged requires an active session");
+        }
+
+        const int32_t n_kv = static_cast<int32_t>(m->session_kv_caches.size());
+        const int32_t n_gdr = static_cast<int32_t>(m->session_gdr_states.size());
+
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_id));
+        for (const auto& kv : m->session_kv_caches) {
+            inputs.push_back(kv);
+        }
+        for (const auto& gdr : m->session_gdr_states) {
+            inputs.push_back(gdr);
+        }
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        if (capture_started) {
+            eval(outputs);
+        }
+
+        std::vector<array> next_kv_caches;
+        std::vector<array> next_gdr_states;
+        next_kv_caches.reserve(n_kv);
+        next_gdr_states.reserve(n_gdr);
+        for (int i = 0; i < n_kv; ++i) {
+            next_kv_caches.push_back(std::move(outputs[1 + i]));
+        }
+        for (int i = 0; i < n_gdr; ++i) {
+            next_gdr_states.push_back(std::move(outputs[1 + n_kv + i]));
+        }
+
+        auto* logits = from_arr(std::move(outputs[0]));
+        m->session_kv_caches = std::move(next_kv_caches);
+        m->session_gdr_states = std::move(next_gdr_states);
+        *out_logits = logits;
+        maybe_capture_qwen35_step_end(capture_started);
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        maybe_capture_qwen35_step_end(capture_started);
+        return -1;
+    }
+}
+
 int32_t qwen35_compiled_step_session(
     void* model,
     mlx_array* token_id,
