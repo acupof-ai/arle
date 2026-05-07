@@ -146,7 +146,7 @@ Phase 2 acceptance:
 | # | Task | Owner | LOC | Trigger |
 |---|---|---:|---:|---|
 | 0 | Confirm SGLang log evidence for 42 buckets | Claude | 0 | before impl |
-| 1 | Audit Qwen3 paged prefill for allocation/event/H2D in layer loop | Explore | 0 | Phase 0 |
+| 1 | ✅ Audit done — see [`docs/research/2026-05-07-arle-prefill-graph-readiness-audit.md`](../research/2026-05-07-arle-prefill-graph-readiness-audit.md):3 hard blockers + 5 soft blockers + 3 graph-safe nodes,LOC est 245-315 after decode-infra reuse | Claude | 0 | DONE |
 | 2 | Add opt-in env gate and 2048 bucket constant | general-purpose | 20 | Phase 0 |
 | 3 | Split Qwen3 paged prefill into prepare/body/finish helpers | general-purpose | 80 | Phase 0 |
 | 4 | Add token-count graph cache and capture/replay | general-purpose | 80 | Phase 0 |
@@ -159,7 +159,11 @@ Phase 2 acceptance:
 
 ## Cross-References
 
+- **Audit (task #1 done)**: `docs/research/2026-05-07-arle-prefill-graph-readiness-audit.md`
+  — 3 hard blockers + 5 soft + LOC est + risks + Phase 0 consolidation path
 - R1 survey: `docs/research/2026-05-07-sglang-prefill-stack-survey.md`
+  at commit `7ef707d`.
+- ARLE callgraph: `docs/research/2026-05-07-arle-prefill-gemm-callgraph.md`
   at commit `7ef707d`.
 - M_world1 full table/key innovation:
   `docs/experience/wins/2026-05-07-m_world1-p0-sglang-baseline-extended.md`
