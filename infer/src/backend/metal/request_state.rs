@@ -2408,6 +2408,12 @@ fn sync_qwen35_packed_decode_batch<'a>(
     Ok(())
 }
 
+// M_e.0 trace probe — log function entry once to confirm dispatch path.
+#[allow(dead_code)]
+static DECODE_QWEN35_PACKED_PROBE: std::sync::Once = std::sync::Once::new();
+#[allow(dead_code)]
+static DECODE_QWEN35_BATCH_PROBE: std::sync::Once = std::sync::Once::new();
+
 fn decode_qwen35_packed_batch<'a>(
     states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
     batch: &mut Qwen35PackedDecodeBatch<'a>,
@@ -2444,6 +2450,12 @@ fn decode_qwen35_packed_batch<'a>(
             &[i32::try_from(states.len())
                 .context("decode_qwen35_packed_batch batch size overflow")?],
         );
+
+    DECODE_QWEN35_PACKED_PROBE.call_once(|| {
+        log::info!(
+            "qwen35_path_probe: decode_qwen35_packed_batch FIRED (varlen path with left_padding)"
+        );
+    });
 
     // Only materialize the additive attention mask when at least one row is
     // left-padded; same-length batches take the no-mask fast path (identical
@@ -2976,6 +2988,10 @@ fn rows_agree_on_dflash_batch_cross_row_predicates<'a>(
 fn decode_qwen35_batch(
     states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'_>>],
 ) -> Result<Vec<u32>> {
+    DECODE_QWEN35_BATCH_PROBE.call_once(|| {
+        log::info!("qwen35_path_probe: decode_qwen35_batch FIRED (same-length non-varlen path)");
+    });
+
     ensure!(
         !states.is_empty(),
         "decode_qwen35_batch requires at least one request state"
@@ -3065,6 +3081,19 @@ fn decode_qwen35_batch(
     let rope_offsets_data: Vec<i32> = vec![cache_len; states.len()];
     let rope_offsets = MlxArray::from_slice_i32(&rope_offsets_data, &[batch]);
 
+    // M_e.0 profile (env-gated): time the major phases of
+    // decode_qwen35_batch so we can attribute the c=4 ITL gap to
+    // step_batch vs concat-split vs pool-write. Set
+    // AGENT_INFER_QWEN35_PHASE_TIMING=1 to enable; logs roll-up every
+    // 32 steps. No-op when env var is unset.
+    let phase_trace = std::env::var_os("AGENT_INFER_QWEN35_PHASE_TIMING")
+        .is_some_and(|v| matches!(v.to_string_lossy().as_ref(), "1" | "true" | "on" | "yes"));
+    let phase_t0 = if phase_trace {
+        Some(Instant::now())
+    } else {
+        None
+    };
+
     // M_e.1 P3.1c.3c — when --kv-pool is on for ALL states, route
     // through step_batch_paged. P3.1c.3b's C++ body is identical to
     // step_batch (new args ignored) so logits stay bit-equal. We pass
@@ -3114,6 +3143,7 @@ fn decode_qwen35_batch(
     step_outputs.extend(flat_kv.iter());
     step_outputs.extend(flat_gdr.iter());
     eval(&step_outputs);
+    let phase_t_step_eval = phase_t0.as_ref().map(Instant::elapsed);
 
     let logits_shape = logits.shape().to_vec();
     ensure!(
@@ -3175,6 +3205,7 @@ fn decode_qwen35_batch(
         kv_iter.next().is_none() && gdr_iter.next().is_none(),
         "decode_qwen35_batch produced unexpected extra state outputs"
     );
+    let phase_t_split = phase_t0.as_ref().map(Instant::elapsed);
 
     // M_e.1 P3.1c.3a — when --kv-pool is on, dual-write each state's
     // just-written K/V column from its updated cpp.kv_flat into the
@@ -3220,7 +3251,50 @@ fn decode_qwen35_batch(
         }
     }
 
+    if let (Some(t0), Some(eval_d), Some(split_d)) = (phase_t0, phase_t_step_eval, phase_t_split) {
+        let total_d = t0.elapsed();
+        log_qwen35_phase_timing(batch, eval_d, split_d, total_d);
+    }
+
     Ok(sampled_tokens)
+}
+
+/// M_e.0 profile — accumulate decode_qwen35_batch phase timings under
+/// AGENT_INFER_QWEN35_PHASE_TIMING and roll up every 32 steps. Static
+/// state so the report is one log line per ~32 steps regardless of
+/// concurrency; gives direct evidence on whether the c=4 gap lives in
+/// the C++ step_batch eval or in the Rust-side concat/split loop.
+fn log_qwen35_phase_timing(
+    batch: i32,
+    step_eval_dur: std::time::Duration,
+    after_split_dur: std::time::Duration,
+    total_dur: std::time::Duration,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    static SUM_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+    static SUM_STEP_US: AtomicU64 = AtomicU64::new(0);
+    static SUM_SPLIT_US: AtomicU64 = AtomicU64::new(0);
+
+    let total_us = total_dur.as_micros() as u64;
+    let step_us = step_eval_dur.as_micros() as u64;
+    let split_us = after_split_dur.as_micros() as u64;
+
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    SUM_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
+    SUM_STEP_US.fetch_add(step_us, Ordering::Relaxed);
+    SUM_SPLIT_US.fetch_add(split_us, Ordering::Relaxed);
+
+    if n % 32 == 0 {
+        let total_avg = SUM_TOTAL_US.load(Ordering::Relaxed) / n;
+        let step_avg = SUM_STEP_US.load(Ordering::Relaxed) / n;
+        let split_avg = SUM_SPLIT_US.load(Ordering::Relaxed) / n;
+        let post_split_avg = total_avg.saturating_sub(split_avg);
+        log::info!(
+            "qwen35_phase[B={batch} n={n}]: total={total_avg}us step_eval={step_avg}us \
+             split_done={split_avg}us post_split={post_split_avg}us",
+        );
+    }
 }
 
 fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver<'_>>]) -> bool {
