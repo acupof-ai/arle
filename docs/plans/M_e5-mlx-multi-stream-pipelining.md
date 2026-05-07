@@ -1,8 +1,33 @@
 # M_e.5 — MLX multi-stream encode pipelining for c≥1 Metal decode
 
-**Owner:** ckl · **Status:** designed 2026-05-07 (subagent), awaiting impl tick
+**Owner:** ckl · **Status:** v1 implemented and falsified 2026-05-07
 **Track:** Metal scheduler · **Predecessor:** M_e.1 oMLX-C v3 (default-on),
   M_e.4 SwiGLU compile-fusion
+
+## ⚠️ Erratum 2026-05-07 — v1 regresses, encoder is on caller thread
+
+The v1 implementation (rotate `mlx::core::StreamContext` between two
+streams around `m->forward(inputs)` per call) **regresses Qwen3.6
+35B-A3B-4bit by 5-13% across c=1/c=4/c=8** when enabled — opposite
+of the predicted ~6-12 ms/step win. Path probe confirms the rotation
+fires; the regression is real.
+
+Root cause: `mx::async_eval` does the encoder work **synchronously on
+the caller thread** (per `mlx/transforms.cpp::eval_impl(... async=true)`
+source). Only GPU completion is async. The "per-stream `StreamThread`
+worker" reading from `mlx/scheduler.h` was optimistic — that worker
+doesn't take encode work off the caller thread today. The cross-stream
+fences MLX inserts on KV-cache reads (when step N+1 on stream B
+consumes step N's KV from stream A) cost real GPU-queue time without
+the encoder-overlap benefit we expected.
+
+Full post-mortem with bench numbers:
+[`docs/experience/errors/2026-05-07-m_e5-naive-dual-stream-regresses.md`](../experience/errors/2026-05-07-m_e5-naive-dual-stream-regresses.md).
+
+The implementation **stays in tree behind `INFER_METAL_DUAL_STREAM=1`
+(default OFF)** as scaffolding; v2 would need either an MLX-side
+change (out of scope) or a dedicated encode-thread inside ARLE (M+
+effort). Original v1 design retained below for context.
 
 ## Goal
 
