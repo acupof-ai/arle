@@ -6,11 +6,14 @@
 > survey of the actual surface — Steps 2 (NFC) and 3 (chat-template fp)
 > are unnecessary in ARLE for the reasons noted below.
 
-## P0 survey findings (2026-05-07)
+## P0 survey findings (2026-05-07; refined post codex review)
 
-`grep` + targeted reads of `infer/src/tokenizer.rs`,
+First-pass `grep` + targeted reads of `infer/src/tokenizer.rs`,
 `infer/src/prefix_cache.rs`, `infer/src/http_server/`, and
-`crates/chat/src/` exposed three facts that simplify the original sketch:
+`crates/chat/src/` exposed three simplifications. Codex review of
+HEAD `78833f7` then surfaced two additional production-surface
+corrections (folded into Steps 2 + 3 below); the sketch is now an
+accurate map of every cache instance that needs the namespace.
 
 | Original sketch step | P0 finding | Decision |
 |---|---|---|
@@ -62,11 +65,16 @@ Cost: pulls `sha2` into `infer/Cargo.toml` (already a transitive dep
 via `cudarc` and `tokenizers`). One `std::fs::read` of `tokenizer.json`
 (typically ~7 MB for Qwen3) at boot — adds <50 ms to startup.
 
-### 2. `RadixCache` namespace field
+### 2. `RadixCache` namespace field — close the public-derive bypass
 
 `infer/src/prefix_cache.rs`:
 
 ```rust
+// Remove `#[derive(Serialize, Deserialize)]` from `RadixCache` —
+// public derive is a bypass: any caller can do
+// `serde_json::from_str::<RadixCache>(s)` and skip the namespace
+// check. Replace with custom impls.
+
 pub struct RadixCache {
     nodes: Vec<Node>,
     free_nodes: Vec<usize>,
@@ -82,34 +90,55 @@ pub struct RadixCache {
 
 impl RadixCache {
     pub fn new(block_size: usize) -> Self {
-        Self::new_with_namespace(block_size, [0; 32])  // legacy default
+        Self::new_with_namespace(block_size, [0; 32])  // legacy/test default
     }
 
     pub fn new_with_namespace(block_size: usize, namespace: [u8; 32]) -> Self { ... }
 
+    pub fn with_soft_pin_keepalive_namespaced(
+        block_size: usize,
+        soft_pin_keepalive_ticks: u64,
+        namespace: [u8; 32],
+    ) -> Self { ... }
+
     pub fn namespace(&self) -> &[u8; 32] { &self.namespace }
+
+    /// THE ONLY snapshot-load API. Custom-implements serde so the
+    /// derive can be removed; takes the expected namespace and rejects
+    /// any snapshot whose stored namespace differs.
+    pub fn load_snapshot(json: &str, expected_namespace: &[u8; 32])
+        -> Result<Self> { ... }
+
+    /// Snapshot serialization stays public via custom Serialize impl
+    /// (writes `namespace` field). No restore-side bypass remains.
+    pub fn save_snapshot(&self) -> String { ... }
 }
 ```
 
-Snapshot load (`from_serde`) MUST verify namespace match before
-returning the deserialized cache; mismatch → return error, not silent
-acceptance. This is the contract that prevents the cache-hit-on-stale-tokenizer
-silent corruption.
+The four existing `serde_json::from_str::<RadixCache>` call sites in
+`infer/src/prefix_cache/tests.rs` (lines 800, 837, 861, 910) MUST migrate
+to `RadixCache::load_snapshot(&json, &expected_namespace)`. After the
+migration `RadixCache: !Deserialize` is the type-system guarantee that
+no future code can bypass the namespace check.
 
-### 3. Server boot wiring
+### 3. Server boot wiring — corrected to actual call sites
 
-Two call sites to update:
+Codex review (HEAD `78833f7` → review feedback) corrected the original
+draft: the production cache surfaces are NOT what was named.
 
-- `scheduler/cuda/core.rs` — wherever `RadixCache::new(block_size)` is
-  called for the CUDA scheduler. Replace with
-  `RadixCache::new_with_namespace(block_size, derive_namespace(&tokenizer))`
-  where `derive_namespace` = `sha256(tokenizer.fingerprint() ++ env!("CARGO_PKG_VERSION") ++ build_git_sha)`.
-- `backend/metal/prefix_cache.rs:38` — same swap.
+| Surface | Actual call site | Action |
+|---|---|---|
+| CUDA scheduler RadixCache | `infer/src/scheduler/cuda/core/construction.rs:269` — `RadixCache::with_soft_pin_keepalive(...)` | Swap to `with_soft_pin_keepalive_namespaced(..., derive_namespace(&tokenizer))` |
+| Metal RadixCache (Qwen3 path) | `infer/src/backend/metal/prefix_cache.rs:38` — `RadixCache::new(block_size)` | Swap to `RadixCache::new_with_namespace(block_size, derive_namespace(&tokenizer))` |
+| Metal Qwen3.5 prefix runtime | `infer/src/backend/metal/runtime.rs:416-418` — `MetalQwen35PrefixRuntime { entries: HashMap<Vec<u32>, _>, disk_entries: HashMap<Vec<u32>, _> }` — independent cache, NOT a `RadixCache` instance | Add `namespace: [u8; 32]` field; SSD disk format includes namespace header; `reconcile_disk_entries` rejects on-disk entries whose namespace ≠ runtime namespace; `entries` lookup is in-memory only and inherits namespace via instance ownership |
 
-Server boot logs the namespace at INFO:
-`"radix-cache namespace: tokenizer=<hex16> build=<hex8>"`. Operators
-who hot-swap `tokenizer.json` will see the namespace change after
-restart and know the cache cleared. Silent swap mid-run is not
+`derive_namespace` = `sha256(tokenizer.fingerprint() ++ env!("CARGO_PKG_VERSION") ++ build_git_sha)`.
+The same helper feeds all three surfaces — single source of truth.
+
+Server boot logs the namespace at INFO once per active backend:
+`"prefix-cache namespace: surface=<cuda|metal-qwen3|metal-qwen35> tokenizer=<hex16> build=<hex8>"`.
+Operators who hot-swap `tokenizer.json` will see the namespace change
+after restart and know the cache cleared. Silent swap mid-run is not
 defended against (the loaded `Tokenizer` instance keeps its old
 fingerprint until restart) — that's the operator-policy half of the
 contract, not code.
@@ -120,28 +149,42 @@ contract, not code.
 
 1. Create RadixCache A with namespace `[0xAA; 32]`, insert blocks for
    token sequence `[1, 2, 3, 4]`.
-2. Snapshot A to bytes via serde.
-3. Try to load the snapshot into RadixCache B with namespace
-   `[0xBB; 32]` — assert error.
-4. Create RadixCache C fresh with namespace `[0xBB; 32]`, lookup
-   `[1, 2, 3, 4]`, assert MISS (no shared state with A).
+2. `let json = A.save_snapshot();`
+3. `assert!(RadixCache::load_snapshot(&json, &[0xBB; 32]).is_err())` —
+   wrong-namespace load rejected.
+4. `let restored = RadixCache::load_snapshot(&json, &[0xAA; 32])?;` —
+   matching-namespace load succeeds and returns the original cache.
+5. Create RadixCache C fresh with namespace `[0xBB; 32]`, lookup
+   `[1, 2, 3, 4]`, assert MISS (no shared state with A — different
+   instance, different namespace).
+6. **Compile-time guard test**: a `compile_fail` doctest or `trybuild`
+   case asserts `serde_json::from_str::<RadixCache>(_)` no longer
+   compiles after the derive removal. This is the structural guarantee
+   that the bypass cannot regress.
+7. Metal Qwen3.5 SSD case: write a fake disk entry with namespace
+   header `[0xAA; 32]`, instantiate `MetalQwen35PrefixRuntime` with
+   namespace `[0xBB; 32]`, call `reconcile_disk_entries`, assert the
+   `[0xAA]` disk entry is rejected (logged + dropped) and not surfaced
+   in `disk_entries`.
 
-This is a CPU-only test (~10 ms), runs in `cargo test --release` no
-features needed. Catches future refactors that bypass the namespace
-check.
+This is a CPU-only test (~50 ms, includes a tempdir for the SSD case),
+runs in `cargo test --release`. Catches future refactors that bypass
+the namespace check on either the in-memory or on-disk surface.
 
 ## Tasks
 
 | # | Task | File | LOC est. | Owner |
 |---|---|---|---|---|
 | 1 | Add `fingerprint: [u8; 32]` to `Tokenizer`, compute in `from_file`, expose `fingerprint()` | `infer/src/tokenizer.rs` | ~15 | Claude |
-| 2 | Add `namespace: [u8; 32]` to `RadixCache`, `new_with_namespace`, snapshot-load mismatch check | `infer/src/prefix_cache.rs` | ~30 | Claude |
-| 3 | Server boot wiring (CUDA + Metal call sites + INFO log) | `scheduler/cuda/core.rs`, `backend/metal/prefix_cache.rs`, `main.rs` | ~20 | Claude |
-| 4 | Test: namespace isolation + snapshot-mismatch reject | `infer/tests/tokenizer_fingerprint_radix_isolation.rs` (new) | ~80 | Claude |
+| 2 | Add `namespace` to `RadixCache`; remove public `#[derive(Serialize, Deserialize)]`; custom `save_snapshot` / `load_snapshot(json, &expected_namespace)` API; add `with_soft_pin_keepalive_namespaced` constructor | `infer/src/prefix_cache.rs` | ~80 | Claude |
+| 2b | Migrate 4 in-tree `serde_json::from_str::<RadixCache>` call sites to `load_snapshot` | `infer/src/prefix_cache/tests.rs` (lines 800, 837, 861, 910) | ~20 | Claude |
+| 3 | Server boot wiring — CUDA `with_soft_pin_keepalive_namespaced` + Metal Qwen3 `new_with_namespace` + Metal Qwen3.5 runtime namespace field | `scheduler/cuda/core/construction.rs:269`, `backend/metal/prefix_cache.rs:38`, `backend/metal/runtime.rs:416-554` (incl. `reconcile_disk_entries` mismatch reject), `main.rs` boot log | ~70 | Claude |
+| 4 | Test: namespace isolation (in-memory + snapshot-mismatch + SSD-mismatch + compile-fail bypass-guard) | `infer/tests/tokenizer_fingerprint_radix_isolation.rs` (new) | ~150 | Claude |
 
-**Total: ~145 LOC, half-day.** Smaller than the original sketch
-because two of the five mitigations were already in place (NFC via HF
-config, chat template via build).
+**Total: ~335 LOC, ~1 day.** Larger than the first draft because
+codex review caught two missed surfaces (Metal Qwen3.5 runtime + the
+public derive bypass); both are required for the contract to actually
+hold.
 
 ## Acceptance
 
