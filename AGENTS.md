@@ -29,6 +29,36 @@ for BF16 attention; custom CUDA C handles quantized decode and supporting ops.
 Tests compare against JSON baselines in
 `infer/test_data/` — regenerate after any change affecting numerical output.
 
+**Metal canonical model — globally unified (2026-05-07).** All Metal
+backend development, benchmarking, and testing uses
+`mlx-community/Qwen3.6-35B-A3B-4bit` (MoE, ~19 GB, cached at
+`~/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit`).
+
+- **Why**: Qwen3.6 is the canonical Metal production target per
+  [`README.md`](README.md) backend matrix and the
+  [`ROADMAP.md`](ROADMAP.md) Next-Model priority queue. Benching against
+  the production shape catches MoE-specific perf and correctness
+  regressions that Qwen3.5-0.8B (dense) cannot surface.
+- **Scope**: every Metal `metal_serve` invocation, `scripts/bench_*.sh`
+  default, smoke test, and `docs/experience/wins`/`errors` entry on the
+  Metal track must use Qwen3.6. CUDA-side benches keep their existing
+  defaults.
+- **Opt-out**: Qwen3.5-0.8B-MLX-4bit and friends remain in
+  `models/` for unit tests that explicitly need a small model;
+  set `INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit` and document
+  the reason in the test/wins entry.
+- **Bench-script invocation**: `./scripts/bench_*.sh <label> --model
+  mlx-community/Qwen3.6-35B-A3B-4bit` (HF id; `metal_serve` resolves to
+  the cached snapshot). For `metal_serve` directly: `--model-path
+  mlx-community/Qwen3.6-35B-A3B-4bit`.
+- **MLX command-buffer tuning** (Metal-only, 2026-05-07): export
+  `MLX_MAX_OPS_PER_BUFFER=200 MLX_MAX_MB_PER_BUFFER=200` for any
+  Qwen3.6 bench at c≥8 — the MLX defaults (40 ops / 40 MB on M-base/pro)
+  fragment the GPU command buffer in MoE forward passes, costing ~3 ms
+  per step. Per
+  [`docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md`](docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md)
+  technique #2.
+
 **Workspace (current):**
 
 ```

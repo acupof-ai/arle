@@ -5,7 +5,7 @@
 #   ./scripts/start_metal_serve.sh [model-path-or-hf-id] [port] [-- extra metal_serve args]
 #
 # Defaults:
-#   model: ${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}}
+#   model: ${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3.6-35B-A3B-4bit}}
 #   port:  8000
 #   bind:  127.0.0.1
 #
@@ -23,13 +23,13 @@ Usage:
   ./scripts/start_metal_serve.sh [model-path-or-hf-id] [port] [-- extra metal_serve args]
 
 Defaults:
-  model: ${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}}
+  model: ${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3.6-35B-A3B-4bit}}
   port:  8000
   bind:  127.0.0.1
 
 Examples:
   ./scripts/start_metal_serve.sh
-  ./scripts/start_metal_serve.sh mlx-community/Qwen3-4B-bf16 8012 -- --warmup 0
+  ./scripts/start_metal_serve.sh mlx-community/Qwen3.6-35B-A3B-4bit 8012 -- --warmup 0
 
 The wrapper hides Cargo feature flags and runs:
   cargo run --release -p infer --no-default-features --features metal,no-cuda --bin metal_serve -- ...
@@ -56,7 +56,7 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-MODEL_PATH="${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3-0.6B-4bit}}"
+MODEL_PATH="${ARLE_MODEL:-${AGENT_INFER_MODEL:-mlx-community/Qwen3.6-35B-A3B-4bit}}"
 PORT="8000"
 
 if [[ $# -gt 0 && "${1}" != --* ]]; then
