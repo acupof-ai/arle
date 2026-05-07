@@ -190,6 +190,59 @@ else
     fi
 fi
 
+# Nsight Systems 2024+ removed `--attach-pid`. The attach-to-running-PID
+# pattern this wrapper was originally built around no longer works against
+# modern nsys; only spawn-the-target-under-nsys mode is supported.
+# Detect BEFORE resolving the server PID so the user sees the real cause
+# first (otherwise they'd hit the unrelated "no listening server" error).
+NSYS_VERSION_LINE="$(nsys --version 2>/dev/null | head -n1 || echo '')"
+NSYS_MAJOR="$(awk '{
+    for (i=1; i<=NF; i++) {
+        if (tolower($i) == "version" && (i+1) <= NF) {
+            split($(i+1), parts, ".")
+            print parts[1]
+            exit
+        }
+    }
+    print 0
+}' <<<"$NSYS_VERSION_LINE")"
+NSYS_MAJOR="${NSYS_MAJOR:-0}"
+if [[ "$DRY_RUN" != true ]] && (( NSYS_MAJOR >= 2024 )); then
+    cat >&2 <<EOF
+error: nsys ${NSYS_VERSION_LINE#NVIDIA Nsight Systems } removed --attach-pid
+       (the running-server-attach pattern this wrapper used). To run the
+       same Phase 1 / Phase 2 traces against ARLE or vLLM today, spawn the
+       server directly under \`nsys profile\` instead. Recipe:
+
+         # 1. (skip if already running) terminate the server you wanted to attach to
+         # 2. spawn it under nsys with delay+duration covering the bench window:
+
+         nsys profile \\
+           --output bench-output/<date>-<label>/<label> \\
+           --force-overwrite=true \\
+           --trace ${TRACE_SET} \\
+           --cuda-graph-trace ${CUDA_GRAPH_TRACE} \\
+           --delay <secs_to_skip_warmup> \\
+           --duration <bench_secs> \\
+           --kill none \\
+           <server-binary-with-args>
+
+         # 3. drive guidellm from a separate terminal during the duration window
+         # 4. nsys writes \`*.nsys-rep\` when --duration elapses; \`nsys stats\` reads it
+
+       Fully worked-out examples for ARLE and vLLM live in:
+         docs/experience/wins/2026-05-07-m3.6-phase1-nsys-arle-s48-highconc.md
+         docs/experience/wins/2026-05-07-m3.6-phase2-vllm-s14-bench.md
+       (the latter notes the deferred trace + the corrected --delay value
+       once vLLM nsys-startup overhead is accounted for).
+
+       This wrapper is preserved against older nsys (<2024) where
+       --attach-pid still exists. Migration to a session-API workflow is
+       tracked as a follow-up.
+EOF
+    exit 5
+fi
+
 SERVER_PID="$(profile_resolve_server_pid "$TARGET" "$SERVER_PID")"
 
 NSYS_CMD=(
