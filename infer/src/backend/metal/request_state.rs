@@ -2450,26 +2450,9 @@ fn phase_timing_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("INFER_PHASE_TIMING").is_ok())
 }
 
-// oMLX-C — multi-step async pipelining feature flag.
-// Default ON as of v3 (2026-05-07) after matched-A/B across 2 sessions
-// reproduced a 15.3% p50 ITL reduction at c=4 (5336μs vs 6296μs avg).
-// See docs/experience/wins/2026-05-07-bench-c4-omlx-c-v3.md.
-// Set INFER_OMLX_C=0 to fall back to the legacy sync-per-step path
-// (e.g. for A/B comparisons or to isolate regressions).
-#[inline(always)]
-fn omlx_c_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("INFER_OMLX_C")
-            .map(|v| v != "0" && v != "false")
-            .unwrap_or(true)
-    })
-}
-
-// oMLX-C path probe — fires once when the pipelined branch (prev_sampled
-// is Some) is first taken. Confirms via log that the flag is wired AND
-// the pipeline path is actually exercised.
+// oMLX-C path probe — fires once when the pipelined branch
+// (`prev_sampled` is Some) is first taken on a packed-batch decode.
+// Confirms the steady-state pipelined path is exercised under workload.
 static OMLX_C_PIPELINE_PROBE: std::sync::Once = std::sync::Once::new();
 
 fn decode_qwen35_packed_batch<'a>(
@@ -2490,13 +2473,12 @@ fn decode_qwen35_packed_batch<'a>(
     let phase_timing = phase_timing_enabled();
     let t0 = phase_timing.then(std::time::Instant::now);
 
-    // oMLX-C — pipelined c≥2 path (env-gated).
-    // Diverts to the pipelined helper when (a) the flag is set AND
-    // (b) we have a stashed `prev_sampled` from a previous call.
-    // The first call after batch construction always falls through
-    // to the legacy path, which now also stashes `new_sampled` so the
-    // second call can pipeline.
-    if omlx_c_enabled() && batch.prev_sampled.is_some() {
+    // oMLX-C — pipelined c≥2 path. Diverts to the pipelined helper
+    // once we have a stashed `prev_sampled` from a previous call. The
+    // first call after batch construction (or admission of new rows)
+    // falls through here for sync bootstrap, then stashes `new_sampled`
+    // before returning so subsequent calls take the pipelined branch.
+    if batch.prev_sampled.is_some() {
         return decode_qwen35_packed_batch_pipelined(states, batch, phase_timing, t0);
     }
 
@@ -2603,7 +2585,6 @@ fn decode_qwen35_packed_batch<'a>(
 
     batch.batch_cache_len += 1;
 
-    let stash_for_pipeline = omlx_c_enabled();
     let sampled_tokens = if qwen35_can_batch_sample(states) {
         let sampled = gpu_sample_token_batched(&logits, &states[0].driver.params);
         eval(&[&sampled]);
@@ -2615,12 +2596,12 @@ fn decode_qwen35_packed_batch<'a>(
             sampled_i32.len()
         );
         let tokens: Vec<u32> = sampled_i32.into_iter().map(|token| token as u32).collect();
-        // oMLX-C: stash sampled MlxArray for next call's pipelined path.
-        // Only the batch_sample fast path supports pipelining; the per-row
-        // fallback below would require concatenating per-row arrays first.
-        if stash_for_pipeline {
-            batch.prev_sampled = Some(sampled);
-        }
+        // oMLX-C bootstrap: stash sampled MlxArray so the next call hits
+        // the pipelined helper. Only the batch-sample fast path stashes;
+        // the per-row fallback below leaves prev_sampled None and forces
+        // bootstrap-style sync on every call (acceptable, that path is
+        // already non-canonical for c≥2).
+        batch.prev_sampled = Some(sampled);
         tokens
     } else {
         let mut sampled_arrays = Vec::with_capacity(states.len());
@@ -2734,7 +2715,6 @@ fn decode_qwen35_packed_batch<'a>(
 /// first call.
 ///
 /// Caller invariants (verified by `decode_qwen35_packed_batch`):
-/// - `omlx_c_enabled() == true`
 /// - `batch.prev_sampled.is_some()`
 /// - `batch.prev_sampled.shape() == [batch.batch_size()]`
 fn decode_qwen35_packed_batch_pipelined<'a>(
