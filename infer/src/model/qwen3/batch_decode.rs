@@ -15,7 +15,9 @@ use log::info;
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVFormat;
-use crate::model::{DecodeContextOps, MixedBatchRequest, ModelForward};
+use crate::model::{
+    DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
+};
 use crate::ops::{self, OpsBackend};
 use cuda_kernels::ffi;
 use cuda_kernels::kv_quant;
@@ -893,37 +895,67 @@ impl Qwen3Model {
         states: &mut [Qwen3State],
         paged_kv_pool: &mut PagedKVPool,
         bufs: &mut BatchDecodeBuffers,
-    ) -> Result<bool> {
+    ) -> Result<MixedBatchOutcome> {
         if self.lora.is_some() {
-            return Ok(false);
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::LoraEnabled,
+            ));
         }
         let kv_format = paged_kv_pool.format;
         if !matches!(
             kv_format,
             KVFormat::BF16 | KVFormat::FP8E4M3 | KVFormat::INT8
         ) {
-            return Ok(false);
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::UnsupportedKvFormat,
+            ));
         }
         let b = batch.decode_tokens.len();
         let prefill_count = batch.prefills.len();
-        if b == 0
-            || b != batch.decode_slot_indices.len()
-            || prefill_count == 0
-            || prefill_count != batch.prefill_start_positions.len()
-        {
-            return Ok(false);
+        if b == 0 {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::EmptyDecodeBatch,
+            ));
+        }
+        if b != batch.decode_slot_indices.len() {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::DecodeSlotCountMismatch,
+            ));
+        }
+        if prefill_count == 0 {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::EmptyPrefillBatch,
+            ));
+        }
+        if prefill_count != batch.prefill_start_positions.len() {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::PrefillStartPositionCountMismatch,
+            ));
         }
 
         let mut prefill_slot_indices = Vec::with_capacity(prefill_count);
         let mut prefill_token_counts = Vec::with_capacity(prefill_count);
         let mut total_prefill_tokens = 0usize;
         for (prefill, &start_pos) in batch.prefills.iter().zip(batch.prefill_start_positions) {
-            if prefill.tokens.is_empty()
-                || batch.decode_slot_indices.contains(&prefill.slot_idx)
-                || prefill_slot_indices.contains(&prefill.slot_idx)
-                || paged_kv_pool.seq_len(prefill.slot_idx) != start_pos
-            {
-                return Ok(false);
+            if prefill.tokens.is_empty() {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::EmptyPrefillTokens,
+                ));
+            }
+            if batch.decode_slot_indices.contains(&prefill.slot_idx) {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::PrefillSlotInDecodeBatch,
+                ));
+            }
+            if prefill_slot_indices.contains(&prefill.slot_idx) {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::DuplicatePrefillSlot,
+                ));
+            }
+            if paged_kv_pool.seq_len(prefill.slot_idx) != start_pos {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::PrefillSeqLenMismatch,
+                ));
             }
             prefill_slot_indices.push(prefill.slot_idx);
             prefill_token_counts.push(prefill.tokens.len());
@@ -1428,7 +1460,7 @@ impl Qwen3Model {
             )?;
         }
 
-        Ok(true)
+        Ok(MixedBatchOutcome::Executed)
     }
 
     /// Batched decode: process B tokens from B different requests in one pass.

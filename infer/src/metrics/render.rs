@@ -571,6 +571,33 @@ impl ServerMetrics {
             .unwrap();
         }
 
+        let prefill_path_stats = self.prefill_path_stats();
+        out.push_str(
+            "# HELP infer_prefill_path_mixed_batch_total Mixed decode+prefill path outcomes.\n",
+        );
+        out.push_str("# TYPE infer_prefill_path_mixed_batch_total counter\n");
+        for (outcome, value) in [
+            ("ok_true", prefill_path_stats.ok_true_count),
+            ("ok_false", prefill_path_stats.ok_false_count),
+        ] {
+            writeln!(
+                out,
+                "infer_prefill_path_mixed_batch_total{{{labels}outcome=\"{outcome}\",}} {value}"
+            )
+            .unwrap();
+        }
+        out.push_str("# HELP infer_prefill_path_mixed_batch_fallback_total Mixed decode+prefill fallback reasons.\n");
+        out.push_str("# TYPE infer_prefill_path_mixed_batch_fallback_total counter\n");
+        let mut fallback_reasons: Vec<_> = prefill_path_stats.ok_false_reasons.iter().collect();
+        fallback_reasons.sort_by(|left, right| left.0.cmp(right.0));
+        for (reason, value) in fallback_reasons {
+            writeln!(
+                out,
+                "infer_prefill_path_mixed_batch_fallback_total{{{labels}reason=\"{reason}\",}} {value}"
+            )
+            .unwrap();
+        }
+
         out.push_str("# HELP infer_spec_draft_tokens_total Draft tokens proposed by Phase 2 speculative decode.\n");
         out.push_str("# TYPE infer_spec_draft_tokens_total counter\n");
         writeln!(
@@ -926,6 +953,7 @@ impl ServerMetrics {
             model_arch,
             kv_tier_hit_rates,
             spec_acceptance_rate,
+            prefill_path_stats: self.prefill_path_stats(),
             timestamp_ms,
         }
     }
@@ -1018,6 +1046,7 @@ impl ServerMetrics {
             "engine_model_arch": telemetry.model_arch,
             "engine_kv_tier_hit_rates": engine_kv_tier_hit_rates,
             "engine_spec_acceptance_rate": telemetry.spec_acceptance_rate,
+            "engine_prefill_path_stats": telemetry.prefill_path_stats,
             "engine_timestamp_ms": telemetry.timestamp_ms,
         })
     }
@@ -1139,6 +1168,21 @@ impl ServerMetrics {
         let plan_suffix = format!(
             " plan_label=idle:{plan_idle},decode:{plan_decode},prefill:{plan_prefill},split:{plan_split},mixed:{plan_mixed}"
         );
+        let prefill_path_stats = self.prefill_path_stats();
+        let mut prefill_path_reasons: Vec<_> = prefill_path_stats.ok_false_reasons.iter().collect();
+        prefill_path_reasons.sort_by(|left, right| left.0.cmp(right.0));
+        let mut prefill_path_reason_suffix = String::new();
+        for (reason, value) in prefill_path_reasons {
+            if *value > 0 {
+                let _ = write!(prefill_path_reason_suffix, ",{reason}:{value}");
+            }
+        }
+        let prefill_path_suffix = format!(
+            " prefill_path=ok_true:{},ok_false:{}{}",
+            prefill_path_stats.ok_true_count,
+            prefill_path_stats.ok_false_count,
+            prefill_path_reason_suffix,
+        );
         let spec_suffix = format!(
             " spec=draft:{},verified:{},accepted:{},empty_sparse_views:{},accept_rate:{:.1}%,step_latency_count:{}",
             self.spec_draft_tokens_total(),
@@ -1232,7 +1276,7 @@ impl ServerMetrics {
         );
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -1249,6 +1293,7 @@ impl ServerMetrics {
             step_p50,
             phase_suffix,
             plan_suffix,
+            prefill_path_suffix,
             spec_suffix,
             self.tier_fetch_wait_seconds() * 1000.0,
             self.tier_store_wait_seconds() * 1000.0,

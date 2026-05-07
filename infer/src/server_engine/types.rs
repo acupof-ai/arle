@@ -93,6 +93,15 @@ impl CompletionStreamDelta {
     }
 }
 
+/// Mixed decode+prefill path counters used to classify split-plan fallback
+/// behavior during M3.9 profiling.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PrefillPathStats {
+    pub ok_true_count: u64,
+    pub ok_false_count: u64,
+    pub ok_false_reasons: HashMap<String, u64>,
+}
+
 /// Backend-agnostic snapshot of engine-level telemetry (`InferenceEngine::telemetry()`).
 ///
 /// M1 unification surface (see `docs/plans/backend-unification.md` §M1):
@@ -130,6 +139,10 @@ pub struct EngineTelemetry {
     /// speculation step has landed; matches the `infer_spec_acceptance_rate`
     /// Prometheus gauge.
     pub spec_acceptance_rate: Option<f64>,
+    /// Mixed decode+prefill path outcome counters. Backend-neutral shape so
+    /// `/v1/stats` can diagnose scheduler lowering without importing model
+    /// implementation types.
+    pub prefill_path_stats: PrefillPathStats,
     /// Wall-clock timestamp of the snapshot (millis since UNIX epoch).
     pub timestamp_ms: u64,
 }
