@@ -3984,8 +3984,20 @@ impl<'a> Qwen35StepDriver<'a> {
         let config = self.config;
         let arch = self.arch;
         let cache_len = self.cache_len;
+        // M_e.1 P3.1b — when --kv-pool is on, route through the paged FFI
+        // entry point. P3.1a left the body identical to step_session so
+        // logits are bit-equal here; this commit just exercises the new
+        // surface so P3.1c can flip the SDPA read source without further
+        // call-site churn.
+        let use_paged = self.kv_pool.is_some();
         let logits = match &mut self.mode {
-            Qwen35StepMode::Cpp(state) => Self::run_cpp_step(weights, cache_len, token_arr, state)?,
+            Qwen35StepMode::Cpp(state) => {
+                if use_paged {
+                    Self::run_cpp_step_paged(weights, cache_len, token_arr, state)?
+                } else {
+                    Self::run_cpp_step(weights, cache_len, token_arr, state)?
+                }
+            }
             Qwen35StepMode::Rust(state) => {
                 Self::run_rust_step(weights, config, arch, cache_len, token_arr, state)
             }
@@ -4041,6 +4053,31 @@ impl<'a> Qwen35StepDriver<'a> {
             .context("Qwen3.5 C++ step path missing compiled model")?;
         state.ensure_session_active(cpp_model)?;
         let logits = cpp_model.step_session(token_arr, cache_len)?;
+        async_eval(&[&logits]);
+        Ok(logits)
+    }
+
+    /// M_e.1 P3.1b — paged variant. P3.1c will fill k_full/v_full with
+    /// `pool.gather_kv_rows` data and the C++ side will switch SDPA to
+    /// read from those tensors. For now we pass empty slices (n=0); the
+    /// P3.1a entry point ignores them and falls through to the legacy
+    /// session-internal cache path. This commit exists only to land the
+    /// call-site change so P3.1c is a body-only edit on the C++ side.
+    fn run_cpp_step_paged(
+        weights: &Qwen35MetalWeights,
+        cache_len: i32,
+        token_arr: &MlxArray,
+        state: &mut Qwen35CppState,
+    ) -> Result<MlxArray> {
+        let cpp_model: &CppQwen35Model = weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.5 C++ paged step path missing compiled model")?;
+        state.ensure_session_active(cpp_model)?;
+        let mut k_full: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        let mut v_full: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        let logits =
+            cpp_model.step_session_paged(token_arr, cache_len, &mut k_full, &mut v_full)?;
         async_eval(&[&logits]);
         Ok(logits)
     }
