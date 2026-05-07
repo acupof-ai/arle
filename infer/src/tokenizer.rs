@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer as HfTokenizer;
 use tokenizers::tokenizer::{
     DecodeStream as HfDecodeStream, DecoderWrapper, ModelWrapper, NormalizerWrapper,
@@ -20,6 +21,11 @@ type InnerDecodeStream<'a> = HfDecodeStream<
 #[derive(Clone)]
 pub struct Tokenizer {
     inner: HfTokenizer,
+    /// SHA-256 of the raw `tokenizer.json` bytes at load time. Used as the
+    /// tokenizer half of the RadixCache namespace per M_d.1 — a one-byte
+    /// `tokenizer.json` change flips the namespace and prevents silent
+    /// prefix-cache reuse across vocabulary swaps.
+    fingerprint: [u8; 32],
 }
 
 #[allow(dead_code)]
@@ -38,9 +44,19 @@ impl Tokenizer {
         } else {
             path.to_path_buf()
         };
-        let inner = HfTokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-        Ok(Self { inner })
+        let bytes = std::fs::read(&tokenizer_path)
+            .map_err(|e| anyhow!("Failed to read tokenizer file: {}", e))?;
+        let fingerprint: [u8; 32] = Sha256::digest(&bytes).into();
+        let inner = HfTokenizer::from_bytes(&bytes)
+            .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
+        Ok(Self { inner, fingerprint })
+    }
+
+    /// SHA-256 of the raw `tokenizer.json` bytes at load time. Stable for
+    /// a given `tokenizer.json`; changes if any byte changes. Used as the
+    /// tokenizer half of the RadixCache namespace (M_d.1).
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -178,6 +194,27 @@ mod tests {
     fn test_load_tokenizer() {
         let tokenizer = Tokenizer::from_file(MODEL_PATH).unwrap();
         assert!(tokenizer.vocab_size() > 0);
+    }
+
+    #[test]
+    #[ignore = "requires model weights at models/Qwen3-4B"]
+    fn fingerprint_is_nonzero_and_stable_across_loads() {
+        // M_d.1 step 1: the SHA-256 of tokenizer.json bytes must be a
+        // non-zero 32-byte value, and two loads of the same file must
+        // produce the same fingerprint.
+        let a = Tokenizer::from_file(MODEL_PATH).unwrap();
+        let b = Tokenizer::from_file(MODEL_PATH).unwrap();
+
+        assert_eq!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "same file → same fingerprint"
+        );
+        assert_ne!(
+            a.fingerprint(),
+            &[0u8; 32],
+            "all-zero fingerprint indicates SHA-256 was not run"
+        );
     }
 
     #[test]
