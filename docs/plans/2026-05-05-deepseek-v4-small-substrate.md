@@ -1,8 +1,18 @@
 # DeepSeek-V4 Small-VRAM Substrate Plan
 
+> ⚠️ **Architecture truth source: [`../projects/2026-05-07-dsv4-truth.md`](../projects/2026-05-07-dsv4-truth.md)**
+> 本 plan 关注 substrate + nano training driver。**架构维度全部以 truth doc 为准**
+> (HF replica `kshitijthakkar/deepseek-v4-mini-1B-init` config)。本 plan 中任何
+> 与 truth doc 冲突的 config 描述视作 deprecated。
+> Companion plan(完整 pre-train methodology):[`dsv4-small-repro.md`](dsv4-small-repro.md)
+> (同样 rewriting 中,truth-aligned)。**注**:本 plan 原引用 MLA 设计文档,
+> 但 DSV4 已**抛弃 MLA**(改用 Q-LoRA + 单 KV 头 + O-LoRA grouping + 混合 SWA/CSA/HCA),
+> MLA 引用仅作为 V3-era 架构演进的历史背景。
+
 **Reference:**
-[`crates/deepseek-spec/`](../../crates/deepseek-spec/) (架构 ground truth) ·
-[`docs/plans/2026-05-01-mla-kernel-design.md`](2026-05-01-mla-kernel-design.md) ·
+[`../projects/2026-05-07-dsv4-truth.md`](../projects/2026-05-07-dsv4-truth.md) (**唯一架构真理**) ·
+[`crates/deepseek-spec/`](../../crates/deepseek-spec/) (Rust 实现层) ·
+[`docs/plans/2026-05-01-mla-kernel-design.md`](2026-05-01-mla-kernel-design.md) (**V3-era,DSV4 已弃 MLA**) ·
 [`docs/plans/2026-05-01-longctx-spec-decode-phase2.md`](2026-05-01-longctx-spec-decode-phase2.md) ·
 [`infer/src/kv_tier/AGENTS.md`](../../infer/src/kv_tier/AGENTS.md) ·
 [`infer/src/model/AGENTS.md`](../../infer/src/model/AGENTS.md) ·
