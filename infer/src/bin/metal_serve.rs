@@ -29,6 +29,84 @@ use log::info;
 const DEFAULT_WARMUP_PROMPT: &str = "Write one short sentence about Metal inference.";
 const WARMUP_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Pin model weights in physical RAM via `mlx::set_wired_limit`.
+///
+/// Sums sizes of all `.safetensors` / `.bin` files in the resolved model
+/// directory and adds 1 GiB headroom. Returns `None` if the model path
+/// can't be resolved locally (HF id not yet downloaded), in which case
+/// the caller can fall back to leaving wired-limit unset.
+///
+/// Why: per docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md
+/// (Qwen3.6 35B-A3B baseline) the OS pages out unused expert weights
+/// under memory pressure, blowing up p99 ITL by 5-20×. Pinning kills
+/// the variance — c=1 p99 dropped from 86 ms to 15 ms (-83%) on first
+/// validation. ARLE has the FFI plumbing
+/// (`crates/mlx-sys/src/mlx_bridge.cpp` + `metal.rs:583`) but no
+/// auto-default until this commit.
+fn auto_wired_limit_bytes(model_path: &str) -> Option<usize> {
+    const HEADROOM: u64 = 1 << 30;
+    let candidates = [
+        PathBuf::from(model_path),
+        PathBuf::from(env!("HOME"))
+            .join(".cache/huggingface/hub")
+            .join(format!("models--{}", model_path.replace('/', "--")))
+            .join("snapshots"),
+    ];
+
+    for candidate in &candidates {
+        let snapshot_dir = if candidate.is_dir() && candidate.ends_with("snapshots") {
+            std::fs::read_dir(candidate)
+                .ok()?
+                .filter_map(Result::ok)
+                .find(|e| e.path().is_dir())
+                .map(|e| e.path())
+        } else if candidate.is_dir() {
+            Some(candidate.clone())
+        } else {
+            None
+        };
+        let Some(dir) = snapshot_dir else { continue };
+        let total = sum_weight_files(&dir).unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        let limit = (total + HEADROOM) as usize;
+        info!(
+            "auto wired_limit = {} GiB ({} bytes; model dir {})",
+            limit / (1 << 30),
+            limit,
+            dir.display()
+        );
+        return Some(limit);
+    }
+
+    None
+}
+
+fn sum_weight_files(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        // Follow symlinks here — HF cache snapshots are symlinks into a sibling
+        // blobs/ directory, so `entry.metadata()` (which doesn't traverse on
+        // Unix) reports the symlink's own ~12-byte size and undercounts
+        // catastrophically. `std::fs::metadata` follows the link.
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if matches!(ext, "safetensors" | "bin" | "gguf" | "npz") {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+
 #[derive(Parser)]
 #[command(
     name = "metal_serve",
@@ -162,7 +240,9 @@ impl Args {
         MetalRuntimeLimits {
             memory_limit_bytes: self.memory_limit_bytes,
             cache_limit_bytes: self.cache_limit_bytes,
-            wired_limit_bytes: self.wired_limit_bytes,
+            wired_limit_bytes: self
+                .wired_limit_bytes
+                .or_else(|| auto_wired_limit_bytes(&self.model_path)),
         }
     }
 
