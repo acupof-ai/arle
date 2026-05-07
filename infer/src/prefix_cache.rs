@@ -40,6 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::kv_tier::{
@@ -216,14 +217,14 @@ impl Node {
 
 /// Radix tree for content-addressable KV prefix caching.
 ///
-/// The `Serialize` / `Deserialize` derives exist so the full cache state
-/// can be snapshotted to disk for session persistence (Tiered KV Cache
-/// §P3). The format is a straightforward serde representation of the
-/// private fields; callers are expected to pair every deserialize with
-/// a separate reconciliation pass if block IDs need to be mapped onto a
-/// fresh allocator (the canonical use case is restoring a snapshot on a
-/// new process where the KV pool layout has changed).
-#[derive(Serialize, Deserialize)]
+/// The `Serialize` derive exists so the full cache state can be snapshotted
+/// to disk for session persistence (Tiered KV Cache §P3). `Deserialize` is
+/// **deliberately not derived** — see M_d.1 step 2: load goes through
+/// [`RadixCache::load_snapshot`], which deserializes a private wrapper and
+/// rejects mismatched namespaces. Removing the public derive is the
+/// type-system guarantee that no caller can bypass the namespace check via
+/// `serde_json::from_str::<RadixCache>(_)`.
+#[derive(Serialize)]
 pub struct RadixCache {
     /// All nodes, indexed by stable integer IDs.
     nodes: Vec<Node>,
@@ -250,25 +251,74 @@ pub struct RadixCache {
     /// [`Self::rebuild_block_index`] after deserialization.
     #[serde(default, skip)]
     block_index: HashMap<BlockId, usize>,
+    /// Compile-time + tokenizer namespace per M_d.1.
+    ///
+    /// Two `RadixCache` instances with different namespaces MUST NOT be
+    /// merged or share blocks. On-disk snapshots include this; loading
+    /// rejects mismatch via [`Self::load_snapshot`]. The legacy
+    /// [`Self::new`] / [`Self::with_soft_pin_keepalive`] constructors set
+    /// this to `[0; 32]` for backward-compatibility with existing tests
+    /// and pre-namespace snapshots; production boot wiring (M_d.1 step 3)
+    /// uses `new_with_namespace` / `with_soft_pin_keepalive_namespaced`
+    /// with a `derive_namespace(&tokenizer)` value.
+    #[serde(default)]
+    namespace: [u8; 32],
+}
+
+/// Deserialize-side mirror of [`RadixCache`]. Private — the only API
+/// surface that loads a snapshot is [`RadixCache::load_snapshot`], which
+/// performs the namespace check before constructing the public type.
+#[derive(Deserialize)]
+struct RadixCacheSnapshot {
+    nodes: Vec<Node>,
+    #[serde(default)]
+    free_nodes: Vec<usize>,
+    block_size: usize,
+    #[serde(default)]
+    soft_pin_keepalive_ticks: Option<u64>,
+    /// Defaulted to `[0; 32]` so pre-M_d.1 snapshots still parse; the
+    /// namespace mismatch then surfaces in [`RadixCache::load_snapshot`].
+    #[serde(default)]
+    namespace: [u8; 32],
 }
 
 impl RadixCache {
-    /// Create a new empty radix cache.
+    /// Create a new empty radix cache with the legacy zero namespace.
     ///
     /// `block_size` must match the KV block size used by the block manager.
+    /// Production callers should use [`Self::new_with_namespace`] with a
+    /// `derive_namespace(&tokenizer)` value; this entry point exists for
+    /// tests and pre-M_d.1 callers.
     pub fn new(block_size: usize) -> Self {
-        Self::new_with_soft_pin_keepalive(block_size, None)
+        Self::new_with_soft_pin_keepalive(block_size, None, [0; 32])
     }
 
     /// Create a radix cache that refreshes already-soft-pinned blocks on every
-    /// successful lookup / lookup_or_stage hit.
+    /// successful lookup / lookup_or_stage hit. Legacy zero-namespace.
     pub fn with_soft_pin_keepalive(block_size: usize, soft_pin_keepalive_ticks: u64) -> Self {
-        Self::new_with_soft_pin_keepalive(block_size, Some(soft_pin_keepalive_ticks))
+        Self::new_with_soft_pin_keepalive(block_size, Some(soft_pin_keepalive_ticks), [0; 32])
+    }
+
+    /// Create a new empty radix cache pinned to the given namespace.
+    /// Per M_d.1 step 3, production boot derives the namespace from the
+    /// tokenizer fingerprint plus the build version.
+    pub fn new_with_namespace(block_size: usize, namespace: [u8; 32]) -> Self {
+        Self::new_with_soft_pin_keepalive(block_size, None, namespace)
+    }
+
+    /// Soft-pin variant with explicit namespace.
+    pub fn with_soft_pin_keepalive_namespaced(
+        block_size: usize,
+        soft_pin_keepalive_ticks: u64,
+        namespace: [u8; 32],
+    ) -> Self {
+        Self::new_with_soft_pin_keepalive(block_size, Some(soft_pin_keepalive_ticks), namespace)
     }
 
     fn new_with_soft_pin_keepalive(
         block_size: usize,
         soft_pin_keepalive_ticks: Option<u64>,
+        namespace: [u8; 32],
     ) -> Self {
         assert!(block_size > 0, "block_size must be > 0");
         let root = Node::new(vec![], None, 0);
@@ -279,7 +329,49 @@ impl RadixCache {
             clock: 0,
             soft_pin_keepalive_ticks,
             block_index: HashMap::new(),
+            namespace,
         }
+    }
+
+    /// Namespace pinned at construction. See [`RadixCache`] doc for the
+    /// per-deployment derivation contract.
+    pub fn namespace(&self) -> &[u8; 32] {
+        &self.namespace
+    }
+
+    /// Serialize this cache to a JSON snapshot suitable for disk persistence.
+    /// The namespace field is included, so [`Self::load_snapshot`] can
+    /// reject mismatched loads.
+    pub fn save_snapshot(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("RadixCache::save_snapshot: {e}"))
+    }
+
+    /// THE ONLY snapshot-load API. Deserializes into a private wrapper,
+    /// rejects any snapshot whose stored namespace differs from
+    /// `expected_namespace`, then returns the populated cache with
+    /// `clock` reset to 0 and `block_index` empty — callers must call
+    /// [`Self::rebuild_block_index`] after `load_snapshot` exactly as
+    /// they would after a raw `serde_json::from_str` (this matches the
+    /// pre-M_d.1 contract; see `rebuild_block_index_round_trips_after_serde`).
+    pub fn load_snapshot(json: &str, expected_namespace: &[u8; 32]) -> Result<Self> {
+        let snap: RadixCacheSnapshot = serde_json::from_str(json)
+            .map_err(|e| anyhow::anyhow!("RadixCache::load_snapshot: deserialize: {e}"))?;
+        if &snap.namespace != expected_namespace {
+            return Err(anyhow::anyhow!(
+                "RadixCache::load_snapshot: namespace mismatch (expected {:02x?}, got {:02x?})",
+                expected_namespace,
+                snap.namespace
+            ));
+        }
+        Ok(Self {
+            nodes: snap.nodes,
+            free_nodes: snap.free_nodes,
+            block_size: snap.block_size,
+            clock: 0,
+            soft_pin_keepalive_ticks: snap.soft_pin_keepalive_ticks,
+            block_index: HashMap::new(),
+            namespace: snap.namespace,
+        })
     }
 
     /// Rebuild `block_index` from the current `nodes` array.
