@@ -16,9 +16,23 @@
 #include "mlx_common.h"
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+
+namespace {
+// Mirrors `cpp_phase_timing_enabled()` in mlx_bridge.cpp — file-local
+// static so each translation unit has its own cached env probe.
+bool cpp_phase_timing_enabled() {
+    static int flag = -1;
+    if (flag == -1) {
+        const char* v = std::getenv("INFER_CPP_PHASE_TIMING");
+        flag = (v && *v && v[0] != '0' && std::string(v) != "false") ? 1 : 0;
+    }
+    return flag == 1;
+}
+}  // namespace
 
 extern "C" mlx_array* qwen35_moe_block_forward(
     mlx_array* hidden,
@@ -2538,8 +2552,23 @@ int32_t qwen35_compiled_step_batch_packed(
             inputs.push_back(*to_arr(packed_gdr_states[gdr_idx]));
         }
 
+        // INFER_CPP_PHASE_TIMING=1 — time the lazy graph build of the
+        // MoE forward (router + 128-expert dispatch × 40 layers).
+        bool tracing = cpp_phase_timing_enabled();
+        auto t_fwd0 = tracing ? std::chrono::high_resolution_clock::now()
+                              : std::chrono::high_resolution_clock::time_point{};
         m->prev_outputs = m->forward(inputs);
         auto& outputs = m->prev_outputs;
+        if (tracing) {
+            auto t_fwd1 = std::chrono::high_resolution_clock::now();
+            auto fwd_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              t_fwd1 - t_fwd0)
+                              .count();
+            std::fprintf(stderr,
+                "cpp_phase_timing step_batch_packed batch=%d cache_pos=%d "
+                "n_kv=%d n_gdr=%d forward_build_us=%lld\n",
+                batch_size, cache_pos, n_kv, n_gdr, (long long)fwd_us);
+        }
 
         *out_logits = from_arr(std::move(outputs[0]));
 

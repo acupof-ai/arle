@@ -51,13 +51,26 @@ backend development, benchmarking, and testing uses
   mlx-community/Qwen3.6-35B-A3B-4bit` (HF id; `metal_serve` resolves to
   the cached snapshot). For `metal_serve` directly: `--model-path
   mlx-community/Qwen3.6-35B-A3B-4bit`.
-- **MLX command-buffer tuning** (Metal-only, 2026-05-07): export
-  `MLX_MAX_OPS_PER_BUFFER=200 MLX_MAX_MB_PER_BUFFER=200` for any
-  Qwen3.6 bench at c≥8 — the MLX defaults (40 ops / 40 MB on M-base/pro)
-  fragment the GPU command buffer in MoE forward passes, costing ~3 ms
-  per step. Per
-  [`docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md`](docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md)
-  technique #2.
+- **Auto-wired-limit** (default since
+  [`2026-05-07-bench-qwen36-mle-perf.md`](docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md)):
+  `metal_serve` auto-pins model weights via `mlx::set_wired_limit`
+  when `--wired-limit-bytes` isn't passed. Computes
+  (model dir size + 1 GiB headroom) and follows HF cache symlinks.
+  Drops c=1 p99 from 86 ms → 15 ms on Qwen3.6 (−82%). Opt-out via
+  `--wired-limit-bytes 0`.
+- **MLX command-buffer env tunes — Qwen3.5-only.** Earlier guidance
+  here recommended `MLX_MAX_OPS_PER_BUFFER=200
+  MLX_MAX_MB_PER_BUFFER=200` for any c≥8 bench. That recommendation
+  was Qwen3.5-dense-specific and benched as wash-or-loss on Qwen3.6
+  MoE — see
+  [`docs/experience/wins/2026-05-07-bench-qwen36-baseline.md`](docs/experience/wins/2026-05-07-bench-qwen36-baseline.md)
+  and
+  [`docs/experience/wins/2026-05-07-bench-qwen36-encode-bottleneck.md`](docs/experience/wins/2026-05-07-bench-qwen36-encode-bottleneck.md).
+  On Qwen3.6 35B-A3B the dominant cost (95% of step) is `mx::async_eval`
+  doing synchronous Metal command-buffer encoding for ~600-1000
+  primitives — increasing `MLX_MAX_OPS_PER_BUFFER` doesn't help that.
+  **Don't set these env vars by default; they're a per-workload
+  matched-A/B tunable.**
 
 **Workspace (current):**
 
