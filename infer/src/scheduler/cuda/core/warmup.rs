@@ -30,7 +30,17 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let graph_capture_enabled = self.model.supports_cuda_graph_decode();
-        let max_bs = num_slots.min(256);
+        // Per `db20d34` H4 root cause: warmup must cover ALL batch sizes the
+        // scheduler may admit per step. Prefill admission cap (model
+        // .max_concurrent_prefill_requests, e.g. Qwen3 Marlin Some(8) per
+        // `12300c5`) can exceed num_slots when sessions queue concurrently —
+        // warming only num_slots leaves batches num_slots+1..cap as cold-
+        // start graph captures during bench → tail-latency regression
+        // (76% turn success at default cap=8, vs 100% with warmed override).
+        // Take max of num_slots and prefill cap so all admissible batch
+        // sizes are pre-captured.
+        let prefill_cap = self.model.max_concurrent_prefill_requests().unwrap_or(0);
+        let max_bs = num_slots.max(prefill_cap).min(256);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
 
         if graph_capture_enabled {
