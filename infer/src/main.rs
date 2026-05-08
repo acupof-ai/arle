@@ -20,6 +20,7 @@ use log::info;
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_SEQ_LEN: usize = 4096;
 const VALID_KV_CACHE_MODES: &str = "'auto', 'bf16', 'fp8', 'int8', 'tq2', 'tq3', or 'tq4'";
+const VALID_QUANT_FORMATS: &str = "'auto' or 'marlin_w4a8'";
 const CONTIGUOUS_KV_TOKENS: usize = 512;
 
 #[derive(Parser)]
@@ -195,6 +196,10 @@ struct Args {
     #[arg(long, default_value = "auto")]
     kv_cache_dtype: String,
 
+    /// Weight quantization override: "auto" (checkpoint metadata) or "marlin_w4a8".
+    #[arg(long, default_value = "auto")]
+    quant_format: String,
+
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
     train_control_url: Option<String>,
@@ -236,11 +241,32 @@ struct Args {
     nccl_smoke: bool,
 }
 
-#[tokio::main]
-async fn main() {
-    logging::init_default();
-
+fn main() {
     let args = Args::parse();
+    apply_quant_format_override(&args);
+    logging::init_default();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async_main(args));
+}
+
+fn apply_quant_format_override(args: &Args) {
+    match args.quant_format.trim().to_ascii_lowercase().as_str() {
+        "auto" => {}
+        "marlin_w4a8" | "w4a8_marlin" => {
+            // SAFETY: called from synchronous main before constructing the
+            // Tokio runtime or installing tracing/background workers.
+            unsafe {
+                std::env::set_var("INFER_QUANT_FORMAT_OVERRIDE", "marlin_w4a8");
+            }
+        }
+        other => panic!("Invalid --quant-format '{other}': expected {VALID_QUANT_FORMATS}"),
+    }
+}
+
+async fn async_main(args: Args) {
     if args.nccl_smoke {
         #[cfg(feature = "nccl")]
         {

@@ -735,8 +735,10 @@ impl ModelForward for Qwen3Model {
     fn supports_cuda_graph_decode(&self) -> bool {
         // LoRA decode allocates per-call temp DeviceVecs inside
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
-        // The LoRA-aware batched decode runs eagerly, so skip warmup.
-        self.enable_cuda_graph && self.lora.is_none()
+        // W4A8 Marlin currently quantizes activations and allocates scratch
+        // inside linear dispatch, so it must also stay eager until that
+        // scratch is hoisted into decode buffers.
+        self.enable_cuda_graph && self.lora.is_none() && !self.uses_marlin_w4a8()
     }
 }
 

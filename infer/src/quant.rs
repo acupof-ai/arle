@@ -13,6 +13,7 @@
 //! | AWQ    | `quant_config.json` | AutoAWQ |
 //! | FP8    | `config.json` → `quantization_config` | Compressed-Tensors / Modelopt |
 //! | INT8   | `config.json` → `quantization_config` | SmoothQuant style |
+//! | MarlinW4A8 | `config.json` → `quantization_config` | Dynamic INT8 activations + W4 Marlin weights |
 //! | GGUF   | file extension `.gguf` in directory | llama.cpp format |
 //! | None   | (no config found) | BF16 / FP16 weights |
 
@@ -33,6 +34,7 @@ pub enum QuantFormat {
     Awq,
     Fp8,
     Int8,
+    MarlinW4A8,
     Gguf,
     TurboQuant,
 }
@@ -49,6 +51,7 @@ impl QuantFormat {
             Self::Awq => "AWQ (INT4)",
             Self::Fp8 => "FP8 (E4M3)",
             Self::Int8 => "INT8 (W8A8)",
+            Self::MarlinW4A8 => "Marlin W4A8",
             Self::Gguf => "GGUF",
             Self::TurboQuant => "TurboQuant",
         }
@@ -173,6 +176,19 @@ pub struct Int8Config {
     pub per_channel: bool,
 }
 
+/// Marlin W4A8 quantization config.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarlinW4A8Config {
+    /// Group size for INT4 weights.
+    pub group_size: usize,
+}
+
+impl Default for MarlinW4A8Config {
+    fn default() -> Self {
+        Self { group_size: 128 }
+    }
+}
+
 impl Default for Int8Config {
     fn default() -> Self {
         Self {
@@ -224,6 +240,7 @@ pub enum QuantMeta {
     Awq(AwqConfig),
     Fp8(Fp8Config),
     Int8(Int8Config),
+    MarlinW4A8(MarlinW4A8Config),
     Gguf(GgufConfig),
     TurboQuant(TurboQuantWeightConfig),
 }
@@ -236,6 +253,7 @@ impl QuantMeta {
             Self::Awq(_) => QuantFormat::Awq,
             Self::Fp8(_) => QuantFormat::Fp8,
             Self::Int8(_) => QuantFormat::Int8,
+            Self::MarlinW4A8(_) => QuantFormat::MarlinW4A8,
             Self::Gguf(_) => QuantFormat::Gguf,
             Self::TurboQuant(_) => QuantFormat::TurboQuant,
         }
@@ -460,6 +478,9 @@ fn try_parse_config_json(json: &str) -> Result<Option<QuantMeta>> {
             is_smoothquant: qc.is_smoothquant.unwrap_or(qtype == "smoothquant"),
             per_channel: true,
         }),
+        "marlin_w4a8" | "w4a8_marlin" => QuantMeta::MarlinW4A8(MarlinW4A8Config {
+            group_size: qc.group_size.unwrap_or(128) as usize,
+        }),
         "turboquant" | "tq" => QuantMeta::TurboQuant(TurboQuantWeightConfig {
             bits: qc.bits.unwrap_or(3),
             group_size: qc.group_size.unwrap_or(128) as usize,
@@ -496,6 +517,10 @@ mod tests {
 
     fn int8_smoothquant_json() -> &'static str {
         r#"{"quantization_config":{"quant_type":"smoothquant","is_smoothquant":true}}"#
+    }
+
+    fn marlin_w4a8_json() -> &'static str {
+        r#"{"quantization_config":{"quant_type":"marlin_w4a8","group_size":128}}"#
     }
 
     fn no_quant_json() -> &'static str {
@@ -559,6 +584,17 @@ mod tests {
             assert!(c.is_smoothquant);
         } else {
             panic!("expected Int8");
+        }
+    }
+
+    #[test]
+    fn parse_marlin_w4a8() {
+        let meta = parse_quant_meta_from_config_json(marlin_w4a8_json()).unwrap();
+        assert_eq!(meta.format(), QuantFormat::MarlinW4A8);
+        if let QuantMeta::MarlinW4A8(c) = meta {
+            assert_eq!(c.group_size, 128);
+        } else {
+            panic!("expected MarlinW4A8");
         }
     }
 
@@ -659,6 +695,7 @@ mod tests {
     fn quant_format_display() {
         assert_eq!(QuantFormat::Gptq.to_string(), "GPTQ (INT4)");
         assert_eq!(QuantFormat::Fp8.to_string(), "FP8 (E4M3)");
+        assert_eq!(QuantFormat::MarlinW4A8.to_string(), "Marlin W4A8");
         assert_eq!(QuantFormat::None.to_string(), "none (BF16/FP16)");
         assert_eq!(QuantFormat::TurboQuant.to_string(), "TurboQuant");
     }

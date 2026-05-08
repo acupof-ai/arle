@@ -18,9 +18,14 @@ use infer::server_engine::CompletionStreamDelta;
 use infer::tokenizer::Tokenizer;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const W4A8_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B-W4A8-marlin");
 
 fn get_model_path() -> String {
     std::env::var("INFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
+}
+
+fn get_w4a8_model_path() -> String {
+    std::env::var("INFER_TEST_W4A8_MODEL_PATH").unwrap_or_else(|_| W4A8_MODEL_PATH.to_string())
 }
 
 fn init_logging() {
@@ -237,4 +242,42 @@ fn test_greedy_solo_vs_concurrent() {
         solo_output, concurrent_output
     );
     info!("PASS: greedy output is consistent across batch compositions");
+}
+
+#[test]
+fn test_greedy_w4a8_marlin_optional() {
+    init_logging();
+    enable_deterministic_gemm_for_test();
+    let model_path = get_w4a8_model_path();
+
+    if !Path::new(&model_path).exists() {
+        eprintln!(
+            "Skipping W4A8 greedy test: model not found at {}",
+            model_path
+        );
+        return;
+    }
+
+    let prompt = "Tell me a story";
+    let max_tokens = 16;
+    let (solo_output, solo_tokens) = run_solo(prompt, max_tokens, &model_path);
+    let (concurrent_output, concurrent_tokens) = run_concurrent(
+        prompt,
+        max_tokens,
+        &["My name is", "What is 2 + 2?"],
+        &model_path,
+    );
+    if let Some((idx, solo, concurrent)) = first_token_divergence(&solo_tokens, &concurrent_tokens)
+    {
+        info!(
+            "W4A8 first generated-token divergence: idx={} solo={:?} concurrent={:?}",
+            idx, solo, concurrent
+        );
+    }
+
+    assert_eq!(
+        solo_output, concurrent_output,
+        "W4A8 greedy output diverged!\n  solo:       {:?}\n  concurrent: {:?}",
+        solo_output, concurrent_output
+    );
 }

@@ -43,6 +43,7 @@ enum LinearKernelPlan {
     Q5KDequantCublasGemm,
     Q6KDequantCublasGemm,
     MarlinW4Gemm,
+    MarlinW4A8Gemm,
     TurboQuantGemv,
     TurboQuantDequantCublasGemm,
 }
@@ -58,11 +59,15 @@ impl LinearKernelPlan {
             WeightFormat::GgufQ4K => Self::Q4KGemv,
             WeightFormat::GgufQ5K => Self::Q5KGemv,
             WeightFormat::GgufQ6K => Self::Q6KGemv,
+            WeightFormat::MarlinW4A8 => Self::MarlinW4A8Gemm,
             WeightFormat::TurboQuant => Self::TurboQuantGemv,
         }
     }
 
     fn batched(weight: &DeviceMatrix, batch: usize) -> Self {
+        if marlin_w4a8_aligned(weight).is_ok() {
+            return Self::MarlinW4A8Gemm;
+        }
         if batch > 1 && marlin_prefill_aligned(weight).is_ok() {
             return Self::MarlinW4Gemm;
         }
@@ -88,6 +93,7 @@ impl LinearKernelPlan {
             (_, WeightFormat::GgufQ4K) => Self::Q4KDequantCublasGemm,
             (_, WeightFormat::GgufQ5K) => Self::Q5KDequantCublasGemm,
             (_, WeightFormat::GgufQ6K) => Self::Q6KDequantCublasGemm,
+            (_, WeightFormat::MarlinW4A8) => Self::MarlinW4A8Gemm,
             (_, WeightFormat::TurboQuant) => Self::TurboQuantDequantCublasGemm,
         }
     }
@@ -105,6 +111,31 @@ fn marlin_prefill_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'st
     }
     if !weight.rows.is_multiple_of(64) {
         return Err("N is not multiple of 64");
+    }
+    Ok(())
+}
+
+fn marlin_w4a8_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'static str> {
+    if weight.weight_format() != WeightFormat::MarlinW4A8 {
+        return Err("source format is not MarlinW4A8");
+    }
+    if weight.marlin_packed.is_none() {
+        return Err("missing W4A8 Marlin-packed side buffer");
+    }
+    if weight.marlin_channel_scales.is_none() {
+        return Err("missing W4A8 per-channel scales");
+    }
+    if weight.marlin_scales.is_none() {
+        return Err("missing W4A8 per-group scales");
+    }
+    if !weight.cols.is_multiple_of(128) {
+        return Err("K is not multiple of 128");
+    }
+    if !weight.rows.is_multiple_of(256) {
+        return Err("N is not multiple of 256");
+    }
+    if weight.group_size != 128 {
+        return Err("group_size is not 128");
     }
     Ok(())
 }
@@ -288,6 +319,11 @@ pub fn gemv(
             )
             .result()?;
         }
+        return Ok(());
+    }
+
+    if plan == LinearKernelPlan::MarlinW4A8Gemm {
+        run_marlin_w4a8_linear(ctx, weight, &input.data, 1, &mut output.data);
         return Ok(());
     }
 
@@ -711,7 +747,7 @@ fn run_marlin_w4_gemm(
                 k as i32,
                 ws_ptr as *mut i32,
                 weight.group_size as i32,
-                0,
+                ctx.ordinal() as i32,
                 ctx.stream.cu_stream(),
                 -1,
                 -1,
@@ -734,6 +770,107 @@ fn run_marlin_w4_gemm(
             )
             .result()
             .expect("fp16_to_bf16 failed");
+        }
+    }
+}
+
+fn run_marlin_w4a8_linear(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &CudaSlice<bf16>,
+    rows: usize,
+    output: &mut CudaSlice<bf16>,
+) {
+    marlin_w4a8_aligned(weight).expect("invalid W4A8 Marlin matrix");
+    let mp = weight.marlin_packed.as_ref().unwrap();
+    let s_channel = weight.marlin_channel_scales.as_ref().unwrap();
+    let s_group = weight.marlin_scales.as_ref().unwrap();
+    let m = rows;
+    let n = weight.rows;
+    let k = weight.cols;
+    let max_par = 16usize;
+
+    let mut x_int8: CudaSlice<i8> = ctx.stream.alloc_zeros(m * k).expect("alloc W4A8 x_int8");
+    let mut s_activation: CudaSlice<f32> = ctx
+        .stream
+        .alloc_zeros(m)
+        .expect("alloc W4A8 activation scales");
+    {
+        let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+        let (xq_ptr, _gq) = x_int8.device_ptr_mut(&ctx.stream);
+        let (s_ptr, _gs) = s_activation.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::quantize_bf16_rows_to_int8_cuda(
+                x_ptr as *const ffi::Half,
+                xq_ptr as *mut i8,
+                s_ptr as *mut f32,
+                m as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("quantize_bf16_rows_to_int8_cuda failed");
+        }
+    }
+
+    let mut y_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * n).expect("alloc W4A8 y_fp16");
+    let mut reduce: CudaSlice<i32> = ctx
+        .stream
+        .alloc_zeros(max_par * 64 * n)
+        .expect("alloc W4A8 reduce buffer");
+    let lock_elems = ((n / 128) * max_par).max(1);
+    let mut workspace: CudaSlice<i32> = ctx
+        .stream
+        .alloc_zeros(lock_elems)
+        .expect("alloc W4A8 lock workspace");
+
+    {
+        let (xq_ptr, _g1) = x_int8.device_ptr(&ctx.stream);
+        let (mp_ptr, _g2) = mp.device_ptr(&ctx.stream);
+        let (reduce_ptr, _g3) = reduce.device_ptr_mut(&ctx.stream);
+        let (yf_ptr, _g4) = y_fp16.device_ptr_mut(&ctx.stream);
+        let (s1_ptr, _g5) = s_activation.device_ptr(&ctx.stream);
+        let (s2_ptr, _g6) = s_channel.device_ptr(&ctx.stream);
+        let (s3_ptr, _g7) = s_group.device_ptr(&ctx.stream);
+        let (ws_ptr, _g8) = workspace.device_ptr_mut(&ctx.stream);
+        let sms = ctx.sm_count() as i32;
+        let ret = unsafe {
+            ffi::gemm_w4a8_marlin_cuda(
+                xq_ptr as *const i8,
+                mp_ptr as *const u8,
+                reduce_ptr as *mut i32,
+                yf_ptr as *mut ffi::Half,
+                s1_ptr as *const f32,
+                s2_ptr as *const f32,
+                s3_ptr as *const ffi::Half,
+                m as i32,
+                n as i32,
+                k as i32,
+                ws_ptr as *mut i32,
+                weight.group_size as i32,
+                ctx.ordinal() as i32,
+                ctx.stream.cu_stream(),
+                -1,
+                -1,
+                sms,
+                max_par as i32,
+            )
+        };
+        assert_eq!(ret, 0, "gemm_w4a8_marlin_cuda failed with code {ret}");
+    }
+
+    {
+        let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);
+        let (y_ptr, _g2) = output.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::fp16_to_bf16_cuda(
+                yf_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                (m * n) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("W4A8 fp16_to_bf16 failed");
         }
     }
 }
@@ -1025,6 +1162,9 @@ pub(crate) fn gemm_into(
     let plan = LinearKernelPlan::batched(weight, x.seq_len);
     match plan {
         LinearKernelPlan::MarlinW4Gemm => run_marlin_w4_gemm(ctx, weight, x, out),
+        LinearKernelPlan::MarlinW4A8Gemm => {
+            run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data);
+        }
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);
         }
