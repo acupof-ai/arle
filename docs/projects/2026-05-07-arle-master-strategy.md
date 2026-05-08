@@ -52,10 +52,39 @@ ARLE 服务以下 3 类用户(优先级排序):
 |---|---|
 | ❌ Generic LLM 服务运营商 | OpenAI/Anthropic API 复刻不是 ARLE 的 product fit |
 | ❌ "在所有 canonical shape 都赢" | 4-shape benchmark 框架不反映 agent 痛点 |
-| ❌ 单点最强(单点 kernel / 单点 scheduler)| moat 是 5 项组合,不是单点 |
-| ❌ 量化(4bit/2bit)优先 | 量化是后置工程,先解决 BF16 路径正确性和 latency |
+| ❌ 单点最强(单点 kernel / 单点 scheduler)| moat 是 5 项组合 + 量化全套,不是单点 |
 | ❌ 多模态(vision)| 暂时 out of scope,先做 text agent |
-| ❌ Distributed 大模型(72B+)| 本 sprint 聚焦单卡 4B-32B BF16,distributed 是后期 |
+| ❌ Distributed 大模型(72B+)| 本 sprint 聚焦单卡 4B-32B,distributed 是后期 |
+
+### §1.2.1 量化全套优先(2026-05-08 user directive override)
+
+**~~量化是后置工程~~** 已 supersede。User 2026-05-08 explicit directive:
+"支持好量化算子 w4a8 可接受 fp4 是未来的主流" + "支持好全套算子"。
+
+ARLE 量化全套范围(per [`docs/plans/M_quant-fp8-w4-magnitude-path.md`](../plans/M_quant-fp8-w4-magnitude-path.md)):
+
+| Path | 状态 | sm_89 viable | sm_100+ |
+|---|---|---|---|
+| BF16(baseline)| ✅ production | ✅ | ✅ |
+| FP8 KV cache | ✅ production | ✅ Ada FP8 mma | ✅ |
+| INT8 KV + decode | ✅ production | ✅ | ✅ |
+| TurboQuant W2/W3/W4 | ✅ production | ✅ | ✅ |
+| GPTQ W4A16(Marlin)| ✅ production | ✅ | ✅ |
+| AWQ W4A16(Marlin)| ✅ production | ✅ | ✅ |
+| GGUF Q4_K_M etc. | ✅ Qwen3.5 only(host)| 加速可选 | 同 |
+| **W8A8 (FP8 weight + FP8 activation)** | 🔴 **plan land,cuBLASLt smoke 1.88× KILL** | cutlass direct 待验证(#28)| ✅ |
+| **W4A8 (W4 + FP8 activation)** | 📋 plan(#26)| stack on W8A8 | ✅ |
+| **W4A8 (W4 + INT8 activation)** | 📋 deferred 兼容性磁道 | ⚠ sm_89 INT8 mma 不 hot | ✅ |
+| **NVFP4 (FP4 + FP8 scale + FP8 act)** | 📋 substrate (#27)| ❌ emulated 慢 | ✅ 4× compute |
+| **FP6 / FP4_E2M1 alt formats** | 待评估 | TBD | ✅ Blackwell |
+| Symmetric/Asymmetric + per-channel/per-group/per-token scale | 单选项,所有 path 通用 | ✅ | ✅ |
+
+**实证 license-or-kill**(per §0 SOLID):
+- cuBLASLt FP8 smoke 实测 1.88× sm_89 + cuda 13.2 → cuBLASLt path KILL
+- cutlass FP8 direct mma 待 smoke(#28,1h codex)→ 决定 W8A8/W4A_FP8 是否 viable
+- W4A16 (Marlin) 已 production 但**未 bench 实测**(#29)→ 验证 weight bandwidth magnitude 路径真实性
+
+**SOLID 工作流**:每个新 quant path 先 cheap smoke(单 GEMM 实测 vs 理论)→ 通过再 implement → bench license-or-kill → 全套 land per `M_quant-fp8-w4-magnitude-path.md` Phase 序列。
 
 ---
 
