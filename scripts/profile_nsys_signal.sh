@@ -44,6 +44,7 @@ BENCH_PRESET="fast"
 CONCURRENCIES=""
 MAX_SECONDS=""
 WARMUP=""
+DATA_SPEC=""
 SERVER_BIN="${REPO_ROOT}/target/release/infer"
 SERVER_ARGS=""
 TRACE_SET="cuda,nvtx,osrt"
@@ -69,6 +70,7 @@ Bench:
   --concurrencies LIST    forwarded to bench_guidellm.sh
   --max-seconds N         forwarded to bench_guidellm.sh
   --warmup N              forwarded to bench_guidellm.sh
+  --data SPEC             forwarded to bench_guidellm.sh
   --target URL            default: ${TARGET}
   --model NAME            default: ${MODEL}
 
@@ -93,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --concurrencies) CONCURRENCIES="$2"; shift 2 ;;
         --max-seconds) MAX_SECONDS="$2"; shift 2 ;;
         --warmup)      WARMUP="$2"; shift 2 ;;
+        --data)        DATA_SPEC="$2"; shift 2 ;;
         --target)      TARGET="$2"; shift 2 ;;
         --model)       MODEL="$2"; shift 2 ;;
         --trace)       TRACE_SET="$2"; shift 2 ;;
@@ -238,6 +241,7 @@ else
     [[ -n "$CONCURRENCIES" ]] && LOAD_CMD+=(--concurrencies "$CONCURRENCIES")
     [[ -n "$MAX_SECONDS" ]]   && LOAD_CMD+=(--max-seconds "$MAX_SECONDS")
     [[ -n "$WARMUP" ]]        && LOAD_CMD+=(--warmup "$WARMUP")
+    [[ -n "$DATA_SPEC" ]]     && LOAD_CMD+=(--data "$DATA_SPEC")
 fi
 
 echo ">>> SIGUSR1 → cuProfilerStart"
