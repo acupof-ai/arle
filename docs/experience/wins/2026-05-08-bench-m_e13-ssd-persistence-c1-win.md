@@ -30,24 +30,44 @@ on shorter prompts produced the earlier disparate numbers; the
 breakdown probe confirms the path is doing exactly what it
 should: ~100ms of import overhead, full prefill skipped.
 
-### Note: same-server in-memory hit perf — TBD (data polluted)
+### Same-server in-memory hit clean re-bench: −26% (asymmetry vs disk attach)
 
-A separate observation in the breakdown bench seemed to show that
-same-server cold→warm in-memory hit does NOT speed up (12.759s
-warm ≈ 12.811s cold), but on closer inspection the bench data is
-polluted by overlapping retry invocations on port 8765 — multiple
-bench scripts ran concurrently, queuing requests onto the same
-server. The 12.759s number cannot be cleanly attributed to a
-single in-memory-hit request.
+After the polluted breakdown-bench retraction, a clean isolated
+re-bench (`/tmp/m_e13_inmem_clean.sh` — lsof guard, single
+invocation, no retry overlap) captured:
 
-A clean re-bench with strict server-lifecycle isolation (lsof
-guard before each phase, single bench invocation, no retry
-overlap) is needed before declaring a `try_import_memory_prefix`
-short-circuit bug. **Retracted from this commit; filed as
-strictly-experimental next-tick work.**
+| Request | E2E | lookup | import |
+|---|---|---|---|
+| req#1 (cold, fresh dir) | 12.059s | memory=None disk=None | n/a |
+| req#2 (warm, same server) | **8.911s** | memory=Some(2064) disk=Some(2064) | **`returned Ok(true)`** |
 
-The −76.7% disk-attach result above is independent of this
-question and stands.
+**Δ = −26.1%** on same-server in-memory hit (NOT no-improvement
+as the polluted-bench data suggested).
+
+Comparison:
+- **Server-restart disk attach** (clean breakdown bench): **−76.7%** E2E
+- **Same-server in-memory hit** (clean isolated re-bench): **−26.1%** E2E
+
+The in-memory path **DOES** short-circuit prefill — just less
+effectively than disk attach. ~50 percentage-point asymmetry
+between the two paths is real and worth investigating: the
+in-memory entry was published from the cold request's exact
+state, so it should logically attach AT LEAST as well as a disk
+snapshot. Hypotheses:
+
+- (i) Same-server scenario carries GPU context / Metal command-
+  buffer state from cold's request that costs time on warm.
+  Server-restart starts clean.
+- (ii) The disk snapshot triggers a different code path (e.g.,
+  `decode_from_disk` populates fresh MlxArrays vs memory's
+  re-use of the live driver's kv_flat with `clone_from`).
+- (iii) OS page cache state of the snapshot file matters for
+  the disk path's ~38ms read; for in-memory it's irrelevant.
+
+**Filed as next-tick experimental work.** Closing the asymmetry
+would deliver disk-level (~−76%) on within-session multi-turn
+(eli's main use case once it runs as a daemon), not just session
+restart.
 
 ## ⚠️ Update (same-day re-bench with INFER_M_E10_TRACE=1)
 
