@@ -615,8 +615,14 @@ impl MetalQwen35PrefixRuntime {
         let memory_len = memory_key.as_ref().map_or(0, Vec::len);
         let disk_len = disk_key.as_ref().map_or(0, Vec::len);
 
+        // M_e.13 diagnostic — `INFER_M_E13_FORCE_DISK=1` flips priority so disk
+        // is tried first even when memory_len >= disk_len. Used to A/B test
+        // whether the same-server in-memory short-circuit asymmetry is caused
+        // by the in-memory import path itself. Revert if/when the asymmetry
+        // is closed.
+        let force_disk = std::env::var("INFER_M_E13_FORCE_DISK").is_ok();
         let mut reused_tokens = 0;
-        if disk_len > memory_len {
+        if force_disk || disk_len > memory_len {
             if let Some(prefix_key) = disk_key.as_deref() {
                 if self.try_import_disk_prefix_or_remove(prefix_key, request) {
                     reused_tokens = prefix_key.len();
