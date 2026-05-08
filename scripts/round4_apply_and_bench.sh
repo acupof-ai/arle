@@ -7,7 +7,7 @@
 # This script:
 #   1. Verifies linear.rs is clean (codex W4A8 already committed)
 #   2. Applies the dispatch threshold edit (sed-safe, single-line constant)
-#   3. Runs cargo build --release --features cuda
+#   3. Runs cargo build --release -p infer --features cuda
 #   4. Runs cargo test --release greedy_consistency (correctness gate)
 #   5. Starts ARLE serving (auto-FP8 KV, no --kv-cache-dtype override per
 #      skill v1.2.0 isolation-motive callout)
@@ -117,16 +117,16 @@ PY
 fi
 
 # Step 4 — Build
-echo "=== Step 4: cargo build --release --features cuda ==="
+echo "=== Step 4: cargo build --release -p infer --features cuda ==="
 run "CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 NVCC_CCBIN=/usr/bin/g++-14 \
      INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
-     cargo build --release --features cuda"
+     cargo build --release -p infer --features cuda"
 
 # Step 5 — Correctness gate
 echo "=== Step 5: greedy_consistency gate ==="
 run "CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 NVCC_CCBIN=/usr/bin/g++-14 \
      INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
-     cargo test --release --features cuda --test greedy_consistency"
+     cargo test --release -p infer --features cuda --test greedy_consistency"
 
 # Step 6 — Start ARLE (production-default auto-FP8 KV per skill v1.2.0)
 echo "=== Step 6: Start ARLE ==="
