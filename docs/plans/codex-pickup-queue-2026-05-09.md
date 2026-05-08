@@ -126,10 +126,12 @@ unblocks ALL cap=8 benefit。
 - **Risk**:Med(scheduler hot path)
 - **ROI**:eliminates bimodal distribution → cap=8 stable -86% TTFT p99
 - **Dependency**:NONE
-- **SOLID gates added 2026-05-09 by codex `eod81` audit-of-audit**:
-  - **Phase 0.5**:verify prefill IS the degraded-path root cause(option 1:
-    log counter + 10 LOC,fastest;option 2:nsys 30s trace;option 3:dummy
-    curl pre-warm A/B)。**Without this,risk burning 80-100 LOC on wrong axis**
+- **SOLID gates added 2026-05-09 by codex `eod81` audit-of-audit + `3456f8f` recipe**:
+  - **Phase 0.5**:verify prefill IS the degraded-path root cause。
+    **Recipe ready at [`docs/research/2026-05-09-eod82-p0.3-phase0.5-cheap-experiment-recipe.md`](../research/2026-05-09-eod82-p0.3-phase0.5-cheap-experiment-recipe.md)**
+    (`3456f8f`)— 3 options:**recommended Option 1**(log counter,~10 min,absolute
+    ms evidence not NVTX framing),Option 2(nsys 30s trace),Option 3(dummy curl pre-warm A/B)。
+    **Without this,risk burning 80-100 LOC on wrong axis**
   - **Phase 0.5b**:5-min grep `infer/src/ops/` to confirm prefill GEMM
     routing(cublasLt vs TileLang AOT)。If TileLang AOT cubins,warmup buys
     ~0 — pivot needed
