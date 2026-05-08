@@ -1,4 +1,30 @@
-# Bench — M_e.13 SSD KV persistence: functional, but no TTFT win on canonical workload — 2026-05-08
+# Bench — M_e.13 SSD KV persistence: functional + −27.3% E2E win on c=1 canonical workload — 2026-05-08
+
+## ⚠️ Update (same-day re-bench with INFER_M_E10_TRACE=1)
+
+The earlier v2 bench (cold=15.343s, warm=16.509s, +7.6% with 2795
+prompt_tokens) showed **no perf win**. A subsequent re-bench with
+`INFER_M_E10_TRACE=1` enabled (so the per-request `m_e10_trace`
+probes fire) on a slightly shorter (2070-token) prompt produced the
+real picture:
+
+| Phase | E2E | prompt_tokens | disk_match_len |
+|---|---|---|---|
+| Cold (fresh disk dir) | 10.072s | 2070 | n/a (fresh dir, no prior snapshot) |
+| Warm (persisted snapshot) | **7.321s** | 2070 | **Some(2064)** |
+
+**Warm vs cold: −27.3% E2E.** Real win.
+
+The trace probe at `runtime.rs:608` directly logs
+`disk_match_len=Some(2064)`, hard evidence the disk-import path
+matched 2064 of 2070 tokens (block-aligned to 16) and the residual
+6 tokens + decode took the remaining 7.3s − (whatever the disk
+hydrate cost is).
+
+The v2 bench's +7.6% number was thermal / OS-page-cache /
+warmup-state noise — not the path's actual signature. The trace
+bench is the authoritative measurement; v2 retained as the false-
+negative case study (see § Lessons below).
 
 ## Goal
 
