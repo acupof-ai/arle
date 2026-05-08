@@ -1,12 +1,14 @@
 # ARLE Codebase Map
 
-> **2026-05-08 — see [`architecture-snapshot-2026-05-07-eod.md`](architecture-snapshot-2026-05-07-eod.md)**
-> for today's incremental ground-truth audit covering 41+ commits since this
-> doc's last edit:M_pf-fuse / M_pf-gemm / M_b.2.2 split-KV all KILLED;
-> M_pf-graph-prefill-capture promoted P0 #1 by SGLang+ARLE callgraph dual
-> evidence;ARLE 4-shape verdict completed(high-conc +69% past SGLang ⭐;
-> longctx 4k −51% TTFT;longctx 8k throughput tied with vLLM −1.6%);M_world1
-> P0.1+P0.2 baselines logged。本 doc 仍是结构性 truth 的来源,但今日变化点请先看 snapshot。
+> **2026-05-08 EOD+18 战略 source of truth:[`projects/2026-05-07-arle-master-strategy.md`](projects/2026-05-07-arle-master-strategy.md)**
+> §0.1 主战场 3 axis(user 2026-05-08 directive):**Agent workload(W3/W4) + 量化全套 + 投机解码(Medusa/EAGLE/DFlash)**。
+> 非主战场 deprecated:Piecewise prefill graph(Phase 0 KILL `8b4a03b`)+ canonical 4-shape 单点优化(6 KILL 全在错的 workload)。
+>
+> 量化全套 plan:[`plans/M_quant-fp8-w4-magnitude-path.md`](plans/M_quant-fp8-w4-magnitude-path.md)。
+> cuBLASLt FP8 smoke 实测 1.88×(< 2× KILL),cutlass FP8 direct mma smoke 待验(#28)。
+>
+> 今日 41+ commits incremental audit:[`architecture-snapshot-2026-05-07-eod.md`](architecture-snapshot-2026-05-07-eod.md)。
+> 本 doc 仍是结构性 truth 来源,战略和今日变化看上面 pointer。
 
 Updated 2026-05-06 after the DSV4 runtime substrate scaffold + nano autograd
 training landed (2026-05-05). DSV4 is the **#1 next-model priority** and Qwen 3.6
