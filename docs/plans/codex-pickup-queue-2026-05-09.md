@@ -78,7 +78,7 @@ Reference:
 Codex pickup pending since 2026-05-08。
 
 - **Effort**:155-175 LOC,**0.75-1 day**
-- **File**:`infer/src/model/weight_loader.rs:514`(detection site)
+- **File**:`infer/src/weight_loader.rs:514`(detection site,top-level not model/)
 - **Risk**:Med(loader changes need careful testing)
 - **ROI**:enables -14% E2E at c≤8 production
 - **Dependency**:NONE — Phase 0(`1959a21`)+ Phase 1a(`b6502f7`)done
@@ -89,7 +89,7 @@ Hybrid Phase 1b — loader patch for marlin_w4_hybrid checkpoint
 
 Reference plan: docs/plans/M_quant-hybrid-phase1b-loader-directive.md (commit 6be30ce)
 
-File: infer/src/model/weight_loader.rs:514
+File: infer/src/weight_loader.rs:514 (verified 2026-05-09 — top-level, not in model/)
 Add: detection for "marlin_w4_hybrid" config field
 Wire: load both W4A16 + W4A8 weight tensors per Phase 0 reconnaissance
 Verify: cargo test + scripts/bench_guidellm.sh hybrid-phase1b-smoke
