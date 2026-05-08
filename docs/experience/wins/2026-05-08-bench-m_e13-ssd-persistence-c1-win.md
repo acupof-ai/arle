@@ -69,6 +69,44 @@ would deliver disk-level (~−76%) on within-session multi-turn
 (eli's main use case once it runs as a daemon), not just session
 restart.
 
+### Same-day deeper probe: import op itself is 35µs (not the bottleneck)
+
+A second isolated bench with a `try_import_memory_prefix` timing
+probe confirms the import operation itself is essentially free:
+
+```
+m_e13_trace try_import_memory_prefix: tokens=2064 import_us=35 ok=true
+```
+
+vs the disk path's:
+```
+m_e13_trace try_import_disk_prefix: read_us=38643 decode_us=60816 import_us=48 imported=true
+```
+
+So:
+- Memory `import_qwen35_prefix_snapshot`: **35 µs**
+- Disk `try_import_disk_prefix` (read + decode + clone): **~100 ms**
+- E2E delta: memory −24.6%, disk −76.7%
+
+The IMPORT itself in both cases takes <0.1s. The 50-percentage-
+point asymmetry is **NOT in the import op**. It's somewhere
+AFTER the import — likely in the first prefill_step / step_session
+or first decode_step that consumes the imported state.
+
+Hypothesis update (most likely first):
+- The in-memory path's first prefill_step may not actually
+  short-circuit despite `prompt_cursor=2064` being set: maybe the
+  driver state from cold's prior request introduces re-encoding
+  overhead, or the C++ session re-initialization on attach is
+  slower than fresh start.
+- Server restart starts with a clean Metal command-buffer cache
+  / GPU residency state. Same-server warm has residual state from
+  cold's decode that may force command-buffer re-validation.
+
+Closing this gap is real engineering — needs tracing inside
+`prefill_step` and the C++ `step_session_paged` to see where the
+time goes. Out of scope for this commit.
+
 ## ⚠️ Update (same-day re-bench with INFER_M_E10_TRACE=1)
 
 The earlier v2 bench (cold=15.343s, warm=16.509s, +7.6% with 2795
