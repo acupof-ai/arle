@@ -139,3 +139,45 @@ Skill v1.3.0 anti-pattern:script-level PASS without end-to-end CUDA
 kernel verification is NOT sufficient evidence of correctness。Always
 gate on actual kernel inference through `greedy_consistency`(or
 similar e2e test)before declaring "calibration preserved"。
+
+## 2026-05-08 Update - Superseded Root Cause
+
+Codex kernel-side isolation refuted the kernel-divergence hypothesis.
+Direct single-layer `marlin.w4a8_mul` checks against the PR #31 extension
+matched an independent PyTorch reference at ~0.4-0.55% relative error
+across q/k/v/o/gate/up/down projections and M=1/5/16.
+
+The actual source of the end-to-end garbage was upstream of W4A8:
+`scripts/convert_gptq.py` decoded GPTQ `qzeros` without the AutoGPTQ
+`+1` offset. The public checkpoint's layer-0 `q_proj.qzeros` unpacked to
+stored value 7, which represents real zero-point 8. The old converter
+used 7 directly, shifting every converted W4A16 weight by one scale unit.
+
+After adding `+1` to `zeros_unpacked`:
+
+```bash
+INFER_TEST_MODEL_PATH=/home/ckl/projects/arle/infer/models/Qwen3-4B-GPTQ-Int4-converted-zpfix \
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo test --release -p infer --features cuda --test greedy_consistency \
+  test_greedy_solo_vs_concurrent -- --nocapture
+
+INFER_TEST_W4A8_MODEL_PATH=/home/ckl/projects/arle/infer/models/Qwen3-4B-GPTQ-W4A8-zpfix \
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo test --release -p infer --features cuda --test greedy_consistency \
+  test_w4a8_vs_bf16_token_diff -- --nocapture
+```
+
+Results:
+- Corrected W4A16 GPTQ source generated coherent English and passed
+  solo-vs-concurrent token equality.
+- Corrected W4A8 generated exactly the BF16 32-token continuation for
+  "The capital of France is" (`matched first 32/32 tokens, diff 0.0%`).
+
+Conclusion: this entry's "kernel != script" diagnosis was a useful
+debugging route but is superseded by the GPTQ `qzeros` off-by-one root
+cause. See
+`docs/experience/errors/2026-05-08-gptq-qzeros-off-by-one-broke-w4a8-source.md`.
