@@ -61,6 +61,27 @@ unsafe extern "C" {
         max_par: i32,
     ) -> i32;
 
+    pub fn gemm_w4a8_marlin_cuda(
+        a: *const i8,    // [M, K] row-major INT8 activations
+        b: *const u8,    // W4A8 Marlin-packed INT4 weights
+        c: *mut i32,     // [max_par * 64, N] INT32 reduce buffer
+        d: *mut Half,    // [M, N] FP16 output
+        s1: *const f32,  // [M] activation scales
+        s2: *const f32,  // [N] per-channel weight scales
+        s3: *const Half, // [K/group_size, N] per-group scales
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        workspace: *mut i32, // lock buffer
+        groupsize: i32,
+        dev: i32,
+        stream: CUstream,
+        thread_k: i32,
+        thread_n: i32,
+        sms: i32,
+        max_par: i32,
+    ) -> i32;
+
     pub fn gptq_marlin_repack_cuda(
         b_q_weight: *const u32,
         out: *mut u32,
@@ -70,6 +91,15 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn marlin_workspace_size(prob_n: i32, sms: i32) -> usize;
+
+    pub fn quantize_bf16_rows_to_int8_cuda(
+        input: *const Half,
+        output: *mut i8,
+        scales: *mut f32,
+        rows: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
 
     pub fn w8a16_gemv_cuda(
         weight: *const i8,

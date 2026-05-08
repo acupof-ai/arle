@@ -138,6 +138,16 @@ impl Qwen3Mlp {
     pub(super) fn uses_fused_gate_up(&self) -> bool {
         matches!(self.gate_up, Qwen3GateUp::Fused { .. })
     }
+
+    pub(super) fn uses_marlin_w4a8(&self) -> bool {
+        self.down_proj.is_marlin_w4a8()
+            || match &self.gate_up {
+                Qwen3GateUp::Separate { gate_proj, up_proj } => {
+                    gate_proj.is_marlin_w4a8() || up_proj.is_marlin_w4a8()
+                }
+                Qwen3GateUp::Fused { gate_up_proj } => gate_up_proj.is_marlin_w4a8(),
+            }
+    }
 }
 
 fn qwen3_fused_gate_up_enabled() -> bool {
@@ -414,7 +424,7 @@ impl Qwen3Model {
             lora: None,
         };
 
-        if model.enable_cuda_graph {
+        if model.enable_cuda_graph && !model.uses_marlin_w4a8() {
             debug!("Preloading decode-path CUDA kernels before CUDA Graph capture");
             model.preload_decode_cuda_kernels()?;
             debug!("Decode path CUDA Graph is enabled");
@@ -552,6 +562,17 @@ impl Qwen3Model {
         self.layers
             .first()
             .is_some_and(|layer| layer.mlp.uses_fused_gate_up())
+    }
+
+    pub(super) fn uses_marlin_w4a8(&self) -> bool {
+        self.output_projection().is_marlin_w4a8()
+            || self.layers.iter().any(|layer| {
+                layer.attention.q_proj.is_marlin_w4a8()
+                    || layer.attention.k_proj.is_marlin_w4a8()
+                    || layer.attention.v_proj.is_marlin_w4a8()
+                    || layer.attention.o_proj.is_marlin_w4a8()
+                    || layer.mlp.uses_marlin_w4a8()
+            })
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {

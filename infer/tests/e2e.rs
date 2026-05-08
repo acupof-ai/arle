@@ -17,12 +17,17 @@ use infer::server_engine::{
 use infer::trace_reporter::FileReporter;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const W4A8_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B-W4A8-marlin");
 
 fn get_model_path() -> String {
     let model_path =
         std::env::var("INFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string());
     info!("Using model path: {}", model_path);
     model_path
+}
+
+fn get_w4a8_model_path() -> String {
+    std::env::var("INFER_TEST_W4A8_MODEL_PATH").unwrap_or_else(|_| W4A8_MODEL_PATH.to_string())
 }
 
 fn get_test_data_path(model_path: &str) -> PathBuf {
@@ -312,4 +317,27 @@ fn test_e2e_generation() {
 
     fastrace::flush();
     info!("Traces written to {}", trace_dir.display());
+}
+
+#[test]
+fn test_e2e_w4a8_marlin_optional() {
+    init_logging();
+    let model_path = get_w4a8_model_path();
+    if !Path::new(&model_path).exists() {
+        eprintln!("Skipping W4A8 e2e: model not found at {}", model_path);
+        return;
+    }
+
+    let mut engine =
+        LoadedInferenceEngine::load(&model_path, true).expect("Failed to load W4A8 engine");
+    let out = engine
+        .complete(make_request("Tell me a story", 16))
+        .expect("W4A8 complete() failed");
+    assert!(!out.text.is_empty(), "empty W4A8 output");
+    let first5: Vec<char> = out.text.chars().take(5).collect();
+    assert!(
+        !(first5.len() == 5 && first5.iter().all(|c| *c == first5[0])),
+        "degenerate W4A8 output: {:?}",
+        out.text
+    );
 }

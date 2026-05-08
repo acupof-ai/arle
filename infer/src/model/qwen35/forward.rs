@@ -454,7 +454,7 @@ impl ModelForward for Qwen35Model {
     }
 
     fn supports_cuda_graph_decode(&self) -> bool {
-        self.enable_cuda_graph
+        self.enable_cuda_graph && !self.uses_marlin_w4a8()
     }
 
     fn select_token(

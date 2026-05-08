@@ -443,6 +443,7 @@ pub(crate) struct QuantLoadConfig {
     pub(crate) group_size: Option<usize>,
     pub(crate) bits: Option<u8>,
     pub(crate) tq_bits: Option<u8>,
+    pub(crate) marlin_w4a8: bool,
     pub(crate) unsupported_reason: Option<&'static str>,
 }
 
@@ -459,12 +460,14 @@ impl QuantLoadConfig {
                 group_size: Some(config.group_size as usize),
                 bits: Some(config.bits),
                 tq_bits: None,
+                marlin_w4a8: false,
                 unsupported_reason: None,
             },
             QuantMeta::Gptq(config) => Self {
                 group_size: None,
                 bits: Some(config.bits),
                 tq_bits: None,
+                marlin_w4a8: false,
                 unsupported_reason: None,
             },
             QuantMeta::Awq(config) if config.zero_point => Self {
@@ -477,18 +480,28 @@ impl QuantLoadConfig {
                 group_size: Some(config.group_size),
                 bits: Some(config.bits),
                 tq_bits: None,
+                marlin_w4a8: false,
                 unsupported_reason: None,
             },
             QuantMeta::Int8(_) => Self {
                 group_size: None,
                 bits: Some(8),
                 tq_bits: None,
+                marlin_w4a8: false,
+                unsupported_reason: None,
+            },
+            QuantMeta::MarlinW4A8(config) => Self {
+                group_size: Some(config.group_size),
+                bits: Some(4),
+                tq_bits: None,
+                marlin_w4a8: true,
                 unsupported_reason: None,
             },
             QuantMeta::TurboQuant(config) => Self {
                 group_size: Some(config.group_size),
                 bits: None,
                 tq_bits: Some(config.bits),
+                marlin_w4a8: false,
                 unsupported_reason: None,
             },
             _ => Self::default(),
@@ -496,6 +509,18 @@ impl QuantLoadConfig {
     }
 
     pub(crate) fn from_model_path(model_path: &str) -> Result<Self> {
+        if matches!(
+            std::env::var("INFER_QUANT_FORMAT_OVERRIDE").as_deref(),
+            Ok("marlin_w4a8" | "w4a8_marlin")
+        ) {
+            return Ok(Self {
+                group_size: Some(128),
+                bits: Some(4),
+                tq_bits: None,
+                marlin_w4a8: true,
+                unsupported_reason: None,
+            });
+        }
         Ok(Self::from_meta(&crate::quant::load_quant_meta(model_path)?))
     }
 
@@ -503,6 +528,7 @@ impl QuantLoadConfig {
         self.group_size.is_some()
             || self.bits.is_some()
             || self.tq_bits.is_some()
+            || self.marlin_w4a8
             || self.unsupported_reason.is_some()
     }
 }
@@ -634,6 +660,60 @@ pub(crate) fn load_tensor_2d_maybe_quantized_with_config(
     name: &str,
     config: QuantLoadConfig,
 ) -> Result<DeviceMatrix> {
+    if config.marlin_w4a8 {
+        anyhow::ensure!(
+            config.group_size.unwrap_or(128) == 128,
+            "{name}: MarlinW4A8 currently supports group_size=128 only, got {:?}",
+            config.group_size
+        );
+        let packed_name = name.replace(".weight", ".marlin_w4a8_qweight");
+        let channel_scales_name = name.replace(".weight", ".marlin_w4a8_s_channel");
+        let group_scales_name = name.replace(".weight", ".marlin_w4a8_s_group");
+        let packed_tensor = find_tensor(shards, weight_map, &packed_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {packed_name}: {e}"))?;
+        let channel_scales_tensor = find_tensor(shards, weight_map, &channel_scales_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {channel_scales_name}: {e}"))?;
+        let group_scales_tensor = find_tensor(shards, weight_map, &group_scales_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {group_scales_name}: {e}"))?;
+        let rows = channel_scales_tensor.shape().iter().product::<usize>();
+        let group_size = config.group_size.unwrap_or(128);
+        let num_groups = group_scales_tensor.shape()[0];
+        let cols = num_groups * group_size;
+
+        let packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(packed_tensor.data().as_ptr(), packed_tensor.data().len())
+        };
+        let channel_scales: &[f32] = unsafe {
+            std::slice::from_raw_parts(channel_scales_tensor.data().as_ptr().cast::<f32>(), rows)
+        };
+        let group_scales: &[u16] = unsafe {
+            std::slice::from_raw_parts(
+                group_scales_tensor.data().as_ptr().cast::<u16>(),
+                group_scales_tensor.shape().iter().product::<usize>(),
+            )
+        };
+
+        log::info!(
+            "Loaded MarlinW4A8 {}: [{}x{}] group_size={} packed {:?} s_channel {:?} s_group {:?}",
+            name,
+            rows,
+            cols,
+            group_size,
+            packed_tensor.shape(),
+            channel_scales_tensor.shape(),
+            group_scales_tensor.shape()
+        );
+        return DeviceMatrix::from_marlin_w4a8(
+            ctx,
+            packed,
+            channel_scales,
+            group_scales,
+            rows,
+            cols,
+            group_size,
+        );
+    }
+
     // Try quantized path: replace ".weight" with ".qweight"
     let qweight_name = name.replace(".weight", ".qweight");
     let scales_name = name.replace(".weight", ".scales");
@@ -1445,6 +1525,7 @@ mod tests {
             group_size: None,
             bits: Some(4),
             tq_bits: None,
+            marlin_w4a8: false,
             unsupported_reason: None,
         };
         let (orig_k, group_size, bits) = detect_uniform_quant_layout("w", 64, 2, cfg).unwrap();
@@ -1461,6 +1542,7 @@ mod tests {
                 group_size: Some(128),
                 bits: None,
                 tq_bits: None,
+                marlin_w4a8: false,
                 unsupported_reason: None,
             },
         )
@@ -1480,6 +1562,7 @@ mod tests {
                     group_size: Some(64),
                     bits: None,
                     tq_bits: Some(bits),
+                    marlin_w4a8: false,
                     unsupported_reason: None,
                 },
             )

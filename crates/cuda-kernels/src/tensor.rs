@@ -403,6 +403,8 @@ pub enum WeightFormat {
     W8A16,
     /// Uniform per-group packed INT4 weights with BF16 scales.
     W4A16,
+    /// Marlin W4 weights with dynamic INT8 activations.
+    MarlinW4A8,
     /// Uniform per-group packed INT2 weights with BF16 scales.
     W2A16,
     /// GGUF Q3_K packed superblocks, scales embedded in each 256-wide block.
@@ -458,6 +460,13 @@ impl WeightFormat {
                 n_multiple: 1,
                 group_size,
             },
+            Self::MarlinW4A8 => WeightKernelAlignment {
+                weight_layout: "marlin.w4a8.packed",
+                scale_layout: "f32[channel] + fp16[group,channel]",
+                k_multiple: group_size.max(128),
+                n_multiple: 256,
+                group_size,
+            },
             Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K => {
                 WeightKernelAlignment {
                     weight_layout: "gguf.qk.row_major.superblock256",
@@ -490,6 +499,26 @@ impl WeightFormat {
                 );
                 Ok(())
             }
+            Self::MarlinW4A8 => {
+                ensure!(group_size > 0, "{self} requires group_size > 0");
+                ensure!(
+                    group_size == 128,
+                    "{self} currently requires group_size=128, got {group_size}"
+                );
+                ensure!(
+                    cols.is_multiple_of(group_size),
+                    "{self} requires cols % group_size == 0, got cols={cols}, group_size={group_size}"
+                );
+                ensure!(
+                    cols.is_multiple_of(128),
+                    "{self} requires cols % 128 == 0, got {cols}"
+                );
+                ensure!(
+                    rows.is_multiple_of(256),
+                    "{self} requires rows % 256 == 0, got {rows}"
+                );
+                Ok(())
+            }
             Self::GgufQ3K | Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K => {
                 ensure!(
                     cols.is_multiple_of(256),
@@ -511,6 +540,7 @@ impl std::fmt::Display for WeightFormat {
             Self::DenseBf16 => f.write_str("dense_bf16"),
             Self::W8A16 => f.write_str("w8a16"),
             Self::W4A16 => f.write_str("w4a16"),
+            Self::MarlinW4A8 => f.write_str("marlin_w4a8"),
             Self::W2A16 => f.write_str("w2a16"),
             Self::GgufQ3K => f.write_str("gguf_q3_k"),
             Self::GgufQ4K => f.write_str("gguf_q4_k"),
@@ -538,6 +568,8 @@ pub struct DeviceMatrix {
     pub marlin_packed: Option<CudaSlice<u8>>,
     /// FP16 scales in Marlin layout [K/group_size, N] (transposed from qscales).
     pub marlin_scales: Option<CudaSlice<u16>>,
+    /// FP32 per-output-channel scales for the W4A8 Marlin path.
+    pub marlin_channel_scales: Option<CudaSlice<f32>>,
     // -- TurboQuant packed weight storage (Phase 2: fused dequant at runtime) --
     /// TQ packed indices [rows, packed_cols] u8.
     /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
@@ -570,6 +602,7 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -615,6 +648,7 @@ impl DeviceMatrix {
             group_size,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -668,6 +702,73 @@ impl DeviceMatrix {
             group_size,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from prepacked W4A8 Marlin side tensors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_marlin_w4a8(
+        ctx: &DeviceContext,
+        packed_data: &[u8],
+        channel_scales: &[f32],
+        group_scales: &[u16],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        WeightFormat::MarlinW4A8.validate_shape(rows, cols, group_size)?;
+        ensure!(
+            packed_data.len() == rows * cols / 2,
+            "MarlinW4A8 packed bytes {} != expected {} for rows={rows} cols={cols}",
+            packed_data.len(),
+            rows * cols / 2
+        );
+        ensure!(
+            channel_scales.len() == rows,
+            "MarlinW4A8 channel scales {} != rows {rows}",
+            channel_scales.len()
+        );
+        ensure!(
+            group_scales.len() == (cols / group_size) * rows,
+            "MarlinW4A8 group scales {} != expected {}",
+            group_scales.len(),
+            (cols / group_size) * rows
+        );
+
+        let packed = ctx
+            .stream
+            .clone_htod(packed_data)
+            .map_err(|e| anyhow!("H2D W4A8 Marlin packed failed: {e}"))?;
+        let s_channel = ctx
+            .stream
+            .clone_htod(channel_scales)
+            .map_err(|e| anyhow!("H2D W4A8 channel scales failed: {e}"))?;
+        let s_group = ctx
+            .stream
+            .clone_htod(group_scales)
+            .map_err(|e| anyhow!("H2D W4A8 group scales failed: {e}"))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            weight_format: WeightFormat::MarlinW4A8,
+            qweight: None,
+            qscales: None,
+            group_size,
+            marlin_packed: Some(packed),
+            marlin_scales: Some(s_group),
+            marlin_channel_scales: Some(s_channel),
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -721,6 +822,7 @@ impl DeviceMatrix {
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -774,6 +876,7 @@ impl DeviceMatrix {
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -833,6 +936,7 @@ impl DeviceMatrix {
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -886,6 +990,7 @@ impl DeviceMatrix {
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -938,6 +1043,7 @@ impl DeviceMatrix {
             group_size,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -948,7 +1054,8 @@ impl DeviceMatrix {
 
     /// Whether this matrix uses quantized weights.
     pub fn is_quantized(&self) -> bool {
-        self.weight_format.is_quantized() && (self.qweight.is_some() || self.tq_packed.is_some())
+        self.weight_format.is_quantized()
+            && (self.qweight.is_some() || self.tq_packed.is_some() || self.marlin_packed.is_some())
     }
 
     /// Whether this matrix is plain BF16 with no packed side buffers.
@@ -966,6 +1073,11 @@ impl DeviceMatrix {
     /// Whether this matrix has Marlin-repacked weights for fast prefill GEMM.
     pub fn has_marlin(&self) -> bool {
         self.marlin_packed.is_some()
+    }
+
+    /// Whether this matrix uses Marlin W4 weights with dynamic INT8 activations.
+    pub fn is_marlin_w4a8(&self) -> bool {
+        self.weight_format == WeightFormat::MarlinW4A8
     }
 
     /// Whether this matrix uses TurboQuant packed weight storage.
@@ -1021,6 +1133,7 @@ impl DeviceMatrix {
             group_size,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: Some(tq_p),
             tq_scales: Some(tq_s),
             tq_signs: Some(tq_sg),
@@ -1169,6 +1282,7 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1212,6 +1326,7 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1248,6 +1363,7 @@ impl DeviceMatrix {
                 group_size: 0,
                 marlin_packed: None,
                 marlin_scales: None,
+                marlin_channel_scales: None,
                 tq_packed: None,
                 tq_scales: None,
                 tq_signs: None,
@@ -1281,6 +1397,7 @@ impl DeviceMatrix {
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
+            marlin_channel_scales: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,

@@ -483,6 +483,29 @@ impl Qwen35Model {
         })
     }
 
+    pub(super) fn uses_marlin_w4a8(&self) -> bool {
+        self.layers.iter().any(|layer| {
+            layer.mlp.gate_proj.is_marlin_w4a8()
+                || layer.mlp.up_proj.is_marlin_w4a8()
+                || layer.mlp.down_proj.is_marlin_w4a8()
+                || match &layer.attn {
+                    LayerKind::FullAttention(attn) => {
+                        attn.q_proj.is_marlin_w4a8()
+                            || attn.k_proj.is_marlin_w4a8()
+                            || attn.v_proj.is_marlin_w4a8()
+                            || attn.o_proj.is_marlin_w4a8()
+                    }
+                    LayerKind::LinearAttention(attn) => {
+                        attn.in_proj_qkv.is_marlin_w4a8()
+                            || attn.in_proj_z.is_marlin_w4a8()
+                            || attn.in_proj_b.is_marlin_w4a8()
+                            || attn.in_proj_a.is_marlin_w4a8()
+                            || attn.out_proj.is_marlin_w4a8()
+                    }
+                }
+        })
+    }
+
     #[cfg(test)]
     fn verify_shapes(&self) -> Result<()> {
         let c = &self.config;
