@@ -100,14 +100,26 @@ fn batched(weight: &DeviceMatrix, batch: usize) -> Self {
 
 LOC delta: ~10 (constant + 1 line edit + comment block). Single file. Single variable: the threshold value.
 
-### Matched controls (skill checklist)
+### Matched controls (skill checklist v1.2.0 — post-`2853551` correction)
 
-- [ ] Same checkpoint: `Qwen3-4B-GPTQ-Int4-marlin`
-- [ ] Same KV dtype: `--kv-cache-dtype bf16` (matches Round 1 baseline B)
+**3-arm A/B at production-default auto-FP8 KV** (no `--kv-cache-dtype` override).
+Round 1 baseline correction at `2853551` proved BF16-forced KV vs FP8-default-baseline
+was anti-pattern #8 forward-direction. R4 #6 must NOT repeat the trap.
+
+- [ ] Same checkpoint across all 3 arms: `Qwen3-4B-W4A16-sym-g128-marlin`
+- [ ] **NO `--kv-cache-dtype` flag** — let auto resolve to FP8 KV on this GPU
 - [ ] Same `--num-slots 8 --max-seq-len 5120`
 - [ ] Same data spec (4096 in / 256 out, c=4, max-seconds=120, warmup=10)
 - [ ] No other GPU process during run (single-card serial)
 - [ ] σ < 5% across n=3 — n=1 only sufficient if σ < 2% (Round 1-3 bench std was 0.02-7.7 ms = 0.05-0.4%)
+
+The 3 arms:
+
+| Arm | Marlin dispatch | Reference |
+|---|---|---|
+| A — BF16 baseline | n/a (full BF16 weight) | re-bench from `786a20a` (auto-FP8 KV) → expected ITL 19.27 |
+| **B — Marlin all-batch (current head)** | `batch > 1` triggers Marlin | matches codex `f6f3af3` setup → expected ITL 11.76 (1.64× vs A) |
+| **C — Marlin batch>8 hybrid (R4 #6 treatment)** | `batch > 8` triggers Marlin; small-batch → `W4A16BatchGemv` | predicted ITL ~8.26 (2.33× vs A) |
 
 ### Build path
 
@@ -117,20 +129,26 @@ CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
   cargo build --release --features cuda 2>&1 | tail -3
 ```
 
-### Bench command (matched to Round 1)
+### Bench command (production-default auto-FP8 KV)
 
 ```bash
+# Server (NO --kv-cache-dtype override → auto-FP8 KV on sm_89)
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer --model-path infer/models/Qwen3-4B-GPTQ-Int4-marlin \
-  --port 8000 --num-slots 8 --max-seq-len 5120 --kv-cache-dtype bf16 &
+  ./target/release/infer --model-path infer/models/Qwen3-4B-W4A16-sym-g128-marlin \
+  --port 8000 --num-slots 8 --max-seq-len 5120 &
 
+# Bench
 PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
   scripts/bench_guidellm.sh marlin-w4a16-round4-hybrid-c4-4k \
-  --model Qwen3-4B-GPTQ-Int4-marlin \
-  --processor /home/ckl/projects/arle/infer/models/Qwen3-4B-GPTQ-Int4-marlin \
+  --model Qwen3-4B-W4A16-sym-g128-marlin \
+  --processor /home/ckl/projects/arle/infer/models/Qwen3-4B-W4A16-sym-g128-marlin \
   --concurrencies 4 --max-seconds 120 --warmup 10 \
   --data 'prompt_tokens=4096,prompt_tokens_stdev=1,prompt_tokens_min=4096,prompt_tokens_max=4096,output_tokens=256,output_tokens_stdev=1,output_tokens_min=256,output_tokens_max=256'
 ```
+
+For arm A (BF16 baseline) and arm B (Marlin all-batch) — re-bench can be
+skipped if `f6f3af3` numbers are recent enough; otherwise n=1 quick reproduction
+each at `marlin-w4a16-round4-baseline-bf16` and `marlin-w4a16-round4-baseline-marlin`.
 
 ## Phase 6 — Combinational A/B (optional, post-license)
 
@@ -163,14 +181,20 @@ n=3 each, total ~12 bench × 2 min = 24 min. Optional — skipping is OK if 8 wi
 
 The "tensor-core advantage at small batch" axis is the one that turns into a hypothesis test. If Phase 5 KILLs (NULL Δ vs Marlin), this axis was overestimated and Marlin's tensor cores DO matter at decode batch=4. Both outcomes are knowledge.
 
-## Phase 8 — License decision
+## Phase 8 — License decision (post-`2853551` reframing)
 
-| Result | Action |
+Decision is **Δ vs arm B (Marlin all-batch)**, not vs BF16. Production Marlin
+already at 1.64× vs BF16 (`f6f3af3`); R4 #6 question is whether hybrid
+dispatch incrementally improves on top.
+
+| Arm C (hybrid) ITL Δ vs Arm B (Marlin all-batch) | Action |
 |---|---|
-| ITL Δ ≥ +20% vs Marlin baseline (1.21× → license) | LAND, optionally Phase 6 sweep |
-| ITL Δ +5% to +20% (1.05× to 1.21×) | LAND with note "incremental win, biggest lever still W4A8" |
-| ITL Δ −5% to +5% (NULL band) | KILL — Marlin tensor cores DO matter at batch=4. Round 4 hypothesis refuted. Surviving binding cause is Marlin kernel utilization itself (need ncu profile, blocked on wrapper migration) |
-| ITL Δ < −5% regression | KILL hard — W4A16BatchGemv slower than Marlin even at batch=4. Marlin dispatch is correct as-is. |
+| Δ ≥ −20% (≤ 9.4 ms ITL) → 2.0× absolute vs BF16 baseline | **LAND** + optional Phase 6 threshold sweep |
+| Δ −5% to −20% (9.4-11.2 ms, 1.7×-2.0× vs BF16) | LAND with note: incremental over Marlin |
+| Δ −5% to +5% NULL band | **KILL** — tensor-core advantage at batch=4 dominates the launch overhead; hybrid hypothesis refuted at this threshold; try Phase 6 sweep with threshold ∈ {16, 32} |
+| Δ > +5% regression | KILL hard — small-batch BF16-native is slower; Marlin all-batch is the right dispatch |
+| TTFT regression > +5% vs Arm B | KILL — hybrid broke prefill (shouldn't, but verify) |
+| greedy_consistency divergence > 1% | KILL — two paths producing different numerical outputs |
 
 **Multi-shape gate (mandatory before LAND)**:
 
@@ -203,6 +227,9 @@ Each tick that revisits this plan logs the conflict-gate status here so the
 | 2026-05-08 ~12:07 | YES | `codex review --uncommitted` (28m, codex edited linear.rs:136-138 group_size constraint) | Conflict still active; brief queued to codex tmux 0:0 |
 | 2026-05-08 ~12:12 | YES (5 files: linear.rs + gemm.rs ffi + quant.rs + 2 new C kernels) | review continues (32m) | Self-loop ScheduleWakeup armed; auto re-checks every ~270s |
 | 2026-05-08 ~12:32 | YES (12 files; codex review continues 40m) | review continues; **codex acknowledged R4 #6 brief**: "W4A8 没 small-batch hybrid threshold,R4 #6 后续单独 tranche 覆盖" → R4 #6 stays valid | Codex 本地 commit `1e713de` (unpushed): KV W4A8 plan (orthogonal axis to weight, master §1.2.1.B P0). R4 #6 (W4A16 weight axis) and KV W4A8 (KV axis) compose: combined Phase 1.B bench should be 3-way A/B (W4A16-only / KV-W4A8-only / both). Plan separately. |
+| 2026-05-08 ~12:43 | YES (12 files) | codex e2e tests passed 2/2; review at 47m | Major: read codex KV W4A8 plan §4 stack table → discovered Round 1 anti-pattern #8 violation (BF16-forced vs FP8 baseline). Self-correction `2853551` issued. R4 #6 reframed: 3-arm A/B at auto-FP8 KV. Skill bumped v1.2.0 (`4add8d7`) with isolation-motive callout. |
+| 2026-05-08 ~12:45 | YES (14 files; cosmetic edits in marlin_w4a8_kernel.cu) | review wrapping at 51m | W4A8 substrate read-only survey: `gemm_w4a8_marlin_cuda` 987 LOC + activation quant 59 LOC. R4 #6 hybrid threshold extends to W4A8 dispatch (zero extra LOC). `4bbe246` |
+| 2026-05-08 ~12:55 | YES (14 files) | codex 3rd-round review 53m, push imminent | This plan's Phase 5 + Phase 8 updated post-`2853551`: 3-arm A/B at production-default auto-FP8 KV; license decision against Arm B (Marlin all-batch). Bench commands drop `--kv-cache-dtype bf16`. |
 
 When this table shows `NO` for `linear.rs WIP`, Claude proceeds Phase 5
 without further confirmation: rebase → apply 10-LOC edit → `cargo build`
