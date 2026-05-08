@@ -716,6 +716,7 @@ async def _stream_one_turn(
     session: Session,
     turn_idx: int,
     max_tokens: int,
+    model: str = "default",
 ) -> TurnResult:
     """Send one turn's request and measure TTFT / ITL / wall."""
     messages = _build_messages(session, turn_idx)
@@ -724,7 +725,7 @@ async def _stream_one_turn(
     expected_prompt_tokens = _turn_expected_prompt_tokens(session, turn_idx)
     request_max_tokens = _turn_max_tokens(session, turn_idx, max_tokens)
     body = {
-        "model": "default",
+        "model": model,
         "messages": messages,
         "session_id": session.session_id,
         "stream": True,
@@ -833,6 +834,7 @@ async def _drive_session(
     session: Session,
     max_tokens: int,
     semaphore: asyncio.Semaphore,
+    model: str = "default",
 ) -> list[TurnResult]:
     """Drive one session through every user turn.
 
@@ -851,7 +853,7 @@ async def _drive_session(
             continue
         async with semaphore:
             result = await _stream_one_turn(
-                client, server, session, turn_idx, max_tokens
+                client, server, session, turn_idx, max_tokens, model
             )
         results.append(result)
         if result.error is not None:
@@ -892,7 +894,7 @@ async def run_benchmark(args: argparse.Namespace) -> RunStats:
                 )
 
         session_tasks = [
-            _drive_session(client, args.server, sess, args.max_tokens, semaphore)
+            _drive_session(client, args.server, sess, args.max_tokens, semaphore, args.model)
             for sess in sessions
         ]
         # as_completed would interleave prints; gather is cleaner for a
@@ -1101,6 +1103,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--server",
         default="http://localhost:8000",
         help="OpenAI-compatible server URL (default: %(default)s)",
+    )
+    p.add_argument(
+        "--model",
+        default="default",
+        help="OpenAI v1 'model' field. ARLE uses 'default'; vLLM/SGLang need actual "
+             "model path or HF id (e.g. /home/ckl/projects/arle/infer/models/Qwen3-4B). "
+             "(default: %(default)s)",
     )
     p.add_argument(
         "--trace",
