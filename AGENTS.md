@@ -6,6 +6,30 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 
 ---
 
+## §0 第一原则 — SOLID(求真务实,追求极致)
+
+**所有事必须 SOLID。不够 SOLID 就不断深入,不断突破。** 不是建议,是 quality bar。
+
+- **推断 ≠ SOLID**:source survey、code grep、文档分析、callgraph 推断 都是 *hypothesis*,
+  不是 evidence。Evidence = 实测 nsys trace / bench 数字 / runtime log counter / 控制变量
+  对照实验。没有 evidence 不下结论,只标 hypothesis。
+- **混淆变量必须隔离**:一个实验同时改 N 个变量(buffer pool + scheduler clamp + KV format
+  + graph capture)→ 任何结果都 **不能归因**。每次只改一个变量,或显式跑控制实验隔离 confounder。
+- **Root cause 假设也要 license-or-kill**:license-or-kill 不只用在 fix 上,**root cause 推断**
+  本身也要 cheap experiment 验证(nsys 占比 / log 计数器 / source 二次读 / 实验对照)。
+  Root cause 错 → 所有 sub-experiment 全废。
+- **80% SOLID 不够**:发现 gap 必须深入到 95%+,或显式声明 "deferred,接受不确定性",**禁止
+  silent 放过**。
+- **写完先自检**:每份 plan / wins / errors / brief / 推荐落地前,先问"SOLID 吗?gap 在哪?
+  深入还是显式 deferred?"。不达标自我反思,继续深入。
+
+实证经验:2026-05-08 M_pf-graph Phase 0 KILL 后回顾,errors entry 80% SOLID(具体 graph
+hit/miss 计数器 + 实测 throughput regression),但 3 个 SOLID gap(launch overhead 占比
+未 nsys 验证 / SGLang 实际 graph trigger 计数未对照 / 4 个变量同时改未隔离),导致"graph
+capture 不是 SGLang 主因"这个 strategic conclusion **不够 SOLID**。
+
+---
+
 ## Project shape
 
 `ARLE` is a Rust-native inference runtime with integrated local
