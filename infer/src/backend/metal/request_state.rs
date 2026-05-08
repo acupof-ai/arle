@@ -847,7 +847,11 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
         }
     }
 
-    pub(crate) fn retain_rows(&mut self, row_indices: &[usize]) -> Result<()> {
+    pub(crate) fn retain_rows(
+        &mut self,
+        row_indices: &[usize],
+        shrink_time_axis: bool,
+    ) -> Result<()> {
         if row_indices.len() == self.batch_size()
             && row_indices.iter().enumerate().all(|(idx, row)| idx == *row)
         {
@@ -881,6 +885,63 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
             .iter()
             .map(|&row| self.left_padding[row])
             .collect();
+
+        // M_e.12 — mid-batch compaction. After the survivors are gathered,
+        // their `left_padding` entries determine how many leading time-axis
+        // slots in the packed KV cache no row needs anymore. Reclaiming
+        // `min_pad` slots shortens the time axis of every packed_kv tensor
+        // (axis 2: [batch, n_kv_heads, kv_capacity, head_dim]) and decrements
+        // both `batch_cache_len` and per-row `left_padding` so the next
+        // step_batch_packed call sees a tighter, contiguous KV window.
+        //
+        // GDR (`packed_gdr_flat`) is per-request recurrent state, NOT a
+        // time-series cache (see `try_build_qwen35_packed_decode_batch`
+        // L2352-2353), so it has no time axis to compact — we deliberately
+        // skip it here and only touch `packed_kv_flat`.
+        if shrink_time_axis && !self.left_padding.is_empty() {
+            let min_pad = self.left_padding.iter().copied().min().unwrap_or(0);
+            if min_pad > 0 {
+                use std::sync::Once;
+                static FIRED: Once = Once::new();
+                let kept = self.left_padding.len();
+                let dropped_rows = row_indices.len();
+                FIRED.call_once(|| {
+                    log::info!(
+                        "metal_path_probe: M_E12_COMPACTION_FIRED (kept {kept}/{dropped_rows} rows, dropped min_pad={min_pad} time slots)"
+                    );
+                });
+
+                for tensor in &mut self.packed_kv_flat {
+                    let shape = tensor.shape();
+                    if shape.len() != 4 {
+                        bail!(
+                            "Qwen3.5 packed_kv_flat expected rank-4 [batch, n_kv_heads, kv_capacity, head_dim], got rank {}",
+                            shape.len()
+                        );
+                    }
+                    let start = [0_i32, 0, min_pad, 0];
+                    let stop = [shape[0], shape[1], self.kv_capacity, shape[3]];
+                    let strides = [1_i32, 1, 1, 1];
+                    let old = std::mem::replace(tensor, slice(tensor, &start, &stop, &strides));
+                    drop(old);
+                }
+
+                self.batch_cache_len -= min_pad;
+                // M_e.12 P1 fix (codex review): physical axis-2 was just sliced
+                // to (kv_capacity - min_pad). The struct field MUST follow,
+                // otherwise admit_rows builds new rows at the stale larger
+                // capacity → concat shape mismatch; subsequent decode would
+                // also write past the sliced axis before the next grow.
+                self.kv_capacity -= min_pad;
+                for pad in &mut self.left_padding {
+                    *pad -= min_pad;
+                }
+                // Mirror the M_e.11 KV_CACHE_CHUNK boundary safety: per-row
+                // axis-0 take + axis-2 slice each allocate fresh tensors,
+                // which can churn the residency set on long-running benches.
+                clear_metal_cache();
+            }
+        }
 
         let mut eval_refs =
             Vec::with_capacity(self.packed_kv_flat.len() + self.packed_gdr_flat.len() + 1);
