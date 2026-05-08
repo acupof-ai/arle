@@ -148,6 +148,57 @@ Before running this plan post-R4 #6:
 - [ ] σ < 5% confirmed on n=3 (acceptance rate has run variance; 3 runs may need
       bumping to n=5 if sampling-RNG variance high)
 
+## Update — 2026-05-08 EOD: 4k random text WORKLOAD-DEAD, 2 independent KILLs
+
+Plan reframing after both classical paths benched at 4k random text c=4:
+
+| Setup | α est | tok/s ratio | Verdict | Reference |
+|---|---:|---:|---|---|
+| self-spec K=5 sparse-KV | ~0.069 | 0.270 | KILL | `5f26675` |
+| ext-draft Qwen3-0.6B K=5 | ~0.187 | 0.535 | KILL | `3ac5f4d` |
+
+**Conclusion**: classical Leviathan spec-decode is **workload-dead** for
+Qwen3 family at 4k random text 4-conc. Two independent draft setups both
+sub-license; K-sweep doesn't save it (at α<0.5, no K gives net speedup).
+
+**Original plan recommendation revised**:
+
+The Phase 1 framing assumed α 0.7-0.85 for same-family Qwen3 draft on
+"coding/agent workload". The 4k random text bench (max_tokens=32 prompt
+"The capital of France is" + bench shape `prompt_tokens=4096`) is NOT the
+agent shape — it's pure-text continuation which is the WORST case for
+spec-decode.
+
+**Open paths (axis NOT closed)**:
+
+1. **Agent W3/W4 structured workload** (master §2.1 production shape):
+   `scripts/bench_agent_trace.py` driver exists per master §4.2. Tool-call
+   JSON output has predictable structure → predicted α 0.7-0.85.
+   **Highest priority for spec-decode re-test**.
+2. **Long-ctx 32k+ self-spec**: sparse-KV draft view designed for this
+   regime. Recent-512 + hot-32-pages approximation more useful at 32k+
+   where attention focuses on local + hotspot tokens.
+3. **Medusa multi-head** (master §7.4 P1.1): based on 2 KILL evidence,
+   classical is NOT cheap as originally assumed — same-family small
+   draft (Qwen3-0.6B) too divergent. Medusa heads share target hidden
+   states → naturally aligned. **Recommend promote above classical**
+   for production agent workload despite 1-week training cost.
+
+**Plan execution order revised**:
+
+- Phase 0 (this plan, classical bench) — **CLOSED at 4k random text**.
+  Hold for re-test on W3/W4 shape before further classical work.
+- Phase 1 — pivot to either Medusa training OR W3/W4 harness validation.
+- Phase 2+ — depends on Phase 1 evidence.
+
+**Skill methodology applied**:
+
+Both KILLs honor anti-pattern #13 (NULL is real elimination): they close
+a workload-specific dead branch while preserving the axis for other
+shapes. Without methodology, "spec-decode tested twice, got -73% and
+-46% tok/s, KILL the axis" would be the natural reaction — wrong.
+Workload distinction matters.
+
 ## Cross-references
 
 - Existing substrate: `infer/src/speculative.rs` (721 LOC, classical Leviathan)
