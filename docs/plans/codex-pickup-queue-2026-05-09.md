@@ -22,7 +22,32 @@
 | B3 Step 1 admission_allows | ✅ byte-identical regression | `7c8fd61` + `c30e298` |
 | **B3 Step 2 PrefixAwareAdmission** | ✅ **LICENSED -24.2% TTFT** σ/mean=4.5% | (codex pending commit, wins entry: `docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md`) |
 | Skill v1.4.0 → v1.7.0 | ✅ +6 anti-patterns | `c768b70` |
+| **Skill v1.8.0 anti-pattern bank**(deferred batch) | 🟡 2 candidates ready | `c076aae` #20 + `153fd93` #21 |
 | Codex pickup directives | ✅ this doc | (current) |
+
+## 🌀 Bidirectional audit cycle status(2026-05-09 EOD,11+ commits)
+
+This session demonstrated **bidirectional audit pattern** at unprecedented density:
+
+| # | Stage | Commit | Layer |
+|---|-------|--------|-------|
+| 1 | Claude — Phase 0 audit warmup.rs | `1fdd763` | Source audit |
+| 2 | Codex — audit-of-audit gaps | `c076aae` | Audit-of-audit |
+| 3 | Claude — adopt gates + LOC reduction | `8b1a913` | Integration |
+| 4 | Codex — Phase 0.5 cheap-experiment recipe | `3456f8f` | Recipe |
+| 5 | Claude — cite recipe in queue | `43b2115` | Reference |
+| 6 | Codex — strategic axis-ROI brief | `d2c2c17` | Strategic |
+| 7 | Claude — P0.0 Phase 1 decomposition gate | `9e964c9` | Strategic gate |
+| 8 | Codex — LICENSE staleness pre-merge gate | `ec5c37c` | Meta-SOLID |
+| 9 | Claude — annotate gate in queue | `183bd60` | Reference |
+| 10 | Codex — B3 Step 2 substrate LANDED | `b85929b` | Implementation |
+| 10' | Codex — Phase 1.A nvtx recipe | `2fafa9e` | Recipe(forward) |
+| 11 | Claude — Phase 1.A scoping fix | `b55bfcd` | Recipe-itself audit |
+| 12 | Codex — recipe-itself audit codification | `153fd93` | Methodology(skill #21 candidate) |
+
+**Pattern**:each prescription layer audited by other side。Compounding rigor。
+**Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,2 skill v1.8.0 candidates,
+P0.2 dispatched + active,Phase 1.A recipe verified-correct。
 
 ## ⚠ STRATEGIC RE-ORDERING(2026-05-09 EOD)— per codex `d2c2c17`
 
