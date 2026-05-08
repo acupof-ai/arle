@@ -250,7 +250,7 @@ stack on Phase 0:**1.86× decode + 7.9× prefill** combined improvement vs BF16 
 
 ✅ §0 SOLID 工作流救 400 LOC implementation:cheap sanity check(<1h codex)阻止了完整 implement 才发现 hardware path 不通。
 
-## §9.1 Phase 0 v2 — cutlass FP8 direct mma smoke
+## §9.1 Phase 0 v2 — cutlass FP8 direct mma smoke ❌ KILLED
 
 cuBLASLt utilization ~24% 不代表 cutlass 也只 ~24%。cuBLASLt 走 algo dispatch
 heuristic 可能是次优 algo,cutlass FP8 direct mma kernel 可能拿到更高 utilization。
@@ -272,6 +272,29 @@ heuristic 可能是次优 algo,cutlass FP8 direct mma kernel 可能拿到更高 
 cutlass smoke license 决定 M_quant 是否 continue。如果 cutlass 也只 ~24%,
 意味着 Ada FP8 mma stack 在本机上 fundamental 不 viable,FP8 magnitude 路径
 全部 KILL,改方向 W4A16 + 5 项 moat。
+
+### 🔴 实测结果(2026-05-08,codex)
+
+Smoke source stayed outside the build graph at `/tmp/fp8_cutlass_smoke.cu`.
+It used TileLang's vendored CUTLASS headers and matched the cuBLASLt
+shape exactly (`M=2048, N=2560, K=2560`, 100 warmup + 100 timed iters).
+
+| Path | Mean / iter | Speedup vs BF16 |
+|---|---:|---:|
+| cuBLASLt BF16 control | 0.325 ms | 1.00× |
+| cuBLASLt FP8 E4M3 TN | 0.177 ms | 1.84× |
+| CUTLASS FP8 default `OpMultiplyAdd` | 0.510 ms | 0.64× |
+| **CUTLASS FP8 `OpMultiplyAddFastAccum`** | **0.203 ms** | **1.60×** |
+
+`A=RowMajor, B=ColumnMajor` is the viable vendored CUTLASS Sm89 FP8 path;
+changing C layout did not change timing, while `A=ColumnMajor, B=RowMajor`
+failed to compile for this specialization.
+
+**License decision**:CUTLASS FP8 lands in the **<3× KILL bucket** and is
+slower than cuBLASLt FP8. M_quant W8A8 FP8 full path is killed for this
+sm_89 + CUDA 13.2 stack. Pivot to W4A16 Marlin and KV W4A8.
+
+Details: [`2026-05-08-m_quant-cutlass-fp8-smoke-killed-sm89.md`](../experience/errors/2026-05-08-m_quant-cutlass-fp8-smoke-killed-sm89.md).
 
 ## §9.2 平行 cheap verify — W4A16 Marlin decode bench(无 implement)
 
