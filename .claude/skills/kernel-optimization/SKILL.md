@@ -1,7 +1,7 @@
 ---
 name: kernel-optimization
 description: Use this skill when the user asks to optimize, tune, speed up, or improve the performance of a GPU/CPU kernel, operator (op), attention path, GEMM call, decode/prefill path, quantization op, scheduler hot path, or any "make this faster" / "reduce ITL/TTFT" / "lower memory" / "拉满 utilization" / "调 kernel" / "优化算子" request. Captures the methodology — formula-predict → measure binding constraint → single-variable A/B with matched controls → combinational A/B when interactions suspected → tradeoff explicit (no tradeoff = not at extremes) → license-or-kill — and an industry-reference catalog (FlashAttention, cutlass, Marlin, SGLang, vLLM, TileLang, ncu/nsys methodology) so each attempt is grounded, not hand-waved.
-version: 1.2.0
+version: 1.3.0
 ---
 
 # kernel-optimization
@@ -422,15 +422,33 @@ Each anti-pattern has a project commit/entry where it was paid for.
       bake conversion cost into Phase 4 formula.
 
 12. **Single-kernel choice ≠ optimal at all batch sizes (decode vs prefill duality)**
-    - Caught by: ARLE Marlin used at all batch>1 (`linear.rs:65-93`); decode
+    - Hypothesis was: ARLE Marlin used at all batch>1 (`linear.rs:65-93`); decode
       (M≤8) is launch-overhead-bound where Marlin's 6-launch wrapper hurts,
       while prefill (M=2048) is compute-bound where Marlin's tensor cores win.
-      The dispatch should be hybrid: small-batch → BF16-native GEMV
-      (`W4A16BatchGemv` in ARLE), large-batch → tensor-core path (Marlin / cutlass).
-    - Caught by: Round 4 prep `b3f22ea` matched-contrast launch density (6 vs 1).
-    - Fix: Phase 7 tradeoff axis "Generality" must include "single-shape
-      optimum may regress sibling shape" — multi-shape A/B mandatory before
-      committing to a single dispatch choice.
+      Hypothesis predicted hybrid dispatch (small-batch → `W4A16BatchGemv`,
+      large-batch → Marlin) would improve decode ITL.
+    - Initial caught by: Round 4 prep `b3f22ea` matched-contrast launch density (6 vs 1).
+    - **HARDENED v1.3.0** (R4 #6 KILL `4571082`): hypothesis **REFUTED by data**.
+      Implementing hybrid dispatch (`MARLIN_DECODE_BATCH_THRESHOLD=8`) at
+      `f00ff8b` produced **+60.7% ITL regression** at batch=4 decode (18.9 ms
+      vs Arm B Marlin all-batch 11.76 ms). Greedy 2/2 PASSED (correctness
+      preserved); σ ITL 0.06 ms (real signal, not noise).
+    - **Root cause** (post-R4 #6): launch overhead is the cost of *amortizing
+      tensor-core compute*. The cost is real, but the **benefit is even larger**.
+      W4A16BatchGemv (CUDA-core GEMV, no tensor mma) at batch=4 is +61% slower
+      than Marlin's multi-launch tensor-core path despite single-launch
+      dispatch. Marlin's tensor-core throughput dominates the 5-launch
+      overhead at decode batch ≥ 2 on sm_89.
+    - Fix: Phase 7 tradeoff axis "Tensor-core advantage at small batch" must be
+      a hypothesis-under-test, not an assumption. **Test the dual-kernel
+      hypothesis with formula + bench BEFORE landing dispatch changes**;
+      assume tensor-core dominance until empirically proven otherwise. The
+      decode-vs-prefill duality applies to **kernels without tensor cores**
+      (e.g., norms, RoPE, sampling) but **NOT** to compute-heavy ops with
+      tensor cores (Marlin W4 GEMM, FA-3 attention, cutlass GEMM).
+    - **Magnitude direction wrong**: Phase 4 formula predicted 1.23-1.47× ITL
+      improvement; actual 0.62× = +60% regression. Skill enforced σ-tight
+      single-arm KILL hard; methodology preserved future axis preservation.
 
 13. **NULL result is real elimination, not skill failure**
     - Caught by: Round 2 (alloc_zeros skip) + Round 3 (variant swap) — both
