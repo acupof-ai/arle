@@ -459,14 +459,40 @@ P0.0 (W3/W4 bench harness 跨引擎实测)
 - Phase 2:graph capture + TileLang HD128 + FP8 paged KV combine
 - Acceptance:4k TTFT < 748 ms(SGLang × 1/1.30)+ 8k TTFT < 1816 ms
 
-### §7.4 P1.1 — Speculative decoding(Medusa 优先)
+### §7.4 P1.1 — Speculative decoding(Medusa **REQUIRED**,classical DEAD)
 
-- **Medusa 多头**(单模型加多个 prediction head)优先 EAGLE(独立 draft)
+> **2026-05-08 evidence-driven update**:Original framing was "Medusa
+> 优先 EAGLE 降数据/训练风险" — implied classical Leviathan was the
+> cheap fallback。**3 independent classical-spec KILLs** prove classical
+> is NOT fallback,**strictly worse than no-spec** across all tested
+> workloads on Qwen3-4B + sm_89 + ARLE current:
+>
+> | Workload | Setup | α | Verdict | Ref |
+> |---|---|---:|---|---|
+> | 4k random text c=4 | self-spec K=5 sparse-KV | 0.069 | KILL | `5f26675` |
+> | 4k random text c=4 | ext-draft Qwen3-0.6B K=5 | 0.187 | KILL | `3ac5f4d` |
+> | 32k random text c=1 | self-spec K=5 sparse-KV | 0.230 | KILL | `8f2b227` |
+>
+> **Pattern**:α ≤ 0.25 across all classical setups。Math:at α=0.23 +
+> 32k context,per-token cost = 2.79× no-spec(verified by formula and
+> bench)。Only architectural change(Medusa shared-target heads,EAGLE
+> auxiliary,radically larger draft)breaks the ceiling。
+
+**Updated recommendation**:
+
+- **Medusa 多头**(单模型加多个 prediction head)is the **REQUIRED path**,
+  not a "preferred" alternative。Classical Leviathan via ARLE current
+  implementation is **production-dead** for tok/s improvement at any
+  tested workload。
 - 复用 ARLE Rust runtime + TileLang verify kernel
 - 目标:tool call 短输出(50-500 tok)tok/s × 2-3,acceptance ≥70%
-- LOC 估:500-800
-- Owner:codex(impl)+ Claude(plan + review)
-- 触发:P0.1 license 通过
+- LOC 估:500-800 + ~1 week training data prep + fine-tune
+- Owner:codex(impl + training)+ Claude(bench + review)
+- 触发:agent W3/W4 admission fix(`a672b08` blocker)→ baseline production
+  shape established,then Medusa training begins
+- **Untested classical alternatives still open**(low priority):
+  - Larger classical draft(Qwen3-1.7B as draft for Qwen3-4B target):marginal upside,untested
+  - W3/W4 structured workload(tool-call JSON):predicted higher α 0.6-0.85,gated on admission fix
 
 ### §7.5 P1.2 — Grammar 约束(xgrammar FFI 优先)
 
