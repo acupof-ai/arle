@@ -10,11 +10,13 @@ use super::super::{ActiveRequest, ModelForward, Phase, Scheduler, error, info, w
 use super::helpers::{
     DeferredWaitingRequest, FetchWaiter, PrefixAdmissionPlan, QueuedAdmissionCandidate,
     WaitingInsertBias, best_reusable_slot_for_radix_hit, finish_rejected_request,
-    insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu, matched_sealed_lookup_blocks,
-    session_affinity_tokens_for_plan, staged_prefix_prefetch_state,
+    insert_deferred_waiting_request, insert_waiting_request_by_priority,
+    lookup_blocks_ready_on_gpu, matched_sealed_lookup_blocks, session_affinity_tokens_for_plan,
+    staged_prefix_prefetch_state,
 };
 use crate::kv_tier::{LookupHeuristics, LookupOutcome, ReadmissionSource, RequestChunkState};
-use crate::scheduler::types::RequestLengthContract;
+use crate::scheduler::policy::SchedulerSignals;
+use crate::scheduler::types::{RequestLengthContract, SchedulerAdmissionPolicy};
 use crate::server_engine::FinishReason;
 use crate::types::SessionId;
 
@@ -288,9 +290,11 @@ impl<M: ModelForward> Scheduler<M> {
     pub(super) fn collect_admission_candidates(
         &mut self,
         free_slots: &[usize],
+        deferred_waiting: &mut std::collections::VecDeque<DeferredWaitingRequest>,
     ) -> Vec<QueuedAdmissionCandidate> {
         let mut candidates = Vec::new();
         let scan_len = self.waiting.len();
+        let mut policy_deferred = std::collections::VecDeque::new();
         for _ in 0..scan_len {
             let Some(mut incoming) = self.waiting.pop_front() else {
                 break;
@@ -329,14 +333,156 @@ impl<M: ModelForward> Scheduler<M> {
             );
             let hint = super::helpers::WaitingRequestHint::from_plan(&plan, reusable_prefix_len)
                 .with_session_affinity_tokens(session_affinity_tokens);
-            candidates.push(QueuedAdmissionCandidate {
+            let candidate = QueuedAdmissionCandidate {
                 incoming,
                 prompt_tokens,
                 plan,
                 hint,
-            });
+            };
+            if !self.prefix_aware_admission_allows_plan(&candidate.plan, scan_len) {
+                policy_deferred.push_back(candidate);
+                continue;
+            }
+            candidates.push(candidate);
+        }
+
+        Self::defer_candidates_below_blocked_priority(&mut candidates, &mut policy_deferred);
+
+        // If every scanned request is cold and the prefix-aware soft cap is
+        // already reached, fail open enough requests to fill the currently
+        // idle slots so cold-only traffic does not underfill the device. The
+        // selector stays inside the highest blocked priority band so warm
+        // promotion never bypasses explicit request priority.
+        let fail_open_target = free_slots.len();
+        while candidates.len() < fail_open_target
+            && let Some(candidate_idx) = self.prefix_aware_fail_open_candidate(&policy_deferred)
+            && let Some(candidate) = policy_deferred.remove(candidate_idx)
+        {
+            candidates.push(candidate);
+        }
+
+        while let Some(candidate) = policy_deferred.pop_front() {
+            self.release_admission_plan(&candidate.plan);
+            insert_deferred_waiting_request(
+                deferred_waiting,
+                DeferredWaitingRequest {
+                    incoming: candidate.incoming,
+                    prompt_tokens: candidate.prompt_tokens,
+                    hint: candidate.hint,
+                },
+                WaitingInsertBias::AfterEqual,
+            );
         }
         candidates
+    }
+
+    fn defer_candidates_below_blocked_priority(
+        candidates: &mut Vec<QueuedAdmissionCandidate>,
+        policy_deferred: &mut std::collections::VecDeque<QueuedAdmissionCandidate>,
+    ) {
+        let Some(blocking_priority) = policy_deferred
+            .iter()
+            .map(|candidate| candidate.incoming.priority)
+            .max()
+        else {
+            return;
+        };
+
+        let mut idx = 0;
+        while idx < candidates.len() {
+            if candidates[idx].incoming.priority < blocking_priority {
+                policy_deferred.push_back(candidates.remove(idx));
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    fn prefix_aware_admission_allows_plan(
+        &self,
+        plan: &PrefixAdmissionPlan,
+        queued_requests: usize,
+    ) -> bool {
+        if !matches!(
+            self.config.admission_policy,
+            SchedulerAdmissionPolicy::PrefixAware
+        ) || !self.config.prefix_cache_enabled
+        {
+            return true;
+        }
+
+        let signals = self.prefix_aware_admission_signals(plan, queued_requests);
+        if !signals.is_cold_request() || self.config.max_waiting_requests == 0 {
+            return true;
+        }
+        let cold_headroom = self
+            .config
+            .cold_headroom
+            .unwrap_or(self.config.max_waiting_requests / 4);
+        let cold_soft_cap = self
+            .config
+            .max_waiting_requests
+            .saturating_sub(cold_headroom);
+        signals.queued_requests < cold_soft_cap
+    }
+
+    fn prefix_aware_fail_open_candidate(
+        &self,
+        candidates: &std::collections::VecDeque<QueuedAdmissionCandidate>,
+    ) -> Option<usize> {
+        let highest_priority = candidates
+            .iter()
+            .map(|candidate| candidate.incoming.priority)
+            .max()?;
+        candidates
+            .iter()
+            .position(|candidate| {
+                candidate.incoming.priority == highest_priority
+                    && !self
+                        .prefix_aware_admission_signals(&candidate.plan, candidates.len())
+                        .is_cold_request()
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.incoming.priority == highest_priority)
+            })
+    }
+
+    fn prefix_aware_admission_signals(
+        &self,
+        plan: &PrefixAdmissionPlan,
+        queued_requests: usize,
+    ) -> SchedulerSignals {
+        let prefix_hit_tokens = self.prefix_aware_reusable_prefix_tokens(plan);
+        SchedulerSignals {
+            queued_requests,
+            active_decodes: self.running_batch.len(),
+            prefix_hit_tokens,
+            // SessionSlotHold currently identifies a retained session prefix,
+            // not a concrete slot. AdmissionPolicy only reads Option-ness.
+            session_affinity_slot: plan
+                .session_slot_hold
+                .as_ref()
+                .map(|_| plan.reusable.map(|(slot_idx, _, _)| slot_idx).unwrap_or(0)),
+            turn_depth: 0,
+        }
+    }
+
+    fn prefix_aware_reusable_prefix_tokens(&self, plan: &PrefixAdmissionPlan) -> usize {
+        if plan.lookup.recompute_advised {
+            return 0;
+        }
+        if plan.direct_gpu_attach {
+            return plan.lookup.matched_len;
+        }
+        if let Some((_, reusable_prefix_len, _)) = plan.reusable {
+            return reusable_prefix_len;
+        }
+        plan.staged_prefix_plan
+            .as_ref()
+            .map(|staged| staged.matched_len)
+            .unwrap_or_default()
     }
 
     pub(super) fn release_admission_plan(&mut self, plan: &PrefixAdmissionPlan) {

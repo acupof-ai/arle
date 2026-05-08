@@ -214,7 +214,7 @@ impl<M: ModelForward> Scheduler<M> {
         );
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, schedule_policy={}, prefix_cache={}, short_prompt_bypass_tokens={}, stream_interval={}, host_pool={:.1}MB, t1_min_prompt_tokens={}",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, schedule_policy={}, admission_policy={}, cold_headroom={}, prefix_cache={}, short_prompt_bypass_tokens={}, stream_interval={}, host_pool={:.1}MB, t1_min_prompt_tokens={}",
             model_id,
             config.max_slots,
             seed,
@@ -227,6 +227,10 @@ impl<M: ModelForward> Scheduler<M> {
                 .prefill_max_requests
                 .map_or_else(|| "none".to_string(), |v| v.to_string()),
             config.schedule_policy.as_str(),
+            config.admission_policy.as_str(),
+            config
+                .cold_headroom
+                .map_or_else(|| "default".to_string(), |v| v.to_string()),
             if config.prefix_cache_enabled {
                 "on"
             } else {

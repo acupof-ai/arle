@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 
 use crate::kv_tier::ClusterSharedBackendConfig;
 use crate::sampler::SamplingParams;
-use crate::scheduler::policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
+use crate::scheduler::policy::{
+    AdmissionPolicy, PrefixAwareAdmission, QueueBoundAdmission, SchedulerSignals,
+};
 use crate::server_engine::CompletionStreamDelta;
 use crate::tokenizer::Tokenizer;
 use crate::types::SessionId;
@@ -99,6 +101,15 @@ pub struct SchedulerConfig {
     pub short_prompt_bypass_tokens: usize,
     /// Whether radix prefix-cache lookup/publish is enabled.
     pub prefix_cache_enabled: bool,
+    /// Admission policy used after CUDA runtime prefix lookup.
+    ///
+    /// `QueueBound` preserves the legacy waiting-queue cap. `PrefixAware`
+    /// reserves headroom for warm/session-continuation requests when the
+    /// queue is under cold-request pressure.
+    pub admission_policy: SchedulerAdmissionPolicy,
+    /// Queue slots reserved for warm requests under `PrefixAware`. `None`
+    /// resolves to `max_waiting_requests / 4`.
+    pub cold_headroom: Option<usize>,
     /// Operator-facing schedule policy name. The CUDA scheduler currently
     /// implements SGLang-compatible `fcfs`; other names are rejected at CLI.
     pub schedule_policy: SchedulePolicy,
@@ -200,6 +211,8 @@ impl Default for SchedulerConfig {
             prefill_max_requests: None,
             short_prompt_bypass_tokens: 256,
             prefix_cache_enabled: true,
+            admission_policy: SchedulerAdmissionPolicy::QueueBound,
+            cold_headroom: None,
             schedule_policy: SchedulePolicy::Fcfs,
             mixed_policy: SchedulerMixedPolicy::Split,
             stream_interval: 1,
@@ -355,6 +368,24 @@ impl SchedulerConfig {
         }
     }
 
+    pub fn admission_policy_allows(&self, signals: SchedulerSignals) -> bool {
+        if self.max_waiting_requests == 0 {
+            return true;
+        }
+
+        match self.admission_policy {
+            SchedulerAdmissionPolicy::QueueBound => QueueBoundAdmission {
+                max_queued_requests: self.max_waiting_requests,
+            }
+            .allow(signals),
+            SchedulerAdmissionPolicy::PrefixAware => {
+                let cold_headroom = self.cold_headroom.unwrap_or(self.max_waiting_requests / 4);
+                PrefixAwareAdmission::with_cold_headroom(self.max_waiting_requests, cold_headroom)
+                    .allow(signals)
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.max_slots == 0 {
             anyhow::bail!("max_slots must be ≥ 1");
@@ -440,6 +471,32 @@ impl SchedulerConfig {
             anyhow::bail!("t1_host_pinned_capacity_bytes must be ≥ 1 when provided");
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SchedulerAdmissionPolicy {
+    #[default]
+    QueueBound,
+    PrefixAware,
+}
+
+impl SchedulerAdmissionPolicy {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "queue-bound" | "queue_bound" | "queue" => Ok(Self::QueueBound),
+            "prefix-aware" | "prefix_aware" => Ok(Self::PrefixAware),
+            other => anyhow::bail!(
+                "unsupported --admission-policy '{other}': expected 'queue-bound' or 'prefix-aware'"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueBound => "queue-bound",
+            Self::PrefixAware => "prefix-aware",
+        }
     }
 }
 
@@ -625,11 +682,9 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    /// Admission gate. Takes full `SchedulerSignals` so future per-request
-    /// hints (`prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`) can
-    /// flow through to PrefixAwareAdmission. Current callers pass
-    /// queue-state-only signals; B3 wiring (per c0ddd4f + e53e4d8) will
-    /// extend submit() to compute prefix_hit_tokens at admission time.
+    /// Admission gate for the backend-neutral ingress queue. Prefix-aware
+    /// admission runs inside the CUDA runtime after radix lookup, where prefix
+    /// hits can be classified without guessing at this channel boundary.
     fn admission_allows(&self, signals: SchedulerSignals) -> bool {
         if self.max_waiting == 0 {
             return true;
@@ -740,9 +795,6 @@ impl SchedulerHandle {
     pub fn submit(&self, req: IncomingRequest) -> std::result::Result<(), SchedulerFull> {
         loop {
             let current = self.waiting_count.load(Ordering::Relaxed);
-            // B3 Step 1 (c0ddd4f + e53e4d8): pass full SchedulerSignals.
-            // Step 2 will compute prefix_hit_tokens via RadixCache.match_prefix
-            // here before constructing signals.
             if !self.admission_allows(SchedulerSignals::queue_state(current, 0)) {
                 return Err(SchedulerFull);
             }
@@ -805,6 +857,8 @@ mod tests {
         assert_eq!(cfg.long_prefill_token_threshold, 4096);
         assert_eq!(cfg.mixed_prefill_token_budget(), 16384);
         assert_eq!(cfg.prefill_max_requests, None);
+        assert_eq!(cfg.admission_policy, SchedulerAdmissionPolicy::QueueBound);
+        assert_eq!(cfg.cold_headroom, None);
         assert_eq!(cfg.mixed_policy, SchedulerMixedPolicy::Split);
         assert!(!cfg.spec_enabled);
         assert_eq!(cfg.spec_draft_k, 5);
@@ -824,6 +878,60 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_min_prompt_tokens, 4096);
         assert_eq!(cfg.cluster_shared_backend, None);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_admission_policy_parse_accepts_documented_values() {
+        assert_eq!(
+            SchedulerAdmissionPolicy::parse("queue-bound").unwrap(),
+            SchedulerAdmissionPolicy::QueueBound
+        );
+        assert_eq!(
+            SchedulerAdmissionPolicy::parse("prefix-aware").unwrap(),
+            SchedulerAdmissionPolicy::PrefixAware
+        );
+        assert!(SchedulerAdmissionPolicy::parse("lifo").is_err());
+    }
+
+    #[test]
+    fn scheduler_config_queue_bound_admission_matches_legacy_cap() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.max_waiting_requests = 4;
+        cfg.admission_policy = SchedulerAdmissionPolicy::QueueBound;
+
+        assert!(cfg.admission_policy_allows(SchedulerSignals {
+            queued_requests: 3,
+            prefix_hit_tokens: 256,
+            ..SchedulerSignals::default()
+        }));
+        assert!(!cfg.admission_policy_allows(SchedulerSignals {
+            queued_requests: 4,
+            prefix_hit_tokens: 256,
+            ..SchedulerSignals::default()
+        }));
+    }
+
+    #[test]
+    fn scheduler_config_prefix_aware_reserves_cold_headroom() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.max_waiting_requests = 4;
+        cfg.admission_policy = SchedulerAdmissionPolicy::PrefixAware;
+        cfg.cold_headroom = Some(1);
+
+        assert!(!cfg.admission_policy_allows(SchedulerSignals {
+            queued_requests: 3,
+            ..SchedulerSignals::default()
+        }));
+        assert!(cfg.admission_policy_allows(SchedulerSignals {
+            queued_requests: 3,
+            prefix_hit_tokens: 128,
+            ..SchedulerSignals::default()
+        }));
+        assert!(!cfg.admission_policy_allows(SchedulerSignals {
+            queued_requests: 4,
+            prefix_hit_tokens: 128,
+            ..SchedulerSignals::default()
+        }));
     }
 
     #[test]

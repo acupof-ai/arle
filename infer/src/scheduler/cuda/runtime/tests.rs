@@ -264,6 +264,21 @@ mod tests {
     }
 
     #[test]
+    fn waiting_hint_ignores_non_runnable_lookup_matches() {
+        let cold_match = hint_plan(64, 0, false, None, false);
+        assert_eq!(cold_match.immediate_reuse_tokens, 0);
+        assert_eq!(cold_match.total_reuse_tokens, 0);
+
+        let direct_attach = hint_plan(64, 0, true, None, false);
+        assert_eq!(direct_attach.immediate_reuse_tokens, 64);
+        assert_eq!(direct_attach.total_reuse_tokens, 64);
+
+        let staged = hint_plan(64, 0, false, Some(48), false);
+        assert_eq!(staged.immediate_reuse_tokens, 0);
+        assert_eq!(staged.total_reuse_tokens, 48);
+    }
+
+    #[test]
     fn session_affinity_tokens_require_matching_session_prefix_blocks() {
         let session_a = crate::types::SessionId::from("session-a");
         let session_b = crate::types::SessionId::from("session-b");

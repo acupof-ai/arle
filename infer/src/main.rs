@@ -12,7 +12,9 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
-use infer::scheduler::{DraftMode, SchedulePolicy, SchedulerConfig, SchedulerMixedPolicy};
+use infer::scheduler::{
+    DraftMode, SchedulePolicy, SchedulerAdmissionPolicy, SchedulerConfig, SchedulerMixedPolicy,
+};
 use infer::server_engine::EnginePoolModelSpec;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
@@ -115,6 +117,16 @@ struct Args {
     /// no-ops.
     #[arg(long, default_value = "fcfs")]
     schedule_policy: String,
+
+    /// Admission policy: `queue-bound` preserves legacy queue-cap behavior;
+    /// `prefix-aware` reserves queue headroom for warm prefix-cache hits.
+    #[arg(long, default_value = "queue-bound")]
+    admission_policy: String,
+
+    /// Cold-request headroom reserved for warm prefix-cache hits when
+    /// `--admission-policy=prefix-aware`. Defaults to max_waiting / 4.
+    #[arg(long)]
+    cold_headroom: Option<usize>,
 
     /// Decode-active prefill policy: `split` keeps production prefill+decode
     /// launches separate; `mixed` opts into the experimental single mixed launch.
@@ -687,6 +699,8 @@ fn kv_mode_candidates(
 fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig {
     let schedule_policy =
         SchedulePolicy::parse(&args.schedule_policy).unwrap_or_else(|err| panic!("{err}"));
+    let admission_policy = SchedulerAdmissionPolicy::parse(&args.admission_policy)
+        .unwrap_or_else(|err| panic!("{err}"));
     let mixed_policy = SchedulerMixedPolicy::parse(&args.scheduler_mixed_policy)
         .unwrap_or_else(|err| panic!("{err}"));
     let spec_draft_model =
@@ -704,6 +718,8 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
             args.short_prompt_bypass_tokens
         },
         prefix_cache_enabled: !args.disable_radix_cache,
+        admission_policy,
+        cold_headroom: args.cold_headroom,
         schedule_policy,
         mixed_policy,
         stream_interval: args.stream_interval,

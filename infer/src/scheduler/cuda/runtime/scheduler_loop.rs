@@ -226,8 +226,9 @@ impl<M: ModelForward> Scheduler<M> {
             self.stats.prefill_oom_cooldown_until = None;
         }
 
-        let mut candidates = self.collect_admission_candidates(&available_free_slots);
         let mut deferred_waiting = std::collections::VecDeque::new();
+        let mut candidates =
+            self.collect_admission_candidates(&available_free_slots, &mut deferred_waiting);
         let mut admission_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
         for (slot_idx, req) in self.active.iter().enumerate() {
             let Some(req) = req.as_ref() else {

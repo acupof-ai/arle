@@ -49,8 +49,6 @@ impl WaitingRequestHint {
             immediate_reuse_tokens
         } else if let Some(staged_prefix_plan) = plan.staged_prefix_plan.as_ref() {
             staged_prefix_plan.matched_len
-        } else if !plan.lookup.recompute_advised {
-            plan.lookup.matched_len
         } else {
             0
         };
