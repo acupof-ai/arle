@@ -744,6 +744,7 @@ impl MetalQwen35PrefixRuntime {
         request: &mut ActiveMetalRequest,
     ) -> Result<bool> {
         let trace = std::env::var("INFER_M_E10_TRACE").is_ok();
+        let trace13 = std::env::var("INFER_M_E13_TRACE").is_ok();
         let imported = {
             let Some(snapshot) = self.entries.get(prefix_key).map(|entry| &entry.snapshot) else {
                 if trace {
@@ -763,9 +764,19 @@ impl MetalQwen35PrefixRuntime {
                     &request.session_id,
                 );
             }
+            let t_import_start = std::time::Instant::now();
             let result = request
                 .request_state
                 .import_qwen35_prefix_snapshot(snapshot, prefix_key.len());
+            let t_import_us = t_import_start.elapsed().as_micros();
+            if trace13 {
+                log::info!(
+                    "m_e13_trace try_import_memory_prefix: tokens={} import_us={} ok={}",
+                    prefix_key.len(),
+                    t_import_us,
+                    result.is_ok(),
+                );
+            }
             match &result {
                 Ok(b) if trace => log::info!(
                     "m_e10_trace import_qwen35_prefix_snapshot returned Ok({})",
