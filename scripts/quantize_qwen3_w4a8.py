@@ -11,10 +11,15 @@ Converts local BF16 safetensors into ARLE's W4A8 side-tensor convention:
 Status (2026-05-08 EOD+27):
   Investigation of W4A8 100%-token-diff bug landed multiple iterations on
   this packing logic:
-    - H3  (25391f3): row stride 4-consecutive → 2-skip-8 (INT8 mma)
+    - H3  (25391f3): row stride 4-consecutive → 2-skip-8. Later
+                     diagnostics found this compared against PR #31's
+                     plain Layer path, not W4A8Layer; W4A8Layer uses
+                     4-consecutive rows.
     - H3b (3479a87): apply scale_perm_single to s_channel (was deleted)
-    - H3c (4dea952): defer scale_perm_single until after division — REVERTED
-                     (06193eb) after empirical regression
+    - H3c (4dea952): defer scale_perm_single until after division. This
+                     was temporarily reverted, then reinstated after the
+                     pack round-trip diagnostic isolated the remaining
+                     scale-chain asymmetry.
     - H4  (592779a): redundant `s_pack = s.t()` mis-aligns broadcast during
                      quant division; current canonical = remove transpose.
 
@@ -48,13 +53,14 @@ def get_perms(groupsize: int, k: int):
         perm1 = []
         col = i // 4
         for block in [0, 1]:
-            # W4A8 INT8 mma fragment layout per PR #31. INT8 mma m16n8k16 has
-            # 16-byte/thread A fragment → row stride 2 with skip-8 pattern.
+            # PR #31 W4A8Layer._get_perms uses the 4-consecutive row pattern.
+            # Do not use the top-level Layer._get_perms skip-8 pattern here;
+            # that path is for the non-W4A8 Marlin layer.
             for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
+                4 * (i % 4),
+                4 * (i % 4) + 1,
+                4 * (i % 4) + 2,
+                4 * (i % 4) + 3,
             ]:
                 perm1.append(16 * row + col + 8 * block)
         for j in range(4):
@@ -96,9 +102,6 @@ def pack_w4a8(weight: torch.Tensor, groupsize: int = GROUP_SIZE):
     s_channel = ref.t().abs().amax(dim=-1, keepdim=True).div(127.0).to(torch.float32)
     s_channel = torch.where(s_channel == 0, torch.ones_like(s_channel), s_channel)
     s_channel = s_channel.reshape(1, n)
-    # H3b: apply scale_perm_single to s_channel (PR #31 Layer.pack does this).
-    s_channel = s_channel.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
-    s_channel = s_channel.reshape((-1, n)).contiguous()
 
     reshaped = ref.reshape(k // groupsize, groupsize, n)
     s = reshaped.abs().amax(dim=1).clamp_min(1e-6).div(7.0).to(torch.float16)
@@ -117,6 +120,10 @@ def pack_w4a8(weight: torch.Tensor, groupsize: int = GROUP_SIZE):
     w = w.reshape((groupsize, -1, n)).permute(1, 0, 2).reshape((k, n)).contiguous()
     s_group = s_group.reshape((-1, len(scale_perm)))[:, scale_perm]
     s_group = s_group.reshape((-1, n)).contiguous()
+    # PR #31 W4A8Layer.pack divides group scales by raw per-channel scales,
+    # then stores the per-channel scales in the kernel's permuted layout.
+    s_channel = s_channel.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    s_channel = s_channel.reshape((-1, n)).contiguous()
 
     tile = 16
     w = w.reshape((k // tile, tile, n // tile, tile))
@@ -142,6 +149,8 @@ def main() -> None:
 
     for pattern in ["*.json", "*.model", "*.txt", "tokenizer*"]:
         for path in src.glob(pattern):
+            if path.name == "model.safetensors.index.json":
+                continue
             target = dst / path.name
             if path.is_file() and not target.exists():
                 shutil.copy2(path, target)
@@ -170,6 +179,9 @@ def main() -> None:
                 out_tensors[name] = tensor
 
     save_file(out_tensors, dst / "model.safetensors")
+    stale_index = dst / "model.safetensors.index.json"
+    if stale_index.exists():
+        stale_index.unlink()
 
     config_path = dst / "config.json"
     with config_path.open() as f:
