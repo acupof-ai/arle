@@ -150,6 +150,51 @@ For arm A (BF16 baseline) and arm B (Marlin all-batch) — re-bench can be
 skipped if `f6f3af3` numbers are recent enough; otherwise n=1 quick reproduction
 each at `marlin-w4a16-round4-baseline-bf16` and `marlin-w4a16-round4-baseline-marlin`.
 
+### Multi-shape defense gate (LAND blocker per Phase 7 generality axis)
+
+After Phase 5 primary 4k-c=4 result, run defense at the two ARLE-leading
+shapes BEFORE committing the dispatch change. Master strategy §3.1
+documents +30% high-conc lead vs vLLM and +80% multi-tenant lead vs
+vLLM — these MUST NOT regress under R4 #6 hybrid:
+
+```bash
+# Defense 1 — high-conc 1k/256/c=64 (batch=64 → Marlin path, expected unchanged)
+PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
+  scripts/bench_guidellm.sh marlin-w4a16-round4-defense-highconc \
+  --model Qwen3-4B-W4A16-sym-g128-marlin \
+  --processor /home/ckl/projects/arle/infer/models/Qwen3-4B-W4A16-sym-g128-marlin \
+  --concurrencies 64 --max-seconds 120 --warmup 10 \
+  --data 'prompt_tokens=1024,prompt_tokens_min=1024,prompt_tokens_max=1024,output_tokens=256,output_tokens_min=256,output_tokens_max=256'
+
+# Defense 2 — multi-tenant prefix-cache (batch varies, decode batches may now
+# route W4A16BatchGemv — must verify TTFT not worse vs Arm B Marlin all-batch)
+PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
+  scripts/bench_kv_cache_prefix.py --target http://localhost:8000 \
+  --concurrencies 4 --shared-prefix-tokens 2048 --tail-tokens 64 \
+  --max-seconds 120 --warmup 10
+
+# Defense 3 — longctx 8k/c=4 (decode happens at batch=4 → directly tests R4 #6
+# threshold; may show LARGER win than 4k due to longer decode tail)
+PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
+  scripts/bench_guidellm.sh marlin-w4a16-round4-defense-longctx8k \
+  --model Qwen3-4B-W4A16-sym-g128-marlin \
+  --processor /home/ckl/projects/arle/infer/models/Qwen3-4B-W4A16-sym-g128-marlin \
+  --concurrencies 4 --max-seconds 180 --warmup 10 \
+  --data 'prompt_tokens=8192,prompt_tokens_min=8192,prompt_tokens_max=8192,output_tokens=256,output_tokens_min=256,output_tokens_max=256'
+```
+
+Defense gate decisions (per shape, vs Arm B Marlin all-batch):
+
+| Shape | Acceptable Δ vs Arm B | Outcome if exceeded |
+|---|---|---|
+| high-conc 1k/256/c=64 | TTFT ±2%, ITL ±2%, tok/s ±2% | KILL — dispatch broke prefill (batch=64 should be unchanged) |
+| multi-tenant prefix-cache | TTFT no regression > +5% | revert dispatch to Marlin all-batch; threshold=8 may be wrong |
+| longctx 8k/c=4 | ITL improvement consistent with 4k Phase 5 | no action — informational |
+
+If primary Phase 5 wins AND all 3 defense shapes pass → LAND.
+If primary wins BUT any defense regresses > threshold → KILL (or Phase 6 sweep
+to find better threshold value).
+
 ## Phase 6 — Combinational A/B (optional, post-license)
 
 If Phase 5 wins ≥ 1.4×, run threshold sweep:
