@@ -898,6 +898,7 @@ impl MetalQwen35PrefixRuntime {
         prefix_key: &[u32],
         request: &mut ActiveMetalRequest,
     ) -> Result<bool> {
+        let trace = std::env::var("INFER_M_E13_TRACE").is_ok();
         if !self.tier_adapter.has_disk_tier() {
             return Ok(false);
         }
@@ -909,21 +910,40 @@ impl MetalQwen35PrefixRuntime {
             return Ok(false);
         };
         let expected = self.fingerprint_for_tokens(prefix_key);
+        let t_read_start = std::time::Instant::now();
         let payload = self
             .tier_adapter
             .get_disk_block(&location, Some(expected))
             .context("read Qwen3.5 prefix snapshot from DiskStore")?;
+        let t_read_us = t_read_start.elapsed().as_micros();
+        let payload_bytes = payload.len();
+
+        let t_decode_start = std::time::Instant::now();
         let snapshot = Qwen35PrefixSnapshot::decode_from_disk(&payload, &self.model_fingerprint)
             .context("decode Qwen3.5 prefix snapshot from DiskStore")?;
+        let t_decode_us = t_decode_start.elapsed().as_micros();
         ensure!(
             snapshot.token_ids == prefix_key,
             "Qwen3.5 SSD prefix snapshot token key mismatch"
         );
 
+        let t_import_start = std::time::Instant::now();
         let imported = request
             .request_state
             .import_qwen35_prefix_snapshot(&snapshot, prefix_key.len())
             .context("import matched Qwen3.5 SSD prefix snapshot into request state")?;
+        let t_import_us = t_import_start.elapsed().as_micros();
+        if trace {
+            log::info!(
+                "m_e13_trace try_import_disk_prefix: tokens={} payload_bytes={} read_us={} decode_us={} import_us={} imported={}",
+                prefix_key.len(),
+                payload_bytes,
+                t_read_us,
+                t_decode_us,
+                t_import_us,
+                imported,
+            );
+        }
         if imported {
             self.touch_disk(prefix_key);
             self.insert_snapshot(snapshot);
