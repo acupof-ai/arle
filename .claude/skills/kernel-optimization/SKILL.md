@@ -1,7 +1,7 @@
 ---
 name: kernel-optimization
 description: Use this skill when the user asks to optimize, tune, speed up, or improve the performance of a GPU/CPU kernel, operator (op), attention path, GEMM call, decode/prefill path, quantization op, scheduler hot path, or any "make this faster" / "reduce ITL/TTFT" / "lower memory" / "拉满 utilization" / "调 kernel" / "优化算子" request. Captures the methodology — formula-predict → measure binding constraint → single-variable A/B with matched controls → combinational A/B when interactions suspected → tradeoff explicit (no tradeoff = not at extremes) → license-or-kill — and an industry-reference catalog (FlashAttention, cutlass, Marlin, SGLang, vLLM, TileLang, ncu/nsys methodology) so each attempt is grounded, not hand-waved.
-version: 1.0.0
+version: 1.2.0
 ---
 
 # kernel-optimization
@@ -175,6 +175,44 @@ scripts/bench_guidellm.sh <name>-<treatment> --concurrencies 4 --max-seconds 120
 - [ ] Same warmup + duration
 - [ ] No other GPU process running (single-card serial)
 - [ ] σ across n≥3 runs < 5% (ground truth precision)
+
+**The "isolation motive" trap (anti-pattern #8 forward direction)**:
+
+The most common matched-control violation in this repo is committed
+*forward*: forcing one variable to a non-production setting because it
+"isolates" the variable under test. Example pattern:
+
+> "I want to A/B Marlin W4A16 vs BF16 weight without confounding KV
+> quantization, so I'll force `--kv-cache-dtype bf16` on both arms."
+
+This LOOKS like good methodology — same KV dtype both arms, isolated
+variable. But the **production-default arm becomes a synthetic baseline**
+(`19.27 ms ITL` was measured at production-default auto-FP8 KV; forcing
+BF16 KV on the comparison arm makes the comparison unmatched).
+
+Two real instances in this repo, opposite directions:
+
+1. Phase 0 KILL `8b4a03b` (codex): forced BF16 KV → -0.8% TTFT artifact (wrong direction)
+2. Round 1-3 Marlin `8e73dad` (Claude): forced BF16 KV → 1.06× ITL artifact (right direction, wrong baseline anyway)
+
+Round 1 was self-corrected at `2853551` once codex's matched bench at
+`f6f3af3` (production-default Marlin, **no** `--kv-cache-dtype`
+override) showed actual 1.64× ITL with -39% Δ.
+
+**Rule**: when the comparison includes a "baseline" measurement that
+already exists in the project (e.g. `786a20a` ARLE pre-Phase 0 was at
+production-default KV format), the treatment arm MUST run at the same
+production-default unless you re-run the baseline yourself with the
+new forced setting. "Isolation" is achieved by re-baselining, not by
+forcing the treatment arm into a non-production config.
+
+If you find yourself reaching for `--kv-cache-dtype bf16` (or any other
+production-override flag) to "isolate", STOP. Either:
+- Run a fresh baseline with the same forced setting (matched, but
+  diverges from production reality), OR
+- Use the production-default both arms (matched, reflects production).
+
+Never compare forced-treatment vs production-default-baseline.
 
 **Statistical sanity**:
 
@@ -360,7 +398,8 @@ Each anti-pattern has a project commit/entry where it was paid for.
 
 8. **Production default ≠ A/B baseline (matched-control violation)**
    - Caught by: Phase 0 forced BF16 KV (graph compat) compared against production auto-FP8 baseline → contaminated -0.8% TTFT comparison.
-   - Fix: Phase 5 matched-control checklist.
+   - **Caught again forward direction** (`2853551` self-correction): Round 1-3 Marlin forced BF16 KV against an FP8-KV-implicit baseline citation → 1.06× ITL artifact while production-default Marlin (`f6f3af3`) actually delivers 1.64× ITL. Same trap, opposite direction. The "isolation motive" disguises the violation when the forced setting feels like good methodology.
+   - Fix: Phase 5 matched-control checklist + new "isolation motive trap" callout (v1.2.0).
 
 9. **No σ → noise reported as win**
    - Caught by: every wins entry now cites σ across n≥3.
