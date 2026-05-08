@@ -11,8 +11,8 @@
 
 [M_world1 P0.2](../../plans/M_world1-30-percent-lead-roadmap.md):
 extend the #2 baseline to all canonical workloads (long-ctx 8k +
-high-conc + multi-tenant). Multi-tenant uses a custom Python
-runner, deferred. Long-ctx 8k and high-conc covered here.
+high-conc + multi-tenant). Long-ctx 8k, high-conc, and the
+custom multi-tenant shared-prefix runner are now covered here.
 
 ## Hypothesis
 
@@ -93,6 +93,70 @@ under tuned SGLang config. Not re-run in this tick due to
   default configs. Tuning SGLang for fair comparison still leaves
   ARLE ahead.
 
+## Results — multi-tenant shared-prefix burst
+
+SGLang launched with:
+
+```bash
+PATH=/home/ckl/sglang-venv/bin:$PATH \
+LD_LIBRARY_PATH=/home/ckl/sglang-venv/lib_extra:$LD_LIBRARY_PATH \
+NVCC_CCBIN=/usr/bin/g++-14 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+CC=/usr/bin/gcc-14 CXX=/usr/bin/g++-14 \
+TMPDIR=/var/tmp \
+/home/ckl/sglang-venv/bin/python -m sglang.launch_server \
+  --model-path /home/ckl/projects/arle/infer/models/Qwen3-4B \
+  --port 8001 --max-running-requests 8 --context-length 12288
+```
+
+SGLang startup confirmed BF16 KV and both decode + piecewise prefill CUDA
+graphs:
+
+```text
+Using KV cache dtype: torch.bfloat16
+Capture cuda graph bs [1, 2, 4, 8]
+Capture cuda graph num tokens [4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048]
+max_total_num_tokens=21786, chunked_prefill_size=2048, max_prefill_tokens=16384, max_running_requests=8, context_len=12288
+```
+
+Bench command:
+
+```bash
+/home/ckl/projects/arle/.venv/bin/python \
+  scripts/bench_multitenant_burst.py \
+  http://localhost:8001 \
+  /home/ckl/projects/arle/infer/models/Qwen3-4B
+```
+
+Output:
+
+```text
+warmup TTFT=1065ms total=2001ms
+
+req_id   TTFT (ms)    total (ms)   first_text
+0        224          1229         '<think>'
+1        75           1212         '<think>'
+2        157          1228         '<think>'
+3        157          1228         '<think>'
+
+Burst total wall: 1230 ms
+TTFT p50/min/max: 157 / 75 / 224 ms
+```
+
+### multi-tenant three-way comparison (COMPLETE)
+
+| Engine | TTFT p50 | TTFT min/max | Burst wall | Rank |
+|---|---:|---:|---:|---:|
+| **SGLang 0.5.11** | **157 ms** ⭐ | 75 / 224 ms | 1230 ms | #1 |
+| **ARLE post-F4-Small/M_b.1/M_pf-P0** | 318 ms | n/a | n/a | #2 |
+| vLLM 0.20.1 s8 | 573 ms | n/a | n/a | #3 |
+
+SGLang is 2.03× faster TTFT than ARLE on this shared-prefix burst
+shape and 3.65× faster than vLLM. This is consistent with SGLang's
+radix/prefix-cache maturity plus piecewise CUDA graph stack. ARLE's
+318 ms remains ahead of vLLM by 1.80×, but the M_world1 multi-tenant
+target now needs a SGLang-specific close-gap plan.
+
 ## 🔥 KEY INNOVATION FINDING — Piecewise CUDA Graph for Prefill
 
 During SGLang server startup (high-conc config), the load log
@@ -165,12 +229,12 @@ but not all 3.
 | 4k/c=4 (long-ctx, TTFT lower=better) | 1976 ms | SGLang 973 ms | **−51% (slower)** | TTFT ≤ 748 ms | ✗ NEEDS WORK |
 | 8k/c=4 (long-ctx, TTFT) | **4574 ms** | vLLM 2362 ms | **−48% (slower)** | TTFT ≤ 1816 ms | ✗ NEEDS WORK |
 | 8k/c=4 (long-ctx, tok/s) | **103.07** | vLLM 104.74 | **−1.6% (close tie)** | tok/s ≥ 136 | ⚠ SLIGHT BEHIND |
-| multi-tenant shared-prefix | 318 ms TTFT | (not benched here) | n/a | n/a | ⏳ NEED SGLANG MULTI-TENANT |
+| multi-tenant shared-prefix | 318 ms TTFT | SGLang 157 ms | **−50.6% (slower)** | TTFT ≤ 121 ms | ✗ NEEDS WORK |
 
 **ARLE confirmed world #1 at 1 of 4 canonical shapes**
-(high-conc by +69%); **needs major TTFT improvement at 2 shapes**
-(4k −51%, 8k −48%); **throughput basically tied at 8k**;
-**multi-tenant pending separate benchmark**.
+(high-conc by +69%); **needs major TTFT improvement at 3 shapes**
+(4k −51%, 8k −48%, multi-tenant −50.6%); **throughput basically
+tied at 8k**.
 
 The TTFT gaps at 4k AND 8k are similar magnitude (~50% slower
 than respective #2). Same root cause likely: prefill kernel
@@ -183,21 +247,19 @@ level, not the kernel level.
 
 ## What's next (P-priority order)
 
-1. **P0.3 — ARLE 8k/c=4 self-bench** (Claude, ~5 min): close the
-   8k gap row in the table. Codex's `bench-output/2026-05-07-m_b22-bf16-splitkv`
-   was at 4k; need an 8k variant.
-2. **P0.4 — Multi-tenant shared-prefix bench across all engines**:
-   uses custom runner, deferred until guidellm Multi-tenant support
-   exists or we author a runner.
-3. **P1 — Prefill CUDA Graph capture** (NEW): innovation track.
+1. **P1 — Multi-tenant close-gap plan**: SGLang is now measured at
+   157 ms TTFT, 2.03× faster than ARLE. Investigate radix-cache
+   publication, shared-prefix matching, and prefill graph interaction
+   under burst arrival.
+2. **P1 — Prefill CUDA Graph capture** (NEW): innovation track.
    - Phase 0: prototype with one num_token size (e.g., 2048)
      gated behind env flag, prove TTFT reduction at long-ctx 4k
    - Phase 1: full piecewise capture (mirror SGLang's 42 sizes)
    - Phase 2: combine with TileLang prefill GEMM (M_pf-gemm
      Phase 2.5)
-4. **P1 — TileLang prefill GEMM port** (M_pf-gemm Phase 2 / 2.5):
+3. **P1 — TileLang prefill GEMM port** (M_pf-gemm Phase 2 / 2.5):
    already planned, even more justified now.
-5. **Codex parallel** — M_b.3 G1+G2 (mixed prefill collapse, was
+4. **Codex parallel** — M_b.3 G1+G2 (mixed prefill collapse, was
    blocked by M_b.2.2 which just KILLED).
 
 ## Cross-references
@@ -210,6 +272,8 @@ level, not the kernel level.
 - SGLang artifacts:
   - 8k: `bench-output/2026-05-07-sglang-longctx-8k-c4/`
   - high-conc: `bench-output/2026-05-07-sglang-highconc-1k-256-c64/`
+  - multi-tenant: `/tmp/sglang-multitenant.log` plus inline
+    `scripts/bench_multitenant_burst.py` output above
 
 ## Rules
 
