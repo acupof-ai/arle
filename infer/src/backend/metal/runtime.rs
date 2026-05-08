@@ -2364,6 +2364,13 @@ fn execute_decode_batch(
         };
 
     if let Some(sampled_tokens) = batch_result {
+        // M_e.12 — capture row-ordered req_ids before consuming `open` so we
+        // can detect mid-batch finishers and compact the packed-decode cache
+        // in the SAME tick (instead of next-tick set-diff via
+        // `invalidate_qwen35_decode_batch_cache`). Order matches both
+        // `open` and the cache's `req_ids` (enforced at the cache-equality
+        // check above), so position == cache row index.
+        let original_req_ids: Vec<RequestId> = open.iter().map(|(req_id, _)| *req_id).collect();
         for ((req_id, mut request), sampled_token) in open.into_iter().zip(sampled_tokens) {
             if let Err(err) = request.process_token(sampled_token) {
                 handle_detached_postprocess_error(
@@ -2377,6 +2384,34 @@ fn execute_decode_batch(
                 continue;
             }
             finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
+        }
+
+        // Survivors are exactly the rows whose req_id is back in `active`
+        // after `finish_or_requeue_decoded_request`. Finished/cancelled rows
+        // got finalized or cancelled and are no longer keys. If any row is
+        // missing, drop it from the cache before returning so the next tick
+        // doesn't carry the dead row's KV slot or its `left_padding`.
+        if let Some(cached) = qwen35_decode_batch_cache.as_mut() {
+            let mut keep_row_indices: Vec<usize> = Vec::with_capacity(original_req_ids.len());
+            let mut keep_req_ids: Vec<RequestId> = Vec::with_capacity(original_req_ids.len());
+            for (row_idx, req_id) in original_req_ids.iter().enumerate() {
+                if active.contains_key(req_id) {
+                    keep_row_indices.push(row_idx);
+                    keep_req_ids.push(*req_id);
+                }
+            }
+            if keep_row_indices.len() < original_req_ids.len() {
+                if keep_row_indices.is_empty() {
+                    *qwen35_decode_batch_cache = None;
+                } else if let Err(err) = cached.batch.retain_rows(&keep_row_indices, true) {
+                    error!(
+                        "Metal packed Qwen3.5 mid-batch compaction failed: {err:#}; invalidating cache"
+                    );
+                    *qwen35_decode_batch_cache = None;
+                } else {
+                    cached.req_ids = keep_req_ids;
+                }
+            }
         }
         return;
     }
@@ -2543,7 +2578,7 @@ fn execute_qwen35_packed_decode_batch(
     if let Some(cached) = cache.as_mut() {
         if cached.req_ids != current_req_ids {
             if let Some(retained_rows) = retained_row_indices(&cached.req_ids, &current_req_ids) {
-                cached.batch.retain_rows(&retained_rows)?;
+                cached.batch.retain_rows(&retained_rows, true)?;
                 cached.req_ids.clone_from(&current_req_ids);
             } else if let Some(new_indices) = admit_row_indices(&cached.req_ids, &current_req_ids) {
                 // Prefix-preserving grow: existing rows still first (in
@@ -2638,7 +2673,7 @@ fn invalidate_qwen35_decode_batch_cache(
     }
 
     if row_indices.len() != cached.req_ids.len() {
-        if let Err(err) = cached.batch.retain_rows(&row_indices) {
+        if let Err(err) = cached.batch.retain_rows(&row_indices, true) {
             error!("Metal packed Qwen3.5 cache retain_rows failed during invalidate: {err:#}");
             return;
         }
