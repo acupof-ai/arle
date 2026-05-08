@@ -64,6 +64,7 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 27 | Codex — pickup queue 4-cell table surgical update for cell-collapse | `05dbceb` | Reflects post-P0.2 reality:cell (a) ≡ (d),cell (b) non-reproducible,cell (c) = current main,cell (d) only experiment;preserves Layer-8 gate |
 | 28 | Codex — docs/index refresh EOD+101(skill v1.8.0 5-candidate batch + cell-collapse codified) | `d738040` | Index resumption pointer current to EOD+101 milestone |
 | 29 | Claude — auto-memory `feedback_bidirectional_audit_cycle.md` codified for cross-session persistence | (memory file,not in repo)| Pattern triggering conditions + anti-patterns + rule for next session;persists locally for future Claude sessions |
+| 30 | Claude/User — auto-memory **natural-closure heuristic** added | (memory file annotation)| **STOP signal codified**:3+ maintenance-only ticks → pivot to (a) wait for state change,(b) orthogonal work,(c) minimal status updates;**Don't force audit briefs**。Cycle CLOSED at stage 30。 |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
