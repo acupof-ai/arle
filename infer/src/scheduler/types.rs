@@ -625,7 +625,12 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    fn admission_allows(&self, queued_requests: usize) -> bool {
+    /// Admission gate. Takes full `SchedulerSignals` so future per-request
+    /// hints (`prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`) can
+    /// flow through to PrefixAwareAdmission. Current callers pass
+    /// queue-state-only signals; B3 wiring (per c0ddd4f + e53e4d8) will
+    /// extend submit() to compute prefix_hit_tokens at admission time.
+    fn admission_allows(&self, signals: SchedulerSignals) -> bool {
         if self.max_waiting == 0 {
             return true;
         }
@@ -633,7 +638,7 @@ impl SchedulerHandle {
         QueueBoundAdmission {
             max_queued_requests: self.max_waiting,
         }
-        .allow(SchedulerSignals::queue_state(queued_requests, 0))
+        .allow(signals)
     }
 
     /// Create a handle from raw parts (useful for testing).
@@ -735,7 +740,10 @@ impl SchedulerHandle {
     pub fn submit(&self, req: IncomingRequest) -> std::result::Result<(), SchedulerFull> {
         loop {
             let current = self.waiting_count.load(Ordering::Relaxed);
-            if !self.admission_allows(current) {
+            // B3 Step 1 (c0ddd4f + e53e4d8): pass full SchedulerSignals.
+            // Step 2 will compute prefix_hit_tokens via RadixCache.match_prefix
+            // here before constructing signals.
+            if !self.admission_allows(SchedulerSignals::queue_state(current, 0)) {
                 return Err(SchedulerFull);
             }
             if self
@@ -776,7 +784,9 @@ impl SchedulerHandle {
 
     /// Whether the queue is currently full.
     pub fn is_full(&self) -> bool {
-        !self.admission_allows(self.waiting_count())
+        // B3 Step 1: pass queue-state-only signals; Step 2 will route
+        // through prefix lookup if/when this becomes a per-request check.
+        !self.admission_allows(SchedulerSignals::queue_state(self.waiting_count(), 0))
     }
 }
 
