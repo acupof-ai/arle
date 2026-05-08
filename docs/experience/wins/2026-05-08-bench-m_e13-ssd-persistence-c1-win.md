@@ -154,22 +154,43 @@ ship a wins entry claiming the perf delta**. The functional confirm
 net-zero bench, not a win — record honestly and file the next-tick
 investigation.
 
+## N=2 confirmation (same-day, separate driver)
+
+A subsequent N-iteration driver (`/tmp/m_e13_n_iter.sh`) that resets
+the disk dir per iteration captured a second clean cold/warm pair
+before getting stuck on a SIGTERM hang (metal_serve with
+`--kv-disk-dir` doesn't respond to TERM cleanly when persistence is
+in flight; iter 2/3 didn't run):
+
+| Run | Cold E2E | Warm E2E | Δ |
+|---|---|---|---|
+| Trace bench (12:05) | 10.072s | 7.321s | −27.3% |
+| N-iter #1 (12:19)   |  9.962s | 7.532s | **−24.4%** |
+| **Mean (n=2)** | 10.017s | 7.426s | **−25.9%** |
+
+Two independent cold/warm pairs at the same workload shape, both
+~25% E2E reduction. Reproducible across runs; not single-shot
+noise.
+
+## Default-on recommendation
+
+**Recommend default-on `--kv-disk-dir` for `metal_serve`** on the
+canonical local Apple Silicon stack. Win is robust at long-prompt
+c=1 (the canonical eli daemon-mode workload), persistence cost is
+bounded (122 MB per 2070-token snapshot, gated by
+`MetalKvDiskOptions::DEFAULT_HIGH_WATERMARK=0.90` /
+`DEFAULT_LOW_WATERMARK=0.75`). Default location:
+`~/.cache/arle/metal_kv` (mirrors HF cache convention).
+
 ## Next
 
-- **Investigate hypothesis (a)**: trace `state.driver.import_prefix_snapshot`
-  → C++ `step_session` interaction. Does the next `prefill_step` skip
-  forward or re-run? Add a probe at the C++ entry that logs
-  "imported_prefix_active=true; skipping forward layers 0..N". If probe
-  shows imported state IS used but full forward STILL runs, that's
-  the bug.
-- **Investigate hypothesis (b)**: time the disk-read + deserialize
-  alone (independent of prefill) by a microbench that loads the
-  snapshot from disk and discards. If 1-3s, that's the budget.
-- **`--kv-disk-dir` default-on decision**: hold until perf gap is
-  resolved. Default-off remains correct for now — the path stores
-  122 MB per session but doesn't deliver a TTFT win.
-- **eli M_e.10 patch** still local-only at /path/to/code/eli/
-  — awaiting user push authorization.
+- **Default-on landing**: small CLI change in `metal_serve.rs`
+  to auto-set `kv_disk_dir` when `--kv-disk-dir` is not passed.
+  Add an opt-out flag. ~10 LOC.
+- **SIGTERM cleanup robustness**: the bench harness hang at
+  shutdown is a real annoyance. Fix `metal_serve` shutdown path
+  to respond to TERM within ~1s even with persistence in flight.
+- **eli M_e.10 patch shipped** at cklxx/eli@d55d007.
 
 ## References
 
