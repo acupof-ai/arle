@@ -740,30 +740,52 @@ async def _stream_one_turn(
     tokens_out = 0
     finish_reason: str | None = None
 
+    # 2026-05-08 503 retry-with-backoff for ARLE c=16 admission burst (per a672b08
+    # errors entry). On 503, wait exponential backoff (1s, 2s, 4s, 8s, 16s caps)
+    # and retry up to 5 times. Other non-200 statuses fail immediately.
+    max_503_retries = 5
+    backoff_s = 1.0
+    retry_count = 0
     try:
-        async with client.stream(
-            "POST",
-            f"{server.rstrip('/')}/v1/chat/completions",
-            json=body,
-            timeout=httpx.Timeout(600.0, connect=30.0),
-        ) as resp:
-            if resp.status_code != 200:
-                body_bytes = await resp.aread()
-                return TurnResult(
-                    session_id=session.session_id,
-                    turn_idx=turn_idx,
-                    prompt_messages=len(messages),
-                    wall_ms=(time.perf_counter() - start) * 1000,
-                    ttft_ms=None,
-                    itl_ms=None,
-                    tokens_out=0,
-                    finish_reason=None,
-                    turn_kind=turn_kind,
-                    scored=scored,
-                    expected_prompt_tokens=expected_prompt_tokens,
-                    request_max_tokens=request_max_tokens,
-                    error=f"HTTP {resp.status_code}: {body_bytes.decode(errors='replace')[:200]}",
-                )
+        # Retry loop: each iteration is a fresh stream attempt.
+        # On 503: backoff + retry. On 200: process body inline + break.
+        # On other non-200: return error immediately.
+        completed_normally = False
+        while True:
+            async with client.stream(
+                "POST",
+                f"{server.rstrip('/')}/v1/chat/completions",
+                json=body,
+                timeout=httpx.Timeout(600.0, connect=30.0),
+            ) as resp:
+                if resp.status_code == 503 and retry_count < max_503_retries:
+                    await resp.aread()
+                    await asyncio.sleep(backoff_s)
+                    backoff_s = min(backoff_s * 2, 16.0)
+                    retry_count += 1
+                    continue
+                if resp.status_code != 200:
+                    body_bytes = await resp.aread()
+                    suffix = (
+                        f" after {retry_count} 503 retries"
+                        if retry_count > 0
+                        else ""
+                    )
+                    return TurnResult(
+                        session_id=session.session_id,
+                        turn_idx=turn_idx,
+                        prompt_messages=len(messages),
+                        wall_ms=(time.perf_counter() - start) * 1000,
+                        ttft_ms=None,
+                        itl_ms=None,
+                        tokens_out=0,
+                        finish_reason=None,
+                        turn_kind=turn_kind,
+                        scored=scored,
+                        expected_prompt_tokens=expected_prompt_tokens,
+                        request_max_tokens=request_max_tokens,
+                        error=f"HTTP {resp.status_code}{suffix}: {body_bytes.decode(errors='replace')[:200]}",
+                    )
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue
@@ -791,6 +813,8 @@ async def _stream_one_turn(
                     tokens_out += 1
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
+            # 200 OK + streaming completed; exit retry while loop
+            break
     except httpx.HTTPError as e:
         return TurnResult(
             session_id=session.session_id,
