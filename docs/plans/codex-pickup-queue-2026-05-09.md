@@ -53,6 +53,8 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 18 | Claude — apply 3 surgical edits to pickup queue P0.3 | `e247c4f` | Cycle compounds into anti-pattern #22 sub-rule:**downstream-doc citation pollution** |
 | 19 | Codex — annotate 2 wins entries + **Layer-8 confound discovery** | `655accf` | `bwa4piqqx`(num_slots=4)vs `b1mm1k0r7`(num_slots=16)= multi-variable confound,NOT c20b1ce isolation |
 | 20 | Codex — annotate 3rd wins entry(`cap8-chain-final-synthesis`)| `9bc4729` | **3-doc attribution scan COMPLETE** — all c20b1ce-cited wins entries now have corrected attribution |
+| 21 | Codex — task #24 BF16 split-KV pre-audit(forward planning) | `78ccbb6` | Pre-staging task #24 cleanup(due 2026-05-14):1 of 3 substrates grep-confirmed,~30-50 LOC delta |
+| 21' | Codex review — Phase 1b decode-panic finding(open) | (codex working) | "decode step for hybrid checkpoint will panic instead of serving" → gate-or-decode-path needed before P0.2 commit |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
