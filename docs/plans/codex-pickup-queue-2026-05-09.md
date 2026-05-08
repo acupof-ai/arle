@@ -121,11 +121,20 @@ Acceptance criteria:
 identified per `db20d34`。Cold-start prefill warmup gap。Single-tick fix
 unblocks ALL cap=8 benefit。
 
-- **Effort**:100-150 LOC,**1-1.5 day**
+- **Effort**:**80-100 LOC**(revised down from 150 per codex `eod81` cross-check — `forward_prefill_batch` already exists),**0.75-1 day**
 - **File**:`infer/src/scheduler/cuda/core/warmup.rs` + adjacent
 - **Risk**:Med(scheduler hot path)
 - **ROI**:eliminates bimodal distribution → cap=8 stable -86% TTFT p99
 - **Dependency**:NONE
+- **SOLID gates added 2026-05-09 by codex `eod81` audit-of-audit**:
+  - **Phase 0.5**:verify prefill IS the degraded-path root cause(option 1:
+    log counter + 10 LOC,fastest;option 2:nsys 30s trace;option 3:dummy
+    curl pre-warm A/B)。**Without this,risk burning 80-100 LOC on wrong axis**
+  - **Phase 0.5b**:5-min grep `infer/src/ops/` to confirm prefill GEMM
+    routing(cublasLt vs TileLang AOT)。If TileLang AOT cubins,warmup buys
+    ~0 — pivot needed
+- **`forward_prefill_batch` already exists** at `infer/src/model/qwen3/forward.rs:415`
+  — call directly,no new model trait method needed
 
 **Dispatch directive**:
 ```
@@ -159,8 +168,31 @@ Implementation hint:
 - Prefill warmup needs dummy prompts at varying lengths (e.g., representative
   short=128, mid=512, long=2048 prompt token counts) to populate prefill GEMM
   shapes
-- May need self.model.warmup_prefill_kernels(dummy_prompts) helper if model
-  trait doesn't already expose this
+- forward_prefill_batch already exists at infer/src/model/qwen3/forward.rs:415
+  → call directly, mirror decode warmup pass structure (warmup.rs:190-266) at
+  varying prompt lengths. NO new model trait method needed (per codex eod81 cross-check).
+
+§0 SOLID gates (per codex eod81 audit-of-audit, 2026-05-09):
+
+Phase 0.5 — Verify prefill is degraded-path root cause BEFORE writing code:
+- "33% degraded path = cold prefill GEMM" is HYPOTHESIS not evidence
+- Could equally be: cublasLt heuristic / TileLang cubin disk-load /
+  paged-KV alloc pattern / first-burst L2 cold
+- Cheap experiments (pick one):
+  1. Log counter on first 10 requests post-startup: per-layer
+     (prefill_time_ms, decode_time_ms, alloc_time_ms). Compare to steady-state.
+  2. nsys 30s trace of fresh-server first burst — identify if p99 ITL
+     spike is dominated by prefill::matmul vs decode::* vs paged_kv::alloc
+  3. Pre-warm prefill via dummy curl (1-token prompt) before bench →
+     if degraded path disappears, prefill warmup confirmed root cause
+- WITHOUT this verification, risk burning 80-100 LOC on wrong axis
+
+Phase 0.5b — Verify prefill GEMM routing (5min grep):
+- grep prefill GEMM dispatch in infer/src/ops/
+- If routes through cublasLt → P0.3 prefill warmup pays off (populate
+  algo cache for new M=prompt_length shapes)
+- If routes through TileLang AOT cubins → cubins pre-built at compile
+  time, no runtime warmup needed/possible, P0.3 axis is wrong
 
 Acceptance criteria:
 - W3 c=4 cap=8 fresh-server bench: 5/5 trials within σ < 5%
