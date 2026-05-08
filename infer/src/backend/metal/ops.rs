@@ -250,6 +250,60 @@ pub(super) fn clear_metal_cache() {
     clear_cache();
 }
 
+// M_e.11 — periodic residency-set hygiene.
+//
+// Apple's IOGPUMetalResidencySet aborts at ~4096 entries; every
+// `mx::random::categorical` → `gumbel` → `uniform` allocates a fresh
+// scalar, accumulating until macOS's `-[IOGPUMetalResidencySet
+// addAllocation:]` asserts. omlx's commit `6bda6781` (2026-05-06)
+// established the proven cadence: 1024 generated tokens summed across
+// the active batch per scheduler tick → `mx::synchronize` then
+// `mx::clear_cache`. ARLE adopts a slightly more conservative version:
+// no explicit synchronize (would need a new FFI; existing per-step
+// `eval(&[&sampled])` already drains the prev async_eval chain), and a
+// single global atomic counter incremented by every successful
+// `record_sampled_token` so all three scheduler paths (c=1
+// step_session, c=1 step_session_paged, c≥2 step_batch_packed) are
+// covered without per-batch bookkeeping.
+//
+// Tunable via `INFER_METAL_RESIDENCY_CLEAR_TOKENS` (default 1024;
+// set to 0 to disable). Path probe `M_E11_RESIDENCY_CLEAR_FIRED`
+// once-fires on the first triggered clear so bench output confirms
+// the cadence is engaged.
+#[cfg(feature = "metal")]
+pub(super) fn track_generated_token_for_residency_clear(n: u64) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static THRESHOLD: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static FIRED: std::sync::Once = std::sync::Once::new();
+
+    let threshold = *THRESHOLD.get_or_init(|| {
+        std::env::var("INFER_METAL_RESIDENCY_CLEAR_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024)
+    });
+    if threshold == 0 {
+        return;
+    }
+    let prev = COUNTER.fetch_add(n, Ordering::Relaxed);
+    let next = prev + n;
+    if next >= threshold {
+        // Reset first so concurrent ticks don't pile multiple clears.
+        // A small race here just means slightly more clears than the
+        // strict threshold — defensive only, not a correctness issue.
+        COUNTER.store(next % threshold, Ordering::Relaxed);
+        FIRED.call_once(|| {
+            log::info!(
+                "metal_path_probe: M_E11_RESIDENCY_CLEAR_FIRED (threshold={threshold} tokens; first fire after {next} accumulated)"
+            );
+        });
+        clear_cache();
+    }
+}
+
 #[cfg(feature = "metal")]
 pub(super) fn extend_kv_cache(cache: &mut MlxArray, n_kv_heads: i32, head_dim: i32, new_cap: i32) {
     let current_cap = cache.shape().get(2).copied().unwrap_or_default();

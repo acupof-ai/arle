@@ -244,6 +244,12 @@ impl<D: StepDriver> ResumableRequestState<D> {
     fn record_sampled_token(&mut self, sampled_token: u32) -> Result<()> {
         self.last_token = Some(sampled_token);
         self.generated_tokens += 1;
+        // M_e.11 — residency-set hygiene. Centralized hook here covers
+        // ALL three scheduler paths (c=1 step_session, c=1 step_session_paged,
+        // c≥2 step_batch_packed) since each commits via record_sampled_token.
+        // Per-token call is cheap (one atomic add); clear fires every 1024
+        // tokens accumulated globally across the active batch.
+        super::ops::track_generated_token_for_residency_clear(1);
 
         if self.should_stop(sampled_token) {
             self.phase = MetalRequestPhase::Finished;

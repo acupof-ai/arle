@@ -772,7 +772,7 @@ impl MetalQwen35PrefixRuntime {
                     b
                 ),
                 Err(e) if trace => {
-                    log::info!("m_e10_trace import_qwen35_prefix_snapshot returned Err: {e:#}")
+                    log::info!("m_e10_trace import_qwen35_prefix_snapshot returned Err: {e:#}");
                 }
                 _ => {}
             }
