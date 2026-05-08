@@ -61,9 +61,22 @@
 
 ## P0 — Pickup directives(cron-Claude paste-buffer ready)
 
-### P0.1 — B3 Step 2 PrefixAwareAdmission CUDA-runtime gate ✅ LICENSED 2026-05-09
+### P0.1 — B3 Step 2 PrefixAwareAdmission CUDA-runtime gate ✅ LICENSED(pending re-bench gate per `ec5c37c`)
 
 **Status:LICENSED -24.2% multi-tenant TTFT(318 ms → 241 ms median,σ/mean=4.5%)**
+
+⚠ **License bench staleness gate**(codex `ec5c37c` 2026-05-09 meta-SOLID):
+`3c334ef` bench(-24.2%)was measured on **Round-2-P2 codepath**。Round 4 P2
+tightened warm signal to **runnable-only**(removed wrong-warm classification
+leak)。Bench number may drift ±5% on actual ship codepath。Pre-commit checklist:
+- [ ] Re-bench(option a)or explicit caveat in wins entry(option b)
+- [ ] Update wins entry numbers if drift > σ band
+- [ ] Add Round-4 attribution in wins entry Problems/Learnings
+
+§0 meta-application:license-or-kill on the LICENSE itself。Bench number must
+match committed codepath。
+
+
 
 Codex implementation 193 LOC across 5 files,EXCEEDS dispatch directive
 with senior-quality fail-open guard against admission deadlock。Wins
