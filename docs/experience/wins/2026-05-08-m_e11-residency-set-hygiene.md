@@ -1,5 +1,22 @@
 # Bench — M_e.11 residency-set hygiene shipped + probe fires — 2026-05-08
 
+## ⚠️ Verification update (same-day Phase A bench)
+
+Phase A pre-fix repro bench (with `INFER_METAL_RESIDENCY_CLEAR_TOKENS=0`
+to disable M_e.11) on **Apple M4 Pro / MLX 0.31.1** ran 7 long
+requests / 21000 cumulative sampling steps without IOGPU abort. **The
+abort mode this entry's "stability" framing claims to prevent is not
+reproducible on the canonical stack.** M_e.11 is prophylactic
+defense-in-depth on this stack — implementation correct, probe fires,
+but no measurable load-bearing fix.
+
+See [`2026-05-08-bench-m_e11-residency-stability-phase-a.md`](2026-05-08-bench-m_e11-residency-stability-phase-a.md)
+for full Phase A evidence and the rule update.
+
+The implementation, probe, and threshold defaults below all stand —
+this is just a calibration of M_e.11's true scope on the current
+production stack.
+
 ## Goal
 
 Ship the omlx-derived periodic `mx::clear_cache` on ARLE's Metal
