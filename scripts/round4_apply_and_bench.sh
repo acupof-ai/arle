@@ -76,22 +76,42 @@ else
     # Insert dispatch threshold guard inside fn batched.
     # Use a marker-aware patch via Python rather than fragile sed.
     if [[ "$DRY_RUN" != true ]]; then
-        python3 <<'PY'
-import re, pathlib
+        python3 <<'PY' || { echo "PATCH FAILED — re-inspect linear.rs (codex W4A8 may have renamed marlin_prefill_aligned)" >&2; exit 6; }
+import re, pathlib, sys
 p = pathlib.Path("infer/src/ops/linear.rs")
 src = p.read_text()
+orig = src
+
 # Add constant before fn batched
-src = re.sub(
+src, n_const = re.subn(
     r"(    fn batched\(weight: &DeviceMatrix, batch: usize\) -> Self \{)",
     "const MARLIN_DECODE_BATCH_THRESHOLD: usize = 8;\n\n\\1",
     src, count=1)
-# Replace marlin gate
+if n_const != 1:
+    print(f"FATAL: could not locate `fn batched(...)` to insert constant", file=sys.stderr)
+    sys.exit(1)
+
+# Replace marlin gate(s) — match any marlin_*aligned function name to be
+# resilient against codex potential W4A8 dispatch addition + renames.
+# Match: "if batch > 1 && marlin_<...>aligned(weight).is_ok() {"
+gate_pat = r"if batch > 1 && (marlin\w*aligned)\(weight\)\.is_ok\(\) \{"
+matches = re.findall(gate_pat, src)
+if not matches:
+    print(f"FATAL: no `if batch > 1 && marlin_*aligned(weight).is_ok()` gates found.", file=sys.stderr)
+    print(f"       codex W4A8 dispatch may have changed shape; manual edit required.", file=sys.stderr)
+    sys.exit(1)
+
 src = re.sub(
-    r"if batch > 1 && marlin_prefill_aligned\(weight\)\.is_ok\(\) \{",
-    "if batch > MARLIN_DECODE_BATCH_THRESHOLD\n            && marlin_prefill_aligned(weight).is_ok()\n        {",
-    src, count=1)
+    gate_pat,
+    r"if batch > MARLIN_DECODE_BATCH_THRESHOLD\n            && \1(weight).is_ok()\n        {",
+    src)
+
+if src == orig:
+    print("FATAL: regex matched but no substitution happened", file=sys.stderr)
+    sys.exit(1)
+
 p.write_text(src)
-print("EDIT APPLIED")
+print(f"EDIT APPLIED: 1 constant + {len(matches)} marlin gate(s) patched ({matches})")
 PY
     fi
 fi
