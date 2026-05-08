@@ -25,6 +25,7 @@
 | Skill v1.4.0 → v1.7.0 | ✅ +6 anti-patterns | `c768b70` |
 | **Skill v1.8.0 anti-pattern bank**(deferred batch) | 🟡 **5 candidates ready,batch trigger pending** | #20 hypothesis-inheritance(`c076aae`)+ #21 recipe-itself audit(`b55bfcd` + `153fd93`)+ #22 twin-commit attribution(`919c0fb` + `8d91d20` + `3fea979`)+ #23 truncated-output partial-view(`156d2c2`)+ #24 cell-collapse blindness(`1ccb448`) |
 | **Wins-entry re-attribution gap**(c20b1ce NO-OP)| 🟡 3 entries need invalidation/re-attribution | `8d91d20` empirical triage |
+| **M_quant Round 4 #6 W4A16BatchGemv override** | ❌ **KILLED** via refined bench(+37% ITL regression even at decode batch=4)| `3b9cc06` — Marlin tensor-core wins over launch-overhead savings;hypothesis empirically eliminated;skill v1.8.0 #25 grounded |
 | Codex pickup directives | ✅ this doc | (current) |
 
 ## 🌀 Bidirectional audit cycle status(2026-05-09 EOD,11+ commits)
