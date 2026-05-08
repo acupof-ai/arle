@@ -67,6 +67,37 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 29 | Claude — auto-memory `feedback_bidirectional_audit_cycle.md` codified for cross-session persistence | (memory file,not in repo)| Pattern triggering conditions + anti-patterns + rule for next session;persists locally for future Claude sessions |
 | 30 | Claude/User — auto-memory **natural-closure heuristic** added | (memory file annotation)| **STOP signal codified**:3+ maintenance-only ticks → pivot to (a) wait for state change,(b) orthogonal work,(c) minimal status updates;**Don't force audit briefs**。Cycle CLOSED at stage 30。 |
 
+### 🌀 R4#6 micro-cycle on truly-orthogonal axis(post main-cycle closure)
+
+Spawned per natural-closure heuristic option (b) "truly orthogonal work"。Demonstrates
+fresh micro-cycle on different axis with full Phase 1-8 skill application:
+
+| # | Stage | Commit | Layer |
+|---|-------|--------|-------|
+| R1 | Claude — R4#6 Phase 0 audit(linear.rs:67-99 dispatch site)| `6ade2d4` | Source audit |
+| R2 | Codex — audit-of-audit verified 6/6 SOLID + 3-line refinement | `5bb99d7` | Audit-of-audit |
+| R3 | Claude — env-gated override implementation | `02209f4` | Substrate |
+| R4 | Codex — wins entry pending-remote stub | `a377e57` | Bench-stub discipline |
+| R5 | Claude — preliminary 60s bench + Layer-9 SOLID gap discovered(hypothesis-context vs implementation-context)| `fe9ea8a` | **Empirical bench eliminates audit blindspot both code-level audits missed** |
+| R6 | Claude — refined `batch ∈ 2..=8` gate + 120s re-bench | `3b9cc06` | **Phase 8 license-or-kill:KILL +37% ITL regression** |
+| R7 | Claude — wins entry pending-remote → KILLED | `3b9cc06`(co-commit) | Closure |
+
+**Outcome**:R4#6 W4A16BatchGemv override hypothesis EMPIRICALLY KILLED via 120s
+N=52 bench(σ/mean<0.5%)。Marlin tensor-core utilization beats W4A16BatchGemv
+launch-overhead savings even at decode batch=4。Hypothesis eliminated from
+M_quant Round 4 active queue。
+
+**Skill v1.8.0 anti-pattern #25**(hypothesis-context vs implementation-context
+mismatch)EMPIRICALLY GROUNDED via this micro-cycle:both Phase 0 audit
+(`6ade2d4`)+ audit-of-audit(`5bb99d7`)missed the prefill-context leak;only
+empirical bench(`fe9ea8a`)caught it。**Bench is the truly orthogonal SOLID
+layer that catches what code-level audits both miss**。
+
+**Methodology insight**:7-stage R4#6 micro-cycle proves the bidirectional audit
+pattern + natural-closure heuristic generalizes beyond the original c20b1ce
+chain。Same compounding rigor produces empirical KILL on different axis with
+same skill discipline applied。
+
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
 candidates(batch ready)**,P0.2 dispatched + active(near-LANDED),Phase 1.A
