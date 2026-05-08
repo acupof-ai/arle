@@ -256,10 +256,10 @@ pub fn apply_lora_gemm_add(
 
     let rank = lora_a.rows;
     let mut tmp_a = HiddenStates::zeros(ctx, rank, input.seq_len)?;
-    gemm_into(ctx, lora_a, input, &mut tmp_a);
+    try_gemm_into(ctx, lora_a, input, &mut tmp_a)?;
 
     let mut tmp_b = HiddenStates::zeros(ctx, lora_b.rows, input.seq_len)?;
-    gemm_into(ctx, lora_b, &tmp_a, &mut tmp_b);
+    try_gemm_into(ctx, lora_b, &tmp_a, &mut tmp_b)?;
 
     let total_elems = output.hidden_dim * output.seq_len;
     let (tmp_ptr, _gt) = tmp_b.data.device_ptr(&ctx.stream);
@@ -323,7 +323,7 @@ pub fn gemv(
     }
 
     if plan == LinearKernelPlan::MarlinW4A8Gemm {
-        run_marlin_w4a8_linear(ctx, weight, &input.data, 1, &mut output.data);
+        run_marlin_w4a8_linear(ctx, weight, &input.data, 1, &mut output.data)?;
         return Ok(());
     }
 
@@ -637,7 +637,7 @@ pub fn mlp_decode_with_lora_into(
 /// weight: [out_dim, in_dim] row-major, X: HiddenStates [in_dim, seq_len], Y: HiddenStates [out_dim, seq_len]
 pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Result<HiddenStates> {
     let mut out = HiddenStates::zeros(ctx, weight.rows, x.seq_len)?;
-    gemm_into(ctx, weight, x, &mut out);
+    try_gemm_into(ctx, weight, x, &mut out)?;
     Ok(out)
 }
 
@@ -698,14 +698,17 @@ fn run_marlin_w4_gemm(
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
-) {
+) -> Result<()> {
     let mp = weight.marlin_packed.as_ref().unwrap();
     let ms = weight.marlin_scales.as_ref().unwrap();
     let m = x.seq_len;
     let n = weight.rows;
     let k = weight.cols;
 
-    let mut x_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * k).expect("alloc x_fp16");
+    let mut x_fp16: CudaSlice<u16> = ctx
+        .stream
+        .alloc_zeros(m * k)
+        .map_err(|e| anyhow::anyhow!("alloc marlin x_fp16: {e}"))?;
     {
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (xf_ptr, _gf) = x_fp16.device_ptr_mut(&ctx.stream);
@@ -717,18 +720,21 @@ fn run_marlin_w4_gemm(
                 ctx.stream.cu_stream(),
             )
             .result()
-            .expect("bf16_to_fp16 failed");
+            .map_err(|e| anyhow::anyhow!("marlin bf16_to_fp16 failed: {e}"))?;
         }
     }
 
-    let mut y_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * n).expect("alloc y_fp16");
+    let mut y_fp16: CudaSlice<u16> = ctx
+        .stream
+        .alloc_zeros(m * n)
+        .map_err(|e| anyhow::anyhow!("alloc marlin y_fp16: {e}"))?;
     let sms = ctx.sm_count() as i32;
     let ws_size = unsafe { ffi::marlin_workspace_size(n as i32, sms) };
     let ws_elems = ws_size.div_ceil(4);
     let mut workspace: CudaSlice<i32> = ctx
         .stream
         .alloc_zeros(ws_elems)
-        .expect("alloc marlin workspace");
+        .map_err(|e| anyhow::anyhow!("alloc marlin workspace: {e}"))?;
 
     {
         let (xf_ptr, _g1) = x_fp16.device_ptr(&ctx.stream);
@@ -755,7 +761,7 @@ fn run_marlin_w4_gemm(
                 16,
             )
         };
-        assert_eq!(ret, 0, "marlin_gemm_cuda failed with code {ret}");
+        anyhow::ensure!(ret == 0, "marlin_gemm_cuda failed with code {ret}");
     }
 
     {
@@ -769,9 +775,10 @@ fn run_marlin_w4_gemm(
                 ctx.stream.cu_stream(),
             )
             .result()
-            .expect("fp16_to_bf16 failed");
+            .map_err(|e| anyhow::anyhow!("marlin fp16_to_bf16 failed: {e}"))?;
         }
     }
+    Ok(())
 }
 
 fn run_marlin_w4a8_linear(
@@ -780,8 +787,9 @@ fn run_marlin_w4a8_linear(
     input: &CudaSlice<bf16>,
     rows: usize,
     output: &mut CudaSlice<bf16>,
-) {
-    marlin_w4a8_aligned(weight).expect("invalid W4A8 Marlin matrix");
+) -> Result<()> {
+    marlin_w4a8_aligned(weight)
+        .map_err(|reason| anyhow::anyhow!("invalid W4A8 Marlin matrix: {reason}"))?;
     let mp = weight.marlin_packed.as_ref().unwrap();
     let s_channel = weight.marlin_channel_scales.as_ref().unwrap();
     let s_group = weight.marlin_scales.as_ref().unwrap();
@@ -790,11 +798,14 @@ fn run_marlin_w4a8_linear(
     let k = weight.cols;
     let max_par = 16usize;
 
-    let mut x_int8: CudaSlice<i8> = ctx.stream.alloc_zeros(m * k).expect("alloc W4A8 x_int8");
+    let mut x_int8: CudaSlice<i8> = ctx
+        .stream
+        .alloc_zeros(m * k)
+        .map_err(|e| anyhow::anyhow!("alloc W4A8 x_int8: {e}"))?;
     let mut s_activation: CudaSlice<f32> = ctx
         .stream
         .alloc_zeros(m)
-        .expect("alloc W4A8 activation scales");
+        .map_err(|e| anyhow::anyhow!("alloc W4A8 activation scales: {e}"))?;
     {
         let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
         let (xq_ptr, _gq) = x_int8.device_ptr_mut(&ctx.stream);
@@ -809,20 +820,23 @@ fn run_marlin_w4a8_linear(
                 ctx.stream.cu_stream(),
             )
             .result()
-            .expect("quantize_bf16_rows_to_int8_cuda failed");
+            .map_err(|e| anyhow::anyhow!("quantize_bf16_rows_to_int8_cuda failed: {e}"))?;
         }
     }
 
-    let mut y_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * n).expect("alloc W4A8 y_fp16");
+    let mut y_fp16: CudaSlice<u16> = ctx
+        .stream
+        .alloc_zeros(m * n)
+        .map_err(|e| anyhow::anyhow!("alloc W4A8 y_fp16: {e}"))?;
     let mut reduce: CudaSlice<i32> = ctx
         .stream
         .alloc_zeros(max_par * 64 * n)
-        .expect("alloc W4A8 reduce buffer");
+        .map_err(|e| anyhow::anyhow!("alloc W4A8 reduce buffer: {e}"))?;
     let lock_elems = ((n / 128) * max_par).max(1);
     let mut workspace: CudaSlice<i32> = ctx
         .stream
         .alloc_zeros(lock_elems)
-        .expect("alloc W4A8 lock workspace");
+        .map_err(|e| anyhow::anyhow!("alloc W4A8 lock workspace: {e}"))?;
 
     {
         let (xq_ptr, _g1) = x_int8.device_ptr(&ctx.stream);
@@ -856,7 +870,7 @@ fn run_marlin_w4a8_linear(
                 max_par as i32,
             )
         };
-        assert_eq!(ret, 0, "gemm_w4a8_marlin_cuda failed with code {ret}");
+        anyhow::ensure!(ret == 0, "gemm_w4a8_marlin_cuda failed with code {ret}");
     }
 
     {
@@ -870,9 +884,10 @@ fn run_marlin_w4a8_linear(
                 ctx.stream.cu_stream(),
             )
             .result()
-            .expect("W4A8 fp16_to_bf16 failed");
+            .map_err(|e| anyhow::anyhow!("W4A8 fp16_to_bf16 failed: {e}"))?;
         }
     }
+    Ok(())
 }
 
 fn run_turboquant_linear(
@@ -1143,6 +1158,15 @@ pub(crate) fn gemm_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) {
+    try_gemm_into(ctx, weight, x, out).expect("gemm_into failed");
+}
+
+pub(crate) fn try_gemm_into(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
     assert_eq!(
         weight.cols, x.hidden_dim,
         "weight cols {} != hidden_dim {}",
@@ -1161,9 +1185,9 @@ pub(crate) fn gemm_into(
 
     let plan = LinearKernelPlan::batched(weight, x.seq_len);
     match plan {
-        LinearKernelPlan::MarlinW4Gemm => run_marlin_w4_gemm(ctx, weight, x, out),
+        LinearKernelPlan::MarlinW4Gemm => run_marlin_w4_gemm(ctx, weight, x, out)?,
         LinearKernelPlan::MarlinW4A8Gemm => {
-            run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data);
+            run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
         }
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);
@@ -1177,4 +1201,5 @@ pub(crate) fn gemm_into(
         LinearKernelPlan::Bf16Gemv => unreachable!("batched linear never selects BF16 GEMV"),
         _ => run_qweight_linear(ctx, weight, x, out, plan),
     }
+    Ok(())
 }

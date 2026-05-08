@@ -358,8 +358,7 @@ impl OpsBackend for CudaOpsBackend<'_> {
         input: &Self::TensorBatch,
         output: &mut Self::TensorBatch,
     ) -> Result<()> {
-        linear::gemm_into(self.ctx, weight, input, output);
-        Ok(())
+        linear::try_gemm_into(self.ctx, weight, input, output)
     }
 
     fn fused_mlp_into(

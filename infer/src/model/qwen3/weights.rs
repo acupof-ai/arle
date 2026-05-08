@@ -148,6 +148,16 @@ impl Qwen3Mlp {
                 Qwen3GateUp::Fused { gate_up_proj } => gate_up_proj.is_marlin_w4a8(),
             }
     }
+
+    pub(super) fn uses_marlin_prefill_gemm(&self) -> bool {
+        self.down_proj.has_marlin()
+            || match &self.gate_up {
+                Qwen3GateUp::Separate { gate_proj, up_proj } => {
+                    gate_proj.has_marlin() || up_proj.has_marlin()
+                }
+                Qwen3GateUp::Fused { gate_up_proj } => gate_up_proj.has_marlin(),
+            }
+    }
 }
 
 fn qwen3_fused_gate_up_enabled() -> bool {
@@ -572,6 +582,17 @@ impl Qwen3Model {
                     || layer.attention.v_proj.is_marlin_w4a8()
                     || layer.attention.o_proj.is_marlin_w4a8()
                     || layer.mlp.uses_marlin_w4a8()
+            })
+    }
+
+    pub(super) fn uses_marlin_prefill_gemm(&self) -> bool {
+        self.output_projection().has_marlin()
+            || self.layers.iter().any(|layer| {
+                layer.attention.q_proj.has_marlin()
+                    || layer.attention.k_proj.has_marlin()
+                    || layer.attention.v_proj.has_marlin()
+                    || layer.attention.o_proj.has_marlin()
+                    || layer.mlp.uses_marlin_prefill_gemm()
             })
     }
 

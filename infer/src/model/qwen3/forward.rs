@@ -307,6 +307,18 @@ impl ModelForward for Qwen3Model {
             .saturating_add(128 * 1024 * 1024)
     }
 
+    fn max_concurrent_prefill_requests(&self) -> Option<usize> {
+        if self.uses_marlin_prefill_gemm() {
+            // Marlin prefill GEMM converts BF16 activations to FP16 and
+            // allocates a FP16 output scratch per projection. A 16-slot burst
+            // can otherwise fit the token budget but still OOM the temporary
+            // GEMM scratch, which used to panic the scheduler thread.
+            Some(4)
+        } else {
+            None
+        }
+    }
+
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         let start_pos = state.base.kv_cache.len();
         let hidden = self.get_embeddings_batch(tokens)?;
