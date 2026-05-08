@@ -570,6 +570,12 @@ pub struct DeviceMatrix {
     pub marlin_scales: Option<CudaSlice<u16>>,
     /// FP32 per-output-channel scales for the W4A8 Marlin path.
     pub marlin_channel_scales: Option<CudaSlice<f32>>,
+    /// Hybrid W4 sidecar: W4A8 packed weights for prefill dispatch.
+    pub hybrid_w4a8_qweight: Option<CudaSlice<u8>>,
+    /// Hybrid W4 sidecar: W4A8 FP32 per-output-channel scales.
+    pub hybrid_w4a8_s_channel: Option<CudaSlice<f32>>,
+    /// Hybrid W4 sidecar: W4A8 FP16 per-group scales.
+    pub hybrid_w4a8_s_group: Option<CudaSlice<u16>>,
     // -- TurboQuant packed weight storage (Phase 2: fused dequant at runtime) --
     /// TQ packed indices [rows, packed_cols] u8.
     /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
@@ -603,6 +609,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -649,6 +658,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -703,6 +715,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -769,6 +784,103 @@ impl DeviceMatrix {
             marlin_packed: Some(packed),
             marlin_scales: Some(s_group),
             marlin_channel_scales: Some(s_channel),
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from a hybrid W4 checkpoint that carries W4A16 decode tensors and
+    /// W4A8 Marlin prefill side tensors in the same `DeviceMatrix`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_hybrid_w4_marlin(
+        ctx: &DeviceContext,
+        w4a16_qweight: &[u8],
+        w4a16_scales: &[u16],
+        w4a8_qweight: &[u8],
+        w4a8_s_channel: &[f32],
+        w4a8_s_group: &[u16],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        WeightFormat::W4A16.validate_shape(rows, cols, group_size)?;
+        WeightFormat::MarlinW4A8.validate_shape(rows, cols, group_size)?;
+        let num_groups = cols / group_size;
+        ensure!(
+            w4a16_qweight.len() == rows * cols / 2,
+            "Hybrid W4A16 Marlin packed bytes {} != expected {} for rows={rows} cols={cols}",
+            w4a16_qweight.len(),
+            rows * cols / 2
+        );
+        ensure!(
+            w4a16_scales.len() == num_groups * rows,
+            "Hybrid W4A16 Marlin scales {} != expected {}",
+            w4a16_scales.len(),
+            num_groups * rows
+        );
+        ensure!(
+            w4a8_qweight.len() == rows * cols / 2,
+            "Hybrid W4A8 packed bytes {} != expected {} for rows={rows} cols={cols}",
+            w4a8_qweight.len(),
+            rows * cols / 2
+        );
+        ensure!(
+            w4a8_s_channel.len() == rows,
+            "Hybrid W4A8 channel scales {} != rows {rows}",
+            w4a8_s_channel.len()
+        );
+        ensure!(
+            w4a8_s_group.len() == num_groups * rows,
+            "Hybrid W4A8 group scales {} != expected {}",
+            w4a8_s_group.len(),
+            num_groups * rows
+        );
+
+        let w4a16_packed = ctx
+            .stream
+            .clone_htod(w4a16_qweight)
+            .map_err(|e| anyhow!("H2D hybrid W4A16 Marlin qweight failed: {e}"))?;
+        let w4a16_group = ctx
+            .stream
+            .clone_htod(w4a16_scales)
+            .map_err(|e| anyhow!("H2D hybrid W4A16 Marlin scales failed: {e}"))?;
+        let w4a8_packed = ctx
+            .stream
+            .clone_htod(w4a8_qweight)
+            .map_err(|e| anyhow!("H2D hybrid W4A8 Marlin qweight failed: {e}"))?;
+        let w4a8_channel = ctx
+            .stream
+            .clone_htod(w4a8_s_channel)
+            .map_err(|e| anyhow!("H2D hybrid W4A8 channel scales failed: {e}"))?;
+        let w4a8_group = ctx
+            .stream
+            .clone_htod(w4a8_s_group)
+            .map_err(|e| anyhow!("H2D hybrid W4A8 group scales failed: {e}"))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            weight_format: WeightFormat::W4A16,
+            qweight: None,
+            qscales: None,
+            group_size,
+            marlin_packed: Some(w4a16_packed),
+            marlin_scales: Some(w4a16_group),
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: Some(w4a8_packed),
+            hybrid_w4a8_s_channel: Some(w4a8_channel),
+            hybrid_w4a8_s_group: Some(w4a8_group),
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -823,6 +935,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -877,6 +992,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -937,6 +1055,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -991,6 +1112,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1044,6 +1168,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1075,9 +1202,14 @@ impl DeviceMatrix {
         self.marlin_packed.is_some()
     }
 
-    /// Whether this matrix uses Marlin W4 weights with dynamic INT8 activations.
+    /// Whether this matrix exposes a W4A8 Marlin side path.
     pub fn is_marlin_w4a8(&self) -> bool {
-        self.weight_format == WeightFormat::MarlinW4A8
+        self.weight_format == WeightFormat::MarlinW4A8 || self.is_hybrid_w4_marlin()
+    }
+
+    /// Whether this matrix carries both W4A16 and W4A8 Marlin side tensors.
+    pub fn is_hybrid_w4_marlin(&self) -> bool {
+        self.hybrid_w4a8_qweight.is_some()
     }
 
     /// Whether this matrix uses TurboQuant packed weight storage.
@@ -1134,6 +1266,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: Some(tq_p),
             tq_scales: Some(tq_s),
             tq_signs: Some(tq_sg),
@@ -1283,6 +1418,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1327,6 +1465,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1364,6 +1505,9 @@ impl DeviceMatrix {
                 marlin_packed: None,
                 marlin_scales: None,
                 marlin_channel_scales: None,
+                hybrid_w4a8_qweight: None,
+                hybrid_w4a8_s_channel: None,
+                hybrid_w4a8_s_group: None,
                 tq_packed: None,
                 tq_scales: None,
                 tq_signs: None,
@@ -1398,6 +1542,9 @@ impl DeviceMatrix {
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,

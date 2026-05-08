@@ -155,6 +155,14 @@ fn turboquant_params(weight: &DeviceMatrix) -> (i32, i32, i32, i32, i32, i32) {
     (n, k, group_size, packed_cols, num_groups, bits)
 }
 
+fn ensure_hybrid_w4_dispatch_ready(weight: &DeviceMatrix) -> Result<()> {
+    anyhow::ensure!(
+        !weight.is_hybrid_w4_marlin(),
+        "marlin_w4_hybrid tensors loaded, but runtime dispatch is not enabled in Phase 1b"
+    );
+    Ok(())
+}
+
 /// Additive LoRA GEMV: `y += B @ (A @ x)`.
 ///
 /// The B matrix is expected to be pre-scaled at load time (see
@@ -286,6 +294,7 @@ pub fn gemv(
     input: &DeviceVec,
     output: &mut DeviceVec,
 ) -> Result<()> {
+    ensure_hybrid_w4_dispatch_ready(weight)?;
     assert_eq!(
         weight.cols, input.len,
         "A cols {} != x len {}",
@@ -1167,6 +1176,7 @@ pub(crate) fn try_gemm_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    ensure_hybrid_w4_dispatch_ready(weight)?;
     assert_eq!(
         weight.cols, x.hidden_dim,
         "weight cols {} != hidden_dim {}",
