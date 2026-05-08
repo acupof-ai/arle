@@ -460,6 +460,31 @@ Each anti-pattern has a project commit/entry where it was paid for.
       ranking. Cumulative table across rounds shows hypothesis space narrowing,
       preserving the axis until the actual binding cause is isolated.
 
+14. **Upstream-data parser silent corruption masks "almost-working" kernel/pack**
+    - Caught by: 5593865 (2026-05-08) — `scripts/convert_gptq.py` decoded
+      AutoGPTQ qzeros without `+1` correction. AutoGPTQ stores
+      `zero_point - 1` (so qzeros=7 means actual zero=8) but ARLE parser
+      treated 7 as the actual zero → every weight off by 1 quantization
+      unit → ~14% systematic bias per element → cumulative through 36
+      layers → wrong logits (silent for W4A16 = "marginal accuracy 1.06×",
+      catastrophic for W4A8 = "all-`!` garbage").
+    - Today's chain: 4 hours debugging on quantize_qwen3_w4a8.py + 9
+      hypothesis iterations (H3, H3b, H3c, H4, perm correction, MAGIC_NUM
+      bound, GPTQ-aware mode, clamp ≤16) — most stemmed from THIS
+      upstream parser bug, not from internal pack/kernel issues.
+    - Audit `01ace86` checked pack + kernel + FFI + loader byte-by-byte
+      against PR #31, but TREATED upstream GPTQ checkpoint as trusted.
+      That trust was misplaced for ~1 year (silent W4A16 marginal).
+    - Fix: when investigating "checkpoint produces wrong output", AUDIT
+      THE UPSTREAM PARSER FIRST. Dump qweight/qzeros/scales raw values,
+      compare to AutoGPTQ source spec EXACTLY (zero-1 convention,
+      sym/asym, scale magnitude, g_idx interpretation, bit-extraction
+      order, sign extension). The parser is the FIRST suspect for "looks
+      slightly off" symptoms — internal kernel/pack iteration is the
+      LAST.
+    - These hidden contracts don't appear in kernel source or pack
+      source — they're entirely in the parser → kernel expectation chain.
+
 ---
 
 ## Quick reference (cheat sheet)
