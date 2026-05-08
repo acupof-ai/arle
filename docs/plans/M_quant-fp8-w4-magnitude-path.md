@@ -225,21 +225,66 @@ stack on Phase 0:**1.86× decode + 7.9× prefill** combined improvement vs BF16 
 - FP8 quantize Qwen3-4B 实际 perplexity loss — literature claim,本机没跑
 - **Phase 0 第一步必须先做**:cuBLASLt FP8 smoke test(单 GEMM call,no model)→ verify hardware path 通
 
-## §9 立即 next step — cuBLASLt FP8 smoke test
+## §9 立即 next step — cuBLASLt FP8 smoke test ✅ DONE
 
 **Phase 0 之前的 P0 sanity check**(15-30 min,SOLID 第一步):
 
 ```cpp
-// crates/cuda-kernels/csrc/gemm/fp8_smoke.cu
+// /tmp/fp8_smoke.cu (not committed,单 binary)
 // 单 GEMM call:(M=2048, N=2560, K=2560) FP8 input × FP8 weight → BF16 output
 // cuBLASLt FP8 mma path,cudaEvent 测 elapsed time
-// expect: < 2 ms (vs BF16 same shape 实测 ~ 16 ms = 8× speedup)
 ```
 
-如果 smoke 跑不出来 → cuBLASLt FP8 + sm_89 + cuda 13.2 路径有问题,Phase 0 假设错,plan abort 或 cuda 版本切换
+### 🔴 实测结果(2026-05-08,codex `9m29s` work):
 
-如果 smoke ≥ 6× speedup → Phase 0 实施按 plan 推进
-如果 smoke < 4× → 重审,可能 need cutlass FP8 而不是 cuBLASLt
+| metric | value |
+|---|---|
+| BF16 mean (M=2048 N=2560 K=2560) | 0.323-0.331 ms |
+| **FP8 mean** | **0.177 ms** |
+| **Speedup** | **1.83-1.88×** |
+| 理论上限 | 8× (Ada FP8 mma 706 / BF16 88.5 TFLOPS) |
+| **utilization** | **~24%** of theoretical |
+| Layout constraint | cuBLASLt FP8 on Ada **要求 TN layout** (NN returned `CUBLAS_STATUS_NOT_SUPPORTED`)|
+
+**License decision per §5**:1.88× 落 **<2× KILL bucket**。**cuBLASLt FP8 path on sm_89 + cuda 13.2 KILL**。
+
+✅ §0 SOLID 工作流救 400 LOC implementation:cheap sanity check(<1h codex)阻止了完整 implement 才发现 hardware path 不通。
+
+## §9.1 Phase 0 v2 — cutlass FP8 direct mma smoke
+
+cuBLASLt utilization ~24% 不代表 cutlass 也只 ~24%。cuBLASLt 走 algo dispatch
+heuristic 可能是次优 algo,cutlass FP8 direct mma kernel 可能拿到更高 utilization。
+
+**v2 smoke spec**(~1h codex implement):
+
+- cutlass `device_gemm_universal` with FP8 (E4M3) input + FP8 weight + BF16 accumulator
+- 同 shape (M=2048, N=2560, K=2560) 对照
+- iterate 100 次 + cudaEvent 测 mean+std
+
+**License v2**:
+
+| 实测 speedup | Action |
+|---|---|
+| ≥ **6×** | ✅ Phase 0 W8A8 用 cutlass path 推进(替换 cuBLASLt)|
+| 3-6× | ⚠ Phase 0 推进但 ROI 调低,cutlass utilization 50-70% 已可接受 |
+| <3× | ❌ **M_quant FP8 全路径 KILL**:sm_89 + cuda 13.2 FP8 mma 整体 fundamental viability 失败,W4A16 (Marlin) 是 sm_89 唯一 bandwidth 路径 |
+
+cutlass smoke license 决定 M_quant 是否 continue。如果 cutlass 也只 ~24%,
+意味着 Ada FP8 mma stack 在本机上 fundamental 不 viable,FP8 magnitude 路径
+全部 KILL,改方向 W4A16 + 5 项 moat。
+
+## §9.2 平行 cheap verify — W4A16 Marlin decode bench(无 implement)
+
+ARLE 已有 GPTQ W4A16 + Marlin kernel production(`marlin_kernel.cu`)。需要:
+
+1. Qwen3-4B GPTQ checkpoint(`find` 实测**没现成**)→ AutoGPTQ 自己 quantize(~30-60 min CPU)或 HF 拉 official
+2. 跑 longctx 4k/c=4 + decode shapes 实测 ITL
+3. 对照 BF16 baseline 验证 weight bandwidth magnitude
+
+**Predicted ITL** = 11.9/4 + 0.28 + 7 = **10.26 ms = 1.88× decode** vs BF16 19.27 ms
+
+如果实测 ≥1.5× decode → bandwidth 路径真有用,M_quant 继续推 W4A_FP8 (Phase 1)
+如果 = 1× → ARLE Marlin 没 enable 或实现 bug,debug
 
 ## Cross-references
 
