@@ -576,6 +576,38 @@ Each anti-pattern has a project commit/entry where it was paid for.
       (implicit-coupling-via-shared-default): all three share the
       "audit existing before scoping new" methodology core.
 
+19. **Dispatch directive paths must be verified at write-time**
+    - Caught by: `8935851` (fixed `codex-pickup-queue-2026-05-09-eod.md`
+      broken link in docs/index.md `14116c1`) + `de8b4dc` (fixed
+      `infer/src/model/weight_loader.rs:514` stale path — actual file
+      is `infer/src/weight_loader.rs:514` top-level not in model/).
+      Both stale paths shipped tonight in artifacts intended for
+      cross-session codex dispatch.
+    - Without methodology, "dispatch directives" (paste-buffer-ready
+      briefs, pickup queue file refs, doc index links) accumulate stale
+      paths as the codebase moves around. Codex picking these up
+      tomorrow hits "file not found" → wasted context-rebuild time
+      OR worse, confused implementation against wrong file.
+    - Fix: when writing a dispatch directive or pickup queue with file
+      paths, ALWAYS run `ls <path>` or `grep <symbol> <file>` to verify
+      the path exists at write-time. For symbol references (line
+      numbers, function names), grep the file at directive-write time
+      AND at pre-dispatch time (paths can drift between writing and
+      firing). Bake the verification into the artifact: add a
+      "verified YYYY-MM-DD" note next to each path so future
+      consumers (cron-fired Claude, codex) see when freshness was
+      last checked.
+    - Special case for cross-session artifacts (pickup queues,
+      EOD anchors): paths persist across days/weeks while the
+      codebase moves. The artifact's *value* is sub-minute dispatch;
+      stale paths erase that value entirely. Verify-at-write +
+      verify-at-dispatch is the cheap insurance that preserves it.
+    - Companion to anti-pattern #18 (Phase 0 substrate audit): #18
+      is about substrate-dependency reuse before scoping new code;
+      #19 is about file-path freshness in artifacts that outlive
+      the session that wrote them. Both share "audit before trust"
+      discipline.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -659,7 +691,8 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.4.0** | **2026-05-08** | **14** | **`6c627c4` added #14 (upstream-data parser silent corruption per `5593865` qzeros bug)** |
 | **v1.5.0** | **2026-05-08** | **17** | **`f05ea3a` added #15-17 from cap=8 chain** |
 | **v1.5.1** | **2026-05-08** | **17(refined)** | **`9f65b4d` #17 workload-shape refinement per `063da81`** |
-| **v1.6.0** | **2026-05-09** | **18** | **(this commit)added #18 Phase 0 substrate audit per `1217375` A1 audit + B3 Step 2 -30% scope** |
+| **v1.6.0** | **2026-05-09** | **18** | **`125f795` added #18 Phase 0 substrate audit per `1217375` A1 audit + B3 Step 2 -30% scope** |
+| **v1.7.0** | **2026-05-09** | **19** | **(this commit) added #19 dispatch directive path verification per `8935851` index.md broken link + `de8b4dc` pickup queue stale path** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
