@@ -61,6 +61,7 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 24 | Claude — current main = cell (c) state verified by code-grep | `717b304` | Partial H7-A evidence collected:cell (c) at c=1 PASS + cell (b) historical 100% turn success(annotated) |
 | 25 | Codex — cell (d) recipe with kill criterion(12300c5 attribution) | `1bf408d` | Step-by-step revert recipe + Layer-8 num_slots=8 gate enforcement + restore step;most informative single remaining experiment |
 | 26 | Codex — **cell (a) ≡ cell (d) post-P0.2** — 4-cell collapses to 1 experiment | `1ccb448` | Cell-collapse blindness anti-pattern #24 candidate;saved tomorrow's pickup duplicate experiment; **net empirical work = 1 experiment** |
+| 27 | Codex — pickup queue 4-cell table surgical update for cell-collapse | `05dbceb` | Reflects post-P0.2 reality:cell (a) ≡ (d),cell (b) non-reproducible,cell (c) = current main,cell (d) only experiment;preserves Layer-8 gate |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
