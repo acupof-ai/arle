@@ -192,10 +192,22 @@ impl<D: StepDriver> ResumableRequestState<D> {
         let processed = budget.min(remaining);
         let prompt_end = self.prompt_cursor + processed;
         let terminal_prompt = prompt_end == self.prompt_tokens.len();
+        let trace_m_e13 = std::env::var("INFER_M_E13_TRACE").is_ok();
+        let prefill_start = trace_m_e13.then(std::time::Instant::now);
         let sampled = self.driver.prefill_tokens(
             &self.prompt_tokens[self.prompt_cursor..prompt_end],
             terminal_prompt,
         )?;
+        if let Some(t0) = prefill_start {
+            let us = t0.elapsed().as_micros();
+            log::info!(
+                "m_e13_trace prefill_chunk: cursor_was={} processed={} terminal={} elapsed_us={}",
+                self.prompt_cursor,
+                processed,
+                terminal_prompt,
+                us,
+            );
+        }
         self.prompt_cursor = prompt_end;
 
         if terminal_prompt {
