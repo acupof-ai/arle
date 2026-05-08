@@ -48,14 +48,6 @@ enum LinearKernelPlan {
     TurboQuantDequantCublasGemm,
 }
 
-/// 2026-05-08 R4 #6: hybrid dispatch threshold. Marlin's BF16↔FP16 conversion
-/// (W4A16 path) and activation-quant + dequant (W4A8 path) cost 5-6 kernel
-/// launches per linear call vs single launch for BF16-native batched GEMV.
-/// Tensor-core throughput dominates only at large M; below this batch size,
-/// launch overhead exceeds the speedup. Threshold matches existing
-/// `(2..=8, GgufQ4K) => Q4KBatchGemv` decode-batch convention.
-const MARLIN_DECODE_BATCH_THRESHOLD: usize = 8;
-
 impl LinearKernelPlan {
     fn decode(weight: &DeviceMatrix) -> Self {
         match weight.weight_format() {
@@ -76,7 +68,7 @@ impl LinearKernelPlan {
         if marlin_w4a8_aligned(weight).is_ok() {
             return Self::MarlinW4A8Gemm;
         }
-        if batch > MARLIN_DECODE_BATCH_THRESHOLD && marlin_prefill_aligned(weight).is_ok() {
+        if batch > 1 && marlin_prefill_aligned(weight).is_ok() {
             return Self::MarlinW4Gemm;
         }
         if batch > 1
