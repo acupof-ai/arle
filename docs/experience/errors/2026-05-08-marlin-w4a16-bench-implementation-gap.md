@@ -217,6 +217,68 @@ multi-day implementation. The alloc hypothesis is now eliminated; remaining
 hypotheses target the actual binding mechanism (kernel utilization or kernel
 choice).
 
+## Round 3 — variant swap, NULL result (2026-05-08)
+
+**Hypothesis #7**: the symmetric `W4A16-sym-g128-marlin` variant uses different
+quant scheme; may expose checkpoint-specific bottleneck.
+
+**Phase 5 A/B** — same workload, swap `--model-path` only:
+
+| Metric | GPTQ-Int4-marlin (R1) | W4A16-sym-g128-marlin (R3) | Δ |
+|---|---:|---:|---:|
+| TTFT p50 | 2331.8 ms | 2331.2 ms | −0.03% (within σ) |
+| TTFT std | 7.7 ms | 7.8 ms | flat |
+| ITL p50 | 18.13 ms | 18.14 ms | +0.05% (within σ) |
+| ITL std | 0.02 ms | 0.03 ms | flat |
+| out tok/s | 150.37 | 150.22 | −0.10% |
+
+**Verdict — NULL**. Both checkpoints behave identically. The bottleneck is
+fundamental to ARLE's Marlin path implementation, not to the specific
+checkpoint quant scheme. Hypothesis #7 eliminated.
+
+**Hypothesis #6 attempted indirectly via non-marlin checkpoint**:
+`Qwen3-4B-GPTQ-Int4` (without `-marlin`) failed to load — ARLE weight loader
+can't find BF16 fallback weights when only GPTQ packed weights are present
+("`'model.layers.0.self_attn.q_proj.weight' not found in any shard`"). So
+testing W4A16BatchGemv via fallback dispatch requires either:
+
+- Code change to dispatch (`(_, W4A16) => W4A16BatchGemv` for `batch>1` even when
+  `marlin_aligned` would succeed), OR
+- A non-marlin GPTQ checkpoint that ARLE can actually load (TBD operational)
+
+## Cumulative round summary (3 rounds, ~30 min wall-clock)
+
+| Round | Hypothesis tested | Outcome | Cost | Eliminated? |
+|---|---|---|---:|---|
+| 1 | Marlin W4A16 vs BF16 ⇒ 1.86× predicted | 1.06× actual | 1 bench + 1 errors entry | Implementation gap confirmed |
+| 2 | `alloc_zeros` cudaMemsetAsync overhead | NULL | 1 build + 1 bench + revert | Hypothesis eliminated |
+| 3 | Checkpoint variant difference | NULL | 1 bench (no LOC) | Hypothesis eliminated |
+
+**Surviving hypotheses for Round 4+**:
+
+| # | Hypothesis | Test cost | Blocker |
+|---|---|---|---|
+| 4 | BF16↔FP16 elementwise conversion launches dominate | nsys trace | Wrapper migration needed |
+| 5 | Marlin kernel sub-peak utilization on sm_89 | ncu single-launch | Wrapper migration needed |
+| 6 | `W4A16BatchGemv` competitive with Marlin (BF16 native, no conversion) | ~10 LOC dispatch override + bench | Solvable now |
+
+**Skill methodology validation**: 3 rounds eliminated 2 hypotheses + confirmed
+implementation gap, no implementation work landed (correctly — none of the
+tests showed a license-worthy Δ%). Total burn: ~30 min wall-clock + 3 errors
+entry rounds. Without the skill, the natural cycle "1.06× → KILL W4A16" or
+"alloc fix didn't help → ship anyway" would have either dropped a viable axis
+OR shipped a no-op change with new uninit-memory risk.
+
+Per skill rule #6 ("License-or-kill with σ < 5% across n≥3"): each NULL was
+σ < 0.5% — clean signal, real elimination.
+
+Round 4 should target #6 (low-LOC, immediate signal) before #4/#5
+(profiler-blocked). If #6 also NULL, the answer is "ARLE Marlin/W4 path on
+sm_89 has fundamental ~1.06× ceiling at current implementation; the W4A8
+combined path (M_quant Phase 1) is gated on either fixing this or pivoting
+to a different W4 kernel (e.g., Machete from Neural Magic, or porting
+sgl-kernel's own W4 path)".
+
 ## Cross-references
 
 - Skill: `.claude/skills/kernel-optimization/SKILL.md` (`faffcb0`)
