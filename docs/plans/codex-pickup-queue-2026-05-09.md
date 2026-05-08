@@ -47,10 +47,33 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 12 | Codex — recipe-itself audit codification | `153fd93` | Methodology(skill #21 candidate) |
 | 13 | Claude — c20b1ce incoherent fix discovery(via codex P0.2 mid-flight) | `919c0fb` | Implementation-impact audit |
 | 14 | Codex — c20b1ce was NO-OP not silent-fail(deeper)| `8d91d20` | Empirical-impact triage(skill #22 candidate refinement) |
+| 15 | Claude — pickup queue NO-OP triage acknowledgment | `921f313` | Reference + cycle codification |
+| 16 | Codex — `12300c5` was actual fix,c20b1ce dead code | `3fea979` | **CLOSURE — 7-layer audit chain CLOSED + anti-pattern #22 final framing** |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
-**Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,2 skill v1.8.0 candidates,
-P0.2 dispatched + active,Phase 1.A recipe verified-correct。
+**Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
+candidates(batch ready)**,P0.2 dispatched + active(near-LANDED),Phase 1.A
+recipe verified-correct,**c20b1ce dead-code revealed via 7-layer chain closure**。
+
+### NEW pre-Phase-1.A action — 4-cell A/B(per `3fea979`)
+
+**Goal**:empirically confirm c20b1ce is dead code before reverting + 3 wins entries re-attribution。
+**Effort**:~30 min Claude-side(distinguishing experiment matrix)
+
+| cell | revert c20b1ce | revert 12300c5 | predicted turn success |
+|------|:------:|:------:|:---:|
+| (a) | YES | YES | 76% |
+| (b) | NO | NO(current main)| 100% |
+| (c) | YES | NO | **100%(predicts H7-A)** |
+| (d) | NO | YES | **76%(predicts H7-A)** |
+
+If (c)≈(b) and (d)≈(a):H7-A confirmed → revert c20b1ce + annotate 3 wins entries
+(`2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md`,
+`2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md`,
+`2026-05-08-cap8-chain-final-synthesis.md`)。
+
+Ordering:**4-cell A/B BEFORE Phase 1.A nvtx decomposition** — corrects
+the bimodal-root-cause assumption baseline before Phase 1 invests effort。
 
 ## ⚠ STRATEGIC RE-ORDERING(2026-05-09 EOD)— per codex `d2c2c17`
 
