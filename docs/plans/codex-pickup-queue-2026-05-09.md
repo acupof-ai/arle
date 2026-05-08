@@ -136,15 +136,36 @@ Reference: docs/research/2026-05-08-cap8-default-h4-warmup-cap-rootcause.md (db2
 Root cause: c20b1ce warmup covers DECODE only, not PREFILL cold-start.
 First fresh-server cap=8 prefill burst hits cold kernel cache → bimodal regression.
 
-File: infer/src/scheduler/cuda/core/warmup.rs
-Add: PREFILL warmup pass
-- Trigger same paths exercised by first prefill at startup
-- Prime kernel cache for cap=8 admission default
-- Cold-start adds ~250ms but unblocks -86% TTFT p99 stable
+File: infer/src/scheduler/cuda/core/warmup.rs (verified 2026-05-09 — exists at this path, 296 LOC)
+
+Phase 0 audit findings (2026-05-09 by Claude):
+- Current warmup_cuda_graphs() at line 26 ONLY handles decode-shaped paths
+  (line 102 comment: "Pass 1: drive forward for each warmup batch size.
+   Populates the cublasLt heuristic algo cache for all GEMM shapes used by decode.")
+- c20b1ce already fixed max_bs to read model.max_concurrent_prefill_requests
+  (line 42-43), so DECODE paths are now warmed for batch sizes up to 8
+- BUT prefill kernel paths (different GEMM shapes from decode) are NOT warmed
+- First fresh-server prefill burst at cap=8 → cold kernel cache → bimodal regression
+
+Add: dedicated PREFILL warmup pass (NEW, not just bump max_bs further)
+- Either: append a Pass 2 in warmup_cuda_graphs() that exercises prefill kernel
+  paths with prefill-shaped dummy data
+- Or: separate warmup_prefill_paths() function called after warmup_cuda_graphs()
+- Trigger paths: prefill GEMM (q/k/v/output projections), prefill attention kernel,
+  prefill RMSNorm if shape differs from decode
+
+Implementation hint:
+- Existing decode warmup uses dummy_tokens=vec![0; max_bs] + slot_indices=0..max_bs
+- Prefill warmup needs dummy prompts at varying lengths (e.g., representative
+  short=128, mid=512, long=2048 prompt token counts) to populate prefill GEMM
+  shapes
+- May need self.model.warmup_prefill_kernels(dummy_prompts) helper if model
+  trait doesn't already expose this
 
 Acceptance criteria:
 - W3 c=4 cap=8 fresh-server bench: 5/5 trials within σ < 5%
-- TTFT p99 stays at -86% relative to cap=4
+- TTFT p99 stays at -86% relative to cap=4 (NO bimodal regression)
+- Cold-start adds ~250ms (acceptable) but unblocks -86% TTFT p99 stable
 - Bench entry: docs/experience/wins/2026-05-XX-bench-cap8-prefill-warmup.md
 ```
 
