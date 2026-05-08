@@ -539,6 +539,14 @@ Each anti-pattern has a project commit/entry where it was paid for.
       probability in LICENSE entry. Production confidence band =
       `mode_prob × mode_value` summed across modes, not just single
       best-case.
+    - **Workload-shape refinement**(`063da81`): bimodal modes can be
+      WORKLOAD-SHAPE-SPECIFIC, not config-global. cap=8 default is
+      bimodal at W4 c=8 8K-prompt burst (stress shape) but CLEAN HARD-
+      LICENSED at W3 c=4 short-multiturn (low-pressure). Production
+      deployment guidance must distinguish bimodal-affected vs clean
+      shapes — single global "production caveat" oversimplifies.
+      Workload classification matters: shape × cap × concurrency ×
+      prompt-length all factor into bimodal trigger.
 
 ---
 
