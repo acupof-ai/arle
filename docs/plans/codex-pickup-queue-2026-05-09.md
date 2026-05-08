@@ -67,19 +67,22 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 candidates(batch ready)**,P0.2 dispatched + active(near-LANDED),Phase 1.A
 recipe verified-correct,**c20b1ce dead-code revealed via 7-layer chain closure**。
 
-### NEW pre-Phase-1.A action — 4-cell A/B(per `3fea979`)
+### NEW pre-Phase-1.A action — 4-cell A/B → **1 experiment** on post-P0.2 main(per `3fea979` + `1ccb448` cell-collapse)
 
-**Goal**:empirically confirm c20b1ce is dead code before reverting + 3 wins entries re-attribution。
-**Effort**:~30 min Claude-side(distinguishing experiment matrix)
+**Goal**:empirically confirm 12300c5 is real fix(c20b1ce dead code already reverted by P0.2 232aed5)。
+**Effort**:~30 min Claude-side(SINGLE experiment per cell-collapse finding `1ccb448`)
 
-| cell | revert c20b1ce | revert 12300c5 | predicted turn success |
-|------|:------:|:------:|:---:|
-| (a) | YES | YES | 76% |
-| (b) | NO | NO(current main)| 100% |
-| (c) | YES | NO | **100%(predicts H7-A)** |
-| (d) | NO | YES | **76%(predicts H7-A)** |
+| cell | revert c20b1ce | revert 12300c5 | post-P0.2 reality | predicted turn success |
+|------|:------:|:------:|--------|:---:|
+| (a) | YES | YES | **same as (d)** — c20b1ce already reverted | 76% |
+| (b) | NO | NO | **non-reproducible** post-P0.2(c20b1ce removed permanently)| historical 100% only |
+| (c) | YES | NO | **current main**(P0.2 reverted c20b1ce + 12300c5 kept) | **100%(c=1 PASS partial confirmed `232aed5`)** |
+| (d) | NO | YES | **revert 12300c5 only**(c20b1ce stays reverted) | **76%(predicts H7-A,run via `1bf408d` recipe)** |
 
-If (c)≈(b) and (d)≈(a):H7-A confirmed → revert c20b1ce + annotate 3 wins entries。
+**Net empirical work**:**1 experiment** = run cell (d) recipe `1bf408d`(~30 min wall-clock,sed Some(8)→Some(4))。
+Result serves as BOTH cell (a) AND cell (d)per `1ccb448` collapse finding。
+
+If (d) shows ~76%/300ms TTFT:H7-A confirmed → 12300c5 is real fix → annotate 3 wins entries(✅ done) + skill v1.8.0 anti-pattern #22(twin-commit attribution)transitions to empirically-grounded codified rule。
 **Codex completed 3-doc attribution scan**(stages 19+20):
 - ✅ `2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md`(annotated `655accf`)
 - ✅ `2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md`(annotated `655accf`)
