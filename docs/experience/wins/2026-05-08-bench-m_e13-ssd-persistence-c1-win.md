@@ -69,6 +69,36 @@ would deliver disk-level (~−76%) on within-session multi-turn
 (eli's main use case once it runs as a daemon), not just session
 restart.
 
+### SLEEP-30 closure: -25% is the realistic eli daemon ceiling
+
+A 30-second sleep between same-server cold and warm changes the
+delta dramatically:
+
+| Sleep between | Cold | Warm | Δ |
+|---|---|---|---|
+| 2 seconds | 12.059s | 8.911s | -26% |
+| **30 seconds** | 10.915s | 10.564s | **-3.2%** |
+
+After 30s of idle, the warm-phase advantage nearly vanishes. The
+likely cause: a fraction of the -25% benefit was actually `cold`'s
+still-hot Metal command-buffer cache + GPU residency state, which
+decays in ~tens of seconds.
+
+**Practical bound**: eli daemon-mode turns are seconds apart, so
+the SLEEP-2 regime applies → realistic same-server M_e.13 ceiling is
+~-25% E2E. The -76% number is achievable only for one-shot
+server-restart workloads, NOT for sustained daemon use.
+
+The 50pp asymmetry the wins entry investigated is therefore
+**primarily a server-warm-state-decay artifact, not an in-memory
+import bug to fix.** Closing it would require artificially keeping
+Metal command-buffer cache + residency hot — fragile and probably
+not worth the complexity.
+
+**Net eli daemon-mode M_e.13 TTFT improvement budget: ~-25%
+ceiling, calibrated correctly.** The default-on shipping decision
+stands; just don't over-promise the ceiling.
+
 ### Same-day deeper probe: import op itself is 35µs (not the bottleneck)
 
 A second isolated bench with a `try_import_memory_prefix` timing
