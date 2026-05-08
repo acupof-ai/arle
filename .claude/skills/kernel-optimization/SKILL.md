@@ -370,6 +370,39 @@ Each anti-pattern has a project commit/entry where it was paid for.
     - User directive 2026-05-08.
     - Fix: Phase 7 tradeoff axis enumeration.
 
+11. **Same-typedef-name across BF16 vs FP16 kernels masks conversion overhead**
+    - Caught by: ARLE Marlin path — `ffi::Half` typedef refers to `__nv_bfloat16`
+      in BF16-native kernels (e.g. `turboquant_weight_gemv.cu`) but the literal
+      IEEE-754 FP16 in Marlin (`marlin_kernel.cu`). Same name, different
+      hardware semantics; per-call cost differs by 2 elementwise launches
+      (`bf16_to_fp16_cuda` + `fp16_to_bf16_cuda`).
+    - Caught by: `b3f22ea` Round 4 prep survey resolving the typedef.
+    - Fix: When integrating a third-party W4/W8 kernel into a BF16 stack,
+      grep the kernel's `.cu` for `__half` vs `__nv_bfloat16` literals BEFORE
+      assuming the FFI typedef is uniform. If the kernel is FP16-internal,
+      bake conversion cost into Phase 4 formula.
+
+12. **Single-kernel choice ≠ optimal at all batch sizes (decode vs prefill duality)**
+    - Caught by: ARLE Marlin used at all batch>1 (`linear.rs:65-93`); decode
+      (M≤8) is launch-overhead-bound where Marlin's 6-launch wrapper hurts,
+      while prefill (M=2048) is compute-bound where Marlin's tensor cores win.
+      The dispatch should be hybrid: small-batch → BF16-native GEMV
+      (`W4A16BatchGemv` in ARLE), large-batch → tensor-core path (Marlin / cutlass).
+    - Caught by: Round 4 prep `b3f22ea` matched-contrast launch density (6 vs 1).
+    - Fix: Phase 7 tradeoff axis "Generality" must include "single-shape
+      optimum may regress sibling shape" — multi-shape A/B mandatory before
+      committing to a single dispatch choice.
+
+13. **NULL result is real elimination, not skill failure**
+    - Caught by: Round 2 (alloc_zeros skip) + Round 3 (variant swap) — both
+      Δ < 0.5%, σ < 5%, hypothesis cleanly eliminated.
+    - Without methodology, NULL is read as "something didn't work, drop the
+      axis"; with methodology, NULL is read as "this hypothesis is dead, here
+      are the surviving N candidates ranked by next-test cost".
+    - Fix: Phase 8 errors entry must list surviving hypotheses with cost
+      ranking. Cumulative table across rounds shows hypothesis space narrowing,
+      preserving the axis until the actual binding cause is isolated.
+
 ---
 
 ## Quick reference (cheat sheet)
