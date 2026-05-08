@@ -56,7 +56,11 @@ def repack_w4a16_to_w4a8(qweight_u8, scales_bf16, groupsize: int, pack_w4a8):
 
     scales_per_element = scales_bf16.repeat_interleave(groupsize, dim=1)
     w_real = (w_int - 8).float() * scales_per_element.float()
-    return pack_w4a8(w_real.to(torch.bfloat16))
+    # Pass GPTQ scales through to pack_w4a8 to preserve calibration. Without
+    # this, pack re-derives s_pack = max/7 from data which drifts ~4% on
+    # boundary groups (per b7176d3 empirical). Pass-through gives near-zero
+    # drift since w_real lives at integer multiples of scales_bf16 already.
+    return pack_w4a8(w_real.to(torch.bfloat16), groupsize=groupsize, gptq_scales=scales_bf16)
 
 
 def main():

@@ -90,7 +90,18 @@ def is_quantized_linear(name: str, tensor: torch.Tensor) -> bool:
     return in_features % 128 == 0 and out_features % 256 == 0
 
 
-def pack_w4a8(weight: torch.Tensor, groupsize: int = GROUP_SIZE):
+def pack_w4a8(weight: torch.Tensor, groupsize: int = GROUP_SIZE,
+              gptq_scales: torch.Tensor | None = None):
+    """Pack BF16/FP16 weight to ARLE W4A8 Marlin format.
+
+    Args:
+      weight: tensor of shape (n, k) = (out_features, in_features)
+      groupsize: per-group quant size (default 128)
+      gptq_scales: optional upstream GPTQ scales of shape (n, k/groupsize) BF16/FP16.
+        When provided, pack uses these instead of re-deriving max-scale from data,
+        preserving GPTQ calibration through re-pack. Set to None for plain naive
+        max-scale quant of FP weights (default behavior).
+    """
     weight = weight.to(dtype=torch.float16, device="cpu").contiguous()
     n, k = weight.shape
     if k % 128 != 0 or n % 256 != 0 or k % groupsize != 0:
@@ -103,8 +114,19 @@ def pack_w4a8(weight: torch.Tensor, groupsize: int = GROUP_SIZE):
     s_channel = torch.where(s_channel == 0, torch.ones_like(s_channel), s_channel)
     s_channel = s_channel.reshape(1, n)
 
-    reshaped = ref.reshape(k // groupsize, groupsize, n)
-    s = reshaped.abs().amax(dim=1).clamp_min(1e-6).div(7.0).to(torch.float16)
+    if gptq_scales is not None:
+        # GPTQ-aware path: use upstream calibrated scales directly.
+        # GPTQ stores (n, k/groupsize); transpose to (k/groupsize, n) to match
+        # our internal s layout (k/gs first, n second matches w's flat order).
+        s = gptq_scales.t().to(torch.float16).contiguous()
+        if s.shape != (k // groupsize, n):
+            raise ValueError(
+                f"gptq_scales shape after transpose {tuple(s.shape)} "
+                f"!= expected ({k // groupsize}, {n})"
+            )
+    else:
+        reshaped = ref.reshape(k // groupsize, groupsize, n)
+        s = reshaped.abs().amax(dim=1).clamp_min(1e-6).div(7.0).to(torch.float16)
     # H4: do NOT transpose s here. s has shape (k/gs, n) which matches w's
     # flat-index order (i_kgs * n + i_n) after permute+reshape. Adding .t()
     # would rotate to (n, k/gs) and reshape((1,-1)) would flatten with
