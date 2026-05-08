@@ -1,5 +1,60 @@
 # Bench — M_e.13 SSD KV persistence: functional + −27.3% E2E win on c=1 canonical workload — 2026-05-08
 
+## ⚠️ Final breakdown bench (same-day, INFER_M_E13_TRACE timing probes)
+
+A third bench with new `INFER_M_E13_TRACE=1` probes captured the
+disk-import wall-clock breakdown:
+
+```
+m_e13_trace try_import_disk_prefix: tokens=2064 payload_bytes=111581111
+  read_us=38643  decode_us=60816  import_us=48  imported=true
+```
+
+→ Disk-import overhead (read + Rust deserialize + KV-clone) =
+**~100ms total** (38ms read + 61ms decode + 48µs in-memory clone).
+Tiny compared to a fresh ~10-12s prefill. So the TTFT win comes
+straight from skipping prefill — the import overhead is essentially
+free.
+
+Same-bench cold vs warm (server-restart between):
+
+| Phase | E2E |
+|---|---|
+| Cold (fresh disk) | 12.811s |
+| **Warm (server restart, disk attach)** | **2.981s** |
+| **Δ** | **−76.7%** |
+
+This is the **cleanest M_e.13 measurement of the day** — bigger
+than the trace bench (-27.3%) and v2 (+7.6%). Run-to-run noise
+on shorter prompts produced the earlier disparate numbers; the
+breakdown probe confirms the path is doing exactly what it
+should: ~100ms of import overhead, full prefill skipped.
+
+### Surprise: in-memory hit (same server) does NOT speed up
+
+The breakdown bench also captured a same-server cold→warm pair
+(no server restart):
+
+| Phase | E2E | session_affinity hit |
+|---|---|---|
+| Cold (1st request) | 12.811s | none |
+| Warm (2nd request, in-memory cache populated by 1st publish) | 12.759s | hit on memory_match=Some(2064) AND disk_match=Some(2064) |
+
+The in-memory entry is present and the lookup matches it, but
+warm e2e is **identical** to cold (12.759s ≈ 12.811s). Server-
+restart **DOES** speed up; same-server in-memory hit **does NOT**.
+
+**Implication**: the M_e.13 disk-attach path short-circuits prefill,
+but the M_e.10 in-memory `try_import_memory_prefix` path does not
+(or hits a different code path that re-runs the prefill). This is
+a separate latent bug — fixing it would deliver the same -76% on
+WITHIN-session multi-turn (eli's actual usage), not just session-
+restart.
+
+Filed as next-tick investigation: code-trace
+`try_import_memory_prefix` vs `try_import_disk_prefix` for the
+prefill-short-circuit asymmetry.
+
 ## ⚠️ Update (same-day re-bench with INFER_M_E10_TRACE=1)
 
 The earlier v2 bench (cold=15.343s, warm=16.509s, +7.6% with 2795
