@@ -166,24 +166,32 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
     no_kv_pool: bool,
 
-    /// Directory for experimental Metal SSD KV cache persistence.
-    #[arg(long, value_name = "DIR")]
+    /// Directory for Metal SSD KV cache persistence. Default-on as of
+    /// M_e.13 (2026-05-08) — auto-resolves to `$HOME/.cache/arle/metal_kv`
+    /// when neither `--kv-disk-dir` nor `--no-kv-disk` is passed. Wins
+    /// entry: docs/experience/wins/2026-05-08-bench-m_e13-ssd-persistence-c1-win.md
+    /// (mean −25.9% E2E on long-prompt c=1 warm restart, n=2).
+    #[arg(long, value_name = "DIR", conflicts_with = "no_kv_disk")]
     kv_disk_dir: Option<PathBuf>,
 
-    /// Maximum bytes for the experimental Metal SSD KV cache.
-    #[arg(long, value_name = "BYTES", requires = "kv_disk_dir")]
+    /// Disable the Metal SSD KV cache (overrides the M_e.13 default-on).
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_disk_dir")]
+    no_kv_disk: bool,
+
+    /// Maximum bytes for the Metal SSD KV cache.
+    #[arg(long, value_name = "BYTES")]
     kv_disk_max_bytes: Option<u64>,
 
     /// High watermark for Metal SSD KV cache reclamation.
-    #[arg(long, requires = "kv_disk_dir")]
+    #[arg(long)]
     kv_disk_high_watermark: Option<f64>,
 
     /// Low watermark for Metal SSD KV cache reclamation.
-    #[arg(long, requires = "kv_disk_dir")]
+    #[arg(long)]
     kv_disk_low_watermark: Option<f64>,
 
-    /// Fsync each experimental Metal SSD KV cache block write.
-    #[arg(long, action = ArgAction::SetTrue, requires = "kv_disk_dir")]
+    /// Fsync each Metal SSD KV cache block write.
+    #[arg(long, action = ArgAction::SetTrue)]
     kv_disk_fsync_each_block: bool,
 
     /// Override the MLX allocator memory limit in bytes before model load.
@@ -246,8 +254,26 @@ impl Args {
     }
 
     fn kv_disk_options(&self) -> Result<Option<MetalKvDiskOptions>> {
-        let Some(dir) = self.kv_disk_dir.clone() else {
+        if self.no_kv_disk {
             return Ok(None);
+        }
+        // M_e.13 default-on: when no explicit --kv-disk-dir and no --no-kv-disk,
+        // auto-resolve to $HOME/.cache/arle/metal_kv. Mirrors HF cache convention.
+        let dir = if let Some(dir) = self.kv_disk_dir.clone() {
+            dir
+        } else {
+            let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+                log::info!(
+                    "metal_serve: HOME not set; Metal SSD KV cache disabled (set --kv-disk-dir to override)"
+                );
+                return Ok(None);
+            };
+            let auto = home.join(".cache").join("arle").join("metal_kv");
+            log::info!(
+                "metal_serve: Metal SSD KV cache auto-defaulting to {} (M_e.13 default-on; pass --no-kv-disk to opt out, or --kv-disk-dir <DIR> to override)",
+                auto.display()
+            );
+            auto
         };
         let options = MetalKvDiskOptions {
             dir,
