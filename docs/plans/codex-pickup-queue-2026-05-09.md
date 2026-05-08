@@ -20,16 +20,30 @@
 | W4A8 prefill LICENSED -36% TTFT | ✅ both arms verified | `b5889b3` |
 | TTFT p99 -86% | ✅ via cap=8 | `cap8-ttft-tail.md` |
 | B3 Step 1 admission_allows | ✅ byte-identical regression | `7c8fd61` + `c30e298` |
-| Skill v1.4.0 → v1.6.0 | ✅ +5 anti-patterns | `125f795` |
+| **B3 Step 2 PrefixAwareAdmission** | ✅ **LICENSED -24.2% TTFT** σ/mean=4.5% | (codex pending commit, wins entry: `docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md`) |
+| Skill v1.4.0 → v1.7.0 | ✅ +6 anti-patterns | `c768b70` |
 | Codex pickup directives | ✅ this doc | (current) |
 
 ## P0 — Pickup directives(cron-Claude paste-buffer ready)
 
-### P0.1 — B3 Step 2 PrefixAwareAdmission CUDA-runtime gate(refined per `1217375`)
+### P0.1 — B3 Step 2 PrefixAwareAdmission CUDA-runtime gate ✅ LICENSED 2026-05-09
 
-**Why first**:smallest concrete next step in production scheduler chain。
-SGLang multi-tenant 2× gap closure。Architecture refined to reuse existing
-`runtime/admission.rs:187` lookup_or_stage(no SchedulerHandle field needed)。
+**Status:LICENSED -24.2% multi-tenant TTFT(318 ms → 241 ms median,σ/mean=4.5%)**
+
+Codex implementation 193 LOC across 5 files,EXCEEDS dispatch directive
+with senior-quality fail-open guard against admission deadlock。Wins
+entry:`docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md`。
+Default policy preserved as `queue-bound`(prod-safe);prefix-aware
+opt-in via `--admission-policy=prefix-aware`。
+
+GuideLLM `turns=3, prompt=6000, session=4` shape produces 12k-18k
+actual tokens > 8192 max-seq-len → invalid zero-output data filtered。
+LICENSED via separate `scripts/bench_multitenant_burst.py` shared-prefix
+warm-cache n=5 (244/241/218/239/249 ms) median 241 ms。
+
+Next-tick directive(after codex commit):dispatch P0.2 hybrid loader。
+
+**Original directive preserved below for record**:
 
 - **Effort**:~100 LOC,**0.5 day**
 - **File**:`infer/src/scheduler/cuda/runtime/admission.rs`
