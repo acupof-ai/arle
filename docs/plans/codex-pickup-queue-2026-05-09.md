@@ -383,31 +383,42 @@ Acceptance criteria:
 - Bench entry: docs/experience/wins/2026-05-XX-bench-cap8-prefill-warmup.md
 ```
 
-## P1 — Larger substrate(later in tomorrow's queue)
+## P1 — Empirically RE-RANKED post nsys decomposition(`aaf0b55` EOD+113)
 
-### P1.1 — KV W4A8 Phase 0a smoke kernel(#33)
+⚠ **EVIDENCE-LOCKED P1 axis**(per nsys 60s decomposition,prefill::compute = 97% of active GPU time):
 
-- **Effort**:100-400 LOC,**1-3 days**
-- **Plan**:`docs/plans/M_quant-kv-w4a8.md`(`1e713de`)
-- **ROI**:21k → 84k tokens KV pool(4×)+ unblock c=16 hybrid
-
-### P1.2 — Hybrid Phase 1-3 dispatch substrate(#30)
+### P1.0 ✅ — **Hybrid Phase 1-3 dispatch substrate(#30)** — PROMOTED
 
 - **Effort**:155-175 LOC scaffolding,**1 day**
-- **ROI**:complete hybrid axis after Phase 1b loader
+- **ROI**:**directly targets prefill::compute,the empirically dominant TTFT phase**
+- **Evidence**:nsys decomposition `aaf0b55` shows prefill 327ms / 337ms active = 97% of compute time
+- **Decision matrix per `d2c2c17`**:prefill dominant → P0.2 Hybrid Phase 2 dispatch wiring is right axis
+- **This is the ONLY P1 item directly targeting prefill compute**(KV W4A8/Medusa target decode)
 
-### P1.3 — W4A8 graph capture hoist(#24)
+### P1.1 ⏬ — KV W4A8 Phase 0a smoke kernel(#33) — DEMOTED post evidence
+
+- **Effort**:100-400 LOC,**1-3 days**
+- **ROI**:**targets decode bandwidth(0.9% of active GPU time per nsys)**,not dominant phase
+- **Evidence-based decision**:demoted from P1 priority to P2 axis until prefill optimization saturates
+- **Original plan**:`docs/plans/M_quant-kv-w4a8.md`(`1e713de`)— still valid for memory headroom but not for TTFT closure
+
+### P1.2 ⏬ — W4A8 graph capture hoist(#24) — adjacent to P1.0
 
 - **Effort**:200-400 LOC
 - **ROI**:enables W4A8 production default-on(currently gated by graph capture)
+- **Note**:helps prefill compute(W4A8 prefill -36% TTFT per `b5889b3`)→ aligns with P1.0 evidence-axis
 
-## P2 — Long-horizon(this week)
+## P2 — Long-horizon(this week,empirically demoted post `aaf0b55`)
 
-### P2.1 — M_medusa scaffold(#28)
+### P2.1 ⏬ — M_medusa scaffold(#28) — DEMOTED post nsys evidence
 
 - **Effort**:600-1200 LOC + 1 week training
 - **Plan**:`docs/plans/M_medusa.md`(`528844c`)
-- **ROI**:potentially +20-30% throughput,short-output workloads
+- **ROI claim**:potentially +20-30% throughput,short-output workloads
+- **Evidence-based note**:targets per-token decode latency(decode = 3% of active GPU per nsys),
+  NOT prefill compute(97% dominant)。15-25 day commitment risks not moving world-#1 needle。
+  Reconsider AFTER P0.2 Phase 2 dispatch closes prefill axis OR if next nsys shows decode-
+  dominance with different workload shape。
 
 ### P2.2 — M_xgrammar FFI scaffold(#26)
 
