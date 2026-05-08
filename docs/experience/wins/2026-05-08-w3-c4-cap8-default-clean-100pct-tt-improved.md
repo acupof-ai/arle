@@ -1,5 +1,20 @@
 # W3 c=4 cap=8 default LICENSED clean 100% — TTFT p50 -45% improvement
 
+> **⚠ ATTRIBUTION NOTE 2026-05-09 EOD+92**:this entry references both
+> `12300c5` cap=8 default flip + `c20b1ce` warmup max=8 as twin-commit
+> "fix"。Per 7-layer audit chain(`919c0fb` / `8d91d20` / `3fea979`):
+> **`12300c5` is the actual fix(cap=4→8 admission flip)**;**`c20b1ce`
+> is NO-OP** in production-default(num_slots=8 ≥ prefill_cap=8 →
+> max_bs = num_slots.max(8).min(256) = 8 = pre-c20b1ce max_bs)。
+>
+> The 100% turn success + TTFT -45% empirical observation is REAL,but
+> attributable to `12300c5` alone(plus possibly other simultaneous
+> changes)。**c20b1ce contribution = 0%** for production-default
+> --num-slots 8 config used in this bench。
+>
+> See `3fea979` Layer-7 closure for 4-cell A/B experiment design to
+> confirm。
+
 > Per `5cee921` EOD reference table production decision tree:cap=8
 > default at low-pressure shapes(W3 short multiturn c=4)expected to
 > work cleanly。Empirical verification confirms。

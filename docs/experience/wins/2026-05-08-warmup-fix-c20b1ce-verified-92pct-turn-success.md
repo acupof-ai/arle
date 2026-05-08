@@ -1,5 +1,28 @@
 # Warmup fix `c20b1ce` empirically validated — 91.8% turn success (up from 56-78%) + best-yet TTFT p99 -87%
 
+> **⚠ ATTRIBUTION CORRECTED 2026-05-09 EOD+92**:per 7-layer audit chain
+> (`919c0fb` / `8d91d20` / `3fea979` / `82eda25` / `e247c4f`),this entry's
+> attribution of improvement to `c20b1ce` alone is **incomplete**:
+> - **`c20b1ce` is NO-OP** when `num_slots ≥ prefill_cap` because `max_bs =
+>   num_slots.max(prefill_cap).min(256) = num_slots.min(256)`,which
+>   equals pre-c20b1ce behavior(`num_slots.min(256)`)
+> - **Layer-8 finding**:baseline runs `bwa4piqqx` had max=4(num_slots=4)
+>   while c20b1ce post-run `b1mm1k0r7` had max=16(num_slots=16)。
+>   **--num-slots changed simultaneously,not just c20b1ce**
+> - True attribution likely combines:(a)`12300c5` cap=4→8 admission flip
+>   (b)larger num_slots(more decode batch sizes warmed via existing
+>   slot loop in warmup.rs:75-82,independent of c20b1ce)(c)other
+>   simultaneous changes
+> - **Controlled A/B at fixed num_slots needed** to isolate c20b1ce
+>   contribution。Without it,this entry's "c20b1ce empirically validated"
+>   framing is **hypothesis,not evidence**
+>
+> Observed bench data REAL(76→91.8%→100% turn success across runs);
+> CAUSAL ATTRIBUTION to c20b1ce alone unsupported per EOD+92 audit chain。
+> Proper attribution requires 4-cell A/B per `3fea979` brief。
+>
+> Original entry preserved below for historical record。
+
 > Codex `c20b1ce` warmup fix landed in response to `db20d34` H4 root
 > cause + `3cd3494` Step 1 evidence。Warmup now respects
 > `model.max_concurrent_prefill_requests`,pre-capturing batch sizes
