@@ -76,33 +76,54 @@ ARLE 服务以下 3 类用户(优先级排序):
 
 ### §1.2.1 量化全套优先(2026-05-08 user directive override)
 
-**~~量化是后置工程~~** 已 supersede。User 2026-05-08 explicit directive:
-"支持好量化算子 w4a8 可接受 fp4 是未来的主流" + "支持好全套算子"。
+**~~量化是后置工程~~** 已 supersede。User 2026-05-08 explicit directives:
+- "支持好量化算子 w4a8 可接受 fp4 是未来的主流"
+- "支持好全套算子"
+- **"先做 FP8 量化支持(硬件最普遍),KV 走 W4A8"**
 
-ARLE 量化全套范围(per [`docs/plans/M_quant-fp8-w4-magnitude-path.md`](../plans/M_quant-fp8-w4-magnitude-path.md)):
+### §1.2.1.A Weight quantization axis(P0 = FP8)
 
-| Path | 状态 | sm_89 viable | sm_100+ |
+硬件最普遍 native FP8 mma(sm_89 Ada / sm_90 Hopper / sm_100 Blackwell 都有)。
+
+| Weight format | 状态 | sm_89 viable | sm_100+ |
 |---|---|---|---|
 | BF16(baseline)| ✅ production | ✅ | ✅ |
-| FP8 KV cache | ✅ production | ✅ Ada FP8 mma | ✅ |
-| INT8 KV + decode | ✅ production | ✅ | ✅ |
-| TurboQuant W2/W3/W4 | ✅ production | ✅ | ✅ |
-| GPTQ W4A16(Marlin)| ✅ production | ✅ | ✅ |
-| AWQ W4A16(Marlin)| ✅ production | ✅ | ✅ |
-| GGUF Q4_K_M etc. | ✅ Qwen3.5 only(host)| 加速可选 | 同 |
-| **W8A8 (FP8 weight + FP8 activation)** | 🔴 **plan land,cuBLASLt smoke 1.88× KILL** | cutlass direct 待验证(#28)| ✅ |
-| **W4A8 (W4 + FP8 activation)** | 📋 plan(#26)| stack on W8A8 | ✅ |
-| **W4A8 (W4 + INT8 activation)** | 📋 deferred 兼容性磁道 | ⚠ sm_89 INT8 mma 不 hot | ✅ |
-| **NVFP4 (FP4 + FP8 scale + FP8 act)** | 📋 substrate (#27)| ❌ emulated 慢 | ✅ 4× compute |
-| **FP6 / FP4_E2M1 alt formats** | 待评估 | TBD | ✅ Blackwell |
-| Symmetric/Asymmetric + per-channel/per-group/per-token scale | 单选项,所有 path 通用 | ✅ | ✅ |
+| **FP8 (E4M3 weight + FP8 activation)** ⭐ **P0** | 🔴 cuBLASLt smoke 1.88× KILL,cutlass v2 待验(#28)| cutlass direct 8× 上限 | ✅ |
+| W4A_FP8(Marlin W4 + FP8 act,Phase 1 stack)| 📋 plan(#26)| stack on FP8 | ✅ |
+| W4A16(GPTQ/AWQ Marlin) | ✅ production 但未 bench(#29)| ✅ | ✅ |
+| TurboQuant W2/W3/W4 weight | ✅ production | ✅ | ✅ |
+| W4A_INT8(deferred 兼容性磁道)| 📋 deferred | ⚠ sm_89 INT8 mma 不 hot | ✅ |
+| NVFP4 (FP4 weight + FP8 scale,sm_100 only)| 📋 substrate(#27)| ❌ emulated 慢 | ✅ 4× compute |
+| FP6 / FP4_E2M1 alt formats | 待评估 | TBD | ✅ Blackwell |
+| GPTQ-Int8 / AWQ-Int8 | 待评估 | ✅ Marlin reuse | ✅ |
 
-**实证 license-or-kill**(per §0 SOLID):
-- cuBLASLt FP8 smoke 实测 1.88× sm_89 + cuda 13.2 → cuBLASLt path KILL
-- cutlass FP8 direct mma 待 smoke(#28,1h codex)→ 决定 W8A8/W4A_FP8 是否 viable
-- W4A16 (Marlin) 已 production 但**未 bench 实测**(#29)→ 验证 weight bandwidth magnitude 路径真实性
+### §1.2.1.B KV quantization axis(P0 = **W4A8**)
 
-**SOLID 工作流**:每个新 quant path 先 cheap smoke(单 GEMM 实测 vs 理论)→ 通过再 implement → bench license-or-kill → 全套 land per `M_quant-fp8-w4-magnitude-path.md` Phase 序列。
+KV cache 量化,axis 跟 weight quant 正交。"W4A8" = K/V 存 4-bit + attention 内部 8-bit activation。
+
+| KV format | 状态 | KV bytes/token (Qwen3-4B 36L 8KV-heads 80d) | KV pool 容量 (16GB) |
+|---|---|---|---|
+| BF16 KV (baseline) | ✅ production | 92 KB / token / ctx | ~21k tokens cap |
+| FP8 KV(E4M3)| ✅ production | 46 KB | ~42k |
+| INT8 KV | ✅ production | 46 KB | ~42k |
+| **W4A8 KV(INT4 K/V + FP8 attention)** ⭐ **P0** | 📋 plan,需 new kernel `decode_attention_w4_a_fp8` | **23 KB** | **~84k** |
+| TurboQuant W2/W3 KV | ✅ production | 12-17 KB | ~110-160k |
+| INT2 KV(extreme)| ❌ accuracy 风险 | 11 KB | ~170k |
+
+**W4A8 KV 收益**(formula):
+- KV pool 容量 4× → 长 ctx / 高 concurrency 直接 +4×
+- decode KV read bandwidth -4× → ITL 减 0.42 ms(BF16 0.56 → W4 0.14 ms)
+  对 4k ctx 占比小,但 32k+ ctx KV bandwidth 占 ITL 主导,**收益放大到 magnitude scale**
+- attention compute (QK^T + softmax × V) 走 FP8 mma,sm_89 native
+
+### §1.2.1.C 实证 license-or-kill(per §0 SOLID)
+
+- cuBLASLt FP8 smoke 实测 1.88× sm_89 + cuda 13.2 → **cuBLASLt path KILL**
+- cutlass FP8 direct mma 待 smoke(#28,1h codex)→ 决定 weight FP8 axis 是否 viable
+- W4A16 (Marlin) 已 production 但**未 bench 实测**(#29)→ 验证 weight bandwidth magnitude 真实性
+- W4A8 KV new kernel(待 plan)→ 在 long ctx workload 验证 KV bandwidth magnitude
+
+**SOLID 工作流**:每个新 quant path 先 cheap smoke(单 GEMM/单 attention 实测 vs 理论)→ 通过再 implement → bench license-or-kill → 全套 land per `M_quant-fp8-w4-magnitude-path.md` Phase 序列。
 
 ---
 
