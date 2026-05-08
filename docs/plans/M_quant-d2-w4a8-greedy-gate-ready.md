@@ -11,7 +11,7 @@ End-to-end loader chain audited complete:
 1. `scripts/convert_gptq_w4a16_to_w4a8_marlin.py`(via `pack_w4a8(gptq_scales=...)`)
    - Writes safetensors with `marlin_w4a8_*` naming
    - **Patches `config.json` with `quantization_config: {quant_type: marlin_w4a8, group_size: 128}`**(per latest script edit)
-   - Writes `quantize_config.json` with full provenance
+   - Does not write `quantize_config.json`; that file would force the GPTQ loader branch and disable `marlin_w4a8`
 2. Loader detection at `infer/src/weight_loader.rs:514`:
    ```rust
    Ok("marlin_w4a8" | "w4a8_marlin")
@@ -31,27 +31,36 @@ end-to-end correctness validation。
 ## Step 1 — Convert checkpoint(5-10 min CPU)
 
 ```bash
+.venv/bin/python scripts/convert_gptq.py \
+    infer/models/Qwen3-4B-GPTQ-Int4 \
+    --output infer/models/Qwen3-4B-GPTQ-Int4-converted-zpfix
+
 .venv/bin/python scripts/convert_gptq_w4a16_to_w4a8_marlin.py \
-    --src infer/models/Qwen3-4B-GPTQ-Int4-marlin \
+    --src infer/models/Qwen3-4B-GPTQ-Int4-converted-zpfix \
     --dst infer/models/Qwen3-4B-GPTQ-W4A8-marlin \
     --groupsize 128
 ```
 
 Expected output:
+- `convert_gptq.py` decodes GPTQ `qzeros` with the required `+1` zero-point offset
 - `~250 layers re-packed`
 - First re-pack reports shapes:e.g. `qweight=[160, 5120] s_channel=[1, 2560] s_group=[20, 2560]`
 - Saves `model.safetensors`(~2.66 GB)
 - Patches `config.json` with `quantization_config: marlin_w4a8`
-- Writes `quantize_config.json`
+- Does not write `quantize_config.json`; W4A8 loader detection uses the
+  inline `config.json` `quantization_config`.
 
 If existing dst exists,delete first:`rm -rf infer/models/Qwen3-4B-GPTQ-W4A8-marlin/`
 
 ## Step 2 — Greedy consistency gate(~1-2 min GPU)
 
 ```bash
-INFER_TEST_MODEL_PATH=infer/models/Qwen3-4B-GPTQ-W4A8-marlin \
+INFER_TEST_W4A8_MODEL_PATH=infer/models/Qwen3-4B-GPTQ-W4A8-marlin \
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+TORCH_CUDA_ARCH_LIST=8.9 \
     cargo test --release -p infer --features cuda \
-    --test greedy_consistency::test_w4a8_vs_bf16_token_diff
+    --test greedy_consistency test_w4a8_vs_bf16_token_diff -- --nocapture
 ```
 
 ### Decision tree

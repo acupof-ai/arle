@@ -128,3 +128,22 @@ running the kernel against BOTH pack outputs and comparing to FP
 reference forward。Skill v1.3.0:**three-way verification(pack A,pack
 B,kernel)is required for cross-mode quant validation**,not just
 two-way A↔A round-trip。
+
+## 2026-05-08 Update - Superseded by Converter Source Bug
+
+The direct naive-vs-GPTQ pack diff remains factual, but it was not the
+cause of the token-id-0 garbage. A follow-up kernel-side check showed
+PR #31 W4A8 Marlin reads the GPTQ-aware packed tensors correctly for
+single-layer projections. The end-to-end failure came from the W4A16
+source checkpoint produced by `scripts/convert_gptq.py`: GPTQ `qzeros`
+were decoded as stored zero-points instead of `(stored + 1)`.
+
+With the corrected converter:
+- W4A16 source no longer emits `!`/garbage and passes
+  `test_greedy_solo_vs_concurrent`.
+- W4A8 repacked from that source passes
+  `test_w4a8_vs_bf16_token_diff` with 32/32 token match against BF16.
+
+Rule refinement: pack-mode tensor diffs are not sufficient to blame the
+kernel. Always first validate the upstream converted W4A16 source quality
+before debugging a downstream W4A8 repack.

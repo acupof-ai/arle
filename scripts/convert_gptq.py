@@ -51,7 +51,9 @@ def unpack_gptq_weight(qweight, qzeros, scales, bits=4, group_size=128):
     # Vectorized unpack zeros: [G, N//8] int32 → [G, N]
     # Each int32 in qzeros[g, n_pack] holds 8 zero-points for n_pack*8..n_pack*8+7
     z_expanded = (qzeros.unsqueeze(2) >> shifts.view(1, 1, -1)) & mask  # [G, N//8, 8]
-    zeros_unpacked = z_expanded.reshape(num_groups, N)  # [G, N]
+    # GPTQ/AutoGPTQ-family checkpoints store zero-points as (zero - 1).
+    # Convert back to the real zero before applying the signed transform.
+    zeros_unpacked = z_expanded.reshape(num_groups, N) + 1  # [G, N]
 
     # Apply zero-point: signed_val = unsigned_val - zero_point, clamped to [-8, 7]
     # Expand zeros to [K, N] by repeating per group

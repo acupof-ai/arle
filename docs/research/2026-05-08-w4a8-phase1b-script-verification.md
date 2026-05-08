@@ -30,13 +30,18 @@ Output shapes match `pack_w4a8` convention exactly:
 
 ### Step 1 — Convert Qwen3-4B checkpoint(~5-10 min CPU)
 ```bash
+.venv/bin/python scripts/convert_gptq.py \
+    infer/models/Qwen3-4B-GPTQ-Int4 \
+    --output infer/models/Qwen3-4B-GPTQ-Int4-converted-zpfix
+
 .venv/bin/python scripts/convert_gptq_w4a16_to_w4a8_marlin.py \
-    --src infer/models/Qwen3-4B-GPTQ-Int4-marlin \
+    --src infer/models/Qwen3-4B-GPTQ-Int4-converted-zpfix \
     --dst infer/models/Qwen3-4B-GPTQ-W4A8-marlin
 ```
 
 Expected:
-- Reads ~1154 tensors from src safetensors
+- First step decodes GPTQ `qzeros` with the required `+1` zero-point offset
+- Reads corrected internal W4A16 `*.qweight` and `*.scales` tensors from src safetensors
 - Repacks each `*.qweight` Linear via repack_w4a16_to_w4a8
 - Writes new safetensors with `marlin_w4a8_*` naming convention
 - Copies non-quantized tensors (embed/lm_head/biases) unchanged
@@ -53,9 +58,12 @@ already confirmed in `0be5967` verbose verification)。
 
 ### Step 3 — Greedy_consistency gate(~1-2 min GPU)
 ```bash
-INFER_TEST_MODEL_PATH=infer/models/Qwen3-4B-GPTQ-W4A8-marlin \
+INFER_TEST_W4A8_MODEL_PATH=infer/models/Qwen3-4B-GPTQ-W4A8-marlin \
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
+TORCH_CUDA_ARCH_LIST=8.9 \
     cargo test --release -p infer --features cuda \
-    --test greedy_consistency::test_w4a8_vs_bf16_token_diff
+    --test greedy_consistency test_w4a8_vs_bf16_token_diff -- --nocapture
 ```
 
 **Expected outcomes**:
