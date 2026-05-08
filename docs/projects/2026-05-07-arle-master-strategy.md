@@ -22,15 +22,33 @@
   `kshitijthakkar/deepseek-v4-mini-1B-init` 为唯一架构真理),**当前 ARLE
   deepseek-spec V4 操作覆盖 = 0%**(V3/MLA scaffold,需大改才能解析 V4 config)
 
-**Defensible moat = 5 项 capability 组合**(2 项 ✓ 已具备,3 项 ⏳ 待 land):
-Rust hot path ✓ + TileLang 自定义 attention ✓ + Piecewise Prefill CUDA Graph ⏳
-+ Speculative decoding(Medusa)⏳ + Grammar 约束(xgrammar FFI)⏳。**没有
-任何竞品同时具备 5 项**,但当前 moat 是 forward-looking 而非现实 — 必须
-执行交付 3 项 plan。
+**Defensible moat = 5 项 capability 组合**(2 项 ✓ 已具备,Piecewise Prefill
+Graph Phase 0 已 KILL,2 项 ⏳ 待 land):Rust hot path ✓ + TileLang 自定义
+attention ✓ + ~~Piecewise Prefill CUDA Graph~~ ❌(`8b4a03b` Phase 0 KILL,
+sm_89 4k longctx kernel time 不 binding,3 confirmed)+ **Speculative
+decoding(Medusa)⏳** + Grammar 约束(xgrammar FFI)⏳ + **量化全套 ⏳**
+(2026-05-08 user directive)。
+
+### §0.1 主战场 3 axis(2026-05-08 user explicit directive)
+
+> "要做好 agent workload,量化和投机是主战场"
+
+| Axis | 状态 | 关键 plan |
+|---|---|---|
+| **Axis 1 — Agent workload(W3/W4)** | ⏳ baseline 待跑 | `2026-05-02-agent-load-bench-spec.md` + `bench_agent_trace.py`(已 infra) |
+| **Axis 2 — 量化全套** | 🔴 cuBLASLt FP8 KILL,cutlass v2 待 smoke | [`M_quant-fp8-w4-magnitude-path.md`](../plans/M_quant-fp8-w4-magnitude-path.md) §1.2.1 全套 inventory |
+| **Axis 3 — Speculative decoding(Medusa / EAGLE / DFlash)** | substrate 已有 `infer/src/speculative.rs`,production 状态待 audit | TODO plan(本 doc 暂未列) |
+
+**非主战场(deprecated for sprint focus)**:
+- Piecewise Prefill CUDA Graph(`8b4a03b` Phase 0 KILL,3 个 independent confirm "kernel time not binding")
+- canonical 4-shape benchmark 单点优化(`8b4a03b` `f76ccc4` 等 6 KILL 全是错的 workload 上做的)
 
 **最终 product-market fit 验证**:DSV4 训出来后,**ARLE 推理侧能直接 serve
 自训 DSV4** — 这是真正的"训练-推理一体"护城河,内部模型不经过 PyTorch/HF
 transformers 中转。
+
+每个主战场 axis 必须在 agent workload(W3/W4)上验证 magnitude 收益,不在
+canonical 4-shape 上自欺。
 
 ---
 
