@@ -548,6 +548,34 @@ Each anti-pattern has a project commit/entry where it was paid for.
       Workload classification matters: shape × cap × concurrency ×
       prompt-length all factor into bimodal trigger.
 
+18. **Phase 0 substrate audit before scoping new wiring**
+    - Caught by: `1217375` A1 audit — codex's original B3 Step 2 plan
+      (`c0ddd4f`) added `Arc<RwLock<RadixCache>>` field to
+      `SchedulerHandle`, violating backend isolation. Code-grep revealed
+      `runtime/admission.rs:187/193/741` ALREADY production-wires
+      `lookup_or_stage` returning matched_tokens — exactly what Step 2
+      needs. Refined architecture: integrate at CUDA-runtime admission
+      (NOT HTTP-layer SchedulerHandle).
+    - Without methodology, "new wiring" plans assume from-scratch
+      implementation when adjacent code paths already provide the data.
+      Wrong-layer plumbing violates backend isolation OR duplicates
+      existing work.
+    - Fix: Phase 0 reconnaissance ALWAYS audits the CLOSEST production-
+      wired layer that touches the dependency before scoping. For
+      "needs RadixCache" features, check:
+      (1) Is RadixCache already accessed in production scheduler path?
+      (2) Where exactly (HTTP handle, scheduler core, runtime admission)?
+      (3) What does that path return that we can reuse?
+    - Generalizes to ALL substrate dependencies (KV pool, allocator,
+      tokenizer, kernel cache, paged buffers): inventory existing
+      production wiring BEFORE designing new field/method/cross-layer
+      access. Saved 70-100 LOC (30% scope reduction) + 0.5d wall-time
+      on B3 Step 2 by routing through existing `lookup_or_stage`
+      instead of duplicating at SchedulerHandle level.
+    - Companion to anti-pattern #14 (upstream parser audit) and #16
+      (implicit-coupling-via-shared-default): all three share the
+      "audit existing before scoping new" methodology core.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -631,6 +659,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.4.0** | **2026-05-08** | **14** | **`6c627c4` added #14 (upstream-data parser silent corruption per `5593865` qzeros bug)** |
 | **v1.5.0** | **2026-05-08** | **17** | **`f05ea3a` added #15-17 from cap=8 chain** |
 | **v1.5.1** | **2026-05-08** | **17(refined)** | **`9f65b4d` #17 workload-shape refinement per `063da81`** |
+| **v1.6.0** | **2026-05-09** | **18** | **(this commit)added #18 Phase 0 substrate audit per `1217375` A1 audit + B3 Step 2 -30% scope** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
