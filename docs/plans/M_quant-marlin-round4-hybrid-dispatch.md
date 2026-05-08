@@ -192,6 +192,21 @@ Trigger sequence:
 
 If codex's W4A8 already includes a similar batch threshold for W4A8 routing, this plan extends the same threshold to W4A16 — single edit, zero new design.
 
+## Tick log (audit trail)
+
+Each tick that revisits this plan logs the conflict-gate status here so the
+"Codex W4A8 commit" trigger fires unambiguously when the file leaves WIP.
+
+| Tick (ISO) | linear.rs WIP? | Codex state | Notes |
+|---|---|---|---|
+| 2026-05-08 ~11:55 | YES | `codex review --uncommitted` (16m) | Plan written (`1c534e6`) |
+| 2026-05-08 ~12:07 | YES | `codex review --uncommitted` (28m, codex edited linear.rs:136-138 group_size constraint) | Conflict still active; brief queued to codex tmux 0:0 |
+| 2026-05-08 ~12:12 | YES (5 files: linear.rs + gemm.rs ffi + quant.rs + 2 new C kernels) | review continues (32m) | Self-loop ScheduleWakeup armed; auto re-checks every ~270s |
+
+When this table shows `NO` for `linear.rs WIP`, Claude proceeds Phase 5
+without further confirmation: rebase → apply 10-LOC edit → `cargo build`
+→ bench → license-or-kill per Phase 8.
+
 ## Cross-references
 
 - Round 4 prep: [`docs/experience/errors/2026-05-08-marlin-w4a16-bench-implementation-gap.md`](../experience/errors/2026-05-08-marlin-w4a16-bench-implementation-gap.md) (`b3f22ea`)
