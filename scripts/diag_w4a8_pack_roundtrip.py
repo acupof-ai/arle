@@ -69,6 +69,93 @@ def load_pack_module():
     return mod
 
 
+def reference_w4a8_get_perms(groupsize: int, k: int):
+    """PR #31 W4A8Layer._get_perms, copied for verbose comparison."""
+    perm = []
+    for i in range(32):
+        perm1 = []
+        col = i // 4
+        for block in [0, 1]:
+            for row in [
+                4 * (i % 4),
+                4 * (i % 4) + 1,
+                4 * (i % 4) + 2,
+                4 * (i % 4) + 3,
+            ]:
+                perm1.append(16 * row + col + 8 * block)
+        for j in range(4):
+            perm.extend([p + 256 * j for p in perm1])
+
+    perm = np.array(perm)
+    if groupsize == k:
+        interleave = np.array([4, 0, 5, 1, 6, 2, 7, 3])
+    else:
+        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    perm = perm.reshape((-1, 8))[:, interleave].ravel()
+    scale_perm = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single = []
+    for i in range(4):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    return torch.from_numpy(perm), scale_perm, scale_perm_single
+
+
+def pack_w4a8_with_intermediates(
+    weight: torch.Tensor,
+    groupsize: int,
+    perm: torch.Tensor,
+    scale_perm: list,
+    scale_perm_single: list,
+):
+    """Pack using the W4A8Layer flow and retain scale-chain intermediates."""
+    weight = weight.to(dtype=torch.float16, device="cpu").contiguous()
+    n, k = weight.shape
+    tile = 16
+
+    ref = weight.t().contiguous()
+    s_channel_raw = ref.t().abs().amax(dim=-1, keepdim=True).div(127.0).to(torch.float32)
+    s_channel_raw = torch.where(s_channel_raw == 0, torch.ones_like(s_channel_raw), s_channel_raw)
+    s_channel_raw = s_channel_raw.reshape(1, n)
+
+    reshaped = ref.reshape(k // groupsize, groupsize, n)
+    s_raw = reshaped.abs().amax(dim=1).clamp_min(1e-6).div(7.0).to(torch.float16)
+
+    w = ref.reshape((-1, groupsize, n)).permute(1, 0, 2).reshape((groupsize, -1))
+    s_work = s_raw.reshape((1, -1))
+    w = torch.round(w / s_work).to(torch.int32)
+    w += 8
+    w = torch.clamp(w, 0, 15)
+
+    s_group_before_perm = (s_work.reshape(-1, n) / s_channel_raw).to(torch.float16)
+    w_int_layout = w.reshape((groupsize, -1, n)).permute(1, 0, 2).reshape((k, n)).contiguous()
+
+    s_group = s_group_before_perm.reshape((-1, len(scale_perm)))[:, scale_perm]
+    s_group = s_group.reshape((-1, n)).contiguous()
+    s_channel = s_channel_raw.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    s_channel = s_channel.reshape((-1, n)).contiguous()
+
+    w_tiled = w_int_layout.reshape((k // tile, tile, n // tile, tile))
+    w_tiled = w_tiled.permute((0, 2, 1, 3)).reshape((k // tile, n * tile))
+    res = w_tiled.reshape((-1, perm.numel()))[:, perm].reshape(w_tiled.shape)
+    res_np = res.cpu().numpy().astype(np.uint32)
+    q = np.zeros((res_np.shape[0], res_np.shape[1] // 8), dtype=np.uint32)
+    for i in range(8):
+        q |= res_np[:, i::8] << (4 * i)
+    qweight = torch.from_numpy(q.astype(np.int32))
+
+    debug = {
+        "s_channel_raw": s_channel_raw,
+        "s_channel_stored": s_channel,
+        "s_raw": s_raw,
+        "s_work": s_work,
+        "s_group_before_perm": s_group_before_perm,
+        "s_group_stored": s_group,
+        "w_int4_layout": w_int_layout,
+    }
+    return qweight, s_channel.contiguous(), s_group.contiguous(), debug
+
+
 def manual_unpack_w4a8(
     qweight: torch.Tensor,
     s_channel: torch.Tensor,
@@ -166,6 +253,12 @@ def main():
     parser.add_argument("--shape", type=int, nargs=2, default=[256, 128],
                         help="(out_features, in_features) — default 256 128")
     parser.add_argument("--groupsize", type=int, default=128)
+    parser.add_argument("--verbose", action="store_true",
+                        help="print scale-chain and PR #31 W4A8Layer comparison details")
+    parser.add_argument("--verbose-row", type=int, default=112,
+                        help="output-channel row to inspect in verbose mode")
+    parser.add_argument("--verbose-cols", type=int, default=16,
+                        help="number of input columns / scale columns to print in verbose mode")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -185,6 +278,47 @@ def main():
     print(f"Pack output shapes: qweight={list(qweight.shape)} dtype={qweight.dtype}")
     print(f"                    s_channel={list(s_channel.shape)} dtype={s_channel.dtype}")
     print(f"                    s_group={list(s_group.shape)} dtype={s_group.dtype}")
+
+    cur_dbg = None
+    if args.verbose:
+        dbg_q, dbg_sc, dbg_sg, cur_dbg = pack_w4a8_with_intermediates(
+            w_bf16,
+            args.groupsize,
+            perm,
+            scale_perm,
+            scale_perm_single,
+        )
+        ref_perm, ref_scale_perm, ref_scale_perm_single = reference_w4a8_get_perms(args.groupsize, k)
+        ref_q, ref_sc, ref_sg, ref_dbg = pack_w4a8_with_intermediates(
+            w_bf16,
+            args.groupsize,
+            ref_perm,
+            ref_scale_perm,
+            ref_scale_perm_single,
+        )
+        print("\nVerbose scale-chain diagnostic:")
+        print(f"  helper matches pack_w4a8 qweight: {torch.equal(dbg_q, qweight)}")
+        print(f"  helper s_channel max abs diff: {(dbg_sc - s_channel).abs().max().item():.6e}")
+        print(f"  helper s_group max abs diff: {(dbg_sg - s_group).abs().max().item():.6e}")
+        print(f"  PR #31 W4A8Layer perm equal current: {torch.equal(ref_perm, perm)}")
+        print(f"  PR #31 qweight equal current: {torch.equal(ref_q, qweight)}")
+        print(f"  PR #31 s_channel max abs diff: {(ref_sc - s_channel).abs().max().item():.6e}")
+        print(f"  PR #31 s_group max abs diff: {(ref_sg - s_group).abs().max().item():.6e}")
+
+        row = min(args.verbose_row, n - 1)
+        cols = min(args.verbose_cols, k)
+        scale_cols = min(args.verbose_cols, n)
+        print(f"  s_work shape={list(cur_dbg['s_work'].shape)} "
+              f"sample={cur_dbg['s_work'][0, :scale_cols].float().tolist()}")
+        print(f"  s_raw shape={list(cur_dbg['s_raw'].shape)} "
+              f"sample={cur_dbg['s_raw'][0, :scale_cols].float().tolist()}")
+        print(f"  s_group before scale_perm shape={list(cur_dbg['s_group_before_perm'].shape)} "
+              f"sample={cur_dbg['s_group_before_perm'][0, :scale_cols].float().tolist()}")
+        print(f"  s_group after scale_perm shape={list(cur_dbg['s_group_stored'].shape)} "
+              f"sample={cur_dbg['s_group_stored'][0, :scale_cols].float().tolist()}")
+        print(f"  s_channel raw sample={cur_dbg['s_channel_raw'][0, :scale_cols].float().tolist()}")
+        print(f"  s_channel stored sample={cur_dbg['s_channel_stored'][0, :scale_cols].float().tolist()}")
+        print(f"  w_int4 output-row {row} sample={cur_dbg['w_int4_layout'].t()[row, :cols].tolist()}")
 
     w_recovered = manual_unpack_w4a8(
         qweight, s_channel, s_group, perm, scale_perm, scale_perm_single,
@@ -208,6 +342,30 @@ def main():
     s_group_real = s_group.float() * s_channel.float()
     sg_med = s_group_real.median().item()
     expected_noise = sg_med / 2
+
+    if args.verbose and cur_dbg is not None:
+        row = min(args.verbose_row, n - 1)
+        cols = min(args.verbose_cols, k)
+        scale_cols = min(args.verbose_cols, n)
+        inv_scale_perm = np.argsort(np.array(scale_perm))
+        inv_scale_perm_single = np.argsort(np.array(scale_perm_single))
+        sg_unpermuted = (
+            s_group.cpu().float()
+            .reshape((-1, len(scale_perm)))[:, inv_scale_perm]
+            .reshape((-1, n))
+        )
+        sc_unpermuted = (
+            s_channel.cpu().float()
+            .reshape((-1, len(scale_perm_single)))[:, inv_scale_perm_single]
+            .reshape((-1, n))
+        )
+        sg_real_unpermuted = sg_unpermuted * sc_unpermuted
+        scale_ratio = sg_real_unpermuted / cur_dbg["s_raw"].float()
+        print(f"  reconstructed s_group_real max abs diff vs s_raw: "
+              f"{(sg_real_unpermuted - cur_dbg['s_raw'].float()).abs().max().item():.6e}")
+        print(f"  reconstructed/raw scale ratio sample={scale_ratio[0, :scale_cols].tolist()}")
+        print(f"  original output-row {row} sample={w_orig[row, :cols].tolist()}")
+        print(f"  recovered output-row {row} sample={w_recovered[row, :cols].tolist()}")
 
     print(f"\nRound-trip diagnostic:")
     print(f"  max abs diff   = {max_abs:.6e}  (expected ~{expected_noise:.4e})")
