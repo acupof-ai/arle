@@ -122,6 +122,35 @@ struct PrefillBudget {
     page_budget: PageBudget,
 }
 
+fn reserve_decode_headroom_for_slots(
+    page_budget: &mut PageBudget,
+    decode_slots: &[usize],
+    mut remaining_tokens: impl FnMut(usize) -> usize,
+) {
+    for &slot_idx in decode_slots {
+        let remaining = remaining_tokens(slot_idx);
+        if remaining > 0 {
+            page_budget.reserve_growth(PageGrowth {
+                slot_idx,
+                tokens: remaining,
+            });
+        }
+    }
+}
+
+fn decode_reservation_slots<M: ModelForward>(scheduler: &Scheduler<M>) -> Vec<usize> {
+    scheduler
+        .running_batch
+        .iter()
+        .filter(|&&slot_idx| {
+            scheduler.request(slot_idx).is_some_and(|req| {
+                matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
+            })
+        })
+        .copied()
+        .collect()
+}
+
 impl PrefillBudget {
     fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
         let decode_slots: Vec<usize> = scheduler
@@ -157,15 +186,12 @@ impl PrefillBudget {
             decode_active: !decode_slots.is_empty(),
             page_budget: PageBudget::from_scheduler(scheduler, true),
         };
-        for &slot_idx in &scheduler.running_batch {
-            let remaining = scheduler.remaining_decode_reservation_tokens(slot_idx);
-            if remaining > 0 {
-                budget.page_budget.reserve_growth(PageGrowth {
-                    slot_idx,
-                    tokens: remaining,
-                });
-            }
-        }
+        let reservation_slots = decode_reservation_slots(scheduler);
+        reserve_decode_headroom_for_slots(
+            &mut budget.page_budget,
+            &reservation_slots,
+            |slot_idx| scheduler.remaining_decode_reservation_tokens(slot_idx),
+        );
         budget
     }
 
@@ -802,8 +828,9 @@ impl<M: ModelForward> Scheduler<M> {
 mod tests {
     use super::{
         PrefillBudget, PrefillCandidate, PrefillCandidateScore, PrefillReservation,
-        ScoredPrefillCandidate, StepPlan, cap_prefill_candidates_by_tokens, route_spec_plan,
-        score_prefill_candidates, select_prefill_candidates,
+        ScoredPrefillCandidate, StepPlan, cap_prefill_candidates_by_tokens,
+        reserve_decode_headroom_for_slots, route_spec_plan, score_prefill_candidates,
+        select_prefill_candidates,
     };
     use crate::scheduler::cuda::budget::{PageBudget, PageGrowth, StepTokenBudget};
 
@@ -935,6 +962,33 @@ mod tests {
 
         assert!(!page_budget.can_fit_growth(PageGrowth {
             slot_idx: 1,
+            tokens: 4,
+        }));
+    }
+
+    #[test]
+    fn prefill_budget_reserves_headroom_for_decode_reservation_slots() {
+        let mut page_budget = PageBudget::new(2, vec![4, 0, 0], 4, true);
+
+        reserve_decode_headroom_for_slots(&mut page_budget, &[0], |slot_idx| match slot_idx {
+            0 => 1,
+            1 => 4_096,
+            _ => 0,
+        });
+
+        assert!(page_budget.can_fit_growth(PageGrowth {
+            slot_idx: 1,
+            tokens: 4,
+        }));
+
+        // Slot 1 models an active decode row that is temporarily not runnable,
+        // for example while stop-string emit gating waits for the stream worker.
+        reserve_decode_headroom_for_slots(&mut page_budget, &[1], |slot_idx| match slot_idx {
+            1 => 4_096,
+            _ => 0,
+        });
+        assert!(!page_budget.can_fit_growth(PageGrowth {
+            slot_idx: 2,
             tokens: 4,
         }));
     }
