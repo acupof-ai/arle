@@ -279,6 +279,79 @@ combined path (M_quant Phase 1) is gated on either fixing this or pivoting
 to a different W4 kernel (e.g., Machete from Neural Magic, or porting
 sgl-kernel's own W4 path)".
 
+## Round 4 prep — W4A16BatchGemv source survey + decode-only dispatch hypothesis (2026-05-08)
+
+While codex 0:0 implements W4A8 (`marlin_w4a8_kernel.cu` + `w4a8_activation_quant.cu` + 5 host edits, in-flight per `git status`), Claude surveyed the existing W4A16BatchGemv path to ground Round 4 #6.
+
+### Source survey
+
+- `infer/src/ops/linear.rs:909-911` calls `ffi::w4a16_gemv_batch_cuda(wptr, sptr, xptr, yptr, batch, n, k, group_size, stream)`.
+- FFI signature in `crates/cuda-kernels/src/ffi/gemm.rs:149`: `*const Half`, `*mut Half`, scales `*const Half`.
+- **`Half` = `__nv_bfloat16`** confirmed via sibling kernel
+  `crates/cuda-kernels/csrc/gemm/turboquant_weight_gemv.cu:82-83,224-236` —
+  Rust `ffi::Half` is the BF16 type, not IEEE754 FP16.
+- Therefore: **W4A16BatchGemv is BF16-native end-to-end**. No `bf16_to_fp16` /
+  `fp16_to_bf16` round-trip, no `alloc_zeros` for conversion buffers, no workspace
+  zero-init.
+
+### Per-call launch density (matched contrast)
+
+| Path | Launches per linear call | Source |
+|---|---:|---|
+| **`MarlinW4Gemm`** (`run_marlin_w4_gemm`) | **6** | linear.rs:660-739 — alloc_zeros×3 + bf16_to_fp16 + marlin_gemm + fp16_to_bf16 |
+| **`W4A16BatchGemv`** (`run_qweight_linear`) | **1** | linear.rs:909-911 — single FFI call |
+
+5 surplus launches per Marlin call. Round 2 confirmed `alloc_zeros` ≈ free
+(cudarc pool elides cudaMemsetAsync). Surviving cost per Marlin call:
+1 conversion-in + 1 conversion-out + 1 GEMM = **3 launches vs 1**.
+
+### Phase 4 formula (Round 4 #6 prediction)
+
+```
+Per linear call surplus = 2 elementwise conversion launches × ~5-10us = 10-20us
+Per token decode: 252 GEMMs × 15us = 3.8 ms (low end) to 5.0 ms (high end)
+Predicted ITL: 18.13 - 4 ≈ 14.1 ms → 1.37× vs BF16 baseline (below license 1.5×)
+Predicted ITL aggressive: 18.13 - 6 ≈ 12.1 ms → 1.59× vs BF16 (above license)
+```
+
+License-band straddler. Worth running.
+
+### Phase 7 tradeoffs (Round 4 #6 specific)
+
+| Axis | Status | Rationale |
+|---|---|---|
+| **Decode (M ≤ 8) launch overhead** | W4A16BatchGemv expected to win | Compute trivial at M=4; per-launch fixed cost dominates; saving 2 launches/call ≈ 5-10% per-token speedup |
+| **Prefill (M = 2048) compute** | Marlin expected to win | Ada FP16 tensor cores 706 TFLOPS; CUDA-core GEMV path won't approach that throughput at large M |
+| **Numerical correctness** | unverified | greedy_consistency BF16 vs Marlin vs W4A16BatchGemv — TBD |
+| **Dispatch surface** | minor | One-line edit per `linear.rs:65-93` to add `(_, W4A16) if batch <= K => W4A16BatchGemv` arm |
+| **Code complexity** | minor | Three-way branch instead of two-way |
+
+**Optimal dispatch hypothesis (Round 4 #6.b)**:
+- `batch <= 8` (decode + small batch): W4A16BatchGemv (BF16 native, low launch overhead)
+- `batch > 8` (prefill): Marlin (tensor core throughput)
+- Threshold `K=8` matches existing `(2..=8, GgufQ4K)` decode-batch convention.
+
+This gives Marlin its compute advantage at prefill AND avoids its launch overhead at decode — the structural tradeoff Marlin's BF16↔FP16 round-trip imposes.
+
+### Round 4 hand-off note for codex
+
+Codex's W4A8 work likely faces the same dispatch question. The grounded answer per this survey:
+
+- For W4A8 batched paths, mirror the same hybrid: large-batch (prefill) → Marlin-style W4A8 with FP8 mma; small-batch (decode) → custom W4A8 BF16-native GEMV (or W4A16 fallback if W4A8 GEMV not implemented).
+- The activation quantization kernel (`w4a8_activation_quant.cu`) needs the same matched-A/B per skill: matched control = same checkpoint, same workload, single-variable = activation BF16 vs FP8 quant only.
+
+### Cumulative state (4 rounds + survey)
+
+| Round | Test | Outcome |
+|---|---|---|
+| 1 | Marlin vs BF16 baseline | 1.06× (predicted 1.86×) — implementation gap |
+| 2 | alloc_zeros skip | NULL — cudarc pool elides |
+| 3 | sym variant swap | NULL — checkpoint not the issue |
+| 4 prep | W4A16BatchGemv source survey | BF16 native + 1 launch/call vs Marlin's 3 — 2-launch surplus per Marlin GEMM is the surviving suspect |
+| 4 (TODO) | Decode-only W4A16BatchGemv dispatch override + bench | Predicted 1.37-1.59× ITL straddling license 1.5× |
+
+Surviving cost per Round so far: ~30 min wall-clock. Next round (#6) needs ~10 LOC edit + 1 build + 1 bench ≈ 5 min.
+
 ## Cross-references
 
 - Skill: `.claude/skills/kernel-optimization/SKILL.md` (`faffcb0`)
