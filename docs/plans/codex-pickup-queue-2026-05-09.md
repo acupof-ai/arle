@@ -23,7 +23,7 @@
 | **B3 Step 2 PrefixAwareAdmission** | ✅ **LICENSED -24.2% TTFT** σ/mean=4.5% | `b85929b` + wins entry `docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md` |
 | **P0.2 Hybrid Phase 1b loader** | ✅ **LANDED**(loader-only,Phase 2 dispatch deferred) | `232aed5` + wins entry `docs/experience/wins/2026-05-09-bench-hybrid-phase1b-loader.md`(TTFT p50 68.4ms regression gate PASS) |
 | Skill v1.4.0 → v1.7.0 | ✅ +6 anti-patterns | `c768b70` |
-| **Skill v1.8.0 anti-pattern bank**(deferred batch) | 🟡 **3 candidates ready,batch trigger ready** | `c076aae` #20 + `153fd93` #21 + `8d91d20` #22 |
+| **Skill v1.8.0 anti-pattern bank**(deferred batch) | 🟡 **5 candidates ready,batch trigger pending** | #20 hypothesis-inheritance(`c076aae`)+ #21 recipe-itself audit(`b55bfcd` + `153fd93`)+ #22 twin-commit attribution(`919c0fb` + `8d91d20` + `3fea979`)+ #23 truncated-output partial-view(`156d2c2`)+ #24 cell-collapse blindness(`1ccb448`) |
 | **Wins-entry re-attribution gap**(c20b1ce NO-OP)| 🟡 3 entries need invalidation/re-attribution | `8d91d20` empirical triage |
 | Codex pickup directives | ✅ this doc | (current) |
 
@@ -60,6 +60,7 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 23 | **Codex — P0.2 SUBSTRATE LANDED**(`feat(cuda): load hybrid W4 Marlin side tensors`)| `232aed5` | **Phase 1b loader-only,reject hybrid at linear dispatch,warmup.rs reverted to `num_slots.min(256)`,5 src + wins entry**;bench TTFT p50 68.4ms regression gate PASS |
 | 24 | Claude — current main = cell (c) state verified by code-grep | `717b304` | Partial H7-A evidence collected:cell (c) at c=1 PASS + cell (b) historical 100% turn success(annotated) |
 | 25 | Codex — cell (d) recipe with kill criterion(12300c5 attribution) | `1bf408d` | Step-by-step revert recipe + Layer-8 num_slots=8 gate enforcement + restore step;most informative single remaining experiment |
+| 26 | Codex — **cell (a) ≡ cell (d) post-P0.2** — 4-cell collapses to 1 experiment | `1ccb448` | Cell-collapse blindness anti-pattern #24 candidate;saved tomorrow's pickup duplicate experiment; **net empirical work = 1 experiment** |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
@@ -101,7 +102,7 @@ the bimodal-root-cause assumption baseline before Phase 1 invests effort。
 | (b) | ✅ Historical bench data + annotation | Pre-`232aed5` main 100% turn success per annotated wins entries |
 | **(c)** | ✅ Code-grep verified post `232aed5` | Current main = cell (c)。c=1 partial bench PASS。**W3 c=4 cap=8 verify needed**(~10 min Claude bench) |
 | **(d)** | 📋 **Recipe ready** | `docs/research/2026-05-09-eod98-cell-d-recipe-12300c5-attribution-kill-criterion.md`(`1bf408d`)— sed `Some(8)→Some(4)`,build,bench,restore(~30 min) |
-| (a) | 🟡 Pending recipe | Revert BOTH(`git revert 232aed5 12300c5`),build,bench,restore(~30 min) |
+| (a) | ❌ **Redundant per `1ccb448`** | Cell (a) ≡ Cell (d) post-P0.2(c20b1ce already reverted by `232aed5`)→ same single experiment closes both cells |
 
 ## ⚠ STRATEGIC RE-ORDERING(2026-05-09 EOD)— per codex `d2c2c17`
 
