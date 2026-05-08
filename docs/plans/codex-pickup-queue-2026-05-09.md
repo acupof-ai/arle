@@ -24,6 +24,41 @@
 | Skill v1.4.0 → v1.7.0 | ✅ +6 anti-patterns | `c768b70` |
 | Codex pickup directives | ✅ this doc | (current) |
 
+## ⚠ STRATEGIC RE-ORDERING(2026-05-09 EOD)— per codex `d2c2c17`
+
+**Per codex strategic axis-ROI brief**(`docs/research/2026-05-09-eod83-post-b3-strategic-next-axis-roi.md`,`d2c2c17`):
+
+> B3 Step 2 closes **only 1/3 of multi-tenant gap**(241ms vs world-#1 121ms target = still 1.99× gap)。
+> Long-ctx 4k/8k 2× gaps **unchanged**(B3 doesn't help)。
+> **SOLID gap**:none of P1(KV W4A8 / Medusa / P0.2 / P0.3)directly targets multi-tenant median TTFT gap。
+> **Risk**:burning 15-25d on KV W4A8 + Medusa,still find world-#1 gap unchanged。
+
+### P0.0 — Phase 1 evidence decomposition(NEW priority,blocks P1 axis lock-in)
+
+**Effort**:0.5-1d Claude-side
+**ROI**:30:1 risk-adjusted return — unblocks 15-25d P1 axis decisions
+**File**:None;analysis-only(produces research entry + axis re-prioritization)
+
+**Phase 1.A** — multi-tenant 241ms TTFT nvtx decomposition:
+- Add nvtx ranges around 4 phases:`prefix::lookup`,`prefill::compute`,
+  `first_decode::compute`,`scheduling::overhead`
+- Run multi-tenant burst,nsys 30s
+- **Use absolute ms not NVTX-window % per §0 SOLID rule 6**(2026-05-08 EOD+19 framing trap)
+
+**Phase 1.B** — SGLang baseline verification:
+- Re-verify SGLang's 157ms multi-tenant + 973ms 4k long-ctx baselines on
+  identical hw(possible SGLang shipped optimizations 2026-05-07 → today)
+- If SGLang baseline drifts → recompute world-#1 gap math
+
+**Decision tree post-Phase 1**:
+- If multi-tenant TTFT 60% prefix-lookup → invest radix-cache opt,deprio KV W4A8/Medusa
+- If multi-tenant TTFT 60% first-decode-attention → KV W4A8 ROI valid
+- If long-ctx 60% prefill compute → P0.2 Hybrid + chunked prefill = P0',KV W4A8 demoted
+
+**KILL criteria**:Phase 1 shows no single dominant phase(<40% any phase)→ pivot to architectural / Option D(re-target hw/model tier — ROADMAP §Next-Model)。
+
+---
+
 ## P0 — Pickup directives(cron-Claude paste-buffer ready)
 
 ### P0.1 — B3 Step 2 PrefixAwareAdmission CUDA-runtime gate ✅ LICENSED 2026-05-09
