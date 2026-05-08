@@ -121,6 +121,45 @@ RPC channel) so the cache has lifetime to engage. CLAUDE.md memory:
 `feedback_path_probe_before_perf_claim.md` already says this for
 ARLE-side perf, extends it cross-repo here.
 
+## ARLE renderer determinism — confirmed (same-day, post-bench probe)
+
+A focused probe-bench (`/tmp/m_e10_prompt_head_diff.sh`, server=fresh
+metal_serve, 2 IDENTICAL chat/completions bodies sent back-to-back)
+captures:
+
+```
+request #1: prompt_len=34 head=[248045, 8678, 198, 2523, 513, 449, 6009, 10597]
+request #2: prompt_len=34 head=[248045, 8678, 198, 2523, 513, 449, 6009, 10597]
+identical: True
+```
+
+→ **ARLE chat-template renderer IS deterministic for identical input
+bodies.** Two identical requests produce byte-identical token streams.
+
+Same probe also captured the cache state at request #2:
+```
+m_e10_trace prepare_request: ... entries_len=1 entries_keys_len_sample=[34] ...
+m_e10_trace lookup: ... memory_match_len=None disk_match_len=None
+```
+
+Cache HAS the 34-token entry from request #1 but lookup MISSES. Code
+trace at `runtime.rs:721`: `prefix_len < prompt_tokens.len()` —
+**strict less-than rejects equal-length keys**. Intentional: cache
+attach requires ≥1 residual token to decode; identical-body case has
+0 residual. **Not a bug** — production multi-turn prompts always
+grow (system + tape + new_user), so `< prompt.len()` is always
+satisfied for real eli traffic.
+
+**Triangulation summary** (combining today's three benches):
+1. ARLE renderer deterministic for identical input ✓ (this probe)
+2. ARLE lookup strict-`<` is intentional, not a bug ✓ (code trace)
+3. Real eli M_e.10 miss = per-turn system_prompt drift → `starts_with`
+   prefix mismatch → cache miss. The eli fix in
+   `cklxx/eli@d55d007` directly addresses this on the eli side
+   (Date date-only + session-cache). Subprocess-mode bench can't
+   validate because of `feedback_subprocess_mode_breaks_inprocess_cache.md`,
+   but the code path is correct.
+
 ## Next
 
 - **Daemon-mode bench harness**: extend `bench_eli_agent.sh` with a
