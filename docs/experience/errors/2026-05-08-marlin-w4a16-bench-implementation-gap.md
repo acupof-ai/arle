@@ -158,6 +158,65 @@ This entry illustrates skill anti-pattern #7 ("cuBLASLt heuristic ≠ cutlass di
 
 Skill methodology cost: 1 bench run + 1 errors entry. Without methodology, the natural reading "1.06× → KILL W4A16" would have rejected the M_quant W4A8 path (master strategy combined target = W4 weight + FP8 activation = 7.9× prefill + 1.86× decode). The errors entry preserves the axis for later debug.
 
+## Round 2 — alloc_zeros → alloc fix attempted, NULL result (2026-05-08)
+
+**Diagnosis update**: read `infer/src/ops/linear.rs:660-739` (`run_marlin_w4_gemm`).
+Each Marlin call issues 6 kernel launches:
+
+1. `alloc_zeros x_fp16` → cudaMemsetAsync (predicted ~7us)
+2. `bf16_to_fp16_cuda` elementwise
+3. `alloc_zeros y_fp16` → cudaMemsetAsync (predicted ~7us)
+4. `alloc_zeros workspace` → cudaMemsetAsync (Marlin atomic accum, must keep)
+5. `marlin_gemm_cuda`
+6. `fp16_to_bf16_cuda` elementwise
+
+**Hypothesis**: 4-5 launches per Marlin call (vs 1 cuBLAS BF16 GEMM call) drives the
++18% TTFT regression and limits decode ITL gain. cuBLAS GEMM = 252 launches per
+chunk; Marlin = 252 × 6 = 1512 launches per chunk → 6× launch density.
+
+**Phase 4 prediction (Round 2)**: skip `alloc_zeros` zero-init for `x_fp16` and
+`y_fp16` (both fully overwritten by conversion / GEMM) → save 2 × 252 cudaMemsetAsync
+launches per chunk = ~3.5 ms/token decode and ~7 ms/req prefill.
+
+**Single-variable A/B (Phase 5)**: replaced `alloc_zeros` with `unsafe alloc` on
+`x_fp16` and `y_fp16`. Workspace kept zeroed (Marlin atomic accumulation needs).
+
+| Metric | Marlin baseline | Marlin alloc-skip | Δ |
+|---|---:|---:|---:|
+| TTFT p50 | 2331.8 ms | 2334.9 ms | +0.13% (within σ) |
+| ITL p50 | 18.13 ms | 18.14 ms | +0.06% (within σ) |
+| ITL std | 0.02 ms | 0.02 ms | flat |
+
+**Verdict — NULL result**. Skipping `alloc_zeros` produced no measurable Δ. Two
+explanations consistent with observation:
+
+- cudarc's CUDA pool returns already-zeroed memory (cudaMemsetAsync internally
+  elided when caller holds a freshly-pooled buffer).
+- The cudaMemsetAsync launch overhead is < 1 us in practice on Ada — far below
+  the 7 us per-launch estimate, so 504 saved launches contribute < 0.5 ms.
+
+**Tradeoff** (Phase 7 revisit): the change adds uninitialized-memory risk for
+zero net benefit → reverted. Phase 8 says NULL + new risk = no land.
+
+**Remaining hypotheses (Round 3+ candidates)**:
+
+| # | Hypothesis | How to test | Cost |
+|---|---|---|---|
+| 4 | BF16↔FP16 elementwise conversion launches dominate | nsys count `bf16_to_fp16` vs `marlin_gemm` time | 30 min |
+| 5 | Marlin kernel sub-peak utilization on sm_89 (paper benched on A100/sm_80) | ncu single-launch profile of `marlin_gemm_cuda` | 30 min, blocked on wrapper fix |
+| 6 | `W4A16BatchGemv` (ARLE-native, used when marlin_aligned fails) may be BF16-native + faster — bypass Marlin | edit dispatch `(_, W4A16) => W4A16BatchGemv` for `batch>1` | ~10 LOC, 1 bench |
+| 7 | The other variant `Qwen3-4B-W4A16-sym-g128-marlin` may have different group_size or symmetry quant — quick A/B vs current `Qwen3-4B-GPTQ-Int4-marlin` | swap `--model-path` + bench | 5 min |
+
+Round 3 should start with #7 (cheapest) → #6 (low LOC + immediate impact if
+W4A16BatchGemv is truly BF16-native and competitive) → #4/#5 (need profiler).
+
+**Round 2 cost**: 1 build + 1 bench + 1 file edit + revert = ~5 min wall-clock.
+Per skill methodology: NULL results are accumulation-of-knowledge (rule #6:
+"License-or-kill with σ < 5%"); they narrow the hypothesis space without burning
+multi-day implementation. The alloc hypothesis is now eliminated; remaining
+hypotheses target the actual binding mechanism (kernel utilization or kernel
+choice).
+
 ## Cross-references
 
 - Skill: `.claude/skills/kernel-optimization/SKILL.md` (`faffcb0`)
