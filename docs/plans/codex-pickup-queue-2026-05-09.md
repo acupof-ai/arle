@@ -49,6 +49,8 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 14 | Codex — c20b1ce was NO-OP not silent-fail(deeper)| `8d91d20` | Empirical-impact triage(skill #22 candidate refinement) |
 | 15 | Claude — pickup queue NO-OP triage acknowledgment | `921f313` | Reference + cycle codification |
 | 16 | Codex — `12300c5` was actual fix,c20b1ce dead code | `3fea979` | **CLOSURE — 7-layer audit chain CLOSED + anti-pattern #22 final framing** |
+| 17 | Codex — P0.3 framing correction post closure | `82eda25` | Surgical doc edits prescribed |
+| 18 | Claude — apply 3 surgical edits to pickup queue P0.3 | (this commit) | Cycle compounds into anti-pattern #22 sub-rule:**downstream-doc citation pollution** |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
@@ -216,9 +218,12 @@ Acceptance criteria:
 
 ### P0.3 — cap=8 prefill pre-warm fix(`56dbd1c` Step 2.B')
 
-**Why**:bimodal failure distribution(67% normal / 33% degraded 56%)
-identified per `db20d34`。Cold-start prefill warmup gap。Single-tick fix
-unblocks ALL cap=8 benefit。
+**Why**(corrected post `3fea979` 7-layer closure):bimodal failure
+distribution(67% normal / 33% degraded per `db20d34`)POST-12300c5
+may persist if first-burst prefill GEMM cold-state contributes。
+**P0.3 prefill warmup pass closes RESIDUAL bimodal variance,
+gated on Phase 0.5 evidence**(per `3456f8f` recipe)— NOT a
+"cold-start gap" framing(that was the c20b1ce-era stale claim)。
 
 - **Effort**:**80-100 LOC**(revised down from 150 per codex `eod81` cross-check — `forward_prefill_batch` already exists),**0.75-1 day**
 - **File**:`infer/src/scheduler/cuda/core/warmup.rs` + adjacent
@@ -243,8 +248,13 @@ cap=8 prefill pre-warm — Step 2.B' implementation
 
 Reference: docs/research/2026-05-08-cap8-default-h4-warmup-cap-rootcause.md (db20d34)
 
-Root cause: c20b1ce warmup covers DECODE only, not PREFILL cold-start.
-First fresh-server cap=8 prefill burst hits cold kernel cache → bimodal regression.
+Root cause hypothesis (corrected post 3fea979 7-layer closure):
+warmup_cuda_graphs covers DECODE batch sizes 1..num_slots via the existing
+slot loop (production-default num_slots=8 already covers 1..8 regardless
+of c20b1ce no-op). Prefill GEMM at varying PROMPT lengths (M dimension)
+is NOT warmed — first burst's prefill shape may hit cold cublasLt
+heuristic state. HYPOTHESIS, not yet evidenced — Phase 0.5 cheap
+experiment required first.
 
 File: infer/src/scheduler/cuda/core/warmup.rs (verified 2026-05-09 — exists at this path, 296 LOC)
 
@@ -252,10 +262,15 @@ Phase 0 audit findings (2026-05-09 by Claude):
 - Current warmup_cuda_graphs() at line 26 ONLY handles decode-shaped paths
   (line 102 comment: "Pass 1: drive forward for each warmup batch size.
    Populates the cublasLt heuristic algo cache for all GEMM shapes used by decode.")
-- c20b1ce already fixed max_bs to read model.max_concurrent_prefill_requests
-  (line 42-43), so DECODE paths are now warmed for batch sizes up to 8
-- BUT prefill kernel paths (different GEMM shapes from decode) are NOT warmed
-- First fresh-server prefill burst at cap=8 → cold kernel cache → bimodal regression
+- Decode paths warmed for batch sizes 1..num_slots via existing slot
+  loop in warmup_cuda_graphs (production-default num_slots=8 → batch 1..8,
+  no c20b1ce dependency per EOD+90 7-layer audit closure 3fea979)
+- Prefill kernel paths (different GEMM shapes from decode, varying M
+  dimension across prompt lengths) are NOT warmed
+- First fresh-server burst at varying prompt lengths may hit cold
+  cublasLt heuristic for prefill GEMM shapes → potential residual
+  bimodal contribution (HYPOTHESIS — Phase 0.5 cheap-experiment
+  per 3456f8f recipe required to evidence)
 
 Add: dedicated PREFILL warmup pass (NEW, not just bump max_bs further)
 - Either: append a Pass 2 in warmup_cuda_graphs() that exercises prefill kernel
