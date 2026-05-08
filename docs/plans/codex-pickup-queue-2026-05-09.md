@@ -52,6 +52,7 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 17 | Codex — P0.3 framing correction post closure | `82eda25` | Surgical doc edits prescribed |
 | 18 | Claude — apply 3 surgical edits to pickup queue P0.3 | `e247c4f` | Cycle compounds into anti-pattern #22 sub-rule:**downstream-doc citation pollution** |
 | 19 | Codex — annotate 2 wins entries + **Layer-8 confound discovery** | `655accf` | `bwa4piqqx`(num_slots=4)vs `b1mm1k0r7`(num_slots=16)= multi-variable confound,NOT c20b1ce isolation |
+| 20 | Codex — annotate 3rd wins entry(`cap8-chain-final-synthesis`)| `9bc4729` | **3-doc attribution scan COMPLETE** — all c20b1ce-cited wins entries now have corrected attribution |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
@@ -71,10 +72,10 @@ recipe verified-correct,**c20b1ce dead-code revealed via 7-layer chain closure**
 | (d) | NO | YES | **76%(predicts H7-A)** |
 
 If (c)≈(b) and (d)≈(a):H7-A confirmed → revert c20b1ce + annotate 3 wins entries。
-**Codex `655accf` already annotated 2 of 3 wins entries**:
-- `2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md`(annotated)
-- `2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md`(annotated)
-- `2026-05-08-cap8-chain-final-synthesis.md`(pending — Claude can do tomorrow)
+**Codex completed 3-doc attribution scan**(stages 19+20):
+- ✅ `2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md`(annotated `655accf`)
+- ✅ `2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md`(annotated `655accf`)
+- ✅ `2026-05-08-cap8-chain-final-synthesis.md`(annotated `9bc4729`)
 
 ⚠ **Layer-8 SOLID requirement on the 4-cell A/B itself**(per `655accf`):
 **FIX num_slots constant across all 4 cells**。Original "validation bench"
