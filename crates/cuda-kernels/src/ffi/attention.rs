@@ -539,6 +539,84 @@ tilelang_decode_hd128_decl!(
     tilelang_batch_decode_paged_hd128_q64_kv8_run_cuda,
 );
 
+// HD64 prefill — DSV4-mini-class substrate (head_dim=64, single KV head).
+// Same FFI shape as HD128 prefill (the kernels share `gen_tilelang_aot.py`'s
+// wrapper fill rules); only the cubin's baked `head_dim` differs. Master
+// §8.2 P1.0 will wire these symbols into a model. Adding a new HD64 head
+// config requires extending all three:
+//   - SUPPORTED_HEADS in tools/tilelang/batch_prefill_paged_hd64.py
+//   - TILELANG_PREFILL_HD64_HEAD_CONFIGS in cuda-kernels/build.rs
+//   - the macro invocation below.
+macro_rules! tilelang_prefill_hd64_decl {
+    ($($name:ident),+ $(,)?) => {
+        unsafe extern "C" {
+            $(
+                #[allow(dead_code)]
+                pub fn $name(
+                    q: *mut Half,
+                    q_indptr: *const i32,
+                    k_pool: *mut Half,
+                    v_pool: *mut Half,
+                    kv_indptr: *const i32,
+                    kv_indices: *const i32,
+                    kv_last_page_len: *const i32,
+                    o: *mut Half,
+                    batch_size: i32,
+                    total_q_tokens: i32,
+                    max_qlen: i32,
+                    num_pages: i32,
+                    total_pages: i32,
+                    num_q_heads: i32,
+                    num_kv_heads: i32,
+                    page_size: i32,
+                    sm_scale: f32,
+                    stream: CUstream,
+                ) -> CUresult;
+            )+
+        }
+    };
+}
+
+tilelang_prefill_hd64_decl!(tilelang_batch_prefill_paged_hd64_q16_kv1_run_cuda,);
+
+// HD64 decode — DSV4-mini-class substrate. Same FFI shape as the HD128
+// decode macro above. Adding a new HD64 head config requires extending
+// all three:
+//   - SUPPORTED_HEADS in tools/tilelang/batch_decode_paged_hd64.py
+//   - TILELANG_DECODE_HD64_HEAD_CONFIGS in cuda-kernels/build.rs
+//   - the macro invocation below.
+macro_rules! tilelang_decode_hd64_decl {
+    ($($name:ident),+ $(,)?) => {
+        unsafe extern "C" {
+            $(
+                #[allow(dead_code)]
+                pub fn $name(
+                    q: *mut Half,
+                    q_indptr: *const i32,
+                    k_pool: *mut Half,
+                    v_pool: *mut Half,
+                    kv_indptr: *const i32,
+                    kv_indices: *const i32,
+                    kv_last_page_len: *const i32,
+                    o: *mut Half,
+                    batch_size: i32,
+                    total_q_tokens: i32,
+                    max_qlen: i32,
+                    num_pages: i32,
+                    total_pages: i32,
+                    num_q_heads: i32,
+                    num_kv_heads: i32,
+                    page_size: i32,
+                    sm_scale: f32,
+                    stream: CUstream,
+                ) -> CUresult;
+            )+
+        }
+    };
+}
+
+tilelang_decode_hd64_decl!(tilelang_batch_decode_paged_hd64_q16_kv1_run_cuda,);
+
 // M_b.1 — HD128 BF16 split-KV decode. Partial and merge phases use separate
 // TileLang AOT cubins and an explicit float workspace supplied by
 // TileLangWorkspace. Keep symbols in lockstep with build.rs and

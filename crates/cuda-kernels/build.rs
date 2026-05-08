@@ -326,6 +326,21 @@ const TILELANG_DECODE_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16
 /// `infer/src/ops/attention.rs`.
 const TILELANG_DECODE_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (40, 8), (64, 8)];
 
+/// One AOT-specialized prefill HD64 kernel per (num_q_heads, num_kv_heads).
+/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_prefill_paged_hd64.py`
+/// — substrate for the DSV4-mini family (head_dim=64, single KV head;
+/// master §8.2 P1.0). When adding a new HD64 head config, extend both
+/// lists in lockstep AND add the matching FFI extern decl in
+/// `crates/cuda-kernels/src/ffi/attention.rs`.
+const TILELANG_PREFILL_HD64_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 1)];
+
+/// One AOT-specialized decode HD64 kernel per (num_q_heads, num_kv_heads).
+/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd64.py`
+/// — substrate for the DSV4-mini family. When adding a new HD64 head
+/// config, extend both lists in lockstep AND add the matching FFI extern
+/// decl in `crates/cuda-kernels/src/ffi/attention.rs`.
+const TILELANG_DECODE_HD64_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 1)];
+
 /// M_b.1 — BF16 split-KV decode phase kernels. Mirrors
 /// `TILELANG_DECODE_HD128_HEAD_CONFIGS`; each config emits a partial kernel and
 /// a merge kernel.
@@ -823,6 +838,63 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         );
     }
 
+    // DSV4-mini HD64 substrate (master §8.2 P1.0). Same FFI shape as the
+    // HD128/HD256 BF16 prefill+decode families; only the cubin's baked
+    // `head_dim` differs.
+    for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_prefill_paged_hd64_{suffix}"),
+            kernel_path: "tools/tilelang/batch_prefill_paged_hd64.py",
+            kernel_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
+            out_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
+            kernel_family: "attention",
+            kernel_key: None,
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_CALL_ARGS,
+        };
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &spec,
+            &mut generated_sources,
+        );
+    }
+
+    for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        let spec = TileLangKernelSpec {
+            artifact_dir: format!("batch_decode_paged_hd64_{suffix}"),
+            kernel_path: "tools/tilelang/batch_decode_paged_hd64.py",
+            kernel_name: format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
+            out_name: format!("tilelang_batch_decode_paged_hd64_{suffix}"),
+            kernel_family: "attention",
+            kernel_key: None,
+            num_q_heads: Some(q),
+            num_kv_heads: Some(kv),
+            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+            call_args: TILELANG_DISPATCH_CALL_ARGS,
+        };
+        build_tilelang_kernel(
+            &python,
+            out_dir,
+            sm_targets,
+            cuda_path,
+            &tilelang_src,
+            &cutlass_include,
+            &spec,
+            &mut generated_sources,
+        );
+    }
+
     for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
         let suffix = format!("q{q}_kv{kv}");
         let partial_spec = TileLangKernelSpec {
@@ -1008,7 +1080,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD128/HD256 prefill, HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
         sm_targets.len()
     );
     for entry in std::fs::read_dir("tools/tilelang")
