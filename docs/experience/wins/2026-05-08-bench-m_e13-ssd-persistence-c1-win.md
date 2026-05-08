@@ -30,30 +30,24 @@ on shorter prompts produced the earlier disparate numbers; the
 breakdown probe confirms the path is doing exactly what it
 should: ~100ms of import overhead, full prefill skipped.
 
-### Surprise: in-memory hit (same server) does NOT speed up
+### Note: same-server in-memory hit perf — TBD (data polluted)
 
-The breakdown bench also captured a same-server cold→warm pair
-(no server restart):
+A separate observation in the breakdown bench seemed to show that
+same-server cold→warm in-memory hit does NOT speed up (12.759s
+warm ≈ 12.811s cold), but on closer inspection the bench data is
+polluted by overlapping retry invocations on port 8765 — multiple
+bench scripts ran concurrently, queuing requests onto the same
+server. The 12.759s number cannot be cleanly attributed to a
+single in-memory-hit request.
 
-| Phase | E2E | session_affinity hit |
-|---|---|---|
-| Cold (1st request) | 12.811s | none |
-| Warm (2nd request, in-memory cache populated by 1st publish) | 12.759s | hit on memory_match=Some(2064) AND disk_match=Some(2064) |
+A clean re-bench with strict server-lifecycle isolation (lsof
+guard before each phase, single bench invocation, no retry
+overlap) is needed before declaring a `try_import_memory_prefix`
+short-circuit bug. **Retracted from this commit; filed as
+strictly-experimental next-tick work.**
 
-The in-memory entry is present and the lookup matches it, but
-warm e2e is **identical** to cold (12.759s ≈ 12.811s). Server-
-restart **DOES** speed up; same-server in-memory hit **does NOT**.
-
-**Implication**: the M_e.13 disk-attach path short-circuits prefill,
-but the M_e.10 in-memory `try_import_memory_prefix` path does not
-(or hits a different code path that re-runs the prefill). This is
-a separate latent bug — fixing it would deliver the same -76% on
-WITHIN-session multi-turn (eli's actual usage), not just session-
-restart.
-
-Filed as next-tick investigation: code-trace
-`try_import_memory_prefix` vs `try_import_disk_prefix` for the
-prefill-short-circuit asymmetry.
+The −76.7% disk-attach result above is independent of this
+question and stands.
 
 ## ⚠️ Update (same-day re-bench with INFER_M_E10_TRACE=1)
 
