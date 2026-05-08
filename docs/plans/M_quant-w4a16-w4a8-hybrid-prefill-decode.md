@@ -129,11 +129,43 @@ kernels routed by phase" pattern,common in production systems
 - **Phase 4**:if hybrid bench shows < 5% combined improvement vs best
   single arm → KILL,not worth weight memory cost
 
+### Phase 0 reconnaissance results(`1959a21`)
+- ✅ Scheduler boundary CLEAN:`StepPlan` enum at `execution.rs:411`
+  discriminates Decode/Prefill/Mixed/Split → hybrid dispatch = trivial
+  match
+- ⚠ DeviceMatrix needs TWO matrices per Linear(`HybridLinear` ~50 LOC
+  vs new WeightFormat variant ~150 LOC — Option A recommended)
+- ⚠ Memory cost:**45%**(7.15GB / 16GB)
+  - c=4:acceptable(76% with KV)
+  - c=8:tight(87% with KV,may need shorter max-seq-len)
+  - **c=16:NOT FEASIBLE** without KV quant(`#33` master §1.2.1.B paired axis)
+- Mixed-step dispatch:Option A(prefill priority) — use W4A8 for ALL
+  Linear in mixed steps,decode capped by prefill chunking anyway
+
+### Concurrency sweep results(`8588f6a`)
+| Concurrency | W4A16 ITL | W4A8 ITL | W4A16 TTFT | W4A8 TTFT |
+|-------------|---:|---:|---:|---:|
+| c=4 | 11.73 ms | 19.18 ms(+63%)| 2388 ms | 1632 ms(-32%)|
+| c=8 | 16.28 ms | 24.09 ms(+48%)| 4811 ms | 3323 ms(-31%)|
+
+- Decode gap **narrows -9% as concurrency doubles**(W4A8 catching up)
+- Prefill advantage **holds robustly**(both -31% to -36%)
+- **Crossover formula c ≈ 78** — impractical at production memory budget
+- **Practical conclusion**:W4A8 decode never crosses W4A16 at production c=4-32
+
+So decode-side decision **W4A16 dominates throughout production range**。
+Hybrid case is **purely about prefill TTFT win** at c≤8 where memory
+allows side-by-side storage。
+
 ## §5 Probability + ROI
 
-P(hybrid landed within 1-2 days) = 75%
+P(hybrid landed within 1-2 days) = 75% — UPDATED post-Phase-0 to 80%
 - High because both arms are LICENSED individually,routing is mechanical
 - Risk concentrated in loader storage augmentation(Phase 1)
+- Phase 0 reconnaissance(`1959a21`)confirmed scheduler clean + impl
+  scope ~50 LOC `HybridLinear` simpler than expected
+- BUT memory budget tight at c=8 + infeasible at c=16 → **scope limited
+  to c≤8 single-tenant production**(c=16 hybrid blocked by KV W4A8 task #33)
 
 ROI estimate(production E2E):
 - W4A16-only baseline:TTFT 2388 ms + ITL 11.73 ms × 256 tok = 5391 ms
