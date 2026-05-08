@@ -124,6 +124,15 @@ def pack_w4a8(weight: torch.Tensor, groupsize: int = GROUP_SIZE,
                 f"gptq_scales shape after transpose {tuple(s.shape)} "
                 f"!= expected ({k // groupsize}, {n})"
             )
+        # Fix A per b255828 (revised): kernel dequant_per_group uses
+        # MAGIC_NUM=0x6480 (FP16 1152) IEEE-754 fast-path. Result range
+        # required: [1024, 1280) → (q-8)*s_group_stored ∈ [-128, 128).
+        # For q=0 (t0=-8): s_group_stored ≤ 16 (TIGHTER than 127/7).
+        # For q=15 (t0=7): s_group_stored < 18.286.
+        # Effective bound: s_group_stored ≤ 16 (binding constraint = q=0 case).
+        # Equivalent: s ≤ 16 * s_channel per element.
+        max_s = 16.0 * s_channel.to(torch.float16).reshape(1, n)
+        s = torch.minimum(s, max_s)
     else:
         reshaped = ref.reshape(k // groupsize, groupsize, n)
         s = reshaped.abs().amax(dim=1).clamp_min(1e-6).div(7.0).to(torch.float16)
