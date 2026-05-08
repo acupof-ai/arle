@@ -1,11 +1,13 @@
 # M_medusa — Medusa multi-head spec-decode REQUIRED path (post-classical-DEAD)
 
-> Master §7.4 P1.1 promoted from "preferred" to **REQUIRED** by 3 classical
-> KILLs: `5f26675` (4k self α=7%), `3ac5f4d` (4k ext α=19%),
-> `8f2b227` (32k self α=23%). Pattern: classical Leviathan α ≤ 0.25 across
-> all tested workloads on Qwen3-4B + sm_89 + ARLE current = structural
-> ceiling. Medusa shared-target heads is the architectural change required
-> to break α ceiling.
+> Master §7.4 P1.1 promoted from "preferred" to **REQUIRED** by **4 classical
+> KILLs**: `5f26675` (4k self α=7%), `3ac5f4d` (4k ext α=19%),
+> `8f2b227` (32k self α=23%), `aa00c6a` (W3 c=4 production-shape α=19%).
+> Pattern: classical Leviathan α ≤ 0.25 across all 4 tested workloads on
+> Qwen3-4B + sm_89 + ARLE current = structural ceiling. Medusa shared-target
+> trained heads is the architectural change required to break α ceiling.
+> The 4th KILL specifically refutes the "high prefix hit will save spec"
+> hypothesis — prefix_hit_rate ≠ accept_rate (independent axes).
 >
 > Codex own (training + substrate). Plan ready for pickup.
 
@@ -33,31 +35,52 @@ Medusa-specific:
 
 ## Phase 3 — Binding constraint (formula-grounded)
 
-Medusa speedup formula (per Cai et al. 2024):
+Medusa speedup uses tree-attention over top-T candidates per head + target
+verification on accepted prefix. Standard Leviathan formula does NOT apply
+directly (that's classical 1-draft-per-step). Correct derivation:
 
 ```
-S = K * α / (1 + K * α - α)   # standard Leviathan
-For Medusa K=4 heads with α typically 0.7-0.85 (paper claims):
-  α=0.7: S = 4*0.7/(1+4*0.7-0.7) = 2.8/3.1 = 0.90× (LESS than 1×!)
+E[accepted tokens / step] = 1 + Σ_{i=1..K} Π_{j=1..i} α_j
+  where α_j is per-position acceptance probability for j-th Medusa head.
 
-Wait that's wrong... Let me redo:
-  α_eff per Medusa: typically tree-attention style where multiple
-  candidates verified per step.
+For uniform α (worst case — heads decay slower with proper training):
+  α=0.7: E = 1 + 0.7 + 0.49 + 0.343 + 0.24 = 2.78 tokens/step
+  α=0.85: E = 1 + 0.85 + 0.72 + 0.61 + 0.52 = 3.71 tokens/step
 
-Actual Medusa paper (with tree attention on top-K candidates):
-  Average tokens accepted per step = 2.0-3.0 (vs 1 for no-spec)
-  Throughput = 2.0-3.0× (Medusa head + tree-attn vs 1× no-spec)
+Per-step cost ratio (Medusa K=4 vs no-spec):
+  cost_ratio = 1 + K × (head_trainable_params / target_params) + tree_attn_overhead
+  Qwen3-4B + 4 heads (each ResBlock + reused lm_head):
+    head_trainable = ~6.5M (single ResBlock) — lm_head shared with target
+    cost_ratio = 1 + 4 × (6.5M / 4B) + 0.05 ≈ 1.06× (heads are essentially free)
+
+Throughput speedup = E[accepted/step] / cost_ratio:
+  α=0.7:  2.78 / 1.06 = 2.62×
+  α=0.85: 3.71 / 1.06 = 3.50×
 ```
 
-Refer to Medusa paper §4.1 for exact formula. For Qwen3-4B + 4 heads,
-literature predicts 2.0-2.5× tok/s at K=4 with shared-target alignment.
+Literature claims α 0.7-0.85 (Medusa-2 paper, Vicuna-7B baseline). For
+Qwen3-4B production W3/W4 (structured agent shape), predict α 0.6-0.8
+range based on similar coding-fine-tuned model behavior. Predicted
+throughput speedup: **2.0-3.0× tok/s**.
 
-## Phase 4 — Formula prediction (rough)
+Why classical α 0.07-0.25 → Medusa α 0.6-0.85? Architectural difference:
+- Classical:single fixed model self-predicting K positions ahead → entropy
+  compounds geometrically → α^K decay
+- Medusa:K *trained* heads each specialized to position-i prediction →
+  per-position α stays high (paper §3.2 shows heads learn position-specific
+  features that vanilla self-spec cannot capture)
+
+## Phase 4 — Formula prediction (concrete numbers)
 
 For Qwen3-4B production W3/W4:
-- Baseline tok/s: TBD (need W3 admission fix, est ~150-200 tok/s for c=16 W3 light)
-- Medusa K=4: ~2.0-2.5× → 300-500 tok/s
-- Medusa K=8 (more heads, deeper tree): potentially 3.0× → 450-600 tok/s
+- W3 c=4 baseline established: ITL p50 8.5 ms = ~117 tok/s/session × 4 conc
+  ≈ 468 tok/s aggregate, or per-session ~117 tok/s (`370a267`)
+- W3 c=16 baseline: BLOCKED on `cb087c7` deadlock(codex `369292f`
+  page_budget hypothesis fix in flight)
+- Medusa K=4 prediction(α=0.7):2.62× → ~306 tok/s/session,~1226 tok/s aggregate
+- Medusa K=4 prediction(α=0.85):3.50× → ~410 tok/s/session,~1638 tok/s aggregate
+- K=8 doesn't help if heads decay below α=0.5 at i≥5 (need empirical α curve);
+  K=4 is the safe starting point per Medusa-2 paper.
 
 ## Phase 5 — Implementation outline (codex own)
 
@@ -70,11 +93,14 @@ For Qwen3-4B production W3/W4:
 
 ### 5.2 Medusa head architecture (~200 LOC PyTorch)
 
-- 4 heads on top of Qwen3-4B last hidden state
-- Each head: Linear(2560 → 2560) + GELU + Linear(2560 → 151936) — predicts
-  position +1, +2, +3, +4
-- Initialize from base lm_head; fine-tune on training data
-- Loss: cross-entropy at each position
+- 4 heads on top of Qwen3-4B last hidden state(d=2560,vocab=151936)
+- Each head:**1× ResBlock(d → d)** with skip,reuse target's lm_head
+  for d → vocab projection (per Medusa paper §3.2 "shared lm_head")
+- Per-head trainable params:~6.5M(ResBlock weights only)
+- Total trainable across 4 heads:~26M(<1% of 4B target — heads are tiny)
+- Initialize ResBlocks from random + bias toward identity(start as
+  "predict same as target")
+- Loss:cross-entropy at each Medusa position(1, 2, 3, 4 ahead)
 
 ### 5.3 ARLE integration (~300 LOC)
 
@@ -127,21 +153,38 @@ Post-license, combine with W4A16 + xgrammar:
 
 ## Pre-execution gates
 
-1. **W3 admission fix** (`a672b08`) — production-shape baseline first
+1. **W3+W4 admission deadlock fix**(codex page_budget hypothesis
+   `369292f` + `infer/src/scheduler/cuda/execution.rs` in flight)— required
+   for production-shape c=16/c=8 baseline pre-Medusa。**Currently blocking;
+   c=4 workaround licensed at `370a267`.**
 2. **Training environment** — Qwen3-4B target + heads fit on 16 GB GPU
-3. **bench_agent_trace.py harness** — production-shape measurement
+   (heads are 26M params total = <100 MB, easily fits even with target +
+   activations + gradients)
+3. **bench_agent_trace.py harness** — production-shape measurement(ready,
+   used by `370a267` and `aa00c6a`)
+4. **W4A16 production decode default** — LICENSED at `f6f3af3` 1.64× ITL,
+   stable comparison baseline for Medusa A/B
 
 ## Cross-references
 
 - Master §7.4 P1.1 update: [`docs/projects/2026-05-07-arle-master-strategy.md`](../projects/2026-05-07-arle-master-strategy.md) (`5acbe94`)
-- 3 classical KILL evidence:
-  - `5f26675` self-spec K=5 4k random
-  - `3ac5f4d` ext-draft Qwen3-0.6B K=5 4k random
-  - `8f2b227` self-spec K=5 32k random
-- W3 admission blocker: `a672b08`
+- **4 classical KILL evidence**(α range 0.07-0.25):
+  - `5f26675` self-spec K=5 4k random α=0.07
+  - `3ac5f4d` ext-draft Qwen3-0.6B K=5 4k random α=0.19
+  - `8f2b227` self-spec K=5 32k random α=0.23
+  - **`aa00c6a` self-spec K=5 W3 c=4 production-shape α=0.19**(refutes "high
+    prefix hit saves spec" — prefix_hit_rate 93% but accept_rate 19%
+    independent)
+- W3+W4 admission deadlock evidence:
+  - `cb087c7` W3 c=16 deadlock initial(harness retry-backoff insufficient)
+  - `e3669d4` W4 c=8 deadlock confirms substrate(workload-dependent)
+  - `369292f` codex page_budget root-cause hypothesis(in-flight fix)
+- W4A16 baseline: `f6f3af3` LICENSED 1.64× ITL(production decode default)
+- W3 c=4 baseline: `370a267` 384 turns OK,99% prefix hit
 - Medusa paper: <https://arxiv.org/abs/2401.10774>
+- Medusa-2(improved): <https://arxiv.org/abs/2402.04968>
 - ARLE spec substrate: `infer/src/speculative.rs` (721 LOC)
-- Skill v1.3.0: `.claude/skills/kernel-optimization/SKILL.md` (`d09480b`)
+- Skill v1.3.0: `.claude/skills/kernel-optimization/SKILL.md` (`faffcb0`)
 
 ## Rule
 
