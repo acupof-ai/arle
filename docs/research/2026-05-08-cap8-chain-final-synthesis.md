@@ -1,5 +1,27 @@
 # cap=8 chain final synthesis — production trade-off + 8.2% residual
 
+> **⚠ ATTRIBUTION CORRECTED 2026-05-09 EOD+93**:per 8-layer audit chain
+> (`919c0fb` / `8d91d20` / `3fea979` / `82eda25` / `e247c4f` / `655accf` /
+> `bbedbc9`),this synthesis's "warmup fix `c20b1ce` empirically lands at
+> 91.8%" framing is **multi-variable confounded**:
+>
+> - **Layer-7**:`c20b1ce` is NO-OP when num_slots ≥ prefill_cap(production
+>   default num_slots=8 + Qwen3-4B prefill_cap=Some(8) → max_bs identical
+>   pre/post)。Real fix was **`12300c5` cap=4→8 admission flip alone**。
+> - **Layer-8**:original cross-run comparison(this synthesis's basis)had
+>   **--num-slots changed simultaneously**:`bwa4piqqx` baseline max=4
+>   (num_slots=4)vs `8281047/b1mm1k0r7` post-c20b1ce max=16(num_slots=16)。
+>   c20b1ce isolation impossible without controlled A/B at fixed num_slots。
+> - **Anti-pattern #22 sub-rule**(skill v1.8.0):multi-variable bench
+>   comparison masquerading as single-variable attribution。
+>
+> Observed bench data REAL(76→91.8% turn success transition);CAUSAL
+> ATTRIBUTION to c20b1ce alone is unsupported per audit chain。Proper
+> attribution requires 4-cell A/B at FIXED num_slots=8(per `bbedbc9`
+> Layer-8 num_slots gate)。
+>
+> Original synthesis preserved below for historical record。
+
 > 7-commit cap=8 investigation chain culminates in `8281047` validation:
 > warmup fix `c20b1ce` empirically lands at **91.8% turn success +
 > -87% TTFT p99**。Still 8.2% residual gap from 100% turn success
