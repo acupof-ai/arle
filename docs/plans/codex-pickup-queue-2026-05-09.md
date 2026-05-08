@@ -20,7 +20,8 @@
 | W4A8 prefill LICENSED -36% TTFT | ✅ both arms verified | `b5889b3` |
 | TTFT p99 -86% | ✅ via cap=8 | `cap8-ttft-tail.md` |
 | B3 Step 1 admission_allows | ✅ byte-identical regression | `7c8fd61` + `c30e298` |
-| **B3 Step 2 PrefixAwareAdmission** | ✅ **LICENSED -24.2% TTFT** σ/mean=4.5% | (codex pending commit, wins entry: `docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md`) |
+| **B3 Step 2 PrefixAwareAdmission** | ✅ **LICENSED -24.2% TTFT** σ/mean=4.5% | `b85929b` + wins entry `docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md` |
+| **P0.2 Hybrid Phase 1b loader** | ✅ **LANDED**(loader-only,Phase 2 dispatch deferred) | `232aed5` + wins entry `docs/experience/wins/2026-05-09-bench-hybrid-phase1b-loader.md`(TTFT p50 68.4ms regression gate PASS) |
 | Skill v1.4.0 → v1.7.0 | ✅ +6 anti-patterns | `c768b70` |
 | **Skill v1.8.0 anti-pattern bank**(deferred batch) | 🟡 **3 candidates ready,batch trigger ready** | `c076aae` #20 + `153fd93` #21 + `8d91d20` #22 |
 | **Wins-entry re-attribution gap**(c20b1ce NO-OP)| 🟡 3 entries need invalidation/re-attribution | `8d91d20` empirical triage |
@@ -54,7 +55,9 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 19 | Codex — annotate 2 wins entries + **Layer-8 confound discovery** | `655accf` | `bwa4piqqx`(num_slots=4)vs `b1mm1k0r7`(num_slots=16)= multi-variable confound,NOT c20b1ce isolation |
 | 20 | Codex — annotate 3rd wins entry(`cap8-chain-final-synthesis`)| `9bc4729` | **3-doc attribution scan COMPLETE** — all c20b1ce-cited wins entries now have corrected attribution |
 | 21 | Codex — task #24 BF16 split-KV pre-audit(forward planning) | `78ccbb6` | Pre-staging task #24 cleanup(due 2026-05-14):1 of 3 substrates grep-confirmed,~30-50 LOC delta |
-| 21' | Codex review — Phase 1b decode-panic finding(open) | (codex working) | "decode step for hybrid checkpoint will panic instead of serving" → gate-or-decode-path needed before P0.2 commit |
+| 21' | Codex review — Phase 1b decode-panic finding | `156d2c2` precursor | "decode step for hybrid checkpoint will panic instead of serving" → gate option chosen |
+| 22 | Codex — targeted-test interpretation verified SOLID | `156d2c2` | Pre-commit empirical-impact verification per skill v1.7.0 #19 + v1.8.0 #22 discipline |
+| 23 | **Codex — P0.2 SUBSTRATE LANDED**(`feat(cuda): load hybrid W4 Marlin side tensors`)| `232aed5` | **Phase 1b loader-only,reject hybrid at linear dispatch,warmup.rs reverted to `num_slots.min(256)`,5 src + wins entry**;bench TTFT p50 68.4ms regression gate PASS |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
