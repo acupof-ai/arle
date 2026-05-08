@@ -130,15 +130,23 @@ def main():
         if src_cfg.exists():
             shutil.copy2(src_cfg, args.dst / cfg)
 
-    quant_cfg = {
-        "bits": 4,
-        "group_size": args.groupsize,
-        "quant_method": "gptq_w4a8",
-        "source": "GPTQ W4A16 re-packed via convert_gptq_w4a16_to_w4a8_marlin.py",
-        "marlin_repacked": True,
-    }
-    (args.dst / "quantize_config.json").write_text(json.dumps(quant_cfg, indent=2))
-    print(f"wrote quantize_config.json with quant_method=gptq_w4a8")
+    # Patch config.json to add inline quantization_config that infer's loader
+    # reads to detect the W4A8 path (overrides any GPTQ-source block).
+    cfg_path = args.dst / "config.json"
+    if cfg_path.exists():
+        cfg = json.loads(cfg_path.read_text())
+        cfg["quantization_config"] = {
+            "quant_type": "marlin_w4a8",
+            "group_size": args.groupsize,
+        }
+        cfg_path.write_text(json.dumps(cfg, indent=2))
+        print(f"patched config.json with quant_type=marlin_w4a8")
+
+    # Do NOT write a separate quantize_config.json — loader's
+    # load_quant_meta order is GGUF > TurboQuant > GPTQ-via-quantize_config.json
+    # > AWQ > config.json fallback. A quantize_config.json forces GPTQ branch
+    # which sets marlin_w4a8: false. Use config.json inline quantization_config
+    # only (patched above with quant_type=marlin_w4a8).
 
 
 if __name__ == "__main__":
