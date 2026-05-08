@@ -90,8 +90,8 @@ ARLE 服务以下 3 类用户(优先级排序):
 | BF16(baseline)| ✅ production | ✅ | ✅ |
 | **FP8 (E4M3 weight + FP8 activation)** ⭐ **P0** | 🔴 cuBLASLt smoke 1.88× KILL,cutlass v2 待验(#28)| cutlass direct 8× 上限 | ✅ |
 | W4A_FP8(Marlin W4 + FP8 act,Phase 1 stack)| 📋 plan(#26)| stack on FP8 | ✅ |
-| W4A16(GPTQ/AWQ Marlin) | ✅ production,**qzeros +1 bug fixed `5593865`/`6c627c4` 2026-05-08**(was silent +1 corruption from convert_gptq.py "zero stored as zero-1" decode)— re-bench pending re-conversion | ✅ | ✅ |
-| **W4A8 GPTQ-Marlin re-pack** ⭐ **P0 axis 3** | 🔧 chain in flight:`12a54da` GPTQ-aware pack + `163c8ee` Fix A clamp s≤16 + `5593865` qzeros +1 root cause — regen+gate pending(EOD+41 codex Working) | ✅ | ✅ |
+| W4A16(GPTQ/AWQ Marlin) | ✅ **production LICENSED** post `2a3a6f0` qzeros fix:**ITL p50 11.73 ms vs R1 buggy 18.13 ms = +54% ITL**(`bc15eca`),tok/s 191.63,closes Round 4 implementation gap | ✅ | ✅ |
+| **W4A8 GPTQ-Marlin re-pack** ⭐ **P0 axis 3** | ✅ **prefill LICENSED** post `2a3a6f0`:**TTFT p50 1632 ms = -36% vs W4A16**(`b5889b3`),greedy gate 32/32 0% diff,decode ITL deferred(small batch INT8 quant overhead — W4A16 wins decode at c=4)| ✅ | ✅ |
 | TurboQuant W2/W3/W4 weight | ✅ production | ✅ | ✅ |
 | W4A_INT8(deferred 兼容性磁道)| 📋 deferred | ⚠ sm_89 INT8 mma 不 hot | ✅ |
 | NVFP4 (FP4 weight + FP8 scale,sm_100 only)| 📋 substrate(#27)| ❌ emulated 慢 | ✅ 4× compute |
