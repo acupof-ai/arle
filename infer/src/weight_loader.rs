@@ -444,6 +444,7 @@ pub(crate) struct QuantLoadConfig {
     pub(crate) bits: Option<u8>,
     pub(crate) tq_bits: Option<u8>,
     pub(crate) marlin_w4a8: bool,
+    pub(crate) marlin_w4_hybrid: bool,
     pub(crate) unsupported_reason: Option<&'static str>,
 }
 
@@ -461,6 +462,7 @@ impl QuantLoadConfig {
                 bits: Some(config.bits),
                 tq_bits: None,
                 marlin_w4a8: false,
+                marlin_w4_hybrid: false,
                 unsupported_reason: None,
             },
             QuantMeta::Gptq(config) => Self {
@@ -468,6 +470,7 @@ impl QuantLoadConfig {
                 bits: Some(config.bits),
                 tq_bits: None,
                 marlin_w4a8: false,
+                marlin_w4_hybrid: false,
                 unsupported_reason: None,
             },
             QuantMeta::Awq(config) if config.zero_point => Self {
@@ -481,6 +484,7 @@ impl QuantLoadConfig {
                 bits: Some(config.bits),
                 tq_bits: None,
                 marlin_w4a8: false,
+                marlin_w4_hybrid: false,
                 unsupported_reason: None,
             },
             QuantMeta::Int8(_) => Self {
@@ -488,6 +492,7 @@ impl QuantLoadConfig {
                 bits: Some(8),
                 tq_bits: None,
                 marlin_w4a8: false,
+                marlin_w4_hybrid: false,
                 unsupported_reason: None,
             },
             QuantMeta::MarlinW4A8(config) => Self {
@@ -495,6 +500,15 @@ impl QuantLoadConfig {
                 bits: Some(4),
                 tq_bits: None,
                 marlin_w4a8: true,
+                marlin_w4_hybrid: false,
+                unsupported_reason: None,
+            },
+            QuantMeta::MarlinW4Hybrid(config) => Self {
+                group_size: Some(config.group_size),
+                bits: Some(4),
+                tq_bits: None,
+                marlin_w4a8: true,
+                marlin_w4_hybrid: true,
                 unsupported_reason: None,
             },
             QuantMeta::TurboQuant(config) => Self {
@@ -502,6 +516,7 @@ impl QuantLoadConfig {
                 bits: None,
                 tq_bits: Some(config.bits),
                 marlin_w4a8: false,
+                marlin_w4_hybrid: false,
                 unsupported_reason: None,
             },
             _ => Self::default(),
@@ -509,17 +524,30 @@ impl QuantLoadConfig {
     }
 
     pub(crate) fn from_model_path(model_path: &str) -> Result<Self> {
-        if matches!(
-            std::env::var("INFER_QUANT_FORMAT_OVERRIDE").as_deref(),
-            Ok("marlin_w4a8" | "w4a8_marlin")
-        ) {
-            return Ok(Self {
-                group_size: Some(128),
-                bits: Some(4),
-                tq_bits: None,
-                marlin_w4a8: true,
-                unsupported_reason: None,
-            });
+        if let Ok(format) = std::env::var("INFER_QUANT_FORMAT_OVERRIDE") {
+            match format.as_str() {
+                "marlin_w4a8" | "w4a8_marlin" => {
+                    return Ok(Self {
+                        group_size: Some(128),
+                        bits: Some(4),
+                        tq_bits: None,
+                        marlin_w4a8: true,
+                        marlin_w4_hybrid: false,
+                        unsupported_reason: None,
+                    });
+                }
+                "marlin_w4_hybrid" => {
+                    return Ok(Self {
+                        group_size: Some(128),
+                        bits: Some(4),
+                        tq_bits: None,
+                        marlin_w4a8: true,
+                        marlin_w4_hybrid: true,
+                        unsupported_reason: None,
+                    });
+                }
+                _ => {}
+            }
         }
         Ok(Self::from_meta(&crate::quant::load_quant_meta(model_path)?))
     }
@@ -529,6 +557,7 @@ impl QuantLoadConfig {
             || self.bits.is_some()
             || self.tq_bits.is_some()
             || self.marlin_w4a8
+            || self.marlin_w4_hybrid
             || self.unsupported_reason.is_some()
     }
 }
@@ -660,6 +689,85 @@ pub(crate) fn load_tensor_2d_maybe_quantized_with_config(
     name: &str,
     config: QuantLoadConfig,
 ) -> Result<DeviceMatrix> {
+    if config.marlin_w4_hybrid {
+        anyhow::ensure!(
+            config.group_size.unwrap_or(128) == 128,
+            "{name}: Marlin W4 hybrid currently supports group_size=128 only, got {:?}",
+            config.group_size
+        );
+        let group_size = config.group_size.unwrap_or(128);
+
+        let w4a16_qweight_name = name.replace(".weight", ".marlin_qweight");
+        let w4a16_scales_name = name.replace(".weight", ".marlin_scales");
+        let w4a8_qweight_name = name.replace(".weight", ".marlin_w4a8_qweight");
+        let w4a8_channel_scales_name = name.replace(".weight", ".marlin_w4a8_s_channel");
+        let w4a8_group_scales_name = name.replace(".weight", ".marlin_w4a8_s_group");
+
+        let w4a16_qweight_tensor = find_tensor(shards, weight_map, &w4a16_qweight_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {w4a16_qweight_name}: {e}"))?;
+        let w4a16_scales_tensor = find_tensor(shards, weight_map, &w4a16_scales_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {w4a16_scales_name}: {e}"))?;
+        let w4a8_qweight_tensor = find_tensor(shards, weight_map, &w4a8_qweight_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {w4a8_qweight_name}: {e}"))?;
+        let w4a8_channel_scales_tensor = find_tensor(shards, weight_map, &w4a8_channel_scales_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {w4a8_channel_scales_name}: {e}"))?;
+        let w4a8_group_scales_tensor = find_tensor(shards, weight_map, &w4a8_group_scales_name)
+            .map_err(|e| anyhow::anyhow!("{name}: missing {w4a8_group_scales_name}: {e}"))?;
+
+        let rows = w4a8_channel_scales_tensor.shape().iter().product::<usize>();
+        anyhow::ensure!(
+            !w4a8_group_scales_tensor.shape().is_empty(),
+            "{name}: {w4a8_group_scales_name} must have at least one dimension"
+        );
+        let num_groups = w4a8_group_scales_tensor.shape()[0];
+        let cols = num_groups * group_size;
+
+        let w4a16_qweight = w4a16_qweight_tensor.data();
+        let w4a16_scales: &[u16] = unsafe {
+            std::slice::from_raw_parts(
+                w4a16_scales_tensor.data().as_ptr().cast::<u16>(),
+                w4a16_scales_tensor.shape().iter().product::<usize>(),
+            )
+        };
+        let w4a8_qweight = w4a8_qweight_tensor.data();
+        let w4a8_channel_scales: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                w4a8_channel_scales_tensor.data().as_ptr().cast::<f32>(),
+                rows,
+            )
+        };
+        let w4a8_group_scales: &[u16] = unsafe {
+            std::slice::from_raw_parts(
+                w4a8_group_scales_tensor.data().as_ptr().cast::<u16>(),
+                w4a8_group_scales_tensor.shape().iter().product::<usize>(),
+            )
+        };
+
+        log::info!(
+            "Loaded Marlin W4 hybrid {}: [{}x{}] group_size={} w4a16_q {:?} w4a16_s {:?} w4a8_q {:?} w4a8_s_channel {:?} w4a8_s_group {:?}",
+            name,
+            rows,
+            cols,
+            group_size,
+            w4a16_qweight_tensor.shape(),
+            w4a16_scales_tensor.shape(),
+            w4a8_qweight_tensor.shape(),
+            w4a8_channel_scales_tensor.shape(),
+            w4a8_group_scales_tensor.shape()
+        );
+        return DeviceMatrix::from_hybrid_w4_marlin(
+            ctx,
+            w4a16_qweight,
+            w4a16_scales,
+            w4a8_qweight,
+            w4a8_channel_scales,
+            w4a8_group_scales,
+            rows,
+            cols,
+            group_size,
+        );
+    }
+
     if config.marlin_w4a8 {
         anyhow::ensure!(
             config.group_size.unwrap_or(128) == 128,
@@ -1515,9 +1623,16 @@ mod gguf_v_reorder_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    use std::path::Path;
 
     const QWEN3_4B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
     const QWEN3_8B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-8B");
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    const QWEN3_4B_HYBRID_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/models/Qwen3-4B-W4-hybrid-zpfix"
+    );
 
     #[test]
     fn quant_layout_uses_configured_bits_and_infers_group_size() {
@@ -1526,6 +1641,7 @@ mod tests {
             bits: Some(4),
             tq_bits: None,
             marlin_w4a8: false,
+            marlin_w4_hybrid: false,
             unsupported_reason: None,
         };
         let (orig_k, group_size, bits) = detect_uniform_quant_layout("w", 64, 2, cfg).unwrap();
@@ -1543,6 +1659,7 @@ mod tests {
                 bits: None,
                 tq_bits: None,
                 marlin_w4a8: false,
+                marlin_w4_hybrid: false,
                 unsupported_reason: None,
             },
         )
@@ -1563,6 +1680,7 @@ mod tests {
                     bits: None,
                     tq_bits: Some(bits),
                     marlin_w4a8: false,
+                    marlin_w4_hybrid: false,
                     unsupported_reason: None,
                 },
             )
@@ -1601,6 +1719,56 @@ mod tests {
                 .expect("asymmetric GPTQ must be rejected")
                 .contains("GPTQ")
         );
+    }
+
+    #[test]
+    fn quant_config_detects_marlin_w4_hybrid() {
+        let hybrid = QuantLoadConfig::from_meta(&crate::quant::QuantMeta::MarlinW4Hybrid(
+            crate::quant::MarlinW4A8Config { group_size: 128 },
+        ));
+        assert!(hybrid.enabled());
+        assert!(hybrid.marlin_w4_hybrid);
+        assert!(hybrid.marlin_w4a8);
+        assert_eq!(hybrid.bits, Some(4));
+        assert_eq!(hybrid.group_size, Some(128));
+    }
+
+    #[test]
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    fn load_hybrid_w4_marlin_linear_populates_side_tensors() -> Result<()> {
+        if !Path::new(QWEN3_4B_HYBRID_PATH).exists() {
+            eprintln!("skipping hybrid loader test: {QWEN3_4B_HYBRID_PATH} is absent");
+            return Ok(());
+        }
+
+        let ctx = DeviceContext::new()?;
+        let (shard_paths, weight_map) = load_shard_info(QWEN3_4B_HYBRID_PATH)?;
+        let mmaps = mmap_shards(&shard_paths)?;
+        let shards = mmaps
+            .iter()
+            .map(|mmap| {
+                SafeTensors::deserialize(mmap)
+                    .map_err(|e| anyhow::anyhow!("Deserialize error: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let config = QuantLoadConfig::from_model_path(QWEN3_4B_HYBRID_PATH)?;
+        assert!(config.marlin_w4_hybrid);
+        assert!(config.marlin_w4a8);
+
+        let matrix = load_tensor_2d_maybe_quantized_with_config(
+            &ctx,
+            &shards,
+            &weight_map,
+            "model.layers.0.mlp.gate_proj.weight",
+            config,
+        )?;
+
+        assert!(matrix.has_marlin());
+        assert!(matrix.is_hybrid_w4_marlin());
+        assert!(matrix.hybrid_w4a8_qweight.is_some());
+        assert!(matrix.hybrid_w4a8_s_channel.is_some());
+        assert!(matrix.hybrid_w4a8_s_group.is_some());
+        Ok(())
     }
 
     fn bf16_matrix_bytes(rows: usize, cols: usize) -> Vec<u8> {
