@@ -98,6 +98,25 @@ ARLE 服务以下 3 类用户(优先级排序):
 | FP6 / FP4_E2M1 alt formats | 待评估 | TBD | ✅ Blackwell |
 | GPTQ-Int8 / AWQ-Int8 | 待评估 | ✅ Marlin reuse | ✅ |
 
+### §1.2.1.A.1 Schedule cap production matrix(2026-05-08 EOD)
+
+`Some(4) → Some(8)` flip per `12300c5` + warmup fix `c20b1ce`。Production
+status varies by workload due to prefill-warmup-gap bimodal(see
+`641e9bf`,fix directive `56dbd1c`):
+
+| Workload | cap=8 status | Empirical |
+|----------|:-------------|-----------|
+| W3 c=4(short multiturn,low-conc)| ✅ **LICENSED HARD**(`063da81`)| 384/384 100%,TTFT p50 -45%(379→208 ms)|
+| W3 c=16(short multiturn,burst)| ✅ **LICENSED HARD**(`27fd5de`)| 384/384 100%,prior 376/384 cap=4 |
+| W4 c=4(longctx,low-conc)| ✅ LICENSED(implied,no bench)| matches W3 c=4 pattern |
+| W4 c=8 8K(agent burst)| ⚠ **CONDITIONAL** | bimodal 76-92%/56% per `a0a3f42`,fix `56dbd1c` 1.5d |
+| W4 c=16+ 8K | ❌ blocked by KV memory(#33)| 7.15GB hybrid + KV W4A8 needed for c=16 |
+
+**Production policy**(per `5cee921` reference table):
+- Tail-latency-bound workloads:cap=8 LICENSED all states
+- Turn-success-bound workloads:WAIT for `56dbd1c` prefill warmup fix or use cap=4
+- Mixed:cap=4 default,override `--prefill-max-requests 8` for known-warm
+
 ### §1.2.1.B KV quantization axis(P0 = **W4A8**)
 
 KV cache 量化,axis 跟 weight quant 正交。"W4A8" = K/V 存 4-bit + attention 内部 8-bit activation。
