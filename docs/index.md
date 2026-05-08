@@ -6,7 +6,7 @@
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
 
-Last refreshed: 2026-05-09 EOD (W4A8 GPTQ-zpfix LANDED `2a3a6f0` greedy 32/32 0% diff; W3/W4 admission deadlock unblocked `b708e00`; cap=8 default + warmup fix LICENSED at W3 c=4/c=16 `12300c5`+`c20b1ce`; B3 Step 1 admission_allows signature `7c8fd61`; skill v1.6.0 with 18 anti-patterns; 100+ commits since 2026-05-08 EOD). Priority order canonical in [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order). Anchor doc for resumption: [`docs/research/2026-05-08-eod67-final-state-anchor.md`](research/2026-05-08-eod67-final-state-anchor.md). Pickup queue: [`docs/plans/codex-pickup-queue-2026-05-09-eod.md`](plans/codex-pickup-queue-2026-05-09-eod.md)(`f6a4869`).
+Last refreshed: 2026-05-09 EOD (W4A8 GPTQ-zpfix LANDED `2a3a6f0` greedy 32/32 0% diff; W3/W4 admission deadlock unblocked `b708e00`; cap=8 default + warmup fix LICENSED at W3 c=4/c=16 `12300c5`+`c20b1ce`; B3 Step 1 admission_allows signature `7c8fd61`; skill v1.6.0 with 18 anti-patterns; 100+ commits since 2026-05-08 EOD). Priority order canonical in [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order). Anchor doc for resumption: [`docs/research/2026-05-08-eod67-final-state-anchor.md`](research/2026-05-08-eod67-final-state-anchor.md). Pickup queue: [`docs/plans/codex-pickup-queue-2026-05-09.md`](plans/codex-pickup-queue-2026-05-09.md)(`f6a4869`).
 
 ## Canonical Truth Surfaces
 
