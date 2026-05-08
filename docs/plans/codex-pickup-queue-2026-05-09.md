@@ -50,7 +50,8 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 15 | Claude — pickup queue NO-OP triage acknowledgment | `921f313` | Reference + cycle codification |
 | 16 | Codex — `12300c5` was actual fix,c20b1ce dead code | `3fea979` | **CLOSURE — 7-layer audit chain CLOSED + anti-pattern #22 final framing** |
 | 17 | Codex — P0.3 framing correction post closure | `82eda25` | Surgical doc edits prescribed |
-| 18 | Claude — apply 3 surgical edits to pickup queue P0.3 | (this commit) | Cycle compounds into anti-pattern #22 sub-rule:**downstream-doc citation pollution** |
+| 18 | Claude — apply 3 surgical edits to pickup queue P0.3 | `e247c4f` | Cycle compounds into anti-pattern #22 sub-rule:**downstream-doc citation pollution** |
+| 19 | Codex — annotate 2 wins entries + **Layer-8 confound discovery** | `655accf` | `bwa4piqqx`(num_slots=4)vs `b1mm1k0r7`(num_slots=16)= multi-variable confound,NOT c20b1ce isolation |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
@@ -69,10 +70,18 @@ recipe verified-correct,**c20b1ce dead-code revealed via 7-layer chain closure**
 | (c) | YES | NO | **100%(predicts H7-A)** |
 | (d) | NO | YES | **76%(predicts H7-A)** |
 
-If (c)≈(b) and (d)≈(a):H7-A confirmed → revert c20b1ce + annotate 3 wins entries
-(`2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md`,
-`2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md`,
-`2026-05-08-cap8-chain-final-synthesis.md`)。
+If (c)≈(b) and (d)≈(a):H7-A confirmed → revert c20b1ce + annotate 3 wins entries。
+**Codex `655accf` already annotated 2 of 3 wins entries**:
+- `2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md`(annotated)
+- `2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md`(annotated)
+- `2026-05-08-cap8-chain-final-synthesis.md`(pending — Claude can do tomorrow)
+
+⚠ **Layer-8 SOLID requirement on the 4-cell A/B itself**(per `655accf`):
+**FIX num_slots constant across all 4 cells**。Original "validation bench"
+had `bwa4piqqx`(num_slots=4)vs `b1mm1k0r7`(num_slots=16)= multi-variable
+confound。4-cell A/B MUST run with `--num-slots 8`(production-default)across
+ALL cells,changing ONLY the c20b1ce/12300c5 revert axes。Otherwise we
+repeat the original confound trap。
 
 Ordering:**4-cell A/B BEFORE Phase 1.A nvtx decomposition** — corrects
 the bimodal-root-cause assumption baseline before Phase 1 invests effort。
