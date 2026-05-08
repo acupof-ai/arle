@@ -58,6 +58,8 @@ This session demonstrated **bidirectional audit pattern** at unprecedented densi
 | 21' | Codex review — Phase 1b decode-panic finding | `156d2c2` precursor | "decode step for hybrid checkpoint will panic instead of serving" → gate option chosen |
 | 22 | Codex — targeted-test interpretation verified SOLID | `156d2c2` | Pre-commit empirical-impact verification per skill v1.7.0 #19 + v1.8.0 #22 discipline |
 | 23 | **Codex — P0.2 SUBSTRATE LANDED**(`feat(cuda): load hybrid W4 Marlin side tensors`)| `232aed5` | **Phase 1b loader-only,reject hybrid at linear dispatch,warmup.rs reverted to `num_slots.min(256)`,5 src + wins entry**;bench TTFT p50 68.4ms regression gate PASS |
+| 24 | Claude — current main = cell (c) state verified by code-grep | `717b304` | Partial H7-A evidence collected:cell (c) at c=1 PASS + cell (b) historical 100% turn success(annotated) |
+| 25 | Codex — cell (d) recipe with kill criterion(12300c5 attribution) | `1bf408d` | Step-by-step revert recipe + Layer-8 num_slots=8 gate enforcement + restore step;most informative single remaining experiment |
 
 **Pattern**:each prescription layer audited by other side。Compounding rigor。
 **Outcome**:B3 Step 2 LANDED LICENSED -24.2% TTFT,**3 skill v1.8.0
@@ -91,6 +93,15 @@ repeat the original confound trap。
 
 Ordering:**4-cell A/B BEFORE Phase 1.A nvtx decomposition** — corrects
 the bimodal-root-cause assumption baseline before Phase 1 invests effort。
+
+### Concrete cell-by-cell pickup-ready recipes(per stages 24-25)
+
+| Cell | Status | Recipe |
+|------|--------|--------|
+| (b) | ✅ Historical bench data + annotation | Pre-`232aed5` main 100% turn success per annotated wins entries |
+| **(c)** | ✅ Code-grep verified post `232aed5` | Current main = cell (c)。c=1 partial bench PASS。**W3 c=4 cap=8 verify needed**(~10 min Claude bench) |
+| **(d)** | 📋 **Recipe ready** | `docs/research/2026-05-09-eod98-cell-d-recipe-12300c5-attribution-kill-criterion.md`(`1bf408d`)— sed `Some(8)→Some(4)`,build,bench,restore(~30 min) |
+| (a) | 🟡 Pending recipe | Revert BOTH(`git revert 232aed5 12300c5`),build,bench,restore(~30 min) |
 
 ## ⚠ STRATEGIC RE-ORDERING(2026-05-09 EOD)— per codex `d2c2c17`
 
