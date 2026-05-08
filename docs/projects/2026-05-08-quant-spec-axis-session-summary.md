@@ -111,3 +111,36 @@ Per skill rule #6 (License-or-kill σ < 5%): all KILLs this session had σ < 5% 
 - **Don't reflexive-KILL on workload-specific failures**: 4k random text spec-decode dead does NOT close the spec axis. W3/W4 + long-ctx + Medusa remain.
 - **W4A16 Marlin remains production decode default** until W4A8 fix; do not attempt premature default-on flip.
 - **Apply skill v1.3.0 Phase 5 isolation-motive callout**: any `--kv-cache-dtype` override triggers matched-control double-check.
+
+## EOD-2 update (post-fcb3fa8 commits 16-19)
+
+After session summary v1, 4 more commits landed:
+
+16. **`decf8c5`** M_spec plan reframed — 4k random text classical workload-dead, promote Medusa above classical
+17. **`25391f3`** Codex H3 CONFIRMED — row stride [4k] vs [2k skip-8] (PR #31 reference comparison)
+18. **`62f885d`** Claude H3 row-fix applied — 4-line patch + re-quantize + re-test → **PARTIAL** (output qualitative changed: period spam → multilingual real-word gibberish; token diff still 100%)
+19. (this entry — EOD-2 pulse)
+
+W4A8 hypothesis chain now: 5 → 1 → 0.5 (row-stride fix corrected magnitude
+but cross-tile / scale-level positioning still wrong). Remaining bug
+suspects ranked:
+
+| # | Suspect | Probability |
+|---|---|---:|
+| Block stride `256 * j` | maybe needs `128 * j` for INT8 byte stride halving | 35% |
+| Interleave `[0,2,4,6,1,3,5,7]` | INT8 mma may need different pattern | 25% |
+| Reshape `(-1, 8)` then `[:, interleave]` | post row-fix, 8-column unit may differ | 20% |
+| `pack_w4a8()` bit-packing `q |= res_np[:, i::8] << (4*i)` | could be wrong for INT8 layout | 15% |
+| `scale_perm` re-verify | codex marked OK but post row-fix worth re-check | 5% |
+
+**Next-fix probability**: ~50-60% (right area, multiple candidates).
+
+Codex action: compare ALL of `pack_w4a8()` (lines 73-111) with PR #31
+reference verbatim, not just `get_perms()`. Apply incremental patches
+with greedy_consistency gate.
+
+## Today's full commit chain (19 total)
+
+`f6f3af3` `2853551` `4571082` `d09480b` `e61d26e` `62e75ee` `81b6481`
+`e20f24c` `b65c8c6` `88dfafc` `5f26675` `3864751` `e3ca4d8` `3ac5f4d`
+`fcb3fa8` `decf8c5` `25391f3` `62f885d` (this update commit)
