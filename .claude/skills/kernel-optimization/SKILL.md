@@ -485,6 +485,61 @@ Each anti-pattern has a project commit/entry where it was paid for.
     - These hidden contracts don't appear in kernel source or pack
       source — they're entirely in the parser → kernel expectation chain.
 
+15. **"Warm-server" implicit dependency trap**
+    - Caught by: `19d12c2` cap=8 override 100% turn success vs `bwa4piqqx`
+      cap=8 default 76% on fresh-build server (same nominal config).
+      Override case had been preceded by prior benches that warmed
+      CUDA Graph cache for batches 5-8; default fresh-build did not.
+    - Without methodology, single-run LICENSE based on warm-server
+      reads as production-ready when it's actually conditional on
+      cache state.
+    - Fix: production-readiness benches MUST start from cold
+      `cargo clean && cargo build` build state OR explicitly document
+      warm-state assumption with deployment guidance. For
+      CUDA-Graph-related benches, log warmup output and note any
+      cache-dependent behavior.
+    - Generalizes: any bench whose result varies between cold and
+      warm process states needs both verified before LICENSE.
+
+16. **Implicit-coupling-via-shared-default trap**
+    - Caught by: `12300c5` bumped `Some(4) → Some(8)` in `forward.rs:316`
+      but `core/warmup.rs:47` had hardcoded `max=4` independently.
+      Single-line config flip broke implicit two-place coupling →
+      production regression on fresh-server cold-start.
+    - Without methodology, "1 LOC change" reads as low-risk when
+      it's actually multi-site coupling rewrite.
+    - Fix: future config-change PR commit body must include grep
+      evidence dump:
+      ```bash
+      $ grep -rn 'OLD_VALUE' infer/src/ crates/cuda-kernels/src/
+      file1.rs:N: this PR changes
+      file2.rs:M: ← also needs OLD_VALUE → NEW_VALUE flip (coupling)
+      ```
+      This forces author to AUDIT all coupling sites before single-line
+      change merges. Codex review process should require this template.
+
+17. **Bimodal failure distribution masks single-run LICENSE**
+    - Caught by: `a0a3f42` cap=8 6-run dataset showed 67% normal mode
+      (76-92% turn success) + 33% degraded mode (56% turn success,
+      byte-identical 23424 tokens out across multiple occurrences).
+      `8281047` LICENSE was based on single normal-mode run.
+    - Without methodology, single-run LICENSE assumes unimodal distribution
+      and is systematically optimistic when bimodal exists.
+    - Fix: multi-run sampling characterizes DISTRIBUTION, not single
+      "true" value. Deployment confidence must account for mode
+      probability:
+      - N=1: point estimate (can be normal or degraded outlier)
+      - N=3: detect bimodal vs unimodal
+      - N=10+: full distribution shape + confidence interval
+    - For binary-outcome thresholds (turn success ≥ 95%), N=3 minimum
+      across run positions to characterize whether stable or progressive
+      degradation. Single-run with σ-tight metrics is necessary but NOT
+      sufficient.
+    - Distribution-shape rule: if runs split into modes, document mode
+      probability in LICENSE entry. Production confidence band =
+      `mode_prob × mode_value` summed across modes, not just single
+      best-case.
+
 ---
 
 ## Quick reference (cheat sheet)
