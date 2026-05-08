@@ -28,7 +28,10 @@ import safetensors.torch as st
 import torch
 
 
-KERNEL_BOUND = 127.0 / 7.0  # ≈ 18.142857
+# Codex 163c8ee corrected derivation: MAGIC_NUM 0x6480 = FP16 1152.0 (not 1536).
+# Constraint: (q-8) * s_group_stored + 1152 ∈ [1024, 1280) → product ∈ [-128, 128).
+# q=0 case is BINDING: -8 * s ≥ -128 → s ≤ 16. (Tighter than q=15: s < 18.286.)
+KERNEL_BOUND = 16.0
 
 
 def compute_s_group_stored(qweight_u8, scales_bf16, groupsize=128):
