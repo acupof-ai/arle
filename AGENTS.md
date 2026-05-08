@@ -22,11 +22,22 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
   silent 放过**。
 - **写完先自检**:每份 plan / wins / errors / brief / 推荐落地前,先问"SOLID 吗?gap 在哪?
   深入还是显式 deferred?"。不达标自我反思,继续深入。
+- **Framing 多角度交叉**:同一数据用不同 framing(per-NVTX-window vs per-wall-clock,
+  per-launch vs per-token,per-layer vs per-request)给出不同结论时,**wall-clock /
+  per-request framing 是 ground truth**。Narrow window 占比 X% 不等于实际 wall-clock 影响 X%。
+  License-or-kill 决策必须用 wall-clock framing,不用 narrow window framing 自欺。
 
-实证经验:2026-05-08 M_pf-graph Phase 0 KILL 后回顾,errors entry 80% SOLID(具体 graph
-hit/miss 计数器 + 实测 throughput regression),但 3 个 SOLID gap(launch overhead 占比
-未 nsys 验证 / SGLang 实际 graph trigger 计数未对照 / 4 个变量同时改未隔离),导致"graph
-capture 不是 SGLang 主因"这个 strategic conclusion **不够 SOLID**。
+实证经验:
+- **2026-05-08 EOD M_pf-graph Phase 0 KILL** 回顾:errors entry 80% SOLID(具体 graph
+  hit/miss 计数器 + 实测 throughput regression),但 3 个 SOLID gap(launch overhead 占比
+  未 nsys 验证 / SGLang 实际 graph trigger 计数未对照 / 4 个变量同时改未隔离),导致"graph
+  capture 不是 SGLang 主因"这个 strategic conclusion **不够 SOLID**。
+- **2026-05-08 EOD+19 M_pf-graph v2 nsys framing trap**:codex nsys finding "dispatch
+  55.7% of prefill launch window" → license Phase 0v2.B PASS,但 §Problems 自己写 "only
+  191 ms in 60s trace" = per prefill 6.4ms / TTFT 1995ms = **0.32% wall-clock**。Window
+  framing PASS 但 wall-clock framing < 10% kill threshold。**License 决策错误**因为用错
+  framing。**Lesson**:nsys "X% of NVTX window" 必须 cross-check "(Y ms / per-request total
+  time)" framing,**取保守的那个**作 license-or-kill ground truth。
 
 ---
 
