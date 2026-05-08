@@ -313,7 +313,12 @@ impl ModelForward for Qwen3Model {
             // allocates a FP16 output scratch per projection. A 16-slot burst
             // can otherwise fit the token budget but still OOM the temporary
             // GEMM scratch, which used to panic the scheduler thread.
-            Some(4)
+            //
+            // Cap=8 validated SAFE multi-shape per `27fd5de`(W4 c=8 8K + W3
+            // c=16 short multiturn,both 100% turn success,peak mem 700 MB
+            // headroom)。Reduces TTFT p99 -86%(72515→10259 ms)at W4 c=8
+            // 8K agent burst per `19d12c2`。
+            Some(8)
         } else {
             None
         }
