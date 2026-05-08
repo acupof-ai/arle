@@ -179,14 +179,22 @@ impl<M: ModelForward> Scheduler<M> {
         let block_size = self.prefix_cache.block_size();
         let heuristics = LookupHeuristics::default();
         let mut session_slot_hold = None;
-        let mut lookup = if let Some(session_id) = session_id
-            && let Some(session_lookup) =
-                self.lookup_session_slot_or_stage(session_id, prompt_tokens.len(), heuristics)
-        {
-            session_slot_hold = Some(session_lookup.hold);
-            session_lookup.lookup
-        } else {
-            self.prefix_cache.lookup_or_stage(prompt_tokens, heuristics)
+        // P0.0 Phase 1.A nvtx scope per `2fafa9e` recipe + `b55bfcd` block-as-rvalue
+        // scoping fix. Isolates prefix::lookup phase from broader step_admission for
+        // nsys 4-phase decomposition (prefix lookup / prefill compute / first decode /
+        // scheduling overhead). _nvtx_scope drops at block-end → range_pop().
+        let mut lookup = {
+            use crate::scheduler::cuda::nvtx_scopes::nvtx_scope;
+            nvtx_scope!("step_admission_prefix_lookup");
+            if let Some(session_id) = session_id
+                && let Some(session_lookup) =
+                    self.lookup_session_slot_or_stage(session_id, prompt_tokens.len(), heuristics)
+            {
+                session_slot_hold = Some(session_lookup.hold);
+                session_lookup.lookup
+            } else {
+                self.prefix_cache.lookup_or_stage(prompt_tokens, heuristics)
+            }
         };
         let mut session_resume_tokens = 0;
         if session_slot_hold.is_some() {
