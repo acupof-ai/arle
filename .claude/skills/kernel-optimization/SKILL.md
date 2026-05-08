@@ -617,3 +617,27 @@ cargo test --release --features cuda --test greedy_consistency
 - Triton (alternative DSL): <https://github.com/openai/triton>
 - ncu reference: <https://docs.nvidia.com/nsight-compute/>
 - nsys reference: <https://docs.nvidia.com/nsight-systems/>
+
+---
+
+## Recent skill version history
+
+| Version | Date | Anti-patterns | Source commits |
+|---|---|---:|---|
+| v1.0.0 | 2026-04-XX | 8(initial) | initial creation |
+| v1.1.0 | 2026-05-XX | 11 | added #9-11 |
+| v1.2.0 | 2026-05-XX | 12 | added #12 (decode-vs-prefill duality) |
+| v1.3.0 | 2026-05-XX | 13 | `faffcb0` added #13 (NULL elimination) |
+| **v1.4.0** | **2026-05-08** | **14** | **`6c627c4` added #14 (upstream-data parser silent corruption per `5593865` qzeros bug)** |
+| **v1.5.0** | **2026-05-08** | **17** | **`f05ea3a` added #15-17 from cap=8 chain** |
+| **v1.5.1** | **2026-05-08** | **17(refined)** | **`9f65b4d` #17 workload-shape refinement per `063da81`** |
+
+Cumulative compound learning pattern:single-day cap=8 chain produced
+3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
+verification added empirical evidence that compounded into rule
+sophistication。Skill rules accumulate via empirical evidence,not
+upfront design。
+
+For future maintainers:when adding new anti-patterns,reference the
+specific source commit + research entry that triggered the rule。
+This preserves evidence trail and prevents rule drift。
