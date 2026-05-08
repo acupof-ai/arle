@@ -1,8 +1,34 @@
-# M_quant Round 4 #6 — W4A16BatchGemv override LICENSE bench(pending-remote)
+# M_quant Round 4 #6 — W4A16BatchGemv override LICENSE bench(KILLED 2026-05-09 EOD+108)
 
-> Status:**pending-remote**(per CLAUDE.md MANDATORY-bench-per-change rule)。
-> Implementation `02209f4` LANDED;bench requires GPU pickup to enable env
-> var + run Round 1 protocol。
+> **Status:KILLED** — empirical bench shows +37% ITL regression vs Marlin baseline。
+> Implementation `02209f4` unguarded(KILLED via `eod106` preliminary bench)+
+> `(this commit)` refined override(`batch ∈ 2..=8` gate prevents prefill firing)
+> ALSO empirically KILLED at decode-batched 2..=8。Default OFF preserves Marlin
+> path,no production impact。R4#6 hypothesis empirically eliminated。
+
+## EOD+108 KILL bench results(refined override,N=52 successful @ 110s)
+
+Per refined override with `batch <= 8` gate(prefill protected):
+
+| Metric | R4#6 refined | Round 1 Marlin | Δ |
+|---|---:|---:|---:|
+| ITL p50 | **24.84 ms** | 18.13 ms | **+37% WORSE** |
+| TTFT p50 | 2.34 sec | 1.98 sec | +18%(prefill bounded) |
+| Out tok/s p50 | 160.8 | ~150 | +7% |
+| Successful | 52/52(100%) | 100% | matched |
+| σ/mean(ITL) | < 0.5%(p50=24.84,p99=24.93) | tight | ✓ valid |
+
+**Phase 8 license decision**:**KILL**。Δ -37% ≠ predicted +37%-59%(ITL ≤ 12.85ms threshold)。
+
+**Why W4A16BatchGemv loses to Marlin even at decode batch=4**:Marlin's tensor-core
+utilization for W4 GEMM(3 launches × tensor-core throughput)beats W4A16BatchGemv's
+launch-overhead savings(1 launch × less-optimized BF16 path)。Predicted "1.4× practical"
+was wrong for batch=4 specifically。
+
+**Skill v1.8.0 anti-pattern #25 empirically grounded**:hypothesis-context vs
+implementation-context mismatch + bench reveals shape-cost-tradeoff inversion。
+
+## Original goal/hypothesis(historical context for reference)
 
 ## Goal
 

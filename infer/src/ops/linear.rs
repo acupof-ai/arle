@@ -69,15 +69,18 @@ impl LinearKernelPlan {
             return Self::MarlinW4A8Gemm;
         }
         // M_quant Round 4 #6: env-gated override to prefer W4A16BatchGemv (BF16-native,
-        // 1 launch) over MarlinW4Gemm (3 launches: bf16→fp16 + gemm + fp16→bf16).
-        // Default OFF preserves Marlin path; INFER_R4_W4A16_GEMV_OVERRIDE=1 falls through
-        // to the W4A16 match arm at line ~89 below. See docs/research/2026-05-09-eod102-r4-w4a16-gemv-override-phase0-audit.md.
+        // 1 launch) over MarlinW4Gemm (3 launches) ONLY for decode-batched (batch ∈ 2..=8).
+        // Prefill (batch > 8 = seq_len > 8) always uses Marlin per Round 1 baseline (tensor-core
+        // utilization wins for matrix-matrix). EOD+106 preliminary bench showed unguarded
+        // override caused +37% ITL regression because it fired for prefill seq=4096.
+        // See docs/research/2026-05-09-eod106-r4-6-bench-preliminary-solid-gap.md.
         if batch > 1
             && marlin_prefill_aligned(weight).is_ok()
-            && std::env::var("INFER_R4_W4A16_GEMV_OVERRIDE")
-                .as_deref()
-                .ok()
-                != Some("1")
+            && !(batch <= 8
+                && std::env::var("INFER_R4_W4A16_GEMV_OVERRIDE")
+                    .as_deref()
+                    .ok()
+                    == Some("1"))
         {
             return Self::MarlinW4Gemm;
         }
