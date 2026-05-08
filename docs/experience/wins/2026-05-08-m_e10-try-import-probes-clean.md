@@ -1,5 +1,44 @@
 # Eval — M_e.10 try_import_memory_prefix probes + 2nd-bench confirmation — 2026-05-08
 
+## ⚠️ Errata (2026-05-08, this entry's own day)
+
+The "chat-template asymmetry / missing trailing `<|im_end|>`" diagnosis
+in this entry is **wrong**. Cross-repo subagent re-decoded the recorded
+`prompt_head` against `models/Qwen3.5-0.8B/tokenizer.json` and found
+the first divergence is at token index 5 inside the **system message
+body** — turn 1 has `system="You are Eli, a..."`, turn 2 has
+`system="You are a helpful assistant"`. Both turns are *before* either
+side reaches `<|im_end|>`.
+
+ARLE's ChatML renderer is symmetric:
+[`crates/chat/src/protocol.rs:331-336`](../../../crates/chat/src/protocol.rs)
+`PromptRenderer::push_user` always calls `end_message()` (`<|im_end|>\n`)
+on every user message including the trailing one (asserted by tests at
+`protocol.rs:683` and `lib.rs:239`). So the `[system + user1]` vs
+`[system + user1 + <|im_end|> + ...]` framing in §"Why this confirms
+the root cause" below is incorrect.
+
+**Real root cause:** eli sends two different `system` strings across
+turns. In
+[`eli/crates/eli/src/builtin/agent/agent_run.rs:552-553`](https://github.com/.../eli)
+`system_prompt_for_turn(...)` is recomputed each call to `agent_loop`.
+When `state[RUNTIME_SYSTEM_PROMPT_KEY]` is unset
+(`agent_request.rs:233-238`), it falls back to
+`PromptBuilder::new(PromptMode::Full).build(...)` which produces a
+different string on a subsequent invocation (or a non-agent code path
+substitutes the stock "You are a helpful assistant").
+
+**Minimum patch — eli-side only, one line:** at session start,
+precompute the system prompt and stash it under `RUNTIME_SYSTEM_PROMPT_KEY`
+before the loop. Every subsequent `system_prompt_for_turn` then hits
+the precomputed branch at `agent_request.rs:234-238`. **No ARLE
+change required** — neither chat template nor tokenizer_config.
+
+The probe instrumentation, bench numbers, and "10% prefix-cache hit
+rate" measurement below all stand. Only the §"chat-template asymmetry"
+interpretation is replaced by the eli-side system-prompt instability
+above.
+
 ## Goal
 
 Follow-up to
