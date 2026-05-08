@@ -202,6 +202,7 @@ Each tick that revisits this plan logs the conflict-gate status here so the
 | 2026-05-08 ~11:55 | YES | `codex review --uncommitted` (16m) | Plan written (`1c534e6`) |
 | 2026-05-08 ~12:07 | YES | `codex review --uncommitted` (28m, codex edited linear.rs:136-138 group_size constraint) | Conflict still active; brief queued to codex tmux 0:0 |
 | 2026-05-08 ~12:12 | YES (5 files: linear.rs + gemm.rs ffi + quant.rs + 2 new C kernels) | review continues (32m) | Self-loop ScheduleWakeup armed; auto re-checks every ~270s |
+| 2026-05-08 ~12:32 | YES (12 files; codex review continues 40m) | review continues; **codex acknowledged R4 #6 brief**: "W4A8 没 small-batch hybrid threshold,R4 #6 后续单独 tranche 覆盖" → R4 #6 stays valid | Codex 本地 commit `1e713de` (unpushed): KV W4A8 plan (orthogonal axis to weight, master §1.2.1.B P0). R4 #6 (W4A16 weight axis) and KV W4A8 (KV axis) compose: combined Phase 1.B bench should be 3-way A/B (W4A16-only / KV-W4A8-only / both). Plan separately. |
 
 When this table shows `NO` for `linear.rs WIP`, Claude proceeds Phase 5
 without further confirmation: rebase → apply 10-LOC edit → `cargo build`
