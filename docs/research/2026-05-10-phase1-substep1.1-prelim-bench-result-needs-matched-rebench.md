@@ -2,8 +2,39 @@
 title: Phase 1 Substep 1.1 prelim bench — STRIKING ITL -36% signal but workload-size mismatch confounds (needs σ-tight re-bench)
 date: 2026-05-10
 type: research
-status: prelim-result-pending-matched-control-rebench
+status: SUPERSEDED-by-f86d0fd-correct-baseline-match
 ---
+
+> **⚠️ SUPERSEDED by codex `f86d0fd` wins entry — 4th Claude
+> hallucination this session**
+>
+> My ITL -35.9% claim used WRONG baseline. Direct evidence (raw
+> `cat command.txt` + `head wins entry` this tick):
+> - 2026-05-09 baseline-B5 used `Qwen3-4B-GPTQ-W4A16-marlin-zpfix`
+>   (zpfix variant, ITL 17.77 ms) — different checkpoint
+> - 2026-05-08 baseline used `Qwen3-4B-W4A16-sym-g128-marlin`
+>   (same as newdequant-r1, ITL 11.76 ms n=3 median)
+>
+> Codex's `f86d0fd` correctly picked matched-checkpoint baseline.
+> Real Δ% (vs 2026-05-08 W4A16 baseline):
+> - TTFT p50: 2565.4 → 2386.3 = **-7.0%**
+> - ITL p50: 11.76 → 11.38 = **-3.2%** (matches e59beb5 conservative
+>   -3-8% estimate)
+> - out tok/s: 191.16 → 195.17 = **+2.1%**
+>
+> **Phase 1.1 LICENSED on conservative gate** — substrate works, modest
+> real win, no regression.
+>
+> Per skill v1.10.0+ #28 strengthened: ANY baseline comparison claim
+> needs raw `command.txt` verification of WHICH CHECKPOINT each
+> baseline uses. I assumed comparable without verifying. 4th
+> Claude hallucination this session (after `0f4d0ae` CLI flag,
+> `43bda9c` reduce buffer, `4b30c15` /health endpoint).
+>
+> The §0-3 analysis below is mathematically correct FOR the
+> baseline I picked, but the baseline was wrong. Treat all
+> "ITL -35.9%" claims below as INVALID — codex's f86d0fd numbers
+> are the authority.
 
 # Phase 1 Substep 1.1 prelim bench — STRIKING ITL -36% signal but workload-size mismatch confounds (needs σ-tight re-bench)
 
