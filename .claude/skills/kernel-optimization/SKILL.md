@@ -726,6 +726,55 @@ Each anti-pattern has a project commit/entry where it was paid for.
           complete, not after. Saves audit-blindspot-grounded LANDS
           that bench reveals as KILLED post-substrate.
 
+26. **Smoke-test small-shape success ≠ production-shape success (capture-key combinatorics)**
+    - Caught by: `a7a8b94` #37 Path B v1 KILL (2026-05-10). Path B device-memory
+      `start_pos` smoke at shapes (page_indices_len=4, prefix_token_rows=3,
+      paged_tokens=8) showed clean cache hits and dropped multi-key churn.
+      But at production 4k/c=4 (page_indices_len up to 64+, prefix_token_rows
+      up to 128+, varying per request), **388 unique capture keys appeared
+      across a 60s window with 0% reuse** — exactly the same outcome as the
+      Path A multi-key cache that had been killed two days earlier.
+    - The smoke shapes accidentally collapsed the variation that production
+      actually exhibits: a handful of fixed dim values can hit a 1-key cache
+      trivially; a continuous distribution of dim values blows the key space
+      out by orders of magnitude.
+    - Fix: Smoke benches for **cache-hit-rate** claims must enumerate the
+      production distribution of cache-key dims, not pick fixed test points.
+      Either (a) sample real production traces for the dim distribution, or
+      (b) parameterize the smoke over the full expected dim range and report
+      key-cardinality + reuse-rate, not just functional correctness. **Cache
+      claims need cardinality evidence, not hit/miss-on-one-shape evidence.**
+    - Companion to anti-pattern #6 ("license on capture exists not capture
+      reused"): same family of error — the shape under test must match the
+      shape under license.
+
+27. **Bucketing without scalar-capture sync (semantic cache miss disguised as functional cache hit)**
+    - Caught by: `a56b7a9`/`c44788f` #40 Path B.2 wins (2026-05-10), specifically
+      Codex's "second-order bucketing" insight beyond Claude's brief.
+    - Setup: Path B.2 added bucketing to the cache key (`page_indices_len`
+      rounded to 64, `prefix_token_rows_len` rounded to 128). Without the
+      second-order step, bucketed-key collisions still produce semantic
+      cache MISSES because the captured TileLang launch parameters
+      (`total_pages`, `prefix_token_count`) were baked from the FIRST
+      capture's exact dim, not the bucket capacity. Replay with a different
+      dim within the same bucket fed an outdated scalar into the captured
+      kernel — silent functional bug or wasted re-capture.
+    - Fix: When bucketing a cache key, **every captured scalar that depends
+      on the bucketed dim must use the bucket capacity, not the
+      first-capture exact value**. Pad input vecs to bucket capacity, zero-fill
+      the slack, assert capacity invariants at allocation site. Audit the
+      capture site for "every place this dim flows in" — kernel scalars,
+      grid dims, mask sizes, allocation sizes.
+    - Evidence of magnitude: without second-order sync, Path B v1 had 388
+      unique capture keys at 4k/c=4. With bucketing alone (first-order),
+      keys collapse but kernels would replay with stale scalars. With
+      second-order sync (Path B.2), 7 unique keys + 98.5% reuse + engine
+      TTFT -92.5% + +632% throughput.
+    - Methodology lesson: **the "obvious" first-order fix is usually only
+      half the win** when the cache key is a derived shape and downstream
+      capture absorbs other shape-derived values. Audit the full data flow
+      from key → capture, not just the key itself.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -812,6 +861,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.6.0** | **2026-05-09** | **18** | **`125f795` added #18 Phase 0 substrate audit per `1217375` A1 audit + B3 Step 2 -30% scope** |
 | **v1.7.0** | **2026-05-09** | **19** | **`c768b70` added #19 dispatch directive path verification per `8935851` index.md broken link + `de8b4dc` pickup queue stale path** |
 | **v1.8.0** | **2026-05-09** | **25** | **(this commit) batch-added #20-25 from c20b1ce attribution + R4#6 KILL + recipe audit chain. Anti-pattern theme: "audit at every prescription layer including recipes themselves"; key lesson: empirical bench is truly orthogonal SOLID layer that catches what bidirectional code audits both miss (#25 evidence). Sources: `c076aae` #20 / `b55bfcd`+`af44efa` #21 (2 evidence points) / `919c0fb`+`8d91d20`+`3fea979` #22 / `156d2c2` #23 / `1ccb448` #24 / `fe9ea8a`+`3b9cc06` #25** |
+| **v1.9.0** | **2026-05-10** | **27** | **(this commit) added #26-27 from #37 Path B v1 KILL → #40 Path B.2 wins chain. Theme: "cache-hit-rate claims need cardinality evidence, and bucketing fixes need second-order scalar-capture sync". Sources: `a7a8b94` #26 (Path B v1 388-key churn at 4k production despite shape-(4,3,8) smoke success) / `a56b7a9`+`c44788f` #27 (Codex's second-order bucketing insight beyond Claude brief: bucketed key + captured scalars baked at first-capture dim = semantic miss; bucketed key + captured scalars baked at bucket capacity = 98.5% reuse, engine TTFT -92.5%). Compound learning: the same Phase B family of optimization required two distinct anti-pattern lessons, one per KILL→WIN cycle.** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
