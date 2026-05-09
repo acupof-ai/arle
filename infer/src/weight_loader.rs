@@ -1152,6 +1152,53 @@ pub(crate) fn precompute_rope(
     precompute_rope_with_scaling(ctx, head_dim, max_seq_len, theta, None)
 }
 
+/// Convert a `qwen35_spec::RopeScalingConfig` to its `qwen3_spec` mirror so
+/// the same scaled-inv_freq math (in qwen3_spec) can drive both backends.
+/// Per `docs/plans/M_rope-yarn-scaling.md` Phase 2 step 2 (2026-05-10):
+/// per-crate enum duplication is intentional; a shared rope-spec crate is
+/// deferred until DeepSeek-V4 needs the same enum. This conversion is the
+/// thin shim that bridges them in the meantime.
+fn qwen35_to_qwen3_rope_scaling(
+    src: &qwen35_spec::RopeScalingConfig,
+) -> qwen3_spec::RopeScalingConfig {
+    use qwen3_spec::RopeScalingConfig as Dst;
+    use qwen35_spec::RopeScalingConfig as Src;
+    match src {
+        Src::Yarn {
+            factor,
+            original_max_position_embeddings,
+            beta_fast,
+            beta_slow,
+            attention_factor,
+            mscale,
+        } => Dst::Yarn {
+            factor: *factor,
+            original_max_position_embeddings: *original_max_position_embeddings,
+            beta_fast: *beta_fast,
+            beta_slow: *beta_slow,
+            attention_factor: *attention_factor,
+            mscale: *mscale,
+        },
+        Src::Linear { factor } => Dst::Linear { factor: *factor },
+        Src::NtkAware { factor } => Dst::NtkAware { factor: *factor },
+    }
+}
+
+/// qwen35-spec-typed wrapper over [`precompute_rope_with_scaling`]. The
+/// underlying math is identical (qwen3_spec::compute_scaled_inv_freq); only
+/// the enum type differs. Caller passes their `Qwen35Config::rope_scaling`
+/// directly without manual conversion.
+pub(crate) fn precompute_rope_with_qwen35_scaling(
+    ctx: &DeviceContext,
+    head_dim: usize,
+    max_seq_len: usize,
+    theta: f32,
+    scaling: Option<&qwen35_spec::RopeScalingConfig>,
+) -> Result<(DeviceVec, DeviceVec)> {
+    let converted = scaling.map(qwen35_to_qwen3_rope_scaling);
+    precompute_rope_with_scaling(ctx, head_dim, max_seq_len, theta, converted.as_ref())
+}
+
 /// Long-context-aware variant of [`precompute_rope`] that accepts an
 /// optional `RopeScalingConfig` (YARN / Linear / NtkAware). When `scaling`
 /// is `None`, this is bit-equivalent to the legacy `precompute_rope`
