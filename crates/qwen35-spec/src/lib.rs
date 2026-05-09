@@ -324,6 +324,76 @@ fn default_yarn_mscale() -> f32 {
     1.0
 }
 
+/// Compute the per-dimension RoPE inverse frequencies, optionally scaled
+/// by a long-context `RopeScalingConfig` variant.
+///
+/// Mirror of `qwen3_spec::compute_scaled_inv_freq` per
+/// `docs/plans/M_rope-yarn-scaling.md` Phase 1b step 2 (2026-05-10).
+/// Returns a vector of `head_dim / 2` floats. `scaling = None` reproduces
+/// the standard `inv_freq[i] = 1.0 / base.powf(2*i / head_dim)` formula.
+pub fn compute_scaled_inv_freq(
+    head_dim: usize,
+    base: f32,
+    scaling: Option<&RopeScalingConfig>,
+) -> Vec<f32> {
+    let half_dim = head_dim / 2;
+    let vanilla: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
+        .collect();
+    match scaling {
+        None => vanilla,
+        Some(RopeScalingConfig::Linear { factor }) => {
+            vanilla.into_iter().map(|f| f / factor).collect()
+        }
+        Some(RopeScalingConfig::NtkAware { factor }) => {
+            let exponent = (head_dim as f32) / (head_dim as f32 - 2.0);
+            let scaled_base = base * factor.powf(exponent);
+            (0..half_dim)
+                .map(|i| 1.0 / scaled_base.powf(i as f32 * 2.0 / head_dim as f32))
+                .collect()
+        }
+        Some(RopeScalingConfig::Yarn {
+            factor,
+            original_max_position_embeddings,
+            beta_fast,
+            beta_slow,
+            ..
+        }) => {
+            let max_pos = *original_max_position_embeddings as f32;
+            let low_freq_wavelen = max_pos / beta_fast;
+            let high_freq_wavelen = max_pos / beta_slow;
+            vanilla
+                .into_iter()
+                .map(|freq| {
+                    let wavelen = std::f32::consts::TAU / freq;
+                    if wavelen < high_freq_wavelen {
+                        freq
+                    } else if wavelen > low_freq_wavelen {
+                        freq / factor
+                    } else {
+                        let smooth = (max_pos / wavelen - beta_slow) / (beta_fast - beta_slow);
+                        smooth * freq + (1.0 - smooth) * (freq / factor)
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// Compute the YARN attention-score scaling factor (Peng et al. 2023 §3.4).
+/// Mirror of `qwen3_spec::compute_attention_factor`.
+pub fn compute_attention_factor(scaling: Option<&RopeScalingConfig>) -> f32 {
+    match scaling {
+        Some(RopeScalingConfig::Yarn {
+            factor,
+            attention_factor,
+            mscale,
+            ..
+        }) => attention_factor.unwrap_or_else(|| 1.0 + 0.1 * mscale * factor.ln()),
+        _ => 1.0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35Config {
     pub hidden_size: usize,
@@ -1361,5 +1431,147 @@ mod tests {
         let config = Qwen35Config::from_model_dir(temp.path()).unwrap();
         assert_eq!(config.stop_token_ids, vec![248_044, 248_167]);
         assert!(config.is_stop_token(248_167));
+    }
+
+    // ──────────────────────────── Phase 1b step 2 ─────────────────────────
+    // RoPE inv_freq + attention_factor compute helper tests
+    // (mirror of qwen3-spec; M_rope-yarn-scaling 2026-05-10)
+
+    #[test]
+    fn vanilla_inv_freq_matches_legacy_formula() {
+        let head_dim = 128;
+        let base = 1_000_000.0_f32;
+        let computed = compute_scaled_inv_freq(head_dim, base, None);
+        let legacy: Vec<f32> = (0..head_dim / 2)
+            .map(|i| 1.0 / base.powf(i as f32 * 2.0 / head_dim as f32))
+            .collect();
+        assert_eq!(computed.len(), legacy.len());
+        for (c, l) in computed.iter().zip(legacy.iter()) {
+            assert!((c - l).abs() < 1e-6, "computed {c} != legacy {l}");
+        }
+    }
+
+    #[test]
+    fn linear_scaling_divides_freq_by_factor() {
+        let head_dim = 64;
+        let base = 1_000_000.0_f32;
+        let scaling = RopeScalingConfig::Linear { factor: 4.0 };
+        let scaled = compute_scaled_inv_freq(head_dim, base, Some(&scaling));
+        let vanilla = compute_scaled_inv_freq(head_dim, base, None);
+        for (s, v) in scaled.iter().zip(vanilla.iter()) {
+            assert!((s - v / 4.0).abs() < 1e-6, "linear: {s} != {v}/4");
+        }
+    }
+
+    #[test]
+    fn ntk_aware_scaling_increases_base() {
+        let head_dim = 128;
+        let base = 1_000_000.0_f32;
+        let scaling = RopeScalingConfig::NtkAware { factor: 4.0 };
+        let scaled = compute_scaled_inv_freq(head_dim, base, Some(&scaling));
+        let vanilla = compute_scaled_inv_freq(head_dim, base, None);
+        assert!((scaled[0] - 1.0).abs() < 1e-6);
+        assert!((vanilla[0] - 1.0).abs() < 1e-6);
+        for i in 1..scaled.len() {
+            assert!(
+                scaled[i] < vanilla[i],
+                "ntk dim {i}: scaled {} should be < vanilla {}",
+                scaled[i],
+                vanilla[i]
+            );
+        }
+    }
+
+    #[test]
+    fn yarn_scaling_blends_extrap_and_interp() {
+        let head_dim = 128;
+        let base = 1_000_000.0_f32;
+        let factor = 4.0_f32;
+        let scaling = RopeScalingConfig::Yarn {
+            factor,
+            original_max_position_embeddings: 32_768,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: None,
+            mscale: 1.0,
+        };
+        let scaled = compute_scaled_inv_freq(head_dim, base, Some(&scaling));
+        let vanilla = compute_scaled_inv_freq(head_dim, base, None);
+        assert!(
+            (scaled[0] - vanilla[0]).abs() / vanilla[0] < 0.01,
+            "yarn high-freq dim 0: {} vs vanilla {}",
+            scaled[0],
+            vanilla[0]
+        );
+        let last = scaled.len() - 1;
+        let expected_interp = vanilla[last] / factor;
+        assert!(
+            (scaled[last] - expected_interp).abs() / expected_interp < 0.01,
+            "yarn low-freq dim {last}: {} vs vanilla/factor {expected_interp}",
+            scaled[last]
+        );
+    }
+
+    #[test]
+    fn yarn_factor_one_is_near_noop() {
+        let head_dim = 64;
+        let base = 1_000_000.0_f32;
+        let scaling = RopeScalingConfig::Yarn {
+            factor: 1.0,
+            original_max_position_embeddings: 32_768,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: None,
+            mscale: 1.0,
+        };
+        let scaled = compute_scaled_inv_freq(head_dim, base, Some(&scaling));
+        let vanilla = compute_scaled_inv_freq(head_dim, base, None);
+        for (s, v) in scaled.iter().zip(vanilla.iter()) {
+            assert!(
+                (s - v).abs() / v.abs() < 1e-3,
+                "yarn factor=1: scaled {s} != vanilla {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_factor_for_yarn_uses_mscale_log_factor() {
+        let scaling = RopeScalingConfig::Yarn {
+            factor: 4.0,
+            original_max_position_embeddings: 32_768,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: None,
+            mscale: 1.0,
+        };
+        let af = compute_attention_factor(Some(&scaling));
+        let expected = 1.0 + 0.1 * (4.0_f32).ln();
+        assert!((af - expected).abs() < 1e-5, "{af} != {expected}");
+    }
+
+    #[test]
+    fn attention_factor_for_explicit_override_used_directly() {
+        let scaling = RopeScalingConfig::Yarn {
+            factor: 4.0,
+            original_max_position_embeddings: 32_768,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: Some(0.95),
+            mscale: 1.0,
+        };
+        assert_eq!(compute_attention_factor(Some(&scaling)), 0.95);
+    }
+
+    #[test]
+    fn attention_factor_is_one_for_non_yarn() {
+        assert_eq!(compute_attention_factor(None), 1.0);
+        assert_eq!(
+            compute_attention_factor(Some(&RopeScalingConfig::Linear { factor: 2.0 })),
+            1.0
+        );
+        assert_eq!(
+            compute_attention_factor(Some(&RopeScalingConfig::NtkAware { factor: 2.0 })),
+            1.0
+        );
     }
 }
