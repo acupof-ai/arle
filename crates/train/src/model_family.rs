@@ -97,6 +97,7 @@ pub fn synthetic_qwen35_config(seq: usize, pattern: Qwen35AttentionPattern) -> Q
         linear_value_head_dim: 16,
         linear_conv_kernel_dim: 4,
         rope_theta: 1_000_000.0,
+        rope_scaling: None,
         partial_rotary_factor: 1.0,
         rotary_dim: 16,
         rope_cache_len_hint: Some(seq),

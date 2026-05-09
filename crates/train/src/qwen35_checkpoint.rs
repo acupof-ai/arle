@@ -301,6 +301,7 @@ mod tests {
             linear_value_head_dim: 32,
             linear_conv_kernel_dim: 4,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             partial_rotary_factor: 1.0,
             rotary_dim: 32,
             rope_cache_len_hint: Some(512),

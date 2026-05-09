@@ -1666,6 +1666,7 @@ impl ScratchShape {
             linear_value_head_dim: self.head_dim,
             linear_conv_kernel_dim: 4,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             partial_rotary_factor: 1.0,
             rotary_dim: self.head_dim,
             rope_cache_len_hint: Some(self.max_pos),

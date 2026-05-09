@@ -283,6 +283,47 @@ fn default_tie_word_embeddings() -> bool {
     true
 }
 
+/// Long-context RoPE scaling config (HF transformers / SGLang
+/// `rope_scaling` schema). `None` ⇒ vanilla RoPE with `rope_theta` base.
+/// Applied during inv_freq precompute to extend native context window.
+///
+/// Mirror of `qwen3_spec::RopeScalingConfig`; per
+/// `docs/plans/M_rope-yarn-scaling.md` Phase 1a step 2 (2026-05-09) we
+/// duplicate per-crate to avoid a new shared rope-spec crate. Future
+/// refactor when DeepSeek-V4 or other model needs same enum.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RopeScalingConfig {
+    /// YARN scaling (Peng et al. 2023). Used by Qwen3.6 long-ctx,
+    /// DeepSeek V3, Llama 3.1.
+    Yarn {
+        factor: f32,
+        original_max_position_embeddings: usize,
+        #[serde(default = "default_yarn_beta_fast")]
+        beta_fast: f32,
+        #[serde(default = "default_yarn_beta_slow")]
+        beta_slow: f32,
+        #[serde(default)]
+        attention_factor: Option<f32>,
+        #[serde(default = "default_yarn_mscale")]
+        mscale: f32,
+    },
+    /// Linear position interpolation (Chen et al. 2023).
+    Linear { factor: f32 },
+    /// NTK-aware scaling (kaiokendev 2023).
+    NtkAware { factor: f32 },
+}
+
+fn default_yarn_beta_fast() -> f32 {
+    32.0
+}
+fn default_yarn_beta_slow() -> f32 {
+    1.0
+}
+fn default_yarn_mscale() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35Config {
     pub hidden_size: usize,
@@ -303,6 +344,8 @@ pub struct Qwen35Config {
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
     pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
     pub partial_rotary_factor: f32,
     pub rotary_dim: usize,
     pub rope_cache_len_hint: Option<usize>,
@@ -545,6 +588,10 @@ impl Qwen35Config {
             linear_value_head_dim,
             linear_conv_kernel_dim,
             rope_theta: rope_parameters.rope_theta,
+            // Phase 1a: rope_scaling not yet read from JSON; the RawConfig
+            // → from_text_config path will be wired in Phase 1b. Default
+            // to None preserves existing behavior.
+            rope_scaling: None,
             partial_rotary_factor: rope_parameters.partial_rotary_factor,
             rotary_dim,
             rope_cache_len_hint: max_position_embeddings.or(context_length).or(seq_length),
