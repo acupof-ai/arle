@@ -3,6 +3,14 @@
 //! Greedy consistency test: verifies that greedy decode output is identical
 //! whether a request runs solo (batch_size=1) or alongside concurrent requests
 //! (batch_size=2+). Regression test for the prior CUDA attention divergence bug.
+//!
+//! BLIND SPOT (anti-pattern #26 candidate, 2026-05-09 P1.4 KILL `51dd5b2`):
+//! this invariant holds when a broken kernel produces deterministically-same
+//! garbage in solo + concurrent — solo == concurrent passes, but the shared
+//! output is repetitive/word-salad. Pair this test with output-quality
+//! assertions (Option A in research entry) or perplexity gates (Option C)
+//! before declaring a new attention/quant kernel wire correct.
+//! See `docs/research/2026-05-09-eod149-anti-pattern-26-same-output-but-garbage.md`.
 
 use std::path::Path;
 use std::time::Instant;
