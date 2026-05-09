@@ -101,6 +101,30 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// PF8.1 — BF16 → FP8 e4m3 per-row activation quant.
+    /// `output` is `*mut u8` (FP8 e4m3 is a 1-byte type).
+    /// `scales` stores per-row absmax / 448.0 (e4m3 finite max).
+    pub fn quantize_bf16_rows_to_fp8_e4m3_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// PF8.2 — Subtraction-merge zero-point=8 into packed INT4 weight tensor.
+    /// Offline weight-prep step for W4+FP8 marlin GEMM; eliminates per-element
+    /// zero-point subtract at runtime.
+    /// `numel` must be a multiple of 32 (kernel processes 32 INT32 per block).
+    /// Returns `cudaErrorInvalidValue` if alignment violated.
+    pub fn marlin_int4_fp8_preprocess_without_zp_cuda(
+        qweight: *const i32,
+        output: *mut i32,
+        numel: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn w8a16_gemv_cuda(
         weight: *const i8,
         scales: *const Half,
