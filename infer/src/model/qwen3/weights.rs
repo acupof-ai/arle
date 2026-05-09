@@ -13,8 +13,8 @@ use crate::tensor_parallel::{TpConfig, column_shard};
 use crate::tp::TpLoadContext;
 use crate::weight_loader::{
     QuantLoadConfig, load_tensor_1d, load_tensor_2d, load_tensor_2d_concat_rows,
-    load_tensor_2d_maybe_quantized_with_config, load_tensor_2d_sharded, precompute_rope,
-    resolve_rope_cache_len,
+    load_tensor_2d_maybe_quantized_with_config, load_tensor_2d_sharded,
+    precompute_rope_with_scaling, resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 use cuda_kernels::tensor::WeightFormat;
@@ -462,8 +462,13 @@ impl Qwen3Model {
 
         debug!("Precomputing RoPE cache on GPU");
         let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
-        let (cos_cache, sin_cache) =
-            precompute_rope(&ctx, config.head_dim, rope_cache_len, config.rope_theta)?;
+        let (cos_cache, sin_cache) = precompute_rope_with_scaling(
+            &ctx,
+            config.head_dim,
+            rope_cache_len,
+            config.rope_theta,
+            config.rope_scaling.as_ref(),
+        )?;
 
         ctx.sync()?;
         info!(
@@ -717,7 +722,8 @@ impl Qwen3Model {
         runtime: ModelRuntimeConfig,
     ) -> Result<Self> {
         use crate::weight_loader::{
-            load_tensor_1d_gguf, load_tensor_2d_gguf, load_tensor_2d_gguf_bf16, precompute_rope,
+            load_tensor_1d_gguf, load_tensor_2d_gguf, load_tensor_2d_gguf_bf16,
+            precompute_rope_with_scaling,
         };
 
         let t_gpu = std::time::Instant::now();
@@ -774,8 +780,13 @@ impl Qwen3Model {
 
         let norm = load_tensor_1d_gguf(ctx, gguf, config.norm_tensor_name())?;
         let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
-        let (cos_cache, sin_cache) =
-            precompute_rope(ctx, config.head_dim, rope_cache_len, config.rope_theta)?;
+        let (cos_cache, sin_cache) = precompute_rope_with_scaling(
+            ctx,
+            config.head_dim,
+            rope_cache_len,
+            config.rope_theta,
+            config.rope_scaling.as_ref(),
+        )?;
 
         ctx.sync()?;
         info!(
