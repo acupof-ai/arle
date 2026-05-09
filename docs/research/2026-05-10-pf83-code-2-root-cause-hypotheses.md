@@ -206,3 +206,87 @@ Per skill v1.11.0+ #28+#31: every claim grounded in raw evidence
 (marlin_w4_fp8_kernel.cu:130/189/199 grep + linear.rs scratch
 pattern from earlier diff capture + skill kernel-optimization §2
 sm_89 smem trap reference).
+
+## §7 H1 REFINED via committed-code re-read (linear.rs:1637+ THIS tick)
+
+Re-reading the COMMITTED `run_marlin_w4_fp8_prefill` after PF8.3
+landed reveals MORE per-call allocations than original H1 estimate:
+
+```rust
+// Per call (every linear forward in PF8 path):
+let mut x_fp8: CudaSlice<u8> = ctx.stream.alloc_zeros(m * k)?;       // 1.3-3.5 MB
+let mut s_activation: CudaSlice<f32> = ctx.stream.alloc_zeros(m)?;    // 2 KB
+let tmp_m = m.div_ceil(16) * 16;
+let tmp_m = tmp_m.min(64);
+let mut reduce: CudaSlice<f32> = ctx.stream
+    .alloc_zeros(ctx.sm_count() * tmp_m * 256)?;                     // 4-5 MB ← BIGGEST
+let lock_elems = ((n / 128) * max_par).max(1);
+let mut workspace: CudaSlice<i32> = ctx.stream.alloc_zeros(lock_elems)?; // 1.3 KB
+let mut y_fp16: CudaSlice<ffi::Half> = ctx.stream.alloc_zeros(m * n)?;   // 2.6 MB
+// Total per call: ~10 MB
+```
+
+**Per forward pass**: 7 linear ops × 36 layers = 252 calls × 10 MB =
+**2.5 GB scratch CHURN per single request**. RAII drops mitigate
+peak (only 1-2 alive at once) but cudarc allocator pool fragments
+under 252 alloc/free cycles per request.
+
+But Code 2 fires at **Request 1** — no concurrency, no accumulated
+fragmentation yet. So pure OOM accumulation isn't the FULL story.
+
+### Refined hypotheses (ranked after committed-code re-read)
+
+1. **H1' — first-call cudarc allocation overhead**: cudarc's stream-
+   ordered allocator may have a known issue allocating 5 MB on the
+   first call (driver init / pool warmup / stream setup race). H1's
+   "fragmentation under load" applies but is secondary to first-call
+   path.
+
+2. **H6 (NEW) — ctx.ordinal() or stream mismatch**: gemm_w4_fp8_marlin_cuda
+   takes `ctx.ordinal() as i32` (device id) and `ctx.stream.cu_stream()`.
+   If these don't match the workspace alloc context, the kernel sees
+   workspace pointer in a different context → fails translation →
+   code 2 from copy/launch.
+
+3. **H7 (NEW) — undocumented `-1, -1` shape args**: positions 14, 15
+   in the FFI call pass `-1, -1`. Likely shape hints (prob_n_min,
+   prob_n_max?) defaulting to "auto". If kernel doesn't handle -1
+   correctly for ALL shapes, fails immediately on first call.
+
+### Quick-test path for codex (small isolated smoke)
+
+```cpp
+// /tmp/pf83_isolated_smoke.cu — single-call test bypassing dispatch
+#include <cuda_runtime.h>
+extern "C" int gemm_w4_fp8_marlin_cuda(...);
+
+int main() {
+    // Allocate fixed-size buffers (m=64, n=2560, k=2560 — small shape)
+    void *xq, *q, *reduce, *yf, *s1, *s2, *ws;
+    cudaMalloc(&xq, 64 * 2560);            // 160 KB
+    cudaMalloc(&q, 2560 * 2560 / 8);       // 800 KB INT4 packed
+    cudaMalloc(&reduce, 80 * 64 * 256 * 4); // 5 MB
+    cudaMalloc(&yf, 64 * 2560 * 2);        // 320 KB
+    cudaMalloc(&s1, 64 * 4);
+    cudaMalloc(&s2, 2560 / 128 * 2);
+    cudaMalloc(&ws, 2560 / 128 * 16 * 4);
+    int ret = gemm_w4_fp8_marlin_cuda(...);
+    printf("Single-call result: %d\n", ret);
+    return 0;
+}
+```
+
+If isolated smoke PASSES → bug is in dispatch/state path (H6/H7).
+If isolated smoke FAILS → bug is in kernel itself (H1'/H2/H5).
+
+This decisively narrows the hypothesis space in 1 test.
+
+## §8 Updated investigation sequence (codex)
+
+1. Run `CUDA_LAUNCH_BLOCKING=1` server + 1 curl request → exact line
+   + cudaError of failure point (5 min)
+2. Build `/tmp/pf83_isolated_smoke.cu` → narrow H6/H7 vs H1'/H2/H5 (10 min)
+3. Per result, apply matched fix:
+   - H1' → static-scratch refactor (50-100 LOC)
+   - H6/H7 → fix dispatch state passing (20-50 LOC)
+   - H2 → kernel variant filter (smem audit + codegen filter, 50-100 LOC)
