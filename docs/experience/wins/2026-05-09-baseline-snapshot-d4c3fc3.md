@@ -1,169 +1,233 @@
-# Baseline Snapshot — 2026-05-09 main `d4c3fc3`(post-46-commit session)
+# Baseline 数据快照 — 2026-05-09 main `d4c3fc3`(全维度重测)
 
-> 当前 main commit `d4c3fc3` 的全维度 baseline。包含 BF16 / W4A16 Marlin / W4A8 GPTQ
-> 三种 quant × c=1/c=4 × prompt-shape 4 个 workload 共 5 bench。**保留作为 future
-> regression / improvement 比较锚点**。Raw artifacts 在 `baseline-d4c3fc3-snapshot/`
-> 子目录(metrics.md + service_stats_trace_summary.md + command.txt 每个 workload)。
+> 当前 main commit 在 RTX 4070 Ti SUPER (sm_89) 上的 baseline,**7-workload 矩阵 +
+> 走的 path/算子标注 + features 启用状态**。
+> 用作 future regression / improvement 比较锚点。Raw artifacts 在
+> `baseline-d4c3fc3-snapshot/{B1..B7}/`(metrics + service trace + command)。
 
-## Snapshot 元数据
+---
 
-- **Date**:2026-05-09
-- **Main commit**:`d4c3fc3`(post B3 Step 2 + P0.2 + Phase 1.A + R4#6 KILLED + c20b1ce reverted)
-- **Hardware**:RTX 4070 Ti SUPER 16GiB sm_89,CUDA 13.2
-- **Server config**:`--num-slots 8 --max-seq-len 5120 --kv-cache-dtype bf16`
-- **Admission policy**:default `queue-bound`(opt-in `prefix-aware` not benched here)
-- **Bench tool**:`scripts/bench_guidellm.sh`(guidellm wrapper)
+## 元数据
 
-## 5-workload baseline matrix
+| 项 | 值 |
+|---|---|
+| 日期 | 2026-05-09 |
+| Main commit | `d4c3fc3` |
+| 硬件 | RTX 4070 Ti SUPER 16 GiB(sm_89,100 KB smem/SM,88.5 BF16 / 706 FP8 TFLOPS,672 GB/s HBM) |
+| CUDA | 13.2(driver) + cudarc + TileLang AOT cubins |
+| 服务器配置 | `--num-slots 8 --max-seq-len 5120 --kv-cache-dtype bf16` |
+| 准入策略 | 默认 `queue-bound`(本次 baseline 全用默认,`prefix-aware` 未测) |
+| Bench 工具 | `scripts/bench_guidellm.sh`(guidellm 包装) |
 
-| ID | 模型 | workload | 维度 | 用途 |
-|----|-----|---------|------|------|
-| **A1** | Qwen3-4B BF16 | c=4 / 4096-in / 256-out | 多并发长 prompt | 单租户长上下文基线 / TTFT-gap reference |
-| **A2** | Qwen3-4B BF16 | c=1 / 4096-in / 256-out | 单用户长 prompt | 无并发对比基线 |
-| **A3** | Qwen3-4B BF16 | c=4 / 512-in / 2048-out | 多并发短 prompt 长 output | decode-dominant throughput |
-| **A4** | Qwen3-4B W4A16 Marlin zpfix | c=4 / 4096-in / 256-out | 多并发长 prompt | W4A16 quant baseline |
-| **A5** | Qwen3-4B W4A8 GPTQ zpfix | c=4 / 4096-in / 256-out | 多并发长 prompt | W4A8 quant baseline |
+---
 
-## Metrics 全表(median / p50 / p99 from successful)
+## 7-workload 测试矩阵
 
-| ID | TTFT median(ms) | TTFT p99(ms) | ITL median(ms) | ITL p99(ms) | TPOT median(ms) | Out tok/s median | Success % |
-|----|----:|----:|----:|----:|----:|----:|----:|
-| **A1 BF16 c=4** | **2005.5** | 2072.1 | **25.43** | 25.58 | 33.18 | 79.08 | 52/56 = 93% |
-| **A2 BF16 c=1** | 519.4 | 806.3 | 22.80 | 22.81 | — | 43.87 | 10/10 = 100% |
-| **A3 BF16 c=4 decode** | 205.9 | 495.8 | 18.29 | 18.34 | — | 112.35 | 9/12 = 75% |
-| **A4 W4A16 Marlin c=4** | 2336.9 | 2359.8 | **18.13** | 18.20 | — | **220.09** | 64/68 = 94% |
-| **A5 W4A8 c=4** | **1634.3** | 1687.3 | 25.10 | 25.90 | — | 81.01 | **56/56 = 100%** |
+| ID | 模型 | 并发 | prompt-in | output | 持续时间 | 用途 |
+|----|-----|------|-----------|--------|---------|------|
+| **B1** | Qwen3-4B BF16 | 1 | 4096 | 256 | 60 s | 单用户长 prompt 基线 |
+| **B2** | Qwen3-4B BF16 | 4 | 4096 | 256 | 120 s | 多并发长 prompt(主基线) |
+| **B3** | Qwen3-4B BF16 | 4 | 512 | 2048 | 120 s | decode-dominant 吞吐测试 |
+| **B4** | Qwen3-4B-GPTQ-W4A16-marlin-zpfix | 1 | 4096 | 256 | 60 s | W4A16 单用户 |
+| **B5** | Qwen3-4B-GPTQ-W4A16-marlin-zpfix | 4 | 4096 | 256 | 120 s | W4A16 多并发(主基线) |
+| **B6** | Qwen3-4B-GPTQ-W4A8-zpfix | 1 | 4096 | 256 | 60 s | W4A8 单用户 |
+| **B7** | Qwen3-4B-GPTQ-W4A8-zpfix | 4 | 4096 | 256 | 120 s | W4A8 多并发(主基线) |
 
-## Quant 维度对比(c=4 4096-in/256-out 同条件)
+---
 
-| Quant | TTFT median | ITL median | Out tok/s median | Success | 主要 win |
+## 全部 metrics 表(成功请求,中位数 / p50 / p99)
+
+| ID | TTFT 中位 (ms) | TTFT p99 (ms) | ITL 中位 (ms) | ITL p99 (ms) | TPOT 中位 (ms) | 输出 tok/s 中位 | 成功率 |
+|----|----:|----:|----:|----:|----:|----:|---|
+| B1 BF16 c=1 | **520.5** | 752.5 | 22.79 | 22.80 | 24.73 | 43.88 | 10/10 = 100% |
+| B2 BF16 c=4 | 2011.6 | 2083.2 | 25.46 | 25.59 | 33.21 | 79.06 | 52/56 = 93% |
+| B3 BF16 decode | **205.6** | 428.1 | **18.30** | 18.35 | 18.39 | 111.86 | 13/16 = 81% |
+| B4 W4A16 c=1 | 572.3 | 626.2 | **14.56** | 14.57 | 16.73 | 68.68 | 13/13 = 100% |
+| B5 W4A16 c=4 | 2339.4 | 2359.8 | **18.15** | 18.24 | 27.25 | **219.94** | 64/68 = 94% |
+| B6 W4A8 c=1 | 415.0 | 779.5 | 22.25 | 22.61 | 23.78 | 44.92 | 10/10 = 100% |
+| B7 W4A8 c=4 | **1652.5** | 1865.9 | 25.13 | 26.19 | 31.97 | 82.88 | **56/56 = 100%** |
+
+---
+
+## 走的 path 和算子(per workload 详细标注)
+
+### Path 1:**BF16 prefill + BF16 decode**(B1 / B2 / B3)
+
+**Linear(权重投影 Q/K/V/O/MLP)**
+| 阶段 | LinearKernelPlan | 实际算子 |
+|------|------------------|---------|
+| Prefill(seq>1)| `Bf16CublasGemm` | cuBLAS GEMM(BF16),源:`infer/src/ops/linear.rs:113` |
+| Decode 单 token | `Bf16Gemv` | 手写 BF16×4 vectorized GEMV,源:`gemv_cuda` |
+| Decode batched(graph-safe)| `Bf16GraphsafeGemm` | cuBLAS GEMM,CUDA Graph 安全(B=1 seq,batched-decode 多 slot)|
+
+**Attention**
+| 阶段 | 算子 | 来源 |
+|------|------|------|
+| Prefill | **TileLang AOT HD128 paged-prefill**(`tilelang_batch_prefill_paged_hd128_q{16,32,40,64}_kv8_run_cuda`) | `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py` AOT cubin |
+| Decode | **TileLang AOT HD128 paged-decode** | `batch_decode_paged_hd128.py` AOT cubin |
+| KV cache | BF16 paged KV(page_size=16) | `crates/cuda-kernels/csrc/kv/` |
+
+**附加算子**
+- RoPE / RMSNorm / Sampling:custom CUDA C(`csrc/misc/`)
+- Token embedding gather:CUDA C
+- Logits → sample:custom kernel
+
+### Path 2:**W4A16 Marlin prefill + W4A16 decode**(B4 / B5)
+
+**Linear**
+| 阶段 | LinearKernelPlan | 实际算子 |
+|------|------------------|---------|
+| Prefill(seq>1)| `MarlinW4Gemm` | **Marlin W4A16 GEMM**(3 launches:bf16→fp16 + GEMM + fp16→bf16),源:`infer/src/ops/linear.rs:705 run_marlin_w4_gemm`,kernel:`crates/cuda-kernels/csrc/gemm/marlin_*.cu` |
+| Decode 单 token | `W4A16Gemv` | `w4a16_gemv_cuda`(BF16-native GEMV with 4-bit unpack),`csrc/gemm/qweight_gemv.cu` |
+| Decode batched(2..=8)| `W4A16BatchGemv` | `w4a16_gemv_batch_cuda`(BF16-native batch GEMV),1 launch |
+
+**Attention**:**TileLang HD128 paged-prefill / paged-decode**(同 Path 1,attention 不受 W4 影响)
+**KV cache**:BF16 paged KV(同 Path 1)
+
+### Path 3:**W4A8 Marlin prefill + W4A8 decode**(B6 / B7)
+
+**Linear**
+| 阶段 | LinearKernelPlan | 实际算子 |
+|------|------------------|---------|
+| 全部(prefill + decode 都通过此路径)| `MarlinW4A8Gemm` | **Marlin W4A8 GEMM**,激活 W8 量化 + 权重 W4 packed,源:`run_marlin_w4a8_linear`,kernel:`csrc/gemm/marlin_w4a8_*.cu` |
+
+**Attention**:**TileLang HD128 paged-prefill / paged-decode**(同上)
+**KV cache**:BF16 paged KV(W4A8 仅压缩权重 + 激活,KV 仍 BF16)
+
+### 调度器 / 准入(全部 baseline 共用)
+
+| 组件 | 实现 | 备注 |
+|------|------|------|
+| Admission policy | `QueueBoundAdmission`(默认) | `infer/src/scheduler/policy.rs`,简单队列上限 |
+| Cap admission | `prefill_max_requests=8`(`12300c5` 默认) | 控制单步并发 prefill 数 |
+| Decode warmup | `warmup_cuda_graphs()` | 提前 capture B=1..num_slots 的 graph |
+| RadixCache | 默认开启(prefix cache lookup) | `infer/src/scheduler/cuda/runtime/admission.rs:189 lookup_or_stage` |
+| KV pool | Paged KV(BF16),page_size=16 | `crates/cuda-kernels/csrc/kv/` |
+| CUDA Graph | Decode 路径自动 capture B=1..8 | warmup time ~1.25 s |
+
+---
+
+## 同条件 quant 对比(c=4 4096-in/256-out:B2 vs B5 vs B7)
+
+| Quant | TTFT 中位 | ITL 中位 | 输出 tok/s | 成功率 | 主要 win |
 |-------|----:|----:|----:|----:|---|
-| BF16(A1) | 2005.5 ms | 25.43 ms | 79.08 | 93% | 平衡 |
-| **W4A16 Marlin(A4)** | 2336.9 ms(+16.5%)| **18.13 ms(-28.7%,1.40× decode)** | **220.09(+178%)** | 94% | **decode 速度 + 吞吐** |
-| **W4A8(A5)** | **1634.3 ms(-18.5%)** | 25.10 ms(同 BF16) | 81.01(+2.4%) | **100%** | **prefill 速度 + 100% success** |
+| **BF16(B2)** | 2011.6 ms | 25.46 ms | 79.06 | 93% | 平衡(参考) |
+| **W4A16 Marlin(B5)** | 2339.4 ms(+16.3%)| **18.15 ms(-28.7%,1.40× decode)** | **219.94(+178%)** | 94% | **decode 速度 + 吞吐** |
+| **W4A8(B7)** | **1652.5 ms(-17.8%)** | 25.13 ms(同 BF16) | 82.88(+4.8%) | **100%** | **prefill 速度 + 100% 成功** |
 
-**关键 quant 取舍**:
-- W4A16 Marlin:**赢 decode**(1.40× ITL,+178% throughput),**输 prefill**(+16.5% TTFT,format 转换开销)→ decode-heavy 场景最优
-- W4A8 GPTQ-zpfix:**赢 prefill**(-18.5% TTFT),**decode 持平**,**100% success rate** → prefill-heavy 场景 + 稳定性最优
-- BF16:全平衡,无特殊优势,**ground truth 参考**
-
-## 并发维度对比(BF16 c=1 vs c=4 同 4096-in/256-out)
-
-| Concurrency | TTFT median | ITL median | Out tok/s median |
-|---|----:|----:|----:|
-| c=1(A2)| 519.4 ms | 22.80 ms | 43.87 |
-| c=4(A1)| 2005.5 ms(+286%)| 25.43 ms(+12%)| 79.08(+80%)|
-
-c=1 → c=4:TTFT 飙升(队列等待 + 多并发 prefill 串行),ITL 略增,throughput 提升 80%(没到 4× 是 prefill bottleneck)。
-
-## Workload-shape 维度对比(BF16 c=4 长 prompt vs decode-dominant)
-
-| Workload | TTFT median | ITL median | Out tok/s |
-|----------|----:|----:|----:|
-| 4096-in/256-out(A1)| 2005.5 ms | 25.43 ms | 79.08 |
-| 512-in/2048-out(A3)| 205.9 ms | **18.29 ms** | **112.35** |
-
-短 prompt 大 output:TTFT 几乎降到 1/10,ITL 减 28%,throughput 增 42%。**符合 nsys 实证**:prefill 是 c=4 4096-in 的主导成本,而 decode-dominant workload 下 ITL 才是主要 metric。
+**核心洞察**:
+- **W4A16 Marlin** 赢 decode(1.40× ITL,+178% 吞吐),但**输 prefill**(+16.3% TTFT,因 bf16↔fp16 转换 3 launches)→ decode-heavy 场景最优
+- **W4A8** 赢 prefill(-17.8% TTFT),**decode 持平 BF16**,**100% 成功率** → prefill-heavy + 稳定性最优
+- **BF16** 平衡参考,无单一优势
 
 ---
 
-## 已落地 Feature 按维度标注
+## 单用户 vs 多并发对比(c=1 vs c=4 同 4096-in/256-out)
 
-### 维度 1 — TTFT(首 token 延迟)
+| Quant | c=1 TTFT | c=4 TTFT | c=1 ITL | c=4 ITL | c=1 tok/s | c=4 tok/s |
+|-------|----:|----:|----:|----:|----:|----:|
+| BF16(B1/B2)| 520 ms | 2012 ms(+286%) | 22.79 ms | 25.46 ms(+12%)| 43.88 | 79.06(+80%)|
+| W4A16(B4/B5)| 572 ms | 2339 ms(+309%)| 14.56 ms | 18.15 ms(+25%)| 68.68 | 219.94(+220%)|
+| W4A8(B6/B7)| 415 ms | 1652 ms(+298%)| 22.25 ms | 25.13 ms(+13%)| 44.92 | 82.88(+85%)|
 
-| Feature | Commit | TTFT 方向 | 实测 metric | 状态 |
-|---------|--------|----------|------------|------|
-| W4A8 GPTQ-zpfix | `2a3a6f0` + `b5889b3` | ⬇ 改善 prefill | TTFT **1634ms**(BF16 2005ms,**-18.5%**)| ✅ LANDED |
-| cap=8 admission default | `12300c5` | ⬇ 改善多租户 TTFT p99 | -86% TTFT p99(per `cap8-ttft-tail.md`)| ✅ LANDED + caveat |
-| B3 Step 2 PrefixAwareAdmission | `b85929b` | ⬇ 改善 multi-tenant warm TTFT | **-24.2% multi-tenant TTFT median**(318→241ms)| ✅ LICENSED + opt-in |
-| W4A16 Marlin | (existing) | ⬆ 略增 prefill TTFT | +16.5%(format conversion overhead) | ✅ tradeoff acknowledged |
-
-### 维度 2 — ITL(每 token 间延迟,decode 速度)
-
-| Feature | Commit | ITL 方向 | 实测 metric | 状态 |
-|---------|--------|---------|------------|------|
-| W4A16 Marlin | (existing) | ⬇ 大幅改善 | **18.13ms vs BF16 25.43ms = 1.40× decode** | ✅ LANDED |
-| W4A8 GPTQ | `b5889b3` | 持平 BF16 | 25.10ms ≈ BF16 25.43ms | ✅ LANDED |
-
-### 维度 3 — Throughput(吞吐 tok/s)
-
-| Feature | Commit | Throughput 方向 | 实测 metric | 状态 |
-|---------|--------|----------------|------------|------|
-| W4A16 Marlin | (existing) | ⬆ 大幅 | **out tok/s 220 vs BF16 79 = +178%** | ✅ LANDED |
-| W3+W4 admission deadlock unblock | `b708e00` | ⬆ multi-tenant 持续吞吐 | (eliminates regression) | ✅ SOLVED |
-| Hybrid Phase 1b loader | `232aed5` | ⬆ enables Phase 2 dispatch | bench TTFT p50 68.4ms regression gate PASS | ✅ LANDED loader-only |
-
-### 维度 4 — Memory(KV 容量 / VRAM 利用)
-
-| Feature | Commit | Memory 方向 | 实测 metric | 状态 |
-|---------|--------|------------|------------|------|
-| W4A16 Marlin | (existing) | ⬇ weight 8GB→2GB(-75%)| 释放 ~6 GB → KV pool 扩容 | ✅ LANDED |
-| W4A8 GPTQ | `2a3a6f0` | ⬇ activation 也 W4 + KV BF16 | 同 W4A16 但激活也压缩 | ✅ LANDED |
-
-### 维度 5 — Stability(success rate / σ)
-
-| Feature | Commit | Stability 方向 | 实测 metric | 状态 |
-|---------|--------|----------------|------------|------|
-| W4A8 GPTQ-zpfix | `2a3a6f0` | ⬆ greedy 32/32 0% diff | A5 baseline 56/56 = **100% success** | ✅ LANDED |
-| cap=8 + warmup fix(c20b1ce REVERTED, 12300c5 是真正 fix)| `12300c5` | ⬆ multi-tenant 76→100% turn success | per `cap8-final-synthesis`(re-attributed)| ✅ LANDED |
-| metal_eval_audit | (existing) | ⬆ Metal materialize regression gate | static-analysis test(unrelated to CUDA path)| 🟡 pre-existing failure documented |
-
-### 维度 6 — 调度 / 准入策略
-
-| Feature | Commit | 维度 | 实测 metric | 状态 |
-|---------|--------|------|------------|------|
-| `--admission-policy {queue-bound,prefix-aware}` CLI | `b85929b` | 准入策略可配 | default queue-bound(prod-safe);prefix-aware opt-in | ✅ LANDED |
-| `--cold-headroom N` CLI | `b85929b` | cold-request 缓冲 | default `max_waiting_requests / 4` | ✅ LANDED |
-| Fail-open guard at admission | `b85929b` | 防 PrefixAware 死锁 | `if candidates.is_empty() { take first deferred }` | ✅ codex 自发加 |
-
-### 维度 7 — Substrate 基础设施
-
-| Feature | Commit | 维度 | 状态 |
-|---------|--------|------|------|
-| Phase 1.A `step_admission_prefix_lookup` nvtx scope | `5a63142` | 性能可观测性 | ✅ LANDED |
-| RadixCache production-wired at CUDA admission | (existing per `1217375` audit) | 前缀缓存 substrate | ✅ default-enabled |
-| Hybrid W4 Marlin DeviceMatrix side-tensor 加载 | `232aed5` | hybrid checkpoint substrate | ✅ LANDED loader-only |
-| Skill kernel-optimization v1.7.0(19 anti-patterns)+ v1.8.0 batch(6 candidates ready)| `c768b70` + memory | 方法论 substrate | ✅ codified |
-
-### 维度 8 — 已 KILL 的 hypothesis(知识沉淀)
-
-| Hypothesis | KILL commit | 原因 |
-|-----------|------------|------|
-| W4A16BatchGemv override(R4#6)| `3b9cc06` | bench +37% ITL regression vs Marlin(empirically refuted) |
-| c20b1ce 是 cap=8 fix 真因 | `3fea979` | 7-layer audit:NO-OP in production-default,12300c5 才是真正 fix |
-| (4 prior P0 KILLs from Q1/Q2)| various | M_pf-gemm autotune / M_pf-fuse / M_b.2.2 split-KV / M_pf-graph Phase 0 |
+**观察**:从 c=1 → c=4,TTFT 几乎飙升 3 倍(prefill 串行 + 队列等待),ITL 略增(KV 容量竞争),吞吐增 80-220%(W4A16 因 throughput 上限高,scaling 最好)。
 
 ---
 
-## 用法 — future regression / improvement comparison
+## Workload-shape 对比(BF16 长 prompt vs decode-dominant:B2 vs B3)
 
-任何 future 优化 落地后,**重跑 5-workload matrix**(同 protocol)→ 与本 snapshot 对比 Δ%。
-- TTFT/ITL/throughput Δ% 落进 wins entry "vs baseline-d4c3fc3" 表
-- Success % regression 即 KILL signal
-- 单维度 win 单维度 lose 必须 explicit tradeoff 罗列(per skill rule 7)
+| Workload | TTFT 中位 | ITL 中位 | 输出 tok/s |
+|---------|----:|----:|----:|
+| 4096-in / 256-out(B2)| 2012 ms | 25.46 ms | 79.06 |
+| 512-in / 2048-out(B3)| **206 ms** | **18.30 ms** | **111.86** |
 
-每 baseline workload 重跑命令保存于 `baseline-d4c3fc3-snapshot/<label>/command.txt`。
+**观察**:短 prompt + 大 output 的 decode-dominant 场景:TTFT 降至 1/10,ITL -28%,吞吐 +42%。**符合 nsys 实证**(prefill 是 c=4 4096-in 的主导成本,而 decode-dominant workload 下 ITL 才是主要 metric)。
 
 ---
 
-## 关键 observation
+## 当前 features 启用状态(全表)
 
-1. **Quant 各有 trade-off,无单一最优**:W4A16 赢 decode/throughput,W4A8 赢 prefill/stability,BF16 平衡。生产应**按 workload 选配**。
-2. **A1(BF16 c=4 4096-in)是 4/56 incomplete**:120s 窗口 + c=4 4096-in 长 prompt 接近 server 极限。Future bench 应延长 max-seconds 或 reduce concurrency。
-3. **A4 W4A16 throughput 220 tok/s** 是当前最强 single-axis win。Hybrid Phase 2 dispatch 可能进一步提升(prefill 也走 W4A8 path)。
-4. **A5 W4A8 100% success rate** 强信号 — W4A8 path 的 stability 最佳,适合 production-default 候选。
-5. **multi-tenant warm-prefix(B3 Step 2)** 未在本 snapshot — 需 single-prompt-from-multi-session workload (`scripts/bench_multitenant_burst.py`)单独 bench。
+### 已 LANDED 默认启用
+
+| Feature | Commit | 默认状态 | 说明 |
+|---------|--------|---------|------|
+| **TileLang HD128 paged-prefill / paged-decode** | (existing) | ✅ 默认开启(`cuda` feature 含 `tilelang-attn`)| BF16 attention 默认走 TileLang AOT cubin |
+| **TileLang HD64 / HD256** | (existing) | ✅ 默认开启 | 不同 head_dim 模型自动 dispatch |
+| **CUDA Graph for decode** | (existing) | ✅ 默认开启 | warmup 时 capture B=1..num_slots,~1.25 s 启动开销 |
+| **RadixCache prefix lookup** | (existing) | ✅ 默认开启(`--disable-radix-cache` opt-out)| `prefix_cache.lookup_or_stage` 在 CUDA admission |
+| **Paged KV (BF16, page_size=16)** | (existing) | ✅ 默认开启 | 主 KV substrate |
+| **Marlin W4A16 GEMM** | (existing) | ✅ checkpoint-driven | `MarlinW4Gemm` plan,需 W4A16 + marlin-packed 权重 |
+| **Marlin W4A8 GEMM** | (existing) | ✅ checkpoint-driven | `MarlinW4A8Gemm` plan,需 MarlinW4A8 权重 |
+| **W4A16 GEMV / BatchGEMV(BF16-native)** | (existing) | ✅ checkpoint-driven | decode 单 token / batch 2..=8 |
+| **GGUF Q3K/Q4K/Q5K/Q6K kernels** | (existing) | ✅ checkpoint-driven | GGUF 量化模型 |
+| **TurboQuant** | (existing) | ✅ checkpoint-driven | 旧 quant 路径 |
+| **W4A8 GPTQ qzeros 修复** | `2a3a6f0` | ✅ 默认 LANDED | greedy 32/32 0% diff,W4A8 准确性 |
+| **cap=8 admission default** | `12300c5` | ✅ 默认 8 | `prefill_max_requests=Some(8)`,提升多并发吞吐 |
+| **cap=8 decode warmup** | (内置)| ✅ 默认 | `warmup_cuda_graphs` warm B=1..num_slots |
+| **B3 Step 1 admission_allows refactor** | `7c8fd61` | ✅ 默认 LANDED | `SchedulerSignals` 信号管线 |
+| **B3 Step 2 PrefixAwareAdmission** | `b85929b` | 🟡 **opt-in**(`--admission-policy=prefix-aware`)| 默认仍 queue-bound,prod-safe |
+| **`--cold-headroom N` CLI** | `b85929b` | ✅ 配套 prefix-aware | 默认 `max_waiting_requests / 4` |
+| **Fail-open guard at admission** | `b85929b` | ✅ 默认 | 防 PrefixAware 死锁 |
+| **W3+W4 admission deadlock unblock** | `b708e00` | ✅ 默认 | codex page_budget 修复 |
+| **P0.2 Hybrid Phase 1b loader** | `232aed5` | ✅ checkpoint-driven | `marlin_w4_hybrid` 配置自动识别;Phase 2 dispatch 默认 OFF |
+| **P0.2 Hybrid Phase 2 dispatch** | (codex 最新)| 🟡 **opt-in**(`hybrid_w4a8_prefill_enabled()` env gate)| 默认 OFF,需要 hybrid checkpoint + env var |
+| **Phase 1.A nvtx scope `step_admission_prefix_lookup`** | `5a63142` | ✅ 默认开启(NVTX no-op without profiler)| 仅在 nsys/ncu 附加时产生数据,zero overhead 否则 |
+| **R4#6 W4A16BatchGemv override** | `3b9cc06`(env-gated)| ❌ **opt-in 但 KILLED** | `INFER_R4_W4A16_GEMV_OVERRIDE=1`,实测 +37% ITL regression,**不建议开** |
+
+### 已 KILLED(env-gated 但实证不该开)
+
+| Feature | KILL Commit | 原因 |
+|---------|------------|------|
+| `INFER_R4_W4A16_GEMV_OVERRIDE=1` | `3b9cc06` | bench +37% ITL regression vs Marlin |
+| TileLang BF16 split-KV(`INFER_TILELANG_BF16_SPLIT_KV`)| (KILLED 2026-05-07) | ITL +31.6% / out tok/s -18.8% regression,33m+ hang |
+| Spec decode self-spec k5 c4 | (KILLED 2026-05-08)| 多次 KILL,axis dead per `aa00c6a` |
+| External draft Qwen3-0.6B k5 c4 | (KILLED) | 同上 |
+
+### 已 LANDED 但有 caveat / 未完成
+
+| Feature | 状态 | 说明 |
+|---------|------|------|
+| cap=8 bimodal 残差 | 🟡 部分残差(33% degraded path) | `db20d34` 分析 + `3fea979` 7-layer 闭环:c20b1ce 是 NO-OP,12300c5 才是真正 fix。残差需 Phase 0.5 evidence 决定是否值得修 |
+| W4A8 graph capture(`#24`)| 🟡 待 hoist | W4A8 prefill -36% TTFT 已 LICENSED 但未 default-on,需 graph capture 改造 |
+| Hybrid Phase 2 dispatch wiring | 🟡 substrate landed,bench 待跑 | 默认 OFF,nsys 实证 prefill 97% 主导 → 高 leverage 轴 |
+| metal_eval_audit 失败 | 🟡 pre-existing | 与 CUDA 路径无关,Metal-only 静态分析 |
+
+### 当前 known broken / 待做
+
+| Feature | 状态 | 备注 |
+|---------|------|------|
+| Phase 1.A `step_admission_prefix_lookup` 实际 fire | 🟡 nsys 60s 没看到 | 可能 workload 太轻(curl burst short prompts 不触发 lookup_or_stage)— Stage 9 验证 |
+| `arle data download` HF Hub blocker(`#34`)| 🟡 P3 demoted | 用 wget + pandas 绕过 |
+| Cell (d) 实验 — 12300c5 attribution 闭环 | 🟡 可选 | ~30 min,验证 12300c5 是真正 fix,closes 7-layer SOLID chain |
+
+---
+
+## 关键 observations
+
+1. **Quant 各有 trade-off,无单一最优**:W4A16 赢 decode/吞吐(220 tok/s),W4A8 赢 prefill/稳定性(100% success),BF16 平衡参考。**生产应按 workload 选配**。
+2. **W4A16 在 c=4 throughput 220 tok/s 是当前最强单一 win**(vs BF16 79 tok/s,+178%)。
+3. **W4A8 100% success rate 强信号** — W4A8 path 稳定性最佳,production-default 候选。
+4. **B2/B3/B5 c=4 长 prompt 有 incomplete**(4-7%)— 120s 窗口对 c=4 4096-in 接近极限,future bench 应延长 max-seconds。
+5. **TileLang attention 默认开启但 vs FlashInfer 输 3-10%**(见 `2026-04-29-bench-guidellm-cuda-l4-tilelang-on-vs-off.md`):tile defaults 是 Hopper-tuned,sm_89 100 KB smem 的 occupancy ceiling 受限,**未来高 leverage 优化点**。
+6. **多并发不是简单 4× 扩展**:c=1 → c=4,throughput 仅 +80-220%(prefill 串行是主因)。
+7. **Multi-tenant warm-prefix(B3 Step 2 -24.2%)未在本 baseline**(默认 queue-bound),需要 `scripts/bench_multitenant_burst.py` 单独跑(仍可用 `b85929b` LICENSE 数据参考)。
+
+---
 
 ## Cross-references
 
-- 5-workload raw metrics:`baseline-d4c3fc3-snapshot/{A1..A5}/metrics.md`
-- Service trace per workload:`baseline-d4c3fc3-snapshot/{A1..A5}/service_stats_trace_summary.md`
-- Bench commands:`baseline-d4c3fc3-snapshot/{A1..A5}/command.txt`
+- 7-workload raw metrics:`baseline-d4c3fc3-snapshot/{B1..B7}/metrics.md`
+- Service trace per workload:`baseline-d4c3fc3-snapshot/{B1..B7}/service_stats_trace_summary.md`
+- Bench 命令:`baseline-d4c3fc3-snapshot/{B1..B7}/command.txt`
+- TileLang on-vs-off 对比:`docs/experience/wins/2026-04-29-bench-guidellm-cuda-l4-tilelang-on-vs-off.md`
+- nsys 4-phase 实证(prefill 97%):`docs/research/2026-05-09-eod113-p1a-nsys-decomposition-evidence.md`
+- B3 Step 2 LICENSE:`docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md`
+- P0.2 hybrid loader:`docs/experience/wins/2026-05-09-bench-hybrid-phase1b-loader.md`
 - Pickup queue:`docs/plans/codex-pickup-queue-2026-05-09.md`
-- Methodology:`memory/feedback_bidirectional_audit_cycle.md`(local auto-memory)
 
-## Status
+---
 
-**5-workload baseline snapshot LANDED**。Future regression / improvement bench
-benchmarks against this anchor。Feature dimension matrix 全部已落地特征按 7 维度
-(TTFT / ITL / throughput / memory / stability / 调度 / substrate)+ KILL 维度标注。
+## 状态
+
+**7-workload baseline 完整重测 + path/算子标注 + features 启用状态全部记录**。
+Future regression / improvement 直接对比此 anchor。每个新 feature 落地后,**重跑 7-workload matrix(同 protocol)**,与本 snapshot 对比 Δ%,落进 wins entry "vs baseline-d4c3fc3" 表。
