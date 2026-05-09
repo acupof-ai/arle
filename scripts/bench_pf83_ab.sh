@@ -39,6 +39,11 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
+# RUST_MIN_STACK=8MB: defensive against Task #43 stack overflow under
+# sustained W4A16 4k-token bench load (PID 1816462 crash at ~7min uptime
+# preceded by prefix cache pressure fallback + 331ms cleanup). Same value
+# applied to both A/B servers so it's invariant across the comparison
+# (doesn't bias TTFT/ITL measurements). Per task #43 documented mitigations.
 PORT="$PORT" exec scripts/bench_ab.sh \
     pf83-baseline-int8 \
     pf83-treatment-fp8 \
@@ -47,8 +52,8 @@ PORT="$PORT" exec scripts/bench_ab.sh \
     --concurrencies 4 \
     --max-seconds 120 \
     --warmup 10 \
-    --cmd-a "INFER_MARLIN_W4_FP8_PREFILL=0 $BIN --model-path $MODEL --port $PORT \
+    --cmd-a "RUST_MIN_STACK=8388608 INFER_MARLIN_W4_FP8_PREFILL=0 $BIN --model-path $MODEL --port $PORT \
              > /tmp/pf83-baseline-int8.log 2>&1 &" \
-    --cmd-b "INFER_MARLIN_W4_FP8_PREFILL=1 $BIN --model-path $MODEL --port $PORT \
+    --cmd-b "RUST_MIN_STACK=8388608 INFER_MARLIN_W4_FP8_PREFILL=1 $BIN --model-path $MODEL --port $PORT \
              > /tmp/pf83-treatment-fp8.log 2>&1 &" \
     "$@"
