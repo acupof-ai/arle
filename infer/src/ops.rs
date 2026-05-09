@@ -1,6 +1,8 @@
 //! GPU operations on device tensors.
 
 use anyhow::Result;
+#[cfg(feature = "cuda")]
+use std::cell::RefCell;
 
 use crate::sampler::SamplingParams;
 
@@ -269,10 +271,14 @@ pub trait OpsBackend {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) use linear::{MarlinDecodeScratch, MarlinDecodeScratchConfig};
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
-pub struct CudaOpsBackend<'ctx> {
+pub struct CudaOpsBackend<'ctx, 'scratch> {
     ctx: &'ctx cuda_kernels::prelude::DeviceContext,
     linear_phase: LinearDispatchPhase,
+    marlin_decode_scratch: Option<&'scratch RefCell<linear::MarlinDecodeScratch>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -283,11 +289,12 @@ pub(crate) enum LinearDispatchPhase {
 }
 
 #[cfg(feature = "cuda")]
-impl<'ctx> CudaOpsBackend<'ctx> {
+impl<'ctx> CudaOpsBackend<'ctx, 'static> {
     pub fn new(ctx: &'ctx cuda_kernels::prelude::DeviceContext) -> Self {
         Self {
             ctx,
             linear_phase: LinearDispatchPhase::Decode,
+            marlin_decode_scratch: None,
         }
     }
 
@@ -295,6 +302,21 @@ impl<'ctx> CudaOpsBackend<'ctx> {
         Self {
             ctx,
             linear_phase: LinearDispatchPhase::Prefill,
+            marlin_decode_scratch: None,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<'ctx, 'scratch> CudaOpsBackend<'ctx, 'scratch> {
+    pub(crate) fn decode_with_marlin_scratch(
+        ctx: &'ctx cuda_kernels::prelude::DeviceContext,
+        scratch: &'scratch RefCell<linear::MarlinDecodeScratch>,
+    ) -> Self {
+        Self {
+            ctx,
+            linear_phase: LinearDispatchPhase::Decode,
+            marlin_decode_scratch: Some(scratch),
         }
     }
 
@@ -304,7 +326,7 @@ impl<'ctx> CudaOpsBackend<'ctx> {
 }
 
 #[cfg(feature = "cuda")]
-impl OpsBackend for CudaOpsBackend<'_> {
+impl OpsBackend for CudaOpsBackend<'_, '_> {
     type Tensor = cuda_kernels::prelude::DeviceVec;
     type TensorBatch = cuda_kernels::prelude::HiddenStates;
     type Matrix = cuda_kernels::prelude::DeviceMatrix;
@@ -367,7 +389,12 @@ impl OpsBackend for CudaOpsBackend<'_> {
         input: &Self::Tensor,
         output: &mut Self::Tensor,
     ) -> Result<()> {
-        linear::gemv(self.ctx, weight, input, output)
+        if let Some(scratch) = self.marlin_decode_scratch {
+            let mut scratch = scratch.borrow_mut();
+            linear::gemv_with_marlin_scratch(self.ctx, weight, input, output, Some(&mut scratch))
+        } else {
+            linear::gemv_with_marlin_scratch(self.ctx, weight, input, output, None)
+        }
     }
 
     fn linear_batch_into(
@@ -376,7 +403,26 @@ impl OpsBackend for CudaOpsBackend<'_> {
         input: &Self::TensorBatch,
         output: &mut Self::TensorBatch,
     ) -> Result<()> {
-        linear::try_gemm_with_phase_into(self.ctx, weight, input, output, self.linear_phase)
+        if let Some(scratch) = self.marlin_decode_scratch {
+            let mut scratch = scratch.borrow_mut();
+            linear::try_gemm_with_phase_and_scratch_into(
+                self.ctx,
+                weight,
+                input,
+                output,
+                self.linear_phase,
+                Some(&mut scratch),
+            )
+        } else {
+            linear::try_gemm_with_phase_and_scratch_into(
+                self.ctx,
+                weight,
+                input,
+                output,
+                self.linear_phase,
+                None,
+            )
+        }
     }
 
     fn fused_mlp_into(
@@ -554,6 +600,8 @@ pub(crate) use attention::{
 pub(crate) use elementwise::{
     add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into, silu_mul_split_batch_into,
 };
+#[cfg(feature = "cuda")]
+pub(crate) use linear::fused_mlp_into_with_scratch;
 #[cfg(all(test, feature = "cuda", not(feature = "no-cuda")))]
 pub(crate) use linear::linear_kernel_plan_for_test;
 #[cfg(feature = "cuda")]

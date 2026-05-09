@@ -11,7 +11,7 @@
 //!   4. BF16, N=1 → `gemm_graphsafe_cuda` (cuBLAS, CUDA Graph safe)
 //!   5. BF16, N>1 → `gemm_cuda` (cuBLAS with workspace)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
@@ -20,6 +20,8 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cuda_kernels::tensor::WeightFormat;
 
 use crate::ops::LinearDispatchPhase;
+
+const MARLIN_MAX_PAR: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinearKernelPlan {
@@ -234,6 +236,198 @@ fn ensure_hybrid_w4_dispatch_ready(
     anyhow::bail!("marlin_w4_hybrid prefill dispatch requires INFER_HYBRID_W4A8_PREFILL=1")
 }
 
+/// Decode-lifetime Marlin scratch used when CUDA Graph capture is enabled.
+///
+/// Both W4A16 and W4A8 Marlin paths previously allocated conversion/output
+/// buffers inside each linear call. Stream capture rejects those allocations,
+/// so qwen3 decode contexts own one scratch arena sized for the largest decode
+/// projection and each captured linear reuses the same arena sequentially.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MarlinDecodeScratchConfig {
+    pub(crate) w4: bool,
+    pub(crate) w4a8: bool,
+}
+
+impl MarlinDecodeScratchConfig {
+    pub(crate) fn new(w4: bool, w4a8: bool) -> Self {
+        Self { w4, w4a8 }
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.w4 || self.w4a8
+    }
+}
+
+pub(crate) struct MarlinDecodeScratch {
+    max_rows: usize,
+    max_k: usize,
+    max_n: usize,
+    w4_x_fp16: Option<CudaSlice<u16>>,
+    w4_y_fp16: Option<CudaSlice<u16>>,
+    w4_workspace: Option<CudaSlice<i32>>,
+    w4a8_x_int8: Option<CudaSlice<i8>>,
+    w4a8_activation_scales: Option<CudaSlice<f32>>,
+    w4a8_y_fp16: Option<CudaSlice<u16>>,
+    w4a8_reduce: Option<CudaSlice<i32>>,
+    w4a8_workspace: Option<CudaSlice<i32>>,
+}
+
+impl MarlinDecodeScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        max_rows: usize,
+        max_k: usize,
+        max_n: usize,
+        config: MarlinDecodeScratchConfig,
+    ) -> Result<Self> {
+        anyhow::ensure!(config.any(), "Marlin decode scratch config is empty");
+        let max_rows = max_rows.max(1);
+        let max_k = max_k.max(1);
+        let max_n = max_n.max(1);
+        let w4_workspace_elems = marlin_workspace_elems(max_n, ctx.sm_count());
+        let w4a8_workspace_elems = w4a8_workspace_elems(max_n);
+
+        Ok(Self {
+            max_rows,
+            max_k,
+            max_n,
+            w4_x_fp16: if config.w4 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(max_rows * max_k)
+                        .map_err(|e| anyhow::anyhow!("alloc Marlin W4 x_fp16 scratch: {e}"))?,
+                )
+            } else {
+                None
+            },
+            w4_y_fp16: if config.w4 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(max_rows * max_n)
+                        .map_err(|e| anyhow::anyhow!("alloc Marlin W4 y_fp16 scratch: {e}"))?,
+                )
+            } else {
+                None
+            },
+            w4_workspace: if config.w4 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(w4_workspace_elems)
+                        .map_err(|e| anyhow::anyhow!("alloc Marlin W4 workspace scratch: {e}"))?,
+                )
+            } else {
+                None
+            },
+            w4a8_x_int8: if config.w4a8 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(max_rows * max_k)
+                        .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 x_int8 scratch: {e}"))?,
+                )
+            } else {
+                None
+            },
+            w4a8_activation_scales: if config.w4a8 {
+                Some(ctx.stream.alloc_zeros(max_rows).map_err(|e| {
+                    anyhow::anyhow!("alloc Marlin W4A8 activation scale scratch: {e}")
+                })?)
+            } else {
+                None
+            },
+            w4a8_y_fp16: if config.w4a8 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(max_rows * max_n)
+                        .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 y_fp16 scratch: {e}"))?,
+                )
+            } else {
+                None
+            },
+            w4a8_reduce: if config.w4a8 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(MARLIN_MAX_PAR * 64 * max_n)
+                        .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 reduce scratch: {e}"))?,
+                )
+            } else {
+                None
+            },
+            w4a8_workspace: if config.w4a8 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(w4a8_workspace_elems)
+                        .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 workspace scratch: {e}"))?,
+                )
+            } else {
+                None
+            },
+        })
+    }
+
+    pub(crate) fn device_bytes(
+        max_rows: usize,
+        max_k: usize,
+        max_n: usize,
+        sm_count: usize,
+        config: MarlinDecodeScratchConfig,
+    ) -> usize {
+        let max_rows = max_rows.max(1);
+        let max_k = max_k.max(1);
+        let max_n = max_n.max(1);
+        let mut total = 0usize;
+        if config.w4 {
+            total = total
+                .saturating_add(bytes_for::<u16>(max_rows * max_k)) // W4 x_fp16
+                .saturating_add(bytes_for::<u16>(max_rows * max_n)) // W4 y_fp16
+                .saturating_add(bytes_for::<i32>(marlin_workspace_elems(
+                    max_n,
+                    sm_count.max(1),
+                )));
+        }
+        if config.w4a8 {
+            total = total
+                .saturating_add(bytes_for::<i8>(max_rows * max_k)) // W4A8 x_int8
+                .saturating_add(bytes_for::<f32>(max_rows)) // W4A8 activation scales
+                .saturating_add(bytes_for::<u16>(max_rows * max_n)) // W4A8 y_fp16
+                .saturating_add(bytes_for::<i32>(MARLIN_MAX_PAR * 64 * max_n)) // W4A8 reduce
+                .saturating_add(bytes_for::<i32>(w4a8_workspace_elems(max_n)));
+        }
+        total
+    }
+
+    fn ensure_capacity(&self, rows: usize, k: usize, n: usize) -> Result<()> {
+        anyhow::ensure!(
+            rows <= self.max_rows,
+            "Marlin decode scratch rows {rows} exceed capacity {}",
+            self.max_rows
+        );
+        anyhow::ensure!(
+            k <= self.max_k,
+            "Marlin decode scratch K {k} exceeds capacity {}",
+            self.max_k
+        );
+        anyhow::ensure!(
+            n <= self.max_n,
+            "Marlin decode scratch N {n} exceeds capacity {}",
+            self.max_n
+        );
+        Ok(())
+    }
+}
+
+fn marlin_workspace_elems(n: usize, sms: usize) -> usize {
+    let bytes = unsafe { ffi::marlin_workspace_size(n as i32, sms.max(1) as i32) };
+    bytes.div_ceil(std::mem::size_of::<i32>()).max(1)
+}
+
+fn w4a8_workspace_elems(n: usize) -> usize {
+    ((n / 128) * MARLIN_MAX_PAR).max(1)
+}
+
+fn bytes_for<T>(count: usize) -> usize {
+    count.saturating_mul(std::mem::size_of::<T>())
+}
+
 #[cfg(all(test, not(feature = "no-cuda")))]
 pub(crate) fn linear_kernel_plan_for_test(
     weight: &DeviceMatrix,
@@ -406,6 +600,16 @@ pub fn gemv(
     input: &DeviceVec,
     output: &mut DeviceVec,
 ) -> Result<()> {
+    gemv_with_marlin_scratch(ctx, weight, input, output, None)
+}
+
+pub(crate) fn gemv_with_marlin_scratch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &DeviceVec,
+    output: &mut DeviceVec,
+    marlin_scratch: Option<&mut MarlinDecodeScratch>,
+) -> Result<()> {
     ensure_hybrid_w4_dispatch_ready(weight, LinearDispatchPhase::Decode, 1)?;
     assert_eq!(
         weight.cols, input.len,
@@ -444,12 +648,34 @@ pub fn gemv(
     }
 
     if plan == LinearKernelPlan::MarlinW4A8Gemm {
-        run_marlin_w4a8_linear(ctx, weight, &input.data, 1, &mut output.data)?;
+        if let Some(scratch) = marlin_scratch {
+            run_marlin_w4a8_linear_with_scratch(
+                ctx,
+                weight,
+                &input.data,
+                1,
+                &mut output.data,
+                scratch,
+            )?;
+        } else {
+            run_marlin_w4a8_linear(ctx, weight, &input.data, 1, &mut output.data)?;
+        }
         return Ok(());
     }
 
     if plan == LinearKernelPlan::MarlinW4Gemm {
-        run_marlin_w4_linear(ctx, weight, &input.data, 1, &mut output.data)?;
+        if let Some(scratch) = marlin_scratch {
+            run_marlin_w4_linear_with_scratch(
+                ctx,
+                weight,
+                &input.data,
+                1,
+                &mut output.data,
+                scratch,
+            )?;
+        } else {
+            run_marlin_w4_linear(ctx, weight, &input.data, 1, &mut output.data)?;
+        }
         return Ok(());
     }
 
@@ -636,6 +862,60 @@ pub fn fused_mlp_into(
         .result()?;
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fused_mlp_into_with_scratch(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    gate_proj: &DeviceMatrix,
+    up_proj: &DeviceMatrix,
+    down_proj: &DeviceMatrix,
+    act: &mut DeviceVec,
+    up_scratch: &mut DeviceVec,
+    out: &mut DeviceVec,
+    marlin_scratch: &mut MarlinDecodeScratch,
+) -> Result<()> {
+    assert_eq!(gate_proj.cols, x.len, "gate_proj cols != x len");
+    assert_eq!(up_proj.cols, x.len, "up_proj cols != x len");
+    assert_eq!(
+        gate_proj.rows, up_proj.rows,
+        "gate and up must have same output dim"
+    );
+    assert_eq!(
+        down_proj.cols, gate_proj.rows,
+        "down_proj cols != intermediate_size"
+    );
+    assert_eq!(down_proj.rows, out.len, "down_proj rows != out len");
+    assert_eq!(act.len, gate_proj.rows, "act len != intermediate_size");
+    assert_eq!(
+        up_scratch.len, gate_proj.rows,
+        "up_scratch len {} != intermediate_size {}",
+        up_scratch.len, gate_proj.rows
+    );
+
+    if !gate_proj.is_quantized() {
+        return fused_mlp_into(ctx, x, gate_proj, up_proj, down_proj, act, out);
+    }
+
+    gemv_with_marlin_scratch(ctx, gate_proj, x, act, Some(marlin_scratch))?;
+    gemv_with_marlin_scratch(ctx, up_proj, x, up_scratch, Some(marlin_scratch))?;
+    {
+        let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
+        let (up_ptr, _gu) = up_scratch.data.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::silu_mul_cuda(
+                act_ptr as *const ffi::Half,
+                up_ptr as *const ffi::Half,
+                act_ptr as *mut ffi::Half,
+                gate_proj.rows as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    gemv_with_marlin_scratch(ctx, down_proj, act, out, Some(marlin_scratch))?;
     Ok(())
 }
 
@@ -917,6 +1197,113 @@ fn run_marlin_w4_linear(
     Ok(())
 }
 
+fn run_marlin_w4_linear_with_scratch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &CudaSlice<bf16>,
+    rows: usize,
+    output: &mut CudaSlice<bf16>,
+    scratch: &mut MarlinDecodeScratch,
+) -> Result<()> {
+    let mp = weight.marlin_packed.as_ref().unwrap();
+    let ms = weight.marlin_scales.as_ref().unwrap();
+    let m = rows;
+    let n = weight.rows;
+    let k = weight.cols;
+    scratch.ensure_capacity(m, k, n)?;
+
+    {
+        let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+        let x_fp16 = scratch
+            .w4_x_fp16
+            .as_mut()
+            .context("Marlin W4 decode scratch missing x_fp16 buffer")?;
+        let (xf_ptr, _gf) = x_fp16.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::bf16_to_fp16_cuda(
+                x_ptr as *const ffi::Half,
+                xf_ptr as *mut ffi::Half,
+                (m * k) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow::anyhow!("marlin bf16_to_fp16 failed: {e}"))?;
+        }
+    }
+
+    let workspace_elems = marlin_workspace_elems(n, ctx.sm_count());
+    ctx.stream
+        .memset_zeros(
+            &mut scratch
+                .w4_workspace
+                .as_mut()
+                .context("Marlin W4 decode scratch missing workspace buffer")?
+                .slice_mut(0..workspace_elems),
+        )
+        .map_err(|e| anyhow::anyhow!("zero Marlin W4 workspace scratch: {e}"))?;
+
+    {
+        let (xf_ptr, _g1) = scratch
+            .w4_x_fp16
+            .as_ref()
+            .context("Marlin W4 decode scratch missing x_fp16 buffer")?
+            .device_ptr(&ctx.stream);
+        let (mp_ptr, _g2) = mp.device_ptr(&ctx.stream);
+        let (yf_ptr, _g3) = scratch
+            .w4_y_fp16
+            .as_mut()
+            .context("Marlin W4 decode scratch missing y_fp16 buffer")?
+            .device_ptr_mut(&ctx.stream);
+        let (ms_ptr, _g4) = ms.device_ptr(&ctx.stream);
+        let (ws_ptr, _g5) = scratch
+            .w4_workspace
+            .as_mut()
+            .context("Marlin W4 decode scratch missing workspace buffer")?
+            .device_ptr_mut(&ctx.stream);
+        let sms = ctx.sm_count() as i32;
+        let ret = unsafe {
+            ffi::marlin_gemm_cuda(
+                xf_ptr as *const ffi::Half,
+                mp_ptr as *const u8,
+                yf_ptr as *mut ffi::Half,
+                ms_ptr as *mut ffi::Half,
+                m as i32,
+                n as i32,
+                k as i32,
+                ws_ptr as *mut i32,
+                weight.group_size as i32,
+                ctx.ordinal() as i32,
+                ctx.stream.cu_stream(),
+                -1,
+                -1,
+                sms,
+                MARLIN_MAX_PAR as i32,
+            )
+        };
+        anyhow::ensure!(ret == 0, "marlin_gemm_cuda failed with code {ret}");
+    }
+
+    {
+        let (yf_ptr, _g1) = scratch
+            .w4_y_fp16
+            .as_ref()
+            .context("Marlin W4 decode scratch missing y_fp16 buffer")?
+            .device_ptr(&ctx.stream);
+        let (y_ptr, _g2) = output.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::fp16_to_bf16_cuda(
+                yf_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                (m * n) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow::anyhow!("marlin fp16_to_bf16 failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn run_marlin_w4a8_linear(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -944,7 +1331,7 @@ fn run_marlin_w4a8_linear(
     let m = rows;
     let n = weight.rows;
     let k = weight.cols;
-    let max_par = 16usize;
+    let max_par = MARLIN_MAX_PAR;
 
     let mut x_int8: CudaSlice<i8> = ctx
         .stream
@@ -1023,6 +1410,159 @@ fn run_marlin_w4a8_linear(
 
     {
         let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);
+        let (y_ptr, _g2) = output.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::fp16_to_bf16_cuda(
+                yf_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                (m * n) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow::anyhow!("W4A8 fp16_to_bf16 failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_marlin_w4a8_linear_with_scratch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &CudaSlice<bf16>,
+    rows: usize,
+    output: &mut CudaSlice<bf16>,
+    scratch: &mut MarlinDecodeScratch,
+) -> Result<()> {
+    let (mp, s_channel, s_group) = if weight.is_hybrid_w4_marlin() {
+        hybrid_w4a8_aligned(weight)
+            .map_err(|reason| anyhow::anyhow!("invalid hybrid W4A8 Marlin matrix: {reason}"))?;
+        (
+            weight.hybrid_w4a8_qweight.as_ref().unwrap(),
+            weight.hybrid_w4a8_s_channel.as_ref().unwrap(),
+            weight.hybrid_w4a8_s_group.as_ref().unwrap(),
+        )
+    } else {
+        marlin_w4a8_aligned(weight)
+            .map_err(|reason| anyhow::anyhow!("invalid W4A8 Marlin matrix: {reason}"))?;
+        (
+            weight.marlin_packed.as_ref().unwrap(),
+            weight.marlin_channel_scales.as_ref().unwrap(),
+            weight.marlin_scales.as_ref().unwrap(),
+        )
+    };
+    let m = rows;
+    let n = weight.rows;
+    let k = weight.cols;
+    scratch.ensure_capacity(m, k, n)?;
+
+    {
+        let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+        let (xq_ptr, _gq) = scratch
+            .w4a8_x_int8
+            .as_mut()
+            .context("Marlin W4A8 decode scratch missing x_int8 buffer")?
+            .device_ptr_mut(&ctx.stream);
+        let (s_ptr, _gs) = scratch
+            .w4a8_activation_scales
+            .as_mut()
+            .context("Marlin W4A8 decode scratch missing activation scale buffer")?
+            .device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::quantize_bf16_rows_to_int8_cuda(
+                x_ptr as *const ffi::Half,
+                xq_ptr as *mut i8,
+                s_ptr as *mut f32,
+                m as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow::anyhow!("quantize_bf16_rows_to_int8_cuda failed: {e}"))?;
+        }
+    }
+
+    let reduce_elems = MARLIN_MAX_PAR * 64 * n;
+    let workspace_elems = w4a8_workspace_elems(n);
+    ctx.stream
+        .memset_zeros(
+            &mut scratch
+                .w4a8_reduce
+                .as_mut()
+                .context("Marlin W4A8 decode scratch missing reduce buffer")?
+                .slice_mut(0..reduce_elems),
+        )
+        .map_err(|e| anyhow::anyhow!("zero Marlin W4A8 reduce scratch: {e}"))?;
+    ctx.stream
+        .memset_zeros(
+            &mut scratch
+                .w4a8_workspace
+                .as_mut()
+                .context("Marlin W4A8 decode scratch missing workspace buffer")?
+                .slice_mut(0..workspace_elems),
+        )
+        .map_err(|e| anyhow::anyhow!("zero Marlin W4A8 workspace scratch: {e}"))?;
+
+    {
+        let (xq_ptr, _g1) = scratch
+            .w4a8_x_int8
+            .as_ref()
+            .context("Marlin W4A8 decode scratch missing x_int8 buffer")?
+            .device_ptr(&ctx.stream);
+        let (mp_ptr, _g2) = mp.device_ptr(&ctx.stream);
+        let (reduce_ptr, _g3) = scratch
+            .w4a8_reduce
+            .as_mut()
+            .context("Marlin W4A8 decode scratch missing reduce buffer")?
+            .device_ptr_mut(&ctx.stream);
+        let (yf_ptr, _g4) = scratch
+            .w4a8_y_fp16
+            .as_mut()
+            .context("Marlin W4A8 decode scratch missing y_fp16 buffer")?
+            .device_ptr_mut(&ctx.stream);
+        let (s1_ptr, _g5) = scratch
+            .w4a8_activation_scales
+            .as_ref()
+            .context("Marlin W4A8 decode scratch missing activation scale buffer")?
+            .device_ptr(&ctx.stream);
+        let (s2_ptr, _g6) = s_channel.device_ptr(&ctx.stream);
+        let (s3_ptr, _g7) = s_group.device_ptr(&ctx.stream);
+        let (ws_ptr, _g8) = scratch
+            .w4a8_workspace
+            .as_mut()
+            .context("Marlin W4A8 decode scratch missing workspace buffer")?
+            .device_ptr_mut(&ctx.stream);
+        let sms = ctx.sm_count() as i32;
+        let ret = unsafe {
+            ffi::gemm_w4a8_marlin_cuda(
+                xq_ptr as *const i8,
+                mp_ptr as *const u8,
+                reduce_ptr as *mut i32,
+                yf_ptr as *mut ffi::Half,
+                s1_ptr as *const f32,
+                s2_ptr as *const f32,
+                s3_ptr as *const ffi::Half,
+                m as i32,
+                n as i32,
+                k as i32,
+                ws_ptr as *mut i32,
+                weight.group_size as i32,
+                ctx.ordinal() as i32,
+                ctx.stream.cu_stream(),
+                -1,
+                -1,
+                sms,
+                MARLIN_MAX_PAR as i32,
+            )
+        };
+        anyhow::ensure!(ret == 0, "gemm_w4a8_marlin_cuda failed with code {ret}");
+    }
+
+    {
+        let (yf_ptr, _g1) = scratch
+            .w4a8_y_fp16
+            .as_ref()
+            .context("Marlin W4A8 decode scratch missing y_fp16 buffer")?
+            .device_ptr(&ctx.stream);
         let (y_ptr, _g2) = output.device_ptr_mut(&ctx.stream);
         unsafe {
             ffi::fp16_to_bf16_cuda(
@@ -1329,6 +1869,17 @@ pub(crate) fn try_gemm_with_phase_into(
     out: &mut HiddenStates,
     phase: LinearDispatchPhase,
 ) -> Result<()> {
+    try_gemm_with_phase_and_scratch_into(ctx, weight, x, out, phase, None)
+}
+
+pub(crate) fn try_gemm_with_phase_and_scratch_into(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    phase: LinearDispatchPhase,
+    marlin_scratch: Option<&mut MarlinDecodeScratch>,
+) -> Result<()> {
     ensure_hybrid_w4_dispatch_ready(weight, phase, x.seq_len)?;
     assert_eq!(
         weight.cols, x.hidden_dim,
@@ -1348,9 +1899,33 @@ pub(crate) fn try_gemm_with_phase_into(
 
     let plan = LinearKernelPlan::batched(weight, x.seq_len, phase);
     match plan {
-        LinearKernelPlan::MarlinW4Gemm => run_marlin_w4_gemm(ctx, weight, x, out)?,
+        LinearKernelPlan::MarlinW4Gemm => {
+            if let Some(scratch) = marlin_scratch {
+                run_marlin_w4_linear_with_scratch(
+                    ctx,
+                    weight,
+                    &x.data,
+                    x.seq_len,
+                    &mut out.data,
+                    scratch,
+                )?;
+            } else {
+                run_marlin_w4_gemm(ctx, weight, x, out)?;
+            }
+        }
         LinearKernelPlan::MarlinW4A8Gemm | LinearKernelPlan::MarlinW4Hybrid => {
-            run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
+            if let Some(scratch) = marlin_scratch {
+                run_marlin_w4a8_linear_with_scratch(
+                    ctx,
+                    weight,
+                    &x.data,
+                    x.seq_len,
+                    &mut out.data,
+                    scratch,
+                )?;
+            } else {
+                run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
+            }
         }
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);

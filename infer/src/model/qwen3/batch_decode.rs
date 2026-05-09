@@ -11,6 +11,7 @@ use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_F
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use cudarc::driver::{CudaEvent, CudaSlice, DevicePtr, DevicePtrMut, PinnedHostSlice};
 use log::info;
+use std::cell::RefCell;
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
@@ -115,6 +116,7 @@ pub struct BatchDecodeBuffers {
     gate_out: HiddenStates,
     up_out: HiddenStates,
     act_out: HiddenStates,
+    marlin_decode_scratch: Option<RefCell<ops::MarlinDecodeScratch>>,
 
     /// Embedding output buffer [max_batch_size, hidden_dim] — avoids alloc in graph.
     embedding_out: HiddenStates,
@@ -336,8 +338,20 @@ impl BatchDecodeBuffers {
         max_total_pages: usize,
         include_hd128_split_workspace: bool,
         fused_gate_up: bool,
+        sm_count: usize,
+        marlin_decode_scratch_config: ops::MarlinDecodeScratchConfig,
     ) -> usize {
         let mlp_scratch_factor = if fused_gate_up { 4usize } else { 3usize };
+        let gate_out_dim = if fused_gate_up {
+            inter_dim.saturating_mul(2)
+        } else {
+            inter_dim
+        };
+        let max_marlin_dim = hidden_dim
+            .max(q_dim)
+            .max(kv_dim)
+            .max(inter_dim)
+            .max(gate_out_dim);
         // Buffers in BatchDecodeBuffers::new:
         //   4×hidden_dim (hidden_out, normed, embedding_out, o_buf)
         //   3×q_dim      (q_batch, attn_output, q_rot)
@@ -360,7 +374,7 @@ impl BatchDecodeBuffers {
             TileLangDecodeMetadata::device_bytes(max_batch_size, max_total_pages, num_qheads)
         };
 
-        bf16_matrix_bytes(activation_dims, max_batch_size)
+        let mut total = bf16_matrix_bytes(activation_dims, max_batch_size)
             .saturating_add(bytes_for::<i32>(max_batch_size)) // argmax_out
             .saturating_add(bytes_for::<f32>(max_batch_size)) // logprobs_gpu
             .saturating_add(bytes_for::<i32>(max_batch_size)) // next_decode_meta_gpu
@@ -371,7 +385,18 @@ impl BatchDecodeBuffers {
                 ASYNC_READBACK_SLOTS.saturating_mul(max_batch_size),
             )) // async_logprobs_gpu_slots
             .saturating_add(bytes_for::<i32>(2 * max_batch_size + 1)) // quantized_kv_meta
-            .saturating_add(metadata_bytes)
+            .saturating_add(metadata_bytes);
+
+        if marlin_decode_scratch_config.any() {
+            total = total.saturating_add(ops::MarlinDecodeScratch::device_bytes(
+                max_batch_size,
+                max_marlin_dim,
+                max_marlin_dim,
+                sm_count,
+                marlin_decode_scratch_config,
+            ));
+        }
+        total
     }
 
     pub(crate) fn logits_device_bytes(vocab_size: usize, max_batch_size: usize) -> usize {
@@ -443,12 +468,18 @@ impl BatchDecodeBuffers {
         max_total_pages: usize,
         include_hd128_split_workspace: bool,
         fused_gate_up: bool,
+        marlin_decode_scratch_config: ops::MarlinDecodeScratchConfig,
     ) -> Result<Self> {
         let gate_out_dim = if fused_gate_up {
             inter_dim * 2
         } else {
             inter_dim
         };
+        let max_marlin_dim = hidden_dim
+            .max(q_dim)
+            .max(kv_dim)
+            .max(inter_dim)
+            .max(gate_out_dim);
         let mut async_argmax_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
         let mut async_logprobs_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
         let mut async_argmax_host_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
@@ -490,6 +521,17 @@ impl BatchDecodeBuffers {
             gate_out: HiddenStates::zeros(ctx, gate_out_dim, max_batch_size)?,
             up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
+            marlin_decode_scratch: if marlin_decode_scratch_config.any() {
+                Some(RefCell::new(ops::MarlinDecodeScratch::new(
+                    ctx,
+                    max_batch_size,
+                    max_marlin_dim,
+                    max_marlin_dim,
+                    marlin_decode_scratch_config,
+                )?))
+            } else {
+                None
+            },
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             logits_batch: None, // lazy-allocated on first use (needs vocab_size)
@@ -1635,7 +1677,6 @@ impl Qwen3Model {
         debug_assert_eq!(batch_size, slot_indices.len());
         debug_assert!(batch_size >= 1);
         debug_assert!(batch_size <= bufs.max_batch_size);
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
 
         // LoRA path: keep the paged KV pool, but run eagerly (no graph
         // capture) with split QKV and split gate/up GEMMs so adapters can
@@ -1656,6 +1697,7 @@ impl Qwen3Model {
             }
             self.decode_batch_lora_body(bufs, paged_kv_pool, batch_size)?;
             if !skip_logit_scatter {
+                let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
                 let logits = bufs.logits_batch.as_ref().unwrap();
                 for (b, &si) in slot_indices.iter().enumerate() {
                     ops_backend.extract_vec_into(logits, b, &mut states[si].decode_bufs.logits)?;
@@ -1731,6 +1773,7 @@ impl Qwen3Model {
 
         // Scatter per-slot logits only when needed (non-greedy fallback).
         if !skip_logit_scatter {
+            let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
             let logits = bufs.logits_batch.as_ref().unwrap();
             for (b, &si) in slot_indices.iter().enumerate() {
                 ops_backend.extract_vec_into(logits, b, &mut states[si].decode_bufs.logits)?;
@@ -2064,14 +2107,20 @@ impl Qwen3Model {
         batch_size: usize,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        {
+            let ops_backend = if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+                ops::CudaOpsBackend::decode_with_marlin_scratch(&self.ctx, scratch)
+            } else {
+                ops::CudaOpsBackend::new(&self.ctx)
+            };
 
-        // Embedding (reads from pre-allocated next_decode_meta_gpu)
-        ops_backend.embedding_batch_into(
-            &self.embed_tokens,
-            &bufs.next_decode_meta_gpu,
-            &mut bufs.embedding_out,
-        )?;
+            // Embedding (reads from pre-allocated next_decode_meta_gpu)
+            ops_backend.embedding_batch_into(
+                &self.embed_tokens,
+                &bufs.next_decode_meta_gpu,
+                &mut bufs.embedding_out,
+            )?;
+        }
 
         // Use embedding_out as the initial hidden state. The layer loop
         // ping-pongs between embedding_out and hidden_out via swap.
@@ -2101,6 +2150,11 @@ impl Qwen3Model {
 
         // Final norm + logits. hidden is whichever buffer was last written.
         let hidden = unsafe { &*hidden_ptr };
+        let ops_backend = if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+            ops::CudaOpsBackend::decode_with_marlin_scratch(&self.ctx, scratch)
+        } else {
+            ops::CudaOpsBackend::new(&self.ctx)
+        };
         ops_backend.rms_norm_batch_into(hidden, &self.norm, eps, &mut bufs.normed)?;
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
@@ -2120,7 +2174,11 @@ impl Qwen3Model {
         next_input_norm: Option<&DeviceVec>,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        let ops_backend = if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+            ops::CudaOpsBackend::decode_with_marlin_scratch(&self.ctx, scratch)
+        } else {
+            ops::CudaOpsBackend::new(&self.ctx)
+        };
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
@@ -2466,7 +2524,19 @@ mod tests {
     #[test]
     fn async_readback_multi_slot_no_loss() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false, false)?;
+        let mut bufs = BatchDecodeBuffers::new(
+            &ctx,
+            1,
+            1,
+            1,
+            1,
+            4,
+            1,
+            16,
+            false,
+            false,
+            ops::MarlinDecodeScratchConfig::default(),
+        )?;
         let mut slots = Vec::new();
 
         for i in 0..ASYNC_READBACK_SLOTS {
@@ -2504,7 +2574,19 @@ mod tests {
     #[test]
     fn mixed_token_upload_uses_sampled_handoff_for_decode_rows() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let mut bufs = BatchDecodeBuffers::new(&ctx, 1, 1, 1, 1, 4, 1, 16, false, false)?;
+        let mut bufs = BatchDecodeBuffers::new(
+            &ctx,
+            1,
+            1,
+            1,
+            1,
+            4,
+            1,
+            16,
+            false,
+            false,
+            ops::MarlinDecodeScratchConfig::default(),
+        )?;
         {
             let mut sampled_dst = bufs.argmax_out.slice_mut(0..2);
             ctx.stream

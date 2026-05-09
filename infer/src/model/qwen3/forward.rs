@@ -164,7 +164,11 @@ impl ModelForward for Qwen3Model {
 
     fn create_state(&self) -> Result<Self::State> {
         Ok(Qwen3State {
-            decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
+            decode_bufs: DecodeBuffers::new(
+                &self.ctx,
+                &self.config,
+                self.marlin_decode_scratch_config(),
+            )?,
             base: GenerationStateBase::new(
                 self.config.num_hidden_layers,
                 self.config.num_key_value_heads,
@@ -204,6 +208,7 @@ impl ModelForward for Qwen3Model {
             max_pages,
             include_hd128_split_workspace,
             self.uses_fused_gate_up(),
+            self.marlin_decode_scratch_config(),
         )
     }
 
@@ -238,6 +243,7 @@ impl ModelForward for Qwen3Model {
         let include_hd128_split_workspace = ops::tilelang_bf16_split_kv_requested()
             && kv_pool_format == crate::model::kv_cache::KVFormat::BF16
             && self.config.head_dim == 128;
+        let marlin_scratch_config = self.marlin_decode_scratch_config();
         let decode_context = super::batch_decode::BatchDecodeBuffers::device_bytes(
             self.config.hidden_size,
             q_dim,
@@ -248,6 +254,8 @@ impl ModelForward for Qwen3Model {
             metadata_max_pages,
             include_hd128_split_workspace,
             self.uses_fused_gate_up(),
+            self.ctx.sm_count(),
+            marlin_scratch_config,
         );
         let decode_logits = super::batch_decode::BatchDecodeBuffers::logits_device_bytes(
             self.config.vocab_size,
@@ -753,10 +761,7 @@ impl ModelForward for Qwen3Model {
     fn supports_cuda_graph_decode(&self) -> bool {
         // LoRA decode allocates per-call temp DeviceVecs inside
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
-        // W4A8 Marlin currently quantizes activations and allocates scratch
-        // inside linear dispatch, so it must also stay eager until that
-        // scratch is hoisted into decode buffers.
-        self.enable_cuda_graph && self.lora.is_none() && !self.uses_marlin_w4a8()
+        self.enable_cuda_graph && self.lora.is_none()
     }
 }
 
