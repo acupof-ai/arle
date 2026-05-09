@@ -99,12 +99,19 @@ else
     fi
 fi
 
+# Cargo fmt (sed/perl preserves the outer let binding so indentation
+# of the new args is one block too shallow; rustfmt fixes this cleanly).
+info "Running cargo fmt to normalize patched indentation..."
+if ! cargo fmt --all > "$LOG_DIR/step2-cargo-fmt.log" 2>&1; then
+    fail_exit "cargo fmt failed; see $LOG_DIR/step2-cargo-fmt.log"
+fi
+
 # Cargo check
 info "Verifying patched build (cargo check no-cuda)..."
 if ! cargo check -p infer --no-default-features --features no-cuda > "$LOG_DIR/step2-cargo-check.log" 2>&1; then
     fail_exit "cargo check failed; see $LOG_DIR/step2-cargo-check.log"
 fi
-ok "Phase 2 step 3 RoPE patch applied + builds"
+ok "Phase 2 step 3 RoPE patch applied + fmt + builds"
 
 # Commit (by explicit path)
 git add "$WEIGHTS_RS"
