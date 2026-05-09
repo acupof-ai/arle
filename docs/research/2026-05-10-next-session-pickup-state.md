@@ -67,15 +67,29 @@ status: session-end-checkpoint-for-next-pickup
   candidate documented (strengthen #29 OR add #33: for non-trivial
   substrate codex review is gate, not formality).
 - **codex review WEDGE → RESOLVED** (`b34de92` + `647210e` errors +
-  recovery confirmed THIS tick): PID 1867396 was alive 51m+ (State=S,
+  recovery confirmed): PID 1867396 was alive 51m+ (State=S,
   futex_wait, 0:10 CPU) blocked on OpenAI API via localhost:7897 proxy.
   Diagnostic ruled out infrastructure (proxy HTTP 400 in 2ms, OpenAI API
   HTTP 401 in 393ms, other codex sessions fine). PushNotification
   dispatched recovery (`kill -TERM 1867396`). RESOLVED: PID 1867396 GONE
   + codex resumed pre-commit chain (standalone nvcc smoke PASS + cargo
-  check re-running PID 1871935). Skill v1.12.0+ candidate #34
-  documented: timeout(1) insufficient for SIGTERM-catching subprocesses;
-  use --kill-after for hard enforcement (or kill -9 PID directly).
+  check re-PASS 3m49s + cargo clippy re-PASS 3m51s + targeted greedy/e2e
+  re-running). Skill v1.12.0+ candidate #34 documented: timeout(1)
+  insufficient for SIGTERM-catching subprocesses; use --kill-after for
+  hard enforcement (or kill -9 PID directly).
+- **PF8.3 substrate post-wedge ADDITIONAL FIXES** (codex narration THIS
+  session): beyond the 3 review-caught bugs (ace3cbe parallel-M loop +
+  max_par/lock workspace + graph capture vs PF8 scratch), codex applied
+  "scale dtype 修正和 lazy sidecar gate" during post-review iteration.
+  These additional fixes will appear in codex's substrate commit (still
+  pending; cargo test in flight PID 1877276 started 07:05). Watch
+  codex's eventual wins entry for full fix list.
+- **PF8.5 ergonomics protection** (Claude this session — extends `c382fba`):
+  - `bf47413` Step 1 INFER_TEST_W4A8_MODEL_PATH=hybrid (anti-pattern #29)
+  - `e99e5a5` defaults to hybrid checkpoint
+  - `a6cf5ac` --dry-run flag (5/5 OK pre-flights verified)
+  - `9bb3843` bench_pf83_ab.sh RUST_MIN_STACK=8388608 (Task #43 protect)
+  - `c6ccd24` stale-binary warning (compares mtime mar..._kernel.cu vs target/release/infer)
 - **#34 RESOLVED** (`df37a68`): `arle data download` + `arle model
   download` CLI surfaces. Data download VERIFIED working on current
   binary (`8735361` Medusa Phase 1.A pickup chain survey). Model
