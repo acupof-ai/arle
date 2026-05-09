@@ -27,6 +27,8 @@ fn qwen3_lora_freezes_base_and_materializes_weights() -> TestResult {
         max_position_embeddings: 16,
         rms_norm_eps: 1.0e-6,
         rope_theta: 10_000.0,
+
+        rope_scaling: None,
         tie_word_embeddings: false,
     };
     let lora = Some(LoraConfig {
@@ -139,6 +141,8 @@ fn qwen35_lora_freezes_base_and_materializes_weights() -> TestResult {
         linear_value_head_dim: 8,
         linear_conv_kernel_dim: 4,
         rope_theta: 10_000.0,
+
+        rope_scaling: None,
         partial_rotary_factor: 1.0,
         rotary_dim: 8,
         rope_cache_len_hint: Some(16),

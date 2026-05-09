@@ -1448,6 +1448,7 @@ mod lora_tests {
             linear_value_head_dim: 8,
             linear_conv_kernel_dim: 4,
             rope_theta: 10_000.0,
+            rope_scaling: None,
             partial_rotary_factor: 1.0,
             rotary_dim: 8,
             rope_cache_len_hint: Some(16),
@@ -1584,6 +1585,7 @@ mod tests {
             vocab_size: 151936,
             rms_norm_eps: 1.0e-6,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             tie_word_embeddings: true,
             max_position_embeddings: 32768,
         }
@@ -1623,6 +1625,7 @@ mod tests {
             vocab_size: 32,
             rms_norm_eps: 1.0e-6,
             rope_theta: 10_000.0,
+            rope_scaling: None,
             tie_word_embeddings: false,
             max_position_embeddings: 64,
         }
@@ -1805,6 +1808,7 @@ mod tests {
 
         let live_cfg = Qwen3Config {
             rope_theta: cfg.rope_theta * 2.0,
+            rope_scaling: None,
             ..cfg
         };
 

@@ -34,6 +34,8 @@ fn tiny_qwen3_config() -> Qwen3Config {
         max_position_embeddings: 32,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+
+        rope_scaling: None,
         tie_word_embeddings: false,
     }
 }
