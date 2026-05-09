@@ -94,6 +94,16 @@ status: session-end-checkpoint-for-next-pickup
   - `a6cf5ac` --dry-run flag (5/5 OK pre-flights verified)
   - `9bb3843` bench_pf83_ab.sh RUST_MIN_STACK=8388608 (Task #43 protect)
   - `c6ccd24` stale-binary warning (compares mtime mar..._kernel.cu vs target/release/infer)
+  - `172c311` PATH=$REPO/.venv/bin:$PATH (M_e gauntlet 2026-05-07 pattern,
+    bench v2 root cause: guidellm not on PATH)
+  - `45579c0` add INFER_HYBRID_W4A8_PREFILL=1 to all 3 entry points
+    (bench v2 root cause: hybrid model loader requires both this AND
+    INFER_MARLIN_W4_FP8_PREFILL — anti-pattern #29 manifested 2nd time)
+- **PF8.5 bench v3 RUNNING** (started 07:19): guidellm PID 1907236
+  + server PID 1907144 at GPU 100% utilization (14 GB used) — first
+  real PF8.3 substrate inference under load this session. ETA ~07:27-30
+  for full A/B (4 concurrencies × 60s × 2 runs ≈ 8-10 min). Logs at
+  /tmp/claude-pf85-bench-v3.log + bench-output/2026-05-10-pf83-baseline-int8-run2/.
 - **#34 RESOLVED** (`df37a68`): `arle data download` + `arle model
   download` CLI surfaces. Data download VERIFIED working on current
   binary (`8735361` Medusa Phase 1.A pickup chain survey). Model
