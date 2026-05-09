@@ -17,8 +17,9 @@ __global__ void prefill_attention_paged_qk_norm_rope_hd128_kernel(
     int seq_len,
     int q_dim,
     int kv_dim,
-    int start_pos,
+    const int* __restrict__ start_pos_ptr,
     float eps) {
+  int start_pos = *start_pos_ptr;
   int head_global = blockIdx.x;
   int token = blockIdx.y;
   int d = threadIdx.x;
@@ -82,20 +83,23 @@ __global__ void prefill_attention_paged_kv_write_hd128_kernel(
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
     const int* __restrict__ page_table,
+    const int* __restrict__ page_table_offset_ptr,
     int page_size,
     __nv_bfloat16* __restrict__ k_pool,
     __nv_bfloat16* __restrict__ v_pool,
     int num_kv_heads,
     int seq_len,
     int kv_dim,
-    int start_pos) {
+    const int* __restrict__ start_pos_ptr) {
+  int start_pos = *start_pos_ptr;
   int kv_head = blockIdx.x;
   int token = blockIdx.y;
   int d = threadIdx.x;
 
   int src_offset = kv_head * PREFILL_PAGED_HD128 + d + token * kv_dim;
   int logical_pos = start_pos + token;
-  int physical_page = page_table[logical_pos / page_size];
+  int page_table_offset = *page_table_offset_ptr;
+  int physical_page = page_table[page_table_offset + logical_pos / page_size];
   int token_in_page = logical_pos % page_size;
   int stride_page = num_kv_heads * page_size * PREFILL_PAGED_HD128;
   int pool_offset = physical_page * stride_page + kv_head * page_size * PREFILL_PAGED_HD128 +
@@ -241,6 +245,7 @@ cudaError_t prefill_attention_paged_prep_cuda(
     const __nv_bfloat16* cos_cache,
     const __nv_bfloat16* sin_cache,
     const int* page_table,
+    const int* page_table_offset_ptr,
     int page_size,
     __nv_bfloat16* k_pool,
     __nv_bfloat16* v_pool,
@@ -248,7 +253,7 @@ cudaError_t prefill_attention_paged_prep_cuda(
     int num_kv_heads,
     int head_dim,
     int seq_len,
-    int start_pos,
+    const int* start_pos_ptr,
     float rms_eps,
     cudaStream_t stream) {
   (void)head_dim;
@@ -268,7 +273,7 @@ cudaError_t prefill_attention_paged_prep_cuda(
       seq_len,
       q_dim,
       kv_dim,
-      start_pos,
+      start_pos_ptr,
       rms_eps);
 
   dim3 cache_grid(num_kv_heads, seq_len);
@@ -276,13 +281,14 @@ cudaError_t prefill_attention_paged_prep_cuda(
       k_batch,
       v_batch,
       page_table,
+      page_table_offset_ptr,
       page_size,
       k_pool,
       v_pool,
       num_kv_heads,
       seq_len,
       kv_dim,
-      start_pos);
+      start_pos_ptr);
   return cudaGetLastError();
 }
 
