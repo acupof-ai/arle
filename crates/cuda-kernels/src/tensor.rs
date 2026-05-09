@@ -43,6 +43,13 @@ fn parse_device_ordinal(value: Option<&str>) -> Result<u32> {
     }
 }
 
+fn marlin_w4_fp8_prefill_enabled_for_load() -> bool {
+    matches!(
+        std::env::var("INFER_MARLIN_W4_FP8_PREFILL").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
 impl DeviceContext {
     /// Query available (free) GPU memory in bytes.
     /// Returns `(free_bytes, total_bytes)`.
@@ -576,6 +583,9 @@ pub struct DeviceMatrix {
     pub hybrid_w4a8_s_channel: Option<CudaSlice<f32>>,
     /// Hybrid W4 sidecar: W4A8 FP16 per-group scales.
     pub hybrid_w4a8_s_group: Option<CudaSlice<u16>>,
+    /// Hybrid W4 sidecar: PF8.2 zero-point preprocessed packed weights for
+    /// W4+FP8 prefill GEMM.
+    pub hybrid_w4_fp8_qweight: Option<CudaSlice<u8>>,
     // -- TurboQuant packed weight storage (Phase 2: fused dequant at runtime) --
     /// TQ packed indices [rows, packed_cols] u8.
     /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
@@ -612,6 +622,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -661,6 +672,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -718,6 +730,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -787,6 +800,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -862,6 +876,30 @@ impl DeviceMatrix {
             .stream
             .clone_htod(w4a8_s_group)
             .map_err(|e| anyhow!("H2D hybrid W4A8 group scales failed: {e}"))?;
+        let w4_fp8_packed = if marlin_w4_fp8_prefill_enabled_for_load() {
+            let mut packed = ctx
+                .stream
+                .alloc_zeros::<u8>(w4a8_qweight.len())
+                .map_err(|e| anyhow!("Alloc hybrid W4+FP8 qweight: {e}"))?;
+            {
+                let (src, _src_guard) = w4a8_packed.device_ptr(&ctx.stream);
+                let (dst, _dst_guard) = packed.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::marlin_int4_fp8_preprocess_without_zp_cuda(
+                        src as *const i32,
+                        dst as *mut i32,
+                        (w4a8_qweight.len() / std::mem::size_of::<i32>()) as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("PF8.2 hybrid W4 qweight preprocess failed: {e}"))?;
+                }
+            }
+            Some(packed)
+        } else {
+            None
+        };
+
         let dummy = ctx
             .stream
             .alloc_zeros::<bf16>(1)
@@ -881,6 +919,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: Some(w4a8_packed),
             hybrid_w4a8_s_channel: Some(w4a8_channel),
             hybrid_w4a8_s_group: Some(w4a8_group),
+            hybrid_w4_fp8_qweight: w4_fp8_packed,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -938,6 +977,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -995,6 +1035,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1058,6 +1099,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1115,6 +1157,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1171,6 +1214,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1210,6 +1254,12 @@ impl DeviceMatrix {
     /// Whether this matrix carries both W4A16 and W4A8 Marlin side tensors.
     pub fn is_hybrid_w4_marlin(&self) -> bool {
         self.hybrid_w4a8_qweight.is_some()
+    }
+
+    /// Whether the hybrid matrix has the PF8.2 preprocessed W4 side tensor
+    /// needed by the W4+FP8 prefill kernel.
+    pub fn has_hybrid_w4_fp8_prefill(&self) -> bool {
+        self.hybrid_w4_fp8_qweight.is_some()
     }
 
     /// Whether this matrix uses TurboQuant packed weight storage.
@@ -1269,6 +1319,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: Some(tq_p),
             tq_scales: Some(tq_s),
             tq_signs: Some(tq_sg),
@@ -1421,6 +1472,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1468,6 +1520,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,
@@ -1508,6 +1561,7 @@ impl DeviceMatrix {
                 hybrid_w4a8_qweight: None,
                 hybrid_w4a8_s_channel: None,
                 hybrid_w4a8_s_group: None,
+                hybrid_w4_fp8_qweight: None,
                 tq_packed: None,
                 tq_scales: None,
                 tq_signs: None,
@@ -1545,6 +1599,7 @@ impl DeviceMatrix {
             hybrid_w4a8_qweight: None,
             hybrid_w4a8_s_channel: None,
             hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
             tq_packed: None,
             tq_scales: None,
             tq_signs: None,

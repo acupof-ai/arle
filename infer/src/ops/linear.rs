@@ -49,7 +49,7 @@ enum LinearKernelPlan {
     MarlinW4Gemm,
     MarlinW4A8Gemm,
     MarlinW4Hybrid,
-    /// PF8.4 — Prefill-only W4+FP8 marlin GEMM dispatch (PF8.3 kernel pending).
+    /// PF8.4 — Prefill-only W4+FP8 marlin GEMM dispatch.
     /// Opt-in via `INFER_MARLIN_W4_FP8_PREFILL=1` env var. Decode path
     /// keeps existing W4A8 (FP8 mma is wrong lever for HBM-bound decode
     /// per docs/research/2026-05-10-phase0a-decode-kill-architectural-implication.md).
@@ -79,11 +79,10 @@ impl LinearKernelPlan {
 
     fn batched(weight: &DeviceMatrix, batch: usize, phase: LinearDispatchPhase) -> Self {
         // PF8.4 — opt-in W4+FP8 prefill dispatch (decode keeps W4+INT8).
-        // Currently bails at call site since PF8.3 GEMM kernel pending.
         if phase == LinearDispatchPhase::Prefill
             && batch > 1
             && marlin_w4_fp8_prefill_enabled()
-            && marlin_w4a8_aligned(weight).is_ok()
+            && hybrid_w4_fp8_aligned(weight).is_ok()
         {
             return Self::MarlinW4FP8Prefill;
         }
@@ -213,6 +212,20 @@ fn hybrid_w4a8_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'stati
     Ok(())
 }
 
+fn hybrid_w4_fp8_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'static str> {
+    hybrid_w4a8_aligned(weight)?;
+    if !weight.has_marlin() {
+        return Err("missing hybrid W4A16 Marlin-packed side buffer");
+    }
+    if weight.marlin_scales.is_none() {
+        return Err("missing hybrid W4A16 per-group scales");
+    }
+    if !weight.has_hybrid_w4_fp8_prefill() {
+        return Err("missing hybrid W4+FP8 preprocessed side buffer");
+    }
+    Ok(())
+}
+
 fn turboquant_params(weight: &DeviceMatrix) -> (i32, i32, i32, i32, i32, i32) {
     let n = weight.rows as i32;
     let k = weight.cols as i32;
@@ -239,7 +252,6 @@ fn hybrid_w4a8_prefill_enabled() -> bool {
 /// Enabled when `INFER_MARLIN_W4_FP8_PREFILL=1` env var is set.
 /// Decode path stays W4+INT8 unchanged (FP8 mma doesn't help HBM-bound
 /// decode per Phase 0 P0.A architectural KILL synthesis).
-/// PF8.3 kernel implementation pending — currently bails at call site.
 fn marlin_w4_fp8_prefill_enabled() -> bool {
     matches!(
         std::env::var("INFER_MARLIN_W4_FP8_PREFILL").as_deref(),
@@ -264,6 +276,11 @@ fn ensure_hybrid_w4_dispatch_ready(
 
 pub(crate) fn graphsafe_batched_weight(weight: &DeviceMatrix) -> bool {
     if weight.is_hybrid_w4_marlin() {
+        if marlin_w4_fp8_prefill_enabled() {
+            // PF8 prefill currently owns per-call quant/reduce scratch; keep it
+            // out of CUDA graph capture until that scratch is context-lifetime.
+            return false;
+        }
         return hybrid_w4a8_prefill_enabled() && hybrid_w4a8_aligned(weight).is_ok();
     }
     weight.is_dense_bf16()
@@ -1617,6 +1634,113 @@ fn run_marlin_w4a8_linear_with_scratch(
     Ok(())
 }
 
+fn run_marlin_w4_fp8_prefill(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &CudaSlice<bf16>,
+    rows: usize,
+    output: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    hybrid_w4_fp8_aligned(weight)
+        .map_err(|reason| anyhow::anyhow!("invalid hybrid W4+FP8 Marlin matrix: {reason}"))?;
+    let qweight = weight.hybrid_w4_fp8_qweight.as_ref().unwrap();
+    let scales = weight.marlin_scales.as_ref().unwrap();
+    let m = rows;
+    let n = weight.rows;
+    let k = weight.cols;
+    let max_par = MARLIN_MAX_PAR;
+
+    let mut x_fp8: CudaSlice<u8> = ctx
+        .stream
+        .alloc_zeros(m * k)
+        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 x_fp8: {e}"))?;
+    let mut s_activation: CudaSlice<f32> = ctx
+        .stream
+        .alloc_zeros(m)
+        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 activation scales: {e}"))?;
+    {
+        let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
+        let (xq_ptr, _gq) = x_fp8.device_ptr_mut(&ctx.stream);
+        let (s_ptr, _gs) = s_activation.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::quantize_bf16_rows_to_fp8_e4m3_cuda(
+                x_ptr as *const ffi::Half,
+                xq_ptr as *mut u8,
+                s_ptr as *mut f32,
+                m as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow::anyhow!("quantize_bf16_rows_to_fp8_e4m3_cuda failed: {e}"))?;
+        }
+    }
+
+    let tmp_m = m.div_ceil(16) * 16;
+    let tmp_m = tmp_m.min(64);
+    let mut reduce: CudaSlice<f32> = ctx
+        .stream
+        .alloc_zeros(ctx.sm_count() * tmp_m * 256)
+        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 reduce buffer: {e}"))?;
+    let lock_elems = ((n / 128) * max_par).max(1);
+    let mut workspace: CudaSlice<i32> = ctx
+        .stream
+        .alloc_zeros(lock_elems)
+        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 lock workspace: {e}"))?;
+    let mut y_fp16: CudaSlice<ffi::Half> = ctx
+        .stream
+        .alloc_zeros(m * n)
+        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 fp16 output: {e}"))?;
+
+    {
+        let (xq_ptr, _g1) = x_fp8.device_ptr(&ctx.stream);
+        let (q_ptr, _g2) = qweight.device_ptr(&ctx.stream);
+        let (reduce_ptr, _g3) = reduce.device_ptr_mut(&ctx.stream);
+        let (yf_ptr, _g4) = y_fp16.device_ptr_mut(&ctx.stream);
+        let (s1_ptr, _g5) = s_activation.device_ptr(&ctx.stream);
+        let (s2_ptr, _g6) = scales.device_ptr(&ctx.stream);
+        let (ws_ptr, _g7) = workspace.device_ptr_mut(&ctx.stream);
+        let sms = ctx.sm_count() as i32;
+        let ret = unsafe {
+            ffi::gemm_w4_fp8_marlin_cuda(
+                xq_ptr as *const u8,
+                q_ptr as *const u8,
+                reduce_ptr as *mut f32,
+                yf_ptr as *mut ffi::Half,
+                s1_ptr as *const f32,
+                s2_ptr as *const ffi::Half,
+                m as i32,
+                n as i32,
+                k as i32,
+                ws_ptr as *mut i32,
+                weight.group_size as i32,
+                ctx.ordinal() as i32,
+                ctx.stream.cu_stream(),
+                -1,
+                -1,
+                sms,
+                max_par as i32,
+            )
+        };
+        anyhow::ensure!(ret == 0, "gemm_w4_fp8_marlin_cuda failed with code {ret}");
+    }
+    {
+        let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);
+        let (out_ptr, _g2) = output.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::fp16_to_bf16_cuda(
+                yf_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                (m * n) as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow::anyhow!("W4+FP8 fp16_to_bf16 failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn run_turboquant_linear(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -1967,15 +2091,7 @@ pub(crate) fn try_gemm_with_phase_and_scratch_into(
             }
         }
         LinearKernelPlan::MarlinW4FP8Prefill => {
-            // PF8.4 — opt-in dispatch reached via INFER_MARLIN_W4_FP8_PREFILL=1.
-            // PF8.3 GEMM kernel implementation pending (codex pickup per
-            // docs/research/2026-05-10-pf8.3-scope-analysis-mma-shape-mismatch.md).
-            // PF8.1 (BF16→FP8 act quant) + PF8.2 (INT4 weight preprocess)
-            // already landed in 940f49e and runtime-verified (b628eca + 451d094).
-            anyhow::bail!(
-                "MarlinW4FP8Prefill: PF8.3 FP8 marlin GEMM kernel not yet implemented. \
-                 Unset INFER_MARLIN_W4_FP8_PREFILL or set =0 to fall back to W4+INT8."
-            );
+            run_marlin_w4_fp8_prefill(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
         }
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);
