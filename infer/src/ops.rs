@@ -271,7 +271,10 @@ pub trait OpsBackend {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) use linear::{MarlinDecodeScratch, MarlinDecodeScratchConfig};
+pub(crate) use linear::{
+    MarlinDecodeScratch, MarlinDecodeScratchConfig, MarlinPrefillScratch,
+    MarlinPrefillScratchConfig,
+};
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
@@ -316,6 +319,17 @@ impl<'ctx, 'scratch> CudaOpsBackend<'ctx, 'scratch> {
         Self {
             ctx,
             linear_phase: LinearDispatchPhase::Decode,
+            marlin_decode_scratch: Some(scratch),
+        }
+    }
+
+    pub(crate) fn prefill_with_marlin_scratch(
+        ctx: &'ctx cuda_kernels::prelude::DeviceContext,
+        scratch: &'scratch RefCell<linear::MarlinPrefillScratch>,
+    ) -> Self {
+        Self {
+            ctx,
+            linear_phase: LinearDispatchPhase::Prefill,
             marlin_decode_scratch: Some(scratch),
         }
     }
@@ -602,6 +616,8 @@ pub(crate) use elementwise::{
 };
 #[cfg(feature = "cuda")]
 pub(crate) use linear::fused_mlp_into_with_scratch;
+#[cfg(feature = "cuda")]
+pub(crate) use linear::graphsafe_batched_weight;
 #[cfg(all(test, feature = "cuda", not(feature = "no-cuda")))]
 pub(crate) use linear::linear_kernel_plan_for_test;
 #[cfg(feature = "cuda")]

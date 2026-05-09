@@ -171,6 +171,17 @@ impl Qwen3Mlp {
             }
     }
 
+    fn uses_marlin_w4_prefill_gemm(&self) -> bool {
+        matrix_uses_marlin_w4_prefill(&self.down_proj)
+            || match &self.gate_up {
+                Qwen3GateUp::Separate { gate_proj, up_proj } => {
+                    matrix_uses_marlin_w4_prefill(gate_proj)
+                        || matrix_uses_marlin_w4_prefill(up_proj)
+                }
+                Qwen3GateUp::Fused { gate_up_proj } => matrix_uses_marlin_w4_prefill(gate_up_proj),
+            }
+    }
+
     fn uses_marlin_w4_decode(&self) -> bool {
         matrix_uses_marlin_w4_decode(&self.down_proj)
             || match &self.gate_up {
@@ -195,6 +206,12 @@ impl Qwen3Mlp {
 
 fn matrix_uses_marlin_w4_decode(matrix: &DeviceMatrix) -> bool {
     matrix.has_marlin() && matrix.weight_format() == WeightFormat::W4A16
+}
+
+fn matrix_uses_marlin_w4_prefill(matrix: &DeviceMatrix) -> bool {
+    matrix.has_marlin()
+        && matrix.weight_format() == WeightFormat::W4A16
+        && !matrix.is_hybrid_w4_marlin()
 }
 
 fn matrix_uses_marlin_w4a8_decode(matrix: &DeviceMatrix) -> bool {
@@ -269,6 +286,7 @@ impl Qwen3Model {
                         vocab_size: gc.vocab_size,
                         rms_norm_eps: gc.rms_norm_eps,
                         rope_theta: gc.rope_theta,
+                        rope_scaling: None,
                         tie_word_embeddings: true,
                         max_position_embeddings: gc.context_length,
                     },
@@ -649,6 +667,17 @@ impl Qwen3Model {
             })
     }
 
+    fn uses_marlin_w4_prefill_gemm(&self) -> bool {
+        matrix_uses_marlin_w4_prefill(self.output_projection())
+            || self.layers.iter().any(|layer| {
+                matrix_uses_marlin_w4_prefill(&layer.attention.q_proj)
+                    || matrix_uses_marlin_w4_prefill(&layer.attention.k_proj)
+                    || matrix_uses_marlin_w4_prefill(&layer.attention.v_proj)
+                    || matrix_uses_marlin_w4_prefill(&layer.attention.o_proj)
+                    || layer.mlp.uses_marlin_w4_prefill_gemm()
+            })
+    }
+
     pub(super) fn marlin_decode_scratch_config(&self) -> ops::MarlinDecodeScratchConfig {
         let w4 = matrix_uses_marlin_w4_decode(self.output_projection())
             || self.layers.iter().any(|layer| {
@@ -667,6 +696,13 @@ impl Qwen3Model {
                     || layer.mlp.uses_marlin_w4a8_decode()
             });
         ops::MarlinDecodeScratchConfig::new(w4, w4a8)
+    }
+
+    pub(super) fn marlin_prefill_scratch_config(&self) -> ops::MarlinPrefillScratchConfig {
+        ops::MarlinPrefillScratchConfig::new(
+            self.uses_marlin_w4_prefill_gemm(),
+            self.uses_marlin_w4a8(),
+        )
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
@@ -848,6 +884,7 @@ mod tests {
                 vocab_size: 128,
                 rms_norm_eps: 1e-6,
                 rope_theta: 1_000_000.0,
+                rope_scaling: None,
                 tie_word_embeddings: true,
                 max_position_embeddings: 4096,
             },

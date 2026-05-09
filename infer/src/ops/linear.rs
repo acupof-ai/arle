@@ -236,6 +236,15 @@ fn ensure_hybrid_w4_dispatch_ready(
     anyhow::bail!("marlin_w4_hybrid prefill dispatch requires INFER_HYBRID_W4A8_PREFILL=1")
 }
 
+pub(crate) fn graphsafe_batched_weight(weight: &DeviceMatrix) -> bool {
+    if weight.is_hybrid_w4_marlin() {
+        return hybrid_w4a8_prefill_enabled() && hybrid_w4a8_aligned(weight).is_ok();
+    }
+    weight.is_dense_bf16()
+        || marlin_prefill_aligned(weight).is_ok()
+        || marlin_w4a8_aligned(weight).is_ok()
+}
+
 /// Decode-lifetime Marlin scratch used when CUDA Graph capture is enabled.
 ///
 /// Both W4A16 and W4A8 Marlin paths previously allocated conversion/output
@@ -271,6 +280,9 @@ pub(crate) struct MarlinDecodeScratch {
     w4a8_reduce: Option<CudaSlice<i32>>,
     w4a8_workspace: Option<CudaSlice<i32>>,
 }
+
+pub(crate) type MarlinPrefillScratchConfig = MarlinDecodeScratchConfig;
+pub(crate) type MarlinPrefillScratch = MarlinDecodeScratch;
 
 impl MarlinDecodeScratch {
     pub(crate) fn new(
