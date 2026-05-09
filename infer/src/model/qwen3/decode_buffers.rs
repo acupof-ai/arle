@@ -3,8 +3,10 @@
 use anyhow::Result;
 
 use cudarc::driver::CudaSlice;
+use std::cell::RefCell;
 
 use super::config::Config;
+use crate::ops::{MarlinDecodeScratch, MarlinDecodeScratchConfig};
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, RawDevicePtr};
 use cuda_kernels::tensor::cache_ptr;
 
@@ -61,13 +63,20 @@ pub(crate) struct DecodeBuffers {
     pub(crate) partial_l: CudaSlice<f32>,
     /// Cached raw device pointers for hot-path sampling ops.
     pub(crate) ptrs: DecodeBufferPtrs,
+    /// Graph-safe scratch for single-token Marlin W4/W4A8 decode paths.
+    pub(crate) marlin_decode_scratch: Option<RefCell<MarlinDecodeScratch>>,
+    pub(crate) marlin_decode_scratch_config: MarlinDecodeScratchConfig,
 }
 
 impl DecodeBuffers {
     /// NUM_KV_SPLITS must match the CUDA decode kernel compile-time constant.
     const NUM_KV_SPLITS: usize = 4;
 
-    pub(crate) fn new(ctx: &DeviceContext, config: &Config) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &Config,
+        marlin_decode_scratch_config: MarlinDecodeScratchConfig,
+    ) -> Result<Self> {
         let h = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
@@ -121,6 +130,34 @@ impl DecodeBuffers {
                 .alloc_zeros(num_qheads * Self::NUM_KV_SPLITS)
                 .map_err(|e| anyhow::anyhow!("Alloc partial_l failed: {}", e))?,
             ptrs,
+            // State decode buffers are materialized once per scheduler slot.
+            // Keep Marlin scratch lazy here; normal paged serving uses the
+            // scheduler-level BatchDecodeBuffers scratch instead.
+            marlin_decode_scratch: None,
+            marlin_decode_scratch_config,
         })
+    }
+
+    pub(crate) fn ensure_marlin_decode_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        config: &Config,
+    ) -> Result<()> {
+        if !self.marlin_decode_scratch_config.any() || self.marlin_decode_scratch.is_some() {
+            return Ok(());
+        }
+
+        let h = config.hidden_size;
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        let max_marlin_dim = h.max(q_dim).max(kv_dim).max(config.intermediate_size);
+        self.marlin_decode_scratch = Some(RefCell::new(MarlinDecodeScratch::new(
+            ctx,
+            1,
+            max_marlin_dim,
+            max_marlin_dim,
+            self.marlin_decode_scratch_config,
+        )?));
+        Ok(())
     }
 }

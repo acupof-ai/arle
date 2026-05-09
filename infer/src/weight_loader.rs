@@ -1626,6 +1626,8 @@ mod tests {
     #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
     use crate::ops::OpsBackend;
     #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    use std::cell::RefCell;
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
     use std::path::Path;
     #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1903,6 +1905,66 @@ mod tests {
             ctx.sync()?;
         }
 
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    fn load_hybrid_w4_marlin_decode_accepts_preallocated_marlin_scratch() -> Result<()> {
+        if !Path::new(QWEN3_4B_HYBRID_PATH).exists() {
+            eprintln!("skipping hybrid scratch test: {QWEN3_4B_HYBRID_PATH} is absent");
+            return Ok(());
+        }
+
+        let ctx = DeviceContext::new()?;
+        let (shard_paths, weight_map) = load_shard_info(QWEN3_4B_HYBRID_PATH)?;
+        let mmaps = mmap_shards(&shard_paths)?;
+        let shards = mmaps
+            .iter()
+            .map(|mmap| {
+                SafeTensors::deserialize(mmap)
+                    .map_err(|e| anyhow::anyhow!("Deserialize error: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let config = QuantLoadConfig::from_model_path(QWEN3_4B_HYBRID_PATH)?;
+        let matrix = load_tensor_2d_maybe_quantized_with_config(
+            &ctx,
+            &shards,
+            &weight_map,
+            "model.layers.0.mlp.gate_proj.weight",
+            config,
+        )?;
+        assert!(matrix.is_hybrid_w4_marlin());
+
+        let seq_len = 2;
+        let host = vec![bf16::from_f32(0.125); matrix.cols * seq_len];
+        let data = ctx
+            .stream
+            .clone_htod(&host)
+            .map_err(|e| anyhow::anyhow!("H2D scratch test hidden states failed: {e}"))?;
+        let input = cuda_kernels::prelude::HiddenStates {
+            data,
+            hidden_dim: matrix.cols,
+            seq_len,
+        };
+        let mut out = cuda_kernels::prelude::HiddenStates::zeros(&ctx, matrix.rows, seq_len)?;
+        let scratch = RefCell::new(crate::ops::MarlinDecodeScratch::new(
+            &ctx,
+            seq_len,
+            matrix.cols.max(matrix.rows),
+            matrix.cols.max(matrix.rows),
+            crate::ops::MarlinDecodeScratchConfig::new(true, false),
+        )?);
+        let backend = crate::ops::CudaOpsBackend::decode_with_marlin_scratch(&ctx, &scratch);
+
+        assert_eq!(
+            crate::ops::linear_kernel_plan_for_test(&matrix, seq_len, false),
+            "MarlinW4Gemm"
+        );
+        backend.linear_batch_into(&matrix, &input, &mut out)?;
+        assert_eq!(out.hidden_dim, matrix.rows);
+        assert_eq!(out.seq_len, seq_len);
+        ctx.sync()?;
         Ok(())
     }
 

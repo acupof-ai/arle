@@ -17,6 +17,7 @@ use crate::weight_loader::{
     resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+use cuda_kernels::tensor::WeightFormat;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelRuntimeConfig {
@@ -139,6 +140,7 @@ impl Qwen3Mlp {
         matches!(self.gate_up, Qwen3GateUp::Fused { .. })
     }
 
+    #[allow(dead_code)]
     pub(super) fn uses_marlin_w4a8(&self) -> bool {
         self.down_proj.is_marlin_w4a8()
             || match &self.gate_up {
@@ -168,6 +170,35 @@ impl Qwen3Mlp {
                 Qwen3GateUp::Fused { gate_up_proj } => gate_up_proj.has_marlin(),
             }
     }
+
+    fn uses_marlin_w4_decode(&self) -> bool {
+        matrix_uses_marlin_w4_decode(&self.down_proj)
+            || match &self.gate_up {
+                Qwen3GateUp::Separate { gate_proj, up_proj } => {
+                    matrix_uses_marlin_w4_decode(gate_proj) || matrix_uses_marlin_w4_decode(up_proj)
+                }
+                Qwen3GateUp::Fused { gate_up_proj } => matrix_uses_marlin_w4_decode(gate_up_proj),
+            }
+    }
+
+    fn uses_marlin_w4a8_decode(&self) -> bool {
+        matrix_uses_marlin_w4a8_decode(&self.down_proj)
+            || match &self.gate_up {
+                Qwen3GateUp::Separate { gate_proj, up_proj } => {
+                    matrix_uses_marlin_w4a8_decode(gate_proj)
+                        || matrix_uses_marlin_w4a8_decode(up_proj)
+                }
+                Qwen3GateUp::Fused { gate_up_proj } => matrix_uses_marlin_w4a8_decode(gate_up_proj),
+            }
+    }
+}
+
+fn matrix_uses_marlin_w4_decode(matrix: &DeviceMatrix) -> bool {
+    matrix.has_marlin() && matrix.weight_format() == WeightFormat::W4A16
+}
+
+fn matrix_uses_marlin_w4a8_decode(matrix: &DeviceMatrix) -> bool {
+    matrix.weight_format() == WeightFormat::MarlinW4A8
 }
 
 fn qwen3_fused_gate_up_enabled() -> bool {
@@ -444,7 +475,7 @@ impl Qwen3Model {
             lora: None,
         };
 
-        if model.enable_cuda_graph && !model.uses_marlin_w4a8() {
+        if model.enable_cuda_graph {
             debug!("Preloading decode-path CUDA kernels before CUDA Graph capture");
             model.preload_decode_cuda_kernels()?;
             debug!("Decode path CUDA Graph is enabled");
@@ -584,6 +615,7 @@ impl Qwen3Model {
             .is_some_and(|layer| layer.mlp.uses_fused_gate_up())
     }
 
+    #[allow(dead_code)]
     pub(super) fn uses_marlin_w4a8(&self) -> bool {
         self.output_projection().is_marlin_w4a8()
             || self.layers.iter().any(|layer| {
@@ -615,6 +647,26 @@ impl Qwen3Model {
                     || layer.attention.o_proj.has_marlin()
                     || layer.mlp.uses_marlin_prefill_gemm()
             })
+    }
+
+    pub(super) fn marlin_decode_scratch_config(&self) -> ops::MarlinDecodeScratchConfig {
+        let w4 = matrix_uses_marlin_w4_decode(self.output_projection())
+            || self.layers.iter().any(|layer| {
+                matrix_uses_marlin_w4_decode(&layer.attention.q_proj)
+                    || matrix_uses_marlin_w4_decode(&layer.attention.k_proj)
+                    || matrix_uses_marlin_w4_decode(&layer.attention.v_proj)
+                    || matrix_uses_marlin_w4_decode(&layer.attention.o_proj)
+                    || layer.mlp.uses_marlin_w4_decode()
+            });
+        let w4a8 = matrix_uses_marlin_w4a8_decode(self.output_projection())
+            || self.layers.iter().any(|layer| {
+                matrix_uses_marlin_w4a8_decode(&layer.attention.q_proj)
+                    || matrix_uses_marlin_w4a8_decode(&layer.attention.k_proj)
+                    || matrix_uses_marlin_w4a8_decode(&layer.attention.v_proj)
+                    || matrix_uses_marlin_w4a8_decode(&layer.attention.o_proj)
+                    || layer.mlp.uses_marlin_w4a8_decode()
+            });
+        ops::MarlinDecodeScratchConfig::new(w4, w4a8)
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {

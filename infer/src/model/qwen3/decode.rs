@@ -28,6 +28,8 @@ impl Qwen3Model {
             )
             .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
 
+        bufs.ensure_marlin_decode_scratch(&self.ctx, &self.config)?;
+
         // Respect the shared model-level graph gate so single-token decode,
         // batched decode, and scheduler warmup stay on the same contract.
         let use_graph = <Self as crate::model::ModelForward>::supports_cuda_graph_decode(self);
@@ -44,20 +46,26 @@ impl Qwen3Model {
     fn decode_kernels(&self, kv_cache: &mut KVCache, bufs: &mut DecodeBuffers) -> Result<()> {
         let eps = self.config.rms_norm_eps;
         let num_layers = self.layers.len();
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        {
+            let ops_backend = if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+                ops::CudaOpsBackend::decode_with_marlin_scratch(&self.ctx, scratch)
+            } else {
+                ops::CudaOpsBackend::new(&self.ctx)
+            };
 
-        ops_backend.embedding_decode_into(
-            &self.embed_tokens,
-            &bufs.decode_meta,
-            &mut bufs.hidden,
-        )?;
+            ops_backend.embedding_decode_into(
+                &self.embed_tokens,
+                &bufs.decode_meta,
+                &mut bufs.hidden,
+            )?;
 
-        ops_backend.rms_norm_into(
-            &bufs.hidden,
-            &self.layers[0].input_layernorm,
-            eps,
-            &mut bufs.normed,
-        )?;
+            ops_backend.rms_norm_into(
+                &bufs.hidden,
+                &self.layers[0].input_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+        }
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.decode_layer_inner(layer_idx, layer, kv_cache, bufs)?;
@@ -66,6 +74,11 @@ impl Qwen3Model {
                 &self.layers[layer_idx + 1].input_layernorm
             } else {
                 &self.norm
+            };
+            let ops_backend = if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+                ops::CudaOpsBackend::decode_with_marlin_scratch(&self.ctx, scratch)
+            } else {
+                ops::CudaOpsBackend::new(&self.ctx)
             };
             ops_backend.fused_add_rms_norm_into(
                 &mut bufs.hidden,
@@ -76,6 +89,11 @@ impl Qwen3Model {
             )?;
         }
 
+        let ops_backend = if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+            ops::CudaOpsBackend::decode_with_marlin_scratch(&self.ctx, scratch)
+        } else {
+            ops::CudaOpsBackend::new(&self.ctx)
+        };
         ops_backend.linear_vec_into(self.output_projection(), &bufs.normed, &mut bufs.logits)?;
 
         Ok(())
@@ -89,7 +107,11 @@ impl Qwen3Model {
         bufs: &mut DecodeBuffers,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        let ops_backend = if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+            ops::CudaOpsBackend::decode_with_marlin_scratch(&self.ctx, scratch)
+        } else {
+            ops::CudaOpsBackend::new(&self.ctx)
+        };
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
@@ -210,14 +232,29 @@ impl Qwen3Model {
                 .mlp
                 .separate_gate_up()
                 .expect("non-fused Qwen3 MLP must carry separate gate/up weights");
-            ops_backend.fused_mlp_into(
-                &bufs.normed,
-                gate_proj,
-                up_proj,
-                &layer.mlp.down_proj,
-                &mut bufs.mlp_act,
-                &mut bufs.mlp_out,
-            )?;
+            if let Some(scratch) = bufs.marlin_decode_scratch.as_ref() {
+                let mut scratch = scratch.borrow_mut();
+                ops::fused_mlp_into_with_scratch(
+                    &self.ctx,
+                    &bufs.normed,
+                    gate_proj,
+                    up_proj,
+                    &layer.mlp.down_proj,
+                    &mut bufs.mlp_act,
+                    &mut bufs.mlp_up_scratch,
+                    &mut bufs.mlp_out,
+                    &mut scratch,
+                )?;
+            } else {
+                ops_backend.fused_mlp_into(
+                    &bufs.normed,
+                    gate_proj,
+                    up_proj,
+                    &layer.mlp.down_proj,
+                    &mut bufs.mlp_act,
+                    &mut bufs.mlp_out,
+                )?;
+            }
         }
         self.layer_communicator
             .post_mlp_all_reduce_device_vec(&mut bufs.mlp_out)?;

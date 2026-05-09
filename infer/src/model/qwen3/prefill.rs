@@ -297,7 +297,7 @@ impl Qwen3Model {
         up_out: &mut HiddenStates,
         act_out: &mut HiddenStates,
         out: &mut HiddenStates,
-        ops_backend: ops::CudaOpsBackend<'_>,
+        ops_backend: ops::CudaOpsBackend<'_, '_>,
     ) -> Result<()> {
         if let Some(gate_up_proj) = layer.mlp.fused_gate_up() {
             if let Some(ll) = self.layer_lora(layer_idx) {
