@@ -24,7 +24,7 @@
 #include <cuda_runtime.h>
 #include <iostream>
 
-#include "marlin_dequant.h"
+#include "marlin_dequant.cuh"
 
 constexpr int ceildiv(int a, int b) {
   return (a + b - 1) / b;
