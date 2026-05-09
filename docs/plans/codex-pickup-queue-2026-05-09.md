@@ -31,7 +31,10 @@
 | **P1.3 quantized fused_mlp** | ❌ **KILLED** TTFT **+7.3% regression** env-on vs env-off — 4-launch fallback already-optimized,launch reduction hypothesis saturated | `edacfe7` errors entry |
 | **P1.4 TileLang FP8 decode wire** | ❌ **KILLED** substrate 语义不对齐:cubin build/link/launch OK + greedy_solo_vs_concurrent PASS,但真实 Qwen3-4B FP8 KV 输出退化(garbage) | `51dd5b2` errors entry |
 | **Anti-pattern #26 candidate** — same-output-but-garbage | 📜 research entry(1 production-scale catch,await 2nd instance for codification) | `2778dc8` |
-| **战略 inflection — ops-layer roadmap exhausted** | 📋 P0.0 Phase 1.B SGLang re-verify brief drafted(`/tmp/codex-brief-p0.0-phase1b-sglang-reverify.txt`)— await user direction | (pending) |
+| **P1.6 QKV projection packing** | ❌ **KILLED** flat TTFT(env-on 1979.5ms vs env-off 1981.4ms = -0.1% license fail)+ r3 server failure(43 ok / 88 failed,packed weight 缩 KV headroom 触发 stability risk under load) | `4d5f870` errors entry |
+| **Anti-pattern #27 candidate** — memory-cost-shadow | 📜 research entry(1 production-scale catch P1.6,await 2nd instance for codification) | `8047072` |
+| **3 consecutive ops-layer KILLs strategic synthesis** | 📜 P1.3 saturated launch / P1.4 substrate semantic / P1.6 memory-cost-shadow — distinct failure modes,ops-layer SOLID-grade saturated at current scope | `8047072` |
+| **战略 inflection — ops-layer 在 current scope SOLID-grade saturated** | 📋 P0.0 Phase 1.B SGLang re-verify brief drafted(`/tmp/codex-brief-p0.0-phase1b-sglang-reverify.txt`)— **NOW critical** evidence-driven gate before any further ops attempt — await user direction | (pending) |
 | Codex pickup directives | ✅ this doc | (current) |
 
 ## 🌀 Bidirectional audit cycle status(2026-05-09 EOD,11+ commits)
