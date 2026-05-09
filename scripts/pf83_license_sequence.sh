@@ -12,6 +12,7 @@
 #   scripts/pf83_license_sequence.sh --quick   # ~2-min triage bench
 #   scripts/pf83_license_sequence.sh --skip-greedy  # if greedy already verified this build
 #   scripts/pf83_license_sequence.sh --skip-ppl     # if PPL already gated separately
+#   scripts/pf83_license_sequence.sh --dry-run      # print invocation plan, do not run anything
 #
 # Exit codes:
 #   0 — full sequence completed (manual review of bench output for final decision)
@@ -24,11 +25,13 @@ cd "$REPO_ROOT"
 
 SKIP_GREEDY=0
 SKIP_PPL=0
+DRY_RUN=0
 BENCH_FLAGS=()
 for arg in "$@"; do
     case "$arg" in
         --skip-greedy) SKIP_GREEDY=1 ;;
         --skip-ppl)    SKIP_PPL=1 ;;
+        --dry-run)     DRY_RUN=1 ;;
         *)             BENCH_FLAGS+=("$arg") ;;
     esac
 done
@@ -37,6 +40,22 @@ done
 # actually exercises the PF8 path (anti-pattern #29: W4A8-only checkpoint silently
 # keeps the new branch INACTIVE per linear.rs:86 hybrid_w4_fp8_aligned guard).
 HYBRID_MODEL="${INFER_TEST_W4A8_MODEL_PATH:-/home/ckl/projects/arle/infer/models/Qwen3-4B-W4-hybrid-zpfix}"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "DRY RUN — would execute (in order):"
+    echo "  HYBRID_MODEL=$HYBRID_MODEL"
+    echo "  Step 1 [skip=$SKIP_GREEDY]: INFER_MARLIN_W4_FP8_PREFILL=1 INFER_TEST_W4A8_MODEL_PATH=\$HYBRID_MODEL cargo test --release --test greedy_consistency w4a8 -- --nocapture"
+    echo "  Step 2 [skip=$SKIP_PPL]: python3 scripts/eval_ppl_pf83.py"
+    echo "  Step 3: scripts/bench_pf83_ab.sh ${BENCH_FLAGS[*]:-}"
+    echo ""
+    echo "Pre-flight checks:"
+    [[ -d "$HYBRID_MODEL" ]] && echo "  OK: HYBRID_MODEL dir present" || echo "  FAIL: HYBRID_MODEL dir missing at $HYBRID_MODEL"
+    [[ -x target/release/infer ]] && echo "  OK: target/release/infer present" || echo "  FAIL: target/release/infer missing or not executable"
+    command -v python3 >/dev/null 2>&1 && echo "  OK: python3 in PATH" || echo "  FAIL: python3 not in PATH"
+    [[ -f scripts/eval_ppl_pf83.py ]] && echo "  OK: scripts/eval_ppl_pf83.py present" || echo "  FAIL: scripts/eval_ppl_pf83.py missing"
+    [[ -x scripts/bench_pf83_ab.sh ]] && echo "  OK: scripts/bench_pf83_ab.sh present" || echo "  FAIL: scripts/bench_pf83_ab.sh missing or not executable"
+    exit 0
+fi
 
 if [[ $SKIP_GREEDY -eq 0 ]]; then
     echo "=== Step 1/3: greedy_consistency with INFER_MARLIN_W4_FP8_PREFILL=1 + hybrid checkpoint ==="
