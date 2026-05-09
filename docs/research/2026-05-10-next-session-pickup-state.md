@@ -36,8 +36,30 @@ status: session-end-checkpoint-for-next-pickup
 - **PF8.4 dispatch wiring LANDED** (`db063ff`, +38 LOC): opt-in
   `INFER_MARLIN_W4_FP8_PREFILL=1` env var, bail at call site pending
   PF8.3 GEMM kernel.
-- **#34 RESOLVED** (`df37a68`): `arle model download <id>` CLI surface
-  unblocks P0 #28 spec decode hypothesis path.
+- **PF8.3 Strategy A' substrate COMPILE+CHECK+CLIPPY+greedy_consistency
+  PASS on hybrid checkpoint** (codex untracked-modified
+  gemm.rs+tensor.rs+linear.rs + untracked marlin_pf8/ + marlin_w4_fp8_kernel.cu
+  + experience entry; commit pending codex review pass). Validation
+  trace: `077b600` (compile smoke PASS), `a0758e7` (Strategy A'
+  validation), greedy_consistency on
+  `infer/models/Qwen3-4B-W4-hybrid-zpfix` 4.33s PASS.
+- **PF8.5 prep tooling COMPLETE** (Claude this session):
+  - `3fa5e74` eval_ppl_pf83.py — PPL Δ% gate adapter
+  - `84d61eb` bench_pf83_ab.sh — e2e A/B wrapper
+  - `c382fba` pf83_license_sequence.sh — orchestrator (+ `bf47413`
+    fix: hybrid-default INFER_TEST_W4A8_MODEL_PATH for Step 1)
+  - `e99e5a5` defaults to hybrid checkpoint
+  - License gates per `aebd4a5`: TTFT Δ ≥ -8% σ<5% n=3 + greedy
+    PASS + PPL Δ% ≤ +1.0% wikitext
+- **#34 RESOLVED** (`df37a68`): `arle data download` + `arle model
+  download` CLI surfaces. Data download VERIFIED working on current
+  binary (`8735361` Medusa Phase 1.A pickup chain survey). Model
+  download source landed but binary stale (2026-05-08 vs 2026-05-10
+  source) — rebuild needed for Phase 2-3 model fetches.
+- **Machete framing canonical disambiguation** (`aa9f72e`): 5+ user
+  reissuances of literal "Machete W4 移植" formally mapped to Path
+  B-Phase2' (PF8 chain Strategy A'). Future ticks won't re-litigate
+  the Hopper-only blocker.
 - **Skill v1.11.0 LANDED** (`b551bea`): canonicalized 4 anti-patterns
   (#29-32) from session retrospective. Now load-bearing for future
   sessions.
@@ -120,23 +142,50 @@ unblocked via `df37a68` #34 CLI surface.
    means literal Machete sm_89 backport: 1800-3300 LOC + multi-week
    + KILL near-certain.
 
-## §5 Anti-pattern reminders (skill v1.11.0)
+## §5 Anti-pattern reminders (skill v1.11.0+)
 
 Load-bearing for next session:
 
 - **#28**: tool-output-vs-peer-claim → re-run + raw quote in same response
-- **#29**: default test fixtures may be known-broken (verify before relying)
-- **#30**: git status BEFORE commit (not just before add) in cooperative session
+- **#29**: default test fixtures may be known-broken (load-bearing
+  THIS session: codex caught greedy_consistency PASS on W4A8
+  checkpoint silently kept PF8 path INACTIVE before re-running on
+  hybrid; saved false-license risk per `da45380`+`473081d`)
+- **#30**: git status BEFORE commit (not just before add) in cooperative
+  session — preserved THIS session by explicit-path `git add` for
+  every Claude commit, leaving codex's untracked-modified files
+  untouched
 - **#31**: ANY ARLE surface claim needs raw evidence in same response
   (extends #28 beyond contesting peer; covers CLI flags, kernel
-  internals, HTTP routes, baseline checkpoint match, model variants)
+  internals, HTTP routes, baseline checkpoint match, model variants,
+  bit-pack arithmetic, mma instruction shapes, model file locations,
+  binary build dates)
 - **#32**: peer "Waiting >5min" warrants direct ps/log/curl verify
-  (4b30c15 33min wedge evidence)
+  (4b30c15 33min wedge evidence). Codex's narrated-progress
+  Working state is NOT a wedge even at 33+ min if narration
+  shows command transitions.
 
-5 hallucinations sedimented this session — pattern: confident claim
-about ARLE/bench surface based on internal recall instead of raw
-verification. Even "deterministic computation" (bit-pack arithmetic)
-can be hallucinated.
+**7 hallucinations** sedimented this session (escalated from 5 in
+earlier checkpoint):
+
+| # | Tick | Hallucination | Reality | Caught by |
+|---|------|---------------|---------|-----------|
+| 1 | `0f4d0ae` | --max-waiting-requests CLI flag exists | Never | codex |
+| 2 | `43bda9c` | W4A16 reduce buffer max_par×64×n | W4A8 has it | codex |
+| 3 | `4b30c15` | ARLE has /health endpoint | /healthz+/readyz | self via grep |
+| 4 | `5bf0e20` | baseline-B5 vs newdequant comparable | different variants | self via cat |
+| 5 | `451d094` | bit-pack 0x76543210→0xFEDCBA98 | →0x89ABCDEF (LSB→MSB) | empirical smoke |
+| 6 | `818b4e0` | FP8 mma uniformly m16n8k32 | BOTH k=16 + k=32 | raw grep on vllm marlin_mma.h |
+| 7 | `473081d` | hybrid checkpoint missing locally | EXISTS at infer/models/ | codex run + raw ls |
+
+Common-mode pattern: confident claim about ARLE/upstream surface
+based on internal recall instead of raw verification. Even
+"deterministic computation" (#5 bit-pack) and "cited evidence" (#7
+CARGO_MANIFEST_DIR convention not followed) can be hallucinated.
+
+**Mitigation**: Step-by-step derivation OR empirical smoke OR raw
+cross-check are the only reliable defense. Cite evidence only after
+following it through to verification.
 
 ## §6 Session productivity summary
 
