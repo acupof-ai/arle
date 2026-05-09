@@ -33,9 +33,17 @@ for arg in "$@"; do
     esac
 done
 
+# Hybrid checkpoint default per 473081d + e99e5a5 — required so greedy_consistency
+# actually exercises the PF8 path (anti-pattern #29: W4A8-only checkpoint silently
+# keeps the new branch INACTIVE per linear.rs:86 hybrid_w4_fp8_aligned guard).
+HYBRID_MODEL="${INFER_TEST_W4A8_MODEL_PATH:-/home/ckl/projects/arle/infer/models/Qwen3-4B-W4-hybrid-zpfix}"
+
 if [[ $SKIP_GREEDY -eq 0 ]]; then
-    echo "=== Step 1/3: greedy_consistency with INFER_MARLIN_W4_FP8_PREFILL=1 ==="
-    if ! INFER_MARLIN_W4_FP8_PREFILL=1 cargo test --release --test greedy_consistency w4a8 -- --nocapture; then
+    echo "=== Step 1/3: greedy_consistency with INFER_MARLIN_W4_FP8_PREFILL=1 + hybrid checkpoint ==="
+    echo "  INFER_TEST_W4A8_MODEL_PATH=$HYBRID_MODEL"
+    if ! INFER_MARLIN_W4_FP8_PREFILL=1 \
+         INFER_TEST_W4A8_MODEL_PATH="$HYBRID_MODEL" \
+         cargo test --release --test greedy_consistency w4a8 -- --nocapture; then
         echo "FAIL: greedy_consistency — KILL PF8.3" >&2
         exit 1
     fi
