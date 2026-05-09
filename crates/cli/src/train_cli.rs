@@ -14,6 +14,8 @@ use train::{
     tokenizer::{ChatTokenizer, write_chatml_wordlevel_tokenizer},
 };
 
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs};
 use crate::{
     args::{
         BackendArg, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs, DatasetFormatArg,
@@ -56,6 +58,38 @@ pub(crate) fn run_data(data: DataArgs) -> ExitCode {
     match data.command {
         DataCommand::Download(args) => run_data_download(args),
         DataCommand::Convert(args) => run_data_convert(args),
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+pub(crate) fn run_model(model: ModelArgs) -> ExitCode {
+    match model.command {
+        ModelCommand::Download(args) => run_model_download(args),
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn run_model_download(args: ModelDownloadArgs) -> ExitCode {
+    let invocation = ResolvedInvocation {
+        command: "model download",
+        argv: vec![args.model_id.clone()],
+        backend: None,
+        output_dir: None,
+        model: None,
+        notes: Vec::new(),
+    };
+    if let Some(exit) = dry_run_exit(&invocation, &args.render) {
+        return exit;
+    }
+    match crate::download::download_model_with_progress(&args.model_id) {
+        Ok(path) => {
+            eprintln!("[ARLE model download] downloaded to: {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("[ARLE model download] error: {err:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 

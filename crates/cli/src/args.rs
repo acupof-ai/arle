@@ -277,6 +277,34 @@ pub(crate) enum CliCommand {
     Train(Box<TrainArgs>),
     /// Dataset utilities.
     Data(Box<DataArgs>),
+    /// Model utilities (download from Hugging Face).
+    Model(Box<ModelArgs>),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+#[command(
+    arg_required_else_help = true,
+    after_help = "Examples:\n  arle model download Qwen/Qwen3-0.6B\n  arle model download mlx-community/Qwen3.6-35B-A3B-4bit"
+)]
+pub(crate) struct ModelArgs {
+    #[command(subcommand)]
+    pub(crate) command: ModelCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum ModelCommand {
+    /// Download a model from Hugging Face Hub (config + tokenizer + sharded weights).
+    Download(ModelDownloadArgs),
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(after_help = "Example:\n  arle model download Qwen/Qwen3-0.6B")]
+pub(crate) struct ModelDownloadArgs {
+    /// Hugging Face model ID (e.g. "Qwen/Qwen3-0.6B" or "mlx-community/Qwen3.6-35B-A3B-4bit").
+    pub(crate) model_id: String,
+
+    #[command(flatten)]
+    pub(crate) render: RenderArgs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ClapArgs)]
