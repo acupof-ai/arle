@@ -734,6 +734,7 @@ fn qwen35_config(
         linear_value_head_dim: args.d_head,
         linear_conv_kernel_dim: 4,
         rope_theta: 1_000_000.0,
+        rope_scaling: None,
         partial_rotary_factor: 1.0,
         rotary_dim: args.d_head,
         rope_cache_len_hint: Some(seq_len.max(32)),

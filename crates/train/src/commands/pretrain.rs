@@ -388,6 +388,7 @@ impl PretrainFamily for Qwen35Family {
             linear_value_head_dim: args.head_dim,
             linear_conv_kernel_dim: 4,
             rope_theta: args.rope_theta,
+            rope_scaling: None,
             partial_rotary_factor: 1.0,
             rotary_dim: args.head_dim,
             rope_cache_len_hint: Some(args.max_position_embeddings),
