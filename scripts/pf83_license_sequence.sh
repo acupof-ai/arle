@@ -41,6 +41,19 @@ done
 # keeps the new branch INACTIVE per linear.rs:86 hybrid_w4_fp8_aligned guard).
 HYBRID_MODEL="${INFER_TEST_W4A8_MODEL_PATH:-/home/ckl/projects/arle/infer/models/Qwen3-4B-W4-hybrid-zpfix}"
 
+# Stale-binary check: warn if target/release/infer is older than PF8.3 source
+# (prevents running PF8.5 against a binary that doesn't have the new dispatch).
+PF83_KERNEL=crates/cuda-kernels/csrc/gemm/marlin_w4_fp8_kernel.cu
+if [[ -f $PF83_KERNEL && -x target/release/infer ]]; then
+    if [[ $PF83_KERNEL -nt target/release/infer ]]; then
+        echo "WARN: target/release/infer is OLDER than $PF83_KERNEL" >&2
+        echo "  → PF8.3 dispatch may not be present in this binary" >&2
+        echo "  → rebuild: CUDA_HOME=/opt/cuda cargo build --release -p infer --features cuda" >&2
+        echo "  (continuing in 5s; Ctrl-C to abort)" >&2
+        [[ $DRY_RUN -eq 1 ]] || sleep 5
+    fi
+fi
+
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "DRY RUN — would execute (in order):"
     echo "  HYBRID_MODEL=$HYBRID_MODEL"
