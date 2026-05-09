@@ -272,12 +272,30 @@ pub trait OpsBackend {
 #[derive(Clone, Copy)]
 pub struct CudaOpsBackend<'ctx> {
     ctx: &'ctx cuda_kernels::prelude::DeviceContext,
+    linear_phase: LinearDispatchPhase,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinearDispatchPhase {
+    Decode,
+    Prefill,
 }
 
 #[cfg(feature = "cuda")]
 impl<'ctx> CudaOpsBackend<'ctx> {
     pub fn new(ctx: &'ctx cuda_kernels::prelude::DeviceContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            linear_phase: LinearDispatchPhase::Decode,
+        }
+    }
+
+    pub fn prefill(ctx: &'ctx cuda_kernels::prelude::DeviceContext) -> Self {
+        Self {
+            ctx,
+            linear_phase: LinearDispatchPhase::Prefill,
+        }
     }
 
     pub fn context(&self) -> &'ctx cuda_kernels::prelude::DeviceContext {
@@ -358,7 +376,7 @@ impl OpsBackend for CudaOpsBackend<'_> {
         input: &Self::TensorBatch,
         output: &mut Self::TensorBatch,
     ) -> Result<()> {
-        linear::try_gemm_into(self.ctx, weight, input, output)
+        linear::try_gemm_with_phase_into(self.ctx, weight, input, output, self.linear_phase)
     }
 
     fn fused_mlp_into(
@@ -536,6 +554,8 @@ pub(crate) use attention::{
 pub(crate) use elementwise::{
     add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into, silu_mul_split_batch_into,
 };
+#[cfg(all(test, feature = "cuda", not(feature = "no-cuda")))]
+pub(crate) use linear::linear_kernel_plan_for_test;
 #[cfg(feature = "cuda")]
 pub(crate) use linear::{gemm_graphsafe_batched_into, gemm_into, linear};
 #[cfg(feature = "cuda")]

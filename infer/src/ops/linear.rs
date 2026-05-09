@@ -19,6 +19,8 @@ use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::WeightFormat;
 
+use crate::ops::LinearDispatchPhase;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinearKernelPlan {
     Bf16Gemv,
@@ -44,12 +46,16 @@ enum LinearKernelPlan {
     Q6KDequantCublasGemm,
     MarlinW4Gemm,
     MarlinW4A8Gemm,
+    MarlinW4Hybrid,
     TurboQuantGemv,
     TurboQuantDequantCublasGemm,
 }
 
 impl LinearKernelPlan {
     fn decode(weight: &DeviceMatrix) -> Self {
+        if weight.is_hybrid_w4_marlin() {
+            return Self::MarlinW4Gemm;
+        }
         match weight.weight_format() {
             WeightFormat::DenseBf16 => Self::Bf16Gemv,
             WeightFormat::W2A16 => Self::W2A16Gemv,
@@ -64,7 +70,20 @@ impl LinearKernelPlan {
         }
     }
 
-    fn batched(weight: &DeviceMatrix, batch: usize) -> Self {
+    fn batched(weight: &DeviceMatrix, batch: usize, phase: LinearDispatchPhase) -> Self {
+        if weight.is_hybrid_w4_marlin() {
+            if phase == LinearDispatchPhase::Prefill && batch > 1 && hybrid_w4a8_prefill_enabled() {
+                if hybrid_w4a8_aligned(weight).is_ok() {
+                    return Self::MarlinW4Hybrid;
+                }
+                if let Err(reason) = hybrid_w4a8_aligned(weight) {
+                    log::trace!("Hybrid W4A8 prefill fallback: {reason}");
+                }
+            }
+            if marlin_prefill_aligned(weight).is_ok() {
+                return Self::MarlinW4Gemm;
+            }
+        }
         if marlin_w4a8_aligned(weight).is_ok() {
             return Self::MarlinW4A8Gemm;
         }
@@ -153,6 +172,31 @@ fn marlin_w4a8_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'stati
     Ok(())
 }
 
+fn hybrid_w4a8_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'static str> {
+    if !weight.is_hybrid_w4_marlin() {
+        return Err("source format is not hybrid W4");
+    }
+    if weight.hybrid_w4a8_qweight.is_none() {
+        return Err("missing hybrid W4A8 Marlin-packed side buffer");
+    }
+    if weight.hybrid_w4a8_s_channel.is_none() {
+        return Err("missing hybrid W4A8 per-channel scales");
+    }
+    if weight.hybrid_w4a8_s_group.is_none() {
+        return Err("missing hybrid W4A8 per-group scales");
+    }
+    if !weight.cols.is_multiple_of(128) {
+        return Err("K is not multiple of 128");
+    }
+    if !weight.rows.is_multiple_of(256) {
+        return Err("N is not multiple of 256");
+    }
+    if weight.group_size != 128 {
+        return Err("group_size is not 128");
+    }
+    Ok(())
+}
+
 fn turboquant_params(weight: &DeviceMatrix) -> (i32, i32, i32, i32, i32, i32) {
     let n = weight.rows as i32;
     let k = weight.cols as i32;
@@ -168,12 +212,67 @@ fn turboquant_params(weight: &DeviceMatrix) -> (i32, i32, i32, i32, i32, i32) {
     (n, k, group_size, packed_cols, num_groups, bits)
 }
 
-fn ensure_hybrid_w4_dispatch_ready(weight: &DeviceMatrix) -> Result<()> {
-    anyhow::ensure!(
-        !weight.is_hybrid_w4_marlin(),
-        "marlin_w4_hybrid tensors loaded, but runtime dispatch is not enabled in Phase 1b"
-    );
-    Ok(())
+fn hybrid_w4a8_prefill_enabled() -> bool {
+    matches!(
+        std::env::var("INFER_HYBRID_W4A8_PREFILL").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+fn ensure_hybrid_w4_dispatch_ready(
+    weight: &DeviceMatrix,
+    phase: LinearDispatchPhase,
+    batch: usize,
+) -> Result<()> {
+    if !weight.is_hybrid_w4_marlin() || phase == LinearDispatchPhase::Decode || batch == 1 {
+        return Ok(());
+    }
+    if hybrid_w4a8_prefill_enabled() {
+        return hybrid_w4a8_aligned(weight)
+            .map_err(|reason| anyhow::anyhow!("invalid hybrid W4A8 prefill matrix: {reason}"));
+    }
+    anyhow::bail!("marlin_w4_hybrid prefill dispatch requires INFER_HYBRID_W4A8_PREFILL=1")
+}
+
+#[cfg(all(test, not(feature = "no-cuda")))]
+pub(crate) fn linear_kernel_plan_for_test(
+    weight: &DeviceMatrix,
+    batch: usize,
+    prefill: bool,
+) -> &'static str {
+    let phase = if prefill {
+        LinearDispatchPhase::Prefill
+    } else {
+        LinearDispatchPhase::Decode
+    };
+    match LinearKernelPlan::batched(weight, batch, phase) {
+        LinearKernelPlan::Bf16Gemv => "Bf16Gemv",
+        LinearKernelPlan::Bf16GraphsafeGemm => "Bf16GraphsafeGemm",
+        LinearKernelPlan::Bf16CublasGemm => "Bf16CublasGemm",
+        LinearKernelPlan::W2A16Gemv => "W2A16Gemv",
+        LinearKernelPlan::W4A16Gemv => "W4A16Gemv",
+        LinearKernelPlan::W8A16Gemv => "W8A16Gemv",
+        LinearKernelPlan::W2A16BatchGemv => "W2A16BatchGemv",
+        LinearKernelPlan::W4A16BatchGemv => "W4A16BatchGemv",
+        LinearKernelPlan::W8A16BatchGemv => "W8A16BatchGemv",
+        LinearKernelPlan::Q3KGemv => "Q3KGemv",
+        LinearKernelPlan::Q4KGemv => "Q4KGemv",
+        LinearKernelPlan::Q5KGemv => "Q5KGemv",
+        LinearKernelPlan::Q6KGemv => "Q6KGemv",
+        LinearKernelPlan::Q3KBatchGemv => "Q3KBatchGemv",
+        LinearKernelPlan::Q4KBatchGemv => "Q4KBatchGemv",
+        LinearKernelPlan::Q5KBatchGemv => "Q5KBatchGemv",
+        LinearKernelPlan::Q6KBatchGemv => "Q6KBatchGemv",
+        LinearKernelPlan::Q3KDequantCublasGemm => "Q3KDequantCublasGemm",
+        LinearKernelPlan::Q4KDequantCublasGemm => "Q4KDequantCublasGemm",
+        LinearKernelPlan::Q5KDequantCublasGemm => "Q5KDequantCublasGemm",
+        LinearKernelPlan::Q6KDequantCublasGemm => "Q6KDequantCublasGemm",
+        LinearKernelPlan::MarlinW4Gemm => "MarlinW4Gemm",
+        LinearKernelPlan::MarlinW4A8Gemm => "MarlinW4A8Gemm",
+        LinearKernelPlan::MarlinW4Hybrid => "MarlinW4Hybrid",
+        LinearKernelPlan::TurboQuantGemv => "TurboQuantGemv",
+        LinearKernelPlan::TurboQuantDequantCublasGemm => "TurboQuantDequantCublasGemm",
+    }
 }
 
 /// Additive LoRA GEMV: `y += B @ (A @ x)`.
@@ -307,7 +406,7 @@ pub fn gemv(
     input: &DeviceVec,
     output: &mut DeviceVec,
 ) -> Result<()> {
-    ensure_hybrid_w4_dispatch_ready(weight)?;
+    ensure_hybrid_w4_dispatch_ready(weight, LinearDispatchPhase::Decode, 1)?;
     assert_eq!(
         weight.cols, input.len,
         "A cols {} != x len {}",
@@ -346,6 +445,11 @@ pub fn gemv(
 
     if plan == LinearKernelPlan::MarlinW4A8Gemm {
         run_marlin_w4a8_linear(ctx, weight, &input.data, 1, &mut output.data)?;
+        return Ok(());
+    }
+
+    if plan == LinearKernelPlan::MarlinW4Gemm {
+        run_marlin_w4_linear(ctx, weight, &input.data, 1, &mut output.data)?;
         return Ok(());
     }
 
@@ -721,9 +825,19 @@ fn run_marlin_w4_gemm(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    run_marlin_w4_linear(ctx, weight, &x.data, x.seq_len, &mut out.data)
+}
+
+fn run_marlin_w4_linear(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &CudaSlice<bf16>,
+    rows: usize,
+    output: &mut CudaSlice<bf16>,
+) -> Result<()> {
     let mp = weight.marlin_packed.as_ref().unwrap();
     let ms = weight.marlin_scales.as_ref().unwrap();
-    let m = x.seq_len;
+    let m = rows;
     let n = weight.rows;
     let k = weight.cols;
 
@@ -732,7 +846,7 @@ fn run_marlin_w4_gemm(
         .alloc_zeros(m * k)
         .map_err(|e| anyhow::anyhow!("alloc marlin x_fp16: {e}"))?;
     {
-        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
         let (xf_ptr, _gf) = x_fp16.device_ptr_mut(&ctx.stream);
         unsafe {
             ffi::bf16_to_fp16_cuda(
@@ -788,7 +902,7 @@ fn run_marlin_w4_gemm(
 
     {
         let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);
-        let (y_ptr, _g2) = out.data.device_ptr_mut(&ctx.stream);
+        let (y_ptr, _g2) = output.device_ptr_mut(&ctx.stream);
         unsafe {
             ffi::fp16_to_bf16_cuda(
                 yf_ptr as *const ffi::Half,
@@ -810,11 +924,23 @@ fn run_marlin_w4a8_linear(
     rows: usize,
     output: &mut CudaSlice<bf16>,
 ) -> Result<()> {
-    marlin_w4a8_aligned(weight)
-        .map_err(|reason| anyhow::anyhow!("invalid W4A8 Marlin matrix: {reason}"))?;
-    let mp = weight.marlin_packed.as_ref().unwrap();
-    let s_channel = weight.marlin_channel_scales.as_ref().unwrap();
-    let s_group = weight.marlin_scales.as_ref().unwrap();
+    let (mp, s_channel, s_group) = if weight.is_hybrid_w4_marlin() {
+        hybrid_w4a8_aligned(weight)
+            .map_err(|reason| anyhow::anyhow!("invalid hybrid W4A8 Marlin matrix: {reason}"))?;
+        (
+            weight.hybrid_w4a8_qweight.as_ref().unwrap(),
+            weight.hybrid_w4a8_s_channel.as_ref().unwrap(),
+            weight.hybrid_w4a8_s_group.as_ref().unwrap(),
+        )
+    } else {
+        marlin_w4a8_aligned(weight)
+            .map_err(|reason| anyhow::anyhow!("invalid W4A8 Marlin matrix: {reason}"))?;
+        (
+            weight.marlin_packed.as_ref().unwrap(),
+            weight.marlin_channel_scales.as_ref().unwrap(),
+            weight.marlin_scales.as_ref().unwrap(),
+        )
+    };
     let m = rows;
     let n = weight.rows;
     let k = weight.cols;
@@ -1189,7 +1315,21 @@ pub(crate) fn try_gemm_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    ensure_hybrid_w4_dispatch_ready(weight)?;
+    anyhow::ensure!(
+        !weight.is_hybrid_w4_marlin(),
+        "marlin_w4_hybrid batched GEMM requires explicit decode/prefill phase dispatch"
+    );
+    try_gemm_with_phase_into(ctx, weight, x, out, LinearDispatchPhase::Decode)
+}
+
+pub(crate) fn try_gemm_with_phase_into(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    phase: LinearDispatchPhase,
+) -> Result<()> {
+    ensure_hybrid_w4_dispatch_ready(weight, phase, x.seq_len)?;
     assert_eq!(
         weight.cols, x.hidden_dim,
         "weight cols {} != hidden_dim {}",
@@ -1206,10 +1346,10 @@ pub(crate) fn try_gemm_into(
         out.seq_len, x.seq_len
     );
 
-    let plan = LinearKernelPlan::batched(weight, x.seq_len);
+    let plan = LinearKernelPlan::batched(weight, x.seq_len, phase);
     match plan {
         LinearKernelPlan::MarlinW4Gemm => run_marlin_w4_gemm(ctx, weight, x, out)?,
-        LinearKernelPlan::MarlinW4A8Gemm => {
+        LinearKernelPlan::MarlinW4A8Gemm | LinearKernelPlan::MarlinW4Hybrid => {
             run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
         }
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {

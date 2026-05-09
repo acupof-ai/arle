@@ -422,7 +422,7 @@ impl Qwen3Model {
             requests.len(),
             sequences.len()
         );
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        let ops_backend = ops::CudaOpsBackend::prefill(&self.ctx);
         for (request, seq) in requests.iter().zip(sequences) {
             let last_token = seq.token_offset + seq.seq_len - 1;
             ops_backend.extract_vec_into(hidden, last_token, &mut bufs.last_hidden)?;
@@ -639,7 +639,7 @@ impl Qwen3Model {
             &format!("L{layer_idx} pre-norm hidden"),
             self.config.hidden_size,
         );
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        let ops_backend = ops::CudaOpsBackend::prefill(&self.ctx);
         // 1. RMSNorm
         ops_backend.rms_norm_batch_into(
             hidden,
@@ -937,7 +937,7 @@ impl Qwen3Model {
         let head_dim = self.config.head_dim;
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
-        let ops_backend = ops::CudaOpsBackend::new(&self.ctx);
+        let ops_backend = ops::CudaOpsBackend::prefill(&self.ctx);
 
         crate::model::common::debug_dump_hidden(
             &self.ctx,
