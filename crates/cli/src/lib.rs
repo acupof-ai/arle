@@ -41,6 +41,13 @@ pub fn run() -> ExitCode {
     match command {
         Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
         Some(CliCommand::Data(command)) => return train_cli::run_data(*command),
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+        Some(CliCommand::Model(command)) => return train_cli::run_model(*command),
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        Some(CliCommand::Model(_)) => {
+            eprintln!("[ARLE] error: model download requires cuda/metal/cpu feature build");
+            return ExitCode::FAILURE;
+        }
         Some(CliCommand::Serve(command)) => return serve::run_serve(&args, *command),
         Some(CliCommand::Run(run_args)) => match run_impl(args, Some(*run_args)) {
             Ok(()) => return ExitCode::SUCCESS,
