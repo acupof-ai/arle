@@ -19,8 +19,13 @@ Usage:
 
   # explicit
   python3 scripts/eval_ppl_pf83.py \\
-      --model models/Qwen3-4B-W4A8-marlin \\
+      --model infer/models/Qwen3-4B-W4-hybrid-zpfix \\
       --datasets wikitext,humaneval --max-samples 15 --max-tokens 200
+
+NOTE: default model is the HYBRID checkpoint (quant_type=marlin_w4_hybrid)
+because PF8 dispatch only activates on hybrid weights per linear.rs:86
+hybrid_w4_fp8_aligned() guard. W4A8-only checkpoints will silently
+skip the new branch (anti-pattern #29 risk per b551bea + 473081d).
 """
 
 import argparse
@@ -34,7 +39,7 @@ import time
 
 URL = "http://localhost:8090"
 BIN = "target/release/infer"
-DEFAULT_MODEL = "models/Qwen3-4B-W4A8-marlin"
+DEFAULT_MODEL = "infer/models/Qwen3-4B-W4-hybrid-zpfix"
 
 
 def load_dataset_texts(name, max_samples=15):

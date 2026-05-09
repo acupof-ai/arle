@@ -19,13 +19,18 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-MODEL="${MODEL:-models/Qwen3-4B-W4A8-marlin}"
+# NOTE: default = HYBRID checkpoint (quant_type=marlin_w4_hybrid). PF8 dispatch
+# only activates on hybrid weights per linear.rs:86 hybrid_w4_fp8_aligned() guard.
+# Using a W4A8-only checkpoint silently keeps the new PF8 branch INACTIVE
+# (anti-pattern #29 per b551bea + 473081d).
+MODEL="${MODEL:-infer/models/Qwen3-4B-W4-hybrid-zpfix}"
 BIN="${BIN:-target/release/infer}"
 PORT="${PORT:-8000}"
 
 if [[ ! -d "$MODEL" ]]; then
     echo "error: model dir not found at $MODEL" >&2
-    echo "  set MODEL=<path> or run: arle model download <hf-id-of-w4a8-marlin>" >&2
+    echo "  set MODEL=<path> to a hybrid W4 marlin checkpoint" >&2
+    echo "  (config.json must have \"quant_type\": \"marlin_w4_hybrid\")" >&2
     exit 2
 fi
 if [[ ! -x "$BIN" ]]; then
