@@ -23,6 +23,14 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Per bench_guidellm.sh:53-56 docstring (M_e gauntlet 2026-05-07): prepend
+# .venv/bin to PATH so guidellm + datasets + httpx are resolved consistently.
+# Without this, bench wrappers fail with "guidellm not on PATH" even though
+# pip install -e .[bench] put it in .venv/bin.
+if [[ -d "$REPO_ROOT/.venv/bin" ]]; then
+    export PATH="$REPO_ROOT/.venv/bin:$PATH"
+fi
+
 SKIP_GREEDY=0
 SKIP_PPL=0
 DRY_RUN=0
