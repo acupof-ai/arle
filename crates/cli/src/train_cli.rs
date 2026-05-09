@@ -1632,6 +1632,7 @@ impl ScratchShape {
             vocab_size,
             rms_norm_eps: 1.0e-6,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             tie_word_embeddings: true,
             max_position_embeddings: self.max_pos,
         }

@@ -72,6 +72,7 @@ pub fn synthetic_qwen3_config(seq: usize) -> Qwen3Config {
         max_position_embeddings: seq,
         rms_norm_eps: 1.0e-6,
         rope_theta: 1_000_000.0,
+        rope_scaling: None,
         tie_word_embeddings: false,
     }
 }

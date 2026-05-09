@@ -305,6 +305,7 @@ mod tests {
             head_dim: 8,
             max_position_embeddings: 8,
             rope_theta: 10_000.0,
+            rope_scaling: None,
         }
     }
 

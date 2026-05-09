@@ -212,6 +212,7 @@ mod tests {
             vocab_size: 1024,
             rms_norm_eps: 1.0e-6,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             tie_word_embeddings: true,
             max_position_embeddings: 2048,
         };
@@ -350,6 +351,7 @@ mod tests {
             vocab_size: 1024,
             rms_norm_eps: 1.0e-6,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             tie_word_embeddings: true,
             max_position_embeddings: 2048,
         };
@@ -397,6 +399,7 @@ mod tests {
             vocab_size: 512,
             rms_norm_eps: 1.0e-6,
             rope_theta: 1_000_000.0,
+            rope_scaling: None,
             tie_word_embeddings: true,
             max_position_embeddings: 1024,
         };
