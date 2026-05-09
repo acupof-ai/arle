@@ -26,6 +26,12 @@
 | **Skill v1.8.0 anti-pattern bank**(deferred batch) | 🟡 **5 candidates ready,batch trigger pending** | #20 hypothesis-inheritance(`c076aae`)+ #21 recipe-itself audit(`b55bfcd` + `153fd93`)+ #22 twin-commit attribution(`919c0fb` + `8d91d20` + `3fea979`)+ #23 truncated-output partial-view(`156d2c2`)+ #24 cell-collapse blindness(`1ccb448`) |
 | **Wins-entry re-attribution gap**(c20b1ce NO-OP)| 🟡 3 entries need invalidation/re-attribution | `8d91d20` empirical triage |
 | **M_quant Round 4 #6 W4A16BatchGemv override** | ❌ **KILLED** via refined bench(+37% ITL regression even at decode batch=4)| `3b9cc06` — Marlin tensor-core wins over launch-overhead savings;hypothesis empirically eliminated;skill v1.8.0 #25 grounded |
+| **P1.0 hybrid W4A8 prefill dispatch** | ✅ **LANDED** TTFT **-31.5%** env-gated `INFER_HYBRID_W4A8_PREFILL=1` | `9773904` |
+| **P1.2 W4A8 Marlin scratch hoist for CUDA graph capture** | ✅ **LANDED** TTFT p50 1638.8ms / **ITL p50 -13.0% vs P1.0 hybrid**(P1.0 ITL tradeoff RESOLVED)/ out tok/s +17.5% | `ca0673b` |
+| **P1.3 quantized fused_mlp** | ❌ **KILLED** TTFT **+7.3% regression** env-on vs env-off — 4-launch fallback already-optimized,launch reduction hypothesis saturated | `edacfe7` errors entry |
+| **P1.4 TileLang FP8 decode wire** | ❌ **KILLED** substrate 语义不对齐:cubin build/link/launch OK + greedy_solo_vs_concurrent PASS,但真实 Qwen3-4B FP8 KV 输出退化(garbage) | `51dd5b2` errors entry |
+| **Anti-pattern #26 candidate** — same-output-but-garbage | 📜 research entry(1 production-scale catch,await 2nd instance for codification) | `2778dc8` |
+| **战略 inflection — ops-layer roadmap exhausted** | 📋 P0.0 Phase 1.B SGLang re-verify brief drafted(`/tmp/codex-brief-p0.0-phase1b-sglang-reverify.txt`)— await user direction | (pending) |
 | Codex pickup directives | ✅ this doc | (current) |
 
 ## 🌀 Bidirectional audit cycle status(2026-05-09 EOD,11+ commits)
