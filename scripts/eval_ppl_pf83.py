@@ -174,8 +174,8 @@ def main():
 
     dataset_names = [d.strip() for d in args.datasets.split(",")]
     treatments = [
-        ("baseline_W4_INT8", {"INFER_MARLIN_W4_FP8_PREFILL": "0"}),
-        ("treatment_W4_FP8", {"INFER_MARLIN_W4_FP8_PREFILL": "1"}),
+        ("baseline_W4_INT8", {"INFER_MARLIN_W4_FP8_PREFILL": "0", "INFER_HYBRID_W4A8_PREFILL": "1"}),
+        ("treatment_W4_FP8", {"INFER_MARLIN_W4_FP8_PREFILL": "1", "INFER_HYBRID_W4A8_PREFILL": "1"}),
     ]
 
     print("Loading datasets...")

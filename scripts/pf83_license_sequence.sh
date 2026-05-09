@@ -82,6 +82,7 @@ if [[ $SKIP_GREEDY -eq 0 ]]; then
     echo "=== Step 1/3: greedy_consistency with INFER_MARLIN_W4_FP8_PREFILL=1 + hybrid checkpoint ==="
     echo "  INFER_TEST_W4A8_MODEL_PATH=$HYBRID_MODEL"
     if ! INFER_MARLIN_W4_FP8_PREFILL=1 \
+         INFER_HYBRID_W4A8_PREFILL=1 \
          INFER_TEST_W4A8_MODEL_PATH="$HYBRID_MODEL" \
          cargo test --release --test greedy_consistency w4a8 -- --nocapture; then
         echo "FAIL: greedy_consistency — KILL PF8.3" >&2
