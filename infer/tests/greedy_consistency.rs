@@ -13,6 +13,7 @@
 //! See `docs/research/2026-05-09-eod149-anti-pattern-26-same-output-but-garbage.md`.
 
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use log::info;
@@ -38,6 +39,11 @@ fn get_w4a8_model_path() -> String {
 
 fn init_logging() {
     infer::logging::init_stderr("info");
+}
+
+fn gpu_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn cuda_graph_enabled() -> bool {
@@ -203,6 +209,7 @@ fn first_token_divergence(lhs: &[u32], rhs: &[u32]) -> Option<(usize, Option<u32
 
 #[test]
 fn test_greedy_solo_vs_concurrent() {
+    let _gpu_guard = gpu_test_lock().lock().expect("GPU test lock poisoned");
     init_logging();
     enable_deterministic_gemm_for_test();
     let model_path = get_model_path();
@@ -254,6 +261,7 @@ fn test_greedy_solo_vs_concurrent() {
 
 #[test]
 fn test_greedy_w4a8_marlin_optional() {
+    let _gpu_guard = gpu_test_lock().lock().expect("GPU test lock poisoned");
     init_logging();
     enable_deterministic_gemm_for_test();
     let model_path = get_w4a8_model_path();
@@ -300,6 +308,7 @@ fn test_greedy_w4a8_marlin_optional() {
 /// Both checkpoints must exist locally; otherwise skipped.
 #[test]
 fn test_w4a8_vs_bf16_token_diff() {
+    let _gpu_guard = gpu_test_lock().lock().expect("GPU test lock poisoned");
     init_logging();
     enable_deterministic_gemm_for_test();
 

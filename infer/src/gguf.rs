@@ -623,6 +623,7 @@ impl GgufFile {
             partial_rotary_factor: rotary_dim as f32 / common.head_dim as f32,
             rotary_dim,
             rope_cache_len_hint: Some(common.context_length),
+            rope_scaling: None,
             layer_types: qwen35_layer_types_from_interval(
                 common.num_hidden_layers,
                 full_attention_interval,

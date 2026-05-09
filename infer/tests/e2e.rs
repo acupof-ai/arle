@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use fastrace::prelude::*;
@@ -81,6 +82,11 @@ fn init_tracing() -> PathBuf {
     trace_dir
 }
 
+fn gpu_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn make_request(prompt: &str, max_tokens: usize) -> CompletionRequest {
     CompletionRequest {
         prompt: prompt.to_string(),
@@ -107,6 +113,7 @@ fn drain_deltas(
 
 #[test]
 fn test_e2e_generation() {
+    let _gpu_guard = gpu_test_lock().lock().expect("GPU test lock poisoned");
     init_logging();
     let trace_dir = init_tracing();
     let model_path = get_model_path();
@@ -321,6 +328,7 @@ fn test_e2e_generation() {
 
 #[test]
 fn test_e2e_w4a8_marlin_optional() {
+    let _gpu_guard = gpu_test_lock().lock().expect("GPU test lock poisoned");
     init_logging();
     let model_path = get_w4a8_model_path();
     if !Path::new(&model_path).exists() {

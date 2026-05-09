@@ -304,7 +304,39 @@ impl ModelForward for Qwen3Model {
             prefill_budget_tokens.max(4096),
             num_heads,
         );
-        let prefill_workspace = prefill_plan.saturating_add(prefill_activation);
+        let prefill_marlin_scratch_config = self.marlin_prefill_scratch_config();
+        let prefill_marlin_scratch = if super::prefill::qwen3_prefill_graph_requested()
+            && prefill_marlin_scratch_config.any()
+        {
+            let gate_out_dim = if self.uses_fused_gate_up() {
+                self.config.intermediate_size.saturating_mul(2)
+            } else {
+                self.config.intermediate_size
+            };
+            let max_k = self
+                .config
+                .hidden_size
+                .max(q_dim)
+                .max(self.config.intermediate_size);
+            let max_n = self
+                .config
+                .hidden_size
+                .max(q_dim)
+                .max(kv_dim)
+                .max(gate_out_dim);
+            ops::MarlinPrefillScratch::device_bytes(
+                prefill_budget_tokens,
+                max_k,
+                max_n,
+                self.ctx.sm_count(),
+                prefill_marlin_scratch_config,
+            )
+        } else {
+            0
+        };
+        let prefill_workspace = prefill_plan
+            .saturating_add(prefill_activation)
+            .saturating_add(prefill_marlin_scratch);
 
         // Async prefill pending buffers and the lazy persistent mixed buffer
         // can coexist, so both must be subtracted before sizing the KV pool.
