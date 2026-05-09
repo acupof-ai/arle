@@ -52,8 +52,8 @@ PORT="$PORT" exec scripts/bench_ab.sh \
     --concurrencies 4 \
     --max-seconds 120 \
     --warmup 10 \
-    --cmd-a "RUST_MIN_STACK=8388608 INFER_MARLIN_W4_FP8_PREFILL=0 $BIN --model-path $MODEL --port $PORT \
+    --cmd-a "RUST_MIN_STACK=8388608 INFER_HYBRID_W4A8_PREFILL=1 INFER_MARLIN_W4_FP8_PREFILL=0 $BIN --model-path $MODEL --port $PORT \
              > /tmp/pf83-baseline-int8.log 2>&1 &" \
-    --cmd-b "RUST_MIN_STACK=8388608 INFER_MARLIN_W4_FP8_PREFILL=1 $BIN --model-path $MODEL --port $PORT \
+    --cmd-b "RUST_MIN_STACK=8388608 INFER_HYBRID_W4A8_PREFILL=1 INFER_MARLIN_W4_FP8_PREFILL=1 $BIN --model-path $MODEL --port $PORT \
              > /tmp/pf83-treatment-fp8.log 2>&1 &" \
     "$@"
