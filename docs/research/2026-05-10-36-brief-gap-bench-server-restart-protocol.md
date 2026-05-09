@@ -2,8 +2,21 @@
 title: #36 brief gap — bench script doesn't restart server, ambiguous "-- --foo" suffix in brief
 date: 2026-05-10
 type: research
-status: course-correction-sent-to-codex
+status: SUPERSEDED-by-2026-05-10-claude-hallucinated-grep-output-cli-flag
 ---
+
+> **⚠️ SUPERSEDED 2026-05-10 by `docs/experience/errors/2026-05-10-claude-hallucinated-grep-output-cli-flag.md`**
+>
+> §"Step 3 — Direct verification (Claude this tick)" of THIS document
+> cites a fabricated grep output claiming `--max-waiting-requests`
+> exists at `infer/src/main.rs:133`. **The flag does NOT exist** (line
+> 133 is `scheduler_mixed_policy`; SchedulerConfig construction has no
+> `args.max_waiting_requests`; `git log -S` proves the string never
+> existed in main.rs history). Codex's `9a8c6d5` errors entry was
+> CORRECT all along. The bench-script-passthrough finding (§"Step 4 —
+> Course correction") IS still accurate; only the CLI-flag-existence
+> claim is fabricated. Use `--cold-headroom 253` workaround for
+> effective cold_soft_cap=3 instead of `--max-waiting-requests 4`.
 
 # #36 brief gap — bench script doesn't restart server, ambiguous "-- --foo" suffix in brief
 
