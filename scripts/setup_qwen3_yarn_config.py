@@ -64,6 +64,14 @@ def main():
     p.add_argument("--max-pos", type=int, default=None, help="extended max_position_embeddings (default: factor * orig-max-pos for yarn, factor * src config max for linear/ntk)")
     p.add_argument("--in-place", action="store_true", help="modify src config.json in place (no copy)")
     p.add_argument("--out", type=Path, default=None, help="output dir (default: <src>-<type>-f<factor>/)")
+    p.add_argument(
+        "--symlink",
+        action="store_true",
+        help="symlink large model files (.safetensors etc) instead of copying; "
+             "only config.json is materialized fresh. Use when src model dir is "
+             "many GB and disk space is tight (e.g. /tmp tmpfs limit). "
+             "Validated by 2026-05-10 Phase 3a smoke (Qwen3-4B 8GB → ~1KB target dir).",
+    )
 
     args = p.parse_args()
     src_config = args.src / "config.json"
@@ -95,8 +103,20 @@ def main():
             target = args.src.parent / f"{args.src.name}-{args.type}-f{args.factor}"
         if target.exists():
             raise SystemExit(f"output dir exists: {target} (rm or pass --out)")
-        print(f"[copy] {args.src} → {target}")
-        shutil.copytree(args.src, target, symlinks=True)
+        if args.symlink:
+            # Symlink mode: only config.json is materialized fresh; all other
+            # files (incl. multi-GB safetensors) are symlinked from src. Saves
+            # disk + IO time when the only differing file is config.json.
+            print(f"[symlink] {args.src} → {target} (config.json materialized; rest symlinked)")
+            target.mkdir(parents=True)
+            for entry in args.src.iterdir():
+                if entry.name == "config.json":
+                    continue  # written below from new_cfg
+                link_target = entry.resolve()
+                (target / entry.name).symlink_to(link_target)
+        else:
+            print(f"[copy] {args.src} → {target}")
+            shutil.copytree(args.src, target, symlinks=True)
         target_cfg = target / "config.json"
 
     target_cfg.write_text(json.dumps(new_cfg, indent=2) + "\n")
