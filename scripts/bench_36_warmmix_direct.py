@@ -80,10 +80,10 @@ async def fire_completion(
 
 
 async def capture_stats(session: aiohttp.ClientSession, target: str) -> dict:
-    """Snapshot /v1/stats."""
+    """Snapshot /v1/stats. Server returns text/plain with JSON body, so skip mimetype check."""
     try:
         async with session.get(f"{target}/v1/stats", timeout=10) as resp:
-            return await resp.json()
+            return await resp.json(content_type=None)
     except Exception as exc:
         return {"error": str(exc)}
 

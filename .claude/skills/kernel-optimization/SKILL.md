@@ -775,6 +775,46 @@ Each anti-pattern has a project commit/entry where it was paid for.
       capture absorbs other shape-derived values. Audit the full data flow
       from key → capture, not just the key itself.
 
+28. **Hallucinated tool output overrides peer-agent investigation**
+    - Caught by: `ee2c5b0` (2026-05-10) — Claude challenged codex's
+      conclusion that `--max-waiting-requests` CLI flag does not exist
+      in `infer/src/main.rs`. Claude cited a "grep result" claiming the
+      flag existed at line 133. Codex (rightly) trusted Claude's
+      "correction" and used `--cold-headroom 253` workaround instead.
+      Two ticks later Claude audited codex's errors entry, re-ran the
+      verification grep, and **direct re-verify proved codex CORRECT
+      the whole time**: line 133 is `scheduler_mixed_policy`, no
+      `max_waiting_requests` field anywhere, `git log -S` returns empty
+      (string never existed in main.rs history).
+    - Root cause: Claude trusted internal model recall of prior bash
+      output over what tool actually returned. Either misread or
+      pattern-completed expected lines from `--admission-policy` +
+      `--cold-headroom` to "infer" `--max-waiting-requests` exists.
+      Built a "correction" of peer agent on fabricated evidence.
+    - **Real-world cost**: Two ticks of cooperative work proceeded with
+      the wrong assumption. Claude then briefed codex on Layer 2 again
+      with the same hallucinated flag, would have caused server start
+      to fail with clap conflict if not caught by audit-of-audit.
+    - Companion to anti-pattern #25 (hypothesis-context vs
+      implementation-context mismatch — both about agent context drift)
+      but distinct: #25 is "audit-chain shared blindspot", #28 is
+      "agent fabricates evidence to override peer's correct
+      conclusion". Empirical bench (#25's lesson) doesn't catch #28
+      because the bench command itself is built on the fabrication.
+    - Fix: When "correcting" a peer agent's claim about file contents,
+      the correction MUST include a re-run of the verification command
+      in the SAME response, with the literal raw output quoted —
+      NOT a summary of memory. Stale memory of prior tool output is
+      hypothesis, not evidence (per
+      `feedback_first_principle_solid_or_deeper.md`). Tie-breaker for
+      conflicting evidence (peer investigation vs your recall): a
+      fresh tool invocation showing raw output that both agents can
+      examine.
+    - Also: the SUPERSEDED notice on the prior research entry is
+      load-bearing — without it, future readers replay the same
+      fabrication. Always update the originating doc when a later
+      audit invalidates its claim.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -862,6 +902,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.7.0** | **2026-05-09** | **19** | **`c768b70` added #19 dispatch directive path verification per `8935851` index.md broken link + `de8b4dc` pickup queue stale path** |
 | **v1.8.0** | **2026-05-09** | **25** | **(this commit) batch-added #20-25 from c20b1ce attribution + R4#6 KILL + recipe audit chain. Anti-pattern theme: "audit at every prescription layer including recipes themselves"; key lesson: empirical bench is truly orthogonal SOLID layer that catches what bidirectional code audits both miss (#25 evidence). Sources: `c076aae` #20 / `b55bfcd`+`af44efa` #21 (2 evidence points) / `919c0fb`+`8d91d20`+`3fea979` #22 / `156d2c2` #23 / `1ccb448` #24 / `fe9ea8a`+`3b9cc06` #25** |
 | **v1.9.0** | **2026-05-10** | **27** | **(this commit) added #26-27 from #37 Path B v1 KILL → #40 Path B.2 wins chain. Theme: "cache-hit-rate claims need cardinality evidence, and bucketing fixes need second-order scalar-capture sync". Sources: `a7a8b94` #26 (Path B v1 388-key churn at 4k production despite shape-(4,3,8) smoke success) / `a56b7a9`+`c44788f` #27 (Codex's second-order bucketing insight beyond Claude brief: bucketed key + captured scalars baked at first-capture dim = semantic miss; bucketed key + captured scalars baked at bucket capacity = 98.5% reuse, engine TTFT -92.5%). Compound learning: the same Phase B family of optimization required two distinct anti-pattern lessons, one per KILL→WIN cycle.** |
+| **v1.10.0** | **2026-05-10** | **28** | **(this commit) added #28 from `ee2c5b0` SOLID-critical hallucination chain. Theme: "agent fabrication overrides peer's correct conclusion when memory of prior tool output is trusted over fresh verification". Source: Claude challenged codex's correct claim that `--max-waiting-requests` CLI flag does not exist, cited fabricated grep evidence, codex (rightly) trusted the "correction" and used `--cold-headroom 253` workaround. Two ticks later audit-of-audit re-ran verification → direct evidence proved codex correct from start (`git log -S` shows string never existed in main.rs). Lesson distinct from #25 ("audit-chain shared blindspot"): #28 is "agent fabricates evidence", and empirical bench doesn't catch it because the bench command itself is built on the fabrication. Fix: when correcting peer agent file-content claim, MUST re-run verification in SAME response and quote raw output literally, NOT summarize memory.** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
