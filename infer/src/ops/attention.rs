@@ -399,6 +399,10 @@ pub(crate) struct PagedPrefillMeta<'a> {
     pub layer_idx: usize,
     /// Concatenated page-table rows for every packed sequence in batch order.
     pub page_indices: &'a CudaSlice<i32>,
+    /// Per-sequence offsets into `page_indices`, refreshed before graph replay.
+    pub page_table_offsets: &'a CudaSlice<i32>,
+    /// Per-sequence start positions in batch order, refreshed before graph replay.
+    pub start_positions: &'a CudaSlice<i32>,
     pub sequences: &'a [PagedPrefillSequence],
     pub page_size: usize,
 }
@@ -425,6 +429,13 @@ pub(crate) struct PagedPrefillForward {
     pub page_size: usize,
 }
 
+struct PagedPrefillHostMetadata {
+    qo_indptr: Vec<i32>,
+    kv_indptr: Vec<i32>,
+    kv_last_page_len: Vec<i32>,
+    total_qo_rows: usize,
+}
+
 impl PagedPrefillForward {
     /// Upload indptrs ONCE for the whole TileLang forward. HD128 flavour.
     pub(crate) fn new_hd128(
@@ -433,6 +444,46 @@ impl PagedPrefillForward {
         page_size: usize,
     ) -> Result<Self> {
         Self::new_inner(ctx, sequences, page_size)
+    }
+
+    /// Refresh graph-stable metadata buffers whose pointers are captured but
+    /// contents vary by request, most importantly `kv_last_page_len` because it
+    /// depends on each sequence's start position.
+    pub(crate) fn refresh_hd128(
+        &mut self,
+        ctx: &DeviceContext,
+        sequences: &[PagedPrefillSequence],
+        page_size: usize,
+    ) -> Result<()> {
+        let metadata = Self::build_metadata(sequences, page_size)?;
+        ensure!(
+            self.batch_size == sequences.len(),
+            "paged prefill graph batch mismatch: captured {} replay {}",
+            self.batch_size,
+            sequences.len()
+        );
+        ensure!(
+            self.total_qo_rows == metadata.total_qo_rows,
+            "paged prefill graph total rows mismatch: captured {} replay {}",
+            self.total_qo_rows,
+            metadata.total_qo_rows
+        );
+        ensure!(
+            self.page_size == page_size,
+            "paged prefill graph page size mismatch: captured {} replay {}",
+            self.page_size,
+            page_size
+        );
+        ctx.stream
+            .memcpy_htod(&metadata.qo_indptr, &mut self.qo_indptr_dev)
+            .map_err(|e| anyhow!("qo_indptr refresh H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&metadata.kv_indptr, &mut self.kv_indptr_dev)
+            .map_err(|e| anyhow!("kv_indptr refresh H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&metadata.kv_last_page_len, &mut self.kv_last_page_len_dev)
+            .map_err(|e| anyhow!("kv_last_page_len refresh H2D failed: {e}"))?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -446,6 +497,35 @@ impl PagedPrefillForward {
             "paged prefill forward requires at least one sequence"
         );
 
+        let metadata = Self::build_metadata(sequences, page_size)?;
+
+        let qo_indptr_dev: CudaSlice<i32> = ctx
+            .stream
+            .clone_htod(&metadata.qo_indptr)
+            .map_err(|e| anyhow!("qo_indptr H2D failed: {e}"))?;
+        let kv_indptr_dev: CudaSlice<i32> = ctx
+            .stream
+            .clone_htod(&metadata.kv_indptr)
+            .map_err(|e| anyhow!("kv_indptr H2D failed: {e}"))?;
+        let kv_last_page_len_dev: CudaSlice<i32> = ctx
+            .stream
+            .clone_htod(&metadata.kv_last_page_len)
+            .map_err(|e| anyhow!("kv_last_page_len H2D failed: {e}"))?;
+
+        Ok(Self {
+            qo_indptr_dev,
+            kv_indptr_dev,
+            kv_last_page_len_dev,
+            batch_size: sequences.len(),
+            total_qo_rows: metadata.total_qo_rows,
+            page_size,
+        })
+    }
+
+    fn build_metadata(
+        sequences: &[PagedPrefillSequence],
+        page_size: usize,
+    ) -> Result<PagedPrefillHostMetadata> {
         let mut total_qo_rows = 0usize;
         let mut total_pages = 0usize;
         let mut qo_indptr = Vec::with_capacity(sequences.len() + 1);
@@ -485,26 +565,11 @@ impl PagedPrefillForward {
             kv_last_page_len.push(paged_prefill_last_page_len(kv_len, page_size));
         }
 
-        let qo_indptr_dev: CudaSlice<i32> = ctx
-            .stream
-            .clone_htod(&qo_indptr)
-            .map_err(|e| anyhow!("qo_indptr H2D failed: {e}"))?;
-        let kv_indptr_dev: CudaSlice<i32> = ctx
-            .stream
-            .clone_htod(&kv_indptr)
-            .map_err(|e| anyhow!("kv_indptr H2D failed: {e}"))?;
-        let kv_last_page_len_dev: CudaSlice<i32> = ctx
-            .stream
-            .clone_htod(&kv_last_page_len)
-            .map_err(|e| anyhow!("kv_last_page_len H2D failed: {e}"))?;
-
-        Ok(Self {
-            qo_indptr_dev,
-            kv_indptr_dev,
-            kv_last_page_len_dev,
-            batch_size: sequences.len(),
+        Ok(PagedPrefillHostMetadata {
+            qo_indptr,
+            kv_indptr,
+            kv_last_page_len,
             total_qo_rows,
-            page_size,
         })
     }
 }
@@ -580,6 +645,8 @@ pub(crate) fn prefill_attention_paged_batch(
         let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&ctx.stream);
         let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
         let (pt_ptr, _gpt) = meta.page_indices.device_ptr(&ctx.stream);
+        let (pto_ptr, _gpto) = meta.page_table_offsets.device_ptr(&ctx.stream);
+        let (sp_ptr, _gsp) = meta.start_positions.device_ptr(&ctx.stream);
         let kp_ptr = meta.pool.k_ptr(meta.layer_idx, &ctx.stream);
         let vp_ptr = meta.pool.v_ptr(meta.layer_idx, &ctx.stream);
 
@@ -588,14 +655,15 @@ pub(crate) fn prefill_attention_paged_batch(
         let half_size = std::mem::size_of::<ffi::Half>();
         let i32_size = std::mem::size_of::<i32>();
 
-        for seq in meta.sequences {
+        for (seq_idx, seq) in meta.sequences.iter().enumerate() {
             let q_ptr_offset =
                 (q_ptr as usize + seq.token_offset * q_stride * half_size) as *mut ffi::Half;
             let k_ptr_offset =
                 (k_ptr as usize + seq.token_offset * kv_stride * half_size) as *mut ffi::Half;
             let v_ptr_offset =
                 (v_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
-            let pt_ptr_offset = (pt_ptr as usize + seq.page_table_offset * i32_size) as *const i32;
+            let pto_ptr_offset = (pto_ptr as usize + seq_idx * i32_size) as *const i32;
+            let sp_ptr_offset = (sp_ptr as usize + seq_idx * i32_size) as *const i32;
 
             ffi::prefill_attention_paged_prep_cuda(
                 q_ptr_offset,
@@ -605,7 +673,8 @@ pub(crate) fn prefill_attention_paged_batch(
                 kn_ptr as *const ffi::Half,
                 cos_ptr as *const ffi::Half,
                 sin_ptr as *const ffi::Half,
-                pt_ptr_offset,
+                pt_ptr as *const i32,
+                pto_ptr_offset,
                 page_size as i32,
                 kp_ptr as *mut ffi::Half,
                 vp_ptr as *mut ffi::Half,
@@ -613,7 +682,7 @@ pub(crate) fn prefill_attention_paged_batch(
                 num_kv_heads as i32,
                 head_dim as i32,
                 seq.seq_len as i32,
-                seq.start_pos as i32,
+                sp_ptr_offset,
                 nrp.rms_eps,
                 ctx.stream.cu_stream(),
             )

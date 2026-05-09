@@ -1140,6 +1140,7 @@ pub(crate) fn resolve_rope_cache_len(config_hint: Option<usize>) -> usize {
         .max(DEFAULT_ROPE_CACHE_LEN)
 }
 
+#[allow(dead_code)]
 pub(crate) fn precompute_rope(
     ctx: &DeviceContext,
     head_dim: usize,

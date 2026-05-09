@@ -1239,6 +1239,27 @@ impl Qwen3Model {
                     .map_err(|e| anyhow::anyhow!("H2D prefill_page_table: {e}"))?,
             );
         }
+        let prefill_start_positions_host: Vec<i32> = batch
+            .prefill_start_positions
+            .iter()
+            .map(|&pos| pos as i32)
+            .collect();
+        let prefill_start_positions_upload = if prefill_start_positions_host.is_empty() {
+            vec![0]
+        } else {
+            prefill_start_positions_host
+        };
+        let prefill_start_positions_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&prefill_start_positions_upload)
+            .map_err(|e| anyhow::anyhow!("H2D prefill_start_positions: {e}"))?;
+        let prefill_page_table_offsets_upload = vec![0i32; prefill_count.max(1)];
+        let prefill_page_table_offsets_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&prefill_page_table_offsets_upload)
+            .map_err(|e| anyhow::anyhow!("H2D prefill_page_table_offsets: {e}"))?;
 
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
@@ -1248,6 +1269,7 @@ impl Qwen3Model {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let bf16_size = std::mem::size_of::<u16>();
+        let i32_size = std::mem::size_of::<i32>();
         let page_size = paged_kv_pool.page_size;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -1303,6 +1325,10 @@ impl Qwen3Model {
                 let (ind_ptr, _gind) = mixed.metadata.kv_indptr.device_ptr(&self.ctx.stream);
                 let (idx_ptr, _gidx) = mixed.metadata.kv_indices.device_ptr(&self.ctx.stream);
                 let (lp_ptr, _glp) = mixed.metadata.kv_last_page_len.device_ptr(&self.ctx.stream);
+                let (prefill_start_pos_ptr, _gprefill_start_pos) =
+                    prefill_start_positions_dev.device_ptr(&self.ctx.stream);
+                let (prefill_page_table_offset_ptr, _gprefill_page_table_offset) =
+                    prefill_page_table_offsets_dev.device_ptr(&self.ctx.stream);
                 let k_pool_ptr = paged_kv_pool.k_ptr(layer_idx, &self.ctx.stream);
                 let v_pool_ptr = paged_kv_pool.v_ptr(layer_idx, &self.ctx.stream);
 
@@ -1356,6 +1382,8 @@ impl Qwen3Model {
                                     .device_ptr(&self.ctx.stream);
                                 ptr as *const i32
                             },
+                            (prefill_page_table_offset_ptr as usize + prefill_idx * i32_size)
+                                as *const i32,
                             page_size as i32,
                             k_pool_ptr as *mut ffi::Half,
                             v_pool_ptr as *mut ffi::Half,
@@ -1363,7 +1391,7 @@ impl Qwen3Model {
                             num_kv_heads as i32,
                             head_dim as i32,
                             c as i32,
-                            batch.prefill_start_positions[prefill_idx] as i32,
+                            (prefill_start_pos_ptr as usize + prefill_idx * i32_size) as *const i32,
                             eps,
                             self.ctx.stream.cu_stream(),
                         )

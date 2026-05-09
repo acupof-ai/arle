@@ -110,6 +110,8 @@ struct OwnedPendingPagedPrefillBuffers {
     _hidden: HiddenStates,
     _bufs: PrefillBuffers,
     _page_indices_dev: CudaSlice<i32>,
+    _page_table_offsets_dev: CudaSlice<i32>,
+    _start_positions_dev: CudaSlice<i32>,
     _prefix_token_rows_dev: CudaSlice<i32>,
     _prefill_token_rows_dev: CudaSlice<i32>,
     _fwd: crate::ops::PagedPrefillForward,
@@ -136,8 +138,6 @@ struct Qwen3PrefillGraphKey {
     prefix_token_rows_len: usize,
     batch_size: usize,
     seq_lens: Vec<usize>,
-    start_positions: Vec<usize>,
-    num_pages: Vec<usize>,
 }
 
 impl Qwen3PrefillGraphKey {
@@ -149,9 +149,66 @@ impl Qwen3PrefillGraphKey {
             prefix_token_rows_len: layout.prefix_token_rows.len(),
             batch_size: layout.sequences.len(),
             seq_lens: layout.sequences.iter().map(|seq| seq.seq_len).collect(),
-            start_positions: layout.sequences.iter().map(|seq| seq.start_pos).collect(),
-            num_pages: layout.sequences.iter().map(|seq| seq.num_pages).collect(),
         }
+    }
+}
+
+struct Qwen3PrefillGraphMetadata {
+    page_table_offsets_dev: CudaSlice<i32>,
+    start_positions_dev: CudaSlice<i32>,
+    seq_lens_dev: CudaSlice<i32>,
+}
+
+impl Qwen3PrefillGraphMetadata {
+    fn new(ctx: &DeviceContext, batch_size: usize) -> Result<Self> {
+        let capacity = batch_size.max(1);
+        Ok(Self {
+            page_table_offsets_dev: ctx
+                .stream
+                .alloc_zeros(capacity)
+                .map_err(|e| anyhow::anyhow!("alloc prefill graph page-table offsets: {e}"))?,
+            start_positions_dev: ctx
+                .stream
+                .alloc_zeros(capacity)
+                .map_err(|e| anyhow::anyhow!("alloc prefill graph start positions: {e}"))?,
+            seq_lens_dev: ctx
+                .stream
+                .alloc_zeros(capacity)
+                .map_err(|e| anyhow::anyhow!("alloc prefill graph seq lens: {e}"))?,
+        })
+    }
+
+    fn refresh(&mut self, ctx: &DeviceContext, layout: &Qwen3PagedPrefillLayout) -> Result<()> {
+        let start_positions: Vec<i32> = layout
+            .sequences
+            .iter()
+            .map(|seq| seq.start_pos as i32)
+            .collect();
+        let page_table_offsets: Vec<i32> = layout
+            .sequences
+            .iter()
+            .map(|seq| seq.page_table_offset as i32)
+            .collect();
+        let seq_lens: Vec<i32> = layout
+            .sequences
+            .iter()
+            .map(|seq| seq.seq_len as i32)
+            .collect();
+        let mut start_positions_dev = self.start_positions_dev.slice_mut(..start_positions.len());
+        ctx.stream
+            .memcpy_htod(&start_positions, &mut start_positions_dev)
+            .map_err(|e| anyhow::anyhow!("prefill graph start positions H2D failed: {e}"))?;
+        let mut page_table_offsets_dev = self
+            .page_table_offsets_dev
+            .slice_mut(..page_table_offsets.len());
+        ctx.stream
+            .memcpy_htod(&page_table_offsets, &mut page_table_offsets_dev)
+            .map_err(|e| anyhow::anyhow!("prefill graph page-table offsets H2D failed: {e}"))?;
+        let mut seq_lens_dev = self.seq_lens_dev.slice_mut(..seq_lens.len());
+        ctx.stream
+            .memcpy_htod(&seq_lens, &mut seq_lens_dev)
+            .map_err(|e| anyhow::anyhow!("prefill graph seq lens H2D failed: {e}"))?;
+        Ok(())
     }
 }
 
@@ -161,6 +218,7 @@ struct Qwen3PagedPrefillGraphResources {
     hidden: HiddenStates,
     bufs: PrefillBuffers,
     page_indices_dev: CudaSlice<i32>,
+    metadata: Qwen3PrefillGraphMetadata,
     prefix_token_rows_dev: CudaSlice<i32>,
     prefill_token_rows_dev: CudaSlice<i32>,
     fwd: crate::ops::PagedPrefillForward,
@@ -171,7 +229,7 @@ pub struct Qwen3PrefillContext {
     pending: Option<PendingPagedPrefill>,
     completion_event: CudaEvent,
     pending_ready_without_event: bool,
-    graph_resources: Option<Qwen3PagedPrefillGraphResources>,
+    graph_resources: Vec<Qwen3PagedPrefillGraphResources>,
 }
 
 impl Qwen3PrefillContext {
@@ -183,7 +241,7 @@ impl Qwen3PrefillContext {
                 .new_event(None)
                 .map_err(|e| anyhow::anyhow!("Alloc async prefill completion event failed: {e}"))?,
             pending_ready_without_event: false,
-            graph_resources: None,
+            graph_resources: Vec::new(),
         })
     }
 
@@ -300,6 +358,8 @@ pub(super) fn qwen3_prefill_graph_requested() -> bool {
     )
 }
 
+const QWEN3_PREFILL_GRAPH_CACHE_MAX_KEYS: usize = 8;
+
 impl Qwen3Model {
     #[fastrace::trace(name = "get_embeddings_batch")]
     pub(super) fn get_embeddings_batch(&self, token_ids: &[u32]) -> Result<HiddenStates> {
@@ -393,20 +453,43 @@ impl Qwen3Model {
         key: Qwen3PrefillGraphKey,
         layout: &Qwen3PagedPrefillLayout,
     ) -> Result<&'a mut Qwen3PagedPrefillGraphResources> {
-        let needs_realloc = prefill_ctx
+        if let Some(pos) = prefill_ctx
             .graph_resources
-            .as_ref()
-            .is_none_or(|resources| resources.key != key);
-        if needs_realloc {
-            log::info!(
-                "Qwen3 prefill graph capture key: tokens={} batch={} pages={} prefix_rows={} marlin_scratch={}",
-                key.total_tokens,
-                key.batch_size,
-                key.page_indices_len,
-                key.prefix_token_rows_len,
-                self.marlin_prefill_scratch_config().any()
+            .iter()
+            .position(|resources| resources.key == key)
+        {
+            if pos + 1 != prefill_ctx.graph_resources.len() {
+                let resources = prefill_ctx.graph_resources.remove(pos);
+                prefill_ctx.graph_resources.push(resources);
+            }
+            return prefill_ctx
+                .graph_resources
+                .last_mut()
+                .context("prefill graph resources must exist after cache hit");
+        }
+
+        if prefill_ctx.graph_resources.len() >= QWEN3_PREFILL_GRAPH_CACHE_MAX_KEYS {
+            let evicted = prefill_ctx.graph_resources.remove(0);
+            log::warn!(
+                "Qwen3 prefill graph cache evicting key: tokens={} batch={} pages={} prefix_rows={}",
+                evicted.key.total_tokens,
+                evicted.key.batch_size,
+                evicted.key.page_indices_len,
+                evicted.key.prefix_token_rows_len
             );
-            prefill_ctx.graph_resources = Some(Qwen3PagedPrefillGraphResources {
+        }
+
+        log::info!(
+            "Qwen3 prefill graph capture key: tokens={} batch={} pages={} prefix_rows={} marlin_scratch={}",
+            key.total_tokens,
+            key.batch_size,
+            key.page_indices_len,
+            key.prefix_token_rows_len,
+            self.marlin_prefill_scratch_config().any()
+        );
+        prefill_ctx
+            .graph_resources
+            .push(Qwen3PagedPrefillGraphResources {
                 token_ids_gpu: self
                     .ctx
                     .stream
@@ -419,6 +502,7 @@ impl Qwen3Model {
                     .stream
                     .alloc_zeros(key.page_indices_len.max(1))
                     .map_err(|e| anyhow::anyhow!("alloc prefill graph page indices: {e}"))?,
+                metadata: Qwen3PrefillGraphMetadata::new(&self.ctx, key.batch_size)?,
                 prefix_token_rows_dev: self
                     .ctx
                     .stream
@@ -437,11 +521,11 @@ impl Qwen3Model {
                 key,
                 graph_state: CudaGraphState::new(),
             });
-        }
+
         prefill_ctx
             .graph_resources
-            .as_mut()
-            .context("prefill graph resources must exist after allocation")
+            .last_mut()
+            .context("prefill graph resources must exist after cache insert")
     }
 
     fn upload_paged_prefill_graph_inputs(
@@ -459,6 +543,10 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&layout.page_indices, &mut resources.page_indices_dev)
             .map_err(|e| anyhow::anyhow!("prefill graph page indices H2D failed: {e}"))?;
+        resources.metadata.refresh(&self.ctx, layout)?;
+        resources
+            .fwd
+            .refresh_hd128(&self.ctx, &layout.sequences, resources.key.page_size)?;
         let prefix_rows: &[i32] = if layout.prefix_token_rows.is_empty() {
             &[0]
         } else {
@@ -720,6 +808,8 @@ impl Qwen3Model {
                         pool,
                         &layout.sequences,
                         &resources.page_indices_dev,
+                        &resources.metadata.page_table_offsets_dev,
+                        &resources.metadata.start_positions_dev,
                         &resources.prefix_token_rows_dev,
                         layout.prefix_token_rows.len(),
                         &resources.prefill_token_rows_dev,
@@ -763,6 +853,26 @@ impl Qwen3Model {
             .stream
             .clone_htod(prefix_token_rows_upload)
             .map_err(|e| anyhow::anyhow!("prefix token rows H2D failed: {e}"))?;
+        let start_positions: Vec<i32> = layout
+            .sequences
+            .iter()
+            .map(|seq| seq.start_pos as i32)
+            .collect();
+        let page_table_offsets: Vec<i32> = layout
+            .sequences
+            .iter()
+            .map(|seq| seq.page_table_offset as i32)
+            .collect();
+        let page_table_offsets_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&page_table_offsets)
+            .map_err(|e| anyhow::anyhow!("page-table offsets H2D failed: {e}"))?;
+        let start_positions_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&start_positions)
+            .map_err(|e| anyhow::anyhow!("start positions H2D failed: {e}"))?;
         let prefill_token_rows_dev: CudaSlice<i32> = self
             .ctx
             .stream
@@ -780,6 +890,8 @@ impl Qwen3Model {
             pool,
             &layout.sequences,
             &page_indices_dev,
+            &page_table_offsets_dev,
+            &start_positions_dev,
             &prefix_token_rows_dev,
             layout.prefix_token_rows.len(),
             &prefill_token_rows_dev,
@@ -803,6 +915,8 @@ impl Qwen3Model {
                     _hidden: hidden,
                     _bufs: bufs,
                     _page_indices_dev: page_indices_dev,
+                    _page_table_offsets_dev: page_table_offsets_dev,
+                    _start_positions_dev: start_positions_dev,
                     _prefix_token_rows_dev: prefix_token_rows_dev,
                     _prefill_token_rows_dev: prefill_token_rows_dev,
                     _fwd: fwd,
@@ -838,6 +952,8 @@ impl Qwen3Model {
         pool: &TokenKVPool,
         sequences: &[ops::PagedPrefillSequence],
         page_indices: &CudaSlice<i32>,
+        page_table_offsets: &CudaSlice<i32>,
+        start_positions: &CudaSlice<i32>,
         prefix_token_rows: &CudaSlice<i32>,
         prefix_token_count: usize,
         prefill_token_rows: &CudaSlice<i32>,
@@ -866,6 +982,8 @@ impl Qwen3Model {
                 pool,
                 sequences,
                 page_indices,
+                page_table_offsets,
+                start_positions,
                 prefix_token_rows,
                 prefix_token_count,
                 prefill_token_rows,
@@ -892,6 +1010,8 @@ impl Qwen3Model {
         pool: &TokenKVPool,
         sequences: &[ops::PagedPrefillSequence],
         page_indices: &CudaSlice<i32>,
+        page_table_offsets: &CudaSlice<i32>,
+        start_positions: &CudaSlice<i32>,
         prefix_token_rows: &CudaSlice<i32>,
         prefix_token_count: usize,
         prefill_token_rows: &CudaSlice<i32>,
@@ -953,6 +1073,8 @@ impl Qwen3Model {
             pool,
             layer_idx,
             page_indices,
+            page_table_offsets,
+            start_positions,
             sequences,
             page_size: pool.page_size,
         };
