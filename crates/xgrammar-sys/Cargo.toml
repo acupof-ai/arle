@@ -1,0 +1,22 @@
+[package]
+name = "xgrammar-sys"
+version = "0.1.5"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+# Build the real upstream xgrammar C++ engine. Requires
+# `XGRAMMAR_SOURCE_DIR` or `ARLE_XGRAMMAR_SOURCE_DIR` to point at a pinned
+# xgrammar checkout (validated against v0.1.34).
+real = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = "1.0"
+
+[lints]
+workspace = true
