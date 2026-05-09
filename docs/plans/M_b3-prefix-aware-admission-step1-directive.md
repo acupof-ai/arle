@@ -153,6 +153,28 @@ After Step 2 + 3:
 
 ## Status
 
+**SUPERSEDED 2026-05-10 by `5e902da` survey** — all three steps
+(signature change, signal pipeline, default policy switch) are LANDED
+in main. Original 200-400 LOC scope collapsed to a bench-validation
+A/B run.
+
+See `docs/research/2026-05-10-36-prefix-aware-admission-substrate-complete-bench-pending.md`
+for:
+- Step 1 commit attribution (`7c8fd61`) + current code locations
+- Step 2 substrate location (`admission.rs:409-435 prefix_aware_admission_allows_plan` +
+  `admission.rs:437-458 prefix_aware_fail_open_candidate`)
+- Step 3 CLI wiring (`main.rs:124,702` + `types.rs:478-493 enum + parse`)
+- Concrete bench command pair for QueueBound vs PrefixAware A/B
+- Open question on gate-trigger evidence (low-pressure benches don't
+  exercise `cold_soft_cap`)
+- Pickup brief for next bench window
+
+Plan body sections below remain useful for KILL-gate framing, SGLang
+gap context, and the per-step KILL criteria. Implementation plan is
+moot.
+
+### Original status (pre-supersession, retained for history)
+
 Step 1 directive ready for codex pickup(0.5 day,30-50 LOC)。
 Steps 2-3 follow sequentially。Total B3 work 2-3 days codex,closes
 SGLang multi-tenant 2× gap = -50% TTFT on multi-tenant axis。
