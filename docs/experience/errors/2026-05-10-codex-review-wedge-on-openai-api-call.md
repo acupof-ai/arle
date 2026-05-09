@@ -48,6 +48,31 @@ either:
 
 Either way: timeout(1) fails to enforce the limit.
 
+**Diagnostic refinement (51m+ tick)**: proxy + upstream are HEALTHY:
+
+```bash
+$ curl -s -o /dev/null -w "HTTP %{http_code} time_total %{time_total}s\n" \
+    --max-time 5 http://localhost:7897
+HTTP 400 time_total 0.002346s     # proxy alive, returns 400 for missing target
+
+$ HTTPS_PROXY=http://localhost:7897 curl -s -o /dev/null \
+    -w "HTTP %{http_code} time_total %{time_total}s\n" --max-time 8 \
+    https://api.openai.com/v1/models
+HTTP 401 time_total 0.393701s     # proxy → OpenAI works, API responds 401 (needs auth)
+```
+
+**This rules out transport-layer/proxy issues**. The wedge is
+specifically PID 1867396's stuck session-state — not a network
+infrastructure problem. The earlier-established TCP connection
+(localhost:60904 → localhost:7897) is dead at the application layer
+but alive at the OS layer (no FIN/RST received).
+
+`kill -TERM 1867396` (or `-9`) is the ONLY recovery; there is nothing
+to fix upstream.
+
+Other codex CLI sessions (PIDs 85424, 642435) running fine concurrently
+— rules out codex CLI binary corruption or system-wide codex issue.
+
 ## Fix
 
 ### Recovery for current wedged process
