@@ -404,6 +404,8 @@ pub(crate) struct PagedPrefillMeta<'a> {
     /// Per-sequence start positions in batch order, refreshed before graph replay.
     pub start_positions: &'a CudaSlice<i32>,
     pub sequences: &'a [PagedPrefillSequence],
+    /// Captured launch capacity for `page_indices`; may be bucketed for graph replay.
+    pub page_indices_len: usize,
     pub page_size: usize,
 }
 
@@ -708,7 +710,14 @@ pub(crate) fn prefill_attention_paged_batch(
         // capacity (`num_pages`) and the per-batch page-table length
         // (`total_pages`). Both come from the runtime metadata.
         let num_pages = meta.pool.max_total_pages as i32;
-        let total_pages = meta.sequences.iter().map(|s| s.num_pages).sum::<usize>() as i32;
+        let actual_total_pages = meta.sequences.iter().map(|s| s.num_pages).sum::<usize>();
+        assert!(
+            meta.page_indices_len >= actual_total_pages,
+            "paged prefill page_indices capacity {} < actual pages {}",
+            meta.page_indices_len,
+            actual_total_pages
+        );
+        let total_pages = meta.page_indices_len as i32;
         unsafe {
             tilelang_kernel(
                 q_u64 as *mut ffi::Half,

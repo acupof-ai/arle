@@ -134,7 +134,9 @@ struct PendingPagedPrefillOwner {
 struct Qwen3PrefillGraphKey {
     total_tokens: usize,
     page_size: usize,
+    /// Bucketed allocation capacity, not the exact request page count.
     page_indices_len: usize,
+    /// Bucketed allocation capacity, not the exact prefix row count.
     prefix_token_rows_len: usize,
     batch_size: usize,
     seq_lens: Vec<usize>,
@@ -145,8 +147,14 @@ impl Qwen3PrefillGraphKey {
         Self {
             total_tokens: layout.prefill_token_rows.len(),
             page_size,
-            page_indices_len: layout.page_indices.len(),
-            prefix_token_rows_len: layout.prefix_token_rows.len(),
+            page_indices_len: round_nonzero_up(
+                layout.page_indices.len(),
+                QWEN3_PREFILL_GRAPH_PAGE_INDICES_BUCKET,
+            ),
+            prefix_token_rows_len: round_nonzero_up(
+                layout.prefix_token_rows.len(),
+                QWEN3_PREFILL_GRAPH_PREFIX_ROWS_BUCKET,
+            ),
             batch_size: layout.sequences.len(),
             seq_lens: layout.sequences.iter().map(|seq| seq.seq_len).collect(),
         }
@@ -359,6 +367,17 @@ pub(super) fn qwen3_prefill_graph_requested() -> bool {
 }
 
 const QWEN3_PREFILL_GRAPH_CACHE_MAX_KEYS: usize = 8;
+const QWEN3_PREFILL_GRAPH_PAGE_INDICES_BUCKET: usize = 64;
+const QWEN3_PREFILL_GRAPH_PREFIX_ROWS_BUCKET: usize = 128;
+
+fn round_nonzero_up(value: usize, bucket: usize) -> usize {
+    debug_assert!(bucket > 0);
+    if value == 0 {
+        0
+    } else {
+        value.div_ceil(bucket) * bucket
+    }
+}
 
 impl Qwen3Model {
     #[fastrace::trace(name = "get_embeddings_batch")]
@@ -539,25 +558,41 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&token_ids, &mut resources.token_ids_gpu)
             .map_err(|e| anyhow::anyhow!("prefill graph token ids H2D failed: {e}"))?;
+        anyhow::ensure!(
+            layout.page_indices.len() <= resources.key.page_indices_len,
+            "prefill graph page index bucket too small: actual {} capacity {}",
+            layout.page_indices.len(),
+            resources.key.page_indices_len
+        );
+        let mut page_indices = vec![0i32; resources.key.page_indices_len.max(1)];
+        page_indices[..layout.page_indices.len()].copy_from_slice(&layout.page_indices);
         self.ctx
             .stream
-            .memcpy_htod(&layout.page_indices, &mut resources.page_indices_dev)
+            .memcpy_htod(&page_indices, &mut resources.page_indices_dev)
             .map_err(|e| anyhow::anyhow!("prefill graph page indices H2D failed: {e}"))?;
         resources.metadata.refresh(&self.ctx, layout)?;
         resources
             .fwd
             .refresh_hd128(&self.ctx, &layout.sequences, resources.key.page_size)?;
-        let prefix_rows: &[i32] = if layout.prefix_token_rows.is_empty() {
-            &[0]
+        anyhow::ensure!(
+            layout.prefix_token_rows.len() <= resources.key.prefix_token_rows_len,
+            "prefill graph prefix row bucket too small: actual {} capacity {}",
+            layout.prefix_token_rows.len(),
+            resources.key.prefix_token_rows_len
+        );
+        let prefix_rows = if resources.key.prefix_token_rows_len == 0 {
+            vec![0]
         } else {
-            &layout.prefix_token_rows
+            let mut rows = vec![0i32; resources.key.prefix_token_rows_len];
+            rows[..layout.prefix_token_rows.len()].copy_from_slice(&layout.prefix_token_rows);
+            rows
         };
         let mut prefix_view = resources
             .prefix_token_rows_dev
             .slice_mut(..prefix_rows.len());
         self.ctx
             .stream
-            .memcpy_htod(prefix_rows, &mut prefix_view)
+            .memcpy_htod(&prefix_rows, &mut prefix_view)
             .map_err(|e| anyhow::anyhow!("prefill graph prefix rows H2D failed: {e}"))?;
         self.ctx
             .stream
@@ -810,8 +845,9 @@ impl Qwen3Model {
                         &resources.page_indices_dev,
                         &resources.metadata.page_table_offsets_dev,
                         &resources.metadata.start_positions_dev,
+                        resources.key.page_indices_len,
                         &resources.prefix_token_rows_dev,
-                        layout.prefix_token_rows.len(),
+                        resources.key.prefix_token_rows_len,
                         &resources.prefill_token_rows_dev,
                         &mut resources.fwd,
                     )
@@ -892,6 +928,7 @@ impl Qwen3Model {
             &page_indices_dev,
             &page_table_offsets_dev,
             &start_positions_dev,
+            layout.page_indices.len(),
             &prefix_token_rows_dev,
             layout.prefix_token_rows.len(),
             &prefill_token_rows_dev,
@@ -954,6 +991,7 @@ impl Qwen3Model {
         page_indices: &CudaSlice<i32>,
         page_table_offsets: &CudaSlice<i32>,
         start_positions: &CudaSlice<i32>,
+        page_indices_len: usize,
         prefix_token_rows: &CudaSlice<i32>,
         prefix_token_count: usize,
         prefill_token_rows: &CudaSlice<i32>,
@@ -984,6 +1022,7 @@ impl Qwen3Model {
                 page_indices,
                 page_table_offsets,
                 start_positions,
+                page_indices_len,
                 prefix_token_rows,
                 prefix_token_count,
                 prefill_token_rows,
@@ -1012,6 +1051,7 @@ impl Qwen3Model {
         page_indices: &CudaSlice<i32>,
         page_table_offsets: &CudaSlice<i32>,
         start_positions: &CudaSlice<i32>,
+        page_indices_len: usize,
         prefix_token_rows: &CudaSlice<i32>,
         prefix_token_count: usize,
         prefill_token_rows: &CudaSlice<i32>,
@@ -1076,6 +1116,7 @@ impl Qwen3Model {
             page_table_offsets,
             start_positions,
             sequences,
+            page_indices_len,
             page_size: pool.page_size,
         };
         self.refill_paged_prefill_prefix_if_needed(
