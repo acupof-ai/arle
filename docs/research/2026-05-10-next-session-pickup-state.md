@@ -36,9 +36,13 @@ status: session-end-checkpoint-for-next-pickup
 - **PF8.4 dispatch wiring LANDED** (`db063ff`, +38 LOC): opt-in
   `INFER_MARLIN_W4_FP8_PREFILL=1` env var, bail at call site pending
   PF8.3 GEMM kernel.
-- **PF8.3 Strategy A' substrate END-TO-END VALIDATED** (codex untracked-modified
-  gemm.rs+tensor.rs+linear.rs + untracked marlin_pf8/ + marlin_w4_fp8_kernel.cu
-  + experience entry; commit pending FINAL codex review re-pass post-bug-fix).
+- **🎉 PF8.3 Strategy A' substrate LANDED `11763ba`** (codex commit
+  `feat(cuda): PF8.3 W4 FP8 Marlin prefill substrate`, 12 files
+  +3936/-13 LOC: marlin_pf8/{core/scalar_type.hpp 58 + dequant.h 611
+  + kernel.h 45 + marlin.cuh 176 + marlin_dtypes.cuh 151 + marlin_mma.h
+  271 + marlin_template.h 2081} + marlin_w4_fp8_kernel.cu 253 + ffi/gemm.rs
+  +20 + tensor.rs +55 + linear.rs +142 + wins entry 86). Substrate
+  END-TO-END VALIDATED:
   Full validation trace:
   - `077b600` compile smoke PASS
   - `a0758e7` Strategy A' validation
