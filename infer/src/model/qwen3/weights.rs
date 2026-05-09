@@ -149,6 +149,16 @@ impl Qwen3Mlp {
             }
     }
 
+    pub(super) fn uses_hybrid_w4_marlin(&self) -> bool {
+        self.down_proj.is_hybrid_w4_marlin()
+            || match &self.gate_up {
+                Qwen3GateUp::Separate { gate_proj, up_proj } => {
+                    gate_proj.is_hybrid_w4_marlin() || up_proj.is_hybrid_w4_marlin()
+                }
+                Qwen3GateUp::Fused { gate_up_proj } => gate_up_proj.is_hybrid_w4_marlin(),
+            }
+    }
+
     pub(super) fn uses_marlin_prefill_gemm(&self) -> bool {
         self.down_proj.has_marlin()
             || match &self.gate_up {
@@ -582,6 +592,17 @@ impl Qwen3Model {
                     || layer.attention.v_proj.is_marlin_w4a8()
                     || layer.attention.o_proj.is_marlin_w4a8()
                     || layer.mlp.uses_marlin_w4a8()
+            })
+    }
+
+    pub(super) fn uses_hybrid_w4_marlin(&self) -> bool {
+        self.output_projection().is_hybrid_w4_marlin()
+            || self.layers.iter().any(|layer| {
+                layer.attention.q_proj.is_hybrid_w4_marlin()
+                    || layer.attention.k_proj.is_hybrid_w4_marlin()
+                    || layer.attention.v_proj.is_hybrid_w4_marlin()
+                    || layer.attention.o_proj.is_hybrid_w4_marlin()
+                    || layer.mlp.uses_hybrid_w4_marlin()
             })
     }
 

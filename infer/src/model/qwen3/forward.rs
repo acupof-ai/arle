@@ -656,6 +656,7 @@ impl ModelForward for Qwen3Model {
     fn supports_mixed_batch(&self, kv_pool_format: crate::model::kv_cache::KVFormat) -> bool {
         self.prefill_uses_paged_pool()
             && self.lora.is_none()
+            && !self.uses_hybrid_w4_marlin()
             && matches!(
                 kv_pool_format,
                 crate::model::kv_cache::KVFormat::BF16

@@ -1202,7 +1202,7 @@ impl DeviceMatrix {
         self.marlin_packed.is_some()
     }
 
-    /// Whether this matrix exposes a W4A8 Marlin side path.
+    /// Whether this matrix exposes a W4A8 Marlin runtime path.
     pub fn is_marlin_w4a8(&self) -> bool {
         self.weight_format == WeightFormat::MarlinW4A8 || self.is_hybrid_w4_marlin()
     }

@@ -1624,7 +1624,11 @@ mod gguf_v_reorder_tests {
 mod tests {
     use super::*;
     #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    use crate::ops::OpsBackend;
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
     use std::path::Path;
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     const QWEN3_4B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
     const QWEN3_8B_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-8B");
@@ -1633,6 +1637,48 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/models/Qwen3-4B-W4-hybrid-zpfix"
     );
+
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    struct HybridPrefillEnvGuard {
+        old: Option<std::ffi::OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    impl Drop for HybridPrefillEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard holds the process-local env test mutex while
+            // restoring this variable, serializing all mutations in this module.
+            unsafe {
+                if let Some(old) = &self.old {
+                    std::env::set_var("INFER_HYBRID_W4A8_PREFILL", old);
+                } else {
+                    std::env::remove_var("INFER_HYBRID_W4A8_PREFILL");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    fn hybrid_prefill_env(value: Option<&str>) -> HybridPrefillEnvGuard {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = std::env::var_os("INFER_HYBRID_W4A8_PREFILL");
+        // SAFETY: the mutex above serializes all mutations of this variable in
+        // these tests. The test only needs process-wide env because the dispatch
+        // gate intentionally reads the runtime env on each call.
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var("INFER_HYBRID_W4A8_PREFILL", value);
+            } else {
+                std::env::remove_var("INFER_HYBRID_W4A8_PREFILL");
+            }
+        }
+        HybridPrefillEnvGuard { old, _lock: lock }
+    }
 
     #[test]
     fn quant_layout_uses_configured_bits_and_infers_group_size() {
@@ -1768,6 +1814,95 @@ mod tests {
         assert!(matrix.hybrid_w4a8_qweight.is_some());
         assert!(matrix.hybrid_w4a8_s_channel.is_some());
         assert!(matrix.hybrid_w4a8_s_group.is_some());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    fn load_hybrid_w4_marlin_dispatches_to_w4a8_prefill() -> Result<()> {
+        if !Path::new(QWEN3_4B_HYBRID_PATH).exists() {
+            eprintln!("skipping hybrid dispatch test: {QWEN3_4B_HYBRID_PATH} is absent");
+            return Ok(());
+        }
+
+        let ctx = DeviceContext::new()?;
+        let (shard_paths, weight_map) = load_shard_info(QWEN3_4B_HYBRID_PATH)?;
+        let mmaps = mmap_shards(&shard_paths)?;
+        let shards = mmaps
+            .iter()
+            .map(|mmap| {
+                SafeTensors::deserialize(mmap)
+                    .map_err(|e| anyhow::anyhow!("Deserialize error: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let config = QuantLoadConfig::from_model_path(QWEN3_4B_HYBRID_PATH)?;
+        let matrix = load_tensor_2d_maybe_quantized_with_config(
+            &ctx,
+            &shards,
+            &weight_map,
+            "model.layers.0.mlp.gate_proj.weight",
+            config,
+        )?;
+        assert!(matrix.is_hybrid_w4_marlin());
+
+        let host = vec![bf16::from_f32(0.125); matrix.cols * 16];
+        let data = ctx
+            .stream
+            .clone_htod(&host)
+            .map_err(|e| anyhow::anyhow!("H2D test hidden states failed: {e}"))?;
+        let input = cuda_kernels::prelude::HiddenStates {
+            data,
+            hidden_dim: matrix.cols,
+            seq_len: 16,
+        };
+
+        {
+            let _env = hybrid_prefill_env(None);
+            let decode_backend = crate::ops::CudaOpsBackend::new(&ctx);
+            let decode_host = vec![bf16::from_f32(0.125); matrix.cols];
+            let decode_input = DeviceVec::from_host(&ctx, &decode_host)?;
+            let mut decode_out = DeviceVec::zeros(&ctx, matrix.rows)?;
+            decode_backend.linear_vec_into(&matrix, &decode_input, &mut decode_out)?;
+            ctx.sync()?;
+
+            let prefill_backend = crate::ops::CudaOpsBackend::prefill(&ctx);
+            let mut out =
+                cuda_kernels::prelude::HiddenStates::zeros(&ctx, matrix.rows, input.seq_len)?;
+            let err = match prefill_backend.linear_batch_into(&matrix, &input, &mut out) {
+                Ok(_) => {
+                    anyhow::bail!("default-off hybrid prefill dispatch unexpectedly succeeded")
+                }
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("INFER_HYBRID_W4A8_PREFILL=1"),
+                "unexpected default-off hybrid dispatch error: {err}"
+            );
+        }
+
+        {
+            let _env = hybrid_prefill_env(Some("1"));
+            assert_eq!(
+                crate::ops::linear_kernel_plan_for_test(&matrix, 2, false),
+                "MarlinW4Gemm"
+            );
+            assert_eq!(
+                crate::ops::linear_kernel_plan_for_test(&matrix, 1, true),
+                "MarlinW4Gemm"
+            );
+            assert_eq!(
+                crate::ops::linear_kernel_plan_for_test(&matrix, 2, true),
+                "MarlinW4Hybrid"
+            );
+            let prefill_backend = crate::ops::CudaOpsBackend::prefill(&ctx);
+            let mut out =
+                cuda_kernels::prelude::HiddenStates::zeros(&ctx, matrix.rows, input.seq_len)?;
+            prefill_backend.linear_batch_into(&matrix, &input, &mut out)?;
+            assert_eq!(out.hidden_dim, matrix.rows);
+            assert_eq!(out.seq_len, input.seq_len);
+            ctx.sync()?;
+        }
+
         Ok(())
     }
 
