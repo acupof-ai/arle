@@ -189,6 +189,13 @@ ARLE tok/s within 5% of SGLang  (≥0.95×)
 
 触发动作：S5 prefill TFLOPs < SGLang 50% → 接受差距 < 5% 进 wins；≥ 5% 时**开 errors/ 立项独立 "FP8 prefill tensor-core kernel" 工程**，Phase 1 接受 degraded 收尾。
 
+2026-05-09 same-machine reverify:
+[`wins/2026-05-09-bench-sglang-reverify-post-p1.0-p1.2.md`](../experience/wins/2026-05-09-bench-sglang-reverify-post-p1.0-p1.2.md)
+shows P1.0+P1.2 did not close the prefill-dominant 4k/c=4 gap:
+ARLE TTFT p50 1639.3 ms vs SGLang 928.4 ms (+76.6% slower for ARLE).
+Short 256/256 TTFT favors ARLE, so the next high-leverage investigation is
+prefill-path architecture rather than decode-only dispatch wiring.
+
 ---
 
 ## 8 · Phase 2 — Long-ctx Speculative Decode (MagicDec/TriForce)
