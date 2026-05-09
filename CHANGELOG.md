@@ -21,6 +21,21 @@ Related governance docs:
 
 ### CUDA
 
+- **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
+  PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
+  graph allocation key reduces capture key churn from 388 unique → **7
+  unique** (98% reduction) with **98.5% LRU dominant key reuse rate**.
+  Engine-side TTFT p50 **2000ms → 150ms = -92.5%** improvement on
+  4k/c=4 prefill-dominant workload (server-side ground truth via
+  `/v1/stats engine_ttft_us`; client-side guidellm 0.6.0 TTFT
+  measurement separately broken per `e8d82b0` — bench tool bug, not
+  substrate). Throughput **+632%** in matched-control 60s window
+  (53 → 388 requests). Codex's "second-order bucketing" insight
+  (captured scalar launch parameters use bucket capacity, not exact
+  dim from first capture) was load-bearing for the win and added to
+  skill v1.7.0 anti-pattern catalog. Followup: n=3 σ-tight re-bench +
+  guidellm streaming fix. Evidence:
+  [`docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`](docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md).
 - W4-hybrid Qwen3 paged-prefill **CUDA Graph capture** lands as opt-in
   via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1` (`35fc3cf`).
   Phase 1 functional gate: prefill-lifetime `MarlinPrefillScratch`
