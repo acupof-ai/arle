@@ -16,7 +16,7 @@ use crate::weight_loader::{
     QuantLoadConfig, load_tensor_1d, load_tensor_1d_f32, load_tensor_1d_f32_sharded,
     load_tensor_1d_fused_segments_sharded, load_tensor_1d_sharded, load_tensor_2d,
     load_tensor_2d_fused_column_segments_sharded, load_tensor_2d_maybe_quantized_with_config,
-    load_tensor_2d_sharded, precompute_rope, resolve_rope_cache_len,
+    load_tensor_2d_sharded, precompute_rope_with_qwen35_scaling, resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -447,8 +447,13 @@ impl Qwen35Model {
             config.rotary_dim
         );
         let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
-        let (cos_cache, sin_cache) =
-            precompute_rope(&ctx, config.rotary_dim, rope_cache_len, config.rope_theta)?;
+        let (cos_cache, sin_cache) = precompute_rope_with_qwen35_scaling(
+            &ctx,
+            config.rotary_dim,
+            rope_cache_len,
+            config.rope_theta,
+            config.rope_scaling.as_ref(),
+        )?;
 
         ctx.sync()?;
         info!(
@@ -649,7 +654,7 @@ impl Qwen35Model {
         use crate::qwen35_gguf_host::Qwen35LinearGgufLayout;
         use crate::weight_loader::{
             load_tensor_1d_gguf_offset_norm, load_tensor_2d_gguf,
-            load_tensor_2d_gguf_v_reorder_rows, precompute_rope,
+            load_tensor_2d_gguf_v_reorder_rows, precompute_rope_with_qwen35_scaling,
         };
 
         let linear_layout = Qwen35LinearGgufLayout::from_config(config)?;
@@ -835,8 +840,13 @@ impl Qwen35Model {
         // stride=rotary_dim=64 → every position > 0 read garbage trig values,
         // collapsing attention to prompt-independent degenerate output.
         let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
-        let (cos_cache, sin_cache) =
-            precompute_rope(ctx, config.rotary_dim, rope_cache_len, config.rope_theta)?;
+        let (cos_cache, sin_cache) = precompute_rope_with_qwen35_scaling(
+            ctx,
+            config.rotary_dim,
+            rope_cache_len,
+            config.rope_theta,
+            config.rope_scaling.as_ref(),
+        )?;
 
         ctx.sync()?;
         info!(
