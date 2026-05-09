@@ -49,6 +49,11 @@ enum LinearKernelPlan {
     MarlinW4Gemm,
     MarlinW4A8Gemm,
     MarlinW4Hybrid,
+    /// PF8.4 — Prefill-only W4+FP8 marlin GEMM dispatch (PF8.3 kernel pending).
+    /// Opt-in via `INFER_MARLIN_W4_FP8_PREFILL=1` env var. Decode path
+    /// keeps existing W4A8 (FP8 mma is wrong lever for HBM-bound decode
+    /// per docs/research/2026-05-10-phase0a-decode-kill-architectural-implication.md).
+    MarlinW4FP8Prefill,
     TurboQuantGemv,
     TurboQuantDequantCublasGemm,
 }
@@ -73,6 +78,15 @@ impl LinearKernelPlan {
     }
 
     fn batched(weight: &DeviceMatrix, batch: usize, phase: LinearDispatchPhase) -> Self {
+        // PF8.4 — opt-in W4+FP8 prefill dispatch (decode keeps W4+INT8).
+        // Currently bails at call site since PF8.3 GEMM kernel pending.
+        if phase == LinearDispatchPhase::Prefill
+            && batch > 1
+            && marlin_w4_fp8_prefill_enabled()
+            && marlin_w4a8_aligned(weight).is_ok()
+        {
+            return Self::MarlinW4FP8Prefill;
+        }
         if weight.is_hybrid_w4_marlin() {
             if phase == LinearDispatchPhase::Prefill && batch > 1 && hybrid_w4a8_prefill_enabled() {
                 if hybrid_w4a8_aligned(weight).is_ok() {
@@ -217,6 +231,18 @@ fn turboquant_params(weight: &DeviceMatrix) -> (i32, i32, i32, i32, i32, i32) {
 fn hybrid_w4a8_prefill_enabled() -> bool {
     matches!(
         std::env::var("INFER_HYBRID_W4A8_PREFILL").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// PF8.4 — opt-in for prefill-only W4+FP8 marlin GEMM dispatch.
+/// Enabled when `INFER_MARLIN_W4_FP8_PREFILL=1` env var is set.
+/// Decode path stays W4+INT8 unchanged (FP8 mma doesn't help HBM-bound
+/// decode per Phase 0 P0.A architectural KILL synthesis).
+/// PF8.3 kernel implementation pending — currently bails at call site.
+fn marlin_w4_fp8_prefill_enabled() -> bool {
+    matches!(
+        std::env::var("INFER_MARLIN_W4_FP8_PREFILL").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
@@ -476,6 +502,7 @@ pub(crate) fn linear_kernel_plan_for_test(
         LinearKernelPlan::MarlinW4Gemm => "MarlinW4Gemm",
         LinearKernelPlan::MarlinW4A8Gemm => "MarlinW4A8Gemm",
         LinearKernelPlan::MarlinW4Hybrid => "MarlinW4Hybrid",
+        LinearKernelPlan::MarlinW4FP8Prefill => "MarlinW4FP8Prefill",
         LinearKernelPlan::TurboQuantGemv => "TurboQuantGemv",
         LinearKernelPlan::TurboQuantDequantCublasGemm => "TurboQuantDequantCublasGemm",
     }
@@ -1938,6 +1965,17 @@ pub(crate) fn try_gemm_with_phase_and_scratch_into(
             } else {
                 run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
             }
+        }
+        LinearKernelPlan::MarlinW4FP8Prefill => {
+            // PF8.4 — opt-in dispatch reached via INFER_MARLIN_W4_FP8_PREFILL=1.
+            // PF8.3 GEMM kernel implementation pending (codex pickup per
+            // docs/research/2026-05-10-pf8.3-scope-analysis-mma-shape-mismatch.md).
+            // PF8.1 (BF16→FP8 act quant) + PF8.2 (INT4 weight preprocess)
+            // already landed in 940f49e and runtime-verified (b628eca + 451d094).
+            anyhow::bail!(
+                "MarlinW4FP8Prefill: PF8.3 FP8 marlin GEMM kernel not yet implemented. \
+                 Unset INFER_MARLIN_W4_FP8_PREFILL or set =0 to fall back to W4+INT8."
+            );
         }
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);
