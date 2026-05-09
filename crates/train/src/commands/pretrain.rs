@@ -286,6 +286,7 @@ impl PretrainFamily for Qwen3Family {
             max_position_embeddings: args.max_position_embeddings,
             rms_norm_eps: args.rms_norm_eps,
             rope_theta: args.rope_theta,
+            rope_scaling: None,
             tie_word_embeddings: args.tie_word_embeddings,
         };
         cfg.validate()?;

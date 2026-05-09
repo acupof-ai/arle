@@ -91,6 +91,45 @@ impl Qwen3LayerTensorNames {
     }
 }
 
+/// Long-context RoPE scaling config (HF transformers / SGLang
+/// `rope_scaling` schema). `None` ⇒ vanilla RoPE with `rope_theta` base.
+/// Applied during `precompute_rope` to extend native context window.
+///
+/// Per `docs/plans/M_rope-yarn-scaling.md` Phase 1a:config 接인 only;
+/// inv_freq compute integration (Phase 1b-2) is the codex-pickup work.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RopeScalingConfig {
+    /// YARN scaling (Peng et al. 2023). Used by Qwen3.6 long-ctx,
+    /// DeepSeek V3, Llama 3.1.
+    Yarn {
+        factor: f32,
+        original_max_position_embeddings: usize,
+        #[serde(default = "default_yarn_beta_fast")]
+        beta_fast: f32,
+        #[serde(default = "default_yarn_beta_slow")]
+        beta_slow: f32,
+        #[serde(default)]
+        attention_factor: Option<f32>,
+        #[serde(default = "default_yarn_mscale")]
+        mscale: f32,
+    },
+    /// Linear position interpolation (Chen et al. 2023).
+    Linear { factor: f32 },
+    /// NTK-aware scaling (kaiokendev 2023).
+    NtkAware { factor: f32 },
+}
+
+fn default_yarn_beta_fast() -> f32 {
+    32.0
+}
+fn default_yarn_beta_slow() -> f32 {
+    1.0
+}
+fn default_yarn_mscale() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Qwen3Config {
     pub hidden_size: usize,
@@ -103,6 +142,8 @@ pub struct Qwen3Config {
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
     pub tie_word_embeddings: bool,
     pub max_position_embeddings: usize,
 }
@@ -423,6 +464,97 @@ mod tests {
         let names = cfg.layer_tensor_names(0);
         assert_eq!(names.shard_for("model.layers.0.unknown.weight"), None);
         assert_eq!(cfg.shard_for_global_tensor("not.a.tensor"), None);
+    }
+
+    #[test]
+    fn parses_yarn_rope_scaling() {
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "rope_scaling": {
+                    "type": "yarn",
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 32768
+                },
+                "tie_word_embeddings": false,
+                "max_position_embeddings": 131072
+            }"#,
+        )
+        .unwrap();
+
+        match cfg.rope_scaling {
+            Some(RopeScalingConfig::Yarn {
+                factor,
+                original_max_position_embeddings,
+                beta_fast,
+                beta_slow,
+                attention_factor,
+                mscale,
+            }) => {
+                assert_eq!(factor, 4.0);
+                assert_eq!(original_max_position_embeddings, 32768);
+                assert_eq!(beta_fast, 32.0);
+                assert_eq!(beta_slow, 1.0);
+                assert_eq!(attention_factor, None);
+                assert_eq!(mscale, 1.0);
+            }
+            _ => panic!("expected Yarn rope_scaling"),
+        }
+    }
+
+    #[test]
+    fn parses_linear_and_ntk_rope_scaling() {
+        let lin = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 2048, "intermediate_size": 5632, "num_hidden_layers": 24,
+                "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+                "rope_scaling": { "type": "linear", "factor": 2.0 },
+                "tie_word_embeddings": true, "max_position_embeddings": 65536
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lin.rope_scaling,
+            Some(RopeScalingConfig::Linear { factor: 2.0 })
+        );
+
+        let ntk = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 2048, "intermediate_size": 5632, "num_hidden_layers": 24,
+                "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+                "rope_scaling": { "type": "ntk_aware", "factor": 4.0 },
+                "tie_word_embeddings": true, "max_position_embeddings": 131072
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ntk.rope_scaling,
+            Some(RopeScalingConfig::NtkAware { factor: 4.0 })
+        );
+    }
+
+    #[test]
+    fn missing_rope_scaling_defaults_to_none() {
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 2048, "intermediate_size": 5632, "num_hidden_layers": 24,
+                "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+                "tie_word_embeddings": true, "max_position_embeddings": 32768
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_scaling, None);
     }
 
     #[test]
