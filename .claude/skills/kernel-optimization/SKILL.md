@@ -608,6 +608,124 @@ Each anti-pattern has a project commit/entry where it was paid for.
       the session that wrote them. Both share "audit before trust"
       discipline.
 
+20. **Phase 0 root-cause hypothesis inheritance trap**
+    - Caught by: `c076aae` (audit-of-audit on `1fdd763`). Phase 0
+      source audit verified file paths/LOC/comment claims (4/4 SOLID)
+      but inherited the upstream "cold prefill GEMM = 33% degraded
+      path" hypothesis without re-evidencing it. The c20b1ce attribution
+      chain that followed turned out to be NO-OP (see #22).
+    - Without methodology, Phase 0 substrate audits feel "complete"
+      because the immediate file-existence/path/LOC claims verify,
+      but the causal chain that motivates the work is itself a
+      hypothesis that wasn't re-checked at audit time.
+    - Fix: Phase 0 audit must restate the **root-cause chain** being
+      implemented and explicitly mark which links are evidenced vs
+      hypothesis. License-or-kill gates inserted appropriately at
+      hypothesis links. "Audit's audit" catches the inheritance trap.
+    - Companion to anti-pattern #25 (hypothesis-context vs
+      implementation-context mismatch): both are forms of unstated
+      assumption propagating into substrate work.
+
+21. **Recipe-itself audit gap (recipe artifacts un-dry-run-audited)**
+    - Caught by: `b55bfcd` (block-as-rvalue scoping fix on `2fafa9e`
+      Phase 1.A nvtx recipe — would have failed compile) + `af44efa`
+      (nsys-target fix on same recipe — would have profiled python
+      bench client instead of Rust server, yielding empty NVTX data).
+      **Two empirical evidence points** showing recipes need their
+      own audit before pickup application.
+    - Without methodology, recipe-style briefs (copy-paste-ready code
+      diffs, shell commands, step-by-step procedures) inherit the
+      hypothesis-vs-evidence trap as any other prescription. Writing
+      a recipe ≠ having a working recipe.
+    - Fix: post-recipe-write audit checklist:
+      (a) Syntax correctness (does diff compile? does shell parse?)
+      (b) Scoping correctness (bindings reach later uses? guards drop right?)
+      (c) Tool/file existence (script exists? expected interface?)
+      (d) Side effects / data flow (does profiling target match data source?)
+      (e) For shell recipes: `--help` / `--dry-run` audit before pickup.
+
+22. **Twin-commit fix attribution trap**
+    - Caught by: `919c0fb` (silent-fail discovery) + `8d91d20` (NO-OP
+      finding) + `3fea979` (Layer-7 closure: `12300c5` was the actual
+      fix, `c20b1ce` is dead cosmetic). 7-layer SOLID gap chain on
+      c20b1ce attribution. Three wins entries had to be annotated with
+      corrected attribution (`655accf` + `9bc4729`).
+    - Without methodology, when two commits co-ship as "fix the issue",
+      default attribution to BOTH causes future readers to repeat the
+      no-op fix in similar situations. One may be the real fix, other
+      may be no-op cosmetic OR config-no-op (NO-OP when num_slots ≥
+      prefill_cap config) OR silent-fail (silent-break when slot-out-
+      of-bounds).
+    - Fix: revert each in turn, measure individual contribution.
+      License criteria 3-level escalation:
+      (1) Code logic correct
+      (2) Effect measurable in target environment
+      (3) Attribution validated by controlled A/B (Layer-8: fix
+          confounding variables, e.g. num_slots constant across cells)
+
+23. **Truncated-output partial-view trap**
+    - Caught by: `156d2c2` (false-alarm self-audit). Cargo test output
+      shows multiple test-binary results; tail-only view of "0 passed
+      M filtered out" can mislead because it's from one specific
+      binary that doesn't contain the target test. Truncated middle
+      contains the actual lib-tests pass.
+    - Without methodology, hasty alarm raised on partial output wastes
+      cycles. Codex was correctly interpreting full 165-line output;
+      Claude flagged based on tail only.
+    - Fix: before raising concern from truncated tool output, verify
+      (a) target's gating compiles under given flags, (b) required
+      runtime dependencies (paths/env/feature flags) satisfied,
+      (c) cross-reference middle of truncated output for actual
+      target binary's run result, (d) understand multi-binary semantics
+      (cargo test runs N binaries, each filters independently).
+
+24. **Cell-collapse blindness in N-cell A/B design**
+    - Caught by: `1ccb448` (post-P0.2 cell-collapse finding). When
+      designing 4-cell A/B for c20b1ce attribution kill, post-P0.2
+      revert of c20b1ce permanently changed substrate state, making
+      cells (a) and (d) identical on current main. Without the audit,
+      tomorrow's pickup would have written redundant cell (a) recipe
+      and run duplicate experiment.
+    - Without methodology, cell INDEPENDENCE under current substrate
+      state may break when substrate changes between A/B design time
+      and execution time.
+    - Fix: after each substrate landing, re-derive each cell's required
+      edits and check for identity overlaps. If 2 cells differ only
+      in dimensions current main has already normalized, they collapse
+      to single experiment. Same applies to cell (b) which may become
+      non-reproducible if substrate change is permanent.
+
+25. **Hypothesis-context vs implementation-context mismatch (the bench-only blindspot)**
+    - Caught by: `fe9ea8a` (preliminary KILL bench) + `3b9cc06`
+      (refined batch∈2..=8 gate ALSO killed). Both Claude's Phase 0
+      audit (`6ade2d4`) AND Codex's audit-of-audit (`5bb99d7`)
+      verified syntactic correctness ("override condition compiles
+      type-safely"). Both missed semantic context check ("in which
+      batch contexts does override actually fire?"). Override fired
+      in PREFILL (batch=4096) where W4A16BatchGemv loses to Marlin
+      tensor-core, opposite of decode-target hypothesis. Bench
+      showed +37% ITL regression.
+    - **Critical methodology lesson: bidirectional code-level audit
+      can share mental-model blindspot. Empirical bench is the truly
+      orthogonal SOLID layer.** Audit chains examine the same claim
+      space; only running the actual workload reveals semantic
+      context-mismatches.
+    - Without methodology, hypothesis target context (e.g. "decode
+      M ≤ 8") and implementation firing context (e.g. "batch > 1
+      includes prefill") drift apart, override leaks into untested
+      contexts where cost-tradeoffs invert.
+    - Fix:
+      (a) Phase 0.5 context-semantics check after Phase 0 syntax +
+          audit-of-audit syntax-of-syntax. What conditions does the
+          implementation fire under? Are those conditions a SUBSET of
+          the hypothesis target context? If broader, gate more narrowly
+          OR explicitly accept broader scope with separate per-context
+          evidence.
+      (b) For high-stakes axis selections (LICENSE bench, strategic
+          axis), include a smoke-bench step BEFORE declaring audit
+          complete, not after. Saves audit-blindspot-grounded LANDS
+          that bench reveals as KILLED post-substrate.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -692,13 +810,22 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.5.0** | **2026-05-08** | **17** | **`f05ea3a` added #15-17 from cap=8 chain** |
 | **v1.5.1** | **2026-05-08** | **17(refined)** | **`9f65b4d` #17 workload-shape refinement per `063da81`** |
 | **v1.6.0** | **2026-05-09** | **18** | **`125f795` added #18 Phase 0 substrate audit per `1217375` A1 audit + B3 Step 2 -30% scope** |
-| **v1.7.0** | **2026-05-09** | **19** | **(this commit) added #19 dispatch directive path verification per `8935851` index.md broken link + `de8b4dc` pickup queue stale path** |
+| **v1.7.0** | **2026-05-09** | **19** | **`c768b70` added #19 dispatch directive path verification per `8935851` index.md broken link + `de8b4dc` pickup queue stale path** |
+| **v1.8.0** | **2026-05-09** | **25** | **(this commit) batch-added #20-25 from c20b1ce attribution + R4#6 KILL + recipe audit chain. Anti-pattern theme: "audit at every prescription layer including recipes themselves"; key lesson: empirical bench is truly orthogonal SOLID layer that catches what bidirectional code audits both miss (#25 evidence). Sources: `c076aae` #20 / `b55bfcd`+`af44efa` #21 (2 evidence points) / `919c0fb`+`8d91d20`+`3fea979` #22 / `156d2c2` #23 / `1ccb448` #24 / `fe9ea8a`+`3b9cc06` #25** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
 verification added empirical evidence that compounded into rule
 sophistication。Skill rules accumulate via empirical evidence,not
 upfront design。
+
+**v1.8.0 batch trigger evidence**:6 anti-patterns emerged from 2 parallel
+audit cycles in single 24h cron-loop session(c20b1ce 30-stage main +
+R4#6 7-stage orthogonal)。Both cycles closed via empirical evidence
+(c20b1ce attribution corrected via 7-layer chain;R4#6 KILLED via 2
+benches)。Anti-pattern #25 itself has 2 audit evidence points(`fe9ea8a`
+preliminary + `3b9cc06` refined-gate-also-fails),demonstrating "bench
+is truly orthogonal SOLID layer" empirically。
 
 For future maintainers:when adding new anti-patterns,reference the
 specific source commit + research entry that triggered the rule。
