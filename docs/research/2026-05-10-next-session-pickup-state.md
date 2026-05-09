@@ -71,7 +71,11 @@ status: session-end-checkpoint-for-next-pickup
 
 ### Codex's natural pickup (highest leverage)
 
-**PF8.3 FP8 marlin GEMM kernel** (~800-1200 LOC, 1-2 days codex)
+**PF8.3 FP8 marlin GEMM kernel** (~800-1200 LOC, 1-2 days codex) —
+**STATUS: codex briefed via tmux paste-buffer THIS tick + Working
+(2s)**. Brief: `/tmp/codex_brief_pf83.txt`. Strategy B selected
+(single-template mirror, NOT verbatim port — m16n8k16→m16n8k32 mma
+shape mismatch per `259277c`).
 - Brief in `a66d99a` §1 + scope analysis in `259277c`
 - Dispatch wiring already landed (`db063ff`); just plug kernel call
   into bail site at `infer/src/ops/linear.rs:1966+`
