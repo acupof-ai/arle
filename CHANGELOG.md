@@ -19,6 +19,53 @@ Related governance docs:
 
 ## [Unreleased]
 
+### CUDA
+
+- W4-hybrid Qwen3 paged-prefill **CUDA Graph capture** lands as opt-in
+  via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1` (`35fc3cf`).
+  Phase 1 functional gate: prefill-lifetime `MarlinPrefillScratch`
+  lifecycle + multi-key 8-d graph cache (token / page layout / start_pos)
+  + W4 graphsafe weight gating for dense BF16, W4A16 Marlin, W4A8 Marlin,
+  and W4-hybrid. Default behavior unchanged when env vars unset.
+  Throughput license deferred: scout bench A vs B (graph OFF baseline
+  TTFT p50 1628.9 ms vs graph ON 1627.8 ms = Δ -0.07%) detected
+  capture-key churn — Path A multi-key direction KILLED, Path B
+  device-memory `start_pos` re-licensed P0 (`e462c53`). Evidence:
+  [`docs/experience/wins/2026-05-10-bench-p24-w4a8-prefill-graph-hoist.md`](docs/experience/wins/2026-05-10-bench-p24-w4a8-prefill-graph-hoist.md),
+  [`docs/experience/errors/2026-05-10-37-throughput-bench-killed-pathA-multikey-churn.md`](docs/experience/errors/2026-05-10-37-throughput-bench-killed-pathA-multikey-churn.md).
+
+### Long-context (cross-backend)
+
+- **RoPE scaling support** (YARN / Linear / NtkAware) wired through
+  `Qwen3Config::rope_scaling` and `Qwen35Config::rope_scaling` (Phase
+  1+2 closed via 7 atomic commits + 51 unit tests). Helpers
+  `compute_scaled_inv_freq` and `compute_attention_factor` ship in both
+  spec crates. CUDA backend integration via
+  `weight_loader::precompute_rope_with_scaling` (qwen3 path) +
+  `precompute_rope_with_qwen35_scaling` thin shim. Vanilla path
+  (`rope_scaling = None`) is bit-equivalent to the legacy
+  `precompute_rope` formula (verified by
+  `vanilla_inv_freq_matches_legacy_formula` test). Long-ctx bench
+  validation (Qwen3-4B 64k YARN×2 / 128k YARN×4 + FP8 KV) deferred to
+  Phase 3; CUDA-side viable on RTX 4070 Ti SUPER 16 GB per
+  [`docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md`](docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md).
+  Apply to a model dir via [`scripts/setup_qwen3_yarn_config.py`](scripts/setup_qwen3_yarn_config.py).
+  Consolidation:
+  [`docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`](docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md).
+
+### Structured-output (xgrammar)
+
+- `crates/xgrammar-sys` Rust safe wrapper over upstream
+  `mlc-ai/xgrammar` v0.1.34 lands as Phase 1 FFI scaffold (codex's #26).
+  Default build is a stub that compiles without native sources or
+  network; `--features real` builds a C++ shim against a pinned
+  upstream checkout via `cc`. Wrapper surface:
+  `GrammarCompiler` / `CompiledGrammar` / `GrammarMatcher` /
+  `bitmask_size` / per-step bitmask fill APIs. No HTTP, scheduler,
+  sampler, or GPU sampling integration yet — that is follow-up
+  tranche work. Plan:
+  [`docs/plans/M_xgrammar-ffi-scaffold.md`](docs/plans/M_xgrammar-ffi-scaffold.md).
+
 ### Metal
 
 - Qwen3.5-0.8B MLX 4bit single-request step-driver reaches 305.5 tok/s mean
