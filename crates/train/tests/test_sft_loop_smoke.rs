@@ -30,6 +30,8 @@ fn sft_loop_smoke_trains_and_roundtrips() -> TestResult {
         max_position_embeddings: 32,
         rms_norm_eps: 1.0e-6,
         rope_theta: 10_000.0,
+
+        rope_scaling: None,
         tie_word_embeddings: false,
     };
     let dataset = tiny_sft_examples();

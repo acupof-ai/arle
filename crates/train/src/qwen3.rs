@@ -954,6 +954,7 @@ mod tests {
             max_position_embeddings: 8,
             rms_norm_eps: 1.0e-6,
             rope_theta: 10_000.0,
+            rope_scaling: None,
             tie_word_embeddings: false,
         };
 

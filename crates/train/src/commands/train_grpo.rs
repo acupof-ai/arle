@@ -1383,6 +1383,7 @@ mod tests {
             max_position_embeddings: 16,
             rms_norm_eps: 1.0e-6,
             rope_theta: 10_000.0,
+            rope_scaling: None,
             tie_word_embeddings: false,
         };
         let lora = LoraConfig {

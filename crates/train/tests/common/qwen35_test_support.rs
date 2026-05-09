@@ -167,6 +167,8 @@ fn base_qwen35_config() -> Qwen35Config {
         linear_value_head_dim: 8,
         linear_conv_kernel_dim: 4,
         rope_theta: 10_000.0,
+
+        rope_scaling: None,
         partial_rotary_factor: 1.0,
         rotary_dim: 16,
         rope_cache_len_hint: Some(32),
@@ -202,6 +204,8 @@ fn tiny_base_qwen35_config(max_seq_len: usize, vocab_size: usize) -> Qwen35Confi
         linear_value_head_dim: 8,
         linear_conv_kernel_dim: 4,
         rope_theta: 10_000.0,
+
+        rope_scaling: None,
         partial_rotary_factor: 1.0,
         rotary_dim: 8,
         rope_cache_len_hint: Some(max_seq_len),

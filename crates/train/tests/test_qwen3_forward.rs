@@ -16,6 +16,8 @@ fn qwen3_forward_smoke_tiny_config() -> TestResult {
         max_position_embeddings: 32,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+
+        rope_scaling: None,
         tie_word_embeddings: false,
     };
 
