@@ -72,6 +72,7 @@
 //! | `infer_session_affinity_hit_total` | counter | Session-tagged requests that reused a prefix |
 //! | `infer_session_affinity_miss_total` | counter | Session-tagged requests without prefix reuse |
 //! | `infer_session_slot_pressure_evictions_hard_total` | counter | Inactive session slots evicted under hard pressure |
+//! | `infer_prefix_aware_admit_deferrals_total` | counter | Cold admission candidates deferred by PrefixAware soft-cap |
 //! | `infer_matched_prefix_tokens` | gauge | Matched prefix tokens for the most recent prefix lookup |
 //! | `infer_resume_prefill_tokens` | gauge | Effective prefill tokens for the most recent prefix lookup |
 //! | `infer_tier_fetch_staged_host_blocks_total` | counter | Request-weighted staged blocks found in T1 |
@@ -236,6 +237,7 @@ struct MetricsInner {
     pub session_affinity_hit_total: AtomicU64,
     pub session_affinity_miss_total: AtomicU64,
     pub session_slot_pressure_evictions_hard_total: AtomicU64,
+    pub prefix_aware_admit_deferrals_total: AtomicU64,
     pub tier_fetch_staged_host_blocks_total: AtomicU64,
     pub tier_fetch_staged_disk_blocks_total: AtomicU64,
     pub tier_fetch_staged_remote_blocks_total: AtomicU64,
@@ -345,6 +347,7 @@ impl ServerMetrics {
                 session_affinity_hit_total: AtomicU64::new(0),
                 session_affinity_miss_total: AtomicU64::new(0),
                 session_slot_pressure_evictions_hard_total: AtomicU64::new(0),
+                prefix_aware_admit_deferrals_total: AtomicU64::new(0),
                 tier_fetch_staged_host_blocks_total: AtomicU64::new(0),
                 tier_fetch_staged_disk_blocks_total: AtomicU64::new(0),
                 tier_fetch_staged_remote_blocks_total: AtomicU64::new(0),
@@ -624,6 +627,13 @@ impl ServerMetrics {
         self.inner
             .session_slot_pressure_evictions_hard_total
             .fetch_add(slots as u64, Ordering::Relaxed);
+    }
+
+    /// Record a cold request deferred by PrefixAwareAdmission's soft cap.
+    pub fn record_prefix_aware_admit_deferral(&self) {
+        self.inner
+            .prefix_aware_admit_deferrals_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Set the number of currently-active requests.
@@ -1119,6 +1129,12 @@ impl ServerMetrics {
             .load(Ordering::Relaxed)
     }
 
+    pub fn prefix_aware_admit_deferrals_total(&self) -> u64 {
+        self.inner
+            .prefix_aware_admit_deferrals_total
+            .load(Ordering::Relaxed)
+    }
+
     pub fn tier_fetch_staged_host_blocks_total(&self) -> u64 {
         self.inner
             .tier_fetch_staged_host_blocks_total
@@ -1382,6 +1398,7 @@ mod tests {
             128,
             64,
         );
+        m.record_prefix_aware_admit_deferral();
         m.record_tier_fetch_plan(2, 3, 4);
         m.record_tier_fetch_promoted(6);
         m.record_tier_fetch_fallback();
@@ -1486,6 +1503,9 @@ mod tests {
                 "infer_session_slot_pressure_evictions_hard_total{model=\"Qwen3-4B\",} 0"
             )
         );
+        assert!(
+            rendered.contains("infer_prefix_aware_admit_deferrals_total{model=\"Qwen3-4B\",} 1")
+        );
         assert!(rendered.contains("infer_matched_prefix_tokens{model=\"Qwen3-4B\",} 64"));
         assert!(rendered.contains("infer_resume_prefill_tokens{model=\"Qwen3-4B\",} 64"));
         assert!(
@@ -1541,6 +1561,7 @@ mod tests {
         m.record_tier_fetch_promoted(2);
         m.record_tier_fetch_fallback();
         m.record_session_slot_pressure_evictions_hard(3);
+        m.record_prefix_aware_admit_deferral();
         m.record_metal_decode_batch(4);
         m.record_metal_decode_scalar_row();
         m.record_metal_decode_batch_fallback(3);
@@ -1578,6 +1599,7 @@ mod tests {
         assert!(s.contains("session_affinity_hit=1"));
         assert!(s.contains("session_affinity_miss=0"));
         assert!(s.contains("session_slot_pressure_evictions_hard=3"));
+        assert!(s.contains("prefix_aware_admit_deferrals=1"));
         assert!(s.contains("matched_prefix_tokens=32"));
         assert!(s.contains("resume_prefill_tokens=96"));
         assert!(s.contains("tier_recall=66.7%"));
@@ -1611,6 +1633,7 @@ mod tests {
         m.record_prefill_path_mixed_ok_true();
         m.record_prefill_path_mixed_ok_false("prefill_seq_len_mismatch");
         m.record_prefill_path_mixed_ok_false("scheduler_pre_dispatch_fallback");
+        m.record_prefix_aware_admit_deferral();
 
         let payload = m.render_stats_json();
         assert_eq!(payload["prefix_hit_rate"], serde_json::json!(1.0));
@@ -1651,6 +1674,10 @@ mod tests {
         assert_eq!(
             payload["session_slot_pressure_evictions_hard"],
             serde_json::json!(0)
+        );
+        assert_eq!(
+            payload["prefix_aware_admit_deferrals"],
+            serde_json::json!(1)
         );
         assert_eq!(payload["matched_prefix_tokens"], serde_json::json!(64));
         assert_eq!(payload["resume_prefill_tokens"], serde_json::json!(64));

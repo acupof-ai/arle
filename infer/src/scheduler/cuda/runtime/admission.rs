@@ -348,6 +348,7 @@ impl<M: ModelForward> Scheduler<M> {
                 hint,
             };
             if !self.prefix_aware_admission_allows_plan(&candidate.plan, scan_len) {
+                self.metrics.record_prefix_aware_admit_deferral();
                 policy_deferred.push_back(candidate);
                 continue;
             }
