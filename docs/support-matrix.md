@@ -6,7 +6,7 @@ It states what the repository currently supports, what is still limited, and
 what validation exists for each area. If something is not listed as supported
 here, do not assume it is supported just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-04-28.
+State reflected here is based on repository evidence as of 2026-05-10.
 Project framing lives in [index.md §Current Positioning](index.md#current-positioning).
 
 ---
@@ -57,8 +57,8 @@ Notes:
 
 | Model family | Status | Notes |
 | --- | --- | --- |
-| Qwen3 | Supported | Primary supported family. |
-| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. Metal DFlash is Beta; see §4a for the current validation note. |
+| Qwen3 | Supported | Primary supported family. Native max ctx 40960. **Long-context RoPE scaling** (YARN / Linear / NtkAware) supported via `Qwen3Config::rope_scaling` (config接인 `e30bffe..da53d81`); apply via `scripts/setup_qwen3_yarn_config.py` to extend native 40k → 64k YARN×2 / 128k YARN×4 (CUDA-side viable, ≤ 16 GB GPU per `docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md`). Bench validation pending. |
+| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. RoPE scaling (YARN / Linear / NtkAware) wired through `Qwen35Config::rope_scaling` for long-ctx extend (Phase 1+2 closed; Phase 3 bench pending). Metal DFlash is Beta; see §4a for the current validation note. |
 | Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. Full Qwen 3.6 serving coverage is the **#2 next-model priority** — see roadmap note below. |
 | DeepSeek V4 | In progress — substrate landing | DS0 spec crate (`crates/deepseek-spec/`) ships config + tensor-name + `Shard` annotations; runtime model skeleton (`infer/src/model/deepseek/*`) + nano autograd training (`arle train pretrain-dsv4 --deepseek-config nano`) landed 2026-05-05. MLA forward kernels, DS4 CUDA MoE forward, DS5 NCCL collectives in forward are the active blockers. Not a serving target yet. **#1 next-model priority.** |
 | Llama 3/4 | Planned | Not yet supported. |
@@ -82,6 +82,7 @@ Other "Planned" families above sit behind these two and are not actively schedul
 | INT8 KV cache | Beta | INT8 W8A16 GEMV/GEMM + INT8 KV fused-dequant decode; benchmarked. |
 | TurboQuant KV (2–4 bit) | Experimental | Fused decode attention with dequant. Fast-moving optimization area. |
 | W8 / W4 / W2 weight quantization | Beta | Native W4 GEMV path + Marlin W4 prefill (5–25× TTFT on long prompts). |
+| W4-hybrid prefill CUDA Graph capture | Opt-in (CUDA) | `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1` enables prefill-lifetime `MarlinPrefillScratch` lifecycle + multi-key 8-d graph cache for Qwen3 paged prefill on W4 / W4-hybrid. Phase 1 functional gate PASS (`35fc3cf`); throughput license deferred to Path B device-memory `start_pos` follow-up (per `errors/2026-05-10-37-throughput-bench-killed-pathA-multikey-churn.md` Path A scout Δ -0.07%). Default behavior unchanged when env vars unset. |
 | GPTQ / AWQ (W4A16) | Beta | GEMV + Marlin kernel path; format detection production-ready. |
 | GGUF loading | Beta | Supported loader path. CUDA ships the native packed Q4_K GPU kernel (`q4k_gemv_kernel` + packed fast path in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. Metal supports Qwen3.5 GGUF on Apple Silicon via the shared Rust GGUF parser; Qwen3.5-0.8B Q4_K_M defaults to exact GGUF affine/packed behavior. Set `AGENT_INFER_METAL_GGUF_NATIVE_Q4=all` for an opt-in lossy load-time conversion into MLX native q4 group64 for packed Q3/Q4/Q5/Q6/Q8 tensors. It is still slower than MLX SafeTensors 4bit, so exact K-quant Metal kernels remain a separate optimization target. |
 
@@ -142,6 +143,7 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
 | `arle serve` front door | Beta | Launches the matching serving binary (`infer`, `metal_serve`, or `cpu_serve`) from the release artifact or PATH. This is a packaging/DX front door over existing server binaries, not a second HTTP implementation. |
 | CLI built-in shell/python tools | Beta | Enabled by default for local trusted agent use. `--no-tools` disables them, and `arle --doctor` reports the detected sandbox backend (`nsjail`, `sandbox-exec`, or `bare`). Do not expose tool-enabled local agent prompts to untrusted users. |
+| Structured-output grammar (xgrammar FFI) | Scaffold (Phase 1) | `crates/xgrammar-sys` Rust safe wrapper over upstream `mlc-ai/xgrammar` v0.1.34 (codex's #26 WIP, FFI substrate landed; default build = stub, `--features real` builds C++ shim via `cc` + pinned upstream checkout). No HTTP, scheduler, sampler, or GPU sampling integration yet. Tracked under [`docs/plans/M_xgrammar-ffi-scaffold.md`](plans/M_xgrammar-ffi-scaffold.md). |
 
 ## 5a. Training Surface Matrix
 
