@@ -66,16 +66,16 @@ status: session-end-checkpoint-for-next-pickup
   on 1 diff in 27 min review = high amortized value. Skill v1.12.0+
   candidate documented (strengthen #29 OR add #33: for non-trivial
   substrate codex review is gate, not formality).
-- **codex review WEDGE flagged** (`b34de92`): final post-bug-fix review
-  pass blocked on OpenAI API via localhost:7897 proxy at PID 1867396
-  (State=S, wchan=futex_wait, 27 threads, 0:10 CPU in 49+ min). timeout(1)
-  failed (codex CLI catches SIGTERM during blocked network future).
-  PushNotification dispatched with recovery instruction (kill -TERM
-  1867396 → graceful exit → manual commit). Codex itself has self-fallback
-  ("如果继续拖过 timeout，就按已通过的门禁提交") but hasn't triggered
-  yet. Substrate is FULLY validated end-to-end; only commit blocked.
-  Skill v1.12.0+ candidate #34: timeout(1) insufficient for SIGTERM-catching
-  subprocesses; use --kill-after for hard enforcement.
+- **codex review WEDGE → RESOLVED** (`b34de92` + `647210e` errors +
+  recovery confirmed THIS tick): PID 1867396 was alive 51m+ (State=S,
+  futex_wait, 0:10 CPU) blocked on OpenAI API via localhost:7897 proxy.
+  Diagnostic ruled out infrastructure (proxy HTTP 400 in 2ms, OpenAI API
+  HTTP 401 in 393ms, other codex sessions fine). PushNotification
+  dispatched recovery (`kill -TERM 1867396`). RESOLVED: PID 1867396 GONE
+  + codex resumed pre-commit chain (standalone nvcc smoke PASS + cargo
+  check re-running PID 1871935). Skill v1.12.0+ candidate #34
+  documented: timeout(1) insufficient for SIGTERM-catching subprocesses;
+  use --kill-after for hard enforcement (or kill -9 PID directly).
 - **#34 RESOLVED** (`df37a68`): `arle data download` + `arle model
   download` CLI surfaces. Data download VERIFIED working on current
   binary (`8735361` Medusa Phase 1.A pickup chain survey). Model
