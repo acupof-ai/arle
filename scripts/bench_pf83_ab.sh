@@ -39,21 +39,21 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-# RUST_MIN_STACK=8MB: defensive against Task #43 stack overflow under
-# sustained W4A16 4k-token bench load (PID 1816462 crash at ~7min uptime
-# preceded by prefix cache pressure fallback + 331ms cleanup). Same value
-# applied to both A/B servers so it's invariant across the comparison
-# (doesn't bias TTFT/ITL measurements). Per task #43 documented mitigations.
+# RUST_MIN_STACK=32MB: bumped from 8MB after bench v3 (07:19) crashed
+# server at conc=8 (PID 1907144 core dumped). Task #43 manifests at high
+# concurrency even at 512-token prompts, not just 4k. 32MB gives 4× headroom.
+# Drop conc=8 from sweep until root cause known — keep 1,2,4 only.
+# Both A/B servers get same RUST_MIN_STACK so invariant across comparison.
 PORT="$PORT" exec scripts/bench_ab.sh \
     pf83-baseline-int8 \
     pf83-treatment-fp8 \
     --model "$MODEL" \
     --processor "$MODEL" \
-    --concurrencies 4 \
+    --concurrencies "1,2,4" \
     --max-seconds 120 \
     --warmup 10 \
-    --cmd-a "RUST_MIN_STACK=8388608 INFER_HYBRID_W4A8_PREFILL=1 INFER_MARLIN_W4_FP8_PREFILL=0 $BIN --model-path $MODEL --port $PORT \
+    --cmd-a "RUST_MIN_STACK=33554432 INFER_HYBRID_W4A8_PREFILL=1 INFER_MARLIN_W4_FP8_PREFILL=0 $BIN --model-path $MODEL --port $PORT \
              > /tmp/pf83-baseline-int8.log 2>&1 &" \
-    --cmd-b "RUST_MIN_STACK=8388608 INFER_HYBRID_W4A8_PREFILL=1 INFER_MARLIN_W4_FP8_PREFILL=1 $BIN --model-path $MODEL --port $PORT \
+    --cmd-b "RUST_MIN_STACK=33554432 INFER_HYBRID_W4A8_PREFILL=1 INFER_MARLIN_W4_FP8_PREFILL=1 $BIN --model-path $MODEL --port $PORT \
              > /tmp/pf83-treatment-fp8.log 2>&1 &" \
     "$@"
