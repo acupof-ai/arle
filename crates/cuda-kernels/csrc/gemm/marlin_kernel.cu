@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <iostream>
 
+#include "marlin_dequant.h"
 
 constexpr int ceildiv(int a, int b) {
   return (a + b - 1) / b;
@@ -126,27 +127,10 @@ __device__ inline int lop3(int a, int b, int c) {
 }
 
 // Efficiently dequantize an int32 value into a full B-fragment of 4 fp16 values.
-// We mostly follow the strategy in the link below, with some small changes:
-// https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h
 __device__ inline FragB dequant(int q) {
-  const int LO = 0x000f000f;
-  const int HI = 0x00f000f0;
-  const int EX = 0x64006400;
-  // Guarantee that the `(a & b) | c` operations are LOP3s.
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
-  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
-  // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point directly into `SUB` and `ADD`.
-  const int SUB = 0x64086408;
-  const int MUL = 0x2c002c00;
-  const int ADD = 0xd480d480;
   FragB frag_b;
-  frag_b[0] = __hsub2(
-    *reinterpret_cast<half2*>(&lo),
-    *reinterpret_cast<const half2*>(&SUB)
-  );
-  frag_b[1] = __hfma2(
-    *reinterpret_cast<half2*>(&hi),
-    *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
+  arle::marlin::dequant<half2, arle::marlin::vllm::kU4B8.id(), false>(
+    q, reinterpret_cast<half2*>(&frag_b)
   );
   return frag_b;
 }
