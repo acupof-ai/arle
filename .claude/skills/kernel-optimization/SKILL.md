@@ -815,6 +815,128 @@ Each anti-pattern has a project commit/entry where it was paid for.
       fabrication. Always update the originating doc when a later
       audit invalidates its claim.
 
+29. **Default test fixtures may be known-broken — verify before relying on PASS/FAIL**
+    - Caught by: `eb2b4b6` (2026-05-10) — codex's #36 PrefixAware
+      Layer 2 greedy_consistency check. The default W4A8 test model
+      at `infer/tests/greedy_consistency.rs:30` (`Qwen3-4B-W4A8-marlin`)
+      is the naive max-scale checkpoint that's been known-broken
+      since #25 W4A8 accuracy fix introduced the GPTQ-calibrated
+      variant. Codex caught + overrode via
+      `INFER_TEST_W4A8_MODEL_PATH=Qwen3-4B-GPTQ-W4A8-marlin` before
+      relying on the gate.
+    - Pattern: when running existing tests as a license/kill gate
+      for a substrate change, the test's default fixture (model,
+      dataset, config) may be a known-broken artifact retained for
+      historical reasons. Test PASS doesn't necessarily mean
+      substrate works; FAIL doesn't necessarily mean substrate broke.
+    - Mitigation: before relying on a test's verdict, grep the test
+      source for fixture defaults + cross-reference against project
+      status (recent errors entries about that fixture). When in
+      doubt, override via env var to use the production-canonical
+      fixture.
+    - Companion to #28 (verify raw output not memory recall): both
+      are about VERIFYING the substrate of a claim before trusting
+      it. #28 is "verify the file content"; #29 is "verify the test
+      fixture matches what production uses".
+
+30. **Commit-time worktree race in cooperative session — `git status` BEFORE commit, not just before add**
+    - Caught by: `0d63a52` + `994a294` recovery + `ca09db0` discipline
+      demonstration (2026-05-10). Claude's `09ae5a5` commit accidentally
+      bundled codex's Substep 1.1 implementation (3 files +
+      `marlin_dequant.cuh` + `marlin_kernel.cu` mod + wins entry) with
+      Claude's unrelated `docs(research)` REVISION research entry.
+    - Failure mode: between Claude's `git add docs/research/<my-file>.md`
+      (1 file staged) and Claude's `git commit -m "..."`, codex's
+      parallel `git add` (likely `git add -A`) staged its WIP files.
+      Claude's `git commit` then captured the UNION of staged files
+      (4 files, not 1). Claude's commit message described only the
+      research entry, but the diff included codex's substantial
+      Substep 1.1 substrate.
+    - Result: codex's Phase 1.1 implementation shipped under Claude's
+      "docs(research)" commit attribution. Required follow-up
+      `0d63a52` errors entry + `994a294` build-restore (because the
+      bundled rename `.h → .cuh` left `marlin_kernel.cu` with stale
+      include).
+    - Rule: `git status --short` BEFORE `git commit` (not just before
+      `git add`). The window between `git add` and `git commit` is
+      when codex's parallel staging can race in. Recipe:
+      ```bash
+      git status --short          # check 1 (before add — the usual)
+      git add docs/my-file.md     # add my file
+      git status --short          # check 2 (race window check) ← KEY
+      git diff --cached --stat    # confirm staged set is what you intend
+      git commit -m "..."         # safe scope
+      ```
+      `994a294` build-restore + `ca09db0` doc-sync demonstrated this
+      discipline correctly (status BEFORE commit, single file confirmed
+      via `--cached --stat`).
+    - Companion to memory rule
+      `feedback_git_status_before_commit_in_cooperative.md` (which
+      already covered "before commit" but in different framing — now
+      the rule is sharpened with the race-window evidence).
+
+31. **ARLE surface claims need raw evidence in same response, even when not contesting peer**
+    - Caught by: `d387b03` (2026-05-10, 4th hallucination this session) +
+      `c3bb82b` (3rd hallucination this session). Original #28 rule said
+      "verify raw output when contradicting peer", but Claude made
+      multiple hallucinated claims about ARLE's surface WITHOUT contradicting
+      anyone — Claude just confidently stated false claims based on
+      memory recall.
+      - 3rd hallucination: `4b30c15` claimed ARLE has `/health` endpoint
+        in unstick brief → reality is `/healthz` + `/readyz` (k8s convention,
+        verified `router.rs:68-69`)
+      - 4th hallucination: `5bf0e20` claimed 2026-05-09 baseline-B5 was
+        comparable to newdequant-r1 for Phase 1.1 Δ% computation → reality
+        is different checkpoint variants (zpfix vs sym-g128, verified via
+        raw `cat command.txt`)
+    - Pattern: Claude's confident claim about ARLE/bench surface (CLI
+      flags, file structure, kernel internals, HTTP routes, baseline
+      checkpoint match, model variant) based on internal recall of
+      "how things usually work" — without grepping the actual code/files.
+      Each claim plausible but ARLE-specific reality differs.
+    - Strengthened rule (extends #28): ANY claim about ARLE's surface
+      MUST be backed by raw `grep`/`Read`/`cat` output IN THE SAME
+      RESPONSE making the claim. Generic conventions don't apply —
+      ARLE's implementation may differ. This applies to:
+      - CLI flag existence + argument types
+      - File/module structure + function signatures
+      - Kernel internals (which kernel has what buffer, which arch tag)
+      - HTTP route endpoints + serialization formats
+      - Baseline checkpoint match (which model variant each bench used)
+      - Scheduler config defaults (max_waiting, cold_headroom, etc.)
+    - Failure mode is silent: hallucinated claims often cause peer
+      agent to do unnecessary work (codex spent 8 min searching for
+      a CLI flag that didn't exist; codex initially used wrong endpoint
+      for readiness probe). Recovery cost averages 1-2 ticks per
+      hallucination.
+
+32. **Peer agent "Waiting >5min" with no observable progress warrants direct process-state verify**
+    - Caught by: `4b30c15` (2026-05-10) — codex was Working on a
+      `for i in $(seq 1 120); do curl -fsS .../v1/models; sleep 2; done`
+      poll loop for 33+ minutes after the nohup'd server died
+      immediately at startup. Server PID 1810426 left no log output
+      (0-byte log file) + curl connection refused, but codex's tmux
+      timer kept incrementing without making progress.
+    - Pattern: when peer agent's terminal shows "Waiting for
+      background terminal X minutes" with no observable forward
+      progress (no new commits, no log growth, no GPU activity
+      indicating the work is happening), don't trust the timer.
+      Directly verify the underlying process state.
+    - Mitigation: if peer "Waiting >5min", run as part of next-tick
+      3-state scan:
+      - `ps -p <PID>` → process alive?
+      - `ls -la <log-file>` → log file growing?
+      - `curl <expected-endpoint>` → service responding?
+      If process is dead, send unstick brief proactively. This tick
+      pattern recovered ~33min of codex bandwidth that would have
+      been wedged indefinitely.
+    - Companion to anti-pattern #28 + #31: all three are about
+      VERIFYING substrate before trusting peer-agent state. #28 is
+      "peer investigation might be wrong, but verify before
+      correcting"; #31 is "your own claim about ARLE surface needs
+      raw evidence"; #32 is "peer's progress timer needs raw
+      evidence too".
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -903,6 +1025,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.8.0** | **2026-05-09** | **25** | **(this commit) batch-added #20-25 from c20b1ce attribution + R4#6 KILL + recipe audit chain. Anti-pattern theme: "audit at every prescription layer including recipes themselves"; key lesson: empirical bench is truly orthogonal SOLID layer that catches what bidirectional code audits both miss (#25 evidence). Sources: `c076aae` #20 / `b55bfcd`+`af44efa` #21 (2 evidence points) / `919c0fb`+`8d91d20`+`3fea979` #22 / `156d2c2` #23 / `1ccb448` #24 / `fe9ea8a`+`3b9cc06` #25** |
 | **v1.9.0** | **2026-05-10** | **27** | **(this commit) added #26-27 from #37 Path B v1 KILL → #40 Path B.2 wins chain. Theme: "cache-hit-rate claims need cardinality evidence, and bucketing fixes need second-order scalar-capture sync". Sources: `a7a8b94` #26 (Path B v1 388-key churn at 4k production despite shape-(4,3,8) smoke success) / `a56b7a9`+`c44788f` #27 (Codex's second-order bucketing insight beyond Claude brief: bucketed key + captured scalars baked at first-capture dim = semantic miss; bucketed key + captured scalars baked at bucket capacity = 98.5% reuse, engine TTFT -92.5%). Compound learning: the same Phase B family of optimization required two distinct anti-pattern lessons, one per KILL→WIN cycle.** |
 | **v1.10.0** | **2026-05-10** | **28** | **(this commit) added #28 from `ee2c5b0` SOLID-critical hallucination chain. Theme: "agent fabrication overrides peer's correct conclusion when memory of prior tool output is trusted over fresh verification". Source: Claude challenged codex's correct claim that `--max-waiting-requests` CLI flag does not exist, cited fabricated grep evidence, codex (rightly) trusted the "correction" and used `--cold-headroom 253` workaround. Two ticks later audit-of-audit re-ran verification → direct evidence proved codex correct from start (`git log -S` shows string never existed in main.rs). Lesson distinct from #25 ("audit-chain shared blindspot"): #28 is "agent fabricates evidence", and empirical bench doesn't catch it because the bench command itself is built on the fabrication. Fix: when correcting peer agent file-content claim, MUST re-run verification in SAME response and quote raw output literally, NOT summarize memory.** |
+| **v1.11.0** | **2026-05-10** | **32** | **(this commit) batch-added #29-32 from same-day cooperative discipline session. Theme: "verify substrate of EVERY claim, not just contested ones". Evidence chain: 4 hallucinations sedimented in single session (`0f4d0ae` CLI flag, `43bda9c` reduce buffer, `4b30c15` /health endpoint, `5bf0e20` baseline mismatch) + cooperative race in `0d63a52`/`994a294` recovery + 33min wedged poll in `4b30c15`. Sources: `eb2b4b6` #29 (default test fixture broken since #25, codex correctly overrode via env var) / `0d63a52`+`994a294`+`ca09db0` #30 (commit-time worktree race; status BEFORE commit not just before add) / `c3bb82b`+`d387b03` #31 (ARLE surface claims need raw evidence even when not contesting peer; 4 hallucination pattern caught by self-audit) / `4b30c15` #32 (peer "Waiting >5min" warrants direct ps/log/curl verify; recovered ~33min of codex bandwidth). Cumulative compound learning: `de36538` retrospective + `940f49e` self-implementation by Claude (PF8.1+2) demonstrated discipline working — cooperative pipeline recovers from individual mis-claims when each agent applies raw-evidence-required rule.** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
