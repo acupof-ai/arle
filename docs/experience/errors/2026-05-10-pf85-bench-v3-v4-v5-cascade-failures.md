@@ -148,7 +148,7 @@ until either:
 - bench_ab.sh fixed (Option B)
 - OR axis pivots to #28 Medusa (Option C, accepts substrate-only PF8.3)
 
-## Update — Option A direct-guidellm chain (v6/v7/v8 attempts)
+## Update — Option A direct-guidellm chain (v6/v7/v8/v9/v10 attempts)
 
 v6 (07:33): direct guidellm with --rate "1,2,4" — failed `404 on /health`
 (guidellm default health endpoint mismatch with ARLE /healthz).
@@ -159,12 +159,23 @@ v7 (07:34): added `--backend-kwargs '{"validate_backend": "/v1/models",
 `ValueError: Unsupported file type:  for bench-output/...`. Missing
 `--outputs html` (v3 had it, v6/v7 only had json+csv).
 
-v8 (07:35-07:37+): added `--outputs html` per v3 invocation pattern.
-Setup PASSED, "Setup complete, starting benchmarks...", GPU 40% active.
-Server PID 1942070 alive. No crash so far. ETA ~07:38-39 for save.
+v8 (07:35-07:37): added `--outputs html` per v3 — same crash. Hypothesis
+"missing html" was wrong.
 
-If v8 saves successfully → first treatment FP8 numbers ready for
-license decision per aebd4a5.
+v9 (07:38-07:41): used ABSOLUTE path for --output-dir (v3 used absolute).
+Bench RAN, crashed on save with same `Unsupported file type:` for the
+absolute path too. So absolute path NOT the differentiator either.
+
+v10 (07:42, in flight): pre-created output dir via `mkdir -p` BEFORE
+invoking guidellm (per bench_guidellm.sh:755). Tests "guidellm requires
+pre-existing dir" hypothesis. ETA ~07:44.
+
+If v10 succeeds: confirmed root cause = guidellm 0.6.0 won't auto-mkdir
+output dir + crashes on save with cryptic error if dir doesn't exist.
+Add `mkdir -p` to direct invocation pattern + document in cascade entry.
+
+If v10 also fails: deeper investigation needed — maybe a guidellm version
+mismatch OR some env var v3 had that I'm missing.
 
 Per skill v1.11.0+ #28+#31: every claim grounded in raw evidence
 (bench v3/v4/v5 logs + core dump messages + bench_guidellm.sh source
