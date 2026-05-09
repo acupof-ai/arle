@@ -1146,11 +1146,27 @@ pub(crate) fn precompute_rope(
     max_seq_len: usize,
     theta: f32,
 ) -> Result<(DeviceVec, DeviceVec)> {
-    let half_dim = head_dim / 2;
+    // Vanilla (no scaling) path. Phase 2 of M_rope-yarn-scaling: caller
+    // wires `Option<&RopeScalingConfig>` via `precompute_rope_with_scaling`
+    // when the model config has rope_scaling = Some(...).
+    precompute_rope_with_scaling(ctx, head_dim, max_seq_len, theta, None)
+}
 
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / theta.powf(i as f32 * 2.0 / head_dim as f32))
-        .collect();
+/// Long-context-aware variant of [`precompute_rope`] that accepts an
+/// optional `RopeScalingConfig` (YARN / Linear / NtkAware). When `scaling`
+/// is `None`, this is bit-equivalent to the legacy `precompute_rope`
+/// (verified by `qwen3-spec::tests::vanilla_inv_freq_matches_legacy_formula`).
+///
+/// Phase 2 of M_rope-yarn-scaling. See `docs/plans/M_rope-yarn-scaling.md`.
+pub(crate) fn precompute_rope_with_scaling(
+    ctx: &DeviceContext,
+    head_dim: usize,
+    max_seq_len: usize,
+    theta: f32,
+    scaling: Option<&qwen3_spec::RopeScalingConfig>,
+) -> Result<(DeviceVec, DeviceVec)> {
+    let half_dim = head_dim / 2;
+    let inv_freq = qwen3_spec::compute_scaled_inv_freq(head_dim, theta, scaling);
 
     let total = max_seq_len * head_dim;
     let mut cos_host = vec![bf16::ZERO; total];
