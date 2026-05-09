@@ -148,6 +148,24 @@ until either:
 - bench_ab.sh fixed (Option B)
 - OR axis pivots to #28 Medusa (Option C, accepts substrate-only PF8.3)
 
+## Update — Option A direct-guidellm chain (v6/v7/v8 attempts)
+
+v6 (07:33): direct guidellm with --rate "1,2,4" — failed `404 on /health`
+(guidellm default health endpoint mismatch with ARLE /healthz).
+
+v7 (07:34): added `--backend-kwargs '{"validate_backend": "/v1/models",
+"request_format": "/v1/completions"}'` — bench RAN (GPU 49%, accumulated
+1:09 server CPU = real benching) but crashed on save:
+`ValueError: Unsupported file type:  for bench-output/...`. Missing
+`--outputs html` (v3 had it, v6/v7 only had json+csv).
+
+v8 (07:35-07:37+): added `--outputs html` per v3 invocation pattern.
+Setup PASSED, "Setup complete, starting benchmarks...", GPU 40% active.
+Server PID 1942070 alive. No crash so far. ETA ~07:38-39 for save.
+
+If v8 saves successfully → first treatment FP8 numbers ready for
+license decision per aebd4a5.
+
 Per skill v1.11.0+ #28+#31: every claim grounded in raw evidence
 (bench v3/v4/v5 logs + core dump messages + bench_guidellm.sh source
 grep — all THIS tick).
