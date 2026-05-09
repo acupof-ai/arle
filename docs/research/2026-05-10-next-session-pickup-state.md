@@ -36,21 +36,36 @@ status: session-end-checkpoint-for-next-pickup
 - **PF8.4 dispatch wiring LANDED** (`db063ff`, +38 LOC): opt-in
   `INFER_MARLIN_W4_FP8_PREFILL=1` env var, bail at call site pending
   PF8.3 GEMM kernel.
-- **PF8.3 Strategy A' substrate COMPILE+CHECK+CLIPPY+greedy_consistency
-  PASS on hybrid checkpoint** (codex untracked-modified
+- **PF8.3 Strategy A' substrate END-TO-END VALIDATED** (codex untracked-modified
   gemm.rs+tensor.rs+linear.rs + untracked marlin_pf8/ + marlin_w4_fp8_kernel.cu
-  + experience entry; commit pending codex review pass). Validation
-  trace: `077b600` (compile smoke PASS), `a0758e7` (Strategy A'
-  validation), greedy_consistency on
-  `infer/models/Qwen3-4B-W4-hybrid-zpfix` 4.33s PASS.
+  + experience entry; commit pending FINAL codex review re-pass post-bug-fix).
+  Full validation trace:
+  - `077b600` compile smoke PASS
+  - `a0758e7` Strategy A' validation
+  - cargo check PASS 3m51s
+  - cargo clippy PASS 3m49s
+  - greedy_consistency PASS 4.33s on `infer/models/Qwen3-4B-W4-hybrid-zpfix`
+  - e2e PASS on hybrid checkpoint
+  - **codex review caught 3 REAL bugs (FIXED)** per `ace3cbe`:
+    parallel-M loop off-by-N (HIGH untriggered shape), max_par/lock
+    workspace contract (HIGH possibly related Task #43), graph capture
+    vs PF8 scratch (MEDIUM perf)
+  - cargo check + clippy + tests RE-PASS post-fix
+  - codex review FINAL pass running THIS tick (post-fix verify)
+  - mma confirmed `m16n8k32` (line 99 of marlin_pf8/marlin_mma.h, k=32 path)
 - **PF8.5 prep tooling COMPLETE** (Claude this session):
   - `3fa5e74` eval_ppl_pf83.py — PPL Δ% gate adapter
   - `84d61eb` bench_pf83_ab.sh — e2e A/B wrapper
   - `c382fba` pf83_license_sequence.sh — orchestrator (+ `bf47413`
-    fix: hybrid-default INFER_TEST_W4A8_MODEL_PATH for Step 1)
+    fix: hybrid-default INFER_TEST_W4A8_MODEL_PATH for Step 1, +
+    `a6cf5ac` --dry-run flag with 5/5 OK pre-flights verified)
   - `e99e5a5` defaults to hybrid checkpoint
   - License gates per `aebd4a5`: TTFT Δ ≥ -8% σ<5% n=3 + greedy
     PASS + PPL Δ% ≤ +1.0% wikitext
+- **codex review pattern empirical validation** (`ace3cbe`): 3 bug catches
+  on 1 diff in 27 min review = high amortized value. Skill v1.12.0+
+  candidate documented (strengthen #29 OR add #33: for non-trivial
+  substrate codex review is gate, not formality).
 - **#34 RESOLVED** (`df37a68`): `arle data download` + `arle model
   download` CLI surfaces. Data download VERIFIED working on current
   binary (`8735361` Medusa Phase 1.A pickup chain survey). Model
