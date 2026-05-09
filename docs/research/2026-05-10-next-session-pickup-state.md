@@ -99,11 +99,18 @@ status: session-end-checkpoint-for-next-pickup
   - `45579c0` add INFER_HYBRID_W4A8_PREFILL=1 to all 3 entry points
     (bench v2 root cause: hybrid model loader requires both this AND
     INFER_MARLIN_W4_FP8_PREFILL — anti-pattern #29 manifested 2nd time)
-- **PF8.5 bench v3 RUNNING** (started 07:19): guidellm PID 1907236
-  + server PID 1907144 at GPU 100% utilization (14 GB used) — first
-  real PF8.3 substrate inference under load this session. ETA ~07:27-30
-  for full A/B (4 concurrencies × 60s × 2 runs ≈ 8-10 min). Logs at
-  /tmp/claude-pf85-bench-v3.log + bench-output/2026-05-10-pf83-baseline-int8-run2/.
+- **PF8.5 bench v3 RUNNING + LIVE NUMBERS** (started 07:19, ~3min in
+  at 07:22): GPU 100%, server PID 1907144 at 90.9% CPU.
+  - engine_ttft_us=75000.0 = **75ms TTFT** baseline INT8 reference
+  - engine_itl_p50_us=10000.0 = **10ms ITL p50**
+  - batch_occupancy=0.65 = 65%, kv_util=64.1%
+  - requests=326, tokens_out=41351 (rate=4 phase active, transitioning
+    to rate=8)
+  - step_phase: prefill 7.3ms / decode 185us / total 7.6ms
+  - ETA completion ~07:29 (4 streams × 60s × 2 A/B runs + overhead)
+  - License threshold per a66d99a: treatment FP8 TTFT ≤ 75 × 0.92 =
+    **69ms** for -8% LICENSE; > 75 × 1.03 = 77.3ms for KILL
+  - Logs: /tmp/claude-pf85-bench-v3.log + bench-output/2026-05-10-pf83-baseline-int8-run2/
 - **#34 RESOLVED** (`df37a68`): `arle data download` + `arle model
   download` CLI surfaces. Data download VERIFIED working on current
   binary (`8735361` Medusa Phase 1.A pickup chain survey). Model
