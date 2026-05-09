@@ -795,6 +795,98 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_yarn_parsed_config_drives_scaled_inv_freq() {
+        // Phase 1c integration: prove that JSON config with rope_scaling
+        // round-trips through Qwen3Config and drives compute_scaled_inv_freq
+        // correctly (i.e., M_rope-yarn-scaling Phase 1+2 chain works end-to-end
+        // without separate manual RopeScalingConfig construction).
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 2560,
+                "intermediate_size": 8960,
+                "num_hidden_layers": 36,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "rope_scaling": {
+                    "type": "yarn",
+                    "factor": 2.0,
+                    "original_max_position_embeddings": 40960
+                },
+                "tie_word_embeddings": false,
+                "max_position_embeddings": 81920
+            }"#,
+        )
+        .unwrap();
+
+        // Verify field round-tripped
+        let scaling = cfg.rope_scaling.as_ref().expect("rope_scaling parsed");
+        assert!(matches!(
+            scaling,
+            RopeScalingConfig::Yarn { factor: 2.0, .. }
+        ));
+
+        // Drive compute_scaled_inv_freq through the parsed config
+        let scaled =
+            compute_scaled_inv_freq(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling.as_ref());
+        let vanilla = compute_scaled_inv_freq(cfg.head_dim, cfg.rope_theta, None);
+        assert_eq!(scaled.len(), cfg.head_dim / 2);
+
+        // Sanity: high-freq dim 0 ≈ vanilla, low-freq last dim ≈ vanilla/2
+        assert!(
+            (scaled[0] - vanilla[0]).abs() / vanilla[0] < 0.01,
+            "yarn high-freq: {} vs {}",
+            scaled[0],
+            vanilla[0]
+        );
+        let last = scaled.len() - 1;
+        let expected_interp = vanilla[last] / 2.0;
+        assert!(
+            (scaled[last] - expected_interp).abs() / expected_interp < 0.01,
+            "yarn low-freq: {} vs {}",
+            scaled[last],
+            expected_interp
+        );
+
+        // attention_factor for factor=2.0 = 1 + 0.1 * 1.0 * ln(2)
+        let af = compute_attention_factor(cfg.rope_scaling.as_ref());
+        let expected_af = 1.0 + 0.1 * (2.0_f32).ln();
+        assert!(
+            (af - expected_af).abs() < 1e-5,
+            "attention_factor: {af} vs {expected_af}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_no_rope_scaling_drives_vanilla() {
+        // Sanity: Qwen3-4B native config (no rope_scaling) must produce
+        // bit-equivalent vanilla inv_freq via the compute helper.
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 2560, "intermediate_size": 8960, "num_hidden_layers": 36,
+                "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+                "tie_word_embeddings": false, "max_position_embeddings": 40960
+            }"#,
+        )
+        .unwrap();
+        assert!(cfg.rope_scaling.is_none());
+
+        let scaled =
+            compute_scaled_inv_freq(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling.as_ref());
+        let legacy: Vec<f32> = (0..cfg.head_dim / 2)
+            .map(|i| 1.0 / cfg.rope_theta.powf(i as f32 * 2.0 / cfg.head_dim as f32))
+            .collect();
+        assert_eq!(scaled.len(), legacy.len());
+        for (s, l) in scaled.iter().zip(legacy.iter()) {
+            assert!((s - l).abs() < 1e-6, "{s} != {l}");
+        }
+    }
+
+    #[test]
     fn rejects_invalid_head_layout() {
         let err = Qwen3Config::from_json_str(
             r#"{
