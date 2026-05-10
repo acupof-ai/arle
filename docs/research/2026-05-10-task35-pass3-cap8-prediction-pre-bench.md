@@ -273,6 +273,61 @@ bugs each**. Pattern is consistent magnitude, not just consistent
 existence. Strong argument that codex review is the highest-yield
 verification step for non-trivial diffs.
 
+### §6.13 W4 Pass 3 OOM-fallback at B=8 2048 tokens/row + n=2 evidence for SKILL #38
+
+Per codex tmux ~1h 07min:
+
+> 当前实现的 W4 Pass 3 三次都成功 warm 到 B=8：B=8 的 2048 tokens/row
+> 会 OOM，然后自动回退到 1024 tokens/row；总 warmup 约 9.2s。
+>
+> [translation]: Current W4 Pass 3 successfully warmed to B=8 in all
+> three runs: B=8 at 2048 tokens/row OOMs, then auto-falls back to
+> 1024 tokens/row; total warmup ~9.2s.
+
+**Two findings**:
+
+1. **W4 Pass 3 graceful OOM-fallback at B=8 2048 tokens/row**:
+   maximum shape exceeds 16GB VRAM headroom at the test's
+   max_seq_len, but Pass 3 implementation gracefully falls back to
+   half-shape (1024 tokens/row). No crash, just adapted warmup. Good
+   defensive design — validates the substrate's robustness under
+   hardware constraints.
+
+2. **n=2 evidence for SKILL candidate #38** (warmup shape ≠
+   effective workload budget):
+   - n=1: §6.8 max_seq_len=512 vs chunked_prefill_size=4096
+     mismatch (codex applied cap fix)
+   - **n=2: this tick** B=8 × 2048 tokens/row exceeds VRAM → OOM
+     fallback to 1024 tokens/row
+
+   Both show: warmup target shape may be unreachable for production
+   given hardware constraints. n=2 is sufficient threshold per skill
+   accumulation policy to **graduate #38 to canonical SKILL anti-
+   pattern in v1.13.0+**.
+
+   Proposed wording for v1.13.0 #38:
+   > "Warmup target shape budget should be clamped to (effective
+   > workload shape budget × hardware headroom). Warming unreachable
+   > shapes (either by config or by OOM) is dead work; substrate
+   > should detect + cap (`max_seq_len` clamp) OR gracefully fall
+   > back (OOM → smaller shape) rather than crash."
+
+   Both ARLE Pass 3 evidence cases implement (a) cap and (b)
+   fallback respectively. The pattern generalizes to any warmup-
+   based optimization.
+
+**Updated W4 startup cost (supersedes §6.12's 8.2s)**:
+
+| Metric | Predicted | Pre-fix BUGGY | Codex run #1 | **Codex run #2-4 (n=3 stable)** |
+|---|---|---|---|---|
+| W4 server startup overhead | +282.7ms | +282.7ms | +8242ms | **+~9200ms** (slight increase from fallback retries at B=8 2048) |
+| Ratio vs prediction | 1× | 1× | ~29× | **~33×** |
+
+Still ~33× over prediction, still well within "tolerable for
+production with INFER_PREFILL_WARMUP=0 escape hatch for dev"
+verdict from §6.12. Wins entry will document this tradeoff
+explicitly per codex's stated plan.
+
 ### §6.12 W4 startup cost MEASURED with new methodology — 8.2s total
 
 Per codex tmux ~1h 02min, log line captured:
