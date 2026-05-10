@@ -846,3 +846,42 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   because no one re-asked "does the constraint still apply?". Adding
   to SKILL #29 evidence chain (n=6 — even self-imposed framing
   decays without periodic re-evaluation).
+
+### §8 EOD+~2700 chain summary (ticks ~100-122, 21+ commits)
+
+Post-`9735b47` REFUTATION + `0a0d221` Medusa audit, sediment of
+21-tick chain into single anchor:
+
+**Strategic pivots**:
+- `bccf1bd` Hybrid plan -14% prediction was CORRECT (my §12.7
+  extrapolation to -35% was wrong); Hybrid is auxiliary that STACKS
+  with Medusa (~2.61× tok/s combined)
+- `fc33cfb` Machete port KILLED (sm_90+ WGMMA+TMA only, 0% on sm_89)
+- `d8ebe73` Machete-inspired sm_89 reframing (M'/M''/M''' alternatives)
+- `b6b8adc` ARLE marlin_pf8/ = COMPLETE vLLM marlin/ fork (P2 dropped)
+- `f8b8174` + `b2cccb9` + `6024d2b` + `e60046b` P2.5 QQQ diff-port
+  (full Step 1 audit; 119-line delta; mixed expected outcome)
+- `494ad3a` + `baa2fed` Task #47 H1' v2 (extends EXISTING MarlinScratch)
+
+**Pickup readiness**:
+- `1ccb41f` vLLM Medusa prior-art (~310 LOC Python, ~350 LOC Rust port estimate)
+- `f0c7561` Phase 1.B substrate brief (concrete codex pickup)
+- `e021026` Alpaca data ALREADY downloaded (52,002 rows chat format)
+
+**Knowledge sediment**:
+- `6577ba6` SKILL v1.16.0 graduated #43 (always source-survey before
+  pending-list, n=4 evidence; saved ~3-4 days false-pending work)
+- `81b5e94` docs/index.md refreshed EOD+2620 (canonical pickup anchor)
+
+**FINAL priority table**:
+| P | Path | Wall-clock | Status |
+|---|---|---:|---|
+| P1 | A+B (Medusa + Hybrid) | 4-5 days | gated on user GO |
+| P2.5/M'' | QQQ Hunk 8 port (merged) | 4.5-6.5 hr | LICENSED with caveats |
+| P3 | Task #47 H1' v2 | 1 day | parallel codex track |
+
+**Compound 5-6 days for ~2.61× tok/s + -14% latency + PF8 path unblock + P2.5 reference.**
+
+USER GO gate items: model (Qwen3-4B vs Qwen3.6) + integration target (CUDA first) + wall-clock approval.
+
+Codex IDLE 8+hr at "Worked 26m 51s". 21-doc decision chain ready for next-session pickup.
