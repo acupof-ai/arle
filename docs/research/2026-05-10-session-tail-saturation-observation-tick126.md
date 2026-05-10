@@ -92,6 +92,12 @@ main axis) — exactly the pattern captured by
 (written tick 121). The reframe brief (`d8ebe73`) is the response;
 no new sediment needed this tick. Countdown to graduation: 1 more.
 
+## §6.65 Tick 193 — saturation persists (false-alarm last tick)
+
+3-state: codex idle, GPU 844 MiB / 1% (msedge GPU process is browser
+noise per nvidia-smi --query-compute-apps last tick — NOT ARLE).
+Saturation effectively persists.
+
 ## §6.64 Tick 191 — saturation persists
 
 3-state unchanged.
