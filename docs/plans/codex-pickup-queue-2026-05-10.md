@@ -246,3 +246,16 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   via lightweight script. Codex's discipline matches #34b's
   underlying principle — "trust raw data, scripts are conveniences
   that may fail". Reinforces #34b without adding new candidate.
+- **2026-05-10 ~10:21 KST**: Task #43 codex DISPROVEN commit `83fc5d0`
+  + Claude INVERSE analysis `e8b6b31` + SKILL v1.14.0 graduation
+  `d2c987f` (#36 grep-+-A/B both required). Codex idle ~2 min after
+  Task #43 wrap. Per cb86836 §6 dispatch logic: Task #48 W4A8
+  regression bisect = safest non-bench-v11-gated pickup.
+- **2026-05-10 ~10:23 KST**: P2 Task #48 W4A8-vs-BF16 84.4%
+  regression bisect DISPATCHED to codex via tmux nudge. Codex
+  Working as of ~10:23. Expected ~1 hour for: re-confirm 84.4% diff
+  + bisect 3 candidate commits (35fc3cf #24 / c44788f #40 /
+  09ae5a5 Path B Phase 1) + reconcile docstring (<1% rule per skill
+  v1.3.0) vs assert (25% lenient gate). Then either fix root cause
+  + tighten threshold OR add canary that breaks if >25% (per skill
+  candidate #35 root-cause-TBD canary watch).
