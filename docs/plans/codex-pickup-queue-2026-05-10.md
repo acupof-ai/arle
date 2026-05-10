@@ -234,3 +234,15 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   failure count. Companion to #38 (warmup graceful fallback) — #38
   introduces the fallback patterns; #40 ensures discrimination tools
   don't conflate them with real failures."
+- **2026-05-10 ~10:18 KST**: Both arms COMPLETED. GPU idle (1293 MiB /
+  0%) confirms. Codex bypassing buggy `pf83_bench_health.sh` JSON
+  parser — running ad-hoc Python script to iterate over both arms'
+  raw `results.json`. Visible percentile output: `'p90': 415.91,
+  'p95': 515.74, 'p99': 872.90, 'p999': 2419.91` (likely TTFT or
+  request-total-latency in ms). Verdict imminent.
+
+  **SKILL operational pattern observed**: when wrapper tool has a
+  parsing bug (#34b's discriminator), fall back to raw inspection
+  via lightweight script. Codex's discipline matches #34b's
+  underlying principle — "trust raw data, scripts are conveniences
+  that may fail". Reinforces #34b without adding new candidate.
