@@ -115,6 +115,10 @@ impl GenerationState for Qwen35State {
         Ok(())
     }
 
+    fn reset_for_warmup_clear(&mut self) -> Result<()> {
+        self.reset()
+    }
+
     fn truncate_to(&mut self, len: usize) -> Result<()> {
         self.base.truncate_to(len)?;
         self.paged_prefill = None;

@@ -250,6 +250,12 @@ pub trait DecodeContextOps {
 pub trait GenerationState {
     fn logits(&self) -> &DeviceVec;
     fn reset(&mut self) -> Result<()>;
+    /// Clear state after startup warmup work wrote dummy KV/logits into a slot.
+    ///
+    /// This is intentionally separate from normal slot reuse so model-specific
+    /// scratch that is safe to keep hot may do so while request-visible state is
+    /// cleared. Implementations should at minimum remove dummy KV and logits.
+    fn reset_for_warmup_clear(&mut self) -> Result<()>;
     /// Truncate KV cache to `len` tokens, keeping the first `len` tokens.
     fn truncate_to(&mut self, len: usize) -> Result<()>;
     /// Set the maximum contiguous sequence length for the KV cache.

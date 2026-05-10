@@ -2,10 +2,10 @@
 //!
 //! Split out of `core.rs` (pure structural refactor — no behavior change).
 
-use log::{error, info};
+use log::{error, info, warn};
 
 use super::super::Scheduler;
-use crate::model::{GenerationState, ModelForward};
+use crate::model::{GenerationState, ModelForward, PrefillBatchRequest};
 
 impl<M: ModelForward> Scheduler<M> {
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
@@ -161,9 +161,10 @@ impl<M: ModelForward> Scheduler<M> {
         // Always reached: frees any slots the warmup body allocated, whether
         // the body ran to completion or bailed on an error above.
         for slot in 0..allocated {
-            self.paged_kv_pool.free_slot(slot);
-            let _ = self.states[slot].reset();
+            self.clear_warmup_slot(slot);
         }
+
+        let prefill_warmed = self.warmup_prefill_pass(num_slots);
 
         let mode = if graph_capture_enabled {
             "CUDA Graph warmup"
@@ -171,12 +172,153 @@ impl<M: ModelForward> Scheduler<M> {
             "Eager warmup + cublasLt autotune"
         };
         info!(
-            "{} done in {:.0}ms ({} batch sizes, max {})",
+            "{} done in {:.0}ms (decode={} batch sizes, prefill={} batch sizes, max decode {})",
             mode,
             t0.elapsed().as_secs_f64() * 1e3,
             warmed,
+            prefill_warmed,
             warmup_sizes.last().copied().unwrap_or(0),
         );
+    }
+
+    /// Pass 3: warm paged prefill kernels and per-shape runtime allocators.
+    fn warmup_prefill_pass(&mut self, num_slots: usize) -> usize {
+        if prefill_warmup_disabled() {
+            info!("Pass 3 prefill warmup disabled by INFER_PREFILL_WARMUP=0");
+            return 0;
+        }
+
+        let prefill_cap = self
+            .model
+            .max_concurrent_prefill_requests()
+            .unwrap_or(num_slots)
+            .min(num_slots);
+        if prefill_cap == 0 {
+            return 0;
+        }
+
+        info!(
+            "Pass 3: warming prefill code paths for {} batch sizes (max {})...",
+            prefill_cap, prefill_cap
+        );
+        let t_prefill = std::time::Instant::now();
+        let configured_chunk = self.prefill_chunk_size();
+        let max_seq_len = self.effective_max_seq_len.unwrap_or(usize::MAX);
+        let warmup_row_cap = configured_chunk.min(max_seq_len).max(1);
+        let max_dummy_tokens = warmup_row_cap
+            .min(self.config.max_prefill_tokens.max(1))
+            .min(self.config.max_num_batched_tokens.max(1))
+            .max(1);
+        let dummy_prompt = vec![0u32; max_dummy_tokens];
+        let mut warmed = 0usize;
+
+        'prefill_sizes: for bs in 1..=prefill_cap {
+            let mut tokens_per_row = warmup_row_cap
+                .min((self.config.max_prefill_tokens / bs).max(1))
+                .min((self.config.max_num_batched_tokens / bs).max(1))
+                .max(1);
+
+            loop {
+                let requests: Vec<PrefillBatchRequest<'_>> = (0..bs)
+                    .map(|slot| PrefillBatchRequest {
+                        slot_idx: slot,
+                        tokens: &dummy_prompt[..tokens_per_row],
+                    })
+                    .collect();
+
+                if self.prefill_ctx.is_none() {
+                    match self.model.create_prefill_context(
+                        self.states.len(),
+                        self.config.max_prefill_tokens,
+                        &self.paged_kv_pool,
+                    ) {
+                        Ok(prefill_ctx) => self.prefill_ctx = Some(prefill_ctx),
+                        Err(e) => {
+                            warn!(
+                                "Pass 3 prefill warmup context creation failed ({}), skipping warmup",
+                                e
+                            );
+                            break 'prefill_sizes;
+                        }
+                    }
+                }
+
+                let forward_result = {
+                    let prefill_ctx = self
+                        .prefill_ctx
+                        .as_mut()
+                        .expect("prefill context must exist before warmup launch");
+                    self.model.launch_prefill_batch(
+                        &requests,
+                        &mut self.states,
+                        Some(&mut self.paged_kv_pool),
+                        prefill_ctx,
+                    )
+                };
+                let sync_result = self.model.device_context().sync();
+                let complete_result = {
+                    let prefill_ctx = self
+                        .prefill_ctx
+                        .as_mut()
+                        .expect("prefill context must exist before warmup completion");
+                    let slot_indices: Vec<usize> = (0..bs).collect();
+                    self.model
+                        .complete_prefill_batch(&mut self.states, prefill_ctx, &slot_indices)
+                };
+                for slot in 0..bs {
+                    self.clear_warmup_slot(slot);
+                }
+
+                let mut retry_reason = None;
+                if let Err(e) = forward_result {
+                    retry_reason = Some(format!("forward failed: {e}"));
+                } else if let Err(e) = sync_result {
+                    retry_reason = Some(format!("sync failed: {e}"));
+                } else {
+                    match complete_result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            retry_reason = Some("completion stayed pending after sync".to_string());
+                        }
+                        Err(e) => retry_reason = Some(format!("completion failed: {e}")),
+                    }
+                }
+
+                let Some(reason) = retry_reason else {
+                    warmed += 1;
+                    break;
+                };
+
+                if tokens_per_row <= 1 {
+                    warn!(
+                        "Pass 3 prefill warmup for B={} failed at 1 token/row ({}), skipping larger sizes",
+                        bs, reason
+                    );
+                    break 'prefill_sizes;
+                }
+                let next_tokens = (tokens_per_row / 2).max(1);
+                warn!(
+                    "Pass 3 prefill warmup for B={} at {} tokens/row failed ({}); retrying at {} tokens/row",
+                    bs, tokens_per_row, reason, next_tokens
+                );
+                tokens_per_row = next_tokens;
+            }
+        }
+
+        info!(
+            "Pass 3 prefill warmup done in {:.0}ms ({} batch sizes, max {})",
+            t_prefill.elapsed().as_secs_f64() * 1e3,
+            warmed,
+            warmed,
+        );
+        warmed
+    }
+
+    fn clear_warmup_slot(&mut self, slot: usize) {
+        self.paged_kv_pool.free_slot(slot);
+        if let Err(e) = self.states[slot].reset_for_warmup_clear() {
+            warn!("Warmup: state reset for slot {} failed: {}", slot, e);
+        }
     }
 
     /// Single pass of graph warmup: set up metadata and forward for each batch size.
@@ -286,4 +428,15 @@ impl<M: ModelForward> Scheduler<M> {
         }
         sizes
     }
+}
+
+fn prefill_warmup_disabled() -> bool {
+    std::env::var("INFER_PREFILL_WARMUP")
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO"
+            )
+        })
+        .unwrap_or(false)
 }
