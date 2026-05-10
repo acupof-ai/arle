@@ -62,8 +62,21 @@ try:
     benchmarks = data.get('benchmarks', [])
     for b in benchmarks:
         m = b.get('metrics', {}) or b.get('run_stats', {}) or {}
-        total_succ += int(m.get('requests_successful_total', m.get('successful_requests', 0)) or 0)
-        total_fail += int(m.get('requests_errored_total', m.get('errored_requests', 0)) or 0)
+        request_totals = m.get('request_totals', {}) or {}
+        total_succ += int(
+            request_totals.get(
+                'successful',
+                m.get('requests_successful_total', m.get('successful_requests', 0)),
+            )
+            or 0
+        )
+        total_fail += int(
+            request_totals.get(
+                'errored',
+                m.get('requests_errored_total', m.get('errored_requests', 0)),
+            )
+            or 0
+        )
     print(f'{total_succ}|{total_fail}')
 except Exception as e:
     print('ERR|' + str(e))
@@ -79,17 +92,32 @@ fi
 
 # 3. Server log pattern check (only if log path provided)
 KERNEL_FAIL_COUNT=0
+LIVE_KERNEL_FAIL_COUNT=0
 KERNEL_FAIL_PATTERN=""
+LIVE_KERNEL_FAIL_PATTERN=""
 if [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]]; then
   # Match kernel failure patterns (PF8.3 + W4A8 + W4A16 marlin)
-  KERNEL_FAIL_COUNT="$(grep -cE 'failed with code|gemm.*failed|prefill batch failed|cudaError' "$SERVER_LOG" 2>/dev/null || echo 0)"
+  KERNEL_FAIL_COUNT="$(grep -cE 'failed with code|gemm.*failed|prefill batch failed|cudaError' "$SERVER_LOG" 2>/dev/null || true)"
+  KERNEL_FAIL_COUNT="${KERNEL_FAIL_COUNT:-0}"
   KERNEL_FAIL_PATTERN="$(grep -mE 1 'failed with code|gemm.*failed|prefill batch failed' "$SERVER_LOG" 2>/dev/null | head -1 | cut -c1-120)"
+  # Warmup may intentionally probe a shape and back off on OOM. Treat only
+  # live-request failures as substrate health failures.
+  LIVE_KERNEL_FAIL_COUNT="$(grep -E 'failed with code|gemm.*failed|prefill batch failed|cudaError' "$SERVER_LOG" 2>/dev/null | grep -vc 'Pass 3 prefill warmup' || true)"
+  LIVE_KERNEL_FAIL_COUNT="${LIVE_KERNEL_FAIL_COUNT:-0}"
+  LIVE_KERNEL_FAIL_PATTERN="$(grep -E 'failed with code|gemm.*failed|prefill batch failed|cudaError' "$SERVER_LOG" 2>/dev/null | grep -v 'Pass 3 prefill warmup' | head -1 | cut -c1-120)"
 fi
 
 # 4. Verdict
 echo "BENCH:   success=$SUCCESS_COUNT  fail=$FAIL_COUNT  output=$BENCH_DIR"
 if [[ -n "$SERVER_LOG" ]]; then
-  echo "SERVER:  log=$SERVER_LOG  kernel_failures=$KERNEL_FAIL_COUNT"
+  echo "SERVER:  log=$SERVER_LOG  kernel_failures=$KERNEL_FAIL_COUNT  live_kernel_failures=$LIVE_KERNEL_FAIL_COUNT"
+fi
+
+if [[ "$LIVE_KERNEL_FAIL_COUNT" -gt 0 ]]; then
+  echo "VERDICT: SUBSTRATE-KILL ($SUCCESS_COUNT successful, server log shows $LIVE_KERNEL_FAIL_COUNT live kernel failures)"
+  echo "DETAIL:  $LIVE_KERNEL_FAIL_PATTERN"
+  echo "NEXT:    debug kernel/runtime memory path (NOT bench tool) — see SKILL v1.12.0 #34b"
+  exit 1
 fi
 
 if [[ "$SUCCESS_COUNT" -gt 0 ]]; then
