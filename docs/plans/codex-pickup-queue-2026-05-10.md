@@ -486,3 +486,23 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
     Claude be133f8 audit picked up by codex + Claude model inventory
     pre-empt)
   - Cooperative loop pattern fully validated end-to-end
+
+- **2026-05-10 EOD+870 (13th idle tick — Task #39 housekeeping)**:
+  Codex IDLE since ~10:55 KST; ~70 min into idle. GPU 1.3 GiB / 0%.
+  Claude noticed Task #39 (M_rope-yarn-scaling impl) was still
+  `in_progress` despite `37ae5f9` final-consolidation wins entry +
+  Phase 1+2 substrate landed (8 commits, +769 LOC, 51 unit tests) +
+  Phase 3a server smoke PASS (`4efd30b`). Phase 3b PPL eval is
+  structurally blocked on `arle train eval` autograd OOM at 16GB GPU
+  (`083364a`) — that's a hardware concern unrelated to impl scope.
+  Marking #39 → completed; the long-ctx unblocker is unblocked.
+
+  **Task list state after #39 close**:
+  - in_progress: #44 PF8 chain (blocked on bench v11)
+  - pending: #28 Medusa, #30 Hybrid W4A16/W4A8, #47 PF8.3 H1'
+  - All forward paths still gated on USER (PF8.5 license decision via
+    `bash scripts/pf85_bench_v11_user.sh` OR new direction).
+
+  **Accumulation discipline note**: housekeeping > mechanical churn at
+  saturation. The 13th tick is producing 1 task-close + this entry
+  rather than another bench/audit on already-saturated paths.
