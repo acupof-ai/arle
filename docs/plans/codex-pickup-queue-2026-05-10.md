@@ -554,3 +554,26 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
     decision (P1 #47 H1' refactor OR P1 #28 Medusa branch)
   - OR new direction (P3 #30 Hybrid W4A16/W4A8 dispatch, standalone
     Medusa, etc.)
+
+- **2026-05-10 EOD+1080 (20th idle tick — saturation cadence bump)**:
+  Codex IDLE since ~10:55 KST; ~130 min (2hr+) into idle. GPU 1.3 GiB / 0%.
+  Claude verified loop prompt's "cleanup claude-detached-tick-recover-1012
+  temp branch" claim — branch does NOT exist on remote
+  (`git ls-remote origin 'refs/heads/claude-detached*'` returns empty).
+  Already cleaned earlier or never pushed. Nothing to do.
+
+  **Other stale `claude/*` remote branches observed** (require user
+  authorization to clean per CLAUDE.md destructive-action rule):
+  - `claude/arle-first-principles-BB11h`
+  - `claude/c16-admission-gate-{v2,v3-crashed,wip}` (3)
+  - `claude/consolidate-docs-hooks-xacK5`
+  - `claude/multi-backend-architecture-design-cgtFr`
+  - `claude/optimize-docs-priority-N9EBA`
+  - `claude/research-{optimization-solutions-E9KOq,p99-gpu-optimization-aIikv}`
+  - `brave-proskuriakova` (likely scrambled placeholder name)
+  Available for batch cleanup if user authorizes.
+
+  **Cadence decision**: 6+ ticks of saturated state, bumping safety-net
+  wake from 1800s (30min) → 3600s (60min, runtime max). Past the 5-min
+  cache window anyway; less wakeup overhead until codex commits or
+  user signals direction.
