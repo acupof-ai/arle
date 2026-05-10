@@ -92,6 +92,12 @@ main axis) — exactly the pattern captured by
 (written tick 121). The reframe brief (`d8ebe73`) is the response;
 no new sediment needed this tick. Countdown to graduation: 1 more.
 
+## §6.4 Tick 131 (post-graduation, 60-min cadence) — saturation persists
+
+Codex idle, GPU empty, local clean. First tick under new 60-min
+cadence per `feedback_cron_loop_steady_state_cadence_expansion`
+memory. State unchanged.
+
 ## §6.3 Tick 130 (countdown 3/3) — GRADUATION
 
 3-state unchanged. Graduation criterion met: 3 consecutive ticks
