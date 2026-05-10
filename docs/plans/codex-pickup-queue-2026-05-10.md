@@ -676,6 +676,23 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   - Cooperative-loop asymmetric saturation pattern documented as
     `e37a46b` errors entry with 3 ground rules
 
+- **2026-05-10 EOD+1620 (53rd tick — STOP self-wakeup REVERSED per user re-fire)**:
+  User re-fired /loop after my 52nd-tick STOP decision — implicit
+  signal they want continued engagement at the loop level despite
+  saturation. Per CLAUDE.md "User correction → preventive feedback"
+  ambiguity (could be explicit disagreement OR cron default), default
+  to "continue per stated directive" and resume ScheduleWakeup.
+
+  Lesson: my e37a46b Rule 3 ("saturation halt criteria") may need
+  qualifying — applies to Claude's self-recommendation BUT can be
+  overridden by user-driven cadence signals. The user firing /loop
+  N+1 times after a STOP decision IS a direction signal even if
+  not verbal.
+
+  Resuming max-cadence ScheduleWakeup. e37a46b errors entry stays
+  valid as research observation; my Rule 3 application was
+  premature given user's continued /loop pattern.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
