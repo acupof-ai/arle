@@ -600,6 +600,29 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   options.md`, OR codex resume, OR explicit "scaffold X while I think"
   authorization for Option A pre-emptive Alpaca dataset prep.
 
+- **2026-05-10 EOD+1430+ (45-47th tick — full 6-cell perf matrix saturation tail)**:
+  Codex IDLE since ~10:55 KST (6+ hr). GPU baseline. Substantive
+  accumulation since EOD+1280:
+  - `8d32576` W4A16 conc=1/2/4 scaling (concrete Medusa floor)
+  - `92813dc` W4A8 conc=1/2/4 scaling — full 6-cell matrix; W4A8 TTFT
+    bimodal across conc; end-to-end latency analysis reveals Hybrid
+    Option B = -2.4% max (sub-Machete-class)
+  - `12e0c07` direction options STRENGTHENED with ironclad
+    recommendation (Option A Medusa = only viable path for stated
+    -20-40% goal)
+  - Math verified for 12e0c07 — TTFT+127×ITL = 1030.7 / 1056.0 / -2.40%
+    matches claims exactly
+
+  **Cumulative Claude bench tally**: 11 PASS (Task #48 verify ×3 +
+  4-arm A/B + 4-cell scaling + 1 self-corrected). PF8 chain
+  CLOSED-KILL with full triangulation + perf matrix + Hybrid Option
+  ruled out at -2.4% (one order of magnitude below user target).
+
+  **Honest saturation acknowledgment**: at this point all bench-
+  axis-relevant evidence is captured. Further benches would be
+  diminishing-returns churn. Awaits user direction (A/B/C/D per
+  direction options) or codex resume.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
