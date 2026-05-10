@@ -1101,12 +1101,15 @@ Each anti-pattern has a project commit/entry where it was paid for.
         that 84.4% slipped past unnoticed at closure. The real
         substrate-broken state was rediscovered ~weeks later when
         Claude's PF8 work loaded the same fixture default.
-      - **n=2**: `81b6481` 2026-05-10 errors entry documents
+      - **n=2**: `81b6481` 2026-05-08 errors entry documents
         "W4A8 substrate produces 100% garbage output" — the broken
-        state WAS already known and documented in errors/, but the
-        25% gate was loose enough that the test still passed,
-        masking the canary signal. Documentation alone (without
-        test-gate enforcement) does not prevent decay.
+        state WAS already known and documented in errors/ TWO DAYS
+        BEFORE Task #48 dispatch, but the 25% gate was loose enough
+        that the test still passed, masking the canary signal.
+        Documentation alone (without test-gate enforcement) does
+        not prevent decay; the temporal gap (2 days between known-
+        broken documentation and downstream Claude work loading the
+        same fixture) underscores the silent-decay danger.
       - **n=3**: `8d1caad` codex Task #48 fix bundle TIGHTENED the
         gate from 25% → 1% AND swapped default fixture to
         qzeros-fixed checkpoint. The 1% gate IS the canary that
