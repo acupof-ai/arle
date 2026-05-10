@@ -14,6 +14,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define MARLIN_NAMESPACE_NAME arle_marlin_pf8
 #include "marlin_pf8/kernel.h"
@@ -135,6 +136,16 @@ extern "C" int gemm_w4_fp8_marlin_cuda(
     int thread_n,
     int sms,
     int max_par) {
+  // H8 diagnostic per docs/plans/M_pf83_h8_fix_patch.md: log + clear any
+  // pre-existing sticky CUDA error so this kernel doesn't get blamed for
+  // an unrelated prior-call error surfaced by cudaGetLastError() at end.
+  {
+    cudaError_t prev_err = cudaGetLastError();
+    if (prev_err != cudaSuccess) {
+      fprintf(stderr, "[gemm_w4_fp8_marlin_cuda] cleared pre-existing CUDA error: %d (%s)\n",
+              static_cast<int>(prev_err), cudaGetErrorString(prev_err));
+    }
+  }
   if (prob_m == 0 || prob_n == 0 || prob_k == 0) {
     return 0;
   }
