@@ -260,6 +260,15 @@ impl SpecPath {
                 scheduler.finish_slot(row.slot_idx);
                 continue;
             }
+            if let Err(err) = scheduler.model.commit_speculative_target_state(
+                &mut scheduler.states,
+                row.slot_idx,
+                result.num_accepted,
+            ) {
+                log::error!("spec target state rollback failed: {err}");
+                scheduler.finish_slot(row.slot_idx);
+                continue;
+            }
             if let Some(draft_engine) = scheduler.draft_engine.as_ref() {
                 if let Err(err) = draft_engine.commit_request_state(
                     row.request_id,
@@ -574,6 +583,15 @@ fn verify_and_commit_rows<M: ModelForward>(
             .truncate_slot(row.slot_idx, keep_target_len)
         {
             log::error!("sparse spec target KV rollback failed: {err}");
+            scheduler.finish_slot(row.slot_idx);
+            continue;
+        }
+        if let Err(err) = scheduler.model.commit_speculative_target_state(
+            &mut scheduler.states,
+            row.slot_idx,
+            result.num_accepted,
+        ) {
+            log::error!("sparse spec target state rollback failed: {err}");
             scheduler.finish_slot(row.slot_idx);
             continue;
         }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rand::RngExt;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers35;
@@ -10,7 +11,8 @@ use super::weights::Qwen35Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
     GenerationState, ModelForward, PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget,
-    decode_metadata_page_capacity, prepare_paged_prefill_batch,
+    SpecVerifyOutput, SpecVerifyRequest, decode_metadata_page_capacity,
+    prepare_paged_prefill_batch,
 };
 use crate::model_arch::ModelArchInfo;
 use crate::model_registry::ModelArch;
@@ -570,6 +572,101 @@ impl ModelForward for Qwen35Model {
             }
             _ => self.decode_batch_contiguous(tokens, states, slot_indices),
         }
+    }
+
+    fn forward_spec_verify_batch(
+        &self,
+        requests: &[SpecVerifyRequest<'_>],
+        states: &mut [Self::State],
+        pool: &mut PagedKVPool,
+    ) -> Result<Vec<SpecVerifyOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        for request in requests {
+            anyhow::ensure!(
+                request.input_tokens.len() == request.draft_tokens.len() + 1,
+                "spec verifier input must be last-token + K draft tokens"
+            );
+        }
+
+        let mut outputs: Vec<SpecVerifyOutput> = requests
+            .iter()
+            .map(|request| SpecVerifyOutput {
+                slot_idx: request.slot_idx,
+                target_argmax_tokens: Vec::with_capacity(request.input_tokens.len()),
+            })
+            .collect();
+        let max_steps = requests
+            .iter()
+            .map(|request| request.input_tokens.len())
+            .max()
+            .unwrap_or(0);
+        let mut decode_ctx = self.create_decode_context(requests.len(), None, pool)?;
+        let greedy = SamplingParams::default();
+        let mut rng = StdRng::seed_from_u64(0x5eec_dec0de);
+
+        for step in 0..max_steps {
+            let mut tokens = Vec::new();
+            let mut slot_indices = Vec::new();
+            let mut output_indices = Vec::new();
+            for (idx, request) in requests.iter().enumerate() {
+                let Some(&token) = request.input_tokens.get(step) else {
+                    continue;
+                };
+                pool.cow_tail_page_for_append(&self.ctx, request.slot_idx)?;
+                pool.alloc_tokens(request.slot_idx, 1)?;
+                tokens.push(token);
+                slot_indices.push(request.slot_idx);
+                output_indices.push(idx);
+            }
+            self.forward_decode_batch(
+                &tokens,
+                states,
+                &slot_indices,
+                Some(pool),
+                &mut decode_ctx,
+                false,
+            )?;
+
+            // `SpecPath` keeps target KV at original_len + 1 + accepted.
+            // Slot j therefore stores recurrent state after verifier step j,
+            // making restore_from_ring(accepted) match the paged-KV truncate.
+            // The ring push replays the licensed CUDA Graph snapshot path, not
+            // the old per-layer memcpy loop killed by Step 0.
+            for &slot_idx in &slot_indices {
+                let verifier_seq_len = pool.seq_len(slot_idx);
+                states[slot_idx].recurrent_state.push_ring_slot_at_seq_len(
+                    &self.ctx,
+                    step,
+                    max_steps,
+                    verifier_seq_len,
+                )?;
+            }
+
+            for (idx, &slot_idx) in output_indices.iter().zip(&slot_indices) {
+                let (token, _) =
+                    self.select_token_with_logprob(&mut states[slot_idx], &greedy, &mut rng)?;
+                outputs[*idx].target_argmax_tokens.push(token);
+            }
+        }
+
+        Ok(requests
+            .iter()
+            .zip(outputs)
+            .map(|(_request, output)| output)
+            .collect())
+    }
+
+    fn commit_speculative_target_state(
+        &self,
+        states: &mut [Self::State],
+        slot_idx: usize,
+        num_accepted: usize,
+    ) -> Result<()> {
+        states[slot_idx]
+            .recurrent_state
+            .restore_from_ring(num_accepted)
     }
 
     fn sample_batch_greedy(

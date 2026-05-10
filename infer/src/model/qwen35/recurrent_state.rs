@@ -198,11 +198,27 @@ impl RecurrentState {
         slot_idx: usize,
         k_plus_1: usize,
     ) -> Result<()> {
+        self.push_ring_slot_at_seq_len(ctx, slot_idx, k_plus_1, self.seq_len)
+    }
+
+    /// Save the current recurrent state into a verifier rollback slot with an
+    /// explicit logical sequence length. Paged batched decode advances
+    /// `PagedKVPool::seq_len` before the model call; Qwen3.5 recurrent decode
+    /// kernels do not read `self.seq_len`, so spec verification must snapshot
+    /// the scheduler-owned length to keep rollback aligned with KV truncation.
+    #[allow(dead_code)]
+    pub(crate) fn push_ring_slot_at_seq_len(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_idx: usize,
+        k_plus_1: usize,
+        seq_len: usize,
+    ) -> Result<()> {
         self.ensure_spec_ring(ctx, k_plus_1)?;
         self.spec_ring
             .as_mut()
             .context("spec ring missing after capture")?
-            .push_slot(slot_idx, self.seq_len)
+            .push_slot(slot_idx, seq_len)
     }
 
     /// Restore recurrent state from a verifier rollback slot.
