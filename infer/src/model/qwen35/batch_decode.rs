@@ -506,7 +506,7 @@ impl Qwen35Model {
         &self,
         bufs: &mut BatchDecodeBuffers35,
         _states: &mut [Qwen35State],
-        _slot_indices: &[usize],
+        slot_indices: &[usize],
         kv_pool: &PagedKVPool,
         batch_size: usize,
     ) -> Result<()> {
@@ -584,6 +584,12 @@ impl Qwen35Model {
             c.rms_norm_eps,
             &mut bufs.common.normed,
         )?;
+        if let Some(capture) = &self.medusa_hidden_capture {
+            capture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Medusa hidden capture lock poisoned"))?
+                .store_batch(&self.ctx, slot_indices, &bufs.common.normed)?;
+        }
         let logits_buf = bufs.logits_batch.as_mut().unwrap();
         logits_buf.seq_len = batch_size;
         ops::gemm_into(

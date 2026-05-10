@@ -643,6 +643,14 @@ impl ModelForward for Qwen35Model {
                     verifier_seq_len,
                 )?;
             }
+            if let Some(capture) = &self.medusa_hidden_capture {
+                let mut capture = capture
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Medusa hidden capture lock poisoned"))?;
+                for &slot_idx in &slot_indices {
+                    capture.push_ring_slot(&self.ctx, slot_idx, step, max_steps)?;
+                }
+            }
 
             for (idx, &slot_idx) in output_indices.iter().zip(&slot_indices) {
                 let (token, _) =
@@ -666,7 +674,14 @@ impl ModelForward for Qwen35Model {
     ) -> Result<()> {
         states[slot_idx]
             .recurrent_state
-            .restore_from_ring(num_accepted)
+            .restore_from_ring(num_accepted)?;
+        if let Some(capture) = &self.medusa_hidden_capture {
+            capture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Medusa hidden capture lock poisoned"))?
+                .restore_ring_slot(&self.ctx, slot_idx, num_accepted)?;
+        }
+        Ok(())
     }
 
     fn sample_batch_greedy(
