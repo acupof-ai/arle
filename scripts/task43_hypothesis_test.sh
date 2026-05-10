@@ -42,6 +42,8 @@ cd "$REPO"
 MODEL_PATH="infer/models/Qwen3-4B-W4A16-sym-g128-marlin"
 PORT=8000
 TARGET="http://127.0.0.1:$PORT"
+NUM_SLOTS=8
+MAX_SEQ_LEN=5120
 DURATION=60
 CONCURRENCY=4
 PROMPT_TOKENS=4096
@@ -89,6 +91,8 @@ run_arm() {
     eval "$env_setup setsid target/release/infer \
       --model-path '$MODEL_PATH' \
       --port '$PORT' \
+      --num-slots '$NUM_SLOTS' \
+      --max-seq-len '$MAX_SEQ_LEN' \
       > '$server_log' 2>&1 &"
   local server_pid=$!
 
@@ -171,6 +175,13 @@ elif [[ "$ARM_A_HEALTH" -eq 0 && "$ARM_B_HEALTH" -eq 0 ]]; then
   echo "🚫 HYPOTHESIS DISPROVEN"
   echo "   Both arms HEALTHY = Task #43 root cause is NOT env-gated scratch fragmentation"
   echo "   Pivot to other Task #43 investigation paths"
+  exit 0
+elif [[ "$ARM_A_HEALTH" -eq 1 && "$ARM_B_HEALTH" -eq 0 ]]; then
+  echo "🚫 HYPOTHESIS DISPROVEN — inverse failure"
+  echo "   Arm A (scratch/prefill graph enabled) SUBSTRATE-KILL + Arm B HEALTHY"
+  echo "   = INFER_PREFILL_GRAPH=1 increases memory pressure for this W4A16 shape."
+  echo "   Pivot toward prefill-graph memory footprint / graph-resource cache sizing,"
+  echo "   not per-call cudarc allocator fragmentation in the eager fallback."
   exit 0
 elif [[ "$ARM_A_HEALTH" -ne 0 && "$ARM_B_HEALTH" -ne 0 ]]; then
   echo "⚠  AMBIGUOUS — both arms failed (Arm A: $ARM_A_HEALTH, Arm B: $ARM_B_HEALTH)"
