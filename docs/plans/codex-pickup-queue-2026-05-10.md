@@ -208,3 +208,29 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   tool quirk vs substrate KILL distinguishable). Arm B starting now;
   if Arm B also TOOL-QUIRK → AMBIGUOUS verdict per verdict-implications
   doc (cb86836) §4.
+- **2026-05-10 ~10:16 KST**: codex applied max-seq fix to script
+  (NUM_SLOTS=8 + MAX_SEQ_LEN=5120 — root cause of Arm A's TOOL-QUIRK
+  was insufficient max-seq for 4k bench). Arm A RE-RAN successfully
+  with real request metrics this time. But TWO new issues surfaced:
+  1. `pf83_bench_health.sh` JSON parser bug — reads success=0 even
+     when guidellm produced real request metrics. Likely results.json
+     schema mismatch (parser expects `requests_successful_total` but
+     guidellm 0.6.0 may use different key). Script refinement needed.
+  2. Server log has **36 failure-pattern matches** — codex notes
+     these may be REAL kernel faults OR benign Pass 3 warmup
+     OOM/backoff patterns (per SKILL #38 graceful fallback semantics).
+     The grep pattern `failed with code|gemm.*failed|prefill batch
+     failed|cudaError` is **too broad** — matches both KILL signals
+     and benign-fallback signals. Script discrimination needs
+     refinement (e.g. exclude `Marlin scratch OOM, falling back to
+     1024 tokens/row` patterns).
+  Codex waiting for Arm B + manual raw log inspection before
+  finalizing verdict.
+
+  **SKILL implication**: candidate v1.13.0+ #40 (single evidence
+  point so far): "bench-health discriminator must distinguish KILL
+  signals from graceful-fallback signals — same log pattern can mean
+  both. Refinement: enumerate fallback patterns + exclude from
+  failure count. Companion to #38 (warmup graceful fallback) — #38
+  introduces the fallback patterns; #40 ensures discrimination tools
+  don't conflate them with real failures."
