@@ -263,3 +263,9 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   targeted test_w4a8_vs_bf16_token_diff, loading 2 models for
   BF16-vs-W4A8 comparison). Mid-run mechanical state. First action
   matches brief verbatim — cooperative dispatch pattern healthy.
+- **2026-05-10 ~10:28 KST**: Task #48 step 1 COMPLETED — test
+  FAILED (`error: test failed, to rerun pass...`). Regression
+  confirmed exists; exact diff number pending codex's analysis of
+  346-line test output (ctrl+t transcript). Codex now likely moving
+  to step 2 (bisect 35fc3cf / c44788f / 09ae5a5 candidates).
+  GPU idle — test was brief 32-token greedy decode comparison.
