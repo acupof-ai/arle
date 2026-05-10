@@ -937,6 +937,58 @@ Each anti-pattern has a project commit/entry where it was paid for.
       raw evidence"; #32 is "peer's progress timer needs raw
       evidence too".
 
+13. **Codex review value-add IS load-bearing for non-trivial substrate
+    (NOT formality)** — anti-pattern #33 v1.12.0
+    - Caught by: `ace3cbe` 2026-05-10 PF8.3 substrate session — codex
+      review caught 3 REAL bugs that build + clippy + greedy_consistency
+      + e2e all PASSED:
+      1. Parallel-M launch loop off-by-N (HIGH severity, untriggered
+         by current test fixtures = anti-pattern #29 territory)
+      2. max_par/lock workspace contract underrun (HIGH severity,
+         likely manifests as Task #43 stack overflow under sustained load)
+      3. Hybrid W4 graph capture vs PF8 scratch interaction (MEDIUM,
+         performance not correctness)
+    - All 3 require contextual understanding (loop accounting cross-line,
+      cross-language workspace contract, cross-feature interaction)
+      that linters/tests cannot provide.
+    - Empirical evidence: 3 bugs / 1 diff / 27 min review = high
+      amortized value
+    - Strengthened rule: when build + clippy + tests all pass on a
+      non-trivial diff (≥3 files OR FFI boundaries OR cross-feature
+      interactions), run `codex review --uncommitted` BEFORE commit.
+      Skip review only for ≤3-file mechanical changes.
+    - Companion to #29: tests passing ≠ code correct; codex review
+      provides another verification layer that catches what tests
+      miss.
+
+14. **greedy_consistency single-request PASS is NECESSARY but NOT
+    SUFFICIENT for new GEMM kernel substrate** — anti-pattern #34 v1.12.0
+    - Caught by: `0cde63d` 2026-05-10 PF8.3 RUNTIME KILL — kernel
+      passed greedy_consistency at conc=1 (4.33s) and e2e PASSED, but
+      ran 100% failure rate (101380/101380 with code 2) under
+      sustained conc=4+ bench load. Confirmed by `57c37b5` H8 verify:
+      kernel STILL works at conc=1 but fragments under sustained load.
+    - Root cause: greedy_consistency runs single requests with small
+      batches; failure modes specific to sustained load (allocator
+      fragmentation, OOM under high concurrency, kernel resource
+      exhaustion under burst) DON'T MANIFEST at conc=1.
+    - Strengthened rule: PAIR greedy_consistency PASS with sustained-
+      load bench (≥30s, multiple concurrencies 1+2+4) BEFORE declaring
+      license. Substrate validation is incomplete without conc≥2
+      sustained-load proof.
+    - **Sub-rule (#34b)**: when bench reports "0 successful requests"
+      OR "all-zero latency table", CHECK SERVER LOG FIRST before
+      debugging bench tool. v3-v10 PF8.5 attempts wasted 30+ min
+      on guidellm CLI quirks (PATH, --backend-kwargs, --outputs html,
+      absolute path, pre-mkdir) when the actual issue was 100%
+      kernel failure surfaced via server log line 627 (`prefill
+      batch failed: gemm_w4_fp8_marlin_cuda failed with code 2`).
+      First diagnostic step: `grep -c "failed with code" /tmp/<server>.log`
+    - Companion to #29 + #33: #29 is "default test fixtures may be
+      broken"; #33 is "tests passing ≠ code correct (codex review
+      catches more)"; #34 is "tests passing AT one shape ≠ tests
+      passing at all shapes (sustained-load bench catches more)".
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -1026,6 +1078,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.9.0** | **2026-05-10** | **27** | **(this commit) added #26-27 from #37 Path B v1 KILL → #40 Path B.2 wins chain. Theme: "cache-hit-rate claims need cardinality evidence, and bucketing fixes need second-order scalar-capture sync". Sources: `a7a8b94` #26 (Path B v1 388-key churn at 4k production despite shape-(4,3,8) smoke success) / `a56b7a9`+`c44788f` #27 (Codex's second-order bucketing insight beyond Claude brief: bucketed key + captured scalars baked at first-capture dim = semantic miss; bucketed key + captured scalars baked at bucket capacity = 98.5% reuse, engine TTFT -92.5%). Compound learning: the same Phase B family of optimization required two distinct anti-pattern lessons, one per KILL→WIN cycle.** |
 | **v1.10.0** | **2026-05-10** | **28** | **(this commit) added #28 from `ee2c5b0` SOLID-critical hallucination chain. Theme: "agent fabrication overrides peer's correct conclusion when memory of prior tool output is trusted over fresh verification". Source: Claude challenged codex's correct claim that `--max-waiting-requests` CLI flag does not exist, cited fabricated grep evidence, codex (rightly) trusted the "correction" and used `--cold-headroom 253` workaround. Two ticks later audit-of-audit re-ran verification → direct evidence proved codex correct from start (`git log -S` shows string never existed in main.rs). Lesson distinct from #25 ("audit-chain shared blindspot"): #28 is "agent fabricates evidence", and empirical bench doesn't catch it because the bench command itself is built on the fabrication. Fix: when correcting peer agent file-content claim, MUST re-run verification in SAME response and quote raw output literally, NOT summarize memory.** |
 | **v1.11.0** | **2026-05-10** | **32** | **(this commit) batch-added #29-32 from same-day cooperative discipline session. Theme: "verify substrate of EVERY claim, not just contested ones". Evidence chain: 4 hallucinations sedimented in single session (`0f4d0ae` CLI flag, `43bda9c` reduce buffer, `4b30c15` /health endpoint, `5bf0e20` baseline mismatch) + cooperative race in `0d63a52`/`994a294` recovery + 33min wedged poll in `4b30c15`. Sources: `eb2b4b6` #29 (default test fixture broken since #25, codex correctly overrode via env var) / `0d63a52`+`994a294`+`ca09db0` #30 (commit-time worktree race; status BEFORE commit not just before add) / `c3bb82b`+`d387b03` #31 (ARLE surface claims need raw evidence even when not contesting peer; 4 hallucination pattern caught by self-audit) / `4b30c15` #32 (peer "Waiting >5min" warrants direct ps/log/curl verify; recovered ~33min of codex bandwidth). Cumulative compound learning: `de36538` retrospective + `940f49e` self-implementation by Claude (PF8.1+2) demonstrated discipline working — cooperative pipeline recovers from individual mis-claims when each agent applies raw-evidence-required rule.** |
+| **v1.12.0** | **2026-05-10** | **34** | **(this commit) added #33+#34 from PF8.3 substrate session evidence. Theme: "code-correct ≠ runtime-correct under load". Evidence chain: codex review caught 3 real bugs that all formal gates passed (`ace3cbe` parallel-M loop + max_par/lock workspace + graph capture interaction); PF8.3 RUNTIME KILL with 101380/101380 failures despite greedy_consistency PASS at conc=1 (`0cde63d` + `57c37b5` H8 verify). Sources: `ace3cbe` #33 (codex review IS load-bearing for non-trivial substrate, NOT formality; 3 bugs/27min review = high amortized value; required when build+clippy+tests pass on FFI/cross-feature/parallel logic diffs) / `0cde63d`+`57c37b5` #34 (greedy single-request PASS NECESSARY but NOT SUFFICIENT; pair with sustained-load bench at conc 1+2+4; sub-rule #34b: bench 0-success → CHECK SERVER LOG FIRST, wasted 30+min on guidellm CLI quirks when real cause was kernel 100% failure visible in /tmp/<server>.log). Cumulative compound learning: 7 hallucinations across this session + 3 codex-review bug catches + 1 RUNTIME KILL exposed by sustained load = code-correctness gates and runtime-correctness gates are SEPARATE concerns; both required for license-grade substrate.** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
