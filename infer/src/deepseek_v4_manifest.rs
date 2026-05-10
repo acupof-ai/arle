@@ -73,7 +73,7 @@ fn safetensor_names(model_path: &Path) -> Result<HashSet<String>> {
             .with_context(|| format!("parsing safetensors header {}", path.display()))?;
         for name in header.keys() {
             if name != "__metadata__" {
-                names.insert(name.to_string());
+                names.insert(name.clone());
             }
         }
     }
