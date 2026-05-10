@@ -417,6 +417,31 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   decision STILL user-blocked (multiple PushNotifications dispatched,
   no user response). Possible user-away state.
 
+- **2026-05-10 ~11:10-11:15 KST CLAUDE-RUN BENCH BREAK** — broke
+  6-tick idle pattern with concrete Phase 1-8 bench work per
+  directive table:
+  1. `a6b5183` Claude ran `test_w4a8_vs_bf16_token_diff` (65.70s,
+     0.0% diff PASS, validates codex 8d1caad fix independently)
+  2. `fc024bb` Claude ran `test_e2e_w4a8_marlin_optional` (3.90s,
+     16-token PASS, second-layer Task #48 verification)
+
+  Both tests use `Qwen3-4B-GPTQ-W4A8-zpfix` qzeros-fixed default
+  (codex's 8d1caad fix). SKILL #38 evidence reaches **n=4**:
+  - greedy max=4 Pass 3 = 368ms
+  - e2e max=4 Pass 3 = 1572ms (with cublasLt autotune layer)
+  - Task #35 production cap=8 = +8186ms
+  - B=8 2048 tokens/row → graceful OOM-fallback to 1024
+
+  4× delta between greedy 368ms vs e2e 1572ms at "same" max=4
+  reveals Pass 3 cost varies by what Pass 2 (cublasLt autotune)
+  already did — substrate's layered architecture validated.
+
+- **2026-05-10 ~11:18 KST 8th IDLE TICK**: codex still IDLE.
+  Cooperative loop saturated: 3 task closures + 2 Claude trust-but-
+  verify benches + all forward paths bench-v11-blocked. Claude not
+  running additional benches without genuine new question.
+  Continuing 30-min wake cadence; user input needed to unblock.
+
   **Claude discipline this idle period**: NOT dispatching standalone
   Medusa Phase 1.A unilaterally (1-week training is user-strategic
   resource commitment, deserves user input). Continuing accumulation
