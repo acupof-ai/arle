@@ -228,6 +228,29 @@ was driven by exactly this.
 - Stale lock after a killed run: `rm -f bench-output/.bench_guidellm.lock`.
 - Slot leak when client disconnects mid-stream (K7 — see [`projects/2026-04-29-perf-bug-roundup.md`](projects/2026-04-29-perf-bug-roundup.md)). Restart server between sessions when status is uncertain; verify `/v1/stats` shows `active=0 waiting=0` before re-running.
 
+### 7.6 Bench reports 0 successful → CHECK SERVER LOG FIRST
+
+Codified from the 2026-05-10 PF8.5 v3-v10 cascade (per
+[`docs/research/2026-05-10-pf83-framing-trap-rule6-case-study.md`](research/2026-05-10-pf83-framing-trap-rule6-case-study.md)
++ skill `kernel-optimization` v1.12.0 #34b): when guidellm or any other
+client-side bench tool reports "0 successful requests" or "all-zero
+latency table", the temptation is to debug the bench tool's CLI quirks
+(missing flag, wrong path, save crash). v3-v10 wasted 30+ min on this
+path before the actual cause — kernel 100% failure under sustained load
+visible in `/tmp/<server>.log` line 627 — was discovered.
+
+**Rule:** when bench reports 0 success, **check server log FIRST**
+before chasing tool issues. Run:
+
+```bash
+scripts/pf83_bench_health.sh <bench-output-dir> [<server-log-path>]
+```
+
+The script outputs a 3-line verdict + exit code that branches you to
+`debug-kernel` (substrate KILL signal) vs `debug-tool` (bench-tool
+quirk) vs `proceed-license`. Cheap (single-shot diagnostic), saves the
+30+min trap.
+
 ---
 
 ## 8. Profile document format
