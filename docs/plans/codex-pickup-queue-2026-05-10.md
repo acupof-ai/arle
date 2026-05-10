@@ -578,6 +578,28 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   cache window anyway; less wakeup overhead until codex commits or
   user signals direction.
 
+- **2026-05-10 EOD+1280 (35-36th tick — saturation tail acknowledgment)**:
+  Codex IDLE since ~10:55 KST (5hr+). GPU baseline. No new state across
+  10+ idle ticks since PF8.5 KILL chain saturated. Multiple
+  PushNotifications dispatched without user response.
+
+  **Recent sediments since EOD+1170**:
+  - `657c297` H1' plan status updated → BLOCKED-pending-redesign
+  - `c6c9563` SKILL.md changelog row ordering bug fix (v1.13 → v1.14 → v1.15)
+  - `a64fad7` direction-options doc (3 forward paths + recommendation
+    matrix for user pickup)
+  - PushNotification: "PF8 chain saturated 5hr. 3 options doc'd."
+
+  **Process honesty note**: per §0 SOLID, accumulation discipline
+  produces diminishing returns past saturation. Recent ticks have
+  produced housekeeping (index refresh, status updates, ordering fix)
+  rather than substantive new evidence — appropriate at saturation,
+  but past the point where bench-running adds value.
+
+  **Awaits**: user A/B/C decision per `2026-05-10-post-pf85-direction-
+  options.md`, OR codex resume, OR explicit "scaffold X while I think"
+  authorization for Option A pre-emptive Alpaca dataset prep.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
