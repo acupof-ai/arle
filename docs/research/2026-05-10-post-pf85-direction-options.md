@@ -137,13 +137,22 @@ the stated -20-40% goal.
 If user wants to pre-empt their decision time:
 - **Scaffold Medusa Phase 1.A dataset prep** (Alpaca download +
   tokenize, ~1-2 hr CPU work, no GPU; per `63769be`)
-- **Read Task #30 Hybrid dispatch source** (current Linear dispatch
-  in `linear.rs:2064-2095` per `1ba06f0`) to estimate Phase 1
-  scope
-- **Draft Option B Phase 1 brief** for codex pickup readiness
+- ~~**Read Task #30 Hybrid dispatch source**~~ — DONE EOD+1340 per
+  `cc8b437` (linear.rs:80-141 read; B.1/B.2/B.3 sub-options identified;
+  Option B downgraded due to checkpoint format blocker)
+- ~~**Draft Option B Phase 1 brief**~~ — VOIDED EOD+1430 per `92813dc`
+  (end-to-end perf math shows -2.4% max value, sub-Machete-class)
 
-These don't commit to a decision, just reduce time-to-execution
-for whichever option the user picks.
+**Prerequisites for Alpaca scaffold (verified ready EOD+1500)**:
+- `datasets` 4.8.5 in `.venv/bin/` ✅
+- No existing `scripts/medusa_*.py` or `scripts/alpaca_*.py` to conflict ✅
+- Public dataset (`tatsu-lab/alpaca`, no HF auth needed) per `63769be` ✅
+- Estimated scaffold script size: ~50-100 LOC (HF loader + Medusa-1 format)
+- Estimated wall-clock: ~20 min for script + ~30-60 min for first download/tokenize
+
+**Awaiting explicit user authorization** ("scaffold X while I think")
+before pre-emptive scaffold execution per §0 SOLID rule (no inferring
+user intent on action commitments).
 
 ## §5 Status
 
