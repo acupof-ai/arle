@@ -273,6 +273,32 @@ bugs each**. Pattern is consistent magnitude, not just consistent
 existence. Strong argument that codex review is the highest-yield
 verification step for non-trivial diffs.
 
+### §6.10 W4 startup A/B attempt — server not ready in 5-10s (W4 likely > 60s BF16)
+
+Per codex tmux ~57min: codex started 6-arm W4 startup A/B (3 off-arm
+runs + 3 on-arm runs) but first arm not ready within expected 5-10s
+window. Codex's discipline statement: "如果 120s 超时，会直接保留已有
+sustained-load 和 targeted greedy 证据，不把这个失败尝试写成成功数据".
+
+Translation: if 120s timeout reached, keep existing evidence + NOT
+claim Pass 3 W4 numbers in the wins entry — exactly the SKILL #34
+multi-shape discipline (refuse to substitute partial data for full
+validation).
+
+**Implication for §6.9 startup cost**: BF16 B=4 = 60s already. W4
+startup is even slower (model weights require quantization unpack +
+graph capture for W4 paths). If W4 Pass 3 takes > 120s per arm,
+the practical Pass 3 cost on production W4 deployments may be
+multiple minutes per server boot — large enough that "default-OFF
+for dev / default-ON for production" decision flips toward "always
+opt-in, never default-on".
+
+**Codex demonstrating SKILL #34 in real-time**: refusing to claim
+data that doesn't exist. This is exactly the discipline #34 codified
+("greedy single-PASS NECESSARY but NOT SUFFICIENT") applied to an
+adjacent decision (don't backfill missing data with optimistic
+assumptions). Reinforces the rule.
+
 ### §6.9 DRAMATIC startup cost surprise — real Pass 3 is ~200-1000× more expensive than predicted
 
 Per codex tmux ~56min: targeted greedy PASSED post-fix, codex measured REAL
