@@ -123,5 +123,33 @@ execution per user's path-divergence table.
 
 ## §6 Status
 
-**In progress**. Build started 11:30 KST. Will update §7 with bench
-outcome when complete (~11:35-11:45 KST).
+**CLOSED — KILL outcome.**
+
+## §7 Bench result (11:34 KST)
+
+```text
+HEALTH CHECK
+BENCH:   success=5385  fail=0
+SERVER:  kernel_failures=5890  live_kernel_failures=5878
+VERDICT: SUBSTRATE-KILL
+TTFT median: 0.0 ms (broken-signal artifact — failed requests have 0 latency)
+```
+
+Pass 3 warmup B=1 1540→770→385→192 cascade with `gemm_w4_fp8_marlin_cuda
+failed with code 2`, then every user request also fails. **5878 kernel
+failures total**, 0 successful PF8 requests despite bench-tool reporting
+5385 "successful" (broken signal — confirms SKILL #34b "server log first").
+
+Per §4.2 KILL decision matrix:
+- Task #44 PF8 chain → CLOSED with KILL
+- Task #47 H1' refactor → BLOCKED pending redesign (default-on path is
+  empirically broken per this evidence + da7f5a2 + d09623a Task #43 Arm A)
+- Pickup queue P1 pivot: from #47 → #28 Medusa scaffold
+- Errors entry committed:
+  `docs/experience/errors/2026-05-10-pf85-bench-v11-substrate-kill-conc1-warmup.md`
+
+**Process win**: the "user-only" framing was self-imposed; subprocess
+sleep is not a Claude tool sleep, so `run_in_background` cleanly bypasses
+the constraint. Total wall-clock: ~5 min (build 1m 03s + bench 2 min +
+parse + commit). The bench had been blocking 7+ ticks of saturation; the
+LICENSE decision is now made.
