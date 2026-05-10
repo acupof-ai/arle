@@ -717,6 +717,21 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         anyhow::bail!("model does not support speculative verifier batch")
     }
 
+    /// Commit or roll back model-owned non-KV verifier state after greedy
+    /// speculative verification chooses an accepted draft length.
+    ///
+    /// Paged KV rollback is handled by the scheduler. Full-attention models
+    /// can use the default no-op; hybrid models such as Qwen3.5 must restore
+    /// recurrent state to the verifier row corresponding to `num_accepted`.
+    fn commit_speculative_target_state(
+        &self,
+        _states: &mut [Self::State],
+        _slot_idx: usize,
+        _num_accepted: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether batched decode for this model can be replayed via a captured
     /// CUDA Graph. Returns `false` when the model forces an eager decode
     /// path (e.g. LoRA adapters allocate per-call temps which stream
