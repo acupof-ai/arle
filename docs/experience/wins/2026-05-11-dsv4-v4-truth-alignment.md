@@ -34,8 +34,9 @@ Expected evidence is compile + CPU manifest validation.
 - Host: local CUDA workstation
 - GPU target: RTX 4070 Ti SUPER / `sm_89`
 - Rust profile for executable validation: release
-- CUDA kernel build status: blocked by pre-existing nvcc/GCC16 issue in
-  `csrc/attention/decode_attention_quantized.cu`
+- CUDA kernel build status: default compiler path hits GCC16/nvcc
+  incompatibility; release CUDA gate passes with
+  `NVCC_CCBIN=/usr/bin/g++-14 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python`
 
 ## Results
 
@@ -59,8 +60,8 @@ Verification:
 | `cargo check -p infer --no-default-features --features cuda,no-cuda` | PASS |
 | `cargo check -p infer --tests --no-default-features --features cuda,no-cuda` | PASS |
 | `cargo test --release -p infer --no-default-features --features no-cuda --lib` | PASS: 569 passed, 11 ignored |
-| `cargo check --release -p infer --features cuda` | FAIL: pre-existing nvcc/GCC16 blocker in `decode_attention_quantized.cu` |
-| `cargo clippy --release -p infer --features cuda -- -D warnings` | FAIL: same pre-existing nvcc/GCC16 blocker |
+| `NVCC_CCBIN=/usr/bin/g++-14 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python cargo check --release -p infer --features cuda` | PASS |
+| `NVCC_CCBIN=/usr/bin/g++-14 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python cargo clippy --release -p infer --features cuda -- -D warnings` | PASS |
 
 The release no-cuda test run includes:
 
@@ -70,10 +71,11 @@ The release no-cuda test run includes:
 
 ## Problems
 
-The CUDA release and clippy gates cannot reach Rust typechecking because nvcc
-fails while compiling `csrc/attention/decode_attention_quantized.cu` against
-`/usr/include/c++/16.1.1/type_traits` (`char8_t` / `requires` errors). This is
-the pre-existing blocker called out in the mission brief.
+The default CUDA release environment still fails because nvcc compiles
+`csrc/attention/decode_attention_quantized.cu` against
+`/usr/include/c++/16.1.1/type_traits` (`char8_t` / `requires` errors). The
+actionable gate for this host is to pin nvcc host compiler to
+`/usr/bin/g++-14` and point `INFER_TILELANG_PYTHON` at the repo `.venv`.
 
 `dsv4_v4_1b_smoke` remains ignored for prefill/decode because V4 attention and
 MoE kernels are intentionally not part of Phase 0.5.
