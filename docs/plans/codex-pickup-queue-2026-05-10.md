@@ -442,6 +442,30 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   running additional benches without genuine new question.
   Continuing 30-min wake cadence; user input needed to unblock.
 
+- **2026-05-10 ~11:25 KST 9th-12th IDLE TICKS**: continued idle
+  through 4 more cron ticks, but Claude broke pattern via:
+  - 9th: 3rd Claude bench `5c2d68e` — TRUE single-variable A/B Pass 3
+    ON vs OFF on test_e2e_w4a8_marlin_optional (1.59s -40.8% delta
+    confirms 1572ms Pass 3 cost; validates Pass 3 is opt-in
+    optimization not correctness requirement)
+  - 10th: 4th Claude bench attempted (`b956f3a`) — applied SKILL #29
+    anti-pattern by substituting W4-hybrid-zpfix into W4A8-marlin
+    test → 100% diff was fixture mismatch not real bug; Claude self-
+    corrected. Discovered codex 8d1caad TIGHTENED gate from 25% → 1%
+    (richer scope than Claude knew).
+  - 11th: SKILL #29 evidence accretion to n=4 (`0062500`) covering
+    eb2b4b6 + Task #48 + Claude be133f8 audit + Claude self-application.
+    Universalized rule: applies to test authors + consumers + env-
+    override users.
+  - 12th (this): saturation acknowledged. Total session-tail work:
+    3 task closures + 4 Claude benches (3 PASS + 1 self-corrected) +
+    SKILL #29 n=4 + 62+ Claude commits.
+
+  PF8.5 license decision STILL user-blocked. Cooperative loop fully
+  validated end-to-end across all 4 layers (codex execution + Claude
+  trust-but-verify + Claude single-variable A/B + Claude self-
+  correction).
+
   **Claude discipline this idle period**: NOT dispatching standalone
   Medusa Phase 1.A unilaterally (1-week training is user-strategic
   resource commitment, deserves user input). Continuing accumulation
