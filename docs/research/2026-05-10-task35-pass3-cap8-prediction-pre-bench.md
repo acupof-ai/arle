@@ -273,6 +273,49 @@ bugs each**. Pattern is consistent magnitude, not just consistent
 existence. Strong argument that codex review is the highest-yield
 verification step for non-trivial diffs.
 
+### §6.11 Codex applying SKILL #29 to its own prior data (pre-fix logs contaminated)
+
+Per codex tmux ~1h 01min:
+
+> 旧 on 日志是 review 修复前的 64-token warmup，不能再作为当前实现的数据。
+> 我改用日志里的 CUDA Graph warmup done 作为 readiness 标志，重新采 W4
+> 当前实现的 Pass 3 startup cost。
+>
+> [translation]: Old on-arm logs are pre-review-fix 64-token warmup
+> data, can no longer count as current implementation data. I'll
+> switch to using the "CUDA Graph warmup done" log line as readiness
+> marker, re-collect W4 current implementation Pass 3 startup cost.
+
+This is **codex independently applying SKILL #29** (default broken
+fixtures may be known-broken) to its OWN prior bench data — the
+recognition that data collected before the 4 review fixes (sync +
+chunked_prefill_size + temp-context + max_seq_len) is from a
+fundamentally different (BUGGY) substrate and must be discarded /
+re-collected.
+
+This validates SKILL #29 as a generalizable pattern beyond test
+fixtures:
+- Original #29 (codex caught W4A8 default greedy_consistency PASS
+  vs PF8 INACTIVE) — test fixture broken default
+- Today's case (codex catching its own pre-fix bench data is no
+  longer current) — substrate-state broken default
+
+Both are "data may be from a substrate snapshot you don't intend to
+generalize from". The pattern: **after substantial code change
+(refactor / fix / dispatch path adjustment), prior bench data may
+not transfer to current substrate even if methodology was identical**.
+
+**Skill candidate v1.13.0+ #39 (single evidence, not codifying yet)**:
+"After applying review fixes / dispatch refactor / non-trivial code
+change, ALL prior bench numbers from that file/path are stale and
+must be re-collected. Do NOT mix pre-fix + post-fix data in same A/B.
+The substrate identity changed."
+
+Watch-list: when Task #47 H1' refactor lands, any prior PF8 chain
+bench numbers (v3-v10 attempts) become STALE — must re-collect at
+the new substrate. Codex is already applying this discipline here in
+real-time.
+
 ### §6.10 W4 startup A/B attempt — server not ready in 5-10s (W4 likely > 60s BF16)
 
 Per codex tmux ~57min: codex started 6-arm W4 startup A/B (3 off-arm
