@@ -192,3 +192,10 @@ P1 branches on bench v11 outcome (user gate). P2 always available.
 
 Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
 `docs/index.md` reference next tick if needed.
+
+## §8 Dispatch log
+
+- **2026-05-10 ~10:08 KST**: P0 Task #43 hypothesis test DISPATCHED to
+  codex via tmux nudge after Task #35 landing (a2ad788) + 25min codex
+  idle gap. Codex Working as of ~10:09. Expected ~30 min wall-clock
+  to verdict.
