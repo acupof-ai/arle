@@ -9,13 +9,13 @@ related_docs: [`2026-05-10-post-pf85-direction-options.md`, `2026-05-10-w4a16-lo
 # 2026-05-10 Session-tail TOTAL summary
 
 > **Purpose**: single-anchor doc capturing ALL substantive work from
-> this session-tail (~6+ hours, 80+ ticks, ~70+ Claude commits) for
+> this session-tail (~7+ hours, 86+ ticks, ~75+ Claude commits) for
 > efficient next-session pickup. Supersedes scattered references in
 > pickup queue §8 + various wins/errors/research entries.
 
 ## §1 Cumulative bench tally (Claude-run)
 
-**18 PASS + 1 NULL-discovery + 1 misapplied (self-corrected)** across
+**19 PASS + 1 NULL-discovery + 1 misapplied (self-corrected)** across
 session-tail. Categorized:
 
 ### §1.1 PF8.5 license + isolation chain (5 benches)
@@ -61,7 +61,20 @@ actual 1.336s).
 
 §9.4 prediction validated at +4% margin (predicted 948 → actual 985).
 
-### §1.5 Verification + self-correction (6 benches)
+### §1.5 BF16 baseline (1 bench, added EOD+2150)
+
+| Path | TTFT | ITL | tok/s | Note |
+|---|---:|---:|---:|---|
+| BF16 (no quant) | 68.7 ms | 14.0 ms | 69.3 | Surprising: W4A16 STRICTLY dominates BF16 (TTFT -4%, ITL -59%, tok/s +130%) |
+
+Per `eab166d` wins entry: quantization is STRICT WIN at sm_89 16GB,
+not a tradeoff. Decode is HBM-bound on weight read; 4× less weight
+memory at W4 → ~4× theoretical decode speedup; actual -59% ITL
+matches. Accuracy preserved (greedy 0.0% diff per Task #48 8d1caad).
+
+**Validates W4 quant axis as primary path on sm_89.**
+
+### §1.6 Verification + self-correction (6 benches)
 
 | Bench | Result | Notes |
 |---|---|---|
