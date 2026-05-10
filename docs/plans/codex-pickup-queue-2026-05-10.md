@@ -354,3 +354,21 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   preferred recommendation; if #3 also fails, fall back to #2 per
   eb2b4b6. If both #2 and #3 fail, then there IS a code regression
   beyond the fixture issue.
+- **2026-05-10 ~10:48 KST COOPERATIVE PATTERN WIN**: codex picked up
+  Claude's be133f8 audit recommendation in real time — modified
+  BOTH `e2e.rs` AND `greedy_consistency.rs` (matches audit §4
+  recommendation), created errors entry
+  `docs/experience/errors/2026-05-10-task48-w4a8-default-fixture-broken.md`
+  (untracked WIP), now running default targeted test (no env
+  override) to verify the new default fixture. fmt + diff checks
+  passed. ~5 min remaining for compile + 2 model loads.
+
+  **Meta-pattern**: this is the 2nd cooperative-pattern win this
+  session where Claude's CPU-bound audit work directly enters codex's
+  next commit:
+  1. Task #43 brief → codex executed verbatim per scaffold
+  2. Task #48 audit (be133f8) → codex applied scope to both files
+
+  Validates the directive "Claude 必须并行执行,不能 idle 等 codex"
+  — Claude's CPU-bound work is load-bearing for codex's diff scope,
+  not just monitoring.
