@@ -733,6 +733,24 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
 
   No code change this tick. Synthesis sediment only.
 
+- **2026-05-10 EOD+2070 (81st-82nd tick — session-tail TOTAL summary anchor)**:
+  Per accumulation discipline at saturation, wrote
+  `2026-05-10-session-tail-total-summary.md` (`9350767`, 168 LOC) as
+  single next-session pickup anchor. Replaces need to read scattered
+  references in pickup queue + various wins/errors/research docs.
+  Captures:
+  - §1 Cumulative bench tally (22 entries, 18 PASS + 1 NULL + 1 misapplied)
+  - §2 SKILL graduations (3 this session-tail, 37 canonical total)
+  - §3 Pending candidates (#37/#39/#40/#41/#42 + 2 new)
+  - §4 n=5 hybrid value progression fully measured
+  - §5 Strategic decision matrix refined post-session
+  - §6 Tasks state at end
+  - §7 Procedural sediments + memory references
+  - §8 Key cross-references for next-session pickup
+  - §9 4 open questions for user
+
+  Most efficient single-doc pickup for next session.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
