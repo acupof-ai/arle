@@ -48,21 +48,40 @@ align; Medusa is a real model with real failure modes.
 
 ### §2.2 Option B: Pickup Task #30 Hybrid W4A16/W4A8 dispatch (P2)
 
-**Scope**: Phase 1-3 substrate (no current scaffold). Per task name
-"Hybrid W4A16/W4A8 dispatch Phase 1-3 substrate" — would build the
-runtime-side dispatch logic for picking W4A16 vs W4A8 path per layer
-or per workload phase.
+**Scope**: Phase 1-3 substrate (no current scaffold).
 
-**Acceptance gate**: per Arm C+D data, hybrid would target
-W4A8-prefill (54.2ms TTFT) + W4A16-decode (5.8ms ITL) =
-**theoretically combines best of both**. Net improvement: -18%
-TTFT vs W4A16-only + -50% ITL vs W4A8-only. Math not yet validated.
+**SOURCE-READ FINDING (added EOD+1340)**: per `linear.rs:80-141`
+(`LinearKernelPlan::batched`), the dispatch logic ALREADY checks
+phase + batch + weight format to pick MarlinW4Gemm /
+MarlinW4A8Gemm / MarlinW4Hybrid (PF8) / MarlinW4FP8Prefill (PF8).
+Adding W4A8-prefill + W4A16-decode hybrid is ~50 LOC dispatch
+change. **BUT**: the real blocker is **model weights are EITHER
+W4A8 OR W4A16, not both** — the dispatch can't route to a path
+that doesn't have weights for it.
 
-**Risk**: dispatch overhead at layer boundaries could eat the win;
-needs measured A/B not just paper math.
+**Therefore Option B requires ONE of**:
+- **B.1**: New "dual-quant" checkpoint format (W4A8 prefill weights
+  + W4A16 decode weights co-loaded) — significant tooling work,
+  doubles weight memory, complicates loader
+- **B.2**: Runtime W4A8↔W4A16 conversion at phase boundary — slow,
+  defeats the perf purpose
+- **B.3**: Two MODEL-LOAD copies of same model (one W4A8 one W4A16)
+  in different slots — doubles VRAM, would not fit 16GB GPU for
+  Qwen3-4B (8GB × 2 = 16GB just for weights, no room for KV)
 
-**Time to first measurement**: ~5 days (Phase 1 substrate scaffold +
-codex pickup + Claude bench cycle).
+**Acceptance gate**: per Arm C+D data, theoretical W4A8-prefill +
+W4A16-decode would combine 54.2ms TTFT + 5.8ms ITL — but this is
+gated on the checkpoint format problem above being solved.
+
+**Risk**: HIGH on checkpoint format work; LOW on dispatch logic
+(already substrate-ready).
+
+**Time to first measurement**: ~2 weeks (B.1 checkpoint format
+tooling + dispatch + codex pickup + Claude bench), NOT ~5 days as
+originally estimated.
+
+**Recommendation update**: Option B is harder than initially framed.
+Re-evaluate vs Option A (Medusa, 2-3 days) for time-to-result.
 
 ### §2.3 Option C: PF8.3 H1' redesign (Task #47 BLOCKED, broader scope)
 
@@ -85,14 +104,21 @@ refactor attempts; redesign may not converge. ~2-4 weeks.
 even at conc=1 with warmup OFF, suggesting the per-call alloc bug
 isn't superficial. Medusa (Option A) gives more confident win path.
 
-## §3 Recommendation matrix
+## §3 Recommendation matrix (REVISED EOD+1340 after §2.2 source-read)
 
 | User priority | Recommended option | Time-to-result |
 |---|---|---|
 | Maximum tok/s (throughput) | **A (Medusa)** | 2-3 days |
-| Maximum TTFT/ITL (latency) | **B (Hybrid)** | ~5 days |
+| Maximum TTFT/ITL (latency) | ~~B (Hybrid)~~ A (Medusa with optimized W4A16 baseline) | A: 2-3d, B: ~2 weeks |
 | Resurrect PF8 path (W4A8 substitute) | **C (H1' v2)** | 2-4 weeks |
-| **Default if no preference** | **A (Medusa)** | clearest pickup |
+| **Default if no preference** | **A (Medusa)** | clearest pickup, lowest blocker risk |
+
+**Why B was downgraded**: source-read of `linear.rs:80-141` reveals
+the dispatch logic is ~50 LOC easy, but the dual-quant CHECKPOINT
+FORMAT problem is the real blocker (~2 weeks of tooling work, and
+B.3 in-VRAM duplication doesn't fit 16GB GPU). Option A (Medusa)
+remains the clearest path to measurable improvement at lowest
+blocker risk.
 
 ## §4 What Claude can do RIGHT NOW (without user decision)
 
