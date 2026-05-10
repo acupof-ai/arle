@@ -48,6 +48,10 @@ impl GenerationState for Qwen3State {
         self.base.reset()
     }
 
+    fn reset_for_warmup_clear(&mut self) -> Result<()> {
+        self.base.reset()
+    }
+
     fn truncate_to(&mut self, len: usize) -> Result<()> {
         self.base.truncate_to(len)
     }

@@ -496,6 +496,10 @@ docs promote them more clearly:
 - `INFER_QWEN3_FP32_RESIDUAL` — force FP32 residual accumulation on
   the Qwen3 prefill path (`infer/src/model/qwen3/prefill.rs`); debug aid
   for numerical-stability investigations
+- `INFER_PREFILL_WARMUP` — controls the CUDA scheduler's startup prefill
+  warmup pass (`infer/src/scheduler/cuda/core/warmup.rs`). Default is enabled.
+  Set to `0`, `false`, `off`, or `no` to skip the pass for cold-start A/B
+  measurements; this is a diagnostic escape hatch, not a runtime tuning knob.
 - `AGENT_INFER_QWEN35_CPP_SEPARATE` — toggle the Rust→C++ separate-proj
   path in `infer/src/backend/metal/qwen35.rs`. Default on; set to `0`
   to force the fused route for A/B comparison
