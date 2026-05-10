@@ -1,8 +1,8 @@
-//! `ModelForward` impl for the DeepSeek scaffold.
+//! `ModelForward` impl for the DeepSeek V4 scaffold.
 //!
 //! Every method body is a `todo!()` stub today — the type plumbing is set up
-//! so that when the MLA prefill + decode kernels (CUDA + Metal) land they can
-//! drop into the existing scheduler interface unchanged.
+//! so that when the V4 attention + MoE kernels land they can drop into the
+//! existing scheduler interface unchanged.
 
 #[cfg(feature = "cuda")]
 use anyhow::Result;
@@ -68,7 +68,7 @@ impl ModelForward for DeepseekModel {
     }
 
     fn forward_decode(&self, _token: u32, _state: &mut Self::State) -> Result<()> {
-        todo!("MLA kernel — see docs/plans/2026-05-01-mla-kernel-design.md")
+        todo!("DeepSeek V4 attention/MoE kernels — Phase 2A")
     }
 
     fn forward_decode_batch(
@@ -80,7 +80,7 @@ impl ModelForward for DeepseekModel {
         _decode_ctx: &mut Self::DecodeContext,
         _skip_logit_scatter: bool,
     ) -> Result<()> {
-        todo!("MLA kernel — see docs/plans/2026-05-01-mla-kernel-design.md")
+        todo!("DeepSeek V4 attention/MoE kernels — Phase 2A")
     }
 
     fn forward_mixed_batch(
@@ -90,8 +90,8 @@ impl ModelForward for DeepseekModel {
         _paged_kv_pool: Option<&mut PagedKVPool>,
         _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<MixedBatchOutcome> {
-        // No mixed-batch support until the MLA prefill + decode kernels share
-        // a single varlen launch path. Mirrors qwen3 default.
+        // No mixed-batch support until the V4 prefill + decode kernels share a
+        // single varlen launch path. Mirrors qwen3 default.
         Ok(MixedBatchOutcome::Fallback(
             MixedBatchFallbackReason::UnsupportedModel,
         ))
@@ -103,7 +103,7 @@ impl ModelForward for DeepseekModel {
         _params: &SamplingParams,
         _rng: &mut StdRng,
     ) -> Result<u32> {
-        todo!("MLA kernel — see docs/plans/2026-05-01-mla-kernel-design.md")
+        todo!("DeepSeek V4 logits/sampling path — Phase 2A")
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
@@ -141,9 +141,7 @@ impl ModelArchInfo for DeepseekModel {
     }
 
     fn num_kv_heads(&self) -> usize {
-        // MLA latent KV is single-head per token (the per-head split happens
-        // inside `kv_b_proj`); the page-pool API still expects an integer.
-        1
+        self.config.num_key_value_heads
     }
 
     fn num_q_heads(&self) -> usize {
@@ -151,16 +149,16 @@ impl ModelArchInfo for DeepseekModel {
     }
 
     fn head_dim(&self) -> usize {
-        // Latent dim used by the paged-KV layout — see substrate plan §6.1.
-        self.config.kv_lora_rank + self.config.qk_rope_head_dim
+        self.config.head_dim
     }
 
     fn kv_cache_bytes_per_token(&self) -> usize {
-        // MLA stores a single latent vector per token of width
-        // `kv_lora_rank + qk_rope_head_dim`, in bf16 (2 bytes), across all
-        // layers. KV cache budgeting in `infer/src/scheduler/` reads this to
-        // size the paged pool; the static formula is kernel-independent.
-        let latent_dim = self.config.kv_lora_rank + self.config.qk_rope_head_dim;
-        2 * self.config.num_hidden_layers * latent_dim
+        // Phase 0.5 uses the conservative expanded single-KV-head BF16 budget.
+        // Phase 2A may replace this once the V4 cache payload for
+        // compressor/indexer streams is finalized.
+        2 * self.config.num_hidden_layers
+            * self.config.num_key_value_heads
+            * self.config.head_dim
+            * 2
     }
 }

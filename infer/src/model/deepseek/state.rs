@@ -1,9 +1,9 @@
-//! Per-request mutable state for the DeepSeek model scaffold.
+//! Per-request mutable state for the DeepSeek V4 model scaffold.
 //!
 //! Mirrors `Qwen3State`: wraps `GenerationStateBase` and forwards every
-//! `GenerationState` method through it. MLA-specific scratch (latent KV cache,
-//! decoupled-RoPE buffers) will live alongside `decode_bufs` once the MLA
-//! kernel exposes its decode-buffer surface.
+//! `GenerationState` method through it. V4-specific scratch (hybrid attention,
+//! compressor/indexer metadata, and MoE route buffers) will live alongside
+//! `decode_bufs` once Phase 2A exposes the kernel surfaces.
 
 use anyhow::Result;
 
@@ -18,8 +18,8 @@ use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 /// Per-request DeepSeek mutable state.
 ///
 /// Currently a thin wrapper over `GenerationStateBase` so the trait surface
-/// matches `Qwen3State`. MLA latent-KV scratch and the decode buffer struct
-/// land here when their kernel surface is real.
+/// matches `Qwen3State`. V4 attention/MoE scratch lands here when the kernel
+/// surface is real.
 pub struct DeepseekState {
     #[cfg(feature = "cuda")]
     pub(crate) base: GenerationStateBase,
@@ -35,14 +35,13 @@ unsafe impl Send for DeepseekState {}
 #[cfg(feature = "cuda")]
 impl GenerationState for DeepseekState {
     fn logits(&self) -> &DeviceVec {
-        // Without the decode-buffer surface in place yet, we can only return
-        // prefill logits if `forward_prefill` ever populated them. Until the
-        // kernel lands the scheduler should not actually call this — but the
-        // trait shape forces a concrete return, so we panic loudly.
+        // Without the V4 decode-buffer surface in place yet, we can only
+        // return prefill logits if `forward_prefill` ever populated them.
+        // Until Phase 2A lands the scheduler should not call this.
         self.base
             .prefill_logits
             .as_ref()
-            .expect("DeepSeek logits accessed before MLA forward kernel landed")
+            .expect("DeepSeek V4 logits accessed before forward kernels landed")
     }
 
     fn reset(&mut self) -> Result<()> {
