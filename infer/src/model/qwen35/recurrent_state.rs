@@ -4,8 +4,11 @@
 //! - Recurrent state: [num_value_heads, key_head_dim, value_head_dim] f32, V contiguous ([H,K,V])
 //! - Conv state: [qkv_dim × (conv_kernel_dim - 1)] bf16
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::driver::CudaSlice;
+use cudarc::driver::safe::CudaGraph;
+use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use half::bf16;
 
 use super::config::Config35;
@@ -200,6 +203,105 @@ pub(crate) fn bench_snapshot_ring_overhead(
     Ok(start.elapsed())
 }
 
+#[allow(dead_code)]
+pub(crate) struct RecurrentSnapshotRing {
+    slots: Vec<RecurrentSnapshot>,
+    snap_graphs: Vec<CudaGraph>,
+    restore_graphs: Vec<CudaGraph>,
+}
+
+impl RecurrentSnapshotRing {
+    #[allow(dead_code)]
+    pub(crate) fn capture_for_bench(
+        ctx: &DeviceContext,
+        state: &mut RecurrentState,
+        k_plus_1: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(k_plus_1 > 0, "k_plus_1 must be non-zero");
+
+        let mut slots = Vec::with_capacity(k_plus_1);
+        for _ in 0..k_plus_1 {
+            slots.push(state.clone_to_snapshot(ctx)?);
+        }
+        ctx.sync()?;
+
+        let mut snap_graphs = Vec::with_capacity(k_plus_1);
+        for slot in &mut slots {
+            ctx.stream
+                .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(|e| anyhow::anyhow!("begin snapshot graph capture failed: {e}"))?;
+            RecurrentState::copy_layers_to_snapshot(ctx, &state.layers, slot, state.seq_len)?;
+            let graph = ctx
+                .stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .map_err(|e| anyhow::anyhow!("end snapshot graph capture failed: {e}"))?
+                .context("snapshot graph capture returned no graph")?;
+            snap_graphs.push(graph);
+        }
+
+        let mut restore_graphs = Vec::with_capacity(k_plus_1);
+        for slot in &slots {
+            ctx.stream
+                .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(|e| anyhow::anyhow!("begin restore graph capture failed: {e}"))?;
+            RecurrentState::restore_layers_from_snapshot(ctx, &mut state.layers, slot)?;
+            let graph = ctx
+                .stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                .map_err(|e| anyhow::anyhow!("end restore graph capture failed: {e}"))?
+                .context("restore graph capture returned no graph")?;
+            restore_graphs.push(graph);
+        }
+        ctx.sync()?;
+
+        Ok(Self {
+            slots,
+            snap_graphs,
+            restore_graphs,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn bench_launch_once(
+        &self,
+        ctx: &DeviceContext,
+        restore_slot: usize,
+    ) -> Result<std::time::Duration> {
+        anyhow::ensure!(
+            restore_slot < self.restore_graphs.len(),
+            "restore_slot out of range"
+        );
+
+        ctx.sync()?;
+        let start = std::time::Instant::now();
+        for graph in &self.snap_graphs {
+            graph
+                .launch()
+                .map_err(|e| anyhow::anyhow!("snapshot graph launch failed: {e}"))?;
+        }
+        self.restore_graphs[restore_slot]
+            .launch()
+            .map_err(|e| anyhow::anyhow!("restore graph launch failed: {e}"))?;
+        ctx.sync()?;
+        Ok(start.elapsed())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn bench_snapshot_ring_graph_overhead(
+    ctx: &DeviceContext,
+    state: &mut RecurrentState,
+    k_plus_1: usize,
+) -> Result<std::time::Duration> {
+    let ring = RecurrentSnapshotRing::capture_for_bench(ctx, state, k_plus_1)?;
+    ring.bench_launch_once(ctx, k_plus_1 / 2)
+}
+
 #[cfg(all(test, feature = "cuda", not(feature = "no-cuda")))]
 mod tests {
     use super::*;
@@ -230,6 +332,54 @@ mod tests {
             k_plus_1,
             total_ms,
             total_ms / k_plus_1 as f64,
+            ring_mib
+        );
+    }
+
+    #[test]
+    #[ignore = "CUDA micro-bench; prints Qwen3.5 recurrent snapshot-ring CUDA Graph timing"]
+    fn qwen35_recurrent_snapshot_ring_bench_k6_graph() {
+        let ctx = DeviceContext::new().expect("create CUDA device context");
+        let config = Config35::from_file(MODEL_PATH).expect("load Qwen3.5-4B config");
+        let mut state = RecurrentState::new(&ctx, &config).expect("allocate recurrent state");
+        let k_plus_1 = 6;
+        let ring = RecurrentSnapshotRing::capture_for_bench(&ctx, &mut state, k_plus_1)
+            .expect("capture recurrent snapshot ring graphs");
+        assert_eq!(ring.slot_count(), k_plus_1);
+
+        let samples: Vec<f64> = (0..3)
+            .map(|_| {
+                let elapsed = ring
+                    .bench_launch_once(&ctx, k_plus_1 / 2)
+                    .expect("bench snapshot ring graph overhead");
+                elapsed.as_secs_f64() * 1_000.0
+            })
+            .collect();
+        let mean_ms = samples.iter().sum::<f64>() / samples.len() as f64;
+        let sigma_ms = (samples
+            .iter()
+            .map(|sample| {
+                let delta = sample - mean_ms;
+                delta * delta
+            })
+            .sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        let state_size = config.linear_num_value_heads
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let conv_state_size = config.linear_attn_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+        let per_snapshot_bytes = state.layers.len()
+            * (state_size * std::mem::size_of::<f32>()
+                + conv_state_size * std::mem::size_of::<bf16>());
+        let ring_mib = (per_snapshot_bytes * k_plus_1) as f64 / (1024.0 * 1024.0);
+        println!(
+            "qwen35_snapshot_ring_graph_bench k_plus_1={} samples_ms={:?} mean_ms={:.3} sigma_ms={:.3} per_snapshot_mean_ms={:.3} estimated_ring_memory_delta_mib={:.1}",
+            k_plus_1,
+            samples,
+            mean_ms,
+            sigma_ms,
+            mean_ms / k_plus_1 as f64,
             ring_mib
         );
     }
