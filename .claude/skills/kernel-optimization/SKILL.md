@@ -1,7 +1,7 @@
 ---
 name: kernel-optimization
 description: Use this skill when the user asks to optimize, tune, speed up, or improve the performance of a GPU/CPU kernel, operator (op), attention path, GEMM call, decode/prefill path, quantization op, scheduler hot path, or any "make this faster" / "reduce ITL/TTFT" / "lower memory" / "拉满 utilization" / "调 kernel" / "优化算子" request. Captures the methodology — formula-predict → measure binding constraint → single-variable A/B with matched controls → combinational A/B when interactions suspected → tradeoff explicit (no tradeoff = not at extremes) → license-or-kill — and an industry-reference catalog (FlashAttention, cutlass, Marlin, SGLang, vLLM, TileLang, ncu/nsys methodology) so each attempt is grounded, not hand-waved.
-version: 1.3.0
+version: 1.14.0
 ---
 
 # kernel-optimization

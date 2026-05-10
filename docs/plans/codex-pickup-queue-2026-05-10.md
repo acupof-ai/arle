@@ -269,3 +269,30 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   346-line test output (ctrl+t transcript). Codex now likely moving
   to step 2 (bisect 35fc3cf / c44788f / 09ae5a5 candidates).
   GPU idle — test was brief 32-token greedy decode comparison.
+- **2026-05-10 ~10:32 KST CRITICAL FINDING**: codex's `git log -S
+  'test_w4a8_vs_bf16_token_diff'` investigation surfaced existing
+  errors entry **`81b6481 docs(errors): W4A8 substrate produces 100%
+  garbage output — accuracy gate fails`**. The 84.4% W4A8-vs-BF16
+  regression is **NOT NEW** — documented previously. The lenient
+  25% assert at greedy_consistency.rs:365 is likely a workaround
+  for this KNOWN substrate issue.
+
+  **SKILL candidate #35 reinforcement** (root-cause-TBD canary):
+  Task #25 was closed `root cause TBD` despite 81b6481 documenting
+  "W4A8 substrate produces 100% garbage". The workaround (loosen
+  test threshold) let the regression slip past the lenient gate
+  unnoticed. **Strong n=2 evidence**: e3e1ab5 (Task #48 surfacing)
+  + 81b6481 (the original errors entry).
+
+  Codex's bisect plan may need revision — the regression isn't from
+  one of the 3 candidate commits (#24/#40/Path B Phase 1) but from
+  the original W4A8 substrate landing whose accuracy was always
+  broken. Codex investigating to confirm.
+
+  **Workspace recovery note**: this tick Claude's local workspace
+  was found 116 commits behind remote (HEAD reset to pre-PF8.3
+  state). Pulled origin/main back to 3844c84 to align. Also
+  discovered SKILL.md frontmatter `version:` field still showed
+  1.3.0 despite v1.13.0 (8b530ad) + v1.14.0 (d2c987f) commits adding
+  changelog rows — bug in those commits (didn't bump frontmatter).
+  Fixed in this same tick.
