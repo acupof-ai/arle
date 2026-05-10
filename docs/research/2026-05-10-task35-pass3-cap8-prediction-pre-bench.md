@@ -223,10 +223,55 @@ codex stopped for time.
   2. Accept Pass 3 as "sustained-load-safe + +282.7ms startup, no
      first-burst measurement yet" — license on regression-guard alone,
      defer first-burst proof
-- Bonus evidence: codex review on Task #35 diff caught a real bug
-  ("sync() called twice"). **Second n=2 evidence point for SKILL #33**
-  (codex review value-add load-bearing, n=1 was `ace3cbe` PF8.3 with
-  3 bugs). Strengthens the case for #33 being canonical not candidate.
+
+### §6.6 CRITICAL CAVEAT — bench numbers came from BUGGY Pass 3
+
+Per codex's tmux output 2026-05-10 ~46min, codex review caught **3
+substantial bugs** in Task #35 diff (not 1 as 5f3f58f initially
+claimed):
+
+1. **sync() called twice** (mentioned earlier, codex review tick)
+2. **Pass 3 needed to derive per-row token count from
+   `chunked_prefill_size` / token budget** (was wrong, fix in flight)
+3. **Pass 3 was warming graphs to a TEMPORARY context that gets
+   dropped** — graph prefill resources were being warmed then thrown
+   away. **This means Pass 3 was effectively a no-op for the
+   graph-prefill case.**
+
+Implication for reconciliation: the bench numbers above (§6.1) measured
+"BUGGY Pass 3 (effectively no-op for graph case)" vs "Pass 3 disabled".
+Both arms had ≈0 functional Pass 3, hence no improvement observed.
+
+The post-fix bench (when codex commits + re-bench) should show:
+- Sustained-load: still ~no improvement (mechanism prediction unchanged
+  — Pass 3 doesn't help c=1/2/4 even when working)
+- First-burst: NOW the actual prediction range (-30% to -60%) becomes
+  testable. Pre-fix bench couldn't have distinguished prediction-true
+  from no-op, since Pass 3 was no-op either way.
+
+This **does NOT invalidate** the §6.1 sustained-load reconciliation
+(predictions held within ±2.5% noise) but **DOES change the
+interpretation**: it doesn't prove "Pass 3 sustained-load-safe" because
+Pass 3 was effectively absent on the graph path. It proves "no-op Pass
+3 sustained-load-safe" — a weaker claim.
+
+**Re-bench needed after codex's fix lands** to validate Pass 3
+sustained-load claim with functional Pass 3.
+
+### §6.7 Updated SKILL #33 evidence count
+
+Task #35 codex review caught **3 real bugs** (sync, chunked_prefill_size,
+temporary-context), not 1. That brings the n=2 evidence to:
+
+| Session | Diff | Formal gates PASS | Codex review caught |
+|---|---|---|---|
+| `ace3cbe` PF8.3 | 12 files | build+clippy+greedy+e2e | 3 real bugs |
+| Task #35 (codex pending) | 6 files | build+clippy+greedy+sustained-load | **3 real bugs** |
+
+Both diffs: substrate, all formal gates PASS, **codex review caught 3
+bugs each**. Pattern is consistent magnitude, not just consistent
+existence. Strong argument that codex review is the highest-yield
+verification step for non-trivial diffs.
 
 ## §7 SKILL #33 reinforcement candidate (n=2 evidence)
 
