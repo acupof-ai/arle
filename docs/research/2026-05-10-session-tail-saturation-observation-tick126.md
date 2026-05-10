@@ -92,6 +92,10 @@ main axis) — exactly the pattern captured by
 (written tick 121). The reframe brief (`d8ebe73`) is the response;
 no new sediment needed this tick. Countdown to graduation: 1 more.
 
+## §6.6 Tick 133 — saturation persists, 60-min cadence holding
+
+3-state unchanged.
+
 ## §6.5 Tick 132 — saturation persists, 60-min cadence holding
 
 3-state unchanged.
