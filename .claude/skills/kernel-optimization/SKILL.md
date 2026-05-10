@@ -989,6 +989,48 @@ Each anti-pattern has a project commit/entry where it was paid for.
       catches more)"; #34 is "tests passing AT one shape ≠ tests
       passing at all shapes (sustained-load bench catches more)".
 
+15. **Warmup target shape budget must clamp to (effective workload
+    shape budget × hardware headroom)** — anti-pattern #38 v1.13.0
+    - Caught by: `b4a3c38` 2026-05-10 Task #35 cap=8 prefill warmup
+      §6.8 + `182d67b` §6.13 + codex Task #35 commit `a2ad788`. Two
+      independent evidence points reached n=2 graduation threshold:
+      1. **n=1**: codex implementing Pass 3 cap=8 prefill warmup
+         discovered `max_seq_len=512` (test config) vs
+         `chunked_prefill_size=4096` (warmup target) → Pass 3
+         attempted to warm shapes the test window could never reach.
+         Fix: clamp warmup token cap to `effective_max_seq_len`.
+      2. **n=2**: same Task #35 implementation, B=8 × 2048 tokens/row
+         exceeds 16GB VRAM budget → Marlin scratch OOMs at maximum
+         shape. Substrate gracefully falls back to 1024 tokens/row
+         (good defensive design, no crash) but the warmup work for
+         the impossible 2048 shape was wasted.
+    - **Generalization**: warmup-based optimizations (graph capture,
+      kernel JIT, allocator pre-warming) target a SET of shapes. The
+      shape set must be:
+      - **Reachable by the actual workload** (otherwise warmup is
+        dead work — the larger shapes will never be hit).
+      - **Within hardware budget** (otherwise warmup OOMs and either
+        crashes OR triggers fallback that wastes the warmup).
+    - **Detection rule**: at warmup-target-set declaration, compute
+      max shape cost = (max_m × max_k × dtype_bytes + lockstep
+      buffers). Compare to (model_max_seq_len) AND (free_VRAM_bytes
+      × headroom_ratio, e.g. 0.7). If max shape exceeds either,
+      either:
+      - **(a) clamp**: reduce target set to fit constraints (per #38
+        n=1 fix — `max_seq_len` cap)
+      - **(b) graceful fallback**: detect OOM at runtime + adapt
+        (per #38 n=2 fix — Marlin scratch OOM → 1024 tokens/row)
+    - Both ARLE Pass 3 evidence cases independently arrived at one
+      of these patterns (a) and (b) respectively. Future warmup
+      substrate should adopt one explicitly, not rely on accident.
+    - Companion to #34 (necessary-not-sufficient bench) + #37
+      (multi-shape bench discipline): #34 is "single bench shape
+      doesn't validate kernel"; #37 is "single bench shape doesn't
+      validate substrate"; #38 is "single warmup shape budget
+      doesn't validate against hardware constraints". All three are
+      "single-X is necessary but not sufficient" patterns at
+      different abstraction levels.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -1079,6 +1121,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.10.0** | **2026-05-10** | **28** | **(this commit) added #28 from `ee2c5b0` SOLID-critical hallucination chain. Theme: "agent fabrication overrides peer's correct conclusion when memory of prior tool output is trusted over fresh verification". Source: Claude challenged codex's correct claim that `--max-waiting-requests` CLI flag does not exist, cited fabricated grep evidence, codex (rightly) trusted the "correction" and used `--cold-headroom 253` workaround. Two ticks later audit-of-audit re-ran verification → direct evidence proved codex correct from start (`git log -S` shows string never existed in main.rs). Lesson distinct from #25 ("audit-chain shared blindspot"): #28 is "agent fabricates evidence", and empirical bench doesn't catch it because the bench command itself is built on the fabrication. Fix: when correcting peer agent file-content claim, MUST re-run verification in SAME response and quote raw output literally, NOT summarize memory.** |
 | **v1.11.0** | **2026-05-10** | **32** | **(this commit) batch-added #29-32 from same-day cooperative discipline session. Theme: "verify substrate of EVERY claim, not just contested ones". Evidence chain: 4 hallucinations sedimented in single session (`0f4d0ae` CLI flag, `43bda9c` reduce buffer, `4b30c15` /health endpoint, `5bf0e20` baseline mismatch) + cooperative race in `0d63a52`/`994a294` recovery + 33min wedged poll in `4b30c15`. Sources: `eb2b4b6` #29 (default test fixture broken since #25, codex correctly overrode via env var) / `0d63a52`+`994a294`+`ca09db0` #30 (commit-time worktree race; status BEFORE commit not just before add) / `c3bb82b`+`d387b03` #31 (ARLE surface claims need raw evidence even when not contesting peer; 4 hallucination pattern caught by self-audit) / `4b30c15` #32 (peer "Waiting >5min" warrants direct ps/log/curl verify; recovered ~33min of codex bandwidth). Cumulative compound learning: `de36538` retrospective + `940f49e` self-implementation by Claude (PF8.1+2) demonstrated discipline working — cooperative pipeline recovers from individual mis-claims when each agent applies raw-evidence-required rule.** |
 | **v1.12.0** | **2026-05-10** | **34** | **(this commit) added #33+#34 from PF8.3 substrate session evidence. Theme: "code-correct ≠ runtime-correct under load". Evidence chain: codex review caught 3 real bugs that all formal gates passed (`ace3cbe` parallel-M loop + max_par/lock workspace + graph capture interaction); PF8.3 RUNTIME KILL with 101380/101380 failures despite greedy_consistency PASS at conc=1 (`0cde63d` + `57c37b5` H8 verify). Sources: `ace3cbe` #33 (codex review IS load-bearing for non-trivial substrate, NOT formality; 3 bugs/27min review = high amortized value; required when build+clippy+tests pass on FFI/cross-feature/parallel logic diffs) / `0cde63d`+`57c37b5` #34 (greedy single-request PASS NECESSARY but NOT SUFFICIENT; pair with sustained-load bench at conc 1+2+4; sub-rule #34b: bench 0-success → CHECK SERVER LOG FIRST, wasted 30+min on guidellm CLI quirks when real cause was kernel 100% failure visible in /tmp/<server>.log). Cumulative compound learning: 7 hallucinations across this session + 3 codex-review bug catches + 1 RUNTIME KILL exposed by sustained load = code-correctness gates and runtime-correctness gates are SEPARATE concerns; both required for license-grade substrate.** |
+| **v1.13.0** | **2026-05-10** | **35** | **(this commit) graduated #38 from candidate to canonical anti-pattern after n=2 evidence threshold reached in same Task #35 cap=8 prefill warmup implementation cycle (per `b4a3c38` §6.8 + `182d67b` §6.13 + codex commit `a2ad788`). Theme: "warmup target shape budget must clamp to (effective workload shape × hardware headroom)". Evidence chain: same Task #35 implementation independently discovered both failure modes — n=1 max_seq_len=512 vs chunked_prefill_size=4096 mismatch (Pass 3 warming unreachable shapes; codex applied cap fix); n=2 B=8 × 2048 tokens/row exceeds 16GB VRAM → Marlin scratch OOM (substrate gracefully falls back to 1024 tokens/row). Both n=1 and n=2 are within ONE substrate development cycle but with INDEPENDENT failure mechanisms (config-vs-config alignment vs hardware-vs-shape alignment) — this satisfies n=2 distinct-mechanism evidence threshold. Generalization: warmup-based optimizations target shape sets; the set must be (a) reachable by actual workload AND (b) within hardware budget. Detection rule + (a) clamp / (b) graceful fallback patterns documented. Companion to #34 (single-bench-shape) + #37 (multi-shape bench discipline) — all three are "single-X is necessary but not sufficient" patterns at different abstraction levels.** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
 3 anti-patterns(#15-17)+ 1 refinement via 6+ verification ticks。Each
