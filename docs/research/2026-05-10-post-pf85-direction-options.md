@@ -2,8 +2,8 @@
 title: Post-PF8.5 KILL — direction options for user decision
 date: 2026-05-10
 type: research
-status: open (decision-needed; awaits user direction)
-related_tasks: [#28 (Medusa, P1 pickup), #30 (Hybrid W4A16/W4A8 dispatch, P2 pickup), #47 (PF8.3 H1' redesign, blocked)]
+status: SUPERSEDED-by-bilateral-A+B-chain (recommendation refined post-`9735b47` REFUTATION + `bccf1bd` consistency audit + `fc33cfb` Machete KILL + `b6b8adc` marlin_pf8 = vLLM fork; final priority per `15c16a4` pickup queue §8 = P1 A+B combined (#28 + #30) > P2.5/M'' (4.5-6.5 hr) > P3 Task #47 v2 (1d) = 5-6 days compound for ~2.61× tok/s + -14% latency)
+related_tasks: [#28 (Medusa, P1 component), #30 (Hybrid W4A16/W4A8 dispatch, P1 component STACKS with #28), #47 (PF8.3 H1' v2 redesign, P3 parallel)]
 ---
 
 # Post-PF8.5 — direction options
