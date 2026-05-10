@@ -829,28 +829,86 @@ __global__ void Marlin(
 
 // 8 warps are a good choice since every SM has 4 schedulers and having more than 1 warp per schedule allows some more
 // latency hiding. At the same time, we want relatively few warps to have many registers per warp and small tiles.
-const int THREADS = 256;
+const int USER_THREADS = 256;
 const int STAGES = 4; // 4 pipeline stages fit into shared memory
 // const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6 (< 8.0)
 
-#define CALL_IF(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, GROUP_BLOCKS) \
+struct thread_config_t {
+  int thread_k;
+  int thread_n;
+  int num_threads;
+};
+
+static constexpr int MIN_THREAD_N = 64;
+static constexpr int MIN_THREAD_K = 64;
+
+thread_config_t small_batch_thread_configs[] = {
+  // Ordered by priority. First entry preserves ARLE's historical choice.
+  {128, 128, 256},
+  {128,  64, 128},
+  { 64, 256, 256},
+  { 64, 128, 128},
+};
+
+thread_config_t large_batch_thread_configs[] = {
+  // Ordered by priority. First entry preserves ARLE's historical choice.
+  { 64, 256, 256},
+  {128, 128, 256},
+  { 64, 128, 128},
+  {128,  64, 128},
+};
+
+bool is_valid_config(const thread_config_t& config, int prob_n, int prob_k) {
+  if (config.thread_k == -1 || config.thread_n == -1 || config.num_threads == -1)
+    return false;
+  if (prob_k % config.thread_k != 0 || prob_n % config.thread_n != 0)
+    return false;
+  if (config.thread_k != 128 && config.thread_k != 64)
+    return false;
+  if (config.thread_n < MIN_THREAD_N || config.thread_k < MIN_THREAD_K)
+    return false;
+  if (config.num_threads < 128)
+    return false;
+  return true;
+}
+
+thread_config_t determine_thread_config(int prob_m, int prob_n, int prob_k) {
+  thread_config_t* configs = prob_m <= 16 ? small_batch_thread_configs : large_batch_thread_configs;
+  for (int i = 0; i < 4; ++i) {
+    if (is_valid_config(configs[i], prob_n, prob_k))
+      return configs[i];
+  }
+  return thread_config_t{-1, -1, -1};
+}
+
+#define CALL_IF_IMPL(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, GROUP_BLOCKS, NUM_THREADS) \
   else if ( \
     thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS && thread_k_blocks == THREAD_K_BLOCKS && \
-    group_blocks == GROUP_BLOCKS \
+    group_blocks == GROUP_BLOCKS && num_threads == NUM_THREADS \
   ) { \
     cudaFuncSetAttribute( \
-      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>, \
+      Marlin<NUM_THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>, \
       cudaFuncAttributeMaxDynamicSharedMemorySize, \
       max_shared_mem \
     ); \
     Marlin< \
-      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS \
-    ><<<blocks, THREADS, max_shared_mem, stream>>>( \
+      NUM_THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS \
+    ><<<blocks, NUM_THREADS, max_shared_mem, stream>>>( \
       A_ptr, B_ptr, C_ptr, D_ptr, s1_ptr, s2_ptr, s3_ptr, \
       prob_m, prob_n, prob_k, \
       locks \
     ); \
   }
+
+#define CALL_IF(THREAD_N_BLOCKS, THREAD_K_BLOCKS, NUM_THREADS) \
+  CALL_IF_IMPL(1, THREAD_N_BLOCKS, THREAD_K_BLOCKS, -1, NUM_THREADS) \
+  CALL_IF_IMPL(1, THREAD_N_BLOCKS, THREAD_K_BLOCKS,  8, NUM_THREADS) \
+  CALL_IF_IMPL(2, THREAD_N_BLOCKS, THREAD_K_BLOCKS, -1, NUM_THREADS) \
+  CALL_IF_IMPL(2, THREAD_N_BLOCKS, THREAD_K_BLOCKS,  8, NUM_THREADS) \
+  CALL_IF_IMPL(3, THREAD_N_BLOCKS, THREAD_K_BLOCKS, -1, NUM_THREADS) \
+  CALL_IF_IMPL(3, THREAD_N_BLOCKS, THREAD_K_BLOCKS,  8, NUM_THREADS) \
+  CALL_IF_IMPL(4, THREAD_N_BLOCKS, THREAD_K_BLOCKS, -1, NUM_THREADS) \
+  CALL_IF_IMPL(4, THREAD_N_BLOCKS, THREAD_K_BLOCKS,  8, NUM_THREADS)
 
 const int ERR_PROB_SHAPE = 1;
 const int ERR_KERN_SHAPE = 2;
@@ -885,17 +943,17 @@ int w4a8_marlin_cuda(
   cudaDeviceGetAttribute(&max_shared_mem,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
 
-  if (thread_k == -1 || thread_n == -1) {
-    if (prob_m <= 16) {
-      // For small batchizes, better partioning is slightly more important than better compute utilization
-      thread_k = 128;
-      thread_n = 128;
-    } else {
-      thread_k = 64;
-      thread_n = 256;
-    }
+  thread_config_t thread_config;
+  if (thread_k != -1 && thread_n != -1) {
+    thread_config = thread_config_t{thread_k, thread_n, USER_THREADS};
+  } else {
+    thread_config = determine_thread_config(prob_m, prob_n, prob_k);
   }
-
+  if (!is_valid_config(thread_config, prob_n, prob_k))
+    return ERR_PROB_SHAPE;
+  int num_threads = thread_config.num_threads;
+  thread_k = thread_config.thread_k;
+  thread_n = thread_config.thread_n;
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
   int group_blocks = (groupsize == -1) ? -1 : groupsize / 16;
@@ -936,16 +994,10 @@ int w4a8_marlin_cuda(
     // For compilation speed, we only define the kernel configurations that have seemed useful (in terms of performance)
     // in our testing, however many more are, in principle, possible.
     if (false) {}
-    CALL_IF(1,  8,  8, -1)
-    CALL_IF(1,  8,  8,  8)
-    CALL_IF(1, 16,  4, -1)
-    CALL_IF(1, 16,  4,  8)
-    CALL_IF(2, 16,  4, -1)
-    CALL_IF(2, 16,  4,  8)
-    CALL_IF(3, 16,  4, -1)
-    CALL_IF(3, 16,  4,  8)
-    CALL_IF(4, 16,  4, -1)
-    CALL_IF(4, 16,  4,  8)
+    CALL_IF( 8, 8, 256)
+    CALL_IF(16, 4, 256)
+    CALL_IF( 4, 8, 128)
+    CALL_IF( 8, 4, 128)
     else
       ret = ERR_KERN_SHAPE;
 
