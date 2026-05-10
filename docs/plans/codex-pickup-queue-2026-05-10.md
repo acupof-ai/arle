@@ -333,3 +333,13 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   candidate #35 (root-cause-TBD canary) graduation evidence still
   reaches potential n=3 (e3e1ab5 + 81b6481 + this fixture-decay
   framing).
+- **2026-05-10 ~10:44 KST**: codex testing **`Qwen3-4B-W4A8-marlin-zpfix`**
+  variant (different calibrated checkpoint than eb2b4b6's recommended
+  `Qwen3-4B-GPTQ-W4A8-marlin`). zpfix = "zero-point fix" = calibrated
+  W4A8 with adjusted zero-points. Compile cached, mainly waiting for
+  2 model loads + warmup. ~5-10 min remaining.
+  **Claude audit this tick** (be133f8): same broken default
+  W4A8_MODEL_PATH constant is duplicated in BOTH e2e.rs:21 AND
+  greedy_consistency.rs:30 — codex Task #48 wrap should fix both
+  test files (or extract to shared constant). Skill candidate
+  enhancement to #29 documented.
