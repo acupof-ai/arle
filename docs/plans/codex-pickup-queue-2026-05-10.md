@@ -640,6 +640,21 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
 
   No further action this tick. Awaits user direction.
 
+- **2026-05-10 EOD+1540 (50-51st tick — saturation pattern errors entry committed)**:
+  Per directive 4 "NULL result 也 commit", sedimented the cooperative-loop
+  asymmetric saturation pattern as `e37a46b` errors entry. Captures:
+  - Claude ~14 substantive commits across session-tail
+  - Codex silent 6.5hr (tmux frozen "Worked 26m 51s" + `> Run /review` queued)
+  - User silent on PushNotifications + direction recommendation
+  - 3 ground rules for future cooperative-loop sessions:
+    1. Codex silence > 1hr → explicit Claude tmux nudge
+    2. Loop prompt freshness check (SKILL #29 cron-instruction-persistence axis)
+    3. Saturation halt criteria (PushNotification + max cadence + STOP self-wakeup)
+  - Key insight: §0 SOLID "80% SOLID 不够" applies IN REVERSE at saturation —
+    more accumulation past 80% complete = INVENTED work, not deeper SOLID
+
+  This 51st tick: cross-link only (this entry). Awaits user direction.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
