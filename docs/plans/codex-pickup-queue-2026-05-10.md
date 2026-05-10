@@ -372,3 +372,31 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   Validates the directive "Claude 必须并行执行,不能 idle 等 codex"
   — Claude's CPU-bound work is load-bearing for codex's diff scope,
   not just monitoring.
+- **2026-05-10 ~10:55 KST TASK #48 LANDED**: codex commit
+  **`8d1caad test(cuda): use qzeros-fixed W4A8 fixture for accuracy
+  gate`**. 3 files / +61 / -7:
+  - e2e.rs (5 lines) — qzeros-fixed default
+  - greedy_consistency.rs (12 lines) — qzeros-fixed default
+  - errors entry (51 lines)
+  Verification: cargo fmt + git diff + cargo check + cargo test
+  test_w4a8_vs_bf16_token_diff + cargo test test_e2e_w4a8_marlin_optional
+  all PASS. Worked 26m 51s total. Worktree clean, port 8000 free.
+
+  **SKILL #29 evidence accumulated to n=3**:
+  - n=1: original eb2b4b6 research entry (W4A8 substrate produces
+    100% garbage)
+  - n=2: codex's Task #48 independent rediscovery via git log -S
+    investigation + Claude's be133f8 audit finding broken default
+    in 2 test files
+  - n=3: codex applied fix to both test files + created errors entry
+  This strengthens SKILL #29 (already canonical since v1.11.0) but
+  also adds enhancement evidence: "broken defaults may be DUPLICATED
+  across test files via copy-paste constants — when fixing one, grep
+  for other test files using the same path constant".
+
+  Cooperative loop fully closed for Task #48: Claude audit (be133f8)
+  → codex execution (matches both files exactly) → codex verification
+  → codex commit (8d1caad). Claude commits: be133f8 (audit) +
+  edeb9ee (status) + 197ac19 (model inventory) + 154bb81 (cooperative
+  pattern win) + 9a055f1 (index) + this entry. Codex commits:
+  8d1caad (final fix).
