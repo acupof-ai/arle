@@ -164,3 +164,51 @@ already did, validates substrate's layered architecture.
 
 Both use new qzeros-fixed default `Qwen3-4B-GPTQ-W4A8-zpfix`. Codex's
 8d1caad fix LANDED + double-verified by Claude bench.
+
+## §9 THIRD Claude-run bench — TRUE SINGLE-VARIABLE A/B captured
+
+Per skill `kernel-optimization` Phase 5 (single-variable A/B): same
+test rerun with `INFER_PREFILL_WARMUP=0` (escape hatch from `60f114f`
+matched-control discipline).
+
+```text
+Pass 3 prefill warmup disabled by INFER_PREFILL_WARMUP=0
+CUDA Graph warmup done in 569ms (decode=4 batch sizes, prefill=0 batch sizes, max decode 4)
+test result: ok. 1 passed; finished in 2.31s
+```
+
+§9.1 TRUE A/B (single-binary, single-variable Pass 3 ON vs OFF):
+
+| Arm | Pass 3 | Wall-clock | Δ |
+|---|---|---|---|
+| ON (default) | 1572ms | 3.90s | baseline |
+| **OFF (`INFER_PREFILL_WARMUP=0`)** | **0ms** | **2.31s** | **−1.59s (−40.8%)** |
+
+The 1.59s delta closely matches 1572ms Pass 3 cost from §8 →
+confirms Pass 3 is dominant variable. Within ~20ms noise.
+
+§9.2 Validates 2 substantive claims:
+
+1. **Codex's qzeros-fixed default works WITHOUT Pass 3** → Pass 3 is
+   an **opt-in optimization, NOT a correctness requirement**.
+   Substrate design correct: default-on + escape-hatch (NOT
+   default-off + opt-in).
+2. **Pass 3 cost = real measured 1572ms** (not log artifact).
+
+§9.3 SKILL escape-hatch discipline reinforcement:
+
+Per `60f114f` matched-control escape-hatch evidence note: codex's
+`INFER_PREFILL_WARMUP=0` enables single-binary single-variable A/B.
+This is the FIRST functional A/B using that escape hatch in a
+DIFFERENT context (Task #35 codex used it for W4A16 startup A/B;
+this is W4A8 e2e correctness). **Strengthens evidence to n=2** for
+escape-hatch discipline candidate.
+
+§9.4 Claude-run bench tally this session-tail: **3 PASS**
+- test_w4a8_vs_bf16_token_diff (greedy, 65.70s, 0.0% diff)
+- test_e2e_w4a8_marlin_optional default (e2e, 3.90s, Pass 3 ON)
+- **test_e2e_w4a8_marlin_optional `INFER_PREFILL_WARMUP=0` (e2e, 2.31s, Pass 3 OFF)**
+
+Cooperative-loop validation now includes: codex 3 task closures +
+Claude trust-but-verify (layers 1-2) + true single-variable A/B
+(layer 3).
