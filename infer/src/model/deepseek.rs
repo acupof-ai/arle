@@ -1,10 +1,8 @@
-//! DeepSeek model: MLA latent attention + (optional) DeepSeekMoE.
+//! DeepSeek V4 model scaffold.
 //!
-//! Scaffold landed 2026-05-05; kernels still pending. See
-//! [`docs/plans/2026-05-05-deepseek-v4-small-substrate.md`](../../../../docs/plans/2026-05-05-deepseek-v4-small-substrate.md)
-//! for the project plan and
-//! [`docs/plans/2026-05-01-mla-kernel-design.md`](../../../../docs/plans/2026-05-01-mla-kernel-design.md)
-//! for the MLA kernel design these stubs are waiting on.
+//! Phase 0.5 aligns infer-side DeepSeek runtime truth to the actual
+//! `DeepseekV4ForCausalLM` checkpoint at `infer/models/dsv4-mini-1B-init/`.
+//! Forward kernels remain pending Phase 2A.
 
 #[cfg(feature = "cuda")]
 #[path = "deepseek/batch_decode.rs"]
@@ -24,6 +22,7 @@ mod state;
 #[path = "deepseek/weights.rs"]
 mod weights;
 
+pub use crate::deepseek_v4_manifest::DeepseekV4CheckpointManifest;
 pub use config::DeepseekRuntimeConfig;
 pub use state::DeepseekState;
 pub use weights::DeepseekModel;

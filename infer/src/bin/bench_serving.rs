@@ -1187,6 +1187,9 @@ fn main() -> Result<()> {
             // benchmark harness.
             todo!("GPU required: Qwen3.6 CUDA not yet implemented")
         }
+        ModelType::DeepSeekV4 => {
+            anyhow::bail!("DeepSeek V4 CUDA bench path is pending Phase 2A kernels")
+        }
     };
 
     emit_report(&cli, &report)

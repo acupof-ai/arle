@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use log::{info, warn};
 
 #[cfg(feature = "cuda")]
+use crate::model::deepseek::{DeepseekModel, DeepseekRuntimeConfig};
 use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 #[cfg(feature = "cuda")]
 use crate::model_registry::{ModelArch, detect_arch};
@@ -38,6 +39,9 @@ pub enum ModelType {
     /// `todo!()` stub until the CUDA MoE kernel lands; Metal path lives
     /// entirely outside this module.
     Qwen35Moe,
+    /// DeepSeek V4 checkpoint. CUDA loader validates V4 config/tensor truth in
+    /// Phase 0.5; forward kernels remain pending Phase 2A.
+    DeepSeekV4,
 }
 
 #[cfg(feature = "cuda")]
@@ -47,6 +51,7 @@ impl fmt::Display for ModelType {
             Self::Qwen3 => write!(f, "Qwen3"),
             Self::Qwen35 => write!(f, "Qwen3.5"),
             Self::Qwen35Moe => write!(f, "Qwen3.5-MoE"),
+            Self::DeepSeekV4 => write!(f, "DeepSeek-V4"),
         }
     }
 }
@@ -121,6 +126,7 @@ pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
         ModelArch::Qwen3 => Ok(ModelType::Qwen3),
         ModelArch::Qwen35 => Ok(ModelType::Qwen35),
         ModelArch::Qwen3_5_Moe => Ok(ModelType::Qwen35Moe),
+        ModelArch::DeepSeekV4 => Ok(ModelType::DeepSeekV4),
         arch => bail!("model architecture {arch:?} is not supported by the runtime yet"),
     }
 }
@@ -146,6 +152,9 @@ pub enum LoadedModelComponents {
     /// MoE-specific dispatch happens at the engine layer. The CUDA loader
     /// for this variant is intentionally a `todo!()` stub.
     Qwen35Moe(ModelComponents<Qwen35Model>),
+    /// DeepSeek V4 runtime target. Phase 0.5 validates loader truth; kernels are
+    /// still pending.
+    DeepSeekV4(ModelComponents<DeepseekModel>),
 }
 
 #[cfg(feature = "cuda")]
@@ -213,6 +222,18 @@ pub fn load_qwen35_moe_components(
 }
 
 #[cfg(feature = "cuda")]
+pub fn load_deepseek_v4_components(
+    model_path: &str,
+    options: InferenceEngineOptions,
+) -> Result<ModelComponents<DeepseekModel>> {
+    load_model_with(model_path, options, |model_path, options| {
+        let mut runtime = DeepseekRuntimeConfig::from_model_dir(model_path)?;
+        runtime.enable_cuda_graph = options.enable_cuda_graph;
+        DeepseekModel::from_safetensors(model_path, runtime)
+    })
+}
+
+#[cfg(feature = "cuda")]
 pub fn load_model_components(
     model_path: &str,
     options: InferenceEngineOptions,
@@ -226,6 +247,9 @@ pub fn load_model_components(
         )?)),
         ModelType::Qwen35Moe => Ok(LoadedModelComponents::Qwen35Moe(
             load_qwen35_moe_components(model_path, options)?,
+        )),
+        ModelType::DeepSeekV4 => Ok(LoadedModelComponents::DeepSeekV4(
+            load_deepseek_v4_components(model_path, options)?,
         )),
     }
 }
@@ -242,6 +266,9 @@ pub fn spawn_scheduler_handle(
         }
         LoadedModelComponents::Qwen35(components)
         | LoadedModelComponents::Qwen35Moe(components) => {
+            spawn_scheduler_for_model(components, runtime, metrics)
+        }
+        LoadedModelComponents::DeepSeekV4(components) => {
             spawn_scheduler_for_model(components, runtime, metrics)
         }
     }

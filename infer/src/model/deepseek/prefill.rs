@@ -1,8 +1,8 @@
-//! DeepSeek prefill scaffold.
+//! DeepSeek V4 prefill scaffold.
 //!
 //! Mirrors `qwen3::prefill` but every entrypoint is a `todo!()` stub. The
-//! prefill path will read packed token activations, run MLA per layer (latent
-//! KV with decoupled RoPE), then dense MLP, and finally project to logits.
+//! prefill path will read packed token activations, run V4 hybrid attention
+//! and routed MoE per layer, then project to logits.
 
 #[cfg(feature = "cuda")]
 use anyhow::Result;
@@ -33,6 +33,6 @@ impl DeepseekModel {
     /// Run prefill for a single sequence into the contiguous KV cache, then
     /// expose the resulting logits via `state.base.prefill_logits`.
     pub(super) fn prefill_one(&self, _tokens: &[u32], _state: &mut DeepseekState) -> Result<()> {
-        todo!("MLA kernel — see docs/plans/2026-05-01-mla-kernel-design.md")
+        todo!("DeepSeek V4 prefill kernels — Phase 2A")
     }
 }
