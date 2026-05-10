@@ -259,3 +259,7 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   v1.3.0) vs assert (25% lenient gate). Then either fix root cause
   + tighten threshold OR add canary that breaks if >25% (per skill
   candidate #35 root-cause-TBD canary watch).
+- **2026-05-10 ~10:25 KST**: codex Task #48 started step 1 (re-run
+  targeted test_w4a8_vs_bf16_token_diff, loading 2 models for
+  BF16-vs-W4A8 comparison). Mid-run mechanical state. First action
+  matches brief verbatim — cooperative dispatch pattern healthy.
