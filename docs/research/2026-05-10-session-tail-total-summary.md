@@ -109,29 +109,45 @@ matches. Accuracy preserved (greedy 0.0% diff per Task #48 8d1caad).
 - **NEW end-to-end latency math vs naïve "best of both"** (n=1 from
   Hybrid Option B aggregation framing decay per `92813dc`)
 
-## §4 Hybrid Option B value progression (n=5 contexts, fully measured)
+## §4 Hybrid Option B value progression (n=6 contexts, fully measured)
 
-| Context | Hybrid value vs W4A16 | Status |
-|---|---:|---|
-| conc=1 prompt=512 | -1.4% | sub-noise |
-| conc=4 prompt=512 | -2.4% | sub-noise |
-| conc=1 prompt=2048 | -7.5% | meaningful |
-| conc=1 prompt=4096 | -11.1% | clearly above noise |
-| conc=1 prompt=8192 | **-14.2% (measured)** | approaching Machete |
-| prompt=16384 (extrap) | ~-17% | asymptotic, diminishing returns |
-| prompt=32768+ (Qwen3 native) | ~-20% Machete-class | YARN required |
+**UPDATED 2026-05-10 EOD+~2300 per `9735b47` REFUTATION**: 16k now
+MEASURED, NOT extrapolated. Plateau confirmed at ~-14% from 8k onward.
 
-**Asymptotic, not linear**. Machete-class -20% threshold needs 32k+
-native ctx OR 64k+ YARN-extended.
+| Context | W4A8 TTFT vs W4A16 | Hybrid value vs W4A16 | Status |
+|---|---:|---:|---|
+| conc=1 prompt=512 | -18% | -1.4% | sub-noise |
+| conc=4 prompt=512 | — | -2.4% | sub-noise |
+| conc=1 prompt=2048 | -30% | -7.5% | meaningful |
+| conc=1 prompt=4096 | -29% | -11.1% | clearly above noise |
+| conc=1 prompt=8192 | -26% | **-14.2%** | first plateau marker |
+| conc=1 prompt=16384 | **-20%** | **-14.2% (measured)** | **plateau confirmed** |
+| prompt=32768+ (Qwen3 native) | (unknown — YARN required) | likely ≤-14% | not Machete-class |
+
+**Plateau, not asymptotic-toward-Machete**. Hybrid value caps at
+~-14% from 8k onward because W4A8 TTFT advantage SHRINKS with context
+(-29% → -26% → -20% across 4k/8k/16k) — both quants share the same
+paged-attention prefill kernel, and W4A8's compute saving is on
+matmul-bound ops which become a smaller fractional share of TTFT as
+context grows.
+
+**Implication**: Machete-class -20-40% target NOT reachable by Hybrid
+Option B alone. Requires either (a) actual Machete kernel port,
+(b) Medusa speculative decoding multiplied with Hybrid, or (c) larger
+model where weight bandwidth dominates more.
 
 ## §5 Strategic decision matrix (refined post-session)
 
-| User priority | Recommended path | Time | Why |
+**REVISED 2026-05-10 EOD+~2300 per `9735b47` REFUTATION**: Option B
+no longer dominant for long-ctx — caps at -14.2% measured, NOT
+Machete-class. Option A now dominant single-axis investment.
+
+| User priority | Recommended path | Time | Why (REVISED) |
 |---|---|---|---|
 | Maximum tok/s (any context) | A (Medusa) | 2-3 days | 2-3× tok/s at ≥70% accept |
 | Maximum TTFT/ITL short-ctx (≤2k) | A (Medusa) | 2-3 days | hybrid value sub-noise here |
-| Maximum TTFT/ITL long-ctx (≥8k) | B (Hybrid) | ~2 weeks | hybrid value -14 to -17% at 8-16k |
-| **World-first 32k+ ctx specifically** | **B (Hybrid)** | ~2 weeks | only path to Machete-class -20% |
+| Maximum TTFT/ITL long-ctx (≥8k) | A (Medusa) | 2-3 days | Hybrid B caps at -14%; A's 2-3× tok/s is bigger lever |
+| **World-first 32k+ ctx Machete-class** | **A + B combined** | **~3 weeks** | Need both speedup paths multiplied; neither alone reaches -20-40% |
 | Short timeline (≤1 week) | A (Medusa) | 2-3 days | clearest pickup, lowest blocker |
 | Match ROADMAP P0 World #1 (W1/W2 32k×c=4) | Separate harness | ~weeks | not addressed by either A or B alone |
 
