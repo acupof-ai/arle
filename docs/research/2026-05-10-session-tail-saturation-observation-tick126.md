@@ -83,6 +83,15 @@ additional evidence accumulates).
 Loop arg references 5-doc Medusa pickup chain (subset of actual
 24-doc decision chain). Countdown to cadence-expansion graduation: 2 more.
 
+## §6.2 Tick 129 (countdown 2/3) — saturation persists, no state change
+
+3-state scan: codex idle, GPU empty (1293 MiB / 0%), local clean.
+User typed loop directive manually (with "Machete W4 移植 from vLLM"
+main axis) — exactly the pattern captured by
+`feedback_reframe_persistent_directive_when_hardware_blocked` memory
+(written tick 121). The reframe brief (`d8ebe73`) is the response;
+no new sediment needed this tick. Countdown to graduation: 1 more.
+
 ## §6 Tick 127 follow-up — saturation persists
 
 State unchanged from §1: codex still IDLE 8+hr, no user response to
