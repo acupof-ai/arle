@@ -296,3 +296,15 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   1.3.0 despite v1.13.0 (8b530ad) + v1.14.0 (d2c987f) commits adding
   changelog rows — bug in those commits (didn't bump frontmatter).
   Fixed in this same tick.
+- **2026-05-10 ~10:36 KST**: codex pivoted bisect approach to
+  **matrix script** — `for cand in <candidates>; do git checkout
+  $sha; cargo test ... > $log; done` with per-candidate output
+  redirection. Better than simple sequential bisect: parallel-
+  inspectable file logs + consistent restoration of original branch.
+  Codex's discipline observation: "终端安静不代表没有进展"
+  (terminal silence ≠ no progress when output redirected to files).
+  GPU between arms (1293 MiB / 0%); each arm will need cargo build
+  (~1-3 min cached) + test run (~30s).
+  Note: matrix approach checks ALL candidates not just bisect entry,
+  validating whether 81b6481 hypothesis is right (regression from
+  substrate landing not from #24/#40/Phase 1).
