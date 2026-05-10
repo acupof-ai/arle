@@ -17,14 +17,26 @@ status: open (supersedes 2026-05-09 queue; pickup-ready as Task #35 completes)
 
 ## §1 Pickup matrix (priority order)
 
-| Priority | Task | Trigger | Scope | Scaffold artifact |
+**Status note**: as of 2026-05-10 ~10:55 KST, P0 (Task #43) and P2
+(Task #48) are CLOSED via codex. Only bench-v11-gated paths remain.
+See §8 dispatch log for closure milestones.
+
+| Priority | Task | Trigger | Scope | Status |
 |---|---|---|---|---|
-| **P0** | #43 W4A16 fragmentation hypothesis test | always available, no user gate | ~30 min single bash | `scripts/task43_hypothesis_test.sh` (commit 458394c) |
-| **P1 (LICENSE branch)** | #47 PF8.3 H1' static-scratch refactor | bench v11 LICENSES PF8 at conc=1 (USER must run `bash scripts/pf85_bench_v11_user.sh` per ead46dc) | ~70 LOC + tests + bench, 3-4 hours | `docs/plans/M_pf83_h1prime_static_scratch.md` (05e2135) + REVISION `docs/research/2026-05-10-h1prime-design-revision-marlinscratch-already-exists.md` (2cc608a) |
-| **P1 (KILL branch)** | #28 Medusa Phase 1.A via Alpaca | bench v11 KILLS PF8 at conc=1 | ~80 LOC Python + 2 hrs data prep + ~1 week training | `docs/research/2026-05-10-medusa-pivot-ready-alpaca-unblocks-hf-auth.md` (63769be) |
-| **P2** | #48 W4A8-vs-BF16 84.4% accuracy regression bisect | always (NOT blocking #35) | ~1 hr bisect + fix scoping | `docs/research/2026-05-10-w4a8-vs-bf16-accuracy-regression-observed.md` (e3e1ab5) |
+| ~~P0~~ | ~~#43 W4A16 fragmentation hypothesis test~~ | ~~always available~~ | ~~~30 min~~ | **CLOSED** — DISPROVEN INVERSE (codex `83fc5d0` + Claude `e8b6b31`) |
+| **P1 (LICENSE branch)** | #47 PF8.3 H1' static-scratch refactor | bench v11 LICENSES PF8 at conc=1 (USER must run `bash scripts/pf85_bench_v11_user.sh` per ead46dc) | ~70 LOC + tests + bench, 3-4 hours | **PENDING bench v11 LICENSE** |
+| **P1 (KILL branch)** | #28 Medusa Phase 1.A via Alpaca | bench v11 KILLS PF8 at conc=1 | ~80 LOC Python + 2 hrs data prep + ~1 week training | **PENDING bench v11 KILL** (or standalone if user wants Medusa now) |
+| ~~P2~~ | ~~#48 W4A8-vs-BF16 84.4% accuracy regression~~ | ~~always~~ | ~~~1 hr~~ | **CLOSED** — codex `8d1caad` (qzeros-fixed default in both test files) |
 | **P3** | #30 Hybrid W4A16/W4A8 dispatch Phase 1-3 substrate | always (older pending task) | unknown (likely substantial) | (no recent scaffold; defer to discovery) |
-| **P4** | #44 PF8 chain (PF8.5 license sequence completion) | bench v11 LICENSES + Task #47 lands first | depends on H1' outcome | `docs/plans/M_pf83_h1prime_static_scratch.md` §10 estimates |
+| **P4** | #44 PF8 chain (PF8.5 license sequence completion) | bench v11 LICENSES + Task #47 lands first | depends on H1' outcome | PENDING bench v11 + #47 |
+
+**Codex idle as of 2026-05-10 ~10:55 KST.** Next dispatch options:
+- Wait for user to run `bash scripts/pf85_bench_v11_user.sh` →
+  P1 LICENSE (#47 H1') OR P1 KILL (#28 Medusa)
+- P3 Task #30 dispatch (no scaffold yet, codex would discover scope)
+- Standalone Medusa Phase 1.A (~2 hr setup + 1 wk training, runs in
+  parallel with awaiting bench v11)
+- New user direction
 
 ## §2 Recommended dispatch logic
 
