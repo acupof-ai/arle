@@ -259,6 +259,20 @@ fn marlin_w4_fp8_prefill_enabled() -> bool {
     )
 }
 
+fn marlin_w4a8_autoconfig_enabled() -> bool {
+    matches!(
+        std::env::var("INFER_MARLIN_W4A8_AUTOCONFIG").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+fn marlin_w4a8_thread_config(rows: usize) -> (i32, i32) {
+    if marlin_w4a8_autoconfig_enabled() {
+        return (-1, -1);
+    }
+    if rows <= 16 { (128, 128) } else { (64, 256) }
+}
+
 fn ensure_hybrid_w4_dispatch_ready(
     weight: &DeviceMatrix,
     phase: LinearDispatchPhase,
@@ -1439,6 +1453,7 @@ fn run_marlin_w4a8_linear(
         let (s3_ptr, _g7) = s_group.device_ptr(&ctx.stream);
         let (ws_ptr, _g8) = workspace.device_ptr_mut(&ctx.stream);
         let sms = ctx.sm_count() as i32;
+        let (thread_k, thread_n) = marlin_w4a8_thread_config(m);
         let ret = unsafe {
             ffi::gemm_w4a8_marlin_cuda(
                 xq_ptr as *const i8,
@@ -1455,8 +1470,8 @@ fn run_marlin_w4a8_linear(
                 weight.group_size as i32,
                 ctx.ordinal() as i32,
                 ctx.stream.cu_stream(),
-                -1,
-                -1,
+                thread_k,
+                thread_n,
                 sms,
                 max_par as i32,
             )
@@ -1588,6 +1603,7 @@ fn run_marlin_w4a8_linear_with_scratch(
             .context("Marlin W4A8 decode scratch missing workspace buffer")?
             .device_ptr_mut(&ctx.stream);
         let sms = ctx.sm_count() as i32;
+        let (thread_k, thread_n) = marlin_w4a8_thread_config(m);
         let ret = unsafe {
             ffi::gemm_w4a8_marlin_cuda(
                 xq_ptr as *const i8,
@@ -1604,8 +1620,8 @@ fn run_marlin_w4a8_linear_with_scratch(
                 weight.group_size as i32,
                 ctx.ordinal() as i32,
                 ctx.stream.cu_stream(),
-                -1,
-                -1,
+                thread_k,
+                thread_n,
                 sms,
                 MARLIN_MAX_PAR as i32,
             )
@@ -1650,14 +1666,18 @@ fn run_marlin_w4_fp8_prefill(
     let k = weight.cols;
     let max_par = MARLIN_MAX_PAR;
 
-    let mut x_fp8: CudaSlice<u8> = ctx
-        .stream
-        .alloc_zeros(m * k)
-        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 x_fp8: {e}"))?;
-    let mut s_activation: CudaSlice<f32> = ctx
-        .stream
-        .alloc_zeros(m)
-        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 activation scales: {e}"))?;
+    let mut x_fp8: CudaSlice<u8> = ctx.stream.alloc_zeros(m * k).map_err(|e| {
+        anyhow::anyhow!(
+            "alloc W4+FP8 x_fp8: {e} [diag: m={m} k={k} n={n} bytes={}]",
+            m * k
+        )
+    })?;
+    let mut s_activation: CudaSlice<f32> = ctx.stream.alloc_zeros(m).map_err(|e| {
+        anyhow::anyhow!(
+            "alloc W4+FP8 activation scales: {e} [diag: m={m} k={k} n={n} bytes={}]",
+            m * 4
+        )
+    })?;
     {
         let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
         let (xq_ptr, _gq) = x_fp8.device_ptr_mut(&ctx.stream);
@@ -1681,16 +1701,28 @@ fn run_marlin_w4_fp8_prefill(
     let mut reduce: CudaSlice<f32> = ctx
         .stream
         .alloc_zeros(ctx.sm_count() * tmp_m * 256)
-        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 reduce buffer: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "alloc W4+FP8 reduce buffer: {e} [diag: m={m} k={k} n={n} sm_count={} tmp_m={tmp_m} bytes={}]",
+                ctx.sm_count(),
+                ctx.sm_count() * tmp_m * 256 * 4
+            )
+        })?;
     let lock_elems = ((n / 128) * max_par).max(1);
     let mut workspace: CudaSlice<i32> = ctx
         .stream
         .alloc_zeros(lock_elems)
-        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 lock workspace: {e}"))?;
-    let mut y_fp16: CudaSlice<ffi::Half> = ctx
-        .stream
-        .alloc_zeros(m * n)
-        .map_err(|e| anyhow::anyhow!("alloc W4+FP8 fp16 output: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "alloc W4+FP8 lock workspace: {e} [diag: m={m} k={k} n={n} lock_elems={lock_elems} max_par={max_par}]"
+            )
+        })?;
+    let mut y_fp16: CudaSlice<ffi::Half> = ctx.stream.alloc_zeros(m * n).map_err(|e| {
+        anyhow::anyhow!(
+            "alloc W4+FP8 fp16 output: {e} [diag: m={m} k={k} n={n} bytes={}]",
+            m * n * 2
+        )
+    })?;
 
     {
         let (xq_ptr, _g1) = x_fp8.device_ptr(&ctx.stream);
