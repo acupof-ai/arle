@@ -290,3 +290,70 @@ This decisively narrows the hypothesis space in 1 test.
    - H1' → static-scratch refactor (50-100 LOC)
    - H6/H7 → fix dispatch state passing (20-50 LOC)
    - H2 → kernel variant filter (smem audit + codegen filter, 50-100 LOC)
+
+## §9 H8 NEW — sticky CUDA error from prior call (HIGHEST after committed-code re-read)
+
+Re-read `marlin_w4_fp8_kernel.cu` wrapper end (lines 250-256):
+
+```cpp
+cudaError_t err = cudaGetLastError();
+if (err != cudaSuccess) {
+  return static_cast<int>(err);
+}
+```
+
+**`cudaGetLastError()` returns the LAST sticky error from ANY prior
+CUDA call** (not just this kernel's launch). And it clears the error
+after returning it.
+
+If any earlier kernel call (e.g. the FP8 quantize at the same call
+site, or an unrelated prefill chunk in another model layer) left a
+sticky error, it would surface here as the wrapper's return code.
+
+Also: H7 mostly DISPROVEN by the auto-detect logic at line 168-176:
+
+```cpp
+if (thread_k == -1 || thread_n == -1) {
+  if (prob_m <= 16) { thread_k = 128; thread_n = 128; }
+  else { thread_k = 64; thread_n = 256; }
+}
+```
+
+For prob_m=513 → auto-set thread_k=64, thread_n=256 → matches
+dispatched variants `<m_blocks, 16, 4, 8>` (n_blocks=16=256/16,
+k_blocks=4=64/16). Dispatch should succeed.
+
+### H8 reproduction test (codex 5 min)
+
+Add at function entry (line 138 area):
+```cpp
+// Clear any pre-existing sticky CUDA errors before this call
+cudaError_t prev_err = cudaGetLastError();
+if (prev_err != cudaSuccess) {
+  // Log + clear the prior error so we don't blame this kernel for it
+  fprintf(stderr, "[gemm_w4_fp8_marlin_cuda] cleared pre-existing CUDA error: %d (%s)\n",
+          prev_err, cudaGetErrorString(prev_err));
+}
+```
+
+If the message fires on every call → H8 confirmed (sticky from prior).
+If the message NEVER fires → H8 disproven, look elsewhere.
+
+### Why H8 is NOW the highest
+
+- Explains 100% failure starting at Request 1
+- Explains why isolated smoke might pass (no prior CUDA call to leave
+  sticky error)
+- Explains why greedy_consistency conc=1 PASSED (different call
+  ordering may avoid the prior sticky error)
+- Explains why ace3cbe Bug 2 fix (workspace contract) didn't help
+  (different mechanism)
+
+### Updated hypothesis ranking
+
+1. **H8 — sticky CUDA error surfaced via `cudaGetLastError()`** (HIGHEST)
+2. H1' — first-call cudarc allocation overhead
+3. H2 — kernel launch shared memory exceeds sm_89 100 KB
+4. H6 — ctx.ordinal()/stream context mismatch
+5. H7 — `-1, -1` FFI args (mostly DISPROVEN by auto-detect logic)
+6. H4/H5 — workspace size / cudaFuncSetAttribute
