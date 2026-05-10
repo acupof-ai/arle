@@ -92,6 +92,22 @@ main axis) — exactly the pattern captured by
 (written tick 121). The reframe brief (`d8ebe73`) is the response;
 no new sediment needed this tick. Countdown to graduation: 1 more.
 
+## §6.3 Tick 130 (countdown 3/3) — GRADUATION
+
+3-state unchanged. Graduation criterion met: 3 consecutive ticks
+(128/129/130) all confirmed pure saturation with no new state.
+
+NEW feedback memory written:
+`feedback_cron_loop_steady_state_cadence_expansion.md` (11th MEMORY.md
+entry). Captures the cadence-expansion discipline: 30min→60+min when
+3+ ticks of pure saturation; ≤1 NULL-note per tick; continue
+PushNotification on actionable items only.
+
+**Effective immediately**: next ScheduleWakeup uses 3600s (60 min)
+not 1800s (30 min) per the new memory. Saturation tracker entries
+this session-tail end here; future ticks resume only when state
+changes (codex pickup, user GO, new finding).
+
 ## §6 Tick 127 follow-up — saturation persists
 
 State unchanged from §1: codex still IDLE 8+hr, no user response to
