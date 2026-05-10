@@ -96,6 +96,11 @@ impl RecurrentState {
     ///
     /// Cost: ~49 MB GPU memcpy for Qwen3.5-4B (24 layers × ~2 MB each).
     pub(crate) fn save_snapshot(&mut self, ctx: &DeviceContext) -> Result<()> {
+        self.snapshot = Some(self.clone_to_snapshot(ctx)?);
+        Ok(())
+    }
+
+    fn clone_to_snapshot(&self, ctx: &DeviceContext) -> Result<RecurrentSnapshot> {
         let mut snap_layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let state_copy: CudaSlice<f32> = ctx
@@ -111,10 +116,43 @@ impl RecurrentState {
                 conv_state: conv_copy,
             });
         }
-        self.snapshot = Some(RecurrentSnapshot {
+        Ok(RecurrentSnapshot {
             layers: snap_layers,
             seq_len: self.seq_len,
-        });
+        })
+    }
+
+    fn restore_layers_from_snapshot(
+        ctx: &DeviceContext,
+        layers: &mut [LayerRecurrentState],
+        snap: &RecurrentSnapshot,
+    ) -> Result<()> {
+        for (i, snap_layer) in snap.layers.iter().enumerate() {
+            ctx.stream
+                .memcpy_dtod(&snap_layer.state, &mut layers[i].state)
+                .map_err(|e| anyhow::anyhow!("restore recurrent state D2D failed: {}", e))?;
+            ctx.stream
+                .memcpy_dtod(&snap_layer.conv_state, &mut layers[i].conv_state.data)
+                .map_err(|e| anyhow::anyhow!("restore conv state D2D failed: {}", e))?;
+        }
+        Ok(())
+    }
+
+    fn copy_layers_to_snapshot(
+        ctx: &DeviceContext,
+        layers: &[LayerRecurrentState],
+        snap: &mut RecurrentSnapshot,
+        seq_len: usize,
+    ) -> Result<()> {
+        for (i, layer) in layers.iter().enumerate() {
+            ctx.stream
+                .memcpy_dtod(&layer.state, &mut snap.layers[i].state)
+                .map_err(|e| anyhow::anyhow!("snapshot recurrent state D2D failed: {}", e))?;
+            ctx.stream
+                .memcpy_dtod(&layer.conv_state.data, &mut snap.layers[i].conv_state)
+                .map_err(|e| anyhow::anyhow!("snapshot conv state D2D failed: {}", e))?;
+        }
+        snap.seq_len = seq_len;
         Ok(())
     }
 
@@ -126,15 +164,73 @@ impl RecurrentState {
         let Some(snap) = &self.snapshot else {
             return Ok(false);
         };
-        for (i, snap_layer) in snap.layers.iter().enumerate() {
-            ctx.stream
-                .memcpy_dtod(&snap_layer.state, &mut self.layers[i].state)
-                .map_err(|e| anyhow::anyhow!("restore recurrent state D2D failed: {}", e))?;
-            ctx.stream
-                .memcpy_dtod(&snap_layer.conv_state, &mut self.layers[i].conv_state.data)
-                .map_err(|e| anyhow::anyhow!("restore conv state D2D failed: {}", e))?;
-        }
+        Self::restore_layers_from_snapshot(ctx, &mut self.layers, snap)?;
         self.seq_len = snap.seq_len;
         Ok(true)
+    }
+}
+
+/// Prototype benchmark for Medusa Phase 1.B-Qwen3.5 snapshot-ring rollback.
+///
+/// Ring slots are allocated before timing. The measured section copies the live
+/// recurrent state into each preallocated slot and restores from the middle slot.
+/// The stream is synchronized before and after so the returned duration includes
+/// the D2D copy work, not just enqueue overhead.
+#[allow(dead_code)]
+pub(crate) fn bench_snapshot_ring_overhead(
+    ctx: &DeviceContext,
+    state: &mut RecurrentState,
+    k_plus_1: usize,
+) -> Result<std::time::Duration> {
+    anyhow::ensure!(k_plus_1 > 0, "k_plus_1 must be non-zero");
+
+    let mut ring = Vec::with_capacity(k_plus_1);
+    for _ in 0..k_plus_1 {
+        ring.push(state.clone_to_snapshot(ctx)?);
+    }
+
+    ctx.sync()?;
+    let start = std::time::Instant::now();
+    for snap in &mut ring {
+        RecurrentState::copy_layers_to_snapshot(ctx, &state.layers, snap, state.seq_len)?;
+    }
+    RecurrentState::restore_layers_from_snapshot(ctx, &mut state.layers, &ring[k_plus_1 / 2])?;
+    state.seq_len = ring[k_plus_1 / 2].seq_len;
+    ctx.sync()?;
+    Ok(start.elapsed())
+}
+
+#[cfg(all(test, feature = "cuda", not(feature = "no-cuda")))]
+mod tests {
+    use super::*;
+
+    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
+
+    #[test]
+    #[ignore = "CUDA micro-bench; prints Qwen3.5 recurrent snapshot-ring timing"]
+    fn qwen35_recurrent_snapshot_ring_bench_k6() {
+        let ctx = DeviceContext::new().expect("create CUDA device context");
+        let config = Config35::from_file(MODEL_PATH).expect("load Qwen3.5-4B config");
+        let mut state = RecurrentState::new(&ctx, &config).expect("allocate recurrent state");
+        let k_plus_1 = 6;
+        let elapsed = bench_snapshot_ring_overhead(&ctx, &mut state, k_plus_1)
+            .expect("bench snapshot ring overhead");
+
+        let state_size = config.linear_num_value_heads
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let conv_state_size = config.linear_attn_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+        let per_snapshot_bytes = state.layers.len()
+            * (state_size * std::mem::size_of::<f32>()
+                + conv_state_size * std::mem::size_of::<bf16>());
+        let ring_mib = (per_snapshot_bytes * k_plus_1) as f64 / (1024.0 * 1024.0);
+        let total_ms = elapsed.as_secs_f64() * 1_000.0;
+        println!(
+            "qwen35_snapshot_ring_bench k_plus_1={} total_ms={:.3} per_snapshot_ms={:.3} estimated_ring_memory_delta_mib={:.1}",
+            k_plus_1,
+            total_ms,
+            total_ms / k_plus_1 as f64,
+            ring_mib
+        );
     }
 }
