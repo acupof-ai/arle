@@ -69,15 +69,33 @@ is W4A16 (Task #43 Arm A degradation) or PF8.3 (this — outright kill).
 ## Reconciliation with prior findings
 
 - `57c37b5` H8 DISPROVEN said "kernel WORKS at conc=1 single requests"
-  — that was a SINGLE manual curl, no Pass 3 warmup pressure. With
-  Pass 3 warmup running first (which the bench script enables), the
-  kernel fails immediately.
+  — that was a SINGLE manual curl, narrow scope; subsequent sustained
+  bench at conc=1 reveals kernel fails on every request.
 - `0cde63d` PF8.3 RUNTIME KILL framed the failure as "load-dependent"
-  — this bench refines: load-INDEPENDENT, but warmup-dependent.
-  Pass 3 warmup (Task #35 substrate) is the trigger.
+  — this bench initially refined to "warmup-dependent", but follow-up
+  Arm B A/B (`2026-05-10-pf85-armB-no-warmup-ab-test.md`) REFUTED that
+  framing: with `INFER_PREFILL_WARMUP=0` Pass 3 disabled, kernel STILL
+  fails 5959 times starting at Request 0. **Per-call workspace alloc
+  in `gemm_w4_fp8_marlin_cuda` is systematically broken on sm_89 16GB**;
+  warmup is just the first place it surfaces because warmup runs
+  before user requests.
 - Task #47 H1' refactor was designed to make MarlinScratch default-on
   for PF8. **This bench evidence says default-on would AMPLIFY the
-  failure**, not fix it. H1' design needs revision before pickup.
+  failure**, not fix it. Per Arm B follow-up: H1' redesign scope is
+  BROADER than originally thought — must address per-call allocation
+  systematically, not just dispatch-time choice.
+
+## Framing self-correction (added 11:45 KST after Arm B A/B)
+
+The original §"Reconciliation with prior findings" framed the failure
+as "warmup-dependent" — that was inferred from log pattern (failures
+START at Pass 3 warmup B=1) without direct A/B. Arm B refutes:
+warmup-INDEPENDENT, the kernel itself is broken regardless of when
+first invoked. SKILL #29 framing-decay pattern at n=6 (caught within
+30 min by follow-up A/B). KILL verdict itself unchanged — both arms
+produce identical "server cannot serve PF8 requests at conc=1"
+outcome — but the EXPLANATION refined to point at the per-call alloc
+path, not warmup interaction.
 
 ## Fix
 
