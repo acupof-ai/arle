@@ -201,6 +201,17 @@ Since H8-VERDICT below, ~8 Claude commits + codex Task #35 in flight:
   (Task #48, NOT blocking #35)
 - About to start cold-start A/B bench (single-binary, baseline =
   `INFER_PREFILL_WARMUP=0`, treatment = default)
+- **Bench IN FLIGHT** as of 2026-05-10 EOD+~14.5hr: server PID 1968247
+  serving on port 8000 (12.6 GiB GPU, 100% util), baseline arm 1/6
+  running. 6-round A/B plan = baseline×3 + treatment×3. First-attempt
+  bench script had a bash-array-in-subshell bug (only printed env, no
+  server start); codex recovered + caught a self-pkill misadventure
+  (pkill -f command-string matched the running shell command itself
+  → killed own shell). Now using port-level cleanup instead of
+  command-string match. Discipline pattern: codex caught both bugs
+  via post-action verification, not via pre-action review — argues
+  for SKILL #33 "codex review --uncommitted" more aggressive use on
+  bench scripts too, not just code substrate.
 - Then will write wins entry per bench-and-trace-spec template
 
 **New tasks**:
