@@ -151,6 +151,36 @@ status: session-end-checkpoint-for-next-pickup
 
 ## §3 Pickup queue (priority order)
 
+### POST-PF8.3 KILL state (this session, 2026-05-10 EOD+~9hr)
+
+**🚫 PF8.3 RUNTIME KILL** (`0cde63d`) — substrate landed (`11763ba`) but
+gemm_w4_fp8_marlin_cuda fails code 2 (cudaErrorMemoryAllocation) on
+101380/101380 requests under sustained load. greedy_consistency PASS
+was conc=1 false-positive (per skill #29 strengthening).
+
+**8 hypotheses ranked** (`2472e8a` + `cd7732a` + `c9abe8e`):
+- H8 HIGHEST: sticky cudaGetLastError surfaces prior-kernel error
+- H1': cudarc allocator first-call overhead
+- H2: sm_89 100 KB smem exceeded by Hopper-tuned tile variants
+- H6: ctx.ordinal/stream context mismatch
+- H7: FFI -1 args (mostly DISPROVEN by auto-detect at line 168-176)
+
+**H8 fix path ready** (`1b3f76c` + Task #46): 1-line cudaGetLastError
+clear + diagnostic at marlin_w4_fp8_kernel.cu line 138, ~40 min codex
+to verify+apply+bench v11+pair-with-greedy-consistency-conc-2-4.
+
+**Medusa Phase 1.A pivot BLOCKED** (`ad14636`): HF_TOKEN not set,
+lmsys-chat-1m gated. User auth setup OR non-gated alternative needed.
+
+**5 user options pending** decision (per ad14636 §4):
+1. HF auth setup → Medusa Phase 1.A
+2. Non-gated alt dataset (humaneval) → Medusa Phase 1.A
+3. PF8.3 kernel fix per H8 (Task #46)
+4. #35 cap=8 prefill warmup (per 58b0ac1 reconciliation)
+5. Session pause + summary (~80 commits, 9+ hours)
+
+
+
 ### Codex's natural pickup (highest leverage)
 
 **PF8.3 FP8 marlin GEMM kernel** (~800-1200 LOC, 1-2 days codex) —
