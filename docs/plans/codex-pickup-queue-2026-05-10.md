@@ -623,6 +623,23 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   diminishing-returns churn. Awaits user direction (A/B/C/D per
   direction options) or codex resume.
 
+- **2026-05-10 EOD+1500 (49th tick — recurring stale-loop-prompt verifications)**:
+  Loop prompt continues to claim "e5deac8 verdict implications PRE-bisect needs
+  cherry-pick to main when codex bisect releases HEAD" — verified yet again
+  this tick: `git log --grep` confirms `01bcefa` is the cherry-picked
+  equivalent in main since many ticks ago. The orphan `e5deac8` is a dangling
+  reference (no branch contains it), harmless, will be cleaned by git GC.
+
+  **Pattern**: loop prompt has carried this stale instruction for ~30 ticks
+  despite the action being completed at tick 19 (per pickup queue §8 EOD+1010
+  state-reconciliation entry). This is the canonical "stale-loop-prompt"
+  pattern documented at SKILL #29 n=6 — when the prompt is fired by a cron-
+  loop without state freshness check, it persists action items beyond their
+  validity window. The 3-state scan + verification discipline at every tick
+  start IS the canonical defense.
+
+  No further action this tick. Awaits user direction.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
