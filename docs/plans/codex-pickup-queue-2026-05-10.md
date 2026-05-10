@@ -655,6 +655,27 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
 
   This 51st tick: cross-link only (this entry). Awaits user direction.
 
+- **2026-05-10 EOD+1580 (52nd tick — applying e37a46b Rule 3)**:
+  Per my own `e37a46b` Rule 3 (saturation halt criteria), this tick:
+  STOP self-ScheduleWakeup. User keeps firing /loop manually each
+  cron tick anyway, so they drive cadence. Applying own evidence-
+  based recommendation honestly. Final PushNotification dispatched.
+
+  This means: no automatic wake-up scheduled. User-fired /loop
+  continues normal pattern. If user closes session, no automatic
+  re-fire (which is correct at saturation — no new evidence to
+  acquire).
+
+  Final state per session-tail accumulation:
+  - PF8 chain CLOSED-KILL with 4-arm + 6-cell triangulation
+  - W4A16/W4A8 perf bar concretely set across conc=1/2/4
+  - Direction options doc with ironclad Option A (Medusa) recommendation
+  - 3 SKILL graduations (#35/#36/#38) + 2 candidates (twin-control,
+    end-to-end-math)
+  - 14+ Claude commits, 11 PASS Claude benches
+  - Cooperative-loop asymmetric saturation pattern documented as
+    `e37a46b` errors entry with 3 ground rules
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
