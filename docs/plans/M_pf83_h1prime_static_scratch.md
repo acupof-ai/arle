@@ -2,14 +2,21 @@
 title: M_pf83 H1' static-scratch refactor — eliminate cudarc allocator fragmentation under sustained PF8 load
 date: 2026-05-10
 type: plan
-status: codex-pickup-ready (gated on user-run bench v11 license decision)
+status: BLOCKED-pending-redesign (PF8.5 bench v11 returned KILL 11:34 KST per 0be278f; original H1' design empirically broken per Arm B/C/D 4-arm A/B)
 depends_on:
-  - bench v11 conc=1 PF8.5 license decision (per docs/research/2026-05-10-next-session-pickup-state.md §3)
-  - PF8.3 H8 DISPROVEN verdict (57c37b5)
-  - PF8.3 RUNTIME KILL evidence (0cde63d)
+  - ~~bench v11 conc=1 PF8.5 license decision~~ — DONE 2026-05-10 11:34 KST: KILL (5878 kernel failures, see 0be278f)
+  - Arm B refute (warmup-INDEPENDENT per 7ed8160)
+  - Arm C+D controls (W4A16 + W4A8 HEALTHY at conc=1, isolates PF8.3 substrate per 06b7437 + d8b2870)
+  - Twin-control SKILL candidate (430a4be)
 gates:
-  - LICENSE: PF8 conc=1 TTFT Δ ≥ -8% vs INT8 baseline → proceed with H1' refactor
-  - KILL: PF8 conc=1 TTFT regression > -3% → close PF8 chain, pivot Task #28 Medusa
+  - ~~LICENSE: PF8 conc=1 TTFT Δ ≥ -8% vs INT8 baseline~~ — N/A, KILL outcome reached
+  - ~~KILL: PF8 conc=1 TTFT regression > -3%~~ — REACHED via different mechanism (kernel failures, not regression)
+  - **REDESIGN required**: original H1' (make MarlinScratch default-on) is empirically broken per Arm B (warmup-OFF still fails 5959 times). Per-call cudaMalloc cannot work for PF8 path; needs ground-up workspace allocation redesign.
+new_acceptance_criteria_for_h1prime_v2:
+  - OOM-regression A/B gate at conc=4 4k W4A16 sustained (per da7f5a2)
+  - TTFT/tok-s regression A/B gate at same workload (per d09623a)
+  - PF8 conc=1 sustained-load HEALTHY (zero kernel failures over 60s) — must beat current Arm A 5878 / Arm B 5959 failures
+  - Match or improve W4A8 perf bar (54.2ms TTFT / 11.9ms ITL / 409 tok/s) at conc=1 — established by Arm D (d8b2870)
 ---
 
 # M_pf83 H1' static-scratch refactor — eliminate cudarc allocator fragmentation under sustained PF8 load
