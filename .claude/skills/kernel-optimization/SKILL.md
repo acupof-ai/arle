@@ -838,6 +838,26 @@ Each anti-pattern has a project commit/entry where it was paid for.
       are about VERIFYING the substrate of a claim before trusting
       it. #28 is "verify the file content"; #29 is "verify the test
       fixture matches what production uses".
+    - **Evidence accretion (n=4 as of 2026-05-10 EOD+880)**:
+      - n=1 `eb2b4b6` original codex W4A8 fixture override
+      - n=2 codex's Task #48 (`8d1caad`) independent rediscovery via
+        `git log -S 'test_w4a8_vs_bf16_token_diff'` — found 81b6481
+        documenting "W4A8 substrate produces 100% garbage output";
+        codex tightened gate from 25% → 1% AND changed default to
+        qzeros-fixed `Qwen3-4B-GPTQ-W4A8-zpfix`
+      - n=3 Claude's `be133f8` audit found same broken default
+        constant duplicated in BOTH `e2e.rs:21` AND
+        `greedy_consistency.rs:30` — "broken defaults may be
+        DUPLICATED across test files via copy-paste constants"
+      - n=4 `b956f3a` Claude itself committed the anti-pattern by
+        substituting W4-hybrid-zpfix model into test designed for
+        W4A8-marlin-class fixtures → 100% diff was test/fixture
+        mismatch, not real bug. **Strengthens to "test-fixture
+        compatibility check is the responsibility of whoever invokes
+        the test, not just whoever wrote the test"**.
+    - Universalized rule: applies to (a) test authors, (b) test
+      consumers, (c) anyone substituting fixtures via env var
+      override. Same pattern at all three layers.
 
 30. **Commit-time worktree race in cooperative session — `git status` BEFORE commit, not just before add**
     - Caught by: `0d63a52` + `994a294` recovery + `ca09db0` discipline
