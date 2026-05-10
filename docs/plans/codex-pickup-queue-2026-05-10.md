@@ -751,6 +751,30 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
 
   Most efficient single-doc pickup for next session.
 
+- **2026-05-10 EOD+2200 (83-88th tick — bench evidence axis fully saturated)**:
+  Last 6 ticks added 2 substantive benches (BF16 baseline + W4A8 prompt=8192)
+  + session-tail TOTAL summary doc (`9350767`) + index refresh EOD+2150.
+  Cumulative tally: **19 PASS + 1 NULL + 1 misapplied**. Bench evidence
+  axis fully saturated; further benches would be invented work.
+
+  **Major findings this 6-tick stretch**:
+  - W4A8 long-ctx 3-point curve complete (prompt=2048/4096/8192)
+  - §9.4 prediction validated +4% margin (W4A8 8k actual 985 vs predicted 948)
+  - Hybrid Option B value at 8k MEASURED -14.2% (was predicted -15.7%)
+  - BF16 baseline measured: W4A16 STRICTLY dominates (-4% TTFT, -59% ITL,
+    +130% tok/s) — quantization is strict win on sm_89 16GB
+
+  **Key strategic anchors for next-session pickup**:
+  - `2026-05-10-session-tail-total-summary.md` (single anchor doc)
+  - `docs/index.md` Last refreshed EOD+2150
+  - `2026-05-10-w4a8-vs-w4a16-concurrency-scaling-full-matrix.md` (§8-§10)
+  - `2026-05-10-w4a16-longctx-prompt2048-bench.md` (§10-§11)
+  - `2026-05-10-bf16-baseline-vs-quant-strict-win.md` (validates W4 axis)
+  - `2026-05-10-post-pf85-direction-options.md` (refined recommendations)
+
+  Awaits user direction. Per memory `feedback_user_drives_cron_cadence_overrides_saturation.md`,
+  continuing minimal accumulation per persistent /loop pattern.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
