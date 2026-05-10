@@ -8,6 +8,11 @@ related_docs: [`b2cccb9` P2.5 diagnostic, `f8b8174` QQQ upstream finding, `d8ebe
 
 # P2.5 Step 1 — LICENSE: QQQ Hunk 8 IS schedule auto-tune; codex Step 2 ready
 
+> **2026-05-10 later update**: any priority-table reference to
+> A+B/Medusa in this document is historical. Current Qwen3.5 Medusa is
+> blocked on recurrent-state rollback; P2.5 remains separate and
+> unaffected.
+
 > **Why now**: `b2cccb9` §4.1 specified P2.5 Step 1 = "diff + categorize
 > 119-line delta". Executed this tick. Result: hunk 8 (+99/-42) IS the
 > schedule auto-tune pattern that M'' (`d8ebe73` §3.2) was supposed

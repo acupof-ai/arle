@@ -7,6 +7,14 @@ status: open (supersedes 2026-05-09 queue; pickup-ready as Task #35 completes)
 
 # Codex pickup queue — 2026-05-10
 
+> **2026-05-10 later update — Qwen3.5 Medusa re-scope**: entries below
+> that mark #28 Medusa as pickup-ready are superseded. User re-scoped
+> away from Qwen3-specific execution and toward Qwen3.5. Qwen3.5 Medusa
+> is blocked on recurrent-state accepted-length commit/rollback; see
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+> The next #28 pickup is a rollback-design/prototype, not Medusa heads,
+> training, or CLI exposure.
+
 > **Purpose**: single-source-of-truth queue for codex's next task pickup
 > when Task #35 cap=8 prefill warmup commits. Supersedes
 > `codex-pickup-queue-2026-05-09.md` which is 1+ day stale.
@@ -25,17 +33,17 @@ See §8 dispatch log for closure milestones.
 |---|---|---|---|---|
 | ~~P0~~ | ~~#43 W4A16 fragmentation hypothesis test~~ | ~~always available~~ | ~~~30 min~~ | **CLOSED** — DISPROVEN INVERSE (codex `83fc5d0` + Claude `e8b6b31`) |
 | **P1 (LICENSE branch)** | #47 PF8.3 H1' static-scratch refactor | bench v11 LICENSES PF8 at conc=1 (USER must run `bash scripts/pf85_bench_v11_user.sh` per ead46dc) | ~70 LOC + tests + bench, 3-4 hours | **PENDING bench v11 LICENSE** |
-| **P1 (KILL branch)** | #28 Medusa Phase 1.A via Alpaca | bench v11 KILLS PF8 at conc=1 | ~80 LOC Python + 2 hrs data prep + ~1 week training | **PENDING bench v11 KILL** (or standalone if user wants Medusa now) |
+| **P1 (KILL branch, superseded)** | #28 Medusa Phase 1.A via Alpaca | bench v11 KILLS PF8 at conc=1 | ~80 LOC Python + 2 hrs data prep + ~1 week training | **SUPERSEDED for Qwen3.5** — dataset ready, but runtime blocked on recurrent rollback |
 | ~~P2~~ | ~~#48 W4A8-vs-BF16 84.4% accuracy regression~~ | ~~always~~ | ~~~1 hr~~ | **CLOSED** — codex `8d1caad` (qzeros-fixed default in both test files) |
 | **P3** | #30 Hybrid W4A16/W4A8 dispatch Phase 1-3 substrate | always (older pending task) | unknown (likely substantial) | (no recent scaffold; defer to discovery) |
 | **P4** | #44 PF8 chain (PF8.5 license sequence completion) | bench v11 LICENSES + Task #47 lands first | depends on H1' outcome | PENDING bench v11 + #47 |
 
 **Codex idle as of 2026-05-10 ~10:55 KST.** Next dispatch options:
 - Wait for user to run `bash scripts/pf85_bench_v11_user.sh` →
-  P1 LICENSE (#47 H1') OR P1 KILL (#28 Medusa)
+  P1 LICENSE (#47 H1') OR Qwen3.5 Medusa rollback-design pickup
 - P3 Task #30 dispatch (no scaffold yet, codex would discover scope)
-- Standalone Medusa Phase 1.A (~2 hr setup + 1 wk training, runs in
-  parallel with awaiting bench v11)
+- Standalone Medusa Phase 1.A is no longer the next step for Qwen3.5;
+  recurrent rollback design/prototype comes first.
 - New user direction
 
 ## §2 Recommended dispatch logic
@@ -52,7 +60,7 @@ codex_finishes_task_35():
         if pf8_licensed:
             pickup_task_47_h1_refactor()  # 3-4 hours
         else:  # pf8_killed
-            pickup_task_28_medusa_via_alpaca()  # 2 hrs setup + 1 wk train
+            pickup_qwen35_recurrent_rollback_design()  # blocks Medusa runtime
     else:
         # User hasn't run bench v11 yet
         if want_to_make_progress_blind:
@@ -826,10 +834,10 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
     redesign (default-on path empirically broken per this evidence)
 
   **PICKUP QUEUE PIVOT** (effective immediately):
-  - **P1 NEW**: #28 Medusa scaffold (codex own ~500 LOC + 1 wk
-    training). Medusa Alpaca cross-link `63769be` previously
-    documented HF auth bypass via Alpaca dataset (ungated). Phase 1.A
-    scaffold ready for codex pickup.
+  - **P1 NEW (superseded 2026-05-10 later)**: #28 Medusa scaffold was
+    framed as codex-own ~500 LOC + 1 wk training. This is now blocked
+    for Qwen3.5 by recurrent-state rollback; Alpaca data remains ready
+    but is not the critical path.
   - **P2 (was P3)**: #30 Hybrid W4A16/W4A8 dispatch substrate
   - **P3 (deferred)**: #47 H1' refactor pending the OOM-regression A/B
     gate redesign per da7f5a2/d09623a
@@ -851,6 +859,10 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
 
 Post-`9735b47` REFUTATION + `0a0d221` Medusa audit, sediment of
 21-tick chain into single anchor:
+
+> **Later correction**: this section is historical for the Qwen3/Qwen3.6
+> chain. Current Qwen3.5 direction replaces "Medusa + Hybrid" pickup
+> with recurrent rollback design before any Medusa runtime/training work.
 
 **Strategic pivots**:
 - `bccf1bd` Hybrid plan -14% prediction was CORRECT (my §12.7
@@ -876,12 +888,14 @@ Post-`9735b47` REFUTATION + `0a0d221` Medusa audit, sediment of
 **FINAL priority table**:
 | P | Path | Wall-clock | Status |
 |---|---|---:|---|
-| P1 | A+B (Medusa + Hybrid) | 4-5 days | gated on user GO |
+| P1 | A+B (Medusa + Hybrid) | 4-5 days | **SUPERSEDED for Qwen3.5** — blocked on recurrent rollback |
 | P2.5/M'' | QQQ Hunk 8 port (merged) | 4.5-6.5 hr | LICENSED with caveats |
 | P3 | Task #47 H1' v2 | 1 day | parallel codex track |
 
 **Compound 5-6 days for ~2.61× tok/s + -14% latency + PF8 path unblock + P2.5 reference.**
 
-USER GO gate items: model (Qwen3-4B vs Qwen3.6) + integration target (CUDA first) + wall-clock approval.
+USER GO gate items from the old chain were model (Qwen3-4B vs Qwen3.6) +
+integration target (CUDA first) + wall-clock approval. Current gate is:
+Qwen3.5 recurrent rollback design evidence.
 
 Codex IDLE 8+hr at "Worked 26m 51s". 21-doc decision chain ready for next-session pickup.

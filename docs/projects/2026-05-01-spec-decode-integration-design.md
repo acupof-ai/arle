@@ -347,7 +347,9 @@ Files intentionally not touched in Phase 2 first pass:
   measured.
 - `infer/src/backend/metal/`: Metal speculative decode is a separate path.
 - `crates/qwen35-spec/` and `infer/src/model/qwen35/`: Qwen3.5 follows only
-  after Qwen3-4B W2 is stable.
+  after Qwen3-4B W2 is stable and after the recurrent-state rollback blocker
+  is solved. Current evidence:
+  `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
 
 ## Correctness Gates
 

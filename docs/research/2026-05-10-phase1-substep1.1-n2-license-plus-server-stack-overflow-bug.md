@@ -7,6 +7,10 @@ status: phase1-licensed-server-bug-flagged
 
 # Phase 1.1 σ-tight n=2 LICENSE confirmed + server stack-overflow bug discovered (r3 crash)
 
+> **2026-05-10 later update**: any priority-matrix references to #28
+> Medusa are superseded for Qwen3.5 by the recurrent rollback blocker.
+> This Phase 1.1 license finding remains independent.
+
 > Claude self-driven n=3 σ-tight re-bench attempt of Phase 1 Substep 1.1
 > dequant.h port. r1 (codex f86d0fd) + r2 (Claude this session) ran
 > cleanly. r3 attempt triggered a server-side stack overflow during

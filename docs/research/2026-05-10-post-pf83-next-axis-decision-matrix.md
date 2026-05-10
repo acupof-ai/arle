@@ -7,6 +7,10 @@ status: forward-looking-decision-matrix-for-next-agent
 
 # Post-PF8.3 next-axis decision matrix — concrete pickup paths for both PF8.5 LICENSE and KILL branches
 
+> **2026-05-10 later update**: KILL-branch Medusa pickup references are
+> superseded for Qwen3.5. The active next step is recurrent rollback
+> design/prototype before Medusa heads/training.
+
 > Written THIS tick while codex Working 35m 48s on PF8.3 substrate
 > commit pre-checks (cargo check PASSED + clippy + targeted CUDA
 > tests serial). Once codex commits substrate + PF8.5 e2e bench

@@ -9,6 +9,10 @@ related_skills: [#34 (greedy single-request not sufficient), #38 (warmup clamp)]
 
 # PF8.5 license bench v11 — Claude runs
 
+> **2026-05-10 later update**: KILL-branch pivots to #28 Medusa in this
+> doc are superseded for Qwen3.5. Current #28 work is recurrent rollback
+> design/prototype before any Medusa data/training/runtime pickup.
+
 > **Purpose**: User reissued cron-loop directive 4× consecutively at
 > ~11:28 KST after 2hr+ saturation, with explicit "Claude 必须并行
 > 执行,不能 idle 等 codex" + path-divergence table mandating

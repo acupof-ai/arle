@@ -8,6 +8,10 @@ related_docs: [`b6b8adc` ARLE marlin_pf8 = vLLM fork, `2f19a3c` Marlin parity su
 
 # ARLE marlin_w4a8 upstream lineage — HandH1998/QQQ, NOT vLLM
 
+> **2026-05-10 later update**: priority-table references to A+B/Medusa
+> are superseded for Qwen3.5 by the recurrent rollback blocker. This
+> upstream-lineage finding remains independent.
+
 > **Why now**: `b6b8adc` closed P2 (vLLM Marlin diff-port) as DONE
 > at file level. This tick surveys whether the W4A8 axis has a
 > SEPARATE upstream worth tracking. Yes: HandH1998/QQQ is the actual

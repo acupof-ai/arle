@@ -8,6 +8,10 @@ related_docs: [`0be278f` PF8.5 KILL, `415de06` Claude RUNS, `bccf1bd` consistenc
 
 # Cron-loop arg vs git-truth status audit — what's actually pending
 
+> **2026-05-10 later update**: Medusa-ready and A+B-ready statements
+> below are superseded by the Qwen3.5 recurrent rollback blocker. Current
+> Medusa next step is rollback design/prototype, not head/training pickup.
+
 > **Why now**: Recent /loop firings repeat stale claims like "PF8.5
 > license decision STILL blocked on USER-runs-only bash script" and
 > "current main axis: Machete W4 kernel 移植". Both are FALSE per

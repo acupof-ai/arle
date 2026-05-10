@@ -8,6 +8,11 @@ related_docs: [`M_pf83_h1prime_static_scratch.md` blocked plan, `0be278f` PF8.5 
 
 # M_pf83 H1' v2 — redesign brief (Task #47 unblock)
 
+> **2026-05-10 later update**: priority references to A+B/Medusa in
+> this brief are historical. The active Qwen3.5 Medusa path is blocked
+> on recurrent-state rollback. This PF8.3 redesign brief remains a
+> separate PF8 track.
+
 > **Why this brief**: original `M_pf83_h1prime_static_scratch.md` §1 root
 > cause hypothesis ("per-call alloc fragmentation under sustained load")
 > was REFUTED by Arm B (`7ed8160`): with `INFER_PREFILL_WARMUP=0`, kernel

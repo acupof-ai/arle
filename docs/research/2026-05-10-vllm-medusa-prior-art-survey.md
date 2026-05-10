@@ -8,6 +8,13 @@ related_docs: [`0a0d221` Task #28 readiness audit, `9735b47` REFUTATION pivot, `
 
 # vLLM Medusa prior-art survey — direct gh-api source read
 
+> **2026-05-10 later update**: the LOC/prior-art result below remains
+> valid for Medusa head/propose substrate, but it does **not** cover the
+> active Qwen3.5 blocker. Qwen3.5 verification also needs recurrent-state
+> rollback, which vLLM's Qwen-style Medusa survey did not address. Use
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md` as
+> the current implementation gate.
+
 > **Why now**: Audit `0a0d221` §3.1 next-step required vLLM/SGLang Medusa
 > survey. Direct read of vLLM v0.x sources via gh API contradicts audit
 > §2.1 substrate-size assumption (~500 LOC + tree-attention kernel).

@@ -8,6 +8,10 @@ related_docs: [`d8ebe73` Machete-inspired reframing brief, `2b956ce` sm_89 alter
 
 # vLLM W4 kernel port completion status — M''' already done
 
+> **2026-05-10 later update**: priority-table references to A+B/Medusa
+> are superseded for Qwen3.5 by the recurrent rollback blocker. This W4
+> port-completion correction remains independent.
+
 > **Why this**: `d8ebe73` §3.3 listed "P3.5 Option M''' (W4-FP8
 > preprocess port from vLLM): 1-2 days, complements P3". Direct file
 > survey shows ARLE has ALREADY ported this kernel as PF8.2 substep.

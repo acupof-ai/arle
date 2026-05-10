@@ -2,11 +2,16 @@
 title: Medusa Phase 1.A pivot ready — Alpaca dataset unblocks HF auth requirement (Path A from 2026-05-08 inventory)
 date: 2026-05-10
 type: research
-status: open (codex pickup ready if PF8 KILLs at bench v11; resolves ad14636 HF auth blocker via existing Path A)
+status: superseded-for-qwen35-by-recurrent-rollback-blocker
 related_tasks: [#28 (M_medusa scaffold, blocked on HF auth per ad14636)]
 ---
 
 # Medusa Phase 1.A pivot ready — Alpaca dataset unblocks HF auth requirement
+
+> **2026-05-10 later update**: Alpaca still resolves the HF-auth data
+> blocker, but the active Qwen3.5 direction is blocked earlier by
+> recurrent-state rollback. This document is now data-readiness context,
+> not a pickup-ready Medusa implementation plan.
 
 > **Purpose**: cross-link the 2026-05-08 Phase 1.A data inventory (which
 > already documented public alternatives) to the 2026-05-10 `ad14636`

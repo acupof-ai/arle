@@ -47,6 +47,11 @@ ARLE 已有四条独立强项:
 
 **缺**:linear-attn 层在 spec-decode 下的等效 KV update(linear-attn 的 hidden state 是 recurrent,要支持 verify-rollback)。
 
+> **2026-05-10 evidence update**: this rollback gap is now confirmed as
+> the active Qwen3.5 Medusa blocker. Current spec commit only truncates
+> paged KV; Qwen3.5 recurrent state has no accepted-length rollback.
+> See `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+
 ### 1.3 Tier-KV
 
 `infer/src/kv_tier/` T0(GPU)/T1(CPU)/T2(disk)三级,有 RadixCache。
@@ -104,6 +109,10 @@ ARLE 已有四条独立强项:
 - TileLang AOT 编译产物 ≤ 12 MB cubin 总量(per-SM × 几个 head config)。
 
 ### M_c — Hybrid + spec-decode 组合
+
+> **Status update**: M_c is blocked at design level until Qwen3.5
+> recurrent rollback has a measured implementation. Do not run Qwen3.5
+> spec-on benches as valid evidence before this lands.
 
 linear-attn 层在 spec-verify 下需要的 hidden state checkpoint/rollback:
 - Verify 前快照 GDR hidden state(O(num_layers × num_kv_heads × head_dim) ~ 几 MB)

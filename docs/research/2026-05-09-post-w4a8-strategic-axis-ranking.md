@@ -1,5 +1,10 @@
 # Post-W4A8 strategic axis ranking — chunked prefill vs Medusa vs xgrammar
 
+> **2026-05-10 later update**: this ranking predates the Qwen3.5 Medusa
+> rollback audit. Medusa remains a strategic non-classical spec-decode
+> direction, but Qwen3.5 execution is blocked on recurrent-state
+> accepted-length rollback before training/runtime work.
+
 > 接续 `2026-05-09-w4a8-axis-saturation-audit.md`(W4A8 5 axis 3 KILL)。
 > 评估 W4A8 后下一 strategic axis ROI,empirical-driven。
 > **结论**:**chunked prefill > Medusa > xgrammar**(by ROI / wall-clock /

@@ -8,6 +8,10 @@ related_docs: [`2f19a3c` Marlin parity survey, `86b28c7` M''' completion correct
 
 # ARLE marlin_pf8/ = complete vLLM marlin/ fork — P2 dropped from queue
 
+> **2026-05-10 later update**: priority-table references to A+B/Medusa
+> are superseded for Qwen3.5 by the recurrent rollback blocker. The
+> marlin_pf8 fork status remains independent.
+
 > **Why now**: `2f19a3c` §5 sized P2 (vLLM Marlin diff-port) at 1.5d
 > based on file-level header attribution check. This tick's deeper
 > survey reveals ARLE's `marlin_pf8/` subdir IS a complete vLLM

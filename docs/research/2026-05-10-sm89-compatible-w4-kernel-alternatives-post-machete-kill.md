@@ -8,6 +8,11 @@ related_docs: [`fc33cfb` Machete KILL errors entry, `9735b47` REFUTATION, `bccf1
 
 # sm_89-compatible W4 GEMM alternatives in vLLM — pivot recommendations after Machete KILL
 
+> **2026-05-10 later update**: references to the Medusa brief as ready
+> for Option A are historical for Qwen3/Qwen3.6. Active Qwen3.5 Medusa
+> is blocked on recurrent-state rollback. The sm_89 W4 alternatives
+> remain independent.
+
 > **Why now**: `fc33cfb` killed Machete port axis (Hopper-only WGMMA/TMA
 > dependency). User-stated main axis "Machete W4 kernel 移植 from
 > vLLM ... 预估 -20-40% ITL" needs re-grounded sm_89-compatible kernel

@@ -2,10 +2,15 @@
 title: Medusa Phase 1.A pickup chain — UNBLOCKED via #34 df37a68 + arle data download already works + arle binary stale ergonomics gap
 date: 2026-05-10
 type: research
-status: medusa-phase-1a-ready-for-codex-pickup
+status: superseded-for-qwen35-by-recurrent-rollback-blocker
 ---
 
 # Medusa Phase 1.A pickup chain — UNBLOCKED via #34 df37a68 + arle data download already works + arle binary stale ergonomics gap
+
+> **2026-05-10 later update**: data download remains unblocked, but the
+> active Qwen3.5 Medusa path is not ready for codex pickup. Runtime
+> correctness is blocked on recurrent-state rollback. Treat this as
+> dataset/CLI inventory only, not an implementation green light.
 
 > Pre-survey for #28 Medusa scaffold (next P0 axis per `61c9666`
 > architectural analysis if PF8 chain KILLs OR after PF8 chain

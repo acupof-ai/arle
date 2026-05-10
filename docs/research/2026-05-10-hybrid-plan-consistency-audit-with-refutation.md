@@ -8,6 +8,10 @@ related_docs: [`9735b47` REFUTATION wins, `114aca4` strategic matrix update, `M_
 
 # Hybrid plan consistency audit — REFUTATION measurement matches plan, NOT my extrapolation
 
+> **2026-05-10 later update**: the "Hybrid stacks with Medusa" framing
+> remains a hypothesis for the old Qwen3/Qwen3.6 chain. For active
+> Qwen3.5, Medusa is blocked until recurrent-state rollback exists.
+
 > **Why now**: Tick 102 (`114aca4`) updated session-tail strategic matrix
 > to position Option A (Medusa) as dominant for ALL contexts based on
 > `9735b47` REFUTATION. This audit cross-checks against the original

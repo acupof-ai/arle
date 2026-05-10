@@ -7,6 +7,10 @@ status: session-end-checkpoint-for-next-pickup
 
 # 2026-05-10 next-session pickup state — quick orientation
 
+> **2026-05-10 later update**: this pickup state predates the Qwen3.5
+> Medusa rollback audit. Any #28 Medusa pickup references should now be
+> read as "Qwen3.5 recurrent rollback design first".
+
 > One-page orientation for the next agent (codex reactivation OR
 > fresh Claude session) to start from after this 16+ hour session.
 > Read this first, then see `docs/index.md` for full context.

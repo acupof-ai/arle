@@ -6,6 +6,12 @@
 > Goal:把"长上下文 + spec-decode + tilelang + tier-KV"四件套的真实 bench
 > 数据放到一张可对比矩阵,公开拿到至少 6/9 workload 第一名。
 
+> **2026-05-10 Qwen3.5 update**: any Qwen3.5 spec-decode row is blocked
+> until recurrent-state accepted-length rollback exists. Without that,
+> spec-on data can pass surface sampling while corrupting hidden recurrent
+> state, so it is invalid for world-first claims. Canonical audit:
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+
 ## 0. 关键差异 vs unification M6
 
 unification M6 的目标是"统一两后端的对比",workload 是 **prefill / decode /
@@ -53,7 +59,7 @@ W8 (128k) 对手能跑的不多 — W8 主要 vs SGLang HiCache + vLLM long-cont
 |---|---|---|---|---|
 | A1 | Qwen3-4B | CUDA(4070 Ti SUPER / L4 / H100) | off | vanilla baseline |
 | A2 | Qwen3-4B | CUDA | on (self-spec K=4) | M_a + M_d |
-| A3 | Qwen3.5-4B(hybrid) | CUDA | on (self-spec K=4) | M_a + M_c + M_d |
+| A3 | Qwen3.5-4B(hybrid) | CUDA | blocked | Requires Qwen3.5 recurrent rollback before any spec-on bench is valid |
 | A4 | Qwen3-4B | Metal M3 Max | off | unification M5 land 之后才能跑 c>1 |
 
 ## 2. 数据采集 protocol
@@ -78,6 +84,7 @@ canonical-params 锁,不动)。
 - 每个 ARLE 第一名都有可重现 commit hash + 启动命令 + raw guidellm output URL。
 - A2 vs A1 在 W2 (decode-heavy) 上 ≥ 1.4× throughput(M_a 数据点)。
 - A3 vs A1 在 W6 (longctx-32k) + spec-decode 上 ≥ 1.5× throughput(M_c + M_d 合并)。
+  Deferred until Qwen3.5 recurrent rollback is implemented and greedy consistency passes targeted reject cases.
 - W6 (longctx-32k) c=4 ARLE A3 vs SGLang HiCache + vLLM 至少其一 ≥ 1.8×(M_d 目标)。
 
 ## 4. 报告产物
