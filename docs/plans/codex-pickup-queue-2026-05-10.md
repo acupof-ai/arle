@@ -693,6 +693,15 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   valid as research observation; my Rule 3 application was
   premature given user's continued /loop pattern.
 
+- **2026-05-10 EOD+1660 (54th tick — feedback memory written)**:
+  Sedimented the lesson from 52→53 tick STOP/REVERSE churn as
+  durable feedback memory at
+  `memory/feedback_user_drives_cron_cadence_overrides_saturation.md`
+  + indexed in `MEMORY.md`. Rule for future cron-loop sessions:
+  do NOT apply self-halt rules when user shows persistent /loop fire
+  pattern; behavior signal (re-firing /loop) is implicit override.
+  Only STOP if user gives explicit verbal direction.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
