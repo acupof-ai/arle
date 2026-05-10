@@ -77,7 +77,25 @@ accumulation churn.
 5-6 candidates ready for graduation at next SKILL bump (when
 additional evidence accumulates).
 
-## §6 Cross-references
+## §6 Tick 127 follow-up — saturation persists
+
+State unchanged from §1: codex still IDLE 8+hr, no user response to
+PushNotification, no new findings to sediment. /loop continues firing
+with stale args (loop arg refs `f0c7561` 4-doc chain, but actual
+state has 24 docs + index/queue/memory consistent per §1 table).
+
+This is the EXPECTED steady-state per
+`feedback_user_drives_cron_cadence_overrides_saturation` memory:
+user-driven cadence overrides Claude's saturation detection; minimal
+accumulation continues but at decreasing per-tick value.
+
+Observation: 1 tick of pure-null commit is sustainable; 5+ ticks of
+the same risks pure churn. If next 3 ticks produce no new finding,
+graduate this to a feedback memory: "**user-driven cron-loop steady-
+state — when chain saturates, commit ≤1 NULL-note per tick AND
+expand cadence to 60+ min instead of 30 min**".
+
+## §7 Cross-references
 
 - `81b5e94` index.md EOD+2620 refresh
 - `15c16a4` pickup queue §8 chain summary
