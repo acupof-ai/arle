@@ -791,6 +791,10 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
 - **2026-05-10 EOD+2350 (92nd tick — saturation continues)**:
   No state change. Per established discipline.
 
+- **2026-05-10 EOD+2390 (93rd tick — loop prompt simplified by user)**:
+  User trimmed loop prompt to minimal directive. State otherwise
+  unchanged. Per established discipline.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
