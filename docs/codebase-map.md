@@ -10,6 +10,11 @@
 > 今日 41+ commits incremental audit:[`architecture-snapshot-2026-05-07-eod.md`](architecture-snapshot-2026-05-07-eod.md)。
 > 本 doc 仍是结构性 truth 来源,战略和今日变化看上面 pointer。
 
+> **2026-05-10 later update:** active Qwen3.5 Medusa/spec work is gated by
+> [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md).
+> Older Medusa-ready / A+B notes are historical for Qwen3 / Qwen3.6 until
+> recurrent-state accepted-length rollback is licensed for Qwen3.5.
+
 Updated 2026-05-06 after the DSV4 runtime substrate scaffold + nano autograd
 training landed (2026-05-05). DSV4 is the **#1 next-model priority** and Qwen 3.6
 the **#2** — see
@@ -212,7 +217,7 @@ For the Route-A folding rationale see
 - `infer/src/weight_loader.rs`: weight loading
 - `infer/src/gguf.rs`: GGUF parsing
 - `infer/src/quant.rs`: quantization metadata + dispatch
-- `infer/src/speculative.rs`: speculative decoding framework — `SpecConfig`, `DraftMode`, `TokenProposal`, `Verifier`, persistent per-request draft state, K-token proposals, greedy verifier accounting, bonus-token commit, and live spec counters (Phase 2 plumbing landed; throughput regression tracked in `docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`)
+- `infer/src/speculative.rs`: speculative decoding framework — `SpecConfig`, `DraftMode`, `TokenProposal`, `Verifier`, persistent per-request draft state, K-token proposals, greedy verifier accounting, bonus-token commit, and live spec counters (Phase 2 plumbing landed; throughput regression tracked in `docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`; Qwen3.5 Medusa/spec verification additionally requires recurrent accepted-length rollback)
 - `infer/src/speculative/cuda.rs`: CUDA-side speculative decode integration — draft/verifier state plumbing for the external-draft path
 - `infer/src/tensor_parallel.rs`: CPU-side TP rank/shard math (used as a library by the `tp` and `distributed` modules; not the runtime collective surface)
 - `infer/src/tp.rs` + `infer/src/tp/load_context.rs`: `TpLoadContext` row/column/head shard helpers that drive shard-aware safetensors loading
