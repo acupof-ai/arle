@@ -506,3 +506,51 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   **Accumulation discipline note**: housekeeping > mechanical churn at
   saturation. The 13th tick is producing 1 task-close + this entry
   rather than another bench/audit on already-saturated paths.
+
+- **2026-05-10 EOD+1010 (14th-19th idle tick state-reconciliation)**:
+  Codex IDLE since ~10:55 KST; ~120 min into idle (saturation continues).
+  GPU 1.3 GiB / 0%. Sequence of substantive Claude commits this stretch:
+  - `da7f5a2` (tick 14): Task #43 Arm A artifact deep-dive — quantified
+    **70:1 OOM ratio** (32 y_fp16 + 9 x_fp16 marlin scratch in Arm A) via
+    on-disk parse, no GPU re-run cost
+  - `d09623a` (tick 15): self-correction via bench CSV parse — Arm A is
+    **16× slower TTFT (1502ms vs 94ms)** + **26× lower throughput
+    (1.23 vs 32.4 tok/s)** than Arm B; "server survived" framing was
+    misleading; SKILL #29 to n=5 with Claude self-application
+  - `3ea2aa4` (tick 16): index.md EOD+930 refresh capturing the above
+  - `b255c58` (tick 17): **SKILL kernel-optimization v1.15.0
+    GRADUATED #35** (root-cause-TBD canary) — n=3 evidence chain
+    (e3e1ab5 + 81b6481 + 8d1caad gate tightening 25% → 1%)
+  - `2356e6a` (tick 18): trust-but-verify on b255c58 caught 2-day date
+    error on 81b6481 — corrected wording actually STRENGTHENS the
+    canary case (2-day temporal gap is the silent-decay danger)
+  - (tick 19 — this entry): state reconciliation — **temp branch
+    `claude-detached-tick-recover-1012` does NOT exist** (cleaned up
+    earlier in chain), `e5deac8` already in main; main is on
+    `main...origin/main` not detached; loop prompt referenced stale state
+    7+ ticks running.
+
+  **Task #47 H1' design now has 2 A/B gates** (per da7f5a2 + d09623a):
+  - OOM-regression A/B at conc=4 4k W4A16 sustained
+  - TTFT/tok-s regression A/B at same workload (>5% kill threshold)
+
+  **SKILL canonical state**: 28-34 + 35 + 36 + 38 = **37 canonical
+  anti-patterns** (3 graduations this session-tail: v1.13.0 #38 +
+  v1.14.0 #36 + v1.15.0 #35).
+
+  **Remaining single-evidence candidates**: #37 / #39 / #40.
+
+  **Stale-loop-prompt observation**: 7+ ticks of cron-fired /loop with
+  detailed action items (cherry-pick, branch ops, SKILL bumps) where
+  each item was already moot or completed by a prior tick. The
+  3-state scan (tmux + nvidia-smi + git status) is the SOLID move
+  before executing prompt-specific instructions, per §0 SOLID rule 1
+  ("推断 ≠ SOLID"). Documenting here so future ticks have an
+  explicit anchor that supersedes stale prompt-text.
+
+  **All forward paths still gated on USER** (no codex / Claude work
+  unblocks without):
+  - `bash scripts/pf85_bench_v11_user.sh` for PF8.5 LICENSE/KILL
+    decision (P1 #47 H1' refactor OR P1 #28 Medusa branch)
+  - OR new direction (P3 #30 Hybrid W4A16/W4A8 dispatch, standalone
+    Medusa, etc.)
