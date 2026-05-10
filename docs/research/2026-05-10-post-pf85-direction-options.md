@@ -104,7 +104,7 @@ refactor attempts; redesign may not converge. ~2-4 weeks.
 even at conc=1 with warmup OFF, suggesting the per-call alloc bug
 isn't superficial. Medusa (Option A) gives more confident win path.
 
-## §3 Recommendation matrix (REVISED EOD+1340 after §2.2 source-read)
+## §3 Recommendation matrix (REVISED EOD+1340; STRENGTHENED EOD+1430 with 6-cell perf matrix)
 
 | User priority | Recommended option | Time-to-result |
 |---|---|---|
@@ -113,12 +113,24 @@ isn't superficial. Medusa (Option A) gives more confident win path.
 | Resurrect PF8 path (W4A8 substitute) | **C (H1' v2)** | 2-4 weeks |
 | **Default if no preference** | **A (Medusa)** | clearest pickup, lowest blocker risk |
 
-**Why B was downgraded**: source-read of `linear.rs:80-141` reveals
-the dispatch logic is ~50 LOC easy, but the dual-quant CHECKPOINT
-FORMAT problem is the real blocker (~2 weeks of tooling work, and
-B.3 in-VRAM duplication doesn't fit 16GB GPU). Option A (Medusa)
-remains the clearest path to measurable improvement at lowest
-blocker risk.
+**Why B was downgraded** (EOD+1340): source-read of `linear.rs:80-141`
+reveals the dispatch logic is ~50 LOC easy, but the dual-quant
+CHECKPOINT FORMAT problem is the real blocker (~2 weeks of tooling
+work, and B.3 in-VRAM duplication doesn't fit 16GB GPU).
+
+**Why B is now DEFINITIVELY ruled out** (EOD+1430, per `92813dc`):
+6-cell perf matrix (W4A8 + W4A16 at conc=1/2/4) reveals end-to-end
+latency math:
+- Hybrid (W4A8 prefill + W4A16 decode) at conc=4: **-2.4% perceived
+  latency** vs W4A16 alone (TTFT + 127×ITL = 1031 vs 1056 ms)
+- conc=1: -1.4%; conc=2: 0% (W4A8 has no TTFT advantage at conc=2)
+- **One order of magnitude below user's stated -20-40% target**
+- Naïve "best of both" framing was SKILL #29 aggregation framing
+  decay — adding TTFT win and decode win without end-to-end math
+
+Option A (Medusa) at 2× tok/s = ~-50% effective ITL >> -2.4% Hybrid.
+The recommendation is now ironclad: A is the only path that meets
+the stated -20-40% goal.
 
 ## §4 What Claude can do RIGHT NOW (without user decision)
 
