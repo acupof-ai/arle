@@ -577,3 +577,55 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   wake from 1800s (30min) → 3600s (60min, runtime max). Past the 5-min
   cache window anyway; less wakeup overhead until codex commits or
   user signals direction.
+
+- **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
+  Multi-tick saturation BROKEN by Claude running the "user-only" bench
+  via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
+  ~5 min wall-clock end-to-end (build 1m 03s + bench 2 min + parse +
+  commit). Verdict: **SUBSTRATE-KILL at conc=1 from Pass 3 warmup**.
+
+  **Bench numbers** (per `0be278f` errors entry):
+  - 5878 `gemm_w4_fp8_marlin_cuda failed code 2` kernel failures
+  - First failures at Pass 3 warmup B=1 (BEFORE any user request)
+  - 5385 "successful" bench requests = broken signal artifact
+    (failed reqs have 0 latency); SKILL #34b "server log first" again
+    validated
+  - TTFT median 0.0 ms in stats table (broken signal)
+
+  **Refines prior framing**:
+  - `0cde63d` framed as load-DEPENDENT → actually warmup-DEPENDENT
+    (Pass 3 is the trigger, not sustained load)
+  - `57c37b5` H8 DISPROVEN at conc=1 single curl was correct in scope
+    but didn't include Pass 3 pressure — kernel works in true single-
+    request only
+
+  **Reconciles with Task #43 Arm A** (`da7f5a2` + `d09623a`):
+  static-scratch / per-call workspace path is broken on sm_89 16GB
+  across W4A16 (degraded 16× TTFT) AND PF8.3 (outright kill at warmup).
+
+  **Task closures**:
+  - Task #44 PF8 chain → completed (KILL)
+  - Task #47 H1' refactor → still pending but BLOCKED pending
+    redesign (default-on path empirically broken per this evidence)
+
+  **PICKUP QUEUE PIVOT** (effective immediately):
+  - **P1 NEW**: #28 Medusa scaffold (codex own ~500 LOC + 1 wk
+    training). Medusa Alpaca cross-link `63769be` previously
+    documented HF auth bypass via Alpaca dataset (ungated). Phase 1.A
+    scaffold ready for codex pickup.
+  - **P2 (was P3)**: #30 Hybrid W4A16/W4A8 dispatch substrate
+  - **P3 (deferred)**: #47 H1' refactor pending the OOM-regression A/B
+    gate redesign per da7f5a2/d09623a
+  - PF8.3 substrate stays in tree as opt-in (default off per
+    `db063ff`) for future H1' redesign work
+  - PF8.5 license tooling (`scripts/pf85_bench_v11_user.sh` +
+    companions) preserved for re-bench after future fix
+
+  **Process win sedimented** (candidate for SKILL feedback memory):
+  "User-only" framing applied to Claude-runnable scripts can become
+  blanket constraint without re-evaluation. Subprocess `sleep` inside
+  a script is not a Claude tool sleep; `run_in_background` cleanly
+  bypasses the original limitation. Multi-tick saturation broke
+  because no one re-asked "does the constraint still apply?". Adding
+  to SKILL #29 evidence chain (n=6 — even self-imposed framing
+  decays without periodic re-evaluation).
