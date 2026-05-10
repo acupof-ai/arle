@@ -151,3 +151,74 @@ ironclad.
 - `bench-output/2026-05-10-armD-w4a8-conc{2,4}/benchmarks.{json,csv}`
 - `/tmp/armD-w4a8-multi-conc.log`
 - SKILL `kernel-optimization` v1.12.0 #34 (multi-conc not sufficient)
+
+## §8 W4A8 long-ctx extension (added EOD+1820)
+
+Per follow-up: W4A8 prompt=2048 conc=1 with `--max-seq-len 8192`,
+parallel to W4A16 long-ctx series (`2048eca` §10).
+
+### §8.1 W4A8 vs W4A16 at long context (prompt=2048)
+
+| Metric | W4A8 prompt=2048 | W4A16 prompt=2048 (8d32576+§10) | W4A8 vs W4A16 |
+|---|---:|---:|---:|
+| Successful (60s) | 32 | 51 | -37% |
+| TTFT mdn | **191.3 ms** | 272.1 ms | **-30%** |
+| ITL mdn | 12.6 ms | 6.4 ms | **+97%** |
+| tok/s mean | 71.8 | 117.6 | -39% |
+| Kernel failures | 0 | 0 | ✓ |
+| Cache demotions | **0** | 1 (at 4k+) | W4A8 less mem pressure |
+
+### §8.2 W4A8 prefill-advantage WIDENS at long context
+
+At prompt=512 (Arms C+D): W4A8 TTFT -18% vs W4A16
+At prompt=2048 (this): W4A8 TTFT **-30%** vs W4A16
+
+Prefill is a larger fraction of total compute at long context, so
+W4A8's FP8 mma advantage compounds. ITL stays ~+100% (architectural,
+per-token cost).
+
+### §8.3 Hybrid Option B value GROWS with context length
+
+End-to-end latency at conc=1 prompt=2048 (output=128):
+
+| Path | TTFT + 127×ITL | E2E | vs W4A16 |
+|---|---|---:|---:|
+| W4A16 | 272.1 + 127×6.4 | 1085 ms | baseline |
+| W4A8 | 191.3 + 127×12.6 | 1791 ms | +65% (worse, ITL dominates) |
+| **Hybrid** (W4A8 prefill + W4A16 decode) | 191.3 + 127×6.4 | **1004 ms** | **-7.5%** |
+
+Compare to short-ctx (prompt=512) hybrid value:
+- conc=1 prompt=512: -1.4% perceived latency
+- conc=4 prompt=512: -2.4% perceived latency
+- **conc=1 prompt=2048: -7.5% perceived latency** (this row)
+
+**Hybrid Option B value 3-5× higher at 2k context vs 512.** Still
+sub-Machete-class (-20-40% target) but no longer sub-1% noise.
+
+### §8.4 Updated direction options recommendation
+
+The original ironclad "A (Medusa) only" recommendation per
+`92813dc` + `12e0c07` was based on prompt=512 data. With long-context
+data, **Option B becomes more viable** — but only for long-context
+workloads where prefill dominates.
+
+Refined recommendation matrix:
+- **Short-ctx workloads (prompt ≤ 512)**: Option A (Medusa) ironclad
+- **Long-ctx workloads (prompt ≥ 2048)**: Option B (Hybrid) viable
+  with -7.5% gain; Option A still better for throughput
+- **Mixed workloads**: depends on prompt distribution; favor whichever
+  is dominant
+
+For "world-first 长序列推理引擎" goal — Option B becomes more
+attractive than the prior short-ctx analysis suggested. Worth
+re-evaluating Option B Phase 1 cost (B.1 dual-quant checkpoint
+~2 weeks tooling) vs Option A (Medusa 2-3 days) given long-ctx
+target audience.
+
+### §8.5 Cross-references (added)
+
+- `bench-output/2026-05-10-w4a8-longctx-prompt2048/benchmarks.{json,csv}`
+- `/tmp/w4a8-longctx-2048.log` (server log, 0 kernel failures, 0 cache demotions)
+- `2048eca` W4A16 long-ctx prompt=2048 (parallel measurement)
+- `12e0c07` direction options strengthening (this complicates the
+  recommendation for long-ctx workloads)
