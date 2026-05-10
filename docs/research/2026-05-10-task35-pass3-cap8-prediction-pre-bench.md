@@ -273,6 +273,75 @@ bugs each**. Pattern is consistent magnitude, not just consistent
 existence. Strong argument that codex review is the highest-yield
 verification step for non-trivial diffs.
 
+### §6.9 DRAMATIC startup cost surprise — real Pass 3 is ~200-1000× more expensive than predicted
+
+Per codex tmux ~56min: targeted greedy PASSED post-fix, codex measured REAL
+post-review Pass 3 behavior:
+
+- **BF16 test window B=4 warmup: ≈ 60 SECONDS** (60,000 ms)
+- BF16 test window B=3 warmup: ≈ 36 seconds
+- Codex's stated plan: update wins entry replacing old 64-token startup
+  cost (308ms) with CURRENT real data, plus a "quick W4 startup A/B as
+  pre-commit bench evidence"
+
+**Reconciliation against my §3.3 prediction (940c7cc):**
+
+| Metric | Predicted | Reported pre-fix (BUGGY) | Reported post-fix (REAL) |
+|---|---|---|---|
+| Server startup cost | +282.7ms | +282.7ms (matched exactly, but was BUGGY no-op Pass 3) | **+~60,000ms BF16 B=4 alone** (≥200× larger) |
+
+The pre-fix bench number `+282.7ms` was the cost of the BUGGY Pass 3
+that warmed graphs to a temporary context immediately discarded — i.e.,
+essentially a no-op. The 308ms was just function-call + minor setup.
+
+Post-fix REAL Pass 3 actually warms each (B=1..=8) shape on the production
+context. BF16 B=4 alone takes ~60s. If all 8 batch sizes scale similarly,
+total startup overhead could be 5-10+ minutes for fully warm Pass 3.
+
+**This is a NEW class of falsification per §4** that I didn't enumerate:
+- Not §4.1 (shape mismatch — codex IS warming the right shapes)
+- Not §4.2 (Pass 3 not warming right kernels — it IS, just SLOW)
+- Not §4.3 (cold first-burst already small)
+- Not §4.4 (variance — this is signal not noise, ~200× over prediction)
+- **NEW falsification mode**: prediction underestimated absolute warmup
+  cost by orders of magnitude. Formula assumed "Pass 3 = pre-warm
+  kernels" without modeling that pre-warming requires running ACTUAL
+  PRODUCTION INFERENCES at each shape, each of which takes seconds.
+
+**Implication for license-or-kill (§3.4 threshold revision):**
+
+Original §3.4 thresholds assumed +282.7ms startup. With +60,000ms
+(or more), the cost-benefit calculation changes:
+
+- **First-burst improvement gate**: my -30% to -60% prediction was for
+  a relatively quick warmup (282ms). Now first-burst saves 60s+ per
+  batch-size-not-yet-seen. Per-burst saving could be MUCH larger
+  absolute number (saves 60s on a request that would otherwise take
+  60s+ to first-burst).
+- **Amortization**: with +5-10 min server startup, Pass 3 only pays
+  off if server runs N>>1 requests AND first-burst latency matters
+  (UX constraint). Production servers handle thousands of requests
+  → amortizes over thousands of requests easily.
+- **Test/dev workflows**: server startup cost +5-10 min is significant
+  — codex's `INFER_PREFILL_WARMUP=0` escape hatch becomes load-bearing
+  for dev iteration speed.
+
+**Updated license verdict (pending codex's W4 A/B numbers):**
+- LICENSE if: first-burst improvement + amortizable cost over realistic
+  production traffic
+- KILL if: first-burst improvement minor AND startup cost prohibitive
+- REVIEW: most likely outcome — Pass 3 should be opt-in default-OFF for
+  dev (escape hatch reverse), default-ON for production deployments
+
+**SOLID lesson for future prediction-reconciliation cycles**: when
+predicting startup cost, account for whether the prediction-anchor
+data was from a FUNCTIONAL or BUGGY substrate. The ~200× error here
+came from anchoring to a no-op measurement (BUGGY Pass 3 reported
+308ms, prediction inherited that anchor). Per skill v1.12.0 #29
+(default broken fixtures), the "prior measurement may be on broken
+substrate" pattern applies to prediction inputs too, not just bench
+outputs.
+
 ### §6.8 Re-verification layer caught 4th issue (post-review)
 
 Per codex tmux ~50min: while running targeted greedy_consistency to
