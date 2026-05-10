@@ -702,6 +702,37 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   pattern; behavior signal (re-firing /loop) is implicit override.
   Only STOP if user gives explicit verbal direction.
 
+- **2026-05-10 EOD+2030 (80th tick — long-ctx evidence ↔ ROADMAP P0 vs Machete goal synthesis)**:
+  My session-tail long-ctx benches (n=5 hybrid value progression at
+  prompt=512/2048/4096/8192 + n=4 W4A16 + n=3 W4A8 long-ctx) inform
+  TWO distinct goals — important to NOT conflate:
+
+  **Goal A — User's stated Machete goal** (reissued ~10× during session):
+  > "Machete W4 kernel 移植 ... -20-40% ITL vs current Marlin"
+  - My evidence: Hybrid Option B reaches -14.2% at 8k → asymptotic
+    -17 to -20% at 32k+ (Machete-class only at very long ctx)
+  - Status: -20% threshold needs 32k+ native ctx OR 64k+ YARN-extended
+
+  **Goal B — ROADMAP P0** (`ROADMAP.md` line 74):
+  > "32k–128k 长上下文吞吐 — World #1 by ≥30% mission ... W1
+  > max-throughput (32k×c=4) + W2 long-decode (32k+2048×c=4) ...
+  > on L4 + H100 + Apple ... vs SGLang/vLLM/TRT-LLM/Mooncake"
+  - My evidence: NOT directly comparable — my benches are conc=1
+    prompt ≤ 8k, sm_89 4070 Ti (not L4/H100), no SGLang/vLLM/TRT-LLM
+    head-to-head
+  - Status: ROADMAP P0 Phase 1 SGLang-row closed 2026-05-01 at
+    1.609× SGLang on W1/c4; my data is supplementary not primary
+
+  **Implication**: For future codex pickup OR user direction:
+  - If user wants Machete-class ITL gain: Hybrid Option B (Task #30)
+    is viable at 32k+ context (per asymptotic projection)
+  - If user wants ROADMAP P0 World #1 progression: separate workload
+    class (W1/W2 conc=4 32k+) needs separate bench harness
+  - These are RELATED but NOT IDENTICAL goals — should not be conflated
+    in pickup discussions
+
+  No code change this tick. Synthesis sediment only.
+
 - **2026-05-10 EOD+1130 (21st tick — 🚫 PF8.5 KILL VERDICT LANDED)**:
   Multi-tick saturation BROKEN by Claude running the "user-only" bench
   via `run_in_background` (subprocess sleep ≠ Claude tool sleep).
