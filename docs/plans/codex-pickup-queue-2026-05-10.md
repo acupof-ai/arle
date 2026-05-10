@@ -199,3 +199,12 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   codex via tmux nudge after Task #35 landing (a2ad788) + 25min codex
   idle gap. Codex Working as of ~10:09. Expected ~30 min wall-clock
   to verdict.
+- **2026-05-10 ~10:13 KST INTERIM**: Arm A (`INFER_PREFILL_GRAPH=1`)
+  completed — NO substrate KILL (server log clean, no kernel failure
+  lines). BUT guidellm reports 0 output tokens / TTFT 0 →
+  `pf83_bench_health.sh` classifies as **TOOL-QUIRK** (exit code 2).
+  Codex investigating /v1/stats + server log + considering direct
+  curl bench fallback. Validates SKILL #34b discrimination (bench
+  tool quirk vs substrate KILL distinguishable). Arm B starting now;
+  if Arm B also TOOL-QUIRK → AMBIGUOUS verdict per verdict-implications
+  doc (cb86836) §4.
