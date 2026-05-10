@@ -151,6 +151,78 @@ status: session-end-checkpoint-for-next-pickup
 
 ## §3 Pickup queue (priority order)
 
+### POST-COOPERATIVE-LOOP state (this session, 2026-05-10 EOD+~14hr — current)
+
+Since H8-VERDICT below, ~8 Claude commits + codex Task #35 in flight:
+
+**Claude-authored chain (8 commits, 2026-05-10 ~08:30-09:30)**:
+- `0be7220` SKILL `kernel-optimization` v1.12.0 — anti-pattern #33
+  (codex review value-add load-bearing) + #34 (greedy single-PASS not
+  sufficient, pair with sustained-load) + #34b (bench 0-success →
+  CHECK SERVER LOG FIRST)
+- `05e2135` `M_pf83_h1prime_static_scratch.md` (264 LOC design,
+  codex-pickup-ready, bench v11 gated): PF8Scratch struct + State
+  integration + 110 LOC delta + 10-step checklist; eliminates per-call
+  alloc fragmentation under sustained PF8 load
+- `40a9184` `docs/index.md` Last-refreshed line refreshed to EOD+580
+  reflecting H8-DISPROVEN + SKILL v1.12.0 + H1' design state
+- `9c9d699` `2026-05-10-pf83-framing-trap-rule6-case-study.md` (153
+  LOC) — codifies PF8.3 chain as §0 SOLID rule-6 case study parallel
+  to 2026-05-08 NVTX framing trap (aggregate failure-rate framing ≠
+  per-request functional ground truth)
+- `868e147` `scripts/pf83_bench_health.sh` (118 LOC) — operationalizes
+  SKILL #34b: single-shot 3-line verdict for any guidellm bench-output
+  + server log pair (exit codes branch caller to debug-kernel vs
+  debug-tool vs proceed-license)
+- `e3e1ab5` `2026-05-10-w4a8-vs-bf16-accuracy-regression-observed.md`
+  (133 LOC) — surfaced via codex Task #35 verification: full
+  greedy_consistency binary fails W4A8-vs-BF16 with 84.4% diff
+  (>>> 25% lenient assert at greedy_consistency.rs:365). Created
+  Task #48. Bisect candidates: `35fc3cf` `c44788f` `09ae5a5`. NOT
+  blocking Task #35 (codex correctly used targeted test).
+- `60f114f` `2026-05-10-matched-control-escape-hatch-discipline.md`
+  (132 LOC) — captures codex's `INFER_PREFILL_WARMUP=0` design
+  decision in Task #35 as evidence point for future SKILL revision;
+  explicit decision NOT to sediment yet (single-occurrence, n=2-3
+  needed); §4 watch-list for n+1 evidence
+
+**Codex-authored work in flight (Task #35, ~19min as of last capture)**:
+- 5 code files modified: `infer/src/model.rs`, `qwen3/forward.rs`,
+  `qwen35/forward.rs`, `deepseek/state.rs`, `scheduler/cuda/core/warmup.rs`
+- `docs/environment.md` documenting `INFER_PREFILL_WARMUP=0`
+- Pass 3 cap=8 prefill warmup added on top of existing Pass 1 + Pass 2
+- `reset_for_warmup_clear` State trait hook + 3 impls per `58b0ac1`
+  reconciliation
+- Default-on with explicit escape hatch for matched-control A/B
+- CUDA release build PASS 1m 03s (initial) + 6.96s (incremental)
+- clippy `-D warnings` PASS
+- Targeted `test_greedy_solo_vs_concurrent` PASS 19.11s
+- Full greedy binary FAILED on EXISTING W4A8-vs-BF16 84.4% regression
+  (Task #48, NOT blocking #35)
+- About to start cold-start A/B bench (single-binary, baseline =
+  `INFER_PREFILL_WARMUP=0`, treatment = default)
+- Then will write wins entry per bench-and-trace-spec template
+
+**New tasks**:
+- Task #47 created: PF8.3 H1' static-scratch refactor (gated on bench
+  v11 license)
+- Task #48 created: Audit + bisect W4A8-vs-BF16 84.4% accuracy
+  regression (NOT blocking, opt-in path only)
+- Task #46 closed: H8 fix (DISPROVEN, root cause = H1' load-dependent)
+
+**Cooperative discipline preserved throughout**: every Claude commit
+used explicit-path `git add` (never `git add .` or `git add -A`),
+codex's 6 WIP files untouched per skill #30. Codex independently
+demonstrated SKILL v1.12.0 #34 internalization (planned sustained-load
+smoke without explicit Claude prompt) + matched-control escape-hatch
+discipline (per `60f114f` evidence point).
+
+**Next session pickup priority (unchanged from POST-H8-VERDICT)**:
+1. User runs bench v11 manually per recipe in POST-H8-VERDICT below
+2. If LICENSE → codex picks up Task #47 H1' refactor
+3. If KILL → close Task #44 + pivot Task #28 Medusa
+4. Independent of bench v11: codex completes Task #35 + commits + writes wins entry
+
 ### POST-H8-VERDICT state (this session, 2026-05-10 EOD+~10hr)
 
 **🎯 H8 DISPROVEN** (`57c37b5`): cargo build with diagnostic patch
