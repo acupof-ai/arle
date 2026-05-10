@@ -168,3 +168,73 @@ load was the original Task #43 trigger; now reproduced at single-stream
 
 - `bench-output/2026-05-10-w4a16-longctx-prompt4096/benchmarks.{json,csv}`
 - `/tmp/w4a16-longctx-4096.log` (server log, 0 kernel failures, 1 prefix cache demotion)
+
+## §11 Follow-up: prompt=8192 extends to n=4 scaling curve (added EOD+1750)
+
+Extended one more point at prompt=8192 with `--max-seq-len 16384`.
+
+### §11.1 Result table (4-point scaling)
+
+| Prompt | TTFT mdn | TTFT scale vs 512 | ITL mdn | ITL Δ% | tok/s mean | req/s mean |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 66.0 ms | 1.0× | 5.8 ms | baseline | 159.6 | 1.25 |
+| 2048 | 272.1 ms | 4.12× | 6.4 ms | +10% | 117.6 | 0.91 |
+| 4096 | 577.6 ms | 8.75× | 7.4 ms | +28% | 84.6 | 0.65 |
+| **8192** | **1335.5 ms** | **20.2×** | **8.9 ms** | **+53%** | **52.4** | **0.40** |
+
+- Successful requests in 60s window: 23 (vs 75 at baseline)
+- 0 kernel failures
+- **4 prefix cache demotion events** (vs 1 at prompt=4096) — memory
+  pressure compounds with context length
+
+### §11.2 Scaling validation (n=4 fit)
+
+**TTFT scaling** (table values vs pure linear `66 × N`):
+- 2048 (4×): 272 vs 264 = +3% over linear
+- 4096 (8×): 577 vs 528 = +9% over linear
+- 8192 (16×): 1335 vs 1056 = **+26% over linear**
+
+Super-linear growth accelerates with context length. Hypothesis (n=1):
+- Chunked prefill overhead per chunk_size=2048 boundary grows
+  proportionally (4× chunks at 8k vs 2× at 4k vs 1× at 2k)
+- Cache demotion latency adds when cache pressure exceeds num_slots
+  budget (1 demotion at 4k → 4 at 8k = 4× growth, matches +26% vs
+  +9% at half the prompt)
+
+**ITL scaling**: 5.8 → 6.4 → 7.4 → 8.9 (+10%, +28%, +53% from baseline):
+- KV bandwidth growth dominates; mostly linear-ish in context length
+- Per-token overhead becomes a larger fraction of decode cost
+
+### §11.3 PREDICTION VALIDATION (vs §10.3 extrapolation)
+
+§10.3 predicted: "8k context: TTFT ≈ 1.2-1.4 s (super-linear continues),
+ITL ≈ 8-9 ms"
+
+**Actual at 8k**:
+- TTFT 1335.5 ms — **WITHIN predicted 1.2-1.4s range** ✓✓
+- ITL 8.9 ms — **WITHIN predicted 8-9 ms range** ✓✓
+
+Phase 4 formula prediction validated at n=4. The 1.26× super-linear
+factor at 8k matches the cache-pressure mechanism hypothesis.
+
+### §11.4 Implications for "world-first 长序列推理引擎"
+
+8k context **works** at conc=1 with default config + `--max-seq-len 16384`:
+- 1.3s TTFT acceptable for many UX scenarios
+- 52 tok/s decode throughput sustainable
+- 0 kernel failures over 60s sustained
+
+Updated extrapolation (Phase 4 formula refined with n=4 data):
+- 16k context: TTFT ≈ 3.0-3.5s (was 2.5-3.5s — refined upper)
+- 32k context (Qwen3-4B native): TTFT ≈ 7-9s (was 6-8s)
+- 64k context (YARN-extended): TTFT ≈ 14-18s, likely needs `--num-slots`
+  reduction to avoid cache pressure killing throughput
+
+For Medusa Phase 1.A (P1 pickup), the long-ctx perf bar is now:
+- 8k: TTFT ≤ 1.3s, ITL ≤ 8.9 ms
+
+### §11.5 Cross-references (added)
+
+- `bench-output/2026-05-10-w4a16-longctx-prompt8192/benchmarks.{json,csv}`
+- `/tmp/w4a16-longctx-8192.log` (server log, 0 kernel failures, **4
+  prefix cache demotion events**)
