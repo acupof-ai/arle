@@ -387,3 +387,5 @@ expand cadence to 60+ min instead of 30 min**".
 - `baa2fed` M_pf83 v1 SUPERSEDED-by-v2
 - `feedback_user_drives_cron_cadence_overrides_saturation.md` (memory)
 - `feedback_reframe_persistent_directive_when_hardware_blocked.md` (memory, new)
+
+## §6.66 Tick 193 — saturation persists, prior 192 commit landed
