@@ -1,7 +1,7 @@
 ---
 name: kernel-optimization
 description: Use this skill when the user asks to optimize, tune, speed up, or improve the performance of a GPU/CPU kernel, operator (op), attention path, GEMM call, decode/prefill path, quantization op, scheduler hot path, or any "make this faster" / "reduce ITL/TTFT" / "lower memory" / "拉满 utilization" / "调 kernel" / "优化算子" request. Captures the methodology — formula-predict → measure binding constraint → single-variable A/B with matched controls → combinational A/B when interactions suspected → tradeoff explicit (no tradeoff = not at extremes) → license-or-kill — and an industry-reference catalog (FlashAttention, cutlass, Marlin, SGLang, vLLM, TileLang, ncu/nsys methodology) so each attempt is grounded, not hand-waved.
-version: 1.14.0
+version: 1.15.0
 ---
 
 # kernel-optimization
@@ -1092,6 +1092,57 @@ Each anti-pattern has a project commit/entry where it was paid for.
       directionally wrong fixes (audit alone, ignoring memory
       behavior).
 
+17. **Tasks closed `root cause TBD` need canary-grade regression test
+    or tightened acceptance gate** — anti-pattern #35 v1.15.0
+    - Caught by:
+      - **n=1**: `e3e1ab5` 2026-05-10 W4A8-vs-BF16 84.4% diff flagged.
+        Task #25 (W4A8 accuracy fix) was closed `root cause TBD` with
+        the existing greedy_consistency gate at 25% — lenient enough
+        that 84.4% slipped past unnoticed at closure. The real
+        substrate-broken state was rediscovered ~weeks later when
+        Claude's PF8 work loaded the same fixture default.
+      - **n=2**: `81b6481` 2026-05-10 errors entry documents
+        "W4A8 substrate produces 100% garbage output" — the broken
+        state WAS already known and documented in errors/, but the
+        25% gate was loose enough that the test still passed,
+        masking the canary signal. Documentation alone (without
+        test-gate enforcement) does not prevent decay.
+      - **n=3**: `8d1caad` codex Task #48 fix bundle TIGHTENED the
+        gate from 25% → 1% AND swapped default fixture to
+        qzeros-fixed checkpoint. The 1% gate IS the canary that
+        would have caught Task #25's decay at original closure
+        time. Per `b956f3a` Claude research: "codex's fix is
+        stronger than I credited" — the gate tightening is the
+        load-bearing canary mechanism, not just the fixture swap.
+    - **Generalization**: when a task closes `root cause TBD`, the
+      closure is OK only if accompanied by ONE of:
+      - **(a) Tightened regression gate** at a threshold that would
+        flag any substrate decay (Task #48 bundle: 25% → 1%).
+      - **(b) Pinned numerical bench reference** future re-runs
+        compare against (e.g. wins entry with σ-tight numbers).
+      - **(c) Explicit "intentionally loose" annotation** with a
+        named kill-condition + planned graduation date.
+      Without (a)/(b)/(c), root-cause-TBD closures silently decay
+      into substrate bugs that resurface as confusing failures
+      months later when downstream work touches the same code path.
+    - **Detection rule**: any commit that closes a task without
+      explicit root cause MUST update either a test (preferred,
+      enforces forever) OR a wins entry (enforces during next
+      bench cycle) OR a documented error budget. Reviewers should
+      block PRs that close issues without one of (a)/(b)/(c).
+    - **Why this matters**: the deepest evidence here is that the
+      broken state was BOTH documented in errors/ AND already in
+      the test suite — but the test gate was loose enough that
+      the test passed. Documentation without enforcement is
+      necessary but not sufficient. The canary must be a
+      machine-checked threshold, not a written claim.
+    - Companion to #29 (default test fixtures may be broken) +
+      #34 (tests passing ≠ code correct under load): #29 is
+      "fixtures decay"; #34 is "load-shape coverage decays"; #35
+      is "acceptance-threshold decay" — all three are forms of
+      silent substrate-state decay that machine-checked canaries
+      catch when written-claim documentation does not.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -1183,6 +1234,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.11.0** | **2026-05-10** | **32** | **(this commit) batch-added #29-32 from same-day cooperative discipline session. Theme: "verify substrate of EVERY claim, not just contested ones". Evidence chain: 4 hallucinations sedimented in single session (`0f4d0ae` CLI flag, `43bda9c` reduce buffer, `4b30c15` /health endpoint, `5bf0e20` baseline mismatch) + cooperative race in `0d63a52`/`994a294` recovery + 33min wedged poll in `4b30c15`. Sources: `eb2b4b6` #29 (default test fixture broken since #25, codex correctly overrode via env var) / `0d63a52`+`994a294`+`ca09db0` #30 (commit-time worktree race; status BEFORE commit not just before add) / `c3bb82b`+`d387b03` #31 (ARLE surface claims need raw evidence even when not contesting peer; 4 hallucination pattern caught by self-audit) / `4b30c15` #32 (peer "Waiting >5min" warrants direct ps/log/curl verify; recovered ~33min of codex bandwidth). Cumulative compound learning: `de36538` retrospective + `940f49e` self-implementation by Claude (PF8.1+2) demonstrated discipline working — cooperative pipeline recovers from individual mis-claims when each agent applies raw-evidence-required rule.** |
 | **v1.12.0** | **2026-05-10** | **34** | **(this commit) added #33+#34 from PF8.3 substrate session evidence. Theme: "code-correct ≠ runtime-correct under load". Evidence chain: codex review caught 3 real bugs that all formal gates passed (`ace3cbe` parallel-M loop + max_par/lock workspace + graph capture interaction); PF8.3 RUNTIME KILL with 101380/101380 failures despite greedy_consistency PASS at conc=1 (`0cde63d` + `57c37b5` H8 verify). Sources: `ace3cbe` #33 (codex review IS load-bearing for non-trivial substrate, NOT formality; 3 bugs/27min review = high amortized value; required when build+clippy+tests pass on FFI/cross-feature/parallel logic diffs) / `0cde63d`+`57c37b5` #34 (greedy single-request PASS NECESSARY but NOT SUFFICIENT; pair with sustained-load bench at conc 1+2+4; sub-rule #34b: bench 0-success → CHECK SERVER LOG FIRST, wasted 30+min on guidellm CLI quirks when real cause was kernel 100% failure visible in /tmp/<server>.log). Cumulative compound learning: 7 hallucinations across this session + 3 codex-review bug catches + 1 RUNTIME KILL exposed by sustained load = code-correctness gates and runtime-correctness gates are SEPARATE concerns; both required for license-grade substrate.** |
 | **v1.13.0** | **2026-05-10** | **35** | **(this commit) graduated #38 from candidate to canonical anti-pattern after n=2 evidence threshold reached in same Task #35 cap=8 prefill warmup implementation cycle (per `b4a3c38` §6.8 + `182d67b` §6.13 + codex commit `a2ad788`). Theme: "warmup target shape budget must clamp to (effective workload shape × hardware headroom)". Evidence chain: same Task #35 implementation independently discovered both failure modes — n=1 max_seq_len=512 vs chunked_prefill_size=4096 mismatch (Pass 3 warming unreachable shapes; codex applied cap fix); n=2 B=8 × 2048 tokens/row exceeds 16GB VRAM → Marlin scratch OOM (substrate gracefully falls back to 1024 tokens/row). Both n=1 and n=2 are within ONE substrate development cycle but with INDEPENDENT failure mechanisms (config-vs-config alignment vs hardware-vs-shape alignment) — this satisfies n=2 distinct-mechanism evidence threshold. Generalization: warmup-based optimizations target shape sets; the set must be (a) reachable by actual workload AND (b) within hardware budget. Detection rule + (a) clamp / (b) graceful fallback patterns documented. Companion to #34 (single-bench-shape) + #37 (multi-shape bench discipline) — all three are "single-X is necessary but not sufficient" patterns at different abstraction levels.** |
+| **v1.15.0** | **2026-05-10** | **37** | **(this commit) graduated #35 (root-cause-TBD canary) from candidate to canonical after n=3 evidence reached. Theme: "Tasks closed `root cause TBD` decay into substrate bugs without machine-checked acceptance gates". Evidence chain: n=1 `e3e1ab5` Task #25 W4A8 closed root-cause-TBD with lenient 25% gate — 84.4% diff slipped past unnoticed; n=2 `81b6481` errors entry already documented "W4A8 substrate produces 100% garbage" but documentation alone (without test-gate enforcement) didn't prevent decay; n=3 `8d1caad` codex Task #48 fix TIGHTENED gate from 25% → 1% — the 1% gate IS the canary that would have caught Task #25's decay at closure (per `b956f3a` Claude research note). Generalization: closing root-cause-TBD requires (a) tightened gate / (b) pinned bench reference / (c) explicit "intentionally loose" annotation with named kill-condition. Documentation without enforcement is necessary but not sufficient. Companion to #29 (fixture decay) + #34 (load-shape coverage decay) — all three are silent substrate-state decay forms that machine-checked canaries catch when written-claim documentation does not.** |
 | **v1.14.0** | **2026-05-10** | **36** | **(this commit) graduated #36 from candidate to canonical after n=2 evidence reached including INVERSE-direction case. Theme: "static code audit is hypothesis-grade evidence; behavioral A/B is ground truth — both required". Evidence chain: n=1 `2cc608a` H1' design REVISION (MarlinScratch already existed in linear.rs, grep for variants saved 40 LOC); n=2 INVERSE `e8b6b31` Task #43 hypothesis OVERTURNED by behavioral A/B (Claude's `1ba06f0` dispatch-audit predicted scratch path safer; reality showed scratch path KILLS with 36 OOM failures, eager fallback HEALTHY — opposite causal direction). The INVERSE n=2 case is especially load-bearing: static audit was directionally wrong, not just incomplete. Cure: cheap behavioral A/B FIRST before designing/planning around audit-derived hypotheses. Companion to §0 SOLID rule 1 (推断 ≠ SOLID) — #36 is the practical implementation: grep gives the hypothesis, A/B gives the evidence; either alone leads to either over-engineered designs (audit ignoring existing patterns) or directionally wrong fixes (audit ignoring memory/timing behavior).** |
 
 Cumulative compound learning pattern:single-day cap=8 chain produced
