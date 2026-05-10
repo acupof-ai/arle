@@ -1146,6 +1146,65 @@ Each anti-pattern has a project commit/entry where it was paid for.
       silent substrate-state decay that machine-checked canaries
       catch when written-claim documentation does not.
 
+18. **Always source-survey existing files BEFORE listing items as
+    "pending pickup" — directory listings + grep are the cheapest
+    way to discover already-done work** — anti-pattern #43 v1.16.0
+    - Caught by:
+      - **n=1**: `e021026` 2026-05-10 wins entry. Phase 1.B Medusa
+        substrate brief (`f0c7561`) §7 estimated dataset wall-clock
+        as part of training prep. Direct survey of `/tmp/medusa_data/`
+        revealed `alpaca_chat.jsonl` (52,002 rows canonical chat,
+        dated 2026-05-08) ALREADY downloaded + converted by prior
+        session-tail work. Saved 12-24 hr critical-path wall-clock
+        from the brief's estimate without writing any code.
+      - **n=2**: `86b28c7` 2026-05-10 research entry. Same brief's
+        `d8ebe73` §3.3 listed "P3.5 Option M''' (W4-FP8 preprocess
+        port from vLLM): 1-2 days, complements P3". Direct survey
+        of `crates/cuda-kernels/csrc/gemm/marlin_int4_fp8_preprocess.cu`
+        (70 LOC, header literal: "Verbatim port of vLLM's
+        marlin_int4_fp8_preprocess.cu _without_zp kernel under
+        Apache 2.0") revealed M''' was ALREADY DONE as PF8.2
+        substep, wired via tensor.rs:888 + ffi/gemm.rs:141. Listed
+        as "pending 1-2d" but actually production-ready.
+      - **n=3**: `2f19a3c` 2026-05-10 research entry. P2 (vLLM
+        Marlin diff-port) sized at "1.5 days, ~2% gain". File-level
+        survey showed ARLE marlin_kernel.cu (828 lines, 33.8 KB)
+        is at-par-magnitude with vLLM marlin.cu (~32.8 KB), forked
+        from same IST-DASLab Frantar 2024 upstream.
+      - **n=4**: `b6b8adc` 2026-05-10 research entry. Deeper survey
+        of `crates/cuda-kernels/csrc/gemm/marlin_pf8/` subdir
+        revealed 6/6 files attributed to vLLM upstream
+        (Apache-2.0). Side-by-side with vLLM
+        csrc/quantization/marlin/: 8/9 files have ARLE analogs (+1
+        deliberately skipped: AWQ; +1 N/A: marlin.cu Torch FFI
+        replaced by Rust dispatch). P2 essentially DONE; remaining
+        diff is maintenance task, not optimization. Dropped from
+        priority queue.
+    - **Generalization**: when briefing pickup options or estimating
+      effort, the FIRST step is `ls` + `grep` + `find` against the
+      candidate work paths. Listing items as "pending" without
+      file-survey verification produces stale brief content that
+      wastes pickup-agent (codex) cycles AND user trust in the
+      brief's accuracy.
+    - **Detection rule**: any "pending pickup" entry must include
+      a one-line evidence pointer to "verified absent at <path>" or
+      "candidate-implementation absent" inline. If no pointer, the
+      brief author has not done step 1.
+    - **Diagnostic chain**: directory listing → grep for likely
+      function/struct names → grep for upstream attribution headers
+      → confirm file presence vs absence in same response. 5-min
+      operation costs 0.1% of typical pickup wall-clock.
+    - **Cost amortization**: across n=4 evidence, this discipline
+      saved ~3-4 days of false-pending pickup work that would have
+      been wasted re-implementing already-done items. The 5-min
+      cost-per-survey amortizes to 100×+ ROI.
+    - Companion to #25 (audit-chain shared blindspot — same
+      blindspot can replicate across audits) and #36 (grep alone is
+      audit-only, needs A/B for binding-constraint claims): #43 is
+      the bare-minimum *first step* of any audit; without it #25's
+      "deep audit" is built on stale assumptions, and #36's behavioral
+      A/B can be skipped entirely if the file already exists.
+
 ---
 
 ## Quick reference (cheat sheet)
@@ -1236,6 +1295,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.10.0** | **2026-05-10** | **28** | **(this commit) added #28 from `ee2c5b0` SOLID-critical hallucination chain. Theme: "agent fabrication overrides peer's correct conclusion when memory of prior tool output is trusted over fresh verification". Source: Claude challenged codex's correct claim that `--max-waiting-requests` CLI flag does not exist, cited fabricated grep evidence, codex (rightly) trusted the "correction" and used `--cold-headroom 253` workaround. Two ticks later audit-of-audit re-ran verification → direct evidence proved codex correct from start (`git log -S` shows string never existed in main.rs). Lesson distinct from #25 ("audit-chain shared blindspot"): #28 is "agent fabricates evidence", and empirical bench doesn't catch it because the bench command itself is built on the fabrication. Fix: when correcting peer agent file-content claim, MUST re-run verification in SAME response and quote raw output literally, NOT summarize memory.** |
 | **v1.11.0** | **2026-05-10** | **32** | **(this commit) batch-added #29-32 from same-day cooperative discipline session. Theme: "verify substrate of EVERY claim, not just contested ones". Evidence chain: 4 hallucinations sedimented in single session (`0f4d0ae` CLI flag, `43bda9c` reduce buffer, `4b30c15` /health endpoint, `5bf0e20` baseline mismatch) + cooperative race in `0d63a52`/`994a294` recovery + 33min wedged poll in `4b30c15`. Sources: `eb2b4b6` #29 (default test fixture broken since #25, codex correctly overrode via env var) / `0d63a52`+`994a294`+`ca09db0` #30 (commit-time worktree race; status BEFORE commit not just before add) / `c3bb82b`+`d387b03` #31 (ARLE surface claims need raw evidence even when not contesting peer; 4 hallucination pattern caught by self-audit) / `4b30c15` #32 (peer "Waiting >5min" warrants direct ps/log/curl verify; recovered ~33min of codex bandwidth). Cumulative compound learning: `de36538` retrospective + `940f49e` self-implementation by Claude (PF8.1+2) demonstrated discipline working — cooperative pipeline recovers from individual mis-claims when each agent applies raw-evidence-required rule.** |
 | **v1.12.0** | **2026-05-10** | **34** | **(this commit) added #33+#34 from PF8.3 substrate session evidence. Theme: "code-correct ≠ runtime-correct under load". Evidence chain: codex review caught 3 real bugs that all formal gates passed (`ace3cbe` parallel-M loop + max_par/lock workspace + graph capture interaction); PF8.3 RUNTIME KILL with 101380/101380 failures despite greedy_consistency PASS at conc=1 (`0cde63d` + `57c37b5` H8 verify). Sources: `ace3cbe` #33 (codex review IS load-bearing for non-trivial substrate, NOT formality; 3 bugs/27min review = high amortized value; required when build+clippy+tests pass on FFI/cross-feature/parallel logic diffs) / `0cde63d`+`57c37b5` #34 (greedy single-request PASS NECESSARY but NOT SUFFICIENT; pair with sustained-load bench at conc 1+2+4; sub-rule #34b: bench 0-success → CHECK SERVER LOG FIRST, wasted 30+min on guidellm CLI quirks when real cause was kernel 100% failure visible in /tmp/<server>.log). Cumulative compound learning: 7 hallucinations across this session + 3 codex-review bug catches + 1 RUNTIME KILL exposed by sustained load = code-correctness gates and runtime-correctness gates are SEPARATE concerns; both required for license-grade substrate.** |
+| **v1.16.0** | **2026-05-10** | **38** | **(this commit) graduated #43 "always source-survey existing files BEFORE listing items as pending pickup" from candidate to canonical after n=4 evidence threshold reached across same-day brief-vs-reality discoveries. Sources: `e021026` (Alpaca data ALREADY downloaded, saved 12-24 hr critical path) / `86b28c7` (M''' W4-FP8 preprocess ALREADY DONE as PF8.2 substep) / `2f19a3c` (ARLE marlin_kernel.cu at-par with vLLM) / `b6b8adc` (ARLE marlin_pf8/ subdir = COMPLETE vLLM marlin/ fork; P2 dropped from queue, wall-clock down 7d → 5-6d). Cumulative: 5-min source-survey discipline saved ~3-4 days of false-pending pickup work, 100×+ ROI. Companion to #25 (audit-chain shared blindspot) + #36 (grep alone needs A/B): #43 is bare-minimum first step before either #25 or #36.** |
 | **v1.13.0** | **2026-05-10** | **35** | **(this commit) graduated #38 from candidate to canonical anti-pattern after n=2 evidence threshold reached in same Task #35 cap=8 prefill warmup implementation cycle (per `b4a3c38` §6.8 + `182d67b` §6.13 + codex commit `a2ad788`). Theme: "warmup target shape budget must clamp to (effective workload shape × hardware headroom)". Evidence chain: same Task #35 implementation independently discovered both failure modes — n=1 max_seq_len=512 vs chunked_prefill_size=4096 mismatch (Pass 3 warming unreachable shapes; codex applied cap fix); n=2 B=8 × 2048 tokens/row exceeds 16GB VRAM → Marlin scratch OOM (substrate gracefully falls back to 1024 tokens/row). Both n=1 and n=2 are within ONE substrate development cycle but with INDEPENDENT failure mechanisms (config-vs-config alignment vs hardware-vs-shape alignment) — this satisfies n=2 distinct-mechanism evidence threshold. Generalization: warmup-based optimizations target shape sets; the set must be (a) reachable by actual workload AND (b) within hardware budget. Detection rule + (a) clamp / (b) graceful fallback patterns documented. Companion to #34 (single-bench-shape) + #37 (multi-shape bench discipline) — all three are "single-X is necessary but not sufficient" patterns at different abstraction levels.** |
 | **v1.14.0** | **2026-05-10** | **36** | **(this commit) graduated #36 from candidate to canonical after n=2 evidence reached including INVERSE-direction case. Theme: "static code audit is hypothesis-grade evidence; behavioral A/B is ground truth — both required". Evidence chain: n=1 `2cc608a` H1' design REVISION (MarlinScratch already existed in linear.rs, grep for variants saved 40 LOC); n=2 INVERSE `e8b6b31` Task #43 hypothesis OVERTURNED by behavioral A/B (Claude's `1ba06f0` dispatch-audit predicted scratch path safer; reality showed scratch path KILLS with 36 OOM failures, eager fallback HEALTHY — opposite causal direction). The INVERSE n=2 case is especially load-bearing: static audit was directionally wrong, not just incomplete. Cure: cheap behavioral A/B FIRST before designing/planning around audit-derived hypotheses. Companion to §0 SOLID rule 1 (推断 ≠ SOLID) — #36 is the practical implementation: grep gives the hypothesis, A/B gives the evidence; either alone leads to either over-engineered designs (audit ignoring existing patterns) or directionally wrong fixes (audit ignoring memory/timing behavior).** |
 | **v1.15.0** | **2026-05-10** | **37** | **(this commit) graduated #35 (root-cause-TBD canary) from candidate to canonical after n=3 evidence reached. Theme: "Tasks closed `root cause TBD` decay into substrate bugs without machine-checked acceptance gates". Evidence chain: n=1 `e3e1ab5` Task #25 W4A8 closed root-cause-TBD with lenient 25% gate — 84.4% diff slipped past unnoticed; n=2 `81b6481` errors entry already documented "W4A8 substrate produces 100% garbage" but documentation alone (without test-gate enforcement) didn't prevent decay; n=3 `8d1caad` codex Task #48 fix TIGHTENED gate from 25% → 1% — the 1% gate IS the canary that would have caught Task #25's decay at closure (per `b956f3a` Claude research note). Generalization: closing root-cause-TBD requires (a) tightened gate / (b) pinned bench reference / (c) explicit "intentionally loose" annotation with named kill-condition. Documentation without enforcement is necessary but not sufficient. Companion to #29 (fixture decay) + #34 (load-shape coverage decay) — all three are silent substrate-state decay forms that machine-checked canaries catch when written-claim documentation does not.** |
