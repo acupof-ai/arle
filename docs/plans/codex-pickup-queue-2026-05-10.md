@@ -308,3 +308,28 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   Note: matrix approach checks ALL candidates not just bisect entry,
   validating whether 81b6481 hypothesis is right (regression from
   substrate landing not from #24/#40/Phase 1).
+- **2026-05-10 ~10:38 KST BREAKTHROUGH** (codex paused matrix to
+  investigate): codex discovered existing research entry **`eb2b4b6`
+  documenting that the DEFAULT W4A8 fixture in greedy_consistency.rs
+  is a KNOWN-BROKEN naive checkpoint** — explicitly recommends
+  `INFER_TEST_W4A8_MODEL_PATH=Qwen3-4B-GPTQ-W4A8-marlin` (calibrated
+  checkpoint). The 84.4% diff is the FIXTURE being wrong, not a code
+  regression. Codex now running calibrated checkpoint test.
+
+  **STRONG SKILL #29 validation in real-time**: skill v1.11.0 #29
+  ("default test fixtures may be known-broken") was codified from
+  THIS EXACT pattern (eb2b4b6 was the original n=1 evidence). Today's
+  Task #48 is n=2 — codex independently re-discovered the same
+  pattern via investigation. **Strongly reinforces #29.**
+
+  **Also reinforces SKILL v1.14.0 #36** (grep + behavioral A/B both
+  required): codex's discipline of "check pre-existing research
+  entries before purely behavioral bisect" caught the issue at min
+  ~13 instead of completing 30+ min matrix bisect. Investigation +
+  behavioral A/B working together — exactly what #36 codifies.
+
+  **Updated Task #48 forward path**: if calibrated checkpoint passes
+  → close Task #48 as "regression was fixture-decay not code". SKILL
+  candidate #35 (root-cause-TBD canary) graduation evidence still
+  reaches potential n=3 (e3e1ab5 + 81b6481 + this fixture-decay
+  framing).
