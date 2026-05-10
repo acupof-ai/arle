@@ -2,7 +2,8 @@
 title: M_pf83 H1' static-scratch refactor — eliminate cudarc allocator fragmentation under sustained PF8 load
 date: 2026-05-10
 type: plan
-status: BLOCKED-pending-redesign (PF8.5 bench v11 returned KILL 11:34 KST per 0be278f; original H1' design empirically broken per Arm B/C/D 4-arm A/B)
+status: SUPERSEDED-by-v2 (was BLOCKED-pending-redesign per 0be278f PF8.5 KILL; redesigned per `494ad3a` `M_pf83_h1prime_v2_redesign_brief.md` — v2 extends EXISTING MarlinScratch struct rather than building new PF8Scratch; v1 §1 fragmentation hypothesis REFUTED by Arm B per `7ed8160` — bug fires at Request 0, not after sustained load)
+supersession_target: docs/plans/M_pf83_h1prime_v2_redesign_brief.md (commit 494ad3a)
 depends_on:
   - ~~bench v11 conc=1 PF8.5 license decision~~ — DONE 2026-05-10 11:34 KST: KILL (5878 kernel failures, see 0be278f)
   - Arm B refute (warmup-INDEPENDENT per 7ed8160)
