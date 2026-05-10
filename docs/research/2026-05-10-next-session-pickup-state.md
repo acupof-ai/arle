@@ -151,6 +151,53 @@ status: session-end-checkpoint-for-next-pickup
 
 ## §3 Pickup queue (priority order)
 
+### POST-H8-VERDICT state (this session, 2026-05-10 EOD+~10hr)
+
+**🎯 H8 DISPROVEN** (`57c37b5`): cargo build with diagnostic patch
+PASS 4m 48s, then `pf83_h8_verify.sh` showed:
+- ✅ Server with PF8 enabled + 2 curl returned valid Chinese+English text
+- ❌ "cleared pre-existing CUDA error" diagnostic NEVER fired
+- ✅ 0 gemm_w4_fp8_marlin_cuda failed log lines
+
+**KEY INSIGHT**: PF8 path WORKS at conc=1. PF8.3 KILL is **LOAD-DEPENDENT**,
+not dispatch-broken. **H1' (per-call alloc fragmentation)** is now the
+confirmed root cause direction.
+
+**PF8.5 license decision NOW POSSIBLE at conc=1**:
+- v3 baseline INT8 conc=1: 53.6ms TTFT mdn, 6.8ms ITL, 1.1 req/s, 697 tok/s
+- License threshold: TTFT ≤ 49.3ms (Δ ≥ -8% per a66d99a §2)
+- Bench v11/v12 attempts blocked by Claude session sleep limits — **USER
+  MUST RUN MANUALLY** in terminal:
+
+```bash
+cd /home/ckl/projects/arle
+mkdir -p bench-output/2026-05-10-pf83-treatment-conc1-FINAL
+PATH=$PWD/.venv/bin:$PATH
+
+RUST_MIN_STACK=33554432 INFER_HYBRID_W4A8_PREFILL=1 INFER_MARLIN_W4_FP8_PREFILL=1 \
+  target/release/infer --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix --port 8000 \
+  > /tmp/pf83-FINAL-treatment.log 2>&1 &
+sleep 30  # wait warmup
+
+guidellm benchmark run \
+    --target http://127.0.0.1:8000 \
+    --model infer/models/Qwen3-4B-W4-hybrid-zpfix \
+    --processor infer/models/Qwen3-4B-W4-hybrid-zpfix \
+    --profile concurrent --rate "1" --max-seconds 60 --warmup 5 \
+    --random-seed 20260416 \
+    --data 'prompt_tokens=512,prompt_tokens_stdev=1,prompt_tokens_min=512,prompt_tokens_max=512,output_tokens=128,output_tokens_stdev=1,output_tokens_min=128,output_tokens_max=128' \
+    --output-dir /home/ckl/projects/arle/bench-output/2026-05-10-pf83-treatment-conc1-FINAL \
+    --backend openai_http \
+    --backend-kwargs '{"validate_backend": "/v1/models", "request_format": "/v1/completions"}' \
+    --disable-console-interactive \
+    --outputs json --outputs csv --outputs html
+
+pkill -f "target/release/infer.*--port 8000"
+```
+
+Compare TTFT mdn from output → if ≤ 49.3ms → LICENSE → codex H1'
+static-scratch refactor for conc≥2.
+
 ### POST-PF8.3 KILL state (this session, 2026-05-10 EOD+~9hr)
 
 **🚫 PF8.3 RUNTIME KILL** (`0cde63d`) — substrate landed (`11763ba`) but
