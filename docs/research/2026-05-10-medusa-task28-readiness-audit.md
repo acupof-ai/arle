@@ -2,11 +2,20 @@
 title: 2026-05-10 Task #28 Medusa scaffold readiness audit (post-REFUTATION pivot)
 date: 2026-05-10
 type: research
-status: open (informs next-session pickup)
+status: superseded-for-qwen35-by-recurrent-rollback-blocker
 related_docs: [`9735b47-w4a8-longctx-prompt16384-hybrid-extrapolation-refuted`, `M_medusa-required-path.md`, `M_medusa-phase1a-dataset-directive.md`, `9350767` session-tail summary §5 strategic matrix]
 ---
 
 # Task #28 Medusa scaffold — readiness audit
+
+> **2026-05-10 later update**: this readiness audit is historical for
+> the Qwen3/Qwen3.6 pickup chain. User re-scoped to Qwen3.5, and the
+> Qwen3.5 Step 0 audit found a blocker: verifier rollback only truncates
+> paged KV, while Qwen3.5 also mutates linear-attention recurrent state.
+> Do not use this document as a direct pickup brief for Qwen3.5. Current
+> next step: recurrent accepted-length commit/rollback design, then
+> Medusa heads/training. See
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
 
 > **Why now**: `9735b47` REFUTATION promoted Option A (Medusa) to
 > dominant single-axis investment for ALL contexts (was: only short-ctx,

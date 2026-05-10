@@ -1,5 +1,11 @@
 # M_medusa Phase 1.A directive — pick dataset + wire HF Hub loader
 
+> **2026-05-10 Qwen3.5 scope update**: dataset prep is not the active
+> blocker anymore. Alpaca is already prepared, but Qwen3.5 Medusa cannot
+> proceed to training/runtime until recurrent-state accepted-length
+> rollback is designed and measured. See
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+
 > Per `74bde06` Medusa Phase 1.A data inventory:584 tokens existing vs
 > 100k+ target = 172× short。Path A(HF Hub integration)preferred per
 > existing `crates/train/src/hub_dataset.rs` infra。

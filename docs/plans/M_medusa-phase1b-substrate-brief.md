@@ -12,6 +12,8 @@
 > linear-attention recurrent state. See
 > `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md` and
 > `docs/experience/errors/2026-05-10-medusa-qwen35-recurrent-rollback-blocker.md`.
+> Current replacement plan for Qwen3.5:
+> `docs/plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`.
 
 > **Historical note**: the remaining sections below describe the older
 > Qwen3/Qwen3.6 pickup shape. Treat them as prior context, not an active

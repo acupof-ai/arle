@@ -8,6 +8,10 @@ related_docs: [`f8b8174` QQQ upstream finding, `2f19a3c` Marlin parity, `b6b8adc
 
 # QQQ vs ARLE marlin_w4a8 diff diagnostic — 119-line delta surfaces
 
+> **2026-05-10 later update**: priority-table references to A+B/Medusa
+> are superseded for Qwen3.5 by the recurrent rollback blocker. The QQQ
+> W4A8 diff-port finding remains independent.
+
 > **Why now**: `f8b8174` §2.3 listed P2.5 (HandH1998/QQQ diff-port) as
 > "diff status not measured this audit". This tick executes the
 > diagnostic step. Result: real 119-line delta exists. P2.5 is a

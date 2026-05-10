@@ -1,5 +1,11 @@
 # Medusa training data infra audit — Alpaca already downloaded + converted, removes §7 gate friction
 
+> **2026-05-10 later update**: Alpaca data remains ready, but it no
+> longer makes Medusa pickup executable for the active Qwen3.5 direction.
+> Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback;
+> see `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+> Treat this entry as data-readiness evidence only, not runtime/training GO.
+
 ## Context
 
 Date: 2026-05-10 (cron-loop tick 105 KST)
@@ -55,8 +61,10 @@ consumes directly (per `crates/train/src/sft_data.rs` pattern).
 - [ ] Integration target (CUDA scheduler first)
 - [ ] ~3-4 day wall-clock approval
 
-**Implication**: if user picks Alpaca, training can begin **immediately**
-once codex Phase 1.B substrate lands. No pre-training data prep wall-clock.
+**Current implication**: Alpaca removes data-prep wall-clock, but Qwen3.5
+training/runtime cannot begin until the recurrent rollback design is settled.
+For the older Qwen3/Qwen3.6 path, this would have meant training could begin
+once Phase 1.B substrate landed.
 
 For lmsys-chat-1m, would need fresh download (~1 GB) + convert
 (~10-15 min wall-clock) — adds friction not present for Alpaca.
@@ -83,7 +91,8 @@ Original estimate (assumed cold start):
 - Bench: 1 hr
 - **Total**: 3-4 days
 
-Refined estimate (Alpaca pre-prepped):
+Historical refined estimate for the older Qwen3/Qwen3.6 path
+(Alpaca pre-prepped):
 - Substrate: 8-11 hr
 - Training: 48-60 hr (just train, no prep wait)
 - Bench: 1 hr

@@ -481,6 +481,16 @@ P0.0 (W3/W4 bench harness 跨引擎实测)
 
 ### §7.4 P1.1 — Speculative decoding(Medusa **REQUIRED**,classical DEAD)
 
+> **2026-05-10 Qwen3.5 scope correction**:Medusa remains the
+> non-classical spec-decode direction after classical α KILLs, but the
+> active Qwen3.5 target is blocked before runtime pickup. Qwen3.5 decode
+> mutates linear-attention recurrent state, while the current spec commit
+> path rolls back only paged KV. Do **not** start the old Qwen3/Qwen3.6
+> Medusa substrate brief for Qwen3.5. First required work item:
+> model-owned accepted-length recurrent commit/rollback design, measured
+> against greedy consistency. Canonical audit:
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+
 > **2026-05-08 evidence-driven update**:Original framing was "Medusa
 > 优先 EAGLE 降数据/训练风险" — implied classical Leviathan was the
 > cheap fallback。**3 independent classical-spec KILLs** prove classical
@@ -500,10 +510,12 @@ P0.0 (W3/W4 bench harness 跨引擎实测)
 
 **Updated recommendation**:
 
-- **Medusa 多头**(单模型加多个 prediction head)is the **REQUIRED path**,
-  not a "preferred" alternative。Classical Leviathan via ARLE current
-  implementation is **production-dead** for tok/s improvement at any
-  tested workload。
+- **Medusa 多头**(单模型加多个 prediction head)is the **REQUIRED path**
+  for full-attention Qwen-family speculation, not a "preferred"
+  alternative。Classical Leviathan via ARLE current implementation is
+  **production-dead** for tok/s improvement at any tested workload。
+  For Qwen3.5 hybrid, Medusa is **blocked** until recurrent-state
+  rollback has a concrete design and evidence.
 - 复用 ARLE Rust runtime + TileLang verify kernel
 - 目标:tool call 短输出(50-500 tok)tok/s × 2-3,acceptance ≥70%
 - LOC 估:500-800 + ~1 week training data prep + fine-tune
@@ -649,7 +661,7 @@ per R2 audit(commit fa6a5ea):
 | 不确定性 | 当前判断依据 | 解除条件 |
 |---|---|---|
 | Prefill graph 在 ARLE Rust runtime 真实 ROI | Codex plan 数学 + R1 evidence | Phase 0 实测 |
-| Spec decode acceptance rate(Qwen3-4B coding tool call)| 行业典型 70-80% | 训练 / 选 draft 后实测 |
+| Spec decode acceptance rate(Qwen3-4B coding tool call)| 行业典型 70-80%; Qwen3.5 currently blocked on recurrent rollback before α can be measured | 训练 / 选 draft 后实测; Qwen3.5 first needs accepted-length recurrent commit/rollback |
 | 32k-128k long-ctx ARLE 表现 | 未 benched | P2 工作 bench |
 | FlashInfer paged prefill vs TileLang HD128 kernel-time | 未对照 bench | nsys A/B + ncu |
 | Metal backend coding/agent 现状 | 未深入分析 | 单独 Metal track plan |

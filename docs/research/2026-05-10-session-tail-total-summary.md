@@ -8,6 +8,11 @@ related_docs: [`2026-05-10-post-pf85-direction-options.md`, `2026-05-10-w4a16-lo
 
 # 2026-05-10 Session-tail TOTAL summary
 
+> **2026-05-10 later update**: the next-session pickup recommendations
+> below predate the user re-scope to Qwen3.5. Option A/Medusa is now
+> blocked for Qwen3.5 by recurrent-state rollback; the latest canonical
+> state is `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+
 > **Purpose**: single-anchor doc capturing ALL substantive work from
 > this session-tail (~7+ hours, 86+ ticks, ~75+ Claude commits) for
 > efficient next-session pickup. Supersedes scattered references in

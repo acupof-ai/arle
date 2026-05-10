@@ -8,6 +8,12 @@ related_docs: [`15c16a4` pickup queue §8 final summary, `81b5e94` index.md EOD+
 
 # Session-tail saturation observation (tick 126)
 
+> **2026-05-10 later update**: the "awaiting user GO" framing below
+> has changed. User chose the Qwen3.5 direction and froze Qwen3-specific
+> execution. The former P1 A+B/Medusa ready chain is superseded by the
+> Qwen3.5 recurrent rollback blocker documented in
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+
 > **Why this entry**: per loop directive "持续累积:NULL result 也
 > commit + push errors entry,绝不 skip 知识沉淀。每 tick 至少 1
 > commit", commit a tight observation when the chain has saturated

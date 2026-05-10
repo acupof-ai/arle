@@ -2,10 +2,14 @@
 title: Medusa Phase 1.A pivot ATTEMPTED post-PF8.3 KILL — blocked on HF auth (HF_TOKEN not set, lmsys-chat-1m gated)
 date: 2026-05-10
 type: research
-status: medusa-phase-1a-pivot-blocked-on-hf-auth
+status: superseded-for-qwen35-by-recurrent-rollback-blocker
 ---
 
 # Medusa Phase 1.A pivot ATTEMPTED post-PF8.3 KILL — blocked on HF auth (HF_TOKEN not set, lmsys-chat-1m gated)
+
+> **2026-05-10 later update**: HF auth is no longer the active Medusa
+> blocker. Alpaca data is available, but Qwen3.5 Medusa is blocked by
+> recurrent-state rollback. Treat this entry as historical auth context.
 
 > Per `0cde63d` PF8.3 RUNTIME KILL + `2e1e73a` decision matrix → KILL
 > branch step 3 = pivot to #28 Medusa Phase 1.A. Phase 1.A unblocked

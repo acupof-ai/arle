@@ -7,6 +7,12 @@ status: strategic-revision-supersedes-61c9666-priority
 
 # REVISION — no immediately-actionable -50%+ ITL path on sm_89 W4 decode (M_spec classical KILLED at 4k)
 
+> **2026-05-10 later update**: the "available path is Medusa" statement
+> below applies to the older Qwen3/Qwen3.6 framing. For active Qwen3.5,
+> Medusa is not immediately actionable because verifier rollback lacks
+> recurrent-state commit semantics. Next actionable work is rollback
+> design/prototype, not head training.
+
 > Per skill v1.10.0 #28 anti-hallucination rule applied to my own
 > prior `61c9666` synthesis. While surveying spec decode infra to plan
 > #28 pickup, found M_spec plan tail evidence I missed: classical

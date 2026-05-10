@@ -2,11 +2,18 @@
 title: Post-PF8.5 KILL — direction options for user decision
 date: 2026-05-10
 type: research
-status: SUPERSEDED-by-bilateral-A+B-chain (recommendation refined post-`9735b47` REFUTATION + `bccf1bd` consistency audit + `fc33cfb` Machete KILL + `b6b8adc` marlin_pf8 = vLLM fork; final priority per `15c16a4` pickup queue §8 = P1 A+B combined (#28 + #30) > P2.5/M'' (4.5-6.5 hr) > P3 Task #47 v2 (1d) = 5-6 days compound for ~2.61× tok/s + -14% latency)
+status: SUPERSEDED-by-qwen35-medusa-recurrent-rollback-blocker (older A+B chain now historical for Qwen3/Qwen3.6; Qwen3.5 needs rollback design before Medusa)
 related_tasks: [#28 (Medusa, P1 component), #30 (Hybrid W4A16/W4A8 dispatch, P1 component STACKS with #28), #47 (PF8.3 H1' v2 redesign, P3 parallel)]
 ---
 
 # Post-PF8.5 — direction options
+
+> **2026-05-10 later update**: the Option A Medusa recommendation below
+> is no longer directly executable after user re-scoped work to Qwen3.5.
+> Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback.
+> Dataset readiness and vLLM LOC reduction remain useful, but the next
+> planning item is a Qwen3.5 rollback-design prototype, not Medusa
+> training or runtime exposure.
 
 > **Purpose**: PF8.5 license bench v11 returned KILL (5878 kernel
 > failures, see `0be278f`). Subsequent 3-arm A/B (Arms B/C/D) bounded

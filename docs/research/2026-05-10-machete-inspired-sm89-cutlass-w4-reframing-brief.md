@@ -8,6 +8,11 @@ related_docs: [`fc33cfb` Machete KILL, `2b956ce` sm_89 alternatives, `89a04d7` l
 
 # Machete-inspired sm_89 cutlass W4 kernel — reframing the user "port Machete" directive
 
+> **2026-05-10 later update**: the "A+B (Medusa + Hybrid)" main-axis
+> references below are historical. User re-scoped away from Qwen3-specific
+> Medusa execution; Qwen3.5 Medusa is blocked on recurrent-state rollback.
+> The sm_89 Machete alternatives remain valid as a separate kernel axis.
+
 > **Why this brief**: User's /loop directive persistently states
 > "**当前主轴: Machete W4 kernel 移植 from vLLM** ... port machete from
 > vllm-project/vllm to ARLE crates/cuda-kernels for sm_89 W4A8 优化

@@ -2,6 +2,10 @@
 
 > Sub-plan of [`longctx-spec-tilelang-combo.md`](longctx-spec-tilelang-combo.md) §M_d.
 > 前置:M_c(hybrid spec-rollback)和 unification M2(Metal kv-tier T2 adapter,已 land `f8f063d`)。
+> **2026-05-10 update**: M_c is now an explicit Qwen3.5 blocker:
+> current spec rollback truncates paged KV only and cannot restore
+> linear-attention recurrent state by accepted length. See
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
 > Goal:把 Tier-KV(T0 GPU / T1 host pinned / T2 disk / T3 remote)和
 > spec-decode 路径对齐,避免 (a) verify 时 cold-tier prefix 拖慢 spec step,
 > 和 (b) 失败 verify 污染 RadixCache 留下"draft 看过的伪前缀"。
