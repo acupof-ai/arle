@@ -118,6 +118,12 @@ self-spec lands. See
 §13 and the regression entry in
 [`docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`](experience/errors/2026-05-01-phase2-real-spec-regression.md).
 
+For Qwen3.5 / Medusa specifically, the current gate is recurrent-state
+rollback: paged KV can be truncated, but hybrid linear-attention recurrent
+state needs a model-owned accepted-length commit/rollback before spec-on
+results are valid. See
+[`docs/plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md).
+
 ## Route-A Note (Historical)
 
 The 2026-04-15 Route-A refactor folded the experimental `infer-core`,

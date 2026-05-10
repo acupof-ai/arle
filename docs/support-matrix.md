@@ -123,7 +123,7 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | Metal DFlash (Qwen3) | Beta | Apple Silicon speculative decode path. Validated on Qwen3; benchmark before production use. |
 | Metal DFlash (Qwen3.5) | Beta | End-to-end correctness landed 2026-04-17 (commits `4db4fe9`, `439293d`); benchmark before production use. |
 | Metal DFlash (Qwen3.6 / Qwen3.5-MoE) | Beta / diagnostic | Target/draft pairing is wired for `mlx-community/Qwen3.6-35B-A3B-4bit` + `z-lab/Qwen3.6-35B-A3B-DFlash`. Short checks are smoke diagnostics only; future DFlash optimization claims must come from long-context / ultra-long-sequence runs. |
-| CUDA speculative decoding | Not shipped | `infer/src/speculative.rs` is a CPU-only framework; GPU integration pending (see `plans/speculative-decoding-impl.md`). |
+| CUDA speculative decoding | Not shipped | CUDA plumbing exists (`infer/src/speculative.rs`, `infer/src/speculative/cuda.rs`, `infer/src/scheduler/cuda/spec_path.rs`) for external/self verifier experiments, but no CUDA spec-decode mode is shipped as throughput-positive. Classical/self/external paths are killed or regressed; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. See [`plans/2026-05-01-longctx-spec-decode-phase2.md`](plans/2026-05-01-longctx-spec-decode-phase2.md) and [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md). |
 
 ---
 
