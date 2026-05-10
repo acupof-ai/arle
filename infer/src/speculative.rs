@@ -31,6 +31,8 @@
 
 use anyhow::{Result, bail};
 use rand::RngExt;
+#[cfg(feature = "cuda")]
+use std::sync::{Mutex, PoisonError};
 
 #[cfg(feature = "cuda")]
 mod cuda;
@@ -419,6 +421,79 @@ impl DraftModel for MockDraftModel {
 
     fn model_id(&self) -> &str {
         &self.id
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct MedusaDraftModel {
+    model_id: String,
+    slot_idx: usize,
+    ctx: cuda_kernels::prelude::DeviceContext,
+    medusa: Mutex<crate::model::medusa::Medusa>,
+    scratch: Mutex<crate::model::medusa::MedusaScratch>,
+    hidden_capture: crate::model::medusa::SharedHiddenStateCapture,
+}
+
+#[cfg(feature = "cuda")]
+impl MedusaDraftModel {
+    pub fn new(
+        model_id: impl Into<String>,
+        slot_idx: usize,
+        medusa: crate::model::medusa::Medusa,
+        hidden_capture: crate::model::medusa::SharedHiddenStateCapture,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+    ) -> Result<Self> {
+        let scratch = medusa.create_scratch(ctx)?;
+        Ok(Self {
+            model_id: model_id.into(),
+            slot_idx,
+            ctx: ctx.clone(),
+            medusa: Mutex::new(medusa),
+            scratch: Mutex::new(scratch),
+            hidden_capture,
+        })
+    }
+
+    pub fn draft_for_slot(
+        &self,
+        slot_idx: usize,
+        num_draft_tokens: usize,
+    ) -> Result<TokenProposal> {
+        if num_draft_tokens == 0 {
+            return Ok(TokenProposal {
+                tokens: Vec::new(),
+                draft_probs: Vec::new(),
+                target_probs: Vec::new(),
+                target_bonus_dist: Vec::new(),
+            });
+        }
+
+        let hidden = self
+            .hidden_capture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Medusa hidden capture lock poisoned"))?
+            .get_last(slot_idx)?;
+        let medusa = self.medusa.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut scratch = self.scratch.lock().unwrap_or_else(PoisonError::into_inner);
+        let tokens = medusa.propose_top1(&self.ctx, &hidden, &mut scratch, num_draft_tokens)?;
+        let draft_probs = vec![1.0; tokens.len()];
+        Ok(TokenProposal {
+            tokens,
+            draft_probs,
+            target_probs: Vec::new(),
+            target_bonus_dist: Vec::new(),
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl DraftModel for MedusaDraftModel {
+    fn draft_batch(&self, _token_ids: &[u32], num_draft_tokens: usize) -> Result<TokenProposal> {
+        self.draft_for_slot(self.slot_idx, num_draft_tokens)
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
     }
 }
 

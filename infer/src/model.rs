@@ -17,6 +17,9 @@ pub(crate) mod generation_state;
 pub(crate) mod kv_cache;
 #[path = "model/layer_communicator.rs"]
 pub mod layer_communicator;
+#[cfg(feature = "cuda")]
+#[path = "model/medusa.rs"]
+pub mod medusa;
 
 #[path = "model/deepseek.rs"]
 pub mod deepseek;

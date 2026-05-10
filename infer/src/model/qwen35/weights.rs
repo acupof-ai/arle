@@ -6,6 +6,7 @@ use std::time::Instant;
 use super::config::{Config35, LayerType};
 use crate::model::common::{self, MLP};
 use crate::model::layer_communicator::LayerCommunicator;
+use crate::model::medusa::SharedHiddenStateCapture;
 use crate::model::qwen35::prefill_buffers::PagedPrefillBuffers35;
 use crate::model_source::ResolvedModelSource;
 #[cfg(test)]
@@ -99,6 +100,7 @@ pub struct Qwen35Model {
     pub(super) enable_cuda_graph: bool,
     pub(super) layer_communicator: LayerCommunicator,
     pub(super) paged_prefill_batch: std::sync::Mutex<Option<PagedPrefillBuffers35>>,
+    pub(super) medusa_hidden_capture: Option<SharedHiddenStateCapture>,
 }
 
 impl Qwen35Model {
@@ -485,7 +487,12 @@ impl Qwen35Model {
                 1,
             )?,
             paged_prefill_batch: std::sync::Mutex::new(None),
+            medusa_hidden_capture: None,
         })
+    }
+
+    pub fn attach_medusa_hidden_capture(&mut self, capture: SharedHiddenStateCapture) {
+        self.medusa_hidden_capture = Some(capture);
     }
 
     pub(super) fn uses_marlin_w4a8(&self) -> bool {
@@ -873,6 +880,7 @@ impl Qwen35Model {
                 1,
             )?,
             paged_prefill_batch: std::sync::Mutex::new(None),
+            medusa_hidden_capture: None,
         })
     }
 }

@@ -26,7 +26,7 @@ older per-layer memcpy loop killed in
 - Model family: Qwen3.5 CUDA hybrid recurrent state
 - Spec verifier rows: `[last_committed_token] + draft_tokens`
 - Snapshot source of truth: post-verifier `PagedKVPool::seq_len(slot)`
-- Medusa K: pending Phase 1.B core wiring
+- Medusa K: default substrate K=5, runtime CLI routing pending
 
 ## Results
 
@@ -37,6 +37,19 @@ This entry is a substrate stub, not a throughput license.
 - `cargo clippy --release -p infer --features cuda -- -D warnings`: PASS
 - `cargo check -p infer --no-default-features --features cuda,no-cuda`: PASS
 - `qwen35_recurrent_snapshot_ring_restore_idempotent`: PASS
+
+Follow-up substrate now also includes:
+
+- Qwen3.5 post-final-RMS hidden capture at `bufs.common.normed`, default `None`
+  so normal decode behavior is unchanged.
+- Hidden capture verifier ring rollback, kept in lockstep with recurrent-state
+  `restore_from_ring(num_accepted)` so uncommitted verifier rows cannot seed the
+  next Medusa draft.
+- Medusa head substrate (`MedusaConfig`, residual blocks, LM heads, safetensors
+  loader, top-1 propose path).
+- `MedusaDraftModel` wrapper over the captured hidden state. This is not yet
+  exposed through `--spec-draft-model medusa:<path>`; that scheduler route is
+  the next tranche.
 
 Final greedy-consistency and tok/s license-or-kill benches are deferred to the
 full Qwen3.5 Medusa substrate commit, where the draft model path exists.
