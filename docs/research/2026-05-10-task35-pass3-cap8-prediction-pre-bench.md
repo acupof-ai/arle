@@ -273,6 +273,53 @@ bugs each**. Pattern is consistent magnitude, not just consistent
 existence. Strong argument that codex review is the highest-yield
 verification step for non-trivial diffs.
 
+### §6.12 W4 startup cost MEASURED with new methodology — 8.2s total
+
+Per codex tmux ~1h 02min, log line captured:
+
+```text
+CUDA Graph warmup done in 8242ms (decode=8 batch sizes, prefill=7 batch sizes, max decode 8)
+```
+
+**W4 actual Pass 3 startup cost: 8.2 seconds** (decode=8 batch sizes
++ prefill=7 batch sizes).
+
+Reconciliation table (UPDATED):
+
+| Metric | Predicted | Pre-fix BUGGY (no-op) | BF16 B=4 only (~56min tmux) | **W4 REAL (8242ms)** |
+|---|---|---|---|---|
+| Server startup overhead | +282.7ms | +282.7ms | ~60,000ms B=4 alone | **+8242ms total (8 decode + 7 prefill)** |
+| Ratio vs prediction | 1× | 1× | ~212× | **~29×** |
+
+**Revised understanding**:
+- Prediction was ~29× too low (anchored to buggy substrate's no-op cost)
+- BF16 60s number was likely a single-shape outlier or test-window
+  artifact, not the production cost
+- Real W4 production Pass 3 cost is **8.2 seconds** = significant but
+  not catastrophic
+- Server boot now adds ~8s for production-grade Pass 3 vs ~ms for
+  empty Pass 1+2
+
+**Updated license verdict (§3.4 threshold revision):**
+
+| Gate | Status |
+|---|---|
+| ITL Δ ≈ 0 | ✅ confirmed (§6.1) |
+| TTFT p99 Δ > -10% | ❓ first-burst still unmeasured per §6.2 |
+| Server startup acceptable | ✅ 8.2s is well within "acceptable for production deployments that boot once and serve thousands of requests" |
+| Dev-iteration friction | ⚠ 8.2s adds friction but `INFER_PREFILL_WARMUP=0` escape hatch covers it |
+
+→ **REVIEW** still (first-burst measurement still pending), but the
+startup cost no longer flips the "default-on prod / default-off dev"
+recommendation toward "always opt-in" — 8.2s is tolerable, just costly
+enough to want the escape hatch for tight test loops.
+
+**SOLID lesson reinforced**: my §6.9 alarm at "200-1000× larger than
+predicted" was based on extrapolating from BF16 60s. Single
+extrapolation point ≠ ground truth. **Codex's discipline to measure
+W4 directly per the actual production target shape was correct**;
+~29× over prediction is bad enough to call out but not catastrophic.
+
 ### §6.11 Codex applying SKILL #29 to its own prior data (pre-fix logs contaminated)
 
 Per codex tmux ~1h 01min:
