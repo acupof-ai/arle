@@ -45,6 +45,10 @@ pub(crate) struct RecurrentState {
     /// Post-prefill snapshot for prefix cache reuse.
     /// Saved after prefill, restored on full prefix hit to avoid decode contamination.
     snapshot: Option<RecurrentSnapshot>,
+    /// Medusa verifier rollback ring. Captured lazily when speculation first
+    /// needs recurrent-state rollback for this slot.
+    #[allow(dead_code)]
+    spec_ring: Option<RecurrentSnapshotRing>,
 }
 
 impl RecurrentState {
@@ -74,6 +78,7 @@ impl RecurrentState {
             layers,
             seq_len: 0,
             snapshot: None,
+            spec_ring: None,
         })
     }
 
@@ -171,6 +176,45 @@ impl RecurrentState {
         self.seq_len = snap.seq_len;
         Ok(true)
     }
+
+    /// Ensure the Medusa verifier rollback ring exists for `k_plus_1` slots.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_spec_ring(&mut self, ctx: &DeviceContext, k_plus_1: usize) -> Result<()> {
+        let needs_capture = self
+            .spec_ring
+            .as_ref()
+            .is_none_or(|ring| ring.slot_count() != k_plus_1);
+        if needs_capture {
+            self.spec_ring = Some(RecurrentSnapshotRing::capture(ctx, self, k_plus_1)?);
+        }
+        Ok(())
+    }
+
+    /// Save the current recurrent state into a verifier rollback slot.
+    #[allow(dead_code)]
+    pub(crate) fn push_ring_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_idx: usize,
+        k_plus_1: usize,
+    ) -> Result<()> {
+        self.ensure_spec_ring(ctx, k_plus_1)?;
+        self.spec_ring
+            .as_mut()
+            .context("spec ring missing after capture")?
+            .push_slot(slot_idx, self.seq_len)
+    }
+
+    /// Restore recurrent state from a verifier rollback slot.
+    #[allow(dead_code)]
+    pub(crate) fn restore_from_ring(&mut self, slot_idx: usize) -> Result<()> {
+        let ring = self
+            .spec_ring
+            .as_ref()
+            .context("spec ring restore requested before capture")?;
+        self.seq_len = ring.restore_slot(slot_idx)?;
+        Ok(())
+    }
 }
 
 /// Prototype benchmark for Medusa Phase 1.B-Qwen3.5 snapshot-ring rollback.
@@ -213,6 +257,14 @@ pub(crate) struct RecurrentSnapshotRing {
 impl RecurrentSnapshotRing {
     #[allow(dead_code)]
     pub(crate) fn capture_for_bench(
+        ctx: &DeviceContext,
+        state: &mut RecurrentState,
+        k_plus_1: usize,
+    ) -> Result<Self> {
+        Self::capture(ctx, state, k_plus_1)
+    }
+
+    pub(crate) fn capture(
         ctx: &DeviceContext,
         state: &mut RecurrentState,
         k_plus_1: usize,
@@ -262,6 +314,30 @@ impl RecurrentSnapshotRing {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn push_slot(&mut self, slot_idx: usize, seq_len: usize) -> Result<()> {
+        anyhow::ensure!(
+            slot_idx < self.slots.len(),
+            "snapshot ring slot out of range"
+        );
+        self.slots[slot_idx].seq_len = seq_len;
+        self.snap_graphs[slot_idx]
+            .launch()
+            .map_err(|e| anyhow::anyhow!("snapshot ring push launch failed: {e}"))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn restore_slot(&self, slot_idx: usize) -> Result<usize> {
+        anyhow::ensure!(
+            slot_idx < self.slots.len(),
+            "snapshot ring slot out of range"
+        );
+        self.restore_graphs[slot_idx]
+            .launch()
+            .map_err(|e| anyhow::anyhow!("snapshot ring restore launch failed: {e}"))?;
+        Ok(self.slots[slot_idx].seq_len)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn bench_launch_once(
         &self,
         ctx: &DeviceContext,
@@ -305,8 +381,123 @@ pub(crate) fn bench_snapshot_ring_graph_overhead(
 #[cfg(all(test, feature = "cuda", not(feature = "no-cuda")))]
 mod tests {
     use super::*;
+    use qwen35_spec::LayerType;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
+
+    fn tiny_config() -> Config35 {
+        Config35 {
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 2,
+            vocab_size: 32,
+            rms_norm_eps: 1e-6,
+            stop_token_ids: vec![0],
+            bos_token_id: Some(1),
+            eos_token_id: 0,
+            tie_word_embeddings: true,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 8,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 4,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 3,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 8,
+            rope_cache_len_hint: Some(16),
+            layer_types: vec![LayerType::LinearAttention, LayerType::LinearAttention],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+        }
+    }
+
+    fn fill_recurrent_state(
+        ctx: &DeviceContext,
+        state: &mut RecurrentState,
+        marker: usize,
+    ) -> Result<()> {
+        state.seq_len = marker;
+        for (layer_idx, layer) in state.layers.iter_mut().enumerate() {
+            let recurrent: Vec<f32> = (0..layer.state.len())
+                .map(|idx| marker as f32 * 1000.0 + layer_idx as f32 * 100.0 + idx as f32)
+                .collect();
+            ctx.stream
+                .memcpy_htod(&recurrent, &mut layer.state)
+                .map_err(|e| anyhow::anyhow!("fill recurrent state failed: {e}"))?;
+
+            let conv: Vec<bf16> = (0..layer.conv_state.len)
+                .map(|idx| bf16::from_f32(marker as f32 * 10.0 + layer_idx as f32 + idx as f32))
+                .collect();
+            ctx.stream
+                .memcpy_htod(&conv, &mut layer.conv_state.data)
+                .map_err(|e| anyhow::anyhow!("fill conv state failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn read_recurrent_state(
+        ctx: &DeviceContext,
+        state: &RecurrentState,
+    ) -> Result<(usize, Vec<Vec<f32>>, Vec<Vec<bf16>>)> {
+        let recurrent = state
+            .layers
+            .iter()
+            .map(|layer| {
+                ctx.stream
+                    .clone_dtoh(&layer.state)
+                    .map_err(|e| anyhow::anyhow!("read recurrent state failed: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let conv = state
+            .layers
+            .iter()
+            .map(|layer| {
+                ctx.stream
+                    .clone_dtoh(&layer.conv_state.data)
+                    .map_err(|e| anyhow::anyhow!("read conv state failed: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((state.seq_len, recurrent, conv))
+    }
+
+    #[test]
+    #[ignore = "CUDA micro-test; verifies Medusa recurrent snapshot-ring restore idempotence"]
+    fn qwen35_recurrent_snapshot_ring_restore_idempotent() {
+        let ctx = DeviceContext::new().expect("create CUDA device context");
+        let config = tiny_config();
+        let mut state = RecurrentState::new(&ctx, &config).expect("allocate recurrent state");
+        let k_plus_1 = 6;
+        let mut expected = Vec::with_capacity(k_plus_1);
+
+        for slot_idx in 0..k_plus_1 {
+            fill_recurrent_state(&ctx, &mut state, slot_idx + 1).expect("fill recurrent state");
+            state
+                .push_ring_slot(&ctx, slot_idx, k_plus_1)
+                .expect("push snapshot ring slot");
+            ctx.sync().expect("sync snapshot ring push");
+            expected.push(read_recurrent_state(&ctx, &state).expect("read expected state"));
+        }
+
+        for slot_idx in (0..k_plus_1).rev() {
+            fill_recurrent_state(&ctx, &mut state, slot_idx + 100)
+                .expect("overwrite recurrent state");
+            state
+                .restore_from_ring(slot_idx)
+                .expect("restore snapshot ring slot");
+            ctx.sync().expect("sync snapshot ring restore");
+            let actual = read_recurrent_state(&ctx, &state).expect("read restored state");
+            assert_eq!(actual, expected[slot_idx]);
+        }
+    }
 
     #[test]
     #[ignore = "CUDA micro-bench; prints Qwen3.5 recurrent snapshot-ring timing"]
