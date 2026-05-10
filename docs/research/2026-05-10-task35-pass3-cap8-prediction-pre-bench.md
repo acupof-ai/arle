@@ -316,17 +316,37 @@ Per codex tmux ~1h 07min:
    fallback respectively. The pattern generalizes to any warmup-
    based optimization.
 
-**Updated W4 startup cost (supersedes §6.12's 8.2s)**:
+**FINAL W4 startup cost (per codex commit `a2ad788` Task #35)** — supersedes my §6.12 8.2s estimate AND my over-extrapolation in earlier draft of this section:
 
-| Metric | Predicted | Pre-fix BUGGY | Codex run #1 | **Codex run #2-4 (n=3 stable)** |
-|---|---|---|---|---|
-| W4 server startup overhead | +282.7ms | +282.7ms | +8242ms | **+~9200ms** (slight increase from fallback retries at B=8 2048) |
-| Ratio vs prediction | 1× | 1× | ~29× | **~33×** |
+| Arm | N=3 raw | Mean | CV |
+|---|---|---|---|
+| Pass 3 OFF (`INFER_PREFILL_WARMUP=0`) | 1043 / 1051 / 1046 ms | **1046.7 ms** | 0.4% |
+| Pass 3 ON (default) | 9221 / 9244 / 9235 ms | **9233.3 ms** | 0.13% |
+| **Δ overhead** | | **+8186.7 ms** | tight σ |
 
-Still ~33× over prediction, still well within "tolerable for
-production with INFER_PREFILL_WARMUP=0 escape hatch for dev"
-verdict from §6.12. Wins entry will document this tradeoff
-explicitly per codex's stated plan.
+| Metric | Predicted | Pre-fix BUGGY | **W4 ACTUAL** |
+|---|---|---|---|
+| W4 server startup overhead | +282.7ms | +282.7ms (false anchor) | **+8186ms** (mean of n=3) |
+| Ratio vs prediction | 1× | 1× | **~29×** |
+
+(My earlier "+9200ms" in this section was over-extrapolation —
+cited the TOTAL ON-arm time, not the OVERHEAD vs OFF-arm. Codex's
+explicit n=3 numbers in the commit message correct this.)
+
+Verdict: ~29× over prediction, **tolerable for production with
+`INFER_PREFILL_WARMUP=0` escape hatch for dev** (per §6.12 verdict
+unchanged). Codex's wins entry §Bench documents the tradeoff
+explicitly with same numbers.
+
+**SOLID self-correction lesson**: the §6.13 overestimate (~9.2s →
+~8.2s actual) shows the same pattern as my original prediction
+overestimate (BF16 60s extrapolation → W4 8.2s actual). Both came
+from extrapolating the wrong-direction. **Direct measurement at
+target shape > extrapolation from adjacent shape, EVERY TIME.**
+Per skill v1.12.0 mantra rule 2 ("measure binding constraint first,
+sweep tunables second"), the same applies to predictions: measure
+the actual target, don't extrapolate from a measurement of an
+adjacent (different) target.
 
 ### §6.12 W4 startup cost MEASURED with new methodology — 8.2s total
 
