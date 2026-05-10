@@ -123,3 +123,44 @@ config matches the clamp-to-effective-budget rule).
 
 This breaks Claude's 6-tick idle pattern via concrete Phase 1-8 bench
 work per directive table "idle + GPU 空 → Claude self-runs bench".
+
+## §8 SECOND Claude-run bench — `test_e2e_w4a8_marlin_optional` PASS
+
+Continuing trust-but-verify discipline next tick (per directive table
+"idle + GPU 空 → Claude bench"), Claude ran the second test codex
+listed in commit 8d1caad verification:
+
+```bash
+cargo test --release -p infer --features cuda --test e2e \
+    test_e2e_w4a8_marlin_optional -- --test-threads=1 --nocapture
+```
+
+**Result**:
+```text
+test result: ok. 1 passed; finished in 3.90s
+- Model: Qwen3-4B-GPTQ-W4A8-zpfix (qzeros-fixed default)
+- Pass 3 prefill warmup: 1572ms (4 batch sizes, max 4)
+- CUDA Graph warmup total: 2141ms
+- Generated 16 tokens for 4-token prompt
+```
+
+§8.1 SKILL #38 evidence reaches **n=4** for clamping discipline:
+| Run | Config | Pass 3 cost |
+|---|---|---|
+| greedy_consistency (§2 above) | max=4 batch sizes | 368ms |
+| **e2e test (this) ** | **max=4 batch sizes (with cublasLt autotune)** | **1572ms** |
+| Task #35 production | cap=8 batch sizes | +8186ms |
+| Task #35 production B=8 2048 tokens/row | OOM → fallback to 1024 | graceful adapt |
+
+The 4× difference between greedy (368ms) and e2e (1572ms) at "same"
+max=4 is interesting — e2e includes the **Pass 2 cublasLt autotune
+re-capture** (visible at warmup.rs:153 in log: "Re-captured 4 graphs
+with autotuned GEMM algorithms"). Pass 3 cost varies by what Pass 2
+already did, validates substrate's layered architecture.
+
+§8.2 Both Task #48 verification tests INDEPENDENTLY CONFIRMED:
+- ✅ test_w4a8_vs_bf16_token_diff (32/32 tokens, 0.0% diff)
+- ✅ test_e2e_w4a8_marlin_optional (16-token e2e PASS in 3.90s)
+
+Both use new qzeros-fixed default `Qwen3-4B-GPTQ-W4A8-zpfix`. Codex's
+8d1caad fix LANDED + double-verified by Claude bench.
