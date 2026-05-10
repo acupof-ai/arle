@@ -27,7 +27,10 @@ use infer::server_engine::CompletionStreamDelta;
 use infer::tokenizer::Tokenizer;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
-const W4A8_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B-W4A8-marlin");
+const W4A8_MODEL_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/models/Qwen3-4B-GPTQ-W4A8-zpfix"
+);
 
 fn get_model_path() -> String {
     std::env::var("INFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
@@ -358,12 +361,9 @@ fn test_w4a8_vs_bf16_token_diff() {
     }
 
     // Skill v1.3.0 + W4A8 wins entry rule: ≤ 1% token diff allowed.
-    // Empirically lenient threshold for first-pass quant validation; literature
-    // GPTQ/AWQ W4 papers cite < 0.5 PPL loss which translates to small token
-    // disagreement on greedy decode at low temperature.
     assert!(
-        diff_pct <= 25.0,
-        "W4A8 token diff {:.1}% exceeds 25% threshold — quantization\
+        diff_pct <= 1.0,
+        "W4A8 token diff {:.1}% exceeds 1% threshold — quantization\
          accuracy unacceptable for default-on flip.\n  BF16: {:?}\n  W4A8: {:?}",
         diff_pct,
         bf16_output,

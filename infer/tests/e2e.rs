@@ -18,7 +18,10 @@ use infer::server_engine::{
 use infer::trace_reporter::FileReporter;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
-const W4A8_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B-W4A8-marlin");
+const W4A8_MODEL_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/models/Qwen3-4B-GPTQ-W4A8-zpfix"
+);
 
 fn get_model_path() -> String {
     let model_path =
