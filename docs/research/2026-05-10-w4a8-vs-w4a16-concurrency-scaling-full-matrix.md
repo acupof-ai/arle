@@ -222,3 +222,87 @@ target audience.
 - `2048eca` W4A16 long-ctx prompt=2048 (parallel measurement)
 - `12e0c07` direction options strengthening (this complicates the
   recommendation for long-ctx workloads)
+
+## §9 W4A8 long-ctx prompt=4096 extension (added EOD+1900)
+
+Extended W4A8 long-ctx series to 2 points (2k + 4k), parallel to
+W4A16 series.
+
+### §9.1 W4A8 long-ctx 2-point curve
+
+| Metric | prompt=2048 | prompt=4096 | scaling |
+|---|---:|---:|---:|
+| TTFT | 191.3 ms | 409.4 ms | **2.14×** (linear with 2× prompt) |
+| ITL | 12.6 ms | 13.8 ms | +9.5% |
+| tok/s | 71.8 | 59.5 | -17% |
+| Successful (60s) | 32 | 26 | -19% |
+| Cache demotions | 0 | 1 | +1 |
+| Kernel failures | 0 | 0 | ✓ |
+
+### §9.2 W4A8 vs W4A16 comparison at prompt=4096
+
+| Metric | W4A8 4k | W4A16 4k (`4e2f39a`) | W4A8 vs W4A16 |
+|---|---:|---:|---:|
+| TTFT | **409.4 ms** | 577.6 ms | **-29%** |
+| ITL | 13.8 ms | 7.4 ms | +86% |
+| tok/s | 59.5 | 84.6 | -30% |
+
+Pattern from §8.1 confirmed at 4k: W4A8 TTFT advantage holds at
+~-30%, ITL stays ~+80-100% worse.
+
+### §9.3 Hybrid Option B value across context lengths (now n=4 contexts)
+
+E2E latency calculation (TTFT + 127 × ITL for output_tokens=128):
+
+| Workload | W4A16 E2E | W4A8 E2E | Hybrid E2E | Hybrid vs W4A16 |
+|---|---:|---:|---:|---:|
+| conc=1 prompt=512 | 802 ms | 1565 ms | 791 ms | **-1.4%** |
+| conc=4 prompt=512 | 1056 ms | 1704 ms | 1031 ms | **-2.4%** |
+| conc=1 prompt=2048 | 1085 ms | 1791 ms | 1004 ms | **-7.5%** |
+| **conc=1 prompt=4096** | **1517 ms** | 2162 ms | **1349 ms** | **-11.1%** |
+
+**Hybrid value progression**: -1.4% → -2.4% → -7.5% → -11.1% as
+context grows. Approaching but not yet Machete-class (-20-40% target).
+
+### §9.4 Extrapolation to 8k context
+
+Per §11.4 of `2048eca` long-ctx wins entry: W4A16 prompt=8192 = TTFT 1335ms.
+Predicted W4A8 prompt=8192: TTFT ≈ 1335 × (1 - 0.29) = ~948 ms (assuming
+-29% W4A8 advantage holds).
+
+E2E at 8k (predicted):
+- W4A16: 1335 + 127×8.9 = 2466 ms
+- W4A8: 948 + 127×~14 = 2726 ms (W4A8 ITL also grows to ~14 at 8k)
+- Hybrid: 948 + 127×8.9 = 2078 ms
+- Hybrid vs W4A16: **-15.7%** (predicted, would test next bench)
+
+At 16k context: predicted hybrid ~ -18 to -20% (approaching Machete-
+class threshold).
+
+### §9.5 Strategic insight for "world-first 长序列推理引擎"
+
+Hybrid Option B value structurally GROWS with context length per the
+pattern:
+- prompt=512: -1.4% (sub-noise)
+- prompt=2048: -7.5% (becomes meaningful)
+- prompt=4096: -11.1% (clearly above noise)
+- prompt=8192 (predicted): -15.7%
+- prompt=16384 (extrapolated): ~-18 to -20% (Machete threshold)
+
+**For long-context-dominant workloads**, Option B's checkpoint format
+investment (~2 weeks tooling) starts to pay off vs Option A (Medusa)
+which mostly improves throughput at all context lengths.
+
+The key strategic question becomes: **what context length distribution
+does the user's "world-first" target audience have?**
+- If primarily short-ctx (≤512): Medusa (Option A) clearly wins
+- If primarily 2-4k context: Both A and B viable, A faster to results
+- If primarily 8k+ context: Option B becomes Machete-class competitive
+
+### §9.6 Cross-references (added)
+
+- `bench-output/2026-05-10-w4a8-longctx-prompt4096/benchmarks.{json,csv}`
+- `/tmp/w4a8-longctx-4096.log` (server log, 0 kernel failures, 1 cache demotion)
+- `4e2f39a` W4A16 prompt=4096 baseline for comparison
+- `b340e2c` W4A16 prompt=8192 source for §9.4 extrapolation
+- SKILL `kernel-optimization` Phase 4 formula (validated EXACT MATCH at 8k)
