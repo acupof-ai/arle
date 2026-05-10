@@ -273,6 +273,41 @@ bugs each**. Pattern is consistent magnitude, not just consistent
 existence. Strong argument that codex review is the highest-yield
 verification step for non-trivial diffs.
 
+### §6.8 Re-verification layer caught 4th issue (post-review)
+
+Per codex tmux ~50min: while running targeted greedy_consistency to
+validate the post-review fixes, codex flagged a 4th issue:
+
+> 测试配置 max_seq_len=512 但 chunked_prefill_size=4096
+> [test config max_seq_len=512 but chunked_prefill_size=4096]
+> ...
+> 把 warmup token cap 再夹到 effective_max_seq_len，避免测试/小窗口
+> 启动时 warming 不可能进入的形状
+> [cap warmup token to effective_max_seq_len, avoid warming shapes
+> the test/small window can't reach at startup]
+
+Codex applied the cap, rebuilt + clippy PASS in 7.02s (~52min).
+
+This is the **4th substantial issue** caught in Task #35 cycle:
+- Issue #1-#3: codex review (sync, chunked_prefill_size, temp-context)
+- Issue #4: codex re-verification (max_seq_len cap on warmup budget)
+
+**Layered discipline pattern emerges**: codex review catches design
+bugs that formal gates miss; codex re-verification (re-running tests
+on the post-review code) catches integration bugs that emerge from
+fix interaction. Both have value. Both are load-bearing.
+
+**Generalization (single-evidence skill candidate #38, not codifying
+yet per accumulation policy)**: "warmup target shape budget should be
+clamped to effective workload shape budget; warming unreachable shapes
+is dead work that may also expose perf/correctness anomalies in
+test-config small-window setups."
+
+Watch-list: when codex implements Task #47 H1' refactor, check whether
+PF8Scratch sizing is similarly clamped (max_m, max_n, max_k vs
+effective workload max_seq_len etc). If H1' design needs the same
+clamp guard → n=2 evidence for #38.
+
 ## §7 SKILL #33 reinforcement candidate (n=2 evidence)
 
 Originally codified in `0be7220` v1.12.0 from PF8.3 substrate session
