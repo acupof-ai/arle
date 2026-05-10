@@ -5,9 +5,17 @@
 > specifies the concrete pickup so codex can start the moment user
 > approves Option A (Medusa) per `9735b47` REFUTATION pivot.
 >
-> **Status**: AWAITING USER GO. Do not pickup until user confirms
-> dataset (Alpaca vs lmsys-chat-1m) + target model (Qwen3-4B vs
-> Qwen3.6) + integration target (CUDA vs Metal first).
+> **Status (2026-05-10)**: PAUSED after user re-scoped pickup away
+> from Qwen3/Qwen3.6 and toward Qwen3.5. Do not implement this brief as
+> written. Qwen3.5 Step 0 audit found a recurrent-state rollback blocker:
+> Medusa verification can roll back paged KV today, but not Qwen3.5
+> linear-attention recurrent state. See
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md` and
+> `docs/experience/errors/2026-05-10-medusa-qwen35-recurrent-rollback-blocker.md`.
+
+> **Historical note**: the remaining sections below describe the older
+> Qwen3/Qwen3.6 pickup shape. Treat them as prior context, not an active
+> Qwen3.5 implementation directive.
 
 ---
 

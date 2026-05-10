@@ -11,6 +11,13 @@
 >
 > Codex own (training + substrate). Plan ready for pickup.
 
+> **2026-05-10 scope update**: Qwen3-specific execution is frozen by user
+> direction. The Qwen3.5 path is not a direct transplant of this plan:
+> Step 0 audit found a recurrent-state rollback blocker in the CUDA
+> Qwen3.5 hybrid model. Do not expose Qwen3.5 Medusa until the verifier
+> has a model-owned accepted-length commit/rollback contract. See
+> `docs/research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`.
+
 ## Phase 1 — Target
 
 | Field | Value |
