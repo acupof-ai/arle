@@ -1,6 +1,12 @@
 # M_quant — W4A16 / W4A8 hybrid dispatch by prefill-vs-decode phase
 
-**Status:** P1 plan — proposal opened by `b5889b3` empirical finding
+**Status:** P1 plan — proposal opened by `b5889b3`;
+**§5 -14% E2E PREDICTION VALIDATED by `9735b47` REFUTATION measurement
+at conc=1 prompt=16384** (-14.2% measured = EXACT MATCH, per `bccf1bd`
+consistency audit). Post-REFUTATION strategic role: "auxiliary -14%
+win that STACKS with Medusa Option A" — combined ~2.61× tok/s + -14%
+latency per `bccf1bd` §4 + `e60046b` §5. Per `15c16a4` final priority
+table = P1 component (with Medusa).
 **Owner:** TBD(codex impl,Claude planning)
 **Effort:** estimate 1-2 days codex(~150-300 LOC)+ 0.5d bench
 **Trigger:** `b5889b3` W4A8 LICENSED prefill / DEFERRED decode + W4A16 LICENSED decode finding
