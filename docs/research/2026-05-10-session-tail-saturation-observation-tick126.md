@@ -77,6 +77,12 @@ accumulation churn.
 5-6 candidates ready for graduation at next SKILL bump (when
 additional evidence accumulates).
 
+## §6.1 Tick 128 (countdown 1/3) — saturation persists, no state change
+
+3-state scan: codex idle, GPU empty (1293 MiB / 0%), local clean.
+Loop arg references 5-doc Medusa pickup chain (subset of actual
+24-doc decision chain). Countdown to cadence-expansion graduation: 2 more.
+
 ## §6 Tick 127 follow-up — saturation persists
 
 State unchanged from §1: codex still IDLE 8+hr, no user response to
