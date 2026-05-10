@@ -113,3 +113,58 @@ When benching long-context paths in ARLE:
 - SKILL `kernel-optimization` Phase 4 formula prediction
 - SKILL `kernel-optimization` v1.12.0+ #34b (server log first — caught
   prior config issue in 1 tick)
+
+## §10 Follow-up: prompt=4096 extends to n=3 scaling curve (added EOD+1700)
+
+Per §"Suggested next ticks" — extended bench to prompt=4096 with
+`--max-seq-len 16384`.
+
+### §10.1 Result table (3-point scaling)
+
+| Prompt | TTFT mdn | TTFT scale vs 512 | ITL mdn | ITL Δ% | tok/s mean | req/s mean |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 66.0 ms | 1.0× | 5.8 ms | baseline | 159.6 | 1.25 |
+| 2048 | 272.1 ms | 4.12× | 6.4 ms | +10% | 117.6 | 0.91 |
+| **4096** | **577.6 ms** | **8.75×** | **7.4 ms** | **+28%** | **84.6** | **0.65** |
+
+- 0 kernel failures across all 3 points
+- prompt=4096 server log shows 1 prefix cache demotion event
+  (1792 GPU blocks reclaimed) — memory pressure visible at 4k context
+  with default num_slots, but graceful via SKILL #38 clamp pattern
+
+### §10.2 Scaling analysis (3-point fit)
+
+**TTFT**: slightly super-linear at 8× prompt (66 → 577.6 = 8.75×).
+- Pure linear would predict 528 ms (66 × 8); actual 577.6 = +9% over linear
+- Hypothesis (n=1, untested): KV cache bandwidth growth at chunked
+  prefill boundary (chunk_size=2048) adds small per-chunk overhead at
+  larger prompts; OR cache demotion event added latency
+- Refined formula: TTFT(prompt) ≈ 0.13 × prompt + ~10% chunk overhead
+  beyond chunk_size
+
+**ITL**: also slightly super-linear (5.8 → 6.4 → 7.4):
+- 2k → 4k context: +16% ITL (5.8→7.4 = +28% from baseline)
+- KV bandwidth cost grows with KV cache size linearly, but only a
+  small fraction of total decode cost
+
+**tok/s**: drops -47% from baseline at 4k vs -26% at 2k:
+- Compounds with prefill cost — each request is ~10× longer wall-clock
+  at 4k vs 512, fewer requests fit in 60s window
+
+### §10.3 Implications for "world-first 长序列推理引擎"
+
+3-point curve enables extrapolation:
+- 8k context: TTFT ≈ 1.2-1.4 s (super-linear continues), ITL ≈ 8-9 ms
+- 16k context: TTFT ≈ 2.5-3.5 s, ITL ≈ 10-12 ms
+- 32k context (Qwen3-4B native): TTFT ≈ 6-8 s, ITL ≈ 14-18 ms
+
+**Memory pressure trigger** at 4k with default config — would need
+`--num-slots` reduction OR `--max-seq-len` increase to avoid demotion
+events at 8k+ contexts. Per Task #43 errors entry, demotion at sustained
+load was the original Task #43 trigger; now reproduced at single-stream
+4k.
+
+### §10.4 Cross-references (added)
+
+- `bench-output/2026-05-10-w4a16-longctx-prompt4096/benchmarks.{json,csv}`
+- `/tmp/w4a16-longctx-4096.log` (server log, 0 kernel failures, 1 prefix cache demotion)
