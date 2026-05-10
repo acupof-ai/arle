@@ -117,3 +117,16 @@ handling. This is the "right" fix but requires bisecting the call chain.
   to confirm fix vs single-request lucky-PASS
 - Total: ~40 min for codex pickup → PF8.5 license-decision-grade
   numbers
+
+## §6 H8 build timing observation (2026-05-10 08:12 update)
+
+cargo build --release with H8 diagnostic patch (81672c3) takes longer
+than initial bench v3-v10 builds because:
+- Adding `#include <stdio.h>` to marlin_w4_fp8_kernel.cu invalidates
+  the file's incremental compile cache
+- nvcc re-compiles the file from scratch including marlin_pf8/marlin_template.h
+  (2081 LOC of templates)
+- Total expected: 5-10 min for this re-compile
+
+cargo PID 1950646 started 08:08, binary mtime still 07:12 at 08:12 (~4
+min in). ETA build complete: 08:14-15. Run pf83_h8_verify.sh after.
