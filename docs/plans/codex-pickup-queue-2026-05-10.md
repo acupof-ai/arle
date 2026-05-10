@@ -343,3 +343,14 @@ Replaces stale `codex-pickup-queue-2026-05-09.md`. Update
   greedy_consistency.rs:30 — codex Task #48 wrap should fix both
   test files (or extract to shared constant). Skill candidate
   enhancement to #29 documented.
+- **2026-05-10 ~10:46 KST MODEL INVENTORY** (Claude `ls infer/models/`
+  this tick): 3 W4A8 variants exist locally:
+  1. `Qwen3-4B-W4A8-marlin` — the broken naive default per eb2b4b6
+  2. `Qwen3-4B-GPTQ-W4A8-marlin` — eb2b4b6 recommended calibrated
+  3. `Qwen3-4B-GPTQ-W4A8-zpfix` — zpfix variant codex is testing now
+  Plus W4A16 + Int4 variants for adjacent paths. Codex picked variant
+  #3 (zpfix, NOT eb2b4b6's #2 recommendation) — possibly because
+  zpfix is the newest/most calibrated. If #3 passes, it's the
+  preferred recommendation; if #3 also fails, fall back to #2 per
+  eb2b4b6. If both #2 and #3 fail, then there IS a code regression
+  beyond the fixture issue.
