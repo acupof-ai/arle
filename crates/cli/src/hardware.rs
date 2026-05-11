@@ -103,7 +103,13 @@ impl SystemInfo {
                 } => *unified_memory_gb * 0.75, // leave headroom for OS
                 _ => 0.0,
             },
-            CompiledBackend::Cpu => self.available_ram_gb,
+            CompiledBackend::Cpu => {
+                if self.available_ram_gb > 0.0 {
+                    self.available_ram_gb
+                } else {
+                    self.total_ram_gb * 0.75
+                }
+            }
             #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
             CompiledBackend::None => 0.0,
         }

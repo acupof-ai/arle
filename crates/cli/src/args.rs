@@ -82,6 +82,15 @@ impl BackendArg {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ServeBackendArg {
+    Auto,
+    Cpu,
+    Metal,
+    Cuda,
+    Sglang,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum ModelFamilyArg {
     Auto,
     Qwen35,
@@ -332,7 +341,7 @@ pub(crate) struct RunArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "This is a thin front door over the backend serving binaries shipped in release artifacts.\nIt looks for `infer`, `metal_serve`, or `cpu_serve` next to the current `arle` binary first, then on PATH.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend cuda --model-path /models/Qwen3-4B -- --num-slots 8"
+    after_help = "This is a thin front door over the backend serving binaries shipped in release artifacts.\nIt looks for `infer`, `metal_serve`, or `cpu_serve` next to the current `arle` binary first, then on PATH. The `sglang` backend launches `python3 -m sglang.launch_server` and forwards flags after `--`.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend cuda --model-path /models/Qwen3-4B -- --num-slots 8\n  arle serve --backend sglang --model-path /models/DeepSeek-V3.2 --bind 0.0.0.0 -- --served-model-name /DeepSeek-V4-Flash --tp 8 --dp 8 --ep 8"
 )]
 pub(crate) struct ServeArgs {
     /// Model directory or HuggingFace model ID. Defaults to the top-level --model-path.
@@ -340,8 +349,8 @@ pub(crate) struct ServeArgs {
     pub(crate) model_path: Option<String>,
 
     /// Serving backend to launch; `auto` selects the compiled backend.
-    #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
-    pub(crate) backend: BackendArg,
+    #[arg(long, value_enum, default_value_t = ServeBackendArg::Auto)]
+    pub(crate) backend: ServeBackendArg,
 
     /// Port to listen on.
     #[arg(long, default_value_t = 8000)]
@@ -1241,7 +1250,7 @@ mod tests {
         .expect("serve command should parse");
         match args.command.expect("serve command") {
             CliCommand::Serve(serve) => {
-                assert_eq!(serve.backend, super::BackendArg::Cpu);
+                assert_eq!(serve.backend, super::ServeBackendArg::Cpu);
                 assert_eq!(serve.model_path.as_deref(), Some("models/tiny"));
                 assert_eq!(serve.port, 8010);
                 assert_eq!(serve.extra_args, ["--max-waiting", "8"]);
