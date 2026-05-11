@@ -152,14 +152,14 @@ Latest benchmark snapshots (per change, dated): [docs/experience/wins/](docs/exp
 |---|---|
 | `arle` (no args) | Interactive agent REPL with built-in `python` and `shell` tools (sandboxed). |
 | `arle run --prompt "…"` / `--stdin --json` | Script-friendly one-shot agent prompt. Use `--no-tools` to disable tool execution. |
-| `arle serve --backend {cuda,metal,cpu} --model-path …` | Launch the OpenAI-compatible HTTP server. |
+| `arle serve --backend {cuda,metal,cpu,sglang} --model-path …` | Launch the OpenAI-compatible HTTP server or the SGLang server fronted by `arle`. |
 | `arle train {pretrain,sft,grpo,multi-turn,eval}` | In-tree training and RL workflows on the same runtime. |
 | `arle data {download,convert}` | Dataset utilities. |
 | `arle --doctor [--json] [--strict]` | Self-check: backend, hardware, HF cache, model resolution. CI-friendly. |
 
 The REPL persists line history at `~/.arle-history` and exposes slash commands: `/help`, `/reset`, `/clear`, `/tools`, `/model`, `/stats`, `/models`, `/save`, `/load`, `/export`.
 
-Operators who want only the serving binary can use `infer` directly (`cargo build -p infer --release --features cuda` on Linux, `--features metal,no-cuda` on Apple Silicon) — same HTTP contract, without the agent / train / data surface.
+Operators who want only the native serving binary can use `infer` directly (`cargo build -p infer --release --features cuda` on Linux, `--features metal,no-cuda` on Apple Silicon) — same HTTP contract, without the agent / train / data surface. For SGLang-backed DeepSeek EP bring-up, use `arle serve --backend sglang --model-path /models/DeepSeek-V3.2 --bind 0.0.0.0 -- --served-model-name /DeepSeek-V4-Flash --tp 8 --dp 8 --ep 8` and pass the rest of the SGLang flags after `--`.
 
 ---
 
