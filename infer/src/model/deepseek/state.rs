@@ -23,6 +23,8 @@ use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 pub struct DeepseekState {
     #[cfg(feature = "cuda")]
     pub(crate) base: GenerationStateBase,
+    #[cfg(feature = "cuda")]
+    pub(crate) decode_logits: DeviceVec,
 }
 
 // SAFETY: identical invariant to `Qwen3State` — every `DeepseekState` is owned
@@ -35,13 +37,7 @@ unsafe impl Send for DeepseekState {}
 #[cfg(feature = "cuda")]
 impl GenerationState for DeepseekState {
     fn logits(&self) -> &DeviceVec {
-        // Without the V4 decode-buffer surface in place yet, we can only
-        // return prefill logits if `forward_prefill` ever populated them.
-        // Until Phase 2A lands the scheduler should not call this.
-        self.base
-            .prefill_logits
-            .as_ref()
-            .expect("DeepSeek V4 logits accessed before forward kernels landed")
+        self.base.logits_or(&self.decode_logits)
     }
 
     fn reset(&mut self) -> Result<()> {
