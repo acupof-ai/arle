@@ -1,74 +1,39 @@
-// DSV4 nano pretrain driver.
+// DSV4 V4 checkpoint training bootstrap.
 //
-// This command owns the train-side DeepSeek nano smoke path: random-init the
-// dense MLA nano config, train it on a plain-text corpus with autograd, and
-// save an infer-shaped checkpoint directory (`model.safetensors`,
-// `config.json`, `generation_config.json`, `tokenizer.json`). SKU-A/B stay on
-// the external cold-path pretrain track from the substrate plan.
+// The only supported DeepSeek train target is the local HF-compatible
+// DeepseekV4ForCausalLM 1B init checkpoint. This command validates that
+// checkpoint, tokenizer, and corpus shape, then publishes an explicit
+// step_000000 seed run directory. It intentionally does not keep the deleted
+// V3/nano random-init training path alive.
 
-use std::{fs, path::PathBuf, str::FromStr, sync::Arc};
-
-use autograd::{
-    AutogradError, ConstantLr, Result as AutogradResult, SafetensorsRegistry, Tape, TensorStore,
+use std::{
+    collections::{BTreeSet, HashSet},
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
 };
-use deepseek_spec::DeepSeekConfig;
+
+use deepseek_spec::{
+    DeepSeekConfigError, DeepSeekV4AttentionTensorNames, DeepSeekV4Config,
+    DeepSeekV4HyperConnectionTensorNames, DeepSeekV4MoeTensorNames, DeepSeekV4MtpTensorNames,
+};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
-    StepCtx, StepOutcome, Trainer, TrainerConfig,
-    causal_lm::{live_tensor_ids, trainable_param_name_map, trainable_params},
     checkpoint::publish_latest_after_weights,
-    cli_args::{ArgError, BackendChoice, SaveDtype, adamw_for_backend, next_value, parse_value},
-    dataset::LcgRng,
-    deepseek::DeepseekNanoModel,
-    grad_clip::GlobalNorm,
-    metrics::NullSink,
+    cli_args::{ArgError, BackendChoice, SaveDtype, next_value, parse_value},
     tokenizer::ChatTokenizer,
-    trainer::cross_entropy_loss,
 };
 
-const DEFAULT_BETAS: (f32, f32) = (0.9, 0.95);
-const DEFAULT_EPS: f32 = 1.0e-8;
-const DEFAULT_WEIGHT_DECAY: f32 = 0.1;
-
-/// DSV4 SKU selector. Only `nano` is wired in-tree; larger SKUs remain an
-/// external cold-path pretrain concern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeepseekSku {
-    Nano,
-}
-
-impl FromStr for DeepseekSku {
-    type Err = DsV4PretrainError;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input {
-            "nano" => Ok(Self::Nano),
-            other => Err(DsV4PretrainError::UnknownSku(other.to_string())),
-        }
-    }
-}
-
-impl DeepseekSku {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Nano => "nano",
-        }
-    }
-
-    pub fn build_config(self) -> DeepSeekConfig {
-        match self {
-            Self::Nano => DeepSeekConfig::nano(),
-        }
-    }
-}
+const DEFAULT_MODEL_DIR: &str = "infer/models/dsv4-mini-1B-init";
 
 /// Parsed CLI for `arle train pretrain-dsv4`.
 #[derive(Debug, Clone)]
 pub struct CliArgs {
-    pub sku: DeepseekSku,
+    pub model: PathBuf,
     pub corpus: PathBuf,
-    pub tokenizer: PathBuf,
+    pub tokenizer: Option<PathBuf>,
     pub out: PathBuf,
     pub seed: u64,
     pub steps: usize,
@@ -84,15 +49,15 @@ pub struct CliArgs {
 impl Default for CliArgs {
     fn default() -> Self {
         Self {
-            sku: DeepseekSku::Nano,
+            model: PathBuf::from(DEFAULT_MODEL_DIR),
             corpus: PathBuf::new(),
-            tokenizer: PathBuf::new(),
+            tokenizer: None,
             out: PathBuf::new(),
             seed: 0xC0FFEE,
             steps: 10,
             batch: 1,
-            seq: 64,
-            lr: 3.0e-4,
+            seq: 128,
+            lr: 1.0e-5,
             log_every: 1,
             save_every: 10,
             backend: BackendChoice::Cpu,
@@ -105,8 +70,6 @@ impl Default for CliArgs {
 pub enum DsV4PretrainError {
     #[error("missing required argument: {0}")]
     MissingArg(&'static str),
-    #[error("unknown DSV4 SKU `{0}` — only `nano` is wired today")]
-    UnknownSku(String),
     #[error("argument `{flag}` requires a value")]
     MissingValue { flag: String },
     #[error("argument `{flag}` value `{value}` is not a valid {kind}")]
@@ -118,9 +81,29 @@ pub enum DsV4PretrainError {
     #[error(transparent)]
     Arg(#[from] ArgError),
     #[error(transparent)]
-    Autograd(#[from] AutogradError),
+    Config(#[from] DeepSeekConfigError),
     #[error("{0}")]
     Custom(String),
+}
+
+#[derive(Debug, Serialize)]
+struct Dsv4TrainBootstrapManifest {
+    model_dir: String,
+    config: String,
+    tokenizer: String,
+    corpus: String,
+    checkpoint: String,
+    tensor_count: usize,
+    required_tensor_count: usize,
+    corpus_tokens: usize,
+    requested_steps: usize,
+    batch: usize,
+    seq: usize,
+    lr: f32,
+    seed: u64,
+    backend: String,
+    save_dtype: String,
+    status: String,
 }
 
 pub fn parse_args_from<I>(args: I) -> Result<CliArgs, DsV4PretrainError>
@@ -132,11 +115,23 @@ where
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--model" => {
+                args_out.model =
+                    PathBuf::from(iter.next().ok_or_else(|| DsV4PretrainError::MissingValue {
+                        flag: arg.to_string(),
+                    })?);
+            }
             "--deepseek-config" => {
                 let value = iter.next().ok_or_else(|| DsV4PretrainError::MissingValue {
                     flag: arg.to_string(),
                 })?;
-                args_out.sku = value.parse()?;
+                if value != "v4-1b-init" && value != "dsv4-mini-1b-init" {
+                    return Err(DsV4PretrainError::InvalidValue {
+                        flag: arg.to_string(),
+                        value,
+                        kind: "v4-1b-init",
+                    });
+                }
             }
             "--corpus" => {
                 args_out.corpus =
@@ -145,10 +140,11 @@ where
                     })?);
             }
             "--tokenizer" => {
-                args_out.tokenizer =
-                    PathBuf::from(iter.next().ok_or_else(|| DsV4PretrainError::MissingValue {
+                args_out.tokenizer = Some(PathBuf::from(iter.next().ok_or_else(|| {
+                    DsV4PretrainError::MissingValue {
                         flag: arg.to_string(),
-                    })?);
+                    }
+                })?));
             }
             "--out" => {
                 args_out.out =
@@ -196,9 +192,6 @@ where
     if args_out.corpus.as_os_str().is_empty() {
         return Err(DsV4PretrainError::MissingArg("--corpus"));
     }
-    if args_out.tokenizer.as_os_str().is_empty() {
-        return Err(DsV4PretrainError::MissingArg("--tokenizer"));
-    }
     if args_out.out.as_os_str().is_empty() {
         return Err(DsV4PretrainError::MissingArg("--out"));
     }
@@ -220,13 +213,41 @@ fn run(args: &CliArgs) -> Result<(), DsV4PretrainError> {
         DsV4PretrainError::Custom(format!("create output dir {}: {err}", args.out.display()))
     })?;
 
-    let tokenizer = ChatTokenizer::from_file(&args.tokenizer)
+    let config_path = args.model.join("config.json");
+    let cfg = DeepSeekV4Config::from_json_file(&config_path)?;
+    let tokenizer_path = args
+        .tokenizer
+        .clone()
+        .unwrap_or_else(|| args.model.join("tokenizer.json"));
+    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)
         .map_err(|err| DsV4PretrainError::Custom(format!("tokenizer: {err}")))?;
-    let cfg = args.sku.build_config();
+    if tokenizer.vocab_size() != cfg.vocab_size {
+        return Err(DsV4PretrainError::Custom(format!(
+            "tokenizer vocab {} does not match DSV4 config vocab {}",
+            tokenizer.vocab_size(),
+            cfg.vocab_size
+        )));
+    }
     if args.seq > cfg.max_position_embeddings {
         return Err(DsV4PretrainError::Custom(format!(
-            "--seq {} exceeds DeepSeek nano context {}",
+            "--seq {} exceeds DSV4 context {}",
             args.seq, cfg.max_position_embeddings
+        )));
+    }
+
+    let available = safetensor_names(&args.model)?;
+    let required = required_v4_tensor_names(&cfg);
+    let missing = required
+        .iter()
+        .filter(|name| !available.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(DsV4PretrainError::Custom(format!(
+            "{} is missing {} required DSV4 tensor(s): {}",
+            args.model.display(),
+            missing.len(),
+            missing.join(", ")
         )));
     }
 
@@ -243,198 +264,250 @@ fn run(args: &CliArgs) -> Result<(), DsV4PretrainError> {
             args.seq
         )));
     }
-    if token_ids.iter().any(|&id| id as usize >= cfg.vocab_size) {
-        return Err(DsV4PretrainError::Custom(format!(
-            "tokenizer produced ids outside DeepSeek nano vocab {}",
-            cfg.vocab_size
-        )));
-    }
 
-    let backend = args.backend.build_backend_or_cpu("pretrain-dsv4")?;
-    let mut store = TensorStore::with_backend(Arc::clone(&backend));
-    let mut tape = Tape::new();
-    let model = DeepseekNanoModel::new(&cfg, &mut store)
-        .map_err(|err| DsV4PretrainError::Custom(err.to_string()))?;
-    let params = trainable_params(&model, &store);
-    let param_names = trainable_param_name_map(&model, &store);
-    let model_ids = live_tensor_ids(&store);
-    let position_ids = (0..args.seq).collect::<Vec<_>>();
-    let batch = args.batch.max(1);
-    let window = args.seq + 1;
-    let upper = token_ids.len() - window + 1;
-    let mut rng = LcgRng::seed(args.seed);
-    let mut train_input_ids = Vec::with_capacity(batch * args.seq);
-    let mut train_targets = Vec::with_capacity(batch * args.seq);
-
-    println!(
-        "[pretrain-dsv4] sku={} backend={} steps={} batch={} seq={} lr={} params={:.2}M corpus_tokens={} out={}",
-        args.sku.as_str(),
-        args.backend.as_str(),
-        args.steps,
-        batch,
-        args.seq,
-        args.lr,
-        params
-            .iter()
-            .map(|&id| store.get(id).map_or(0, |tensor| tensor.size))
-            .sum::<usize>() as f64
-            / 1_000_000.0,
-        token_ids.len(),
-        args.out.display(),
-    );
-
-    let optim = adamw_for_backend(
-        args.lr,
-        DEFAULT_BETAS,
-        DEFAULT_EPS,
-        DEFAULT_WEIGHT_DECAY,
-        Arc::clone(&backend),
-    );
-    let mut trainer = Trainer::new(
-        optim,
-        GlobalNorm::new(1.0),
-        ConstantLr(args.lr),
-        Box::new(NullSink),
-        TrainerConfig {
-            total_steps: args.steps as u64,
-            grad_accum_steps: 1,
-            log_every: args.log_every.max(1) as u64,
-            eval_every: None,
-            save_every: Some(args.save_every.max(1) as u64),
-            save_dir: Some(args.out.clone()),
-            resume_from: None,
-            rng_seed: args.seed,
-        },
-    );
-
-    let step_fn = |ctx: &mut StepCtx<'_>| -> AutogradResult<StepOutcome> {
-        train_input_ids.clear();
-        train_targets.clear();
-        for _ in 0..batch {
-            let start = (rng.next_u64() % upper as u64) as usize;
-            let slice = &token_ids[start..start + window];
-            train_input_ids.extend(slice[..args.seq].iter().map(|&id| id as usize));
-            train_targets.extend(slice[1..].iter().map(|&id| id as usize));
-        }
-        let logits = model
-            .forward_batch_tokens_with_positions(
-                &train_input_ids,
-                &position_ids,
-                batch,
-                ctx.store,
-                ctx.tape,
-            )
-            .map_err(|err| {
-                AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
-            })?;
-        let loss_id = cross_entropy_loss(logits, &train_targets, ctx.store, ctx.tape)?;
-        Ok(StepOutcome {
-            loss_id,
-            token_count: (batch * args.seq) as u64,
-        })
-    };
-
-    let out_dir = args.out.clone();
-    let tokenizer_path = args.tokenizer.clone();
-    let cfg_for_save = cfg.clone();
-    let save_dtype = args.save_dtype;
-    let on_step_end = |step: u64, store: &mut TensorStore| -> AutogradResult<()> {
-        if step.is_multiple_of(args.save_every.max(1) as u64) || step == args.steps as u64 {
-            save_checkpoint(
-                &out_dir,
-                step as usize,
-                &model,
-                store,
-                &cfg_for_save,
-                &tokenizer_path,
-                save_dtype,
-            )
-            .map_err(|err| {
-                AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
-            })?;
-        }
-        Ok(())
-    };
-
-    trainer.run_with_hooks(
-        &mut store,
-        &mut tape,
-        params,
-        param_names,
-        model_ids,
-        step_fn,
-        on_step_end,
-    )?;
-    Ok(())
-}
-
-fn save_checkpoint(
-    out_dir: &std::path::Path,
-    step: usize,
-    model: &DeepseekNanoModel,
-    store: &mut TensorStore,
-    cfg: &DeepSeekConfig,
-    tokenizer_path: &std::path::Path,
-    save_dtype: SaveDtype,
-) -> Result<(), DsV4PretrainError> {
-    let basename = format!("step_{step:06}");
-    let step_dir = out_dir.join(&basename);
+    let step_dir = args.out.join("step_000000");
     fs::create_dir_all(&step_dir).map_err(|err| {
         DsV4PretrainError::Custom(format!(
             "create checkpoint dir {}: {err}",
             step_dir.display()
         ))
     })?;
-
-    let weights_path = step_dir.join("model.safetensors");
-    let mut registry = SafetensorsRegistry::new();
-    for (name, tensor_id) in model.param_name_map() {
-        registry.insert(name, tensor_id);
-    }
-    match save_dtype {
-        SaveDtype::F32 => registry.save_from(store, &weights_path)?,
-        SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
-    }
-
-    let config = serde_json::to_string_pretty(cfg)
-        .map_err(|err| DsV4PretrainError::Custom(format!("serialize config: {err}")))?;
-    fs::write(step_dir.join("config.json"), config).map_err(|err| {
-        DsV4PretrainError::Custom(format!(
-            "write config.json in {}: {err}",
-            step_dir.display()
-        ))
+    fs::copy(&config_path, step_dir.join("config.json")).map_err(|err| {
+        DsV4PretrainError::Custom(format!("copy {}: {err}", config_path.display()))
     })?;
-    let generation_config = serde_json::json!({
-        "bos_token_id": cfg.bos_token_id,
-        "eos_token_id": cfg.eos_token_id,
-    });
+    fs::copy(&tokenizer_path, step_dir.join("tokenizer.json")).map_err(|err| {
+        DsV4PretrainError::Custom(format!("copy {}: {err}", tokenizer_path.display()))
+    })?;
+    link_or_copy_weights(
+        &args.model.join("model.safetensors"),
+        &step_dir.join("model.safetensors"),
+    )?;
+
+    let manifest = Dsv4TrainBootstrapManifest {
+        model_dir: args.model.display().to_string(),
+        config: step_dir.join("config.json").display().to_string(),
+        tokenizer: step_dir.join("tokenizer.json").display().to_string(),
+        corpus: args.corpus.display().to_string(),
+        checkpoint: step_dir.join("model.safetensors").display().to_string(),
+        tensor_count: available.len(),
+        required_tensor_count: required.len(),
+        corpus_tokens: token_ids.len(),
+        requested_steps: args.steps,
+        batch: args.batch,
+        seq: args.seq,
+        lr: args.lr,
+        seed: args.seed,
+        backend: args.backend.as_str().to_string(),
+        save_dtype: format!("{:?}", args.save_dtype),
+        status: "seeded-v4-1b-init-checkpoint; optimizer update path pending V4 autograd/runtime forward"
+            .to_string(),
+    };
     fs::write(
-        step_dir.join("generation_config.json"),
-        serde_json::to_string_pretty(&generation_config).unwrap(),
+        step_dir.join("dsv4_train_manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
     )
     .map_err(|err| {
         DsV4PretrainError::Custom(format!(
-            "write generation_config.json in {}: {err}",
+            "write dsv4_train_manifest.json in {}: {err}",
             step_dir.display()
         ))
     })?;
-    fs::copy(tokenizer_path, step_dir.join("tokenizer.json")).map_err(|err| {
-        DsV4PretrainError::Custom(format!(
-            "copy tokenizer {} into {}: {err}",
-            tokenizer_path.display(),
-            step_dir.display()
-        ))
+    publish_latest_after_weights(&args.out, "step_000000").map_err(|err| {
+        DsV4PretrainError::Custom(format!("publish latest DSV4 checkpoint: {err}"))
     })?;
-    publish_latest_after_weights(out_dir, &basename).map_err(|err| {
-        DsV4PretrainError::Custom(format!("publish latest checkpoint {}: {err}", basename))
-    })?;
+
     println!(
-        "[pretrain-dsv4] saved step {} to {} (dtype: {:?})",
-        step,
-        step_dir.display(),
-        save_dtype,
+        "[pretrain-dsv4] model={} tokens={} tensors={}/{} out={} status=seeded-v4-1b-init",
+        args.model.display(),
+        token_ids.len(),
+        required.len(),
+        available.len(),
+        args.out.display()
     );
     Ok(())
+}
+
+fn link_or_copy_weights(src: &Path, dst: &Path) -> Result<(), DsV4PretrainError> {
+    if dst.exists() {
+        fs::remove_file(dst).map_err(|err| {
+            DsV4PretrainError::Custom(format!("remove existing {}: {err}", dst.display()))
+        })?;
+    }
+    fs::hard_link(src, dst)
+        .or_else(|_| fs::copy(src, dst).map(|_| ()))
+        .map_err(|err| {
+            DsV4PretrainError::Custom(format!(
+                "link or copy model weights {} -> {}: {err}",
+                src.display(),
+                dst.display()
+            ))
+        })
+}
+
+fn safetensor_names(model_path: &Path) -> Result<HashSet<String>, DsV4PretrainError> {
+    let mut names = HashSet::new();
+    for path in safetensor_paths(model_path)? {
+        let mut file = fs::File::open(&path)
+            .map_err(|err| DsV4PretrainError::Custom(format!("open {}: {err}", path.display())))?;
+        let mut len_bytes = [0_u8; 8];
+        file.read_exact(&mut len_bytes).map_err(|err| {
+            DsV4PretrainError::Custom(format!(
+                "read safetensors header len {}: {err}",
+                path.display()
+            ))
+        })?;
+        let header_len: usize = u64::from_le_bytes(len_bytes)
+            .try_into()
+            .map_err(|_| DsV4PretrainError::Custom("safetensors header length overflow".into()))?;
+        let mut header = vec![0_u8; header_len];
+        file.read_exact(&mut header).map_err(|err| {
+            DsV4PretrainError::Custom(format!("read safetensors header {}: {err}", path.display()))
+        })?;
+        let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+            .map_err(|err| {
+                DsV4PretrainError::Custom(format!(
+                    "parse safetensors header {}: {err}",
+                    path.display()
+                ))
+            })?;
+        for name in header.keys() {
+            if name != "__metadata__" {
+                names.insert(name.clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn safetensor_paths(model_path: &Path) -> Result<Vec<PathBuf>, DsV4PretrainError> {
+    let index_path = model_path.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let index_content = fs::read_to_string(&index_path).map_err(|err| {
+            DsV4PretrainError::Custom(format!("read {}: {err}", index_path.display()))
+        })?;
+        let index: serde_json::Value = serde_json::from_str(&index_content).map_err(|err| {
+            DsV4PretrainError::Custom(format!("parse {}: {err}", index_path.display()))
+        })?;
+        let weight_map = index["weight_map"].as_object().ok_or_else(|| {
+            DsV4PretrainError::Custom(format!("{} missing weight_map", index_path.display()))
+        })?;
+        let mut files = BTreeSet::new();
+        for shard in weight_map.values() {
+            let shard = shard.as_str().ok_or_else(|| {
+                DsV4PretrainError::Custom(format!(
+                    "{} has non-string shard path",
+                    index_path.display()
+                ))
+            })?;
+            files.insert(model_path.join(shard));
+        }
+        return Ok(files.into_iter().collect());
+    }
+
+    let single = model_path.join("model.safetensors");
+    if single.exists() {
+        return Ok(vec![single]);
+    }
+
+    Err(DsV4PretrainError::Custom(format!(
+        "{} has no model.safetensors checkpoint",
+        model_path.display()
+    )))
+}
+
+fn push_hc(out: &mut Vec<String>, names: &DeepSeekV4HyperConnectionTensorNames) {
+    out.push(names.base.clone());
+    out.push(names.mix_fn.clone());
+    out.push(names.scale.clone());
+}
+
+fn push_attention(out: &mut Vec<String>, names: &DeepSeekV4AttentionTensorNames) {
+    out.push(names.wq_a.clone());
+    out.push(names.q_norm.clone());
+    out.push(names.wq_b.clone());
+    out.push(names.wkv.clone());
+    out.push(names.kv_norm.clone());
+    out.push(names.wo_a.clone());
+    out.push(names.wo_b.clone());
+    out.push(names.attn_sink.clone());
+    if let Some(compressor) = &names.compressor {
+        out.push(compressor.wkv.clone());
+        out.push(compressor.wgate.clone());
+        out.push(compressor.ape.clone());
+        out.push(compressor.norm.clone());
+    }
+    if let Some(indexer) = &names.indexer {
+        out.push(indexer.wq_b.clone());
+        out.push(indexer.weights_proj.clone());
+        out.push(indexer.compressor.wkv.clone());
+        out.push(indexer.compressor.wgate.clone());
+        out.push(indexer.compressor.ape.clone());
+        out.push(indexer.compressor.norm.clone());
+    }
+}
+
+fn push_moe(out: &mut Vec<String>, config: &DeepSeekV4Config, names: &DeepSeekV4MoeTensorNames) {
+    out.push(names.gate_weight.clone());
+    if let Some(gate_bias) = &names.gate_bias {
+        out.push(gate_bias.clone());
+    }
+    if let Some(gate_tid2eid) = &names.gate_tid2eid {
+        out.push(gate_tid2eid.clone());
+    }
+    for expert_idx in 0..config.n_routed_experts {
+        let expert = names.expert(expert_idx);
+        out.push(expert.w1);
+        out.push(expert.w2);
+        out.push(expert.w3);
+    }
+    if let Some(shared) = &names.shared_experts {
+        out.push(shared.w1.clone());
+        out.push(shared.w2.clone());
+        out.push(shared.w3.clone());
+    }
+}
+
+fn push_mtp(out: &mut Vec<String>, config: &DeepSeekV4Config, names: &DeepSeekV4MtpTensorNames) {
+    out.push(names.enorm.clone());
+    out.push(names.hnorm.clone());
+    out.push(names.e_proj.clone());
+    out.push(names.h_proj.clone());
+    out.push(names.attn_norm.clone());
+    out.push(names.ffn_norm.clone());
+    out.push(names.norm.clone());
+    push_hc(out, &names.hc_attn);
+    push_hc(out, &names.hc_ffn);
+    push_hc(out, &names.hc_head);
+    push_attention(out, &names.attn);
+    push_moe(out, config, &names.ffn);
+}
+
+fn required_v4_tensor_names(config: &DeepSeekV4Config) -> Vec<String> {
+    let mut out = Vec::new();
+    let top = config.tensor_names();
+    out.push(top.embed_tokens().to_string());
+    out.push(top.norm().to_string());
+    out.push(top.lm_head().to_string());
+    push_hc(&mut out, &top.head_hc());
+
+    for layer_idx in 0..config.num_hidden_layers {
+        let layer = config.layer_tensor_names(layer_idx);
+        out.push(layer.attn_norm);
+        out.push(layer.ffn_norm);
+        push_hc(&mut out, &layer.hc_attn);
+        push_hc(&mut out, &layer.hc_ffn);
+        push_attention(&mut out, &layer.attn);
+        push_moe(&mut out, config, &layer.ffn);
+    }
+
+    for mtp_idx in 0..config.num_nextn_predict_layers {
+        let mtp = config.mtp_tensor_names(mtp_idx);
+        push_mtp(&mut out, config, &mtp);
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -446,29 +519,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_minimal_invocation() {
-        let parsed = parse_args_from(vec_of(&[
-            "--deepseek-config",
-            "nano",
-            "--corpus",
-            "corpus.txt",
-            "--tokenizer",
-            "tokenizer.json",
-            "--out",
-            "/tmp/dsv4-nano",
-        ]))
-        .unwrap();
+    fn parses_minimal_v4_invocation() {
+        let parsed =
+            parse_args_from(vec_of(&["--corpus", "corpus.txt", "--out", "/tmp/dsv4-v4"])).unwrap();
 
-        assert_eq!(parsed.sku, DeepseekSku::Nano);
+        assert_eq!(parsed.model, PathBuf::from(DEFAULT_MODEL_DIR));
         assert_eq!(parsed.corpus, PathBuf::from("corpus.txt"));
-        assert_eq!(parsed.tokenizer, PathBuf::from("tokenizer.json"));
-        assert_eq!(parsed.out, PathBuf::from("/tmp/dsv4-nano"));
+        assert_eq!(parsed.tokenizer, None);
+        assert_eq!(parsed.out, PathBuf::from("/tmp/dsv4-v4"));
         assert_eq!(parsed.steps, 10);
     }
 
     #[test]
-    fn parses_training_knobs() {
+    fn parses_training_bootstrap_knobs() {
         let parsed = parse_args_from(vec_of(&[
+            "--model",
+            "infer/models/dsv4-mini-1B-init",
             "--corpus",
             "corpus.txt",
             "--tokenizer",
@@ -498,44 +564,35 @@ mod tests {
         assert_eq!(parsed.save_every, 1);
         assert_eq!(parsed.backend, BackendChoice::Cpu);
         assert_eq!(parsed.save_dtype, SaveDtype::F32);
+        assert_eq!(parsed.tokenizer, Some(PathBuf::from("tokenizer.json")));
     }
 
     #[test]
-    fn defaults_sku_to_nano() {
-        let parsed = parse_args_from(vec_of(&[
-            "--corpus",
-            "corpus.txt",
-            "--tokenizer",
-            "tokenizer.json",
-            "--out",
-            "/tmp/out",
-        ]))
-        .unwrap();
-        assert_eq!(parsed.sku, DeepseekSku::Nano);
-    }
-
-    #[test]
-    fn rejects_unknown_sku() {
-        let err = parse_args_from(vec_of(&[
+    fn accepts_legacy_v4_alias_but_rejects_old_skus() {
+        parse_args_from(vec_of(&[
             "--deepseek-config",
-            "tiny-dense",
+            "v4-1b-init",
             "--corpus",
             "c",
-            "--tokenizer",
-            "t",
+            "--out",
+            "o",
+        ]))
+        .unwrap();
+        let err = parse_args_from(vec_of(&[
+            "--deepseek-config",
+            "nano",
+            "--corpus",
+            "c",
             "--out",
             "o",
         ]))
         .unwrap_err();
-        match err {
-            DsV4PretrainError::UnknownSku(name) => assert_eq!(name, "tiny-dense"),
-            other => panic!("expected UnknownSku, got {other:?}"),
-        }
+        assert!(matches!(err, DsV4PretrainError::InvalidValue { .. }));
     }
 
     #[test]
     fn requires_corpus() {
-        let err = parse_args_from(vec_of(&["--tokenizer", "t", "--out", "o"])).unwrap_err();
+        let err = parse_args_from(vec_of(&["--out", "o"])).unwrap_err();
         match err {
             DsV4PretrainError::MissingArg(name) => assert_eq!(name, "--corpus"),
             other => panic!("expected MissingArg(--corpus), got {other:?}"),

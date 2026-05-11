@@ -1,9 +1,9 @@
 //! Runtime configuration for the DeepSeek V4 model scaffold.
 //!
 //! Wraps the canonical [`deepseek_spec::DeepSeekV4Config`] with the infer-side
-//! serving knobs. The older V3-era [`deepseek_spec::DeepSeekConfig`] remains in
-//! the spec crate for train fixtures, but the runtime target for
-//! `infer/models/dsv4-mini-1B-init/` is the V4 HF checkpoint shape.
+//! serving knobs. The runtime target for `infer/models/dsv4-mini-1B-init/` is
+//! the V4 HF checkpoint shape; older DeepSeek V3/nano configs are intentionally
+//! unsupported.
 
 use std::ops::Deref;
 use std::path::Path;

@@ -114,6 +114,32 @@ impl DeepSeekV4Config {
                 "DSV4 replica expects num_key_value_heads=1",
             ));
         }
+        if self.q_lora_rank == 0
+            || self.o_lora_rank == 0
+            || self.o_groups == 0
+            || self.qk_rope_head_dim == 0
+            || self.index_n_heads == 0
+            || self.index_head_dim == 0
+            || self.index_topk == 0
+            || self.hc_mult == 0
+        {
+            return Err(DeepSeekConfigError::InvalidConfig(
+                "DSV4 low-rank, indexer, mHC, and routing dimensions must be non-zero",
+            ));
+        }
+        if self.n_routed_experts == 0
+            || self.num_experts_per_tok == 0
+            || self.moe_intermediate_size == 0
+        {
+            return Err(DeepSeekConfigError::InvalidConfig(
+                "DSV4 routed MoE dimensions must be non-zero",
+            ));
+        }
+        if self.num_experts_per_tok > self.n_routed_experts {
+            return Err(DeepSeekConfigError::InvalidConfig(
+                "num_experts_per_tok must not exceed n_routed_experts",
+            ));
+        }
         if !self.num_attention_heads.is_multiple_of(self.o_groups) {
             return Err(DeepSeekConfigError::InvalidConfig(
                 "num_attention_heads must be divisible by o_groups",
@@ -122,17 +148,6 @@ impl DeepSeekV4Config {
         if self.compress_ratios.len() != self.num_hidden_layers {
             return Err(DeepSeekConfigError::InvalidConfig(
                 "compress_ratios length must match num_hidden_layers",
-            ));
-        }
-        if self.q_lora_rank == 0
-            || self.o_lora_rank == 0
-            || self.qk_rope_head_dim == 0
-            || self.index_n_heads == 0
-            || self.index_head_dim == 0
-            || self.hc_mult == 0
-        {
-            return Err(DeepSeekConfigError::InvalidConfig(
-                "DSV4 low-rank, indexer, and mHC dimensions must be non-zero",
             ));
         }
         Ok(())
@@ -165,6 +180,363 @@ impl DeepSeekV4Config {
             _ => None,
         }
     }
+
+    pub fn attention_mode_for_compress_ratio(
+        &self,
+        compress_ratio: usize,
+    ) -> DeepSeekV4AttentionMode {
+        DeepSeekV4AttentionMode::from_compress_ratio(compress_ratio)
+    }
+
+    pub fn attention_layer_plan(&self, layer_idx: usize) -> Option<DeepSeekV4AttentionLayerPlan> {
+        let compress_ratio = *self.compress_ratios.get(layer_idx)?;
+        let mode = self.attention_mode_for_compress_ratio(compress_ratio);
+        Some(DeepSeekV4AttentionLayerPlan {
+            layer_idx,
+            compress_ratio,
+            mode,
+            hash_routing: self.moe_routing_kind(layer_idx) == DeepSeekV4MoeRoutingKind::Hash,
+            has_compressor: mode.has_compressor(),
+            has_indexer: mode.has_indexer(),
+            sliding_window: self.sliding_window,
+            index_topk: mode.has_indexer().then_some(self.index_topk),
+        })
+    }
+
+    pub fn attention_operator_summary(&self) -> DeepSeekV4AttentionOperatorSummary {
+        let mut summary = DeepSeekV4AttentionOperatorSummary::default();
+        for layer_idx in 0..self.num_hidden_layers {
+            let plan = self
+                .attention_layer_plan(layer_idx)
+                .expect("compress_ratios length validated");
+            match plan.mode {
+                DeepSeekV4AttentionMode::SlidingWindow => summary.sliding_window_layers += 1,
+                DeepSeekV4AttentionMode::CompressedSparse => summary.csa_layers += 1,
+                DeepSeekV4AttentionMode::HybridCompressed => summary.hca_layers += 1,
+            }
+            if plan.hash_routing {
+                summary.hash_routed_moe_layers += 1;
+            } else {
+                summary.bias_routed_moe_layers += 1;
+            }
+        }
+        summary
+    }
+
+    pub fn compressor_shape(&self, compress_ratio: usize) -> Option<DeepSeekV4CompressorShape> {
+        (compress_ratio > 0).then(|| {
+            let overlap = compress_ratio < 16;
+            let coeff = if overlap { 2 } else { 1 };
+            DeepSeekV4CompressorShape {
+                compress_ratio,
+                overlap,
+                wkv_rows: coeff * self.head_dim,
+                wkv_cols: self.hidden_size,
+                wgate_rows: coeff * self.head_dim,
+                wgate_cols: self.hidden_size,
+                ape_rows: compress_ratio,
+                ape_cols: coeff * self.head_dim,
+                norm_len: self.head_dim,
+            }
+        })
+    }
+
+    pub fn indexer_shape(&self, compress_ratio: usize) -> Option<DeepSeekV4IndexerShape> {
+        (self.attention_mode_for_compress_ratio(compress_ratio)
+            == DeepSeekV4AttentionMode::CompressedSparse)
+            .then(|| DeepSeekV4IndexerShape {
+                compress_ratio,
+                wq_b_rows: self.index_n_heads * self.index_head_dim,
+                wq_b_cols: self.q_lora_rank,
+                weights_proj_rows: self.index_n_heads,
+                weights_proj_cols: self.hidden_size,
+                key_head_dim: self.index_head_dim,
+                key_heads: self.index_n_heads,
+                topk: self.index_topk,
+                compressor: self
+                    .compressor_shape(compress_ratio)
+                    .expect("CSA compress_ratio must have compressor shape"),
+            })
+    }
+
+    pub fn output_projection_shape(&self) -> DeepSeekV4OutputProjectionShape {
+        let heads_per_group = self.num_attention_heads / self.o_groups;
+        DeepSeekV4OutputProjectionShape {
+            heads_per_group,
+            wo_a_rows: self.o_groups * self.o_lora_rank,
+            wo_a_cols: heads_per_group * self.head_dim,
+            wo_b_rows: self.hidden_size,
+            wo_b_cols: self.o_groups * self.o_lora_rank,
+        }
+    }
+
+    pub fn moe_routing_kind(&self, layer_idx: usize) -> DeepSeekV4MoeRoutingKind {
+        if layer_idx < self.num_hash_layers {
+            DeepSeekV4MoeRoutingKind::Hash
+        } else {
+            DeepSeekV4MoeRoutingKind::LearnedBias
+        }
+    }
+
+    pub fn router_scores_from_logits(&self, logits: &[f32]) -> Result<Vec<f32>> {
+        if logits.len() != self.n_routed_experts {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "router logits length {} does not match n_routed_experts {}",
+                logits.len(),
+                self.n_routed_experts
+            )));
+        }
+        if logits.iter().any(|value| !value.is_finite()) {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(
+                "router logits must be finite".to_string(),
+            ));
+        }
+        match self.scoring_func.as_str() {
+            "softmax" => Ok(stable_softmax(logits)),
+            "sigmoid" => Ok(logits.iter().map(|&value| sigmoid(value)).collect()),
+            "sqrtsoftplus" => Ok(logits
+                .iter()
+                .map(|&value| stable_softplus(value).sqrt())
+                .collect()),
+            _ => Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "unsupported DSV4 router scoring_func `{}`",
+                self.scoring_func
+            ))),
+        }
+    }
+
+    pub fn moe_routes_from_scores(
+        &self,
+        layer_idx: usize,
+        token_idx: usize,
+        scores: &[f32],
+        bias: Option<&[f32]>,
+        hash_experts: Option<&[usize]>,
+    ) -> Result<Vec<DeepSeekV4MoeRoute>> {
+        if scores.len() != self.n_routed_experts {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "router scores length {} does not match n_routed_experts {}",
+                scores.len(),
+                self.n_routed_experts
+            )));
+        }
+        if scores
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(
+                "router scores must be finite and non-negative".to_string(),
+            ));
+        }
+
+        let selected = match self.moe_routing_kind(layer_idx) {
+            DeepSeekV4MoeRoutingKind::Hash => {
+                let hash_experts = hash_experts.ok_or_else(|| {
+                    DeepSeekConfigError::InvalidForwardBatch(format!(
+                        "hash-routed layer {layer_idx} requires tid2eid experts"
+                    ))
+                })?;
+                validate_expert_indices_in_range(hash_experts, self.n_routed_experts)?;
+                if hash_experts.len() != self.num_experts_per_tok {
+                    return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                        "hash expert count {} does not match num_experts_per_tok {}",
+                        hash_experts.len(),
+                        self.num_experts_per_tok
+                    )));
+                }
+                hash_experts.to_vec()
+            }
+            DeepSeekV4MoeRoutingKind::LearnedBias => {
+                let bias = bias.ok_or_else(|| {
+                    DeepSeekConfigError::InvalidForwardBatch(format!(
+                        "bias-routed layer {layer_idx} requires gate bias"
+                    ))
+                })?;
+                if bias.len() != self.n_routed_experts {
+                    return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                        "gate bias length {} does not match n_routed_experts {}",
+                        bias.len(),
+                        self.n_routed_experts
+                    )));
+                }
+                if bias.iter().any(|value| !value.is_finite()) {
+                    return Err(DeepSeekConfigError::InvalidForwardBatch(
+                        "gate bias must be finite".to_string(),
+                    ));
+                }
+                topk_indices_by_score(scores, bias, self.num_experts_per_tok)
+            }
+        };
+
+        let selected_sum = selected
+            .iter()
+            .map(|&expert_idx| scores[expert_idx])
+            .sum::<f32>();
+        let normalize = self.scoring_func != "softmax";
+        let denom = if normalize {
+            selected_sum + 1.0e-9
+        } else {
+            1.0
+        };
+        Ok(selected
+            .into_iter()
+            .map(|expert_idx| DeepSeekV4MoeRoute {
+                token_idx,
+                expert_idx,
+                weight: scores[expert_idx] / denom * self.routed_scaling_factor,
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeepSeekV4AttentionMode {
+    SlidingWindow,
+    CompressedSparse,
+    HybridCompressed,
+}
+
+impl DeepSeekV4AttentionMode {
+    pub fn from_compress_ratio(compress_ratio: usize) -> Self {
+        match compress_ratio {
+            0 => Self::SlidingWindow,
+            1..=15 => Self::CompressedSparse,
+            _ => Self::HybridCompressed,
+        }
+    }
+
+    pub fn has_compressor(self) -> bool {
+        matches!(self, Self::CompressedSparse | Self::HybridCompressed)
+    }
+
+    pub fn has_indexer(self) -> bool {
+        self == Self::CompressedSparse
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepSeekV4AttentionLayerPlan {
+    pub layer_idx: usize,
+    pub compress_ratio: usize,
+    pub mode: DeepSeekV4AttentionMode,
+    pub hash_routing: bool,
+    pub has_compressor: bool,
+    pub has_indexer: bool,
+    pub sliding_window: usize,
+    pub index_topk: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepSeekV4AttentionOperatorSummary {
+    pub sliding_window_layers: usize,
+    pub csa_layers: usize,
+    pub hca_layers: usize,
+    pub hash_routed_moe_layers: usize,
+    pub bias_routed_moe_layers: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepSeekV4CompressorShape {
+    pub compress_ratio: usize,
+    pub overlap: bool,
+    pub wkv_rows: usize,
+    pub wkv_cols: usize,
+    pub wgate_rows: usize,
+    pub wgate_cols: usize,
+    pub ape_rows: usize,
+    pub ape_cols: usize,
+    pub norm_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepSeekV4IndexerShape {
+    pub compress_ratio: usize,
+    pub wq_b_rows: usize,
+    pub wq_b_cols: usize,
+    pub weights_proj_rows: usize,
+    pub weights_proj_cols: usize,
+    pub key_heads: usize,
+    pub key_head_dim: usize,
+    pub topk: usize,
+    pub compressor: DeepSeekV4CompressorShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepSeekV4OutputProjectionShape {
+    pub heads_per_group: usize,
+    pub wo_a_rows: usize,
+    pub wo_a_cols: usize,
+    pub wo_b_rows: usize,
+    pub wo_b_cols: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeepSeekV4MoeRoutingKind {
+    Hash,
+    LearnedBias,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DeepSeekV4MoeRoute {
+    pub token_idx: usize,
+    pub expert_idx: usize,
+    pub weight: f32,
+}
+
+fn stable_softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+    let mut denom = 0.0_f32;
+    let exp = logits
+        .iter()
+        .map(|&value| {
+            let value = (value - max).exp();
+            denom += value;
+            value
+        })
+        .collect::<Vec<_>>();
+    exp.into_iter().map(|value| value / denom).collect()
+}
+
+fn sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
+}
+
+fn stable_softplus(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else {
+        value.exp().ln_1p()
+    }
+}
+
+fn validate_expert_indices_in_range(indices: &[usize], n_routed_experts: usize) -> Result<()> {
+    for &expert_idx in indices {
+        if expert_idx >= n_routed_experts {
+            return Err(DeepSeekConfigError::InvalidForwardBatch(format!(
+                "expert {expert_idx} out of range for n_routed_experts {n_routed_experts}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn topk_indices_by_score(scores: &[f32], bias: &[f32], k: usize) -> Vec<usize> {
+    let mut indices = (0..scores.len()).collect::<Vec<_>>();
+    indices.sort_by(|&a, &b| {
+        let score_b = scores[b] + bias[b];
+        let score_a = scores[a] + bias[a];
+        score_b.total_cmp(&score_a).then_with(|| a.cmp(&b))
+    });
+    indices.truncate(k);
+    indices
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

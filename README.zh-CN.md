@@ -120,9 +120,9 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | **CUDA** | Linux + NVIDIA | **Stable** | 持续批处理、paged KV、radix 复用、TileLang BF16 attention、自定义 CUDA 量化 decode、CUDA Graph decode、Qwen3 / Qwen3.5 packed paged-prefill。**L4 / Qwen3-4B BF16 + FP8 paged KV（auto）：c=16 / 4096-in 输出 197 tok/s，peak_active=16 满槽。** |
 | **Metal** | Apple Silicon | **Beta** | 调度器驱动的实时服务、chunked prefill、replay-based prefix 复用。Qwen3.5-0.8B MLX 4bit 单请求 step-driver 在 M4 Pro 20c 上达到 305.5 tok/s；GGUF Q4_K_M 在匹配的 1024/256 profile 上是 202.1 tok/s，仍作为独立 kernel/权重格式 gap 继续追。 |
 | **Metal DFlash** | Apple Silicon | **Beta — 默认开启** | Qwen3 / Qwen3.5 推测解码。Qwen3-4B bf16 5.9× decode，Qwen3.5-4B-4bit 比特一致，c=1..8 已验证。 |
-| **CPU** | 通用 | **仅开发用** | 冒烟测试与请求路径校验，不作为服务目标。 |
+| **CPU** | 通用 | **仅开发用** | 冒烟测试与请求路径校验。DeepSeek V4 有慢速 Rust 参考路径用于 1B init 正确性 / HTTP smoke，不作为吞吐服务目标。 |
 
-模型：**Qwen3 (0.6B – 72B)** 与 **Qwen3.5 系列**（包括 0.8B GGUF Q4_K_M、4B 混合线性 + 全注意力）按当前矩阵已支持 CUDA 与 Metal。**Qwen3.6 / Qwen3.5-MoE** 目前是窄 Metal Beta 路径，CUDA 仍是 stub。后续模型优先级：**DeepSeek V4（#1，substrate 落地中）** → **Qwen 3.6（#2，规划中）**；见 [ROADMAP.md §Next-Model Priority Order](ROADMAP.md#next-model-priority-order)。Llama 3 / 4、DeepSeek V3 / R1 排在更后。
+模型：**Qwen3 (0.6B – 72B)** 与 **Qwen3.5 系列**（包括 0.8B GGUF Q4_K_M、4B 混合线性 + 全注意力）按当前矩阵已支持 CUDA 与 Metal。**Qwen3.6 / Qwen3.5-MoE** 目前是窄 Metal Beta 路径，CUDA 仍是 stub。后续模型优先级：**DeepSeek V4（#1，V4-only substrate + CPU reference smoke 已落地）** → **Qwen 3.6（#2，规划中）**；见 [ROADMAP.md §Next-Model Priority Order](ROADMAP.md#next-model-priority-order)。当前 runtime 有意不保留 DeepSeek V2/V3/R1 支持路径。
 
 权威矩阵（HTTP API 等级、量化、agent / train / eval 表面）：[docs/support-matrix.md](docs/support-matrix.md)。
 稳定性分级：[docs/stability-policy.md](docs/stability-policy.md)。

@@ -13,8 +13,6 @@
 //! | `LlamaForCausalLM`                    | `Llama`                  |
 //! | `MistralForCausalLM`                  | `Mistral`                |
 //! | `MixtralForCausalLM`                  | `Mixtral`                |
-//! | `DeepseekV2ForCausalLM`               | `DeepSeekV2`             |
-//! | `DeepseekV3ForCausalLM`               | `DeepSeekV3`             |
 //! | `DeepseekV4ForCausalLM`               | `DeepSeekV4`             |
 //! | `DeepseekV4MTP`                       | `DeepSeekV4Mtp`          |
 //! | `GemmaForCausalLM` / `Gemma2ForCausalLM` | `Gemma`               |
@@ -46,8 +44,6 @@ pub enum ModelArch {
     Llama,
     Mistral,
     Mixtral,
-    DeepSeekV2,
-    DeepSeekV3,
     DeepSeekV4,
     DeepSeekV4Mtp,
     Gemma,
@@ -64,8 +60,6 @@ impl ModelArch {
             Self::Llama => "Llama",
             Self::Mistral => "Mistral",
             Self::Mixtral => "Mixtral",
-            Self::DeepSeekV2 => "DeepSeek-V2",
-            Self::DeepSeekV3 => "DeepSeek-V3",
             Self::DeepSeekV4 => "DeepSeek-V4",
             Self::DeepSeekV4Mtp => "DeepSeek-V4-MTP",
             Self::Gemma => "Gemma",
@@ -77,7 +71,6 @@ impl ModelArch {
     pub fn attention_variant(self) -> AttentionVariant {
         match self {
             Self::Qwen35 | Self::Qwen3_5_Moe => AttentionVariant::HybridGqa,
-            Self::DeepSeekV2 | Self::DeepSeekV3 => AttentionVariant::Mla,
             Self::DeepSeekV4 | Self::DeepSeekV4Mtp => AttentionVariant::DeepSeekV4Hybrid,
             Self::Gemma => AttentionVariant::Mha,
             Self::Qwen3 | Self::Llama | Self::Mistral | Self::Mixtral | Self::Phi => {
@@ -97,8 +90,6 @@ impl ModelArch {
             Self::Llama
             | Self::Mistral
             | Self::Mixtral
-            | Self::DeepSeekV2
-            | Self::DeepSeekV3
             | Self::DeepSeekV4
             | Self::DeepSeekV4Mtp
             | Self::Gemma
@@ -123,8 +114,6 @@ pub enum AttentionVariant {
     Mha,
     /// Grouped-query attention (GQA / MQA).
     Gqa,
-    /// Multi-head latent attention (DeepSeek MLA).
-    Mla,
     /// DeepSeek-V4 hybrid local + long-range sparse attention.
     DeepSeekV4Hybrid,
     /// Hybrid: alternates linear recurrent layers with full attention (Qwen3.5).
@@ -156,9 +145,7 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
         m.insert("Llama3ForCausalLM", ModelArch::Llama);
         m.insert("MistralForCausalLM", ModelArch::Mistral);
         m.insert("MixtralForCausalLM", ModelArch::Mixtral);
-        // DeepSeek
-        m.insert("DeepseekV2ForCausalLM", ModelArch::DeepSeekV2);
-        m.insert("DeepseekV3ForCausalLM", ModelArch::DeepSeekV3);
+        // DeepSeek V4 only. V2/V3-era MLA paths were intentionally deleted.
         m.insert("DeepseekV4ForCausalLM", ModelArch::DeepSeekV4);
         m.insert("DeepseekV4MTP", ModelArch::DeepSeekV4Mtp);
         // Gemma
@@ -284,10 +271,6 @@ mod tests {
         r#"{"architectures":["LlamaForCausalLM"],"hidden_size":4096}"#
     }
 
-    fn deepseek_v3_config() -> &'static str {
-        r#"{"architectures":["DeepseekV3ForCausalLM"],"hidden_size":7168}"#
-    }
-
     fn deepseek_v4_config() -> &'static str {
         r#"{"architectures":["DeepseekV4ForCausalLM"],"hidden_size":8192,"layer_types":["compressed_sparse_attention"]}"#
     }
@@ -345,14 +328,6 @@ mod tests {
         assert_eq!(
             detect_arch_from_json(llama_config()).unwrap(),
             ModelArch::Llama
-        );
-    }
-
-    #[test]
-    fn detects_deepseek_v3() {
-        assert_eq!(
-            detect_arch_from_json(deepseek_v3_config()).unwrap(),
-            ModelArch::DeepSeekV3
         );
     }
 
@@ -422,10 +397,6 @@ mod tests {
     #[test]
     fn attention_variants_correct() {
         assert_eq!(
-            ModelArch::DeepSeekV2.attention_variant(),
-            AttentionVariant::Mla
-        );
-        assert_eq!(
             ModelArch::DeepSeekV4.attention_variant(),
             AttentionVariant::DeepSeekV4Hybrid
         );
@@ -454,8 +425,6 @@ mod tests {
             ModelArch::Llama,
             ModelArch::Mistral,
             ModelArch::Mixtral,
-            ModelArch::DeepSeekV2,
-            ModelArch::DeepSeekV3,
             ModelArch::DeepSeekV4,
             ModelArch::DeepSeekV4Mtp,
             ModelArch::Gemma,

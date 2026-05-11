@@ -388,8 +388,7 @@ pub(crate) enum TrainCommand {
     EstimateMemory(TrainEstimateMemoryArgs),
     /// Scratch pretraining from a plain-text corpus.
     Pretrain(TrainPretrainArgs),
-    /// Scratch DSV4-nano pretraining (scaffold; autograd model pending).
-    /// See docs/plans/2026-05-05-deepseek-v4-small-substrate.md §6.
+    /// DeepSeek V4 1B checkpoint training bootstrap.
     PretrainDsv4(TrainPretrainDsv4Args),
     /// Supervised fine-tuning from canonical chat JSONL.
     Sft(TrainSftArgs),
@@ -694,32 +693,31 @@ pub(crate) struct TrainPretrainArgs {
     pub(crate) extra: ExtraArgs,
 }
 
-/// CLI args for `arle train pretrain-dsv4` — the DSV4 nano scaffold driver.
-///
-/// Scope intentionally narrow: only the arguments
-/// `train::commands::pretrain_dsv4::parse_args_from` consumes today. Once the
-/// train-side autograd `DeepseekModel` lands this struct grows to mirror
-/// `TrainPretrainArgs` (LR schedule, eval cadence, resume, etc.). See
-/// docs/plans/2026-05-05-deepseek-v4-small-substrate.md §6.
+/// CLI args for `arle train pretrain-dsv4` — the V4 1B checkpoint training
+/// bootstrap. The old V3/nano random-init path is intentionally gone.
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "Scaffold notice: the train-side autograd `DeepseekModel` is not yet wired. \nThis subcommand validates CLI parsing today and will execute training once the MLA prefill+decode kernels stabilize. See docs/plans/2026-05-05-deepseek-v4-small-substrate.md §6."
+    after_help = "Examples:\n  arle train pretrain-dsv4 --corpus corpus.txt\n  arle train pretrain-dsv4 --model infer/models/dsv4-mini-1B-init --corpus corpus.txt --out runs/dsv4-v4"
 )]
 pub(crate) struct TrainPretrainDsv4Args {
+    /// DeepSeek V4 model directory. Defaults to the local 1B init checkpoint.
+    #[arg(long)]
+    pub(crate) model: Option<PathBuf>,
+
     /// Plain-text training corpus.
     #[arg(long)]
     pub(crate) corpus: PathBuf,
 
-    /// Tokenizer source (`tokenizer.json` or a local model dir containing it).
+    /// Tokenizer source. Defaults to `<model>/tokenizer.json`.
     #[arg(long)]
-    pub(crate) tokenizer: PathBuf,
+    pub(crate) tokenizer: Option<PathBuf>,
 
     /// Output checkpoint directory. Defaults to `runs/pretrain-dsv4/<corpus-stem>`.
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
 
-    /// DSV4 SKU. Only `nano` is wired today.
-    #[arg(long, default_value = "nano")]
+    /// Compatibility alias. Only `v4-1b-init` is accepted; `nano` is deleted.
+    #[arg(long, default_value = "v4-1b-init")]
     pub(crate) deepseek_config: String,
 
     /// Random seed for corpus-window sampling.

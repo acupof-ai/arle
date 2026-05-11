@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use qwen3_spec::Qwen3Config;
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
@@ -258,13 +259,27 @@ fn run_pretrain_dsv4(args: TrainPretrainDsv4Args) -> ExitCode {
 }
 
 fn resolve_pretrain_dsv4_invocation(args: &TrainPretrainDsv4Args) -> Result<ResolvedInvocation> {
-    let tokenizer_path = resolve_local_tokenizer_path(&args.tokenizer)?;
+    let model_dir = args
+        .model
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("infer/models/dsv4-mini-1B-init"));
+    let model = inspect_model_source(&model_dir, !args.render.dry_run)?;
+    let model_arg = model
+        .resolved_dir
+        .clone()
+        .unwrap_or_else(|| model_dir.display().to_string());
+    let tokenizer_path = match &args.tokenizer {
+        Some(tokenizer) => resolve_local_tokenizer_path(tokenizer)?,
+        None => model_dir.join("tokenizer.json"),
+    };
     let out_dir = args
         .out
         .clone()
         .unwrap_or_else(|| default_job_output("pretrain-dsv4", &args.corpus));
 
     let mut argv = vec![
+        "--model".to_string(),
+        model_arg.clone(),
         "--corpus".to_string(),
         args.corpus.display().to_string(),
         "--tokenizer".to_string(),
@@ -295,18 +310,17 @@ fn resolve_pretrain_dsv4_invocation(args: &TrainPretrainDsv4Args) -> Result<Reso
     if args.out.is_none() {
         notes.push("out omitted; defaulted under runs/pretrain-dsv4".to_string());
     }
+    notes.extend(model.notes.clone());
+    notes.push(format!("resolved model {model_arg}"));
     notes.push(format!("resolved tokenizer {}", tokenizer_path.display()));
-    notes.push(
-        "train-side DeepSeek nano autograd model active; SKU-A/B remain external cold-path"
-            .to_string(),
-    );
+    notes.push("DeepSeek train surface is V4-only; deleted V3/nano random-init path".to_string());
 
     Ok(ResolvedInvocation {
         command: "train pretrain-dsv4",
         argv,
         backend: None,
         output_dir: Some(out_dir.display().to_string()),
-        model: None,
+        model: Some(model),
         notes,
     })
 }
@@ -1080,6 +1094,39 @@ fn resolve_model_command(
 
 fn inspect_resolved_model_dir(model_dir: &Path) -> Result<ModelDirSummary> {
     let config_path = model_dir.join("config.json");
+    let config_value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path)?)
+        .with_context(|| {
+            format!(
+                "reading model inspection config from {}",
+                config_path.display()
+            )
+        })?;
+    let is_deepseek_v4 = config_value
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model_type| model_type == "deepseek_v4")
+        || config_value
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|architectures| {
+                architectures
+                    .iter()
+                    .any(|arch| arch.as_str() == Some("DeepseekV4ForCausalLM"))
+            });
+    if is_deepseek_v4 {
+        let cfg = DeepSeekV4Config::from_json_value(&config_value)?;
+        return Ok(ModelDirSummary {
+            family: "deepseek-v4".to_string(),
+            config: ResolvedModelConfig::DeepSeekV4,
+            config_path: config_path.display().to_string(),
+            tokenizer_path: existing_display_path(model_dir.join("tokenizer.json")),
+            generation_config_path: existing_display_path(model_dir.join("generation_config.json")),
+            vocab_size: cfg.vocab_size,
+            hidden_size: cfg.hidden_size,
+            param_count: deepseek_v4_param_count(&cfg),
+        });
+    }
+
     let family = match resolve_model_family(&config_path, ModelFamily::Auto)? {
         ModelFamily::Qwen3 => "qwen3",
         ModelFamily::Qwen35 => "qwen35",
@@ -1206,6 +1253,88 @@ fn qwen35_param_count(cfg: &Qwen35Config) -> u64 {
         + cfg.hidden_size as u64
 }
 
+fn deepseek_v4_param_count(cfg: &DeepSeekV4Config) -> u64 {
+    let embed = mul_u64(cfg.vocab_size, cfg.hidden_size);
+    let lm_head = if cfg.tie_word_embeddings { 0 } else { embed };
+    let hc_mix = (2 + cfg.hc_mult) * cfg.hc_mult;
+    let hc_flat = cfg.hc_mult * cfg.hidden_size;
+    let head_hc = mul_u64(cfg.hc_mult, hc_flat) + cfg.hc_mult as u64 + 1;
+    let per_hc = mul_u64(hc_mix, hc_flat) + hc_mix as u64 + 3;
+    let heads_per_group = cfg.num_attention_heads / cfg.o_groups;
+    let base_attn = mul_u64(cfg.q_lora_rank, cfg.hidden_size)
+        + cfg.q_lora_rank as u64
+        + mul_u64(cfg.num_attention_heads * cfg.head_dim, cfg.q_lora_rank)
+        + mul_u64(cfg.head_dim, cfg.hidden_size)
+        + cfg.head_dim as u64
+        + mul_u64(
+            cfg.o_groups * cfg.o_lora_rank,
+            heads_per_group * cfg.head_dim,
+        )
+        + mul_u64(cfg.hidden_size, cfg.o_groups * cfg.o_lora_rank)
+        + cfg.num_attention_heads as u64;
+    let expert = mul_u64(cfg.moe_intermediate_size, cfg.hidden_size) * 2
+        + mul_u64(cfg.hidden_size, cfg.moe_intermediate_size);
+    let routed_experts = (cfg.n_routed_experts as u64).saturating_mul(expert);
+    let shared_experts = if cfg.n_shared_experts == 0 {
+        0
+    } else {
+        let shared_intermediate = cfg.moe_intermediate_size * cfg.n_shared_experts;
+        mul_u64(shared_intermediate, cfg.hidden_size) * 2
+            + mul_u64(cfg.hidden_size, shared_intermediate)
+    };
+    let gate_bias_or_hash = cfg
+        .n_routed_experts
+        .max(cfg.vocab_size * cfg.num_experts_per_tok);
+    let moe = mul_u64(cfg.n_routed_experts, cfg.hidden_size)
+        + gate_bias_or_hash as u64
+        + routed_experts
+        + shared_experts;
+
+    let layers = cfg
+        .compress_ratios
+        .iter()
+        .copied()
+        .map(|compress_ratio| {
+            let compressor = cfg
+                .compressor_shape(compress_ratio)
+                .map(|shape| {
+                    mul_u64(shape.wkv_rows, shape.wkv_cols)
+                        + mul_u64(shape.wgate_rows, shape.wgate_cols)
+                        + mul_u64(shape.ape_rows, shape.ape_cols)
+                        + shape.norm_len as u64
+                })
+                .unwrap_or(0);
+            let indexer = if cfg.attention_mode_for_compress_ratio(compress_ratio)
+                == DeepSeekV4AttentionMode::CompressedSparse
+            {
+                let shape = cfg
+                    .indexer_shape(compress_ratio)
+                    .expect("CSA layer has indexer shape");
+                mul_u64(shape.wq_b_rows, shape.wq_b_cols)
+                    + mul_u64(shape.weights_proj_rows, shape.weights_proj_cols)
+                    + mul_u64(shape.compressor.wkv_rows, shape.compressor.wkv_cols)
+                    + mul_u64(shape.compressor.wgate_rows, shape.compressor.wgate_cols)
+                    + mul_u64(shape.compressor.ape_rows, shape.compressor.ape_cols)
+                    + shape.compressor.norm_len as u64
+            } else {
+                0
+            };
+            mul_u64(2, cfg.hidden_size) + per_hc * 2 + base_attn + compressor + indexer + moe
+        })
+        .sum::<u64>();
+
+    let mtp = (cfg.num_nextn_predict_layers as u64).saturating_mul(
+        mul_u64(7, cfg.hidden_size)
+            + mul_u64(2, cfg.hidden_size * cfg.hidden_size)
+            + per_hc * 2
+            + head_hc
+            + base_attn
+            + moe,
+    );
+
+    embed + lm_head + cfg.hidden_size as u64 + head_hc + layers + mtp
+}
+
 fn lora_param_count(config: &ResolvedModelConfig, rank: usize) -> u64 {
     match config {
         ResolvedModelConfig::Qwen3(cfg) => {
@@ -1249,6 +1378,7 @@ fn lora_param_count(config: &ResolvedModelConfig, rank: usize) -> u64 {
                 .sum::<u64>();
             (cfg.num_hidden_layers as u64).saturating_mul(common) + attention
         }
+        ResolvedModelConfig::DeepSeekV4 => 0,
     }
 }
 
@@ -1792,6 +1922,7 @@ struct ModelDirSummary {
 enum ResolvedModelConfig {
     Qwen3(Qwen3Config),
     Qwen35(Qwen35Config),
+    DeepSeekV4,
 }
 
 #[derive(Debug, Serialize)]
