@@ -20,12 +20,14 @@
 #   ARLE_SKIP_WEB — Set to 1 to skip the web/ frontend (bun + Astro) bootstrap
 #   PYTHON        — Python interpreter     (default: python3)
 #
-# Cross-platform: Linux/CUDA + macOS/Metal. Auto-detects host and routes
-# CUDA-only steps (nvcc validation, nsjail build, CUDA cargo features) to
-# the Linux path; on macOS those are skipped and `cargo build` uses
-# `metal,no-cuda`. The KV-tier persistence substrate (`crates/kv-native-sys`)
-# is now pure Rust — no external toolchain is required. All Python deps
-# install into .venv/.
+# Cross-platform: Linux/CUDA, Linux/CPU (no CUDA toolchain), macOS/Metal.
+# Auto-detects host AND CUDA availability — never presupposes a toolchain.
+# Build features picked automatically:
+#   Linux  + nvcc found   → --features cuda,cli      (+ nsjail + TileLang)
+#   Linux  + no nvcc      → --features cpu,no-cuda,cli (CPU only; GPU ops panic at runtime)
+#   macOS  (Apple Silicon)→ --features metal,no-cuda
+# The KV-tier persistence substrate (`crates/kv-native-sys`) is pure Rust —
+# no external toolchain required. All Python deps install into .venv/.
 # Activate manually:  source .venv/bin/activate
 # ============================================================================
 set -euo pipefail
@@ -81,6 +83,9 @@ PYTHON="${PYTHON:-python3}"
 #   Ubuntu/RHEL/Debian: /usr/local/cuda
 #   Arch/CachyOS:       /opt/cuda
 #   Fallback:           derive from `nvcc` on PATH
+# HAS_CUDA is set to 1 only when an nvcc binary is actually present; Linux
+# hosts without CUDA fall back to the CPU build path.
+HAS_CUDA=0
 if [ -z "${CUDA_HOME:-}" ]; then
     for _candidate in /usr/local/cuda /opt/cuda; do
         if [ -x "$_candidate/bin/nvcc" ]; then
@@ -92,6 +97,9 @@ if [ -z "${CUDA_HOME:-}" ]; then
         CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
     fi
     CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+fi
+if [ -x "$CUDA_HOME/bin/nvcc" ]; then
+    HAS_CUDA=1
 fi
 
 # ---------------------------------------------------------------------------
@@ -147,17 +155,19 @@ do_check() {
     check_cmd cargo || errors=$((errors + 1))
 
     if [ "$PLATFORM" = "linux" ]; then
-        if [ -x "$CUDA_HOME/bin/nvcc" ]; then
+        if [ "$HAS_CUDA" = "1" ]; then
             ok "nvcc: $CUDA_HOME/bin/nvcc"
             info "  $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
+            if command -v nvidia-smi &>/dev/null; then
+                ok "nvidia-smi found: $(command -v nvidia-smi)"
+                info "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+            else
+                warn "nvidia-smi not found — CUDA toolchain present but no driver/GPU on host"
+            fi
         else
-            fail "nvcc not found at $CUDA_HOME/bin/nvcc"
-            errors=$((errors + 1))
+            warn "CUDA toolchain not detected — Linux build will use CPU backend (cpu,no-cuda)"
+            info "  install CUDA + set CUDA_HOME to enable the GPU path"
         fi
-
-        if check_cmd nvidia-smi; then
-            info "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-        else errors=$((errors + 1)); fi
     else
         if xcrun --find metal &>/dev/null; then
             ok "metal toolchain: $(xcrun --find metal)"
@@ -279,29 +289,29 @@ do_deps() {
     # --- CUDA / Metal ---
     if [ "$PLATFORM" = "linux" ]; then
         step "CUDA toolkit"
-        if [ -x "$CUDA_HOME/bin/nvcc" ]; then
+        if [ "$HAS_CUDA" = "1" ]; then
             ok "nvcc: $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
-        else
-            fail "CUDA toolkit not found at $CUDA_HOME"
-            info "Install CUDA toolkit or set CUDA_HOME=/path/to/cuda"
-            exit 1
-        fi
 
-        step "nsjail (sandbox)"
-        if command -v nsjail &>/dev/null; then
-            ok "nsjail already installed"
+            step "nsjail (sandbox)"
+            if command -v nsjail &>/dev/null; then
+                ok "nsjail already installed"
+            else
+                info "Building nsjail from source..."
+                apt-get install -y -qq autoconf bison flex gcc g++ git \
+                    libprotobuf-dev libnl-route-3-dev libtool make pkg-config protobuf-compiler \
+                    >/dev/null 2>&1
+                local nsjail_tmp
+                nsjail_tmp="$(mktemp -d)"
+                git clone --depth 1 https://github.com/google/nsjail.git "$nsjail_tmp/nsjail" 2>/dev/null
+                make -C "$nsjail_tmp/nsjail" -j"$(nproc)" >/dev/null 2>&1
+                cp "$nsjail_tmp/nsjail/nsjail" /usr/local/bin/
+                rm -rf "$nsjail_tmp"
+                ok "nsjail built and installed"
+            fi
         else
-            info "Building nsjail from source..."
-            apt-get install -y -qq autoconf bison flex gcc g++ git \
-                libprotobuf-dev libnl-route-3-dev libtool make pkg-config protobuf-compiler \
-                >/dev/null 2>&1
-            local nsjail_tmp
-            nsjail_tmp="$(mktemp -d)"
-            git clone --depth 1 https://github.com/google/nsjail.git "$nsjail_tmp/nsjail" 2>/dev/null
-            make -C "$nsjail_tmp/nsjail" -j"$(nproc)" >/dev/null 2>&1
-            cp "$nsjail_tmp/nsjail/nsjail" /usr/local/bin/
-            rm -rf "$nsjail_tmp"
-            ok "nsjail built and installed"
+            warn "CUDA toolchain not found — falling back to CPU build (--features cpu,no-cuda)"
+            info "GPU ops will panic at runtime; install CUDA + set CUDA_HOME to enable cuda path"
+            info "skipping nsjail (CUDA-host sandbox); CPU build runs tools without sandbox"
         fi
     else
         step "Apple Silicon / Metal backend"
@@ -344,15 +354,16 @@ do_deps() {
 
     # --- Build deps ---
     # TileLang is the only Python AOT dependency for CUDA kernels; the rest is
-    # platform-neutral utility support.
+    # platform-neutral utility support. Skip TileLang on hosts without nvcc
+    # (macOS, Linux+no-CUDA, dev CI) since it requires the CUDA toolchain.
     step "Python build dependencies (from requirements-build.txt)"
-    if [ "$PLATFORM" = "linux" ]; then
+    if [ "$HAS_CUDA" = "1" ]; then
         grep -E '^[a-zA-Z]' requirements-build.txt | pip install -r /dev/stdin -q
         ok "CUDA build deps installed"
     else
         grep -E '^[a-zA-Z]' requirements-build.txt | grep -Ev '^tilelang($|[<=>])' | \
             pip install -r /dev/stdin -q
-        ok "Platform-neutral build deps installed (TileLang skipped)"
+        ok "Platform-neutral build deps installed (TileLang skipped, no CUDA toolchain)"
     fi
 
     # --- Bench/test deps ---
@@ -360,8 +371,8 @@ do_deps() {
     pip install -r requirements-bench.txt -q
     ok "Bench deps installed"
 
-    # --- TileLang (Linux/CUDA only - AOT codegen for CUDA cubins) ---
-    if [ "$PLATFORM" = "linux" ]; then
+    # --- TileLang (CUDA-toolchain hosts only — AOT codegen for CUDA cubins) ---
+    if [ "$HAS_CUDA" = "1" ]; then
         step "TileLang (AOT codegen for --features cuda)"
         if python -c "import tilelang" 2>/dev/null; then
             ok "tilelang already installed: $(python -c 'import tilelang; print(tilelang.__version__)')"
@@ -412,19 +423,22 @@ do_deps() {
 # BUILD — compile Rust + CUDA kernels
 # ============================================================================
 do_build() {
-    if [ "$PLATFORM" = "linux" ]; then
-        step "Building ARLE CLI + infer server (release, CUDA)"
+    local arle_features infer_features build_label
+    if [ "$PLATFORM" = "linux" ] && [ "$HAS_CUDA" = "1" ]; then
+        build_label="CUDA"
+    elif [ "$PLATFORM" = "linux" ]; then
+        build_label="CPU (no CUDA toolchain)"
     else
-        step "Building ARLE CLI + infer server (release, Metal)"
+        build_label="Metal"
     fi
+    step "Building ARLE CLI + infer server (release, $build_label)"
     activate_venv
 
     # Ensure cargo is on PATH
     # shellcheck disable=SC1091
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
-    local arle_features infer_features
-    if [ "$PLATFORM" = "linux" ]; then
+    if [ "$PLATFORM" = "linux" ] && [ "$HAS_CUDA" = "1" ]; then
         export CUDA_HOME
         export PATH="$CUDA_HOME/bin:$PATH"
         export LIBRARY_PATH="$CUDA_HOME/lib64/stubs:${LIBRARY_PATH:-}"
@@ -449,6 +463,11 @@ do_build() {
         fi
         arle_features="cuda,cli"
         infer_features="cuda"
+    elif [ "$PLATFORM" = "linux" ]; then
+        info "Linux without CUDA toolchain: building with cpu,no-cuda,cli"
+        info "  GPU ops will panic at runtime; install CUDA to enable the cuda path"
+        arle_features="cpu,no-cuda,cli"
+        infer_features="cpu,no-cuda"
     else
         info "Apple Silicon: building with metal,no-cuda"
         arle_features="metal,no-cuda"
@@ -591,7 +610,7 @@ do_full() {
     echo "  # 1. Activate the virtual environment"
     echo "  source .venv/bin/activate"
     echo ""
-    if [ "$PLATFORM" = "linux" ]; then
+    if [ "$PLATFORM" = "linux" ] && [ "$HAS_CUDA" = "1" ]; then
         echo "  # 2. Set runtime library paths (Linux/CUDA)"
         echo "  export LD_LIBRARY_PATH=/usr/lib64-nvidia:$CUDA_HOME/lib64:\$LD_LIBRARY_PATH"
         echo ""
@@ -599,8 +618,11 @@ do_full() {
     echo "  # Run agent REPL"
     echo "  ./target/release/arle --model-path $MODEL_DIR"
     echo ""
-    if [ "$PLATFORM" = "linux" ]; then
+    if [ "$PLATFORM" = "linux" ] && [ "$HAS_CUDA" = "1" ]; then
         echo "  # Run HTTP server (CUDA)"
+        echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
+    elif [ "$PLATFORM" = "linux" ]; then
+        echo "  # Run HTTP server (CPU — install CUDA + rebuild for GPU)"
         echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
     else
         echo "  # Run HTTP server (Metal)"
