@@ -20,12 +20,14 @@
 #   ARLE_SKIP_WEB — Set to 1 to skip the web/ frontend (bun + Astro) bootstrap
 #   PYTHON        — Python interpreter     (default: python3)
 #
-# Cross-platform: Linux/CUDA, Linux/CPU (no CUDA toolchain), macOS/Metal.
-# Auto-detects host AND CUDA availability — never presupposes a toolchain.
-# Build features picked automatically:
-#   Linux  + nvcc found   → --features cuda,cli      (+ nsjail + TileLang)
-#   Linux  + no nvcc      → --features cpu,no-cuda,cli (CPU only; GPU ops panic at runtime)
-#   macOS  (Apple Silicon)→ --features metal,no-cuda
+# Cross-platform: Linux/CUDA, Linux/CPU (auto-install attempted), macOS/Metal.
+# Auto-detects host AND CUDA availability — when CUDA is missing on Linux,
+# setup.sh first tries to install it via the host package manager (pacman /
+# apt / dnf / yum / zypper). If install fails (no sudo, unknown distro, etc.)
+# it falls back to the CPU build with a warning. Build features picked:
+#   Linux  + nvcc found / installed → --features cuda,cli (+ nsjail + TileLang)
+#   Linux  + install failed         → --features cpu,no-cuda,cli (CPU only)
+#   macOS  (Apple Silicon)          → --features metal,no-cuda
 # The KV-tier persistence substrate (`crates/kv-native-sys`) is pure Rust —
 # no external toolchain required. All Python deps install into .venv/.
 # Activate manually:  source .venv/bin/activate
@@ -271,6 +273,74 @@ do_check() {
 }
 
 # ============================================================================
+# CUDA AUTO-INSTALL — best-effort install via the host package manager.
+# Returns 0 on success (sets HAS_CUDA=1 + CUDA_HOME), 1 on failure.
+# ============================================================================
+try_install_cuda() {
+    local distro=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        distro="$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')"
+    fi
+
+    local sudo_prefix=""
+    if [ "$(id -u)" != "0" ]; then
+        if command -v sudo &>/dev/null; then
+            sudo_prefix="sudo"
+        else
+            warn "non-root and no sudo on PATH — cannot auto-install CUDA"
+            return 1
+        fi
+    fi
+
+    info "Detected distro: ${distro:-unknown} — attempting CUDA install"
+    case "$distro" in
+        *cachyos*|*arch*|*manjaro*|*endeavouros*)
+            $sudo_prefix pacman -S --noconfirm --needed cuda || return 1
+            ;;
+        *ubuntu*|*debian*|*pop*|*linuxmint*)
+            $sudo_prefix apt-get update -qq || return 1
+            $sudo_prefix apt-get install -y -qq nvidia-cuda-toolkit || return 1
+            ;;
+        *fedora*|*rhel*|*centos*|*rocky*|*alma*)
+            if command -v dnf &>/dev/null; then
+                $sudo_prefix dnf install -y cuda-toolkit || $sudo_prefix dnf install -y cuda || return 1
+            elif command -v yum &>/dev/null; then
+                $sudo_prefix yum install -y cuda-toolkit || $sudo_prefix yum install -y cuda || return 1
+            else
+                return 1
+            fi
+            ;;
+        *opensuse*|*suse*)
+            $sudo_prefix zypper --non-interactive install cuda || return 1
+            ;;
+        *)
+            warn "no auto-install recipe for distro '$distro'"
+            return 1
+            ;;
+    esac
+
+    # Re-run autodetect after install
+    CUDA_HOME=""
+    for _candidate in /usr/local/cuda /opt/cuda /usr; do
+        if [ -x "$_candidate/bin/nvcc" ]; then
+            CUDA_HOME="$_candidate"
+            break
+        fi
+    done
+    if [ -z "$CUDA_HOME" ] && command -v nvcc &>/dev/null; then
+        CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+    fi
+    if [ -n "$CUDA_HOME" ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
+        HAS_CUDA=1
+        ok "CUDA installed at $CUDA_HOME"
+        return 0
+    fi
+    warn "package install ran but nvcc not found afterwards"
+    return 1
+}
+
+# ============================================================================
 # DEPS — toolchain + venv + Python packages
 # ============================================================================
 do_deps() {
@@ -289,9 +359,20 @@ do_deps() {
     # --- CUDA / Metal ---
     if [ "$PLATFORM" = "linux" ]; then
         step "CUDA toolkit"
-        if [ "$HAS_CUDA" = "1" ]; then
+        if [ "$HAS_CUDA" != "1" ]; then
+            info "CUDA toolchain not detected — attempting auto-install"
+            if try_install_cuda; then
+                ok "nvcc: $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
+            else
+                warn "auto-install failed — falling back to CPU build (--features cpu,no-cuda)"
+                info "  GPU ops will panic at runtime; install CUDA manually + set CUDA_HOME"
+                info "  skipping nsjail (CUDA-host sandbox); CPU build runs tools without sandbox"
+            fi
+        else
             ok "nvcc: $("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | grep release)"
+        fi
 
+        if [ "$HAS_CUDA" = "1" ]; then
             step "nsjail (sandbox)"
             if command -v nsjail &>/dev/null; then
                 ok "nsjail already installed"
@@ -308,10 +389,6 @@ do_deps() {
                 rm -rf "$nsjail_tmp"
                 ok "nsjail built and installed"
             fi
-        else
-            warn "CUDA toolchain not found — falling back to CPU build (--features cpu,no-cuda)"
-            info "GPU ops will panic at runtime; install CUDA + set CUDA_HOME to enable cuda path"
-            info "skipping nsjail (CUDA-host sandbox); CPU build runs tools without sandbox"
         fi
     else
         step "Apple Silicon / Metal backend"
