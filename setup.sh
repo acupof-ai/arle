@@ -273,6 +273,67 @@ do_check() {
 }
 
 # ============================================================================
+# SYSTEM DEPS — Rust crate native deps (pkg-config, openssl-dev, cmake, clang,
+# protobuf-compiler, build essentials). Without these, `cargo build` fails on
+# crates like openssl-sys / prost-build / bindgen-using crates. Idempotent —
+# package managers skip already-installed packages. Soft-fail on unknown
+# distros (we warn; the user can install manually).
+# ============================================================================
+install_system_deps() {
+    local distro=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        distro="$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')"
+    fi
+
+    local sudo_prefix=""
+    if [ "$(id -u)" != "0" ]; then
+        if command -v sudo &>/dev/null; then
+            sudo_prefix="sudo"
+        else
+            warn "non-root and no sudo — skipping system-deps install; run as root or install manually:"
+            warn "  pkg-config openssl-dev cmake clang protobuf-compiler build-essential"
+            return 1
+        fi
+    fi
+
+    info "Installing native build deps (pkg-config, openssl, cmake, clang, protobuf)"
+    case "$distro" in
+        *cachyos*|*arch*|*manjaro*|*endeavouros*)
+            $sudo_prefix pacman -S --noconfirm --needed \
+                base-devel pkgconf openssl cmake clang protobuf || return 1
+            ;;
+        *ubuntu*|*debian*|*pop*|*linuxmint*)
+            $sudo_prefix apt-get update -qq || return 1
+            $sudo_prefix apt-get install -y -qq \
+                build-essential pkg-config libssl-dev cmake clang libclang-dev \
+                protobuf-compiler curl ca-certificates || return 1
+            ;;
+        *fedora*|*rhel*|*centos*|*rocky*|*alma*)
+            local pkg_mgr=""
+            command -v dnf &>/dev/null && pkg_mgr=dnf
+            [ -z "$pkg_mgr" ] && command -v yum &>/dev/null && pkg_mgr=yum
+            [ -z "$pkg_mgr" ] && return 1
+            $sudo_prefix "$pkg_mgr" install -y \
+                pkgconf-pkg-config openssl-devel cmake clang protobuf-compiler \
+                gcc gcc-c++ make curl ca-certificates || return 1
+            ;;
+        *opensuse*|*suse*)
+            $sudo_prefix zypper --non-interactive install \
+                pkg-config libopenssl-devel cmake clang protobuf-devel \
+                gcc gcc-c++ make curl ca-certificates || return 1
+            ;;
+        *)
+            warn "no system-deps recipe for distro '$distro' — install manually:"
+            warn "  pkg-config openssl-dev cmake clang protobuf-compiler build-essential"
+            return 1
+            ;;
+    esac
+    ok "Native build deps installed"
+    return 0
+}
+
+# ============================================================================
 # CUDA AUTO-INSTALL — best-effort install via the host package manager.
 # Returns 0 on success (sets HAS_CUDA=1 + CUDA_HOME), 1 on failure.
 # ============================================================================
@@ -344,6 +405,16 @@ try_install_cuda() {
 # DEPS — toolchain + venv + Python packages
 # ============================================================================
 do_deps() {
+    # --- System deps (pkg-config, openssl-dev, cmake, clang, protobuf) ---
+    # These are required by cargo dep build scripts (openssl-sys, prost-build,
+    # bindgen-using crates). Without them `cargo build` fails before we even
+    # reach CUDA. Linux-only; macOS gets these from Xcode CLT + Homebrew on
+    # demand.
+    if [ "$PLATFORM" = "linux" ]; then
+        step "System build dependencies"
+        install_system_deps || warn "system-deps install failed — cargo build may break on openssl-sys / prost / bindgen"
+    fi
+
     # --- Rust ---
     step "Rust toolchain"
     if command -v rustc &>/dev/null; then
