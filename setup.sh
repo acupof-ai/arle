@@ -15,7 +15,7 @@
 # Environment variables:
 #   MODEL_ID      — HuggingFace model ID  (default: Qwen/Qwen3-8B)
 #   MODEL_DIR     — Local path for model  (default: models/Qwen3-8B)
-#   CUDA_HOME     — CUDA toolkit path     (default: /usr/local/cuda)
+#   CUDA_HOME     — CUDA toolkit path     (autodetect: /usr/local/cuda, /opt/cuda, or `nvcc` on PATH)
 #   SKIP_MODEL    — Set to 1 to skip model download
 #   ARLE_SKIP_WEB — Set to 1 to skip the web/ frontend (bun + Astro) bootstrap
 #   PYTHON        — Python interpreter     (default: python3)
@@ -74,9 +74,25 @@ fi
 VENV_DIR="$SCRIPT_DIR/.venv"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-8B}"
 MODEL_DIR="${MODEL_DIR:-models/Qwen3-8B}"
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 SKIP_MODEL="${SKIP_MODEL:-0}"
 PYTHON="${PYTHON:-python3}"
+
+# CUDA_HOME: honor env, else autodetect across common distro layouts.
+#   Ubuntu/RHEL/Debian: /usr/local/cuda
+#   Arch/CachyOS:       /opt/cuda
+#   Fallback:           derive from `nvcc` on PATH
+if [ -z "${CUDA_HOME:-}" ]; then
+    for _candidate in /usr/local/cuda /opt/cuda; do
+        if [ -x "$_candidate/bin/nvcc" ]; then
+            CUDA_HOME="$_candidate"
+            break
+        fi
+    done
+    if [ -z "${CUDA_HOME:-}" ] && command -v nvcc &>/dev/null; then
+        CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+    fi
+    CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+fi
 
 # ---------------------------------------------------------------------------
 # Mode parsing
@@ -577,7 +593,7 @@ do_full() {
     echo ""
     if [ "$PLATFORM" = "linux" ]; then
         echo "  # 2. Set runtime library paths (Linux/CUDA)"
-        echo "  export LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
+        echo "  export LD_LIBRARY_PATH=/usr/lib64-nvidia:$CUDA_HOME/lib64:\$LD_LIBRARY_PATH"
         echo ""
     fi
     echo "  # Run agent REPL"
