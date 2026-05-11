@@ -116,16 +116,13 @@ __global__ void add_native_kernel(
     __nv_bfloat162 b_lo = load_bf16x2(bv.x);
     __nv_bfloat162 b_hi = load_bf16x2(bv.y);
 
-    __nv_bfloat162 r_lo, r_hi;
-    r_lo.x = __float2bfloat16(__bfloat162float(a_lo.x) + __bfloat162float(b_lo.x));
-    r_lo.y = __float2bfloat16(__bfloat162float(a_lo.y) + __bfloat162float(b_lo.y));
-    r_hi.x = __float2bfloat16(__bfloat162float(a_hi.x) + __bfloat162float(b_hi.x));
-    r_hi.y = __float2bfloat16(__bfloat162float(a_hi.y) + __bfloat162float(b_hi.y));
+    __nv_bfloat162 r_lo = __hadd2_rn(a_lo, b_lo);
+    __nv_bfloat162 r_hi = __hadd2_rn(a_hi, b_hi);
     out_vec[idx4] = make_uint2(store_bf16x2(r_lo), store_bf16x2(r_hi));
   }
 
   for (int idx = n4 * 4 + idx4; idx < n; idx += gridDim.x * BASIC_BLOCK) {
-    out[idx] = __float2bfloat16(__bfloat162float(a[idx]) + __bfloat162float(b[idx]));
+    out[idx] = __hadd_rn(a[idx], b[idx]);
   }
 }
 
@@ -136,7 +133,7 @@ __global__ void add_scalar_kernel(
     int n) {
   int idx = blockIdx.x * BASIC_BLOCK + threadIdx.x;
   if (idx < n) {
-    out[idx] = __float2bfloat16(__bfloat162float(a[idx]) + __bfloat162float(b[idx]));
+    out[idx] = __hadd_rn(a[idx], b[idx]);
   }
 }
 
