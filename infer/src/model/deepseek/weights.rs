@@ -1,9 +1,8 @@
 //! DeepSeek V4 model weights.
 //!
 //! The runtime target is the local `DeepseekV4ForCausalLM` checkpoint at
-//! `infer/models/dsv4-mini-1B-init/`. V3-era `DeepSeekConfig::nano()` remains a
-//! train-side fixture, but infer-side DeepSeek wiring uses
-//! [`deepseek_spec::DeepSeekV4Config`] and its HF tensor-name contract.
+//! `infer/models/dsv4-mini-1B-init/`. Infer-side DeepSeek wiring uses
+//! [`deepseek_spec::DeepSeekV4Config`] and its HF tensor-name contract only.
 
 use std::path::Path;
 

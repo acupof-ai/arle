@@ -19,8 +19,8 @@ use cuda_kernels::prelude::{DeviceContext, PagedKVPool};
 pub struct DeepseekBatchDecodeBuffers;
 
 impl DeepseekBatchDecodeBuffers {
-    /// Allocate the decode context. Returns an empty marker until the MLA
-    /// decode kernel lands.
+    /// Allocate the decode context. Returns an empty marker until the V4 decode
+    /// kernels land.
     pub(super) fn new(
         _ctx: &DeviceContext,
         _max_batch_size: usize,

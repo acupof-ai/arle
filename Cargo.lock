@@ -520,6 +520,7 @@ dependencies = [
  "clap",
  "console 0.16.3",
  "ctrlc",
+ "deepseek-spec",
  "dialoguer",
  "hf-hub",
  "indicatif",

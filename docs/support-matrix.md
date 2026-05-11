@@ -60,14 +60,14 @@ Notes:
 | Qwen3 | Supported | Primary supported family. Native max ctx 40960. **Long-context RoPE scaling** (YARN / Linear / NtkAware) supported via `Qwen3Config::rope_scaling` (config接인 `e30bffe..da53d81`); apply via `scripts/setup_qwen3_yarn_config.py` to extend native 40k → 64k YARN×2 / 128k YARN×4 (CUDA-side viable, ≤ 16 GB GPU per `docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md`). Bench validation pending. |
 | Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. RoPE scaling (YARN / Linear / NtkAware) wired through `Qwen35Config::rope_scaling` for long-ctx extend (Phase 1+2 closed; Phase 3 bench pending). Metal DFlash is Beta; see §4a for the current validation note. |
 | Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. Full Qwen 3.6 serving coverage is the **#2 next-model priority** — see roadmap note below. |
-| DeepSeek V4 | In progress — substrate landing | DS0 spec crate (`crates/deepseek-spec/`) ships config + tensor-name + `Shard` annotations; runtime model skeleton (`infer/src/model/deepseek/*`) + nano autograd training (`arle train pretrain-dsv4 --deepseek-config nano`) landed 2026-05-05. MLA forward kernels, DS4 CUDA MoE forward, DS5 NCCL collectives in forward are the active blockers. Not a serving target yet. **#1 next-model priority.** |
+| DeepSeek V4 | In progress — V4-only substrate + CPU reference smoke | `crates/deepseek-spec` is V4-only for the local `infer/models/dsv4-mini-1B-init` checkpoint. `cpu_serve` has a slow Rust reference path that mmaps the 2.0 GB safetensors and runs a 1-token HTTP completion smoke; `arle train pretrain-dsv4` seeds from the same V4 1B init checkpoint and rejects old nano/V3 SKUs. CUDA optimized V4 attention/MoE/MTP kernels remain pending, so this is not a serving-performance target yet. **#1 next-model priority.** |
 | Llama 3/4 | Planned | Not yet supported. |
-| DeepSeek-V3/R1 | Planned | Not yet supported. |
+| DeepSeek-V3/R1 | Not carried | Deleted from the current registry/spec/train surface; reintroduction would require a new explicit project, not a compatibility branch inside DSv4. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
 
 **Next-model roadmap priority** (canonical in [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order)):
 
-1. **DeepSeek V4 (DS4)** — substrate landing; DS3 MLA + DS4 CUDA MoE + DS5 collectives are the active runtime blockers.
+1. **DeepSeek V4 (DS4)** — V4-only substrate and CPU reference smoke landed; CUDA V4 hybrid attention + MoE + MTP kernels are the active runtime blockers.
 2. **Qwen 3.6** — planned / scoping; CUDA serving and kernel coverage land after the DS4 runtime substrate is producing benches. Metal load path already exists for diagnostic use.
 
 Other "Planned" families above sit behind these two and are not actively scheduled.

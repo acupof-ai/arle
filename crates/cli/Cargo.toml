@@ -29,6 +29,7 @@ agent = { path = "../agent" }
 autograd = { path = "../autograd", default-features = false }
 chat = { path = "../chat" }
 infer = { path = "../../infer", default-features = false }
+deepseek-spec = { path = "../deepseek-spec" }
 qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
 thiserror = { workspace = true }

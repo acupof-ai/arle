@@ -10,6 +10,9 @@ pub mod weight_loader;
 pub mod backend;
 pub mod block_manager;
 pub(crate) mod deepseek_v4_manifest;
+#[cfg(feature = "cpu")]
+#[path = "model/deepseek/reference.rs"]
+pub(crate) mod deepseek_v4_reference;
 pub mod distributed;
 pub mod error;
 pub mod events;

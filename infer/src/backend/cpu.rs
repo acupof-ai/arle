@@ -6,16 +6,19 @@
 //! without CUDA or Metal.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde_json::Value;
 
 use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+use crate::deepseek_v4_reference::DeepseekV4ReferenceModel;
 use crate::model_source::ResolvedModelSource;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
 const DEFAULT_COMPLETION_BUDGET: usize = 64;
+const DEFAULT_DSV4_REFERENCE_BUDGET: usize = 1;
 const STREAM_CHUNK_CHARS: usize = 24;
 
 pub struct CpuBackend {
@@ -23,6 +26,7 @@ pub struct CpuBackend {
     model_family: Option<String>,
     model_path: Option<PathBuf>,
     tokenizer: Option<Tokenizer>,
+    dsv4_reference: Option<DeepseekV4ReferenceModel>,
 }
 
 impl CpuBackend {
@@ -32,6 +36,7 @@ impl CpuBackend {
             model_family: None,
             model_path: None,
             tokenizer: None,
+            dsv4_reference: None,
         }
     }
 
@@ -81,6 +86,74 @@ impl CpuBackend {
 
         fallback_generate_text(&base, budget)
     }
+
+    fn generate_dsv4_reference(
+        &self,
+        prompt: &str,
+        params: &SamplingParams,
+    ) -> Result<GenerateResult> {
+        let model = self
+            .dsv4_reference
+            .as_ref()
+            .ok_or_else(|| anyhow!("DeepSeek V4 reference model is not loaded"))?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow!("DeepSeek V4 reference path requires tokenizer.json"))?;
+        ensure!(
+            params.is_greedy(),
+            "DeepSeek V4 CPU reference currently supports greedy decoding only"
+        );
+        let prompt_tokens = self.count_tokens(prompt);
+        let budget = params
+            .max_new_tokens
+            .unwrap_or(DEFAULT_DSV4_REFERENCE_BUDGET);
+        if budget == 0 {
+            return Ok(GenerateResult {
+                text: String::new(),
+                prompt_tokens,
+                completion_tokens: 0,
+                finish_reason: "length".into(),
+                ttft_ms: 0.0,
+                prompt_tps: 0.0,
+                generation_tps: 0.0,
+                total_time_ms: 0.0,
+            });
+        }
+
+        let started = Instant::now();
+        let (text, completion_tokens) = model.generate_greedy(
+            prompt,
+            tokenizer,
+            budget,
+            &params.stop_token_ids,
+            params.ignore_eos,
+        )?;
+        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let finish_reason = if completion_tokens < budget {
+            "stop"
+        } else {
+            "length"
+        };
+        Ok(GenerateResult {
+            text,
+            prompt_tokens,
+            completion_tokens,
+            finish_reason: finish_reason.into(),
+            ttft_ms: total_ms,
+            prompt_tps: if total_ms > 0.0 {
+                prompt_tokens as f64 / (total_ms / 1000.0)
+            } else {
+                0.0
+            },
+            generation_tps: if total_ms > 0.0 {
+                completion_tokens as f64 / (total_ms / 1000.0)
+            } else {
+                0.0
+            },
+            total_time_ms: total_ms,
+        })
+    }
 }
 
 fn fallback_generate_text(base: &str, budget: usize) -> (String, String, usize) {
@@ -116,12 +189,26 @@ impl InferenceBackend for CpuBackend {
                     .map(str::to_string)
             });
         self.tokenizer = source.load_tokenizer().ok();
+        self.dsv4_reference = match self.model_family.as_deref() {
+            Some("DeepseekV4ForCausalLM" | "deepseek_v4") => Some(
+                DeepseekV4ReferenceModel::load(source.model_root()).with_context(|| {
+                    format!(
+                        "loading DeepSeek V4 CPU reference model from {}",
+                        source.model_root().display()
+                    )
+                })?,
+            ),
+            _ => None,
+        };
         self.model_path = Some(source.model_root().to_path_buf());
         Ok(())
     }
 
     fn generate(&self, prompt: &str, params: &SamplingParams) -> Result<GenerateResult> {
         self.ensure_loaded()?;
+        if self.dsv4_reference.is_some() {
+            return self.generate_dsv4_reference(prompt, params);
+        }
 
         let prompt_tokens = self.count_tokens(prompt);
         let (text, finish_reason, completion_tokens) = self.generate_text(prompt, params);
