@@ -253,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires checkpoint at infer/models/dsv4-mini-1B-init"]
     fn v4_config_fields_match_init_checkpoint() {
         let cfg = replica_config();
         assert_eq!(cfg.model_type, "deepseek_v4");
@@ -279,12 +280,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires checkpoint at infer/models/dsv4-mini-1B-init"]
     fn v4_tensor_names_fully_covered() {
         let cfg = replica_config();
         validate_v4_tensor_name_coverage(&cfg).expect("V4 tensor coverage");
     }
 
     #[test]
+    #[ignore = "requires checkpoint at infer/models/dsv4-mini-1B-init"]
     fn v4_checkpoint_manifest_contains_required_tensors() {
         let cfg = replica_config();
         let manifest = validate_deepseek_v4_checkpoint_manifest(replica_model_path(), &cfg)
