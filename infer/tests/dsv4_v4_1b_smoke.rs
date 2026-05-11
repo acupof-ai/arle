@@ -70,3 +70,29 @@ fn dsv4_v4_1b_smoke_prefill_and_greedy_decode() {
         logits.len
     );
 }
+
+#[test]
+#[ignore = "requires CUDA and checkpoint at infer/models/dsv4-mini-1B-init"]
+fn dsv4_cuda_sw_one_token_decode_logits_shape_finite() {
+    let path = model_path();
+    let runtime = DeepseekRuntimeConfig::from_model_dir(&path).expect("parse V4 runtime config");
+    let summary = runtime.spec.attention_operator_summary();
+    assert!(
+        summary.sliding_window_layers > 0,
+        "Phase 2A.0 requires at least one SlidingWindow layer"
+    );
+
+    let model =
+        DeepseekModel::from_safetensors(path.to_str().unwrap(), runtime).expect("load V4 model");
+    let mut state = model.create_state().expect("create state");
+    model.forward_decode(1, &mut state).expect("forward_decode");
+
+    use infer::model::GenerationState;
+    let logits = state.logits();
+    assert_eq!(logits.len, 129_280);
+    let logits_host = logits
+        .to_host(model.device_context())
+        .expect("copy logits to host");
+    assert_eq!(logits_host.len(), 129_280);
+    assert!(logits_host.iter().all(|value| value.is_finite()));
+}
