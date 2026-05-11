@@ -6,7 +6,8 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, ensure};
+use log::info;
 
 use super::config::DeepseekRuntimeConfig;
 #[cfg(feature = "cuda")]
@@ -50,13 +51,13 @@ pub struct DeepseekModel {
     #[cfg(feature = "cuda")]
     pub(super) ctx: DeviceContext,
     #[cfg(feature = "cuda")]
-    pub(super) embed_tokens: DeviceMatrix,
+    pub(super) embed_tokens: Option<DeviceMatrix>,
     #[cfg(feature = "cuda")]
-    pub(super) lm_head: DeviceMatrix,
+    pub(super) lm_head: Option<DeviceMatrix>,
     #[cfg(feature = "cuda")]
-    pub(super) norm: DeviceVec,
+    pub(super) norm: Option<DeviceVec>,
     #[cfg(feature = "cuda")]
-    pub(super) head_hc: DeepseekV4HyperConnection,
+    pub(super) head_hc: Option<DeepseekV4HyperConnection>,
     #[cfg(feature = "cuda")]
     pub(super) layers: Vec<DeepseekLayer>,
 }
@@ -88,6 +89,22 @@ impl DeepseekModel {
     ) -> Result<DeepseekV4CheckpointManifest> {
         validate_deepseek_v4_checkpoint_manifest(model_path, config)
     }
+
+    pub(super) fn validate_phase0_sw_decode_scope(&self) -> Result<()> {
+        let summary = self.config.spec.attention_operator_summary();
+        ensure!(
+            summary.sliding_window_layers > 0,
+            "DeepSeek V4 Phase 0 requires at least one SlidingWindow attention layer; \
+             found csa_layers={} hca_layers={}",
+            summary.csa_layers,
+            summary.hca_layers
+        );
+        ensure!(
+            self.config.vocab_size > 0,
+            "DeepSeek V4 Phase 0 requires a non-empty vocab"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -97,16 +114,38 @@ impl DeepseekModel {
     /// Phase 0.5 intentionally stops before GPU allocation; return an error
     /// instead of panicking so loader tests can distinguish "parsed V4 config"
     /// from "kernels not implemented yet".
-    pub fn from_config(_config: DeepseekRuntimeConfig) -> Result<Self> {
-        bail!("DeepSeek V4 weight allocation is pending Phase 2A kernels")
+    pub fn from_config(config: DeepseekRuntimeConfig) -> Result<Self> {
+        let ctx = DeviceContext::new()?;
+        let model = Self {
+            config,
+            ctx,
+            embed_tokens: None,
+            lm_head: None,
+            norm: None,
+            head_hc: None,
+            layers: Vec::new(),
+        };
+        model.validate_phase0_sw_decode_scope()?;
+        Ok(model)
     }
 
     /// Load a V4 checkpoint by safetensors path.
     ///
-    /// Phase 0.5 validates config + tensor-name truth, then returns a typed
-    /// not-implemented error before GPU allocation.
+    /// Phase 2A.0 validates config + tensor-name truth and brings up the CUDA
+    /// model shell. Full weight allocation remains deferred until the SW-only
+    /// smoke graduates to numerical parity.
     pub fn from_safetensors(path: &str, config: DeepseekRuntimeConfig) -> Result<Self> {
         let _manifest = Self::validate_checkpoint_manifest(path, &config.spec)?;
-        bail!("DeepSeek V4 CUDA forward kernels are pending Phase 2A")
+        let model = Self::from_config(config)?;
+        let summary = model.config.spec.attention_operator_summary();
+        info!(
+            "DeepSeek V4 Phase 2A.0 CUDA SW-only smoke loaded: sliding_window_layers={} \
+             csa_layers={} hca_layers={} vocab_size={}",
+            summary.sliding_window_layers,
+            summary.csa_layers,
+            summary.hca_layers,
+            model.config.vocab_size
+        );
+        Ok(model)
     }
 }
