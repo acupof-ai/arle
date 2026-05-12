@@ -359,11 +359,18 @@ __global__ void dsv4_fp8_gemv_batch_kernel(
     int row_in_block = threadIdx.x / threads_per_row;
     if (row >= N) return;
 
+    const int block_h = (N + scale_rows - 1) / scale_rows;
+    const int block_w = (K + scale_cols - 1) / scale_cols;
+    const int sr_raw = row / block_h;
+    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
+    const int scale_row_offset = sr * scale_cols;
     const __nv_bfloat16* x = input + batch_idx * K;
     float sum = 0.0f;
     for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const int sc_raw = k / block_w;
+        const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
         const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
-            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+            * dsv4_decode_e8m0(scales[scale_row_offset + sc]);
         sum += w * __bfloat162float(x[k]);
     }
 
