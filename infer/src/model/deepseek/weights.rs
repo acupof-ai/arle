@@ -11,6 +11,8 @@ use log::info;
 
 use super::config::DeepseekRuntimeConfig;
 #[cfg(feature = "cuda")]
+use super::load::load_dsv4_matrix_raw;
+#[cfg(feature = "cuda")]
 use super::mla::DeepseekV4Attention;
 #[cfg(feature = "cuda")]
 use super::mlp::DeepseekV4MoeBlock;
@@ -24,7 +26,7 @@ use crate::deepseek_v4_manifest::{
 #[cfg(feature = "cuda")]
 use crate::model::common;
 #[cfg(feature = "cuda")]
-use crate::weight_loader::{load_tensor_1d, load_tensor_2d};
+use crate::weight_loader::load_tensor_1d;
 
 /// Hyper-connection tensors used by the V4 layer/head mixers.
 #[cfg(feature = "cuda")]
@@ -154,7 +156,8 @@ impl DeepseekModel {
         let vocab_size = model.config.vocab_size;
         let hidden_size = model.config.hidden_size;
 
-        let embed_tokens = load_tensor_2d(&model.ctx, &shards, &weight_map, names.embed_tokens())?;
+        let embed_tokens =
+            load_dsv4_matrix_raw(&model.ctx, &shards, &weight_map, names.embed_tokens())?;
         ensure!(
             embed_tokens.rows == vocab_size && embed_tokens.cols == hidden_size,
             "DeepSeek V4 embed.weight shape [{}, {}] does not match vocab_size={} hidden_size={}",
@@ -163,7 +166,7 @@ impl DeepseekModel {
             vocab_size,
             hidden_size
         );
-        let lm_head = load_tensor_2d(&model.ctx, &shards, &weight_map, names.lm_head())?;
+        let lm_head = load_dsv4_matrix_raw(&model.ctx, &shards, &weight_map, names.lm_head())?;
         ensure!(
             lm_head.rows == vocab_size && lm_head.cols == hidden_size,
             "DeepSeek V4 head.weight shape [{}, {}] does not match vocab_size={} hidden_size={}",
