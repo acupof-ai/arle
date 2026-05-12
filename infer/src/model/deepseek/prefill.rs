@@ -58,12 +58,16 @@ impl DeepseekModel {
             );
         }
 
-        // Phase 2A.1 only promises a scheduler-safe CUDA prefill surface. The
-        // logits vector is intentionally all-zero until the V4 weight loader and
-        // real attention/MoE kernels are wired.
         state.base.prefill_logits = Some(
-            DeviceVec::zeros(&self.ctx, self.config.vocab_size)?
-                .with_label("dsv4_phase2a1_prefill_logits"),
+            if let Some(logits) = self.compute_top_level_logits(tokens)? {
+                logits
+            } else {
+                // `from_config` tests still build a shell without weights.
+                // Keep that path scheduler-safe while `from_safetensors`
+                // exercises the real top-level tensors.
+                DeviceVec::zeros(&self.ctx, self.config.vocab_size)?
+                    .with_label("dsv4_phase2a1_prefill_logits")
+            },
         );
         state.base.kv_cache.advance_seq_len(tokens.len());
         Ok(())

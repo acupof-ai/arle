@@ -84,10 +84,12 @@ impl ModelForward for DeepseekModel {
             self.config.vocab_size
         );
 
-        // Phase 2A.0 only licenses the CUDA decode surface: a device-resident
-        // logits vector with the correct vocab length and finite values. The
-        // buffer is allocated as zeros in `create_state`; real SW attention and
-        // shared-expert compute land in later, separately gated tranches.
+        // Phase 2A.1 uses the loaded top-level tensors for non-zero logits when
+        // available. Real contextual attention and shared-expert compute land
+        // in later, separately gated tranches.
+        if let Some(logits) = self.compute_top_level_logits(&[token])? {
+            state.decode_logits = logits;
+        }
         state.base.prefill_logits = None;
         state.base.kv_cache.advance_seq_len(1);
         Ok(())
@@ -153,10 +155,9 @@ impl ModelForward for DeepseekModel {
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
-        // Stop-token resolution mirrors `Qwen3Model::is_stop_token`: BOS / EOS
-        // come from the spec config; downstream callers (REPL, HTTP) override
-        // via per-request stop sequences.
-        self.config.eos_token_id == Some(token_id) || self.config.bos_token_id == Some(token_id)
+        // DeepSeek V4 generation stops on EOS; BOS is a valid emitted special
+        // token and the CPU reference path intentionally does not stop on it.
+        self.config.eos_token_id == Some(token_id)
     }
 
     fn device_context(&self) -> &DeviceContext {

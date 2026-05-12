@@ -21,6 +21,10 @@ use deepseek_spec::DeepSeekV4Config;
 use crate::deepseek_v4_manifest::{
     DeepseekV4CheckpointManifest, validate_deepseek_v4_checkpoint_manifest,
 };
+#[cfg(feature = "cuda")]
+use crate::model::common;
+#[cfg(feature = "cuda")]
+use crate::weight_loader::{load_tensor_1d, load_tensor_2d};
 
 /// Hyper-connection tensors used by the V4 layer/head mixers.
 #[cfg(feature = "cuda")]
@@ -137,24 +141,83 @@ impl DeepseekModel {
 
     /// Load a V4 checkpoint by safetensors path.
     ///
-    /// Phase 2A.0 validates config + tensor-name truth and brings up the CUDA
-    /// model shell. Full weight allocation remains deferred until the SW-only
-    /// smoke graduates to numerical parity.
+    /// Phase 2A.1 validates config + tensor-name truth, loads the top-level
+    /// embedding/final-norm/LM-head tensors, and brings up a CUDA logits smoke.
+    /// Full per-layer weight allocation remains deferred until attention/MoE
+    /// kernels graduate to numerical parity.
     pub fn from_safetensors(path: &str, config: DeepseekRuntimeConfig) -> Result<Self> {
         let _manifest = Self::validate_checkpoint_manifest(path, &config.spec)?;
-        let model = Self::from_config(config)?;
+        let mut model = Self::from_config(config)?;
+        let (mmaps, weight_map) = common::load_safetensors(path, false)?;
+        let shards = common::deserialize_shards(&mmaps)?;
+        let names = model.config.spec.tensor_names();
+        let vocab_size = model.config.vocab_size;
+        let hidden_size = model.config.hidden_size;
+
+        let embed_tokens = load_tensor_2d(&model.ctx, &shards, &weight_map, names.embed_tokens())?;
+        ensure!(
+            embed_tokens.rows == vocab_size && embed_tokens.cols == hidden_size,
+            "DeepSeek V4 embed.weight shape [{}, {}] does not match vocab_size={} hidden_size={}",
+            embed_tokens.rows,
+            embed_tokens.cols,
+            vocab_size,
+            hidden_size
+        );
+        let lm_head = load_tensor_2d(&model.ctx, &shards, &weight_map, names.lm_head())?;
+        ensure!(
+            lm_head.rows == vocab_size && lm_head.cols == hidden_size,
+            "DeepSeek V4 head.weight shape [{}, {}] does not match vocab_size={} hidden_size={}",
+            lm_head.rows,
+            lm_head.cols,
+            vocab_size,
+            hidden_size
+        );
+        let norm = load_tensor_1d(&model.ctx, &shards, &weight_map, names.norm())?;
+        ensure!(
+            norm.len == hidden_size,
+            "DeepSeek V4 norm.weight len {} does not match hidden_size={}",
+            norm.len,
+            hidden_size
+        );
+
+        model.embed_tokens = Some(embed_tokens);
+        model.lm_head = Some(lm_head);
+        model.norm = Some(norm);
+
         let summary = model.config.spec.attention_operator_summary();
         info!(
-            "DeepSeek V4 Phase 2A.0 CUDA SW-only smoke loaded: sliding_window_layers={} \
-             csa_layers={} hca_layers={} vocab_size={} ep_rank={}/{} experts_per_rank={}",
+            "DeepSeek V4 Phase 2A.1 CUDA top-level logits smoke loaded: sliding_window_layers={} \
+             csa_layers={} hca_layers={} vocab_size={} hidden_size={} ep_rank={}/{} experts_per_rank={}",
             summary.sliding_window_layers,
             summary.csa_layers,
             summary.hca_layers,
             model.config.vocab_size,
+            model.config.hidden_size,
             model.config.ep.rank,
             model.config.ep.world_size,
             model.config.ep.experts_per_rank
         );
         Ok(model)
+    }
+
+    pub(super) fn compute_top_level_logits(&self, tokens: &[u32]) -> Result<Option<DeviceVec>> {
+        let (Some(embed_tokens), Some(norm), Some(lm_head)) = (
+            self.embed_tokens.as_ref(),
+            self.norm.as_ref(),
+            self.lm_head.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let hidden =
+            common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, self.config.hidden_size)?;
+        let logits = common::compute_logits_batch(
+            &self.ctx,
+            &hidden,
+            norm,
+            lm_head,
+            self.config.rms_norm_eps,
+            false,
+        )?;
+        Ok(Some(logits.with_label("dsv4_phase2a1_top_level_logits")))
     }
 }
