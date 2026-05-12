@@ -100,6 +100,18 @@ fn test_dsv4_fp8_gemv() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_fp8_gemv_preserves_finite_nan_pattern() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let weight = DeviceMatrix::from_dsv4_fp8_block_scaled(&ctx, &[0x7f, 0xff], &[127], 2, 1, 1, 1)?;
+    let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0]))?;
+    let y = linear(&ctx, &x, &weight)?;
+    let host = y.to_host(&ctx)?;
+
+    assert_close(&host, &[448.0, -448.0], 0.01);
+    Ok(())
+}
+
+#[test]
 fn test_dsv4_fp4_gemv() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let weight = DeviceMatrix::from_dsv4_fp4_block_scaled(&ctx, &[0x21, 0xb3], &[127], 2, 2, 1, 1)?;

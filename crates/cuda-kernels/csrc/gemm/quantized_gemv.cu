@@ -8,6 +8,7 @@
 // W2: unsigned 2-bit, zero-point=2. Extract via 0x03030303 mask.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -211,16 +212,12 @@ __device__ __forceinline__ float dsv4_decode_e8m0(uint8_t bits) {
 
 __device__ __forceinline__ float dsv4_decode_fp8_e4m3(uint8_t bits) {
     if ((bits & 0x7f) == 0) return 0.0f;
-    const float sign = (bits & 0x80) ? -1.0f : 1.0f;
-    const int exp = (bits >> 3) & 0x0f;
-    const int mant = bits & 0x07;
-    if (exp == 0) {
-        return sign * static_cast<float>(mant) * 0.001953125f;  // 2^-9
+    if ((bits & 0x7f) == 0x7f) {
+        return (bits & 0x80) ? -448.0f : 448.0f;
     }
-    if (exp == 15 && mant == 7) {
-        return sign * 448.0f;
-    }
-    return sign * (1.0f + static_cast<float>(mant) * 0.125f) * exp2f(static_cast<float>(exp - 7));
+    __nv_fp8_e4m3 value;
+    value.__x = bits;
+    return static_cast<float>(value);
 }
 
 __device__ __forceinline__ float dsv4_decode_fp4_e2m1(uint8_t bits) {
