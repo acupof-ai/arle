@@ -146,9 +146,12 @@ impl DeepSeekV4Config {
                 "num_attention_heads must be divisible by o_groups",
             ));
         }
-        if self.compress_ratios.len() != self.num_hidden_layers {
+        let compress_ratio_count = self.compress_ratios.len();
+        let hidden_plus_mtp = self.num_hidden_layers + self.num_nextn_predict_layers;
+        if compress_ratio_count != self.num_hidden_layers && compress_ratio_count != hidden_plus_mtp
+        {
             return Err(DeepSeekConfigError::InvalidConfig(
-                "compress_ratios length must match num_hidden_layers",
+                "compress_ratios length must match num_hidden_layers or include MTP layers",
             ));
         }
         if self.rope_parameters.rope_type.is_empty() {
@@ -977,7 +980,7 @@ mod tests {
             "index_topk": 512,
             "num_hash_layers": 1,
             "sliding_window": 128,
-            "compress_ratios": [0, 4],
+            "compress_ratios": [0, 4, 0],
             "compress_rope_theta": 160000.0,
             "hc_mult": 4,
             "hc_sinkhorn_iters": 20,
@@ -1006,6 +1009,7 @@ mod tests {
         assert_eq!(cfg.dtype, "bfloat16");
         assert_eq!(cfg.rope_parameters.rope_type, "yarn");
         assert_eq!(cfg.rope_parameters.factor, 16.0);
+        assert_eq!(cfg.compress_ratios.len(), 3);
         assert_eq!(cfg.pad_token_id, None);
     }
 
