@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail, ensure};
 use deepseek_spec::{DeepSeekV4CompressorTensorNames, DeepSeekV4Config, DeepSeekV4MoeTensorNames};
 use half::bf16;
+use log::info;
 use memmap2::Mmap;
 use serde::Deserialize;
 
@@ -125,7 +126,24 @@ impl DeepseekV4ReferenceModel {
             self.config.compress_rope_theta,
         );
 
-        for layer_idx in 0..self.config.num_hidden_layers {
+        let layer_limit = reference_layer_limit(self.config.num_hidden_layers)?;
+        let progress =
+            reference_progress_enabled()? || layer_limit != self.config.num_hidden_layers;
+        if layer_limit != self.config.num_hidden_layers {
+            info!(
+                "DeepSeek V4 CPU reference limiting forward to {}/{} layer(s)",
+                layer_limit, self.config.num_hidden_layers
+            );
+        }
+
+        for layer_idx in 0..layer_limit {
+            if progress {
+                info!(
+                    "DeepSeek V4 CPU reference layer {}/{} begin",
+                    layer_idx + 1,
+                    layer_limit
+                );
+            }
             stream = self.layer_forward(
                 layer_idx,
                 &stream,
@@ -135,6 +153,13 @@ impl DeepseekV4ReferenceModel {
                 &rope_cos_c,
                 &rope_sin_c,
             )?;
+            if progress {
+                info!(
+                    "DeepSeek V4 CPU reference layer {}/{} done",
+                    layer_idx + 1,
+                    layer_limit
+                );
+            }
         }
 
         let last = seq - 1;
@@ -1208,6 +1233,39 @@ fn silu(value: f32) -> f32 {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn reference_layer_limit(total_layers: usize) -> Result<usize> {
+    let Some(raw) = std::env::var("INFER_DSV4_REF_MAX_LAYERS")
+        .ok()
+        .or_else(|| std::env::var("ARLE_DSV4_REF_MAX_LAYERS").ok())
+    else {
+        return Ok(total_layers);
+    };
+    let limit = raw
+        .parse::<usize>()
+        .with_context(|| format!("invalid INFER_DSV4_REF_MAX_LAYERS value `{raw}`"))?;
+    ensure!(
+        limit <= total_layers,
+        "INFER_DSV4_REF_MAX_LAYERS={} exceeds model layer count {}",
+        limit,
+        total_layers
+    );
+    Ok(limit)
+}
+
+fn reference_progress_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("INFER_DSV4_REF_PROGRESS")
+        .ok()
+        .or_else(|| std::env::var("ARLE_DSV4_REF_PROGRESS").ok())
+    else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+        _ => bail!("invalid INFER_DSV4_REF_PROGRESS value `{raw}`"),
+    }
 }
 
 fn decode_f8_e8m0(bits: u8) -> f32 {
