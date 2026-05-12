@@ -532,5 +532,10 @@ mod tests {
             got_output[..cols].iter().all(|&byte| byte == 0),
             "zero row should quantize to all-zero fp8 bytes"
         );
+        assert_eq!(
+            got_output[cols + 257],
+            0xfe,
+            "largest-magnitude negative value should quantize to E4M3 negative max"
+        );
     }
 }
