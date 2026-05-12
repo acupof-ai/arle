@@ -25,6 +25,9 @@ enum TensorDtype {
     Bf16,
     F32,
     I64,
+    I8,
+    F8E4M3,
+    F8E8M0,
     Unsupported,
 }
 
@@ -758,6 +761,9 @@ impl SafeTensorStore {
                 "BF16" => TensorDtype::Bf16,
                 "F32" => TensorDtype::F32,
                 "I64" => TensorDtype::I64,
+                "I8" => TensorDtype::I8,
+                "F8_E4M3" => TensorDtype::F8E4M3,
+                "F8_E8M0" => TensorDtype::F8E8M0,
                 _ => TensorDtype::Unsupported,
             };
             let start = header_end + tensor.data_offsets[0];
@@ -838,7 +844,7 @@ impl SafeTensorStore {
         let meta = self.meta(name)?;
         ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
         let rows = meta.shape[0];
-        let cols = meta.shape[1];
+        let cols = self.matrix_input_cols(meta);
         ensure!(
             x.len() == cols,
             "matvec {name} expects input len {cols}, got {}",
@@ -855,17 +861,83 @@ impl SafeTensorStore {
         let meta = self.meta(name)?;
         ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
         let rows = meta.shape[0];
-        let cols = meta.shape[1];
+        let cols = self.matrix_input_cols(meta);
         ensure!(row < rows, "row {row} out of range for {name}");
         ensure!(
             x.len() == cols,
             "row_dot {name} expects input len {cols}, got {}",
             x.len()
         );
-        let base = row * cols;
+        if matches!(meta.dtype, TensorDtype::F8E4M3 | TensorDtype::I8) {
+            return self.quantized_row_dot(name, meta, row, x);
+        }
+
+        let base = row * meta.shape[1];
         let mut acc = 0.0_f32;
         for col in 0..cols {
             acc += self.f32_at(meta, base + col)? * x[col];
+        }
+        Ok(acc)
+    }
+
+    fn matrix_input_cols(&self, meta: &TensorMeta) -> usize {
+        if meta.dtype == TensorDtype::I8 && meta.shape.len() == 2 {
+            meta.shape[1] * 2
+        } else {
+            meta.shape[1]
+        }
+    }
+
+    fn quantized_row_dot(
+        &self,
+        name: &str,
+        meta: &TensorMeta,
+        row: usize,
+        x: &[f32],
+    ) -> Result<f32> {
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map(|prefix| format!("{prefix}.scale"))
+            .with_context(|| format!("quantized tensor {name} must end with .weight"))?;
+        let scale = self.meta(&scale_name)?;
+        ensure!(
+            scale.shape.len() == 2,
+            "quantized scale tensor {scale_name} must be 2D"
+        );
+        let rows = meta.shape[0];
+        let cols = self.matrix_input_cols(meta);
+        let scale_rows = scale.shape[0];
+        let scale_cols = scale.shape[1];
+        let block_h = rows.div_ceil(scale_rows).max(1);
+        let block_w = cols.div_ceil(scale_cols).max(1);
+        let scale_row = (row / block_h).min(scale_rows - 1);
+
+        let mut acc = 0.0_f32;
+        match meta.dtype {
+            TensorDtype::F8E4M3 => {
+                let base = row * meta.shape[1];
+                for col in 0..cols {
+                    let scale_col = (col / block_w).min(scale_cols - 1);
+                    let sf = self.f32_at(scale, scale_row * scale_cols + scale_col)?;
+                    acc += self.f32_at(meta, base + col)? * sf * x[col];
+                }
+            }
+            TensorDtype::I8 => {
+                let base = row * meta.shape[1];
+                let data = self.data(meta);
+                for col in 0..cols {
+                    let packed = data[base + col / 2];
+                    let fp4 = if col % 2 == 0 {
+                        packed & 0x0f
+                    } else {
+                        (packed >> 4) & 0x0f
+                    };
+                    let scale_col = (col / block_w).min(scale_cols - 1);
+                    let sf = self.f32_at(scale, scale_row * scale_cols + scale_col)?;
+                    acc += decode_fp4_e2m1(fp4) * sf * x[col];
+                }
+            }
+            _ => unreachable!("quantized_row_dot called for non-quantized tensor"),
         }
         Ok(acc)
     }
@@ -892,6 +964,23 @@ impl SafeTensorStore {
                 Ok(f32::from_le_bytes(bytes))
             }
             TensorDtype::I64 => bail!("cannot read I64 tensor as f32"),
+            TensorDtype::I8 => bail!("cannot read packed I8/FP4 tensor as scalar f32"),
+            TensorDtype::F8E4M3 => {
+                let offset = idx;
+                ensure!(
+                    offset < meta.end - meta.start,
+                    "F8_E4M3 tensor read out of range"
+                );
+                Ok(decode_fp8_e4m3fn(self.data(meta)[offset]))
+            }
+            TensorDtype::F8E8M0 => {
+                let offset = idx;
+                ensure!(
+                    offset < meta.end - meta.start,
+                    "F8_E8M0 tensor read out of range"
+                );
+                Ok(decode_f8_e8m0(self.data(meta)[offset]))
+            }
             TensorDtype::Unsupported => bail!("cannot read unsupported tensor dtype as f32"),
         }
     }
@@ -1121,6 +1210,32 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+fn decode_f8_e8m0(bits: u8) -> f32 {
+    f32::from_bits((bits as u32) << 23)
+}
+
+fn decode_fp8_e4m3fn(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exp = (bits >> 3) & 0x0f;
+    let mant = bits & 0x07;
+    if exp == 0 {
+        sign * (mant as f32 / 8.0) * 2.0_f32.powi(-6)
+    } else {
+        sign * (1.0 + mant as f32 / 8.0) * 2.0_f32.powi(exp as i32 - 7)
+    }
+}
+
+fn decode_fp4_e2m1(bits: u8) -> f32 {
+    let sign = if bits & 0x08 == 0 { 1.0 } else { -1.0 };
+    let exp = (bits >> 1) & 0x03;
+    let mant = bits & 0x01;
+    if exp == 0 {
+        sign * (mant as f32 * 0.5)
+    } else {
+        sign * (1.0 + mant as f32 * 0.5) * 2.0_f32.powi(exp as i32 - 1)
+    }
+}
+
 fn argmax(values: &[f32]) -> usize {
     values
         .iter()
@@ -1169,6 +1284,18 @@ mod tests {
                     .into_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn dsv4_reference_decodes_flash_quant_scalars() {
+        assert_eq!(decode_f8_e8m0(127), 1.0);
+        assert_eq!(decode_f8_e8m0(126), 0.5);
+        assert_eq!(decode_fp4_e2m1(0b0000), 0.0);
+        assert_eq!(decode_fp4_e2m1(0b0001), 0.5);
+        assert_eq!(decode_fp4_e2m1(0b0010), 1.0);
+        assert_eq!(decode_fp4_e2m1(0b1011), -1.5);
+        assert_eq!(decode_fp8_e4m3fn(0x38), 1.0);
+        assert_eq!(decode_fp8_e4m3fn(0xb8), -1.0);
     }
 
     #[test]
