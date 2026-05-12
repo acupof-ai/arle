@@ -269,17 +269,26 @@ __global__ void quantize_scatter_kv_fp8_kernel(
         }
     }
     __syncthreads();
-    if (d < head_dim) {
-        kv_fp8[dst] = __nv_fp8_e4m3(val0 / s_scale);
-    }
-    if (d + 1 < head_dim) {
-        kv_fp8[dst + 1] = __nv_fp8_e4m3(val1 / s_scale);
-    }
-    if (d + 2 < head_dim) {
-        kv_fp8[dst + 2] = __nv_fp8_e4m3(val2 / s_scale);
-    }
-    if (d + 3 < head_dim) {
-        kv_fp8[dst + 3] = __nv_fp8_e4m3(val3 / s_scale);
+    if (d + 3 < head_dim && (dst & 3) == 0) {
+        float4 scaled = make_float4(
+            val0 / s_scale,
+            val1 / s_scale,
+            val2 / s_scale,
+            val3 / s_scale);
+        *reinterpret_cast<__nv_fp8x4_e4m3*>(kv_fp8 + dst) = __nv_fp8x4_e4m3(scaled);
+    } else {
+        if (d < head_dim) {
+            kv_fp8[dst] = __nv_fp8_e4m3(val0 / s_scale);
+        }
+        if (d + 1 < head_dim) {
+            kv_fp8[dst + 1] = __nv_fp8_e4m3(val1 / s_scale);
+        }
+        if (d + 2 < head_dim) {
+            kv_fp8[dst + 2] = __nv_fp8_e4m3(val2 / s_scale);
+        }
+        if (d + 3 < head_dim) {
+            kv_fp8[dst + 3] = __nv_fp8_e4m3(val3 / s_scale);
+        }
     }
 }
 
