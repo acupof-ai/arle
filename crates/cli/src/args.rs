@@ -83,11 +83,11 @@ impl BackendArg {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum ServeBackendArg {
+    #[value(alias = "arle", alias = "native")]
     Auto,
     Cpu,
     Metal,
     Cuda,
-    Sglang,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -341,7 +341,7 @@ pub(crate) struct RunArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "This is a thin front door over the backend serving binaries shipped in release artifacts.\nIt looks for `infer`, `metal_serve`, or `cpu_serve` next to the current `arle` binary first, then on PATH. The `sglang` backend launches `python3 -m sglang.launch_server` and forwards flags after `--`.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend cuda --model-path /models/Qwen3-4B -- --num-slots 8\n  arle serve --backend sglang --model-path /models/DeepSeek-V3.2 --bind 0.0.0.0 -- --served-model-name /DeepSeek-V4-Flash --tp 8 --dp 8 --ep 8"
+    after_help = "This is a thin front door over the ARLE-native backend serving binaries shipped in release artifacts.\nIt looks for `infer`, `metal_serve`, or `cpu_serve` next to the current `arle` binary first, then on PATH. Flags after `--` are forwarded to that native backend binary.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend arle --model-path /models/Qwen3-4B --port 8000\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend cuda --model-path /models/Qwen3-4B -- --num-slots 8"
 )]
 pub(crate) struct ServeArgs {
     /// Model directory or HuggingFace model ID. Defaults to the top-level --model-path.
