@@ -80,6 +80,26 @@ KV_bytes_per_token_BF16 = 36 layers × 2 (K+V) × 8 KV_heads × 80 dim × 2 byte
 - 1.5-2× → ⚠ borderline,看 KV bandwidth 占 ITL 比是否 > 50%
 - < 1.5× → ❌ KILL,INT4 unpack overhead 反吃 bandwidth saving
 
+**2026-05-12 Phase 0a-narrow result(sm_89 scan only): no runtime license.** Added
+`scripts/kv_w4a8_smoke.cu` as a standalone CUDA probe for KV read + scale +
+dequant scan (not full attention). Hot repeated runs on RTX 4070 Ti SUPER:
+
+| path | hot time | vs BF16 time | vs FP8 time |
+|---|---:|---:|---:|
+| BF16 scan | ~732.4 us | 1.000x | n/a |
+| FP8 E4M3 + f32 scale scan | ~694.4 us | 1.055x | 1.000x |
+| FP4 E2M1 LUT + f32 scale scan | ~948.9 us | 0.772x | 0.732x |
+| FP4 E2M1 bit-dequant + f32 scale scan | ~493.8 us | 1.483x | 1.407x |
+
+Evidence: [`docs/experience/errors/2026-05-12-kv-w4a8-fp4-sm89-scan-kill.md`](../experience/errors/2026-05-12-kv-w4a8-fp4-sm89-scan-kill.md).
+
+This does **not** kill every possible FP4 attention design, because the smoke
+does not include register-resident FP4->FP8 unpack plus FP8 MMA. It does kill
+the naive runtime direction for sm_89: the bit-dequant scan is only ~1.48x
+faster than BF16 and ~1.40x faster than FP8, below this plan's 1.5x Phase 0a
+license floor, so no `w4a8` KV enum/CLI/runtime dispatch until a
+full-attention smoke passes in the long-context wall-clock regime.
+
 ### Phase 0b — implement(LOC budget 400)
 
 | 文件 | LOC est | 内容 |
