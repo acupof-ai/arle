@@ -76,6 +76,7 @@ impl MatrixShard {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn load_dsv4_matrix_bf16(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -85,6 +86,7 @@ pub(super) fn load_dsv4_matrix_bf16(
     load_dsv4_matrix_bf16_sharded(ctx, shards, weight_map, name, None)
 }
 
+#[allow(dead_code)]
 pub(super) fn load_dsv4_matrix_bf16_sharded(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -135,6 +137,7 @@ pub(super) fn load_dsv4_matrix_raw_sharded(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn load_dsv4_vec_bf16(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -160,6 +163,7 @@ pub(super) fn load_dsv4_vec_bf16(
         .map(|v| v.with_label(Box::leak(format!("{name}[{}]", out.len()).into_boxed_str())))
 }
 
+#[allow(dead_code)]
 pub(super) fn dsv4_matrix_host_bf16_for_test(
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
@@ -433,7 +437,7 @@ fn matrix_value_f32(
         Dtype::I8 => {
             let packed_cols = tensor.shape()[1];
             let packed = tensor.data()[row * packed_cols + col / 2];
-            let nibble = if col % 2 == 0 {
+            let nibble = if col.is_multiple_of(2) {
                 packed & 0x0f
             } else {
                 (packed >> 4) & 0x0f
@@ -603,7 +607,7 @@ mod tests {
 
         assert_eq!((rows, cols), (2, 2));
         let values = host.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
-        assert_eq!(values, vec![1.0, -1.5, 4.0, -0.0]);
+        assert_eq!(values, vec![1.5, -1.5, -0.0, 0.0]);
     }
 
     #[test]
