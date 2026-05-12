@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_file = "tile_kernels/_version.py"
+
+[project]
+name = "tile_kernels"
+dynamic = ["version"]
+description = "Tilelang-based kernels."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Chenhao Xu", email = "xch@deepseek.com" },
+    { name = "Xiangwen Wang", email = "xiangwen.wang@deepseek.com" },
+    { name = "Huanqi Cao", email = "caohuanqi@deepseek.com" },
+    { name = "Rui Tian", email = "tianr22@deepseek.com"},
+    { name = "Weilin Zhao", email = "zhaoweilin@deepseek.com" },
+    { name = "Kuai Yu", email = "yukuai@deepseek.com" },
+    { name = "Chenggang Zhao", email = "chenggangz@deepseek.com"}
+]
+dependencies = [
+    "torch>=2.10",
+    "tilelang>=0.1.9"
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+dev = ["setuptools", "wheel", "setuptools-scm>=8", "pytest", "pytest-xdist", "pytest-repeat"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tile_kernels*"]
+
+[project.urls]
+Homepage = "https://github.com/deepseek-ai/TileKernels"
+
+# Linter tools
+
+[tool.ruff]
+line-length = 150
+
+[tool.ruff.lint]
+select = ["Q000"]
+fixable = ["Q000"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
