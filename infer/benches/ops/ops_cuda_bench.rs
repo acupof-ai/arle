@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput};
-use cuda_kernels::kv_quant;
+use cuda_kernels::{ffi, kv_quant};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use infer::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use infer::ops;
@@ -220,6 +220,89 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
             .expect("decode_attention_fp8 failed");
         });
     });
+
+    group.throughput(Throughput::Elements((4 * 4096 * 16 * 64) as u64));
+    group.bench_function(
+        BenchmarkId::new("tilelang_decode_hd64_dsv4mini", 4096),
+        |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let batch_size = 4usize;
+            let seq_len = 4096usize;
+            let page_size = 16usize;
+            let num_q_heads = 16usize;
+            let num_kv_heads = 1usize;
+            let head_dim = 64usize;
+            let pages_per_request = seq_len / page_size;
+            let total_pages = batch_size * pages_per_request;
+            let total_rows = total_pages * page_size;
+            let q_dim = num_q_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+
+            let q = hidden_states(&ctx, q_dim, batch_size).expect("failed to allocate hd64 q");
+            let k_pool = device_vec(&ctx, total_rows * kv_dim).expect("failed to allocate hd64 k");
+            let v_pool = device_vec(&ctx, total_rows * kv_dim).expect("failed to allocate hd64 v");
+            let q_indptr_host: Vec<i32> = (0..=batch_size).map(|idx| idx as i32).collect();
+            let kv_indptr_host: Vec<i32> = (0..=batch_size)
+                .map(|idx| (idx * pages_per_request) as i32)
+                .collect();
+            let kv_indices_host: Vec<i32> = (0..total_pages).map(|idx| idx as i32).collect();
+            let last_page_len_host = vec![page_size as i32; batch_size];
+            let q_indptr = ctx
+                .stream
+                .clone_htod(&q_indptr_host)
+                .expect("failed to H2D hd64 q indptr");
+            let kv_indptr = ctx
+                .stream
+                .clone_htod(&kv_indptr_host)
+                .expect("failed to H2D hd64 kv indptr");
+            let kv_indices = ctx
+                .stream
+                .clone_htod(&kv_indices_host)
+                .expect("failed to H2D hd64 kv indices");
+            let last_page_len = ctx
+                .stream
+                .clone_htod(&last_page_len_host)
+                .expect("failed to H2D hd64 last page len");
+            let mut out =
+                HiddenStates::zeros(&ctx, q_dim, batch_size).expect("failed to allocate hd64 out");
+
+            let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+            let (k_ptr, _gk) = k_pool.data.device_ptr(&ctx.stream);
+            let (v_ptr, _gv) = v_pool.data.device_ptr(&ctx.stream);
+            let (qoi_ptr, _gqoi) = q_indptr.device_ptr(&ctx.stream);
+            let (ind_ptr, _gind) = kv_indptr.device_ptr(&ctx.stream);
+            let (idx_ptr, _gidx) = kv_indices.device_ptr(&ctx.stream);
+            let (lp_ptr, _glp) = last_page_len.device_ptr(&ctx.stream);
+
+            iter_sync(b, &ctx, || {
+                let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::tilelang_batch_decode_paged_hd64_q16_kv1_run_cuda(
+                        q_ptr as *mut ffi::Half,
+                        qoi_ptr as *const i32,
+                        k_ptr as *mut ffi::Half,
+                        v_ptr as *mut ffi::Half,
+                        ind_ptr as *const i32,
+                        idx_ptr as *const i32,
+                        lp_ptr as *const i32,
+                        out_ptr as *mut ffi::Half,
+                        batch_size as i32,
+                        batch_size as i32,
+                        1,
+                        total_pages as i32,
+                        total_pages as i32,
+                        num_q_heads as i32,
+                        num_kv_heads as i32,
+                        page_size as i32,
+                        1.0 / (head_dim as f32).sqrt(),
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .expect("tilelang_batch_decode_paged_hd64_q16_kv1 failed");
+                }
+            });
+        },
+    );
 
     group.throughput(Throughput::Elements((Q_HEADS_128 * HEAD_DIM_128) as u64));
     group.bench_function(

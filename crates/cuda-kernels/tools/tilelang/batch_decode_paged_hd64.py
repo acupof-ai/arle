@@ -13,11 +13,9 @@ Sister to ``batch_decode_paged_hd128.py``. Deltas vs the HD128 template:
   * ``SM_SCALE = 1.0 / sqrt(64)``.
   * ``SUPPORTED_HEADS = ((16, 1),)`` — DSV4-mini only.
 
-Everything else (BLOCK_M=64, BLOCK_N=16=PAGE_SIZE, NUM_STAGES=2,
+Everything else (BLOCK_M=64, BLOCK_N=256=PAGE_SIZE*16, NUM_STAGES=2,
 NUM_THREADS=128, no causal mask, padded BLOCK_M layout) is identical to
-the HD128 decode template — TileLang's tile/pipeline tunables are
-HEAD_DIM-independent at this scale, and the sm_89 re-tune is a separate
-later task.
+the HD128 decode template except for the larger decode KV tile.
 
 Symbolic runtime int32 args (``batch_size``, ``total_q_tokens``,
 ``max_qlen``, ``num_pages``, ``total_pages``) are kept identical to the
@@ -36,9 +34,10 @@ import tilelang.language as T
 HEAD_DIM = 64
 PAGE_SIZE = 16
 BLOCK_M = 64
-# Decode keeps the prefill-compatible BLOCK_M=64 fragment layout, then lowers
-# BLOCK_N to one page so dynamic shared memory remains SM-cap-safe.
-BLOCK_N = 16
+# Decode keeps the prefill-compatible BLOCK_M=64 fragment layout but uses a
+# wider KV tile to reduce single-token loop overhead. BLOCK_N=512 launched
+# with CUDA_ERROR_INVALID_VALUE on sm_89, so 256 is the measured cap here.
+BLOCK_N = 256
 NUM_STAGES = 2
 NUM_THREADS = 128
 
