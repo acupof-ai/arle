@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+#[cfg(feature = "cuda")]
+use std::ops::Range;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -56,6 +58,13 @@ struct HeaderTensor {
     data_offsets: [usize; 2],
 }
 
+#[cfg(feature = "cuda")]
+struct ScaleRowSlice<'a> {
+    bytes: &'a [u8],
+    rows: usize,
+    cols: usize,
+}
+
 pub(crate) struct DeepseekV4ReferenceModel {
     config: DeepSeekV4Config,
     tensors: SafeTensorStore,
@@ -65,7 +74,9 @@ pub(crate) struct DeepseekV4ReferenceModel {
 
 #[cfg(feature = "cuda")]
 struct CudaReferenceMatvec {
-    ctx: DeviceContext,
+    devices: Vec<DeviceContext>,
+    tp_size: usize,
+    ep_size: usize,
 }
 
 impl DeepseekV4ReferenceModel {
@@ -746,7 +757,14 @@ impl DeepseekV4ReferenceModel {
     fn matvec(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
         #[cfg(feature = "cuda")]
         if let Some(cuda) = &self.cuda {
-            return self.tensors.cuda_matvec(&cuda.ctx, name, x);
+            if let Some(expert_idx) = parse_expert_idx_from_weight_name(name) {
+                let device_idx =
+                    cuda.expert_device_idx(expert_idx, self.config.n_routed_experts)?;
+                return self
+                    .tensors
+                    .cuda_matvec_on(&cuda.devices[device_idx], name, x);
+            }
+            return self.tensors.cuda_matvec_tp(cuda, name, x);
         }
         self.tensors.matvec(name, x)
     }
@@ -758,13 +776,60 @@ impl CudaReferenceMatvec {
         if !env_flag("ARLE_DSV4_REFERENCE_CUDA_MATVEC")? {
             return Ok(None);
         }
-        let ctx =
-            DeviceContext::new().context("creating CUDA context for DSv4 reference matvec")?;
+        let tp_size = env_usize(
+            &[
+                "ARLE_DSV4_REFERENCE_TP_SIZE",
+                "INFER_TP_SIZE",
+                "ARLE_TP_SIZE",
+            ],
+            1,
+        )?;
+        let ep_size = env_usize(
+            &[
+                "ARLE_DSV4_REFERENCE_EP_SIZE",
+                "INFER_EP_SIZE",
+                "ARLE_EP_SIZE",
+            ],
+            1,
+        )?;
+        ensure!(tp_size > 0, "ARLE_DSV4_REFERENCE_TP_SIZE must be >= 1");
+        ensure!(ep_size > 0, "ARLE_DSV4_REFERENCE_EP_SIZE must be >= 1");
+        let device_count = tp_size.max(ep_size);
+        let mut devices = Vec::with_capacity(device_count);
+        for ordinal in 0..device_count {
+            devices.push(DeviceContext::on_device(ordinal as u32).with_context(|| {
+                format!("creating CUDA context {ordinal} for DSv4 reference matvec")
+            })?);
+        }
         info!(
-            "DeepSeek V4 reference path using ARLE CUDA raw matvec on device {}",
-            ctx.ordinal
+            "DeepSeek V4 reference path using ARLE CUDA raw matvec: tp_size={} ep_size={} cuda_devices={}",
+            tp_size, ep_size, device_count
         );
-        Ok(Some(Self { ctx }))
+        Ok(Some(Self {
+            devices,
+            tp_size,
+            ep_size,
+        }))
+    }
+
+    fn expert_device_idx(&self, expert_idx: usize, num_experts: usize) -> Result<usize> {
+        ensure!(
+            self.ep_size <= self.devices.len(),
+            "EP size {} exceeds initialized CUDA device count {}",
+            self.ep_size,
+            self.devices.len()
+        );
+        ensure!(
+            expert_idx < num_experts,
+            "expert index {expert_idx} out of range for {num_experts} experts"
+        );
+        ensure!(
+            num_experts.is_multiple_of(self.ep_size),
+            "num_experts {num_experts} must be divisible by ep_size {}",
+            self.ep_size
+        );
+        let experts_per_rank = num_experts / self.ep_size;
+        Ok((expert_idx / experts_per_rank).min(self.ep_size - 1))
     }
 }
 
@@ -865,17 +930,102 @@ impl SafeTensorStore {
     }
 
     #[cfg(feature = "cuda")]
-    fn cuda_matvec(&self, ctx: &DeviceContext, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+    fn cuda_matvec_tp(
+        &self,
+        cuda: &CudaReferenceMatvec,
+        name: &str,
+        x: &[f32],
+    ) -> Result<Vec<f32>> {
         let meta = self.meta(name)?;
         ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
+        let rows = meta.shape[0];
         let cols = self.matrix_input_cols(meta);
         ensure!(
             x.len() == cols,
             "matvec {name} expects input len {cols}, got {}",
             x.len()
         );
+        ensure!(
+            cuda.tp_size <= cuda.devices.len(),
+            "TP size {} exceeds initialized CUDA device count {}",
+            cuda.tp_size,
+            cuda.devices.len()
+        );
+        if cuda.tp_size == 1 || rows < cuda.tp_size {
+            return self.cuda_matvec_on(&cuda.devices[0], name, x);
+        }
 
-        let weight = self.cuda_matrix(ctx, name, meta)?;
+        let mut out = vec![0.0_f32; rows];
+        for (rank, range) in self.cuda_row_shards(name, meta, cuda.tp_size)? {
+            let shard =
+                self.cuda_matvec_row_range(&cuda.devices[rank], name, meta, x, range.clone())?;
+            out[range].copy_from_slice(&shard);
+        }
+        Ok(out)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_matvec_on(&self, ctx: &DeviceContext, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        let meta = self.meta(name)?;
+        ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
+        let rows = meta.shape[0];
+        self.cuda_matvec_row_range(ctx, name, meta, x, 0..rows)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_row_shards(
+        &self,
+        name: &str,
+        meta: &TensorMeta,
+        tp_size: usize,
+    ) -> Result<Vec<(usize, Range<usize>)>> {
+        let rows = meta.shape[0];
+        if matches!(meta.dtype, TensorDtype::F8E4M3 | TensorDtype::I8) {
+            let scale = self.scale_meta_for_weight(name)?;
+            let scale_rows = scale.shape[0];
+            let active_ranks = tp_size.min(scale_rows);
+            let block_h = rows.div_ceil(scale_rows).max(1);
+            return (0..active_ranks)
+                .map(|rank| {
+                    let scale_range = shard_range(scale_rows, active_ranks, rank);
+                    let row_start = scale_range.start * block_h;
+                    let row_end = (scale_range.end * block_h).min(rows);
+                    ensure!(
+                        row_start < row_end,
+                        "empty quantized TP row shard for {name}: scale_range={scale_range:?}"
+                    );
+                    Ok((rank, row_start..row_end))
+                })
+                .collect();
+        }
+
+        Ok((0..tp_size)
+            .map(|rank| (rank, shard_range(rows, tp_size, rank)))
+            .collect())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_matvec_row_range(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        meta: &TensorMeta,
+        x: &[f32],
+        row_range: Range<usize>,
+    ) -> Result<Vec<f32>> {
+        let rows = meta.shape[0];
+        let cols = self.matrix_input_cols(meta);
+        ensure!(
+            x.len() == cols,
+            "matvec {name} expects input len {cols}, got {}",
+            x.len()
+        );
+        ensure!(
+            row_range.start < row_range.end && row_range.end <= rows,
+            "invalid row shard {:?} for matrix {name} with {rows} rows",
+            row_range
+        );
+        let weight = self.cuda_matrix_row_range(ctx, name, meta, row_range.clone())?;
         let input_host = x.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
         let input = DeviceVec::from_host(ctx, &input_host)?;
         let output = crate::ops::linear(ctx, &input, &weight)?;
@@ -937,6 +1087,106 @@ impl SafeTensorStore {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_matrix_row_range(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        meta: &TensorMeta,
+        row_range: Range<usize>,
+    ) -> Result<DeviceMatrix> {
+        ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
+        let total_rows = meta.shape[0];
+        let rows = row_range.end - row_range.start;
+        let cols = self.matrix_input_cols(meta);
+        ensure!(
+            row_range.start < row_range.end && row_range.end <= total_rows,
+            "invalid row shard {:?} for matrix {name} with {total_rows} rows",
+            row_range
+        );
+        if row_range.start == 0 && row_range.end == total_rows {
+            return self.cuda_matrix(ctx, name, meta);
+        }
+
+        match meta.dtype {
+            TensorDtype::Bf16 => {
+                let bytes_per_row = cols * std::mem::size_of::<bf16>();
+                let start = row_range.start * bytes_per_row;
+                let end = row_range.end * bytes_per_row;
+                DeviceMatrix::from_safetensors(ctx, &self.data(meta)[start..end], rows, cols)
+                    .with_context(|| {
+                        format!(
+                            "uploading BF16 matrix row shard {name}[{:?}] to CUDA",
+                            row_range
+                        )
+                    })
+            }
+            TensorDtype::F32 | TensorDtype::F8E8M0 => {
+                let dense_cols = meta.shape[1];
+                let host = row_range
+                    .clone()
+                    .flat_map(|row| (0..cols).map(move |col| row * dense_cols + col))
+                    .map(|idx| self.f32_at(meta, idx).map(bf16::from_f32))
+                    .collect::<Result<Vec<_>>>()?;
+                DeviceMatrix::from_host(ctx, &host, rows, cols).with_context(|| {
+                    format!(
+                        "uploading dense matrix row shard {name}[{:?}] to CUDA",
+                        row_range
+                    )
+                })
+            }
+            TensorDtype::F8E4M3 => {
+                let weight_start = row_range.start * cols;
+                let weight_end = row_range.end * cols;
+                let scale = self.scale_meta_for_weight(name)?;
+                let scale_slice = self.scale_row_slice(name, meta, scale, row_range.clone())?;
+                DeviceMatrix::from_dsv4_fp8_block_scaled(
+                    ctx,
+                    &self.data(meta)[weight_start..weight_end],
+                    scale_slice.bytes,
+                    rows,
+                    cols,
+                    scale_slice.rows,
+                    scale_slice.cols,
+                )
+                .with_context(|| {
+                    format!(
+                        "uploading DeepSeek V4 FP8 matrix row shard {name}[{:?}] to CUDA",
+                        row_range
+                    )
+                })
+            }
+            TensorDtype::I8 => {
+                let packed_cols = meta.shape[1];
+                let weight_start = row_range.start * packed_cols;
+                let weight_end = row_range.end * packed_cols;
+                let scale = self.scale_meta_for_weight(name)?;
+                let scale_slice = self.scale_row_slice(name, meta, scale, row_range.clone())?;
+                DeviceMatrix::from_dsv4_fp4_block_scaled(
+                    ctx,
+                    &self.data(meta)[weight_start..weight_end],
+                    scale_slice.bytes,
+                    rows,
+                    cols,
+                    scale_slice.rows,
+                    scale_slice.cols,
+                )
+                .with_context(|| {
+                    format!(
+                        "uploading DeepSeek V4 FP4 matrix row shard {name}[{:?}] to CUDA",
+                        row_range
+                    )
+                })
+            }
+            TensorDtype::I64 | TensorDtype::Unsupported => {
+                bail!(
+                    "tensor {name} dtype {:?} cannot be used as CUDA matrix",
+                    meta.dtype
+                )
+            }
+        }
+    }
+
     fn scale_meta_for_weight(&self, name: &str) -> Result<&TensorMeta> {
         let scale_name = name
             .strip_suffix(".weight")
@@ -956,6 +1206,44 @@ impl SafeTensorStore {
             "quantized scale tensor {scale_name} byte length mismatch"
         );
         Ok(scale)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn scale_row_slice<'a>(
+        &'a self,
+        name: &str,
+        meta: &TensorMeta,
+        scale: &TensorMeta,
+        row_range: Range<usize>,
+    ) -> Result<ScaleRowSlice<'a>> {
+        let total_rows = meta.shape[0];
+        let scale_rows = scale.shape[0];
+        let scale_cols = scale.shape[1];
+        let block_h = total_rows.div_ceil(scale_rows).max(1);
+        ensure!(
+            row_range.start.is_multiple_of(block_h),
+            "row shard {:?} for {name} is not aligned to scale block_h={block_h}",
+            row_range
+        );
+        ensure!(
+            row_range.end == total_rows || row_range.end.is_multiple_of(block_h),
+            "row shard {:?} for {name} is not aligned to scale block_h={block_h}",
+            row_range
+        );
+        let scale_start = row_range.start / block_h;
+        let scale_end = row_range.end.div_ceil(block_h).min(scale_rows);
+        ensure!(
+            scale_start < scale_end,
+            "row shard {:?} for {name} maps to an empty scale slice",
+            row_range
+        );
+        let start = scale_start * scale_cols;
+        let end = scale_end * scale_cols;
+        Ok(ScaleRowSlice {
+            bytes: &self.data(scale)[start..end],
+            rows: scale_end - scale_start,
+            cols: scale_cols,
+        })
     }
 
     fn vec_f32(&self, name: &str) -> Result<Vec<f32>> {
@@ -1393,6 +1681,32 @@ fn reference_progress_enabled() -> Result<bool> {
 }
 
 #[cfg(feature = "cuda")]
+fn shard_range(total: usize, world_size: usize, rank: usize) -> Range<usize> {
+    let base = total / world_size;
+    let remainder = total % world_size;
+    let start = rank * base;
+    let len = if rank == world_size - 1 {
+        base + remainder
+    } else {
+        base
+    };
+    start..start + len
+}
+
+#[cfg(feature = "cuda")]
+fn parse_expert_idx_from_weight_name(name: &str) -> Option<usize> {
+    let (_, rest) = name.split_once(".ffn.experts.")?;
+    let digits = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+#[cfg(feature = "cuda")]
 fn env_flag(name: &str) -> Result<bool> {
     let Some(raw) = std::env::var(name).ok() else {
         return Ok(false);
@@ -1402,6 +1716,18 @@ fn env_flag(name: &str) -> Result<bool> {
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid {name} value `{raw}`"),
     }
+}
+
+#[cfg(feature = "cuda")]
+fn env_usize(names: &[&str], default: usize) -> Result<usize> {
+    for name in names {
+        if let Ok(raw) = std::env::var(name) {
+            return raw
+                .parse::<usize>()
+                .with_context(|| format!("invalid {name} value `{raw}`"));
+        }
+    }
+    Ok(default)
 }
 
 fn decode_f8_e8m0(bits: u8) -> f32 {
