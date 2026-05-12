@@ -424,6 +424,10 @@ pub enum WeightFormat {
     GgufQ6K,
     /// TurboQuant packed indices + FP16 group norms + Hadamard signs.
     TurboQuant,
+    /// DeepSeek V4 row-major FP8 E4M3 weights with FP8 E8M0 block scales.
+    Dsv4Fp8BlockScaled,
+    /// DeepSeek V4 row-major packed FP4 E2M1 weights with FP8 E8M0 block scales.
+    Dsv4Fp4BlockScaled,
 }
 
 /// Shape/layout constraints expected by the matching CUDA kernels.
@@ -490,6 +494,20 @@ impl WeightFormat {
                 n_multiple: 1,
                 group_size,
             },
+            Self::Dsv4Fp8BlockScaled => WeightKernelAlignment {
+                weight_layout: "dsv4.fp8_e4m3.row_major",
+                scale_layout: "fp8_e8m0[scale_rows, scale_cols]",
+                k_multiple: 1,
+                n_multiple: 1,
+                group_size: 0,
+            },
+            Self::Dsv4Fp4BlockScaled => WeightKernelAlignment {
+                weight_layout: "dsv4.fp4_e2m1.row_major.packed2",
+                scale_layout: "fp8_e8m0[scale_rows, scale_cols]",
+                k_multiple: 2,
+                n_multiple: 1,
+                group_size: 0,
+            },
         }
     }
 
@@ -537,6 +555,14 @@ impl WeightFormat {
                 );
                 Ok(())
             }
+            Self::Dsv4Fp8BlockScaled => Ok(()),
+            Self::Dsv4Fp4BlockScaled => {
+                ensure!(
+                    cols.is_multiple_of(2),
+                    "{self} requires cols % 2 == 0, got {cols}"
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -554,6 +580,8 @@ impl std::fmt::Display for WeightFormat {
             Self::GgufQ5K => f.write_str("gguf_q5_k"),
             Self::GgufQ6K => f.write_str("gguf_q6_k"),
             Self::TurboQuant => f.write_str("turboquant"),
+            Self::Dsv4Fp8BlockScaled => f.write_str("dsv4_fp8_block_scaled"),
+            Self::Dsv4Fp4BlockScaled => f.write_str("dsv4_fp4_block_scaled"),
         }
     }
 }
@@ -569,6 +597,12 @@ pub struct DeviceMatrix {
     pub qweight: Option<CudaSlice<i8>>,
     /// Per-group bf16 scales for quantized weights. Shape: [rows, cols/group_size].
     pub qscales: Option<CudaSlice<bf16>>,
+    /// DeepSeek V4 block scales encoded as raw FP8 E8M0 bytes.
+    pub dsv4_scales: Option<CudaSlice<u8>>,
+    /// Number of rows in the DeepSeek V4 block-scale matrix.
+    pub dsv4_scale_rows: usize,
+    /// Number of columns in the DeepSeek V4 block-scale matrix.
+    pub dsv4_scale_cols: usize,
     /// Quantization group size (0 = not quantized).
     pub group_size: usize,
     /// Marlin-repacked INT4 weights for prefill GEMM (None if not W4 or repack failed).
@@ -615,6 +649,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -665,6 +702,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W8A16,
             qweight: Some(qw),
             qscales: Some(qs),
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size,
             marlin_packed: None,
             marlin_scales: None,
@@ -723,7 +763,148 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W4A16,
             qweight: Some(qw),
             qscales: Some(qs),
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size,
+            marlin_packed: None,
+            marlin_scales: None,
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from DeepSeek V4 FP8 E4M3 weights plus FP8 E8M0 block scales.
+    pub fn from_dsv4_fp8_block_scaled(
+        ctx: &DeviceContext,
+        weight_bytes: &[u8],
+        scale_bytes: &[u8],
+        rows: usize,
+        cols: usize,
+        scale_rows: usize,
+        scale_cols: usize,
+    ) -> Result<Self> {
+        WeightFormat::Dsv4Fp8BlockScaled.validate_shape(rows, cols, 0)?;
+        ensure!(
+            weight_bytes.len() == rows * cols,
+            "DeepSeek V4 FP8 weight bytes {} != expected {} for rows={rows} cols={cols}",
+            weight_bytes.len(),
+            rows * cols
+        );
+        ensure!(
+            scale_rows > 0 && scale_cols > 0,
+            "DeepSeek V4 FP8 scale shape must be non-empty"
+        );
+        ensure!(
+            scale_bytes.len() == scale_rows * scale_cols,
+            "DeepSeek V4 FP8 scale bytes {} != expected {}",
+            scale_bytes.len(),
+            scale_rows * scale_cols
+        );
+
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(weight_bytes.as_ptr().cast::<i8>(), weight_bytes.len())
+            })
+            .map_err(|e| anyhow!("H2D DeepSeek V4 FP8 weight failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .clone_htod(scale_bytes)
+            .map_err(|e| anyhow!("H2D DeepSeek V4 FP8 scales failed: {e}"))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {e}"))?;
+
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            weight_format: WeightFormat::Dsv4Fp8BlockScaled,
+            qweight: Some(qw),
+            qscales: None,
+            dsv4_scales: Some(scales),
+            dsv4_scale_rows: scale_rows,
+            dsv4_scale_cols: scale_cols,
+            group_size: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from DeepSeek V4 packed FP4 E2M1 weights plus FP8 E8M0 block scales.
+    pub fn from_dsv4_fp4_block_scaled(
+        ctx: &DeviceContext,
+        packed_bytes: &[u8],
+        scale_bytes: &[u8],
+        rows: usize,
+        logical_cols: usize,
+        scale_rows: usize,
+        scale_cols: usize,
+    ) -> Result<Self> {
+        WeightFormat::Dsv4Fp4BlockScaled.validate_shape(rows, logical_cols, 0)?;
+        ensure!(
+            packed_bytes.len() == rows * logical_cols / 2,
+            "DeepSeek V4 FP4 packed bytes {} != expected {} for rows={rows} cols={logical_cols}",
+            packed_bytes.len(),
+            rows * logical_cols / 2
+        );
+        ensure!(
+            scale_rows > 0 && scale_cols > 0,
+            "DeepSeek V4 FP4 scale shape must be non-empty"
+        );
+        ensure!(
+            scale_bytes.len() == scale_rows * scale_cols,
+            "DeepSeek V4 FP4 scale bytes {} != expected {}",
+            scale_bytes.len(),
+            scale_rows * scale_cols
+        );
+
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
+            })
+            .map_err(|e| anyhow!("H2D DeepSeek V4 FP4 weight failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .clone_htod(scale_bytes)
+            .map_err(|e| anyhow!("H2D DeepSeek V4 FP4 scales failed: {e}"))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {e}"))?;
+
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols: logical_cols,
+            weight_format: WeightFormat::Dsv4Fp4BlockScaled,
+            qweight: Some(qw),
+            qscales: None,
+            dsv4_scales: Some(scales),
+            dsv4_scale_rows: scale_rows,
+            dsv4_scale_cols: scale_cols,
+            group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
@@ -793,6 +974,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::MarlinW4A8,
             qweight: None,
             qscales: None,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size,
             marlin_packed: Some(packed),
             marlin_scales: Some(s_group),
@@ -912,6 +1096,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W4A16,
             qweight: None,
             qscales: None,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size,
             marlin_packed: Some(w4a16_packed),
             marlin_scales: Some(w4a16_group),
@@ -970,6 +1157,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ6K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -1028,6 +1218,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ3K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -1092,6 +1285,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ4K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -1150,6 +1346,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::GgufQ5K,
             qweight: Some(qw),
             qscales: Some(dummy_scales),
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -1207,6 +1406,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::W2A16,
             qweight: Some(qw),
             qscales: Some(qs),
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size,
             marlin_packed: None,
             marlin_scales: None,
@@ -1312,6 +1514,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::TurboQuant,
             qweight: None,
             qscales: None,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size,
             marlin_packed: None,
             marlin_scales: None,
@@ -1465,6 +1670,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -1513,6 +1721,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -1554,6 +1765,9 @@ impl DeviceMatrix {
                 weight_format: WeightFormat::DenseBf16,
                 qweight: None,
                 qscales: None,
+                dsv4_scales: None,
+                dsv4_scale_rows: 0,
+                dsv4_scale_cols: 0,
                 group_size: 0,
                 marlin_packed: None,
                 marlin_scales: None,
@@ -1592,6 +1806,9 @@ impl DeviceMatrix {
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
             qscales: None,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,

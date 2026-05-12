@@ -204,6 +204,217 @@ __global__ void w2a16_gemv_kernel(
     }
 }
 
+__device__ __forceinline__ float dsv4_decode_e8m0(uint8_t bits) {
+    uint32_t raw = static_cast<uint32_t>(bits) << 23;
+    return __uint_as_float(raw);
+}
+
+__device__ __forceinline__ float dsv4_decode_fp8_e4m3(uint8_t bits) {
+    if ((bits & 0x7f) == 0) return 0.0f;
+    const float sign = (bits & 0x80) ? -1.0f : 1.0f;
+    const int exp = (bits >> 3) & 0x0f;
+    const int mant = bits & 0x07;
+    if (exp == 0) {
+        return sign * static_cast<float>(mant) * 0.001953125f;  // 2^-9
+    }
+    if (exp == 15 && mant == 7) {
+        return sign * 448.0f;
+    }
+    return sign * (1.0f + static_cast<float>(mant) * 0.125f) * exp2f(static_cast<float>(exp - 7));
+}
+
+__device__ __forceinline__ float dsv4_decode_fp4_e2m1(uint8_t bits) {
+    const float sign = (bits & 0x08) ? -1.0f : 1.0f;
+    const int exp = (bits >> 1) & 0x03;
+    const int mant = bits & 0x01;
+    if (exp == 0) {
+        return sign * static_cast<float>(mant) * 0.5f;
+    }
+    return sign * (1.0f + static_cast<float>(mant) * 0.5f) * exp2f(static_cast<float>(exp - 1));
+}
+
+__device__ __forceinline__ float dsv4_block_scale(
+    const uint8_t* __restrict__ scales,
+    int row,
+    int col,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols)
+{
+    const int block_h = (N + scale_rows - 1) / scale_rows;
+    const int block_w = (K + scale_cols - 1) / scale_cols;
+    const int sr_raw = row / block_h;
+    const int sc_raw = col / block_w;
+    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
+    const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
+    return dsv4_decode_e8m0(scales[sr * scale_cols + sc]);
+}
+
+__global__ void dsv4_fp8_gemv_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+
+    float sum = 0.0f;
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
+            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+        sum += w * __bfloat162float(input[k]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        output[row] = __float2bfloat16(total);
+    }
+}
+
+__global__ void dsv4_fp4_gemv_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+
+    const int bytes_per_row = K / 2;
+    float sum = 0.0f;
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const uint8_t packed = weight[row * bytes_per_row + (k >> 1)];
+        const uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+        const float w = dsv4_decode_fp4_e2m1(nibble)
+            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+        sum += w * __bfloat162float(input[k]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        output[row] = __float2bfloat16(total);
+    }
+}
+
+__global__ void dsv4_fp8_gemv_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int batch_idx = blockIdx.y;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+
+    const __nv_bfloat16* x = input + batch_idx * K;
+    float sum = 0.0f;
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
+            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+        sum += w * __bfloat162float(x[k]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        output[batch_idx * N + row] = __float2bfloat16(total);
+    }
+}
+
+__global__ void dsv4_fp4_gemv_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int batch_idx = blockIdx.y;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+
+    const int bytes_per_row = K / 2;
+    const __nv_bfloat16* x = input + batch_idx * K;
+    float sum = 0.0f;
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const uint8_t packed = weight[row * bytes_per_row + (k >> 1)];
+        const uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+        const float w = dsv4_decode_fp4_e2m1(nibble)
+            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+        sum += w * __bfloat162float(x[k]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        output[batch_idx * N + row] = __float2bfloat16(total);
+    }
+}
+
 // ============================================================================
 // Batched W8A16 GEMV: [B, K] × [N, K]^T → [B, N]
 // ============================================================================
@@ -1383,6 +1594,66 @@ cudaError_t w2a16_gemv_batch_cuda(
     dim3 block(GEMV_THREADS);
     w2a16_gemv_batch_kernel<<<grid, block, 0, stream>>>(
         weight, scales, input, output, B, N, K, group_size);
+    return cudaGetLastError();
+}
+
+cudaError_t dsv4_fp8_gemv_cuda(
+    const uint8_t* weight, const uint8_t* scales,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int N, int K, int scale_rows, int scale_cols, cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS);
+    dim3 block(GEMV_THREADS);
+    dsv4_fp8_gemv_kernel<<<grid, block, 0, stream>>>(
+        weight, scales, input, output, N, K, scale_rows, scale_cols);
+    return cudaGetLastError();
+}
+
+cudaError_t dsv4_fp4_gemv_cuda(
+    const uint8_t* weight, const uint8_t* scales,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int N, int K, int scale_rows, int scale_cols, cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || (K & 1) != 0 || scale_rows <= 0 || scale_cols <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS);
+    dim3 block(GEMV_THREADS);
+    dsv4_fp4_gemv_kernel<<<grid, block, 0, stream>>>(
+        weight, scales, input, output, N, K, scale_rows, scale_cols);
+    return cudaGetLastError();
+}
+
+cudaError_t dsv4_fp8_gemv_batch_cuda(
+    const uint8_t* weight, const uint8_t* scales,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int B, int N, int K, int scale_rows, int scale_cols, cudaStream_t stream)
+{
+    if (B <= 0 || N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
+    dim3 block(GEMV_THREADS);
+    dsv4_fp8_gemv_batch_kernel<<<grid, block, 0, stream>>>(
+        weight, scales, input, output, B, N, K, scale_rows, scale_cols);
+    return cudaGetLastError();
+}
+
+cudaError_t dsv4_fp4_gemv_batch_cuda(
+    const uint8_t* weight, const uint8_t* scales,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int B, int N, int K, int scale_rows, int scale_cols, cudaStream_t stream)
+{
+    if (B <= 0 || N <= 0 || K <= 0 || (K & 1) != 0 || scale_rows <= 0 || scale_cols <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
+    dim3 block(GEMV_THREADS);
+    dsv4_fp4_gemv_batch_kernel<<<grid, block, 0, stream>>>(
+        weight, scales, input, output, B, N, K, scale_rows, scale_cols);
     return cudaGetLastError();
 }
 

@@ -11,6 +11,9 @@ mod batch_decode;
 mod config;
 #[path = "deepseek/forward.rs"]
 mod forward;
+#[cfg(feature = "cuda")]
+#[path = "deepseek/load.rs"]
+mod load;
 #[path = "deepseek/mla.rs"]
 mod mla;
 #[path = "deepseek/mlp.rs"]
