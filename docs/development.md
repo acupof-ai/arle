@@ -2,7 +2,8 @@
 
 ARLE's `dev` Docker target is a CUDA/Rust/Python toolchain container for
 building and checking the CUDA backend. The default final Dockerfile stage
-remains the release runtime image used by `ghcr.io/cklxx/arle:latest`.
+remains the release runtime image published as `ghcr.io/cklxx/arle:latest` on
+stable release tags.
 
 Build the local image:
 
