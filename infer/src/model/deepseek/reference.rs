@@ -12,6 +12,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(feature = "cuda")]
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 use deepseek_spec::{DeepSeekV4CompressorTensorNames, DeepSeekV4Config, DeepSeekV4MoeTensorNames};
 use half::bf16;
 use log::info;
@@ -57,6 +59,13 @@ struct HeaderTensor {
 pub(crate) struct DeepseekV4ReferenceModel {
     config: DeepSeekV4Config,
     tensors: SafeTensorStore,
+    #[cfg(feature = "cuda")]
+    cuda: Option<CudaReferenceMatvec>,
+}
+
+#[cfg(feature = "cuda")]
+struct CudaReferenceMatvec {
+    ctx: DeviceContext,
 }
 
 impl DeepseekV4ReferenceModel {
@@ -66,7 +75,14 @@ impl DeepseekV4ReferenceModel {
             .with_context(|| format!("loading DeepSeek V4 config from {}", model_dir.display()))?;
         let tensors = SafeTensorStore::open_model_dir(model_dir)?;
         validate_deepseek_v4_checkpoint_manifest(model_dir, &config)?;
-        Ok(Self { config, tensors })
+        #[cfg(feature = "cuda")]
+        let cuda = CudaReferenceMatvec::from_env()?;
+        Ok(Self {
+            config,
+            tensors,
+            #[cfg(feature = "cuda")]
+            cuda,
+        })
     }
 
     pub(crate) fn generate_greedy(
@@ -174,7 +190,7 @@ impl DeepseekV4ReferenceModel {
             }
         }
         let hidden = self.rms_norm(&hidden, "norm.weight")?;
-        self.tensors.matvec("head.weight", &hidden)
+        self.matvec("head.weight", &hidden)
     }
 
     fn layer_forward(
@@ -254,12 +270,12 @@ impl DeepseekV4ReferenceModel {
         let mut kv_sw = vec![0.0_f32; seq * c];
         for t in 0..seq {
             let xt = &x[t * d..(t + 1) * d];
-            let mut cq = self.tensors.matvec(&format!("{prefix}.wq_a.weight"), xt)?;
+            let mut cq = self.matvec(&format!("{prefix}.wq_a.weight"), xt)?;
             self.rms_norm_vec_in_place(&mut cq, &format!("{prefix}.q_norm.weight"))?;
             c_q[t * self.config.q_lora_rank..(t + 1) * self.config.q_lora_rank]
                 .copy_from_slice(&cq);
 
-            let q_raw = self.tensors.matvec(&format!("{prefix}.wq_b.weight"), &cq)?;
+            let q_raw = self.matvec(&format!("{prefix}.wq_b.weight"), &cq)?;
             ensure!(q_raw.len() == heads * c, "attention q width mismatch");
             for h in 0..heads {
                 let dst = &mut q[(t * heads + h) * c..(t * heads + h + 1) * c];
@@ -274,7 +290,7 @@ impl DeepseekV4ReferenceModel {
                 );
             }
 
-            let mut kv = self.tensors.matvec(&format!("{prefix}.wkv.weight"), xt)?;
+            let mut kv = self.matvec(&format!("{prefix}.wkv.weight"), xt)?;
             self.rms_norm_vec_in_place(&mut kv, &format!("{prefix}.kv_norm.weight"))?;
             apply_partial_rope(
                 &mut kv,
@@ -415,7 +431,7 @@ impl DeepseekV4ReferenceModel {
                     latent[row] = self.tensors.row_dot(&wo_a_name, row, &group_in)?;
                 }
             }
-            let projected = self.tensors.matvec(&wo_b_name, &latent)?;
+            let projected = self.matvec(&wo_b_name, &latent)?;
             out[t * d..(t + 1) * d].copy_from_slice(&projected);
         }
         Ok(out)
@@ -440,8 +456,8 @@ impl DeepseekV4ReferenceModel {
         let mut score = vec![0.0_f32; padded * width];
         for t in 0..seq {
             let xt = &x[t * d..(t + 1) * d];
-            let k = self.tensors.matvec(&names.wkv, xt)?;
-            let s = self.tensors.matvec(&names.wgate, xt)?;
+            let k = self.matvec(&names.wkv, xt)?;
+            let s = self.matvec(&names.wgate, xt)?;
             kv[t * width..(t + 1) * width].copy_from_slice(&k);
             score[t * width..(t + 1) * width].copy_from_slice(&s);
         }
@@ -512,10 +528,8 @@ impl DeepseekV4ReferenceModel {
         let mut out = vec![Vec::new(); seq];
         for t in 0..seq {
             let cq = &c_q[t * self.config.q_lora_rank..(t + 1) * self.config.q_lora_rank];
-            let q_i = self.tensors.matvec(&names.wq_b, cq)?;
-            let mut w_i = self
-                .tensors
-                .matvec(&names.weights_proj, &x[t * d..(t + 1) * d])?;
+            let q_i = self.matvec(&names.wq_b, cq)?;
+            let mut w_i = self.matvec(&names.weights_proj, &x[t * d..(t + 1) * d])?;
             for value in &mut w_i {
                 *value *= score_scale;
             }
@@ -563,7 +577,7 @@ impl DeepseekV4ReferenceModel {
 
         for t in 0..seq {
             let xt = &x[t * d..(t + 1) * d];
-            let logits = self.tensors.matvec(&names.gate_weight, xt)?;
+            let logits = self.matvec(&names.gate_weight, xt)?;
             let scores = self.config.router_scores_from_logits(&logits)?;
             let routes = if hash_routing {
                 let table = names
@@ -601,8 +615,8 @@ impl DeepseekV4ReferenceModel {
     }
 
     fn expert_forward(&self, prefix: &str, x: &[f32]) -> Result<Vec<f32>> {
-        let mut gate = self.tensors.matvec(&format!("{prefix}.w1.weight"), x)?;
-        let mut up = self.tensors.matvec(&format!("{prefix}.w3.weight"), x)?;
+        let mut gate = self.matvec(&format!("{prefix}.w1.weight"), x)?;
+        let mut up = self.matvec(&format!("{prefix}.w3.weight"), x)?;
         for value in &mut up {
             *value = value.clamp(-self.config.swiglu_limit, self.config.swiglu_limit);
         }
@@ -614,7 +628,7 @@ impl DeepseekV4ReferenceModel {
             .zip(up)
             .map(|(g, u)| silu(g) * u)
             .collect::<Vec<_>>();
-        self.tensors.matvec(&format!("{prefix}.w2.weight"), &hidden)
+        self.matvec(&format!("{prefix}.w2.weight"), &hidden)
     }
 
     fn gen_mhc_params(
@@ -728,6 +742,30 @@ impl DeepseekV4ReferenceModel {
         }
         Ok(())
     }
+
+    fn matvec(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.cuda {
+            return self.tensors.cuda_matvec(&cuda.ctx, name, x);
+        }
+        self.tensors.matvec(name, x)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CudaReferenceMatvec {
+    fn from_env() -> Result<Option<Self>> {
+        if !env_flag("ARLE_DSV4_REFERENCE_CUDA_MATVEC")? {
+            return Ok(None);
+        }
+        let ctx =
+            DeviceContext::new().context("creating CUDA context for DSv4 reference matvec")?;
+        info!(
+            "DeepSeek V4 reference path using ARLE CUDA raw matvec on device {}",
+            ctx.ordinal
+        );
+        Ok(Some(Self { ctx }))
+    }
 }
 
 impl SafeTensorStore {
@@ -826,6 +864,100 @@ impl SafeTensorStore {
         &self.mmaps[meta.shard][meta.start..meta.end]
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_matvec(&self, ctx: &DeviceContext, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        let meta = self.meta(name)?;
+        ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
+        let cols = self.matrix_input_cols(meta);
+        ensure!(
+            x.len() == cols,
+            "matvec {name} expects input len {cols}, got {}",
+            x.len()
+        );
+
+        let weight = self.cuda_matrix(ctx, name, meta)?;
+        let input_host = x.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
+        let input = DeviceVec::from_host(ctx, &input_host)?;
+        let output = crate::ops::linear(ctx, &input, &weight)?;
+        output.to_host(ctx)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_matrix(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        meta: &TensorMeta,
+    ) -> Result<DeviceMatrix> {
+        ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
+        let rows = meta.shape[0];
+        let cols = self.matrix_input_cols(meta);
+        match meta.dtype {
+            TensorDtype::Bf16 => DeviceMatrix::from_safetensors(ctx, self.data(meta), rows, cols)
+                .with_context(|| format!("uploading BF16 matrix {name} to CUDA")),
+            TensorDtype::F32 | TensorDtype::F8E8M0 => {
+                let host = (0..rows * cols)
+                    .map(|idx| self.f32_at(meta, idx).map(bf16::from_f32))
+                    .collect::<Result<Vec<_>>>()?;
+                DeviceMatrix::from_host(ctx, &host, rows, cols)
+                    .with_context(|| format!("uploading dense matrix {name} to CUDA"))
+            }
+            TensorDtype::F8E4M3 => {
+                let scale = self.scale_meta_for_weight(name)?;
+                DeviceMatrix::from_dsv4_fp8_block_scaled(
+                    ctx,
+                    self.data(meta),
+                    self.data(scale),
+                    rows,
+                    cols,
+                    scale.shape[0],
+                    scale.shape[1],
+                )
+                .with_context(|| format!("uploading DeepSeek V4 FP8 matrix {name} to CUDA"))
+            }
+            TensorDtype::I8 => {
+                let scale = self.scale_meta_for_weight(name)?;
+                DeviceMatrix::from_dsv4_fp4_block_scaled(
+                    ctx,
+                    self.data(meta),
+                    self.data(scale),
+                    rows,
+                    cols,
+                    scale.shape[0],
+                    scale.shape[1],
+                )
+                .with_context(|| format!("uploading DeepSeek V4 FP4 matrix {name} to CUDA"))
+            }
+            TensorDtype::I64 | TensorDtype::Unsupported => {
+                bail!(
+                    "tensor {name} dtype {:?} cannot be used as CUDA matrix",
+                    meta.dtype
+                )
+            }
+        }
+    }
+
+    fn scale_meta_for_weight(&self, name: &str) -> Result<&TensorMeta> {
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map(|prefix| format!("{prefix}.scale"))
+            .with_context(|| format!("quantized tensor {name} must end with .weight"))?;
+        let scale = self.meta(&scale_name)?;
+        ensure!(
+            scale.dtype == TensorDtype::F8E8M0,
+            "quantized scale tensor {scale_name} must be F8_E8M0"
+        );
+        ensure!(
+            scale.shape.len() == 2,
+            "quantized scale tensor {scale_name} must be 2D"
+        );
+        ensure!(
+            self.data(scale).len() == scale.shape[0] * scale.shape[1],
+            "quantized scale tensor {scale_name} byte length mismatch"
+        );
+        Ok(scale)
+    }
+
     fn vec_f32(&self, name: &str) -> Result<Vec<f32>> {
         let meta = self.meta(name)?;
         let len = meta.shape.iter().product();
@@ -920,15 +1052,7 @@ impl SafeTensorStore {
         row: usize,
         x: &[f32],
     ) -> Result<f32> {
-        let scale_name = name
-            .strip_suffix(".weight")
-            .map(|prefix| format!("{prefix}.scale"))
-            .with_context(|| format!("quantized tensor {name} must end with .weight"))?;
-        let scale = self.meta(&scale_name)?;
-        ensure!(
-            scale.shape.len() == 2,
-            "quantized scale tensor {scale_name} must be 2D"
-        );
+        let scale = self.scale_meta_for_weight(name)?;
         let rows = meta.shape[0];
         let cols = self.matrix_input_cols(meta);
         let scale_rows = scale.shape[0];
@@ -1265,6 +1389,18 @@ fn reference_progress_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
         "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
         _ => bail!("invalid INFER_DSV4_REF_PROGRESS value `{raw}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn env_flag(name: &str) -> Result<bool> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid {name} value `{raw}`"),
     }
 }
 
