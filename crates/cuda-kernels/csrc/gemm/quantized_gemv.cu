@@ -16,6 +16,11 @@
 #define GEMV_THREADS 256
 #define GEMV_ROWS 4
 
+__device__ __constant__ float DSV4_FP4_E2M1_LUT[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -221,13 +226,7 @@ __device__ __forceinline__ float dsv4_decode_fp8_e4m3(uint8_t bits) {
 }
 
 __device__ __forceinline__ float dsv4_decode_fp4_e2m1(uint8_t bits) {
-    const float sign = (bits & 0x08) ? -1.0f : 1.0f;
-    const int exp = (bits >> 1) & 0x03;
-    const int mant = bits & 0x01;
-    if (exp == 0) {
-        return sign * static_cast<float>(mant) * 0.5f;
-    }
-    return sign * (1.0f + static_cast<float>(mant) * 0.5f) * exp2f(static_cast<float>(exp - 1));
+    return DSV4_FP4_E2M1_LUT[bits & 0x0f];
 }
 
 __device__ __forceinline__ float dsv4_block_scale(
