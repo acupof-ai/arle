@@ -7,9 +7,10 @@
 //! Dispatch priority for `gemm_into()` (batched, prefill path):
 //!   1. Marlin W4 → `marlin_gemm_cuda` (tensor core, 5-25× TTFT speedup)
 //!   2. TurboQuant → bulk dequant + cuBLAS GEMM
-//!   3. Quantized INT → `w{2,4,8}a16_gemv_batch_cuda`
-//!   4. BF16, N=1 → `gemm_graphsafe_cuda` (cuBLAS, CUDA Graph safe)
-//!   5. BF16, N>1 → `gemm_cuda` (cuBLAS with workspace)
+//!   3. DeepSeek V4 block-scaled raw FP8/FP4 → matching batched GEMV kernel
+//!   4. Quantized INT → `w{2,4,8}a16_gemv_batch_cuda`
+//!   5. BF16, N=1 → `gemm_graphsafe_cuda` (cuBLAS, CUDA Graph safe)
+//!   6. BF16, N>1 → `gemm_cuda` (cuBLAS with workspace)
 
 use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -31,9 +32,13 @@ enum LinearKernelPlan {
     W2A16Gemv,
     W4A16Gemv,
     W8A16Gemv,
+    Dsv4Fp8Gemv,
+    Dsv4Fp4Gemv,
     W2A16BatchGemv,
     W4A16BatchGemv,
     W8A16BatchGemv,
+    Dsv4Fp8BatchGemv,
+    Dsv4Fp4BatchGemv,
     Q3KGemv,
     Q4KGemv,
     Q5KGemv,
@@ -68,6 +73,8 @@ impl LinearKernelPlan {
             WeightFormat::W2A16 => Self::W2A16Gemv,
             WeightFormat::W4A16 => Self::W4A16Gemv,
             WeightFormat::W8A16 => Self::W8A16Gemv,
+            WeightFormat::Dsv4Fp8BlockScaled => Self::Dsv4Fp8Gemv,
+            WeightFormat::Dsv4Fp4BlockScaled => Self::Dsv4Fp4Gemv,
             WeightFormat::GgufQ3K => Self::Q3KGemv,
             WeightFormat::GgufQ4K => Self::Q4KGemv,
             WeightFormat::GgufQ5K => Self::Q5KGemv,
@@ -132,6 +139,8 @@ impl LinearKernelPlan {
             (_, WeightFormat::W2A16) => Self::W2A16BatchGemv,
             (_, WeightFormat::W4A16) => Self::W4A16BatchGemv,
             (_, WeightFormat::W8A16) => Self::W8A16BatchGemv,
+            (_, WeightFormat::Dsv4Fp8BlockScaled) => Self::Dsv4Fp8BatchGemv,
+            (_, WeightFormat::Dsv4Fp4BlockScaled) => Self::Dsv4Fp4BatchGemv,
             (2..=8, WeightFormat::GgufQ3K) => Self::Q3KBatchGemv,
             (2..=8, WeightFormat::GgufQ4K) => Self::Q4KBatchGemv,
             (2..=8, WeightFormat::GgufQ5K) => Self::Q5KBatchGemv,
@@ -515,9 +524,13 @@ pub(crate) fn linear_kernel_plan_for_test(
         LinearKernelPlan::W2A16Gemv => "W2A16Gemv",
         LinearKernelPlan::W4A16Gemv => "W4A16Gemv",
         LinearKernelPlan::W8A16Gemv => "W8A16Gemv",
+        LinearKernelPlan::Dsv4Fp8Gemv => "Dsv4Fp8Gemv",
+        LinearKernelPlan::Dsv4Fp4Gemv => "Dsv4Fp4Gemv",
         LinearKernelPlan::W2A16BatchGemv => "W2A16BatchGemv",
         LinearKernelPlan::W4A16BatchGemv => "W4A16BatchGemv",
         LinearKernelPlan::W8A16BatchGemv => "W8A16BatchGemv",
+        LinearKernelPlan::Dsv4Fp8BatchGemv => "Dsv4Fp8BatchGemv",
+        LinearKernelPlan::Dsv4Fp4BatchGemv => "Dsv4Fp4BatchGemv",
         LinearKernelPlan::Q3KGemv => "Q3KGemv",
         LinearKernelPlan::Q4KGemv => "Q4KGemv",
         LinearKernelPlan::Q5KGemv => "Q5KGemv",
@@ -786,6 +799,13 @@ pub(crate) fn gemv_with_marlin_scratch(
             );
         }
         return Ok(());
+    }
+
+    if matches!(
+        plan,
+        LinearKernelPlan::Dsv4Fp8Gemv | LinearKernelPlan::Dsv4Fp4Gemv
+    ) {
+        return run_dsv4_block_scaled_gemv(ctx, weight, input, output, plan);
     }
 
     if let Some(qw) = weight.qweight.as_ref() {
@@ -1851,6 +1871,118 @@ fn run_turboquant_linear(
     }
 }
 
+fn run_dsv4_block_scaled_gemv(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &DeviceVec,
+    output: &mut DeviceVec,
+    plan: LinearKernelPlan,
+) -> Result<()> {
+    let qw = weight
+        .qweight
+        .as_ref()
+        .context("DeepSeek V4 matrix missing raw weight bytes")?;
+    let scales = weight
+        .dsv4_scales
+        .as_ref()
+        .context("DeepSeek V4 matrix missing block scales")?;
+    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
+    let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+
+    unsafe {
+        let res = match plan {
+            LinearKernelPlan::Dsv4Fp8Gemv => ffi::dsv4_fp8_gemv_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                stream,
+            ),
+            LinearKernelPlan::Dsv4Fp4Gemv => ffi::dsv4_fp4_gemv_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                stream,
+            ),
+            _ => unreachable!("unexpected DeepSeek V4 GEMV plan {plan:?}"),
+        };
+        res.result()
+            .map_err(|e| anyhow::anyhow!("DeepSeek V4 block-scaled GEMV failed: {e}"))?;
+    }
+    Ok(())
+}
+
+fn run_dsv4_block_scaled_linear(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    plan: LinearKernelPlan,
+) -> Result<()> {
+    let qw = weight
+        .qweight
+        .as_ref()
+        .context("DeepSeek V4 matrix missing raw weight bytes")?;
+    let scales = weight
+        .dsv4_scales
+        .as_ref()
+        .context("DeepSeek V4 matrix missing block scales")?;
+    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+
+    unsafe {
+        let res = match plan {
+            LinearKernelPlan::Dsv4Fp8Gemv | LinearKernelPlan::Dsv4Fp8BatchGemv => {
+                ffi::dsv4_fp8_gemv_batch_cuda(
+                    qw_ptr as *const u8,
+                    scales_ptr as *const u8,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    x.seq_len as i32,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.dsv4_scale_rows as i32,
+                    weight.dsv4_scale_cols as i32,
+                    stream,
+                )
+            }
+            LinearKernelPlan::Dsv4Fp4Gemv | LinearKernelPlan::Dsv4Fp4BatchGemv => {
+                ffi::dsv4_fp4_gemv_batch_cuda(
+                    qw_ptr as *const u8,
+                    scales_ptr as *const u8,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    x.seq_len as i32,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.dsv4_scale_rows as i32,
+                    weight.dsv4_scale_cols as i32,
+                    stream,
+                )
+            }
+            _ => unreachable!("unexpected DeepSeek V4 linear plan {plan:?}"),
+        };
+        res.result()
+            .map_err(|e| anyhow::anyhow!("DeepSeek V4 block-scaled batch GEMV failed: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_qweight_linear(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -2127,6 +2259,12 @@ pub(crate) fn try_gemm_with_phase_and_scratch_into(
         }
         LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);
+        }
+        LinearKernelPlan::Dsv4Fp8Gemv
+        | LinearKernelPlan::Dsv4Fp4Gemv
+        | LinearKernelPlan::Dsv4Fp8BatchGemv
+        | LinearKernelPlan::Dsv4Fp4BatchGemv => {
+            run_dsv4_block_scaled_linear(ctx, weight, x, out, plan)?;
         }
         LinearKernelPlan::Bf16CublasGemm if deterministic_gemm_enabled() => {
             run_bf16_graphsafe_per_row(ctx, weight, x, out);

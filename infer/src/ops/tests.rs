@@ -6,6 +6,8 @@ use super::*;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::*;
 
+use crate::ops::linear::try_gemm_with_phase_into;
+
 fn bf16_vec(data: &[f32]) -> Vec<bf16> {
     data.iter().map(|&x| bf16::from_f32(x)).collect()
 }
@@ -74,6 +76,67 @@ fn test_gemv() -> Result<()> {
         result[1]
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_dsv4_fp8_gemv() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let weight = DeviceMatrix::from_dsv4_fp8_block_scaled(
+        &ctx,
+        &[0x38, 0xb8, 0x40, 0xc0],
+        &[127],
+        2,
+        2,
+        1,
+        1,
+    )?;
+    let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 2.0]))?;
+    let y = linear(&ctx, &x, &weight)?;
+    let host = y.to_host(&ctx)?;
+
+    assert_close(&host, &[-1.0, -2.0], 0.01);
+    Ok(())
+}
+
+#[test]
+fn test_dsv4_fp4_gemv() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let weight = DeviceMatrix::from_dsv4_fp4_block_scaled(&ctx, &[0x21, 0xb3], &[127], 2, 2, 1, 1)?;
+    let x = DeviceVec::from_host(&ctx, &bf16_vec(&[2.0, 4.0]))?;
+    let y = linear(&ctx, &x, &weight)?;
+    let host = y.to_host(&ctx)?;
+
+    assert_close(&host, &[5.0, -3.0], 0.01);
+    Ok(())
+}
+
+#[test]
+fn test_dsv4_fp8_batched_gemv() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let weight = DeviceMatrix::from_dsv4_fp8_block_scaled(
+        &ctx,
+        &[0x38, 0xb8, 0x40, 0xc0],
+        &[127],
+        2,
+        2,
+        1,
+        1,
+    )?;
+    let x_host = bf16_vec(&[1.0, 2.0, 3.0, 4.0]);
+    let x = HiddenStates {
+        data: ctx.stream.clone_htod(&x_host)?,
+        hidden_dim: 2,
+        seq_len: 2,
+    };
+    let mut out = HiddenStates::zeros(&ctx, 2, 2)?;
+
+    try_gemm_with_phase_into(&ctx, &weight, &x, &mut out, LinearDispatchPhase::Prefill)?;
+    let host = ctx.stream.clone_dtoh(&out.data)?;
+    ctx.sync()?;
+    let values = host.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+
+    assert_close(&values, &[-1.0, -2.0, -1.0, -2.0], 0.01);
     Ok(())
 }
 
