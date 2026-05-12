@@ -303,12 +303,19 @@ __global__ void dsv4_fp4_gemv_kernel(
     if (row >= N) return;
 
     const int bytes_per_row = K / 2;
+    const int block_h = (N + scale_rows - 1) / scale_rows;
+    const int block_w = (K + scale_cols - 1) / scale_cols;
+    const int sr_raw = row / block_h;
+    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
+    const int scale_row_offset = sr * scale_cols;
     float sum = 0.0f;
     for (int k = tid_in_row; k < K; k += threads_per_row) {
         const uint8_t packed = weight[row * bytes_per_row + (k >> 1)];
         const uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+        const int sc_raw = k / block_w;
+        const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
         const float w = dsv4_decode_fp4_e2m1(nibble)
-            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+            * dsv4_decode_e8m0(scales[scale_row_offset + sc]);
         sum += w * __bfloat162float(input[k]);
     }
 
