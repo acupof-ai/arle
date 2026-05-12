@@ -218,7 +218,7 @@ __global__ void quantize_paged_kv_fp8_kernel(
 
 // BF16 → FP8 E4M3 quantize for contiguous → paged migration.
 // Reads from HND contiguous layout, writes to NHD paged layout.
-// Grid: (num_kv_heads, seq_len)   Block: (head_dim)
+// Grid: (num_kv_heads, seq_len)   Block: ceil(head_dim / 4), rounded to a warp
 __global__ void quantize_scatter_kv_fp8_kernel(
     const __nv_bfloat16* __restrict__ kv_cont,    // [num_kv_heads, max_seq_len, head_dim] HND
     __nv_fp8_e4m3* __restrict__ kv_fp8,           // [max_total_tokens, kv_dim] NHD
@@ -232,8 +232,7 @@ __global__ void quantize_scatter_kv_fp8_kernel(
 {
     int kv_head = blockIdx.x;
     int rel_pos = blockIdx.y;
-    int d = threadIdx.x;
-    if (d >= head_dim) return;
+    int d = threadIdx.x * 4;
 
     int pos = start_pos + rel_pos;
     constexpr int kPageSize = 16;
@@ -245,12 +244,17 @@ __global__ void quantize_scatter_kv_fp8_kernel(
     int src = kv_head * max_seq_len * head_dim + pos * head_dim + d;
     // Dest: NHD
     int dst = row_idx * kv_dim + kv_head * head_dim + d;
-    float val = __bfloat162float(kv_cont[src]);
+    float val0 = (d < head_dim) ? __bfloat162float(kv_cont[src]) : 0.0f;
+    float val1 = (d + 1 < head_dim) ? __bfloat162float(kv_cont[src + 1]) : 0.0f;
+    float val2 = (d + 2 < head_dim) ? __bfloat162float(kv_cont[src + 2]) : 0.0f;
+    float val3 = (d + 3 < head_dim) ? __bfloat162float(kv_cont[src + 3]) : 0.0f;
 
-    float abs_val = warp_reduce_max_abs(fabsf(val));
-    int warp_id = d / 32;
-    int lane_id = d % 32;
-    int num_warps = (head_dim + 31) / 32;
+    float abs_val = fmaxf(fabsf(val0), fabsf(val1));
+    abs_val = fmaxf(abs_val, fabsf(val2));
+    abs_val = warp_reduce_max_abs(fmaxf(abs_val, fabsf(val3)));
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    int num_warps = (blockDim.x + 31) / 32;
     extern __shared__ float smem[];
     if (lane_id == 0) smem[warp_id] = abs_val;
     __syncthreads();
@@ -265,7 +269,18 @@ __global__ void quantize_scatter_kv_fp8_kernel(
         }
     }
     __syncthreads();
-    kv_fp8[dst] = __nv_fp8_e4m3(val / s_scale);
+    if (d < head_dim) {
+        kv_fp8[dst] = __nv_fp8_e4m3(val0 / s_scale);
+    }
+    if (d + 1 < head_dim) {
+        kv_fp8[dst + 1] = __nv_fp8_e4m3(val1 / s_scale);
+    }
+    if (d + 2 < head_dim) {
+        kv_fp8[dst + 2] = __nv_fp8_e4m3(val2 / s_scale);
+    }
+    if (d + 3 < head_dim) {
+        kv_fp8[dst + 3] = __nv_fp8_e4m3(val3 / s_scale);
+    }
 }
 
 // Quantize 1 new token per request: bf16 working → FP8 paged pool.
@@ -300,8 +315,10 @@ cudaError_t quantize_scatter_kv_fp8_cuda(
 {
     if (seq_len <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, seq_len);
-    dim3 block(head_dim);
-    int smem_bytes = ((head_dim + 31) / 32) * sizeof(float);
+    int group_threads = (head_dim + 3) / 4;
+    int block_threads = ((group_threads + 31) / 32) * 32;
+    dim3 block(block_threads);
+    int smem_bytes = ((block_threads + 31) / 32) * sizeof(float);
     quantize_scatter_kv_fp8_kernel<<<grid, block, smem_bytes, stream>>>(
         kv_cont, kv_fp8, scales, page_indices,
         0, max_seq_len, num_kv_heads, head_dim, kv_dim);
@@ -319,8 +336,10 @@ cudaError_t quantize_scatter_kv_fp8_range_cuda(
 {
     if (token_count <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, token_count);
-    dim3 block(head_dim);
-    int smem_bytes = ((head_dim + 31) / 32) * sizeof(float);
+    int group_threads = (head_dim + 3) / 4;
+    int block_threads = ((group_threads + 31) / 32) * 32;
+    dim3 block(block_threads);
+    int smem_bytes = ((block_threads + 31) / 32) * sizeof(float);
     quantize_scatter_kv_fp8_kernel<<<grid, block, smem_bytes, stream>>>(
         kv_cont, kv_fp8, scales, page_indices,
         start_pos, max_seq_len, num_kv_heads, head_dim, kv_dim);

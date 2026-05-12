@@ -175,6 +175,57 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Elements(
+        (2048 * QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM) as u64,
+    ));
+    group.bench_function(
+        BenchmarkId::new("quantize_scatter_kv_fp8_qwen35", 2048),
+        |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let max_seq_len = 4096usize;
+            let token_count = 2048usize;
+            let num_kv_heads = QWEN35_4B_KV_HEADS;
+            let head_dim = QWEN35_4B_HEAD_DIM;
+            let kv_dim = num_kv_heads * head_dim;
+            let cont_elems = max_seq_len * kv_dim;
+            let paged_elems = token_count * kv_dim;
+
+            let kv_cont = device_vec(&ctx, cont_elems).expect("failed to allocate fp8 kv cont");
+            let mut kv_fp8 = ctx
+                .stream
+                .alloc_zeros::<u8>(paged_elems)
+                .expect("failed to allocate fp8 scatter pool");
+            let mut scales = ctx
+                .stream
+                .alloc_zeros::<f32>(token_count * num_kv_heads)
+                .expect("failed to allocate fp8 scatter scales");
+            let page_indices_host: Vec<i32> = (0..token_count).map(|idx| idx as i32).collect();
+            let page_indices = ctx
+                .stream
+                .clone_htod(&page_indices_host)
+                .expect("failed to H2D fp8 scatter rows");
+            let (dst_ptr, _dst_guard) = kv_fp8.device_ptr_mut(&ctx.stream);
+            let (scale_ptr, _scale_guard) = scales.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || {
+                kv_quant::quantize_scatter_kv_fp8_range(
+                    &ctx,
+                    &kv_cont,
+                    dst_ptr,
+                    scale_ptr,
+                    &page_indices,
+                    0,
+                    max_seq_len,
+                    token_count,
+                    num_kv_heads,
+                    head_dim,
+                    kv_dim,
+                )
+                .expect("quantize_scatter_kv_fp8_range failed");
+            });
+        },
+    );
+
+    group.throughput(Throughput::Elements(
         (4 * 4096 * QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM) as u64,
     ));
     group.bench_function(BenchmarkId::new("decode_attention_fp8_qwen35", 4096), |b| {
