@@ -8,9 +8,10 @@ use infer::ops;
 
 use super::common::{
     ATTN_SEQ_LEN, BATCH_SEQ_LEN, HEAD_DIM_128, KV_HEADS_128, MAX_SEQ_LEN, Q_HEADS_128,
-    QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS, QWEN35_4B_Q_HEADS, ROPE_THETA_QWEN3, VECTOR_DIM,
-    VOCAB_SIZE, configure_group, decode_meta, device_vec, embedding_matrix, hidden_states,
-    iter_sync, positive_device_vec, rope_cache, token_ids, zero_f32_slice,
+    QWEN35_4B_HEAD_DIM, QWEN35_4B_HIDDEN, QWEN35_4B_INTERMEDIATE, QWEN35_4B_KV_HEADS,
+    QWEN35_4B_Q_HEADS, ROPE_THETA_QWEN3, VECTOR_DIM, VOCAB_SIZE, configure_group, decode_meta,
+    device_vec, device_vec_scaled, embedding_matrix, hidden_states, iter_sync, positive_device_vec,
+    rope_cache, token_ids, zero_f32_slice,
 };
 
 pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
@@ -71,6 +72,49 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
                 .expect("embedding_batch failed");
         });
     });
+
+    for &(label, rows, cols) in &[
+        ("qwen35_hidden_2048x2560", 2048usize, QWEN35_4B_HIDDEN),
+        (
+            "qwen35_intermediate_2048x9216",
+            2048usize,
+            QWEN35_4B_INTERMEDIATE,
+        ),
+    ] {
+        group.throughput(Throughput::Elements((rows * cols) as u64));
+        group.bench_function(
+            BenchmarkId::new("quantize_bf16_rows_to_fp8_e4m3", label),
+            |b| {
+                let ctx = DeviceContext::new().expect("failed to create CUDA context");
+                let input = device_vec_scaled(&ctx, rows * cols, 0.015_625)
+                    .expect("failed to allocate fp8 activation input");
+                let mut output = ctx
+                    .stream
+                    .alloc_zeros::<u8>(rows * cols)
+                    .expect("failed to allocate fp8 activation output");
+                let mut scales = ctx
+                    .stream
+                    .alloc_zeros::<f32>(rows)
+                    .expect("failed to allocate fp8 activation scales");
+                let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
+                let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+                let (scales_ptr, _scales_guard) = scales.device_ptr_mut(&ctx.stream);
+
+                iter_sync(b, &ctx, || unsafe {
+                    ffi::quantize_bf16_rows_to_fp8_e4m3_cuda(
+                        input_ptr as *const ffi::Half,
+                        output_ptr as *mut u8,
+                        scales_ptr as *mut f32,
+                        rows as i32,
+                        cols as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .expect("quantize_bf16_rows_to_fp8_e4m3_cuda failed");
+                });
+            },
+        );
+    }
 
     group.throughput(Throughput::Elements((4 * 1024 * 256) as u64));
     group.bench_function(

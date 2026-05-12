@@ -361,3 +361,68 @@ unsafe extern "C" {
         stream: CUstream,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::DeviceContext;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use half::bf16;
+
+    #[test]
+    fn fp8_row_quantization_scales_match_absmax() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        let rows = 2usize;
+        let cols = 513usize;
+        let mut input_host = vec![bf16::ZERO; rows * cols];
+        for col in 0..cols {
+            let value = if col == 257 {
+                -2.0
+            } else {
+                ((col % 17) as f32 - 8.0) * 0.03125
+            };
+            input_host[cols + col] = bf16::from_f32(value);
+        }
+
+        let input = ctx.stream.clone_htod(&input_host).expect("input H2D");
+        let mut output = ctx
+            .stream
+            .alloc_zeros::<u8>(rows * cols)
+            .expect("output alloc");
+        let mut scales = ctx.stream.alloc_zeros::<f32>(rows).expect("scales alloc");
+        {
+            let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+            let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales.device_ptr_mut(&ctx.stream);
+
+            unsafe {
+                quantize_bf16_rows_to_fp8_e4m3_cuda(
+                    input_ptr as *const Half,
+                    output_ptr as *mut u8,
+                    scales_ptr as *mut f32,
+                    rows as i32,
+                    cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("fp8 row quantize");
+            }
+        }
+        ctx.sync().expect("sync fp8 row quantize");
+
+        let got_scales = ctx.stream.clone_dtoh(&scales).expect("scales D2H");
+        assert_eq!(got_scales[0], 1.0);
+        assert!(
+            (got_scales[1] - (2.0 / 448.0)).abs() < 1.0e-7,
+            "nonzero row scale mismatch: got {}, expected {}",
+            got_scales[1],
+            2.0 / 448.0
+        );
+
+        let got_output = ctx.stream.clone_dtoh(&output).expect("output D2H");
+        assert!(
+            got_output[..cols].iter().all(|&byte| byte == 0),
+            "zero row should quantize to all-zero fp8 bytes"
+        );
+    }
+}
