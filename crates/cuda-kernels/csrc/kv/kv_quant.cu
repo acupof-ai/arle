@@ -12,6 +12,7 @@
 // Grid: (num_kv_heads, token_count)   Block: (head_dim)
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -345,7 +346,7 @@ __global__ void dequantize_paged_kv_fp8_to_hnd_kernel(
 {
     int kv_head = blockIdx.x;
     int tok_flat = blockIdx.y;
-    int d = threadIdx.x;
+    int d = threadIdx.x * 2;
     if (d >= head_dim) return;
 
     int token_row = token_rows[tok_flat];
@@ -358,8 +359,24 @@ __global__ void dequantize_paged_kv_fp8_to_hnd_kernel(
                    + kv_head * kPageSize * head_dim
                    + offset_in_page * head_dim
                    + d;
-    float val = static_cast<float>(kv_fp8[src_offset]) * scales[scale_offset];
-    kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+    float scale = scales[scale_offset];
+    if (d + 1 < head_dim) {
+        __nv_fp8x2_e4m3 packed;
+        if (((src_offset | dst_offset) & 1) == 0) {
+            packed.__x = *reinterpret_cast<const __nv_fp8x2_storage_t*>(kv_fp8 + src_offset);
+            float2 vals = static_cast<float2>(packed);
+            __nv_bfloat162 out = __floats2bfloat162_rn(vals.x * scale, vals.y * scale);
+            *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset) = out;
+        } else {
+            float val0 = static_cast<float>(kv_fp8[src_offset]) * scale;
+            float val1 = static_cast<float>(kv_fp8[src_offset + 1]) * scale;
+            kv_bf16_hnd[dst_offset] = __float2bfloat16(val0);
+            kv_bf16_hnd[dst_offset + 1] = __float2bfloat16(val1);
+        }
+    } else {
+        float val = static_cast<float>(kv_fp8[src_offset]) * scale;
+        kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+    }
 }
 
 cudaError_t dequantize_paged_kv_fp8_to_hnd_cuda(
@@ -375,7 +392,7 @@ cudaError_t dequantize_paged_kv_fp8_to_hnd_cuda(
 {
     if (total_tokens <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, total_tokens);
-    dim3 block(head_dim);
+    dim3 block((head_dim + 1) / 2);
     dequantize_paged_kv_fp8_to_hnd_kernel<<<grid, block, 0, stream>>>(
         kv_fp8, scales, kv_bf16_hnd, token_rows, num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();
@@ -393,7 +410,7 @@ __global__ void dequantize_paged_kv_int8_to_hnd_kernel(
 {
     int kv_head = blockIdx.x;
     int tok_flat = blockIdx.y;
-    int d = threadIdx.x;
+    int d = threadIdx.x * 2;
     if (d >= head_dim) return;
 
     int token_row = token_rows[tok_flat];
@@ -406,8 +423,26 @@ __global__ void dequantize_paged_kv_int8_to_hnd_kernel(
                    + kv_head * kPageSize * head_dim
                    + offset_in_page * head_dim
                    + d;
-    float val = static_cast<float>(kv_int8[src_offset]) * scales[scale_offset];
-    kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+    float scale = scales[scale_offset];
+    if (d + 1 < head_dim) {
+        if (((src_offset | dst_offset) & 1) == 0) {
+            uint16_t packed = *reinterpret_cast<const uint16_t*>(kv_int8 + src_offset);
+            int8_t lo = static_cast<int8_t>(packed & 0xffu);
+            int8_t hi = static_cast<int8_t>((packed >> 8) & 0xffu);
+            __nv_bfloat162 out = __floats2bfloat162_rn(
+                static_cast<float>(lo) * scale,
+                static_cast<float>(hi) * scale);
+            *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset) = out;
+        } else {
+            float val0 = static_cast<float>(kv_int8[src_offset]) * scale;
+            float val1 = static_cast<float>(kv_int8[src_offset + 1]) * scale;
+            kv_bf16_hnd[dst_offset] = __float2bfloat16(val0);
+            kv_bf16_hnd[dst_offset + 1] = __float2bfloat16(val1);
+        }
+    } else {
+        float val = static_cast<float>(kv_int8[src_offset]) * scale;
+        kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+    }
 }
 
 cudaError_t dequantize_paged_kv_int8_to_hnd_cuda(
@@ -423,7 +458,7 @@ cudaError_t dequantize_paged_kv_int8_to_hnd_cuda(
 {
     if (total_tokens <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, total_tokens);
-    dim3 block(head_dim);
+    dim3 block((head_dim + 1) / 2);
     dequantize_paged_kv_int8_to_hnd_kernel<<<grid, block, 0, stream>>>(
         kv_int8, scales, kv_bf16_hnd, token_rows, num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();

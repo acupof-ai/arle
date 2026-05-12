@@ -602,3 +602,133 @@ pub fn quantize_paged_kv_single(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::bf16;
+
+    fn fp8_reference(byte: u8) -> f32 {
+        match byte {
+            0x00 => 0.0,
+            0x38 => 1.0,
+            0xb8 => -1.0,
+            0x40 => 2.0,
+            other => panic!("unexpected fp8 test byte: {other:#04x}"),
+        }
+    }
+
+    fn hnd_offset(
+        token_row: usize,
+        kv_head: usize,
+        d: usize,
+        head_dim: usize,
+        kv_dim: usize,
+    ) -> usize {
+        const PAGE_SIZE: usize = 16;
+        let page_idx = token_row / PAGE_SIZE;
+        let offset_in_page = token_row % PAGE_SIZE;
+        page_idx * PAGE_SIZE * kv_dim
+            + kv_head * PAGE_SIZE * head_dim
+            + offset_in_page * head_dim
+            + d
+    }
+
+    fn run_hnd_refill_case(ctx: &DeviceContext, head_dim: usize) {
+        let num_kv_heads = 3usize;
+        let total_tokens = 17usize;
+        let kv_dim = num_kv_heads * head_dim;
+        let elem_count = total_tokens * kv_dim;
+        let hnd_elem_count = total_tokens.div_ceil(16) * 16 * kv_dim;
+
+        let fp8_pattern = [0x00u8, 0x38, 0xb8, 0x40];
+        let fp8_host: Vec<u8> = (0..elem_count)
+            .map(|idx| fp8_pattern[idx % fp8_pattern.len()])
+            .collect();
+        let int8_host: Vec<i8> = (0..elem_count).map(|idx| (idx as i8 % 9) - 4).collect();
+        let scale_host: Vec<f32> = (0..total_tokens * num_kv_heads)
+            .map(|idx| 0.25 + (idx % 5) as f32 * 0.125)
+            .collect();
+        let token_rows_host: Vec<i32> = (0..total_tokens).map(|idx| idx as i32).collect();
+
+        let fp8_gpu = ctx.stream.clone_htod(&fp8_host).expect("fp8 H2D");
+        let int8_gpu = ctx.stream.clone_htod(&int8_host).expect("int8 H2D");
+        let scales_gpu = ctx.stream.clone_htod(&scale_host).expect("scales H2D");
+        let token_rows_gpu = ctx.stream.clone_htod(&token_rows_host).expect("rows H2D");
+        let mut fp8_out = ctx
+            .stream
+            .alloc_zeros::<u16>(hnd_elem_count)
+            .expect("fp8 out");
+        let mut int8_out = ctx
+            .stream
+            .alloc_zeros::<u16>(hnd_elem_count)
+            .expect("int8 out");
+
+        {
+            let (fp8_ptr, _fp8_guard) = fp8_gpu.device_ptr(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales_gpu.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = fp8_out.device_ptr_mut(&ctx.stream);
+            dequantize_paged_kv_fp8_to_hnd(
+                ctx,
+                fp8_ptr,
+                scales_ptr,
+                out_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("fp8 hnd refill");
+        }
+        {
+            let (int8_ptr, _int8_guard) = int8_gpu.device_ptr(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales_gpu.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = int8_out.device_ptr_mut(&ctx.stream);
+            dequantize_paged_kv_int8_to_hnd(
+                ctx,
+                int8_ptr,
+                scales_ptr,
+                out_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("int8 hnd refill");
+        }
+
+        ctx.sync().expect("sync refill kernels");
+        let fp8_got = ctx.stream.clone_dtoh(&fp8_out).expect("fp8 D2H");
+        let int8_got = ctx.stream.clone_dtoh(&int8_out).expect("int8 D2H");
+
+        for token_row in 0..total_tokens {
+            for kv_head in 0..num_kv_heads {
+                let scale = scale_host[token_row * num_kv_heads + kv_head];
+                for d in 0..head_dim {
+                    let src = token_row * kv_dim + kv_head * head_dim + d;
+                    let dst = hnd_offset(token_row, kv_head, d, head_dim, kv_dim);
+                    let expected_fp8 =
+                        bf16::from_f32(fp8_reference(fp8_host[src]) * scale).to_bits();
+                    let expected_int8 = bf16::from_f32(int8_host[src] as f32 * scale).to_bits();
+                    assert_eq!(
+                        fp8_got[dst], expected_fp8,
+                        "fp8 mismatch head_dim={head_dim} token={token_row} head={kv_head} d={d}"
+                    );
+                    assert_eq!(
+                        int8_got[dst], expected_int8,
+                        "int8 mismatch head_dim={head_dim} token={token_row} head={kv_head} d={d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hnd_refill_quantized_kv_matches_reference_values() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        run_hnd_refill_case(&ctx, 8);
+        run_hnd_refill_case(&ctx, 7);
+    }
+}

@@ -1,6 +1,8 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput};
+use cuda_kernels::kv_quant;
+use cudarc::driver::{DevicePtr, DevicePtrMut};
 use infer::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use infer::ops;
 
@@ -69,6 +71,62 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
                 .expect("embedding_batch failed");
         });
     });
+
+    group.throughput(Throughput::Elements((4 * 1024 * 256) as u64));
+    group.bench_function(
+        BenchmarkId::new("dequantize_paged_kv_fp8_to_hnd", 1024),
+        |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let num_kv_heads = 4usize;
+            let head_dim = 256usize;
+            let total_tokens = 1024usize;
+            let kv_dim = num_kv_heads * head_dim;
+            let elem_count = total_tokens * kv_dim;
+
+            let fp8_host: Vec<u8> = (0..elem_count)
+                .map(|idx| 0x20u8.saturating_add((idx % 31) as u8))
+                .collect();
+            let scale_host: Vec<f32> = (0..total_tokens * num_kv_heads)
+                .map(|idx| 0.001 + (idx % 17) as f32 * 0.000_25)
+                .collect();
+            let token_rows_host: Vec<i32> = (0..total_tokens).map(|idx| idx as i32).collect();
+
+            let kv_fp8 = ctx
+                .stream
+                .clone_htod(&fp8_host)
+                .expect("failed to allocate fp8 kv");
+            let scales = ctx
+                .stream
+                .clone_htod(&scale_host)
+                .expect("failed to allocate fp8 scales");
+            let token_rows = ctx
+                .stream
+                .clone_htod(&token_rows_host)
+                .expect("failed to allocate token rows");
+            let mut kv_bf16_hnd = ctx
+                .stream
+                .alloc_zeros::<u16>(elem_count)
+                .expect("failed to allocate bf16 hnd output");
+            let (fp8_ptr, _fp8_guard) = kv_fp8.device_ptr(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = kv_bf16_hnd.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || {
+                kv_quant::dequantize_paged_kv_fp8_to_hnd(
+                    &ctx,
+                    fp8_ptr,
+                    scales_ptr,
+                    out_ptr,
+                    &token_rows,
+                    num_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    total_tokens,
+                )
+                .expect("dequantize_paged_kv_fp8_to_hnd failed");
+            });
+        },
+    );
 
     group.throughput(Throughput::Elements((Q_HEADS_128 * HEAD_DIM_128) as u64));
     group.bench_function(
