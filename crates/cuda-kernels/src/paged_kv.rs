@@ -815,7 +815,7 @@ impl TokenKVPool {
             .iter()
             .map(|layer| {
                 let (ptr, _guard) = layer.device_ptr(&ctx.stream);
-                ptr as u64
+                ptr
             })
             .collect::<Vec<_>>();
         ctx.stream
