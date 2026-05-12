@@ -25,11 +25,12 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
         &self,
         req: CompletionRequest,
         delta_tx: UnboundedSender<CompletionStreamDelta>,
-    ) -> Result<()> {
+    ) -> Result<Option<Vec<u32>>> {
+        let prompt_tokens = self.preprocess_prompt_tokens(&req);
         self.handle
             .submit(IncomingRequest {
                 prompt: req.prompt,
-                prompt_tokens: None,
+                prompt_tokens: prompt_tokens.clone(),
                 max_tokens: req.max_tokens,
                 sampling: req.sampling,
                 stop: req.stop,
@@ -39,7 +40,13 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 delta_tx,
                 trace_context: req.trace_context,
             })
-            .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))
+            .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))?;
+        Ok(prompt_tokens)
+    }
+
+    fn preprocess_prompt_tokens(&self, req: &CompletionRequest) -> Option<Vec<u32>> {
+        let tokenizer = self.handle.tokenizer_clone()?;
+        tokenizer.encode(&req.prompt).ok()
     }
 }
 
@@ -49,14 +56,8 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
     }
 
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
-        // Phase 2 trajectory: snapshot the prompt before submission so
-        // we can tokenize it after the worker takes ownership of `req`.
-        // Failures collapse to empty Vec — the agent loop treats empty
-        // as "unavailable" and downgrades `tokens = None`.
-        let prompt_token_ids = self.tokenize(&req.prompt).unwrap_or_default();
-
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        self.submit_request(req, tx)?;
+        let prompt_token_ids = self.submit_request(req, tx)?.unwrap_or_default();
 
         let mut text = String::new();
         let mut finish_reason = None;
@@ -100,7 +101,7 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
         // Forward via an internal channel so we can wait for the finish
         // marker before returning.
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.submit_request(req, inner_tx)?;
+        let _ = self.submit_request(req, inner_tx)?;
         while let Some(delta) = inner_rx.blocking_recv() {
             let finished = delta.finish_reason.is_some();
             if tx.send(delta).is_err() {

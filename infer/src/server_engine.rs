@@ -361,6 +361,109 @@ mod tests {
         assert!(response_token_ids.is_empty());
     }
 
+    #[cfg(any(feature = "metal", test))]
+    #[test]
+    fn request_handle_engine_preprocesses_prompt_tokens_before_submit() {
+        use super::{
+            CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
+            RequestHandleInferenceEngine, TokenUsage,
+        };
+        use crate::request_handle::{RequestHandle, SubmitError};
+        use crate::sampler::SamplingParams;
+        use crate::scheduler::IncomingRequest;
+        use crate::tokenizer::Tokenizer;
+        use std::sync::{Arc, Mutex};
+        use tokenizers::{
+            Tokenizer as HfTokenizer, models::wordlevel::WordLevel,
+            pre_tokenizers::whitespace::Whitespace,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vocab = [
+            ("<unk>".to_string(), 0u32),
+            ("hello".to_string(), 1u32),
+            ("world".to_string(), 2u32),
+        ]
+        .into_iter()
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut hf_tokenizer = HfTokenizer::new(model);
+        hf_tokenizer.with_pre_tokenizer(Some(Whitespace));
+        hf_tokenizer
+            .save(dir.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
+        let tokenizer =
+            Tokenizer::from_file(dir.path().to_str().expect("utf8 path")).expect("load tokenizer");
+
+        struct TokenizingMock {
+            tokenizer: Tokenizer,
+            submitted_tokens: Arc<Mutex<Option<Vec<u32>>>>,
+        }
+
+        impl RequestHandle for TokenizingMock {
+            fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+                let prompt_tokens = req.prompt_tokens.clone().expect("pretokenized prompt");
+                *self.submitted_tokens.lock().expect("lock") = Some(prompt_tokens.clone());
+                let _ = req.delta_tx.send(CompletionStreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: prompt_tokens.len(),
+                        completion_tokens: 0,
+                        total_tokens: prompt_tokens.len(),
+                    }),
+                    logprob: None,
+                    token_ids: Vec::new(),
+                });
+                Ok(())
+            }
+
+            fn model_id(&self) -> &'static str {
+                "tokenizing-mock"
+            }
+
+            fn tokenizer_clone(&self) -> Option<Tokenizer> {
+                Some(self.tokenizer.clone())
+            }
+        }
+
+        let submitted_tokens = Arc::new(Mutex::new(None));
+        let mut engine = RequestHandleInferenceEngine {
+            model_id: "tokenizing-mock".into(),
+            handle: TokenizingMock {
+                tokenizer,
+                submitted_tokens: Arc::clone(&submitted_tokens),
+            },
+        };
+
+        let output = engine
+            .complete(CompletionRequest {
+                prompt: "hello world".into(),
+                max_tokens: 1,
+                sampling: SamplingParams::default(),
+                stop: None,
+                logprobs: false,
+                session_id: None,
+                trace_context: None,
+            })
+            .expect("complete");
+
+        assert_eq!(output.prompt_token_ids, vec![1, 2]);
+        assert_eq!(*submitted_tokens.lock().expect("lock"), Some(vec![1, 2]));
+        assert_eq!(
+            output.usage,
+            TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 0,
+                total_tokens: 2,
+            }
+        );
+    }
+
     /// Regression for codex review 70e2776 High #1 — stop *inside* a
     /// single chunk. The default `StreamingInferenceBackend` impl sends
     /// the whole completion as one chunk; the old end-of-buffer check

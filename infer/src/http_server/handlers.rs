@@ -266,22 +266,41 @@ pub(super) async fn attach_request_id(
     response
 }
 
-fn submit_request(
+async fn preprocess_prompt_tokens(
+    state: &AppState,
+    prompt: String,
+) -> Result<(String, Option<Vec<u32>>), ApiError> {
+    let Some(tokenizer) = state.tokenizer.clone() else {
+        return Ok((prompt, None));
+    };
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<u32>)> {
+        let prompt_tokens = tokenizer.encode(&prompt)?;
+        Ok((prompt, prompt_tokens))
+    })
+    .await
+    .map_err(|err| {
+        error!("Prompt preprocessing worker failed before scheduler submission: {err}");
+        ApiError::service_unavailable("Failed to preprocess request prompt")
+    })?
+    .map(|(prompt, prompt_tokens)| (prompt, Some(prompt_tokens)))
+    .map_err(|err| {
+        error!("Prompt tokenization failed before scheduler submission: {err}");
+        ApiError::service_unavailable("Failed to tokenize request prompt")
+    })
+}
+
+async fn submit_request(
     state: &AppState,
     options: RequestExecutionOptions,
     prompt: String,
 ) -> Result<UnboundedReceiver<CompletionStreamDelta>, ApiError> {
     let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
-    let prompt_tokens = {
-        let _tokenize_span = LocalSpan::enter_with_local_parent("tokenize");
-        match state.tokenizer.as_ref() {
-            Some(tokenizer) => Some(tokenizer.encode(&prompt).map_err(|err| {
-                error!("Prompt tokenization failed before scheduler submission: {err}");
-                ApiError::service_unavailable("Failed to tokenize request prompt")
-            })?),
-            None => None,
-        }
-    };
+    let preprocess_parent = SpanContext::current_local_parent().unwrap_or_default();
+    let preprocess_span = Span::root("preprocess", preprocess_parent);
+    let (prompt, prompt_tokens) = preprocess_prompt_tokens(state, prompt)
+        .in_span(preprocess_span)
+        .await?;
     let enqueue_context = {
         let _enqueue_span = LocalSpan::enter_with_local_parent("enqueue");
         SpanContext::current_local_parent()
@@ -572,7 +591,7 @@ pub(super) async fn completions(
             stream,
         );
 
-        let delta_rx = submit_request(state.as_ref(), options, req.prompt)?;
+        let delta_rx = submit_request(state.as_ref(), options, req.prompt).await?;
 
         if stream {
             let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
@@ -659,7 +678,7 @@ pub(super) async fn chat_completions(
             do_stream,
         );
 
-        let delta_rx = submit_request(state.as_ref(), options, prompt)?;
+        let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
 
         if do_stream {
             let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -776,7 +795,7 @@ pub(super) async fn responses_handler(
             max_tokens,
         );
 
-        let delta_rx = submit_request(state.as_ref(), options, prompt)?;
+        let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
         if stream {
             let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
             let created_at = now_secs();
