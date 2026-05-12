@@ -103,6 +103,12 @@ impl DeepseekModel {
             self.config.vocab_size > 0,
             "DeepSeek V4 Phase 0 requires a non-empty vocab"
         );
+        ensure!(
+            self.config.ep.num_experts == self.config.n_routed_experts,
+            "DeepSeek V4 EP layout has {} experts but config declares {} routed experts",
+            self.config.ep.num_experts,
+            self.config.n_routed_experts
+        );
         Ok(())
     }
 }
@@ -140,11 +146,14 @@ impl DeepseekModel {
         let summary = model.config.spec.attention_operator_summary();
         info!(
             "DeepSeek V4 Phase 2A.0 CUDA SW-only smoke loaded: sliding_window_layers={} \
-             csa_layers={} hca_layers={} vocab_size={}",
+             csa_layers={} hca_layers={} vocab_size={} ep_rank={}/{} experts_per_rank={}",
             summary.sliding_window_layers,
             summary.csa_layers,
             summary.hca_layers,
-            model.config.vocab_size
+            model.config.vocab_size,
+            model.config.ep.rank,
+            model.config.ep.world_size,
+            model.config.ep.experts_per_rank
         );
         Ok(model)
     }
