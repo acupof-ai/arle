@@ -8,6 +8,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
+use tokio::sync::Semaphore;
 
 use super::handlers::{
     attach_request_id, chat_completions, completions, healthz_handler, method_not_allowed_handler,
@@ -52,6 +53,10 @@ where
     H: RequestHandle + 'static,
 {
     let tokenizer = handle.tokenizer_clone().map(Arc::new);
+    let preprocess_capacity = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(4)
+        .clamp(1, 32);
     let identity = ServingIdentity {
         model_id: handle.model_id().to_string(),
         dflash_status: handle.dflash_status(),
@@ -59,6 +64,8 @@ where
     let state = Arc::new(AppState {
         handle: Arc::new(handle),
         tokenizer,
+        preprocess_permits: Arc::new(Semaphore::new(preprocess_capacity)),
+        preprocess_capacity,
         identity,
         metrics,
         config,

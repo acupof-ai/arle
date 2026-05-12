@@ -564,6 +564,76 @@ impl ServerMetrics {
             }
         }
 
+        let (preprocess_depth, preprocess_wait_us, preprocess_tokenize_us) =
+            self.preprocess_stage_us();
+        for (name, help, value) in [
+            (
+                "infer_preprocess_queue_depth",
+                "HTTP preprocess requests currently holding a bounded preprocess permit.",
+                preprocess_depth,
+            ),
+            (
+                "infer_preprocess_wait_microseconds",
+                "Most recent HTTP preprocess permit wait duration.",
+                preprocess_wait_us,
+            ),
+            (
+                "infer_preprocess_tokenize_microseconds",
+                "Most recent HTTP prompt tokenization duration.",
+                preprocess_tokenize_us,
+            ),
+        ] {
+            writeln!(out, "# HELP {name} {help}").unwrap();
+            writeln!(out, "# TYPE {name} gauge").unwrap();
+            writeln!(out, "{name}{{{labels}}} {value}").unwrap();
+        }
+
+        let (
+            pipeline_snapshot_us,
+            pipeline_cpu_plan_us,
+            pipeline_gpu_completion_wait_us,
+            pipeline_gpu_queue_depth,
+        ) = self.scheduler_pipeline_us();
+        for (name, help, value) in [
+            (
+                "infer_scheduler_pipeline_snapshot_microseconds",
+                "Most recent scheduler snapshot construction duration.",
+                pipeline_snapshot_us,
+            ),
+            (
+                "infer_scheduler_pipeline_cpu_plan_microseconds",
+                "Most recent scheduler CPU candidate-plan duration.",
+                pipeline_cpu_plan_us,
+            ),
+            (
+                "infer_scheduler_pipeline_gpu_completion_wait_microseconds",
+                "Most recent scheduler wait/readback duration for prior GPU completion.",
+                pipeline_gpu_completion_wait_us,
+            ),
+            (
+                "infer_scheduler_pipeline_gpu_command_queue_depth",
+                "Scheduler-visible GPU command queue depth.",
+                pipeline_gpu_queue_depth,
+            ),
+        ] {
+            writeln!(out, "# HELP {name} {help}").unwrap();
+            writeln!(out, "# TYPE {name} gauge").unwrap();
+            writeln!(out, "{name}{{{labels}}} {value}").unwrap();
+        }
+        let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
+        out.push_str("# HELP infer_scheduler_pipeline_cpu_plan_total Scheduler CPU candidate-plan validation outcomes.\n");
+        out.push_str("# TYPE infer_scheduler_pipeline_cpu_plan_total counter\n");
+        for (outcome, value) in [
+            ("accept", pipeline_plan_accept),
+            ("stale", pipeline_plan_stale),
+        ] {
+            writeln!(
+                out,
+                "infer_scheduler_pipeline_cpu_plan_total{{{labels}outcome=\"{outcome}\",}} {value}"
+            )
+            .unwrap();
+        }
+
         out.push_str("# HELP infer_scheduler_plan_total Scheduler ticks by selected plan label.\n");
         out.push_str("# TYPE infer_scheduler_plan_total counter\n");
         let (plan_idle, plan_decode, plan_prefill, plan_split, plan_mixed) =
@@ -1025,6 +1095,15 @@ impl ServerMetrics {
                 .map(|(tier, rate)| (tier.clone(), serde_json::json!(rate)))
                 .collect(),
         );
+        let (preprocess_depth, preprocess_wait_us, preprocess_tokenize_us) =
+            self.preprocess_stage_us();
+        let (
+            pipeline_snapshot_us,
+            pipeline_cpu_plan_us,
+            pipeline_gpu_completion_wait_us,
+            pipeline_gpu_queue_depth,
+        ) = self.scheduler_pipeline_us();
+        let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
 
         serde_json::json!({
             "requests": self.requests_total(),
@@ -1059,6 +1138,19 @@ impl ServerMetrics {
             "engine_kv_tier_hit_rates": engine_kv_tier_hit_rates,
             "engine_spec_acceptance_rate": telemetry.spec_acceptance_rate,
             "engine_prefill_path_stats": telemetry.prefill_path_stats,
+            "preprocess": {
+                "queue_depth": preprocess_depth,
+                "wait_us": preprocess_wait_us,
+                "tokenize_us": preprocess_tokenize_us,
+            },
+            "scheduler_pipeline": {
+                "snapshot_us": pipeline_snapshot_us,
+                "cpu_plan_us": pipeline_cpu_plan_us,
+                "gpu_completion_wait_us": pipeline_gpu_completion_wait_us,
+                "gpu_command_queue_depth": pipeline_gpu_queue_depth,
+                "cpu_plan_accept_total": pipeline_plan_accept,
+                "cpu_plan_stale_total": pipeline_plan_stale,
+            },
             "engine_timestamp_ms": telemetry.timestamp_ms,
         })
     }
@@ -1141,6 +1233,18 @@ impl ServerMetrics {
                     admission_us, prefill_us, decode_us, emit_us, total_us, cleanup_suffix
                 )
             },
+        );
+        let (preprocess_depth, preprocess_wait_us, preprocess_tokenize_us) =
+            self.preprocess_stage_us();
+        let (
+            pipeline_snapshot_us,
+            pipeline_cpu_plan_us,
+            pipeline_gpu_completion_wait_us,
+            pipeline_gpu_queue_depth,
+        ) = self.scheduler_pipeline_us();
+        let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
+        let pipeline_suffix = format!(
+            " preprocess=depth:{preprocess_depth},wait_us:{preprocess_wait_us},tokenize_us:{preprocess_tokenize_us} pipeline=snapshot_us:{pipeline_snapshot_us},cpu_plan_us:{pipeline_cpu_plan_us},gpu_wait_us:{pipeline_gpu_completion_wait_us},gpu_q:{pipeline_gpu_queue_depth},plan_accept:{pipeline_plan_accept},plan_stale:{pipeline_plan_stale}"
         );
 
         let dflash_blocks = self.inner.dflash_blocks_total.load(Ordering::Relaxed);
@@ -1289,7 +1393,7 @@ impl ServerMetrics {
         );
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -1308,6 +1412,7 @@ impl ServerMetrics {
             plan_suffix,
             prefill_path_suffix,
             spec_suffix,
+            pipeline_suffix,
             self.tier_fetch_wait_seconds() * 1000.0,
             self.tier_store_wait_seconds() * 1000.0,
             self.kv_gpu_utilization() * 100.0,

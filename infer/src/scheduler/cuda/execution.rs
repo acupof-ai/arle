@@ -106,6 +106,59 @@ impl StepPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SchedulerSnapshot {
+    epoch: u64,
+    waiting_len: usize,
+    active_len: usize,
+    free_slots: usize,
+    running_decode_slots: usize,
+    prefill_queue_len: usize,
+    has_pending_gpu_work: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PreparedHostMetadata {
+    decode_rows: usize,
+    prefill_rows: usize,
+    prefill_tokens: usize,
+    page_table_rows: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CandidatePlan {
+    epoch: u64,
+    plan: StepPlan,
+    host_metadata: PreparedHostMetadata,
+}
+
+impl CandidatePlan {
+    fn is_valid_for_epoch(&self, epoch: u64) -> bool {
+        self.epoch == epoch
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GpuCommand {
+    epoch: u64,
+    plan: StepPlan,
+    host_metadata: PreparedHostMetadata,
+}
+
+impl GpuCommand {
+    fn from_candidate(candidate: CandidatePlan) -> Self {
+        Self {
+            epoch: candidate.epoch,
+            plan: candidate.plan,
+            host_metadata: candidate.host_metadata,
+        }
+    }
+
+    fn queue_depth(&self) -> u64 {
+        u64::from(!self.plan.is_idle())
+    }
+}
+
 fn route_spec_plan(spec_enabled: bool, _spec_draft_k: usize, plan: StepPlan) -> StepPlan {
     if spec_enabled && matches!(plan, StepPlan::Decode) {
         StepPlan::SpecDecode
@@ -257,6 +310,86 @@ fn cap_prefill_candidates_by_tokens(
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn scheduler_snapshot(&self, epoch: u64) -> SchedulerSnapshot {
+        let running_decode_slots = self
+            .running_batch
+            .iter()
+            .filter(|&&slot_idx| self.slot_is_runnable_decode(slot_idx))
+            .count();
+        SchedulerSnapshot {
+            epoch,
+            waiting_len: self.waiting.len(),
+            active_len: self.active_len(),
+            free_slots: self.active.iter().filter(|req| req.is_none()).count(),
+            running_decode_slots,
+            prefill_queue_len: self.prefill_queue.len(),
+            has_pending_gpu_work: self.has_pending_gpu_work(),
+        }
+    }
+
+    fn prepare_host_metadata(&self, plan: &StepPlan) -> PreparedHostMetadata {
+        let decode_rows = if plan.expects_decode() {
+            self.running_batch
+                .iter()
+                .filter(|&&slot_idx| self.slot_is_runnable_decode(slot_idx))
+                .count()
+        } else {
+            0
+        };
+        let prefill_rows = plan.scheduled_prefill_rows() as usize;
+        let prefill_tokens = plan.scheduled_prefill_tokens() as usize;
+        PreparedHostMetadata {
+            decode_rows,
+            prefill_rows,
+            prefill_tokens,
+            page_table_rows: decode_rows.saturating_add(prefill_rows),
+        }
+    }
+
+    fn build_candidate_plan(&mut self, snapshot: SchedulerSnapshot) -> CandidatePlan {
+        log::trace!(
+            "scheduler snapshot epoch={} waiting={} active={} free_slots={} running_decode={} prefill_queue={} pending_gpu={}",
+            snapshot.epoch,
+            snapshot.waiting_len,
+            snapshot.active_len,
+            snapshot.free_slots,
+            snapshot.running_decode_slots,
+            snapshot.prefill_queue_len,
+            snapshot.has_pending_gpu_work,
+        );
+        let plan = self.plan_step();
+        let host_metadata = self.prepare_host_metadata(&plan);
+        CandidatePlan {
+            epoch: snapshot.epoch,
+            plan,
+            host_metadata,
+        }
+    }
+
+    fn fallback_candidate_plan(&mut self) -> CandidatePlan {
+        let epoch = self.stats.scheduler_epoch;
+        let plan = self.plan_step();
+        let host_metadata = self.prepare_host_metadata(&plan);
+        CandidatePlan {
+            epoch,
+            plan,
+            host_metadata,
+        }
+    }
+
+    fn launch_gpu_command(&mut self, command: GpuCommand) -> (u128, u128) {
+        log::trace!(
+            "scheduler gpu command epoch={} plan={} decode_rows={} prefill_rows={} prefill_tokens={} page_table_rows={}",
+            command.epoch,
+            command.plan.label(),
+            command.host_metadata.decode_rows,
+            command.host_metadata.prefill_rows,
+            command.host_metadata.prefill_tokens,
+            command.host_metadata.page_table_rows,
+        );
+        self.launch_planned_step(&command.plan)
+    }
+
     fn dispatch_decode_emits(&mut self) -> u128 {
         nvtx_scope!("step_dispatch_emits");
         let emit_t = std::time::Instant::now();
@@ -697,6 +830,7 @@ impl<M: ModelForward> Scheduler<M> {
         let num = self.active_len();
         if num == 0 && self.waiting.is_empty() && !self.has_pending_gpu_work() {
             self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
+            self.metrics.set_scheduler_pipeline_us(0, 0, 0, 0);
             return;
         }
 
@@ -712,6 +846,13 @@ impl<M: ModelForward> Scheduler<M> {
             self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
             self.metrics
                 .observe_scheduler_step(prefill_readback_us as f64 / 1_000_000.0);
+            self.stats.record_pipeline_timing(0, 0, prefill_readback_us);
+            self.metrics.set_scheduler_pipeline_us(
+                self.stats.step_timing_snapshot_us.round() as u64,
+                self.stats.step_timing_cpu_plan_us.round() as u64,
+                self.stats.step_timing_gpu_completion_wait_us.round() as u64,
+                1,
+            );
             std::thread::sleep(std::time::Duration::from_micros(100));
             return;
         }
@@ -731,20 +872,42 @@ impl<M: ModelForward> Scheduler<M> {
             self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
             self.metrics
                 .observe_scheduler_step(readback_us as f64 / 1_000_000.0);
+            self.stats.record_pipeline_timing(0, 0, readback_us);
+            self.metrics.set_scheduler_pipeline_us(
+                self.stats.step_timing_snapshot_us.round() as u64,
+                self.stats.step_timing_cpu_plan_us.round() as u64,
+                self.stats.step_timing_gpu_completion_wait_us.round() as u64,
+                1,
+            );
             return;
         }
 
-        let (plan, plan_us) = {
+        let epoch = self.stats.advance_epoch();
+        let (snapshot, snapshot_us) = {
+            nvtx_scope!("scheduler_snapshot");
+            let snapshot_t = std::time::Instant::now();
+            let snapshot = self.scheduler_snapshot(epoch);
+            (snapshot, snapshot_t.elapsed().as_micros())
+        };
+        let (candidate, plan_us) = {
             nvtx_scope!("step_plan");
             let plan_t = std::time::Instant::now();
-            let plan = self.plan_step();
-            (plan, plan_t.elapsed().as_micros())
+            let candidate = self.build_candidate_plan(snapshot);
+            (candidate, plan_t.elapsed().as_micros())
         };
-        let admission_us = assign_us + plan_us;
-        let scheduled_prefill_rows = plan.scheduled_prefill_rows();
-        let scheduled_prefill_tokens = plan.scheduled_prefill_tokens();
-        self.metrics.record_scheduler_plan(plan.metrics_label());
-        self.maybe_log_logical_shadow_plan(&plan);
+        let candidate = if candidate.is_valid_for_epoch(self.stats.scheduler_epoch) {
+            self.metrics.record_scheduler_cpu_plan_accept();
+            candidate
+        } else {
+            self.metrics.record_scheduler_cpu_plan_stale();
+            self.fallback_candidate_plan()
+        };
+        let admission_us = assign_us + snapshot_us + plan_us;
+        let scheduled_prefill_rows = candidate.plan.scheduled_prefill_rows();
+        let scheduled_prefill_tokens = candidate.plan.scheduled_prefill_tokens();
+        self.metrics
+            .record_scheduler_plan(candidate.plan.metrics_label());
+        self.maybe_log_logical_shadow_plan(&candidate.plan);
 
         assert!(
             self.pending_decode.is_none(),
@@ -755,7 +918,11 @@ impl<M: ModelForward> Scheduler<M> {
             "pending prefill must be cleared before the next launch"
         );
 
-        let (mut prefill_us, mut decode_launch_us) = self.launch_planned_step(&plan);
+        let command = GpuCommand::from_candidate(candidate);
+        let gpu_command_queue_depth = command.queue_depth();
+        let command_label = command.plan.label();
+        let command_is_idle = command.plan.is_idle();
+        let (mut prefill_us, mut decode_launch_us) = self.launch_gpu_command(command);
         let scheduled_decode_rows = self
             .pending_decode
             .as_ref()
@@ -784,6 +951,14 @@ impl<M: ModelForward> Scheduler<M> {
         );
         self.metrics
             .observe_scheduler_step(total_us as f64 / 1_000_000.0);
+        self.stats
+            .record_pipeline_timing(snapshot_us, plan_us, prefill_readback_us + readback_us);
+        self.metrics.set_scheduler_pipeline_us(
+            self.stats.step_timing_snapshot_us.round() as u64,
+            self.stats.step_timing_cpu_plan_us.round() as u64,
+            self.stats.step_timing_gpu_completion_wait_us.round() as u64,
+            gpu_command_queue_depth,
+        );
         let update_ema = |ema: &mut f64, val: u128| {
             const ALPHA: f64 = 0.1;
             let v = val as f64;
@@ -809,10 +984,10 @@ impl<M: ModelForward> Scheduler<M> {
             self.stats.step_timing_total_us,
         );
 
-        if total_us > 100_000 && !plan.is_idle() {
+        if total_us > 100_000 && !command_is_idle {
             info!(
                 "step breakdown: plan={} admission={}us decode={}us emit={}us prefill={}us total={}us batch={}",
-                plan.label(),
+                command_label,
                 admission_us,
                 decode_us,
                 emit_us,
@@ -827,10 +1002,10 @@ impl<M: ModelForward> Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrefillBudget, PrefillCandidate, PrefillCandidateScore, PrefillReservation,
-        ScoredPrefillCandidate, StepPlan, cap_prefill_candidates_by_tokens,
-        reserve_decode_headroom_for_slots, route_spec_plan, score_prefill_candidates,
-        select_prefill_candidates,
+        CandidatePlan, GpuCommand, PrefillBudget, PrefillCandidate, PrefillCandidateScore,
+        PrefillReservation, PreparedHostMetadata, ScoredPrefillCandidate, StepPlan,
+        cap_prefill_candidates_by_tokens, reserve_decode_headroom_for_slots, route_spec_plan,
+        score_prefill_candidates, select_prefill_candidates,
     };
     use crate::scheduler::cuda::budget::{PageBudget, PageGrowth, StepTokenBudget};
 
@@ -1176,5 +1351,39 @@ mod tests {
     fn multi_token_spec_route_waits_for_real_verifier() {
         let plan = route_spec_plan(true, 5, StepPlan::Decode);
         assert!(matches!(plan, StepPlan::SpecDecode));
+    }
+
+    #[test]
+    fn candidate_plan_epoch_validation_rejects_stale_snapshot() {
+        let candidate = CandidatePlan {
+            epoch: 7,
+            plan: StepPlan::Idle,
+            host_metadata: PreparedHostMetadata::default(),
+        };
+
+        assert!(candidate.is_valid_for_epoch(7));
+        assert!(!candidate.is_valid_for_epoch(8));
+    }
+
+    #[test]
+    fn gpu_command_depth_tracks_non_idle_work() {
+        let idle = GpuCommand::from_candidate(CandidatePlan {
+            epoch: 1,
+            plan: StepPlan::Idle,
+            host_metadata: PreparedHostMetadata::default(),
+        });
+        let decode = GpuCommand::from_candidate(CandidatePlan {
+            epoch: 1,
+            plan: StepPlan::Decode,
+            host_metadata: PreparedHostMetadata {
+                decode_rows: 2,
+                prefill_rows: 0,
+                prefill_tokens: 0,
+                page_table_rows: 2,
+            },
+        });
+
+        assert_eq!(idle.queue_depth(), 0);
+        assert_eq!(decode.queue_depth(), 1);
     }
 }

@@ -22,6 +22,8 @@
 //! | `infer_scheduler_step_phase_*_microseconds` | gauge | EMA scheduler tick phase duration |
 //! | `infer_scheduler_step_cleanup_microseconds` | gauge | EMA scheduler cleanup duration |
 //! | `infer_scheduler_loop_total_microseconds` | gauge | EMA full scheduler loop duration |
+//! | `infer_preprocess_*` | gauge | HTTP preprocess queue and tokenization timing |
+//! | `infer_scheduler_pipeline_*` | gauge/counter | Scheduler pipeline snapshot/plan/GPU-command telemetry |
 //! | `infer_scheduler_plan_total` | counter | Scheduler ticks by selected plan label |
 //! | `infer_prefill_path_mixed_batch_total` | counter | Mixed decode+prefill path outcomes |
 //! | `infer_prefill_path_mixed_batch_fallback_total` | counter | Mixed decode+prefill fallback reasons |
@@ -279,6 +281,15 @@ struct MetricsInner {
     pub scheduler_step_cleanup_us: AtomicU64,
     pub scheduler_loop_total_us: AtomicU64,
     pub scheduler_step_phase_samples: AtomicU64,
+    pub preprocess_queue_depth: AtomicU64,
+    pub preprocess_wait_us: AtomicU64,
+    pub preprocess_tokenize_us: AtomicU64,
+    pub scheduler_pipeline_snapshot_us: AtomicU64,
+    pub scheduler_pipeline_cpu_plan_us: AtomicU64,
+    pub scheduler_pipeline_gpu_completion_wait_us: AtomicU64,
+    pub scheduler_pipeline_gpu_command_queue_depth: AtomicU64,
+    pub scheduler_pipeline_cpu_plan_accept_total: AtomicU64,
+    pub scheduler_pipeline_cpu_plan_stale_total: AtomicU64,
     pub scheduler_plan_idle_total: AtomicU64,
     pub scheduler_plan_decode_total: AtomicU64,
     pub scheduler_plan_prefill_total: AtomicU64,
@@ -385,6 +396,15 @@ impl ServerMetrics {
                 scheduler_step_cleanup_us: AtomicU64::new(0),
                 scheduler_loop_total_us: AtomicU64::new(0),
                 scheduler_step_phase_samples: AtomicU64::new(0),
+                preprocess_queue_depth: AtomicU64::new(0),
+                preprocess_wait_us: AtomicU64::new(0),
+                preprocess_tokenize_us: AtomicU64::new(0),
+                scheduler_pipeline_snapshot_us: AtomicU64::new(0),
+                scheduler_pipeline_cpu_plan_us: AtomicU64::new(0),
+                scheduler_pipeline_gpu_completion_wait_us: AtomicU64::new(0),
+                scheduler_pipeline_gpu_command_queue_depth: AtomicU64::new(0),
+                scheduler_pipeline_cpu_plan_accept_total: AtomicU64::new(0),
+                scheduler_pipeline_cpu_plan_stale_total: AtomicU64::new(0),
                 scheduler_plan_idle_total: AtomicU64::new(0),
                 scheduler_plan_decode_total: AtomicU64::new(0),
                 scheduler_plan_prefill_total: AtomicU64::new(0),
@@ -735,6 +755,53 @@ impl ServerMetrics {
             .store(loop_total_us.max(0.0).round() as u64, Ordering::Relaxed);
     }
 
+    /// Update HTTP preprocess queue and tokenization gauges.
+    pub fn set_preprocess_stage(&self, queue_depth: u64, wait_us: u64, tokenize_us: u64) {
+        self.inner
+            .preprocess_queue_depth
+            .store(queue_depth, Ordering::Relaxed);
+        self.inner
+            .preprocess_wait_us
+            .store(wait_us, Ordering::Relaxed);
+        self.inner
+            .preprocess_tokenize_us
+            .store(tokenize_us, Ordering::Relaxed);
+    }
+
+    /// Update scheduler pipeline split gauges for the most recent tick.
+    pub fn set_scheduler_pipeline_us(
+        &self,
+        snapshot_us: u64,
+        cpu_plan_us: u64,
+        gpu_completion_wait_us: u64,
+        gpu_command_queue_depth: u64,
+    ) {
+        self.inner
+            .scheduler_pipeline_snapshot_us
+            .store(snapshot_us, Ordering::Relaxed);
+        self.inner
+            .scheduler_pipeline_cpu_plan_us
+            .store(cpu_plan_us, Ordering::Relaxed);
+        self.inner
+            .scheduler_pipeline_gpu_completion_wait_us
+            .store(gpu_completion_wait_us, Ordering::Relaxed);
+        self.inner
+            .scheduler_pipeline_gpu_command_queue_depth
+            .store(gpu_command_queue_depth, Ordering::Relaxed);
+    }
+
+    pub fn record_scheduler_cpu_plan_accept(&self) {
+        self.inner
+            .scheduler_pipeline_cpu_plan_accept_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_scheduler_cpu_plan_stale(&self) {
+        self.inner
+            .scheduler_pipeline_cpu_plan_stale_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record the scheduler plan selected for one runtime tick.
     pub fn record_scheduler_plan(&self, label: SchedulerPlanLabel) {
         let counter = match label {
@@ -971,6 +1038,42 @@ impl ServerMetrics {
             self.inner.scheduler_step_cleanup_us.load(Ordering::Relaxed),
             self.inner.scheduler_loop_total_us.load(Ordering::Relaxed),
         ))
+    }
+
+    pub fn preprocess_stage_us(&self) -> (u64, u64, u64) {
+        (
+            self.inner.preprocess_queue_depth.load(Ordering::Relaxed),
+            self.inner.preprocess_wait_us.load(Ordering::Relaxed),
+            self.inner.preprocess_tokenize_us.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn scheduler_pipeline_us(&self) -> (u64, u64, u64, u64) {
+        (
+            self.inner
+                .scheduler_pipeline_snapshot_us
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_cpu_plan_us
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_gpu_completion_wait_us
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_gpu_command_queue_depth
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn scheduler_pipeline_plan_totals(&self) -> (u64, u64) {
+        (
+            self.inner
+                .scheduler_pipeline_cpu_plan_accept_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_cpu_plan_stale_total
+                .load(Ordering::Relaxed),
+        )
     }
 
     pub fn scheduler_plan_totals(&self) -> (u64, u64, u64, u64, u64) {
@@ -1383,6 +1486,10 @@ mod tests {
         m.observe_scheduler_step(0.012);
         m.set_scheduler_step_phase_us(100.0, 200.0, 300.0, 400.0, 1000.0);
         m.set_scheduler_loop_phase_us(50.0, 1050.0);
+        m.set_preprocess_stage(2, 11, 22);
+        m.set_scheduler_pipeline_us(33, 44, 55, 1);
+        m.record_scheduler_cpu_plan_accept();
+        m.record_scheduler_cpu_plan_stale();
         m.record_scheduler_plan(SchedulerPlanLabel::Decode);
         m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
         m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
@@ -1449,6 +1556,33 @@ mod tests {
         assert!(
             rendered.contains("infer_scheduler_loop_total_microseconds{model=\"Qwen3-4B\",} 1050")
         );
+        assert!(rendered.contains("infer_preprocess_queue_depth{model=\"Qwen3-4B\",} 2"));
+        assert!(rendered.contains("infer_preprocess_wait_microseconds{model=\"Qwen3-4B\",} 11"));
+        assert!(
+            rendered.contains("infer_preprocess_tokenize_microseconds{model=\"Qwen3-4B\",} 22")
+        );
+        assert!(
+            rendered
+                .contains("infer_scheduler_pipeline_snapshot_microseconds{model=\"Qwen3-4B\",} 33")
+        );
+        assert!(
+            rendered
+                .contains("infer_scheduler_pipeline_cpu_plan_microseconds{model=\"Qwen3-4B\",} 44")
+        );
+        assert!(rendered.contains(
+            "infer_scheduler_pipeline_gpu_completion_wait_microseconds{model=\"Qwen3-4B\",} 55"
+        ));
+        assert!(
+            rendered.contains(
+                "infer_scheduler_pipeline_gpu_command_queue_depth{model=\"Qwen3-4B\",} 1"
+            )
+        );
+        assert!(rendered.contains(
+            "infer_scheduler_pipeline_cpu_plan_total{model=\"Qwen3-4B\",outcome=\"accept\",} 1"
+        ));
+        assert!(rendered.contains(
+            "infer_scheduler_pipeline_cpu_plan_total{model=\"Qwen3-4B\",outcome=\"stale\",} 1"
+        ));
         assert!(
             rendered.contains("infer_scheduler_plan_total{model=\"Qwen3-4B\",plan=\"decode\",} 1")
         );
@@ -1568,6 +1702,9 @@ mod tests {
         m.record_metal_qwen35_packed_decode_batch(4);
         m.set_scheduler_step_phase_us(11.0, 22.0, 33.0, 44.0, 110.0);
         m.set_scheduler_loop_phase_us(55.0, 165.0);
+        m.set_preprocess_stage(1, 7, 8);
+        m.set_scheduler_pipeline_us(9, 10, 11, 1);
+        m.record_scheduler_cpu_plan_accept();
         m.record_scheduler_plan(SchedulerPlanLabel::Prefill);
         m.record_scheduler_plan(SchedulerPlanLabel::Split);
         m.record_scheduler_plan(SchedulerPlanLabel::Mixed);
@@ -1582,6 +1719,9 @@ mod tests {
         assert!(s.contains(
             "step_phase_us=adm:11,prefill:22,decode:33,emit:44,total:110,cleanup:55,loop_total:165"
         ));
+        assert!(
+            s.contains("preprocess=depth:1,wait_us:7,tokenize_us:8 pipeline=snapshot_us:9,cpu_plan_us:10,gpu_wait_us:11,gpu_q:1,plan_accept:1,plan_stale:0")
+        );
         assert!(s.contains("plan_label=idle:0,decode:0,prefill:1,split:1,mixed:2"));
         assert!(s.contains(
             "prefill_path=ok_true:1,ok_false:2,prefill_seq_len_mismatch:1,scheduler_pre_dispatch_fallback:1"
@@ -1634,6 +1774,10 @@ mod tests {
         m.record_prefill_path_mixed_ok_false("prefill_seq_len_mismatch");
         m.record_prefill_path_mixed_ok_false("scheduler_pre_dispatch_fallback");
         m.record_prefix_aware_admit_deferral();
+        m.set_preprocess_stage(3, 21, 34);
+        m.set_scheduler_pipeline_us(55, 89, 144, 1);
+        m.record_scheduler_cpu_plan_accept();
+        m.record_scheduler_cpu_plan_stale();
 
         let payload = m.render_stats_json();
         assert_eq!(payload["prefix_hit_rate"], serde_json::json!(1.0));
@@ -1667,6 +1811,33 @@ mod tests {
         );
         assert_eq!(
             payload["engine_prefill_path_stats"]["ok_false_reasons"]["scheduler_pre_dispatch_fallback"],
+            serde_json::json!(1)
+        );
+        assert_eq!(payload["preprocess"]["queue_depth"], serde_json::json!(3));
+        assert_eq!(payload["preprocess"]["wait_us"], serde_json::json!(21));
+        assert_eq!(payload["preprocess"]["tokenize_us"], serde_json::json!(34));
+        assert_eq!(
+            payload["scheduler_pipeline"]["snapshot_us"],
+            serde_json::json!(55)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["cpu_plan_us"],
+            serde_json::json!(89)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["gpu_completion_wait_us"],
+            serde_json::json!(144)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["gpu_command_queue_depth"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["cpu_plan_accept_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["cpu_plan_stale_total"],
             serde_json::json!(1)
         );
         assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));

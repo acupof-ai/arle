@@ -1,7 +1,7 @@
 # Scheduler Preprocess Pipeline
 
 Date: 2026-05-12
-Status: design
+Status: implemented locally; performance license pending
 Scope: CUDA serving scheduler hot path. Metal/CPU may reuse the intake API
 shape later, but this plan is licensed only for the CUDA continuous-batching
 runtime.
@@ -23,6 +23,30 @@ for tests, warmup paths, and direct internal submitters.
 Success means fewer GPU bubbles caused by CPU-side request intake, admission,
 planning, metadata construction, or token readback. It does not claim a
 throughput win until an nsys trace proves the CPU side was blocking GPU work.
+
+## Implementation Status 2026-05-12
+
+Stages 1-4 are now represented in the runtime as explicit boundaries:
+
+- **Stage 1 preprocess:** HTTP prompt tokenization runs before scheduler
+  submission behind a bounded semaphore, records preprocess queue/wait/tokenize
+  telemetry, and sends `IncomingRequest::prompt_tokens = Some(...)`.
+- **Stage 2 snapshot planning:** CUDA `step()` now builds a cheap
+  `SchedulerSnapshot`, advances a scheduler epoch, produces a `CandidatePlan`,
+  validates the epoch, counts accepted/stale plans, and falls back on stale
+  candidates.
+- **Stage 3 metadata staging:** accepted candidate plans now carry a
+  `PreparedHostMetadata` descriptor with decode rows, prefill rows, prefill
+  token count, and page-table row count before launch dispatch. Model-specific
+  buffer uploads still happen inside the existing decode/prefill contexts until
+  an nsys gate proves this is worth pushing into a dedicated copy-stream path.
+- **Stage 4 GPU command split:** CUDA launch dispatch now goes through an
+  explicit `GpuCommand` boundary, and readback timing is reported as GPU
+  completion wait telemetry. SchedulerCore remains the only writer of request,
+  prefix-cache, and paged-KV state.
+
+This is an architecture and correctness landing, not a performance conclusion.
+The next required evidence is the CUDA GuideLLM + nsys matrix in this document.
 
 ## Current State
 
@@ -439,7 +463,7 @@ Acceptance:
 
 ## Decision
 
-Proceed in small tranches. Start with P0 because it is small, removes one known
-CPU task from scheduler intake, and creates the explicit preprocess boundary
-needed for the later pipeline. Do not implement P2-P4 until P0/P1 traces show
-CPU-side scheduler work is a real wall-clock limiter.
+Stages 1-4 have landed as a default-safe pipeline boundary while preserving the
+single-writer scheduler invariant. Treat the current implementation as
+correctness and observability scaffolding until GuideLLM + nsys prove that the
+CPU-side ranges are wall-clock material and that GPU idle time drops.

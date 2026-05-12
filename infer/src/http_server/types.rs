@@ -18,8 +18,10 @@ use crate::scheduler::{IncomingRequest, RequestPriority, RequestSpecConfig};
 use crate::server_engine::{
     CompletionOutput, CompletionStreamDelta, EnginePoolModelSpec, FinishReason, TokenUsage,
 };
-use crate::tokenizer::Tokenizer;
 use fastrace::collector::SpanContext;
+use tokio::sync::Semaphore;
+
+use crate::tokenizer::Tokenizer;
 
 /// Maximum wall-clock time allowed for a non-streaming request to complete.
 /// Streaming responses have natural per-chunk flow control and are not capped here.
@@ -30,6 +32,8 @@ pub(super) const HTTP_REQUEST_ID_HEADER: &str = "x-request-id";
 pub(super) struct AppState {
     pub(super) handle: Arc<dyn RequestHandle>,
     pub(super) tokenizer: Option<Arc<Tokenizer>>,
+    pub(super) preprocess_permits: Arc<Semaphore>,
+    pub(super) preprocess_capacity: usize,
     pub(super) identity: ServingIdentity,
     pub(super) metrics: ServerMetrics,
     pub(super) config: HttpServerConfig,

@@ -274,7 +274,23 @@ async fn preprocess_prompt_tokens(
         return Ok((prompt, None));
     };
 
+    let wait_started_at = std::time::Instant::now();
+    let permit = state
+        .preprocess_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|err| {
+            error!("Prompt preprocessing queue closed before scheduler submission: {err}");
+            ApiError::service_unavailable("Failed to preprocess request prompt")
+        })?;
+    let wait_us = wait_started_at.elapsed().as_micros() as u64;
+    let active_depth = state
+        .preprocess_capacity
+        .saturating_sub(state.preprocess_permits.available_permits()) as u64;
+    let tokenize_started_at = std::time::Instant::now();
     tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<u32>)> {
+        let _permit = permit;
         let prompt_tokens = tokenizer.encode(&prompt)?;
         Ok((prompt, prompt_tokens))
     })
@@ -283,7 +299,14 @@ async fn preprocess_prompt_tokens(
         error!("Prompt preprocessing worker failed before scheduler submission: {err}");
         ApiError::service_unavailable("Failed to preprocess request prompt")
     })?
-    .map(|(prompt, prompt_tokens)| (prompt, Some(prompt_tokens)))
+    .map(|(prompt, prompt_tokens)| {
+        state.metrics.set_preprocess_stage(
+            active_depth,
+            wait_us,
+            tokenize_started_at.elapsed().as_micros() as u64,
+        );
+        (prompt, Some(prompt_tokens))
+    })
     .map_err(|err| {
         error!("Prompt tokenization failed before scheduler submission: {err}");
         ApiError::service_unavailable("Failed to tokenize request prompt")
