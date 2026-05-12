@@ -153,6 +153,27 @@ fn test_dsv4_fp8_batched_gemv() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_fp4_batched_gemv() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let weight = DeviceMatrix::from_dsv4_fp4_block_scaled(&ctx, &[0x21, 0xb3], &[127], 2, 2, 1, 1)?;
+    let x_host = bf16_vec(&[2.0, 4.0, 1.0, 1.0]);
+    let x = HiddenStates {
+        data: ctx.stream.clone_htod(&x_host)?,
+        hidden_dim: 2,
+        seq_len: 2,
+    };
+    let mut out = HiddenStates::zeros(&ctx, 2, 2)?;
+
+    try_gemm_with_phase_into(&ctx, &weight, &x, &mut out, LinearDispatchPhase::Prefill)?;
+    let host = ctx.stream.clone_dtoh(&out.data)?;
+    ctx.sync()?;
+    let values = host.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+
+    assert_close(&values, &[5.0, -3.0, 1.5, 0.0], 0.01);
+    Ok(())
+}
+
+#[test]
 fn test_argmax() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 9.0, 3.0, 8.0]))?;
