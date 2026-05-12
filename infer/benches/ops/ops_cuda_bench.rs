@@ -129,6 +129,52 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
     );
 
     group.throughput(Throughput::Elements(
+        (8 * QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM) as u64,
+    ));
+    group.bench_function(BenchmarkId::new("quantize_paged_kv_fp8_qwen35", 8), |b| {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        let batch_size = 8usize;
+        let page_size = 16usize;
+        let num_kv_heads = QWEN35_4B_KV_HEADS;
+        let head_dim = QWEN35_4B_HEAD_DIM;
+        let kv_dim = num_kv_heads * head_dim;
+        let elem_count = page_size * kv_dim;
+
+        let kv_bf16 = device_vec(&ctx, elem_count).expect("failed to allocate bf16 kv work");
+        let mut kv_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(elem_count)
+            .expect("failed to allocate fp8 kv pool");
+        let mut scales = ctx
+            .stream
+            .alloc_zeros::<f32>(page_size * num_kv_heads)
+            .expect("failed to allocate fp8 kv scales");
+        let new_token_indices_host: Vec<i32> = (0..batch_size).map(|idx| idx as i32).collect();
+        let new_token_indices = ctx
+            .stream
+            .clone_htod(&new_token_indices_host)
+            .expect("failed to H2D fp8 kv token rows");
+        let (src_ptr, _src_guard) = kv_bf16.data.device_ptr(&ctx.stream);
+        let (dst_ptr, _dst_guard) = kv_fp8.device_ptr_mut(&ctx.stream);
+        let (scale_ptr, _scale_guard) = scales.device_ptr_mut(&ctx.stream);
+
+        iter_sync(b, &ctx, || {
+            kv_quant::quantize_paged_kv_fp8(
+                &ctx,
+                src_ptr,
+                dst_ptr,
+                scale_ptr,
+                &new_token_indices,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                batch_size,
+            )
+            .expect("quantize_paged_kv_fp8 failed");
+        });
+    });
+
+    group.throughput(Throughput::Elements(
         (4 * 4096 * QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM) as u64,
     ));
     group.bench_function(BenchmarkId::new("decode_attention_fp8_qwen35", 4096), |b| {
