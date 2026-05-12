@@ -244,10 +244,27 @@ __global__ void quantize_scatter_kv_fp8_kernel(
     int src = kv_head * max_seq_len * head_dim + pos * head_dim + d;
     // Dest: NHD
     int dst = row_idx * kv_dim + kv_head * head_dim + d;
-    float val0 = (d < head_dim) ? __bfloat162float(kv_cont[src]) : 0.0f;
-    float val1 = (d + 1 < head_dim) ? __bfloat162float(kv_cont[src + 1]) : 0.0f;
-    float val2 = (d + 2 < head_dim) ? __bfloat162float(kv_cont[src + 2]) : 0.0f;
-    float val3 = (d + 3 < head_dim) ? __bfloat162float(kv_cont[src + 3]) : 0.0f;
+    float val0 = 0.0f;
+    float val1 = 0.0f;
+    float val2 = 0.0f;
+    float val3 = 0.0f;
+    if (d + 3 < head_dim && (src & 1) == 0) {
+        __nv_bfloat162 packed01 =
+            *reinterpret_cast<const __nv_bfloat162*>(kv_cont + src);
+        __nv_bfloat162 packed23 =
+            *reinterpret_cast<const __nv_bfloat162*>(kv_cont + src + 2);
+        float2 vals01 = __bfloat1622float2(packed01);
+        float2 vals23 = __bfloat1622float2(packed23);
+        val0 = vals01.x;
+        val1 = vals01.y;
+        val2 = vals23.x;
+        val3 = vals23.y;
+    } else {
+        val0 = (d < head_dim) ? __bfloat162float(kv_cont[src]) : 0.0f;
+        val1 = (d + 1 < head_dim) ? __bfloat162float(kv_cont[src + 1]) : 0.0f;
+        val2 = (d + 2 < head_dim) ? __bfloat162float(kv_cont[src + 2]) : 0.0f;
+        val3 = (d + 3 < head_dim) ? __bfloat162float(kv_cont[src + 3]) : 0.0f;
+    }
 
     float abs_val = fmaxf(fabsf(val0), fabsf(val1));
     abs_val = fmaxf(abs_val, fabsf(val2));
