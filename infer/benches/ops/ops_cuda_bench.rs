@@ -175,6 +175,80 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Elements(
+        (2 * 8 * QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM) as u64,
+    ));
+    group.bench_function(
+        BenchmarkId::new("quantize_paged_kv_fp8_qwen35_pair", 8),
+        |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let batch_size = 8usize;
+            let page_size = 16usize;
+            let num_kv_heads = QWEN35_4B_KV_HEADS;
+            let head_dim = QWEN35_4B_HEAD_DIM;
+            let kv_dim = num_kv_heads * head_dim;
+            let elem_count = page_size * kv_dim;
+            let scale_count = page_size * num_kv_heads;
+
+            let k_bf16 = device_vec(&ctx, elem_count).expect("failed to allocate k work");
+            let v_bf16 = device_vec(&ctx, elem_count).expect("failed to allocate v work");
+            let mut k_fp8 = ctx
+                .stream
+                .alloc_zeros::<u8>(elem_count)
+                .expect("failed to allocate k fp8 pool");
+            let mut v_fp8 = ctx
+                .stream
+                .alloc_zeros::<u8>(elem_count)
+                .expect("failed to allocate v fp8 pool");
+            let mut k_scales = ctx
+                .stream
+                .alloc_zeros::<f32>(scale_count)
+                .expect("failed to allocate k fp8 scales");
+            let mut v_scales = ctx
+                .stream
+                .alloc_zeros::<f32>(scale_count)
+                .expect("failed to allocate v fp8 scales");
+            let new_token_indices_host: Vec<i32> = (0..batch_size).map(|idx| idx as i32).collect();
+            let new_token_indices = ctx
+                .stream
+                .clone_htod(&new_token_indices_host)
+                .expect("failed to H2D fp8 pair token rows");
+            let (k_src_ptr, _k_src_guard) = k_bf16.data.device_ptr(&ctx.stream);
+            let (v_src_ptr, _v_src_guard) = v_bf16.data.device_ptr(&ctx.stream);
+            let (k_dst_ptr, _k_dst_guard) = k_fp8.device_ptr_mut(&ctx.stream);
+            let (v_dst_ptr, _v_dst_guard) = v_fp8.device_ptr_mut(&ctx.stream);
+            let (k_scale_ptr, _k_scale_guard) = k_scales.device_ptr_mut(&ctx.stream);
+            let (v_scale_ptr, _v_scale_guard) = v_scales.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || {
+                kv_quant::quantize_paged_kv_fp8(
+                    &ctx,
+                    k_src_ptr,
+                    k_dst_ptr,
+                    k_scale_ptr,
+                    &new_token_indices,
+                    num_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    batch_size,
+                )
+                .expect("quantize_paged_kv_fp8 k failed");
+                kv_quant::quantize_paged_kv_fp8(
+                    &ctx,
+                    v_src_ptr,
+                    v_dst_ptr,
+                    v_scale_ptr,
+                    &new_token_indices,
+                    num_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    batch_size,
+                )
+                .expect("quantize_paged_kv_fp8 v failed");
+            });
+        },
+    );
+
+    group.throughput(Throughput::Elements(
         (2048 * QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM) as u64,
     ));
     group.bench_function(
