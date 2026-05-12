@@ -27,7 +27,6 @@ kv-native-sys = { path = "../crates/kv-native-sys" }
 cudarc = { version = "0.18", features = [
     "cuda-version-from-build-system",
     "cublas",
-    "cuda-12080",
     "f16",
 ], optional = true }
 memmap2 = { version = "0.9", optional = true }
