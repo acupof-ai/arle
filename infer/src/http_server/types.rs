@@ -29,7 +29,7 @@ pub(super) const HTTP_REQUEST_ID_HEADER: &str = "x-request-id";
 
 pub(super) struct AppState {
     pub(super) handle: Arc<dyn RequestHandle>,
-    pub(super) tokenizer: Option<Tokenizer>,
+    pub(super) tokenizer: Option<Arc<Tokenizer>>,
     pub(super) identity: ServingIdentity,
     pub(super) metrics: ServerMetrics,
     pub(super) config: HttpServerConfig,

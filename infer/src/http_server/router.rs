@@ -51,7 +51,7 @@ fn build_app_inner<H>(handle: H, metrics: ServerMetrics, config: HttpServerConfi
 where
     H: RequestHandle + 'static,
 {
-    let tokenizer = handle.tokenizer_clone();
+    let tokenizer = handle.tokenizer_clone().map(Arc::new);
     let identity = ServingIdentity {
         model_id: handle.model_id().to_string(),
         dflash_status: handle.dflash_status(),
