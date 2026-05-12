@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
 use deepseek_spec::{DeepSeekV4CompressorTensorNames, DeepSeekV4Config, DeepSeekV4MoeTensorNames};
@@ -27,6 +29,7 @@ enum TensorDtype {
 
 #[derive(Debug, Clone)]
 struct TensorMeta {
+    shard: usize,
     dtype: TensorDtype,
     shape: Vec<usize>,
     start: usize,
@@ -35,7 +38,7 @@ struct TensorMeta {
 
 #[derive(Debug)]
 struct SafeTensorStore {
-    mmap: Mmap,
+    mmaps: Vec<Mmap>,
     tensors: HashMap<String, TensorMeta>,
 }
 
@@ -56,7 +59,7 @@ impl DeepseekV4ReferenceModel {
         let model_dir = model_dir.as_ref();
         let config = DeepSeekV4Config::from_json_file(model_dir.join("config.json"))
             .with_context(|| format!("loading DeepSeek V4 config from {}", model_dir.display()))?;
-        let tensors = SafeTensorStore::open(resolve_single_safetensors(model_dir)?)?;
+        let tensors = SafeTensorStore::open_model_dir(model_dir)?;
         validate_deepseek_v4_checkpoint_manifest(model_dir, &config)?;
         Ok(Self { config, tensors })
     }
@@ -699,12 +702,38 @@ impl DeepseekV4ReferenceModel {
 }
 
 impl SafeTensorStore {
-    fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+    fn open_model_dir(model_dir: &Path) -> Result<Self> {
+        let shard_paths = resolve_safetensor_shards(model_dir)?;
+        Self::open_shards(&shard_paths)
+    }
+
+    fn open_shards(shard_paths: &[String]) -> Result<Self> {
+        ensure!(
+            !shard_paths.is_empty(),
+            "DeepSeek V4 reference needs at least one safetensors shard"
+        );
+        let mut mmaps = Vec::with_capacity(shard_paths.len());
+        let mut tensors = HashMap::new();
+        for (shard, path) in shard_paths.iter().enumerate() {
+            let mmap = Self::mmap_one(Path::new(path))?;
+            Self::parse_header(shard, path, &mmap, &mut tensors)?;
+            mmaps.push(mmap);
+        }
+        Ok(Self { mmaps, tensors })
+    }
+
+    fn mmap_one(path: &Path) -> Result<Mmap> {
         let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("mmap safetensors {}", path.display()))?;
-        ensure!(mmap.len() >= 8, "{} is too small", path.display());
+        unsafe { Mmap::map(&file) }.with_context(|| format!("mmap safetensors {}", path.display()))
+    }
+
+    fn parse_header(
+        shard: usize,
+        path: &str,
+        mmap: &Mmap,
+        tensors: &mut HashMap<String, TensorMeta>,
+    ) -> Result<()> {
+        ensure!(mmap.len() >= 8, "{path} is too small");
         let mut len_bytes = [0_u8; 8];
         len_bytes.copy_from_slice(&mmap[..8]);
         let header_len = u64::from_le_bytes(len_bytes) as usize;
@@ -713,12 +742,11 @@ impl SafeTensorStore {
         ensure!(
             header_end <= mmap.len(),
             "{} safetensors header exceeds file size",
-            path.display()
+            path
         );
         let header: HashMap<String, serde_json::Value> =
             serde_json::from_slice(&mmap[header_start..header_end])
-                .with_context(|| format!("parsing safetensors header {}", path.display()))?;
-        let mut tensors = HashMap::new();
+                .with_context(|| format!("parsing safetensors header {path}"))?;
         for (name, value) in header {
             if name == "__metadata__" {
                 continue;
@@ -737,17 +765,23 @@ impl SafeTensorStore {
                 start <= end && end <= mmap.len(),
                 "tensor {name} offsets out of range"
             );
-            tensors.insert(
-                name,
-                TensorMeta {
-                    dtype,
-                    shape: tensor.shape,
-                    start,
-                    end,
-                },
+            ensure!(
+                tensors
+                    .insert(
+                        name.clone(),
+                        TensorMeta {
+                            shard,
+                            dtype,
+                            shape: tensor.shape,
+                            start,
+                            end,
+                        },
+                    )
+                    .is_none(),
+                "duplicate tensor {name} across DeepSeek V4 shards"
             );
         }
-        Ok(Self { mmap, tensors })
+        Ok(())
     }
 
     fn meta(&self, name: &str) -> Result<&TensorMeta> {
@@ -757,7 +791,7 @@ impl SafeTensorStore {
     }
 
     fn data(&self, meta: &TensorMeta) -> &[u8] {
-        &self.mmap[meta.start..meta.end]
+        &self.mmaps[meta.shard][meta.start..meta.end]
     }
 
     fn vec_f32(&self, name: &str) -> Result<Vec<f32>> {
@@ -867,15 +901,41 @@ struct MhcParams {
     comb: Vec<f32>,
 }
 
-fn resolve_single_safetensors(model_dir: &Path) -> Result<PathBuf> {
-    let path = model_dir.join("model.safetensors");
-    if path.exists() {
-        return Ok(path);
+fn resolve_safetensor_shards(model_dir: &Path) -> Result<Vec<String>> {
+    let single = model_dir.join("model.safetensors");
+    let index = model_dir.join("model.safetensors.index.json");
+    if single.exists() && !index.exists() {
+        return Ok(vec![single.to_string_lossy().into_owned()]);
     }
-    bail!(
-        "DeepSeek V4 CPU reference currently expects a single model.safetensors under {}",
-        model_dir.display()
-    )
+
+    let content = fs::read_to_string(&index)
+        .with_context(|| format!("reading safetensors index {}", index.display()))?;
+    let index_json: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("parsing safetensors index {}", index.display()))?;
+    let weight_map = index_json["weight_map"]
+        .as_object()
+        .with_context(|| format!("{} missing weight_map", index.display()))?;
+
+    let mut shard_names = weight_map
+        .values()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{} contains a non-string shard path", index.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    shard_names.sort();
+    shard_names.dedup();
+    ensure!(
+        !shard_names.is_empty(),
+        "{} does not reference any safetensors shards",
+        index.display()
+    );
+    Ok(shard_names
+        .into_iter()
+        .map(|name| model_dir.join(name).to_string_lossy().into_owned())
+        .collect())
 }
 
 fn stream_slice(stream: &[f32], token: usize, hc: usize, n_hc: usize, d: usize) -> &[f32] {
@@ -1075,6 +1135,38 @@ mod tests {
 
     fn model_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/dsv4-mini-1B-init")
+    }
+
+    #[test]
+    fn dsv4_reference_resolves_sharded_safetensors_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{
+              "metadata": {},
+              "weight_map": {
+                "embed.weight": "model-00002-of-00002.safetensors",
+                "head.weight": "model-00001-of-00002.safetensors",
+                "norm.weight": "model-00002-of-00002.safetensors"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let shards = resolve_safetensor_shards(dir.path()).unwrap();
+        assert_eq!(
+            shards,
+            vec![
+                dir.path()
+                    .join("model-00001-of-00002.safetensors")
+                    .to_string_lossy()
+                    .into_owned(),
+                dir.path()
+                    .join("model-00002-of-00002.safetensors")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
     }
 
     #[test]
