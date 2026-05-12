@@ -14,7 +14,6 @@ enum ServeBackend {
     Cuda,
     Metal,
     Cpu,
-    Sglang,
 }
 
 impl ServeBackend {
@@ -23,7 +22,6 @@ impl ServeBackend {
             Self::Cuda => "infer",
             Self::Metal => "metal_serve",
             Self::Cpu => "cpu_serve",
-            Self::Sglang => "python3",
         }
     }
 
@@ -32,7 +30,6 @@ impl ServeBackend {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Cpu => "cpu",
-            Self::Sglang => "sglang",
         }
     }
 }
@@ -94,41 +91,16 @@ fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvoca
             "no model selected; pass `arle serve --model-path ...`, top-level `--model-path`, or set ARLE_MODEL".to_string()
         })?;
 
-    if backend == ServeBackend::Sglang && serve_args.train_control_url.is_some() {
-        return Err(
-            "`--train-control-url` is only supported by ARLE-native serving binaries".to_string(),
-        );
-    }
-
-    if backend == ServeBackend::Sglang && !serve_args.pool_models.is_empty() {
-        return Err("`--pool-model` is only supported by ARLE-native serving binaries".to_string());
-    }
-
-    let mut argv = if backend == ServeBackend::Sglang {
-        vec![
-            "-m".to_string(),
-            "sglang.launch_server".to_string(),
-            "--model-path".to_string(),
-            model_path,
-            "--host".to_string(),
-            serve_args.bind.clone(),
-            "--port".to_string(),
-            serve_args.port.to_string(),
-        ]
-    } else {
-        vec![
-            "--model-path".to_string(),
-            model_path,
-            "--port".to_string(),
-            serve_args.port.to_string(),
-        ]
-    };
+    let mut argv = vec![
+        "--model-path".to_string(),
+        model_path,
+        "--port".to_string(),
+        serve_args.port.to_string(),
+    ];
 
     let bind_warning = if backend == ServeBackend::Metal {
         argv.push("--bind".to_string());
         argv.push(serve_args.bind.clone());
-        None
-    } else if backend == ServeBackend::Sglang {
         None
     } else if serve_args.bind != "127.0.0.1" {
         Some(format!(
@@ -170,7 +142,6 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
         ServeBackendArg::Cuda => Ok(ServeBackend::Cuda),
         ServeBackendArg::Metal => Ok(ServeBackend::Metal),
         ServeBackendArg::Cpu => Ok(ServeBackend::Cpu),
-        ServeBackendArg::Sglang => Ok(ServeBackend::Sglang),
         ServeBackendArg::Auto => match CompiledBackend::detect() {
             CompiledBackend::Cuda => Ok(ServeBackend::Cuda),
             CompiledBackend::Metal => Ok(ServeBackend::Metal),
@@ -193,24 +164,12 @@ fn model_from_env() -> Option<String> {
 }
 
 fn resolve_binary(name: &str) -> PathBuf {
-    if name == "python3"
-        && let Some(python) = sglang_python_from_env()
-    {
-        return PathBuf::from(python);
-    }
     if let Some(sibling) = current_exe_sibling(name)
         && sibling.is_file()
     {
         return sibling;
     }
     PathBuf::from(name)
-}
-
-fn sglang_python_from_env() -> Option<String> {
-    env::var("ARLE_SGLANG_PYTHON")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn current_exe_sibling(name: &str) -> Option<PathBuf> {
@@ -316,80 +275,19 @@ mod tests {
     }
 
     #[test]
-    fn sglang_serve_launches_python_module_and_forwards_ep_args() {
+    fn serve_backend_arle_alias_selects_compiled_backend() {
         let mut args = Args::parse_from([
             "arle",
             "serve",
             "--backend",
-            "sglang",
-            "--model-path",
-            "/models/DeepSeek-V3.2",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            "30000",
-            "--",
-            "--served-model-name",
-            "/DeepSeek-V4-Flash",
-            "--tp",
-            "8",
-            "--dp",
-            "8",
-            "--ep",
-            "8",
-        ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert_eq!(invocation.backend, ServeBackend::Sglang);
-        assert_eq!(invocation.binary, PathBuf::from("python3"));
-        assert_eq!(
-            invocation.argv[..8],
-            [
-                "-m",
-                "sglang.launch_server",
-                "--model-path",
-                "/models/DeepSeek-V3.2",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "30000",
-            ]
-        );
-        assert!(
-            invocation
-                .argv
-                .windows(2)
-                .any(|item| item[0] == "--served-model-name" && item[1] == "/DeepSeek-V4-Flash")
-        );
-        assert!(
-            invocation
-                .argv
-                .windows(2)
-                .any(|item| item[0] == "--ep" && item[1] == "8")
-        );
-        assert!(invocation.bind_warning.is_none());
-    }
-
-    #[test]
-    fn sglang_serve_rejects_arle_native_pool_models() {
-        let mut args = Args::parse_from([
             "arle",
-            "serve",
-            "--backend",
-            "sglang",
             "--model-path",
             "/models/main",
-            "--pool-model",
-            "embed=/models/embed,type=embedding",
         ]);
         let serve = match args.command.take().expect("serve command") {
             crate::args::CliCommand::Serve(serve) => *serve,
             _ => panic!("expected serve"),
         };
-        let err = resolve_invocation(&args, &serve).expect_err("sglang pool-model rejected");
-        assert!(err.contains("--pool-model"));
+        assert_eq!(serve.backend, ServeBackendArg::Auto);
     }
 }
