@@ -61,6 +61,11 @@ pub(in crate::scheduler::cuda) struct SchedulerRuntimeStats {
     pub step_timing_total_us: f64,
     pub step_timing_cleanup_us: f64,
     pub step_timing_loop_total_us: f64,
+    pub step_timing_snapshot_us: f64,
+    pub step_timing_cpu_plan_us: f64,
+    pub step_timing_gpu_completion_wait_us: f64,
+    /// Monotonic scheduler-state epoch used to validate snapshot-derived CPU plans.
+    pub scheduler_epoch: u64,
     /// Throttled GPU memory query state and peak high-water mark.
     pub last_mem_query: std::time::Instant,
     pub peak_mem_bytes: u64,
@@ -84,10 +89,43 @@ impl SchedulerRuntimeStats {
             step_timing_total_us: 0.0,
             step_timing_cleanup_us: 0.0,
             step_timing_loop_total_us: 0.0,
+            step_timing_snapshot_us: 0.0,
+            step_timing_cpu_plan_us: 0.0,
+            step_timing_gpu_completion_wait_us: 0.0,
+            scheduler_epoch: 0,
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             prefill_oom_cooldown_until: None,
         }
+    }
+
+    pub(in crate::scheduler::cuda) fn advance_epoch(&mut self) -> u64 {
+        self.scheduler_epoch = self.scheduler_epoch.wrapping_add(1).max(1);
+        self.scheduler_epoch
+    }
+
+    pub(in crate::scheduler::cuda) fn record_pipeline_timing(
+        &mut self,
+        snapshot_us: u128,
+        cpu_plan_us: u128,
+        gpu_completion_wait_us: u128,
+    ) {
+        fn update_ema(ema: &mut f64, val: u128) {
+            const ALPHA: f64 = 0.1;
+            let v = val as f64;
+            if *ema == 0.0 {
+                *ema = v;
+            } else {
+                *ema = ALPHA * v + (1.0 - ALPHA) * *ema;
+            }
+        }
+
+        update_ema(&mut self.step_timing_snapshot_us, snapshot_us);
+        update_ema(&mut self.step_timing_cpu_plan_us, cpu_plan_us);
+        update_ema(
+            &mut self.step_timing_gpu_completion_wait_us,
+            gpu_completion_wait_us,
+        );
     }
 
     pub(in crate::scheduler::cuda) fn record_loop_phase_timing(

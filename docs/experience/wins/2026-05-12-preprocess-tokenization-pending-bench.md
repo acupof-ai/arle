@@ -43,6 +43,23 @@ cargo test -p infer --no-default-features --features metal,no-cuda \
   pending_metal_request_uses_cached_prompt_tokens -- --nocapture
 
 cargo clippy -p infer --no-default-features --features metal,no-cuda -- -D warnings
+
+rustfmt --check --edition 2024 --config skip_children=true \
+  infer/src/http_server/types.rs \
+  infer/src/http_server/router.rs \
+  infer/src/http_server/handlers.rs \
+  infer/src/metrics.rs \
+  infer/src/metrics/render.rs \
+  infer/src/scheduler/cuda/core/state_types.rs \
+  infer/src/scheduler/cuda/execution.rs
+
+cargo test -p infer --no-default-features --features no-cuda \
+  server_metrics_ -- --nocapture
+
+CUDARC_CUDA_VERSION=13010 \
+cargo check -p infer --no-default-features --features cuda,no-cuda
+
+cargo clippy -p infer --no-default-features --features no-cuda -- -D warnings
 ```
 
 Deferred serving benchmark:
@@ -73,9 +90,11 @@ scripts/bench_guidellm.sh preprocess-tokenization-cuda \
 |---|---|
 | Change type | runtime control-plane / request preprocessing |
 | Tokenizer ownership | HTTP stores `Arc<Tokenizer>` snapshot in `AppState` |
-| HTTP preprocess executor | `tokio::task::spawn_blocking` |
+| HTTP preprocess executor | bounded semaphore + `tokio::task::spawn_blocking` |
 | Scheduler fallback | preserved when prompt tokens are absent |
 | Metal runtime | `MetalSchedulerHandle` forwards tokenizer and `PendingMetalRequest` consumes cached prompt tokens |
+| CUDA pipeline boundary | `SchedulerSnapshot` -> `CandidatePlan` -> `PreparedHostMetadata` -> `GpuCommand` |
+| New telemetry | preprocess queue/wait/tokenize, snapshot, CPU plan, stale/accepted plan, GPU completion wait, GPU command depth |
 | Perf status | `pending-bench`, no performance conclusion claimed |
 
 ## Results
@@ -89,6 +108,10 @@ scripts/bench_guidellm.sh preprocess-tokenization-cuda \
 | Metal tokenizer-forwarding targeted test | PASS |
 | Metal cached-token targeted test | PASS |
 | Metal/no-cuda clippy `-D warnings` | PASS |
+| Stage 1-4 edited-file rustfmt check | PASS |
+| metrics preprocess/pipeline tests | PASS |
+| Stage 1-4 `cuda,no-cuda` typecheck | PASS with unrelated warnings from existing untracked `infer/src/model/deepseek/load.rs` |
+| Stage 1-4 no-cuda clippy `-D warnings` | PASS |
 | full no-cuda release tests | FAIL due unrelated `metal_eval_audit` materialize-boundary classification drift |
 
 Full no-cuda release test failure:
@@ -107,6 +130,11 @@ left includes infer/src/backend/metal/kv_pool.rs, right does not
 - Repository state contains unrelated dirty/untracked DeepSeek/CUDA KV files.
   They were not modified for this tranche and affected broad formatting/check
   surfaces.
+- `cargo test -p infer --no-default-features --features cuda,no-cuda
+  cuda::execution::tests` compiles but cannot link on this Mac/no-cuda setup:
+  test binaries reference CUDA FFI symbols while `/usr/local/cuda/lib64/stubs`
+  is absent. The accepted local CUDA check for this workspace is therefore the
+  `cuda,no-cuda` typecheck above.
 
 ## Learnings
 
@@ -114,6 +142,9 @@ left includes infer/src/backend/metal/kv_pool.rs, right does not
   the submission boundary while keeping scheduler-side tokenization as a
   compatibility fallback. That changes ownership without changing admission
   semantics.
+- The Stage 2-4 boundary can be introduced without sharing scheduler state:
+  epoch validation makes stale CPU plans a counted fallback, and `GpuCommand`
+  makes launch/readback ownership explicit before any worker-thread split.
 
 ## Delta vs baseline
 
