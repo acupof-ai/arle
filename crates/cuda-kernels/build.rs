@@ -1165,6 +1165,11 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
     let ccbin = std::env::var("NVCC_CCBIN").ok();
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_MARLIN_W4_FP8");
+    let disable_marlin_w4_fp8 = matches!(
+        std::env::var("ARLE_CUDA_DISABLE_MARLIN_W4_FP8").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    );
 
     let mut obj_files = Vec::new();
     for cu_file in &cu_files {
@@ -1180,6 +1185,9 @@ fn main() {
         ];
         if let Some(bin) = ccbin.as_deref() {
             nvcc_args.push(format!("-ccbin={bin}"));
+        }
+        if disable_marlin_w4_fp8 && stem == "marlin_w4_fp8_kernel" {
+            nvcc_args.push("-DARLE_DISABLE_MARLIN_W4_FP8=1".to_string());
         }
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
