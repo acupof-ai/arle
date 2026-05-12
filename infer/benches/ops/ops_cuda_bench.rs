@@ -8,9 +8,9 @@ use infer::ops;
 
 use super::common::{
     ATTN_SEQ_LEN, BATCH_SEQ_LEN, HEAD_DIM_128, KV_HEADS_128, MAX_SEQ_LEN, Q_HEADS_128,
-    ROPE_THETA_QWEN3, VECTOR_DIM, VOCAB_SIZE, configure_group, decode_meta, device_vec,
-    embedding_matrix, hidden_states, iter_sync, positive_device_vec, rope_cache, token_ids,
-    zero_f32_slice,
+    QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS, QWEN35_4B_Q_HEADS, ROPE_THETA_QWEN3, VECTOR_DIM,
+    VOCAB_SIZE, configure_group, decode_meta, device_vec, embedding_matrix, hidden_states,
+    iter_sync, positive_device_vec, rope_cache, token_ids, zero_f32_slice,
 };
 
 pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
@@ -127,6 +127,99 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
             });
         },
     );
+
+    group.throughput(Throughput::Elements(
+        (4 * 4096 * QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM) as u64,
+    ));
+    group.bench_function(BenchmarkId::new("decode_attention_fp8_qwen35", 4096), |b| {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        let batch_size = 4usize;
+        let seq_len = 4096usize;
+        let page_size = 16usize;
+        let pages_per_request = seq_len / page_size;
+        let total_pages = batch_size * pages_per_request;
+        let total_rows = total_pages * page_size;
+        let q_dim = QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM;
+        let kv_dim = QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM;
+        let data_len = total_rows * kv_dim;
+        let scales_len = total_rows * QWEN35_4B_KV_HEADS;
+
+        let q = hidden_states(&ctx, q_dim, batch_size).expect("failed to allocate q");
+        let fp8_pattern = [0x00u8, 0x38, 0xb8, 0x40, 0xc0, 0x30, 0xb0, 0x34];
+        let k_host: Vec<u8> = (0..data_len)
+            .map(|idx| fp8_pattern[(idx * 3 + 1) % fp8_pattern.len()])
+            .collect();
+        let v_host: Vec<u8> = (0..data_len)
+            .map(|idx| fp8_pattern[(idx * 5 + 2) % fp8_pattern.len()])
+            .collect();
+        let scale_host: Vec<f32> = (0..scales_len)
+            .map(|idx| 0.001 + (idx % 19) as f32 * 0.000_25)
+            .collect();
+        let kv_indices_host: Vec<i32> = (0..total_pages).map(|idx| idx as i32).collect();
+        let mut kv_meta_host = Vec::with_capacity(batch_size + 1 + batch_size);
+        for req in 0..=batch_size {
+            kv_meta_host.push((req * pages_per_request) as i32);
+        }
+        kv_meta_host.extend(std::iter::repeat_n(page_size as i32, batch_size));
+
+        let k_data = ctx.stream.clone_htod(&k_host).expect("failed to H2D k");
+        let v_data = ctx.stream.clone_htod(&v_host).expect("failed to H2D v");
+        let k_scales = ctx
+            .stream
+            .clone_htod(&scale_host)
+            .expect("failed to H2D k scales");
+        let v_scales = ctx
+            .stream
+            .clone_htod(&scale_host)
+            .expect("failed to H2D v scales");
+        let kv_indices = ctx
+            .stream
+            .clone_htod(&kv_indices_host)
+            .expect("failed to H2D kv indices");
+        let kv_meta = ctx
+            .stream
+            .clone_htod(&kv_meta_host)
+            .expect("failed to H2D kv meta");
+        let mut out =
+            HiddenStates::zeros(&ctx, q_dim, batch_size).expect("failed to allocate attention out");
+        let workspace_bytes = kv_quant::decode_attention_int8_workspace_bytes(
+            batch_size,
+            QWEN35_4B_Q_HEADS,
+            QWEN35_4B_HEAD_DIM,
+            32,
+        );
+        let workspace = ctx
+            .stream
+            .alloc_zeros::<u8>(workspace_bytes)
+            .expect("failed to allocate attention workspace");
+        let (k_ptr, _k_guard) = k_data.device_ptr(&ctx.stream);
+        let (v_ptr, _v_guard) = v_data.device_ptr(&ctx.stream);
+        let (k_scale_ptr, _ks_guard) = k_scales.device_ptr(&ctx.stream);
+        let (v_scale_ptr, _vs_guard) = v_scales.device_ptr(&ctx.stream);
+
+        iter_sync(b, &ctx, || {
+            kv_quant::decode_attention_fp8(
+                &ctx,
+                &q,
+                k_ptr,
+                v_ptr,
+                k_scale_ptr,
+                v_scale_ptr,
+                &kv_indices,
+                &kv_meta,
+                &mut out,
+                batch_size,
+                QWEN35_4B_Q_HEADS,
+                QWEN35_4B_KV_HEADS,
+                QWEN35_4B_HEAD_DIM,
+                kv_dim,
+                1.0 / (QWEN35_4B_HEAD_DIM as f32).sqrt(),
+                &workspace,
+                workspace_bytes,
+            )
+            .expect("decode_attention_fp8 failed");
+        });
+    });
 
     group.throughput(Throughput::Elements((Q_HEADS_128 * HEAD_DIM_128) as u64));
     group.bench_function(
