@@ -252,10 +252,13 @@ impl TokenKVPool {
                 .div_ceil(page_size)
     }
 
-    fn recycle_page_if_unreferenced(&mut self, page: u32) {
+    fn recycle_page_if_unreferenced(&mut self, page: u32) -> bool {
         let page_idx = page as usize;
         if self.page_attach_count[page_idx] == 0 && self.page_ref_count[page_idx] == 0 {
             self.free_pages.push(page);
+            true
+        } else {
+            false
         }
     }
 
@@ -1054,14 +1057,14 @@ impl TokenKVPool {
         }
     }
 
-    /// Decrement the external reference count on each page by one and
-    /// return the set of pages whose refcount just dropped to zero.
+    /// Decrement the external reference count on each page by one and return
+    /// the set of pages that actually moved back to the free-page stack.
     ///
-    /// For each returned page, the caller is expected to treat the page
-    /// as "just became reclaimable". The pool itself pushes those pages
-    /// onto `free_slots` internally before returning so the caller does
-    /// not have to worry about double-frees; the returned `Vec<u32>` is
-    /// informational — scheduler logs, metrics, or radix-cache bookkeeping.
+    /// A page whose refcount drops to zero is still not reclaimable while a
+    /// live slot attaches it. In that case the page remains in its owner slot
+    /// and is not returned. The returned `Vec<u32>` is informational —
+    /// scheduler logs, metrics, or radix-cache bookkeeping — and means
+    /// "pushed to `free_pages` during this call".
     ///
     /// Pages that still have refcount > 0 after the decrement stay in
     /// their current state (in a live slot or in limbo).
@@ -1083,8 +1086,9 @@ impl TokenKVPool {
             let next = cur.saturating_sub(1);
             self.page_ref_count[usize_idx] = next;
             if next == 0 {
-                self.recycle_page_if_unreferenced(idx);
-                newly_freed.push(idx);
+                if self.recycle_page_if_unreferenced(idx) {
+                    newly_freed.push(idx);
+                }
             }
         }
         newly_freed
@@ -1855,10 +1859,13 @@ mod tests {
                 .then_some(hot_tail_page)
         }
 
-        fn recycle_page_if_unreferenced(&mut self, page: u32) {
+        fn recycle_page_if_unreferenced(&mut self, page: u32) -> bool {
             let page_idx = page as usize;
             if self.page_ref_count[page_idx] == 0 && self.page_attach_count[page_idx] == 0 {
                 self.free_pages.push(page);
+                true
+            } else {
+                false
             }
         }
 
@@ -1921,8 +1928,9 @@ mod tests {
                 let cur = self.page_ref_count[pu];
                 self.page_ref_count[pu] = cur.saturating_sub(1);
                 if self.page_ref_count[pu] == 0 {
-                    self.recycle_page_if_unreferenced(p);
-                    freed.push(p);
+                    if self.recycle_page_if_unreferenced(p) {
+                        freed.push(p);
+                    }
                 }
             }
             freed
