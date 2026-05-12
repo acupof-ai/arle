@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use log::{error, info, warn};
 use tokio::sync::mpsc;
 
@@ -45,12 +45,16 @@ struct PendingMetalRequest {
 impl PendingMetalRequest {
     fn from_incoming(
         tokenizer: &Tokenizer,
-        incoming: IncomingRequest,
+        mut incoming: IncomingRequest,
     ) -> Result<(Self, MetalRequestPriority)> {
-        let prompt_tokens = tokenizer.encode(&incoming.prompt)?;
-        if prompt_tokens.is_empty() {
-            bail!("Metal scheduler request requires at least one prompt token");
-        }
+        let prompt_tokens = match incoming.prompt_tokens.take() {
+            Some(tokens) => tokens,
+            None => tokenizer.encode(&incoming.prompt)?,
+        };
+        ensure!(
+            !prompt_tokens.is_empty(),
+            "Metal scheduler request requires at least one prompt token"
+        );
         Ok((
             Self {
                 delta_tx: incoming.delta_tx,
@@ -1327,6 +1331,10 @@ impl crate::request_handle::RequestHandle for MetalSchedulerHandle {
 
     fn dflash_status(&self) -> Option<crate::request_handle::DflashStatus> {
         self.dflash_status.clone()
+    }
+
+    fn tokenizer_clone(&self) -> Option<Tokenizer> {
+        SchedulerHandle::tokenizer_clone(&self.inner)
     }
 
     /// Forward the inner `SchedulerHandle`'s server-metrics handle so
@@ -3126,8 +3134,77 @@ fn send_text_delta_with_ids(
 mod tests {
     use super::*;
     use crate::backend::metal::mlx::MlxArray;
+    use crate::request_handle::RequestHandle;
     use crate::test_support::metal_test_guard;
     use tempfile::tempdir;
+    use tokenizers::{
+        Tokenizer as HfTokenizer, models::wordlevel::WordLevel,
+        pre_tokenizers::whitespace::Whitespace,
+    };
+
+    fn test_word_tokenizer() -> (tempfile::TempDir, Tokenizer) {
+        let dir = tempdir().expect("tempdir");
+        let vocab = [
+            ("<unk>".to_string(), 0u32),
+            ("hello".to_string(), 1u32),
+            ("world".to_string(), 2u32),
+        ]
+        .into_iter()
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut hf_tokenizer = HfTokenizer::new(model);
+        hf_tokenizer.with_pre_tokenizer(Some(Whitespace));
+        hf_tokenizer
+            .save(dir.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
+        let tokenizer =
+            Tokenizer::from_file(dir.path().to_str().expect("utf8 path")).expect("load tokenizer");
+        (dir, tokenizer)
+    }
+
+    #[test]
+    fn metal_handle_forwards_inner_tokenizer_clone() {
+        let (_dir, tokenizer) = test_word_tokenizer();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let inner = SchedulerHandle::from_parts(tx, "metal-tokenizer-test")
+            .with_tokenizer(tokenizer.clone());
+        let handle = MetalSchedulerHandle {
+            inner,
+            dflash_status: None,
+        };
+
+        let forwarded = handle
+            .tokenizer_clone()
+            .expect("metal handle should forward tokenizer");
+        assert_eq!(forwarded.encode("hello world").expect("encode"), vec![1, 2]);
+    }
+
+    #[test]
+    fn pending_metal_request_uses_cached_prompt_tokens() {
+        let (_dir, tokenizer) = test_word_tokenizer();
+        let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
+        let incoming = IncomingRequest {
+            prompt: "hello world".into(),
+            prompt_tokens: Some(vec![42, 43]),
+            max_tokens: 8,
+            sampling: SamplingParams::default(),
+            stop: None,
+            speculative: None,
+            priority: RequestPriority::High,
+            session_id: None,
+            delta_tx,
+            trace_context: None,
+        };
+
+        let (pending, priority) =
+            PendingMetalRequest::from_incoming(&tokenizer, incoming).expect("pending request");
+        assert_eq!(pending.prompt_tokens, vec![42, 43]);
+        assert_eq!(priority, MetalRequestPriority::High);
+    }
 
     #[test]
     fn dflash_row_dispatch_plan_preserves_scheduler_order() {

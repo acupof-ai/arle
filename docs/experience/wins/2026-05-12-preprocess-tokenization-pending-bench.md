@@ -35,6 +35,14 @@ cargo clippy -p infer --no-default-features --features no-cuda -- -D warnings
 
 CUDARC_CUDA_VERSION=13010 \
 cargo check -p infer --no-default-features --features cuda,no-cuda
+
+cargo test -p infer --no-default-features --features metal,no-cuda \
+  metal_handle_forwards_inner_tokenizer_clone -- --nocapture
+
+cargo test -p infer --no-default-features --features metal,no-cuda \
+  pending_metal_request_uses_cached_prompt_tokens -- --nocapture
+
+cargo clippy -p infer --no-default-features --features metal,no-cuda -- -D warnings
 ```
 
 Deferred serving benchmark:
@@ -67,6 +75,7 @@ scripts/bench_guidellm.sh preprocess-tokenization-cuda \
 | Tokenizer ownership | HTTP stores `Arc<Tokenizer>` snapshot in `AppState` |
 | HTTP preprocess executor | `tokio::task::spawn_blocking` |
 | Scheduler fallback | preserved when prompt tokens are absent |
+| Metal runtime | `MetalSchedulerHandle` forwards tokenizer and `PendingMetalRequest` consumes cached prompt tokens |
 | Perf status | `pending-bench`, no performance conclusion claimed |
 
 ## Results
@@ -77,6 +86,9 @@ scripts/bench_guidellm.sh preprocess-tokenization-cuda \
 | edited-file rustfmt check | PASS |
 | no-cuda clippy `-D warnings` | PASS |
 | `cuda,no-cuda` typecheck | PASS with unrelated warnings from existing untracked `infer/src/model/deepseek/load.rs` |
+| Metal tokenizer-forwarding targeted test | PASS |
+| Metal cached-token targeted test | PASS |
+| Metal/no-cuda clippy `-D warnings` | PASS |
 | full no-cuda release tests | FAIL due unrelated `metal_eval_audit` materialize-boundary classification drift |
 
 Full no-cuda release test failure:
