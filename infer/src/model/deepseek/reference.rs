@@ -25,6 +25,7 @@ enum TensorDtype {
     Bf16,
     F32,
     I64,
+    Unsupported,
 }
 
 #[derive(Debug, Clone)]
@@ -757,7 +758,7 @@ impl SafeTensorStore {
                 "BF16" => TensorDtype::Bf16,
                 "F32" => TensorDtype::F32,
                 "I64" => TensorDtype::I64,
-                other => bail!("unsupported safetensors dtype {other} for {name}"),
+                _ => TensorDtype::Unsupported,
             };
             let start = header_end + tensor.data_offsets[0];
             let end = header_end + tensor.data_offsets[1];
@@ -891,6 +892,7 @@ impl SafeTensorStore {
                 Ok(f32::from_le_bytes(bytes))
             }
             TensorDtype::I64 => bail!("cannot read I64 tensor as f32"),
+            TensorDtype::Unsupported => bail!("cannot read unsupported tensor dtype as f32"),
         }
     }
 }
