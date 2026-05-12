@@ -24,7 +24,7 @@ use fastrace::local::LocalSpan;
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
 use serde::Deserialize;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{OwnedSemaphorePermit, mpsc::UnboundedReceiver};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::openai_v1::{
@@ -115,27 +115,22 @@ fn sse_done_stream() -> impl futures_util::Stream<Item = Result<Event, Infallibl
     stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) })
 }
 
-async fn collect_buffered_response(
+fn non_streaming_timeout_error(request_kind: &str) -> ApiError {
+    error!(
+        "Non-streaming {request_kind} timed out after {}s",
+        RESPONSE_TIMEOUT.as_secs()
+    );
+    ApiError::timeout(RESPONSE_TIMEOUT.as_secs())
+}
+
+async fn collect_buffered_response_inner(
     mut delta_rx: UnboundedReceiver<CompletionStreamDelta>,
     request_kind: &str,
 ) -> Result<BufferedResponse, ApiError> {
-    let collect = async {
-        let mut buffered = BufferedResponse::default();
-        while let Some(delta) = delta_rx.recv().await {
-            buffered.apply_delta(&delta);
-        }
-        buffered
-    };
-
-    let buffered = tokio::time::timeout(RESPONSE_TIMEOUT, collect)
-        .await
-        .map_err(|_| {
-            error!(
-                "Non-streaming {request_kind} timed out after {}s",
-                RESPONSE_TIMEOUT.as_secs()
-            );
-            ApiError::timeout(RESPONSE_TIMEOUT.as_secs())
-        })?;
+    let mut buffered = BufferedResponse::default();
+    while let Some(delta) = delta_rx.recv().await {
+        buffered.apply_delta(&delta);
+    }
 
     // Channel closed without a terminal delta — the scheduler aborted this
     // request (e.g. prefill OOM, slot teardown). Returning the buffered
@@ -252,6 +247,58 @@ fn request_id_from_headers(headers: &HeaderMap) -> String {
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToOwned::to_owned)
 }
 
+fn preprocess_active_depth(state: &AppState) -> u64 {
+    state
+        .preprocess_capacity
+        .saturating_sub(state.preprocess_permits.available_permits()) as u64
+}
+
+struct PreprocessPermitGuard {
+    permit: Option<OwnedSemaphorePermit>,
+    permits: Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+    metrics: crate::metrics::ServerMetrics,
+    wait_us: u64,
+    tokenize_started_at: std::time::Instant,
+    tokenize_us: u64,
+}
+
+impl PreprocessPermitGuard {
+    fn new(
+        state: &AppState,
+        permit: OwnedSemaphorePermit,
+        wait_us: u64,
+        tokenize_started_at: std::time::Instant,
+    ) -> Self {
+        Self {
+            permit: Some(permit),
+            permits: state.preprocess_permits.clone(),
+            capacity: state.preprocess_capacity,
+            metrics: state.metrics.clone(),
+            wait_us,
+            tokenize_started_at,
+            tokenize_us: 0,
+        }
+    }
+
+    fn record_tokenize_elapsed(&mut self) {
+        self.tokenize_us = self.tokenize_started_at.elapsed().as_micros() as u64;
+    }
+
+    fn active_depth(&self) -> u64 {
+        self.capacity
+            .saturating_sub(self.permits.available_permits()) as u64
+    }
+}
+
+impl Drop for PreprocessPermitGuard {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.metrics
+            .set_preprocess_stage(self.active_depth(), self.wait_us, self.tokenize_us);
+    }
+}
+
 pub(super) async fn attach_request_id(
     mut request: AxumRequest,
     next: middleware::Next,
@@ -285,13 +332,16 @@ async fn preprocess_prompt_tokens(
             ApiError::service_unavailable("Failed to preprocess request prompt")
         })?;
     let wait_us = wait_started_at.elapsed().as_micros() as u64;
-    let active_depth = state
-        .preprocess_capacity
-        .saturating_sub(state.preprocess_permits.available_permits()) as u64;
+    state
+        .metrics
+        .set_preprocess_stage(preprocess_active_depth(state), wait_us, 0);
     let tokenize_started_at = std::time::Instant::now();
+    let permit_guard = PreprocessPermitGuard::new(state, permit, wait_us, tokenize_started_at);
     tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<u32>)> {
-        let _permit = permit;
-        let prompt_tokens = tokenizer.encode(&prompt)?;
+        let mut permit_guard = permit_guard;
+        let prompt_tokens = tokenizer.encode(&prompt);
+        permit_guard.record_tokenize_elapsed();
+        let prompt_tokens = prompt_tokens?;
         Ok((prompt, prompt_tokens))
     })
     .await
@@ -299,14 +349,7 @@ async fn preprocess_prompt_tokens(
         error!("Prompt preprocessing worker failed before scheduler submission: {err}");
         ApiError::service_unavailable("Failed to preprocess request prompt")
     })?
-    .map(|(prompt, prompt_tokens)| {
-        state.metrics.set_preprocess_stage(
-            active_depth,
-            wait_us,
-            tokenize_started_at.elapsed().as_micros() as u64,
-        );
-        (prompt, Some(prompt_tokens))
-    })
+    .map(|(prompt, prompt_tokens)| (prompt, Some(prompt_tokens)))
     .map_err(|err| {
         error!("Prompt tokenization failed before scheduler submission: {err}");
         ApiError::service_unavailable("Failed to tokenize request prompt")
@@ -338,6 +381,29 @@ async fn submit_request(
     }
 
     Ok(delta_rx)
+}
+
+async fn submit_and_collect_buffered_response(
+    state: &AppState,
+    options: RequestExecutionOptions,
+    prompt: String,
+    request_kind: &'static str,
+    route: &'static str,
+) -> Result<(BufferedResponse, SpanContext), ApiError> {
+    let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
+    let stream_span = Span::root("stream_flush", stream_parent)
+        .with_properties(|| [("route", route.to_string())]);
+    let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
+    let collect = async {
+        let delta_rx = submit_request(state, options, prompt).await?;
+        async move { collect_buffered_response_inner(delta_rx, request_kind).await }
+            .in_span(stream_span)
+            .await
+    };
+    let buffered = tokio::time::timeout(RESPONSE_TIMEOUT, collect)
+        .await
+        .map_err(|_| non_streaming_timeout_error(request_kind))??;
+    Ok((buffered, finish_parent))
 }
 
 fn authorize_headers(headers: &HeaderMap, expected_api_key: Option<&str>) -> Result<(), ApiError> {
@@ -614,9 +680,8 @@ pub(super) async fn completions(
             stream,
         );
 
-        let delta_rx = submit_request(state.as_ref(), options, req.prompt).await?;
-
         if stream {
+            let delta_rx = submit_request(state.as_ref(), options, req.prompt).await?;
             let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
             let created = now_secs();
 
@@ -632,13 +697,14 @@ pub(super) async fn completions(
 
             Ok(Sse::new(sse_stream.chain(sse_done_stream())).into_response())
         } else {
-            let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
-            let stream_span = Span::root("stream_flush", stream_parent)
-                .with_properties(|| [("route", "/v1/completions".to_string())]);
-            let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
-            let buffered = async move { collect_buffered_response(delta_rx, "request").await }
-                .in_span(stream_span)
-                .await?;
+            let (buffered, finish_parent) = submit_and_collect_buffered_response(
+                state.as_ref(),
+                options,
+                req.prompt,
+                "request",
+                "/v1/completions",
+            )
+            .await?;
 
             info!(
                 "Request completed: prompt_tokens={}, completion_tokens={}",
@@ -701,9 +767,8 @@ pub(super) async fn chat_completions(
             do_stream,
         );
 
-        let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
-
         if do_stream {
+            let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
             let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
             let created = now_secs();
 
@@ -733,13 +798,14 @@ pub(super) async fn chat_completions(
 
             Ok(Sse::new(full_stream).into_response())
         } else {
-            let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
-            let stream_span = Span::root("stream_flush", stream_parent)
-                .with_properties(|| [("route", "/v1/chat/completions".to_string())]);
-            let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
-            let buffered = async move { collect_buffered_response(delta_rx, "chat request").await }
-                .in_span(stream_span)
-                .await?;
+            let (buffered, finish_parent) = submit_and_collect_buffered_response(
+                state.as_ref(),
+                options,
+                prompt,
+                "chat request",
+                "/v1/chat/completions",
+            )
+            .await?;
 
             info!(
                 "chat/completions done: prompt_tokens={}, completion_tokens={}",
@@ -818,21 +884,21 @@ pub(super) async fn responses_handler(
             max_tokens,
         );
 
-        let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
         if stream {
+            let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
             let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
             let created_at = now_secs();
             let stream = responses_sse_stream(delta_rx, response_id, created_at, model_id);
             Ok(Sse::new(stream.chain(sse_done_stream())).into_response())
         } else {
-            let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
-            let stream_span = Span::root("stream_flush", stream_parent)
-                .with_properties(|| [("route", "/v1/responses".to_string())]);
-            let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
-            let buffered =
-                async move { collect_buffered_response(delta_rx, "responses request").await }
-                    .in_span(stream_span)
-                    .await?;
+            let (buffered, finish_parent) = submit_and_collect_buffered_response(
+                state.as_ref(),
+                options,
+                prompt,
+                "responses request",
+                "/v1/responses",
+            )
+            .await?;
             async move {
                 let response =
                     ResponsesResponse::from_output(model_id, now_secs(), buffered.into_output());
