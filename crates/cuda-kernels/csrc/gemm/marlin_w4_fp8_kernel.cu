@@ -16,6 +16,52 @@
 #include <stdint.h>
 #include <stdio.h>
 
+constexpr int ERR_PROB_SHAPE = 1;
+constexpr int ERR_KERN_SHAPE = 2;
+constexpr int ERR_ARCH = 3;
+
+#ifdef ARLE_DISABLE_MARLIN_W4_FP8
+
+extern "C" int gemm_w4_fp8_marlin_cuda(
+    const void* A,
+    const void* B,
+    void* C_tmp,
+    void* D,
+    const void* s1,
+    const void* s2,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    void* workspace,
+    int groupsize,
+    int dev,
+    cudaStream_t stream,
+    int thread_k,
+    int thread_n,
+    int sms,
+    int max_par) {
+  (void)A;
+  (void)B;
+  (void)C_tmp;
+  (void)D;
+  (void)s1;
+  (void)s2;
+  (void)prob_m;
+  (void)prob_n;
+  (void)prob_k;
+  (void)workspace;
+  (void)groupsize;
+  (void)dev;
+  (void)stream;
+  (void)thread_k;
+  (void)thread_n;
+  (void)sms;
+  (void)max_par;
+  return ERR_ARCH;
+}
+
+#else
+
 #define MARLIN_NAMESPACE_NAME arle_marlin_pf8
 #include "marlin_pf8/kernel.h"
 #include "marlin_pf8/marlin_template.h"
@@ -113,10 +159,6 @@ bool maybe_launch_pf8_kernel(int thread_m_blocks,
 }
 
 }  // namespace
-
-constexpr int ERR_PROB_SHAPE = 1;
-constexpr int ERR_KERN_SHAPE = 2;
-constexpr int ERR_ARCH = 3;
 
 extern "C" int gemm_w4_fp8_marlin_cuda(
     const void* A,       // [M,K] row-major FP8 e4m3 activations
@@ -262,3 +304,5 @@ extern "C" int gemm_w4_fp8_marlin_cuda(
   }
   return ret;
 }
+
+#endif  // ARLE_DISABLE_MARLIN_W4_FP8
