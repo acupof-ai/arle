@@ -370,6 +370,64 @@ mod tests {
     use half::bf16;
 
     #[test]
+    fn int8_row_quantization_scales_match_absmax() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        let rows = 2usize;
+        let cols = 513usize;
+        let mut input_host = vec![bf16::ZERO; rows * cols];
+        for col in 0..cols {
+            let value = if col == 257 {
+                -2.0
+            } else {
+                ((col % 17) as f32 - 8.0) * 0.03125
+            };
+            input_host[cols + col] = bf16::from_f32(value);
+        }
+
+        let input = ctx.stream.clone_htod(&input_host).expect("input H2D");
+        let mut output = ctx
+            .stream
+            .alloc_zeros::<i8>(rows * cols)
+            .expect("output alloc");
+        let mut scales = ctx.stream.alloc_zeros::<f32>(rows).expect("scales alloc");
+        {
+            let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+            let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales.device_ptr_mut(&ctx.stream);
+
+            unsafe {
+                quantize_bf16_rows_to_int8_cuda(
+                    input_ptr as *const Half,
+                    output_ptr as *mut i8,
+                    scales_ptr as *mut f32,
+                    rows as i32,
+                    cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("int8 row quantize");
+            }
+        }
+        ctx.sync().expect("sync int8 row quantize");
+
+        let got_scales = ctx.stream.clone_dtoh(&scales).expect("scales D2H");
+        assert_eq!(got_scales[0], 1.0);
+        assert!(
+            (got_scales[1] - (2.0 / 127.0)).abs() < 1.0e-7,
+            "nonzero row scale mismatch: got {}, expected {}",
+            got_scales[1],
+            2.0 / 127.0
+        );
+
+        let got_output = ctx.stream.clone_dtoh(&output).expect("output D2H");
+        assert!(
+            got_output[..cols].iter().all(|&byte| byte == 0),
+            "zero row should quantize to all-zero int8 values"
+        );
+        assert_eq!(got_output[cols + 257], -127);
+    }
+
+    #[test]
     fn fp8_row_quantization_scales_match_absmax() {
         let ctx = DeviceContext::new().expect("failed to create CUDA context");
         let rows = 2usize;

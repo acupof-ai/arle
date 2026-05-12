@@ -82,6 +82,46 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
         ),
     ] {
         group.throughput(Throughput::Elements((rows * cols) as u64));
+        group.bench_function(BenchmarkId::new("quantize_bf16_rows_to_int8", label), |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let input = device_vec_scaled(&ctx, rows * cols, 0.015_625)
+                .expect("failed to allocate int8 activation input");
+            let mut output = ctx
+                .stream
+                .alloc_zeros::<i8>(rows * cols)
+                .expect("failed to allocate int8 activation output");
+            let mut scales = ctx
+                .stream
+                .alloc_zeros::<f32>(rows)
+                .expect("failed to allocate int8 activation scales");
+            let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
+            let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || unsafe {
+                ffi::quantize_bf16_rows_to_int8_cuda(
+                    input_ptr as *const ffi::Half,
+                    output_ptr as *mut i8,
+                    scales_ptr as *mut f32,
+                    rows as i32,
+                    cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("quantize_bf16_rows_to_int8_cuda failed");
+            });
+        });
+    }
+
+    for &(label, rows, cols) in &[
+        ("qwen35_hidden_2048x2560", 2048usize, QWEN35_4B_HIDDEN),
+        (
+            "qwen35_intermediate_2048x9216",
+            2048usize,
+            QWEN35_4B_INTERMEDIATE,
+        ),
+    ] {
+        group.throughput(Throughput::Elements((rows * cols) as u64));
         group.bench_function(
             BenchmarkId::new("quantize_bf16_rows_to_fp8_e4m3", label),
             |b| {
