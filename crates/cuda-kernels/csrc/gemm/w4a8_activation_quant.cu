@@ -3,6 +3,14 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+__device__ __forceinline__ float warp_reduce_max_abs(float val) {
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+  }
+  return val;
+}
+
 __global__ void quantize_bf16_rows_to_int8_kernel(
     const __nv_bfloat16* __restrict__ input,
     int8_t* __restrict__ output,
@@ -20,15 +28,24 @@ __global__ void quantize_bf16_rows_to_int8_kernel(
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     local_max = fmaxf(local_max, fabsf(__bfloat162float(in_row[col])));
   }
-  smem[threadIdx.x] = local_max;
+  local_max = warp_reduce_max_abs(local_max);
+
+  int lane_id = threadIdx.x & 31;
+  int warp_id = threadIdx.x >> 5;
+  int num_warps = (blockDim.x + 31) >> 5;
+  if (lane_id == 0) {
+    smem[warp_id] = local_max;
+  }
   __syncthreads();
 
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+  if (warp_id == 0) {
+    float block_max = lane_id < num_warps ? smem[lane_id] : 0.0f;
+    block_max = warp_reduce_max_abs(block_max);
+    if (lane_id == 0) {
+      smem[0] = block_max;
     }
-    __syncthreads();
   }
+  __syncthreads();
 
   float scale = smem[0] > 0.0f ? smem[0] / 127.0f : 1.0f;
   if (threadIdx.x == 0) {
