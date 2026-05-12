@@ -383,10 +383,15 @@ __global__ void decode_attention_fp8_partial_kernel(
 
             float qk = 0.0f;
             #pragma unroll
-            for (int i = 0; i < EPT; i++) {
+            for (int i = 0; i < EPT; i += 4) {
                 int d = lane_id * EPT + i;
-                float k_val = static_cast<float>(K_data[base + d]) * k_scale;
-                qk += q_reg[i] * k_val;
+                __nv_fp8x4_e4m3 packed =
+                    *reinterpret_cast<const __nv_fp8x4_e4m3*>(K_data + base + d);
+                float4 k_vals = static_cast<float4>(packed);
+                qk += q_reg[i] * k_vals.x * k_scale;
+                qk += q_reg[i + 1] * k_vals.y * k_scale;
+                qk += q_reg[i + 2] * k_vals.z * k_scale;
+                qk += q_reg[i + 3] * k_vals.w * k_scale;
             }
             qk = warp_reduce_sum(qk);
 
@@ -396,10 +401,15 @@ __global__ void decode_attention_fp8_partial_kernel(
             float l_new = l_local * exp_diff + exp_qk;
 
             #pragma unroll
-            for (int i = 0; i < EPT; i++) {
+            for (int i = 0; i < EPT; i += 4) {
                 int d = lane_id * EPT + i;
-                float v_val = static_cast<float>(V_data[base + d]) * v_scale;
-                o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
+                __nv_fp8x4_e4m3 packed =
+                    *reinterpret_cast<const __nv_fp8x4_e4m3*>(V_data + base + d);
+                float4 v_vals = static_cast<float4>(packed);
+                o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_vals.x * v_scale;
+                o_reg[i + 1] = o_reg[i + 1] * exp_diff + exp_qk * v_vals.y * v_scale;
+                o_reg[i + 2] = o_reg[i + 2] * exp_diff + exp_qk * v_vals.z * v_scale;
+                o_reg[i + 3] = o_reg[i + 3] * exp_diff + exp_qk * v_vals.w * v_scale;
             }
             m_local = m_new;
             l_local = l_new;
