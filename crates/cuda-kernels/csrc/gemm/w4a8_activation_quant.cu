@@ -69,7 +69,7 @@ extern "C" cudaError_t quantize_bf16_rows_to_int8_cuda(
   constexpr int threads = 256;
   dim3 grid(rows);
   dim3 block(threads);
-  size_t smem = threads * sizeof(float);
+  size_t smem = ((threads + 31) / 32) * sizeof(float);
   quantize_bf16_rows_to_int8_kernel<<<grid, block, smem, stream>>>(
       input, output, scales, rows, cols);
   return cudaGetLastError();
