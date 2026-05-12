@@ -21,7 +21,6 @@ log = "0.4"
 cudarc = { version = "0.18", features = [
     "cuda-version-from-build-system",
     "cublas",
-    "cuda-12080",
     "f16",
 ], optional = true }
 
