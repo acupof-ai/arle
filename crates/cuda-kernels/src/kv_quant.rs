@@ -725,10 +725,115 @@ mod tests {
         }
     }
 
+    fn run_fp8_scatter_roundtrip_case(ctx: &DeviceContext, head_dim: usize) {
+        let num_kv_heads = 3usize;
+        let max_seq_len = 19usize;
+        let total_tokens = 17usize;
+        let kv_dim = num_kv_heads * head_dim;
+        let hnd_elem_count = total_tokens.div_ceil(16) * 16 * kv_dim;
+        let pattern = [1.0f32, -1.0, 0.5, -0.5, 0.25, -0.25, 0.0, 0.125];
+
+        let mut cont_host = vec![bf16::ZERO; num_kv_heads * max_seq_len * head_dim];
+        for kv_head in 0..num_kv_heads {
+            for token_row in 0..total_tokens {
+                for d in 0..head_dim {
+                    let value = pattern[(token_row + kv_head + d) % pattern.len()];
+                    let src = kv_head * max_seq_len * head_dim + token_row * head_dim + d;
+                    cont_host[src] = bf16::from_f32(value);
+                }
+            }
+        }
+
+        let kv_cont = DeviceVec::from_host(ctx, &cont_host).expect("scatter cont H2D");
+        let mut kv_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(total_tokens * kv_dim)
+            .expect("scatter fp8 alloc");
+        let mut scales = ctx
+            .stream
+            .alloc_zeros::<f32>(total_tokens * num_kv_heads)
+            .expect("scatter scales alloc");
+        let token_rows_host: Vec<i32> = (0..total_tokens).map(|idx| idx as i32).collect();
+        let token_rows_gpu = ctx.stream.clone_htod(&token_rows_host).expect("rows H2D");
+
+        {
+            let (fp8_ptr, _fp8_guard) = kv_fp8.device_ptr_mut(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales.device_ptr_mut(&ctx.stream);
+            quantize_scatter_kv_fp8_range(
+                ctx,
+                &kv_cont,
+                fp8_ptr,
+                scales_ptr,
+                &token_rows_gpu,
+                0,
+                max_seq_len,
+                total_tokens,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+            )
+            .expect("fp8 scatter quantize");
+        }
+
+        let mut hnd_out = ctx
+            .stream
+            .alloc_zeros::<u16>(hnd_elem_count)
+            .expect("scatter hnd alloc");
+        {
+            let (fp8_ptr, _fp8_guard) = kv_fp8.device_ptr(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = hnd_out.device_ptr_mut(&ctx.stream);
+            dequantize_paged_kv_fp8_to_hnd(
+                ctx,
+                fp8_ptr,
+                scales_ptr,
+                out_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("fp8 scatter hnd refill");
+        }
+
+        ctx.sync().expect("sync scatter roundtrip");
+        let got = ctx.stream.clone_dtoh(&hnd_out).expect("scatter D2H");
+        let got_scales = ctx.stream.clone_dtoh(&scales).expect("scales D2H");
+        let expected_scale = 1.0f32 / 448.0f32;
+
+        for token_row in 0..total_tokens {
+            for kv_head in 0..num_kv_heads {
+                let scale = got_scales[token_row * num_kv_heads + kv_head];
+                assert!(
+                    (scale - expected_scale).abs() < 1.0e-7,
+                    "scale mismatch head_dim={head_dim} token={token_row} head={kv_head}: {scale}"
+                );
+                for d in 0..head_dim {
+                    let src = kv_head * max_seq_len * head_dim + token_row * head_dim + d;
+                    let dst = hnd_offset(token_row, kv_head, d, head_dim, kv_dim);
+                    let expected = cont_host[src].to_f32();
+                    let actual = bf16::from_bits(got[dst]).to_f32();
+                    assert!(
+                        (actual - expected).abs() <= 0.002,
+                        "roundtrip mismatch head_dim={head_dim} token={token_row} head={kv_head} d={d}: got {actual}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn hnd_refill_quantized_kv_matches_reference_values() {
         let ctx = DeviceContext::new().expect("failed to create CUDA context");
         run_hnd_refill_case(&ctx, 8);
         run_hnd_refill_case(&ctx, 7);
+    }
+
+    #[test]
+    fn fp8_scatter_quantized_kv_roundtrips_representable_values() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        run_fp8_scatter_roundtrip_case(&ctx, 8);
+        run_fp8_scatter_roundtrip_case(&ctx, 7);
     }
 }
