@@ -365,7 +365,7 @@ __global__ void dequantize_paged_kv_fp8_to_hnd_kernel(
 {
     int kv_head = blockIdx.x;
     int tok_flat = blockIdx.y;
-    int d = threadIdx.x * 2;
+    int d = threadIdx.x * 4;
     if (d >= head_dim) return;
 
     int token_row = token_rows[tok_flat];
@@ -379,22 +379,22 @@ __global__ void dequantize_paged_kv_fp8_to_hnd_kernel(
                    + offset_in_page * head_dim
                    + d;
     float scale = scales[scale_offset];
-    if (d + 1 < head_dim) {
-        __nv_fp8x2_e4m3 packed;
-        if (((src_offset | dst_offset) & 1) == 0) {
-            packed.__x = *reinterpret_cast<const __nv_fp8x2_storage_t*>(kv_fp8 + src_offset);
-            float2 vals = static_cast<float2>(packed);
-            __nv_bfloat162 out = __floats2bfloat162_rn(vals.x * scale, vals.y * scale);
-            *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset) = out;
-        } else {
-            float val0 = static_cast<float>(kv_fp8[src_offset]) * scale;
-            float val1 = static_cast<float>(kv_fp8[src_offset + 1]) * scale;
-            kv_bf16_hnd[dst_offset] = __float2bfloat16(val0);
-            kv_bf16_hnd[dst_offset + 1] = __float2bfloat16(val1);
-        }
+    if (d + 3 < head_dim && ((src_offset | dst_offset) & 3) == 0) {
+        __nv_fp8x4_e4m3 packed =
+            *reinterpret_cast<const __nv_fp8x4_e4m3*>(kv_fp8 + src_offset);
+        float4 vals = static_cast<float4>(packed);
+        __nv_bfloat162 out01 = __floats2bfloat162_rn(vals.x * scale, vals.y * scale);
+        __nv_bfloat162 out23 = __floats2bfloat162_rn(vals.z * scale, vals.w * scale);
+        *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset) = out01;
+        *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset + 2) = out23;
     } else {
-        float val = static_cast<float>(kv_fp8[src_offset]) * scale;
-        kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (d + i < head_dim) {
+                float val = static_cast<float>(kv_fp8[src_offset + i]) * scale;
+                kv_bf16_hnd[dst_offset + i] = __float2bfloat16(val);
+            }
+        }
     }
 }
 
@@ -411,7 +411,7 @@ cudaError_t dequantize_paged_kv_fp8_to_hnd_cuda(
 {
     if (total_tokens <= 0) return cudaSuccess;
     dim3 grid(num_kv_heads, total_tokens);
-    dim3 block((head_dim + 1) / 2);
+    dim3 block((head_dim + 3) / 4);
     dequantize_paged_kv_fp8_to_hnd_kernel<<<grid, block, 0, stream>>>(
         kv_fp8, scales, kv_bf16_hnd, token_rows, num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();
