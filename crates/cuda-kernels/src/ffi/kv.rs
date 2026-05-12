@@ -222,4 +222,19 @@ unsafe extern "C" {
         kv_dim: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn transfer_kv_pages_layer_table_cuda(
+        src_k_layers: *const u64,
+        dst_k_layers: *const u64,
+        src_v_layers: *const u64,
+        dst_v_layers: *const u64,
+        src_pages: *const i32,
+        dst_pages: *const i32,
+        num_pages: i32,
+        start_layer: i32,
+        num_layers: i32,
+        bytes_per_page: i64,
+        num_warps_per_block: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

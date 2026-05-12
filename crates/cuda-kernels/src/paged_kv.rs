@@ -10,8 +10,8 @@
 //! token-granular (`page_size = 1`) until its decode and migration kernels are
 //! rewritten around paged layout.
 
-use anyhow::{Result, anyhow};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::{Result, anyhow, ensure};
+use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr};
 use log::info;
 
 use super::ffi;
@@ -806,99 +806,190 @@ impl TokenKVPool {
     }
 
     #[cfg(feature = "cuda")]
+    fn upload_layer_table<T: DeviceRepr>(
+        &self,
+        ctx: &DeviceContext,
+        layers: &[CudaSlice<T>],
+    ) -> Result<CudaSlice<u64>> {
+        let ptrs = layers
+            .iter()
+            .map(|layer| {
+                let (ptr, _guard) = layer.device_ptr(&ctx.stream);
+                ptr as u64
+            })
+            .collect::<Vec<_>>();
+        ctx.stream
+            .clone_htod(&ptrs)
+            .map_err(|e| anyhow!("paged_kv H2D layer pointer table failed: {e}"))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_layer_table_pair<T: DeviceRepr>(
+        &self,
+        ctx: &DeviceContext,
+        src_k_layers: &[CudaSlice<T>],
+        dst_k_layers: &[CudaSlice<T>],
+        src_v_layers: Option<&[CudaSlice<T>]>,
+        dst_v_layers: Option<&[CudaSlice<T>]>,
+        src_pages_gpu: &CudaSlice<i32>,
+        dst_pages_gpu: &CudaSlice<i32>,
+        page_count: usize,
+        bytes_per_page: usize,
+        label: &str,
+    ) -> Result<()> {
+        if page_count == 0 || bytes_per_page == 0 {
+            return Ok(());
+        }
+        ensure!(
+            src_k_layers.len() == self.num_layers && dst_k_layers.len() == self.num_layers,
+            "paged_kv transfer {label}: layer table length mismatch"
+        );
+        ensure!(
+            src_v_layers.is_some() == dst_v_layers.is_some(),
+            "paged_kv transfer {label}: K/V table option mismatch"
+        );
+        if let (Some(src_v), Some(dst_v)) = (src_v_layers, dst_v_layers) {
+            ensure!(
+                src_v.len() == self.num_layers && dst_v.len() == self.num_layers,
+                "paged_kv transfer {label}: V layer table length mismatch"
+            );
+        }
+
+        let src_k_table = self.upload_layer_table(ctx, src_k_layers)?;
+        let dst_k_table = self.upload_layer_table(ctx, dst_k_layers)?;
+        let src_v_table = src_v_layers
+            .map(|layers| self.upload_layer_table(ctx, layers))
+            .transpose()?;
+        let dst_v_table = dst_v_layers
+            .map(|layers| self.upload_layer_table(ctx, layers))
+            .transpose()?;
+
+        let (src_k_ptr, _g_src_k) = src_k_table.device_ptr(&ctx.stream);
+        let (dst_k_ptr, _g_dst_k) = dst_k_table.device_ptr(&ctx.stream);
+        let (src_pages_ptr, _g_src_pages) = src_pages_gpu.device_ptr(&ctx.stream);
+        let (dst_pages_ptr, _g_dst_pages) = dst_pages_gpu.device_ptr(&ctx.stream);
+        let (src_v_ptr, _g_src_v) = if let Some(table) = src_v_table.as_ref() {
+            let (ptr, guard) = table.device_ptr(&ctx.stream);
+            (ptr as *const u64, Some(guard))
+        } else {
+            (std::ptr::null(), None)
+        };
+        let (dst_v_ptr, _g_dst_v) = if let Some(table) = dst_v_table.as_ref() {
+            let (ptr, guard) = table.device_ptr(&ctx.stream);
+            (ptr as *const u64, Some(guard))
+        } else {
+            (std::ptr::null(), None)
+        };
+
+        unsafe {
+            ffi::transfer_kv_pages_layer_table_cuda(
+                src_k_ptr as *const u64,
+                dst_k_ptr as *const u64,
+                src_v_ptr,
+                dst_v_ptr,
+                src_pages_ptr as *const i32,
+                dst_pages_ptr as *const i32,
+                page_count as i32,
+                0,
+                self.num_layers as i32,
+                bytes_per_page as i64,
+                8,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("paged_kv transfer {label} failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn copy_pages_device_to_device(
+        &mut self,
+        ctx: &DeviceContext,
+        src_pages: &[u32],
+        dst_pages: &[u32],
+    ) -> Result<()> {
+        ensure!(
+            src_pages.len() == dst_pages.len(),
+            "paged_kv device copy source/destination page count mismatch: {} vs {}",
+            src_pages.len(),
+            dst_pages.len()
+        );
+        if src_pages.is_empty() {
+            return Ok(());
+        }
+        for &page in src_pages.iter().chain(dst_pages) {
+            ensure!(
+                (page as usize) < self.max_total_pages,
+                "paged_kv device copy page {page} out of range {}",
+                self.max_total_pages
+            );
+            ensure!(
+                page <= i32::MAX as u32,
+                "paged_kv device copy page {page} exceeds i32 page table limit"
+            );
+        }
+
+        let src_pages_gpu = self.upload_page_indices(ctx, src_pages)?;
+        let dst_pages_gpu = self.upload_page_indices(ctx, dst_pages)?;
+        let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
+        let scale_len = self.page_size * self.num_kv_heads;
+
+        self.transfer_layer_table_pair(
+            ctx,
+            &self.k_data,
+            &self.k_data,
+            Some(&self.v_data),
+            Some(&self.v_data),
+            &src_pages_gpu,
+            &dst_pages_gpu,
+            src_pages.len(),
+            token_bytes,
+            "data",
+        )?;
+
+        if self.format.has_scales() {
+            self.transfer_layer_table_pair(
+                ctx,
+                &self.k_scales,
+                &self.k_scales,
+                Some(&self.v_scales),
+                Some(&self.v_scales),
+                &src_pages_gpu,
+                &dst_pages_gpu,
+                src_pages.len(),
+                scale_len * std::mem::size_of::<f32>(),
+                "scales",
+            )?;
+        }
+
+        if self.format.has_norms() {
+            self.transfer_layer_table_pair(
+                ctx,
+                &self.k_norms,
+                &self.k_norms,
+                Some(&self.v_norms),
+                Some(&self.v_norms),
+                &src_pages_gpu,
+                &dst_pages_gpu,
+                src_pages.len(),
+                scale_len * std::mem::size_of::<u16>(),
+                "norms",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
     fn copy_page_device_to_device(
         &mut self,
         ctx: &DeviceContext,
         src_page: u32,
         dst_page: u32,
     ) -> Result<()> {
-        fn copy_same_buffer_region<T>(
-            ctx: &DeviceContext,
-            buffer: &mut CudaSlice<T>,
-            src_elem_start: usize,
-            dst_elem_start: usize,
-            elem_count: usize,
-            label: &str,
-        ) -> Result<()> {
-            use cudarc::driver::sys::{cuMemcpyDtoDAsync_v2, cudaError_enum::CUDA_SUCCESS};
-
-            let (base_ptr, _guard) = buffer.device_ptr_mut(&ctx.stream);
-            let src_ptr = unsafe { (base_ptr as *mut T).add(src_elem_start) } as u64;
-            let dst_ptr = unsafe { (base_ptr as *mut T).add(dst_elem_start) } as u64;
-            let bytes = elem_count * std::mem::size_of::<T>();
-            let result =
-                unsafe { cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, bytes, ctx.stream.cu_stream()) };
-            if result != CUDA_SUCCESS {
-                return Err(anyhow!("{label} failed: {result:?}"));
-            }
-            Ok(())
-        }
-
-        let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
-        let scale_len = self.page_size * self.num_kv_heads;
-        let src_data_start = src_page as usize * token_bytes;
-        let dst_data_start = dst_page as usize * token_bytes;
-        let src_scale_start = src_page as usize * scale_len;
-        let dst_scale_start = dst_page as usize * scale_len;
-
-        for layer in 0..self.num_layers {
-            copy_same_buffer_region(
-                ctx,
-                &mut self.k_data[layer],
-                src_data_start,
-                dst_data_start,
-                token_bytes,
-                "paged_kv copy K page dtod",
-            )?;
-            copy_same_buffer_region(
-                ctx,
-                &mut self.v_data[layer],
-                src_data_start,
-                dst_data_start,
-                token_bytes,
-                "paged_kv copy V page dtod",
-            )?;
-
-            if self.format.has_scales() {
-                copy_same_buffer_region(
-                    ctx,
-                    &mut self.k_scales[layer],
-                    src_scale_start,
-                    dst_scale_start,
-                    scale_len,
-                    "paged_kv copy K scales dtod",
-                )?;
-                copy_same_buffer_region(
-                    ctx,
-                    &mut self.v_scales[layer],
-                    src_scale_start,
-                    dst_scale_start,
-                    scale_len,
-                    "paged_kv copy V scales dtod",
-                )?;
-            }
-
-            if self.format.has_norms() {
-                copy_same_buffer_region(
-                    ctx,
-                    &mut self.k_norms[layer],
-                    src_scale_start,
-                    dst_scale_start,
-                    scale_len,
-                    "paged_kv copy K norms dtod",
-                )?;
-                copy_same_buffer_region(
-                    ctx,
-                    &mut self.v_norms[layer],
-                    src_scale_start,
-                    dst_scale_start,
-                    scale_len,
-                    "paged_kv copy V norms dtod",
-                )?;
-            }
-        }
-
-        Ok(())
+        self.copy_pages_device_to_device(ctx, &[src_page], &[dst_page])
     }
 
     #[cfg(feature = "cuda")]
@@ -1785,6 +1876,60 @@ mod tests {
     fn budget_respects_slot_floor_when_budget_is_tiny() {
         let budget = compute_budget_breakdown(2, 8, 16, 32, 1, KVFormat::FP8E4M3);
         assert_eq!(budget.max_total_tokens, 32);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_transfer_copies_fp8_page_payload() {
+        use super::TokenKVPool;
+        use crate::tensor::DeviceContext;
+
+        let ctx = DeviceContext::new().expect("CUDA context");
+        let num_layers = 2;
+        let num_kv_heads = 1;
+        let head_dim = 8;
+        let page_size = KVFormat::FP8E4M3.default_page_size();
+        let kv_dim = num_kv_heads * head_dim;
+        let token_bytes = page_size * kv_dim * KVFormat::FP8E4M3.bytes_per_element();
+        let scale_len = page_size * num_kv_heads;
+        let storage_bytes_per_page =
+            num_layers * (2 * token_bytes + 2 * scale_len * std::mem::size_of::<f32>());
+        let mut pool = TokenKVPool::with_format(
+            &ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            1,
+            storage_bytes_per_page * 4,
+            KVFormat::FP8E4M3,
+        )
+        .expect("pool");
+
+        let mut payload = Vec::with_capacity(storage_bytes_per_page);
+        for layer in 0..num_layers {
+            for stream in 0..2 {
+                for byte in 0..token_bytes {
+                    payload.push((layer * 41 + stream * 17 + byte) as u8);
+                }
+            }
+            for stream in 0..2 {
+                for idx in 0..scale_len {
+                    let value = 1.0 + layer as f32 * 0.5 + stream as f32 * 0.25 + idx as f32;
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        pool.copy_pages_from_host(&ctx, &[0], &payload)
+            .expect("seed source page");
+        pool.copy_page_device_to_device(&ctx, 0, 1)
+            .expect("copy page on device");
+        ctx.sync().expect("sync");
+
+        let copied = pool
+            .copy_pages_to_host(&ctx, &[1])
+            .expect("read copied page");
+        assert_eq!(copied, payload);
     }
 
     // ------------------------------------------------------------------
