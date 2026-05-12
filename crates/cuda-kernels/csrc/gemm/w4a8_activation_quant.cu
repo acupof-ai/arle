@@ -53,9 +53,9 @@ __global__ void quantize_bf16_rows_to_int8_kernel(
   }
 
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-    float qf = nearbyintf(__bfloat162float(in_row[col]) / scale);
-    qf = fminf(127.0f, fmaxf(-128.0f, qf));
-    out_row[col] = static_cast<int8_t>(qf);
+    int q = __float2int_rn(__bfloat162float(in_row[col]) / scale);
+    q = max(-128, min(127, q));
+    out_row[col] = static_cast<int8_t>(q);
   }
 }
 
