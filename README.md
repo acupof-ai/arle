@@ -59,9 +59,10 @@ docker run --rm --gpus all -p 8000:8000 \
   serve --backend cuda --model-path /model --port 8000
 ```
 
-The `:latest` tag tracks `main`; tagged releases are published as
-`ghcr.io/cklxx/arle:X.Y.Z` (note: no `v` prefix — the docker metadata-action
-strips it). For the current release: `ghcr.io/cklxx/arle:0.1.5`.
+The `:latest` tag tracks the newest non-prerelease release image. Tagged
+releases are published as `ghcr.io/cklxx/arle:X.Y.Z` (note: no `v` prefix -
+the docker metadata-action strips it). For the current release:
+`ghcr.io/cklxx/arle:0.1.5`.
 
 **From source** (any backend; needed for `cpu`, CUDA/TileLang, or local hacking):
 

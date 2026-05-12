@@ -90,8 +90,9 @@ docker run --rm --gpus all -p 8000:8000 \
   serve --backend cuda --model-path /model --port 8000
 ```
 
-The `:latest` tag tracks `main`. Tagged releases are published as
-`ghcr.io/cklxx/arle:X.Y.Z` (no `v` prefix — docker metadata-action strips it).
+The `:latest` tag tracks the newest non-prerelease release image. Tagged
+releases are published as `ghcr.io/cklxx/arle:X.Y.Z` (no `v` prefix - docker
+metadata-action strips it).
 
 ## 4. From source
 
