@@ -7,9 +7,8 @@ use crate::{DeepSeekConfigError, Result, Shard};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeepSeekV4RopeParameters {
+    #[serde(default, alias = "type")]
     pub rope_type: String,
-    #[serde(default, rename = "type")]
-    pub type_alias: Option<String>,
     pub factor: f32,
     pub original_max_position_embeddings: usize,
     pub beta_fast: f32,
@@ -22,6 +21,7 @@ pub struct DeepSeekV4RopeParameters {
 pub struct DeepSeekV4Config {
     pub architectures: Vec<String>,
     pub model_type: String,
+    #[serde(alias = "torch_dtype")]
     pub dtype: String,
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -56,6 +56,7 @@ pub struct DeepSeekV4Config {
     pub num_nextn_predict_layers: usize,
     pub max_position_embeddings: usize,
     pub rope_theta: f32,
+    #[serde(alias = "rope_scaling")]
     pub rope_parameters: DeepSeekV4RopeParameters,
     pub rms_norm_eps: f32,
     pub initializer_range: f32,
@@ -148,6 +149,11 @@ impl DeepSeekV4Config {
         if self.compress_ratios.len() != self.num_hidden_layers {
             return Err(DeepSeekConfigError::InvalidConfig(
                 "compress_ratios length must match num_hidden_layers",
+            ));
+        }
+        if self.rope_parameters.rope_type.is_empty() {
+            return Err(DeepSeekConfigError::InvalidConfig(
+                "rope_parameters rope_type/type must be set",
             ));
         }
         Ok(())
@@ -937,6 +943,70 @@ mod tests {
 
     fn replica_config() -> DeepSeekV4Config {
         DeepSeekV4Config::from_json_file(replica_config_path()).unwrap()
+    }
+
+    #[test]
+    fn parses_hf_flash_alias_config_fields() {
+        let cfg = DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "torch_dtype": "bfloat16",
+            "vocab_size": 129280,
+            "hidden_size": 4096,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "head_dim": 512,
+            "hidden_act": "silu",
+            "swiglu_limit": 10.0,
+            "q_lora_rank": 1024,
+            "o_lora_rank": 1024,
+            "o_groups": 8,
+            "qk_rope_head_dim": 64,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 2048,
+            "routed_scaling_factor": 1.5,
+            "norm_topk_prob": true,
+            "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc",
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "num_hash_layers": 1,
+            "sliding_window": 128,
+            "compress_ratios": [0, 4],
+            "compress_rope_theta": 160000.0,
+            "hc_mult": 4,
+            "hc_sinkhorn_iters": 20,
+            "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 1,
+            "max_position_embeddings": 1048576,
+            "rope_theta": 10000.0,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 16.0,
+                "original_max_position_embeddings": 65536,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            },
+            "rms_norm_eps": 1.0e-6,
+            "initializer_range": 0.02,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.dtype, "bfloat16");
+        assert_eq!(cfg.rope_parameters.rope_type, "yarn");
+        assert_eq!(cfg.rope_parameters.factor, 16.0);
+        assert_eq!(cfg.pad_token_id, None);
     }
 
     #[test]
