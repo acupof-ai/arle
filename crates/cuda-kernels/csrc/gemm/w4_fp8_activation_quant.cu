@@ -3,7 +3,7 @@
 // Mirrors w4a8_activation_quant.cu (INT8 variant) with:
 //   - Output type: __nv_fp8_e4m3 (sm_89 native conversion)
 //   - Scale divisor: 448.0f (e4m3 finite max per IEEE FP8 spec)
-//   - Clamp: ±448.0f
+//   - Conversion saturation: CUDA FP8 __NV_SATFINITE
 //
 // Used by NEW prefill-only FP8 directive (per
 // docs/research/2026-05-10-prefill-only-fp8-directive-draft.md
@@ -75,11 +75,10 @@ __global__ void quantize_bf16_rows_to_fp8_e4m3_kernel(
     scales[row] = scale;
   }
 
-  // Quantize: clamp to e4m3 representable range, then convert
+  // Quantize. The __nv_fp8_e4m3(float) constructor uses __NV_SATFINITE for
+  // out-of-range values, so no separate fminf/fmaxf clamp is needed here.
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     float qf = __bfloat162float(in_row[col]) / scale;
-    qf = fminf(FP8_E4M3_MAX, fmaxf(-FP8_E4M3_MAX, qf));
-    // __nv_fp8_e4m3 has constructor from float (sm_89 native conversion)
     out_row[col] = __nv_fp8_e4m3(qf);
   }
 }
