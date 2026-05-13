@@ -10,9 +10,13 @@ use anyhow::{Result, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use deepseek_spec::{DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 
 #[cfg(feature = "cuda")]
-use crate::distributed::expert_state::LocalExpertRouting;
+use crate::distributed::expert_state::{
+    ExpertGroup, ExpertRoute, ExpertRoutingWeights, LocalExpertRouting,
+};
 #[cfg(feature = "cuda")]
 use crate::ops;
 
@@ -139,6 +143,136 @@ impl DeepseekV4MoeBlock {
 
         Ok(out)
     }
+
+    /// Route tokens with the loaded gate tensors, localize routes to this EP
+    /// rank, and run the local MoE contribution.
+    pub(super) fn forward_routed(
+        &self,
+        ctx: &DeviceContext,
+        layer_idx: usize,
+        config: &DeepSeekV4Config,
+        ep: &ExpertGroup,
+        hidden: &HiddenStates,
+        token_ids: &[u32],
+    ) -> Result<HiddenStates> {
+        let routing = self.route_local(ctx, layer_idx, config, ep, hidden, token_ids)?;
+        self.forward_local_routes(ctx, hidden, &routing, config.swiglu_limit)
+    }
+
+    fn route_local(
+        &self,
+        ctx: &DeviceContext,
+        layer_idx: usize,
+        config: &DeepSeekV4Config,
+        ep: &ExpertGroup,
+        hidden: &HiddenStates,
+        token_ids: &[u32],
+    ) -> Result<LocalExpertRouting> {
+        ensure!(
+            token_ids.len() == hidden.seq_len,
+            "DeepSeek V4 route token count {} does not match hidden seq_len {}",
+            token_ids.len(),
+            hidden.seq_len
+        );
+        ensure!(
+            self.gate_weight.rows == config.n_routed_experts
+                && self.gate_weight.cols == hidden.hidden_dim,
+            "DeepSeek V4 gate shape mismatch: gate={}x{} hidden_dim={} n_routed_experts={}",
+            self.gate_weight.rows,
+            self.gate_weight.cols,
+            hidden.hidden_dim,
+            config.n_routed_experts
+        );
+        if let Some(bias) = &self.gate_bias {
+            ensure!(
+                bias.len == config.n_routed_experts,
+                "DeepSeek V4 gate bias len {} does not match n_routed_experts {}",
+                bias.len,
+                config.n_routed_experts
+            );
+        }
+
+        let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
+        let logits_host = ctx.stream.clone_dtoh(&logits.data)?;
+        let bias_host = self
+            .gate_bias
+            .as_ref()
+            .map(|bias| ctx.stream.clone_dtoh(&bias.data))
+            .transpose()?
+            .map(|bias| {
+                bias.into_iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>()
+            });
+        let mut routes = Vec::with_capacity(hidden.seq_len * config.num_experts_per_tok);
+
+        for token_idx in 0..hidden.seq_len {
+            let start = token_idx * logits.hidden_dim;
+            let token_logits = logits_host[start..start + logits.hidden_dim]
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>();
+            let scores = config.router_scores_from_logits(&token_logits)?;
+            let hash_experts = match config.moe_routing_kind(layer_idx) {
+                DeepSeekV4MoeRoutingKind::Hash => {
+                    Some(self.hash_experts_for_token(ctx, config, token_ids[token_idx])?)
+                }
+                DeepSeekV4MoeRoutingKind::LearnedBias => None,
+            };
+            let token_routes = config.moe_routes_from_scores(
+                layer_idx,
+                token_idx,
+                &scores,
+                bias_host.as_deref(),
+                hash_experts.as_deref(),
+            )?;
+            routes.extend(token_routes.into_iter().map(|route| ExpertRoute {
+                token_idx: route.token_idx,
+                expert_idx: route.expert_idx,
+                weight: route.weight,
+            }));
+        }
+
+        ep.localize_routing(&ExpertRoutingWeights::new(config.n_routed_experts, routes))
+    }
+
+    fn hash_experts_for_token(
+        &self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        token_id: u32,
+    ) -> Result<Vec<usize>> {
+        let table = self
+            .gate_tid2eid
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hash-routed DeepSeek V4 MoE layer missing tid2eid"))?;
+        ensure!(
+            (token_id as usize) < config.vocab_size,
+            "DeepSeek V4 token id {token_id} exceeds vocab_size {}",
+            config.vocab_size
+        );
+        let start = token_id as usize * config.num_experts_per_tok;
+        let end = start + config.num_experts_per_tok;
+        ensure!(
+            end <= table.len(),
+            "DeepSeek V4 tid2eid table too short: need {} entries for token {}, have {}",
+            end,
+            token_id,
+            table.len()
+        );
+        let experts_i64 = ctx.stream.clone_dtoh(&table.slice(start..end))?;
+        experts_i64
+            .into_iter()
+            .map(|expert_idx| {
+                ensure!(
+                    expert_idx >= 0,
+                    "DeepSeek V4 tid2eid contains negative expert id"
+                );
+                usize::try_from(expert_idx)
+                    .map_err(|_| anyhow::anyhow!("DeepSeek V4 tid2eid expert id overflow"))
+            })
+            .collect()
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -158,7 +292,7 @@ fn hidden_token(
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
-    use crate::distributed::expert_state::LocalExpertRoute;
+    use crate::distributed::expert_state::{ExpertGroup, LocalExpertRoute};
     use half::bf16;
 
     fn bf16_vec(values: &[f32]) -> Vec<bf16> {
@@ -167,6 +301,64 @@ mod tests {
 
     fn silu(value: f32) -> f32 {
         value / (1.0 + (-value).exp())
+    }
+
+    fn tiny_config() -> DeepSeekV4Config {
+        DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "torch_dtype": "bfloat16",
+            "vocab_size": 16,
+            "hidden_size": 2,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 1,
+            "hidden_act": "silu",
+            "swiglu_limit": 10.0,
+            "q_lora_rank": 1,
+            "o_lora_rank": 1,
+            "o_groups": 1,
+            "qk_rope_head_dim": 1,
+            "n_routed_experts": 4,
+            "n_shared_experts": 0,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 1,
+            "routed_scaling_factor": 1.0,
+            "norm_topk_prob": false,
+            "scoring_func": "softmax",
+            "topk_method": "noaux_tc",
+            "index_n_heads": 1,
+            "index_head_dim": 1,
+            "index_topk": 1,
+            "num_hash_layers": 0,
+            "sliding_window": 4,
+            "compress_ratios": [0],
+            "compress_rope_theta": 160000.0,
+            "hc_mult": 1,
+            "hc_sinkhorn_iters": 1,
+            "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 0,
+            "max_position_embeddings": 16,
+            "rope_theta": 10000.0,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 1.0,
+                "original_max_position_embeddings": 16,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            },
+            "rms_norm_eps": 1.0e-6,
+            "initializer_range": 0.02,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        }"#,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -300,6 +492,73 @@ mod tests {
             0.25 * (2.0 * e0_t0) + 0.5 * (0.5 * e1_t0),
             -e1_t1,
             0.5 * e1_t1,
+        ];
+
+        for (idx, got) in out_host.iter().enumerate() {
+            assert!(
+                (got.to_f32() - expected[idx]).abs() < 0.05,
+                "idx={idx} expected={} got={}",
+                expected[idx],
+                got.to_f32()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn moe_forward_routed_computes_gate_routes_and_localizes_ep() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let config = tiny_config();
+        let ep = ExpertGroup::new(0, 2, config.n_routed_experts)?;
+        let hidden = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 0.0, 0.0, 2.0]))?,
+            hidden_dim: 2,
+            seq_len: 2,
+        };
+        let expert0 = DeepseekV4Expert {
+            w1: DeviceMatrix::from_host(&ctx, &bf16_vec(&[1.0, 0.0]), 1, 2)?,
+            w2: DeviceMatrix::from_host(&ctx, &bf16_vec(&[1.0, 2.0]), 2, 1)?,
+            w3: DeviceMatrix::from_host(&ctx, &bf16_vec(&[1.0, 0.0]), 1, 2)?,
+        };
+        let expert1 = DeepseekV4Expert {
+            w1: DeviceMatrix::from_host(&ctx, &bf16_vec(&[0.0, 1.0]), 1, 2)?,
+            w2: DeviceMatrix::from_host(&ctx, &bf16_vec(&[-1.0, 0.5]), 2, 1)?,
+            w3: DeviceMatrix::from_host(&ctx, &bf16_vec(&[0.0, 1.0]), 1, 2)?,
+        };
+        let block = DeepseekV4MoeBlock {
+            gate_weight: DeviceMatrix::from_host(
+                &ctx,
+                &bf16_vec(&[
+                    1.0, 0.0, //
+                    0.0, 1.0, //
+                    -1.0, 0.0, //
+                    0.0, -1.0,
+                ]),
+                4,
+                2,
+            )?,
+            gate_bias: Some(DeviceVec::from_host(
+                &ctx,
+                &bf16_vec(&[0.0, 0.0, 0.0, 0.0]),
+            )?),
+            gate_tid2eid: None,
+            experts: vec![expert0, expert1],
+            shared_experts: None,
+        };
+
+        let out = block.forward_routed(&ctx, 0, &config, &ep, &hidden, &[3, 4])?;
+        let out_host = ctx.stream.clone_dtoh(&out.data)?;
+        ctx.sync()?;
+
+        let token0_scores = config.router_scores_from_logits(&[1.0, 0.0, -1.0, 0.0])?;
+        let token1_scores = config.router_scores_from_logits(&[0.0, 2.0, 0.0, -2.0])?;
+        let e0_t0 = silu(1.0) * 1.0;
+        let e1_t1 = silu(2.0) * 2.0;
+        let expected = [
+            token0_scores[0] * e0_t0,
+            token0_scores[0] * (2.0 * e0_t0),
+            -token1_scores[1] * e1_t1,
+            token1_scores[1] * (0.5 * e1_t1),
         ];
 
         for (idx, got) in out_host.iter().enumerate() {
