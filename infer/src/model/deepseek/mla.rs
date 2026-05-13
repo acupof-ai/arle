@@ -18,7 +18,7 @@ use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
 pub(super) struct DeepseekV4Compressor {
     pub(super) wkv: DeviceMatrix,
     pub(super) wgate: DeviceMatrix,
-    pub(super) ape: DeviceVec,
+    pub(super) ape: DeviceMatrix,
     pub(super) norm: DeviceVec,
 }
 

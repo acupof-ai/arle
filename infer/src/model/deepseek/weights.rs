@@ -14,9 +14,11 @@ use super::config::DeepseekRuntimeConfig;
 #[cfg(feature = "cuda")]
 use super::load::load_dsv4_matrix_raw;
 #[cfg(feature = "cuda")]
-use super::mla::DeepseekV4Attention;
+use super::load::{load_dsv4_matrix_raw_sharded, load_dsv4_vec_bf16};
 #[cfg(feature = "cuda")]
-use super::mlp::DeepseekV4MoeBlock;
+use super::mla::{DeepseekV4Attention, DeepseekV4Compressor, DeepseekV4Indexer};
+#[cfg(feature = "cuda")]
+use super::mlp::{DeepseekV4Expert, DeepseekV4MoeBlock};
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 use deepseek_spec::DeepSeekV4Config;
@@ -29,6 +31,8 @@ use crate::deepseek_v4_reference::DeepseekV4ReferenceModel;
 #[cfg(feature = "cuda")]
 use crate::model::common;
 #[cfg(feature = "cuda")]
+use crate::tp::TpLoadContext;
+#[cfg(feature = "cuda")]
 use crate::weight_loader::load_tensor_1d;
 
 /// Hyper-connection tensors used by the V4 layer/head mixers.
@@ -36,7 +40,7 @@ use crate::weight_loader::load_tensor_1d;
 #[allow(dead_code)] // populated once the Phase 2A loader allocates tensors
 pub(super) struct DeepseekV4HyperConnection {
     pub(super) base: DeviceVec,
-    pub(super) mix_fn: DeviceVec,
+    pub(super) mix_fn: DeviceMatrix,
     pub(super) scale: DeviceVec,
 }
 
@@ -158,6 +162,11 @@ impl DeepseekModel {
         let mut model = Self::from_config(config)?;
         let real_reference = infer_real_reference_enabled()?;
         if real_reference {
+            if load_layer_weights_enabled()? {
+                let (mmaps, weight_map) = common::load_safetensors(path, false)?;
+                let shards = common::deserialize_shards(&mmaps)?;
+                model.load_layer_weights(&shards, &weight_map)?;
+            }
             model.reference = Some(DeepseekV4ReferenceModel::load(path)?);
             let summary = model.config.spec.attention_operator_summary();
             info!(
@@ -214,6 +223,9 @@ impl DeepseekModel {
         model.embed_tokens = Some(embed_tokens);
         model.lm_head = Some(lm_head);
         model.norm = Some(norm);
+        if load_layer_weights_enabled()? {
+            model.load_layer_weights(&shards, &weight_map)?;
+        }
 
         let summary = model.config.spec.attention_operator_summary();
         info!(
@@ -268,6 +280,216 @@ impl DeepseekModel {
         Ok(Some(self.reference_logits_to_device(logits)?))
     }
 
+    fn load_layer_weights(
+        &mut self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+    ) -> Result<()> {
+        if !self.layers.is_empty() {
+            return Ok(());
+        }
+        let mut layers = Vec::with_capacity(self.config.num_hidden_layers);
+        self.head_hc = Some(self.load_hyper_connection(
+            shards,
+            weight_map,
+            &self.config.spec.tensor_names().head_hc(),
+        )?);
+        for layer_idx in 0..self.config.num_hidden_layers {
+            let names = self.config.spec.layer_tensor_names(layer_idx);
+            layers.push(DeepseekLayer {
+                attn_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.attn_norm)?,
+                hc_attn: self.load_hyper_connection(shards, weight_map, &names.hc_attn)?,
+                attention: self.load_attention(shards, weight_map, &names.attn)?,
+                ffn_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.ffn_norm)?,
+                hc_ffn: self.load_hyper_connection(shards, weight_map, &names.hc_ffn)?,
+                ffn: self.load_moe_block(shards, weight_map, &names.ffn)?,
+            });
+        }
+        info!(
+            "DeepSeek V4 loaded GPU-resident layer weights: layers={} local_experts_per_layer={} tp_rank={}/{} ep_rank={}/{}",
+            layers.len(),
+            self.config.ep.experts_per_rank,
+            self.config.tp.rank,
+            self.config.tp.world_size,
+            self.config.ep.rank,
+            self.config.ep.world_size,
+        );
+        self.layers = layers;
+        Ok(())
+    }
+
+    fn load_hyper_connection(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        names: &deepseek_spec::DeepSeekV4HyperConnectionTensorNames,
+    ) -> Result<DeepseekV4HyperConnection> {
+        Ok(DeepseekV4HyperConnection {
+            base: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.base)?,
+            mix_fn: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.mix_fn)?,
+            scale: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.scale)?,
+        })
+    }
+
+    fn load_attention(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
+    ) -> Result<DeepseekV4Attention> {
+        Ok(DeepseekV4Attention {
+            wq_a: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.wq_a)?,
+            q_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.q_norm)?,
+            wq_b: self.load_tp_column_matrix(shards, weight_map, &names.wq_b)?,
+            wkv: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.wkv)?,
+            kv_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.kv_norm)?,
+            wo_a: self.load_tp_column_matrix(shards, weight_map, &names.wo_a)?,
+            wo_b: self.load_tp_row_matrix(shards, weight_map, &names.wo_b)?,
+            attn_sink: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.attn_sink)?,
+            compressor: names
+                .compressor
+                .as_ref()
+                .map(|compressor| self.load_compressor(shards, weight_map, compressor))
+                .transpose()?,
+            indexer: names
+                .indexer
+                .as_ref()
+                .map(|indexer| self.load_indexer(shards, weight_map, indexer))
+                .transpose()?,
+        })
+    }
+
+    fn load_compressor(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        names: &deepseek_spec::DeepSeekV4CompressorTensorNames,
+    ) -> Result<DeepseekV4Compressor> {
+        Ok(DeepseekV4Compressor {
+            wkv: self.load_tp_column_matrix(shards, weight_map, &names.wkv)?,
+            wgate: self.load_tp_column_matrix(shards, weight_map, &names.wgate)?,
+            ape: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.ape)?,
+            norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.norm)?,
+        })
+    }
+
+    fn load_indexer(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        names: &deepseek_spec::DeepSeekV4IndexerTensorNames,
+    ) -> Result<DeepseekV4Indexer> {
+        Ok(DeepseekV4Indexer {
+            wq_b: self.load_tp_column_matrix(shards, weight_map, &names.wq_b)?,
+            weights_proj: self.load_tp_column_matrix(shards, weight_map, &names.weights_proj)?,
+            compressor: self.load_compressor(shards, weight_map, &names.compressor)?,
+        })
+    }
+
+    fn load_moe_block(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        names: &deepseek_spec::DeepSeekV4MoeTensorNames,
+    ) -> Result<DeepseekV4MoeBlock> {
+        let mut experts = Vec::with_capacity(self.config.ep.experts_per_rank);
+        for expert_idx in self.config.ep.local_expert_range() {
+            let expert = names.expert(expert_idx);
+            experts.push(self.load_expert(shards, weight_map, &expert)?);
+        }
+        Ok(DeepseekV4MoeBlock {
+            gate_weight: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.gate_weight)?,
+            gate_bias: names
+                .gate_bias
+                .as_deref()
+                .map(|name| load_dsv4_vec_bf16(&self.ctx, shards, weight_map, name))
+                .transpose()?,
+            gate_tid2eid: None,
+            experts,
+            shared_experts: names
+                .shared_experts
+                .as_ref()
+                .map(|shared| self.load_expert(shards, weight_map, shared))
+                .transpose()?,
+        })
+    }
+
+    fn load_expert(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        names: &deepseek_spec::DeepSeekV4ExpertTensorNames,
+    ) -> Result<DeepseekV4Expert> {
+        Ok(DeepseekV4Expert {
+            w1: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.w1)?,
+            w2: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.w2)?,
+            w3: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.w3)?,
+        })
+    }
+
+    fn load_tp_column_matrix(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        if self.config.tp.is_single() {
+            return load_dsv4_matrix_raw(&self.ctx, shards, weight_map, name);
+        }
+        let rows = self.matrix_rows(shards, weight_map, name)?;
+        let tp = TpLoadContext::column(self.config.tp.rank, self.config.tp.world_size, rows)?;
+        load_dsv4_matrix_raw_sharded(&self.ctx, shards, weight_map, name, Some(&tp))
+    }
+
+    fn load_tp_row_matrix(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        if self.config.tp.is_single() {
+            return load_dsv4_matrix_raw(&self.ctx, shards, weight_map, name);
+        }
+        let cols = self.matrix_logical_cols(shards, weight_map, name)?;
+        let tp = TpLoadContext::row(self.config.tp.rank, self.config.tp.world_size, cols)?;
+        load_dsv4_matrix_raw_sharded(&self.ctx, shards, weight_map, name, Some(&tp))
+    }
+
+    fn matrix_rows(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        name: &str,
+    ) -> Result<usize> {
+        let tensor = deepseek_find_tensor(shards, weight_map, name)?;
+        ensure!(
+            tensor.shape().len() == 2,
+            "{name}: expected 2D tensor, got {:?}",
+            tensor.shape()
+        );
+        Ok(tensor.shape()[0])
+    }
+
+    fn matrix_logical_cols(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        name: &str,
+    ) -> Result<usize> {
+        let tensor = deepseek_find_tensor(shards, weight_map, name)?;
+        ensure!(
+            tensor.shape().len() == 2,
+            "{name}: expected 2D tensor, got {:?}",
+            tensor.shape()
+        );
+        let physical_cols = tensor.shape()[1];
+        Ok(if tensor.dtype() == safetensors::Dtype::I8 {
+            physical_cols * 2
+        } else {
+            physical_cols
+        })
+    }
+
     pub(super) fn compute_reference_logits_after_decode(
         &self,
         token: u32,
@@ -302,4 +524,31 @@ fn infer_real_reference_enabled() -> Result<bool> {
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_INFER_REAL_REFERENCE value `{raw}`"),
     }
+}
+
+fn load_layer_weights_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_LOAD_LAYER_WEIGHTS").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_LOAD_LAYER_WEIGHTS value `{raw}`"),
+    }
+}
+
+fn deepseek_find_tensor<'data>(
+    shards: &[safetensors::SafeTensors<'data>],
+    weight_map: &std::collections::HashMap<String, usize>,
+    name: &str,
+) -> Result<safetensors::tensor::TensorView<'data>> {
+    let shard_idx = *weight_map
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("missing tensor {name}"))?;
+    let shard = shards
+        .get(shard_idx)
+        .ok_or_else(|| anyhow::anyhow!("tensor {name} points to missing shard {shard_idx}"))?;
+    shard
+        .tensor(name)
+        .map_err(|err| anyhow::anyhow!("loading tensor {name}: {err}"))
 }
