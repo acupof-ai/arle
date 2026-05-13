@@ -7,6 +7,8 @@ pub mod kv_quant;
 pub mod kv_turboquant;
 pub mod kv_types;
 #[cfg(feature = "cuda")]
+pub mod moe;
+#[cfg(feature = "cuda")]
 pub mod paged_kv;
 #[cfg(feature = "cuda")]
 pub mod prelude;
