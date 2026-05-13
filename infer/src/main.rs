@@ -8,8 +8,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use infer::backend::cuda::bootstrap::{
-    InferenceEngineOptions, ModelType, SchedulerRuntimeGuard, ServerRuntimeConfig,
-    detect_model_type, spawn_scheduler_handle_from_path,
+    DeepseekParallelConfig, InferenceEngineOptions, ModelType, SchedulerRuntimeGuard,
+    ServerRuntimeConfig, detect_model_type, spawn_scheduler_handle_from_path,
 };
 use infer::backend::cuda::tensor::{DeviceContext, with_device_ordinal_override};
 use infer::hf_hub;
@@ -17,7 +17,7 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{GenerationState, KVCacheDtype, KVFormat, ModelForward};
-use infer::request_handle::{NumaSchedulerRouter, NumaSchedulerWorker};
+use infer::request_handle::{DistributedSchedulerGroup, NumaSchedulerRouter, NumaSchedulerWorker};
 use infer::runtime_topology::{
     AffinityApplyResult, RuntimeTopology, WorkerPlacement, bind_process_to_placement,
     configured_cuda_worker_ordinals, sample_process_numa_maps,
@@ -295,6 +295,8 @@ fn main() {
             .unwrap_or_else(|err| panic!("DeepSeek distributed generate failed: {err:#}"));
         return;
     }
+    configure_deepseek_serving_env_if_needed(&args)
+        .unwrap_or_else(|err| panic!("DeepSeek serving env setup failed: {err:#}"));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -314,6 +316,84 @@ fn apply_quant_format_override(args: &Args) {
         }
         other => panic!("Invalid --quant-format '{other}': expected {VALID_QUANT_FORMATS}"),
     }
+}
+
+fn configure_deepseek_serving_env_if_needed(args: &Args) -> Result<()> {
+    let model_path = args
+        .model_path
+        .to_str()
+        .context("Model path must be valid UTF-8")?;
+    let resolved_model_path = hf_hub::resolve_model_path(model_path)
+        .with_context(|| format!("failed to resolve model path {model_path}"))?;
+    let resolved_model_path = resolved_model_path
+        .to_str()
+        .context("Resolved model path must be valid UTF-8")?
+        .to_string();
+    let model_type = detect_model_type(&resolved_model_path)?;
+    if !matches!(model_type, ModelType::DeepSeekV4) {
+        return Ok(());
+    }
+
+    let runtime =
+        infer::model::deepseek::DeepseekRuntimeConfig::from_model_dir(&resolved_model_path)?;
+    let layers = args
+        .deepseek_distributed_layers
+        .unwrap_or(runtime.num_hidden_layers);
+    if layers == 0 || layers > runtime.num_hidden_layers {
+        bail!(
+            "--deepseek-distributed-layers must be in 1..={}, got {}",
+            runtime.num_hidden_layers,
+            layers
+        );
+    }
+    let world_size = configured_cuda_worker_ordinals()
+        .map_err(|err| anyhow::anyhow!("invalid CUDA workers: {err}"))?
+        .len();
+    if world_size == 0 {
+        bail!("at least one CUDA ordinal is required");
+    }
+    if world_size > 1 && runtime.o_groups != world_size {
+        bail!(
+            "DeepSeek V4 HTTP distributed path maps TP ranks to O-LoRA groups; configured ranks={} but o_groups={}",
+            world_size,
+            runtime.o_groups
+        );
+    }
+    if world_size > 1 && !runtime.n_routed_experts.is_multiple_of(world_size) {
+        bail!(
+            "DeepSeek V4 n_routed_experts={} must be divisible by ranks={}",
+            runtime.n_routed_experts,
+            world_size
+        );
+    }
+
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("reserve NCCL rendezvous TCP port")?;
+    let port = listener
+        .local_addr()
+        .context("read NCCL rendezvous TCP port")?
+        .port();
+    drop(listener);
+
+    // SAFETY: this runs before the Tokio runtime and before CUDA scheduler
+    // worker threads are spawned. NCCL EnvBootstrap reads MASTER_* during
+    // model construction on each rank.
+    unsafe {
+        if world_size > 1 {
+            std::env::set_var("MASTER_ADDR", "127.0.0.1");
+            std::env::set_var("MASTER_PORT", port.to_string());
+            std::env::set_var("WORLD_SIZE", world_size.to_string());
+        }
+        std::env::set_var("ARLE_DSV4_LOAD_LAYER_WEIGHTS", "1");
+        std::env::set_var("ARLE_DSV4_GPU_FULL_LAYERS", layers.to_string());
+        std::env::set_var("ARLE_DSV4_GPU_CONTEXT_TOKENS", "1");
+        std::env::set_var("ARLE_DSV4_INFER_REAL_REFERENCE", "0");
+    }
+    info!(
+        "DeepSeek V4 serving distributed env: ranks={} gpu_layers={} model={}",
+        world_size, layers, resolved_model_path
+    );
+    Ok(())
 }
 
 fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
@@ -769,6 +849,7 @@ fn shutdown_started_workers(workers: Vec<StartedCudaWorker>) {
 fn spawn_cuda_worker_group(
     model_path: &str,
     args: &Args,
+    model_type: ModelType,
     num_slots: usize,
     kv_cache_dtype: KVCacheDtype,
     kv_pool_format: KVFormat,
@@ -776,8 +857,9 @@ fn spawn_cuda_worker_group(
     single_worker_pre_model_free_bytes: Option<usize>,
     metrics: &infer::metrics::ServerMetrics,
 ) -> anyhow::Result<Vec<StartedCudaWorker>> {
-    let mut started = Vec::with_capacity(workers.len());
-    for worker in workers {
+    let world_size = workers.len();
+    let mut planned = Vec::with_capacity(workers.len());
+    for (rank, worker) in workers.iter().enumerate() {
         let runtime = ServerRuntimeConfig {
             engine: InferenceEngineOptions {
                 enable_cuda_graph: args.cuda_graph && !args.disable_cuda_graph,
@@ -796,30 +878,84 @@ fn spawn_cuda_worker_group(
                 .flatten(),
             worker_placement: Some(worker.placement.clone()),
             cuda_device_ordinal: Some(worker.cuda_ordinal as u32),
+            deepseek_parallel: (matches!(model_type, ModelType::DeepSeekV4) && world_size > 1)
+                .then_some(DeepseekParallelConfig { rank, world_size }),
         };
+        planned.push((rank, worker.clone(), runtime));
+    }
 
-        match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
-            Ok((handle, guard)) => {
-                started.push(StartedCudaWorker {
-                    handle,
-                    guard,
-                    placement: worker.placement.clone(),
-                });
-            }
-            Err(err) => {
-                shutdown_started_workers(started);
-                return Err(err).with_context(|| {
-                    format!(
-                        "worker={} cuda_ordinal={} gpu={}",
-                        worker.placement.worker_id,
-                        worker.cuda_ordinal,
-                        worker.placement.gpu_ordinal
-                    )
-                });
+    if world_size <= 1 {
+        let mut started = Vec::with_capacity(planned.len());
+        for (_, worker, runtime) in planned {
+            match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
+                Ok((handle, guard)) => {
+                    started.push(StartedCudaWorker {
+                        handle,
+                        guard,
+                        placement: worker.placement.clone(),
+                    });
+                }
+                Err(err) => {
+                    shutdown_started_workers(started);
+                    return Err(err).with_context(|| {
+                        format!(
+                            "worker={} cuda_ordinal={} gpu={}",
+                            worker.placement.worker_id,
+                            worker.cuda_ordinal,
+                            worker.placement.gpu_ordinal
+                        )
+                    });
+                }
             }
         }
+        return Ok(started);
     }
-    Ok(started)
+
+    let mut load_threads = Vec::with_capacity(planned.len());
+    for (rank, worker, runtime) in planned {
+        let model_path = model_path.to_string();
+        let metrics = metrics.clone();
+        load_threads.push(std::thread::spawn(
+            move || -> (usize, anyhow::Result<StartedCudaWorker>) {
+                let result = spawn_scheduler_handle_from_path(&model_path, runtime, metrics)
+                    .map(|(handle, guard)| StartedCudaWorker {
+                        handle,
+                        guard,
+                        placement: worker.placement.clone(),
+                    })
+                    .with_context(|| {
+                        format!(
+                            "worker={} cuda_ordinal={} gpu={}",
+                            worker.placement.worker_id,
+                            worker.cuda_ordinal,
+                            worker.placement.gpu_ordinal
+                        )
+                    });
+                (rank, result)
+            },
+        ));
+    }
+
+    let mut started_by_rank = (0..world_size).map(|_| None).collect::<Vec<_>>();
+    let mut first_err = None;
+    for thread in load_threads {
+        let (rank, result) = thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("CUDA worker loader thread panicked"))?;
+        match result {
+            Ok(worker) => started_by_rank[rank] = Some(worker),
+            Err(err) if first_err.is_none() => first_err = Some(err),
+            Err(_) => {}
+        }
+    }
+    if let Some(err) = first_err {
+        shutdown_started_workers(started_by_rank.into_iter().flatten().collect());
+        return Err(err);
+    }
+    Ok(started_by_rank
+        .into_iter()
+        .map(|worker| worker.expect("all ranks loaded successfully"))
+        .collect())
 }
 
 async fn async_main(args: Args) {
@@ -945,6 +1081,7 @@ async fn async_main(args: Args) {
         match spawn_cuda_worker_group(
             model_path,
             &args,
+            model_type,
             num_slots,
             kv_cache_dtype,
             kv_pool_format,
@@ -1042,13 +1179,25 @@ async fn async_main(args: Args) {
             placement: worker.placement.clone(),
         })
         .collect::<Vec<_>>();
-    let routed_handle = Arc::new(NumaSchedulerRouter::new(
-        runtime_topology.clone(),
-        router_workers,
-        metrics.clone(),
-    ));
+    let request_handle: Arc<dyn infer::request_handle::RequestHandle> =
+        if matches!(model_type, ModelType::DeepSeekV4) && scheduler_workers.len() > 1 {
+            info!(
+                "Using DeepSeek distributed scheduler group: ranks={}",
+                scheduler_workers.len()
+            );
+            Arc::new(DistributedSchedulerGroup::new(
+                router_workers,
+                metrics.clone(),
+            ))
+        } else {
+            Arc::new(NumaSchedulerRouter::new(
+                runtime_topology.clone(),
+                router_workers,
+                metrics.clone(),
+            ))
+        };
     let app = build_app_with_config(
-        routed_handle.clone(),
+        request_handle.clone(),
         metrics,
         HttpServerConfig {
             train_control_target,
@@ -1076,7 +1225,7 @@ async fn async_main(args: Args) {
 
     // Drop the last submission handle before joining the scheduler thread so
     // request_rx disconnects and the scheduler can unwind its CUDA resources.
-    drop(routed_handle);
+    drop(request_handle);
     drop(primary_handle);
     shutdown_started_workers(scheduler_workers);
 
