@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::fmt;
 
 use crate::scheduler::{IncomingRequest, SchedulerHandle};
+use crate::server_engine::CompletionStreamDelta;
 
 /// Error returned when a request cannot be submitted to a runtime handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +88,13 @@ pub struct NumaSchedulerRouter {
     metrics: crate::metrics::ServerMetrics,
     session_routes: Mutex<HashMap<crate::types::SessionId, usize>>,
     rebalance_threshold: usize,
+}
+
+pub struct DistributedSchedulerGroup {
+    workers: Vec<NumaSchedulerWorker>,
+    model_id: Arc<str>,
+    tokenizer: Option<crate::tokenizer::Tokenizer>,
+    metrics: crate::metrics::ServerMetrics,
 }
 
 impl NumaSchedulerRouter {
@@ -204,6 +212,54 @@ impl NumaSchedulerRouter {
     }
 }
 
+impl DistributedSchedulerGroup {
+    pub fn new(workers: Vec<NumaSchedulerWorker>, metrics: crate::metrics::ServerMetrics) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "distributed scheduler group requires at least one worker"
+        );
+        let model_id = Arc::from(workers[0].handle.model_id());
+        let tokenizer = workers[0].handle.tokenizer_clone();
+        Self {
+            workers,
+            model_id,
+            tokenizer,
+            metrics,
+        }
+    }
+
+    fn clone_request_for_rank(
+        req: &IncomingRequest,
+        delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+    ) -> IncomingRequest {
+        IncomingRequest {
+            prompt: req.prompt.clone(),
+            prompt_tokens: req.prompt_tokens.clone(),
+            max_tokens: req.max_tokens,
+            sampling: req.sampling.clone(),
+            stop: req.stop.clone(),
+            speculative: req.speculative.clone(),
+            priority: req.priority,
+            session_id: req.session_id.clone(),
+            ingress_numa_node: req.ingress_numa_node,
+            delta_tx,
+            trace_context: req.trace_context,
+        }
+    }
+
+    fn spawn_rank_delta_drain(mut rx: tokio::sync::mpsc::UnboundedReceiver<CompletionStreamDelta>) {
+        let _ = std::thread::Builder::new()
+            .name("infer-distributed-rank-drain".to_string())
+            .spawn(move || {
+                while let Some(delta) = rx.blocking_recv() {
+                    if delta.finish_reason.is_some() {
+                        break;
+                    }
+                }
+            });
+    }
+}
+
 fn locality(worker_numa: Option<i32>, ingress_numa: Option<i32>) -> Option<bool> {
     match (worker_numa, ingress_numa) {
         (Some(worker), Some(ingress)) => Some(worker == ingress),
@@ -237,6 +293,45 @@ impl RequestHandle for NumaSchedulerRouter {
             }
         }
         Err(SubmitError)
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn tokenizer_clone(&self) -> Option<crate::tokenizer::Tokenizer> {
+        self.tokenizer.clone()
+    }
+
+    fn server_metrics(&self) -> Option<&crate::metrics::ServerMetrics> {
+        Some(&self.metrics)
+    }
+}
+
+impl RequestHandle for DistributedSchedulerGroup {
+    fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+        let mut permits = Vec::with_capacity(self.workers.len());
+        for worker in &self.workers {
+            let permit = worker
+                .handle
+                .reserve_submission()
+                .map_err(|_| SubmitError)?;
+            permits.push(permit);
+        }
+
+        let mut requests = Vec::with_capacity(self.workers.len());
+        requests.push(req);
+        for _ in 1..self.workers.len() {
+            let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel();
+            let rank_req = Self::clone_request_for_rank(&requests[0], sink_tx);
+            Self::spawn_rank_delta_drain(sink_rx);
+            requests.push(rank_req);
+        }
+
+        for (permit, rank_req) in permits.into_iter().zip(requests) {
+            permit.submit(rank_req).map_err(|_| SubmitError)?;
+        }
+        Ok(())
     }
 
     fn model_id(&self) -> &str {
@@ -424,5 +519,52 @@ mod tests {
         router.submit(test_request(None, Some(0))).unwrap();
         assert_eq!(rx0.try_recv().unwrap().ingress_numa_node, Some(0));
         assert_eq!(rx1.try_recv().unwrap().ingress_numa_node, Some(0));
+    }
+
+    #[test]
+    fn distributed_group_fans_out_and_keeps_rank0_stream() {
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let worker0 = SchedulerHandle::from_parts(tx0, "model");
+        let worker1 = SchedulerHandle::from_parts(tx1, "model");
+        let group = DistributedSchedulerGroup::new(
+            vec![
+                NumaSchedulerWorker {
+                    handle: worker0,
+                    placement: placement(0, 0),
+                },
+                NumaSchedulerWorker {
+                    handle: worker1,
+                    placement: placement(1, 1),
+                },
+            ],
+            crate::metrics::ServerMetrics::new("model"),
+        );
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let mut req = test_request(None, Some(0));
+        req.delta_tx = client_tx;
+
+        group.submit(req).unwrap();
+        let rank0 = rx0.try_recv().unwrap();
+        let rank1 = rx1.try_recv().unwrap();
+        assert_eq!(rank0.prompt_tokens, rank1.prompt_tokens);
+        rank0
+            .delta_tx
+            .send(CompletionStreamDelta::text("rank0".to_string()))
+            .unwrap();
+        assert_eq!(
+            client_rx.try_recv().unwrap().text_delta,
+            "rank0".to_string()
+        );
+        rank1
+            .delta_tx
+            .send(CompletionStreamDelta {
+                text_delta: String::new(),
+                finish_reason: Some(crate::server_engine::FinishReason::Length),
+                usage: None,
+                logprob: None,
+                token_ids: Vec::new(),
+            })
+            .unwrap();
     }
 }

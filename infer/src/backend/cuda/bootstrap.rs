@@ -72,6 +72,13 @@ impl Default for InferenceEngineOptions {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeepseekParallelConfig {
+    pub rank: usize,
+    pub world_size: usize,
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug)]
 pub struct ServerRuntimeConfig {
     pub engine: InferenceEngineOptions,
@@ -100,6 +107,10 @@ pub struct ServerRuntimeConfig {
     /// every `DeviceContext::new()` during model load and scheduler runtime
     /// resolves to this ordinal without mutating process-global env vars.
     pub cuda_device_ordinal: Option<u32>,
+    /// Explicit DeepSeek V4 TP/EP placement for this CUDA worker. This avoids
+    /// process-global rank env races when the HTTP server creates one scheduler
+    /// thread per rank inside a single process.
+    pub deepseek_parallel: Option<DeepseekParallelConfig>,
 }
 
 #[cfg(feature = "cuda")]
@@ -116,6 +127,7 @@ impl Default for ServerRuntimeConfig {
             pre_model_free_bytes: None,
             worker_placement: None,
             cuda_device_ordinal: None,
+            deepseek_parallel: None,
         }
     }
 }
@@ -235,10 +247,19 @@ pub fn load_qwen35_moe_components(
 pub fn load_deepseek_v4_components(
     model_path: &str,
     options: InferenceEngineOptions,
+    parallel: Option<DeepseekParallelConfig>,
 ) -> Result<ModelComponents<DeepseekModel>> {
     load_model_with(model_path, options, |model_path, options| {
         let mut runtime = DeepseekRuntimeConfig::from_model_dir(model_path)?;
         runtime.enable_cuda_graph = options.enable_cuda_graph;
+        if let Some(parallel) = parallel {
+            runtime.tp = crate::tensor_parallel::TpConfig::new(parallel.world_size, parallel.rank)?;
+            runtime.ep = crate::distributed::expert_state::ExpertGroup::new(
+                parallel.rank,
+                parallel.world_size,
+                runtime.spec.n_routed_experts,
+            )?;
+        }
         DeepseekModel::from_safetensors(model_path, runtime)
     })
 }
@@ -247,6 +268,7 @@ pub fn load_deepseek_v4_components(
 pub fn load_model_components(
     model_path: &str,
     options: InferenceEngineOptions,
+    deepseek_parallel: Option<DeepseekParallelConfig>,
 ) -> Result<LoadedModelComponents> {
     match detect_model_type(model_path)? {
         ModelType::Qwen3 => Ok(LoadedModelComponents::Qwen3(load_qwen3_components(
@@ -259,7 +281,7 @@ pub fn load_model_components(
             load_qwen35_moe_components(model_path, options)?,
         )),
         ModelType::DeepSeekV4 => Ok(LoadedModelComponents::DeepSeekV4(
-            load_deepseek_v4_components(model_path, options)?,
+            load_deepseek_v4_components(model_path, options, deepseek_parallel)?,
         )),
     }
 }
@@ -305,6 +327,7 @@ fn spawn_scheduler_handle_from_path_inner(
     mut runtime: ServerRuntimeConfig,
     metrics: crate::metrics::ServerMetrics,
 ) -> Result<(SchedulerHandle, SchedulerRuntimeGuard)> {
+    let deepseek_parallel = runtime.deepseek_parallel;
     if let Some(placement) = runtime.worker_placement.as_ref() {
         let affinity = crate::runtime_topology::bind_current_thread_to_placement(
             placement,
@@ -360,7 +383,7 @@ fn spawn_scheduler_handle_from_path_inner(
                 .unwrap_or_else(|| "n/a".to_string()),
         );
     }
-    let components = load_model_components(model_path, runtime.engine)?;
+    let components = load_model_components(model_path, runtime.engine, deepseek_parallel)?;
     if let Ok((free, total)) = crate::backend::cuda::tensor::DeviceContext::gpu_memory_info() {
         info!(
             "GPU memory @ post_model_load: free={:.2} GB / total={:.2} GB",
