@@ -417,12 +417,15 @@ impl DeepseekModel {
         let compress_ratio = *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
             anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
         })?;
-        ensure!(
-            compress_ratio == 0,
-            "DeepSeek V4 GPU attention currently supports sliding-window layers only; layer {} has compress_ratio {}",
-            layer_idx,
-            compress_ratio
-        );
+        if compress_ratio > 0 {
+            ensure!(
+                hidden.seq_len <= compress_ratio,
+                "DeepSeek V4 GPU attention layer {} needs compressed blocks for seq_len {} > compress_ratio {}; compressed CSA/HCA blocks are not wired yet",
+                layer_idx,
+                hidden.seq_len,
+                compress_ratio
+            );
+        }
         ensure!(
             hidden.hidden_dim == self.config.hidden_size,
             "DeepSeek V4 attention hidden dim {} does not match hidden_size {}",
@@ -1808,6 +1811,50 @@ mod tests {
             indexer: None,
         };
         let mut config = DeepseekRuntimeConfig::from_spec(tiny_config());
+        config.ep = ExpertGroup::new(0, 1, 1)?;
+        let model = DeepseekModel {
+            config,
+            ctx,
+            embed_tokens: None,
+            lm_head: None,
+            norm: None,
+            head_hc: None,
+            layers: Vec::new(),
+            reference: None,
+        };
+
+        let out = model.forward_sliding_window_attention(0, &attention, &hidden)?;
+        let host = model.ctx.stream.clone_dtoh(&out.data)?;
+        model.ctx.sync()?;
+        let got = host.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+        let expected = 1.0_f32.exp() / (1.0_f32.exp() + 1.0);
+        assert_close(got[0], expected, 0.01);
+        assert_close(got[1], expected, 0.01);
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_attention_short_sequence_uses_local_window_only() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 2.0]))?,
+            hidden_dim: 2,
+            seq_len: 1,
+        };
+        let attention = DeepseekV4Attention {
+            wq_a: matrix(&ctx, &[1.0, 0.0], 1, 2)?,
+            q_norm: vec(&ctx, &[1.0])?,
+            wq_b: matrix(&ctx, &[1.0], 1, 1)?,
+            wkv: matrix(&ctx, &[0.0, 1.0], 1, 2)?,
+            kv_norm: vec(&ctx, &[1.0])?,
+            wo_a: matrix(&ctx, &[1.0], 1, 1)?,
+            wo_b: matrix(&ctx, &[1.0, 1.0], 2, 1)?,
+            attn_sink: vec(&ctx, &[0.0])?,
+            compressor: None,
+            indexer: None,
+        };
+        let mut config = DeepseekRuntimeConfig::from_spec(tiny_config());
+        config.spec.compress_ratios[0] = 4;
         config.ep = ExpertGroup::new(0, 1, 1)?;
         let model = DeepseekModel {
             config,
