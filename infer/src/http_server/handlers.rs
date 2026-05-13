@@ -16,7 +16,10 @@ use axum::http::{HeaderMap, Method, header};
 use axum::middleware;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use chat::openai_messages_to_prompt as chat_messages_to_prompt;
+use chat::{
+    DeepSeekV4ChatTemplateOptions, openai_messages_to_deepseek_v4_prompt,
+    openai_messages_to_prompt as chat_messages_to_prompt,
+};
 use fastrace::Span;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
@@ -395,6 +398,24 @@ fn authorize_v1_request(headers: &HeaderMap, state: &AppState) -> Result<(), Api
     authorize_headers(headers, state.config.api_key.as_deref())
 }
 
+fn is_deepseek_v4_model(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase().replace(['_', '-'], "");
+    normalized.contains("deepseekv4") || normalized.contains("dsv4")
+}
+
+fn build_chat_prompt(model_id: &str, req: &ChatCompletionRequest) -> String {
+    if is_deepseek_v4_model(model_id) {
+        let kwargs = req.chat_template_kwargs.as_ref();
+        let options = DeepSeekV4ChatTemplateOptions {
+            thinking: kwargs.and_then(|value| value.thinking).unwrap_or(false),
+            reasoning_effort: kwargs.and_then(|value| value.reasoning_effort.clone()),
+        };
+        openai_messages_to_deepseek_v4_prompt(&req.messages, &req.tools, &options)
+    } else {
+        chat_messages_to_prompt(&req.messages, &req.tools)
+    }
+}
+
 fn build_responses_prompt(req: &ResponsesRequest) -> String {
     let mut messages = Vec::new();
     if let Some(instructions) = req.instructions.as_deref() {
@@ -715,8 +736,7 @@ pub(super) async fn chat_completions(
         let include_usage = options.include_usage;
         let continuous_usage_stats = options.continuous_usage_stats;
 
-        // Convert messages → ChatML prompt.
-        let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
+        let prompt = build_chat_prompt(&model_id, &req);
 
         info!(
             "chat/completions: messages={}, prompt_bytes={}, max_tokens={}, stream={}",

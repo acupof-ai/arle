@@ -845,6 +845,16 @@ pub(super) struct ResponseFormat {
     pub(super) json_schema: Option<serde_json::Value>,
 }
 
+/// vLLM-compatible chat-template controls. DeepSeek-V4 uses these to select
+/// non-thinking, Think High, or Think Max prompt prefixes.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(super) struct ChatTemplateKwargs {
+    #[serde(default)]
+    pub(super) thinking: Option<bool>,
+    #[serde(default)]
+    pub(super) reasoning_effort: Option<String>,
+}
+
 // ============================================================================
 // /v1/chat/completions — request
 // ============================================================================
@@ -883,6 +893,9 @@ pub(super) struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub(super) response_format: Option<ResponseFormat>,
+    /// Model-specific prompt rendering options. Currently used by DeepSeek-V4.
+    #[serde(default)]
+    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Optional client-supplied session/conversation identifier.
     ///
     /// See [`CompletionRequest::session_id`] for the routing contract.
@@ -924,6 +937,17 @@ impl ChatCompletionRequest {
             return Err(invalid_parameter(
                 "stream",
                 "stream=true is not supported when tools are present; use non-streaming chat completions for tool calls",
+            ));
+        }
+        if let Some(effort) = self
+            .chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.reasoning_effort.as_deref())
+            && !matches!(effort, "high" | "max")
+        {
+            return Err(invalid_parameter(
+                "chat_template_kwargs.reasoning_effort",
+                "must be `high` or `max` when provided",
             ));
         }
         Ok(())

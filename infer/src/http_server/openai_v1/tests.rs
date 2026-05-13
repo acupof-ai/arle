@@ -116,6 +116,36 @@ fn chat_completion_request_accepts_speculative_override() {
 }
 
 #[test]
+fn chat_completion_request_accepts_chat_template_kwargs() {
+    let raw = r#"{
+        "messages":[{"role":"user","content":"hi"}],
+        "chat_template_kwargs":{"thinking":true,"reasoning_effort":"max"}
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    req.validate().unwrap();
+    let kwargs = req.chat_template_kwargs.as_ref().unwrap();
+    assert_eq!(kwargs.thinking, Some(true));
+    assert_eq!(kwargs.reasoning_effort.as_deref(), Some("max"));
+}
+
+#[test]
+fn chat_completion_request_rejects_invalid_reasoning_effort() {
+    let raw = r#"{
+        "messages":[{"role":"user","content":"hi"}],
+        "chat_template_kwargs":{"thinking":true,"reasoning_effort":"medium"}
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    let err = req
+        .validate()
+        .expect_err("unsupported reasoning_effort should fail");
+    assert_eq!(err.body.code, "invalid_parameter");
+    assert_eq!(
+        err.body.param.as_deref(),
+        Some("chat_template_kwargs.reasoning_effort")
+    );
+}
+
+#[test]
 fn responses_request_accepts_string_input_and_user_alias() {
     let raw = r#"{"input":"hi","user":"agent-7"}"#;
     let req: ResponsesRequest = serde_json::from_str(raw).unwrap();
