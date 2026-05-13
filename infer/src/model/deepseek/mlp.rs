@@ -109,6 +109,22 @@ impl DeepseekV4MoeBlock {
         routing: &LocalExpertRouting,
         swiglu_limit: f32,
     ) -> Result<HiddenStates> {
+        let routed = self.forward_local_routed_only(ctx, hidden, routing, swiglu_limit)?;
+        self.add_shared_expert(ctx, hidden, routed, swiglu_limit)
+    }
+
+    /// Run only this EP rank's routed expert contribution.
+    ///
+    /// The shared expert is intentionally excluded so callers can all-reduce
+    /// routed expert outputs across EP ranks and then add the shared expert
+    /// exactly once per rank.
+    pub(super) fn forward_local_routed_only(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &HiddenStates,
+        routing: &LocalExpertRouting,
+        swiglu_limit: f32,
+    ) -> Result<HiddenStates> {
         ensure!(
             routing.experts_per_rank == self.experts.len(),
             "DeepSeek V4 routing expects {} local experts but block loaded {}",
@@ -116,11 +132,7 @@ impl DeepseekV4MoeBlock {
             self.experts.len()
         );
 
-        let mut out = if let Some(shared) = &self.shared_experts {
-            shared.forward(ctx, hidden, swiglu_limit)?
-        } else {
-            HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?
-        };
+        let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
 
         for route in &routing.routes {
             ensure!(
@@ -144,6 +156,20 @@ impl DeepseekV4MoeBlock {
         Ok(out)
     }
 
+    pub(super) fn add_shared_expert(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &HiddenStates,
+        routed: HiddenStates,
+        swiglu_limit: f32,
+    ) -> Result<HiddenStates> {
+        let Some(shared) = &self.shared_experts else {
+            return Ok(routed);
+        };
+        let shared = shared.forward(ctx, hidden, swiglu_limit)?;
+        ops::add_batch(ctx, &routed, &shared)
+    }
+
     /// Route tokens with the loaded gate tensors, localize routes to this EP
     /// rank, and run the local MoE contribution.
     pub(super) fn forward_routed(
@@ -157,6 +183,18 @@ impl DeepseekV4MoeBlock {
     ) -> Result<HiddenStates> {
         let routing = self.route_local(ctx, layer_idx, config, ep, hidden, token_ids)?;
         self.forward_local_routes(ctx, hidden, &routing, config.swiglu_limit)
+    }
+
+    pub(super) fn route_local_for_layer(
+        &self,
+        ctx: &DeviceContext,
+        layer_idx: usize,
+        config: &DeepSeekV4Config,
+        ep: &ExpertGroup,
+        hidden: &HiddenStates,
+        token_ids: &[u32],
+    ) -> Result<LocalExpertRouting> {
+        self.route_local(ctx, layer_idx, config, ep, hidden, token_ids)
     }
 
     fn route_local(

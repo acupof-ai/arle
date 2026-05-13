@@ -19,6 +19,7 @@ use crate::distributed::nccl::NcclGroup;
 pub enum LayerCollective {
     PostAttentionAllReduce,
     PostMlpAllReduce,
+    PostMoeExpertAllReduce,
     DpAttentionGather,
     DpAttentionScatter,
     CpAttentionSplit,
@@ -39,8 +40,12 @@ pub struct LayerCommunicator {
     dp_world_size: usize,
     cp_rank: usize,
     cp_world_size: usize,
+    ep_rank: usize,
+    ep_world_size: usize,
     #[cfg(feature = "nccl")]
     tp_nccl: Option<Arc<NcclGroup>>,
+    #[cfg(feature = "nccl")]
+    ep_nccl: Option<Arc<NcclGroup>>,
 }
 
 impl LayerCommunicator {
@@ -52,8 +57,12 @@ impl LayerCommunicator {
             dp_world_size: 1,
             cp_rank: 0,
             cp_world_size: 1,
+            ep_rank: 0,
+            ep_world_size: 1,
             #[cfg(feature = "nccl")]
             tp_nccl: None,
+            #[cfg(feature = "nccl")]
+            ep_nccl: None,
         }
     }
 
@@ -65,9 +74,33 @@ impl LayerCommunicator {
         cp_rank: usize,
         cp_world_size: usize,
     ) -> Result<Self> {
+        Self::new_with_ep(
+            tp_rank,
+            tp_world_size,
+            dp_rank,
+            dp_world_size,
+            cp_rank,
+            cp_world_size,
+            0,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_ep(
+        tp_rank: usize,
+        tp_world_size: usize,
+        dp_rank: usize,
+        dp_world_size: usize,
+        cp_rank: usize,
+        cp_world_size: usize,
+        ep_rank: usize,
+        ep_world_size: usize,
+    ) -> Result<Self> {
         validate_axis("tp", tp_rank, tp_world_size)?;
         validate_axis("dp", dp_rank, dp_world_size)?;
         validate_axis("cp", cp_rank, cp_world_size)?;
+        validate_axis("ep", ep_rank, ep_world_size)?;
         Ok(Self {
             tp_rank,
             tp_world_size,
@@ -75,8 +108,12 @@ impl LayerCommunicator {
             dp_world_size,
             cp_rank,
             cp_world_size,
+            ep_rank,
+            ep_world_size,
             #[cfg(feature = "nccl")]
             tp_nccl: None,
+            #[cfg(feature = "nccl")]
+            ep_nccl: None,
         })
     }
 
@@ -97,6 +134,26 @@ impl LayerCommunicator {
             );
         }
         self.tp_nccl = Some(nccl);
+        Ok(self)
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn with_ep_nccl(mut self, nccl: Arc<NcclGroup>) -> Result<Self> {
+        if self.ep_world_size != nccl.world_size {
+            bail!(
+                "LayerCommunicator EP world_size {} does not match NCCL world_size {}",
+                self.ep_world_size,
+                nccl.world_size
+            );
+        }
+        if self.ep_rank != nccl.rank {
+            bail!(
+                "LayerCommunicator EP rank {} does not match NCCL rank {}",
+                self.ep_rank,
+                nccl.rank
+            );
+        }
+        self.ep_nccl = Some(nccl);
         Ok(self)
     }
 
@@ -124,8 +181,19 @@ impl LayerCommunicator {
         self.cp_world_size
     }
 
+    pub fn ep_rank(&self) -> usize {
+        self.ep_rank
+    }
+
+    pub fn ep_world_size(&self) -> usize {
+        self.ep_world_size
+    }
+
     pub fn is_single_rank(&self) -> bool {
-        self.tp_world_size == 1 && self.dp_world_size == 1 && self.cp_world_size == 1
+        self.tp_world_size == 1
+            && self.dp_world_size == 1
+            && self.cp_world_size == 1
+            && self.ep_world_size == 1
     }
 
     pub fn post_attn_all_reduce<T>(&self, hidden: &mut [T]) -> Result<LayerCommStatus> {
@@ -144,13 +212,22 @@ impl LayerCommunicator {
         )
     }
 
+    pub fn post_moe_expert_all_reduce<T>(&self, hidden: &mut [T]) -> Result<LayerCommStatus> {
+        Self::ensure_noop(
+            LayerCollective::PostMoeExpertAllReduce,
+            self.ep_world_size,
+            hidden.len(),
+        )
+    }
+
     #[cfg(feature = "cuda")]
     pub fn post_attn_all_reduce_hidden_states(
         &self,
         hidden: &mut HiddenStates,
     ) -> Result<LayerCommStatus> {
-        self.all_reduce_tp_bf16(
+        self.all_reduce_bf16(
             LayerCollective::PostAttentionAllReduce,
+            ParallelAxis::Tensor,
             &mut hidden.data,
             hidden.hidden_dim.saturating_mul(hidden.seq_len),
         )
@@ -161,8 +238,22 @@ impl LayerCommunicator {
         &self,
         hidden: &mut HiddenStates,
     ) -> Result<LayerCommStatus> {
-        self.all_reduce_tp_bf16(
+        self.all_reduce_bf16(
             LayerCollective::PostMlpAllReduce,
+            ParallelAxis::Tensor,
+            &mut hidden.data,
+            hidden.hidden_dim.saturating_mul(hidden.seq_len),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn post_moe_expert_all_reduce_hidden_states(
+        &self,
+        hidden: &mut HiddenStates,
+    ) -> Result<LayerCommStatus> {
+        self.all_reduce_bf16(
+            LayerCollective::PostMoeExpertAllReduce,
+            ParallelAxis::Expert,
             &mut hidden.data,
             hidden.hidden_dim.saturating_mul(hidden.seq_len),
         )
@@ -185,8 +276,9 @@ impl LayerCommunicator {
         &self,
         hidden: &mut DeviceVec,
     ) -> Result<LayerCommStatus> {
-        self.all_reduce_tp_bf16(
+        self.all_reduce_bf16(
             LayerCollective::PostAttentionAllReduce,
+            ParallelAxis::Tensor,
             &mut hidden.data,
             hidden.len,
         )
@@ -197,8 +289,22 @@ impl LayerCommunicator {
         &self,
         hidden: &mut DeviceVec,
     ) -> Result<LayerCommStatus> {
-        self.all_reduce_tp_bf16(
+        self.all_reduce_bf16(
             LayerCollective::PostMlpAllReduce,
+            ParallelAxis::Tensor,
+            &mut hidden.data,
+            hidden.len,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn post_moe_expert_all_reduce_device_vec(
+        &self,
+        hidden: &mut DeviceVec,
+    ) -> Result<LayerCommStatus> {
+        self.all_reduce_bf16(
+            LayerCollective::PostMoeExpertAllReduce,
+            ParallelAxis::Expert,
             &mut hidden.data,
             hidden.len,
         )
@@ -285,9 +391,10 @@ impl LayerCommunicator {
     }
 
     #[cfg(feature = "cuda")]
-    fn all_reduce_tp_bf16(
+    fn all_reduce_bf16(
         &self,
         collective: LayerCollective,
+        axis: ParallelAxis,
         buffer: &mut cudarc::driver::CudaSlice<half::bf16>,
         len: usize,
     ) -> Result<LayerCommStatus> {
@@ -297,15 +404,23 @@ impl LayerCommunicator {
                 buffer.len()
             );
         }
-        if self.tp_world_size == 1 {
+        let world_size = match axis {
+            ParallelAxis::Tensor => self.tp_world_size,
+            ParallelAxis::Expert => self.ep_world_size,
+        };
+        if world_size == 1 {
             return Ok(LayerCommStatus::NoopSingleRank);
         }
         #[cfg(feature = "nccl")]
         {
-            let Some(nccl) = &self.tp_nccl else {
+            let nccl = match axis {
+                ParallelAxis::Tensor => self.tp_nccl.as_ref(),
+                ParallelAxis::Expert => self.ep_nccl.as_ref(),
+            };
+            let Some(nccl) = nccl else {
                 bail!(
-                    "{collective:?} requires TP NCCL backend for world_size={}",
-                    self.tp_world_size
+                    "{collective:?} requires {} NCCL backend for world_size={world_size}",
+                    axis.name()
                 );
             };
             nccl.all_reduce_bf16_in_place(buffer)?;
@@ -313,9 +428,26 @@ impl LayerCommunicator {
         }
         #[cfg(not(feature = "nccl"))]
         bail!(
-            "{collective:?} requires TP NCCL backend for world_size={}; build with --features nccl",
-            self.tp_world_size
+            "{collective:?} requires {} NCCL backend for world_size={world_size}; build with --features nccl",
+            axis.name()
         )
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum ParallelAxis {
+    Tensor,
+    Expert,
+}
+
+#[cfg(feature = "cuda")]
+impl ParallelAxis {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tensor => "TP",
+            Self::Expert => "EP",
+        }
     }
 }
 
