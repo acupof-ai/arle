@@ -142,7 +142,7 @@ impl HealthResponse {
     pub(super) fn live() -> Self {
         Self {
             status: "ok".to_string(),
-            service: "agent-infer".to_string(),
+            service: "arle".to_string(),
             model: None,
         }
     }
@@ -150,7 +150,7 @@ impl HealthResponse {
     pub(super) fn ready(model_id: &str) -> Self {
         Self {
             status: "ready".to_string(),
-            service: "agent-infer".to_string(),
+            service: "arle".to_string(),
             model: Some(model_id.to_string()),
         }
     }
