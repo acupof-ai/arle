@@ -1791,10 +1791,11 @@ fn build_rope_cache(seq: usize, dim: usize, base: f32) -> (Vec<f32>, Vec<f32>) {
             let value = pos as f32 * inv_freq[i];
             let c = value.cos();
             let s = value.sin();
-            cos[pos * dim + i] = c;
-            cos[pos * dim + i + half] = c;
-            sin[pos * dim + i] = s;
-            sin[pos * dim + i + half] = s;
+            let col = 2 * i;
+            cos[pos * dim + col] = c;
+            cos[pos * dim + col + 1] = c;
+            sin[pos * dim + col] = s;
+            sin[pos * dim + col + 1] = s;
         }
     }
     (cos, sin)
@@ -1802,13 +1803,21 @@ fn build_rope_cache(seq: usize, dim: usize, base: f32) -> (Vec<f32>, Vec<f32>) {
 
 #[cfg(feature = "cuda")]
 fn apply_partial_rope(row: &mut [f32], cos: &[f32], sin: &[f32], rope_dim: usize, sign: f32) {
+    if rope_dim == 0 {
+        return;
+    }
+    debug_assert!(row.len() >= rope_dim);
+    debug_assert!(cos.len() >= rope_dim && sin.len() >= rope_dim);
+    let start = row.len() - rope_dim;
     let half = rope_dim / 2;
     for i in 0..half {
-        let a = row[i];
-        let b = row[i + half];
-        let s = sign * sin[i];
-        row[i] = a * cos[i] - b * s;
-        row[i + half] = b * cos[i] + a * s;
+        let idx = start + 2 * i;
+        let a = row[idx];
+        let b = row[idx + 1];
+        let c = cos[2 * i];
+        let s = sign * sin[2 * i];
+        row[idx] = a * c - b * s;
+        row[idx + 1] = b * c + a * s;
     }
 }
 
@@ -1978,6 +1987,22 @@ mod tests {
             (got - expected).abs() <= tol,
             "expected {expected}, got {got}, tol {tol}"
         );
+    }
+
+    #[test]
+    fn partial_rope_rotates_tail_adjacent_pairs() {
+        let mut row = vec![10.0, 20.0, 1.0, 0.0, 0.0, 1.0];
+        let cos = vec![0.0, 0.0, 0.0, 0.0];
+        let sin = vec![1.0, 1.0, 1.0, 1.0];
+
+        apply_partial_rope(&mut row, &cos, &sin, 4, 1.0);
+
+        assert_eq!(row[0], 10.0);
+        assert_eq!(row[1], 20.0);
+        assert_close(row[2], 0.0, 1.0e-6);
+        assert_close(row[3], 1.0, 1.0e-6);
+        assert_close(row[4], -1.0, 1.0e-6);
+        assert_close(row[5], 0.0, 1.0e-6);
     }
 
     #[test]
