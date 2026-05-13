@@ -145,6 +145,19 @@ pub struct ServerMetrics {
     inner: Arc<MetricsInner>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixLookupDetail {
+    pub prompt_tokens: usize,
+    pub matched_prefix_tokens: usize,
+    pub reusable_tokens: usize,
+    pub lookup_latency_us: u64,
+    pub ready_on_gpu: bool,
+    pub direct_gpu_attach: bool,
+    pub staged: bool,
+    pub prefetch: bool,
+    pub recompute: bool,
+}
+
 fn ratio_ppm(numer: u64, denom: u64) -> u64 {
     if denom == 0 {
         return 0;
@@ -668,19 +681,18 @@ impl ServerMetrics {
 
     /// Record the scheduler admission-side prefix lookup decision without
     /// incrementing lookup counters that are already updated at request prefill.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_prefix_lookup_detail(
-        &self,
-        prompt_tokens: usize,
-        matched_prefix_tokens: usize,
-        reusable_tokens: usize,
-        lookup_latency_us: u64,
-        ready_on_gpu: bool,
-        direct_gpu_attach: bool,
-        staged: bool,
-        prefetch: bool,
-        recompute: bool,
-    ) {
+    pub fn record_prefix_lookup_detail(&self, detail: PrefixLookupDetail) {
+        let PrefixLookupDetail {
+            prompt_tokens,
+            matched_prefix_tokens,
+            reusable_tokens,
+            lookup_latency_us,
+            ready_on_gpu,
+            direct_gpu_attach,
+            staged,
+            prefetch,
+            recompute,
+        } = detail;
         let matched_prefix_tokens = matched_prefix_tokens.min(prompt_tokens);
         let reusable_tokens = reusable_tokens.min(prompt_tokens);
         self.inner
