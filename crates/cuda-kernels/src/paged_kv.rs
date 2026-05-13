@@ -166,6 +166,20 @@ fn compute_budget_breakdown(
 }
 
 impl TokenKVPool {
+    /// Return the budget bytes needed to allocate at least `token_count` logical
+    /// tokens for this pool shape and format.
+    pub fn budget_bytes_for_tokens(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        token_count: usize,
+        format: KVFormat,
+    ) -> usize {
+        let budget =
+            compute_budget_breakdown(num_layers, num_kv_heads, head_dim, 1, usize::MAX, format);
+        token_count.saturating_mul(budget.total_bytes_per_token)
+    }
+
     fn storage_bytes_per_token(&self) -> usize {
         let data_bytes = self.kv_dim * self.format.bytes_per_element() * 2;
         let scale_bytes = if self.format.has_scales() {
@@ -1846,7 +1860,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 16;
 
 #[cfg(test)]
 mod tests {
-    use super::{BudgetBreakdown, compute_budget_breakdown};
+    use super::{BudgetBreakdown, TokenKVPool, compute_budget_breakdown};
     use crate::KVFormat;
 
     #[test]
@@ -1876,6 +1890,15 @@ mod tests {
     fn budget_respects_slot_floor_when_budget_is_tiny() {
         let budget = compute_budget_breakdown(2, 8, 16, 32, 1, KVFormat::FP8E4M3);
         assert_eq!(budget.max_total_tokens, 32);
+    }
+
+    #[test]
+    fn explicit_token_budget_matches_pool_accounting() {
+        let tokens = 128;
+        let required = TokenKVPool::budget_bytes_for_tokens(43, 1, 512, tokens, KVFormat::FP8E4M3);
+        let budget = compute_budget_breakdown(43, 1, 512, 1, required, KVFormat::FP8E4M3);
+        assert!(budget.max_total_tokens >= tokens);
+        assert_eq!(required, tokens * budget.total_bytes_per_token);
     }
 
     #[cfg(feature = "cuda")]
