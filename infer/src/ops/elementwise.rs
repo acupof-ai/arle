@@ -84,6 +84,39 @@ pub(crate) fn silu_mul_batch_into(
     Ok(())
 }
 
+/// DeepSeek V4 SwiGLU: `silu(min(gate, limit)) * clamp(up, -limit, limit)`.
+pub(crate) fn dsv4_swiglu_clamped_batch_into(
+    ctx: &DeviceContext,
+    gate: &HiddenStates,
+    up: &HiddenStates,
+    out: &mut HiddenStates,
+    limit: f32,
+) -> Result<()> {
+    assert_eq!(gate.hidden_dim, up.hidden_dim);
+    assert_eq!(gate.seq_len, up.seq_len);
+    assert_eq!(out.hidden_dim, gate.hidden_dim);
+    assert_eq!(out.seq_len, gate.seq_len);
+
+    let n = gate.hidden_dim * gate.seq_len;
+    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::dsv4_swiglu_clamped_cuda(
+            g_ptr as *const ffi::Half,
+            u_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            limit,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
 /// Batched SiLU+mul from a fused gate-up buffer.
 ///
 /// `gate_up` stores each token row as `[gate, up]`, with

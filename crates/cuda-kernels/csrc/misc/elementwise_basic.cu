@@ -23,6 +23,14 @@ __device__ __forceinline__ __nv_bfloat16 silu_mul_one(__nv_bfloat16 gate,
   return __float2bfloat16(silu * u);
 }
 
+__device__ __forceinline__ __nv_bfloat16 dsv4_swiglu_one(
+    __nv_bfloat16 gate, __nv_bfloat16 up, float limit) {
+  float g = fminf(__bfloat162float(gate), limit);
+  float u = fminf(fmaxf(__bfloat162float(up), -limit), limit);
+  float silu = g / (1.0f + expf(-g));
+  return __float2bfloat16(silu * u);
+}
+
 __host__ __forceinline__ bool is_bf16x4_aligned(const void *ptr) {
   return (reinterpret_cast<uintptr_t>(ptr) & (sizeof(uint2) - 1)) == 0;
 }
@@ -90,6 +98,30 @@ extern "C" CUresult silu_mul_cuda(
         (const __nv_bfloat16 *)gate, (const __nv_bfloat16 *)up,
         (__nv_bfloat16 *)out, n);
   }
+  return (CUresult)cudaGetLastError();
+}
+
+__global__ void dsv4_swiglu_clamped_kernel(
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ up,
+    __nv_bfloat16 *__restrict__ out,
+    int n,
+    float limit) {
+  int idx = blockIdx.x * BASIC_BLOCK + threadIdx.x;
+  if (idx < n) {
+    out[idx] = dsv4_swiglu_one(gate[idx], up[idx], limit);
+  }
+}
+
+extern "C" CUresult dsv4_swiglu_clamped_cuda(
+    const uint16_t *gate, const uint16_t *up, uint16_t *out, int n,
+    float limit, CUstream stream) {
+  if (n <= 0) return CUDA_SUCCESS;
+  if (!(limit > 0.0f)) return CUDA_ERROR_INVALID_VALUE;
+  int grid = (n + BASIC_BLOCK - 1) / BASIC_BLOCK;
+  dsv4_swiglu_clamped_kernel<<<grid, BASIC_BLOCK, 0, (cudaStream_t)stream>>>(
+      (const __nv_bfloat16 *)gate, (const __nv_bfloat16 *)up,
+      (__nv_bfloat16 *)out, n, limit);
   return (CUresult)cudaGetLastError();
 }
 

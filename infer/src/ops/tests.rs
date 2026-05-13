@@ -426,6 +426,44 @@ fn test_silu_mul_batch_tail_and_in_place() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_swiglu_clamped_batch() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let hidden_dim = 5;
+    let seq_len = 2;
+    let limit = 2.0;
+    let gate_host = bf16_vec(&[-3.0, -1.0, 0.0, 1.0, 3.0, 2.5, -2.5, 0.5, 1.5, -0.5]);
+    let up_host = bf16_vec(&[-4.0, -2.0, 0.5, 3.0, 4.0, 1.0, -3.0, 2.5, -0.25, 0.75]);
+    let gate = HiddenStates {
+        data: ctx.stream.clone_htod(&gate_host)?,
+        hidden_dim,
+        seq_len,
+    };
+    let up = HiddenStates {
+        data: ctx.stream.clone_htod(&up_host)?,
+        hidden_dim,
+        seq_len,
+    };
+    let mut out = HiddenStates::zeros(&ctx, hidden_dim, seq_len)?;
+
+    dsv4_swiglu_clamped_batch_into(&ctx, &gate, &up, &mut out, limit)?;
+    let out_host = ctx.stream.clone_dtoh(&out.data)?;
+    ctx.sync()?;
+
+    for (idx, got) in out_host.iter().enumerate() {
+        let g = gate_host[idx].to_f32().min(limit);
+        let u = up_host[idx].to_f32().clamp(-limit, limit);
+        let expected = bf16::from_f32((g / (1.0 + (-g).exp())) * u).to_f32();
+        assert!(
+            (got.to_f32() - expected).abs() < 0.01,
+            "index {idx} expected {expected} got {}",
+            got.to_f32()
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_gpu_sample() -> Result<()> {
     let ctx = DeviceContext::new()?;
 
