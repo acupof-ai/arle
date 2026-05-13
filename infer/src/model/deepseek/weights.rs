@@ -591,7 +591,7 @@ impl DeepseekModel {
             rope_params.beta_fast,
             rope_params.beta_slow,
         );
-        let needs_compressed_blocks = compress_ratio > 0 && hidden.seq_len > compress_ratio;
+        let needs_compressed_blocks = compress_ratio > 0 && hidden.seq_len >= compress_ratio;
         let compressed_kv = if needs_compressed_blocks {
             let compressor = attention.compressor.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -691,7 +691,7 @@ impl DeepseekModel {
                         deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed => {
                             for block_idx in 0..nb {
                                 let block_end = block_idx * compress_ratio + (compress_ratio - 1);
-                                if block_end < token_idx {
+                                if block_end <= token_idx {
                                     let value =
                                         &kv_comp[block_idx * head_dim..(block_idx + 1) * head_dim];
                                     logits.push(dot(qh, value) * scale);
@@ -1436,16 +1436,19 @@ fn compressor_forward(
         .map(|value| value.to_f32())
         .collect::<Vec<_>>();
 
-    let padded = x.seq_len.next_multiple_of(ratio);
-    let nb = padded / ratio;
-    let mut kv = vec![0.0_f32; padded * width];
-    let mut score = vec![0.0_f32; padded * width];
-    for token_idx in 0..x.seq_len {
+    let cutoff = x.seq_len - (x.seq_len % ratio);
+    let nb = cutoff / ratio;
+    if nb == 0 {
+        return Ok(Vec::new());
+    }
+    let mut kv = vec![0.0_f32; cutoff * width];
+    let mut score = vec![0.0_f32; cutoff * width];
+    for token_idx in 0..cutoff {
         let dst = token_idx * width;
         kv[dst..dst + width].copy_from_slice(&kv_raw[dst..dst + width]);
         score[dst..dst + width].copy_from_slice(&score_raw[dst..dst + width]);
     }
-    for token_idx in 0..padded {
+    for token_idx in 0..cutoff {
         let pos = token_idx % ratio;
         for col in 0..width {
             score[token_idx * width + col] += ape[pos * width + col];
@@ -1551,7 +1554,7 @@ fn csa_selected_blocks(
     for token_idx in 0..x.seq_len {
         let mut scored = Vec::new();
         for block_idx in 0..nb {
-            if block_idx >= token_idx / ratio {
+            if block_idx >= (token_idx + 1) / ratio {
                 continue;
             }
             let key =
@@ -2356,7 +2359,7 @@ mod tests {
     }
 
     #[test]
-    fn compressor_forward_builds_padded_blocks() -> Result<()> {
+    fn compressor_forward_uses_only_complete_blocks() -> Result<()> {
         let ctx = DeviceContext::new()?;
         let hidden = HiddenStates {
             data: ctx
@@ -2373,10 +2376,9 @@ mod tests {
         };
 
         let out = compressor_forward(&ctx, &compressor, &hidden, 1, 2, false, 1.0e-6)?;
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 1);
         assert!(out.iter().all(|value| value.is_finite()));
         assert_close(out[0], 1.0, 0.01);
-        assert_close(out[1], 1.0, 0.01);
         Ok(())
     }
 }
