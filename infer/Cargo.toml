@@ -75,7 +75,7 @@ cuda = ["dep:cudarc", "dep:libc", "dep:memmap2", "cuda-kernels/cuda"]
 # Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = ["cuda-kernels/no-cuda"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda` (NCCL needs CUDA).
-nccl = ["cuda", "cuda-kernels/nccl", "cudarc/nccl"]
+nccl = ["cuda", "cuda-kernels/nccl"]
 # Development-oriented CPU backend for serial smoke tests and local validation.
 cpu = ["dep:memmap2"]
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).
