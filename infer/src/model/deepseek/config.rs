@@ -48,6 +48,7 @@ impl DeepseekRuntimeConfig {
         let spec = DeepSeekV4Config::from_json_file(&config_path)
             .with_context(|| format!("loading DeepSeek V4 config {}", config_path.display()))?;
         let mut runtime = Self::from_spec(spec);
+        runtime.tp = TpConfig::from_env().context("loading DeepSeek V4 tensor-parallel env")?;
         runtime.ep = ExpertGroup::from_env(runtime.spec.n_routed_experts)
             .context("loading DeepSeek V4 expert-parallel env")?;
         Ok(runtime)

@@ -73,6 +73,20 @@ impl TpConfig {
         }
         Ok(())
     }
+
+    /// Parse tensor-parallel rank placement from environment.
+    ///
+    /// Primary names match the serving binary; `ARLE_*` aliases keep the
+    /// lower-level runtime scripts usable while DSv4 bring-up is still moving.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let world_size = parse_parallel_env_usize("INFER_TP_SIZE", "ARLE_TP_SIZE", 1, &mut lookup)?;
+        let rank = parse_parallel_env_usize("INFER_TP_RANK", "ARLE_TP_RANK", 0, &mut lookup)?;
+        Self::new(world_size, rank)
+    }
 }
 
 impl Default for TpConfig {
@@ -154,6 +168,21 @@ pub fn column_shard(total: usize, tp: &TpConfig) -> ShardingSpec {
 /// Identical formula to column_shard — differs only in semantic interpretation.
 pub fn row_shard(total: usize, tp: &TpConfig) -> ShardingSpec {
     column_shard(total, tp)
+}
+
+fn parse_parallel_env_usize(
+    primary: &str,
+    alias: &str,
+    default: usize,
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<usize> {
+    let value = lookup(primary).or_else(|| lookup(alias));
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    value.parse::<usize>().map_err(|err| {
+        anyhow::anyhow!("invalid {primary}/{alias} value `{value}`: expected usize: {err}")
+    })
 }
 
 /// Compute the assignment of attention heads for this TP rank.
@@ -596,6 +625,28 @@ mod tests {
     fn tp_config_invalid_rank() {
         assert!(TpConfig::new(4, 4).is_err());
         assert!(TpConfig::new(0, 0).is_err());
+    }
+
+    #[test]
+    fn tp_config_from_lookup_reads_primary_names() {
+        let tp = TpConfig::from_lookup(|key| match key {
+            "INFER_TP_SIZE" => Some("8".to_string()),
+            "INFER_TP_RANK" => Some("3".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(tp, TpConfig::new(8, 3).unwrap());
+    }
+
+    #[test]
+    fn tp_config_from_lookup_accepts_arle_aliases() {
+        let tp = TpConfig::from_lookup(|key| match key {
+            "ARLE_TP_SIZE" => Some("4".to_string()),
+            "ARLE_TP_RANK" => Some("1".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(tp, TpConfig::new(4, 1).unwrap());
     }
 
     // ---------------------------------------------------------------- column_shard
