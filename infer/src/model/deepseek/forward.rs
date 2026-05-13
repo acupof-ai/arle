@@ -7,7 +7,7 @@
 #[cfg(feature = "cuda")]
 use anyhow::{Result, ensure};
 #[cfg(feature = "cuda")]
-use rand::{Rng, rngs::StdRng};
+use rand::{RngExt, rngs::StdRng};
 
 #[cfg(feature = "cuda")]
 use super::batch_decode::DeepseekBatchDecodeBuffers;
@@ -21,7 +21,7 @@ use super::weights::DeepseekModel;
 use crate::model::generation_state::GenerationStateBase;
 #[cfg(feature = "cuda")]
 use crate::model::{
-    GenerationState, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
+    MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
     PrefillBatchRequest, prepare_paged_prefill_batch,
 };
 #[cfg(feature = "cuda")]
