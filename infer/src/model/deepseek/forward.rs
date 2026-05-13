@@ -51,6 +51,7 @@ impl ModelForward for DeepseekModel {
                 self.config.vocab_size,
             )?
             .with_label("dsv4_phase2a0_decode_logits"),
+            reference_tokens: Vec::new(),
         })
     }
 
@@ -91,6 +92,13 @@ impl ModelForward for DeepseekModel {
             "DeepSeek V4 token id {token} exceeds vocab_size {}",
             self.config.vocab_size
         );
+
+        if let Some(logits) = self.compute_reference_logits_after_decode(token, state)? {
+            state.decode_logits = logits;
+            state.base.prefill_logits = None;
+            state.base.kv_cache.advance_seq_len(1);
+            return Ok(());
+        }
 
         // Phase 2A.1 uses the loaded top-level tensors for non-zero logits when
         // available. Real contextual attention and shared-expert compute land

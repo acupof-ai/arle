@@ -25,6 +25,8 @@ pub struct DeepseekState {
     pub(crate) base: GenerationStateBase,
     #[cfg(feature = "cuda")]
     pub(crate) decode_logits: DeviceVec,
+    #[cfg(feature = "cuda")]
+    pub(crate) reference_tokens: Vec<u32>,
 }
 
 // SAFETY: identical invariant to `Qwen3State` — every `DeepseekState` is owned
@@ -41,14 +43,17 @@ impl GenerationState for DeepseekState {
     }
 
     fn reset(&mut self) -> Result<()> {
+        self.reference_tokens.clear();
         self.base.reset()
     }
 
     fn reset_for_warmup_clear(&mut self) -> Result<()> {
+        self.reference_tokens.clear();
         self.base.reset()
     }
 
     fn truncate_to(&mut self, len: usize) -> Result<()> {
+        self.reference_tokens.truncate(len);
         self.base.truncate_to(len)
     }
 
