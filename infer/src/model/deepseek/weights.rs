@@ -417,15 +417,9 @@ impl DeepseekModel {
         let compress_ratio = *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
             anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
         })?;
-        if compress_ratio > 0 {
-            ensure!(
-                hidden.seq_len <= compress_ratio,
-                "DeepSeek V4 GPU attention layer {} needs compressed blocks for seq_len {} > compress_ratio {}; compressed CSA/HCA blocks are not wired yet",
-                layer_idx,
-                hidden.seq_len,
-                compress_ratio
-            );
-        }
+        let mode = self
+            .config
+            .attention_mode_for_compress_ratio(compress_ratio);
         ensure!(
             hidden.hidden_dim == self.config.hidden_size,
             "DeepSeek V4 attention hidden dim {} does not match hidden_size {}",
@@ -516,6 +510,69 @@ impl DeepseekModel {
             self.config.qk_rope_head_dim,
             self.config.rope_theta,
         );
+        let needs_compressed_blocks = compress_ratio > 0 && hidden.seq_len > compress_ratio;
+        let compressed_kv = if needs_compressed_blocks {
+            let compressor = attention.compressor.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek V4 layer {} has compress_ratio {} but no compressor weights",
+                    layer_idx,
+                    compress_ratio
+                )
+            })?;
+            let mut kv = compressor_forward(
+                &self.ctx,
+                compressor,
+                hidden,
+                head_dim,
+                compress_ratio,
+                compress_ratio < 16,
+                self.config.rms_norm_eps,
+            )?;
+            let (rope_cos_c, rope_sin_c) = build_rope_cache(
+                hidden.seq_len.max(1),
+                self.config.qk_rope_head_dim,
+                self.config.compress_rope_theta,
+            );
+            for block_idx in 0..kv.len() / head_dim {
+                let pos =
+                    (block_idx * compress_ratio + (compress_ratio - 1)).min(hidden.seq_len - 1);
+                apply_partial_rope(
+                    &mut kv[block_idx * head_dim..(block_idx + 1) * head_dim],
+                    &rope_cos_c[pos * self.config.qk_rope_head_dim
+                        ..(pos + 1) * self.config.qk_rope_head_dim],
+                    &rope_sin_c[pos * self.config.qk_rope_head_dim
+                        ..(pos + 1) * self.config.qk_rope_head_dim],
+                    self.config.qk_rope_head_dim,
+                    1.0,
+                );
+            }
+            Some(kv)
+        } else {
+            None
+        };
+        let csa_selected = if needs_compressed_blocks
+            && matches!(
+                mode,
+                deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse
+            ) {
+            let indexer = attention.indexer.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek V4 layer {} has CSA compress_ratio {} but no indexer weights",
+                    layer_idx,
+                    compress_ratio
+                )
+            })?;
+            Some(csa_selected_blocks(
+                &self.ctx,
+                &self.config.spec,
+                indexer,
+                hidden,
+                &c_q_normed,
+                compress_ratio,
+            )?)
+        } else {
+            None
+        };
         for token_idx in 0..hidden.seq_len {
             let kv_start = token_idx * head_dim;
             apply_partial_rope(
@@ -550,17 +607,44 @@ impl DeepseekModel {
             for head_idx in 0..local_heads {
                 let q_start = token_idx * local_width + head_idx * head_dim;
                 let qh = &q_host[q_start..q_start + head_dim];
-                let mut logits = Vec::with_capacity(token_idx + 1 - sw_start);
+                let mut logits = Vec::new();
+                let mut values = Vec::new();
+                if let Some(kv_comp) = &compressed_kv {
+                    let nb = kv_comp.len() / head_dim;
+                    match mode {
+                        deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed => {
+                            for block_idx in 0..nb {
+                                let block_end = block_idx * compress_ratio + (compress_ratio - 1);
+                                if block_end < token_idx {
+                                    let value =
+                                        &kv_comp[block_idx * head_dim..(block_idx + 1) * head_dim];
+                                    logits.push(dot(qh, value) * scale);
+                                    values.push(value);
+                                }
+                            }
+                        }
+                        deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse => {
+                            if let Some(selected) = &csa_selected {
+                                for &block_idx in &selected[token_idx] {
+                                    let value =
+                                        &kv_comp[block_idx * head_dim..(block_idx + 1) * head_dim];
+                                    logits.push(dot(qh, value) * scale);
+                                    values.push(value);
+                                }
+                            }
+                        }
+                        deepseek_spec::DeepSeekV4AttentionMode::SlidingWindow => {}
+                    }
+                }
                 for key_idx in sw_start..=token_idx {
                     let key = &kv_host[key_idx * head_dim..(key_idx + 1) * head_dim];
                     logits.push(dot(qh, key) * scale);
+                    values.push(key);
                 }
                 let probs = sink_softmax(&logits, sink[sink_offset + head_idx]);
                 let dst_start = token_idx * local_width + head_idx * head_dim;
                 let dst = &mut attn_out[dst_start..dst_start + head_dim];
-                for (offset, prob) in probs.iter().enumerate() {
-                    let key_idx = sw_start + offset;
-                    let value = &kv_host[key_idx * head_dim..(key_idx + 1) * head_dim];
+                for (prob, value) in probs.iter().zip(values) {
                     for col in 0..head_dim {
                         dst[col] += prob * value[col];
                     }
@@ -763,8 +847,8 @@ impl DeepseekModel {
         names: &deepseek_spec::DeepSeekV4CompressorTensorNames,
     ) -> Result<DeepseekV4Compressor> {
         Ok(DeepseekV4Compressor {
-            wkv: self.load_tp_column_matrix(shards, weight_map, &names.wkv)?,
-            wgate: self.load_tp_column_matrix(shards, weight_map, &names.wgate)?,
+            wkv: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.wkv)?,
+            wgate: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.wgate)?,
             ape: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.ape)?,
             norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.norm)?,
         })
@@ -777,8 +861,8 @@ impl DeepseekModel {
         names: &deepseek_spec::DeepSeekV4IndexerTensorNames,
     ) -> Result<DeepseekV4Indexer> {
         Ok(DeepseekV4Indexer {
-            wq_b: self.load_tp_column_matrix(shards, weight_map, &names.wq_b)?,
-            weights_proj: self.load_tp_column_matrix(shards, weight_map, &names.weights_proj)?,
+            wq_b: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.wq_b)?,
+            weights_proj: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.weights_proj)?,
             compressor: self.load_compressor(shards, weight_map, &names.compressor)?,
         })
     }
@@ -1202,6 +1286,211 @@ fn hc_post_to_stream(
         }
     }
     Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn compressor_forward(
+    ctx: &DeviceContext,
+    compressor: &DeepseekV4Compressor,
+    x: &HiddenStates,
+    head_dim: usize,
+    ratio: usize,
+    overlap: bool,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    ensure!(ratio > 0, "DeepSeek V4 compressor ratio must be non-zero");
+    let coeff = if overlap { 2 } else { 1 };
+    let width = coeff * head_dim;
+    ensure!(
+        compressor.wkv.rows == width && compressor.wgate.rows == width,
+        "DeepSeek V4 compressor rows mismatch: wkv={} wgate={} expected_width={}",
+        compressor.wkv.rows,
+        compressor.wgate.rows,
+        width
+    );
+    ensure!(
+        compressor.ape.rows >= ratio && compressor.ape.cols == width,
+        "DeepSeek V4 compressor APE shape {}x{} does not cover ratio {} width {}",
+        compressor.ape.rows,
+        compressor.ape.cols,
+        ratio,
+        width
+    );
+    ensure!(
+        compressor.norm.len == head_dim,
+        "DeepSeek V4 compressor norm len {} does not match head_dim {}",
+        compressor.norm.len,
+        head_dim
+    );
+
+    let kv_raw = ops::gemm(ctx, &compressor.wkv, x)?;
+    let score_raw = ops::gemm(ctx, &compressor.wgate, x)?;
+    let kv_raw = ctx
+        .stream
+        .clone_dtoh(&kv_raw.data)?
+        .into_iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let score_raw = ctx
+        .stream
+        .clone_dtoh(&score_raw.data)?
+        .into_iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let ape = matrix_host_f32(ctx, &compressor.ape)?;
+    let norm = ctx
+        .stream
+        .clone_dtoh(&compressor.norm.data)?
+        .into_iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+
+    let padded = x.seq_len.next_multiple_of(ratio);
+    let nb = padded / ratio;
+    let mut kv = vec![0.0_f32; padded * width];
+    let mut score = vec![0.0_f32; padded * width];
+    for token_idx in 0..x.seq_len {
+        let dst = token_idx * width;
+        kv[dst..dst + width].copy_from_slice(&kv_raw[dst..dst + width]);
+        score[dst..dst + width].copy_from_slice(&score_raw[dst..dst + width]);
+    }
+    for token_idx in 0..padded {
+        let pos = token_idx % ratio;
+        for col in 0..width {
+            score[token_idx * width + col] += ape[pos * width + col];
+        }
+    }
+
+    let mut out = vec![0.0_f32; nb * head_dim];
+    for block_idx in 0..nb {
+        for col in 0..head_dim {
+            let mut logits = Vec::with_capacity(if overlap { 2 * ratio } else { ratio });
+            let mut values = Vec::with_capacity(logits.capacity());
+            if overlap {
+                for pos in 0..ratio {
+                    if block_idx == 0 {
+                        logits.push(f32::NEG_INFINITY);
+                        values.push(0.0);
+                    } else {
+                        let token_idx = (block_idx - 1) * ratio + pos;
+                        logits.push(score[token_idx * width + col]);
+                        values.push(kv[token_idx * width + col]);
+                    }
+                }
+                for pos in 0..ratio {
+                    let token_idx = block_idx * ratio + pos;
+                    logits.push(score[token_idx * width + head_dim + col]);
+                    values.push(kv[token_idx * width + head_dim + col]);
+                }
+            } else {
+                for pos in 0..ratio {
+                    let token_idx = block_idx * ratio + pos;
+                    logits.push(score[token_idx * width + col]);
+                    values.push(kv[token_idx * width + col]);
+                }
+            }
+            let probs = softmax(&logits);
+            out[block_idx * head_dim + col] = probs
+                .iter()
+                .zip(values)
+                .map(|(prob, value)| prob * value)
+                .sum::<f32>();
+        }
+    }
+    for block_idx in 0..nb {
+        let row = &mut out[block_idx * head_dim..(block_idx + 1) * head_dim];
+        let mean_square = row.iter().map(|value| value.powi(2)).sum::<f32>() / head_dim as f32;
+        let scale = 1.0 / (mean_square + eps).sqrt();
+        for col in 0..head_dim {
+            row[col] *= scale * norm[col];
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn csa_selected_blocks(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    indexer: &DeepseekV4Indexer,
+    x: &HiddenStates,
+    c_q: &HiddenStates,
+    ratio: usize,
+) -> Result<Vec<Vec<usize>>> {
+    let keys = compressor_forward(
+        ctx,
+        &indexer.compressor,
+        x,
+        config.index_head_dim,
+        ratio,
+        true,
+        config.rms_norm_eps,
+    )?;
+    let nb = keys.len() / config.index_head_dim;
+    let q_i = ops::gemm(ctx, &indexer.wq_b, c_q)?;
+    let weights = ops::gemm(ctx, &indexer.weights_proj, x)?;
+    ensure!(
+        q_i.hidden_dim.is_multiple_of(config.index_head_dim),
+        "DeepSeek V4 indexer q width {} is not divisible by index_head_dim {}",
+        q_i.hidden_dim,
+        config.index_head_dim
+    );
+    let local_index_heads = q_i.hidden_dim / config.index_head_dim;
+    ensure!(
+        weights.hidden_dim == local_index_heads,
+        "DeepSeek V4 indexer weights width {} does not match local heads {}",
+        weights.hidden_dim,
+        local_index_heads
+    );
+    let q_host = ctx
+        .stream
+        .clone_dtoh(&q_i.data)?
+        .into_iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let weights_host = ctx
+        .stream
+        .clone_dtoh(&weights.data)?
+        .into_iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let score_scale =
+        (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
+    let mut out = vec![Vec::new(); x.seq_len];
+    for token_idx in 0..x.seq_len {
+        let mut scored = Vec::new();
+        for block_idx in 0..nb {
+            if block_idx >= token_idx / ratio {
+                continue;
+            }
+            let key =
+                &keys[block_idx * config.index_head_dim..(block_idx + 1) * config.index_head_dim];
+            let mut score = 0.0_f32;
+            for head_idx in 0..local_index_heads {
+                let q_start = token_idx * q_i.hidden_dim + head_idx * config.index_head_dim;
+                let qh = &q_host[q_start..q_start + config.index_head_dim];
+                let weight = weights_host[token_idx * weights.hidden_dim + head_idx] * score_scale;
+                score += weight * dot(qh, key).max(0.0);
+            }
+            if score.is_finite() {
+                scored.push((score, block_idx));
+            }
+        }
+        scored.sort_by(|lhs, rhs| rhs.0.total_cmp(&lhs.0).then_with(|| lhs.1.cmp(&rhs.1)));
+        scored.truncate(config.index_topk.min(scored.len()));
+        out[token_idx] = scored.into_iter().map(|(_, block_idx)| block_idx).collect();
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn matrix_host_f32(ctx: &DeviceContext, matrix: &DeviceMatrix) -> Result<Vec<f32>> {
+    Ok(ctx
+        .stream
+        .clone_dtoh(&matrix.data)?
+        .into_iter()
+        .map(|value| value.to_f32())
+        .collect())
 }
 
 #[cfg(feature = "cuda")]
@@ -1911,6 +2200,31 @@ mod tests {
         let expected = 1.0_f32.exp() / (1.0_f32.exp() + 1.0);
         assert_close(got[0], expected, 0.01);
         assert_close(got[1], expected, 0.01);
+        Ok(())
+    }
+
+    #[test]
+    fn compressor_forward_builds_padded_blocks() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))?,
+            hidden_dim: 2,
+            seq_len: 3,
+        };
+        let compressor = DeepseekV4Compressor {
+            wkv: matrix(&ctx, &[0.0, 1.0], 1, 2)?,
+            wgate: matrix(&ctx, &[1.0, 0.0], 1, 2)?,
+            ape: matrix(&ctx, &[0.0, 0.0], 2, 1)?,
+            norm: vec(&ctx, &[1.0])?,
+        };
+
+        let out = compressor_forward(&ctx, &compressor, &hidden, 1, 2, false, 1.0e-6)?;
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|value| value.is_finite()));
+        assert_close(out[0], 1.0, 0.01);
+        assert_close(out[1], 1.0, 0.01);
         Ok(())
     }
 }
