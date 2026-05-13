@@ -67,6 +67,21 @@ pub(in crate::scheduler::cuda) fn can_publish_prefix_pages(
         <= prefix_cache_retain_hard_cap_pages(total_pages, cap_fraction)
 }
 
+pub(in crate::scheduler::cuda) fn can_publish_prefix_pages_without_watermark_pressure(
+    retained_pages: usize,
+    total_pages: usize,
+    new_pages: usize,
+    cap_fraction: f64,
+    high_water_fraction: f64,
+) -> bool {
+    let high_water_pages = (total_pages as f64 * high_water_fraction) as usize;
+    retained_pages.saturating_add(new_pages)
+        <= high_water_pages.min(prefix_cache_retain_hard_cap_pages(
+            total_pages,
+            cap_fraction,
+        ))
+}
+
 pub(in crate::scheduler::cuda) fn sealed_block_token_count(
     block_size: usize,
     block_count: usize,

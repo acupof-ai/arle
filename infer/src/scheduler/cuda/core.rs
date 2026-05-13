@@ -45,8 +45,9 @@ mod warmup;
 pub(in crate::scheduler::cuda) use emit_worker::{EmitCommand, EmitEvent, spawn_emit_worker};
 pub(in crate::scheduler::cuda) use helpers::{
     CONTIGUOUS_KV_TOKENS, PREFIX_CACHE_BLOCK_SIZE, can_publish_prefix_pages,
-    host_spill_target_bytes, is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages,
-    sealed_block_token_count, select_sparse_pages_from_slot_pages,
+    can_publish_prefix_pages_without_watermark_pressure, host_spill_target_bytes,
+    is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
+    select_sparse_pages_from_slot_pages,
 };
 pub(in crate::scheduler::cuda) use session_slots::{PressureMode, SessionSlot, SessionSlotHold};
 pub(in crate::scheduler::cuda) use state_types::{
@@ -1117,18 +1118,23 @@ impl<M: ModelForward> Scheduler<M> {
         let retained_pages = self.paged_kv_pool.retained_count();
         let total_pages = self.paged_kv_pool.max_total_pages;
         let retain_cap_fraction = self.config.prefix_cache_retain_hard_cap;
-        if !can_publish_prefix_pages(
+        if !can_publish_prefix_pages_without_watermark_pressure(
             retained_pages,
             total_pages,
             required_pages,
             retain_cap_fraction,
+            self.config.prefix_cache_high_water,
         ) {
+            let high_water_pages =
+                (total_pages as f64 * self.config.prefix_cache_high_water) as usize;
             info!(
                 "prefix cache publish skipped for slot {}: retain hard cap hit \
-                 (retained={}, new_pages={}, cap={}, total={})",
+                 or high-water pressure would start synchronous eviction \
+                 (retained={}, new_pages={}, high_water={}, cap={}, total={})",
                 slot_idx,
                 retained_pages,
                 required_pages,
+                high_water_pages,
                 prefix_cache_retain_hard_cap_pages(total_pages, retain_cap_fraction),
                 total_pages,
             );
