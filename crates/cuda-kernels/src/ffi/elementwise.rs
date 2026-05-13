@@ -25,6 +25,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_swiglu_clamped_cuda(
+        gate: *const Half,
+        up: *const Half,
+        out: *mut Half,
+        n: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn split_qkv_cuda(
         qkv: *const Half,
         q: *mut Half,
