@@ -40,6 +40,7 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 ingress_numa_node: None,
                 delta_tx,
                 trace_context: req.trace_context,
+                distributed: None,
             })
             .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))?;
         Ok(prompt_tokens)

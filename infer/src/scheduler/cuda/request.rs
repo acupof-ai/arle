@@ -276,6 +276,8 @@ pub(crate) struct ActiveRequest {
     pub(crate) ingress_numa_node: Option<i32>,
     /// Most recent trace context used to chain request-level spans across threads.
     pub(crate) trace_context: Option<SpanContext>,
+    /// Per-request token coordinator for multi-rank HTTP serving.
+    pub(crate) distributed: Option<crate::scheduler::DistributedRequestCoordination>,
     pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     /// Streaming emit dispatch bookkeeping.
     pub(crate) emit_cursor: EmitCursor,
@@ -440,6 +442,7 @@ mod tests {
             session_id: None,
             ingress_numa_node: None,
             trace_context: None,
+            distributed: None,
             delta_tx,
             emit_cursor: EmitCursor::default(),
             phase: Phase::Finished,

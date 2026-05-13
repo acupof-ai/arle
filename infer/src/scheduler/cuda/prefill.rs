@@ -616,6 +616,23 @@ impl<M: ModelForward> Scheduler<M> {
         ) {
             Ok(tokens) => {
                 for (slot_idx, token) in completed_slots.into_iter().zip(tokens) {
+                    let step_idx = self
+                        .request(slot_idx)
+                        .map(|req| req.generated_tokens.len())
+                        .unwrap_or(0);
+                    let token = match self.coordinate_prefill_token(slot_idx, step_idx, token) {
+                        Ok(token) => token,
+                        Err(err) => {
+                            let req_id =
+                                self.request(slot_idx).map(|req| req.id).unwrap_or_default();
+                            error!(
+                                "Request {}: distributed prefill token sync failed: {}",
+                                req_id, err
+                            );
+                            self.finish_slot(slot_idx);
+                            continue;
+                        }
+                    };
                     self.apply_prefill_completion_token(slot_idx, token);
                 }
             }
@@ -630,6 +647,33 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
+    }
+
+    fn coordinate_prefill_token(
+        &self,
+        slot_idx: usize,
+        step_idx: usize,
+        local_token: u32,
+    ) -> Result<u32> {
+        let Some(distributed) = self
+            .request(slot_idx)
+            .and_then(|req| req.distributed.as_ref())
+            .cloned()
+        else {
+            return Ok(local_token);
+        };
+        let token = distributed.synchronize_token(step_idx, local_token)?;
+        if distributed.rank() != 0 && token != local_token {
+            log::debug!(
+                "Distributed prefill token override: rank={} slot={} step={} local={} rank0={}",
+                distributed.rank(),
+                slot_idx,
+                step_idx,
+                local_token,
+                token
+            );
+        }
+        Ok(token)
     }
 
     fn finish_prefill_batch_error(&mut self, rows: &[PendingPrefillRow], err: &anyhow::Error) {

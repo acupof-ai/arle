@@ -691,6 +691,7 @@ impl<M: ModelForward> Scheduler<M> {
             ingress_numa_node: incoming.ingress_numa_node,
             trace_context: incoming.trace_context,
             delta_tx: incoming.delta_tx,
+            distributed: incoming.distributed,
             emit_cursor: super::super::request::EmitCursor::default(),
             phase: if waiting_fetch {
                 Phase::WaitingFetch

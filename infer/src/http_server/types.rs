@@ -270,6 +270,7 @@ impl RequestExecutionOptions {
             ingress_numa_node,
             delta_tx,
             trace_context,
+            distributed: None,
         }
     }
 }

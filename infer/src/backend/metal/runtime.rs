@@ -3199,6 +3199,7 @@ mod tests {
             ingress_numa_node: None,
             delta_tx,
             trace_context: None,
+            distributed: None,
         };
 
         let (pending, priority) =
