@@ -156,6 +156,28 @@ impl DeepseekModel {
     pub fn from_safetensors(path: &str, config: DeepseekRuntimeConfig) -> Result<Self> {
         let _manifest = Self::validate_checkpoint_manifest(path, &config.spec)?;
         let mut model = Self::from_config(config)?;
+        let real_reference = infer_real_reference_enabled()?;
+        if real_reference {
+            model.reference = Some(DeepseekV4ReferenceModel::load(path)?);
+            let summary = model.config.spec.attention_operator_summary();
+            info!(
+                "DeepSeek V4 real-reference logits enabled: skipping top-level CUDA smoke \
+                 weights, sliding_window_layers={} csa_layers={} hca_layers={} vocab_size={} \
+                 hidden_size={} tp_rank={}/{} ep_rank={}/{} experts_per_rank={}",
+                summary.sliding_window_layers,
+                summary.csa_layers,
+                summary.hca_layers,
+                model.config.vocab_size,
+                model.config.hidden_size,
+                model.config.tp.rank,
+                model.config.tp.world_size,
+                model.config.ep.rank,
+                model.config.ep.world_size,
+                model.config.ep.experts_per_rank,
+            );
+            return Ok(model);
+        }
+
         let (mmaps, weight_map) = common::load_safetensors(path, false)?;
         let shards = common::deserialize_shards(&mmaps)?;
         let names = model.config.spec.tensor_names();
@@ -192,23 +214,22 @@ impl DeepseekModel {
         model.embed_tokens = Some(embed_tokens);
         model.lm_head = Some(lm_head);
         model.norm = Some(norm);
-        if infer_real_reference_enabled()? {
-            model.reference = Some(DeepseekV4ReferenceModel::load(path)?);
-        }
 
         let summary = model.config.spec.attention_operator_summary();
         info!(
             "DeepSeek V4 Phase 2A.1 CUDA top-level logits smoke loaded: sliding_window_layers={} \
-             csa_layers={} hca_layers={} vocab_size={} hidden_size={} ep_rank={}/{} experts_per_rank={} real_reference={}",
+             csa_layers={} hca_layers={} vocab_size={} hidden_size={} tp_rank={}/{} ep_rank={}/{} experts_per_rank={} real_reference={}",
             summary.sliding_window_layers,
             summary.csa_layers,
             summary.hca_layers,
             model.config.vocab_size,
             model.config.hidden_size,
+            model.config.tp.rank,
+            model.config.tp.world_size,
             model.config.ep.rank,
             model.config.ep.world_size,
             model.config.ep.experts_per_rank,
-            model.reference.is_some()
+            real_reference,
         );
         Ok(model)
     }
