@@ -250,6 +250,19 @@ impl DeepseekModel {
     }
 
     pub(super) fn compute_top_level_logits(&self, tokens: &[u32]) -> Result<Option<DeviceVec>> {
+        let gpu_ffn_layers = dsv4_gpu_ffn_layer_limit()?;
+        self.compute_top_level_logits_with_ffn_layer_limit(tokens, gpu_ffn_layers)
+    }
+
+    fn compute_top_level_logits_with_ffn_layer_limit(
+        &self,
+        tokens: &[u32],
+        gpu_ffn_layers: usize,
+    ) -> Result<Option<DeviceVec>> {
+        ensure!(
+            !tokens.is_empty(),
+            "DeepSeek V4 top-level logits require at least one token"
+        );
         let (Some(embed_tokens), Some(norm), Some(lm_head)) = (
             self.embed_tokens.as_ref(),
             self.norm.as_ref(),
@@ -260,12 +273,21 @@ impl DeepseekModel {
         let embeddings =
             common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, self.config.hidden_size)?;
         let hidden = if let Some(head_hc) = &self.head_hc {
-            let stream = initial_hc_stream_from_embeddings(
+            ensure!(
+                gpu_ffn_layers <= self.layers.len(),
+                "DeepSeek V4 requested {} GPU FFN layers but only {} layers are loaded",
+                gpu_ffn_layers,
+                self.layers.len()
+            );
+            let mut stream = initial_hc_stream_from_embeddings(
                 &self.ctx,
                 &embeddings,
                 self.config.hidden_size,
                 self.config.hc_mult,
             )?;
+            for layer_idx in 0..gpu_ffn_layers {
+                stream = self.forward_ffn_layer_stream(layer_idx, &stream, tokens)?;
+            }
             head_hidden_from_stream(
                 &self.ctx,
                 head_hc,
@@ -287,6 +309,75 @@ impl DeepseekModel {
             false,
         )?;
         Ok(Some(logits.with_label("dsv4_phase2a1_top_level_logits")))
+    }
+
+    fn forward_ffn_layer_stream(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        tokens: &[u32],
+    ) -> Result<HiddenStates> {
+        ensure!(
+            tokens.len() == stream.seq_len,
+            "DeepSeek V4 FFN layer token count {} does not match stream seq_len {}",
+            tokens.len(),
+            stream.seq_len
+        );
+        ensure!(
+            stream.hidden_dim == self.config.hidden_size * self.config.hc_mult,
+            "DeepSeek V4 FFN layer stream dim {} does not match hidden_size {} * hc_mult {}",
+            stream.hidden_dim,
+            self.config.hidden_size,
+            self.config.hc_mult
+        );
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 GPU FFN layer {} out of range for {} loaded layers",
+                layer_idx,
+                self.layers.len()
+            )
+        })?;
+
+        let mhc = gen_mhc_params(
+            &self.ctx,
+            &layer.hc_ffn,
+            stream,
+            self.config.hc_mult,
+            self.config.hc_eps,
+            self.config.hc_sinkhorn_iters,
+        )?;
+        let sub_in = hc_pre_from_stream(
+            &self.ctx,
+            stream,
+            &mhc.pre,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        let mut normed = HiddenStates::zeros(&self.ctx, self.config.hidden_size, stream.seq_len)?;
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &sub_in,
+            &layer.ffn_norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        );
+        let ffn_out = layer.ffn.forward_routed(
+            &self.ctx,
+            layer_idx,
+            &self.config.spec,
+            &self.config.ep,
+            &normed,
+            tokens,
+        )?;
+        hc_post_to_stream(
+            &self.ctx,
+            &ffn_out,
+            stream,
+            &mhc.post,
+            &mhc.comb,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )
     }
 
     pub(super) fn compute_reference_logits_after_prefill(
@@ -604,6 +695,190 @@ fn initial_hc_stream_from_embeddings(
 }
 
 #[cfg(feature = "cuda")]
+struct MhcParams {
+    pre: Vec<f32>,
+    post: Vec<f32>,
+    comb: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+fn gen_mhc_params(
+    ctx: &DeviceContext,
+    hc: &DeepseekV4HyperConnection,
+    stream: &HiddenStates,
+    hc_mult: usize,
+    hc_eps: f32,
+    hc_sinkhorn_iters: usize,
+) -> Result<MhcParams> {
+    ensure!(
+        hc_mult > 0,
+        "DeepSeek V4 MHC generation requires non-zero hc_mult"
+    );
+    let mix_dim = (2 + hc_mult) * hc_mult;
+    ensure!(
+        hc.mix_fn.cols == stream.hidden_dim && hc.mix_fn.rows >= mix_dim,
+        "DeepSeek V4 HC mix shape {}x{} cannot produce {} weights from stream dim {}",
+        hc.mix_fn.rows,
+        hc.mix_fn.cols,
+        mix_dim,
+        stream.hidden_dim
+    );
+    ensure!(
+        hc.base.len >= mix_dim && hc.scale.len >= 3,
+        "DeepSeek V4 HC base/scale too short: base={} scale={} required_base={} required_scale=3",
+        hc.base.len,
+        hc.scale.len,
+        mix_dim
+    );
+
+    let mixes = ops::gemm(ctx, &hc.mix_fn, stream)?;
+    let stream_host = ctx.stream.clone_dtoh(&stream.data)?;
+    let mixes_host = ctx.stream.clone_dtoh(&mixes.data)?;
+    let base_host = ctx.stream.clone_dtoh(&hc.base.data)?;
+    let scale_host = ctx.stream.clone_dtoh(&hc.scale.data)?;
+    let mut pre = vec![0.0_f32; stream.seq_len * hc_mult];
+    let mut post = vec![0.0_f32; stream.seq_len * hc_mult];
+    let mut comb = vec![0.0_f32; stream.seq_len * hc_mult * hc_mult];
+
+    for token_idx in 0..stream.seq_len {
+        let stream_start = token_idx * stream.hidden_dim;
+        let row = &stream_host[stream_start..stream_start + stream.hidden_dim];
+        let rsqrt = rms_rsqrt_bf16(row, hc_eps);
+        let mix_start = token_idx * mixes.hidden_dim;
+        let token_mixes = &mixes_host[mix_start..mix_start + mixes.hidden_dim];
+
+        for hc_idx in 0..hc_mult {
+            let pre_mix = token_mixes[hc_idx].to_f32() * rsqrt;
+            let post_mix = token_mixes[hc_mult + hc_idx].to_f32() * rsqrt;
+            pre[token_idx * hc_mult + hc_idx] =
+                sigmoid(scale_host[0].to_f32() * pre_mix + base_host[hc_idx].to_f32()) + hc_eps;
+            post[token_idx * hc_mult + hc_idx] = 2.0
+                * sigmoid(scale_host[1].to_f32() * post_mix + base_host[hc_mult + hc_idx].to_f32());
+        }
+
+        let mut raw = vec![0.0_f32; hc_mult * hc_mult];
+        for row_idx in 0..hc_mult {
+            for col_idx in 0..hc_mult {
+                let idx = row_idx * hc_mult + col_idx;
+                let mix = token_mixes[2 * hc_mult + idx].to_f32() * rsqrt;
+                raw[idx] = scale_host[2].to_f32() * mix + base_host[2 * hc_mult + idx].to_f32();
+            }
+        }
+        row_softmax_plus_eps(&mut raw, hc_mult, hc_eps);
+        column_normalize(&mut raw, hc_mult, hc_eps);
+        for _ in 1..hc_sinkhorn_iters {
+            row_normalize(&mut raw, hc_mult, hc_eps);
+            column_normalize(&mut raw, hc_mult, hc_eps);
+        }
+        let dst = token_idx * hc_mult * hc_mult;
+        comb[dst..dst + hc_mult * hc_mult].copy_from_slice(&raw);
+    }
+
+    Ok(MhcParams { pre, post, comb })
+}
+
+#[cfg(feature = "cuda")]
+fn hc_pre_from_stream(
+    ctx: &DeviceContext,
+    stream: &HiddenStates,
+    pre: &[f32],
+    hidden_size: usize,
+    hc_mult: usize,
+) -> Result<HiddenStates> {
+    ensure!(
+        stream.hidden_dim == hidden_size * hc_mult,
+        "DeepSeek V4 HC pre stream dim {} does not match hidden_size {} * hc_mult {}",
+        stream.hidden_dim,
+        hidden_size,
+        hc_mult
+    );
+    ensure!(
+        pre.len() == stream.seq_len * hc_mult,
+        "DeepSeek V4 HC pre len {} does not match seq_len {} * hc_mult {}",
+        pre.len(),
+        stream.seq_len,
+        hc_mult
+    );
+    let mut out = HiddenStates::zeros(ctx, hidden_size, stream.seq_len)?;
+    for token_idx in 0..stream.seq_len {
+        for hc_idx in 0..hc_mult {
+            let lane = extract_hc_lane(ctx, stream, token_idx, hc_idx, hidden_size)?;
+            ops::add_scaled_row_into(
+                ctx,
+                &lane,
+                &mut out,
+                token_idx,
+                pre[token_idx * hc_mult + hc_idx],
+            )?;
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn hc_post_to_stream(
+    ctx: &DeviceContext,
+    new_x: &HiddenStates,
+    residual: &HiddenStates,
+    post: &[f32],
+    comb: &[f32],
+    hidden_size: usize,
+    hc_mult: usize,
+) -> Result<HiddenStates> {
+    ensure!(
+        new_x.hidden_dim == hidden_size && residual.hidden_dim == hidden_size * hc_mult,
+        "DeepSeek V4 HC post dim mismatch: new_x={} residual={} hidden_size={} hc_mult={}",
+        new_x.hidden_dim,
+        residual.hidden_dim,
+        hidden_size,
+        hc_mult
+    );
+    ensure!(
+        new_x.seq_len == residual.seq_len,
+        "DeepSeek V4 HC post seq mismatch: new_x={} residual={}",
+        new_x.seq_len,
+        residual.seq_len
+    );
+    ensure!(
+        post.len() == residual.seq_len * hc_mult
+            && comb.len() == residual.seq_len * hc_mult * hc_mult,
+        "DeepSeek V4 HC post weights mismatch: post={} comb={} seq_len={} hc_mult={}",
+        post.len(),
+        comb.len(),
+        residual.seq_len,
+        hc_mult
+    );
+
+    let mut out = HiddenStates::zeros(ctx, hidden_size * hc_mult, residual.seq_len)?;
+    for token_idx in 0..residual.seq_len {
+        let token_new = extract_hidden_token_with_width(ctx, new_x, token_idx, hidden_size)?;
+        for dst_hc in 0..hc_mult {
+            let segment_offset = dst_hc * hidden_size;
+            ops::add_scaled_row_segment_into(
+                ctx,
+                &token_new,
+                &mut out,
+                token_idx,
+                segment_offset,
+                post[token_idx * hc_mult + dst_hc],
+            )?;
+            for src_hc in 0..hc_mult {
+                let residual_lane = extract_hc_lane(ctx, residual, token_idx, src_hc, hidden_size)?;
+                ops::add_scaled_row_segment_into(
+                    ctx,
+                    &residual_lane,
+                    &mut out,
+                    token_idx,
+                    segment_offset,
+                    comb[(token_idx * hc_mult + dst_hc) * hc_mult + src_hc],
+                )?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
 fn head_hidden_from_stream(
     ctx: &DeviceContext,
     head_hc: &DeepseekV4HyperConnection,
@@ -672,6 +947,12 @@ fn extract_hidden_token_with_width(
     width: usize,
 ) -> Result<HiddenStates> {
     ensure!(
+        token_idx < hidden.seq_len,
+        "DeepSeek V4 token {} out of range for seq_len {}",
+        token_idx,
+        hidden.seq_len
+    );
+    ensure!(
         hidden.hidden_dim == width,
         "DeepSeek V4 token extract width {} does not match hidden dim {}",
         width,
@@ -723,6 +1004,55 @@ fn rms_rsqrt_bf16(values: &[bf16], eps: f32) -> f32 {
     1.0 / (mean_square + eps).sqrt()
 }
 
+#[cfg(feature = "cuda")]
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return vec![0.0; logits.len()];
+    }
+    let exp = logits
+        .iter()
+        .map(|value| (*value - max).exp())
+        .collect::<Vec<_>>();
+    let denom = exp.iter().sum::<f32>();
+    exp.into_iter().map(|value| value / denom).collect()
+}
+
+#[cfg(feature = "cuda")]
+fn row_softmax_plus_eps(raw: &mut [f32], n: usize, eps: f32) {
+    for row in 0..n {
+        let start = row * n;
+        let probs = softmax(&raw[start..start + n]);
+        for col in 0..n {
+            raw[start + col] = probs[col] + eps;
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn row_normalize(raw: &mut [f32], n: usize, eps: f32) {
+    for row in 0..n {
+        let start = row * n;
+        let sum = raw[start..start + n].iter().sum::<f32>() + eps;
+        for col in 0..n {
+            raw[start + col] /= sum;
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn column_normalize(raw: &mut [f32], n: usize, eps: f32) {
+    for col in 0..n {
+        let mut sum = eps;
+        for row in 0..n {
+            sum += raw[row * n + col];
+        }
+        for row in 0..n {
+            raw[row * n + col] /= sum;
+        }
+    }
+}
+
 fn infer_real_reference_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_INFER_REAL_REFERENCE").ok() else {
         return Ok(false);
@@ -745,6 +1075,14 @@ fn load_layer_weights_enabled() -> Result<bool> {
     }
 }
 
+fn dsv4_gpu_ffn_layer_limit() -> Result<usize> {
+    let Some(raw) = std::env::var("ARLE_DSV4_GPU_FFN_LAYERS").ok() else {
+        return Ok(0);
+    };
+    raw.parse::<usize>()
+        .map_err(|err| anyhow::anyhow!("invalid ARLE_DSV4_GPU_FFN_LAYERS value `{raw}`: {err}"))
+}
+
 fn deepseek_find_tensor<'data>(
     shards: &[safetensors::SafeTensors<'data>],
     weight_map: &std::collections::HashMap<String, usize>,
@@ -764,10 +1102,104 @@ fn deepseek_find_tensor<'data>(
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
+    use crate::distributed::expert_state::ExpertGroup;
     use half::bf16;
 
     fn bf16_vec(values: &[f32]) -> Vec<bf16> {
         values.iter().map(|&value| bf16::from_f32(value)).collect()
+    }
+
+    fn tiny_config() -> DeepSeekV4Config {
+        DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "torch_dtype": "bfloat16",
+            "vocab_size": 4,
+            "hidden_size": 2,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 1,
+            "hidden_act": "silu",
+            "swiglu_limit": 10.0,
+            "q_lora_rank": 1,
+            "o_lora_rank": 1,
+            "o_groups": 1,
+            "qk_rope_head_dim": 1,
+            "n_routed_experts": 1,
+            "n_shared_experts": 0,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 1,
+            "routed_scaling_factor": 1.0,
+            "norm_topk_prob": false,
+            "scoring_func": "softmax",
+            "topk_method": "noaux_tc",
+            "index_n_heads": 1,
+            "index_head_dim": 1,
+            "index_topk": 1,
+            "num_hash_layers": 0,
+            "sliding_window": 4,
+            "compress_ratios": [0],
+            "compress_rope_theta": 160000.0,
+            "hc_mult": 1,
+            "hc_sinkhorn_iters": 1,
+            "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 0,
+            "max_position_embeddings": 16,
+            "rope_theta": 10000.0,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 1.0,
+                "original_max_position_embeddings": 16,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            },
+            "rms_norm_eps": 1.0e-6,
+            "initializer_range": 0.02,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        }"#,
+        )
+        .unwrap()
+    }
+
+    fn matrix(
+        ctx: &DeviceContext,
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<DeviceMatrix> {
+        DeviceMatrix::from_host(ctx, &bf16_vec(values), rows, cols)
+    }
+
+    fn vec(ctx: &DeviceContext, values: &[f32]) -> Result<DeviceVec> {
+        DeviceVec::from_host(ctx, &bf16_vec(values))
+    }
+
+    fn dummy_attention(ctx: &DeviceContext) -> Result<DeepseekV4Attention> {
+        Ok(DeepseekV4Attention {
+            wq_a: matrix(ctx, &[0.0, 0.0], 1, 2)?,
+            q_norm: vec(ctx, &[1.0])?,
+            wq_b: matrix(ctx, &[0.0], 1, 1)?,
+            wkv: matrix(ctx, &[0.0, 0.0], 1, 2)?,
+            kv_norm: vec(ctx, &[1.0])?,
+            wo_a: matrix(ctx, &[0.0], 1, 1)?,
+            wo_b: matrix(ctx, &[0.0, 0.0], 2, 1)?,
+            attn_sink: vec(ctx, &[0.0])?,
+            compressor: None,
+            indexer: None,
+        })
+    }
+
+    fn assert_close(got: f32, expected: f32, tol: f32) {
+        assert!(
+            (got - expected).abs() <= tol,
+            "expected {expected}, got {got}, tol {tol}"
+        );
     }
 
     #[test]
@@ -827,6 +1259,165 @@ mod tests {
                 expected[idx]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn gen_mhc_params_uses_rms_scaled_mixes() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let stream = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 5.0]))?,
+            hidden_dim: 4,
+            seq_len: 1,
+        };
+        let hc = DeepseekV4HyperConnection {
+            base: vec(&ctx, &[0.0; 8])?,
+            mix_fn: matrix(
+                &ctx,
+                &[
+                    1.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0, //
+                    0.0, 1.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0,
+                ],
+                8,
+                4,
+            )?,
+            scale: vec(&ctx, &[1.0, 1.0, 1.0])?,
+        };
+
+        let mhc = gen_mhc_params(&ctx, &hc, &stream, 2, 1.0e-6, 2)?;
+        let rsqrt = 1.0_f32 / ((1.0_f32 + 4.0 + 9.0 + 25.0) / 4.0 + 1.0e-6).sqrt();
+        assert_close(mhc.pre[0], sigmoid(rsqrt) + 1.0e-6, 0.003);
+        assert_close(mhc.pre[1], 0.5 + 1.0e-6, 0.003);
+        assert_close(mhc.post[0], 1.0, 0.003);
+        assert_close(mhc.post[1], 2.0 * sigmoid(2.0 * rsqrt), 0.003);
+        for col in 0..2 {
+            let sum = mhc.comb[col] + mhc.comb[2 + col];
+            assert_close(sum, 1.0, 0.01);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hc_pre_and_post_move_rows_through_segments() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let stream = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 5.0]))?,
+            hidden_dim: 4,
+            seq_len: 1,
+        };
+
+        let pre = hc_pre_from_stream(&ctx, &stream, &[0.25, 0.5], 2, 2)?;
+        let pre_host = ctx.stream.clone_dtoh(&pre.data)?;
+        ctx.sync()?;
+        let pre_got = pre_host
+            .iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        assert_close(pre_got[0], 1.75, 0.01);
+        assert_close(pre_got[1], 3.0, 0.01);
+
+        let new_x = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[10.0, 20.0]))?,
+            hidden_dim: 2,
+            seq_len: 1,
+        };
+        let out = hc_post_to_stream(
+            &ctx,
+            &new_x,
+            &stream,
+            &[0.1, 0.2],
+            &[1.0, 0.0, 0.25, 0.75],
+            2,
+            2,
+        )?;
+        let host = ctx.stream.clone_dtoh(&out.data)?;
+        ctx.sync()?;
+        let got = host.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+        assert_close(got[0], 2.0, 0.02);
+        assert_close(got[1], 4.0, 0.02);
+        assert_close(got[2], 4.5, 0.03);
+        assert_close(got[3], 8.25, 0.04);
+        Ok(())
+    }
+
+    #[test]
+    fn top_level_logits_can_run_one_gpu_ffn_layer() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let mut config = DeepseekRuntimeConfig::from_spec(tiny_config());
+        config.ep = ExpertGroup::new(0, 1, 1)?;
+        let model = DeepseekModel {
+            embed_tokens: Some(matrix(
+                &ctx,
+                &[
+                    1.0, 0.0, //
+                    0.0, 1.0, //
+                    1.0, 1.0, //
+                    -1.0, 1.0,
+                ],
+                4,
+                2,
+            )?),
+            lm_head: Some(matrix(
+                &ctx,
+                &[
+                    1.0, 0.0, //
+                    0.0, 1.0, //
+                    1.0, 1.0, //
+                    -1.0, 1.0,
+                ],
+                4,
+                2,
+            )?),
+            norm: Some(DeviceVec::ones(&ctx, 2)?),
+            head_hc: Some(DeepseekV4HyperConnection {
+                base: vec(&ctx, &[0.0])?,
+                mix_fn: matrix(&ctx, &[0.0, 0.0], 1, 2)?,
+                scale: vec(&ctx, &[0.0])?,
+            }),
+            layers: vec![DeepseekLayer {
+                attn_norm: DeviceVec::ones(&ctx, 2)?,
+                hc_attn: DeepseekV4HyperConnection {
+                    base: vec(&ctx, &[0.0, 0.0, 0.0])?,
+                    mix_fn: matrix(&ctx, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 3, 2)?,
+                    scale: vec(&ctx, &[0.0, 0.0, 0.0])?,
+                },
+                attention: dummy_attention(&ctx)?,
+                ffn_norm: DeviceVec::ones(&ctx, 2)?,
+                hc_ffn: DeepseekV4HyperConnection {
+                    base: vec(&ctx, &[0.0, 0.0, 0.0])?,
+                    mix_fn: matrix(&ctx, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 3, 2)?,
+                    scale: vec(&ctx, &[0.0, 0.0, 0.0])?,
+                },
+                ffn: DeepseekV4MoeBlock {
+                    gate_weight: matrix(&ctx, &[1.0, 0.0], 1, 2)?,
+                    gate_bias: Some(vec(&ctx, &[0.0])?),
+                    gate_tid2eid: None,
+                    experts: vec![DeepseekV4Expert {
+                        w1: matrix(&ctx, &[1.0, 0.0], 1, 2)?,
+                        w2: matrix(&ctx, &[1.0, 1.0], 2, 1)?,
+                        w3: matrix(&ctx, &[0.0, 1.0], 1, 2)?,
+                    }],
+                    shared_experts: None,
+                },
+            }],
+            config,
+            ctx,
+            reference: None,
+        };
+
+        let logits = model
+            .compute_top_level_logits_with_ffn_layer_limit(&[0], 1)?
+            .expect("logits");
+        assert_eq!(logits.len, 4);
+        let host = model.ctx.stream.clone_dtoh(&logits.data)?;
+        model.ctx.sync()?;
+        assert!(host.iter().all(|value| value.to_f32().is_finite()));
         Ok(())
     }
 }
