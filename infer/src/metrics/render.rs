@@ -207,6 +207,60 @@ impl ServerMetrics {
         .unwrap();
 
         out.push_str(
+            "# HELP infer_prefix_lookup_latency_microseconds Latency of the most recent scheduler prefix lookup.\n",
+        );
+        out.push_str("# TYPE infer_prefix_lookup_latency_microseconds gauge\n");
+        writeln!(
+            out,
+            "infer_prefix_lookup_latency_microseconds{{{labels}}} {}",
+            self.prefix_lookup_latency_us()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_prefix_lookup_reusable_tokens Reusable tokens selected by the most recent scheduler prefix lookup.\n",
+        );
+        out.push_str("# TYPE infer_prefix_lookup_reusable_tokens gauge\n");
+        writeln!(
+            out,
+            "infer_prefix_lookup_reusable_tokens{{{labels}}} {}",
+            self.prefix_lookup_reusable_tokens()
+        )
+        .unwrap();
+
+        for (name, value, help) in [
+            (
+                "infer_prefix_lookup_ready_on_gpu",
+                self.prefix_lookup_ready_on_gpu(),
+                "Whether the most recent scheduler prefix lookup was fully ready on GPU.",
+            ),
+            (
+                "infer_prefix_lookup_direct_gpu_attach",
+                self.prefix_lookup_direct_gpu_attach(),
+                "Whether the most recent scheduler prefix lookup selected direct GPU attachment.",
+            ),
+            (
+                "infer_prefix_lookup_staged",
+                self.prefix_lookup_staged(),
+                "Whether the most recent scheduler prefix lookup selected staged readmission.",
+            ),
+            (
+                "infer_prefix_lookup_prefetch",
+                self.prefix_lookup_prefetch(),
+                "Whether the most recent staged prefix lookup queued prefetch.",
+            ),
+            (
+                "infer_prefix_lookup_recompute",
+                self.prefix_lookup_recompute(),
+                "Whether the most recent scheduler prefix lookup advised recompute.",
+            ),
+        ] {
+            writeln!(out, "# HELP {name} {help}").unwrap();
+            writeln!(out, "# TYPE {name} gauge").unwrap();
+            writeln!(out, "{name}{{{labels}}} {}", u64::from(value)).unwrap();
+        }
+
+        out.push_str(
             "# HELP infer_tier_fetch_staged_host_blocks_total Request-weighted staged blocks found in T1.\n",
         );
         out.push_str("# TYPE infer_tier_fetch_staged_host_blocks_total counter\n");
@@ -1304,6 +1358,13 @@ impl ServerMetrics {
             "prefix_aware_admit_deferrals": self.prefix_aware_admit_deferrals_total(),
             "matched_prefix_tokens": self.matched_prefix_tokens(),
             "resume_prefill_tokens": self.resume_prefill_tokens(),
+            "prefix_lookup_latency_us": self.prefix_lookup_latency_us(),
+            "prefix_lookup_reusable_tokens": self.prefix_lookup_reusable_tokens(),
+            "prefix_lookup_ready_on_gpu": self.prefix_lookup_ready_on_gpu(),
+            "prefix_lookup_direct_gpu_attach": self.prefix_lookup_direct_gpu_attach(),
+            "prefix_lookup_staged": self.prefix_lookup_staged(),
+            "prefix_lookup_prefetch": self.prefix_lookup_prefetch(),
+            "prefix_lookup_recompute": self.prefix_lookup_recompute(),
             "last_request": {
                 "session_id": latest.session_id,
                 "prefix_hit_rate": latest.prefix_hit_rate(),
@@ -1542,7 +1603,7 @@ impl ServerMetrics {
             format!(" prefix_skip_rate={:.1}%", self.prefix_skip_rate() * 100.0)
         };
         let agent_cache_suffix = format!(
-            " prefix_request_hit_rate={:.1}% prefix_request_skip_rate={:.1}% session_affinity_hit={} session_affinity_miss={} session_slot_pressure_evictions_hard={} prefix_aware_admit_deferrals={} matched_prefix_tokens={} resume_prefill_tokens={}",
+            " prefix_request_hit_rate={:.1}% prefix_request_skip_rate={:.1}% session_affinity_hit={} session_affinity_miss={} session_slot_pressure_evictions_hard={} prefix_aware_admit_deferrals={} matched_prefix_tokens={} resume_prefill_tokens={} prefix_lookup_latency_us={} prefix_lookup_reusable_tokens={} prefix_lookup_ready_on_gpu={} prefix_lookup_direct_gpu_attach={} prefix_lookup_staged={} prefix_lookup_prefetch={} prefix_lookup_recompute={}",
             self.prefix_request_hit_rate() * 100.0,
             self.prefix_request_skip_rate() * 100.0,
             self.session_affinity_hit_total(),
@@ -1551,6 +1612,13 @@ impl ServerMetrics {
             self.prefix_aware_admit_deferrals_total(),
             self.matched_prefix_tokens(),
             self.resume_prefill_tokens(),
+            self.prefix_lookup_latency_us(),
+            self.prefix_lookup_reusable_tokens(),
+            u64::from(self.prefix_lookup_ready_on_gpu()),
+            u64::from(self.prefix_lookup_direct_gpu_attach()),
+            u64::from(self.prefix_lookup_staged()),
+            u64::from(self.prefix_lookup_prefetch()),
+            u64::from(self.prefix_lookup_recompute()),
         );
 
         // M1 unified engine telemetry tail. Keys are flat key=value
