@@ -654,7 +654,7 @@ impl<M: ModelForward> Scheduler<M> {
         slot_idx: usize,
         step_idx: usize,
         local_token: u32,
-    ) -> Result<u32> {
+    ) -> anyhow::Result<u32> {
         let Some(distributed) = self
             .request(slot_idx)
             .and_then(|req| req.distributed.as_ref())
