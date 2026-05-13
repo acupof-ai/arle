@@ -1,6 +1,7 @@
 use super::{
-    BlockSelectionIntent, can_publish_prefix_pages, host_spill_target_bytes, is_full_sealed_prefix,
-    prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
+    BlockSelectionIntent, can_publish_prefix_pages,
+    can_publish_prefix_pages_without_watermark_pressure, host_spill_target_bytes,
+    is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
     select_sparse_pages_from_slot_pages,
 };
 use crate::prefix_cache::BlockId;
@@ -19,6 +20,19 @@ fn publish_is_denied_once_new_pages_cross_hard_cap() {
     assert!(can_publish_prefix_pages(80, 100, 10, HARD_CAP));
     assert!(!can_publish_prefix_pages(81, 100, 10, HARD_CAP));
     assert!(!can_publish_prefix_pages(90, 100, 1, HARD_CAP));
+}
+
+#[test]
+fn publish_is_denied_once_new_pages_cross_high_water() {
+    assert!(can_publish_prefix_pages_without_watermark_pressure(
+        50, 100, 25, HARD_CAP, 0.75,
+    ));
+    assert!(!can_publish_prefix_pages_without_watermark_pressure(
+        50, 100, 26, HARD_CAP, 0.75,
+    ));
+    assert!(!can_publish_prefix_pages_without_watermark_pressure(
+        0, 100, 76, HARD_CAP, 0.75,
+    ));
 }
 
 #[test]
