@@ -73,12 +73,14 @@
 //! | `infer_prefix_skip_rate` | gauge | Fraction of prompt tokens skipped by prefix reuse |
 //! | `infer_prefix_request_hit_rate` | gauge | Prefix hit rate for the most recent lookup |
 //! | `infer_prefix_request_skip_rate` | gauge | Prompt-token skip rate for the most recent lookup |
+//! | `infer_prefix_lookup_latency_microseconds` | gauge | Latency of the most recent scheduler prefix lookup |
 //! | `infer_session_affinity_hit_total` | counter | Session-tagged requests that reused a prefix |
 //! | `infer_session_affinity_miss_total` | counter | Session-tagged requests without prefix reuse |
 //! | `infer_session_slot_pressure_evictions_hard_total` | counter | Inactive session slots evicted under hard pressure |
 //! | `infer_prefix_aware_admit_deferrals_total` | counter | Cold admission candidates deferred by PrefixAware soft-cap |
 //! | `infer_matched_prefix_tokens` | gauge | Matched prefix tokens for the most recent prefix lookup |
 //! | `infer_resume_prefill_tokens` | gauge | Effective prefill tokens for the most recent prefix lookup |
+//! | `infer_prefix_lookup_reusable_tokens` | gauge | Reusable tokens selected by the most recent scheduler prefix lookup |
 //! | `infer_tier_fetch_staged_host_blocks_total` | counter | Request-weighted staged blocks found in T1 |
 //! | `infer_tier_fetch_staged_disk_blocks_total` | counter | Request-weighted staged blocks found in T2 |
 //! | `infer_tier_fetch_staged_remote_blocks_total` | counter | Request-weighted staged blocks found in T3 |
@@ -367,6 +369,13 @@ struct MetricsInner {
     pub resume_prefill_tokens: AtomicU64,
     pub prefix_request_hit_ppm: AtomicU64,
     pub prefix_request_skip_ppm: AtomicU64,
+    pub prefix_lookup_latency_us: AtomicU64,
+    pub prefix_lookup_reusable_tokens: AtomicU64,
+    pub prefix_lookup_ready_on_gpu: AtomicU64,
+    pub prefix_lookup_direct_gpu_attach: AtomicU64,
+    pub prefix_lookup_staged: AtomicU64,
+    pub prefix_lookup_prefetch: AtomicU64,
+    pub prefix_lookup_recompute: AtomicU64,
     pub memory_active_bytes: AtomicU64,
     pub memory_peak_bytes: AtomicU64,
     pub memory_cache_bytes: AtomicU64,
@@ -483,6 +492,13 @@ impl ServerMetrics {
                 resume_prefill_tokens: AtomicU64::new(0),
                 prefix_request_hit_ppm: AtomicU64::new(0),
                 prefix_request_skip_ppm: AtomicU64::new(0),
+                prefix_lookup_latency_us: AtomicU64::new(0),
+                prefix_lookup_reusable_tokens: AtomicU64::new(0),
+                prefix_lookup_ready_on_gpu: AtomicU64::new(0),
+                prefix_lookup_direct_gpu_attach: AtomicU64::new(0),
+                prefix_lookup_staged: AtomicU64::new(0),
+                prefix_lookup_prefetch: AtomicU64::new(0),
+                prefix_lookup_recompute: AtomicU64::new(0),
                 memory_active_bytes: AtomicU64::new(0),
                 memory_peak_bytes: AtomicU64::new(0),
                 memory_cache_bytes: AtomicU64::new(0),
@@ -648,6 +664,68 @@ impl ServerMetrics {
                 );
             }
         }
+    }
+
+    /// Record the scheduler admission-side prefix lookup decision without
+    /// incrementing lookup counters that are already updated at request prefill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_prefix_lookup_detail(
+        &self,
+        prompt_tokens: usize,
+        matched_prefix_tokens: usize,
+        reusable_tokens: usize,
+        lookup_latency_us: u64,
+        ready_on_gpu: bool,
+        direct_gpu_attach: bool,
+        staged: bool,
+        prefetch: bool,
+        recompute: bool,
+    ) {
+        let matched_prefix_tokens = matched_prefix_tokens.min(prompt_tokens);
+        let reusable_tokens = reusable_tokens.min(prompt_tokens);
+        self.inner
+            .matched_prefix_tokens
+            .store(matched_prefix_tokens as u64, Ordering::Relaxed);
+        self.inner
+            .prefix_lookup_reusable_tokens
+            .store(reusable_tokens as u64, Ordering::Relaxed);
+        self.inner
+            .prefix_lookup_latency_us
+            .store(lookup_latency_us, Ordering::Relaxed);
+        self.inner.prefix_request_hit_ppm.store(
+            if matched_prefix_tokens > 0 {
+                1_000_000
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+        self.inner.prefix_request_skip_ppm.store(
+            ratio_ppm(matched_prefix_tokens as u64, prompt_tokens as u64),
+            Ordering::Relaxed,
+        );
+        self.inner
+            .prefix_lookup_ready_on_gpu
+            .store(ready_on_gpu as u64, Ordering::Relaxed);
+        self.inner
+            .prefix_lookup_direct_gpu_attach
+            .store(direct_gpu_attach as u64, Ordering::Relaxed);
+        self.inner
+            .prefix_lookup_staged
+            .store(staged as u64, Ordering::Relaxed);
+        self.inner
+            .prefix_lookup_prefetch
+            .store(prefetch as u64, Ordering::Relaxed);
+        self.inner
+            .prefix_lookup_recompute
+            .store(recompute as u64, Ordering::Relaxed);
+    }
+
+    /// Mark that the most recent staged prefix lookup was queued for prefetch.
+    pub fn record_prefix_lookup_prefetch_queued(&self) {
+        self.inner
+            .prefix_lookup_prefetch
+            .store(1, Ordering::Relaxed);
     }
 
     /// Record request-weighted staged fetch blocks by slower-tier source.
@@ -1398,6 +1476,42 @@ impl ServerMetrics {
 
     pub fn resume_prefill_tokens(&self) -> u64 {
         self.inner.resume_prefill_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn prefix_lookup_latency_us(&self) -> u64 {
+        self.inner.prefix_lookup_latency_us.load(Ordering::Relaxed)
+    }
+
+    pub fn prefix_lookup_reusable_tokens(&self) -> u64 {
+        self.inner
+            .prefix_lookup_reusable_tokens
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn prefix_lookup_ready_on_gpu(&self) -> bool {
+        self.inner
+            .prefix_lookup_ready_on_gpu
+            .load(Ordering::Relaxed)
+            != 0
+    }
+
+    pub fn prefix_lookup_direct_gpu_attach(&self) -> bool {
+        self.inner
+            .prefix_lookup_direct_gpu_attach
+            .load(Ordering::Relaxed)
+            != 0
+    }
+
+    pub fn prefix_lookup_staged(&self) -> bool {
+        self.inner.prefix_lookup_staged.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn prefix_lookup_prefetch(&self) -> bool {
+        self.inner.prefix_lookup_prefetch.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn prefix_lookup_recompute(&self) -> bool {
+        self.inner.prefix_lookup_recompute.load(Ordering::Relaxed) != 0
     }
 
     pub fn session_slot_pressure_evictions_hard(&self) -> u64 {

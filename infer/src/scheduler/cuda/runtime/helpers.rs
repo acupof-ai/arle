@@ -16,6 +16,7 @@ pub(super) struct FetchWaiter {
 pub(super) struct PrefixAdmissionPlan {
     pub(super) radix_blocks: Vec<crate::prefix_cache::BlockId>,
     pub(super) lookup: crate::kv_tier::LookupOutcome,
+    pub(super) trace_context: Option<fastrace::collector::SpanContext>,
     pub(super) session_resume_tokens: usize,
     pub(super) reusable: Option<(usize, usize, usize)>,
     pub(super) direct_gpu_attach: bool,

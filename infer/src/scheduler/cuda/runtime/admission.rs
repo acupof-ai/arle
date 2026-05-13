@@ -19,12 +19,14 @@ use crate::scheduler::policy::SchedulerSignals;
 use crate::scheduler::types::{RequestLengthContract, SchedulerAdmissionPolicy};
 use crate::server_engine::FinishReason;
 use crate::types::SessionId;
+use fastrace::{Event, Span};
 
 impl<M: ModelForward> Scheduler<M> {
     fn cold_prefix_admission_plan(&self) -> PrefixAdmissionPlan {
         PrefixAdmissionPlan {
             radix_blocks: Vec::new(),
             lookup: crate::kv_tier::LookupOutcome::new(0, Vec::new(), false),
+            trace_context: None,
             session_resume_tokens: 0,
             reusable: None,
             direct_gpu_attach: false,
@@ -165,6 +167,7 @@ impl<M: ModelForward> Scheduler<M> {
         &mut self,
         prompt_tokens: &[u32],
         session_id: Option<&SessionId>,
+        trace_context: Option<fastrace::collector::SpanContext>,
         free_slots: &[usize],
     ) -> PrefixAdmissionPlan {
         if !self.config.prefix_cache_enabled {
@@ -179,6 +182,20 @@ impl<M: ModelForward> Scheduler<M> {
         let block_size = self.prefix_cache.block_size();
         let heuristics = LookupHeuristics::default();
         let mut session_slot_hold = None;
+        let lookup_started_at = std::time::Instant::now();
+        let lookup_trace = trace_context.map(|parent| {
+            Span::root("prefix_lookup", parent).with_properties(|| {
+                [
+                    ("prompt_tokens", prompt_tokens.len().to_string()),
+                    (
+                        "session_id",
+                        session_id
+                            .map(|id| id.as_str().to_string())
+                            .unwrap_or_default(),
+                    ),
+                ]
+            })
+        });
         // P0.0 Phase 1.A nvtx scope per `2fafa9e` recipe + `b55bfcd` block-as-rvalue
         // scoping fix. Isolates prefix::lookup phase from broader step_admission for
         // nsys 4-phase decomposition (prefix lookup / prefill compute / first decode /
@@ -278,10 +295,58 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             None
         };
+        let reusable_tokens = if lookup.recompute_advised {
+            0
+        } else if direct_gpu_attach {
+            lookup.matched_len
+        } else if let Some((_, reusable_prefix_len, _)) = reusable_gpu_prefix {
+            reusable_prefix_len
+        } else {
+            staged_prefix_plan
+                .as_ref()
+                .map(|staged| staged.matched_len)
+                .unwrap_or_default()
+        };
+        let lookup_latency_us = lookup_started_at.elapsed().as_micros() as u64;
+        let staged = staged_prefix_plan.is_some();
+        self.metrics.record_prefix_lookup_detail(
+            prompt_tokens.len(),
+            lookup.matched_len,
+            reusable_tokens,
+            lookup_latency_us,
+            ready_on_gpu,
+            direct_gpu_attach,
+            staged,
+            false,
+            lookup.recompute_advised,
+        );
+        if let Some(span) = lookup_trace.as_ref() {
+            let (host_blocks, disk_blocks, remote_blocks) = staged_prefix_plan
+                .as_ref()
+                .map(|staged| staged.source_counts())
+                .unwrap_or((0, 0, 0));
+            let props = vec![
+                ("matched_len", lookup.matched_len.to_string()),
+                ("reusable_tokens", reusable_tokens.to_string()),
+                ("hit", (lookup.matched_len > 0).to_string()),
+                ("ready_on_gpu", ready_on_gpu.to_string()),
+                ("direct_gpu_attach", direct_gpu_attach.to_string()),
+                ("staged", staged.to_string()),
+                ("prefetch", false.to_string()),
+                ("recompute", lookup.recompute_advised.to_string()),
+                ("lookup_latency_us", lookup_latency_us.to_string()),
+                ("staged_host_blocks", host_blocks.to_string()),
+                ("staged_disk_blocks", disk_blocks.to_string()),
+                ("staged_remote_blocks", remote_blocks.to_string()),
+            ];
+            span.add_properties(|| props.clone());
+            span.add_event(Event::new("prefix_lookup_result").with_properties(|| props));
+        }
 
         PrefixAdmissionPlan {
             radix_blocks,
             lookup,
+            trace_context,
             session_resume_tokens,
             reusable: reusable_gpu_prefix,
             direct_gpu_attach,
@@ -323,6 +388,7 @@ impl<M: ModelForward> Scheduler<M> {
             let plan = self.build_prefix_admission_plan(
                 &prompt_tokens,
                 incoming.session_id.as_ref(),
+                incoming.trace_context,
                 free_slots,
             );
             let reusable_prefix_len = plan
@@ -530,6 +596,7 @@ impl<M: ModelForward> Scheduler<M> {
     ) {
         let PrefixAdmissionPlan {
             lookup,
+            trace_context: _,
             direct_gpu_attach,
             attached_prefix_blocks,
             staged_prefix_plan,
@@ -844,6 +911,25 @@ impl<M: ModelForward> Scheduler<M> {
         self.fetch_ticket_started_at
             .insert(ticket, std::time::Instant::now());
         self.prefetch_fetching.insert(ticket, prefetch_state);
+        self.metrics.record_prefix_lookup_prefetch_queued();
+        if let Some(parent) = plan.trace_context {
+            let span = Span::root("prefix_prefetch", parent).with_properties(|| {
+                [
+                    ("matched_len", staged_prefix.matched_len.to_string()),
+                    ("prefetch", true.to_string()),
+                    ("host_blocks", prefetch_state.host_blocks.to_string()),
+                    ("disk_blocks", prefetch_state.disk_blocks.to_string()),
+                    ("remote_blocks", prefetch_state.remote_blocks.to_string()),
+                ]
+            });
+            span.add_event(Event::new("prefix_prefetch_queued").with_properties(|| {
+                [
+                    ("matched_len", staged_prefix.matched_len.to_string()),
+                    ("prefetch", true.to_string()),
+                    ("ticket", ticket.0.to_string()),
+                ]
+            }));
+        }
         info!(
             "Prefetch {} queued: matched={} src=h:{}/d:{}/r:{}",
             ticket.0,

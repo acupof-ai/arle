@@ -317,6 +317,22 @@ fn apply_quant_format_override(args: &Args) {
 }
 
 fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
+    let tracing = configure_global_tracing(TraceStartupConfig {
+        level: args.trace_level.clone(),
+        sample_rate: args.trace_sample_rate,
+        report_interval_ms: args.trace_report_interval_ms,
+        slow_request_ms: args.trace_slow_request_ms,
+        file_output: args.trace_output_path.clone(),
+        otlp_endpoint: args.otlp_traces_endpoint.clone(),
+        otlp_headers: args.trace_otlp_headers.clone(),
+        otlp_timeout_ms: args.trace_otlp_timeout_ms,
+        service_name: args.trace_service_name.clone(),
+    })
+    .context("invalid tracing config")?;
+    if tracing.reporter_installed() {
+        info!("Tracing configured: {}", tracing.config().summary());
+    }
+
     #[cfg(not(all(feature = "cuda", feature = "nccl")))]
     {
         let _ = args;
@@ -330,6 +346,23 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
         use infer::sampler::SamplingParams;
         use infer::tensor_parallel::TpConfig;
         use infer::tokenizer::Tokenizer;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct DirectRankPerf {
+            event: &'static str,
+            rank: usize,
+            world_size: usize,
+            tp_rank: usize,
+            ep_rank: usize,
+            layers: usize,
+            prompt_tokens: usize,
+            completion_tokens: usize,
+            load_ms: f64,
+            prefill_ms: f64,
+            decode_ms: f64,
+            total_ms: f64,
+        }
 
         let model_path = args
             .model_path
@@ -398,9 +431,28 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
         let selected_token = Arc::new(AtomicU32::new(0));
         let should_stop = Arc::new(AtomicBool::new(false));
         let generated = Arc::new(Mutex::new(Vec::new()));
+        let perf_summaries = Arc::new(Mutex::new(Vec::<DirectRankPerf>::new()));
         let prefill_barrier = Arc::new(Barrier::new(world_size));
         let token_barrier = Arc::new(Barrier::new(world_size));
         let decode_barrier = Arc::new(Barrier::new(world_size));
+        let trace_root = fastrace::Span::root(
+            "deepseek_distributed_generate",
+            fastrace::collector::SpanContext::random(),
+        )
+        .with_properties(|| {
+            [
+                ("model", resolved_model_path.clone()),
+                ("world_size", world_size.to_string()),
+                ("prompt_tokens", prompt_tokens.len().to_string()),
+                (
+                    "max_new_tokens",
+                    args.deepseek_distributed_max_new_tokens.to_string(),
+                ),
+                ("layers", layers.to_string()),
+            ]
+        });
+        let trace_root_context = fastrace::collector::SpanContext::from_span(&trace_root)
+            .unwrap_or_else(fastrace::collector::SpanContext::random);
 
         info!(
             "DeepSeek distributed direct generate: model={} ranks={} cuda_ordinals={:?} prompt_tokens={} max_new_tokens={} gpu_layers={}",
@@ -419,34 +471,86 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
             let selected_token = Arc::clone(&selected_token);
             let should_stop = Arc::clone(&should_stop);
             let generated = Arc::clone(&generated);
+            let perf_summaries = Arc::clone(&perf_summaries);
             let prefill_barrier = Arc::clone(&prefill_barrier);
             let token_barrier = Arc::clone(&token_barrier);
             let decode_barrier = Arc::clone(&decode_barrier);
             let max_new_tokens = args.deepseek_distributed_max_new_tokens;
+            let trace_parent = trace_root_context;
             handles.push(
                 std::thread::Builder::new()
                     .name(format!("dsv4-direct-rank-{rank}"))
                     .spawn(move || -> Result<()> {
+                        let total_start = Instant::now();
+                        let rank_span = fastrace::Span::root("deepseek_direct_rank", trace_parent)
+                            .with_properties(|| {
+                                [
+                                    ("rank", rank.to_string()),
+                                    ("world_size", world_size.to_string()),
+                                    ("tp_rank", rank.to_string()),
+                                    ("ep_rank", rank.to_string()),
+                                    ("layers", layers.to_string()),
+                                ]
+                            });
                         with_device_ordinal_override(cuda_ordinal as u32, || -> Result<()> {
+                            let load_start = Instant::now();
                             let mut runtime = DeepseekRuntimeConfig::from_model_dir(&model_path)?;
                             runtime.enable_cuda_graph = false;
                             runtime.tp = TpConfig::new(world_size, rank)?;
                             runtime.ep =
                                 ExpertGroup::new(rank, world_size, runtime.spec.n_routed_experts)?;
-                            let model = DeepseekModel::from_safetensors(&model_path, runtime)
-                                .with_context(|| {
-                                    format!("rank {rank}: load DeepSeek V4 weights")
-                                })?;
+                            let model = {
+                                let _load_span = fastrace::Span::enter_with_parent(
+                                    "deepseek_direct_load",
+                                    &rank_span,
+                                )
+                                .with_properties(|| {
+                                    [
+                                        ("rank", rank.to_string()),
+                                        ("cuda_ordinal", cuda_ordinal.to_string()),
+                                    ]
+                                });
+                                DeepseekModel::from_safetensors(&model_path, runtime).with_context(
+                                    || format!("rank {rank}: load DeepSeek V4 weights"),
+                                )?
+                            };
+                            let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
                             let mut state = model.create_state()?;
                             state.set_max_seq_len(max_seq_len);
                             state.set_kv_dtype(kv_cache_dtype);
-                            model
-                                .forward_prefill(&prompt_tokens, &mut state)
-                                .with_context(|| format!("rank {rank}: prefill"))?;
+                            let prefill_start = Instant::now();
+                            {
+                                let _prefill_span = fastrace::Span::enter_with_parent(
+                                    "deepseek_direct_prefill",
+                                    &rank_span,
+                                )
+                                .with_properties(|| {
+                                    [
+                                        ("rank", rank.to_string()),
+                                        ("tokens", prompt_tokens.len().to_string()),
+                                    ]
+                                });
+                                model
+                                    .forward_prefill(&prompt_tokens, &mut state)
+                                    .with_context(|| format!("rank {rank}: prefill"))?;
+                            }
+                            let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
                             prefill_barrier.wait();
 
                             let mut rng = StdRng::seed_from_u64(42);
                             let sampling = SamplingParams::default();
+                            let decode_start = Instant::now();
+                            let _decode_span = fastrace::Span::enter_with_parent(
+                                "deepseek_direct_decode",
+                                &rank_span,
+                            )
+                            .with_properties(|| {
+                                [
+                                    ("rank", rank.to_string()),
+                                    ("max_new_tokens", max_new_tokens.to_string()),
+                                ]
+                            });
+                            let mut completion_tokens = 0usize;
                             for step_idx in 0..max_new_tokens {
                                 if rank == 0 {
                                     let token = model
@@ -464,6 +568,7 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
                                     }
                                 }
                                 token_barrier.wait();
+                                completion_tokens = completion_tokens.saturating_add(1);
 
                                 let token = selected_token.load(Ordering::SeqCst);
                                 let stop = should_stop.load(Ordering::SeqCst);
@@ -477,6 +582,34 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
                                     break;
                                 }
                             }
+                            let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+                            let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+                            rank_span.add_properties(|| {
+                                [
+                                    ("load_ms", format!("{load_ms:.3}")),
+                                    ("prefill_ms", format!("{prefill_ms:.3}")),
+                                    ("decode_ms", format!("{decode_ms:.3}")),
+                                    ("total_ms", format!("{total_ms:.3}")),
+                                    ("completion_tokens", completion_tokens.to_string()),
+                                ]
+                            });
+                            perf_summaries
+                                .lock()
+                                .expect("perf summary lock poisoned")
+                                .push(DirectRankPerf {
+                                    event: "deepseek_distributed_perf",
+                                    rank,
+                                    world_size,
+                                    tp_rank: rank,
+                                    ep_rank: rank,
+                                    layers,
+                                    prompt_tokens: prompt_tokens.len(),
+                                    completion_tokens,
+                                    load_ms,
+                                    prefill_ms,
+                                    decode_ms,
+                                    total_ms,
+                                });
                             Ok(())
                         })
                     })?,
@@ -491,11 +624,24 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
         }
 
         let generated = generated.lock().expect("generated lock poisoned").clone();
+        let mut perf_summaries = perf_summaries
+            .lock()
+            .expect("perf summary lock poisoned")
+            .drain(..)
+            .collect::<Vec<_>>();
+        perf_summaries.sort_by_key(|summary| summary.rank);
+        for summary in perf_summaries {
+            println!("{}", serde_json::to_string(&summary)?);
+        }
         let generated_text = tokenizer
             .decode(&generated)
             .unwrap_or_else(|err| format!("<decode failed for {:?}: {err:#}>", generated));
         println!("deepseek_distributed_generated_token_ids={generated:?}");
         println!("deepseek_distributed_generated_text={generated_text:?}");
+        drop(trace_root);
+        if tracing.reporter_installed() {
+            fastrace::flush();
+        }
         Ok(())
     }
 }
