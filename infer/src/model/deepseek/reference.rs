@@ -12,6 +12,8 @@ use std::ops::Range;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail, ensure};
 #[cfg(feature = "cuda")]
@@ -77,6 +79,16 @@ struct CudaReferenceMatvec {
     devices: Vec<DeviceContext>,
     tp_size: usize,
     ep_size: usize,
+    matrix_cache: Mutex<HashMap<MatrixCacheKey, DeviceMatrix>>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MatrixCacheKey {
+    device_idx: usize,
+    name: String,
+    row_start: usize,
+    row_end: usize,
 }
 
 impl DeepseekV4ReferenceModel {
@@ -762,7 +774,7 @@ impl DeepseekV4ReferenceModel {
                     cuda.expert_device_idx(expert_idx, self.config.n_routed_experts)?;
                 return self
                     .tensors
-                    .cuda_matvec_on(&cuda.devices[device_idx], name, x);
+                    .cuda_matvec_on_device(cuda, device_idx, name, x);
             }
             return self.tensors.cuda_matvec_tp(cuda, name, x);
         }
@@ -809,6 +821,7 @@ impl CudaReferenceMatvec {
             devices,
             tp_size,
             ep_size,
+            matrix_cache: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -952,24 +965,30 @@ impl SafeTensorStore {
             cuda.devices.len()
         );
         if cuda.tp_size == 1 || rows < cuda.tp_size {
-            return self.cuda_matvec_on(&cuda.devices[0], name, x);
+            return self.cuda_matvec_on_device(cuda, 0, name, x);
         }
 
         let mut out = vec![0.0_f32; rows];
         for (rank, range) in self.cuda_row_shards(name, meta, cuda.tp_size)? {
             let shard =
-                self.cuda_matvec_row_range(&cuda.devices[rank], name, meta, x, range.clone())?;
+                self.cuda_matvec_row_range_cached(cuda, rank, name, meta, x, range.clone())?;
             out[range].copy_from_slice(&shard);
         }
         Ok(out)
     }
 
     #[cfg(feature = "cuda")]
-    fn cuda_matvec_on(&self, ctx: &DeviceContext, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+    fn cuda_matvec_on_device(
+        &self,
+        cuda: &CudaReferenceMatvec,
+        device_idx: usize,
+        name: &str,
+        x: &[f32],
+    ) -> Result<Vec<f32>> {
         let meta = self.meta(name)?;
         ensure!(meta.shape.len() == 2, "tensor {name} must be 2D");
         let rows = meta.shape[0];
-        self.cuda_matvec_row_range(ctx, name, meta, x, 0..rows)
+        self.cuda_matvec_row_range_cached(cuda, device_idx, name, meta, x, 0..rows)
     }
 
     #[cfg(feature = "cuda")]
@@ -1005,14 +1024,19 @@ impl SafeTensorStore {
     }
 
     #[cfg(feature = "cuda")]
-    fn cuda_matvec_row_range(
+    fn cuda_matvec_row_range_cached(
         &self,
-        ctx: &DeviceContext,
+        cuda: &CudaReferenceMatvec,
+        device_idx: usize,
         name: &str,
         meta: &TensorMeta,
         x: &[f32],
         row_range: Range<usize>,
     ) -> Result<Vec<f32>> {
+        let ctx = cuda
+            .devices
+            .get(device_idx)
+            .with_context(|| format!("missing CUDA reference device {device_idx}"))?;
         let rows = meta.shape[0];
         let cols = self.matrix_input_cols(meta);
         ensure!(
@@ -1025,10 +1049,30 @@ impl SafeTensorStore {
             "invalid row shard {:?} for matrix {name} with {rows} rows",
             row_range
         );
-        let weight = self.cuda_matrix_row_range(ctx, name, meta, row_range.clone())?;
         let input_host = x.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
         let input = DeviceVec::from_host(ctx, &input_host)?;
-        let output = crate::ops::linear(ctx, &input, &weight)?;
+        let key = MatrixCacheKey {
+            device_idx,
+            name: name.to_string(),
+            row_start: row_range.start,
+            row_end: row_range.end,
+        };
+        let mut cache = cuda
+            .matrix_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 reference matrix cache poisoned"))?;
+        if !cache.contains_key(&key) {
+            let weight = self.cuda_matrix_row_range(ctx, name, meta, row_range)?;
+            cache.insert(key.clone(), weight);
+        }
+        let output = crate::ops::linear(
+            ctx,
+            &input,
+            cache
+                .get(&key)
+                .expect("DeepSeek V4 reference matrix cache inserted before use"),
+        )?;
+        drop(cache);
         output.to_host(ctx)
     }
 
