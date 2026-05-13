@@ -467,3 +467,39 @@ Stages 1-4 have landed as a default-safe pipeline boundary while preserving the
 single-writer scheduler invariant. Treat the current implementation as
 correctness and observability scaffolding until GuideLLM + nsys prove that the
 CPU-side ranges are wall-clock material and that GPU idle time drops.
+
+## NUMA Pipeline Upgrade 2026-05-13
+
+Status: implemented as runtime architecture substrate; performance evidence
+pending on Linux/CUDA NUMA hardware.
+
+The follow-up tranche extends the Stage 1-4 boundary into a NUMA-aware worker
+layout:
+
+- **P0 topology and placement:** startup discovers NUMA nodes, NVIDIA GPU PCI
+  bus IDs, GPU -> NUMA locality, NIC PCI/NUMA locality, and fallback CPUs from
+  sysfs/procfs. The selected CUDA worker placement is logged before CUDA
+  context creation.
+- **P0 affinity before CUDA init:** `main.rs` applies the selected worker CPU
+  affinity before the early `DeviceContext::new()` memory snapshot. CUDA
+  scheduler and detokenizer worker threads re-apply the same placement when
+  they start.
+- **P0 pinned memory locality:** the scheduler still owns its T1
+  `HostPinnedPool`, but construction now happens inside the selected worker
+  placement path, so each scheduler worker allocates its own pinned pool.
+- **P1 tokenizer/detokenizer grouping:** HTTP tokenization uses ARLE-owned
+  NUMA worker groups instead of Tokio's global blocking pool. The CUDA
+  detokenizer/emit worker is placed with the scheduler worker.
+- **P1 NIC/GPU affinity:** worker placement carries nearest NIC names selected
+  from same-NUMA or CPU-intersection proximity.
+- **P1 metrics:** `/metrics` and `/v1/stats` expose topology, worker
+  placement, affinity result, preprocess/detokenizer worker counts, numastat
+  local/remote pages, and H2D latency samples from host-pinned KV promotion.
+- **P2 NUMA routing:** `NumaSchedulerRouter` selects a worker by NUMA cost plus
+  queue-load penalty, preserves session stickiness, and migrates sticky routes
+  when the previous worker is overloaded.
+
+This is still not a throughput claim. The required next evidence is a
+controlled CUDA host run that captures the final topology log, `/v1/stats`
+runtime topology payload, `numastat`/H2D counters under load, and a GuideLLM
+delta against the 2026-05-12 preprocess baseline.

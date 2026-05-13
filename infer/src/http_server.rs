@@ -13,6 +13,7 @@
 //!   train_* proxies), JSON/route helpers, SSE streaming machinery,
 //!   the `attach_request_id` middleware, and the train control TCP proxy.
 //! - `router` — the `build_app*` family that wires handlers + middleware.
+//! - `preprocess` — NUMA-aware tokenizer worker pool for prompt preprocessing.
 //! - `tests` — end-to-end Axum tests for every route.
 //!
 //! Pre-existing sibling `openai_v1` (request/response DTOs) remains unchanged.
@@ -28,6 +29,9 @@ pub(in crate::http_server) mod handlers;
 
 #[path = "http_server/router.rs"]
 pub(in crate::http_server) mod router;
+
+#[path = "http_server/preprocess.rs"]
+pub(in crate::http_server) mod preprocess;
 
 #[path = "http_server/tests.rs"]
 mod tests_mod;

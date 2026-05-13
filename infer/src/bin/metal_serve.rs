@@ -379,6 +379,7 @@ async fn main() -> Result<()> {
             api_key: api_key.map(Arc::<str>::from),
             train_control_target,
             pool_models: parse_pool_models(&args.pool_models)?,
+            ..Default::default()
         },
     );
     let listener = tokio::net::TcpListener::bind((args.bind.as_str(), args.port))
@@ -513,6 +514,7 @@ fn submit_warmup_request(
             speculative: None,
             priority: RequestPriority::High,
             session_id: None,
+            ingress_numa_node: None,
             delta_tx,
             trace_context: None,
         })

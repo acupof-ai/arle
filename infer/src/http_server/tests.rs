@@ -1109,6 +1109,7 @@ mod tests {
                     TrainControlTarget::parse("http://127.0.0.1:9123").expect("parse target"),
                 ),
                 pool_models: Vec::new(),
+                ..Default::default()
             },
         );
         let request = Request::builder()

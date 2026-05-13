@@ -21,6 +21,7 @@ use crate::backend::cuda::paged_kv::PagedKVPool;
 use crate::kv_tier::transport::DiskStore;
 use crate::model::{GenerationState, ModelForward};
 use crate::prefix_cache::RadixCache;
+use crate::runtime_topology::WorkerPlacement;
 use crate::tokenizer::Tokenizer;
 
 const WORKSPACE_SAFETY_BYTES: usize = 256 * 1024 * 1024;
@@ -48,6 +49,7 @@ impl<M: ModelForward> Scheduler<M> {
             None,
             crate::model::kv_cache::KVCacheDtype::BF16,
             crate::model::kv_cache::KVFormat::BF16,
+            None,
         )
     }
 
@@ -71,6 +73,7 @@ impl<M: ModelForward> Scheduler<M> {
             max_seq_len_override,
             crate::model::kv_cache::KVCacheDtype::BF16,
             crate::model::kv_cache::KVFormat::BF16,
+            None,
         )
     }
 
@@ -85,6 +88,7 @@ impl<M: ModelForward> Scheduler<M> {
         max_seq_len_override: Option<usize>,
         kv_cache_dtype: crate::model::kv_cache::KVCacheDtype,
         kv_pool_format: crate::model::kv_cache::KVFormat,
+        worker_placement: Option<WorkerPlacement>,
     ) -> Result<(Self, SchedulerHandle)> {
         config.validate()?;
 
@@ -282,8 +286,26 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let (coordinator, coordinator_handle, coordinator_events) = coord_builder.build();
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
-        let (emit_tx, emit_events, emit_thread) =
-            spawn_emit_worker(tokenizer.clone(), config.stream_interval);
+        if let Some(placement) = worker_placement.as_ref() {
+            info!(
+                "Scheduler worker placement: worker={} gpu={} numa={:?} cpus={} nics={}",
+                placement.worker_id,
+                placement.gpu_ordinal,
+                placement.numa_node,
+                placement.cpus.len(),
+                if placement.nics.is_empty() {
+                    "none".to_string()
+                } else {
+                    placement.nics.join(",")
+                },
+            );
+            metrics.set_detokenizer_topology(1, 1);
+        }
+        let (emit_tx, emit_events, emit_thread) = spawn_emit_worker(
+            tokenizer.clone(),
+            config.stream_interval,
+            worker_placement.clone(),
+        );
         let max_slots = config.max_slots;
         let max_waiting_requests = config.max_waiting_requests;
         let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;

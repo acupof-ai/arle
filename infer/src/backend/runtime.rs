@@ -530,6 +530,7 @@ mod tests {
                 speculative: None,
                 priority: crate::scheduler::RequestPriority::default(),
                 session_id: None,
+                ingress_numa_node: None,
                 delta_tx,
                 trace_context: None,
             },

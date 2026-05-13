@@ -11,8 +11,10 @@ use super::openai_v1::{
     ChatCompletionRequest, CompletionRequest as OpenAiCompletionRequest, ResponsesRequest,
     SpecConfig as OpenAiSpecConfig,
 };
+use super::preprocess::PreprocessWorkerPool;
 use crate::metrics::ServerMetrics;
 use crate::request_handle::RequestHandle;
+use crate::runtime_topology::RuntimeTopology;
 use crate::sampler::{SamplingParams, sampling_params_from_request};
 use crate::scheduler::{IncomingRequest, RequestPriority, RequestSpecConfig};
 use crate::server_engine::{
@@ -20,8 +22,6 @@ use crate::server_engine::{
 };
 use fastrace::collector::SpanContext;
 use tokio::sync::Semaphore;
-
-use crate::tokenizer::Tokenizer;
 
 /// Maximum wall-clock time allowed for a non-streaming request to complete.
 /// Streaming responses have natural per-chunk flow control and are not capped here.
@@ -31,7 +31,7 @@ pub(super) const HTTP_REQUEST_ID_HEADER: &str = "x-request-id";
 
 pub(super) struct AppState {
     pub(super) handle: Arc<dyn RequestHandle>,
-    pub(super) tokenizer: Option<Arc<Tokenizer>>,
+    pub(super) preprocess_pool: Option<Arc<PreprocessWorkerPool>>,
     pub(super) preprocess_permits: Arc<Semaphore>,
     pub(super) preprocess_capacity: usize,
     pub(super) identity: ServingIdentity,
@@ -54,6 +54,7 @@ pub struct HttpServerConfig {
     pub api_key: Option<Arc<str>>,
     pub train_control_target: Option<TrainControlTarget>,
     pub pool_models: Vec<EnginePoolModelSpec>,
+    pub runtime_topology: Option<RuntimeTopology>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,6 +254,7 @@ impl RequestExecutionOptions {
         self,
         prompt: String,
         prompt_tokens: Option<Vec<u32>>,
+        ingress_numa_node: Option<i32>,
         delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
         trace_context: Option<SpanContext>,
     ) -> IncomingRequest {
@@ -265,6 +267,7 @@ impl RequestExecutionOptions {
             speculative: self.speculative,
             priority: RequestPriority::default(),
             session_id: self.session_id,
+            ingress_numa_node,
             delta_tx,
             trace_context,
         }

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
@@ -12,6 +13,10 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
+use infer::request_handle::NumaSchedulerRouter;
+use infer::runtime_topology::{
+    RuntimeTopology, bind_process_to_placement, sample_process_numa_maps,
+};
 use infer::scheduler::{
     DraftMode, SchedulePolicy, SchedulerAdmissionPolicy, SchedulerConfig, SchedulerMixedPolicy,
 };
@@ -330,6 +335,29 @@ async fn async_main(args: Args) {
         .expect("Resolved model path must be valid UTF-8");
     let model_type = detect_model_type(resolved_model_path).expect("Failed to detect model type");
     info!("=== Infer Server - {} (GPU) ===", model_type);
+    let metrics = infer::metrics::ServerMetrics::new(model_path);
+    let runtime_topology = RuntimeTopology::discover();
+    runtime_topology.log_summary();
+    let worker_placement = runtime_topology.placement_for_configured_cuda_device();
+    let affinity = bind_process_to_placement(&worker_placement, "main-before-cuda");
+    info!(
+        "Final runtime worker placement: worker={} gpu={} numa={:?} cpus={} nics={} affinity_applied={} reason={}",
+        worker_placement.worker_id,
+        worker_placement.gpu_ordinal,
+        worker_placement.numa_node,
+        worker_placement.cpus.len(),
+        if worker_placement.nics.is_empty() {
+            "none".to_string()
+        } else {
+            worker_placement.nics.join(",")
+        },
+        affinity.applied,
+        affinity.reason,
+    );
+    metrics.set_runtime_topology(&runtime_topology, &worker_placement, &affinity);
+    if let Some(numastat) = sample_process_numa_maps() {
+        metrics.set_runtime_numastat(&numastat, worker_placement.numa_node);
+    }
 
     // Earliest possible CUDA snapshot: initialize the primary context (and
     // cuBLAS handle) here, BEFORE any cuda-kernels lazy-static cubin loaders
@@ -377,7 +405,6 @@ async fn async_main(args: Args) {
             args.mem_fraction_static,
         )
     });
-    let metrics = infer::metrics::ServerMetrics::new(model_path);
     let kv_candidates = kv_mode_candidates(requested_kv_mode, args.max_seq_len.is_some());
     let mut last_err = None;
     let mut selected_mode = None;
@@ -400,6 +427,7 @@ async fn async_main(args: Args) {
             kv_cache_dtype,
             kv_pool_format,
             pre_model_free_bytes,
+            worker_placement: Some(worker_placement.clone()),
         };
 
         match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
@@ -461,6 +489,9 @@ async fn async_main(args: Args) {
     scheduler_runtime
         .wait_ready()
         .unwrap_or_else(|err| panic!("scheduler warmup failed: {err}"));
+    if let Some(numastat) = sample_process_numa_maps() {
+        metrics.set_runtime_numastat(&numastat, worker_placement.numa_node);
+    }
 
     let train_control_target = args
         .train_control_url
@@ -468,12 +499,19 @@ async fn async_main(args: Args) {
         .map(TrainControlTarget::parse)
         .transpose()
         .unwrap_or_else(|err| panic!("invalid --train-control-url: {err}"));
-    let app = build_app_with_config(
+    let routed_handle = Arc::new(NumaSchedulerRouter::single(
         handle.clone(),
+        runtime_topology.clone(),
+        worker_placement.clone(),
+        metrics.clone(),
+    ));
+    let app = build_app_with_config(
+        routed_handle.clone(),
         metrics,
         HttpServerConfig {
             train_control_target,
             pool_models: parse_pool_models(&args.pool_models),
+            runtime_topology: Some(runtime_topology.clone()),
             ..Default::default()
         },
     );
@@ -496,6 +534,7 @@ async fn async_main(args: Args) {
 
     // Drop the last submission handle before joining the scheduler thread so
     // request_rx disconnects and the scheduler can unwind its CUDA resources.
+    drop(routed_handle);
     drop(handle);
     scheduler_runtime.wait();
 

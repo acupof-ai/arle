@@ -157,6 +157,7 @@ impl<M: ModelForward> Scheduler<M> {
                 speculative: victim.speculative.clone(),
                 priority: victim.priority,
                 session_id: victim.session_id.clone(),
+                ingress_numa_node: victim.ingress_numa_node,
                 trace_context: victim.trace_context,
                 delta_tx: victim.delta_tx.clone(),
             };

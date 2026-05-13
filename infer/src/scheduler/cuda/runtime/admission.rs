@@ -619,6 +619,7 @@ impl<M: ModelForward> Scheduler<M> {
                 .then(crate::speculative::AcceptanceTracker::default_window),
             spec_decode_disabled: false,
             session_id: incoming.session_id,
+            ingress_numa_node: incoming.ingress_numa_node,
             trace_context: incoming.trace_context,
             delta_tx: incoming.delta_tx,
             emit_cursor: super::super::request::EmitCursor::default(),
@@ -982,6 +983,7 @@ impl<M: ModelForward> Scheduler<M> {
                         )
                     })?;
                     let pages = self.paged_kv_pool.alloc_detached_pages(pages_per_block)?;
+                    let h2d_started_at = std::time::Instant::now();
                     let copy_result =
                         self.host_pinned_pool
                             .with_region_slice(fetched.host_region, |payload| {
@@ -1002,6 +1004,8 @@ impl<M: ModelForward> Scheduler<M> {
                         let _ = self.paged_kv_pool.release_pages(&pages);
                         return Err(err);
                     }
+                    self.metrics
+                        .observe_h2d_latency_us(h2d_started_at.elapsed().as_micros() as u64);
                     let new_block_id = crate::prefix_cache::BlockId(
                         *pages
                             .first()

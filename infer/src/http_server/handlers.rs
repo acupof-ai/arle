@@ -24,7 +24,7 @@ use fastrace::local::LocalSpan;
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
 use serde::Deserialize;
-use tokio::sync::{OwnedSemaphorePermit, mpsc::UnboundedReceiver};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::openai_v1::{
@@ -33,6 +33,7 @@ use super::openai_v1::{
     ModelsListResponse, ResponsesInput, ResponsesRequest, ResponsesResponse,
     ResponsesStreamCreatedEvent, ResponsesStreamDeltaEvent, StreamChunk, StreamUsageChunk,
 };
+use super::preprocess::PreprocessPermitGuard;
 use super::types::{
     AppState, BufferedResponse, HTTP_REQUEST_ID_HEADER, HealthResponse, ProxiedTrainResponse,
     RESPONSE_TIMEOUT, RequestExecutionOptions, TrainControlTarget, TrainEventsQuery,
@@ -253,52 +254,6 @@ fn preprocess_active_depth(state: &AppState) -> u64 {
         .saturating_sub(state.preprocess_permits.available_permits()) as u64
 }
 
-struct PreprocessPermitGuard {
-    permit: Option<OwnedSemaphorePermit>,
-    permits: Arc<tokio::sync::Semaphore>,
-    capacity: usize,
-    metrics: crate::metrics::ServerMetrics,
-    wait_us: u64,
-    tokenize_started_at: std::time::Instant,
-    tokenize_us: u64,
-}
-
-impl PreprocessPermitGuard {
-    fn new(
-        state: &AppState,
-        permit: OwnedSemaphorePermit,
-        wait_us: u64,
-        tokenize_started_at: std::time::Instant,
-    ) -> Self {
-        Self {
-            permit: Some(permit),
-            permits: state.preprocess_permits.clone(),
-            capacity: state.preprocess_capacity,
-            metrics: state.metrics.clone(),
-            wait_us,
-            tokenize_started_at,
-            tokenize_us: 0,
-        }
-    }
-
-    fn record_tokenize_elapsed(&mut self) {
-        self.tokenize_us = self.tokenize_started_at.elapsed().as_micros() as u64;
-    }
-
-    fn active_depth(&self) -> u64 {
-        self.capacity
-            .saturating_sub(self.permits.available_permits()) as u64
-    }
-}
-
-impl Drop for PreprocessPermitGuard {
-    fn drop(&mut self) {
-        drop(self.permit.take());
-        self.metrics
-            .set_preprocess_stage(self.active_depth(), self.wait_us, self.tokenize_us);
-    }
-}
-
 pub(super) async fn attach_request_id(
     mut request: AxumRequest,
     next: middleware::Next,
@@ -316,9 +271,9 @@ pub(super) async fn attach_request_id(
 async fn preprocess_prompt_tokens(
     state: &AppState,
     prompt: String,
-) -> Result<(String, Option<Vec<u32>>), ApiError> {
-    let Some(tokenizer) = state.tokenizer.clone() else {
-        return Ok((prompt, None));
+) -> Result<(String, Option<Vec<u32>>, Option<i32>), ApiError> {
+    let Some(preprocess_pool) = state.preprocess_pool.clone() else {
+        return Ok((prompt, None, None));
     };
 
     let wait_started_at = std::time::Instant::now();
@@ -336,24 +291,22 @@ async fn preprocess_prompt_tokens(
         .metrics
         .set_preprocess_stage(preprocess_active_depth(state), wait_us, 0);
     let tokenize_started_at = std::time::Instant::now();
-    let permit_guard = PreprocessPermitGuard::new(state, permit, wait_us, tokenize_started_at);
-    tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<u32>)> {
-        let mut permit_guard = permit_guard;
-        let prompt_tokens = tokenizer.encode(&prompt);
-        permit_guard.record_tokenize_elapsed();
-        let prompt_tokens = prompt_tokens?;
-        Ok((prompt, prompt_tokens))
-    })
-    .await
-    .map_err(|err| {
-        error!("Prompt preprocessing worker failed before scheduler submission: {err}");
-        ApiError::service_unavailable("Failed to preprocess request prompt")
-    })?
-    .map(|(prompt, prompt_tokens)| (prompt, Some(prompt_tokens)))
-    .map_err(|err| {
-        error!("Prompt tokenization failed before scheduler submission: {err}");
-        ApiError::service_unavailable("Failed to tokenize request prompt")
-    })
+    let permit_guard = PreprocessPermitGuard::new(
+        state.preprocess_permits.clone(),
+        state.preprocess_capacity,
+        state.metrics.clone(),
+        permit,
+        wait_us,
+        tokenize_started_at,
+    );
+    let output = preprocess_pool
+        .encode(prompt, permit_guard)
+        .await
+        .map_err(|err| {
+            error!("Prompt tokenization failed before scheduler submission: {err}");
+            ApiError::service_unavailable("Failed to tokenize request prompt")
+        })?;
+    Ok((output.prompt, Some(output.prompt_tokens), output.numa_node))
 }
 
 async fn submit_request(
@@ -364,14 +317,20 @@ async fn submit_request(
     let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
     let preprocess_parent = SpanContext::current_local_parent().unwrap_or_default();
     let preprocess_span = Span::root("preprocess", preprocess_parent);
-    let (prompt, prompt_tokens) = preprocess_prompt_tokens(state, prompt)
+    let (prompt, prompt_tokens, ingress_numa_node) = preprocess_prompt_tokens(state, prompt)
         .in_span(preprocess_span)
         .await?;
     let enqueue_context = {
         let _enqueue_span = LocalSpan::enter_with_local_parent("enqueue");
         SpanContext::current_local_parent()
     };
-    let incoming = options.into_incoming_request(prompt, prompt_tokens, delta_tx, enqueue_context);
+    let incoming = options.into_incoming_request(
+        prompt,
+        prompt_tokens,
+        ingress_numa_node,
+        delta_tx,
+        enqueue_context,
+    );
 
     if let Err(e) = state.handle.submit(incoming) {
         warn!("Scheduler at capacity: {e}");
