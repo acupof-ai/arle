@@ -160,6 +160,7 @@ impl<M: ModelForward> Scheduler<M> {
                 ingress_numa_node: victim.ingress_numa_node,
                 trace_context: victim.trace_context,
                 delta_tx: victim.delta_tx.clone(),
+                distributed: victim.distributed.clone(),
             };
             victim.phase = Phase::Finished;
             (victim.id, generated_tokens, requeue)
@@ -773,7 +774,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         for (j, &slot_idx) in pending.decode_indices.iter().enumerate() {
-            let Some(&token) = sampled_tokens.get(j) else {
+            let Some(&local_token) = sampled_tokens.get(j) else {
                 continue;
             };
             if !matches!(
@@ -782,6 +783,22 @@ impl<M: ModelForward> Scheduler<M> {
             ) {
                 continue;
             }
+            let step_idx = self
+                .request(slot_idx)
+                .map(|req| req.generated_tokens.len())
+                .unwrap_or(0);
+            let token = match self.coordinate_decode_token(slot_idx, step_idx, local_token) {
+                Ok(token) => token,
+                Err(err) => {
+                    let req_id = self.request(slot_idx).map(|req| req.id).unwrap_or_default();
+                    error!(
+                        "Request {}: distributed decode token sync failed: {}",
+                        req_id, err
+                    );
+                    self.finish_slot(slot_idx);
+                    continue;
+                }
+            };
             if let Some(req) = self.request_mut(slot_idx) {
                 req.trace_context = decode_trace_contexts
                     .get(&slot_idx)
@@ -821,6 +838,33 @@ impl<M: ModelForward> Scheduler<M> {
                 prefill_spans: mixed_prefill.prefill_spans,
             });
         }
+    }
+
+    fn coordinate_decode_token(
+        &self,
+        slot_idx: usize,
+        step_idx: usize,
+        local_token: u32,
+    ) -> anyhow::Result<u32> {
+        let Some(distributed) = self
+            .request(slot_idx)
+            .and_then(|req| req.distributed.as_ref())
+            .cloned()
+        else {
+            return Ok(local_token);
+        };
+        let token = distributed.synchronize_token(step_idx, local_token)?;
+        if distributed.rank() != 0 && token != local_token {
+            log::debug!(
+                "Distributed decode token override: rank={} slot={} step={} local={} rank0={}",
+                distributed.rank(),
+                slot_idx,
+                step_idx,
+                local_token,
+                token
+            );
+        }
+        Ok(token)
     }
 
     pub(super) fn step_decode_readback(&mut self) {

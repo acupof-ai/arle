@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use std::fmt;
 
-use crate::scheduler::{IncomingRequest, SchedulerHandle};
+use crate::scheduler::{
+    DistributedRequestCoordination, DistributedTokenCoordinator, IncomingRequest, SchedulerHandle,
+};
 use crate::server_engine::CompletionStreamDelta;
 
 /// Error returned when a request cannot be submitted to a runtime handle.
@@ -231,6 +233,7 @@ impl DistributedSchedulerGroup {
     fn clone_request_for_rank(
         req: &IncomingRequest,
         delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+        distributed: DistributedRequestCoordination,
     ) -> IncomingRequest {
         IncomingRequest {
             prompt: req.prompt.clone(),
@@ -244,6 +247,7 @@ impl DistributedSchedulerGroup {
             ingress_numa_node: req.ingress_numa_node,
             delta_tx,
             trace_context: req.trace_context,
+            distributed: Some(distributed),
         }
     }
 
@@ -319,11 +323,20 @@ impl RequestHandle for DistributedSchedulerGroup {
             permits.push(permit);
         }
 
+        let coordinator =
+            DistributedTokenCoordinator::new(self.workers.len()).map_err(|_| SubmitError)?;
         let mut requests = Vec::with_capacity(self.workers.len());
-        requests.push(req);
-        for _ in 1..self.workers.len() {
+        let mut rank0_req = req;
+        rank0_req.distributed = Some(
+            DistributedRequestCoordination::new(0, Arc::clone(&coordinator))
+                .map_err(|_| SubmitError)?,
+        );
+        requests.push(rank0_req);
+        for rank in 1..self.workers.len() {
             let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel();
-            let rank_req = Self::clone_request_for_rank(&requests[0], sink_tx);
+            let distributed = DistributedRequestCoordination::new(rank, Arc::clone(&coordinator))
+                .map_err(|_| SubmitError)?;
+            let rank_req = Self::clone_request_for_rank(&requests[0], sink_tx, distributed);
             Self::spawn_rank_delta_drain(sink_rx);
             requests.push(rank_req);
         }
@@ -395,6 +408,7 @@ mod tests {
             ingress_numa_node,
             delta_tx,
             trace_context: None,
+            distributed: None,
         }
     }
 

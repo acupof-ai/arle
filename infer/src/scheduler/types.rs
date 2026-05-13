@@ -1,6 +1,7 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use fastrace::collector::SpanContext;
@@ -14,6 +15,120 @@ use crate::scheduler::policy::{
 use crate::server_engine::CompletionStreamDelta;
 use crate::tokenizer::Tokenizer;
 use crate::types::SessionId;
+
+const DISTRIBUTED_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Per-request token synchronization for multi-rank HTTP serving.
+///
+/// The distributed HTTP path submits the same logical request to one scheduler
+/// per rank. Only rank 0 is allowed to choose the next token; follower ranks
+/// use the published token so TP/EP collectives see identical token histories
+/// on the next forward step.
+#[derive(Clone)]
+pub struct DistributedRequestCoordination {
+    rank: usize,
+    coordinator: Arc<DistributedTokenCoordinator>,
+}
+
+impl DistributedRequestCoordination {
+    pub fn new(rank: usize, coordinator: Arc<DistributedTokenCoordinator>) -> Result<Self> {
+        if rank >= coordinator.world_size {
+            anyhow::bail!(
+                "distributed request rank {rank} out of range for world_size {}",
+                coordinator.world_size
+            );
+        }
+        Ok(Self { rank, coordinator })
+    }
+
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    pub fn synchronize_token(&self, step_idx: usize, local_token: u32) -> Result<u32> {
+        self.coordinator
+            .synchronize_token(self.rank, step_idx, local_token)
+    }
+}
+
+pub struct DistributedTokenCoordinator {
+    world_size: usize,
+    inner: Mutex<DistributedTokenState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct DistributedTokenState {
+    step_idx: Option<usize>,
+    token: Option<u32>,
+}
+
+impl DistributedTokenCoordinator {
+    pub fn new(world_size: usize) -> Result<Arc<Self>> {
+        if world_size == 0 {
+            anyhow::bail!("distributed token coordinator world_size must be >= 1");
+        }
+        Ok(Arc::new(Self {
+            world_size,
+            inner: Mutex::new(DistributedTokenState::default()),
+            changed: Condvar::new(),
+        }))
+    }
+
+    fn synchronize_token(&self, rank: usize, step_idx: usize, local_token: u32) -> Result<u32> {
+        if rank == 0 {
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.step_idx == Some(step_idx) {
+                return state
+                    .token
+                    .ok_or_else(|| anyhow::anyhow!("distributed token step {step_idx} missing"));
+            }
+            state.step_idx = Some(step_idx);
+            state.token = Some(local_token);
+            self.changed.notify_all();
+            return Ok(local_token);
+        }
+
+        let deadline = Instant::now() + DISTRIBUTED_TOKEN_WAIT_TIMEOUT;
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if state.step_idx == Some(step_idx) {
+                return state
+                    .token
+                    .ok_or_else(|| anyhow::anyhow!("distributed token step {step_idx} missing"));
+            }
+            if state.step_idx.is_some_and(|published| published > step_idx) {
+                anyhow::bail!(
+                    "distributed token coordinator skipped step {step_idx}; current={:?}",
+                    state.step_idx
+                );
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for distributed token step {step_idx} on rank {rank}"
+                );
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_state, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if wait.timed_out() && state.step_idx != Some(step_idx) {
+                anyhow::bail!(
+                    "timed out waiting for distributed token step {step_idx} on rank {rank}"
+                );
+            }
+        }
+    }
+}
 
 /// Draft-model source for Phase 2 speculative decode wiring.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -651,6 +766,9 @@ pub struct IncomingRequest {
     pub delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     /// Parent tracing context captured from the request ingress path.
     pub trace_context: Option<SpanContext>,
+    /// Optional per-request token coordinator for multi-rank distributed
+    /// serving. `None` is the normal single-rank or NUMA-routed path.
+    pub distributed: Option<DistributedRequestCoordination>,
 }
 
 /// Error returned when the scheduler's waiting queue is full.
