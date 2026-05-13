@@ -2627,6 +2627,8 @@ mod tests {
         let prefills = [PrefillBatchRequest {
             slot_idx: 30,
             tokens: &prefill_tokens,
+            start_pos: 0,
+            total_tokens: prefill_tokens.len(),
         }];
         let used_handoff = upload_mixed_token_ids_with_handoff(
             &ctx,

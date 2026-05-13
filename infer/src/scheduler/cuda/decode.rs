@@ -573,10 +573,16 @@ impl<M: ModelForward> Scheduler<M> {
             .expect("decode context initialized before mixed launch");
         let prefills: Vec<PrefillBatchRequest<'_>> = prefill_chunks
             .iter()
-            .map(|(slot_idx, tokens)| PrefillBatchRequest {
-                slot_idx: *slot_idx,
-                tokens,
-            })
+            .zip(prefill_start_positions.iter().copied())
+            .zip(pending_rows.iter())
+            .map(
+                |(((slot_idx, tokens), start_pos), row)| PrefillBatchRequest {
+                    slot_idx: *slot_idx,
+                    tokens,
+                    start_pos,
+                    total_tokens: row.total_tokens,
+                },
+            )
             .collect();
         let mixed_batch = MixedBatchRequest {
             decode_tokens: &token_ids,
