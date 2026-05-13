@@ -2,23 +2,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use clap::Parser;
 use infer::backend::cuda::bootstrap::{
-    InferenceEngineOptions, ServerRuntimeConfig, detect_model_type,
+    InferenceEngineOptions, SchedulerRuntimeGuard, ServerRuntimeConfig, detect_model_type,
     spawn_scheduler_handle_from_path,
 };
-use infer::backend::cuda::tensor::DeviceContext;
+use infer::backend::cuda::tensor::{DeviceContext, with_device_ordinal_override};
 use infer::hf_hub;
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
-use infer::request_handle::NumaSchedulerRouter;
+use infer::request_handle::{NumaSchedulerRouter, NumaSchedulerWorker};
 use infer::runtime_topology::{
-    RuntimeTopology, bind_process_to_placement, sample_process_numa_maps,
+    AffinityApplyResult, RuntimeTopology, WorkerPlacement, bind_process_to_placement,
+    configured_cuda_worker_ordinals, sample_process_numa_maps,
 };
 use infer::scheduler::{
-    DraftMode, SchedulePolicy, SchedulerAdmissionPolicy, SchedulerConfig, SchedulerMixedPolicy,
+    DraftMode, SchedulePolicy, SchedulerAdmissionPolicy, SchedulerConfig, SchedulerHandle,
+    SchedulerMixedPolicy,
 };
 use infer::server_engine::EnginePoolModelSpec;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
@@ -283,6 +286,158 @@ fn apply_quant_format_override(args: &Args) {
     }
 }
 
+#[derive(Clone)]
+struct CudaWorkerBootstrap {
+    cuda_ordinal: usize,
+    placement: WorkerPlacement,
+}
+
+struct StartedCudaWorker {
+    handle: SchedulerHandle,
+    guard: SchedulerRuntimeGuard,
+    placement: WorkerPlacement,
+}
+
+fn format_nics(nics: &[String]) -> String {
+    if nics.is_empty() {
+        "none".to_string()
+    } else {
+        nics.join(",")
+    }
+}
+
+fn multi_worker_affinity_placeholder() -> AffinityApplyResult {
+    AffinityApplyResult {
+        label: "main-multi-worker".to_string(),
+        applied: false,
+        requested_cpus: Vec::new(),
+        applied_threads: 0,
+        failed_threads: 0,
+        reason: "multi-worker bootstrap applies affinity per worker before CUDA context"
+            .to_string(),
+    }
+}
+
+fn build_cuda_worker_bootstrap(topology: &RuntimeTopology) -> Vec<CudaWorkerBootstrap> {
+    let cuda_ordinals = configured_cuda_worker_ordinals()
+        .unwrap_or_else(|err| panic!("invalid CUDA workers: {err}"));
+    cuda_ordinals
+        .into_iter()
+        .enumerate()
+        .map(|(worker_id, cuda_ordinal)| CudaWorkerBootstrap {
+            cuda_ordinal,
+            placement: topology.placement_for_cuda_device_ordinal(cuda_ordinal, worker_id),
+        })
+        .collect()
+}
+
+fn log_final_worker_topology(worker: &CudaWorkerBootstrap, affinity: &AffinityApplyResult) {
+    info!(
+        "Final runtime worker placement: worker={} cuda_ordinal={} gpu={} numa={:?} cpus={} nics={} affinity_applied={} reason={}",
+        worker.placement.worker_id,
+        worker.cuda_ordinal,
+        worker.placement.gpu_ordinal,
+        worker.placement.numa_node,
+        worker.placement.cpus.len(),
+        format_nics(&worker.placement.nics),
+        affinity.applied,
+        affinity.reason,
+    );
+}
+
+fn early_pre_model_free_bytes(worker: &CudaWorkerBootstrap) -> Option<usize> {
+    with_device_ordinal_override(worker.cuda_ordinal as u32, || match DeviceContext::new() {
+        Ok(_ctx) => match DeviceContext::gpu_memory_info() {
+            Ok((free, total)) => {
+                info!(
+                    "GPU memory @ post_cuda_ctx (early): cuda_ordinal={} gpu={} free={:.2} GB / total={:.2} GB \
+                     (driver+ctx+cuBLAS overhead = {:.0} MB)",
+                    worker.cuda_ordinal,
+                    worker.placement.gpu_ordinal,
+                    free as f64 / 1e9,
+                    total as f64 / 1e9,
+                    (total - free) as f64 / 1e6,
+                );
+                Some(free)
+            }
+            Err(err) => {
+                log::warn!("post_cuda_ctx GPU memory query failed: {err}");
+                None
+            }
+        },
+        Err(err) => {
+            log::warn!(
+                "Early DeviceContext::new() failed on cuda_ordinal={}: {err} — pre_model_free snapshot disabled",
+                worker.cuda_ordinal,
+            );
+            None
+        }
+    })
+}
+
+fn shutdown_started_workers(workers: Vec<StartedCudaWorker>) {
+    for StartedCudaWorker { handle, guard, .. } in workers {
+        drop(handle);
+        guard.wait();
+    }
+}
+
+fn spawn_cuda_worker_group(
+    model_path: &str,
+    args: &Args,
+    num_slots: usize,
+    kv_cache_dtype: KVCacheDtype,
+    kv_pool_format: KVFormat,
+    workers: &[CudaWorkerBootstrap],
+    single_worker_pre_model_free_bytes: Option<usize>,
+    metrics: &infer::metrics::ServerMetrics,
+) -> anyhow::Result<Vec<StartedCudaWorker>> {
+    let mut started = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let runtime = ServerRuntimeConfig {
+            engine: InferenceEngineOptions {
+                enable_cuda_graph: args.cuda_graph && !args.disable_cuda_graph,
+            },
+            scheduler: scheduler_config_from_args(args, num_slots),
+            runtime_envelope: infer::scheduler::RuntimeEnvelopeOverrides {
+                chunked_prefill_size: args.chunked_prefill_size,
+                max_prefill_tokens: args.max_prefill_tokens,
+            },
+            seed: 42,
+            max_seq_len: args.max_seq_len,
+            kv_cache_dtype,
+            kv_pool_format,
+            pre_model_free_bytes: (workers.len() == 1)
+                .then_some(single_worker_pre_model_free_bytes)
+                .flatten(),
+            worker_placement: Some(worker.placement.clone()),
+            cuda_device_ordinal: Some(worker.cuda_ordinal as u32),
+        };
+
+        match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
+            Ok((handle, guard)) => {
+                started.push(StartedCudaWorker {
+                    handle,
+                    guard,
+                    placement: worker.placement.clone(),
+                });
+            }
+            Err(err) => {
+                shutdown_started_workers(started);
+                return Err(err).with_context(|| {
+                    format!(
+                        "worker={} cuda_ordinal={} gpu={}",
+                        worker.placement.worker_id,
+                        worker.cuda_ordinal,
+                        worker.placement.gpu_ordinal
+                    )
+                });
+            }
+        }
+    }
+    Ok(started)
+}
+
 async fn async_main(args: Args) {
     if args.nccl_smoke {
         #[cfg(feature = "nccl")]
@@ -338,25 +493,29 @@ async fn async_main(args: Args) {
     let metrics = infer::metrics::ServerMetrics::new(model_path);
     let runtime_topology = RuntimeTopology::discover();
     runtime_topology.log_summary();
-    let worker_placement = runtime_topology.placement_for_configured_cuda_device();
-    let affinity = bind_process_to_placement(&worker_placement, "main-before-cuda");
-    info!(
-        "Final runtime worker placement: worker={} gpu={} numa={:?} cpus={} nics={} affinity_applied={} reason={}",
-        worker_placement.worker_id,
-        worker_placement.gpu_ordinal,
-        worker_placement.numa_node,
-        worker_placement.cpus.len(),
-        if worker_placement.nics.is_empty() {
-            "none".to_string()
-        } else {
-            worker_placement.nics.join(",")
-        },
-        affinity.applied,
-        affinity.reason,
-    );
-    metrics.set_runtime_topology(&runtime_topology, &worker_placement, &affinity);
+    let worker_bootstrap = build_cuda_worker_bootstrap(&runtime_topology);
+    let primary_worker = worker_bootstrap
+        .first()
+        .expect("configured CUDA workers must not be empty");
+    let affinity = if worker_bootstrap.len() == 1 {
+        bind_process_to_placement(&primary_worker.placement, "main-before-cuda")
+    } else {
+        info!(
+            "Configured {} CUDA scheduler workers; per-worker bootstrap will bind CPU affinity before initializing CUDA",
+            worker_bootstrap.len()
+        );
+        multi_worker_affinity_placeholder()
+    };
+    for worker in &worker_bootstrap {
+        log_final_worker_topology(worker, &affinity);
+    }
+    metrics.set_runtime_topology(&runtime_topology, &primary_worker.placement, &affinity);
     if let Some(numastat) = sample_process_numa_maps() {
-        metrics.set_runtime_numastat(&numastat, worker_placement.numa_node);
+        let local_nodes = worker_bootstrap
+            .iter()
+            .map(|worker| worker.placement.numa_node)
+            .collect::<Vec<_>>();
+        metrics.set_runtime_numastat_for_nodes(&numastat, &local_nodes);
     }
 
     // Earliest possible CUDA snapshot: initialize the primary context (and
@@ -367,29 +526,14 @@ async fn async_main(args: Args) {
     // SGLang's lazy PyTorch boot does not. The captured value is fed into
     // `ServerRuntimeConfig.pre_model_free_bytes`, matching SGLang's
     // `pre_model_load_memory` semantics in `profile_max_num_token`.
-    let pre_model_free_bytes = match DeviceContext::new() {
-        Ok(_ctx) => match DeviceContext::gpu_memory_info() {
-            Ok((free, total)) => {
-                info!(
-                    "GPU memory @ post_cuda_ctx (early): free={:.2} GB / total={:.2} GB \
-                     (driver+ctx+cuBLAS overhead = {:.0} MB)",
-                    free as f64 / 1e9,
-                    total as f64 / 1e9,
-                    (total - free) as f64 / 1e6,
-                );
-                Some(free)
-            }
-            Err(err) => {
-                log::warn!("post_cuda_ctx GPU memory query failed: {err}");
-                None
-            }
-        },
-        Err(err) => {
-            log::warn!(
-                "Early DeviceContext::new() failed: {err} — pre_model_free snapshot disabled"
-            );
-            None
-        }
+    let pre_model_free_bytes = if worker_bootstrap.len() == 1 {
+        early_pre_model_free_bytes(primary_worker)
+    } else {
+        info!(
+            "Skipping process-wide early GPU memory snapshot for {} CUDA workers; each worker snapshots after NUMA binding before model load",
+            worker_bootstrap.len()
+        );
+        None
     };
 
     info!("Loading model...");
@@ -408,32 +552,24 @@ async fn async_main(args: Args) {
     let kv_candidates = kv_mode_candidates(requested_kv_mode, args.max_seq_len.is_some());
     let mut last_err = None;
     let mut selected_mode = None;
-    let mut scheduler = None;
+    let mut scheduler_workers = None;
 
     for (candidate_idx, (kv_cache_dtype, kv_pool_format, kv_mode_label)) in
         kv_candidates.iter().copied().enumerate()
     {
-        let runtime = ServerRuntimeConfig {
-            engine: InferenceEngineOptions {
-                enable_cuda_graph: args.cuda_graph && !args.disable_cuda_graph,
-            },
-            scheduler: scheduler_config_from_args(&args, num_slots),
-            runtime_envelope: infer::scheduler::RuntimeEnvelopeOverrides {
-                chunked_prefill_size: args.chunked_prefill_size,
-                max_prefill_tokens: args.max_prefill_tokens,
-            },
-            seed: 42,
-            max_seq_len: args.max_seq_len,
+        match spawn_cuda_worker_group(
+            model_path,
+            &args,
+            num_slots,
             kv_cache_dtype,
             kv_pool_format,
+            &worker_bootstrap,
             pre_model_free_bytes,
-            worker_placement: Some(worker_placement.clone()),
-        };
-
-        match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
-            Ok(pair) => {
+            &metrics,
+        ) {
+            Ok(workers) => {
                 selected_mode = Some((kv_cache_dtype, kv_pool_format, kv_mode_label));
-                scheduler = Some(pair);
+                scheduler_workers = Some(workers);
                 break;
             }
             Err(err) => {
@@ -463,10 +599,16 @@ async fn async_main(args: Args) {
                 .unwrap_or_default()
         )
     });
-    let (handle, mut scheduler_runtime) = scheduler.expect("scheduler pair must exist");
+    let mut scheduler_workers = scheduler_workers.expect("scheduler workers must exist");
+    metrics.set_detokenizer_topology(scheduler_workers.len(), scheduler_workers.len());
+    let primary_handle = scheduler_workers
+        .first()
+        .expect("scheduler workers must not be empty")
+        .handle
+        .clone();
 
     info!(
-        "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={} ({})",
+        "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={} ({}), cuda_workers={}",
         args.model_path.display(),
         args.cuda_graph && !args.disable_cuda_graph,
         num_slots,
@@ -477,6 +619,7 @@ async fn async_main(args: Args) {
         },
         args.kv_cache_dtype,
         kv_mode_label,
+        scheduler_workers.len(),
     );
     info!("KV cache layout: contiguous={kv_cache_dtype:?}, paged_pool={kv_pool_format:?}");
     log_tier_config_overrides(&args);
@@ -484,13 +627,22 @@ async fn async_main(args: Args) {
     info!(
         "Model loaded: elapsed_ms={}, model_id={}",
         start.elapsed().as_millis(),
-        handle.model_id()
+        primary_handle.model_id()
     );
-    scheduler_runtime
-        .wait_ready()
-        .unwrap_or_else(|err| panic!("scheduler warmup failed: {err}"));
+    for worker in &mut scheduler_workers {
+        worker.guard.wait_ready().unwrap_or_else(|err| {
+            panic!(
+                "scheduler warmup failed for worker={} gpu={}: {err}",
+                worker.placement.worker_id, worker.placement.gpu_ordinal
+            )
+        });
+    }
     if let Some(numastat) = sample_process_numa_maps() {
-        metrics.set_runtime_numastat(&numastat, worker_placement.numa_node);
+        let local_nodes = scheduler_workers
+            .iter()
+            .map(|worker| worker.placement.numa_node)
+            .collect::<Vec<_>>();
+        metrics.set_runtime_numastat_for_nodes(&numastat, &local_nodes);
     }
 
     let train_control_target = args
@@ -499,10 +651,16 @@ async fn async_main(args: Args) {
         .map(TrainControlTarget::parse)
         .transpose()
         .unwrap_or_else(|err| panic!("invalid --train-control-url: {err}"));
-    let routed_handle = Arc::new(NumaSchedulerRouter::single(
-        handle.clone(),
+    let router_workers = scheduler_workers
+        .iter()
+        .map(|worker| NumaSchedulerWorker {
+            handle: worker.handle.clone(),
+            placement: worker.placement.clone(),
+        })
+        .collect::<Vec<_>>();
+    let routed_handle = Arc::new(NumaSchedulerRouter::new(
         runtime_topology.clone(),
-        worker_placement.clone(),
+        router_workers,
         metrics.clone(),
     ));
     let app = build_app_with_config(
@@ -535,8 +693,8 @@ async fn async_main(args: Args) {
     // Drop the last submission handle before joining the scheduler thread so
     // request_rx disconnects and the scheduler can unwind its CUDA resources.
     drop(routed_handle);
-    drop(handle);
-    scheduler_runtime.wait();
+    drop(primary_handle);
+    shutdown_started_workers(scheduler_workers);
 
     if tracing.reporter_installed() {
         info!("Flushing pending traces...");

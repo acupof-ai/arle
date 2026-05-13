@@ -96,6 +96,10 @@ pub struct ServerRuntimeConfig {
     /// applies this before scheduler execution and passes it to detokenizer
     /// workers so CPU-side pipeline stages stay NUMA-local to the GPU.
     pub worker_placement: Option<crate::runtime_topology::WorkerPlacement>,
+    /// CUDA visible-device ordinal assigned to this worker. When present,
+    /// every `DeviceContext::new()` during model load and scheduler runtime
+    /// resolves to this ordinal without mutating process-global env vars.
+    pub cuda_device_ordinal: Option<u32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -111,6 +115,7 @@ impl Default for ServerRuntimeConfig {
             kv_pool_format: crate::model::kv_cache::KVFormat::BF16,
             pre_model_free_bytes: None,
             worker_placement: None,
+            cuda_device_ordinal: None,
         }
     }
 }
@@ -282,9 +287,46 @@ pub fn spawn_scheduler_handle(
 #[cfg(feature = "cuda")]
 pub fn spawn_scheduler_handle_from_path(
     model_path: &str,
+    runtime: ServerRuntimeConfig,
+    metrics: crate::metrics::ServerMetrics,
+) -> Result<(SchedulerHandle, SchedulerRuntimeGuard)> {
+    if let Some(cuda_device_ordinal) = runtime.cuda_device_ordinal {
+        return crate::backend::cuda::tensor::with_device_ordinal_override(
+            cuda_device_ordinal,
+            || spawn_scheduler_handle_from_path_inner(model_path, runtime, metrics),
+        );
+    }
+    spawn_scheduler_handle_from_path_inner(model_path, runtime, metrics)
+}
+
+#[cfg(feature = "cuda")]
+fn spawn_scheduler_handle_from_path_inner(
+    model_path: &str,
     mut runtime: ServerRuntimeConfig,
     metrics: crate::metrics::ServerMetrics,
 ) -> Result<(SchedulerHandle, SchedulerRuntimeGuard)> {
+    if let Some(placement) = runtime.worker_placement.as_ref() {
+        let affinity = crate::runtime_topology::bind_current_thread_to_placement(
+            placement,
+            "cuda-bootstrap-before-context",
+        );
+        info!(
+            "CUDA bootstrap worker placement: worker={} gpu={} cuda_ordinal={:?} numa={:?} cpus={} nics={} affinity_applied={} reason={}",
+            placement.worker_id,
+            placement.gpu_ordinal,
+            runtime.cuda_device_ordinal,
+            placement.numa_node,
+            placement.cpus.len(),
+            if placement.nics.is_empty() {
+                "none".to_string()
+            } else {
+                placement.nics.join(",")
+            },
+            affinity.applied,
+            affinity.reason,
+        );
+    }
+
     // Snapshot free GPU memory BEFORE model load — the KV-pool budget
     // formula uses `pre_model_free × (1 - mem_fraction_static)` for the
     // headroom, matching SGLang's `profile_max_num_token`
@@ -420,6 +462,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         kv_pool_format,
         pre_model_free_bytes,
         worker_placement,
+        cuda_device_ordinal,
         ..
     } = runtime;
 
@@ -479,6 +522,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     )?;
     let (ready_tx, ready_rx) = mpsc::channel();
     let scheduler_thread_placement = worker_placement.clone();
+    let scheduler_thread_cuda_ordinal = cuda_device_ordinal;
     let thread_name = scheduler_thread_placement.as_ref().map_or_else(
         || "infer-cuda-scheduler".to_string(),
         |placement| format!("infer-cuda-scheduler-gpu{}", placement.gpu_ordinal),
@@ -486,22 +530,33 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     let thread = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            if let Some(placement) = scheduler_thread_placement.as_ref() {
-                let affinity = crate::runtime_topology::bind_current_thread_to_placement(
-                    placement,
-                    "cuda-scheduler",
+            let run_scheduler = move || {
+                if let Some(placement) = scheduler_thread_placement.as_ref() {
+                    let affinity = crate::runtime_topology::bind_current_thread_to_placement(
+                        placement,
+                        "cuda-scheduler",
+                    );
+                    info!(
+                        "CUDA scheduler worker ready: worker={} gpu={} cuda_ordinal={:?} numa={:?} cpus={} affinity_applied={} reason={}",
+                        placement.worker_id,
+                        placement.gpu_ordinal,
+                        scheduler_thread_cuda_ordinal,
+                        placement.numa_node,
+                        placement.cpus.len(),
+                        affinity.applied,
+                        affinity.reason,
+                    );
+                }
+                scheduler.run_with_ready_signal(ready_tx);
+            };
+            if let Some(cuda_ordinal) = scheduler_thread_cuda_ordinal {
+                crate::backend::cuda::tensor::with_device_ordinal_override(
+                    cuda_ordinal,
+                    run_scheduler,
                 );
-                info!(
-                    "CUDA scheduler worker ready: worker={} gpu={} numa={:?} cpus={} affinity_applied={} reason={}",
-                    placement.worker_id,
-                    placement.gpu_ordinal,
-                    placement.numa_node,
-                    placement.cpus.len(),
-                    affinity.applied,
-                    affinity.reason,
-                );
+            } else {
+                run_scheduler();
             }
-            scheduler.run_with_ready_signal(ready_tx);
         })
         .context("spawn CUDA scheduler worker thread")?;
     Ok((

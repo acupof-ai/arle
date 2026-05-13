@@ -4,7 +4,7 @@
 //! builds keep the same API but return a single fallback CPU group so callers
 //! can keep one code path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -198,17 +198,25 @@ impl RuntimeTopology {
         }
     }
 
-    pub fn placement_for_configured_cuda_device(&self) -> WorkerPlacement {
-        let cuda_ordinal = configured_cuda_device_ordinal();
+    pub fn placement_for_cuda_device_ordinal(
+        &self,
+        cuda_ordinal: usize,
+        worker_id: usize,
+    ) -> WorkerPlacement {
         let gpu = self.resolve_cuda_visible_gpu(
             cuda_ordinal,
             std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(),
             std::env::var("CUDA_DEVICE_ORDER").ok().as_deref(),
         );
         match gpu {
-            Some(gpu) => self.placement_for_gpu_with_worker(gpu.ordinal, cuda_ordinal),
-            None => self.placement_for_gpu_with_worker(cuda_ordinal, cuda_ordinal),
+            Some(gpu) => self.placement_for_gpu_with_worker(gpu.ordinal, worker_id),
+            None => self.placement_for_gpu_with_worker(cuda_ordinal, worker_id),
         }
+    }
+
+    pub fn placement_for_configured_cuda_device(&self) -> WorkerPlacement {
+        let cuda_ordinal = configured_cuda_device_ordinal();
+        self.placement_for_cuda_device_ordinal(cuda_ordinal, cuda_ordinal)
     }
 
     pub fn preprocess_worker_groups(&self, desired_workers: usize) -> Vec<NumaWorkerGroup> {
@@ -313,6 +321,61 @@ impl RuntimeTopology {
 
 pub fn configured_cuda_device_ordinal() -> usize {
     parse_configured_cuda_device_ordinal(std::env::var("INFER_CUDA_DEVICE").ok().as_deref())
+}
+
+pub fn configured_cuda_worker_ordinals() -> Result<Vec<usize>, String> {
+    parse_configured_cuda_worker_ordinals(
+        std::env::var("INFER_CUDA_DEVICES").ok().as_deref(),
+        std::env::var("INFER_CUDA_DEVICE").ok().as_deref(),
+    )
+}
+
+fn parse_configured_cuda_worker_ordinals(
+    worker_devices: Option<&str>,
+    single_device: Option<&str>,
+) -> Result<Vec<usize>, String> {
+    if let Some(value) = worker_devices
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return parse_cuda_worker_ordinal_list(value);
+    }
+    parse_required_cuda_ordinal(single_device, "INFER_CUDA_DEVICE").map(|ordinal| vec![ordinal])
+}
+
+fn parse_cuda_worker_ordinal_list(value: &str) -> Result<Vec<usize>, String> {
+    let mut ordinals = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in value.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            return Err("INFER_CUDA_DEVICES must not contain empty entries".to_string());
+        }
+        let ordinal = parse_required_cuda_ordinal(Some(item), "INFER_CUDA_DEVICES")?;
+        if !seen.insert(ordinal) {
+            return Err(format!(
+                "INFER_CUDA_DEVICES contains duplicate CUDA ordinal {ordinal}"
+            ));
+        }
+        ordinals.push(ordinal);
+    }
+    if ordinals.is_empty() {
+        return Err("INFER_CUDA_DEVICES must contain at least one ordinal".to_string());
+    }
+    Ok(ordinals)
+}
+
+fn parse_required_cuda_ordinal(value: Option<&str>, var_name: &str) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{var_name} must be a non-negative integer"));
+    }
+    value
+        .parse::<usize>()
+        .map_err(|err| format!("{var_name} must be a non-negative integer, got {value:?}: {err}"))
 }
 
 fn parse_configured_cuda_device_ordinal(value: Option<&str>) -> usize {
@@ -795,6 +858,25 @@ mod tests {
     }
 
     #[test]
+    fn configured_cuda_worker_ordinals_parse_single_and_multi() {
+        assert_eq!(
+            parse_configured_cuda_worker_ordinals(None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            parse_configured_cuda_worker_ordinals(None, Some(" 3 ")).unwrap(),
+            vec![3]
+        );
+        assert_eq!(
+            parse_configured_cuda_worker_ordinals(Some("0, 2,4"), Some("7")).unwrap(),
+            vec![0, 2, 4]
+        );
+        assert!(parse_configured_cuda_worker_ordinals(None, Some("bad")).is_err());
+        assert!(parse_configured_cuda_worker_ordinals(Some("0,,1"), None).is_err());
+        assert!(parse_configured_cuda_worker_ordinals(Some("0,1,0"), None).is_err());
+    }
+
+    #[test]
     fn cuda_visible_devices_selector_resolves_physical_gpu() {
         let topology = RuntimeTopology {
             numa_nodes: Vec::new(),
@@ -832,6 +914,9 @@ mod tests {
             .resolve_cuda_visible_gpu(1, None, Some("PCI_BUS_ID"))
             .unwrap();
         assert_eq!(gpu.ordinal, 2);
+
+        let placement = topology.placement_for_cuda_device_ordinal(0, 9);
+        assert_eq!(placement.worker_id, 9);
     }
 
     #[test]
