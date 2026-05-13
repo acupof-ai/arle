@@ -5,6 +5,8 @@
 //! [`deepseek_spec::DeepSeekV4Config`] and its HF tensor-name contract only.
 
 use std::path::Path;
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
 use half::bf16;
@@ -31,6 +33,8 @@ use crate::deepseek_v4_manifest::{
 use crate::deepseek_v4_reference::DeepseekV4ReferenceModel;
 #[cfg(feature = "cuda")]
 use crate::model::common;
+#[cfg(feature = "cuda")]
+use crate::model::layer_communicator::LayerCommunicator;
 #[cfg(feature = "cuda")]
 use crate::ops;
 #[cfg(feature = "cuda")]
@@ -76,6 +80,8 @@ pub struct DeepseekModel {
     pub(super) head_hc: Option<DeepseekV4HyperConnection>,
     #[cfg(feature = "cuda")]
     pub(super) layers: Vec<DeepseekLayer>,
+    #[cfg(feature = "cuda")]
+    pub(super) layer_communicator: LayerCommunicator,
     #[cfg(feature = "cuda")]
     pub(super) reference: Option<DeepseekV4ReferenceModel>,
 }
@@ -140,6 +146,7 @@ impl DeepseekModel {
     /// from "kernels not implemented yet".
     pub fn from_config(config: DeepseekRuntimeConfig) -> Result<Self> {
         let ctx = DeviceContext::new()?;
+        let layer_communicator = Self::layer_communicator_from_config(&ctx, &config)?;
         let model = Self {
             config,
             ctx,
@@ -148,10 +155,71 @@ impl DeepseekModel {
             norm: None,
             head_hc: None,
             layers: Vec::new(),
+            layer_communicator,
             reference: None,
         };
         model.validate_phase0_sw_decode_scope()?;
         Ok(model)
+    }
+
+    fn layer_communicator_from_config(
+        ctx: &DeviceContext,
+        config: &DeepseekRuntimeConfig,
+    ) -> Result<LayerCommunicator> {
+        let mut comm = LayerCommunicator::new_with_ep(
+            config.tp.rank,
+            config.tp.world_size,
+            0,
+            1,
+            0,
+            1,
+            config.ep.rank,
+            config.ep.world_size,
+        )?;
+
+        #[cfg(feature = "nccl")]
+        {
+            use crate::distributed::nccl::{NcclGroup, NcclInitMethod};
+
+            let mut tp_nccl = None;
+            if config.tp.world_size > 1 {
+                let group = Arc::new(NcclGroup::new_on_stream(
+                    config.tp.rank,
+                    config.tp.world_size,
+                    NcclInitMethod::EnvBootstrap,
+                    ctx.stream.clone(),
+                )?);
+                comm = comm.with_tp_nccl(Arc::clone(&group))?;
+                tp_nccl = Some(group);
+            }
+            if config.ep.world_size > 1 {
+                let group = if config.ep.world_size == config.tp.world_size
+                    && config.ep.rank == config.tp.rank
+                    && tp_nccl.is_some()
+                {
+                    tp_nccl.expect("checked is_some")
+                } else {
+                    Arc::new(NcclGroup::new_on_stream(
+                        config.ep.rank,
+                        config.ep.world_size,
+                        NcclInitMethod::EnvBootstrap,
+                        ctx.stream.clone(),
+                    )?)
+                };
+                comm = comm.with_ep_nccl(group)?;
+            }
+        }
+
+        #[cfg(not(feature = "nccl"))]
+        {
+            if config.tp.world_size > 1 || config.ep.world_size > 1 {
+                bail!(
+                    "DeepSeek V4 TP/EP world_size > 1 requires building infer with --features nccl"
+                );
+            }
+        }
+
+        Ok(comm)
     }
 
     /// Load a V4 checkpoint by safetensors path.
@@ -663,7 +731,10 @@ impl DeepseekModel {
 
         let local_attn = hidden_states_from_f32(&self.ctx, &attn_out, local_width, hidden.seq_len)?;
         let latent = ops::gemm(&self.ctx, &attention.wo_a, &local_attn)?;
-        ops::gemm(&self.ctx, &attention.wo_b, &latent)
+        let mut out = ops::gemm(&self.ctx, &attention.wo_b, &latent)?;
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut out)?;
+        Ok(out)
     }
 
     fn forward_ffn_layer_stream(
@@ -716,7 +787,7 @@ impl DeepseekModel {
             self.config.rms_norm_eps,
             &mut normed,
         );
-        let ffn_out = layer.ffn.forward_routed(
+        let routing = layer.ffn.route_local_for_layer(
             &self.ctx,
             layer_idx,
             &self.config.spec,
@@ -724,6 +795,18 @@ impl DeepseekModel {
             &normed,
             tokens,
         )?;
+        let mut routed = layer.ffn.forward_local_routed_only(
+            &self.ctx,
+            &normed,
+            &routing,
+            self.config.swiglu_limit,
+        )?;
+        self.layer_communicator
+            .post_moe_expert_all_reduce_hidden_states(&mut routed)?;
+        let ffn_out =
+            layer
+                .ffn
+                .add_shared_expert(&self.ctx, &normed, routed, self.config.swiglu_limit)?;
         hc_post_to_stream(
             &self.ctx,
             &ffn_out,
@@ -2103,6 +2186,7 @@ mod tests {
             }],
             config,
             ctx,
+            layer_communicator: LayerCommunicator::single(),
             reference: None,
         };
 
@@ -2146,6 +2230,7 @@ mod tests {
             norm: None,
             head_hc: None,
             layers: Vec::new(),
+            layer_communicator: LayerCommunicator::single(),
             reference: None,
         };
 
@@ -2190,6 +2275,7 @@ mod tests {
             norm: None,
             head_hc: None,
             layers: Vec::new(),
+            layer_communicator: LayerCommunicator::single(),
             reference: None,
         };
 
