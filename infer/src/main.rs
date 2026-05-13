@@ -320,7 +320,11 @@ fn apply_quant_format_override(args: &Args) {
 
 unsafe fn set_env_default(key: &str, value: impl AsRef<str>) {
     if std::env::var_os(key).is_none() {
-        std::env::set_var(key, value.as_ref());
+        // SAFETY: callers invoke this only from startup paths before the
+        // Tokio runtime or CUDA scheduler worker threads are spawned.
+        unsafe {
+            std::env::set_var(key, value.as_ref());
+        }
     }
 }
 
