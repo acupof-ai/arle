@@ -1,0 +1,629 @@
+# CPU/GPU Pipeline With Explicit Stream Synchronization
+
+Last updated: 2026-05-13
+
+Status: design plan. Implementation is partially present in CUDA serving
+today, but the common pipeline/fence contract described here is not yet a
+single source of truth in code.
+
+## Goal
+
+Make ARLE serving a staged CPU/GPU pipeline where CPU-owned work can overlap
+GPU-owned work without weakening correctness. The target shape is:
+
+```text
+HTTP ingress
+  -> CPU preprocessing: chat template, tokenization, routing hints
+  -> H2D staging: prompt ids, decode metadata, prefix/KV promotions
+  -> GPU compute: prefill, decode, graph replay, sampling kernels
+  -> D2H readback: sampled token ids, logprobs, terminal metadata
+  -> CPU postprocessing: detokenize, stop handling, SSE/JSON emit
+```
+
+The architecture must expose explicit synchronization semantics at the
+necessary boundaries. In practice, this means CUDA streams and events on CUDA,
+and MLX/Metal async-eval or command-buffer completion tokens on Metal.
+
+## Overlap Modes
+
+This plan is about overlap at three levels:
+
+1. **Request-level CPU/GPU overlap.** While GPU worker N is running prefill or
+   decode for one batch, CPU ingress can tokenize, compute routing hints, route,
+   and detokenize other requests. The selected worker then performs worker-local
+   prefix lookup during admission.
+2. **Copy/compute overlap.** H2D and D2H transfers that are independent of the
+   current compute stream work can run on a copy stream. Required dependencies
+   are expressed with events.
+3. **Worker-lane overlap.** On multi-GPU hosts, each CUDA ordinal owns a worker
+   lane with local CPU affinity and local pinned-memory allocation. NUMA routing
+   keeps requests near the right lane.
+
+This plan is **not** claiming that one request's strictly dependent decode
+steps can overlap with themselves. A sampled token from step `t` remains a hard
+dependency for step `t + 1`; the pipeline only removes waits that are not
+semantic dependencies.
+
+## Non-goals
+
+- Do not claim a throughput or latency win from this document alone. The
+  acceptance gate requires nsys/bench evidence.
+- Do not treat NUMA as the pipeline itself. NUMA is the locality layer that
+  places CPU workers, pinned memory, NICs, and GPU workers close together.
+- Do not try to overlap dependent GPU kernels inside a single model step.
+  The immediate target is CPU/GPU and copy/compute overlap, not kernel DAG
+  scheduling.
+- Do not put H2D/D2H stream waits inside CUDA Graph capture. Graph bodies stay
+  compute-stream-only unless a later trace proves a different shape is safe.
+
+## Current ARLE State
+
+CUDA already has the key primitives, but they are local patterns rather than
+a runtime-wide pipeline contract:
+
+- `DeviceContext` owns a compute stream and a copy stream:
+  [`crates/cuda-kernels/src/tensor.rs`](../../crates/cuda-kernels/src/tensor.rs).
+- `DeviceContext::copy_waits_for_compute()` records an event on the compute
+  stream and makes the copy stream wait.
+- `DeviceContext::compute_waits_for_copy()` records an event on the copy
+  stream and makes the compute stream wait.
+- Qwen3 decode already uses an async greedy-readback ring:
+  `argmax/logprobs -> copy stream D2H -> event query -> CPU read`.
+- CUDA prefill already has `launch_prefill_batch` and
+  `complete_prefill_batch` separation in the scheduler path.
+- Request preprocessing can carry `prompt_tokens` into `IncomingRequest`, so
+  model workers do not need to own every tokenization path.
+- CUDA prefix lookup and prefix-aware admission already run inside the selected
+  worker, where worker-local radix/KV state is valid.
+- CUDA multi-worker bootstrap already discovers runtime topology, binds CPU
+  before CUDA init, allocates worker-local resources, and routes by NUMA cost.
+
+The gaps:
+
+- Most tensor H2D helpers still enqueue on the compute stream.
+- Qwen3 has the strongest async readback path; Qwen3.5 and DeepSeek paths are
+  less uniformly wired and can still contain full-stream sync points.
+- There is no common `PipelineFence` type that scheduler code can pass between
+  stages.
+- Metrics report many stage timings, but do not yet form one pipeline wait
+  accounting model across tokenization, H2D, compute, D2H, and detokenization.
+- Metal has a scheduler/runtime pipeline, but lacks a command-buffer/fence
+  abstraction equivalent to CUDA events at the Rust boundary.
+
+## External Runtime Contract
+
+CUDA supports the desired contract directly:
+
+- Kernel launches are asynchronous with respect to the host.
+- Streams are ordered internally; independent streams can overlap when device
+  resources allow it.
+- `cudaEventRecord` plus `cudaStreamWaitEvent` is the correct primitive for
+  producer/consumer edges across streams.
+- `cudaMemcpyAsync` only gives useful copy/compute overlap when host memory is
+  page-locked and the transfer uses an async-capable stream.
+- The legacy/default stream can introduce implicit synchronization; pipeline
+  code should stay on explicit non-default streams.
+
+Metal/MLX supports a coarser contract:
+
+- MLX is lazy and can submit work asynchronously via `async_eval`.
+- MLX exposes stream concepts, but ARLE's Rust side currently sees most of
+  this through the C++ bridge.
+- Short term, Metal fences should be coarse-grained around async eval or
+  request-state operations.
+- Medium term, the bridge should expose command-buffer completion tokens if
+  trace evidence shows host-side waiting is material.
+
+References:
+
+- NVIDIA CUDA C Programming Guide, asynchronous concurrent execution.
+- NVIDIA CUDA Runtime API, synchronization behavior.
+- MLX lazy evaluation and `async_eval` documentation.
+- MLX stream documentation.
+- Apple Metal command-buffer completion and wait APIs.
+
+## Pipeline Model
+
+Every stage consumes a packet and returns a packet plus a fence:
+
+```rust
+pub struct PipelinePacket<T> {
+    pub payload: T,
+    pub fence: PipelineFence,
+    pub trace_id: RequestTraceId,
+    pub owner: ResourceOwner,
+}
+
+pub enum PipelineFence {
+    Ready,
+    Cuda(CudaPipelineFence),
+    Metal(MetalPipelineFence),
+}
+
+pub struct CudaPipelineFence {
+    pub device_ordinal: u32,
+    pub producer: PipelineStreamKind,
+    pub event: CudaEventHandle,
+}
+
+pub enum PipelineStreamKind {
+    Compute,
+    Copy,
+}
+```
+
+Fence rules:
+
+- `Ready` means the payload is immediately consumable by CPU code.
+- A CUDA fence is ready when its event query succeeds.
+- A CPU reader may poll a fence; it may only block if the next semantic action
+  cannot proceed without the payload.
+- A resource owner may not reuse or free a buffer until all dependent fences
+  have completed.
+- Cross-stream waits are encoded as edge operations, not hidden in random
+  tensor helpers.
+
+## Stage Semantics
+
+### CPU Preprocess
+
+Inputs:
+
+- HTTP request, sampling params, optional `session_id`, trace context.
+
+Work:
+
+- Apply chat template if needed.
+- Tokenize prompt.
+- Compute routing hints such as ingress NUMA node and session id.
+- Compute request length contract.
+
+Output:
+
+- `PreprocessedRequest { prompt_tokens, sampling, session_id, ingress_numa_node }`
+- `PipelineFence::Ready`
+
+This stage should run before request submission to a GPU worker whenever the
+handle exposes a tokenizer. The GPU worker keeps a fallback tokenizer path for
+compatibility and error isolation.
+
+### Route
+
+Inputs:
+
+- Preprocessed request.
+- Runtime topology and worker queue counters.
+
+Work:
+
+- Select worker by NUMA cost plus queue pressure.
+- Preserve session stickiness while the selected worker is not overloaded.
+- Record migration/rebalance metrics.
+- Do not attach a prefix plan before the worker is selected. Prefix/radix state
+  is worker-local.
+
+Output:
+
+- Worker-local packet.
+- `PipelineFence::Ready`
+
+### Worker Admission / Prefix Lookup
+
+Inputs:
+
+- Worker-local packet.
+- Selected worker's radix/prefix cache state.
+
+Work:
+
+- Run worker-local prefix lookup and session-affinity lookup.
+- Build `PrefixAdmissionPlan` for direct GPU reuse, staged readmission, or cold
+  prefill.
+- Degrade stale or non-runnable hits to cold prefill inside the same worker.
+
+Output:
+
+- `WorkerAdmission { prompt_tokens, prefix_plan, sampling, session_id }`
+- `PipelineFence::Ready`
+
+### H2D Stage
+
+Inputs:
+
+- Worker admission packet.
+- Host prompt/meta buffers.
+- Optional staged prefix/KV blocks from the selected worker's prefix plan.
+
+Work:
+
+- Allocate or borrow worker-local pinned buffers.
+- Enqueue H2D on the worker copy stream.
+- Record an event on the copy stream.
+
+Output:
+
+- Device-side prompt/meta/KV handles.
+- `CudaPipelineFence { producer: Copy, event: h2d_done }`
+
+Consumer rule:
+
+```text
+compute_stream waits h2d_done before any kernel reads uploaded data
+```
+
+### GPU Prefill/Decode Stage
+
+Inputs:
+
+- Device payload.
+- H2D fence, if the payload was produced by copy stream.
+
+Work:
+
+- Make compute stream wait on H2D fence.
+- Launch prefill, decode, graph replay, and sampling kernels.
+- Record compute-done event if any downstream copy or host read needs results.
+
+Output:
+
+- Device logits/sampled-token state.
+- `CudaPipelineFence { producer: Compute, event: compute_done }`
+
+### D2H Readback Stage
+
+Inputs:
+
+- Device sampled token ids and logprobs.
+- Compute-done fence.
+
+Work:
+
+- Make copy stream wait on compute-done fence.
+- Copy sampled ids/logprobs into pinned host ring slots.
+- Record D2H-done event on copy stream.
+
+Output:
+
+- Host ring slot.
+- `CudaPipelineFence { producer: Copy, event: d2h_done }`
+
+Consumer rule:
+
+```text
+CPU may only read the host ring slot after d2h_done is ready
+```
+
+### CPU Postprocess
+
+Inputs:
+
+- Readback host slot.
+- D2H fence.
+
+Work:
+
+- Poll or wait on D2H fence only when token ids are required.
+- Decode token ids incrementally.
+- Apply stop sequence handling.
+- Emit SSE/JSON delta.
+- Update usage, cache, and request metrics.
+
+Output:
+
+- Client-visible delta or terminal response.
+- `PipelineFence::Ready`
+
+## Required Synchronization Points
+
+These are the only required sync points in the target architecture:
+
+| Edge | Sync primitive | Blocking policy |
+| --- | --- | --- |
+| H2D -> GPU compute | compute stream waits on copy-stream event | never block CPU |
+| GPU compute -> D2H | copy stream waits on compute-stream event | never block CPU |
+| D2H -> CPU read | CPU event query or narrow wait | block only if token ids are needed now |
+| Resource reuse | owning stage waits on last consumer fence | local wait only, no device-wide sync |
+| Request finish/error | drain request-local fences | local wait only |
+| CUDA Graph replay | graph runs on compute stream | graph boundary handles copy waits outside capture |
+
+Forbidden by default:
+
+- `cudaDeviceSynchronize` on serving hot path.
+- Full compute stream synchronize for sampled-token readback when an event
+  query ring can be used.
+- Hidden stream waits inside helper APIs that do not return or consume a fence.
+- Copy from pageable host memory in a path expected to overlap with compute.
+
+## CUDA Implementation Plan
+
+### P0: Fence substrate
+
+Files likely involved:
+
+- `crates/cuda-kernels/src/tensor.rs`
+- `infer/src/model.rs`
+- `infer/src/scheduler/cuda/*`
+- `infer/src/metrics.rs`
+
+Work:
+
+- Introduce `PipelineFence` and CUDA event wrapper.
+- Convert `DeviceContext::{copy_waits_for_compute, compute_waits_for_copy}`
+  into lower-level helpers used by the fence wrapper.
+- Add tests for event state transitions where CUDA is available; keep no-cuda
+  type tests as stubs.
+- Add metrics for fence poll/ready/wait counts.
+
+Exit gate:
+
+- No behavior change except new metrics and type surface.
+
+### P1: H2D as a copy-stream stage
+
+Files likely involved:
+
+- `crates/cuda-kernels/src/tensor.rs`
+- `infer/src/model/*`
+- `infer/src/scheduler/cuda/prefill.rs`
+- `infer/src/scheduler/cuda/decode.rs`
+
+Work:
+
+- Add async H2D helpers that enqueue on `copy_stream` and return a fence.
+- Keep existing compute-stream copy helpers for load-time and graph-sensitive
+  paths.
+- Switch request metadata and staged-prefix promotion first; do not switch
+  model weight loading in this phase.
+- Add `h2d_latency_us` and `h2d_wait_us`.
+
+Exit gate:
+
+- nsys shows H2D copies on copy stream.
+- compute stream waits only on matching H2D events.
+
+### P2: Readback unification
+
+Files likely involved:
+
+- `infer/src/model/qwen3/batch_decode.rs`
+- `infer/src/model/qwen3/forward.rs`
+- `infer/src/model/qwen35/forward.rs`
+- `infer/src/model/deepseek/*`
+
+Work:
+
+- Keep Qwen3 async readback as the reference implementation.
+- Replace Qwen3.5 full `ctx.sync()` readback with the same event/ring model
+  where model semantics allow it.
+- Add DeepSeek readback only after correctness parity is stable.
+- Surface `d2h_latency_us`, `d2h_wait_us`, and `readback_poll_not_ready`.
+
+Exit gate:
+
+- No per-step full stream sync remains in the hot sampled-token path for
+  Qwen3. Qwen3.5/DeepSeek exceptions must be logged as explicit fallback.
+
+### P3: Scheduler pipeline handles
+
+Files likely involved:
+
+- `infer/src/scheduler/cuda/prefill.rs`
+- `infer/src/scheduler/cuda/decode.rs`
+- `infer/src/scheduler/cuda/runtime/*`
+
+Work:
+
+- Convert prefill launch/complete to return a typed `GpuStageHandle`.
+- Keep decode planning CPU-side while GPU work from the previous stage is in
+  flight.
+- Poll stage handles at scheduler step boundaries instead of synchronizing
+  eagerly.
+- Ensure request cancellation drains only request-local fences.
+
+Exit gate:
+
+- Service metrics can show queued, in-flight, ready, and completed stage
+  counts for prefill and readback.
+
+### P4: NUMA and worker-lane policy
+
+Files likely involved:
+
+- `infer/src/runtime_topology.rs`
+- `infer/src/request_handle.rs`
+- `infer/src/backend/cuda/bootstrap.rs`
+- `infer/src/main.rs`
+
+Work:
+
+- Keep one worker-local `WorkerDeviceContext` per CUDA ordinal.
+- Ensure pinned host pools are allocated after CPU binding and before hot
+  request flow.
+- Route requests by NUMA route cost plus queue pressure.
+- Keep NIC affinity in topology logs and metrics.
+
+Exit gate:
+
+- Startup log prints final worker topology.
+- `numastat` metrics classify local/remote pages across all active worker
+  NUMA nodes.
+
+### P5: Metal bridge
+
+Files likely involved:
+
+- `infer/src/backend/metal/runtime.rs`
+- `infer/src/backend/metal/scheduler.rs`
+- `crates/mlx-sys/src/*`
+
+Work:
+
+- Represent MLX async eval completion as a coarse `MetalPipelineFence`.
+- Keep CPU scheduler and postprocess stages separate from MLX execution.
+- Add C++ bridge command-buffer completion only if trace shows host waits are
+  material and MLX-level fences are too coarse.
+
+Exit gate:
+
+- Metal serving keeps current correctness and CI coverage.
+- Any new wait is visible in metrics.
+
+## Metrics Contract
+
+Add or standardize:
+
+```text
+infer_pipeline_stage_duration_microseconds{stage=preprocess|route|h2d|compute|d2h|postprocess}
+infer_pipeline_stage_queue_depth{stage=...}
+infer_pipeline_fence_wait_microseconds{edge=h2d_to_compute|compute_to_d2h|d2h_to_cpu}
+infer_pipeline_fence_poll_total{edge=...,outcome=ready|not_ready|error}
+infer_pipeline_h2d_latency_microseconds
+infer_pipeline_d2h_latency_microseconds
+infer_pipeline_inflight{stage=...}
+infer_scheduler_gpu_bubble_microseconds
+```
+
+Use existing runtime topology metrics for:
+
+- worker GPU ordinal
+- worker NUMA node
+- local and remote numastat pages
+- route locality and migration/rebalance counters
+
+## Verification Plan
+
+### Local CPU/no-cuda gates
+
+```bash
+cargo test -p infer --no-default-features --features no-cuda runtime_topology -- --nocapture
+cargo test -p infer --no-default-features --features no-cuda numa_router -- --nocapture
+cargo test -p infer --no-default-features --features no-cuda server_metrics --lib
+```
+
+### CUDA type gate on non-GPU hosts
+
+```bash
+CUDARC_CUDA_VERSION=13010 \
+  cargo check -p infer --no-default-features --features cuda,no-cuda
+```
+
+### CUDA runtime gate
+
+Run on a CUDA host:
+
+Terminal A starts the server:
+
+```bash
+CUDA_HOME=/usr/local/cuda cargo build --release -p infer --features cuda
+./target/release/infer \
+  --model-path infer/models/Qwen3-4B \
+  --port 8000 \
+  --max-seq-len 8192
+```
+
+Terminal B drives the workload against that server:
+
+```bash
+scripts/bench_guidellm.sh pipeline-fence-smoke \
+  --fast \
+  --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-4B \
+  --processor infer/models/Qwen3-4B \
+  --trace-interval-ms 250
+```
+
+Trace with nsys:
+
+```bash
+scripts/profile_nsys_signal.sh pipeline-fence-smoke \
+  --server-args "--model-path infer/models/Qwen3-4B --port 8000 --max-seq-len 8192" \
+  --fast \
+  --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-4B
+```
+
+Acceptance evidence:
+
+- copy stream has H2D/D2H work.
+- compute stream has prefill/decode kernels.
+- H2D/D2H overlap compute when workload has independent work available.
+- no unexpected `cudaDeviceSynchronize`.
+- `cuStreamSynchronize` count does not increase except at intentional warmup
+  or shutdown boundaries.
+- emitted tokens and usage match baseline.
+
+### Metal runtime gate
+
+Run on Apple Silicon:
+
+```bash
+cargo test -p infer --release --no-default-features --features metal --lib
+cargo build -p infer --release --no-default-features --features metal --bin metal_serve
+```
+
+Terminal A starts the canonical Metal server and runs startup warmup:
+
+```bash
+./target/release/metal_serve \
+  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
+  --warmup 1 \
+  --warmup-max-new-tokens 1 \
+  --port 8000
+```
+
+Terminal B submits a request and captures stats:
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"Qwen3.6-35B-A3B-4bit","prompt":"Hello","max_tokens":1}'
+
+curl -fsS http://127.0.0.1:8000/v1/stats | jq .
+```
+
+Acceptance evidence:
+
+- Metal scheduler still starts and warmup emits a terminal delta.
+- A live `/v1/completions` request returns a non-empty completion or a valid
+  terminal response.
+- CPU scheduler metrics and postprocess metrics remain populated.
+- Any async-eval wait is visible as a stage/fence metric.
+
+## Rollback Flags
+
+Each phase should have a narrow off switch:
+
+```text
+INFER_PIPELINE_FENCES=0
+INFER_COPY_STREAM_H2D=0
+INFER_ASYNC_D2H_READBACK=0
+INFER_PIPELINE_STAGE_METRICS=0
+```
+
+Flags must disable only the new pipeline behavior. They must not disable
+existing NUMA routing, topology logs, or baseline scheduler behavior.
+
+## Main Risks
+
+- Silent race: CPU reads a pinned host slot before D2H completes.
+- Silent race: compute consumes prompt/meta buffers before H2D completes.
+- Buffer reuse race: a ring slot or scratch buffer is reused before its last
+  consumer fence is ready.
+- CUDA Graph regression: cross-stream waits or allocations leak into graph
+  capture.
+- Pageable-memory regression: async copy becomes effectively synchronous.
+- Hidden sync regression: a model path keeps `ctx.sync()` in the token loop.
+- False attribution: a run changes pipeline, scheduler policy, and kernel
+  code at the same time, making the result unexplainable.
+
+## Review Checklist
+
+Before landing any implementation tranche:
+
+- Every cross-stream dependency has an explicit fence.
+- Every CPU read of GPU-produced data checks or waits on a fence.
+- Every reusable buffer has a last-consumer fence.
+- No graph-captured path performs copy-stream waits.
+- Metrics identify where time is spent and where waits occur.
+- Bench entry states whether performance evidence is real, pending remote, or
+  intentionally deferred.
