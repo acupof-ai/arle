@@ -44,7 +44,7 @@ mod warmup;
 // via `core::*`.
 pub(in crate::scheduler::cuda) use emit_worker::{EmitCommand, EmitEvent, spawn_emit_worker};
 pub(in crate::scheduler::cuda) use helpers::{
-    CONTIGUOUS_KV_TOKENS, PREFIX_CACHE_BLOCK_SIZE, can_publish_prefix_pages,
+    CONTIGUOUS_KV_TOKENS, PREFIX_CACHE_BLOCK_SIZE,
     can_publish_prefix_pages_without_watermark_pressure, host_spill_target_bytes,
     is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
     select_sparse_pages_from_slot_pages,
