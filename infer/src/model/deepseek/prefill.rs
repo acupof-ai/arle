@@ -62,6 +62,12 @@ impl DeepseekModel {
             );
         }
 
+        if let Some(logits) = self.compute_reference_logits_after_prefill(tokens, state)? {
+            state.base.prefill_logits = Some(logits);
+            state.base.kv_cache.advance_seq_len(tokens.len());
+            return Ok(());
+        }
+
         state.base.prefill_logits = Some(
             if let Some(logits) = self.compute_top_level_logits(&[tokens[tokens.len() - 1]])? {
                 logits

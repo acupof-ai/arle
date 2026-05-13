@@ -6,7 +6,8 @@
 
 use std::path::Path;
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
+use half::bf16;
 use log::info;
 
 use super::config::DeepseekRuntimeConfig;
@@ -23,6 +24,8 @@ use deepseek_spec::DeepSeekV4Config;
 use crate::deepseek_v4_manifest::{
     DeepseekV4CheckpointManifest, validate_deepseek_v4_checkpoint_manifest,
 };
+#[cfg(feature = "cuda")]
+use crate::deepseek_v4_reference::DeepseekV4ReferenceModel;
 #[cfg(feature = "cuda")]
 use crate::model::common;
 #[cfg(feature = "cuda")]
@@ -66,6 +69,8 @@ pub struct DeepseekModel {
     pub(super) head_hc: Option<DeepseekV4HyperConnection>,
     #[cfg(feature = "cuda")]
     pub(super) layers: Vec<DeepseekLayer>,
+    #[cfg(feature = "cuda")]
+    pub(super) reference: Option<DeepseekV4ReferenceModel>,
 }
 
 impl DeepseekModel {
@@ -136,6 +141,7 @@ impl DeepseekModel {
             norm: None,
             head_hc: None,
             layers: Vec::new(),
+            reference: None,
         };
         model.validate_phase0_sw_decode_scope()?;
         Ok(model)
@@ -186,11 +192,14 @@ impl DeepseekModel {
         model.embed_tokens = Some(embed_tokens);
         model.lm_head = Some(lm_head);
         model.norm = Some(norm);
+        if infer_real_reference_enabled()? {
+            model.reference = Some(DeepseekV4ReferenceModel::load(path)?);
+        }
 
         let summary = model.config.spec.attention_operator_summary();
         info!(
             "DeepSeek V4 Phase 2A.1 CUDA top-level logits smoke loaded: sliding_window_layers={} \
-             csa_layers={} hca_layers={} vocab_size={} hidden_size={} ep_rank={}/{} experts_per_rank={}",
+             csa_layers={} hca_layers={} vocab_size={} hidden_size={} ep_rank={}/{} experts_per_rank={} real_reference={}",
             summary.sliding_window_layers,
             summary.csa_layers,
             summary.hca_layers,
@@ -198,7 +207,8 @@ impl DeepseekModel {
             model.config.hidden_size,
             model.config.ep.rank,
             model.config.ep.world_size,
-            model.config.ep.experts_per_rank
+            model.config.ep.experts_per_rank,
+            model.reference.is_some()
         );
         Ok(model)
     }
@@ -222,5 +232,53 @@ impl DeepseekModel {
             false,
         )?;
         Ok(Some(logits.with_label("dsv4_phase2a1_top_level_logits")))
+    }
+
+    pub(super) fn compute_reference_logits_after_prefill(
+        &self,
+        tokens: &[u32],
+        state: &mut super::state::DeepseekState,
+    ) -> Result<Option<DeviceVec>> {
+        let Some(reference) = self.reference.as_ref() else {
+            return Ok(None);
+        };
+        state.reference_tokens.extend_from_slice(tokens);
+        let logits = reference.forward_last_logits(&state.reference_tokens)?;
+        Ok(Some(self.reference_logits_to_device(logits)?))
+    }
+
+    pub(super) fn compute_reference_logits_after_decode(
+        &self,
+        token: u32,
+        state: &mut super::state::DeepseekState,
+    ) -> Result<Option<DeviceVec>> {
+        let Some(reference) = self.reference.as_ref() else {
+            return Ok(None);
+        };
+        state.reference_tokens.push(token);
+        let logits = reference.forward_last_logits(&state.reference_tokens)?;
+        Ok(Some(self.reference_logits_to_device(logits)?))
+    }
+
+    fn reference_logits_to_device(&self, logits: Vec<f32>) -> Result<DeviceVec> {
+        ensure!(
+            logits.len() == self.config.vocab_size,
+            "DeepSeek V4 reference logits len {} does not match vocab_size {}",
+            logits.len(),
+            self.config.vocab_size
+        );
+        let host = logits.into_iter().map(bf16::from_f32).collect::<Vec<_>>();
+        DeviceVec::from_host(&self.ctx, &host).map(|v| v.with_label("dsv4_real_reference_logits"))
+    }
+}
+
+fn infer_real_reference_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_INFER_REAL_REFERENCE").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_INFER_REAL_REFERENCE value `{raw}`"),
     }
 }
