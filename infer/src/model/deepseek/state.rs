@@ -5,6 +5,8 @@
 //! compressor/indexer metadata, and MoE route buffers) will live alongside
 //! `decode_bufs` once Phase 2A exposes the kernel surfaces.
 
+use std::collections::VecDeque;
+
 use anyhow::Result;
 
 use crate::model::GenerationState;
@@ -33,6 +35,66 @@ pub struct DeepseekState {
     pub(crate) sample_out: CudaSlice<i32>,
     #[cfg(feature = "cuda")]
     pub(crate) reference_tokens: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    pub(crate) incremental: DeepseekIncrementalState,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(crate) struct DeepseekIncrementalState {
+    pub(crate) processed_tokens: usize,
+    pub(crate) layers: Vec<DeepseekLayerRuntimeCache>,
+}
+
+#[cfg(feature = "cuda")]
+impl DeepseekIncrementalState {
+    pub(crate) fn clear(&mut self) {
+        self.processed_tokens = 0;
+        self.layers.clear();
+    }
+
+    pub(crate) fn ensure_layers(&mut self, layers: usize) {
+        if self.layers.len() < layers {
+            self.layers
+                .resize_with(layers, DeepseekLayerRuntimeCache::default);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(crate) struct DeepseekLayerRuntimeCache {
+    pub(crate) attention: DeepseekAttentionRuntimeCache,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(crate) struct DeepseekAttentionRuntimeCache {
+    pub(crate) window: VecDeque<DeepseekKvRow>,
+    pub(crate) compressed: Option<DeepseekCompressorRuntimeCache>,
+    pub(crate) indexer: Option<DeepseekCompressorRuntimeCache>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekKvRow {
+    pub(crate) pos: usize,
+    pub(crate) values: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekCompressedRow {
+    pub(crate) end_pos: usize,
+    pub(crate) values: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(crate) struct DeepseekCompressorRuntimeCache {
+    pub(crate) pending_kv: Vec<f32>,
+    pub(crate) pending_score: Vec<f32>,
+    pub(crate) prev_overlap_kv: Vec<f32>,
+    pub(crate) prev_overlap_score: Vec<f32>,
+    pub(crate) compressed: Vec<DeepseekCompressedRow>,
 }
 
 // SAFETY: identical invariant to `Qwen3State` — every `DeepseekState` is owned
@@ -50,16 +112,21 @@ impl GenerationState for DeepseekState {
 
     fn reset(&mut self) -> Result<()> {
         self.reference_tokens.clear();
+        self.incremental.clear();
         self.base.reset()
     }
 
     fn reset_for_warmup_clear(&mut self) -> Result<()> {
         self.reference_tokens.clear();
+        self.incremental.clear();
         self.base.reset()
     }
 
     fn truncate_to(&mut self, len: usize) -> Result<()> {
         self.reference_tokens.truncate(len);
+        if self.incremental.processed_tokens > len {
+            self.incremental.clear();
+        }
         self.base.truncate_to(len)
     }
 
