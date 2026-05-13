@@ -15,6 +15,7 @@ use super::helpers::{
     staged_prefix_prefetch_state,
 };
 use crate::kv_tier::{LookupHeuristics, LookupOutcome, ReadmissionSource, RequestChunkState};
+use crate::metrics::PrefixLookupDetail;
 use crate::scheduler::policy::SchedulerSignals;
 use crate::scheduler::types::{RequestLengthContract, SchedulerAdmissionPolicy};
 use crate::server_engine::FinishReason;
@@ -309,17 +310,18 @@ impl<M: ModelForward> Scheduler<M> {
         };
         let lookup_latency_us = lookup_started_at.elapsed().as_micros() as u64;
         let staged = staged_prefix_plan.is_some();
-        self.metrics.record_prefix_lookup_detail(
-            prompt_tokens.len(),
-            lookup.matched_len,
-            reusable_tokens,
-            lookup_latency_us,
-            ready_on_gpu,
-            direct_gpu_attach,
-            staged,
-            false,
-            lookup.recompute_advised,
-        );
+        self.metrics
+            .record_prefix_lookup_detail(PrefixLookupDetail {
+                prompt_tokens: prompt_tokens.len(),
+                matched_prefix_tokens: lookup.matched_len,
+                reusable_tokens,
+                lookup_latency_us,
+                ready_on_gpu,
+                direct_gpu_attach,
+                staged,
+                prefetch: false,
+                recompute: lookup.recompute_advised,
+            });
         if let Some(span) = lookup_trace.as_ref() {
             let (host_blocks, disk_blocks, remote_blocks) = staged_prefix_plan
                 .as_ref()
