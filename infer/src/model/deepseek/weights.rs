@@ -644,12 +644,16 @@ fn head_hidden_from_stream(
 
     let stream_row = extract_hidden_token_with_width(ctx, stream, token_idx, stream.hidden_dim)?;
     let mixes = ops::gemm(ctx, &head_hc.mix_fn, &stream_row)?;
+    let stream_row_host = ctx.stream.clone_dtoh(&stream_row.data)?;
+    let rsqrt = rms_rsqrt_bf16(&stream_row_host, hc_eps);
     let mixes_host = ctx.stream.clone_dtoh(&mixes.data)?;
     let base_host = ctx.stream.clone_dtoh(&head_hc.base.data)?;
     let scale_host = ctx.stream.clone_dtoh(&head_hc.scale.data)?;
     let scale = scale_host[0].to_f32();
     let pre = (0..hc_mult)
-        .map(|idx| sigmoid(scale * mixes_host[idx].to_f32() + base_host[idx].to_f32()) + hc_eps)
+        .map(|idx| {
+            sigmoid(scale * mixes_host[idx].to_f32() * rsqrt + base_host[idx].to_f32()) + hc_eps
+        })
         .collect::<Vec<_>>();
 
     let mut out = HiddenStates::zeros(ctx, hidden_size, 1)?;
@@ -707,6 +711,16 @@ fn sigmoid(value: f32) -> f32 {
         let exp = value.exp();
         exp / (1.0 + exp)
     }
+}
+
+#[cfg(feature = "cuda")]
+fn rms_rsqrt_bf16(values: &[bf16], eps: f32) -> f32 {
+    let mean_square = values
+        .iter()
+        .map(|value| value.to_f32().powi(2))
+        .sum::<f32>()
+        / values.len().max(1) as f32;
+    1.0 / (mean_square + eps).sqrt()
 }
 
 fn infer_real_reference_enabled() -> Result<bool> {
@@ -785,11 +799,11 @@ mod tests {
             seq_len: 1,
         };
         let head_hc = DeepseekV4HyperConnection {
-            base: DeviceVec::from_host(&ctx, &bf16_vec(&[0.0, 1.0986123]))?,
+            base: DeviceVec::from_host(&ctx, &bf16_vec(&[0.0, 0.0]))?,
             mix_fn: DeviceMatrix::from_host(
                 &ctx,
                 &bf16_vec(&[
-                    0.0, 0.0, 0.0, 0.0, //
+                    1.0, 0.0, 0.0, 0.0, //
                     0.0, 0.0, 0.0, 0.0,
                 ]),
                 2,
@@ -802,7 +816,10 @@ mod tests {
         let host = ctx.stream.clone_dtoh(&hidden.data)?;
         ctx.sync()?;
         let got = host.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
-        let expected = [2.75_f32, 4.75_f32];
+        let rsqrt = 1.0_f32 / ((1.0_f32 + 4.0 + 9.0 + 25.0) / 4.0).sqrt();
+        let pre0 = sigmoid(rsqrt);
+        let pre1 = 0.5_f32;
+        let expected = [pre0 * 1.0 + pre1 * 3.0, pre0 * 2.0 + pre1 * 5.0];
         for (idx, value) in got.iter().enumerate() {
             assert!(
                 (*value - expected[idx]).abs() < 0.03,
