@@ -1,10 +1,9 @@
 //! DeepSeek V4 prefill scaffold.
 //!
 //! Phase 2A.1 keeps the same CUDA smoke contract as decode: validate the
-//! scheduler-visible surface, expose device-resident logits with the expected
-//! vocab shape, and advance sequence state. Real V4 embedding, hybrid
-//! attention, routed MoE, and LM-head projection remain behind the Phase 2A
-//! kernel work.
+//! scheduler-visible surface, expose device-resident next-token logits with the
+//! expected vocab shape, and advance sequence state. Real V4 hybrid attention,
+//! routed MoE, and full-context logits remain behind the Phase 2A kernel work.
 
 #[cfg(feature = "cuda")]
 use anyhow::{Result, ensure};
@@ -34,21 +33,26 @@ impl DeepseekPrefillContext {
 
 #[cfg(feature = "cuda")]
 impl DeepseekModel {
-    /// Run prefill for a single sequence into the contiguous KV cache, then
-    /// expose the resulting logits via `state.base.prefill_logits`.
+    /// Run prefill for a single sequence chunk, then expose next-token logits
+    /// via `state.base.prefill_logits`.
+    ///
+    /// The Phase 2A.1 DeepSeek path uses the scheduler's paged pool for long
+    /// context accounting and does not write contiguous KV. Bound the request
+    /// by the model context window instead of the small contiguous scratch
+    /// allocation that paged-prefill models keep only for decode plumbing.
     pub(super) fn prefill_one(&self, tokens: &[u32], state: &mut DeepseekState) -> Result<()> {
         self.validate_phase0_sw_decode_scope()?;
         ensure!(
             !tokens.is_empty(),
             "DeepSeek V4 prefill requires at least one token"
         );
+        let max_seq_len = self.config.max_position_embeddings;
         ensure!(
-            state.base.kv_cache.len().saturating_add(tokens.len())
-                <= state.base.kv_cache.max_seq_len(),
+            state.base.kv_cache.len().saturating_add(tokens.len()) <= max_seq_len,
             "DeepSeek V4 prefill would exceed max_seq_len: current={} incoming={} max={}",
             state.base.kv_cache.len(),
             tokens.len(),
-            state.base.kv_cache.max_seq_len()
+            max_seq_len
         );
         for &token in tokens {
             ensure!(
@@ -59,7 +63,7 @@ impl DeepseekModel {
         }
 
         state.base.prefill_logits = Some(
-            if let Some(logits) = self.compute_top_level_logits(tokens)? {
+            if let Some(logits) = self.compute_top_level_logits(&[tokens[tokens.len() - 1]])? {
                 logits
             } else {
                 // `from_config` tests still build a shell without weights.

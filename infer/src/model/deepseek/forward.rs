@@ -76,6 +76,14 @@ impl ModelForward for DeepseekModel {
         self.prefill_one(tokens, state)
     }
 
+    fn prefill_uses_paged_pool(&self) -> bool {
+        true
+    }
+
+    fn supports_cross_slot_prefix_attach(&self) -> bool {
+        false
+    }
+
     fn forward_decode(&self, token: u32, state: &mut Self::State) -> Result<()> {
         self.validate_phase0_sw_decode_scope()?;
         ensure!(
