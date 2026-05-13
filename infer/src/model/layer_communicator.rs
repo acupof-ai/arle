@@ -9,6 +9,11 @@ use anyhow::{Result, bail};
 
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceVec, HiddenStates};
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
+
+#[cfg(feature = "nccl")]
+use crate::distributed::nccl::NcclGroup;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayerCollective {
@@ -23,9 +28,10 @@ pub enum LayerCollective {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayerCommStatus {
     NoopSingleRank,
+    AllReduceSum,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LayerCommunicator {
     tp_rank: usize,
     tp_world_size: usize,
@@ -33,6 +39,8 @@ pub struct LayerCommunicator {
     dp_world_size: usize,
     cp_rank: usize,
     cp_world_size: usize,
+    #[cfg(feature = "nccl")]
+    tp_nccl: Option<Arc<NcclGroup>>,
 }
 
 impl LayerCommunicator {
@@ -44,6 +52,8 @@ impl LayerCommunicator {
             dp_world_size: 1,
             cp_rank: 0,
             cp_world_size: 1,
+            #[cfg(feature = "nccl")]
+            tp_nccl: None,
         }
     }
 
@@ -65,7 +75,29 @@ impl LayerCommunicator {
             dp_world_size,
             cp_rank,
             cp_world_size,
+            #[cfg(feature = "nccl")]
+            tp_nccl: None,
         })
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn with_tp_nccl(mut self, nccl: Arc<NcclGroup>) -> Result<Self> {
+        if self.tp_world_size != nccl.world_size {
+            bail!(
+                "LayerCommunicator TP world_size {} does not match NCCL world_size {}",
+                self.tp_world_size,
+                nccl.world_size
+            );
+        }
+        if self.tp_rank != nccl.rank {
+            bail!(
+                "LayerCommunicator TP rank {} does not match NCCL rank {}",
+                self.tp_rank,
+                nccl.rank
+            );
+        }
+        self.tp_nccl = Some(nccl);
+        Ok(self)
     }
 
     pub fn tp_rank(&self) -> usize {
@@ -117,9 +149,9 @@ impl LayerCommunicator {
         &self,
         hidden: &mut HiddenStates,
     ) -> Result<LayerCommStatus> {
-        Self::ensure_noop(
+        self.all_reduce_tp_bf16(
             LayerCollective::PostAttentionAllReduce,
-            self.tp_world_size,
+            &mut hidden.data,
             hidden.hidden_dim.saturating_mul(hidden.seq_len),
         )
     }
@@ -129,9 +161,9 @@ impl LayerCommunicator {
         &self,
         hidden: &mut HiddenStates,
     ) -> Result<LayerCommStatus> {
-        Self::ensure_noop(
+        self.all_reduce_tp_bf16(
             LayerCollective::PostMlpAllReduce,
-            self.tp_world_size,
+            &mut hidden.data,
             hidden.hidden_dim.saturating_mul(hidden.seq_len),
         )
     }
@@ -153,9 +185,9 @@ impl LayerCommunicator {
         &self,
         hidden: &mut DeviceVec,
     ) -> Result<LayerCommStatus> {
-        Self::ensure_noop(
+        self.all_reduce_tp_bf16(
             LayerCollective::PostAttentionAllReduce,
-            self.tp_world_size,
+            &mut hidden.data,
             hidden.len,
         )
     }
@@ -165,9 +197,9 @@ impl LayerCommunicator {
         &self,
         hidden: &mut DeviceVec,
     ) -> Result<LayerCommStatus> {
-        Self::ensure_noop(
+        self.all_reduce_tp_bf16(
             LayerCollective::PostMlpAllReduce,
-            self.tp_world_size,
+            &mut hidden.data,
             hidden.len,
         )
     }
@@ -249,6 +281,40 @@ impl LayerCommunicator {
         }
         bail!(
             "{collective:?} requires world_size={world_size}; LayerCommunicator F0.8 only supports single-rank no-op"
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn all_reduce_tp_bf16(
+        &self,
+        collective: LayerCollective,
+        buffer: &mut cudarc::driver::CudaSlice<half::bf16>,
+        len: usize,
+    ) -> Result<LayerCommStatus> {
+        if len != buffer.len() {
+            bail!(
+                "{collective:?} buffer len {} does not match logical len {len}",
+                buffer.len()
+            );
+        }
+        if self.tp_world_size == 1 {
+            return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        #[cfg(feature = "nccl")]
+        {
+            let Some(nccl) = &self.tp_nccl else {
+                bail!(
+                    "{collective:?} requires TP NCCL backend for world_size={}",
+                    self.tp_world_size
+                );
+            };
+            nccl.all_reduce_bf16_in_place(buffer)?;
+            return Ok(LayerCommStatus::AllReduceSum);
+        }
+        #[cfg(not(feature = "nccl"))]
+        bail!(
+            "{collective:?} requires TP NCCL backend for world_size={}; build with --features nccl",
+            self.tp_world_size
         )
     }
 }
