@@ -1,19 +1,22 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Barrier, Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 use std::time::Instant;
 
-use anyhow::Context;
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use infer::backend::cuda::bootstrap::{
-    InferenceEngineOptions, SchedulerRuntimeGuard, ServerRuntimeConfig, detect_model_type,
-    spawn_scheduler_handle_from_path,
+    InferenceEngineOptions, ModelType, SchedulerRuntimeGuard, ServerRuntimeConfig,
+    detect_model_type, spawn_scheduler_handle_from_path,
 };
 use infer::backend::cuda::tensor::{DeviceContext, with_device_ordinal_override};
 use infer::hf_hub;
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
-use infer::model::{KVCacheDtype, KVFormat};
+use infer::model::{GenerationState, KVCacheDtype, KVFormat, ModelForward};
 use infer::request_handle::{NumaSchedulerRouter, NumaSchedulerWorker};
 use infer::runtime_topology::{
     AffinityApplyResult, RuntimeTopology, WorkerPlacement, bind_process_to_placement,
@@ -26,6 +29,7 @@ use infer::scheduler::{
 use infer::server_engine::EnginePoolModelSpec;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
+use rand::{SeedableRng, rngs::StdRng};
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_SEQ_LEN: usize = 4096;
@@ -259,12 +263,38 @@ struct Args {
     /// Run the F0 two-rank NCCL all-reduce smoke and exit.
     #[arg(long)]
     nccl_smoke: bool,
+
+    /// Run a direct DeepSeek V4 multi-rank generation smoke and exit.
+    ///
+    /// This bypasses the HTTP scheduler and drives ARLE's CUDA model forward
+    /// path directly across one rank thread per configured CUDA ordinal.
+    #[arg(long)]
+    deepseek_distributed_generate: bool,
+
+    /// Prompt used by `--deepseek-distributed-generate`.
+    #[arg(long, default_value = "Hello")]
+    deepseek_distributed_prompt: String,
+
+    /// New tokens to generate with `--deepseek-distributed-generate`.
+    #[arg(long, default_value_t = 1)]
+    deepseek_distributed_max_new_tokens: usize,
+
+    /// Number of DeepSeek transformer layers to run on the GPU direct path.
+    /// Leave unset to run one layer for bring-up; set to the model layer count
+    /// for a full-model correctness run.
+    #[arg(long)]
+    deepseek_distributed_layers: Option<usize>,
 }
 
 fn main() {
     let args = Args::parse();
     apply_quant_format_override(&args);
     logging::init_default();
+    if args.deepseek_distributed_generate {
+        run_deepseek_distributed_generate(&args)
+            .unwrap_or_else(|err| panic!("DeepSeek distributed generate failed: {err:#}"));
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -284,6 +314,214 @@ fn apply_quant_format_override(args: &Args) {
         }
         other => panic!("Invalid --quant-format '{other}': expected {VALID_QUANT_FORMATS}"),
     }
+}
+
+fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
+    #[cfg(not(all(feature = "cuda", feature = "nccl")))]
+    {
+        let _ = args;
+        bail!("--deepseek-distributed-generate requires building infer with --features cuda,nccl");
+    }
+
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    {
+        use infer::distributed::expert_state::ExpertGroup;
+        use infer::model::deepseek::{DeepseekModel, DeepseekRuntimeConfig};
+        use infer::sampler::SamplingParams;
+        use infer::tensor_parallel::TpConfig;
+        use infer::tokenizer::Tokenizer;
+
+        let model_path = args
+            .model_path
+            .to_str()
+            .context("Model path must be valid UTF-8")?;
+        let resolved_model_path = hf_hub::resolve_model_path(model_path)
+            .with_context(|| format!("failed to resolve model path {model_path}"))?;
+        let resolved_model_path = resolved_model_path
+            .to_str()
+            .context("Resolved model path must be valid UTF-8")?
+            .to_string();
+        let model_type = detect_model_type(&resolved_model_path)?;
+        if !matches!(model_type, ModelType::DeepSeekV4) {
+            bail!("--deepseek-distributed-generate only supports DeepSeek V4, got {model_type}");
+        }
+
+        let spec_runtime = DeepseekRuntimeConfig::from_model_dir(&resolved_model_path)?;
+        let layers = args.deepseek_distributed_layers.unwrap_or(1);
+        if layers == 0 || layers > spec_runtime.num_hidden_layers {
+            bail!(
+                "--deepseek-distributed-layers must be in 1..={}, got {}",
+                spec_runtime.num_hidden_layers,
+                layers
+            );
+        }
+
+        let cuda_ordinals = configured_cuda_worker_ordinals()
+            .map_err(|err| anyhow::anyhow!("invalid CUDA workers: {err}"))?;
+        if cuda_ordinals.is_empty() {
+            bail!("at least one CUDA ordinal is required");
+        }
+        let world_size = cuda_ordinals.len();
+        if spec_runtime.o_groups != world_size {
+            bail!(
+                "DeepSeek V4 direct distributed path maps TP ranks to O-LoRA groups; configured ranks={} but o_groups={}",
+                world_size,
+                spec_runtime.o_groups
+            );
+        }
+        if !spec_runtime.n_routed_experts.is_multiple_of(world_size) {
+            bail!(
+                "DeepSeek V4 n_routed_experts={} must be divisible by ranks={}",
+                spec_runtime.n_routed_experts,
+                world_size
+            );
+        }
+
+        let tokenizer = Tokenizer::from_file(&resolved_model_path)?;
+        let prompt_tokens = tokenizer.encode(&args.deepseek_distributed_prompt)?;
+        if prompt_tokens.is_empty() {
+            bail!("distributed generate prompt encoded to zero tokens");
+        }
+        let prompt_tokens = Arc::new(prompt_tokens);
+        let max_seq_len = args
+            .max_seq_len
+            .unwrap_or_else(|| prompt_tokens.len() + args.deepseek_distributed_max_new_tokens + 1);
+        let kv_mode = parse_kv_cache_mode(&args.kv_cache_dtype)
+            .map_err(|err| anyhow::anyhow!("invalid KV cache mode: {err}"))?;
+        let kv_cache_dtype = match kv_mode {
+            RequestedKvCacheMode::Auto => KVCacheDtype::BF16,
+            RequestedKvCacheMode::Explicit { kv_cache_dtype, .. } => kv_cache_dtype,
+        };
+
+        configure_deepseek_distributed_env(layers, world_size)?;
+
+        let selected_token = Arc::new(AtomicU32::new(0));
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let generated = Arc::new(Mutex::new(Vec::new()));
+        let prefill_barrier = Arc::new(Barrier::new(world_size));
+        let token_barrier = Arc::new(Barrier::new(world_size));
+        let decode_barrier = Arc::new(Barrier::new(world_size));
+
+        info!(
+            "DeepSeek distributed direct generate: model={} ranks={} cuda_ordinals={:?} prompt_tokens={} max_new_tokens={} gpu_layers={}",
+            resolved_model_path,
+            world_size,
+            cuda_ordinals,
+            prompt_tokens.len(),
+            args.deepseek_distributed_max_new_tokens,
+            layers,
+        );
+
+        let mut handles = Vec::with_capacity(world_size);
+        for (rank, cuda_ordinal) in cuda_ordinals.into_iter().enumerate() {
+            let model_path = resolved_model_path.clone();
+            let prompt_tokens = Arc::clone(&prompt_tokens);
+            let selected_token = Arc::clone(&selected_token);
+            let should_stop = Arc::clone(&should_stop);
+            let generated = Arc::clone(&generated);
+            let prefill_barrier = Arc::clone(&prefill_barrier);
+            let token_barrier = Arc::clone(&token_barrier);
+            let decode_barrier = Arc::clone(&decode_barrier);
+            let max_new_tokens = args.deepseek_distributed_max_new_tokens;
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("dsv4-direct-rank-{rank}"))
+                    .spawn(move || -> Result<()> {
+                        with_device_ordinal_override(cuda_ordinal as u32, || -> Result<()> {
+                            let mut runtime = DeepseekRuntimeConfig::from_model_dir(&model_path)?;
+                            runtime.enable_cuda_graph = false;
+                            runtime.tp = TpConfig::new(world_size, rank)?;
+                            runtime.ep =
+                                ExpertGroup::new(rank, world_size, runtime.spec.n_routed_experts)?;
+                            let model = DeepseekModel::from_safetensors(&model_path, runtime)
+                                .with_context(|| {
+                                    format!("rank {rank}: load DeepSeek V4 weights")
+                                })?;
+                            let mut state = model.create_state()?;
+                            state.set_max_seq_len(max_seq_len);
+                            state.set_kv_dtype(kv_cache_dtype);
+                            model
+                                .forward_prefill(&prompt_tokens, &mut state)
+                                .with_context(|| format!("rank {rank}: prefill"))?;
+                            prefill_barrier.wait();
+
+                            let mut rng = StdRng::seed_from_u64(42);
+                            let sampling = SamplingParams::default();
+                            for step_idx in 0..max_new_tokens {
+                                if rank == 0 {
+                                    let token = model
+                                        .select_token(&mut state, &sampling, &mut rng)
+                                        .with_context(|| {
+                                            format!("rank 0: select token step {step_idx}")
+                                        })?;
+                                    selected_token.store(token, Ordering::SeqCst);
+                                    generated
+                                        .lock()
+                                        .expect("generated lock poisoned")
+                                        .push(token);
+                                    if model.is_stop_token(token) {
+                                        should_stop.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                token_barrier.wait();
+
+                                let token = selected_token.load(Ordering::SeqCst);
+                                let stop = should_stop.load(Ordering::SeqCst);
+                                if step_idx + 1 < max_new_tokens && !stop {
+                                    model.forward_decode(token, &mut state).with_context(|| {
+                                        format!("rank {rank}: decode step {step_idx} token {token}")
+                                    })?;
+                                }
+                                decode_barrier.wait();
+                                if stop {
+                                    break;
+                                }
+                            }
+                            Ok(())
+                        })
+                    })?,
+            );
+        }
+
+        for (rank, handle) in handles.into_iter().enumerate() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("DeepSeek direct rank {rank} thread panicked"))?
+                .with_context(|| format!("DeepSeek direct rank {rank} failed"))?;
+        }
+
+        let generated = generated.lock().expect("generated lock poisoned").clone();
+        let generated_text = tokenizer
+            .decode(&generated)
+            .unwrap_or_else(|err| format!("<decode failed for {:?}: {err:#}>", generated));
+        println!("deepseek_distributed_generated_token_ids={generated:?}");
+        println!("deepseek_distributed_generated_text={generated_text:?}");
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn configure_deepseek_distributed_env(layers: usize, world_size: usize) -> Result<()> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("reserve NCCL rendezvous TCP port")?;
+    let port = listener
+        .local_addr()
+        .context("read NCCL rendezvous TCP port")?
+        .port();
+    drop(listener);
+
+    // SAFETY: direct distributed generate runs before the Tokio runtime starts
+    // and before any background threads are spawned.
+    unsafe {
+        std::env::set_var("MASTER_ADDR", "127.0.0.1");
+        std::env::set_var("MASTER_PORT", port.to_string());
+        std::env::set_var("WORLD_SIZE", world_size.to_string());
+        std::env::set_var("ARLE_DSV4_LOAD_LAYER_WEIGHTS", "1");
+        std::env::set_var("ARLE_DSV4_GPU_FULL_LAYERS", layers.to_string());
+        std::env::set_var("ARLE_DSV4_GPU_CONTEXT_TOKENS", "1");
+        std::env::set_var("ARLE_DSV4_INFER_REAL_REFERENCE", "0");
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
