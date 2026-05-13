@@ -318,6 +318,12 @@ fn apply_quant_format_override(args: &Args) {
     }
 }
 
+unsafe fn set_env_default(key: &str, value: impl AsRef<str>) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value.as_ref());
+    }
+}
+
 fn configure_deepseek_serving_env_if_needed(args: &Args) -> Result<()> {
     let model_path = args
         .model_path
@@ -384,10 +390,10 @@ fn configure_deepseek_serving_env_if_needed(args: &Args) -> Result<()> {
             std::env::set_var("MASTER_PORT", port.to_string());
             std::env::set_var("WORLD_SIZE", world_size.to_string());
         }
-        std::env::set_var("ARLE_DSV4_LOAD_LAYER_WEIGHTS", "1");
-        std::env::set_var("ARLE_DSV4_GPU_FULL_LAYERS", layers.to_string());
-        std::env::set_var("ARLE_DSV4_GPU_CONTEXT_TOKENS", "1");
-        std::env::set_var("ARLE_DSV4_INFER_REAL_REFERENCE", "0");
+        set_env_default("ARLE_DSV4_LOAD_LAYER_WEIGHTS", "1");
+        set_env_default("ARLE_DSV4_GPU_FULL_LAYERS", layers.to_string());
+        set_env_default("ARLE_DSV4_GPU_CONTEXT_TOKENS", "1");
+        set_env_default("ARLE_DSV4_INFER_REAL_REFERENCE", "0");
     }
     info!(
         "DeepSeek V4 serving distributed env: ranks={} gpu_layers={} model={}",
@@ -742,10 +748,10 @@ fn configure_deepseek_distributed_env(layers: usize, world_size: usize) -> Resul
         std::env::set_var("MASTER_ADDR", "127.0.0.1");
         std::env::set_var("MASTER_PORT", port.to_string());
         std::env::set_var("WORLD_SIZE", world_size.to_string());
-        std::env::set_var("ARLE_DSV4_LOAD_LAYER_WEIGHTS", "1");
-        std::env::set_var("ARLE_DSV4_GPU_FULL_LAYERS", layers.to_string());
-        std::env::set_var("ARLE_DSV4_GPU_CONTEXT_TOKENS", "1");
-        std::env::set_var("ARLE_DSV4_INFER_REAL_REFERENCE", "0");
+        set_env_default("ARLE_DSV4_LOAD_LAYER_WEIGHTS", "1");
+        set_env_default("ARLE_DSV4_GPU_FULL_LAYERS", layers.to_string());
+        set_env_default("ARLE_DSV4_GPU_CONTEXT_TOKENS", "1");
+        set_env_default("ARLE_DSV4_INFER_REAL_REFERENCE", "0");
     }
     Ok(())
 }
