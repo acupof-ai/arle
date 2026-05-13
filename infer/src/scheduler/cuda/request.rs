@@ -271,6 +271,9 @@ pub(crate) struct ActiveRequest {
     /// Optional client session identifier forwarded from `IncomingRequest`.
     /// Preserved across preemption so requeued work stays session-sticky.
     pub(crate) session_id: Option<crate::types::SessionId>,
+    /// NUMA node where HTTP preprocessing ran, carried through requeues so
+    /// a future cross-worker handoff keeps the original cost signal.
+    pub(crate) ingress_numa_node: Option<i32>,
     /// Most recent trace context used to chain request-level spans across threads.
     pub(crate) trace_context: Option<SpanContext>,
     pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
@@ -435,6 +438,7 @@ mod tests {
             spec_acceptance_tracker: None,
             spec_decode_disabled: false,
             session_id: None,
+            ingress_numa_node: None,
             trace_context: None,
             delta_tx,
             emit_cursor: EmitCursor::default(),

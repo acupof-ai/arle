@@ -57,6 +57,7 @@ struct EmitWorkerRequest {
 pub(in crate::scheduler::cuda) fn spawn_emit_worker(
     tokenizer: Tokenizer,
     stream_interval: usize,
+    worker_placement: Option<crate::runtime_topology::WorkerPlacement>,
 ) -> (
     crossbeam_channel::Sender<EmitCommand>,
     crossbeam_channel::Receiver<EmitEvent>,
@@ -68,6 +69,20 @@ pub(in crate::scheduler::cuda) fn spawn_emit_worker(
     let thread = std::thread::Builder::new()
         .name("infer-cuda-emit".to_string())
         .spawn(move || {
+            if let Some(placement) = worker_placement.as_ref() {
+                let affinity = crate::runtime_topology::bind_current_thread_to_placement(
+                    placement,
+                    "cuda-detokenizer",
+                );
+                log::info!(
+                    "CUDA detokenizer worker ready: worker={} numa={:?} cpus={} affinity_applied={} reason={}",
+                    placement.worker_id,
+                    placement.numa_node,
+                    placement.cpus.len(),
+                    affinity.applied,
+                    affinity.reason,
+                );
+            }
             let mut active = HashMap::<u64, EmitWorkerRequest>::new();
             while let Ok(command) = rx.recv() {
                 match command {

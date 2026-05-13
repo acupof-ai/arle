@@ -92,6 +92,10 @@ pub struct ServerRuntimeConfig {
     /// `total × (1 - mem_fraction_static)`. `None` falls back to `total`,
     /// which over-counts the driver overhead.
     pub pre_model_free_bytes: Option<usize>,
+    /// Worker placement selected before CUDA initialization. CUDA bootstrap
+    /// applies this before scheduler execution and passes it to detokenizer
+    /// workers so CPU-side pipeline stages stay NUMA-local to the GPU.
+    pub worker_placement: Option<crate::runtime_topology::WorkerPlacement>,
 }
 
 #[cfg(feature = "cuda")]
@@ -106,6 +110,7 @@ impl Default for ServerRuntimeConfig {
             kv_cache_dtype: crate::model::kv_cache::KVCacheDtype::BF16,
             kv_pool_format: crate::model::kv_cache::KVFormat::BF16,
             pre_model_free_bytes: None,
+            worker_placement: None,
         }
     }
 }
@@ -414,6 +419,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         kv_cache_dtype,
         kv_pool_format,
         pre_model_free_bytes,
+        worker_placement,
         ..
     } = runtime;
 
@@ -469,9 +475,35 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         max_seq_len,
         kv_cache_dtype,
         kv_pool_format,
+        worker_placement.clone(),
     )?;
     let (ready_tx, ready_rx) = mpsc::channel();
-    let thread = std::thread::spawn(move || scheduler.run_with_ready_signal(ready_tx));
+    let scheduler_thread_placement = worker_placement.clone();
+    let thread_name = scheduler_thread_placement.as_ref().map_or_else(
+        || "infer-cuda-scheduler".to_string(),
+        |placement| format!("infer-cuda-scheduler-gpu{}", placement.gpu_ordinal),
+    );
+    let thread = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            if let Some(placement) = scheduler_thread_placement.as_ref() {
+                let affinity = crate::runtime_topology::bind_current_thread_to_placement(
+                    placement,
+                    "cuda-scheduler",
+                );
+                info!(
+                    "CUDA scheduler worker ready: worker={} gpu={} numa={:?} cpus={} affinity_applied={} reason={}",
+                    placement.worker_id,
+                    placement.gpu_ordinal,
+                    placement.numa_node,
+                    placement.cpus.len(),
+                    affinity.applied,
+                    affinity.reason,
+                );
+            }
+            scheduler.run_with_ready_signal(ready_tx);
+        })
+        .context("spawn CUDA scheduler worker thread")?;
     Ok((
         handle,
         SchedulerRuntimeGuard::new(model_id, thread, ready_rx),

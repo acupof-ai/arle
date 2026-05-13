@@ -24,6 +24,8 @@
 //! | `infer_scheduler_loop_total_microseconds` | gauge | EMA full scheduler loop duration |
 //! | `infer_preprocess_*` | gauge | HTTP preprocess queue and tokenization timing |
 //! | `infer_scheduler_pipeline_*` | gauge/counter | Scheduler pipeline snapshot/plan/GPU-command telemetry |
+//! | `infer_runtime_topology_*` | gauge | NUMA/GPU/NIC topology and worker placement |
+//! | `infer_runtime_h2d_latency_*` | gauge/counter | Host-to-device copy latency telemetry |
 //! | `infer_scheduler_plan_total` | counter | Scheduler ticks by selected plan label |
 //! | `infer_prefill_path_mixed_batch_total` | counter | Mixed decode+prefill path outcomes |
 //! | `infer_prefill_path_mixed_batch_fallback_total` | counter | Mixed decode+prefill fallback reasons |
@@ -100,6 +102,9 @@ pub use histogram::{Histogram, HistogramSet, LATENCY_BUCKETS};
 use histogram::{micros_to_secs, secs_to_micros};
 
 use crate::model_arch::ModelArchSummary;
+use crate::runtime_topology::{
+    AffinityApplyResult, NumaMemoryStats, RuntimeTopology, WorkerPlacement,
+};
 use crate::server_engine::PrefillPathStats;
 
 // ============================================================================
@@ -226,6 +231,39 @@ impl SessionCacheStats {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeTopologyMetrics {
+    pub numa_nodes: u64,
+    pub gpus: u64,
+    pub nics: u64,
+    pub worker_id: u64,
+    pub worker_gpu_ordinal: u64,
+    pub worker_numa_node: i64,
+    pub worker_cpu_count: u64,
+    pub worker_nic_count: u64,
+    pub affinity_applied: bool,
+    pub affinity_threads: u64,
+    pub affinity_failed_threads: u64,
+    pub affinity_reason: String,
+    pub preprocess_groups: u64,
+    pub preprocess_workers: u64,
+    pub detokenizer_groups: u64,
+    pub detokenizer_workers: u64,
+    pub numastat_local_pages: u64,
+    pub numastat_remote_pages: u64,
+    pub numastat_total_pages: u64,
+    pub numastat_nodes: Vec<(i32, u64)>,
+    pub h2d_latency_last_us: u64,
+    pub h2d_latency_max_us: u64,
+    pub h2d_latency_count: u64,
+    pub numa_route_local_total: u64,
+    pub numa_route_cross_total: u64,
+    pub numa_route_unknown_total: u64,
+    pub numa_route_cost_last: u64,
+    pub numa_migration_total: u64,
+    pub numa_rebalance_total: u64,
+}
+
 struct MetricsInner {
     // Counters (atomic for lock-free updates from scheduler thread).
     pub requests_total: AtomicU64,
@@ -337,6 +375,7 @@ struct MetricsInner {
     pub histograms: Mutex<HistogramSet>,
     pub latest_request_cache: Mutex<RequestCacheStats>,
     pub session_cache: Mutex<HashMap<String, SessionCacheStats>>,
+    pub runtime_topology: Mutex<RuntimeTopologyMetrics>,
 
     // Model metadata.
     pub model_id: String,
@@ -450,6 +489,7 @@ impl ServerMetrics {
                 histograms: Mutex::new(HistogramSet::new()),
                 latest_request_cache: Mutex::new(RequestCacheStats::default()),
                 session_cache: Mutex::new(HashMap::new()),
+                runtime_topology: Mutex::new(RuntimeTopologyMetrics::default()),
                 model_id: model_id.to_string(),
                 model_arch: Mutex::new(None),
             }),
@@ -790,6 +830,122 @@ impl ServerMetrics {
             .store(gpu_command_queue_depth, Ordering::Relaxed);
     }
 
+    pub fn set_runtime_topology(
+        &self,
+        topology: &RuntimeTopology,
+        placement: &WorkerPlacement,
+        affinity: &AffinityApplyResult,
+    ) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.numa_nodes = topology.numa_nodes.len() as u64;
+        metrics.gpus = topology.gpus.len() as u64;
+        metrics.nics = topology.nics.len() as u64;
+        metrics.worker_id = placement.worker_id as u64;
+        metrics.worker_gpu_ordinal = placement.gpu_ordinal as u64;
+        metrics.worker_numa_node = placement.numa_node.map_or(-1, i64::from);
+        metrics.worker_cpu_count = placement.cpus.len() as u64;
+        metrics.worker_nic_count = placement.nics.len() as u64;
+        metrics.affinity_applied = affinity.applied;
+        metrics.affinity_threads = affinity.applied_threads as u64;
+        metrics.affinity_failed_threads = affinity.failed_threads as u64;
+        metrics.affinity_reason.clone_from(&affinity.reason);
+    }
+
+    pub fn set_preprocess_topology(&self, groups: usize, workers: usize) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.preprocess_groups = groups as u64;
+        metrics.preprocess_workers = workers as u64;
+    }
+
+    pub fn set_detokenizer_topology(&self, groups: usize, workers: usize) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.detokenizer_groups = groups as u64;
+        metrics.detokenizer_workers = workers as u64;
+    }
+
+    pub fn set_runtime_numastat(&self, stats: &NumaMemoryStats, local_node: Option<i32>) {
+        let local_pages = local_node
+            .and_then(|node| {
+                stats
+                    .per_node_pages
+                    .iter()
+                    .find(|(sample_node, _)| *sample_node == node)
+                    .map(|(_, pages)| *pages)
+            })
+            .unwrap_or(0);
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.numastat_local_pages = local_pages;
+        metrics.numastat_total_pages = stats.total_pages;
+        metrics.numastat_remote_pages = stats.total_pages.saturating_sub(local_pages);
+        metrics.numastat_nodes.clone_from(&stats.per_node_pages);
+    }
+
+    pub fn observe_h2d_latency_us(&self, latency_us: u64) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.h2d_latency_last_us = latency_us;
+        metrics.h2d_latency_max_us = metrics.h2d_latency_max_us.max(latency_us);
+        metrics.h2d_latency_count = metrics.h2d_latency_count.saturating_add(1);
+    }
+
+    pub fn record_numa_route(&self, route_cost: u32, local: Option<bool>) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match local {
+            Some(true) => {
+                metrics.numa_route_local_total = metrics.numa_route_local_total.saturating_add(1);
+            }
+            Some(false) => {
+                metrics.numa_route_cross_total = metrics.numa_route_cross_total.saturating_add(1);
+            }
+            None => {
+                metrics.numa_route_unknown_total =
+                    metrics.numa_route_unknown_total.saturating_add(1);
+            }
+        }
+        metrics.numa_route_cost_last = u64::from(route_cost);
+    }
+
+    pub fn record_numa_migration(&self) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.numa_migration_total = metrics.numa_migration_total.saturating_add(1);
+    }
+
+    pub fn record_numa_rebalance(&self) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.numa_rebalance_total = metrics.numa_rebalance_total.saturating_add(1);
+    }
+
     pub fn record_scheduler_cpu_plan_accept(&self) {
         self.inner
             .scheduler_pipeline_cpu_plan_accept_total
@@ -1074,6 +1230,14 @@ impl ServerMetrics {
                 .scheduler_pipeline_cpu_plan_stale_total
                 .load(Ordering::Relaxed),
         )
+    }
+
+    pub fn runtime_topology_snapshot(&self) -> RuntimeTopologyMetrics {
+        self.inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn scheduler_plan_totals(&self) -> (u64, u64, u64, u64, u64) {
@@ -1488,6 +1652,60 @@ mod tests {
         m.set_scheduler_loop_phase_us(50.0, 1050.0);
         m.set_preprocess_stage(2, 11, 22);
         m.set_scheduler_pipeline_us(33, 44, 55, 1);
+        m.set_runtime_topology(
+            &crate::runtime_topology::RuntimeTopology {
+                numa_nodes: vec![crate::runtime_topology::NumaNodeTopology {
+                    node: 0,
+                    cpus: vec![0, 1],
+                }],
+                gpus: vec![crate::runtime_topology::GpuTopology {
+                    ordinal: 0,
+                    pci_bus_id: Some("17:00.0".to_string()),
+                    uuid: None,
+                    numa_node: Some(0),
+                    local_cpus: vec![0, 1],
+                    nearest_nics: vec!["mlx5_0".to_string()],
+                }],
+                nics: vec![crate::runtime_topology::NicTopology {
+                    name: "mlx5_0".to_string(),
+                    pci_bus_id: Some("18:00.0".to_string()),
+                    numa_node: Some(0),
+                    local_cpus: vec![0, 1],
+                }],
+                fallback_cpus: vec![0, 1],
+            },
+            &crate::runtime_topology::WorkerPlacement {
+                worker_id: 0,
+                gpu_ordinal: 0,
+                numa_node: Some(0),
+                cpus: vec![0, 1],
+                nics: vec!["mlx5_0".to_string()],
+                route_cost: 0,
+            },
+            &crate::runtime_topology::AffinityApplyResult {
+                label: "test".to_string(),
+                applied: true,
+                requested_cpus: vec![0, 1],
+                applied_threads: 2,
+                failed_threads: 0,
+                reason: "applied".to_string(),
+            },
+        );
+        m.set_preprocess_topology(1, 2);
+        m.set_detokenizer_topology(1, 1);
+        m.set_runtime_numastat(
+            &crate::runtime_topology::NumaMemoryStats {
+                total_pages: 9,
+                per_node_pages: vec![(0, 7), (1, 2)],
+            },
+            Some(0),
+        );
+        m.observe_h2d_latency_us(77);
+        m.observe_h2d_latency_us(99);
+        m.record_numa_route(0, Some(true));
+        m.record_numa_route(100, Some(false));
+        m.record_numa_migration();
+        m.record_numa_rebalance();
         m.record_scheduler_cpu_plan_accept();
         m.record_scheduler_cpu_plan_stale();
         m.record_scheduler_plan(SchedulerPlanLabel::Decode);
@@ -1583,6 +1801,22 @@ mod tests {
         assert!(rendered.contains(
             "infer_scheduler_pipeline_cpu_plan_total{model=\"Qwen3-4B\",outcome=\"stale\",} 1"
         ));
+        assert!(rendered.contains("infer_runtime_topology_numa_nodes{model=\"Qwen3-4B\",} 1"));
+        assert!(rendered.contains("infer_runtime_worker_affinity_applied{model=\"Qwen3-4B\",} 1"));
+        assert!(
+            rendered.contains(
+                "infer_runtime_numastat_pages{model=\"Qwen3-4B\",placement=\"local\",} 7"
+            )
+        );
+        assert!(rendered.contains(
+            "infer_runtime_h2d_latency_microseconds{model=\"Qwen3-4B\",stat=\"max\",} 99"
+        ));
+        assert!(
+            rendered.contains(
+                "infer_scheduler_numa_route_total{model=\"Qwen3-4B\",outcome=\"cross\",} 1"
+            )
+        );
+        assert!(rendered.contains("infer_scheduler_numa_migration_total{model=\"Qwen3-4B\",} 1"));
         assert!(
             rendered.contains("infer_scheduler_plan_total{model=\"Qwen3-4B\",plan=\"decode\",} 1")
         );
@@ -1776,6 +2010,36 @@ mod tests {
         m.record_prefix_aware_admit_deferral();
         m.set_preprocess_stage(3, 21, 34);
         m.set_scheduler_pipeline_us(55, 89, 144, 1);
+        m.set_runtime_topology(
+            &crate::runtime_topology::RuntimeTopology {
+                numa_nodes: vec![crate::runtime_topology::NumaNodeTopology {
+                    node: 1,
+                    cpus: vec![2, 3],
+                }],
+                gpus: Vec::new(),
+                nics: Vec::new(),
+                fallback_cpus: vec![2, 3],
+            },
+            &crate::runtime_topology::WorkerPlacement {
+                worker_id: 0,
+                gpu_ordinal: 0,
+                numa_node: Some(1),
+                cpus: vec![2, 3],
+                nics: Vec::new(),
+                route_cost: 0,
+            },
+            &crate::runtime_topology::AffinityApplyResult {
+                label: "test".to_string(),
+                applied: true,
+                requested_cpus: vec![2, 3],
+                applied_threads: 1,
+                failed_threads: 0,
+                reason: "applied".to_string(),
+            },
+        );
+        m.set_preprocess_topology(1, 2);
+        m.set_detokenizer_topology(1, 1);
+        m.observe_h2d_latency_us(123);
         m.record_scheduler_cpu_plan_accept();
         m.record_scheduler_cpu_plan_stale();
 
@@ -1839,6 +2103,18 @@ mod tests {
         assert_eq!(
             payload["scheduler_pipeline"]["cpu_plan_stale_total"],
             serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["runtime_topology"]["worker_numa_node"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["runtime_topology"]["preprocess_workers"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            payload["runtime_topology"]["h2d_latency_last_us"],
+            serde_json::json!(123)
         );
         assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));
         assert_eq!(payload["session_affinity_miss"], serde_json::json!(0));

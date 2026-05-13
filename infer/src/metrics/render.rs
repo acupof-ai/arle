@@ -634,6 +634,159 @@ impl ServerMetrics {
             .unwrap();
         }
 
+        let runtime = self.runtime_topology_snapshot();
+        for (name, help, value) in [
+            (
+                "infer_runtime_topology_numa_nodes",
+                "NUMA nodes discovered at runtime startup.",
+                runtime.numa_nodes,
+            ),
+            (
+                "infer_runtime_topology_gpus",
+                "GPU devices discovered at runtime startup.",
+                runtime.gpus,
+            ),
+            (
+                "infer_runtime_topology_nics",
+                "NIC devices discovered at runtime startup.",
+                runtime.nics,
+            ),
+            (
+                "infer_runtime_worker_gpu_ordinal",
+                "GPU ordinal selected for this runtime worker.",
+                runtime.worker_gpu_ordinal,
+            ),
+            (
+                "infer_runtime_worker_cpu_count",
+                "CPU count in this runtime worker affinity set.",
+                runtime.worker_cpu_count,
+            ),
+            (
+                "infer_runtime_worker_nic_count",
+                "NIC count selected as nearest to this runtime worker GPU.",
+                runtime.worker_nic_count,
+            ),
+            (
+                "infer_runtime_worker_affinity_applied",
+                "Whether CPU affinity was applied for the runtime worker.",
+                u64::from(runtime.affinity_applied),
+            ),
+            (
+                "infer_runtime_worker_affinity_threads",
+                "Threads successfully updated by runtime worker affinity.",
+                runtime.affinity_threads,
+            ),
+            (
+                "infer_runtime_worker_affinity_failed_threads",
+                "Threads that failed runtime worker affinity update.",
+                runtime.affinity_failed_threads,
+            ),
+            (
+                "infer_runtime_preprocess_numa_groups",
+                "NUMA groups backing the HTTP tokenization pool.",
+                runtime.preprocess_groups,
+            ),
+            (
+                "infer_runtime_preprocess_workers",
+                "Worker threads backing the HTTP tokenization pool.",
+                runtime.preprocess_workers,
+            ),
+            (
+                "infer_runtime_detokenizer_numa_groups",
+                "NUMA groups backing scheduler detokenization workers.",
+                runtime.detokenizer_groups,
+            ),
+            (
+                "infer_runtime_detokenizer_workers",
+                "Worker threads backing scheduler detokenization.",
+                runtime.detokenizer_workers,
+            ),
+            (
+                "infer_runtime_h2d_latency_count",
+                "Observed host-to-device latency samples.",
+                runtime.h2d_latency_count,
+            ),
+            (
+                "infer_scheduler_numa_route_cost",
+                "NUMA routing cost selected for the most recent request.",
+                runtime.numa_route_cost_last,
+            ),
+        ] {
+            writeln!(out, "# HELP {name} {help}").unwrap();
+            writeln!(out, "# TYPE {name} gauge").unwrap();
+            writeln!(out, "{name}{{{labels}}} {value}").unwrap();
+        }
+        writeln!(
+            out,
+            "# HELP infer_runtime_worker_numa_node NUMA node selected for this runtime worker (-1 unknown)."
+        )
+        .unwrap();
+        writeln!(out, "# TYPE infer_runtime_worker_numa_node gauge").unwrap();
+        writeln!(
+            out,
+            "infer_runtime_worker_numa_node{{{labels}}} {}",
+            runtime.worker_numa_node
+        )
+        .unwrap();
+        out.push_str("# HELP infer_runtime_numastat_pages Process memory pages by runtime placement locality.\n");
+        out.push_str("# TYPE infer_runtime_numastat_pages gauge\n");
+        for (placement, value) in [
+            ("local", runtime.numastat_local_pages),
+            ("remote", runtime.numastat_remote_pages),
+            ("total", runtime.numastat_total_pages),
+        ] {
+            writeln!(
+                out,
+                "infer_runtime_numastat_pages{{{labels}placement=\"{placement}\",}} {value}"
+            )
+            .unwrap();
+        }
+        out.push_str(
+            "# HELP infer_runtime_h2d_latency_microseconds Host-to-device copy latency.\n",
+        );
+        out.push_str("# TYPE infer_runtime_h2d_latency_microseconds gauge\n");
+        for (stat, value) in [
+            ("last", runtime.h2d_latency_last_us),
+            ("max", runtime.h2d_latency_max_us),
+        ] {
+            writeln!(
+                out,
+                "infer_runtime_h2d_latency_microseconds{{{labels}stat=\"{stat}\",}} {value}"
+            )
+            .unwrap();
+        }
+        out.push_str(
+            "# HELP infer_scheduler_numa_route_total NUMA router decisions by locality outcome.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_numa_route_total counter\n");
+        for (outcome, value) in [
+            ("local", runtime.numa_route_local_total),
+            ("cross", runtime.numa_route_cross_total),
+            ("unknown", runtime.numa_route_unknown_total),
+        ] {
+            writeln!(
+                out,
+                "infer_scheduler_numa_route_total{{{labels}outcome=\"{outcome}\",}} {value}"
+            )
+            .unwrap();
+        }
+        for (name, help, value) in [
+            (
+                "infer_scheduler_numa_migration_total",
+                "Requests whose sticky NUMA route migrated for rebalancing.",
+                runtime.numa_migration_total,
+            ),
+            (
+                "infer_scheduler_numa_rebalance_total",
+                "NUMA router rebalance decisions.",
+                runtime.numa_rebalance_total,
+            ),
+        ] {
+            writeln!(out, "# HELP {name} {help}").unwrap();
+            writeln!(out, "# TYPE {name} counter").unwrap();
+            writeln!(out, "{name}{{{labels}}} {value}").unwrap();
+        }
+
         out.push_str("# HELP infer_scheduler_plan_total Scheduler ticks by selected plan label.\n");
         out.push_str("# TYPE infer_scheduler_plan_total counter\n");
         let (plan_idle, plan_decode, plan_prefill, plan_split, plan_mixed) =
@@ -1104,6 +1257,38 @@ impl ServerMetrics {
             pipeline_gpu_queue_depth,
         ) = self.scheduler_pipeline_us();
         let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
+        let runtime = self.runtime_topology_snapshot();
+        let runtime_topology = serde_json::json!({
+            "numa_nodes": runtime.numa_nodes,
+            "gpus": runtime.gpus,
+            "nics": runtime.nics,
+            "worker_id": runtime.worker_id,
+            "worker_gpu_ordinal": runtime.worker_gpu_ordinal,
+            "worker_numa_node": runtime.worker_numa_node,
+            "worker_cpu_count": runtime.worker_cpu_count,
+            "worker_nic_count": runtime.worker_nic_count,
+            "affinity_applied": runtime.affinity_applied,
+            "affinity_threads": runtime.affinity_threads,
+            "affinity_failed_threads": runtime.affinity_failed_threads,
+            "affinity_reason": runtime.affinity_reason,
+            "preprocess_groups": runtime.preprocess_groups,
+            "preprocess_workers": runtime.preprocess_workers,
+            "detokenizer_groups": runtime.detokenizer_groups,
+            "detokenizer_workers": runtime.detokenizer_workers,
+            "numastat_local_pages": runtime.numastat_local_pages,
+            "numastat_remote_pages": runtime.numastat_remote_pages,
+            "numastat_total_pages": runtime.numastat_total_pages,
+            "numastat_nodes": runtime.numastat_nodes,
+            "h2d_latency_last_us": runtime.h2d_latency_last_us,
+            "h2d_latency_max_us": runtime.h2d_latency_max_us,
+            "h2d_latency_count": runtime.h2d_latency_count,
+            "numa_route_local_total": runtime.numa_route_local_total,
+            "numa_route_cross_total": runtime.numa_route_cross_total,
+            "numa_route_unknown_total": runtime.numa_route_unknown_total,
+            "numa_route_cost_last": runtime.numa_route_cost_last,
+            "numa_migration_total": runtime.numa_migration_total,
+            "numa_rebalance_total": runtime.numa_rebalance_total,
+        });
 
         serde_json::json!({
             "requests": self.requests_total(),
@@ -1151,6 +1336,7 @@ impl ServerMetrics {
                 "cpu_plan_accept_total": pipeline_plan_accept,
                 "cpu_plan_stale_total": pipeline_plan_stale,
             },
+            "runtime_topology": runtime_topology,
             "engine_timestamp_ms": telemetry.timestamp_ms,
         })
     }
@@ -1243,8 +1429,21 @@ impl ServerMetrics {
             pipeline_gpu_queue_depth,
         ) = self.scheduler_pipeline_us();
         let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
+        let runtime = self.runtime_topology_snapshot();
         let pipeline_suffix = format!(
-            " preprocess=depth:{preprocess_depth},wait_us:{preprocess_wait_us},tokenize_us:{preprocess_tokenize_us} pipeline=snapshot_us:{pipeline_snapshot_us},cpu_plan_us:{pipeline_cpu_plan_us},gpu_wait_us:{pipeline_gpu_completion_wait_us},gpu_q:{pipeline_gpu_queue_depth},plan_accept:{pipeline_plan_accept},plan_stale:{pipeline_plan_stale}"
+            " preprocess=depth:{preprocess_depth},wait_us:{preprocess_wait_us},tokenize_us:{preprocess_tokenize_us} pipeline=snapshot_us:{pipeline_snapshot_us},cpu_plan_us:{pipeline_cpu_plan_us},gpu_wait_us:{pipeline_gpu_completion_wait_us},gpu_q:{pipeline_gpu_queue_depth},plan_accept:{pipeline_plan_accept},plan_stale:{pipeline_plan_stale} runtime_topology=numa:{},gpu:{},worker_numa:{},worker_cpus:{},pre_workers:{},detok_workers:{},h2d_last_us:{},numa_route=local:{},cross:{},unknown:{},migrate:{},rebalance:{}",
+            runtime.numa_nodes,
+            runtime.gpus,
+            runtime.worker_numa_node,
+            runtime.worker_cpu_count,
+            runtime.preprocess_workers,
+            runtime.detokenizer_workers,
+            runtime.h2d_latency_last_us,
+            runtime.numa_route_local_total,
+            runtime.numa_route_cross_total,
+            runtime.numa_route_unknown_total,
+            runtime.numa_migration_total,
+            runtime.numa_rebalance_total,
         );
 
         let dflash_blocks = self.inner.dflash_blocks_total.load(Ordering::Relaxed);

@@ -644,6 +644,9 @@ pub struct IncomingRequest {
     /// preserves the legacy slot-affinity behaviour. See
     /// `docs/projects/agent-first-architecture.md::A2`.
     pub session_id: Option<SessionId>,
+    /// NUMA node where HTTP preprocessing ran, if known. NUMA-aware request
+    /// routers use this as the request-origin cost signal before enqueue.
+    pub ingress_numa_node: Option<i32>,
     /// Channel to send streaming deltas back to the HTTP handler.
     pub delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     /// Parent tracing context captured from the request ingress path.
@@ -679,6 +682,46 @@ pub struct SchedulerHandle {
     /// `RequestHandle::server_metrics()`. `None` in legacy / test paths
     /// that build the handle without metrics wiring.
     server_metrics: Option<crate::metrics::ServerMetrics>,
+}
+
+pub struct SchedulerSubmissionPermit<'a> {
+    handle: &'a SchedulerHandle,
+    committed: bool,
+}
+
+pub struct SchedulerSubmitFailure {
+    request: Box<IncomingRequest>,
+}
+
+impl SchedulerSubmitFailure {
+    pub fn into_request(self) -> IncomingRequest {
+        *self.request
+    }
+}
+
+impl SchedulerSubmissionPermit<'_> {
+    pub fn submit(
+        mut self,
+        req: IncomingRequest,
+    ) -> std::result::Result<(), SchedulerSubmitFailure> {
+        self.handle
+            .tx
+            .send(req)
+            .map_err(|err| SchedulerSubmitFailure {
+                request: Box::new(err.0),
+            })?;
+        let _ = self.handle.wakeup_tx.send(());
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for SchedulerSubmissionPermit<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.handle.waiting_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl SchedulerHandle {
@@ -787,12 +830,9 @@ impl SchedulerHandle {
         self.server_metrics.as_ref()
     }
 
-    /// Submit a request to the scheduler.
-    ///
-    /// Returns `Ok(())` on success.
-    /// Returns `Err(SchedulerFull)` if the waiting queue is at capacity.
-    /// Returns `Err(SchedulerFull)` if the scheduler has shut down.
-    pub fn submit(&self, req: IncomingRequest) -> std::result::Result<(), SchedulerFull> {
+    pub fn reserve_submission(
+        &self,
+    ) -> std::result::Result<SchedulerSubmissionPermit<'_>, SchedulerFull> {
         loop {
             let current = self.waiting_count.load(Ordering::Relaxed);
             if !self.admission_allows(SchedulerSignals::queue_state(current, 0)) {
@@ -807,12 +847,21 @@ impl SchedulerHandle {
             }
         }
 
-        self.tx.send(req).map_err(|_| {
-            self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-            SchedulerFull
-        })?;
-        let _ = self.wakeup_tx.send(());
-        Ok(())
+        Ok(SchedulerSubmissionPermit {
+            handle: self,
+            committed: false,
+        })
+    }
+
+    /// Submit a request to the scheduler.
+    ///
+    /// Returns `Ok(())` on success.
+    /// Returns `Err(SchedulerFull)` if the waiting queue is at capacity.
+    /// Returns `Err(SchedulerFull)` if the scheduler has shut down.
+    pub fn submit(&self, req: IncomingRequest) -> std::result::Result<(), SchedulerFull> {
+        self.reserve_submission()?
+            .submit(req)
+            .map_err(|_| SchedulerFull)
     }
 
     /// Decrement the waiting count (called by the scheduler when it consumes a request).

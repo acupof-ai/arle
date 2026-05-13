@@ -16,6 +16,7 @@ fn make_request() -> IncomingRequest {
         speculative: None,
         priority: RequestPriority::Normal,
         session_id: None,
+        ingress_numa_node: None,
         delta_tx: tx,
         trace_context: None,
     }

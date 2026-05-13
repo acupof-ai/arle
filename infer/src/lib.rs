@@ -31,6 +31,7 @@ pub mod quant;
 #[path = "model/qwen35/gguf_host.rs"]
 pub(crate) mod qwen35_gguf_host;
 pub mod request_handle;
+pub mod runtime_topology;
 pub mod sampler;
 pub mod scheduler;
 pub mod server_engine;

@@ -16,9 +16,11 @@ use super::handlers::{
     stats_handler, train_events_handler, train_save_handler, train_status_handler,
     train_stop_handler,
 };
+use super::preprocess::PreprocessWorkerPool;
 use super::types::{AppState, HTTP_REQUEST_BODY_LIMIT_BYTES, HttpServerConfig, ServingIdentity};
 use crate::metrics::ServerMetrics;
 use crate::request_handle::RequestHandle;
+use crate::runtime_topology::RuntimeTopology;
 
 /// Build the Axum router with default (empty) metrics.
 pub fn build_app<H>(handle: H) -> Router
@@ -53,17 +55,30 @@ where
     H: RequestHandle + 'static,
 {
     let tokenizer = handle.tokenizer_clone().map(Arc::new);
-    let preprocess_capacity = std::thread::available_parallelism()
+    let requested_preprocess_capacity = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(4)
         .clamp(1, 32);
+    let topology = config
+        .runtime_topology
+        .clone()
+        .unwrap_or_else(RuntimeTopology::discover);
+    let preprocess_pool = tokenizer.map(|tokenizer| {
+        let groups = topology.preprocess_worker_groups(requested_preprocess_capacity);
+        let pool = Arc::new(PreprocessWorkerPool::spawn((*tokenizer).clone(), groups));
+        metrics.set_preprocess_topology(pool.group_count(), pool.capacity());
+        pool
+    });
+    let preprocess_capacity = preprocess_pool
+        .as_ref()
+        .map_or(requested_preprocess_capacity, |pool| pool.capacity());
     let identity = ServingIdentity {
         model_id: handle.model_id().to_string(),
         dflash_status: handle.dflash_status(),
     };
     let state = Arc::new(AppState {
         handle: Arc::new(handle),
-        tokenizer,
+        preprocess_pool,
         preprocess_permits: Arc::new(Semaphore::new(preprocess_capacity)),
         preprocess_capacity,
         identity,

@@ -37,6 +37,7 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 speculative: None,
                 priority: RequestPriority::Normal,
                 session_id: req.session_id,
+                ingress_numa_node: None,
                 delta_tx,
                 trace_context: req.trace_context,
             })
