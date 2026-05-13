@@ -33,7 +33,7 @@ use crate::ops;
 #[cfg(feature = "cuda")]
 use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
-use cuda_kernels::prelude::{DeviceContext, PagedKVPool};
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 #[cfg(feature = "cuda")]
 impl ModelForward for DeepseekModel {
@@ -203,14 +203,16 @@ impl ModelForward for DeepseekModel {
             ..
         } = state;
         let logits = base.logits_or(decode_logits);
-        ops::gpu_sample_into(
+        let selected = ops::gpu_sample_into(
             &self.ctx,
             logits,
             sample_probs,
             sample_out,
             params,
             random_val,
-        )
+        )?;
+        log_dsv4_sampler_topk(&self.ctx, logits, selected, random_val)?;
+        Ok(selected)
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
@@ -226,6 +228,56 @@ impl ModelForward for DeepseekModel {
     fn supports_cuda_graph_decode(&self) -> bool {
         false
     }
+}
+
+#[cfg(feature = "cuda")]
+fn log_dsv4_sampler_topk(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    selected: u32,
+    random_val: f32,
+) -> Result<()> {
+    let Some(k) = std::env::var("ARLE_DSV4_LOG_TOPK")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+    else {
+        return Ok(());
+    };
+    let host = ctx.stream.clone_dtoh(&logits.data)?;
+    let mut top = Vec::<(u32, f32)>::with_capacity(k);
+    let mut selected_logit = None;
+    for (idx, value) in host.iter().enumerate() {
+        let value = value.to_f32();
+        if idx == selected as usize {
+            selected_logit = Some(value);
+        }
+        if !value.is_finite() {
+            continue;
+        }
+        let insert_at = top
+            .iter()
+            .position(|&(_, existing)| value > existing)
+            .unwrap_or(top.len());
+        if insert_at < k {
+            top.insert(insert_at, (idx as u32, value));
+            top.truncate(k);
+        }
+    }
+    let top = top
+        .into_iter()
+        .map(|(token_id, value)| format!("{token_id}:{value:.4}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    log::info!(
+        "DeepSeek V4 sampler selected={} selected_logit={:.4} random={:.6} top{}=[{}]",
+        selected,
+        selected_logit.unwrap_or(f32::NAN),
+        random_val,
+        k,
+        top
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
