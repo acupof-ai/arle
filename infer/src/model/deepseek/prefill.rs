@@ -13,6 +13,8 @@ use super::state::DeepseekState;
 #[cfg(feature = "cuda")]
 use super::weights::DeepseekModel;
 #[cfg(feature = "cuda")]
+use crate::model::PrefillBatchRequest;
+#[cfg(feature = "cuda")]
 use cuda_kernels::prelude::DeviceVec;
 
 /// Pre-allocated scratch for a batched prefill launch. Empty until the kernel
@@ -41,6 +43,15 @@ impl DeepseekModel {
     /// by the model context window instead of the small contiguous scratch
     /// allocation that paged-prefill models keep only for decode plumbing.
     pub(super) fn prefill_one(&self, tokens: &[u32], state: &mut DeepseekState) -> Result<()> {
+        self.prefill_one_chunk(tokens, state, true)
+    }
+
+    pub(super) fn prefill_one_chunk(
+        &self,
+        tokens: &[u32],
+        state: &mut DeepseekState,
+        emit_logits: bool,
+    ) -> Result<()> {
         self.validate_phase0_sw_decode_scope()?;
         ensure!(
             !tokens.is_empty(),
@@ -62,6 +73,16 @@ impl DeepseekModel {
             );
         }
 
+        if !emit_logits {
+            state.reference_tokens.extend_from_slice(tokens);
+            state.base.prefill_logits = Some(
+                DeviceVec::zeros(&self.ctx, self.config.vocab_size)?
+                    .with_label("dsv4_deferred_prefill_logits"),
+            );
+            state.base.kv_cache.advance_seq_len(tokens.len());
+            return Ok(());
+        }
+
         if let Some(logits) = self.compute_reference_logits_after_prefill(tokens, state)? {
             state.base.prefill_logits = Some(logits);
             state.base.kv_cache.advance_seq_len(tokens.len());
@@ -80,6 +101,25 @@ impl DeepseekModel {
             },
         );
         state.base.kv_cache.advance_seq_len(tokens.len());
+        Ok(())
+    }
+
+    pub(super) fn prefill_batch_chunks(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [DeepseekState],
+    ) -> Result<()> {
+        let state_count = states.len();
+        for request in requests {
+            let state = states.get_mut(request.slot_idx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek V4 prefill slot {} out of range for {} states",
+                    request.slot_idx,
+                    state_count
+                )
+            })?;
+            self.prefill_one_chunk(request.tokens, state, request.is_final_chunk())?;
+        }
         Ok(())
     }
 }

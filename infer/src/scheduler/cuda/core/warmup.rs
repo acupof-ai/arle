@@ -223,6 +223,8 @@ impl<M: ModelForward> Scheduler<M> {
                     .map(|slot| PrefillBatchRequest {
                         slot_idx: slot,
                         tokens: &dummy_prompt[..tokens_per_row],
+                        start_pos: 0,
+                        total_tokens: tokens_per_row,
                     })
                     .collect();
 

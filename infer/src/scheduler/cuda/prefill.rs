@@ -61,9 +61,16 @@ enum PrefillCompletionAction {
 
 struct PreparedPrefillBatch {
     rows: Vec<PendingPrefillRow>,
-    chunk_tokens: Vec<(usize, Vec<u32>)>,
+    chunks: Vec<PreparedPrefillChunk>,
     uses_paged: bool,
     prefill_spans: Vec<(usize, fastrace::Span)>,
+}
+
+struct PreparedPrefillChunk {
+    slot_idx: usize,
+    tokens: Vec<u32>,
+    start_pos: usize,
+    total_tokens: usize,
 }
 
 impl PreparedPrefillBatch {
@@ -72,11 +79,13 @@ impl PreparedPrefillBatch {
     }
 
     fn requests(&self) -> Vec<PrefillBatchRequest<'_>> {
-        self.chunk_tokens
+        self.chunks
             .iter()
-            .map(|(slot_idx, tokens)| PrefillBatchRequest {
-                slot_idx: *slot_idx,
-                tokens,
+            .map(|chunk| PrefillBatchRequest {
+                slot_idx: chunk.slot_idx,
+                tokens: &chunk.tokens,
+                start_pos: chunk.start_pos,
+                total_tokens: chunk.total_tokens,
             })
             .collect()
     }
@@ -480,7 +489,7 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn prepare_prefill_batch(&mut self, candidates: &[PrefillCandidate]) -> PreparedPrefillBatch {
         let mut rows = Vec::with_capacity(candidates.len());
-        let mut chunk_tokens = Vec::with_capacity(candidates.len());
+        let mut chunks = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let slot_idx = candidate.slot_idx;
             let Some(req) = self.request(slot_idx) else {
@@ -515,22 +524,27 @@ impl<M: ModelForward> Scheduler<M> {
                 total_tokens: total,
                 next_progress: progress + tokens.len(),
             });
-            chunk_tokens.push((slot_idx, tokens));
+            chunks.push(PreparedPrefillChunk {
+                slot_idx,
+                tokens,
+                start_pos: progress,
+                total_tokens: total,
+            });
         }
 
         let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
-        let batch_size = chunk_tokens.len();
-        let prefill_spans: Vec<(usize, fastrace::Span)> = chunk_tokens
+        let batch_size = chunks.len();
+        let prefill_spans: Vec<(usize, fastrace::Span)> = chunks
             .iter()
-            .filter_map(|(slot_idx, tokens)| {
-                self.request(*slot_idx).and_then(|req| {
+            .filter_map(|chunk| {
+                self.request(chunk.slot_idx).and_then(|req| {
                     req.begin_trace_span("prefill").map(|span| {
                         (
-                            *slot_idx,
+                            chunk.slot_idx,
                             span.with_properties(|| {
                                 [
-                                    ("slot_idx", slot_idx.to_string()),
-                                    ("chunk_tokens", tokens.len().to_string()),
+                                    ("slot_idx", chunk.slot_idx.to_string()),
+                                    ("chunk_tokens", chunk.tokens.len().to_string()),
                                     ("batch_size", batch_size.to_string()),
                                 ]
                             }),
@@ -541,7 +555,7 @@ impl<M: ModelForward> Scheduler<M> {
             .collect();
         PreparedPrefillBatch {
             rows,
-            chunk_tokens,
+            chunks,
             uses_paged,
             prefill_spans,
         }

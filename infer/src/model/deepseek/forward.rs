@@ -22,6 +22,7 @@ use crate::model::generation_state::GenerationStateBase;
 #[cfg(feature = "cuda")]
 use crate::model::{
     GenerationState, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
+    PrefillBatchRequest, prepare_paged_prefill_batch,
 };
 #[cfg(feature = "cuda")]
 use crate::model_arch::ModelArchInfo;
@@ -75,6 +76,21 @@ impl ModelForward for DeepseekModel {
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         self.prefill_one(tokens, state)
+    }
+
+    fn forward_prefill_batch(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+    ) -> Result<()> {
+        if let Some(pool) = paged_kv_pool
+            && pool.is_active()
+            && !prepare_paged_prefill_batch(self.device_context(), requests, pool)?
+        {
+            return Ok(());
+        }
+        self.prefill_batch_chunks(requests, states)
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {

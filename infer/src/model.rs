@@ -37,6 +37,14 @@ pub use qwen35::{Qwen35Model, Qwen35RuntimeConfig, Qwen35State};
 pub struct PrefillBatchRequest<'a> {
     pub slot_idx: usize,
     pub tokens: &'a [u32],
+    pub start_pos: usize,
+    pub total_tokens: usize,
+}
+
+impl PrefillBatchRequest<'_> {
+    pub fn is_final_chunk(&self) -> bool {
+        self.start_pos.saturating_add(self.tokens.len()) >= self.total_tokens
+    }
 }
 
 /// One scheduler-planned mixed decode + packed-prefill batch.
