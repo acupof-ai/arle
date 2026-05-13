@@ -7,7 +7,7 @@
 #[cfg(feature = "cuda")]
 use anyhow::{Result, ensure};
 #[cfg(feature = "cuda")]
-use rand::rngs::StdRng;
+use rand::{Rng, rngs::StdRng};
 
 #[cfg(feature = "cuda")]
 use super::batch_decode::DeepseekBatchDecodeBuffers;
@@ -52,6 +52,16 @@ impl ModelForward for DeepseekModel {
                 self.config.vocab_size,
             )?
             .with_label("dsv4_phase2a0_decode_logits"),
+            sample_probs: self
+                .ctx
+                .stream
+                .alloc_zeros(self.config.vocab_size)
+                .map_err(|e| anyhow::anyhow!("Alloc DeepSeek V4 sample_probs failed: {e}"))?,
+            sample_out: self
+                .ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc DeepSeek V4 sample_out failed: {e}"))?,
             reference_tokens: Vec::new(),
         })
     }
@@ -177,13 +187,30 @@ impl ModelForward for DeepseekModel {
         &self,
         state: &mut Self::State,
         params: &SamplingParams,
-        _rng: &mut StdRng,
+        rng: &mut StdRng,
     ) -> Result<u32> {
         ensure!(
-            params.is_greedy() && !params.has_penalties(),
-            "DeepSeek V4 Phase 2A.0 only supports greedy sampling without penalties"
+            !params.has_penalties() && params.min_p <= 0.0,
+            "DeepSeek V4 sampler supports greedy and temperature/top_k/top_p sampling; \
+             penalties and min_p are not implemented yet"
         );
-        ops::argmax(&self.ctx, state.logits())
+        let random_val: f32 = rng.random();
+        let DeepseekState {
+            base,
+            decode_logits,
+            sample_probs,
+            sample_out,
+            ..
+        } = state;
+        let logits = base.logits_or(decode_logits);
+        ops::gpu_sample_into(
+            &self.ctx,
+            logits,
+            sample_probs,
+            sample_out,
+            params,
+            random_val,
+        )
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {

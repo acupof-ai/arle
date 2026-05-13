@@ -14,6 +14,8 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::kv_cache::KVCacheDtype;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
 
 /// Per-request DeepSeek mutable state.
 ///
@@ -25,6 +27,10 @@ pub struct DeepseekState {
     pub(crate) base: GenerationStateBase,
     #[cfg(feature = "cuda")]
     pub(crate) decode_logits: DeviceVec,
+    #[cfg(feature = "cuda")]
+    pub(crate) sample_probs: CudaSlice<f32>,
+    #[cfg(feature = "cuda")]
+    pub(crate) sample_out: CudaSlice<i32>,
     #[cfg(feature = "cuda")]
     pub(crate) reference_tokens: Vec<u32>,
 }
