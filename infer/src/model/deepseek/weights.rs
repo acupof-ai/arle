@@ -251,17 +251,32 @@ impl DeepseekModel {
 
     pub(super) fn compute_top_level_logits(&self, tokens: &[u32]) -> Result<Option<DeviceVec>> {
         let gpu_ffn_layers = dsv4_gpu_ffn_layer_limit()?;
-        self.compute_top_level_logits_with_ffn_layer_limit(tokens, gpu_ffn_layers)
+        let gpu_full_layers = dsv4_gpu_full_layer_limit()?;
+        self.compute_top_level_logits_with_layer_limits(tokens, gpu_ffn_layers, gpu_full_layers)
     }
 
+    #[allow(dead_code)] // exercised by CUDA unit tests to avoid mutating process env
     fn compute_top_level_logits_with_ffn_layer_limit(
         &self,
         tokens: &[u32],
         gpu_ffn_layers: usize,
     ) -> Result<Option<DeviceVec>> {
+        self.compute_top_level_logits_with_layer_limits(tokens, gpu_ffn_layers, 0)
+    }
+
+    fn compute_top_level_logits_with_layer_limits(
+        &self,
+        tokens: &[u32],
+        gpu_ffn_layers: usize,
+        gpu_full_layers: usize,
+    ) -> Result<Option<DeviceVec>> {
         ensure!(
             !tokens.is_empty(),
             "DeepSeek V4 top-level logits require at least one token"
+        );
+        ensure!(
+            gpu_ffn_layers == 0 || gpu_full_layers == 0,
+            "DeepSeek V4 GPU FFN-only layers and full layers are mutually exclusive"
         );
         let (Some(embed_tokens), Some(norm), Some(lm_head)) = (
             self.embed_tokens.as_ref(),
@@ -274,10 +289,22 @@ impl DeepseekModel {
             common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, self.config.hidden_size)?;
         let hidden = if let Some(head_hc) = &self.head_hc {
             ensure!(
-                gpu_ffn_layers <= self.layers.len(),
-                "DeepSeek V4 requested {} GPU FFN layers but only {} layers are loaded",
-                gpu_ffn_layers,
+                gpu_ffn_layers.max(gpu_full_layers) <= self.layers.len(),
+                "DeepSeek V4 requested {} GPU layers but only {} layers are loaded",
+                gpu_ffn_layers.max(gpu_full_layers),
                 self.layers.len()
+            );
+            ensure!(
+                gpu_full_layers == 0 || self.config.tp.world_size == self.config.o_groups,
+                "DeepSeek V4 GPU attention currently maps TP ranks to O-LoRA groups; tp_world={} o_groups={}",
+                self.config.tp.world_size,
+                self.config.o_groups
+            );
+            ensure!(
+                gpu_full_layers == 0 || self.config.tp.rank < self.config.o_groups,
+                "DeepSeek V4 GPU attention tp_rank={} out of O-LoRA group range {}",
+                self.config.tp.rank,
+                self.config.o_groups
             );
             let mut stream = initial_hc_stream_from_embeddings(
                 &self.ctx,
@@ -285,6 +312,9 @@ impl DeepseekModel {
                 self.config.hidden_size,
                 self.config.hc_mult,
             )?;
+            for layer_idx in 0..gpu_full_layers {
+                stream = self.forward_transformer_layer_stream(layer_idx, &stream, tokens)?;
+            }
             for layer_idx in 0..gpu_ffn_layers {
                 stream = self.forward_ffn_layer_stream(layer_idx, &stream, tokens)?;
             }
@@ -298,6 +328,10 @@ impl DeepseekModel {
                 self.config.hc_eps,
             )?
         } else {
+            ensure!(
+                gpu_ffn_layers == 0 && gpu_full_layers == 0,
+                "DeepSeek V4 GPU layer path requires loaded HC/layer weights"
+            );
             embeddings
         };
         let logits = common::compute_logits_batch(
@@ -309,6 +343,240 @@ impl DeepseekModel {
             false,
         )?;
         Ok(Some(logits.with_label("dsv4_phase2a1_top_level_logits")))
+    }
+
+    fn forward_transformer_layer_stream(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        tokens: &[u32],
+    ) -> Result<HiddenStates> {
+        ensure!(
+            tokens.len() == stream.seq_len,
+            "DeepSeek V4 full layer token count {} does not match stream seq_len {}",
+            tokens.len(),
+            stream.seq_len
+        );
+        ensure!(
+            stream.hidden_dim == self.config.hidden_size * self.config.hc_mult,
+            "DeepSeek V4 full layer stream dim {} does not match hidden_size {} * hc_mult {}",
+            stream.hidden_dim,
+            self.config.hidden_size,
+            self.config.hc_mult
+        );
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 GPU full layer {} out of range for {} loaded layers",
+                layer_idx,
+                self.layers.len()
+            )
+        })?;
+        let mhc = gen_mhc_params(
+            &self.ctx,
+            &layer.hc_attn,
+            stream,
+            self.config.hc_mult,
+            self.config.hc_eps,
+            self.config.hc_sinkhorn_iters,
+        )?;
+        let attn_in = hc_pre_from_stream(
+            &self.ctx,
+            stream,
+            &mhc.pre,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        let mut normed = HiddenStates::zeros(&self.ctx, self.config.hidden_size, stream.seq_len)?;
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &attn_in,
+            &layer.attn_norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        );
+        let attn_out =
+            self.forward_sliding_window_attention(layer_idx, &layer.attention, &normed)?;
+        let stream = hc_post_to_stream(
+            &self.ctx,
+            &attn_out,
+            stream,
+            &mhc.post,
+            &mhc.comb,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        self.forward_ffn_layer_stream(layer_idx, &stream, tokens)
+    }
+
+    fn forward_sliding_window_attention(
+        &self,
+        layer_idx: usize,
+        attention: &DeepseekV4Attention,
+        hidden: &HiddenStates,
+    ) -> Result<HiddenStates> {
+        let compress_ratio = *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
+            anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
+        })?;
+        ensure!(
+            compress_ratio == 0,
+            "DeepSeek V4 GPU attention currently supports sliding-window layers only; layer {} has compress_ratio {}",
+            layer_idx,
+            compress_ratio
+        );
+        ensure!(
+            hidden.hidden_dim == self.config.hidden_size,
+            "DeepSeek V4 attention hidden dim {} does not match hidden_size {}",
+            hidden.hidden_dim,
+            self.config.hidden_size
+        );
+        let head_dim = self.config.head_dim;
+        ensure!(
+            head_dim > 0,
+            "DeepSeek V4 attention head_dim must be non-zero"
+        );
+        let local_width = attention.wq_b.rows;
+        ensure!(
+            local_width.is_multiple_of(head_dim),
+            "DeepSeek V4 local q width {} is not divisible by head_dim {}",
+            local_width,
+            head_dim
+        );
+        let local_heads = local_width / head_dim;
+        ensure!(
+            local_heads > 0,
+            "DeepSeek V4 attention requires at least one local head"
+        );
+        ensure!(
+            attention.wkv.rows == head_dim,
+            "DeepSeek V4 attention wkv rows {} does not match head_dim {}",
+            attention.wkv.rows,
+            head_dim
+        );
+        ensure!(
+            attention.wo_a.cols == local_width,
+            "DeepSeek V4 attention wo_a cols {} does not match local attention width {}",
+            attention.wo_a.cols,
+            local_width
+        );
+
+        let c_q = ops::gemm(&self.ctx, &attention.wq_a, hidden)?;
+        let mut c_q_normed = HiddenStates::zeros(&self.ctx, c_q.hidden_dim, c_q.seq_len)?;
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &c_q,
+            &attention.q_norm,
+            self.config.rms_norm_eps,
+            &mut c_q_normed,
+        );
+        let q_raw = ops::gemm(&self.ctx, &attention.wq_b, &c_q_normed)?;
+        let kv_raw = ops::gemm(&self.ctx, &attention.wkv, hidden)?;
+        let mut kv_normed = HiddenStates::zeros(&self.ctx, kv_raw.hidden_dim, kv_raw.seq_len)?;
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &kv_raw,
+            &attention.kv_norm,
+            self.config.rms_norm_eps,
+            &mut kv_normed,
+        );
+
+        let mut q_host = self
+            .ctx
+            .stream
+            .clone_dtoh(&q_raw.data)?
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        let mut kv_host = self
+            .ctx
+            .stream
+            .clone_dtoh(&kv_normed.data)?
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        let sink = self
+            .ctx
+            .stream
+            .clone_dtoh(&attention.attn_sink.data)?
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        let sink_offset = self.config.tp.rank * local_heads;
+        ensure!(
+            sink_offset + local_heads <= sink.len(),
+            "DeepSeek V4 attn_sink len {} cannot cover local heads {} at offset {}",
+            sink.len(),
+            local_heads,
+            sink_offset
+        );
+        let (rope_cos, rope_sin) = build_rope_cache(
+            hidden.seq_len,
+            self.config.qk_rope_head_dim,
+            self.config.rope_theta,
+        );
+        for token_idx in 0..hidden.seq_len {
+            let kv_start = token_idx * head_dim;
+            apply_partial_rope(
+                &mut kv_host[kv_start..kv_start + head_dim],
+                &rope_cos[token_idx * self.config.qk_rope_head_dim
+                    ..(token_idx + 1) * self.config.qk_rope_head_dim],
+                &rope_sin[token_idx * self.config.qk_rope_head_dim
+                    ..(token_idx + 1) * self.config.qk_rope_head_dim],
+                self.config.qk_rope_head_dim,
+                1.0,
+            );
+            for head_idx in 0..local_heads {
+                let q_start = token_idx * local_width + head_idx * head_dim;
+                let qh = &mut q_host[q_start..q_start + head_dim];
+                fixed_rms_norm_in_place(qh, self.config.rms_norm_eps);
+                apply_partial_rope(
+                    qh,
+                    &rope_cos[token_idx * self.config.qk_rope_head_dim
+                        ..(token_idx + 1) * self.config.qk_rope_head_dim],
+                    &rope_sin[token_idx * self.config.qk_rope_head_dim
+                        ..(token_idx + 1) * self.config.qk_rope_head_dim],
+                    self.config.qk_rope_head_dim,
+                    1.0,
+                );
+            }
+        }
+
+        let mut attn_out = vec![0.0_f32; hidden.seq_len * local_width];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        for token_idx in 0..hidden.seq_len {
+            let sw_start = (token_idx + 1).saturating_sub(self.config.sliding_window);
+            for head_idx in 0..local_heads {
+                let q_start = token_idx * local_width + head_idx * head_dim;
+                let qh = &q_host[q_start..q_start + head_dim];
+                let mut logits = Vec::with_capacity(token_idx + 1 - sw_start);
+                for key_idx in sw_start..=token_idx {
+                    let key = &kv_host[key_idx * head_dim..(key_idx + 1) * head_dim];
+                    logits.push(dot(qh, key) * scale);
+                }
+                let probs = sink_softmax(&logits, sink[sink_offset + head_idx]);
+                let dst_start = token_idx * local_width + head_idx * head_dim;
+                let dst = &mut attn_out[dst_start..dst_start + head_dim];
+                for (offset, prob) in probs.iter().enumerate() {
+                    let key_idx = sw_start + offset;
+                    let value = &kv_host[key_idx * head_dim..(key_idx + 1) * head_dim];
+                    for col in 0..head_dim {
+                        dst[col] += prob * value[col];
+                    }
+                }
+                apply_partial_rope(
+                    dst,
+                    &rope_cos[token_idx * self.config.qk_rope_head_dim
+                        ..(token_idx + 1) * self.config.qk_rope_head_dim],
+                    &rope_sin[token_idx * self.config.qk_rope_head_dim
+                        ..(token_idx + 1) * self.config.qk_rope_head_dim],
+                    self.config.qk_rope_head_dim,
+                    -1.0,
+                );
+            }
+        }
+
+        let local_attn = hidden_states_from_f32(&self.ctx, &attn_out, local_width, hidden.seq_len)?;
+        let latent = ops::gemm(&self.ctx, &attention.wo_a, &local_attn)?;
+        ops::gemm(&self.ctx, &attention.wo_b, &latent)
     }
 
     fn forward_ffn_layer_stream(
@@ -695,6 +963,35 @@ fn initial_hc_stream_from_embeddings(
 }
 
 #[cfg(feature = "cuda")]
+fn hidden_states_from_f32(
+    ctx: &DeviceContext,
+    values: &[f32],
+    hidden_dim: usize,
+    seq_len: usize,
+) -> Result<HiddenStates> {
+    ensure!(
+        values.len() == hidden_dim * seq_len,
+        "DeepSeek V4 host hidden state len {} does not match hidden_dim {} * seq_len {}",
+        values.len(),
+        hidden_dim,
+        seq_len
+    );
+    Ok(HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(
+                &values
+                    .iter()
+                    .map(|&value| bf16::from_f32(value))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 host hidden H2D copy: {err}"))?,
+        hidden_dim,
+        seq_len,
+    })
+}
+
+#[cfg(feature = "cuda")]
 struct MhcParams {
     pre: Vec<f32>,
     post: Vec<f32>,
@@ -1005,6 +1302,21 @@ fn rms_rsqrt_bf16(values: &[bf16], eps: f32) -> f32 {
 }
 
 #[cfg(feature = "cuda")]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(lhs, rhs)| lhs * rhs).sum()
+}
+
+#[cfg(feature = "cuda")]
+fn sink_softmax(logits: &[f32], sink: f32) -> Vec<f32> {
+    let max = logits.iter().copied().fold(sink, f32::max);
+    let denom = logits.iter().map(|value| (*value - max).exp()).sum::<f32>() + (sink - max).exp();
+    logits
+        .iter()
+        .map(|value| (*value - max).exp() / denom)
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
@@ -1053,6 +1365,52 @@ fn column_normalize(raw: &mut [f32], n: usize, eps: f32) {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn fixed_rms_norm_in_place(values: &mut [f32], eps: f32) {
+    let mean_square = values.iter().map(|value| value.powi(2)).sum::<f32>() / values.len() as f32;
+    let scale = 1.0 / (mean_square + eps).sqrt();
+    for value in values {
+        *value *= scale;
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn build_rope_cache(seq: usize, dim: usize, base: f32) -> (Vec<f32>, Vec<f32>) {
+    if dim == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let half = dim / 2;
+    let inv_freq = (0..half)
+        .map(|i| 1.0_f32 / base.powf((2 * i) as f32 / dim as f32))
+        .collect::<Vec<_>>();
+    let mut cos = vec![0.0_f32; seq * dim];
+    let mut sin = vec![0.0_f32; seq * dim];
+    for pos in 0..seq {
+        for i in 0..half {
+            let value = pos as f32 * inv_freq[i];
+            let c = value.cos();
+            let s = value.sin();
+            cos[pos * dim + i] = c;
+            cos[pos * dim + i + half] = c;
+            sin[pos * dim + i] = s;
+            sin[pos * dim + i + half] = s;
+        }
+    }
+    (cos, sin)
+}
+
+#[cfg(feature = "cuda")]
+fn apply_partial_rope(row: &mut [f32], cos: &[f32], sin: &[f32], rope_dim: usize, sign: f32) {
+    let half = rope_dim / 2;
+    for i in 0..half {
+        let a = row[i];
+        let b = row[i + half];
+        let s = sign * sin[i];
+        row[i] = a * cos[i] - b * s;
+        row[i + half] = b * cos[i] + a * s;
+    }
+}
+
 fn infer_real_reference_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_INFER_REAL_REFERENCE").ok() else {
         return Ok(false);
@@ -1081,6 +1439,14 @@ fn dsv4_gpu_ffn_layer_limit() -> Result<usize> {
     };
     raw.parse::<usize>()
         .map_err(|err| anyhow::anyhow!("invalid ARLE_DSV4_GPU_FFN_LAYERS value `{raw}`: {err}"))
+}
+
+fn dsv4_gpu_full_layer_limit() -> Result<usize> {
+    let Some(raw) = std::env::var("ARLE_DSV4_GPU_FULL_LAYERS").ok() else {
+        return Ok(0);
+    };
+    raw.parse::<usize>()
+        .map_err(|err| anyhow::anyhow!("invalid ARLE_DSV4_GPU_FULL_LAYERS value `{raw}`: {err}"))
 }
 
 fn deepseek_find_tensor<'data>(
@@ -1418,6 +1784,49 @@ mod tests {
         let host = model.ctx.stream.clone_dtoh(&logits.data)?;
         model.ctx.sync()?;
         assert!(host.iter().all(|value| value.to_f32().is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_window_attention_runs_gpu_projection_path() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 2.0]))?,
+            hidden_dim: 2,
+            seq_len: 1,
+        };
+        let attention = DeepseekV4Attention {
+            wq_a: matrix(&ctx, &[1.0, 0.0], 1, 2)?,
+            q_norm: vec(&ctx, &[1.0])?,
+            wq_b: matrix(&ctx, &[1.0], 1, 1)?,
+            wkv: matrix(&ctx, &[0.0, 1.0], 1, 2)?,
+            kv_norm: vec(&ctx, &[1.0])?,
+            wo_a: matrix(&ctx, &[1.0], 1, 1)?,
+            wo_b: matrix(&ctx, &[1.0, 1.0], 2, 1)?,
+            attn_sink: vec(&ctx, &[0.0])?,
+            compressor: None,
+            indexer: None,
+        };
+        let mut config = DeepseekRuntimeConfig::from_spec(tiny_config());
+        config.ep = ExpertGroup::new(0, 1, 1)?;
+        let model = DeepseekModel {
+            config,
+            ctx,
+            embed_tokens: None,
+            lm_head: None,
+            norm: None,
+            head_hc: None,
+            layers: Vec::new(),
+            reference: None,
+        };
+
+        let out = model.forward_sliding_window_attention(0, &attention, &hidden)?;
+        let host = model.ctx.stream.clone_dtoh(&out.data)?;
+        model.ctx.sync()?;
+        let got = host.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+        let expected = 1.0_f32.exp() / (1.0_f32.exp() + 1.0);
+        assert_close(got[0], expected, 0.01);
+        assert_close(got[1], expected, 0.01);
         Ok(())
     }
 }
