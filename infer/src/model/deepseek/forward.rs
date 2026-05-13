@@ -202,6 +202,38 @@ impl ModelForward for DeepseekModel {
 }
 
 #[cfg(feature = "cuda")]
+impl DeepseekModel {
+    fn scheduler_c128_cache_layers(&self) -> usize {
+        self.config
+            .compress_ratios
+            .iter()
+            .copied()
+            .filter(|&ratio| {
+                self.config.spec.attention_mode_for_compress_ratio(ratio)
+                    == deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed
+            })
+            .count()
+            .max(1)
+    }
+
+    fn scheduler_c128_cache_head_dim(&self) -> usize {
+        let c128_ratio = self
+            .config
+            .compress_ratios
+            .iter()
+            .copied()
+            .filter(|&ratio| {
+                self.config.spec.attention_mode_for_compress_ratio(ratio)
+                    == deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed
+            })
+            .min()
+            .unwrap_or(128)
+            .max(1);
+        self.config.head_dim.div_ceil(c128_ratio).max(1)
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl ModelArchInfo for DeepseekModel {
     fn arch_kind(&self) -> ModelArch {
         ModelArch::DeepSeekV4
@@ -220,7 +252,7 @@ impl ModelArchInfo for DeepseekModel {
     }
 
     fn num_kv_layers(&self) -> usize {
-        self.config.num_hidden_layers
+        self.scheduler_c128_cache_layers()
     }
 
     fn num_kv_heads(&self) -> usize {
@@ -232,16 +264,21 @@ impl ModelArchInfo for DeepseekModel {
     }
 
     fn head_dim(&self) -> usize {
-        self.config.head_dim
+        self.scheduler_c128_cache_head_dim()
     }
 
     fn kv_cache_bytes_per_token(&self) -> usize {
-        // Phase 0.5 uses the conservative expanded single-KV-head BF16 budget.
-        // Phase 2A may replace this once the V4 cache payload for
-        // compressor/indexer streams is finalized.
-        2 * self.config.num_hidden_layers
+        // Scheduler-visible DSv4 cache profile:
+        // - C128/HCA summaries stay hot in the GPU/host-visible TokenKVPool.
+        // - C4/CSA entries are sparse and tiered through the offload path.
+        // - SWA uses the 128-token local window and is not charged to the
+        //   long-context pool.
+        //
+        // This keeps admission/page accounting aligned with DSv4's compact
+        // cache shape instead of the generic expanded MHA K/V envelope.
+        2 * self.scheduler_c128_cache_layers()
             * self.config.num_key_value_heads
-            * self.config.head_dim
+            * self.scheduler_c128_cache_head_dim()
             * 2
     }
 }
