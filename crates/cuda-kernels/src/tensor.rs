@@ -3,6 +3,7 @@
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -29,6 +30,44 @@ pub struct DeviceContext {
 /// Parse `INFER_CUDA_DEVICE` (default 0). Selects the device for `DeviceContext::new()`.
 pub fn parse_device_ordinal_from_env() -> Result<u32> {
     parse_device_ordinal(std::env::var("INFER_CUDA_DEVICE").ok().as_deref())
+}
+
+thread_local! {
+    static DEVICE_ORDINAL_OVERRIDE: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+fn scoped_device_ordinal_override() -> Option<u32> {
+    DEVICE_ORDINAL_OVERRIDE.with(Cell::get)
+}
+
+fn effective_device_ordinal_for_new() -> Result<u32> {
+    scoped_device_ordinal_override()
+        .map(Ok)
+        .unwrap_or_else(parse_device_ordinal_from_env)
+}
+
+struct DeviceOrdinalOverrideReset {
+    previous: Option<u32>,
+}
+
+impl Drop for DeviceOrdinalOverrideReset {
+    fn drop(&mut self) {
+        DEVICE_ORDINAL_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Runs `f` while [`DeviceContext::new`] resolves to `ordinal` on this thread.
+///
+/// The override is thread-local so multi-worker runtimes can initialize
+/// separate CUDA contexts without mutating process-global environment variables.
+pub fn with_device_ordinal_override<T>(ordinal: u32, f: impl FnOnce() -> T) -> T {
+    let previous = DEVICE_ORDINAL_OVERRIDE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(ordinal));
+        previous
+    });
+    let _reset = DeviceOrdinalOverrideReset { previous };
+    f()
 }
 
 /// String-pure parse of an `INFER_CUDA_DEVICE`-style ordinal. `None` => 0.
@@ -61,7 +100,7 @@ impl DeviceContext {
     /// Default constructor: honours `INFER_CUDA_DEVICE` (default 0).
     /// F1+ multi-GPU rank threads bypass this and call `on_device(ordinal)`.
     pub fn new() -> Result<Self> {
-        let ordinal = parse_device_ordinal_from_env()?;
+        let ordinal = effective_device_ordinal_for_new()?;
         Self::on_device(ordinal)
     }
 
@@ -1903,6 +1942,19 @@ mod tests {
         assert_eq!(parse_device_ordinal(Some("  7 ")).unwrap(), 7);
         assert!(parse_device_ordinal(Some("not-a-number")).is_err());
         assert!(parse_device_ordinal(Some("")).is_err());
+    }
+
+    #[test]
+    fn device_ordinal_override_is_thread_local_and_nested() {
+        assert_eq!(scoped_device_ordinal_override(), None);
+        let outer = with_device_ordinal_override(2, || {
+            assert_eq!(scoped_device_ordinal_override(), Some(2));
+            let inner = with_device_ordinal_override(7, || scoped_device_ordinal_override());
+            assert_eq!(inner, Some(7));
+            scoped_device_ordinal_override()
+        });
+        assert_eq!(outer, Some(2));
+        assert_eq!(scoped_device_ordinal_override(), None);
     }
 
     #[test]

@@ -89,7 +89,7 @@
 //! | `infer_memory_peak_bytes` | gauge | Peak MLX allocator memory |
 //! | `infer_memory_cache_bytes` | gauge | Cached MLX allocator memory |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -876,15 +876,25 @@ impl ServerMetrics {
     }
 
     pub fn set_runtime_numastat(&self, stats: &NumaMemoryStats, local_node: Option<i32>) {
-        let local_pages = local_node
-            .and_then(|node| {
-                stats
-                    .per_node_pages
-                    .iter()
-                    .find(|(sample_node, _)| *sample_node == node)
-                    .map(|(_, pages)| *pages)
-            })
-            .unwrap_or(0);
+        self.set_runtime_numastat_for_nodes(stats, &[local_node]);
+    }
+
+    pub fn set_runtime_numastat_for_nodes(
+        &self,
+        stats: &NumaMemoryStats,
+        local_nodes: &[Option<i32>],
+    ) {
+        let local_nodes = local_nodes
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        let local_pages = stats
+            .per_node_pages
+            .iter()
+            .filter(|(node, _)| local_nodes.contains(node))
+            .map(|(_, pages)| *pages)
+            .sum();
         let mut metrics = self
             .inner
             .runtime_topology
