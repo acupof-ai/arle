@@ -8,6 +8,8 @@
 use anyhow::Result;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
 
 /// One SwiGLU expert: `w2(silu(w1(x)) * w3(x))`.
 #[cfg(feature = "cuda")]
@@ -27,7 +29,7 @@ pub(super) struct DeepseekV4MoeBlock {
     /// Hash-router table for early layers. The exact integer storage type is
     /// finalized with the Phase 2A loader; Phase 0.5 only validates the tensor
     /// name and keeps the field explicit.
-    pub(super) gate_tid2eid: Option<DeviceVec>,
+    pub(super) gate_tid2eid: Option<CudaSlice<i64>>,
     pub(super) experts: Vec<DeepseekV4Expert>,
     pub(super) shared_experts: Option<DeepseekV4Expert>,
 }

@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::{Result, bail, ensure};
 use half::bf16;
 use log::info;
+use safetensors::Dtype;
 
 use super::config::DeepseekRuntimeConfig;
 #[cfg(feature = "cuda")]
@@ -404,7 +405,11 @@ impl DeepseekModel {
                 .as_deref()
                 .map(|name| load_dsv4_vec_bf16(&self.ctx, shards, weight_map, name))
                 .transpose()?,
-            gate_tid2eid: None,
+            gate_tid2eid: names
+                .gate_tid2eid
+                .as_deref()
+                .map(|name| self.load_i64_tensor(shards, weight_map, name))
+                .transpose()?,
             experts,
             shared_experts: names
                 .shared_experts
@@ -488,6 +493,38 @@ impl DeepseekModel {
         } else {
             physical_cols
         })
+    }
+
+    fn load_i64_tensor(
+        &self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+        name: &str,
+    ) -> Result<cudarc::driver::CudaSlice<i64>> {
+        let tensor = deepseek_find_tensor(shards, weight_map, name)?;
+        ensure!(
+            tensor.dtype() == Dtype::I64,
+            "{name}: expected I64 tensor, got {:?}",
+            tensor.dtype()
+        );
+        ensure!(
+            tensor
+                .data()
+                .len()
+                .is_multiple_of(std::mem::size_of::<i64>()),
+            "{name}: I64 tensor has unaligned byte length {}",
+            tensor.data().len()
+        );
+        let mut host = Vec::with_capacity(tensor.data().len() / std::mem::size_of::<i64>());
+        for chunk in tensor.data().chunks_exact(std::mem::size_of::<i64>()) {
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(chunk);
+            host.push(i64::from_le_bytes(bytes));
+        }
+        self.ctx
+            .stream
+            .clone_htod(&host)
+            .map_err(|err| anyhow::anyhow!("uploading DeepSeek V4 I64 tensor {name}: {err}"))
     }
 
     pub(super) fn compute_reference_logits_after_decode(
