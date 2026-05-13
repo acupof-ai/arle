@@ -338,6 +338,20 @@ Forbidden by default:
 
 ### P0: Fence substrate
 
+Status:
+
+- Initial CUDA substrate is landed in `crates/cuda-kernels/src/tensor.rs`:
+  `CudaPipelineFence`, `CudaPipelineStreamKind`,
+  `CudaPipelineFenceStatus`, and
+  `DeviceContext::{record_pipeline_fence, wait_on_pipeline_fence}`.
+- Existing `copy_waits_for_compute()` and `compute_waits_for_copy()` now route
+  through the explicit fence API, preserving behavior while making the fence
+  boundary reusable by later stages.
+- `wait_on_pipeline_fence()` uses cudarc's stream wait path and
+  `CudaPipelineFence::query()` binds the event context before polling, so
+  cross-thread stage handoff does not depend on the caller's current CUDA
+  context.
+
 Files likely involved:
 
 - `crates/cuda-kernels/src/tensor.rs`
@@ -357,6 +371,26 @@ Work:
 Exit gate:
 
 - No behavior change except new metrics and type surface.
+
+GPU verification TODO for CUDA Codex:
+
+```bash
+CUDARC_CUDA_VERSION=13010 \
+  cargo check -p cuda-kernels --no-default-features --features cuda,no-cuda
+
+CUDARC_CUDA_VERSION=13010 \
+  cargo check -p infer --no-default-features --features cuda,no-cuda
+
+CUDA_HOME=/usr/local/cuda \
+  cargo test -p cuda-kernels --no-default-features --features cuda \
+  pipeline_fence_orders_compute_and_copy_streams -- --nocapture
+```
+
+Evidence to capture:
+
+- the test passes on a real CUDA host.
+- no `cudaDeviceSynchronize` is introduced by the fence API.
+- `cuStreamWaitEvent` appears only on the intended compute/copy stream edges.
 
 ### P1: H2D as a copy-stream stage
 

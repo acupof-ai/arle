@@ -1,7 +1,7 @@
 //! Device tensor types and CUDA context.
 
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -25,6 +25,70 @@ pub struct DeviceContext {
     pub copy_stream: Arc<CudaStream>,
     /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
+}
+
+/// Logical stream lane used by the serving pipeline.
+///
+/// Keep this small and CUDA-specific: higher-level scheduler stages should
+/// pass fences around, not raw `CudaStream` handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaPipelineStreamKind {
+    /// Main compute stream. Kernels, graph capture/replay, and D2D snapshots
+    /// stay here unless a call site explicitly opts into a copy-stream stage.
+    Compute,
+    /// Dedicated transfer stream for H2D/D2H work that can be ordered with
+    /// compute via explicit events.
+    Copy,
+}
+
+/// Result of a non-blocking CUDA pipeline fence poll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaPipelineFenceStatus {
+    Ready,
+    NotReady,
+}
+
+/// CUDA event fence produced by one pipeline stream and consumed by another.
+///
+/// The fence owns the CUDA event until every consumer has either enqueued its
+/// stream wait or polled/read the result. This makes stage dependencies explicit
+/// instead of hiding event creation inside ad hoc helper calls.
+pub struct CudaPipelineFence {
+    device_ordinal: u32,
+    producer: CudaPipelineStreamKind,
+    event: CudaEvent,
+}
+
+impl CudaPipelineFence {
+    #[must_use]
+    pub fn device_ordinal(&self) -> u32 {
+        self.device_ordinal
+    }
+
+    #[must_use]
+    pub fn producer(&self) -> CudaPipelineStreamKind {
+        self.producer
+    }
+
+    /// Poll the event without blocking the host.
+    pub fn query(&self) -> Result<CudaPipelineFenceStatus> {
+        self.event
+            .context()
+            .bind_to_thread()
+            .map_err(|e| anyhow!("Bind CUDA context before pipeline fence query failed: {e}"))?;
+        match unsafe { cudarc::driver::result::event::query(self.event.cu_event()) } {
+            Ok(()) => Ok(CudaPipelineFenceStatus::Ready),
+            Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
+                Ok(CudaPipelineFenceStatus::NotReady)
+            }
+            Err(err) => Err(anyhow!("CUDA pipeline fence query failed: {err}")),
+        }
+    }
+
+    /// Convenience wrapper for callers that only need a boolean readiness check.
+    pub fn is_ready(&self) -> Result<bool> {
+        Ok(matches!(self.query()?, CudaPipelineFenceStatus::Ready))
+    }
 }
 
 /// Parse `INFER_CUDA_DEVICE` (default 0). Selects the device for `DeviceContext::new()`.
@@ -108,10 +172,10 @@ impl DeviceContext {
         let ctx = CudaContext::new(ordinal as usize)
             .map_err(|e| anyhow!("Failed to create CUDA context on device {ordinal}: {e}"))?;
 
-        // Disable multi-stream event tracking before creating streams.
-        // We use a single compute stream, so no cross-stream synchronization is needed.
-        // This avoids stream.wait(event) calls that break CUDA Graph capture.
-        // SAFETY: We only use one stream for all GPU work.
+        // Disable cudarc's automatic event tracking before creating streams.
+        // Serving owns cross-stream dependencies explicitly via
+        // CudaPipelineFence, which avoids hidden waits in CUDA Graph capture
+        // paths while still allowing a dedicated copy stream.
         unsafe {
             ctx.disable_event_tracking();
         }
@@ -169,54 +233,96 @@ impl DeviceContext {
             .map_err(|e| anyhow!("Copy stream sync failed: {}", e))
     }
 
+    /// Return the raw stream that backs a pipeline lane.
+    #[must_use]
+    pub fn pipeline_stream(&self, kind: CudaPipelineStreamKind) -> &Arc<CudaStream> {
+        match kind {
+            CudaPipelineStreamKind::Compute => &self.stream,
+            CudaPipelineStreamKind::Copy => &self.copy_stream,
+        }
+    }
+
+    /// Record a fence on the selected producer stream.
+    pub fn record_pipeline_fence(
+        &self,
+        producer: CudaPipelineStreamKind,
+    ) -> Result<CudaPipelineFence> {
+        let event = self
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("Alloc CUDA pipeline fence failed: {e}"))?;
+        event
+            .record(self.pipeline_stream(producer))
+            .map_err(|e| anyhow!("Record CUDA pipeline fence on {producer:?} failed: {e}"))?;
+        Ok(CudaPipelineFence {
+            device_ordinal: self.ordinal,
+            producer,
+            event,
+        })
+    }
+
+    /// Make `consumer` wait for `fence` without blocking the host.
+    pub fn wait_on_pipeline_fence(
+        &self,
+        fence: &CudaPipelineFence,
+        consumer: CudaPipelineStreamKind,
+    ) -> Result<()> {
+        ensure!(
+            fence.device_ordinal == self.ordinal,
+            "CUDA pipeline fence device mismatch: fence device {} consumed on device {}",
+            fence.device_ordinal,
+            self.ordinal
+        );
+        self.pipeline_stream(consumer)
+            .wait(&fence.event)
+            .map_err(|e| {
+                anyhow!(
+                    "CUDA pipeline fence wait failed for {consumer:?} waiting on {:?}: {e}",
+                    fence.producer
+                )
+            })
+    }
+
     /// Record an event on the compute stream and make the copy stream wait for it.
     ///
     /// Use after GPU kernels finish (e.g. sampling) to ensure the copy stream
     /// sees the results before starting D2H transfer.
     pub fn copy_waits_for_compute(&self) -> Result<()> {
-        use cudarc::driver::sys::*;
-        unsafe {
-            let mut event: CUevent = std::ptr::null_mut();
-            let r = cuEventCreate(&mut event, CUevent_flags::CU_EVENT_DISABLE_TIMING as u32);
-            if r != CUresult::CUDA_SUCCESS {
-                return Err(anyhow!("cuEventCreate failed: {:?}", r));
-            }
-            let r = cuEventRecord(event, self.stream.cu_stream());
-            if r != CUresult::CUDA_SUCCESS {
-                cuEventDestroy_v2(event);
-                return Err(anyhow!("cuEventRecord failed: {:?}", r));
-            }
-            let r = cuStreamWaitEvent(self.copy_stream.cu_stream(), event, 0);
-            cuEventDestroy_v2(event);
-            if r != CUresult::CUDA_SUCCESS {
-                return Err(anyhow!("cuStreamWaitEvent failed: {:?}", r));
-            }
-        }
-        Ok(())
+        let fence = self.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+        self.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Copy)
     }
 
     /// Record an event on the copy stream and make the compute stream wait for it.
     ///
     /// Use after H2D transfer completes to ensure compute kernels see the uploaded data.
     pub fn compute_waits_for_copy(&self) -> Result<()> {
-        use cudarc::driver::sys::*;
-        unsafe {
-            let mut event: CUevent = std::ptr::null_mut();
-            let r = cuEventCreate(&mut event, CUevent_flags::CU_EVENT_DISABLE_TIMING as u32);
-            if r != CUresult::CUDA_SUCCESS {
-                return Err(anyhow!("cuEventCreate failed: {:?}", r));
-            }
-            let r = cuEventRecord(event, self.copy_stream.cu_stream());
-            if r != CUresult::CUDA_SUCCESS {
-                cuEventDestroy_v2(event);
-                return Err(anyhow!("cuEventRecord failed: {:?}", r));
-            }
-            let r = cuStreamWaitEvent(self.stream.cu_stream(), event, 0);
-            cuEventDestroy_v2(event);
-            if r != CUresult::CUDA_SUCCESS {
-                return Err(anyhow!("cuStreamWaitEvent failed: {:?}", r));
-            }
-        }
+        let fence = self.record_pipeline_fence(CudaPipelineStreamKind::Copy)?;
+        self.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Compute)
+    }
+}
+
+#[cfg(test)]
+mod pipeline_fence_tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_fence_orders_compute_and_copy_streams() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+
+        let compute_done = ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+        assert_eq!(compute_done.device_ordinal(), ctx.ordinal());
+        assert_eq!(compute_done.producer(), CudaPipelineStreamKind::Compute);
+        ctx.wait_on_pipeline_fence(&compute_done, CudaPipelineStreamKind::Copy)?;
+
+        let copy_done = ctx.record_pipeline_fence(CudaPipelineStreamKind::Copy)?;
+        assert_eq!(copy_done.device_ordinal(), ctx.ordinal());
+        assert_eq!(copy_done.producer(), CudaPipelineStreamKind::Copy);
+        ctx.wait_on_pipeline_fence(&copy_done, CudaPipelineStreamKind::Compute)?;
+
+        ctx.sync()?;
+        ctx.sync_copy()?;
+        assert!(compute_done.is_ready()?);
+        assert!(copy_done.is_ready()?);
         Ok(())
     }
 }
