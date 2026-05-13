@@ -74,6 +74,8 @@ cargo check -p infer --no-default-features --features cuda,no-cuda
 CUDARC_CUDA_VERSION=13010 \
 cargo test -p cuda-kernels --no-default-features --features cuda,no-cuda \
   device_ordinal_override -- --nocapture
+
+codex review --commit 83524c12
 ```
 
 Deferred serving benchmark:
@@ -95,6 +97,7 @@ scripts/bench_guidellm.sh numa-pipeline-cuda \
   hardware pending.
 - **Commit before change:** `74d88283`.
 - **Commit before production multi-worker follow-up:** `559d367d`.
+- **Commit before review follow-up:** `83524c12`.
 - **Feature set:** `--no-default-features --features no-cuda` and
   `--no-default-features --features cuda,no-cuda`.
 - **Non-default flags / env vars:** `CUDARC_CUDA_VERSION=13010` for CUDA-Rust
@@ -132,6 +135,7 @@ scripts/bench_guidellm.sh numa-pipeline-cuda \
 | full no-cuda tests | FAIL due unrelated `metal_eval_audit` materialize-boundary classification drift after 582 passing lib tests |
 | `cuda,no-cuda` typecheck | PASS with pre-existing DeepSeek reference dead-code warnings |
 | `cuda-kernels device_ordinal_override` test | BLOCKED locally: macOS link lacks CUDA C/stub symbols under `cuda,no-cuda`; Rust typecheck passed |
+| `codex review --commit 83524c12` | FOUND 2 P2; both fixed in follow-up (`auto_num_slots` ordinal, full error-chain display) |
 
 ## Problems
 
@@ -167,6 +171,10 @@ scripts/bench_guidellm.sh numa-pipeline-cuda \
   `INFER_CUDA_DEVICES` is the multi-worker path and is resolved as CUDA
   visible-device ordinals, then mapped back to physical GPU/NUMA topology for
   placement logs and routing cost.
+- Automatic slot sizing must use the same selected CUDA ordinal as worker
+  bootstrap; otherwise `INFER_CUDA_DEVICES=1` can accidentally probe device 0.
+- Worker bootstrap errors need alternate-chain formatting (`{err:#}`) because
+  `anyhow::Context` displays only the top context under normal `{err}`.
 
 ## Delta vs baseline
 
