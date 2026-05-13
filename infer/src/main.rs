@@ -547,6 +547,7 @@ async fn async_main(args: Args) {
             args.max_seq_len,
             requested_kv_mode.slot_sizing_format(),
             args.mem_fraction_static,
+            Some(primary_worker.cuda_ordinal),
         )
     });
     let kv_candidates = kv_mode_candidates(requested_kv_mode, args.max_seq_len.is_some());
@@ -573,19 +574,18 @@ async fn async_main(args: Args) {
                 break;
             }
             Err(err) => {
+                let err_chain = format!("{err:#}");
                 let can_retry = candidate_idx + 1 < kv_candidates.len()
-                    && err
-                        .to_string()
-                        .contains("requested scheduler envelope needs at least");
+                    && err_chain.contains("requested scheduler envelope needs at least");
                 if can_retry {
                     info!(
                         "KV auto fallback: {} failed to satisfy the requested envelope ({}); retrying denser layout",
-                        kv_mode_label, err
+                        kv_mode_label, err_chain
                     );
                     last_err = Some(err);
                     continue;
                 }
-                panic!("Failed to create scheduler: {err}");
+                panic!("Failed to create scheduler: {err_chain}");
             }
         }
     }
@@ -595,7 +595,7 @@ async fn async_main(args: Args) {
             "Failed to create scheduler{}",
             last_err
                 .as_ref()
-                .map(|err| format!(": {err}"))
+                .map(|err| format!(": {err:#}"))
                 .unwrap_or_default()
         )
     });
@@ -1040,6 +1040,7 @@ fn auto_num_slots(
     max_seq_len: Option<usize>,
     kv_pool_format: KVFormat,
     mem_fraction_static: f64,
+    cuda_ordinal: Option<usize>,
 ) -> usize {
     use infer::backend::cuda::tensor::DeviceContext;
     use std::path::Path;
@@ -1059,7 +1060,11 @@ fn auto_num_slots(
                 .sum()
         });
 
-    let Ok(_ctx) = DeviceContext::new() else {
+    let cuda_ctx = match cuda_ordinal {
+        Some(cuda_ordinal) => with_device_ordinal_override(cuda_ordinal as u32, DeviceContext::new),
+        None => DeviceContext::new(),
+    };
+    let Ok(_ctx) = cuda_ctx else {
         info!("auto_num_slots: CUDA init failed, using default 8 slots");
         return 8;
     };
