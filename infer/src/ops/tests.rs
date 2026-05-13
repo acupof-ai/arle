@@ -464,6 +464,40 @@ fn test_dsv4_swiglu_clamped_batch() -> Result<()> {
 }
 
 #[test]
+fn test_add_scaled_row_segment_into() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let row = HiddenStates {
+        data: ctx.stream.clone_htod(&bf16_vec(&[1.0, -2.0, 3.0]))?,
+        hidden_dim: 3,
+        seq_len: 1,
+    };
+    let mut out = HiddenStates {
+        data: ctx
+            .stream
+            .clone_htod(&bf16_vec(&[0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0]))?,
+        hidden_dim: 4,
+        seq_len: 2,
+    };
+
+    add_scaled_row_segment_into(&ctx, &row, &mut out, 1, 1, 0.5)?;
+    let out_host = ctx.stream.clone_dtoh(&out.data)?;
+    ctx.sync()?;
+    let got = out_host
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let expected = [0.0, 0.0, 0.0, 0.0, 10.0, 10.5, 9.0, 11.5];
+    for (idx, value) in got.iter().enumerate() {
+        assert!(
+            (*value - expected[idx]).abs() < 0.01,
+            "idx={idx} expected={} got={value}",
+            expected[idx]
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_gpu_sample() -> Result<()> {
     let ctx = DeviceContext::new()?;
 

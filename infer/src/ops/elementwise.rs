@@ -148,6 +148,41 @@ pub(crate) fn add_scaled_row_into(
     Ok(())
 }
 
+/// Add one BF16 row into a segment of a token row:
+/// `out[token_idx, segment_offset + i] += scale * row[0, i]`.
+#[allow(dead_code)] // used by DeepSeek V4 layer-HC wiring once that tranche lands
+pub(crate) fn add_scaled_row_segment_into(
+    ctx: &DeviceContext,
+    row: &HiddenStates,
+    out: &mut HiddenStates,
+    token_idx: usize,
+    segment_offset: usize,
+    scale: f32,
+) -> Result<()> {
+    assert_eq!(row.seq_len, 1);
+    assert!(token_idx < out.seq_len);
+    assert!(segment_offset + row.hidden_dim <= out.hidden_dim);
+
+    let (row_ptr, _gr) = row.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::add_scaled_row_segment_cuda(
+            row_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            row.hidden_dim as i32,
+            out.hidden_dim as i32,
+            token_idx as i32,
+            segment_offset as i32,
+            scale,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
 /// Batched SiLU+mul from a fused gate-up buffer.
 ///
 /// `gate_up` stores each token row as `[gate, up]`, with

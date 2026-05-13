@@ -151,6 +151,37 @@ extern "C" CUresult add_scaled_row_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void add_scaled_row_segment_kernel(
+    const __nv_bfloat16 *__restrict__ row,
+    __nv_bfloat16 *__restrict__ out,
+    int row_len,
+    int out_hidden_dim,
+    int token_idx,
+    int segment_offset,
+    float scale) {
+  int idx = blockIdx.x * BASIC_BLOCK + threadIdx.x;
+  if (idx < row_len) {
+    int out_idx = token_idx * out_hidden_dim + segment_offset + idx;
+    float prev = __bfloat162float(out[out_idx]);
+    float value = __bfloat162float(row[idx]);
+    out[out_idx] = __float2bfloat16(prev + scale * value);
+  }
+}
+
+extern "C" CUresult add_scaled_row_segment_cuda(
+    const uint16_t *row, uint16_t *out, int row_len, int out_hidden_dim,
+    int token_idx, int segment_offset, float scale, CUstream stream) {
+  if (row_len <= 0 || out_hidden_dim <= 0 || token_idx < 0 ||
+      segment_offset < 0 || segment_offset + row_len > out_hidden_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int grid = (row_len + BASIC_BLOCK - 1) / BASIC_BLOCK;
+  add_scaled_row_segment_kernel<<<grid, BASIC_BLOCK, 0, (cudaStream_t)stream>>>(
+      (const __nv_bfloat16 *)row, (__nv_bfloat16 *)out, row_len,
+      out_hidden_dim, token_idx, segment_offset, scale);
+  return (CUresult)cudaGetLastError();
+}
+
 // ============================================================================
 // Element-wise BF16 add: out = a + b
 // ============================================================================

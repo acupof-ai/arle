@@ -611,6 +611,9 @@ pub(crate) use attention::{
     tilelang_run_layer_hd256,
 };
 #[cfg(feature = "cuda")]
+#[allow(unused_imports)] // used by DeepSeek V4 layer-HC wiring once that tranche lands
+pub(crate) use elementwise::add_scaled_row_segment_into;
+#[cfg(feature = "cuda")]
 pub(crate) use elementwise::{
     add_batch_into, add_scaled_row_into, dsv4_swiglu_clamped_batch_into, extract_vec,
     extract_vec_into, silu_mul_batch_into, silu_mul_split_batch_into,
