@@ -573,10 +573,23 @@ impl DeepseekModel {
             local_heads,
             sink_offset
         );
+        let rope_params = &self.config.rope_parameters;
+        let (rope_base, original_seq_len) = if compress_ratio > 0 {
+            (
+                self.config.compress_rope_theta,
+                rope_params.original_max_position_embeddings,
+            )
+        } else {
+            (self.config.rope_theta, 0)
+        };
         let (rope_cos, rope_sin) = build_rope_cache(
             hidden.seq_len,
             self.config.qk_rope_head_dim,
-            self.config.rope_theta,
+            rope_base,
+            original_seq_len,
+            rope_params.factor,
+            rope_params.beta_fast,
+            rope_params.beta_slow,
         );
         let needs_compressed_blocks = compress_ratio > 0 && hidden.seq_len > compress_ratio;
         let compressed_kv = if needs_compressed_blocks {
@@ -596,19 +609,14 @@ impl DeepseekModel {
                 compress_ratio < 16,
                 self.config.rms_norm_eps,
             )?;
-            let (rope_cos_c, rope_sin_c) = build_rope_cache(
-                hidden.seq_len.max(1),
-                self.config.qk_rope_head_dim,
-                self.config.compress_rope_theta,
-            );
             for block_idx in 0..kv.len() / head_dim {
                 let pos =
                     (block_idx * compress_ratio + (compress_ratio - 1)).min(hidden.seq_len - 1);
                 apply_partial_rope(
                     &mut kv[block_idx * head_dim..(block_idx + 1) * head_dim],
-                    &rope_cos_c[pos * self.config.qk_rope_head_dim
+                    &rope_cos[pos * self.config.qk_rope_head_dim
                         ..(pos + 1) * self.config.qk_rope_head_dim],
-                    &rope_sin_c[pos * self.config.qk_rope_head_dim
+                    &rope_sin[pos * self.config.qk_rope_head_dim
                         ..(pos + 1) * self.config.qk_rope_head_dim],
                     self.config.qk_rope_head_dim,
                     1.0,
@@ -1776,14 +1784,41 @@ fn fixed_rms_norm_in_place(values: &mut [f32], eps: f32) {
 }
 
 #[cfg(feature = "cuda")]
-fn build_rope_cache(seq: usize, dim: usize, base: f32) -> (Vec<f32>, Vec<f32>) {
+fn build_rope_cache(
+    seq: usize,
+    dim: usize,
+    base: f32,
+    original_seq_len: usize,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> (Vec<f32>, Vec<f32>) {
     if dim == 0 {
         return (Vec::new(), Vec::new());
     }
     let half = dim / 2;
-    let inv_freq = (0..half)
+    let mut inv_freq = (0..half)
         .map(|i| 1.0_f32 / base.powf((2 * i) as f32 / dim as f32))
         .collect::<Vec<_>>();
+    if original_seq_len > 0 {
+        let low = yarn_correction_dim(beta_fast, dim, base, original_seq_len as f32)
+            .floor()
+            .max(0.0) as usize;
+        let high = yarn_correction_dim(beta_slow, dim, base, original_seq_len as f32)
+            .ceil()
+            .max(0.0)
+            .min((dim.saturating_sub(1)) as f32) as usize;
+        let denom = if low == high {
+            0.001_f32
+        } else {
+            (high - low) as f32
+        };
+        for (i, freq) in inv_freq.iter_mut().enumerate() {
+            let ramp = ((i as f32 - low as f32) / denom).clamp(0.0, 1.0);
+            let smooth = 1.0 - ramp;
+            *freq = *freq / factor * (1.0 - smooth) + *freq * smooth;
+        }
+    }
     let mut cos = vec![0.0_f32; seq * dim];
     let mut sin = vec![0.0_f32; seq * dim];
     for pos in 0..seq {
@@ -1799,6 +1834,12 @@ fn build_rope_cache(seq: usize, dim: usize, base: f32) -> (Vec<f32>, Vec<f32>) {
         }
     }
     (cos, sin)
+}
+
+#[cfg(feature = "cuda")]
+fn yarn_correction_dim(num_rotations: f32, dim: usize, base: f32, max_seq_len: f32) -> f32 {
+    dim as f32 * (max_seq_len / (num_rotations * 2.0 * std::f32::consts::PI)).ln()
+        / (2.0 * base.ln())
 }
 
 #[cfg(feature = "cuda")]
