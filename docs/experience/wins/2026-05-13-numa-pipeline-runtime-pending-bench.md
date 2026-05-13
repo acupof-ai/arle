@@ -37,6 +37,7 @@ rustfmt --edition 2024 \
   infer/src/scheduler/cuda/request.rs \
   infer/src/scheduler/cuda/decode.rs \
   infer/src/server_engine/request_handle_engine.rs \
+  crates/cuda-kernels/src/tensor.rs \
   infer/src/bin/metal_serve.rs \
   infer/src/backend/runtime.rs \
   infer/src/backend/metal/runtime.rs \
@@ -46,6 +47,9 @@ rustfmt --edition 2024 \
 
 cargo test -p infer --no-default-features --features no-cuda \
   runtime_topology -- --nocapture
+
+cargo test -p infer --no-default-features --features no-cuda \
+  runtime_topology::tests::configured_cuda_worker_ordinals_parse_single_and_multi -- --nocapture
 
 cargo test -p infer --no-default-features --features no-cuda \
   server_metrics_ -- --nocapture
@@ -59,10 +63,17 @@ cargo test -p infer --no-default-features --features no-cuda \
 cargo test -p infer --no-default-features --features no-cuda \
   http_server -- --nocapture
 
+cargo test -p infer --no-default-features --features no-cuda \
+  request_handle_engine_preprocesses_prompt_tokens_before_submit -- --nocapture
+
 cargo test -p infer --no-default-features --features no-cuda
 
 CUDARC_CUDA_VERSION=13010 \
 cargo check -p infer --no-default-features --features cuda,no-cuda
+
+CUDARC_CUDA_VERSION=13010 \
+cargo test -p cuda-kernels --no-default-features --features cuda,no-cuda \
+  device_ordinal_override -- --nocapture
 ```
 
 Deferred serving benchmark:
@@ -83,6 +94,7 @@ scripts/bench_guidellm.sh numa-pipeline-cuda \
 - **Hardware:** Apple Silicon/macOS local development host; Linux CUDA NUMA
   hardware pending.
 - **Commit before change:** `74d88283`.
+- **Commit before production multi-worker follow-up:** `559d367d`.
 - **Feature set:** `--no-default-features --features no-cuda` and
   `--no-default-features --features cuda,no-cuda`.
 - **Non-default flags / env vars:** `CUDARC_CUDA_VERSION=13010` for CUDA-Rust
@@ -98,7 +110,9 @@ scripts/bench_guidellm.sh numa-pipeline-cuda \
 | GPU affinity | GPU PCI bus -> NUMA node -> local CPU set |
 | NIC affinity | same-NUMA NICs, then CPU-intersection fallback |
 | Tokenizer workers | ARLE-owned NUMA worker groups |
-| Detokenizer worker | CUDA emit worker bound to scheduler placement |
+| CUDA workers | `INFER_CUDA_DEVICES=0,1,...` starts one scheduler worker per visible-device ordinal |
+| Device selection | thread-local `DeviceContext::new()` override per worker; no global env mutation |
+| Detokenizer worker | one CUDA emit worker per scheduler placement, NUMA-bound |
 | Request routing | NUMA route cost + queue-load penalty + sticky-session migration |
 | New telemetry | topology, affinity, worker groups, numastat, H2D latency, NUMA route/migration/rebalance |
 | Perf status | `pending-remote`, no performance conclusion claimed |
@@ -109,22 +123,33 @@ scripts/bench_guidellm.sh numa-pipeline-cuda \
 |---|---|
 | edited-file rustfmt | PASS |
 | `runtime_topology` tests | PASS |
+| `configured_cuda_worker_ordinals_parse_single_and_multi` | PASS |
 | `server_metrics_` tests | PASS |
 | `request_handle` tests | PASS |
 | `numa_router` tests | PASS |
 | `http_server` tests | PASS |
-| full no-cuda tests | FAIL due unrelated `metal_eval_audit` materialize-boundary classification drift after 581 passing lib tests |
+| `request_handle_engine_preprocesses_prompt_tokens_before_submit` | PASS |
+| full no-cuda tests | FAIL due unrelated `metal_eval_audit` materialize-boundary classification drift after 582 passing lib tests |
 | `cuda,no-cuda` typecheck | PASS with pre-existing DeepSeek reference dead-code warnings |
+| `cuda-kernels device_ordinal_override` test | BLOCKED locally: macOS link lacks CUDA C/stub symbols under `cuda,no-cuda`; Rust typecheck passed |
 
 ## Problems
 
 - No Linux CUDA NUMA host was used in this local run, so affinity application,
   sysfs GPU/NIC mapping, numastat locality, and H2D latency under load remain
   pending runtime evidence.
+- The first implementation landed the NUMA router substrate while `main` still
+  constructed a single router worker. Follow-up production bootstrap now expands
+  `INFER_CUDA_DEVICES`, creates one CUDA scheduler worker per ordinal, binds the
+  worker before context creation, and passes all workers into
+  `NumaSchedulerRouter::new`.
 - Full no-cuda test failure is unrelated to this change: `metal_eval_audit`
   reports `infer/src/backend/metal/kv_pool.rs` as an unclassified Metal
   materialize-boundary file. This file is outside the NUMA/CUDA/HTTP paths
   touched here.
+- `cuda-kernels` unit test linking is not runnable on this macOS host because
+  `no-cuda` skips CUDA C objects while the test binary still references CUDA
+  FFI symbols; keep this as remote/Linux CUDA validation.
 - This entry intentionally reports no TTFT, ITL, throughput, or GPU idle-time
   conclusion. Those require GuideLLM plus nsys on the target host.
 
@@ -138,6 +163,10 @@ scripts/bench_guidellm.sh numa-pipeline-cuda \
   placement.
 - H2D latency should be recorded at concrete copy sites. The first landed
   sample point is host-pinned KV promotion back into the paged GPU pool.
+- `INFER_CUDA_DEVICE` is still the single-worker compatibility path.
+  `INFER_CUDA_DEVICES` is the multi-worker path and is resolved as CUDA
+  visible-device ordinals, then mapped back to physical GPU/NUMA topology for
+  placement logs and routing cost.
 
 ## Delta vs baseline
 
