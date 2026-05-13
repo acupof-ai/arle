@@ -664,6 +664,19 @@ impl DeepseekModel {
         Ok(Some(self.reference_logits_to_device(logits)?))
     }
 
+    pub(super) fn compute_gpu_logits_after_prefill(
+        &self,
+        tokens: &[u32],
+        state: &mut super::state::DeepseekState,
+    ) -> Result<Option<DeviceVec>> {
+        state.reference_tokens.extend_from_slice(tokens);
+        if dsv4_gpu_contextual_logits_enabled()? {
+            self.compute_top_level_logits(&state.reference_tokens)
+        } else {
+            self.compute_top_level_logits(&[tokens[tokens.len() - 1]])
+        }
+    }
+
     fn load_layer_weights(
         &mut self,
         shards: &[safetensors::SafeTensors],
@@ -921,6 +934,19 @@ impl DeepseekModel {
         state.reference_tokens.push(token);
         let logits = reference.forward_last_logits(&state.reference_tokens)?;
         Ok(Some(self.reference_logits_to_device(logits)?))
+    }
+
+    pub(super) fn compute_gpu_logits_after_decode(
+        &self,
+        token: u32,
+        state: &mut super::state::DeepseekState,
+    ) -> Result<Option<DeviceVec>> {
+        state.reference_tokens.push(token);
+        if dsv4_gpu_contextual_logits_enabled()? {
+            self.compute_top_level_logits(&state.reference_tokens)
+        } else {
+            self.compute_top_level_logits(&[token])
+        }
     }
 
     fn reference_logits_to_device(&self, logits: Vec<f32>) -> Result<DeviceVec> {
@@ -1450,6 +1476,17 @@ fn dsv4_gpu_full_layer_limit() -> Result<usize> {
     };
     raw.parse::<usize>()
         .map_err(|err| anyhow::anyhow!("invalid ARLE_DSV4_GPU_FULL_LAYERS value `{raw}`: {err}"))
+}
+
+fn dsv4_gpu_contextual_logits_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_GPU_CONTEXT_TOKENS").ok() else {
+        return Ok(dsv4_gpu_full_layer_limit()? > 0);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_GPU_CONTEXT_TOKENS value `{raw}`"),
+    }
 }
 
 fn deepseek_find_tensor<'data>(

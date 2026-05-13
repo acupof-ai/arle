@@ -69,7 +69,7 @@ impl DeepseekModel {
         }
 
         state.base.prefill_logits = Some(
-            if let Some(logits) = self.compute_top_level_logits(&[tokens[tokens.len() - 1]])? {
+            if let Some(logits) = self.compute_gpu_logits_after_prefill(tokens, state)? {
                 logits
             } else {
                 // `from_config` tests still build a shell without weights.

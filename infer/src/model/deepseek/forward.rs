@@ -103,7 +103,7 @@ impl ModelForward for DeepseekModel {
         // Phase 2A.1 uses the loaded top-level tensors for non-zero logits when
         // available. Real contextual attention and shared-expert compute land
         // in later, separately gated tranches.
-        if let Some(logits) = self.compute_top_level_logits(&[token])? {
+        if let Some(logits) = self.compute_gpu_logits_after_decode(token, state)? {
             state.decode_logits = logits;
         }
         state.base.prefill_logits = None;
