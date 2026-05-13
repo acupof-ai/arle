@@ -21,7 +21,7 @@ use super::mla::{DeepseekV4Attention, DeepseekV4Compressor, DeepseekV4Indexer};
 #[cfg(feature = "cuda")]
 use super::mlp::{DeepseekV4Expert, DeepseekV4MoeBlock};
 #[cfg(feature = "cuda")]
-use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use deepseek_spec::DeepSeekV4Config;
 
 use crate::deepseek_v4_manifest::{
@@ -31,6 +31,8 @@ use crate::deepseek_v4_manifest::{
 use crate::deepseek_v4_reference::DeepseekV4ReferenceModel;
 #[cfg(feature = "cuda")]
 use crate::model::common;
+#[cfg(feature = "cuda")]
+use crate::ops;
 #[cfg(feature = "cuda")]
 use crate::tp::TpLoadContext;
 #[cfg(feature = "cuda")]
@@ -255,8 +257,27 @@ impl DeepseekModel {
         ) else {
             return Ok(None);
         };
-        let hidden =
+        let embeddings =
             common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, self.config.hidden_size)?;
+        let hidden = if let Some(head_hc) = &self.head_hc {
+            let stream = initial_hc_stream_from_embeddings(
+                &self.ctx,
+                &embeddings,
+                self.config.hidden_size,
+                self.config.hc_mult,
+            )?;
+            head_hidden_from_stream(
+                &self.ctx,
+                head_hc,
+                &stream,
+                tokens.len() - 1,
+                self.config.hidden_size,
+                self.config.hc_mult,
+                self.config.hc_eps,
+            )?
+        } else {
+            embeddings
+        };
         let logits = common::compute_logits_batch(
             &self.ctx,
             &hidden,
@@ -552,6 +573,142 @@ impl DeepseekModel {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn initial_hc_stream_from_embeddings(
+    ctx: &DeviceContext,
+    embeddings: &HiddenStates,
+    hidden_size: usize,
+    hc_mult: usize,
+) -> Result<HiddenStates> {
+    ensure!(
+        embeddings.hidden_dim == hidden_size,
+        "DeepSeek V4 embedding hidden dim {} does not match hidden_size {}",
+        embeddings.hidden_dim,
+        hidden_size
+    );
+    ensure!(hc_mult > 0, "DeepSeek V4 hc_mult must be non-zero");
+    let stream_hidden = hidden_size * hc_mult;
+    let mut stream = HiddenStates::zeros(ctx, stream_hidden, embeddings.seq_len)?;
+    for token_idx in 0..embeddings.seq_len {
+        let src_start = token_idx * hidden_size;
+        let src = embeddings.data.slice(src_start..src_start + hidden_size);
+        for hc_idx in 0..hc_mult {
+            let dst_start = token_idx * stream_hidden + hc_idx * hidden_size;
+            let mut dst = stream.data.slice_mut(dst_start..dst_start + hidden_size);
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 initial HC stream copy: {err}"))?;
+        }
+    }
+    Ok(stream)
+}
+
+#[cfg(feature = "cuda")]
+fn head_hidden_from_stream(
+    ctx: &DeviceContext,
+    head_hc: &DeepseekV4HyperConnection,
+    stream: &HiddenStates,
+    token_idx: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+    hc_eps: f32,
+) -> Result<HiddenStates> {
+    ensure!(
+        token_idx < stream.seq_len,
+        "DeepSeek V4 head token {} out of range for stream seq_len {}",
+        token_idx,
+        stream.seq_len
+    );
+    ensure!(
+        stream.hidden_dim == hidden_size * hc_mult,
+        "DeepSeek V4 head stream dim {} does not match hidden_size {} * hc_mult {}",
+        stream.hidden_dim,
+        hidden_size,
+        hc_mult
+    );
+    ensure!(
+        head_hc.mix_fn.cols == stream.hidden_dim && head_hc.mix_fn.rows >= hc_mult,
+        "DeepSeek V4 head HC mix shape {}x{} cannot produce {} pre weights from stream dim {}",
+        head_hc.mix_fn.rows,
+        head_hc.mix_fn.cols,
+        hc_mult,
+        stream.hidden_dim
+    );
+    ensure!(
+        head_hc.base.len >= hc_mult && head_hc.scale.len >= 1,
+        "DeepSeek V4 head HC base/scale too short: base={} scale={} hc_mult={}",
+        head_hc.base.len,
+        head_hc.scale.len,
+        hc_mult
+    );
+
+    let stream_row = extract_hidden_token_with_width(ctx, stream, token_idx, stream.hidden_dim)?;
+    let mixes = ops::gemm(ctx, &head_hc.mix_fn, &stream_row)?;
+    let mixes_host = ctx.stream.clone_dtoh(&mixes.data)?;
+    let base_host = ctx.stream.clone_dtoh(&head_hc.base.data)?;
+    let scale_host = ctx.stream.clone_dtoh(&head_hc.scale.data)?;
+    let scale = scale_host[0].to_f32();
+    let pre = (0..hc_mult)
+        .map(|idx| sigmoid(scale * mixes_host[idx].to_f32() + base_host[idx].to_f32()) + hc_eps)
+        .collect::<Vec<_>>();
+
+    let mut out = HiddenStates::zeros(ctx, hidden_size, 1)?;
+    for (hc_idx, weight) in pre.into_iter().enumerate() {
+        let lane = extract_hc_lane(ctx, stream, token_idx, hc_idx, hidden_size)?;
+        ops::add_scaled_row_into(ctx, &lane, &mut out, 0, weight)?;
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn extract_hidden_token_with_width(
+    ctx: &DeviceContext,
+    hidden: &HiddenStates,
+    token_idx: usize,
+    width: usize,
+) -> Result<HiddenStates> {
+    ensure!(
+        hidden.hidden_dim == width,
+        "DeepSeek V4 token extract width {} does not match hidden dim {}",
+        width,
+        hidden.hidden_dim
+    );
+    let mut out = HiddenStates::zeros(ctx, width, 1)?;
+    let start = token_idx * width;
+    let src = hidden.data.slice(start..start + width);
+    ctx.stream
+        .memcpy_dtod(&src, &mut out.data)
+        .map_err(|err| anyhow::anyhow!("DeepSeek V4 token extract copy: {err}"))?;
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn extract_hc_lane(
+    ctx: &DeviceContext,
+    stream: &HiddenStates,
+    token_idx: usize,
+    hc_idx: usize,
+    hidden_size: usize,
+) -> Result<HiddenStates> {
+    let start = token_idx * stream.hidden_dim + hc_idx * hidden_size;
+    let mut out = HiddenStates::zeros(ctx, hidden_size, 1)?;
+    let src = stream.data.slice(start..start + hidden_size);
+    ctx.stream
+        .memcpy_dtod(&src, &mut out.data)
+        .map_err(|err| anyhow::anyhow!("DeepSeek V4 HC lane extract copy: {err}"))?;
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
+}
+
 fn infer_real_reference_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_INFER_REAL_REFERENCE").ok() else {
         return Ok(false);
@@ -588,4 +745,71 @@ fn deepseek_find_tensor<'data>(
     shard
         .tensor(name)
         .map_err(|err| anyhow::anyhow!("loading tensor {name}: {err}"))
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use half::bf16;
+
+    fn bf16_vec(values: &[f32]) -> Vec<bf16> {
+        values.iter().map(|&value| bf16::from_f32(value)).collect()
+    }
+
+    #[test]
+    fn initial_hc_stream_repeats_embedding_rows() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let embeddings = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 4.0]))?,
+            hidden_dim: 2,
+            seq_len: 2,
+        };
+
+        let stream = initial_hc_stream_from_embeddings(&ctx, &embeddings, 2, 3)?;
+        let host = ctx.stream.clone_dtoh(&stream.data)?;
+        ctx.sync()?;
+        let got = host.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn head_hidden_from_stream_combines_hc_lanes() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let stream = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, 5.0]))?,
+            hidden_dim: 4,
+            seq_len: 1,
+        };
+        let head_hc = DeepseekV4HyperConnection {
+            base: DeviceVec::from_host(&ctx, &bf16_vec(&[0.0, 1.0986123]))?,
+            mix_fn: DeviceMatrix::from_host(
+                &ctx,
+                &bf16_vec(&[
+                    0.0, 0.0, 0.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0,
+                ]),
+                2,
+                4,
+            )?,
+            scale: DeviceVec::from_host(&ctx, &bf16_vec(&[1.0]))?,
+        };
+
+        let hidden = head_hidden_from_stream(&ctx, &head_hc, &stream, 0, 2, 2, 0.0)?;
+        let host = ctx.stream.clone_dtoh(&hidden.data)?;
+        ctx.sync()?;
+        let got = host.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+        let expected = [2.75_f32, 4.75_f32];
+        for (idx, value) in got.iter().enumerate() {
+            assert!(
+                (*value - expected[idx]).abs() < 0.03,
+                "idx={idx} expected={} got={value}",
+                expected[idx]
+            );
+        }
+        Ok(())
+    }
 }
