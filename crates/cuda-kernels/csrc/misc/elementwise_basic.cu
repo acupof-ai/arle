@@ -125,6 +125,32 @@ extern "C" CUresult dsv4_swiglu_clamped_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void add_scaled_row_kernel(
+    const __nv_bfloat16 *__restrict__ row,
+    __nv_bfloat16 *__restrict__ out,
+    int hidden_dim,
+    int token_idx,
+    float scale) {
+  int idx = blockIdx.x * BASIC_BLOCK + threadIdx.x;
+  if (idx < hidden_dim) {
+    int out_idx = token_idx * hidden_dim + idx;
+    float prev = __bfloat162float(out[out_idx]);
+    float value = __bfloat162float(row[idx]);
+    out[out_idx] = __float2bfloat16(prev + scale * value);
+  }
+}
+
+extern "C" CUresult add_scaled_row_cuda(
+    const uint16_t *row, uint16_t *out, int hidden_dim, int token_idx,
+    float scale, CUstream stream) {
+  if (hidden_dim <= 0 || token_idx < 0) return CUDA_ERROR_INVALID_VALUE;
+  int grid = (hidden_dim + BASIC_BLOCK - 1) / BASIC_BLOCK;
+  add_scaled_row_kernel<<<grid, BASIC_BLOCK, 0, (cudaStream_t)stream>>>(
+      (const __nv_bfloat16 *)row, (__nv_bfloat16 *)out, hidden_dim,
+      token_idx, scale);
+  return (CUresult)cudaGetLastError();
+}
+
 // ============================================================================
 // Element-wise BF16 add: out = a + b
 // ============================================================================

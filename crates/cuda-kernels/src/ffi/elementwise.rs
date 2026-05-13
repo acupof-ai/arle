@@ -34,6 +34,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn add_scaled_row_cuda(
+        row: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        token_idx: i32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn split_qkv_cuda(
         qkv: *const Half,
         q: *mut Half,

@@ -12,6 +12,8 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cudarc::driver::CudaSlice;
 
 #[cfg(feature = "cuda")]
+use crate::distributed::expert_state::LocalExpertRouting;
+#[cfg(feature = "cuda")]
 use crate::ops;
 
 /// One SwiGLU expert: `w2(silu(w1(x)) * w3(x))`.
@@ -90,11 +92,73 @@ impl DeepseekV4MoeBlock {
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 MoE block has no shared expert"))?;
         shared.forward(ctx, hidden, swiglu_limit)
     }
+
+    /// Run the EP-local portion of routed V4 MoE and add the shared expert.
+    ///
+    /// `routing` must already be localized for this EP rank. The returned
+    /// tensor is this rank's partial MoE output; callers that run multiple EP
+    /// ranks still need the cross-rank reduction step.
+    pub(super) fn forward_local_routes(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &HiddenStates,
+        routing: &LocalExpertRouting,
+        swiglu_limit: f32,
+    ) -> Result<HiddenStates> {
+        ensure!(
+            routing.experts_per_rank == self.experts.len(),
+            "DeepSeek V4 routing expects {} local experts but block loaded {}",
+            routing.experts_per_rank,
+            self.experts.len()
+        );
+
+        let mut out = if let Some(shared) = &self.shared_experts {
+            shared.forward(ctx, hidden, swiglu_limit)?
+        } else {
+            HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?
+        };
+
+        for route in &routing.routes {
+            ensure!(
+                route.token_idx < hidden.seq_len,
+                "DeepSeek V4 route token {} out of range for seq_len {}",
+                route.token_idx,
+                hidden.seq_len
+            );
+            let expert = self.experts.get(route.local_expert_idx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek V4 local expert {} out of range for {} local experts",
+                    route.local_expert_idx,
+                    self.experts.len()
+                )
+            })?;
+            let token_hidden = hidden_token(ctx, hidden, route.token_idx)?;
+            let expert_out = expert.forward(ctx, &token_hidden, swiglu_limit)?;
+            ops::add_scaled_row_into(ctx, &expert_out, &mut out, route.token_idx, route.weight)?;
+        }
+
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn hidden_token(
+    ctx: &DeviceContext,
+    hidden: &HiddenStates,
+    token_idx: usize,
+) -> Result<HiddenStates> {
+    let token = ops::extract_vec(ctx, hidden, token_idx)?;
+    Ok(HiddenStates {
+        data: token.data,
+        hidden_dim: hidden.hidden_dim,
+        seq_len: 1,
+    })
 }
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
+    use crate::distributed::expert_state::LocalExpertRoute;
     use half::bf16;
 
     fn bf16_vec(values: &[f32]) -> Vec<bf16> {
@@ -162,6 +226,81 @@ mod tests {
             expected.push(act[0] + 0.5 * act[2]);
             expected.push(act[1] - act[2]);
         }
+
+        for (idx, got) in out_host.iter().enumerate() {
+            assert!(
+                (got.to_f32() - expected[idx]).abs() < 0.05,
+                "idx={idx} expected={} got={}",
+                expected[idx],
+                got.to_f32()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn moe_forward_local_routes_accumulates_ep_local_experts() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden = HiddenStates {
+            data: ctx.stream.clone_htod(&bf16_vec(&[1.0, 2.0, 3.0, -1.0]))?,
+            hidden_dim: 2,
+            seq_len: 2,
+        };
+        let expert0 = DeepseekV4Expert {
+            w1: DeviceMatrix::from_host(&ctx, &bf16_vec(&[1.0, 0.0]), 1, 2)?,
+            w2: DeviceMatrix::from_host(&ctx, &bf16_vec(&[1.0, 2.0]), 2, 1)?,
+            w3: DeviceMatrix::from_host(&ctx, &bf16_vec(&[1.0, 0.0]), 1, 2)?,
+        };
+        let expert1 = DeepseekV4Expert {
+            w1: DeviceMatrix::from_host(&ctx, &bf16_vec(&[0.0, 1.0]), 1, 2)?,
+            w2: DeviceMatrix::from_host(&ctx, &bf16_vec(&[-1.0, 0.5]), 2, 1)?,
+            w3: DeviceMatrix::from_host(&ctx, &bf16_vec(&[0.0, 1.0]), 1, 2)?,
+        };
+        let block = DeepseekV4MoeBlock {
+            gate_weight: DeviceMatrix::from_host(&ctx, &bf16_vec(&[0.0, 0.0]), 1, 2)?,
+            gate_bias: None,
+            gate_tid2eid: None,
+            experts: vec![expert0, expert1],
+            shared_experts: None,
+        };
+        let routing = LocalExpertRouting {
+            num_global_experts: 4,
+            experts_per_rank: 2,
+            routes: vec![
+                LocalExpertRoute {
+                    token_idx: 0,
+                    global_expert_idx: 0,
+                    local_expert_idx: 0,
+                    weight: 0.25,
+                },
+                LocalExpertRoute {
+                    token_idx: 0,
+                    global_expert_idx: 1,
+                    local_expert_idx: 1,
+                    weight: 0.5,
+                },
+                LocalExpertRoute {
+                    token_idx: 1,
+                    global_expert_idx: 1,
+                    local_expert_idx: 1,
+                    weight: 1.0,
+                },
+            ],
+        };
+
+        let out = block.forward_local_routes(&ctx, &hidden, &routing, 10.0)?;
+        let out_host = ctx.stream.clone_dtoh(&out.data)?;
+        ctx.sync()?;
+
+        let e0_t0 = silu(1.0) * 1.0;
+        let e1_t0 = silu(2.0) * 2.0;
+        let e1_t1 = silu(-1.0) * -1.0;
+        let expected = [
+            0.25 * e0_t0 - 0.5 * e1_t0,
+            0.25 * (2.0 * e0_t0) + 0.5 * (0.5 * e1_t0),
+            -e1_t1,
+            0.5 * e1_t1,
+        ];
 
         for (idx, got) in out_host.iter().enumerate() {
             assert!(

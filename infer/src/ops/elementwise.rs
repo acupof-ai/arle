@@ -117,6 +117,37 @@ pub(crate) fn dsv4_swiglu_clamped_batch_into(
     Ok(())
 }
 
+/// Add one BF16 row into a token row of a HiddenStates batch:
+/// `out[token_idx, i] += scale * row[0, i]`.
+pub(crate) fn add_scaled_row_into(
+    ctx: &DeviceContext,
+    row: &HiddenStates,
+    out: &mut HiddenStates,
+    token_idx: usize,
+    scale: f32,
+) -> Result<()> {
+    assert_eq!(row.hidden_dim, out.hidden_dim);
+    assert_eq!(row.seq_len, 1);
+    assert!(token_idx < out.seq_len);
+
+    let (row_ptr, _gr) = row.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::add_scaled_row_cuda(
+            row_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            out.hidden_dim as i32,
+            token_idx as i32,
+            scale,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
 /// Batched SiLU+mul from a fused gate-up buffer.
 ///
 /// `gate_up` stores each token row as `[gate, up]`, with
