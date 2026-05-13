@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
@@ -177,7 +177,32 @@ impl<M: ModelForward> Scheduler<M> {
                             static_reserve as f64 / 1e9,
                         );
                     }
-                    free.saturating_sub(contiguous_cost.saturating_add(static_reserve))
+                    let budget =
+                        free.saturating_sub(contiguous_cost.saturating_add(static_reserve));
+                    if let Some(explicit_max_seq_len) = max_seq_len_override {
+                        let requested_tokens =
+                            config.max_slots.saturating_mul(explicit_max_seq_len.max(1));
+                        let explicit_budget = PagedKVPool::budget_bytes_for_tokens(
+                            model.num_kv_layers(),
+                            model.num_kv_heads(),
+                            model.head_dim(),
+                            requested_tokens,
+                            kv_pool_format,
+                        );
+                        if budget < explicit_budget {
+                            warn!(
+                                "TokenKVPool budget raised from {:.3} GB to {:.3} GB to honor \
+                                 explicit max_seq_len={} across {} slot(s)",
+                                budget as f64 / 1e9,
+                                explicit_budget as f64 / 1e9,
+                                explicit_max_seq_len,
+                                config.max_slots,
+                            );
+                        }
+                        budget.max(explicit_budget)
+                    } else {
+                        budget
+                    }
                 }
                 Err(_) => config.kv_pool_fallback_bytes,
             };
