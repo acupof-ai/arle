@@ -16,7 +16,7 @@ use crate::server_engine::CompletionStreamDelta;
 use crate::tokenizer::Tokenizer;
 use crate::types::SessionId;
 
-const DISTRIBUTED_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const DISTRIBUTED_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Per-request token synchronization for multi-rank HTTP serving.
 ///
