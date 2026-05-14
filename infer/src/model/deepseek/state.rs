@@ -76,6 +76,7 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
+    pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
 }
 
 #[cfg(feature = "cuda")]
@@ -100,6 +101,14 @@ pub(crate) struct DeepseekGroupedExpertRuntimeScratch {
     pub(crate) up: HiddenStates,
     pub(crate) act: HiddenStates,
     pub(crate) out: HiddenStates,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekRouteCombineRuntimeScratch {
+    pub(crate) capacity_routes: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) combine_recv: HiddenStates,
+    pub(crate) route_slot_out: HiddenStates,
 }
 
 #[cfg(feature = "cuda")]
@@ -174,6 +183,34 @@ impl DeepseekMoeRuntimeCache {
             .grouped
             .as_mut()
             .expect("DeepSeek V4 grouped expert scratch allocated"))
+    }
+
+    pub(crate) fn ensure_route_combine_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_dim: usize,
+        capacity_routes: usize,
+    ) -> Result<&mut DeepseekRouteCombineRuntimeScratch> {
+        let capacity_routes = capacity_routes.max(1);
+        let needs_alloc = self
+            .route_combine
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_routes < capacity_routes || scratch.hidden_dim != hidden_dim
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            self.route_combine = Some(DeepseekRouteCombineRuntimeScratch {
+                capacity_routes,
+                hidden_dim,
+                combine_recv: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+                route_slot_out: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+            });
+        }
+        Ok(self
+            .route_combine
+            .as_mut()
+            .expect("DeepSeek V4 route combine scratch allocated"))
     }
 }
 
