@@ -72,6 +72,15 @@ Related governance docs:
   to 2.69 s, but traced `ffn_deepep_local_experts` p50 is still 1.196 ms versus
   roughly 0.46 ms on the default scratch-reuse path. The harness is ready for
   the next replacement with real grouped GEMM/DeepGEMM.
+- Added a gated DSv4 grouped gate/up pair GEMV launch for the same
+  `ARLE_DSV4_GROUPED_EXPERTS=1` harness. The FP8/FP4 pair kernels compute
+  `w1` and `w3` in one grouped launch when format, shape, and block-scale
+  layout match, otherwise the path falls back to separate grouped GEMV
+  launches. 8xH20 nsys with `ARLE_DSV4_MOE_BACKEND=deepep` confirms
+  `dsv4_fp4_grouped_gemv_pair_batch_kernel` runs in decode, but the grouped
+  harness remains default-off: the decode window is still dominated by NCCL
+  send/recv plus allocation/free and launch churn, not by the missing gate/up
+  fusion alone.
 - Added a gated DSv4 MoE combine exchange experiment via
   `ARLE_DSV4_COMBINE_DTYPE=fp8`. The path quantizes return-route BF16 rows to
   FP8 E4M3 with per-row FP32 scales, exchanges the FP8 payload through NCCL

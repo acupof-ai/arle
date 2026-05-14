@@ -1,0 +1,2 @@
+{"phase": "warmup", "seconds": 1.285336, "usage": {"prompt_tokens": 14, "completion_tokens": 2, "total_tokens": 16}, "output": "1073"}
+{"phase": "profiled_stream_decode_window", "status": 200, "seconds_to_first": 1.300255, "captured_decode_wall_s": 0.320807, "first_chunk": "一", "second_chunk": ",", "chunks": "一,", "usage_seen": null}

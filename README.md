@@ -180,7 +180,10 @@ Operators who want only the native serving binary can use `infer` directly (`car
   gated grouped expert harness now caches per-layer weight pointer arrays and
   launches indexed active experts, improving the raw grouped prototype while
   keeping it default-off until real grouped GEMM/DeepGEMM replaces the current
-  GEMV kernels. Per-layer DeepEP dispatch scratch reuse further raises default
+  GEMV kernels. A follow-up pair GEMV kernel now fuses grouped `w1`/`w3`
+  gate/up launches and is visible in DeepEP decode nsys, but it remains opt-in:
+  the decode window is still dominated by NCCL send/recv plus alloc/free and
+  launch churn. Per-layer DeepEP dispatch scratch reuse further raises default
   short math smoke to **7.7-7.8 tok/s** and cuts Nsight
   `cuMemAllocAsync`/`cuMemFreeAsync` calls in the 8-token window from 136,825 to
   111,531, leaving stream sync plus return-side NCCL/GEMM work as the next

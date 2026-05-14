@@ -1,0 +1,23 @@
+Processing [docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-pair-gemv-deepep-decode/trace.sqlite] with [/opt/nvidia/nsight-systems/2023.2.3/host-linux-x64/reports/cuda_api_sum.py]...
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)    Min (ns)  Max (ns)   StdDev (ns)                 Name
+ --------  ---------------  ---------  -----------  -----------  --------  ---------  -----------  ----------------------------------
+     26.6      415,036,350     12,720     32,628.6      7,881.5       119  1,288,348     56,211.6  cuMemAllocAsync
+     24.9      388,502,972     12,717     30,549.9      3,575.0       113  1,333,521     57,347.9  cuMemFreeAsync
+     23.6      368,083,599        940    391,578.3     79,308.5    12,011  3,005,044    548,870.6  cuMemcpyDtoHAsync_v2
+      7.9      122,777,214     15,461      7,941.1      6,148.0     2,983     56,863      5,305.8  cudaLaunchKernel
+      7.5      116,639,863     13,836      8,430.2      5,734.0       109     96,753      7,237.4  cuMemsetD8Async
+      1.7       26,243,223         16  1,640,201.4  1,347,096.5   951,994  3,851,722    776,394.7  cuStreamSynchronize
+      1.5       24,155,779      1,568     15,405.5     11,074.5     2,280     84,848     11,904.3  cuMemcpyHtoDAsync_v2
+      1.4       21,986,387      1,808     12,160.6      8,870.5     3,597    360,936     14,460.4  cuLaunchKernelEx
+      1.4       21,543,572      4,361      4,940.1      2,226.0       412     82,041      6,516.6  cudaEventRecord
+      1.3       19,814,667      3,616      5,479.7      2,538.5       467     66,321      6,871.0  cudaStreamWaitEvent
+      0.9       13,673,848      5,530      2,472.7      1,046.5       231     45,434      3,956.3  cudaStreamGetCaptureInfo_v2_v11030
+      0.7       11,535,407        648     17,801.6     13,994.5     5,187     73,301     11,441.1  cuMemcpyDtoDAsync_v2
+      0.4        6,042,732      1,808      3,342.2        977.0       135     48,305      5,436.2  cudaGetFuncBySymbol_v11000
+      0.1        1,713,174          2    856,587.0    856,587.0     4,758  1,708,416  1,204,668.1  cuCtxSynchronize
+      0.0          745,101          8     93,137.6     94,042.0    53,139    121,119     27,648.6  cuMemGetInfo_v2
+      0.0            4,462          1      4,462.0      4,462.0     4,462      4,462          0.0  cuProfilerStart
+      0.0              583          1        583.0        583.0       583        583          0.0  cuProfilerStop
