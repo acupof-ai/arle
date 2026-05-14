@@ -52,6 +52,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_count_expert_ranks_cuda(
+        indices: *const i32,
+        counts: *mut i32,
+        num_tokens: i32,
+        topk: i32,
+        experts_per_rank: i32,
+        ep_world_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_pack_local_experts_cuda(
         hidden: *const Half,
         indices: *const i32,
@@ -69,6 +79,51 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_pack_expert_ranks_cuda(
+        hidden: *const Half,
+        indices: *const i32,
+        weights: *const f32,
+        offsets: *const i32,
+        cursors: *mut i32,
+        packed_hidden: *mut Half,
+        packed_token: *mut i32,
+        packed_expert: *mut i32,
+        packed_weight: *mut f32,
+        num_tokens: i32,
+        hidden_dim: i32,
+        topk: i32,
+        experts_per_rank: i32,
+        ep_world_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_count_packed_local_experts_cuda(
+        packed_expert: *const i32,
+        counts: *mut i32,
+        num_routes: i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_pack_received_experts_cuda(
+        received_hidden: *const Half,
+        received_token: *const i32,
+        received_expert: *const i32,
+        received_weight: *const f32,
+        offsets: *const i32,
+        cursors: *mut i32,
+        expert_hidden: *mut Half,
+        expert_token: *mut i32,
+        expert_weight: *mut f32,
+        expert_route_slot: *mut i32,
+        num_routes: i32,
+        hidden_dim: i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_scatter_packed_expert_cuda(
         expert_out: *const Half,
         routed_out: *mut Half,
@@ -76,6 +131,27 @@ unsafe extern "C" {
         packed_weight: *const f32,
         start_slot: i32,
         count: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_scatter_packed_route_slot_cuda(
+        expert_out: *const Half,
+        route_out: *mut Half,
+        expert_route_slot: *const i32,
+        expert_weight: *const f32,
+        start_slot: i32,
+        count: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_combine_route_outputs_cuda(
+        route_out: *const Half,
+        packed_token: *const i32,
+        routed_out: *mut Half,
+        num_tokens: i32,
+        num_routes: i32,
         hidden_dim: i32,
         stream: CUstream,
     ) -> CUresult;
