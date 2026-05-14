@@ -457,3 +457,17 @@ calls dropped from 11,988 to 11,105. Remaining allocator pressure is still
 large, so the next scratch/graph work should target recv/local route buffers
 and the return-side combine path rather than this already-removed send-route
 metadata.
+
+`recv-route-scratch/` continues that decode cleanup by reusing received route
+rows/metadata, local expert packed rows/weights/route slots, and route-output
+buffers for B=1 decode. To avoid long-prefill memory blow-up, prefill only
+preallocates a small decode capacity of `ep_world * topk` routes; it does not
+size these buffers from prompt length. The trace-off math/writing smokes remain
+normal at 8.24-8.79 completion tok/s. The single-token nsys window returned
+`好的，` and captured one 8-rank decode wave, now 148.253 ms wall. Decode-only
+`cuMemAllocAsync` calls dropped from 11,097 to 9,480, `cuMemFreeAsync` calls
+dropped from 11,105 to 9,488, and `cuMemsetD8Async` calls dropped from 12,167
+to 10,554. The largest remaining runtime costs are still async alloc/free,
+DtoH routing readbacks, kernel launch/memset churn, and NCCL send/recv plus
+all-reduce boundaries; `dsv4_hybrid_attention_kernel` is visible at about
+7.1 ms per rank range and is not the primary bottleneck.
