@@ -1,0 +1,60 @@
+{
+  "default": {
+    "warmup16": {
+      "prompt_tokens": 14,
+      "completion_tokens": 16,
+      "total_ms": 1558.738545,
+      "ttft_ms": 377.003396,
+      "completion_tokens_per_s_e2e": 10.264710557985207,
+      "finish_reason": "length",
+      "text_bytes": 96
+    },
+    "decode64": {
+      "prompt_tokens": 21,
+      "completion_tokens": 64,
+      "total_ms": 5577.40041,
+      "ttft_ms": 443.40329699999995,
+      "completion_tokens_per_s_e2e": 11.474879925287631,
+      "finish_reason": "length",
+      "text_bytes": 314
+    },
+    "math": {
+      "prompt_tokens": 17,
+      "completion_tokens": 1,
+      "total_ms": 469.269952,
+      "ttft_ms": 389.86307999999997,
+      "completion_tokens_per_s_e2e": 2.1309695959395243,
+      "finish_reason": "stop",
+      "text_bytes": 3
+    }
+  },
+  "route_grouped_pair": {
+    "warmup16": {
+      "prompt_tokens": 14,
+      "completion_tokens": 16,
+      "total_ms": 2565.7205400000003,
+      "ttft_ms": 371.368545,
+      "completion_tokens_per_s_e2e": 6.236064976897288,
+      "finish_reason": "length",
+      "text_bytes": 96
+    },
+    "decode64": {
+      "prompt_tokens": 21,
+      "completion_tokens": 64,
+      "total_ms": 9785.509877999999,
+      "ttft_ms": 448.32475700000003,
+      "completion_tokens_per_s_e2e": 6.540282601306879,
+      "finish_reason": "length",
+      "text_bytes": 335
+    },
+    "math": {
+      "prompt_tokens": 17,
+      "completion_tokens": 1,
+      "total_ms": 545.197299,
+      "ttft_ms": 397.23206500000003,
+      "completion_tokens_per_s_e2e": 1.8341983752197568,
+      "finish_reason": "stop",
+      "text_bytes": 3
+    }
+  }
+}

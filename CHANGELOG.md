@@ -110,6 +110,12 @@ Related governance docs:
   elevated route-count D2H synchronization. This confirms the opt-in grouped
   GEMV path remains default-off and that the target remains true grouped
   GEMM/DeepGEMM with DeepEP overlap.
+- Added the DSv4 route-grouped pair trace-off HTTP comparison under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-route-grouped-pair-vs-default/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-route-grouped-pair-vs-default/).
+  Default fused-dispatch decode keeps `decode64` at 11.47 completion tok/s and
+  arithmetic at `410`; `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1` returns normal text
+  and the same arithmetic answer but regresses `decode64` to 6.54 completion
+  tok/s. Route-wise grouped GEMV remains default-off.
 
 ### CUDA
 
