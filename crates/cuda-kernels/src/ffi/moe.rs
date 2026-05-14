@@ -200,6 +200,24 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_sum_padded_route_outputs_by_peer_cuda(
+        route_out: *const Half,
+        recv_meta: *const i32,
+        peer_out: *mut Half,
+        ep_world_size: i32,
+        topk: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_sum_bf16_rows_cuda(
+        rows: *const Half,
+        out: *mut Half,
+        num_rows: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_add_local_expert_cuda(
         expert_out: *const Half,
         routed_out: *mut Half,

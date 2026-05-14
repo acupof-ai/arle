@@ -2431,16 +2431,101 @@ impl DeepseekV4MoeBlock {
             )
         };
         let combine_mode = dsv4_combine_exchange_mode()?;
+        let use_padded_bf16_combine =
+            use_padded_dispatch && matches!(combine_mode, Dsv4CombineExchangeMode::Bf16);
+        let (peer_hidden_offsets, peer_hidden_counts) = if use_padded_bf16_combine {
+            (
+                dsv4_scale_usize(&peer_offsets, hidden.hidden_dim)?,
+                dsv4_scale_usize(&one_per_peer, hidden.hidden_dim)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let run_padded_peer_combine_kernel = |combine_recv: &HiddenStates,
+                                              out: &mut HiddenStates|
+         -> Result<()> {
+            let combine_kernel_trace = dsv4_moe_trace_begin(ctx)?;
+            let (combine_ptr, _combine_guard) = combine_recv.data.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_sum_bf16_rows_cuda(
+                    combine_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    ep_world_i32,
+                    hidden.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 padded peer combine failed: {err}"))?;
+            }
+            dsv4_moe_trace_end(
+                ctx,
+                "ffn_deepep_combine_kernel",
+                layer_idx,
+                hidden.seq_len,
+                combine_kernel_trace,
+            )
+        };
         if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
             let scratch = scratch_cache.ensure_route_combine_scratch(
                 ctx,
                 hidden.hidden_dim,
                 route_combine_capacity,
             )?;
-            scratch.combine_recv.seq_len = total_send_routes;
-            scratch.route_slot_out.seq_len = route_slot_capacity;
+            scratch.combine_recv.seq_len = if use_padded_bf16_combine {
+                ep.world_size
+            } else {
+                total_send_routes
+            };
+            scratch.route_slot_out.seq_len = if use_padded_bf16_combine {
+                ep.world_size
+            } else {
+                route_slot_capacity
+            };
             let combine_exchange_trace = dsv4_moe_trace_begin(ctx)?;
             match combine_mode {
+                Dsv4CombineExchangeMode::Bf16 if use_padded_bf16_combine => {
+                    ensure!(
+                        total_recv_routes
+                            == ep.world_size.saturating_mul(config.num_experts_per_tok)
+                            && total_send_routes
+                                == ep.world_size.saturating_mul(config.num_experts_per_tok),
+                        "DeepSeek V4 padded combine expected fixed route rows send={} recv={} ep={} topk={}",
+                        total_send_routes,
+                        total_recv_routes,
+                        ep.world_size,
+                        config.num_experts_per_tok
+                    );
+                    {
+                        let (route_ptr, _route_guard) = route_out.data.device_ptr(&ctx.stream);
+                        let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+                        let (peer_ptr, _peer_guard) =
+                            scratch.route_slot_out.data.device_ptr_mut(&ctx.stream);
+                        unsafe {
+                            ffi::dsv4_sum_padded_route_outputs_by_peer_cuda(
+                                route_ptr as *const ffi::Half,
+                                meta_ptr as *const i32,
+                                peer_ptr as *mut ffi::Half,
+                                ep_world_i32,
+                                topk_i32,
+                                hidden.hidden_dim as i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 padded route peer sum failed: {err}")
+                            })?;
+                        }
+                    }
+                    comm.moe_grouped_send_recv_bf16(
+                        &scratch.route_slot_out.data,
+                        &peer_hidden_offsets,
+                        &peer_hidden_counts,
+                        &mut scratch.combine_recv.data,
+                        &peer_hidden_offsets,
+                        &peer_hidden_counts,
+                    )?;
+                }
                 Dsv4CombineExchangeMode::Bf16 => {
                     comm.moe_grouped_send_recv_bf16(
                         &route_out.data,
@@ -2481,15 +2566,58 @@ impl DeepseekV4MoeBlock {
                 hidden.seq_len,
                 combine_exchange_trace,
             )?;
-            run_combine_kernel(
-                &scratch.combine_recv,
-                Some(&mut scratch.route_slot_out),
-                &mut out,
-            )?;
+            if use_padded_bf16_combine {
+                run_padded_peer_combine_kernel(&scratch.combine_recv, &mut out)?;
+            } else {
+                run_combine_kernel(
+                    &scratch.combine_recv,
+                    Some(&mut scratch.route_slot_out),
+                    &mut out,
+                )?;
+            }
         } else {
-            let mut combine_recv = HiddenStates::zeros(ctx, hidden.hidden_dim, total_send_routes)?;
+            let mut combine_recv = HiddenStates::zeros(
+                ctx,
+                hidden.hidden_dim,
+                if use_padded_bf16_combine {
+                    ep.world_size
+                } else {
+                    total_send_routes
+                },
+            )?;
             let combine_exchange_trace = dsv4_moe_trace_begin(ctx)?;
             match combine_mode {
+                Dsv4CombineExchangeMode::Bf16 if use_padded_bf16_combine => {
+                    let mut peer_send = HiddenStates::zeros(ctx, hidden.hidden_dim, ep.world_size)?;
+                    {
+                        let (route_ptr, _route_guard) = route_out.data.device_ptr(&ctx.stream);
+                        let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+                        let (peer_ptr, _peer_guard) = peer_send.data.device_ptr_mut(&ctx.stream);
+                        unsafe {
+                            ffi::dsv4_sum_padded_route_outputs_by_peer_cuda(
+                                route_ptr as *const ffi::Half,
+                                meta_ptr as *const i32,
+                                peer_ptr as *mut ffi::Half,
+                                ep_world_i32,
+                                topk_i32,
+                                hidden.hidden_dim as i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 padded route peer sum failed: {err}")
+                            })?;
+                        }
+                    }
+                    comm.moe_grouped_send_recv_bf16(
+                        &peer_send.data,
+                        &peer_hidden_offsets,
+                        &peer_hidden_counts,
+                        &mut combine_recv.data,
+                        &peer_hidden_offsets,
+                        &peer_hidden_counts,
+                    )?;
+                }
                 Dsv4CombineExchangeMode::Bf16 => {
                     comm.moe_grouped_send_recv_bf16(
                         &route_out.data,
@@ -2554,7 +2682,11 @@ impl DeepseekV4MoeBlock {
                 hidden.seq_len,
                 combine_exchange_trace,
             )?;
-            run_combine_kernel(&combine_recv, None, &mut out)?;
+            if use_padded_bf16_combine {
+                run_padded_peer_combine_kernel(&combine_recv, &mut out)?;
+            } else {
+                run_combine_kernel(&combine_recv, None, &mut out)?;
+            }
         }
         dsv4_moe_trace_end(ctx, "ffn_deepep_combine", layer_idx, hidden.seq_len, trace)?;
         if let Some(cache) = moe_scratch.as_deref_mut() {

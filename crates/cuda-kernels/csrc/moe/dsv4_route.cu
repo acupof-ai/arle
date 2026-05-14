@@ -778,6 +778,78 @@ extern "C" CUresult dsv4_combine_route_outputs_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_sum_padded_route_outputs_by_peer_kernel(
+    const uint16_t *__restrict__ route_out,
+    const int32_t *__restrict__ recv_meta,
+    uint16_t *__restrict__ peer_out,
+    int ep_world_size,
+    int topk,
+    int hidden_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = ep_world_size * hidden_dim;
+  if (idx >= total) return;
+  int peer = idx / hidden_dim;
+  int col = idx - peer * hidden_dim;
+  int route_base = peer * topk;
+  float sum = 0.0f;
+  for (int k = 0; k < topk; ++k) {
+    int route = route_base + k;
+    if (recv_meta[route * 3 + 1] >= 0) {
+      sum += dsv4_route_bf16_to_f32(route_out[route * hidden_dim + col]);
+    }
+  }
+  peer_out[idx] = dsv4_route_f32_to_bf16_bits(sum);
+}
+
+extern "C" CUresult dsv4_sum_padded_route_outputs_by_peer_cuda(
+    const uint16_t *route_out,
+    const int32_t *recv_meta,
+    uint16_t *peer_out,
+    int ep_world_size,
+    int topk,
+    int hidden_dim,
+    CUstream stream) {
+  if (ep_world_size < 0 || topk <= 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = ep_world_size * hidden_dim;
+  if (total == 0) return CUDA_SUCCESS;
+  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_sum_padded_route_outputs_by_peer_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      route_out, recv_meta, peer_out, ep_world_size, topk, hidden_dim);
+  return (CUresult)cudaGetLastError();
+}
+
+__global__ void dsv4_sum_bf16_rows_kernel(
+    const uint16_t *__restrict__ rows,
+    uint16_t *__restrict__ out,
+    int num_rows,
+    int hidden_dim) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= hidden_dim) return;
+  float sum = 0.0f;
+  for (int row = 0; row < num_rows; ++row) {
+    sum += dsv4_route_bf16_to_f32(rows[row * hidden_dim + col]);
+  }
+  out[col] = dsv4_route_f32_to_bf16_bits(sum);
+}
+
+extern "C" CUresult dsv4_sum_bf16_rows_cuda(
+    const uint16_t *rows,
+    uint16_t *out,
+    int num_rows,
+    int hidden_dim,
+    CUstream stream) {
+  if (num_rows < 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (num_rows == 0) return CUDA_SUCCESS;
+  int grid = (hidden_dim + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_sum_bf16_rows_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      rows, out, num_rows, hidden_dim);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_add_local_expert_kernel(
     const uint16_t *__restrict__ expert_out,
     uint16_t *__restrict__ routed_out,
