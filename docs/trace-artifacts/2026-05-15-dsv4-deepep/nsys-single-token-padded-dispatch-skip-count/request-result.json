@@ -1,0 +1,22 @@
+{
+  "warmup": {
+    "status": 200,
+    "elapsed_s": 0.4093306064605713,
+    "text": "霓彩",
+    "chunks": 5
+  },
+  "profiled": {
+    "status": 200,
+    "elapsed_s": 1.2253217697143555,
+    "text": "霓彩",
+    "chunks": 5
+  },
+  "pid": 779230,
+  "prompt": "用两个字形容彩虹。",
+  "payload": {
+    "model": "/root/DeepSeek-V4-Flash",
+    "temperature": 0,
+    "max_tokens": 2,
+    "stream": true
+  }
+}

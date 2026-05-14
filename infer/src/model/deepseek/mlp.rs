@@ -657,6 +657,18 @@ fn dsv4_count_exchange_mode() -> Result<Dsv4CountExchangeMode> {
 }
 
 #[cfg(feature = "cuda")]
+fn dsv4_padded_dispatch_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_PADDED_DISPATCH").ok() else {
+        return Ok(true);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
+        other => bail!("invalid ARLE_DSV4_PADDED_DISPATCH value `{other}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Dsv4CombineExchangeMode {
     Bf16,
@@ -1459,6 +1471,20 @@ impl DeepseekV4MoeBlock {
         );
 
         let has_moe_scratch = moe_scratch.is_some();
+        let count_exchange_mode = dsv4_count_exchange_mode()?;
+        let use_padded_dispatch = hidden.seq_len == 1
+            && matches!(count_exchange_mode, Dsv4CountExchangeMode::AllGather)
+            && dsv4_padded_dispatch_enabled()?;
+        let send_route_capacity = if use_padded_dispatch {
+            ep.world_size.saturating_mul(config.num_experts_per_tok)
+        } else {
+            hidden.seq_len.saturating_mul(config.num_experts_per_tok)
+        };
+        let dispatch_capacity_tokens = if use_padded_dispatch {
+            ep.world_size
+        } else {
+            hidden.seq_len
+        };
         let use_decode_route_scratch = has_moe_scratch && hidden.seq_len == 1;
         let mut route_logits_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
             cache.route_logits.take()
@@ -1545,7 +1571,7 @@ impl DeepseekV4MoeBlock {
             Some(cache.ensure_dispatch_scratch(
                 ctx,
                 hidden.hidden_dim,
-                hidden.seq_len,
+                dispatch_capacity_tokens,
                 config.num_experts_per_tok,
                 ep.world_size,
                 ep.experts_per_rank,
@@ -1587,7 +1613,7 @@ impl DeepseekV4MoeBlock {
             ctx.stream
                 .memcpy_htod(token_ids, &mut dispatch.token_ids)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
-            dispatch.send_hidden.seq_len = hidden.seq_len * config.num_experts_per_tok;
+            dispatch.send_hidden.seq_len = send_route_capacity;
             (
                 &dispatch.token_ids,
                 &mut dispatch.route_indices,
@@ -1632,14 +1658,10 @@ impl DeepseekV4MoeBlock {
                 .map_err(|err| {
                     anyhow::anyhow!("DeepSeek V4 rank route cursor alloc failed: {err}")
                 })?;
-            send_hidden_owned = HiddenStates::zeros(
-                ctx,
-                hidden.hidden_dim,
-                hidden.seq_len * config.num_experts_per_tok,
-            )?;
+            send_hidden_owned = HiddenStates::zeros(ctx, hidden.hidden_dim, send_route_capacity)?;
             send_meta_owned = ctx
                 .stream
-                .alloc_zeros::<i32>(hidden.seq_len * config.num_experts_per_tok * 3)
+                .alloc_zeros::<i32>(send_route_capacity * 3)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 send meta alloc failed: {err}"))?;
             all_rank_counts_owned = ctx
                 .stream
@@ -1769,14 +1791,13 @@ impl DeepseekV4MoeBlock {
             trace,
         )?;
 
-        let count_exchange_mode = dsv4_count_exchange_mode()?;
         let trace = dsv4_moe_trace_begin(ctx)?;
         let experts_per_rank_i32 = i32::try_from(ep.experts_per_rank)
             .map_err(|_| anyhow::anyhow!("DeepSeek V4 experts_per_rank overflows i32"))?;
         let ep_world_i32 = i32::try_from(ep.world_size)
             .map_err(|_| anyhow::anyhow!("DeepSeek V4 ep_world_size overflows i32"))?;
-        dsv4_zero_i32_slice(ctx, send_rank_counts, ep.world_size)?;
-        {
+        if !use_padded_dispatch {
+            dsv4_zero_i32_slice(ctx, send_rank_counts, ep.world_size)?;
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
             let (count_ptr, _count_guard) = send_rank_counts.device_ptr_mut(&ctx.stream);
             unsafe {
@@ -1794,7 +1815,13 @@ impl DeepseekV4MoeBlock {
             }
         }
         let mut precomputed_recv_rank_counts_host = None;
+        let topk_i32 = i32::try_from(config.num_experts_per_tok)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 top-k overflows i32"))?;
         let send_rank_counts_host = match count_exchange_mode {
+            _ if use_padded_dispatch => {
+                precomputed_recv_rank_counts_host = Some(vec![topk_i32; ep.world_size]);
+                vec![topk_i32; ep.world_size]
+            }
             Dsv4CountExchangeMode::AllGather => {
                 comm.moe_all_gather_i32(send_rank_counts, ep.world_size, all_rank_counts)?;
                 let all_counts_host = ctx.stream.clone_dtoh(all_rank_counts).map_err(|err| {
@@ -1833,7 +1860,6 @@ impl DeepseekV4MoeBlock {
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route offsets H2D failed: {err}"))?;
         dsv4_zero_i32_slice(ctx, rank_cursors, ep.world_size)?;
         send_hidden.seq_len = total_send_routes;
-        let send_route_capacity = hidden.seq_len * config.num_experts_per_tok;
         let send_route_scratch = if send_route_scratch_slot.is_some() || has_moe_scratch {
             Some(ensure_send_route_scratch(
                 &mut send_route_scratch_slot,
@@ -1869,6 +1895,24 @@ impl DeepseekV4MoeBlock {
                     .expect("DeepSeek V4 send route-slot fallback allocated"),
             )
         };
+        if use_padded_dispatch {
+            let total_send_routes_i32 =
+                dsv4_usize_to_i32(total_send_routes, "padded dispatch route count")?;
+            let (token_ptr, _token_guard) = send_token.device_ptr_mut(&ctx.stream);
+            let (route_slot_ptr, _route_slot_guard) = send_route_slot.device_ptr_mut(&ctx.stream);
+            let (meta_ptr, _meta_guard) = send_meta.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_init_padded_route_slots_cuda(
+                    token_ptr as *mut i32,
+                    route_slot_ptr as *mut i32,
+                    meta_ptr as *mut i32,
+                    total_send_routes_i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 padded route init failed: {err}"))?;
+            }
+        }
         {
             let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
@@ -2063,12 +2107,14 @@ impl DeepseekV4MoeBlock {
                     anyhow::anyhow!("DeepSeek V4 recv local offsets H2D failed: {err}")
                 })?;
             dsv4_zero_i32_slice(ctx, local_cursors, ep.experts_per_rank)?;
-            ensure!(
-                total_local_routes == total_recv_routes,
-                "DeepSeek V4 DeepEP received {} routes but only {} target this rank",
-                total_recv_routes,
-                total_local_routes
-            );
+            if !use_padded_dispatch {
+                ensure!(
+                    total_local_routes == total_recv_routes,
+                    "DeepSeek V4 DeepEP received {} routes but only {} target this rank",
+                    total_recv_routes,
+                    total_local_routes
+                );
+            }
             let mut expert_hidden_owned: Option<HiddenStates>;
             let mut expert_weight_owned: Option<CudaSlice<f32>>;
             let mut expert_route_slot_owned: Option<CudaSlice<i32>>;

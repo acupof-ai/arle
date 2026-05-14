@@ -36,3 +36,14 @@ Current trace set:
   matrix. The same `霓虹` output now measures a 129.768 ms decode wave, and
   decode-only D2H calls drop from 887 to 543. The remaining count readback is
   the 256-byte all-rank matrix.
+- [`nsys-single-token-padded-dispatch/`](nsys-single-token-padded-dispatch/)
+  records the first fixed-top-k padded dispatch experiment. It removes the
+  256-byte all-rank matrix readback but still runs the now-unused send-count
+  kernel, so decode regresses to 136.908 ms. This is kept as a negative trace.
+- [`nsys-single-token-padded-dispatch-skip-count/`](nsys-single-token-padded-dispatch-skip-count/)
+  is the shipped B=1 decode path: fixed `ep_world * topk` padded dispatch plus
+  skipping the unused send-rank zero/count kernel. The `霓彩` streaming output
+  is normal, the decode wave drops to 123.955 ms, and decode-only D2H calls
+  fall from 543 to 344 by deleting the 256-byte all-rank count readback. The
+  remaining slow stack is NCCL SendRecv/AllReduce, launch/runtime churn,
+  allocator/memset/free overhead, the local-count D2H, and FP8/FP4 expert GEMV.

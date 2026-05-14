@@ -66,6 +66,12 @@ Related governance docs:
   one-token decode shape is now 158.439 ms wall. The remaining ranked costs are
   async allocation/free, launch/memset churn, D2H route readbacks, NCCL
   SendRecv/AllReduce, and local expert FP8/FP4 GEMV.
+- Added 2026-05-15 DSv4 padded-dispatch Nsight records under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/).
+  The negative first trace (`nsys-single-token-padded-dispatch`) shows that
+  padding without removing the dead send-count kernel regresses to 136.908 ms;
+  the fixed trace (`nsys-single-token-padded-dispatch-skip-count`) validates the
+  shipped B=1 decode path at 123.955 ms and records the remaining ranked costs.
 
 ### CUDA
 
@@ -168,6 +174,17 @@ Related governance docs:
   from 887 to 543. The remaining D2H cost is the 256-byte all-rank count matrix
   readback, ahead of deeper device-side count-prefix or countless dispatch
   work.
+- Added the default DSv4 B=1 padded dispatch fast path for DeepEP decode. When
+  the count exchange mode is the default AllGather route, decode now uses fixed
+  `ep_world * topk` route slots, initializes unused slots as invalid, skips the
+  unused send-rank zero/count kernel, and avoids the count AllGather plus its
+  256-byte all-rank D2H readback. Set `ARLE_DSV4_PADDED_DISPATCH=0` to force
+  exact-count dispatch. Real 8xH20 nsys kept the `霓彩` streaming output, moved
+  the single-token decode wave from 129.768 ms to 123.955 ms, removed
+  `ncclDevKernel_AllGather` from the decode window, and reduced decode-only D2H
+  calls from 543 to 344. The remaining slow stack is NCCL SendRecv/AllReduce,
+  launch/runtime and allocator/memset/free churn, local-count D2H, and local
+  expert FP8/FP4 GEMV.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

@@ -467,6 +467,37 @@ extern "C" CUresult dsv4_pack_expert_ranks_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_init_padded_route_slots_kernel(
+    int32_t *__restrict__ packed_token,
+    int32_t *__restrict__ packed_route_slot,
+    int32_t *__restrict__ packed_meta,
+    int total_routes) {
+  int route = blockIdx.x * blockDim.x + threadIdx.x;
+  if (route >= total_routes) return;
+  packed_token[route] = -1;
+  packed_route_slot[route] = -1;
+  int meta_base = route * 3;
+  packed_meta[meta_base] = -1;
+  packed_meta[meta_base + 1] = -1;
+  packed_meta[meta_base + 2] = 0;
+}
+
+extern "C" CUresult dsv4_init_padded_route_slots_cuda(
+    int32_t *packed_token,
+    int32_t *packed_route_slot,
+    int32_t *packed_meta,
+    int total_routes,
+    CUstream stream) {
+  if (total_routes < 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (total_routes == 0) return CUDA_SUCCESS;
+  int grid = (total_routes + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_init_padded_route_slots_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      packed_token, packed_route_slot, packed_meta, total_routes);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_count_packed_local_experts_kernel(
     const int32_t *__restrict__ packed_meta,
     int32_t *__restrict__ counts,

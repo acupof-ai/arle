@@ -108,6 +108,14 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_init_padded_route_slots_cuda(
+        packed_token: *mut i32,
+        packed_route_slot: *mut i32,
+        packed_meta: *mut i32,
+        total_routes: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_count_packed_local_experts_cuda(
         packed_meta: *const i32,
         counts: *mut i32,
