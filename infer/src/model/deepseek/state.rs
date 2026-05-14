@@ -16,7 +16,7 @@ use crate::model::generation_state::GenerationStateBase;
 #[cfg(feature = "cuda")]
 use crate::model::kv_cache::KVCacheDtype;
 #[cfg(feature = "cuda")]
-use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
@@ -68,6 +68,67 @@ impl DeepseekIncrementalState {
 #[derive(Default)]
 pub(crate) struct DeepseekLayerRuntimeCache {
     pub(crate) attention: DeepseekAttentionRuntimeCache,
+    pub(crate) moe: DeepseekMoeRuntimeCache,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(crate) struct DeepseekMoeRuntimeCache {
+    pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekExpertRuntimeScratch {
+    pub(crate) capacity_tokens: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) intermediate_dim: usize,
+    pub(crate) output_dim: usize,
+    pub(crate) input: HiddenStates,
+    pub(crate) gate: HiddenStates,
+    pub(crate) up: HiddenStates,
+    pub(crate) act: HiddenStates,
+    pub(crate) out: HiddenStates,
+}
+
+#[cfg(feature = "cuda")]
+impl DeepseekMoeRuntimeCache {
+    pub(crate) fn ensure_expert_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        output_dim: usize,
+        capacity_tokens: usize,
+    ) -> Result<&mut DeepseekExpertRuntimeScratch> {
+        let capacity_tokens = capacity_tokens.max(1);
+        let needs_alloc = self
+            .expert
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_tokens < capacity_tokens
+                    || scratch.hidden_dim != hidden_dim
+                    || scratch.intermediate_dim != intermediate_dim
+                    || scratch.output_dim != output_dim
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            self.expert = Some(DeepseekExpertRuntimeScratch {
+                capacity_tokens,
+                hidden_dim,
+                intermediate_dim,
+                output_dim,
+                input: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
+                gate: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
+                up: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
+                act: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
+                out: HiddenStates::zeros(ctx, output_dim, capacity_tokens)?,
+            });
+        }
+        Ok(self
+            .expert
+            .as_mut()
+            .expect("DeepSeek V4 expert scratch allocated"))
+    }
 }
 
 #[cfg(feature = "cuda")]

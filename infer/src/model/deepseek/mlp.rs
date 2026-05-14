@@ -21,6 +21,8 @@ use log::info;
 use std::time::Instant;
 
 #[cfg(feature = "cuda")]
+use super::state::{DeepseekExpertRuntimeScratch, DeepseekMoeRuntimeCache};
+#[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
 #[cfg(test)]
 use crate::distributed::expert_state::{ExpertRoute, ExpertRoutingWeights, LocalExpertRouting};
@@ -76,6 +78,58 @@ impl DeepseekV4Expert {
         let mut out = HiddenStates::zeros(ctx, self.w2.rows, hidden.seq_len)?;
         ops::try_gemm_with_phase_into(ctx, &self.w2, &act, &mut out, phase)?;
         Ok(out)
+    }
+
+    pub(super) fn forward_scratch_input<'a>(
+        &self,
+        ctx: &DeviceContext,
+        swiglu_limit: f32,
+        scratch: &'a mut DeepseekExpertRuntimeScratch,
+    ) -> Result<&'a HiddenStates> {
+        let seq_len = scratch.input.seq_len;
+        ensure!(
+            self.w1.cols == scratch.input.hidden_dim && self.w3.cols == scratch.input.hidden_dim,
+            "DeepSeek V4 expert input width mismatch: hidden_dim={} w1.cols={} w3.cols={}",
+            scratch.input.hidden_dim,
+            self.w1.cols,
+            self.w3.cols
+        );
+        ensure!(
+            self.w1.rows == self.w3.rows && self.w2.cols == self.w1.rows,
+            "DeepSeek V4 expert intermediate mismatch: w1.rows={} w3.rows={} w2.cols={}",
+            self.w1.rows,
+            self.w3.rows,
+            self.w2.cols
+        );
+        ensure!(
+            scratch.capacity_tokens >= seq_len
+                && scratch.hidden_dim == scratch.input.hidden_dim
+                && scratch.intermediate_dim == self.w1.rows
+                && scratch.output_dim == self.w2.rows,
+            "DeepSeek V4 expert scratch shape mismatch"
+        );
+
+        scratch.gate.seq_len = seq_len;
+        scratch.up.seq_len = seq_len;
+        scratch.act.seq_len = seq_len;
+        scratch.out.seq_len = seq_len;
+
+        let phase = if seq_len > 1 {
+            ops::LinearDispatchPhase::Prefill
+        } else {
+            ops::LinearDispatchPhase::Decode
+        };
+        ops::try_gemm_with_phase_into(ctx, &self.w1, &scratch.input, &mut scratch.gate, phase)?;
+        ops::try_gemm_with_phase_into(ctx, &self.w3, &scratch.input, &mut scratch.up, phase)?;
+        ops::dsv4_swiglu_clamped_batch_into(
+            ctx,
+            &scratch.gate,
+            &scratch.up,
+            &mut scratch.act,
+            swiglu_limit,
+        )?;
+        ops::try_gemm_with_phase_into(ctx, &self.w2, &scratch.act, &mut scratch.out, phase)?;
+        Ok(&scratch.out)
     }
 }
 
@@ -521,6 +575,7 @@ impl DeepseekV4MoeBlock {
         ep: &ExpertGroup,
         hidden: &HiddenStates,
         token_ids: &[u32],
+        mut moe_scratch: Option<&mut DeepseekMoeRuntimeCache>,
     ) -> Result<HiddenStates> {
         ensure!(
             ep.world_size > 1,
@@ -858,6 +913,18 @@ impl DeepseekV4MoeBlock {
                 dsv4_counts_to_offsets_i32(&local_counts_host, "recv_local_counts")?;
             let local_offsets = dsv4_offsets_to_usize(&local_offsets_i32)?;
             let local_counts_usize = dsv4_counts_to_usize(&local_counts_host, "recv_local_counts")?;
+            let max_local_routes = local_counts_usize.iter().copied().max().unwrap_or(0);
+            if let (Some(scratch), Some(expert)) =
+                (moe_scratch.as_deref_mut(), self.experts.first())
+            {
+                scratch.ensure_expert_scratch(
+                    ctx,
+                    hidden.hidden_dim,
+                    expert.w1.rows,
+                    expert.w2.rows,
+                    max_local_routes,
+                )?;
+            }
             let local_offsets_gpu = ctx.stream.clone_htod(&local_offsets_i32).map_err(|err| {
                 anyhow::anyhow!("DeepSeek V4 recv local offsets H2D failed: {err}")
             })?;
@@ -929,16 +996,38 @@ impl DeepseekV4MoeBlock {
                 let offset = local_offsets[local_expert_idx];
                 let elem_start = offset * hidden.hidden_dim;
                 let elem_end = elem_start + count * hidden.hidden_dim;
-                let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;
-                {
+                let expert_out_ref;
+                let expert_out_owned;
+                let expert_out = if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
+                    let scratch = scratch_cache.ensure_expert_scratch(
+                        ctx,
+                        hidden.hidden_dim,
+                        expert.w1.rows,
+                        expert.w2.rows,
+                        count,
+                    )?;
+                    scratch.input.seq_len = count;
                     let src = expert_hidden.data.slice(elem_start..elem_end);
-                    ctx.stream
-                        .memcpy_dtod(&src, &mut expert_input.data)
-                        .map_err(|err| {
-                            anyhow::anyhow!("DeepSeek V4 recv expert input D2D failed: {err}")
-                        })?;
-                }
-                let expert_out = expert.forward(ctx, &expert_input, config.swiglu_limit)?;
+                    let mut dst = scratch.input.data.slice_mut(0..count * hidden.hidden_dim);
+                    ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 recv expert input scratch D2D failed: {err}")
+                    })?;
+                    expert_out_ref =
+                        expert.forward_scratch_input(ctx, config.swiglu_limit, scratch)?;
+                    expert_out_ref
+                } else {
+                    let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;
+                    {
+                        let src = expert_hidden.data.slice(elem_start..elem_end);
+                        ctx.stream
+                            .memcpy_dtod(&src, &mut expert_input.data)
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 recv expert input D2D failed: {err}")
+                            })?;
+                    }
+                    expert_out_owned = expert.forward(ctx, &expert_input, config.swiglu_limit)?;
+                    &expert_out_owned
+                };
                 let (expert_ptr, _expert_guard) = expert_out.data.device_ptr(&ctx.stream);
                 let (route_out_ptr, _route_guard) = route_out.data.device_ptr_mut(&ctx.stream);
                 let (route_slot_ptr, _route_slot_guard) = expert_route_slot.device_ptr(&ctx.stream);

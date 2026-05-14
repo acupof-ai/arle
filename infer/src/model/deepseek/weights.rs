@@ -647,7 +647,12 @@ impl DeepseekModel {
         )?;
         dsv4_trace_end(&self.ctx, "attn_post", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let stream = self.forward_ffn_layer_stream(layer_idx, &stream, tokens)?;
+        let stream = self.forward_ffn_layer_stream_with_scratch(
+            layer_idx,
+            &stream,
+            tokens,
+            Some(&mut cache.moe),
+        )?;
         dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, stream.seq_len, trace)?;
         Ok(stream)
     }
@@ -1752,6 +1757,16 @@ impl DeepseekModel {
         stream: &HiddenStates,
         tokens: &[u32],
     ) -> Result<HiddenStates> {
+        self.forward_ffn_layer_stream_with_scratch(layer_idx, stream, tokens, None)
+    }
+
+    fn forward_ffn_layer_stream_with_scratch(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        tokens: &[u32],
+        moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
+    ) -> Result<HiddenStates> {
         ensure!(
             tokens.len() == stream.seq_len,
             "DeepSeek V4 FFN layer token count {} does not match stream seq_len {}",
@@ -1812,6 +1827,7 @@ impl DeepseekModel {
                     &self.config.ep,
                     &normed,
                     tokens,
+                    moe_scratch,
                 )?;
                 dsv4_trace_end(
                     &self.ctx,
