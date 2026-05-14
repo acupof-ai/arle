@@ -191,14 +191,34 @@ fn load_dsv4_marlin_w4_matrix_if_available(
                     "DeepSeek V4 Marlin hybrid decode side tensor rejected for {name}; \
                  falling back to W4A8 side tensors: {err:#}"
                 );
-                load_tensor_2d_maybe_quantized_with_config(
+                match load_tensor_2d_maybe_quantized_with_config(
                     ctx,
                     shards,
                     weight_map,
                     name,
                     dsv4_marlin_w4_quant_config(Dsv4MarlinW4Layout::W4A8),
-                )
-                .with_context(|| format!("loading DeepSeek V4 W4A8 fallback matrix {name}"))?
+                ) {
+                    Ok(matrix) => matrix,
+                    Err(fallback_err) if is_dsv4_marlin_shape_rejection(&fallback_err) => {
+                        log::warn!(
+                            "DeepSeek V4 W4A8 side tensor rejected for {name}; \
+                             falling back to raw block-scaled tensor: {fallback_err:#}"
+                        );
+                        return Ok(None);
+                    }
+                    Err(fallback_err) => {
+                        return Err(fallback_err).with_context(|| {
+                            format!("loading DeepSeek V4 W4A8 fallback matrix {name}")
+                        });
+                    }
+                }
+            }
+            Err(err) if requested.is_none() && is_dsv4_marlin_shape_rejection(&err) => {
+                log::warn!(
+                    "DeepSeek V4 Marlin side tensor rejected for {name}; \
+                     falling back to raw block-scaled tensor: {err:#}"
+                );
+                return Ok(None);
             }
             Err(err) => {
                 return Err(err)
@@ -206,6 +226,13 @@ fn load_dsv4_marlin_w4_matrix_if_available(
             }
         };
     Ok(Some(matrix))
+}
+
+fn is_dsv4_marlin_shape_rejection(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("Hybrid W4A16 Marlin packed bytes")
+        || text.contains("Hybrid W4A8 packed bytes")
+        || text.contains("MarlinW4A8 packed bytes")
 }
 
 fn dsv4_marlin_w4_quant_config(layout: Dsv4MarlinW4Layout) -> QuantLoadConfig {
@@ -233,9 +260,10 @@ fn dsv4_marlin_w4_layout(
     weight_map: &HashMap<String, usize>,
     name: &str,
 ) -> Option<Dsv4MarlinW4Layout> {
-    let w4a8_qweight = name.replace(".weight", ".marlin_w4a8_qweight");
-    let w4a8_s_channel = name.replace(".weight", ".marlin_w4a8_s_channel");
-    let w4a8_s_group = name.replace(".weight", ".marlin_w4a8_s_group");
+    let prefix = name.strip_suffix(".weight")?;
+    let w4a8_qweight = format!("{prefix}.marlin_w4a8_qweight");
+    let w4a8_s_channel = format!("{prefix}.marlin_w4a8_s_channel");
+    let w4a8_s_group = format!("{prefix}.marlin_w4a8_s_group");
     let has_w4a8 = weight_map.contains_key(&w4a8_qweight)
         && weight_map.contains_key(&w4a8_s_channel)
         && weight_map.contains_key(&w4a8_s_group);
@@ -243,8 +271,8 @@ fn dsv4_marlin_w4_layout(
         return None;
     }
 
-    let w4a16_qweight = name.replace(".weight", ".marlin_qweight");
-    let w4a16_scales = name.replace(".weight", ".marlin_scales");
+    let w4a16_qweight = format!("{prefix}.marlin_qweight");
+    let w4a16_scales = format!("{prefix}.marlin_scales");
     if weight_map.contains_key(&w4a16_qweight) && weight_map.contains_key(&w4a16_scales) {
         Some(Dsv4MarlinW4Layout::Hybrid)
     } else {
@@ -736,6 +764,13 @@ mod tests {
         ]);
 
         assert_eq!(dsv4_marlin_w4_layout(&map, "e.weight"), None);
+    }
+
+    #[test]
+    fn ignores_non_weight_tensor_names_for_marlin_auto_detect() {
+        let map = HashMap::from([("hc_head_fn".to_string(), 0)]);
+
+        assert_eq!(dsv4_marlin_w4_layout(&map, "hc_head_fn"), None);
     }
 
     #[test]
