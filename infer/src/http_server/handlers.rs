@@ -14,7 +14,7 @@ use axum::extract::rejection::{BytesRejection, JsonRejection};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method, header};
 use axum::middleware;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use chat::{
     DeepSeekV4ChatTemplateOptions, openai_messages_to_deepseek_v4_prompt,
@@ -117,6 +117,12 @@ fn http_request_span(
 /// Returns the terminal `[DONE]` SSE event that ends every streaming response.
 fn sse_done_stream() -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
     stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) })
+}
+
+fn sse_keep_alive() -> KeepAlive {
+    KeepAlive::new()
+        .interval(std::time::Duration::from_secs(15))
+        .text("arle-keepalive")
 }
 
 fn non_streaming_timeout_error(request_kind: &str) -> ApiError {
@@ -675,7 +681,9 @@ pub(super) async fn completions(
                 ))
             });
 
-            Ok(Sse::new(sse_stream.chain(sse_done_stream())).into_response())
+            Ok(Sse::new(sse_stream.chain(sse_done_stream()))
+                .keep_alive(sse_keep_alive())
+                .into_response())
         } else {
             let (buffered, finish_parent) = submit_and_collect_buffered_response(
                 state.as_ref(),
@@ -775,7 +783,9 @@ pub(super) async fn chat_completions(
                 .chain(content_stream)
                 .chain(sse_done_stream());
 
-            Ok(Sse::new(full_stream).into_response())
+            Ok(Sse::new(full_stream)
+                .keep_alive(sse_keep_alive())
+                .into_response())
         } else {
             let (buffered, finish_parent) = submit_and_collect_buffered_response(
                 state.as_ref(),
@@ -868,7 +878,9 @@ pub(super) async fn responses_handler(
             let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
             let created_at = now_secs();
             let stream = responses_sse_stream(delta_rx, response_id, created_at, model_id);
-            Ok(Sse::new(stream.chain(sse_done_stream())).into_response())
+            Ok(Sse::new(stream.chain(sse_done_stream()))
+                .keep_alive(sse_keep_alive())
+                .into_response())
         } else {
             let (buffered, finish_parent) = submit_and_collect_buffered_response(
                 state.as_ref(),
