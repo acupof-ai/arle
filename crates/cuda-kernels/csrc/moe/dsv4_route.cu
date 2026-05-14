@@ -549,6 +549,45 @@ extern "C" CUresult dsv4_scatter_packed_route_slot_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_scatter_all_route_slots_kernel(
+    const uint16_t *__restrict__ expert_out,
+    uint16_t *__restrict__ route_out,
+    const int32_t *__restrict__ expert_route_slot,
+    const float *__restrict__ expert_weight,
+    int num_routes,
+    int hidden_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_routes * hidden_dim;
+  if (idx >= total) return;
+  int route = idx / hidden_dim;
+  int col = idx - route * hidden_dim;
+  int route_slot = expert_route_slot[route];
+  float weight = expert_weight[route];
+  float value = dsv4_route_bf16_to_f32(expert_out[idx]);
+  route_out[route_slot * hidden_dim + col] =
+      dsv4_route_f32_to_bf16_bits(weight * value);
+}
+
+extern "C" CUresult dsv4_scatter_all_route_slots_cuda(
+    const uint16_t *expert_out,
+    uint16_t *route_out,
+    const int32_t *expert_route_slot,
+    const float *expert_weight,
+    int num_routes,
+    int hidden_dim,
+    CUstream stream) {
+  if (num_routes < 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = num_routes * hidden_dim;
+  if (total == 0) return CUDA_SUCCESS;
+  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_scatter_all_route_slots_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      expert_out, route_out, expert_route_slot, expert_weight, num_routes,
+      hidden_dim);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_combine_route_outputs_kernel(
     const uint16_t *__restrict__ route_out,
     const int32_t *__restrict__ packed_token,

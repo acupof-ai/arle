@@ -75,6 +75,7 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 #[derive(Default)]
 pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
+    pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
 }
 
 #[cfg(feature = "cuda")]
@@ -84,6 +85,17 @@ pub(crate) struct DeepseekExpertRuntimeScratch {
     pub(crate) intermediate_dim: usize,
     pub(crate) output_dim: usize,
     pub(crate) input: HiddenStates,
+    pub(crate) gate: HiddenStates,
+    pub(crate) up: HiddenStates,
+    pub(crate) act: HiddenStates,
+    pub(crate) out: HiddenStates,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekGroupedExpertRuntimeScratch {
+    pub(crate) capacity_routes: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) intermediate_dim: usize,
     pub(crate) gate: HiddenStates,
     pub(crate) up: HiddenStates,
     pub(crate) act: HiddenStates,
@@ -128,6 +140,40 @@ impl DeepseekMoeRuntimeCache {
             .expert
             .as_mut()
             .expect("DeepSeek V4 expert scratch allocated"))
+    }
+
+    pub(crate) fn ensure_grouped_expert_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        capacity_routes: usize,
+    ) -> Result<&mut DeepseekGroupedExpertRuntimeScratch> {
+        let capacity_routes = capacity_routes.max(1);
+        let needs_alloc = self
+            .grouped
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_routes < capacity_routes
+                    || scratch.hidden_dim != hidden_dim
+                    || scratch.intermediate_dim != intermediate_dim
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            self.grouped = Some(DeepseekGroupedExpertRuntimeScratch {
+                capacity_routes,
+                hidden_dim,
+                intermediate_dim,
+                gate: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
+                up: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
+                act: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
+                out: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+            });
+        }
+        Ok(self
+            .grouped
+            .as_mut()
+            .expect("DeepSeek V4 grouped expert scratch allocated"))
     }
 }
 

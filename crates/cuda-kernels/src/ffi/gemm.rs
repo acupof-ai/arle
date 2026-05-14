@@ -264,6 +264,38 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_fp8_grouped_gemv_batch_cuda(
+        weight_ptrs: *const u64,
+        scale_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_fp4_grouped_gemv_batch_cuda(
+        weight_ptrs: *const u64,
+        scale_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn q6k_gemv_cuda(
         weight: *const u8,
         input: *const Half,

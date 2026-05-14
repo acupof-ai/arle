@@ -143,6 +143,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_scatter_all_route_slots_cuda(
+        expert_out: *const Half,
+        route_out: *mut Half,
+        expert_route_slot: *const i32,
+        expert_weight: *const f32,
+        num_routes: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_combine_route_outputs_cuda(
         route_out: *const Half,
         packed_token: *const i32,

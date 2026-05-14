@@ -83,6 +83,25 @@ Clean trace phase medians from the same window:
 | `ffn_total` | 2.519 ms | 2.989 ms |
 | `attn_total` | 1.187 ms | 1.687 ms |
 
+## Grouped Expert Experiment
+
+A raw grouped FP8/FP4 GEMV expert path is available behind
+`ARLE_DSV4_GROUPED_EXPERTS=1`. It packs active expert weight pointers and uses
+one grouped launch per `w1`, `w3`, and `w2`, then scatters all route slots in one
+kernel. The gate is off by default because the current raw GEMV prototype is
+slower than the scratch-reuse per-expert path on B=1 decode.
+
+| Path | `ARLE_DSV4_GROUPED_EXPERTS` | Math latency | Writing latency | `ffn_deepep_local_experts` p50 | `ffn_total` p50 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Scratch reuse baseline | unset | 1.98-2.53 s | 2.53 s | 0.464 ms | 2.519 ms |
+| Grouped raw GEMV, all local experts | `1` | 3.58 s | 4.27 s | 1.549 ms | 4.181 ms |
+| Grouped raw GEMV, active experts only | `1` | 3.40-3.48 s | 4.56 s | 1.301 ms | 4.085 ms |
+| Gated default validation | unset | 2.04-2.16 s | 2.51 s | 0.463 ms | 2.478 ms |
+
+The grouped-kernel harness is kept for the next replacement step: swap the raw
+GEMV implementation for real grouped GEMM/DeepGEMM rather than enabling the
+slower prototype.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not
