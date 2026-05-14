@@ -24,6 +24,10 @@ Current benchmark evidence:
 
 - Client output for 32 tokens: `alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau ups phi chi psi omega`
 - Client output for 64 tokens continues with deterministic low-entropy text after the Greek sequence; content is not all repeated `2`.
+- Content smoke is not single-token or repeated-token only:
+  - Math case output starts with `17 + 25 = 42.` and explains the addition.
+  - Writing case discusses GPU communication as a MoE decode latency bottleneck,
+    though the 48-token cap cuts off mid-sentence.
 - `/tmp/arle-dsv4-default-after.json`: 32-token run `4.2694s`, 64-token run `8.3799s`.
 - Current metrics after 64-token run: `infer_scheduler_step_phase_decode_microseconds=117646`.
 
