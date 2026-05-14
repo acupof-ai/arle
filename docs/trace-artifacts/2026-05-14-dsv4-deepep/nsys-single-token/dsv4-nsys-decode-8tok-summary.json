@@ -1,0 +1,133 @@
+{
+  "run": "dsv4-nsys-decode-8tok",
+  "remote_head": "8f0326a",
+  "remote_workspace_dirty": true,
+  "request": {
+    "prompt_tokens": 14,
+    "completion_tokens": 7,
+    "elapsed_s": 2.7959582805633545,
+    "ttft_ms": 959.296466,
+    "text": "静水流深云淡风清"
+  },
+  "decode_waves_ms": [
+    269.508,
+    267.15,
+    260.684,
+    257.021,
+    259.656,
+    259.565,
+    258.663
+  ],
+  "decode_wall_ms": {
+    "p50": 259.656,
+    "min": 257.021,
+    "max": 269.508
+  },
+  "per_wave_gpu_kernel_sum_ms": {
+    "range": "~80.6-102.5 per GPU, max device ~94-102ms after warmup",
+    "observation": "GPU kernels occupy only about 95-100ms of a ~258-270ms decode wave; host/API synchronization and allocation overhead fill the rest."
+  },
+  "top_decode_kernels_per_token_rank_ms": [
+    {
+      "name": "ncclDevKernel_SendRecv",
+      "ms": 28.858
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_kernel",
+      "ms": 11.474
+    },
+    {
+      "name": "dsv4_fp4_gemv_batch_tiled_kernel",
+      "ms": 10.871
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "ms": 7.934
+    },
+    {
+      "name": "dsv4_hybrid_attention_kernel",
+      "ms": 7.406
+    },
+    {
+      "name": "ncclDevKernel_AllGather_RING_LL",
+      "ms": 6.026
+    },
+    {
+      "name": "dsv4_route_kernel",
+      "ms": 5.668
+    },
+    {
+      "name": "dsv4_mhc_params_kernel",
+      "ms": 5.502
+    },
+    {
+      "name": "dsv4_csa_select_kernel",
+      "ms": 4.14
+    }
+  ],
+  "top_decode_runtime_api_per_token_rank_ms": [
+    {
+      "name": "cuStreamSynchronize",
+      "ms": 92.605
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "ms": 42.053
+    },
+    {
+      "name": "cuMemAllocAsync",
+      "ms": 20.331
+    },
+    {
+      "name": "cudaLaunchKernel",
+      "ms": 19.384
+    },
+    {
+      "name": "cuMemsetD8Async",
+      "ms": 16.968
+    },
+    {
+      "name": "cuMemcpyDtoHAsync",
+      "ms": 7.581
+    }
+  ],
+  "layer_trace_p50_ms": [
+    {
+      "phase": "ffn_total",
+      "p50": 2.881
+    },
+    {
+      "phase": "ffn_deepep_dispatch_combine",
+      "p50": 2.298
+    },
+    {
+      "phase": "attn_total",
+      "p50": 1.396
+    },
+    {
+      "phase": "attn_core",
+      "p50": 1.099
+    },
+    {
+      "phase": "ffn_deepep_combine",
+      "p50": 0.597
+    },
+    {
+      "phase": "ffn_deepep_combine_exchange",
+      "p50": 0.495
+    },
+    {
+      "phase": "ffn_deepep_local_experts",
+      "p50": 0.488
+    }
+  ],
+  "artifacts": [
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-single-token/arle-dsv4-decode-8tok.nsys-rep",
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-single-token/arle-dsv4-decode-8tok.sqlite",
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-single-token/decode-only-kernel-top.csv",
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-single-token/decode-only-runtime-api-top.csv",
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-single-token/decode-layer-phase-summary.csv",
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-single-token/request-profile-8tok.json",
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-single-token/server-8tok.log"
+  ]
+}

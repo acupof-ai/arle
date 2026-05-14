@@ -1,0 +1,44 @@
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+31.4,2319183805,8256,280908.9,46480.5,4608,5129280,553638.0,ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)
+19.0,1400368150,10461,133865.6,115617.0,101631,676033,67228.9,"dsv4_fp4_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)"
+8.7,642529733,20440,31434.9,27392.0,20672,45152,8670.4,"dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)"
+7.4,548101944,2752,199165.0,157536.0,14688,2229920,182928.5,ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)
+6.1,448697487,2624,170997.5,147200.0,56576,231968,51395.2,"dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)"
+5.2,382275801,2752,138908.4,86992.0,7488,588993,132984.3,ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)
+4.9,362400227,2752,131686.1,137983.0,46559,140096,23091.8,"dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)"
+4.8,352688870,5504,64078.6,64031.0,63328,65760,354.6,"dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)"
+4.4,325224475,2920,111378.2,110608.0,65664,195040,37897.0,"dsv4_fp8_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)"
+3.6,264452318,1344,196765.1,196272.5,184864,207360,4579.2,"dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)"
+1.0,71892385,3968,18118.0,13616.0,1664,48320,13021.6,"dsv4_compressor_update_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, int, int, int, int, int, int, int, int, int, float, int, float, int, float, float, float)"
+0.8,60030435,10528,5702.0,4832.0,4160,9664,1526.3,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+0.4,27555063,11008,2503.2,2560.0,1823,3360,385.7,"rms_norm_batched_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)"
+0.4,26064421,64,407256.6,407136.0,405503,409727,1013.1,"gemv_handwritten_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int)"
+0.2,15266879,4880,3128.5,3136.0,2144,3584,109.3,"void dot_kernel<float, (int)128, (int)0, cublasDotParams<cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<float>>>(T4)"
+0.2,12843099,5504,2333.4,1984.0,1824,4960,807.9,"dsv4_mhc_post_kernel(const unsigned short *, const unsigned short *, const float *, const float *, unsigned short *, int, int, int)"
+0.2,12471017,2752,4531.6,4480.0,4255,5568,218.0,"dsv4_pack_expert_ranks_kernel(const unsigned short *, const int *, const float *, const int *, int *, unsigned short *, int *, int *, int *, int, int, int, int, int)"
+0.2,12221219,128,95478.3,104480.0,29024,108640,25018.9,"dsv4_swa_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float)"
+0.1,9083807,6239,1456.0,1440.0,1280,2272,77.3,"dsv4_swiglu_clamped_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)"
+0.1,8976045,2752,3261.6,3232.0,2975,4512,184.3,"dsv4_prepare_q_kernel(const unsigned short *, unsigned short *, int, int, int, int, int, float, float, int, float, float, float)"
+0.1,8747833,1699,5148.8,5152.0,4385,5888,227.9,"dsv4_pack_received_experts_kernel(const unsigned short *, const int *, const int *, int *, unsigned short *, int *, float *, int *, int, int, int, int)"
+0.1,8544286,5504,1552.4,1504.0,1408,2176,126.6,"dsv4_mhc_pre_kernel(const unsigned short *, const float *, unsigned short *, int, int, int)"
+0.1,8101375,4880,1660.1,1664.0,1536,2176,33.7,"void reduce_1Block_kernel<float, (int)128, (int)7, cublasGemvTensorStridedBatched<float>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>>(const T1 *, T1, T4, int, const T1 *, T1, T5, T6, cublasPointerMode_t, cublasLtEpilogue_t, cublasGemvTensorStridedBatched<const biasType<T6::value_type, T1>::type>)"
+0.1,7326662,2752,2662.3,2656.0,2304,3872,217.4,"dsv4_prepare_k_kernel(const unsigned short *, unsigned short *, int, int, int, int, float, int, float, float, float)"
+0.1,5773847,3487,1655.8,1568.0,1472,3456,242.3,"dsv4_scatter_packed_route_slot_kernel(const unsigned short *, unsigned short *, const int *, const float *, int, int, int)"
+0.1,5312711,2408,2206.3,2208.0,2017,2529,81.4,"dsv4_combine_route_outputs_kernel(const unsigned short *, const int *, unsigned short *, int, int, int)"
+0.1,4640042,848,5471.7,5567.5,4576,7360,490.1,void cutlass::Kernel<cutlass_80_tensorop_s16816gemm_bf16_64x64_32x6_tn_align8>(T1::Params)
+0.1,4046778,336,12044.0,11808.0,11072,14432,921.8,void cutlass::Kernel<cutlass_80_tensorop_s16816gemm_bf16_64x64_64x4_tn_align8>(T1::Params)
+0.1,3861222,688,5612.2,5568.0,5376,7904,228.3,void cutlass::Kernel<cutlass_80_tensorop_bf16_s16816gemm_bf16_64x64_64x6_tn_align8>(T1::Params)
+0.1,3765514,2752,1368.3,1345.0,1055,1856,153.5,"dsv4_count_expert_ranks_kernel(const int *, int *, int, int, int, int)"
+0.0,3550464,2752,1290.1,1311.0,1055,1824,103.5,"add_native_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int)"
+0.0,3194799,2752,1160.9,1184.0,928,1376,100.1,"dsv4_update_window_cache_kernel(const unsigned short *, unsigned short *, int, int, int, int)"
+0.0,2925112,1504,1944.9,1952.0,1727,2432,128.1,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T5 *, T5 *, const T6 *, const T6 *, const T7 *, const T4 *, T7 *, void *, long, T6 *, int *)"
+0.0,2333830,1699,1373.6,1376.0,1055,2016,170.7,"dsv4_count_packed_local_experts_kernel(const int *, int *, int, int, int)"
+0.0,2312452,320,7226.4,7136.0,6752,8129,297.9,void cutlass::Kernel<cutlass_80_tensorop_s16816gemm_bf16_64x64_32x10_tn_align8>(T1::Params)
+0.0,2196506,688,3192.6,3199.0,2880,3520,133.8,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, __nv_bfloat16, __nv_bfloat16, float, __nv_bfloat16, (bool)1, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T5 *, T5 *, const T6 *, const T6 *, const T7 *, const T4 *, T7 *, void *, long, T6 *, int *)"
+0.0,1148451,344,3338.5,3360.0,3008,3777,111.1,"dsv4_scatter_route_outputs_by_slot_kernel(const unsigned short *, unsigned short *, const int *, int, int)"
+0.0,982912,64,15358.0,15360.0,14976,15968,207.8,"dsv4_mhc_head_pre_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, int, int, int, float)"
+0.0,828126,64,12939.5,12864.0,12192,13824,372.1,"argmax_kernel_fast(const __nv_bfloat16 *, int *, int)"
+0.0,824900,344,2398.0,2400.0,2272,2528,45.4,"dsv4_combine_route_slot_outputs_kernel(const unsigned short *, unsigned short *, int, int, int)"
+0.0,178848,64,2794.5,2784.0,2591,3072,107.6,"rms_norm_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)"
+0.0,140831,64,2200.5,2240.0,1824,2816,261.6,"embedding_batched_native_kernel(const __nv_bfloat16 *, const int *, __nv_bfloat16 *, int, int)"
+0.0,104540,64,1633.4,1504.0,1440,2688,353.0,"dsv4_mhc_expand_kernel(const unsigned short *, unsigned short *, int, int, int)"
