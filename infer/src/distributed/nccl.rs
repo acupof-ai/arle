@@ -93,6 +93,43 @@ impl NcclGroup {
         )
     }
 
+    pub fn all_gather_i32_device(
+        &self,
+        sendbuf: &CudaSlice<i32>,
+        send_count: usize,
+        recvbuf: &mut CudaSlice<i32>,
+    ) -> Result<()> {
+        if send_count == 0 {
+            return Ok(());
+        }
+        if sendbuf.len() < send_count {
+            bail!(
+                "NCCL all_gather_i32 rank {} send buffer len {} smaller than count {}",
+                self.rank,
+                sendbuf.len(),
+                send_count
+            );
+        }
+        let expected_recv = send_count.saturating_mul(self.world_size);
+        if recvbuf.len() < expected_recv {
+            bail!(
+                "NCCL all_gather_i32 rank {} recv buffer len {} smaller than expected {}",
+                self.rank,
+                recvbuf.len(),
+                expected_recv
+            );
+        }
+        let (src, _src_record) = sendbuf.device_ptr(&self.stream);
+        let (dst, _dst_record) = recvbuf.device_ptr_mut(&self.stream);
+        self.comm.all_gather(
+            src as *const c_void,
+            dst as *mut c_void,
+            send_count,
+            ncclDataType_t::Int32,
+            &self.stream,
+        )
+    }
+
     /// Grouped point-to-point BF16 exchange for EP token dispatch/combine.
     ///
     /// `send_offsets/counts` and `recv_offsets/counts` are element offsets in

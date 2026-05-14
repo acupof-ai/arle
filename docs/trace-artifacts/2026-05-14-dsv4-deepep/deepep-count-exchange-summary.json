@@ -1,0 +1,195 @@
+{
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle",
+  "model": "/root/DeepSeek-V4-Flash",
+  "change": "Use NCCL all-gather as the default DeepEP route-count exchange for tiny i32 per-rank counts. Preserve the previous grouped send/recv path behind ARLE_DSV4_COUNT_EXCHANGE=sendrecv.",
+  "runtime": {
+    "env": {
+      "ARLE_DSV4_TRACE_LAYER": "1",
+      "ARLE_DSV4_MOE_BACKEND": "deepep",
+      "ARLE_DSV4_INCREMENTAL_KV": "1",
+      "INFER_CUDA_DEVICES": "0,1,2,3,4,5,6,7"
+    },
+    "args": [
+      "--model-path",
+      "/root/DeepSeek-V4-Flash",
+      "--port",
+      "18084",
+      "--max-seq-len",
+      "900000",
+      "--kv-cache-dtype",
+      "fp8",
+      "--num-slots",
+      "1",
+      "--deepseek-distributed-layers",
+      "43",
+      "--mem-fraction-static",
+      "0.1"
+    ]
+  },
+  "allgather_default": {
+    "ARLE_DSV4_COUNT_EXCHANGE": null,
+    "ready_poll": 12,
+    "requests": [
+      {
+        "name": "math_37x29",
+        "elapsed_s": 1.938915,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "37乘以29等于1073。计算"
+      },
+      {
+        "name": "math_58p67",
+        "elapsed_s": 1.860243,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "58加67等于125。计算过程"
+      },
+      {
+        "name": "write_city",
+        "elapsed_s": 2.404421,
+        "prompt_tokens": 17,
+        "completion_tokens": 10,
+        "text": "霓灯织夜，车流如河。"
+      }
+    ],
+    "phase_stats": {
+      "ffn_deepep_dispatch_combine": {
+        "count": 8256,
+        "p50_ms": 1.72,
+        "p95_ms": 2.187,
+        "max_ms": 4.211,
+        "avg_ms": 1.762
+      },
+      "ffn_deepep_dispatch": {
+        "count": 8256,
+        "p50_ms": 0.056,
+        "p95_ms": 0.117,
+        "max_ms": 0.589,
+        "avg_ms": 0.062
+      },
+      "ffn_deepep_count_exchange": {
+        "count": 8256,
+        "p50_ms": 0.115,
+        "p95_ms": 0.271,
+        "max_ms": 1.31,
+        "avg_ms": 0.134
+      },
+      "ffn_deepep_local_experts": {
+        "count": 8256,
+        "p50_ms": 0.446,
+        "p95_ms": 0.853,
+        "max_ms": 1.809,
+        "avg_ms": 0.337
+      },
+      "ffn_deepep_combine": {
+        "count": 8256,
+        "p50_ms": 0.714,
+        "p95_ms": 1.27,
+        "max_ms": 1.948,
+        "avg_ms": 0.635
+      },
+      "ffn_total": {
+        "count": 8256,
+        "p50_ms": 2.334,
+        "p95_ms": 2.825,
+        "max_ms": 4.759,
+        "avg_ms": 2.372
+      },
+      "attn_total": {
+        "count": 8256,
+        "p50_ms": 1.11,
+        "p95_ms": 1.547,
+        "max_ms": 3.447,
+        "avg_ms": 1.1
+      }
+    }
+  },
+  "sendrecv_fallback": {
+    "ARLE_DSV4_COUNT_EXCHANGE": "sendrecv",
+    "ready_poll": 13,
+    "requests": [
+      {
+        "name": "math_37x29",
+        "elapsed_s": 2.125913,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "37乘以29等于1073。计算"
+      },
+      {
+        "name": "math_58p67",
+        "elapsed_s": 2.066012,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "58加67等于125。计算过程"
+      },
+      {
+        "name": "write_city",
+        "elapsed_s": 2.581159,
+        "prompt_tokens": 17,
+        "completion_tokens": 10,
+        "text": "霓灯织夜，车流如河。"
+      }
+    ],
+    "phase_stats": {
+      "ffn_deepep_dispatch_combine": {
+        "count": 8256,
+        "p50_ms": 1.908,
+        "p95_ms": 2.447,
+        "max_ms": 4.441,
+        "avg_ms": 1.947
+      },
+      "ffn_deepep_dispatch": {
+        "count": 8256,
+        "p50_ms": 0.059,
+        "p95_ms": 0.137,
+        "max_ms": 0.409,
+        "avg_ms": 0.07
+      },
+      "ffn_deepep_count_exchange": {
+        "count": 8256,
+        "p50_ms": 0.176,
+        "p95_ms": 0.419,
+        "max_ms": 2.169,
+        "avg_ms": 0.199
+      },
+      "ffn_deepep_local_experts": {
+        "count": 8256,
+        "p50_ms": 0.465,
+        "p95_ms": 0.888,
+        "max_ms": 1.86,
+        "avg_ms": 0.355
+      },
+      "ffn_deepep_combine": {
+        "count": 8256,
+        "p50_ms": 0.722,
+        "p95_ms": 1.311,
+        "max_ms": 1.956,
+        "avg_ms": 0.662
+      },
+      "ffn_total": {
+        "count": 8256,
+        "p50_ms": 2.59,
+        "p95_ms": 3.19,
+        "max_ms": 5.117,
+        "avg_ms": 2.632
+      },
+      "attn_total": {
+        "count": 8256,
+        "p50_ms": 1.269,
+        "p95_ms": 1.928,
+        "max_ms": 3.411,
+        "avg_ms": 1.288
+      }
+    }
+  },
+  "delta": {
+    "count_exchange_p50_ms": -0.061,
+    "count_exchange_p95_ms": -0.148,
+    "ffn_dispatch_combine_p50_ms": -0.188,
+    "ffn_total_p50_ms": -0.256,
+    "math_latency_best_delta_s": -0.205769,
+    "writing_latency_delta_s": -0.176738
+  },
+  "conclusion": "NCCL all-gather is a better default for the tiny per-rank route-count exchange on the current 8xH20 DSv4 B=1 decode path. The grouped send/recv implementation remains available as ARLE_DSV4_COUNT_EXCHANGE=sendrecv."
+}

@@ -304,6 +304,29 @@ fn dsv4_grouped_experts_enabled() -> Result<bool> {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dsv4CountExchangeMode {
+    AllGather,
+    SendRecv,
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_count_exchange_mode() -> Result<Dsv4CountExchangeMode> {
+    let Some(raw) = std::env::var("ARLE_DSV4_COUNT_EXCHANGE").ok() else {
+        return Ok(Dsv4CountExchangeMode::AllGather);
+    };
+    match raw.as_str() {
+        "allgather" | "all_gather" | "gather" | "AllGather" | "ALLGATHER" => {
+            Ok(Dsv4CountExchangeMode::AllGather)
+        }
+        "sendrecv" | "send_recv" | "p2p" | "SendRecv" | "SENDRECV" => {
+            Ok(Dsv4CountExchangeMode::SendRecv)
+        }
+        other => bail!("invalid ARLE_DSV4_COUNT_EXCHANGE value `{other}`"),
+    }
+}
+
 /// V4 routed MoE block plus optional shared expert.
 #[cfg(feature = "cuda")]
 #[allow(dead_code)] // populated once the Phase 2A loader allocates tensors
@@ -1116,22 +1139,42 @@ impl DeepseekV4MoeBlock {
         let trace = dsv4_moe_trace_begin(ctx)?;
         let peer_offsets: Vec<usize> = (0..ep.world_size).collect();
         let one_per_peer = vec![1usize; ep.world_size];
-        let mut recv_rank_counts = ctx
-            .stream
-            .alloc_zeros::<i32>(ep.world_size)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv rank count alloc failed: {err}"))?;
-        comm.moe_grouped_send_recv_i32(
-            &send_rank_counts,
-            &peer_offsets,
-            &one_per_peer,
-            &mut recv_rank_counts,
-            &peer_offsets,
-            &one_per_peer,
-        )?;
-        let recv_rank_counts_host = ctx
-            .stream
-            .clone_dtoh(&recv_rank_counts)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv rank count D2H failed: {err}"))?;
+        let recv_rank_counts_host = match dsv4_count_exchange_mode()? {
+            Dsv4CountExchangeMode::AllGather => {
+                let mut all_rank_counts = ctx
+                    .stream
+                    .alloc_zeros::<i32>(ep.world_size * ep.world_size)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 all rank count alloc failed: {err}")
+                    })?;
+                comm.moe_all_gather_i32(&send_rank_counts, ep.world_size, &mut all_rank_counts)?;
+                let all_counts_host = ctx.stream.clone_dtoh(&all_rank_counts).map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 all rank count D2H failed: {err}")
+                })?;
+                (0..ep.world_size)
+                    .map(|peer| all_counts_host[peer * ep.world_size + ep.rank])
+                    .collect::<Vec<_>>()
+            }
+            Dsv4CountExchangeMode::SendRecv => {
+                let mut recv_rank_counts =
+                    ctx.stream
+                        .alloc_zeros::<i32>(ep.world_size)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 recv rank count alloc failed: {err}")
+                        })?;
+                comm.moe_grouped_send_recv_i32(
+                    &send_rank_counts,
+                    &peer_offsets,
+                    &one_per_peer,
+                    &mut recv_rank_counts,
+                    &peer_offsets,
+                    &one_per_peer,
+                )?;
+                ctx.stream.clone_dtoh(&recv_rank_counts).map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 recv rank count D2H failed: {err}")
+                })?
+            }
+        };
         let (recv_rank_offsets_i32, total_recv_routes) =
             dsv4_counts_to_offsets_i32(&recv_rank_counts_host, "recv_rank_counts")?;
         let recv_rank_offsets = dsv4_offsets_to_usize(&recv_rank_offsets_i32)?;
