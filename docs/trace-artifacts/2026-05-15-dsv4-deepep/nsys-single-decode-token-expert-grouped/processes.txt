@@ -1,0 +1,4 @@
+2276756       1 nsys            Ds    4.2  0.0 [nsys]
+2276833       1 nsys-launcher   S     0.0  0.0 /opt/nvidia/nsight-systems/2023.2.3/target-linux-x64/nsys-launcher /tmp/f456-1734-0f44-7a48 91
+2276834 2276833 infer <defunct> Zsl   115  0.0 [infer] <defunct>
+2276835 2276833 nsys- <defunct> Z     0.0  0.0 [nsys-tee] <defunct>

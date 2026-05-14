@@ -1,0 +1,13 @@
+{
+  "label": "warmup_decode",
+  "status": 200,
+  "max_tokens": 2,
+  "elapsed_s": 0.9515137672424316,
+  "output": "霓彩",
+  "usage": {
+    "prompt_tokens": 9,
+    "completion_tokens": 2,
+    "total_tokens": 11
+  },
+  "response": null
+}

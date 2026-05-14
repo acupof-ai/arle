@@ -101,6 +101,15 @@ Related governance docs:
   `cuMemAllocAsync` calls and 6,048 `cuMemFreeAsync` calls. The slow stack is
   NCCL SendRecv/AllReduce, local FP8/FP4 expert GEMV, launch/runtime overhead,
   allocator/free churn, and route-count D2H synchronization.
+- Added the DSv4 expert-wise grouped GEMV negative Nsight trace under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expert-grouped/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expert-grouped/).
+  With `ARLE_DSV4_GROUPED_EXPERTS=1`, the real 8xH20 run keeps the `霓彩`
+  output but regresses the warmed single-token decode wave to 145.693 ms.
+  The trace shows `ncclDevKernel_SendRecv` at 58.049 ms per rank range, FP4
+  grouped gate/up GEMV at 23.162 ms, FP4 grouped `w2` GEMV at 11.428 ms, and
+  elevated route-count D2H synchronization. This confirms the opt-in grouped
+  GEMV path remains default-off and that the target remains true grouped
+  GEMM/DeepGEMM with DeepEP overlap.
 
 ### CUDA
 
