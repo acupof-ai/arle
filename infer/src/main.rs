@@ -888,8 +888,11 @@ fn spawn_cuda_worker_group(
                 .flatten(),
             worker_placement: Some(worker.placement.clone()),
             cuda_device_ordinal: Some(worker.cuda_ordinal as u32),
-            deepseek_parallel: (matches!(model_type, ModelType::DeepSeekV4) && world_size > 1)
-                .then_some(DeepseekParallelConfig { rank, world_size }),
+            deepseek_parallel: if matches!(model_type, ModelType::DeepSeekV4) && world_size > 1 {
+                Some(deepseek_parallel_config_for_rank(rank, world_size)?)
+            } else {
+                None
+            },
         };
         planned.push((rank, worker.clone(), runtime));
     }
@@ -966,6 +969,60 @@ fn spawn_cuda_worker_group(
         .into_iter()
         .map(|worker| worker.expect("all ranks loaded successfully"))
         .collect())
+}
+
+fn deepseek_parallel_config_for_rank(
+    rank: usize,
+    world_size: usize,
+) -> anyhow::Result<DeepseekParallelConfig> {
+    let tp_world_size =
+        parse_deepseek_axis_world_size("INFER_TP_SIZE", "ARLE_TP_SIZE", world_size, world_size)?;
+    let ep_world_size =
+        parse_deepseek_axis_world_size("INFER_EP_SIZE", "ARLE_EP_SIZE", world_size, world_size)?;
+    anyhow::ensure!(
+        tp_world_size == 1 || tp_world_size == world_size,
+        "DeepSeek HTTP TP override must be 1 or total CUDA workers ({world_size}); got {tp_world_size}"
+    );
+    anyhow::ensure!(
+        ep_world_size == 1 || ep_world_size == world_size,
+        "DeepSeek HTTP EP override must be 1 or total CUDA workers ({world_size}); got {ep_world_size}"
+    );
+    anyhow::ensure!(
+        tp_world_size > 1 || ep_world_size > 1,
+        "DeepSeek distributed HTTP needs TP or EP to span the CUDA workers"
+    );
+    Ok(DeepseekParallelConfig {
+        tp_rank: if tp_world_size == 1 { 0 } else { rank },
+        tp_world_size,
+        ep_rank: if ep_world_size == 1 { 0 } else { rank },
+        ep_world_size,
+    })
+}
+
+fn parse_deepseek_axis_world_size(
+    primary: &str,
+    alias: &str,
+    default: usize,
+    worker_count: usize,
+) -> anyhow::Result<usize> {
+    let Some(raw) = std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(alias).ok())
+    else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<usize>()
+        .map_err(|err| anyhow::anyhow!("invalid {primary}/{alias} value `{raw}`: {err}"))?;
+    anyhow::ensure!(
+        value > 0,
+        "{primary}/{alias} must be positive for DeepSeek HTTP parallel layout"
+    );
+    anyhow::ensure!(
+        worker_count.is_multiple_of(value),
+        "{primary}/{alias}={value} must divide CUDA worker count {worker_count}"
+    );
+    Ok(value)
 }
 
 async fn async_main(args: Args) {

@@ -1,8 +1,8 @@
 //! DeepSeek V4 batched-decode scratch buffers.
 //!
-//! Mirrors `qwen3::batch_decode::BatchDecodeBuffers` once the V4 decode kernels
-//! expose their required scratch shape. Until then the type is an empty marker
-//! that satisfies the `ModelForward::DecodeContext` associated type.
+//! Tracks scheduler batch capacity for DSv4 decode. The model currently uses a
+//! sequential per-slot decode fallback for B>1; vectorized V4 decode kernels
+//! will add real scratch buffers here.
 
 use anyhow::{Result, ensure};
 
@@ -10,19 +10,18 @@ use crate::model::DecodeContextOps;
 use crate::model::kv_cache::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, PagedKVPool};
 
-/// Pre-allocated buffers for batched decode. Stub: kernel-shaped fields land
-/// alongside the V4 decode kernels.
+/// Pre-allocated decode context. Stub: kernel-shaped fields land alongside the
+/// V4 vectorized decode kernels.
 ///
 /// Public so the `ModelForward::DecodeContext` associated type (a `pub`
-/// surface on the trait) does not leak a private name. Mirrors
-/// `qwen3::batch_decode::BatchDecodeBuffers` once kernels land.
+/// surface on the trait) does not leak a private name.
 pub struct DeepseekBatchDecodeBuffers {
     max_batch_size: usize,
 }
 
 impl DeepseekBatchDecodeBuffers {
-    /// Allocate the decode context. Returns an empty marker until the V4 decode
-    /// kernels land.
+    /// Allocate the decode context. The current serial fallback still needs to
+    /// validate scheduler batch capacity.
     pub(super) fn new(
         _ctx: &DeviceContext,
         max_batch_size: usize,

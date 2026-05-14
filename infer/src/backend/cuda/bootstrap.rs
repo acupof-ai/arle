@@ -74,8 +74,10 @@ impl Default for InferenceEngineOptions {
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeepseekParallelConfig {
-    pub rank: usize,
-    pub world_size: usize,
+    pub tp_rank: usize,
+    pub tp_world_size: usize,
+    pub ep_rank: usize,
+    pub ep_world_size: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -253,10 +255,11 @@ pub fn load_deepseek_v4_components(
         let mut runtime = DeepseekRuntimeConfig::from_model_dir(model_path)?;
         runtime.enable_cuda_graph = options.enable_cuda_graph;
         if let Some(parallel) = parallel {
-            runtime.tp = crate::tensor_parallel::TpConfig::new(parallel.world_size, parallel.rank)?;
+            runtime.tp =
+                crate::tensor_parallel::TpConfig::new(parallel.tp_world_size, parallel.tp_rank)?;
             runtime.ep = crate::distributed::expert_state::ExpertGroup::new(
-                parallel.rank,
-                parallel.world_size,
+                parallel.ep_rank,
+                parallel.ep_world_size,
                 runtime.spec.n_routed_experts,
             )?;
         }
