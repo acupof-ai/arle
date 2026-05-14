@@ -628,6 +628,68 @@ extern "C" CUresult dsv4_compressor_update_cuda(
 #define DSV4_CSA_SORT_MAX_KEYS 4096
 #define DSV4_CSA_INVALID_INDEX 2147483647
 
+__device__ __forceinline__ bool dsv4_csa_rhs_better(
+    float lhs_score,
+    int lhs_index,
+    float rhs_score,
+    int rhs_index) {
+  return rhs_score > lhs_score || (rhs_score == lhs_score && rhs_index < lhs_index);
+}
+
+__device__ void dsv4_csa_bitonic_sort_desc(
+    float *__restrict__ scores,
+    int *__restrict__ indices,
+    int sort_len) {
+  for (int width = 2; width <= sort_len; width <<= 1) {
+    for (int stride = width >> 1; stride > 0; stride >>= 1) {
+      for (int idx = threadIdx.x; idx < sort_len; idx += blockDim.x) {
+        int other = idx ^ stride;
+        if (other <= idx) continue;
+        bool descending = (idx & width) == 0;
+        float lhs_score = scores[idx];
+        int lhs_index = indices[idx];
+        float rhs_score = scores[other];
+        int rhs_index = indices[other];
+        bool rhs_better = dsv4_csa_rhs_better(lhs_score, lhs_index, rhs_score, rhs_index);
+        bool lhs_better = dsv4_csa_rhs_better(rhs_score, rhs_index, lhs_score, lhs_index);
+        bool swap = descending ? rhs_better : lhs_better;
+        if (swap) {
+          scores[idx] = rhs_score;
+          indices[idx] = rhs_index;
+          scores[other] = lhs_score;
+          indices[other] = lhs_index;
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+__device__ __forceinline__ float dsv4_csa_score_block(
+    const uint16_t *__restrict__ q,
+    const uint16_t *__restrict__ weights,
+    const uint16_t *__restrict__ keys,
+    int token,
+    int block_idx,
+    int q_width,
+    int local_heads,
+    int index_dim,
+    float score_scale) {
+  float score = 0.0f;
+  for (int head = 0; head < local_heads; ++head) {
+    float dotv = 0.0f;
+    int q_base = token * q_width + head * index_dim;
+    int key_base = block_idx * index_dim;
+    for (int col = 0; col < index_dim; ++col) {
+      dotv += dsv4_attn_bf16_to_f32(q[q_base + col]) *
+              dsv4_attn_bf16_to_f32(keys[key_base + col]);
+    }
+    float weight = dsv4_attn_bf16_to_f32(weights[token * local_heads + head]) * score_scale;
+    score += weight * fmaxf(dotv, 0.0f);
+  }
+  return score;
+}
+
 __global__ void dsv4_hybrid_attention_kernel(
     const uint16_t *__restrict__ q,
     const uint16_t *__restrict__ k_new,
@@ -830,27 +892,23 @@ __global__ void dsv4_csa_select_kernel(
   if (token >= num_tokens) return;
   int abs_pos = start_pos + token;
   int available = dsv4_imin(key_count, (abs_pos + 1) / ratio);
+
+  __shared__ float sort_scores[DSV4_CSA_SORT_MAX_KEYS];
+  __shared__ int sort_indices[DSV4_CSA_SORT_MAX_KEYS];
+  __shared__ float global_scores[DSV4_CSA_MAX_TOPK];
+  __shared__ int global_indices[DSV4_CSA_MAX_TOPK];
+  __shared__ float tile_scores[DSV4_CSA_MAX_TOPK];
+  __shared__ int tile_indices[DSV4_CSA_MAX_TOPK];
+
   if (available <= DSV4_CSA_SORT_MAX_KEYS) {
-    __shared__ float sort_scores[DSV4_CSA_SORT_MAX_KEYS];
-    __shared__ int sort_indices[DSV4_CSA_SORT_MAX_KEYS];
     int sort_len = 1;
     while (sort_len < available) sort_len <<= 1;
     for (int idx = threadIdx.x; idx < sort_len; idx += blockDim.x) {
       float score = -INFINITY;
       int out_idx = DSV4_CSA_INVALID_INDEX;
       if (idx < available) {
-        score = 0.0f;
-        for (int head = 0; head < local_heads; ++head) {
-          float dotv = 0.0f;
-          int q_base = token * q_width + head * index_dim;
-          int key_base = idx * index_dim;
-          for (int col = 0; col < index_dim; ++col) {
-            dotv += dsv4_attn_bf16_to_f32(q[q_base + col]) *
-                    dsv4_attn_bf16_to_f32(keys[key_base + col]);
-          }
-          float weight = dsv4_attn_bf16_to_f32(weights[token * local_heads + head]) * score_scale;
-          score += weight * fmaxf(dotv, 0.0f);
-        }
+        score = dsv4_csa_score_block(
+            q, weights, keys, token, idx, q_width, local_heads, index_dim, score_scale);
         if (isfinite(score)) {
           out_idx = idx;
         } else {
@@ -862,31 +920,7 @@ __global__ void dsv4_csa_select_kernel(
     }
     __syncthreads();
 
-    for (int width = 2; width <= sort_len; width <<= 1) {
-      for (int stride = width >> 1; stride > 0; stride >>= 1) {
-        for (int idx = threadIdx.x; idx < sort_len; idx += blockDim.x) {
-          int other = idx ^ stride;
-          if (other <= idx) continue;
-          bool descending = (idx & width) == 0;
-          float lhs_score = sort_scores[idx];
-          int lhs_index = sort_indices[idx];
-          float rhs_score = sort_scores[other];
-          int rhs_index = sort_indices[other];
-          bool rhs_better = rhs_score > lhs_score ||
-                            (rhs_score == lhs_score && rhs_index < lhs_index);
-          bool lhs_better = lhs_score > rhs_score ||
-                            (lhs_score == rhs_score && lhs_index < rhs_index);
-          bool swap = descending ? rhs_better : lhs_better;
-          if (swap) {
-            sort_scores[idx] = rhs_score;
-            sort_indices[idx] = rhs_index;
-            sort_scores[other] = lhs_score;
-            sort_indices[other] = lhs_index;
-          }
-        }
-        __syncthreads();
-      }
-    }
+    dsv4_csa_bitonic_sort_desc(sort_scores, sort_indices, sort_len);
 
     for (int k = threadIdx.x; k < topk; k += blockDim.x) {
       int idx = k < available ? sort_indices[k] : -1;
@@ -895,43 +929,72 @@ __global__ void dsv4_csa_select_kernel(
     return;
   }
 
-  __shared__ float top_scores[DSV4_CSA_MAX_TOPK];
-  __shared__ int top_indices[DSV4_CSA_MAX_TOPK];
-  if (threadIdx.x == 0) {
-    for (int k = 0; k < topk; ++k) {
-      top_scores[k] = -INFINITY;
-      top_indices[k] = -1;
-    }
-    for (int block_idx = 0; block_idx < available; ++block_idx) {
-      float score = 0.0f;
-      for (int head = 0; head < local_heads; ++head) {
-        float dotv = 0.0f;
-        int q_base = token * q_width + head * index_dim;
-        int key_base = block_idx * index_dim;
-        for (int col = 0; col < index_dim; ++col) {
-          dotv += dsv4_attn_bf16_to_f32(q[q_base + col]) *
-                  dsv4_attn_bf16_to_f32(keys[key_base + col]);
+  for (int k = threadIdx.x; k < topk; k += blockDim.x) {
+    global_scores[k] = -INFINITY;
+    global_indices[k] = DSV4_CSA_INVALID_INDEX;
+  }
+  __syncthreads();
+
+  for (int tile_start = 0; tile_start < available; tile_start += DSV4_CSA_SORT_MAX_KEYS) {
+    int tile_len = dsv4_imin(DSV4_CSA_SORT_MAX_KEYS, available - tile_start);
+    int sort_len = 1;
+    while (sort_len < tile_len) sort_len <<= 1;
+
+    for (int idx = threadIdx.x; idx < sort_len; idx += blockDim.x) {
+      float score = -INFINITY;
+      int out_idx = DSV4_CSA_INVALID_INDEX;
+      if (idx < tile_len) {
+        int block_idx = tile_start + idx;
+        score = dsv4_csa_score_block(
+            q, weights, keys, token, block_idx, q_width, local_heads, index_dim, score_scale);
+        if (isfinite(score)) {
+          out_idx = block_idx;
+        } else {
+          score = -INFINITY;
         }
-        float weight = dsv4_attn_bf16_to_f32(weights[token * local_heads + head]) * score_scale;
-        score += weight * fmaxf(dotv, 0.0f);
       }
-      if (!isfinite(score)) continue;
-      for (int k = 0; k < topk; ++k) {
-        bool better = score > top_scores[k] ||
-                      (score == top_scores[k] && block_idx < top_indices[k]);
-        if (!better) continue;
-        for (int shift = topk - 1; shift > k; --shift) {
-          top_scores[shift] = top_scores[shift - 1];
-          top_indices[shift] = top_indices[shift - 1];
-        }
-        top_scores[k] = score;
-        top_indices[k] = block_idx;
-        break;
+      sort_scores[idx] = score;
+      sort_indices[idx] = out_idx;
+    }
+    __syncthreads();
+    dsv4_csa_bitonic_sort_desc(sort_scores, sort_indices, sort_len);
+
+    int tile_take = dsv4_imin(topk, tile_len);
+    for (int k = threadIdx.x; k < tile_take; k += blockDim.x) {
+      tile_scores[k] = sort_scores[k];
+      tile_indices[k] = sort_indices[k];
+    }
+    __syncthreads();
+
+    int merge_len = topk + tile_take;
+    int merge_sort_len = 1;
+    while (merge_sort_len < merge_len) merge_sort_len <<= 1;
+    for (int idx = threadIdx.x; idx < merge_sort_len; idx += blockDim.x) {
+      if (idx < topk) {
+        sort_scores[idx] = global_scores[idx];
+        sort_indices[idx] = global_indices[idx];
+      } else if (idx < merge_len) {
+        int tile_idx = idx - topk;
+        sort_scores[idx] = tile_scores[tile_idx];
+        sort_indices[idx] = tile_indices[tile_idx];
+      } else {
+        sort_scores[idx] = -INFINITY;
+        sort_indices[idx] = DSV4_CSA_INVALID_INDEX;
       }
     }
-    for (int k = 0; k < topk; ++k) {
-      selected[token * topk + k] = top_indices[k];
+    __syncthreads();
+    dsv4_csa_bitonic_sort_desc(sort_scores, sort_indices, merge_sort_len);
+
+    for (int k = threadIdx.x; k < topk; k += blockDim.x) {
+      global_scores[k] = sort_scores[k];
+      global_indices[k] = sort_indices[k];
     }
+    __syncthreads();
+  }
+
+  for (int k = threadIdx.x; k < topk; k += blockDim.x) {
+    int idx = global_indices[k];
+    selected[token * topk + k] = idx == DSV4_CSA_INVALID_INDEX ? -1 : idx;
   }
 }
 
