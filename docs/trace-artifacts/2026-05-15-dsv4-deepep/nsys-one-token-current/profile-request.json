@@ -1,0 +1,46 @@
+{
+  "status": 200,
+  "total_s": 1.428094,
+  "usage": {
+    "prompt_tokens": 16,
+    "completion_tokens": 2,
+    "total_tokens": 18
+  },
+  "text": "霓灯",
+  "chunks": [
+    {
+      "t_ms": 1271.6,
+      "text": "霓"
+    },
+    {
+      "t_ms": 1427.738,
+      "text": "灯"
+    }
+  ],
+  "raw_events": [
+    {
+      "t_ms": 824.613,
+      "line": "data: {\"id\":\"chatcmpl-9fea1db7-316a-4419-bc0e-dce3a1a9b8b7\",\"object\":\"chat.completion.chunk\",\"created\":1778778554,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}"
+    },
+    {
+      "t_ms": 1271.6,
+      "line": "data: {\"id\":\"chatcmpl-9fea1db7-316a-4419-bc0e-dce3a1a9b8b7\",\"object\":\"chat.completion.chunk\",\"created\":1778778554,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"霓\"},\"finish_reason\":null}]}"
+    },
+    {
+      "t_ms": 1427.738,
+      "line": "data: {\"id\":\"chatcmpl-9fea1db7-316a-4419-bc0e-dce3a1a9b8b7\",\"object\":\"chat.completion.chunk\",\"created\":1778778554,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"灯\"},\"finish_reason\":null}]}"
+    },
+    {
+      "t_ms": 1427.833,
+      "line": "data: {\"id\":\"chatcmpl-9fea1db7-316a-4419-bc0e-dce3a1a9b8b7\",\"object\":\"chat.completion.chunk\",\"created\":1778778554,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}"
+    },
+    {
+      "t_ms": 1427.858,
+      "line": "data: {\"id\":\"chatcmpl-9fea1db7-316a-4419-bc0e-dce3a1a9b8b7\",\"object\":\"chat.completion.chunk\",\"created\":1778778554,\"model\":\"DeepSeek-V4-Flash\",\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":2,\"total_tokens\":18}}"
+    },
+    {
+      "t_ms": 1427.891,
+      "line": "data: [DONE]"
+    }
+  ]
+}

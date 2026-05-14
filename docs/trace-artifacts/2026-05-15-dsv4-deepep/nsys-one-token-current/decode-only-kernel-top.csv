@@ -1,0 +1,25 @@
+total_ms,count,per_decode_range_ms,avg_us,min_us,max_us,name
+232.145141,1032,29.018143,224.946842,4.672,1320.83,ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)
+159.968468,344,19.996059,465.024616,15.136,1354.623,ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)
+91.802765,2920,11.475346,31.439303,20.704,44.96,"dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)"
+86.96345,774,10.870431,112.355879,102.016,121.344,"dsv4_fp4_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)"
+58.841964,328,7.355246,179.396232,133.184,223.84,"dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)"
+45.27386,344,5.659233,131.610058,46.656,139.488,"dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)"
+44.020048,688,5.502506,63.982628,63.328,64.576,"dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)"
+33.128,168,4.141,197.190476,192.48,199.456,"dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)"
+21.963678,344,2.74546,63.847901,7.712,300.833,ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)
+8.5582,1504,1.069775,5.690293,4.192,9.375,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)"
+5.868889,496,0.733611,11.832438,1.664,31.072,"dsv4_compressor_update_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, int, int, int, int, int, int, int, int, int, float, int, float, int, float, float, float)"
+3.476803,1376,0.4346,2.526746,1.824,3.36,"rms_norm_batched_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)"
+2.174991,696,0.271874,3.124987,2.145,3.488,"void dot_kernel<float, (int)128, (int)0, cublasDotParams<cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<float>>>(T4)"
+2.03661,5,0.254576,407.322,406.08,408.609,"gemv_handwritten_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int)"
+1.66416,16,0.20802,104.01,103.68,104.672,"dsv4_swa_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float)"
+1.553149,344,0.194144,4.514968,4.288,4.992,"dsv4_pack_expert_ranks_kernel(const unsigned short *, const int *, const float *, const int *, int *, unsigned short *, int *, int *, int *, int, int, int, int, int)"
+1.391289,688,0.173911,2.022222,1.855,2.592,"dsv4_mhc_post_kernel(const unsigned short *, const unsigned short *, const float *, const float *, unsigned short *, int, int, int)"
+1.155123,696,0.14439,1.659659,1.568,1.824,"void reduce_1Block_kernel<float, (int)128, (int)7, cublasGemvTensorStridedBatched<float>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>>(const T1 *, T1, T4, int, const T1 *, T1, T5, T6, cublasPointerMode_t, cublasLtEpilogue_t, cublasGemvTensorStridedBatched<const biasType<T6::value_type, T1>::type>)"
+1.102724,344,0.13784,3.205593,3.008,3.36,"dsv4_prepare_q_kernel(const unsigned short *, unsigned short *, int, int, int, int, int, float, float, int, float, float, float)"
+1.042822,688,0.130353,1.51573,1.439,1.824,"dsv4_mhc_pre_kernel(const unsigned short *, const float *, unsigned short *, int, int, int)"
+0.950473,183,0.118809,5.193842,4.384,5.824,"dsv4_pack_received_experts_kernel(const unsigned short *, const int *, const int *, int *, unsigned short *, float *, int *, int, int, int, int)"
+0.897825,344,0.112228,2.609956,2.367,2.88,"dsv4_prepare_k_kernel(const unsigned short *, unsigned short *, int, int, int, int, float, int, float, float, float)"
+0.865227,602,0.108153,1.437254,1.311,1.536,"dsv4_swiglu_clamped_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)"
+0.769621,344,0.096203,2.23727,2.08,2.496,"dsv4_combine_route_outputs_kernel(const unsigned short *, const int *, unsigned short *, int, int, int)"
