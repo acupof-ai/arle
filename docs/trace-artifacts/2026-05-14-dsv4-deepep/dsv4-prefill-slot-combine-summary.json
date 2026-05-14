@@ -1,0 +1,126 @@
+{
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle",
+  "model": "/root/DeepSeek-V4-Flash",
+  "change": {
+    "name": "route-slot prefill combine",
+    "description": "Pack the original top-k route slot during DeepEP-style dispatch and use it to combine prefill outputs with an O(tokens * topk) route-slot kernel instead of the legacy token scan combine path.",
+    "files": [
+      "crates/cuda-kernels/csrc/moe/dsv4_route.cu",
+      "crates/cuda-kernels/src/ffi/moe.rs",
+      "infer/src/model/deepseek/mlp.rs"
+    ]
+  },
+  "validation": {
+    "local": [
+      "cargo fmt --check",
+      "cargo check -p infer --no-default-features --features no-cuda --lib",
+      "git diff --check"
+    ],
+    "remote": [
+      "cargo build --release -p infer --bin infer --features cuda,nccl"
+    ],
+    "request": {
+      "prompt_tokens": 1039,
+      "completion_tokens": 4,
+      "status": 200,
+      "elapsed_s": 16.825892,
+      "output": "37 \u00d7 29"
+    }
+  },
+  "baseline": {
+    "artifact": "dsv4-prefill-1024-trace-summary.json",
+    "request": {
+      "prompt_tokens": 1039,
+      "completion_tokens": 4,
+      "elapsed_s": 17.177764,
+      "output": "37 \u00d7 29"
+    },
+    "prefill_tokens_1039": {
+      "ffn_total": {
+        "count": 344,
+        "sum_ms": 114269.243,
+        "avg_ms": 332.178,
+        "max_ms": 595.966
+      },
+      "ffn_deepep_dispatch_combine": {
+        "count": 344,
+        "sum_ms": 106179.338,
+        "avg_ms": 308.661,
+        "max_ms": 571.507
+      },
+      "ffn_deepep_combine": {
+        "count": 344,
+        "sum_ms": 58949.56,
+        "avg_ms": 171.365,
+        "max_ms": 560.34
+      },
+      "ffn_deepep_local_experts": {
+        "count": 344,
+        "sum_ms": 44305.389,
+        "avg_ms": 128.795,
+        "max_ms": 549.584
+      }
+    }
+  },
+  "route_slot_result": {
+    "prefill_tokens_1039": {
+      "ffn_total": {
+        "count": 344,
+        "sum_ms": 110966.587,
+        "avg_ms": 322.577,
+        "p50_ms": 301.702,
+        "p95_ms": 487.458,
+        "max_ms": 585.278
+      },
+      "ffn_deepep_dispatch_combine": {
+        "count": 344,
+        "sum_ms": 102896.862,
+        "avg_ms": 299.119,
+        "p50_ms": 278.425,
+        "p95_ms": 463.357,
+        "max_ms": 560.983
+      },
+      "ffn_deepep_combine": {
+        "count": 344,
+        "sum_ms": 55084.44,
+        "avg_ms": 160.129,
+        "p50_ms": 154.059,
+        "p95_ms": 368.623,
+        "max_ms": 550.135
+      },
+      "ffn_deepep_local_experts": {
+        "count": 344,
+        "sum_ms": 44574.507,
+        "avg_ms": 129.577,
+        "p50_ms": 108.014,
+        "p95_ms": 317.202,
+        "max_ms": 551.589
+      },
+      "attn_total": {
+        "count": 344,
+        "sum_ms": 16570.841,
+        "avg_ms": 48.171,
+        "p50_ms": 59.84,
+        "p95_ms": 77.403,
+        "max_ms": 148.037
+      }
+    },
+    "delta_vs_baseline": {
+      "request_elapsed_s": -0.351872,
+      "request_elapsed_pct": -2.048,
+      "ffn_deepep_combine_avg_ms": -11.236,
+      "ffn_deepep_combine_avg_pct": -6.557,
+      "ffn_total_avg_ms": -9.601,
+      "ffn_total_avg_pct": -2.891
+    }
+  },
+  "conclusion": {
+    "status": "correct_but_not_primary_bottleneck",
+    "notes": [
+      "The route-slot combine avoids the O(tokens * routes) token scan and keeps B=1 decode on the cheaper existing combine kernel.",
+      "The measured gain is small because the prefill combine phase is dominated by return all-to-all communication and synchronization, not only the final combine kernel.",
+      "The next high-value work is DeepEP-style communication overlap plus real grouped GEMM/DeepGEMM for local experts."
+    ]
+  }
+}

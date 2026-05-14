@@ -1093,6 +1093,10 @@ impl DeepseekV4MoeBlock {
             .stream
             .alloc_zeros::<i32>(total_send_routes)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 send token alloc failed: {err}"))?;
+        let mut send_route_slot = ctx
+            .stream
+            .alloc_zeros::<i32>(total_send_routes)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send route slot alloc failed: {err}"))?;
         let mut send_meta = ctx
             .stream
             .alloc_zeros::<i32>(total_send_routes * 3)
@@ -1106,6 +1110,7 @@ impl DeepseekV4MoeBlock {
             let (packed_hidden_ptr, _packed_hidden_guard) =
                 send_hidden.data.device_ptr_mut(&ctx.stream);
             let (token_ptr, _token_guard) = send_token.device_ptr_mut(&ctx.stream);
+            let (route_slot_ptr, _route_slot_guard) = send_route_slot.device_ptr_mut(&ctx.stream);
             let (meta_ptr, _meta_guard) = send_meta.device_ptr_mut(&ctx.stream);
             unsafe {
                 ffi::dsv4_pack_expert_ranks_cuda(
@@ -1116,6 +1121,7 @@ impl DeepseekV4MoeBlock {
                     cursor_ptr as *mut i32,
                     packed_hidden_ptr as *mut ffi::Half,
                     token_ptr as *mut i32,
+                    route_slot_ptr as *mut i32,
                     meta_ptr as *mut i32,
                     hidden.seq_len as i32,
                     hidden.hidden_dim as i32,
@@ -1464,7 +1470,47 @@ impl DeepseekV4MoeBlock {
             &send_hidden_counts,
         )?;
         let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
-        {
+        if hidden.seq_len > 1 {
+            let mut route_slot_out = HiddenStates::zeros(
+                ctx,
+                hidden.hidden_dim,
+                hidden.seq_len * config.num_experts_per_tok,
+            )?;
+            {
+                let (packed_ptr, _packed_guard) = combine_recv.data.device_ptr(&ctx.stream);
+                let (slot_out_ptr, _slot_out_guard) =
+                    route_slot_out.data.device_ptr_mut(&ctx.stream);
+                let (route_slot_ptr, _route_slot_guard) = send_route_slot.device_ptr(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_scatter_route_outputs_by_slot_cuda(
+                        packed_ptr as *const ffi::Half,
+                        slot_out_ptr as *mut ffi::Half,
+                        route_slot_ptr as *const i32,
+                        total_send_routes as i32,
+                        hidden.hidden_dim as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 route slot scatter failed: {err}")
+                    })?;
+                }
+            }
+            let (slot_out_ptr, _slot_out_guard) = route_slot_out.data.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_combine_route_slot_outputs_cuda(
+                    slot_out_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    hidden.seq_len as i32,
+                    config.num_experts_per_tok as i32,
+                    hidden.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 route-slot combine failed: {err}"))?;
+            }
+        } else {
             let (route_out_ptr, _route_guard) = combine_recv.data.device_ptr(&ctx.stream);
             let (token_ptr, _token_guard) = send_token.device_ptr(&ctx.stream);
             let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);

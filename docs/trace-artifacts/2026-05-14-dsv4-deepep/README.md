@@ -157,6 +157,28 @@ This makes the next prefill optimization target concrete: count exchange and
 token dispatch are no longer first-order; prefill needs real grouped
 GEMM/DeepGEMM for local experts plus a more efficient combine path.
 
+## Route-Slot Prefill Combine
+
+The combine path now preserves each packed route's original top-k slot during
+rank dispatch and uses that slot for prefill output aggregation. B=1 decode
+keeps the previous direct combine kernel to avoid adding extra launches.
+
+Matched 1,039-token request with layer trace:
+
+| Metric | Baseline | Route-slot combine | Delta |
+| --- | ---: | ---: | ---: |
+| End-to-end latency | 17.178 s | 16.826 s | -2.0% |
+| `ffn_deepep_combine` avg | 171.365 ms | 160.129 ms | -6.6% |
+| `ffn_deepep_dispatch_combine` avg | 308.661 ms | 299.119 ms | -3.1% |
+| `ffn_total` avg | 332.178 ms | 322.577 ms | -2.9% |
+| Output | `37 × 29` | `37 × 29` | correct |
+
+This removes an avoidable route scan, but it is not the main prefill fix: the
+phase remains dominated by MoE return all-to-all synchronization and local
+expert GEMMs. The next optimization has to target DeepEP-style communication
+overlap and real grouped GEMM/DeepGEMM rather than only the final combine
+scatter.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not
