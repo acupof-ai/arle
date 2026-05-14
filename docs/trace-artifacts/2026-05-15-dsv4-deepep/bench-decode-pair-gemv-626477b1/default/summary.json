@@ -1,0 +1,47 @@
+{
+  "case": "default",
+  "results": [
+    {
+      "label": "warmup16",
+      "status": 200,
+      "error": null,
+      "ttft_s": 0.5329,
+      "total_s": 1.7666,
+      "usage": {
+        "prompt_tokens": 26,
+        "completion_tokens": 16,
+        "total_tokens": 42
+      },
+      "post_first_decode_tok_s": 12.16,
+      "output": "alpha beta gamma delta speed test run fast quick slow compare time count words per second"
+    },
+    {
+      "label": "decode64",
+      "status": 200,
+      "error": null,
+      "ttft_s": 0.7178,
+      "total_s": 6.0595,
+      "usage": {
+        "prompt_tokens": 35,
+        "completion_tokens": 64,
+        "total_tokens": 99
+      },
+      "post_first_decode_tok_s": 11.79,
+      "output": "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau ups phi chi psi omega one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty one twenty two twenty three twenty four twenty five twenty six twenty seven"
+    },
+    {
+      "label": "math",
+      "status": 200,
+      "error": null,
+      "ttft_s": 0.4344,
+      "total_s": 0.5169,
+      "usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 1,
+        "total_tokens": 21
+      },
+      "post_first_decode_tok_s": null,
+      "output": "410"
+    }
+  ]
+}
