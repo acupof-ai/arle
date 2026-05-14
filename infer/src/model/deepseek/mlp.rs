@@ -24,6 +24,8 @@ use std::time::Instant;
 use crate::distributed::expert_state::ExpertGroup;
 #[cfg(test)]
 use crate::distributed::expert_state::{ExpertRoute, ExpertRoutingWeights, LocalExpertRouting};
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use crate::model::layer_communicator::LayerCommunicator;
 #[cfg(feature = "cuda")]
 use crate::ops;
 
@@ -509,6 +511,528 @@ impl DeepseekV4MoeBlock {
         Ok(out)
     }
 
+    #[cfg(feature = "nccl")]
+    pub(super) fn forward_deepep_routed_gpu(
+        &self,
+        ctx: &DeviceContext,
+        comm: &LayerCommunicator,
+        layer_idx: usize,
+        config: &DeepSeekV4Config,
+        ep: &ExpertGroup,
+        hidden: &HiddenStates,
+        token_ids: &[u32],
+    ) -> Result<HiddenStates> {
+        ensure!(
+            ep.world_size > 1,
+            "DeepSeek V4 DeepEP-style MoE path requires ep_world_size > 1"
+        );
+        ensure!(
+            token_ids.len() == hidden.seq_len,
+            "DeepSeek V4 GPU route token count {} does not match hidden seq_len {}",
+            token_ids.len(),
+            hidden.seq_len
+        );
+        ensure!(
+            self.gate_weight.rows == config.n_routed_experts
+                && self.gate_weight.cols == hidden.hidden_dim,
+            "DeepSeek V4 GPU gate shape mismatch: gate={}x{} hidden_dim={} n_routed_experts={}",
+            self.gate_weight.rows,
+            self.gate_weight.cols,
+            hidden.hidden_dim,
+            config.n_routed_experts
+        );
+        ensure!(
+            ep.experts_per_rank == self.experts.len(),
+            "DeepSeek V4 GPU route expects {} local experts but block loaded {}",
+            ep.experts_per_rank,
+            self.experts.len()
+        );
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_deepep_route_logits",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let token_ids_gpu = ctx
+            .stream
+            .clone_htod(token_ids)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
+        let mut route_indices = ctx
+            .stream
+            .alloc_zeros::<i32>(hidden.seq_len * config.num_experts_per_tok)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 route index alloc failed: {err}"))?;
+        let mut route_weights = ctx
+            .stream
+            .alloc_zeros::<f32>(hidden.seq_len * config.num_experts_per_tok)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 route weight alloc failed: {err}"))?;
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_deepep_route_setup",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let routing_kind = match config.moe_routing_kind(layer_idx) {
+            DeepSeekV4MoeRoutingKind::Hash => 0,
+            DeepSeekV4MoeRoutingKind::LearnedBias => 1,
+        };
+        let scoring_kind = match config.scoring_func.as_str() {
+            "softmax" => 0,
+            "sigmoid" => 1,
+            "sqrtsoftplus" => 2,
+            other => bail!("unsupported DSV4 GPU router scoring_func `{other}`"),
+        };
+        if routing_kind == 0 {
+            ensure!(
+                self.gate_tid2eid.is_some(),
+                "hash-routed DeepSeek V4 MoE layer missing tid2eid"
+            );
+        } else {
+            ensure!(
+                self.gate_bias.is_some(),
+                "bias-routed DeepSeek V4 MoE layer missing gate bias"
+            );
+        }
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        {
+            let (logits_ptr, _logits_guard) = logits.data.device_ptr(&ctx.stream);
+            let bias_guard;
+            let bias_ptr = if let Some(bias) = self.gate_bias.as_ref() {
+                let (ptr, guard) = bias.data.device_ptr(&ctx.stream);
+                bias_guard = Some(guard);
+                ptr as *const ffi::Half
+            } else {
+                bias_guard = None;
+                std::ptr::null()
+            };
+            let tid_guard;
+            let tid_ptr = if let Some(tid2eid) = self.gate_tid2eid.as_ref() {
+                let (ptr, guard) = tid2eid.device_ptr(&ctx.stream);
+                tid_guard = Some(guard);
+                ptr as *const i64
+            } else {
+                tid_guard = None;
+                std::ptr::null()
+            };
+            let (token_ptr, _token_guard) = token_ids_gpu.device_ptr(&ctx.stream);
+            let (idx_ptr, _idx_guard) = route_indices.device_ptr_mut(&ctx.stream);
+            let (weight_ptr, _weight_guard) = route_weights.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_route_cuda(
+                    logits_ptr as *const ffi::Half,
+                    bias_ptr,
+                    tid_ptr,
+                    token_ptr as *const u32,
+                    idx_ptr as *mut i32,
+                    weight_ptr as *mut f32,
+                    hidden.seq_len as i32,
+                    config.n_routed_experts as i32,
+                    config.num_experts_per_tok as i32,
+                    routing_kind,
+                    scoring_kind,
+                    config.routed_scaling_factor,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU router failed: {err}"))?;
+            }
+            drop(bias_guard);
+            drop(tid_guard);
+        }
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_deepep_route_select",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let experts_per_rank_i32 = i32::try_from(ep.experts_per_rank)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 experts_per_rank overflows i32"))?;
+        let ep_world_i32 = i32::try_from(ep.world_size)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 ep_world_size overflows i32"))?;
+        let mut send_rank_counts = ctx
+            .stream
+            .alloc_zeros::<i32>(ep.world_size)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank count alloc failed: {err}"))?;
+        {
+            let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
+            let (count_ptr, _count_guard) = send_rank_counts.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_count_expert_ranks_cuda(
+                    idx_ptr as *const i32,
+                    count_ptr as *mut i32,
+                    hidden.seq_len as i32,
+                    config.num_experts_per_tok as i32,
+                    experts_per_rank_i32,
+                    ep_world_i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route count failed: {err}"))?;
+            }
+        }
+        let send_rank_counts_host = ctx
+            .stream
+            .clone_dtoh(&send_rank_counts)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route count D2H failed: {err}"))?;
+        let (send_rank_offsets_i32, total_send_routes) =
+            dsv4_counts_to_offsets_i32(&send_rank_counts_host, "send_rank_counts")?;
+        let send_rank_offsets = dsv4_offsets_to_usize(&send_rank_offsets_i32)?;
+        let send_rank_counts_usize =
+            dsv4_counts_to_usize(&send_rank_counts_host, "send_rank_counts")?;
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_deepep_count_by_rank",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let send_offsets_gpu = ctx
+            .stream
+            .clone_htod(&send_rank_offsets_i32)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route offsets H2D failed: {err}"))?;
+        let mut rank_cursors = ctx
+            .stream
+            .alloc_zeros::<i32>(ep.world_size)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route cursor alloc failed: {err}"))?;
+        let mut send_hidden = HiddenStates::zeros(ctx, hidden.hidden_dim, total_send_routes)?;
+        let mut send_token = ctx
+            .stream
+            .alloc_zeros::<i32>(total_send_routes)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send token alloc failed: {err}"))?;
+        let mut send_expert = ctx
+            .stream
+            .alloc_zeros::<i32>(total_send_routes)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send expert alloc failed: {err}"))?;
+        let mut send_weight = ctx
+            .stream
+            .alloc_zeros::<f32>(total_send_routes)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send weight alloc failed: {err}"))?;
+        {
+            let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
+            let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
+            let (weight_ptr, _weight_guard) = route_weights.device_ptr(&ctx.stream);
+            let (offset_ptr, _offset_guard) = send_offsets_gpu.device_ptr(&ctx.stream);
+            let (cursor_ptr, _cursor_guard) = rank_cursors.device_ptr_mut(&ctx.stream);
+            let (packed_hidden_ptr, _packed_hidden_guard) =
+                send_hidden.data.device_ptr_mut(&ctx.stream);
+            let (token_ptr, _token_guard) = send_token.device_ptr_mut(&ctx.stream);
+            let (expert_ptr, _expert_guard) = send_expert.device_ptr_mut(&ctx.stream);
+            let (packed_weight_ptr, _packed_weight_guard) = send_weight.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_pack_expert_ranks_cuda(
+                    hidden_ptr as *const ffi::Half,
+                    idx_ptr as *const i32,
+                    weight_ptr as *const f32,
+                    offset_ptr as *const i32,
+                    cursor_ptr as *mut i32,
+                    packed_hidden_ptr as *mut ffi::Half,
+                    token_ptr as *mut i32,
+                    expert_ptr as *mut i32,
+                    packed_weight_ptr as *mut f32,
+                    hidden.seq_len as i32,
+                    hidden.hidden_dim as i32,
+                    config.num_experts_per_tok as i32,
+                    experts_per_rank_i32,
+                    ep_world_i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route pack failed: {err}"))?;
+            }
+        }
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_deepep_pack_by_rank",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let peer_offsets: Vec<usize> = (0..ep.world_size).collect();
+        let one_per_peer = vec![1usize; ep.world_size];
+        let mut recv_rank_counts = ctx
+            .stream
+            .alloc_zeros::<i32>(ep.world_size)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv rank count alloc failed: {err}"))?;
+        comm.moe_grouped_send_recv_i32(
+            &send_rank_counts,
+            &peer_offsets,
+            &one_per_peer,
+            &mut recv_rank_counts,
+            &peer_offsets,
+            &one_per_peer,
+        )?;
+        let recv_rank_counts_host = ctx
+            .stream
+            .clone_dtoh(&recv_rank_counts)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv rank count D2H failed: {err}"))?;
+        let (recv_rank_offsets_i32, total_recv_routes) =
+            dsv4_counts_to_offsets_i32(&recv_rank_counts_host, "recv_rank_counts")?;
+        let recv_rank_offsets = dsv4_offsets_to_usize(&recv_rank_offsets_i32)?;
+        let recv_rank_counts_usize =
+            dsv4_counts_to_usize(&recv_rank_counts_host, "recv_rank_counts")?;
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_deepep_count_exchange",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let send_hidden_offsets = dsv4_scale_usize(&send_rank_offsets, hidden.hidden_dim)?;
+        let send_hidden_counts = dsv4_scale_usize(&send_rank_counts_usize, hidden.hidden_dim)?;
+        let recv_hidden_offsets = dsv4_scale_usize(&recv_rank_offsets, hidden.hidden_dim)?;
+        let recv_hidden_counts = dsv4_scale_usize(&recv_rank_counts_usize, hidden.hidden_dim)?;
+        let mut recv_hidden = HiddenStates::zeros(ctx, hidden.hidden_dim, total_recv_routes)?;
+        let mut recv_token = ctx
+            .stream
+            .alloc_zeros::<i32>(total_recv_routes)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv token alloc failed: {err}"))?;
+        let mut recv_expert = ctx
+            .stream
+            .alloc_zeros::<i32>(total_recv_routes)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv expert alloc failed: {err}"))?;
+        let mut recv_weight = ctx
+            .stream
+            .alloc_zeros::<f32>(total_recv_routes)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv weight alloc failed: {err}"))?;
+        comm.moe_grouped_send_recv_bf16(
+            &send_hidden.data,
+            &send_hidden_offsets,
+            &send_hidden_counts,
+            &mut recv_hidden.data,
+            &recv_hidden_offsets,
+            &recv_hidden_counts,
+        )?;
+        comm.moe_grouped_send_recv_i32(
+            &send_token,
+            &send_rank_offsets,
+            &send_rank_counts_usize,
+            &mut recv_token,
+            &recv_rank_offsets,
+            &recv_rank_counts_usize,
+        )?;
+        comm.moe_grouped_send_recv_i32(
+            &send_expert,
+            &send_rank_offsets,
+            &send_rank_counts_usize,
+            &mut recv_expert,
+            &recv_rank_offsets,
+            &recv_rank_counts_usize,
+        )?;
+        comm.moe_grouped_send_recv_f32(
+            &send_weight,
+            &send_rank_offsets,
+            &send_rank_counts_usize,
+            &mut recv_weight,
+            &recv_rank_offsets,
+            &recv_rank_counts_usize,
+        )?;
+        dsv4_moe_trace_end(ctx, "ffn_deepep_dispatch", layer_idx, hidden.seq_len, trace)?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let route_out = if total_recv_routes == 0 {
+            HiddenStates::zeros(ctx, hidden.hidden_dim, 0)?
+        } else {
+            let local_expert_start = ep.local_expert_range().start;
+            let local_expert_start_i32 = i32::try_from(local_expert_start)
+                .map_err(|_| anyhow::anyhow!("DeepSeek V4 local expert start overflows i32"))?;
+            let mut local_counts =
+                ctx.stream
+                    .alloc_zeros::<i32>(ep.experts_per_rank)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 recv local count alloc failed: {err}")
+                    })?;
+            {
+                let (expert_ptr, _expert_guard) = recv_expert.device_ptr(&ctx.stream);
+                let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_count_packed_local_experts_cuda(
+                        expert_ptr as *const i32,
+                        count_ptr as *mut i32,
+                        total_recv_routes as i32,
+                        local_expert_start_i32,
+                        experts_per_rank_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 recv local expert count failed: {err}")
+                    })?;
+                }
+            }
+            let local_counts_host = ctx
+                .stream
+                .clone_dtoh(&local_counts)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv local count D2H failed: {err}"))?;
+            let (local_offsets_i32, total_local_routes) =
+                dsv4_counts_to_offsets_i32(&local_counts_host, "recv_local_counts")?;
+            let local_offsets = dsv4_offsets_to_usize(&local_offsets_i32)?;
+            let local_counts_usize = dsv4_counts_to_usize(&local_counts_host, "recv_local_counts")?;
+            let local_offsets_gpu = ctx.stream.clone_htod(&local_offsets_i32).map_err(|err| {
+                anyhow::anyhow!("DeepSeek V4 recv local offsets H2D failed: {err}")
+            })?;
+            let mut local_cursors =
+                ctx.stream
+                    .alloc_zeros::<i32>(ep.experts_per_rank)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 recv local cursor alloc failed: {err}")
+                    })?;
+            let mut expert_hidden =
+                HiddenStates::zeros(ctx, hidden.hidden_dim, total_local_routes)?;
+            let mut expert_token = ctx
+                .stream
+                .alloc_zeros::<i32>(total_local_routes)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 expert token alloc failed: {err}"))?;
+            let mut expert_weight = ctx
+                .stream
+                .alloc_zeros::<f32>(total_local_routes)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 expert weight alloc failed: {err}"))?;
+            let mut expert_route_slot =
+                ctx.stream
+                    .alloc_zeros::<i32>(total_local_routes)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 expert route-slot alloc failed: {err}")
+                    })?;
+            {
+                let (recv_hidden_ptr, _recv_hidden_guard) =
+                    recv_hidden.data.device_ptr(&ctx.stream);
+                let (recv_token_ptr, _recv_token_guard) = recv_token.device_ptr(&ctx.stream);
+                let (recv_expert_ptr, _recv_expert_guard) = recv_expert.device_ptr(&ctx.stream);
+                let (recv_weight_ptr, _recv_weight_guard) = recv_weight.device_ptr(&ctx.stream);
+                let (offset_ptr, _offset_guard) = local_offsets_gpu.device_ptr(&ctx.stream);
+                let (cursor_ptr, _cursor_guard) = local_cursors.device_ptr_mut(&ctx.stream);
+                let (expert_hidden_ptr, _expert_hidden_guard) =
+                    expert_hidden.data.device_ptr_mut(&ctx.stream);
+                let (expert_token_ptr, _expert_token_guard) =
+                    expert_token.device_ptr_mut(&ctx.stream);
+                let (expert_weight_ptr, _expert_weight_guard) =
+                    expert_weight.device_ptr_mut(&ctx.stream);
+                let (route_slot_ptr, _route_slot_guard) =
+                    expert_route_slot.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_pack_received_experts_cuda(
+                        recv_hidden_ptr as *const ffi::Half,
+                        recv_token_ptr as *const i32,
+                        recv_expert_ptr as *const i32,
+                        recv_weight_ptr as *const f32,
+                        offset_ptr as *const i32,
+                        cursor_ptr as *mut i32,
+                        expert_hidden_ptr as *mut ffi::Half,
+                        expert_token_ptr as *mut i32,
+                        expert_weight_ptr as *mut f32,
+                        route_slot_ptr as *mut i32,
+                        total_recv_routes as i32,
+                        hidden.hidden_dim as i32,
+                        local_expert_start_i32,
+                        experts_per_rank_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 recv local expert pack failed: {err}")
+                    })?;
+                }
+            }
+
+            let mut route_out = HiddenStates::zeros(ctx, hidden.hidden_dim, total_recv_routes)?;
+            for (local_expert_idx, expert) in self.experts.iter().enumerate() {
+                let count = local_counts_usize[local_expert_idx];
+                if count == 0 {
+                    continue;
+                }
+                let offset = local_offsets[local_expert_idx];
+                let elem_start = offset * hidden.hidden_dim;
+                let elem_end = elem_start + count * hidden.hidden_dim;
+                let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;
+                {
+                    let src = expert_hidden.data.slice(elem_start..elem_end);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut expert_input.data)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 recv expert input D2D failed: {err}")
+                        })?;
+                }
+                let expert_out = expert.forward(ctx, &expert_input, config.swiglu_limit)?;
+                let (expert_ptr, _expert_guard) = expert_out.data.device_ptr(&ctx.stream);
+                let (route_out_ptr, _route_guard) = route_out.data.device_ptr_mut(&ctx.stream);
+                let (route_slot_ptr, _route_slot_guard) = expert_route_slot.device_ptr(&ctx.stream);
+                let (weight_ptr, _weight_guard) = expert_weight.device_ptr(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_scatter_packed_route_slot_cuda(
+                        expert_ptr as *const ffi::Half,
+                        route_out_ptr as *mut ffi::Half,
+                        route_slot_ptr as *const i32,
+                        weight_ptr as *const f32,
+                        local_offsets_i32[local_expert_idx],
+                        local_counts_host[local_expert_idx],
+                        hidden.hidden_dim as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 recv expert route scatter failed: {err}")
+                    })?;
+                }
+            }
+            route_out
+        };
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_deepep_local_experts",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let mut combine_recv = HiddenStates::zeros(ctx, hidden.hidden_dim, total_send_routes)?;
+        comm.moe_grouped_send_recv_bf16(
+            &route_out.data,
+            &recv_hidden_offsets,
+            &recv_hidden_counts,
+            &mut combine_recv.data,
+            &send_hidden_offsets,
+            &send_hidden_counts,
+        )?;
+        let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
+        {
+            let (route_out_ptr, _route_guard) = combine_recv.data.device_ptr(&ctx.stream);
+            let (token_ptr, _token_guard) = send_token.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_combine_route_outputs_cuda(
+                    route_out_ptr as *const ffi::Half,
+                    token_ptr as *const i32,
+                    out_ptr as *mut ffi::Half,
+                    hidden.seq_len as i32,
+                    total_send_routes as i32,
+                    hidden.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 route combine failed: {err}"))?;
+            }
+        }
+        dsv4_moe_trace_end(ctx, "ffn_deepep_combine", layer_idx, hidden.seq_len, trace)?;
+        Ok(out)
+    }
+
     #[cfg(test)]
     fn route_local(
         &self,
@@ -664,6 +1188,71 @@ fn dsv4_moe_trace_end(
         layer_idx, phase, tokens, elapsed_ms
     );
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_counts_to_offsets_i32(counts: &[i32], label: &str) -> Result<(Vec<i32>, usize)> {
+    let mut offsets = Vec::with_capacity(counts.len());
+    let mut total = 0usize;
+    for &count in counts {
+        ensure!(
+            count >= 0,
+            "DeepSeek V4 {label} contains negative count {count}"
+        );
+        offsets.push(
+            i32::try_from(total)
+                .map_err(|_| anyhow::anyhow!("DeepSeek V4 {label} offset overflows i32"))?,
+        );
+        total = total
+            .checked_add(
+                usize::try_from(count)
+                    .map_err(|_| anyhow::anyhow!("DeepSeek V4 {label} count overflows usize"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 {label} total overflows usize"))?;
+    }
+    Ok((offsets, total))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_counts_to_usize(counts: &[i32], label: &str) -> Result<Vec<usize>> {
+    counts
+        .iter()
+        .map(|&count| {
+            ensure!(
+                count >= 0,
+                "DeepSeek V4 {label} contains negative count {count}"
+            );
+            usize::try_from(count)
+                .map_err(|_| anyhow::anyhow!("DeepSeek V4 {label} count overflows usize"))
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_offsets_to_usize(offsets: &[i32]) -> Result<Vec<usize>> {
+    offsets
+        .iter()
+        .map(|&offset| {
+            ensure!(
+                offset >= 0,
+                "DeepSeek V4 offset list contains negative offset {offset}"
+            );
+            usize::try_from(offset)
+                .map_err(|_| anyhow::anyhow!("DeepSeek V4 offset overflows usize"))
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_scale_usize(values: &[usize], factor: usize) -> Result<Vec<usize>> {
+    values
+        .iter()
+        .map(|&value| {
+            value
+                .checked_mul(factor)
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 scaled route extent overflows usize"))
+        })
+        .collect()
 }
 
 #[cfg(feature = "cuda")]

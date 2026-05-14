@@ -377,6 +377,37 @@ impl LayerCommunicator {
         Ok(LayerCommStatus::GroupedSendRecv)
     }
 
+    /// EP-axis grouped F32 send/recv for DeepEP-style route weights.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_grouped_send_recv_f32(
+        &self,
+        sendbuf: &CudaSlice<f32>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<f32>,
+        recv_offsets: &[usize],
+        recv_counts: &[usize],
+    ) -> Result<LayerCommStatus> {
+        if self.ep_world_size == 1 {
+            return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        let Some(nccl) = self.ep_nccl.as_ref() else {
+            bail!(
+                "MoE grouped F32 send/recv requires EP NCCL backend for world_size={}",
+                self.ep_world_size
+            );
+        };
+        nccl.grouped_send_recv_f32(
+            sendbuf,
+            send_offsets,
+            send_counts,
+            recvbuf,
+            recv_offsets,
+            recv_counts,
+        )?;
+        Ok(LayerCommStatus::GroupedSendRecv)
+    }
+
     pub fn all_reduce_post_attention<T>(&self, hidden: &mut [T]) -> Result<LayerCommStatus> {
         self.post_attn_all_reduce(hidden)
     }
