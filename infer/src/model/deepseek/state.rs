@@ -82,6 +82,7 @@ pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
     pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
+    pub(crate) shared_expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
 }
@@ -309,6 +310,44 @@ impl DeepseekMoeRuntimeCache {
             .expert
             .as_mut()
             .expect("DeepSeek V4 expert scratch allocated"))
+    }
+
+    pub(crate) fn ensure_shared_expert_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        output_dim: usize,
+        capacity_tokens: usize,
+    ) -> Result<&mut DeepseekExpertRuntimeScratch> {
+        let capacity_tokens = capacity_tokens.max(1);
+        let needs_alloc = self
+            .shared_expert
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_tokens < capacity_tokens
+                    || scratch.hidden_dim != hidden_dim
+                    || scratch.intermediate_dim != intermediate_dim
+                    || scratch.output_dim != output_dim
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            self.shared_expert = Some(DeepseekExpertRuntimeScratch {
+                capacity_tokens,
+                hidden_dim,
+                intermediate_dim,
+                output_dim,
+                input: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
+                gate: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
+                up: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
+                act: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
+                out: HiddenStates::zeros(ctx, output_dim, capacity_tokens)?,
+            });
+        }
+        Ok(self
+            .shared_expert
+            .as_mut()
+            .expect("DeepSeek V4 shared expert scratch allocated"))
     }
 
     pub(crate) fn ensure_grouped_expert_scratch(

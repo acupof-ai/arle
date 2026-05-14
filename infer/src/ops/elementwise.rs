@@ -42,6 +42,32 @@ pub(crate) fn add_batch_into(
     Ok(())
 }
 
+/// Batched element-wise add in place: `a += b`.
+pub(crate) fn add_batch_in_place(
+    ctx: &DeviceContext,
+    a: &mut HiddenStates,
+    b: &HiddenStates,
+) -> Result<()> {
+    assert_eq!(a.hidden_dim, b.hidden_dim);
+    assert_eq!(a.seq_len, b.seq_len);
+
+    let n = a.hidden_dim * a.seq_len;
+    let (a_ptr, _ga) = a.data.device_ptr_mut(&ctx.stream);
+    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::add_assign_cuda(
+            a_ptr as *mut ffi::Half,
+            b_ptr as *const ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
 /// Batched SiLU+mul: `out[i] = silu(gate[i]) * up[i]`
 pub fn silu_mul_batch(
     ctx: &DeviceContext,

@@ -103,6 +103,14 @@ Related governance docs:
   remaining cost center is not sampler or KV-cache lookup: runtime allocation,
   launch, memset, D2H routing readbacks, NCCL exchange/reduction, and per-expert
   GEMV still dominate before attention.
+- Reused per-layer DSv4 shared expert scratch during DeepEP decode and added an
+  in-place BF16 add kernel for accumulating shared expert output into the routed
+  MoE output. Real 8xH20 smoke stayed correct at 9.07-9.50 completion tok/s,
+  while the single-token nsys wave improved from 158.439 ms to 140.111 ms and
+  decode-only `cuMemAllocAsync`/`cuMemFreeAsync` calls fell from 9,136/9,144 to
+  7,416/7,424. The same step restored the CUDA `argmax_batch_readback_into`
+  re-export required by Qwen3.5 CUDA builds. The scratch is gated to B=1 decode
+  so long prefill does not retain prompt-sized shared expert buffers.
 - Optimized the gated DSv4 grouped expert prototype behind
   `ARLE_DSV4_GROUPED_EXPERTS=1` by caching per-layer local expert weight
   pointer arrays and launching indexed active experts instead of rebuilding

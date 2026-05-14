@@ -617,8 +617,8 @@ pub(crate) use elementwise::add_scaled_row_into;
 pub(crate) use elementwise::add_scaled_row_segment_into;
 #[cfg(feature = "cuda")]
 pub(crate) use elementwise::{
-    add_batch_into, dsv4_swiglu_clamped_batch_into, extract_vec, extract_vec_into,
-    silu_mul_batch_into, silu_mul_split_batch_into,
+    add_batch_in_place, add_batch_into, dsv4_swiglu_clamped_batch_into, extract_vec,
+    extract_vec_into, silu_mul_batch_into, silu_mul_split_batch_into,
 };
 #[cfg(feature = "cuda")]
 pub(crate) use linear::fused_mlp_into_with_scratch;
@@ -641,4 +641,6 @@ pub(crate) use recurrent::{
     gated_delta_rule_prefill_chunkwise_batch_into, gdr_decode_batch_into,
 };
 #[cfg(feature = "cuda")]
-pub(crate) use sampling::{argmax_batch_logprob_launch, gpu_sample_launch_raw};
+pub(crate) use sampling::{
+    argmax_batch_logprob_launch, argmax_batch_readback_into, gpu_sample_launch_raw,
+};

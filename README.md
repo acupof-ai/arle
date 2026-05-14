@@ -201,9 +201,12 @@ Operators who want only the native serving binary can use `infer` directly (`car
   single-token decode wave at **158 ms wall** and shows the concrete remaining
   stack: async allocation/free, launch/memset churn, D2H routing readbacks,
   NCCL SendRecv/AllReduce, local expert FP8/FP4 GEMV, then attention/MHC. That
-  leaves allocator lifetime or graph capture, fewer host readbacks,
-  lower-latency/overlapped DeepEP exchange, and true grouped GEMM/DeepGEMM as
-  the next targets.
+  led directly to shared expert scratch reuse plus an in-place BF16 add kernel:
+  short math/writing smoke now reaches **9.07-9.50 tok/s**, and the isolated
+  single-token nsys wave drops to **140 ms wall** with allocator calls down to
+  **7,416/7,424**. Remaining targets are fewer host route readbacks,
+  graph/lifetime cleanup, lower-latency/overlapped DeepEP exchange, and true
+  grouped GEMM/DeepGEMM.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)

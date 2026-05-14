@@ -240,6 +240,25 @@ extern "C" cudaError_t add_cuda(
   return cudaGetLastError();
 }
 
+__global__ void add_assign_bf16_kernel(
+    __nv_bfloat16 *a,
+    const __nv_bfloat16 *b,
+    int n) {
+  int idx = blockIdx.x * BASIC_BLOCK + threadIdx.x;
+  if (idx < n) {
+    a[idx] = __hadd_rn(a[idx], b[idx]);
+  }
+}
+
+extern "C" cudaError_t add_assign_cuda(
+    __nv_bfloat16 *a, const __nv_bfloat16 *b,
+    int n, cudaStream_t stream) {
+  int grid = (n + BASIC_BLOCK - 1) / BASIC_BLOCK;
+  if (grid == 0) return cudaSuccess;
+  add_assign_bf16_kernel<<<grid, BASIC_BLOCK, 0, stream>>>(a, b, n);
+  return cudaGetLastError();
+}
+
 // ============================================================================
 // Embedding lookup — single token decode
 // out[i] = table[token_id * hidden_dim + i] for i in 0..hidden_dim

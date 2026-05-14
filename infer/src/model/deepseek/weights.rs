@@ -1786,7 +1786,7 @@ impl DeepseekModel {
         layer_idx: usize,
         stream: &HiddenStates,
         tokens: &[u32],
-        moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
+        mut moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
         mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
     ) -> Result<HiddenStates> {
         ensure!(
@@ -1860,7 +1860,7 @@ impl DeepseekModel {
                     &self.config.ep,
                     &normed,
                     tokens,
-                    moe_scratch,
+                    moe_scratch.as_deref_mut(),
                 )?;
                 dsv4_trace_end(
                     &self.ctx,
@@ -1907,10 +1907,25 @@ impl DeepseekModel {
             routed
         };
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let ffn_out =
+        let ffn_out = if normed.seq_len == 1 {
+            if let Some(scratch) = moe_scratch.as_deref_mut() {
+                layer.ffn.add_shared_expert_with_scratch(
+                    &self.ctx,
+                    &normed,
+                    routed,
+                    self.config.swiglu_limit,
+                    scratch,
+                )?
+            } else {
+                layer
+                    .ffn
+                    .add_shared_expert(&self.ctx, &normed, routed, self.config.swiglu_limit)?
+            }
+        } else {
             layer
                 .ffn
-                .add_shared_expert(&self.ctx, &normed, routed, self.config.swiglu_limit)?;
+                .add_shared_expert(&self.ctx, &normed, routed, self.config.swiglu_limit)?
+        };
         dsv4_trace_end(&self.ctx, "ffn_shared", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
         hc_post_to_stream(

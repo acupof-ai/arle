@@ -1,0 +1,38 @@
+[
+  {
+    "case": "warmup",
+    "status": 200,
+    "latency_s": 0.447882,
+    "prompt_tokens": 13,
+    "completion_tokens": 1,
+    "completion_tok_s": 2.233,
+    "text": "2"
+  },
+  {
+    "case": "mul",
+    "status": 200,
+    "latency_s": 1.262907,
+    "prompt_tokens": 15,
+    "completion_tokens": 12,
+    "completion_tok_s": 9.502,
+    "text": "37 × 29 = 1073。  \n解释："
+  },
+  {
+    "case": "add",
+    "status": 200,
+    "latency_s": 1.267266,
+    "prompt_tokens": 15,
+    "completion_tokens": 12,
+    "completion_tok_s": 9.469,
+    "text": "58 + 67 等于 **125**。\n\n**简短"
+  },
+  {
+    "case": "write",
+    "status": 200,
+    "latency_s": 1.102889,
+    "prompt_tokens": 16,
+    "completion_tokens": 10,
+    "completion_tok_s": 9.067,
+    "text": "**智联万物，芯动未来。**"
+  }
+]

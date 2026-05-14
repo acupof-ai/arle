@@ -10,4 +10,6 @@ Current trace set:
 
 - [`nsys-one-token-current/`](nsys-one-token-current/) isolates one generated
   decode token with Nsight Systems.
-
+- [`shared-expert-scratch/`](shared-expert-scratch/) records the shared expert
+  scratch cleanup, including trace-off math/writing smoke and a single-token
+  Nsight comparison.
