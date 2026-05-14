@@ -88,6 +88,11 @@ Current trace set:
   output and exact arithmetic `410`, but route-grouped pair regresses `decode64`
   server-side completion throughput from 11.47 tok/s to 6.54 tok/s. The
   route-grouped path remains default-off.
+- [`bench-stream-recycle/`](bench-stream-recycle/) records the matching
+  trace-off HTTP smoke after incremental stream scratch recycling. The outputs
+  remain normal and the arithmetic case returns `410`; `decode64` is still
+  11.48 e2e requested tok/s, effectively unchanged from the 11.47 tok/s
+  default baseline.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789
@@ -120,6 +125,14 @@ Current trace set:
   D2H payload is only 44 KiB total. The steady-state bottleneck is NCCL
   SendRecv/AllReduce, local expert FP8/FP4 GEMV, CUDA launch overhead,
   allocator/free overhead, and route-count D2H synchronization.
+- [`nsys-single-decode-token-stream-recycle/`](nsys-single-decode-token-stream-recycle/)
+  validates incremental stream scratch recycling on the default fused-dispatch
+  DeepEP path. The `霓彩` output remains normal and the single decode wave drops
+  from 128.130 ms to 111.798 ms. Alloc/free overhead improves but remains
+  visible: `cuMemAllocAsync` falls from 8,453 calls / 16.802 ms to 7,757 calls /
+  12.574 ms, and `cuMemFreeAsync` falls from 6,048 calls / 13.801 ms to
+  5,352 calls / 11.096 ms. HTTP throughput remains essentially unchanged, so
+  the dominant target remains NCCL plus local expert GEMV.
 - [`nsys-single-decode-token-expert-grouped/`](nsys-single-decode-token-expert-grouped/)
   records the opt-in `ARLE_DSV4_GROUPED_EXPERTS=1` expert-wise grouped GEMV
   path after the same real decode warmup. The output remains `霓彩`, but the
