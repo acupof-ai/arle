@@ -1,0 +1,13 @@
+phase,count,p50_ms,p95_ms,max_ms
+ffn_total,2752,3.58,4.121,4.823
+ffn_deepep_dispatch_combine,2752,2.751,3.318,3.986
+ffn_deepep_dispatch,2752,0.318,0.4,0.46
+ffn_deepep_count_exchange,2752,0.183,0.481,0.639
+ffn_deepep_local_experts,2752,0.5255000000000001,0.966,1.949
+ffn_deepep_combine_exchange,2752,0.718,1.407,2.142
+ffn_deepep_combine_kernel,2752,0.029,0.05,0.089
+ffn_deepep_combine,2752,0.797,1.526,2.241
+attn_total,2752,1.555,2.232,2.801
+attn_core,2752,1.206,1.862,2.539
+attn_mhc,2752,0.137,0.18,0.239
+ffn_mhc,2752,0.139,0.176,0.218
