@@ -1,0 +1,10 @@
+{
+  "elapsed_s": 2.7959582805633545,
+  "status": 200,
+  "usage": {
+    "prompt_tokens": 14,
+    "completion_tokens": 7,
+    "total_tokens": 21
+  },
+  "text": "静水流深云淡风清"
+}

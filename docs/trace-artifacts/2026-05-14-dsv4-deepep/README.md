@@ -294,3 +294,42 @@ work:
 - Enable CUDA Graph/PDL after allocation and dynamic NCCL paths are made graph-safe.
 - Add B>1 vectorized decode after B=1 dispatch/combine is stable.
 - Add MTP after the decode path is vectorized and the sampler path is stable.
+
+## Nsight Decode Trace
+
+`nsys-single-token/` records a warmed 8xH20 HTTP decode profile captured with
+`nsys launch/start/stop`. A first `max_tokens=2` attempt only produced one
+completion token, so the actionable capture uses `max_tokens=8` and returns
+seven completion tokens: `静水流深云淡风清`.
+
+Decode waves in the Nsight capture are 257-270 ms wall each. Per GPU, summed
+CUDA kernel time is only about 81-102 ms per wave, so the remaining decode wall
+time is mostly host/runtime overhead: `cuStreamSynchronize`, async allocation
+and free, kernel launch, memset, and small-message communication boundaries.
+
+Top decode CUDA runtime API time per token/rank:
+
+| API | Time |
+| --- | ---: |
+| `cuStreamSynchronize` | 92.605 ms |
+| `cuMemFreeAsync` | 42.053 ms |
+| `cuMemAllocAsync` | 20.331 ms |
+| `cudaLaunchKernel` | 19.384 ms |
+| `cuMemsetD8Async` | 16.968 ms |
+
+Top decode CUDA kernel time per token/rank:
+
+| Kernel | Time |
+| --- | ---: |
+| `ncclDevKernel_SendRecv` | 28.858 ms |
+| `dsv4_fp8_gemv_batch_kernel` | 11.474 ms |
+| `dsv4_fp4_gemv_batch_tiled_kernel` | 10.871 ms |
+| `ncclDevKernel_AllReduce_Sum_bf16_RING_LL` | 7.934 ms |
+| `dsv4_hybrid_attention_kernel` | 7.406 ms |
+| `ncclDevKernel_AllGather_RING_LL` | 6.026 ms |
+
+The trace confirms the slow single-token decode is not explained by missing KV
+reads alone. The attention kernel is present and costs about 7.4 ms/token/rank,
+but the larger issue is that B=1 decode spends most wall time in synchronization,
+temporary allocation/free, launch overhead, and MoE/NCCL boundaries around many
+small kernels.
