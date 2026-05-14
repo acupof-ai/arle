@@ -32,6 +32,17 @@ Related governance docs:
   serializes cross-rank fanout submission, preventing rank 0 and follower ranks
   from entering different per-request token coordinators under concurrent
   traffic.
+- Allowed DSv4 decode to run scheduler batches larger than one via the existing
+  per-slot decode path. This keeps multi-slot distributed HTTP fanout alive
+  while the vectorized DSv4 B>1 decode kernel work remains pending.
+- Added DSv4 HTTP TP/EP axis overrides through the existing `INFER_TP_SIZE`
+  / `ARLE_TP_SIZE` and `INFER_EP_SIZE` / `ARLE_EP_SIZE` env vars. The default
+  remains the legacy overlapping TP=world, EP=world layout. The first 8xH20
+  profiling pass confirms the current runnable DSv4 layout is decode
+  communication-bound: default TP=8/EP=8 performs 86 all-reduces per generated
+  token per rank, and nsys observed 22016 NCCL all-reduce kernels for a
+  32-token decode window. Evidence and industry comparison are recorded in
+  [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
 
 ### CUDA
 

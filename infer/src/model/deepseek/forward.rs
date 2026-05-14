@@ -156,18 +156,15 @@ impl ModelForward for DeepseekModel {
         if tokens.is_empty() {
             return Ok(());
         }
-        ensure!(
-            tokens.len() == 1,
-            "DeepSeek V4 Phase 2A.0 supports only B=1 decode, got B={}",
-            tokens.len()
-        );
-        let slot_idx = slot_indices[0];
-        ensure!(
-            slot_idx < states.len(),
-            "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
-            states.len()
-        );
-        self.forward_decode(tokens[0], &mut states[slot_idx])
+        for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
+            ensure!(
+                slot_idx < states.len(),
+                "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
+                states.len()
+            );
+            self.forward_decode(token, &mut states[slot_idx])?;
+        }
+        Ok(())
     }
 
     fn forward_mixed_batch(
