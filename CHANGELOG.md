@@ -72,6 +72,10 @@ Related governance docs:
   padding without removing the dead send-count kernel regresses to 136.908 ms;
   the fixed trace (`nsys-single-token-padded-dispatch-skip-count`) validates the
   shipped B=1 decode path at 123.955 ms and records the remaining ranked costs.
+- Added the DSv4 padded peer-combine Nsight trace under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-token-padded-peer-combine/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-token-padded-peer-combine/).
+  The real 8xH20 run keeps the `霓彩` output and shows the single-token decode
+  wave at 112.133 ms after pre-summing padded return rows per origin peer.
 
 ### CUDA
 
@@ -185,6 +189,13 @@ Related governance docs:
   calls from 543 to 344. The remaining slow stack is NCCL SendRecv/AllReduce,
   launch/runtime and allocator/memset/free churn, local-count D2H, and local
   expert FP8/FP4 GEMV.
+- Optimized the B=1 padded return-side combine exchange by summing valid padded
+  route outputs into one BF16 row per origin peer on the expert rank before the
+  return send/recv. This keeps the same `霓彩` streaming output, reduces
+  returned combine rows by 8x, moves the real 8xH20 single-token decode wave
+  from 123.955 ms to 112.133 ms, and drops `ncclDevKernel_SendRecv` time from
+  25.211 ms to 23.329 ms per rank range. The local expert FP8/FP4 GEMV timings
+  are unchanged, so true grouped GEMM/DeepGEMM remains the next compute target.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

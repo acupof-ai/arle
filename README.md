@@ -222,9 +222,12 @@ Operators who want only the native serving binary can use `infer` directly (`car
   padded dispatch path now ships by default, skips its unused send-count kernel,
   removes that readback plus the count AllGather, and moves the same single
   token wave to **124 ms wall** with decode-only D2H calls **543 → 344**.
-  Remaining hard blockers are NCCL SendRecv/AllReduce, launch/runtime and
-  allocator/memset/free churn, the local-count D2H, and local expert FP8/FP4
-  GEMV.
+  The return-side combine path now also pre-sums valid padded route rows into
+  one BF16 row per origin peer before the return exchange, reducing returned
+  combine rows by **8×** and moving the wave to **112 ms wall**; `SendRecv`
+  time falls **25.211 → 23.329 ms** per rank range. Remaining hard blockers are
+  NCCL SendRecv/AllReduce, launch/runtime and allocator/memset/free churn, the
+  local-count D2H, and local expert FP8/FP4 GEMV.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)

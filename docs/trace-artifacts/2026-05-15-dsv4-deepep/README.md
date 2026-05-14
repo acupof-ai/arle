@@ -47,3 +47,10 @@ Current trace set:
   fall from 543 to 344 by deleting the 256-byte all-rank count readback. The
   remaining slow stack is NCCL SendRecv/AllReduce, launch/runtime churn,
   allocator/memset/free overhead, the local-count D2H, and FP8/FP4 expert GEMV.
+- [`nsys-single-token-padded-peer-combine/`](nsys-single-token-padded-peer-combine/)
+  adds the B=1 padded return-side combine optimization. Expert ranks now sum
+  padded `topk` route outputs into one row per origin peer before the return
+  exchange, shrinking combine payload from `ep_world * topk` rows to `ep_world`
+  rows. The same `霓彩` output measures a 112.133 ms decode wave; `SendRecv`
+  time drops from 25.211 ms to 23.329 ms per rank range, while local expert
+  FP8/FP4 GEMV remains essentially unchanged.
