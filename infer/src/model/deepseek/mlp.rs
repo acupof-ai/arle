@@ -15,6 +15,10 @@ use cuda_kernels::{
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 #[cfg(feature = "cuda")]
 use deepseek_spec::{DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
+#[cfg(feature = "cuda")]
+use log::info;
+#[cfg(feature = "cuda")]
+use std::time::Instant;
 
 #[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
@@ -244,7 +248,11 @@ impl DeepseekV4MoeBlock {
             self.experts.len()
         );
 
+        let trace = dsv4_moe_trace_begin(ctx)?;
         let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
+        dsv4_moe_trace_end(ctx, "ffn_route_logits", layer_idx, hidden.seq_len, trace)?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
         let token_ids_gpu = ctx
             .stream
             .clone_htod(token_ids)
@@ -257,6 +265,7 @@ impl DeepseekV4MoeBlock {
             .stream
             .alloc_zeros::<f32>(hidden.seq_len * config.num_experts_per_tok)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 route weight alloc failed: {err}"))?;
+        dsv4_moe_trace_end(ctx, "ffn_route_setup", layer_idx, hidden.seq_len, trace)?;
 
         let routing_kind = match config.moe_routing_kind(layer_idx) {
             DeepSeekV4MoeRoutingKind::Hash => 0,
@@ -280,6 +289,7 @@ impl DeepseekV4MoeBlock {
             );
         }
 
+        let trace = dsv4_moe_trace_begin(ctx)?;
         {
             let (logits_ptr, _logits_guard) = logits.data.device_ptr(&ctx.stream);
             let bias_guard;
@@ -325,6 +335,7 @@ impl DeepseekV4MoeBlock {
             drop(bias_guard);
             drop(tid_guard);
         }
+        dsv4_moe_trace_end(ctx, "ffn_route_select", layer_idx, hidden.seq_len, trace)?;
 
         let local_expert_start = ep.local_expert_range().start;
         let local_expert_start_i32 = i32::try_from(local_expert_start)
@@ -335,6 +346,7 @@ impl DeepseekV4MoeBlock {
             .stream
             .alloc_zeros::<i32>(ep.experts_per_rank)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route count alloc failed: {err}"))?;
+        let trace = dsv4_moe_trace_begin(ctx)?;
         {
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
             let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
@@ -352,10 +364,19 @@ impl DeepseekV4MoeBlock {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route count failed: {err}"))?;
             }
         }
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_route_count_kernel",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+        let trace = dsv4_moe_trace_begin(ctx)?;
         let counts_host = ctx
             .stream
             .clone_dtoh(&local_counts)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route count D2H failed: {err}"))?;
+        dsv4_moe_trace_end(ctx, "ffn_route_count_d2h", layer_idx, hidden.seq_len, trace)?;
         let mut offsets_host = Vec::with_capacity(ep.experts_per_rank);
         let mut total_local_routes = 0usize;
         for &count in &counts_host {
@@ -377,6 +398,7 @@ impl DeepseekV4MoeBlock {
             return Ok(out);
         }
 
+        let trace = dsv4_moe_trace_begin(ctx)?;
         let offsets_gpu = ctx
             .stream
             .clone_htod(&offsets_host)
@@ -394,6 +416,14 @@ impl DeepseekV4MoeBlock {
             .stream
             .alloc_zeros::<f32>(total_local_routes)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed weight alloc failed: {err}"))?;
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_route_pack_setup",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+        let trace = dsv4_moe_trace_begin(ctx)?;
         {
             let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
@@ -426,7 +456,15 @@ impl DeepseekV4MoeBlock {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 local expert pack failed: {err}"))?;
             }
         }
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_route_pack_kernel",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
 
+        let trace = dsv4_moe_trace_begin(ctx)?;
         for (local_expert_idx, expert) in self.experts.iter().enumerate() {
             let count = usize::try_from(counts_host[local_expert_idx])
                 .map_err(|_| anyhow::anyhow!("DeepSeek V4 local route count overflows usize"))?;
@@ -467,6 +505,7 @@ impl DeepseekV4MoeBlock {
                 })?;
             }
         }
+        dsv4_moe_trace_end(ctx, "ffn_expert_loop", layer_idx, hidden.seq_len, trace)?;
         Ok(out)
     }
 
@@ -586,6 +625,45 @@ impl DeepseekV4MoeBlock {
             })
             .collect()
     }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_moe_trace_enabled() -> bool {
+    std::env::var("ARLE_DSV4_TRACE_LAYER")
+        .ok()
+        .is_some_and(|raw| !matches!(raw.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_moe_trace_begin(ctx: &DeviceContext) -> Result<Instant> {
+    if dsv4_moe_trace_enabled() {
+        ctx.stream
+            .synchronize()
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 MoE trace pre-sync failed: {err}"))?;
+    }
+    Ok(Instant::now())
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_moe_trace_end(
+    ctx: &DeviceContext,
+    phase: &str,
+    layer_idx: usize,
+    tokens: usize,
+    started: Instant,
+) -> Result<()> {
+    if !dsv4_moe_trace_enabled() {
+        return Ok(());
+    }
+    ctx.stream
+        .synchronize()
+        .map_err(|err| anyhow::anyhow!("DeepSeek V4 MoE trace post-sync failed: {err}"))?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    info!(
+        "dsv4_trace layer={} phase={} tokens={} elapsed_ms={:.3}",
+        layer_idx, phase, tokens, elapsed_ms
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
