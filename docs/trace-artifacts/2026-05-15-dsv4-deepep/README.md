@@ -69,3 +69,10 @@ Current trace set:
   experiment is therefore gated behind `ARLE_DSV4_PAIR_EXPERT_GEMV=1` and
   default-off; simple gate/up fusion is not a substitute for real grouped
   GEMM/DeepGEMM plus DeepEP overlap.
+- [`nsys-single-decode-token-route-grouped/`](nsys-single-decode-token-route-grouped/)
+  records a negative route-wise grouped expert experiment behind
+  `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1`. It removes the local-count D2H readback
+  from the top runtime list, but the fixed padded route shape makes
+  `dsv4_fp4_route_gemv_batch_kernel` cost 35.895 ms per rank range and regresses
+  the single decode wave to 145.669 ms. This stays default-off; the compute
+  target remains real grouped GEMM/DeepGEMM, not route-wise GEMV.

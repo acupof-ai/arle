@@ -203,6 +203,14 @@ Related governance docs:
   (`23.207 ms` per rank range for the pair kernel, 127.412 ms decode wave), so
   the shipped default remains the split GEMV path while the next compute target
   stays true grouped GEMM/DeepGEMM.
+- Added and gated a DSv4 route-wise grouped expert experiment behind
+  `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1`. It runs local experts directly from
+  padded received route slots and removes the local-count D2H readback from the
+  top decode runtime list, but the real 8xH20 nsys trace regressed to a
+  145.669 ms single-token wave because `dsv4_fp4_route_gemv_batch_kernel`
+  costs 35.895 ms per rank range. The path remains default-off and documents
+  why the next compute step needs DeepGEMM-style grouped GEMM rather than
+  route-wise GEMV.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7
