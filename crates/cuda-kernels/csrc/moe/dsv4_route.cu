@@ -533,6 +533,113 @@ extern "C" CUresult dsv4_pack_expert_ranks_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_pack_dispatch_payload_kernel(
+    const uint16_t *__restrict__ hidden,
+    const int32_t *__restrict__ meta,
+    uint16_t *__restrict__ payload,
+    int num_routes,
+    int hidden_dim,
+    int stride_elems) {
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int meta_words = 3 * (int)sizeof(int32_t) / (int)sizeof(uint16_t);
+  int64_t total = (int64_t)num_routes * stride_elems;
+  if (idx >= total) return;
+
+  int route = (int)(idx / stride_elems);
+  int word = (int)(idx - (int64_t)route * stride_elems);
+  if (word < hidden_dim) {
+    payload[idx] = hidden[(int64_t)route * hidden_dim + word];
+  } else if (word < hidden_dim + meta_words) {
+    const uint8_t *meta_bytes_ptr = reinterpret_cast<const uint8_t *>(meta);
+    int meta_word = word - hidden_dim;
+    int64_t byte_offset = (int64_t)route * 3 * (int)sizeof(int32_t) +
+                          meta_word * (int)sizeof(uint16_t);
+    payload[idx] = (uint16_t)meta_bytes_ptr[byte_offset] |
+                   ((uint16_t)meta_bytes_ptr[byte_offset + 1] << 8);
+  } else {
+    payload[idx] = 0;
+  }
+}
+
+extern "C" CUresult dsv4_pack_dispatch_payload_cuda(
+    const uint16_t *hidden,
+    const int32_t *meta,
+    uint16_t *payload,
+    int num_routes,
+    int hidden_dim,
+    int stride_elems,
+    CUstream stream) {
+  if (num_routes < 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int meta_words = 3 * (int)sizeof(int32_t) / (int)sizeof(uint16_t);
+  if (stride_elems < hidden_dim + meta_words) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int64_t total = (int64_t)num_routes * stride_elems;
+  if (total == 0) return CUDA_SUCCESS;
+  int64_t grid64 = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  if (grid64 > INT32_MAX) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_pack_dispatch_payload_kernel<<<(int)grid64, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      hidden, meta, payload, num_routes, hidden_dim, stride_elems);
+  return (CUresult)cudaGetLastError();
+}
+
+__global__ void dsv4_unpack_dispatch_payload_kernel(
+    const uint16_t *__restrict__ payload,
+    uint16_t *__restrict__ hidden,
+    int32_t *__restrict__ meta,
+    int num_routes,
+    int hidden_dim,
+    int stride_elems) {
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int meta_words = 3 * (int)sizeof(int32_t) / (int)sizeof(uint16_t);
+  int64_t total = (int64_t)num_routes * stride_elems;
+  if (idx >= total) return;
+
+  int route = (int)(idx / stride_elems);
+  int word = (int)(idx - (int64_t)route * stride_elems);
+  if (word < hidden_dim) {
+    hidden[(int64_t)route * hidden_dim + word] = payload[idx];
+  } else if (word < hidden_dim + meta_words) {
+    uint8_t *meta_bytes_ptr = reinterpret_cast<uint8_t *>(meta);
+    int meta_word = word - hidden_dim;
+    int64_t byte_offset = (int64_t)route * 3 * (int)sizeof(int32_t) +
+                          meta_word * (int)sizeof(uint16_t);
+    uint16_t value = payload[idx];
+    meta_bytes_ptr[byte_offset] = (uint8_t)(value & 0xffu);
+    meta_bytes_ptr[byte_offset + 1] = (uint8_t)(value >> 8);
+  }
+}
+
+extern "C" CUresult dsv4_unpack_dispatch_payload_cuda(
+    const uint16_t *payload,
+    uint16_t *hidden,
+    int32_t *meta,
+    int num_routes,
+    int hidden_dim,
+    int stride_elems,
+    CUstream stream) {
+  if (num_routes < 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int meta_words = 3 * (int)sizeof(int32_t) / (int)sizeof(uint16_t);
+  if (stride_elems < hidden_dim + meta_words) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int64_t total = (int64_t)num_routes * stride_elems;
+  if (total == 0) return CUDA_SUCCESS;
+  int64_t grid64 = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  if (grid64 > INT32_MAX) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_unpack_dispatch_payload_kernel<<<(int)grid64, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      payload, hidden, meta, num_routes, hidden_dim, stride_elems);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_init_padded_route_slots_kernel(
     int32_t *__restrict__ packed_token,
     int32_t *__restrict__ packed_route_slot,

@@ -121,6 +121,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_pack_dispatch_payload_cuda(
+        hidden: *const Half,
+        meta: *const i32,
+        payload: *mut Half,
+        num_routes: i32,
+        hidden_dim: i32,
+        stride_elems: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_unpack_dispatch_payload_cuda(
+        payload: *const Half,
+        hidden: *mut Half,
+        meta: *mut i32,
+        num_routes: i32,
+        hidden_dim: i32,
+        stride_elems: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_init_padded_route_slots_cuda(
         packed_token: *mut i32,
         packed_route_slot: *mut i32,

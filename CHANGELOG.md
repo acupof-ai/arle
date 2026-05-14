@@ -76,6 +76,15 @@ Related governance docs:
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-token-padded-peer-combine/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-token-padded-peer-combine/).
   The real 8xH20 run keeps the `霓彩` output and shows the single-token decode
   wave at 112.133 ms after pre-summing padded return rows per origin peer.
+- Added the DSv4 fused dispatch payload Nsight trace and matching HTTP smoke
+  under [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/).
+  The real 8xH20 run keeps the `霓彩` output, cuts decode-window SendRecv
+  launches from 1,032 to 688 by exchanging hidden rows and route metadata in
+  one BF16 payload, and records a fresh isolated single-token decode wave at
+  118.985 ms. The trace-off `decode64` smoke returns normal English content at
+  12.22 post-first tok/s and the arithmetic case returns `410`; the nsys run
+  makes clear that NCCL exchange/reduction, launch overhead, allocator churn,
+  D2H, and local expert GEMV still dominate.
 
 ### CUDA
 
@@ -226,6 +235,15 @@ Related governance docs:
   decode wave moves from 125.497 ms to 112.724 ms; NCCL exchange, launch
   overhead, async allocation/free, and local expert FP8/FP4 GEMV remain the top
   targets.
+- Added the default DSv4 B=1 fused dispatch payload path. Padded DeepEP decode
+  now appends the route metadata as raw BF16 words behind each hidden row and
+  exchanges hidden+metadata through one BF16 grouped send/recv instead of
+  separate BF16 hidden and I32 metadata exchanges. Set
+  `ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=0` to force the old split exchange. Real
+  8xH20 nsys keeps the output correct, reduces SendRecv launches from 1,032 to
+  688, and records the isolated decode wave at 118.985 ms in the latest capture;
+  NCCL SendRecv/AllReduce, launch/runtime overhead, allocator churn, D2H, and
+  local expert FP8/FP4 GEMV remain the next targets.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7
