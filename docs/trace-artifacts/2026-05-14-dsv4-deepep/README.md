@@ -179,6 +179,39 @@ expert GEMMs. The next optimization has to target DeepEP-style communication
 overlap and real grouped GEMM/DeepGEMM rather than only the final combine
 scatter.
 
+## Combine Scratch and Trace Split
+
+The route-combine path now reuses per-layer MoE scratch for `combine_recv` and
+prefill `route_slot_out`. The same patch splits `ffn_deepep_combine` into:
+
+- `ffn_deepep_combine_exchange`: return-side grouped BF16 send/recv.
+- `ffn_deepep_combine_kernel`: route-slot zero/scatter/final sum.
+
+The compressed full trace log is committed as
+`arle-http-dsv4-combine-scratch-trace.log.gz`.
+
+Trace-off functional smoke:
+
+| Case | Prompt tokens | Completion tokens | Latency | Completion throughput | Output |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `37*29` | 17 | 11 | 1.968 s | 5.59 tok/s | `37 乘以 29 等于 1073。` |
+| `58+67` | 17 | 10 | 1.741 s | 5.75 tok/s | `58 加 67 等于 125。` |
+| writing | 22 | 34 | 5.141 s | 6.61 tok/s | `毫秒级响应，千亿级吞吐。智能调度算力...` |
+
+Matched 1,039-token trace request:
+
+| Metric | Route-slot combine | Scratch + split trace | Delta |
+| --- | ---: | ---: | ---: |
+| End-to-end latency | 16.826 s | 16.488 s | -2.0% |
+| `ffn_total` avg | 322.577 ms | 316.543 ms | -1.9% |
+| `ffn_deepep_combine` avg | 160.129 ms | 157.944 ms | -1.4% |
+| `ffn_deepep_combine_exchange` avg | n/a | 157.052 ms | dominant |
+| `ffn_deepep_combine_kernel` avg | n/a | 0.438 ms | not bottleneck |
+| Output | `37 × 29` | `37 × 29` | correct |
+
+This confirms the current prefill combine bottleneck is not the final route
+aggregation kernel. It is the return all-to-all exchange/synchronization.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not

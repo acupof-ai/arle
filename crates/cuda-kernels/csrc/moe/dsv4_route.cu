@@ -24,6 +24,19 @@ __device__ __forceinline__ float dsv4_route_i32_bits_to_f32(const int32_t value)
   return __int_as_float(value);
 }
 
+extern "C" CUresult dsv4_zero_bf16_cuda(
+    uint16_t *data,
+    int elements,
+    CUstream stream) {
+  if (elements < 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (elements == 0) return CUDA_SUCCESS;
+  cudaError_t err =
+      cudaMemsetAsync(data, 0, (size_t)elements * sizeof(uint16_t), (cudaStream_t)stream);
+  return (CUresult)err;
+}
+
 __device__ __forceinline__ float dsv4_route_sigmoid(float value) {
   if (value >= 0.0f) {
     return 1.0f / (1.0f + expf(-value));

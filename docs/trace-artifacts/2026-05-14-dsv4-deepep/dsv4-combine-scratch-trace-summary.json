@@ -1,0 +1,135 @@
+{
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle",
+  "model": "/root/DeepSeek-V4-Flash",
+  "commit_base": "49ce1593",
+  "change": {
+    "name": "combine scratch reuse and trace split",
+    "description": "Reuse per-layer MoE route-combine buffers for combine_recv and route_slot_out, add a CUDA memset wrapper for reused BF16 route-slot scratch, and split ffn_deepep_combine into exchange and kernel trace phases.",
+    "files": [
+      "crates/cuda-kernels/csrc/moe/dsv4_route.cu",
+      "crates/cuda-kernels/src/ffi/moe.rs",
+      "infer/src/model/deepseek/mlp.rs",
+      "infer/src/model/deepseek/state.rs"
+    ]
+  },
+  "validation": {
+    "local": [
+      "cargo fmt --check",
+      "git diff --check",
+      "cargo check -p infer --no-default-features --features no-cuda --lib"
+    ],
+    "remote": [
+      "cargo build --release -p infer --bin infer --features cuda,nccl"
+    ],
+    "trace_artifact": "arle-http-dsv4-combine-scratch-trace.log.gz"
+  },
+  "trace_off_smoke": [
+    {
+      "case": "math_37x29",
+      "elapsed_s": 1.968169,
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 11,
+        "total_tokens": 28
+      },
+      "completion_tok_s": 5.589,
+      "output": "37 \u4e58\u4ee5 29 \u7b49\u4e8e 1073\u3002"
+    },
+    {
+      "case": "math_58p67",
+      "elapsed_s": 1.740529,
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 10,
+        "total_tokens": 27
+      },
+      "completion_tok_s": 5.745,
+      "output": "58 \u52a0 67 \u7b49\u4e8e 125\u3002"
+    },
+    {
+      "case": "write_city",
+      "elapsed_s": 5.141199,
+      "usage": {
+        "prompt_tokens": 22,
+        "completion_tokens": 34,
+        "total_tokens": 56
+      },
+      "completion_tok_s": 6.613,
+      "output": "\u6beb\u79d2\u7ea7\u54cd\u5e94\uff0c\u5343\u4ebf\u7ea7\u541e\u5410\u3002\u667a\u80fd\u8c03\u5ea6\u7b97\u529b\uff0c\u7cbe\u51c6\u4f18\u5316\u8def\u5f84\u3002\u4ee5\u6781\u81f4\u6548\u7387\u9a71\u52a8AI\u8fb9\u754c\uff0c\u8ba9\u6bcf\u4e00\u6b21\u63a8\u7406\u90fd\u7cbe\u51c6\u5982\u521d\u3002"
+    }
+  ],
+  "trace_on_request": {
+    "prompt_tokens": 1039,
+    "completion_tokens": 4,
+    "elapsed_s": 16.487648,
+    "output": "37 \u00d7 29"
+  },
+  "prefill_tokens_1039": {
+    "ffn_total": {
+      "count": 344,
+      "sum_ms": 108890.779,
+      "avg_ms": 316.543,
+      "p50_ms": 297.224,
+      "p95_ms": 489.347,
+      "max_ms": 577.144
+    },
+    "ffn_deepep_dispatch_combine": {
+      "count": 344,
+      "sum_ms": 100919.355,
+      "avg_ms": 293.37,
+      "p50_ms": 274.268,
+      "p95_ms": 465.933,
+      "max_ms": 553.4
+    },
+    "ffn_deepep_combine": {
+      "count": 344,
+      "sum_ms": 54332.862,
+      "avg_ms": 157.944,
+      "p50_ms": 151.035,
+      "p95_ms": 365.234,
+      "max_ms": 545.236
+    },
+    "ffn_deepep_combine_exchange": {
+      "count": 344,
+      "sum_ms": 54025.883,
+      "avg_ms": 157.052,
+      "p50_ms": 149.828,
+      "p95_ms": 364.298,
+      "max_ms": 543.463
+    },
+    "ffn_deepep_combine_kernel": {
+      "count": 344,
+      "sum_ms": 150.55,
+      "avg_ms": 0.438,
+      "p50_ms": 0.242,
+      "p95_ms": 1.172,
+      "max_ms": 3.646
+    },
+    "ffn_deepep_local_experts": {
+      "count": 344,
+      "sum_ms": 44275.721,
+      "avg_ms": 128.708,
+      "p50_ms": 106.229,
+      "p95_ms": 317.627,
+      "max_ms": 547.287
+    }
+  },
+  "delta_vs_route_slot_summary": {
+    "baseline_artifact": "dsv4-prefill-slot-combine-summary.json",
+    "request_elapsed_s": -0.338244,
+    "request_elapsed_pct": -2.01,
+    "ffn_total_avg_ms": -6.034,
+    "ffn_total_avg_pct": -1.87,
+    "ffn_deepep_combine_avg_ms": -2.185,
+    "ffn_deepep_combine_avg_pct": -1.36
+  },
+  "conclusion": {
+    "status": "low_risk_incremental_gain_and_clearer_bottleneck",
+    "notes": [
+      "Scratch reuse removes repeated route-combine allocations but the measured gain is small.",
+      "The new split shows ffn_deepep_combine is almost entirely return exchange/synchronization: avg 157.052 ms exchange versus 0.438 ms kernel at 1039 tokens.",
+      "The next MoE work must overlap or replace the return all-to-all path and optimize local experts with grouped GEMM/DeepGEMM where hardware/toolkit support allows."
+    ]
+  }
+}

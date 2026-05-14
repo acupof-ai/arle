@@ -2,6 +2,8 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
+    pub fn dsv4_zero_bf16_cuda(data: *mut Half, elements: i32, stream: CUstream) -> CUresult;
+
     pub fn dsv4_mask_indices_by_ep_i64_cuda(
         indices: *const i64,
         masked_indices: *mut i64,
