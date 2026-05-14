@@ -48,9 +48,21 @@ Related governance docs:
   including the compressed raw nsys report/database, `nsys stats`, client JSON,
   server log, and SHA256 manifest. The trace record no longer depends on remote
   `/tmp` files.
+- Added DSv4 DeepEP MoE trace artifacts under
+  [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
+  including compressed BF16 and FP8 combine trace logs, parsed summaries, remote
+  build evidence, default trace-off post-checks, and the current bottleneck
+  callout for return-side combine exchange plus local expert GEMMs.
 
 ### CUDA
 
+- Added a gated DSv4 MoE combine exchange experiment via
+  `ARLE_DSV4_COMBINE_DTYPE=fp8`. The path quantizes return-route BF16 rows to
+  FP8 E4M3 with per-row FP32 scales, exchanges the FP8 payload through NCCL
+  `Uint8` send/recv plus scale exchange, and dequantizes back to BF16 before
+  the existing route-slot combine kernel. It is validated on 8xH20 but remains
+  opt-in because the measured 1,039-token prefill trace is not faster than the
+  BF16 combine default.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

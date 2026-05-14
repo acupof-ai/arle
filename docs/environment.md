@@ -220,18 +220,19 @@ export INFER_CUDA_DEVICE=1   # bind default context to GPU 1
 
 ### Single-node multi-GPU topology variables (F0.11)
 
-Status: documented contract for the single-node multi-GPU line. Only
-`INFER_CUDA_DEVICE` is active in the default single-rank runtime today. The
-multi-rank variables below are reserved for F1+ bootstrap; until that parser is
-wired, they must not be treated as evidence that TP/PP/EP serving is active.
+Status: documented contract for the single-node multi-GPU line.
+`INFER_CUDA_DEVICE` remains the default single-rank runtime selector. DeepSeek
+V4 distributed HTTP serving now consumes `INFER_CUDA_DEVICES` and the TP/EP
+axis size overrides below; generic Qwen TP/PP/EP serving remains staged unless
+a model path explicitly wires the corresponding collectives.
 
 | Variable | Parsed at startup today | Accepted range / format | Current behavior |
 |---|---|---|---|
 | `INFER_CUDA_DEVICE` | yes, by `DeviceContext::new()` | one CUDA ordinal, default `0` | Binds the single process to one GPU. Parse failure is a hard error. |
-| `INFER_CUDA_DEVICES` | no, reserved F1+ | comma-separated ordinals such as `0,1,2,3`; unique, non-empty | Future rank-thread bootstrap will map local ranks to these ordinals. |
-| `INFER_TP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future tensor-parallel world size. `1` means disabled. |
+| `INFER_CUDA_DEVICES` | yes, by distributed CUDA worker bootstrap | comma-separated ordinals such as `0,1,2,3`; unique, non-empty | Maps local rank threads to CUDA devices for distributed serving. |
+| `INFER_TP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Tensor-parallel axis size. DSv4 also accepts `ARLE_TP_SIZE`; unset DSv4 HTTP runs use the worker world size. |
 | `INFER_PP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future pipeline-parallel world size. `1` means disabled. |
-| `INFER_EP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future expert-parallel world size. `1` means disabled. |
+| `INFER_EP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Expert-parallel axis size. DSv4 also accepts `ARLE_EP_SIZE`; unset DSv4 HTTP runs use the worker world size. |
 | `INFER_ATTN_DP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future attention data-parallel axis. |
 | `INFER_ATTN_CP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future attention context-parallel axis. |
 | `INFER_NCCL_PORT` | no, reserved F1+ | TCP port `1..=65535` | Future convenience alias for `MASTER_PORT` during single-node rendezvous. |
@@ -278,6 +279,36 @@ multi_gpu_config:
   cuda_devices=[INFER_CUDA_DEVICE or 0]
   tp_size=1 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1
   world_size=1 status=single-rank
+```
+
+### DeepSeek V4 distributed CUDA debug variables
+
+Status: experimental DSv4 bring-up controls. These are intentionally documented
+as diagnostics and validation gates, not stable tuning API.
+
+| Variable | Values | Default | Current behavior |
+|---|---|---|---|
+| `ARLE_DSV4_MOE_BACKEND` | `deepep` or unset | model default | Selects the DSv4 MoE runtime. The high-performance route uses DeepEP-style dispatch/combine. |
+| `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
+| `ARLE_DSV4_TRACE_LAYER` | `1` / unset | unset | Emits CUDA-synchronizing per-layer phase traces. Use for diagnosis only; it changes latency. |
+| `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
+| `ARLE_DSV4_GROUPED_EXPERTS` | `1` / unset | unset | Enables the raw grouped expert GEMV prototype. It is functionally correct but slower than the default scratch-reuse path on B=1 decode. |
+| `ARLE_DSV4_COMBINE_DTYPE` | `bf16`, `fp8`, unset | `bf16` | Selects the return-side MoE combine exchange payload. `fp8` is validated as an opt-in experiment but is not faster than the BF16 default on the current 8xH20 trace. |
+
+Current DSv4 8-rank validation command shape:
+
+```bash
+ARLE_DSV4_MOE_BACKEND=deepep \
+ARLE_DSV4_INCREMENTAL_KV=1 \
+INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 \
+./target/release/infer \
+  --model-path /root/DeepSeek-V4-Flash \
+  --port 18084 \
+  --max-seq-len 900000 \
+  --kv-cache-dtype fp8 \
+  --num-slots 1 \
+  --deepseek-distributed-layers 43 \
+  --mem-fraction-static 0.1
 ```
 
 ### `INFER_TILELANG_PYTHON`

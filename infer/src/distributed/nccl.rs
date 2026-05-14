@@ -265,6 +265,71 @@ impl NcclGroup {
         group_result
     }
 
+    /// Grouped point-to-point U8 exchange for quantized MoE payloads.
+    pub fn grouped_send_recv_u8(
+        &self,
+        sendbuf: &CudaSlice<u8>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<u8>,
+        recv_offsets: &[usize],
+        recv_counts: &[usize],
+    ) -> Result<()> {
+        validate_grouped_exchange(
+            self.rank,
+            self.world_size,
+            sendbuf.len(),
+            send_offsets,
+            send_counts,
+            recvbuf.len(),
+            recv_offsets,
+            recv_counts,
+        )?;
+        self.copy_self_peer(sendbuf, send_offsets, send_counts, recvbuf, recv_offsets)?;
+
+        let (send_ptr, _send_record) = sendbuf.device_ptr(&self.stream);
+        let (recv_ptr, _recv_record) = recvbuf.device_ptr_mut(&self.stream);
+        self.comm.group_start()?;
+        let mut first_error = None;
+        for peer in 0..self.world_size {
+            if peer == self.rank || recv_counts[peer] == 0 {
+                continue;
+            }
+            let peer_ptr = unsafe { (recv_ptr as *mut u8).add(recv_offsets[peer]) };
+            if let Err(err) = self.comm.recv(
+                peer_ptr as *mut c_void,
+                recv_counts[peer],
+                ncclDataType_t::Uint8,
+                peer,
+                &self.stream,
+            ) && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        for peer in 0..self.world_size {
+            if peer == self.rank || send_counts[peer] == 0 {
+                continue;
+            }
+            let peer_ptr = unsafe { (send_ptr as *const u8).add(send_offsets[peer]) };
+            if let Err(err) = self.comm.send(
+                peer_ptr as *const c_void,
+                send_counts[peer],
+                ncclDataType_t::Uint8,
+                peer,
+                &self.stream,
+            ) && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        let group_result = self.comm.group_end();
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        group_result
+    }
+
     /// Grouped point-to-point F32 exchange for MoE route weights.
     pub fn grouped_send_recv_f32(
         &self,

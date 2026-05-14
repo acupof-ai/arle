@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include <cuda.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 
@@ -35,6 +36,40 @@ extern "C" CUresult dsv4_zero_bf16_cuda(
   cudaError_t err =
       cudaMemsetAsync(data, 0, (size_t)elements * sizeof(uint16_t), (cudaStream_t)stream);
   return (CUresult)err;
+}
+
+__global__ void dsv4_dequantize_fp8_rows_to_bf16_kernel(
+    const uint8_t *__restrict__ input,
+    const float *__restrict__ scales,
+    uint16_t *__restrict__ output,
+    int rows,
+    int cols) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * cols;
+  if (idx >= total) return;
+  int row = idx / cols;
+  __nv_fp8_e4m3 fp8;
+  *reinterpret_cast<uint8_t *>(&fp8) = input[idx];
+  float value = static_cast<float>(fp8) * scales[row];
+  output[idx] = dsv4_route_f32_to_bf16_bits(value);
+}
+
+extern "C" CUresult dsv4_dequantize_fp8_rows_to_bf16_cuda(
+    const uint8_t *input,
+    const float *scales,
+    uint16_t *output,
+    int rows,
+    int cols,
+    CUstream stream) {
+  if (rows < 0 || cols <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = rows * cols;
+  if (total == 0) return CUDA_SUCCESS;
+  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_dequantize_fp8_rows_to_bf16_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      input, scales, output, rows, cols);
+  return (CUresult)cudaGetLastError();
 }
 
 __device__ __forceinline__ float dsv4_route_sigmoid(float value) {

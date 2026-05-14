@@ -212,6 +212,44 @@ Matched 1,039-token trace request:
 This confirms the current prefill combine bottleneck is not the final route
 aggregation kernel. It is the return all-to-all exchange/synchronization.
 
+## FP8 Combine Exchange Experiment
+
+The return-side MoE combine exchange has a gated FP8 E4M3 experiment behind
+`ARLE_DSV4_COMBINE_DTYPE=fp8`. It quantizes each BF16 route-output row with a
+per-row FP32 scale, exchanges the FP8 payload plus scales, then dequantizes back
+to BF16 before the existing route-slot combine kernel. The default remains the
+BF16 exchange path.
+
+The full FP8 trace log is committed as
+`arle-http-dsv4-combine-fp8-trace.log.gz`; the parsed record is
+`dsv4-combine-fp8-experiment-summary.json`.
+
+Matched 1,039-token trace request:
+
+| Metric | BF16 scratch default | FP8 combine experiment | Delta |
+| --- | ---: | ---: | ---: |
+| End-to-end latency | 16.488 s | 17.505 s | +6.2% |
+| `ffn_total` avg | 316.543 ms | 318.873 ms | +0.7% |
+| `ffn_deepep_dispatch_combine` avg | 293.370 ms | 295.244 ms | +0.6% |
+| `ffn_deepep_combine` avg | 157.944 ms | 158.361 ms | +0.3% |
+| `ffn_deepep_combine_exchange` avg | 157.052 ms | 156.936 ms | -0.1% |
+| `ffn_deepep_combine_kernel` avg | 0.438 ms | 0.362 ms | -17.4% |
+| Output | `37 × 29` | `37 × 29 = 1073` | correct |
+
+Trace-off default post-check after this change:
+
+| Case | Prompt tokens | Completion tokens | Latency | Completion throughput | Output |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `37*29` | 19 | 11 | 1.997 s | 5.51 tok/s | `37 乘以 29 等于 1073。` |
+| `58+67` | 19 | 10 | 1.795 s | 5.57 tok/s | `58 加 67 等于 125。` |
+| writing | 20 | 19 | 3.142 s | 6.05 tok/s | `毫秒级响应，万亿级参数。算力极致调度，智能无界延伸。` |
+
+Conclusion: FP8 combine is functionally correct but not a throughput win on the
+current 8xH20 shape. The smaller payload is offset by the extra FP32 scale
+exchange plus quantize/dequantize kernels, so the path stays opt-in. The
+highest-value work remains real grouped GEMM/DeepGEMM for local experts and a
+combine strategy that reduces or overlaps the return all-to-all synchronization.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not

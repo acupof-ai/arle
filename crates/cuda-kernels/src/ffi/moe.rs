@@ -4,6 +4,15 @@ use super::{CUresult, CUstream, Half};
 unsafe extern "C" {
     pub fn dsv4_zero_bf16_cuda(data: *mut Half, elements: i32, stream: CUstream) -> CUresult;
 
+    pub fn dsv4_dequantize_fp8_rows_to_bf16_cuda(
+        input: *const u8,
+        scales: *const f32,
+        output: *mut Half,
+        rows: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_mask_indices_by_ep_i64_cuda(
         indices: *const i64,
         masked_indices: *mut i64,
