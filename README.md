@@ -254,7 +254,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   the token is still dominated by `ncclDevKernel_SendRecv`
   (**50.3 ms/rank-range**), FP4 route pair GEMV (**19.6 ms**), FP4 route
   `w2` GEMV (**10.5 ms**), FP8 GEMV (**9.4 ms**), plus allocation and launch
-  overhead, so the path stays opt-in.
+  overhead, so the path stays opt-in. A subsequent default-path incremental
+  stream scratch recycle lowers the warmed single-token nsys wave
+  **128.1 → 111.8 ms** and cuts allocator/free calls
+  **8,453/6,048 → 7,757/5,352**, while trace-off HTTP `decode64` stays flat at
+  **11.48 tok/s**; the end-to-end blocker remains NCCL plus local expert GEMV.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)

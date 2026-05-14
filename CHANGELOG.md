@@ -116,6 +116,17 @@ Related governance docs:
   arithmetic at `410`; `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1` returns normal text
   and the same arithmetic answer but regresses `decode64` to 6.54 completion
   tok/s. Route-wise grouped GEMV remains default-off.
+- Added DSv4 incremental stream scratch recycling and captured both the HTTP
+  smoke and Nsight follow-up under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-stream-recycle/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-stream-recycle/)
+  and
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-stream-recycle/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-stream-recycle/).
+  The real 8xH20 run keeps normal text and arithmetic `410`; the isolated
+  warmed decode wave improves from 128.130 ms to 111.798 ms, with
+  `cuMemAllocAsync` dropping from 8,453 calls / 16.802 ms to 7,757 calls /
+  12.574 ms and `cuMemFreeAsync` from 6,048 calls / 13.801 ms to 5,352 calls /
+  11.096 ms. HTTP `decode64` stays effectively flat at 11.48 tok/s, so the
+  main target remains NCCL plus local expert GEMV.
 
 ### CUDA
 

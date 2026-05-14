@@ -47,6 +47,7 @@ pub struct DeepseekState {
 pub(crate) struct DeepseekIncrementalState {
     pub(crate) processed_tokens: usize,
     pub(crate) layers: Vec<DeepseekLayerRuntimeCache>,
+    pub(crate) stream_recycle: Option<DeepseekHiddenRuntimeScratch>,
 }
 
 #[cfg(feature = "cuda")]
@@ -69,10 +70,12 @@ impl DeepseekIncrementalState {
 pub(crate) struct DeepseekLayerRuntimeCache {
     pub(crate) attention: DeepseekAttentionRuntimeCache,
     pub(crate) moe: DeepseekMoeRuntimeCache,
+    pub(crate) stream_recycle: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) attn_mhc: Option<DeepseekMhcRuntimeScratch>,
     pub(crate) ffn_mhc: Option<DeepseekMhcRuntimeScratch>,
     pub(crate) attn_pre: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) attn_normed: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) attn_post: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) ffn_pre: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) ffn_normed: Option<DeepseekHiddenRuntimeScratch>,
 }
@@ -661,6 +664,38 @@ pub(crate) fn ensure_hidden_scratch<'a>(
     let scratch = slot.as_mut().expect("DeepSeek V4 hidden scratch allocated");
     scratch.hidden.seq_len = seq_len;
     Ok(&mut scratch.hidden)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn take_hidden_scratch(
+    slot: &mut Option<DeepseekHiddenRuntimeScratch>,
+    ctx: &DeviceContext,
+    hidden_dim: usize,
+    seq_len: usize,
+) -> Result<DeepseekHiddenRuntimeScratch> {
+    let capacity_tokens = seq_len.max(1);
+    let scratch = match slot.take() {
+        Some(mut scratch)
+            if scratch.capacity_tokens >= capacity_tokens && scratch.hidden_dim == hidden_dim =>
+        {
+            scratch.hidden.seq_len = seq_len;
+            scratch
+        }
+        _ => DeepseekHiddenRuntimeScratch {
+            capacity_tokens,
+            hidden_dim,
+            hidden: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_tokens)? },
+        },
+    };
+    Ok(scratch)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn put_hidden_scratch(
+    slot: &mut Option<DeepseekHiddenRuntimeScratch>,
+    scratch: DeepseekHiddenRuntimeScratch,
+) {
+    *slot = Some(scratch);
 }
 
 #[cfg(feature = "cuda")]

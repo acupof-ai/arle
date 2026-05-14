@@ -27,7 +27,8 @@ use super::mlp::{DeepseekV4Expert, DeepseekV4MoeBlock};
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache, DeepseekHiddenRuntimeScratch,
-    DeepseekMhcRuntimeScratch, ensure_hidden_scratch, ensure_mhc_scratch,
+    DeepseekMhcRuntimeScratch, ensure_hidden_scratch, ensure_mhc_scratch, put_hidden_scratch,
+    take_hidden_scratch,
 };
 #[cfg(all(test, feature = "cuda"))]
 use super::state::{DeepseekCompressedRow, DeepseekCompressorRuntimeCache};
@@ -461,11 +462,19 @@ impl DeepseekModel {
 
         let embeddings =
             common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, self.config.hidden_size)?;
-        let mut stream = initial_hc_stream_from_embeddings(
+        let stream_hidden_dim = self.config.hidden_size * self.config.hc_mult;
+        let mut stream = take_hidden_scratch(
+            &mut state.incremental.stream_recycle,
+            &self.ctx,
+            stream_hidden_dim,
+            tokens.len(),
+        )?;
+        initial_hc_stream_from_embeddings_into(
             &self.ctx,
             &embeddings,
             self.config.hidden_size,
             self.config.hc_mult,
+            &mut stream.hidden,
         )?;
         for layer_idx in 0..self.layers.len() {
             let layer_cache = state
@@ -473,24 +482,34 @@ impl DeepseekModel {
                 .layers
                 .get_mut(layer_idx)
                 .expect("incremental cache layer initialized");
-            stream = self.forward_transformer_layer_stream_incremental(
+            let mut next_stream = take_hidden_scratch(
+                &mut layer_cache.stream_recycle,
+                &self.ctx,
+                stream_hidden_dim,
+                tokens.len(),
+            )?;
+            self.forward_transformer_layer_stream_incremental_into(
                 layer_idx,
-                &stream,
+                &stream.hidden,
                 tokens,
                 start_pos,
                 layer_cache,
+                &mut next_stream.hidden,
             )?;
+            put_hidden_scratch(&mut layer_cache.stream_recycle, stream);
+            stream = next_stream;
         }
         state.incremental.processed_tokens += tokens.len();
 
         if !emit_logits {
+            put_hidden_scratch(&mut state.incremental.stream_recycle, stream);
             return Ok(None);
         }
 
         let hidden = head_hidden_from_stream(
             &self.ctx,
             head_hc,
-            &stream,
+            &stream.hidden,
             tokens.len() - 1,
             self.config.hidden_size,
             self.config.hc_mult,
@@ -504,6 +523,7 @@ impl DeepseekModel {
             self.config.rms_norm_eps,
             false,
         )?;
+        put_hidden_scratch(&mut state.incremental.stream_recycle, stream);
         Ok(Some(logits.with_label("dsv4_incremental_top_level_logits")))
     }
 
@@ -582,19 +602,36 @@ impl DeepseekModel {
         Ok(stream)
     }
 
-    fn forward_transformer_layer_stream_incremental(
+    fn forward_transformer_layer_stream_incremental_into(
         &self,
         layer_idx: usize,
         stream: &HiddenStates,
         tokens: &[u32],
         start_pos: usize,
         cache: &mut super::state::DeepseekLayerRuntimeCache,
-    ) -> Result<HiddenStates> {
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         ensure!(
             tokens.len() == stream.seq_len,
             "DeepSeek V4 incremental full layer token count {} does not match stream seq_len {}",
             tokens.len(),
             stream.seq_len
+        );
+        ensure!(
+            stream.hidden_dim == self.config.hidden_size * self.config.hc_mult,
+            "DeepSeek V4 incremental full layer stream dim {} does not match hidden_size {} * hc_mult {}",
+            stream.hidden_dim,
+            self.config.hidden_size,
+            self.config.hc_mult
+        );
+        ensure!(
+            out.hidden_dim == self.config.hidden_size * self.config.hc_mult
+                && out.seq_len == stream.seq_len,
+            "DeepSeek V4 incremental full layer output shape mismatch: out={}x{} expected={}x{}",
+            out.seq_len,
+            out.hidden_dim,
+            stream.seq_len,
+            self.config.hidden_size * self.config.hc_mult
         );
         let layer = self.layers.get(layer_idx).ok_or_else(|| {
             anyhow::anyhow!(
@@ -661,7 +698,13 @@ impl DeepseekModel {
         )?;
         dsv4_trace_end(&self.ctx, "attn_total", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let stream = hc_post_to_stream(
+        let attn_stream = ensure_hidden_scratch(
+            &mut cache.attn_post,
+            &self.ctx,
+            self.config.hidden_size * self.config.hc_mult,
+            stream.seq_len,
+        )?;
+        hc_post_to_stream_into(
             &self.ctx,
             &attn_out,
             stream,
@@ -669,28 +712,36 @@ impl DeepseekModel {
             mhc.comb(),
             self.config.hidden_size,
             self.config.hc_mult,
+            attn_stream,
         )?;
-        dsv4_trace_end(&self.ctx, "attn_post", layer_idx, stream.seq_len, trace)?;
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_post",
+            layer_idx,
+            attn_stream.seq_len,
+            trace,
+        )?;
         let trace = dsv4_trace_begin(&self.ctx)?;
         let ffn_mhc_scratch = ensure_mhc_scratch(
             &mut cache.ffn_mhc,
             &self.ctx,
-            stream.hidden_dim,
+            attn_stream.hidden_dim,
             layer.hc_ffn.mix_fn.rows,
             self.config.hc_mult,
-            stream.seq_len,
+            attn_stream.seq_len,
         )?;
-        let stream = self.forward_ffn_layer_stream_with_scratch(
+        self.forward_ffn_layer_stream_with_scratch_into(
             layer_idx,
-            &stream,
+            attn_stream,
             tokens,
             Some(&mut cache.moe),
             Some(ffn_mhc_scratch),
             Some(&mut cache.ffn_pre),
             Some(&mut cache.ffn_normed),
+            out,
         )?;
-        dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, stream.seq_len, trace)?;
-        Ok(stream)
+        dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, out.seq_len, trace)?;
+        Ok(())
     }
 
     fn forward_sliding_window_attention(
@@ -1807,11 +1858,59 @@ impl DeepseekModel {
         layer_idx: usize,
         stream: &HiddenStates,
         tokens: &[u32],
-        mut moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
+        moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
         mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
         ffn_pre_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
         ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
     ) -> Result<HiddenStates> {
+        self.forward_ffn_layer_stream_with_scratch_impl(
+            layer_idx,
+            stream,
+            tokens,
+            moe_scratch,
+            mhc_scratch,
+            ffn_pre_scratch,
+            ffn_normed_scratch,
+            None,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 FFN owned output missing"))
+    }
+
+    fn forward_ffn_layer_stream_with_scratch_into(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        tokens: &[u32],
+        moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
+        mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
+        ffn_pre_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
+        ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        self.forward_ffn_layer_stream_with_scratch_impl(
+            layer_idx,
+            stream,
+            tokens,
+            moe_scratch,
+            mhc_scratch,
+            ffn_pre_scratch,
+            ffn_normed_scratch,
+            Some(out),
+        )?;
+        Ok(())
+    }
+
+    fn forward_ffn_layer_stream_with_scratch_impl(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        tokens: &[u32],
+        mut moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
+        mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
+        ffn_pre_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
+        ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
+        post_out: Option<&mut HiddenStates>,
+    ) -> Result<Option<HiddenStates>> {
         ensure!(
             tokens.len() == stream.seq_len,
             "DeepSeek V4 FFN layer token count {} does not match stream seq_len {}",
@@ -1984,19 +2083,31 @@ impl DeepseekModel {
         };
         dsv4_trace_end(&self.ctx, "ffn_shared", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        hc_post_to_stream(
-            &self.ctx,
-            &ffn_out,
-            stream,
-            mhc.post(),
-            mhc.comb(),
-            self.config.hidden_size,
-            self.config.hc_mult,
-        )
-        .and_then(|out| {
-            dsv4_trace_end(&self.ctx, "ffn_post", layer_idx, stream.seq_len, trace)?;
-            Ok(out)
-        })
+        let owned_out = if let Some(out) = post_out {
+            hc_post_to_stream_into(
+                &self.ctx,
+                &ffn_out,
+                stream,
+                mhc.post(),
+                mhc.comb(),
+                self.config.hidden_size,
+                self.config.hc_mult,
+                out,
+            )?;
+            None
+        } else {
+            Some(hc_post_to_stream(
+                &self.ctx,
+                &ffn_out,
+                stream,
+                mhc.post(),
+                mhc.comb(),
+                self.config.hidden_size,
+                self.config.hc_mult,
+            )?)
+        };
+        dsv4_trace_end(&self.ctx, "ffn_post", layer_idx, stream.seq_len, trace)?;
+        Ok(owned_out)
     }
 
     pub(super) fn compute_reference_logits_after_prefill(
@@ -2332,6 +2443,20 @@ fn initial_hc_stream_from_embeddings(
     hidden_size: usize,
     hc_mult: usize,
 ) -> Result<HiddenStates> {
+    let stream_hidden = hidden_size * hc_mult;
+    let mut stream = unsafe { HiddenStates::uninit(ctx, stream_hidden, embeddings.seq_len)? };
+    initial_hc_stream_from_embeddings_into(ctx, embeddings, hidden_size, hc_mult, &mut stream)?;
+    Ok(stream)
+}
+
+#[cfg(feature = "cuda")]
+fn initial_hc_stream_from_embeddings_into(
+    ctx: &DeviceContext,
+    embeddings: &HiddenStates,
+    hidden_size: usize,
+    hc_mult: usize,
+    stream: &mut HiddenStates,
+) -> Result<()> {
     ensure!(
         embeddings.hidden_dim == hidden_size,
         "DeepSeek V4 embedding hidden dim {} does not match hidden_size {}",
@@ -2340,7 +2465,14 @@ fn initial_hc_stream_from_embeddings(
     );
     ensure!(hc_mult > 0, "DeepSeek V4 hc_mult must be non-zero");
     let stream_hidden = hidden_size * hc_mult;
-    let mut stream = unsafe { HiddenStates::uninit(ctx, stream_hidden, embeddings.seq_len)? };
+    ensure!(
+        stream.hidden_dim == stream_hidden && stream.seq_len == embeddings.seq_len,
+        "DeepSeek V4 initial HC stream output shape mismatch: out={}x{} expected={}x{}",
+        stream.seq_len,
+        stream.hidden_dim,
+        embeddings.seq_len,
+        stream_hidden
+    );
     {
         let (emb_ptr, _emb_guard) = embeddings.data.device_ptr(&ctx.stream);
         let (out_ptr, _out_guard) = stream.data.device_ptr_mut(&ctx.stream);
@@ -2357,7 +2489,7 @@ fn initial_hc_stream_from_embeddings(
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 initial HC expand CUDA failed: {err}"))?;
         }
     }
-    Ok(stream)
+    Ok(())
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -2758,6 +2890,31 @@ fn hc_post_to_stream(
     hidden_size: usize,
     hc_mult: usize,
 ) -> Result<HiddenStates> {
+    let mut out = unsafe { HiddenStates::uninit(ctx, hidden_size * hc_mult, residual.seq_len)? };
+    hc_post_to_stream_into(
+        ctx,
+        new_x,
+        residual,
+        post,
+        comb,
+        hidden_size,
+        hc_mult,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn hc_post_to_stream_into(
+    ctx: &DeviceContext,
+    new_x: &HiddenStates,
+    residual: &HiddenStates,
+    post: &CudaSlice<f32>,
+    comb: &CudaSlice<f32>,
+    hidden_size: usize,
+    hc_mult: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
     ensure!(
         new_x.hidden_dim == hidden_size && residual.hidden_dim == hidden_size * hc_mult,
         "DeepSeek V4 HC post dim mismatch: new_x={} residual={} hidden_size={} hc_mult={}",
@@ -2781,8 +2938,15 @@ fn hc_post_to_stream(
         residual.seq_len,
         hc_mult
     );
+    ensure!(
+        out.hidden_dim == hidden_size * hc_mult && out.seq_len == residual.seq_len,
+        "DeepSeek V4 HC post output shape mismatch: out={}x{} expected={}x{}",
+        out.seq_len,
+        out.hidden_dim,
+        residual.seq_len,
+        hidden_size * hc_mult
+    );
 
-    let mut out = unsafe { HiddenStates::uninit(ctx, hidden_size * hc_mult, residual.seq_len)? };
     {
         let (new_ptr, _new_guard) = new_x.data.device_ptr(&ctx.stream);
         let (residual_ptr, _residual_guard) = residual.data.device_ptr(&ctx.stream);
@@ -2805,7 +2969,7 @@ fn hc_post_to_stream(
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 HC post CUDA failed: {err}"))?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(all(test, feature = "cuda"))]
