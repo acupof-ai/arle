@@ -17,6 +17,8 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn add_assign_cuda(a: *mut Half, b: *const Half, n: i32, stream: CUstream) -> CUresult;
+
     pub fn silu_mul_cuda(
         gate: *const Half,
         up: *const Half,

@@ -136,6 +136,58 @@ impl DeepseekV4Expert {
         ops::try_gemm_with_phase_into(ctx, &self.w2, &scratch.act, &mut scratch.out, phase)?;
         Ok(&scratch.out)
     }
+
+    pub(super) fn forward_with_scratch<'a>(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &HiddenStates,
+        swiglu_limit: f32,
+        scratch: &'a mut DeepseekExpertRuntimeScratch,
+    ) -> Result<&'a HiddenStates> {
+        ensure!(
+            self.w1.cols == hidden.hidden_dim && self.w3.cols == hidden.hidden_dim,
+            "DeepSeek V4 expert input width mismatch: hidden_dim={} w1.cols={} w3.cols={}",
+            hidden.hidden_dim,
+            self.w1.cols,
+            self.w3.cols
+        );
+        ensure!(
+            self.w1.rows == self.w3.rows && self.w2.cols == self.w1.rows,
+            "DeepSeek V4 expert intermediate mismatch: w1.rows={} w3.rows={} w2.cols={}",
+            self.w1.rows,
+            self.w3.rows,
+            self.w2.cols
+        );
+        ensure!(
+            scratch.capacity_tokens >= hidden.seq_len
+                && scratch.hidden_dim == hidden.hidden_dim
+                && scratch.intermediate_dim == self.w1.rows
+                && scratch.output_dim == self.w2.rows,
+            "DeepSeek V4 expert scratch shape mismatch"
+        );
+
+        scratch.gate.seq_len = hidden.seq_len;
+        scratch.up.seq_len = hidden.seq_len;
+        scratch.act.seq_len = hidden.seq_len;
+        scratch.out.seq_len = hidden.seq_len;
+
+        let phase = if hidden.seq_len > 1 {
+            ops::LinearDispatchPhase::Prefill
+        } else {
+            ops::LinearDispatchPhase::Decode
+        };
+        ops::try_gemm_with_phase_into(ctx, &self.w1, hidden, &mut scratch.gate, phase)?;
+        ops::try_gemm_with_phase_into(ctx, &self.w3, hidden, &mut scratch.up, phase)?;
+        ops::dsv4_swiglu_clamped_batch_into(
+            ctx,
+            &scratch.gate,
+            &scratch.up,
+            &mut scratch.act,
+            swiglu_limit,
+        )?;
+        ops::try_gemm_with_phase_into(ctx, &self.w2, &scratch.act, &mut scratch.out, phase)?;
+        Ok(&scratch.out)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -649,6 +701,29 @@ impl DeepseekV4MoeBlock {
         };
         let shared = shared.forward(ctx, hidden, swiglu_limit)?;
         ops::add_batch(ctx, &routed, &shared)
+    }
+
+    pub(super) fn add_shared_expert_with_scratch(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &HiddenStates,
+        mut routed: HiddenStates,
+        swiglu_limit: f32,
+        scratch_cache: &mut DeepseekMoeRuntimeCache,
+    ) -> Result<HiddenStates> {
+        let Some(shared) = &self.shared_experts else {
+            return Ok(routed);
+        };
+        let scratch = scratch_cache.ensure_shared_expert_scratch(
+            ctx,
+            hidden.hidden_dim,
+            shared.w1.rows,
+            shared.w2.rows,
+            hidden.seq_len,
+        )?;
+        let shared = shared.forward_with_scratch(ctx, hidden, swiglu_limit, scratch)?;
+        ops::add_batch_in_place(ctx, &mut routed, shared)?;
+        Ok(routed)
     }
 
     /// Route tokens with the loaded gate tensors, localize routes to this EP
