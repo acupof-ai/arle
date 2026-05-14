@@ -86,6 +86,12 @@ Related governance docs:
   single-token nsys window improved from 191.152 ms to 148.253 ms while
   reducing decode-only `cuMemAllocAsync`/`cuMemFreeAsync` calls to
   9,480/9,488 and `cuMemsetD8Async` calls to 10,554.
+- Reused the DSv4 B=1 decode MoE route-logits buffer and preallocated its
+  one-token scratch during prefill. This is an allocator-count cleanup rather
+  than a confirmed wall-time win: the single-token nsys window reduced
+  decode-only `cuMemAllocAsync`/`cuMemFreeAsync` calls again to 9,136/9,144 and
+  `cuMemsetD8Async` calls to 10,210, while the captured wall time was noisy
+  at 162.062 ms versus the prior 148.253 ms.
 - Optimized the gated DSv4 grouped expert prototype behind
   `ARLE_DSV4_GROUPED_EXPERTS=1` by caching per-layer local expert weight
   pointer arrays and launching indexed active experts instead of rebuilding

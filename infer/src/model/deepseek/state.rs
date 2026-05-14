@@ -76,6 +76,7 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub(crate) struct DeepseekMoeRuntimeCache {
+    pub(crate) route_logits: Option<DeepseekRouteLogitsRuntimeScratch>,
     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
@@ -83,6 +84,13 @@ pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekRouteLogitsRuntimeScratch {
+    pub(crate) capacity_tokens: usize,
+    pub(crate) n_experts: usize,
+    pub(crate) logits: HiddenStates,
 }
 
 #[cfg(feature = "cuda")]
@@ -372,6 +380,30 @@ impl DeepseekMoeRuntimeCache {
             .as_mut()
             .expect("DeepSeek V4 route combine scratch allocated"))
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_route_logits_scratch<'a>(
+    slot: &'a mut Option<DeepseekRouteLogitsRuntimeScratch>,
+    ctx: &DeviceContext,
+    n_experts: usize,
+    capacity_tokens: usize,
+) -> Result<&'a mut DeepseekRouteLogitsRuntimeScratch> {
+    let capacity_tokens = capacity_tokens.max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| scratch.capacity_tokens < capacity_tokens || scratch.n_experts != n_experts)
+        .unwrap_or(true);
+    if needs_alloc {
+        *slot = Some(DeepseekRouteLogitsRuntimeScratch {
+            capacity_tokens,
+            n_experts,
+            logits: HiddenStates::zeros(ctx, n_experts, capacity_tokens)?,
+        });
+    }
+    Ok(slot
+        .as_mut()
+        .expect("DeepSeek V4 route logits scratch allocated"))
 }
 
 #[cfg(feature = "cuda")]

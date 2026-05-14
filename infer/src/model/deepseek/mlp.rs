@@ -25,7 +25,7 @@ use std::time::Instant;
 use super::state::{
     DeepseekDsv4GroupedBlockFormat, DeepseekExpertRuntimeScratch,
     DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_local_route_scratch,
-    ensure_recv_route_scratch, ensure_send_route_scratch,
+    ensure_recv_route_scratch, ensure_route_logits_scratch, ensure_send_route_scratch,
 };
 #[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
@@ -1215,8 +1215,50 @@ impl DeepseekV4MoeBlock {
             self.experts.len()
         );
 
+        let has_moe_scratch = moe_scratch.is_some();
+        let use_decode_route_scratch = has_moe_scratch && hidden.seq_len == 1;
+        let mut route_logits_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
+            cache.route_logits.take()
+        } else {
+            None
+        };
+        if has_moe_scratch && hidden.seq_len > 1 {
+            ensure_route_logits_scratch(
+                &mut route_logits_scratch_slot,
+                ctx,
+                config.n_routed_experts,
+                1,
+            )?;
+        }
+
         let trace = dsv4_moe_trace_begin(ctx)?;
-        let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
+        let logits_owned: Option<HiddenStates>;
+        let mut route_logits_scratch = if use_decode_route_scratch {
+            Some(ensure_route_logits_scratch(
+                &mut route_logits_scratch_slot,
+                ctx,
+                config.n_routed_experts,
+                hidden.seq_len,
+            )?)
+        } else {
+            None
+        };
+        let logits = if let Some(scratch) = route_logits_scratch.as_deref_mut() {
+            scratch.logits.seq_len = hidden.seq_len;
+            ops::try_gemm_with_phase_into(
+                ctx,
+                &self.gate_weight,
+                hidden,
+                &mut scratch.logits,
+                ops::LinearDispatchPhase::Decode,
+            )?;
+            &scratch.logits
+        } else {
+            logits_owned = Some(ops::gemm(ctx, &self.gate_weight, hidden)?);
+            logits_owned
+                .as_ref()
+                .expect("DeepSeek V4 route logits fallback allocated")
+        };
         dsv4_moe_trace_end(
             ctx,
             "ffn_deepep_route_logits",
@@ -1226,8 +1268,6 @@ impl DeepseekV4MoeBlock {
         )?;
 
         let trace = dsv4_moe_trace_begin(ctx)?;
-        let has_moe_scratch = moe_scratch.is_some();
-        let use_decode_route_scratch = has_moe_scratch && hidden.seq_len == 1;
         let mut send_route_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
             cache.send_route.take()
         } else {
@@ -2205,6 +2245,7 @@ impl DeepseekV4MoeBlock {
         }
         dsv4_moe_trace_end(ctx, "ffn_deepep_combine", layer_idx, hidden.seq_len, trace)?;
         if let Some(cache) = moe_scratch.as_deref_mut() {
+            cache.route_logits = route_logits_scratch_slot.take();
             cache.send_route = send_route_scratch_slot.take();
             cache.recv_route = recv_route_scratch_slot.take();
             cache.local_route = local_route_scratch_slot.take();

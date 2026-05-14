@@ -1,0 +1,46 @@
+{
+  "status": 200,
+  "total_s": 1.27236,
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 2,
+    "total_tokens": 14
+  },
+  "text": "好的，",
+  "chunks": [
+    {
+      "t_ms": 1108.491,
+      "text": "好的"
+    },
+    {
+      "t_ms": 1272.09,
+      "text": "，"
+    }
+  ],
+  "raw_events": [
+    {
+      "t_ms": 706.155,
+      "line": "data: {\"id\":\"chatcmpl-96562044-b490-42f8-936e-67caadaa1b27\",\"object\":\"chat.completion.chunk\",\"created\":1778777869,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}"
+    },
+    {
+      "t_ms": 1108.491,
+      "line": "data: {\"id\":\"chatcmpl-96562044-b490-42f8-936e-67caadaa1b27\",\"object\":\"chat.completion.chunk\",\"created\":1778777869,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好的\"},\"finish_reason\":null}]}"
+    },
+    {
+      "t_ms": 1272.09,
+      "line": "data: {\"id\":\"chatcmpl-96562044-b490-42f8-936e-67caadaa1b27\",\"object\":\"chat.completion.chunk\",\"created\":1778777869,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"，\"},\"finish_reason\":null}]}"
+    },
+    {
+      "t_ms": 1272.2,
+      "line": "data: {\"id\":\"chatcmpl-96562044-b490-42f8-936e-67caadaa1b27\",\"object\":\"chat.completion.chunk\",\"created\":1778777869,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}"
+    },
+    {
+      "t_ms": 1272.229,
+      "line": "data: {\"id\":\"chatcmpl-96562044-b490-42f8-936e-67caadaa1b27\",\"object\":\"chat.completion.chunk\",\"created\":1778777869,\"model\":\"DeepSeek-V4-Flash\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}}"
+    },
+    {
+      "t_ms": 1272.247,
+      "line": "data: [DONE]"
+    }
+  ]
+}
