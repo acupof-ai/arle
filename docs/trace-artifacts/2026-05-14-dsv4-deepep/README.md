@@ -102,6 +102,22 @@ The grouped-kernel harness is kept for the next replacement step: swap the raw
 GEMV implementation for real grouped GEMM/DeepGEMM rather than enabling the
 slower prototype.
 
+## Count Exchange Optimization
+
+The tiny per-layer `i32[ep_world]` route-count exchange now defaults to NCCL
+all-gather. The previous grouped send/recv path is still available with
+`ARLE_DSV4_COUNT_EXCHANGE=sendrecv`.
+
+Matched same-build A/B on 8xH20:
+
+| Count exchange | Math latency | Writing latency | `ffn_deepep_count_exchange` p50 | `ffn_deepep_count_exchange` p95 | `ffn_total` p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| all-gather default | 1.86-1.94 s | 2.40 s | 0.115 ms | 0.271 ms | 2.334 ms |
+| grouped send/recv fallback | 2.07-2.13 s | 2.58 s | 0.176 ms | 0.419 ms | 2.590 ms |
+
+The output content was identical across both modes for the math and writing
+smokes.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not

@@ -377,6 +377,27 @@ impl LayerCommunicator {
         Ok(LayerCommStatus::GroupedSendRecv)
     }
 
+    /// EP-axis I32 all-gather for tiny DeepEP-style route-count exchange.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_all_gather_i32(
+        &self,
+        sendbuf: &CudaSlice<i32>,
+        send_count: usize,
+        recvbuf: &mut CudaSlice<i32>,
+    ) -> Result<LayerCommStatus> {
+        if self.ep_world_size == 1 {
+            return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        let Some(nccl) = self.ep_nccl.as_ref() else {
+            bail!(
+                "MoE I32 all-gather requires EP NCCL backend for world_size={}",
+                self.ep_world_size
+            );
+        };
+        nccl.all_gather_i32_device(sendbuf, send_count, recvbuf)?;
+        Ok(LayerCommStatus::GroupedSendRecv)
+    }
+
     /// EP-axis grouped F32 send/recv for DeepEP-style route weights.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     pub fn moe_grouped_send_recv_f32(
