@@ -27,6 +27,11 @@ Related governance docs:
   snapshots. Added `scripts/bench_dsv4_trace_http.py` to run DSv4 HTTP smoke
   cases and collect matching `request_trace` entries from server logs without
   enabling CUDA-synchronizing per-layer tracing.
+- Fixed DSv4 distributed HTTP submissions so concurrent client requests keep
+  the same logical queue order on every rank. `DistributedSchedulerGroup` now
+  serializes cross-rank fanout submission, preventing rank 0 and follower ranks
+  from entering different per-request token coordinators under concurrent
+  traffic.
 
 ### CUDA
 

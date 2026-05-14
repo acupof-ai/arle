@@ -97,6 +97,12 @@ pub struct DistributedSchedulerGroup {
     model_id: Arc<str>,
     tokenizer: Option<crate::tokenizer::Tokenizer>,
     metrics: crate::metrics::ServerMetrics,
+    /// Keep all per-rank waiting queues in the same logical request order.
+    ///
+    /// Token synchronization is per request; if concurrent HTTP submissions
+    /// interleave differently across ranks, rank 0 can run request A while a
+    /// follower runs request B and both coordinators wait forever.
+    submission_lock: Mutex<()>,
 }
 
 impl NumaSchedulerRouter {
@@ -227,6 +233,7 @@ impl DistributedSchedulerGroup {
             model_id,
             tokenizer,
             metrics,
+            submission_lock: Mutex::new(()),
         }
     }
 
@@ -314,6 +321,10 @@ impl RequestHandle for NumaSchedulerRouter {
 
 impl RequestHandle for DistributedSchedulerGroup {
     fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+        let _submission_guard = self
+            .submission_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut permits = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
             let permit = worker
@@ -410,6 +421,13 @@ mod tests {
             trace_context: None,
             distributed: None,
         }
+    }
+
+    fn labeled_test_request(label: &str) -> IncomingRequest {
+        let mut req = test_request(Some(label), Some(0));
+        req.prompt = label.to_string();
+        req.prompt_tokens = Some(vec![label.as_bytes()[0] as u32]);
+        req
     }
 
     fn test_topology() -> RuntimeTopology {
@@ -580,5 +598,48 @@ mod tests {
                 token_ids: Vec::new(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn distributed_group_preserves_rank_queue_order_under_concurrent_submit() {
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let worker0 = SchedulerHandle::from_parts(tx0, "model");
+        let worker1 = SchedulerHandle::from_parts(tx1, "model");
+        let group = Arc::new(DistributedSchedulerGroup::new(
+            vec![
+                NumaSchedulerWorker {
+                    handle: worker0,
+                    placement: placement(0, 0),
+                },
+                NumaSchedulerWorker {
+                    handle: worker1,
+                    placement: placement(1, 1),
+                },
+            ],
+            crate::metrics::ServerMetrics::new("model"),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut joins = Vec::new();
+        for label in ["a", "b", "c", "d"] {
+            let group = Arc::clone(&group);
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                group.submit(labeled_test_request(label)).unwrap();
+            }));
+        }
+        barrier.wait();
+        for join in joins {
+            join.join().unwrap();
+        }
+
+        let mut rank0_order = Vec::new();
+        let mut rank1_order = Vec::new();
+        for _ in 0..4 {
+            rank0_order.push(rx0.try_recv().unwrap().prompt);
+            rank1_order.push(rx1.try_recv().unwrap().prompt);
+        }
+        assert_eq!(rank0_order, rank1_order);
     }
 }
