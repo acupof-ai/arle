@@ -82,3 +82,10 @@ Current trace set:
   return normal decode text and the arithmetic check returns `410`, but pair
   GEMV regresses `decode64` post-first throughput from 11.79 tok/s to
   7.70 tok/s, so it remains default-off.
+- [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
+  validates uninitialized allocation for selected full-write temporary hidden
+  buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789
+  calls / 11.855 ms per rank range to 2,957 calls / 4.180 ms, and the isolated
+  single decode wave moves from 125.497 ms to 112.724 ms. Remaining top costs
+  are still NCCL SendRecv/AllReduce, launch overhead, async allocation/free,
+  and local expert FP8/FP4 GEMV.

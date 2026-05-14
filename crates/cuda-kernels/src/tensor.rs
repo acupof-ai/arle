@@ -2052,6 +2052,26 @@ impl HiddenStates {
             seq_len,
         })
     }
+
+    /// Create an uninitialized batch for call sites that immediately overwrite
+    /// every element with a CUDA kernel.
+    ///
+    /// # Safety
+    ///
+    /// The returned buffer must not be read before all `hidden_dim * seq_len`
+    /// elements have been written by a kernel or device copy.
+    pub unsafe fn uninit(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize) -> Result<Self> {
+        let data: CudaSlice<bf16> = unsafe {
+            ctx.stream
+                .alloc(hidden_dim * seq_len)
+                .map_err(|e| anyhow!("Alloc failed: {}", e))?
+        };
+        Ok(Self {
+            data,
+            hidden_dim,
+            seq_len,
+        })
+    }
 }
 
 /// Cached raw CUDA device pointer for a pre-allocated buffer.

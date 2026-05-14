@@ -190,7 +190,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   HTTP comparison also keeps pair GEMV default-off: default split expert GEMV
   reaches **11.79 post-first tok/s** on `decode64`, while
   `ARLE_DSV4_PAIR_EXPERT_GEMV=1` reaches **7.70 tok/s**; both paths return
-  normal text and `410` for the arithmetic check. Per-layer DeepEP
+  normal text and `410` for the arithmetic check. A full-write temporary
+  allocation cleanup then switches selected decode buffers from zeroed to
+  uninitialized allocations: HTTP `decode64` reaches **11.99 post-first tok/s**,
+  math still returns `410`, `cuMemsetD8Async` drops **8,789 → 2,957 calls**, and
+  the isolated single-token wave is **112.7 ms**. Per-layer DeepEP
   dispatch scratch reuse further raises default
   short math smoke to **7.7-7.8 tok/s** and cuts Nsight
   `cuMemAllocAsync`/`cuMemFreeAsync` calls in the 8-token window from 136,825 to

@@ -6,7 +6,7 @@ use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
 pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
-    let mut out = HiddenStates::zeros(ctx, a.hidden_dim, a.seq_len)?;
+    let mut out = unsafe { HiddenStates::uninit(ctx, a.hidden_dim, a.seq_len)? };
     add_batch_into(ctx, a, b, &mut out)?;
     Ok(out)
 }
@@ -74,7 +74,7 @@ pub fn silu_mul_batch(
     gate: &HiddenStates,
     up: &HiddenStates,
 ) -> Result<HiddenStates> {
-    let mut out = HiddenStates::zeros(ctx, gate.hidden_dim, gate.seq_len)?;
+    let mut out = unsafe { HiddenStates::uninit(ctx, gate.hidden_dim, gate.seq_len)? };
     silu_mul_batch_into(ctx, gate, up, &mut out)?;
     Ok(out)
 }

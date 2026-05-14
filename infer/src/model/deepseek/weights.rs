@@ -551,7 +551,8 @@ impl DeepseekModel {
             self.config.hidden_size,
             self.config.hc_mult,
         )?;
-        let mut normed = HiddenStates::zeros(&self.ctx, self.config.hidden_size, stream.seq_len)?;
+        let mut normed =
+            unsafe { HiddenStates::uninit(&self.ctx, self.config.hidden_size, stream.seq_len)? };
         ops::rms_norm_batch_into(
             &self.ctx,
             &attn_in,
@@ -741,7 +742,8 @@ impl DeepseekModel {
         );
 
         let c_q = ops::gemm(&self.ctx, &attention.wq_a, hidden)?;
-        let mut c_q_normed = HiddenStates::zeros(&self.ctx, c_q.hidden_dim, c_q.seq_len)?;
+        let mut c_q_normed =
+            unsafe { HiddenStates::uninit(&self.ctx, c_q.hidden_dim, c_q.seq_len)? };
         ops::rms_norm_batch_into(
             &self.ctx,
             &c_q,
@@ -751,7 +753,8 @@ impl DeepseekModel {
         );
         let q_raw = ops::gemm(&self.ctx, &attention.wq_b, &c_q_normed)?;
         let kv_raw = ops::gemm(&self.ctx, &attention.wkv, hidden)?;
-        let mut kv_normed = HiddenStates::zeros(&self.ctx, kv_raw.hidden_dim, kv_raw.seq_len)?;
+        let mut kv_normed =
+            unsafe { HiddenStates::uninit(&self.ctx, kv_raw.hidden_dim, kv_raw.seq_len)? };
         ops::rms_norm_batch_into(
             &self.ctx,
             &kv_raw,
@@ -814,7 +817,8 @@ impl DeepseekModel {
 
         let trace = dsv4_trace_begin(&self.ctx)?;
         let c_q = ops::gemm(&self.ctx, &attention.wq_a, hidden)?;
-        let mut c_q_normed = HiddenStates::zeros(&self.ctx, c_q.hidden_dim, c_q.seq_len)?;
+        let mut c_q_normed =
+            unsafe { HiddenStates::uninit(&self.ctx, c_q.hidden_dim, c_q.seq_len)? };
         ops::rms_norm_batch_into(
             &self.ctx,
             &c_q,
@@ -824,7 +828,8 @@ impl DeepseekModel {
         );
         let q_raw = ops::gemm(&self.ctx, &attention.wq_b, &c_q_normed)?;
         let kv_raw = ops::gemm(&self.ctx, &attention.wkv, hidden)?;
-        let mut kv_normed = HiddenStates::zeros(&self.ctx, kv_raw.hidden_dim, kv_raw.seq_len)?;
+        let mut kv_normed =
+            unsafe { HiddenStates::uninit(&self.ctx, kv_raw.hidden_dim, kv_raw.seq_len)? };
         ops::rms_norm_batch_into(
             &self.ctx,
             &kv_raw,
@@ -908,8 +913,8 @@ impl DeepseekModel {
         let rope_base = self.config.rope_theta;
         let original_seq_len = 0;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut q_prepared = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
-        let mut k_prepared = HiddenStates::zeros(&self.ctx, head_dim, token_count)?;
+        let mut q_prepared = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
+        let mut k_prepared = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
         {
             let (q_raw_ptr, _q_raw_guard) = q_raw.data.device_ptr(&self.ctx.stream);
             let (k_raw_ptr, _k_raw_guard) = kv_normed.data.device_ptr(&self.ctx.stream);
@@ -971,7 +976,7 @@ impl DeepseekModel {
         )?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut local_attn = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
+        let mut local_attn = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
@@ -1395,8 +1400,8 @@ impl DeepseekModel {
             (self.config.rope_theta, 0)
         };
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut q_prepared = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
-        let mut k_prepared = HiddenStates::zeros(&self.ctx, head_dim, token_count)?;
+        let mut q_prepared = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
+        let mut k_prepared = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
         {
             let (q_raw_ptr, _q_raw_guard) = q_raw.data.device_ptr(&self.ctx.stream);
             let (k_raw_ptr, _k_raw_guard) = kv_normed.data.device_ptr(&self.ctx.stream);
@@ -1452,7 +1457,7 @@ impl DeepseekModel {
         )?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut local_attn = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
+        let mut local_attn = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
@@ -1886,7 +1891,9 @@ impl DeepseekModel {
             );
             &*scratch
         } else {
-            normed_owned = HiddenStates::zeros(&self.ctx, self.config.hidden_size, stream.seq_len)?;
+            normed_owned = unsafe {
+                HiddenStates::uninit(&self.ctx, self.config.hidden_size, stream.seq_len)?
+            };
             ops::rms_norm_batch_into(
                 &self.ctx,
                 sub_in,
@@ -2333,7 +2340,7 @@ fn initial_hc_stream_from_embeddings(
     );
     ensure!(hc_mult > 0, "DeepSeek V4 hc_mult must be non-zero");
     let stream_hidden = hidden_size * hc_mult;
-    let mut stream = HiddenStates::zeros(ctx, stream_hidden, embeddings.seq_len)?;
+    let mut stream = unsafe { HiddenStates::uninit(ctx, stream_hidden, embeddings.seq_len)? };
     {
         let (emb_ptr, _emb_guard) = embeddings.data.device_ptr(&ctx.stream);
         let (out_ptr, _out_guard) = stream.data.device_ptr_mut(&ctx.stream);
@@ -2684,7 +2691,7 @@ fn hc_pre_from_stream(
     hidden_size: usize,
     hc_mult: usize,
 ) -> Result<HiddenStates> {
-    let mut out = HiddenStates::zeros(ctx, hidden_size, stream.seq_len)?;
+    let mut out = unsafe { HiddenStates::uninit(ctx, hidden_size, stream.seq_len)? };
     hc_pre_from_stream_into(ctx, stream, pre, hidden_size, hc_mult, &mut out)?;
     Ok(out)
 }
@@ -2775,7 +2782,7 @@ fn hc_post_to_stream(
         hc_mult
     );
 
-    let mut out = HiddenStates::zeros(ctx, hidden_size * hc_mult, residual.seq_len)?;
+    let mut out = unsafe { HiddenStates::uninit(ctx, hidden_size * hc_mult, residual.seq_len)? };
     {
         let (new_ptr, _new_guard) = new_x.data.device_ptr(&ctx.stream);
         let (residual_ptr, _residual_guard) = residual.data.device_ptr(&ctx.stream);
@@ -3261,7 +3268,7 @@ fn head_hidden_from_stream(
 
     let stream_row = extract_hidden_token_with_width(ctx, stream, token_idx, stream.hidden_dim)?;
     let mixes = ops::gemm(ctx, &head_hc.mix_fn, &stream_row)?;
-    let mut out = HiddenStates::zeros(ctx, hidden_size, 1)?;
+    let mut out = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
     {
         let (row_ptr, _row_guard) = stream_row.data.device_ptr(&ctx.stream);
         let (mixes_ptr, _mixes_guard) = mixes.data.device_ptr(&ctx.stream);
@@ -3307,7 +3314,7 @@ fn extract_hidden_token_with_width(
         width,
         hidden.hidden_dim
     );
-    let mut out = HiddenStates::zeros(ctx, width, 1)?;
+    let mut out = unsafe { HiddenStates::uninit(ctx, width, 1)? };
     let start = token_idx * width;
     let src = hidden.data.slice(start..start + width);
     ctx.stream
