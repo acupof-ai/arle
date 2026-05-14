@@ -1,0 +1,223 @@
+{
+  "run": "dsv4-nsys-dispatch-scratch-8tok",
+  "profile": "default DeepEP with per-layer dispatch scratch reuse",
+  "request": {
+    "phase": "profiled",
+    "elapsed_s": 2.7976558208465576,
+    "status": 200,
+    "usage": {
+      "prompt_tokens": 14,
+      "completion_tokens": 8,
+      "total_tokens": 22
+    },
+    "text": "霓灯吻碎江，夜城"
+  },
+  "normalization": {
+    "completion_tokens": 8,
+    "ranks": 8
+  },
+  "top_runtime_api_per_token_rank_ms": [
+    {
+      "name": "cuStreamSynchronize",
+      "total_ms": 10245.9928,
+      "calls": 172992,
+      "per_token_rank_ms": 160.0936375,
+      "avg_ms": 0.0592,
+      "med_ms": 0.0106
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "total_ms": 2496.0633,
+      "calls": 111531,
+      "per_token_rank_ms": 39.0009890625,
+      "avg_ms": 0.0224,
+      "med_ms": 0.0067
+    },
+    {
+      "name": "cuMemAllocAsync",
+      "total_ms": 1842.9194,
+      "calls": 111531,
+      "per_token_rank_ms": 28.795615625,
+      "avg_ms": 0.0165,
+      "med_ms": 0.0053
+    },
+    {
+      "name": "cudaLaunchKernel",
+      "total_ms": 1509.1592,
+      "calls": 130204,
+      "per_token_rank_ms": 23.5806125,
+      "avg_ms": 0.0116,
+      "med_ms": 0.0092
+    },
+    {
+      "name": "cuMemsetD8Async",
+      "total_ms": 1310.036,
+      "calls": 120303,
+      "per_token_rank_ms": 20.4693125,
+      "avg_ms": 0.0109,
+      "med_ms": 0.0087
+    },
+    {
+      "name": "cuMemcpyDtoHAsync_v2",
+      "total_ms": 466.4005,
+      "calls": 7234,
+      "per_token_rank_ms": 7.2875078125,
+      "avg_ms": 0.0645,
+      "med_ms": 0.0237
+    },
+    {
+      "name": "cudaEventRecord",
+      "total_ms": 248.8326,
+      "calls": 32400,
+      "per_token_rank_ms": 3.888009375,
+      "avg_ms": 0.0077,
+      "med_ms": 0.0047
+    },
+    {
+      "name": "cudaStreamWaitEvent",
+      "total_ms": 213.4672,
+      "calls": 27520,
+      "per_token_rank_ms": 3.335425,
+      "avg_ms": 0.0078,
+      "med_ms": 0.0046
+    }
+  ],
+  "top_kernels_per_token_rank_ms": [
+    {
+      "name": "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "total_ms": 2405.8146,
+      "calls": 8256,
+      "per_token_rank_ms": 37.590853125,
+      "avg_ms": 0.2914,
+      "med_ms": 0.0467
+    },
+    {
+      "name": "dsv4_fp4_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "total_ms": 1411.7024,
+      "calls": 10656,
+      "per_token_rank_ms": 22.05785,
+      "avg_ms": 0.1325,
+      "med_ms": 0.1156
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "total_ms": 642.5075,
+      "calls": 20440,
+      "per_token_rank_ms": 10.0391796875,
+      "avg_ms": 0.0314,
+      "med_ms": 0.0274
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "total_ms": 488.5922,
+      "calls": 2752,
+      "per_token_rank_ms": 7.634253125,
+      "avg_ms": 0.1775,
+      "med_ms": 0.1427
+    },
+    {
+      "name": "dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)",
+      "total_ms": 448.4605,
+      "calls": 2624,
+      "per_token_rank_ms": 7.0071953125,
+      "avg_ms": 0.1709,
+      "med_ms": 0.1472
+    },
+    {
+      "name": "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "total_ms": 363.6601,
+      "calls": 2752,
+      "per_token_rank_ms": 5.6821890625,
+      "avg_ms": 0.1321,
+      "med_ms": 0.0887
+    },
+    {
+      "name": "dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)",
+      "total_ms": 362.0887,
+      "calls": 2752,
+      "per_token_rank_ms": 5.6576359375,
+      "avg_ms": 0.1316,
+      "med_ms": 0.1379
+    },
+    {
+      "name": "dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)",
+      "total_ms": 352.5834,
+      "calls": 5504,
+      "per_token_rank_ms": 5.509115625,
+      "avg_ms": 0.0641,
+      "med_ms": 0.064
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "total_ms": 326.0747,
+      "calls": 2920,
+      "per_token_rank_ms": 5.0949171875,
+      "avg_ms": 0.1117,
+      "med_ms": 0.1109
+    },
+    {
+      "name": "dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)",
+      "total_ms": 265.2443,
+      "calls": 1344,
+      "per_token_rank_ms": 4.1444421875,
+      "avg_ms": 0.1974,
+      "med_ms": 0.1966
+    }
+  ],
+  "layer_trace_last_profiled_request": [
+    {
+      "phase": "ffn_total",
+      "count": 2752,
+      "p50_ms": 3.437,
+      "p95_ms": 3.971,
+      "max_ms": 4.76
+    },
+    {
+      "phase": "ffn_deepep_dispatch_combine",
+      "count": 2752,
+      "p50_ms": 2.492,
+      "p95_ms": 3.026,
+      "max_ms": 3.839
+    },
+    {
+      "phase": "ffn_deepep_dispatch",
+      "count": 2752,
+      "p50_ms": 0.393,
+      "p95_ms": 0.486,
+      "max_ms": 0.576
+    },
+    {
+      "phase": "ffn_deepep_local_experts",
+      "count": 2752,
+      "p50_ms": 0.5265,
+      "p95_ms": 0.975,
+      "max_ms": 2.003
+    },
+    {
+      "phase": "ffn_deepep_combine_exchange",
+      "count": 2752,
+      "p50_ms": 0.7155,
+      "p95_ms": 1.412,
+      "max_ms": 2.146
+    },
+    {
+      "phase": "ffn_deepep_combine",
+      "count": 2752,
+      "p50_ms": 0.808,
+      "p95_ms": 1.553,
+      "max_ms": 2.256
+    },
+    {
+      "phase": "attn_total",
+      "count": 2752,
+      "p50_ms": 1.7515,
+      "p95_ms": 2.469,
+      "max_ms": 2.888
+    }
+  ],
+  "raw_remote_artifacts": [
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-dispatch-scratch/arle-dsv4-dispatch-scratch.nsys-rep",
+    "docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-dispatch-scratch/arle-dsv4-dispatch-scratch.sqlite"
+  ],
+  "conclusion": "Dispatch scratch reuse removes a large fraction of DSv4 per-layer CUDA allocation churn. Runtime API time remains dominated by stream synchronization, but cuMemAllocAsync/cuMemFreeAsync are lower than the previous rerun."
+}

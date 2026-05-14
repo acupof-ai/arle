@@ -1,0 +1,167 @@
+{
+  "run": "dsv4-dispatch-scratch",
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle-perf-dispatch-scratch",
+  "build": {
+    "command": "cargo build --release -p infer --bin infer --features cuda,nccl",
+    "status": "pass",
+    "target_dir": "/root/arle/target",
+    "duration": "5m37s"
+  },
+  "profile": {
+    "moe_backend": "deepep",
+    "incremental_kv": true,
+    "grouped_experts": false,
+    "kv_cache_dtype": "fp8",
+    "gpus": 8,
+    "model_path": "/root/DeepSeek-V4-Flash"
+  },
+  "implementation": {
+    "summary": "DeepSeek MoE runtime state now carries a per-layer dispatch scratch for token ids, route indices, route weights, rank counts/offsets/cursors, packed send hidden rows, packed send metadata, rank count exchange buffers, and local expert count/offset/cursor buffers.",
+    "why": "The previous decode trace showed cuMemAllocAsync/cuMemFreeAsync as major runtime API costs. This change removes repeated allocations from the DeepEP route setup, count, pack, and dispatch metadata path while preserving the default MoE behavior."
+  },
+  "trace_off_results": [
+    {
+      "case": "warmup",
+      "prompt_tokens": 14,
+      "completion_tokens": 2,
+      "latency_s": 0.5911059379577637,
+      "completion_tok_s": 3.383488257468505,
+      "output": "1073"
+    },
+    {
+      "case": "math_37x29",
+      "prompt_tokens": 15,
+      "completion_tokens": 12,
+      "latency_s": 1.5510737895965576,
+      "completion_tok_s": 7.736575835712666,
+      "output": "好的，我们一起来计算 37 × 29，我会"
+    },
+    {
+      "case": "math_58p67",
+      "prompt_tokens": 15,
+      "completion_tokens": 12,
+      "latency_s": 1.5395371913909912,
+      "completion_tok_s": 7.794550249973402,
+      "output": "好的，我们一起来计算58加67。我们可以用竖"
+    },
+    {
+      "case": "write_perf",
+      "prompt_tokens": 18,
+      "completion_tokens": 8,
+      "latency_s": 1.2486457824707031,
+      "completion_tok_s": 6.406941113572138,
+      "output": "极速推理，秒级洞察。"
+    }
+  ],
+  "layer_trace": {
+    "request": {
+      "prompt_tokens": 15,
+      "completion_tokens": 8,
+      "latency_s": 1.7684404850006104,
+      "output": "好的，我们一起来计算 37 ×"
+    },
+    "rows": [
+      {
+        "phase": "ffn_deepep_route_setup",
+        "count": 2752,
+        "p50_ms": 0.01,
+        "p95_ms": 0.022,
+        "max_ms": 0.283
+      },
+      {
+        "phase": "ffn_deepep_count_by_rank",
+        "count": 2752,
+        "p50_ms": 0.019,
+        "p95_ms": 0.03,
+        "max_ms": 0.053
+      },
+      {
+        "phase": "ffn_deepep_pack_by_rank",
+        "count": 2752,
+        "p50_ms": 0.025,
+        "p95_ms": 0.05,
+        "max_ms": 0.111
+      },
+      {
+        "phase": "ffn_deepep_count_exchange",
+        "count": 2752,
+        "p50_ms": 0.082,
+        "p95_ms": 0.229,
+        "max_ms": 1.896
+      },
+      {
+        "phase": "ffn_deepep_dispatch",
+        "count": 2752,
+        "p50_ms": 0.064,
+        "p95_ms": 0.119,
+        "max_ms": 0.344
+      },
+      {
+        "phase": "ffn_deepep_local_experts",
+        "count": 2752,
+        "p50_ms": 0.439,
+        "p95_ms": 0.836,
+        "max_ms": 1.827
+      },
+      {
+        "phase": "ffn_deepep_combine_exchange",
+        "count": 2752,
+        "p50_ms": 0.485,
+        "p95_ms": 1.231,
+        "max_ms": 1.908
+      },
+      {
+        "phase": "ffn_deepep_combine_kernel",
+        "count": 2752,
+        "p50_ms": 0.013,
+        "p95_ms": 0.022,
+        "max_ms": 0.086
+      },
+      {
+        "phase": "ffn_deepep_combine",
+        "count": 2752,
+        "p50_ms": 0.565,
+        "p95_ms": 1.308,
+        "max_ms": 1.987
+      },
+      {
+        "phase": "ffn_deepep_dispatch_combine",
+        "count": 2752,
+        "p50_ms": 1.552,
+        "p95_ms": 2.004,
+        "max_ms": 3.473
+      },
+      {
+        "phase": "ffn_total",
+        "count": 2752,
+        "p50_ms": 2.079,
+        "p95_ms": 2.557,
+        "max_ms": 6.967
+      },
+      {
+        "phase": "attn_total",
+        "count": 2752,
+        "p50_ms": 1.124,
+        "p95_ms": 1.543,
+        "max_ms": 22.927
+      }
+    ]
+  },
+  "nsys": {
+    "summary": "nsys-dispatch-scratch/dsv4-nsys-dispatch-scratch-summary.json",
+    "allocation_call_delta": {
+      "before_cuMemAllocAsync_calls": 136825,
+      "after_cuMemAllocAsync_calls": 111531,
+      "before_cuMemFreeAsync_calls": 136825,
+      "after_cuMemFreeAsync_calls": 111531
+    },
+    "per_token_rank_ms": {
+      "cuMemFreeAsync_before": 44.2969765625,
+      "cuMemFreeAsync_after": 39.0009890625,
+      "cuMemAllocAsync_before": 28.65598125,
+      "cuMemAllocAsync_after": 28.795615625
+    }
+  },
+  "conclusion": "Dispatch scratch reuse measurably reduces per-layer allocation churn and improves the traced default DeepEP decode phase. It is a prerequisite cleanup, not the final high-performance MoE route; the remaining target is still real grouped GEMM/DeepGEMM plus a combine path that overlaps or reduces return-side send/recv."
+}
