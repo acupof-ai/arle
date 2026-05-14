@@ -1800,32 +1800,63 @@ impl DeepseekModel {
             &mut normed,
         );
         dsv4_trace_end(&self.ctx, "ffn_pre_norm", layer_idx, stream.seq_len, trace)?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut routed = layer.ffn.forward_local_routed_gpu(
-            &self.ctx,
-            layer_idx,
-            &self.config.spec,
-            &self.config.ep,
-            &normed,
-            tokens,
-        )?;
-        dsv4_trace_end(
-            &self.ctx,
-            "ffn_routed_local",
-            layer_idx,
-            stream.seq_len,
-            trace,
-        )?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        self.layer_communicator
-            .post_moe_expert_all_reduce_hidden_states(&mut routed)?;
-        dsv4_trace_end(
-            &self.ctx,
-            "ffn_all_reduce",
-            layer_idx,
-            stream.seq_len,
-            trace,
-        )?;
+        let routed = if dsv4_moe_deepep_enabled()? && self.config.ep.world_size > 1 {
+            #[cfg(feature = "nccl")]
+            {
+                let trace = dsv4_trace_begin(&self.ctx)?;
+                let routed = layer.ffn.forward_deepep_routed_gpu(
+                    &self.ctx,
+                    &self.layer_communicator,
+                    layer_idx,
+                    &self.config.spec,
+                    &self.config.ep,
+                    &normed,
+                    tokens,
+                )?;
+                dsv4_trace_end(
+                    &self.ctx,
+                    "ffn_deepep_dispatch_combine",
+                    layer_idx,
+                    stream.seq_len,
+                    trace,
+                )?;
+                routed
+            }
+            #[cfg(not(feature = "nccl"))]
+            {
+                bail!(
+                    "DeepSeek V4 ARLE_DSV4_MOE_BACKEND=deepep requires building infer with --features nccl"
+                );
+            }
+        } else {
+            let trace = dsv4_trace_begin(&self.ctx)?;
+            let mut routed = layer.ffn.forward_local_routed_gpu(
+                &self.ctx,
+                layer_idx,
+                &self.config.spec,
+                &self.config.ep,
+                &normed,
+                tokens,
+            )?;
+            dsv4_trace_end(
+                &self.ctx,
+                "ffn_routed_local",
+                layer_idx,
+                stream.seq_len,
+                trace,
+            )?;
+            let trace = dsv4_trace_begin(&self.ctx)?;
+            self.layer_communicator
+                .post_moe_expert_all_reduce_hidden_states(&mut routed)?;
+            dsv4_trace_end(
+                &self.ctx,
+                "ffn_all_reduce",
+                layer_idx,
+                stream.seq_len,
+                trace,
+            )?;
+            routed
+        };
         let trace = dsv4_trace_begin(&self.ctx)?;
         let ffn_out =
             layer
@@ -3255,6 +3286,20 @@ fn dsv4_gpu_contextual_logits_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_GPU_CONTEXT_TOKENS value `{raw}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_moe_deepep_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_MOE_BACKEND").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "deepep" | "DeepEP" | "dispatch" | "dispatch_combine" => Ok(true),
+        "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "FALSE" | "off" | "OFF" => {
+            Ok(false)
+        }
+        _ => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{raw}`"),
     }
 }
 
