@@ -87,6 +87,7 @@ unsafe extern "C" {
         cursors: *mut i32,
         packed_hidden: *mut Half,
         packed_token: *mut i32,
+        packed_route_slot: *mut i32,
         packed_meta: *mut i32,
         num_tokens: i32,
         hidden_dim: i32,
@@ -149,6 +150,24 @@ unsafe extern "C" {
         expert_route_slot: *const i32,
         expert_weight: *const f32,
         num_routes: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_scatter_route_outputs_by_slot_cuda(
+        packed_route_out: *const Half,
+        route_slot_out: *mut Half,
+        packed_route_slot: *const i32,
+        num_routes: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_combine_route_slot_outputs_cuda(
+        route_slot_out: *const Half,
+        routed_out: *mut Half,
+        num_tokens: i32,
+        topk: i32,
         hidden_dim: i32,
         stream: CUstream,
     ) -> CUresult;

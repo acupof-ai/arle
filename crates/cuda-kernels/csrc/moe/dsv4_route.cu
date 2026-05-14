@@ -355,6 +355,7 @@ __global__ void dsv4_pack_expert_ranks_kernel(
     int32_t *__restrict__ cursors,
     uint16_t *__restrict__ packed_hidden,
     int32_t *__restrict__ packed_token,
+    int32_t *__restrict__ packed_route_slot,
     int32_t *__restrict__ packed_meta,
     int num_tokens,
     int hidden_dim,
@@ -374,6 +375,7 @@ __global__ void dsv4_pack_expert_ranks_kernel(
   if (threadIdx.x == 0) {
     slot = offsets[rank] + atomicAdd(&cursors[rank], 1);
     packed_token[slot] = token;
+    packed_route_slot[slot] = route;
     int meta_base = slot * 3;
     packed_meta[meta_base] = token;
     packed_meta[meta_base + 1] = expert;
@@ -396,6 +398,7 @@ extern "C" CUresult dsv4_pack_expert_ranks_cuda(
     int32_t *cursors,
     uint16_t *packed_hidden,
     int32_t *packed_token,
+    int32_t *packed_route_slot,
     int32_t *packed_meta,
     int num_tokens,
     int hidden_dim,
@@ -411,7 +414,8 @@ extern "C" CUresult dsv4_pack_expert_ranks_cuda(
   if (total_routes == 0) return CUDA_SUCCESS;
   dsv4_pack_expert_ranks_kernel<<<total_routes, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
       hidden, indices, weights, offsets, cursors, packed_hidden, packed_token,
-      packed_meta, num_tokens, hidden_dim, topk, experts_per_rank, ep_world_size);
+      packed_route_slot, packed_meta, num_tokens, hidden_dim, topk, experts_per_rank,
+      ep_world_size);
   return (CUresult)cudaGetLastError();
 }
 
@@ -585,6 +589,77 @@ extern "C" CUresult dsv4_scatter_all_route_slots_cuda(
   dsv4_scatter_all_route_slots_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
       expert_out, route_out, expert_route_slot, expert_weight, num_routes,
       hidden_dim);
+  return (CUresult)cudaGetLastError();
+}
+
+__global__ void dsv4_scatter_route_outputs_by_slot_kernel(
+    const uint16_t *__restrict__ packed_route_out,
+    uint16_t *__restrict__ route_slot_out,
+    const int32_t *__restrict__ packed_route_slot,
+    int num_routes,
+    int hidden_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_routes * hidden_dim;
+  if (idx >= total) return;
+  int route = idx / hidden_dim;
+  int col = idx - route * hidden_dim;
+  int route_slot = packed_route_slot[route];
+  if (route_slot < 0) return;
+  route_slot_out[route_slot * hidden_dim + col] = packed_route_out[idx];
+}
+
+extern "C" CUresult dsv4_scatter_route_outputs_by_slot_cuda(
+    const uint16_t *packed_route_out,
+    uint16_t *route_slot_out,
+    const int32_t *packed_route_slot,
+    int num_routes,
+    int hidden_dim,
+    CUstream stream) {
+  if (num_routes < 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = num_routes * hidden_dim;
+  if (total == 0) return CUDA_SUCCESS;
+  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_scatter_route_outputs_by_slot_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      packed_route_out, route_slot_out, packed_route_slot, num_routes, hidden_dim);
+  return (CUresult)cudaGetLastError();
+}
+
+__global__ void dsv4_combine_route_slot_outputs_kernel(
+    const uint16_t *__restrict__ route_slot_out,
+    uint16_t *__restrict__ routed_out,
+    int num_tokens,
+    int topk,
+    int hidden_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_tokens * hidden_dim;
+  if (idx >= total) return;
+  int token = idx / hidden_dim;
+  int col = idx - token * hidden_dim;
+  float sum = 0.0f;
+  int route_base = token * topk;
+  for (int k = 0; k < topk; ++k) {
+    sum += dsv4_route_bf16_to_f32(route_slot_out[(route_base + k) * hidden_dim + col]);
+  }
+  routed_out[idx] = dsv4_route_f32_to_bf16_bits(sum);
+}
+
+extern "C" CUresult dsv4_combine_route_slot_outputs_cuda(
+    const uint16_t *route_slot_out,
+    uint16_t *routed_out,
+    int num_tokens,
+    int topk,
+    int hidden_dim,
+    CUstream stream) {
+  if (num_tokens < 0 || topk <= 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = num_tokens * hidden_dim;
+  if (total == 0) return CUDA_SUCCESS;
+  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_combine_route_slot_outputs_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      route_slot_out, routed_out, num_tokens, topk, hidden_dim);
   return (CUresult)cudaGetLastError();
 }
 
