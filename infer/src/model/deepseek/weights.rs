@@ -819,6 +819,7 @@ impl DeepseekModel {
 
     fn forward_swa_attention_gpu(
         &self,
+        layer_idx: usize,
         attention: &DeepseekV4Attention,
         q_raw: &HiddenStates,
         kv_normed: &HiddenStates,
@@ -866,6 +867,7 @@ impl DeepseekModel {
         let rope_params = &self.config.rope_parameters;
         let rope_base = self.config.rope_theta;
         let original_seq_len = 0;
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let mut q_prepared = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
         let mut k_prepared = HiddenStates::zeros(&self.ctx, head_dim, token_count)?;
         {
@@ -896,7 +898,15 @@ impl DeepseekModel {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU SWA q/k prep failed: {err}"))?;
             }
         }
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_swa_prepare_qk",
+            layer_idx,
+            token_count,
+            trace,
+        )?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let cache_len = self.config.sliding_window * head_dim;
         let mut scratch_window;
         let update_window_cache = cache.is_some();
@@ -912,7 +922,15 @@ impl DeepseekModel {
                 })?;
             &mut scratch_window
         };
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_swa_window_alloc",
+            layer_idx,
+            token_count,
+            trace,
+        )?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let mut local_attn = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
@@ -946,8 +964,10 @@ impl DeepseekModel {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU SWA attention failed: {err}"))?;
             }
         }
+        dsv4_trace_end(&self.ctx, "attn_swa_kernel", layer_idx, token_count, trace)?;
 
         if update_window_cache {
+            let trace = dsv4_trace_begin(&self.ctx)?;
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
             let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
             unsafe {
@@ -963,12 +983,35 @@ impl DeepseekModel {
                 .result()
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU SWA cache update failed: {err}"))?;
             }
+            dsv4_trace_end(
+                &self.ctx,
+                "attn_swa_window_update",
+                layer_idx,
+                token_count,
+                trace,
+            )?;
         }
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let latent = ops::gemm(&self.ctx, &attention.wo_a, &local_attn)?;
         let mut out = ops::gemm(&self.ctx, &attention.wo_b, &latent)?;
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_swa_output_proj",
+            layer_idx,
+            token_count,
+            trace,
+        )?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
         self.layer_communicator
             .post_attn_all_reduce_hidden_states(&mut out)?;
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_swa_all_reduce",
+            layer_idx,
+            token_count,
+            trace,
+        )?;
         Ok(out)
     }
 
@@ -991,6 +1034,7 @@ impl DeepseekModel {
     ) -> Result<HiddenStates> {
         if compress_ratio == 0 {
             return self.forward_swa_attention_gpu(
+                layer_idx,
                 attention,
                 q_raw,
                 kv_normed,
@@ -1054,6 +1098,7 @@ impl DeepseekModel {
         compress_ratio: usize,
         mode: deepseek_spec::DeepSeekV4AttentionMode,
     ) -> Result<HiddenStates> {
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let compressed = self.compressor_forward_gpu_temp(
             attention.compressor.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1069,6 +1114,7 @@ impl DeepseekModel {
             start_pos,
             true,
         )?;
+        dsv4_trace_end(&self.ctx, "attn_compressor", layer_idx, token_count, trace)?;
         let selected = if matches!(
             mode,
             deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse
@@ -1080,6 +1126,7 @@ impl DeepseekModel {
                     compress_ratio
                 )
             })?;
+            let trace = dsv4_trace_begin(&self.ctx)?;
             let index_keys = self.compressor_forward_gpu_temp(
                 &indexer.compressor,
                 hidden,
@@ -1089,7 +1136,15 @@ impl DeepseekModel {
                 start_pos,
                 false,
             )?;
+            dsv4_trace_end(
+                &self.ctx,
+                "attn_indexer_compressor",
+                layer_idx,
+                token_count,
+                trace,
+            )?;
             Some(self.csa_selected_blocks_gpu(
+                layer_idx,
                 indexer,
                 hidden,
                 c_q_normed,
@@ -1102,6 +1157,7 @@ impl DeepseekModel {
             None
         };
         self.finish_attention_gpu(
+            layer_idx,
             attention,
             q_raw,
             kv_normed,
@@ -1143,6 +1199,7 @@ impl DeepseekModel {
                 compress_ratio
             )
         })?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
         self.update_compressor_gpu_cache(
             compressor,
             hidden,
@@ -1156,6 +1213,13 @@ impl DeepseekModel {
                 .compressed_gpu
                 .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
         )?;
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_compressor_update",
+            layer_idx,
+            token_count,
+            trace,
+        )?;
 
         let selected = if matches!(
             mode,
@@ -1168,6 +1232,7 @@ impl DeepseekModel {
                     compress_ratio
                 )
             })?;
+            let trace = dsv4_trace_begin(&self.ctx)?;
             self.update_compressor_gpu_cache(
                 &indexer.compressor,
                 hidden,
@@ -1181,6 +1246,13 @@ impl DeepseekModel {
                     .indexer_gpu
                     .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
             )?;
+            dsv4_trace_end(
+                &self.ctx,
+                "attn_indexer_update",
+                layer_idx,
+                token_count,
+                trace,
+            )?;
             let index_cache = cache
                 .indexer_gpu
                 .as_ref()
@@ -1190,6 +1262,7 @@ impl DeepseekModel {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 indexer GPU cache missing rows"))?;
             Some(self.csa_selected_blocks_gpu(
+                layer_idx,
                 indexer,
                 hidden,
                 c_q_normed,
@@ -1215,6 +1288,7 @@ impl DeepseekModel {
             .take()
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 compressed GPU cache missing rows"))?;
         let result = self.finish_attention_gpu(
+            layer_idx,
             attention,
             q_raw,
             kv_normed,
@@ -1240,6 +1314,7 @@ impl DeepseekModel {
     #[allow(clippy::too_many_arguments)]
     fn finish_attention_gpu(
         &self,
+        layer_idx: usize,
         attention: &DeepseekV4Attention,
         q_raw: &HiddenStates,
         kv_normed: &HiddenStates,
@@ -1279,6 +1354,7 @@ impl DeepseekModel {
         } else {
             (self.config.rope_theta, 0)
         };
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let mut q_prepared = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
         let mut k_prepared = HiddenStates::zeros(&self.ctx, head_dim, token_count)?;
         {
@@ -1309,7 +1385,9 @@ impl DeepseekModel {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU q/k prep failed: {err}"))?;
             }
         }
+        dsv4_trace_end(&self.ctx, "attn_prepare_qk", layer_idx, token_count, trace)?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let cache_len = self.config.sliding_window * head_dim;
         let mut scratch_window;
         let update_window_cache = cache.is_some();
@@ -1325,7 +1403,15 @@ impl DeepseekModel {
                 })?;
             &mut scratch_window
         };
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_window_alloc",
+            layer_idx,
+            token_count,
+            trace,
+        )?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let mut local_attn = HiddenStates::zeros(&self.ctx, local_width, token_count)?;
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
@@ -1390,8 +1476,16 @@ impl DeepseekModel {
             drop(compressed_guard);
             drop(selected_guard);
         }
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_hybrid_kernel",
+            layer_idx,
+            token_count,
+            trace,
+        )?;
 
         if update_window_cache {
+            let trace = dsv4_trace_begin(&self.ctx)?;
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
             let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
             unsafe {
@@ -1407,12 +1501,23 @@ impl DeepseekModel {
                 .result()
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU cache update failed: {err}"))?;
             }
+            dsv4_trace_end(
+                &self.ctx,
+                "attn_window_update",
+                layer_idx,
+                token_count,
+                trace,
+            )?;
         }
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let latent = ops::gemm(&self.ctx, &attention.wo_a, &local_attn)?;
         let mut out = ops::gemm(&self.ctx, &attention.wo_b, &latent)?;
+        dsv4_trace_end(&self.ctx, "attn_output_proj", layer_idx, token_count, trace)?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
         self.layer_communicator
             .post_attn_all_reduce_hidden_states(&mut out)?;
+        dsv4_trace_end(&self.ctx, "attn_all_reduce", layer_idx, token_count, trace)?;
         Ok(out)
     }
 
@@ -1565,6 +1670,7 @@ impl DeepseekModel {
 
     fn csa_selected_blocks_gpu(
         &self,
+        layer_idx: usize,
         indexer: &DeepseekV4Indexer,
         hidden: &HiddenStates,
         c_q: &HiddenStates,
@@ -1573,8 +1679,16 @@ impl DeepseekModel {
         start_pos: usize,
         ratio: usize,
     ) -> Result<CudaSlice<i32>> {
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let q_i = ops::gemm(&self.ctx, &indexer.wq_b, c_q)?;
         let weights = ops::gemm(&self.ctx, &indexer.weights_proj, hidden)?;
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_csa_project",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
         ensure!(
             q_i.hidden_dim.is_multiple_of(self.config.index_head_dim),
             "DeepSeek V4 GPU indexer q width {} is not divisible by index_head_dim {}",
@@ -1595,6 +1709,7 @@ impl DeepseekModel {
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 CSA selected alloc failed: {err}"))?;
         let score_scale = (self.config.index_head_dim as f32).powf(-0.5)
             * (self.config.index_n_heads as f32).powf(-0.5);
+        let trace = dsv4_trace_begin(&self.ctx)?;
         {
             let (q_ptr, _q_guard) = q_i.data.device_ptr(&self.ctx.stream);
             let (weights_ptr, _weights_guard) = weights.data.device_ptr(&self.ctx.stream);
@@ -1621,6 +1736,13 @@ impl DeepseekModel {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU CSA select failed: {err}"))?;
             }
         }
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_csa_select_kernel",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
         Ok(selected)
     }
 
