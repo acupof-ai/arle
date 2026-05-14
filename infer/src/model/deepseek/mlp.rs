@@ -712,14 +712,10 @@ impl DeepseekV4MoeBlock {
             .stream
             .alloc_zeros::<i32>(total_send_routes)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 send token alloc failed: {err}"))?;
-        let mut send_expert = ctx
+        let mut send_meta = ctx
             .stream
-            .alloc_zeros::<i32>(total_send_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send expert alloc failed: {err}"))?;
-        let mut send_weight = ctx
-            .stream
-            .alloc_zeros::<f32>(total_send_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send weight alloc failed: {err}"))?;
+            .alloc_zeros::<i32>(total_send_routes * 3)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send meta alloc failed: {err}"))?;
         {
             let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
@@ -729,8 +725,7 @@ impl DeepseekV4MoeBlock {
             let (packed_hidden_ptr, _packed_hidden_guard) =
                 send_hidden.data.device_ptr_mut(&ctx.stream);
             let (token_ptr, _token_guard) = send_token.device_ptr_mut(&ctx.stream);
-            let (expert_ptr, _expert_guard) = send_expert.device_ptr_mut(&ctx.stream);
-            let (packed_weight_ptr, _packed_weight_guard) = send_weight.device_ptr_mut(&ctx.stream);
+            let (meta_ptr, _meta_guard) = send_meta.device_ptr_mut(&ctx.stream);
             unsafe {
                 ffi::dsv4_pack_expert_ranks_cuda(
                     hidden_ptr as *const ffi::Half,
@@ -740,8 +735,7 @@ impl DeepseekV4MoeBlock {
                     cursor_ptr as *mut i32,
                     packed_hidden_ptr as *mut ffi::Half,
                     token_ptr as *mut i32,
-                    expert_ptr as *mut i32,
-                    packed_weight_ptr as *mut f32,
+                    meta_ptr as *mut i32,
                     hidden.seq_len as i32,
                     hidden.hidden_dim as i32,
                     config.num_experts_per_tok as i32,
@@ -798,19 +792,15 @@ impl DeepseekV4MoeBlock {
         let send_hidden_counts = dsv4_scale_usize(&send_rank_counts_usize, hidden.hidden_dim)?;
         let recv_hidden_offsets = dsv4_scale_usize(&recv_rank_offsets, hidden.hidden_dim)?;
         let recv_hidden_counts = dsv4_scale_usize(&recv_rank_counts_usize, hidden.hidden_dim)?;
+        let send_meta_offsets = dsv4_scale_usize(&send_rank_offsets, 3)?;
+        let send_meta_counts = dsv4_scale_usize(&send_rank_counts_usize, 3)?;
+        let recv_meta_offsets = dsv4_scale_usize(&recv_rank_offsets, 3)?;
+        let recv_meta_counts = dsv4_scale_usize(&recv_rank_counts_usize, 3)?;
         let mut recv_hidden = HiddenStates::zeros(ctx, hidden.hidden_dim, total_recv_routes)?;
-        let mut recv_token = ctx
+        let mut recv_meta = ctx
             .stream
-            .alloc_zeros::<i32>(total_recv_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv token alloc failed: {err}"))?;
-        let mut recv_expert = ctx
-            .stream
-            .alloc_zeros::<i32>(total_recv_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv expert alloc failed: {err}"))?;
-        let mut recv_weight = ctx
-            .stream
-            .alloc_zeros::<f32>(total_recv_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv weight alloc failed: {err}"))?;
+            .alloc_zeros::<i32>(total_recv_routes * 3)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv meta alloc failed: {err}"))?;
         comm.moe_grouped_send_recv_bf16(
             &send_hidden.data,
             &send_hidden_offsets,
@@ -820,28 +810,12 @@ impl DeepseekV4MoeBlock {
             &recv_hidden_counts,
         )?;
         comm.moe_grouped_send_recv_i32(
-            &send_token,
-            &send_rank_offsets,
-            &send_rank_counts_usize,
-            &mut recv_token,
-            &recv_rank_offsets,
-            &recv_rank_counts_usize,
-        )?;
-        comm.moe_grouped_send_recv_i32(
-            &send_expert,
-            &send_rank_offsets,
-            &send_rank_counts_usize,
-            &mut recv_expert,
-            &recv_rank_offsets,
-            &recv_rank_counts_usize,
-        )?;
-        comm.moe_grouped_send_recv_f32(
-            &send_weight,
-            &send_rank_offsets,
-            &send_rank_counts_usize,
-            &mut recv_weight,
-            &recv_rank_offsets,
-            &recv_rank_counts_usize,
+            &send_meta,
+            &send_meta_offsets,
+            &send_meta_counts,
+            &mut recv_meta,
+            &recv_meta_offsets,
+            &recv_meta_counts,
         )?;
         dsv4_moe_trace_end(ctx, "ffn_deepep_dispatch", layer_idx, hidden.seq_len, trace)?;
 
@@ -859,11 +833,11 @@ impl DeepseekV4MoeBlock {
                         anyhow::anyhow!("DeepSeek V4 recv local count alloc failed: {err}")
                     })?;
             {
-                let (expert_ptr, _expert_guard) = recv_expert.device_ptr(&ctx.stream);
+                let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
                 let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
                 unsafe {
                     ffi::dsv4_count_packed_local_experts_cuda(
-                        expert_ptr as *const i32,
+                        meta_ptr as *const i32,
                         count_ptr as *mut i32,
                         total_recv_routes as i32,
                         local_expert_start_i32,
@@ -912,9 +886,7 @@ impl DeepseekV4MoeBlock {
             {
                 let (recv_hidden_ptr, _recv_hidden_guard) =
                     recv_hidden.data.device_ptr(&ctx.stream);
-                let (recv_token_ptr, _recv_token_guard) = recv_token.device_ptr(&ctx.stream);
-                let (recv_expert_ptr, _recv_expert_guard) = recv_expert.device_ptr(&ctx.stream);
-                let (recv_weight_ptr, _recv_weight_guard) = recv_weight.device_ptr(&ctx.stream);
+                let (recv_meta_ptr, _recv_meta_guard) = recv_meta.device_ptr(&ctx.stream);
                 let (offset_ptr, _offset_guard) = local_offsets_gpu.device_ptr(&ctx.stream);
                 let (cursor_ptr, _cursor_guard) = local_cursors.device_ptr_mut(&ctx.stream);
                 let (expert_hidden_ptr, _expert_hidden_guard) =
@@ -928,9 +900,7 @@ impl DeepseekV4MoeBlock {
                 unsafe {
                     ffi::dsv4_pack_received_experts_cuda(
                         recv_hidden_ptr as *const ffi::Half,
-                        recv_token_ptr as *const i32,
-                        recv_expert_ptr as *const i32,
-                        recv_weight_ptr as *const f32,
+                        recv_meta_ptr as *const i32,
                         offset_ptr as *const i32,
                         cursor_ptr as *mut i32,
                         expert_hidden_ptr as *mut ffi::Half,
