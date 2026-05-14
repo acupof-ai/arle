@@ -1,0 +1,147 @@
+{
+  "date": "2026-05-14",
+  "model_path": "/root/DeepSeek-V4-Flash",
+  "runtime": {
+    "cuda_workers": 8,
+    "tp_world_size": 8,
+    "ep_world_size": 8,
+    "experts_per_rank": 32,
+    "max_seq_len": 900000,
+    "kv_cache_dtype": "fp8",
+    "moe_backend": "deepep",
+    "startup_prefill_warmup": "disabled_by_model_capability",
+    "layer_trace": true
+  },
+  "commits": {
+    "prefill_warmup_capability": "b5811699",
+    "moe_expert_scratch_reuse": "86141ce1"
+  },
+  "content_smoke": [
+    {
+      "case": "math_37x29",
+      "prompt_tokens": 17,
+      "completion_tokens": 8,
+      "elapsed_s": 1.979254,
+      "text": "37乘以29等于1073。计算"
+    },
+    {
+      "case": "math_58p67",
+      "prompt_tokens": 17,
+      "completion_tokens": 8,
+      "elapsed_s": 1.987586,
+      "text": "58加67等于125。计算过程"
+    },
+    {
+      "case": "write_city",
+      "prompt_tokens": 17,
+      "completion_tokens": 10,
+      "elapsed_s": 2.527676,
+      "text": "霓灯织夜，车流如河。"
+    }
+  ],
+  "phase_summary_tokens_1": {
+    "ffn_deepep_dispatch_combine": {
+      "count": 8256,
+      "p50_ms": 1.834,
+      "p95_ms": 2.281,
+      "max_ms": 3.166,
+      "avg_ms": 1.865
+    },
+    "ffn_deepep_route_logits": {
+      "count": 8256,
+      "p50_ms": 0.024,
+      "p95_ms": 0.051,
+      "max_ms": 0.114,
+      "avg_ms": 0.028
+    },
+    "ffn_deepep_route_setup": {
+      "count": 8256,
+      "p50_ms": 0.028,
+      "p95_ms": 0.079,
+      "max_ms": 0.223,
+      "avg_ms": 0.035
+    },
+    "ffn_deepep_route_select": {
+      "count": 8256,
+      "p50_ms": 0.148,
+      "p95_ms": 0.153,
+      "max_ms": 0.185,
+      "avg_ms": 0.142
+    },
+    "ffn_deepep_count_by_rank": {
+      "count": 8256,
+      "p50_ms": 0.026,
+      "p95_ms": 0.06,
+      "max_ms": 0.165,
+      "avg_ms": 0.031
+    },
+    "ffn_deepep_pack_by_rank": {
+      "count": 8256,
+      "p50_ms": 0.067,
+      "p95_ms": 0.146,
+      "max_ms": 0.336,
+      "avg_ms": 0.073
+    },
+    "ffn_deepep_count_exchange": {
+      "count": 8256,
+      "p50_ms": 0.119,
+      "p95_ms": 0.297,
+      "max_ms": 1.003,
+      "avg_ms": 0.141
+    },
+    "ffn_deepep_dispatch": {
+      "count": 8256,
+      "p50_ms": 0.058,
+      "p95_ms": 0.115,
+      "max_ms": 0.285,
+      "avg_ms": 0.06
+    },
+    "ffn_deepep_local_experts": {
+      "count": 8256,
+      "p50_ms": 0.464,
+      "p95_ms": 0.886,
+      "max_ms": 1.845,
+      "avg_ms": 0.35
+    },
+    "ffn_deepep_combine": {
+      "count": 8256,
+      "p50_ms": 0.723,
+      "p95_ms": 1.286,
+      "max_ms": 1.947,
+      "avg_ms": 0.648
+    },
+    "ffn_total": {
+      "count": 8256,
+      "p50_ms": 2.519,
+      "p95_ms": 2.989,
+      "max_ms": 4.093,
+      "avg_ms": 2.539
+    },
+    "attn_total": {
+      "count": 8256,
+      "p50_ms": 1.187,
+      "p95_ms": 1.687,
+      "max_ms": 2.33,
+      "avg_ms": 1.185
+    },
+    "attn_mhc": {
+      "count": 8256,
+      "p50_ms": 0.167,
+      "p95_ms": 0.263,
+      "max_ms": 0.542,
+      "avg_ms": 0.174
+    },
+    "ffn_mhc": {
+      "count": 8256,
+      "p50_ms": 0.152,
+      "p95_ms": 0.225,
+      "max_ms": 1.027,
+      "avg_ms": 0.156
+    }
+  },
+  "bottleneck": [
+    "Decode remains dominated by per-layer attention plus FFN dispatch/combine.",
+    "Within FFN, combine and local expert computation are larger than route selection or count exchange.",
+    "Next high-value kernel change is grouped expert GEMM/DeepGEMM, then graph-safe low-latency dispatch/combine."
+  ]
+}
