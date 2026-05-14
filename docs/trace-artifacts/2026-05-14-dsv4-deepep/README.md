@@ -283,11 +283,46 @@ reuse is a real decode cleanup, but it does not change the long-prefill
 bottleneck: return-side MoE combine exchange and local expert GEMMs still
 dominate.
 
+## Dispatch Scratch Reuse
+
+The DeepEP MoE path now reuses per-layer dispatch scratch for token ids, route
+indices, route weights, rank counts/offsets/cursors, packed send hidden rows,
+packed send metadata, rank count exchange buffers, and local expert
+count/offset/cursor buffers. Atomic count/cursor buffers are explicitly zeroed
+before reuse.
+
+Trace-off default route, same 8xH20 shape:
+
+| Case | Prompt tokens | Completion tokens | Latency | Completion throughput | Output |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `37*29` | 15 | 12 | 1.551 s | 7.74 tok/s | `好的，我们一起来计算 37 × 29，我会` |
+| `58+67` | 15 | 12 | 1.540 s | 7.79 tok/s | `好的，我们一起来计算58加67。我们可以用竖` |
+| writing | 18 | 8 | 1.249 s | 6.41 tok/s | `极速推理，秒级洞察。` |
+
+Layer-trace phase medians from an 8-token math request:
+
+| Phase | p50 | p95 |
+| --- | ---: | ---: |
+| `ffn_deepep_dispatch_combine` | 1.552 ms | 2.004 ms |
+| `ffn_total` | 2.079 ms | 2.557 ms |
+| `ffn_deepep_local_experts` | 0.439 ms | 0.836 ms |
+| `ffn_deepep_combine_exchange` | 0.485 ms | 1.231 ms |
+| `ffn_deepep_dispatch` | 0.064 ms | 0.119 ms |
+
+`nsys-dispatch-scratch/` confirms the allocator call count dropped in the
+profiled 8-token window: `cuMemAllocAsync` and `cuMemFreeAsync` calls went from
+136,825 to 111,531. `cuMemFreeAsync` normalized time improved from
+44.297 ms/token/rank to 39.001 ms/token/rank; `cuMemAllocAsync` time was roughly
+flat. The remaining runtime API cost is still dominated by stream
+synchronization, so this is a prerequisite cleanup rather than the final
+DeepGEMM/DeepEP overlap fix.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not
 the old full hidden all-reduce. In the warm trace, median `ffn_deepep_dispatch_combine` is roughly
-1.865 ms per layer/rank, while the overall decode step is roughly 143 ms/token. Remaining high-value
+1.552 ms per layer/rank after dispatch scratch reuse, while the overall decode step remains dominated
+by synchronization and small communication boundaries. Remaining high-value
 work:
 
 - Replace chunked 900K prefill with a real high-throughput paged/varlen prefill

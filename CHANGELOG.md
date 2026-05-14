@@ -56,6 +56,14 @@ Related governance docs:
 
 ### CUDA
 
+- Reused per-layer DSv4 DeepEP dispatch scratch for route setup, rank count
+  exchange buffers, packed send hidden rows/metadata, and local expert
+  count/offset/cursor buffers. On the 8xH20 default path, trace-off math smoke
+  reached 7.7-7.8 tok/s for 12 generated tokens, traced
+  `ffn_deepep_dispatch_combine` p50 dropped to 1.552 ms, and the profiled
+  `cuMemAllocAsync`/`cuMemFreeAsync` call count fell from 136,825 to 111,531 in
+  the 8-token Nsight window. Remaining bottlenecks are still stream sync,
+  return-side NCCL send/recv, and local expert GEMV/GEMM.
 - Optimized the gated DSv4 grouped expert prototype behind
   `ARLE_DSV4_GROUPED_EXPERTS=1` by caching per-layer local expert weight
   pointer arrays and launching indexed active experts instead of rebuilding

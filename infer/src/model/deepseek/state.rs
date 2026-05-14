@@ -76,9 +76,33 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub(crate) struct DeepseekMoeRuntimeCache {
+    pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekDispatchRuntimeScratch {
+    pub(crate) capacity_tokens: usize,
+    pub(crate) capacity_routes: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) topk: usize,
+    pub(crate) ep_world: usize,
+    pub(crate) experts_per_rank: usize,
+    pub(crate) token_ids: CudaSlice<u32>,
+    pub(crate) route_indices: CudaSlice<i32>,
+    pub(crate) route_weights: CudaSlice<f32>,
+    pub(crate) send_rank_counts: CudaSlice<i32>,
+    pub(crate) send_rank_offsets: CudaSlice<i32>,
+    pub(crate) rank_cursors: CudaSlice<i32>,
+    pub(crate) send_hidden: HiddenStates,
+    pub(crate) send_meta: CudaSlice<i32>,
+    pub(crate) all_rank_counts: CudaSlice<i32>,
+    pub(crate) recv_rank_counts: CudaSlice<i32>,
+    pub(crate) local_counts: CudaSlice<i32>,
+    pub(crate) local_offsets: CudaSlice<i32>,
+    pub(crate) local_cursors: CudaSlice<i32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -161,6 +185,58 @@ pub(crate) struct DeepseekRouteCombineRuntimeScratch {
 
 #[cfg(feature = "cuda")]
 impl DeepseekMoeRuntimeCache {
+    pub(crate) fn ensure_dispatch_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_dim: usize,
+        capacity_tokens: usize,
+        topk: usize,
+        ep_world: usize,
+        experts_per_rank: usize,
+    ) -> Result<&mut DeepseekDispatchRuntimeScratch> {
+        let capacity_tokens = capacity_tokens.max(1);
+        let capacity_routes = capacity_tokens.saturating_mul(topk).max(1);
+        let needs_alloc = self
+            .dispatch
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_tokens < capacity_tokens
+                    || scratch.capacity_routes < capacity_routes
+                    || scratch.hidden_dim != hidden_dim
+                    || scratch.topk != topk
+                    || scratch.ep_world != ep_world
+                    || scratch.experts_per_rank != experts_per_rank
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            self.dispatch = Some(DeepseekDispatchRuntimeScratch {
+                capacity_tokens,
+                capacity_routes,
+                hidden_dim,
+                topk,
+                ep_world,
+                experts_per_rank,
+                token_ids: ctx.stream.alloc_zeros::<u32>(capacity_tokens)?,
+                route_indices: ctx.stream.alloc_zeros::<i32>(capacity_routes)?,
+                route_weights: ctx.stream.alloc_zeros::<f32>(capacity_routes)?,
+                send_rank_counts: ctx.stream.alloc_zeros::<i32>(ep_world)?,
+                send_rank_offsets: ctx.stream.alloc_zeros::<i32>(ep_world)?,
+                rank_cursors: ctx.stream.alloc_zeros::<i32>(ep_world)?,
+                send_hidden: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+                send_meta: ctx.stream.alloc_zeros::<i32>(capacity_routes * 3)?,
+                all_rank_counts: ctx.stream.alloc_zeros::<i32>(ep_world * ep_world)?,
+                recv_rank_counts: ctx.stream.alloc_zeros::<i32>(ep_world)?,
+                local_counts: ctx.stream.alloc_zeros::<i32>(experts_per_rank)?,
+                local_offsets: ctx.stream.alloc_zeros::<i32>(experts_per_rank)?,
+                local_cursors: ctx.stream.alloc_zeros::<i32>(experts_per_rank)?,
+            });
+        }
+        Ok(self
+            .dispatch
+            .as_mut()
+            .expect("DeepSeek V4 dispatch scratch allocated"))
+    }
+
     pub(crate) fn ensure_expert_scratch(
         &mut self,
         ctx: &DeviceContext,
