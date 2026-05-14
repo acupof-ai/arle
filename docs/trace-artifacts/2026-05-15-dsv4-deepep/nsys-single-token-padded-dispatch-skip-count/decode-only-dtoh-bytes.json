@@ -1,0 +1,10 @@
+[
+  {
+    "bytes": 128,
+    "calls": 344,
+    "runtime_ms": 70.088777,
+    "per_decode_range_runtime_ms": 8.761097,
+    "avg_runtime_us": 203.746445,
+    "memcpy_ms": 0.833795
+  }
+]
