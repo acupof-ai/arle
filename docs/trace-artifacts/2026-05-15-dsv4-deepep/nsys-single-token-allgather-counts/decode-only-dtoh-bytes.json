@@ -1,0 +1,18 @@
+[
+  {
+    "bytes": 256,
+    "calls": 344,
+    "runtime_ms": 136.692288,
+    "per_decode_range_runtime_ms": 17.086536,
+    "avg_runtime_us": 397.361302,
+    "memcpy_ms": 0.835384
+  },
+  {
+    "bytes": 128,
+    "calls": 199,
+    "runtime_ms": 8.155464,
+    "per_decode_range_runtime_ms": 1.019433,
+    "avg_runtime_us": 40.982231,
+    "memcpy_ms": 0.483684
+  }
+]

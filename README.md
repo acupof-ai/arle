@@ -214,7 +214,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   pre-projection and RMSNorm temporaries then cuts alloc/free/memset calls by
   **1,376 each** and moves the same single-token wave to **135 ms wall**; the
   current top costs are launch/runtime overhead, D2H route readback, NCCL
-  SendRecv/AllReduce, and local expert FP8/FP4 GEMV.
+  SendRecv/AllReduce, and local expert FP8/FP4 GEMV. Reusing the default
+  AllGather count matrix for both send and receive counts removes the
+  redundant 32-byte send-count D2H readback, cutting decode-only D2H calls
+  **887 → 543** and the same wave to **130 ms wall**. The next count-side
+  target is avoiding the remaining 256-byte all-rank count matrix readback.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)
