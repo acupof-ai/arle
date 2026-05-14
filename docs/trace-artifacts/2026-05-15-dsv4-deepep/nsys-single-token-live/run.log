@@ -1,0 +1,12 @@
+nsys_pid=178064
+infer_pid=178215
+total 36M
+-rw-r--r-- 1 root root  452 May 15 01:59 command.txt
+-rw-r--r-- 1 root root 3.4K May 15 02:00 cuda_api_sum.txt
+-rw-r--r-- 1 root root 9.6K May 15 02:00 cuda_gpu_kern_sum.txt
+-rw-r--r-- 1 root root 2.8K May 15 02:00 profile-request.json
+-rw-r--r-- 1 root root   33 May 15 02:00 run.log
+-rw-r--r-- 1 root root  90K May 15 02:00 server.log
+-rw-rw-r-- 1 root root  11M May 15 02:00 trace.nsys-rep
+-rw-r--r-- 1 root root  25M May 15 02:00 trace.sqlite
+-rw-r--r-- 1 root root  292 May 15 02:00 warmup.json

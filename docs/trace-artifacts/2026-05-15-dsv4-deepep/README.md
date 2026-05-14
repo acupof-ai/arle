@@ -13,3 +13,7 @@ Current trace set:
 - [`shared-expert-scratch/`](shared-expert-scratch/) records the shared expert
   scratch cleanup, including trace-off math/writing smoke and a single-token
   Nsight comparison.
+- [`nsys-single-token-live/`](nsys-single-token-live/) is the current live
+  single-token rerun from a clean remote source tree. It shows a 146.448 ms
+  decode wave with the remaining cost concentrated in allocator/runtime churn,
+  D2H routing readback, NCCL exchange, and per-expert GEMV.
