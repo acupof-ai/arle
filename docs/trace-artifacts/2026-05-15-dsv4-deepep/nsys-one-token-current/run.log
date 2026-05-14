@@ -1,0 +1,3 @@
+ready nsys_pid=3997756 arle_pid=3997876
+SIGUSR1 start
+SIGUSR2 stop

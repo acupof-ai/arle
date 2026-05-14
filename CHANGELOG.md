@@ -60,6 +60,12 @@ Related governance docs:
   266.020 ms wall; decode-only nsys shows `cuStreamSynchronize`,
   async allocation/free, launch/memset churn, and NCCL send/recv ahead of the
   actual attention and GEMV kernels.
+- Added a refreshed 2026-05-15 DSv4 single-token Nsight trace under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-one-token-current/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-one-token-current/).
+  With send/recv route and route-logits scratch reuse in place, the same
+  one-token decode shape is now 158.439 ms wall. The remaining ranked costs are
+  async allocation/free, launch/memset churn, D2H route readbacks, NCCL
+  SendRecv/AllReduce, and local expert FP8/FP4 GEMV.
 
 ### CUDA
 
@@ -92,6 +98,11 @@ Related governance docs:
   decode-only `cuMemAllocAsync`/`cuMemFreeAsync` calls again to 9,136/9,144 and
   `cuMemsetD8Async` calls to 10,210, while the captured wall time was noisy
   at 162.062 ms versus the prior 148.253 ms.
+- Reran the post-scratch DSv4 single-token Nsight capture on 2026-05-15. The
+  fresh one-token decode wave measured 158.439 ms wall and confirms the
+  remaining cost center is not sampler or KV-cache lookup: runtime allocation,
+  launch, memset, D2H routing readbacks, NCCL exchange/reduction, and per-expert
+  GEMV still dominate before attention.
 - Optimized the gated DSv4 grouped expert prototype behind
   `ARLE_DSV4_GROUPED_EXPERTS=1` by caching per-layer local expert weight
   pointer arrays and launching indexed active experts instead of rebuilding

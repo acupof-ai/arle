@@ -197,10 +197,16 @@ Operators who want only the native serving binary can use `infer` directly (`car
   `cuMemAllocAsync`/`cuMemFreeAsync` calls down to **9,480/9,488**. A further
   route-logits scratch cleanup lowers allocator calls again to **9,136/9,144**,
   though its single capture is a call-count cleanup rather than a confirmed
-  wall-time win. That leaves stream sync, D2H routing readbacks,
-  launch/memset churn, and return-side NCCL/GEMM work as the next targets.
+  wall-time win. A refreshed 2026-05-15 nsys run isolates the current
+  single-token decode wave at **158 ms wall** and shows the concrete remaining
+  stack: async allocation/free, launch/memset churn, D2H routing readbacks,
+  NCCL SendRecv/AllReduce, local expert FP8/FP4 GEMV, then attention/MHC. That
+  leaves allocator lifetime or graph capture, fewer host readbacks,
+  lower-latency/overlapped DeepEP exchange, and true grouped GEMM/DeepGEMM as
+  the next targets.
   Evidence:
-  [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
+  [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)
   and
   [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
 - **2026-05-10** — 🎉 W4-hybrid prefill graph capture **closes 4k/c=4 SGLang +76.6% gap** via Path B.2 bucketed allocation key (`a56b7a9`/`c44788f`). Engine-side TTFT p50 **2000ms → 150ms = -92.5%** improvement on RTX 4070 Ti SUPER 16GB (server-side `/v1/stats engine_ttft_us` ground truth; client-side guidellm 0.6.0 broken — bench tool bug isolated). Throughput **+632%** in 60s window. Bucketed `page_indices_len` (64-entry) + `prefix_token_rows_len` (128-row) reduce capture key churn from 388 unique → **7 unique** with **98.5% LRU dominant key reuse**. Codex's "second-order bucketing" insight (captured scalar launch parameters use bucket capacity, not exact dim from first capture) was load-bearing; new anti-pattern in skill v1.7.0 catalog. Opt-in via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1`. Plus **RoPE scaling support** (YARN / Linear / NtkAware) wired through qwen3-spec + qwen35-spec + `precompute_rope_with_scaling`. Evidence: [`docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`](docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md), [`docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`](docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md).
