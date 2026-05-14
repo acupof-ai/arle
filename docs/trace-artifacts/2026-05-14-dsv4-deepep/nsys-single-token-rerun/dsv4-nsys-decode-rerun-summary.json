@@ -1,0 +1,256 @@
+{
+  "run": "dsv4-nsys-decode-rerun-8tok",
+  "remote_workspace": "/root/arle-perf-main",
+  "profile": "DeepEP default, incremental KV, FP8 KV cache, grouped experts disabled",
+  "request": {
+    "phase": "profiled",
+    "elapsed_s": 2.7049574851989746,
+    "status": 200,
+    "usage": {
+      "prompt_tokens": 14,
+      "completion_tokens": 8,
+      "total_tokens": 22
+    },
+    "text": "霓灯吻碎江，夜城"
+  },
+  "normalization": {
+    "completion_tokens": 8,
+    "ranks": 8,
+    "per_token_rank_divisor": 64
+  },
+  "top_runtime_api_per_token_rank_ms": [
+    {
+      "name": "cuStreamSynchronize",
+      "total_ms": 10165.3272,
+      "calls": 172992,
+      "per_token_rank_ms": 158.8332375,
+      "avg_ms": 0.0588,
+      "med_ms": 0.0091
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "total_ms": 2835.0065,
+      "calls": 136825,
+      "per_token_rank_ms": 44.2969765625,
+      "avg_ms": 0.0207,
+      "med_ms": 0.005
+    },
+    {
+      "name": "cuMemAllocAsync",
+      "total_ms": 1833.9828,
+      "calls": 136825,
+      "per_token_rank_ms": 28.65598125,
+      "avg_ms": 0.0134,
+      "med_ms": 0.0039
+    },
+    {
+      "name": "cudaLaunchKernel",
+      "total_ms": 1274.6462,
+      "calls": 130204,
+      "per_token_rank_ms": 19.916346875,
+      "avg_ms": 0.0098,
+      "med_ms": 0.0079
+    },
+    {
+      "name": "cuMemsetD8Async",
+      "total_ms": 1112.8535,
+      "calls": 129591,
+      "per_token_rank_ms": 17.3883359375,
+      "avg_ms": 0.0086,
+      "med_ms": 0.0067
+    },
+    {
+      "name": "cuMemcpyDtoHAsync_v2",
+      "total_ms": 465.0697,
+      "calls": 7234,
+      "per_token_rank_ms": 7.2667140625,
+      "avg_ms": 0.0643,
+      "med_ms": 0.0234
+    },
+    {
+      "name": "cudaEventRecord",
+      "total_ms": 191.4169,
+      "calls": 32400,
+      "per_token_rank_ms": 2.9908890625,
+      "avg_ms": 0.0059,
+      "med_ms": 0.0033
+    },
+    {
+      "name": "cudaStreamWaitEvent",
+      "total_ms": 165.8376,
+      "calls": 27520,
+      "per_token_rank_ms": 2.5912125,
+      "avg_ms": 0.006,
+      "med_ms": 0.0032
+    }
+  ],
+  "top_kernels_per_token_rank_ms": [
+    {
+      "name": "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "total_ms": 2389.6604,
+      "calls": 8256,
+      "per_token_rank_ms": 37.33844375,
+      "avg_ms": 0.2894,
+      "med_ms": 0.0381
+    },
+    {
+      "name": "dsv4_fp4_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "total_ms": 1411.6176,
+      "calls": 10656,
+      "per_token_rank_ms": 22.056525,
+      "avg_ms": 0.1325,
+      "med_ms": 0.1156
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "total_ms": 642.3875,
+      "calls": 20440,
+      "per_token_rank_ms": 10.0373046875,
+      "avg_ms": 0.0314,
+      "med_ms": 0.0274
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "total_ms": 503.439,
+      "calls": 2752,
+      "per_token_rank_ms": 7.866234375,
+      "avg_ms": 0.1829,
+      "med_ms": 0.1485
+    },
+    {
+      "name": "dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)",
+      "total_ms": 448.5735,
+      "calls": 2624,
+      "per_token_rank_ms": 7.0089609375,
+      "avg_ms": 0.171,
+      "med_ms": 0.1473
+    },
+    {
+      "name": "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "total_ms": 365.9811,
+      "calls": 2752,
+      "per_token_rank_ms": 5.7184546875,
+      "avg_ms": 0.133,
+      "med_ms": 0.0807
+    },
+    {
+      "name": "dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)",
+      "total_ms": 362.0849,
+      "calls": 2752,
+      "per_token_rank_ms": 5.6575765625,
+      "avg_ms": 0.1316,
+      "med_ms": 0.1378
+    },
+    {
+      "name": "dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)",
+      "total_ms": 352.5552,
+      "calls": 5504,
+      "per_token_rank_ms": 5.508675,
+      "avg_ms": 0.0641,
+      "med_ms": 0.064
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "total_ms": 326.2993,
+      "calls": 2920,
+      "per_token_rank_ms": 5.0984265625,
+      "avg_ms": 0.1117,
+      "med_ms": 0.1112
+    },
+    {
+      "name": "dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)",
+      "total_ms": 264.8795,
+      "calls": 1344,
+      "per_token_rank_ms": 4.1387421875,
+      "avg_ms": 0.1971,
+      "med_ms": 0.1957
+    }
+  ],
+  "layer_trace_last_profiled_request": [
+    {
+      "phase": "ffn_total",
+      "count": 2752,
+      "p50_ms": 3.58,
+      "p95_ms": 4.121,
+      "max_ms": 4.823
+    },
+    {
+      "phase": "ffn_deepep_dispatch_combine",
+      "count": 2752,
+      "p50_ms": 2.751,
+      "p95_ms": 3.318,
+      "max_ms": 3.986
+    },
+    {
+      "phase": "ffn_deepep_dispatch",
+      "count": 2752,
+      "p50_ms": 0.318,
+      "p95_ms": 0.4,
+      "max_ms": 0.46
+    },
+    {
+      "phase": "ffn_deepep_count_exchange",
+      "count": 2752,
+      "p50_ms": 0.183,
+      "p95_ms": 0.481,
+      "max_ms": 0.639
+    },
+    {
+      "phase": "ffn_deepep_local_experts",
+      "count": 2752,
+      "p50_ms": 0.5255000000000001,
+      "p95_ms": 0.966,
+      "max_ms": 1.949
+    },
+    {
+      "phase": "ffn_deepep_combine_exchange",
+      "count": 2752,
+      "p50_ms": 0.718,
+      "p95_ms": 1.407,
+      "max_ms": 2.142
+    },
+    {
+      "phase": "ffn_deepep_combine_kernel",
+      "count": 2752,
+      "p50_ms": 0.029,
+      "p95_ms": 0.05,
+      "max_ms": 0.089
+    },
+    {
+      "phase": "ffn_deepep_combine",
+      "count": 2752,
+      "p50_ms": 0.797,
+      "p95_ms": 1.526,
+      "max_ms": 2.241
+    },
+    {
+      "phase": "attn_total",
+      "count": 2752,
+      "p50_ms": 1.555,
+      "p95_ms": 2.232,
+      "max_ms": 2.801
+    },
+    {
+      "phase": "attn_core",
+      "count": 2752,
+      "p50_ms": 1.206,
+      "p95_ms": 1.862,
+      "max_ms": 2.539
+    },
+    {
+      "phase": "attn_mhc",
+      "count": 2752,
+      "p50_ms": 0.137,
+      "p95_ms": 0.18,
+      "max_ms": 0.239
+    },
+    {
+      "phase": "ffn_mhc",
+      "count": 2752,
+      "p50_ms": 0.139,
+      "p95_ms": 0.176,
+      "max_ms": 0.218
+    }
+  ],
+  "conclusion": "Single-token decode is dominated by host/runtime synchronization, async allocation/free, launch/memset overhead, and small NCCL send/recv/allreduce/allgather boundaries. KV is active: dsv4_hybrid_attention_kernel and attn_core are present, but attention is not the largest cost."
+}

@@ -333,3 +333,15 @@ reads alone. The attention kernel is present and costs about 7.4 ms/token/rank,
 but the larger issue is that B=1 decode spends most wall time in synchronization,
 temporary allocation/free, launch overhead, and MoE/NCCL boundaries around many
 small kernels.
+
+`nsys-single-token-rerun/` repeats the same question on the current default
+DeepEP path with grouped experts disabled. The profiled 8-token request returned
+normal text (`霓灯吻碎江，夜城`) and again points at runtime/synchronization
+overhead first: normalized `cuStreamSynchronize` is 158.833 ms/token/rank,
+followed by `cuMemFreeAsync` at 44.297 ms, `cuMemAllocAsync` at 28.656 ms, and
+`cudaLaunchKernel` at 19.916 ms. Kernel-side cost is led by NCCL send/recv
+at 37.338 ms/token/rank, FP4 GEMV at 22.057 ms, FP8 GEMV at 10.037 ms, BF16
+all-reduce at 7.866 ms, and hybrid attention at 7.009 ms. This reinforces the
+same conclusion: KV is active, but the slow single-token path is dominated by
+host/runtime sync, allocation churn, launch overhead, and small communication
+boundaries.
