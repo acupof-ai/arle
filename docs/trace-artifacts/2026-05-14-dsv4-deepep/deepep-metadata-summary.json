@@ -1,0 +1,79 @@
+{
+  "date": "2026-05-14",
+  "model_path": "/root/DeepSeek-V4-Flash",
+  "runtime": {
+    "cuda_workers": 8,
+    "tp_world_size": 8,
+    "ep_world_size": 8,
+    "experts_per_rank": 32,
+    "max_seq_len": 900000,
+    "kv_cache_dtype": "fp8",
+    "moe_backend": "deepep",
+    "prefill_warmup": false,
+    "layer_trace": true
+  },
+  "functional_smoke": [
+    {
+      "case": "math",
+      "prompt_tokens": 17,
+      "completion_tokens": 33,
+      "elapsed_s": 5.318,
+      "text": "37乘以29等于1073。计算过程是：先算37乘以30等于1110，再减去37乘以1（即37），得到1073。"
+    },
+    {
+      "case": "writing",
+      "prompt_tokens": 23,
+      "completion_tokens": 48,
+      "elapsed_s": 7.291,
+      "text": "夜幕低程序悄然运行，调试者紧盯屏幕，指尖轻触键盘调整参数。暗色界面中，数据流如萤火般闪烁，逻辑脉络逐渐清晰。待晨光微露时，系统终于稳定，无声"
+    }
+  ],
+  "before_route_metadata_packing": {
+    "prompt_tokens": 14,
+    "completion_tokens": 8,
+    "total_ms": 1980.970708,
+    "ttft_ms": 685.336918,
+    "decode_step_ms": 151.809,
+    "completion_tokens_per_s_e2e": 4.038424176436636,
+    "trace_counts": {
+      "ffn_deepep_dispatch_combine": 1720,
+      "ffn_deepep_dispatch": 3440,
+      "ffn_deepep_combine": 1720,
+      "ffn_all_reduce": 0
+    },
+    "phase_p50_ms": {
+      "ffn_deepep_dispatch": 0.135,
+      "ffn_deepep_dispatch_combine": 2.03,
+      "ffn_deepep_count_exchange": 0.118,
+      "ffn_deepep_local_experts": 0.538,
+      "ffn_total": 2.706
+    }
+  },
+  "after_route_metadata_packing": {
+    "prompt_tokens": 14,
+    "completion_tokens": 8,
+    "total_ms": 1887.811024,
+    "ttft_ms": 664.852322,
+    "decode_step_ms": 142.818,
+    "completion_tokens_per_s_e2e": 4.237712301864384,
+    "trace_counts": {
+      "ffn_deepep_dispatch_combine": 1720,
+      "ffn_deepep_dispatch": 3440,
+      "ffn_deepep_combine": 1720,
+      "ffn_all_reduce": 0
+    },
+    "phase_p50_ms": {
+      "ffn_deepep_dispatch": 0.069,
+      "ffn_deepep_dispatch_combine": 1.865,
+      "ffn_deepep_count_exchange": 0.115,
+      "ffn_deepep_local_experts": 0.526,
+      "ffn_total": 2.52
+    }
+  },
+  "first_request_init_spike": {
+    "phase": "ffn_deepep_count_exchange",
+    "layer": 0,
+    "elapsed_ms": 4689.0,
+    "reason": "first NCCL send/recv connection setup"
+  }
+}
