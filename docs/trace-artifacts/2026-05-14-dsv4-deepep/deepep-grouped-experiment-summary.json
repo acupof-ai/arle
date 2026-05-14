@@ -1,0 +1,193 @@
+{
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle",
+  "model": "/root/DeepSeek-V4-Flash",
+  "runtime": {
+    "env": {
+      "ARLE_DSV4_TRACE_LAYER": "1",
+      "ARLE_DSV4_MOE_BACKEND": "deepep",
+      "ARLE_DSV4_INCREMENTAL_KV": "1",
+      "INFER_CUDA_DEVICES": "0,1,2,3,4,5,6,7"
+    },
+    "args": [
+      "--model-path",
+      "/root/DeepSeek-V4-Flash",
+      "--port",
+      "18084",
+      "--max-seq-len",
+      "900000",
+      "--kv-cache-dtype",
+      "fp8",
+      "--num-slots",
+      "1",
+      "--deepseek-distributed-layers",
+      "43",
+      "--mem-fraction-static",
+      "0.1"
+    ]
+  },
+  "gate": {
+    "env": "ARLE_DSV4_GROUPED_EXPERTS",
+    "default": false,
+    "enabled_values": ["1", "true", "TRUE", "on", "ON"],
+    "disabled_values": ["0", "false", "FALSE", "off", "OFF"]
+  },
+  "baseline_scratch_reuse": {
+    "requests": [
+      {
+        "name": "math_37x29",
+        "elapsed_s": 1.979254,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "37乘以29等于1073。计算"
+      },
+      {
+        "name": "math_58p67",
+        "elapsed_s": 1.987586,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "58加67等于125。计算过程"
+      },
+      {
+        "name": "write_city",
+        "elapsed_s": 2.527676,
+        "prompt_tokens": 17,
+        "completion_tokens": 10,
+        "text": "霓灯织夜，车流如河。"
+      }
+    ],
+    "phase_p50_ms": {
+      "ffn_deepep_dispatch_combine": 1.834,
+      "ffn_deepep_dispatch": 0.058,
+      "ffn_deepep_count_exchange": 0.119,
+      "ffn_deepep_local_experts": 0.464,
+      "ffn_deepep_combine": 0.723,
+      "ffn_total": 2.519,
+      "attn_total": 1.187
+    }
+  },
+  "grouped_raw_gemv_experiments": [
+    {
+      "name": "all_local_experts",
+      "ARLE_DSV4_GROUPED_EXPERTS": "1",
+      "result": "slower_than_scratch",
+      "notes": "Grouped raw GEMV launches covered every local expert slot, including zero-count experts.",
+      "request_latency_s": {
+        "math_cases": 3.58,
+        "write_case": 4.27
+      },
+      "phase_p50_ms": {
+        "ffn_deepep_local_experts": 1.549,
+        "ffn_deepep_combine": 1.995,
+        "ffn_total": 4.181
+      }
+    },
+    {
+      "name": "active_local_experts_only",
+      "ARLE_DSV4_GROUPED_EXPERTS": "1",
+      "result": "slower_than_scratch",
+      "notes": "Grouped raw GEMV launches used only experts with nonzero route counts.",
+      "requests": [
+        {
+          "name": "math_37x29",
+          "elapsed_s": 3.481573,
+          "text": "37乘以29等于1073。计算"
+        },
+        {
+          "name": "math_58p67",
+          "elapsed_s": 3.396225,
+          "text": "58加67等于125。计算过程"
+        },
+        {
+          "name": "write_city",
+          "elapsed_s": 4.561858,
+          "text": "霓灯织夜，车流如河。"
+        }
+      ],
+      "phase_p50_ms": {
+        "ffn_deepep_local_experts": 1.301,
+        "ffn_deepep_combine": 1.872,
+        "ffn_total": 4.085
+      }
+    }
+  ],
+  "default_gated_validation": {
+    "ARLE_DSV4_GROUPED_EXPERTS": null,
+    "result": "scratch_reuse_path_preserved",
+    "requests": [
+      {
+        "name": "math_37x29",
+        "elapsed_s": 2.035756,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "37乘以29等于1073。计算"
+      },
+      {
+        "name": "math_58p67",
+        "elapsed_s": 2.158145,
+        "prompt_tokens": 17,
+        "completion_tokens": 8,
+        "text": "58加67等于125。计算过程"
+      },
+      {
+        "name": "write_city",
+        "elapsed_s": 2.512657,
+        "prompt_tokens": 17,
+        "completion_tokens": 10,
+        "text": "霓灯织夜，车流如河。"
+      }
+    ],
+    "phase_stats": {
+      "ffn_deepep_dispatch_combine": {
+        "count": 8256,
+        "p50_ms": 1.813,
+        "p95_ms": 2.271,
+        "max_ms": 5.56,
+        "avg_ms": 1.846
+      },
+      "ffn_deepep_dispatch": {
+        "count": 8256,
+        "p50_ms": 0.057,
+        "p95_ms": 0.114,
+        "max_ms": 0.173,
+        "avg_ms": 0.059
+      },
+      "ffn_deepep_count_exchange": {
+        "count": 8256,
+        "p50_ms": 0.114,
+        "p95_ms": 0.293,
+        "max_ms": 0.709,
+        "avg_ms": 0.137
+      },
+      "ffn_deepep_local_experts": {
+        "count": 8256,
+        "p50_ms": 0.463,
+        "p95_ms": 0.878,
+        "max_ms": 4.38,
+        "avg_ms": 0.349
+      },
+      "ffn_deepep_combine": {
+        "count": 8256,
+        "p50_ms": 0.721,
+        "p95_ms": 1.28,
+        "max_ms": 4.521,
+        "avg_ms": 0.648
+      },
+      "ffn_total": {
+        "count": 8256,
+        "p50_ms": 2.478,
+        "p95_ms": 2.962,
+        "max_ms": 6.884,
+        "avg_ms": 2.512
+      },
+      "attn_total": {
+        "count": 8256,
+        "p50_ms": 1.174,
+        "p95_ms": 1.655,
+        "max_ms": 4.702,
+        "avg_ms": 1.171
+      }
+    }
+  },
+  "conclusion": "The raw grouped GEMV prototype is functionally correct but slower than the scratch-reuse per-expert path on the current DSv4 B=1 decode shape. It remains opt-in behind ARLE_DSV4_GROUPED_EXPERTS=1. The default path preserves the faster scratch baseline while keeping the grouped-kernel harness available for replacing with real grouped GEMM/DeepGEMM."
+}
