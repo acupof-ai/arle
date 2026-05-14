@@ -1,0 +1,239 @@
+{
+  "capture": "nsys-single-decode-token-pair-gemv",
+  "decode_ranges": 8,
+  "decode_waves": 1,
+  "decode_wave_wall_ms": [
+    127.411896
+  ],
+  "decode_wave_wall_ms_max": 127.411896,
+  "decode_range_ms_p50": 127.212564,
+  "decode_range_ms_min": 126.833856,
+  "decode_range_ms_max": 127.353088,
+  "runtime_api_total_ms_per_rank_range": 100.6380315,
+  "kernel_total_ms_per_rank_range": 114.022063625,
+  "top_runtime_apis": [
+    {
+      "name": "cudaLaunchKernel_v7000",
+      "time_ms_per_rank_range": 23.242203125,
+      "total_time_ms_all_ranges": 185.937625,
+      "calls": 15464
+    },
+    {
+      "name": "cuMemcpyDtoHAsync_v2",
+      "time_ms_per_rank_range": 18.933002375,
+      "total_time_ms_all_ranges": 151.464019,
+      "calls": 344
+    },
+    {
+      "name": "cuMemAllocAsync",
+      "time_ms_per_rank_range": 17.6159635,
+      "total_time_ms_all_ranges": 140.927708,
+      "calls": 7765
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "time_ms_per_rank_range": 14.85223125,
+      "total_time_ms_all_ranges": 118.81785,
+      "calls": 6048
+    },
+    {
+      "name": "cuMemsetD8Async",
+      "time_ms_per_rank_range": 12.310366875,
+      "total_time_ms_all_ranges": 98.482935,
+      "calls": 8789
+    },
+    {
+      "name": "cudaEventRecord_v3020",
+      "time_ms_per_rank_range": 2.988410875,
+      "total_time_ms_all_ranges": 23.907287,
+      "calls": 3448
+    },
+    {
+      "name": "cudaStreamWaitEvent_v3020",
+      "time_ms_per_rank_range": 2.35341725,
+      "total_time_ms_all_ranges": 18.827338,
+      "calls": 2752
+    },
+    {
+      "name": "cudaStreamGetCaptureInfo_v2_v11030",
+      "time_ms_per_rank_range": 2.21424825,
+      "total_time_ms_all_ranges": 17.713986,
+      "calls": 4856
+    },
+    {
+      "name": "cuMemcpyDtoDAsync_v2",
+      "time_ms_per_rank_range": 1.929909875,
+      "total_time_ms_all_ranges": 15.439279,
+      "calls": 1048
+    },
+    {
+      "name": "cuLaunchKernelEx",
+      "time_ms_per_rank_range": 1.928085625,
+      "total_time_ms_all_ranges": 15.424685,
+      "calls": 1376
+    },
+    {
+      "name": "cuMemcpyHtoDAsync_v2",
+      "time_ms_per_rank_range": 1.80502825,
+      "total_time_ms_all_ranges": 14.440226,
+      "calls": 1040
+    },
+    {
+      "name": "cudaGetFuncBySymbol_v11000",
+      "time_ms_per_rank_range": 0.46516425,
+      "total_time_ms_all_ranges": 3.721314,
+      "calls": 1376
+    }
+  ],
+  "top_kernels": [
+    {
+      "name": "ncclDevKernel_SendRecv",
+      "time_ms_per_rank_range": 45.793519,
+      "total_time_ms_all_ranges": 366.348152,
+      "calls": 1032
+    },
+    {
+      "name": "dsv4_fp4_gemv_pair_batch_kernel",
+      "time_ms_per_rank_range": 23.207153125,
+      "total_time_ms_all_ranges": 185.657225,
+      "calls": 258
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_kernel",
+      "time_ms_per_rank_range": 11.47269525,
+      "total_time_ms_all_ranges": 91.781562,
+      "calls": 2920
+    },
+    {
+      "name": "dsv4_hybrid_attention_kernel",
+      "time_ms_per_rank_range": 6.9525035,
+      "total_time_ms_all_ranges": 55.620028,
+      "calls": 328
+    },
+    {
+      "name": "dsv4_route_kernel",
+      "time_ms_per_rank_range": 5.656846125,
+      "total_time_ms_all_ranges": 45.254769,
+      "calls": 344
+    },
+    {
+      "name": "dsv4_mhc_params_kernel",
+      "time_ms_per_rank_range": 5.498254125,
+      "total_time_ms_all_ranges": 43.986033,
+      "calls": 688
+    },
+    {
+      "name": "dsv4_csa_select_kernel",
+      "time_ms_per_rank_range": 3.960137875,
+      "total_time_ms_all_ranges": 31.681103,
+      "calls": 168
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "time_ms_per_rank_range": 3.54912925,
+      "total_time_ms_all_ranges": 28.393034,
+      "calls": 344
+    },
+    {
+      "name": "dsv4_fp4_gemv_batch_tiled_kernel",
+      "time_ms_per_rank_range": 3.348858625,
+      "total_time_ms_all_ranges": 26.790869,
+      "calls": 258
+    },
+    {
+      "name": "kernel",
+      "time_ms_per_rank_range": 1.075930625,
+      "total_time_ms_all_ranges": 8.607445,
+      "calls": 1504
+    },
+    {
+      "name": "dsv4_compressor_update_kernel",
+      "time_ms_per_rank_range": 0.587682125,
+      "total_time_ms_all_ranges": 4.701457,
+      "calls": 496
+    },
+    {
+      "name": "rms_norm_batched_kernel",
+      "time_ms_per_rank_range": 0.434728375,
+      "total_time_ms_all_ranges": 3.477827,
+      "calls": 1376
+    },
+    {
+      "name": "gemv_handwritten_kernel",
+      "time_ms_per_rank_range": 0.40798825,
+      "total_time_ms_all_ranges": 3.263906,
+      "calls": 8
+    },
+    {
+      "name": "dot_kernel",
+      "time_ms_per_rank_range": 0.272926625,
+      "total_time_ms_all_ranges": 2.183413,
+      "calls": 696
+    },
+    {
+      "name": "dsv4_pack_expert_ranks_kernel",
+      "time_ms_per_rank_range": 0.199025,
+      "total_time_ms_all_ranges": 1.5922,
+      "calls": 344
+    }
+  ],
+  "memcpy_by_kind": [
+    {
+      "name": "Device-to-Device",
+      "copyKind": "8",
+      "time_ms_per_rank_range": 0.16883625,
+      "total_time_ms_all_ranges": 1.35069,
+      "calls": 1048,
+      "bytes": 20078784
+    },
+    {
+      "name": "Device-to-Host",
+      "copyKind": "2",
+      "time_ms_per_rank_range": 0.104048375,
+      "total_time_ms_all_ranges": 0.832387,
+      "calls": 344,
+      "bytes": 44032
+    },
+    {
+      "name": "Host-to-Device",
+      "copyKind": "1",
+      "time_ms_per_rank_range": 0.103986625,
+      "total_time_ms_all_ranges": 0.831893,
+      "calls": 1040,
+      "bytes": 56448
+    }
+  ],
+  "memset": {
+    "time_ms_per_rank_range": 1.29039375,
+    "total_time_ms_all_ranges": 10.32315,
+    "calls": 8789,
+    "bytes": 57157440
+  },
+  "correlation_count": 54306,
+  "warmup": {
+    "label": "warmup",
+    "status": 200,
+    "max_tokens": 2,
+    "elapsed_s": 0.7602076530456543,
+    "ttft_s": 0.6412229537963867,
+    "output": "霓彩",
+    "usage": {
+      "prompt_tokens": 9,
+      "completion_tokens": 2,
+      "total_tokens": 11
+    }
+  },
+  "profile_request": {
+    "label": "profile-request",
+    "status": 200,
+    "max_tokens": 2,
+    "elapsed_s": 1.4211337566375732,
+    "ttft_s": 1.2944591045379639,
+    "output": "霓彩",
+    "usage": {
+      "prompt_tokens": 9,
+      "completion_tokens": 2,
+      "total_tokens": 11
+    }
+  }
+}

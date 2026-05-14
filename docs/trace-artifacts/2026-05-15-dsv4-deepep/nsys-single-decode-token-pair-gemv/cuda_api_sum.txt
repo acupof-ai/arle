@@ -1,0 +1,14 @@
+Top CUDA runtime APIs inside step_decode_kernel_launch ranges
+name,time_ms_per_rank_range,total_time_ms_all_ranges,calls
+cudaLaunchKernel_v7000,23.242203,185.937625,15464
+cuMemcpyDtoHAsync_v2,18.933002,151.464019,344
+cuMemAllocAsync,17.615963,140.927708,7765
+cuMemFreeAsync,14.852231,118.817850,6048
+cuMemsetD8Async,12.310367,98.482935,8789
+cudaEventRecord_v3020,2.988411,23.907287,3448
+cudaStreamWaitEvent_v3020,2.353417,18.827338,2752
+cudaStreamGetCaptureInfo_v2_v11030,2.214248,17.713986,4856
+cuMemcpyDtoDAsync_v2,1.929910,15.439279,1048
+cuLaunchKernelEx,1.928086,15.424685,1376
+cuMemcpyHtoDAsync_v2,1.805028,14.440226,1040
+cudaGetFuncBySymbol_v11000,0.465164,3.721314,1376

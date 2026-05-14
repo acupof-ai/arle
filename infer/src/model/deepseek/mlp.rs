@@ -183,24 +183,40 @@ impl DeepseekV4Expert {
         } else {
             ops::LinearDispatchPhase::Decode
         };
-        let ran_gate = dsv4_run_block_scaled_gemv_segment(
-            ctx,
-            &self.w1,
-            hidden,
-            input_token_offset,
-            count,
-            &mut scratch.gate,
-        )?;
-        let ran_up = dsv4_run_block_scaled_gemv_segment(
-            ctx,
-            &self.w3,
-            hidden,
-            input_token_offset,
-            count,
-            &mut scratch.up,
-        )?;
-        if !ran_gate || !ran_up {
-            return Ok(false);
+        let paired_gate_up = if dsv4_pair_expert_gemv_enabled()? {
+            dsv4_run_block_scaled_gemv_pair_segment(
+                ctx,
+                &self.w1,
+                &self.w3,
+                hidden,
+                input_token_offset,
+                count,
+                &mut scratch.gate,
+                &mut scratch.up,
+            )?
+        } else {
+            false
+        };
+        if !paired_gate_up {
+            let ran_gate = dsv4_run_block_scaled_gemv_segment(
+                ctx,
+                &self.w1,
+                hidden,
+                input_token_offset,
+                count,
+                &mut scratch.gate,
+            )?;
+            let ran_up = dsv4_run_block_scaled_gemv_segment(
+                ctx,
+                &self.w3,
+                hidden,
+                input_token_offset,
+                count,
+                &mut scratch.up,
+            )?;
+            if !ran_gate || !ran_up {
+                return Ok(false);
+            }
         }
         ops::dsv4_swiglu_clamped_batch_into(
             ctx,
@@ -364,6 +380,113 @@ fn dsv4_run_block_scaled_gemv_segment(
     };
     res.result()
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 segment GEMV failed: {err}"))?;
+    Ok(true)
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_run_block_scaled_gemv_pair_segment(
+    ctx: &DeviceContext,
+    weight_a: &DeviceMatrix,
+    weight_b: &DeviceMatrix,
+    input: &HiddenStates,
+    input_token_offset: usize,
+    batch_size: usize,
+    output_a: &mut HiddenStates,
+    output_b: &mut HiddenStates,
+) -> Result<bool> {
+    let Some(format) = dsv4_block_scaled_format(weight_a) else {
+        return Ok(false);
+    };
+    if dsv4_block_scaled_format(weight_b) != Some(format) {
+        return Ok(false);
+    }
+    ensure!(
+        batch_size > 0,
+        "DeepSeek V4 segment GEMV pair needs non-empty input"
+    );
+    let input_end = input_token_offset
+        .checked_add(batch_size)
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV pair input range overflow"))?;
+    ensure!(
+        weight_a.rows == weight_b.rows
+            && weight_a.cols == weight_b.cols
+            && weight_a.dsv4_scale_rows == weight_b.dsv4_scale_rows
+            && weight_a.dsv4_scale_cols == weight_b.dsv4_scale_cols
+            && input.hidden_dim == weight_a.cols
+            && output_a.hidden_dim == weight_a.rows
+            && output_b.hidden_dim == weight_a.rows
+            && output_a.seq_len >= batch_size
+            && output_b.seq_len >= batch_size
+            && input_end <= input.seq_len,
+        "DeepSeek V4 segment GEMV pair shape mismatch"
+    );
+    ensure!(
+        weight_a.dsv4_scale_rows > 0 && weight_a.dsv4_scale_cols > 0,
+        "DeepSeek V4 segment GEMV pair needs block scales"
+    );
+    let elem_offset = input_token_offset
+        .checked_mul(input.hidden_dim)
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV pair element offset overflow"))?;
+    let qweight_a = weight_a
+        .qweight
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV pair missing w1 bytes"))?;
+    let scales_a = weight_a
+        .dsv4_scales
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV pair missing w1 scales"))?;
+    let qweight_b = weight_b
+        .qweight
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV pair missing w3 bytes"))?;
+    let scales_b = weight_b
+        .dsv4_scales
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV pair missing w3 scales"))?;
+    let (qw_a_ptr, _qw_a_guard) = qweight_a.device_ptr(&ctx.stream);
+    let (scales_a_ptr, _scales_a_guard) = scales_a.device_ptr(&ctx.stream);
+    let (qw_b_ptr, _qw_b_guard) = qweight_b.device_ptr(&ctx.stream);
+    let (scales_b_ptr, _scales_b_guard) = scales_b.device_ptr(&ctx.stream);
+    let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
+    let (output_a_ptr, _output_a_guard) = output_a.data.device_ptr_mut(&ctx.stream);
+    let (output_b_ptr, _output_b_guard) = output_b.data.device_ptr_mut(&ctx.stream);
+    let input_ptr = unsafe { (input_ptr as *const ffi::Half).add(elem_offset) };
+    let res = unsafe {
+        match format {
+            DeepseekDsv4GroupedBlockFormat::Fp8 => ffi::dsv4_fp8_gemv_pair_batch_cuda(
+                qw_a_ptr as *const u8,
+                scales_a_ptr as *const u8,
+                qw_b_ptr as *const u8,
+                scales_b_ptr as *const u8,
+                input_ptr,
+                output_a_ptr as *mut ffi::Half,
+                output_b_ptr as *mut ffi::Half,
+                batch_size as i32,
+                weight_a.rows as i32,
+                weight_a.cols as i32,
+                weight_a.dsv4_scale_rows as i32,
+                weight_a.dsv4_scale_cols as i32,
+                ctx.stream.cu_stream(),
+            ),
+            DeepseekDsv4GroupedBlockFormat::Fp4 => ffi::dsv4_fp4_gemv_pair_batch_cuda(
+                qw_a_ptr as *const u8,
+                scales_a_ptr as *const u8,
+                qw_b_ptr as *const u8,
+                scales_b_ptr as *const u8,
+                input_ptr,
+                output_a_ptr as *mut ffi::Half,
+                output_b_ptr as *mut ffi::Half,
+                batch_size as i32,
+                weight_a.rows as i32,
+                weight_a.cols as i32,
+                weight_a.dsv4_scale_rows as i32,
+                weight_a.dsv4_scale_cols as i32,
+                ctx.stream.cu_stream(),
+            ),
+        }
+    };
+    res.result()
+        .map_err(|err| anyhow::anyhow!("DeepSeek V4 segment GEMV pair failed: {err}"))?;
     Ok(true)
 }
 
@@ -630,6 +753,18 @@ fn dsv4_grouped_experts_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
         other => bail!("invalid ARLE_DSV4_GROUPED_EXPERTS value `{other}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_pair_expert_gemv_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_PAIR_EXPERT_GEMV").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
+        other => bail!("invalid ARLE_DSV4_PAIR_EXPERT_GEMV value `{other}`"),
     }
 }
 

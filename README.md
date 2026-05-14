@@ -227,7 +227,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   combine rows by **8×** and moving the wave to **112 ms wall**; `SendRecv`
   time falls **25.211 → 23.329 ms** per rank range. Remaining hard blockers are
   NCCL SendRecv/AllReduce, launch/runtime and allocator/memset/free churn, the
-  local-count D2H, and local expert FP8/FP4 GEMV.
+  local-count D2H, and local expert FP8/FP4 GEMV. A default-path single-expert
+  `w1`/`w3` pair GEMV experiment is now available only as
+  `ARLE_DSV4_PAIR_EXPERT_GEMV=1`: the 8xH20 trace kept output correct but
+  showed the FP4 pair kernel is slower on B=1 decode, so it stays default-off
+  while the main compute target remains true grouped GEMM/DeepGEMM.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)
