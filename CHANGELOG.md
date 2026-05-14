@@ -92,6 +92,15 @@ Related governance docs:
   costs are now explicit: `ncclDevKernel_SendRecv` at 50.338 ms per rank
   range, FP4 route pair GEMV at 19.616 ms, FP4 route `w2` GEMV at 10.487 ms,
   FP8 GEMV at 9.408 ms, plus allocator/free and launch overhead.
+- Added the DSv4 default-path warm decode Nsight trace under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
+  The run warms a real decode first, then profiles a second single decode token
+  on 8xH20. The output remains `霓彩`, the decode wave is 128.130 ms, and the
+  trace confirms allocator/free overhead is steady-state rather than only
+  first-decode initialization: the decode window still records 8,453
+  `cuMemAllocAsync` calls and 6,048 `cuMemFreeAsync` calls. The slow stack is
+  NCCL SendRecv/AllReduce, local FP8/FP4 expert GEMV, launch/runtime overhead,
+  allocator/free churn, and route-count D2H synchronization.
 
 ### CUDA
 

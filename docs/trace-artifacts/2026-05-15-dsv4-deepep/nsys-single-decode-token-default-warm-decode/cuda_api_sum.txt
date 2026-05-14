@@ -1,0 +1,15 @@
+Decode-window CUDA API summary
+time_ms_per_rank_range,total_time_ms_all_ranges,calls,name
+30.559096,244.472765,16416,cudaLaunchKernel_v7000
+16.802490,134.419918,8453,cuMemAllocAsync
+16.470324,131.762593,347,cuMemcpyDtoHAsync_v2
+13.801356,110.410851,6048,cuMemFreeAsync
+5.857513,46.860108,3645,cuMemsetD8Async
+3.275906,26.207245,2760,cudaEventRecord_v3020
+2.702364,21.618908,4512,cudaStreamGetCaptureInfo_v2_v11030
+2.387586,19.100684,2064,cudaStreamWaitEvent_v3020
+1.984794,15.878355,1040,cuMemcpyHtoDAsync_v2
+1.791789,14.334308,1032,cuLaunchKernelEx
+1.592493,12.739947,704,cuMemcpyDtoDAsync_v2
+0.558927,4.471413,1032,cudaGetFuncBySymbol_v11000
+0.015009,0.120069,3,cuStreamSynchronize

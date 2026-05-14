@@ -105,6 +105,15 @@ Current trace set:
   9.408 ms, plus allocator and launch overhead. The route-grouped path remains
   opt-in; this is evidence for grouped GEMM/DeepGEMM plus DeepEP overlap, not a
   default-path replacement.
+- [`nsys-single-decode-token-default-warm-decode/`](nsys-single-decode-token-default-warm-decode/)
+  reruns the default fused-dispatch DeepEP path after a real `max_tokens=2`
+  decode warmup, then profiles a second `max_tokens=2` request. The `霓彩`
+  output remains normal and the profiled single decode wave is 128.130 ms.
+  Warmup does not remove allocator/free churn: decode-window runtime still has
+  8,453 `cuMemAllocAsync` calls and 6,048 `cuMemFreeAsync` calls, while actual
+  D2H payload is only 44 KiB total. The steady-state bottleneck is NCCL
+  SendRecv/AllReduce, local expert FP8/FP4 GEMV, CUDA launch overhead,
+  allocator/free overhead, and route-count D2H synchronization.
 - [`bench-fused-dispatch-payload-local/`](bench-fused-dispatch-payload-local/)
   records the matching trace-off HTTP smoke. `decode64` returns normal English
   content at 12.22 post-first tok/s and the arithmetic case returns `410`.
