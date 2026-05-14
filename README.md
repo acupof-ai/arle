@@ -258,7 +258,10 @@ Operators who want only the native serving binary can use `infer` directly (`car
   stream scratch recycle lowers the warmed single-token nsys wave
   **128.1 → 111.8 ms** and cuts allocator/free calls
   **8,453/6,048 → 7,757/5,352**, while trace-off HTTP `decode64` stays flat at
-  **11.48 tok/s**; the end-to-end blocker remains NCCL plus local expert GEMV.
+  **11.48 tok/s**. Reusing GPU compressor projection scratch cuts allocator/free
+  calls again to **6,765/4,360** but does not improve HTTP throughput; the
+  end-to-end blocker remains NCCL plus D2H synchronization and local expert
+  GEMV.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)

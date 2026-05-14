@@ -728,6 +728,8 @@ pub(crate) struct DeepseekCompressedRow {
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub(crate) struct DeepseekGpuCompressorRuntimeCache {
+    pub(crate) kv_raw: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) score_raw: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) pending_kv: Option<CudaSlice<bf16>>,
     pub(crate) pending_score: Option<CudaSlice<bf16>>,
     pub(crate) prev_overlap_kv: Option<CudaSlice<bf16>>,

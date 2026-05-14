@@ -1676,8 +1676,11 @@ impl DeepseekModel {
             width
         );
         ensure_gpu_compressor_cache(&self.ctx, cache, capacity_rows, ratio, width, head_dim)?;
-        let kv_raw = ops::gemm(&self.ctx, &compressor.wkv, hidden)?;
-        let score_raw = ops::gemm(&self.ctx, &compressor.wgate, hidden)?;
+        let kv_raw = ensure_hidden_scratch(&mut cache.kv_raw, &self.ctx, width, hidden.seq_len)?;
+        ops::gemm_into(&self.ctx, &compressor.wkv, hidden, kv_raw);
+        let score_raw =
+            ensure_hidden_scratch(&mut cache.score_raw, &self.ctx, width, hidden.seq_len)?;
+        ops::gemm_into(&self.ctx, &compressor.wgate, hidden, score_raw);
         let completed = (cache.pending_len + hidden.seq_len) / ratio;
         ensure!(
             cache.compressed_rows + completed <= cache.compressed_capacity,

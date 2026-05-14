@@ -127,6 +127,16 @@ Related governance docs:
   12.574 ms and `cuMemFreeAsync` from 6,048 calls / 13.801 ms to 5,352 calls /
   11.096 ms. HTTP `decode64` stays effectively flat at 11.48 tok/s, so the
   main target remains NCCL plus local expert GEMV.
+- Added DSv4 GPU compressor projection scratch reuse for `kv_raw` and
+  `score_raw`, with trace artifacts under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-compressor-projection-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-compressor-projection-scratch/)
+  and
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-compressor-projection-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-compressor-projection-scratch/).
+  The real-output checks still pass (`decode64` normal text, arithmetic `410`)
+  and alloc/free calls fall again (`cuMemAllocAsync` 7,757 -> 6,765,
+  `cuMemFreeAsync` 5,352 -> 4,360), but HTTP `decode64` remains flat at
+  11.47 tok/s and the single nsys wave is not a wall-time win because D2H/NCCL
+  timing dominates this capture.
 
 ### CUDA
 
