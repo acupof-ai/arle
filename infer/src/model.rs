@@ -750,4 +750,10 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
     fn supports_cuda_graph_decode(&self) -> bool {
         true
     }
+
+    /// Whether scheduler startup should issue synthetic prefill requests to warm
+    /// prefill kernels and runtime allocators.
+    fn supports_prefill_warmup(&self) -> bool {
+        true
+    }
 }

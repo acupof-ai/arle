@@ -226,6 +226,10 @@ impl ModelForward for DeepseekModel {
     fn supports_cuda_graph_decode(&self) -> bool {
         false
     }
+
+    fn supports_prefill_warmup(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "cuda")]
