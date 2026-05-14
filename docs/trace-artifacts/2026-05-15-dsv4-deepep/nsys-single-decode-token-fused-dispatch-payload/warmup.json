@@ -1,0 +1,13 @@
+{
+  "label": "warmup",
+  "status": 200,
+  "max_tokens": 1,
+  "elapsed_s": 0.32613205909729004,
+  "ttft_s": 0.3260035514831543,
+  "output": "霓",
+  "usage": {
+    "prompt_tokens": 9,
+    "completion_tokens": 1,
+    "total_tokens": 10
+  }
+}

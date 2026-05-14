@@ -82,6 +82,7 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) route_logits: Option<DeepseekRouteLogitsRuntimeScratch>,
     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
+    pub(crate) dispatch_payload: Option<DeepseekDispatchPayloadRuntimeScratch>,
     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
     pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
@@ -119,6 +120,14 @@ pub(crate) struct DeepseekDispatchRuntimeScratch {
     pub(crate) local_counts: CudaSlice<i32>,
     pub(crate) local_offsets: CudaSlice<i32>,
     pub(crate) local_cursors: CudaSlice<i32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekDispatchPayloadRuntimeScratch {
+    pub(crate) capacity_routes: usize,
+    pub(crate) stride_elems: usize,
+    pub(crate) send_payload: CudaSlice<bf16>,
+    pub(crate) recv_payload: CudaSlice<bf16>,
 }
 
 #[cfg(feature = "cuda")]
@@ -477,6 +486,35 @@ pub(crate) fn ensure_send_route_scratch<'a>(
     Ok(slot
         .as_mut()
         .expect("DeepSeek V4 send-route scratch allocated"))
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_dispatch_payload_scratch<'a>(
+    slot: &'a mut Option<DeepseekDispatchPayloadRuntimeScratch>,
+    ctx: &DeviceContext,
+    capacity_routes: usize,
+    stride_elems: usize,
+) -> Result<&'a mut DeepseekDispatchPayloadRuntimeScratch> {
+    let capacity_routes = capacity_routes.max(1);
+    let stride_elems = stride_elems.max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| {
+            scratch.capacity_routes < capacity_routes || scratch.stride_elems != stride_elems
+        })
+        .unwrap_or(true);
+    if needs_alloc {
+        let elems = capacity_routes.saturating_mul(stride_elems);
+        *slot = Some(DeepseekDispatchPayloadRuntimeScratch {
+            capacity_routes,
+            stride_elems,
+            send_payload: ctx.stream.alloc_zeros::<bf16>(elems)?,
+            recv_payload: ctx.stream.alloc_zeros::<bf16>(elems)?,
+        });
+    }
+    Ok(slot
+        .as_mut()
+        .expect("DeepSeek V4 dispatch payload scratch allocated"))
 }
 
 #[cfg(feature = "cuda")]

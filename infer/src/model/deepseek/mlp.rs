@@ -17,6 +17,8 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 #[cfg(feature = "cuda")]
 use deepseek_spec::{DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 #[cfg(feature = "cuda")]
+use half::bf16;
+#[cfg(feature = "cuda")]
 use log::info;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
@@ -24,8 +26,9 @@ use std::time::Instant;
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekDsv4GroupedBlockFormat, DeepseekExpertRuntimeScratch,
-    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_local_route_scratch,
-    ensure_recv_route_scratch, ensure_route_logits_scratch, ensure_send_route_scratch,
+    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
+    ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
+    ensure_send_route_scratch,
 };
 #[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
@@ -886,6 +889,18 @@ fn dsv4_padded_dispatch_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
         other => bail!("invalid ARLE_DSV4_PADDED_DISPATCH value `{other}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_fused_dispatch_payload_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_FUSED_DISPATCH_PAYLOAD").ok() else {
+        return Ok(true);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
+        other => bail!("invalid ARLE_DSV4_FUSED_DISPATCH_PAYLOAD value `{other}`"),
     }
 }
 
@@ -1838,6 +1853,8 @@ impl DeepseekV4MoeBlock {
         let use_padded_dispatch = hidden.seq_len == 1
             && matches!(count_exchange_mode, Dsv4CountExchangeMode::AllGather)
             && dsv4_padded_dispatch_enabled()?;
+        let use_fused_dispatch_payload =
+            use_padded_dispatch && dsv4_fused_dispatch_payload_enabled()?;
         let use_route_grouped_experts =
             use_padded_dispatch && dsv4_route_grouped_experts_enabled()?;
         let send_route_capacity = if use_padded_dispatch {
@@ -1904,6 +1921,15 @@ impl DeepseekV4MoeBlock {
         let trace = dsv4_moe_trace_begin(ctx)?;
         let mut send_route_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
             cache.send_route.take()
+        } else {
+            None
+        };
+        let mut dispatch_payload_scratch_slot = if use_fused_dispatch_payload {
+            if let Some(cache) = moe_scratch.as_deref_mut() {
+                cache.dispatch_payload.take()
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -2422,22 +2448,121 @@ impl DeepseekV4MoeBlock {
                     .expect("DeepSeek V4 route output fallback allocated"),
             )
         };
-        comm.moe_grouped_send_recv_bf16(
-            &send_hidden.data,
-            &send_hidden_offsets,
-            &send_hidden_counts,
-            &mut recv_hidden.data,
-            &recv_hidden_offsets,
-            &recv_hidden_counts,
-        )?;
-        comm.moe_grouped_send_recv_i32(
-            send_meta,
-            &send_meta_offsets,
-            &send_meta_counts,
-            recv_meta,
-            &recv_meta_offsets,
-            &recv_meta_counts,
-        )?;
+        if use_fused_dispatch_payload {
+            let payload_stride = hidden
+                .hidden_dim
+                .checked_add(3 * std::mem::size_of::<i32>() / std::mem::size_of::<bf16>())
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 dispatch payload stride overflows"))?;
+            let payload_stride_i32 = dsv4_usize_to_i32(payload_stride, "dispatch payload stride")?;
+            let total_send_routes_i32 =
+                dsv4_usize_to_i32(total_send_routes, "dispatch payload send routes")?;
+            let total_recv_routes_i32 =
+                dsv4_usize_to_i32(total_recv_routes, "dispatch payload recv routes")?;
+            let payload_capacity = send_route_capacity.max(total_recv_routes);
+            let mut send_payload_owned: Option<CudaSlice<bf16>>;
+            let mut recv_payload_owned: Option<CudaSlice<bf16>>;
+            let (send_payload, recv_payload): (&mut CudaSlice<bf16>, &mut CudaSlice<bf16>) =
+                if has_moe_scratch {
+                    let scratch = ensure_dispatch_payload_scratch(
+                        &mut dispatch_payload_scratch_slot,
+                        ctx,
+                        payload_capacity,
+                        payload_stride,
+                    )?;
+                    (&mut scratch.send_payload, &mut scratch.recv_payload)
+                } else {
+                    let elems = payload_capacity
+                        .checked_mul(payload_stride)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("DeepSeek V4 dispatch payload elems overflow")
+                        })?;
+                    send_payload_owned =
+                        Some(ctx.stream.alloc_zeros::<bf16>(elems).map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 dispatch send payload alloc failed: {err}")
+                        })?);
+                    recv_payload_owned =
+                        Some(ctx.stream.alloc_zeros::<bf16>(elems).map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 dispatch recv payload alloc failed: {err}")
+                        })?);
+                    (
+                        send_payload_owned
+                            .as_mut()
+                            .expect("DeepSeek V4 dispatch send payload allocated"),
+                        recv_payload_owned
+                            .as_mut()
+                            .expect("DeepSeek V4 dispatch recv payload allocated"),
+                    )
+                };
+            {
+                let (hidden_ptr, _hidden_guard) = send_hidden.data.device_ptr(&ctx.stream);
+                let (meta_ptr, _meta_guard) = send_meta.device_ptr(&ctx.stream);
+                let (payload_ptr, _payload_guard) = send_payload.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_pack_dispatch_payload_cuda(
+                        hidden_ptr as *const ffi::Half,
+                        meta_ptr as *const i32,
+                        payload_ptr as *mut ffi::Half,
+                        total_send_routes_i32,
+                        hidden.hidden_dim as i32,
+                        payload_stride_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 dispatch payload pack failed: {err}")
+                    })?;
+                }
+            }
+            let send_payload_offsets = dsv4_scale_usize(&send_rank_offsets, payload_stride)?;
+            let send_payload_counts = dsv4_scale_usize(&send_rank_counts_usize, payload_stride)?;
+            let recv_payload_offsets = dsv4_scale_usize(&recv_rank_offsets, payload_stride)?;
+            let recv_payload_counts = dsv4_scale_usize(&recv_rank_counts_usize, payload_stride)?;
+            comm.moe_grouped_send_recv_bf16(
+                send_payload,
+                &send_payload_offsets,
+                &send_payload_counts,
+                recv_payload,
+                &recv_payload_offsets,
+                &recv_payload_counts,
+            )?;
+            {
+                let (payload_ptr, _payload_guard) = recv_payload.device_ptr(&ctx.stream);
+                let (hidden_ptr, _hidden_guard) = recv_hidden.data.device_ptr_mut(&ctx.stream);
+                let (meta_ptr, _meta_guard) = recv_meta.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_unpack_dispatch_payload_cuda(
+                        payload_ptr as *const ffi::Half,
+                        hidden_ptr as *mut ffi::Half,
+                        meta_ptr as *mut i32,
+                        total_recv_routes_i32,
+                        hidden.hidden_dim as i32,
+                        payload_stride_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 dispatch payload unpack failed: {err}")
+                    })?;
+                }
+            }
+        } else {
+            comm.moe_grouped_send_recv_bf16(
+                &send_hidden.data,
+                &send_hidden_offsets,
+                &send_hidden_counts,
+                &mut recv_hidden.data,
+                &recv_hidden_offsets,
+                &recv_hidden_counts,
+            )?;
+            comm.moe_grouped_send_recv_i32(
+                send_meta,
+                &send_meta_offsets,
+                &send_meta_counts,
+                recv_meta,
+                &recv_meta_offsets,
+                &recv_meta_counts,
+            )?;
+        }
         dsv4_moe_trace_end(ctx, "ffn_deepep_dispatch", layer_idx, hidden.seq_len, trace)?;
 
         let trace = dsv4_moe_trace_begin(ctx)?;
@@ -3100,6 +3225,9 @@ impl DeepseekV4MoeBlock {
         dsv4_moe_trace_end(ctx, "ffn_deepep_combine", layer_idx, hidden.seq_len, trace)?;
         if let Some(cache) = moe_scratch.as_deref_mut() {
             cache.route_logits = route_logits_scratch_slot.take();
+            if use_fused_dispatch_payload {
+                cache.dispatch_payload = dispatch_payload_scratch_slot.take();
+            }
             cache.send_route = send_route_scratch_slot.take();
             cache.recv_route = recv_route_scratch_slot.take();
             cache.local_route = local_route_scratch_slot.take();

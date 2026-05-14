@@ -237,7 +237,12 @@ Operators who want only the native serving binary can use `infer` directly (`car
   The return-side combine path now also pre-sums valid padded route rows into
   one BF16 row per origin peer before the return exchange, reducing returned
   combine rows by **8×** and moving the wave to **112 ms wall**; `SendRecv`
-  time falls **25.211 → 23.329 ms** per rank range. Remaining hard blockers are
+  time falls **25.211 → 23.329 ms** per rank range. The B=1 dispatch side now
+  also fuses hidden rows and route metadata into one BF16 payload by appending
+  the 3xI32 metadata as raw 16-bit words, reducing SendRecv launches
+  **1,032 → 688**, raising HTTP `decode64` to **12.22 post-first tok/s**, and
+  recording the latest isolated nsys wave at **119.0 ms** while keeping the
+  `霓彩` and `410` checks correct. Remaining hard blockers are
   NCCL SendRecv/AllReduce, launch/runtime and allocator/memset/free churn, the
   local-count D2H, and local expert FP8/FP4 GEMV. A default-path single-expert
   `w1`/`w3` pair GEMV experiment is now available only as

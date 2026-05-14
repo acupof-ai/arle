@@ -89,3 +89,13 @@ Current trace set:
   single decode wave moves from 125.497 ms to 112.724 ms. Remaining top costs
   are still NCCL SendRecv/AllReduce, launch overhead, async allocation/free,
   and local expert FP8/FP4 GEMV.
+- [`nsys-single-decode-token-fused-dispatch-payload/`](nsys-single-decode-token-fused-dispatch-payload/)
+  validates the default BF16 fused dispatch payload for B=1 DeepEP decode. It
+  appends route metadata as raw 16-bit words behind each hidden row and sends
+  hidden+metadata through one BF16 grouped exchange, reducing decode-window
+  SendRecv launches from 1,032 to 688. The `霓彩` output remains normal and the
+  latest isolated single decode wave is 118.985 ms, still dominated by NCCL,
+  launch/runtime overhead, allocator churn, D2H, and local expert GEMV.
+- [`bench-fused-dispatch-payload-local/`](bench-fused-dispatch-payload-local/)
+  records the matching trace-off HTTP smoke. `decode64` returns normal English
+  content at 12.22 post-first tok/s and the arithmetic case returns `410`.
