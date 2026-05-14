@@ -7,6 +7,7 @@ use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::Request as AxumRequest;
@@ -42,7 +43,8 @@ use super::types::{
     RESPONSE_TIMEOUT, RequestExecutionOptions, TrainControlTarget, TrainEventsQuery,
 };
 use crate::error::ApiError;
-use crate::server_engine::CompletionStreamDelta;
+use crate::metrics::ServerMetrics;
+use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::trace_reporter::trace_runtime;
 
 fn now_secs() -> u64 {
@@ -133,12 +135,227 @@ fn non_streaming_timeout_error(request_kind: &str) -> ApiError {
     ApiError::timeout(RESPONSE_TIMEOUT.as_secs())
 }
 
+struct RequestTraceState {
+    request_id: String,
+    route: &'static str,
+    stream: bool,
+    max_tokens: usize,
+    prompt_bytes: usize,
+    started_at: Instant,
+    first_token_at: Option<Instant>,
+    chunks_seen: u64,
+    text_bytes: usize,
+    token_ids_seen: usize,
+    last_usage: Option<TokenUsage>,
+    metrics: ServerMetrics,
+    finished: bool,
+}
+
+impl RequestTraceState {
+    fn new(
+        route: &'static str,
+        request_id: String,
+        stream: bool,
+        max_tokens: usize,
+        prompt_bytes: usize,
+        metrics: ServerMetrics,
+    ) -> Self {
+        Self {
+            request_id,
+            route,
+            stream,
+            max_tokens,
+            prompt_bytes,
+            started_at: Instant::now(),
+            first_token_at: None,
+            chunks_seen: 0,
+            text_bytes: 0,
+            token_ids_seen: 0,
+            last_usage: None,
+            metrics,
+            finished: false,
+        }
+    }
+
+    fn observe_delta(&mut self, delta: &CompletionStreamDelta) {
+        self.chunks_seen = self.chunks_seen.saturating_add(1);
+        self.text_bytes = self.text_bytes.saturating_add(delta.text_delta.len());
+        self.token_ids_seen = self.token_ids_seen.saturating_add(delta.token_ids.len());
+        if self.first_token_at.is_none()
+            && (!delta.text_delta.is_empty() || !delta.token_ids.is_empty())
+        {
+            self.first_token_at = Some(Instant::now());
+        }
+        if let Some(usage) = delta.usage {
+            self.last_usage = Some(usage);
+        }
+    }
+
+    fn finish(
+        &mut self,
+        terminal_seen: bool,
+        finish_reason: Option<FinishReason>,
+        error: Option<&'static str>,
+    ) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        let elapsed = self.started_at.elapsed();
+        let ttft_ms = self
+            .first_token_at
+            .map(|first| first.duration_since(self.started_at).as_secs_f64() * 1_000.0);
+        let total_ms = elapsed.as_secs_f64() * 1_000.0;
+        let usage = self.last_usage.unwrap_or(TokenUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        });
+        let scheduler_phase = self.metrics.scheduler_step_phase_us();
+        let scheduler_loop = self.metrics.scheduler_loop_phase_us();
+        let scheduler_pipeline = self.metrics.scheduler_pipeline_us();
+        let preprocess_stage = self.metrics.preprocess_stage_us();
+
+        info!(
+            target: "infer::request_trace",
+            "request_trace {}",
+            serde_json::json!({
+                "request_id": self.request_id,
+                "route": self.route,
+                "stream": self.stream,
+                "terminal_seen": terminal_seen,
+                "finish_reason": finish_reason.map(FinishReason::as_openai_str),
+                "error": error,
+                "max_tokens": self.max_tokens,
+                "prompt_bytes": self.prompt_bytes,
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+                "chunks_seen": self.chunks_seen,
+                "text_bytes": self.text_bytes,
+                "token_ids_seen": self.token_ids_seen,
+                "ttft_ms": ttft_ms,
+                "total_ms": total_ms,
+                "throughput": {
+                    "prompt_tokens_per_s_at_ttft": ttft_ms
+                        .filter(|value| *value > 0.0)
+                        .map(|value| usage.prompt_tokens as f64 * 1_000.0 / value),
+                    "completion_tokens_per_s_e2e": (total_ms > 0.0)
+                        .then(|| usage.completion_tokens as f64 * 1_000.0 / total_ms),
+                    "total_tokens_per_s_e2e": (total_ms > 0.0)
+                        .then(|| usage.total_tokens as f64 * 1_000.0 / total_ms),
+                },
+                "kv": {
+                    "gpu_util": self.metrics.kv_gpu_utilization(),
+                    "fetch_queue_depth": self.metrics.kv_fetch_queue_depth(),
+                    "fetch_waiters": self.metrics.kv_fetch_waiters(),
+                    "store_queue_depth": self.metrics.kv_store_queue_depth(),
+                    "fetch_backpressure": self.metrics.kv_fetch_backpressure(),
+                    "store_backpressure": self.metrics.kv_store_backpressure(),
+                },
+                "prefix": {
+                    "hit_rate": self.metrics.prefix_hit_rate(),
+                    "skip_rate": self.metrics.prefix_skip_rate(),
+                    "request_hit_rate": self.metrics.prefix_request_hit_rate(),
+                    "request_skip_rate": self.metrics.prefix_request_skip_rate(),
+                    "matched_tokens": self.metrics.matched_prefix_tokens(),
+                    "resume_prefill_tokens": self.metrics.resume_prefill_tokens(),
+                    "lookup_latency_us": self.metrics.prefix_lookup_latency_us(),
+                    "lookup_reusable_tokens": self.metrics.prefix_lookup_reusable_tokens(),
+                    "ready_on_gpu": self.metrics.prefix_lookup_ready_on_gpu(),
+                    "direct_gpu_attach": self.metrics.prefix_lookup_direct_gpu_attach(),
+                    "staged": self.metrics.prefix_lookup_staged(),
+                    "prefetch": self.metrics.prefix_lookup_prefetch(),
+                    "recompute": self.metrics.prefix_lookup_recompute(),
+                },
+                "scheduler": {
+                    "active": self.metrics.requests_active(),
+                    "waiting": self.metrics.requests_waiting(),
+                    "running_batch": self.metrics.scheduler_running_batch(),
+                    "prefill_queue": self.metrics.scheduler_prefill_queue(),
+                    "scheduled_rows": self.metrics.scheduler_scheduled_rows(),
+                    "scheduled_decode_rows": self.metrics.scheduler_scheduled_decode_rows(),
+                    "scheduled_prefill_rows": self.metrics.scheduler_scheduled_prefill_rows(),
+                    "decode_tokens": self.metrics.scheduler_decode_tokens(),
+                    "prefill_tokens": self.metrics.scheduler_prefill_tokens(),
+                    "batch_width": self.metrics.scheduler_batch_width(),
+                    "step_last_s": self.metrics.scheduler_step_last_seconds(),
+                    "phase_us": scheduler_phase.map(|(
+                        admission,
+                        prefill,
+                        decode,
+                        emit,
+                        total,
+                    )| serde_json::json!({
+                        "admission": admission,
+                        "prefill": prefill,
+                        "decode": decode,
+                        "emit": emit,
+                        "total": total,
+                    })),
+                    "loop_us": scheduler_loop.map(|(cleanup, total)| serde_json::json!({
+                        "cleanup": cleanup,
+                        "total": total,
+                    })),
+                    "pipeline_us": {
+                        "snapshot": scheduler_pipeline.0,
+                        "cpu_plan": scheduler_pipeline.1,
+                        "gpu_completion_wait": scheduler_pipeline.2,
+                        "gpu_command_queue_depth": scheduler_pipeline.3,
+                    },
+                },
+                "preprocess": {
+                    "queue_depth": preprocess_stage.0,
+                    "wait_us": preprocess_stage.1,
+                    "tokenize_us": preprocess_stage.2,
+                },
+            })
+        );
+    }
+}
+
+fn trace_streaming_deltas(
+    mut source: UnboundedReceiver<CompletionStreamDelta>,
+    mut trace: RequestTraceState,
+) -> UnboundedReceiver<CompletionStreamDelta> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(delta) = source.recv().await {
+            trace.observe_delta(&delta);
+            let finish_reason = delta.finish_reason;
+            let terminal = finish_reason.is_some();
+            if terminal {
+                trace.finish(true, finish_reason, None);
+            }
+            if tx.send(delta).is_err() {
+                trace.finish(false, finish_reason, Some("client_channel_closed"));
+                while let Some(delta) = source.recv().await {
+                    trace.observe_delta(&delta);
+                    if let Some(finish_reason) = delta.finish_reason {
+                        trace.finish(true, Some(finish_reason), None);
+                        break;
+                    }
+                }
+                return;
+            }
+            if terminal {
+                return;
+            }
+        }
+        trace.finish(false, None, Some("scheduler_channel_closed"));
+    });
+    rx
+}
+
 async fn collect_buffered_response_inner(
     mut delta_rx: UnboundedReceiver<CompletionStreamDelta>,
     request_kind: &str,
+    mut trace: RequestTraceState,
 ) -> Result<BufferedResponse, ApiError> {
     let mut buffered = BufferedResponse::default();
     while let Some(delta) = delta_rx.recv().await {
+        trace.observe_delta(&delta);
         buffered.apply_delta(&delta);
     }
 
@@ -153,11 +370,13 @@ async fn collect_buffered_response_inner(
             buffered.usage.completion_tokens,
             buffered.text.len(),
         );
+        trace.finish(false, None, Some("scheduler_channel_closed"));
         return Err(ApiError::service_unavailable(
             "Inference request aborted before completion (server overloaded or out of memory). Please retry.",
         ));
     }
 
+    trace.finish(true, Some(buffered.finish_reason), None);
     Ok(buffered)
 }
 
@@ -358,13 +577,28 @@ async fn submit_and_collect_buffered_response(
     request_kind: &'static str,
     route: &'static str,
 ) -> Result<(BufferedResponse, SpanContext), ApiError> {
+    let trace = RequestTraceState::new(
+        route,
+        format!("http-{}", uuid::Uuid::new_v4()),
+        false,
+        options.max_tokens,
+        prompt.len(),
+        state.metrics.clone(),
+    );
     let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
     let stream_span = Span::root("stream_flush", stream_parent)
         .with_properties(|| [("route", route.to_string())]);
     let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
-    let collect = async {
-        let delta_rx = submit_request(state, options, prompt).await?;
-        async move { collect_buffered_response_inner(delta_rx, request_kind).await }
+    let collect = async move {
+        let mut trace = trace;
+        let delta_rx = match submit_request(state, options, prompt).await {
+            Ok(delta_rx) => delta_rx,
+            Err(err) => {
+                trace.finish(false, None, Some("submit_failed"));
+                return Err(err);
+            }
+        };
+        async move { collect_buffered_response_inner(delta_rx, request_kind, trace).await }
             .in_span(stream_span)
             .await
     };
@@ -667,8 +901,23 @@ pub(super) async fn completions(
         );
 
         if stream {
-            let delta_rx = submit_request(state.as_ref(), options, req.prompt).await?;
             let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
+            let mut trace = RequestTraceState::new(
+                "/v1/completions",
+                request_id.clone(),
+                true,
+                max_tokens,
+                req.prompt.len(),
+                state.metrics.clone(),
+            );
+            let delta_rx = match submit_request(state.as_ref(), options, req.prompt).await {
+                Ok(delta_rx) => delta_rx,
+                Err(err) => {
+                    trace.finish(false, None, Some("submit_failed"));
+                    return Err(err);
+                }
+            };
+            let delta_rx = trace_streaming_deltas(delta_rx, trace);
             let created = now_secs();
 
             let sse_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
@@ -755,8 +1004,23 @@ pub(super) async fn chat_completions(
         );
 
         if do_stream {
-            let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
             let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+            let mut trace = RequestTraceState::new(
+                "/v1/chat/completions",
+                request_id.clone(),
+                true,
+                max_tokens,
+                prompt.len(),
+                state.metrics.clone(),
+            );
+            let delta_rx = match submit_request(state.as_ref(), options, prompt).await {
+                Ok(delta_rx) => delta_rx,
+                Err(err) => {
+                    trace.finish(false, None, Some("submit_failed"));
+                    return Err(err);
+                }
+            };
+            let delta_rx = trace_streaming_deltas(delta_rx, trace);
             let created = now_secs();
 
             let role_event =
@@ -874,8 +1138,23 @@ pub(super) async fn responses_handler(
         );
 
         if stream {
-            let delta_rx = submit_request(state.as_ref(), options, prompt).await?;
             let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+            let mut trace = RequestTraceState::new(
+                "/v1/responses",
+                response_id.clone(),
+                true,
+                max_tokens,
+                prompt.len(),
+                state.metrics.clone(),
+            );
+            let delta_rx = match submit_request(state.as_ref(), options, prompt).await {
+                Ok(delta_rx) => delta_rx,
+                Err(err) => {
+                    trace.finish(false, None, Some("submit_failed"));
+                    return Err(err);
+                }
+            };
+            let delta_rx = trace_streaming_deltas(delta_rx, trace);
             let created_at = now_secs();
             let stream = responses_sse_stream(delta_rx, response_id, created_at, model_id);
             Ok(Sse::new(stream.chain(sse_done_stream()))

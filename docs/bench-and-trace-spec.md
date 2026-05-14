@@ -57,6 +57,12 @@ the canonical layout automatically.
 - **`scripts/profile_ncu_guidellm.sh <label> --family <name>`** — Nsight Compute → `.ncu-rep` + summary.
 
 **Component / fallback:**
+- **`scripts/bench_dsv4_trace_http.py`** — DSv4 HTTP smoke helper for
+  streaming trace bring-up. It emits client-side TTFT / token throughput and,
+  when `--trace-log` points at the service log, collects matching
+  `request_trace` JSON summaries with KV, prefix, scheduler phase, and
+  preprocess snapshots. Keep `--fanout 0` for trace smoke; use explicit fanout
+  only when testing scheduler concurrency.
 - **`scripts/bench_throughput.py`** — legacy synthetic helper; historical reproducibility only.
 - **`scripts/bench_kv_cache*.py`** — internal component checks.
 - **`nsys profile` / `ncu --set full`** — raw CUDA CLIs; wrappers preferred.
