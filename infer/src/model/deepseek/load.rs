@@ -12,6 +12,7 @@ use half::bf16;
 use safetensors::{Dtype, SafeTensors};
 
 use crate::tp::{TpLoadContext, TpShardAxis};
+use crate::weight_loader::{QuantLoadConfig, load_tensor_2d_maybe_quantized_with_config};
 
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -20,6 +21,12 @@ enum MatrixShard {
     Full,
     Rows { range: Range<usize>, total: usize },
     Cols { range: Range<usize>, total: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dsv4MarlinW4Layout {
+    W4A8,
+    Hybrid,
 }
 
 impl MatrixShard {
@@ -117,6 +124,11 @@ pub(super) fn load_dsv4_matrix_raw_sharded(
     tp: Option<&TpLoadContext>,
 ) -> Result<DeviceMatrix> {
     let shard = MatrixShard::from_tp(tp);
+    if let Some(matrix) =
+        load_dsv4_marlin_w4_matrix_if_available(ctx, shards, weight_map, name, &shard)?
+    {
+        return Ok(matrix);
+    }
     let tensor = find_tensor(shards, weight_map, name)?;
     let shape = tensor.shape();
     ensure!(
@@ -134,6 +146,89 @@ pub(super) fn load_dsv4_matrix_raw_sharded(
                 .with_context(|| format!("uploading DeepSeek V4 dense matrix {name}"))
         }
         dtype => bail!("unsupported DeepSeek V4 raw matrix dtype {dtype:?} for {name}"),
+    }
+}
+
+fn load_dsv4_marlin_w4_matrix_if_available(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    shard: &MatrixShard,
+) -> Result<Option<DeviceMatrix>> {
+    let requested = dsv4_marlin_w4_override();
+    let layout = dsv4_marlin_w4_layout(weight_map, name).or(requested);
+    let Some(layout) = layout else {
+        return Ok(None);
+    };
+
+    ensure!(
+        matches!(shard, MatrixShard::Full),
+        "{name}: DSv4 Marlin W4A8/hybrid side tensors are not TP-shardable yet; \
+         use the raw FP4/FP8 block-scaled loader for TP-sharded matrices"
+    );
+
+    if requested.is_some() && dsv4_marlin_w4_layout(weight_map, name).is_none() {
+        bail!(
+            "{name}: INFER_QUANT_FORMAT_OVERRIDE requested DSv4 {layout:?}, but the checkpoint \
+             has no Marlin W4A8 side tensors (`.marlin_w4a8_qweight`, \
+             `.marlin_w4a8_s_channel`, `.marlin_w4a8_s_group`). Official DeepSeek V4 FP4 \
+             checkpoints are MXFP4 block-scaled weights, not Marlin W4A8; convert/repack the \
+             checkpoint first or run with quantization format `auto`."
+        );
+    }
+
+    let config = match layout {
+        Dsv4MarlinW4Layout::W4A8 => QuantLoadConfig {
+            group_size: Some(128),
+            bits: Some(4),
+            tq_bits: None,
+            marlin_w4a8: true,
+            marlin_w4_hybrid: false,
+            unsupported_reason: None,
+        },
+        Dsv4MarlinW4Layout::Hybrid => QuantLoadConfig {
+            group_size: Some(128),
+            bits: Some(4),
+            tq_bits: None,
+            marlin_w4a8: true,
+            marlin_w4_hybrid: true,
+            unsupported_reason: None,
+        },
+    };
+    let matrix = load_tensor_2d_maybe_quantized_with_config(ctx, shards, weight_map, name, config)
+        .with_context(|| format!("loading DeepSeek V4 {layout:?} matrix {name}"))?;
+    Ok(Some(matrix))
+}
+
+fn dsv4_marlin_w4_layout(
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Option<Dsv4MarlinW4Layout> {
+    let w4a8_qweight = name.replace(".weight", ".marlin_w4a8_qweight");
+    let w4a8_s_channel = name.replace(".weight", ".marlin_w4a8_s_channel");
+    let w4a8_s_group = name.replace(".weight", ".marlin_w4a8_s_group");
+    let has_w4a8 = weight_map.contains_key(&w4a8_qweight)
+        && weight_map.contains_key(&w4a8_s_channel)
+        && weight_map.contains_key(&w4a8_s_group);
+    if !has_w4a8 {
+        return None;
+    }
+
+    let w4a16_qweight = name.replace(".weight", ".marlin_qweight");
+    let w4a16_scales = name.replace(".weight", ".marlin_scales");
+    if weight_map.contains_key(&w4a16_qweight) && weight_map.contains_key(&w4a16_scales) {
+        Some(Dsv4MarlinW4Layout::Hybrid)
+    } else {
+        Some(Dsv4MarlinW4Layout::W4A8)
+    }
+}
+
+fn dsv4_marlin_w4_override() -> Option<Dsv4MarlinW4Layout> {
+    match std::env::var("INFER_QUANT_FORMAT_OVERRIDE").ok()?.as_str() {
+        "marlin_w4a8" | "w4a8_marlin" => Some(Dsv4MarlinW4Layout::W4A8),
+        "marlin_w4_hybrid" => Some(Dsv4MarlinW4Layout::Hybrid),
+        _ => None,
     }
 }
 
@@ -573,6 +668,46 @@ mod tests {
             map.insert(scale_name.to_string(), 0);
         }
         (serialize(tensors, None).unwrap(), map)
+    }
+
+    #[test]
+    fn detects_marlin_w4a8_side_tensors() {
+        let map = HashMap::from([
+            ("e.marlin_w4a8_qweight".to_string(), 0),
+            ("e.marlin_w4a8_s_channel".to_string(), 0),
+            ("e.marlin_w4a8_s_group".to_string(), 0),
+        ]);
+
+        assert_eq!(
+            dsv4_marlin_w4_layout(&map, "e.weight"),
+            Some(Dsv4MarlinW4Layout::W4A8)
+        );
+    }
+
+    #[test]
+    fn detects_hybrid_marlin_w4_side_tensors() {
+        let map = HashMap::from([
+            ("e.marlin_qweight".to_string(), 0),
+            ("e.marlin_scales".to_string(), 0),
+            ("e.marlin_w4a8_qweight".to_string(), 0),
+            ("e.marlin_w4a8_s_channel".to_string(), 0),
+            ("e.marlin_w4a8_s_group".to_string(), 0),
+        ]);
+
+        assert_eq!(
+            dsv4_marlin_w4_layout(&map, "e.weight"),
+            Some(Dsv4MarlinW4Layout::Hybrid)
+        );
+    }
+
+    #[test]
+    fn ignores_incomplete_marlin_w4a8_side_tensors() {
+        let map = HashMap::from([
+            ("e.marlin_w4a8_qweight".to_string(), 0),
+            ("e.marlin_w4a8_s_channel".to_string(), 0),
+        ]);
+
+        assert_eq!(dsv4_marlin_w4_layout(&map, "e.weight"), None);
     }
 
     #[test]
