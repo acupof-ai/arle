@@ -183,6 +183,10 @@ impl<M: ModelForward> Scheduler<M> {
 
     /// Pass 3: warm paged prefill kernels and per-shape runtime allocators.
     fn warmup_prefill_pass(&mut self, num_slots: usize) -> usize {
+        if !self.model.supports_prefill_warmup() {
+            info!("Pass 3 prefill warmup disabled by model capability");
+            return 0;
+        }
         if prefill_warmup_disabled() {
             info!("Pass 3 prefill warmup disabled by INFER_PREFILL_WARMUP=0");
             return 0;
