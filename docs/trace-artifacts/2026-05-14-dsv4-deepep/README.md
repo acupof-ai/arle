@@ -9,7 +9,6 @@ Model: `/root/DeepSeek-V4-Flash`
 Runtime command shape:
 
 ```bash
-INFER_PREFILL_WARMUP=0 \
 ARLE_DSV4_TRACE_LAYER=1 \
 ARLE_DSV4_MOE_BACKEND=deepep \
 ARLE_DSV4_INCREMENTAL_KV=1 \
@@ -23,6 +22,9 @@ INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 \
   --deepseek-distributed-layers 43 \
   --mem-fraction-static 0.1
 ```
+
+DSv4 now disables startup prefill warmup through the model capability hook, so
+`INFER_PREFILL_WARMUP=0` is no longer required for this run shape.
 
 ## Functional Result
 
@@ -58,6 +60,29 @@ The first traced request after process start had a one-time NCCL send/recv conne
 `layer=0 phase=ffn_deepep_count_exchange elapsed_ms=4689`. The warm request above excludes that
 first-use initialization spike.
 
+## Scratch Reuse Snapshot
+
+After adding per-layer incremental MoE expert scratch reuse, a clean three-request
+window produced normal content:
+
+| Case | Prompt tokens | Completion tokens | Latency | Output |
+| --- | ---: | ---: | ---: | --- |
+| `37*29` | 17 | 8 | 1.979 s | `37乘以29等于1073。计算` |
+| `58+67` | 17 | 8 | 1.988 s | `58加67等于125。计算过程` |
+| writing | 17 | 10 | 2.528 s | `霓灯织夜，车流如河。` |
+
+Clean trace phase medians from the same window:
+
+| Phase | p50 | p95 |
+| --- | ---: | ---: |
+| `ffn_deepep_dispatch_combine` | 1.834 ms | 2.281 ms |
+| `ffn_deepep_dispatch` | 0.058 ms | 0.115 ms |
+| `ffn_deepep_count_exchange` | 0.119 ms | 0.297 ms |
+| `ffn_deepep_local_experts` | 0.464 ms | 0.886 ms |
+| `ffn_deepep_combine` | 0.723 ms | 1.286 ms |
+| `ffn_total` | 2.519 ms | 2.989 ms |
+| `attn_total` | 1.187 ms | 1.687 ms |
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not
@@ -66,8 +91,6 @@ the old full hidden all-reduce. In the warm trace, median `ffn_deepep_dispatch_c
 work:
 
 - Replace per-expert looped GEMMs with grouped GEMM/DeepGEMM.
-- Reuse DSv4 MoE scratch buffers across layers/decode steps to remove allocator churn.
 - Enable CUDA Graph/PDL after allocation and dynamic NCCL paths are made graph-safe.
 - Add B>1 vectorized decode after B=1 dispatch/combine is stable.
 - Add MTP after the decode path is vectorized and the sampler path is stable.
-
