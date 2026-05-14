@@ -93,6 +93,160 @@ impl NcclGroup {
         )
     }
 
+    /// Grouped point-to-point BF16 exchange for EP token dispatch/combine.
+    ///
+    /// `send_offsets/counts` and `recv_offsets/counts` are element offsets in
+    /// the corresponding flat device buffers, one entry per EP peer. Self-peer
+    /// traffic is copied with D2D memcpy on the communicator stream; all other
+    /// peers are issued under one NCCL group to avoid N small launch fences.
+    pub fn grouped_send_recv_bf16(
+        &self,
+        sendbuf: &CudaSlice<bf16>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<bf16>,
+        recv_offsets: &[usize],
+        recv_counts: &[usize],
+    ) -> Result<()> {
+        validate_grouped_exchange(
+            self.rank,
+            self.world_size,
+            sendbuf.len(),
+            send_offsets,
+            send_counts,
+            recvbuf.len(),
+            recv_offsets,
+            recv_counts,
+        )?;
+        self.copy_self_peer(sendbuf, send_offsets, send_counts, recvbuf, recv_offsets)?;
+
+        let (send_ptr, _send_record) = sendbuf.device_ptr(&self.stream);
+        let (recv_ptr, _recv_record) = recvbuf.device_ptr_mut(&self.stream);
+        self.comm.group_start()?;
+        let mut first_error = None;
+        for peer in 0..self.world_size {
+            if peer == self.rank || recv_counts[peer] == 0 {
+                continue;
+            }
+            let peer_ptr = unsafe { (recv_ptr as *mut bf16).add(recv_offsets[peer]) };
+            if let Err(err) = self.comm.recv(
+                peer_ptr as *mut c_void,
+                recv_counts[peer],
+                ncclDataType_t::Bfloat16,
+                peer,
+                &self.stream,
+            ) && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        for peer in 0..self.world_size {
+            if peer == self.rank || send_counts[peer] == 0 {
+                continue;
+            }
+            let peer_ptr = unsafe { (send_ptr as *const bf16).add(send_offsets[peer]) };
+            if let Err(err) = self.comm.send(
+                peer_ptr as *const c_void,
+                send_counts[peer],
+                ncclDataType_t::Bfloat16,
+                peer,
+                &self.stream,
+            ) && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        let group_result = self.comm.group_end();
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        group_result
+    }
+
+    /// Grouped point-to-point I32 exchange for MoE dispatch metadata.
+    pub fn grouped_send_recv_i32(
+        &self,
+        sendbuf: &CudaSlice<i32>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<i32>,
+        recv_offsets: &[usize],
+        recv_counts: &[usize],
+    ) -> Result<()> {
+        validate_grouped_exchange(
+            self.rank,
+            self.world_size,
+            sendbuf.len(),
+            send_offsets,
+            send_counts,
+            recvbuf.len(),
+            recv_offsets,
+            recv_counts,
+        )?;
+        self.copy_self_peer(sendbuf, send_offsets, send_counts, recvbuf, recv_offsets)?;
+
+        let (send_ptr, _send_record) = sendbuf.device_ptr(&self.stream);
+        let (recv_ptr, _recv_record) = recvbuf.device_ptr_mut(&self.stream);
+        self.comm.group_start()?;
+        let mut first_error = None;
+        for peer in 0..self.world_size {
+            if peer == self.rank || recv_counts[peer] == 0 {
+                continue;
+            }
+            let peer_ptr = unsafe { (recv_ptr as *mut i32).add(recv_offsets[peer]) };
+            if let Err(err) = self.comm.recv(
+                peer_ptr as *mut c_void,
+                recv_counts[peer],
+                ncclDataType_t::Int32,
+                peer,
+                &self.stream,
+            ) && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        for peer in 0..self.world_size {
+            if peer == self.rank || send_counts[peer] == 0 {
+                continue;
+            }
+            let peer_ptr = unsafe { (send_ptr as *const i32).add(send_offsets[peer]) };
+            if let Err(err) = self.comm.send(
+                peer_ptr as *const c_void,
+                send_counts[peer],
+                ncclDataType_t::Int32,
+                peer,
+                &self.stream,
+            ) && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        let group_result = self.comm.group_end();
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        group_result
+    }
+
+    fn copy_self_peer<T: cudarc::driver::DeviceRepr>(
+        &self,
+        sendbuf: &CudaSlice<T>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<T>,
+        recv_offsets: &[usize],
+    ) -> Result<()> {
+        let count = send_counts[self.rank];
+        if count == 0 {
+            return Ok(());
+        }
+        let src = sendbuf.slice(send_offsets[self.rank]..send_offsets[self.rank] + count);
+        let mut dst = recvbuf.slice_mut(recv_offsets[self.rank]..recv_offsets[self.rank] + count);
+        self.stream
+            .memcpy_dtod(&src, &mut dst)
+            .with_context(|| format!("rank {} NCCL self-peer D2D copy failed", self.rank))
+    }
+
     pub fn all_reduce_f32(&self, input: &[f32]) -> Result<Vec<f32>> {
         let send = self
             .stream
@@ -327,6 +481,66 @@ impl NcclComm {
             api,
         )
     }
+
+    fn send(
+        &self,
+        sendbuff: *const c_void,
+        count: usize,
+        dtype: ncclDataType_t,
+        peer: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let api = nccl_api()?;
+        check_nccl(
+            unsafe {
+                (api.send)(
+                    sendbuff,
+                    count,
+                    dtype,
+                    peer as i32,
+                    self.raw,
+                    stream.cu_stream() as *mut c_void,
+                )
+            },
+            "ncclSend",
+            api,
+        )
+    }
+
+    fn recv(
+        &self,
+        recvbuff: *mut c_void,
+        count: usize,
+        dtype: ncclDataType_t,
+        peer: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let api = nccl_api()?;
+        check_nccl(
+            unsafe {
+                (api.recv)(
+                    recvbuff,
+                    count,
+                    dtype,
+                    peer as i32,
+                    self.raw,
+                    stream.cu_stream() as *mut c_void,
+                )
+            },
+            "ncclRecv",
+            api,
+        )
+    }
+
+    fn group_start(&self) -> Result<()> {
+        let api = nccl_api()?;
+        check_nccl(unsafe { (api.group_start)() }, "ncclGroupStart", api)
+    }
+
+    fn group_end(&self) -> Result<()> {
+        let api = nccl_api()?;
+        check_nccl(unsafe { (api.group_end)() }, "ncclGroupEnd", api)
+    }
 }
 
 impl Drop for NcclComm {
@@ -371,6 +585,24 @@ type NcclBroadcast = unsafe extern "C" fn(
     ncclComm_t,
     *mut c_void,
 ) -> ncclResult_t;
+type NcclSend = unsafe extern "C" fn(
+    *const c_void,
+    usize,
+    ncclDataType_t,
+    i32,
+    ncclComm_t,
+    *mut c_void,
+) -> ncclResult_t;
+type NcclRecv = unsafe extern "C" fn(
+    *mut c_void,
+    usize,
+    ncclDataType_t,
+    i32,
+    ncclComm_t,
+    *mut c_void,
+) -> ncclResult_t;
+type NcclGroupStart = unsafe extern "C" fn() -> ncclResult_t;
+type NcclGroupEnd = unsafe extern "C" fn() -> ncclResult_t;
 type NcclGetErrorString = unsafe extern "C" fn(ncclResult_t) -> *const c_char;
 
 struct NcclApi {
@@ -381,6 +613,10 @@ struct NcclApi {
     all_reduce: NcclAllReduce,
     all_gather: NcclAllGather,
     broadcast: NcclBroadcast,
+    send: NcclSend,
+    recv: NcclRecv,
+    group_start: NcclGroupStart,
+    group_end: NcclGroupEnd,
     get_error_string: NcclGetErrorString,
 }
 
@@ -413,9 +649,68 @@ impl NcclApi {
             all_reduce: unsafe { load_symbol(handle, b"ncclAllReduce\0")? },
             all_gather: unsafe { load_symbol(handle, b"ncclAllGather\0")? },
             broadcast: unsafe { load_symbol(handle, b"ncclBroadcast\0")? },
+            send: unsafe { load_symbol(handle, b"ncclSend\0")? },
+            recv: unsafe { load_symbol(handle, b"ncclRecv\0")? },
+            group_start: unsafe { load_symbol(handle, b"ncclGroupStart\0")? },
+            group_end: unsafe { load_symbol(handle, b"ncclGroupEnd\0")? },
             get_error_string: unsafe { load_symbol(handle, b"ncclGetErrorString\0")? },
         })
     }
+}
+
+fn validate_grouped_exchange(
+    rank: usize,
+    world_size: usize,
+    send_len: usize,
+    send_offsets: &[usize],
+    send_counts: &[usize],
+    recv_len: usize,
+    recv_offsets: &[usize],
+    recv_counts: &[usize],
+) -> Result<()> {
+    if send_offsets.len() != world_size
+        || send_counts.len() != world_size
+        || recv_offsets.len() != world_size
+        || recv_counts.len() != world_size
+    {
+        bail!(
+            "NCCL grouped exchange rank {rank} expects {world_size} peer entries, got send_offsets={} send_counts={} recv_offsets={} recv_counts={}",
+            send_offsets.len(),
+            send_counts.len(),
+            recv_offsets.len(),
+            recv_counts.len()
+        );
+    }
+    if send_counts[rank] != recv_counts[rank] {
+        bail!(
+            "NCCL grouped exchange self-peer count mismatch on rank {rank}: send={} recv={}",
+            send_counts[rank],
+            recv_counts[rank]
+        );
+    }
+    for peer in 0..world_size {
+        let send_end = send_offsets[peer]
+            .checked_add(send_counts[peer])
+            .ok_or_else(|| anyhow!("NCCL grouped exchange send range overflow for peer {peer}"))?;
+        if send_end > send_len {
+            bail!(
+                "NCCL grouped exchange send range for peer {peer} exceeds buffer: offset={} count={} len={send_len}",
+                send_offsets[peer],
+                send_counts[peer]
+            );
+        }
+        let recv_end = recv_offsets[peer]
+            .checked_add(recv_counts[peer])
+            .ok_or_else(|| anyhow!("NCCL grouped exchange recv range overflow for peer {peer}"))?;
+        if recv_end > recv_len {
+            bail!(
+                "NCCL grouped exchange recv range for peer {peer} exceeds buffer: offset={} count={} len={recv_len}",
+                recv_offsets[peer],
+                recv_counts[peer]
+            );
+        }
+    }
+    Ok(())
 }
 
 fn open_nccl_library() -> Result<*mut c_void> {

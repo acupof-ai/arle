@@ -9,6 +9,10 @@ use anyhow::{Result, bail};
 
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceVec, HiddenStates};
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use cudarc::driver::CudaSlice;
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use half::bf16;
 #[cfg(feature = "nccl")]
 use std::sync::Arc;
 
@@ -30,6 +34,7 @@ pub enum LayerCollective {
 pub enum LayerCommStatus {
     NoopSingleRank,
     AllReduceSum,
+    GroupedSendRecv,
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +313,68 @@ impl LayerCommunicator {
             &mut hidden.data,
             hidden.len,
         )
+    }
+
+    /// EP-axis grouped BF16 send/recv for DeepEP-style MoE token exchange.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_grouped_send_recv_bf16(
+        &self,
+        sendbuf: &CudaSlice<bf16>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<bf16>,
+        recv_offsets: &[usize],
+        recv_counts: &[usize],
+    ) -> Result<LayerCommStatus> {
+        if self.ep_world_size == 1 {
+            return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        let Some(nccl) = self.ep_nccl.as_ref() else {
+            bail!(
+                "MoE grouped BF16 send/recv requires EP NCCL backend for world_size={}",
+                self.ep_world_size
+            );
+        };
+        nccl.grouped_send_recv_bf16(
+            sendbuf,
+            send_offsets,
+            send_counts,
+            recvbuf,
+            recv_offsets,
+            recv_counts,
+        )?;
+        Ok(LayerCommStatus::GroupedSendRecv)
+    }
+
+    /// EP-axis grouped I32 send/recv for DeepEP-style MoE metadata exchange.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_grouped_send_recv_i32(
+        &self,
+        sendbuf: &CudaSlice<i32>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<i32>,
+        recv_offsets: &[usize],
+        recv_counts: &[usize],
+    ) -> Result<LayerCommStatus> {
+        if self.ep_world_size == 1 {
+            return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        let Some(nccl) = self.ep_nccl.as_ref() else {
+            bail!(
+                "MoE grouped I32 send/recv requires EP NCCL backend for world_size={}",
+                self.ep_world_size
+            );
+        };
+        nccl.grouped_send_recv_i32(
+            sendbuf,
+            send_offsets,
+            send_counts,
+            recvbuf,
+            recv_offsets,
+            recv_counts,
+        )?;
+        Ok(LayerCommStatus::GroupedSendRecv)
     }
 
     pub fn all_reduce_post_attention<T>(&self, hidden: &mut [T]) -> Result<LayerCommStatus> {
