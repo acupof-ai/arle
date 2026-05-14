@@ -114,6 +114,14 @@ Current trace set:
   D2H payload is only 44 KiB total. The steady-state bottleneck is NCCL
   SendRecv/AllReduce, local expert FP8/FP4 GEMV, CUDA launch overhead,
   allocator/free overhead, and route-count D2H synchronization.
+- [`nsys-single-decode-token-expert-grouped/`](nsys-single-decode-token-expert-grouped/)
+  records the opt-in `ARLE_DSV4_GROUPED_EXPERTS=1` expert-wise grouped GEMV
+  path after the same real decode warmup. The output remains `霓彩`, but the
+  single decode wave regresses to 145.693 ms. `ncclDevKernel_SendRecv` rises to
+  58.049 ms per rank range, the FP4 grouped gate/up GEMV costs 23.162 ms, and
+  the FP4 grouped `w2` GEMV costs 11.428 ms. This stays default-off; the trace
+  confirms that the current grouped GEMV path is not the target grouped
+  GEMM/DeepGEMM implementation.
 - [`bench-fused-dispatch-payload-local/`](bench-fused-dispatch-payload-local/)
   records the matching trace-off HTTP smoke. `decode64` returns normal English
   content at 12.22 post-first tok/s and the arithmetic case returns `410`.
