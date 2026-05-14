@@ -53,6 +53,13 @@ Related governance docs:
   including compressed BF16 and FP8 combine trace logs, parsed summaries, remote
   build evidence, default trace-off post-checks, and the current bottleneck
   callout for return-side combine exchange plus local expert GEMMs.
+- Added a current 8xH20 DSv4 single-token Nsight trace under
+  [`docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-one-token-current/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-one-token-current/).
+  The `max_tokens=2` streaming request returned `霓灯` and produced exactly one
+  `step_decode_kernel_launch` wave across 8 ranks. The isolated token takes
+  266.020 ms wall; decode-only nsys shows `cuStreamSynchronize`,
+  async allocation/free, launch/memset churn, and NCCL send/recv ahead of the
+  actual attention and GEMV kernels.
 
 ### CUDA
 

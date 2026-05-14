@@ -186,8 +186,10 @@ Operators who want only the native serving binary can use `infer` directly (`car
   launch churn. Per-layer DeepEP dispatch scratch reuse further raises default
   short math smoke to **7.7-7.8 tok/s** and cuts Nsight
   `cuMemAllocAsync`/`cuMemFreeAsync` calls in the 8-token window from 136,825 to
-  111,531, leaving stream sync plus return-side NCCL/GEMM work as the next
-  target.
+  111,531. A follow-up single-token nsys window now isolates one generated
+  decode token at **266 ms wall**: `cuStreamSynchronize`, async allocation/free,
+  launch/memset churn, and NCCL send/recv dominate before attention or GEMV.
+  That leaves stream sync plus return-side NCCL/GEMM work as the next target.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
   and
