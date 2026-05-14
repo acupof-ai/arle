@@ -135,6 +135,28 @@ before the 300s non-streaming HTTP timeout. The service remained alive and all
 long-prefill throughput blocker rather than a sampler, HTTP fanout, or decode
 synchronization blocker.
 
+## Prefill Bottleneck Trace
+
+A 1,039-token prompt with per-layer trace enabled completed in 17.178 s and
+returned `37 × 29`. The trace separates the true prefill row (`tokens=1039`)
+from the subsequent decode rows (`tokens=1`).
+
+Top prefill phase totals across 43 layers and 8 ranks:
+
+| Phase | Count | Sum | Avg per layer/rank | Max |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_total` | 344 | 114269.243 ms | 332.178 ms | 595.966 ms |
+| `ffn_deepep_dispatch_combine` | 344 | 106179.338 ms | 308.661 ms | 571.507 ms |
+| `ffn_deepep_combine` | 344 | 58949.560 ms | 171.365 ms | 560.340 ms |
+| `ffn_deepep_local_experts` | 344 | 44305.389 ms | 128.795 ms | 549.584 ms |
+| `attn_total` | 344 | 15854.440 ms | 46.088 ms | 143.814 ms |
+| `ffn_deepep_dispatch` | 344 | 293.982 ms | 0.855 ms | 1.637 ms |
+| `ffn_deepep_count_exchange` | 344 | 182.072 ms | 0.529 ms | 3.023 ms |
+
+This makes the next prefill optimization target concrete: count exchange and
+token dispatch are no longer first-order; prefill needs real grouped
+GEMM/DeepGEMM for local experts plus a more efficient combine path.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not

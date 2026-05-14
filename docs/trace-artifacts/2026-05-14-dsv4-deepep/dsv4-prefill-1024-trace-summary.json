@@ -1,0 +1,125 @@
+{
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle",
+  "model": "/root/DeepSeek-V4-Flash",
+  "runtime": {
+    "env": {
+      "ARLE_DSV4_TRACE_LAYER": "1",
+      "ARLE_DSV4_MOE_BACKEND": "deepep",
+      "ARLE_DSV4_INCREMENTAL_KV": "1",
+      "INFER_CUDA_DEVICES": "0,1,2,3,4,5,6,7",
+      "ARLE_DSV4_COUNT_EXCHANGE": null
+    },
+    "args": [
+      "--model-path",
+      "/root/DeepSeek-V4-Flash",
+      "--port",
+      "18084",
+      "--max-seq-len",
+      "900000",
+      "--kv-cache-dtype",
+      "fp8",
+      "--num-slots",
+      "1",
+      "--deepseek-distributed-layers",
+      "43",
+      "--mem-fraction-static",
+      "0.1"
+    ]
+  },
+  "request": {
+    "prompt_tokens": 1039,
+    "completion_tokens": 4,
+    "elapsed_s": 17.177764,
+    "text": "37 \u00d7 29"
+  },
+  "prefill_tokens_1039_phase_sums": {
+    "ffn_total": {
+      "count": 344,
+      "sum_ms": 114269.243,
+      "avg_ms": 332.178,
+      "max_ms": 595.966
+    },
+    "ffn_deepep_dispatch_combine": {
+      "count": 344,
+      "sum_ms": 106179.338,
+      "avg_ms": 308.661,
+      "max_ms": 571.507
+    },
+    "ffn_deepep_combine": {
+      "count": 344,
+      "sum_ms": 58949.56,
+      "avg_ms": 171.365,
+      "max_ms": 560.34
+    },
+    "ffn_deepep_local_experts": {
+      "count": 344,
+      "sum_ms": 44305.389,
+      "avg_ms": 128.795,
+      "max_ms": 549.584
+    },
+    "attn_total": {
+      "count": 344,
+      "sum_ms": 15854.44,
+      "avg_ms": 46.088,
+      "max_ms": 143.814
+    },
+    "attn_core": {
+      "count": 344,
+      "sum_ms": 12273.238,
+      "avg_ms": 35.678,
+      "max_ms": 129.54
+    },
+    "ffn_shared": {
+      "count": 344,
+      "sum_ms": 7725.474,
+      "avg_ms": 22.458,
+      "max_ms": 24.663
+    },
+    "attn_proj": {
+      "count": 344,
+      "sum_ms": 3493.415,
+      "avg_ms": 10.155,
+      "max_ms": 13.937
+    },
+    "ffn_deepep_route_logits": {
+      "count": 344,
+      "sum_ms": 730.127,
+      "avg_ms": 2.122,
+      "max_ms": 88.305
+    },
+    "ffn_deepep_dispatch": {
+      "count": 344,
+      "sum_ms": 293.982,
+      "avg_ms": 0.855,
+      "max_ms": 1.637
+    },
+    "ffn_deepep_count_exchange": {
+      "count": 344,
+      "sum_ms": 182.072,
+      "avg_ms": 0.529,
+      "max_ms": 3.023
+    }
+  },
+  "decode_tokens_1_phase_sums": {
+    "ffn_total": {
+      "count": 1032,
+      "sum_ms": 2710.915,
+      "avg_ms": 2.627,
+      "max_ms": 4.954
+    },
+    "attn_total": {
+      "count": 1032,
+      "sum_ms": 2040.702,
+      "avg_ms": 1.977,
+      "max_ms": 3.845
+    },
+    "ffn_deepep_dispatch_combine": {
+      "count": 1032,
+      "sum_ms": 1973.583,
+      "avg_ms": 1.912,
+      "max_ms": 4.336
+    }
+  },
+  "conclusion": "For 1K prompt prefill, the wall-clock bottleneck is DSv4 MoE prefill: ffn_deepep_dispatch_combine dominates attention by about 6.7x on average. Within MoE, combine and local expert compute dominate; count all-gather and token dispatch are no longer first-order. This is the next target for real grouped GEMM/DeepGEMM and a more efficient combine."
+}
