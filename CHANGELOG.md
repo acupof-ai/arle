@@ -217,6 +217,15 @@ Related governance docs:
   7.70 tok/s; both return normal sequence text and the arithmetic check returns
   `410`. This keeps pair GEMV default-off and confirms the next compute target
   is real grouped GEMM/DeepGEMM rather than single-expert gate/up fusion.
+- Added `HiddenStates::uninit` for CUDA call sites that immediately overwrite
+  every element and switched DSv4 decode temporaries plus generic GEMM/add/SwiGLU
+  outputs to use it where safe. Real 8xH20 DSv4 HTTP smoke remains correct
+  (`decode64` reaches 11.99 post-first tok/s and the arithmetic check returns
+  `410`), and single-token nsys shows `cuMemsetD8Async` dropping from 8,789
+  calls / 11.855 ms per rank range to 2,957 calls / 4.180 ms. The isolated
+  decode wave moves from 125.497 ms to 112.724 ms; NCCL exchange, launch
+  overhead, async allocation/free, and local expert FP8/FP4 GEMV remain the top
+  targets.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

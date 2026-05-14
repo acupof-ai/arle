@@ -652,10 +652,10 @@ pub fn apply_lora_gemm_add(
     );
 
     let rank = lora_a.rows;
-    let mut tmp_a = HiddenStates::zeros(ctx, rank, input.seq_len)?;
+    let mut tmp_a = unsafe { HiddenStates::uninit(ctx, rank, input.seq_len)? };
     try_gemm_into(ctx, lora_a, input, &mut tmp_a)?;
 
-    let mut tmp_b = HiddenStates::zeros(ctx, lora_b.rows, input.seq_len)?;
+    let mut tmp_b = unsafe { HiddenStates::uninit(ctx, lora_b.rows, input.seq_len)? };
     try_gemm_into(ctx, lora_b, &tmp_a, &mut tmp_b)?;
 
     let total_elems = output.hidden_dim * output.seq_len;
@@ -1132,7 +1132,7 @@ pub fn mlp_decode_with_lora_into(
 /// GEMM: Y = weight @ X (batched linear projection)
 /// weight: [out_dim, in_dim] row-major, X: HiddenStates [in_dim, seq_len], Y: HiddenStates [out_dim, seq_len]
 pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Result<HiddenStates> {
-    let mut out = HiddenStates::zeros(ctx, weight.rows, x.seq_len)?;
+    let mut out = unsafe { HiddenStates::uninit(ctx, weight.rows, x.seq_len)? };
     try_gemm_into(ctx, weight, x, &mut out)?;
     Ok(out)
 }

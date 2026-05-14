@@ -243,7 +243,7 @@ pub(crate) fn prefill_attention_hd256_batch(
     rotary_dim: usize,
 ) -> Result<()> {
     let q_dim = num_q_heads * 256;
-    let mut q_prepped = HiddenStates::zeros(ctx, q_dim, q_full_batch.seq_len)?;
+    let mut q_prepped = unsafe { HiddenStates::uninit(ctx, q_dim, q_full_batch.seq_len)? };
     // Allocate temporary GPU scalar for start_pos
     let start_pos_buf: CudaSlice<i32> = ctx
         .stream

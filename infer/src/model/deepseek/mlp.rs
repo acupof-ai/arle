@@ -74,13 +74,13 @@ impl DeepseekV4Expert {
         } else {
             ops::LinearDispatchPhase::Decode
         };
-        let mut gate = HiddenStates::zeros(ctx, self.w1.rows, hidden.seq_len)?;
+        let mut gate = unsafe { HiddenStates::uninit(ctx, self.w1.rows, hidden.seq_len)? };
         ops::try_gemm_with_phase_into(ctx, &self.w1, hidden, &mut gate, phase)?;
-        let mut up = HiddenStates::zeros(ctx, self.w3.rows, hidden.seq_len)?;
+        let mut up = unsafe { HiddenStates::uninit(ctx, self.w3.rows, hidden.seq_len)? };
         ops::try_gemm_with_phase_into(ctx, &self.w3, hidden, &mut up, phase)?;
-        let mut act = HiddenStates::zeros(ctx, self.w1.rows, hidden.seq_len)?;
+        let mut act = unsafe { HiddenStates::uninit(ctx, self.w1.rows, hidden.seq_len)? };
         ops::dsv4_swiglu_clamped_batch_into(ctx, &gate, &up, &mut act, swiglu_limit)?;
-        let mut out = HiddenStates::zeros(ctx, self.w2.rows, hidden.seq_len)?;
+        let mut out = unsafe { HiddenStates::uninit(ctx, self.w2.rows, hidden.seq_len)? };
         ops::try_gemm_with_phase_into(ctx, &self.w2, &act, &mut out, phase)?;
         Ok(out)
     }
@@ -2690,7 +2690,7 @@ impl DeepseekV4MoeBlock {
                             expert_out_ref
                         } else {
                             let mut expert_input =
-                                HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;
+                                unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, count)? };
                             {
                                 let src = expert_hidden.data.slice(elem_start..elem_end);
                                 ctx.stream
@@ -2746,7 +2746,7 @@ impl DeepseekV4MoeBlock {
         let route_combine_capacity = total_send_routes
             .max(total_recv_routes)
             .max(route_slot_capacity);
-        let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
+        let mut out = unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, hidden.seq_len)? };
         let run_combine_kernel = |combine_recv: &HiddenStates,
                                   route_slot_out: Option<&mut HiddenStates>,
                                   out: &mut HiddenStates|
@@ -2760,8 +2760,9 @@ impl DeepseekV4MoeBlock {
                         scratch
                     }
                     None => {
-                        route_slot_out_owned =
-                            HiddenStates::zeros(ctx, hidden.hidden_dim, route_slot_capacity)?;
+                        route_slot_out_owned = unsafe {
+                            HiddenStates::uninit(ctx, hidden.hidden_dim, route_slot_capacity)?
+                        };
                         &mut route_slot_out_owned
                     }
                 };
@@ -2995,7 +2996,8 @@ impl DeepseekV4MoeBlock {
             let combine_exchange_trace = dsv4_moe_trace_begin(ctx)?;
             match combine_mode {
                 Dsv4CombineExchangeMode::Bf16 if use_padded_bf16_combine => {
-                    let mut peer_send = HiddenStates::zeros(ctx, hidden.hidden_dim, ep.world_size)?;
+                    let mut peer_send =
+                        unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, ep.world_size)? };
                     {
                         let (route_ptr, _route_guard) = route_out.data.device_ptr(&ctx.stream);
                         let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
