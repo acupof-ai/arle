@@ -1,7 +1,10 @@
 //! Device tensor types and CUDA context.
 
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
+    PinnedHostSlice,
+};
 use half::bf16;
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -283,6 +286,34 @@ impl DeviceContext {
             })
     }
 
+    /// Upload pinned host data into an existing device allocation on the copy stream.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `dst` is already valid on the copy stream before
+    /// this call. If its allocation or previous writes are on another stream,
+    /// order that stream first, e.g. with [`DeviceContext::copy_waits_for_compute`].
+    /// `dst` must stay allocated and must not be read, written, or freed by
+    /// another stream until that stream waits on the returned fence. `src` must
+    /// be pinned so the async H2D copy has a stable host address.
+    pub unsafe fn memcpy_pinned_htod_on_copy_stream<T, Dst>(
+        &self,
+        src: &PinnedHostSlice<T>,
+        dst: &mut Dst,
+    ) -> Result<CudaPipelineFence>
+    where
+        T: DeviceRepr,
+        Dst: DevicePtrMut<T>,
+    {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow!("Bind CUDA context before copy-stream H2D failed: {e}"))?;
+        self.copy_stream
+            .memcpy_htod(src, dst)
+            .map_err(|e| anyhow!("copy-stream pinned H2D memcpy failed: {e}"))?;
+        self.record_pipeline_fence(CudaPipelineStreamKind::Copy)
+    }
+
     /// Record an event on the compute stream and make the copy stream wait for it.
     ///
     /// Use after GPU kernels finish (e.g. sampling) to ensure the copy stream
@@ -323,6 +354,34 @@ mod pipeline_fence_tests {
         ctx.sync_copy()?;
         assert!(compute_done.is_ready()?);
         assert!(copy_done.is_ready()?);
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_copy_stream_h2d_helper_returns_compute_waitable_fence() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+
+        let initial = [11_i32, 22, 33, 44];
+        let mut pinned = unsafe {
+            ctx.ctx
+                .alloc_pinned::<i32>(initial.len())
+                .map_err(|e| anyhow!("Alloc pinned H2D helper source failed: {e}"))?
+        };
+        pinned.as_mut_slice()?.copy_from_slice(&initial);
+        let mut existing = ctx
+            .copy_stream
+            .alloc_zeros::<i32>(initial.len())
+            .map_err(|e| anyhow!("Alloc H2D helper test buffer failed: {e}"))?;
+
+        // SAFETY: `pinned` and `existing` both live until compute waits on the
+        // returned fence and reads the uploaded data below.
+        let upload_done = unsafe { ctx.memcpy_pinned_htod_on_copy_stream(&pinned, &mut existing)? };
+        assert_eq!(upload_done.producer(), CudaPipelineStreamKind::Copy);
+        ctx.wait_on_pipeline_fence(&upload_done, CudaPipelineStreamKind::Compute)?;
+        let got = ctx.stream.clone_dtoh(&existing)?;
+        ctx.sync()?;
+        assert_eq!(got.as_slice(), &initial);
+        assert!(upload_done.is_ready()?);
         Ok(())
     }
 }
