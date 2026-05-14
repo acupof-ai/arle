@@ -15,7 +15,7 @@
 #define WARP_SIZE 32
 #define GEMV_THREADS 256
 #define GEMV_ROWS 4
-#define DSV4_BATCH_TILE 8
+#define DSV4_BATCH_TILE 16
 
 __device__ __constant__ float DSV4_FP4_E2M1_LUT[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
