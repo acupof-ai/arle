@@ -81,10 +81,7 @@ impl DeepseekModel {
             } else {
                 state.reference_tokens.extend_from_slice(tokens);
             }
-            state.base.prefill_logits = Some(
-                DeviceVec::zeros(&self.ctx, self.config.vocab_size)?
-                    .with_label("dsv4_deferred_prefill_logits"),
-            );
+            state.base.prefill_logits = None;
             state.base.kv_cache.advance_seq_len(tokens.len());
             return Ok(());
         }
