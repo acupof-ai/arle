@@ -19,6 +19,15 @@ Related governance docs:
 
 ## [Unreleased]
 
+### Observability
+
+- Added low-overhead HTTP `request_trace` JSON summaries for streaming and
+  buffered requests, including TTFT, total latency, token throughput,
+  KV/prefix-cache state, scheduler phase EMA, pipeline, and preprocess
+  snapshots. Added `scripts/bench_dsv4_trace_http.py` to run DSv4 HTTP smoke
+  cases and collect matching `request_trace` entries from server logs without
+  enabling CUDA-synchronizing per-layer tracing.
+
 ### CUDA
 
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
