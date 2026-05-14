@@ -1,0 +1,18 @@
+Processing [docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-pair-gemv-deepep-decode/trace.sqlite] with [/opt/nvidia/nsight-systems/2023.2.3/host-linux-x64/reports/nvtx_sum.py]...
+
+ ** NVTX Range Summary (nvtx_sum):
+
+ Time (%)  Total Time (ns)  Instances    Avg (ns)       Med (ns)      Min (ns)     Max (ns)    StdDev (ns)    Style             Range
+ --------  ---------------  ---------  -------------  -------------  -----------  -----------  ------------  -------  -------------------------
+     49.3    3,227,276,893         16  201,704,805.8  200,918,836.5  197,169,356  206,240,366   4,122,946.9  PushPop  step_decode_kernel_launch
+     46.6    3,052,832,801         23  132,731,860.9  198,920,280.0      411,179  208,607,476  98,664,713.5  PushPop  step_total
+      2.5      164,762,184      2,066       79,749.4       81,240.5       15,732      237,959      36,241.7  PushPop  NCCL:ncclGroupEnd
+      0.8       49,647,238        688       72,161.7       70,578.0       15,429      420,058      29,066.1  PushPop  NCCL:ncclAllGather
+      0.6       38,191,723        688       55,511.2       49,560.0       15,061      410,320      30,685.6  PushPop  NCCL:ncclAllReduce
+      0.2       11,306,522      8,449        1,338.2          328.0          156       59,640       3,286.9  PushPop  NCCL:ncclRecv
+      0.1        6,650,081      8,456          786.4          235.0          154       45,482       2,291.3  PushPop  NCCL:ncclSend
+      0.0          853,952      2,065          413.5          313.0          101        7,125         471.6  PushPop  NCCL:ncclGroupStart
+      0.0          160,664         31        5,182.7        6,273.0          536        8,413       2,640.2  PushPop  step_dispatch_emits
+      0.0           76,162         24        3,173.4        3,062.5        2,247        4,521         518.6  PushPop  step_plan
+      0.0           31,754         24        1,323.1          954.5          540        8,638       1,591.3  PushPop  scheduler_snapshot
+      0.0            8,773         23          381.4          347.0          170          838         151.8  PushPop  step_admission

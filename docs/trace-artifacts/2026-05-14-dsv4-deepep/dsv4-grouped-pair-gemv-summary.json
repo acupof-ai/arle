@@ -1,0 +1,139 @@
+{
+  "run": "dsv4-grouped-pair-gemv",
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle-perf-pair-gemv",
+  "build": {
+    "command": "cargo build --release -p infer --bin infer --features cuda,nccl",
+    "status": "pass",
+    "target_dir": "/root/arle/target",
+    "duration": "5m39s"
+  },
+  "profile": {
+    "model_path": "/root/DeepSeek-V4-Flash",
+    "gpus": 8,
+    "moe_backend": "deepep",
+    "incremental_kv": true,
+    "kv_cache_dtype": "fp8",
+    "grouped_experts": true,
+    "default_enabled": false
+  },
+  "implementation": {
+    "summary": "The gated DSv4 grouped expert harness now has FP8 and FP4 pair GEMV kernels that compute w1 and w3 in one grouped launch and write gate/up outputs together. The Rust grouped path uses the pair launch when w1/w3 format, shape, and block-scale layout match, otherwise it falls back to separate grouped GEMV launches.",
+    "reason_default_disabled": "The opt-in raw grouped GEMV path remains slower than the default scratch-reuse DeepEP path on B=1 decode. The pair launch is kept as a harness boundary for replacing the raw GEMV implementation with real grouped GEMM/DeepGEMM."
+  },
+  "trace_off_results": [
+    {
+      "case": "warmup",
+      "prompt_tokens": 14,
+      "completion_tokens": 2,
+      "latency_s": 1.44175,
+      "completion_tok_s": 1.387,
+      "output": "1073"
+    },
+    {
+      "case": "math_37x29",
+      "prompt_tokens": 15,
+      "completion_tokens": 12,
+      "latency_s": 2.994205,
+      "completion_tok_s": 4.008,
+      "output": "好的，我们一起来计算 37 × 29，我会"
+    },
+    {
+      "case": "math_58p67",
+      "prompt_tokens": 15,
+      "completion_tokens": 12,
+      "latency_s": 3.038266,
+      "completion_tok_s": 3.95,
+      "output": "好的，我们一起来计算58加67。我们可以用竖"
+    },
+    {
+      "case": "write_city",
+      "prompt_tokens": 14,
+      "completion_tokens": 10,
+      "latency_s": 2.667881,
+      "completion_tok_s": 3.748,
+      "output": "霓灯吻碎江，夜城醉成"
+    },
+    {
+      "case": "write_perf",
+      "prompt_tokens": 18,
+      "completion_tokens": 8,
+      "latency_s": 2.689103,
+      "completion_tok_s": 2.975,
+      "output": "极速推理，秒级洞察。"
+    }
+  ],
+  "nsys_decode": {
+    "directory": "nsys-pair-gemv-deepep-decode",
+    "raw_remote_nsys_rep": "/root/arle-perf-pair-gemv/docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-pair-gemv-deepep-decode/trace.nsys-rep",
+    "raw_remote_sqlite": "/root/arle-perf-pair-gemv/docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-pair-gemv-deepep-decode/trace.sqlite",
+    "client_window": {
+      "seconds_to_first": 1.300255,
+      "captured_decode_wall_s": 0.320807,
+      "first_chunk": "一",
+      "second_chunk": ",",
+      "nvtx_step_decode_kernel_launch_instances": 16,
+      "interpretation": "8 ranks and about two decode scheduler steps were captured in the external streaming signal window."
+    },
+    "top_cuda_api": [
+      {
+        "name": "cuMemAllocAsync",
+        "time_percent": 26.6,
+        "calls": 12720
+      },
+      {
+        "name": "cuMemFreeAsync",
+        "time_percent": 24.9,
+        "calls": 12717
+      },
+      {
+        "name": "cuMemcpyDtoHAsync_v2",
+        "time_percent": 23.6,
+        "calls": 940
+      },
+      {
+        "name": "cudaLaunchKernel",
+        "time_percent": 7.9,
+        "calls": 15461
+      },
+      {
+        "name": "cuMemsetD8Async",
+        "time_percent": 7.5,
+        "calls": 13836
+      }
+    ],
+    "top_kernels": [
+      {
+        "name": "ncclDevKernel_SendRecv",
+        "time_percent": 46.9,
+        "instances": 1025
+      },
+      {
+        "name": "dsv4_fp4_grouped_gemv_pair_batch_kernel",
+        "time_percent": 14.6,
+        "instances": 195
+      },
+      {
+        "name": "dsv4_fp4_grouped_gemv_batch_kernel",
+        "time_percent": 7.2,
+        "instances": 194
+      },
+      {
+        "name": "dsv4_fp8_gemv_batch_kernel",
+        "time_percent": 7.1,
+        "instances": 2900
+      },
+      {
+        "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+        "time_percent": 5.1,
+        "instances": 339
+      },
+      {
+        "name": "dsv4_hybrid_attention_kernel",
+        "time_percent": 4.6,
+        "instances": 309
+      }
+    ]
+  },
+  "conclusion": "The pair GEMV kernel is present in the real DeepEP grouped decode trace, but the grouped raw GEMV harness is still slower than the default scratch-reuse path. The concrete bottleneck remains NCCL send/recv plus allocation/free and launch churn, followed by raw grouped expert GEMV. Keep ARLE_DSV4_GROUPED_EXPERTS default-off until the harness is replaced by grouped GEMM/DeepGEMM with DeepEP-style overlap."
+}

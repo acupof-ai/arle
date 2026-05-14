@@ -98,11 +98,61 @@ still slower than the scratch-reuse per-expert path on B=1 decode.
 | Grouped raw GEMV, all local experts | `1` | 3.58 s | 4.27 s | 1.549 ms | 4.181 ms |
 | Grouped raw GEMV, active experts only | `1` | 3.40-3.48 s | 4.56 s | 1.301 ms | 4.085 ms |
 | Grouped raw GEMV, indexed active + cached ptrs | `1` | 2.37-2.40 s | 2.69 s | 1.196 ms | 3.853 ms |
+| Grouped raw GEMV, fused gate/up pair launch | `1` | 2.99-3.04 s | 2.67-2.69 s | nsys-only | nsys-only |
 | Gated default validation | unset | 2.04-2.16 s | 2.51 s | 0.463 ms | 2.478 ms |
 
 The grouped-kernel harness is kept for the next replacement step: swap the raw
 GEMV implementation for real grouped GEMM/DeepGEMM rather than enabling the
 slower prototype.
+
+## Grouped Pair GEMV Nsys
+
+The grouped expert harness now has a pair GEMV kernel that computes `w1` and
+`w3` in one grouped launch and writes gate/up outputs together. It is still
+gated behind `ARLE_DSV4_GROUPED_EXPERTS=1`.
+
+Correct DeepEP validation must include `ARLE_DSV4_MOE_BACKEND=deepep`; a
+missing env var falls back to the legacy all-reduce route and does not exercise
+the grouped expert code. With the correct DeepEP env, the trace-off smoke
+returned normal content:
+
+| Case | Prompt tokens | Completion tokens | Latency | Completion throughput | Output |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `37*29` | 15 | 12 | 2.994 s | 4.01 tok/s | `好的，我们一起来计算 37 × 29，我会` |
+| `58+67` | 15 | 12 | 3.038 s | 3.95 tok/s | `好的，我们一起来计算58加67。我们可以用竖` |
+| writing | 14 | 10 | 2.668 s | 3.75 tok/s | `霓灯吻碎江，夜城醉成` |
+
+The stream-delimited nsys decode window in
+`nsys-pair-gemv-deepep-decode/` captured 16
+`step_decode_kernel_launch` ranges, i.e. 8 ranks and about two decode scheduler
+steps. The client observed 0.320807 s between streamed chunks `一` and `,`.
+
+Top CUDA kernels in that DeepEP decode window:
+
+| Kernel | GPU time share | Instances |
+| --- | ---: | ---: |
+| `ncclDevKernel_SendRecv` | 46.9% | 1025 |
+| `dsv4_fp4_grouped_gemv_pair_batch_kernel` | 14.6% | 195 |
+| `dsv4_fp4_grouped_gemv_batch_kernel` | 7.2% | 194 |
+| `dsv4_fp8_gemv_batch_kernel` | 7.1% | 2900 |
+| `ncclDevKernel_AllReduce_Sum_bf16_RING_LL` | 5.1% | 339 |
+| `dsv4_hybrid_attention_kernel` | 4.6% | 309 |
+
+Top CUDA API time remains allocation/free and host-transfer dominated:
+
+| API | API time share | Calls |
+| --- | ---: | ---: |
+| `cuMemAllocAsync` | 26.6% | 12720 |
+| `cuMemFreeAsync` | 24.9% | 12717 |
+| `cuMemcpyDtoHAsync_v2` | 23.6% | 940 |
+| `cudaLaunchKernel` | 7.9% | 15461 |
+| `cuMemsetD8Async` | 7.5% | 13836 |
+
+This confirms the pair launch is wired and visible in nsys, but the opt-in raw
+grouped GEMV path remains slower than the default scratch-reuse DeepEP path.
+The bottleneck is still NCCL send/recv plus alloc/free and launch churn,
+followed by raw grouped expert GEMV. Keep the gate default-off until this
+harness is backed by true grouped GEMM/DeepGEMM and communication overlap.
 
 ## Count Exchange Optimization
 
