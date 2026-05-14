@@ -71,6 +71,10 @@ pub(crate) struct DeepseekLayerRuntimeCache {
     pub(crate) moe: DeepseekMoeRuntimeCache,
     pub(crate) attn_mhc: Option<DeepseekMhcRuntimeScratch>,
     pub(crate) ffn_mhc: Option<DeepseekMhcRuntimeScratch>,
+    pub(crate) attn_pre: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) attn_normed: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) ffn_pre: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) ffn_normed: Option<DeepseekHiddenRuntimeScratch>,
 }
 
 #[cfg(feature = "cuda")]
@@ -152,6 +156,13 @@ pub(crate) struct DeepseekMhcRuntimeScratch {
     pub(crate) pre: CudaSlice<f32>,
     pub(crate) post: CudaSlice<f32>,
     pub(crate) comb: CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekHiddenRuntimeScratch {
+    pub(crate) capacity_tokens: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) hidden: HiddenStates,
 }
 
 #[cfg(feature = "cuda")]
@@ -586,6 +597,32 @@ pub(crate) fn ensure_mhc_scratch<'a>(
         });
     }
     Ok(slot.as_mut().expect("DeepSeek V4 MHC scratch allocated"))
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_hidden_scratch<'a>(
+    slot: &'a mut Option<DeepseekHiddenRuntimeScratch>,
+    ctx: &DeviceContext,
+    hidden_dim: usize,
+    seq_len: usize,
+) -> Result<&'a mut HiddenStates> {
+    let capacity_tokens = seq_len.max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| {
+            scratch.capacity_tokens < capacity_tokens || scratch.hidden_dim != hidden_dim
+        })
+        .unwrap_or(true);
+    if needs_alloc {
+        *slot = Some(DeepseekHiddenRuntimeScratch {
+            capacity_tokens,
+            hidden_dim,
+            hidden: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
+        });
+    }
+    let scratch = slot.as_mut().expect("DeepSeek V4 hidden scratch allocated");
+    scratch.hidden.seq_len = seq_len;
+    Ok(&mut scratch.hidden)
 }
 
 #[cfg(feature = "cuda")]
