@@ -23,3 +23,10 @@ Current trace set:
   1.795 ms per rank range to 613 calls / 1.240 ms, and leaves the main
   bottleneck concentrated in allocator/runtime churn, D2H readback, NCCL
   exchange, and per-expert GEMV.
+- [`nsys-single-token-hidden-scratch/`](nsys-single-token-hidden-scratch/)
+  validates per-layer hidden scratch reuse for incremental HC pre-projection
+  and RMSNorm temporaries. The same streaming output remains `霓虹`, decode
+  wave wall time drops from 145.104 ms to 135.390 ms, and decode-only
+  alloc/free/memset calls each drop by 1,376. Remaining cost is still launch
+  overhead, D2H route readback, NCCL SendRecv/AllReduce, and local expert
+  FP8/FP4 GEMV.

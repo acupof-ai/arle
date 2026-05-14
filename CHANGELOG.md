@@ -151,6 +151,14 @@ Related governance docs:
   confirms this is a small cleanup: allocator/runtime churn, D2H route
   readback, NCCL SendRecv/AllReduce, and per-expert FP8/FP4 GEMV remain the
   dominant costs.
+- Reused per-layer DSv4 incremental hidden scratch for attention/FFN
+  HyperConnection pre-projection and RMSNorm temporaries. Real 8xH20 nsys
+  against `/root/DeepSeek-V4-Flash` kept the streaming `霓虹` output and moved
+  the isolated decode wave from 145.104 ms to 135.390 ms. Decode-only
+  `cuMemAllocAsync`, `cuMemFreeAsync`, and `cuMemsetD8Async` calls each dropped
+  by 1,376, matching four one-token temporary buffers across 43 layers and 8
+  ranks. The remaining ranked costs are launch/runtime overhead, D2H route
+  readback, NCCL SendRecv/AllReduce, and local expert FP8/FP4 GEMV.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

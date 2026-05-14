@@ -210,7 +210,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   to **613 calls / 1.240 ms** per rank range, and the same one-token wave is
   **145 ms wall**. Remaining targets are fewer host route readbacks,
   graph/lifetime cleanup, lower-latency/overlapped DeepEP exchange, and true
-  grouped GEMM/DeepGEMM.
+  grouped GEMM/DeepGEMM. Reusing per-layer hidden scratch for incremental HC
+  pre-projection and RMSNorm temporaries then cuts alloc/free/memset calls by
+  **1,376 each** and moves the same single-token wave to **135 ms wall**; the
+  current top costs are launch/runtime overhead, D2H route readback, NCCL
+  SendRecv/AllReduce, and local expert FP8/FP4 GEMV.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)
