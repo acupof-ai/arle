@@ -115,6 +115,36 @@ pub(crate) struct DeepseekGroupedExpertRuntimeScratch {
     pub(crate) up: HiddenStates,
     pub(crate) act: HiddenStates,
     pub(crate) out: HiddenStates,
+    pub(crate) w1_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
+    pub(crate) w3_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
+    pub(crate) w2_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
+    pub(crate) active: Option<DeepseekGroupedExpertActiveScratch>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekGroupedExpertActiveScratch {
+    pub(crate) capacity_experts: usize,
+    pub(crate) indices: CudaSlice<i32>,
+    pub(crate) offsets: CudaSlice<i32>,
+    pub(crate) counts: CudaSlice<i32>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeepseekDsv4GroupedBlockFormat {
+    Fp8,
+    Fp4,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekGroupedExpertWeightPtrCache {
+    pub(crate) weight_ptrs: CudaSlice<u64>,
+    pub(crate) scale_ptrs: CudaSlice<u64>,
+    pub(crate) format: DeepseekDsv4GroupedBlockFormat,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) scale_rows: usize,
+    pub(crate) scale_cols: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -195,6 +225,10 @@ impl DeepseekMoeRuntimeCache {
                 up: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
                 act: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
                 out: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+                w1_ptrs: None,
+                w3_ptrs: None,
+                w2_ptrs: None,
+                active: None,
             });
         }
         Ok(self
@@ -233,6 +267,34 @@ impl DeepseekMoeRuntimeCache {
             .route_combine
             .as_mut()
             .expect("DeepSeek V4 route combine scratch allocated"))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl DeepseekGroupedExpertRuntimeScratch {
+    pub(crate) fn ensure_active_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        capacity_experts: usize,
+    ) -> Result<&mut DeepseekGroupedExpertActiveScratch> {
+        let capacity_experts = capacity_experts.max(1);
+        let needs_alloc = self
+            .active
+            .as_ref()
+            .map(|scratch| scratch.capacity_experts < capacity_experts)
+            .unwrap_or(true);
+        if needs_alloc {
+            self.active = Some(DeepseekGroupedExpertActiveScratch {
+                capacity_experts,
+                indices: ctx.stream.alloc_zeros::<i32>(capacity_experts)?,
+                offsets: ctx.stream.alloc_zeros::<i32>(capacity_experts)?,
+                counts: ctx.stream.alloc_zeros::<i32>(capacity_experts)?,
+            });
+        }
+        Ok(self
+            .active
+            .as_mut()
+            .expect("DeepSeek V4 grouped expert active scratch allocated"))
     }
 }
 

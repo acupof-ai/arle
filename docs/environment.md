@@ -292,7 +292,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
 | `ARLE_DSV4_TRACE_LAYER` | `1` / unset | unset | Emits CUDA-synchronizing per-layer phase traces. Use for diagnosis only; it changes latency. |
 | `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
-| `ARLE_DSV4_GROUPED_EXPERTS` | `1` / unset | unset | Enables the raw grouped expert GEMV prototype. It is functionally correct but slower than the default scratch-reuse path on B=1 decode. |
+| `ARLE_DSV4_GROUPED_EXPERTS` | `1` / unset | unset | Enables the raw grouped expert GEMV prototype. The current harness caches per-layer local expert weight pointer arrays and launches only indexed active experts, but remains slower than the default scratch-reuse path on B=1 decode until the raw GEMV work is replaced by real grouped GEMM/DeepGEMM. |
 | `ARLE_DSV4_COMBINE_DTYPE` | `bf16`, `fp8`, unset | `bf16` | Selects the return-side MoE combine exchange payload. `fp8` is validated as an opt-in experiment but is not faster than the BF16 default on the current 8xH20 trace. |
 
 Current DSv4 8-rank validation command shape:

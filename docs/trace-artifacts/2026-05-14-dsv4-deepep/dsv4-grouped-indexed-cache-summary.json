@@ -1,0 +1,85 @@
+{
+  "run": "dsv4-grouped-indexed-cache",
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle-perf-latest",
+  "build": {
+    "command": "cargo build --release -p infer --bin infer --features cuda,nccl",
+    "status": "pass",
+    "target_dir": "/root/arle/target",
+    "duration": "5m38s"
+  },
+  "profile": {
+    "moe_backend": "deepep",
+    "incremental_kv": true,
+    "grouped_experts": true,
+    "kv_cache_dtype": "fp8",
+    "gpus": 8,
+    "model_path": "/root/DeepSeek-V4-Flash"
+  },
+  "implementation": {
+    "summary": "The gated grouped expert prototype now caches full per-layer local expert weight pointer arrays and uploads only compact active expert indices, offsets, and counts per step. The CUDA grouped GEMV kernels launch over active experts and use expert_indices to index the cached full pointer arrays.",
+    "default_enabled": false,
+    "reason_default_disabled": "Still slower than the default scratch-reuse per-expert path on B=1 decode; kept as a harness for replacing raw GEMV with real grouped GEMM/DeepGEMM."
+  },
+  "trace_off_results": [
+    {
+      "case": "warmup",
+      "prompt_tokens": 14,
+      "completion_tokens": 2,
+      "latency_s": 1.445967435836792,
+      "completion_tok_s": 1.3831570133822448,
+      "output": "1073"
+    },
+    {
+      "case": "math_37x29_process",
+      "prompt_tokens": 15,
+      "completion_tokens": 8,
+      "latency_s": 2.3691482543945312,
+      "completion_tok_s": 3.3767409807135564,
+      "output": "好的，我们一起来计算 37 ×"
+    },
+    {
+      "case": "math_58p67_process",
+      "prompt_tokens": 15,
+      "completion_tokens": 8,
+      "latency_s": 2.398231029510498,
+      "completion_tok_s": 3.3357920490391106,
+      "output": "好的，我们一起来计算58加67"
+    },
+    {
+      "case": "write_city",
+      "prompt_tokens": 14,
+      "completion_tokens": 10,
+      "latency_s": 2.685535430908203,
+      "completion_tok_s": 3.7236522314725775,
+      "output": "霓灯吻碎江，夜城醉成"
+    },
+    {
+      "case": "write_perf",
+      "prompt_tokens": 18,
+      "completion_tokens": 8,
+      "latency_s": 2.713772773742676,
+      "completion_tok_s": 2.947925514399966,
+      "output": "极速推理，秒级洞察。"
+    }
+  ],
+  "comparison": {
+    "previous_grouped_all_or_active_latency_s": {
+      "math_37x29_process": "2.52-3.58",
+      "math_58p67_process": "2.57-3.48",
+      "write_city": "2.85-4.56"
+    },
+    "indexed_active_cached_ptrs_latency_s": {
+      "math_37x29_process": 2.3691482543945312,
+      "math_58p67_process": 2.398231029510498,
+      "write_city": 2.685535430908203
+    },
+    "trace_phase_p50_ms": {
+      "ffn_deepep_local_experts": 1.196,
+      "ffn_total": 3.853,
+      "ffn_deepep_dispatch_combine": 3.325,
+      "attn_total": 1.132
+    }
+  },
+  "conclusion": "The pointer-cache/indexed-active change makes the grouped expert harness measurably better than earlier raw grouped variants, but it is not a production win yet. The production route remains the default scratch-reuse path until the grouped harness is backed by true grouped GEMM/DeepGEMM and DeepEP-style communication overlap."
+}
