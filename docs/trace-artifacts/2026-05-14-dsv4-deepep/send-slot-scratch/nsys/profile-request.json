@@ -1,0 +1,21 @@
+{
+  "status": 200,
+  "total_s": 1.352673,
+  "ttft_s": 1.160856,
+  "usage": {
+    "prompt_tokens": 23,
+    "completion_tokens": 2,
+    "total_tokens": 25
+  },
+  "text": "霓灯",
+  "chunks": [
+    {
+      "t_ms": 1160.856,
+      "text": "霓"
+    },
+    {
+      "t_ms": 1352.552,
+      "text": "灯"
+    }
+  ]
+}

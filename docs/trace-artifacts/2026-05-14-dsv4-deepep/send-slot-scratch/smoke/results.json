@@ -1,0 +1,56 @@
+{
+  "results": [
+    {
+      "label": "warmup",
+      "status": 200,
+      "total_s": 0.458598,
+      "ttft_s": 0.356601,
+      "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 2,
+        "total_tokens": 14
+      },
+      "completion_tok_s": 4.361,
+      "text": "2"
+    },
+    {
+      "label": "math37x29",
+      "status": 200,
+      "total_s": 1.5059,
+      "ttft_s": 0.375517,
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 12,
+        "total_tokens": 29
+      },
+      "completion_tok_s": 7.969,
+      "text": "37 × 29 = 1073。  \n解释："
+    },
+    {
+      "label": "math58p67",
+      "status": 200,
+      "total_s": 1.510623,
+      "ttft_s": 0.380654,
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 12,
+        "total_tokens": 29
+      },
+      "completion_tok_s": 7.944,
+      "text": "答案：125  \n解释：先算 50+60"
+    },
+    {
+      "label": "write_perf",
+      "status": 200,
+      "total_s": 1.235539,
+      "ttft_s": 0.317052,
+      "usage": {
+        "prompt_tokens": 13,
+        "completion_tokens": 10,
+        "total_tokens": 23
+      },
+      "completion_tok_s": 8.094,
+      "text": "算力奔涌，逻辑如刃，在"
+    }
+  ]
+}

@@ -77,6 +77,7 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 #[derive(Default)]
 pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
+    pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
@@ -103,6 +104,13 @@ pub(crate) struct DeepseekDispatchRuntimeScratch {
     pub(crate) local_counts: CudaSlice<i32>,
     pub(crate) local_offsets: CudaSlice<i32>,
     pub(crate) local_cursors: CudaSlice<i32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekSendRouteRuntimeScratch {
+    pub(crate) capacity_routes: usize,
+    pub(crate) send_token: CudaSlice<i32>,
+    pub(crate) send_route_slot: CudaSlice<i32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -344,6 +352,29 @@ impl DeepseekMoeRuntimeCache {
             .as_mut()
             .expect("DeepSeek V4 route combine scratch allocated"))
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_send_route_scratch<'a>(
+    slot: &'a mut Option<DeepseekSendRouteRuntimeScratch>,
+    ctx: &DeviceContext,
+    capacity_routes: usize,
+) -> Result<&'a mut DeepseekSendRouteRuntimeScratch> {
+    let capacity_routes = capacity_routes.max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| scratch.capacity_routes < capacity_routes)
+        .unwrap_or(true);
+    if needs_alloc {
+        *slot = Some(DeepseekSendRouteRuntimeScratch {
+            capacity_routes,
+            send_token: ctx.stream.alloc_zeros::<i32>(capacity_routes)?,
+            send_route_slot: ctx.stream.alloc_zeros::<i32>(capacity_routes)?,
+        });
+    }
+    Ok(slot
+        .as_mut()
+        .expect("DeepSeek V4 send-route scratch allocated"))
 }
 
 #[cfg(feature = "cuda")]

@@ -445,3 +445,15 @@ all-reduce at 8.166 ms, hybrid attention at 7.825 ms, and NCCL all-gather at
 6.294 ms. The conclusion is unchanged but sharper: a single B=1 token is slow
 because synchronization, allocation/free, launch churn, and many small
 MoE/NCCL boundaries dominate the useful attention and GEMV work.
+
+`send-slot-scratch/` validates the follow-up cleanup that moves DeepEP
+send-token and send-route-slot buffers into reusable scratch and removes the
+unused `expert_token` output from `dsv4_pack_received_experts_cuda`. Trace-off
+math/writing smokes remained normal at 7.94-8.09 completion tok/s. The
+single-token nsys window again returned `霓灯` and captured one 8-rank decode
+wave, now 191.152 ms wall. The stable allocator signal improved: decode-only
+`cuMemAllocAsync` calls dropped from 11,980 to 11,097 and `cuMemFreeAsync`
+calls dropped from 11,988 to 11,105. Remaining allocator pressure is still
+large, so the next scratch/graph work should target recv/local route buffers
+and the return-side combine path rather than this already-removed send-route
+metadata.

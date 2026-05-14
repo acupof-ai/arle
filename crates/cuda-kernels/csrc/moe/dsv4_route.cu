@@ -505,7 +505,6 @@ __global__ void dsv4_pack_received_experts_kernel(
     const int32_t *__restrict__ offsets,
     int32_t *__restrict__ cursors,
     uint16_t *__restrict__ expert_hidden,
-    int32_t *__restrict__ expert_token,
     float *__restrict__ expert_weight,
     int32_t *__restrict__ expert_route_slot,
     int num_routes,
@@ -521,7 +520,6 @@ __global__ void dsv4_pack_received_experts_kernel(
   __shared__ int slot;
   if (threadIdx.x == 0) {
     slot = offsets[local] + atomicAdd(&cursors[local], 1);
-    expert_token[slot] = received_meta[meta_base];
     expert_weight[slot] = dsv4_route_i32_bits_to_f32(received_meta[meta_base + 2]);
     expert_route_slot[slot] = route;
   }
@@ -540,7 +538,6 @@ extern "C" CUresult dsv4_pack_received_experts_cuda(
     const int32_t *offsets,
     int32_t *cursors,
     uint16_t *expert_hidden,
-    int32_t *expert_token,
     float *expert_weight,
     int32_t *expert_route_slot,
     int num_routes,
@@ -554,9 +551,8 @@ extern "C" CUresult dsv4_pack_received_experts_cuda(
   }
   if (num_routes == 0) return CUDA_SUCCESS;
   dsv4_pack_received_experts_kernel<<<num_routes, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
-      received_hidden, received_meta, offsets, cursors, expert_hidden, expert_token,
-      expert_weight, expert_route_slot, num_routes, hidden_dim, local_expert_start,
-      experts_per_rank);
+      received_hidden, received_meta, offsets, cursors, expert_hidden, expert_weight,
+      expert_route_slot, num_routes, hidden_dim, local_expert_start, experts_per_rank);
   return (CUresult)cudaGetLastError();
 }
 

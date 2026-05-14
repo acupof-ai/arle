@@ -123,7 +123,6 @@ unsafe extern "C" {
         offsets: *const i32,
         cursors: *mut i32,
         expert_hidden: *mut Half,
-        expert_token: *mut i32,
         expert_weight: *mut f32,
         expert_route_slot: *mut i32,
         num_routes: i32,

@@ -71,6 +71,13 @@ Related governance docs:
   `cuMemAllocAsync`/`cuMemFreeAsync` call count fell from 136,825 to 111,531 in
   the 8-token Nsight window. Remaining bottlenecks are still stream sync,
   return-side NCCL send/recv, and local expert GEMV/GEMM.
+- Reused DSv4 DeepEP send-route token/slot buffers across decode steps and
+  removed the unused `expert_token` output from `dsv4_pack_received_experts`.
+  The 8xH20 trace-off math/writing smoke remained normal at 7.94-8.09
+  completion tok/s, while the single-token nsys window reduced decode-only
+  `cuMemAllocAsync` calls from 11,980 to 11,097 and `cuMemFreeAsync` calls from
+  11,988 to 11,105. Remaining allocator pressure now sits in recv/local route
+  buffers plus combine scratch and still needs a broader lifetime/graph pass.
 - Optimized the gated DSv4 grouped expert prototype behind
   `ARLE_DSV4_GROUPED_EXPERTS=1` by caching per-layer local expert weight
   pointer arrays and launching indexed active experts instead of rebuilding
