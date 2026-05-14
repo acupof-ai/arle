@@ -298,7 +298,12 @@ impl ModelForward for Qwen35Model {
                 ),
             )
             .saturating_add(max_batch_size.saturating_mul(4).saturating_mul(i32_bytes))
-            .saturating_add(max_batch_size.saturating_mul(f32_bytes));
+            .saturating_add(max_batch_size.saturating_mul(f32_bytes))
+            .saturating_add(
+                super::batch_decode::ASYNC_READBACK_SLOTS
+                    .saturating_mul(max_batch_size)
+                    .saturating_mul(i32_bytes + f32_bytes),
+            );
 
         let prefill_hidden_dims = 6usize
             .saturating_mul(hidden)
@@ -689,6 +694,7 @@ impl ModelForward for Qwen35Model {
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Option<Vec<u32>>> {
+        decode_ctx.invalidate_sampled_token_handoff();
         let logits = match decode_ctx.logits_batch.as_ref() {
             Some(l) if l.seq_len > 0 => l,
             _ => return Ok(None),
@@ -701,25 +707,9 @@ impl ModelForward for Qwen35Model {
             &mut decode_ctx.logprobs_gpu,
             batch_size,
         )?;
-        self.ctx.sync()?;
-        crate::ops::argmax_batch_readback_into(
-            &self.ctx,
-            &decode_ctx.argmax_out,
-            &mut decode_ctx.argmax_host,
-            batch_size,
-        )?;
-        let lp_tmp = self
-            .ctx
-            .stream
-            .clone_dtoh(&decode_ctx.logprobs_gpu)
-            .map_err(|e| anyhow::anyhow!("D2H logprobs: {e}"))?;
-        decode_ctx.logprobs_host[..batch_size].copy_from_slice(&lp_tmp[..batch_size]);
-        Ok(Some(
-            decode_ctx.argmax_host[..batch_size]
-                .iter()
-                .map(|&x| x as u32)
-                .collect(),
-        ))
+        let async_slot_idx = decode_ctx.start_greedy_readback_async(&self.ctx, batch_size)?;
+        self.ctx.sync_copy()?;
+        decode_ctx.poll_greedy_readback(async_slot_idx, batch_size)
     }
 
     fn sample_batch_greedy_launch(
@@ -739,35 +729,22 @@ impl ModelForward for Qwen35Model {
             &mut decode_ctx.logprobs_gpu,
             batch_size,
         )?;
-        Ok(Some(0))
+        decode_ctx.stage_sampled_tokens_for_next_step(&self.ctx, slot_indices)?;
+        let async_slot_idx = decode_ctx.start_greedy_readback_async(&self.ctx, batch_size)?;
+        Ok(Some(async_slot_idx))
     }
 
     fn sample_batch_greedy_readback(
         &self,
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
-        _async_slot_idx: Option<usize>,
+        async_slot_idx: Option<usize>,
     ) -> Result<Option<Vec<u32>>> {
         let batch_size = slot_indices.len();
-        self.ctx.sync()?;
-        crate::ops::argmax_batch_readback_into(
-            &self.ctx,
-            &decode_ctx.argmax_out,
-            &mut decode_ctx.argmax_host,
-            batch_size,
-        )?;
-        let lp_tmp = self
-            .ctx
-            .stream
-            .clone_dtoh(&decode_ctx.logprobs_gpu)
-            .map_err(|e| anyhow::anyhow!("D2H logprobs: {e}"))?;
-        decode_ctx.logprobs_host[..batch_size].copy_from_slice(&lp_tmp[..batch_size]);
-        Ok(Some(
-            decode_ctx.argmax_host[..batch_size]
-                .iter()
-                .map(|&x| x as u32)
-                .collect(),
-        ))
+        let Some(async_slot_idx) = async_slot_idx else {
+            anyhow::bail!("Qwen3.5 greedy readback missing async slot");
+        };
+        decode_ctx.poll_greedy_readback(async_slot_idx, batch_size)
     }
 
     fn prepare_batch_sampling_fallback(
@@ -776,6 +753,7 @@ impl ModelForward for Qwen35Model {
         slot_indices: &[usize],
         decode_ctx: &mut Self::DecodeContext,
     ) -> Result<()> {
+        decode_ctx.invalidate_sampled_token_handoff();
         let logits = match decode_ctx.logits_batch.as_ref() {
             Some(logits) if logits.seq_len >= slot_indices.len() => logits,
             _ => return Ok(()),

@@ -9,19 +9,21 @@ use anyhow::Result;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaEvent, CudaSlice, DevicePtr, DevicePtrMut, PinnedHostSlice};
 use log::info;
 
 use super::forward::Qwen35State;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
-use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
+use crate::model::{DecodeContextOps, ModelForward};
 use crate::ops;
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
 use cuda_kernels::prelude::{DeviceContext, HiddenStates, PagedKVPool, TileLangDecodeMetadata};
+
+pub(super) const ASYNC_READBACK_SLOTS: usize = 4;
 
 // ── Sub-structs ─────────────────────────────────────────────────────────────
 
@@ -140,10 +142,22 @@ pub struct BatchDecodeBuffers35 {
     pub(super) argmax_host: Vec<i32>,
     pub(super) logprobs_gpu: CudaSlice<f32>,
     pub(super) logprobs_host: Vec<f32>,
+    async_argmax_gpu_slots: Vec<CudaSlice<i32>>,
+    async_logprobs_gpu_slots: Vec<CudaSlice<f32>>,
+    async_argmax_host_slots: Vec<PinnedHostSlice<i32>>,
+    async_logprobs_host_slots: Vec<PinnedHostSlice<f32>>,
+    async_readback_event_slots: Vec<CudaEvent>,
+    async_readback_in_flight_slots: Vec<bool>,
+    async_readback_batch_sizes: Vec<usize>,
+    next_async_slot: usize,
 
     // ── Token IDs ──
     token_ids_gpu: CudaSlice<i32>,
     token_ids_scratch: Vec<i32>,
+    /// Slot owner for each row staged from `argmax_out` into `token_ids_gpu`.
+    sampled_tokens_owner: Vec<Option<usize>>,
+    sampled_tokens_len: usize,
+    sampled_tokens_valid: bool,
 
     // ── TileLang metadata (for full attention layers) ──
     pub(crate) metadata: TileLangDecodeMetadata,
@@ -236,6 +250,35 @@ impl BatchDecodeBuffers35 {
             act_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
         };
 
+        let mut async_argmax_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_logprobs_gpu_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_argmax_host_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_logprobs_host_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        let mut async_readback_event_slots = Vec::with_capacity(ASYNC_READBACK_SLOTS);
+        for slot_idx in 0..ASYNC_READBACK_SLOTS {
+            async_argmax_gpu_slots.push(
+                ctx.stream.alloc_zeros(max_batch_size).map_err(|e| {
+                    anyhow::anyhow!("Alloc qwen35 async_argmax_gpu[{slot_idx}]: {e}")
+                })?,
+            );
+            async_logprobs_gpu_slots.push(ctx.stream.alloc_zeros(max_batch_size).map_err(|e| {
+                anyhow::anyhow!("Alloc qwen35 async_logprobs_gpu[{slot_idx}]: {e}")
+            })?);
+            async_argmax_host_slots.push(unsafe {
+                ctx.ctx.alloc_pinned(max_batch_size).map_err(|e| {
+                    anyhow::anyhow!("Alloc qwen35 pinned argmax_host[{slot_idx}]: {e}")
+                })?
+            });
+            async_logprobs_host_slots.push(unsafe {
+                ctx.ctx.alloc_pinned(max_batch_size).map_err(|e| {
+                    anyhow::anyhow!("Alloc qwen35 pinned logprobs_host[{slot_idx}]: {e}")
+                })?
+            });
+            async_readback_event_slots.push(ctx.ctx.new_event(None).map_err(|e| {
+                anyhow::anyhow!("Alloc qwen35 async readback event[{slot_idx}]: {e}")
+            })?);
+        }
+
         Ok(Self {
             common,
             attn,
@@ -253,12 +296,23 @@ impl BatchDecodeBuffers35 {
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc logprobs_gpu: {e}"))?,
             logprobs_host: vec![0.0f32; max_batch_size],
+            async_argmax_gpu_slots,
+            async_logprobs_gpu_slots,
+            async_argmax_host_slots,
+            async_logprobs_host_slots,
+            async_readback_event_slots,
+            async_readback_in_flight_slots: vec![false; ASYNC_READBACK_SLOTS],
+            async_readback_batch_sizes: vec![0; ASYNC_READBACK_SLOTS],
+            next_async_slot: 0,
 
             token_ids_gpu: ctx
                 .stream
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc token_ids_gpu: {e}"))?,
             token_ids_scratch: Vec::with_capacity(max_batch_size),
+            sampled_tokens_owner: vec![None; max_batch_size],
+            sampled_tokens_len: 0,
+            sampled_tokens_valid: false,
 
             metadata: TileLangDecodeMetadata::new(
                 ctx,
@@ -297,6 +351,221 @@ impl BatchDecodeBuffers35 {
         self.attn.set_batch_size(bs);
         self.recurrent.set_batch_size(bs);
         self.mlp.set_batch_size(bs);
+    }
+
+    pub(crate) fn prepare_decode_token_ids(
+        &mut self,
+        ctx: &DeviceContext,
+        tokens: &[u32],
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        if tokens.len() != slot_indices.len() {
+            anyhow::bail!(
+                "qwen35 decode token/slot length mismatch: tokens={} slots={}",
+                tokens.len(),
+                slot_indices.len()
+            );
+        }
+        if !self.sampled_tokens_valid || self.sampled_tokens_len == 0 {
+            return self.upload_token_ids(ctx, tokens);
+        }
+
+        let mut src_rows = Vec::with_capacity(slot_indices.len());
+        let mut missing_sampled_rows = false;
+        for &slot_idx in slot_indices {
+            let src = self.sampled_tokens_owner[..self.sampled_tokens_len]
+                .iter()
+                .position(|owner| *owner == Some(slot_idx));
+            if src.is_none() {
+                missing_sampled_rows = true;
+            }
+            src_rows.push(src);
+        }
+
+        if missing_sampled_rows {
+            self.upload_token_ids(ctx, tokens)?;
+        }
+        let order_unchanged = !missing_sampled_rows
+            && src_rows
+                .iter()
+                .enumerate()
+                .all(|(dst_row, src_row)| *src_row == Some(dst_row));
+        if order_unchanged {
+            self.invalidate_sampled_token_handoff();
+            return Ok(());
+        }
+
+        for (dst_row, src_row) in src_rows.into_iter().enumerate() {
+            let Some(src_row) = src_row else {
+                continue;
+            };
+            let src = self.argmax_out.slice(src_row..=src_row);
+            let mut dst = self.token_ids_gpu.slice_mut(dst_row..=dst_row);
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow::anyhow!("qwen35 D2D sampled token remap failed: {e}"))?;
+        }
+        self.invalidate_sampled_token_handoff();
+        Ok(())
+    }
+
+    pub(crate) fn stage_sampled_tokens_for_next_step(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        let batch_size = slot_indices.len();
+        let src = self.argmax_out.slice(0..batch_size);
+        let mut dst = self.token_ids_gpu.slice_mut(0..batch_size);
+        ctx.stream
+            .memcpy_dtod(&src, &mut dst)
+            .map_err(|e| anyhow::anyhow!("qwen35 D2D sampled token handoff failed: {e}"))?;
+
+        for owner in &mut self.sampled_tokens_owner {
+            *owner = None;
+        }
+        for (row, &slot_idx) in slot_indices.iter().enumerate() {
+            self.sampled_tokens_owner[row] = Some(slot_idx);
+        }
+        self.sampled_tokens_len = batch_size;
+        self.sampled_tokens_valid = true;
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_sampled_token_handoff(&mut self) {
+        self.sampled_tokens_valid = false;
+        self.sampled_tokens_len = 0;
+        for owner in &mut self.sampled_tokens_owner {
+            *owner = None;
+        }
+    }
+
+    pub(crate) fn invalidate_sampled_token_handoff_for_slot(&mut self, slot_idx: usize) {
+        for owner in &mut self.sampled_tokens_owner {
+            if *owner == Some(slot_idx) {
+                *owner = None;
+            }
+        }
+        self.sampled_tokens_valid = self.sampled_tokens_owner[..self.sampled_tokens_len]
+            .iter()
+            .any(Option::is_some);
+        if !self.sampled_tokens_valid {
+            self.sampled_tokens_len = 0;
+        }
+    }
+
+    pub(crate) fn start_greedy_readback_async(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+    ) -> Result<usize> {
+        if batch_size > self.max_batch_size {
+            anyhow::bail!(
+                "qwen35 async greedy readback batch {} exceeds max batch {}",
+                batch_size,
+                self.max_batch_size
+            );
+        }
+        let slot_idx = self.next_async_slot;
+        if self.async_readback_in_flight_slots[slot_idx] {
+            anyhow::bail!("qwen35 async greedy readback slot {slot_idx} still in flight");
+        }
+
+        let ids_src = self.argmax_out.slice(0..batch_size);
+        let mut ids_dst = self.async_argmax_gpu_slots[slot_idx].slice_mut(0..batch_size);
+        ctx.stream
+            .memcpy_dtod(&ids_src, &mut ids_dst)
+            .map_err(|e| anyhow::anyhow!("qwen35 D2D async argmax snapshot failed: {e}"))?;
+
+        let logprobs_src = self.logprobs_gpu.slice(0..batch_size);
+        let mut logprobs_dst = self.async_logprobs_gpu_slots[slot_idx].slice_mut(0..batch_size);
+        ctx.stream
+            .memcpy_dtod(&logprobs_src, &mut logprobs_dst)
+            .map_err(|e| anyhow::anyhow!("qwen35 D2D async logprobs snapshot failed: {e}"))?;
+
+        ctx.copy_waits_for_compute()?;
+        ctx.copy_stream
+            .memcpy_dtoh(
+                &self.async_argmax_gpu_slots[slot_idx].slice(0..batch_size),
+                &mut self.async_argmax_host_slots[slot_idx],
+            )
+            .map_err(|e| anyhow::anyhow!("qwen35 async D2H argmax readback: {e}"))?;
+        ctx.copy_stream
+            .memcpy_dtoh(
+                &self.async_logprobs_gpu_slots[slot_idx].slice(0..batch_size),
+                &mut self.async_logprobs_host_slots[slot_idx],
+            )
+            .map_err(|e| anyhow::anyhow!("qwen35 async D2H logprobs readback: {e}"))?;
+        self.async_readback_event_slots[slot_idx]
+            .record(&ctx.copy_stream)
+            .map_err(|e| anyhow::anyhow!("record qwen35 async greedy readback event: {e}"))?;
+
+        self.async_readback_in_flight_slots[slot_idx] = true;
+        self.async_readback_batch_sizes[slot_idx] = batch_size;
+        self.next_async_slot = (self.next_async_slot + 1) % ASYNC_READBACK_SLOTS;
+        Ok(slot_idx)
+    }
+
+    fn finish_greedy_readback(
+        &mut self,
+        slot_idx: usize,
+        batch_size: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        if slot_idx >= self.async_readback_in_flight_slots.len() {
+            anyhow::bail!("qwen35 async greedy readback slot {slot_idx} out of range");
+        }
+        if !self.async_readback_in_flight_slots[slot_idx] {
+            return Ok(None);
+        }
+
+        self.async_readback_event_slots[slot_idx]
+            .context()
+            .bind_to_thread()
+            .map_err(|e| anyhow::anyhow!("Bind CUDA context before qwen35 readback query: {e}"))?;
+        match unsafe {
+            cudarc::driver::result::event::query(
+                self.async_readback_event_slots[slot_idx].cu_event(),
+            )
+        } {
+            Ok(()) => {}
+            Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
+                return Ok(None);
+            }
+            Err(err) => {
+                self.async_readback_in_flight_slots[slot_idx] = false;
+                self.async_readback_batch_sizes[slot_idx] = 0;
+                return Err(anyhow::anyhow!(
+                    "qwen35 async greedy readback event failed: {err}"
+                ));
+            }
+        }
+
+        let batch_size = batch_size.min(self.async_readback_batch_sizes[slot_idx]);
+        let ids = self.async_argmax_host_slots[slot_idx]
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("read qwen35 pinned argmax_host: {e}"))?;
+        self.argmax_host[..batch_size].copy_from_slice(&ids[..batch_size]);
+        let logprobs = self.async_logprobs_host_slots[slot_idx]
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("read qwen35 pinned logprobs_host: {e}"))?;
+        self.logprobs_host[..batch_size].copy_from_slice(&logprobs[..batch_size]);
+
+        self.async_readback_in_flight_slots[slot_idx] = false;
+        self.async_readback_batch_sizes[slot_idx] = 0;
+        Ok(Some(
+            self.argmax_host[..batch_size]
+                .iter()
+                .map(|&x| x as u32)
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn poll_greedy_readback(
+        &mut self,
+        slot_idx: usize,
+        batch_size: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        self.finish_greedy_readback(slot_idx, batch_size)
     }
 }
 
@@ -357,6 +626,10 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         self.force_eager_once = true;
     }
 
+    fn invalidate_sampled_token_handoff_for_slot(&mut self, slot_idx: usize) {
+        BatchDecodeBuffers35::invalidate_sampled_token_handoff_for_slot(self, slot_idx);
+    }
+
     fn logprobs_host(&self) -> &[f32] {
         &self.logprobs_host
     }
@@ -373,7 +646,7 @@ impl Qwen35Model {
         use crate::model::DecodeContextOps;
 
         bufs.set_batch_size(tokens.len());
-        bufs.upload_token_ids(&self.ctx, tokens)?;
+        bufs.prepare_decode_token_ids(&self.ctx, tokens, slot_indices)?;
         let reallocated = bufs.update_metadata(&self.ctx, paged_kv_pool, slot_indices)?;
         if reallocated {
             bufs.invalidate_graph_cache(tokens.len());

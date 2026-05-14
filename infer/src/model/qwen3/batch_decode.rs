@@ -826,6 +826,10 @@ impl BatchDecodeBuffers {
         if !self.async_readback_in_flight_slots[slot_idx] {
             return Ok(None);
         }
+        self.async_readback_event_slots[slot_idx]
+            .context()
+            .bind_to_thread()
+            .map_err(|e| anyhow::anyhow!("Bind CUDA context before qwen3 readback query: {e}"))?;
         match unsafe {
             cudarc::driver::result::event::query(
                 self.async_readback_event_slots[slot_idx].cu_event(),

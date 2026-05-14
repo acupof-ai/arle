@@ -868,7 +868,7 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             0
         };
-        if self.pending_decode.is_some() {
+        if self.pending_decode.is_some() || self.deferred_decode_requires_readback_before_launch() {
             self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
             self.metrics
                 .observe_scheduler_step(readback_us as f64 / 1_000_000.0);

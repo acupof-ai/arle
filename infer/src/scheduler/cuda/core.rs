@@ -778,6 +778,15 @@ impl<M: ModelForward> Scheduler<M> {
             || self.pending_prefill.is_some()
     }
 
+    pub(super) fn deferred_decode_requires_readback_before_launch(&self) -> bool {
+        self.deferred_decode_emit.as_ref().is_some_and(|pending| {
+            pending.decode_indices.iter().any(|&slot_idx| {
+                self.request(slot_idx)
+                    .is_some_and(|req| req.distributed.is_some())
+            })
+        })
+    }
+
     pub(super) fn slot_has_pending_gpu_work(&self, slot_idx: usize) -> bool {
         self.pending_decode.as_ref().is_some_and(|pending| {
             pending.decode_indices.contains(&slot_idx)

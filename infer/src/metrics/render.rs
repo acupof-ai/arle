@@ -761,6 +761,16 @@ impl ServerMetrics {
                 runtime.h2d_latency_count,
             ),
             (
+                "infer_runtime_d2h_latency_count",
+                "Observed device-to-host latency samples.",
+                runtime.d2h_latency_count,
+            ),
+            (
+                "infer_runtime_d2h_wait_count",
+                "Observed scheduler readback wait samples.",
+                runtime.d2h_wait_count,
+            ),
+            (
                 "infer_scheduler_numa_route_cost",
                 "NUMA routing cost selected for the most recent request.",
                 runtime.numa_route_cost_last,
@@ -809,6 +819,44 @@ impl ServerMetrics {
             )
             .unwrap();
         }
+        out.push_str(
+            "# HELP infer_runtime_d2h_latency_microseconds Device-to-host readback latency.\n",
+        );
+        out.push_str("# TYPE infer_runtime_d2h_latency_microseconds gauge\n");
+        for (stat, value) in [
+            ("last", runtime.d2h_latency_last_us),
+            ("max", runtime.d2h_latency_max_us),
+        ] {
+            writeln!(
+                out,
+                "infer_runtime_d2h_latency_microseconds{{{labels}stat=\"{stat}\",}} {value}"
+            )
+            .unwrap();
+        }
+        out.push_str(
+            "# HELP infer_runtime_d2h_wait_microseconds Scheduler time spent polling or completing D2H readback.\n",
+        );
+        out.push_str("# TYPE infer_runtime_d2h_wait_microseconds gauge\n");
+        for (stat, value) in [
+            ("last", runtime.d2h_wait_last_us),
+            ("max", runtime.d2h_wait_max_us),
+        ] {
+            writeln!(
+                out,
+                "infer_runtime_d2h_wait_microseconds{{{labels}stat=\"{stat}\",}} {value}"
+            )
+            .unwrap();
+        }
+        out.push_str(
+            "# HELP infer_runtime_readback_poll_not_ready_total Non-blocking decode readback polls that found the D2H event not ready.\n",
+        );
+        out.push_str("# TYPE infer_runtime_readback_poll_not_ready_total counter\n");
+        writeln!(
+            out,
+            "infer_runtime_readback_poll_not_ready_total{{{labels}}} {}",
+            runtime.readback_poll_not_ready_total
+        )
+        .unwrap();
         out.push_str(
             "# HELP infer_scheduler_numa_route_total NUMA router decisions by locality outcome.\n",
         );
@@ -1336,6 +1384,13 @@ impl ServerMetrics {
             "h2d_latency_last_us": runtime.h2d_latency_last_us,
             "h2d_latency_max_us": runtime.h2d_latency_max_us,
             "h2d_latency_count": runtime.h2d_latency_count,
+            "d2h_latency_last_us": runtime.d2h_latency_last_us,
+            "d2h_latency_max_us": runtime.d2h_latency_max_us,
+            "d2h_latency_count": runtime.d2h_latency_count,
+            "d2h_wait_last_us": runtime.d2h_wait_last_us,
+            "d2h_wait_max_us": runtime.d2h_wait_max_us,
+            "d2h_wait_count": runtime.d2h_wait_count,
+            "readback_poll_not_ready_total": runtime.readback_poll_not_ready_total,
             "numa_route_local_total": runtime.numa_route_local_total,
             "numa_route_cross_total": runtime.numa_route_cross_total,
             "numa_route_unknown_total": runtime.numa_route_unknown_total,
@@ -1492,7 +1547,7 @@ impl ServerMetrics {
         let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
         let runtime = self.runtime_topology_snapshot();
         let pipeline_suffix = format!(
-            " preprocess=depth:{preprocess_depth},wait_us:{preprocess_wait_us},tokenize_us:{preprocess_tokenize_us} pipeline=snapshot_us:{pipeline_snapshot_us},cpu_plan_us:{pipeline_cpu_plan_us},gpu_wait_us:{pipeline_gpu_completion_wait_us},gpu_q:{pipeline_gpu_queue_depth},plan_accept:{pipeline_plan_accept},plan_stale:{pipeline_plan_stale} runtime_topology=numa:{},gpu:{},worker_numa:{},worker_cpus:{},pre_workers:{},detok_workers:{},h2d_last_us:{},numa_route=local:{},cross:{},unknown:{},migrate:{},rebalance:{}",
+            " preprocess=depth:{preprocess_depth},wait_us:{preprocess_wait_us},tokenize_us:{preprocess_tokenize_us} pipeline=snapshot_us:{pipeline_snapshot_us},cpu_plan_us:{pipeline_cpu_plan_us},gpu_wait_us:{pipeline_gpu_completion_wait_us},gpu_q:{pipeline_gpu_queue_depth},plan_accept:{pipeline_plan_accept},plan_stale:{pipeline_plan_stale} runtime_topology=numa:{},gpu:{},worker_numa:{},worker_cpus:{},pre_workers:{},detok_workers:{},h2d_last_us:{},d2h_last_us:{},d2h_wait_us:{},readback_not_ready:{},numa_route=local:{},cross:{},unknown:{},migrate:{},rebalance:{}",
             runtime.numa_nodes,
             runtime.gpus,
             runtime.worker_numa_node,
@@ -1500,6 +1555,9 @@ impl ServerMetrics {
             runtime.preprocess_workers,
             runtime.detokenizer_workers,
             runtime.h2d_latency_last_us,
+            runtime.d2h_latency_last_us,
+            runtime.d2h_wait_last_us,
+            runtime.readback_poll_not_ready_total,
             runtime.numa_route_local_total,
             runtime.numa_route_cross_total,
             runtime.numa_route_unknown_total,

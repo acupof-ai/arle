@@ -445,6 +445,25 @@ CUDA_HOME=/usr/local/cuda \
 
 ### P2: Readback unification
 
+Status:
+
+- Qwen3 remains the reference async greedy readback implementation:
+  argmax/logprob outputs are snapshotted, copied D2H on the copy stream, and
+  polled through a model-owned event ring.
+- Qwen3.5 now uses the same async D2H pattern for greedy batched decode:
+  `sample_batch_greedy_launch()` enqueues copy-stream readback and returns the
+  ring slot, while `sample_batch_greedy_readback()` polls without a full
+  compute-stream sync. Qwen3.5 also stages sampled-token GPU handoff for the
+  one-step-ahead scheduler path. The scheduler invalidates the per-slot handoff
+  whenever distributed rank0 coordination changes the local sampled token, and
+  keeps the conservative readback-before-next-launch guard for deferred
+  distributed rows whose next decode input is not final yet.
+- `ServerMetrics` now surfaces `d2h_latency_us`, `d2h_wait_us`, and
+  `readback_poll_not_ready` through Prometheus, `/v1/stats`, and summary logs.
+- DeepSeek readback remains an explicit fallback until DSV4 correctness parity
+  is stable; the current worktree has unrelated DSV4 changes and this P2
+  tranche intentionally does not touch them.
+
 Files likely involved:
 
 - `infer/src/model/qwen3/batch_decode.rs`
@@ -464,6 +483,22 @@ Exit gate:
 
 - No per-step full stream sync remains in the hot sampled-token path for
   Qwen3. Qwen3.5/DeepSeek exceptions must be logged as explicit fallback.
+
+GPU verification TODO for CUDA Codex:
+
+```bash
+CUDARC_CUDA_VERSION=13010 \
+  cargo check -p infer --no-default-features --features cuda,no-cuda
+
+CUDA_HOME=/usr/local/cuda \
+  cargo test --release -p infer --features cuda --test e2e_qwen35 -- --nocapture
+
+scripts/profile_nsys_signal.sh pipeline-d2h-readback-qwen35 \
+  --server-args "--model-path infer/models/Qwen3.5-4B --port 8000 --max-seq-len 8192" \
+  --fast \
+  --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3.5-4B
+```
 
 ### P3: Scheduler pipeline handles
 

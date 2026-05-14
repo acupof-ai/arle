@@ -14,6 +14,8 @@ pub(in crate::scheduler::cuda) struct PendingDecode {
     pub greedy_launched: bool,
     /// Model-owned async readback ring slot for the in-flight greedy sample.
     pub async_slot_idx: Option<usize>,
+    /// Timestamp taken after the model enqueued the async D2H readback.
+    pub readback_started_at: Option<std::time::Instant>,
     /// True when the launch was routed through the Phase 2 speculative decode
     /// verifier path. P2.3 is restricted to a single-token greedy canary; K-token
     /// speculation must use separate pending verifier metadata.

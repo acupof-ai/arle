@@ -219,6 +219,7 @@ impl<M: ModelForward> Scheduler<M> {
             slot_indices,
             greedy_launched,
             async_slot_idx,
+            readback_started_at: greedy_launched.then(std::time::Instant::now),
             speculative,
             decode_spans,
             mixed_prefill,
@@ -799,6 +800,11 @@ impl<M: ModelForward> Scheduler<M> {
                     continue;
                 }
             };
+            if token != local_token
+                && let Some(decode_ctx) = self.decode_bufs.as_mut()
+            {
+                decode_ctx.invalidate_sampled_token_handoff_for_slot(slot_idx);
+            }
             if let Some(req) = self.request_mut(slot_idx) {
                 req.trace_context = decode_trace_contexts
                     .get(&slot_idx)
@@ -871,12 +877,19 @@ impl<M: ModelForward> Scheduler<M> {
         if let Some(pending) = self.deferred_decode_emit.take() {
             let spec_readback_started = pending.speculative.then(std::time::Instant::now);
             let decode_ctx = self.decode_bufs.as_mut().unwrap();
+            let readback_poll_started = std::time::Instant::now();
             match self.model.sample_batch_greedy_readback(
                 &pending.slot_indices,
                 decode_ctx,
                 pending.async_slot_idx,
             ) {
                 Ok(Some(tokens)) => {
+                    self.metrics
+                        .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
+                    if let Some(started_at) = pending.readback_started_at {
+                        self.metrics
+                            .observe_d2h_latency_us(started_at.elapsed().as_micros() as u64);
+                    }
                     let logprobs_host =
                         Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx).to_vec());
                     self.apply_sampled_decode_tokens(
@@ -887,10 +900,17 @@ impl<M: ModelForward> Scheduler<M> {
                     );
                 }
                 Ok(None) => {
+                    self.metrics
+                        .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
+                    self.metrics.record_readback_poll_not_ready();
                     self.deferred_decode_emit = Some(pending);
                     return;
                 }
-                Err(e) => self.finish_pending_decode_with_error(pending, e),
+                Err(e) => {
+                    self.metrics
+                        .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
+                    self.finish_pending_decode_with_error(pending, e);
+                }
             }
         }
 
@@ -900,12 +920,19 @@ impl<M: ModelForward> Scheduler<M> {
         let spec_readback_started = pending.speculative.then(std::time::Instant::now);
         if pending.greedy_launched {
             let decode_ctx = self.decode_bufs.as_mut().unwrap();
+            let readback_poll_started = std::time::Instant::now();
             match self.model.sample_batch_greedy_readback(
                 &pending.slot_indices,
                 decode_ctx,
                 pending.async_slot_idx,
             ) {
                 Ok(Some(tokens)) => {
+                    self.metrics
+                        .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
+                    if let Some(started_at) = pending.readback_started_at {
+                        self.metrics
+                            .observe_d2h_latency_us(started_at.elapsed().as_micros() as u64);
+                    }
                     let logprobs_host =
                         Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx).to_vec());
                     self.apply_sampled_decode_tokens(
@@ -916,9 +943,16 @@ impl<M: ModelForward> Scheduler<M> {
                     );
                 }
                 Ok(None) => {
+                    self.metrics
+                        .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
+                    self.metrics.record_readback_poll_not_ready();
                     self.deferred_decode_emit = Some(pending);
                 }
-                Err(e) => self.finish_pending_decode_with_error(pending, e),
+                Err(e) => {
+                    self.metrics
+                        .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
+                    self.finish_pending_decode_with_error(pending, e);
+                }
             }
         } else {
             let mut live_decode_indices = Vec::with_capacity(pending.decode_indices.len());
@@ -946,6 +980,7 @@ impl<M: ModelForward> Scheduler<M> {
                 slot_indices: live_slot_indices,
                 greedy_launched: false,
                 async_slot_idx: None,
+                readback_started_at: None,
                 speculative: pending.speculative,
                 decode_spans: live_decode_spans,
                 mixed_prefill: pending.mixed_prefill,
