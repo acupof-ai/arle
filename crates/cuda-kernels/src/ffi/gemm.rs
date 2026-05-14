@@ -404,6 +404,44 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_fp8_route_gemv_pair_batch_cuda(
+        weight_a_ptrs: *const u64,
+        scale_a_ptrs: *const u64,
+        weight_b_ptrs: *const u64,
+        scale_b_ptrs: *const u64,
+        input: *const Half,
+        output_a: *mut Half,
+        output_b: *mut Half,
+        route_meta: *const i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        num_routes: i32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_fp4_route_gemv_pair_batch_cuda(
+        weight_a_ptrs: *const u64,
+        scale_a_ptrs: *const u64,
+        weight_b_ptrs: *const u64,
+        scale_b_ptrs: *const u64,
+        input: *const Half,
+        output_a: *mut Half,
+        output_b: *mut Half,
+        route_meta: *const i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        num_routes: i32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn q6k_gemv_cuda(
         weight: *const u8,
         input: *const Half,

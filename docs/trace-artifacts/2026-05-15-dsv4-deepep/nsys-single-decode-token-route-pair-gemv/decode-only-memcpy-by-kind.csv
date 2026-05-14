@@ -1,0 +1,3 @@
+kind,time_ms_per_rank_range,total_time_ms_all_ranges,calls,bytes
+Host-to-Device,0.28474325,2.277946,2248,440192
+Device-to-Device,0.089823375,0.718587,560,16076480

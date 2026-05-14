@@ -1,0 +1,5 @@
+2124865 2124788 Sl    1.2  0.0 nsys profile --output /root/arle-decode-hidden-scratch/docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-pair-gemv/trace --force-overwrite=true --trace cuda,nvtx,osrt --capture-range=cudaProfilerApi --capture-range-end=stop --export=sqlite --kill=none /root/arle/target/release/infer --model-path /root/DeepSeek-V4-Flash --port 18175 --num-slots 1 --max-seq-len 4096 --mem-fraction-static 0.10 --kv-cache-dtype fp8 --deepseek-distributed-layers 43
+2124876       1 Ssl   1.9  0.0 /opt/nvidia/nsight-systems/2023.2.3/target-linux-x64/nsys --start-agent --session-name=profile-infer-2124865 --shm-name=quadd-create-agent-f287826a-0091-4f08-84c1-a77b1ca60a09
+2124948 2124865 S     0.0  0.0 /opt/nvidia/nsight-systems/2023.2.3/target-linux-x64/nsys-launcher /tmp/55ef-a4ec-088b-b541 91
+2124949 2124948 Ssl   535  0.3 /root/arle/target/release/infer --model-path /root/DeepSeek-V4-Flash --port 18175 --num-slots 1 --max-seq-len 4096 --mem-fraction-static 0.10 --kv-cache-dtype fp8 --deepseek-distributed-layers 43
+2124950 2124948 S     0.0  0.0 nsys-tee 3 4 5 6
