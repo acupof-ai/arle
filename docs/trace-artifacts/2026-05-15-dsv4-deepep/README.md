@@ -30,3 +30,9 @@ Current trace set:
   alloc/free/memset calls each drop by 1,376. Remaining cost is still launch
   overhead, D2H route readback, NCCL SendRecv/AllReduce, and local expert
   FP8/FP4 GEMV.
+- [`nsys-single-token-allgather-counts/`](nsys-single-token-allgather-counts/)
+  removes the default AllGather path's redundant 32-byte send-count D2H
+  readback by deriving send and receive counts from the same all-rank count
+  matrix. The same `霓虹` output now measures a 129.768 ms decode wave, and
+  decode-only D2H calls drop from 887 to 543. The remaining count readback is
+  the 256-byte all-rank matrix.

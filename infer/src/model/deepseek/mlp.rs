@@ -1769,6 +1769,7 @@ impl DeepseekV4MoeBlock {
             trace,
         )?;
 
+        let count_exchange_mode = dsv4_count_exchange_mode()?;
         let trace = dsv4_moe_trace_begin(ctx)?;
         let experts_per_rank_i32 = i32::try_from(ep.experts_per_rank)
             .map_err(|_| anyhow::anyhow!("DeepSeek V4 experts_per_rank overflows i32"))?;
@@ -1792,10 +1793,27 @@ impl DeepseekV4MoeBlock {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route count failed: {err}"))?;
             }
         }
-        let send_rank_counts_host = ctx
-            .stream
-            .clone_dtoh(send_rank_counts)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route count D2H failed: {err}"))?;
+        let mut precomputed_recv_rank_counts_host = None;
+        let send_rank_counts_host = match count_exchange_mode {
+            Dsv4CountExchangeMode::AllGather => {
+                comm.moe_all_gather_i32(send_rank_counts, ep.world_size, all_rank_counts)?;
+                let all_counts_host = ctx.stream.clone_dtoh(all_rank_counts).map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 all rank count D2H failed: {err}")
+                })?;
+                precomputed_recv_rank_counts_host = Some(
+                    (0..ep.world_size)
+                        .map(|peer| all_counts_host[peer * ep.world_size + ep.rank])
+                        .collect::<Vec<_>>(),
+                );
+                (0..ep.world_size)
+                    .map(|peer| all_counts_host[ep.rank * ep.world_size + peer])
+                    .collect::<Vec<_>>()
+            }
+            Dsv4CountExchangeMode::SendRecv => ctx
+                .stream
+                .clone_dtoh(send_rank_counts)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route count D2H failed: {err}"))?,
+        };
         let (send_rank_offsets_i32, total_send_routes) =
             dsv4_counts_to_offsets_i32(&send_rank_counts_host, "send_rank_counts")?;
         let send_rank_offsets = dsv4_offsets_to_usize(&send_rank_offsets_i32)?;
@@ -1895,16 +1913,10 @@ impl DeepseekV4MoeBlock {
         let trace = dsv4_moe_trace_begin(ctx)?;
         let peer_offsets: Vec<usize> = (0..ep.world_size).collect();
         let one_per_peer = vec![1usize; ep.world_size];
-        let recv_rank_counts_host = match dsv4_count_exchange_mode()? {
-            Dsv4CountExchangeMode::AllGather => {
-                comm.moe_all_gather_i32(send_rank_counts, ep.world_size, all_rank_counts)?;
-                let all_counts_host = ctx.stream.clone_dtoh(all_rank_counts).map_err(|err| {
-                    anyhow::anyhow!("DeepSeek V4 all rank count D2H failed: {err}")
-                })?;
-                (0..ep.world_size)
-                    .map(|peer| all_counts_host[peer * ep.world_size + ep.rank])
-                    .collect::<Vec<_>>()
-            }
+        let recv_rank_counts_host = match count_exchange_mode {
+            Dsv4CountExchangeMode::AllGather => precomputed_recv_rank_counts_host
+                .take()
+                .expect("DeepSeek V4 AllGather rank counts precomputed"),
             Dsv4CountExchangeMode::SendRecv => {
                 comm.moe_grouped_send_recv_i32(
                     send_rank_counts,

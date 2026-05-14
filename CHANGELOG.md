@@ -159,6 +159,15 @@ Related governance docs:
   by 1,376, matching four one-token temporary buffers across 43 layers and 8
   ranks. The remaining ranked costs are launch/runtime overhead, D2H route
   readback, NCCL SendRecv/AllReduce, and local expert FP8/FP4 GEMV.
+- Removed the default DSv4 DeepEP AllGather route's redundant 32-byte
+  `send_rank_counts` host readback. The AllGather count matrix is now
+  collected before route packing and reused to derive both send and receive
+  counts; the `ARLE_DSV4_COUNT_EXCHANGE=sendrecv` fallback keeps the previous
+  readback. Real 8xH20 nsys kept the `霓虹` output, moved the single-token
+  decode wave from 135.390 ms to 129.768 ms, and reduced decode-only D2H calls
+  from 887 to 543. The remaining D2H cost is the 256-byte all-rank count matrix
+  readback, ahead of deeper device-side count-prefix or countless dispatch
+  work.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7
