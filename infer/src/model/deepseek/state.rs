@@ -155,6 +155,10 @@ impl GenerationState for DeepseekState {
         self.base.truncate_to(len)
     }
 
+    fn supports_partial_prefix(&self) -> bool {
+        false
+    }
+
     fn set_max_seq_len(&mut self, max_seq: usize) {
         self.base.set_max_seq_len(max_seq);
     }
