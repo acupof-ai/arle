@@ -1,0 +1,114 @@
+{
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle",
+  "model": "/root/DeepSeek-V4-Flash",
+  "runtime": {
+    "env": {
+      "ARLE_DSV4_MOE_BACKEND": "deepep",
+      "ARLE_DSV4_INCREMENTAL_KV": "1",
+      "INFER_CUDA_DEVICES": "0,1,2,3,4,5,6,7",
+      "ARLE_DSV4_COUNT_EXCHANGE": null,
+      "ARLE_DSV4_TRACE_LAYER": null
+    },
+    "args": [
+      "--model-path",
+      "/root/DeepSeek-V4-Flash",
+      "--port",
+      "18084",
+      "--max-seq-len",
+      "900000",
+      "--kv-cache-dtype",
+      "fp8",
+      "--num-slots",
+      "1",
+      "--deepseek-distributed-layers",
+      "43",
+      "--mem-fraction-static",
+      "0.1"
+    ]
+  },
+  "short_context_notrace": [
+    {
+      "name": "math_write_32",
+      "elapsed_s": 3.134915,
+      "prompt_tokens": 21,
+      "completion_tokens": 21,
+      "decode_tok_s": 6.699,
+      "text": "计算结果：579  \n总结：三位数加法，个十百位分别相加，满十进位。"
+    },
+    {
+      "name": "essay_64",
+      "elapsed_s": 6.126955,
+      "prompt_tokens": 18,
+      "completion_tokens": 45,
+      "decode_tok_s": 7.345,
+      "text": "高性能推理系统，如疾风掠影，毫秒间解析海数据。它融合算法优化与硬件加速，让AI决策如闪电般精准，驱动智能应用从云端到边缘，重塑效率边界。"
+    }
+  ],
+  "short_context_with_layer_trace": {
+    "note": "Per-layer trace synchronizes the CUDA stream and is not the throughput number.",
+    "phase_stats": {
+      "ffn_deepep_dispatch_combine": {
+        "count": 22704,
+        "p50_ms": 1.748,
+        "p95_ms": 2.208,
+        "max_ms": 3.137,
+        "avg_ms": 1.781
+      },
+      "ffn_deepep_count_exchange": {
+        "count": 22704,
+        "p50_ms": 0.123,
+        "p95_ms": 0.329,
+        "max_ms": 1.203,
+        "avg_ms": 0.15
+      },
+      "ffn_deepep_local_experts": {
+        "count": 22704,
+        "p50_ms": 0.45,
+        "p95_ms": 0.861,
+        "max_ms": 1.857,
+        "avg_ms": 0.342
+      },
+      "ffn_deepep_combine": {
+        "count": 22704,
+        "p50_ms": 0.678,
+        "p95_ms": 1.261,
+        "max_ms": 2.071,
+        "avg_ms": 0.629
+      },
+      "ffn_total": {
+        "count": 22704,
+        "p50_ms": 2.359,
+        "p95_ms": 2.839,
+        "max_ms": 4.01,
+        "avg_ms": 2.387
+      },
+      "attn_total": {
+        "count": 22704,
+        "p50_ms": 1.167,
+        "p95_ms": 1.677,
+        "max_ms": 2.861,
+        "avg_ms": 1.159
+      }
+    }
+  },
+  "long_context_900k": {
+    "prompt_bytes": 2699957,
+    "prompt_tokens": 899965,
+    "max_tokens": 8,
+    "result": "client_timeout",
+    "timeout_s": 300,
+    "log_evidence": [
+      "chat/completions: messages=1, prompt_bytes=2699957, max_tokens=8, stream=false",
+      "Request 2 -> slot 0 (prompt=899965 tokens, queue=0)",
+      "Request 2: prefix MISS",
+      "Request 2: chunked prefill starting (899965 effective tokens, chunk_size=16384)",
+      "Non-streaming chat request timed out after 300s"
+    ],
+    "gpu_state_after_timeout": {
+      "utilization_gpu_percent": [100, 100, 100, 100, 100, 100, 100, 100],
+      "memory_used_mib": [81455, 79023, 87535, 74639, 80783, 81263, 87375, 85039]
+    },
+    "conclusion": "The 900K true prompt enters real chunked prefill and does not complete within the current 300s non-streaming HTTP timeout. The process stays alive and GPUs remain saturated, so the blocker is long-prefill throughput rather than HTTP fanout, sampler, or decode synchronization."
+  }
+}

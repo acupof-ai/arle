@@ -118,6 +118,23 @@ Matched same-build A/B on 8xH20:
 The output content was identical across both modes for the math and writing
 smokes.
 
+## Current Throughput and 900K Context
+
+With per-layer trace disabled, the current default route (`DeepEP` MoE,
+incremental KV, count all-gather) returns normal multi-token content:
+
+| Case | Prompt tokens | Completion tokens | Latency | Completion throughput | Output |
+| --- | ---: | ---: | ---: | ---: | --- |
+| math + summary | 21 | 21 | 3.135 s | 6.70 tok/s | `计算结果：579  \n总结：三位数加法，个十百位分别相加，满十进位。` |
+| writing | 18 | 45 | 6.127 s | 7.35 tok/s | `高性能推理系统，如疾风掠影，毫秒间解析海数据。...` |
+
+A true long-context request with a 2,699,957-byte prompt admitted as 899,965
+tokens and entered chunked prefill with `chunk_size=16384`, but did not finish
+before the 300s non-streaming HTTP timeout. The service remained alive and all
+8 GPUs were at 100% utilization after the client timeout, so this is now a
+long-prefill throughput blocker rather than a sampler, HTTP fanout, or decode
+synchronization blocker.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not
@@ -125,6 +142,8 @@ the old full hidden all-reduce. In the warm trace, median `ffn_deepep_dispatch_c
 1.865 ms per layer/rank, while the overall decode step is roughly 143 ms/token. Remaining high-value
 work:
 
+- Replace chunked 900K prefill with a real high-throughput paged/varlen prefill
+  path for DSv4; current 900K true prompt exceeds the 300s HTTP timeout.
 - Replace per-expert looped GEMMs with grouped GEMM/DeepGEMM.
 - Enable CUDA Graph/PDL after allocation and dynamic NCCL paths are made graph-safe.
 - Add B>1 vectorized decode after B=1 dispatch/combine is stable.
