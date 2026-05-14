@@ -1,0 +1,264 @@
+{
+  "run": "nsys-one-token-current",
+  "decode_range_count": 8,
+  "unique_decode_threads": 8,
+  "decode_wave_count": 1,
+  "decode_waves_ms": [
+    266.02
+  ],
+  "decode_range_ms": {
+    "p50": 265.759,
+    "min": 265.308,
+    "max": 266.004
+  },
+  "request": {
+    "status": 200,
+    "total_s": 1.950393,
+    "ttft_s": 1.683753,
+    "usage": {
+      "prompt_tokens": 23,
+      "completion_tokens": 2,
+      "total_tokens": 25
+    },
+    "text": "霓灯",
+    "chunks": [
+      {
+        "t_ms": 1683.753,
+        "text": "霓"
+      },
+      {
+        "t_ms": 1950.247,
+        "text": "灯"
+      }
+    ],
+    "raw_events": [
+      {
+        "t_ms": 543.033,
+        "line": "data: {\"id\":\"chatcmpl-e7fc072c-43e7-4831-b878-058eeee1b527\",\"object\":\"chat.completion.chunk\",\"created\":1778773007,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}"
+      },
+      {
+        "t_ms": 1683.753,
+        "line": "data: {\"id\":\"chatcmpl-e7fc072c-43e7-4831-b878-058eeee1b527\",\"object\":\"chat.completion.chunk\",\"created\":1778773007,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"霓\"},\"finish_reason\":null}]}"
+      },
+      {
+        "t_ms": 1950.247,
+        "line": "data: {\"id\":\"chatcmpl-e7fc072c-43e7-4831-b878-058eeee1b527\",\"object\":\"chat.completion.chunk\",\"created\":1778773007,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"灯\"},\"finish_reason\":null}]}"
+      },
+      {
+        "t_ms": 1950.279,
+        "line": "data: {\"id\":\"chatcmpl-e7fc072c-43e7-4831-b878-058eeee1b527\",\"object\":\"chat.completion.chunk\",\"created\":1778773007,\"model\":\"DeepSeek-V4-Flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}"
+      },
+      {
+        "t_ms": 1950.302,
+        "line": "data: {\"id\":\"chatcmpl-e7fc072c-43e7-4831-b878-058eeee1b527\",\"object\":\"chat.completion.chunk\",\"created\":1778773007,\"model\":\"DeepSeek-V4-Flash\",\"usage\":{\"prompt_tokens\":23,\"completion_tokens\":2,\"total_tokens\":25}}"
+      },
+      {
+        "t_ms": 1950.318,
+        "line": "data: [DONE]"
+      }
+    ]
+  },
+  "top_kernels_per_decode_range_ms": [
+    {
+      "name": "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "ms": 30.801,
+      "count": 1032
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "ms": 11.469,
+      "count": 2920
+    },
+    {
+      "name": "dsv4_fp4_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "ms": 10.881,
+      "count": 774
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "ms": 8.166,
+      "count": 344
+    },
+    {
+      "name": "dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)",
+      "ms": 7.825,
+      "count": 328
+    },
+    {
+      "name": "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "ms": 6.294,
+      "count": 344
+    },
+    {
+      "name": "dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)",
+      "ms": 5.658,
+      "count": 344
+    },
+    {
+      "name": "dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)",
+      "ms": 5.5,
+      "count": 688
+    },
+    {
+      "name": "dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)",
+      "ms": 4.412,
+      "count": 168
+    },
+    {
+      "name": "dsv4_compressor_update_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, int, int, int, int, int, int, int, int, int, float, int, float, int, float, float, float)",
+      "ms": 1.609,
+      "count": 496
+    },
+    {
+      "name": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+      "ms": 1.088,
+      "count": 1504
+    },
+    {
+      "name": "rms_norm_batched_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)",
+      "ms": 0.432,
+      "count": 1376
+    }
+  ],
+  "top_runtime_api_per_decode_range_ms": [
+    {
+      "name": "cuStreamSynchronize",
+      "ms": 97.863,
+      "count": 21616
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "ms": 38.412,
+      "count": 11988
+    },
+    {
+      "name": "cuMemAllocAsync",
+      "ms": 23.346,
+      "count": 11980
+    },
+    {
+      "name": "cudaLaunchKernel_v7000",
+      "ms": 20.081,
+      "count": 15080
+    },
+    {
+      "name": "cuMemsetD8Async",
+      "ms": 16.18,
+      "count": 13050
+    },
+    {
+      "name": "cuMemcpyDtoHAsync_v2",
+      "ms": 7.838,
+      "count": 883
+    },
+    {
+      "name": "cudaEventRecord_v3020",
+      "ms": 3.429,
+      "count": 4136
+    },
+    {
+      "name": "cudaStreamWaitEvent_v3020",
+      "ms": 3.03,
+      "count": 3440
+    },
+    {
+      "name": "cuLaunchKernelEx",
+      "ms": 2.463,
+      "count": 1720
+    },
+    {
+      "name": "cudaStreamGetCaptureInfo_v2_v11030",
+      "ms": 2.125,
+      "count": 5200
+    },
+    {
+      "name": "cuMemcpyDtoDAsync_v2",
+      "ms": 1.519,
+      "count": 859
+    },
+    {
+      "name": "cuMemcpyHtoDAsync_v2",
+      "ms": 1.347,
+      "count": 891
+    }
+  ],
+  "top_layer_phase_p50_ms": [
+    {
+      "phase": "ffn_total",
+      "p50": 2.301,
+      "p95": 3.757,
+      "count": 3096
+    },
+    {
+      "phase": "ffn_deepep_dispatch_combine",
+      "p50": 1.75,
+      "p95": 2.709,
+      "count": 3096
+    },
+    {
+      "phase": "ffn_deepep_dispatch",
+      "p50": 0.09,
+      "p95": 0.407,
+      "count": 3096
+    },
+    {
+      "phase": "ffn_deepep_combine",
+      "p50": 0.593,
+      "p95": 1.427,
+      "count": 3096
+    },
+    {
+      "phase": "ffn_deepep_combine_exchange",
+      "p50": 0.498,
+      "p95": 1.303,
+      "count": 3096
+    },
+    {
+      "phase": "attn_total",
+      "p50": 1.346,
+      "p95": 6.911,
+      "count": 3096
+    },
+    {
+      "phase": "attn_core",
+      "p50": 1.086,
+      "p95": 4.887,
+      "count": 3096
+    },
+    {
+      "phase": "attn_swa_all_reduce",
+      "p50": 0.19,
+      "p95": 233.519,
+      "count": 144
+    },
+    {
+      "phase": "ffn_deepep_local_experts",
+      "p50": 0.458,
+      "p95": 0.923,
+      "count": 3096
+    },
+    {
+      "phase": "ffn_shared",
+      "p50": 0.268,
+      "p95": 0.573,
+      "count": 3096
+    },
+    {
+      "phase": "attn_compressor_update",
+      "p50": 0.096,
+      "p95": 1.557,
+      "count": 2952
+    },
+    {
+      "phase": "attn_all_reduce",
+      "p50": 0.196,
+      "p95": 0.581,
+      "count": 2952
+    }
+  ],
+  "raw_remote_artifacts": [
+    "trace.nsys-rep",
+    "trace.sqlite",
+    "server.log"
+  ]
+}

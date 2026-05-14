@@ -432,3 +432,16 @@ all-reduce at 7.866 ms, and hybrid attention at 7.009 ms. This reinforces the
 same conclusion: KV is active, but the slow single-token path is dominated by
 host/runtime sync, allocation churn, launch overhead, and small communication
 boundaries.
+
+`nsys-one-token-current/` isolates the same question to a single generated
+decode token. The profiled request used `max_tokens=2` and returned `霓灯`; the
+Nsight filter found one `step_decode_kernel_launch` wave across 8 rank threads.
+That one token takes 266.020 ms wall. Normalized per rank range, the largest
+runtime costs are `cuStreamSynchronize` at 97.863 ms, `cuMemFreeAsync` at
+38.412 ms, `cuMemAllocAsync` at 23.346 ms, `cudaLaunchKernel_v7000` at
+20.081 ms, and `cuMemsetD8Async` at 16.180 ms. Kernel-side cost is led by NCCL
+send/recv at 30.801 ms, FP8 GEMV at 11.469 ms, FP4 GEMV at 10.881 ms, BF16
+all-reduce at 8.166 ms, hybrid attention at 7.825 ms, and NCCL all-gather at
+6.294 ms. The conclusion is unchanged but sharper: a single B=1 token is slow
+because synchronization, allocation/free, launch churn, and many small
+MoE/NCCL boundaries dominate the useful attention and GEMV work.
