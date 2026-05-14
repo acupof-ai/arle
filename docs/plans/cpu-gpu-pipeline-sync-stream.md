@@ -394,6 +394,23 @@ Evidence to capture:
 
 ### P1: H2D as a copy-stream stage
 
+Status:
+
+- Initial CUDA H2D copy-stream helpers are landed in
+  `crates/cuda-kernels/src/tensor.rs`:
+  `DeviceContext::memcpy_pinned_htod_on_copy_stream`.
+- The helper enqueues pinned-host-source uploads into an existing device
+  allocation on the copy stream and returns a
+  `CudaPipelineFence { producer: Copy, .. }`. Compute consumers must call
+  `wait_on_pipeline_fence()` explicitly before reading the uploaded payload.
+- The helper is intentionally `unsafe`: the destination allocation must stay
+  alive and must already be valid on the copy stream before enqueue. Callers
+  add a pre-copy wait only when the destination actually depends on prior
+  work from another stream; the helper itself does not serialize behind
+  unrelated compute.
+- No model weight-loading path has been switched. This tranche only establishes
+  the request-metadata substrate for later call-site migrations.
+
 Files likely involved:
 
 - `crates/cuda-kernels/src/tensor.rs`
@@ -414,6 +431,17 @@ Exit gate:
 
 - nsys shows H2D copies on copy stream.
 - compute stream waits only on matching H2D events.
+
+GPU verification TODO for CUDA Codex:
+
+```bash
+CUDARC_CUDA_VERSION=13010 \
+  cargo check -p cuda-kernels --no-default-features --features cuda,no-cuda
+
+CUDA_HOME=/usr/local/cuda \
+  cargo test -p cuda-kernels --no-default-features --features cuda \
+  pinned_copy_stream_h2d_helper_returns_compute_waitable_fence -- --nocapture
+```
 
 ### P2: Readback unification
 
