@@ -250,6 +250,37 @@ exchange plus quantize/dequantize kernels, so the path stays opt-in. The
 highest-value work remains real grouped GEMM/DeepGEMM for local experts and a
 combine strategy that reduces or overlaps the return all-to-all synchronization.
 
+## MHC Scratch Reuse
+
+Incremental DSv4 attention and FFN now reuse per-layer HyperConnection/MHC
+temporary buffers for the mix projection output plus `pre` / `post` / `comb`
+parameter tensors. This removes repeated small allocations from every
+attention/FFN layer after the first matching shape.
+
+The full trace log is committed as `arle-http-dsv4-mhc-scratch-trace.log.gz`;
+the parsed record is `dsv4-mhc-scratch-summary.json`.
+
+Trace-off default route, same smoke set:
+
+| Case | Before latency | After latency | Before throughput | After throughput | Output |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `37*29` | 1.997 s | 1.733 s | 5.51 tok/s | 6.35 tok/s | `37 乘以 29 等于 1073。` |
+| `58+67` | 1.795 s | 1.612 s | 5.57 tok/s | 6.20 tok/s | `58 加 67 等于 125。` |
+| writing | 3.142 s | 2.590 s | 6.05 tok/s | 7.34 tok/s | `毫秒级响应，万亿级参数。算力极致调度，智能无界延伸。` |
+
+Layer-trace phase comparison:
+
+| Phase | Shape | Before p50 | After p50 | Before p95 | After p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `attn_mhc` | decode `tokens=1` | 0.152 ms | 0.088 ms | 0.254 ms | 0.185 ms |
+| `ffn_mhc` | decode `tokens=1` | 0.134 ms | 0.085 ms | 0.194 ms | 0.096 ms |
+| `ffn_mhc` | prefill `tokens=1039` | 0.274 ms | 0.255 ms | 0.317 ms | 0.270 ms |
+
+The 1,039-token traced request still returns `37 × 29 = 1073`. MHC scratch
+reuse is a real decode cleanup, but it does not change the long-prefill
+bottleneck: return-side MoE combine exchange and local expert GEMMs still
+dominate.
+
 ## Current Bottleneck
 
 The current decode bottleneck is still model compute and per-layer routing/GEMM orchestration, not

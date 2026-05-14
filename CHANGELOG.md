@@ -63,6 +63,11 @@ Related governance docs:
   the existing route-slot combine kernel. It is validated on 8xH20 but remains
   opt-in because the measured 1,039-token prefill trace is not faster than the
   BF16 combine default.
+- Reused per-layer DSv4 HyperConnection/MHC temporary buffers in the
+  incremental attention and FFN paths. The 8xH20 trace-off smoke set improved
+  from roughly 5.5/5.6/6.0 tok/s to 6.3/6.2/7.3 tok/s for two math cases and
+  one short writing case, while traced decode `attn_mhc` and `ffn_mhc` p50
+  dropped to 0.088 ms and 0.085 ms respectively.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

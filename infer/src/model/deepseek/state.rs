@@ -69,6 +69,8 @@ impl DeepseekIncrementalState {
 pub(crate) struct DeepseekLayerRuntimeCache {
     pub(crate) attention: DeepseekAttentionRuntimeCache,
     pub(crate) moe: DeepseekMoeRuntimeCache,
+    pub(crate) attn_mhc: Option<DeepseekMhcRuntimeScratch>,
+    pub(crate) ffn_mhc: Option<DeepseekMhcRuntimeScratch>,
 }
 
 #[cfg(feature = "cuda")]
@@ -77,6 +79,18 @@ pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekMhcRuntimeScratch {
+    pub(crate) capacity_tokens: usize,
+    pub(crate) stream_hidden_dim: usize,
+    pub(crate) mix_dim: usize,
+    pub(crate) hc_mult: usize,
+    pub(crate) mixes: HiddenStates,
+    pub(crate) pre: CudaSlice<f32>,
+    pub(crate) post: CudaSlice<f32>,
+    pub(crate) comb: CudaSlice<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -220,6 +234,42 @@ impl DeepseekMoeRuntimeCache {
             .as_mut()
             .expect("DeepSeek V4 route combine scratch allocated"))
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_mhc_scratch<'a>(
+    slot: &'a mut Option<DeepseekMhcRuntimeScratch>,
+    ctx: &DeviceContext,
+    stream_hidden_dim: usize,
+    mix_dim: usize,
+    hc_mult: usize,
+    capacity_tokens: usize,
+) -> Result<&'a mut DeepseekMhcRuntimeScratch> {
+    let capacity_tokens = capacity_tokens.max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| {
+            scratch.capacity_tokens < capacity_tokens
+                || scratch.stream_hidden_dim != stream_hidden_dim
+                || scratch.mix_dim != mix_dim
+                || scratch.hc_mult != hc_mult
+        })
+        .unwrap_or(true);
+    if needs_alloc {
+        *slot = Some(DeepseekMhcRuntimeScratch {
+            capacity_tokens,
+            stream_hidden_dim,
+            mix_dim,
+            hc_mult,
+            mixes: HiddenStates::zeros(ctx, mix_dim, capacity_tokens)?,
+            pre: ctx.stream.alloc_zeros::<f32>(capacity_tokens * hc_mult)?,
+            post: ctx.stream.alloc_zeros::<f32>(capacity_tokens * hc_mult)?,
+            comb: ctx
+                .stream
+                .alloc_zeros::<f32>(capacity_tokens * hc_mult * hc_mult)?,
+        });
+    }
+    Ok(slot.as_mut().expect("DeepSeek V4 MHC scratch allocated"))
 }
 
 #[cfg(feature = "cuda")]

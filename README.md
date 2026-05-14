@@ -174,7 +174,10 @@ Operators who want only the native serving binary can use `infer` directly (`car
   writing output, while the 1,039-token prefill trace identifies return-side
   MoE combine exchange and local experts as the concrete blockers. A gated
   `ARLE_DSV4_COMBINE_DTYPE=fp8` experiment is functionally correct but remains
-  opt-in because it is not faster than the BF16 combine default. Evidence:
+  opt-in because it is not faster than the BF16 combine default. Per-layer MHC
+  scratch reuse raises the latest trace-off smoke throughput to **6.2-7.3
+  tok/s** on short math/writing cases without changing output correctness.
+  Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
   and
   [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).

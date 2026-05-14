@@ -25,7 +25,10 @@ use super::mla::{DeepseekV4Attention, DeepseekV4Compressor, DeepseekV4Indexer};
 #[cfg(feature = "cuda")]
 use super::mlp::{DeepseekV4Expert, DeepseekV4MoeBlock};
 #[cfg(feature = "cuda")]
-use super::state::{DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache};
+use super::state::{
+    DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache, DeepseekMhcRuntimeScratch,
+    ensure_mhc_scratch,
+};
 #[cfg(all(test, feature = "cuda"))]
 use super::state::{DeepseekCompressedRow, DeepseekCompressorRuntimeCache};
 #[cfg(feature = "cuda")]
@@ -600,20 +603,29 @@ impl DeepseekModel {
             )
         })?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mhc = gen_mhc_params(
+        let mhc_scratch = ensure_mhc_scratch(
+            &mut cache.attn_mhc,
+            &self.ctx,
+            stream.hidden_dim,
+            layer.hc_attn.mix_fn.rows,
+            self.config.hc_mult,
+            stream.seq_len,
+        )?;
+        let mhc = MhcParamsView::Cached(gen_mhc_params_cached(
             &self.ctx,
             &layer.hc_attn,
             stream,
             self.config.hc_mult,
             self.config.hc_eps,
             self.config.hc_sinkhorn_iters,
-        )?;
+            mhc_scratch,
+        )?);
         dsv4_trace_end(&self.ctx, "attn_mhc", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
         let attn_in = hc_pre_from_stream(
             &self.ctx,
             stream,
-            &mhc.pre,
+            mhc.pre(),
             self.config.hidden_size,
             self.config.hc_mult,
         )?;
@@ -640,18 +652,27 @@ impl DeepseekModel {
             &self.ctx,
             &attn_out,
             stream,
-            &mhc.post,
-            &mhc.comb,
+            mhc.post(),
+            mhc.comb(),
             self.config.hidden_size,
             self.config.hc_mult,
         )?;
         dsv4_trace_end(&self.ctx, "attn_post", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
+        let ffn_mhc_scratch = ensure_mhc_scratch(
+            &mut cache.ffn_mhc,
+            &self.ctx,
+            stream.hidden_dim,
+            layer.hc_ffn.mix_fn.rows,
+            self.config.hc_mult,
+            stream.seq_len,
+        )?;
         let stream = self.forward_ffn_layer_stream_with_scratch(
             layer_idx,
             &stream,
             tokens,
             Some(&mut cache.moe),
+            Some(ffn_mhc_scratch),
         )?;
         dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, stream.seq_len, trace)?;
         Ok(stream)
@@ -1757,7 +1778,7 @@ impl DeepseekModel {
         stream: &HiddenStates,
         tokens: &[u32],
     ) -> Result<HiddenStates> {
-        self.forward_ffn_layer_stream_with_scratch(layer_idx, stream, tokens, None)
+        self.forward_ffn_layer_stream_with_scratch(layer_idx, stream, tokens, None, None)
     }
 
     fn forward_ffn_layer_stream_with_scratch(
@@ -1766,6 +1787,7 @@ impl DeepseekModel {
         stream: &HiddenStates,
         tokens: &[u32],
         moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
+        mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
     ) -> Result<HiddenStates> {
         ensure!(
             tokens.len() == stream.seq_len,
@@ -1789,20 +1811,31 @@ impl DeepseekModel {
         })?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mhc = gen_mhc_params(
-            &self.ctx,
-            &layer.hc_ffn,
-            stream,
-            self.config.hc_mult,
-            self.config.hc_eps,
-            self.config.hc_sinkhorn_iters,
-        )?;
+        let mhc = match mhc_scratch {
+            Some(scratch) => MhcParamsView::Cached(gen_mhc_params_cached(
+                &self.ctx,
+                &layer.hc_ffn,
+                stream,
+                self.config.hc_mult,
+                self.config.hc_eps,
+                self.config.hc_sinkhorn_iters,
+                scratch,
+            )?),
+            None => MhcParamsView::Owned(gen_mhc_params(
+                &self.ctx,
+                &layer.hc_ffn,
+                stream,
+                self.config.hc_mult,
+                self.config.hc_eps,
+                self.config.hc_sinkhorn_iters,
+            )?),
+        };
         dsv4_trace_end(&self.ctx, "ffn_mhc", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
         let sub_in = hc_pre_from_stream(
             &self.ctx,
             stream,
-            &mhc.pre,
+            mhc.pre(),
             self.config.hidden_size,
             self.config.hc_mult,
         )?;
@@ -1884,8 +1917,8 @@ impl DeepseekModel {
             &self.ctx,
             &ffn_out,
             stream,
-            &mhc.post,
-            &mhc.comb,
+            mhc.post(),
+            mhc.comb(),
             self.config.hidden_size,
             self.config.hc_mult,
         )
@@ -2379,6 +2412,43 @@ struct MhcParams {
 }
 
 #[cfg(feature = "cuda")]
+struct MhcParamsRef<'a> {
+    pre: &'a CudaSlice<f32>,
+    post: &'a CudaSlice<f32>,
+    comb: &'a CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+enum MhcParamsView<'a> {
+    Owned(MhcParams),
+    Cached(MhcParamsRef<'a>),
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> MhcParamsView<'a> {
+    fn pre(&self) -> &CudaSlice<f32> {
+        match self {
+            Self::Owned(params) => &params.pre,
+            Self::Cached(params) => params.pre,
+        }
+    }
+
+    fn post(&self) -> &CudaSlice<f32> {
+        match self {
+            Self::Owned(params) => &params.post,
+            Self::Cached(params) => params.post,
+        }
+    }
+
+    fn comb(&self) -> &CudaSlice<f32> {
+        match self {
+            Self::Owned(params) => &params.comb,
+            Self::Cached(params) => params.comb,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn gen_mhc_params(
     ctx: &DeviceContext,
     hc: &DeepseekV4HyperConnection,
@@ -2399,6 +2469,13 @@ fn gen_mhc_params(
         hc.mix_fn.cols,
         mix_dim,
         stream.hidden_dim
+    );
+    ensure!(
+        hc.base.len >= mix_dim && hc.scale.len >= 3,
+        "DeepSeek V4 HC base/scale too short: base={} scale={} required_base={} required_scale=3",
+        hc.base.len,
+        hc.scale.len,
+        mix_dim
     );
     ensure!(
         hc.base.len >= mix_dim && hc.scale.len >= 3,
@@ -2456,6 +2533,86 @@ fn gen_mhc_params(
 }
 
 #[cfg(feature = "cuda")]
+fn gen_mhc_params_cached<'a>(
+    ctx: &DeviceContext,
+    hc: &DeepseekV4HyperConnection,
+    stream: &HiddenStates,
+    hc_mult: usize,
+    hc_eps: f32,
+    hc_sinkhorn_iters: usize,
+    scratch: &'a mut DeepseekMhcRuntimeScratch,
+) -> Result<MhcParamsRef<'a>> {
+    ensure!(
+        hc_mult > 0,
+        "DeepSeek V4 MHC generation requires non-zero hc_mult"
+    );
+    let mix_dim = (2 + hc_mult) * hc_mult;
+    ensure!(
+        hc.mix_fn.cols == stream.hidden_dim && hc.mix_fn.rows >= mix_dim,
+        "DeepSeek V4 HC mix shape {}x{} cannot produce {} weights from stream dim {}",
+        hc.mix_fn.rows,
+        hc.mix_fn.cols,
+        mix_dim,
+        stream.hidden_dim
+    );
+    ensure!(
+        scratch.capacity_tokens >= stream.seq_len
+            && scratch.stream_hidden_dim == stream.hidden_dim
+            && scratch.mix_dim == hc.mix_fn.rows
+            && scratch.hc_mult == hc_mult,
+        "DeepSeek V4 MHC scratch shape mismatch"
+    );
+    scratch.mixes.seq_len = stream.seq_len;
+    ops::try_gemm_with_phase_into(
+        ctx,
+        &hc.mix_fn,
+        stream,
+        &mut scratch.mixes,
+        if stream.seq_len > 1 {
+            ops::LinearDispatchPhase::Prefill
+        } else {
+            ops::LinearDispatchPhase::Decode
+        },
+    )?;
+
+    {
+        let (stream_ptr, _stream_guard) = stream.data.device_ptr(&ctx.stream);
+        let (mixes_ptr, _mixes_guard) = scratch.mixes.data.device_ptr(&ctx.stream);
+        let (base_ptr, _base_guard) = hc.base.data.device_ptr(&ctx.stream);
+        let (scale_ptr, _scale_guard) = hc.scale.data.device_ptr(&ctx.stream);
+        let (pre_ptr, _pre_guard) = scratch.pre.device_ptr_mut(&ctx.stream);
+        let (post_ptr, _post_guard) = scratch.post.device_ptr_mut(&ctx.stream);
+        let (comb_ptr, _comb_guard) = scratch.comb.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_mhc_params_cuda(
+                stream_ptr as *const ffi::Half,
+                mixes_ptr as *const ffi::Half,
+                base_ptr as *const ffi::Half,
+                scale_ptr as *const ffi::Half,
+                pre_ptr as *mut f32,
+                post_ptr as *mut f32,
+                comb_ptr as *mut f32,
+                stream.seq_len as i32,
+                stream.hidden_dim as i32,
+                scratch.mixes.hidden_dim as i32,
+                hc_mult as i32,
+                hc_eps,
+                hc_sinkhorn_iters as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 HC params CUDA failed: {err}"))?;
+        }
+    }
+
+    Ok(MhcParamsRef {
+        pre: &scratch.pre,
+        post: &scratch.post,
+        comb: &scratch.comb,
+    })
+}
+
+#[cfg(feature = "cuda")]
 fn hc_pre_from_stream(
     ctx: &DeviceContext,
     stream: &HiddenStates,
@@ -2471,8 +2628,8 @@ fn hc_pre_from_stream(
         hc_mult
     );
     ensure!(
-        pre.len() == stream.seq_len * hc_mult,
-        "DeepSeek V4 HC pre len {} does not match seq_len {} * hc_mult {}",
+        pre.len() >= stream.seq_len * hc_mult,
+        "DeepSeek V4 HC pre len {} is smaller than seq_len {} * hc_mult {}",
         pre.len(),
         stream.seq_len,
         hc_mult
@@ -2524,9 +2681,9 @@ fn hc_post_to_stream(
         residual.seq_len
     );
     ensure!(
-        post.len() == residual.seq_len * hc_mult
-            && comb.len() == residual.seq_len * hc_mult * hc_mult,
-        "DeepSeek V4 HC post weights mismatch: post={} comb={} seq_len={} hc_mult={}",
+        post.len() >= residual.seq_len * hc_mult
+            && comb.len() >= residual.seq_len * hc_mult * hc_mult,
+        "DeepSeek V4 HC post weights too small: post={} comb={} seq_len={} hc_mult={}",
         post.len(),
         comb.len(),
         residual.seq_len,
