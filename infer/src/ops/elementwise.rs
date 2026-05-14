@@ -119,6 +119,7 @@ pub(crate) fn dsv4_swiglu_clamped_batch_into(
 
 /// Add one BF16 row into a token row of a HiddenStates batch:
 /// `out[token_idx, i] += scale * row[0, i]`.
+#[cfg(test)]
 pub(crate) fn add_scaled_row_into(
     ctx: &DeviceContext,
     row: &HiddenStates,

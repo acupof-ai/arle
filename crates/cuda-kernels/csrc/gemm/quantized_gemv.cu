@@ -15,6 +15,7 @@
 #define WARP_SIZE 32
 #define GEMV_THREADS 256
 #define GEMV_ROWS 4
+#define DSV4_BATCH_TILE 8
 
 __device__ __constant__ float DSV4_FP4_E2M1_LUT[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -388,6 +389,73 @@ __global__ void dsv4_fp8_gemv_batch_kernel(
     }
 }
 
+__global__ void dsv4_fp8_gemv_batch_tiled_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int batch_base = blockIdx.y * DSV4_BATCH_TILE;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+
+    const int block_h = (N + scale_rows - 1) / scale_rows;
+    const int block_w = (K + scale_cols - 1) / scale_cols;
+    const int sr_raw = row / block_h;
+    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
+    const int scale_row_offset = sr * scale_cols;
+    float sums[DSV4_BATCH_TILE];
+#pragma unroll
+    for (int b = 0; b < DSV4_BATCH_TILE; ++b) sums[b] = 0.0f;
+
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const int sc_raw = k / block_w;
+        const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
+        const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
+            * dsv4_decode_e8m0(scales[scale_row_offset + sc]);
+#pragma unroll
+        for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
+            int batch_idx = batch_base + b;
+            if (batch_idx < B) {
+                sums[b] += w * __bfloat162float(input[batch_idx * K + k]);
+            }
+        }
+    }
+
+    __shared__ float smem[GEMV_ROWS * 8 * DSV4_BATCH_TILE];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+#pragma unroll
+    for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
+        sums[b] = warp_reduce_sum(sums[b]);
+        if (lane_id == 0) {
+            smem[(row_in_block * warps_per_row + warp_in_row) * DSV4_BATCH_TILE + b] = sums[b];
+        }
+    }
+    __syncthreads();
+    if (tid_in_row == 0) {
+#pragma unroll
+        for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
+            int batch_idx = batch_base + b;
+            if (batch_idx >= B) continue;
+            float total = 0.0f;
+            for (int w = 0; w < warps_per_row; ++w) {
+                total += smem[(row_in_block * warps_per_row + w) * DSV4_BATCH_TILE + b];
+            }
+            output[batch_idx * N + row] = __float2bfloat16(total);
+        }
+    }
+}
+
 __global__ void dsv4_fp4_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
     const uint8_t* __restrict__ scales,
@@ -429,6 +497,69 @@ __global__ void dsv4_fp4_gemv_batch_kernel(
         for (int w = 0; w < warps_per_row; w++)
             total += smem[row_in_block * warps_per_row + w];
         output[batch_idx * N + row] = __float2bfloat16(total);
+    }
+}
+
+__global__ void dsv4_fp4_gemv_batch_tiled_kernel(
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int batch_base = blockIdx.y * DSV4_BATCH_TILE;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+
+    const int bytes_per_row = K / 2;
+    float sums[DSV4_BATCH_TILE];
+#pragma unroll
+    for (int b = 0; b < DSV4_BATCH_TILE; ++b) sums[b] = 0.0f;
+
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const uint8_t packed = weight[row * bytes_per_row + (k >> 1)];
+        const uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+        const float w = dsv4_decode_fp4_e2m1(nibble)
+            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+#pragma unroll
+        for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
+            int batch_idx = batch_base + b;
+            if (batch_idx < B) {
+                sums[b] += w * __bfloat162float(input[batch_idx * K + k]);
+            }
+        }
+    }
+
+    __shared__ float smem[GEMV_ROWS * 8 * DSV4_BATCH_TILE];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+#pragma unroll
+    for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
+        sums[b] = warp_reduce_sum(sums[b]);
+        if (lane_id == 0) {
+            smem[(row_in_block * warps_per_row + warp_in_row) * DSV4_BATCH_TILE + b] = sums[b];
+        }
+    }
+    __syncthreads();
+    if (tid_in_row == 0) {
+#pragma unroll
+        for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
+            int batch_idx = batch_base + b;
+            if (batch_idx >= B) continue;
+            float total = 0.0f;
+            for (int w = 0; w < warps_per_row; ++w) {
+                total += smem[(row_in_block * warps_per_row + w) * DSV4_BATCH_TILE + b];
+            }
+            output[batch_idx * N + row] = __float2bfloat16(total);
+        }
     }
 }
 
@@ -1652,6 +1783,13 @@ cudaError_t dsv4_fp8_gemv_batch_cuda(
     if (B <= 0 || N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0) {
         return cudaErrorInvalidValue;
     }
+    if (B > 1) {
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + DSV4_BATCH_TILE - 1) / DSV4_BATCH_TILE);
+        dim3 block(GEMV_THREADS);
+        dsv4_fp8_gemv_batch_tiled_kernel<<<grid, block, 0, stream>>>(
+            weight, scales, input, output, B, N, K, scale_rows, scale_cols);
+        return cudaGetLastError();
+    }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
     dsv4_fp8_gemv_batch_kernel<<<grid, block, 0, stream>>>(
@@ -1666,6 +1804,13 @@ cudaError_t dsv4_fp4_gemv_batch_cuda(
 {
     if (B <= 0 || N <= 0 || K <= 0 || (K & 1) != 0 || scale_rows <= 0 || scale_cols <= 0) {
         return cudaErrorInvalidValue;
+    }
+    if (B > 1) {
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + DSV4_BATCH_TILE - 1) / DSV4_BATCH_TILE);
+        dim3 block(GEMV_THREADS);
+        dsv4_fp4_gemv_batch_tiled_kernel<<<grid, block, 0, stream>>>(
+            weight, scales, input, output, B, N, K, scale_rows, scale_cols);
+        return cudaGetLastError();
     }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
