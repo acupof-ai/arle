@@ -1,0 +1,111 @@
+Top CUDA runtime APIs inside step_decode_kernel_launch ranges
+[
+  {
+    "name": "cuMemAllocAsync",
+    "total_ms": 247.072149,
+    "count": 9136,
+    "per_decode_range_ms": 30.884019,
+    "avg_us": 27.043799,
+    "min_us": 0.646,
+    "max_us": 375.461
+  },
+  {
+    "name": "cuMemFreeAsync",
+    "total_ms": 184.218613,
+    "count": 7424,
+    "per_decode_range_ms": 23.027327,
+    "avg_us": 24.81393,
+    "min_us": 0.503,
+    "max_us": 442.823
+  },
+  {
+    "name": "cuMemcpyDtoHAsync_v2",
+    "total_ms": 162.658018,
+    "count": 887,
+    "per_decode_range_ms": 20.332252,
+    "avg_us": 183.379953,
+    "min_us": 11.422,
+    "max_us": 1109.332
+  },
+  {
+    "name": "cudaLaunchKernel_v7000",
+    "total_ms": 142.278229,
+    "count": 15088,
+    "per_decode_range_ms": 17.784779,
+    "avg_us": 9.429893,
+    "min_us": 3.005,
+    "max_us": 109.217
+  },
+  {
+    "name": "cuMemsetD8Async",
+    "total_ms": 95.221154,
+    "count": 10214,
+    "per_decode_range_ms": 11.902644,
+    "avg_us": 9.322612,
+    "min_us": 1.658,
+    "max_us": 89.562
+  },
+  {
+    "name": "cudaEventRecord_v3020",
+    "total_ms": 31.772541,
+    "count": 4136,
+    "per_decode_range_ms": 3.971568,
+    "avg_us": 7.681949,
+    "min_us": 0.473,
+    "max_us": 100.749
+  },
+  {
+    "name": "cudaStreamWaitEvent_v3020",
+    "total_ms": 28.606775,
+    "count": 3440,
+    "per_decode_range_ms": 3.575847,
+    "avg_us": 8.315923,
+    "min_us": 0.598,
+    "max_us": 64.668
+  },
+  {
+    "name": "cuLaunchKernelEx",
+    "total_ms": 21.693657,
+    "count": 1720,
+    "per_decode_range_ms": 2.711707,
+    "avg_us": 12.612591,
+    "min_us": 3.341,
+    "max_us": 90.642
+  },
+  {
+    "name": "cudaStreamGetCaptureInfo_v2_v11030",
+    "total_ms": 13.879836,
+    "count": 5200,
+    "per_decode_range_ms": 1.734979,
+    "avg_us": 2.669199,
+    "min_us": 0.243,
+    "max_us": 54.5
+  },
+  {
+    "name": "cuMemcpyHtoDAsync_v2",
+    "total_ms": 11.142342,
+    "count": 895,
+    "per_decode_range_ms": 1.392793,
+    "avg_us": 12.449544,
+    "min_us": 2.588,
+    "max_us": 52.764
+  },
+  {
+    "name": "cuMemcpyDtoDAsync_v2",
+    "total_ms": 9.921007,
+    "count": 613,
+    "per_decode_range_ms": 1.240126,
+    "avg_us": 16.184351,
+    "min_us": 5.87,
+    "max_us": 74.162
+  },
+  {
+    "name": "cudaGetFuncBySymbol_v11000",
+    "total_ms": 6.306516,
+    "count": 1720,
+    "per_decode_range_ms": 0.788314,
+    "avg_us": 3.666579,
+    "min_us": 0.14,
+    "max_us": 66.985
+  }
+]

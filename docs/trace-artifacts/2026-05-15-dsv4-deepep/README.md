@@ -17,3 +17,9 @@ Current trace set:
   single-token rerun from a clean remote source tree. It shows a 146.448 ms
   decode wave with the remaining cost concentrated in allocator/runtime churn,
   D2H routing readback, NCCL exchange, and per-expert GEMV.
+- [`nsys-single-token-segment-input/`](nsys-single-token-segment-input/)
+  validates the local expert packed-input segment path. It keeps the same
+  `霓虹` output, trims decode-only `cuMemcpyDtoDAsync_v2` from 871 calls /
+  1.795 ms per rank range to 613 calls / 1.240 ms, and leaves the main
+  bottleneck concentrated in allocator/runtime churn, D2H readback, NCCL
+  exchange, and per-expert GEMV.

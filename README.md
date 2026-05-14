@@ -204,7 +204,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   led directly to shared expert scratch reuse plus an in-place BF16 add kernel:
   short math/writing smoke now reaches **9.07-9.50 tok/s**, and the isolated
   single-token nsys wave drops to **140 ms wall** with allocator calls down to
-  **7,416/7,424**. Remaining targets are fewer host route readbacks,
+  **7,416/7,424**. A current follow-up nsys run validates direct packed
+  segment input for local expert `w1`/`w3`: the streaming output remains
+  `霓虹`, decode-only `cuMemcpyDtoDAsync_v2` falls from **871 calls / 1.795 ms**
+  to **613 calls / 1.240 ms** per rank range, and the same one-token wave is
+  **145 ms wall**. Remaining targets are fewer host route readbacks,
   graph/lifetime cleanup, lower-latency/overlapped DeepEP exchange, and true
   grouped GEMM/DeepGEMM.
   Evidence:
