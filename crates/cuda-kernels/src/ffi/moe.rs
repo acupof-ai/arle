@@ -1,4 +1,4 @@
-use super::{CUresult, CUstream};
+use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
@@ -23,6 +23,72 @@ unsafe extern "C" {
         experts_per_moe_dp_group: i32,
         num_tp_ranks: i32,
         tp_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_route_cuda(
+        logits: *const Half,
+        bias: *const Half,
+        tid2eid: *const i64,
+        token_ids: *const u32,
+        indices: *mut i32,
+        weights: *mut f32,
+        num_tokens: i32,
+        n_experts: i32,
+        topk: i32,
+        routing_kind: i32,
+        scoring_kind: i32,
+        routed_scaling_factor: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_count_local_experts_cuda(
+        indices: *const i32,
+        counts: *mut i32,
+        num_tokens: i32,
+        topk: i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_pack_local_experts_cuda(
+        hidden: *const Half,
+        indices: *const i32,
+        weights: *const f32,
+        offsets: *const i32,
+        cursors: *mut i32,
+        packed_hidden: *mut Half,
+        packed_token: *mut i32,
+        packed_weight: *mut f32,
+        num_tokens: i32,
+        hidden_dim: i32,
+        topk: i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_scatter_packed_expert_cuda(
+        expert_out: *const Half,
+        routed_out: *mut Half,
+        packed_token: *const i32,
+        packed_weight: *const f32,
+        start_slot: i32,
+        count: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_add_local_expert_cuda(
+        expert_out: *const Half,
+        routed_out: *mut Half,
+        indices: *const i32,
+        weights: *const f32,
+        num_tokens: i32,
+        hidden_dim: i32,
+        topk: i32,
+        global_expert_idx: i32,
         stream: CUstream,
     ) -> CUresult;
 }

@@ -5,6 +5,7 @@
 //! compressor/indexer metadata, and MoE route buffers) will live alongside
 //! `decode_bufs` once Phase 2A exposes the kernel surfaces.
 
+#[cfg(all(test, feature = "cuda"))]
 use std::collections::VecDeque;
 
 use anyhow::Result;
@@ -18,6 +19,8 @@ use crate::model::kv_cache::KVCacheDtype;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use half::bf16;
 
 /// Per-request DeepSeek mutable state.
 ///
@@ -70,24 +73,46 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub(crate) struct DeepseekAttentionRuntimeCache {
+    #[cfg(test)]
     pub(crate) window: VecDeque<DeepseekKvRow>,
+    pub(crate) window_gpu: Option<CudaSlice<bf16>>,
+    pub(crate) window_gpu_len: usize,
+    #[cfg(test)]
     pub(crate) compressed: Option<DeepseekCompressorRuntimeCache>,
+    #[cfg(test)]
     pub(crate) indexer: Option<DeepseekCompressorRuntimeCache>,
+    pub(crate) compressed_gpu: Option<DeepseekGpuCompressorRuntimeCache>,
+    pub(crate) indexer_gpu: Option<DeepseekGpuCompressorRuntimeCache>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) struct DeepseekKvRow {
     pub(crate) pos: usize,
     pub(crate) values: Vec<f32>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) struct DeepseekCompressedRow {
     pub(crate) end_pos: usize,
     pub(crate) values: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(crate) struct DeepseekGpuCompressorRuntimeCache {
+    pub(crate) pending_kv: Option<CudaSlice<bf16>>,
+    pub(crate) pending_score: Option<CudaSlice<bf16>>,
+    pub(crate) prev_overlap_kv: Option<CudaSlice<bf16>>,
+    pub(crate) prev_overlap_score: Option<CudaSlice<bf16>>,
+    pub(crate) compressed: Option<CudaSlice<bf16>>,
+    pub(crate) pending_len: usize,
+    pub(crate) compressed_rows: usize,
+    pub(crate) compressed_capacity: usize,
+    pub(crate) pending_width: usize,
+    pub(crate) head_dim: usize,
+}
+
+#[cfg(all(test, feature = "cuda"))]
 #[derive(Default)]
 pub(crate) struct DeepseekCompressorRuntimeCache {
     pub(crate) pending_kv: Vec<f32>,
