@@ -194,9 +194,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   single-token decode allocator calls by 883. Reusing recv/local route scratch
   for B=1 decode raises the latest short smoke to **8.24-8.79 tok/s** and cuts
   the isolated single-token nsys wave to **148 ms wall**, with decode-only
-  `cuMemAllocAsync`/`cuMemFreeAsync` calls down to **9,480/9,488**. That leaves
-  stream sync, D2H routing readbacks, launch/memset churn, and return-side
-  NCCL/GEMM work as the next targets.
+  `cuMemAllocAsync`/`cuMemFreeAsync` calls down to **9,480/9,488**. A further
+  route-logits scratch cleanup lowers allocator calls again to **9,136/9,144**,
+  though its single capture is a call-count cleanup rather than a confirmed
+  wall-time win. That leaves stream sync, D2H routing readbacks,
+  launch/memset churn, and return-side NCCL/GEMM work as the next targets.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
   and

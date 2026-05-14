@@ -471,3 +471,16 @@ to 10,554. The largest remaining runtime costs are still async alloc/free,
 DtoH routing readbacks, kernel launch/memset churn, and NCCL send/recv plus
 all-reduce boundaries; `dsv4_hybrid_attention_kernel` is visible at about
 7.1 ms per rank range and is not the primary bottleneck.
+
+`route-logits-scratch/` adds one more allocator-count cleanup by reusing the
+B=1 decode MoE gate-logits output buffer. Prefill preallocates a one-token
+route-logits buffer so the first generated decode token does not allocate it
+inside the decode NVTX range. Trace-off smokes remained normal at 8.18-8.62
+completion tok/s. In the single-token nsys window, decode-only
+`cuMemAllocAsync`/`cuMemFreeAsync` calls dropped again from 9,480/9,488 to
+9,136/9,144 and `cuMemsetD8Async` calls dropped from 10,554 to 10,210. Wall
+time was not a confirmed win in this one capture (148.253 ms before versus
+162.062 ms after), so treat this as graph/lifetime cleanup rather than the main
+performance fix. The remaining bottleneck remains runtime overhead, D2H routing
+readbacks, launch/memset churn, and NCCL send/recv/all-reduce around the
+per-expert GEMV work.
