@@ -1,0 +1,10 @@
+data: {"id":"chatcmpl-1fb35d4a-0b35-499d-882b-da0eac29aa11","object":"chat.completion.chunk","created":1778782773,"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1fb35d4a-0b35-499d-882b-da0eac29aa11","object":"chat.completion.chunk","created":1778782773,"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":{"content":"霓"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1fb35d4a-0b35-499d-882b-da0eac29aa11","object":"chat.completion.chunk","created":1778782773,"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":{"content":"虹"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1fb35d4a-0b35-499d-882b-da0eac29aa11","object":"chat.completion.chunk","created":1778782773,"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+

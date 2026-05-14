@@ -137,6 +137,82 @@ impl DeepseekV4Expert {
         Ok(&scratch.out)
     }
 
+    pub(super) fn try_forward_scratch_input_segment(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &HiddenStates,
+        input_token_offset: usize,
+        count: usize,
+        swiglu_limit: f32,
+        scratch: &mut DeepseekExpertRuntimeScratch,
+    ) -> Result<bool> {
+        if dsv4_block_scaled_format(&self.w1).is_none()
+            || dsv4_block_scaled_format(&self.w3).is_none()
+        {
+            return Ok(false);
+        }
+        ensure!(
+            self.w1.cols == hidden.hidden_dim && self.w3.cols == hidden.hidden_dim,
+            "DeepSeek V4 expert input width mismatch: hidden_dim={} w1.cols={} w3.cols={}",
+            hidden.hidden_dim,
+            self.w1.cols,
+            self.w3.cols
+        );
+        ensure!(
+            self.w1.rows == self.w3.rows && self.w2.cols == self.w1.rows,
+            "DeepSeek V4 expert intermediate mismatch: w1.rows={} w3.rows={} w2.cols={}",
+            self.w1.rows,
+            self.w3.rows,
+            self.w2.cols
+        );
+        ensure!(
+            scratch.capacity_tokens >= count
+                && scratch.hidden_dim == hidden.hidden_dim
+                && scratch.intermediate_dim == self.w1.rows
+                && scratch.output_dim == self.w2.rows,
+            "DeepSeek V4 expert scratch shape mismatch"
+        );
+
+        scratch.gate.seq_len = count;
+        scratch.up.seq_len = count;
+        scratch.act.seq_len = count;
+        scratch.out.seq_len = count;
+
+        let phase = if count > 1 {
+            ops::LinearDispatchPhase::Prefill
+        } else {
+            ops::LinearDispatchPhase::Decode
+        };
+        let ran_gate = dsv4_run_block_scaled_gemv_segment(
+            ctx,
+            &self.w1,
+            hidden,
+            input_token_offset,
+            count,
+            &mut scratch.gate,
+        )?;
+        let ran_up = dsv4_run_block_scaled_gemv_segment(
+            ctx,
+            &self.w3,
+            hidden,
+            input_token_offset,
+            count,
+            &mut scratch.up,
+        )?;
+        if !ran_gate || !ran_up {
+            return Ok(false);
+        }
+        ops::dsv4_swiglu_clamped_batch_into(
+            ctx,
+            &scratch.gate,
+            &scratch.up,
+            &mut scratch.act,
+            swiglu_limit,
+        )?;
+        ops::try_gemm_with_phase_into(ctx, &self.w2, &scratch.act, &mut scratch.out, phase)?;
+        Ok(true)
+    }
+
     pub(super) fn forward_with_scratch<'a>(
         &self,
         ctx: &DeviceContext,
@@ -191,12 +267,104 @@ impl DeepseekV4Expert {
 }
 
 #[cfg(feature = "cuda")]
-fn dsv4_grouped_format(weight: &DeviceMatrix) -> Option<DeepseekDsv4GroupedBlockFormat> {
+fn dsv4_block_scaled_format(weight: &DeviceMatrix) -> Option<DeepseekDsv4GroupedBlockFormat> {
     match weight.weight_format {
         WeightFormat::Dsv4Fp8BlockScaled => Some(DeepseekDsv4GroupedBlockFormat::Fp8),
         WeightFormat::Dsv4Fp4BlockScaled => Some(DeepseekDsv4GroupedBlockFormat::Fp4),
         _ => None,
     }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_grouped_format(weight: &DeviceMatrix) -> Option<DeepseekDsv4GroupedBlockFormat> {
+    dsv4_block_scaled_format(weight)
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_run_block_scaled_gemv_segment(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    input: &HiddenStates,
+    input_token_offset: usize,
+    batch_size: usize,
+    output: &mut HiddenStates,
+) -> Result<bool> {
+    let Some(format) = dsv4_block_scaled_format(weight) else {
+        return Ok(false);
+    };
+    ensure!(
+        batch_size > 0,
+        "DeepSeek V4 segment GEMV needs non-empty input"
+    );
+    let input_end = input_token_offset
+        .checked_add(batch_size)
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV input range overflow"))?;
+    ensure!(
+        input.hidden_dim == weight.cols
+            && output.hidden_dim == weight.rows
+            && output.seq_len >= batch_size
+            && input_end <= input.seq_len,
+        "DeepSeek V4 segment GEMV shape mismatch: input={}x{} offset={} batch={} weight={}x{} output={}x{}",
+        input.seq_len,
+        input.hidden_dim,
+        input_token_offset,
+        batch_size,
+        weight.rows,
+        weight.cols,
+        output.seq_len,
+        output.hidden_dim
+    );
+    ensure!(
+        weight.dsv4_scale_rows > 0 && weight.dsv4_scale_cols > 0,
+        "DeepSeek V4 segment GEMV needs block scales"
+    );
+    let elem_offset = input_token_offset
+        .checked_mul(input.hidden_dim)
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV element offset overflow"))?;
+    let qweight = weight
+        .qweight
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV missing raw weight bytes"))?;
+    let scales = weight
+        .dsv4_scales
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 segment GEMV missing block scales"))?;
+    let (qw_ptr, _qw_guard) = qweight.device_ptr(&ctx.stream);
+    let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
+    let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
+    let (output_ptr, _output_guard) = output.data.device_ptr_mut(&ctx.stream);
+    let input_ptr = unsafe { (input_ptr as *const ffi::Half).add(elem_offset) };
+    let res = unsafe {
+        match format {
+            DeepseekDsv4GroupedBlockFormat::Fp8 => ffi::dsv4_fp8_gemv_batch_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                input_ptr,
+                output_ptr as *mut ffi::Half,
+                batch_size as i32,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                ctx.stream.cu_stream(),
+            ),
+            DeepseekDsv4GroupedBlockFormat::Fp4 => ffi::dsv4_fp4_gemv_batch_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                input_ptr,
+                output_ptr as *mut ffi::Half,
+                batch_size as i32,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                ctx.stream.cu_stream(),
+            ),
+        }
+    };
+    res.result()
+        .map_err(|err| anyhow::anyhow!("DeepSeek V4 segment GEMV failed: {err}"))?;
+    Ok(true)
 }
 
 #[cfg(feature = "cuda")]
@@ -2037,16 +2205,28 @@ impl DeepseekV4MoeBlock {
                             expert.w2.rows,
                             count,
                         )?;
-                        scratch.input.seq_len = count;
-                        let src = expert_hidden.data.slice(elem_start..elem_end);
-                        let mut dst = scratch.input.data.slice_mut(0..count * hidden.hidden_dim);
-                        ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|err| {
-                            anyhow::anyhow!(
-                                "DeepSeek V4 recv expert input scratch D2D failed: {err}"
-                            )
-                        })?;
-                        expert_out_ref =
-                            expert.forward_scratch_input(ctx, config.swiglu_limit, scratch)?;
+                        let segment_done = expert.try_forward_scratch_input_segment(
+                            ctx,
+                            expert_hidden,
+                            offset,
+                            count,
+                            config.swiglu_limit,
+                            scratch,
+                        )?;
+                        if !segment_done {
+                            scratch.input.seq_len = count;
+                            let src = expert_hidden.data.slice(elem_start..elem_end);
+                            let mut dst =
+                                scratch.input.data.slice_mut(0..count * hidden.hidden_dim);
+                            ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DeepSeek V4 recv expert input scratch D2D failed: {err}"
+                                )
+                            })?;
+                            let _ =
+                                expert.forward_scratch_input(ctx, config.swiglu_limit, scratch)?;
+                        }
+                        expert_out_ref = &scratch.out;
                         expert_out_ref
                     } else {
                         let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;

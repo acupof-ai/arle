@@ -140,6 +140,17 @@ Related governance docs:
   from roughly 5.5/5.6/6.0 tok/s to 6.3/6.2/7.3 tok/s for two math cases and
   one short writing case, while traced decode `attn_mhc` and `ffn_mhc` p50
   dropped to 0.088 ms and 0.085 ms respectively.
+- Added a default DSv4 local expert segment-input path for DeepEP decode. When
+  `w1` and `w3` are DSv4 block-scaled FP8/FP4 matrices, the per-expert fallback
+  now runs their GEMV directly from the packed `expert_hidden` segment and
+  skips the old D2D copy into `scratch.input`; unsupported formats still use
+  the original copy fallback. Real 8xH20 nsys against `/root/DeepSeek-V4-Flash`
+  kept the `霓虹` streaming output, reduced decode-only `cuMemcpyDtoDAsync_v2`
+  from 871 calls / 1.795 ms per rank range to 613 calls / 1.240 ms, and moved
+  the isolated single-token wave from 146.448 ms to 145.104 ms. The trace
+  confirms this is a small cleanup: allocator/runtime churn, D2H route
+  readback, NCCL SendRecv/AllReduce, and per-expert FP8/FP4 GEMV remain the
+  dominant costs.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7
