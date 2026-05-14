@@ -78,6 +78,14 @@ Related governance docs:
   `cuMemAllocAsync` calls from 11,980 to 11,097 and `cuMemFreeAsync` calls from
   11,988 to 11,105. Remaining allocator pressure now sits in recv/local route
   buffers plus combine scratch and still needs a broader lifetime/graph pass.
+- Reused DSv4 DeepEP B=1 decode recv/local route scratch for received hidden
+  rows and metadata, local expert packed rows/weights/route slots, and
+  route-output rows. Prefill preallocates only a small `ep_world * topk` decode
+  capacity so long prompts do not retain prompt-sized route buffers. The real
+  8xH20 DSv4 smoke stayed correct at 8.24-8.79 completion tok/s, and the
+  single-token nsys window improved from 191.152 ms to 148.253 ms while
+  reducing decode-only `cuMemAllocAsync`/`cuMemFreeAsync` calls to
+  9,480/9,488 and `cuMemsetD8Async` calls to 10,554.
 - Optimized the gated DSv4 grouped expert prototype behind
   `ARLE_DSV4_GROUPED_EXPERTS=1` by caching per-layer local expert weight
   pointer arrays and launching indexed active experts instead of rebuilding

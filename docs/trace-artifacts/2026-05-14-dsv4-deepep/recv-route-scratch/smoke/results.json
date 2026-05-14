@@ -1,0 +1,52 @@
+{
+  "results": [
+    {
+      "label": "warmup",
+      "status": 200,
+      "total_s": 0.457176,
+      "usage": {
+        "prompt_tokens": 13,
+        "completion_tokens": 2,
+        "total_tokens": 15
+      },
+      "completion_tok_s": 4.375,
+      "text": "1+"
+    },
+    {
+      "label": "math37x29",
+      "status": 200,
+      "total_s": 1.365963,
+      "usage": {
+        "prompt_tokens": 19,
+        "completion_tokens": 12,
+        "total_tokens": 31
+      },
+      "completion_tok_s": 8.785,
+      "text": "37 × 29 = 1073。  \n解释："
+    },
+    {
+      "label": "math58p67",
+      "status": 200,
+      "total_s": 1.39697,
+      "usage": {
+        "prompt_tokens": 19,
+        "completion_tokens": 12,
+        "total_tokens": 31
+      },
+      "completion_tok_s": 8.59,
+      "text": "58 + 67 = 125。  \n解释：先"
+    },
+    {
+      "label": "write_perf",
+      "status": 200,
+      "total_s": 1.214397,
+      "usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 10,
+        "total_tokens": 30
+      },
+      "completion_tok_s": 8.235,
+      "text": "毫秒级洞察，极致算力释放。"
+    }
+  ]
+}

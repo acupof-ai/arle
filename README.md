@@ -191,8 +191,12 @@ Operators who want only the native serving binary can use `infer` directly (`car
   launch/memset churn, and NCCL send/recv dominate before attention or GEMV.
   Reusing send-route token/slot buffers and deleting the unused expert-token
   pack output keeps short DeepEP smoke at **7.94-8.09 tok/s** while reducing
-  single-token decode allocator calls by 883. That leaves stream sync,
-  recv/local route scratch, and return-side NCCL/GEMM work as the next target.
+  single-token decode allocator calls by 883. Reusing recv/local route scratch
+  for B=1 decode raises the latest short smoke to **8.24-8.79 tok/s** and cuts
+  the isolated single-token nsys wave to **148 ms wall**, with decode-only
+  `cuMemAllocAsync`/`cuMemFreeAsync` calls down to **9,480/9,488**. That leaves
+  stream sync, D2H routing readbacks, launch/memset churn, and return-side
+  NCCL/GEMM work as the next targets.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
   and

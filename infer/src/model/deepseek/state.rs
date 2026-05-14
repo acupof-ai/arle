@@ -78,6 +78,8 @@ pub(crate) struct DeepseekLayerRuntimeCache {
 pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
+    pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
+    pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
@@ -111,6 +113,24 @@ pub(crate) struct DeepseekSendRouteRuntimeScratch {
     pub(crate) capacity_routes: usize,
     pub(crate) send_token: CudaSlice<i32>,
     pub(crate) send_route_slot: CudaSlice<i32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekRecvRouteRuntimeScratch {
+    pub(crate) capacity_routes: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) recv_hidden: HiddenStates,
+    pub(crate) recv_meta: CudaSlice<i32>,
+    pub(crate) route_out: HiddenStates,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekLocalRouteRuntimeScratch {
+    pub(crate) capacity_routes: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) expert_hidden: HiddenStates,
+    pub(crate) expert_weight: CudaSlice<f32>,
+    pub(crate) expert_route_slot: CudaSlice<i32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -375,6 +395,62 @@ pub(crate) fn ensure_send_route_scratch<'a>(
     Ok(slot
         .as_mut()
         .expect("DeepSeek V4 send-route scratch allocated"))
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_recv_route_scratch<'a>(
+    slot: &'a mut Option<DeepseekRecvRouteRuntimeScratch>,
+    ctx: &DeviceContext,
+    hidden_dim: usize,
+    capacity_routes: usize,
+) -> Result<&'a mut DeepseekRecvRouteRuntimeScratch> {
+    let capacity_routes = capacity_routes.max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| {
+            scratch.capacity_routes < capacity_routes || scratch.hidden_dim != hidden_dim
+        })
+        .unwrap_or(true);
+    if needs_alloc {
+        *slot = Some(DeepseekRecvRouteRuntimeScratch {
+            capacity_routes,
+            hidden_dim,
+            recv_hidden: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+            recv_meta: ctx.stream.alloc_zeros::<i32>(capacity_routes * 3)?,
+            route_out: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+        });
+    }
+    Ok(slot
+        .as_mut()
+        .expect("DeepSeek V4 recv-route scratch allocated"))
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_local_route_scratch<'a>(
+    slot: &'a mut Option<DeepseekLocalRouteRuntimeScratch>,
+    ctx: &DeviceContext,
+    hidden_dim: usize,
+    capacity_routes: usize,
+) -> Result<&'a mut DeepseekLocalRouteRuntimeScratch> {
+    let capacity_routes = capacity_routes.max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| {
+            scratch.capacity_routes < capacity_routes || scratch.hidden_dim != hidden_dim
+        })
+        .unwrap_or(true);
+    if needs_alloc {
+        *slot = Some(DeepseekLocalRouteRuntimeScratch {
+            capacity_routes,
+            hidden_dim,
+            expert_hidden: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+            expert_weight: ctx.stream.alloc_zeros::<f32>(capacity_routes)?,
+            expert_route_slot: ctx.stream.alloc_zeros::<i32>(capacity_routes)?,
+        });
+    }
+    Ok(slot
+        .as_mut()
+        .expect("DeepSeek V4 local-route scratch allocated"))
 }
 
 #[cfg(feature = "cuda")]
