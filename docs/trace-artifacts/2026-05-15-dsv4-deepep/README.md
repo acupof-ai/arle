@@ -82,6 +82,12 @@ Current trace set:
   return normal decode text and the arithmetic check returns `410`, but pair
   GEMV regresses `decode64` post-first throughput from 11.79 tok/s to
   7.70 tok/s, so it remains default-off.
+- [`bench-route-grouped-pair-vs-default/`](bench-route-grouped-pair-vs-default/)
+  records a trace-off HTTP comparison for the default fused-dispatch path
+  versus `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1`. Both paths return normal writing
+  output and exact arithmetic `410`, but route-grouped pair regresses `decode64`
+  server-side completion throughput from 11.47 tok/s to 6.54 tok/s. The
+  route-grouped path remains default-off.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789

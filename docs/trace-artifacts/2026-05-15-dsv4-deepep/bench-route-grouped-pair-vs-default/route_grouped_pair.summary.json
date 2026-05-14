@@ -1,0 +1,32 @@
+{
+  "warmup16": {
+    "status": 200,
+    "elapsed_s": 2.567105770111084,
+    "ttft_s": null,
+    "chunks": 18,
+    "content_chunks": 16,
+    "post_first_tok_s_estimate": 6.232699948046023,
+    "text": "彩虹之所以有多种颜色，是因为阳光（白光）被空气中的水滴折射、反射",
+    "chars": 32
+  },
+  "decode64": {
+    "status": 200,
+    "elapsed_s": 9.786075592041016,
+    "ttft_s": null,
+    "chunks": 66,
+    "content_chunks": 64,
+    "post_first_tok_s_estimate": 6.539904520260501,
+    "text": "In mixture-of experts (MoE) inference, the model's efficiency hinges on routing each input token to only a subset of expert sub-networks. However, this sparse activation creates a critical bottleneck: **GPU communication overhead**. Unlike dense models where all parameters reside on every GPU, MoE often shards experts across multiple",
+    "chars": 335
+  },
+  "math": {
+    "status": 200,
+    "elapsed_s": 0.5457637310028076,
+    "ttft_s": null,
+    "chunks": 3,
+    "content_chunks": 1,
+    "post_first_tok_s_estimate": 29.31671544131556,
+    "text": "410",
+    "chars": 3
+  }
+}
