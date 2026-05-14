@@ -87,8 +87,7 @@ unsafe extern "C" {
         cursors: *mut i32,
         packed_hidden: *mut Half,
         packed_token: *mut i32,
-        packed_expert: *mut i32,
-        packed_weight: *mut f32,
+        packed_meta: *mut i32,
         num_tokens: i32,
         hidden_dim: i32,
         topk: i32,
@@ -98,7 +97,7 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn dsv4_count_packed_local_experts_cuda(
-        packed_expert: *const i32,
+        packed_meta: *const i32,
         counts: *mut i32,
         num_routes: i32,
         local_expert_start: i32,
@@ -108,9 +107,7 @@ unsafe extern "C" {
 
     pub fn dsv4_pack_received_experts_cuda(
         received_hidden: *const Half,
-        received_token: *const i32,
-        received_expert: *const i32,
-        received_weight: *const f32,
+        received_meta: *const i32,
         offsets: *const i32,
         cursors: *mut i32,
         expert_hidden: *mut Half,
