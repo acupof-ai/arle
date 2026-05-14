@@ -93,6 +93,10 @@ Current trace set:
   remain normal and the arithmetic case returns `410`; `decode64` is still
   11.48 e2e requested tok/s, effectively unchanged from the 11.47 tok/s
   default baseline.
+- [`bench-compressor-projection-scratch/`](bench-compressor-projection-scratch/)
+  records the trace-off HTTP smoke after reusing GPU compressor projection
+  buffers. The output checks remain normal and arithmetic returns `410`;
+  `decode64` stays flat at 11.47 e2e requested tok/s.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789
@@ -133,6 +137,13 @@ Current trace set:
   12.574 ms, and `cuMemFreeAsync` falls from 6,048 calls / 13.801 ms to
   5,352 calls / 11.096 ms. HTTP throughput remains essentially unchanged, so
   the dominant target remains NCCL plus local expert GEMV.
+- [`nsys-single-decode-token-compressor-projection-scratch/`](nsys-single-decode-token-compressor-projection-scratch/)
+  reuses GPU compressor update `kv_raw` and `score_raw` projection buffers. It
+  removes another 992 alloc/free pairs from the warmed decode window
+  (`cuMemAllocAsync` 7,757 -> 6,765 and `cuMemFreeAsync` 5,352 -> 4,360), but
+  the single captured wave regresses to 121.550 ms due to D2H/NCCL timing
+  variance. This is recorded as allocator-pressure cleanup, not a throughput
+  win.
 - [`nsys-single-decode-token-expert-grouped/`](nsys-single-decode-token-expert-grouped/)
   records the opt-in `ARLE_DSV4_GROUPED_EXPERTS=1` expert-wise grouped GEMV
   path after the same real decode warmup. The output remains `霓彩`, but the
