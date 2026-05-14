@@ -196,6 +196,13 @@ Related governance docs:
   from 123.955 ms to 112.133 ms, and drops `ncclDevKernel_SendRecv` time from
   25.211 ms to 23.329 ms per rank range. The local expert FP8/FP4 GEMV timings
   are unchanged, so true grouped GEMM/DeepGEMM remains the next compute target.
+- Added and gated the default-path DSv4 single-expert `w1`/`w3` pair GEMV
+  experiment behind `ARLE_DSV4_PAIR_EXPERT_GEMV=1`. The real 8xH20 trace kept
+  the `霓彩` output and proved the new `dsv4_fp4_gemv_pair_batch_kernel` runs,
+  but it regressed the local expert work on the current B=1 decode shape
+  (`23.207 ms` per rank range for the pair kernel, 127.412 ms decode wave), so
+  the shipped default remains the split GEMV path while the next compute target
+  stays true grouped GEMM/DeepGEMM.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

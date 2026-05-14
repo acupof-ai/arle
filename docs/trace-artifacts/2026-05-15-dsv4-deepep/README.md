@@ -62,3 +62,10 @@ Current trace set:
   SendRecv/AllReduce, alloc/free/memset/launch runtime overhead, and local
   FP8/FP4 expert GEMV. Actual D2H copy payload is only 44 KiB total; the
   visible `cuMemcpyDtoHAsync_v2` cost is call/synchronization overhead.
+- [`nsys-single-decode-token-pair-gemv/`](nsys-single-decode-token-pair-gemv/)
+  records a negative single-expert `w1`/`w3` pair GEMV experiment. The output
+  remains `霓彩`, but the decode wave is 127.412 ms and the new
+  `dsv4_fp4_gemv_pair_batch_kernel` costs 23.207 ms per rank range. The
+  experiment is therefore gated behind `ARLE_DSV4_PAIR_EXPERT_GEMV=1` and
+  default-off; simple gate/up fusion is not a substitute for real grouped
+  GEMM/DeepGEMM plus DeepEP overlap.

@@ -294,6 +294,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
 | `ARLE_DSV4_PADDED_DISPATCH` | `1`, `0`, unset | `1` | Enables the B=1 decode padded dispatch fast path when `ARLE_DSV4_COUNT_EXCHANGE=allgather`. It uses fixed `ep_world * topk` route slots, skips the send-count zero/count kernel, removes the per-layer count AllGather and all-rank count D2H, and pre-sums padded BF16 combine rows to one row per origin peer before the return exchange. Set `0` to force the exact-count fallback. |
 | `ARLE_DSV4_GROUPED_EXPERTS` | `1` / unset | unset | Enables the raw grouped expert GEMV prototype. The current harness caches per-layer local expert weight pointer arrays and launches only indexed active experts, but remains slower than the default scratch-reuse path on B=1 decode until the raw GEMV work is replaced by real grouped GEMM/DeepGEMM. |
+| `ARLE_DSV4_PAIR_EXPERT_GEMV` | `1` / unset | unset | Enables the single-expert `w1`/`w3` pair GEMV experiment in the default local expert loop. The 8xH20 Nsight trace shows it is functionally correct but slower on the current B=1 decode shape, so it remains default-off. |
 | `ARLE_DSV4_COMBINE_DTYPE` | `bf16`, `fp8`, unset | `bf16` | Selects the return-side MoE combine exchange payload. `fp8` is validated as an opt-in experiment but is not faster than the BF16 default on the current 8xH20 trace. |
 
 Current DSv4 8-rank validation command shape:
