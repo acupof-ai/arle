@@ -884,6 +884,139 @@ __global__ void dsv4_fp4_grouped_gemv_pair_batch_kernel(
     }
 }
 
+__device__ __forceinline__ int dsv4_route_local_expert(
+    const int32_t* __restrict__ route_meta,
+    int route,
+    int local_expert_start,
+    int experts_per_rank)
+{
+    const int expert = route_meta[route * 3 + 1];
+    const int local = expert - local_expert_start;
+    return (local >= 0 && local < experts_per_rank) ? local : -1;
+}
+
+__device__ __forceinline__ float dsv4_route_weight(
+    const int32_t* __restrict__ route_meta,
+    int route)
+{
+    return __int_as_float(route_meta[route * 3 + 2]);
+}
+
+__global__ void dsv4_fp8_route_gemv_batch_kernel(
+    const uint64_t* __restrict__ weight_ptrs,
+    const uint64_t* __restrict__ scale_ptrs,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const int32_t* __restrict__ route_meta,
+    int local_expert_start,
+    int experts_per_rank,
+    int num_routes,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int apply_route_weight)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int route = blockIdx.y;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N || route >= num_routes) return;
+
+    const int expert_idx =
+        dsv4_route_local_expert(route_meta, route, local_expert_start, experts_per_rank);
+    if (expert_idx < 0) return;
+
+    const auto* weight = reinterpret_cast<const uint8_t*>(weight_ptrs[expert_idx]);
+    const auto* scales = reinterpret_cast<const uint8_t*>(scale_ptrs[expert_idx]);
+    const __nv_bfloat16* x = input + route * K;
+
+    const int block_h = (N + scale_rows - 1) / scale_rows;
+    const int block_w = (K + scale_cols - 1) / scale_cols;
+    const int sr_raw = row / block_h;
+    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
+    const int scale_row_offset = sr * scale_cols;
+    float sum = 0.0f;
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const int sc_raw = k / block_w;
+        const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
+        const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
+            * dsv4_decode_e8m0(scales[scale_row_offset + sc]);
+        sum += w * __bfloat162float(x[k]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        if (apply_route_weight) total *= dsv4_route_weight(route_meta, route);
+        output[route * N + row] = __float2bfloat16(total);
+    }
+}
+
+__global__ void dsv4_fp4_route_gemv_batch_kernel(
+    const uint64_t* __restrict__ weight_ptrs,
+    const uint64_t* __restrict__ scale_ptrs,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const int32_t* __restrict__ route_meta,
+    int local_expert_start,
+    int experts_per_rank,
+    int num_routes,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int apply_route_weight)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int route = blockIdx.y;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N || route >= num_routes) return;
+
+    const int expert_idx =
+        dsv4_route_local_expert(route_meta, route, local_expert_start, experts_per_rank);
+    if (expert_idx < 0) return;
+
+    const auto* weight = reinterpret_cast<const uint8_t*>(weight_ptrs[expert_idx]);
+    const auto* scales = reinterpret_cast<const uint8_t*>(scale_ptrs[expert_idx]);
+    const __nv_bfloat16* x = input + route * K;
+    const int bytes_per_row = K / 2;
+    float sum = 0.0f;
+    for (int k = tid_in_row; k < K; k += threads_per_row) {
+        const uint8_t packed = weight[row * bytes_per_row + (k >> 1)];
+        const uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+        const float w = dsv4_decode_fp4_e2m1(nibble)
+            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
+        sum += w * __bfloat162float(x[k]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        if (apply_route_weight) total *= dsv4_route_weight(route_meta, route);
+        output[route * N + row] = __float2bfloat16(total);
+    }
+}
+
 __global__ void dsv4_fp4_gemv_pair_batch_kernel(
     const uint8_t* __restrict__ weight_a,
     const uint8_t* __restrict__ scales_a,
@@ -2369,6 +2502,63 @@ cudaError_t dsv4_fp4_grouped_gemv_pair_batch_cuda(
         weight_a_ptrs, scale_a_ptrs, weight_b_ptrs, scale_b_ptrs, input,
         output_a, output_b, offsets, counts, expert_indices, max_count, N, K,
         scale_rows, scale_cols);
+    return cudaGetLastError();
+}
+
+cudaError_t dsv4_fp8_route_gemv_batch_cuda(
+    const uint64_t* weight_ptrs,
+    const uint64_t* scale_ptrs,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    const int32_t* route_meta,
+    int local_expert_start,
+    int experts_per_rank,
+    int num_routes,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int apply_route_weight,
+    cudaStream_t stream) {
+    if (num_routes <= 0 || N <= 0 || K <= 0 || local_expert_start < 0 ||
+        experts_per_rank <= 0 || scale_rows <= 0 || scale_cols <= 0) {
+        return cudaSuccess;
+    }
+    dim3 block(GEMV_THREADS);
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, num_routes);
+    dsv4_fp8_route_gemv_batch_kernel<<<grid, block, 0, stream>>>(
+        weight_ptrs, scale_ptrs, input, output, route_meta, local_expert_start,
+        experts_per_rank, num_routes, N, K, scale_rows, scale_cols,
+        apply_route_weight);
+    return cudaGetLastError();
+}
+
+cudaError_t dsv4_fp4_route_gemv_batch_cuda(
+    const uint64_t* weight_ptrs,
+    const uint64_t* scale_ptrs,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    const int32_t* route_meta,
+    int local_expert_start,
+    int experts_per_rank,
+    int num_routes,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int apply_route_weight,
+    cudaStream_t stream) {
+    if (num_routes <= 0 || N <= 0 || K <= 0 || (K & 1) != 0 ||
+        local_expert_start < 0 || experts_per_rank <= 0 || scale_rows <= 0 ||
+        scale_cols <= 0) {
+        return cudaSuccess;
+    }
+    dim3 block(GEMV_THREADS);
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, num_routes);
+    dsv4_fp4_route_gemv_batch_kernel<<<grid, block, 0, stream>>>(
+        weight_ptrs, scale_ptrs, input, output, route_meta, local_expert_start,
+        experts_per_rank, num_routes, N, K, scale_rows, scale_cols,
+        apply_route_weight);
     return cudaGetLastError();
 }
 

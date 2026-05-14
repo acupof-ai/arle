@@ -183,7 +183,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   GEMV kernels. A follow-up pair GEMV kernel now fuses grouped `w1`/`w3`
   gate/up launches and is visible in DeepEP decode nsys, but it remains opt-in:
   the decode window is still dominated by NCCL send/recv plus alloc/free and
-  launch churn. Per-layer DeepEP dispatch scratch reuse further raises default
+  launch churn. A route-wise grouped expert experiment also remains opt-in:
+  it removes the local-count D2H readback, but real 8xH20 nsys regresses the
+  single-token decode wave to **145.7 ms** because route-wise FP4 GEMV over
+  fixed padded slots costs **35.9 ms** per rank range. Per-layer DeepEP
+  dispatch scratch reuse further raises default
   short math smoke to **7.7-7.8 tok/s** and cuts Nsight
   `cuMemAllocAsync`/`cuMemFreeAsync` calls in the 8-token window from 136,825 to
   111,531. A follow-up single-token nsys window now isolates one generated

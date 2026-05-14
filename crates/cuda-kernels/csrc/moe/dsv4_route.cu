@@ -25,6 +25,16 @@ __device__ __forceinline__ float dsv4_route_i32_bits_to_f32(const int32_t value)
   return __int_as_float(value);
 }
 
+__device__ __forceinline__ int dsv4_route_local_expert(
+    const int32_t *__restrict__ meta,
+    int route,
+    int local_expert_start,
+    int experts_per_rank) {
+  int expert = meta[route * 3 + 1];
+  int local = expert - local_expert_start;
+  return (local >= 0 && local < experts_per_rank) ? local : -1;
+}
+
 extern "C" CUresult dsv4_zero_bf16_cuda(
     uint16_t *data,
     int elements,
@@ -69,6 +79,62 @@ extern "C" CUresult dsv4_dequantize_fp8_rows_to_bf16_cuda(
   int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
   dsv4_dequantize_fp8_rows_to_bf16_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
       input, scales, output, rows, cols);
+  return (CUresult)cudaGetLastError();
+}
+
+__device__ __forceinline__ uint16_t dsv4_swiglu_clamped_one(
+    uint16_t gate_bits,
+    uint16_t up_bits,
+    float limit) {
+  float gate = dsv4_route_bf16_to_f32(gate_bits);
+  float up = dsv4_route_bf16_to_f32(up_bits);
+  gate = fminf(gate, limit);
+  up = fminf(fmaxf(up, -limit), limit);
+  float silu = gate / (1.0f + expf(-gate));
+  return dsv4_route_f32_to_bf16_bits(silu * up);
+}
+
+__global__ void dsv4_swiglu_clamped_routes_kernel(
+    const uint16_t *__restrict__ gate,
+    const uint16_t *__restrict__ up,
+    uint16_t *__restrict__ out,
+    const int32_t *__restrict__ route_meta,
+    int num_routes,
+    int hidden_dim,
+    int local_expert_start,
+    int experts_per_rank,
+    float limit) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_routes * hidden_dim;
+  if (idx >= total) return;
+  int route = idx / hidden_dim;
+  if (dsv4_route_local_expert(route_meta, route, local_expert_start, experts_per_rank) < 0) {
+    return;
+  }
+  out[idx] = dsv4_swiglu_clamped_one(gate[idx], up[idx], limit);
+}
+
+extern "C" CUresult dsv4_swiglu_clamped_routes_cuda(
+    const uint16_t *gate,
+    const uint16_t *up,
+    uint16_t *out,
+    const int32_t *route_meta,
+    int num_routes,
+    int hidden_dim,
+    int local_expert_start,
+    int experts_per_rank,
+    float limit,
+    CUstream stream) {
+  if (num_routes < 0 || hidden_dim <= 0 || local_expert_start < 0 ||
+      experts_per_rank <= 0 || !(limit > 0.0f)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = num_routes * hidden_dim;
+  if (total == 0) return CUDA_SUCCESS;
+  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_swiglu_clamped_routes_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      gate, up, out, route_meta, num_routes, hidden_dim, local_expert_start,
+      experts_per_rank, limit);
   return (CUresult)cudaGetLastError();
 }
 

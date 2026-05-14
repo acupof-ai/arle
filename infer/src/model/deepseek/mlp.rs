@@ -745,6 +745,80 @@ fn dsv4_run_grouped_block_scaled_gemv_pair(
 }
 
 #[cfg(feature = "cuda")]
+fn dsv4_run_route_block_scaled_gemv(
+    ctx: &DeviceContext,
+    weights: &DeepseekGroupedExpertWeightPtrCache,
+    input: &HiddenStates,
+    output: &mut HiddenStates,
+    route_meta: &CudaSlice<i32>,
+    local_expert_start: i32,
+    experts_per_rank: i32,
+    num_routes: usize,
+    apply_route_weight: bool,
+) -> Result<()> {
+    ensure!(
+        input.hidden_dim == weights.cols && output.hidden_dim == weights.rows,
+        "DeepSeek V4 route-grouped expert GEMV shape mismatch: input={} weight={}x{} output={}",
+        input.hidden_dim,
+        weights.rows,
+        weights.cols,
+        output.hidden_dim
+    );
+    ensure!(
+        input.seq_len >= num_routes && output.seq_len >= num_routes,
+        "DeepSeek V4 route-grouped expert GEMV route capacity mismatch: input={} output={} routes={}",
+        input.seq_len,
+        output.seq_len,
+        num_routes
+    );
+
+    let (w_ptr, _w_guard) = weights.weight_ptrs.device_ptr(&ctx.stream);
+    let (s_ptr, _s_guard) = weights.scale_ptrs.device_ptr(&ctx.stream);
+    let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+    let (y_ptr, _y_guard) = output.data.device_ptr_mut(&ctx.stream);
+    let (meta_ptr, _meta_guard) = route_meta.device_ptr(&ctx.stream);
+    let apply = i32::from(apply_route_weight);
+    let res = unsafe {
+        match weights.format {
+            DeepseekDsv4GroupedBlockFormat::Fp8 => ffi::dsv4_fp8_route_gemv_batch_cuda(
+                w_ptr as *const u64,
+                s_ptr as *const u64,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                meta_ptr as *const i32,
+                local_expert_start,
+                experts_per_rank,
+                num_routes as i32,
+                weights.rows as i32,
+                weights.cols as i32,
+                weights.scale_rows as i32,
+                weights.scale_cols as i32,
+                apply,
+                ctx.stream.cu_stream(),
+            ),
+            DeepseekDsv4GroupedBlockFormat::Fp4 => ffi::dsv4_fp4_route_gemv_batch_cuda(
+                w_ptr as *const u64,
+                s_ptr as *const u64,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                meta_ptr as *const i32,
+                local_expert_start,
+                experts_per_rank,
+                num_routes as i32,
+                weights.rows as i32,
+                weights.cols as i32,
+                weights.scale_rows as i32,
+                weights.scale_cols as i32,
+                apply,
+                ctx.stream.cu_stream(),
+            ),
+        }
+    };
+    res.result()
+        .map_err(|err| anyhow::anyhow!("DeepSeek V4 route-grouped expert GEMV failed: {err}"))
+}
+
+#[cfg(feature = "cuda")]
 fn dsv4_grouped_experts_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_GROUPED_EXPERTS").ok() else {
         return Ok(false);
@@ -765,6 +839,18 @@ fn dsv4_pair_expert_gemv_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
         other => bail!("invalid ARLE_DSV4_PAIR_EXPERT_GEMV value `{other}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_route_grouped_experts_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_ROUTE_GROUPED_EXPERTS").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
+        other => bail!("invalid ARLE_DSV4_ROUTE_GROUPED_EXPERTS value `{other}`"),
     }
 }
 
@@ -1567,6 +1653,148 @@ impl DeepseekV4MoeBlock {
         Ok(true)
     }
 
+    fn forward_route_grouped_dsv4_experts_gpu(
+        &self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        recv_hidden: &HiddenStates,
+        recv_meta: &CudaSlice<i32>,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        num_routes: usize,
+        route_out: &mut HiddenStates,
+        scratch_cache: &mut DeepseekMoeRuntimeCache,
+    ) -> Result<bool> {
+        if num_routes == 0 || self.experts.is_empty() {
+            return Ok(true);
+        }
+        if self.experts.is_empty()
+            || self
+                .experts
+                .iter()
+                .any(|expert| dsv4_grouped_format(&expert.w1).is_none())
+            || self
+                .experts
+                .iter()
+                .any(|expert| dsv4_grouped_format(&expert.w3).is_none())
+            || self
+                .experts
+                .iter()
+                .any(|expert| dsv4_grouped_format(&expert.w2).is_none())
+        {
+            return Ok(false);
+        }
+
+        let first = &self.experts[0];
+        ensure!(
+            first.w1.rows == first.w3.rows
+                && first.w1.cols == recv_hidden.hidden_dim
+                && first.w3.cols == recv_hidden.hidden_dim
+                && first.w2.cols == first.w1.rows
+                && first.w2.rows == route_out.hidden_dim,
+            "DeepSeek V4 route-grouped expert shape mismatch"
+        );
+        ensure!(
+            recv_hidden.seq_len >= num_routes && route_out.seq_len >= num_routes,
+            "DeepSeek V4 route-grouped expert route capacity mismatch: recv={} route_out={} routes={}",
+            recv_hidden.seq_len,
+            route_out.seq_len,
+            num_routes
+        );
+
+        let scratch = scratch_cache.ensure_grouped_expert_scratch(
+            ctx,
+            route_out.hidden_dim,
+            first.w1.rows,
+            num_routes,
+        )?;
+        scratch.gate.seq_len = num_routes;
+        scratch.up.seq_len = num_routes;
+        scratch.act.seq_len = num_routes;
+        scratch.out.seq_len = num_routes;
+
+        {
+            let w1_ptrs = dsv4_ensure_grouped_weight_ptrs(
+                ctx,
+                &self.experts,
+                &mut scratch.w1_ptrs,
+                |expert| &expert.w1,
+            )?;
+            dsv4_run_route_block_scaled_gemv(
+                ctx,
+                w1_ptrs,
+                recv_hidden,
+                &mut scratch.gate,
+                recv_meta,
+                local_expert_start,
+                experts_per_rank,
+                num_routes,
+                false,
+            )?;
+        }
+        {
+            let w3_ptrs = dsv4_ensure_grouped_weight_ptrs(
+                ctx,
+                &self.experts,
+                &mut scratch.w3_ptrs,
+                |expert| &expert.w3,
+            )?;
+            dsv4_run_route_block_scaled_gemv(
+                ctx,
+                w3_ptrs,
+                recv_hidden,
+                &mut scratch.up,
+                recv_meta,
+                local_expert_start,
+                experts_per_rank,
+                num_routes,
+                false,
+            )?;
+        }
+        {
+            let (gate_ptr, _gate_guard) = scratch.gate.data.device_ptr(&ctx.stream);
+            let (up_ptr, _up_guard) = scratch.up.data.device_ptr(&ctx.stream);
+            let (act_ptr, _act_guard) = scratch.act.data.device_ptr_mut(&ctx.stream);
+            let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_swiglu_clamped_routes_cuda(
+                    gate_ptr as *const ffi::Half,
+                    up_ptr as *const ffi::Half,
+                    act_ptr as *mut ffi::Half,
+                    meta_ptr as *const i32,
+                    num_routes as i32,
+                    first.w1.rows as i32,
+                    local_expert_start,
+                    experts_per_rank,
+                    config.swiglu_limit,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 route-grouped SwiGLU failed: {err}"))?;
+            }
+        }
+        {
+            let w2_ptrs = dsv4_ensure_grouped_weight_ptrs(
+                ctx,
+                &self.experts,
+                &mut scratch.w2_ptrs,
+                |expert| &expert.w2,
+            )?;
+            dsv4_run_route_block_scaled_gemv(
+                ctx,
+                w2_ptrs,
+                &scratch.act,
+                route_out,
+                recv_meta,
+                local_expert_start,
+                experts_per_rank,
+                num_routes,
+                true,
+            )?;
+        }
+        Ok(true)
+    }
+
     #[cfg(feature = "nccl")]
     pub(super) fn forward_deepep_routed_gpu(
         &self,
@@ -1610,6 +1838,8 @@ impl DeepseekV4MoeBlock {
         let use_padded_dispatch = hidden.seq_len == 1
             && matches!(count_exchange_mode, Dsv4CountExchangeMode::AllGather)
             && dsv4_padded_dispatch_enabled()?;
+        let use_route_grouped_experts =
+            use_padded_dispatch && dsv4_route_grouped_experts_enabled()?;
         let send_route_capacity = if use_padded_dispatch {
             ep.world_size.saturating_mul(config.num_experts_per_tok)
         } else {
@@ -1684,6 +1914,13 @@ impl DeepseekV4MoeBlock {
         };
         let mut local_route_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
             cache.local_route.take()
+        } else {
+            None
+        };
+        let mut route_grouped_scratch_slot = if use_route_grouped_experts && moe_scratch.is_some() {
+            moe_scratch
+                .as_deref_mut()
+                .and_then(|cache| cache.grouped.take())
         } else {
             None
         };
@@ -2208,255 +2445,290 @@ impl DeepseekV4MoeBlock {
             let local_expert_start = ep.local_expert_range().start;
             let local_expert_start_i32 = i32::try_from(local_expert_start)
                 .map_err(|_| anyhow::anyhow!("DeepSeek V4 local expert start overflows i32"))?;
-            dsv4_zero_i32_slice(ctx, local_counts, ep.experts_per_rank)?;
-            {
-                let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
-                let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
-                unsafe {
-                    ffi::dsv4_count_packed_local_experts_cuda(
-                        meta_ptr as *const i32,
-                        count_ptr as *mut i32,
-                        total_recv_routes as i32,
+            let route_grouped_done = if use_route_grouped_experts {
+                if has_moe_scratch {
+                    let mut route_grouped_cache = DeepseekMoeRuntimeCache {
+                        grouped: route_grouped_scratch_slot.take(),
+                        ..Default::default()
+                    };
+                    let done = self.forward_route_grouped_dsv4_experts_gpu(
+                        ctx,
+                        config,
+                        recv_hidden,
+                        recv_meta,
                         local_expert_start_i32,
                         experts_per_rank_i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 recv local expert count failed: {err}")
-                    })?;
-                }
-            }
-            let local_counts_host = ctx
-                .stream
-                .clone_dtoh(local_counts)
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv local count D2H failed: {err}"))?;
-            let (local_offsets_i32, total_local_routes) =
-                dsv4_counts_to_offsets_i32(&local_counts_host, "recv_local_counts")?;
-            let local_offsets = dsv4_offsets_to_usize(&local_offsets_i32)?;
-            let local_counts_usize = dsv4_counts_to_usize(&local_counts_host, "recv_local_counts")?;
-            let max_local_routes = local_counts_usize.iter().copied().max().unwrap_or(0);
-            ctx.stream
-                .memcpy_htod(&local_offsets_i32, local_offsets_gpu)
-                .map_err(|err| {
-                    anyhow::anyhow!("DeepSeek V4 recv local offsets H2D failed: {err}")
-                })?;
-            dsv4_zero_i32_slice(ctx, local_cursors, ep.experts_per_rank)?;
-            if !use_padded_dispatch {
-                ensure!(
-                    total_local_routes == total_recv_routes,
-                    "DeepSeek V4 DeepEP received {} routes but only {} target this rank",
-                    total_recv_routes,
-                    total_local_routes
-                );
-            }
-            let mut expert_hidden_owned: Option<HiddenStates>;
-            let mut expert_weight_owned: Option<CudaSlice<f32>>;
-            let mut expert_route_slot_owned: Option<CudaSlice<i32>>;
-            let mut local_route_scratch = if use_decode_route_scratch {
-                Some(ensure_local_route_scratch(
-                    &mut local_route_scratch_slot,
-                    ctx,
-                    hidden.hidden_dim,
-                    total_local_routes,
-                )?)
-            } else {
-                None
-            };
-            let (expert_hidden, expert_weight, expert_route_slot): (
-                &mut HiddenStates,
-                &mut CudaSlice<f32>,
-                &mut CudaSlice<i32>,
-            ) = if let Some(scratch) = local_route_scratch.as_deref_mut() {
-                scratch.expert_hidden.seq_len = total_local_routes;
-                (
-                    &mut scratch.expert_hidden,
-                    &mut scratch.expert_weight,
-                    &mut scratch.expert_route_slot,
-                )
-            } else {
-                expert_hidden_owned = Some(HiddenStates::zeros(
-                    ctx,
-                    hidden.hidden_dim,
-                    total_local_routes,
-                )?);
-                expert_weight_owned = Some(
-                    ctx.stream
-                        .alloc_zeros::<f32>(total_local_routes)
-                        .map_err(|err| {
-                            anyhow::anyhow!("DeepSeek V4 expert weight alloc failed: {err}")
-                        })?,
-                );
-                expert_route_slot_owned = Some(
-                    ctx.stream
-                        .alloc_zeros::<i32>(total_local_routes)
-                        .map_err(|err| {
-                            anyhow::anyhow!("DeepSeek V4 expert route-slot alloc failed: {err}")
-                        })?,
-                );
-                (
-                    expert_hidden_owned
-                        .as_mut()
-                        .expect("DeepSeek V4 expert hidden fallback allocated"),
-                    expert_weight_owned
-                        .as_mut()
-                        .expect("DeepSeek V4 expert weight fallback allocated"),
-                    expert_route_slot_owned
-                        .as_mut()
-                        .expect("DeepSeek V4 expert route-slot fallback allocated"),
-                )
-            };
-            {
-                let (recv_hidden_ptr, _recv_hidden_guard) =
-                    recv_hidden.data.device_ptr(&ctx.stream);
-                let (recv_meta_ptr, _recv_meta_guard) = recv_meta.device_ptr(&ctx.stream);
-                let (offset_ptr, _offset_guard) = local_offsets_gpu.device_ptr(&ctx.stream);
-                let (cursor_ptr, _cursor_guard) = local_cursors.device_ptr_mut(&ctx.stream);
-                let (expert_hidden_ptr, _expert_hidden_guard) =
-                    expert_hidden.data.device_ptr_mut(&ctx.stream);
-                let (expert_weight_ptr, _expert_weight_guard) =
-                    expert_weight.device_ptr_mut(&ctx.stream);
-                let (route_slot_ptr, _route_slot_guard) =
-                    expert_route_slot.device_ptr_mut(&ctx.stream);
-                unsafe {
-                    ffi::dsv4_pack_received_experts_cuda(
-                        recv_hidden_ptr as *const ffi::Half,
-                        recv_meta_ptr as *const i32,
-                        offset_ptr as *const i32,
-                        cursor_ptr as *mut i32,
-                        expert_hidden_ptr as *mut ffi::Half,
-                        expert_weight_ptr as *mut f32,
-                        route_slot_ptr as *mut i32,
-                        total_recv_routes as i32,
-                        hidden.hidden_dim as i32,
-                        local_expert_start_i32,
-                        experts_per_rank_i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 recv local expert pack failed: {err}")
-                    })?;
-                }
-            }
-
-            let grouped_done = if dsv4_grouped_experts_enabled()? {
-                if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
-                    let active_experts = local_counts_usize
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, &count)| (count > 0).then_some(idx))
-                        .collect::<Vec<_>>();
-                    if active_experts.is_empty() {
-                        true
-                    } else {
-                        let active_offsets_i32 = active_experts
-                            .iter()
-                            .map(|&idx| local_offsets_i32[idx])
-                            .collect::<Vec<_>>();
-                        let active_counts_i32 = active_experts
-                            .iter()
-                            .map(|&idx| local_counts_host[idx])
-                            .collect::<Vec<_>>();
-                        self.forward_grouped_dsv4_experts_gpu(
-                            ctx,
-                            config,
-                            &expert_hidden,
-                            &expert_route_slot,
-                            &expert_weight,
-                            &active_experts,
-                            &active_offsets_i32,
-                            &active_counts_i32,
-                            total_local_routes,
-                            max_local_routes,
-                            route_out,
-                            scratch_cache,
-                        )?
-                    }
+                        total_recv_routes,
+                        route_out,
+                        &mut route_grouped_cache,
+                    )?;
+                    route_grouped_scratch_slot = route_grouped_cache.grouped.take();
+                    done
                 } else {
                     false
                 }
             } else {
                 false
             };
-            if !grouped_done {
-                for (local_expert_idx, expert) in self.experts.iter().enumerate() {
-                    let count = local_counts_usize[local_expert_idx];
-                    if count == 0 {
-                        continue;
-                    }
-                    let offset = local_offsets[local_expert_idx];
-                    let elem_start = offset * hidden.hidden_dim;
-                    let elem_end = elem_start + count * hidden.hidden_dim;
-                    let expert_out_ref;
-                    let expert_out_owned;
-                    let expert_out = if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
-                        let scratch = scratch_cache.ensure_expert_scratch(
-                            ctx,
-                            hidden.hidden_dim,
-                            expert.w1.rows,
-                            expert.w2.rows,
-                            count,
-                        )?;
-                        let segment_done = expert.try_forward_scratch_input_segment(
-                            ctx,
-                            expert_hidden,
-                            offset,
-                            count,
-                            config.swiglu_limit,
-                            scratch,
-                        )?;
-                        if !segment_done {
-                            scratch.input.seq_len = count;
-                            let src = expert_hidden.data.slice(elem_start..elem_end);
-                            let mut dst =
-                                scratch.input.data.slice_mut(0..count * hidden.hidden_dim);
-                            ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|err| {
-                                anyhow::anyhow!(
-                                    "DeepSeek V4 recv expert input scratch D2D failed: {err}"
-                                )
-                            })?;
-                            let _ =
-                                expert.forward_scratch_input(ctx, config.swiglu_limit, scratch)?;
-                        }
-                        expert_out_ref = &scratch.out;
-                        expert_out_ref
-                    } else {
-                        let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;
-                        {
-                            let src = expert_hidden.data.slice(elem_start..elem_end);
-                            ctx.stream
-                                .memcpy_dtod(&src, &mut expert_input.data)
-                                .map_err(|err| {
-                                    anyhow::anyhow!(
-                                        "DeepSeek V4 recv expert input D2D failed: {err}"
-                                    )
-                                })?;
-                        }
-                        expert_out_owned =
-                            expert.forward(ctx, &expert_input, config.swiglu_limit)?;
-                        &expert_out_owned
-                    };
-                    let (expert_ptr, _expert_guard) = expert_out.data.device_ptr(&ctx.stream);
-                    let (route_out_ptr, _route_guard) = route_out.data.device_ptr_mut(&ctx.stream);
-                    let (route_slot_ptr, _route_slot_guard) =
-                        expert_route_slot.device_ptr(&ctx.stream);
-                    let (weight_ptr, _weight_guard) = expert_weight.device_ptr(&ctx.stream);
+
+            if !route_grouped_done {
+                dsv4_zero_i32_slice(ctx, local_counts, ep.experts_per_rank)?;
+                {
+                    let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+                    let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
                     unsafe {
-                        ffi::dsv4_scatter_packed_route_slot_cuda(
-                            expert_ptr as *const ffi::Half,
-                            route_out_ptr as *mut ffi::Half,
-                            route_slot_ptr as *const i32,
-                            weight_ptr as *const f32,
-                            local_offsets_i32[local_expert_idx],
-                            local_counts_host[local_expert_idx],
-                            hidden.hidden_dim as i32,
+                        ffi::dsv4_count_packed_local_experts_cuda(
+                            meta_ptr as *const i32,
+                            count_ptr as *mut i32,
+                            total_recv_routes as i32,
+                            local_expert_start_i32,
+                            experts_per_rank_i32,
                             ctx.stream.cu_stream(),
                         )
                         .result()
                         .map_err(|err| {
-                            anyhow::anyhow!("DeepSeek V4 recv expert route scatter failed: {err}")
+                            anyhow::anyhow!("DeepSeek V4 recv local expert count failed: {err}")
                         })?;
+                    }
+                }
+                let local_counts_host = ctx.stream.clone_dtoh(local_counts).map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 recv local count D2H failed: {err}")
+                })?;
+                let (local_offsets_i32, total_local_routes) =
+                    dsv4_counts_to_offsets_i32(&local_counts_host, "recv_local_counts")?;
+                let local_offsets = dsv4_offsets_to_usize(&local_offsets_i32)?;
+                let local_counts_usize =
+                    dsv4_counts_to_usize(&local_counts_host, "recv_local_counts")?;
+                let max_local_routes = local_counts_usize.iter().copied().max().unwrap_or(0);
+                ctx.stream
+                    .memcpy_htod(&local_offsets_i32, local_offsets_gpu)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 recv local offsets H2D failed: {err}")
+                    })?;
+                dsv4_zero_i32_slice(ctx, local_cursors, ep.experts_per_rank)?;
+                if !use_padded_dispatch {
+                    ensure!(
+                        total_local_routes == total_recv_routes,
+                        "DeepSeek V4 DeepEP received {} routes but only {} target this rank",
+                        total_recv_routes,
+                        total_local_routes
+                    );
+                }
+                let mut expert_hidden_owned: Option<HiddenStates>;
+                let mut expert_weight_owned: Option<CudaSlice<f32>>;
+                let mut expert_route_slot_owned: Option<CudaSlice<i32>>;
+                let mut local_route_scratch = if use_decode_route_scratch {
+                    Some(ensure_local_route_scratch(
+                        &mut local_route_scratch_slot,
+                        ctx,
+                        hidden.hidden_dim,
+                        total_local_routes,
+                    )?)
+                } else {
+                    None
+                };
+                let (expert_hidden, expert_weight, expert_route_slot): (
+                    &mut HiddenStates,
+                    &mut CudaSlice<f32>,
+                    &mut CudaSlice<i32>,
+                ) = if let Some(scratch) = local_route_scratch.as_deref_mut() {
+                    scratch.expert_hidden.seq_len = total_local_routes;
+                    (
+                        &mut scratch.expert_hidden,
+                        &mut scratch.expert_weight,
+                        &mut scratch.expert_route_slot,
+                    )
+                } else {
+                    expert_hidden_owned = Some(HiddenStates::zeros(
+                        ctx,
+                        hidden.hidden_dim,
+                        total_local_routes,
+                    )?);
+                    expert_weight_owned = Some(
+                        ctx.stream
+                            .alloc_zeros::<f32>(total_local_routes)
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 expert weight alloc failed: {err}")
+                            })?,
+                    );
+                    expert_route_slot_owned = Some(
+                        ctx.stream
+                            .alloc_zeros::<i32>(total_local_routes)
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 expert route-slot alloc failed: {err}")
+                            })?,
+                    );
+                    (
+                        expert_hidden_owned
+                            .as_mut()
+                            .expect("DeepSeek V4 expert hidden fallback allocated"),
+                        expert_weight_owned
+                            .as_mut()
+                            .expect("DeepSeek V4 expert weight fallback allocated"),
+                        expert_route_slot_owned
+                            .as_mut()
+                            .expect("DeepSeek V4 expert route-slot fallback allocated"),
+                    )
+                };
+                {
+                    let (recv_hidden_ptr, _recv_hidden_guard) =
+                        recv_hidden.data.device_ptr(&ctx.stream);
+                    let (recv_meta_ptr, _recv_meta_guard) = recv_meta.device_ptr(&ctx.stream);
+                    let (offset_ptr, _offset_guard) = local_offsets_gpu.device_ptr(&ctx.stream);
+                    let (cursor_ptr, _cursor_guard) = local_cursors.device_ptr_mut(&ctx.stream);
+                    let (expert_hidden_ptr, _expert_hidden_guard) =
+                        expert_hidden.data.device_ptr_mut(&ctx.stream);
+                    let (expert_weight_ptr, _expert_weight_guard) =
+                        expert_weight.device_ptr_mut(&ctx.stream);
+                    let (route_slot_ptr, _route_slot_guard) =
+                        expert_route_slot.device_ptr_mut(&ctx.stream);
+                    unsafe {
+                        ffi::dsv4_pack_received_experts_cuda(
+                            recv_hidden_ptr as *const ffi::Half,
+                            recv_meta_ptr as *const i32,
+                            offset_ptr as *const i32,
+                            cursor_ptr as *mut i32,
+                            expert_hidden_ptr as *mut ffi::Half,
+                            expert_weight_ptr as *mut f32,
+                            route_slot_ptr as *mut i32,
+                            total_recv_routes as i32,
+                            hidden.hidden_dim as i32,
+                            local_expert_start_i32,
+                            experts_per_rank_i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 recv local expert pack failed: {err}")
+                        })?;
+                    }
+                }
+
+                let grouped_done = if dsv4_grouped_experts_enabled()? {
+                    if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
+                        let active_experts = local_counts_usize
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, &count)| (count > 0).then_some(idx))
+                            .collect::<Vec<_>>();
+                        if active_experts.is_empty() {
+                            true
+                        } else {
+                            let active_offsets_i32 = active_experts
+                                .iter()
+                                .map(|&idx| local_offsets_i32[idx])
+                                .collect::<Vec<_>>();
+                            let active_counts_i32 = active_experts
+                                .iter()
+                                .map(|&idx| local_counts_host[idx])
+                                .collect::<Vec<_>>();
+                            self.forward_grouped_dsv4_experts_gpu(
+                                ctx,
+                                config,
+                                &expert_hidden,
+                                &expert_route_slot,
+                                &expert_weight,
+                                &active_experts,
+                                &active_offsets_i32,
+                                &active_counts_i32,
+                                total_local_routes,
+                                max_local_routes,
+                                route_out,
+                                scratch_cache,
+                            )?
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !grouped_done {
+                    for (local_expert_idx, expert) in self.experts.iter().enumerate() {
+                        let count = local_counts_usize[local_expert_idx];
+                        if count == 0 {
+                            continue;
+                        }
+                        let offset = local_offsets[local_expert_idx];
+                        let elem_start = offset * hidden.hidden_dim;
+                        let elem_end = elem_start + count * hidden.hidden_dim;
+                        let expert_out_ref;
+                        let expert_out_owned;
+                        let expert_out = if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
+                            let scratch = scratch_cache.ensure_expert_scratch(
+                                ctx,
+                                hidden.hidden_dim,
+                                expert.w1.rows,
+                                expert.w2.rows,
+                                count,
+                            )?;
+                            let segment_done = expert.try_forward_scratch_input_segment(
+                                ctx,
+                                expert_hidden,
+                                offset,
+                                count,
+                                config.swiglu_limit,
+                                scratch,
+                            )?;
+                            if !segment_done {
+                                scratch.input.seq_len = count;
+                                let src = expert_hidden.data.slice(elem_start..elem_end);
+                                let mut dst =
+                                    scratch.input.data.slice_mut(0..count * hidden.hidden_dim);
+                                ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|err| {
+                                    anyhow::anyhow!(
+                                        "DeepSeek V4 recv expert input scratch D2D failed: {err}"
+                                    )
+                                })?;
+                                let _ = expert.forward_scratch_input(
+                                    ctx,
+                                    config.swiglu_limit,
+                                    scratch,
+                                )?;
+                            }
+                            expert_out_ref = &scratch.out;
+                            expert_out_ref
+                        } else {
+                            let mut expert_input =
+                                HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;
+                            {
+                                let src = expert_hidden.data.slice(elem_start..elem_end);
+                                ctx.stream
+                                    .memcpy_dtod(&src, &mut expert_input.data)
+                                    .map_err(|err| {
+                                        anyhow::anyhow!(
+                                            "DeepSeek V4 recv expert input D2D failed: {err}"
+                                        )
+                                    })?;
+                            }
+                            expert_out_owned =
+                                expert.forward(ctx, &expert_input, config.swiglu_limit)?;
+                            &expert_out_owned
+                        };
+                        let (expert_ptr, _expert_guard) = expert_out.data.device_ptr(&ctx.stream);
+                        let (route_out_ptr, _route_guard) =
+                            route_out.data.device_ptr_mut(&ctx.stream);
+                        let (route_slot_ptr, _route_slot_guard) =
+                            expert_route_slot.device_ptr(&ctx.stream);
+                        let (weight_ptr, _weight_guard) = expert_weight.device_ptr(&ctx.stream);
+                        unsafe {
+                            ffi::dsv4_scatter_packed_route_slot_cuda(
+                                expert_ptr as *const ffi::Half,
+                                route_out_ptr as *mut ffi::Half,
+                                route_slot_ptr as *const i32,
+                                weight_ptr as *const f32,
+                                local_offsets_i32[local_expert_idx],
+                                local_counts_host[local_expert_idx],
+                                hidden.hidden_dim as i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DeepSeek V4 recv expert route scatter failed: {err}"
+                                )
+                            })?;
+                        }
                     }
                 }
             }
@@ -2829,6 +3101,9 @@ impl DeepseekV4MoeBlock {
             cache.send_route = send_route_scratch_slot.take();
             cache.recv_route = recv_route_scratch_slot.take();
             cache.local_route = local_route_scratch_slot.take();
+            if use_route_grouped_experts {
+                cache.grouped = route_grouped_scratch_slot.take();
+            }
         }
         Ok(out)
     }

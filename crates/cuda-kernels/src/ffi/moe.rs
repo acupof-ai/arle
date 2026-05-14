@@ -4,6 +4,19 @@ use super::{CUresult, CUstream, Half};
 unsafe extern "C" {
     pub fn dsv4_zero_bf16_cuda(data: *mut Half, elements: i32, stream: CUstream) -> CUresult;
 
+    pub fn dsv4_swiglu_clamped_routes_cuda(
+        gate: *const Half,
+        up: *const Half,
+        out: *mut Half,
+        route_meta: *const i32,
+        num_routes: i32,
+        hidden_dim: i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_dequantize_fp8_rows_to_bf16_cuda(
         input: *const u8,
         scales: *const f32,

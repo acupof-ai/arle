@@ -1,0 +1,25 @@
+Processing [/root/arle-decode-hidden-scratch/docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-grouped/trace.sqlite] with [/opt/nvidia/nsight-systems/2023.2.3/host-linux-x64/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)    Min (ns)   Max (ns)   StdDev (ns)                 Name               
+ --------  ---------------  ---------  -----------  -----------  ---------  ---------  -----------  ----------------------------------
+     36.3    1,467,974,936     40,670     36,094.8      2,916.5        149  1,024,243     72,658.5  cuMemFreeAsync                    
+     30.8    1,244,542,246     40,670     30,601.0     13,321.0        116  1,394,115     43,200.1  cuMemAllocAsync                   
+     10.1      409,157,860     38,189     10,714.0      7,419.0      2,680    192,633      8,346.6  cudaLaunchKernel                  
+      9.9      398,622,493     40,302      9,890.9      6,463.0        111    376,626      8,882.0  cuMemsetD8Async                   
+      4.9      197,809,580        700    282,585.1    145,926.5     12,082  8,782,807    480,796.3  cuMemcpyDtoHAsync_v2              
+      1.4       57,515,201      3,796     15,151.5     10,584.0      2,456    169,378     12,063.3  cuMemcpyHtoDAsync_v2              
+      1.4       56,083,062         16  3,505,191.4  3,061,966.5  1,640,002  8,022,097  1,967,338.1  cuStreamSynchronize               
+      1.2       49,319,204      6,896      7,151.9      3,500.0        499     82,606      8,277.6  cudaEventRecord                   
+      1.1       42,887,847      6,192      6,926.3      3,433.0        642    103,220      7,983.3  cudaStreamWaitEvent               
+      1.0       41,666,083      2,084     19,993.3     15,293.0      3,961    666,059     19,667.4  cuMemcpyDtoDAsync_v2              
+      0.9       35,363,783      3,096     11,422.4      8,071.5      3,444     81,840      8,441.1  cuLaunchKernelEx                  
+      0.6       25,124,493      6,616      3,797.5      1,538.0        244     65,256      5,518.6  cudaStreamGetCaptureInfo_v2_v11030
+      0.2        8,522,630      3,096      2,752.8        685.5        133     49,340      4,795.4  cudaGetFuncBySymbol_v11000        
+      0.1        4,868,494        344     14,152.6     10,221.5      4,842     94,995      9,771.8  cudaMemsetAsync                   
+      0.0        1,471,637          8    183,954.6    185,548.0     88,829    302,015     75,422.7  cuMemGetInfo_v2                   
+      0.0           22,678          2     11,339.0     11,339.0      7,748     14,930      5,078.4  cuCtxSynchronize                  
+      0.0            6,178          1      6,178.0      6,178.0      6,178      6,178          0.0  cuProfilerStart                   
+      0.0            1,571          1      1,571.0      1,571.0      1,571      1,571          0.0  cuProfilerStop                    
+
