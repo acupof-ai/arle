@@ -570,6 +570,7 @@ __global__ void dsv4_fp8_grouped_gemv_batch_kernel(
     __nv_bfloat16* __restrict__ output,
     const int* __restrict__ offsets,
     const int* __restrict__ counts,
+    const int* __restrict__ expert_indices,
     int max_count,
     int N,
     int K,
@@ -578,16 +579,17 @@ __global__ void dsv4_fp8_grouped_gemv_batch_kernel(
 {
     int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
     int batch_idx = blockIdx.y;
-    int expert_idx = blockIdx.z;
+    int compact_expert_idx = blockIdx.z;
+    int expert_idx = expert_indices ? expert_indices[compact_expert_idx] : compact_expert_idx;
     int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
     int threads_per_row = GEMV_THREADS / GEMV_ROWS;
     int lane_id = threadIdx.x % WARP_SIZE;
     int row_in_block = threadIdx.x / threads_per_row;
-    if (row >= N || batch_idx >= max_count || batch_idx >= counts[expert_idx]) return;
+    if (row >= N || batch_idx >= max_count || batch_idx >= counts[compact_expert_idx]) return;
 
     const auto* weight = reinterpret_cast<const uint8_t*>(weight_ptrs[expert_idx]);
     const auto* scales = reinterpret_cast<const uint8_t*>(scale_ptrs[expert_idx]);
-    const int route = offsets[expert_idx] + batch_idx;
+    const int route = offsets[compact_expert_idx] + batch_idx;
     const __nv_bfloat16* x = input + route * K;
 
     const int block_h = (N + scale_rows - 1) / scale_rows;
@@ -625,6 +627,7 @@ __global__ void dsv4_fp4_grouped_gemv_batch_kernel(
     __nv_bfloat16* __restrict__ output,
     const int* __restrict__ offsets,
     const int* __restrict__ counts,
+    const int* __restrict__ expert_indices,
     int max_count,
     int N,
     int K,
@@ -633,16 +636,17 @@ __global__ void dsv4_fp4_grouped_gemv_batch_kernel(
 {
     int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
     int batch_idx = blockIdx.y;
-    int expert_idx = blockIdx.z;
+    int compact_expert_idx = blockIdx.z;
+    int expert_idx = expert_indices ? expert_indices[compact_expert_idx] : compact_expert_idx;
     int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
     int threads_per_row = GEMV_THREADS / GEMV_ROWS;
     int lane_id = threadIdx.x % WARP_SIZE;
     int row_in_block = threadIdx.x / threads_per_row;
-    if (row >= N || batch_idx >= max_count || batch_idx >= counts[expert_idx]) return;
+    if (row >= N || batch_idx >= max_count || batch_idx >= counts[compact_expert_idx]) return;
 
     const auto* weight = reinterpret_cast<const uint8_t*>(weight_ptrs[expert_idx]);
     const auto* scales = reinterpret_cast<const uint8_t*>(scale_ptrs[expert_idx]);
-    const int route = offsets[expert_idx] + batch_idx;
+    const int route = offsets[compact_expert_idx] + batch_idx;
     const __nv_bfloat16* x = input + route * K;
     const int bytes_per_row = K / 2;
     float sum = 0.0f;
@@ -1944,6 +1948,7 @@ cudaError_t dsv4_fp8_grouped_gemv_batch_cuda(
     __nv_bfloat16* output,
     const int* offsets,
     const int* counts,
+    const int* expert_indices,
     int num_experts,
     int max_count,
     int N,
@@ -1955,7 +1960,7 @@ cudaError_t dsv4_fp8_grouped_gemv_batch_cuda(
     dim3 block(GEMV_THREADS);
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, max_count, num_experts);
     dsv4_fp8_grouped_gemv_batch_kernel<<<grid, block, 0, stream>>>(
-        weight_ptrs, scale_ptrs, input, output, offsets, counts,
+        weight_ptrs, scale_ptrs, input, output, offsets, counts, expert_indices,
         max_count, N, K, scale_rows, scale_cols);
     return cudaGetLastError();
 }
@@ -1967,6 +1972,7 @@ cudaError_t dsv4_fp4_grouped_gemv_batch_cuda(
     __nv_bfloat16* output,
     const int* offsets,
     const int* counts,
+    const int* expert_indices,
     int num_experts,
     int max_count,
     int N,
@@ -1978,7 +1984,7 @@ cudaError_t dsv4_fp4_grouped_gemv_batch_cuda(
     dim3 block(GEMV_THREADS);
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, max_count, num_experts);
     dsv4_fp4_grouped_gemv_batch_kernel<<<grid, block, 0, stream>>>(
-        weight_ptrs, scale_ptrs, input, output, offsets, counts,
+        weight_ptrs, scale_ptrs, input, output, offsets, counts, expert_indices,
         max_count, N, K, scale_rows, scale_cols);
     return cudaGetLastError();
 }

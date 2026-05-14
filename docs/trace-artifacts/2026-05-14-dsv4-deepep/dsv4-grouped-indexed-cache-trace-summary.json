@@ -1,0 +1,75 @@
+{
+  "profile": "ARLE_DSV4_GROUPED_EXPERTS=1 indexed active + cached full ptrs",
+  "rows": [
+    {
+      "phase": "ffn_deepep_local_experts",
+      "count": 2752,
+      "p50_ms": 1.196,
+      "p95_ms": 2.311,
+      "max_ms": 5.265
+    },
+    {
+      "phase": "ffn_total",
+      "count": 2752,
+      "p50_ms": 3.853,
+      "p95_ms": 4.952,
+      "max_ms": 6.997
+    },
+    {
+      "phase": "ffn_deepep_dispatch_combine",
+      "count": 2752,
+      "p50_ms": 3.325,
+      "p95_ms": 4.426,
+      "max_ms": 6.539
+    },
+    {
+      "phase": "ffn_deepep_dispatch",
+      "count": 2752,
+      "p50_ms": 0.064,
+      "p95_ms": 0.129,
+      "max_ms": 0.173
+    },
+    {
+      "phase": "ffn_deepep_count_exchange",
+      "count": 2752,
+      "p50_ms": 0.1305,
+      "p95_ms": 0.336,
+      "max_ms": 0.489
+    },
+    {
+      "phase": "ffn_deepep_combine",
+      "count": 2752,
+      "p50_ms": 1.28,
+      "p95_ms": 3.43,
+      "max_ms": 5.463
+    },
+    {
+      "phase": "ffn_deepep_combine_exchange",
+      "count": 2752,
+      "p50_ms": 1.213,
+      "p95_ms": 3.353,
+      "max_ms": 5.36
+    },
+    {
+      "phase": "ffn_deepep_combine_kernel",
+      "count": 2752,
+      "p50_ms": 0.013,
+      "p95_ms": 0.025,
+      "max_ms": 0.051
+    },
+    {
+      "phase": "attn_total",
+      "count": 2752,
+      "p50_ms": 1.132,
+      "p95_ms": 1.564,
+      "max_ms": 2.741
+    },
+    {
+      "phase": "attn_core",
+      "count": 2752,
+      "p50_ms": 0.9075,
+      "p95_ms": 1.355,
+      "max_ms": 2.476
+    }
+  ]
+}

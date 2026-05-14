@@ -176,7 +176,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   `ARLE_DSV4_COMBINE_DTYPE=fp8` experiment is functionally correct but remains
   opt-in because it is not faster than the BF16 combine default. Per-layer MHC
   scratch reuse raises the latest trace-off smoke throughput to **6.2-7.3
-  tok/s** on short math/writing cases without changing output correctness.
+  tok/s** on short math/writing cases without changing output correctness. The
+  gated grouped expert harness now caches per-layer weight pointer arrays and
+  launches indexed active experts, improving the raw grouped prototype while
+  keeping it default-off until real grouped GEMM/DeepGEMM replaces the current
+  GEMV kernels.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
   and

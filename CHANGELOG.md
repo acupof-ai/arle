@@ -56,6 +56,14 @@ Related governance docs:
 
 ### CUDA
 
+- Optimized the gated DSv4 grouped expert prototype behind
+  `ARLE_DSV4_GROUPED_EXPERTS=1` by caching per-layer local expert weight
+  pointer arrays and launching indexed active experts instead of rebuilding
+  active pointer tables every step. The route remains opt-in: 8xH20 trace-off
+  smoke improved grouped math latency to 2.37-2.40 s and short writing latency
+  to 2.69 s, but traced `ffn_deepep_local_experts` p50 is still 1.196 ms versus
+  roughly 0.46 ms on the default scratch-reuse path. The harness is ready for
+  the next replacement with real grouped GEMM/DeepGEMM.
 - Added a gated DSv4 MoE combine exchange experiment via
   `ARLE_DSV4_COMBINE_DTYPE=fp8`. The path quantizes return-route BF16 rows to
   FP8 E4M3 with per-row FP32 scales, exchanges the FP8 payload through NCCL
