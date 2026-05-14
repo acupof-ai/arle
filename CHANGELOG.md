@@ -211,6 +211,12 @@ Related governance docs:
   costs 35.895 ms per rank range. The path remains default-off and documents
   why the next compute step needs DeepGEMM-style grouped GEMM rather than
   route-wise GEMV.
+- Added a clean 8xH20 decode-only HTTP comparison for the gated
+  `ARLE_DSV4_PAIR_EXPERT_GEMV=1` path. The default split expert GEMV path
+  reaches 11.79 post-first tok/s on `decode64`, while pair GEMV reaches
+  7.70 tok/s; both return normal sequence text and the arithmetic check returns
+  `410`. This keeps pair GEMV default-off and confirms the next compute target
+  is real grouped GEMM/DeepGEMM rather than single-expert gate/up fusion.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

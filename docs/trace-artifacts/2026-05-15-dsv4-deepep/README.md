@@ -76,3 +76,9 @@ Current trace set:
   `dsv4_fp4_route_gemv_batch_kernel` cost 35.895 ms per rank range and regresses
   the single decode wave to 145.669 ms. This stays default-off; the compute
   target remains real grouped GEMM/DeepGEMM, not route-wise GEMV.
+- [`bench-decode-pair-gemv-626477b1/`](bench-decode-pair-gemv-626477b1/)
+  records a clean decode-only HTTP comparison for the default split expert GEMV
+  path versus `ARLE_DSV4_PAIR_EXPERT_GEMV=1` on commit `626477b1`. Both paths
+  return normal decode text and the arithmetic check returns `410`, but pair
+  GEMV regresses `decode64` post-first throughput from 11.79 tok/s to
+  7.70 tok/s, so it remains default-off.
