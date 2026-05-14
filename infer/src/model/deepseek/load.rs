@@ -178,7 +178,38 @@ fn load_dsv4_marlin_w4_matrix_if_available(
         );
     }
 
-    let config = match layout {
+    let config = dsv4_marlin_w4_quant_config(layout);
+    let matrix =
+        match load_tensor_2d_maybe_quantized_with_config(ctx, shards, weight_map, name, config) {
+            Ok(matrix) => matrix,
+            Err(err)
+                if requested.is_none()
+                    && matches!(layout, Dsv4MarlinW4Layout::Hybrid)
+                    && err.to_string().contains("Hybrid W4A16 Marlin packed bytes") =>
+            {
+                log::warn!(
+                    "DeepSeek V4 Marlin hybrid decode side tensor rejected for {name}; \
+                 falling back to W4A8 side tensors: {err:#}"
+                );
+                load_tensor_2d_maybe_quantized_with_config(
+                    ctx,
+                    shards,
+                    weight_map,
+                    name,
+                    dsv4_marlin_w4_quant_config(Dsv4MarlinW4Layout::W4A8),
+                )
+                .with_context(|| format!("loading DeepSeek V4 W4A8 fallback matrix {name}"))?
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("loading DeepSeek V4 {layout:?} matrix {name}"));
+            }
+        };
+    Ok(Some(matrix))
+}
+
+fn dsv4_marlin_w4_quant_config(layout: Dsv4MarlinW4Layout) -> QuantLoadConfig {
+    match layout {
         Dsv4MarlinW4Layout::W4A8 => QuantLoadConfig {
             group_size: Some(128),
             bits: Some(4),
@@ -195,10 +226,7 @@ fn load_dsv4_marlin_w4_matrix_if_available(
             marlin_w4_hybrid: true,
             unsupported_reason: None,
         },
-    };
-    let matrix = load_tensor_2d_maybe_quantized_with_config(ctx, shards, weight_map, name, config)
-        .with_context(|| format!("loading DeepSeek V4 {layout:?} matrix {name}"))?;
-    Ok(Some(matrix))
+    }
 }
 
 fn dsv4_marlin_w4_layout(
