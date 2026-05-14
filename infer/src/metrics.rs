@@ -271,6 +271,13 @@ pub struct RuntimeTopologyMetrics {
     pub h2d_latency_last_us: u64,
     pub h2d_latency_max_us: u64,
     pub h2d_latency_count: u64,
+    pub d2h_latency_last_us: u64,
+    pub d2h_latency_max_us: u64,
+    pub d2h_latency_count: u64,
+    pub d2h_wait_last_us: u64,
+    pub d2h_wait_max_us: u64,
+    pub d2h_wait_count: u64,
+    pub readback_poll_not_ready_total: u64,
     pub numa_route_local_total: u64,
     pub numa_route_cross_total: u64,
     pub numa_route_unknown_total: u64,
@@ -1005,6 +1012,38 @@ impl ServerMetrics {
         metrics.h2d_latency_last_us = latency_us;
         metrics.h2d_latency_max_us = metrics.h2d_latency_max_us.max(latency_us);
         metrics.h2d_latency_count = metrics.h2d_latency_count.saturating_add(1);
+    }
+
+    pub fn observe_d2h_latency_us(&self, latency_us: u64) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.d2h_latency_last_us = latency_us;
+        metrics.d2h_latency_max_us = metrics.d2h_latency_max_us.max(latency_us);
+        metrics.d2h_latency_count = metrics.d2h_latency_count.saturating_add(1);
+    }
+
+    pub fn observe_d2h_wait_us(&self, wait_us: u64) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.d2h_wait_last_us = wait_us;
+        metrics.d2h_wait_max_us = metrics.d2h_wait_max_us.max(wait_us);
+        metrics.d2h_wait_count = metrics.d2h_wait_count.saturating_add(1);
+    }
+
+    pub fn record_readback_poll_not_ready(&self) {
+        let mut metrics = self
+            .inner
+            .runtime_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.readback_poll_not_ready_total =
+            metrics.readback_poll_not_ready_total.saturating_add(1);
     }
 
     pub fn record_numa_route(&self, route_cost: u32, local: Option<bool>) {
@@ -1838,6 +1877,9 @@ mod tests {
         );
         m.observe_h2d_latency_us(77);
         m.observe_h2d_latency_us(99);
+        m.observe_d2h_latency_us(111);
+        m.observe_d2h_wait_us(7);
+        m.record_readback_poll_not_ready();
         m.record_numa_route(0, Some(true));
         m.record_numa_route(100, Some(false));
         m.record_numa_migration();
@@ -1947,6 +1989,17 @@ mod tests {
         assert!(rendered.contains(
             "infer_runtime_h2d_latency_microseconds{model=\"Qwen3-4B\",stat=\"max\",} 99"
         ));
+        assert!(rendered.contains(
+            "infer_runtime_d2h_latency_microseconds{model=\"Qwen3-4B\",stat=\"last\",} 111"
+        ));
+        assert!(
+            rendered.contains(
+                "infer_runtime_d2h_wait_microseconds{model=\"Qwen3-4B\",stat=\"last\",} 7"
+            )
+        );
+        assert!(
+            rendered.contains("infer_runtime_readback_poll_not_ready_total{model=\"Qwen3-4B\",} 1")
+        );
         assert!(
             rendered.contains(
                 "infer_scheduler_numa_route_total{model=\"Qwen3-4B\",outcome=\"cross\",} 1"
@@ -2176,6 +2229,9 @@ mod tests {
         m.set_preprocess_topology(1, 2);
         m.set_detokenizer_topology(1, 1);
         m.observe_h2d_latency_us(123);
+        m.observe_d2h_latency_us(45);
+        m.observe_d2h_wait_us(6);
+        m.record_readback_poll_not_ready();
         m.record_scheduler_cpu_plan_accept();
         m.record_scheduler_cpu_plan_stale();
 
@@ -2251,6 +2307,18 @@ mod tests {
         assert_eq!(
             payload["runtime_topology"]["h2d_latency_last_us"],
             serde_json::json!(123)
+        );
+        assert_eq!(
+            payload["runtime_topology"]["d2h_latency_last_us"],
+            serde_json::json!(45)
+        );
+        assert_eq!(
+            payload["runtime_topology"]["d2h_wait_last_us"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            payload["runtime_topology"]["readback_poll_not_ready_total"],
+            serde_json::json!(1)
         );
         assert_eq!(payload["session_affinity_hit"], serde_json::json!(1));
         assert_eq!(payload["session_affinity_miss"], serde_json::json!(0));
