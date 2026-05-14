@@ -54,3 +54,11 @@ Current trace set:
   rows. The same `霓彩` output measures a 112.133 ms decode wave; `SendRecv`
   time drops from 25.211 ms to 23.329 ms per rank range, while local expert
   FP8/FP4 GEMV remains essentially unchanged.
+- [`nsys-single-decode-token-current-b48/`](nsys-single-decode-token-current-b48/)
+  reruns a current commit `b48a363d` single decode-token Nsight capture with
+  streaming `max_tokens=2`, because `max_tokens=1` exits from prefill and does
+  not create a decode launch. The `霓彩` output is normal. The single decode
+  wave measures 125.497 ms, with the slow stack concentrated in NCCL
+  SendRecv/AllReduce, alloc/free/memset/launch runtime overhead, and local
+  FP8/FP4 expert GEMV. Actual D2H copy payload is only 44 KiB total; the
+  visible `cuMemcpyDtoHAsync_v2` cost is call/synchronization overhead.
