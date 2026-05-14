@@ -377,6 +377,37 @@ impl LayerCommunicator {
         Ok(LayerCommStatus::GroupedSendRecv)
     }
 
+    /// EP-axis grouped U8 send/recv for quantized DeepEP-style MoE payloads.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_grouped_send_recv_u8(
+        &self,
+        sendbuf: &CudaSlice<u8>,
+        send_offsets: &[usize],
+        send_counts: &[usize],
+        recvbuf: &mut CudaSlice<u8>,
+        recv_offsets: &[usize],
+        recv_counts: &[usize],
+    ) -> Result<LayerCommStatus> {
+        if self.ep_world_size == 1 {
+            return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        let Some(nccl) = self.ep_nccl.as_ref() else {
+            bail!(
+                "MoE grouped U8 send/recv requires EP NCCL backend for world_size={}",
+                self.ep_world_size
+            );
+        };
+        nccl.grouped_send_recv_u8(
+            sendbuf,
+            send_offsets,
+            send_counts,
+            recvbuf,
+            recv_offsets,
+            recv_counts,
+        )?;
+        Ok(LayerCommStatus::GroupedSendRecv)
+    }
+
     /// EP-axis I32 all-gather for tiny DeepEP-style route-count exchange.
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     pub fn moe_all_gather_i32(

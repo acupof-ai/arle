@@ -168,13 +168,15 @@ Operators who want only the native serving binary can use `infer` directly (`car
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
-- **2026-05-14** — DeepSeek V4 8xH20 decode tracing now has a grounded NCCL
-  bottleneck record. The current runnable TP=8/EP=8 layout serves true
-  `/root/DeepSeek-V4-Flash` with FP8 KV at **7.5-7.6 tok/s** for 32/64 token
-  streaming decode, but nsys shows **22016 NCCL all-reduce kernels** for a
-  32-token decode window (`43 layers * 2 all-reduces * 32 tokens * 8 ranks`).
-  The documented route is DeepEP-style dispatch/combine + grouped GEMM/DeepGEMM,
-  scratch reuse, then vectorized B>1 and MTP. Evidence:
+- **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
+  DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
+  FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and
+  writing output, while the 1,039-token prefill trace identifies return-side
+  MoE combine exchange and local experts as the concrete blockers. A gated
+  `ARLE_DSV4_COMBINE_DTYPE=fp8` experiment is functionally correct but remains
+  opt-in because it is not faster than the BF16 combine default. Evidence:
+  [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
+  and
   [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
 - **2026-05-10** — 🎉 W4-hybrid prefill graph capture **closes 4k/c=4 SGLang +76.6% gap** via Path B.2 bucketed allocation key (`a56b7a9`/`c44788f`). Engine-side TTFT p50 **2000ms → 150ms = -92.5%** improvement on RTX 4070 Ti SUPER 16GB (server-side `/v1/stats engine_ttft_us` ground truth; client-side guidellm 0.6.0 broken — bench tool bug isolated). Throughput **+632%** in 60s window. Bucketed `page_indices_len` (64-entry) + `prefix_token_rows_len` (128-row) reduce capture key churn from 388 unique → **7 unique** with **98.5% LRU dominant key reuse**. Codex's "second-order bucketing" insight (captured scalar launch parameters use bucket capacity, not exact dim from first capture) was load-bearing; new anti-pattern in skill v1.7.0 catalog. Opt-in via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1`. Plus **RoPE scaling support** (YARN / Linear / NtkAware) wired through qwen3-spec + qwen35-spec + `precompute_rope_with_scaling`. Evidence: [`docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`](docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md), [`docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`](docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md).
 

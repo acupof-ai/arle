@@ -109,6 +109,10 @@ pub(crate) struct DeepseekRouteCombineRuntimeScratch {
     pub(crate) hidden_dim: usize,
     pub(crate) combine_recv: HiddenStates,
     pub(crate) route_slot_out: HiddenStates,
+    pub(crate) combine_fp8_send: CudaSlice<u8>,
+    pub(crate) combine_fp8_recv: CudaSlice<u8>,
+    pub(crate) combine_scale_send: CudaSlice<f32>,
+    pub(crate) combine_scale_recv: CudaSlice<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -205,6 +209,10 @@ impl DeepseekMoeRuntimeCache {
                 hidden_dim,
                 combine_recv: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
                 route_slot_out: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+                combine_fp8_send: ctx.stream.alloc_zeros::<u8>(hidden_dim * capacity_routes)?,
+                combine_fp8_recv: ctx.stream.alloc_zeros::<u8>(hidden_dim * capacity_routes)?,
+                combine_scale_send: ctx.stream.alloc_zeros::<f32>(capacity_routes)?,
+                combine_scale_recv: ctx.stream.alloc_zeros::<f32>(capacity_routes)?,
             });
         }
         Ok(self

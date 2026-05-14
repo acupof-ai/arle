@@ -1,0 +1,113 @@
+{
+  "title": "DeepSeek V4 gated FP8 combine exchange experiment",
+  "date": "2026-05-14",
+  "remote_workspace": "/root/arle",
+  "model_path": "/root/DeepSeek-V4-Flash",
+  "change": "Add a gated ARLE_DSV4_COMBINE_DTYPE=fp8 path that quantizes MoE return-route BF16 rows to FP8 E4M3 with per-row FP32 scales before the DeepEP-style combine exchange, then dequantizes back to BF16 before the existing route combine kernel. Default combine exchange remains BF16.",
+  "remote_sync": {
+    "local_remote_sha256_match": true,
+    "verified_files": [
+      "crates/cuda-kernels/csrc/moe/dsv4_route.cu",
+      "crates/cuda-kernels/src/ffi/moe.rs",
+      "infer/src/distributed/nccl.rs",
+      "infer/src/model/layer_communicator.rs",
+      "infer/src/model/deepseek/mlp.rs",
+      "infer/src/model/deepseek/state.rs"
+    ]
+  },
+  "build": {
+    "command": "cargo build --release -p infer --bin infer --features cuda,nccl",
+    "env": {
+      "CUDA_HOME": "/usr/local/cuda-12.2",
+      "CUDA_PATH": "/usr/local/cuda-12.2",
+      "ARLE_CUDA_DISABLE_MARLIN_W4_FP8": "1",
+      "LD_LIBRARY_PATH": "/tmp/arle-nccl-227-lib:/usr/local/cuda-12.2/lib64:${LD_LIBRARY_PATH:-}",
+      "LIBRARY_PATH": "/tmp/arle-nccl-227-lib:${LIBRARY_PATH:-}"
+    },
+    "result": "pass",
+    "duration": "5m40s"
+  },
+  "fp8_trace_request": {
+    "service_env": {
+      "ARLE_DSV4_TRACE_LAYER": "1",
+      "ARLE_DSV4_COMBINE_DTYPE": "fp8",
+      "ARLE_DSV4_MOE_BACKEND": "deepep",
+      "ARLE_DSV4_INCREMENTAL_KV": "1",
+      "INFER_CUDA_DEVICES": "0,1,2,3,4,5,6,7"
+    },
+    "service_ready_after_s": 23,
+    "request": {
+      "prompt_tokens": 1039,
+      "max_tokens": 8,
+      "temperature": 0
+    },
+    "response": {
+      "status": 200,
+      "elapsed_s": 17.5048,
+      "completion_tokens": 8,
+      "text": "37 \\u00d7 29 = 1073"
+    },
+    "artifact": "arle-http-dsv4-combine-fp8-trace.log.gz"
+  },
+  "prefill_trace_comparison": {
+    "tokens": 1039,
+    "counts": 344,
+    "bf16_scratch_baseline": {
+      "source": "dsv4-combine-scratch-trace-summary.json",
+      "end_to_end_s": 16.487648,
+      "ffn_total_avg_ms": 316.543,
+      "ffn_deepep_dispatch_combine_avg_ms": 293.37,
+      "ffn_deepep_combine_avg_ms": 157.944,
+      "ffn_deepep_combine_exchange_avg_ms": 157.052,
+      "ffn_deepep_combine_kernel_avg_ms": 0.438,
+      "ffn_deepep_local_experts_avg_ms": 128.708
+    },
+    "fp8_combine": {
+      "end_to_end_s": 17.5048,
+      "ffn_total_avg_ms": 318.873,
+      "ffn_deepep_dispatch_combine_avg_ms": 295.244,
+      "ffn_deepep_combine_avg_ms": 158.361,
+      "ffn_deepep_combine_exchange_avg_ms": 156.936,
+      "ffn_deepep_combine_kernel_avg_ms": 0.362,
+      "ffn_deepep_local_experts_avg_ms": 129.214
+    },
+    "interpretation": "The FP8 payload exchange is functionally correct but does not materially improve this 8xH20 1039-token prefill shape. The smaller payload is offset by the extra FP32 scale exchange plus quantize/dequantize kernels. Keep BF16 as the default and leave FP8 combine as an explicit experiment."
+  },
+  "default_trace_off_postcheck": {
+    "service_env": {
+      "ARLE_DSV4_COMBINE_DTYPE": null,
+      "ARLE_DSV4_TRACE_LAYER": null,
+      "ARLE_DSV4_MOE_BACKEND": "deepep",
+      "ARLE_DSV4_INCREMENTAL_KV": "1",
+      "INFER_CUDA_DEVICES": "0,1,2,3,4,5,6,7"
+    },
+    "service_ready_after_s": 18,
+    "cases": [
+      {
+        "name": "math_37x29",
+        "prompt_tokens": 19,
+        "completion_tokens": 11,
+        "elapsed_s": 1.996577,
+        "completion_tok_s": 5.509,
+        "result": "correct, returned 1073"
+      },
+      {
+        "name": "math_58p67",
+        "prompt_tokens": 19,
+        "completion_tokens": 10,
+        "elapsed_s": 1.794633,
+        "completion_tok_s": 5.572,
+        "result": "correct, returned 125"
+      },
+      {
+        "name": "writing",
+        "prompt_tokens": 20,
+        "completion_tokens": 19,
+        "elapsed_s": 3.142331,
+        "completion_tok_s": 6.046,
+        "result": "normal non-repetitive Chinese prose"
+      }
+    ]
+  },
+  "conclusion": "ARLE_DSV4_COMBINE_DTYPE=fp8 is a verified gated path, not a default optimization. The current concrete bottleneck remains return-side MoE all-to-all synchronization and local expert GEMM throughput; replacing the expert path with real grouped GEMM/DeepGEMM and reducing/overlapping combine communication remain higher-value than quantizing the combine payload alone."
+}

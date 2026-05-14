@@ -327,6 +327,110 @@ fn dsv4_count_exchange_mode() -> Result<Dsv4CountExchangeMode> {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dsv4CombineExchangeMode {
+    Bf16,
+    Fp8,
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_combine_exchange_mode() -> Result<Dsv4CombineExchangeMode> {
+    let Some(raw) = std::env::var("ARLE_DSV4_COMBINE_DTYPE").ok() else {
+        return Ok(Dsv4CombineExchangeMode::Bf16);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "bf16" | "bfloat16" => Ok(Dsv4CombineExchangeMode::Bf16),
+        "fp8" | "e4m3" | "fp8_e4m3" => Ok(Dsv4CombineExchangeMode::Fp8),
+        other => bail!("invalid ARLE_DSV4_COMBINE_DTYPE value `{other}`"),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_run_fp8_combine_exchange(
+    ctx: &DeviceContext,
+    comm: &LayerCommunicator,
+    route_out: &HiddenStates,
+    send_u8_offsets: &[usize],
+    send_u8_counts: &[usize],
+    send_scale_offsets: &[usize],
+    send_scale_counts: &[usize],
+    recv_u8_offsets: &[usize],
+    recv_u8_counts: &[usize],
+    recv_scale_offsets: &[usize],
+    recv_scale_counts: &[usize],
+    send_route_rows: usize,
+    recv_route_rows: usize,
+    fp8_send: &mut CudaSlice<u8>,
+    fp8_recv: &mut CudaSlice<u8>,
+    scale_send: &mut CudaSlice<f32>,
+    scale_recv: &mut CudaSlice<f32>,
+    combine_recv: &mut HiddenStates,
+) -> Result<()> {
+    let hidden_dim_i32 = dsv4_usize_to_i32(route_out.hidden_dim, "combine hidden_dim")?;
+    let send_route_rows_i32 = dsv4_usize_to_i32(send_route_rows, "combine send route count")?;
+    let recv_route_rows_i32 = dsv4_usize_to_i32(recv_route_rows, "combine recv route count")?;
+    ensure!(
+        combine_recv.hidden_dim == route_out.hidden_dim,
+        "DeepSeek V4 FP8 combine hidden_dim mismatch: recv={} route_out={}",
+        combine_recv.hidden_dim,
+        route_out.hidden_dim
+    );
+    combine_recv.seq_len = recv_route_rows;
+    {
+        let (route_ptr, _route_guard) = route_out.data.device_ptr(&ctx.stream);
+        let (fp8_ptr, _fp8_guard) = fp8_send.device_ptr_mut(&ctx.stream);
+        let (scale_ptr, _scale_guard) = scale_send.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::quantize_bf16_rows_to_fp8_e4m3_cuda(
+                route_ptr as *const ffi::Half,
+                fp8_ptr as *mut u8,
+                scale_ptr as *mut f32,
+                send_route_rows_i32,
+                hidden_dim_i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 combine FP8 quantize failed: {err}"))?;
+        }
+    }
+    comm.moe_grouped_send_recv_u8(
+        fp8_send,
+        send_u8_offsets,
+        send_u8_counts,
+        fp8_recv,
+        recv_u8_offsets,
+        recv_u8_counts,
+    )?;
+    comm.moe_grouped_send_recv_f32(
+        scale_send,
+        send_scale_offsets,
+        send_scale_counts,
+        scale_recv,
+        recv_scale_offsets,
+        recv_scale_counts,
+    )?;
+    {
+        let (fp8_ptr, _fp8_guard) = fp8_recv.device_ptr(&ctx.stream);
+        let (scale_ptr, _scale_guard) = scale_recv.device_ptr(&ctx.stream);
+        let (recv_ptr, _recv_guard) = combine_recv.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_dequantize_fp8_rows_to_bf16_cuda(
+                fp8_ptr as *const u8,
+                scale_ptr as *const f32,
+                recv_ptr as *mut ffi::Half,
+                recv_route_rows_i32,
+                hidden_dim_i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 combine FP8 dequantize failed: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// V4 routed MoE block plus optional shared expert.
 #[cfg(feature = "cuda")]
 #[allow(dead_code)] // populated once the Phase 2A loader allocates tensors
@@ -1461,6 +1565,9 @@ impl DeepseekV4MoeBlock {
 
         let trace = dsv4_moe_trace_begin(ctx)?;
         let route_slot_capacity = hidden.seq_len * config.num_experts_per_tok;
+        let route_combine_capacity = total_send_routes
+            .max(total_recv_routes)
+            .max(route_slot_capacity);
         let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
         let run_combine_kernel = |combine_recv: &HiddenStates,
                                   route_slot_out: Option<&mut HiddenStates>,
@@ -1552,23 +1659,50 @@ impl DeepseekV4MoeBlock {
                 combine_kernel_trace,
             )
         };
+        let combine_mode = dsv4_combine_exchange_mode()?;
         if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
             let scratch = scratch_cache.ensure_route_combine_scratch(
                 ctx,
                 hidden.hidden_dim,
-                total_send_routes.max(route_slot_capacity),
+                route_combine_capacity,
             )?;
             scratch.combine_recv.seq_len = total_send_routes;
             scratch.route_slot_out.seq_len = route_slot_capacity;
             let combine_exchange_trace = dsv4_moe_trace_begin(ctx)?;
-            comm.moe_grouped_send_recv_bf16(
-                &route_out.data,
-                &recv_hidden_offsets,
-                &recv_hidden_counts,
-                &mut scratch.combine_recv.data,
-                &send_hidden_offsets,
-                &send_hidden_counts,
-            )?;
+            match combine_mode {
+                Dsv4CombineExchangeMode::Bf16 => {
+                    comm.moe_grouped_send_recv_bf16(
+                        &route_out.data,
+                        &recv_hidden_offsets,
+                        &recv_hidden_counts,
+                        &mut scratch.combine_recv.data,
+                        &send_hidden_offsets,
+                        &send_hidden_counts,
+                    )?;
+                }
+                Dsv4CombineExchangeMode::Fp8 => {
+                    dsv4_run_fp8_combine_exchange(
+                        ctx,
+                        comm,
+                        &route_out,
+                        &recv_hidden_offsets,
+                        &recv_hidden_counts,
+                        &recv_rank_offsets,
+                        &recv_rank_counts_usize,
+                        &send_hidden_offsets,
+                        &send_hidden_counts,
+                        &send_rank_offsets,
+                        &send_rank_counts_usize,
+                        total_recv_routes,
+                        total_send_routes,
+                        &mut scratch.combine_fp8_send,
+                        &mut scratch.combine_fp8_recv,
+                        &mut scratch.combine_scale_send,
+                        &mut scratch.combine_scale_recv,
+                        &mut scratch.combine_recv,
+                    )?;
+                }
+            }
             dsv4_moe_trace_end(
                 ctx,
                 "ffn_deepep_combine_exchange",
@@ -1584,14 +1718,64 @@ impl DeepseekV4MoeBlock {
         } else {
             let mut combine_recv = HiddenStates::zeros(ctx, hidden.hidden_dim, total_send_routes)?;
             let combine_exchange_trace = dsv4_moe_trace_begin(ctx)?;
-            comm.moe_grouped_send_recv_bf16(
-                &route_out.data,
-                &recv_hidden_offsets,
-                &recv_hidden_counts,
-                &mut combine_recv.data,
-                &send_hidden_offsets,
-                &send_hidden_counts,
-            )?;
+            match combine_mode {
+                Dsv4CombineExchangeMode::Bf16 => {
+                    comm.moe_grouped_send_recv_bf16(
+                        &route_out.data,
+                        &recv_hidden_offsets,
+                        &recv_hidden_counts,
+                        &mut combine_recv.data,
+                        &send_hidden_offsets,
+                        &send_hidden_counts,
+                    )?;
+                }
+                Dsv4CombineExchangeMode::Fp8 => {
+                    let mut combine_fp8_send = ctx
+                        .stream
+                        .alloc_zeros::<u8>(total_recv_routes * hidden.hidden_dim)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 combine FP8 send alloc failed: {err}")
+                        })?;
+                    let mut combine_fp8_recv = ctx
+                        .stream
+                        .alloc_zeros::<u8>(total_send_routes * hidden.hidden_dim)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 combine FP8 recv alloc failed: {err}")
+                        })?;
+                    let mut combine_scale_send = ctx
+                        .stream
+                        .alloc_zeros::<f32>(total_recv_routes)
+                        .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 combine FP8 send-scale alloc failed: {err}")
+                    })?;
+                    let mut combine_scale_recv = ctx
+                        .stream
+                        .alloc_zeros::<f32>(total_send_routes)
+                        .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 combine FP8 recv-scale alloc failed: {err}")
+                    })?;
+                    dsv4_run_fp8_combine_exchange(
+                        ctx,
+                        comm,
+                        &route_out,
+                        &recv_hidden_offsets,
+                        &recv_hidden_counts,
+                        &recv_rank_offsets,
+                        &recv_rank_counts_usize,
+                        &send_hidden_offsets,
+                        &send_hidden_counts,
+                        &send_rank_offsets,
+                        &send_rank_counts_usize,
+                        total_recv_routes,
+                        total_send_routes,
+                        &mut combine_fp8_send,
+                        &mut combine_fp8_recv,
+                        &mut combine_scale_send,
+                        &mut combine_scale_recv,
+                        &mut combine_recv,
+                    )?;
+                }
+            }
             dsv4_moe_trace_end(
                 ctx,
                 "ffn_deepep_combine_exchange",
@@ -1825,6 +2009,11 @@ fn dsv4_scale_usize(values: &[usize], factor: usize) -> Result<Vec<usize>> {
                 .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 scaled route extent overflows usize"))
         })
         .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_usize_to_i32(value: usize, label: &str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| anyhow::anyhow!("DeepSeek V4 {label} overflows i32"))
 }
 
 #[cfg(feature = "cuda")]
