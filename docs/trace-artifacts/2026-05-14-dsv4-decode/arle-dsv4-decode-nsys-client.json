@@ -1,0 +1,11 @@
+{
+  "status": 200,
+  "total_s": 6.464,
+  "ttft_s": 0.4226,
+  "usage": {
+    "prompt_tokens": 29,
+    "completion_tokens": 32,
+    "total_tokens": 61
+  },
+  "output": "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau ups phi chi psi omega"
+}

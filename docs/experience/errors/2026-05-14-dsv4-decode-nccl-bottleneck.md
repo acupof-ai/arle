@@ -28,15 +28,17 @@ Current benchmark evidence:
   - Math case output starts with `17 + 25 = 42.` and explains the addition.
   - Writing case discusses GPU communication as a MoE decode latency bottleneck,
     though the 48-token cap cuts off mid-sentence.
-- `/tmp/arle-dsv4-default-after.json`: 32-token run `4.2694s`, 64-token run `8.3799s`.
+- [`docs/trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-default-after.json`](../../trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-default-after.json):
+  32-token run `4.2694s`, 64-token run `8.3799s`.
 - Current metrics after 64-token run: `infer_scheduler_step_phase_decode_microseconds=117646`.
 
 nsys evidence:
 
-- `/tmp/arle-dsv4-decode-nsys.nsys-rep`
-- `/tmp/arle-dsv4-decode-nsys.sqlite`
-- `/tmp/arle-dsv4-decode-nsys-stats.txt`
-- `/tmp/arle-dsv4-decode-nsys-client.json`
+- [`docs/trace-artifacts/2026-05-14-dsv4-decode/README.md`](../../trace-artifacts/2026-05-14-dsv4-decode/README.md)
+- [`docs/trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys.nsys-rep.gz`](../../trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys.nsys-rep.gz)
+- [`docs/trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys.sqlite.gz`](../../trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys.sqlite.gz)
+- [`docs/trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys-stats.txt`](../../trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys-stats.txt)
+- [`docs/trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys-client.json`](../../trace-artifacts/2026-05-14-dsv4-decode/arle-dsv4-decode-nsys-client.json)
 
 Top nsys signals:
 

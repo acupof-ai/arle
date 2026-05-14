@@ -1,0 +1,30 @@
+[
+  {
+    "max_tokens": 32,
+    "status": 200,
+    "total_s": 4.2694,
+    "ttft_s": 0.3698,
+    "usage": {
+      "prompt_tokens": 29,
+      "completion_tokens": 32,
+      "total_tokens": 61
+    },
+    "completion_tok_s_e2e": 7.5,
+    "post_first_tok_s": 7.95,
+    "output": "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau ups phi chi psi omega"
+  },
+  {
+    "max_tokens": 64,
+    "status": 200,
+    "total_s": 8.3799,
+    "ttft_s": 0.3028,
+    "usage": {
+      "prompt_tokens": 29,
+      "completion_tokens": 64,
+      "total_tokens": 93
+    },
+    "completion_tok_s_e2e": 7.64,
+    "post_first_tok_s": 7.8,
+    "output": "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau ups phi chi psi omega22 3 4 5 6 7 8 9 10 11 12 13 14 15 "
+  }
+]

@@ -43,6 +43,11 @@ Related governance docs:
   token per rank, and nsys observed 22016 NCCL all-reduce kernels for a
   32-token decode window. Evidence and industry comparison are recorded in
   [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
+- Added committed DSv4 trace artifacts under
+  [`docs/trace-artifacts/2026-05-14-dsv4-decode/`](docs/trace-artifacts/2026-05-14-dsv4-decode/),
+  including the compressed raw nsys report/database, `nsys stats`, client JSON,
+  server log, and SHA256 manifest. The trace record no longer depends on remote
+  `/tmp` files.
 
 ### CUDA
 
