@@ -1,0 +1,12 @@
+name,time_ms_per_rank_range,total_time_ms_all_ranges,calls
+cuMemAllocAsync,33.662224,269.297792,11888
+cudaLaunchKernel_v7000,21.741476375,173.931811,15471
+cuMemFreeAsync,15.486194625,123.889557,6048
+cuMemsetD8Async,6.220324625,49.762597,4328
+cuMemcpyHtoDAsync_v2,4.665760875,37.326087,2760
+cudaEventRecord_v3020,2.3471105,18.776884,2760
+cudaStreamGetCaptureInfo_v2_v11030,1.924698375,15.397587,4512
+cudaStreamWaitEvent_v3020,1.818116375,14.544931,2064
+cuMemcpyDtoDAsync_v2,1.683033375,13.464267,704
+cuLaunchKernelEx,1.562827625,12.502621,1032
+cudaGetFuncBySymbol_v11000,0.358554625,2.868437,1032

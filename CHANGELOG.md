@@ -85,6 +85,13 @@ Related governance docs:
   12.22 post-first tok/s and the arithmetic case returns `410`; the nsys run
   makes clear that NCCL exchange/reduction, launch overhead, allocator churn,
   D2H, and local expert GEMV still dominate.
+- Added the DSv4 route-grouped pair GEMV Nsight trace under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-pair-gemv/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-pair-gemv/).
+  The opt-in `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1` run keeps the `霓彩` output
+  and measures a 117.894 ms single-token decode wave. The decode-window top
+  costs are now explicit: `ncclDevKernel_SendRecv` at 50.338 ms per rank
+  range, FP4 route pair GEMV at 19.616 ms, FP4 route `w2` GEMV at 10.487 ms,
+  FP8 GEMV at 9.408 ms, plus allocator/free and launch overhead.
 
 ### CUDA
 
@@ -244,6 +251,14 @@ Related governance docs:
   688, and records the isolated decode wave at 118.985 ms in the latest capture;
   NCCL SendRecv/AllReduce, launch/runtime overhead, allocator churn, D2H, and
   local expert FP8/FP4 GEMV remain the next targets.
+- Optimized the gated route-wise grouped expert experiment by pairing its
+  route-local `w1` and `w3` GEMV launches for matching DSv4 block-scaled FP8 or
+  FP4 weights, falling back to split route GEMV when format or shape differs.
+  The real 8xH20 nsys run lowers the prior route-grouped regression from
+  145.669 ms to 117.894 ms, but it remains default-off because single-token
+  decode is still dominated by NCCL SendRecv, route GEMV work, launch overhead,
+  and async allocation/free. The main target remains true grouped
+  GEMM/DeepGEMM with DeepEP overlap.
 - **🎉 W4-hybrid prefill graph capture closes 4k/c=4 gap — Tier 1 STRONG
   PROCEED** (`a56b7a9`/`c44788f` 2026-05-10). Path B.2 bucketed prefill
   graph allocation key reduces capture key churn from 388 unique → **7

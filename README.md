@@ -248,7 +248,13 @@ Operators who want only the native serving binary can use `infer` directly (`car
   `w1`/`w3` pair GEMV experiment is now available only as
   `ARLE_DSV4_PAIR_EXPERT_GEMV=1`: the 8xH20 trace kept output correct but
   showed the FP4 pair kernel is slower on B=1 decode, so it stays default-off
-  while the main compute target remains true grouped GEMM/DeepGEMM.
+  while the main compute target remains true grouped GEMM/DeepGEMM. The
+  route-wise grouped expert path now also has a pair route GEMV follow-up:
+  output remains `霓彩` and the isolated wave is **117.9 ms**, but nsys shows
+  the token is still dominated by `ncclDevKernel_SendRecv`
+  (**50.3 ms/rank-range**), FP4 route pair GEMV (**19.6 ms**), FP4 route
+  `w2` GEMV (**10.5 ms**), FP8 GEMV (**9.4 ms**), plus allocation and launch
+  overhead, so the path stays opt-in.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)

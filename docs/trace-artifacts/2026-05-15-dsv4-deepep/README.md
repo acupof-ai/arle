@@ -96,6 +96,15 @@ Current trace set:
   SendRecv launches from 1,032 to 688. The `霓彩` output remains normal and the
   latest isolated single decode wave is 118.985 ms, still dominated by NCCL,
   launch/runtime overhead, allocator churn, D2H, and local expert GEMV.
+- [`nsys-single-decode-token-route-pair-gemv/`](nsys-single-decode-token-route-pair-gemv/)
+  records the route-wise grouped expert follow-up that pairs the route-local
+  `w1` and `w3` GEMV launches. The `max_tokens=2` request returns `霓彩` and
+  measures a 117.894 ms decode wave, but the trace shows the slow stack is
+  still `ncclDevKernel_SendRecv` at 50.338 ms per rank range, the FP4 route
+  pair GEMV at 19.616 ms, the FP4 route `w2` GEMV at 10.487 ms, FP8 GEMV at
+  9.408 ms, plus allocator and launch overhead. The route-grouped path remains
+  opt-in; this is evidence for grouped GEMM/DeepGEMM plus DeepEP overlap, not a
+  default-path replacement.
 - [`bench-fused-dispatch-payload-local/`](bench-fused-dispatch-payload-local/)
   records the matching trace-off HTTP smoke. `decode64` returns normal English
   content at 12.22 post-first tok/s and the arithmetic case returns `410`.
