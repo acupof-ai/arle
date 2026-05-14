@@ -1,0 +1,22 @@
+Top CUDA kernels launched inside step_decode_kernel_launch ranges
+name,time_ms_per_rank_range,total_time_ms_all_ranges,calls
+ncclDevKernel_SendRecv,25.480829,203.846629,1032
+ncclDevKernel_AllReduce_Sum_bf16_RING_LL,15.278173,122.225382,344
+dsv4_fp8_gemv_batch_kernel,11.479105,91.832843,2920
+dsv4_fp4_gemv_batch_tiled_kernel,10.850159,86.801273,774
+dsv4_hybrid_attention_kernel,6.953614,55.628916,328
+dsv4_route_kernel,5.659732,45.277853,344
+dsv4_mhc_params_kernel,5.501333,44.010665,688
+dsv4_csa_select_kernel,3.961915,31.695320,168
+kernel,1.078277,8.626214,1504
+dsv4_compressor_update_kernel,0.584921,4.679368,496
+rms_norm_batched_kernel,0.434528,3.476221,1376
+gemv_handwritten_kernel,0.409476,3.275810,8
+dot_kernel,0.273061,2.184490,696
+dsv4_pack_expert_ranks_kernel,0.199101,1.592805,344
+dsv4_swa_attention_kernel,0.197740,1.581920,16
+dsv4_mhc_post_kernel,0.176441,1.411525,688
+dsv4_pack_received_experts_kernel,0.152740,1.221922,344
+reduce_1Block_kernel,0.144395,1.155158,696
+dsv4_prepare_q_kernel,0.137960,1.103676,344
+dsv4_mhc_pre_kernel,0.130166,1.041327,688
