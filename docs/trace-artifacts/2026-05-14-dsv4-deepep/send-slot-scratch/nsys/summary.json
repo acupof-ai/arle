@@ -1,0 +1,136 @@
+{
+  "decode_range_count": 8,
+  "unique_decode_threads": 8,
+  "decode_wave_count": 1,
+  "decode_waves_ms": [
+    191.152
+  ],
+  "decode_range_ms": {
+    "p50": 190.959
+  },
+  "request": {
+    "status": 200,
+    "total_s": 1.352673,
+    "ttft_s": 1.160856,
+    "usage": {
+      "prompt_tokens": 23,
+      "completion_tokens": 2,
+      "total_tokens": 25
+    },
+    "text": "霓灯",
+    "chunks": [
+      {
+        "t_ms": 1160.856,
+        "text": "霓"
+      },
+      {
+        "t_ms": 1352.552,
+        "text": "灯"
+      }
+    ]
+  },
+  "top_runtime_api_per_decode_range_ms": [
+    {
+      "name": "cuMemAllocAsync",
+      "ms": 47.625,
+      "count": 11097
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "ms": 43.305,
+      "count": 11105
+    },
+    {
+      "name": "cuMemcpyDtoHAsync_v2",
+      "ms": 29.611,
+      "count": 883
+    },
+    {
+      "name": "cudaLaunchKernel_v7000",
+      "ms": 15.926,
+      "count": 15080
+    },
+    {
+      "name": "cuMemsetD8Async",
+      "ms": 13.672,
+      "count": 12167
+    },
+    {
+      "name": "cudaEventRecord_v3020",
+      "ms": 3.84,
+      "count": 4136
+    },
+    {
+      "name": "cudaStreamWaitEvent_v3020",
+      "ms": 3.441,
+      "count": 3440
+    },
+    {
+      "name": "cuLaunchKernelEx",
+      "ms": 2.641,
+      "count": 1720
+    },
+    {
+      "name": "cuMemcpyDtoDAsync_v2",
+      "ms": 2.097,
+      "count": 859
+    },
+    {
+      "name": "cudaStreamGetCaptureInfo_v2_v11030",
+      "ms": 1.757,
+      "count": 5200
+    }
+  ],
+  "top_kernels_per_decode_range_ms": [
+    {
+      "name": "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "ms": 33.657,
+      "count": 1032
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "ms": 28.449,
+      "count": 344
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "ms": 11.47,
+      "count": 2920
+    },
+    {
+      "name": "dsv4_fp4_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "ms": 10.875,
+      "count": 774
+    },
+    {
+      "name": "dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)",
+      "ms": 7.842,
+      "count": 328
+    },
+    {
+      "name": "dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)",
+      "ms": 5.657,
+      "count": 344
+    },
+    {
+      "name": "dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)",
+      "ms": 5.501,
+      "count": 688
+    },
+    {
+      "name": "dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)",
+      "ms": 4.419,
+      "count": 168
+    },
+    {
+      "name": "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "ms": 2.907,
+      "count": 344
+    },
+    {
+      "name": "dsv4_compressor_update_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, int, int, int, int, int, int, int, int, int, float, int, float, int, float, float, float)",
+      "ms": 1.61,
+      "count": 496
+    }
+  ]
+}

@@ -24,7 +24,7 @@ use std::time::Instant;
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekDsv4GroupedBlockFormat, DeepseekExpertRuntimeScratch,
-    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache,
+    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_send_route_scratch,
 };
 #[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
@@ -1225,6 +1225,12 @@ impl DeepseekV4MoeBlock {
         )?;
 
         let trace = dsv4_moe_trace_begin(ctx)?;
+        let has_moe_scratch = moe_scratch.is_some();
+        let mut send_route_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
+            cache.send_route.take()
+        } else {
+            None
+        };
         let mut dispatch_scratch = if let Some(cache) = moe_scratch.as_deref_mut() {
             Some(cache.ensure_dispatch_scratch(
                 ctx,
@@ -1244,6 +1250,8 @@ impl DeepseekV4MoeBlock {
         let mut send_offsets_gpu_owned: CudaSlice<i32>;
         let mut rank_cursors_owned: CudaSlice<i32>;
         let mut send_hidden_owned: HiddenStates;
+        let mut send_token_owned: Option<CudaSlice<i32>> = None;
+        let mut send_route_slot_owned: Option<CudaSlice<i32>> = None;
         let mut send_meta_owned: CudaSlice<i32>;
         let mut all_rank_counts_owned: CudaSlice<i32>;
         let mut recv_rank_counts_owned: CudaSlice<i32>;
@@ -1497,14 +1505,42 @@ impl DeepseekV4MoeBlock {
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank route offsets H2D failed: {err}"))?;
         dsv4_zero_i32_slice(ctx, rank_cursors, ep.world_size)?;
         send_hidden.seq_len = total_send_routes;
-        let mut send_token = ctx
-            .stream
-            .alloc_zeros::<i32>(total_send_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send token alloc failed: {err}"))?;
-        let mut send_route_slot = ctx
-            .stream
-            .alloc_zeros::<i32>(total_send_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 send route slot alloc failed: {err}"))?;
+        let send_route_capacity = hidden.seq_len * config.num_experts_per_tok;
+        let send_route_scratch = if send_route_scratch_slot.is_some() || has_moe_scratch {
+            Some(ensure_send_route_scratch(
+                &mut send_route_scratch_slot,
+                ctx,
+                send_route_capacity,
+            )?)
+        } else {
+            None
+        };
+        if send_route_scratch.is_none() {
+            send_token_owned = Some(
+                ctx.stream
+                    .alloc_zeros::<i32>(send_route_capacity)
+                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 send token alloc failed: {err}"))?,
+            );
+            send_route_slot_owned = Some(
+                ctx.stream
+                    .alloc_zeros::<i32>(send_route_capacity)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 send route slot alloc failed: {err}")
+                    })?,
+            );
+        }
+        let (send_token, send_route_slot) = if let Some(scratch) = send_route_scratch {
+            (&mut scratch.send_token, &mut scratch.send_route_slot)
+        } else {
+            (
+                send_token_owned
+                    .as_mut()
+                    .expect("DeepSeek V4 send token fallback allocated"),
+                send_route_slot_owned
+                    .as_mut()
+                    .expect("DeepSeek V4 send route-slot fallback allocated"),
+            )
+        };
         {
             let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
@@ -1661,10 +1697,6 @@ impl DeepseekV4MoeBlock {
             dsv4_zero_i32_slice(ctx, local_cursors, ep.experts_per_rank)?;
             let mut expert_hidden =
                 HiddenStates::zeros(ctx, hidden.hidden_dim, total_local_routes)?;
-            let mut expert_token = ctx
-                .stream
-                .alloc_zeros::<i32>(total_local_routes)
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 expert token alloc failed: {err}"))?;
             let mut expert_weight = ctx
                 .stream
                 .alloc_zeros::<f32>(total_local_routes)
@@ -1683,8 +1715,6 @@ impl DeepseekV4MoeBlock {
                 let (cursor_ptr, _cursor_guard) = local_cursors.device_ptr_mut(&ctx.stream);
                 let (expert_hidden_ptr, _expert_hidden_guard) =
                     expert_hidden.data.device_ptr_mut(&ctx.stream);
-                let (expert_token_ptr, _expert_token_guard) =
-                    expert_token.device_ptr_mut(&ctx.stream);
                 let (expert_weight_ptr, _expert_weight_guard) =
                     expert_weight.device_ptr_mut(&ctx.stream);
                 let (route_slot_ptr, _route_slot_guard) =
@@ -1696,7 +1726,6 @@ impl DeepseekV4MoeBlock {
                         offset_ptr as *const i32,
                         cursor_ptr as *mut i32,
                         expert_hidden_ptr as *mut ffi::Half,
-                        expert_token_ptr as *mut i32,
                         expert_weight_ptr as *mut f32,
                         route_slot_ptr as *mut i32,
                         total_recv_routes as i32,
@@ -2054,6 +2083,9 @@ impl DeepseekV4MoeBlock {
             run_combine_kernel(&combine_recv, None, &mut out)?;
         }
         dsv4_moe_trace_end(ctx, "ffn_deepep_combine", layer_idx, hidden.seq_len, trace)?;
+        if let Some(cache) = moe_scratch.as_deref_mut() {
+            cache.send_route = send_route_scratch_slot.take();
+        }
         Ok(out)
     }
 

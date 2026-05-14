@@ -1,0 +1,11 @@
+{
+  "status": 200,
+  "total_s": 0.487862,
+  "ttft_s": 0.382069,
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 2,
+    "total_tokens": 14
+  },
+  "text": "2"
+}

@@ -189,7 +189,10 @@ Operators who want only the native serving binary can use `infer` directly (`car
   111,531. A follow-up single-token nsys window now isolates one generated
   decode token at **266 ms wall**: `cuStreamSynchronize`, async allocation/free,
   launch/memset churn, and NCCL send/recv dominate before attention or GEMV.
-  That leaves stream sync plus return-side NCCL/GEMM work as the next target.
+  Reusing send-route token/slot buffers and deleting the unused expert-token
+  pack output keeps short DeepEP smoke at **7.94-8.09 tok/s** while reducing
+  single-token decode allocator calls by 883. That leaves stream sync,
+  recv/local route scratch, and return-side NCCL/GEMM work as the next target.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/)
   and
