@@ -137,6 +137,17 @@ Related governance docs:
   `cuMemFreeAsync` 5,352 -> 4,360), but HTTP `decode64` remains flat at
   11.47 tok/s and the single nsys wave is not a wall-time win because D2H/NCCL
   timing dominates this capture.
+- Added DSv4 incremental attention scratch Nsight and HTTP artifacts under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-attention-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-attention-scratch/)
+  and
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-attention-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-attention-scratch/).
+  The real 8xH20 run returns normal multi-token output and arithmetic `410`;
+  the isolated single-token decode wave is 97.042 ms after B=1 attention
+  scratch cuts decode-window free calls from 4,360 to 3,048 without retaining
+  prompt-sized prefill buffers. The trace directly answers the current
+  bottleneck question: sampler is not in the top stack; NCCL SendRecv/AllReduce,
+  D2H route-count synchronization, launch/runtime overhead, local expert
+  FP8/FP4 GEMV, and attention/MHC kernels dominate.
 
 ### CUDA
 
@@ -211,6 +222,12 @@ Related governance docs:
   from roughly 5.5/5.6/6.0 tok/s to 6.3/6.2/7.3 tok/s for two math cases and
   one short writing case, while traced decode `attn_mhc` and `ffn_mhc` p50
   dropped to 0.088 ms and 0.085 ms respectively.
+- Reused DSv4 incremental attention scratch for prepared Q/K, local attention
+  output, and the `wo_a` latent projection, gated to B=1 decode so prefill does
+  not retain prompt-sized buffers. The real 8xH20 HTTP smoke remains correct
+  (`decode64` normal text, writing normal Chinese, arithmetic `410`), while the
+  paired single-token Nsight capture reduces warmed decode `cuMemFreeAsync`
+  calls from 4,360 to 3,048.
 - Added a default DSv4 local expert segment-input path for DeepEP decode. When
   `w1` and `w3` are DSv4 block-scaled FP8/FP4 matrices, the per-expert fallback
   now runs their GEMV directly from the packed `expert_hidden` segment and

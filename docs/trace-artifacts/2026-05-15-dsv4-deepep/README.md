@@ -97,6 +97,19 @@ Current trace set:
   records the trace-off HTTP smoke after reusing GPU compressor projection
   buffers. The output checks remain normal and arithmetic returns `410`;
   `decode64` stays flat at 11.47 e2e requested tok/s.
+- [`bench-attention-scratch/`](bench-attention-scratch/) records the matching
+  trace-off HTTP smoke after reusing incremental attention scratch. It returns
+  normal multi-token Chinese/English output and exact arithmetic `410`;
+  `decode64` reaches 12.08 post-first tok/s.
+- [`nsys-single-decode-token-attention-scratch/`](nsys-single-decode-token-attention-scratch/)
+  reuses prepared Q/K, local-attention, and `wo_a` latent buffers in the
+  B=1 incremental attention path without retaining prompt-sized prefill
+  buffers. The profiled request returns `406`, alloc/free calls move from
+  6,765/4,360 to 6,760/3,048, and the isolated single-token decode wave is
+  97.042 ms. The remaining top costs are NCCL
+  SendRecv/AllReduce, D2H route-count synchronization, launch/runtime overhead,
+  local expert FP8/FP4 GEMV, and attention/MHC kernels; sampler is not visible
+  in the top stack.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789

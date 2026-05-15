@@ -261,7 +261,13 @@ Operators who want only the native serving binary can use `infer` directly (`car
   **11.48 tok/s**. Reusing GPU compressor projection scratch cuts allocator/free
   calls again to **6,765/4,360** but does not improve HTTP throughput; the
   end-to-end blocker remains NCCL plus D2H synchronization and local expert
-  GEMV.
+  GEMV. Reusing B=1 incremental attention scratch then cuts warmed decode
+  free calls to **3,048** without retaining prompt-sized prefill buffers, and
+  the isolated single-token nsys wave is **97.0 ms**; the profiler shows the
+  token is still dominated by
+  NCCL SendRecv/AllReduce, D2H route-count synchronization, launch/runtime
+  overhead, local FP8/FP4 expert GEMV, and attention/MHC kernels rather than
+  sampler.
   Evidence:
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)
