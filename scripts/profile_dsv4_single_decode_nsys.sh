@@ -117,6 +117,75 @@ import sqlite3
 from pathlib import Path
 
 out = Path(__file__).resolve().parent
+server_log = out / "server.log"
+
+
+def load_request_traces(path):
+    traces = []
+    if not path.exists():
+        return traces
+    marker = "request_trace "
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            idx = line.find(marker)
+            if idx < 0:
+                continue
+            payload = line[idx + len(marker) :].strip()
+            try:
+                traces.append(json.loads(payload))
+            except json.JSONDecodeError:
+                continue
+    return traces
+
+
+request_traces = load_request_traces(server_log)
+alloc_trace = None
+for trace in reversed(request_traces):
+    candidate = trace.get("cuda_alloc_trace_process_delta")
+    if candidate:
+        alloc_trace = candidate
+        break
+
+(out / "request-traces.json").write_text(
+    json.dumps(request_traces, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+
+alloc_trace_payload = (
+    alloc_trace
+    if alloc_trace is not None
+    else {
+        "found": False,
+        "reason": "no cuda_alloc_trace_process_delta field in request_trace",
+    }
+)
+(out / "cuda-alloc-trace-process-delta.json").write_text(
+    json.dumps(alloc_trace_payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+with (out / "cuda-alloc-trace-process-delta.csv").open(
+    "w", newline="", encoding="utf-8"
+) as f:
+    writer = csv.writer(f, lineterminator="\n")
+    writer.writerow(
+        ["rank", "file", "line", "column", "kind", "label", "type", "calls", "bytes"]
+    )
+    if alloc_trace is not None:
+        for rank, entry in enumerate(alloc_trace.get("entries", []), start=1):
+            writer.writerow(
+                [
+                    rank,
+                    entry.get("file"),
+                    entry.get("line"),
+                    entry.get("column"),
+                    entry.get("kind"),
+                    entry.get("label"),
+                    entry.get("type"),
+                    entry.get("calls"),
+                    entry.get("bytes"),
+                ]
+            )
+
 conn = sqlite3.connect(out / "trace.sqlite")
 cur = conn.cursor()
 tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -224,6 +293,9 @@ wave_wall_ms = [
 range_count = len(ranges)
 summary = {
     "capture": "single profile request, filtered to step_decode_kernel_launch NVTX ranges",
+    "request_trace_count": len(request_traces),
+    "cuda_alloc_trace_found": alloc_trace is not None,
+    "cuda_alloc_trace_process_delta": alloc_trace,
     "decode_ranges": len(ranges),
     "decode_waves": (len(ranges) // 8) if len(ranges) % 8 == 0 else None,
     "decode_wave_wall_ms": wave_wall_ms,
