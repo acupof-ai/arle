@@ -705,6 +705,10 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) window: VecDeque<DeepseekKvRow>,
     pub(crate) window_gpu: Option<CudaSlice<bf16>>,
     pub(crate) window_gpu_len: usize,
+    pub(crate) q_prepared: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) k_prepared: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) local_attn: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) output_latent: Option<DeepseekHiddenRuntimeScratch>,
     #[cfg(test)]
     pub(crate) compressed: Option<DeepseekCompressorRuntimeCache>,
     #[cfg(test)]

@@ -1451,8 +1451,64 @@ impl DeepseekModel {
             (self.config.rope_theta, 0)
         };
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut q_prepared = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
-        let mut k_prepared = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
+        let reuse_decode_scratch = token_count == 1;
+        let mut q_prepared_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.q_prepared,
+                    &self.ctx,
+                    local_width,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut k_prepared_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.k_prepared,
+                    &self.ctx,
+                    head_dim,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut local_attn_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.local_attn,
+                    &self.ctx,
+                    local_width,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut q_prepared_owned;
+        let mut k_prepared_owned;
+        let q_prepared = if let Some(scratch) = q_prepared_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            q_prepared_owned =
+                unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
+            &mut q_prepared_owned
+        };
+        let k_prepared = if let Some(scratch) = k_prepared_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            k_prepared_owned = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
+            &mut k_prepared_owned
+        };
         {
             let (q_raw_ptr, _q_raw_guard) = q_raw.data.device_ptr(&self.ctx.stream);
             let (k_raw_ptr, _k_raw_guard) = kv_normed.data.device_ptr(&self.ctx.stream);
@@ -1508,7 +1564,14 @@ impl DeepseekModel {
         )?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut local_attn = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
+        let mut local_attn_owned;
+        let local_attn = if let Some(scratch) = local_attn_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            local_attn_owned =
+                unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
+            &mut local_attn_owned
+        };
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
@@ -1607,9 +1670,66 @@ impl DeepseekModel {
         }
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let latent = ops::gemm(&self.ctx, &attention.wo_a, &local_attn)?;
-        let mut out = ops::gemm(&self.ctx, &attention.wo_b, &latent)?;
+        let mut latent_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.output_latent,
+                    &self.ctx,
+                    attention.wo_a.rows,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut latent_owned;
+        let latent = if let Some(scratch) = latent_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            latent_owned =
+                unsafe { HiddenStates::uninit(&self.ctx, attention.wo_a.rows, token_count)? };
+            &mut latent_owned
+        };
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wo_a,
+            &*local_attn,
+            latent,
+            if token_count > 1 {
+                ops::LinearDispatchPhase::Prefill
+            } else {
+                ops::LinearDispatchPhase::Decode
+            },
+        )?;
+        let mut out = unsafe { HiddenStates::uninit(&self.ctx, attention.wo_b.rows, token_count)? };
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wo_b,
+            &*latent,
+            &mut out,
+            if token_count > 1 {
+                ops::LinearDispatchPhase::Prefill
+            } else {
+                ops::LinearDispatchPhase::Decode
+            },
+        )?;
         dsv4_trace_end(&self.ctx, "attn_output_proj", layer_idx, token_count, trace)?;
+        if let Some(cache) = cache.as_deref_mut() {
+            if let Some(scratch) = q_prepared_scratch.take() {
+                put_hidden_scratch(&mut cache.q_prepared, scratch);
+            }
+            if let Some(scratch) = k_prepared_scratch.take() {
+                put_hidden_scratch(&mut cache.k_prepared, scratch);
+            }
+            if let Some(scratch) = local_attn_scratch.take() {
+                put_hidden_scratch(&mut cache.local_attn, scratch);
+            }
+            if let Some(scratch) = latent_scratch.take() {
+                put_hidden_scratch(&mut cache.output_latent, scratch);
+            }
+        }
         let trace = dsv4_trace_begin(&self.ctx)?;
         self.layer_communicator
             .post_attn_all_reduce_hidden_states(&mut out)?;

@@ -1,0 +1,240 @@
+{
+  "capture": "single profile request, filtered to step_decode_kernel_launch NVTX ranges",
+  "decode_ranges": 8,
+  "decode_waves": 1,
+  "decode_wave_wall_ms": [
+    97.041571
+  ],
+  "decode_wave_wall_ms_max": 97.041571,
+  "decode_range_ms_min": 96.530093,
+  "decode_range_ms_p50": 96.79338,
+  "decode_range_ms_max": 97.033765,
+  "top_runtime_apis": [
+    {
+      "name": "cudaLaunchKernel_v7000",
+      "time_ms_per_rank_range": 27.98742937499983,
+      "total_time_ms_all_ranges": 223.89943499999865,
+      "calls": 16415,
+      "avg_ms": 0.013639929028327667
+    },
+    {
+      "name": "cuMemAllocAsync",
+      "time_ms_per_rank_range": 9.696099500000042,
+      "total_time_ms_all_ranges": 77.56879600000033,
+      "calls": 6760,
+      "avg_ms": 0.011474673964497091
+    },
+    {
+      "name": "cuMemcpyDtoHAsync_v2",
+      "time_ms_per_rank_range": 8.111034249999996,
+      "total_time_ms_all_ranges": 64.88827399999997,
+      "calls": 344,
+      "avg_ms": 0.188628703488372
+    },
+    {
+      "name": "cuMemsetD8Async",
+      "time_ms_per_rank_range": 5.381143750000003,
+      "total_time_ms_all_ranges": 43.049150000000026,
+      "calls": 3640,
+      "avg_ms": 0.011826689560439568
+    },
+    {
+      "name": "cuMemFreeAsync",
+      "time_ms_per_rank_range": 4.909158124999994,
+      "total_time_ms_all_ranges": 39.27326499999995,
+      "calls": 3048,
+      "avg_ms": 0.012884929461942241
+    },
+    {
+      "name": "cudaEventRecord_v3020",
+      "time_ms_per_rank_range": 2.9901862499999945,
+      "total_time_ms_all_ranges": 23.921489999999956,
+      "calls": 2760,
+      "avg_ms": 0.008667206521739114
+    },
+    {
+      "name": "cudaStreamGetCaptureInfo_v2_v11030",
+      "time_ms_per_rank_range": 2.5358731249999984,
+      "total_time_ms_all_ranges": 20.286984999999987,
+      "calls": 4512,
+      "avg_ms": 0.004496228945035458
+    },
+    {
+      "name": "cudaStreamWaitEvent_v3020",
+      "time_ms_per_rank_range": 2.160019125000003,
+      "total_time_ms_all_ranges": 17.280153000000023,
+      "calls": 2064,
+      "avg_ms": 0.008372167151162803
+    },
+    {
+      "name": "cuMemcpyHtoDAsync_v2",
+      "time_ms_per_rank_range": 1.8165952499999982,
+      "total_time_ms_all_ranges": 14.532761999999986,
+      "calls": 1040,
+      "avg_ms": 0.013973809615384601
+    },
+    {
+      "name": "cuLaunchKernelEx",
+      "time_ms_per_rank_range": 1.6782299999999981,
+      "total_time_ms_all_ranges": 13.425839999999985,
+      "calls": 1032,
+      "avg_ms": 0.013009534883720916
+    },
+    {
+      "name": "cuMemcpyDtoDAsync_v2",
+      "time_ms_per_rank_range": 1.3529383749999984,
+      "total_time_ms_all_ranges": 10.823506999999987,
+      "calls": 704,
+      "avg_ms": 0.015374299715909073
+    },
+    {
+      "name": "cudaGetFuncBySymbol_v11000",
+      "time_ms_per_rank_range": 0.5058296250000001,
+      "total_time_ms_all_ranges": 4.0466370000000005,
+      "calls": 1032,
+      "avg_ms": 0.003921159883720931
+    }
+  ],
+  "top_kernels": [
+    {
+      "name": "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "time_ms_per_rank_range": 23.41047924999999,
+      "total_time_ms_all_ranges": 187.28383399999993,
+      "calls": 688,
+      "avg_ms": 0.2722148749999999
+    },
+    {
+      "name": "dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "time_ms_per_rank_range": 11.479831500000005,
+      "total_time_ms_all_ranges": 91.83865200000004,
+      "calls": 2920,
+      "avg_ms": 0.031451593150684944
+    },
+    {
+      "name": "dsv4_fp4_gemv_batch_tiled_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",
+      "time_ms_per_rank_range": 10.849372999999995,
+      "total_time_ms_all_ranges": 86.79498399999996,
+      "calls": 774,
+      "avg_ms": 0.11213822222222217
+    },
+    {
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "time_ms_per_rank_range": 7.498712000000005,
+      "total_time_ms_all_ranges": 59.98969600000004,
+      "calls": 344,
+      "avg_ms": 0.17438865116279081
+    },
+    {
+      "name": "dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)",
+      "time_ms_per_rank_range": 7.3980282499999985,
+      "total_time_ms_all_ranges": 59.18422599999999,
+      "calls": 328,
+      "avg_ms": 0.1804397134146341
+    },
+    {
+      "name": "dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)",
+      "time_ms_per_rank_range": 5.661615625000001,
+      "total_time_ms_all_ranges": 45.29292500000001,
+      "calls": 344,
+      "avg_ms": 0.13166547965116282
+    },
+    {
+      "name": "dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)",
+      "time_ms_per_rank_range": 5.501228500000002,
+      "total_time_ms_all_ranges": 44.00982800000001,
+      "calls": 688,
+      "avg_ms": 0.06396777325581397
+    },
+    {
+      "name": "dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)",
+      "time_ms_per_rank_range": 4.139694125000001,
+      "total_time_ms_all_ranges": 33.11755300000001,
+      "calls": 168,
+      "avg_ms": 0.1971282916666667
+    },
+    {
+      "name": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+      "time_ms_per_rank_range": 1.079356375000007,
+      "total_time_ms_all_ranges": 8.634851000000056,
+      "calls": 1504,
+      "avg_ms": 0.005741257313829825
+    },
+    {
+      "name": "dsv4_compressor_update_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, int, int, int, int, int, int, int, int, int, float, int, float, int, float, float, float)",
+      "time_ms_per_rank_range": 0.8556222500000007,
+      "total_time_ms_all_ranges": 6.844978000000006,
+      "calls": 496,
+      "avg_ms": 0.013800358870967753
+    },
+    {
+      "name": "rms_norm_batched_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)",
+      "time_ms_per_rank_range": 0.4349867500000003,
+      "total_time_ms_all_ranges": 3.4798940000000025,
+      "calls": 1376,
+      "avg_ms": 0.002528992732558141
+    },
+    {
+      "name": "void dot_kernel<float, (int)128, (int)0, cublasDotParams<cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<float>>>(T4)",
+      "time_ms_per_rank_range": 0.273268250000001,
+      "total_time_ms_all_ranges": 2.186146000000008,
+      "calls": 696,
+      "avg_ms": 0.0031410143678161032
+    },
+    {
+      "name": "dsv4_swa_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float)",
+      "time_ms_per_rank_range": 0.20980025000000002,
+      "total_time_ms_all_ranges": 1.6784020000000002,
+      "calls": 16,
+      "avg_ms": 0.10490012500000001
+    },
+    {
+      "name": "dsv4_pack_expert_ranks_kernel(const unsigned short *, const int *, const float *, const int *, int *, unsigned short *, int *, int *, int *, int, int, int, int, int)",
+      "time_ms_per_rank_range": 0.19879199999999989,
+      "total_time_ms_all_ranges": 1.590335999999999,
+      "calls": 344,
+      "avg_ms": 0.004623069767441858
+    },
+    {
+      "name": "dsv4_mhc_post_kernel(const unsigned short *, const unsigned short *, const float *, const float *, unsigned short *, int, int, int)",
+      "time_ms_per_rank_range": 0.1754816249999994,
+      "total_time_ms_all_ranges": 1.4038529999999951,
+      "calls": 688,
+      "avg_ms": 0.0020404840116279
+    },
+    {
+      "name": "void reduce_1Block_kernel<float, (int)128, (int)7, cublasGemvTensorStridedBatched<float>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>>(const T1 *, T1, T4, int, const T1 *, T1, T5, T6, cublasPointerMode_t, cublasLtEpilogue_t, cublasGemvTensorStridedBatched<const biasType<T6::value_type, T1>::type>)",
+      "time_ms_per_rank_range": 0.14457600000000045,
+      "total_time_ms_all_ranges": 1.1566080000000036,
+      "calls": 696,
+      "avg_ms": 0.0016617931034482811
+    },
+    {
+      "name": "dsv4_pack_received_experts_kernel(const unsigned short *, const int *, const int *, int *, unsigned short *, float *, int *, int, int, int, int)",
+      "time_ms_per_rank_range": 0.14299124999999996,
+      "total_time_ms_all_ranges": 1.1439299999999997,
+      "calls": 344,
+      "avg_ms": 0.0033253779069767433
+    },
+    {
+      "name": "dsv4_prepare_q_kernel(const unsigned short *, unsigned short *, int, int, int, int, int, float, float, int, float, float, float)",
+      "time_ms_per_rank_range": 0.13777624999999993,
+      "total_time_ms_all_ranges": 1.1022099999999995,
+      "calls": 344,
+      "avg_ms": 0.003204098837209301
+    },
+    {
+      "name": "dsv4_mhc_pre_kernel(const unsigned short *, const float *, unsigned short *, int, int, int)",
+      "time_ms_per_rank_range": 0.13030937499999945,
+      "total_time_ms_all_ranges": 1.0424749999999956,
+      "calls": 688,
+      "avg_ms": 0.001515225290697668
+    },
+    {
+      "name": "dsv4_pack_dispatch_payload_kernel(const unsigned short *, const int *, unsigned short *, int, int, int)",
+      "time_ms_per_rank_range": 0.11638837500000007,
+      "total_time_ms_all_ranges": 0.9311070000000006,
+      "calls": 344,
+      "avg_ms": 0.002706706395348839
+    }
+  ]
+}
