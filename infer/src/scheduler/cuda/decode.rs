@@ -8,7 +8,7 @@ use crate::model::{
 };
 use crate::scheduler::DraftMode;
 use crate::scheduler::cuda::core::{
-    PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow,
+    GpuStageKind, PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow,
 };
 use crate::scheduler::cuda::execution::PrefillCandidate;
 use crate::scheduler::cuda::runtime::WaitingInsertBias;
@@ -213,8 +213,11 @@ impl<M: ModelForward> Scheduler<M> {
                 })
             })
             .collect();
+        let mut stage = self.new_gpu_stage_handle(GpuStageKind::Readback, slot_indices.clone());
+        stage.mark_inflight();
 
         self.pending_decode = Some(PendingDecode {
+            stage: stage.clone(),
             decode_indices,
             slot_indices,
             greedy_launched,
@@ -224,6 +227,7 @@ impl<M: ModelForward> Scheduler<M> {
             decode_spans,
             mixed_prefill,
         });
+        self.publish_gpu_stage_depths();
     }
 
     pub(super) fn launch_decode_batch_from_tokens(
@@ -688,6 +692,11 @@ impl<M: ModelForward> Scheduler<M> {
             false
         };
 
+        let mut mixed_prefill_stage = self.new_gpu_stage_handle(
+            GpuStageKind::Prefill,
+            pending_rows.iter().map(|row| row.slot_idx).collect(),
+        );
+        mixed_prefill_stage.mark_inflight();
         self.queue_pending_decode_launch(
             decode_indices,
             slot_indices,
@@ -695,6 +704,7 @@ impl<M: ModelForward> Scheduler<M> {
             async_slot_idx,
             false,
             Some(PendingMixedPrefill {
+                stage: mixed_prefill_stage,
                 rows: pending_rows,
                 uses_paged: self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active(),
                 prefill_spans,
@@ -702,25 +712,36 @@ impl<M: ModelForward> Scheduler<M> {
         );
     }
 
-    fn finish_pending_decode_with_error(&mut self, pending: PendingDecode, err: anyhow::Error) {
+    fn finish_pending_decode_with_error(&mut self, mut pending: PendingDecode, err: anyhow::Error) {
         error!("Batched sampling failed: {}", err);
+        pending.stage.mark_completed();
+        self.metrics
+            .record_scheduler_pipeline_stage_completed(pending.stage.kind.as_str());
         for &slot_idx in &pending.decode_indices {
             self.finish_slot(slot_idx);
         }
-        if let Some(mixed_prefill) = pending.mixed_prefill {
+        if let Some(mut mixed_prefill) = pending.mixed_prefill {
+            mixed_prefill.stage.mark_completed();
+            self.metrics
+                .record_scheduler_pipeline_stage_completed(mixed_prefill.stage.kind.as_str());
             for row in mixed_prefill.rows {
                 self.finish_slot(row.slot_idx);
             }
         }
+        self.publish_gpu_stage_depths();
     }
 
     fn apply_sampled_decode_tokens(
         &mut self,
-        pending: PendingDecode,
+        mut pending: PendingDecode,
         sampled_tokens: Vec<u32>,
         logprobs_host: Option<Vec<f32>>,
         spec_readback_started: Option<std::time::Instant>,
     ) {
+        pending.stage.mark_completed();
+        self.metrics
+            .record_scheduler_pipeline_stage_completed(pending.stage.kind.as_str());
+        self.publish_gpu_stage_depths();
         let decode_trace_contexts: std::collections::HashMap<
             usize,
             fastrace::collector::SpanContext,
@@ -837,8 +858,12 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        if let Some(mixed_prefill) = pending.mixed_prefill {
+        if let Some(mut mixed_prefill) = pending.mixed_prefill {
+            mixed_prefill.stage.mark_ready();
+            self.metrics
+                .record_scheduler_pipeline_stage_ready(mixed_prefill.stage.kind.as_str());
             self.finish_prefill_batch(PendingPrefill {
+                stage: mixed_prefill.stage,
                 rows: mixed_prefill.rows,
                 uses_paged: mixed_prefill.uses_paged,
                 prefill_spans: mixed_prefill.prefill_spans,
@@ -874,7 +899,7 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn step_decode_readback(&mut self) {
-        if let Some(pending) = self.deferred_decode_emit.take() {
+        if let Some(mut pending) = self.deferred_decode_emit.take() {
             let spec_readback_started = pending.speculative.then(std::time::Instant::now);
             let decode_ctx = self.decode_bufs.as_mut().unwrap();
             let readback_poll_started = std::time::Instant::now();
@@ -884,6 +909,9 @@ impl<M: ModelForward> Scheduler<M> {
                 pending.async_slot_idx,
             ) {
                 Ok(Some(tokens)) => {
+                    pending.stage.mark_ready();
+                    self.metrics
+                        .record_scheduler_pipeline_stage_ready(pending.stage.kind.as_str());
                     self.metrics
                         .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
                     if let Some(started_at) = pending.readback_started_at {
@@ -904,6 +932,7 @@ impl<M: ModelForward> Scheduler<M> {
                         .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
                     self.metrics.record_readback_poll_not_ready();
                     self.deferred_decode_emit = Some(pending);
+                    self.publish_gpu_stage_depths();
                     return;
                 }
                 Err(e) => {
@@ -914,7 +943,7 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        let Some(pending) = self.pending_decode.take() else {
+        let Some(mut pending) = self.pending_decode.take() else {
             return;
         };
         let spec_readback_started = pending.speculative.then(std::time::Instant::now);
@@ -927,6 +956,9 @@ impl<M: ModelForward> Scheduler<M> {
                 pending.async_slot_idx,
             ) {
                 Ok(Some(tokens)) => {
+                    pending.stage.mark_ready();
+                    self.metrics
+                        .record_scheduler_pipeline_stage_ready(pending.stage.kind.as_str());
                     self.metrics
                         .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
                     if let Some(started_at) = pending.readback_started_at {
@@ -947,6 +979,7 @@ impl<M: ModelForward> Scheduler<M> {
                         .observe_d2h_wait_us(readback_poll_started.elapsed().as_micros() as u64);
                     self.metrics.record_readback_poll_not_ready();
                     self.deferred_decode_emit = Some(pending);
+                    self.publish_gpu_stage_depths();
                 }
                 Err(e) => {
                     self.metrics
@@ -975,7 +1008,8 @@ impl<M: ModelForward> Scheduler<M> {
                 .into_iter()
                 .filter(|(slot_idx, _)| live_slot_indices.contains(slot_idx))
                 .collect();
-            let live_pending = PendingDecode {
+            let mut live_pending = PendingDecode {
+                stage: pending.stage,
                 decode_indices: live_decode_indices,
                 slot_indices: live_slot_indices,
                 greedy_launched: false,
@@ -986,6 +1020,9 @@ impl<M: ModelForward> Scheduler<M> {
                 mixed_prefill: pending.mixed_prefill,
             };
             if live_pending.decode_indices.is_empty() {
+                live_pending.stage.mark_ready();
+                self.metrics
+                    .record_scheduler_pipeline_stage_ready(live_pending.stage.kind.as_str());
                 self.apply_sampled_decode_tokens(
                     live_pending,
                     Vec::new(),
@@ -1003,6 +1040,10 @@ impl<M: ModelForward> Scheduler<M> {
                 &mut self.rng,
             ) {
                 Ok(sampled_tokens) => {
+                    let mut live_pending = live_pending;
+                    live_pending.stage.mark_ready();
+                    self.metrics
+                        .record_scheduler_pipeline_stage_ready(live_pending.stage.kind.as_str());
                     self.apply_sampled_decode_tokens(
                         live_pending,
                         sampled_tokens,

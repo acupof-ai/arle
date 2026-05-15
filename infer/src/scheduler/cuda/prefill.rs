@@ -1,4 +1,4 @@
-use super::core::{PendingPrefill, PendingPrefillRow};
+use super::core::{GpuStageKind, PendingPrefill, PendingPrefillRow};
 use super::nvtx_scopes::nvtx_scope;
 use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, info, warn};
 use crate::model::PrefillBatchRequest;
@@ -561,7 +561,11 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    pub(super) fn finish_prefill_batch(&mut self, pending: PendingPrefill) {
+    pub(super) fn finish_prefill_batch(&mut self, mut pending: PendingPrefill) {
+        pending.stage.mark_completed();
+        self.metrics
+            .record_scheduler_pipeline_stage_completed(pending.stage.kind.as_str());
+        self.publish_gpu_stage_depths();
         for (slot_idx, span) in &pending.prefill_spans {
             if let Some(req) = self.request_mut(*slot_idx) {
                 req.update_trace_context(Some(span));
@@ -706,6 +710,12 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn step_prefill_batch_sync(&mut self, batch: PreparedPrefillBatch) {
+        let mut stage = self.new_gpu_stage_handle(
+            GpuStageKind::Prefill,
+            batch.rows.iter().map(|row| row.slot_idx).collect(),
+        );
+        stage.mark_inflight();
+        self.publish_gpu_stage_depths_including(Some(&stage));
         let requests = batch.requests();
         if batch.uses_paged {
             self.reclaim_for_paged_appends(
@@ -720,10 +730,18 @@ impl<M: ModelForward> Scheduler<M> {
             batch.uses_paged.then_some(&mut self.paged_kv_pool),
         );
         if let Err(e) = forward_result {
+            stage.mark_completed();
+            self.metrics
+                .record_scheduler_pipeline_stage_completed(stage.kind.as_str());
+            self.publish_gpu_stage_depths();
             self.finish_prefill_batch_error(&batch.rows, &e);
             return;
         }
+        stage.mark_ready();
+        self.metrics
+            .record_scheduler_pipeline_stage_ready(stage.kind.as_str());
         self.finish_prefill_batch(PendingPrefill {
+            stage,
             rows: batch.rows,
             uses_paged: batch.uses_paged,
             prefill_spans: batch.prefill_spans,
@@ -744,6 +762,12 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
+        let mut stage = self.new_gpu_stage_handle(
+            GpuStageKind::Prefill,
+            batch.rows.iter().map(|row| row.slot_idx).collect(),
+        );
+        stage.mark_inflight();
+        self.publish_gpu_stage_depths_including(Some(&stage));
 
         let requests = batch.requests();
         if batch.uses_paged {
@@ -764,22 +788,32 @@ impl<M: ModelForward> Scheduler<M> {
             prefill_ctx,
         );
         if let Err(e) = forward_result {
+            stage.mark_completed();
+            self.metrics
+                .record_scheduler_pipeline_stage_completed(stage.kind.as_str());
+            self.publish_gpu_stage_depths();
             self.finish_prefill_batch_error(&batch.rows, &e);
             return;
         }
 
         self.pending_prefill = Some(PendingPrefill {
+            stage: stage.clone(),
             rows: batch.rows,
             uses_paged: batch.uses_paged,
             prefill_spans: batch.prefill_spans,
         });
+        self.publish_gpu_stage_depths();
     }
 
     pub(super) fn step_prefill_readback(&mut self) -> bool {
-        let Some(pending) = self.pending_prefill.take() else {
+        let Some(mut pending) = self.pending_prefill.take() else {
             return true;
         };
         let Some(prefill_ctx) = self.prefill_ctx.as_mut() else {
+            pending.stage.mark_completed();
+            self.metrics
+                .record_scheduler_pipeline_stage_completed(pending.stage.kind.as_str());
+            self.publish_gpu_stage_depths();
             self.finish_prefill_batch_error(
                 &pending.rows,
                 &anyhow::anyhow!("missing prefill context for async completion"),
@@ -795,14 +829,22 @@ impl<M: ModelForward> Scheduler<M> {
             Ok(true) => {}
             Ok(false) => {
                 self.pending_prefill = Some(pending);
+                self.publish_gpu_stage_depths();
                 return false;
             }
             Err(e) => {
+                pending.stage.mark_completed();
+                self.metrics
+                    .record_scheduler_pipeline_stage_completed(pending.stage.kind.as_str());
+                self.publish_gpu_stage_depths();
                 self.finish_prefill_batch_error(&pending.rows, &e);
                 return true;
             }
         }
 
+        pending.stage.mark_ready();
+        self.metrics
+            .record_scheduler_pipeline_stage_ready(pending.stage.kind.as_str());
         self.finish_prefill_batch(pending);
         true
     }

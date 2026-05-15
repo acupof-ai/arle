@@ -51,8 +51,8 @@ pub(in crate::scheduler::cuda) use helpers::{
 };
 pub(in crate::scheduler::cuda) use session_slots::{PressureMode, SessionSlot, SessionSlotHold};
 pub(in crate::scheduler::cuda) use state_types::{
-    PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow, PrefetchTicketState,
-    SchedulerRuntimeStats, StoreDedupKey,
+    GpuStageHandle, GpuStageKind, GpuStageState, PendingDecode, PendingMixedPrefill,
+    PendingPrefill, PendingPrefillRow, PrefetchTicketState, SchedulerRuntimeStats, StoreDedupKey,
 };
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
@@ -778,6 +778,112 @@ impl<M: ModelForward> Scheduler<M> {
             || self.pending_prefill.is_some()
     }
 
+    pub(super) fn new_gpu_stage_handle(
+        &mut self,
+        kind: GpuStageKind,
+        slots: Vec<usize>,
+    ) -> GpuStageHandle {
+        let id = self.stats.next_gpu_stage_id();
+        self.metrics
+            .record_scheduler_pipeline_stage_queued(kind.as_str());
+        GpuStageHandle::new(id, kind, slots)
+    }
+
+    pub(super) fn publish_gpu_stage_depths(&self) {
+        self.publish_gpu_stage_depths_including(None);
+    }
+
+    pub(super) fn publish_gpu_stage_depths_including(&self, extra: Option<&GpuStageHandle>) {
+        fn add_stage(
+            stage: &GpuStageHandle,
+            prefill_queued: &mut u64,
+            prefill_inflight: &mut u64,
+            readback_queued: &mut u64,
+            readback_inflight: &mut u64,
+        ) {
+            let (queued, inflight) = match stage.state {
+                GpuStageState::Queued => (1, 0),
+                GpuStageState::InFlight | GpuStageState::Ready => (0, 1),
+                GpuStageState::Completed => (0, 0),
+            };
+            match stage.kind {
+                GpuStageKind::Prefill => {
+                    *prefill_queued += queued;
+                    *prefill_inflight += inflight;
+                }
+                GpuStageKind::Readback => {
+                    *readback_queued += queued;
+                    *readback_inflight += inflight;
+                }
+            }
+        }
+
+        let mut prefill_queued = 0;
+        let mut prefill_inflight = 0;
+        let mut readback_queued = 0;
+        let mut readback_inflight = 0;
+        if let Some(pending) = &self.pending_prefill {
+            add_stage(
+                &pending.stage,
+                &mut prefill_queued,
+                &mut prefill_inflight,
+                &mut readback_queued,
+                &mut readback_inflight,
+            );
+        }
+        if let Some(pending) = &self.pending_decode {
+            add_stage(
+                &pending.stage,
+                &mut prefill_queued,
+                &mut prefill_inflight,
+                &mut readback_queued,
+                &mut readback_inflight,
+            );
+            if let Some(mixed) = &pending.mixed_prefill {
+                add_stage(
+                    &mixed.stage,
+                    &mut prefill_queued,
+                    &mut prefill_inflight,
+                    &mut readback_queued,
+                    &mut readback_inflight,
+                );
+            }
+        }
+        if let Some(pending) = &self.deferred_decode_emit {
+            add_stage(
+                &pending.stage,
+                &mut prefill_queued,
+                &mut prefill_inflight,
+                &mut readback_queued,
+                &mut readback_inflight,
+            );
+            if let Some(mixed) = &pending.mixed_prefill {
+                add_stage(
+                    &mixed.stage,
+                    &mut prefill_queued,
+                    &mut prefill_inflight,
+                    &mut readback_queued,
+                    &mut readback_inflight,
+                );
+            }
+        }
+        if let Some(stage) = extra {
+            add_stage(
+                stage,
+                &mut prefill_queued,
+                &mut prefill_inflight,
+                &mut readback_queued,
+                &mut readback_inflight,
+            );
+        }
+        self.metrics.set_scheduler_pipeline_stage_depths(
+            prefill_queued,
+            prefill_inflight,
+            readback_queued,
+            readback_inflight,
+        );
+    }
+
     pub(super) fn deferred_decode_requires_readback_before_launch(&self) -> bool {
         self.deferred_decode_emit.as_ref().is_some_and(|pending| {
             pending.decode_indices.iter().any(|&slot_idx| {
@@ -789,21 +895,21 @@ impl<M: ModelForward> Scheduler<M> {
 
     pub(super) fn slot_has_pending_gpu_work(&self, slot_idx: usize) -> bool {
         self.pending_decode.as_ref().is_some_and(|pending| {
-            pending.decode_indices.contains(&slot_idx)
+            pending.stage.contains_slot(slot_idx)
                 || pending
                     .mixed_prefill
                     .as_ref()
-                    .is_some_and(|mixed| mixed.rows.iter().any(|row| row.slot_idx == slot_idx))
+                    .is_some_and(|mixed| mixed.stage.contains_slot(slot_idx))
         }) || self.deferred_decode_emit.as_ref().is_some_and(|pending| {
-            pending.decode_indices.contains(&slot_idx)
+            pending.stage.contains_slot(slot_idx)
                 || pending
                     .mixed_prefill
                     .as_ref()
-                    .is_some_and(|mixed| mixed.rows.iter().any(|row| row.slot_idx == slot_idx))
+                    .is_some_and(|mixed| mixed.stage.contains_slot(slot_idx))
         }) || self
             .pending_prefill
             .as_ref()
-            .is_some_and(|pending| pending.rows.iter().any(|row| row.slot_idx == slot_idx))
+            .is_some_and(|pending| pending.stage.contains_slot(slot_idx))
     }
 
     pub(super) fn request(&self, slot_idx: usize) -> Option<&ActiveRequest> {
