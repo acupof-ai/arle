@@ -189,7 +189,12 @@ Operators who want only the native serving binary can use `infer` directly (`car
   `q_raw`, `kv_raw`, and `kv_normed` is a positive follow-up: the single-token
   nsys wave moves to **90.946 ms**, `cuMemAllocAsync` drops from **6,760** to
   **5,040** calls, `cuMemFreeAsync` drops from **3,048** to **1,328**, and the
-  trace-off `decode64` smoke remains normal at **11.89 post-first tok/s**.
+  trace-off `decode64` smoke remains normal at **11.89 post-first tok/s**. A
+  fresh direct single-token breakdown records **105.205 ms** for the same
+  current default path and makes the ranked bottleneck explicit: **16,177**
+  CUDA launches, **20.122 ms** reduce-scatter, **11.474/11.109 ms** FP8/FP4
+  expert GEMV, **8.978 ms** all-reduce, attention/MHC/route kernels, and
+  **347** D2H synchronization calls.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and

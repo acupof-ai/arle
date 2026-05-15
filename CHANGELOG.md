@@ -121,6 +121,14 @@ Related governance docs:
   6,760 to 5,040 and `cuMemFreeAsync` calls drop from 3,048 to 1,328 inside
   the decode range. The matching HTTP smoke keeps normal Chinese/English
   streaming output and exact math, with `decode64` at 11.89 post-first tok/s.
+- Added a direct current-path single decode-token Nsight breakdown under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-breakdown/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-breakdown/).
+  The real 8xH20 `/root/DeepSeek-V4-Flash` run returns exact arithmetic `406`
+  and measures a 105.205 ms isolated second-token decode wave. The top stack is
+  now explicit: 16,177 CUDA launches, reduce-scatter combine, local FP8/FP4
+  expert GEMV, all-reduce, attention/MHC/route kernels, and 347 D2H calls for
+  per-layer synchronization. This confirms the current issue is MoE
+  communication/compute plus launch/runtime granularity, not sampler time.
 - Added the DSv4 default-path warm decode Nsight trace under
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
   The run warms a real decode first, then profiles a second single decode token
