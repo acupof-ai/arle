@@ -24,6 +24,7 @@
 //! | `infer_scheduler_loop_total_microseconds` | gauge | EMA full scheduler loop duration |
 //! | `infer_preprocess_*` | gauge | HTTP preprocess queue and tokenization timing |
 //! | `infer_scheduler_pipeline_*` | gauge/counter | Scheduler pipeline snapshot/plan/GPU-command telemetry |
+//! | `infer_scheduler_pipeline_stage_*` | gauge/counter | Scheduler GPU stage lifecycle counts |
 //! | `infer_runtime_topology_*` | gauge | NUMA/GPU/NIC topology and worker placement |
 //! | `infer_runtime_h2d_latency_*` | gauge/counter | Host-to-device copy latency telemetry |
 //! | `infer_scheduler_plan_total` | counter | Scheduler ticks by selected plan label |
@@ -350,6 +351,16 @@ struct MetricsInner {
     pub scheduler_pipeline_gpu_command_queue_depth: AtomicU64,
     pub scheduler_pipeline_cpu_plan_accept_total: AtomicU64,
     pub scheduler_pipeline_cpu_plan_stale_total: AtomicU64,
+    pub scheduler_pipeline_stage_prefill_queued_depth: AtomicU64,
+    pub scheduler_pipeline_stage_prefill_inflight_depth: AtomicU64,
+    pub scheduler_pipeline_stage_prefill_queued_total: AtomicU64,
+    pub scheduler_pipeline_stage_prefill_ready_total: AtomicU64,
+    pub scheduler_pipeline_stage_prefill_completed_total: AtomicU64,
+    pub scheduler_pipeline_stage_readback_queued_depth: AtomicU64,
+    pub scheduler_pipeline_stage_readback_inflight_depth: AtomicU64,
+    pub scheduler_pipeline_stage_readback_queued_total: AtomicU64,
+    pub scheduler_pipeline_stage_readback_ready_total: AtomicU64,
+    pub scheduler_pipeline_stage_readback_completed_total: AtomicU64,
     pub scheduler_plan_idle_total: AtomicU64,
     pub scheduler_plan_decode_total: AtomicU64,
     pub scheduler_plan_prefill_total: AtomicU64,
@@ -473,6 +484,16 @@ impl ServerMetrics {
                 scheduler_pipeline_gpu_command_queue_depth: AtomicU64::new(0),
                 scheduler_pipeline_cpu_plan_accept_total: AtomicU64::new(0),
                 scheduler_pipeline_cpu_plan_stale_total: AtomicU64::new(0),
+                scheduler_pipeline_stage_prefill_queued_depth: AtomicU64::new(0),
+                scheduler_pipeline_stage_prefill_inflight_depth: AtomicU64::new(0),
+                scheduler_pipeline_stage_prefill_queued_total: AtomicU64::new(0),
+                scheduler_pipeline_stage_prefill_ready_total: AtomicU64::new(0),
+                scheduler_pipeline_stage_prefill_completed_total: AtomicU64::new(0),
+                scheduler_pipeline_stage_readback_queued_depth: AtomicU64::new(0),
+                scheduler_pipeline_stage_readback_inflight_depth: AtomicU64::new(0),
+                scheduler_pipeline_stage_readback_queued_total: AtomicU64::new(0),
+                scheduler_pipeline_stage_readback_ready_total: AtomicU64::new(0),
+                scheduler_pipeline_stage_readback_completed_total: AtomicU64::new(0),
                 scheduler_plan_idle_total: AtomicU64::new(0),
                 scheduler_plan_decode_total: AtomicU64::new(0),
                 scheduler_plan_prefill_total: AtomicU64::new(0),
@@ -927,6 +948,69 @@ impl ServerMetrics {
             .store(gpu_command_queue_depth, Ordering::Relaxed);
     }
 
+    /// Update scheduler-visible GPU stage depths for stages that can remain
+    /// pending across loop turns.
+    pub fn set_scheduler_pipeline_stage_depths(
+        &self,
+        prefill_queued: u64,
+        prefill_inflight: u64,
+        readback_queued: u64,
+        readback_inflight: u64,
+    ) {
+        self.inner
+            .scheduler_pipeline_stage_prefill_queued_depth
+            .store(prefill_queued, Ordering::Relaxed);
+        self.inner
+            .scheduler_pipeline_stage_prefill_inflight_depth
+            .store(prefill_inflight, Ordering::Relaxed);
+        self.inner
+            .scheduler_pipeline_stage_readback_queued_depth
+            .store(readback_queued, Ordering::Relaxed);
+        self.inner
+            .scheduler_pipeline_stage_readback_inflight_depth
+            .store(readback_inflight, Ordering::Relaxed);
+    }
+
+    fn scheduler_pipeline_stage_counter(&self, stage: &str, state: &str) -> Option<&AtomicU64> {
+        match (stage, state) {
+            ("prefill", "queued") => {
+                Some(&self.inner.scheduler_pipeline_stage_prefill_queued_total)
+            }
+            ("prefill", "ready") => Some(&self.inner.scheduler_pipeline_stage_prefill_ready_total),
+            ("prefill", "completed") => {
+                Some(&self.inner.scheduler_pipeline_stage_prefill_completed_total)
+            }
+            ("readback", "queued") => {
+                Some(&self.inner.scheduler_pipeline_stage_readback_queued_total)
+            }
+            ("readback", "ready") => {
+                Some(&self.inner.scheduler_pipeline_stage_readback_ready_total)
+            }
+            ("readback", "completed") => {
+                Some(&self.inner.scheduler_pipeline_stage_readback_completed_total)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn record_scheduler_pipeline_stage_queued(&self, stage: &str) {
+        if let Some(counter) = self.scheduler_pipeline_stage_counter(stage, "queued") {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_scheduler_pipeline_stage_ready(&self, stage: &str) {
+        if let Some(counter) = self.scheduler_pipeline_stage_counter(stage, "ready") {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_scheduler_pipeline_stage_completed(&self, stage: &str) {
+        if let Some(counter) = self.scheduler_pipeline_stage_counter(stage, "completed") {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn set_runtime_topology(
         &self,
         topology: &RuntimeTopology,
@@ -1367,6 +1451,46 @@ impl ServerMetrics {
                 .load(Ordering::Relaxed),
             self.inner
                 .scheduler_pipeline_cpu_plan_stale_total
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn scheduler_pipeline_stage_depths(&self) -> (u64, u64, u64, u64) {
+        (
+            self.inner
+                .scheduler_pipeline_stage_prefill_queued_depth
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_prefill_inflight_depth
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_readback_queued_depth
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_readback_inflight_depth
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn scheduler_pipeline_stage_totals(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.inner
+                .scheduler_pipeline_stage_prefill_queued_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_prefill_ready_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_prefill_completed_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_readback_queued_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_readback_ready_total
+                .load(Ordering::Relaxed),
+            self.inner
+                .scheduler_pipeline_stage_readback_completed_total
                 .load(Ordering::Relaxed),
         )
     }
@@ -1827,6 +1951,14 @@ mod tests {
         m.set_scheduler_loop_phase_us(50.0, 1050.0);
         m.set_preprocess_stage(2, 11, 22);
         m.set_scheduler_pipeline_us(33, 44, 55, 1);
+        m.set_scheduler_pipeline_stage_depths(1, 2, 3, 4);
+        m.record_scheduler_pipeline_stage_queued("prefill");
+        m.record_scheduler_pipeline_stage_ready("prefill");
+        m.record_scheduler_pipeline_stage_completed("prefill");
+        m.record_scheduler_pipeline_stage_queued("readback");
+        m.record_scheduler_pipeline_stage_ready("readback");
+        m.record_scheduler_pipeline_stage_completed("readback");
+        m.record_scheduler_pipeline_stage_completed("readback");
         m.set_runtime_topology(
             &crate::runtime_topology::RuntimeTopology {
                 numa_nodes: vec![crate::runtime_topology::NumaNodeTopology {
@@ -1979,6 +2111,18 @@ mod tests {
         assert!(rendered.contains(
             "infer_scheduler_pipeline_cpu_plan_total{model=\"Qwen3-4B\",outcome=\"stale\",} 1"
         ));
+        assert!(rendered.contains(
+            "infer_scheduler_pipeline_stage_depth{model=\"Qwen3-4B\",stage=\"prefill\",state=\"queued\",} 1"
+        ));
+        assert!(rendered.contains(
+            "infer_scheduler_pipeline_stage_depth{model=\"Qwen3-4B\",stage=\"readback\",state=\"inflight\",} 4"
+        ));
+        assert!(rendered.contains(
+            "infer_scheduler_pipeline_stage_total{model=\"Qwen3-4B\",stage=\"prefill\",state=\"ready\",} 1"
+        ));
+        assert!(rendered.contains(
+            "infer_scheduler_pipeline_stage_total{model=\"Qwen3-4B\",stage=\"readback\",state=\"completed\",} 2"
+        ));
         assert!(rendered.contains("infer_runtime_topology_numa_nodes{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_runtime_worker_affinity_applied{model=\"Qwen3-4B\",} 1"));
         assert!(
@@ -2127,6 +2271,13 @@ mod tests {
         m.set_scheduler_loop_phase_us(55.0, 165.0);
         m.set_preprocess_stage(1, 7, 8);
         m.set_scheduler_pipeline_us(9, 10, 11, 1);
+        m.set_scheduler_pipeline_stage_depths(0, 1, 0, 2);
+        m.record_scheduler_pipeline_stage_queued("prefill");
+        m.record_scheduler_pipeline_stage_ready("prefill");
+        m.record_scheduler_pipeline_stage_completed("prefill");
+        m.record_scheduler_pipeline_stage_queued("readback");
+        m.record_scheduler_pipeline_stage_ready("readback");
+        m.record_scheduler_pipeline_stage_completed("readback");
         m.record_scheduler_cpu_plan_accept();
         m.record_scheduler_plan(SchedulerPlanLabel::Prefill);
         m.record_scheduler_plan(SchedulerPlanLabel::Split);
@@ -2143,7 +2294,7 @@ mod tests {
             "step_phase_us=adm:11,prefill:22,decode:33,emit:44,total:110,cleanup:55,loop_total:165"
         ));
         assert!(
-            s.contains("preprocess=depth:1,wait_us:7,tokenize_us:8 pipeline=snapshot_us:9,cpu_plan_us:10,gpu_wait_us:11,gpu_q:1,plan_accept:1,plan_stale:0")
+            s.contains("preprocess=depth:1,wait_us:7,tokenize_us:8 pipeline=snapshot_us:9,cpu_plan_us:10,gpu_wait_us:11,gpu_q:1,plan_accept:1,plan_stale:0,stage_prefill=q:0/if:1/ready:1/done:1/queued:1,stage_readback=q:0/if:2/ready:1/done:1/queued:1")
         );
         assert!(s.contains("plan_label=idle:0,decode:0,prefill:1,split:1,mixed:2"));
         assert!(s.contains(
@@ -2199,6 +2350,13 @@ mod tests {
         m.record_prefix_aware_admit_deferral();
         m.set_preprocess_stage(3, 21, 34);
         m.set_scheduler_pipeline_us(55, 89, 144, 1);
+        m.set_scheduler_pipeline_stage_depths(0, 1, 0, 1);
+        m.record_scheduler_pipeline_stage_queued("prefill");
+        m.record_scheduler_pipeline_stage_ready("prefill");
+        m.record_scheduler_pipeline_stage_completed("prefill");
+        m.record_scheduler_pipeline_stage_queued("readback");
+        m.record_scheduler_pipeline_stage_ready("readback");
+        m.record_scheduler_pipeline_stage_completed("readback");
         m.set_runtime_topology(
             &crate::runtime_topology::RuntimeTopology {
                 numa_nodes: vec![crate::runtime_topology::NumaNodeTopology {
@@ -2294,6 +2452,18 @@ mod tests {
         );
         assert_eq!(
             payload["scheduler_pipeline"]["cpu_plan_stale_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["stages"]["prefill"]["inflight_depth"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["stages"]["prefill"]["completed_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["scheduler_pipeline"]["stages"]["readback"]["ready_total"],
             serde_json::json!(1)
         );
         assert_eq!(

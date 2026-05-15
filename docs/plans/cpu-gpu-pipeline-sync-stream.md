@@ -1,6 +1,6 @@
 # CPU/GPU Pipeline With Explicit Stream Synchronization
 
-Last updated: 2026-05-13
+Last updated: 2026-05-15
 
 Status: design plan. Implementation is partially present in CUDA serving
 today, but the common pipeline/fence contract described here is not yet a
@@ -502,6 +502,29 @@ scripts/profile_nsys_signal.sh pipeline-d2h-readback-qwen35 \
 
 ### P3: Scheduler pipeline handles
 
+Status:
+
+- Scheduler pending GPU work now carries typed `GpuStageHandle`s for prefill
+  and readback stages. Handles track stage kind, lifecycle state, stable
+  stage id, and the request slots whose local fences must drain before reuse.
+- Async and sync prefill launch/complete paths now create prefill stage
+  handles; mixed decode+prefill carries a prefill handle alongside the
+  decode readback handle.
+- Decode readback pending work now carries a readback stage handle. The
+  scheduler still plans CPU-side work between launch and readback, and polls
+  handles at step boundaries through the existing pending readback path rather
+  than synchronizing eagerly.
+- `slot_has_pending_gpu_work()` now checks handle slot membership, so request
+  cancellation and cleanup continue to drain only the request-local prefill or
+  readback fences instead of blocking on unrelated slots.
+- `ServerMetrics` exposes scheduler pipeline stage depth and transition
+  counts in Prometheus, `/v1/stats`, and summary logs:
+  `infer_scheduler_pipeline_stage_depth{stage,state}` for queued/in-flight
+  depth and `infer_scheduler_pipeline_stage_total{stage,state}` for
+  queued/ready/completed transitions.
+- CUDA runtime and nsys validation remain pending on a GPU host; this tranche
+  does not claim a throughput or latency result.
+
 Files likely involved:
 
 - `infer/src/scheduler/cuda/prefill.rs`
@@ -521,6 +544,22 @@ Exit gate:
 
 - Service metrics can show queued, in-flight, ready, and completed stage
   counts for prefill and readback.
+
+GPU verification TODO for CUDA Codex:
+
+```bash
+CUDARC_CUDA_VERSION=13010 \
+  cargo check -p infer --no-default-features --features cuda,no-cuda
+
+CUDA_HOME=/usr/local/cuda \
+  cargo test --release -p infer --features cuda --test e2e_qwen35 -- --nocapture
+
+scripts/profile_nsys_signal.sh pipeline-scheduler-stage-handles \
+  --server-args "--model-path infer/models/Qwen3.5-4B --port 8000 --max-seq-len 8192" \
+  --fast \
+  --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3.5-4B
+```
 
 ### P4: NUMA and worker-lane policy
 
@@ -577,6 +616,8 @@ infer_pipeline_fence_poll_total{edge=...,outcome=ready|not_ready|error}
 infer_pipeline_h2d_latency_microseconds
 infer_pipeline_d2h_latency_microseconds
 infer_pipeline_inflight{stage=...}
+infer_scheduler_pipeline_stage_depth{stage=prefill|readback,state=queued|inflight}
+infer_scheduler_pipeline_stage_total{stage=prefill|readback,state=queued|ready|completed}
 infer_scheduler_gpu_bubble_microseconds
 ```
 

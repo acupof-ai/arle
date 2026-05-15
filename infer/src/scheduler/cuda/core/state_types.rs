@@ -7,7 +7,103 @@
 use crate::types::BlockFingerprint;
 use fastrace::Span;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::scheduler::cuda) enum GpuStageKind {
+    Prefill,
+    Readback,
+}
+
+impl GpuStageKind {
+    pub(in crate::scheduler::cuda) fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Readback => "readback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::scheduler::cuda) enum GpuStageState {
+    Queued,
+    InFlight,
+    Ready,
+    Completed,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::scheduler::cuda) struct GpuStageHandle {
+    pub id: u64,
+    pub kind: GpuStageKind,
+    pub state: GpuStageState,
+    pub slots: Vec<usize>,
+    pub rows: usize,
+    pub queued_at: std::time::Instant,
+    pub launched_at: Option<std::time::Instant>,
+    pub ready_at: Option<std::time::Instant>,
+}
+
+impl GpuStageHandle {
+    pub(in crate::scheduler::cuda) fn new(id: u64, kind: GpuStageKind, slots: Vec<usize>) -> Self {
+        Self {
+            id,
+            kind,
+            state: GpuStageState::Queued,
+            rows: slots.len(),
+            slots,
+            queued_at: std::time::Instant::now(),
+            launched_at: None,
+            ready_at: None,
+        }
+    }
+
+    pub(in crate::scheduler::cuda) fn mark_inflight(&mut self) {
+        log::trace!(
+            "gpu stage {} {} inflight rows={} queued_us={}",
+            self.id,
+            self.kind.as_str(),
+            self.rows,
+            self.queued_at.elapsed().as_micros(),
+        );
+        self.state = GpuStageState::InFlight;
+        self.launched_at = Some(std::time::Instant::now());
+    }
+
+    pub(in crate::scheduler::cuda) fn mark_ready(&mut self) {
+        let launch_us = self
+            .launched_at
+            .map_or(0, |launched_at| launched_at.elapsed().as_micros());
+        log::trace!(
+            "gpu stage {} {} ready rows={} launch_us={}",
+            self.id,
+            self.kind.as_str(),
+            self.rows,
+            launch_us,
+        );
+        self.state = GpuStageState::Ready;
+        self.ready_at = Some(std::time::Instant::now());
+    }
+
+    pub(in crate::scheduler::cuda) fn mark_completed(&mut self) {
+        let ready_us = self
+            .ready_at
+            .map_or(0, |ready_at| ready_at.elapsed().as_micros());
+        log::trace!(
+            "gpu stage {} {} completed rows={} ready_us={}",
+            self.id,
+            self.kind.as_str(),
+            self.rows,
+            ready_us,
+        );
+        self.state = GpuStageState::Completed;
+    }
+
+    pub(in crate::scheduler::cuda) fn contains_slot(&self, slot_idx: usize) -> bool {
+        self.slots.contains(&slot_idx)
+    }
+}
+
 pub(in crate::scheduler::cuda) struct PendingDecode {
+    pub stage: GpuStageHandle,
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
@@ -31,12 +127,14 @@ pub(in crate::scheduler::cuda) struct PendingPrefillRow {
 }
 
 pub(in crate::scheduler::cuda) struct PendingPrefill {
+    pub stage: GpuStageHandle,
     pub rows: Vec<PendingPrefillRow>,
     pub uses_paged: bool,
     pub prefill_spans: Vec<(usize, Span)>,
 }
 
 pub(in crate::scheduler::cuda) struct PendingMixedPrefill {
+    pub stage: GpuStageHandle,
     pub rows: Vec<PendingPrefillRow>,
     pub uses_paged: bool,
     pub prefill_spans: Vec<(usize, Span)>,
@@ -77,6 +175,7 @@ pub(in crate::scheduler::cuda) struct SchedulerRuntimeStats {
     /// flight) so a transient workspace shortage doesn't cascade into
     /// every subsequent request OOMing too.
     pub prefill_oom_cooldown_until: Option<std::time::Instant>,
+    pub next_gpu_stage_id: u64,
 }
 
 impl SchedulerRuntimeStats {
@@ -98,7 +197,14 @@ impl SchedulerRuntimeStats {
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             prefill_oom_cooldown_until: None,
+            next_gpu_stage_id: 1,
         }
+    }
+
+    pub(in crate::scheduler::cuda) fn next_gpu_stage_id(&mut self) -> u64 {
+        let id = self.next_gpu_stage_id;
+        self.next_gpu_stage_id = self.next_gpu_stage_id.wrapping_add(1).max(1);
+        id
     }
 
     pub(in crate::scheduler::cuda) fn advance_epoch(&mut self) -> u64 {

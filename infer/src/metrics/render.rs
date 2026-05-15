@@ -687,6 +687,50 @@ impl ServerMetrics {
             )
             .unwrap();
         }
+        let (
+            prefill_queued_depth,
+            prefill_inflight_depth,
+            readback_queued_depth,
+            readback_inflight_depth,
+        ) = self.scheduler_pipeline_stage_depths();
+        out.push_str("# HELP infer_scheduler_pipeline_stage_depth Scheduler-visible GPU stage depth by stage and state.\n");
+        out.push_str("# TYPE infer_scheduler_pipeline_stage_depth gauge\n");
+        for (stage, state, value) in [
+            ("prefill", "queued", prefill_queued_depth),
+            ("prefill", "inflight", prefill_inflight_depth),
+            ("readback", "queued", readback_queued_depth),
+            ("readback", "inflight", readback_inflight_depth),
+        ] {
+            writeln!(
+                out,
+                "infer_scheduler_pipeline_stage_depth{{{labels}stage=\"{stage}\",state=\"{state}\",}} {value}"
+            )
+            .unwrap();
+        }
+        let (
+            prefill_queued_total,
+            prefill_ready_total,
+            prefill_completed_total,
+            readback_queued_total,
+            readback_ready_total,
+            readback_completed_total,
+        ) = self.scheduler_pipeline_stage_totals();
+        out.push_str("# HELP infer_scheduler_pipeline_stage_total Scheduler GPU stage lifecycle transition count.\n");
+        out.push_str("# TYPE infer_scheduler_pipeline_stage_total counter\n");
+        for (stage, state, value) in [
+            ("prefill", "queued", prefill_queued_total),
+            ("prefill", "ready", prefill_ready_total),
+            ("prefill", "completed", prefill_completed_total),
+            ("readback", "queued", readback_queued_total),
+            ("readback", "ready", readback_ready_total),
+            ("readback", "completed", readback_completed_total),
+        ] {
+            writeln!(
+                out,
+                "infer_scheduler_pipeline_stage_total{{{labels}stage=\"{stage}\",state=\"{state}\",}} {value}"
+            )
+            .unwrap();
+        }
 
         let runtime = self.runtime_topology_snapshot();
         for (name, help, value) in [
@@ -1359,6 +1403,20 @@ impl ServerMetrics {
             pipeline_gpu_queue_depth,
         ) = self.scheduler_pipeline_us();
         let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
+        let (
+            prefill_queued_depth,
+            prefill_inflight_depth,
+            readback_queued_depth,
+            readback_inflight_depth,
+        ) = self.scheduler_pipeline_stage_depths();
+        let (
+            prefill_queued_total,
+            prefill_ready_total,
+            prefill_completed_total,
+            readback_queued_total,
+            readback_ready_total,
+            readback_completed_total,
+        ) = self.scheduler_pipeline_stage_totals();
         let runtime = self.runtime_topology_snapshot();
         let runtime_topology = serde_json::json!({
             "numa_nodes": runtime.numa_nodes,
@@ -1397,6 +1455,30 @@ impl ServerMetrics {
             "numa_route_cost_last": runtime.numa_route_cost_last,
             "numa_migration_total": runtime.numa_migration_total,
             "numa_rebalance_total": runtime.numa_rebalance_total,
+        });
+        let scheduler_pipeline = serde_json::json!({
+            "snapshot_us": pipeline_snapshot_us,
+            "cpu_plan_us": pipeline_cpu_plan_us,
+            "gpu_completion_wait_us": pipeline_gpu_completion_wait_us,
+            "gpu_command_queue_depth": pipeline_gpu_queue_depth,
+            "cpu_plan_accept_total": pipeline_plan_accept,
+            "cpu_plan_stale_total": pipeline_plan_stale,
+            "stages": {
+                "prefill": {
+                    "queued_depth": prefill_queued_depth,
+                    "inflight_depth": prefill_inflight_depth,
+                    "queued_total": prefill_queued_total,
+                    "ready_total": prefill_ready_total,
+                    "completed_total": prefill_completed_total,
+                },
+                "readback": {
+                    "queued_depth": readback_queued_depth,
+                    "inflight_depth": readback_inflight_depth,
+                    "queued_total": readback_queued_total,
+                    "ready_total": readback_ready_total,
+                    "completed_total": readback_completed_total,
+                },
+            },
         });
 
         serde_json::json!({
@@ -1444,14 +1526,7 @@ impl ServerMetrics {
                 "wait_us": preprocess_wait_us,
                 "tokenize_us": preprocess_tokenize_us,
             },
-            "scheduler_pipeline": {
-                "snapshot_us": pipeline_snapshot_us,
-                "cpu_plan_us": pipeline_cpu_plan_us,
-                "gpu_completion_wait_us": pipeline_gpu_completion_wait_us,
-                "gpu_command_queue_depth": pipeline_gpu_queue_depth,
-                "cpu_plan_accept_total": pipeline_plan_accept,
-                "cpu_plan_stale_total": pipeline_plan_stale,
-            },
+            "scheduler_pipeline": scheduler_pipeline,
             "runtime_topology": runtime_topology,
             "engine_timestamp_ms": telemetry.timestamp_ms,
         })
@@ -1545,9 +1620,23 @@ impl ServerMetrics {
             pipeline_gpu_queue_depth,
         ) = self.scheduler_pipeline_us();
         let (pipeline_plan_accept, pipeline_plan_stale) = self.scheduler_pipeline_plan_totals();
+        let (
+            prefill_queued_depth,
+            prefill_inflight_depth,
+            readback_queued_depth,
+            readback_inflight_depth,
+        ) = self.scheduler_pipeline_stage_depths();
+        let (
+            prefill_queued_total,
+            prefill_ready_total,
+            prefill_completed_total,
+            readback_queued_total,
+            readback_ready_total,
+            readback_completed_total,
+        ) = self.scheduler_pipeline_stage_totals();
         let runtime = self.runtime_topology_snapshot();
         let pipeline_suffix = format!(
-            " preprocess=depth:{preprocess_depth},wait_us:{preprocess_wait_us},tokenize_us:{preprocess_tokenize_us} pipeline=snapshot_us:{pipeline_snapshot_us},cpu_plan_us:{pipeline_cpu_plan_us},gpu_wait_us:{pipeline_gpu_completion_wait_us},gpu_q:{pipeline_gpu_queue_depth},plan_accept:{pipeline_plan_accept},plan_stale:{pipeline_plan_stale} runtime_topology=numa:{},gpu:{},worker_numa:{},worker_cpus:{},pre_workers:{},detok_workers:{},h2d_last_us:{},d2h_last_us:{},d2h_wait_us:{},readback_not_ready:{},numa_route=local:{},cross:{},unknown:{},migrate:{},rebalance:{}",
+            " preprocess=depth:{preprocess_depth},wait_us:{preprocess_wait_us},tokenize_us:{preprocess_tokenize_us} pipeline=snapshot_us:{pipeline_snapshot_us},cpu_plan_us:{pipeline_cpu_plan_us},gpu_wait_us:{pipeline_gpu_completion_wait_us},gpu_q:{pipeline_gpu_queue_depth},plan_accept:{pipeline_plan_accept},plan_stale:{pipeline_plan_stale},stage_prefill=q:{prefill_queued_depth}/if:{prefill_inflight_depth}/ready:{prefill_ready_total}/done:{prefill_completed_total}/queued:{prefill_queued_total},stage_readback=q:{readback_queued_depth}/if:{readback_inflight_depth}/ready:{readback_ready_total}/done:{readback_completed_total}/queued:{readback_queued_total} runtime_topology=numa:{},gpu:{},worker_numa:{},worker_cpus:{},pre_workers:{},detok_workers:{},h2d_last_us:{},d2h_last_us:{},d2h_wait_us:{},readback_not_ready:{},numa_route=local:{},cross:{},unknown:{},migrate:{},rebalance:{}",
             runtime.numa_nodes,
             runtime.gpus,
             runtime.worker_numa_node,
