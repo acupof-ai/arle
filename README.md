@@ -120,12 +120,12 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 
 | Backend | Platform | Status | Notes |
 |---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, custom CUDA quantized decode, CUDA Graph decode, packed paged-prefill for Qwen3 / Qwen3.5. **L4 / Qwen3-4B BF16 + FP8 paged KV (auto): 197 tok/s @ c=16 / 4096-in, peak_active=16 saturated.** |
-| **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse. Qwen3.5-0.8B MLX 4bit single-request step-driver reaches 305.5 tok/s on M4 Pro 20c; GGUF Q4_K_M exact default is 202.1 tok/s direct, with an opt-in native-q4 Metal load path at 236.7 tok/s direct / 239.8 tok/s step-driver on the matched 1024/256 profile. |
-| **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 achieves 5.9× decode speedup, Qwen3.5-4B-4bit maintains bit-identical parity, validated for c=1..8. |
-| **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation. DeepSeek V4 has a slow Rust reference path for 1B init correctness / HTTP smoke; not a serving-performance target. |
+| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, CUDA Graph decode. L4 / Qwen3-4B BF16 + FP8 KV: **197 tok/s @ c=16 / 4k-in**. |
+| **Metal** | Apple Silicon | **Beta** | Scheduler-backed serving, chunked prefill, replay prefix reuse. Qwen3.5-0.8B MLX-4bit step-driver: **305.5 tok/s** on M4 Pro 20c. |
+| **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16: **5.9× decode**; Qwen3.5-4B-4bit bit-identical, c=1..8. |
+| **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a perf target. |
 
-Models: **Qwen3 (0.6B – 72B)** and the **Qwen3.5 family** (including 0.8B GGUF Q4_K_M and 4B hybrid linear + full attention) are supported on CUDA and Metal according to the current matrix. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA remains stubbed. Next-model priority queue: **DeepSeek V4 (#1, V4-only substrate + CPU reference smoke landed)** then **Qwen 3.6 (#2, planned)**; see [ROADMAP.md §Next-Model Priority Order](ROADMAP.md#next-model-priority-order). DeepSeek V2/V3/R1 support paths are intentionally not carried in the current runtime.
+Models: **Qwen3 (0.6B – 72B)** and **Qwen3.5 family** (incl. 0.8B GGUF Q4_K_M and 4B hybrid attention) on CUDA + Metal. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA stubbed. Next-model queue: **DeepSeek V4 (#1)** → **Qwen 3.6 (#2)**, see [ROADMAP.md](ROADMAP.md#next-model-priority-order). DeepSeek V2/V3/R1 intentionally out of scope.
 
 Authoritative matrix (HTTP API tiers, quantization, agent / train / eval surfaces): [docs/support-matrix.md](docs/support-matrix.md).
 Stability tiers: [docs/stability-policy.md](docs/stability-policy.md).
@@ -168,167 +168,24 @@ Operators who want only the native serving binary can use `infer` directly (`car
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
-- **2026-05-15** — DSv4 DeepEP decode now has a default B=1 padded BF16
-  reduce-scatter combine path. `ARLE_DSV4_COMBINE_REDUCE_SCATTER=1` folds the
-  owner-rank return-side combine into NCCL `ReduceScatter` after each expert
-  rank pre-sums padded route outputs by origin peer; set it to `0` to force the
-  previous grouped SendRecv combine. Real 8xH20 validation against
-  `/root/DeepSeek-V4-Flash` keeps normal streaming output and exact `410`
-  arithmetic, with `decode64` at **12.05 post-first tok/s**. The matching
-  single-token nsys trace moves the decode wave from **97.071 ms** to
-  **94.923 ms**: return combine becomes `ReduceScatter` at **20.44 ms** per
-  rank range and residual `SendRecv` falls to **3.26 ms**. The remaining
-  bottlenecks are still local expert FP8/FP4 GEMV, AllReduce, attention/MHC,
-  launch overhead, async alloc/free, and D2H readbacks. A follow-up
-  `ARLE_DSV4_COMBINE_OVERLAP=1` experiment adds a dedicated communication
-  stream and routed-output fence, but stays default-off: it returns exact
-  `406` while regressing the single-token decode wave to **104.359 ms** due to
-  all-reduce variance and cross-stream event overhead. The same binary with
-  overlap disabled keeps the **12.05 post-first tok/s** decode64 baseline.
-  Reusing incremental attention projection scratch for `c_q`, `c_q_normed`,
-  `q_raw`, `kv_raw`, and `kv_normed` is a positive follow-up: the single-token
-  nsys wave moves to **90.946 ms**, `cuMemAllocAsync` drops from **6,760** to
-  **5,040** calls, `cuMemFreeAsync` drops from **3,048** to **1,328**, and the
-  trace-off `decode64` smoke remains normal at **11.89 post-first tok/s**. A
-  fresh direct single-token breakdown records **105.205 ms** for the same
-  current default path and makes the ranked bottleneck explicit: **16,177**
-  CUDA launches, **20.122 ms** reduce-scatter, **11.474/11.109 ms** FP8/FP4
-  expert GEMV, **8.978 ms** all-reduce, attention/MHC/route kernels, and
-  **347** D2H synchronization calls over only **44,044 B** of D2H activity.
-  The opt-in route-grouped path now keeps grouped expert weight/scale pointer
-  tables in layer-load-time caches, cutting its H2D activity from **1,918**
-  calls / **374,752 B** to **440** calls / **7,808 B** and moving that trace
-  from **105.808 ms** to **94.828 ms** while still returning `406`; it remains
-  default-off until route-wise GEMV is replaced by true grouped GEMM/DeepGEMM.
-  Expanding uninitialized allocation to additional full-write DSv4 runtime
-  scratch buffers is now validated on the real 8xH20 path: the arithmetic
-  request returns `406`, the isolated decode wave moves from **105.205 ms** to
-  **88.554 ms**, and `cuMemsetD8Async` drops from **3,640** calls /
-  **6.932 ms** per rank range to **1,920** calls / **2.839 ms**. The remaining
-  ranked costs are still reduce-scatter combine, FP8/FP4 expert GEMV,
-  attention/MHC/route kernels, and **16,177** CUDA launches. The matching
-  trace-off smoke keeps normal Chinese/English multi-token output, exact
-  `410` math, and `decode64` at **11.94 post-first tok/s**.
-  Extending the same cleanup to MoE dispatch/payload/recv/local/combine scratch
-  cuts `cuMemsetD8Async` further to **1,232** calls / **1.558 ms** and moves
-  the isolated decode wave to **87.667 ms** after rerun; the trace-off smoke
-  reaches **12.06 post-first tok/s**. The dominant stack is still
-  reduce-scatter combine plus local expert FP8/FP4 GEMV. The B=1 padded DeepEP
-  local expert prepare step now also has a fused small CUDA kernel that clears
-  local counts, counts received routes, writes device offsets, and clears pack
-  cursors in one launch. On real 8xH20 nsys this cuts H2D runtime calls
-  **1,040 -> 696** and `cuMemsetD8Async` **1,232 -> 544** while preserving
-  exact `406`; the matching trace-off smoke keeps normal output and
-  **12.05 post-first tok/s** `decode64`. The single captured wave is not a
-  wall-time win because D2H/AllReduce timing was noisier, so the remaining
-  target is still eliminating the local-count readback and replacing the expert
-  GEMV loop with true grouped GEMM/DeepGEMM.
-- **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
-  DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
-  FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and
-  writing output, while the 1,039-token prefill trace identifies return-side
-  MoE combine exchange and local experts as the concrete blockers. A gated
-  `ARLE_DSV4_COMBINE_DTYPE=fp8` experiment is functionally correct but remains
-  opt-in because it is not faster than the BF16 combine default. Per-layer MHC
-  scratch reuse raises the latest trace-off smoke throughput to **6.2-7.3
-  tok/s** on short math/writing cases without changing output correctness. The
-  gated grouped expert harness now caches per-layer weight pointer arrays and
-  launches indexed active experts, improving the raw grouped prototype while
-  keeping it default-off until real grouped GEMM/DeepGEMM replaces the current
-  GEMV kernels. A follow-up pair GEMV kernel now fuses grouped `w1`/`w3`
-  gate/up launches and is visible in DeepEP decode nsys, but it remains opt-in:
-  the decode window is still dominated by NCCL send/recv plus alloc/free and
-  launch churn. A route-wise grouped expert experiment also remains opt-in:
-  it removes the local-count D2H readback, but real 8xH20 nsys regresses the
-  single-token decode wave to **145.7 ms** because route-wise FP4 GEMV over
-  fixed padded slots costs **35.9 ms** per rank range. A clean decode-only
-  HTTP comparison also keeps pair GEMV default-off: default split expert GEMV
-  reaches **11.79 post-first tok/s** on `decode64`, while
-  `ARLE_DSV4_PAIR_EXPERT_GEMV=1` reaches **7.70 tok/s**; both paths return
-  normal text and `410` for the arithmetic check. A full-write temporary
-  allocation cleanup then switches selected decode buffers from zeroed to
-  uninitialized allocations: HTTP `decode64` reaches **11.99 post-first tok/s**,
-  math still returns `410`, `cuMemsetD8Async` drops **8,789 → 2,957 calls**, and
-  the isolated single-token wave is **112.7 ms**. Per-layer DeepEP
-  dispatch scratch reuse further raises default
-  short math smoke to **7.7-7.8 tok/s** and cuts Nsight
-  `cuMemAllocAsync`/`cuMemFreeAsync` calls in the 8-token window from 136,825 to
-  111,531. A follow-up single-token nsys window now isolates one generated
-  decode token at **266 ms wall**: `cuStreamSynchronize`, async allocation/free,
-  launch/memset churn, and NCCL send/recv dominate before attention or GEMV.
-  Reusing send-route token/slot buffers and deleting the unused expert-token
-  pack output keeps short DeepEP smoke at **7.94-8.09 tok/s** while reducing
-  single-token decode allocator calls by 883. Reusing recv/local route scratch
-  for B=1 decode raises the latest short smoke to **8.24-8.79 tok/s** and cuts
-  the isolated single-token nsys wave to **148 ms wall**, with decode-only
-  `cuMemAllocAsync`/`cuMemFreeAsync` calls down to **9,480/9,488**. A further
-  route-logits scratch cleanup lowers allocator calls again to **9,136/9,144**,
-  though its single capture is a call-count cleanup rather than a confirmed
-  wall-time win. A refreshed 2026-05-15 nsys run isolates the current
-  single-token decode wave at **158 ms wall** and shows the concrete remaining
-  stack: async allocation/free, launch/memset churn, D2H routing readbacks,
-  NCCL SendRecv/AllReduce, local expert FP8/FP4 GEMV, then attention/MHC. That
-  led directly to shared expert scratch reuse plus an in-place BF16 add kernel:
-  short math/writing smoke now reaches **9.07-9.50 tok/s**, and the isolated
-  single-token nsys wave drops to **140 ms wall** with allocator calls down to
-  **7,416/7,424**. A current follow-up nsys run validates direct packed
-  segment input for local expert `w1`/`w3`: the streaming output remains
-  `霓虹`, decode-only `cuMemcpyDtoDAsync_v2` falls from **871 calls / 1.795 ms**
-  to **613 calls / 1.240 ms** per rank range, and the same one-token wave is
-  **145 ms wall**. Remaining targets are fewer host route readbacks,
-  graph/lifetime cleanup, lower-latency/overlapped DeepEP exchange, and true
-  grouped GEMM/DeepGEMM. Reusing per-layer hidden scratch for incremental HC
-  pre-projection and RMSNorm temporaries then cuts alloc/free/memset calls by
-  **1,376 each** and moves the same single-token wave to **135 ms wall**; the
-  current top costs are launch/runtime overhead, D2H route readback, NCCL
-  SendRecv/AllReduce, and local expert FP8/FP4 GEMV. Reusing the default
-  AllGather count matrix for both send and receive counts removes the
-  redundant 32-byte send-count D2H readback, cutting decode-only D2H calls
-  **887 → 543** and the same wave to **130 ms wall**. The next count-side
-  target was the remaining 256-byte all-rank count matrix readback; the B=1
-  padded dispatch path now ships by default, skips its unused send-count kernel,
-  removes that readback plus the count AllGather, and moves the same single
-  token wave to **124 ms wall** with decode-only D2H calls **543 → 344**.
-  The return-side combine path now also pre-sums valid padded route rows into
-  one BF16 row per origin peer before the return exchange, reducing returned
-  combine rows by **8×** and moving the wave to **112 ms wall**; `SendRecv`
-  time falls **25.211 → 23.329 ms** per rank range. The B=1 dispatch side now
-  also fuses hidden rows and route metadata into one BF16 payload by appending
-  the 3xI32 metadata as raw 16-bit words, reducing SendRecv launches
-  **1,032 → 688**, raising HTTP `decode64` to **12.22 post-first tok/s**, and
-  recording the latest isolated nsys wave at **119.0 ms** while keeping the
-  `霓彩` and `410` checks correct. Remaining hard blockers are
-  NCCL SendRecv/AllReduce, launch/runtime and allocator/memset/free churn, the
-  local-count D2H, and local expert FP8/FP4 GEMV. A default-path single-expert
-  `w1`/`w3` pair GEMV experiment is now available only as
-  `ARLE_DSV4_PAIR_EXPERT_GEMV=1`: the 8xH20 trace kept output correct but
-  showed the FP4 pair kernel is slower on B=1 decode, so it stays default-off
-  while the main compute target remains true grouped GEMM/DeepGEMM. The
-  route-wise grouped expert path now also has a pair route GEMV follow-up:
-  output remains `霓彩` and the isolated wave is **117.9 ms**, but nsys shows
-  the token is still dominated by `ncclDevKernel_SendRecv`
-  (**50.3 ms/rank-range**), FP4 route pair GEMV (**19.6 ms**), FP4 route
-  `w2` GEMV (**10.5 ms**), FP8 GEMV (**9.4 ms**), plus allocation and launch
-  overhead, so the path stays opt-in. A subsequent default-path incremental
-  stream scratch recycle lowers the warmed single-token nsys wave
-  **128.1 → 111.8 ms** and cuts allocator/free calls
-  **8,453/6,048 → 7,757/5,352**, while trace-off HTTP `decode64` stays flat at
-  **11.48 tok/s**. Reusing GPU compressor projection scratch cuts allocator/free
-  calls again to **6,765/4,360** but does not improve HTTP throughput; the
-  end-to-end blocker remains NCCL plus D2H synchronization and local expert
-  GEMV. Reusing B=1 incremental attention scratch then cuts warmed decode
-  free calls to **3,048** without retaining prompt-sized prefill buffers, and
-  the isolated single-token nsys wave is **97.0 ms**; the profiler shows the
-  token is still dominated by
-  NCCL SendRecv/AllReduce, D2H route-count synchronization, launch/runtime
-  overhead, local FP8/FP4 expert GEMV, and attention/MHC kernels rather than
-  sampler.
-  Evidence:
+- **2026-05-15** — DSv4 DeepEP decode lands default B=1 padded BF16
+  reduce-scatter combine, fused local-expert prepare kernel, and broad
+  scratch-reuse cleanup. Real 8xH20 on `DeepSeek-V4-Flash`: `decode64` holds
+  **12.05 post-first tok/s**; isolated single-token nsys wave **105.2 → 87.7 ms**,
+  `cuMemsetD8Async` calls **3,640 → 544**, arithmetic exact (`410`/`406`).
+  Remaining stack: NCCL SendRecv/AllReduce, FP8/FP4 expert GEMV (awaits true
+  grouped GEMM/DeepGEMM), launch churn, D2H route-count readback.
+  Evidence: [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/)
-  and
   [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
-- **2026-05-10** — 🎉 W4-hybrid prefill graph capture **closes 4k/c=4 SGLang +76.6% gap** via Path B.2 bucketed allocation key (`a56b7a9`/`c44788f`). Engine-side TTFT p50 **2000ms → 150ms = -92.5%** improvement on RTX 4070 Ti SUPER 16GB (server-side `/v1/stats engine_ttft_us` ground truth; client-side guidellm 0.6.0 broken — bench tool bug isolated). Throughput **+632%** in 60s window. Bucketed `page_indices_len` (64-entry) + `prefix_token_rows_len` (128-row) reduce capture key churn from 388 unique → **7 unique** with **98.5% LRU dominant key reuse**. Codex's "second-order bucketing" insight (captured scalar launch parameters use bucket capacity, not exact dim from first capture) was load-bearing; new anti-pattern in skill v1.7.0 catalog. Opt-in via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1`. Plus **RoPE scaling support** (YARN / Linear / NtkAware) wired through qwen3-spec + qwen35-spec + `precompute_rope_with_scaling`. Evidence: [`docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`](docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md), [`docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`](docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md).
+- **2026-05-10** — W4-hybrid prefill graph capture closes the 4k/c=4 SGLang
+  +76.6% gap via Path B.2 bucketed allocation key. Engine-side TTFT p50
+  **2000 → 150 ms (-92.5%)**, throughput **+632%** in 60s on RTX 4070 Ti
+  SUPER 16GB. Capture-key churn **388 → 7 unique** (98.5% LRU reuse). Opt-in
+  via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1`. Also lands
+  RoPE YARN/Linear/NtkAware scaling.
+  Evidence: [`docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`](docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md),
+  [`docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`](docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md). Next up: [ROADMAP.md](ROADMAP.md).
 
