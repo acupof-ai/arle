@@ -99,6 +99,12 @@ Related governance docs:
   combine, local FP8/FP4 expert GEMV, residual all-reduce/send-recv,
   attention/MHC/route kernels, and high per-token launch/alloc/free/D2H
   runtime overhead, not sampler time.
+- Added the matching DSv4 single-token `NCCL_PROTO=LL128` negative trace under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-nccl-ll128/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-nccl-ll128/).
+  The arithmetic request still returns `406`, but the isolated decode wave is
+  94.936 ms versus 94.841 ms on the current default reference, and
+  reduce-scatter combine is slightly worse at 21.371 ms per rank-range.
+  Protocol selection alone is therefore not the next default decode fix.
 - Added the DSv4 default-path warm decode Nsight trace under
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
   The run warms a real decode first, then profiles a second single decode token

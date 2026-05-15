@@ -136,6 +136,12 @@ Current trace set:
   7.396 ms, all-reduce at 6.184 ms, route/MHC at 5.661/5.501 ms, plus large
   runtime overhead from 16,176 kernel launches, 6,760 async allocations, 3,048
   async frees, 3,640 memsets, and 344 D2H copies inside the decode range.
+- [`nsys-single-decode-token-nccl-ll128/`](nsys-single-decode-token-nccl-ll128/)
+  records the matching `NCCL_PROTO=LL128` protocol experiment. It also returns
+  exact arithmetic `406`, but the isolated decode wave is 94.936 ms versus
+  94.841 ms on the current default reference, with reduce-scatter combine
+  slightly worse at 21.371 ms per rank-range. This stays a negative trace:
+  changing NCCL protocol alone does not address the main decode bottleneck.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789
