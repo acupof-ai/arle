@@ -39,6 +39,7 @@ use super::state::{DeepseekCompressedRow, DeepseekCompressorRuntimeCache};
 use cuda_kernels::{
     ffi,
     prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
+    tensor::CudaAllocTraceExt,
 };
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -1067,7 +1068,7 @@ impl DeepseekModel {
             scratch_window = self
                 .ctx
                 .stream
-                .alloc_zeros::<bf16>(cache_len)
+                .alloc_zeros_traced::<bf16>(cache_len)
                 .map_err(|err| {
                     anyhow::anyhow!("DeepSeek V4 GPU SWA scratch alloc failed: {err}")
                 })?;
@@ -1604,7 +1605,7 @@ impl DeepseekModel {
             scratch_window = self
                 .ctx
                 .stream
-                .alloc_zeros::<bf16>(cache_len)
+                .alloc_zeros_traced::<bf16>(cache_len)
                 .map_err(|err| {
                     anyhow::anyhow!("DeepSeek V4 GPU attention scratch alloc failed: {err}")
                 })?;
@@ -1979,7 +1980,7 @@ impl DeepseekModel {
         let mut selected = self
             .ctx
             .stream
-            .alloc_zeros::<i32>(hidden.seq_len * self.config.index_topk)
+            .alloc_zeros_traced::<i32>(hidden.seq_len * self.config.index_topk)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 CSA selected alloc failed: {err}"))?;
         let score_scale = (self.config.index_head_dim as f32).powf(-0.5)
             * (self.config.index_n_heads as f32).powf(-0.5);
@@ -2728,7 +2729,7 @@ fn ensure_swa_window_cache<'a>(
 ) -> Result<&'a mut CudaSlice<bf16>> {
     if cache.window_gpu_len != len || cache.window_gpu.is_none() {
         cache.window_gpu =
-            Some(ctx.stream.alloc_zeros::<bf16>(len).map_err(|err| {
+            Some(ctx.stream.alloc_zeros_traced::<bf16>(len).map_err(|err| {
                 anyhow::anyhow!("DeepSeek V4 SWA window cache alloc failed: {err}")
             })?);
         cache.window_gpu_len = len;
@@ -2763,22 +2764,22 @@ fn ensure_gpu_compressor_cache(
     {
         cache.pending_kv = Some(
             ctx.stream
-                .alloc_zeros::<bf16>(pending_len)
+                .alloc_zeros_traced::<bf16>(pending_len)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 pending kv alloc failed: {err}"))?,
         );
         cache.pending_score = Some(
             ctx.stream
-                .alloc_zeros::<bf16>(pending_len)
+                .alloc_zeros_traced::<bf16>(pending_len)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 pending score alloc failed: {err}"))?,
         );
         cache.prev_overlap_kv = Some(
             ctx.stream
-                .alloc_zeros::<bf16>(ratio * head_dim)
+                .alloc_zeros_traced::<bf16>(ratio * head_dim)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 prev kv alloc failed: {err}"))?,
         );
         cache.prev_overlap_score = Some(
             ctx.stream
-                .alloc_zeros::<bf16>(ratio * head_dim)
+                .alloc_zeros_traced::<bf16>(ratio * head_dim)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 prev score alloc failed: {err}"))?,
         );
         cache.pending_len = 0;
@@ -2794,7 +2795,7 @@ fn ensure_gpu_compressor_cache(
     {
         cache.compressed = Some(
             ctx.stream
-                .alloc_zeros::<bf16>(compressed_len)
+                .alloc_zeros_traced::<bf16>(compressed_len)
                 .map_err(|err| {
                     anyhow::anyhow!("DeepSeek V4 compressed cache alloc failed: {err}")
                 })?,
@@ -2890,15 +2891,15 @@ fn gen_mhc_params(
     let mixes = ops::gemm(ctx, &hc.mix_fn, stream)?;
     let mut pre = ctx
         .stream
-        .alloc_zeros::<f32>(stream.seq_len * hc_mult)
+        .alloc_zeros_traced::<f32>(stream.seq_len * hc_mult)
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 HC pre alloc failed: {err}"))?;
     let mut post = ctx
         .stream
-        .alloc_zeros::<f32>(stream.seq_len * hc_mult)
+        .alloc_zeros_traced::<f32>(stream.seq_len * hc_mult)
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 HC post alloc failed: {err}"))?;
     let mut comb = ctx
         .stream
-        .alloc_zeros::<f32>(stream.seq_len * hc_mult * hc_mult)
+        .alloc_zeros_traced::<f32>(stream.seq_len * hc_mult * hc_mult)
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 HC comb alloc failed: {err}"))?;
 
     {

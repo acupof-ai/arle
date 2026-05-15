@@ -18,7 +18,7 @@ use half::bf16;
 
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::tensor::WeightFormat;
+use cuda_kernels::tensor::{CudaAllocTraceExt, WeightFormat};
 
 use crate::ops::LinearDispatchPhase;
 
@@ -372,7 +372,7 @@ impl MarlinDecodeScratch {
             w4_x_fp16: if config.w4 {
                 Some(
                     ctx.stream
-                        .alloc_zeros(max_rows * max_k)
+                        .alloc_zeros_traced(max_rows * max_k)
                         .map_err(|e| anyhow::anyhow!("alloc Marlin W4 x_fp16 scratch: {e}"))?,
                 )
             } else {
@@ -381,7 +381,7 @@ impl MarlinDecodeScratch {
             w4_y_fp16: if config.w4 {
                 Some(
                     ctx.stream
-                        .alloc_zeros(max_rows * max_n)
+                        .alloc_zeros_traced(max_rows * max_n)
                         .map_err(|e| anyhow::anyhow!("alloc Marlin W4 y_fp16 scratch: {e}"))?,
                 )
             } else {
@@ -390,7 +390,7 @@ impl MarlinDecodeScratch {
             w4_workspace: if config.w4 {
                 Some(
                     ctx.stream
-                        .alloc_zeros(w4_workspace_elems)
+                        .alloc_zeros_traced(w4_workspace_elems)
                         .map_err(|e| anyhow::anyhow!("alloc Marlin W4 workspace scratch: {e}"))?,
                 )
             } else {
@@ -399,14 +399,14 @@ impl MarlinDecodeScratch {
             w4a8_x_int8: if config.w4a8 {
                 Some(
                     ctx.stream
-                        .alloc_zeros(max_rows * max_k)
+                        .alloc_zeros_traced(max_rows * max_k)
                         .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 x_int8 scratch: {e}"))?,
                 )
             } else {
                 None
             },
             w4a8_activation_scales: if config.w4a8 {
-                Some(ctx.stream.alloc_zeros(max_rows).map_err(|e| {
+                Some(ctx.stream.alloc_zeros_traced(max_rows).map_err(|e| {
                     anyhow::anyhow!("alloc Marlin W4A8 activation scale scratch: {e}")
                 })?)
             } else {
@@ -415,7 +415,7 @@ impl MarlinDecodeScratch {
             w4a8_y_fp16: if config.w4a8 {
                 Some(
                     ctx.stream
-                        .alloc_zeros(max_rows * max_n)
+                        .alloc_zeros_traced(max_rows * max_n)
                         .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 y_fp16 scratch: {e}"))?,
                 )
             } else {
@@ -424,7 +424,7 @@ impl MarlinDecodeScratch {
             w4a8_reduce: if config.w4a8 {
                 Some(
                     ctx.stream
-                        .alloc_zeros(MARLIN_MAX_PAR * 64 * max_n)
+                        .alloc_zeros_traced(MARLIN_MAX_PAR * 64 * max_n)
                         .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 reduce scratch: {e}"))?,
                 )
             } else {
@@ -433,7 +433,7 @@ impl MarlinDecodeScratch {
             w4a8_workspace: if config.w4a8 {
                 Some(
                     ctx.stream
-                        .alloc_zeros(w4a8_workspace_elems)
+                        .alloc_zeros_traced(w4a8_workspace_elems)
                         .map_err(|e| anyhow::anyhow!("alloc Marlin W4A8 workspace scratch: {e}"))?,
                 )
             } else {
@@ -1213,7 +1213,7 @@ fn run_marlin_w4_linear(
 
     let mut x_fp16: CudaSlice<u16> = ctx
         .stream
-        .alloc_zeros(m * k)
+        .alloc_zeros_traced(m * k)
         .map_err(|e| anyhow::anyhow!("alloc marlin x_fp16: {e}"))?;
     {
         let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
@@ -1232,14 +1232,14 @@ fn run_marlin_w4_linear(
 
     let mut y_fp16: CudaSlice<u16> = ctx
         .stream
-        .alloc_zeros(m * n)
+        .alloc_zeros_traced(m * n)
         .map_err(|e| anyhow::anyhow!("alloc marlin y_fp16: {e}"))?;
     let sms = ctx.sm_count() as i32;
     let ws_size = unsafe { ffi::marlin_workspace_size(n as i32, sms) };
     let ws_elems = ws_size.div_ceil(4);
     let mut workspace: CudaSlice<i32> = ctx
         .stream
-        .alloc_zeros(ws_elems)
+        .alloc_zeros_traced(ws_elems)
         .map_err(|e| anyhow::anyhow!("alloc marlin workspace: {e}"))?;
 
     {
@@ -1425,11 +1425,11 @@ fn run_marlin_w4a8_linear(
 
     let mut x_int8: CudaSlice<i8> = ctx
         .stream
-        .alloc_zeros(m * k)
+        .alloc_zeros_traced(m * k)
         .map_err(|e| anyhow::anyhow!("alloc W4A8 x_int8: {e}"))?;
     let mut s_activation: CudaSlice<f32> = ctx
         .stream
-        .alloc_zeros(m)
+        .alloc_zeros_traced(m)
         .map_err(|e| anyhow::anyhow!("alloc W4A8 activation scales: {e}"))?;
     {
         let (x_ptr, _gx) = input.device_ptr(&ctx.stream);
@@ -1451,16 +1451,16 @@ fn run_marlin_w4a8_linear(
 
     let mut y_fp16: CudaSlice<u16> = ctx
         .stream
-        .alloc_zeros(m * n)
+        .alloc_zeros_traced(m * n)
         .map_err(|e| anyhow::anyhow!("alloc W4A8 y_fp16: {e}"))?;
     let mut reduce: CudaSlice<i32> = ctx
         .stream
-        .alloc_zeros(max_par * 64 * n)
+        .alloc_zeros_traced(max_par * 64 * n)
         .map_err(|e| anyhow::anyhow!("alloc W4A8 reduce buffer: {e}"))?;
     let lock_elems = ((n / 128) * max_par).max(1);
     let mut workspace: CudaSlice<i32> = ctx
         .stream
-        .alloc_zeros(lock_elems)
+        .alloc_zeros_traced(lock_elems)
         .map_err(|e| anyhow::anyhow!("alloc W4A8 lock workspace: {e}"))?;
 
     {
@@ -1686,13 +1686,13 @@ fn run_marlin_w4_fp8_prefill(
     let k = weight.cols;
     let max_par = MARLIN_MAX_PAR;
 
-    let mut x_fp8: CudaSlice<u8> = ctx.stream.alloc_zeros(m * k).map_err(|e| {
+    let mut x_fp8: CudaSlice<u8> = ctx.stream.alloc_zeros_traced(m * k).map_err(|e| {
         anyhow::anyhow!(
             "alloc W4+FP8 x_fp8: {e} [diag: m={m} k={k} n={n} bytes={}]",
             m * k
         )
     })?;
-    let mut s_activation: CudaSlice<f32> = ctx.stream.alloc_zeros(m).map_err(|e| {
+    let mut s_activation: CudaSlice<f32> = ctx.stream.alloc_zeros_traced(m).map_err(|e| {
         anyhow::anyhow!(
             "alloc W4+FP8 activation scales: {e} [diag: m={m} k={k} n={n} bytes={}]",
             m * 4
@@ -1720,7 +1720,7 @@ fn run_marlin_w4_fp8_prefill(
     let tmp_m = tmp_m.min(64);
     let mut reduce: CudaSlice<f32> = ctx
         .stream
-        .alloc_zeros(ctx.sm_count() * tmp_m * 256)
+        .alloc_zeros_traced(ctx.sm_count() * tmp_m * 256)
         .map_err(|e| {
             anyhow::anyhow!(
                 "alloc W4+FP8 reduce buffer: {e} [diag: m={m} k={k} n={n} sm_count={} tmp_m={tmp_m} bytes={}]",
@@ -1731,13 +1731,13 @@ fn run_marlin_w4_fp8_prefill(
     let lock_elems = ((n / 128) * max_par).max(1);
     let mut workspace: CudaSlice<i32> = ctx
         .stream
-        .alloc_zeros(lock_elems)
+        .alloc_zeros_traced(lock_elems)
         .map_err(|e| {
             anyhow::anyhow!(
                 "alloc W4+FP8 lock workspace: {e} [diag: m={m} k={k} n={n} lock_elems={lock_elems} max_par={max_par}]"
             )
         })?;
-    let mut y_fp16: CudaSlice<ffi::Half> = ctx.stream.alloc_zeros(m * n).map_err(|e| {
+    let mut y_fp16: CudaSlice<ffi::Half> = ctx.stream.alloc_zeros_traced(m * n).map_err(|e| {
         anyhow::anyhow!(
             "alloc W4+FP8 fp16 output: {e} [diag: m={m} k={k} n={n} bytes={}]",
             m * n * 2
@@ -1836,7 +1836,7 @@ fn run_turboquant_linear(
             let ws_size = weight.rows * weight.cols;
             let mut workspace: CudaSlice<bf16> = ctx
                 .stream
-                .alloc_zeros(ws_size)
+                .alloc_zeros_traced(ws_size)
                 .expect("alloc TQ dequant workspace");
             let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
             unsafe {
@@ -2023,7 +2023,7 @@ fn run_qweight_linear(
                 let ws_elems = weight.rows * weight.cols;
                 let mut workspace: CudaSlice<bf16> = ctx
                     .stream
-                    .alloc_zeros(ws_elems)
+                    .alloc_zeros_traced(ws_elems)
                     .expect("alloc QxK dequant workspace");
                 let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
                 let tile = ws_ptr as *mut ffi::Half;

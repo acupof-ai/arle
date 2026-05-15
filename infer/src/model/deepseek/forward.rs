@@ -34,6 +34,8 @@ use crate::ops;
 use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+#[cfg(feature = "cuda")]
+use cuda_kernels::tensor::CudaAllocTraceExt;
 
 #[cfg(feature = "cuda")]
 impl ModelForward for DeepseekModel {
@@ -55,12 +57,12 @@ impl ModelForward for DeepseekModel {
             sample_probs: self
                 .ctx
                 .stream
-                .alloc_zeros(self.config.vocab_size)
+                .alloc_zeros_traced(self.config.vocab_size)
                 .map_err(|e| anyhow::anyhow!("Alloc DeepSeek V4 sample_probs failed: {e}"))?,
             sample_out: self
                 .ctx
                 .stream
-                .alloc_zeros(1)
+                .alloc_zeros_traced(1)
                 .map_err(|e| anyhow::anyhow!("Alloc DeepSeek V4 sample_out failed: {e}"))?,
             reference_tokens: Vec::new(),
             incremental: Default::default(),

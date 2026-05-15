@@ -13,6 +13,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, RawDevicePtr};
+use cuda_kernels::tensor::CudaAllocTraceExt;
 
 /// Argmax — returns the index of the maximum element.
 ///
@@ -21,7 +22,7 @@ use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, RawDevicePtr
 pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     let mut out_gpu: CudaSlice<i32> = ctx
         .stream
-        .alloc_zeros(1)
+        .alloc_zeros_traced(1)
         .map_err(|e| anyhow!("Alloc failed: {}", e))?;
 
     {
@@ -101,7 +102,7 @@ pub fn gpu_sample(
 ) -> Result<u32> {
     let mut out_gpu: CudaSlice<i32> = ctx
         .stream
-        .alloc_zeros(1)
+        .alloc_zeros_traced(1)
         .map_err(|e| anyhow!("Alloc failed: {}", e))?;
 
     gpu_sample_core(ctx, logits, probs_scratch, &mut out_gpu, params, random_val)

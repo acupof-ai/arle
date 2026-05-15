@@ -31,8 +31,10 @@ Options:
 
 Environment:
   CUDA_VISIBLE_DEVICES, INFER_CUDA_DEVICES, ARLE_DSV4_MOE_BACKEND,
-  ARLE_DSV4_INCREMENTAL_KV, and ARLE_DSV4_FUSED_DISPATCH_PAYLOAD are read
-  from the environment and defaulted for 8xH20 DSv4 DeepEP runs.
+  ARLE_DSV4_INCREMENTAL_KV, ARLE_DSV4_FUSED_DISPATCH_PAYLOAD, and
+  ARLE_CUDA_ALLOC_TRACE are read from the environment. The DSv4 runtime
+  knobs are defaulted for 8xH20 DeepEP runs; allocation tracing stays
+  default-off unless explicitly set.
 EOF
 }
 
@@ -299,9 +301,10 @@ NSYS_CMD=(
 )
 
 {
-    printf 'CUDA_VISIBLE_DEVICES=%q INFER_CUDA_DEVICES=%q ARLE_DSV4_MOE_BACKEND=%q ARLE_DSV4_INCREMENTAL_KV=%q ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=%q ' \
+    printf 'CUDA_VISIBLE_DEVICES=%q INFER_CUDA_DEVICES=%q ARLE_DSV4_MOE_BACKEND=%q ARLE_DSV4_INCREMENTAL_KV=%q ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=%q ARLE_CUDA_ALLOC_TRACE=%q ' \
         "$CUDA_VISIBLE_DEVICES" "$INFER_CUDA_DEVICES" "$ARLE_DSV4_MOE_BACKEND" \
-        "$ARLE_DSV4_INCREMENTAL_KV" "$ARLE_DSV4_FUSED_DISPATCH_PAYLOAD"
+        "$ARLE_DSV4_INCREMENTAL_KV" "$ARLE_DSV4_FUSED_DISPATCH_PAYLOAD" \
+        "${ARLE_CUDA_ALLOC_TRACE:-}"
     printf 'nsys'
     for arg in "${NSYS_CMD[@]:1}"; do printf ' %q' "$arg"; done
     printf '\n'

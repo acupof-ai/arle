@@ -18,6 +18,8 @@ use crate::model::kv_cache::KVCacheDtype;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
 #[cfg(feature = "cuda")]
+use cuda_kernels::tensor::CudaAllocTraceExt;
+#[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use half::bf16;
@@ -276,19 +278,19 @@ impl DeepseekMoeRuntimeCache {
                 topk,
                 ep_world,
                 experts_per_rank,
-                token_ids: unsafe { ctx.stream.alloc::<u32>(capacity_tokens)? },
-                route_indices: unsafe { ctx.stream.alloc::<i32>(capacity_routes)? },
-                route_weights: unsafe { ctx.stream.alloc::<f32>(capacity_routes)? },
-                send_rank_counts: unsafe { ctx.stream.alloc::<i32>(ep_world)? },
-                send_rank_offsets: unsafe { ctx.stream.alloc::<i32>(ep_world)? },
-                rank_cursors: unsafe { ctx.stream.alloc::<i32>(ep_world)? },
+                token_ids: unsafe { ctx.stream.alloc_traced::<u32>(capacity_tokens)? },
+                route_indices: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes)? },
+                route_weights: unsafe { ctx.stream.alloc_traced::<f32>(capacity_routes)? },
+                send_rank_counts: unsafe { ctx.stream.alloc_traced::<i32>(ep_world)? },
+                send_rank_offsets: unsafe { ctx.stream.alloc_traced::<i32>(ep_world)? },
+                rank_cursors: unsafe { ctx.stream.alloc_traced::<i32>(ep_world)? },
                 send_hidden: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
-                send_meta: unsafe { ctx.stream.alloc::<i32>(capacity_routes * 3)? },
-                all_rank_counts: unsafe { ctx.stream.alloc::<i32>(ep_world * ep_world)? },
-                recv_rank_counts: unsafe { ctx.stream.alloc::<i32>(ep_world)? },
-                local_counts: unsafe { ctx.stream.alloc::<i32>(experts_per_rank)? },
-                local_offsets: unsafe { ctx.stream.alloc::<i32>(experts_per_rank)? },
-                local_cursors: unsafe { ctx.stream.alloc::<i32>(experts_per_rank)? },
+                send_meta: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes * 3)? },
+                all_rank_counts: unsafe { ctx.stream.alloc_traced::<i32>(ep_world * ep_world)? },
+                recv_rank_counts: unsafe { ctx.stream.alloc_traced::<i32>(ep_world)? },
+                local_counts: unsafe { ctx.stream.alloc_traced::<i32>(experts_per_rank)? },
+                local_offsets: unsafe { ctx.stream.alloc_traced::<i32>(experts_per_rank)? },
+                local_cursors: unsafe { ctx.stream.alloc_traced::<i32>(experts_per_rank)? },
             });
         }
         Ok(self
@@ -431,10 +433,16 @@ impl DeepseekMoeRuntimeCache {
                 hidden_dim,
                 combine_recv: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
                 route_slot_out: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
-                combine_fp8_send: unsafe { ctx.stream.alloc::<u8>(hidden_dim * capacity_routes)? },
-                combine_fp8_recv: unsafe { ctx.stream.alloc::<u8>(hidden_dim * capacity_routes)? },
-                combine_scale_send: unsafe { ctx.stream.alloc::<f32>(capacity_routes)? },
-                combine_scale_recv: unsafe { ctx.stream.alloc::<f32>(capacity_routes)? },
+                combine_fp8_send: unsafe {
+                    ctx.stream
+                        .alloc_traced::<u8>(hidden_dim * capacity_routes)?
+                },
+                combine_fp8_recv: unsafe {
+                    ctx.stream
+                        .alloc_traced::<u8>(hidden_dim * capacity_routes)?
+                },
+                combine_scale_send: unsafe { ctx.stream.alloc_traced::<f32>(capacity_routes)? },
+                combine_scale_recv: unsafe { ctx.stream.alloc_traced::<f32>(capacity_routes)? },
             });
         }
         Ok(self
@@ -482,8 +490,8 @@ pub(crate) fn ensure_send_route_scratch<'a>(
     if needs_alloc {
         *slot = Some(DeepseekSendRouteRuntimeScratch {
             capacity_routes,
-            send_token: unsafe { ctx.stream.alloc::<i32>(capacity_routes)? },
-            send_route_slot: unsafe { ctx.stream.alloc::<i32>(capacity_routes)? },
+            send_token: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes)? },
+            send_route_slot: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes)? },
         });
     }
     Ok(slot
@@ -511,8 +519,8 @@ pub(crate) fn ensure_dispatch_payload_scratch<'a>(
         *slot = Some(DeepseekDispatchPayloadRuntimeScratch {
             capacity_routes,
             stride_elems,
-            send_payload: unsafe { ctx.stream.alloc::<bf16>(elems)? },
-            recv_payload: unsafe { ctx.stream.alloc::<bf16>(elems)? },
+            send_payload: unsafe { ctx.stream.alloc_traced::<bf16>(elems)? },
+            recv_payload: unsafe { ctx.stream.alloc_traced::<bf16>(elems)? },
         });
     }
     Ok(slot
@@ -539,7 +547,7 @@ pub(crate) fn ensure_recv_route_scratch<'a>(
             capacity_routes,
             hidden_dim,
             recv_hidden: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
-            recv_meta: unsafe { ctx.stream.alloc::<i32>(capacity_routes * 3)? },
+            recv_meta: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes * 3)? },
             route_out: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
         });
     }
@@ -567,8 +575,8 @@ pub(crate) fn ensure_local_route_scratch<'a>(
             capacity_routes,
             hidden_dim,
             expert_hidden: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
-            expert_weight: unsafe { ctx.stream.alloc::<f32>(capacity_routes)? },
-            expert_route_slot: unsafe { ctx.stream.alloc::<i32>(capacity_routes)? },
+            expert_weight: unsafe { ctx.stream.alloc_traced::<f32>(capacity_routes)? },
+            expert_route_slot: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes)? },
         });
     }
     Ok(slot
@@ -592,9 +600,9 @@ impl DeepseekGroupedExpertRuntimeScratch {
         if needs_alloc {
             self.active = Some(DeepseekGroupedExpertActiveScratch {
                 capacity_experts,
-                indices: unsafe { ctx.stream.alloc::<i32>(capacity_experts)? },
-                offsets: unsafe { ctx.stream.alloc::<i32>(capacity_experts)? },
-                counts: unsafe { ctx.stream.alloc::<i32>(capacity_experts)? },
+                indices: unsafe { ctx.stream.alloc_traced::<i32>(capacity_experts)? },
+                offsets: unsafe { ctx.stream.alloc_traced::<i32>(capacity_experts)? },
+                counts: unsafe { ctx.stream.alloc_traced::<i32>(capacity_experts)? },
             });
         }
         Ok(self
@@ -630,11 +638,11 @@ pub(crate) fn ensure_mhc_scratch<'a>(
             mix_dim,
             hc_mult,
             mixes: unsafe { HiddenStates::uninit(ctx, mix_dim, capacity_tokens)? },
-            pre: unsafe { ctx.stream.alloc::<f32>(capacity_tokens * hc_mult)? },
-            post: unsafe { ctx.stream.alloc::<f32>(capacity_tokens * hc_mult)? },
+            pre: unsafe { ctx.stream.alloc_traced::<f32>(capacity_tokens * hc_mult)? },
+            post: unsafe { ctx.stream.alloc_traced::<f32>(capacity_tokens * hc_mult)? },
             comb: unsafe {
                 ctx.stream
-                    .alloc::<f32>(capacity_tokens * hc_mult * hc_mult)?
+                    .alloc_traced::<f32>(capacity_tokens * hc_mult * hc_mult)?
             },
         });
     }

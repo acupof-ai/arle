@@ -148,6 +148,8 @@ struct RequestTraceState {
     token_ids_seen: usize,
     last_usage: Option<TokenUsage>,
     metrics: ServerMetrics,
+    #[cfg(feature = "cuda")]
+    cuda_alloc_trace_start: Option<cuda_kernels::tensor::CudaAllocTraceSnapshot>,
     finished: bool,
 }
 
@@ -173,6 +175,8 @@ impl RequestTraceState {
             token_ids_seen: 0,
             last_usage: None,
             metrics,
+            #[cfg(feature = "cuda")]
+            cuda_alloc_trace_start: cuda_kernels::tensor::cuda_alloc_trace_snapshot(),
             finished: false,
         }
     }
@@ -216,101 +220,136 @@ impl RequestTraceState {
         let scheduler_loop = self.metrics.scheduler_loop_phase_us();
         let scheduler_pipeline = self.metrics.scheduler_pipeline_us();
         let preprocess_stage = self.metrics.preprocess_stage_us();
+        let payload = serde_json::json!({
+            "request_id": self.request_id,
+            "route": self.route,
+            "stream": self.stream,
+            "terminal_seen": terminal_seen,
+            "finish_reason": finish_reason.map(FinishReason::as_openai_str),
+            "error": error,
+            "max_tokens": self.max_tokens,
+            "prompt_bytes": self.prompt_bytes,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "chunks_seen": self.chunks_seen,
+            "text_bytes": self.text_bytes,
+            "token_ids_seen": self.token_ids_seen,
+            "ttft_ms": ttft_ms,
+            "total_ms": total_ms,
+            "throughput": {
+                "prompt_tokens_per_s_at_ttft": ttft_ms
+                    .filter(|value| *value > 0.0)
+                    .map(|value| usage.prompt_tokens as f64 * 1_000.0 / value),
+                "completion_tokens_per_s_e2e": (total_ms > 0.0)
+                    .then(|| usage.completion_tokens as f64 * 1_000.0 / total_ms),
+                "total_tokens_per_s_e2e": (total_ms > 0.0)
+                    .then(|| usage.total_tokens as f64 * 1_000.0 / total_ms),
+            },
+            "kv": {
+                "gpu_util": self.metrics.kv_gpu_utilization(),
+                "fetch_queue_depth": self.metrics.kv_fetch_queue_depth(),
+                "fetch_waiters": self.metrics.kv_fetch_waiters(),
+                "store_queue_depth": self.metrics.kv_store_queue_depth(),
+                "fetch_backpressure": self.metrics.kv_fetch_backpressure(),
+                "store_backpressure": self.metrics.kv_store_backpressure(),
+            },
+            "prefix": {
+                "hit_rate": self.metrics.prefix_hit_rate(),
+                "skip_rate": self.metrics.prefix_skip_rate(),
+                "request_hit_rate": self.metrics.prefix_request_hit_rate(),
+                "request_skip_rate": self.metrics.prefix_request_skip_rate(),
+                "matched_tokens": self.metrics.matched_prefix_tokens(),
+                "resume_prefill_tokens": self.metrics.resume_prefill_tokens(),
+                "lookup_latency_us": self.metrics.prefix_lookup_latency_us(),
+                "lookup_reusable_tokens": self.metrics.prefix_lookup_reusable_tokens(),
+                "ready_on_gpu": self.metrics.prefix_lookup_ready_on_gpu(),
+                "direct_gpu_attach": self.metrics.prefix_lookup_direct_gpu_attach(),
+                "staged": self.metrics.prefix_lookup_staged(),
+                "prefetch": self.metrics.prefix_lookup_prefetch(),
+                "recompute": self.metrics.prefix_lookup_recompute(),
+            },
+            "scheduler": {
+                "active": self.metrics.requests_active(),
+                "waiting": self.metrics.requests_waiting(),
+                "running_batch": self.metrics.scheduler_running_batch(),
+                "prefill_queue": self.metrics.scheduler_prefill_queue(),
+                "scheduled_rows": self.metrics.scheduler_scheduled_rows(),
+                "scheduled_decode_rows": self.metrics.scheduler_scheduled_decode_rows(),
+                "scheduled_prefill_rows": self.metrics.scheduler_scheduled_prefill_rows(),
+                "decode_tokens": self.metrics.scheduler_decode_tokens(),
+                "prefill_tokens": self.metrics.scheduler_prefill_tokens(),
+                "batch_width": self.metrics.scheduler_batch_width(),
+                "step_last_s": self.metrics.scheduler_step_last_seconds(),
+                "phase_us": scheduler_phase.map(|(
+                    admission,
+                    prefill,
+                    decode,
+                    emit,
+                    total,
+                )| serde_json::json!({
+                    "admission": admission,
+                    "prefill": prefill,
+                    "decode": decode,
+                    "emit": emit,
+                    "total": total,
+                })),
+                "loop_us": scheduler_loop.map(|(cleanup, total)| serde_json::json!({
+                    "cleanup": cleanup,
+                    "total": total,
+                })),
+                "pipeline_us": {
+                    "snapshot": scheduler_pipeline.0,
+                    "cpu_plan": scheduler_pipeline.1,
+                    "gpu_completion_wait": scheduler_pipeline.2,
+                    "gpu_command_queue_depth": scheduler_pipeline.3,
+                },
+            },
+            "preprocess": {
+                "queue_depth": preprocess_stage.0,
+                "wait_us": preprocess_stage.1,
+                "tokenize_us": preprocess_stage.2,
+            },
+        });
+
+        #[cfg(feature = "cuda")]
+        let mut payload = payload;
+
+        #[cfg(feature = "cuda")]
+        if let Some(entries) = self
+            .cuda_alloc_trace_start
+            .as_ref()
+            .and_then(|start| cuda_kernels::tensor::cuda_alloc_trace_summary_since(start, 20))
+            .filter(|entries| !entries.is_empty())
+        {
+            let entries = serde_json::Value::Array(
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "file": entry.key.file,
+                            "line": entry.key.line,
+                            "column": entry.key.column,
+                            "kind": entry.key.kind,
+                            "label": entry.key.label,
+                            "type": entry.key.type_name,
+                            "calls": entry.calls,
+                            "bytes": entry.bytes,
+                        })
+                    })
+                    .collect(),
+            );
+            payload["cuda_alloc_trace_process_delta"] = serde_json::json!({
+                "scope": "process_global_delta_since_request_trace_start",
+                "valid_for": "single_inflight_profiling_only",
+                "entries": entries,
+            });
+        }
 
         info!(
             target: "infer::request_trace",
             "request_trace {}",
-            serde_json::json!({
-                "request_id": self.request_id,
-                "route": self.route,
-                "stream": self.stream,
-                "terminal_seen": terminal_seen,
-                "finish_reason": finish_reason.map(FinishReason::as_openai_str),
-                "error": error,
-                "max_tokens": self.max_tokens,
-                "prompt_bytes": self.prompt_bytes,
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens,
-                "chunks_seen": self.chunks_seen,
-                "text_bytes": self.text_bytes,
-                "token_ids_seen": self.token_ids_seen,
-                "ttft_ms": ttft_ms,
-                "total_ms": total_ms,
-                "throughput": {
-                    "prompt_tokens_per_s_at_ttft": ttft_ms
-                        .filter(|value| *value > 0.0)
-                        .map(|value| usage.prompt_tokens as f64 * 1_000.0 / value),
-                    "completion_tokens_per_s_e2e": (total_ms > 0.0)
-                        .then(|| usage.completion_tokens as f64 * 1_000.0 / total_ms),
-                    "total_tokens_per_s_e2e": (total_ms > 0.0)
-                        .then(|| usage.total_tokens as f64 * 1_000.0 / total_ms),
-                },
-                "kv": {
-                    "gpu_util": self.metrics.kv_gpu_utilization(),
-                    "fetch_queue_depth": self.metrics.kv_fetch_queue_depth(),
-                    "fetch_waiters": self.metrics.kv_fetch_waiters(),
-                    "store_queue_depth": self.metrics.kv_store_queue_depth(),
-                    "fetch_backpressure": self.metrics.kv_fetch_backpressure(),
-                    "store_backpressure": self.metrics.kv_store_backpressure(),
-                },
-                "prefix": {
-                    "hit_rate": self.metrics.prefix_hit_rate(),
-                    "skip_rate": self.metrics.prefix_skip_rate(),
-                    "request_hit_rate": self.metrics.prefix_request_hit_rate(),
-                    "request_skip_rate": self.metrics.prefix_request_skip_rate(),
-                    "matched_tokens": self.metrics.matched_prefix_tokens(),
-                    "resume_prefill_tokens": self.metrics.resume_prefill_tokens(),
-                    "lookup_latency_us": self.metrics.prefix_lookup_latency_us(),
-                    "lookup_reusable_tokens": self.metrics.prefix_lookup_reusable_tokens(),
-                    "ready_on_gpu": self.metrics.prefix_lookup_ready_on_gpu(),
-                    "direct_gpu_attach": self.metrics.prefix_lookup_direct_gpu_attach(),
-                    "staged": self.metrics.prefix_lookup_staged(),
-                    "prefetch": self.metrics.prefix_lookup_prefetch(),
-                    "recompute": self.metrics.prefix_lookup_recompute(),
-                },
-                "scheduler": {
-                    "active": self.metrics.requests_active(),
-                    "waiting": self.metrics.requests_waiting(),
-                    "running_batch": self.metrics.scheduler_running_batch(),
-                    "prefill_queue": self.metrics.scheduler_prefill_queue(),
-                    "scheduled_rows": self.metrics.scheduler_scheduled_rows(),
-                    "scheduled_decode_rows": self.metrics.scheduler_scheduled_decode_rows(),
-                    "scheduled_prefill_rows": self.metrics.scheduler_scheduled_prefill_rows(),
-                    "decode_tokens": self.metrics.scheduler_decode_tokens(),
-                    "prefill_tokens": self.metrics.scheduler_prefill_tokens(),
-                    "batch_width": self.metrics.scheduler_batch_width(),
-                    "step_last_s": self.metrics.scheduler_step_last_seconds(),
-                    "phase_us": scheduler_phase.map(|(
-                        admission,
-                        prefill,
-                        decode,
-                        emit,
-                        total,
-                    )| serde_json::json!({
-                        "admission": admission,
-                        "prefill": prefill,
-                        "decode": decode,
-                        "emit": emit,
-                        "total": total,
-                    })),
-                    "loop_us": scheduler_loop.map(|(cleanup, total)| serde_json::json!({
-                        "cleanup": cleanup,
-                        "total": total,
-                    })),
-                    "pipeline_us": {
-                        "snapshot": scheduler_pipeline.0,
-                        "cpu_plan": scheduler_pipeline.1,
-                        "gpu_completion_wait": scheduler_pipeline.2,
-                        "gpu_command_queue_depth": scheduler_pipeline.3,
-                    },
-                },
-                "preprocess": {
-                    "queue_depth": preprocess_stage.0,
-                    "wait_us": preprocess_stage.1,
-                    "tokenize_us": preprocess_stage.2,
-                },
-            })
+            payload,
         );
     }
 }

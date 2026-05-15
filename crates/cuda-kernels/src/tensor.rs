@@ -3,14 +3,166 @@
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
-    PinnedHostSlice,
+    DriverError, PinnedHostSlice, ValidAsZeroBits,
 };
 use half::bf16;
+use std::any::type_name;
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::panic::Location;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::ffi;
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct CudaAllocTraceKey {
+    pub file: &'static str,
+    pub line: u32,
+    pub column: u32,
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub type_name: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CudaAllocTraceStats {
+    pub calls: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CudaAllocTraceSnapshot {
+    entries: BTreeMap<CudaAllocTraceKey, CudaAllocTraceStats>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CudaAllocTraceEntry {
+    pub key: CudaAllocTraceKey,
+    pub calls: u64,
+    pub bytes: u64,
+}
+
+static CUDA_ALLOC_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+static CUDA_ALLOC_TRACE: LazyLock<Mutex<BTreeMap<CudaAllocTraceKey, CudaAllocTraceStats>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn cuda_alloc_trace_enabled() -> bool {
+    *CUDA_ALLOC_TRACE_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_CUDA_ALLOC_TRACE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
+}
+
+pub fn cuda_alloc_trace_is_enabled() -> bool {
+    cuda_alloc_trace_enabled()
+}
+
+#[track_caller]
+fn record_cuda_alloc<T>(kind: &'static str, label: &'static str, len: usize) {
+    if !cuda_alloc_trace_enabled() {
+        return;
+    }
+    let location = Location::caller();
+    let key = CudaAllocTraceKey {
+        file: location.file(),
+        line: location.line(),
+        column: location.column(),
+        kind,
+        label,
+        type_name: type_name::<T>(),
+    };
+    let bytes = len.saturating_mul(std::mem::size_of::<T>()) as u64;
+    let Ok(mut trace) = CUDA_ALLOC_TRACE.lock() else {
+        return;
+    };
+    let stats = trace.entry(key).or_default();
+    stats.calls = stats.calls.saturating_add(1);
+    stats.bytes = stats.bytes.saturating_add(bytes);
+}
+
+pub fn cuda_alloc_trace_snapshot() -> Option<CudaAllocTraceSnapshot> {
+    if !cuda_alloc_trace_enabled() {
+        return None;
+    }
+    CUDA_ALLOC_TRACE
+        .lock()
+        .ok()
+        .map(|entries| CudaAllocTraceSnapshot {
+            entries: entries.clone(),
+        })
+}
+
+pub fn cuda_alloc_trace_summary_since(
+    start: &CudaAllocTraceSnapshot,
+    limit: usize,
+) -> Option<Vec<CudaAllocTraceEntry>> {
+    if !cuda_alloc_trace_enabled() {
+        return None;
+    }
+    let trace = CUDA_ALLOC_TRACE.lock().ok()?;
+    let mut entries = Vec::new();
+    for (key, current) in trace.iter() {
+        let before = start.entries.get(key).copied().unwrap_or_default();
+        let calls = current.calls.saturating_sub(before.calls);
+        let bytes = current.bytes.saturating_sub(before.bytes);
+        if calls == 0 && bytes == 0 {
+            continue;
+        }
+        entries.push(CudaAllocTraceEntry {
+            key: key.clone(),
+            calls,
+            bytes,
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.calls
+            .cmp(&a.calls)
+            .then_with(|| b.bytes.cmp(&a.bytes))
+            .then_with(|| a.key.file.cmp(b.key.file))
+            .then_with(|| a.key.line.cmp(&b.key.line))
+    });
+    entries.truncate(limit);
+    Some(entries)
+}
+
+pub trait CudaAllocTraceExt {
+    /// Allocate and attribute the call site when `ARLE_CUDA_ALLOC_TRACE=1`.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`CudaStream::alloc`]: the returned memory is uninitialized.
+    unsafe fn alloc_traced<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>, DriverError>;
+
+    /// Allocate zeroed memory and attribute the call site when
+    /// `ARLE_CUDA_ALLOC_TRACE=1`.
+    fn alloc_zeros_traced<T: DeviceRepr + ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> Result<CudaSlice<T>, DriverError>;
+}
+
+impl CudaAllocTraceExt for Arc<CudaStream> {
+    #[track_caller]
+    unsafe fn alloc_traced<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>, DriverError> {
+        let out = unsafe { self.alloc(len)? };
+        record_cuda_alloc::<T>("alloc", "CudaStream::alloc", len);
+        Ok(out)
+    }
+
+    #[track_caller]
+    fn alloc_zeros_traced<T: DeviceRepr + ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> Result<CudaSlice<T>, DriverError> {
+        let mut out = unsafe { self.alloc(len)? };
+        record_cuda_alloc::<T>("alloc_zeros", "CudaStream::alloc_zeros", len);
+        self.memset_zeros(&mut out)?;
+        Ok(out)
+    }
+}
 
 /// CUDA device context holding compute stream and optional copy stream.
 ///
@@ -460,11 +612,13 @@ impl DeviceVec {
     }
 
     /// Create zeroed tensor
+    #[track_caller]
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let gpu_data: CudaSlice<bf16> = ctx
             .stream
             .alloc_zeros(len)
             .map_err(|e| anyhow!("Alloc failed: {}", e))?;
+        record_cuda_alloc::<bf16>("alloc_zeros", "DeviceVec::zeros", len);
         Ok(Self {
             data: gpu_data,
             len,
@@ -2076,11 +2230,14 @@ pub struct HiddenStates {
 
 impl HiddenStates {
     /// Create zeroed batch
+    #[track_caller]
     pub fn zeros(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize) -> Result<Self> {
+        let len = hidden_dim * seq_len;
         let data: CudaSlice<bf16> = ctx
             .stream
-            .alloc_zeros(hidden_dim * seq_len)
+            .alloc_zeros(len)
             .map_err(|e| anyhow!("Alloc failed: {}", e))?;
+        record_cuda_alloc::<bf16>("alloc_zeros", "HiddenStates::zeros", len);
         Ok(Self {
             data,
             hidden_dim,
@@ -2095,12 +2252,15 @@ impl HiddenStates {
     ///
     /// The returned buffer must not be read before all `hidden_dim * seq_len`
     /// elements have been written by a kernel or device copy.
+    #[track_caller]
     pub unsafe fn uninit(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize) -> Result<Self> {
+        let len = hidden_dim * seq_len;
         let data: CudaSlice<bf16> = unsafe {
             ctx.stream
-                .alloc(hidden_dim * seq_len)
+                .alloc(len)
                 .map_err(|e| anyhow!("Alloc failed: {}", e))?
         };
+        record_cuda_alloc::<bf16>("alloc", "HiddenStates::uninit", len);
         Ok(Self {
             data,
             hidden_dim,
