@@ -81,6 +81,7 @@ ARLE_CUDA_ALLOC_TRACE=1 \
 | Trace surface | `infer::request_trace` JSON |
 | Allocation wrappers | `DeviceVec::zeros`, `HiddenStates::zeros`, `HiddenStates::uninit`, DSv4 `forward.rs`, DSv4 `mlp.rs`, DSv4 `state.rs`, DSv4 `weights.rs`, shared `ops/linear.rs`, shared `ops/sampling.rs` |
 | Request output | top 20 callsites by calls, then bytes |
+| Profile artifacts | `request-traces.json`, `cuda-alloc-trace-process-delta.json`, `cuda-alloc-trace-process-delta.csv` |
 | Perf status | `pending-remote`, no optimization conclusion claimed |
 
 ## Results
@@ -139,6 +140,8 @@ ARLE_CUDA_ALLOC_TRACE=1 \
 
 - Remote trace directory: pending
   `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-alloc-trace`.
+- Remote allocation caller artifacts: pending
+  `cuda-alloc-trace-process-delta.{json,csv}` from the same trace directory.
 - Local compile/test logs: terminal output from the commands listed above.
 
 ## Notes
