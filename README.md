@@ -209,6 +209,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   attention/MHC/route kernels, and **16,177** CUDA launches. The matching
   trace-off smoke keeps normal Chinese/English multi-token output, exact
   `410` math, and `decode64` at **11.94 post-first tok/s**.
+  Extending the same cleanup to MoE dispatch/payload/recv/local/combine scratch
+  cuts `cuMemsetD8Async` further to **1,232** calls / **1.558 ms** and moves
+  the isolated decode wave to **87.667 ms** after rerun; the trace-off smoke
+  reaches **12.06 post-first tok/s**. The dominant stack is still
+  reduce-scatter combine plus local expert FP8/FP4 GEMV.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and

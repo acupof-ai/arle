@@ -208,6 +208,19 @@ Current trace set:
   matching trace-off HTTP smoke for the expanded uninit change. Multi-token
   Chinese and English output remains normal, arithmetic returns exact `410`,
   and `decode64` reaches 11.94 post-first tok/s.
+- [`nsys-single-decode-token-moe-scratch-uninit-rerun/`](nsys-single-decode-token-moe-scratch-uninit-rerun/)
+  extends the uninitialized allocation cleanup to MoE dispatch, payload,
+  recv/local-route, active grouped, and combine scratch buffers. The profiled
+  arithmetic request returns exact `406`; after rerunning to avoid a noisy NCCL
+  sample, the isolated decode wave moves from 88.554 ms to 87.667 ms and
+  `cuMemsetD8Async` drops from 1,920 calls / 2.839 ms per rank range to 1,232
+  calls / 1.558 ms. Remaining dominant work is unchanged: reduce-scatter
+  combine, FP8/FP4 expert GEMV, attention/MHC/route kernels, and 16,177 CUDA
+  launches.
+- [`bench-moe-scratch-uninit-smoke/`](bench-moe-scratch-uninit-smoke/) records
+  the matching trace-off HTTP smoke. Multi-token Chinese and English output
+  remains normal, arithmetic returns exact `410`, and `decode64` reaches 12.06
+  post-first tok/s.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789
