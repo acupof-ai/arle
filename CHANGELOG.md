@@ -143,6 +143,17 @@ Related governance docs:
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-expanded-uninit-smoke/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-expanded-uninit-smoke/)
   keeps normal Chinese/English multi-token output, exact math `410`, and
   `decode64` at 11.94 post-first tok/s.
+- Extended the DSv4 uninitialized scratch cleanup to MoE dispatch, payload,
+  recv/local-route, active grouped, and combine buffers. The real 8xH20
+  single-token `nsys` artifact under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-moe-scratch-uninit-rerun/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-moe-scratch-uninit-rerun/)
+  returns exact arithmetic `406`, moves the isolated decode wave from
+  88.554 ms to 87.667 ms after a rerun, and cuts `cuMemsetD8Async` from
+  1,920 calls / 2.839 ms per rank range to 1,232 calls / 1.558 ms. The
+  matching HTTP smoke under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-moe-scratch-uninit-smoke/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-moe-scratch-uninit-smoke/)
+  keeps normal Chinese/English multi-token output, exact math `410`, and
+  `decode64` at 12.06 post-first tok/s.
 - Moved DSv4 grouped expert weight/scale pointer tables into
   `DeepseekV4MoeBlock` load-time caches for the opt-in grouped/route-grouped
   expert paths and future raw-pointer DeepGEMM integration. On the real 8xH20
