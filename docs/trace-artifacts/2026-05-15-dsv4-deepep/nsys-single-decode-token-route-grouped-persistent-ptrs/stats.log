@@ -1,0 +1,9 @@
+
+NOTICE: Existing SQLite export found: docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-grouped-persistent-ptrs/trace.sqlite
+        It is assumed file was previously exported from: docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-grouped-persistent-ptrs/trace.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-grouped-persistent-ptrs/trace.sqlite] with [/opt/nvidia/nsight-systems/2023.2.3/host-linux-x64/reports/cuda_api_sum.py] to [docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-grouped-persistent-ptrs/stats_cuda_api_sum.csv]... PROCESSED
+
+Processing [docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-grouped-persistent-ptrs/trace.sqlite] with [/opt/nvidia/nsight-systems/2023.2.3/host-linux-x64/reports/cuda_gpu_kern_sum.py] to [docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-grouped-persistent-ptrs/stats_cuda_gpu_kern_sum.csv]... PROCESSED
+

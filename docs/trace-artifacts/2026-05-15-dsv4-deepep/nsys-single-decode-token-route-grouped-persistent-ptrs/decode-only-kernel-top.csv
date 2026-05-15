@@ -1,0 +1,32 @@
+name,calls,total_ms,avg_ms
+ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),216,342.620893,1.5862078379629632
+"dsv4_fp4_route_gemv_pair_batch_kernel(const unsigned long *, const unsigned long *, const unsigned long *, const unsigned long *, const __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, const int *, int, int, int, int, int, int, int)",216,120.97138699999992,0.5600527175925922
+"dsv4_fp4_route_gemv_batch_kernel(const unsigned long *, const unsigned long *, const __nv_bfloat16 *, __nv_bfloat16 *, const int *, int, int, int, int, int, int, int, int)",216,64.68274799999999,0.2994571666666666
+"dsv4_fp8_gemv_batch_kernel(const unsigned char *, const unsigned char *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int)",1808,56.566615000000034,0.031286844579646034
+"dsv4_hybrid_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, const int *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float, int, int, int, int)",200,36.214618,0.18107309000000002
+"dsv4_mhc_params_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, float *, float *, float *, int, int, int, int, float, int)",432,27.64714000000001,0.06399800925925929
+"dsv4_route_kernel(const unsigned short *, const unsigned short *, const long *, const unsigned int *, int *, float *, int, int, int, int, int, float)",216,27.60663099999998,0.12780847685185176
+"dsv4_csa_select_kernel(const unsigned short *, const unsigned short *, const unsigned short *, int *, int, int, int, int, int, int, int, float, int)",104,20.383007999999997,0.1959904615384615
+ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>),216,5.372549999999995,0.024872916666666644
+"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",928,5.310399000000021,0.005722412715517264
+"dsv4_compressor_update_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, unsigned short *, int, int, int, int, int, int, int, int, int, float, int, float, int, float, float, float)",304,4.133119000000005,0.013595786184210543
+ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>),216,3.7953520000000016,0.017571074074074083
+"rms_norm_batched_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)",864,2.193540999999997,0.0025388206018518485
+"dsv4_swa_attention_kernel(const unsigned short *, const unsigned short *, const unsigned short *, const unsigned short *, unsigned short *, int, int, int, int, int, int, float, int, float, int, float, float, float)",16,1.677474,0.104842125
+"void dot_kernel<float, (int)128, (int)0, cublasDotParams<cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<float>>>(T4)",432,1.3561230000000006,0.0031391736111111125
+"dsv4_pack_expert_ranks_kernel(const unsigned short *, const int *, const float *, const int *, int *, unsigned short *, int *, int *, int *, int, int, int, int, int)",216,1.0008369999999993,0.004633504629629626
+"dsv4_mhc_post_kernel(const unsigned short *, const unsigned short *, const float *, const float *, unsigned short *, int, int, int)",424,0.8593979999999999,0.0020268820754716977
+"void reduce_1Block_kernel<float, (int)128, (int)7, cublasGemvTensorStridedBatched<float>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>>(const T1 *, T1, T4, int, const T1 *, T1, T5, T6, cublasPointerMode_t, cublasLtEpilogue_t, cublasGemvTensorStridedBatched<const biasType<T6::value_type, T1>::type>)",432,0.7192549999999999,0.0016649421296296293
+"dsv4_prepare_q_kernel(const unsigned short *, unsigned short *, int, int, int, int, int, float, float, int, float, float, float)",216,0.6910119999999995,0.0031991296296296273
+"dsv4_mhc_pre_kernel(const unsigned short *, const float *, unsigned short *, int, int, int)",432,0.6522299999999983,0.0015097916666666628
+"dsv4_pack_dispatch_payload_kernel(const unsigned short *, const int *, unsigned short *, int, int, int)",216,0.584264,0.002704925925925926
+"dsv4_prepare_k_kernel(const unsigned short *, unsigned short *, int, int, int, int, float, int, float, float, float)",216,0.5631699999999995,0.002607268518518516
+"dsv4_unpack_dispatch_payload_kernel(const unsigned short *, unsigned short *, int *, int, int, int)",216,0.5098169999999997,0.002360263888888888
+"dsv4_sum_padded_route_outputs_by_peer_kernel(const unsigned short *, const int *, unsigned short *, int, int, int)",216,0.48179499999999964,0.002230532407407406
+"dsv4_swiglu_clamped_routes_kernel(const unsigned short *, const unsigned short *, unsigned short *, const int *, int, int, int, int, float)",216,0.38909400000000016,0.0018013611111111119
+"dsv4_swiglu_clamped_kernel(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, float)",208,0.29235799999999973,0.0014055673076923065
+"add_assign_bf16_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, int)",208,0.2813220000000003,0.0013525096153846167
+"dsv4_init_padded_route_slots_kernel(int *, int *, int *, int)",216,0.25603500000000023,0.0011853472222222233
+"dsv4_update_window_cache_kernel(const unsigned short *, unsigned short *, int, int, int, int)",216,0.24786599999999998,0.0011475277777777777
+"embedding_batched_native_kernel(const __nv_bfloat16 *, const int *, __nv_bfloat16 *, int, int)",8,0.015584000000000002,0.0019480000000000003
+"dsv4_mhc_expand_kernel(const unsigned short *, unsigned short *, int, int, int)",8,0.011969,0.001496125

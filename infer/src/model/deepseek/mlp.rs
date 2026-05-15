@@ -555,6 +555,25 @@ where
 }
 
 #[cfg(feature = "cuda")]
+pub(super) fn dsv4_try_build_grouped_weight_ptrs<'a, F>(
+    ctx: &DeviceContext,
+    experts: &'a [DeepseekV4Expert],
+    select: F,
+) -> Result<Option<DeepseekGroupedExpertWeightPtrCache>>
+where
+    F: Fn(&'a DeepseekV4Expert) -> &'a DeviceMatrix + Copy,
+{
+    if experts.is_empty()
+        || experts
+            .iter()
+            .any(|expert| dsv4_grouped_format(select(expert)).is_none())
+    {
+        return Ok(None);
+    }
+    dsv4_build_grouped_weight_ptrs(ctx, experts, select).map(Some)
+}
+
+#[cfg(feature = "cuda")]
 fn dsv4_ensure_grouped_weight_ptrs<'a, F>(
     ctx: &DeviceContext,
     experts: &'a [DeepseekV4Expert],
@@ -570,6 +589,45 @@ where
     Ok(slot
         .as_ref()
         .expect("DeepSeek V4 grouped expert weight pointers cached"))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_grouped_w1_ptrs<'a>(
+    block: &'a DeepseekV4MoeBlock,
+    ctx: &DeviceContext,
+    slot: &'a mut Option<DeepseekGroupedExpertWeightPtrCache>,
+) -> Result<&'a DeepseekGroupedExpertWeightPtrCache> {
+    if let Some(ptrs) = block.grouped_w1_ptrs.as_ref() {
+        Ok(ptrs)
+    } else {
+        dsv4_ensure_grouped_weight_ptrs(ctx, &block.experts, slot, |expert| &expert.w1)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_grouped_w3_ptrs<'a>(
+    block: &'a DeepseekV4MoeBlock,
+    ctx: &DeviceContext,
+    slot: &'a mut Option<DeepseekGroupedExpertWeightPtrCache>,
+) -> Result<&'a DeepseekGroupedExpertWeightPtrCache> {
+    if let Some(ptrs) = block.grouped_w3_ptrs.as_ref() {
+        Ok(ptrs)
+    } else {
+        dsv4_ensure_grouped_weight_ptrs(ctx, &block.experts, slot, |expert| &expert.w3)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_grouped_w2_ptrs<'a>(
+    block: &'a DeepseekV4MoeBlock,
+    ctx: &DeviceContext,
+    slot: &'a mut Option<DeepseekGroupedExpertWeightPtrCache>,
+) -> Result<&'a DeepseekGroupedExpertWeightPtrCache> {
+    if let Some(ptrs) = block.grouped_w2_ptrs.as_ref() {
+        Ok(ptrs)
+    } else {
+        dsv4_ensure_grouped_weight_ptrs(ctx, &block.experts, slot, |expert| &expert.w2)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1129,6 +1187,9 @@ pub(super) struct DeepseekV4MoeBlock {
     /// name and keeps the field explicit.
     pub(super) gate_tid2eid: Option<CudaSlice<i64>>,
     pub(super) experts: Vec<DeepseekV4Expert>,
+    pub(super) grouped_w1_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
+    pub(super) grouped_w3_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
+    pub(super) grouped_w2_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
     pub(super) shared_experts: Option<DeepseekV4Expert>,
 }
 
@@ -1685,18 +1746,8 @@ impl DeepseekV4MoeBlock {
             .expect("DeepSeek V4 grouped active scratch allocated");
 
         let paired_gate_up = {
-            let w1_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                ctx,
-                &self.experts,
-                &mut scratch.w1_ptrs,
-                |expert| &expert.w1,
-            )?;
-            let w3_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                ctx,
-                &self.experts,
-                &mut scratch.w3_ptrs,
-                |expert| &expert.w3,
-            )?;
+            let w1_ptrs = dsv4_grouped_w1_ptrs(self, ctx, &mut scratch.w1_ptrs)?;
+            let w3_ptrs = dsv4_grouped_w3_ptrs(self, ctx, &mut scratch.w3_ptrs)?;
             dsv4_run_grouped_block_scaled_gemv_pair(
                 ctx,
                 w1_ptrs,
@@ -1713,12 +1764,7 @@ impl DeepseekV4MoeBlock {
         };
         if !paired_gate_up {
             {
-                let w1_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                    ctx,
-                    &self.experts,
-                    &mut scratch.w1_ptrs,
-                    |expert| &expert.w1,
-                )?;
+                let w1_ptrs = dsv4_grouped_w1_ptrs(self, ctx, &mut scratch.w1_ptrs)?;
                 dsv4_run_grouped_block_scaled_gemv(
                     ctx,
                     w1_ptrs,
@@ -1732,12 +1778,7 @@ impl DeepseekV4MoeBlock {
                 )?;
             }
             {
-                let w3_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                    ctx,
-                    &self.experts,
-                    &mut scratch.w3_ptrs,
-                    |expert| &expert.w3,
-                )?;
+                let w3_ptrs = dsv4_grouped_w3_ptrs(self, ctx, &mut scratch.w3_ptrs)?;
                 dsv4_run_grouped_block_scaled_gemv(
                     ctx,
                     w3_ptrs,
@@ -1759,12 +1800,7 @@ impl DeepseekV4MoeBlock {
             config.swiglu_limit,
         )?;
         {
-            let w2_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                ctx,
-                &self.experts,
-                &mut scratch.w2_ptrs,
-                |expert| &expert.w2,
-            )?;
+            let w2_ptrs = dsv4_grouped_w2_ptrs(self, ctx, &mut scratch.w2_ptrs)?;
             dsv4_run_grouped_block_scaled_gemv(
                 ctx,
                 w2_ptrs,
@@ -1859,18 +1895,8 @@ impl DeepseekV4MoeBlock {
         scratch.out.seq_len = num_routes;
 
         let paired_gate_up = {
-            let w1_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                ctx,
-                &self.experts,
-                &mut scratch.w1_ptrs,
-                |expert| &expert.w1,
-            )?;
-            let w3_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                ctx,
-                &self.experts,
-                &mut scratch.w3_ptrs,
-                |expert| &expert.w3,
-            )?;
+            let w1_ptrs = dsv4_grouped_w1_ptrs(self, ctx, &mut scratch.w1_ptrs)?;
+            let w3_ptrs = dsv4_grouped_w3_ptrs(self, ctx, &mut scratch.w3_ptrs)?;
             dsv4_run_route_block_scaled_gemv_pair(
                 ctx,
                 w1_ptrs,
@@ -1886,12 +1912,7 @@ impl DeepseekV4MoeBlock {
         };
         if !paired_gate_up {
             {
-                let w1_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                    ctx,
-                    &self.experts,
-                    &mut scratch.w1_ptrs,
-                    |expert| &expert.w1,
-                )?;
+                let w1_ptrs = dsv4_grouped_w1_ptrs(self, ctx, &mut scratch.w1_ptrs)?;
                 dsv4_run_route_block_scaled_gemv(
                     ctx,
                     w1_ptrs,
@@ -1905,12 +1926,7 @@ impl DeepseekV4MoeBlock {
                 )?;
             }
             {
-                let w3_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                    ctx,
-                    &self.experts,
-                    &mut scratch.w3_ptrs,
-                    |expert| &expert.w3,
-                )?;
+                let w3_ptrs = dsv4_grouped_w3_ptrs(self, ctx, &mut scratch.w3_ptrs)?;
                 dsv4_run_route_block_scaled_gemv(
                     ctx,
                     w3_ptrs,
@@ -1947,12 +1963,7 @@ impl DeepseekV4MoeBlock {
             }
         }
         {
-            let w2_ptrs = dsv4_ensure_grouped_weight_ptrs(
-                ctx,
-                &self.experts,
-                &mut scratch.w2_ptrs,
-                |expert| &expert.w2,
-            )?;
+            let w2_ptrs = dsv4_grouped_w2_ptrs(self, ctx, &mut scratch.w2_ptrs)?;
             dsv4_run_route_block_scaled_gemv(
                 ctx,
                 w2_ptrs,
@@ -3921,6 +3932,9 @@ mod tests {
             gate_bias: None,
             gate_tid2eid: None,
             experts: vec![expert0, expert1],
+            grouped_w1_ptrs: None,
+            grouped_w3_ptrs: None,
+            grouped_w2_ptrs: None,
             shared_experts: None,
         };
         let routing = LocalExpertRouting {
@@ -4011,6 +4025,9 @@ mod tests {
             )?),
             gate_tid2eid: None,
             experts: vec![expert0, expert1],
+            grouped_w1_ptrs: None,
+            grouped_w3_ptrs: None,
+            grouped_w2_ptrs: None,
             shared_experts: None,
         };
 
