@@ -89,6 +89,12 @@ pub(crate) fn print_welcome_banner(model_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -117,6 +123,7 @@ mod tests {
 
     #[test]
     fn banner_marker_path_respects_xdg() {
+        let _env_lock = env_lock().lock().expect("env lock should not be poisoned");
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", Some("/tmp/xdgtest"));
         let _home = EnvGuard::set("HOME", Some("/home/ignored"));
         let p = banner_marker_path().expect("xdg set => Some");
@@ -125,6 +132,7 @@ mod tests {
 
     #[test]
     fn banner_marker_path_falls_back_to_home() {
+        let _env_lock = env_lock().lock().expect("env lock should not be poisoned");
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", None);
         let _home = EnvGuard::set("HOME", Some("/home/u"));
         let p = banner_marker_path().expect("home set => Some");
@@ -133,6 +141,7 @@ mod tests {
 
     #[test]
     fn banner_marker_path_empty_xdg_treated_as_unset() {
+        let _env_lock = env_lock().lock().expect("env lock should not be poisoned");
         let _xdg = EnvGuard::set("XDG_CONFIG_HOME", Some(""));
         let _home = EnvGuard::set("HOME", Some("/home/u"));
         let p = banner_marker_path().expect("home set => Some");
