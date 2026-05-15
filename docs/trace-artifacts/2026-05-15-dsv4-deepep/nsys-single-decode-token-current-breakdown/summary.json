@@ -243,5 +243,31 @@
       "calls": 696,
       "avg_ms": 0.0016641163793103487
     }
+  ],
+  "memcpy_activity": [
+    {
+      "kind": "Device-to-Host",
+      "calls": 347,
+      "bytes": 44044,
+      "time_ms_per_rank_range": 0.1055,
+      "total_time_ms_all_ranges": 0.844,
+      "avg_ms": 0.002432
+    },
+    {
+      "kind": "Host-to-Device",
+      "calls": 1040,
+      "bytes": 56448,
+      "time_ms_per_rank_range": 0.102625,
+      "total_time_ms_all_ranges": 0.821,
+      "avg_ms": 0.00079
+    },
+    {
+      "kind": "Device-to-Device",
+      "calls": 360,
+      "bytes": 17260736,
+      "time_ms_per_rank_range": 0.0595,
+      "total_time_ms_all_ranges": 0.476,
+      "avg_ms": 0.001323
+    }
   ]
 }

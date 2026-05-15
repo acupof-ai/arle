@@ -77,6 +77,29 @@ kernel_rows = cur.execute(
     """
 ).fetchall()
 
+memcpy_rows = []
+if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
+    memcpy_rows = cur.execute(
+        """
+        WITH hits AS (
+            SELECT DISTINCT m.rowid AS mid,
+                   m.copyKind AS copy_kind,
+                   m.bytes AS bytes,
+                   (m.end-m.start)/1e6 AS time_ms
+            FROM CUPTI_ACTIVITY_KIND_MEMCPY m
+            JOIN decode_ranges_tmp d ON m.start >= d.start AND m.end <= d.end
+        )
+        SELECT COALESCE(e.label, e.name, printf('%d', h.copy_kind)) AS kind,
+               COUNT(*) AS calls,
+               SUM(bytes) AS bytes,
+               SUM(time_ms) AS total_ms,
+               AVG(time_ms) AS avg_ms
+        FROM hits h
+        LEFT JOIN ENUM_CUDA_MEMCPY_OPER e ON h.copy_kind = e.id
+        GROUP BY 1 ORDER BY total_ms DESC
+        """
+    ).fetchall()
+
 range_ms = [(end - start) / 1e6 for start, end in ranges]
 wave_ranges = [ranges]
 if len(ranges) % 8 == 0:
@@ -115,6 +138,17 @@ summary = {
         }
         for name, calls, total, avg in kernel_rows[:20]
     ],
+    "memcpy_activity": [
+        {
+            "kind": kind,
+            "calls": calls,
+            "bytes": bytes_,
+            "time_ms_per_rank_range": total / range_count,
+            "total_time_ms_all_ranges": total,
+            "avg_ms": avg,
+        }
+        for kind, calls, bytes_, total, avg in memcpy_rows
+    ],
 }
 
 (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -126,5 +160,9 @@ with (out / "decode-only-kernel-top.csv").open("w", newline="", encoding="utf-8"
     writer = csv.writer(f, lineterminator="\n")
     writer.writerow(["name", "calls", "total_ms", "avg_ms"])
     writer.writerows(kernel_rows)
+with (out / "decode-only-memcpy-summary.csv").open("w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f, lineterminator="\n")
+    writer.writerow(["kind", "calls", "bytes", "total_ms", "avg_ms"])
+    writer.writerows(memcpy_rows)
 
 print(json.dumps(summary, indent=2))

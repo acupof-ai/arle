@@ -37,6 +37,14 @@ Top CUDA runtime API time inside the decode-token NVTX ranges:
 | `cuLaunchKernelEx` | 2.054 ms | 1,032 |
 | `cuMemFreeAsync` | 1.955 ms | 1,328 |
 
+Memcpy activity bytes inside the same decode window:
+
+| Direction | Calls | Bytes | Activity time |
+| --- | ---: | ---: | ---: |
+| Device-to-Host | 347 | 44,044 B | 0.844 ms |
+| Host-to-Device | 1,040 | 56,448 B | 0.821 ms |
+| Device-to-Device | 360 | 17,260,736 B | 0.476 ms |
+
 Top CUDA kernels inside the same decode-token window:
 
 | Kernel | Time per rank range | Calls |
@@ -63,7 +71,9 @@ failure. The isolated second-token decode wave is dominated by:
   event, and stream-wait API work are visible in the decode range.
 - Host synchronization: 347 D2H calls remain. The main code path is the
   per-layer local expert count readback used to build host offsets before the
-  local expert loop.
+  local expert loop. The actual D2H payload is only 44,044 bytes in the decode
+  window, so the visible runtime cost is call/synchronization overhead rather
+  than transfer bandwidth.
 - Attention is real but secondary at this context size: hybrid attention is
   7.394 ms per rank range, MHC parameter kernels are 5.500 ms, and CSA select is
   4.124 ms.

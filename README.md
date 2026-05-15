@@ -194,7 +194,7 @@ Operators who want only the native serving binary can use `infer` directly (`car
   current default path and makes the ranked bottleneck explicit: **16,177**
   CUDA launches, **20.122 ms** reduce-scatter, **11.474/11.109 ms** FP8/FP4
   expert GEMV, **8.978 ms** all-reduce, attention/MHC/route kernels, and
-  **347** D2H synchronization calls.
+  **347** D2H synchronization calls over only **44,044 B** of D2H activity.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and
