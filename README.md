@@ -200,6 +200,15 @@ Operators who want only the native serving binary can use `infer` directly (`car
   calls / **374,752 B** to **440** calls / **7,808 B** and moving that trace
   from **105.808 ms** to **94.828 ms** while still returning `406`; it remains
   default-off until route-wise GEMV is replaced by true grouped GEMM/DeepGEMM.
+  Expanding uninitialized allocation to additional full-write DSv4 runtime
+  scratch buffers is now validated on the real 8xH20 path: the arithmetic
+  request returns `406`, the isolated decode wave moves from **105.205 ms** to
+  **88.554 ms**, and `cuMemsetD8Async` drops from **3,640** calls /
+  **6.932 ms** per rank range to **1,920** calls / **2.839 ms**. The remaining
+  ranked costs are still reduce-scatter combine, FP8/FP4 expert GEMV,
+  attention/MHC/route kernels, and **16,177** CUDA launches. The matching
+  trace-off smoke keeps normal Chinese/English multi-token output, exact
+  `410` math, and `decode64` at **11.94 post-first tok/s**.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and
