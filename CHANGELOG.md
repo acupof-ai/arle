@@ -130,6 +130,16 @@ Related governance docs:
   per-layer synchronization. The actual D2H activity payload is only 44,044
   bytes, confirming the current issue is MoE communication/compute plus
   launch/runtime synchronization granularity, not sampler time or copy bandwidth.
+- Moved DSv4 grouped expert weight/scale pointer tables into
+  `DeepseekV4MoeBlock` load-time caches for the opt-in grouped/route-grouped
+  expert paths and future raw-pointer DeepGEMM integration. On the real 8xH20
+  `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1` trace, exact arithmetic remains `406`,
+  H2D activity drops from 1,918 calls / 374,752 bytes to 440 calls / 7,808
+  bytes, H2D runtime drops from 5.490 ms to 1.380 ms, and the route-grouped
+  single-token wave moves from 105.808 ms to 94.828 ms. The path remains
+  default-off because reduce-scatter combine and route-wise FP4/FP8 GEMV still
+  dominate; the default DeepEP smoke still returns math `410`, normal Chinese
+  writing, and normal English decode text.
 - Added the DSv4 default-path warm decode Nsight trace under
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
   The run warms a real decode first, then profiles a second single decode token

@@ -195,6 +195,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   CUDA launches, **20.122 ms** reduce-scatter, **11.474/11.109 ms** FP8/FP4
   expert GEMV, **8.978 ms** all-reduce, attention/MHC/route kernels, and
   **347** D2H synchronization calls over only **44,044 B** of D2H activity.
+  The opt-in route-grouped path now keeps grouped expert weight/scale pointer
+  tables in layer-load-time caches, cutting its H2D activity from **1,918**
+  calls / **374,752 B** to **440** calls / **7,808 B** and moving that trace
+  from **105.808 ms** to **94.828 ms** while still returning `406`; it remains
+  default-off until route-wise GEMV is replaced by true grouped GEMM/DeepGEMM.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and

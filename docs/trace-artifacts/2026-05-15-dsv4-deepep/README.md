@@ -76,6 +76,25 @@ Current trace set:
   `dsv4_fp4_route_gemv_batch_kernel` cost 35.895 ms per rank range and regresses
   the single decode wave to 145.669 ms. This stays default-off; the compute
   target remains real grouped GEMM/DeepGEMM, not route-wise GEMV.
+- [`nsys-single-decode-token-route-grouped-current/`](nsys-single-decode-token-route-grouped-current/)
+  reruns the current opt-in route-grouped path before persistent grouped
+  pointer caches. It returns exact arithmetic `406` and removes decode-window
+  D2H, but still measures a 105.808 ms decode wave. The trace exposes 1,918 H2D
+  memcpy activity calls / 374,752 bytes from small pointer/control copies plus
+  heavy route-wise FP4/FP8 GEMV and reduce-scatter timing.
+- [`nsys-single-decode-token-route-grouped-persistent-ptrs/`](nsys-single-decode-token-route-grouped-persistent-ptrs/)
+  validates moving grouped expert weight/scale pointer tables into
+  `DeepseekV4MoeBlock` load-time caches. The same opt-in route-grouped request
+  returns `406`, H2D activity drops to 440 calls / 7,808 bytes, H2D runtime
+  drops from 5.490 ms to 1.380 ms, and the single decode wave moves from
+  105.808 ms to 94.828 ms. The path remains default-off because reduce-scatter
+  combine and route-wise FP4/FP8 GEMV still dominate; this is a prerequisite
+  cleanup for true grouped GEMM/DeepGEMM, not the final compute path.
+- [`bench-persistent-grouped-ptrs-default-smoke/`](bench-persistent-grouped-ptrs-default-smoke/)
+  keeps `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=0` after the persistent pointer-cache
+  change and verifies the default DeepEP path still loads the true checkpoint:
+  math returns `410`, Chinese writing is normal, and a 16-token English decode
+  produces normal text instead of repeated digits.
 - [`bench-decode-pair-gemv-626477b1/`](bench-decode-pair-gemv-626477b1/)
   records a clean decode-only HTTP comparison for the default split expert GEMV
   path versus `ARLE_DSV4_PAIR_EXPERT_GEMV=1` on commit `626477b1`. Both paths

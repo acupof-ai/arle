@@ -23,7 +23,10 @@ use super::load::{load_dsv4_matrix_raw_sharded, load_dsv4_vec_bf16};
 #[cfg(feature = "cuda")]
 use super::mla::{DeepseekV4Attention, DeepseekV4Compressor, DeepseekV4Indexer};
 #[cfg(feature = "cuda")]
-use super::mlp::{DeepseekRoutedMoeOutput, DeepseekV4Expert, DeepseekV4MoeBlock};
+use super::mlp::{
+    DeepseekRoutedMoeOutput, DeepseekV4Expert, DeepseekV4MoeBlock,
+    dsv4_try_build_grouped_weight_ptrs,
+};
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache, DeepseekHiddenRuntimeScratch,
@@ -2453,6 +2456,12 @@ impl DeepseekModel {
             let expert = names.expert(expert_idx);
             experts.push(self.load_expert(shards, weight_map, &expert)?);
         }
+        let grouped_w1_ptrs =
+            dsv4_try_build_grouped_weight_ptrs(&self.ctx, &experts, |expert| &expert.w1)?;
+        let grouped_w3_ptrs =
+            dsv4_try_build_grouped_weight_ptrs(&self.ctx, &experts, |expert| &expert.w3)?;
+        let grouped_w2_ptrs =
+            dsv4_try_build_grouped_weight_ptrs(&self.ctx, &experts, |expert| &expert.w2)?;
         Ok(DeepseekV4MoeBlock {
             gate_weight: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.gate_weight)?,
             gate_bias: names
@@ -2466,6 +2475,9 @@ impl DeepseekModel {
                 .map(|name| self.load_i64_tensor(shards, weight_map, name))
                 .transpose()?,
             experts,
+            grouped_w1_ptrs,
+            grouped_w3_ptrs,
+            grouped_w2_ptrs,
             shared_experts: names
                 .shared_experts
                 .as_ref()
@@ -4341,6 +4353,9 @@ mod tests {
                         w2: matrix(&ctx, &[1.0, 1.0], 2, 1)?,
                         w3: matrix(&ctx, &[0.0, 1.0], 1, 2)?,
                     }],
+                    grouped_w1_ptrs: None,
+                    grouped_w3_ptrs: None,
+                    grouped_w2_ptrs: None,
                     shared_experts: None,
                 },
             }],

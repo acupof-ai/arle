@@ -1,0 +1,34 @@
+{
+  "results": [
+    {
+      "label": "math",
+      "elapsed_s": 0.5247253077104688,
+      "usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 1,
+        "total_tokens": 21
+      },
+      "text": "410"
+    },
+    {
+      "label": "write_zh",
+      "elapsed_s": 4.240483099129051,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 48,
+        "total_tokens": 73
+      },
+      "text": "本次更新显著提升了推理吞吐能力，在保持原有精度的前提下，吞吐性能提升达 **XX%**（请替换具体数值）。同时，优化了 **trace** 追踪机制，确保高并发场景下的请求链路清晰"
+    },
+    {
+      "label": "decode16",
+      "elapsed_s": 1.6491450858302414,
+      "usage": {
+        "prompt_tokens": 21,
+        "completion_tokens": 16,
+        "total_tokens": 37
+      },
+      "text": "alpha beta gamma start small steps.  \nnext step delta.  \nthen epsilon."
+    }
+  ]
+}
