@@ -10,7 +10,7 @@ use anyhow::{Result, bail, ensure};
 use cuda_kernels::{
     ffi,
     prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
-    tensor::{CudaPipelineFence, CudaPipelineStreamKind, WeightFormat},
+    tensor::{CudaAllocTraceExt, CudaPipelineFence, CudaPipelineStreamKind, WeightFormat},
 };
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -1404,11 +1404,11 @@ impl DeepseekV4MoeBlock {
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
         let mut route_indices = ctx
             .stream
-            .alloc_zeros::<i32>(hidden.seq_len * config.num_experts_per_tok)
+            .alloc_zeros_traced::<i32>(hidden.seq_len * config.num_experts_per_tok)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 route index alloc failed: {err}"))?;
         let mut route_weights = ctx
             .stream
-            .alloc_zeros::<f32>(hidden.seq_len * config.num_experts_per_tok)
+            .alloc_zeros_traced::<f32>(hidden.seq_len * config.num_experts_per_tok)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 route weight alloc failed: {err}"))?;
         dsv4_moe_trace_end(ctx, "ffn_route_setup", layer_idx, hidden.seq_len, trace)?;
 
@@ -1489,7 +1489,7 @@ impl DeepseekV4MoeBlock {
             .map_err(|_| anyhow::anyhow!("DeepSeek V4 experts_per_rank overflows i32"))?;
         let mut local_counts = ctx
             .stream
-            .alloc_zeros::<i32>(ep.experts_per_rank)
+            .alloc_zeros_traced::<i32>(ep.experts_per_rank)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route count alloc failed: {err}"))?;
         let trace = dsv4_moe_trace_begin(ctx)?;
         {
@@ -1550,16 +1550,16 @@ impl DeepseekV4MoeBlock {
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route offsets H2D failed: {err}"))?;
         let mut pack_cursors = ctx
             .stream
-            .alloc_zeros::<i32>(ep.experts_per_rank)
+            .alloc_zeros_traced::<i32>(ep.experts_per_rank)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route cursor alloc failed: {err}"))?;
         let mut packed_hidden = HiddenStates::zeros(ctx, hidden.hidden_dim, total_local_routes)?;
         let mut packed_token = ctx
             .stream
-            .alloc_zeros::<i32>(total_local_routes)
+            .alloc_zeros_traced::<i32>(total_local_routes)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed token alloc failed: {err}"))?;
         let mut packed_weight = ctx
             .stream
-            .alloc_zeros::<f32>(total_local_routes)
+            .alloc_zeros_traced::<f32>(total_local_routes)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed weight alloc failed: {err}"))?;
         dsv4_moe_trace_end(
             ctx,
@@ -2203,61 +2203,61 @@ impl DeepseekV4MoeBlock {
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
             route_indices_owned = ctx
                 .stream
-                .alloc_zeros::<i32>(hidden.seq_len * config.num_experts_per_tok)
+                .alloc_zeros_traced::<i32>(hidden.seq_len * config.num_experts_per_tok)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 route index alloc failed: {err}"))?;
             route_weights_owned = ctx
                 .stream
-                .alloc_zeros::<f32>(hidden.seq_len * config.num_experts_per_tok)
+                .alloc_zeros_traced::<f32>(hidden.seq_len * config.num_experts_per_tok)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 route weight alloc failed: {err}"))?;
             send_rank_counts_owned = ctx
                 .stream
-                .alloc_zeros::<i32>(ep.world_size)
+                .alloc_zeros_traced::<i32>(ep.world_size)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 rank count alloc failed: {err}"))?;
-            send_offsets_gpu_owned =
-                ctx.stream
-                    .alloc_zeros::<i32>(ep.world_size)
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 rank route offset alloc failed: {err}")
-                    })?;
+            send_offsets_gpu_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.world_size)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 rank route offset alloc failed: {err}")
+                })?;
             rank_cursors_owned = ctx
                 .stream
-                .alloc_zeros::<i32>(ep.world_size)
+                .alloc_zeros_traced::<i32>(ep.world_size)
                 .map_err(|err| {
                     anyhow::anyhow!("DeepSeek V4 rank route cursor alloc failed: {err}")
                 })?;
             send_hidden_owned = HiddenStates::zeros(ctx, hidden.hidden_dim, send_route_capacity)?;
             send_meta_owned = ctx
                 .stream
-                .alloc_zeros::<i32>(send_route_capacity * 3)
+                .alloc_zeros_traced::<i32>(send_route_capacity * 3)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 send meta alloc failed: {err}"))?;
             all_rank_counts_owned = ctx
                 .stream
-                .alloc_zeros::<i32>(ep.world_size * ep.world_size)
+                .alloc_zeros_traced::<i32>(ep.world_size * ep.world_size)
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 all rank count alloc failed: {err}"))?;
-            recv_rank_counts_owned =
-                ctx.stream
-                    .alloc_zeros::<i32>(ep.world_size)
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 recv rank count alloc failed: {err}")
-                    })?;
-            local_counts_owned =
-                ctx.stream
-                    .alloc_zeros::<i32>(ep.experts_per_rank)
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 recv local count alloc failed: {err}")
-                    })?;
-            local_offsets_gpu_owned =
-                ctx.stream
-                    .alloc_zeros::<i32>(ep.experts_per_rank)
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 recv local offsets alloc failed: {err}")
-                    })?;
-            local_cursors_owned =
-                ctx.stream
-                    .alloc_zeros::<i32>(ep.experts_per_rank)
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 recv local cursor alloc failed: {err}")
-                    })?;
+            recv_rank_counts_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.world_size)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 recv rank count alloc failed: {err}")
+                })?;
+            local_counts_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 recv local count alloc failed: {err}")
+                })?;
+            local_offsets_gpu_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 recv local offsets alloc failed: {err}")
+                })?;
+            local_cursors_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 recv local cursor alloc failed: {err}")
+                })?;
             (
                 &token_ids_gpu_owned,
                 &mut route_indices_owned,
@@ -2439,12 +2439,12 @@ impl DeepseekV4MoeBlock {
         if send_route_scratch.is_none() {
             send_token_owned = Some(
                 ctx.stream
-                    .alloc_zeros::<i32>(send_route_capacity)
+                    .alloc_zeros_traced::<i32>(send_route_capacity)
                     .map_err(|err| anyhow::anyhow!("DeepSeek V4 send token alloc failed: {err}"))?,
             );
             send_route_slot_owned = Some(
                 ctx.stream
-                    .alloc_zeros::<i32>(send_route_capacity)
+                    .alloc_zeros_traced::<i32>(send_route_capacity)
                     .map_err(|err| {
                         anyhow::anyhow!("DeepSeek V4 send route slot alloc failed: {err}")
                     })?,
@@ -2597,7 +2597,7 @@ impl DeepseekV4MoeBlock {
             )?);
             recv_meta_owned = Some(
                 ctx.stream
-                    .alloc_zeros::<i32>(total_recv_routes * 3)
+                    .alloc_zeros_traced::<i32>(total_recv_routes * 3)
                     .map_err(|err| anyhow::anyhow!("DeepSeek V4 recv meta alloc failed: {err}"))?,
             );
             route_out_owned = Some(HiddenStates::zeros(
@@ -2645,14 +2645,24 @@ impl DeepseekV4MoeBlock {
                         .ok_or_else(|| {
                             anyhow::anyhow!("DeepSeek V4 dispatch payload elems overflow")
                         })?;
-                    send_payload_owned =
-                        Some(ctx.stream.alloc_zeros::<bf16>(elems).map_err(|err| {
-                            anyhow::anyhow!("DeepSeek V4 dispatch send payload alloc failed: {err}")
-                        })?);
-                    recv_payload_owned =
-                        Some(ctx.stream.alloc_zeros::<bf16>(elems).map_err(|err| {
-                            anyhow::anyhow!("DeepSeek V4 dispatch recv payload alloc failed: {err}")
-                        })?);
+                    send_payload_owned = Some(
+                        ctx.stream
+                            .alloc_zeros_traced::<bf16>(elems)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DeepSeek V4 dispatch send payload alloc failed: {err}"
+                                )
+                            })?,
+                    );
+                    recv_payload_owned = Some(
+                        ctx.stream
+                            .alloc_zeros_traced::<bf16>(elems)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DeepSeek V4 dispatch recv payload alloc failed: {err}"
+                                )
+                            })?,
+                    );
                     (
                         send_payload_owned
                             .as_mut()
@@ -2869,14 +2879,14 @@ impl DeepseekV4MoeBlock {
                     )?);
                     expert_weight_owned = Some(
                         ctx.stream
-                            .alloc_zeros::<f32>(total_local_routes)
+                            .alloc_zeros_traced::<f32>(total_local_routes)
                             .map_err(|err| {
                                 anyhow::anyhow!("DeepSeek V4 expert weight alloc failed: {err}")
                             })?,
                     );
                     expert_route_slot_owned = Some(
                         ctx.stream
-                            .alloc_zeros::<i32>(total_local_routes)
+                            .alloc_zeros_traced::<i32>(total_local_routes)
                             .map_err(|err| {
                                 anyhow::anyhow!("DeepSeek V4 expert route-slot alloc failed: {err}")
                             })?,
@@ -3467,28 +3477,32 @@ impl DeepseekV4MoeBlock {
                 Dsv4CombineExchangeMode::Fp8 => {
                     let mut combine_fp8_send = ctx
                         .stream
-                        .alloc_zeros::<u8>(total_recv_routes * hidden.hidden_dim)
+                        .alloc_zeros_traced::<u8>(total_recv_routes * hidden.hidden_dim)
                         .map_err(|err| {
                             anyhow::anyhow!("DeepSeek V4 combine FP8 send alloc failed: {err}")
                         })?;
                     let mut combine_fp8_recv = ctx
                         .stream
-                        .alloc_zeros::<u8>(total_send_routes * hidden.hidden_dim)
+                        .alloc_zeros_traced::<u8>(total_send_routes * hidden.hidden_dim)
                         .map_err(|err| {
                             anyhow::anyhow!("DeepSeek V4 combine FP8 recv alloc failed: {err}")
                         })?;
                     let mut combine_scale_send = ctx
                         .stream
-                        .alloc_zeros::<f32>(total_recv_routes)
+                        .alloc_zeros_traced::<f32>(total_recv_routes)
                         .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 combine FP8 send-scale alloc failed: {err}")
-                    })?;
+                            anyhow::anyhow!(
+                                "DeepSeek V4 combine FP8 send-scale alloc failed: {err}"
+                            )
+                        })?;
                     let mut combine_scale_recv = ctx
                         .stream
-                        .alloc_zeros::<f32>(total_send_routes)
+                        .alloc_zeros_traced::<f32>(total_send_routes)
                         .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 combine FP8 recv-scale alloc failed: {err}")
-                    })?;
+                            anyhow::anyhow!(
+                                "DeepSeek V4 combine FP8 recv-scale alloc failed: {err}"
+                            )
+                        })?;
                     dsv4_run_fp8_combine_exchange(
                         ctx,
                         comm,
