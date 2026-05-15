@@ -1021,6 +1021,18 @@ fn dsv4_combine_exchange_mode() -> Result<Dsv4CombineExchangeMode> {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn dsv4_reduce_scatter_combine_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_COMBINE_REDUCE_SCATTER").ok() else {
+        return Ok(true);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
+        other => bail!("invalid ARLE_DSV4_COMBINE_REDUCE_SCATTER value `{other}`"),
+    }
+}
+
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 #[allow(clippy::too_many_arguments)]
 fn dsv4_run_fp8_combine_exchange(
@@ -3092,6 +3104,8 @@ impl DeepseekV4MoeBlock {
         let combine_mode = dsv4_combine_exchange_mode()?;
         let use_padded_bf16_combine =
             use_padded_dispatch && matches!(combine_mode, Dsv4CombineExchangeMode::Bf16);
+        let use_reduce_scatter_combine =
+            use_padded_bf16_combine && dsv4_reduce_scatter_combine_enabled()?;
         let (peer_hidden_offsets, peer_hidden_counts) = if use_padded_bf16_combine {
             (
                 dsv4_scale_usize(&peer_offsets, hidden.hidden_dim)?,
@@ -3143,6 +3157,47 @@ impl DeepseekV4MoeBlock {
             };
             let combine_exchange_trace = dsv4_moe_trace_begin(ctx)?;
             match combine_mode {
+                Dsv4CombineExchangeMode::Bf16
+                    if use_padded_bf16_combine && use_reduce_scatter_combine =>
+                {
+                    ensure!(
+                        total_recv_routes
+                            == ep.world_size.saturating_mul(config.num_experts_per_tok)
+                            && total_send_routes
+                                == ep.world_size.saturating_mul(config.num_experts_per_tok),
+                        "DeepSeek V4 padded reduce-scatter combine expected fixed route rows send={} recv={} ep={} topk={}",
+                        total_send_routes,
+                        total_recv_routes,
+                        ep.world_size,
+                        config.num_experts_per_tok
+                    );
+                    {
+                        let (route_ptr, _route_guard) = route_out.data.device_ptr(&ctx.stream);
+                        let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+                        let (peer_ptr, _peer_guard) =
+                            scratch.route_slot_out.data.device_ptr_mut(&ctx.stream);
+                        unsafe {
+                            ffi::dsv4_sum_padded_route_outputs_by_peer_cuda(
+                                route_ptr as *const ffi::Half,
+                                meta_ptr as *const i32,
+                                peer_ptr as *mut ffi::Half,
+                                ep_world_i32,
+                                topk_i32,
+                                hidden.hidden_dim as i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 padded route peer sum failed: {err}")
+                            })?;
+                        }
+                    }
+                    comm.moe_reduce_scatter_bf16(
+                        &scratch.route_slot_out.data,
+                        hidden.hidden_dim,
+                        &mut out.data,
+                    )?;
+                }
                 Dsv4CombineExchangeMode::Bf16 if use_padded_bf16_combine => {
                     ensure!(
                         total_recv_routes
@@ -3225,7 +3280,9 @@ impl DeepseekV4MoeBlock {
                 hidden.seq_len,
                 combine_exchange_trace,
             )?;
-            if use_padded_bf16_combine {
+            if use_reduce_scatter_combine {
+                // The reduce-scatter path writes the final owner-rank hidden row directly to `out`.
+            } else if use_padded_bf16_combine {
                 run_padded_peer_combine_kernel(&scratch.combine_recv, &mut out)?;
             } else {
                 run_combine_kernel(
@@ -3246,6 +3303,48 @@ impl DeepseekV4MoeBlock {
             )?;
             let combine_exchange_trace = dsv4_moe_trace_begin(ctx)?;
             match combine_mode {
+                Dsv4CombineExchangeMode::Bf16
+                    if use_padded_bf16_combine && use_reduce_scatter_combine =>
+                {
+                    ensure!(
+                        total_recv_routes
+                            == ep.world_size.saturating_mul(config.num_experts_per_tok)
+                            && total_send_routes
+                                == ep.world_size.saturating_mul(config.num_experts_per_tok),
+                        "DeepSeek V4 padded reduce-scatter combine expected fixed route rows send={} recv={} ep={} topk={}",
+                        total_send_routes,
+                        total_recv_routes,
+                        ep.world_size,
+                        config.num_experts_per_tok
+                    );
+                    let mut peer_send =
+                        unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, ep.world_size)? };
+                    {
+                        let (route_ptr, _route_guard) = route_out.data.device_ptr(&ctx.stream);
+                        let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+                        let (peer_ptr, _peer_guard) = peer_send.data.device_ptr_mut(&ctx.stream);
+                        unsafe {
+                            ffi::dsv4_sum_padded_route_outputs_by_peer_cuda(
+                                route_ptr as *const ffi::Half,
+                                meta_ptr as *const i32,
+                                peer_ptr as *mut ffi::Half,
+                                ep_world_i32,
+                                topk_i32,
+                                hidden.hidden_dim as i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 padded route peer sum failed: {err}")
+                            })?;
+                        }
+                    }
+                    comm.moe_reduce_scatter_bf16(
+                        &peer_send.data,
+                        hidden.hidden_dim,
+                        &mut out.data,
+                    )?;
+                }
                 Dsv4CombineExchangeMode::Bf16 if use_padded_bf16_combine => {
                     let mut peer_send =
                         unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, ep.world_size)? };
@@ -3342,7 +3441,9 @@ impl DeepseekV4MoeBlock {
                 hidden.seq_len,
                 combine_exchange_trace,
             )?;
-            if use_padded_bf16_combine {
+            if use_reduce_scatter_combine {
+                // The reduce-scatter path writes the final owner-rank hidden row directly to `out`.
+            } else if use_padded_bf16_combine {
                 run_padded_peer_combine_kernel(&combine_recv, &mut out)?;
             } else {
                 run_combine_kernel(&combine_recv, None, &mut out)?;
