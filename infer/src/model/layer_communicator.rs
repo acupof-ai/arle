@@ -35,6 +35,7 @@ pub enum LayerCommStatus {
     NoopSingleRank,
     AllReduceSum,
     GroupedSendRecv,
+    ReduceScatter,
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +345,27 @@ impl LayerCommunicator {
             recv_counts,
         )?;
         Ok(LayerCommStatus::GroupedSendRecv)
+    }
+
+    /// EP-axis BF16 reduce-scatter for padded DeepEP-style MoE combine.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_reduce_scatter_bf16(
+        &self,
+        sendbuf: &CudaSlice<bf16>,
+        recv_count: usize,
+        recvbuf: &mut CudaSlice<bf16>,
+    ) -> Result<LayerCommStatus> {
+        if self.ep_world_size == 1 {
+            return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        let Some(nccl) = self.ep_nccl.as_ref() else {
+            bail!(
+                "MoE BF16 reduce-scatter requires EP NCCL backend for world_size={}",
+                self.ep_world_size
+            );
+        };
+        nccl.reduce_scatter_bf16_device(sendbuf, recv_count, recvbuf)?;
+        Ok(LayerCommStatus::ReduceScatter)
     }
 
     /// EP-axis grouped I32 send/recv for DeepEP-style MoE metadata exchange.

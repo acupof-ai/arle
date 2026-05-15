@@ -151,6 +151,18 @@ Related governance docs:
 
 ### CUDA
 
+- Added a default DSv4 B=1 padded BF16 combine reduce-scatter path behind
+  `ARLE_DSV4_COMBINE_REDUCE_SCATTER` (default `1`). Expert ranks now sum padded
+  route outputs into one row per origin peer and call NCCL `ReduceScatter`
+  directly into the owner-rank output hidden row, with `0` preserving the prior
+  grouped SendRecv combine. Real 8xH20 DSv4 validation against
+  `/root/DeepSeek-V4-Flash` keeps normal Chinese/English streaming output and
+  exact arithmetic `410`; `decode64` measures 12.05 post-first tok/s. The
+  matching single-token nsys wave moves from 97.071 ms to 94.923 ms, replacing
+  the old 23.163 ms SendRecv combine bucket with a 20.443 ms ReduceScatter
+  bucket plus 3.259 ms residual SendRecv. This is a modest communication-shape
+  cleanup; local expert grouped GEMM/DeepGEMM, DeepEP overlap, launch reduction,
+  scratch reuse, and D2H readback removal remain the main performance targets.
 - Reused per-layer DSv4 DeepEP dispatch scratch for route setup, rank count
   exchange buffers, packed send hidden rows/metadata, and local expert
   count/offset/cursor buffers. On the 8xH20 default path, trace-off math smoke

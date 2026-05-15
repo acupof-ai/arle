@@ -110,6 +110,23 @@ Current trace set:
   SendRecv/AllReduce, D2H route-count synchronization, launch/runtime overhead,
   local expert FP8/FP4 GEMV, and attention/MHC kernels; sampler is not visible
   in the top stack.
+- [`nsys-single-decode-token-direct-20260515-0829/`](nsys-single-decode-token-direct-20260515-0829/)
+  is the direct single-token nsys request used to answer where one generated
+  token is slow on the current default path. It returns `406` and measures a
+  97.071 ms decode wave. The largest buckets are NCCL SendRecv at 23.163 ms,
+  local expert FP8/FP4 GEMV at 11.476/10.851 ms, AllReduce at 7.505 ms,
+  attention at 7.399 ms, and large runtime overhead from kernel launches,
+  async allocation/free, D2H readbacks, memsets, and event waits.
+- [`bench-reduce-scatter-combine/`](bench-reduce-scatter-combine/) and
+  [`nsys-single-decode-token-reduce-scatter-combine/`](nsys-single-decode-token-reduce-scatter-combine/)
+  validate the default-on `ARLE_DSV4_COMBINE_REDUCE_SCATTER=1` path for B=1
+  padded BF16 combine. The focused HTTP smoke keeps normal Chinese/English
+  output and exact arithmetic `410`; `decode64` reaches 12.05 post-first
+  tok/s. The single-token nsys wave moves from 97.071 ms to 94.923 ms, with
+  return-side combine visible as `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`
+  at 20.443 ms and residual `SendRecv` down to 3.259 ms per rank range. The
+  gain is limited; grouped GEMM/DeepGEMM plus DeepEP overlap remains the main
+  performance target.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789

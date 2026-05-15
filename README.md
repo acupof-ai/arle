@@ -168,6 +168,18 @@ Operators who want only the native serving binary can use `infer` directly (`car
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
+- **2026-05-15** — DSv4 DeepEP decode now has a default B=1 padded BF16
+  reduce-scatter combine path. `ARLE_DSV4_COMBINE_REDUCE_SCATTER=1` folds the
+  owner-rank return-side combine into NCCL `ReduceScatter` after each expert
+  rank pre-sums padded route outputs by origin peer; set it to `0` to force the
+  previous grouped SendRecv combine. Real 8xH20 validation against
+  `/root/DeepSeek-V4-Flash` keeps normal streaming output and exact `410`
+  arithmetic, with `decode64` at **12.05 post-first tok/s**. The matching
+  single-token nsys trace moves the decode wave from **97.071 ms** to
+  **94.923 ms**: return combine becomes `ReduceScatter` at **20.44 ms** per
+  rank range and residual `SendRecv` falls to **3.26 ms**. The remaining
+  bottlenecks are still local expert FP8/FP4 GEMV, AllReduce, attention/MHC,
+  launch overhead, async alloc/free, and D2H readbacks.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and

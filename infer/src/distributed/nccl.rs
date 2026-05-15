@@ -130,6 +130,45 @@ impl NcclGroup {
         )
     }
 
+    pub fn reduce_scatter_bf16_device(
+        &self,
+        sendbuf: &CudaSlice<bf16>,
+        recv_count: usize,
+        recvbuf: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        if recv_count == 0 {
+            return Ok(());
+        }
+        let expected_send = recv_count
+            .checked_mul(self.world_size)
+            .ok_or_else(|| anyhow!("NCCL reduce_scatter_bf16 send count overflow"))?;
+        if sendbuf.len() < expected_send {
+            bail!(
+                "NCCL reduce_scatter_bf16 rank {} send buffer len {} smaller than expected {}",
+                self.rank,
+                sendbuf.len(),
+                expected_send
+            );
+        }
+        if recvbuf.len() < recv_count {
+            bail!(
+                "NCCL reduce_scatter_bf16 rank {} recv buffer len {} smaller than count {}",
+                self.rank,
+                recvbuf.len(),
+                recv_count
+            );
+        }
+        let (src, _src_record) = sendbuf.device_ptr(&self.stream);
+        let (dst, _dst_record) = recvbuf.device_ptr_mut(&self.stream);
+        self.comm.reduce_scatter(
+            src as *const c_void,
+            dst as *mut c_void,
+            recv_count,
+            ncclDataType_t::Bfloat16,
+            &self.stream,
+        )
+    }
+
     /// Grouped point-to-point BF16 exchange for EP token dispatch/combine.
     ///
     /// `send_offsets/counts` and `recv_offsets/counts` are element offsets in
@@ -598,6 +637,32 @@ impl NcclComm {
         )
     }
 
+    fn reduce_scatter(
+        &self,
+        sendbuff: *const c_void,
+        recvbuff: *mut c_void,
+        recvcount: usize,
+        dtype: ncclDataType_t,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let api = nccl_api()?;
+        check_nccl(
+            unsafe {
+                (api.reduce_scatter)(
+                    sendbuff,
+                    recvbuff,
+                    recvcount,
+                    dtype,
+                    ncclRedOp_t::Sum,
+                    self.raw,
+                    stream.cu_stream() as *mut c_void,
+                )
+            },
+            "ncclReduceScatter",
+            api,
+        )
+    }
+
     fn all_gather(
         &self,
         sendbuff: *const c_void,
@@ -735,6 +800,15 @@ type NcclAllReduce = unsafe extern "C" fn(
     ncclComm_t,
     *mut c_void,
 ) -> ncclResult_t;
+type NcclReduceScatter = unsafe extern "C" fn(
+    *const c_void,
+    *mut c_void,
+    usize,
+    ncclDataType_t,
+    ncclRedOp_t,
+    ncclComm_t,
+    *mut c_void,
+) -> ncclResult_t;
 type NcclAllGather = unsafe extern "C" fn(
     *const c_void,
     *mut c_void,
@@ -778,6 +852,7 @@ struct NcclApi {
     comm_init_rank: NcclCommInitRank,
     comm_destroy: NcclCommDestroy,
     all_reduce: NcclAllReduce,
+    reduce_scatter: NcclReduceScatter,
     all_gather: NcclAllGather,
     broadcast: NcclBroadcast,
     send: NcclSend,
@@ -814,6 +889,7 @@ impl NcclApi {
             comm_init_rank: unsafe { load_symbol(handle, b"ncclCommInitRank\0")? },
             comm_destroy: unsafe { load_symbol(handle, b"ncclCommDestroy\0")? },
             all_reduce: unsafe { load_symbol(handle, b"ncclAllReduce\0")? },
+            reduce_scatter: unsafe { load_symbol(handle, b"ncclReduceScatter\0")? },
             all_gather: unsafe { load_symbol(handle, b"ncclAllGather\0")? },
             broadcast: unsafe { load_symbol(handle, b"ncclBroadcast\0")? },
             send: unsafe { load_symbol(handle, b"ncclSend\0")? },
