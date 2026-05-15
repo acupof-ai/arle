@@ -221,6 +221,19 @@ Current trace set:
   the matching trace-off HTTP smoke. Multi-token Chinese and English output
   remains normal, arithmetic returns exact `410`, and `decode64` reaches 12.06
   post-first tok/s.
+- [`nsys-single-decode-token-small-local-pack-prepare/`](nsys-single-decode-token-small-local-pack-prepare/)
+  validates fusing the B=1 padded DeepEP local expert prepare step. The new
+  small CUDA kernel clears local counts, counts received route metadata, writes
+  device-side local offsets, and clears pack cursors. The arithmetic request
+  returns exact `406`; H2D runtime calls drop from 1,040 to 696 and
+  `cuMemsetD8Async` drops from 1,232 calls / 1.558 ms per rank range to 544
+  calls / 0.728 ms. The single captured wave is 92.602 ms because D2H and
+  AllReduce timing were noisier than the prior rerun, so this is recorded as
+  small-call cleanup rather than a wall-time win.
+- [`bench-small-local-pack-prepare-smoke/`](bench-small-local-pack-prepare-smoke/)
+  records the matching trace-off HTTP smoke. Multi-token Chinese/English output
+  remains normal, arithmetic returns exact `410`, and `decode64` reaches 12.05
+  post-first tok/s.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789

@@ -2766,14 +2766,19 @@ impl DeepseekV4MoeBlock {
             };
 
             if !route_grouped_done {
-                dsv4_zero_i32_slice(ctx, local_counts, ep.experts_per_rank)?;
-                {
+                let prepared_small_local_pack =
+                    use_padded_dispatch && total_recv_routes <= 256 && ep.experts_per_rank <= 256;
+                if prepared_small_local_pack {
                     let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
                     let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
+                    let (offset_ptr, _offset_guard) = local_offsets_gpu.device_ptr_mut(&ctx.stream);
+                    let (cursor_ptr, _cursor_guard) = local_cursors.device_ptr_mut(&ctx.stream);
                     unsafe {
-                        ffi::dsv4_count_packed_local_experts_cuda(
+                        ffi::dsv4_prepare_packed_local_experts_small_cuda(
                             meta_ptr as *const i32,
                             count_ptr as *mut i32,
+                            offset_ptr as *mut i32,
+                            cursor_ptr as *mut i32,
                             total_recv_routes as i32,
                             local_expert_start_i32,
                             experts_per_rank_i32,
@@ -2781,8 +2786,30 @@ impl DeepseekV4MoeBlock {
                         )
                         .result()
                         .map_err(|err| {
-                            anyhow::anyhow!("DeepSeek V4 recv local expert count failed: {err}")
+                            anyhow::anyhow!(
+                                "DeepSeek V4 recv local expert small prepare failed: {err}"
+                            )
                         })?;
+                    }
+                } else {
+                    dsv4_zero_i32_slice(ctx, local_counts, ep.experts_per_rank)?;
+                    {
+                        let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+                        let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
+                        unsafe {
+                            ffi::dsv4_count_packed_local_experts_cuda(
+                                meta_ptr as *const i32,
+                                count_ptr as *mut i32,
+                                total_recv_routes as i32,
+                                local_expert_start_i32,
+                                experts_per_rank_i32,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DeepSeek V4 recv local expert count failed: {err}")
+                            })?;
+                        }
                     }
                 }
                 let local_counts_host = ctx.stream.clone_dtoh(local_counts).map_err(|err| {
@@ -2794,12 +2821,14 @@ impl DeepseekV4MoeBlock {
                 let local_counts_usize =
                     dsv4_counts_to_usize(&local_counts_host, "recv_local_counts")?;
                 let max_local_routes = local_counts_usize.iter().copied().max().unwrap_or(0);
-                ctx.stream
-                    .memcpy_htod(&local_offsets_i32, local_offsets_gpu)
-                    .map_err(|err| {
-                        anyhow::anyhow!("DeepSeek V4 recv local offsets H2D failed: {err}")
-                    })?;
-                dsv4_zero_i32_slice(ctx, local_cursors, ep.experts_per_rank)?;
+                if !prepared_small_local_pack {
+                    ctx.stream
+                        .memcpy_htod(&local_offsets_i32, local_offsets_gpu)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DeepSeek V4 recv local offsets H2D failed: {err}")
+                        })?;
+                    dsv4_zero_i32_slice(ctx, local_cursors, ep.experts_per_rank)?;
+                }
                 if !use_padded_dispatch {
                     ensure!(
                         total_local_routes == total_recv_routes,

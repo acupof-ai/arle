@@ -703,6 +703,60 @@ extern "C" CUresult dsv4_count_packed_local_experts_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_prepare_packed_local_experts_small_kernel(
+    const int32_t *__restrict__ packed_meta,
+    int32_t *__restrict__ counts,
+    int32_t *__restrict__ offsets,
+    int32_t *__restrict__ cursors,
+    int num_routes,
+    int local_expert_start,
+    int experts_per_rank) {
+  int tid = threadIdx.x;
+  for (int idx = tid; idx < experts_per_rank; idx += blockDim.x) {
+    counts[idx] = 0;
+    offsets[idx] = 0;
+    cursors[idx] = 0;
+  }
+  __syncthreads();
+
+  for (int route = tid; route < num_routes; route += blockDim.x) {
+    int expert = packed_meta[route * 3 + 1];
+    int local = expert - local_expert_start;
+    if (local >= 0 && local < experts_per_rank) {
+      atomicAdd(&counts[local], 1);
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int running = 0;
+    for (int idx = 0; idx < experts_per_rank; ++idx) {
+      int count = counts[idx];
+      offsets[idx] = running;
+      running += count;
+    }
+  }
+}
+
+extern "C" CUresult dsv4_prepare_packed_local_experts_small_cuda(
+    const int32_t *packed_meta,
+    int32_t *counts,
+    int32_t *offsets,
+    int32_t *cursors,
+    int num_routes,
+    int local_expert_start,
+    int experts_per_rank,
+    CUstream stream) {
+  if (num_routes < 0 || local_expert_start < 0 || experts_per_rank <= 0 ||
+      num_routes > DSV4_ROUTE_BLOCK || experts_per_rank > DSV4_ROUTE_BLOCK) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_prepare_packed_local_experts_small_kernel<<<1, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      packed_meta, counts, offsets, cursors, num_routes, local_expert_start,
+      experts_per_rank);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_pack_received_experts_kernel(
     const uint16_t *__restrict__ received_hidden,
     const int32_t *__restrict__ received_meta,
