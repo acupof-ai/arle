@@ -92,6 +92,13 @@ Related governance docs:
   costs are now explicit: `ncclDevKernel_SendRecv` at 50.338 ms per rank
   range, FP4 route pair GEMV at 19.616 ms, FP4 route `w2` GEMV at 10.487 ms,
   FP8 GEMV at 9.408 ms, plus allocator/free and launch overhead.
+- Added a fresh user-requested single-token `nsys` rerun under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-user/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-user/).
+  The real 8xH20 `/root/DeepSeek-V4-Flash` run returns exact arithmetic `406`
+  and measures a 94.841 ms decode wave. The slow stack is reduce-scatter
+  combine, local FP8/FP4 expert GEMV, residual all-reduce/send-recv,
+  attention/MHC/route kernels, and high per-token launch/alloc/free/D2H
+  runtime overhead, not sampler time.
 - Added the DSv4 default-path warm decode Nsight trace under
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
   The run warms a real decode first, then profiles a second single decode token
