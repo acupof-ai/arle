@@ -127,6 +127,15 @@ Current trace set:
   at 20.443 ms and residual `SendRecv` down to 3.259 ms per rank range. The
   gain is limited; grouped GEMM/DeepGEMM plus DeepEP overlap remains the main
   performance target.
+- [`nsys-single-decode-token-current-user/`](nsys-single-decode-token-current-user/)
+  is a fresh user-requested single-token `nsys` rerun of the current
+  default-on reduce-scatter path. The profiled arithmetic request returns
+  `406`, and the isolated decode wave measures 94.841 ms. The trace shows the
+  current slow stack directly: reduce-scatter combine at 20.549 ms per
+  rank-range, local FP8/FP4 expert GEMV at 11.471/11.103 ms, attention at
+  7.396 ms, all-reduce at 6.184 ms, route/MHC at 5.661/5.501 ms, plus large
+  runtime overhead from 16,176 kernel launches, 6,760 async allocations, 3,048
+  async frees, 3,640 memsets, and 344 D2H copies inside the decode range.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789
