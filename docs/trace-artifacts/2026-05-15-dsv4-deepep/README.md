@@ -170,10 +170,11 @@ Current trace set:
   concrete slow stack: 16,177 CUDA kernel launches at 34.159 ms per rank range,
   reduce-scatter combine at 20.122 ms, local FP8/FP4 expert GEMV at
   11.474/11.109 ms, all-reduce at 8.978 ms, attention at 7.394 ms, route/MHC at
-  5.660/5.500 ms, and 347 D2H calls at 7.306 ms. This is not a sampler issue
-  and not a missing-KV/full-prefill failure; the next target remains removing
-  local-count host sync, real grouped GEMM/DeepGEMM, launch/runtime
-  consolidation, and DeepEP combine overlap/fusion.
+  5.660/5.500 ms, and 347 D2H calls at 7.306 ms. The D2H activity payload is
+  only 44,044 bytes, so the cost is synchronization/call overhead rather than
+  bandwidth. This is not a sampler issue and not a missing-KV/full-prefill
+  failure; the next target remains removing local-count host sync, real grouped
+  GEMM/DeepGEMM, launch/runtime consolidation, and DeepEP combine overlap/fusion.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789

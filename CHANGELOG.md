@@ -127,8 +127,9 @@ Related governance docs:
   and measures a 105.205 ms isolated second-token decode wave. The top stack is
   now explicit: 16,177 CUDA launches, reduce-scatter combine, local FP8/FP4
   expert GEMV, all-reduce, attention/MHC/route kernels, and 347 D2H calls for
-  per-layer synchronization. This confirms the current issue is MoE
-  communication/compute plus launch/runtime granularity, not sampler time.
+  per-layer synchronization. The actual D2H activity payload is only 44,044
+  bytes, confirming the current issue is MoE communication/compute plus
+  launch/runtime synchronization granularity, not sampler time or copy bandwidth.
 - Added the DSv4 default-path warm decode Nsight trace under
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
   The run warms a real decode first, then profiles a second single decode token
