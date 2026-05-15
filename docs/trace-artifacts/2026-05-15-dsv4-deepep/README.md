@@ -155,6 +155,14 @@ Current trace set:
   confirms default-off decode throughput remains at the current 12.05
   post-first tok/s baseline, while `prefill4k` still OOMs under the low
   `mem_fraction_static=0.10` profile.
+- [`nsys-single-decode-token-attn-proj-scratch/`](nsys-single-decode-token-attn-proj-scratch/)
+  validates per-layer incremental attention projection scratch reuse for
+  `c_q`, `c_q_normed`, `q_raw`, `kv_raw`, and `kv_normed`. It returns exact
+  arithmetic `406` and moves the single-token decode wave from 94.841 ms to
+  90.946 ms, with `cuMemAllocAsync` calls down from 6,760 to 5,040 and
+  `cuMemFreeAsync` calls down from 3,048 to 1,328. The matching
+  [`bench-attn-proj-scratch/`](bench-attn-proj-scratch/) smoke keeps normal
+  math and writing output, with `decode64` at 11.89 post-first tok/s.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789
