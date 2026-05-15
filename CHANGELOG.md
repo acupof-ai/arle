@@ -130,6 +130,19 @@ Related governance docs:
   per-layer synchronization. The actual D2H activity payload is only 44,044
   bytes, confirming the current issue is MoE communication/compute plus
   launch/runtime synchronization granularity, not sampler time or copy bandwidth.
+- Switched additional full-write DSv4 runtime scratch buffers from zeroed
+  allocation to uninitialized allocation: expert/shared/grouped hidden scratch,
+  route logits, per-layer hidden scratch, and MHC parameter scratch. The real
+  8xH20 single-token `nsys` trace under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expanded-uninit/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expanded-uninit/)
+  returns exact arithmetic `406`, moves the isolated decode wave from
+  105.205 ms to 88.554 ms, and cuts `cuMemsetD8Async` from 3,640 calls /
+  6.932 ms per rank range to 1,920 calls / 2.839 ms. The trace still points at
+  reduce-scatter combine and local FP8/FP4 expert GEMV as the main bottlenecks.
+  The matching HTTP smoke under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-expanded-uninit-smoke/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-expanded-uninit-smoke/)
+  keeps normal Chinese/English multi-token output, exact math `410`, and
+  `decode64` at 11.94 post-first tok/s.
 - Moved DSv4 grouped expert weight/scale pointer tables into
   `DeepseekV4MoeBlock` load-time caches for the opt-in grouped/route-grouped
   expert paths and future raw-pointer DeepGEMM integration. On the real 8xH20

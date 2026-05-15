@@ -194,6 +194,20 @@ Current trace set:
   bandwidth. This is not a sampler issue and not a missing-KV/full-prefill
   failure; the next target remains removing local-count host sync, real grouped
   GEMM/DeepGEMM, launch/runtime consolidation, and DeepEP combine overlap/fusion.
+- [`nsys-single-decode-token-expanded-uninit/`](nsys-single-decode-token-expanded-uninit/)
+  validates switching additional full-write DSv4 runtime scratch buffers
+  (`HiddenStates`, MHC parameter buffers, and route logits) from zeroed
+  allocation to uninitialized allocation. The same arithmetic request returns
+  exact `406`; the isolated decode wave moves from 105.205 ms to 88.554 ms,
+  and `cuMemsetD8Async` drops from 3,640 calls / 6.932 ms per rank range to
+  1,920 calls / 2.839 ms. The remaining top costs are still reduce-scatter
+  combine at 20.342 ms, local FP8/FP4 expert GEMV at 11.477/11.108 ms,
+  attention/MHC/route kernels, and 16,177 CUDA launches, so the next large
+  target remains real grouped GEMM/DeepGEMM plus DeepEP combine fusion/overlap.
+- [`bench-expanded-uninit-smoke/`](bench-expanded-uninit-smoke/) records the
+  matching trace-off HTTP smoke for the expanded uninit change. Multi-token
+  Chinese and English output remains normal, arithmetic returns exact `410`,
+  and `decode64` reaches 11.94 post-first tok/s.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789

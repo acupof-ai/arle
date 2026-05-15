@@ -322,11 +322,11 @@ impl DeepseekMoeRuntimeCache {
                 hidden_dim,
                 intermediate_dim,
                 output_dim,
-                input: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
-                gate: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
-                up: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
-                act: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
-                out: HiddenStates::zeros(ctx, output_dim, capacity_tokens)?,
+                input: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_tokens)? },
+                gate: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_tokens)? },
+                up: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_tokens)? },
+                act: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_tokens)? },
+                out: unsafe { HiddenStates::uninit(ctx, output_dim, capacity_tokens)? },
             });
         }
         Ok(self
@@ -360,11 +360,11 @@ impl DeepseekMoeRuntimeCache {
                 hidden_dim,
                 intermediate_dim,
                 output_dim,
-                input: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
-                gate: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
-                up: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
-                act: HiddenStates::zeros(ctx, intermediate_dim, capacity_tokens)?,
-                out: HiddenStates::zeros(ctx, output_dim, capacity_tokens)?,
+                input: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_tokens)? },
+                gate: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_tokens)? },
+                up: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_tokens)? },
+                act: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_tokens)? },
+                out: unsafe { HiddenStates::uninit(ctx, output_dim, capacity_tokens)? },
             });
         }
         Ok(self
@@ -395,10 +395,10 @@ impl DeepseekMoeRuntimeCache {
                 capacity_routes,
                 hidden_dim,
                 intermediate_dim,
-                gate: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
-                up: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
-                act: HiddenStates::zeros(ctx, intermediate_dim, capacity_routes)?,
-                out: HiddenStates::zeros(ctx, hidden_dim, capacity_routes)?,
+                gate: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_routes)? },
+                up: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_routes)? },
+                act: unsafe { HiddenStates::uninit(ctx, intermediate_dim, capacity_routes)? },
+                out: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
                 w1_ptrs: None,
                 w3_ptrs: None,
                 w2_ptrs: None,
@@ -460,7 +460,7 @@ pub(crate) fn ensure_route_logits_scratch<'a>(
         *slot = Some(DeepseekRouteLogitsRuntimeScratch {
             capacity_tokens,
             n_experts,
-            logits: HiddenStates::zeros(ctx, n_experts, capacity_tokens)?,
+            logits: unsafe { HiddenStates::uninit(ctx, n_experts, capacity_tokens)? },
         });
     }
     Ok(slot
@@ -629,12 +629,13 @@ pub(crate) fn ensure_mhc_scratch<'a>(
             stream_hidden_dim,
             mix_dim,
             hc_mult,
-            mixes: HiddenStates::zeros(ctx, mix_dim, capacity_tokens)?,
-            pre: ctx.stream.alloc_zeros::<f32>(capacity_tokens * hc_mult)?,
-            post: ctx.stream.alloc_zeros::<f32>(capacity_tokens * hc_mult)?,
-            comb: ctx
-                .stream
-                .alloc_zeros::<f32>(capacity_tokens * hc_mult * hc_mult)?,
+            mixes: unsafe { HiddenStates::uninit(ctx, mix_dim, capacity_tokens)? },
+            pre: unsafe { ctx.stream.alloc::<f32>(capacity_tokens * hc_mult)? },
+            post: unsafe { ctx.stream.alloc::<f32>(capacity_tokens * hc_mult)? },
+            comb: unsafe {
+                ctx.stream
+                    .alloc::<f32>(capacity_tokens * hc_mult * hc_mult)?
+            },
         });
     }
     Ok(slot.as_mut().expect("DeepSeek V4 MHC scratch allocated"))
@@ -658,7 +659,7 @@ pub(crate) fn ensure_hidden_scratch<'a>(
         *slot = Some(DeepseekHiddenRuntimeScratch {
             capacity_tokens,
             hidden_dim,
-            hidden: HiddenStates::zeros(ctx, hidden_dim, capacity_tokens)?,
+            hidden: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_tokens)? },
         });
     }
     let scratch = slot.as_mut().expect("DeepSeek V4 hidden scratch allocated");
