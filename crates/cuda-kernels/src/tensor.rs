@@ -17,6 +17,7 @@ use super::ffi;
 /// Two-stream architecture for overlapping H2D/D2H transfers with compute:
 /// - `stream` (compute): all GPU kernels, CUDA Graph capture/replay
 /// - `copy_stream`: async H2D/D2H transfers, runs concurrently with compute
+/// - `comm_stream`: communication collectives that can overlap independent compute
 ///
 /// Cross-stream sync uses raw CUDA events (not cudarc's automatic tracking,
 /// which breaks CUDA Graph capture).
@@ -26,6 +27,8 @@ pub struct DeviceContext {
     pub stream: Arc<CudaStream>,
     /// Separate stream for async H2D/D2H memory copies.
     pub copy_stream: Arc<CudaStream>,
+    /// Separate stream for NCCL/communication work that can overlap compute.
+    pub comm_stream: Arc<CudaStream>,
     /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
 }
@@ -42,6 +45,8 @@ pub enum CudaPipelineStreamKind {
     /// Dedicated transfer stream for H2D/D2H work that can be ordered with
     /// compute via explicit events.
     Copy,
+    /// Dedicated communication stream for NCCL collectives and P2P exchanges.
+    Comm,
 }
 
 /// Result of a non-blocking CUDA pipeline fence poll.
@@ -191,6 +196,10 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA copy stream: {}", e))?;
 
+        let comm_stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("Failed to create CUDA communication stream: {}", e))?;
+
         // Initialize cuBLAS handle
         unsafe {
             ffi::cublas_init();
@@ -200,6 +209,7 @@ impl DeviceContext {
             ctx,
             stream,
             copy_stream,
+            comm_stream,
             ordinal,
         })
     }
@@ -236,12 +246,20 @@ impl DeviceContext {
             .map_err(|e| anyhow!("Copy stream sync failed: {}", e))
     }
 
+    /// Synchronize communication stream.
+    pub fn sync_comm(&self) -> Result<()> {
+        self.comm_stream
+            .synchronize()
+            .map_err(|e| anyhow!("Communication stream sync failed: {}", e))
+    }
+
     /// Return the raw stream that backs a pipeline lane.
     #[must_use]
     pub fn pipeline_stream(&self, kind: CudaPipelineStreamKind) -> &Arc<CudaStream> {
         match kind {
             CudaPipelineStreamKind::Compute => &self.stream,
             CudaPipelineStreamKind::Copy => &self.copy_stream,
+            CudaPipelineStreamKind::Comm => &self.comm_stream,
         }
     }
 
@@ -328,6 +346,23 @@ impl DeviceContext {
     /// Use after H2D transfer completes to ensure compute kernels see the uploaded data.
     pub fn compute_waits_for_copy(&self) -> Result<()> {
         let fence = self.record_pipeline_fence(CudaPipelineStreamKind::Copy)?;
+        self.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Compute)
+    }
+
+    /// Record an event on the compute stream and make the communication stream wait for it.
+    ///
+    /// Use after kernels that produce collective inputs, so NCCL can run on
+    /// `comm_stream` without reading incomplete compute-stream data.
+    pub fn comm_waits_for_compute(&self) -> Result<()> {
+        let fence = self.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+        self.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Comm)
+    }
+
+    /// Record an event on the communication stream and make compute wait for it.
+    ///
+    /// Use before kernels consume collective outputs produced on `comm_stream`.
+    pub fn compute_waits_for_comm(&self) -> Result<()> {
+        let fence = self.record_pipeline_fence(CudaPipelineStreamKind::Comm)?;
         self.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Compute)
     }
 }

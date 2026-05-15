@@ -10,7 +10,7 @@ use anyhow::{Result, bail, ensure};
 use cuda_kernels::{
     ffi,
     prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
-    tensor::WeightFormat,
+    tensor::{CudaPipelineFence, CudaPipelineStreamKind, WeightFormat},
 };
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -1133,6 +1133,12 @@ pub(super) struct DeepseekV4MoeBlock {
 }
 
 #[cfg(feature = "cuda")]
+pub(super) struct DeepseekRoutedMoeOutput {
+    pub(super) hidden: HiddenStates,
+    pub(super) ready: Option<CudaPipelineFence>,
+}
+
+#[cfg(feature = "cuda")]
 #[allow(dead_code)] // method called from forward.rs once MoE kernels land
 impl DeepseekV4MoeBlock {
     /// Run routed V4 MoE for a packed `[tokens, hidden]` row block.
@@ -1168,7 +1174,7 @@ impl DeepseekV4MoeBlock {
         swiglu_limit: f32,
     ) -> Result<HiddenStates> {
         let routed = self.forward_local_routed_only(ctx, hidden, routing, swiglu_limit)?;
-        self.add_shared_expert(ctx, hidden, routed, swiglu_limit)
+        self.add_shared_expert(ctx, hidden, routed, None, swiglu_limit)
     }
 
     /// Run only this EP rank's routed expert contribution.
@@ -1220,12 +1226,19 @@ impl DeepseekV4MoeBlock {
         ctx: &DeviceContext,
         hidden: &HiddenStates,
         routed: HiddenStates,
+        routed_ready: Option<CudaPipelineFence>,
         swiglu_limit: f32,
     ) -> Result<HiddenStates> {
         let Some(shared) = &self.shared_experts else {
+            if let Some(fence) = routed_ready.as_ref() {
+                ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+            }
             return Ok(routed);
         };
         let shared = shared.forward(ctx, hidden, swiglu_limit)?;
+        if let Some(fence) = routed_ready.as_ref() {
+            ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+        }
         ops::add_batch(ctx, &routed, &shared)
     }
 
@@ -1234,10 +1247,14 @@ impl DeepseekV4MoeBlock {
         ctx: &DeviceContext,
         hidden: &HiddenStates,
         mut routed: HiddenStates,
+        routed_ready: Option<CudaPipelineFence>,
         swiglu_limit: f32,
         scratch_cache: &mut DeepseekMoeRuntimeCache,
     ) -> Result<HiddenStates> {
         let Some(shared) = &self.shared_experts else {
+            if let Some(fence) = routed_ready.as_ref() {
+                ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+            }
             return Ok(routed);
         };
         let scratch = scratch_cache.ensure_shared_expert_scratch(
@@ -1248,6 +1265,9 @@ impl DeepseekV4MoeBlock {
             hidden.seq_len,
         )?;
         let shared = shared.forward_with_scratch(ctx, hidden, swiglu_limit, scratch)?;
+        if let Some(fence) = routed_ready.as_ref() {
+            ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+        }
         ops::add_batch_in_place(ctx, &mut routed, shared)?;
         Ok(routed)
     }
@@ -1959,7 +1979,7 @@ impl DeepseekV4MoeBlock {
         hidden: &HiddenStates,
         token_ids: &[u32],
         mut moe_scratch: Option<&mut DeepseekMoeRuntimeCache>,
-    ) -> Result<HiddenStates> {
+    ) -> Result<DeepseekRoutedMoeOutput> {
         ensure!(
             ep.world_size > 1,
             "DeepSeek V4 DeepEP-style MoE path requires ep_world_size > 1"
@@ -3010,6 +3030,7 @@ impl DeepseekV4MoeBlock {
             .max(total_recv_routes)
             .max(route_slot_capacity);
         let mut out = unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, hidden.seq_len)? };
+        let mut routed_ready = None;
         let run_combine_kernel = |combine_recv: &HiddenStates,
                                   route_slot_out: Option<&mut HiddenStates>,
                                   out: &mut HiddenStates|
@@ -3192,11 +3213,23 @@ impl DeepseekV4MoeBlock {
                             })?;
                         }
                     }
-                    comm.moe_reduce_scatter_bf16(
-                        &scratch.route_slot_out.data,
-                        hidden.hidden_dim,
-                        &mut out.data,
-                    )?;
+                    if comm.moe_reduce_scatter_bf16_can_overlap() {
+                        ctx.comm_waits_for_compute()?;
+                        let overlapped = comm.moe_reduce_scatter_bf16_overlap(
+                            &scratch.route_slot_out.data,
+                            hidden.hidden_dim,
+                            &mut out.data,
+                        )?;
+                        debug_assert!(overlapped);
+                        routed_ready =
+                            Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?);
+                    } else {
+                        comm.moe_reduce_scatter_bf16(
+                            &scratch.route_slot_out.data,
+                            hidden.hidden_dim,
+                            &mut out.data,
+                        )?;
+                    }
                 }
                 Dsv4CombineExchangeMode::Bf16 if use_padded_bf16_combine => {
                     ensure!(
@@ -3282,6 +3315,10 @@ impl DeepseekV4MoeBlock {
             )?;
             if use_reduce_scatter_combine {
                 // The reduce-scatter path writes the final owner-rank hidden row directly to `out`.
+                if routed_ready.is_some() && dsv4_moe_trace_enabled() {
+                    ctx.compute_waits_for_comm()?;
+                    routed_ready = None;
+                }
             } else if use_padded_bf16_combine {
                 run_padded_peer_combine_kernel(&scratch.combine_recv, &mut out)?;
             } else {
@@ -3462,7 +3499,10 @@ impl DeepseekV4MoeBlock {
                 cache.grouped = route_grouped_scratch_slot.take();
             }
         }
-        Ok(out)
+        Ok(DeepseekRoutedMoeOutput {
+            hidden: out,
+            ready: routed_ready,
+        })
     }
 
     #[cfg(test)]

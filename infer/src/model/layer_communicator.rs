@@ -52,6 +52,8 @@ pub struct LayerCommunicator {
     tp_nccl: Option<Arc<NcclGroup>>,
     #[cfg(feature = "nccl")]
     ep_nccl: Option<Arc<NcclGroup>>,
+    #[cfg(feature = "nccl")]
+    ep_overlap_nccl: Option<Arc<NcclGroup>>,
 }
 
 impl LayerCommunicator {
@@ -69,6 +71,8 @@ impl LayerCommunicator {
             tp_nccl: None,
             #[cfg(feature = "nccl")]
             ep_nccl: None,
+            #[cfg(feature = "nccl")]
+            ep_overlap_nccl: None,
         }
     }
 
@@ -120,6 +124,8 @@ impl LayerCommunicator {
             tp_nccl: None,
             #[cfg(feature = "nccl")]
             ep_nccl: None,
+            #[cfg(feature = "nccl")]
+            ep_overlap_nccl: None,
         })
     }
 
@@ -160,6 +166,26 @@ impl LayerCommunicator {
             );
         }
         self.ep_nccl = Some(nccl);
+        Ok(self)
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn with_ep_overlap_nccl(mut self, nccl: Arc<NcclGroup>) -> Result<Self> {
+        if self.ep_world_size != nccl.world_size {
+            bail!(
+                "LayerCommunicator overlap EP world_size {} does not match NCCL world_size {}",
+                self.ep_world_size,
+                nccl.world_size
+            );
+        }
+        if self.ep_rank != nccl.rank {
+            bail!(
+                "LayerCommunicator overlap EP rank {} does not match NCCL rank {}",
+                self.ep_rank,
+                nccl.rank
+            );
+        }
+        self.ep_overlap_nccl = Some(nccl);
         Ok(self)
     }
 
@@ -366,6 +392,35 @@ impl LayerCommunicator {
         };
         nccl.reduce_scatter_bf16_device(sendbuf, recv_count, recvbuf)?;
         Ok(LayerCommStatus::ReduceScatter)
+    }
+
+    /// Whether an overlap EP communicator is available for reduce-scatter.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_reduce_scatter_bf16_can_overlap(&self) -> bool {
+        self.ep_world_size > 1 && self.ep_overlap_nccl.is_some()
+    }
+
+    /// EP-axis BF16 reduce-scatter for DeepEP-style overlap experiments.
+    ///
+    /// Returns `true` when the collective was enqueued on the overlap
+    /// communicator stream. Callers must explicitly order producer and
+    /// consumer streams with `DeviceContext` fences around this call.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn moe_reduce_scatter_bf16_overlap(
+        &self,
+        sendbuf: &CudaSlice<bf16>,
+        recv_count: usize,
+        recvbuf: &mut CudaSlice<bf16>,
+    ) -> Result<bool> {
+        if self.ep_world_size == 1 {
+            return Ok(false);
+        }
+        if let Some(nccl) = self.ep_overlap_nccl.as_ref() {
+            nccl.reduce_scatter_bf16_device(sendbuf, recv_count, recvbuf)?;
+            return Ok(true);
+        }
+        self.moe_reduce_scatter_bf16(sendbuf, recv_count, recvbuf)?;
+        Ok(false)
     }
 
     /// EP-axis grouped I32 send/recv for DeepEP-style MoE metadata exchange.

@@ -105,6 +105,15 @@ Related governance docs:
   94.936 ms versus 94.841 ms on the current default reference, and
   reduce-scatter combine is slightly worse at 21.371 ms per rank-range.
   Protocol selection alone is therefore not the next default decode fix.
+- Added an opt-in DSv4 return-combine overlap experiment behind
+  `ARLE_DSV4_COMBINE_OVERLAP=1`. The path creates a second EP NCCL
+  communicator on a dedicated communication stream and delays routed-output
+  consumption with an explicit CUDA fence so shared expert compute can overlap
+  the reduce-scatter. The real 8xH20 run returns exact arithmetic `406`, but
+  the trace regresses from 94.841 ms to 104.359 ms because all-reduce timing
+  and cross-stream event overhead outweigh the reduce-scatter improvement.
+  The matching default-off HTTP smoke still reaches 12.05 post-first tok/s,
+  so the overlap experiment remains disabled by default.
 - Added the DSv4 default-path warm decode Nsight trace under
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
   The run warms a real decode first, then profiles a second single decode token

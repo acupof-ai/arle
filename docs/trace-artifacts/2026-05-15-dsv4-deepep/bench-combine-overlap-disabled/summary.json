@@ -1,0 +1,45 @@
+{
+  "capture": "partial HTTP smoke, combine-overlap-capable binary with overlap disabled",
+  "model": "/root/DeepSeek-V4-Flash",
+  "hardware": "8xH20",
+  "env": {
+    "ARLE_DSV4_MOE_BACKEND": "deepep",
+    "ARLE_DSV4_INCREMENTAL_KV": "1",
+    "ARLE_DSV4_FUSED_DISPATCH_PAYLOAD": "1",
+    "ARLE_DSV4_COMBINE_REDUCE_SCATTER": "1",
+    "ARLE_DSV4_COMBINE_OVERLAP": "0",
+    "ARLE_CUDA_DISABLE_MARLIN_W4_FP8": "1"
+  },
+  "args": {
+    "kv_cache_dtype": "fp8",
+    "deepseek_distributed_layers": 43,
+    "mem_fraction_static": 0.10
+  },
+  "status": "partial",
+  "results": [
+    {
+      "label": "decode64",
+      "status": 200,
+      "prompt_tokens": 35,
+      "completion_tokens": 64,
+      "ttft_s": 0.7347,
+      "total_s": 5.964,
+      "post_first_decode_tok_s": 12.05,
+      "output_check": "normal English sequence"
+    },
+    {
+      "label": "prefill1k",
+      "status": 200,
+      "prompt_tokens": 1016,
+      "completion_tokens": 1,
+      "ttft_s": 15.419,
+      "total_s": 15.4192,
+      "output": "One"
+    },
+    {
+      "label": "prefill4k",
+      "status": "oom",
+      "note": "mem_fraction_static=0.10 profile exhausted memory; run was stopped after collecting decode64 and prefill1k"
+    }
+  ]
+}

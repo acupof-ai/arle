@@ -142,6 +142,19 @@ Current trace set:
   94.841 ms on the current default reference, with reduce-scatter combine
   slightly worse at 21.371 ms per rank-range. This stays a negative trace:
   changing NCCL protocol alone does not address the main decode bottleneck.
+- [`nsys-single-decode-token-combine-overlap/`](nsys-single-decode-token-combine-overlap/)
+  records the opt-in `ARLE_DSV4_COMBINE_OVERLAP=1` experiment. It returns
+  exact arithmetic `406`; reduce-scatter improves from 20.549 ms to
+  18.918 ms per rank-range, but the decode wave regresses to 104.359 ms
+  because all-reduce timing and cross-stream event overhead dominate.
+  The overlap path therefore stays default-off.
+- [`nsys-single-decode-token-combine-overlap-disabled/`](nsys-single-decode-token-combine-overlap-disabled/)
+  is the same binary with `ARLE_DSV4_COMBINE_OVERLAP=0`. It also returns exact
+  arithmetic `406` and is kept as a control trace. The matching
+  [`bench-combine-overlap-disabled/`](bench-combine-overlap-disabled/) smoke
+  confirms default-off decode throughput remains at the current 12.05
+  post-first tok/s baseline, while `prefill4k` still OOMs under the low
+  `mem_fraction_static=0.10` profile.
 - [`nsys-single-decode-token-uninit/`](nsys-single-decode-token-uninit/)
   validates uninitialized allocation for selected full-write temporary hidden
   buffers. The `霓彩` output remains normal, `cuMemsetD8Async` drops from 8,789

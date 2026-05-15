@@ -23,7 +23,7 @@ use super::load::{load_dsv4_matrix_raw_sharded, load_dsv4_vec_bf16};
 #[cfg(feature = "cuda")]
 use super::mla::{DeepseekV4Attention, DeepseekV4Compressor, DeepseekV4Indexer};
 #[cfg(feature = "cuda")]
-use super::mlp::{DeepseekV4Expert, DeepseekV4MoeBlock};
+use super::mlp::{DeepseekRoutedMoeOutput, DeepseekV4Expert, DeepseekV4MoeBlock};
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache, DeepseekHiddenRuntimeScratch,
@@ -222,6 +222,16 @@ impl DeepseekModel {
                     )?)
                 };
                 comm = comm.with_ep_nccl(group)?;
+
+                if dsv4_combine_overlap_enabled() {
+                    let overlap_group = Arc::new(NcclGroup::new_on_stream(
+                        config.ep.rank,
+                        config.ep.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(1)?,
+                        ctx.comm_stream.clone(),
+                    )?);
+                    comm = comm.with_ep_overlap_nccl(overlap_group)?;
+                }
             }
         }
 
@@ -2182,7 +2192,10 @@ impl DeepseekModel {
                 stream.seq_len,
                 trace,
             )?;
-            routed
+            DeepseekRoutedMoeOutput {
+                hidden: routed,
+                ready: None,
+            }
         };
         let trace = dsv4_trace_begin(&self.ctx)?;
         let ffn_out = if normed.seq_len == 1 {
@@ -2190,19 +2203,28 @@ impl DeepseekModel {
                 layer.ffn.add_shared_expert_with_scratch(
                     &self.ctx,
                     &normed,
-                    routed,
+                    routed.hidden,
+                    routed.ready,
                     self.config.swiglu_limit,
                     scratch,
                 )?
             } else {
-                layer
-                    .ffn
-                    .add_shared_expert(&self.ctx, &normed, routed, self.config.swiglu_limit)?
+                layer.ffn.add_shared_expert(
+                    &self.ctx,
+                    &normed,
+                    routed.hidden,
+                    routed.ready,
+                    self.config.swiglu_limit,
+                )?
             }
         } else {
-            layer
-                .ffn
-                .add_shared_expert(&self.ctx, &normed, routed, self.config.swiglu_limit)?
+            layer.ffn.add_shared_expert(
+                &self.ctx,
+                &normed,
+                routed.hidden,
+                routed.ready,
+                self.config.swiglu_limit,
+            )?
         };
         dsv4_trace_end(&self.ctx, "ffn_shared", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
@@ -3853,6 +3875,36 @@ fn dsv4_moe_deepep_enabled() -> Result<bool> {
         }
         _ => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{raw}`"),
     }
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_combine_overlap_enabled() -> bool {
+    std::env::var("ARLE_DSV4_COMBINE_OVERLAP")
+        .map(|raw| !matches!(raw.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(false)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_nccl_env_bootstrap_with_port_offset(
+    offset: u16,
+) -> Result<crate::distributed::nccl::NcclInitMethod> {
+    use std::net::ToSocketAddrs;
+
+    let host = std::env::var("MASTER_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let raw_port = std::env::var("MASTER_PORT")
+        .map_err(|err| anyhow::anyhow!("NCCL overlap EnvBootstrap requires MASTER_PORT: {err}"))?;
+    let port = raw_port.parse::<u16>().map_err(|err| {
+        anyhow::anyhow!("invalid MASTER_PORT for NCCL overlap: {raw_port}: {err}")
+    })?;
+    let port = port.checked_add(offset).ok_or_else(|| {
+        anyhow::anyhow!("MASTER_PORT {port} plus NCCL overlap offset {offset} overflows u16")
+    })?;
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|err| anyhow::anyhow!("failed to resolve NCCL overlap addr {host}:{port}: {err}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("NCCL overlap addr {host}:{port} resolved to zero addrs"))?;
+    Ok(crate::distributed::nccl::NcclInitMethod::TcpStore(addr))
 }
 
 #[cfg(feature = "cuda")]
