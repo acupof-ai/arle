@@ -179,7 +179,12 @@ Operators who want only the native serving binary can use `infer` directly (`car
   **94.923 ms**: return combine becomes `ReduceScatter` at **20.44 ms** per
   rank range and residual `SendRecv` falls to **3.26 ms**. The remaining
   bottlenecks are still local expert FP8/FP4 GEMV, AllReduce, attention/MHC,
-  launch overhead, async alloc/free, and D2H readbacks.
+  launch overhead, async alloc/free, and D2H readbacks. A follow-up
+  `ARLE_DSV4_COMBINE_OVERLAP=1` experiment adds a dedicated communication
+  stream and routed-output fence, but stays default-off: it returns exact
+  `406` while regressing the single-token decode wave to **104.359 ms** due to
+  all-reduce variance and cross-stream event overhead. The same binary with
+  overlap disabled keeps the **12.05 post-first tok/s** decode64 baseline.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and

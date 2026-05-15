@@ -298,6 +298,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DSV4_PAIR_EXPERT_GEMV` | `1` / unset | unset | Enables the single-expert `w1`/`w3` pair GEMV experiment in the default local expert loop. The 8xH20 Nsight trace shows it is functionally correct but slower on the current B=1 decode shape, so it remains default-off. |
 | `ARLE_DSV4_ROUTE_GROUPED_EXPERTS` | `1` / unset | unset | Enables the route-wise grouped local expert experiment for padded B=1 decode. The current opt-in path pairs route-local `w1`/`w3` GEMV when DSv4 block-scaled formats match. The latest 8xH20 nsys run keeps `霓彩` output and measures a 117.894 ms single-token wave, with `ncclDevKernel_SendRecv`, route GEMV, allocator/free, and launch overhead still dominant. Keep default-off until this becomes true grouped GEMM/DeepGEMM with DeepEP overlap. |
 | `ARLE_DSV4_COMBINE_DTYPE` | `bf16`, `fp8`, unset | `bf16` | Selects the return-side MoE combine exchange payload. `fp8` is validated as an opt-in experiment but is not faster than the BF16 default on the current 8xH20 trace. |
+| `ARLE_DSV4_COMBINE_OVERLAP` | `1`, `0`, unset | unset | Enables the opt-in return-side MoE reduce-scatter overlap experiment. It creates a second EP NCCL communicator on `comm_stream` and returns a routed-output fence so shared expert compute can run before consuming routed output. Real 8xH20 nsys returns exact `406`, but regresses the single-token decode wave from 94.841 ms to 104.359 ms, so the default remains off. |
 
 Current DSv4 8-rank validation command shape:
 
