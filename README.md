@@ -213,7 +213,16 @@ Operators who want only the native serving binary can use `infer` directly (`car
   cuts `cuMemsetD8Async` further to **1,232** calls / **1.558 ms** and moves
   the isolated decode wave to **87.667 ms** after rerun; the trace-off smoke
   reaches **12.06 post-first tok/s**. The dominant stack is still
-  reduce-scatter combine plus local expert FP8/FP4 GEMV.
+  reduce-scatter combine plus local expert FP8/FP4 GEMV. The B=1 padded DeepEP
+  local expert prepare step now also has a fused small CUDA kernel that clears
+  local counts, counts received routes, writes device offsets, and clears pack
+  cursors in one launch. On real 8xH20 nsys this cuts H2D runtime calls
+  **1,040 -> 696** and `cuMemsetD8Async` **1,232 -> 544** while preserving
+  exact `406`; the matching trace-off smoke keeps normal output and
+  **12.05 post-first tok/s** `decode64`. The single captured wave is not a
+  wall-time win because D2H/AllReduce timing was noisier, so the remaining
+  target is still eliminating the local-count readback and replacing the expert
+  GEMV loop with true grouped GEMM/DeepGEMM.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and

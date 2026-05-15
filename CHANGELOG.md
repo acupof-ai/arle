@@ -114,6 +114,16 @@ Related governance docs:
   and cross-stream event overhead outweigh the reduce-scatter improvement.
   The matching default-off HTTP smoke still reaches 12.05 post-first tok/s,
   so the overlap experiment remains disabled by default.
+- Added a fused DSv4 B=1 padded DeepEP local expert prepare kernel and matching
+  trace records under
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-small-local-pack-prepare/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-small-local-pack-prepare/)
+  and
+  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-small-local-pack-prepare-smoke/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-small-local-pack-prepare-smoke/).
+  The real 8xH20 run returns exact arithmetic `406`, cuts H2D runtime calls
+  from 1,040 to 696, cuts `cuMemsetD8Async` calls from 1,232 to 544, and keeps
+  trace-off `decode64` at 12.05 post-first tok/s. The single captured nsys wave
+  is 92.602 ms due to noisier D2H/AllReduce timing, so this is recorded as
+  small-call cleanup rather than a wall-time win.
 - Reused per-layer DSv4 incremental attention projection buffers for `c_q`,
   `c_q_normed`, `q_raw`, `kv_raw`, and `kv_normed`. The real 8xH20
   single-token `nsys` run returns exact arithmetic `406` and moves the decode

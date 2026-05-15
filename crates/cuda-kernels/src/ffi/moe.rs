@@ -158,6 +158,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_prepare_packed_local_experts_small_cuda(
+        packed_meta: *const i32,
+        counts: *mut i32,
+        offsets: *mut i32,
+        cursors: *mut i32,
+        num_routes: i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_pack_received_experts_cuda(
         received_hidden: *const Half,
         received_meta: *const i32,

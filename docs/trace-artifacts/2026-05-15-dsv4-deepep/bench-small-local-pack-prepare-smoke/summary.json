@@ -1,0 +1,70 @@
+{
+  "warmup16": {
+    "status": 200,
+    "error": null,
+    "elapsed_s": 1.5306382989510894,
+    "ttft_s": 0.35799294989556074,
+    "chunks": 19,
+    "content_chunks": 16,
+    "usage": {
+      "prompt_tokens": 13,
+      "completion_tokens": 16,
+      "total_tokens": 29
+    },
+    "post_first_tok_s": 12.791591261655787,
+    "requested_tok_s_e2e": 10.45315539991677,
+    "text": "彩虹之所以有多种颜色，是因为阳光（白光）穿过空气中的水滴时，发生了",
+    "chars": 33
+  },
+  "decode64": {
+    "status": 200,
+    "error": null,
+    "elapsed_s": 5.950846279039979,
+    "ttft_s": 0.7212036238051951,
+    "chunks": 67,
+    "content_chunks": 64,
+    "usage": {
+      "prompt_tokens": 35,
+      "completion_tokens": 64,
+      "total_tokens": 99
+    },
+    "post_first_tok_s": 12.046712204501787,
+    "requested_tok_s_e2e": 10.754772850614586,
+    "text": "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau ups phi chi psi omega one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty one twenty two twenty three twenty four twenty five twenty six twenty seven",
+    "chars": 334
+  },
+  "math": {
+    "status": 200,
+    "error": null,
+    "elapsed_s": 0.51943787233904,
+    "ttft_s": 0.4409063709899783,
+    "chunks": 4,
+    "content_chunks": 1,
+    "usage": {
+      "prompt_tokens": 20,
+      "completion_tokens": 1,
+      "total_tokens": 21
+    },
+    "post_first_tok_s": null,
+    "requested_tok_s_e2e": 61.60505751323696,
+    "text": "410",
+    "chars": 3
+  },
+  "writing": {
+    "status": 200,
+    "error": null,
+    "elapsed_s": 2.3032166589982808,
+    "ttft_s": 0.4955859612673521,
+    "chunks": 27,
+    "content_chunks": 24,
+    "usage": {
+      "prompt_tokens": 25,
+      "completion_tokens": 24,
+      "total_tokens": 49
+    },
+    "post_first_tok_s": 12.723837910515293,
+    "requested_tok_s_e2e": 10.420209451957561,
+    "text": "本次发布显著优化了长上下文推理性能，吞吐提升30%，流式输出延迟降低40%，并新增端",
+    "chars": 42
+  }
+}
