@@ -236,9 +236,8 @@ was driven by exactly this.
 
 ### 7.6 Bench reports 0 successful → CHECK SERVER LOG FIRST
 
-Codified from the 2026-05-10 PF8.5 v3-v10 cascade (per
-[`docs/research/2026-05-10-pf83-framing-trap-rule6-case-study.md`](research/2026-05-10-pf83-framing-trap-rule6-case-study.md)
-+ skill `kernel-optimization` v1.12.0 #34b): when guidellm or any other
+Codified from the 2026-05-10 PF8.5 v3-v10 cascade (skill
+`kernel-optimization` v1.12.0 #34b): when guidellm or any other
 client-side bench tool reports "0 successful requests" or "all-zero
 latency table", the temptation is to debug the bench tool's CLI quirks
 (missing flag, wrong path, save crash). v3-v10 wasted 30+ min on this
