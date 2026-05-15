@@ -185,6 +185,11 @@ Operators who want only the native serving binary can use `infer` directly (`car
   `406` while regressing the single-token decode wave to **104.359 ms** due to
   all-reduce variance and cross-stream event overhead. The same binary with
   overlap disabled keeps the **12.05 post-first tok/s** decode64 baseline.
+  Reusing incremental attention projection scratch for `c_q`, `c_q_normed`,
+  `q_raw`, `kv_raw`, and `kv_normed` is a positive follow-up: the single-token
+  nsys wave moves to **90.946 ms**, `cuMemAllocAsync` drops from **6,760** to
+  **5,040** calls, `cuMemFreeAsync` drops from **3,048** to **1,328**, and the
+  trace-off `decode64` smoke remains normal at **11.89 post-first tok/s**.
 - **2026-05-14** — DeepSeek V4 8xH20 serving now has committed decode and
   DeepEP-style MoE trace records against true `/root/DeepSeek-V4-Flash` with
   FP8 KV. The runnable TP=8/EP=8 layout returns normal multi-token math and

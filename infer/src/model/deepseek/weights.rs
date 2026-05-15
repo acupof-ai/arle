@@ -877,37 +877,74 @@ impl DeepseekModel {
         );
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let c_q = ops::gemm(&self.ctx, &attention.wq_a, hidden)?;
-        let mut c_q_normed =
-            unsafe { HiddenStates::uninit(&self.ctx, c_q.hidden_dim, c_q.seq_len)? };
+        let mut c_q_scratch = take_hidden_scratch(
+            &mut cache.c_q,
+            &self.ctx,
+            attention.wq_a.rows,
+            hidden.seq_len,
+        )?;
+        let mut c_q_normed_scratch = take_hidden_scratch(
+            &mut cache.c_q_normed,
+            &self.ctx,
+            attention.wq_a.rows,
+            hidden.seq_len,
+        )?;
+        let mut q_raw_scratch =
+            take_hidden_scratch(&mut cache.q_raw, &self.ctx, local_width, hidden.seq_len)?;
+        let mut kv_raw_scratch =
+            take_hidden_scratch(&mut cache.kv_raw, &self.ctx, head_dim, hidden.seq_len)?;
+        let mut kv_normed_scratch =
+            take_hidden_scratch(&mut cache.kv_normed, &self.ctx, head_dim, hidden.seq_len)?;
+        let c_q = &mut c_q_scratch.hidden;
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wq_a,
+            hidden,
+            c_q,
+            ops::LinearDispatchPhase::Decode,
+        )?;
+        let c_q_normed = &mut c_q_normed_scratch.hidden;
         ops::rms_norm_batch_into(
             &self.ctx,
-            &c_q,
+            c_q,
             &attention.q_norm,
             self.config.rms_norm_eps,
-            &mut c_q_normed,
+            c_q_normed,
         );
-        let q_raw = ops::gemm(&self.ctx, &attention.wq_b, &c_q_normed)?;
-        let kv_raw = ops::gemm(&self.ctx, &attention.wkv, hidden)?;
-        let mut kv_normed =
-            unsafe { HiddenStates::uninit(&self.ctx, kv_raw.hidden_dim, kv_raw.seq_len)? };
+        let q_raw = &mut q_raw_scratch.hidden;
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wq_b,
+            c_q_normed,
+            q_raw,
+            ops::LinearDispatchPhase::Decode,
+        )?;
+        let kv_raw = &mut kv_raw_scratch.hidden;
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wkv,
+            hidden,
+            kv_raw,
+            ops::LinearDispatchPhase::Decode,
+        )?;
+        let kv_normed = &mut kv_normed_scratch.hidden;
         ops::rms_norm_batch_into(
             &self.ctx,
-            &kv_raw,
+            kv_raw,
             &attention.kv_norm,
             self.config.rms_norm_eps,
-            &mut kv_normed,
+            kv_normed,
         );
         dsv4_trace_end(&self.ctx, "attn_proj", layer_idx, hidden.seq_len, trace)?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        self.forward_attention_gpu(
+        let result = self.forward_attention_gpu(
             layer_idx,
             attention,
             hidden,
-            &c_q_normed,
-            &q_raw,
-            &kv_normed,
+            c_q_normed,
+            q_raw,
+            kv_normed,
             hidden.seq_len,
             start_pos,
             local_heads,
@@ -915,9 +952,14 @@ impl DeepseekModel {
             head_dim,
             compress_ratio,
             mode,
-            Some(cache),
-        )
-        .and_then(|out| {
+            Some(&mut *cache),
+        );
+        put_hidden_scratch(&mut cache.c_q, c_q_scratch);
+        put_hidden_scratch(&mut cache.c_q_normed, c_q_normed_scratch);
+        put_hidden_scratch(&mut cache.q_raw, q_raw_scratch);
+        put_hidden_scratch(&mut cache.kv_raw, kv_raw_scratch);
+        put_hidden_scratch(&mut cache.kv_normed, kv_normed_scratch);
+        result.and_then(|out| {
             dsv4_trace_end(&self.ctx, "attn_core", layer_idx, hidden.seq_len, trace)?;
             Ok(out)
         })

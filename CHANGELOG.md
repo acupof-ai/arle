@@ -114,6 +114,13 @@ Related governance docs:
   and cross-stream event overhead outweigh the reduce-scatter improvement.
   The matching default-off HTTP smoke still reaches 12.05 post-first tok/s,
   so the overlap experiment remains disabled by default.
+- Reused per-layer DSv4 incremental attention projection buffers for `c_q`,
+  `c_q_normed`, `q_raw`, `kv_raw`, and `kv_normed`. The real 8xH20
+  single-token `nsys` run returns exact arithmetic `406` and moves the decode
+  wave from 94.841 ms to 90.946 ms, while `cuMemAllocAsync` calls drop from
+  6,760 to 5,040 and `cuMemFreeAsync` calls drop from 3,048 to 1,328 inside
+  the decode range. The matching HTTP smoke keeps normal Chinese/English
+  streaming output and exact math, with `decode64` at 11.89 post-first tok/s.
 - Added the DSv4 default-path warm decode Nsight trace under
   [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
   The run warms a real decode first, then profiles a second single decode token
