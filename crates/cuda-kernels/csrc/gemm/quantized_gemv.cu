@@ -785,12 +785,18 @@ __global__ void dsv4_fp4_grouped_gemv_batch_kernel(
     const __nv_bfloat16* x = input + route * K;
     const int bytes_per_row = K / 2;
     float sum = 0.0f;
-    for (int k = tid_in_row; k < K; k += threads_per_row) {
-        const uint8_t packed = weight[row * bytes_per_row + (k >> 1)];
-        const uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
-        const float w = dsv4_decode_fp4_e2m1(nibble)
-            * dsv4_block_scale(scales, row, k, N, K, scale_rows, scale_cols);
-        sum += w * __bfloat162float(x[k]);
+    for (int pair = tid_in_row; pair < bytes_per_row; pair += threads_per_row) {
+        const int k0 = pair << 1;
+        const int k1 = k0 + 1;
+        const uint8_t packed = weight[row * bytes_per_row + pair];
+        const uint8_t lo = packed & 0x0f;
+        const uint8_t hi = (packed >> 4) & 0x0f;
+        const float w0 = dsv4_decode_fp4_e2m1(lo)
+            * dsv4_block_scale(scales, row, k0, N, K, scale_rows, scale_cols);
+        const float w1 = dsv4_decode_fp4_e2m1(hi)
+            * dsv4_block_scale(scales, row, k1, N, K, scale_rows, scale_cols);
+        sum += w0 * __bfloat162float(x[k0]);
+        sum += w1 * __bfloat162float(x[k1]);
     }
 
     sum = warp_reduce_sum(sum);
