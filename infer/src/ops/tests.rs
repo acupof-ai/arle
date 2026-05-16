@@ -12,6 +12,40 @@ fn bf16_vec(data: &[f32]) -> Vec<bf16> {
     data.iter().map(|&x| bf16::from_f32(x)).collect()
 }
 
+fn dsv4_decode_fp4_e2m1_reference(bits: u8) -> f32 {
+    match bits & 0x0f {
+        0 => 0.0,
+        1 => 0.5,
+        2 => 1.0,
+        3 => 1.5,
+        4 => 2.0,
+        5 => 3.0,
+        6 => 4.0,
+        7 => 6.0,
+        8 => -0.0,
+        9 => -0.5,
+        10 => -1.0,
+        11 => -1.5,
+        12 => -2.0,
+        13 => -3.0,
+        14 => -4.0,
+        _ => -6.0,
+    }
+}
+
+fn dsv4_dot_fp4_row_reference(weight: &[u8], row: usize, input: &[bf16], cols: usize) -> f32 {
+    let bytes_per_row = cols / 2;
+    let mut sum = 0.0f32;
+    for pair in 0..bytes_per_row {
+        let packed = weight[row * bytes_per_row + pair];
+        let k0 = pair * 2;
+        let k1 = k0 + 1;
+        sum += dsv4_decode_fp4_e2m1_reference(packed & 0x0f) * input[k0].to_f32();
+        sum += dsv4_decode_fp4_e2m1_reference((packed >> 4) & 0x0f) * input[k1].to_f32();
+    }
+    sum
+}
+
 fn rms_norm_reference(x: &[bf16], weight: &[bf16], eps: f32, offset: bool) -> Vec<f32> {
     let sum_sq: f32 = x
         .iter()
@@ -252,6 +286,83 @@ fn test_dsv4_fp4_batched_gemv_b1_raw() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_fp4_grouped_gemv() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let rows = 2usize;
+    let cols = 4usize;
+    let num_experts = 2usize;
+    let routes_per_expert = 1usize;
+    let total_routes = 2usize;
+
+    let weight0_host = [0x21_u8, 0x43, 0xa1, 0x2b];
+    let weight1_host = [0x32_u8, 0x54, 0x91, 0xb3];
+    let scales_host = [127_u8];
+    let input_host = bf16_vec(&[2.0, 4.0, 1.0, 3.0, 1.0, 2.0, 3.0, 4.0]);
+
+    let weight0 = ctx.stream.clone_htod(&weight0_host)?;
+    let weight1 = ctx.stream.clone_htod(&weight1_host)?;
+    let scale0 = ctx.stream.clone_htod(&scales_host)?;
+    let scale1 = ctx.stream.clone_htod(&scales_host)?;
+    let input = ctx.stream.clone_htod(&input_host)?;
+    let offsets = ctx.stream.clone_htod(&[0_i32, 1])?;
+    let counts = ctx.stream.clone_htod(&[1_i32, 1])?;
+    let mut output = ctx.stream.alloc_zeros::<bf16>(total_routes * rows)?;
+
+    {
+        let (weight0_ptr, _weight0_guard) = weight0.device_ptr(&ctx.stream);
+        let (weight1_ptr, _weight1_guard) = weight1.device_ptr(&ctx.stream);
+        let (scale0_ptr, _scale0_guard) = scale0.device_ptr(&ctx.stream);
+        let (scale1_ptr, _scale1_guard) = scale1.device_ptr(&ctx.stream);
+        let weight_ptrs = ctx
+            .stream
+            .clone_htod(&[weight0_ptr as u64, weight1_ptr as u64])?;
+        let scale_ptrs = ctx
+            .stream
+            .clone_htod(&[scale0_ptr as u64, scale1_ptr as u64])?;
+        let (weight_ptrs, _weight_ptrs_guard) = weight_ptrs.device_ptr(&ctx.stream);
+        let (scale_ptrs, _scale_ptrs_guard) = scale_ptrs.device_ptr(&ctx.stream);
+        let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+        let (offsets_ptr, _offsets_guard) = offsets.device_ptr(&ctx.stream);
+        let (counts_ptr, _counts_guard) = counts.device_ptr(&ctx.stream);
+        let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            ffi::dsv4_fp4_grouped_gemv_batch_cuda(
+                weight_ptrs as *const u64,
+                scale_ptrs as *const u64,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                offsets_ptr as *const i32,
+                counts_ptr as *const i32,
+                std::ptr::null(),
+                num_experts as i32,
+                routes_per_expert as i32,
+                rows as i32,
+                cols as i32,
+                1,
+                1,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    let expected = [
+        dsv4_dot_fp4_row_reference(&weight0_host, 0, &input_host[0..cols], cols),
+        dsv4_dot_fp4_row_reference(&weight0_host, 1, &input_host[0..cols], cols),
+        dsv4_dot_fp4_row_reference(&weight1_host, 0, &input_host[cols..2 * cols], cols),
+        dsv4_dot_fp4_row_reference(&weight1_host, 1, &input_host[cols..2 * cols], cols),
+    ];
+
+    let host = ctx.stream.clone_dtoh(&output)?;
+    ctx.sync()?;
+    let values = host.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+
+    assert_close(&values, &expected, 0.01);
+    Ok(())
+}
+
+#[test]
 fn test_dsv4_fp4_grouped_gemv_pair() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let rows = 2usize;
@@ -336,51 +447,17 @@ fn test_dsv4_fp4_grouped_gemv_pair() -> Result<()> {
         }
     }
 
-    fn decode_fp4(bits: u8) -> f32 {
-        match bits & 0x0f {
-            0 => 0.0,
-            1 => 0.5,
-            2 => 1.0,
-            3 => 1.5,
-            4 => 2.0,
-            5 => 3.0,
-            6 => 4.0,
-            7 => 6.0,
-            8 => -0.0,
-            9 => -0.5,
-            10 => -1.0,
-            11 => -1.5,
-            12 => -2.0,
-            13 => -3.0,
-            14 => -4.0,
-            _ => -6.0,
-        }
-    }
-
-    fn dot_row(weight: &[u8], row: usize, input: &[bf16], cols: usize) -> f32 {
-        let bytes_per_row = cols / 2;
-        let mut sum = 0.0f32;
-        for pair in 0..bytes_per_row {
-            let packed = weight[row * bytes_per_row + pair];
-            let k0 = pair * 2;
-            let k1 = k0 + 1;
-            sum += decode_fp4(packed & 0x0f) * input[k0].to_f32();
-            sum += decode_fp4((packed >> 4) & 0x0f) * input[k1].to_f32();
-        }
-        sum
-    }
-
     let expected_a = [
-        dot_row(&weight_a0_host, 0, &input_host[0..cols], cols),
-        dot_row(&weight_a0_host, 1, &input_host[0..cols], cols),
-        dot_row(&weight_a1_host, 0, &input_host[cols..2 * cols], cols),
-        dot_row(&weight_a1_host, 1, &input_host[cols..2 * cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_a0_host, 0, &input_host[0..cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_a0_host, 1, &input_host[0..cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_a1_host, 0, &input_host[cols..2 * cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_a1_host, 1, &input_host[cols..2 * cols], cols),
     ];
     let expected_b = [
-        dot_row(&weight_b0_host, 0, &input_host[0..cols], cols),
-        dot_row(&weight_b0_host, 1, &input_host[0..cols], cols),
-        dot_row(&weight_b1_host, 0, &input_host[cols..2 * cols], cols),
-        dot_row(&weight_b1_host, 1, &input_host[cols..2 * cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_b0_host, 0, &input_host[0..cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_b0_host, 1, &input_host[0..cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_b1_host, 0, &input_host[cols..2 * cols], cols),
+        dsv4_dot_fp4_row_reference(&weight_b1_host, 1, &input_host[cols..2 * cols], cols),
     ];
 
     let host_a = ctx.stream.clone_dtoh(&output_a)?;
