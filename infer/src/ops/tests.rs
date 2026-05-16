@@ -586,6 +586,123 @@ fn test_dsv4_compressor_update_cuda_overlap_decode() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_compressor_update_cuda_pending_only_appends_raw() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let head_dim = 2usize;
+    let ratio = 4usize;
+    let width = 2 * head_dim;
+    let num_tokens = 1usize;
+    let start_pos = 2usize;
+    let pending_tokens = 2usize;
+
+    let kv_raw_host = bf16_vec(&[3.0, 3.5, 4.0, 4.5]);
+    let score_raw_host = bf16_vec(&[0.4, 0.5, 0.6, 0.7]);
+    let ape_host = bf16_vec(&[
+        0.0, 0.0, 0.0, 0.0, //
+        0.01, 0.02, 0.03, 0.04, //
+        0.05, 0.06, 0.07, 0.08, //
+        0.09, 0.10, 0.11, 0.12,
+    ]);
+    let norm_host = bf16_vec(&[1.0, 0.5]);
+    let pending_kv_host = bf16_vec(&[
+        1.0, 1.5, 2.0, 2.5, //
+        2.0, 2.5, 3.0, 3.5, //
+        -9.0, -9.0, -9.0, -9.0, //
+        -8.0, -8.0, -8.0, -8.0,
+    ]);
+    let pending_score_host = bf16_vec(&[
+        0.05, 0.15, 0.25, 0.35, //
+        0.45, 0.55, 0.65, 0.75, //
+        -9.0, -9.0, -9.0, -9.0, //
+        -8.0, -8.0, -8.0, -8.0,
+    ]);
+    let prev_overlap_kv_host = bf16_vec(&[0.0; 8]);
+    let prev_overlap_score_host = bf16_vec(&[0.0; 8]);
+
+    let kv_raw = ctx.stream.clone_htod(&kv_raw_host)?;
+    let score_raw = ctx.stream.clone_htod(&score_raw_host)?;
+    let ape = ctx.stream.clone_htod(&ape_host)?;
+    let norm = ctx.stream.clone_htod(&norm_host)?;
+    let mut pending_kv = ctx.stream.clone_htod(&pending_kv_host)?;
+    let mut pending_score = ctx.stream.clone_htod(&pending_score_host)?;
+    let mut prev_overlap_kv = ctx.stream.clone_htod(&prev_overlap_kv_host)?;
+    let mut prev_overlap_score = ctx.stream.clone_htod(&prev_overlap_score_host)?;
+    let mut compressed = ctx.stream.alloc_zeros::<bf16>(head_dim)?;
+
+    {
+        let (kv_raw_ptr, _kv_raw_guard) = kv_raw.device_ptr(&ctx.stream);
+        let (score_raw_ptr, _score_raw_guard) = score_raw.device_ptr(&ctx.stream);
+        let (ape_ptr, _ape_guard) = ape.device_ptr(&ctx.stream);
+        let (norm_ptr, _norm_guard) = norm.device_ptr(&ctx.stream);
+        let (pending_kv_ptr, _pending_kv_guard) = pending_kv.device_ptr_mut(&ctx.stream);
+        let (pending_score_ptr, _pending_score_guard) = pending_score.device_ptr_mut(&ctx.stream);
+        let (prev_overlap_kv_ptr, _prev_overlap_kv_guard) =
+            prev_overlap_kv.device_ptr_mut(&ctx.stream);
+        let (prev_overlap_score_ptr, _prev_overlap_score_guard) =
+            prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let (compressed_ptr, _compressed_guard) = compressed.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_compressor_update_cuda(
+                kv_raw_ptr as *const ffi::Half,
+                score_raw_ptr as *const ffi::Half,
+                ape_ptr as *const ffi::Half,
+                norm_ptr as *const ffi::Half,
+                pending_kv_ptr as *mut ffi::Half,
+                pending_score_ptr as *mut ffi::Half,
+                prev_overlap_kv_ptr as *mut ffi::Half,
+                prev_overlap_score_ptr as *mut ffi::Half,
+                compressed_ptr as *mut ffi::Half,
+                num_tokens as i32,
+                start_pos as i32,
+                pending_tokens as i32,
+                0,
+                head_dim as i32,
+                ratio as i32,
+                width as i32,
+                1,
+                1,
+                1.0e-6,
+                0,
+                160_000.0,
+                65_536,
+                16.0,
+                32.0,
+                1.0,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    let expected_kv = [
+        1.0, 1.5, 2.0, 2.5, //
+        2.0, 2.5, 3.0, 3.5, //
+        3.0, 3.5, 4.0, 4.5,
+    ];
+    let expected_score = [
+        0.05, 0.15, 0.25, 0.35, //
+        0.45, 0.55, 0.65, 0.75, //
+        0.45, 0.56, 0.67, 0.78,
+    ];
+
+    let pending_kv_host = ctx.stream.clone_dtoh(&pending_kv)?;
+    let pending_score_host = ctx.stream.clone_dtoh(&pending_score)?;
+    ctx.sync()?;
+    let got_kv = pending_kv_host[..(pending_tokens + num_tokens) * width]
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let got_score = pending_score_host[..(pending_tokens + num_tokens) * width]
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+
+    assert_close(&got_kv, &expected_kv, 0.01);
+    assert_close(&got_score, &expected_score, 0.01);
+    Ok(())
+}
+
+#[test]
 fn test_argmax() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 9.0, 3.0, 8.0]))?;
