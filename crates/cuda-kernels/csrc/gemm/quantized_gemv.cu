@@ -413,20 +413,26 @@ __global__ void dsv4_fp8_gemv_batch_tiled_kernel(
     const int sr_raw = row / block_h;
     const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
     const int scale_row_offset = sr * scale_cols;
+    const uint8_t* weight_row = weight + row * K;
+    const uint8_t* scale_row = scales + scale_row_offset;
     float sums[DSV4_BATCH_TILE];
 #pragma unroll
     for (int b = 0; b < DSV4_BATCH_TILE; ++b) sums[b] = 0.0f;
 
-    for (int k = tid_in_row; k < K; k += threads_per_row) {
-        const int sc_raw = k / block_w;
-        const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
-        const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
-            * dsv4_decode_e8m0(scales[scale_row_offset + sc]);
+    for (int sc = 0; sc < scale_cols; ++sc) {
+        const int k_start = sc * block_w;
+        if (k_start >= K) break;
+        int k_end = k_start + block_w;
+        if (k_end > K) k_end = K;
+        const float scale = dsv4_decode_e8m0(scale_row[sc]);
+        for (int k = k_start + tid_in_row; k < k_end; k += threads_per_row) {
+            const float w = dsv4_decode_fp8_e4m3(weight_row[k]) * scale;
 #pragma unroll
-        for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
-            int batch_idx = batch_base + b;
-            if (batch_idx < B) {
-                sums[b] += w * __bfloat162float(input[batch_idx * K + k]);
+            for (int b = 0; b < DSV4_BATCH_TILE; ++b) {
+                int batch_idx = batch_base + b;
+                if (batch_idx < B) {
+                    sums[b] += w * __bfloat162float(input[batch_idx * K + k]);
+                }
             }
         }
     }
