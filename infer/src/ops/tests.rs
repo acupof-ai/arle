@@ -213,6 +213,90 @@ fn test_dsv4_fp4_batched_gemv_b1_raw() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_route_cuda_top2_sqrtsoftplus_bias() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let num_tokens = 2usize;
+    let n_experts = 4usize;
+    let topk = 2usize;
+    let routed_scaling_factor = 1.5f32;
+    let logits_host = bf16_vec(&[0.0, 1.0, -1.0, 0.5, 2.0, -0.5, 0.25, 1.5]);
+    let bias_host = bf16_vec(&[0.0, 0.1, 0.2, -0.1]);
+    let token_ids = ctx.stream.clone_htod(&[0_u32, 1])?;
+    let logits = ctx.stream.clone_htod(&logits_host)?;
+    let bias = ctx.stream.clone_htod(&bias_host)?;
+    let mut indices = ctx.stream.alloc_zeros::<i32>(num_tokens * topk)?;
+    let mut weights = ctx.stream.alloc_zeros::<f32>(num_tokens * topk)?;
+
+    {
+        let (logits_ptr, _logits_guard) = logits.device_ptr(&ctx.stream);
+        let (bias_ptr, _bias_guard) = bias.device_ptr(&ctx.stream);
+        let (token_ptr, _token_guard) = token_ids.device_ptr(&ctx.stream);
+        let (idx_ptr, _idx_guard) = indices.device_ptr_mut(&ctx.stream);
+        let (weight_ptr, _weight_guard) = weights.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_route_cuda(
+                logits_ptr as *const ffi::Half,
+                bias_ptr as *const ffi::Half,
+                std::ptr::null(),
+                token_ptr as *const u32,
+                idx_ptr as *mut i32,
+                weight_ptr as *mut f32,
+                num_tokens as i32,
+                n_experts as i32,
+                topk as i32,
+                1,
+                2,
+                routed_scaling_factor,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    fn softplus(value: f32) -> f32 {
+        if value > 20.0 {
+            value
+        } else {
+            (1.0 + value.exp()).ln()
+        }
+    }
+
+    let mut expected_indices = Vec::with_capacity(num_tokens * topk);
+    let mut expected_weights = Vec::with_capacity(num_tokens * topk);
+    for token in 0..num_tokens {
+        let mut scores = Vec::with_capacity(n_experts);
+        for expert in 0..n_experts {
+            scores.push(softplus(logits_host[token * n_experts + expert].to_f32()).sqrt());
+        }
+        let mut ranked = (0..n_experts)
+            .map(|expert| (expert, scores[expert] + bias_host[expert].to_f32()))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let selected_sum: f32 = ranked[..topk]
+            .iter()
+            .map(|(expert, _)| scores[*expert])
+            .sum();
+        for &(expert, _) in &ranked[..topk] {
+            expected_indices.push(expert as i32);
+            expected_weights.push(scores[expert] / (selected_sum + 1.0e-9) * routed_scaling_factor);
+        }
+    }
+
+    let got_indices = ctx.stream.clone_dtoh(&indices)?;
+    let got_weights = ctx.stream.clone_dtoh(&weights)?;
+    ctx.sync()?;
+
+    assert_eq!(got_indices, expected_indices);
+    for (idx, (got, expected)) in got_weights.iter().zip(expected_weights.iter()).enumerate() {
+        assert!(
+            (got - expected).abs() < 1.0e-5,
+            "idx={idx} expected={expected} got={got}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_argmax() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 9.0, 3.0, 8.0]))?;
