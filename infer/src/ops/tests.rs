@@ -174,6 +174,45 @@ fn test_dsv4_fp4_batched_gemv() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_fp4_batched_gemv_b1_raw() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let weight = ctx.stream.clone_htod(&[0x21_u8, 0x21, 0xb3, 0xb3])?;
+    let scales = ctx.stream.clone_htod(&[127_u8])?;
+    let input = ctx.stream.clone_htod(&bf16_vec(&[2.0, 4.0, 1.0, 3.0]))?;
+    let mut output = ctx.stream.alloc_zeros::<bf16>(2)?;
+
+    {
+        let (weight_ptr, _weight_guard) = weight.device_ptr(&ctx.stream);
+        let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
+        let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+        let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            ffi::dsv4_fp4_gemv_batch_cuda(
+                weight_ptr as *const u8,
+                scales_ptr as *const u8,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                1,
+                2,
+                4,
+                1,
+                1,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    let host = ctx.stream.clone_dtoh(&output)?;
+    ctx.sync()?;
+    let values = host.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+
+    assert_close(&values, &[8.5, -6.0], 0.01);
+    Ok(())
+}
+
+#[test]
 fn test_argmax() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 9.0, 3.0, 8.0]))?;
