@@ -473,7 +473,6 @@ __global__ void dsv4_compressor_update_kernel(
     int block_end = block_start + ratio - 1;
     for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
       float max_logit = -INFINITY;
-      float logits[256];
       int count = overlap ? 2 * ratio : ratio;
       for (int pos = 0; pos < count; ++pos) {
         float logit;
@@ -489,31 +488,39 @@ __global__ void dsv4_compressor_update_kernel(
               score_raw, pending_score, ape, abs_pos, start_pos, block_start,
               ratio, width, score_col);
         }
-        logits[pos] = logit;
         max_logit = fmaxf(max_logit, logit);
       }
       float denom = 0.0f;
-      for (int pos = 0; pos < count; ++pos) {
-        float value = expf(logits[pos] - max_logit);
-        logits[pos] = value;
-        denom += value;
-      }
       float acc = 0.0f;
-      if (isfinite(max_logit) && denom > 0.0f) {
+      if (isfinite(max_logit)) {
         for (int pos = 0; pos < count; ++pos) {
-          float value;
+          float logit;
+          float raw_value;
           if (overlap && pos < ratio) {
-            value = (has_prev_overlap || block > 0)
-                        ? dsv4_attn_bf16_to_f32(prev_overlap_kv[pos * head_dim + col])
-                        : 0.0f;
+            if (has_prev_overlap || block > 0) {
+              logit = dsv4_attn_bf16_to_f32(prev_overlap_score[pos * head_dim + col]);
+              raw_value = dsv4_attn_bf16_to_f32(prev_overlap_kv[pos * head_dim + col]);
+            } else {
+              logit = -INFINITY;
+              raw_value = 0.0f;
+            }
           } else {
             int local_pos = overlap ? (pos - ratio) : pos;
             int abs_pos = block_start + local_pos;
+            int score_col = overlap ? (head_dim + col) : col;
             int kv_col = overlap ? (head_dim + col) : col;
-            value = dsv4_compressor_raw_value(
+            logit = dsv4_compressor_score_value(
+                score_raw, pending_score, ape, abs_pos, start_pos, block_start,
+                ratio, width, score_col);
+            raw_value = dsv4_compressor_raw_value(
                 kv_raw, pending_kv, abs_pos, start_pos, block_start, width, kv_col);
           }
-          acc += (logits[pos] / denom) * value;
+          float weight = expf(logit - max_logit);
+          denom += weight;
+          acc += weight * raw_value;
+        }
+        if (denom > 0.0f) {
+          acc /= denom;
         }
       }
       row[col] = acc;
