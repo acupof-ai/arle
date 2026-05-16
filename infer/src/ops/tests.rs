@@ -213,6 +213,149 @@ fn test_dsv4_fp4_batched_gemv_b1_raw() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_fp4_grouped_gemv_pair() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let rows = 2usize;
+    let cols = 4usize;
+    let num_experts = 2usize;
+    let routes_per_expert = 1usize;
+    let total_routes = 2usize;
+
+    let weight_a0_host = [0x21_u8, 0x43, 0xa1, 0x2b];
+    let weight_a1_host = [0x32_u8, 0x54, 0x91, 0xb3];
+    let weight_b0_host = [0x31_u8, 0x24, 0xb2, 0x19];
+    let weight_b1_host = [0x41_u8, 0x53, 0xa2, 0x2c];
+    let scales_host = [127_u8];
+    let input_host = bf16_vec(&[2.0, 4.0, 1.0, 3.0, 1.0, 2.0, 3.0, 4.0]);
+
+    let weight_a0 = ctx.stream.clone_htod(&weight_a0_host)?;
+    let weight_a1 = ctx.stream.clone_htod(&weight_a1_host)?;
+    let weight_b0 = ctx.stream.clone_htod(&weight_b0_host)?;
+    let weight_b1 = ctx.stream.clone_htod(&weight_b1_host)?;
+    let scale_a0 = ctx.stream.clone_htod(&scales_host)?;
+    let scale_a1 = ctx.stream.clone_htod(&scales_host)?;
+    let scale_b0 = ctx.stream.clone_htod(&scales_host)?;
+    let scale_b1 = ctx.stream.clone_htod(&scales_host)?;
+    let input = ctx.stream.clone_htod(&input_host)?;
+    let offsets = ctx.stream.clone_htod(&[0_i32, 1])?;
+    let counts = ctx.stream.clone_htod(&[1_i32, 1])?;
+    let mut output_a = ctx.stream.alloc_zeros::<bf16>(total_routes * rows)?;
+    let mut output_b = ctx.stream.alloc_zeros::<bf16>(total_routes * rows)?;
+
+    {
+        let (weight_a0_ptr, _weight_a0_guard) = weight_a0.device_ptr(&ctx.stream);
+        let (weight_a1_ptr, _weight_a1_guard) = weight_a1.device_ptr(&ctx.stream);
+        let (weight_b0_ptr, _weight_b0_guard) = weight_b0.device_ptr(&ctx.stream);
+        let (weight_b1_ptr, _weight_b1_guard) = weight_b1.device_ptr(&ctx.stream);
+        let (scale_a0_ptr, _scale_a0_guard) = scale_a0.device_ptr(&ctx.stream);
+        let (scale_a1_ptr, _scale_a1_guard) = scale_a1.device_ptr(&ctx.stream);
+        let (scale_b0_ptr, _scale_b0_guard) = scale_b0.device_ptr(&ctx.stream);
+        let (scale_b1_ptr, _scale_b1_guard) = scale_b1.device_ptr(&ctx.stream);
+        let weight_a_ptrs = ctx
+            .stream
+            .clone_htod(&[weight_a0_ptr as u64, weight_a1_ptr as u64])?;
+        let weight_b_ptrs = ctx
+            .stream
+            .clone_htod(&[weight_b0_ptr as u64, weight_b1_ptr as u64])?;
+        let scale_a_ptrs = ctx
+            .stream
+            .clone_htod(&[scale_a0_ptr as u64, scale_a1_ptr as u64])?;
+        let scale_b_ptrs = ctx
+            .stream
+            .clone_htod(&[scale_b0_ptr as u64, scale_b1_ptr as u64])?;
+        let (weight_a_ptrs, _weight_a_ptrs_guard) = weight_a_ptrs.device_ptr(&ctx.stream);
+        let (weight_b_ptrs, _weight_b_ptrs_guard) = weight_b_ptrs.device_ptr(&ctx.stream);
+        let (scale_a_ptrs, _scale_a_ptrs_guard) = scale_a_ptrs.device_ptr(&ctx.stream);
+        let (scale_b_ptrs, _scale_b_ptrs_guard) = scale_b_ptrs.device_ptr(&ctx.stream);
+        let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+        let (offsets_ptr, _offsets_guard) = offsets.device_ptr(&ctx.stream);
+        let (counts_ptr, _counts_guard) = counts.device_ptr(&ctx.stream);
+        let (output_a_ptr, _output_a_guard) = output_a.device_ptr_mut(&ctx.stream);
+        let (output_b_ptr, _output_b_guard) = output_b.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            ffi::dsv4_fp4_grouped_gemv_pair_batch_cuda(
+                weight_a_ptrs as *const u64,
+                scale_a_ptrs as *const u64,
+                weight_b_ptrs as *const u64,
+                scale_b_ptrs as *const u64,
+                input_ptr as *const ffi::Half,
+                output_a_ptr as *mut ffi::Half,
+                output_b_ptr as *mut ffi::Half,
+                offsets_ptr as *const i32,
+                counts_ptr as *const i32,
+                std::ptr::null(),
+                num_experts as i32,
+                routes_per_expert as i32,
+                rows as i32,
+                cols as i32,
+                1,
+                1,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    fn decode_fp4(bits: u8) -> f32 {
+        match bits & 0x0f {
+            0 => 0.0,
+            1 => 0.5,
+            2 => 1.0,
+            3 => 1.5,
+            4 => 2.0,
+            5 => 3.0,
+            6 => 4.0,
+            7 => 6.0,
+            8 => -0.0,
+            9 => -0.5,
+            10 => -1.0,
+            11 => -1.5,
+            12 => -2.0,
+            13 => -3.0,
+            14 => -4.0,
+            _ => -6.0,
+        }
+    }
+
+    fn dot_row(weight: &[u8], row: usize, input: &[bf16], cols: usize) -> f32 {
+        let bytes_per_row = cols / 2;
+        let mut sum = 0.0f32;
+        for pair in 0..bytes_per_row {
+            let packed = weight[row * bytes_per_row + pair];
+            let k0 = pair * 2;
+            let k1 = k0 + 1;
+            sum += decode_fp4(packed & 0x0f) * input[k0].to_f32();
+            sum += decode_fp4((packed >> 4) & 0x0f) * input[k1].to_f32();
+        }
+        sum
+    }
+
+    let expected_a = [
+        dot_row(&weight_a0_host, 0, &input_host[0..cols], cols),
+        dot_row(&weight_a0_host, 1, &input_host[0..cols], cols),
+        dot_row(&weight_a1_host, 0, &input_host[cols..2 * cols], cols),
+        dot_row(&weight_a1_host, 1, &input_host[cols..2 * cols], cols),
+    ];
+    let expected_b = [
+        dot_row(&weight_b0_host, 0, &input_host[0..cols], cols),
+        dot_row(&weight_b0_host, 1, &input_host[0..cols], cols),
+        dot_row(&weight_b1_host, 0, &input_host[cols..2 * cols], cols),
+        dot_row(&weight_b1_host, 1, &input_host[cols..2 * cols], cols),
+    ];
+
+    let host_a = ctx.stream.clone_dtoh(&output_a)?;
+    let host_b = ctx.stream.clone_dtoh(&output_b)?;
+    ctx.sync()?;
+    let values_a = host_a.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+    let values_b = host_b.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+
+    assert_close(&values_a, &expected_a, 0.01);
+    assert_close(&values_b, &expected_b, 0.01);
+    Ok(())
+}
+
+#[test]
 fn test_dsv4_route_cuda_top2_sqrtsoftplus_bias() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let num_tokens = 2usize;

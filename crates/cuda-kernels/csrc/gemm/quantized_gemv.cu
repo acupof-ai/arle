@@ -864,16 +864,25 @@ __global__ void dsv4_fp4_grouped_gemv_pair_batch_kernel(
     const int bytes_per_row = K / 2;
     float sum_a = 0.0f;
     float sum_b = 0.0f;
-    for (int k = tid_in_row; k < K; k += threads_per_row) {
-        const uint8_t packed_a = weight_a[row * bytes_per_row + (k >> 1)];
-        const uint8_t packed_b = weight_b[row * bytes_per_row + (k >> 1)];
-        const uint8_t nibble_a = (k & 1) ? ((packed_a >> 4) & 0x0f) : (packed_a & 0x0f);
-        const uint8_t nibble_b = (k & 1) ? ((packed_b >> 4) & 0x0f) : (packed_b & 0x0f);
-        const float xv = __bfloat162float(x[k]);
-        const float scale_a = dsv4_block_scale(scales_a, row, k, N, K, scale_rows, scale_cols);
-        const float scale_b = dsv4_block_scale(scales_b, row, k, N, K, scale_rows, scale_cols);
-        sum_a += dsv4_decode_fp4_e2m1(nibble_a) * scale_a * xv;
-        sum_b += dsv4_decode_fp4_e2m1(nibble_b) * scale_b * xv;
+    for (int pair = tid_in_row; pair < bytes_per_row; pair += threads_per_row) {
+        const int k0 = pair << 1;
+        const int k1 = k0 + 1;
+        const uint8_t packed_a = weight_a[row * bytes_per_row + pair];
+        const uint8_t packed_b = weight_b[row * bytes_per_row + pair];
+        const uint8_t lo_a = packed_a & 0x0f;
+        const uint8_t hi_a = (packed_a >> 4) & 0x0f;
+        const uint8_t lo_b = packed_b & 0x0f;
+        const uint8_t hi_b = (packed_b >> 4) & 0x0f;
+        const float xv0 = __bfloat162float(x[k0]);
+        const float xv1 = __bfloat162float(x[k1]);
+        const float scale_a0 = dsv4_block_scale(scales_a, row, k0, N, K, scale_rows, scale_cols);
+        const float scale_a1 = dsv4_block_scale(scales_a, row, k1, N, K, scale_rows, scale_cols);
+        const float scale_b0 = dsv4_block_scale(scales_b, row, k0, N, K, scale_rows, scale_cols);
+        const float scale_b1 = dsv4_block_scale(scales_b, row, k1, N, K, scale_rows, scale_cols);
+        sum_a += dsv4_decode_fp4_e2m1(lo_a) * scale_a0 * xv0;
+        sum_a += dsv4_decode_fp4_e2m1(hi_a) * scale_a1 * xv1;
+        sum_b += dsv4_decode_fp4_e2m1(lo_b) * scale_b0 * xv0;
+        sum_b += dsv4_decode_fp4_e2m1(hi_b) * scale_b1 * xv1;
     }
 
     sum_a = warp_reduce_sum(sum_a);
