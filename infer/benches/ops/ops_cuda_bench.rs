@@ -720,6 +720,160 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
         });
     }
 
+    for &(
+        label,
+        head_dim,
+        ratio,
+        overlap,
+        apply_rope,
+        num_tokens,
+        start_pos,
+        pending_tokens,
+        compressed_base,
+        has_prev_overlap,
+    ) in &[
+        (
+            "dsv4_mini_csa_first_r4_h64_overlap_rope",
+            64usize,
+            4usize,
+            true,
+            true,
+            4usize,
+            0usize,
+            0usize,
+            0usize,
+            false,
+        ),
+        (
+            "dsv4_mini_csa_decode_r4_h64_overlap_rope",
+            64usize,
+            4usize,
+            true,
+            true,
+            1usize,
+            7usize,
+            3usize,
+            1usize,
+            true,
+        ),
+        (
+            "dsv4_mini_indexer_decode_r4_h64_overlap_no_rope",
+            64usize,
+            4usize,
+            true,
+            false,
+            1usize,
+            7usize,
+            3usize,
+            1usize,
+            true,
+        ),
+        (
+            "dsv4_mini_hca_decode_r96_h64_rope",
+            64usize,
+            96usize,
+            false,
+            true,
+            1usize,
+            191usize,
+            95usize,
+            1usize,
+            false,
+        ),
+    ] {
+        let width = if overlap { 2 * head_dim } else { head_dim };
+        let completed = (pending_tokens + num_tokens) / ratio;
+        group.throughput(Throughput::Elements(
+            ((pending_tokens + num_tokens) * width) as u64,
+        ));
+        group.bench_function(BenchmarkId::new("dsv4_compressor_update", label), |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let kv_raw = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(num_tokens * width, 0.015_625))
+                .expect("failed to H2D dsv4 compressor kv raw");
+            let score_raw = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(num_tokens * width, 0.031_25))
+                .expect("failed to H2D dsv4 compressor score raw");
+            let ape = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(ratio * width, 0.003_906_25))
+                .expect("failed to H2D dsv4 compressor ape");
+            let norm = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(head_dim, 0.007_812_5))
+                .expect("failed to H2D dsv4 compressor norm");
+            let mut pending_kv = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(ratio * width, 0.011_718_75))
+                .expect("failed to H2D dsv4 compressor pending kv");
+            let mut pending_score = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(ratio * width, 0.019_531_25))
+                .expect("failed to H2D dsv4 compressor pending score");
+            let mut prev_overlap_kv = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(ratio * head_dim, 0.013_671_875))
+                .expect("failed to H2D dsv4 compressor previous overlap kv");
+            let mut prev_overlap_score = ctx
+                .stream
+                .clone_htod(&bf16_data_scaled(ratio * head_dim, 0.017_578_125))
+                .expect("failed to H2D dsv4 compressor previous overlap score");
+            let mut compressed = ctx
+                .stream
+                .alloc_zeros::<u16>((compressed_base + completed.max(1)) * head_dim)
+                .expect("failed to allocate dsv4 compressor compressed rows");
+
+            let (kv_raw_ptr, _kv_raw_guard) = kv_raw.device_ptr(&ctx.stream);
+            let (score_raw_ptr, _score_raw_guard) = score_raw.device_ptr(&ctx.stream);
+            let (ape_ptr, _ape_guard) = ape.device_ptr(&ctx.stream);
+            let (norm_ptr, _norm_guard) = norm.device_ptr(&ctx.stream);
+            let (pending_kv_ptr, _pending_kv_guard) = pending_kv.device_ptr_mut(&ctx.stream);
+            let (pending_score_ptr, _pending_score_guard) =
+                pending_score.device_ptr_mut(&ctx.stream);
+            let (prev_overlap_kv_ptr, _prev_overlap_kv_guard) =
+                prev_overlap_kv.device_ptr_mut(&ctx.stream);
+            let (prev_overlap_score_ptr, _prev_overlap_score_guard) =
+                prev_overlap_score.device_ptr_mut(&ctx.stream);
+            let (compressed_ptr, _compressed_guard) = compressed.device_ptr_mut(&ctx.stream);
+
+            let rope_dim = if apply_rope { 32usize } else { 0usize };
+            iter_sync(b, &ctx, || unsafe {
+                ffi::dsv4_compressor_update_cuda(
+                    kv_raw_ptr as *const ffi::Half,
+                    score_raw_ptr as *const ffi::Half,
+                    ape_ptr as *const ffi::Half,
+                    norm_ptr as *const ffi::Half,
+                    pending_kv_ptr as *mut ffi::Half,
+                    pending_score_ptr as *mut ffi::Half,
+                    prev_overlap_kv_ptr as *mut ffi::Half,
+                    prev_overlap_score_ptr as *mut ffi::Half,
+                    compressed_ptr as *mut ffi::Half,
+                    num_tokens as i32,
+                    start_pos as i32,
+                    pending_tokens as i32,
+                    compressed_base as i32,
+                    head_dim as i32,
+                    ratio as i32,
+                    width as i32,
+                    i32::from(overlap),
+                    i32::from(has_prev_overlap),
+                    1.0e-6,
+                    rope_dim as i32,
+                    160_000.0,
+                    65_536,
+                    16.0,
+                    32.0,
+                    1.0,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("dsv4_compressor_update_cuda failed");
+            });
+        });
+    }
+
     group.throughput(Throughput::Elements((4 * 1024 * 256) as u64));
     group.bench_function(
         BenchmarkId::new("dequantize_paged_kv_fp8_to_hnd", 1024),
