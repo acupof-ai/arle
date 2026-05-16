@@ -256,6 +256,48 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
 
         let batch = 4usize;
 
+        group.throughput(Throughput::Elements((rows * cols) as u64));
+        group.bench_function(BenchmarkId::new("dsv4_fp8_gemv_batch_b1", label), |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let fp8_pattern = [0x38u8, 0xb8, 0x40, 0xc0, 0x30, 0xb0, 0x34, 0xb4];
+            let weight_host: Vec<u8> = (0..rows * cols)
+                .map(|idx| fp8_pattern[(idx * 7 + 3) % fp8_pattern.len()])
+                .collect();
+            let scale_host = vec![127u8; scale_rows * scale_cols];
+            let weight = ctx
+                .stream
+                .clone_htod(&weight_host)
+                .expect("failed to H2D dsv4 fp8 weights");
+            let scales = ctx
+                .stream
+                .clone_htod(&scale_host)
+                .expect("failed to H2D dsv4 scales");
+            let input = hidden_states(&ctx, cols, 1).expect("failed to allocate dsv4 input");
+            let mut output =
+                HiddenStates::zeros(&ctx, rows, 1).expect("failed to allocate dsv4 output");
+            let (weight_ptr, _weight_guard) = weight.device_ptr(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
+            let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
+            let (output_ptr, _output_guard) = output.data.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || unsafe {
+                ffi::dsv4_fp8_gemv_batch_cuda(
+                    weight_ptr as *const u8,
+                    scales_ptr as *const u8,
+                    input_ptr as *const ffi::Half,
+                    output_ptr as *mut ffi::Half,
+                    1,
+                    rows as i32,
+                    cols as i32,
+                    scale_rows as i32,
+                    scale_cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("dsv4_fp8_gemv_batch_cuda failed");
+            });
+        });
+
         group.throughput(Throughput::Elements((batch * rows * cols) as u64));
         group.bench_function(BenchmarkId::new("dsv4_fp8_gemv_batch", label), |b| {
             let ctx = DeviceContext::new().expect("failed to create CUDA context");
