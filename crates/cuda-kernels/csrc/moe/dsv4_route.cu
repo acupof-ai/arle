@@ -216,19 +216,40 @@ __global__ void dsv4_route_kernel(
         rank_scores[k] = (expert >= 0 && expert < n_experts) ? scores[expert] : 0.0f;
       }
     } else {
-      for (int expert = 0; expert < n_experts; ++expert) {
-        float top_score = scores[expert] + dsv4_route_bf16_to_f32(bias[expert]);
-        for (int k = 0; k < topk; ++k) {
-          bool better = top_score > rank_scores[k] ||
-                        (top_score == rank_scores[k] && expert < rank_indices[k]);
-          if (!better) continue;
-          for (int shift = topk - 1; shift > k; --shift) {
-            rank_scores[shift] = rank_scores[shift - 1];
-            rank_indices[shift] = rank_indices[shift - 1];
+      if (topk == 2) {
+        for (int expert = 0; expert < n_experts; ++expert) {
+          float top_score = scores[expert] + dsv4_route_bf16_to_f32(bias[expert]);
+          bool better0 = top_score > rank_scores[0] ||
+                         (top_score == rank_scores[0] && expert < rank_indices[0]);
+          if (better0) {
+            rank_scores[1] = rank_scores[0];
+            rank_indices[1] = rank_indices[0];
+            rank_scores[0] = top_score;
+            rank_indices[0] = expert;
+            continue;
           }
-          rank_scores[k] = top_score;
-          rank_indices[k] = expert;
-          break;
+          bool better1 = top_score > rank_scores[1] ||
+                         (top_score == rank_scores[1] && expert < rank_indices[1]);
+          if (better1) {
+            rank_scores[1] = top_score;
+            rank_indices[1] = expert;
+          }
+        }
+      } else {
+        for (int expert = 0; expert < n_experts; ++expert) {
+          float top_score = scores[expert] + dsv4_route_bf16_to_f32(bias[expert]);
+          for (int k = 0; k < topk; ++k) {
+            bool better = top_score > rank_scores[k] ||
+                          (top_score == rank_scores[k] && expert < rank_indices[k]);
+            if (!better) continue;
+            for (int shift = topk - 1; shift > k; --shift) {
+              rank_scores[shift] = rank_scores[shift - 1];
+              rank_indices[shift] = rank_indices[shift - 1];
+            }
+            rank_scores[k] = top_score;
+            rank_indices[k] = expert;
+            break;
+          }
         }
       }
     }
