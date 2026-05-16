@@ -447,6 +447,95 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
     ] {
         let total_routes = num_experts * routes_per_expert;
         group.throughput(Throughput::Elements((total_routes * rows * cols) as u64));
+        group.bench_function(BenchmarkId::new("dsv4_fp4_grouped_gemv", label), |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let fp4_pattern = [0x21u8, 0xb3, 0x64, 0x9a, 0x52, 0xc1, 0x73, 0x8b];
+            let scale_host = vec![127u8; scale_rows * scale_cols];
+
+            let mut weight = Vec::with_capacity(num_experts);
+            let mut scales = Vec::with_capacity(num_experts);
+            for expert in 0..num_experts {
+                let weight_host: Vec<u8> = (0..rows * cols / 2)
+                    .map(|idx| fp4_pattern[(idx * 5 + expert + 1) % fp4_pattern.len()])
+                    .collect();
+                weight.push(
+                    ctx.stream
+                        .clone_htod(&weight_host)
+                        .expect("failed to H2D dsv4 grouped fp4 weight"),
+                );
+                scales.push(
+                    ctx.stream
+                        .clone_htod(&scale_host)
+                        .expect("failed to H2D dsv4 grouped fp4 scales"),
+                );
+            }
+
+            let mut weight_guards = Vec::with_capacity(num_experts);
+            let mut scale_guards = Vec::with_capacity(num_experts);
+            let mut weight_ptrs_host = Vec::with_capacity(num_experts);
+            let mut scale_ptrs_host = Vec::with_capacity(num_experts);
+            for idx in 0..num_experts {
+                let (ptr, guard) = weight[idx].device_ptr(&ctx.stream);
+                weight_ptrs_host.push(ptr as u64);
+                weight_guards.push(guard);
+                let (ptr, guard) = scales[idx].device_ptr(&ctx.stream);
+                scale_ptrs_host.push(ptr as u64);
+                scale_guards.push(guard);
+            }
+
+            let weight_ptrs = ctx
+                .stream
+                .clone_htod(&weight_ptrs_host)
+                .expect("failed to H2D dsv4 grouped weight ptrs");
+            let scale_ptrs = ctx
+                .stream
+                .clone_htod(&scale_ptrs_host)
+                .expect("failed to H2D dsv4 grouped scale ptrs");
+            let offsets_host: Vec<i32> = (0..num_experts)
+                .map(|expert| (expert * routes_per_expert) as i32)
+                .collect();
+            let counts_host = vec![routes_per_expert as i32; num_experts];
+            let offsets = ctx
+                .stream
+                .clone_htod(&offsets_host)
+                .expect("failed to H2D dsv4 grouped offsets");
+            let counts = ctx
+                .stream
+                .clone_htod(&counts_host)
+                .expect("failed to H2D dsv4 grouped counts");
+            let input = hidden_states(&ctx, cols, total_routes)
+                .expect("failed to allocate dsv4 grouped input");
+            let mut output = HiddenStates::zeros(&ctx, rows, total_routes)
+                .expect("failed to allocate dsv4 grouped output");
+            let (weight_ptrs, _weight_ptrs_guard) = weight_ptrs.device_ptr(&ctx.stream);
+            let (scale_ptrs, _scale_ptrs_guard) = scale_ptrs.device_ptr(&ctx.stream);
+            let (offsets_ptr, _offsets_guard) = offsets.device_ptr(&ctx.stream);
+            let (counts_ptr, _counts_guard) = counts.device_ptr(&ctx.stream);
+            let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
+            let (output_ptr, _output_guard) = output.data.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || unsafe {
+                ffi::dsv4_fp4_grouped_gemv_batch_cuda(
+                    weight_ptrs as *const u64,
+                    scale_ptrs as *const u64,
+                    input_ptr as *const ffi::Half,
+                    output_ptr as *mut ffi::Half,
+                    offsets_ptr as *const i32,
+                    counts_ptr as *const i32,
+                    std::ptr::null(),
+                    num_experts as i32,
+                    routes_per_expert as i32,
+                    rows as i32,
+                    cols as i32,
+                    scale_rows as i32,
+                    scale_cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("dsv4_fp4_grouped_gemv_batch_cuda failed");
+            });
+        });
+
         group.bench_function(BenchmarkId::new("dsv4_fp4_grouped_gemv_pair", label), |b| {
             let ctx = DeviceContext::new().expect("failed to create CUDA context");
             let fp4_pattern_a = [0x21u8, 0xb3, 0x64, 0x9a, 0x52, 0xc1, 0x73, 0x8b];
