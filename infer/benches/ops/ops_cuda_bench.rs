@@ -9,9 +9,9 @@ use infer::ops;
 use super::common::{
     ATTN_SEQ_LEN, BATCH_SEQ_LEN, HEAD_DIM_128, KV_HEADS_128, MAX_SEQ_LEN, Q_HEADS_128,
     QWEN35_4B_HEAD_DIM, QWEN35_4B_HIDDEN, QWEN35_4B_INTERMEDIATE, QWEN35_4B_KV_HEADS,
-    QWEN35_4B_Q_HEADS, ROPE_THETA_QWEN3, VECTOR_DIM, VOCAB_SIZE, configure_group, decode_meta,
-    device_vec, device_vec_scaled, embedding_matrix, hidden_states, iter_sync, positive_device_vec,
-    rope_cache, token_ids, zero_f32_slice,
+    QWEN35_4B_Q_HEADS, ROPE_THETA_QWEN3, VECTOR_DIM, VOCAB_SIZE, bf16_data_scaled, configure_group,
+    decode_meta, device_vec, device_vec_scaled, embedding_matrix, hidden_states, iter_sync,
+    positive_device_vec, rope_cache, token_ids, zero_f32_slice,
 };
 
 pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
@@ -421,6 +421,64 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
                 )
                 .result()
                 .expect("dsv4_fp4_gemv_batch_cuda failed");
+            });
+        });
+    }
+
+    for &(label, num_tokens, n_experts, topk) in &[
+        ("dsv4_mini_decode_t1_e16_top2", 1usize, 16usize, 2usize),
+        ("dsv4_mini_batch_t64_e16_top2", 64usize, 16usize, 2usize),
+    ] {
+        group.throughput(Throughput::Elements((num_tokens * n_experts) as u64));
+        group.bench_function(BenchmarkId::new("dsv4_route", label), |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let logits_host = bf16_data_scaled(num_tokens * n_experts, 0.125);
+            let bias_host = bf16_data_scaled(n_experts, 0.031_25);
+            let token_ids_host: Vec<u32> = (0..num_tokens).map(|idx| idx as u32).collect();
+            let logits = ctx
+                .stream
+                .clone_htod(&logits_host)
+                .expect("failed to H2D dsv4 route logits");
+            let bias = ctx
+                .stream
+                .clone_htod(&bias_host)
+                .expect("failed to H2D dsv4 route bias");
+            let token_ids = ctx
+                .stream
+                .clone_htod(&token_ids_host)
+                .expect("failed to H2D dsv4 route token ids");
+            let mut indices = ctx
+                .stream
+                .alloc_zeros::<i32>(num_tokens * topk)
+                .expect("failed to allocate dsv4 route indices");
+            let mut weights = ctx
+                .stream
+                .alloc_zeros::<f32>(num_tokens * topk)
+                .expect("failed to allocate dsv4 route weights");
+            let (logits_ptr, _logits_guard) = logits.device_ptr(&ctx.stream);
+            let (bias_ptr, _bias_guard) = bias.device_ptr(&ctx.stream);
+            let (token_ptr, _token_guard) = token_ids.device_ptr(&ctx.stream);
+            let (idx_ptr, _idx_guard) = indices.device_ptr_mut(&ctx.stream);
+            let (weight_ptr, _weight_guard) = weights.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || unsafe {
+                ffi::dsv4_route_cuda(
+                    logits_ptr as *const ffi::Half,
+                    bias_ptr as *const ffi::Half,
+                    std::ptr::null(),
+                    token_ptr as *const u32,
+                    idx_ptr as *mut i32,
+                    weight_ptr as *mut f32,
+                    num_tokens as i32,
+                    n_experts as i32,
+                    topk as i32,
+                    1,
+                    2,
+                    1.5,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("dsv4_route_cuda failed");
             });
         });
     }
