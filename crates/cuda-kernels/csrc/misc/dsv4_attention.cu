@@ -468,6 +468,22 @@ __global__ void dsv4_compressor_update_kernel(
   int completed = total / ratio;
   int block_start0 = start_pos - pending_len;
 
+  if (completed == 0) {
+    int raw_elems = num_tokens * width;
+    for (int idx = threadIdx.x; idx < raw_elems; idx += blockDim.x) {
+      int pos = idx / width;
+      int col = idx - pos * width;
+      int abs_pos = start_pos + pos;
+      int dst = (pending_len + pos) * width + col;
+      float kv = dsv4_attn_bf16_to_f32(kv_raw[idx]);
+      float score = dsv4_attn_bf16_to_f32(score_raw[idx]) +
+                    dsv4_attn_bf16_to_f32(ape[(abs_pos % ratio) * width + col]);
+      pending_kv[dst] = dsv4_attn_f32_to_bf16_bits(kv);
+      pending_score[dst] = dsv4_attn_f32_to_bf16_bits(score);
+    }
+    return;
+  }
+
   for (int block = 0; block < completed; ++block) {
     int block_start = block_start0 + block * ratio;
     int block_end = block_start + ratio - 1;
