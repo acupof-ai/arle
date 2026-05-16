@@ -78,6 +78,51 @@ __device__ void column_normalize(float *raw, int n, float eps) {
   }
 }
 
+__device__ __forceinline__ void row_softmax_plus_eps4(float *raw, float eps) {
+#pragma unroll
+  for (int row = 0; row < 4; ++row) {
+    int base = row * 4;
+    float max_value = raw[base];
+    max_value = fmaxf(max_value, raw[base + 1]);
+    max_value = fmaxf(max_value, raw[base + 2]);
+    max_value = fmaxf(max_value, raw[base + 3]);
+
+    float value0 = expf(raw[base] - max_value);
+    float value1 = expf(raw[base + 1] - max_value);
+    float value2 = expf(raw[base + 2] - max_value);
+    float value3 = expf(raw[base + 3] - max_value);
+    float denom = value0 + value1 + value2 + value3;
+
+    raw[base] = value0 / denom + eps;
+    raw[base + 1] = value1 / denom + eps;
+    raw[base + 2] = value2 / denom + eps;
+    raw[base + 3] = value3 / denom + eps;
+  }
+}
+
+__device__ __forceinline__ void row_normalize4(float *raw, float eps) {
+#pragma unroll
+  for (int row = 0; row < 4; ++row) {
+    int base = row * 4;
+    float sum = eps + raw[base] + raw[base + 1] + raw[base + 2] + raw[base + 3];
+    raw[base] /= sum;
+    raw[base + 1] /= sum;
+    raw[base + 2] /= sum;
+    raw[base + 3] /= sum;
+  }
+}
+
+__device__ __forceinline__ void column_normalize4(float *raw, float eps) {
+#pragma unroll
+  for (int col = 0; col < 4; ++col) {
+    float sum = eps + raw[col] + raw[4 + col] + raw[8 + col] + raw[12 + col];
+    raw[col] /= sum;
+    raw[4 + col] /= sum;
+    raw[8 + col] /= sum;
+    raw[12 + col] /= sum;
+  }
+}
+
 __global__ void dsv4_mhc_expand_kernel(
     const uint16_t *__restrict__ embeddings,
     uint16_t *__restrict__ out,
@@ -169,11 +214,20 @@ __global__ void dsv4_mhc_params_kernel(
                  bf16_to_f32(base[2 * hc_mult + idx]);
     }
   }
-  row_softmax_plus_eps(raw, hc_mult, eps);
-  column_normalize(raw, hc_mult, eps);
-  for (int iter = 1; iter < sinkhorn_iters; ++iter) {
-    row_normalize(raw, hc_mult, eps);
+  if (hc_mult == 4) {
+    row_softmax_plus_eps4(raw, eps);
+    column_normalize4(raw, eps);
+    for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+      row_normalize4(raw, eps);
+      column_normalize4(raw, eps);
+    }
+  } else {
+    row_softmax_plus_eps(raw, hc_mult, eps);
     column_normalize(raw, hc_mult, eps);
+    for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+      row_normalize(raw, hc_mult, eps);
+      column_normalize(raw, hc_mult, eps);
+    }
   }
   for (int idx = 0; idx < hc_mult * hc_mult; ++idx) {
     comb[token_comb + idx] = raw[idx];
