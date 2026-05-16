@@ -415,6 +415,58 @@ __global__ void dsv4_fp8_gemv_batch_tiled_kernel(
     const int scale_row_offset = sr * scale_cols;
     const uint8_t* weight_row = weight + row * K;
     const uint8_t* scale_row = scales + scale_row_offset;
+    const int tile_batches_raw = B - batch_base;
+    const int tile_batches = tile_batches_raw < DSV4_BATCH_TILE ? tile_batches_raw : DSV4_BATCH_TILE;
+
+    if (tile_batches <= 4) {
+        float sums4[4];
+#pragma unroll
+        for (int b = 0; b < 4; ++b) sums4[b] = 0.0f;
+
+        for (int sc = 0; sc < scale_cols; ++sc) {
+            const int k_start = sc * block_w;
+            if (k_start >= K) break;
+            int k_end = k_start + block_w;
+            if (k_end > K) k_end = K;
+            const float scale = dsv4_decode_e8m0(scale_row[sc]);
+            for (int k = k_start + tid_in_row; k < k_end; k += threads_per_row) {
+                const float w = dsv4_decode_fp8_e4m3(weight_row[k]) * scale;
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    if (b < tile_batches) {
+                        const int batch_idx = batch_base + b;
+                        sums4[b] += w * __bfloat162float(input[batch_idx * K + k]);
+                    }
+                }
+            }
+        }
+
+        __shared__ float smem4[GEMV_ROWS * 8 * 4];
+        int warps_per_row = threads_per_row / WARP_SIZE;
+        int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            sums4[b] = warp_reduce_sum(sums4[b]);
+            if (lane_id == 0) {
+                smem4[(row_in_block * warps_per_row + warp_in_row) * 4 + b] = sums4[b];
+            }
+        }
+        __syncthreads();
+        if (tid_in_row == 0) {
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                if (b >= tile_batches) continue;
+                const int batch_idx = batch_base + b;
+                float total = 0.0f;
+                for (int w = 0; w < warps_per_row; ++w) {
+                    total += smem4[(row_in_block * warps_per_row + w) * 4 + b];
+                }
+                output[batch_idx * N + row] = __float2bfloat16(total);
+            }
+        }
+        return;
+    }
+
     float sums[DSV4_BATCH_TILE];
 #pragma unroll
     for (int b = 0; b < DSV4_BATCH_TILE; ++b) sums[b] = 0.0f;
