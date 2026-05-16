@@ -169,22 +169,46 @@ fn run_dsv4_fp8_batched_gemv_case(seq_len: usize) -> Result<()> {
 
 #[test]
 fn test_dsv4_fp4_batched_gemv() -> Result<()> {
+    run_dsv4_fp4_batched_gemv_case(2)?;
+    run_dsv4_fp4_batched_gemv_case(5)?;
+    Ok(())
+}
+
+fn run_dsv4_fp4_batched_gemv_case(seq_len: usize) -> Result<()> {
     let ctx = DeviceContext::new()?;
     let weight = DeviceMatrix::from_dsv4_fp4_block_scaled(&ctx, &[0x21, 0xb3], &[127], 2, 2, 1, 1)?;
-    let x_host = bf16_vec(&[2.0, 4.0, 1.0, 1.0]);
+    let x_values = (0..seq_len)
+        .flat_map(|token| {
+            if token % 2 == 0 {
+                [2.0, 4.0]
+            } else {
+                [1.0, 1.0]
+            }
+        })
+        .collect::<Vec<_>>();
+    let x_host = bf16_vec(&x_values);
     let x = HiddenStates {
         data: ctx.stream.clone_htod(&x_host)?,
         hidden_dim: 2,
-        seq_len: 2,
+        seq_len,
     };
-    let mut out = HiddenStates::zeros(&ctx, 2, 2)?;
+    let mut out = HiddenStates::zeros(&ctx, 2, seq_len)?;
 
     try_gemm_with_phase_into(&ctx, &weight, &x, &mut out, LinearDispatchPhase::Prefill)?;
     let host = ctx.stream.clone_dtoh(&out.data)?;
     ctx.sync()?;
     let values = host.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+    let expected = (0..seq_len)
+        .flat_map(|token| {
+            if token % 2 == 0 {
+                [5.0, -3.0]
+            } else {
+                [1.5, 0.0]
+            }
+        })
+        .collect::<Vec<_>>();
 
-    assert_close(&values, &[5.0, -3.0, 1.5, 0.0], 0.01);
+    assert_close(&values, &expected, 0.01);
     Ok(())
 }
 
