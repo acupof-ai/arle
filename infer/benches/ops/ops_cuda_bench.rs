@@ -483,6 +483,89 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
         });
     }
 
+    for &(label, num_tokens, residual_hidden_dim, mix_dim, hc_mult, sinkhorn_iters) in &[
+        (
+            "dsv4_mini_decode_t1_h4096_m24_hc4",
+            1usize,
+            4096usize,
+            24usize,
+            4usize,
+            20usize,
+        ),
+        (
+            "dsv4_mini_batch_t64_h4096_m24_hc4",
+            64usize,
+            4096usize,
+            24usize,
+            4usize,
+            20usize,
+        ),
+    ] {
+        group.throughput(Throughput::Elements(
+            (num_tokens * residual_hidden_dim) as u64,
+        ));
+        group.bench_function(BenchmarkId::new("dsv4_mhc_params", label), |b| {
+            let ctx = DeviceContext::new().expect("failed to create CUDA context");
+            let residual = hidden_states(&ctx, residual_hidden_dim, num_tokens)
+                .expect("failed to allocate dsv4 mhc residual");
+            let mixes_host = bf16_data_scaled(num_tokens * mix_dim, 0.0625);
+            let base_host = bf16_data_scaled(mix_dim, 0.015_625);
+            let scale_host = bf16_data_scaled(3, 0.125);
+            let mixes = ctx
+                .stream
+                .clone_htod(&mixes_host)
+                .expect("failed to H2D dsv4 mhc mixes");
+            let base = ctx
+                .stream
+                .clone_htod(&base_host)
+                .expect("failed to H2D dsv4 mhc base");
+            let scale = ctx
+                .stream
+                .clone_htod(&scale_host)
+                .expect("failed to H2D dsv4 mhc scale");
+            let mut pre = ctx
+                .stream
+                .alloc_zeros::<f32>(num_tokens * hc_mult)
+                .expect("failed to allocate dsv4 mhc pre");
+            let mut post = ctx
+                .stream
+                .alloc_zeros::<f32>(num_tokens * hc_mult)
+                .expect("failed to allocate dsv4 mhc post");
+            let mut comb = ctx
+                .stream
+                .alloc_zeros::<f32>(num_tokens * hc_mult * hc_mult)
+                .expect("failed to allocate dsv4 mhc comb");
+            let (residual_ptr, _residual_guard) = residual.data.device_ptr(&ctx.stream);
+            let (mixes_ptr, _mixes_guard) = mixes.device_ptr(&ctx.stream);
+            let (base_ptr, _base_guard) = base.device_ptr(&ctx.stream);
+            let (scale_ptr, _scale_guard) = scale.device_ptr(&ctx.stream);
+            let (pre_ptr, _pre_guard) = pre.device_ptr_mut(&ctx.stream);
+            let (post_ptr, _post_guard) = post.device_ptr_mut(&ctx.stream);
+            let (comb_ptr, _comb_guard) = comb.device_ptr_mut(&ctx.stream);
+
+            iter_sync(b, &ctx, || unsafe {
+                ffi::dsv4_mhc_params_cuda(
+                    residual_ptr as *const ffi::Half,
+                    mixes_ptr as *const ffi::Half,
+                    base_ptr as *const ffi::Half,
+                    scale_ptr as *const ffi::Half,
+                    pre_ptr as *mut f32,
+                    post_ptr as *mut f32,
+                    comb_ptr as *mut f32,
+                    num_tokens as i32,
+                    residual_hidden_dim as i32,
+                    mix_dim as i32,
+                    hc_mult as i32,
+                    1.0e-6,
+                    sinkhorn_iters as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("dsv4_mhc_params_cuda failed");
+            });
+        });
+    }
+
     group.throughput(Throughput::Elements((4 * 1024 * 256) as u64));
     group.bench_function(
         BenchmarkId::new("dequantize_paged_kv_fp8_to_hnd", 1024),
