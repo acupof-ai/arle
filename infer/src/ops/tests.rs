@@ -455,6 +455,137 @@ fn test_dsv4_route_cuda_top2_sqrtsoftplus_bias() -> Result<()> {
 }
 
 #[test]
+fn test_dsv4_compressor_update_cuda_overlap_decode() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let head_dim = 2usize;
+    let ratio = 2usize;
+    let width = 2 * head_dim;
+    let num_tokens = 1usize;
+    let start_pos = 3usize;
+    let pending_tokens = 1usize;
+    let compressed_base = 1usize;
+
+    let kv_raw_host = bf16_vec(&[3.0, 3.5, 4.0, 4.5]);
+    let score_raw_host = bf16_vec(&[0.4, 0.5, 0.6, 0.7]);
+    let ape_host = bf16_vec(&[
+        0.0, 0.0, 0.0, 0.0, //
+        0.01, 0.02, 0.03, 0.04,
+    ]);
+    let norm_host = bf16_vec(&[1.0, 0.5]);
+    let pending_kv_host = bf16_vec(&[
+        1.0, 1.5, 2.0, 2.5, //
+        0.0, 0.0, 0.0, 0.0,
+    ]);
+    let pending_score_host = bf16_vec(&[
+        0.05, 0.15, 0.25, 0.35, //
+        0.0, 0.0, 0.0, 0.0,
+    ]);
+    let prev_overlap_kv_host = bf16_vec(&[0.25, -0.25, 0.5, -0.5]);
+    let prev_overlap_score_host = bf16_vec(&[0.1, -0.2, 0.3, 0.0]);
+
+    let kv_raw = ctx.stream.clone_htod(&kv_raw_host)?;
+    let score_raw = ctx.stream.clone_htod(&score_raw_host)?;
+    let ape = ctx.stream.clone_htod(&ape_host)?;
+    let norm = ctx.stream.clone_htod(&norm_host)?;
+    let mut pending_kv = ctx.stream.clone_htod(&pending_kv_host)?;
+    let mut pending_score = ctx.stream.clone_htod(&pending_score_host)?;
+    let mut prev_overlap_kv = ctx.stream.clone_htod(&prev_overlap_kv_host)?;
+    let mut prev_overlap_score = ctx.stream.clone_htod(&prev_overlap_score_host)?;
+    let mut compressed = ctx
+        .stream
+        .alloc_zeros::<bf16>((compressed_base + 1) * head_dim)?;
+
+    {
+        let (kv_raw_ptr, _kv_raw_guard) = kv_raw.device_ptr(&ctx.stream);
+        let (score_raw_ptr, _score_raw_guard) = score_raw.device_ptr(&ctx.stream);
+        let (ape_ptr, _ape_guard) = ape.device_ptr(&ctx.stream);
+        let (norm_ptr, _norm_guard) = norm.device_ptr(&ctx.stream);
+        let (pending_kv_ptr, _pending_kv_guard) = pending_kv.device_ptr_mut(&ctx.stream);
+        let (pending_score_ptr, _pending_score_guard) = pending_score.device_ptr_mut(&ctx.stream);
+        let (prev_overlap_kv_ptr, _prev_overlap_kv_guard) =
+            prev_overlap_kv.device_ptr_mut(&ctx.stream);
+        let (prev_overlap_score_ptr, _prev_overlap_score_guard) =
+            prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let (compressed_ptr, _compressed_guard) = compressed.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_compressor_update_cuda(
+                kv_raw_ptr as *const ffi::Half,
+                score_raw_ptr as *const ffi::Half,
+                ape_ptr as *const ffi::Half,
+                norm_ptr as *const ffi::Half,
+                pending_kv_ptr as *mut ffi::Half,
+                pending_score_ptr as *mut ffi::Half,
+                prev_overlap_kv_ptr as *mut ffi::Half,
+                prev_overlap_score_ptr as *mut ffi::Half,
+                compressed_ptr as *mut ffi::Half,
+                num_tokens as i32,
+                start_pos as i32,
+                pending_tokens as i32,
+                compressed_base as i32,
+                head_dim as i32,
+                ratio as i32,
+                width as i32,
+                1,
+                1,
+                1.0e-6,
+                0,
+                160_000.0,
+                65_536,
+                16.0,
+                32.0,
+                1.0,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    fn weighted(logits: &[f32], values: &[f32]) -> f32 {
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let weights = logits
+            .iter()
+            .map(|logit| (logit - max_logit).exp())
+            .collect::<Vec<_>>();
+        let denom = weights.iter().sum::<f32>();
+        weights
+            .iter()
+            .zip(values.iter())
+            .map(|(weight, value)| weight / denom * value)
+            .sum()
+    }
+
+    let row0 = weighted(&[0.1, 0.3, 0.25, 0.63], &[0.25, 0.5, 2.0, 4.0]);
+    let row1 = weighted(&[-0.2, 0.0, 0.35, 0.74], &[-0.25, -0.5, 2.5, 4.5]);
+    let norm_scale = 1.0 / (((row0 * row0 + row1 * row1) / head_dim as f32) + 1.0e-6).sqrt();
+    let expected_compressed = [row0 * norm_scale, row1 * norm_scale * 0.5];
+    let expected_prev_kv = [1.0, 1.5, 3.0, 3.5];
+    let expected_prev_score = [0.05, 0.15, 0.41, 0.52];
+
+    let compressed_host = ctx.stream.clone_dtoh(&compressed)?;
+    let prev_kv_host = ctx.stream.clone_dtoh(&prev_overlap_kv)?;
+    let prev_score_host = ctx.stream.clone_dtoh(&prev_overlap_score)?;
+    ctx.sync()?;
+    let got_compressed = compressed_host
+        [compressed_base * head_dim..(compressed_base + 1) * head_dim]
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let got_prev_kv = prev_kv_host
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let got_prev_score = prev_score_host
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+
+    assert_close(&got_compressed, &expected_compressed, 0.01);
+    assert_close(&got_prev_kv, &expected_prev_kv, 0.01);
+    assert_close(&got_prev_score, &expected_prev_score, 0.01);
+    Ok(())
+}
+
+#[test]
 fn test_argmax() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let x = DeviceVec::from_host(&ctx, &bf16_vec(&[1.0, 9.0, 3.0, 8.0]))?;
