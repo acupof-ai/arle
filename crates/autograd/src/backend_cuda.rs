@@ -473,6 +473,82 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// Device-resident matmul backward — foundation for the post-G3
+    /// device-resident gradient tape. Mirrors the cuBLAS dispatch of the
+    /// host-buffer `matmul_backward` (`grad_a = dC @ B^T`,
+    /// `grad_b = A^T @ dC` via two SGEMMs with `OP_T` on the transposed
+    /// operand) but consumes existing device handles and returns
+    /// unevaluated `CudaSlice<f32>` outputs — no host roundtrip on either
+    /// side. The terminal `backend.eval(...)` in `AdamW::step_device`
+    /// performs the single host fence per training step (M5.3b.11
+    /// batched-eval contract). See
+    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    fn matmul_backward_device(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (
+                a,
+                a_shape,
+                b,
+                b_shape,
+                grad_out,
+                grad_out_shape,
+                need_grad_a,
+                need_grad_b,
+            );
+            todo!("GPU required: cuda matmul_backward_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_matmul_backward_device(
+                self,
+                a,
+                a_shape,
+                b,
+                b_shape,
+                grad_out,
+                grad_out_shape,
+                need_grad_a,
+                need_grad_b,
+            )
+        }
+    }
+
+    /// Device-resident gradient accumulation. Allocates a fresh
+    /// `CudaSlice<f32>` for the sum (so the previous `dest` handle remains
+    /// valid for any tape consumers still holding it) and launches the
+    /// `add_into_f32` 1D NVRTC kernel. Returns the unevaluated handle for
+    /// the batched terminal `eval`. See
+    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    fn add_into_device(
+        &self,
+        dest: &DeviceHandle,
+        src: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (dest, src, shape);
+            todo!("GPU required: cuda add_into_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_add_into_device(self, dest, src, shape)
+        }
+    }
+
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -1525,6 +1601,264 @@ fn cuda_matmul_backward(
             got: a_shape.len().max(b_shape.len()),
         }),
     }
+}
+
+// Device-resident sibling of `cuda_matmul_backward`. Same cuBLAS dispatch
+// (two SGEMMs with OP_T on the transposed operand) but consumes existing
+// `CudaSlice<f32>` handles via `cuda_slice` and emits the gradients as
+// fresh `CudaSlice<f32>` buffers wrapped in `DeviceHandle::Cuda`. No
+// `synchronize()` — the caller's terminal `eval` does the single host
+// fence per training step (M5.3b.11 contract). Foundation for the
+// post-G3 device-resident gradient tape; the dispatch wiring lands in a
+// follow-up subagent.
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_matmul_backward_device(
+    backend: &CudaBackend,
+    a: &DeviceHandle,
+    a_shape: &[usize],
+    b: &DeviceHandle,
+    b_shape: &[usize],
+    grad_out: &DeviceHandle,
+    grad_out_shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+    let expected_out = matmul_output_shape(a_shape, b_shape)?;
+    if grad_out_shape != expected_out.as_slice() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: expected_out,
+            got: grad_out_shape.to_vec(),
+        });
+    }
+
+    if !need_grad_a && !need_grad_b {
+        return Ok((None, None));
+    }
+
+    let d_a = backend.cuda_slice(a, "matmul_backward_device")?;
+    let d_b = backend.cuda_slice(b, "matmul_backward_device")?;
+    let d_g = backend.cuda_slice(grad_out, "matmul_backward_device")?;
+
+    if d_a.len() != shape_size(a_shape)
+        || d_b.len() != shape_size(b_shape)
+        || d_g.len() != shape_size(grad_out_shape)
+    {
+        return Err(AutogradError::TapeInvariant(
+            "cuda matmul_backward_device handle size does not match shape",
+        ));
+    }
+
+    match (a_shape.len(), b_shape.len()) {
+        (2, 2) => {
+            let m = a_shape[0];
+            let k = a_shape[1];
+            let n = b_shape[1];
+
+            let grad_a_handle = if need_grad_a {
+                // grad_a[M,K] = grad_out[M,N] @ B^T[N,K]
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(m * k)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let cfg = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: k as i32,
+                    n: m as i32,
+                    k: n as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: n as i32,
+                    beta: 0.0,
+                    ldc: k as i32,
+                };
+                // Safety: dims validated; device buffers outlive the call.
+                unsafe {
+                    backend.blas.gemm(cfg, d_b, d_g, &mut c).map_err(|_| {
+                        AutogradError::TapeInvariant(
+                            "cuBLAS sgemm failed (matmul_backward_device grad_a)",
+                        )
+                    })?;
+                }
+                Some(DeviceHandle::Cuda(CudaStorage::new(c)))
+            } else {
+                None
+            };
+
+            let grad_b_handle = if need_grad_b {
+                // grad_b[K,N] = A^T[K,M] @ grad_out[M,N]
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(k * n)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let cfg = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_N,
+                    transb: cublasOperation_t::CUBLAS_OP_T,
+                    m: n as i32,
+                    n: k as i32,
+                    k: m as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: k as i32,
+                    beta: 0.0,
+                    ldc: n as i32,
+                };
+                // Safety: dims validated; device buffers outlive the call.
+                unsafe {
+                    backend.blas.gemm(cfg, d_g, d_a, &mut c).map_err(|_| {
+                        AutogradError::TapeInvariant(
+                            "cuBLAS sgemm failed (matmul_backward_device grad_b)",
+                        )
+                    })?;
+                }
+                Some(DeviceHandle::Cuda(CudaStorage::new(c)))
+            } else {
+                None
+            };
+
+            Ok((grad_a_handle, grad_b_handle))
+        }
+        (3, 3) => {
+            let batch = a_shape[0];
+            let m = a_shape[1];
+            let k = a_shape[2];
+            let n = b_shape[2];
+            if b_shape[0] != batch || grad_out_shape[0] != batch {
+                return Err(AutogradError::ShapeMismatch {
+                    expected: vec![batch],
+                    got: vec![b_shape[0].min(grad_out_shape[0])],
+                });
+            }
+
+            let grad_a_handle = if need_grad_a {
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(batch * m * k)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let gemm = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: k as i32,
+                    n: m as i32,
+                    k: n as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: n as i32,
+                    beta: 0.0,
+                    ldc: k as i32,
+                };
+                let cfg = StridedBatchedConfig::<f32> {
+                    gemm,
+                    batch_size: batch as i32,
+                    stride_a: (k * n) as i64,
+                    stride_b: (m * n) as i64,
+                    stride_c: (m * k) as i64,
+                };
+                // Safety: dims validated; buffers outlive the call.
+                unsafe {
+                    backend
+                        .blas
+                        .gemm_strided_batched(cfg, d_b, d_g, &mut c)
+                        .map_err(|_| {
+                            AutogradError::TapeInvariant(
+                                "cuBLAS sgemm_strided_batched failed (matmul_backward_device grad_a)",
+                            )
+                        })?;
+                }
+                Some(DeviceHandle::Cuda(CudaStorage::new(c)))
+            } else {
+                None
+            };
+
+            let grad_b_handle = if need_grad_b {
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(batch * k * n)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let gemm = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_N,
+                    transb: cublasOperation_t::CUBLAS_OP_T,
+                    m: n as i32,
+                    n: k as i32,
+                    k: m as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: k as i32,
+                    beta: 0.0,
+                    ldc: n as i32,
+                };
+                let cfg = StridedBatchedConfig::<f32> {
+                    gemm,
+                    batch_size: batch as i32,
+                    stride_a: (m * n) as i64,
+                    stride_b: (m * k) as i64,
+                    stride_c: (k * n) as i64,
+                };
+                // Safety: dims validated; buffers outlive the call.
+                unsafe {
+                    backend
+                        .blas
+                        .gemm_strided_batched(cfg, d_g, d_a, &mut c)
+                        .map_err(|_| {
+                            AutogradError::TapeInvariant(
+                                "cuBLAS sgemm_strided_batched failed (matmul_backward_device grad_b)",
+                            )
+                        })?;
+                }
+                Some(DeviceHandle::Cuda(CudaStorage::new(c)))
+            } else {
+                None
+            };
+
+            Ok((grad_a_handle, grad_b_handle))
+        }
+        _ => Err(AutogradError::InvalidRank {
+            expected: "both operands must be rank-2 or rank-3",
+            got: a_shape.len().max(b_shape.len()),
+        }),
+    }
+}
+
+// Device-resident gradient accumulation. Allocates a fresh output buffer
+// and writes `dest[i] + src[i]` via the `add_into_f32` NVRTC kernel. The
+// returned handle is unevaluated — terminal `eval` is the caller's.
+// Foundation for the post-G3 device-resident gradient tape; dispatch wires
+// in a follow-up subagent.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_add_into_device(
+    backend: &CudaBackend,
+    dest: &DeviceHandle,
+    src: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    let d_dest = backend.cuda_slice(dest, "add_into_device")?;
+    let d_src = backend.cuda_slice(src, "add_into_device")?;
+    let size = shape_size(shape);
+    if d_dest.len() != size || d_src.len() != size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_dest.len().min(d_src.len()),
+            shape: shape.to_vec(),
+            size,
+        });
+    }
+
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (add_into_device)"))?;
+    let n = i32::try_from(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda add_into length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("add_into_f32")?,
+        size,
+        |mut builder| {
+            builder.arg(&mut d_out).arg(d_dest).arg(d_src).arg(&n);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
 #[cfg(not(feature = "no-cuda"))]

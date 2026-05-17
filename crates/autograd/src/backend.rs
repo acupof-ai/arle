@@ -196,9 +196,106 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         )
     }
 
+    /// Device-handle variant of `matmul_backward`. Foundation for the
+    /// device-resident gradient tape — see
+    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    ///
+    /// Computes `grad_a = grad_out @ B^T` and `grad_b = A^T @ grad_out` and
+    /// returns each as an *unevaluated* `DeviceHandle` so the caller can
+    /// batch a single terminal `backend.eval(...)` per training step (mirrors
+    /// the M5.3b.11 contract used by `adamw_step` /
+    /// `log_softmax_last_axis_backward`). `need_grad_a` / `need_grad_b`
+    /// short-circuit to `None` so the unused SGEMM is never launched.
+    ///
+    /// The default implementation does
+    /// `readback → cpu_matmul_backward → upload` so non-CUDA backends silently
+    /// inherit correct (but slow) behaviour; CUDA overrides to keep both
+    /// SGEMMs on-device with no host roundtrip.
+    ///
+    /// The existing host-buffer `matmul_backward` stays in place — both
+    /// methods coexist while the dispatch wiring lands in a follow-up
+    /// subagent.
+    fn matmul_backward_device(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        if !need_grad_a && !need_grad_b {
+            return Ok((None, None));
+        }
+        let a_host = self.readback(a)?;
+        let b_host = self.readback(b)?;
+        let grad_host = self.readback(grad_out)?;
+        let (grad_a, grad_b) = cpu_matmul_backward(
+            &a_host,
+            a_shape,
+            &b_host,
+            b_shape,
+            &grad_host,
+            grad_out_shape,
+            need_grad_a,
+            need_grad_b,
+        )?;
+        let grad_a_handle = if need_grad_a {
+            Some(self.upload(&grad_a, a_shape)?)
+        } else {
+            None
+        };
+        let grad_b_handle = if need_grad_b {
+            Some(self.upload(&grad_b, b_shape)?)
+        } else {
+            None
+        };
+        Ok((grad_a_handle, grad_b_handle))
+    }
+
     /// Elementwise `C = A + B` over identically-shaped contiguous tensors.
     /// Lazy on backends that support it (e.g. Metal defers to `mlx_eval`).
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
+
+    /// In-place gradient accumulation: returns a fresh `DeviceHandle`
+    /// holding `dest + src` elementwise. Foundation for the device-resident
+    /// gradient tape — when two backward paths converge on the same
+    /// parameter, the merge runs through this op rather than a host
+    /// `accumulate_grad` roundtrip. See
+    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    ///
+    /// `dest` and `src` must share `shape` and `product(shape)` elements.
+    /// The returned handle is *unevaluated* on backends with a lazy graph
+    /// (CUDA returns a `CudaSlice` ready for the batched `eval`).
+    ///
+    /// The default implementation does `readback both → host add → upload`
+    /// so CPU/Metal inherit correct behaviour; CUDA overrides with a
+    /// 1D NVRTC kernel.
+    fn add_into_device(
+        &self,
+        dest: &DeviceHandle,
+        src: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let dest_host = self.readback(dest)?;
+        let src_host = self.readback(src)?;
+        let size = shape_size(shape);
+        if dest_host.len() != size || src_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: dest_host.len().min(src_host.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let out: Vec<f32> = dest_host
+            .iter()
+            .zip(src_host.iter())
+            .map(|(d, s)| d + s)
+            .collect();
+        self.upload(&out, shape)
+    }
 
     /// Reduce-sum **all** elements of `x` into a rank-0 scalar device handle.
     /// `shape` describes the input layout (`product(shape)` elements; an

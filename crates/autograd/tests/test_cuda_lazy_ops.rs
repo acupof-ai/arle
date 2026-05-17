@@ -23,7 +23,7 @@
 
 use autograd::backend::{
     cpu_gather_last_dim_backward, cpu_gather_last_dim_forward, cpu_log_softmax_backward,
-    cpu_log_softmax_forward_last_axis, cpu_softmax_forward_last_axis,
+    cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_softmax_forward_last_axis,
 };
 use autograd::backend_cuda::CudaBackend;
 use autograd::{Backend, DeviceHandle};
@@ -305,5 +305,125 @@ fn cuda_gather_last_dim_backward_matches_cpu() {
          (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
         dev_grad[idx],
         host_grad[idx]
+    );
+}
+
+#[test]
+fn cuda_matmul_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_matmul_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // [B*S=1024, K=2560] @ [K=2560, N=512] — production-scale rank-2 matmul
+    // for the post-G3 device-resident gradient tape foundation. The forward
+    // produces a `[1024, 512]` activation; backward computes
+    // `grad_a:[1024, 2560]` and `grad_b:[2560, 512]` via two SGEMMs each.
+    let a_shape: Vec<usize> = vec![1024, 2560];
+    let b_shape: Vec<usize> = vec![2560, 512];
+    let g_shape: Vec<usize> = vec![1024, 512];
+
+    let a = rng_vec(0x12345, a_shape.iter().product(), 1.0);
+    let b = rng_vec(0x67890, b_shape.iter().product(), 1.0);
+    let g = rng_vec(0xABCDE, g_shape.iter().product(), 1.0);
+
+    // Host reference: identical math to the device override, just via the
+    // physically-transposed `cpu_matmul_forward` chain.
+    let (host_grad_a, host_grad_b) =
+        cpu_matmul_backward(&a, &a_shape, &b, &b_shape, &g, &g_shape, true, true)
+            .expect("cpu matmul_backward");
+
+    // Device-resident path: all three operands stay on-device, both grads
+    // come back as unevaluated `DeviceHandle::Cuda`. Terminal eval performs
+    // the single host fence per the M5.3b.11 batched-eval contract.
+    let a_h: DeviceHandle = backend.upload(&a, &a_shape).expect("upload a");
+    let b_h: DeviceHandle = backend.upload(&b, &b_shape).expect("upload b");
+    let g_h: DeviceHandle = backend.upload(&g, &g_shape).expect("upload g");
+    let (grad_a_h, grad_b_h) = backend
+        .matmul_backward_device(&a_h, &a_shape, &b_h, &b_shape, &g_h, &g_shape, true, true)
+        .expect("cuda matmul_backward_device");
+    let grad_a_h = grad_a_h.expect("need_grad_a -> Some");
+    let grad_b_h = grad_b_h.expect("need_grad_b -> Some");
+    backend.eval(&[&grad_a_h, &grad_b_h]).expect("cuda eval");
+    let dev_grad_a = backend.readback(&grad_a_h).expect("grad_a readback");
+    let dev_grad_b = backend.readback(&grad_b_h).expect("grad_b readback");
+
+    // cuBLAS double-SGEMM accumulates more rounding than a single sgemm on a
+    // K=2560 reduction (~sqrt(K) * f32_eps ≈ 6e-6 per dot, scaled by the
+    // input magnitude bound). Use combined `atol=1e-4 + rtol=1e-4` — mirrors
+    // the Metal matmul-backward gate (Wave 1 reference).
+    let (excess_a, abs_a, idx_a) = max_err_with_tol(&dev_grad_a, &host_grad_a, 1e-4, 1e-4);
+    assert!(
+        excess_a <= 1.0,
+        "matmul_backward_device grad_a exceeds atol=1e-4 + rtol=1e-4 at idx {idx_a} \
+         (|diff|={abs_a}, dev={}, host={}, excess_ratio={excess_a})",
+        dev_grad_a[idx_a],
+        host_grad_a[idx_a]
+    );
+    let (excess_b, abs_b, idx_b) = max_err_with_tol(&dev_grad_b, &host_grad_b, 1e-4, 1e-4);
+    assert!(
+        excess_b <= 1.0,
+        "matmul_backward_device grad_b exceeds atol=1e-4 + rtol=1e-4 at idx {idx_b} \
+         (|diff|={abs_b}, dev={}, host={}, excess_ratio={excess_b})",
+        dev_grad_b[idx_b],
+        host_grad_b[idx_b]
+    );
+
+    // need_grad_a=false / need_grad_b=true short-circuit: grad_a comes back
+    // as `None` so the unused SGEMM is never launched.
+    let (grad_a_h2, grad_b_h2) = backend
+        .matmul_backward_device(&a_h, &a_shape, &b_h, &b_shape, &g_h, &g_shape, false, true)
+        .expect("cuda matmul_backward_device (need_grad_a=false)");
+    assert!(
+        grad_a_h2.is_none(),
+        "need_grad_a=false must short-circuit to None"
+    );
+    let grad_b_h2 = grad_b_h2.expect("need_grad_b -> Some");
+    backend.eval(&[&grad_b_h2]).expect("cuda eval");
+    let dev_grad_b2 = backend
+        .readback(&grad_b_h2)
+        .expect("grad_b readback (short)");
+    let (excess_b2, abs_b2, idx_b2) = max_err_with_tol(&dev_grad_b2, &host_grad_b, 1e-4, 1e-4);
+    assert!(
+        excess_b2 <= 1.0,
+        "matmul_backward_device grad_b (need_grad_a=false) exceeds atol=1e-4 + rtol=1e-4 at idx {idx_b2} \
+         (|diff|={abs_b2}, dev={}, host={}, excess_ratio={excess_b2})",
+        dev_grad_b2[idx_b2],
+        host_grad_b[idx_b2]
+    );
+}
+
+#[test]
+fn cuda_add_into_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_add_into_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // [N=10000] — small but large enough to span multiple 256-thread blocks
+    // (10000/256 ≈ 40 blocks) so we exercise the launch grid.
+    let shape: Vec<usize> = vec![10_000];
+    let size: usize = shape.iter().product();
+
+    let dest = rng_vec(0xACC, size, 1.0);
+    let src = rng_vec(0x9AB, size, 1.0);
+
+    let host_sum: Vec<f32> = dest.iter().zip(src.iter()).map(|(d, s)| d + s).collect();
+
+    let dest_h: DeviceHandle = backend.upload(&dest, &shape).expect("upload dest");
+    let src_h: DeviceHandle = backend.upload(&src, &shape).expect("upload src");
+    let out_h = backend
+        .add_into_device(&dest_h, &src_h, &shape)
+        .expect("cuda add_into_device");
+    backend.eval(&[&out_h]).expect("cuda eval");
+    let dev_sum = backend.readback(&out_h).expect("dev add_into readback");
+
+    let (excess, abs, idx) = max_err(&dev_sum, &host_sum);
+    assert!(
+        excess <= 1.0,
+        "add_into_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_sum[idx],
+        host_sum[idx]
     );
 }
