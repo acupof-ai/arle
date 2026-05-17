@@ -499,6 +499,45 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// M5.3b: device-resident row-wise softmax over the last axis. The
+    /// default trait implementation falls back to
+    /// `readback → host compute → upload`, which on production shapes
+    /// (`[B, S, V] = 2 × 512 × 248070 × 4 B ≈ 1 GB`) dominates per-step
+    /// wall time. Here we reuse the existing NVRTC kernel
+    /// (`softmax_last_axis_f32` in `backend_cuda/kernels/softmax.cu`) but
+    /// keep the result on-device so the CE-loss chain (softmax → gather)
+    /// stays lazy. No `synchronize()` — the eval contract belongs to the
+    /// caller (`Tape::backward` / `AdamW::step_device`).
+    fn softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda softmax_last_axis is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_softmax_like_device(self, x, shape, "softmax_last_axis_f32")
+        }
+    }
+
+    /// M5.3b: device-resident row-wise log-softmax over the last axis.
+    /// Same rationale as `softmax_last_axis` (no host roundtrip; the
+    /// existing `log_softmax_last_axis_f32` NVRTC kernel runs against
+    /// the device-side slice in place).
+    fn log_softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda log_softmax_last_axis is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_softmax_like_device(self, x, shape, "log_softmax_last_axis_f32")
+        }
+    }
+
     fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -681,6 +720,31 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_gather_last_dim(self, src, src_shape, ids)
+        }
+    }
+
+    /// M5.3b: device-resident gather along the last axis. Reuses the
+    /// existing `gather_last_dim_f32` NVRTC kernel against the
+    /// device-side `src` slice, returning a fresh `CudaSlice<f32>` of
+    /// length `product(src_shape[..-1])` without a host roundtrip. The
+    /// CE-loss chain is the production caller: keeps the
+    /// `[B,S,V]` logits on-device through the per-row gather instead of
+    /// materializing the full ~1 GB tensor on the host between
+    /// `log_softmax` and `gather`.
+    fn gather_last_dim(
+        &self,
+        src: &DeviceHandle,
+        src_shape: &[usize],
+        ids: &[i32],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (src, src_shape, ids);
+            todo!("GPU required: cuda gather_last_dim is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_gather_last_dim_device(self, src, src_shape, ids)
         }
     }
 
@@ -915,6 +979,135 @@ fn cuda_softmax_like(
         .synchronize()
         .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
     Ok(host)
+}
+
+// Device-resident sibling of `cuda_softmax_like`: same NVRTC kernel + same
+// 256-thread shared-mem reduction, but takes the input as a borrowed
+// `CudaSlice<f32>` and returns a fresh `CudaSlice<f32>` instead of doing
+// `upload → kernel → readback`. No `synchronize()` — the caller owns the
+// terminal eval (Tape::backward / AdamW::step_device batched flush per the
+// M5.3b.11 contract). Reused for both `softmax_last_axis_f32` and
+// `log_softmax_last_axis_f32` (selected by `kernel_name`).
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_softmax_like_device(
+    backend: &CudaBackend,
+    x: &DeviceHandle,
+    shape: &[usize],
+    kernel_name: &'static str,
+) -> Result<DeviceHandle> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected = shape_size(shape);
+    let d_in = backend.cuda_slice(x, "softmax_last_axis")?;
+    if d_in.len() != expected {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_in.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
+
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda softmax cols exceeds i32"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(expected)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        rows,
+        BLOCK,
+        SHARED,
+        |mut builder| {
+            builder.arg(&mut d_out).arg(d_in).arg(&cols);
+            builder
+        },
+    )?;
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+// Device-resident sibling of `cuda_gather_last_dim`: reuses the same
+// `gather_last_dim_f32` NVRTC kernel against a borrowed device slice and
+// returns the per-prefix output on-device. Only the int32 `ids` array
+// crosses PCIe; the `[B*S*V]` source stays on-device. No `synchronize()` —
+// caller owns the terminal eval.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_gather_last_dim_device(
+    backend: &CudaBackend,
+    src: &DeviceHandle,
+    src_shape: &[usize],
+    ids: &[i32],
+) -> Result<DeviceHandle> {
+    if src_shape.is_empty() {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        });
+    }
+    let vocab = *src_shape.last().expect("non-empty shape above");
+    let prefix: usize = src_shape[..src_shape.len() - 1]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let expected: usize = src_shape.iter().product();
+    let d_src = backend.cuda_slice(src, "gather_last_dim")?;
+    if d_src.len() != expected {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_src.len(),
+            shape: src_shape.to_vec(),
+            size: expected,
+        });
+    }
+    if ids.len() != prefix {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix,
+            got: ids.len(),
+        });
+    }
+    let d_ids = backend
+        .stream
+        .clone_htod(ids)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(prefix)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    let n_i32 = i32::try_from(prefix)
+        .map_err(|_| AutogradError::TapeInvariant("cuda gather n exceeds i32"))?;
+    let vocab_i32 = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda gather vocab exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("gather_last_dim_f32")?,
+        prefix,
+        |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_src)
+                .arg(&d_ids)
+                .arg(&n_i32)
+                .arg(&vocab_i32);
+            builder
+        },
+    )?;
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
 #[cfg(not(feature = "no-cuda"))]
