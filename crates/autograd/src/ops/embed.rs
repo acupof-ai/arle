@@ -175,17 +175,43 @@ pub(crate) fn embedding_backward(
         ));
     };
 
-    let upstream = store.tensor_host(output_grad_id)?;
     let hidden = table_shape[1];
+    let vocab = table_shape[0];
     let expected_shape = vec![1, indices.len(), hidden];
-    if upstream.shape != expected_shape {
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if upstream_shape != expected_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: expected_shape,
-            got: upstream.shape,
+            got: upstream_shape,
         });
     }
 
-    let vocab = table_shape[0];
+    // Wave 2 Commit A: route Dirty::Device upstream through
+    // `embedding_backward_device` so the `[1, S, H]` upstream tensor and the
+    // resulting `[V, H]` table grad stay on-device. atomicAdd inside the
+    // kernel handles duplicate token ids (e.g. `the` appearing N times in a
+    // batch) correctly. Host fallback below preserved for CPU/Metal paths.
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+        let grad_handle =
+            store
+                .backend()
+                .embedding_backward_device(&upstream_handle, &ids_i32, vocab, hidden)?;
+        let grad_id = store.alloc_device_tensor(table_shape, grad_handle)?;
+        return Ok(smallvec![(table, grad_id)]);
+    }
+
+    let upstream = store.tensor_host(output_grad_id)?;
     let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
     let grad_table = store.backend().scatter_add_rows_forward(
         &upstream.data,
