@@ -325,12 +325,52 @@ impl TensorStore {
 
         match existing_grad {
             Some(existing_id) => {
-                let incoming = self.to_host(grad_id)?;
-                let existing = self
-                    .get_mut(existing_id)
-                    .ok_or(AutogradError::InvalidTensorId(existing_id))?;
-                for (dst, src) in existing.data.iter_mut().zip(incoming) {
-                    *dst += src;
+                // P2 (device-resident gradient tape): when both the
+                // persistent param-grad tensor and the incoming new grad
+                // are still device-resident, fuse with `add_into_device`
+                // and re-install the device handle on the persistent
+                // grad. Without this, the second `accumulate_grad` call
+                // per training step (gather + log_softmax + matmul
+                // backward each emit a grad for the LM-head weight via
+                // tied embeddings) would force a `to_host(grad_id)` and
+                // permanently demote the persistent grad to
+                // `Dirty::Host`. See
+                // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+                let both_on_device = {
+                    let existing = self.tensor(existing_id)?;
+                    let incoming = self.tensor(grad_id)?;
+                    existing.dirty != Dirty::Host
+                        && existing.device_handle.is_some()
+                        && incoming.dirty != Dirty::Host
+                        && incoming.device_handle.is_some()
+                };
+                if both_on_device {
+                    let existing_handle = self
+                        .tensor(existing_id)?
+                        .device_handle
+                        .as_ref()
+                        .expect("checked above")
+                        .clone();
+                    let incoming_handle = self
+                        .tensor(grad_id)?
+                        .device_handle
+                        .as_ref()
+                        .expect("checked above")
+                        .clone();
+                    let sum_handle = self.backend().add_into_device(
+                        &existing_handle,
+                        &incoming_handle,
+                        &shape,
+                    )?;
+                    self.replace_device_handle(existing_id, sum_handle)?;
+                } else {
+                    let incoming = self.to_host(grad_id)?;
+                    let existing = self
+                        .get_mut(existing_id)
+                        .ok_or(AutogradError::InvalidTensorId(existing_id))?;
+                    for (dst, src) in existing.data.iter_mut().zip(incoming) {
+                        *dst += src;
+                    }
                 }
             }
             None => {
