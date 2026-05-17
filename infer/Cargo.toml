@@ -23,7 +23,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 kv-native-sys = { path = "../crates/kv-native-sys" }
-cudarc = { version = "0.18", features = [
+cudarc = { version = "0.19", features = [
     "cuda-version-from-build-system",
     "cublas",
     "f16",
