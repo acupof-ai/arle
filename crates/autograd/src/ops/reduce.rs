@@ -61,7 +61,7 @@ fn sum_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Resu
     // Pre-M5.3b.1 fast path for Dirty::Host / Dirty::Both inputs. Keeps
     // host-resident reductions purely host-side — no FFI, no upload, no
     // device scalar that the next op will have to pull back down.
-    let input = store.tensor(a)?.clone();
+    let input = store.tensor_host(a)?;
     let value = input.data.iter().sum::<f32>();
     let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
 
@@ -127,7 +127,7 @@ fn mean_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
 }
 
 fn mean_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor(a)?.clone();
+    let input = store.tensor_host(a)?;
     let value = input.data.iter().sum::<f32>() / input.size as f32;
     let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
 

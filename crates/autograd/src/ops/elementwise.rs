@@ -295,8 +295,8 @@ pub(crate) fn mul_backward(
         .ok_or(AutogradError::TapeInvariant("mul missing rhs input"))?;
 
     let upstream = store.to_host(output_grad_id)?;
-    let a_tensor = store.tensor(a)?.clone();
-    let b_tensor = store.tensor(b)?.clone();
+    let a_tensor = store.tensor_host(a)?;
+    let b_tensor = store.tensor_host(b)?;
     if a_tensor.shape != b_tensor.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: a_tensor.shape,

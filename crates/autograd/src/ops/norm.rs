@@ -52,7 +52,7 @@ fn rmsnorm_device_lazy(
         expected: "at least 1",
         got: 0,
     })?;
-    let weight_tensor = store.tensor(weight)?.clone();
+    let weight_tensor = store.tensor_host(weight)?;
     if weight_tensor.shape != vec![hidden] {
         return Err(AutogradError::ShapeMismatch {
             expected: vec![hidden],
@@ -103,8 +103,8 @@ fn rmsnorm_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let x_tensor = store.tensor(x)?.clone();
-    let weight_tensor = store.tensor(weight)?.clone();
+    let x_tensor = store.tensor_host(x)?;
+    let weight_tensor = store.tensor_host(weight)?;
     let hidden = *x_tensor.shape.last().ok_or(AutogradError::InvalidRank {
         expected: "at least 1",
         got: 0,
@@ -177,9 +177,9 @@ pub(crate) fn rmsnorm_backward(
     // path; when called from `tape.backward` this is a no-op (batch
     // flush already ran).
     store.ensure_host(x)?;
-    let upstream = store.tensor(output_grad_id)?.clone();
-    let x_tensor = store.tensor(x)?.clone();
-    let weight_tensor = store.tensor(weight)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
+    let x_tensor = store.tensor_host(x)?;
+    let weight_tensor = store.tensor_host(weight)?;
     if upstream.shape != x_tensor.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: x_tensor.shape.clone(),

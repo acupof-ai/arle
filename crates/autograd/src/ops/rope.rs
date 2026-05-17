@@ -105,9 +105,9 @@ fn rope_host_eager(
     store.ensure_host(x)?;
     store.ensure_host(cos)?;
     store.ensure_host(sin)?;
-    let x_tensor = store.tensor(x)?.clone();
-    let cos_tensor = store.tensor(cos)?.clone();
-    let sin_tensor = store.tensor(sin)?.clone();
+    let x_tensor = store.tensor_host(x)?;
+    let cos_tensor = store.tensor_host(cos)?;
+    let sin_tensor = store.tensor_host(sin)?;
     validate_shapes(&x_tensor.shape, &cos_tensor.shape, &sin_tensor.shape)?;
 
     let output = if cos_tensor.shape[1] * 2 == x_tensor.shape[3] {
@@ -163,11 +163,11 @@ pub(crate) fn rope_backward(
     };
 
     let x_shape = store.tensor(x)?.shape.clone();
-    let cos_tensor = store.tensor(cos)?.clone();
-    let sin_tensor = store.tensor(sin)?.clone();
+    let cos_tensor = store.tensor_host(cos)?;
+    let sin_tensor = store.tensor_host(sin)?;
     validate_shapes(&x_shape, &cos_tensor.shape, &sin_tensor.shape)?;
 
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
     if upstream.shape != x_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: x_shape.clone(),

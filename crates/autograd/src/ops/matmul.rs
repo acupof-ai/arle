@@ -151,9 +151,9 @@ pub(crate) fn matmul_backward(
     // Host-eager fallback. Any operand without a device handle (or already
     // marked `Dirty::Host`) drops the whole call back onto the legacy
     // `matmul_backward(&[f32], …)` contract, matching pre-P2 behaviour.
-    let a_tensor = store.tensor(a)?.clone();
-    let b_tensor = store.tensor(b)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let a_tensor = store.tensor_host(a)?;
+    let b_tensor = store.tensor_host(b)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     let (grad_a_data, grad_b_data) = store.backend().matmul_backward(
         &a_tensor.data,
         &a_tensor.shape,

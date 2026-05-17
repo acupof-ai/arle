@@ -96,8 +96,8 @@ fn add_broadcast_host_eager(
     // we clone + call the host-side `add_broadcast_forward`.
     store.ensure_host(a)?;
     store.ensure_host(b)?;
-    let a_tensor = store.tensor(a)?.clone();
-    let b_tensor = store.tensor(b)?.clone();
+    let a_tensor = store.tensor_host(a)?;
+    let b_tensor = store.tensor_host(b)?;
 
     let output = store.backend().add_broadcast_forward(
         &a_tensor.data,
@@ -140,7 +140,7 @@ pub(crate) fn add_broadcast_backward(
             "add_broadcast backward missing saved shapes",
         ));
     };
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
     if upstream.shape != a_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: a_shape.clone(),

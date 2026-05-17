@@ -126,6 +126,12 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn prefers_pre_backward_flush(&self) -> bool {
+        // Metal benefits from batching N `mlx_eval` round-trips into 1
+        // via `flush_to_host_batch` — see autograd::tape backward walk.
+        true
+    }
+
     fn eval(&self, handles: &[&DeviceHandle]) -> Result<()> {
         let mut metal_handles = handles
             .iter()
