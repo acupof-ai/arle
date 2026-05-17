@@ -30,6 +30,8 @@ const ADAMW_CU: &str = include_str!("kernels/adamw.cu");
 const LOG_SOFTMAX_BACKWARD_CU: &str = include_str!("kernels/log_softmax_backward.cu");
 #[cfg(not(feature = "no-cuda"))]
 const GATHER_BACKWARD_CU: &str = include_str!("kernels/gather_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ADD_INTO_CU: &str = include_str!("kernels/add_into.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -53,6 +55,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "adamw_step_f32",
     "log_softmax_last_axis_backward_f32",
     "gather_last_dim_backward_f32",
+    "add_into_f32",
 ];
 
 #[derive(Debug)]
@@ -200,6 +203,7 @@ fn concat_sources() -> String {
         ADAMW_CU,
         LOG_SOFTMAX_BACKWARD_CU,
         GATHER_BACKWARD_CU,
+        ADD_INTO_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');
