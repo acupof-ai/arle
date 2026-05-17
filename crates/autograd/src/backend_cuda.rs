@@ -1034,6 +1034,45 @@ impl Backend for CudaBackend {
             )
         }
     }
+
+    /// Wave 2.0: device-grad fused AdamW. Same kernel as `adamw_step`
+    /// (`adamw_step_f32` from G3) but the gradient is sourced directly from
+    /// the caller's `DeviceHandle::Cuda` — **no `clone_htod`**. This kills
+    /// the per-param-per-grad-accum-step DtoH that Wave 2 Commit A
+    /// inadvertently introduced when `embedding_backward` /
+    /// `add_broadcast_backward` started producing device-resident grads.
+    /// See `docs/experience/wins/2026-05-17-bench-pretrain-wave2a-embedding-addbcast.md`.
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_step_device(
+        &self,
+        param: &DeviceHandle,
+        m: &DeviceHandle,
+        v: &DeviceHandle,
+        grad: &DeviceHandle,
+        shape: &[usize],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        wd: f32,
+        bc1: f32,
+        bc2: f32,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (
+                param, m, v, grad, shape, lr, beta1, beta2, eps, wd, bc1, bc2,
+            );
+            todo!("GPU required: cuda adamw_step_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_adamw_step_device(
+                self, param, m, v, grad, shape, lr, beta1, beta2, eps, wd, bc1, bc2,
+            )
+        }
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -1139,6 +1178,107 @@ fn cuda_adamw_step(
     // For CUDA that terminal eval is `stream.synchronize()` — a single
     // host fence per optimizer step regardless of param count, instead
     // of `num_params × (3 readback + 3 upload)` PCIe roundtrips.
+    Ok((
+        DeviceHandle::Cuda(CudaStorage::new(new_param)),
+        DeviceHandle::Cuda(CudaStorage::new(new_m)),
+        DeviceHandle::Cuda(CudaStorage::new(new_v)),
+    ))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_adamw_step_device(
+    backend: &CudaBackend,
+    param: &DeviceHandle,
+    m: &DeviceHandle,
+    v: &DeviceHandle,
+    grad: &DeviceHandle,
+    shape: &[usize],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    wd: f32,
+    bc1: f32,
+    bc2: f32,
+) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+    let size = shape_size(shape);
+    let param_slice = backend.cuda_slice(param, "adamw_step_device")?;
+    let m_slice = backend.cuda_slice(m, "adamw_step_device")?;
+    let v_slice = backend.cuda_slice(v, "adamw_step_device")?;
+    let grad_slice = backend.cuda_slice(grad, "adamw_step_device")?;
+    if param_slice.len() != size
+        || m_slice.len() != size
+        || v_slice.len() != size
+        || grad_slice.len() != size
+    {
+        return Err(AutogradError::DataLengthMismatch {
+            len: param_slice
+                .len()
+                .min(m_slice.len())
+                .min(v_slice.len())
+                .min(grad_slice.len()),
+            shape: shape.to_vec(),
+            size,
+        });
+    }
+
+    // Allocate fresh output buffers and seed them via device-to-device copy.
+    // Mirrors `cuda_adamw_step` — keeps the caller's prior handles valid so
+    // the optimizer's `replace_device_handle` discipline is preserved.
+    let mut new_param = backend
+        .stream
+        .alloc_zeros::<f32>(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw param)"))?;
+    let mut new_m = backend
+        .stream
+        .alloc_zeros::<f32>(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw m)"))?;
+    let mut new_v = backend
+        .stream
+        .alloc_zeros::<f32>(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw v)"))?;
+    backend
+        .stream
+        .memcpy_dtod(param_slice, &mut new_param)
+        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw param seed)"))?;
+    backend
+        .stream
+        .memcpy_dtod(m_slice, &mut new_m)
+        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw m seed)"))?;
+    backend
+        .stream
+        .memcpy_dtod(v_slice, &mut new_v)
+        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw v seed)"))?;
+
+    // Crucially: no `clone_htod(grad)`. The grad already lives on-device;
+    // we pass the existing `&CudaSlice<f32>` straight into the kernel.
+    let n = i32::try_from(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda adamw length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("adamw_step_f32")?,
+        size,
+        |mut builder| {
+            builder
+                .arg(&mut new_param)
+                .arg(&mut new_m)
+                .arg(&mut new_v)
+                .arg(grad_slice)
+                .arg(&n)
+                .arg(&lr)
+                .arg(&beta1)
+                .arg(&beta2)
+                .arg(&eps)
+                .arg(&wd)
+                .arg(&bc1)
+                .arg(&bc2);
+            builder
+        },
+    )?;
+
+    // Eval contract (M5.3b.11): return unevaluated; caller batches the
+    // terminal `stream.synchronize()` for the whole optimizer step.
     Ok((
         DeviceHandle::Cuda(CudaStorage::new(new_param)),
         DeviceHandle::Cuda(CudaStorage::new(new_m)),

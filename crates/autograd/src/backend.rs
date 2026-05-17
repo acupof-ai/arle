@@ -905,6 +905,41 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((new_param, new_m, new_v))
     }
 
+    /// Wave 2.0: device-grad variant of `adamw_step`. Accepts the gradient as
+    /// a `DeviceHandle` so device-resident backward ops
+    /// (`embedding_backward_device`, `add_broadcast_backward_device`,
+    /// `matmul_backward_device`, ...) skip the per-param `to_host(grad_id)` DtoH
+    /// that turned Wave 2 Commit A into a +1.8% wash (and added 41.5 GB DtoH /
+    /// step). See `docs/experience/wins/2026-05-17-bench-pretrain-wave2a-embedding-addbcast.md`.
+    ///
+    /// Same semantics + eval contract as `adamw_step`: returns the updated
+    /// `(param, m, v)` *unevaluated* so the caller batches a single terminal
+    /// `backend.eval(...)` per optimizer step. Default impl: `readback(grad) →
+    /// self.adamw_step(...)` so CPU/Metal silently inherit correctness through
+    /// the host fallback. CUDA overrides to keep the gradient on-device and
+    /// reuse the existing fused `adamw_step_f32` NVRTC kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_step_device(
+        &self,
+        param: &DeviceHandle,
+        m: &DeviceHandle,
+        v: &DeviceHandle,
+        grad: &DeviceHandle,
+        shape: &[usize],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        wd: f32,
+        bc1: f32,
+        bc2: f32,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        let grad_host = self.readback(grad)?;
+        self.adamw_step(
+            param, m, v, &grad_host, shape, lr, beta1, beta2, eps, wd, bc1, bc2,
+        )
+    }
+
     /// Scatter-add rows into a `[vocab, feature_dim]` output.
     ///
     /// `upstream` is `[prefix_rows * feature_dim]` row-major. For each prefix
