@@ -36,6 +36,10 @@ const ADD_INTO_CU: &str = include_str!("kernels/add_into.cu");
 const MEAN_BACKWARD_CU: &str = include_str!("kernels/mean_backward.cu");
 #[cfg(not(feature = "no-cuda"))]
 const MUL_SCALAR_BACKWARD_CU: &str = include_str!("kernels/mul_scalar_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const EMBEDDING_BACKWARD_CU: &str = include_str!("kernels/embedding_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ADD_BROADCAST_BACKWARD_CU: &str = include_str!("kernels/add_broadcast_backward.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -62,6 +66,8 @@ const FUNCTION_NAMES: &[&str] = &[
     "add_into_f32",
     "mean_backward_f32",
     "mul_scalar_backward_f32",
+    "embedding_backward_f32",
+    "add_broadcast_backward_f32",
 ];
 
 #[derive(Debug)]
@@ -212,6 +218,8 @@ fn concat_sources() -> String {
         ADD_INTO_CU,
         MEAN_BACKWARD_CU,
         MUL_SCALAR_BACKWARD_CU,
+        EMBEDDING_BACKWARD_CU,
+        ADD_BROADCAST_BACKWARD_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

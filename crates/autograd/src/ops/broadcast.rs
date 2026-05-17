@@ -140,21 +140,61 @@ pub(crate) fn add_broadcast_backward(
             "add_broadcast backward missing saved shapes",
         ));
     };
-    let upstream = store.tensor_host(output_grad_id)?;
-    if upstream.shape != a_shape {
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if upstream_shape != a_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: a_shape.clone(),
-            got: upstream.shape,
+            got: upstream_shape,
         });
     }
 
+    let a_requires_grad = store.tensor(a)?.requires_grad;
+    let b_requires_grad = store.tensor(b)?.requires_grad;
+
+    // Wave 2 Commit A: route Dirty::Device upstream through
+    // `add_broadcast_backward_device` so the `[B, S, H]` upstream tensor
+    // and the `[H]`-shaped b-grad stay on-device. grad_a is the upstream
+    // tensor itself (no reduce); just share its handle when device-resident
+    // — that avoids both a memcpy and an extra device alloc.
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        let mut grads = GradPairs::new();
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        if a_requires_grad {
+            // grad_a = upstream (identity through broadcast-add). Share the
+            // same device handle — the tape will accumulate into `a`'s grad
+            // via the device-resident `add_into_device` path.
+            let grad_a_id = store.alloc_device_tensor(a_shape.clone(), upstream_handle.clone())?;
+            grads.push((a, grad_a_id));
+        }
+        if b_requires_grad {
+            let grad_b_handle = store.backend().add_broadcast_backward_device(
+                &upstream_handle,
+                &a_shape,
+                &b_shape,
+            )?;
+            let grad_b_id = store.alloc_device_tensor(b_shape, grad_b_handle)?;
+            grads.push((b, grad_b_id));
+        }
+        return Ok(grads);
+    }
+
+    let upstream = store.tensor_host(output_grad_id)?;
     let mut grads = GradPairs::new();
-    if store.tensor(a)?.requires_grad {
+    if a_requires_grad {
         let grad_id = store.alloc(Tensor::new(upstream.data.clone(), a_shape, false)?);
         grads.push((a, grad_id));
     }
 
-    if store.tensor(b)?.requires_grad {
+    if b_requires_grad {
         let b_size = if b_shape.is_empty() {
             1
         } else {

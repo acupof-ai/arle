@@ -926,6 +926,84 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     ) -> Result<Vec<f32>> {
         cpu_scatter_add_rows_forward(upstream, prefix_rows, feature_dim, indices, vocab)
     }
+
+    /// Wave 2 Commit A: device-resident backward for `embedding`. Scatter-adds
+    /// the per-token-position upstream gradient `[1, n_ids, hidden]` (or any
+    /// rank that flattens to `n_ids * hidden`) into the `[vocab, hidden]`
+    /// embedding table gradient. `atomicAdd` is mandatory — duplicate token
+    /// ids within a single batch are normal (e.g. `the` appears N times in a
+    /// 1024-token sequence) and must accumulate correctly.
+    ///
+    /// Default fallback runs `readback → cpu_scatter_add_rows_forward →
+    /// upload` so CPU/Metal inherit correct behaviour. CUDA overrides with
+    /// an NVRTC kernel that initializes the `[vocab, hidden]` output to zero
+    /// and accumulates each `(b*S + s)`-row of upstream into
+    /// `out[ids[b*S+s], :]` via `atomicAdd`.
+    ///
+    /// Keeps the embedding backward off the host so the `[B, S, H]` upstream
+    /// tensor — second largest per-step DtoH in the P3.1 residue — never
+    /// crosses PCIe. See
+    /// `docs/research/2026-05-17-candle-kernel-vendor-survey.md` §1 for why
+    /// hand-write (candle's `scatter_add` deliberately omits atomics).
+    fn embedding_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        indices: &[i32],
+        vocab_size: usize,
+        hidden_dim: usize,
+    ) -> Result<DeviceHandle> {
+        let n_ids = indices.len();
+        let upstream_host = self.readback(upstream_grad)?;
+        let grad =
+            self.scatter_add_rows_forward(&upstream_host, n_ids, hidden_dim, indices, vocab_size)?;
+        self.upload(&grad, &[vocab_size, hidden_dim])
+    }
+
+    /// Wave 2 Commit A: device-resident backward for `add_broadcast`.
+    /// Given the forward `out = a + broadcast(b, a_shape)`, this returns
+    /// `grad_b = sum_over_broadcast_axes(upstream)` with output shape
+    /// `b_shape`. Axes whose `b_shape` dim is 1 (or are absent from `b_shape`
+    /// via right-alignment) are reduced over; matching axes pass through.
+    ///
+    /// `upstream` has shape `a_shape` (the output shape of the forward). The
+    /// reduction is implemented as one block per output element — each block
+    /// strides through the broadcast-source slots and shared-memory-reduces.
+    ///
+    /// Default fallback runs `readback → host loop (mirrors
+    /// `add_broadcast_backward` host path) → upload`. CUDA overrides with an
+    /// NVRTC kernel.
+    fn add_broadcast_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        a_shape: &[usize],
+        b_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        validate_broadcast(a_shape, b_shape)?;
+        let upstream_host = self.readback(upstream)?;
+        let out_total: usize = if a_shape.is_empty() {
+            1
+        } else {
+            a_shape.iter().product()
+        };
+        if upstream_host.len() != out_total {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len(),
+                shape: a_shape.to_vec(),
+                size: out_total,
+            });
+        }
+        let b_size: usize = if b_shape.is_empty() {
+            1
+        } else {
+            b_shape.iter().product()
+        };
+        let mut grad_b = vec![0.0_f32; b_size];
+        for (out_index, value) in upstream_host.iter().enumerate() {
+            let offset = broadcast_offset(out_index, a_shape, b_shape);
+            grad_b[offset] += *value;
+        }
+        self.upload(&grad_b, b_shape)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

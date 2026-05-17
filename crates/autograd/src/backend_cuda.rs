@@ -941,6 +941,57 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// Wave 2 Commit A: device-resident embedding backward.
+    /// Allocates a zero-filled `[vocab, hidden]` grad on-device and
+    /// atomicAdd-scatters the per-token-position upstream slice into
+    /// `grad_table[ids[row], :]`. `atomicAdd` is mandatory for the
+    /// duplicate-token correctness guarantee. No `synchronize()` — terminal
+    /// eval is the caller's.
+    fn embedding_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        indices: &[i32],
+        vocab_size: usize,
+        hidden_dim: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream_grad, indices, vocab_size, hidden_dim);
+            todo!(
+                "GPU required: cuda embedding_backward_device is unavailable under feature no-cuda"
+            )
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_embedding_backward_device(self, upstream_grad, indices, vocab_size, hidden_dim)
+        }
+    }
+
+    /// Wave 2 Commit A: device-resident add_broadcast backward.
+    /// Reduces the upstream `[a_shape]` tensor along broadcast axes into
+    /// a `[b_shape]` grad via a per-output-element shared-memory block
+    /// reduction. Mirrors the `add_broadcast` forward layout contract
+    /// (right-aligned `b_strides` of length `out_rank`, stride-0 entries
+    /// for contracted axes).
+    fn add_broadcast_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        a_shape: &[usize],
+        b_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, a_shape, b_shape);
+            todo!(
+                "GPU required: cuda add_broadcast_backward_device is unavailable under feature no-cuda"
+            )
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_add_broadcast_backward_device(self, upstream, a_shape, b_shape)
+        }
+    }
+
     /// Fused on-device AdamW per-parameter update. Replaces the default
     /// `Backend::adamw_step` host-loop fallback (which does
     /// `readback × 3 + cpu_adamw_step_in_place + upload × 3` per param per
@@ -2591,4 +2642,199 @@ fn cuda_download(
         .synchronize()
         .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
     Ok(host)
+}
+
+// Wave 2 Commit A: device-resident embedding backward. Allocates a
+// zero-filled `[vocab, hidden]` grad on-device and atomicAdd-scatters the
+// per-token-position upstream slice into `grad_table[ids[row], :]`. Only the
+// int32 `indices` array crosses PCIe; the `[n_ids, hidden]` upstream stays
+// on-device. No `synchronize()` — terminal eval is the caller's.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_embedding_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    indices: &[i32],
+    vocab_size: usize,
+    hidden_dim: usize,
+) -> Result<DeviceHandle> {
+    let n_ids = indices.len();
+    let expected_upstream = n_ids * hidden_dim;
+    let d_up = backend.cuda_slice(upstream, "embedding_backward_device")?;
+    if d_up.len() != expected_upstream {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_up.len(),
+            shape: vec![n_ids, hidden_dim],
+            size: expected_upstream,
+        });
+    }
+
+    let out_len = vocab_size * hidden_dim;
+    // alloc_zeros gives the required zero-init contract — the kernel only adds.
+    let mut d_grad = backend.stream.alloc_zeros::<f32>(out_len).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding_backward_device)")
+    })?;
+
+    if n_ids == 0 || hidden_dim == 0 {
+        return Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)));
+    }
+
+    let d_ids = backend.stream.clone_htod(indices).map_err(|_| {
+        AutogradError::TapeInvariant("cuda htod copy failed (embedding_backward ids)")
+    })?;
+
+    let n_ids_i32 = i32::try_from(n_ids)
+        .map_err(|_| AutogradError::TapeInvariant("cuda embedding_backward n_ids exceeds i32"))?;
+    let hidden_i32 = i32::try_from(hidden_dim).map_err(|_| {
+        AutogradError::TapeInvariant("cuda embedding_backward hidden_dim exceeds i32")
+    })?;
+    let vocab_i32 = i32::try_from(vocab_size).map_err(|_| {
+        AutogradError::TapeInvariant("cuda embedding_backward vocab_size exceeds i32")
+    })?;
+
+    // One thread per token position (block=256 via launch_1d). Inner
+    // per-thread loop strides `hidden_dim` columns with atomicAdd. With
+    // n_ids = B*S = 1024 on the canonical bench shape, this dispatches
+    // 4 blocks × 256 threads — atomicAdd traffic dominates, so block-size
+    // selection beyond "warp-aligned" is in the noise.
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("embedding_backward_f32")?,
+        n_ids,
+        |mut builder| {
+            builder
+                .arg(&mut d_grad)
+                .arg(d_up)
+                .arg(&d_ids)
+                .arg(&n_ids_i32)
+                .arg(&hidden_i32)
+                .arg(&vocab_i32);
+            builder
+        },
+    )?;
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+// Wave 2 Commit A: device-resident add_broadcast backward. Reduces the
+// upstream tensor along broadcast axes into a `[b_shape]` grad. One block
+// per output element; threads cooperatively reduce over the cartesian
+// product of contracted axes via shared memory.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_add_broadcast_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    a_shape: &[usize],
+    b_shape: &[usize],
+) -> Result<DeviceHandle> {
+    validate_broadcast(a_shape, b_shape)?;
+    let out_rank = a_shape.len();
+    if out_rank > 8 {
+        return Err(AutogradError::InvalidRank {
+            expected: "<= 8",
+            got: out_rank,
+        });
+    }
+    let a_total: usize = if a_shape.is_empty() {
+        1
+    } else {
+        a_shape.iter().product()
+    };
+    let b_total: usize = if b_shape.is_empty() {
+        1
+    } else {
+        b_shape.iter().product()
+    };
+    let d_up = backend.cuda_slice(upstream, "add_broadcast_backward_device")?;
+    if d_up.len() != a_total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_up.len(),
+            shape: a_shape.to_vec(),
+            size: a_total,
+        });
+    }
+
+    let mut d_grad = backend
+        .stream
+        .alloc_zeros::<f32>(b_total.max(1))
+        .map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (add_broadcast_backward_device)")
+        })?;
+
+    if a_total == 0 || b_total == 0 || out_rank == 0 {
+        return Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)));
+    }
+
+    // Build right-aligned b-strides (length=out_rank, 0 on contracted axes;
+    // contiguous row-major stride within b on matching axes). Mirrors the
+    // forward `cuda_add_broadcast` helper.
+    let rank_offset = out_rank - b_shape.len();
+    let mut b_strides = vec![0_i32; out_rank];
+    let mut stride_b: i32 = 1;
+    for i in (0..b_shape.len()).rev() {
+        let dim = b_shape[i];
+        if dim == 1 {
+            b_strides[rank_offset + i] = 0;
+        } else {
+            b_strides[rank_offset + i] = stride_b;
+        }
+        stride_b = stride_b.saturating_mul(dim as i32);
+    }
+    // Row-major contiguous strides in upstream (a-shape layout).
+    let mut out_strides = vec![0_i32; out_rank];
+    let mut stride_a: i32 = 1;
+    for i in (0..out_rank).rev() {
+        out_strides[i] = stride_a;
+        stride_a = stride_a.saturating_mul(a_shape[i] as i32);
+    }
+    // contract_total = product of out_shape[d] over axes where b_strides[d]==0.
+    let contract_total: i64 = (0..out_rank)
+        .filter(|&d| b_strides[d] == 0)
+        .map(|d| a_shape[d] as i64)
+        .product();
+    let contract_total_i32 = i32::try_from(contract_total).map_err(|_| {
+        AutogradError::TapeInvariant("cuda add_broadcast_backward contract_total exceeds i32")
+    })?;
+
+    let out_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
+
+    let d_out_shape = backend.stream.clone_htod(&out_shape_i32).map_err(|_| {
+        AutogradError::TapeInvariant("cuda htod copy failed (add_broadcast_bwd out_shape)")
+    })?;
+    let d_b_strides = backend.stream.clone_htod(&b_strides).map_err(|_| {
+        AutogradError::TapeInvariant("cuda htod copy failed (add_broadcast_bwd b_strides)")
+    })?;
+    let d_out_strides = backend.stream.clone_htod(&out_strides).map_err(|_| {
+        AutogradError::TapeInvariant("cuda htod copy failed (add_broadcast_bwd out_strides)")
+    })?;
+
+    let out_rank_i32 = i32::try_from(out_rank).map_err(|_| {
+        AutogradError::TapeInvariant("cuda add_broadcast_backward out_rank exceeds i32")
+    })?;
+    let b_total_i32 = i32::try_from(b_total).map_err(|_| {
+        AutogradError::TapeInvariant("cuda add_broadcast_backward b_total exceeds i32")
+    })?;
+
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("add_broadcast_backward_f32")?,
+        b_total,
+        BLOCK,
+        SHARED,
+        |mut builder| {
+            builder
+                .arg(&mut d_grad)
+                .arg(d_up)
+                .arg(&d_out_shape)
+                .arg(&d_b_strides)
+                .arg(&d_out_strides)
+                .arg(&out_rank_i32)
+                .arg(&b_total_i32)
+                .arg(&contract_total_i32);
+            builder
+        },
+    )?;
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
 }

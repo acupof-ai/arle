@@ -23,7 +23,8 @@
 
 use autograd::backend::{
     cpu_gather_last_dim_backward, cpu_gather_last_dim_forward, cpu_log_softmax_backward,
-    cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_softmax_forward_last_axis,
+    cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_scatter_add_rows_forward,
+    cpu_softmax_forward_last_axis,
 };
 use autograd::backend_cuda::CudaBackend;
 use autograd::{Backend, DeviceHandle};
@@ -510,5 +511,177 @@ fn cuda_add_into_device_matches_cpu() {
          (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
         dev_sum[idx],
         host_sum[idx]
+    );
+}
+
+#[test]
+fn cuda_embedding_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_embedding_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // Production shape — matches the pretrain `small-25m` Qwen3.5 config:
+    // `[B=2, S=512, H=160]` upstream → `[V=248070, H=160]` table grad.
+    // 1024 token positions across vocab 248 070 → typical "sparse-into-
+    // wide" scatter pattern. The kernel keeps the table grad on-device
+    // via `atomicAdd`.
+    const B: usize = 2;
+    const S: usize = 512;
+    const H: usize = 160;
+    const V: usize = 248_070;
+    let upstream_shape: Vec<usize> = vec![1, B * S, H];
+    let upstream = rng_vec(0xE_B_07, B * S * H, 1.0);
+
+    // Part A — uniformly random indices (production-ish). Most are unique
+    // because B*S=1024 << V=248070, but the kernel must remain correct under
+    // ANY id distribution. Use `rng_ids` for a deterministic LCG sequence.
+    let ids_random = rng_ids(0x1d5, B * S, V as i32);
+    let ids_random_i32: Vec<i32> = ids_random.iter().map(|&i| i).collect();
+    let ids_random_usize: Vec<usize> = ids_random.iter().map(|&i| i as usize).collect();
+
+    // Host reference uses the existing scatter_add reference path.
+    let host_grad_random = cpu_scatter_add_rows_forward(&upstream, B * S, H, &ids_random_i32, V)
+        .expect("cpu scatter_add (random ids)");
+
+    let upstream_h: DeviceHandle = backend
+        .upload(&upstream, &upstream_shape)
+        .expect("upload upstream");
+    let grad_h = backend
+        .embedding_backward_device(&upstream_h, &ids_random_i32, V, H)
+        .expect("cuda embedding_backward_device (random)");
+    backend.eval(&[&grad_h]).expect("cuda eval (random)");
+    let dev_grad_random = backend
+        .readback(&grad_h)
+        .expect("dev embedding_backward readback (random)");
+
+    assert_eq!(
+        dev_grad_random.len(),
+        host_grad_random.len(),
+        "embedding_backward grad length (random)"
+    );
+    // Allow 1e-4 absolute + 1e-4 relative to absorb the atomicAdd
+    // accumulation order divergence vs the host scatter loop (host
+    // accumulates in row-order; the atomicAdd order on-GPU is
+    // nondeterministic across blocks, so identical sum semantics yield
+    // identical results only modulo f32 round-off).
+    let (excess, abs, idx) = max_err_with_tol(&dev_grad_random, &host_grad_random, 1e-4, 1e-4);
+    assert!(
+        excess <= 1.0,
+        "embedding_backward_device (random ids) exceeds atol=1e-4 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad_random[idx],
+        host_grad_random[idx]
+    );
+
+    // Part B — deliberately duplicated indices (the atomicAdd correctness
+    // gate). All B*S=1024 token positions hit the same 4 vocab slots, with
+    // many duplicates per slot. If atomicAdd were absent (race condition
+    // between blocks), the resulting grad would have lost increments and
+    // diverge well beyond our tolerance. The canonical "the appears 800
+    // times" stress case.
+    let _ = ids_random_usize; // (only needed for the comment above)
+    let dup_targets: [i32; 4] = [0, 42, 1337, (V - 1) as i32];
+    let ids_dup_i32: Vec<i32> = (0..(B * S))
+        .map(|i| dup_targets[i % dup_targets.len()])
+        .collect();
+
+    let host_grad_dup = cpu_scatter_add_rows_forward(&upstream, B * S, H, &ids_dup_i32, V)
+        .expect("cpu scatter_add (duplicates)");
+
+    let grad_h_dup = backend
+        .embedding_backward_device(&upstream_h, &ids_dup_i32, V, H)
+        .expect("cuda embedding_backward_device (duplicates)");
+    backend
+        .eval(&[&grad_h_dup])
+        .expect("cuda eval (duplicates)");
+    let dev_grad_dup = backend
+        .readback(&grad_h_dup)
+        .expect("dev embedding_backward readback (duplicates)");
+
+    // Spot-check: each of the 4 duplicate target rows received B*S/4=256
+    // increments. Sum the first column across the 4 target rows in both
+    // host and device output and assert they agree to atol=1e-3 (256
+    // f32 sums × `half_range=1.0` upstream ≈ `sqrt(256) * f32_eps * 1.0
+    // = 2e-6` per element; the cross-block reordering bumps that by ~10×
+    // in the worst case).
+    let host_dup_sum: f32 = dup_targets
+        .iter()
+        .map(|&t| host_grad_dup[t as usize * H])
+        .sum();
+    let dev_dup_sum: f32 = dup_targets
+        .iter()
+        .map(|&t| dev_grad_dup[t as usize * H])
+        .sum();
+    assert!(
+        (host_dup_sum - dev_dup_sum).abs() <= 1e-3,
+        "embedding_backward_device duplicate-ids stress: host_sum={host_dup_sum} \
+         dev_sum={dev_dup_sum} diff={}",
+        (host_dup_sum - dev_dup_sum).abs()
+    );
+
+    let (excess_d, abs_d, idx_d) = max_err_with_tol(&dev_grad_dup, &host_grad_dup, 1e-4, 1e-4);
+    assert!(
+        excess_d <= 1.0,
+        "embedding_backward_device (duplicate ids) exceeds atol=1e-4 + rtol=1e-4 at idx {idx_d} \
+         (|diff|={abs_d}, dev={}, host={}, excess_ratio={excess_d})",
+        dev_grad_dup[idx_d],
+        host_grad_dup[idx_d]
+    );
+}
+
+#[test]
+fn cuda_add_broadcast_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_add_broadcast_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // Production shape: `[B=2, S=512, H=160]` upstream → `[H=160]` reduce.
+    // The grad_b reduction sums B*S=1024 elements per output position,
+    // sqrt(1024) ≈ 32, so accumulated f32 round-off is ~32 * f32_eps ≈ 4e-6
+    // per output element (multiplied by `half_range=1.0` upstream
+    // magnitude). atol=1e-5 + rtol=1e-4 absorbs that with margin.
+    const B: usize = 2;
+    const S: usize = 512;
+    const H: usize = 160;
+    let a_shape: Vec<usize> = vec![B, S, H];
+    let b_shape: Vec<usize> = vec![H];
+
+    let upstream = rng_vec(0xAB_BC_DE, B * S * H, 1.0);
+
+    // Host reference: for each h ∈ [0, H), grad_b[h] = sum_{b,s} upstream[b,s,h].
+    let mut host_grad_b = vec![0.0_f32; H];
+    for b_idx in 0..B {
+        for s_idx in 0..S {
+            for h_idx in 0..H {
+                host_grad_b[h_idx] += upstream[(b_idx * S + s_idx) * H + h_idx];
+            }
+        }
+    }
+
+    let upstream_h: DeviceHandle = backend
+        .upload(&upstream, &a_shape)
+        .expect("upload upstream");
+    let grad_b_h = backend
+        .add_broadcast_backward_device(&upstream_h, &a_shape, &b_shape)
+        .expect("cuda add_broadcast_backward_device");
+    backend.eval(&[&grad_b_h]).expect("cuda eval");
+    let dev_grad_b = backend
+        .readback(&grad_b_h)
+        .expect("dev add_broadcast_backward readback");
+
+    assert_eq!(
+        dev_grad_b.len(),
+        host_grad_b.len(),
+        "add_broadcast_backward grad_b length"
+    );
+    let (excess, abs, idx) = max_err_with_tol(&dev_grad_b, &host_grad_b, 1e-5, 1e-4);
+    assert!(
+        excess <= 1.0,
+        "add_broadcast_backward_device exceeds atol=1e-5 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad_b[idx],
+        host_grad_b[idx]
     );
 }
