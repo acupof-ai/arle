@@ -415,7 +415,7 @@ fn cpu_gather_last_dim_basic() {
 #[test]
 fn cpu_rope_matches_ops() {
     // Cross-check the Backend trait default (`cpu_rope_forward`) against the
-    // original `ops::rope::rope` implementation on a small Qwen3-shaped input.
+    // original `ops::rope::rope` implementation on a small Qwen3.5-shaped input.
     use autograd::Tape;
     use autograd::TensorStore;
     use autograd::ops;

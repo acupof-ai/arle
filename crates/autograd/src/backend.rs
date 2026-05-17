@@ -462,7 +462,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_mean_last_axis_forward(x, shape)
     }
 
-    /// Rotary position embedding (NeoX / `rotate_half` layout, matches Qwen3).
+    /// Rotary position embedding (NeoX / `rotate_half` layout, matches Qwen3.5).
     /// `x` is `[batch, heads, seq, head_dim]`; `cos`/`sin` are
     /// `[seq, rotary_dim/2]`, where `rotary_dim <= head_dim`. When
     /// `rotary_dim < head_dim`, only the prefix is rotated and the suffix is

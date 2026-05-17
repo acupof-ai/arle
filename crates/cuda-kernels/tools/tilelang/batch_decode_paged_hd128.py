@@ -1,7 +1,7 @@
 """TileLang batch decode HD128 paged attention.
 
-TileLang HD128 paged decode path used by Qwen3 full-attention layers
-(Qwen3-1.5B / 4B / 8B / 14B+ — all share head_dim=128 with kv_heads=8).
+TileLang HD128 paged decode path used by smaller Qwen3.5 full-attention
+shapes (head_dim=128 with kv_heads=8 GQA family).
 Decode = single-token Q per request (qo_len == 1), so the kernel reads
 paged K/V, runs one row of Q against the full kv_total_len for that
 request, and writes one output row.
@@ -10,7 +10,8 @@ Sister to ``batch_decode_paged_hd256.py``. Deltas vs the HD256 template:
 
   * ``HEAD_DIM = 128`` (vs 256).
   * ``SM_SCALE = 1.0 / sqrt(128)``.
-  * ``SUPPORTED_HEADS`` covers the Qwen3 family rather than Qwen3.5.
+  * ``SUPPORTED_HEADS`` covers the smaller HD128 GQA shapes; HD256
+    covers the larger Qwen3.5 full-attn family.
 
 Everything else (BLOCK_M=64, BLOCK_N=16=PAGE_SIZE, NUM_STAGES=2,
 NUM_THREADS=128, no causal mask, padded BLOCK_M layout) is identical to
@@ -22,12 +23,12 @@ Symbolic runtime int32 args (``batch_size``, ``total_q_tokens``,
 HD256 decode kernel so ``gen_tilelang_aot.py::WRAPPER_FILL_RULES`` works
 without modification.
 
-Supported (num_q_heads, num_kv_heads) configurations (Qwen3 full-attn
-families, mirrors ``TILELANG_PREFILL_HD128_HEAD_CONFIGS``):
-  (16, 8)  — Qwen3-1.5B
-  (32, 8)  — Qwen3-4B
-  (40, 8)  — Qwen3-8B
-  (64, 8)  — Qwen3-14B / 32B-class
+Supported (num_q_heads, num_kv_heads) configurations (HD128 GQA full-attn
+shapes, mirrors ``TILELANG_PREFILL_HD128_HEAD_CONFIGS``):
+  (16, 8)
+  (32, 8)
+  (40, 8)
+  (64, 8)
 
 Tile / pipeline tunables (mirror HD256 decode):
 
@@ -64,14 +65,14 @@ NUM_STAGES = 2
 NUM_THREADS = 128
 MAX_SPLITS = 16
 
-# (num_q_heads, num_kv_heads) configurations. Mirrors the Qwen3 HD128
+# (num_q_heads, num_kv_heads) configurations. Mirrors the HD128 GQA
 # full-attn family. Extend here + the build.rs list + the matching
 # FFI/Rust dispatch arms in lockstep when adding a new size.
 SUPPORTED_HEADS = (
-    (16, 8),  # Qwen3-1.5B
-    (32, 8),  # Qwen3-4B
-    (40, 8),  # Qwen3-8B
-    (64, 8),  # Qwen3-14B / 32B-class
+    (16, 8),
+    (32, 8),
+    (40, 8),
+    (64, 8),
 )
 
 

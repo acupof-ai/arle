@@ -3,9 +3,10 @@
 HD128, BF16, causal, page_size=16. One kernel is AOT-specialized per
 (num_q_heads, num_kv_heads) pair in SUPPORTED_HEADS — keeping these as
 compile-time constants gives TileLang the freedom to specialize codegen
-per shape instead of paying for runtime parameterization. Add a new Qwen3
-size by extending the lockstep lists in this module, cuda-kernels/build.rs,
-cuda-kernels/src/ffi/attention.rs, and infer/src/ops/attention.rs.
+per shape instead of paying for runtime parameterization. Add a new
+HD128 head config by extending the lockstep lists in this module,
+cuda-kernels/build.rs, cuda-kernels/src/ffi/attention.rs, and
+infer/src/ops/attention.rs.
 
 Tile / pipeline tunables (chosen as Hopper defaults; tuned during the
 H100 spike per docs/plans/tilelang-integration.md §6):
@@ -28,13 +29,13 @@ NUM_STAGES = 2
 NUM_THREADS = 128
 
 # (num_q_heads, num_kv_heads) configurations the Phase 0 build emits.
-# Mirrors the Qwen3 HD128 family at the time of writing. Extend here +
+# Mirrors the HD128 GQA family at the time of writing. Extend here +
 # the build.rs list + the matching FFI/Rust dispatch arms in lockstep.
 SUPPORTED_HEADS = (
-    (16, 8),   # Qwen3-0.6B / 1.7B
-    (32, 8),   # Qwen3-4B / 8B
-    (40, 8),   # Qwen3-14B
-    (64, 8),   # Qwen3-32B
+    (16, 8),
+    (32, 8),
+    (40, 8),
+    (64, 8),
 )
 
 

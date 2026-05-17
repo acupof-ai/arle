@@ -266,7 +266,7 @@ array qwen35_moe_block_forward_cpp(
     // INFER_MOE_TOP_K=N (1..top_k) — runtime knob to reduce active-expert
     // count below the model's configured top_k. Per the parallel research
     // subagent (2026-05-07): vllm-mlx ships this as `--moe-top-k` and reports
-    // +7-16% throughput on Qwen3-30B-A3B with ~3% MMLU drop at top_k=6 vs 8.
+    // +7-16% throughput per upstream MoE reports on similar models with ~3% MMLU drop at top_k=6 vs 8.
     // Cached env probe; clamps to valid range. Env unset = passthrough.
     {
         static int env_top_k = -2;
