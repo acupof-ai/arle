@@ -253,6 +253,9 @@ impl Qwen35Model {
             }
         };
         let load_linear_qkv = |name: &str| -> Result<DeviceMatrix> {
+            if runtime.tp.is_single() {
+                return load_linear(name);
+            }
             load_tensor_2d_fused_column_segments_sharded(
                 &ctx,
                 &shards,

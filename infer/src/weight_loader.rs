@@ -9,7 +9,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::{info, warn};
 use memmap2::Mmap;
-use safetensors::SafeTensors;
+use safetensors::{SafeTensors, tensor::Dtype};
 use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
@@ -445,6 +445,9 @@ pub(crate) struct QuantLoadConfig {
     pub(crate) tq_bits: Option<u8>,
     pub(crate) marlin_w4a8: bool,
     pub(crate) marlin_w4_hybrid: bool,
+    pub(crate) fp8_weight_scale_inv: bool,
+    pub(crate) fp8_block_rows: usize,
+    pub(crate) fp8_block_cols: usize,
     pub(crate) unsupported_reason: Option<&'static str>,
 }
 
@@ -460,18 +463,11 @@ impl QuantLoadConfig {
             QuantMeta::Gptq(config) if config.group_size > 0 => Self {
                 group_size: Some(config.group_size as usize),
                 bits: Some(config.bits),
-                tq_bits: None,
-                marlin_w4a8: false,
-                marlin_w4_hybrid: false,
-                unsupported_reason: None,
+                ..Self::default()
             },
             QuantMeta::Gptq(config) => Self {
-                group_size: None,
                 bits: Some(config.bits),
-                tq_bits: None,
-                marlin_w4a8: false,
-                marlin_w4_hybrid: false,
-                unsupported_reason: None,
+                ..Self::default()
             },
             QuantMeta::Awq(config) if config.zero_point => Self {
                 unsupported_reason: Some(
@@ -482,42 +478,35 @@ impl QuantLoadConfig {
             QuantMeta::Awq(config) => Self {
                 group_size: Some(config.group_size),
                 bits: Some(config.bits),
-                tq_bits: None,
-                marlin_w4a8: false,
-                marlin_w4_hybrid: false,
-                unsupported_reason: None,
+                ..Self::default()
             },
             QuantMeta::Int8(_) => Self {
-                group_size: None,
                 bits: Some(8),
-                tq_bits: None,
-                marlin_w4a8: false,
-                marlin_w4_hybrid: false,
-                unsupported_reason: None,
+                ..Self::default()
             },
             QuantMeta::MarlinW4A8(config) => Self {
                 group_size: Some(config.group_size),
                 bits: Some(4),
-                tq_bits: None,
                 marlin_w4a8: true,
-                marlin_w4_hybrid: false,
-                unsupported_reason: None,
+                ..Self::default()
             },
             QuantMeta::MarlinW4Hybrid(config) => Self {
                 group_size: Some(config.group_size),
                 bits: Some(4),
-                tq_bits: None,
                 marlin_w4a8: true,
                 marlin_w4_hybrid: true,
-                unsupported_reason: None,
+                ..Self::default()
+            },
+            QuantMeta::Fp8(config) => Self {
+                fp8_weight_scale_inv: true,
+                fp8_block_rows: config.weight_block_size[0],
+                fp8_block_cols: config.weight_block_size[1],
+                ..Self::default()
             },
             QuantMeta::TurboQuant(config) => Self {
                 group_size: Some(config.group_size),
-                bits: None,
                 tq_bits: Some(config.bits),
-                marlin_w4a8: false,
-                marlin_w4_hybrid: false,
-                unsupported_reason: None,
+                ..Self::default()
             },
             _ => Self::default(),
         }
@@ -530,20 +519,17 @@ impl QuantLoadConfig {
                     return Ok(Self {
                         group_size: Some(128),
                         bits: Some(4),
-                        tq_bits: None,
                         marlin_w4a8: true,
-                        marlin_w4_hybrid: false,
-                        unsupported_reason: None,
+                        ..Self::default()
                     });
                 }
                 "marlin_w4_hybrid" => {
                     return Ok(Self {
                         group_size: Some(128),
                         bits: Some(4),
-                        tq_bits: None,
                         marlin_w4a8: true,
                         marlin_w4_hybrid: true,
-                        unsupported_reason: None,
+                        ..Self::default()
                     });
                 }
                 _ => {}
@@ -558,6 +544,7 @@ impl QuantLoadConfig {
             || self.tq_bits.is_some()
             || self.marlin_w4a8
             || self.marlin_w4_hybrid
+            || self.fp8_weight_scale_inv
             || self.unsupported_reason.is_some()
     }
 }
@@ -822,6 +809,50 @@ pub(crate) fn load_tensor_2d_maybe_quantized_with_config(
         );
     }
 
+    if config.fp8_weight_scale_inv {
+        let scale_name = name.replace(".weight", ".weight_scale_inv");
+        if let Ok(weight_tensor) = find_tensor(shards, weight_map, name) {
+            match find_tensor(shards, weight_map, &scale_name) {
+                Ok(scale_tensor) if weight_tensor.dtype() == Dtype::F8_E4M3 => {
+                    let shape = weight_tensor.shape();
+                    anyhow::ensure!(
+                        shape.len() == 2,
+                        "{name}: expected 2D FP8 tensor, got shape {:?}",
+                        shape
+                    );
+                    let host = dequantize_fp8_e4m3_weight_scale_inv_to_bf16_host(
+                        name,
+                        weight_tensor.data(),
+                        shape[0],
+                        shape[1],
+                        scale_tensor.data(),
+                        scale_tensor.dtype(),
+                        scale_tensor.shape(),
+                        config.fp8_block_rows,
+                        config.fp8_block_cols,
+                    )?;
+                    log::info!(
+                        "Loaded FP8 {} via weight_scale_inv: [{}x{}] block=[{},{}] scale {:?}",
+                        name,
+                        shape[0],
+                        shape[1],
+                        config.fp8_block_rows,
+                        config.fp8_block_cols,
+                        scale_tensor.shape()
+                    );
+                    return DeviceMatrix::from_host(ctx, &host, shape[0], shape[1]);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    anyhow::ensure!(
+                        weight_tensor.dtype() != Dtype::F8_E4M3,
+                        "{name}: FP8 tensor is missing side tensor {scale_name}: {err}"
+                    );
+                }
+            }
+        }
+    }
+
     // Try quantized path: replace ".weight" with ".qweight"
     let qweight_name = name.replace(".weight", ".qweight");
     let scales_name = name.replace(".weight", ".scales");
@@ -1028,6 +1059,90 @@ pub(crate) fn load_tensor_2d_maybe_quantized_with_config(
 
     // Fallback: bf16
     load_tensor_2d(ctx, shards, weight_map, name)
+}
+
+fn dequantize_fp8_e4m3_weight_scale_inv_to_bf16_host(
+    name: &str,
+    weight: &[u8],
+    rows: usize,
+    cols: usize,
+    scales: &[u8],
+    scale_dtype: Dtype,
+    scale_shape: &[usize],
+    block_rows: usize,
+    block_cols: usize,
+) -> Result<Vec<bf16>> {
+    anyhow::ensure!(
+        block_rows > 0 && block_cols > 0,
+        "{name}: FP8 block shape must be positive, got [{block_rows},{block_cols}]"
+    );
+    anyhow::ensure!(
+        weight.len() == rows * cols,
+        "{name}: FP8 byte length mismatch: expected {}, got {}",
+        rows * cols,
+        weight.len()
+    );
+    let scale_rows = rows.div_ceil(block_rows);
+    let scale_cols = cols.div_ceil(block_cols);
+    anyhow::ensure!(
+        scale_shape == [scale_rows, scale_cols],
+        "{name}: weight_scale_inv shape {:?} does not match expected [{scale_rows},{scale_cols}] for weight [{rows},{cols}] and block [{block_rows},{block_cols}]",
+        scale_shape
+    );
+    let scale_elem_bytes = match scale_dtype {
+        Dtype::BF16 => std::mem::size_of::<bf16>(),
+        Dtype::F32 => std::mem::size_of::<f32>(),
+        dtype => anyhow::bail!("{name}: unsupported FP8 weight_scale_inv dtype {dtype:?}"),
+    };
+    anyhow::ensure!(
+        scales.len() == scale_rows * scale_cols * scale_elem_bytes,
+        "{name}: weight_scale_inv byte length mismatch: expected {}, got {}",
+        scale_rows * scale_cols * scale_elem_bytes,
+        scales.len()
+    );
+
+    let mut out = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        let scale_row = row / block_rows;
+        for col in 0..cols {
+            let scale_col = col / block_cols;
+            let scale = fp8_scale_value(scales, scale_dtype, scale_row * scale_cols + scale_col)?;
+            let value = decode_fp8_e4m3fn(weight[row * cols + col]) * scale;
+            out.push(bf16::from_f32(value));
+        }
+    }
+    Ok(out)
+}
+
+fn fp8_scale_value(scales: &[u8], dtype: Dtype, idx: usize) -> Result<f32> {
+    match dtype {
+        Dtype::BF16 => {
+            let offset = idx * std::mem::size_of::<bf16>();
+            let bytes = scales
+                .get(offset..offset + std::mem::size_of::<bf16>())
+                .ok_or_else(|| anyhow::anyhow!("BF16 scale index {idx} out of range"))?;
+            Ok(bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32())
+        }
+        Dtype::F32 => {
+            let offset = idx * std::mem::size_of::<f32>();
+            let bytes = scales
+                .get(offset..offset + std::mem::size_of::<f32>())
+                .ok_or_else(|| anyhow::anyhow!("F32 scale index {idx} out of range"))?;
+            Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        dtype => anyhow::bail!("unsupported FP8 scale dtype {dtype:?}"),
+    }
+}
+
+fn decode_fp8_e4m3fn(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exp = (bits >> 3) & 0x0f;
+    let mant = bits & 0x07;
+    if exp == 0 {
+        sign * (mant as f32 / 8.0) * 2.0_f32.powi(-6)
+    } else {
+        sign * (1.0 + mant as f32 / 8.0) * 2.0_f32.powi(exp as i32 - 7)
+    }
 }
 
 /// TurboQuant Phase 1: dequantize packed weights at load time on CPU.
@@ -1751,10 +1866,7 @@ mod tests {
         let cfg = QuantLoadConfig {
             group_size: None,
             bits: Some(4),
-            tq_bits: None,
-            marlin_w4a8: false,
-            marlin_w4_hybrid: false,
-            unsupported_reason: None,
+            ..QuantLoadConfig::default()
         };
         let (orig_k, group_size, bits) = detect_uniform_quant_layout("w", 64, 2, cfg).unwrap();
         assert_eq!((orig_k, group_size, bits), (128, 64, 4));
@@ -1769,10 +1881,7 @@ mod tests {
             QuantLoadConfig {
                 group_size: Some(128),
                 bits: None,
-                tq_bits: None,
-                marlin_w4a8: false,
-                marlin_w4_hybrid: false,
-                unsupported_reason: None,
+                ..QuantLoadConfig::default()
             },
         )
         .unwrap_err()
@@ -1791,9 +1900,7 @@ mod tests {
                     group_size: Some(64),
                     bits: None,
                     tq_bits: Some(bits),
-                    marlin_w4a8: false,
-                    marlin_w4_hybrid: false,
-                    unsupported_reason: None,
+                    ..QuantLoadConfig::default()
                 },
             )
             .unwrap();
@@ -2042,6 +2149,74 @@ mod tests {
 
     fn sum_bf16(values: &[bf16]) -> f32 {
         values.iter().map(|value| value.to_f32()).sum()
+    }
+
+    #[test]
+    fn fp8_weight_scale_inv_dequantizes_block_scaled_matrix() {
+        let weights = [0x38, 0xb8, 0x40, 0xc0]; // 1, -1, 2, -2 in E4M3FN
+        let mut scales = Vec::new();
+        scales.extend_from_slice(&bf16::from_f32(2.0).to_le_bytes());
+        scales.extend_from_slice(&bf16::from_f32(0.5).to_le_bytes());
+
+        let out = dequantize_fp8_e4m3_weight_scale_inv_to_bf16_host(
+            "test.weight",
+            &weights,
+            2,
+            2,
+            &scales,
+            Dtype::BF16,
+            &[2, 1],
+            1,
+            2,
+        )
+        .unwrap();
+        let values = out.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+        assert_eq!(values, vec![2.0, -2.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    fn fp8_weight_scale_inv_loads_single_file_without_weight_map() -> Result<()> {
+        use safetensors::tensor::{TensorView, serialize};
+
+        let ctx = DeviceContext::new()?;
+        let weights = [0x38, 0xb8, 0x40, 0xc0]; // 1, -1, 2, -2 in E4M3FN
+        let mut scales = Vec::new();
+        scales.extend_from_slice(&bf16::from_f32(2.0).to_le_bytes());
+        scales.extend_from_slice(&bf16::from_f32(0.5).to_le_bytes());
+        let weight = TensorView::new(Dtype::F8_E4M3, vec![2, 2], &weights)?;
+        let scale = TensorView::new(Dtype::BF16, vec![2, 1], &scales)?;
+        let buf = serialize(
+            vec![
+                ("layer.weight".to_string(), weight),
+                ("layer.weight_scale_inv".to_string(), scale),
+            ],
+            None,
+        )?;
+        let shards = vec![SafeTensors::deserialize(&buf)?];
+        let weight_map = HashMap::new();
+
+        let matrix = load_tensor_2d_maybe_quantized_with_config(
+            &ctx,
+            &shards,
+            &weight_map,
+            "layer.weight",
+            QuantLoadConfig {
+                fp8_weight_scale_inv: true,
+                fp8_block_rows: 1,
+                fp8_block_cols: 2,
+                ..QuantLoadConfig::default()
+            },
+        )?;
+        assert_eq!((matrix.rows, matrix.cols), (2, 2));
+        let host = ctx
+            .stream
+            .clone_dtoh(&matrix.data)
+            .map_err(|e| anyhow::anyhow!("DTOH FP8 single-file fixture failed: {e}"))?;
+        ctx.sync()?;
+        let values = host.iter().map(|v| v.to_f32()).collect::<Vec<_>>();
+        assert_eq!(values, vec![2.0, -2.0, 1.0, -1.0]);
+        Ok(())
     }
 
     #[test]
