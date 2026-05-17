@@ -10,7 +10,10 @@ use anyhow::{Result, bail, ensure};
 use cuda_kernels::{
     ffi,
     prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
-    tensor::{CudaAllocTraceExt, CudaPipelineFence, CudaPipelineStreamKind, WeightFormat},
+    tensor::{
+        CudaAllocTraceExt, CudaPipelineFence, CudaPipelineStreamKind, Dsv4Fp8DeepGemmWeightCache,
+        WeightFormat,
+    },
 };
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -20,6 +23,8 @@ use deepseek_spec::{DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 use half::bf16;
 #[cfg(feature = "cuda")]
 use log::info;
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 
@@ -46,6 +51,15 @@ pub(super) struct DeepseekV4Expert {
     pub(super) w1: DeviceMatrix,
     pub(super) w2: DeviceMatrix,
     pub(super) w3: DeviceMatrix,
+}
+
+#[cfg(feature = "cuda")]
+pub(super) struct DeepseekDsv4DeepGemmExpertCache {
+    /// Fused gate/up expert weights: `[local_experts, 2 * intermediate, hidden]`.
+    pub(super) w13: Dsv4Fp8DeepGemmWeightCache,
+    /// Down expert weights: `[local_experts, hidden, intermediate]`.
+    pub(super) w2: Dsv4Fp8DeepGemmWeightCache,
+    pub(super) num_experts: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -631,6 +645,101 @@ fn dsv4_grouped_w2_ptrs<'a>(
 }
 
 #[cfg(feature = "cuda")]
+pub(super) fn dsv4_try_build_deepgemm_expert_cache(
+    ctx: &DeviceContext,
+    experts: &[DeepseekV4Expert],
+) -> Result<Option<DeepseekDsv4DeepGemmExpertCache>> {
+    let backend = dsv4_expert_backend()?;
+    let explicit_cache = dsv4_env_flag("ARLE_DSV4_DEEPGEMM_WEIGHT_CACHE")?;
+    let should_build = explicit_cache || matches!(backend, Dsv4ExpertBackend::DeepGemmRequired);
+    if !should_build {
+        return Ok(None);
+    }
+
+    match dsv4_build_deepgemm_expert_cache(ctx, experts) {
+        Ok(cache) => {
+            info!(
+                "DeepSeek V4 DeepGEMM FP8 expert cache built: experts={} w13={}x{} scales={}x{} w2={}x{} scales={}x{} bytes={:.2} MiB",
+                cache.num_experts,
+                cache.w13.rows,
+                cache.w13.cols,
+                cache.w13.scale_rows,
+                cache.w13.scale_cols,
+                cache.w2.rows,
+                cache.w2.cols,
+                cache.w2.scale_rows,
+                cache.w2.scale_cols,
+                (cache.w13.weight_bytes()
+                    + cache.w13.scale_bytes()
+                    + cache.w2.weight_bytes()
+                    + cache.w2.scale_bytes()) as f64
+                    / (1024.0 * 1024.0)
+            );
+            Ok(Some(cache))
+        }
+        Err(err) if matches!(backend, Dsv4ExpertBackend::DeepGemmRequired) => Err(err),
+        Err(err) => {
+            static LOGGED: OnceLock<()> = OnceLock::new();
+            LOGGED.get_or_init(|| {
+                info!(
+                    "DeepSeek V4 DeepGEMM FP8 expert cache disabled after build failure: {err:#}"
+                );
+            });
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_build_deepgemm_expert_cache(
+    ctx: &DeviceContext,
+    experts: &[DeepseekV4Expert],
+) -> Result<DeepseekDsv4DeepGemmExpertCache> {
+    let first = experts
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 DeepGEMM cache needs local experts"))?;
+    ensure!(
+        first.w1.rows == first.w3.rows
+            && first.w1.cols == first.w3.cols
+            && first.w2.cols == first.w1.rows
+            && first.w2.rows == first.w1.cols,
+        "DeepSeek V4 DeepGEMM cache expects SwiGLU shapes w1/w3=[I,H], w2=[H,I]"
+    );
+    let expert_w13_rows = first.w1.rows + first.w3.rows;
+    ensure!(
+        expert_w13_rows.is_multiple_of(128) && first.w2.rows.is_multiple_of(128),
+        "DeepSeek V4 DeepGEMM cache needs per-expert row groups aligned to 128"
+    );
+
+    let mut w13 =
+        Dsv4Fp8DeepGemmWeightCache::uninit(ctx, experts.len() * expert_w13_rows, first.w1.cols)?;
+    let mut w2 =
+        Dsv4Fp8DeepGemmWeightCache::uninit(ctx, experts.len() * first.w2.rows, first.w2.cols)?;
+
+    for (idx, expert) in experts.iter().enumerate() {
+        ensure!(
+            expert.w1.rows == first.w1.rows
+                && expert.w1.cols == first.w1.cols
+                && expert.w3.rows == first.w3.rows
+                && expert.w3.cols == first.w3.cols
+                && expert.w2.rows == first.w2.rows
+                && expert.w2.cols == first.w2.cols,
+            "DeepSeek V4 DeepGEMM cache needs uniform local expert shapes"
+        );
+        let w13_offset = idx * expert_w13_rows;
+        w13.fill_from_dsv4_weight(ctx, &expert.w1, w13_offset)?;
+        w13.fill_from_dsv4_weight(ctx, &expert.w3, w13_offset + expert.w1.rows)?;
+        w2.fill_from_dsv4_weight(ctx, &expert.w2, idx * first.w2.rows)?;
+    }
+
+    Ok(DeepseekDsv4DeepGemmExpertCache {
+        w13,
+        w2,
+        num_experts: experts.len(),
+    })
+}
+
+#[cfg(feature = "cuda")]
 fn dsv4_run_grouped_block_scaled_gemv(
     ctx: &DeviceContext,
     weights: &DeepseekGroupedExpertWeightPtrCache,
@@ -1003,13 +1112,115 @@ fn dsv4_pair_expert_gemv_enabled() -> Result<bool> {
 
 #[cfg(feature = "cuda")]
 fn dsv4_route_grouped_experts_enabled() -> Result<bool> {
-    let Some(raw) = std::env::var("ARLE_DSV4_ROUTE_GROUPED_EXPERTS").ok() else {
+    dsv4_env_flag("ARLE_DSV4_ROUTE_GROUPED_EXPERTS")
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_env_flag(name: &str) -> Result<bool> {
+    let Some(raw) = std::env::var(name).ok() else {
         return Ok(false);
     };
     match raw.as_str() {
-        "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
-        "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
-        other => bail!("invalid ARLE_DSV4_ROUTE_GROUPED_EXPERTS value `{other}`"),
+        "1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO" => Ok(false),
+        other => bail!("invalid {name} value `{other}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dsv4ExpertBackend {
+    Native,
+    DeepGemmAuto,
+    DeepGemmRequired,
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
+    let Some(raw) = std::env::var("ARLE_DSV4_EXPERT_BACKEND").ok() else {
+        return Ok(Dsv4ExpertBackend::Native);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "" | "native" | "gemv" | "raw-gemv" | "raw_gemv" => Ok(Dsv4ExpertBackend::Native),
+        "deepgemm-auto" | "deepgemm_auto" | "auto-deepgemm" | "auto_deepgemm" => {
+            Ok(Dsv4ExpertBackend::DeepGemmAuto)
+        }
+        "deepgemm" | "required-deepgemm" | "required_deepgemm" => {
+            Ok(Dsv4ExpertBackend::DeepGemmRequired)
+        }
+        other => bail!("invalid ARLE_DSV4_EXPERT_BACKEND value `{other}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_format_label(format: Option<DeepseekDsv4GroupedBlockFormat>) -> &'static str {
+    match format {
+        Some(DeepseekDsv4GroupedBlockFormat::Fp8) => "fp8-block-scaled",
+        Some(DeepseekDsv4GroupedBlockFormat::Fp4) => "fp4-block-scaled",
+        None => "dense-or-unsupported",
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_weight_format_summary(weights: &[&DeviceMatrix]) -> String {
+    weights
+        .iter()
+        .map(|weight| dsv4_format_label(dsv4_grouped_format(weight)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_validate_deepgemm_expert_backend(
+    ctx: &DeviceContext,
+    path: &str,
+    weights: &[&DeviceMatrix],
+) -> Result<()> {
+    ensure!(
+        !weights.is_empty(),
+        "DeepSeek V4 DeepGEMM backend needs expert weights for {path}"
+    );
+    let formats = weights
+        .iter()
+        .map(|weight| dsv4_grouped_format(weight))
+        .collect::<Vec<_>>();
+    ensure!(
+        formats.iter().all(Option::is_some),
+        "DeepSeek V4 DeepGEMM backend for {path} needs raw DSv4 FP8/FP4 block-scaled weights, got {}",
+        dsv4_weight_format_summary(weights)
+    );
+
+    let (major, minor) = ctx.compute_capability();
+    bail!(
+        "DeepSeek V4 DeepGEMM backend for {path} is selected, but ARLE has not linked a raw-pointer DeepGEMM C ABI launcher yet. \
+         The load-time FP4/FP8 -> FP8 expert-weight cache boundary is wired, but the vendored DeepGEMM entrypoints are still PyTorch/JIT APIs. \
+         The next code step is a raw C ABI masked/contiguous grouped-GEMM launcher that consumes the resident FP8 cache. formats={} sm_{}{minor}",
+        dsv4_weight_format_summary(weights),
+        major
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_handle_deepgemm_expert_backend(
+    ctx: &DeviceContext,
+    backend: Dsv4ExpertBackend,
+    path: &str,
+    weights: &[&DeviceMatrix],
+) -> Result<()> {
+    match backend {
+        Dsv4ExpertBackend::Native => Ok(()),
+        Dsv4ExpertBackend::DeepGemmRequired => {
+            dsv4_validate_deepgemm_expert_backend(ctx, path, weights)
+        }
+        Dsv4ExpertBackend::DeepGemmAuto => {
+            static LOGGED: OnceLock<()> = OnceLock::new();
+            if let Err(err) = dsv4_validate_deepgemm_expert_backend(ctx, path, weights) {
+                LOGGED.get_or_init(|| {
+                    info!("DeepSeek V4 DeepGEMM auto fallback to native expert path: {err:#}");
+                });
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1190,6 +1401,7 @@ pub(super) struct DeepseekV4MoeBlock {
     pub(super) grouped_w1_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
     pub(super) grouped_w3_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
     pub(super) grouped_w2_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
+    pub(super) deepgemm_cache: Option<DeepseekDsv4DeepGemmExpertCache>,
     pub(super) shared_experts: Option<DeepseekV4Expert>,
 }
 
@@ -1392,6 +1604,14 @@ impl DeepseekV4MoeBlock {
             ep.experts_per_rank,
             self.experts.len()
         );
+        if let Some(first) = self.experts.first() {
+            dsv4_handle_deepgemm_expert_backend(
+                ctx,
+                dsv4_expert_backend()?,
+                "local routed experts",
+                &[&first.w1, &first.w3, &first.w2],
+            )?;
+        }
 
         let trace = dsv4_moe_trace_begin(ctx)?;
         let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
@@ -1704,6 +1924,12 @@ impl DeepseekV4MoeBlock {
             route_out.seq_len,
             total_local_routes
         );
+        dsv4_handle_deepgemm_expert_backend(
+            ctx,
+            dsv4_expert_backend()?,
+            "packed grouped local experts",
+            &[&first.w1, &first.w3, &first.w2],
+        )?;
 
         let scratch = scratch_cache.ensure_grouped_expert_scratch(
             ctx,
@@ -1882,6 +2108,12 @@ impl DeepseekV4MoeBlock {
             route_out.seq_len,
             num_routes
         );
+        dsv4_handle_deepgemm_expert_backend(
+            ctx,
+            dsv4_expert_backend()?,
+            "route-grouped decode experts",
+            &[&first.w1, &first.w3, &first.w2],
+        )?;
 
         let scratch = scratch_cache.ensure_grouped_expert_scratch(
             ctx,
@@ -2018,6 +2250,19 @@ impl DeepseekV4MoeBlock {
         );
 
         let has_moe_scratch = moe_scratch.is_some();
+        let expert_backend = dsv4_expert_backend()?;
+        if let Some(first) = self.experts.first() {
+            dsv4_handle_deepgemm_expert_backend(
+                ctx,
+                expert_backend,
+                "DeepEP routed experts",
+                &[&first.w1, &first.w3, &first.w2],
+            )?;
+        }
+        ensure!(
+            !matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired) || has_moe_scratch,
+            "ARLE_DSV4_EXPERT_BACKEND=deepgemm requires DeepSeek V4 MoE runtime scratch"
+        );
         let count_exchange_mode = dsv4_count_exchange_mode()?;
         let use_padded_dispatch = hidden.seq_len == 1
             && matches!(count_exchange_mode, Dsv4CountExchangeMode::AllGather)
@@ -3978,6 +4223,7 @@ mod tests {
             grouped_w1_ptrs: None,
             grouped_w3_ptrs: None,
             grouped_w2_ptrs: None,
+            deepgemm_cache: None,
             shared_experts: None,
         };
         let routing = LocalExpertRouting {
@@ -4071,6 +4317,7 @@ mod tests {
             grouped_w1_ptrs: None,
             grouped_w3_ptrs: None,
             grouped_w2_ptrs: None,
+            deepgemm_cache: None,
             shared_experts: None,
         };
 

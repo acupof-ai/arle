@@ -384,6 +384,26 @@ impl DeviceContext {
         count.max(1) as usize
     }
 
+    /// Query the CUDA compute capability for the GPU this context is bound to.
+    pub fn compute_capability(&self) -> (i32, i32) {
+        use cudarc::driver::sys::*;
+        let mut major: i32 = 0;
+        let mut minor: i32 = 0;
+        unsafe {
+            cuDeviceGetAttribute(
+                &mut major,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                self.ctx.cu_device(),
+            );
+            cuDeviceGetAttribute(
+                &mut minor,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                self.ctx.cu_device(),
+            );
+        }
+        (major, minor)
+    }
+
     /// Synchronize compute stream.
     pub fn sync(&self) -> Result<()> {
         self.stream
@@ -977,6 +997,201 @@ impl std::fmt::Display for WeightFormat {
             Self::Dsv4Fp4BlockScaled => f.write_str("dsv4_fp4_block_scaled"),
         }
     }
+}
+
+const DSV4_DEEPGEMM_FP8_SCALE_GRAN_M: usize = 128;
+const DSV4_DEEPGEMM_FP8_SCALE_GRAN_K: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dsv4DeepGemmSourceFormat {
+    Fp8 = 0,
+    Fp4 = 1,
+}
+
+impl Dsv4DeepGemmSourceFormat {
+    fn from_weight_format(format: WeightFormat) -> Result<Self> {
+        match format {
+            WeightFormat::Dsv4Fp8BlockScaled => Ok(Self::Fp8),
+            WeightFormat::Dsv4Fp4BlockScaled => Ok(Self::Fp4),
+            other => Err(anyhow!(
+                "DeepSeek V4 DeepGEMM FP8 cache needs raw DSv4 block-scaled weights, got {other}"
+            )),
+        }
+    }
+}
+
+/// Resident FP8 E4M3 weight cache plus FP32 block scales in DeepGEMM's SM90
+/// grouped-GEMM source layout.
+///
+/// `weight` is row-major `[rows, cols]` FP8 bytes. `scales` is contiguous
+/// `[ceil(rows/128), ceil(cols/128)]` FP32, matching DeepGEMM's Hopper SFB
+/// recipe for m-grouped FP8 GEMM.
+pub struct Dsv4Fp8DeepGemmWeightCache {
+    pub weight: CudaSlice<u8>,
+    pub scales: CudaSlice<f32>,
+    pub rows: usize,
+    pub cols: usize,
+    pub scale_rows: usize,
+    pub scale_cols: usize,
+}
+
+impl Dsv4Fp8DeepGemmWeightCache {
+    pub fn uninit(ctx: &DeviceContext, rows: usize, cols: usize) -> Result<Self> {
+        let scale_rows = rows.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M);
+        let scale_cols = cols.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_K);
+        Ok(Self {
+            weight: unsafe { ctx.stream.alloc_traced::<u8>(rows.saturating_mul(cols))? },
+            scales: unsafe {
+                ctx.stream
+                    .alloc_traced::<f32>(scale_rows.saturating_mul(scale_cols))?
+            },
+            rows,
+            cols,
+            scale_rows,
+            scale_cols,
+        })
+    }
+
+    #[must_use]
+    pub fn scale_gran_m(&self) -> usize {
+        DSV4_DEEPGEMM_FP8_SCALE_GRAN_M
+    }
+
+    #[must_use]
+    pub fn scale_gran_k(&self) -> usize {
+        DSV4_DEEPGEMM_FP8_SCALE_GRAN_K
+    }
+
+    #[must_use]
+    pub fn weight_bytes(&self) -> usize {
+        self.rows.saturating_mul(self.cols)
+    }
+
+    #[must_use]
+    pub fn scale_bytes(&self) -> usize {
+        self.scale_rows
+            .saturating_mul(self.scale_cols)
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
+
+    pub fn from_dsv4_weight(ctx: &DeviceContext, weight: &DeviceMatrix) -> Result<Self> {
+        let mut cache = Self::uninit(ctx, weight.rows, weight.cols)?;
+        cache.fill_from_dsv4_weight(ctx, weight, 0)?;
+        Ok(cache)
+    }
+
+    pub fn from_dsv4_weight_pair_rows(
+        ctx: &DeviceContext,
+        first: &DeviceMatrix,
+        second: &DeviceMatrix,
+    ) -> Result<Self> {
+        ensure!(
+            first.cols == second.cols,
+            "DeepSeek V4 DeepGEMM fused cache needs matching K: first={} second={}",
+            first.cols,
+            second.cols
+        );
+        ensure!(
+            first.rows.is_multiple_of(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M),
+            "DeepSeek V4 DeepGEMM fused cache needs first row count aligned to {}, got {}",
+            DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
+            first.rows
+        );
+        let mut cache = Self::uninit(ctx, first.rows + second.rows, first.cols)?;
+        cache.fill_from_dsv4_weight(ctx, first, 0)?;
+        cache.fill_from_dsv4_weight(ctx, second, first.rows)?;
+        Ok(cache)
+    }
+
+    pub fn fill_from_dsv4_weight(
+        &mut self,
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+        dst_row_offset: usize,
+    ) -> Result<()> {
+        dsv4_fill_fp8_deepgemm_weight_cache(
+            ctx,
+            weight,
+            self,
+            dst_row_offset,
+            dst_row_offset / DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
+        )
+    }
+}
+
+fn dsv4_fill_fp8_deepgemm_weight_cache(
+    ctx: &DeviceContext,
+    src: &DeviceMatrix,
+    dst: &mut Dsv4Fp8DeepGemmWeightCache,
+    dst_row_offset: usize,
+    dst_scale_row_offset: usize,
+) -> Result<()> {
+    let source_format = Dsv4DeepGemmSourceFormat::from_weight_format(src.weight_format)?;
+    ensure!(
+        src.cols == dst.cols,
+        "DeepSeek V4 DeepGEMM cache K mismatch: source={} cache={}",
+        src.cols,
+        dst.cols
+    );
+    ensure!(
+        dst_row_offset + src.rows <= dst.rows,
+        "DeepSeek V4 DeepGEMM cache row range overflow: offset={} src={} cache={}",
+        dst_row_offset,
+        src.rows,
+        dst.rows
+    );
+    ensure!(
+        dst_row_offset.is_multiple_of(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M),
+        "DeepSeek V4 DeepGEMM cache row offset must be {}-aligned, got {}",
+        DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
+        dst_row_offset
+    );
+    ensure!(
+        src.dsv4_scale_rows > 0 && src.dsv4_scale_cols > 0,
+        "DeepSeek V4 DeepGEMM cache source needs DSv4 block scales"
+    );
+    let src_scale_rows = src.rows.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M);
+    ensure!(
+        dst_scale_row_offset + src_scale_rows <= dst.scale_rows,
+        "DeepSeek V4 DeepGEMM cache scale row overflow: offset={} src={} cache={}",
+        dst_scale_row_offset,
+        src_scale_rows,
+        dst.scale_rows
+    );
+
+    let qweight = src
+        .qweight
+        .as_ref()
+        .ok_or_else(|| anyhow!("DeepSeek V4 DeepGEMM cache source missing raw weight bytes"))?;
+    let src_scales = src
+        .dsv4_scales
+        .as_ref()
+        .ok_or_else(|| anyhow!("DeepSeek V4 DeepGEMM cache source missing block scales"))?;
+    let (src_ptr, _src_guard) = qweight.device_ptr(&ctx.stream);
+    let (src_scale_ptr, _src_scale_guard) = src_scales.device_ptr(&ctx.stream);
+    let (dst_weight_ptr, _dst_weight_guard) = dst.weight.device_ptr_mut(&ctx.stream);
+    let (dst_scale_ptr, _dst_scale_guard) = dst.scales.device_ptr_mut(&ctx.stream);
+    let dst_weight_ptr = unsafe { (dst_weight_ptr as *mut u8).add(dst_row_offset * dst.cols) };
+    let dst_scale_ptr =
+        unsafe { (dst_scale_ptr as *mut f32).add(dst_scale_row_offset * dst.scale_cols) };
+    unsafe {
+        ffi::dsv4_block_scaled_to_fp8_deepgemm_cuda(
+            src_ptr as *const u8,
+            src_scale_ptr as *const u8,
+            dst_weight_ptr,
+            dst_scale_ptr,
+            src.rows as i32,
+            src.cols as i32,
+            src.dsv4_scale_rows as i32,
+            src.dsv4_scale_cols as i32,
+            dst.scale_cols as i32,
+            source_format as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|err| anyhow!("DeepSeek V4 DeepGEMM FP8 cache build failed: {err}"))?;
+    }
+    Ok(())
 }
 
 /// 2D device tensor (matrix) — stored in row-major order as bf16 unless
