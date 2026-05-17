@@ -334,8 +334,41 @@ pub(crate) fn mul_scalar_backward(
         return Ok(GradPairs::new());
     }
 
-    let upstream = store.to_host(output_grad_id)?;
+    // P3: route Dirty::Device upstream through `mul_scalar_backward_device`
+    // so the gradient stays on-device. Pre-P3 this op did
+    // `to_host(upstream) → mul_scalar_forward → alloc Tensor::new`, which
+    // (combined with `mean_backward`'s host fallback) was the *first*
+    // host op in the CE-loss backward chain — see the M5.3b architectural-
+    // correction doc. Keeping this on-device unblocks every downstream
+    // `device_path_ok` gate (matmul / softmax / gather / accumulate_grad).
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let input_shape = store.tensor(a)?.shape.clone();
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        if upstream_shape != input_shape {
+            return Err(AutogradError::ShapeMismatch {
+                expected: input_shape,
+                got: upstream_shape,
+            });
+        }
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle =
+            store
+                .backend()
+                .mul_scalar_backward_device(&upstream_handle, k, &input_shape)?;
+        let grad_id = store.alloc_device_tensor(input_shape, grad_handle)?;
+        return Ok(smallvec![(a, grad_id)]);
+    }
+
+    let upstream = store.to_host(output_grad_id)?;
     let grad = store.backend().mul_scalar_forward(&upstream, k)?;
     let grad_id = store.alloc(Tensor::new(grad, input_shape, false)?);
     Ok(smallvec![(a, grad_id)])

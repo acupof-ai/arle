@@ -32,6 +32,10 @@ const LOG_SOFTMAX_BACKWARD_CU: &str = include_str!("kernels/log_softmax_backward
 const GATHER_BACKWARD_CU: &str = include_str!("kernels/gather_backward.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ADD_INTO_CU: &str = include_str!("kernels/add_into.cu");
+#[cfg(not(feature = "no-cuda"))]
+const MEAN_BACKWARD_CU: &str = include_str!("kernels/mean_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const MUL_SCALAR_BACKWARD_CU: &str = include_str!("kernels/mul_scalar_backward.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -56,6 +60,8 @@ const FUNCTION_NAMES: &[&str] = &[
     "log_softmax_last_axis_backward_f32",
     "gather_last_dim_backward_f32",
     "add_into_f32",
+    "mean_backward_f32",
+    "mul_scalar_backward_f32",
 ];
 
 #[derive(Debug)]
@@ -204,6 +210,8 @@ fn concat_sources() -> String {
         LOG_SOFTMAX_BACKWARD_CU,
         GATHER_BACKWARD_CU,
         ADD_INTO_CU,
+        MEAN_BACKWARD_CU,
+        MUL_SCALAR_BACKWARD_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

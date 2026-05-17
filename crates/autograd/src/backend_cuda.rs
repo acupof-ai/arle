@@ -549,6 +549,50 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// P3: device-resident backward for `mul_scalar`. Pure elementwise
+    /// `grad_x[i] = upstream[i] * k` via a 1D NVRTC kernel; returns an
+    /// unevaluated handle per the M5.3b.11 batched-eval contract.
+    fn mul_scalar_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        scale: f32,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream_grad, scale, shape);
+            todo!(
+                "GPU required: cuda mul_scalar_backward_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_mul_scalar_backward_device(self, upstream_grad, scale, shape)
+        }
+    }
+
+    /// P3: device-resident backward for `mean`. Scalar `upstream_grad`
+    /// (rank-0 device handle) broadcast-divided by `elem_count` across
+    /// `output_shape`. Returns an unevaluated handle.
+    fn mean_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        output_shape: &[usize],
+        elem_count: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream_grad, output_shape, elem_count);
+            todo!("GPU required: cuda mean_backward_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_mean_backward_device(self, upstream_grad, output_shape, elem_count)
+        }
+    }
+
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -1818,6 +1862,94 @@ fn cuda_matmul_backward_device(
             got: a_shape.len().max(b_shape.len()),
         }),
     }
+}
+
+// P3: device-resident backward for `mul_scalar(x, k)`. Reads
+// `upstream[i] * k` via `mul_scalar_backward_f32` (functionally identical
+// to the forward `mul_scalar_f32`, but kept as a separately-registered
+// kernel so the audit trail in nsys traces matches the autograd op name).
+// Returned handle is unevaluated — terminal `eval` is the caller's.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_mul_scalar_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    scale: f32,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    let d_up = backend.cuda_slice(upstream, "mul_scalar_backward_device")?;
+    let size = shape_size(shape);
+    if d_up.len() != size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_up.len(),
+            shape: shape.to_vec(),
+            size,
+        });
+    }
+
+    let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (mul_scalar_backward_device)")
+    })?;
+    let n = i32::try_from(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda mul_scalar_backward length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("mul_scalar_backward_f32")?,
+        size,
+        |mut builder| {
+            builder.arg(&mut d_out).arg(d_up).arg(&scale).arg(&n);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+// P3: device-resident backward for `mean(x)`. The upstream is a rank-0
+// device scalar; the kernel reads it once per thread (block-broadcast
+// from L1 after the first warp) and writes `upstream * (1/N)` across
+// `elem_count` slots. Returned handle is unevaluated.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_mean_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    output_shape: &[usize],
+    elem_count: usize,
+) -> Result<DeviceHandle> {
+    let d_up = backend.cuda_slice(upstream, "mean_backward_device")?;
+    if d_up.len() != 1 {
+        return Err(AutogradError::ShapeMismatch {
+            expected: Vec::new(),
+            got: vec![d_up.len()],
+        });
+    }
+    let expected = shape_size(output_shape);
+    if expected != elem_count {
+        return Err(AutogradError::DataLengthMismatch {
+            len: elem_count,
+            shape: output_shape.to_vec(),
+            size: expected,
+        });
+    }
+
+    let inv_n: f32 = if elem_count == 0 {
+        0.0
+    } else {
+        1.0 / elem_count as f32
+    };
+    let mut d_out = backend.stream.alloc_zeros::<f32>(elem_count).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (mean_backward_device)")
+    })?;
+    let n = i32::try_from(elem_count)
+        .map_err(|_| AutogradError::TapeInvariant("cuda mean_backward length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("mean_backward_f32")?,
+        elem_count,
+        |mut builder| {
+            builder.arg(&mut d_out).arg(d_up).arg(&inv_n).arg(&n);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
 // Device-resident gradient accumulation. Allocates a fresh output buffer
