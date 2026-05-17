@@ -198,19 +198,61 @@ pub(crate) fn log_softmax_backward(
             "log_softmax backward missing saved output",
         ));
     };
-    let output = store.tensor(y)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
-    if output.shape != upstream.shape {
+
+    // Shape check uses borrowed access only — `.clone()` on a
+    // `Dirty::Device` tensor would panic, and the device-aware fast path
+    // (below) does not need a clone.
+    let output_shape = store.tensor(y)?.shape.clone();
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if output_shape != upstream_shape {
         return Err(AutogradError::ShapeMismatch {
-            expected: output.shape,
-            got: upstream.shape,
+            expected: output_shape,
+            got: upstream_shape,
         });
     }
 
-    // dL/dx = dL/dy - softmax(x) * sum(dL/dy, axis=-1, keepdim)
-    // Saved output is log_softmax(x), so softmax(x) = exp(output). Stream
-    // row-wise to avoid materializing `exp(output)` + `scaled` + `grad` at
-    // full-vocab scale (codex review 2026-04-19).
+    // Wave 1 (post-M5.3b nsys attribution): fast-path the backward when
+    // BOTH the saved forward output and the upstream gradient are still
+    // device-resident. This is the production CUDA path: the saved
+    // `LogSoftmaxCtx { y }` is produced by `softmax_device_lazy` on a
+    // `Dirty::Device` tensor, and the upstream gradient flows from
+    // `gather_last_dim_backward`'s device override. Skipping the host
+    // round-trip here kills the `[B, S, V] × 4 B ≈ 1 GB` DtoH that nsys
+    // identified as the single largest readback per training step (see
+    // `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    let saved_on_device =
+        store.tensor(y)?.dirty == Dirty::Device && store.tensor(y)?.device_handle.is_some();
+    let upstream_on_device = store.tensor(output_grad_id)?.dirty == Dirty::Device
+        && store.tensor(output_grad_id)?.device_handle.is_some();
+    if saved_on_device && upstream_on_device {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let output_handle = store
+            .tensor(y)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle = store.backend().log_softmax_last_axis_backward(
+            &upstream_handle,
+            &output_handle,
+            &output_shape,
+        )?;
+        let grad_id = store.alloc_device_tensor(output_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
+
+    // Host-eager fallback: any backend (CPU/Metal) plus any case where
+    // the upstream or saved tensor is already host-resident. Mirrors the
+    // pre-Wave-1 reference and stays in lock-step with
+    // `cpu_log_softmax_backward` so device + host produce byte-identical
+    // grads up to fp rounding.
+    let output = store.tensor(y)?.clone();
+    let upstream = store.tensor(output_grad_id)?.clone();
     let last = last_dim(&output.shape)?;
     let rows = output.data.len() / last;
     let mut grad = vec![0.0_f32; output.data.len()];

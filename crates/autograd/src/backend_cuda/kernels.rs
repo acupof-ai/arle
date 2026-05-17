@@ -26,6 +26,10 @@ const SCATTER_ADD_CU: &str = include_str!("kernels/scatter_add.cu");
 const ADD_BROADCAST_CU: &str = include_str!("kernels/add_broadcast.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ADAMW_CU: &str = include_str!("kernels/adamw.cu");
+#[cfg(not(feature = "no-cuda"))]
+const LOG_SOFTMAX_BACKWARD_CU: &str = include_str!("kernels/log_softmax_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const GATHER_BACKWARD_CU: &str = include_str!("kernels/gather_backward.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -47,6 +51,8 @@ const FUNCTION_NAMES: &[&str] = &[
     "scatter_add_rows_f32",
     "add_broadcast_f32",
     "adamw_step_f32",
+    "log_softmax_last_axis_backward_f32",
+    "gather_last_dim_backward_f32",
 ];
 
 #[derive(Debug)]
@@ -192,6 +198,8 @@ fn concat_sources() -> String {
         SCATTER_ADD_CU,
         ADD_BROADCAST_CU,
         ADAMW_CU,
+        LOG_SOFTMAX_BACKWARD_CU,
+        GATHER_BACKWARD_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

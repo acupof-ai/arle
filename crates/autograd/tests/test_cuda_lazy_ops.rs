@@ -22,7 +22,8 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
 use autograd::backend::{
-    cpu_gather_last_dim_forward, cpu_log_softmax_forward_last_axis, cpu_softmax_forward_last_axis,
+    cpu_gather_last_dim_backward, cpu_gather_last_dim_forward, cpu_log_softmax_backward,
+    cpu_log_softmax_forward_last_axis, cpu_softmax_forward_last_axis,
 };
 use autograd::backend_cuda::CudaBackend;
 use autograd::{Backend, DeviceHandle};
@@ -60,14 +61,28 @@ fn rng_ids(seed: u64, n: usize, upper: i32) -> Vec<i32> {
 /// and the AdamW parity gate. Returns the worst `|diff| / tol` excess
 /// ratio so the assert message can name the failing index.
 fn max_err(dev: &[f32], host: &[f32]) -> (f32, f32, usize) {
-    const ATOL: f32 = 1e-6;
-    const RTOL: f32 = 1e-4;
+    max_err_with_tol(dev, host, 1e-6, 1e-4)
+}
+
+/// Tolerance-parameterised variant of `max_err`. The log_softmax
+/// backward path sums `upstream` across `vocab = 248 070` elements per
+/// row inside the kernel, so accumulated `__expf` / `__fadd` rounding
+/// is bounded by ~`sqrt(vocab) * f32_eps ≈ 5e-5`. Combined with the
+/// `expf` vs `__expf` ~1-2 ULP gap on the per-element multiply, that
+/// pushes the worst absolute diff to ~1e-5 at small grad magnitudes —
+/// the strict AdamW gate (`atol=1e-6`) would false-positive on those
+/// near-zero entries even though the relative error is well below
+/// 1e-4. Keep the forward gates strict (their outputs are
+/// probabilities normalized to 1, not the cancellation result of a
+/// vocab-wide sum) and only relax the absolute floor for the
+/// backward where the math demands it.
+fn max_err_with_tol(dev: &[f32], host: &[f32], atol: f32, rtol: f32) -> (f32, f32, usize) {
     let mut worst_excess = 0.0_f32;
     let mut worst_abs = 0.0_f32;
     let mut worst_idx = 0_usize;
     for (i, (d, h)) in dev.iter().zip(host.iter()).enumerate() {
         let abs_diff = (d - h).abs();
-        let tol = ATOL + RTOL * h.abs();
+        let tol = atol + rtol * h.abs();
         let excess = abs_diff / tol;
         if excess > worst_excess {
             worst_excess = excess;
@@ -181,5 +196,114 @@ fn cuda_gather_last_dim_device_lazy_matches_cpu() {
          (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
         dev_out[idx],
         host_out[idx]
+    );
+}
+
+#[test]
+fn cuda_log_softmax_last_axis_backward_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_log_softmax_last_axis_backward_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // Production shape: `[B=2, S=512, V=248070]`. The saved log_softmax
+    // output (`y`) feeds the backward identity
+    // `grad = upstream - exp(y) * sum(upstream, axis=-1)`. This is the
+    // exact `1 015 MB` tensor that nsys identified as the single largest
+    // DtoH per training step (see
+    // `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`);
+    // benching against the production shape catches reductions /
+    // intrinsics drift the smaller unit-test shapes miss.
+    let shape: Vec<usize> = vec![2, 512, 248_070];
+    let size: usize = shape.iter().product();
+
+    let x = rng_vec(0xDEC0DE, size, 4.0);
+    let upstream = rng_vec(0xF00DCAFE, size, 1.0);
+
+    // Host reference: cpu_log_softmax produces the saved `y`, then
+    // cpu_log_softmax_backward consumes it with the upstream gradient.
+    let log_softmax_output =
+        cpu_log_softmax_forward_last_axis(&x, &shape).expect("cpu log_softmax forward");
+    let host_grad = cpu_log_softmax_backward(&upstream, &log_softmax_output, &shape)
+        .expect("cpu log_softmax_backward");
+
+    // Device-resident path: forward stays lazy via M5.3b override; the
+    // Wave 1 backward consumes the saved device handle without a host
+    // roundtrip on either tensor.
+    let x_h: DeviceHandle = backend.upload(&x, &shape).expect("upload x");
+    let y_h = backend
+        .log_softmax_last_axis(&x_h, &shape)
+        .expect("cuda log_softmax forward (device lazy)");
+    let upstream_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+    let grad_h = backend
+        .log_softmax_last_axis_backward(&upstream_h, &y_h, &shape)
+        .expect("cuda log_softmax_last_axis_backward");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend
+        .readback(&grad_h)
+        .expect("dev log_softmax grad readback");
+
+    // Backward sums upstream across the full vocab inside the kernel
+    // (`sqrt(248070)`-bounded `__fadd` rounding) and then multiplies by
+    // `__expf(saved_output)`, so the cancellation result at small grad
+    // magnitudes carries a few ULP of accumulated drift. Keep the
+    // relative tolerance at the standard 1e-4 but bump the absolute
+    // floor by 10× so near-zero entries don't false-positive — see the
+    // `max_err_with_tol` rationale comment.
+    let (excess, abs, idx) = max_err_with_tol(&dev_grad, &host_grad, 1e-5, 1e-4);
+    assert!(
+        excess <= 1.0,
+        "log_softmax_last_axis_backward exceeds atol=1e-5 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
+
+#[test]
+fn cuda_gather_last_dim_backward_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_gather_last_dim_backward_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // Production shape: `[B=2, S=512, V=248070]`. The backward
+    // zero-fills the full `[B, S, V]` grad and scatters the per-prefix
+    // upstream scalar at `(row, ids[row])` — the same `1 GB` device
+    // grad that feeds `log_softmax_last_axis_backward` in the
+    // post-Wave-1 chain.
+    let shape: Vec<usize> = vec![2, 512, 248_070];
+    let prefix: usize = shape[..shape.len() - 1].iter().product();
+    let vocab = *shape.last().unwrap();
+
+    let upstream = rng_vec(0x501ACE, prefix, 1.0);
+    let ids = rng_ids(0xBEAF, prefix, vocab as i32);
+
+    let host_grad = cpu_gather_last_dim_backward(&upstream, &ids, &shape)
+        .expect("cpu gather_last_dim_backward");
+
+    // Device-resident path: upstream uploads (4 KB), the `[B, S, V]`
+    // grad stays on-device after `alloc_zeros` + scatter kernel.
+    let upstream_h: DeviceHandle = backend
+        .upload(&upstream, &[shape[0], shape[1]])
+        .expect("upload upstream");
+    let grad_h = backend
+        .gather_last_dim_backward(&upstream_h, &ids, &shape)
+        .expect("cuda gather_last_dim_backward");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend.readback(&grad_h).expect("dev gather grad readback");
+
+    assert_eq!(
+        dev_grad.len(),
+        host_grad.len(),
+        "gather backward grad length"
+    );
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "gather_last_dim_backward exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
     );
 }
