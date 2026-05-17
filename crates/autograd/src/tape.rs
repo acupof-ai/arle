@@ -7,6 +7,9 @@ use crate::{
     tensor::{Dirty, TensorId, TensorStore},
 };
 
+// `Dirty` is used both by the pre-existing batched-flush filter (line ~176)
+// and by the P2 device-residency gate inside `merge_grad`.
+
 #[derive(Debug, Clone)]
 pub enum SavedContext {
     None,
@@ -313,10 +316,45 @@ fn merge_grad(
             });
         }
 
-        let incoming_data = store.to_host(new_grad_id)?;
-        let existing = store.tensor_mut(existing_grad_id)?;
-        for (dst, src) in existing.data.iter_mut().zip(incoming_data) {
-            *dst += src;
+        // P2 (device-resident gradient tape): if both grads are still
+        // device-resident, fuse them with `add_into_device` so neither
+        // side gets pulled back to host. Without this, the second
+        // backward path that arrives at the same parameter would force a
+        // `to_host(new_grad_id)` and the merged sum lives only in
+        // `existing.data` — host-resident from then on. See
+        // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+        let both_on_device = {
+            let existing = store.tensor(existing_grad_id)?;
+            let incoming = store.tensor(new_grad_id)?;
+            existing.dirty != Dirty::Host
+                && existing.device_handle.is_some()
+                && incoming.dirty != Dirty::Host
+                && incoming.device_handle.is_some()
+        };
+        if both_on_device {
+            let existing_handle = store
+                .tensor(existing_grad_id)?
+                .device_handle
+                .as_ref()
+                .expect("checked above")
+                .clone();
+            let incoming_handle = store
+                .tensor(new_grad_id)?
+                .device_handle
+                .as_ref()
+                .expect("checked above")
+                .clone();
+            let sum_handle =
+                store
+                    .backend()
+                    .add_into_device(&existing_handle, &incoming_handle, &expected)?;
+            store.replace_device_handle(existing_grad_id, sum_handle)?;
+        } else {
+            let incoming_data = store.to_host(new_grad_id)?;
+            let existing = store.tensor_mut(existing_grad_id)?;
+            for (dst, src) in existing.data.iter_mut().zip(incoming_data) {
+                *dst += src;
+            }
         }
     } else {
         let cloned_grad_id = store.clone_tensor(new_grad_id)?;

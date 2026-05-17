@@ -4,7 +4,7 @@ use crate::{
     AutogradError, Result,
     backend::matmul_output_shape as backend_matmul_output_shape,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Tensor, TensorId, TensorStore},
+    tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
 pub fn matmul(
@@ -59,51 +59,118 @@ pub(crate) fn matmul_backward(
         ));
     };
 
-    let upstream = store.tensor(output_grad_id)?.clone();
-    let a_tensor = store.tensor(a)?.clone();
-    let b_tensor = store.tensor(b)?.clone();
-    let expected_shape = matmul_output_shape(&a_tensor.shape, &b_tensor.shape)?;
-    if upstream.shape != expected_shape {
+    // Shape gate — borrow-only so we don't force a host readback when both
+    // sides are still device-resident. Cloning here would panic on
+    // `Dirty::Device` and (worse for `Dirty::Both`) materialise the 1 GB
+    // upstream gradient on host even when the device path is taken.
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    let need_grad_a = store.tensor(a)?.requires_grad;
+    let need_grad_b = store.tensor(b)?.requires_grad;
+    let expected_shape = matmul_output_shape(&a_shape, &b_shape)?;
+    if upstream_shape != expected_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: expected_shape,
-            got: upstream.shape,
+            got: upstream_shape,
         });
     }
 
     let mut grads = GradPairs::new();
-    match (a_tensor.shape.len(), b_tensor.shape.len()) {
-        (2, 2) | (3, 3) => {
-            let need_grad_a = a_tensor.requires_grad;
-            let need_grad_b = b_tensor.requires_grad;
-            if need_grad_a || need_grad_b {
-                let (grad_a_data, grad_b_data) = store.backend().matmul_backward(
-                    &a_tensor.data,
-                    &a_tensor.shape,
-                    &b_tensor.data,
-                    &b_tensor.shape,
-                    &upstream.data,
-                    &upstream.shape,
-                    need_grad_a,
-                    need_grad_b,
-                )?;
-                if need_grad_a {
-                    let grad_id =
-                        store.alloc(Tensor::new(grad_a_data, a_tensor.shape.clone(), false)?);
-                    grads.push((a, grad_id));
-                }
-                if need_grad_b {
-                    let grad_id =
-                        store.alloc(Tensor::new(grad_b_data, b_tensor.shape.clone(), false)?);
-                    grads.push((b, grad_id));
-                }
-            }
-        }
+    if !need_grad_a && !need_grad_b {
+        return Ok(grads);
+    }
+    match (a_shape.len(), b_shape.len()) {
+        (2, 2) | (3, 3) => {}
         _ => {
             return Err(AutogradError::InvalidRank {
                 expected: "both operands must be rank-2 or rank-3",
-                got: a_tensor.shape.len().max(b_tensor.shape.len()),
+                got: a_shape.len().max(b_shape.len()),
             });
         }
+    }
+
+    // P2 (device-resident gradient tape): when all three operands are still
+    // device-resident, dispatch through `matmul_backward_device` so the
+    // saved hidden / weight buffers and the upstream gradient never round-
+    // trip through host. This is the contract change that retires the
+    // 1 GB DtoH that Wave 1 surfaced — the LM-head GEMM's
+    // `grad_out: &[f32]` was the single largest readback per step
+    // (`docs/research/2026-05-17-cuda-training-architectural-correction.md`).
+    let device_path_ok = {
+        let a_t = store.tensor(a)?;
+        let b_t = store.tensor(b)?;
+        let g_t = store.tensor(output_grad_id)?;
+        a_t.dirty != Dirty::Host
+            && a_t.device_handle.is_some()
+            && b_t.dirty != Dirty::Host
+            && b_t.device_handle.is_some()
+            && g_t.dirty != Dirty::Host
+            && g_t.device_handle.is_some()
+    };
+    if device_path_ok {
+        let a_handle = store
+            .tensor(a)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let b_handle = store
+            .tensor(b)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let g_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let (grad_a_handle, grad_b_handle) = store.backend().matmul_backward_device(
+            &a_handle,
+            &a_shape,
+            &b_handle,
+            &b_shape,
+            &g_handle,
+            &upstream_shape,
+            need_grad_a,
+            need_grad_b,
+        )?;
+        if let Some(handle) = grad_a_handle {
+            let grad_id = store.alloc_device_tensor(a_shape.clone(), handle)?;
+            grads.push((a, grad_id));
+        }
+        if let Some(handle) = grad_b_handle {
+            let grad_id = store.alloc_device_tensor(b_shape.clone(), handle)?;
+            grads.push((b, grad_id));
+        }
+        return Ok(grads);
+    }
+
+    // Host-eager fallback. Any operand without a device handle (or already
+    // marked `Dirty::Host`) drops the whole call back onto the legacy
+    // `matmul_backward(&[f32], …)` contract, matching pre-P2 behaviour.
+    let a_tensor = store.tensor(a)?.clone();
+    let b_tensor = store.tensor(b)?.clone();
+    let upstream = store.tensor(output_grad_id)?.clone();
+    let (grad_a_data, grad_b_data) = store.backend().matmul_backward(
+        &a_tensor.data,
+        &a_tensor.shape,
+        &b_tensor.data,
+        &b_tensor.shape,
+        &upstream.data,
+        &upstream.shape,
+        need_grad_a,
+        need_grad_b,
+    )?;
+    if need_grad_a {
+        let grad_id = store.alloc(Tensor::new(grad_a_data, a_tensor.shape.clone(), false)?);
+        grads.push((a, grad_id));
+    }
+    if need_grad_b {
+        let grad_id = store.alloc(Tensor::new(grad_b_data, b_tensor.shape.clone(), false)?);
+        grads.push((b, grad_id));
     }
 
     Ok(grads)
