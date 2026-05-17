@@ -242,6 +242,35 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// Device-handle variant of `cpu_log_softmax_backward`. Computes
+    /// `grad_input = upstream - exp(log_softmax_output) * sum(upstream, axis=-1, keepdim=true)`
+    /// row-wise over the last axis.
+    ///
+    /// `log_softmax_output` is the saved forward output (NOT the input —
+    /// `softmax(x) = exp(log_softmax(x))` and the backward identity uses the
+    /// softmax probability, which is just `exp(saved_output)`). `upstream`
+    /// has the same shape as `log_softmax_output`.
+    ///
+    /// Wave 1 (post-M5.3b-nsys attribution): the default fallback runs
+    /// the host formula via `cpu_log_softmax_backward`, so non-CUDA
+    /// backends inherit correct behaviour. CUDA overrides this with a
+    /// single per-row NVRTC kernel that consumes the saved forward output
+    /// without a host roundtrip — kills the `[B, S, V]` × 4 B ≈ 1 GB DtoH
+    /// copy that nsys identified as the single largest readback per
+    /// training step (see
+    /// `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    fn log_softmax_last_axis_backward(
+        &self,
+        upstream: &DeviceHandle,
+        log_softmax_output: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let output_host = self.readback(log_softmax_output)?;
+        let grad = cpu_log_softmax_backward(&upstream_host, &output_host, shape)?;
+        self.upload(&grad, shape)
+    }
+
     /// Device-handle variant of `silu_forward`. Lazy on backends that can
     /// compose `x * sigmoid(x)` into their graph (Metal: `mlx_multiply` +
     /// `mlx_sigmoid`); the default implementation falls back to
@@ -530,6 +559,36 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             src_shape[..src_shape.len() - 1].to_vec()
         };
         self.upload(&out, &out_shape)
+    }
+
+    /// Device-handle backward for `gather_last_dim`. Zero-fills a
+    /// `[prefix_rows, vocab] = src_shape` output and scatters the per-prefix
+    /// `upstream` values into the `(row, ids[row])` slots. Equivalent to the
+    /// flat `scatter_add_rows_forward(upstream, prefix_rows, 1,
+    /// remapped_ids, prefix_rows * vocab)` path the host backward takes, but
+    /// the trait-level signature exposes the natural `[B, S, V]` output
+    /// shape so backends can pick block tiling (one block per prefix row of
+    /// `vocab` cols) without un-flattening.
+    ///
+    /// `upstream` has length `product(src_shape[..-1])` (one scalar per
+    /// prefix position). `indices.len() == prefix_rows == upstream.len()`.
+    /// Negative or out-of-range indices are silently skipped, matching
+    /// `cpu_gather_last_dim_backward` / `cpu_scatter_add_rows_forward`.
+    ///
+    /// Wave 1: CUDA overrides this with a single per-row NVRTC kernel so
+    /// the `[B, S, V]` grad stays device-resident — keeps the `1 GB`
+    /// scatter-add output off the host-roundtrip path that the host
+    /// `gather_last_dim_backward` previously forced (see
+    /// `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    fn gather_last_dim_backward(
+        &self,
+        upstream: &DeviceHandle,
+        indices: &[i32],
+        src_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let grad = cpu_gather_last_dim_backward(&upstream_host, indices, src_shape)?;
+        self.upload(&grad, src_shape)
     }
 
     /// Pure-layout reshape: returns a handle whose view is `new_shape` over
@@ -1011,6 +1070,62 @@ pub fn cpu_log_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<V
     Ok(out)
 }
 
+/// CPU reference for `log_softmax_last_axis_backward`. Computes
+/// `grad_input[i, j] = upstream[i, j] - exp(log_softmax_output[i, j]) * sum_j(upstream[i, j])`
+/// row-wise over the last axis. `log_softmax_output` is the saved
+/// forward output — `softmax(x) = exp(log_softmax(x))`, so the
+/// derivative identity reuses it without recomputing softmax.
+///
+/// Mirrors the inline math in `ops::softmax::log_softmax_backward`
+/// (host-eager path). Kept as a free function so the device-handle
+/// fallback in `Backend::log_softmax_last_axis_backward` can reuse the
+/// same reference and parity tests can compare device against CPU.
+pub fn cpu_log_softmax_backward(
+    upstream: &[f32],
+    log_softmax_output: &[f32],
+    shape: &[usize],
+) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected = shape_size(shape);
+    if upstream.len() != expected {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: upstream.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
+    if log_softmax_output.len() != expected {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: log_softmax_output.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
+    let rows = expected / last_dim;
+    let mut grad = vec![0.0_f32; expected];
+    for row in 0..rows {
+        let base = row * last_dim;
+        let mut sum_grad = 0.0_f32;
+        for col in 0..last_dim {
+            sum_grad += upstream[base + col];
+        }
+        for col in 0..last_dim {
+            grad[base + col] =
+                upstream[base + col] - log_softmax_output[base + col].exp() * sum_grad;
+        }
+    }
+    Ok(grad)
+}
+
 /// CPU reference `out = a * b` for equal-length contiguous slices.
 pub fn cpu_mul_forward(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
     if a.len() != b.len() {
@@ -1406,6 +1521,63 @@ pub fn cpu_gather_last_dim_forward(
         out[i] = src[i * vocab + id as usize];
     }
     Ok(out)
+}
+
+/// CPU reference for `gather_last_dim_backward`. Zero-fills a
+/// `src_shape = [prefix..., vocab]` buffer then writes
+/// `upstream[row]` into `out[row * vocab + indices[row]]` for each
+/// prefix position. Equivalent to the `scatter_add_rows_forward` call
+/// in `ops::gather::gather_last_dim_backward` with `feature_dim = 1`
+/// and remapped flat ids — kept as a dedicated function so the device
+/// backward override returns the same `[B, S, V]` grad shape the
+/// autograd graph expects without needing the caller to know about
+/// the flat-id trick.
+///
+/// Negative or out-of-range indices are silently skipped (matches
+/// `cpu_scatter_add_rows_forward` and the CUDA kernel's OOB handling).
+pub fn cpu_gather_last_dim_backward(
+    upstream: &[f32],
+    indices: &[i32],
+    src_shape: &[usize],
+) -> Result<Vec<f32>> {
+    use crate::AutogradError;
+    if src_shape.is_empty() {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        });
+    }
+    let vocab = *src_shape.last().expect("non-empty shape above");
+    let prefix: usize = src_shape[..src_shape.len() - 1]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    if upstream.len() != prefix {
+        return Err(AutogradError::DataLengthMismatch {
+            len: upstream.len(),
+            shape: src_shape[..src_shape.len() - 1].to_vec(),
+            size: prefix,
+        });
+    }
+    if indices.len() != prefix {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix,
+            got: indices.len(),
+        });
+    }
+    let total = prefix * vocab;
+    let mut grad = vec![0.0_f32; total];
+    for (row, &id) in indices.iter().enumerate() {
+        if id < 0 {
+            continue;
+        }
+        let id_usize = id as usize;
+        if id_usize >= vocab {
+            continue;
+        }
+        grad[row * vocab + id_usize] = upstream[row];
+    }
+    Ok(grad)
 }
 
 /// CPU reference scatter-add into a `[vocab, feature_dim]` output.

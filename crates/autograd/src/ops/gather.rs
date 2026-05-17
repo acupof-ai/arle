@@ -184,23 +184,47 @@ pub(crate) fn gather_last_dim_backward(
             "gather backward missing saved context",
         ));
     };
-    let upstream = store.tensor(output_grad_id)?.clone();
     let output_shape = src_shape[..src_shape.len() - 1].to_vec();
-    if upstream.shape != output_shape {
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if upstream_shape != output_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: output_shape,
-            got: upstream.shape,
+            got: upstream_shape,
         });
     }
 
+    // Wave 1 (post-M5.3b nsys attribution): fast-path the backward when
+    // the upstream gradient is still device-resident. This keeps the
+    // `[B, S, V]` grad on-device for `log_softmax_last_axis_backward`'s
+    // upstream — the two backwards form the chain that nsys flagged as
+    // the host-readback bottleneck. Only the int32 `indices` array
+    // crosses PCIe (KB-scale, not the GB-scale data tensor).
+    let upstream_on_device = store.tensor(output_grad_id)?.dirty == Dirty::Device
+        && store.tensor(output_grad_id)?.device_handle.is_some();
+    if upstream_on_device {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+        let grad_handle =
+            store
+                .backend()
+                .gather_last_dim_backward(&upstream_handle, &ids_i32, &src_shape)?;
+        let grad_id = store.alloc_device_tensor(src_shape, grad_handle)?;
+        return Ok(smallvec![(src, grad_id)]);
+    }
+
+    // Host-eager fallback: identical to the pre-Wave-1 path. Flatten the
+    // target to `[prefix_rows * vocab]` and dispatch a single scatter-add
+    // with remapped flat ids `i * vocab + original_indices[i]` — one
+    // trait call, one host or single-GPU launch.
+    let upstream = store.tensor(output_grad_id)?.clone();
     let vocab = *src_shape.last().ok_or(AutogradError::TapeInvariant(
         "gather missing source last dim",
     ))?;
-    // Gather's backward is a per-prefix point-write into a `[prefix_rows, vocab]`
-    // buffer. Each `(prefix_index, original_index)` pair is unique, so we can
-    // flatten the target to `[prefix_rows * vocab]` and dispatch a single
-    // scatter-add with remapped indices `i * vocab + original_indices[i]`.
-    // One trait call, one GPU launch — the same shape the old inline loop wrote.
     let prefix_rows = indices.len();
     let flat_vocab = prefix_rows * vocab;
     let flat_ids: Vec<i32> = indices

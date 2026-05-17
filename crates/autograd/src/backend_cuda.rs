@@ -748,6 +748,60 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// Wave 1 (post-M5.3b nsys attribution): device-resident backward for
+    /// `log_softmax_last_axis`. Consumes the saved forward output
+    /// directly from its `DeviceHandle` (no DtoH) and the upstream gradient
+    /// directly from device — kills the `1 015 MB` log_softmax-grad readback
+    /// nsys identified as the single largest transfer per training step
+    /// (see `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    /// Returns an unevaluated `CudaSlice<f32>` handle per the M5.3b.11
+    /// batched-eval contract — `Tape::backward`'s terminal eval (or the
+    /// AdamW step) does the single host fence.
+    fn log_softmax_last_axis_backward(
+        &self,
+        upstream: &DeviceHandle,
+        log_softmax_output: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, log_softmax_output, shape);
+            todo!(
+                "GPU required: cuda log_softmax_last_axis_backward is unavailable under feature no-cuda"
+            )
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_log_softmax_last_axis_backward(self, upstream, log_softmax_output, shape)
+        }
+    }
+
+    /// Wave 1: device-resident backward for `gather_last_dim`. Produces a
+    /// zero-filled `[B, S, V]` (or any `src_shape`) grad on-device and
+    /// writes the per-prefix upstream scalar at `(row, ids[row])` — one
+    /// thread per prefix row, no atomics needed since indices across rows
+    /// touch disjoint slots. Keeps the post-gather backward chain
+    /// device-resident so the upstream gradient flowing into
+    /// `log_softmax_last_axis_backward` never goes through host.
+    fn gather_last_dim_backward(
+        &self,
+        upstream: &DeviceHandle,
+        indices: &[i32],
+        src_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, indices, src_shape);
+            todo!(
+                "GPU required: cuda gather_last_dim_backward is unavailable under feature no-cuda"
+            )
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_gather_last_dim_backward(self, upstream, indices, src_shape)
+        }
+    }
+
     fn scatter_add_rows_forward(
         &self,
         upstream: &[f32],
@@ -1108,6 +1162,146 @@ fn cuda_gather_last_dim_device(
     )?;
 
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+// Wave 1 (post-M5.3b nsys attribution): device-resident log_softmax
+// backward. `upstream` and `log_softmax_output` arrive as borrowed CUDA
+// slices via the `Backend::log_softmax_last_axis_backward` contract; the
+// fresh grad allocation stays device-resident and is returned unevaluated
+// for the tape's terminal eval (mirrors the M5.3b forward helper pattern).
+// Same 256-thread shared-mem reduce shape as `softmax_last_axis_f32`.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_log_softmax_last_axis_backward(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    log_softmax_output: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected = shape_size(shape);
+    let d_up = backend.cuda_slice(upstream, "log_softmax_last_axis_backward")?;
+    let d_out = backend.cuda_slice(log_softmax_output, "log_softmax_last_axis_backward")?;
+    if d_up.len() != expected {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_up.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
+    if d_out.len() != expected {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_out.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
+
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda log_softmax_backward cols exceeds i32"))?;
+    let mut d_grad = backend
+        .stream
+        .alloc_zeros::<f32>(expected)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (log_softmax_bwd)"))?;
+
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    launch_rows(
+        &backend.stream,
+        backend
+            .kernels
+            .function("log_softmax_last_axis_backward_f32")?,
+        rows,
+        BLOCK,
+        SHARED,
+        |mut builder| {
+            builder.arg(&mut d_grad).arg(d_up).arg(d_out).arg(&cols);
+            builder
+        },
+    )?;
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+// Wave 1: device-resident backward for gather_last_dim. Allocates a
+// zero-filled `[product(src_shape)]` grad on-device and scatters the
+// per-prefix upstream scalar into `(row, ids[row])`. Only the int32
+// `indices` array crosses PCIe; the `[prefix_rows]` upstream slice stays
+// on-device. No `synchronize()` — terminal eval is the caller's.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_gather_last_dim_backward(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    indices: &[i32],
+    src_shape: &[usize],
+) -> Result<DeviceHandle> {
+    if src_shape.is_empty() {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        });
+    }
+    let vocab = *src_shape.last().expect("non-empty shape above");
+    let prefix: usize = src_shape[..src_shape.len() - 1]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let total = prefix * vocab;
+    let d_up = backend.cuda_slice(upstream, "gather_last_dim_backward")?;
+    if d_up.len() != prefix {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_up.len(),
+            shape: src_shape[..src_shape.len() - 1].to_vec(),
+            size: prefix,
+        });
+    }
+    if indices.len() != prefix {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix,
+            got: indices.len(),
+        });
+    }
+    let d_ids = backend
+        .stream
+        .clone_htod(indices)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (gather_bwd ids)"))?;
+    // alloc_zeros gives us the zero-fill for free — kernel only writes the
+    // single (row, ids[row]) slot per prefix row.
+    let mut d_grad = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (gather_bwd grad)"))?;
+
+    let prefix_i32 = i32::try_from(prefix)
+        .map_err(|_| AutogradError::TapeInvariant("cuda gather_bwd prefix exceeds i32"))?;
+    let vocab_i32 = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda gather_bwd vocab exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("gather_last_dim_backward_f32")?,
+        prefix,
+        |mut builder| {
+            builder
+                .arg(&mut d_grad)
+                .arg(d_up)
+                .arg(&d_ids)
+                .arg(&prefix_i32)
+                .arg(&vocab_i32);
+            builder
+        },
+    )?;
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
 }
 
 #[cfg(not(feature = "no-cuda"))]

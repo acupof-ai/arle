@@ -351,6 +351,41 @@ impl TensorStore {
     }
 
     pub(crate) fn clone_tensor(&mut self, id: TensorId) -> Result<TensorId> {
+        // Wave 1 (post-M5.3b nsys attribution): preserve the device
+        // handle on `Dirty::Device` tensors so the post-backward grad map
+        // doesn't force a host readback for tensors that subsequent
+        // backward ops will consume on-device. Pre-Wave-1 this always
+        // called `ensure_host`, which on the `[B, S, V] ≈ 1 GB`
+        // log_softmax grad triggered the same readback the pre-backward
+        // flush used to. The device-aware backward overrides on `CudaBackend`
+        // (and the dispatchers in `ops::softmax::log_softmax_backward` /
+        // `ops::gather::gather_last_dim_backward`) keep the chain
+        // device-resident as long as the grad never gets touched through
+        // a host-only path.
+        //
+        // `DeviceHandle` is `Arc`-shared (`CudaStorage`'s `Arc<CudaSlice<f32>>`,
+        // `MlxHandle`'s `Arc<MlxHandleInner>`), so cloning the handle is a
+        // ref-count bump — no extra device allocation. Grads are write-once
+        // (each backward emits a fresh handle), so aliasing the storage is
+        // sound: nothing in the autograd graph mutates a tape entry's
+        // output buffer in place.
+        let dirty = self.tensor(id)?.dirty.clone();
+        if dirty == Dirty::Device {
+            let source = self.tensor(id)?;
+            let device_handle = source.device_handle.clone();
+            let cloned = Tensor {
+                data: Vec::new(),
+                shape: source.shape.clone(),
+                strides: source.strides.clone(),
+                size: source.size,
+                requires_grad: source.requires_grad,
+                grad: source.grad,
+                device_handle,
+                dirty: Dirty::Device,
+            };
+            return Ok(self.alloc(cloned));
+        }
+
         self.ensure_host(id)?;
         let tensor = self.tensor(id)?.clone();
         Ok(self.alloc(tensor))
