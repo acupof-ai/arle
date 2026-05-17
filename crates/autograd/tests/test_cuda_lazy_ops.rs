@@ -685,3 +685,135 @@ fn cuda_add_broadcast_backward_device_matches_cpu() {
         host_grad_b[idx]
     );
 }
+
+/// Wave 2.0 parity gate: `Backend::adamw_step_device` (device-resident
+/// gradient handle) must match `Backend::adamw_step` (host-slice gradient)
+/// bit-for-bit on the same numerical inputs. The only thing that changes
+/// between the two paths is where `grad` lives before the kernel launch —
+/// the kernel itself (`adamw_step_f32`) is shared, so any numerical
+/// divergence here is a real bug (e.g. wrong slice passed, dtod seed
+/// missed, eval contract violated). Tolerance: `atol=1e-6 + rtol=1e-4`
+/// (same as `cuda_adamw_step_matches_cpu_5_steps`).
+#[test]
+fn cuda_adamw_step_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_adamw_step_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    use autograd::backend::cpu_adamw_step_in_place;
+
+    let shape = vec![128, 64];
+    let size: usize = shape.iter().product();
+    const STEPS: usize = 5;
+    const LR: f32 = 3e-4;
+    const BETA1: f32 = 0.9;
+    const BETA2: f32 = 0.95;
+    const EPS: f32 = 1e-8;
+    const WD: f32 = 0.01;
+
+    let param_init = rng_vec(0xA11CE, size, 0.1);
+    let grads_per_step: Vec<Vec<f32>> = (0..STEPS)
+        .map(|step| {
+            rng_vec(
+                0xBEEF ^ (step as u64).wrapping_mul(0x9E3779B97F4A7C15),
+                size,
+                0.02,
+            )
+        })
+        .collect();
+
+    // Host reference (identical to `cuda_adamw_step_matches_cpu_5_steps`).
+    let mut host_param = param_init.clone();
+    let mut host_m = vec![0.0_f32; size];
+    let mut host_v = vec![0.0_f32; size];
+    for (step, grad) in grads_per_step.iter().enumerate().take(STEPS) {
+        let t = step as i32 + 1;
+        let bc1 = 1.0 - BETA1.powi(t);
+        let bc2 = 1.0 - BETA2.powi(t);
+        cpu_adamw_step_in_place(
+            &mut host_param,
+            &mut host_m,
+            &mut host_v,
+            grad,
+            LR,
+            BETA1,
+            BETA2,
+            EPS,
+            WD,
+            bc1,
+            bc2,
+        );
+    }
+
+    // Device chain: same as the host-slice test, except the gradient is
+    // pre-uploaded as a DeviceHandle::Cuda and fed through
+    // `adamw_step_device`. No `clone_htod` happens inside the kernel
+    // launch in this path.
+    let mut param_h: DeviceHandle = backend
+        .upload(&param_init, &shape)
+        .expect("upload initial param");
+    let mut m_h: DeviceHandle = backend
+        .upload(&vec![0.0_f32; size], &shape)
+        .expect("upload zero m");
+    let mut v_h: DeviceHandle = backend
+        .upload(&vec![0.0_f32; size], &shape)
+        .expect("upload zero v");
+
+    for (step, grad) in grads_per_step.iter().enumerate().take(STEPS) {
+        let t = step as i32 + 1;
+        let bc1 = 1.0 - BETA1.powi(t);
+        let bc2 = 1.0 - BETA2.powi(t);
+        // Upload the per-step grad as a device handle (simulates a
+        // device-resident grad produced by embedding_backward_device /
+        // add_broadcast_backward_device upstream).
+        let grad_h: DeviceHandle = backend
+            .upload(grad, &shape)
+            .expect("upload grad as device handle");
+        let (new_param, new_m, new_v) = backend
+            .adamw_step_device(
+                &param_h, &m_h, &v_h, &grad_h, &shape, LR, BETA1, BETA2, EPS, WD, bc1, bc2,
+            )
+            .expect("cuda adamw_step_device");
+        param_h = new_param;
+        m_h = new_m;
+        v_h = new_v;
+    }
+
+    backend
+        .eval(&[&param_h, &m_h, &v_h])
+        .expect("cuda eval after adamw_step_device chain");
+
+    let dev_param = backend.readback(&param_h).expect("dev param readback");
+    let dev_m = backend.readback(&m_h).expect("dev m readback");
+    let dev_v = backend.readback(&v_h).expect("dev v readback");
+
+    let (param_excess, param_abs, param_idx) = max_err(&dev_param, &host_param);
+    let (m_excess, m_abs, m_idx) = max_err(&dev_m, &host_m);
+    let (v_excess, v_abs, v_idx) = max_err(&dev_v, &host_v);
+
+    assert!(
+        param_excess <= 1.0,
+        "param exceeds atol=1e-6 + rtol=1e-4 at idx {param_idx} \
+         (|diff|={param_abs}, dev={}, host={}, excess_ratio={param_excess}) \
+         after {STEPS} cuda adamw_step_device calls",
+        dev_param[param_idx],
+        host_param[param_idx]
+    );
+    assert!(
+        m_excess <= 1.0,
+        "m exceeds atol=1e-6 + rtol=1e-4 at idx {m_idx} \
+         (|diff|={m_abs}, dev={}, host={}, excess_ratio={m_excess}) \
+         after {STEPS} cuda adamw_step_device calls",
+        dev_m[m_idx],
+        host_m[m_idx]
+    );
+    assert!(
+        v_excess <= 1.0,
+        "v exceeds atol=1e-6 + rtol=1e-4 at idx {v_idx} \
+         (|diff|={v_abs}, dev={}, host={}, excess_ratio={v_excess}) \
+         after {STEPS} cuda adamw_step_device calls",
+        dev_v[v_idx],
+        host_v[v_idx]
+    );
+}

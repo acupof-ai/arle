@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::adamw_state::AdamWState;
 use crate::backend::{Backend, DeviceHandle};
+use crate::tensor::Dirty;
 use crate::{Result, TensorId, tensor::TensorStore};
 
 /// Per-parameter moment storage. Host is the long-standing path; Device is
@@ -223,10 +224,24 @@ impl AdamW {
                 (grad_id, param_snapshot.shape.clone(), param_snapshot.size)
             };
 
-            // Grad stays host-side — matmul_backward returns host Vec<f32>.
-            let grad = store
-                .to_host(grad_id)
-                .expect("gradient tensor should be readable from the store");
+            // Wave 2.0: peek at the grad's residency *before* any
+            // `to_host` would touch it. If the gradient is already
+            // device-resident (Wave 2a's embedding/add_broadcast
+            // backwards, P3's mean/mul_scalar, etc.) we route through
+            // `adamw_step_device` and skip the DtoH that turned Wave 2a
+            // into a +1.8% wash (3 423 extra DtoH calls, 41.5 GB extra
+            // bytes per step). The host fallback below stays for params
+            // whose backward producer still emits host grads.
+            let grad_device_handle = {
+                let grad_tensor = store
+                    .tensor(grad_id)
+                    .expect("gradient tensor should exist in the store");
+                if grad_tensor.dirty != Dirty::Host {
+                    grad_tensor.device_handle.clone()
+                } else {
+                    None
+                }
+            };
 
             // Param: ensure it's on the device (upload if currently Host
             // or if this is the first step). Then clone the handle so the
@@ -277,22 +292,47 @@ impl AdamW {
                 _ => unreachable!("moments migrated to Device above"),
             };
 
-            let (new_param, new_m, new_v) = backend
-                .adamw_step(
-                    &param_handle,
-                    &m_handle,
-                    &v_handle,
-                    &grad,
-                    &entry.shape,
-                    self.lr,
-                    beta1,
-                    beta2,
-                    self.eps,
-                    self.wd,
-                    bc1,
-                    bc2,
-                )
-                .expect("backend adamw_step");
+            let (new_param, new_m, new_v) = if let Some(grad_h) = grad_device_handle {
+                backend
+                    .adamw_step_device(
+                        &param_handle,
+                        &m_handle,
+                        &v_handle,
+                        &grad_h,
+                        &entry.shape,
+                        self.lr,
+                        beta1,
+                        beta2,
+                        self.eps,
+                        self.wd,
+                        bc1,
+                        bc2,
+                    )
+                    .expect("backend adamw_step_device")
+            } else {
+                // Host fallback: grad is still authoritative on host
+                // (e.g. matmul_backward in legacy host path). Mirrors the
+                // pre-Wave-2.0 `to_host` → `adamw_step(&[f32], ...)` path.
+                let grad = store
+                    .to_host(grad_id)
+                    .expect("gradient tensor should be readable from the store");
+                backend
+                    .adamw_step(
+                        &param_handle,
+                        &m_handle,
+                        &v_handle,
+                        &grad,
+                        &entry.shape,
+                        self.lr,
+                        beta1,
+                        beta2,
+                        self.eps,
+                        self.wd,
+                        bc1,
+                        bc2,
+                    )
+                    .expect("backend adamw_step")
+            };
 
             // Record cheap Arc-clones for the terminal batched eval below.
             pending_eval.push(new_param.clone());
