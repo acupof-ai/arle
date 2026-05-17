@@ -25,7 +25,7 @@ use super::mla::{DeepseekV4Attention, DeepseekV4Compressor, DeepseekV4Indexer};
 #[cfg(feature = "cuda")]
 use super::mlp::{
     DeepseekRoutedMoeOutput, DeepseekV4Expert, DeepseekV4MoeBlock,
-    dsv4_try_build_grouped_weight_ptrs,
+    dsv4_try_build_deepgemm_expert_cache, dsv4_try_build_grouped_weight_ptrs,
 };
 #[cfg(feature = "cuda")]
 use super::state::{
@@ -2463,6 +2463,7 @@ impl DeepseekModel {
             dsv4_try_build_grouped_weight_ptrs(&self.ctx, &experts, |expert| &expert.w3)?;
         let grouped_w2_ptrs =
             dsv4_try_build_grouped_weight_ptrs(&self.ctx, &experts, |expert| &expert.w2)?;
+        let deepgemm_cache = dsv4_try_build_deepgemm_expert_cache(&self.ctx, &experts)?;
         Ok(DeepseekV4MoeBlock {
             gate_weight: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.gate_weight)?,
             gate_bias: names
@@ -2479,6 +2480,7 @@ impl DeepseekModel {
             grouped_w1_ptrs,
             grouped_w3_ptrs,
             grouped_w2_ptrs,
+            deepgemm_cache,
             shared_experts: names
                 .shared_experts
                 .as_ref()
@@ -4357,6 +4359,7 @@ mod tests {
                     grouped_w1_ptrs: None,
                     grouped_w3_ptrs: None,
                     grouped_w2_ptrs: None,
+                    deepgemm_cache: None,
                     shared_experts: None,
                 },
             }],

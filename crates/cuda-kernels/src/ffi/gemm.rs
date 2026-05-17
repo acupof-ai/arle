@@ -442,6 +442,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_block_scaled_to_fp8_deepgemm_cuda(
+        weight: *const u8,
+        src_scales: *const u8,
+        dst_weight: *mut u8,
+        dst_scales: *mut f32,
+        rows: i32,
+        cols: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        dst_scale_cols: i32,
+        source_format: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn q6k_gemv_cuda(
         weight: *const u8,
         input: *const Half,
