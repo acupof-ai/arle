@@ -1,4 +1,4 @@
-// SiLU (Swish) = x * sigmoid(x). Qwen3 SwiGLU uses silu on the gate projection.
+// SiLU (Swish) = x * sigmoid(x). Qwen3.5 SwiGLU uses silu on the gate projection.
 // One element per thread; simple 1D launch with block=256.
 
 extern "C" __global__ void silu_f32(

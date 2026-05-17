@@ -50,7 +50,7 @@
 //!   `cuda_kernels::ffi::xxx` directly.
 //! - `EngineOptions` / `InferenceEngineOptions` — these are runtime
 //!   configuration types owned by `infer::server_engine`, not kernel types.
-//! - Any model-specific state (`Qwen3Model`, etc.) — those are application
+//! - Any model-specific state (`Qwen35Model`, etc.) — those are application
 //!   types and stay inside `infer::model::*`.
 
 pub use super::paged_kv::PagedKVPool;

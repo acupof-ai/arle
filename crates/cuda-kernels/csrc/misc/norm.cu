@@ -363,7 +363,7 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
 //
 // Used to let the residual stream stay in fp32 across layers while still
 // feeding bf16 downstream GEMMs. Reading fp32 here avoids the bf16 rounding
-// that compounds Q4_K-level weight noise through 36 layers on Qwen3-4B.
+// that compounds Q4_K-level weight noise through 36 layers on Qwen3.5-4B.
 // Precision chain: fp32 -> fp32 rsqrt -> fp32 * fp32 weight -> bf16 store.
 // ============================================================================
 __global__ void rms_norm_batched_f32_in_kernel(
@@ -765,7 +765,7 @@ __global__ void rms_norm_offset_kernel(const __nv_bfloat16 *__restrict__ x,
 
   // Pass 2: out[i] = (x[i] * inv_rms * (1 + weight[i])) cast to bf16
   // NOTE: GemmaRMSNorm does ALL computation in float32, only rounds to bf16 at the end.
-  // No intermediate bf16 rounding (unlike Llama/Qwen3 RMSNorm).
+  // No intermediate bf16 rounding (unlike Llama/Qwen3.5 RMSNorm).
   const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
   uint2 *out_vec = reinterpret_cast<uint2 *>(out);
 

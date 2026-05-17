@@ -296,7 +296,7 @@ fn format_dispatch_wrapper(
 
 /// One AOT-specialized prefill HD128 kernel per (num_q_heads, num_kv_heads).
 /// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_prefill_paged_hd128.py`
-/// — when adding a new Qwen3 head config, extend both lists in lockstep
+/// — when adding a new HD128 head config, extend both lists in lockstep
 /// AND add the matching FFI extern + dispatch arm in
 /// `crates/cuda-kernels/src/ffi/attention.rs` and
 /// `infer/src/ops/attention.rs`.
@@ -320,7 +320,7 @@ const TILELANG_DECODE_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16
 
 /// One AOT-specialized decode HD128 kernel per (num_q_heads, num_kv_heads).
 /// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd128.py`
-/// — when adding a new Qwen3 full-attn head config, extend both lists in
+/// — when adding a new HD128 full-attn head config, extend both lists in
 /// lockstep AND add the matching FFI extern + dispatch arm in
 /// `crates/cuda-kernels/src/ffi/attention.rs` and
 /// `infer/src/ops/attention.rs`.
@@ -347,7 +347,7 @@ const TILELANG_DECODE_HD64_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 1)];
 const TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS: &[(u32, u32)] = TILELANG_DECODE_HD128_HEAD_CONFIGS;
 
 /// M_b.2 Phase A0 — FP8 KV variant of HD128 paged decode. A0 scope is
-/// single-config (32, 8) = Qwen3-4B; A1 will extend to all four head
+/// single-config (32, 8) = Qwen3.5-4B; A1 will extend to all four head
 /// shapes once codegen + numerical correctness are proven. Mirrors
 /// `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd128_fp8.py`.
 const TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS: &[(u32, u32)] = &[(32, 8)];
@@ -946,7 +946,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         );
     }
 
-    // M_b.2 Phase A0 — FP8 KV decode (single config (32,8) = Qwen3-4B).
+    // M_b.2 Phase A0 — FP8 KV decode (single config (32,8) = Qwen3.5-4B).
     for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
         let suffix = format!("q{q}_kv{kv}");
         let spec = TileLangKernelSpec {

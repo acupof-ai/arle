@@ -1,4 +1,4 @@
-// Variable-length Q + paged quantized KV attention for Qwen3 HD128.
+// Variable-length Q + paged quantized KV attention for Qwen3.5 HD128.
 //
 // This is the mixed decode+prefill attention path for FP8 E4M3 and INT8 KV
 // pools. It uses FlashDecoding-style split-KV: phase 1 computes one partial

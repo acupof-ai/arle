@@ -28,7 +28,7 @@
 
 // ─── Constants ───
 
-// Maximum supported head_dim (128 for Qwen3/Llama).
+// Maximum supported head_dim (128 for Qwen3.5/Llama).
 #define TQ_MAX_HEAD_DIM 256
 
 // Maximum bits supported.

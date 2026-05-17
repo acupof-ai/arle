@@ -369,7 +369,7 @@ unsafe extern "C" {
 
 // One AOT-specialized symbol per (num_q_heads, num_kv_heads). The matching
 // Rust dispatch table lives in `infer/src/ops/attention.rs`. Adding a new
-// Qwen3 head config requires extending all three:
+// HD128 head config requires extending all three:
 //   - SUPPORTED_HEADS in tools/tilelang/batch_prefill_paged_hd128.py
 //   - TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs
 //   - the macro invocation below + the dispatch arm in attention.rs
@@ -499,7 +499,7 @@ tilelang_decode_hd256_decl!(
 
 // HD128 decode — same FFI shape as the HD256 decode macro above; the
 // kernels share `gen_tilelang_aot.py`'s wrapper fill rules. Adding a new
-// Qwen3 head config requires extending all three:
+// HD128 head config requires extending all three:
 //   - SUPPORTED_HEADS in tools/tilelang/batch_decode_paged_hd128.py
 //   - TILELANG_DECODE_HD128_HEAD_CONFIGS in cuda-kernels/build.rs
 //   - the macro invocation below + the dispatch arm in attention.rs

@@ -1,6 +1,6 @@
 """TileLang batch decode HD128 paged attention with FP8 E4M3 KV.
 
-M_b.2 Phase A0 — single-config (q32_kv8 = Qwen3-4B) FP8 codegen smoke
+M_b.2 Phase A0 — single-config (q32_kv8 = Qwen3.5-4B) FP8 codegen smoke
 test. Predicates the rest of M_b.2 phasing per
 [`docs/plans/M_b.2-tilelang-hd128-fp8-decode.md`](../../docs/plans/M_b.2-tilelang-hd128-fp8-decode.md).
 
@@ -27,7 +27,7 @@ Tile / pipeline tunables unchanged from the BF16 HD128 decode kernel.
 Why A0 single-config: this validates that TileLang 0.1.9 can lower
 ``T.cast(fp8_e4m3fn, "float32")`` end-to-end (codegen → nvcc cubin →
 ARLE link). If A0 cubin builds and links, A1 extends to all four
-Qwen3 head shapes and adds a numerical-diff test against hand-CUDA
+HD128 head shapes and adds a numerical-diff test against hand-CUDA
 ``decode_attention_varlen_fp8``. If A0 fails to codegen, M_b.2
 pivots to fallback (B) — see plan §Risks.
 """
@@ -46,10 +46,10 @@ BLOCK_N = 16
 NUM_STAGES = 2
 NUM_THREADS = 128
 
-# A0 scope: single config only (Qwen3-4B). Extend to (16,8) / (40,8) / (64,8)
+# A0 scope: single config only (Qwen3.5-4B). Extend to (16,8) / (40,8) / (64,8)
 # in A1 once codegen + numerical correctness are proven on (32, 8).
 SUPPORTED_HEADS = (
-    (32, 8),  # Qwen3-4B
+    (32, 8),  # Qwen3.5-4B
 )
 
 
