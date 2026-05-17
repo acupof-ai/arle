@@ -114,9 +114,10 @@ impl FromStr for BackendChoice {
     }
 }
 
-/// Use the device-backed AdamW path only on Metal, where `Backend::adamw_step`
-/// is overridden to stay device-resident. CPU keeps the host path, and CUDA
-/// also stays host-backed until it has a real device-side AdamW override.
+/// Use the device-backed AdamW path on backends that override
+/// `Backend::adamw_step` to stay device-resident (Metal and CUDA). CPU
+/// keeps the host path — the default trait impl there is already a no-op
+/// over host-resident state.
 pub fn adamw_for_backend(
     lr: f32,
     betas: (f32, f32),
@@ -125,8 +126,8 @@ pub fn adamw_for_backend(
     backend: Arc<dyn Backend>,
 ) -> AdamW {
     match backend.device() {
-        Device::Metal => AdamW::new_with_device(lr, betas, eps, wd, backend),
-        Device::Cpu | Device::Cuda => AdamW::new(lr, betas, eps, wd),
+        Device::Metal | Device::Cuda => AdamW::new_with_device(lr, betas, eps, wd, backend),
+        Device::Cpu => AdamW::new(lr, betas, eps, wd),
     }
 }
 
