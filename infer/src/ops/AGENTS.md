@@ -68,8 +68,8 @@ there's an existing caller that can't hold the buffer.
    dequant, FP8 via custom split-KV kernel with FP32 cast. The selector is `KVFormat`, not
    the model — adding a fourth format means a fourth path.
 6. **Prefill dispatches on head dim:** HD128 -> TileLang paged prefill HD128,
-   HD256 -> TileLang paged prefill HD256. Qwen3 = HD128;
-   Qwen3.5 full-attention = HD256.
+   HD256 -> TileLang paged prefill HD256. Qwen3.5 dense-small uses HD128;
+   Qwen3.5 full-attention (large dense + hybrid) uses HD256.
 7. **Single-token BF16 decode** uses the TileLang paged decode path. Don't
    split or add a second BF16 path without a bench snapshot.
 

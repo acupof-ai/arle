@@ -73,7 +73,7 @@ Axes scaffolded today (see
 and [`docs/plans/2026-04-28-single-node-multi-gpu.md`](plans/2026-04-28-single-node-multi-gpu.md)):
 
 - **TP (tensor parallel):** F1 `parallel_state.rs` + `TpLoadContext` shard
-  helpers; F2 Qwen3 + Qwen3.5 forward sharding through
+  helpers; F2 Qwen3.5 forward sharding through
   `LayerCommunicator` (`post_attn_all_reduce`, `post_mlp_all_reduce`,
   DP-attention gather hook). TP=1 is no-op; TP>1 production model load
   fails fast until F2 collectives complete.

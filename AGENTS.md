@@ -59,7 +59,7 @@ runtime (Apple Silicon, `crates/mlx-sys` C++ bridge — continuous batching with
 variable-length packed decode via mlx-lm `BatchKVCache` pattern: left-padding +
 additive mask + per-row RoPE offsets, see
 [`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7).
-Models: Qwen3 and Qwen3.5-family. TileLang drives CUDA paged prefill/decode
+Models: Qwen3.5-family. TileLang drives CUDA paged prefill/decode
 for BF16 attention; custom CUDA C handles quantized decode and supporting ops.
 Tests compare against JSON baselines in
 `infer/test_data/` — regenerate after any change affecting numerical output.
@@ -120,7 +120,6 @@ ARLE/
 │   ├── deepseek-spec/         ← DeepSeek V4 readiness scaffold (DS0 config + tensor names + Shard)
 │   ├── kv-native-sys/         ← local persistence substrate for KV tier transports
 │   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc), Qwen3.5 step / MoE / DFlash draft / Metal capture hook
-│   ├── qwen3-spec/            ← shared Qwen3 config + tensor-name contract
 │   ├── qwen35-spec/           ← shared Qwen3.5 config + tensor-name contract
 │   └── train/                 ← train-side control plane + runtime-integrated RL stack
 └── docs/                      ← projects/ plans/ experience/ reviews/ resources/
@@ -331,7 +330,7 @@ cargo test --release --no-default-features --features metal
 
 Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),
 `INFER_TILELANG_PYTHON` (TileLang AOT Python), `INFER_TEST_MODEL_PATH`
-(default `models/Qwen3-4B`). Full list: [`docs/environment.md`](docs/environment.md).
+(default `models/Qwen3.5-4B`). Full list: [`docs/environment.md`](docs/environment.md).
 SM tier policy: [`docs/plans/sm-coverage.md`](docs/plans/sm-coverage.md).
 
 Disk hygiene: `cargo sweep --time 30` (weekly) prunes target/ artifacts

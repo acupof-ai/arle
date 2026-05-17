@@ -50,7 +50,7 @@ scripts should use `ARLE_MODEL`.
 Example:
 
 ```bash
-export ARLE_MODEL=models/Qwen3-4B
+export ARLE_MODEL=models/Qwen3.5-4B
 ./target/release/arle --max-turns 10
 ```
 
@@ -66,7 +66,7 @@ Example:
 
 ```bash
 export AGENT_INFER_API_KEY=dev-secret
-./target/release/metal_serve --model-path mlx-community/Qwen3-4B-bf16
+./target/release/metal_serve --model-path mlx-community/Qwen3.5-4B-bf16
 ```
 
 ### Apple Silicon one-command bring-up
@@ -78,7 +78,7 @@ Cargo feature flags, builds `metal_serve`, and starts the server on
 
 Defaults:
 
-- model: `ARLE_MODEL` if set, otherwise legacy `AGENT_INFER_MODEL`, otherwise `mlx-community/Qwen3-0.6B-4bit`
+- model: `ARLE_MODEL` if set, otherwise legacy `AGENT_INFER_MODEL`, otherwise `mlx-community/Qwen3.5-0.8B-MLX-4bit`
 - port: `8000`
 - bind: `127.0.0.1`
 
@@ -86,7 +86,7 @@ Examples:
 
 ```bash
 ./scripts/start_metal_serve.sh
-./scripts/start_metal_serve.sh mlx-community/Qwen3-4B-bf16 8012 -- --warmup 0
+./scripts/start_metal_serve.sh mlx-community/Qwen3.5-4B-bf16 8012 -- --warmup 0
 ```
 
 Extra `metal_serve` flags go after `--`. For example, you can still pass
@@ -143,7 +143,7 @@ override.
 For `mlx-community/Qwen3.6-35B-A3B-4bit` (default top_k=8):
 - `INFER_MOE_TOP_K=6` cut c=4 ITL p50 by **−21.4%** (28880 → 22694
   μs) and c=8 by **−9.9%** (41108 → 37044 μs). Quality cost ~3%
-  MMLU drop per upstream `vllm-mlx` reports on Qwen3-30B-A3B; not
+  MMLU drop per upstream `vllm-mlx` reports on similar MoE models; not
   validated for Qwen3.6 specifically.
 
 Mirrors `vllm-mlx`'s `--moe-top-k` flag. Use for latency-critical
@@ -370,13 +370,13 @@ These are primarily consumed by `setup.sh`.
 
 HuggingFace model ID to download.
 
-Default: `Qwen/Qwen3-8B`
+Default: `Qwen/Qwen3.5-4B`
 
 ### `MODEL_DIR`
 
 Local directory for downloaded model files.
 
-Default: `models/Qwen3-8B`
+Default: `models/Qwen3.5-4B`
 
 ### `SKIP_MODEL`
 
@@ -401,13 +401,13 @@ Override model path for infer-side GPU tests.
   `AGENTS.md` §"Metal canonical model"). Use `INFER_TEST_MODEL_PATH`
   to opt down to a smaller model for fast iteration on dense-only
   paths.
-- **CUDA**: `models/Qwen3-4B` (canonical for CUDA bench/test scripts).
+- **CUDA**: `models/Qwen3.5-4B` (canonical for CUDA bench/test scripts).
 
 Example:
 
 ```bash
 # CUDA — use a smaller model for a quick e2e test:
-INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release --test e2e
 
 # Metal — bench the canonical Qwen3.6 35B-A3B MoE:
 ./target/release/metal_serve \
@@ -419,12 +419,6 @@ INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 
 Override model path for selected E2E regeneration flows
 (`infer/tests/regen_test_data.rs`).
-
-### `INFER_QWEN3_PATH`
-
-Override model path for the Qwen3-4B GGUF smoke test
-(`infer/tests/smoke_qwen3_4b_gguf.rs`). Default:
-`models/Qwen3-4B-GGUF`.
 
 ### `INFER_Q35_PATH`
 
@@ -493,7 +487,7 @@ sandboxing.
 ### CLI usage
 
 ```bash
-export ARLE_MODEL=models/Qwen3-4B
+export ARLE_MODEL=models/Qwen3.5-4B
 ```
 
 ### CUDA build
@@ -506,14 +500,14 @@ export INFER_TILELANG_PYTHON=.venv/bin/python
 ### GPU tests
 
 ```bash
-export INFER_TEST_MODEL_PATH=models/Qwen3-4B
+export INFER_TEST_MODEL_PATH=models/Qwen3.5-4B
 ```
 
 ### Integration API tests
 
 ```bash
 export INFER_URL=http://localhost:8000
-export INFER_MODEL=Qwen3-8B
+export INFER_MODEL=Qwen3.5-4B
 ```
 
 ---
@@ -531,9 +525,6 @@ docs promote them more clearly:
   `weight_loader.rs` and force BF16 tensor load (debug aid for quant-format issues)
 - `INFER_DEBUG_DUMP` — enable tensor debug-dump capture in
   `infer/src/model/common.rs` (default off; set to any value to enable)
-- `INFER_QWEN3_FP32_RESIDUAL` — force FP32 residual accumulation on
-  the Qwen3 prefill path (`infer/src/model/qwen3/prefill.rs`); debug aid
-  for numerical-stability investigations
 - `INFER_PREFILL_WARMUP` — controls the CUDA scheduler's startup prefill
   warmup pass (`infer/src/scheduler/cuda/core/warmup.rs`). Default is enabled.
   Set to `0`, `false`, `off`, or `no` to skip the pass for cold-start A/B

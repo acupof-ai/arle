@@ -57,8 +57,9 @@ lists — there is no glob.
    so process-global MLX state has one Rust synchronization boundary.
 6. **The Qwen3.5 step model is a separate C++ file** (`mlx_qwen35_model.cpp`),
    not a generic MLX composition. It exists because Qwen3.5 hybrid attention
-   benefits from a fused C++ step path; Qwen3 still goes through the Rust
-   `rust_transformer_layer`. Don't merge the two without a bench snapshot.
+   benefits from a fused C++ step path — keep this dedicated, don't fold it
+   into the generic Rust `rust_transformer_layer` fallback without a bench
+   snapshot.
 7. **Specialized C++ helpers for Qwen3.5 sub-layers compose the C++ side
    of the bridge.** `mlx_qwen35_moe_block.cpp` is the canonical SparseMoE
    forward; `mlx_dflash_draft_model.cpp` is the canonical draft-model
