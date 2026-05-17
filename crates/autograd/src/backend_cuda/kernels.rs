@@ -40,6 +40,14 @@ const MUL_SCALAR_BACKWARD_CU: &str = include_str!("kernels/mul_scalar_backward.c
 const EMBEDDING_BACKWARD_CU: &str = include_str!("kernels/embedding_backward.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ADD_BROADCAST_BACKWARD_CU: &str = include_str!("kernels/add_broadcast_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ACTIVATION_BACKWARD_CU: &str = include_str!("kernels/activation_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const MUL_BACKWARD_CU: &str = include_str!("kernels/mul_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const RMS_NORM_BACKWARD_CU: &str = include_str!("kernels/rms_norm_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ROPE_BACKWARD_CU: &str = include_str!("kernels/rope_backward.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -68,6 +76,16 @@ const FUNCTION_NAMES: &[&str] = &[
     "mul_scalar_backward_f32",
     "embedding_backward_f32",
     "add_broadcast_backward_f32",
+    "silu_backward_f32",
+    "gelu_backward_f32",
+    "sigmoid_backward_f32",
+    "exp_backward_f32",
+    "mul_backward_lhs_f32",
+    "mul_backward_rhs_f32",
+    "rms_norm_inv_rms_f32",
+    "rms_norm_backward_x_f32",
+    "rms_norm_backward_w_f32",
+    "rope_backward_f32",
 ];
 
 #[derive(Debug)]
@@ -220,6 +238,10 @@ fn concat_sources() -> String {
         MUL_SCALAR_BACKWARD_CU,
         EMBEDDING_BACKWARD_CU,
         ADD_BROADCAST_BACKWARD_CU,
+        ACTIVATION_BACKWARD_CU,
+        MUL_BACKWARD_CU,
+        RMS_NORM_BACKWARD_CU,
+        ROPE_BACKWARD_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

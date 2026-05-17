@@ -294,23 +294,93 @@ pub(crate) fn mul_backward(
         .get(1)
         .ok_or(AutogradError::TapeInvariant("mul missing rhs input"))?;
 
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
+    if a_shape != b_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: a_shape,
+            got: b_shape,
+        });
+    }
+    let need_grad_a = store.tensor(a)?.requires_grad;
+    let need_grad_b = store.tensor(b)?.requires_grad;
+    if !need_grad_a && !need_grad_b {
+        return Ok(GradPairs::new());
+    }
+
+    // Wave 2.1: route through `mul_backward_device` whenever upstream and
+    // both saved operands are device-resident. Pre-2.1 this op did
+    // `to_host(upstream) + tensor_host(a) + tensor_host(b)`, which forced
+    // three readbacks per layer (Qwen3.5 hot paths `attn * gate` and
+    // `silu(gate) * up` × 28 layers).
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        let a_t = store.tensor(a)?;
+        let b_t = store.tensor(b)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && a_t.dirty != Dirty::Host
+            && a_t.device_handle.is_some()
+            && b_t.dirty != Dirty::Host
+            && b_t.device_handle.is_some()
+    };
+    if device_path_ok {
+        if upstream_shape != a_shape {
+            return Err(AutogradError::ShapeMismatch {
+                expected: a_shape,
+                got: upstream_shape,
+            });
+        }
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let a_handle = store
+            .tensor(a)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let b_handle = store
+            .tensor(b)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let (grad_a_handle, grad_b_handle) = store.backend().mul_backward_device(
+            &upstream_handle,
+            &a_handle,
+            &b_handle,
+            &a_shape,
+            need_grad_a,
+            need_grad_b,
+        )?;
+        let mut grads = GradPairs::new();
+        if let Some(h) = grad_a_handle {
+            let grad_id = store.alloc_device_tensor(a_shape.clone(), h)?;
+            grads.push((a, grad_id));
+        }
+        if let Some(h) = grad_b_handle {
+            let grad_id = store.alloc_device_tensor(b_shape, h)?;
+            grads.push((b, grad_id));
+        }
+        return Ok(grads);
+    }
+
     let upstream = store.to_host(output_grad_id)?;
     let a_tensor = store.tensor_host(a)?;
     let b_tensor = store.tensor_host(b)?;
-    if a_tensor.shape != b_tensor.shape {
-        return Err(AutogradError::ShapeMismatch {
-            expected: a_tensor.shape,
-            got: b_tensor.shape,
-        });
-    }
 
     let mut grads = GradPairs::new();
-    if a_tensor.requires_grad {
+    if need_grad_a {
         let grad_a = store.backend().mul_forward(&upstream, &b_tensor.data)?;
         let grad_id = store.alloc(Tensor::new(grad_a, a_tensor.shape.clone(), false)?);
         grads.push((a, grad_id));
     }
-    if b_tensor.requires_grad {
+    if need_grad_b {
         let grad_b = store.backend().mul_forward(&upstream, &a_tensor.data)?;
         let grad_id = store.alloc(Tensor::new(grad_b, b_tensor.shape.clone(), false)?);
         grads.push((b, grad_id));

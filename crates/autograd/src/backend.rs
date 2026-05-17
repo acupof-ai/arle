@@ -1039,6 +1039,314 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         }
         self.upload(&grad_b, b_shape)
     }
+
+    /// Wave 2.1: device-resident backward for `silu(x)`. Elementwise
+    /// `grad_x[i] = upstream[i] * silu'(x[i])` where
+    /// `silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))`. The saved
+    /// context is the original input `x` (not the output), matching the
+    /// host `silu_backward`.
+    ///
+    /// Default fallback: `readback(upstream) → readback(x) → host loop →
+    /// upload`. CUDA overrides with a 1D NVRTC kernel. Returned handle is
+    /// unevaluated per the M5.3b.11 batched-eval contract.
+    fn silu_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let x_host = self.readback(x)?;
+        let size = shape_size(shape);
+        if upstream_host.len() != size || x_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len().min(x_host.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let grad: Vec<f32> = x_host
+            .iter()
+            .zip(upstream_host.iter())
+            .map(|(&xv, &up)| {
+                let sigmoid = 1.0 / (1.0 + (-xv).exp());
+                let deriv = sigmoid + (xv * sigmoid * (1.0 - sigmoid));
+                up * deriv
+            })
+            .collect();
+        self.upload(&grad, shape)
+    }
+
+    /// Wave 2.1: device-resident backward for `gelu(x)` (erf form, matches
+    /// the autograd `gelu_host_eager` forward). Elementwise
+    /// `grad_x[i] = upstream[i] * gelu'(x[i])` where
+    /// `gelu'(x) = 0.5*(1 + erf(x/√2)) + x * (1/√(2π)) * exp(-x²/2)`.
+    ///
+    /// Default fallback: `readback → host loop → upload`. CUDA overrides
+    /// with a 1D NVRTC kernel. Returned handle is unevaluated.
+    fn gelu_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        const INV_SQRT_2: f32 = 0.707_106_77;
+        const INV_SQRT_2PI: f32 = 0.398_942_3;
+        let upstream_host = self.readback(upstream)?;
+        let x_host = self.readback(x)?;
+        let size = shape_size(shape);
+        if upstream_host.len() != size || x_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len().min(x_host.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let grad: Vec<f32> = x_host
+            .iter()
+            .zip(upstream_host.iter())
+            .map(|(&xv, &up)| {
+                let erf_term = libm::erff(xv * INV_SQRT_2);
+                let exp_term = (-0.5 * xv * xv).exp();
+                let deriv = 0.5 * (1.0 + erf_term) + (xv * INV_SQRT_2PI * exp_term);
+                up * deriv
+            })
+            .collect();
+        self.upload(&grad, shape)
+    }
+
+    /// Wave 2.1: device-resident backward for `sigmoid(x)`. Consumes the
+    /// saved output `y`: `grad_x[i] = upstream[i] * y[i] * (1 - y[i])`.
+    ///
+    /// Default fallback: `readback → host loop → upload`. CUDA overrides
+    /// with a 1D NVRTC kernel.
+    fn sigmoid_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        y: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let y_host = self.readback(y)?;
+        let size = shape_size(shape);
+        if upstream_host.len() != size || y_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len().min(y_host.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let grad: Vec<f32> = y_host
+            .iter()
+            .zip(upstream_host.iter())
+            .map(|(&yv, &up)| up * yv * (1.0 - yv))
+            .collect();
+        self.upload(&grad, shape)
+    }
+
+    /// Wave 2.1: device-resident backward for `exp(x)`. Consumes the saved
+    /// output `y = exp(x)`: `grad_x[i] = upstream[i] * y[i]`.
+    ///
+    /// Default fallback: `readback → host multiply → upload`. CUDA
+    /// overrides with a 1D NVRTC kernel.
+    fn exp_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        y: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let y_host = self.readback(y)?;
+        let size = shape_size(shape);
+        if upstream_host.len() != size || y_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len().min(y_host.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let grad: Vec<f32> = y_host
+            .iter()
+            .zip(upstream_host.iter())
+            .map(|(&yv, &up)| up * yv)
+            .collect();
+        self.upload(&grad, shape)
+    }
+
+    /// Wave 2.1: device-resident backward for `mul(a, b)`. Returns
+    /// `(grad_a, grad_b)` where `grad_a[i] = upstream[i] * b[i]` and
+    /// `grad_b[i] = upstream[i] * a[i]`. `need_grad_a` / `need_grad_b`
+    /// short-circuit each side to `None` (mirrors `matmul_backward_device`).
+    ///
+    /// Default fallback: `readback → host multiply → upload` for each
+    /// requested side. CUDA overrides with two 1D NVRTC kernels.
+    fn mul_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        a: &DeviceHandle,
+        b: &DeviceHandle,
+        shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        if !need_grad_a && !need_grad_b {
+            return Ok((None, None));
+        }
+        let upstream_host = self.readback(upstream)?;
+        let a_host = if need_grad_b {
+            Some(self.readback(a)?)
+        } else {
+            None
+        };
+        let b_host = if need_grad_a {
+            Some(self.readback(b)?)
+        } else {
+            None
+        };
+        let size = shape_size(shape);
+        if upstream_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let grad_a = if need_grad_a {
+            let b = b_host.as_ref().expect("requested above");
+            let grad: Vec<f32> = upstream_host
+                .iter()
+                .zip(b.iter())
+                .map(|(&up, &bv)| up * bv)
+                .collect();
+            Some(self.upload(&grad, shape)?)
+        } else {
+            None
+        };
+        let grad_b = if need_grad_b {
+            let a = a_host.as_ref().expect("requested above");
+            let grad: Vec<f32> = upstream_host
+                .iter()
+                .zip(a.iter())
+                .map(|(&up, &av)| up * av)
+                .collect();
+            Some(self.upload(&grad, shape)?)
+        } else {
+            None
+        };
+        Ok((grad_a, grad_b))
+    }
+
+    /// Wave 2.1: device-resident backward for `rms_norm(x, weight, eps)`.
+    /// Returns `(grad_x, grad_w)` where each side is gated by the
+    /// corresponding `need_grad_*` flag (default impl skips the host
+    /// allocation for skipped sides).
+    ///
+    /// Math (mirrors `cpu_rmsnorm_backward`):
+    ///   inv_rms[r] = 1 / sqrt(mean(x[r,:]^2) + eps)
+    ///   dot[r]     = sum_j(upstream[r,j] * weight[j] * x[r,j])
+    ///   grad_x[r,j] = inv*upstream[r,j]*weight[j] - x[r,j]*inv*inv*dot/H
+    ///   grad_w[j]   = sum_r(upstream[r,j] * x[r,j] * inv_rms[r])
+    ///
+    /// Default fallback: `readback → host loop → upload`. CUDA overrides
+    /// with three NVRTC kernels (per-row inv_rms scratch, then per-row
+    /// grad_x with shared-mem `dot` reduce, then per-col grad_w reduce).
+    fn rms_norm_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        weight: &DeviceHandle,
+        shape: &[usize],
+        eps: f32,
+        need_grad_x: bool,
+        need_grad_w: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        if !need_grad_x && !need_grad_w {
+            return Ok((None, None));
+        }
+        let hidden = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        })?;
+        let total = shape_size(shape);
+        let rows = total.checked_div(hidden).unwrap_or(0);
+
+        let upstream_host = self.readback(upstream)?;
+        let x_host = self.readback(x)?;
+        let weight_host = self.readback(weight)?;
+        if upstream_host.len() != total || x_host.len() != total || weight_host.len() != hidden {
+            return Err(crate::AutogradError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: vec![upstream_host.len()],
+            });
+        }
+
+        // Per-row inv_rms.
+        let mut inv_rms = vec![0.0_f32; rows];
+        for (row, inv_slot) in inv_rms.iter_mut().enumerate() {
+            let base = row * hidden;
+            let mut sum_sq = 0.0_f32;
+            for col in 0..hidden {
+                let v = x_host[base + col];
+                sum_sq += v * v;
+            }
+            *inv_slot = 1.0 / ((sum_sq / hidden as f32) + eps).sqrt();
+        }
+
+        let grad_x = if need_grad_x {
+            let mut grad = vec![0.0_f32; total];
+            for (row, &inv) in inv_rms.iter().enumerate() {
+                let base = row * hidden;
+                let mut dot = 0.0_f32;
+                for col in 0..hidden {
+                    dot += upstream_host[base + col] * weight_host[col] * x_host[base + col];
+                }
+                let correction = inv * inv * dot / hidden as f32;
+                for col in 0..hidden {
+                    grad[base + col] = (inv * upstream_host[base + col] * weight_host[col])
+                        - (x_host[base + col] * inv * correction);
+                }
+            }
+            Some(self.upload(&grad, shape)?)
+        } else {
+            None
+        };
+        let grad_w = if need_grad_w {
+            let mut grad = vec![0.0_f32; hidden];
+            for (row, &inv) in inv_rms.iter().enumerate() {
+                let base = row * hidden;
+                for col in 0..hidden {
+                    grad[col] += upstream_host[base + col] * x_host[base + col] * inv;
+                }
+            }
+            Some(self.upload(&grad, &[hidden])?)
+        } else {
+            None
+        };
+        Ok((grad_x, grad_w))
+    }
+
+    /// Wave 2.1: device-resident backward for `rope(x, cos, sin)`. The
+    /// backward is identical to the forward with `sin` negated:
+    ///   grad_x = rope_forward(upstream, cos, -sin)
+    ///
+    /// `cos`/`sin` stay host-side (mirrors `rope` forward — caches are
+    /// per-seq and seldom benefit from being device-resident).
+    ///
+    /// Default fallback: `readback(upstream) → host neg(sin) →
+    /// cpu_rope_forward → upload`. CUDA overrides with a dedicated NVRTC
+    /// kernel that inlines the sign flip.
+    fn rope_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x_shape: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let neg_sin: Vec<f32> = sin.iter().map(|&v| -v).collect();
+        let grad = cpu_rope_forward(&upstream_host, x_shape, cos, &neg_sin)?;
+        self.upload(&grad, x_shape)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

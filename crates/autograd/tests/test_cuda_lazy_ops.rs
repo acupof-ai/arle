@@ -817,3 +817,389 @@ fn cuda_adamw_step_device_matches_cpu() {
         host_v[v_idx]
     );
 }
+
+// ============================================================================
+// Wave 2.1 — atomic batch port of 7 host-only backward ops to device-lazy.
+// Each test mirrors the production-representative shape per the wave-2.1
+// brief. Tolerance follows `max_err_with_tol(atol=1e-5, rtol=1e-4)` for
+// the multi-pass / trig ops (rms_norm, rope) which accumulate enough
+// rounding to need the absolute floor; pure elementwise (silu, gelu,
+// sigmoid, exp, mul) stay on the strict `max_err` tolerance.
+// ============================================================================
+
+/// SiLU backward parity: `dx[i] = upstream[i] * silu'(x[i])` where
+/// `silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))`. Per-layer
+/// activation shape `[B=2, S=512, H=160]` from the wave-2.1 brief.
+#[test]
+fn cuda_silu_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_silu_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let shape: Vec<usize> = vec![2, 512, 160];
+    let size: usize = shape.iter().product();
+    let x = rng_vec(0x511, size, 4.0);
+    let upstream = rng_vec(0x511_511, size, 1.0);
+
+    let host_grad: Vec<f32> = x
+        .iter()
+        .zip(upstream.iter())
+        .map(|(&xv, &up)| {
+            let sigmoid = 1.0_f32 / (1.0 + (-xv).exp());
+            let deriv = sigmoid + (xv * sigmoid * (1.0 - sigmoid));
+            up * deriv
+        })
+        .collect();
+
+    let x_h: DeviceHandle = backend.upload(&x, &shape).expect("upload x");
+    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+    let grad_h = backend
+        .silu_backward_device(&up_h, &x_h, &shape)
+        .expect("cuda silu_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend.readback(&grad_h).expect("silu_bwd readback");
+
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "silu_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
+
+/// GELU (erf form) backward parity. Per-layer activation shape.
+#[test]
+fn cuda_gelu_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_gelu_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    const INV_SQRT_2: f32 = 0.707_106_77;
+    const INV_SQRT_2PI: f32 = 0.398_942_3;
+
+    let shape: Vec<usize> = vec![2, 512, 160];
+    let size: usize = shape.iter().product();
+    let x = rng_vec(0x6e1, size, 4.0);
+    let upstream = rng_vec(0x6e1_6e1, size, 1.0);
+
+    let host_grad: Vec<f32> = x
+        .iter()
+        .zip(upstream.iter())
+        .map(|(&xv, &up)| {
+            let erf_term = libm::erff(xv * INV_SQRT_2);
+            let exp_term = (-0.5_f32 * xv * xv).exp();
+            let deriv = 0.5 * (1.0 + erf_term) + (xv * INV_SQRT_2PI * exp_term);
+            up * deriv
+        })
+        .collect();
+
+    let x_h: DeviceHandle = backend.upload(&x, &shape).expect("upload x");
+    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+    let grad_h = backend
+        .gelu_backward_device(&up_h, &x_h, &shape)
+        .expect("cuda gelu_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend.readback(&grad_h).expect("gelu_bwd readback");
+
+    // erff intrinsic vs libm::erff: ~1-2 ULP gap. Use the strict gate
+    // (1e-6 + 1e-4) — well within the absolute floor.
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "gelu_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
+
+/// Sigmoid backward parity: consumes the saved output `y`.
+#[test]
+fn cuda_sigmoid_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_sigmoid_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let shape: Vec<usize> = vec![2, 512, 160];
+    let size: usize = shape.iter().product();
+    // Saved y = sigmoid(x); generate by sampling x and computing sigmoid
+    // host-side so we feed the kernel exactly the same `y` the device
+    // sigmoid forward would have produced.
+    let x = rng_vec(0x515, size, 4.0);
+    let y: Vec<f32> = x.iter().map(|&v| 1.0_f32 / (1.0 + (-v).exp())).collect();
+    let upstream = rng_vec(0x515_515, size, 1.0);
+
+    let host_grad: Vec<f32> = y
+        .iter()
+        .zip(upstream.iter())
+        .map(|(&yv, &up)| up * yv * (1.0 - yv))
+        .collect();
+
+    let y_h: DeviceHandle = backend.upload(&y, &shape).expect("upload y");
+    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+    let grad_h = backend
+        .sigmoid_backward_device(&up_h, &y_h, &shape)
+        .expect("cuda sigmoid_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend.readback(&grad_h).expect("sigmoid_bwd readback");
+
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "sigmoid_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
+
+/// Exp backward parity: consumes the saved output `y = exp(x)`.
+#[test]
+fn cuda_exp_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_exp_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let shape: Vec<usize> = vec![2, 512, 160];
+    let size: usize = shape.iter().product();
+    // Bound x so exp doesn't overflow into the inf band that would make
+    // the parity check pointless (any test value > ~88 returns inf in f32).
+    let x = rng_vec(0xE17, size, 2.0);
+    let y: Vec<f32> = x.iter().map(|&v| v.exp()).collect();
+    let upstream = rng_vec(0xE17_E17, size, 1.0);
+
+    let host_grad: Vec<f32> = y
+        .iter()
+        .zip(upstream.iter())
+        .map(|(&yv, &up)| up * yv)
+        .collect();
+
+    let y_h: DeviceHandle = backend.upload(&y, &shape).expect("upload y");
+    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+    let grad_h = backend
+        .exp_backward_device(&up_h, &y_h, &shape)
+        .expect("cuda exp_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend.readback(&grad_h).expect("exp_bwd readback");
+
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "exp_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
+
+/// Mul backward parity: `grad_a = upstream * b`, `grad_b = upstream * a`.
+#[test]
+fn cuda_mul_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_mul_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let shape: Vec<usize> = vec![2, 512, 160];
+    let size: usize = shape.iter().product();
+    let a = rng_vec(0x77a, size, 2.0);
+    let b = rng_vec(0x77b, size, 2.0);
+    let upstream = rng_vec(0x77c, size, 1.0);
+
+    let host_grad_a: Vec<f32> = upstream
+        .iter()
+        .zip(b.iter())
+        .map(|(&up, &bv)| up * bv)
+        .collect();
+    let host_grad_b: Vec<f32> = upstream
+        .iter()
+        .zip(a.iter())
+        .map(|(&up, &av)| up * av)
+        .collect();
+
+    let a_h: DeviceHandle = backend.upload(&a, &shape).expect("upload a");
+    let b_h: DeviceHandle = backend.upload(&b, &shape).expect("upload b");
+    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+
+    // Both sides.
+    let (grad_a_h, grad_b_h) = backend
+        .mul_backward_device(&up_h, &a_h, &b_h, &shape, true, true)
+        .expect("cuda mul_backward_device");
+    let grad_a_h = grad_a_h.expect("need_grad_a -> Some");
+    let grad_b_h = grad_b_h.expect("need_grad_b -> Some");
+    backend.eval(&[&grad_a_h, &grad_b_h]).expect("cuda eval");
+    let dev_grad_a = backend.readback(&grad_a_h).expect("grad_a readback");
+    let dev_grad_b = backend.readback(&grad_b_h).expect("grad_b readback");
+
+    let (excess_a, abs_a, idx_a) = max_err(&dev_grad_a, &host_grad_a);
+    assert!(
+        excess_a <= 1.0,
+        "mul_backward_device grad_a exceeds atol=1e-6 + rtol=1e-4 at idx {idx_a} \
+         (|diff|={abs_a}, dev={}, host={}, excess_ratio={excess_a})",
+        dev_grad_a[idx_a],
+        host_grad_a[idx_a]
+    );
+    let (excess_b, abs_b, idx_b) = max_err(&dev_grad_b, &host_grad_b);
+    assert!(
+        excess_b <= 1.0,
+        "mul_backward_device grad_b exceeds atol=1e-6 + rtol=1e-4 at idx {idx_b} \
+         (|diff|={abs_b}, dev={}, host={}, excess_ratio={excess_b})",
+        dev_grad_b[idx_b],
+        host_grad_b[idx_b]
+    );
+
+    // need_grad_a=false short-circuit.
+    let (grad_a_h2, grad_b_h2) = backend
+        .mul_backward_device(&up_h, &a_h, &b_h, &shape, false, true)
+        .expect("cuda mul_backward_device (need_grad_a=false)");
+    assert!(
+        grad_a_h2.is_none(),
+        "need_grad_a=false must short-circuit to None"
+    );
+    let grad_b_h2 = grad_b_h2.expect("need_grad_b -> Some");
+    backend.eval(&[&grad_b_h2]).expect("cuda eval");
+    let dev_grad_b2 = backend.readback(&grad_b_h2).expect("grad_b short readback");
+    let (excess_b2, _, idx_b2) = max_err(&dev_grad_b2, &host_grad_b);
+    assert!(excess_b2 <= 1.0, "short-circuit grad_b idx {idx_b2}");
+}
+
+/// RMSNorm backward parity: both `grad_x` and `grad_w`. Production-ish
+/// per-layer norm shape `[B=2, S=512, H=160]` + weight `[160]`. Tolerance
+/// bumped to `atol=1e-5` because the two-pass reduce + per-row sqrt
+/// accumulates ~`sqrt(H)*f32_eps` ≈ 1.5e-6 per output element, scaled by
+/// the host loop's row-major order vs the kernel's parallel reduction
+/// order.
+#[test]
+fn cuda_rms_norm_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_rms_norm_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let shape: Vec<usize> = vec![2, 512, 160];
+    let hidden = 160_usize;
+    let size: usize = shape.iter().product();
+    let eps = 1e-6_f32;
+
+    let x = rng_vec(0x88a, size, 1.0);
+    let weight = rng_vec(0x88b, hidden, 1.0);
+    let upstream = rng_vec(0x88c, size, 1.0);
+
+    // Host reference (matches `cpu_rmsnorm_backward` math + the new
+    // `Backend::rms_norm_backward_device` default impl).
+    let rows = size / hidden;
+    let mut inv_rms = vec![0.0_f32; rows];
+    for r in 0..rows {
+        let base = r * hidden;
+        let mut sum_sq = 0.0_f32;
+        for c in 0..hidden {
+            let v = x[base + c];
+            sum_sq += v * v;
+        }
+        inv_rms[r] = 1.0 / ((sum_sq / hidden as f32) + eps).sqrt();
+    }
+    let mut host_grad_x = vec![0.0_f32; size];
+    for r in 0..rows {
+        let base = r * hidden;
+        let inv = inv_rms[r];
+        let mut dot = 0.0_f32;
+        for c in 0..hidden {
+            dot += upstream[base + c] * weight[c] * x[base + c];
+        }
+        let correction = inv * inv * dot / hidden as f32;
+        for c in 0..hidden {
+            host_grad_x[base + c] =
+                (inv * upstream[base + c] * weight[c]) - (x[base + c] * inv * correction);
+        }
+    }
+    let mut host_grad_w = vec![0.0_f32; hidden];
+    for r in 0..rows {
+        let base = r * hidden;
+        let inv = inv_rms[r];
+        for c in 0..hidden {
+            host_grad_w[c] += upstream[base + c] * x[base + c] * inv;
+        }
+    }
+
+    let x_h: DeviceHandle = backend.upload(&x, &shape).expect("upload x");
+    let w_h: DeviceHandle = backend.upload(&weight, &[hidden]).expect("upload w");
+    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+
+    let (grad_x_h, grad_w_h) = backend
+        .rms_norm_backward_device(&up_h, &x_h, &w_h, &shape, eps, true, true)
+        .expect("cuda rms_norm_backward_device");
+    let grad_x_h = grad_x_h.expect("need_grad_x -> Some");
+    let grad_w_h = grad_w_h.expect("need_grad_w -> Some");
+    backend.eval(&[&grad_x_h, &grad_w_h]).expect("cuda eval");
+    let dev_grad_x = backend.readback(&grad_x_h).expect("grad_x readback");
+    let dev_grad_w = backend.readback(&grad_w_h).expect("grad_w readback");
+
+    let (excess_x, abs_x, idx_x) = max_err_with_tol(&dev_grad_x, &host_grad_x, 1e-5, 1e-4);
+    assert!(
+        excess_x <= 1.0,
+        "rms_norm_backward_device grad_x exceeds atol=1e-5 + rtol=1e-4 at idx {idx_x} \
+         (|diff|={abs_x}, dev={}, host={}, excess_ratio={excess_x})",
+        dev_grad_x[idx_x],
+        host_grad_x[idx_x]
+    );
+    let (excess_w, abs_w, idx_w) = max_err_with_tol(&dev_grad_w, &host_grad_w, 1e-5, 1e-4);
+    assert!(
+        excess_w <= 1.0,
+        "rms_norm_backward_device grad_w exceeds atol=1e-5 + rtol=1e-4 at idx {idx_w} \
+         (|diff|={abs_w}, dev={}, host={}, excess_ratio={excess_w})",
+        dev_grad_w[idx_w],
+        host_grad_w[idx_w]
+    );
+}
+
+/// RoPE backward parity. Per the wave-2.1 brief: `[B=2, n_heads=5,
+/// S=512, head_dim=32]` (NeoX layout, full-head rotation).
+#[test]
+fn cuda_rope_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_rope_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    use autograd::backend::cpu_rope_forward;
+    let batch = 2_usize;
+    let heads = 5_usize;
+    let seq = 512_usize;
+    let head_dim = 32_usize;
+    let half_dim = head_dim / 2;
+    let shape: Vec<usize> = vec![batch, heads, seq, head_dim];
+    let size: usize = shape.iter().product();
+    let cache_len = seq * half_dim;
+
+    let upstream = rng_vec(0x69e, size, 1.0);
+    let cos = rng_vec(0x69c, cache_len, 1.0);
+    let sin = rng_vec(0x69b, cache_len, 1.0);
+
+    // Host reference: cpu_rope_forward(upstream, cos, -sin).
+    let neg_sin: Vec<f32> = sin.iter().map(|&v| -v).collect();
+    let host_grad = cpu_rope_forward(&upstream, &shape, &cos, &neg_sin).expect("cpu rope backward");
+
+    let up_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+    let grad_h = backend
+        .rope_backward_device(&up_h, &shape, &cos, &sin)
+        .expect("cuda rope_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend.readback(&grad_h).expect("rope_bwd readback");
+
+    // Trig accumulation: one mul-add per element, no reduction. atol=1e-5
+    // + rtol=1e-4 absorbs the cos/sin intrinsic ULP gap with margin.
+    let (excess, abs, idx) = max_err_with_tol(&dev_grad, &host_grad, 1e-5, 1e-4);
+    assert!(
+        excess <= 1.0,
+        "rope_backward_device exceeds atol=1e-5 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}

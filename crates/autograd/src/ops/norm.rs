@@ -170,33 +170,92 @@ pub(crate) fn rmsnorm_backward(
         ));
     };
 
-    // If the forward took the lazy device path (M5.3b.6), inv_rms was
-    // saved empty — recompute it from the now-host-side x. Cheap: one
-    // mean-squared + sqrt per row per layer, far below matmul_backward
-    // cost. Needs `ensure_host(x)` for the lazy-forward + eager-eps-only
-    // path; when called from `tape.backward` this is a no-op (batch
-    // flush already ran).
+    let x_shape = store.tensor(x)?.shape.clone();
+    let weight_shape = store.tensor(weight)?.shape.clone();
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if upstream_shape != x_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: x_shape,
+            got: upstream_shape,
+        });
+    }
+    let hidden = *x_shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    let need_grad_x = store.tensor(x)?.requires_grad;
+    let need_grad_w = store.tensor(weight)?.requires_grad;
+    if !need_grad_x && !need_grad_w {
+        return Ok(GradPairs::new());
+    }
+
+    // Wave 2.1: route through `rms_norm_backward_device` whenever
+    // upstream, x, and weight are all device-resident. Pre-2.1 this op
+    // unconditionally `ensure_host(x)` + read `tensor_host` for all three
+    // operands — every layer's rmsnorm thus demoted x back to host before
+    // any downstream device op could see it, poisoning the entire post-
+    // P3.1 chain.
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        let x_t = store.tensor(x)?;
+        let w_t = store.tensor(weight)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && x_t.dirty != Dirty::Host
+            && x_t.device_handle.is_some()
+            && w_t.dirty != Dirty::Host
+            && w_t.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let x_handle = store
+            .tensor(x)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let w_handle = store
+            .tensor(weight)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let (grad_x_handle, grad_w_handle) = store.backend().rms_norm_backward_device(
+            &upstream_handle,
+            &x_handle,
+            &w_handle,
+            &x_shape,
+            eps,
+            need_grad_x,
+            need_grad_w,
+        )?;
+        let mut grads = GradPairs::new();
+        if let Some(h) = grad_x_handle {
+            let grad_id = store.alloc_device_tensor(x_shape.clone(), h)?;
+            grads.push((x, grad_id));
+        }
+        if let Some(h) = grad_w_handle {
+            let grad_id = store.alloc_device_tensor(weight_shape, h)?;
+            grads.push((weight, grad_id));
+        }
+        return Ok(grads);
+    }
+
+    // Host fallback (CPU/Metal). If the forward took the lazy device path
+    // (M5.3b.6), inv_rms was saved empty — recompute it from the now-host
+    // x.
     store.ensure_host(x)?;
     let upstream = store.tensor_host(output_grad_id)?;
     let x_tensor = store.tensor_host(x)?;
     let weight_tensor = store.tensor_host(weight)?;
-    if upstream.shape != x_tensor.shape {
-        return Err(AutogradError::ShapeMismatch {
-            expected: x_tensor.shape.clone(),
-            got: upstream.shape,
-        });
-    }
 
-    let hidden = *x_tensor.shape.last().ok_or(AutogradError::InvalidRank {
-        expected: "at least 1",
-        got: 0,
-    })?;
     let rows = x_tensor.size / hidden;
     let inv_rms = if inv_rms.is_empty() {
-        // Lazy-forward path saved an empty vec and the forward's `eps`;
-        // recompute inv_rms host-side. Cheap: one mean-squared + sqrt per
-        // row per layer, far below matmul_backward cost. `tape.backward`'s
-        // pre-walk batch-flush has already materialized x to the host.
         let mut computed = Vec::with_capacity(rows);
         for row in 0..rows {
             let base = row * hidden;
@@ -217,7 +276,7 @@ pub(crate) fn rmsnorm_backward(
     };
 
     let mut grads = GradPairs::new();
-    if x_tensor.requires_grad {
+    if need_grad_x {
         let mut grad_x = vec![0.0; x_tensor.size];
         for (row, &inv) in inv_rms.iter().enumerate() {
             let base = row * hidden;
@@ -237,7 +296,7 @@ pub(crate) fn rmsnorm_backward(
         grads.push((x, grad_id));
     }
 
-    if weight_tensor.requires_grad {
+    if need_grad_w {
         let mut grad_weight = vec![0.0; hidden];
         for (row, &inv) in inv_rms.iter().enumerate() {
             let base = row * hidden;
