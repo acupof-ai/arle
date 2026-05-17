@@ -112,6 +112,7 @@ marked as the current source of truth, treat it as historical context.
 | [resources/metal-dflash-params.md](resources/metal-dflash-params.md) | DFlash CLI parameter reference |
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV-cache quantization formats and operator-side guidance |
 | [resources/infer-cuda-profiling-wrappers.md](resources/infer-cuda-profiling-wrappers.md) | `nsys` / `ncu` wrapper scripts |
+| [resources/eli-integration.md](resources/eli-integration.md) | Eli sibling-repo integration runbook; layer-2 nexil session-id forwarding shipped 2026-05-07. |
 
 ## Archived / Historical (kept for evidence + cross-refs)
 
@@ -140,6 +141,7 @@ brings them back.
 | [projects/2026-04-29-throughput-gap-analysis.md](projects/2026-04-29-throughput-gap-analysis.md) | "Why we're 28% behind SGLang at c=16" snapshot; cited by the longctx project. |
 | [projects/2026-04-30-arle-vs-sglang-admission.md](projects/2026-04-30-arle-vs-sglang-admission.md) | Admission policy gap matrix; sibling to active SGLang admission research note. |
 | [projects/2026-05-02-tilekernels-integration-decision.md](projects/2026-05-02-tilekernels-integration-decision.md) | Decision record (don't-submodule, port-selectively) for `cklxx/TileKernels`; referenced from the multi-backend plan. |
+| [projects/2026-05-07-eli-arle-native-provider-design.md](projects/2026-05-07-eli-arle-native-provider-design.md) | Layer-2 nexil ↔ arle native-provider design; shipped 2026-05-07 (`http_server/openai_v1.rs` session_id forwarding). Kept as post-implementation reference. |
 
 ## Historical Material
 
