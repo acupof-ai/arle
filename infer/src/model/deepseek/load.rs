@@ -240,18 +240,15 @@ fn dsv4_marlin_w4_quant_config(layout: Dsv4MarlinW4Layout) -> QuantLoadConfig {
         Dsv4MarlinW4Layout::W4A8 => QuantLoadConfig {
             group_size: Some(128),
             bits: Some(4),
-            tq_bits: None,
             marlin_w4a8: true,
-            marlin_w4_hybrid: false,
-            unsupported_reason: None,
+            ..QuantLoadConfig::default()
         },
         Dsv4MarlinW4Layout::Hybrid => QuantLoadConfig {
             group_size: Some(128),
             bits: Some(4),
-            tq_bits: None,
             marlin_w4a8: true,
             marlin_w4_hybrid: true,
-            unsupported_reason: None,
+            ..QuantLoadConfig::default()
         },
     }
 }

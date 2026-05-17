@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 // ============================================================================
@@ -150,6 +150,8 @@ pub struct Fp8Config {
     pub activation_scheme: Fp8ActivationScheme,
     /// Whether weights use FP8 storage (E4M3). Currently always true.
     pub weight_fp8: bool,
+    /// Weight block shape for FP8 block scales.
+    pub weight_block_size: [usize; 2],
 }
 
 impl Default for Fp8Config {
@@ -157,6 +159,7 @@ impl Default for Fp8Config {
         Self {
             activation_scheme: Fp8ActivationScheme::Dynamic,
             weight_fp8: true,
+            weight_block_size: [128, 128],
         }
     }
 }
@@ -296,9 +299,12 @@ struct RawAwqConfig {
 #[serde(default)]
 struct RawQuantizationConfig {
     quant_type: Option<String>,
+    quant_method: Option<String>,
     #[serde(rename = "type")]
     type_field: Option<String>,
+    fmt: Option<String>,
     activation_scheme: Option<String>,
+    weight_block_size: Option<Vec<usize>>,
     is_smoothquant: Option<bool>,
     // AWQ / GPTQ sub-fields sometimes appear at top level
     bits: Option<u8>,
@@ -451,6 +457,7 @@ fn try_parse_config_json(json: &str) -> Result<Option<QuantMeta>> {
     let qtype = qc
         .quant_type
         .as_deref()
+        .or(qc.quant_method.as_deref())
         .or(qc.type_field.as_deref())
         .unwrap_or("")
         .to_lowercase();
@@ -472,13 +479,39 @@ fn try_parse_config_json(json: &str) -> Result<Option<QuantMeta>> {
                 .as_deref()
                 .map_or(AwqVersion::Gemm, AwqVersion::from_str),
         }),
-        "fp8" | "float8" | "fp8_e4m3" => QuantMeta::Fp8(Fp8Config {
-            activation_scheme: match qc.activation_scheme.as_deref().unwrap_or("dynamic") {
-                "static" => Fp8ActivationScheme::Static,
-                _ => Fp8ActivationScheme::Dynamic,
-            },
-            weight_fp8: true,
-        }),
+        "fp8" | "float8" | "fp8_e4m3" => {
+            if let Some(fmt) = qc.fmt.as_deref() {
+                ensure!(
+                    matches!(fmt.to_ascii_lowercase().as_str(), "e4m3" | "fp8_e4m3"),
+                    "unsupported FP8 fmt `{fmt}`; only e4m3 is supported"
+                );
+            }
+            let block = match qc.weight_block_size.as_deref() {
+                Some([rows, cols]) => [*rows, *cols],
+                Some(other) => {
+                    ensure!(
+                        other.len() == 2,
+                        "FP8 weight_block_size must have two entries, got {:?}",
+                        other
+                    );
+                    unreachable!("length checked above")
+                }
+                None => [128, 128],
+            };
+            ensure!(
+                block[0] > 0 && block[1] > 0,
+                "FP8 weight_block_size entries must be positive, got {:?}",
+                block
+            );
+            QuantMeta::Fp8(Fp8Config {
+                activation_scheme: match qc.activation_scheme.as_deref().unwrap_or("dynamic") {
+                    "static" => Fp8ActivationScheme::Static,
+                    _ => Fp8ActivationScheme::Dynamic,
+                },
+                weight_fp8: true,
+                weight_block_size: block,
+            })
+        }
         "int8" | "smoothquant" | "w8a8" => QuantMeta::Int8(Int8Config {
             is_smoothquant: qc.is_smoothquant.unwrap_or(qtype == "smoothquant"),
             per_channel: true,
@@ -521,6 +554,10 @@ mod tests {
 
     fn fp8_static_json() -> &'static str {
         r#"{"quantization_config":{"quant_type":"fp8","activation_scheme":"static"}}"#
+    }
+
+    fn fp8_modelopt_json() -> &'static str {
+        r#"{"quantization_config":{"quant_method":"fp8","fmt":"e4m3","activation_scheme":"dynamic","weight_block_size":[128,128]}}"#
     }
 
     fn int8_smoothquant_json() -> &'static str {
@@ -583,6 +620,20 @@ mod tests {
         let meta = parse_quant_meta_from_config_json(fp8_static_json()).unwrap();
         if let QuantMeta::Fp8(c) = meta {
             assert_eq!(c.activation_scheme, Fp8ActivationScheme::Static);
+            assert_eq!(c.weight_block_size, [128, 128]);
+        } else {
+            panic!("expected Fp8");
+        }
+    }
+
+    #[test]
+    fn parse_fp8_modelopt_quant_method() {
+        let meta = parse_quant_meta_from_config_json(fp8_modelopt_json()).unwrap();
+        assert_eq!(meta.format(), QuantFormat::Fp8);
+        if let QuantMeta::Fp8(c) = meta {
+            assert_eq!(c.activation_scheme, Fp8ActivationScheme::Dynamic);
+            assert_eq!(c.weight_block_size, [128, 128]);
+            assert!(c.weight_fp8);
         } else {
             panic!("expected Fp8");
         }
