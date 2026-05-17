@@ -18,7 +18,7 @@ safetensors = ["dep:safetensors", "dep:memmap2", "dep:half"]
 
 [dependencies]
 anyhow = "1.0"
-cudarc = { version = "0.18", features = [
+cudarc = { version = "0.19", features = [
     "cuda-version-from-build-system",
     "cublas",
     "nvrtc",
