@@ -12,7 +12,7 @@
 
 > **2026-05-10 later update:** active Qwen3.5 Medusa/spec work is gated by
 > [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md).
-> Older Medusa-ready / A+B notes are historical for Qwen3 / Qwen3.6 until
+> Older Medusa-ready / A+B notes are historical for Qwen3.6 until
 > recurrent-state accepted-length rollback is licensed for Qwen3.5.
 
 Updated 2026-05-06 after the DSV4 runtime substrate scaffold + nano autograd
@@ -155,7 +155,7 @@ Key files:
 
 ### Runtime entry, serving, and wiring
 
-- `infer/src/server_engine.rs`: unified `InferenceEngine` trait, `CompletionRequest`/`CompletionOutput`/`TokenUsage`/`CompletionStreamDelta` types, CUDA generation loop, and the `LoadedInferenceEngine` enum that dispatches to Qwen3/Qwen35/Qwen35Moe (CUDA), `BackendInferenceEngine<MetalBackend>` (Metal), or `BackendInferenceEngine<CpuBackend>` (CPU)
+- `infer/src/server_engine.rs`: unified `InferenceEngine` trait, `CompletionRequest`/`CompletionOutput`/`TokenUsage`/`CompletionStreamDelta` types, CUDA generation loop, and the `LoadedInferenceEngine` enum that dispatches to Qwen35/Qwen35Moe (CUDA), `BackendInferenceEngine<MetalBackend>` (Metal), or `BackendInferenceEngine<CpuBackend>` (CPU)
 - `infer/src/backend/cuda/bootstrap.rs`: builds CUDA engines and schedulers
 - `infer/src/backend/runtime.rs`: serial backend runtime for CPU/Metal
 - `infer/src/http_server.rs`: axum wiring for serving
@@ -203,7 +203,7 @@ For the Route-A folding rationale see
 - `infer/src/backend/metal/kv_pool.rs`
 - `infer/src/backend/metal/prefix_cache.rs`
 - `infer/src/backend/metal/gdr.rs`
-- `infer/src/backend/metal/request_state.rs`: resumable Metal request state layer for Qwen3 / Qwen3.5 (prefill in chunks, one-step decode, deterministic cleanup); M0.2a landed locally 2026-04-15
+- `infer/src/backend/metal/request_state.rs`: resumable Metal request state layer for Qwen3.5 (prefill in chunks, one-step decode, deterministic cleanup); M0.2a landed locally 2026-04-15
 
 ### Models, kernels, and numerics
 
@@ -242,7 +242,7 @@ These crates remain independent after Route A:
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored
   MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/kv-native-sys`: local persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors
-- `crates/qwen3-spec`, `crates/qwen35-spec`: shared train↔infer Qwen3 / Qwen3.5 config + canonical tensor-name contracts + `Shard` annotations consumed by the F1 sharded loader path
+- `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the F1 sharded loader path
 - `crates/deepseek-spec`: DeepSeek support is now V4-only for `infer/models/dsv4-mini-1B-init`. The crate owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries, and MoE route helpers. `infer/src/model/deepseek/*` remains the CUDA model scaffold; `infer/src/model/deepseek/reference.rs` is the CPU-only Rust reference smoke path used by `cpu_serve`; `arle train pretrain-dsv4` seeds from the same V4 1B init checkpoint and rejects old nano/V3 SKUs. CUDA V4 hybrid attention + MoE + MTP kernels remain the active runtime blockers. DS4 is the **#1 next-model priority** ([ROADMAP §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order))
 
 Current dependency direction:

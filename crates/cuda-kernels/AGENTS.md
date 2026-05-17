@@ -105,7 +105,7 @@ RawDevicePtr
 - Anything from `ffi::*` — consumers that need `extern "C"` symbols use
   `cuda_kernels::ffi::xxx` directly.
 - `EngineOptions` / runtime configs — owned by `infer::server_engine`.
-- Model-specific state (`Qwen3Model`, etc.) — application types, stay in `infer::model::*`.
+- Model-specific state (`Qwen35Model`, etc.) — application types, stay in `infer::model::*`.
 - `CollectiveBackend` / `NcclBackend` — multi-GPU collective trait lives at
   `cuda_kernels::collective::*`. It will graduate to the prelude only once
   more than two callers exist outside the F0–F2 distributed scaffold.

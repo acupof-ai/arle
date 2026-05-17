@@ -64,7 +64,7 @@ You built without selecting a backend feature. Rebuild with one of `cuda` /
 Same root cause as the `bare` doctor message — backend feature was not
 compiled in. Pass the matching `--features` flag at build time.
 
-### `Model 'qwen3-4b' is not available on this server; loaded model is 'Qwen3-0.6B-4bit'`
+### `Model 'qwen3.5-4b' is not available on this server; loaded model is 'Qwen3.5-0.8B-MLX-4bit'`
 
 The server matches the request body's `model` field (case-insensitive, last
 path segment) against the loaded model's id. Either:

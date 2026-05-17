@@ -54,7 +54,7 @@ matrix, env-var overrides, and uninstall steps.
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
-  -v /path/to/Qwen3-4B:/model:ro \
+  -v /path/to/Qwen3.5-4B:/model:ro \
   ghcr.io/cklxx/arle:latest \
   serve --backend cuda --model-path /model --port 8000
 ```
@@ -78,9 +78,9 @@ cargo build --release --features cuda --bin arle
 
 ```bash
 arle serve --backend metal \
-  --model-path mlx-community/Qwen3-0.6B-4bit --port 8000   # Apple Silicon
+  --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit --port 8000   # Apple Silicon
 arle serve --backend cuda \
-  --model-path /path/to/Qwen3-4B --port 8000               # Linux + NVIDIA
+  --model-path /path/to/Qwen3.5-4B --port 8000                   # Linux + NVIDIA
 ```
 
 ### 3. Talk to it
@@ -91,7 +91,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
 print(client.chat.completions.create(
-    model="qwen3-4b",
+    model="qwen3.5-4b",
     messages=[{"role": "user", "content": "Hello from ARLE"}],
 ).choices[0].message.content)
 ```
@@ -103,7 +103,7 @@ More copy-paste paths: [`examples/`](examples/).
 
 ```bash
 arle                                                       # interactive REPL with built-in tools
-arle --model-path /path/to/Qwen3-4B run --prompt "Summarize this repo"   # one-shot
+arle --model-path /path/to/Qwen3.5-4B run --prompt "Summarize this repo"   # one-shot
 arle --doctor --json                                       # self-check, machine-readable
 ```
 
@@ -120,12 +120,12 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 
 | Backend | Platform | Status | Notes |
 |---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, CUDA Graph decode. L4 / Qwen3-4B BF16 + FP8 KV: **197 tok/s @ c=16 / 4k-in**. |
+| **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, CUDA Graph decode. L4 / Qwen3.5-4B BF16 + FP8 KV: **197 tok/s @ c=16 / 4k-in**. |
 | **Metal** | Apple Silicon | **Beta** | Scheduler-backed serving, chunked prefill, replay prefix reuse. Qwen3.5-0.8B MLX-4bit step-driver: **305.5 tok/s** on M4 Pro 20c. |
-| **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16: **5.9× decode**; Qwen3.5-4B-4bit bit-identical, c=1..8. |
+| **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3.5. Qwen3.5-4B-4bit bit-identical, c=1..8. |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a perf target. |
 
-Models: **Qwen3 (0.6B – 72B)** and **Qwen3.5 family** (incl. 0.8B GGUF Q4_K_M and 4B hybrid attention) on CUDA + Metal. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA stubbed. Next-model queue: **DeepSeek V4 (#1)** → **Qwen 3.6 (#2)**, see [ROADMAP.md](ROADMAP.md#next-model-priority-order). DeepSeek V2/V3/R1 intentionally out of scope.
+Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B; dense, hybrid linear-attn, and MoE; GGUF Q4_K_M and 4B hybrid attention) on CUDA + Metal. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA stubbed. Next-model queue: **DeepSeek V4 (#1)** → **Qwen 3.6 (#2)**, see [ROADMAP.md](ROADMAP.md#next-model-priority-order). DeepSeek V2/V3/R1 intentionally out of scope.
 
 Authoritative matrix (HTTP API tiers, quantization, agent / train / eval surfaces): [docs/support-matrix.md](docs/support-matrix.md).
 Stability tiers: [docs/stability-policy.md](docs/stability-policy.md).

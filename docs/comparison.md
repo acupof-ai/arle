@@ -9,13 +9,13 @@ this page summarizes.
 > on consumer machines and edge devices. Pick **ARLE** if you specifically
 > want a Rust runtime where serving, the local agent loop, and the train / RL
 > stack share one set of model + scheduler code paths, and you are working on
-> Qwen3 / Qwen3.5 today.
+> Qwen3.5 today.
 
 ## What ARLE is not
 
 ARLE is **not** a drop-in vLLM replacement. As of 2026-04-27 the supported-
-model list is short (Qwen3 0.6B–72B and the current Qwen3.5 family paths,
-including 0.8B GGUF Q4_K_M and 4B); see
+model list is short (Qwen3.5 family — 0.8B / 4B / 30B-A3B / 35B dense, hybrid
+linear-attn, and MoE paths, including 0.8B GGUF Q4_K_M and 4B); see
 [support-matrix.md](support-matrix.md). If "support 50 model families on day
 one" is on your requirements list, use vLLM.
 
@@ -27,7 +27,7 @@ candle or directly at PyTorch.
 
 | | Language | Models | Multi-turn KV reuse | Train / RL surface | Best fit |
 |---|---|---|---|---|---|
-| **ARLE** | Pure Rust | Qwen3 / Qwen3.5 | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree (`arle train pretrain/sft/grpo/multi-turn/eval`) | Rust shops; agent / RL workloads on Qwen3 family that pay a heavy prefill tax per turn |
+| **ARLE** | Pure Rust | Qwen3.5 family | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree (`arle train pretrain/sft/grpo/multi-turn/eval`) | Rust shops; agent / RL workloads on Qwen3.5 family that pay a heavy prefill tax per turn |
 | **vLLM** | Python (CUDA / ROCm) | Broad (Llama, Qwen, Mistral, DeepSeek, …) | PagedAttention + prefix cache | Separate (vLLM serves; train is your problem) | Production Python serving with a wide model menu |
 | **SGLang** | Python | Broad | RadixAttention prefix tree | Structured generation / multi-step prompting strengths | Python serving with structured / agent prompting |
 | **mistral.rs** | Pure Rust | Broad (multimodal too) | KV cache + prefix cache | Inference-focused | Rust serving with broad model coverage |
@@ -77,8 +77,8 @@ shows. Read each project's own docs before committing.
 
 ## When to pick ARLE specifically
 
-- You are building or evaluating an **agent / RL** workload on **Qwen3 or
-  Qwen3.5** and want serving + rollout / training to share runtime code.
+- You are building or evaluating an **agent / RL** workload on **Qwen3.5**
+  and want serving + rollout / training to share runtime code.
 - You want a **pure-Rust serving binary** (`infer`) that you can embed
   without a Python sidecar.
 - You are on **Apple Silicon** and want a runtime where Metal is a

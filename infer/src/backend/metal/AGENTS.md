@@ -28,7 +28,7 @@ metal.rs                — MetalBackend, InferenceBackend + StreamingInferenceB
 metal/config.rs         — MetalModelConfig, quant config parsing (serde)
 metal/loader.rs         — safetensors → MLX unified memory
 metal/weights.rs        — MetalWeights, projection fusion, tensor merging
-metal/forward.rs        — rust_transformer_layer (Qwen3 path)
+metal/forward.rs        — rust_transformer_layer (legacy generic Rust fallback path)
 metal/qwen35.rs + metal/qwen35/   — Qwen3.5 path (delegates to mlx-sys C++ step model). Sub-dir currently holds the qwen35 test split (`tests.rs`); add Qwen3.5-only Rust glue here, never inside `forward.rs`.
 metal/ops.rs            — MLX-backed linear, extend_kv_cache, clear_metal_cache
 metal/mlx.rs            — thin mlx-sys wrappers (MlxArray, slice, take_axis, eval, rms_norm, build_varlen_decode_mask, …)
@@ -74,13 +74,11 @@ metal/request_state.rs + metal/request_state/  — `MetalRequestState` per-reque
    `CachedQwen35DecodeBatch` (`runtime.rs`) with `retain_rows` (shrink) +
    `admit_rows` (prefix-preserving grow via `admit_row_indices`) and
    supports variable-length rows via a shared `batch_cache_len` cursor plus
-   per-row `left_padding`. Qwen3 batched decode still goes through
-   `MetalRequestState::decode_batch` → `decode_qwen3_batch` and still
-   requires same-length rows.
-5. **Qwen3 and Qwen3.5 take different paths.** Qwen3 runs through the Rust
-   `rust_transformer_layer` path in `forward.rs`. Qwen3.5 delegates to the
-   dedicated C++ step model in `qwen35.rs` + `mlx-sys/src/mlx_qwen35_model.cpp`
-   — don't mix them.
+   per-row `left_padding`.
+5. **Qwen3.5 has its own dedicated path.** Qwen3.5 delegates to the
+   dedicated C++ step model in `qwen35.rs` + `mlx-sys/src/mlx_qwen35_model.cpp`;
+   `forward.rs::rust_transformer_layer` is a legacy generic Rust fallback
+   that should not be mixed in.
 6. **DFlash (speculative decode) is experimental and optional.** Guarded by
    `MetalDflashOptions`; empty draft model = feature off. See
    `docs/resources/metal-dflash.md` for user-facing flags. DFlash dispatches

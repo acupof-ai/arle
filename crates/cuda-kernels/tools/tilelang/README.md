@@ -105,7 +105,7 @@ The smoke imports TileLang from that checkout, lowers ARLE's in-tree
 TileLang Metal `T.gemm` kernel on MPS. For a full local server/bench loop:
 
 ```bash
-scripts/tilelang_metal_dev_backend.sh bench models/Qwen3-0.6B 8765
+scripts/tilelang_metal_dev_backend.sh bench models/Qwen3.5-0.8B 8765
 ```
 
 This is a Metal dev gate for the local TileLang checkout. The production

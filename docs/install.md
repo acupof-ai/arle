@@ -85,7 +85,7 @@ rm -f ~/.local/bin/arle ~/.local/bin/metal_serve ~/.local/bin/infer ~/.local/bin
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 \
-  -v /path/to/Qwen3-4B:/model:ro \
+  -v /path/to/Qwen3.5-4B:/model:ro \
   ghcr.io/cklxx/arle:latest \
   serve --backend cuda --model-path /model --port 8000
 ```
