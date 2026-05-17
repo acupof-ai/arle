@@ -1073,6 +1073,160 @@ impl Backend for CudaBackend {
             )
         }
     }
+
+    /// Wave 2.1: device-resident backward for `silu(x)`. Single 1D NVRTC
+    /// kernel `dx[i] = upstream[i] * silu'(x[i])`; both `upstream` and the
+    /// saved input `x` stay on-device. Returned handle is unevaluated.
+    fn silu_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, x, shape);
+            todo!("GPU required: cuda silu_backward_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_silu_backward_device(self, upstream, x, shape)
+        }
+    }
+
+    /// Wave 2.1: device-resident backward for `gelu(x)` (erf form).
+    fn gelu_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, x, shape);
+            todo!("GPU required: cuda gelu_backward_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_gelu_backward_device(self, upstream, x, shape)
+        }
+    }
+
+    /// Wave 2.1: device-resident backward for `sigmoid(x)`. Consumes the
+    /// saved output `y`: `dx[i] = upstream[i] * y[i] * (1 - y[i])`.
+    fn sigmoid_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        y: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, y, shape);
+            todo!("GPU required: cuda sigmoid_backward_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_sigmoid_backward_device(self, upstream, y, shape)
+        }
+    }
+
+    /// Wave 2.1: device-resident backward for `exp(x)`. Consumes the saved
+    /// output `y = exp(x)`: `dx[i] = upstream[i] * y[i]`.
+    fn exp_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        y: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, y, shape);
+            todo!("GPU required: cuda exp_backward_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_exp_backward_device(self, upstream, y, shape)
+        }
+    }
+
+    /// Wave 2.1: device-resident backward for `mul(a, b)`. Two 1D NVRTC
+    /// kernels — one per side — gated by `need_grad_a` / `need_grad_b`.
+    fn mul_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        a: &DeviceHandle,
+        b: &DeviceHandle,
+        shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, a, b, shape, need_grad_a, need_grad_b);
+            todo!("GPU required: cuda mul_backward_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_mul_backward_device(self, upstream, a, b, shape, need_grad_a, need_grad_b)
+        }
+    }
+
+    /// Wave 2.1: device-resident backward for `rms_norm`. Three NVRTC
+    /// kernels: per-row `inv_rms`, per-row `grad_x` with shared-mem `dot`
+    /// reduction, per-col `grad_w` reduction.
+    fn rms_norm_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x: &DeviceHandle,
+        weight: &DeviceHandle,
+        shape: &[usize],
+        eps: f32,
+        need_grad_x: bool,
+        need_grad_w: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, x, weight, shape, eps, need_grad_x, need_grad_w);
+            todo!(
+                "GPU required: cuda rms_norm_backward_device is unavailable under feature no-cuda"
+            )
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_rms_norm_backward_device(
+                self,
+                upstream,
+                x,
+                weight,
+                shape,
+                eps,
+                need_grad_x,
+                need_grad_w,
+            )
+        }
+    }
+
+    /// Wave 2.1: device-resident backward for `rope`. Single NVRTC kernel
+    /// — same body as `rope_f32` with the `sin` sign inlined-negated.
+    /// `cos`/`sin` are uploaded fresh (tiny: `[seq, head_dim/2]`).
+    fn rope_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        x_shape: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, x_shape, cos, sin);
+            todo!("GPU required: cuda rope_backward_device is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_rope_backward_device(self, upstream, x_shape, cos, sin)
+        }
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -2976,5 +3130,420 @@ fn cuda_add_broadcast_backward_device(
         },
     )?;
 
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+// Wave 2.1: shared helper for the 4 elementwise activation/exp backward
+// ops. All consume one extra device buffer (`saved`, either x or y) plus
+// `upstream`; output is the same `shape`. Returned handle is unevaluated
+// per the M5.3b.11 batched-eval contract.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_elementwise_backward_with_saved(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    saved: &DeviceHandle,
+    shape: &[usize],
+    kernel_name: &'static str,
+    op_label: &'static str,
+) -> Result<DeviceHandle> {
+    let d_up = backend.cuda_slice(upstream, op_label)?;
+    let d_saved = backend.cuda_slice(saved, op_label)?;
+    let size = shape_size(shape);
+    if d_up.len() != size || d_saved.len() != size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_up.len().min(d_saved.len()),
+            shape: shape.to_vec(),
+            size,
+        });
+    }
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    let n = i32::try_from(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda activation_backward length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        size,
+        |mut builder| {
+            builder.arg(&mut d_out).arg(d_up).arg(d_saved).arg(&n);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_silu_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    x: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    cuda_elementwise_backward_with_saved(
+        backend,
+        upstream,
+        x,
+        shape,
+        "silu_backward_f32",
+        "silu_backward_device",
+    )
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_gelu_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    x: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    cuda_elementwise_backward_with_saved(
+        backend,
+        upstream,
+        x,
+        shape,
+        "gelu_backward_f32",
+        "gelu_backward_device",
+    )
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_sigmoid_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    y: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    cuda_elementwise_backward_with_saved(
+        backend,
+        upstream,
+        y,
+        shape,
+        "sigmoid_backward_f32",
+        "sigmoid_backward_device",
+    )
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_exp_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    y: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    cuda_elementwise_backward_with_saved(
+        backend,
+        upstream,
+        y,
+        shape,
+        "exp_backward_f32",
+        "exp_backward_device",
+    )
+}
+
+// Wave 2.1: device-resident backward for `mul(a, b)`. Two independent 1D
+// NVRTC kernels, each gated by `need_grad_*` so the unused side is never
+// launched (mirrors `matmul_backward_device`'s short-circuit). Returned
+// handles are unevaluated.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_mul_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    a: &DeviceHandle,
+    b: &DeviceHandle,
+    shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+    if !need_grad_a && !need_grad_b {
+        return Ok((None, None));
+    }
+    let d_up = backend.cuda_slice(upstream, "mul_backward_device")?;
+    let d_a = backend.cuda_slice(a, "mul_backward_device")?;
+    let d_b = backend.cuda_slice(b, "mul_backward_device")?;
+    let size = shape_size(shape);
+    if d_up.len() != size || d_a.len() != size || d_b.len() != size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_up.len().min(d_a.len()).min(d_b.len()),
+            shape: shape.to_vec(),
+            size,
+        });
+    }
+    let n = i32::try_from(size)
+        .map_err(|_| AutogradError::TapeInvariant("cuda mul_backward length exceeds i32"))?;
+
+    let grad_a = if need_grad_a {
+        let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (mul_backward grad_a)")
+        })?;
+        launch_1d(
+            &backend.stream,
+            backend.kernels.function("mul_backward_lhs_f32")?,
+            size,
+            |mut builder| {
+                builder.arg(&mut d_out).arg(d_up).arg(d_b).arg(&n);
+                builder
+            },
+        )?;
+        Some(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+    } else {
+        None
+    };
+    let grad_b = if need_grad_b {
+        let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (mul_backward grad_b)")
+        })?;
+        launch_1d(
+            &backend.stream,
+            backend.kernels.function("mul_backward_rhs_f32")?,
+            size,
+            |mut builder| {
+                builder.arg(&mut d_out).arg(d_up).arg(d_a).arg(&n);
+                builder
+            },
+        )?;
+        Some(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+    } else {
+        None
+    };
+    Ok((grad_a, grad_b))
+}
+
+// Wave 2.1: device-resident backward for `rms_norm`. Three kernels:
+//   1. `rms_norm_inv_rms_f32` — one block per row, reduces sum_sq and
+//      emits `inv_rms[rows]` to a device scratch buffer.
+//   2. `rms_norm_backward_x_f32` — one block per row, consumes the saved
+//      `inv_rms` and reduces `dot` (one shared-mem reduction).
+//   3. `rms_norm_backward_w_f32` — one block per column, accumulates
+//      `upstream * x * inv_rms` across rows and reduces to grad_w.
+// Returned handles are unevaluated; the terminal `eval` belongs to the
+// caller.
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_rms_norm_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    x: &DeviceHandle,
+    weight: &DeviceHandle,
+    shape: &[usize],
+    eps: f32,
+    need_grad_x: bool,
+    need_grad_w: bool,
+) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+    if !need_grad_x && !need_grad_w {
+        return Ok((None, None));
+    }
+    let hidden = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if hidden == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let total = shape_size(shape);
+    let rows = total / hidden;
+
+    let d_up = backend.cuda_slice(upstream, "rms_norm_backward_device")?;
+    let d_x = backend.cuda_slice(x, "rms_norm_backward_device")?;
+    let d_w = backend.cuda_slice(weight, "rms_norm_backward_device")?;
+    if d_up.len() != total || d_x.len() != total || d_w.len() != hidden {
+        return Err(AutogradError::ShapeMismatch {
+            expected: shape.to_vec(),
+            got: vec![d_up.len()],
+        });
+    }
+
+    // Phase 1: inv_rms scratch buffer.
+    let mut d_inv = backend
+        .stream
+        .alloc_zeros::<f32>(rows.max(1))
+        .map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward inv_rms)")
+        })?;
+    if rows > 0 {
+        let cols_i = i32::try_from(hidden)
+            .map_err(|_| AutogradError::TapeInvariant("cuda rms_norm_backward cols exceeds i32"))?;
+        const BLOCK: u32 = 256;
+        const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+        launch_rows(
+            &backend.stream,
+            backend.kernels.function("rms_norm_inv_rms_f32")?,
+            rows,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder.arg(&mut d_inv).arg(d_x).arg(&cols_i).arg(&eps);
+                builder
+            },
+        )?;
+    }
+
+    let grad_x = if need_grad_x {
+        let mut d_grad = backend.stream.alloc_zeros::<f32>(total).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_x)")
+        })?;
+        if rows > 0 {
+            let cols_i = i32::try_from(hidden).map_err(|_| {
+                AutogradError::TapeInvariant("cuda rms_norm_backward cols exceeds i32")
+            })?;
+            const BLOCK: u32 = 256;
+            const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+            launch_rows(
+                &backend.stream,
+                backend.kernels.function("rms_norm_backward_x_f32")?,
+                rows,
+                BLOCK,
+                SHARED,
+                |mut builder| {
+                    builder
+                        .arg(&mut d_grad)
+                        .arg(d_up)
+                        .arg(d_x)
+                        .arg(d_w)
+                        .arg(&d_inv)
+                        .arg(&cols_i);
+                    builder
+                },
+            )?;
+        }
+        Some(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+    } else {
+        None
+    };
+
+    let grad_w = if need_grad_w {
+        let mut d_grad = backend.stream.alloc_zeros::<f32>(hidden).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_w)")
+        })?;
+        if rows > 0 && hidden > 0 {
+            let rows_i = i32::try_from(rows).map_err(|_| {
+                AutogradError::TapeInvariant("cuda rms_norm_backward rows exceeds i32")
+            })?;
+            let cols_i = i32::try_from(hidden).map_err(|_| {
+                AutogradError::TapeInvariant("cuda rms_norm_backward cols exceeds i32")
+            })?;
+            const BLOCK: u32 = 256;
+            const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+            launch_rows(
+                &backend.stream,
+                backend.kernels.function("rms_norm_backward_w_f32")?,
+                hidden,
+                BLOCK,
+                SHARED,
+                |mut builder| {
+                    builder
+                        .arg(&mut d_grad)
+                        .arg(d_up)
+                        .arg(d_x)
+                        .arg(&d_inv)
+                        .arg(&rows_i)
+                        .arg(&cols_i);
+                    builder
+                },
+            )?;
+        }
+        Some(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+    } else {
+        None
+    };
+
+    Ok((grad_x, grad_w))
+}
+
+// Wave 2.1: device-resident backward for `rope`. Same launch shape as
+// `cuda_rope` (one block per (batch, head, token); block=min(half_dim,256)).
+// Only difference vs the forward kernel is the inlined `sin -> -sin` sign
+// flip — `cpu_rope_backward` does the equivalent via a host
+// `neg_forward(sin) → cpu_rope_forward` chain. cos/sin upload fresh every
+// call (tiny: `[seq, head_dim/2]` per call).
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_rope_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    x_shape: &[usize],
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<DeviceHandle> {
+    if x_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: x_shape.len(),
+        });
+    }
+    let batch = x_shape[0];
+    let heads = x_shape[1];
+    let seq = x_shape[2];
+    let head_dim = x_shape[3];
+    if !head_dim.is_multiple_of(2) {
+        return Err(AutogradError::InvalidRank {
+            expected: "even head dim",
+            got: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    let total = batch * heads * seq * head_dim;
+    let d_up = backend.cuda_slice(upstream, "rope_backward_device")?;
+    if d_up.len() != total {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![total],
+            got: vec![d_up.len()],
+        });
+    }
+    let cache_len = seq * half_dim;
+    if cos.len() != cache_len || sin.len() != cache_len {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![cache_len],
+            got: vec![cos.len().min(sin.len())],
+        });
+    }
+
+    let d_cos = backend
+        .stream
+        .clone_htod(cos)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (rope_backward cos)"))?;
+    let d_sin = backend
+        .stream
+        .clone_htod(sin)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (rope_backward sin)"))?;
+    let mut d_grad = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope_backward)"))?;
+
+    let batch_i = i32::try_from(batch)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward batch exceeds i32"))?;
+    let heads_i = i32::try_from(heads)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward heads exceeds i32"))?;
+    let seq_i = i32::try_from(seq)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward seq exceeds i32"))?;
+    let head_dim_i = i32::try_from(head_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward head_dim exceeds i32"))?;
+
+    let rows = batch * heads * seq;
+    let block = std::cmp::min(half_dim, 256) as u32;
+    let block = block.max(1);
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("rope_backward_f32")?,
+        rows,
+        block,
+        0,
+        |mut builder| {
+            builder
+                .arg(&mut d_grad)
+                .arg(d_up)
+                .arg(&d_cos)
+                .arg(&d_sin)
+                .arg(&batch_i)
+                .arg(&heads_i)
+                .arg(&seq_i)
+                .arg(&head_dim_i);
+            builder
+        },
+    )?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
 }

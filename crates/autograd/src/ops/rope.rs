@@ -163,24 +163,57 @@ pub(crate) fn rope_backward(
     };
 
     let x_shape = store.tensor(x)?.shape.clone();
+    // cos/sin are host caches — ensure_host is a no-op on the canonical
+    // path (caller seeds them host-side). Reading host data here matches
+    // the forward's contract.
+    store.ensure_host(cos)?;
+    store.ensure_host(sin)?;
     let cos_tensor = store.tensor_host(cos)?;
     let sin_tensor = store.tensor_host(sin)?;
     validate_shapes(&x_shape, &cos_tensor.shape, &sin_tensor.shape)?;
-
-    let upstream = store.tensor_host(output_grad_id)?;
-    if upstream.shape != x_shape {
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if upstream_shape != x_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: x_shape.clone(),
-            got: upstream.shape,
+            got: upstream_shape,
         });
     }
 
-    // rope backward is rope forward with sin negated:
+    // Wave 2.1: route through `rope_backward_device` whenever upstream is
+    // device-resident and the rotary-dim covers the full head (the CUDA
+    // kernel requires that). Pre-2.1 this op did `tensor_host(upstream)
+    // → backend.rope_forward(host, ...)`, demoting every layer's q/k
+    // grad to host immediately after `mul_scalar_backward_device` /
+    // `matmul_backward_device` had kept it on-device.
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && cos_tensor.shape[1] * 2 == x_shape[3]
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle = store.backend().rope_backward_device(
+            &upstream_handle,
+            &x_shape,
+            &cos_tensor.data,
+            &sin_tensor.data,
+        )?;
+        let grad_id = store.alloc_device_tensor(x_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
+
+    // Host fallback (CPU/Metal default). rope backward is rope forward
+    // with sin negated:
     //   forward:  y0 = x0*cos - x1*sin,   y1 = x1*cos + x0*sin
     //   backward: gx0 = gy0*cos + gy1*sin, gx1 = gy1*cos - gy0*sin
     //           = rope_forward(gy, cos, -sin)
-    // Negate on the CPU (cheap; cache only; tiny compared to the 4-D rotation)
-    // then dispatch through the backend so Metal / CUDA accelerate the bulk op.
+    let upstream = store.tensor_host(output_grad_id)?;
     let neg_sin = store.backend().neg_forward(&sin_tensor.data)?;
     let grad_x = if cos_tensor.shape[1] * 2 == x_shape[3] {
         store

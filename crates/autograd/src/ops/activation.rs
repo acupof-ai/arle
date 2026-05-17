@@ -316,15 +316,52 @@ pub(crate) fn exp_backward(
         ));
     };
 
-    let output = store.tensor_host(y_id)?;
-    let upstream = store.tensor_host(output_grad_id)?;
-    if output.shape != upstream.shape {
+    // Wave 2.1: route the (upstream, saved-output) pair through
+    // `exp_backward_device` when both tensors are device-resident. Pre-2.1
+    // this op did `tensor_host(y) + tensor_host(upstream) → mul_forward →
+    // alloc`, which (via `tensor_host`'s `ensure_host`) demoted the saved
+    // output from Dirty::Device → Dirty::Both, poisoning every downstream
+    // op that re-read `y`. Keeping both on-device keeps the post-P3.1
+    // backward chain unbroken.
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    let y_shape = store.tensor(y_id)?.shape.clone();
+    if y_shape != upstream_shape {
         return Err(AutogradError::ShapeMismatch {
-            expected: output.shape,
-            got: upstream.shape,
+            expected: y_shape,
+            got: upstream_shape,
         });
     }
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        let saved = store.tensor(y_id)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && saved.dirty != Dirty::Host
+            && saved.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let y_handle = store
+            .tensor(y_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle =
+            store
+                .backend()
+                .exp_backward_device(&upstream_handle, &y_handle, &y_shape)?;
+        let grad_id = store.alloc_device_tensor(y_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
 
+    let output = store.tensor_host(y_id)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     let grad = store.backend().mul_forward(&output.data, &upstream.data)?;
     let grad_id = store.alloc(Tensor::new(grad, output.shape, false)?);
     Ok(smallvec![(x, grad_id)])
@@ -344,15 +381,47 @@ pub(crate) fn gelu_backward(
         return Ok(GradPairs::new());
     }
 
-    let input = store.tensor_host(x)?;
-    let upstream = store.tensor_host(output_grad_id)?;
-    if input.shape != upstream.shape {
+    // Wave 2.1: route through `gelu_backward_device` whenever upstream and
+    // saved input are both device-resident.
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    let x_shape = store.tensor(x)?.shape.clone();
+    if x_shape != upstream_shape {
         return Err(AutogradError::ShapeMismatch {
-            expected: input.shape,
-            got: upstream.shape,
+            expected: x_shape,
+            got: upstream_shape,
         });
     }
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        let saved = store.tensor(x)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && saved.dirty != Dirty::Host
+            && saved.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let x_handle = store
+            .tensor(x)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle =
+            store
+                .backend()
+                .gelu_backward_device(&upstream_handle, &x_handle, &x_shape)?;
+        let grad_id = store.alloc_device_tensor(x_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
 
+    let input = store.tensor_host(x)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     let grad = input
         .data
         .iter()
@@ -382,15 +451,47 @@ pub(crate) fn silu_backward(
         return Ok(GradPairs::new());
     }
 
-    let input = store.tensor_host(x)?;
-    let upstream = store.tensor_host(output_grad_id)?;
-    if input.shape != upstream.shape {
+    // Wave 2.1: route through `silu_backward_device` whenever upstream and
+    // saved input are both device-resident.
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    let x_shape = store.tensor(x)?.shape.clone();
+    if x_shape != upstream_shape {
         return Err(AutogradError::ShapeMismatch {
-            expected: input.shape,
-            got: upstream.shape,
+            expected: x_shape,
+            got: upstream_shape,
         });
     }
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        let saved = store.tensor(x)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && saved.dirty != Dirty::Host
+            && saved.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let x_handle = store
+            .tensor(x)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle =
+            store
+                .backend()
+                .silu_backward_device(&upstream_handle, &x_handle, &x_shape)?;
+        let grad_id = store.alloc_device_tensor(x_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
 
+    let input = store.tensor_host(x)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     let grad = input
         .data
         .iter()
@@ -424,15 +525,47 @@ pub(crate) fn sigmoid_backward(
         ));
     };
 
-    let output = store.tensor_host(y)?;
-    let upstream = store.tensor_host(output_grad_id)?;
-    if output.shape != upstream.shape {
+    // Wave 2.1: route through `sigmoid_backward_device` whenever upstream
+    // and saved output are both device-resident.
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    let y_shape = store.tensor(y)?.shape.clone();
+    if y_shape != upstream_shape {
         return Err(AutogradError::ShapeMismatch {
-            expected: output.shape,
-            got: upstream.shape,
+            expected: y_shape,
+            got: upstream_shape,
         });
     }
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        let saved = store.tensor(y)?;
+        upstream.dirty != Dirty::Host
+            && upstream.device_handle.is_some()
+            && saved.dirty != Dirty::Host
+            && saved.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let y_handle = store
+            .tensor(y)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle =
+            store
+                .backend()
+                .sigmoid_backward_device(&upstream_handle, &y_handle, &y_shape)?;
+        let grad_id = store.alloc_device_tensor(y_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
 
+    let output = store.tensor_host(y)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     let grad = output
         .data
         .iter()
