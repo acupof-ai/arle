@@ -176,13 +176,14 @@ impl AdamW {
                 }
             }
 
+            let step_size = self.lr / bc1;
+            let inv_bc2 = 1.0 / bc2;
             for index in 0..param.data.len() {
                 let g = grad[index];
                 m[index] = (beta1 * m[index]) + ((1.0 - beta1) * g);
                 v[index] = (beta2 * v[index]) + ((1.0 - beta2) * g * g);
-                let m_hat = m[index] / bc1;
-                let v_hat = v[index] / bc2;
-                param.data[index] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                let denom = (v[index] * inv_bc2).sqrt() + self.eps;
+                param.data[index] -= step_size * m[index] / denom;
             }
         }
     }
