@@ -625,18 +625,18 @@ impl LayerCommunicator {
         buffer: &mut cudarc::driver::CudaSlice<half::bf16>,
         len: usize,
     ) -> Result<LayerCommStatus> {
-        if len != buffer.len() {
-            bail!(
-                "{collective:?} buffer len {} does not match logical len {len}",
-                buffer.len()
-            );
-        }
         let world_size = match axis {
             ParallelAxis::Tensor => self.tp_world_size,
             ParallelAxis::Expert => self.ep_world_size,
         };
         if world_size == 1 {
             return Ok(LayerCommStatus::NoopSingleRank);
+        }
+        if len != buffer.len() {
+            bail!(
+                "{collective:?} buffer len {} does not match logical len {len}",
+                buffer.len()
+            );
         }
         #[cfg(feature = "nccl")]
         {
