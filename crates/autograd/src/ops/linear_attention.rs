@@ -66,14 +66,14 @@ pub fn linear_attention_core(
         store.ensure_host(tensor_id)?;
     }
 
-    let qkv_tensor = store.tensor(qkv)?.clone();
-    let z_tensor = store.tensor(z)?.clone();
-    let b_tensor = store.tensor(b_proj)?.clone();
-    let a_tensor = store.tensor(a_proj)?.clone();
-    let conv_tensor = store.tensor(conv1d_weight)?.clone();
-    let dt_tensor = store.tensor(dt_bias)?.clone();
-    let a_log_tensor = store.tensor(a_log)?.clone();
-    let norm_tensor = store.tensor(norm_weight)?.clone();
+    let qkv_tensor = store.tensor_host(qkv)?;
+    let z_tensor = store.tensor_host(z)?;
+    let b_tensor = store.tensor_host(b_proj)?;
+    let a_tensor = store.tensor_host(a_proj)?;
+    let conv_tensor = store.tensor_host(conv1d_weight)?;
+    let dt_tensor = store.tensor_host(dt_bias)?;
+    let a_log_tensor = store.tensor_host(a_log)?;
+    let norm_tensor = store.tensor_host(norm_weight)?;
 
     let forward = linear_attention_forward(
         &qkv_tensor.data,
@@ -206,15 +206,15 @@ pub(crate) fn linear_attention_backward(
         store.ensure_host(tensor_id)?;
     }
 
-    let upstream = store.tensor(output_grad_id)?.clone();
-    let qkv_tensor = store.tensor(qkv)?.clone();
-    let z_tensor = store.tensor(z)?.clone();
-    let b_tensor = store.tensor(b_proj)?.clone();
-    let a_tensor = store.tensor(a_proj)?.clone();
-    let conv_tensor = store.tensor(conv1d_weight)?.clone();
-    let dt_tensor = store.tensor(dt_bias)?.clone();
-    let a_log_tensor = store.tensor(a_log)?.clone();
-    let norm_tensor = store.tensor(norm_weight)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
+    let qkv_tensor = store.tensor_host(qkv)?;
+    let z_tensor = store.tensor_host(z)?;
+    let b_tensor = store.tensor_host(b_proj)?;
+    let a_tensor = store.tensor_host(a_proj)?;
+    let conv_tensor = store.tensor_host(conv1d_weight)?;
+    let dt_tensor = store.tensor_host(dt_bias)?;
+    let a_log_tensor = store.tensor_host(a_log)?;
+    let norm_tensor = store.tensor_host(norm_weight)?;
 
     let expected_shape = vec![batch, seq_len, num_value_heads * value_dim];
     if upstream.shape != expected_shape {

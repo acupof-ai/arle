@@ -141,6 +141,21 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok(())
     }
 
+    /// Whether `Tape::backward` should `flush_to_host_batch` every
+    /// device-resident tape output **before** walking backward. Metal
+    /// returns `true` because each `mlx_eval` round-trip dominates at
+    /// small shapes and batching N FFI guards into 1 is a real win.
+    /// CUDA returns `false` (default) — the batch readback there is the
+    /// 1 GB DtoH the M5.3b / Wave 1 / P1 / P2 / P3 milestones could
+    /// never kill, and per-op lazy readback is strictly cheaper because
+    /// device-resident downstream backward ops never need the host
+    /// snapshot in the first place. See
+    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`
+    /// and the P3 wins entry.
+    fn prefers_pre_backward_flush(&self) -> bool {
+        false
+    }
+
     /// Compute `C = A @ B` for rank-2 or rank-3 (batched) row-major tensors.
     /// Returns a device handle for the output plus its logical shape.
     fn matmul(

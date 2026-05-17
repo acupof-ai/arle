@@ -27,21 +27,34 @@ pub struct Tensor {
 
 impl Clone for Tensor {
     fn clone(&self) -> Self {
-        assert!(
-            self.dirty != Dirty::Device,
-            "ensure_host before cloning a device-resident tensor"
-        );
+        // P3.1 (post-Wave-1): mirror the `TensorStore::clone_tensor`
+        // discipline at the `Tensor` level — when the source is
+        // `Dirty::Device` (host data is empty/stale, the truth lives on
+        // device), preserve the `Arc`-shared `DeviceHandle` (ref-count
+        // bump, no extra alloc) instead of panicking. Callers that need
+        // host data are expected to `ensure_host` first; callers that
+        // only need shape/metadata or that route the clone back through
+        // a device path (which is the entire post-P3.1 backward chain)
+        // see a clone that still has device residency.
+        //
+        // Pre-P3.1 this asserted `dirty != Dirty::Device`. The
+        // assertion was load-bearing for the *post* M5.3b world where
+        // `Tape::backward`'s `flush_to_host_batch` made every tape output
+        // `Dirty::Both` before any clone. Once P3.1 dropped that flush
+        // on CUDA (it was the 1 GB DtoH), assorted backward ops still
+        // doing `store.tensor(x)?.clone()` (rope, rms_norm, silu, ...)
+        // hit the assert. Preserving the handle is the right fix; the
+        // host-only fallback paths inside those ops already
+        // `ensure_host(x)` before they touch `.data`.
         Self {
             data: self.data.clone(),
-            // Device handles own unique backend allocations; clones fall back
-            // to the host copy until an explicit re-upload repopulates them.
             shape: self.shape.clone(),
             strides: self.strides.clone(),
             size: self.size,
             requires_grad: self.requires_grad,
             grad: self.grad,
-            device_handle: None,
-            dirty: Dirty::Host,
+            device_handle: self.device_handle.clone(),
+            dirty: self.dirty.clone(),
         }
     }
 }
@@ -388,6 +401,19 @@ impl TensorStore {
 
     pub(crate) fn tensor_mut(&mut self, id: TensorId) -> Result<&mut Tensor> {
         self.get_mut(id).ok_or(AutogradError::InvalidTensorId(id))
+    }
+
+    /// P3.1: Read a tensor by id with `ensure_host` applied first, then
+    /// return an owned clone. This is the "I want host data" version
+    /// that op-backward host fallbacks should call instead of
+    /// `store.tensor(x)?.clone()`. Pre-P3.1, every `tensor(x)?.clone()`
+    /// was safe because `Tape::backward`'s `flush_to_host_batch` made
+    /// every tape output `Dirty::Both` before any backward op ran. With
+    /// the flush gone on CUDA, host-only backward ops have to be
+    /// explicit about their host residency requirement.
+    pub fn tensor_host(&mut self, id: TensorId) -> Result<Tensor> {
+        self.ensure_host(id)?;
+        Ok(self.tensor(id)?.clone())
     }
 
     pub(crate) fn clone_tensor(&mut self, id: TensorId) -> Result<TensorId> {

@@ -103,7 +103,7 @@ fn embedding_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let table_tensor = store.tensor(table)?.clone();
+    let table_tensor = store.tensor_host(table)?;
     if table_tensor.shape.len() != 2 {
         return Err(AutogradError::InvalidRank {
             expected: "2",
@@ -175,7 +175,7 @@ pub(crate) fn embedding_backward(
         ));
     };
 
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
     let hidden = table_shape[1];
     let expected_shape = vec![1, indices.len(), hidden];
     if upstream.shape != expected_shape {

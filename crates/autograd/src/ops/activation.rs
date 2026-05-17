@@ -60,7 +60,7 @@ fn exp_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 }
 
 fn exp_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     let output = store.backend().exp_forward(&input.data)?;
     let output_id = store.alloc(Tensor::new(
         output,
@@ -131,7 +131,7 @@ fn gelu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
 }
 
 fn gelu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     let output = input
         .data
         .iter()
@@ -206,7 +206,7 @@ fn silu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
 }
 
 fn silu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     let output = store.backend().silu_forward(&input.data)?;
     let output_id = store.alloc(Tensor::new(
         output,
@@ -277,7 +277,7 @@ fn sigmoid_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) ->
 }
 
 fn sigmoid_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     let output = store.backend().sigmoid_forward(&input.data)?;
     let output_id = store.alloc(Tensor::new(
         output,
@@ -316,8 +316,8 @@ pub(crate) fn exp_backward(
         ));
     };
 
-    let output = store.tensor(y_id)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let output = store.tensor_host(y_id)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     if output.shape != upstream.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: output.shape,
@@ -344,8 +344,8 @@ pub(crate) fn gelu_backward(
         return Ok(GradPairs::new());
     }
 
-    let input = store.tensor(x)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let input = store.tensor_host(x)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     if input.shape != upstream.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: input.shape,
@@ -382,8 +382,8 @@ pub(crate) fn silu_backward(
         return Ok(GradPairs::new());
     }
 
-    let input = store.tensor(x)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let input = store.tensor_host(x)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     if input.shape != upstream.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: input.shape,
@@ -424,8 +424,8 @@ pub(crate) fn sigmoid_backward(
         ));
     };
 
-    let output = store.tensor(y)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let output = store.tensor_host(y)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     if output.shape != upstream.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: output.shape,

@@ -111,7 +111,7 @@ fn gather_last_dim_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let src_tensor = store.tensor(src)?.clone();
+    let src_tensor = store.tensor_host(src)?;
     if src_tensor.shape.is_empty() {
         return Err(AutogradError::InvalidRank {
             expected: "at least 1",
@@ -221,7 +221,7 @@ pub(crate) fn gather_last_dim_backward(
     // target to `[prefix_rows * vocab]` and dispatch a single scatter-add
     // with remapped flat ids `i * vocab + original_indices[i]` — one
     // trait call, one host or single-GPU launch.
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
     let vocab = *src_shape.last().ok_or(AutogradError::TapeInvariant(
         "gather missing source last dim",
     ))?;

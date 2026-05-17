@@ -80,7 +80,7 @@ fn reshape_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     if shape_numel(shape) != input.size {
         return Err(AutogradError::ShapeMismatch {
             expected: input.shape,
@@ -185,7 +185,7 @@ fn transpose_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     let (data, shape) = transpose_data(&input.data, &input.shape, axis1, axis2)?;
     let output_id = store.alloc(Tensor::new(data, shape, input.requires_grad)?);
 
@@ -307,7 +307,7 @@ fn slice_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     let (data, shape) = slice_data(&input.data, &input.shape, starts, ends)?;
     let output_id = store.alloc(Tensor::new(data, shape, input.requires_grad)?);
 
@@ -345,7 +345,7 @@ pub(crate) fn reshape_backward(
             "reshape backward missing saved shape",
         ));
     };
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
     if shape_numel(&input_shape) != upstream.size {
         return Err(AutogradError::ShapeMismatch {
             expected: input_shape,
@@ -375,7 +375,7 @@ pub(crate) fn transpose_backward(
             "transpose backward missing saved axes",
         ));
     };
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
     let (data, shape) = transpose_data(&upstream.data, &upstream.shape, axis1, axis2)?;
     let grad_id = store.alloc(Tensor::new(data, shape, false)?);
     Ok(smallvec![(x, grad_id)])
@@ -405,7 +405,7 @@ pub(crate) fn slice_backward(
         ));
     };
 
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let upstream = store.tensor_host(output_grad_id)?;
     let expected_shape: Vec<usize> = starts
         .iter()
         .zip(ends.iter())

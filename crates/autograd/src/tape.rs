@@ -180,7 +180,16 @@ impl Tape {
                 })
                 .map(|entry| entry.output_id)
                 .collect();
-            store.flush_to_host_batch(&device_ids)?;
+            // P3.1: only flush all tape outputs to host upfront when the
+            // backend prefers it (Metal). On CUDA this batch readback is
+            // the 1 GB DtoH the M5.3b / Wave 1 / P1 / P2 / P3 milestones
+            // could never kill — per-op lazy readback is strictly cheaper
+            // because device-resident backward ops never need the host
+            // snapshot. See
+            // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+            if store.backend().prefers_pre_backward_flush() {
+                store.flush_to_host_batch(&device_ids)?;
+            }
 
             let mut entry_by_output = HashMap::with_capacity(self.entries.len());
             for (index, entry) in self.entries.iter().enumerate() {
@@ -201,6 +210,13 @@ impl Tape {
 
             let mut grads = HashMap::new();
             let loss_grad_id = store.fill_like(loss_id, 1.0)?;
+            // P3.1: seed the backward chain with a device-resident `1.0`
+            // when the backend has device residency. Without this the
+            // every-op `device_path_ok` gate in M5.3b / Wave 1 / P1 / P2 /
+            // P3 falls through to host fallback, because `g.dirty=Host`
+            // from the first step. The seed is scalar (4 B), so the
+            // upload cost is negligible.
+            store.ensure_device(loss_grad_id)?;
             grads.insert(loss_id, loss_grad_id);
             if store
                 .get(loss_id)

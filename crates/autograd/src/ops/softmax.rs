@@ -103,7 +103,7 @@ fn softmax_host_eager(
     tape: &mut Tape,
     kind: SoftmaxKind,
 ) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
+    let input = store.tensor_host(x)?;
     let _ = last_dim(&input.shape)?;
     let output = match kind {
         SoftmaxKind::Softmax => store
@@ -149,8 +149,8 @@ pub(crate) fn softmax_backward(
             "softmax backward missing saved output",
         ));
     };
-    let output = store.tensor(y)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let output = store.tensor_host(y)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     if output.shape != upstream.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: output.shape,
@@ -251,8 +251,8 @@ pub(crate) fn log_softmax_backward(
     // pre-Wave-1 reference and stays in lock-step with
     // `cpu_log_softmax_backward` so device + host produce byte-identical
     // grads up to fp rounding.
-    let output = store.tensor(y)?.clone();
-    let upstream = store.tensor(output_grad_id)?.clone();
+    let output = store.tensor_host(y)?;
+    let upstream = store.tensor_host(output_grad_id)?;
     let last = last_dim(&output.shape)?;
     let rows = output.data.len() / last;
     let mut grad = vec![0.0_f32; output.data.len()];
