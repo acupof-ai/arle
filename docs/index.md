@@ -28,6 +28,7 @@ live in this file.
 
 | Concern | Canonical source | Notes |
 | --- | --- | --- |
+| Strategic master (positioning, axes, kill criteria) | [projects/2026-05-07-arle-master-strategy.md](projects/2026-05-07-arle-master-strategy.md) | Cited by [`ROADMAP.md`](../ROADMAP.md) as strategic master. |
 | Support status of backends / APIs / model families / quantization | [support-matrix.md](support-matrix.md) | README and roadmap summarize only. |
 | Stability levels and compatibility posture | [stability-policy.md](stability-policy.md) | Do not redefine tiers elsewhere. |
 | Workspace topology and module entry points | [codebase-map.md](codebase-map.md) | Source of truth for "what exists today". |
@@ -91,6 +92,13 @@ marked as the current source of truth, treat it as historical context.
 | [plans/cuda-kernel-crate-extraction.md](plans/cuda-kernel-crate-extraction.md) | Reference (extraction landed; trip wires govern future splits). |
 | [plans/guidellm-integration.md](plans/guidellm-integration.md) | Canonical `guidellm` parameter set and bench wrapper contract. |
 
+## Multi-SM / Hardware Coverage
+
+| Path | Role |
+| --- | --- |
+| [plans/sm-coverage.md](plans/sm-coverage.md) | SM tier policy (T1/T2), per-SM cubin contract; referenced from CLAUDE.md build section. |
+| [plans/sm-coverage-verification.md](plans/sm-coverage-verification.md) | Runbook for retiring `pending-remote` bench stubs across A100/A10/L4/H100. |
+
 ## Operator And Policy References
 
 | Path | Role |
@@ -105,6 +113,34 @@ marked as the current source of truth, treat it as historical context.
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV-cache quantization formats and operator-side guidance |
 | [resources/infer-cuda-profiling-wrappers.md](resources/infer-cuda-profiling-wrappers.md) | `nsys` / `ncu` wrapper scripts |
 
+## Archived / Historical (kept for evidence + cross-refs)
+
+These plans and project notes are not active source of truth, but stay
+in tree because active docs link to them or they capture audit history
+worth preserving. Treat them as historical context unless a current plan
+brings them back.
+
+### Plans (archived)
+
+| Path | Why kept |
+| --- | --- |
+| [plans/2026-05-05-multi-backend-tilelang-rocm-vulkan.md](plans/2026-05-05-multi-backend-tilelang-rocm-vulkan.md) | Strix Halo / ROCm / Vulkan exploration; referenced from `backend-unification.md` and `cuda-kernel-tilelang-unification.md`. |
+| [plans/M3.5-collapse-scheduler-loops.md](plans/M3.5-collapse-scheduler-loops.md) | Structural follow-up to M3; cited by `m6-cuda-vllm-gap-followups.md`. |
+| [plans/M5-P0-modelforward-survey.md](plans/M5-P0-modelforward-survey.md) | Pre-plan survey behind the landed `m5-modelarch-trait.md`. |
+| [plans/M_medusa-phase1b-substrate-brief.md](plans/M_medusa-phase1b-substrate-brief.md) | PAUSED Qwen3/Qwen3.6 Medusa brief; superseded by `M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md` which links back to it. |
+| [plans/2026-05-10-dsv4-qwen36-substrate-audit.md](plans/2026-05-10-dsv4-qwen36-substrate-audit.md) | Phase 0 audit for DSv4 1B + Qwen3.6 CUDA substrate; predates current DSv4 readiness project. |
+
+### Projects (archived)
+
+| Path | Why kept |
+| --- | --- |
+| [projects/2026-05-07-metal-world-first-strategy.md](projects/2026-05-07-metal-world-first-strategy.md) | Consolidated 2026-05-07 Metal strategy synthesis (SOTA gap audit + unification recalibration + sequencing). Folds in three earlier same-day notes; current state pointer is ROADMAP P3 and `mlx-backend-roadmap.md`. |
+| [projects/2026-04-29-scheduler-pipeline-map.md](projects/2026-04-29-scheduler-pipeline-map.md) | End-to-end CUDA scheduler walk-through with file:line cites; referenced from `mla-kernel-design.md` and the longctx project. |
+| [projects/2026-04-29-perf-bug-roundup.md](projects/2026-04-29-perf-bug-roundup.md) | SGLang-parity perf bug ledger; cited by `bench-and-trace-spec.md` and the throughput-gap analysis. |
+| [projects/2026-04-29-throughput-gap-analysis.md](projects/2026-04-29-throughput-gap-analysis.md) | "Why we're 28% behind SGLang at c=16" snapshot; cited by the longctx project. |
+| [projects/2026-04-30-arle-vs-sglang-admission.md](projects/2026-04-30-arle-vs-sglang-admission.md) | Admission policy gap matrix; sibling to active SGLang admission research note. |
+| [projects/2026-05-02-tilekernels-integration-decision.md](projects/2026-05-02-tilekernels-integration-decision.md) | Decision record (don't-submodule, port-selectively) for `cklxx/TileKernels`; referenced from the multi-backend plan. |
+
 ## Historical Material
 
 - `docs/experience/wins/` and `docs/experience/errors/` are the curated
@@ -116,8 +152,9 @@ marked as the current source of truth, treat it as historical context.
   reference for the cuda-link audit.
 - `docs/trace-artifacts/` holds dated nsys / GPU trace artifacts (DSv4 decode
   + DeepEP, 2026-05-14 onwards).
-- Plans / projects / research / reviews not listed in the active section
-  above are historical. Anything not on this index is not a source of truth.
+- Plans / projects / research / reviews not listed above (active or archived)
+  are historical session notes. Anything not on this index is not a source
+  of truth.
 
 ## Truth-surface invariant
 
