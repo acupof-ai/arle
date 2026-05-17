@@ -204,6 +204,35 @@ pub(crate) fn mean_backward(
         return Err(AutogradError::TapeInvariant("mean backward input mismatch"));
     }
 
+    // P3: route Dirty::Device upstream through `mean_backward_device` so
+    // the scalar gradient is broadcast-scaled on-device. Pre-P3 the
+    // host fallback (readback scalar + alloc `vec![v; N]`) was the
+    // *first* host op in the CE-loss backward chain — its Dirty::Host
+    // output demoted every downstream device override (`matmul_backward_device`,
+    // `log_softmax_last_axis_backward`, `gather_last_dim_backward`,
+    // `add_into_device`) to host, dragging the full `[B, S, V] ≈ 1 GB`
+    // logits tile back through DtoH per step. See
+    // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    let input_shape = store.tensor(a)?.shape.clone();
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle =
+            store
+                .backend()
+                .mean_backward_device(&upstream_handle, &input_shape, numel)?;
+        let grad_id = store.alloc_device_tensor(input_shape, grad_handle)?;
+        return Ok(smallvec![(a, grad_id)]);
+    }
+
     let output_grad = store.tensor(output_grad_id)?;
     if output_grad.shape != Vec::<usize>::new() || output_grad.data.len() != 1 {
         return Err(AutogradError::ShapeMismatch {
@@ -212,7 +241,6 @@ pub(crate) fn mean_backward(
         });
     }
 
-    let input_shape = store.tensor(a)?.shape.clone();
     let grad_value = output_grad.data[0] / numel as f32;
     let grad_id = store.alloc(Tensor::new(vec![grad_value; numel], input_shape, false)?);
     Ok(smallvec![(a, grad_id)])

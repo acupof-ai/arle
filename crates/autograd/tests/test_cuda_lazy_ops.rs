@@ -394,6 +394,91 @@ fn cuda_matmul_backward_device_matches_cpu() {
 }
 
 #[test]
+fn cuda_mean_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_mean_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // P3 production-derivative tile: the CE-loss chain produces a rank-0
+    // scalar `mean` whose backward broadcasts `upstream / N` across
+    // `[B=2, S=512]`. Smaller than the `[B, S, V]` softmax tile but still
+    // multi-block (1024 / 256 = 4 blocks) so the launch grid is exercised.
+    let output_shape: Vec<usize> = vec![2, 512];
+    let elem_count: usize = output_shape.iter().product();
+
+    // Single-element rank-0 upstream gradient. Deterministic value so the
+    // host vs device math compares to identity.
+    let upstream_scalar: f32 = 0.375_f32;
+    let upstream_host = vec![upstream_scalar];
+
+    // Host reference: broadcast `upstream / N` across `elem_count` slots.
+    let inv_n = 1.0_f32 / elem_count as f32;
+    let host_grad: Vec<f32> = vec![upstream_scalar * inv_n; elem_count];
+
+    // Device path: rank-0 scalar upload, then `mean_backward_device`
+    // broadcasts on-device via the 1D NVRTC kernel.
+    let upstream_h: DeviceHandle = backend
+        .upload(&upstream_host, &[])
+        .expect("upload upstream scalar");
+    let grad_h = backend
+        .mean_backward_device(&upstream_h, &output_shape, elem_count)
+        .expect("cuda mean_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend.readback(&grad_h).expect("dev mean_bwd readback");
+
+    assert_eq!(dev_grad.len(), host_grad.len(), "mean_backward grad length");
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "mean_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
+
+#[test]
+fn cuda_mul_scalar_backward_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_mul_scalar_backward_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    // [N=10000] — small but multi-block (10000/256 ≈ 40 blocks) so we
+    // exercise the launch grid the same way the `add_into_device` test does.
+    let shape: Vec<usize> = vec![10_000];
+    let size: usize = shape.iter().product();
+    let scale: f32 = 0.5;
+
+    let upstream = rng_vec(0xFEED, size, 2.0);
+    let host_grad: Vec<f32> = upstream.iter().map(|u| u * scale).collect();
+
+    let upstream_h: DeviceHandle = backend.upload(&upstream, &shape).expect("upload upstream");
+    let grad_h = backend
+        .mul_scalar_backward_device(&upstream_h, scale, &shape)
+        .expect("cuda mul_scalar_backward_device");
+    backend.eval(&[&grad_h]).expect("cuda eval");
+    let dev_grad = backend
+        .readback(&grad_h)
+        .expect("dev mul_scalar_bwd readback");
+
+    assert_eq!(
+        dev_grad.len(),
+        host_grad.len(),
+        "mul_scalar_backward grad length"
+    );
+    let (excess, abs, idx) = max_err(&dev_grad, &host_grad);
+    assert!(
+        excess <= 1.0,
+        "mul_scalar_backward_device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_grad[idx],
+        host_grad[idx]
+    );
+}
+
+#[test]
 fn cuda_add_into_device_matches_cpu() {
     let Ok(backend) = CudaBackend::new(0) else {
         eprintln!("skipping cuda_add_into_device_matches_cpu: no CUDA device");

@@ -438,6 +438,71 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// P3: device-resident backward for `mul_scalar(x, k)`. Computes
+    /// `grad_x[i] = upstream[i] * k` and returns an unevaluated handle.
+    ///
+    /// The default fallback runs `readback → host multiply → upload` so
+    /// CPU/Metal inherit correct behaviour. CUDA overrides with a 1D
+    /// NVRTC kernel.
+    ///
+    /// Wires the CE-loss backward chain that P2 / Wave 1 / M5.3b.x already
+    /// device-overrode: `mul_scalar_backward` was the *first* host op in
+    /// `d_loss → mul_scalar_backward → mean_backward → gather_backward →
+    /// log_softmax_backward → matmul_backward`, so its host fallback
+    /// demoted every downstream `device_path_ok` gate to host. Keeping
+    /// this on-device unblocks the whole chain — see
+    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    fn mul_scalar_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        scale: f32,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream_grad)?;
+        let grad = self.mul_scalar_forward(&upstream_host, scale)?;
+        self.upload(&grad, shape)
+    }
+
+    /// P3: device-resident backward for `mean(x)`. The forward reduces
+    /// `elem_count = product(output_shape)` elements to a rank-0 scalar;
+    /// the backward broadcasts `upstream_grad / elem_count` across
+    /// `elem_count` slots of the returned `d_input` handle.
+    ///
+    /// `upstream_grad` must be a rank-0 scalar (shape `[]` or `[1]`).
+    /// `output_shape` is the shape of the input to the original `mean`
+    /// op (i.e. the shape of the returned `d_input`).
+    ///
+    /// The default fallback runs `readback scalar → host broadcast-scale
+    /// → upload` so CPU/Metal inherit correct behaviour. CUDA overrides
+    /// with a 1D NVRTC kernel that fetches the upstream scalar from
+    /// device memory (free L1 broadcast) and writes one slot per thread.
+    ///
+    /// Pairs with `mul_scalar_backward_device` to keep the CE-loss
+    /// backward chain device-resident — see
+    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    fn mean_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        output_shape: &[usize],
+        elem_count: usize,
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream_grad)?;
+        if upstream_host.len() != 1 {
+            return Err(crate::AutogradError::ShapeMismatch {
+                expected: Vec::new(),
+                got: vec![upstream_host.len()],
+            });
+        }
+        let inv = if elem_count == 0 {
+            0.0
+        } else {
+            1.0 / elem_count as f32
+        };
+        let value = upstream_host[0] * inv;
+        let grad = vec![value; elem_count];
+        self.upload(&grad, output_shape)
+    }
+
     /// Right-aligned broadcast-add `out[i..] = a[i..] + b[broadcast_offset(i)]`.
     ///
     /// `b_shape.len() <= a_shape.len()`. Each `b`-axis of size 1 broadcasts
