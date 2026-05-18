@@ -37,6 +37,7 @@ fn tiny_qwen35_config() -> Qwen35Config {
         shared_expert_intermediate_size: 0,
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
+        full_attn_gated: true,
     }
 }
 

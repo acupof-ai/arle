@@ -440,6 +440,20 @@ pub struct Qwen35Config {
     pub norm_topk_prob: bool,
     #[serde(default)]
     pub mlp_only_layers: Vec<usize>,
+
+    /// Whether full-attention Q projection carries a per-head sigmoid gate
+    /// fused into the projection output. Qwen3.5 / Qwen3.6 ship with the
+    /// gate (so `q_proj` rows = `num_heads * head_dim * 2`); vanilla Qwen3
+    /// (0.6B / 1.7B / 4B / 8B) does not (`q_proj` rows = `num_heads * head_dim`).
+    /// Default is `true` to preserve back-compat with existing Qwen3.5/3.6
+    /// callers; `qwen35_loader` flips it to `false` when it detects the
+    /// flat HF Qwen3 config schema.
+    #[serde(default = "default_full_attn_gated")]
+    pub full_attn_gated: bool,
+}
+
+fn default_full_attn_gated() -> bool {
+    true
 }
 
 impl Qwen35Config {
@@ -673,6 +687,11 @@ impl Qwen35Config {
             shared_expert_intermediate_size: moe_shared_expert_intermediate_size,
             norm_topk_prob: moe_norm_topk_prob,
             mlp_only_layers: moe_mlp_only_layers,
+            // qwen35-spec's HF parser is the canonical Qwen3.5 / Qwen3.6 path,
+            // where the full-attention block carries the per-head gate. The
+            // `qwen35_loader` train-side path flips this to `false` when it
+            // detects vanilla Qwen3 (flat-config schema, no `text_config`).
+            full_attn_gated: true,
         };
         config.validate()?;
         Ok(config)
@@ -808,7 +827,11 @@ impl Qwen35Config {
     }
 
     pub fn full_attn_q_proj_dim(&self) -> usize {
-        self.num_attention_heads * self.head_dim * 2
+        if self.full_attn_gated {
+            self.num_attention_heads * self.head_dim * 2
+        } else {
+            self.num_attention_heads * self.head_dim
+        }
     }
 
     pub fn full_attn_q_dim(&self) -> usize {

@@ -313,6 +313,7 @@ mod tests {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             mlp_only_layers: Vec::new(),
+            full_attn_gated: true,
         }
     }
 
