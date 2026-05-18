@@ -2,6 +2,16 @@
 
 Last updated: 2026-04-21
 
+> **Status update 2026-05-18**: the observability substrate this plan
+> defined (SharedSink + JSONL/MLflow/OTLP/W&B adapters +
+> lifecycle/artifact events + `/v1/train/*` server) **survives the
+> OPD-only pivot** and will host OPD's progress stream. The
+> per-binary `pretrain --serve` / `train_sft --serve` /
+> `train_grpo --serve` / `train_multi_turn --serve` wiring described
+> below was retired with those binaries; the same wiring is reused
+> by `arle train opd --serve` once the OPD substrate lands.
+> See [`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md).
+
 ## Goal
 
 Give the Rust training stack a single observability/export contract that:
