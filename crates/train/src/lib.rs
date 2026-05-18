@@ -20,6 +20,8 @@ pub mod loss;
 pub mod metrics;
 #[path = "model_family.rs"]
 pub mod model_family;
+#[path = "opd.rs"]
+pub mod opd;
 #[path = "qwen35.rs"]
 pub mod qwen35;
 #[path = "qwen35_checkpoint.rs"]
