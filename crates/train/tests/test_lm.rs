@@ -1,6 +1,5 @@
 use autograd::{Tape, TensorStore, optim::AdamW};
 use train::{
-    dataset::{CopyDataset, Dataset},
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
     trainer::{clip_grad_norm, cross_entropy_loss, retained_param_and_grad_ids},
 };
@@ -40,6 +39,11 @@ fn tiny_qwen35_config() -> Qwen35Config {
     }
 }
 
+fn tiny_copy_batch() -> (Vec<usize>, Vec<usize>, usize, usize) {
+    let raw = [3, 8, 15, 3, 8];
+    (raw[..4].to_vec(), raw[1..].to_vec(), 1, 4)
+}
+
 #[test]
 fn lm_copy_loss_drops_over_three_steps() {
     let mut store = TensorStore::default();
@@ -50,9 +54,7 @@ fn lm_copy_loss_drops_over_three_steps() {
     let mut losses = Vec::with_capacity(3);
 
     for _ in 0..3 {
-        let mut dataset = CopyDataset::with_vocab(1, 4, 7, 15, 15);
-        let (inputs, targets) = dataset.sample();
-        let (batch, seq_len) = dataset.batch_shape();
+        let (inputs, targets, batch, seq_len) = tiny_copy_batch();
 
         tape.entries.clear();
         tape.set_enabled(true);
