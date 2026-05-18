@@ -5,9 +5,9 @@ use std::{
 
 use autograd::{Result, SafetensorsRegistry, Tape, TensorId, TensorStore};
 
-use crate::{policy::GrpoPolicy, trainer::extend_keep_with_params_and_grads};
+use crate::trainer::extend_keep_with_params_and_grads;
 
-pub trait CausalLm: GrpoPolicy {
+pub trait CausalLm {
     fn forward_with_positions(
         &self,
         store: &mut TensorStore,
@@ -29,6 +29,8 @@ pub trait CausalLm: GrpoPolicy {
     ) -> Result<HashMap<&'static str, TensorId>> {
         Ok(self.param_name_map())
     }
+
+    fn all_parameter_ids(&self) -> Vec<TensorId>;
 }
 
 pub fn build_registry<M: CausalLm>(model: &M) -> SafetensorsRegistry {

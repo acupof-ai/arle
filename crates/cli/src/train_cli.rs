@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
-use qwen3_spec::Qwen3Config;
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
@@ -825,16 +824,8 @@ fn estimate_from_scratch(args: &TrainEstimateMemoryArgs) -> Result<EstimateMemor
         .unwrap_or(ModelFamilyArg::Qwen35)
         .as_train_family()
         .to_string();
-    let (param_count, hidden_size) = match args.model_family.unwrap_or(ModelFamilyArg::Qwen35) {
-        ModelFamilyArg::Qwen3 => (
-            qwen3_param_count(&shape.qwen3_config(vocab_size)),
-            shape.hidden,
-        ),
-        ModelFamilyArg::Auto | ModelFamilyArg::Qwen35 => (
-            qwen35_param_count(&shape.qwen35_config(vocab_size)),
-            shape.hidden,
-        ),
-    };
+    let param_count = qwen35_param_count(&shape.qwen35_config(vocab_size));
+    let hidden_size = shape.hidden;
     Ok(EstimateMemoryReport {
         mode: "scratch-pretrain".to_string(),
         family,
@@ -941,26 +932,10 @@ fn inspect_resolved_model_dir(model_dir: &Path) -> Result<ModelDirSummary> {
     }
 
     let family = match resolve_model_family(&config_path, ModelFamily::Auto)? {
-        ModelFamily::Qwen3 => "qwen3",
         ModelFamily::Qwen35 => "qwen35",
         ModelFamily::Auto => unreachable!("auto must resolve to a concrete family"),
     };
     match family {
-        "qwen3" => {
-            let cfg = Qwen3Config::from_json_file(&config_path)?;
-            Ok(ModelDirSummary {
-                family: "qwen3".to_string(),
-                config: ResolvedModelConfig::Qwen3(cfg.clone()),
-                config_path: config_path.display().to_string(),
-                tokenizer_path: existing_display_path(model_dir.join("tokenizer.json")),
-                generation_config_path: existing_display_path(
-                    model_dir.join("generation_config.json"),
-                ),
-                vocab_size: cfg.vocab_size,
-                hidden_size: cfg.hidden_size,
-                param_count: qwen3_param_count(&cfg),
-            })
-        }
         "qwen35" => {
             let cfg = Qwen35Config::from_json_file(&config_path)?;
             Ok(ModelDirSummary {
@@ -1012,24 +987,6 @@ fn resolve_local_tokenizer_path(source: &Path) -> Result<PathBuf> {
         "tokenizer source {} must be tokenizer.json or a local model dir containing tokenizer.json",
         source.display()
     );
-}
-
-fn qwen3_param_count(cfg: &Qwen3Config) -> u64 {
-    let embed = mul_u64(cfg.vocab_size, cfg.hidden_size);
-    let lm_head = if cfg.tie_word_embeddings { 0 } else { embed };
-    let attn_q = mul_u64(cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim);
-    let attn_k = mul_u64(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim);
-    let attn_v = attn_k;
-    let attn_o = mul_u64(cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size);
-    let attn_norms = mul_u64(2, cfg.head_dim);
-    let mlp = mul_u64(cfg.hidden_size, cfg.intermediate_size) * 2
-        + mul_u64(cfg.intermediate_size, cfg.hidden_size);
-    let layer_norms = mul_u64(2, cfg.hidden_size);
-    let per_layer = attn_q + attn_k + attn_v + attn_o + attn_norms + mlp + layer_norms;
-    embed
-        + lm_head
-        + (cfg.num_hidden_layers as u64).saturating_mul(per_layer)
-        + cfg.hidden_size as u64
 }
 
 fn qwen35_param_count(cfg: &Qwen35Config) -> u64 {
@@ -1150,25 +1107,6 @@ fn deepseek_v4_param_count(cfg: &DeepSeekV4Config) -> u64 {
 
 fn lora_param_count(config: &ResolvedModelConfig, rank: usize) -> u64 {
     match config {
-        ResolvedModelConfig::Qwen3(cfg) => {
-            let per_layer = lora_linear(
-                cfg.hidden_size,
-                cfg.num_attention_heads * cfg.head_dim,
-                rank,
-            ) + lora_linear(
-                cfg.hidden_size,
-                cfg.num_key_value_heads * cfg.head_dim,
-                rank,
-            ) * 2
-                + lora_linear(
-                    cfg.num_attention_heads * cfg.head_dim,
-                    cfg.hidden_size,
-                    rank,
-                )
-                + lora_linear(cfg.hidden_size, cfg.intermediate_size, rank) * 2
-                + lora_linear(cfg.intermediate_size, cfg.hidden_size, rank);
-            (cfg.num_hidden_layers as u64).saturating_mul(per_layer)
-        }
         ResolvedModelConfig::Qwen35(cfg) => {
             let common = lora_linear(cfg.hidden_size, cfg.intermediate_size, rank) * 2
                 + lora_linear(cfg.intermediate_size, cfg.hidden_size, rank);
@@ -1598,23 +1536,6 @@ impl ScratchShape {
         }
     }
 
-    fn qwen3_config(&self, vocab_size: usize) -> Qwen3Config {
-        Qwen3Config {
-            hidden_size: self.hidden,
-            intermediate_size: self.intermediate,
-            num_hidden_layers: self.layers,
-            num_attention_heads: self.heads,
-            num_key_value_heads: self.kv_heads,
-            head_dim: self.head_dim,
-            vocab_size,
-            rms_norm_eps: 1.0e-6,
-            rope_theta: 1_000_000.0,
-            rope_scaling: None,
-            tie_word_embeddings: true,
-            max_position_embeddings: self.max_pos,
-        }
-    }
-
     fn qwen35_config(&self, vocab_size: usize) -> Qwen35Config {
         let mut layer_types = vec![LayerType::FullAttention; self.layers];
         if self.linear_attn_every > 0 {
@@ -1733,7 +1654,6 @@ struct ModelDirSummary {
 
 #[derive(Debug)]
 enum ResolvedModelConfig {
-    Qwen3(Qwen3Config),
     Qwen35(Qwen35Config),
     DeepSeekV4,
 }
