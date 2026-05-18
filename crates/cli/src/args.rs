@@ -94,7 +94,6 @@ pub(crate) enum ServeBackendArg {
 pub(crate) enum ModelFamilyArg {
     Auto,
     Qwen35,
-    Qwen3,
 }
 
 impl ModelFamilyArg {
@@ -102,7 +101,6 @@ impl ModelFamilyArg {
         match self {
             Self::Auto => "auto",
             Self::Qwen35 => "qwen35",
-            Self::Qwen3 => "qwen3",
         }
     }
 }

@@ -2,16 +2,12 @@ use std::{path::Path, str::FromStr};
 
 use thiserror::Error;
 
-use crate::{
-    qwen3::Qwen3Config,
-    qwen35::{LayerType, Qwen35Config},
-};
+use crate::qwen35::{LayerType, Qwen35Config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
     Auto,
     Qwen35,
-    Qwen3,
 }
 
 impl FromStr for ModelFamily {
@@ -21,7 +17,6 @@ impl FromStr for ModelFamily {
         match value {
             "auto" => Ok(Self::Auto),
             "qwen35" | "qwen3.5" => Ok(Self::Qwen35),
-            "qwen3" => Ok(Self::Qwen3),
             _ => Err(format!("unknown model family: {value}")),
         }
     }
@@ -47,33 +42,14 @@ pub fn resolve_model_family(
         ModelFamily::Auto => {
             if Qwen35Config::from_json_file(config_path).is_ok() {
                 Ok(ModelFamily::Qwen35)
-            } else if Qwen3Config::from_json_file(config_path).is_ok() {
-                Ok(ModelFamily::Qwen3)
             } else {
                 Err(ModelFamilyError::Custom(format!(
-                    "unable to infer model family from {}; neither qwen3 nor qwen3.5 config parsers accepted it",
+                    "unable to infer model family from {}; qwen3.5 config parser did not accept it",
                     config_path.display()
                 )))
             }
         }
         family => Ok(family),
-    }
-}
-
-pub fn synthetic_qwen3_config(seq: usize) -> Qwen3Config {
-    Qwen3Config {
-        vocab_size: 256,
-        hidden_size: 64,
-        num_hidden_layers: 2,
-        num_attention_heads: 4,
-        num_key_value_heads: 2,
-        head_dim: 16,
-        intermediate_size: 128,
-        max_position_embeddings: seq,
-        rms_norm_eps: 1.0e-6,
-        rope_theta: 1_000_000.0,
-        rope_scaling: None,
-        tie_word_embeddings: false,
     }
 }
 

@@ -17,7 +17,6 @@ use thiserror::Error;
 use crate::{
     causal_lm::CausalLm,
     lora::{LinearWithLora, LoraConfig},
-    policy::{GrpoPolicy, GrpoPolicyConfig},
 };
 
 #[derive(Debug, Error)]
@@ -919,70 +918,6 @@ impl Qwen35Model {
     }
 }
 
-impl GrpoPolicyConfig for Qwen35Config {
-    fn max_seq_len(&self) -> usize {
-        self.rope_cache_len_hint.unwrap_or(0)
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.vocab_size
-    }
-}
-
-impl GrpoPolicy for Qwen35Model {
-    type Config = Qwen35Config;
-
-    fn config(&self) -> &Self::Config {
-        &self.config
-    }
-
-    fn forward_single(
-        &self,
-        input_ids: &[usize],
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> autograd::Result<TensorId> {
-        Qwen35Model::forward_tokens(self, input_ids, store, tape)
-    }
-
-    fn forward_batch_tokens(
-        &self,
-        input_ids: &[usize],
-        batch: usize,
-        seq_len: usize,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> autograd::Result<TensorId> {
-        Qwen35Model::forward_batch_tokens(self, input_ids, batch, seq_len, store, tape)
-    }
-
-    fn forward_batch_tokens_with_positions(
-        &self,
-        input_ids: &[usize],
-        position_ids: &[usize],
-        batch: usize,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> autograd::Result<TensorId> {
-        Qwen35Model::forward_batch_tokens_with_positions(
-            self,
-            input_ids,
-            position_ids,
-            batch,
-            store,
-            tape,
-        )
-    }
-
-    fn all_parameter_ids(&self) -> Vec<TensorId> {
-        Qwen35Model::all_parameter_ids(self)
-    }
-
-    fn clone_frozen(&self, store: &mut TensorStore) -> Self {
-        Qwen35Model::clone_frozen(self, store)
-    }
-}
-
 impl CausalLm for Qwen35Model {
     fn forward_with_positions(
         &self,
@@ -1008,6 +943,10 @@ impl CausalLm for Qwen35Model {
         _tape: &mut Tape,
     ) -> autograd::Result<HashMap<&'static str, TensorId>> {
         Qwen35Model::materialized_param_name_map(self, store).map_err(qwen35_to_autograd)
+    }
+
+    fn all_parameter_ids(&self) -> Vec<TensorId> {
+        Qwen35Model::all_parameter_ids(self)
     }
 }
 
