@@ -378,8 +378,7 @@ pub fn write_latest_symlink(_parent: &Path, _target_basename: &str) -> io::Resul
 /// artifact exposes readers to an incomplete step dir.
 ///
 /// Returns an error if `<parent>/<target_basename>/model.safetensors`
-/// does not exist yet. Both binary save hooks (`pretrain::save_checkpoint`
-/// and `train_sft::save_checkpoint_via_registry`) call this instead of
+/// does not exist yet. Higher-level OPD/model save hooks call this instead of
 /// raw `write_latest_symlink` so a future refactor that drops the
 /// ordering-dependent weight write first would fail a targeted unit
 /// test (see `latest_symlink_tests::publish_after_weights_*`).
@@ -472,12 +471,11 @@ mod latest_symlink_tests {
 
     // --- publish_latest_after_weights: publish-last contract ------------------
     // These pin the "no `latest` without model.safetensors" invariant so a
-    // future refactor of the binary save hooks that moves the symlink above
+    // future refactor of higher-level model save hooks that moves the symlink above
     // the weight write — or drops the weight write — fails here instead of
     // silently exposing an incomplete step dir. Paired with the call-site
-    // swaps in `pretrain::save_checkpoint` and
-    // `train_sft::save_checkpoint_via_registry` (codex review 2026-04-20 on
-    // 8bde810, Low — restore end-to-end coverage the `latest`-refactor
+    // save-hook call sites (codex review 2026-04-20 on 8bde810, Low — restore
+    // end-to-end coverage the `latest`-refactor
     // dropped from `test_trainer_loop.rs:278`).
 
     #[cfg(unix)]

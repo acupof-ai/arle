@@ -278,7 +278,7 @@ fn trainer_save_then_resume_roundtrip() {
     // DX-1 (docs/plans/train-eval-infer-dx-v1.md Phase DX-1): the `latest`
     // symlink is intentionally NOT written at Trainer::save_checkpoint time.
     // Trainer writes only trainer_state.json + optimizer.safetensors; the
-    // binary-level save hook (pretrain / train_sft) writes model.safetensors
+    // higher-level OPD/model save hook writes model.safetensors
     // and *then* refreshes `<save_dir>/latest`. Asserting the symlink here
     // would force Trainer to publish a pointer to an incomplete checkpoint.
     // Codex review 2026-04-20 on 0da212f (Medium).
@@ -578,8 +578,7 @@ fn metrics_emit_at_log_every() {
 
     let samples = buf.lock().unwrap();
     // Codex review 44a7e19 (medium): the Trainer now always force-emits on
-    // step 1 and on the final step in addition to the `log_every` rule, to
-    // match the pre-migration train_sft CLI contract. So log_every=2 +
+    // step 1 and on the final step in addition to the `log_every` rule. So log_every=2 +
     // total_steps=4 yields 3 samples: step 1 (forced), step 2
     // (is_multiple_of), step 4 (is_multiple_of AND final).
     assert_eq!(
@@ -718,8 +717,8 @@ fn ppl_field_equals_exp_of_loss_field_in_metric_plumbing() {
 }
 
 /// Codex review 44a7e19 (medium): the Trainer must always force-emit on
-/// step 1 and the final step regardless of `log_every`. Pins the CLI
-/// contract inherited from pre-migration train_sft so `--log-every 5
+/// step 1 and the final step regardless of `log_every`. Pins the OPD runner
+/// contract so `--log-every 5
 /// --steps 12` still produces a first progress line and a final summary,
 /// not just steps 5 and 10.
 #[test]
@@ -775,7 +774,7 @@ fn metrics_force_emit_on_first_and_final_step() {
 
 /// `run_with_hooks` must invoke `on_step_end` exactly once per optimizer step
 /// (never per micro-batch), after cleanup, with the post-update step index.
-/// This is the hook train_sft uses to save bf16 model weights.
+/// This is the hook higher-level OPD/model runners use to save model weights.
 #[test]
 fn run_with_hooks_fires_after_each_optimizer_step() {
     let (mut store, p) = setup_param(&[0.1, 0.2]);
@@ -824,8 +823,8 @@ fn run_with_hooks_fires_after_each_optimizer_step() {
 
 /// `run_with_eval_and_hooks` must drive both the eval closure (every
 /// `eval_every` steps) AND the on_step_end hook (every step) in the same
-/// run — this is the surface the pretrain binary uses, which owns its own
-/// weight-save pipeline AND wants eval-loss metrics. Codex review 613ff3c
+/// run — this is the surface for callers that own their own weight-save
+/// pipeline AND want eval-loss metrics. Codex review 613ff3c
 /// flagged that the separate `run_with_eval` / `run_with_hooks` coverage
 /// doesn't prove the combined shape works.
 #[test]
@@ -1344,9 +1343,9 @@ fn trainer_lr(trainer: &Trainer<AdamW, NoClip, LinearWarmup>) -> f32 {
     trainer.optim().lr()
 }
 
-/// Codex review 2026-04-20 on 09c5c89 (P1): the SFT→GRPO boundary in
-/// `train_grpo` used to silently reset AdamW moments and bias correction
-/// because a fresh AdamW was constructed for the GRPO phase. The fix hands
+/// Codex review 2026-04-20 on 09c5c89 (P1): a two-phase runner boundary used
+/// to silently reset AdamW moments and bias correction because a fresh AdamW was
+/// constructed for the second phase. The fix hands
 /// optimizer state across via `Trainer::optim().export_state(...)` +
 /// `AdamW::import_state(...)`. Pin that roundtrip: 3 steps in trainer A →
 /// export → import into a fresh AdamW → 1 step in trainer B must match
@@ -1428,8 +1427,7 @@ fn adamw_state_roundtrip_across_trainer_boundary() {
         "handoff state should carry step=3 across the boundary"
     );
 
-    // Fresh AdamW + fresh Trainer — this is the GRPO-phase shape in
-    // train_grpo.rs. Without `import_state`, bias correction would restart
+    // Fresh AdamW + fresh Trainer. Without `import_state`, bias correction would restart
     // at step=1 here and moments would be zeroed.
     let mut optim_b2 = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
     let restored = optim_b2

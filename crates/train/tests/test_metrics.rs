@@ -231,8 +231,8 @@ fn jsonl_line_is_parseable_by_serde_json() {
 }
 
 /// Phase 4 follow-up (commit 60f7183): `JsonlSink::open_append` is the
-/// multi-phase-binary sibling of `create`. `train_grpo` uses it for the
-/// GRPO phase so JSONL output from the SFT-phase Trainer doesn't get
+/// multi-phase-runner sibling of `create`. Later phases use it so JSONL output
+/// from an earlier Trainer phase doesn't get
 /// clobbered. Pins the truncate-vs-append contract so a future
 /// "simplify" refactor can't silently swap append for truncate.
 #[test]
@@ -285,8 +285,8 @@ fn jsonl_sink_open_append_extends_existing_file() {
 }
 
 /// Factory-level variant of the above: `open_sink_append` must yield a
-/// sink that extends rather than truncates, matching what `train_grpo`
-/// actually calls. Also verifies `open_sink_append` creates the file
+/// sink that extends rather than truncates, matching the multi-phase runner
+/// call path. Also verifies `open_sink_append` creates the file
 /// when absent (i.e. single-phase binaries wouldn't break if they
 /// accidentally used the append variant).
 #[test]

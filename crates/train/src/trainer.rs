@@ -228,9 +228,9 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         // Codex review 2026-04-20 on d9eee61 (Medium): the checkpoint
         // persists `rng_seed` (see `TrainerStateDoc`), but the previous
         // version of this function never compared it to `self.cfg.rng_seed`.
-        // Binaries now derive their sampler directly from the live CLI
-        // `--seed` (e.g. the stateless `sample_index(seed, step, micro_step)`
-        // in `train_sft`). If the operator resumes with a different `--seed`
+        // OPD runners derive their sampler directly from the live CLI
+        // `--seed` (e.g. a stateless `sample_index(seed, step, micro_step)`).
+        // If the operator resumes with a different `--seed`
         // than the interrupted run used, the sampler silently consumes a
         // different data stream from the resume step onward. Reject the
         // mismatch so the operator either restores the original seed or
@@ -490,9 +490,9 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             steps_since_last_log += 1;
 
             // ---- metrics emission ----
-            // Codex review 44a7e19 (medium): pre-migration train_sft always
-            // logged step 1 and the final step regardless of `log_every`.
-            // Force-emit on both boundaries so the CLI contract is preserved
+            // Codex review 44a7e19 (medium): the shared runner contract always
+            // logs step 1 and the final step regardless of `log_every`.
+            // Force-emit on both boundaries so that contract is preserved
             // (first progress line + final summary) across log_every values.
             let is_final = self.step == self.cfg.total_steps;
             let log_now =
@@ -547,8 +547,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             {
                 let eval = eval_fn(store, tape)?;
                 // Codex review 2026-04-20 on bd5e277 (High): defensive
-                // post-eval cleanup. Multi-forward eval closures (see
-                // the pretrain binary's `--eval-windows N` path) accumulate
+                // post-eval cleanup. Multi-forward eval closures can accumulate
                 // forward temporaries across windows; even single-call evals
                 // can leave scratch tensors in the store. Prune down to
                 // `params ∪ grads ∪ keep_extra` so the next training step
@@ -639,7 +638,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         });
 
         // DX-1 note: the `<save_dir>/latest` symlink is refreshed by the
-        // *binary*'s save hook (pretrain / train_sft), NOT here.
+        // higher-level OPD/model save hook, NOT here.
         // Trainer::save_checkpoint only writes trainer_state.json +
         // optimizer.safetensors; the model weights are written in
         // `on_step_end` which runs AFTER this function returns. Publishing
@@ -663,8 +662,8 @@ fn wrap_checkpoint_err(err: CheckpointError) -> AutogradError {
 /// store.retain_ids(...)` idiom used across the historic hand-written
 /// training loops before the shared trainer/runtime factoring landed.
 ///
-/// Exposed `pub` so eval closures that produce multi-forward activations
-/// (e.g. the pretrain binary's `--eval-windows N` loop) can prune the store
+/// Exposed `pub` so OPD eval closures that produce multi-forward activations
+/// can prune the store
 /// between windows. Note: this unconditionally re-enables the tape, which
 /// is correct for the post-backward path but NOT for an eval loop that
 /// wants the tape disabled across windows — the caller must re-disable
