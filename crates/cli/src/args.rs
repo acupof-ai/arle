@@ -284,8 +284,6 @@ pub(crate) enum CliCommand {
     Serve(Box<ServeArgs>),
     /// Training jobs.
     Train(Box<TrainArgs>),
-    /// Dataset utilities.
-    Data(Box<DataArgs>),
     /// Model utilities (download from Hugging Face).
     Model(Box<ModelArgs>),
 }
@@ -391,22 +389,12 @@ pub(crate) struct TrainArgs {
 pub(crate) enum TrainCommand {
     /// Print train-time environment diagnostics.
     Env(TrainEnvArgs),
-    /// Build the canonical tiny fixture via convert -> pretrain -> sft -> eval.
+    /// Build the canonical tiny fixture.
     Test(TrainTestArgs),
-    /// Estimate parameter count and rough memory for scratch pretrain or LoRA SFT.
+    /// Estimate parameter count and rough memory.
     EstimateMemory(TrainEstimateMemoryArgs),
-    /// Scratch pretraining from a plain-text corpus.
-    Pretrain(TrainPretrainArgs),
-    /// DeepSeek V4 1B checkpoint training bootstrap.
-    PretrainDsv4(TrainPretrainDsv4Args),
-    /// Supervised fine-tuning from canonical chat JSONL.
-    Sft(TrainSftArgs),
-    /// Group-relative policy optimization.
-    Grpo(TrainGrpoArgs),
-    /// Multi-turn RL training.
-    MultiTurn(TrainMultiTurnArgs),
-    /// Evaluate a checkpoint on tokenized or chat JSONL.
-    Eval(TrainEvalArgs),
+    /// On-policy distillation. Stub until the OPD substrate lands.
+    Opd(TrainOpdArgs),
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -533,6 +521,10 @@ pub(crate) struct TrainEstimateMemoryArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
 }
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(after_help = "OPD substrate landing next milestone.")]
+pub(crate) struct TrainOpdArgs {}
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
