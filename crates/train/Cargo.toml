@@ -26,6 +26,8 @@ hf-hub = { version = "0.5", features = ["tokio"] }
 opentelemetry = { version = "0.31", default-features = false, features = ["logs"] }
 opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["logs"] }
+half = "2"
+memmap2 = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
