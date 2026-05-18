@@ -12,10 +12,13 @@ doc wins:
 
 ## Positioning
 
-ARLE is a Rust-native inference runtime with integrated local agent / train
-/ self-evolution workflows. Runtime stays primary: `infer` owns serving truth;
-`arle` is the unified front door; train/RL strengthens the runtime loop, it
-does not fork a second product identity.
+ARLE is a Rust-native inference runtime with integrated local agent and
+**On-Policy Distillation (OPD)** workflows. Runtime stays primary: `infer`
+owns serving truth; `arle` is the unified front door; OPD train
+strengthens the runtime loop (teacher in `infer`, student LoRA on the same
+backend), it does not fork a second product identity. Scratch pretrain,
+SFT, GRPO, and multi-turn RL surfaces were retired 2026-05-18 — see
+[`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md).
 
 ## Active Priorities
 
@@ -27,7 +30,7 @@ does not fork a second product identity.
 | **P1** | Finish the `infer`-side observability spine: throughput, TTFT, ITL, queue shape, `ncu`, `nsys`, sampled traces on one operator surface. | [`docs/plans/infer-observability-v1.md`](docs/plans/infer-observability-v1.md) |
 | **P2** | Push tiered KV from a strong local CUDA path toward validated staged readmission + remote/shared backends. | [`docs/projects/tiered-kv-cache.md`](docs/projects/tiered-kv-cache.md), [`docs/plans/tiered-kv-hicache-readmission.md`](docs/plans/tiered-kv-hicache-readmission.md) |
 | **P3** | Finish serving-grade Metal batching and long-context closure without forking runtime truth away from CUDA. | [`docs/projects/mlx-backend-roadmap.md`](docs/projects/mlx-backend-roadmap.md) |
-| **P4** | Keep Phase 6 train/agent work runtime-led: shared model truth, unified operator surface, no second project identity. | [`docs/projects/agent-rl-self-evolving.md`](docs/projects/agent-rl-self-evolving.md), [`docs/plans/train-runtime-architecture-v1.md`](docs/plans/train-runtime-architecture-v1.md) |
+| **P4** | OPD-only training substrate. Teacher in `infer`, student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces deleted 2026-05-18 — train crate slimmed to OPD pre-req substrate (autograd, Trainer skeleton, checkpoint codec, tokenizer, LoRA). | [`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md) |
 
 ## Next-Model Priority Order
 

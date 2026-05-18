@@ -1,6 +1,6 @@
 <p align="center">
   <strong>ARLE</strong><br>
-  <em>Pure-Rust runtime for serving, local agents, training, and evaluation. <code>infer</code> is the OpenAI-compatible serving binary; <code>arle</code> is the unified front door.</em>
+  <em>Pure-Rust runtime for serving, local agents, On-Policy Distillation training, and evaluation. <code>infer</code> is the OpenAI-compatible serving binary; <code>arle</code> is the unified front door.</em>
 </p>
 
 <p align="center">
@@ -127,7 +127,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 
 Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B; dense, hybrid linear-attn, and MoE; GGUF Q4_K_M and 4B hybrid attention) on CUDA + Metal. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA stubbed. Next-model queue: **DeepSeek V4 (#1)** → **Qwen 3.6 (#2)**, see [ROADMAP.md](ROADMAP.md#next-model-priority-order). DeepSeek V2/V3/R1 intentionally out of scope.
 
-Authoritative matrix (HTTP API tiers, quantization, agent / train / eval surfaces): [docs/support-matrix.md](docs/support-matrix.md).
+Authoritative matrix (HTTP API tiers, quantization, agent / OPD train / eval surfaces): [docs/support-matrix.md](docs/support-matrix.md).
 Stability tiers: [docs/stability-policy.md](docs/stability-policy.md).
 
 ---
@@ -138,7 +138,7 @@ In agent and RL workloads every turn pays a prefill tax: system prompt + history
 
 - **Multi-turn KV reuse.** Slot-sticky reuse keeps prior-turn KV hot for the next turn. CUDA also includes a radix-backed tiered-KV path (`T0 GPU → T1 host pinned → T2 local disk → T3 cluster-shared`) for full-block reuse and staged readmission, so only the new user message requires prefill each turn when the prefix stays reusable.
 - **Paged KV pool.** Main CUDA KV formats use `page_size=16` with direct GPU page attach and tail-page CoW on shared prefixes — predictable accounting, reusable full blocks, cheaper prefix sharing.
-- **Shared runtime authority.** `infer`, `arle`, and the in-tree train / eval jobs resolve models and reuse the same Rust runtime / model contracts. Serving, local agent work, and RL tooling stay on one code path instead of drifting across separate stacks.
+- **Shared runtime authority.** `infer`, `arle`, and the in-tree OPD train + eval jobs resolve models and reuse the same Rust runtime / model contracts. Serving, local agent work, and the teacher-student loop stay on one code path instead of drifting across separate stacks.
 
 Architecture deep-dive: [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md).
 Latest benchmark snapshots (per change, dated): [docs/experience/wins/](docs/experience/wins/) · run your own with [`scripts/bench_guidellm.sh`](scripts/bench_guidellm.sh).
@@ -154,8 +154,7 @@ Latest benchmark snapshots (per change, dated): [docs/experience/wins/](docs/exp
 | `arle` (no args) | Interactive agent REPL with built-in `python` and `shell` tools (sandboxed). |
 | `arle run --prompt "…"` / `--stdin --json` | Script-friendly one-shot agent prompt. Use `--no-tools` to disable tool execution. |
 | `arle serve --backend {cuda,metal,cpu} --model-path …` | Launch the OpenAI-compatible HTTP server through an ARLE-native backend. |
-| `arle train {pretrain,sft,grpo,multi-turn,eval}` | In-tree training and RL workflows on the same runtime. |
-| `arle data {download,convert}` | Dataset utilities. |
+| `arle train opd` | **On-Policy Distillation** — the one in-tree training surface (teacher in `infer`, student LoRA on the same runtime). Pretrain / SFT / GRPO / multi-turn RL were retired 2026-05-18 ([rationale](docs/projects/2026-05-18-opd-only-pivot.md)). |
 | `arle --doctor [--json] [--strict]` | Self-check: backend, hardware, HF cache, model resolution. CI-friendly. |
 
 The REPL persists line history at `~/.arle-history` and exposes slash commands: `/help`, `/reset`, `/clear`, `/tools`, `/model`, `/stats`, `/models`, `/save`, `/load`, `/export`.

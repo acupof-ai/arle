@@ -27,7 +27,7 @@ candle or directly at PyTorch.
 
 | | Language | Models | Multi-turn KV reuse | Train / RL surface | Best fit |
 |---|---|---|---|---|---|
-| **ARLE** | Pure Rust | Qwen3.5 family | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree (`arle train pretrain/sft/grpo/multi-turn/eval`) | Rust shops; agent / RL workloads on Qwen3.5 family that pay a heavy prefill tax per turn |
+| **ARLE** | Pure Rust | Qwen3.5 family | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree On-Policy Distillation only (`arle train opd`) — teacher hosted in `infer`, student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces retired 2026-05-18. | Rust shops doing OPD on Qwen3.5; agent workloads that pay a heavy prefill tax per turn |
 | **vLLM** | Python (CUDA / ROCm) | Broad (Llama, Qwen, Mistral, DeepSeek, …) | PagedAttention + prefix cache | Separate (vLLM serves; train is your problem) | Production Python serving with a wide model menu |
 | **SGLang** | Python | Broad | RadixAttention prefix tree | Structured generation / multi-step prompting strengths | Python serving with structured / agent prompting |
 | **mistral.rs** | Pure Rust | Broad (multimodal too) | KV cache + prefix cache | Inference-focused | Rust serving with broad model coverage |
