@@ -467,8 +467,48 @@ pub(crate) struct TrainEstimateMemoryArgs {
 }
 
 #[derive(Debug, Clone, ClapArgs)]
-#[command(after_help = "OPD substrate landing next milestone.")]
-pub(crate) struct TrainOpdArgs {}
+#[command(
+    after_help = "On-Policy Distillation. The student samples a rollout greedily, the\nteacher re-scores it, and forward KL drives backward through the student.\n\nSmoke (no model load, tiny embedded Qwen3.5 config):\n  arle train opd --smoke --steps 5\n\nReal (HF / ModelScope-cached model directory, pending loader):\n  arle train opd --student-model ~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B \\\n                 --teacher-model ~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B \\\n                 --steps 20 --rollout-len 16"
+)]
+pub(crate) struct TrainOpdArgs {
+    /// Student model directory in HF safetensors layout. If unset and
+    /// `--smoke` is given, uses the embedded tiny Qwen3.5 config.
+    #[arg(long, alias = "student")]
+    pub(crate) student_model: Option<PathBuf>,
+
+    /// Teacher model directory. If unset, clones the student (self-distill).
+    #[arg(long, alias = "teacher")]
+    pub(crate) teacher_model: Option<PathBuf>,
+
+    /// Initial prompt token ids, comma-separated. Defaults to `1,3,8`.
+    #[arg(long, value_name = "IDS")]
+    pub(crate) prompt_ids: Option<String>,
+
+    /// Tokens to roll out greedily from the student per step.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) rollout_len: usize,
+
+    /// Total OPD training steps.
+    #[arg(long, default_value_t = 5)]
+    pub(crate) steps: usize,
+
+    /// AdamW learning rate.
+    #[arg(long, default_value_t = 1.0e-4)]
+    pub(crate) lr: f32,
+
+    /// Gradient L2 norm clip threshold.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) grad_clip: f32,
+
+    /// Smoke mode — use the embedded tiny Qwen3.5 config instead of
+    /// loading weights from disk. Useful for hardware smoke + CI gating.
+    #[arg(long, default_value_t = false)]
+    pub(crate) smoke: bool,
+
+    /// Render output as JSON for scripts and CI.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+}
 
 #[cfg(test)]
 mod tests {

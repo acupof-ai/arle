@@ -18,7 +18,7 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         ModelFamilyArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs,
-        TrainEstimateMemoryArgs, TrainTestArgs,
+        TrainEstimateMemoryArgs, TrainOpdArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
 };
@@ -35,7 +35,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::Env(args) => exit_from_result(run_train_env(args)),
         TrainCommand::Test(args) => run_train_test(args),
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
-        TrainCommand::Opd(_) => run_opd(),
+        TrainCommand::Opd(args) => run_opd(args),
     }
 }
 
@@ -194,12 +194,143 @@ fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_opd() -> ExitCode {
+fn run_opd(args: TrainOpdArgs) -> ExitCode {
+    if args.smoke {
+        return exit_from_result(run_opd_smoke(args));
+    }
+    if args.student_model.is_some() {
+        eprintln!(
+            "[arle train opd] error: HF/ModelScope-cached model loading is pending — \
+             a `train::qwen35_loader` is landing in the next tranche. For now, run \
+             `arle train opd --smoke` to exercise the rollout/KL/backward path on the \
+             embedded tiny Qwen3.5 config. See docs/projects/2026-05-18-opd-only-pivot.md."
+        );
+        return ExitCode::FAILURE;
+    }
     eprintln!(
-        "[ARLE train opd] error: OPD substrate landing next milestone; see \
-         docs/projects/2026-05-18-opd-only-pivot.md"
+        "[arle train opd] error: either `--student-model <dir>` or `--smoke` is required.\n\
+         See `arle train opd --help` for the full surface."
     );
     ExitCode::FAILURE
+}
+
+fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
+    use autograd::{Tape, TensorStore, optim::AdamW};
+    use train::{
+        opd::{OpdStepConfig, opd_step},
+        qwen35::Qwen35Model,
+    };
+
+    let cfg = embedded_tiny_qwen35_config();
+    let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
+    if prompt_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
+        bail!(
+            "smoke prompt token ids must be < {} (the embedded tiny vocab size)",
+            cfg.vocab_size
+        );
+    }
+
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let teacher = Qwen35Model::new(&cfg, &mut store).context("build smoke teacher")?;
+    let student = Qwen35Model::new(&cfg, &mut store).context("build smoke student")?;
+    let student_params = student.all_parameter_ids();
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let step_cfg = OpdStepConfig {
+        rollout_len: args.rollout_len,
+        grad_clip: args.grad_clip,
+    };
+
+    let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
+    for step in 1..=args.steps {
+        let outcome = opd_step(
+            &student,
+            &teacher,
+            &prompt_ids,
+            step_cfg,
+            &student_params,
+            &mut optimizer,
+            &mut store,
+            &mut tape,
+        )
+        .with_context(|| format!("opd step {step} failed"))?;
+        losses.push(outcome.loss);
+        if !args.json {
+            println!(
+                "step {step}/{total} loss {loss:.6} rollout_len {rl}",
+                total = args.steps,
+                loss = outcome.loss,
+                rl = outcome.rollout_len,
+            );
+        }
+    }
+
+    if args.json {
+        let report = serde_json::json!({
+            "mode": "smoke",
+            "backend": "cpu",
+            "steps": args.steps,
+            "rollout_len": args.rollout_len,
+            "lr": args.lr,
+            "losses": losses,
+            "prompt_ids": prompt_ids,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "ARLE train opd smoke: ran {} step(s) on tiny Qwen3.5 (vocab={}, hidden={}, layers={})",
+            args.steps, cfg.vocab_size, cfg.hidden_size, cfg.num_hidden_layers
+        );
+    }
+    Ok(())
+}
+
+fn parse_prompt_ids(raw: Option<&str>) -> Result<Vec<u32>> {
+    let raw = raw.unwrap_or("1,3,8");
+    raw.split(',')
+        .map(|piece| {
+            piece
+                .trim()
+                .parse::<u32>()
+                .with_context(|| format!("invalid prompt id `{piece}` (expected u32)"))
+        })
+        .collect()
+}
+
+fn embedded_tiny_qwen35_config() -> Qwen35Config {
+    Qwen35Config {
+        hidden_size: 16,
+        intermediate_size: 32,
+        num_hidden_layers: 2,
+        vocab_size: 16,
+        rms_norm_eps: 1.0e-6,
+        stop_token_ids: vec![15],
+        bos_token_id: Some(1),
+        eos_token_id: 15,
+        tie_word_embeddings: false,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 8,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 8,
+        linear_num_value_heads: 2,
+        linear_value_head_dim: 8,
+        linear_conv_kernel_dim: 4,
+        rope_theta: 10_000.0,
+        rope_scaling: None,
+        partial_rotary_factor: 1.0,
+        rotary_dim: 8,
+        rope_cache_len_hint: Some(64),
+        layer_types: vec![LayerType::FullAttention; 2],
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        decoder_sparse_step: 1,
+        moe_intermediate_size: 0,
+        shared_expert_intermediate_size: 0,
+        norm_topk_prob: true,
+        mlp_only_layers: Vec::new(),
+    }
 }
 
 fn estimate_from_model_dir(
