@@ -136,7 +136,7 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | SSE streaming | Stable at high level | Intended to remain OpenAI-style; edge behavior may improve. |
 | `/metrics` | Stable | Prometheus endpoint; Metal now reports live queue / latency / MLX memory gauges. |
 | `/v1/stats` | Stable | Human-readable stats endpoint; Metal now reports live queue / latency / MLX memory gauges. |
-| Train-side `/v1/train/status|events|stop|save` via `pretrain --serve`, `train_sft --serve`, `train_grpo --serve`, `train_multi_turn --serve` | Beta | Current control-plane truth lives in `crates/train`. Shared control-plane wiring is live on all four binaries, and CUDA has now been validated on all four active train surfaces. `train_grpo` and `train_multi_turn` were both exercised on CUDA for live `/v1/train/{status,events,save,stop}` control-plane behavior on 2026-04-21. `infer` can now expose the same surface as an optional proxy via `--train-control-url`, while the train-side server remains the sole authority. |
+| Train-side `/v1/train/status|events|stop|save` | Substrate landed; OPD wiring pending | Control-plane truth lives in `crates/train/src/server.rs` and survives the 2026-05-18 OPD-only pivot. The per-binary `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` / `train_multi_turn --serve` wiring was retired alongside those binaries; the same control plane is reused by `arle train opd --serve` once the OPD substrate lands. `infer` can still expose the surface as an optional proxy via `--train-control-url`. |
 | Metal runtime memory knobs | Beta | `metal_request`, `metal_bench`, and `metal_serve` expose `--memory-limit-bytes`, `--cache-limit-bytes`, and `--wired-limit-bytes` for MLX allocator control. |
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
 | `arle serve` front door | Beta | Launches the matching serving binary (`infer`, `metal_serve`, or `cpu_serve`) from the release artifact or PATH. This is a packaging/DX front door over existing server binaries, not a second HTTP implementation. |
@@ -162,7 +162,7 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | Surface | Status | Notes |
 | --- | --- | --- |
 | `arle train opd` | **Substrate landing** | OPD command stub is in tree; full teacher-student loop ships next milestone. Substrate kept: `Trainer<O, C, S>`, HF-style checkpoint codec, tokenizer load, `/v1/train/*` control plane, LoRA, `crates/autograd` device-resident gradient kernels (Wave 1–2.x). |
-| `arle train env` / `arle train test` / `arle train estimate-memory` | Supported | Diagnostic surfaces preserved across the pivot; `test` runs the canonical convert→pretrain→sft→eval fixture against autograd (intentional regression hook for the substrate, not a user-facing pipeline). |
+| `arle train env` / `arle train estimate-memory` | Supported | Diagnostic surfaces preserved across the OPD-only pivot. `arle train test` was retired with the legacy `convert→pretrain→sft→eval` fixture and will return as an OPD smoke fixture once the substrate lands. |
 | Infer-side unified `/v1/train/*` bridge | Supported (optional proxy) | `infer` exposes `/v1/train/status|events|stop|save` when `--train-control-url http://...` is configured, forwarding to the train-side server in `crates/train/src/server.rs`. Will host OPD progress events when the substrate lands. |
 
 ---
