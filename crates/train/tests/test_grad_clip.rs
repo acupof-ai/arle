@@ -240,8 +240,8 @@ fn norm_on_empty_params_is_zero() {
 // `max_norm <= 0.0` gate in `clip_grad_norm` (NaN comparisons always
 // false) and then poison every gradient via `scale = max_norm /
 // total_norm`. Codex review ef24ca6 P2. Any non-finite (or non-positive)
-// value is now a documented no-op — matching the pretrain.rs binary's
-// CLI warning path so all call sites stay consistent.
+// value is now a documented no-op, matching the CLI warning path so all call
+// sites stay consistent.
 #[test]
 fn non_finite_max_norm_is_noop() {
     for max_norm in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0_f32] {

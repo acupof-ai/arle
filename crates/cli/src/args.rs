@@ -447,7 +447,7 @@ pub(crate) struct TrainTestArgs {
     after_help = "Examples:\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m\n  arle train estimate-memory --model checkpoints/base --lora-rank 32 --json"
 )]
 pub(crate) struct TrainEstimateMemoryArgs {
-    /// Existing model directory to inspect for LoRA SFT / eval-style runs.
+    /// Existing model directory to inspect for LoRA adaptation / eval-style runs.
     #[arg(long, alias = "model-path")]
     pub(crate) model: Option<PathBuf>,
 
@@ -455,7 +455,7 @@ pub(crate) struct TrainEstimateMemoryArgs {
     #[arg(long)]
     pub(crate) tokenizer: Option<PathBuf>,
 
-    /// Optional scratch preset for `pretrain`-style estimates.
+    /// Optional scratch preset for OPD-side scratch estimates.
     #[arg(long, value_enum)]
     pub(crate) preset: Option<PretrainPresetArg>,
 
@@ -537,7 +537,7 @@ pub(crate) struct TrainPretrainArgs {
     #[arg(long)]
     pub(crate) tokenizer: PathBuf,
 
-    /// Output checkpoint directory. Defaults to `runs/pretrain/<corpus-stem>`.
+    /// Output checkpoint directory for the legacy scratch path.
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
 
@@ -692,8 +692,8 @@ pub(crate) struct TrainPretrainArgs {
     pub(crate) extra: ExtraArgs,
 }
 
-/// CLI args for `arle train pretrain-dsv4` — the V4 1B checkpoint training
-/// bootstrap. The old V3/nano random-init path is intentionally gone.
+/// CLI args for the legacy V4 1B checkpoint bootstrap. The old V3/nano
+/// random-init path is intentionally gone.
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
     after_help = "Examples:\n  arle train pretrain-dsv4 --corpus corpus.txt\n  arle train pretrain-dsv4 --model infer/models/dsv4-mini-1B-init --corpus corpus.txt --out runs/dsv4-v4"
@@ -711,7 +711,7 @@ pub(crate) struct TrainPretrainDsv4Args {
     #[arg(long)]
     pub(crate) tokenizer: Option<PathBuf>,
 
-    /// Output checkpoint directory. Defaults to `runs/pretrain-dsv4/<corpus-stem>`.
+    /// Output checkpoint directory for the legacy V4 bootstrap path.
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
 
@@ -775,7 +775,7 @@ pub(crate) struct TrainSftArgs {
     #[arg(long)]
     pub(crate) data: PathBuf,
 
-    /// Output checkpoint directory. Defaults to `runs/sft/<model-name>`.
+    /// Output checkpoint directory for the legacy adaptation path.
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
 
@@ -911,11 +911,11 @@ pub(crate) struct TrainGrpoArgs {
     #[arg(long, value_enum)]
     pub(crate) model_family: Option<ModelFamilyArg>,
 
-    /// Warm-start SFT steps before GRPO.
+    /// Warm-start adaptation steps before policy optimization.
     #[arg(long)]
     pub(crate) sft_steps: Option<usize>,
 
-    /// Total GRPO iterations.
+    /// Total policy-optimization iterations.
     #[arg(long)]
     pub(crate) grpo_iters: Option<usize>,
 
@@ -923,7 +923,7 @@ pub(crate) struct TrainGrpoArgs {
     #[arg(long)]
     pub(crate) save_every: Option<usize>,
 
-    /// Prompt batch size per GRPO iteration.
+    /// Prompt batch size per policy-optimization iteration.
     #[arg(long)]
     pub(crate) batch_prompts: Option<usize>,
 
