@@ -115,56 +115,14 @@ fn run_train_env(args: TrainEnvArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_train_test(args: TrainTestArgs) -> ExitCode {
-    let root_dir = args
-        .out_dir
-        .clone()
-        .unwrap_or_else(|| unique_temp_dir("arle-train-test"));
-    let cleanup_path = if args.keep_artifacts || args.out_dir.is_some() {
-        None
-    } else {
-        Some(root_dir.clone())
-    };
-    let result = train_test_inner(&args, &root_dir);
-    if let Some(path) = cleanup_path.as_ref() {
-        let _ = fs::remove_dir_all(path);
-    }
-    match result {
-        Ok(report) => {
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else {
-                println!("ARLE train test");
-                println!("backend {}", report.backend);
-                println!("root {}", report.root_dir);
-                if let Some(model_dir) = &report.servable_model_dir {
-                    println!("model {}", model_dir);
-                } else {
-                    println!(
-                        "note pass --keep-artifacts or --out-dir to keep the final checkpoint"
-                    );
-                }
-                for step in &report.steps {
-                    println!("{} {}", step.name, step.status);
-                }
-                if let Some(eval_summary) = &report.eval_summary {
-                    println!(
-                        "eval metrics loss={:.6} ppl={:.6} tokens={}",
-                        eval_summary.loss, eval_summary.ppl, eval_summary.tokens
-                    );
-                }
-                println!("wall {:.2}s", report.wall_secs);
-                if report.kept_artifacts {
-                    println!("artifacts kept {}", report.root_dir);
-                }
-            }
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("[ARLE train test] error: {err:#}");
-            ExitCode::FAILURE
-        }
-    }
+fn run_train_test(_args: TrainTestArgs) -> ExitCode {
+    eprintln!(
+        "[arle train test] OPD smoke fixture pending — the legacy \
+         convert→pretrain→sft→eval pipeline was retired in the \
+         2026-05-18 OPD-only pivot. Re-implementation lands with \
+         the OPD substrate. See docs/projects/2026-05-18-opd-only-pivot.md."
+    );
+    ExitCode::from(0)
 }
 
 fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
