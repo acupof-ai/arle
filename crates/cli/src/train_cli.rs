@@ -14,7 +14,7 @@ use train::{
 };
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs};
+use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         ModelFamilyArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs,
@@ -48,6 +48,10 @@ pub(crate) fn run_model(model: ModelArgs) -> ExitCode {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_model_download(args: ModelDownloadArgs) -> ExitCode {
+    let source_label = match args.source {
+        ModelSourceArg::Hf => "hf",
+        ModelSourceArg::Modelscope => "modelscope",
+    };
     if args.render.dry_run {
         if args.render.json {
             println!(
@@ -55,17 +59,28 @@ fn run_model_download(args: ModelDownloadArgs) -> ExitCode {
                 serde_json::json!({
                     "command": "model download",
                     "argv": [args.model_id],
+                    "source": source_label,
                 })
             );
         } else {
             println!("command model download");
             println!("argv {}", args.model_id);
+            println!("source {source_label}");
         }
         return ExitCode::SUCCESS;
     }
-    match crate::download::download_model_with_progress(&args.model_id) {
+    let result = match args.source {
+        ModelSourceArg::Hf => crate::download::download_model_with_progress(&args.model_id),
+        ModelSourceArg::Modelscope => {
+            crate::modelscope::download_model_from_modelscope_with_progress(&args.model_id)
+        }
+    };
+    match result {
         Ok(path) => {
-            eprintln!("[ARLE model download] downloaded to: {}", path.display());
+            eprintln!(
+                "[ARLE model download] downloaded ({source_label}) to: {}",
+                path.display()
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {

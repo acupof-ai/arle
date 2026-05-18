@@ -244,15 +244,33 @@ pub(crate) struct ModelArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ModelCommand {
-    /// Download a model from Hugging Face Hub (config + tokenizer + sharded weights).
+    /// Download a model from Hugging Face Hub or ModelScope (config + tokenizer + sharded weights).
     Download(ModelDownloadArgs),
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ModelSourceArg {
+    /// Hugging Face Hub (default, global; uses `hf-hub` + `~/.cache/huggingface/`).
+    Hf,
+    /// ModelScope (魔搭) — PRC-friendly mirror used by the OPD substrate.
+    /// Cache lives at `~/.cache/modelscope/hub/models/{org}/{name}/`.
+    Modelscope,
+}
+
 #[derive(Debug, Clone, ClapArgs)]
-#[command(after_help = "Example:\n  arle model download Qwen/Qwen3-0.6B")]
+#[command(
+    after_help = "Examples:\n  arle model download Qwen/Qwen3-0.6B\n  arle model download --source modelscope Qwen/Qwen3-0.6B"
+)]
 pub(crate) struct ModelDownloadArgs {
-    /// Hugging Face model ID (e.g. "Qwen/Qwen3-0.6B" or "mlx-community/Qwen3.6-35B-A3B-4bit").
+    /// Model ID (e.g. "Qwen/Qwen3-0.6B" or "mlx-community/Qwen3.6-35B-A3B-4bit").
+    /// Both HF and ModelScope accept the same `org/name` shape for Qwen-family
+    /// and other dual-published repos.
     pub(crate) model_id: String,
+
+    /// Where to download from. Defaults to `hf`; use `modelscope` from PRC
+    /// networks or to feed the OPD substrate without HF reach.
+    #[arg(long, value_enum, default_value_t = ModelSourceArg::Hf)]
+    pub(crate) source: ModelSourceArg,
 
     #[command(flatten)]
     pub(crate) render: RenderArgs,
