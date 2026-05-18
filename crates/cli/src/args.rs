@@ -387,7 +387,7 @@ pub(crate) struct TrainArgs {
 pub(crate) enum TrainCommand {
     /// Print train-time environment diagnostics.
     Env(TrainEnvArgs),
-    /// Build the canonical tiny fixture.
+    /// Report OPD smoke fixture status.
     Test(TrainTestArgs),
     /// Estimate parameter count and rough memory.
     EstimateMemory(TrainEstimateMemoryArgs),
@@ -422,7 +422,7 @@ pub(crate) struct TrainEnvArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "This command builds the canonical tiny fixture through convert -> pretrain -> sft -> eval.\nUse `--keep-artifacts` or `--out-dir` when you want to keep the generated checkpoint.\nThe final checkpoint lives at `<root>/sft/latest` and can be passed directly to `arle --model-path` or `infer --model-path`."
+    after_help = "OPD smoke fixture pending. Returns once the OPD substrate lands; see docs/projects/2026-05-18-opd-only-pivot.md."
 )]
 pub(crate) struct TrainTestArgs {
     /// Training backend to exercise; `auto` selects the compiled backend.
