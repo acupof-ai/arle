@@ -17,8 +17,8 @@ use train::{
 use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
-        ModelFamilyArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs,
-        TrainEstimateMemoryArgs, TrainOpdArgs, TrainTestArgs,
+        ModelFamilyArg, OpdBackendArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand,
+        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
 };
@@ -215,7 +215,7 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
 }
 
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{Tape, TensorStore, optim::AdamW};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         opd::{OpdStepConfig, opd_step},
         qwen35::Qwen35Model,
@@ -230,7 +230,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         );
     }
 
-    let mut store = TensorStore::default();
+    let (mut store, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
     let teacher = Qwen35Model::new(&cfg, &mut store).context("build smoke teacher")?;
     let student = Qwen35Model::new(&cfg, &mut store).context("build smoke student")?;
@@ -269,7 +269,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     if args.json {
         let report = serde_json::json!({
             "mode": "smoke",
-            "backend": "cpu",
+            "backend": backend_label,
             "steps": args.steps,
             "rollout_len": args.rollout_len,
             "lr": args.lr,
@@ -279,11 +279,38 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "ARLE train opd smoke: ran {} step(s) on tiny Qwen3.5 (vocab={}, hidden={}, layers={})",
-            args.steps, cfg.vocab_size, cfg.hidden_size, cfg.num_hidden_layers
+            "ARLE train opd smoke: ran {} step(s) on tiny Qwen3.5 (vocab={}, hidden={}, layers={}, backend={})",
+            args.steps, cfg.vocab_size, cfg.hidden_size, cfg.num_hidden_layers, backend_label,
         );
     }
     Ok(())
+}
+
+#[allow(unused_variables)]
+fn build_opd_store(arg: OpdBackendArg) -> Result<(autograd::TensorStore, &'static str)> {
+    #[cfg(feature = "cuda")]
+    {
+        use std::sync::Arc;
+        let want_cuda = matches!(arg, OpdBackendArg::Cuda | OpdBackendArg::Auto);
+        if want_cuda {
+            let backend =
+                autograd::backend_cuda::CudaBackend::new(0).context("init CUDA backend (GPU 0)")?;
+            return Ok((
+                autograd::TensorStore::with_backend(Arc::new(backend)),
+                "cuda:0",
+            ));
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        if matches!(arg, OpdBackendArg::Cuda) {
+            bail!(
+                "arle was built without the cuda feature; rebuild with \
+                 `cargo build --release --features cuda` to use --backend cuda"
+            );
+        }
+    }
+    Ok((autograd::TensorStore::default(), "cpu"))
 }
 
 fn parse_prompt_ids(raw: Option<&str>) -> Result<Vec<u32>> {

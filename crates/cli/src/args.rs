@@ -505,9 +505,23 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) smoke: bool,
 
+    /// Compute backend for autograd. `auto` picks CUDA when the binary
+    /// is built with the cuda feature, else CPU. `cpu` forces the CPU
+    /// reference path even on a CUDA-built binary.
+    #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
+    pub(crate) backend: OpdBackendArg,
+
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum OpdBackendArg {
+    /// Pick CUDA when available, else CPU.
+    Auto,
+    Cpu,
+    Cuda,
 }
 
 #[cfg(test)]
