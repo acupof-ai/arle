@@ -58,6 +58,77 @@ fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
     }
 }
 
+fn slow_matmul_reference(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> (Vec<f32>, Vec<usize>) {
+    match (a_shape.len(), b_shape.len()) {
+        (2, 2) => {
+            let m = a_shape[0];
+            let k = a_shape[1];
+            let n = b_shape[1];
+            assert_eq!(b_shape[0], k);
+            let mut out = vec![0.0f32; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0.0f32;
+                    for inner in 0..k {
+                        acc += a[(row * k) + inner] * b[(inner * n) + col];
+                    }
+                    out[(row * n) + col] = acc;
+                }
+            }
+            (out, vec![m, n])
+        }
+        (3, 3) => {
+            let batch = a_shape[0];
+            let m = a_shape[1];
+            let k = a_shape[2];
+            let n = b_shape[2];
+            assert_eq!(b_shape, &[batch, k, n]);
+            let a_batch_stride = m * k;
+            let b_batch_stride = k * n;
+            let out_batch_stride = m * n;
+            let mut out = vec![0.0f32; batch * out_batch_stride];
+            for batch_index in 0..batch {
+                let a_base = batch_index * a_batch_stride;
+                let b_base = batch_index * b_batch_stride;
+                let out_base = batch_index * out_batch_stride;
+                for row in 0..m {
+                    for col in 0..n {
+                        let mut acc = 0.0f32;
+                        for inner in 0..k {
+                            acc += a[a_base + (row * k) + inner] * b[b_base + (inner * n) + col];
+                        }
+                        out[out_base + (row * n) + col] = acc;
+                    }
+                }
+            }
+            (out, vec![batch, m, n])
+        }
+        _ => panic!("slow reference only supports rank-2 and rank-3 matmul"),
+    }
+}
+
+#[test]
+fn cpu_matmul_forward_matches_slow_reference_2d_and_batched_3d() {
+    let a = make_rows(&[5, 7], 101);
+    let b = make_rows(&[7, 11], 202);
+    let (got, got_shape) = cpu_matmul_forward(&a, &[5, 7], &b, &[7, 11]).expect("cpu 2d");
+    let (want, want_shape) = slow_matmul_reference(&a, &[5, 7], &b, &[7, 11]);
+    assert_eq!(got_shape, want_shape);
+    assert_close(&got, &want, 1e-6, "cpu matmul forward 2d");
+
+    let a = make_rows(&[2, 3, 5], 303);
+    let b = make_rows(&[2, 5, 4], 404);
+    let (got, got_shape) = cpu_matmul_forward(&a, &[2, 3, 5], &b, &[2, 5, 4]).expect("cpu 3d");
+    let (want, want_shape) = slow_matmul_reference(&a, &[2, 3, 5], &b, &[2, 5, 4]);
+    assert_eq!(got_shape, want_shape);
+    assert_close(&got, &want, 1e-6, "cpu matmul forward batched 3d");
+}
+
 fn run_lazy_matmul<B: Backend>(
     backend: &B,
     a: &[f32],

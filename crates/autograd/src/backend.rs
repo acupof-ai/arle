@@ -1483,12 +1483,14 @@ pub fn cpu_matmul_forward(
             let n = b_shape[1];
             let mut out = vec![0.0f32; m * n];
             for row in 0..m {
-                for col in 0..n {
-                    let mut acc = 0.0f32;
-                    for inner in 0..k {
-                        acc += a[(row * k) + inner] * b[(inner * n) + col];
+                let a_row = &a[row * k..(row + 1) * k];
+                let out_row = &mut out[row * n..(row + 1) * n];
+                for inner in 0..k {
+                    let a_value = a_row[inner];
+                    let b_row = &b[inner * n..(inner + 1) * n];
+                    for col in 0..n {
+                        out_row[col] += a_value * b_row[col];
                     }
-                    out[(row * n) + col] = acc;
                 }
             }
             Ok((out, out_shape))
@@ -1508,12 +1510,14 @@ pub fn cpu_matmul_forward(
                 let b_base = batch_index * b_batch_stride;
                 let out_base = batch_index * out_batch_stride;
                 for row in 0..m {
-                    for col in 0..n {
-                        let mut acc = 0.0f32;
-                        for inner in 0..k {
-                            acc += a[a_base + (row * k) + inner] * b[b_base + (inner * n) + col];
+                    let a_row = &a[a_base + (row * k)..a_base + ((row + 1) * k)];
+                    let out_row = &mut out[out_base + (row * n)..out_base + ((row + 1) * n)];
+                    for inner in 0..k {
+                        let a_value = a_row[inner];
+                        let b_row = &b[b_base + (inner * n)..b_base + ((inner + 1) * n)];
+                        for col in 0..n {
+                            out_row[col] += a_value * b_row[col];
                         }
-                        out[out_base + (row * n) + col] = acc;
                     }
                 }
             }
