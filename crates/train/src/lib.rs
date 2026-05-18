@@ -26,6 +26,8 @@ pub mod opd;
 pub mod qwen35;
 #[path = "qwen35_checkpoint.rs"]
 pub mod qwen35_checkpoint;
+#[path = "qwen35_loader.rs"]
+pub mod qwen35_loader;
 #[path = "server.rs"]
 pub mod server;
 #[path = "tokenizer.rs"]
