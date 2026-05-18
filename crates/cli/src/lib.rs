@@ -12,6 +12,8 @@ mod model_catalog;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod model_picker;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod modelscope;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
 mod serve;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
