@@ -1,8 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Output},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    process::ExitCode,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -11,16 +10,15 @@ use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
     model_family::{ModelFamily, resolve_model_family},
-    tokenizer::{ChatTokenizer, write_chatml_wordlevel_tokenizer},
+    tokenizer::ChatTokenizer,
 };
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs};
 use crate::{
     args::{
-        BackendArg, DatasetFormatArg, ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg,
-        TrainArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs,
-        TrainGrpoArgs, TrainMultiTurnArgs, TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
+        ModelFamilyArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs,
+        TrainEstimateMemoryArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
 };
@@ -50,16 +48,20 @@ pub(crate) fn run_model(model: ModelArgs) -> ExitCode {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_model_download(args: ModelDownloadArgs) -> ExitCode {
-    let invocation = ResolvedInvocation {
-        command: "model download",
-        argv: vec![args.model_id.clone()],
-        backend: None,
-        output_dir: None,
-        model: None,
-        notes: Vec::new(),
-    };
-    if let Some(exit) = dry_run_exit(&invocation, &args.render) {
-        return exit;
+    if args.render.dry_run {
+        if args.render.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "command": "model download",
+                    "argv": [args.model_id],
+                })
+            );
+        } else {
+            println!("command model download");
+            println!("argv {}", args.model_id);
+        }
+        return ExitCode::SUCCESS;
     }
     match crate::download::download_model_with_progress(&args.model_id) {
         Ok(path) => {
@@ -185,543 +187,6 @@ fn run_opd() -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn run_train_invocation<F>(invocation: ResolvedInvocation, render: &RenderArgs, run: F) -> ExitCode
-where
-    F: FnOnce(Vec<String>) -> std::result::Result<(), String>,
-{
-    if let Some(exit) = dry_run_exit(&invocation, render) {
-        return exit;
-    }
-    match run(invocation.argv) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("[ARLE {}] error: {err}", invocation.command);
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run_train_command<F>(
-    command: &'static str,
-    resolved: Result<ResolvedInvocation>,
-    render: &RenderArgs,
-    run: F,
-) -> ExitCode
-where
-    F: FnOnce(Vec<String>) -> std::result::Result<(), String>,
-{
-    match resolved {
-        Ok(invocation) => run_train_invocation(invocation, render, run),
-        Err(err) => {
-            eprintln!("[ARLE {command}] error: {err:#}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run_passthrough_invocation<F>(
-    invocation: ResolvedInvocation,
-    render: &RenderArgs,
-    run: F,
-) -> ExitCode
-where
-    F: FnOnce(Vec<String>) -> ExitCode,
-{
-    if let Some(exit) = dry_run_exit(&invocation, render) {
-        return exit;
-    }
-    run(invocation.argv)
-}
-
-fn dry_run_exit(invocation: &ResolvedInvocation, render: &RenderArgs) -> Option<ExitCode> {
-    render
-        .dry_run
-        .then(|| print_invocation(invocation, render.json))
-}
-
-fn print_invocation(invocation: &ResolvedInvocation, json: bool) -> ExitCode {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&invocation).unwrap());
-    } else {
-        println!("command {}", invocation.command);
-        if let Some(backend) = &invocation.backend {
-            println!("backend {}", backend);
-        }
-        if let Some(output_dir) = &invocation.output_dir {
-            println!("out {}", output_dir);
-        }
-        if let Some(model) = &invocation.model {
-            if let Some(resolved_dir) = &model.resolved_dir {
-                println!("model {}", resolved_dir);
-            } else {
-                println!("model {}", model.source);
-            }
-            if let Some(config_path) = &model.config_path {
-                println!("config {}", config_path);
-            }
-            if let Some(tokenizer_path) = &model.tokenizer_path {
-                println!("tokenizer {}", tokenizer_path);
-            }
-            if let Some(generation_config_path) = &model.generation_config_path {
-                println!("generation_config {}", generation_config_path);
-            }
-            if let Some(family) = &model.family {
-                println!("family {}", family);
-            }
-        }
-        for note in &invocation.notes {
-            println!("note {note}");
-        }
-        println!("argv {}", shell_words(&invocation.argv));
-    }
-    ExitCode::SUCCESS
-}
-
-fn resolve_pretrain_invocation(args: &TrainPretrainArgs) -> Result<ResolvedInvocation> {
-    let tokenizer_path = resolve_local_tokenizer_path(&args.tokenizer)?;
-    let out_dir = args
-        .out
-        .clone()
-        .unwrap_or_else(|| default_job_output("pretrain", &args.corpus));
-    let backend = args
-        .backend
-        .as_train_backend()
-        .unwrap_or_else(default_train_backend);
-
-    let mut shape = ScratchShape::default();
-    if let Some(preset) = args.preset {
-        shape.apply_preset(preset);
-    }
-    shape.apply_overrides(
-        args.hidden,
-        args.layers,
-        args.heads,
-        args.kv_heads,
-        args.head_dim,
-        args.intermediate,
-        args.max_pos,
-        args.linear_attn_every,
-    );
-
-    let mut argv = vec![
-        "--corpus".to_string(),
-        args.corpus.display().to_string(),
-        "--tokenizer".to_string(),
-        tokenizer_path.display().to_string(),
-        "--out".to_string(),
-        out_dir.display().to_string(),
-        "--backend".to_string(),
-        backend.to_string(),
-    ];
-    push_opt_family(&mut argv, args.model_family);
-    push_opt_value(&mut argv, "--steps", args.steps);
-    push_opt_value(&mut argv, "--batch", args.batch);
-    push_opt_value(&mut argv, "--seq", args.seq);
-    push_opt_value(&mut argv, "--lr", args.lr);
-    push_opt_value(&mut argv, "--grad-accum-steps", args.grad_accum_steps);
-    push_opt_value(&mut argv, "--log-every", args.log_every);
-    push_opt_value(&mut argv, "--save-every", args.save_every);
-    push_opt_value(&mut argv, "--eval-every", args.eval_every);
-    push_opt_value(&mut argv, "--eval-windows", args.eval_windows);
-    push_opt_value(&mut argv, "--eval-frac", args.eval_frac);
-    push_opt_path(&mut argv, "--resume-from", args.resume_from.as_deref());
-    push_opt_value(&mut argv, "--seed", args.seed);
-    push_grad_clip_flags(&mut argv, args.grad_clip, args.no_grad_clip);
-    push_opt_save_dtype(&mut argv, args.save_dtype);
-    push_opt_value(&mut argv, "--vocab-size", args.vocab_size);
-    let explicit_shape = args.preset.is_some() || args.has_shape_overrides();
-    if explicit_shape {
-        shape.push_shape_flags(&mut argv);
-    }
-    push_opt_value(&mut argv, "--rms-eps", args.rms_eps);
-    push_opt_value(&mut argv, "--rope-theta", args.rope_theta);
-    if args.no_tie_embed {
-        argv.push("--no-tie-embed".to_string());
-    }
-    push_opt_token(&mut argv, "--bos-token", args.bos_token.as_deref());
-    push_opt_token(&mut argv, "--eos-token", args.eos_token.as_deref());
-    push_opt_value(&mut argv, "--bos-token-id", args.bos_token_id);
-    push_opt_value(&mut argv, "--eos-token-id", args.eos_token_id);
-    push_opt_path(&mut argv, "--metrics-jsonl", args.metrics_jsonl.as_deref());
-    push_opt_value(&mut argv, "--serve", args.serve);
-    argv.extend(args.extra.extra_args.iter().cloned());
-
-    let mut notes = Vec::new();
-    if args.out.is_none() {
-        notes.push("out omitted; defaulted under runs/pretrain".to_string());
-    }
-    if args.preset.is_some() {
-        notes.push("applied scratch preset before explicit shape overrides".to_string());
-    }
-    if !explicit_shape {
-        notes.push("scratch shape omitted; underlying pretrain defaults apply".to_string());
-    }
-    notes.push(format!("resolved tokenizer {}", tokenizer_path.display()));
-
-    Ok(ResolvedInvocation {
-        command: "train pretrain",
-        argv,
-        backend: Some(backend.to_string()),
-        output_dir: Some(out_dir.display().to_string()),
-        model: None,
-        notes,
-    })
-}
-
-fn resolve_sft_invocation(args: &TrainSftArgs) -> Result<ResolvedInvocation> {
-    let model = resolve_model_command(&args.model, args.backend, args.render.dry_run)?;
-    let out_dir = args
-        .out
-        .clone()
-        .unwrap_or_else(|| default_job_output("sft", &args.model));
-
-    let mut argv = vec![
-        "--model".to_string(),
-        model.model_arg.clone(),
-        "--data".to_string(),
-        args.data.display().to_string(),
-        "--out".to_string(),
-        out_dir.display().to_string(),
-        "--backend".to_string(),
-        model.backend.clone(),
-    ];
-    push_opt_family(&mut argv, args.model_family);
-    push_opt_value(&mut argv, "--steps", args.steps);
-    push_opt_value(&mut argv, "--batch", args.batch);
-    push_opt_value(&mut argv, "--lr", args.lr);
-    push_opt_value(&mut argv, "--seq-len", args.seq_len);
-    push_opt_value(&mut argv, "--save-every", args.save_every);
-    push_opt_value(&mut argv, "--log-every", args.log_every);
-    push_opt_value(&mut argv, "--seed", args.seed);
-    push_opt_save_dtype(&mut argv, args.save_dtype);
-    push_opt_string(&mut argv, "--lr-schedule", args.lr_schedule.as_deref());
-    push_opt_value(&mut argv, "--warmup-steps", args.warmup_steps);
-    push_opt_value(&mut argv, "--min-lr", args.min_lr);
-    push_opt_value(&mut argv, "--grad-accum-steps", args.grad_accum_steps);
-    push_opt_path(&mut argv, "--metrics-jsonl", args.metrics_jsonl.as_deref());
-    push_opt_path(&mut argv, "--resume-from", args.resume_from.as_deref());
-    push_opt_value(&mut argv, "--lora-rank", args.lora_rank);
-    push_opt_value(&mut argv, "--lora-alpha", args.lora_alpha);
-    push_opt_value(&mut argv, "--serve", args.serve);
-    argv.extend(args.extra.extra_args.iter().cloned());
-
-    let mut notes = model.inspection.notes.clone();
-    if args.out.is_none() {
-        notes.push("out omitted; defaulted under runs/sft".to_string());
-    }
-    notes.push("config/tokenizer/generation config are auto-loaded from --model".to_string());
-
-    Ok(ResolvedInvocation {
-        command: "train sft",
-        argv,
-        backend: Some(model.backend),
-        output_dir: Some(out_dir.display().to_string()),
-        model: Some(model.inspection),
-        notes,
-    })
-}
-
-fn resolve_eval_invocation(args: &TrainEvalArgs) -> Result<ResolvedInvocation> {
-    let model = resolve_model_command(&args.model, args.backend, args.render.dry_run)?;
-
-    let mut argv = vec![
-        "--model-path".to_string(),
-        model.model_arg.clone(),
-        "--data".to_string(),
-        args.data.display().to_string(),
-        "--backend".to_string(),
-        model.backend.clone(),
-    ];
-    push_opt_family(&mut argv, args.model_family);
-    if let Some(tokenizer) = args.tokenizer.as_deref() {
-        let tokenizer_path = resolve_local_tokenizer_path(tokenizer)?;
-        argv.push("--tokenizer".to_string());
-        argv.push(tokenizer_path.display().to_string());
-    }
-    push_opt_value(&mut argv, "--seq-len", args.seq_len);
-    push_opt_path(&mut argv, "--metrics-jsonl", args.metrics_jsonl.as_deref());
-    argv.extend(args.extra.extra_args.iter().cloned());
-
-    let mut notes = model.inspection.notes.clone();
-    notes.push(
-        "config/tokenizer are auto-loaded from --model unless --tokenizer overrides it".to_string(),
-    );
-
-    Ok(ResolvedInvocation {
-        command: "train eval",
-        argv,
-        backend: Some(model.backend),
-        output_dir: None,
-        model: Some(model.inspection),
-        notes,
-    })
-}
-
-fn resolve_grpo_invocation(args: &TrainGrpoArgs) -> ResolvedInvocation {
-    let backend = args
-        .backend
-        .as_train_backend()
-        .unwrap_or_else(default_train_backend);
-    let mut argv = vec!["--backend".to_string(), backend.to_string()];
-    push_opt_family(&mut argv, args.model_family);
-    push_opt_value(&mut argv, "--sft-steps", args.sft_steps);
-    push_opt_value(&mut argv, "--grpo-iters", args.grpo_iters);
-    push_opt_value(&mut argv, "--save-every", args.save_every);
-    push_opt_value(&mut argv, "--batch-prompts", args.batch_prompts);
-    push_opt_value(&mut argv, "--group-size", args.group_size);
-    push_opt_value(&mut argv, "--seq", args.seq);
-    push_opt_value(&mut argv, "--lr", args.lr);
-    push_opt_value(&mut argv, "--kl-coef", args.kl_coef);
-    push_opt_value(&mut argv, "--temperature", args.temperature);
-    push_opt_value(&mut argv, "--seed", args.seed);
-    push_opt_value(&mut argv, "--lora-rank", args.lora_rank);
-    push_opt_value(&mut argv, "--lora-alpha", args.lora_alpha);
-    push_grad_clip_flags(&mut argv, args.grad_clip, args.no_grad_clip);
-    push_opt_path(&mut argv, "--metrics-jsonl", args.metrics_jsonl.as_deref());
-    push_opt_path(&mut argv, "--save-path", args.save_path.as_deref());
-    push_opt_path(&mut argv, "--resume-from", args.resume_from.as_deref());
-    push_opt_value(&mut argv, "--serve", args.serve);
-    push_opt_value(&mut argv, "--linear-attn-every", args.linear_attn_every);
-    argv.extend(args.extra.extra_args.iter().cloned());
-
-    ResolvedInvocation {
-        command: "train grpo",
-        argv,
-        backend: Some(backend.to_string()),
-        output_dir: args
-            .save_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        model: None,
-        notes: Vec::new(),
-    }
-}
-
-fn resolve_multi_turn_invocation(args: &TrainMultiTurnArgs) -> ResolvedInvocation {
-    let backend = args
-        .backend
-        .as_train_backend()
-        .unwrap_or_else(default_train_backend);
-    let mut argv = vec!["--backend".to_string(), backend.to_string()];
-    push_opt_value(&mut argv, "--iters", args.iters);
-    push_opt_value(&mut argv, "--group-size", args.group_size);
-    push_opt_value(&mut argv, "--agent-tokens", args.agent_tokens);
-    push_opt_value(&mut argv, "--obs-tokens", args.obs_tokens);
-    push_opt_value(&mut argv, "--turns", args.turns);
-    push_opt_value(&mut argv, "--prompt-len", args.prompt_len);
-    push_opt_value(&mut argv, "--lr", args.lr);
-    push_opt_value(&mut argv, "--kl-coef", args.kl_coef);
-    push_opt_value(&mut argv, "--clip-eps", args.clip_eps);
-    push_opt_value(&mut argv, "--temperature", args.temperature);
-    push_opt_value(&mut argv, "--gamma", args.gamma);
-    push_opt_value(&mut argv, "--lora-rank", args.lora_rank);
-    push_opt_value(&mut argv, "--lora-alpha", args.lora_alpha);
-    push_opt_value(&mut argv, "--seed", args.seed);
-    push_opt_value(&mut argv, "--vocab", args.vocab);
-    push_opt_value(&mut argv, "--target-range", args.target_range);
-    push_opt_value(&mut argv, "--d-model", args.d_model);
-    push_opt_value(&mut argv, "--n-layers", args.n_layers);
-    push_opt_value(&mut argv, "--n-heads", args.n_heads);
-    push_opt_value(&mut argv, "--d-head", args.d_head);
-    push_opt_value(&mut argv, "--d-ff", args.d_ff);
-    push_opt_value(&mut argv, "--linear-attn-every", args.linear_attn_every);
-    push_opt_value(&mut argv, "--eval-every", args.eval_every);
-    push_opt_value(&mut argv, "--eval-prompts", args.eval_prompts);
-    push_opt_value(&mut argv, "--eval-temperature", args.eval_temperature);
-    push_opt_path(&mut argv, "--save-path", args.save_path.as_deref());
-    push_opt_path(&mut argv, "--resume-from", args.resume_from.as_deref());
-    push_opt_value(&mut argv, "--serve", args.serve);
-    push_grad_clip_flags(&mut argv, args.grad_clip, args.no_grad_clip);
-    push_opt_path(&mut argv, "--metrics-jsonl", args.metrics_jsonl.as_deref());
-    if let Some(objective) = args.objective {
-        argv.push("--objective".to_string());
-        argv.push(objective.as_train_objective().to_string());
-    }
-    argv.extend(args.extra.extra_args.iter().cloned());
-
-    ResolvedInvocation {
-        command: "train multi-turn",
-        argv,
-        backend: Some(backend.to_string()),
-        output_dir: args
-            .save_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        model: None,
-        notes: Vec::new(),
-    }
-}
-
-fn train_test_inner(args: &TrainTestArgs, root_dir: &Path) -> Result<TrainTestReport> {
-    let backend = args
-        .backend
-        .as_train_backend()
-        .unwrap_or_else(default_train_backend)
-        .to_string();
-    fs::create_dir_all(root_dir)?;
-
-    let executable = arle_executable()?;
-    let corpus = root_dir.join("corpus.txt");
-    let tokenizer = root_dir.join("tokenizer.json");
-    let raw = root_dir.join("raw_dolly.jsonl");
-    let chat = root_dir.join("train.chat.jsonl");
-    let pretrain_out = root_dir.join("pretrain");
-    let sft_out = root_dir.join("sft");
-
-    fs::write(&corpus, "hello world\n2+2 equals 4\nblue is a color\n")?;
-    write_chatml_wordlevel_tokenizer(
-        &tokenizer,
-        [
-            "hello",
-            "world",
-            "2+2",
-            "equals",
-            "4",
-            "blue",
-            "is",
-            "a",
-            "color",
-            "Say",
-            "What",
-            "Name",
-            "one",
-            "word.",
-            "?",
-            "Hello!",
-            "Blue.",
-            "2+2 equals 4.",
-        ],
-    )?;
-    fs::write(
-        &raw,
-        concat!(
-            "{\"instruction\":\"Say hello in one word.\",\"response\":\"Hello!\"}\n",
-            "{\"instruction\":\"What is 2+2?\",\"response\":\"2+2 equals 4.\"}\n"
-        ),
-    )?;
-
-    let started = Instant::now();
-    run_arle_step(
-        &executable,
-        "convert",
-        &[
-            "data".to_string(),
-            "convert".to_string(),
-            "--input".to_string(),
-            raw.display().to_string(),
-            "--format".to_string(),
-            DatasetFormatArg::Dolly.as_train_format().to_string(),
-            "--output".to_string(),
-            chat.display().to_string(),
-        ],
-    )?;
-
-    run_arle_step(
-        &executable,
-        "pretrain",
-        &[
-            "train".to_string(),
-            "pretrain".to_string(),
-            "--corpus".to_string(),
-            corpus.display().to_string(),
-            "--tokenizer".to_string(),
-            tokenizer.display().to_string(),
-            "--out".to_string(),
-            pretrain_out.display().to_string(),
-            "--steps".to_string(),
-            "2".to_string(),
-            "--seq".to_string(),
-            "8".to_string(),
-            "--hidden".to_string(),
-            "32".to_string(),
-            "--layers".to_string(),
-            "2".to_string(),
-            "--heads".to_string(),
-            "2".to_string(),
-            "--kv-heads".to_string(),
-            "2".to_string(),
-            "--head-dim".to_string(),
-            "16".to_string(),
-            "--intermediate".to_string(),
-            "64".to_string(),
-            "--max-pos".to_string(),
-            "16".to_string(),
-            "--backend".to_string(),
-            backend.clone(),
-            "--save-every".to_string(),
-            "2".to_string(),
-            "--log-every".to_string(),
-            "1".to_string(),
-        ],
-    )?;
-
-    run_arle_step(
-        &executable,
-        "sft",
-        &[
-            "train".to_string(),
-            "sft".to_string(),
-            "--model".to_string(),
-            pretrain_out.join("latest").display().to_string(),
-            "--data".to_string(),
-            chat.display().to_string(),
-            "--out".to_string(),
-            sft_out.display().to_string(),
-            "--steps".to_string(),
-            "1".to_string(),
-            "--seq-len".to_string(),
-            "16".to_string(),
-            "--backend".to_string(),
-            backend.clone(),
-            "--save-every".to_string(),
-            "1".to_string(),
-            "--log-every".to_string(),
-            "1".to_string(),
-            "--lora-rank".to_string(),
-            "4".to_string(),
-            "--lora-alpha".to_string(),
-            "8".to_string(),
-        ],
-    )?;
-
-    let eval = run_arle_step(
-        &executable,
-        "eval",
-        &[
-            "train".to_string(),
-            "eval".to_string(),
-            "--model".to_string(),
-            sft_out.join("latest").display().to_string(),
-            "--data".to_string(),
-            chat.display().to_string(),
-            "--seq-len".to_string(),
-            "16".to_string(),
-            "--backend".to_string(),
-            backend.clone(),
-        ],
-    )?;
-    let eval_summary: EvalSummary =
-        serde_json::from_str(eval.stdout.trim()).with_context(|| {
-            format!(
-                "parsing eval smoke JSON from stdout:\n{}",
-                printable_output(&eval.stdout)
-            )
-        })?;
-    let kept_artifacts = args.keep_artifacts || args.out_dir.is_some();
-    let servable_model_dir = kept_artifacts.then(|| sft_out.join("latest").display().to_string());
-
-    let report = TrainTestReport {
-        backend,
-        root_dir: root_dir.display().to_string(),
-        servable_model_dir,
-        wall_secs: started.elapsed().as_secs_f64(),
-        steps: ok_train_test_steps(),
-        eval_summary: Some(eval_summary),
-        kept_artifacts,
-    };
-    Ok(report)
-}
-
 fn estimate_from_model_dir(
     model_source: &Path,
     args: &TrainEstimateMemoryArgs,
@@ -835,25 +300,6 @@ fn inspect_model_source(source: &Path, allow_download: bool) -> Result<ModelInsp
     })
 }
 
-fn resolve_model_command(
-    source: &Path,
-    backend: BackendArg,
-    dry_run: bool,
-) -> Result<ResolvedModelCommand> {
-    let inspection = inspect_model_source(source, !dry_run)?;
-    Ok(ResolvedModelCommand {
-        model_arg: inspection
-            .resolved_dir
-            .clone()
-            .unwrap_or_else(|| source.display().to_string()),
-        backend: backend
-            .as_train_backend()
-            .unwrap_or_else(default_train_backend)
-            .to_string(),
-        inspection,
-    })
-}
-
 fn inspect_resolved_model_dir(model_dir: &Path) -> Result<ModelDirSummary> {
     let config_path = model_dir.join("config.json");
     let config_value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path)?)
@@ -898,7 +344,7 @@ fn inspect_resolved_model_dir(model_dir: &Path) -> Result<ModelDirSummary> {
             let cfg = Qwen35Config::from_json_file(&config_path)?;
             Ok(ModelDirSummary {
                 family: "qwen35".to_string(),
-                config: ResolvedModelConfig::Qwen35(cfg.clone()),
+                config: ResolvedModelConfig::Qwen35(Box::new(cfg.clone())),
                 config_path: config_path.display().to_string(),
                 tokenizer_path: existing_display_path(model_dir.join("tokenizer.json")),
                 generation_config_path: existing_display_path(
@@ -1107,205 +553,8 @@ fn mul_u64(lhs: usize, rhs: usize) -> u64 {
     (lhs as u64).saturating_mul(rhs as u64)
 }
 
-fn push_opt_value<T: ToString>(argv: &mut Vec<String>, flag: &str, value: Option<T>) {
-    if let Some(value) = value {
-        argv.push(flag.to_string());
-        argv.push(value.to_string());
-    }
-}
-
-fn push_opt_string(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
-    if let Some(value) = value {
-        argv.push(flag.to_string());
-        argv.push(value.to_string());
-    }
-}
-
-fn push_opt_token(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
-    push_opt_string(argv, flag, value);
-}
-
-fn push_opt_path(argv: &mut Vec<String>, flag: &str, value: Option<&Path>) {
-    if let Some(value) = value {
-        argv.push(flag.to_string());
-        argv.push(value.display().to_string());
-    }
-}
-
-fn push_opt_family(argv: &mut Vec<String>, family: Option<ModelFamilyArg>) {
-    if let Some(family) = family {
-        argv.push("--model-family".to_string());
-        argv.push(family.as_train_family().to_string());
-    }
-}
-
-fn push_opt_save_dtype(argv: &mut Vec<String>, dtype: Option<SaveDtypeArg>) {
-    if let Some(dtype) = dtype {
-        argv.push("--save-dtype".to_string());
-        argv.push(dtype.as_train_dtype().to_string());
-    }
-}
-
-fn push_grad_clip_flags(argv: &mut Vec<String>, grad_clip: Option<f32>, no_grad_clip: bool) {
-    if no_grad_clip {
-        argv.push("--no-grad-clip".to_string());
-    } else {
-        push_opt_value(argv, "--grad-clip", grad_clip);
-    }
-}
-
-fn default_job_output(job: &str, seed: &Path) -> PathBuf {
-    PathBuf::from("runs")
-        .join(job)
-        .join(sanitize_name(path_seed_name(seed)))
-}
-
-fn default_chat_output_path(input: &Path) -> PathBuf {
-    let stem = input
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("dataset");
-    input.with_file_name(format!("{stem}.chat.jsonl"))
-}
-
-fn path_seed_name(seed: &Path) -> String {
-    seed.file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("run")
-        .to_string()
-}
-
-fn sanitize_name(value: String) -> String {
-    let mapped = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let sanitized = mapped.trim_matches('-').to_string();
-    if sanitized.is_empty() {
-        "run".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    std::env::temp_dir().join(format!("{prefix}-{}-{millis}", std::process::id()))
-}
-
-fn shell_words(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| {
-            if arg.contains(' ') {
-                format!("{arg:?}")
-            } else {
-                arg.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn existing_display_path(path: PathBuf) -> Option<String> {
     path.is_file().then(|| path.display().to_string())
-}
-
-fn arle_executable() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_arle").map(PathBuf::from) {
-        return Ok(path);
-    }
-    std::env::current_exe().context("resolve current ARLE executable")
-}
-
-fn run_arle_step(
-    executable: &Path,
-    step: &'static str,
-    args: &[String],
-) -> Result<CapturedStepOutput> {
-    let output = Command::new(executable)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawn smoke step {step}"))?;
-    ensure_successful_step(executable, step, args, output)
-}
-
-fn ensure_successful_step(
-    executable: &Path,
-    step: &'static str,
-    args: &[String],
-    output: Output,
-) -> Result<CapturedStepOutput> {
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    if output.status.success() {
-        return Ok(CapturedStepOutput { stdout });
-    }
-    let code = output
-        .status
-        .code()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "signal".to_string());
-    bail!(
-        "{step} smoke failed (exit {code})\ncommand: {} {}\nstdout:\n{}\nstderr:\n{}",
-        executable.display(),
-        shell_words(args),
-        printable_output(&stdout),
-        printable_output(&stderr),
-    );
-}
-
-fn printable_output(output: &str) -> &str {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        "<empty>"
-    } else {
-        trimmed
-    }
-}
-
-fn ok_train_test_steps() -> Vec<TrainTestStep> {
-    vec![
-        TrainTestStep {
-            name: "convert",
-            status: "ok",
-        },
-        TrainTestStep {
-            name: "pretrain",
-            status: "ok",
-        },
-        TrainTestStep {
-            name: "sft",
-            status: "ok",
-        },
-        TrainTestStep {
-            name: "eval",
-            status: "ok",
-        },
-    ]
-}
-
-impl TrainPretrainArgs {
-    fn has_shape_overrides(&self) -> bool {
-        self.hidden.is_some()
-            || self.layers.is_some()
-            || self.heads.is_some()
-            || self.kv_heads.is_some()
-            || self.head_dim.is_some()
-            || self.intermediate.is_some()
-            || self.max_pos.is_some()
-            || self.linear_attn_every.is_some()
-    }
 }
 
 fn format_count(count: u64) -> String {
@@ -1473,27 +722,6 @@ impl ScratchShape {
         }
     }
 
-    fn push_shape_flags(&self, argv: &mut Vec<String>) {
-        argv.push("--hidden".to_string());
-        argv.push(self.hidden.to_string());
-        argv.push("--layers".to_string());
-        argv.push(self.layers.to_string());
-        argv.push("--heads".to_string());
-        argv.push(self.heads.to_string());
-        argv.push("--kv-heads".to_string());
-        argv.push(self.kv_heads.to_string());
-        argv.push("--head-dim".to_string());
-        argv.push(self.head_dim.to_string());
-        argv.push("--intermediate".to_string());
-        argv.push(self.intermediate.to_string());
-        argv.push("--max-pos".to_string());
-        argv.push(self.max_pos.to_string());
-        if self.linear_attn_every > 0 {
-            argv.push("--linear-attn-every".to_string());
-            argv.push(self.linear_attn_every.to_string());
-        }
-    }
-
     fn qwen35_config(&self, vocab_size: usize) -> Qwen35Config {
         let mut layer_types = vec![LayerType::FullAttention; self.layers];
         if self.linear_attn_every > 0 {
@@ -1555,20 +783,6 @@ struct TrainEnvReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ResolvedInvocation {
-    command: &'static str,
-    argv: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backend: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_dir: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<ModelInspection>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 struct ModelInspection {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1592,13 +806,6 @@ impl ModelInspection {
 }
 
 #[derive(Debug)]
-struct ResolvedModelCommand {
-    inspection: ModelInspection,
-    model_arg: String,
-    backend: String,
-}
-
-#[derive(Debug)]
 struct ModelDirSummary {
     family: String,
     config: ResolvedModelConfig,
@@ -1612,7 +819,7 @@ struct ModelDirSummary {
 
 #[derive(Debug)]
 enum ResolvedModelConfig {
-    Qwen35(Qwen35Config),
+    Qwen35(Box<Qwen35Config>),
     DeepSeekV4,
 }
 
@@ -1640,37 +847,6 @@ struct EstimateMemoryReport {
     save_dtype: String,
 }
 
-#[derive(Debug, Serialize)]
-struct TrainTestReport {
-    backend: String,
-    root_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    servable_model_dir: Option<String>,
-    wall_secs: f64,
-    steps: Vec<TrainTestStep>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    eval_summary: Option<EvalSummary>,
-    kept_artifacts: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct TrainTestStep {
-    name: &'static str,
-    status: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-struct EvalSummary {
-    loss: f64,
-    ppl: f64,
-    tokens: usize,
-}
-
-#[derive(Debug)]
-struct CapturedStepOutput {
-    stdout: String,
-}
-
 impl SaveDtypeArg {
     fn bytes_per_param(self) -> u64 {
         match self {
@@ -1682,32 +858,7 @@ impl SaveDtypeArg {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EvalSummary, PretrainPresetArg, ResolvedInvocation, ScratchShape, TrainTestReport,
-        TrainTestStep, default_chat_output_path, resolve_pretrain_invocation,
-        run_passthrough_invocation, run_train_command, sanitize_name,
-    };
-    use crate::args::{BackendArg, ExtraArgs, RenderArgs, TrainPretrainArgs};
-    use std::{cell::Cell, path::Path, process::ExitCode};
-
-    #[test]
-    fn default_chat_output_uses_chat_suffix() {
-        let output = default_chat_output_path(Path::new("train.jsonl"));
-        assert_eq!(output, Path::new("train.chat.jsonl"));
-    }
-
-    #[test]
-    fn sanitize_name_collapses_non_ascii_path_chars() {
-        assert_eq!(
-            sanitize_name("Qwen/Qwen3-0.6B".to_string()),
-            "Qwen-Qwen3-0-6B"
-        );
-    }
-
-    #[test]
-    fn sanitize_name_falls_back_when_everything_is_filtered() {
-        assert_eq!(sanitize_name("！！！".to_string()), "run");
-    }
+    use super::{PretrainPresetArg, ScratchShape};
 
     #[test]
     fn small_30m_preset_applies_expected_shape() {
@@ -1718,179 +869,5 @@ mod tests {
         assert_eq!(shape.heads, 6);
         assert_eq!(shape.kv_heads, 3);
         assert_eq!(shape.head_dim, 32);
-    }
-
-    #[test]
-    fn default_pretrain_invocation_preserves_binary_shape_defaults() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let tokenizer = temp.path().join("tokenizer.json");
-        std::fs::write(&tokenizer, "{}").expect("write tokenizer");
-        let invocation = resolve_pretrain_invocation(&base_pretrain_args(&tokenizer))
-            .expect("resolve pretrain args");
-        assert!(!invocation.argv.iter().any(|arg| arg == "--hidden"));
-        assert!(!invocation.argv.iter().any(|arg| arg == "--layers"));
-        assert!(
-            invocation
-                .notes
-                .iter()
-                .any(|note| note.contains("underlying pretrain defaults apply"))
-        );
-    }
-
-    #[test]
-    fn train_test_report_serializes_public_fields_only() {
-        let report = TrainTestReport {
-            backend: "metal".to_string(),
-            root_dir: "/tmp/arle-train-test".to_string(),
-            servable_model_dir: Some("/tmp/arle-train-test/sft/latest".to_string()),
-            wall_secs: 1.25,
-            steps: vec![
-                TrainTestStep {
-                    name: "convert",
-                    status: "ok",
-                },
-                TrainTestStep {
-                    name: "eval",
-                    status: "ok",
-                },
-            ],
-            eval_summary: Some(EvalSummary {
-                loss: 1.0,
-                ppl: 2.0,
-                tokens: 3,
-            }),
-            kept_artifacts: false,
-        };
-        let value = serde_json::to_value(report).expect("serialize train test report");
-        assert_eq!(value["backend"], "metal");
-        assert_eq!(
-            value["servable_model_dir"],
-            "/tmp/arle-train-test/sft/latest"
-        );
-        assert_eq!(value["steps"][0]["name"], "convert");
-        assert_eq!(value["steps"][1]["status"], "ok");
-        assert!(value.get("json").is_none());
-    }
-
-    #[test]
-    fn train_test_report_omits_model_dir_when_artifacts_are_deleted() {
-        let report = TrainTestReport {
-            backend: "cpu".to_string(),
-            root_dir: "/tmp/arle-train-test".to_string(),
-            servable_model_dir: None,
-            wall_secs: 1.25,
-            steps: vec![TrainTestStep {
-                name: "convert",
-                status: "ok",
-            }],
-            eval_summary: None,
-            kept_artifacts: false,
-        };
-        let value = serde_json::to_value(report).expect("serialize train test report");
-        assert!(value.get("servable_model_dir").is_none());
-    }
-
-    #[test]
-    fn train_command_runs_dispatch_for_non_dry_run() {
-        let called = Cell::new(false);
-        let exit = run_train_command(
-            "train eval",
-            Ok(test_invocation("train eval", ["--seq-len", "32"])),
-            &RenderArgs {
-                dry_run: false,
-                json: false,
-            },
-            |argv| {
-                called.set(true);
-                assert_eq!(argv, vec!["--seq-len".to_string(), "32".to_string()]);
-                Ok(())
-            },
-        );
-        assert!(called.get());
-        assert_eq!(exit, ExitCode::SUCCESS);
-    }
-
-    #[test]
-    fn passthrough_invocation_preserves_child_exit_code() {
-        let called = Cell::new(false);
-        let exit = run_passthrough_invocation(
-            test_invocation("data convert", ["--input", "train.jsonl"]),
-            &RenderArgs {
-                dry_run: false,
-                json: false,
-            },
-            |argv| {
-                called.set(true);
-                assert_eq!(argv, vec!["--input".to_string(), "train.jsonl".to_string()]);
-                ExitCode::from(2)
-            },
-        );
-        assert!(called.get());
-        assert_eq!(exit, ExitCode::from(2));
-    }
-
-    fn base_pretrain_args(tokenizer: &Path) -> TrainPretrainArgs {
-        TrainPretrainArgs {
-            corpus: "corpus.txt".into(),
-            tokenizer: tokenizer.into(),
-            out: None,
-            preset: None,
-            model_family: None,
-            steps: None,
-            batch: None,
-            seq: None,
-            lr: None,
-            grad_accum_steps: None,
-            log_every: None,
-            save_every: None,
-            eval_every: None,
-            eval_windows: None,
-            eval_frac: None,
-            resume_from: None,
-            seed: None,
-            grad_clip: None,
-            no_grad_clip: false,
-            backend: BackendArg::Auto,
-            save_dtype: None,
-            vocab_size: None,
-            hidden: None,
-            layers: None,
-            heads: None,
-            kv_heads: None,
-            head_dim: None,
-            intermediate: None,
-            max_pos: None,
-            rms_eps: None,
-            rope_theta: None,
-            no_tie_embed: false,
-            linear_attn_every: None,
-            bos_token: None,
-            eos_token: None,
-            bos_token_id: None,
-            eos_token_id: None,
-            metrics_jsonl: None,
-            serve: None,
-            render: RenderArgs {
-                dry_run: false,
-                json: false,
-            },
-            extra: ExtraArgs {
-                extra_args: Vec::new(),
-            },
-        }
-    }
-
-    fn test_invocation<const N: usize>(
-        command: &'static str,
-        argv: [&str; N],
-    ) -> ResolvedInvocation {
-        ResolvedInvocation {
-            command,
-            argv: argv.into_iter().map(ToString::to_string).collect(),
-            backend: None,
-            output_dir: None,
-            model: None,
-            notes: Vec::new(),
-        }
     }
 }
