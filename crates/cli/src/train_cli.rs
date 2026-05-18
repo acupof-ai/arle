@@ -19,10 +19,9 @@ use train::{
 use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs};
 use crate::{
     args::{
-        BackendArg, DataArgs, DataCommand, DataConvertArgs, DataDownloadArgs, DatasetFormatArg,
-        ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg, TrainArgs, TrainCommand,
-        TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs, TrainGrpoArgs, TrainMultiTurnArgs,
-        TrainPretrainArgs, TrainPretrainDsv4Args, TrainSftArgs, TrainTestArgs,
+        BackendArg, DatasetFormatArg, ModelFamilyArg, PretrainPresetArg, RenderArgs, SaveDtypeArg,
+        TrainArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainEvalArgs,
+        TrainGrpoArgs, TrainMultiTurnArgs, TrainPretrainArgs, TrainSftArgs, TrainTestArgs,
     },
     hardware, hub_discovery,
 };
@@ -31,14 +30,7 @@ const TRAIN_ENV_COMMANDS: &[&str] = &[
     "train env",
     "train test",
     "train estimate-memory",
-    "train pretrain",
-    "train pretrain-dsv4",
-    "train sft",
-    "train grpo",
-    "train multi-turn",
-    "train eval",
-    "data download",
-    "data convert",
+    "train opd",
 ];
 
 pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
@@ -46,19 +38,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::Env(args) => exit_from_result(run_train_env(args)),
         TrainCommand::Test(args) => run_train_test(args),
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
-        TrainCommand::Pretrain(args) => run_pretrain(args),
-        TrainCommand::PretrainDsv4(args) => run_pretrain_dsv4(args),
-        TrainCommand::Sft(args) => run_sft(args),
-        TrainCommand::Grpo(args) => run_grpo(args),
-        TrainCommand::MultiTurn(args) => run_multi_turn(args),
-        TrainCommand::Eval(args) => run_eval(args),
-    }
-}
-
-pub(crate) fn run_data(data: DataArgs) -> ExitCode {
-    match data.command {
-        DataCommand::Download(args) => run_data_download(args),
-        DataCommand::Convert(args) => run_data_convert(args),
+        TrainCommand::Opd(_) => run_opd(),
     }
 }
 
@@ -240,179 +220,12 @@ fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_pretrain(args: TrainPretrainArgs) -> ExitCode {
-    run_train_command(
-        "train pretrain",
-        resolve_pretrain_invocation(&args),
-        &args.render,
-        train::commands::pretrain::dispatch_from_args,
-    )
-}
-
-fn run_pretrain_dsv4(args: TrainPretrainDsv4Args) -> ExitCode {
-    run_train_command(
-        "train pretrain-dsv4",
-        resolve_pretrain_dsv4_invocation(&args),
-        &args.render,
-        train::commands::pretrain_dsv4::dispatch_from_args,
-    )
-}
-
-fn resolve_pretrain_dsv4_invocation(args: &TrainPretrainDsv4Args) -> Result<ResolvedInvocation> {
-    let model_dir = args
-        .model
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("infer/models/dsv4-mini-1B-init"));
-    let model = inspect_model_source(&model_dir, !args.render.dry_run)?;
-    let model_arg = model
-        .resolved_dir
-        .clone()
-        .unwrap_or_else(|| model_dir.display().to_string());
-    let tokenizer_path = match &args.tokenizer {
-        Some(tokenizer) => resolve_local_tokenizer_path(tokenizer)?,
-        None => model_dir.join("tokenizer.json"),
-    };
-    let out_dir = args
-        .out
-        .clone()
-        .unwrap_or_else(|| default_job_output("pretrain-dsv4", &args.corpus));
-
-    let mut argv = vec![
-        "--model".to_string(),
-        model_arg.clone(),
-        "--corpus".to_string(),
-        args.corpus.display().to_string(),
-        "--tokenizer".to_string(),
-        tokenizer_path.display().to_string(),
-        "--out".to_string(),
-        out_dir.display().to_string(),
-        "--deepseek-config".to_string(),
-        args.deepseek_config.clone(),
-    ];
-    if let Some(seed) = args.seed {
-        argv.push("--seed".to_string());
-        argv.push(seed.to_string());
-    }
-    push_opt_value(&mut argv, "--steps", args.steps);
-    push_opt_value(&mut argv, "--batch", args.batch);
-    push_opt_value(&mut argv, "--seq", args.seq);
-    push_opt_value(&mut argv, "--lr", args.lr);
-    push_opt_value(&mut argv, "--log-every", args.log_every);
-    push_opt_value(&mut argv, "--save-every", args.save_every);
-    if let Some(backend) = args.backend.as_train_backend() {
-        argv.push("--backend".to_string());
-        argv.push(backend.to_string());
-    }
-    push_opt_save_dtype(&mut argv, args.save_dtype);
-    argv.extend(args.extra.extra_args.iter().cloned());
-
-    let mut notes = Vec::new();
-    if args.out.is_none() {
-        notes.push("out omitted; defaulted under runs/pretrain-dsv4".to_string());
-    }
-    notes.extend(model.notes.clone());
-    notes.push(format!("resolved model {model_arg}"));
-    notes.push(format!("resolved tokenizer {}", tokenizer_path.display()));
-    notes.push("DeepSeek train surface is V4-only; deleted V3/nano random-init path".to_string());
-
-    Ok(ResolvedInvocation {
-        command: "train pretrain-dsv4",
-        argv,
-        backend: None,
-        output_dir: Some(out_dir.display().to_string()),
-        model: Some(model),
-        notes,
-    })
-}
-
-fn run_sft(args: TrainSftArgs) -> ExitCode {
-    run_train_command(
-        "train sft",
-        resolve_sft_invocation(&args),
-        &args.render,
-        train::commands::train_sft::dispatch_from_args,
-    )
-}
-
-fn run_eval(args: TrainEvalArgs) -> ExitCode {
-    run_train_command(
-        "train eval",
-        resolve_eval_invocation(&args),
-        &args.render,
-        train::commands::eval_lm::dispatch_from_args,
-    )
-}
-
-fn run_grpo(args: TrainGrpoArgs) -> ExitCode {
-    run_train_command(
-        "train grpo",
-        Ok(resolve_grpo_invocation(&args)),
-        &args.render,
-        train::commands::train_grpo::dispatch_from_args,
-    )
-}
-
-fn run_multi_turn(args: TrainMultiTurnArgs) -> ExitCode {
-    run_train_command(
-        "train multi-turn",
-        Ok(resolve_multi_turn_invocation(&args)),
-        &args.render,
-        train::commands::train_multi_turn::dispatch_from_args,
-    )
-}
-
-fn run_data_convert(args: DataConvertArgs) -> ExitCode {
-    let used_default_output = args.output.is_none();
-    let output = args
-        .output
-        .unwrap_or_else(|| default_chat_output_path(&args.input));
-    let invocation = ResolvedInvocation {
-        command: "data convert",
-        argv: vec![
-            "--input".to_string(),
-            args.input.display().to_string(),
-            "--format".to_string(),
-            args.format.as_train_format().to_string(),
-            "--output".to_string(),
-            output.display().to_string(),
-        ],
-        backend: None,
-        output_dir: None,
-        model: None,
-        notes: if used_default_output {
-            vec!["output omitted; defaulted from input path".to_string()]
-        } else {
-            Vec::new()
-        },
-    };
-
-    run_passthrough_invocation(
-        invocation,
-        &args.render,
-        train::commands::convert_dataset::dispatch_from_args,
-    )
-}
-
-fn run_data_download(args: DataDownloadArgs) -> ExitCode {
-    let invocation = ResolvedInvocation {
-        command: "data download",
-        argv: vec![
-            "--repo".to_string(),
-            args.repo,
-            "--file".to_string(),
-            args.file,
-        ],
-        backend: None,
-        output_dir: None,
-        model: None,
-        notes: Vec::new(),
-    };
-
-    run_passthrough_invocation(
-        invocation,
-        &args.render,
-        train::commands::download_dataset::dispatch_from_args,
-    )
+fn run_opd() -> ExitCode {
+    eprintln!(
+        "[ARLE train opd] error: OPD substrate landing next milestone; see \
+         docs/projects/2026-05-18-opd-only-pivot.md"
+    );
+    ExitCode::FAILURE
 }
 
 fn run_train_invocation<F>(invocation: ResolvedInvocation, render: &RenderArgs, run: F) -> ExitCode

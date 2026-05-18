@@ -40,7 +40,6 @@ pub fn run() -> ExitCode {
 
     match command {
         Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
-        Some(CliCommand::Data(command)) => return train_cli::run_data(*command),
         #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
         Some(CliCommand::Model(command)) => return train_cli::run_model(*command),
         #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
