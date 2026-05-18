@@ -20,6 +20,7 @@ use autograd::backend::cpu_matmul_forward;
 
 const WARMUP: usize = 1;
 const RUNS: usize = 5;
+const TARGET_FMAS_PER_RUN: usize = 1_000_000_000;
 
 #[derive(Clone, Copy)]
 struct Shape {
@@ -104,67 +105,104 @@ fn deterministic_fill(buf: &mut [f32], seed: u64) {
     }
 }
 
-fn time_one(shape: Shape) -> (f64, f64) {
+fn time_one(shape: Shape) -> (f64, f64, f64) {
     let a_len = shape.m * shape.k;
     let b_len = shape.k * shape.n;
     let mut a = vec![0.0f32; a_len];
     let mut b = vec![0.0f32; b_len];
-    deterministic_fill(&mut a, 0xA110_C5);
-    deterministic_fill(&mut b, 0xB770_C5);
+    deterministic_fill(&mut a, 0x00A1_10C5);
+    deterministic_fill(&mut b, 0x00B7_70C5);
     let a_shape = [shape.m, shape.k];
     let b_shape = [shape.k, shape.n];
+    let fmas = shape.m * shape.k * shape.n;
+    let iters_per_run = (TARGET_FMAS_PER_RUN / fmas).max(1);
 
     // Warm caches.
     for _ in 0..WARMUP {
-        let _ = cpu_matmul_forward(&a, &a_shape, &b, &b_shape).expect("warmup");
+        for _ in 0..iters_per_run {
+            let _ = cpu_matmul_forward(&a, &a_shape, &b, &b_shape).expect("warmup");
+        }
     }
 
     let mut secs_runs = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         let started = Instant::now();
-        let (out, _) = cpu_matmul_forward(&a, &a_shape, &b, &b_shape).expect("run");
+        for _ in 0..iters_per_run {
+            let (out, _) = cpu_matmul_forward(&a, &a_shape, &b, &b_shape).expect("run");
+            std::hint::black_box(out);
+        }
         let elapsed = started.elapsed().as_secs_f64();
-        std::hint::black_box(out);
-        secs_runs.push(elapsed);
+        secs_runs.push(elapsed / iters_per_run as f64);
     }
     secs_runs.sort_by(f64::total_cmp);
     let median = secs_runs[secs_runs.len() / 2];
     let mean = secs_runs.iter().sum::<f64>() / secs_runs.len() as f64;
-    (median, mean)
+    let variance = secs_runs
+        .iter()
+        .map(|secs| {
+            let delta = secs - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / secs_runs.len() as f64;
+    let sigma = variance.sqrt();
+    let sigma_pct = if mean == 0.0 {
+        0.0
+    } else {
+        sigma / mean * 100.0
+    };
+    (median, mean, sigma_pct)
 }
 
 fn main() {
     println!(
-        "backend=cpu_matmul_forward (naive triple-loop scalar) shape_count={} warmup={} runs={}",
+        "backend=cpu_matmul_forward shape_count={} warmup={} runs={} target_fmas_per_run={}",
         QWEN3_06B_SHAPES.len(),
         WARMUP,
-        RUNS
+        RUNS,
+        TARGET_FMAS_PER_RUN
     );
     println!(
-        "{:<45} {:>10} {:>12} {:>14} {:>10} {:>14}",
-        "shape", "fmas", "median_s", "gflops_s", "×/fwd", "fwd_total_s"
+        "{:<45} {:>10} {:>12} {:>12} {:>10} {:>14} {:>10} {:>10} {:>14}",
+        "shape",
+        "fmas",
+        "median_s",
+        "mean_s",
+        "sigma_pct",
+        "gflops_s",
+        "iters/run",
+        "x/fwd",
+        "fwd_total_s"
     );
 
     let mut total_per_forward_secs = 0.0_f64;
     for shape in QWEN3_06B_SHAPES {
-        let fmas = (shape.m * shape.k * shape.n) as f64;
-        let (median, _mean) = time_one(*shape);
-        let gflops = (2.0 * fmas / median) / 1.0e9;
+        let fmas = shape.m * shape.k * shape.n;
+        let (median, mean, sigma_pct) = time_one(*shape);
+        let gflops = (2.0 * fmas as f64 / median) / 1.0e9;
         let per_fwd_secs = median * shape.per_forward_count as f64;
         total_per_forward_secs += per_fwd_secs;
         println!(
-            "{:<45} {:>10.3e} {:>12.6} {:>14.3} {:>10} {:>14.6}",
-            shape.name, fmas, median, gflops, shape.per_forward_count, per_fwd_secs
+            "{:<45} {:>10.3e} {:>12.6} {:>12.6} {:>10.3} {:>14.3} {:>10} {:>10} {:>14.6}",
+            shape.name,
+            fmas as f64,
+            median,
+            mean,
+            sigma_pct,
+            gflops,
+            (TARGET_FMAS_PER_RUN / fmas).max(1),
+            shape.per_forward_count,
+            per_fwd_secs
         );
     }
 
     println!();
     println!(
-        "estimated naive matmul cost per full forward (seq=4, all 28 layers + lm_head) = {:.6} s",
+        "estimated matmul cost per full forward (seq=4, all 28 layers + lm_head) = {:.6} s",
         total_per_forward_secs
     );
     println!(
-        "estimated naive matmul cost per OPD step (≈3 forwards, ignores backward) = {:.6} s",
+        "estimated matmul cost per OPD step (≈3 forwards, ignores backward) = {:.6} s",
         total_per_forward_secs * 3.0
     );
 }
