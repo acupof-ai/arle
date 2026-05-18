@@ -1548,66 +1548,163 @@ pub fn cpu_matmul_backward(
     need_grad_a: bool,
     need_grad_b: bool,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    use crate::AutogradError;
     let expected_out = matmul_output_shape(a_shape, b_shape)?;
     if grad_out_shape != expected_out.as_slice() {
-        return Err(crate::AutogradError::ShapeMismatch {
+        return Err(AutogradError::ShapeMismatch {
             expected: expected_out,
             got: grad_out_shape.to_vec(),
         });
     }
 
-    let grad_a = if need_grad_a {
-        // grad_a = grad_out @ b^T
-        let (b_t, b_t_shape) = transpose_last_two_ref(b, b_shape);
-        let (data, _) = cpu_matmul_forward(grad_out, grad_out_shape, &b_t, &b_t_shape)?;
-        data
-    } else {
-        Vec::new()
-    };
-    let grad_b = if need_grad_b {
-        // grad_b = a^T @ grad_out
-        let (a_t, a_t_shape) = transpose_last_two_ref(a, a_shape);
-        let (data, _) = cpu_matmul_forward(&a_t, &a_t_shape, grad_out, grad_out_shape)?;
-        data
-    } else {
-        Vec::new()
-    };
-    Ok((grad_a, grad_b))
+    match (a_shape.len(), b_shape.len()) {
+        (2, 2) => {
+            let m = a_shape[0];
+            let k = a_shape[1];
+            let n = b_shape[1];
+            let grad_a = if need_grad_a {
+                let mut out = vec![0.0f32; m * k];
+                matmul_a_bt_into(grad_out, a_shape_2d(m, n), b, b_shape_2d(k, n), &mut out);
+                out
+            } else {
+                Vec::new()
+            };
+            let grad_b = if need_grad_b {
+                let mut out = vec![0.0f32; k * n];
+                matmul_at_b_into(a, a_shape_2d(m, k), grad_out, b_shape_2d(m, n), &mut out);
+                out
+            } else {
+                Vec::new()
+            };
+            Ok((grad_a, grad_b))
+        }
+        (3, 3) => {
+            let batch = a_shape[0];
+            let m = a_shape[1];
+            let k = a_shape[2];
+            let n = b_shape[2];
+            let a_plane = m * k;
+            let b_plane = k * n;
+            let grad_out_plane = m * n;
+            let grad_a = if need_grad_a {
+                let mut out = vec![0.0f32; batch * m * k];
+                for bi in 0..batch {
+                    matmul_a_bt_into(
+                        &grad_out[bi * grad_out_plane..(bi + 1) * grad_out_plane],
+                        a_shape_2d(m, n),
+                        &b[bi * b_plane..(bi + 1) * b_plane],
+                        b_shape_2d(k, n),
+                        &mut out[bi * a_plane..(bi + 1) * a_plane],
+                    );
+                }
+                out
+            } else {
+                Vec::new()
+            };
+            let grad_b = if need_grad_b {
+                let mut out = vec![0.0f32; batch * k * n];
+                for bi in 0..batch {
+                    matmul_at_b_into(
+                        &a[bi * a_plane..(bi + 1) * a_plane],
+                        a_shape_2d(m, k),
+                        &grad_out[bi * grad_out_plane..(bi + 1) * grad_out_plane],
+                        b_shape_2d(m, n),
+                        &mut out[bi * b_plane..(bi + 1) * b_plane],
+                    );
+                }
+                out
+            } else {
+                Vec::new()
+            };
+            Ok((grad_a, grad_b))
+        }
+        _ => Err(AutogradError::InvalidRank {
+            expected: "both operands must be rank-2 or rank-3",
+            got: a_shape.len().max(b_shape.len()),
+        }),
+    }
 }
 
-/// Transpose the inner-most two axes of a rank-2 or rank-3 row-major buffer.
-/// Pure-host scratch used by `cpu_matmul_backward` and the `no-cuda`
-/// type-check path of the CUDA backend.
-pub(crate) fn transpose_last_two_ref(data: &[f32], shape: &[usize]) -> (Vec<f32>, Vec<usize>) {
-    match shape.len() {
-        2 => {
-            let rows = shape[0];
-            let cols = shape[1];
-            let mut out = vec![0.0f32; rows * cols];
-            for row in 0..rows {
-                for col in 0..cols {
-                    out[col * rows + row] = data[row * cols + col];
-                }
+/// Pair of rank-2 row dimensions, kept inline so the rank-3 dispatcher can
+/// reuse the same kernel without re-allocating shape `Vec`s on every batch.
+#[inline]
+fn a_shape_2d(rows: usize, cols: usize) -> (usize, usize) {
+    (rows, cols)
+}
+#[inline]
+fn b_shape_2d(rows: usize, cols: usize) -> (usize, usize) {
+    (rows, cols)
+}
+
+/// Compute `out = a @ b^T` for row-major rank-2 buffers **without materialising
+/// `b^T`**. Same row-major locality pattern as `cpu_matmul_forward` (commit
+/// `499bfc0`): every inner loop iteration reads two contiguous f32 slices
+/// (a row of `a` and a row of `b`) and writes one f32. Used by
+/// `cpu_matmul_backward` for `grad_a = grad_out @ B^T`.
+///
+/// Shapes (caller-enforced):
+/// - `a`: `[M, N]` (row-major contiguous, len `M * N`)
+/// - `b`: `[K, N]` (row-major contiguous, len `K * N`) — logical pre-transpose
+/// - `out`: `[M, K]` (row-major contiguous, len `M * K`, pre-zeroed)
+#[inline]
+fn matmul_a_bt_into(
+    a: &[f32],
+    a_shape: (usize, usize),
+    b: &[f32],
+    b_shape: (usize, usize),
+    out: &mut [f32],
+) {
+    let (m, n_a) = a_shape;
+    let (k, n_b) = b_shape;
+    debug_assert_eq!(n_a, n_b, "a and b must share the K-equivalent dim");
+    let n = n_a;
+    for row in 0..m {
+        let a_row = &a[row * n..(row + 1) * n];
+        let out_row = &mut out[row * k..(row + 1) * k];
+        for kk in 0..k {
+            let b_row = &b[kk * n..(kk + 1) * n];
+            let mut acc = 0.0f32;
+            for col in 0..n {
+                acc += a_row[col] * b_row[col];
             }
-            (out, vec![cols, rows])
+            out_row[kk] = acc;
         }
-        3 => {
-            let batch = shape[0];
-            let rows = shape[1];
-            let cols = shape[2];
-            let plane = rows * cols;
-            let mut out = vec![0.0f32; batch * plane];
-            for batch_index in 0..batch {
-                let base = batch_index * plane;
-                for row in 0..rows {
-                    for col in 0..cols {
-                        out[base + col * rows + row] = data[base + row * cols + col];
-                    }
-                }
+    }
+}
+
+/// Compute `out = a^T @ b` for row-major rank-2 buffers **without materialising
+/// `a^T`**. Loop order is `kk → m → col` so the innermost `col` loop is a
+/// saxpy with **stable** `out_row` borrowed once per `kk` — same shape as the
+/// codex `499bfc0` forward inner loop, lets rustc keep `out_row` in registers
+/// for the whole M sweep. The `a_val = a[m * k + kk]` load is column-strided
+/// in `a` (stride `k`), but with `m ≤ 4` in OPD the strided lane fits trivially
+/// in L1d (≤ 4 cache lines per `kk`).
+///
+/// Shapes (caller-enforced):
+/// - `a`: `[M, K]` (row-major contiguous, len `M * K`) — logical pre-transpose
+/// - `b`: `[M, N]` (row-major contiguous, len `M * N`)
+/// - `out`: `[K, N]` (row-major contiguous, len `K * N`, pre-zeroed)
+#[inline]
+fn matmul_at_b_into(
+    a: &[f32],
+    a_shape: (usize, usize),
+    b: &[f32],
+    b_shape: (usize, usize),
+    out: &mut [f32],
+) {
+    let (m_a, k) = a_shape;
+    let (m_b, n) = b_shape;
+    debug_assert_eq!(m_a, m_b, "a and b must share the M dim");
+    let m = m_a;
+    for kk in 0..k {
+        let out_row = &mut out[kk * n..(kk + 1) * n];
+        for row in 0..m {
+            let a_val = a[row * k + kk];
+            let b_row = &b[row * n..(row + 1) * n];
+            for col in 0..n {
+                out_row[col] += a_val * b_row[col];
             }
-            (out, vec![batch, cols, rows])
         }
-        _ => (data.to_vec(), shape.to_vec()),
     }
 }
 

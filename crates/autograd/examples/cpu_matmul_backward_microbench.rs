@@ -105,9 +105,9 @@ fn time_one(shape: Shape) -> (f64, f64, f64) {
     let mut a = vec![0.0f32; a_len];
     let mut b = vec![0.0f32; b_len];
     let mut grad_out = vec![0.0f32; out_len];
-    deterministic_fill(&mut a, 0xA110_C5);
-    deterministic_fill(&mut b, 0xB770_C5);
-    deterministic_fill(&mut grad_out, 0x9_AD_07);
+    deterministic_fill(&mut a, 0x00A1_10C5);
+    deterministic_fill(&mut b, 0x00B7_70C5);
+    deterministic_fill(&mut grad_out, 0x0009_AD07);
     let a_shape = [shape.m, shape.k];
     let b_shape = [shape.k, shape.n];
     let grad_shape = [shape.m, shape.n];
