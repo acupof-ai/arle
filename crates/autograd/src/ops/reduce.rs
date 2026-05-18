@@ -11,8 +11,8 @@ pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
     // (composes `reshape -> sum_axis` into the MLX graph with no eval),
     // but keep Dirty::Host and Dirty::Both inputs on the host fast path
     // so we don't pay an unnecessary upload+device-reduce+readback for
-    // scalars whose producer already lives on host (e.g. train_sft's
-    // `sum(masked, ...)` right after `mul`). Codex-flagged P1 regression
+    // scalars whose producer already lives on host (e.g. a masked
+    // `sum(..., ...)` right after `mul`). Codex-flagged P1 regression
     // that this branch closes.
     let dirty = store.tensor(a)?.dirty.clone();
     match dirty {
