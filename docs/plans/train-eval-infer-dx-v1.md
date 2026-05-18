@@ -1,5 +1,15 @@
 # Train → Eval → Infer DX (v1)
 
+> **Status — partially retired 2026-05-18**: the DX surfaces this
+> plan defined for `arle train {pretrain,sft,grpo,multi-turn,eval}`
+> were retired alongside those commands in the OPD-only pivot
+> ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)).
+> The substrate it produced (HF-style checkpoint dirs, `latest`
+> marker, eval codec → reborn as OPD-side eval, shared CLI arg
+> helpers) **survives** and will host the OPD command's DX when the
+> substrate lands. The cross-surface train → eval → infer story now
+> reduces to `arle train opd → eval → infer`.
+
 **Driver:** user directive 2026-04-20 — "现在训练出来的模型能够直接自动化评测和推理吗；这部分的 dx 也做好；做好 cli 的易用性，可理解"
 (Can trained models be directly auto-evaluated and served? Polish the
 DX; make CLI usable and understandable.)

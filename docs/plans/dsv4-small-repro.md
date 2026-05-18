@@ -1,5 +1,14 @@
 # DSv4 Small-Scale Full-Method Repro Plan (Single 4070 Ti SUPER 16 GiB)
 
+> ⚠️ **Status updated 2026-05-18**: ARLE training surface is now
+> **OPD-only** (see [`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)).
+> `arle train pretrain-dsv4` was retired alongside other non-OPD
+> training surfaces. The DSv4 inference substrate (CPU reference + V4
+> kernels in `infer/src/model/deepseek/*`) is unchanged and remains
+> P0 of the inference roadmap. Pretrain reproduction of DSv4 mini is
+> out of scope for ARLE's training crate; the existing inference
+> substrate continues to validate against the published V4 checkpoint.
+
 > ⚠️ **Architecture truth source: [`../projects/2026-05-07-arle-master-strategy.md`](../projects/2026-05-07-arle-master-strategy.md) §5.1**
 > 架构维度全部以 master §5.1 为准(HF replica `kshitijthakkar/deepseek-v4-mini-1B-init`
 > config)。本 plan 关注**训练方法论**(数据源 / pipeline / curriculum / eval /

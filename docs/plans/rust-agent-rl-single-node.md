@@ -1,6 +1,13 @@
 # Plan — 单机 Rust Agent RL 训推一体（M0–M5）
 
-**Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
+**Status**: **Retired 2026-05-18** (superseded by [OPD-only pivot](../projects/2026-05-18-opd-only-pivot.md)) · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
+
+> **Retirement note**. M0–M2 (autograd + LoRA hook + agent-infer
+> integration) substrate **survives** as OPD prerequisite. M3+
+> (GRPO closed-loop, agent self-evolving) milestones were deleted in
+> the OPD-only pivot — GRPO duplicates verl/TRL and the
+> single-product GRPO axis lost to industry baselines. Continue at
+> [`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md).
 **Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相，`infer --train-control-url` 可选暴露代理入口） / 训练端从零写 / sole train-side model line is the Qwen3.5-family path with HF-style checkpoint dirs; hybrid linear-attn is now locally accepted on CPU + Metal across scratch pretrain / LoRA-eval / RL, handwritten Transformer/TinyLM runtime compat deleted
 
 This plan executes under the runtime-first rule: `infer` remains the primary
