@@ -42,11 +42,12 @@ fn tiny_qwen35_config() -> Qwen35Config {
 
 /// Smoke for `kl_distill_loss`: a fixed soft target acts as the "teacher
 /// logits" with mass concentrated on a single vocab token; the student
-/// should learn to match it (KL ↓ across steps). We use a fixed target
-/// tensor with `requires_grad = false` rather than a second
-/// `Qwen35Model` here so the assertion only depends on `kl_distill_loss`
-/// + Qwen35Model backward; the runtime-coupled rollout path is exercised
-/// separately by `crates/train/src/opd.rs::opd_step`.
+/// should learn to match it (KL ↓ across steps).
+///
+/// We use a fixed target tensor with `requires_grad = false` rather than
+/// a second `Qwen35Model` here so the assertion only depends on
+/// `kl_distill_loss` + Qwen35Model backward; the runtime-coupled rollout
+/// path is exercised separately by `crates/train/src/opd.rs::opd_step`.
 #[test]
 fn kl_distill_loss_drops_over_three_steps() {
     let mut store = TensorStore::default();

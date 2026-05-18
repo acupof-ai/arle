@@ -280,6 +280,10 @@ impl Qwen35Model {
         Self::new_internal(cfg, None, Qwen35InitMode::ScratchTrain, store)
     }
 
+    pub fn config(&self) -> &Qwen35Config {
+        &self.config
+    }
+
     pub fn new_for_eval(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
         Self::new_internal(cfg, None, Qwen35InitMode::LoraOrFrozen, store)
     }
