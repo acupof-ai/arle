@@ -1482,17 +1482,7 @@ pub fn cpu_matmul_forward(
             let k = a_shape[1];
             let n = b_shape[1];
             let mut out = vec![0.0f32; m * n];
-            for row in 0..m {
-                let a_row = &a[row * k..(row + 1) * k];
-                let out_row = &mut out[row * n..(row + 1) * n];
-                for inner in 0..k {
-                    let a_value = a_row[inner];
-                    let b_row = &b[inner * n..(inner + 1) * n];
-                    for col in 0..n {
-                        out_row[col] += a_value * b_row[col];
-                    }
-                }
-            }
+            sgemm_row_major(m, k, n, a, b, &mut out);
             Ok((out, out_shape))
         }
         (3, 3) => {
@@ -1509,17 +1499,14 @@ pub fn cpu_matmul_forward(
                 let a_base = batch_index * a_batch_stride;
                 let b_base = batch_index * b_batch_stride;
                 let out_base = batch_index * out_batch_stride;
-                for row in 0..m {
-                    let a_row = &a[a_base + (row * k)..a_base + ((row + 1) * k)];
-                    let out_row = &mut out[out_base + (row * n)..out_base + ((row + 1) * n)];
-                    for inner in 0..k {
-                        let a_value = a_row[inner];
-                        let b_row = &b[b_base + (inner * n)..b_base + ((inner + 1) * n)];
-                        for col in 0..n {
-                            out_row[col] += a_value * b_row[col];
-                        }
-                    }
-                }
+                sgemm_row_major(
+                    m,
+                    k,
+                    n,
+                    &a[a_base..a_base + a_batch_stride],
+                    &b[b_base..b_base + b_batch_stride],
+                    &mut out[out_base..out_base + out_batch_stride],
+                );
             }
             Ok((out, out_shape))
         }
@@ -1527,6 +1514,66 @@ pub fn cpu_matmul_forward(
             expected: "both operands must be rank-2 or rank-3",
             got: a_shape.len().max(b_shape.len()),
         }),
+    }
+}
+
+/// Row-major `C = A @ B` for one rank-2 sgemm tile. OPD-shape-aware dispatch:
+///   - **Saxpy inline loop** for thin matmuls (`n < SAXPY_N_THRESHOLD`). Hits
+///     ~20 GFLOPs/s on Zen 2 because the A row (`m*k` floats, M=4 in OPD)
+///     and per-iter B row fit comfortably in L1d; matrixmultiply's
+///     pack-A / pack-B overhead would swamp the inner work at M=4 (measured
+///     3× regression on q/k/v/o/gate/up/down forward, 2026-05-19).
+///   - **`matrixmultiply::sgemm`** for `n >= SAXPY_N_THRESHOLD`. With
+///     `lm_head`'s `N=151936` the saxpy thrashes L1 (608 KB per B row);
+///     matrixmultiply's tile-pack reuses A across N-tiles and pushes lm_head
+///     forward from ~8 GFLOPs/s saxpy ceiling to ~16 GFLOPs/s on Zen 2.
+///
+/// Caller guarantees `a.len() == m*k`, `b.len() == k*n`, `out.len() == m*n` and
+/// that `out` is already zero-initialised.
+fn sgemm_row_major(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], out: &mut [f32]) {
+    /// Crossover N where matrixmultiply's pack-A / pack-B is amortised by
+    /// the extra cache reuse. Empirically at M=4 Qwen3-0.6B shapes on Zen 2:
+    /// gate_proj (N=3072) wins with saxpy; lm_head (N=151936) wins with
+    /// matrixmultiply. Loose bracket so future model shapes between 3K and
+    /// 30K take the lower-overhead saxpy path.
+    const SAXPY_N_THRESHOLD: usize = 32_768;
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    if n < SAXPY_N_THRESHOLD {
+        for row in 0..m {
+            let a_row = &a[row * k..(row + 1) * k];
+            let out_row = &mut out[row * n..(row + 1) * n];
+            for inner in 0..k {
+                let a_value = a_row[inner];
+                let b_row = &b[inner * n..(inner + 1) * n];
+                for col in 0..n {
+                    out_row[col] += a_value * b_row[col];
+                }
+            }
+        }
+        return;
+    }
+    // Safety: a/b are row-major contiguous slices of length m*k / k*n; `out`
+    // is row-major contiguous m*n; beta=0 means the pre-existing `C` values
+    // are unread.
+    unsafe {
+        matrixmultiply::sgemm(
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            k as isize,
+            1,
+            b.as_ptr(),
+            n as isize,
+            1,
+            0.0,
+            out.as_mut_ptr(),
+            n as isize,
+            1,
+        );
     }
 }
 
@@ -1637,9 +1684,9 @@ fn b_shape_2d(rows: usize, cols: usize) -> (usize, usize) {
 }
 
 /// Compute `out = a @ b^T` for row-major rank-2 buffers **without materialising
-/// `b^T`**. Same row-major locality pattern as `cpu_matmul_forward` (commit
-/// `499bfc0`): every inner loop iteration reads two contiguous f32 slices
-/// (a row of `a` and a row of `b`) and writes one f32. Used by
+/// `b^T`**. Dispatches to `matrixmultiply::sgemm` with a strided view of `b`:
+/// passing `rsb = 1, csb = N_phys` re-interprets the row-major `[K_phys, N_phys]`
+/// buffer as the transposed `[N_phys, K_phys]` matrix without copying. Used by
 /// `cpu_matmul_backward` for `grad_a = grad_out @ B^T`.
 ///
 /// Shapes (caller-enforced):
@@ -1658,27 +1705,39 @@ fn matmul_a_bt_into(
     let (k, n_b) = b_shape;
     debug_assert_eq!(n_a, n_b, "a and b must share the K-equivalent dim");
     let n = n_a;
-    for row in 0..m {
-        let a_row = &a[row * n..(row + 1) * n];
-        let out_row = &mut out[row * k..(row + 1) * k];
-        for kk in 0..k {
-            let b_row = &b[kk * n..(kk + 1) * n];
-            let mut acc = 0.0f32;
-            for col in 0..n {
-                acc += a_row[col] * b_row[col];
-            }
-            out_row[kk] = acc;
-        }
+    if m == 0 || k == 0 || n == 0 {
+        return;
+    }
+    // Safety: a/b are row-major contiguous slices of length m*n / k*n; the
+    // strided `b` view (rsb=1, csb=n) addresses every element once via
+    // `b_ptr[k_log * 1 + n_log * n]`, which equals `b_ptr[n_log * n + k_log]`
+    // = the (n_log, k_log) entry of the logical transpose. beta=0 means the
+    // pre-existing `out` values are unread.
+    unsafe {
+        matrixmultiply::sgemm(
+            m,
+            n,
+            k,
+            1.0,
+            a.as_ptr(),
+            n as isize,
+            1,
+            b.as_ptr(),
+            1,
+            n as isize,
+            0.0,
+            out.as_mut_ptr(),
+            k as isize,
+            1,
+        );
     }
 }
 
 /// Compute `out = a^T @ b` for row-major rank-2 buffers **without materialising
-/// `a^T`**. Loop order is `kk → m → col` so the innermost `col` loop is a
-/// saxpy with **stable** `out_row` borrowed once per `kk` — same shape as the
-/// codex `499bfc0` forward inner loop, lets rustc keep `out_row` in registers
-/// for the whole M sweep. The `a_val = a[m * k + kk]` load is column-strided
-/// in `a` (stride `k`), but with `m ≤ 4` in OPD the strided lane fits trivially
-/// in L1d (≤ 4 cache lines per `kk`).
+/// `a^T`**. Dispatches to `matrixmultiply::sgemm` with a strided view of `a`:
+/// passing `rsa = 1, csa = K_phys` re-interprets the row-major `[M_phys, K_phys]`
+/// buffer as the transposed `[K_phys, M_phys]` matrix without copying. Used by
+/// `cpu_matmul_backward` for `grad_b = A^T @ grad_out`.
 ///
 /// Shapes (caller-enforced):
 /// - `a`: `[M, K]` (row-major contiguous, len `M * K`) — logical pre-transpose
@@ -1696,15 +1755,31 @@ fn matmul_at_b_into(
     let (m_b, n) = b_shape;
     debug_assert_eq!(m_a, m_b, "a and b must share the M dim");
     let m = m_a;
-    for kk in 0..k {
-        let out_row = &mut out[kk * n..(kk + 1) * n];
-        for row in 0..m {
-            let a_val = a[row * k + kk];
-            let b_row = &b[row * n..(row + 1) * n];
-            for col in 0..n {
-                out_row[col] += a_val * b_row[col];
-            }
-        }
+    if m == 0 || k == 0 || n == 0 {
+        return;
+    }
+    // Safety: a/b are row-major contiguous slices of length m*k / m*n; the
+    // strided `a` view (rsa=1, csa=k) addresses `a_ptr[k_log * 1 + m_log * k]`
+    // = `a_ptr[m_log * k + k_log]` = the (m_log, k_log) entry of physical A,
+    // which is the (k_log, m_log) entry of logical A^T. beta=0 means the
+    // pre-existing `out` values are unread.
+    unsafe {
+        matrixmultiply::sgemm(
+            k,
+            m,
+            n,
+            1.0,
+            a.as_ptr(),
+            1,
+            k as isize,
+            b.as_ptr(),
+            n as isize,
+            1,
+            0.0,
+            out.as_mut_ptr(),
+            n as isize,
+            1,
+        );
     }
 }
 
