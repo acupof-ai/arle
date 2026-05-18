@@ -271,6 +271,7 @@ impl Qwen35HfConfig {
             shared_expert_intermediate_size: 0,
             norm_topk_prob: true,
             mlp_only_layers: Vec::new(),
+            full_attn_gated: true,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -423,7 +424,13 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
 
     // 1) HF config → Qwen35Config → eval-init Qwen35Model.
     let (hf_cfg, schema) = Qwen35HfConfig::from_json_file(dir.join("config.json"))?;
-    let cfg = hf_cfg.to_qwen35_config()?;
+    let mut cfg = hf_cfg.to_qwen35_config()?;
+    // Vanilla Qwen3 (flat-schema HF config) ships un-gated q_proj. Qwen3.5 /
+    // Qwen3.6 (nested `text_config`) ships gated q_proj — the default that
+    // `to_qwen35_config` writes.
+    if matches!(schema, HfSchema::Qwen3) {
+        cfg.full_attn_gated = false;
+    }
     let model = Qwen35Model::new_for_eval(&cfg, store)?;
     let param_map = model.param_name_map();
 

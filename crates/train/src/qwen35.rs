@@ -145,29 +145,48 @@ impl Qwen35Layer {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
+        // Qwen3.5 / Qwen3.6 ship a gated Q projection: q_proj rows =
+        // `num_heads * head_dim * 2`, with the second half acting as a
+        // per-head sigmoid gate applied to the attention output. Vanilla
+        // Qwen3 (0.6B / 1.7B / 4B / 8B) is un-gated: q_proj rows =
+        // `num_heads * head_dim`. The arch flag `cfg.full_attn_gated`
+        // selects between the two paths so `qwen35_loader` can load both
+        // checkpoint families without an arch fork.
         let q_full = attn.q_proj.forward(h, store, tape)?;
-        let q_full = reshape(
-            q_full,
-            &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
-            store,
-            tape,
-        )?;
-        let q = slice(
-            q_full,
-            &[0, 0, 0, 0],
-            &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
-            store,
-            tape,
-        )?;
-        let gate = slice(
-            q_full,
-            &[0, 0, 0, cfg.head_dim],
-            &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
-            store,
-            tape,
-        )?;
-        let q = transpose(q, 1, 2, store, tape)?;
-        let gate = transpose(gate, 1, 2, store, tape)?;
+        let (q, gate) = if cfg.full_attn_gated {
+            let q_full = reshape(
+                q_full,
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            let q = slice(
+                q_full,
+                &[0, 0, 0, 0],
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            let gate = slice(
+                q_full,
+                &[0, 0, 0, cfg.head_dim],
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            (
+                transpose(q, 1, 2, store, tape)?,
+                Some(transpose(gate, 1, 2, store, tape)?),
+            )
+        } else {
+            let q = reshape(
+                q_full,
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            (transpose(q, 1, 2, store, tape)?, None)
+        };
 
         let k = attn.k_proj.forward(h, store, tape)?;
         let v = attn.v_proj.forward(h, store, tape)?;
@@ -194,14 +213,18 @@ impl Qwen35Layer {
         let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
         let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
-        let gate = sigmoid(gate, store, tape)?;
 
         let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
         let attn_hidden = causal_sdpa(q, k, v, store, tape)?;
-        let attn_hidden = mul(attn_hidden, gate, store, tape)?;
+        let attn_hidden = if let Some(gate) = gate {
+            let gate = sigmoid(gate, store, tape)?;
+            mul(attn_hidden, gate, store, tape)?
+        } else {
+            attn_hidden
+        };
         let attn_hidden = merge_heads(
             attn_hidden,
             batch,

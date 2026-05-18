@@ -85,6 +85,7 @@ pub fn synthetic_qwen35_config(seq: usize, pattern: Qwen35AttentionPattern) -> Q
         shared_expert_intermediate_size: 0,
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
+        full_attn_gated: true,
     };
     apply_qwen35_attention_pattern(&mut cfg, pattern)
         .expect("synthetic_qwen35_config must satisfy the qwen3.5 scratch contract");
