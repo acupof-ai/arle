@@ -1,10 +1,24 @@
 # Project — Agent RL 训推一体 · 自进化栈
 
-**Status**: Active · **Started**: 2026-04-18 · **Owner**: ckl
-**Locked scope**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成
+**Status**: **Retired 2026-05-18** (superseded by [OPD-only pivot](2026-05-18-opd-only-pivot.md)) · **Started**: 2026-04-18 · **Owner**: ckl
+**Locked scope**: 单机 / CUDA first / LoRA-only / ~~GRPO~~ → **On-Policy Distillation only** / 统一训推集成
 **Strategic role**: runtime-integrated Phase 6 track; this work must strengthen
 `infer`/`arle`'s runtime spine rather than create a second equal product
 identity
+
+> **Status — retired**. The "runtime-led, not a second product"
+> doctrine this project established **carries forward** into the OPD
+> pivot. The GRPO + multi-turn RL algorithm-level milestones (M3 / M4
+> / M5) **shipped, validated, and were deleted** on 2026-05-18 because
+> the nanochat-d12 industry baseline (56 291 tok/s) made the
+> "runtime-led RL" framing economically unwinnable as a duplicate of
+> vLLM+verl / TRL / axolotl. ARLE training narrows to **On-Policy
+> Distillation only** — teacher hosted in `infer`, student LoRA on the
+> same backend, no second product surface. Continue at
+> [`2026-05-18-opd-only-pivot.md`](2026-05-18-opd-only-pivot.md).
+> Historical content below is preserved as the record of how the
+> "runtime is primary, train is led by runtime" doctrine was
+> established.
 
 ---
 

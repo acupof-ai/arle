@@ -27,7 +27,7 @@ rather than defining a second equal architecture.
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations | Runtime model code, MLA/MoE kernels (gated on F0–F4 multi-GPU collectives in forward) |
 | `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
-| `train` | Generic Qwen-family pretrain/SFT/GRPO stack, train-side `/v1/train/*` control plane, shared async observability | GPU kernels, scheduler |
+| `train` | On-Policy Distillation substrate (teacher in `infer`, student LoRA), train-side `/v1/train/*` control plane, shared async observability. Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see `docs/projects/2026-05-18-opd-only-pivot.md`. | GPU kernels, scheduler |
 
 ## Dependency Direction
 

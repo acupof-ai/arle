@@ -120,36 +120,34 @@ Key files:
 - `infer/src/bin/cpu_serve.rs`
 - `infer/src/bin/metal_serve.rs`
 
-### Current train control-plane path
+### Current train control-plane path (post-OPD-pivot, 2026-05-18)
 
 ```text
-crates/train/src/bin/{pretrain,train_sft,train_grpo,train_multi_turn}.rs
+crates/train/src/commands/train_opd.rs   (substrate landing next milestone)
   -> train::server::bind_and_serve_on_thread()
   -> std TcpListener control plane on /v1/train/{status,events,stop,save}
   -> train::control::TrainingController + ControllerSink
   -> SharedSink background worker
   -> local JSONL/stdout + optional MLflow / OTLP / W&B export
-  -> autograd + train runtime loop
+  -> autograd + Trainer<O, C, S> + teacher (in `infer`) + student LoRA
 ```
 
-This is the **current implementation truth** for train-side control.
-`infer` now exposes an optional `/v1/train/*` proxy surface when
-`--train-control-url` is configured; docs that imply infer owns a
-separate trainer remain target architecture, not current repository
-surface.
+Scratch pretrain, SFT, GRPO, and multi-turn RL surfaces were retired
+in commit `bd94c09` (see `docs/projects/2026-05-18-opd-only-pivot.md`).
+Their dispatch sources, supporting modules, and tests have been
+deleted from `crates/train`. The autograd + Trainer + checkpoint codec
++ tokenizer + LoRA + `/v1/train/*` control plane remain as OPD
+substrate. `infer` continues to expose the optional `/v1/train/*`
+proxy when `--train-control-url` is configured.
 
-Key files:
+Key files (surviving the pivot):
 
-- `crates/train/src/bin/eval_lm.rs`: dispatch source for `arle train eval`; included as a module by `crates/cli/src/train_cli.rs`
-- `crates/train/src/bin/pretrain.rs`: dispatch source for `arle train pretrain`; `--serve` starts the train-side control plane for scratch pretraining
-- `crates/train/src/bin/train_sft.rs`: dispatch source for `arle train sft`; `--serve` starts the same control plane
-- `crates/train/src/bin/train_grpo.rs`: dispatch source for `arle train grpo`; `--serve` starts the same control plane
-- `crates/train/src/bin/train_multi_turn.rs`: dispatch source for `arle train multi-turn` on the Qwen3.5-family dense/full-attn path; `--serve` starts the same control plane
-
-> The standalone `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` / `eval_lm` / `download_dataset` / `convert_dataset` binaries that previously shipped from `crates/train` are no longer produced. Each `src/bin/*.rs` file now exists solely as a dispatch source included in-process by `train_cli.rs`; there is one user-facing front door (`arle train ...` / `arle data ...`).
+- `crates/train/src/commands/env.rs`, `test.rs`, `estimate-memory.rs`: diagnostic surfaces preserved
 - `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|events|stop|save`
-- `crates/train/src/control.rs`: shared controller / status state plus recent event ring buffer used by the server thread and trainer loop
-- `crates/train/src/metrics.rs`: shared async observability sink, lifecycle/artifact events, bounded-queue backpressure accounting, and MLflow / OTLP / W&B export adapters
+- `crates/train/src/control.rs`: shared controller / status state plus recent event ring buffer
+- `crates/train/src/metrics.rs`: shared async observability sink, lifecycle/artifact events, MLflow / OTLP / W&B export adapters
+- `crates/train/src/trainer.rs`: `Trainer<O, C, S>` skeleton — kept; OPD will provide its own `step_fn`
+- `crates/train/src/{checkpoint,cli_args,grad_accum,grad_clip,loss,lora,tokenizer,causal_lm,qwen35,qwen35_checkpoint,model_family}.rs`: substrate kept for OPD
 
 ## 3. `infer/` crate map
 
@@ -243,7 +241,7 @@ These crates remain independent after Route A:
   MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/kv-native-sys`: local persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the F1 sharded loader path
-- `crates/deepseek-spec`: DeepSeek support is now V4-only for `infer/models/dsv4-mini-1B-init`. The crate owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries, and MoE route helpers. `infer/src/model/deepseek/*` remains the CUDA model scaffold; `infer/src/model/deepseek/reference.rs` is the CPU-only Rust reference smoke path used by `cpu_serve`; `arle train pretrain-dsv4` seeds from the same V4 1B init checkpoint and rejects old nano/V3 SKUs. CUDA V4 hybrid attention + MoE + MTP kernels remain the active runtime blockers. DS4 is the **#1 next-model priority** ([ROADMAP §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order))
+- `crates/deepseek-spec`: DeepSeek support is now V4-only for `infer/models/dsv4-mini-1B-init`. The crate owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries, and MoE route helpers. `infer/src/model/deepseek/*` remains the CUDA model scaffold; `infer/src/model/deepseek/reference.rs` is the CPU-only Rust reference smoke path used by `cpu_serve`. (The `arle train pretrain-dsv4` bootstrap was retired in the 2026-05-18 OPD-only pivot along with the rest of the non-OPD training surfaces.) CUDA V4 hybrid attention + MoE + MTP kernels remain the active runtime blockers. DS4 is the **#1 next-model priority** ([ROADMAP §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order))
 
 Current dependency direction:
 

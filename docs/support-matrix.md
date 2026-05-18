@@ -145,18 +145,25 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 
 ## 5a. Training Surface Matrix
 
+> **2026-05-18 pivot — OPD only.** Scratch pretrain, SFT, GRPO, and
+> multi-turn RL surfaces were retired in commit `bd94c09`
+> ([`docs/projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md)).
+> Rationale: the nanochat-d12 industry baseline measured 56 291 tok/s
+> single-GPU on this hardware vs ARLE 174.7 tok/s = 322× gap, making
+> from-scratch pretrain not a winnable axis; SFT/GRPO/multi-turn
+> duplicate mature OSS (vLLM+verl, TRL, axolotl). OPD is the one
+> training surface where ARLE's pure-Rust runtime authority is
+> structurally differentiating — teacher hosted in `infer`, student
+> LoRA on the same backend, no Python on the hot path. Historical
+> validation evidence for the retired surfaces lives in
+> `docs/experience/wins/` (immutable per bench-spec §9) and is not
+> removed.
+
 | Surface | Status | Notes |
 | --- | --- | --- |
-> All training surfaces are reached through `arle train ...` / `arle data ...`. The standalone `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` / `eval_lm` / `download_dataset` / `convert_dataset` binaries that previously shipped from `crates/train` are no longer produced; their dispatch logic is included in-process from `crates/cli/src/train_cli.rs`.
-
-| `arle train pretrain` | Supported | Canonical scratch-pretrain surface for the current Qwen-family train stack. HF-style checkpoint dirs + `latest` marker + exact optimizer-state resume. CUDA save/eval/resume was validated on L4 on 2026-04-21. Hybrid Qwen3.5 scratch-pretrain is accepted locally on CPU + Metal via `arle train pretrain --linear-attn-every 2 -> arle train eval` using the same checkpoint layout. |
-| `arle train sft` | Supported | Qwen3.5 family dispatch, LoRA-only fine-tune surface, adapter-aware checkpointing and resume. Mac-local Metal validation covers the dense/full-attn Qwen3.5 path (`train pretrain -> train sft --backend metal -> train eval -> resume`, LoRA rank=8, Apple M4 Pro, 2026-04-21). Hybrid linear-attn Qwen3.5 LoRA fine-tune is also validated on CPU + Metal for tiny synthetic checkpoints on 2026-04-21; CUDA compile surface is checked, but CUDA runtime acceptance for the hybrid path is not yet closed. |
-| `arle train grpo` | Supported | Single-turn RL surface with exact checkpoint/resume, shared observability/control-plane wiring, and backend selection across `cpu|metal|cuda`. CUDA was validated on 2026-04-21 for `train grpo -> checkpoint/latest -> train eval -> resume` plus live `/v1/train/{status,events,save,stop}` control-plane behavior on the synthetic dense Qwen3.5 path. Hybrid linear-attn Qwen3.5 end-to-end acceptance is closed locally on CPU + Metal for `arle train grpo --linear-attn-every 2` including checkpoint materialization; CUDA compile surface is checked, but CUDA hybrid runtime acceptance is still pending. |
-| `arle train multi-turn` | Supported | Backend flag supports `cpu|metal|cuda`. CUDA was validated on 2026-04-21 for stepwise GRPO, sequence-level GSPO, exact resume, `/v1/train/{status,events,save,stop}` control-plane endpoints, and checkpoint reload through `arle train eval` on the dense/full-attn path. Hybrid linear-attn Qwen3.5 end-to-end acceptance is closed locally on CPU + Metal: stepwise-GRPO and sequence-level-GSPO both run against hybrid configs and save checkpoints; CUDA compile surface is checked, but CUDA hybrid runtime acceptance is still pending. |
-| `arle train eval` | Supported | Loss / perplexity evaluation for Qwen3.5 checkpoint dirs on tokenized or chat JSONL. Hybrid linear-attn Qwen3.5 checkpoint evaluation is validated on CPU + Metal on 2026-04-21. |
-| Hybrid linear-attn Qwen3.5 LoRA/eval path | Supported | `Qwen35Model` supports hybrid linear-attn layers for LoRA/frozen-eval use. Acceptance is closed for `arle train sft` + `arle train eval` on CPU + Metal using tiny synthetic checkpoints, and the CUDA compile surface is checked. |
-| Hybrid linear-attn Qwen3.5 scratch pretrain / RL acceptance | Supported on validated CPU + Metal path | Hybrid scratch pretrain runs through `arle train pretrain --linear-attn-every > 0`, `arle train eval` reloads the resulting checkpoints, `arle train grpo` accepts hybrid configs end-to-end on CPU + Metal, and `arle train multi-turn` has end-to-end hybrid acceptance for both stepwise-GRPO and sequence-level-GSPO across CPU + Metal. CUDA compile surface is checked; CUDA runtime acceptance for the hybrid path remains pending. |
-| Infer-side unified `/v1/train/*` bridge | Supported (optional proxy) | `infer` exposes `/v1/train/status|events|stop|save` when `--train-control-url http://...` is configured, forwarding to the train-side server in `crates/train/src/server.rs` without duplicating trainer logic. Live proxying was validated on 2026-04-21 with `arle train pretrain --serve` behind `cpu_serve --train-control-url`. |
+| `arle train opd` | **Substrate landing** | OPD command stub is in tree; full teacher-student loop ships next milestone. Substrate kept: `Trainer<O, C, S>`, HF-style checkpoint codec, tokenizer load, `/v1/train/*` control plane, LoRA, `crates/autograd` device-resident gradient kernels (Wave 1–2.x). |
+| `arle train env` / `arle train test` / `arle train estimate-memory` | Supported | Diagnostic surfaces preserved across the pivot; `test` runs the canonical convert→pretrain→sft→eval fixture against autograd (intentional regression hook for the substrate, not a user-facing pipeline). |
+| Infer-side unified `/v1/train/*` bridge | Supported (optional proxy) | `infer` exposes `/v1/train/status|events|stop|save` when `--train-control-url http://...` is configured, forwarding to the train-side server in `crates/train/src/server.rs`. Will host OPD progress events when the substrate lands. |
 
 ---
 

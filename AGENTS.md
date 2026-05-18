@@ -44,13 +44,23 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 ## Project shape
 
 `ARLE` is a Rust-native inference runtime with integrated local
-agent/train/self-evolution workflows. The runtime remains primary:
+agent and **On-Policy Distillation (OPD)** workflows. The runtime
+remains primary:
 
 - `infer` owns serving/runtime truth.
-- `arle` is the runtime-led CLI front door for local agent, train, eval, and
-  data workflows.
-- `train` extends the same runtime/model authority; it is not a second equal
-  product line with its own independent truth surface.
+- `arle` is the runtime-led CLI front door for local agent, OPD train,
+  and eval workflows.
+- `train` extends the same runtime/model authority via **OPD only**;
+  it is not a second equal product line with its own independent
+  truth surface. Scratch pretrain, SFT, GRPO, and multi-turn RL
+  surfaces have been deleted (2026-05-18 pivot — see
+  [`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md))
+  because the industry baseline made pretrain unwinnable (322× gap)
+  and SFT/GRPO/multi-turn duplicate mature OSS (vLLM+verl, TRL,
+  axolotl). OPD is the one training axis where ARLE's runtime
+  authority is structurally differentiating: it needs a strong
+  inference path for the teacher and tight latency to score student
+  rollouts — both already in `infer`.
 
 No PyTorch and no Python on the hot path. Two backends plug into one contract
 (`server_engine::InferenceEngine`): the CUDA continuous-batching scheduler

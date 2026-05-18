@@ -1,7 +1,19 @@
 # Plan — Train Runtime Architecture v1
 
-**Status**: Draft · **Opened**: 2026-04-20 · **Driver**: systematize train stack for extensibility + CUDA readiness
+**Status**: **Retired 2026-05-18** (superseded by [OPD-only pivot](../projects/2026-05-18-opd-only-pivot.md)) · **Opened**: 2026-04-20 · **Driver**: systematize train stack for extensibility + CUDA readiness
 **Relates**: [rust-agent-rl-single-node.md](./rust-agent-rl-single-node.md) · [cuda-kernel-crate-extraction.md](./cuda-kernel-crate-extraction.md)
+
+> **Status — retired**. The `Trainer<O, C, S>` skeleton, checkpoint
+> codec v2, MetricSink + SharedSink, GradAccumulator, GradClip, and
+> LrSchedule traits this plan introduced **remain in tree** as OPD
+> substrate. The pretrain / SFT / GRPO / multi-turn binaries this
+> plan migrated onto the trainer **were deleted** in the 2026-05-18
+> OPD-only pivot — they shipped, validated, then retired when the
+> nanochat-d12 industry baseline showed from-scratch pretrain was a
+> 322× gap and SFT/GRPO duplicated mature OSS. New training-runtime
+> work lands under [`2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md);
+> this doc is kept as the historical record of how the surviving
+> substrate took its shape.
 
 > **Current reality note**
 > This runtime layer is model-family agnostic. The current train-side
