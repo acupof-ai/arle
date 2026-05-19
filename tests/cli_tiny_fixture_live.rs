@@ -16,6 +16,11 @@ fn expected_backend() -> &'static str {
 }
 
 #[test]
+#[ignore = "OPD-only pivot (2026-05-18, a2dc647d) retired the legacy \
+            convert→pretrain→sft→eval pipeline; `arle train test` now \
+            emits a pending stub instead of a servable /sft/latest \
+            checkpoint. Re-enable when the OPD substrate produces one. \
+            See docs/projects/2026-05-18-opd-only-pivot.md."]
 fn train_test_fixture_checkpoint_runs_through_real_backend_cli() {
     let backend = expected_backend();
     let root_dir = unique_temp_dir("arle-cli-fixture");
