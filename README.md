@@ -121,7 +121,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | Backend | Platform | Status | Notes |
 |---|---|:---:|---|
 | **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, CUDA Graph decode. L4 / Qwen3.5-4B BF16 + FP8 KV: **197 tok/s @ c=16 / 4k-in**. |
-| **Metal** | Apple Silicon | **Beta** | Scheduler-backed serving, chunked prefill, replay prefix reuse. Qwen3.5-0.8B MLX-4bit step-driver: **305.5 tok/s** on M4 Pro 20c. |
+| **Metal** | Apple Silicon | **Beta** | Scheduler-backed serving, chunked prefill, replay prefix reuse. Qwen3.6 35B-A3B 4-bit MLX HTTP serve: **85.6 tok/s decode / 385 ms TTFT** on M4 Pro 48GB (256/91, temp 0) — at parity with `mlx-lm` direct (86.3), both at ~78% of the 273 GB/s unified-memory ceiling. Qwen3.5-0.8B MLX-4bit step-driver: **305.5 tok/s** on M4 Pro 20c. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3.5. Qwen3.5-4B-4bit bit-identical, c=1..8. |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a perf target. |
 
