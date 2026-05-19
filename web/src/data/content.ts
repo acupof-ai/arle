@@ -223,6 +223,20 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
 
 const BENCH_ROWS_EN: BenchRow[] = [
   {
+    date: "2026-05-18",
+    stability: "beta",
+    stabilityLabel: "beta · ad-hoc",
+    caption: '<b>metal</b> · Apple M4 Pro 48GB · <code>Qwen3.6-35B-A3B 4-bit MLX</code> · HTTP serve, streaming /v1/completions',
+    cells: [
+      { key: "decode", value: "85.6", unit: "tok/s" },
+      { key: "e2e", value: "76.1", unit: "tok/s" },
+      { key: "ttft", value: "385", unit: "ms" },
+      { key: "vs mlx-lm", value: "≈100", unit: "%" },
+    ],
+    cmd: "arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8010",
+    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md#3-model-family-matrix",
+  },
+  {
     date: "2026-04-28",
     stability: "stable",
     stabilityLabel: "stable · ci-gated",
@@ -253,6 +267,20 @@ const BENCH_ROWS_EN: BenchRow[] = [
 ];
 
 const BENCH_ROWS_ZH: BenchRow[] = [
+  {
+    date: "2026-05-18",
+    stability: "beta",
+    stabilityLabel: "beta · 即席",
+    caption: '<b>metal</b> · Apple M4 Pro 48GB · <code>Qwen3.6-35B-A3B 4-bit MLX</code> · HTTP serve、流式 /v1/completions',
+    cells: [
+      { key: "解码", value: "85.6", unit: "tok/s" },
+      { key: "e2e", value: "76.1", unit: "tok/s" },
+      { key: "TTFT", value: "385", unit: "ms" },
+      { key: "对比 mlx-lm", value: "≈100", unit: "%" },
+    ],
+    cmd: "arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8010",
+    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md#3-model-family-matrix",
+  },
   {
     date: "2026-04-28",
     stability: "stable",
