@@ -341,7 +341,7 @@ fn opd_progress_style() -> Result<ProgressStyle> {
 }
 
 fn current_grad_norm(params: &[TensorId], store: &TensorStore) -> f32 {
-    let mut total_sq_norm = 0.0_f32;
+    let mut total_sq_norm = 0.0_f64;
     for &param_id in params {
         let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
             continue;
@@ -349,9 +349,16 @@ fn current_grad_norm(params: &[TensorId], store: &TensorStore) -> f32 {
         let Some(grad) = store.get(grad_id) else {
             continue;
         };
-        total_sq_norm += grad.data.iter().map(|value| value * value).sum::<f32>();
+        total_sq_norm += grad
+            .data
+            .iter()
+            .map(|&value| {
+                let value = f64::from(value);
+                value * value
+            })
+            .sum::<f64>();
     }
-    total_sq_norm.sqrt()
+    total_sq_norm.sqrt() as f32
 }
 
 fn opd_summary(step_metrics: &[OpdStepMetric]) -> OpdSummary {
@@ -1125,7 +1132,9 @@ impl SaveDtypeArg {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpdStepMetric, PretrainPresetArg, ScratchShape, opd_summary};
+    use autograd::{Tensor, TensorStore};
+
+    use super::{OpdStepMetric, PretrainPresetArg, ScratchShape, current_grad_norm, opd_summary};
 
     #[test]
     fn small_30m_preset_applies_expected_shape() {
@@ -1169,5 +1178,25 @@ mod tests {
         assert!(step.get("lr").is_some());
         assert!(step.get("grad_norm").is_some());
         assert!(step.get("rollout_len").is_some());
+    }
+
+    #[test]
+    fn current_grad_norm_handles_large_finite_grads() {
+        let mut store = TensorStore::default();
+        let param = store.alloc(
+            Tensor::new(vec![0.0; 2], vec![2], /* requires_grad = */ true).expect("param tensor"),
+        );
+        let grad = store
+            .alloc(Tensor::new(vec![1.0e20, -1.0e20], vec![2], false).expect("large grad tensor"));
+        store.accumulate_grad(param, grad).expect("accumulate grad");
+
+        let norm = current_grad_norm(&[param], &store);
+
+        assert!(norm.is_finite(), "grad_norm should be finite, got {norm:e}");
+        let expected = 2.0_f32.sqrt() * 1.0e20;
+        assert!(
+            (norm - expected).abs() / expected < 1.0e-5,
+            "grad_norm should be about {expected:e}, got {norm:e}"
+        );
     }
 }
