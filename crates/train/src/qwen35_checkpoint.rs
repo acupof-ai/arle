@@ -465,6 +465,7 @@ mod tests {
     use crate::{
         lora::{LoraAdapterConfig, LoraConfig},
         qwen35::Qwen35Model,
+        qwen35_loader::load_qwen35_from_hf_dir,
     };
     use autograd::{Tape, TensorStore};
     use safetensors::SafeTensors;
@@ -812,6 +813,60 @@ mod tests {
     }
 
     #[test]
+    fn save_qwen35_student_checkpoint_full_materialized_loads_from_hf_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut source_store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = Qwen35Model::new(&cfg, &mut source_store).expect("scratch student");
+        let source_param_map = student.param_name_map();
+
+        let step_dir = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 10,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut source_store,
+            &mut tape,
+            Qwen35StudentWeights::FullMaterialized { bf16: false },
+        )
+        .expect("save full checkpoint");
+
+        let mut loaded_store = TensorStore::default();
+        let loaded =
+            load_qwen35_from_hf_dir(&step_dir, &mut loaded_store).expect("reload saved student");
+        let loaded_param_map = loaded.param_name_map();
+        assert_eq!(loaded_param_map.len(), source_param_map.len());
+
+        let mut names = source_param_map.keys().copied().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            let source_id = source_param_map[name];
+            let loaded_id = loaded_param_map[name];
+            let source = source_store.to_host(source_id).expect("source host");
+            let loaded = loaded_store.to_host(loaded_id).expect("loaded host");
+            assert_eq!(loaded.len(), source.len(), "tensor {name} length mismatch");
+            for (idx, (a, b)) in source.iter().zip(&loaded).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "tensor {name}[{idx}] changed across save/load"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn save_qwen35_student_checkpoint_rejects_adapter_only_without_lora() {
         let tmp = tempdir().expect("tempdir");
         let cfg = tiny_qwen35_config();
@@ -823,7 +878,7 @@ mod tests {
         let err = save_qwen35_student_checkpoint(
             Qwen35StepCheckpoint {
                 out_dir: tmp.path(),
-                step: 10,
+                step: 11,
                 tokenizer_path: None,
                 config_json: ConfigJsonSource::Synthesize {
                     cfg: &cfg,
@@ -848,7 +903,7 @@ mod tests {
         assert!(message.contains("adapter-only checkpoint requested"));
         assert!(message.contains("Qwen35Model::new_with_lora"));
         assert!(
-            !tmp.path().join("step_000010").exists(),
+            !tmp.path().join("step_000011").exists(),
             "failed adapter-only save must remove partial step dir"
         );
         assert!(
