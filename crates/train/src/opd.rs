@@ -236,6 +236,31 @@ fn validate_step_config(cfg: OpdStepConfig) -> Result<()> {
     )))
 }
 
+fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -> Result<()> {
+    let total_len = prompt_len.checked_add(rollout_len).ok_or_else(|| {
+        OpdError::InvalidInput(format!(
+            "OPD rollout length overflow: prompt_len={prompt_len}, \
+             cfg.rollout_len={rollout_len}. Hint: reduce --rollout-len or \
+             split the prompt before calling opd_step."
+        ))
+    })?;
+    if total_len > u32::MAX as usize {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD rollout total length {total_len} exceeds u32::MAX position ids. \
+             Hint: reduce --rollout-len or prompt length; the current OPD \
+             Qwen3.5 path uses u32 position ids."
+        )));
+    }
+    if vocab > u32::MAX as usize {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD student.config().vocab_size={vocab} exceeds u32::MAX token ids. \
+             Hint: verify Qwen35Config::vocab_size; greedy rollout returns u32 \
+             token ids."
+        )));
+    }
+    Ok(())
+}
+
 /// Run one OPD step:
 /// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
@@ -270,6 +295,7 @@ pub fn opd_step<O: Optimizer>(
                 .to_owned(),
         ));
     }
+    validate_rollout_shape(prompt_ids.len(), cfg.rollout_len, vocab)?;
     let teacher_vocab = teacher.config().vocab_size;
     if teacher_vocab != vocab {
         return Err(OpdError::InvalidInput(format!(
@@ -359,8 +385,9 @@ mod tests {
     use autograd::{Tensor, TensorStore};
 
     use super::{
-        OpdError, OpdStepConfig, greedy_next_token, validate_loss_value, validate_step_config,
-        validate_student_param_ownership, validate_student_params, validate_teacher_params,
+        OpdError, OpdStepConfig, greedy_next_token, validate_loss_value, validate_rollout_shape,
+        validate_step_config, validate_student_param_ownership, validate_student_params,
+        validate_teacher_params,
     };
 
     #[test]
@@ -544,5 +571,42 @@ mod tests {
             assert!(message.contains("finite"));
             assert!(message.contains("0.0"));
         }
+    }
+
+    #[test]
+    fn validate_rollout_shape_rejects_total_len_overflow() {
+        let err = validate_rollout_shape(2, usize::MAX, 16)
+            .expect_err("rollout length overflow must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("rollout length overflow"));
+        assert!(message.contains("prompt_len=2"));
+        assert!(message.contains("rollout-len"));
+    }
+
+    #[test]
+    fn validate_rollout_shape_rejects_u32_position_overflow() {
+        let err = validate_rollout_shape(u32::MAX as usize, 1, 16)
+            .expect_err("position id overflow must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("exceeds u32::MAX position ids"));
+        assert!(message.contains("u32 position ids"));
+    }
+
+    #[test]
+    fn validate_rollout_shape_rejects_u32_vocab_overflow() {
+        let err = validate_rollout_shape(1, 1, u32::MAX as usize + 1)
+            .expect_err("token id overflow must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("vocab_size"));
+        assert!(message.contains("u32 token ids"));
     }
 }
