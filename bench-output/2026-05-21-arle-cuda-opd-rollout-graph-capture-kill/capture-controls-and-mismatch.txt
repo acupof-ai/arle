@@ -1,0 +1,10 @@
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `release` profile [optimized] target(s) in 3.15s
+     Running `target/release/examples/opd_step_cuda_rollout_graph_probe`
+control_probe name=empty_capture status=captured
+control_probe name=preallocated_raw_mul_scalar status=captured output=[2.0, 4.0, 6.0, 8.0]
+control_probe name=backend_mul_scalar status=captured detail=op_ok output=Some([2.0, 4.0, 6.0, 8.0])
+control_probe name=backend_matmul status=captured shape=[2, 2] output=Some([19.0, 22.0, 43.0, 50.0])
+probe_config model_dir=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B prompt=[1, 872, 198, 3456] hidden=1024 layers=28 vocab=151936 load_seconds=7.058362
+probe_prefill next_token=888 normal_decode_next=536 decode_input=[888] decode_positions=[4]
+probe_result status=captured normal_next=536 captured_next=0 match=false capture_wall_seconds=0.027168
