@@ -45,13 +45,11 @@ fn tiny_qwen35_config() -> Qwen35Config {
 }
 
 /// End-to-end opd_step smoke: rollout → teacher forward → student forward
-/// → KL → backward → AdamW step. Teacher is `clone_frozen`-ed from a
-/// SEPARATELY built student so the two models start with the SAME init
-/// (deterministic `Qwen35Model::new`). We pre-load one CE-style optimizer
-/// step on the student against a different target distribution to drive
-/// student and teacher apart, then run `opd_step` and verify the loss is
-/// finite + the call returns the expected rollout length. The full
-/// loss-decrease curve is exercised on real GPU smoke (see
+/// → KL → backward → AdamW step. Teacher is built with `new_for_eval`, so
+/// its deterministic scratch weights match the student initializer while
+/// carrying `requires_grad = false`. The test runs `opd_step` and verifies
+/// the loss is finite + the call returns the expected rollout length. The
+/// full loss-decrease curve is exercised on real GPU smoke (see
 /// `arle train opd --self-distill-smoke` once wired).
 #[test]
 fn opd_step_runs_end_to_end() {
@@ -59,7 +57,7 @@ fn opd_step_runs_end_to_end() {
     let mut tape = Tape::new();
     let cfg = tiny_qwen35_config();
 
-    let teacher = Qwen35Model::new(&cfg, &mut store).expect("build teacher");
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
     let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
     let student_params = student.all_parameter_ids();
 
@@ -95,7 +93,7 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
     let mut tape = Tape::new();
     let cfg = tiny_qwen35_config();
 
-    let teacher = Qwen35Model::new(&cfg, &mut store).expect("build teacher");
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
     let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
     let student_params = student.all_parameter_ids();
 
@@ -139,7 +137,7 @@ fn opd_step_rejects_empty_prompt_with_actionable_error() {
     let mut tape = Tape::new();
     let cfg = tiny_qwen35_config();
 
-    let teacher = Qwen35Model::new(&cfg, &mut store).expect("build teacher");
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
     let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
     let student_params = student.all_parameter_ids();
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
@@ -172,7 +170,7 @@ fn opd_step_rejects_prompt_token_outside_student_vocab() {
     let mut tape = Tape::new();
     let cfg = tiny_qwen35_config();
 
-    let teacher = Qwen35Model::new(&cfg, &mut store).expect("build teacher");
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
     let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
     let student_params = student.all_parameter_ids();
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
@@ -211,7 +209,7 @@ fn opd_step_rejects_teacher_student_vocab_mismatch() {
     teacher_cfg.stop_token_ids = vec![11];
     teacher_cfg.eos_token_id = 11;
 
-    let teacher = Qwen35Model::new(&teacher_cfg, &mut store).expect("build teacher");
+    let teacher = Qwen35Model::new_for_eval(&teacher_cfg, &mut store).expect("build teacher");
     let student = Qwen35Model::new(&student_cfg, &mut store).expect("build student");
     let student_params = student.all_parameter_ids();
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
