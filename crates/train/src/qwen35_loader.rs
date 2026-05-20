@@ -488,13 +488,21 @@ fn dtype_to_f32(view: &TensorView<'_>, name: &str) -> Result<Vec<f32>> {
 /// LoRA, no `requires_grad`) and every parameter slot is overwritten with
 /// the data read from the safetensors shards in `dir`.
 ///
-/// Returns the constructed model. On any name/shape mismatch the function
-/// returns a [`LoaderError`] before committing any checkpoint tensor
-/// overwrites. Directory/config/shard-discovery failures leave `store`
-/// untouched; tensor-level failures can leave the scratch eval model
-/// allocation in `store`, so callers should discard the store after any
-/// returned `Err`.
+/// Returns the constructed model. On any error the function rolls `store`
+/// back to its entry state, so callers do not need to discard the store after
+/// a failed OPD checkpoint load.
 pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
+    let rollback = TensorStoreRollback::capture(store);
+    match load_qwen35_from_hf_dir_inner(dir, store) {
+        Ok(model) => Ok(model),
+        Err(err) => {
+            rollback.restore(store);
+            Err(err)
+        }
+    }
+}
+
+fn load_qwen35_from_hf_dir_inner(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
     if !dir.is_dir() {
         return Err(LoaderError::Custom(format!(
             "{} is not a directory. Hint: pass a local HF/ModelScope checkpoint \
@@ -554,6 +562,30 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
     }
 
     Ok(model)
+}
+
+struct TensorStoreRollback {
+    tensors_len: usize,
+    free_ids: Vec<TensorId>,
+}
+
+impl TensorStoreRollback {
+    fn capture(store: &TensorStore) -> Self {
+        Self {
+            tensors_len: store.tensors.len(),
+            free_ids: store.free_ids.clone(),
+        }
+    }
+
+    fn restore(self, store: &mut TensorStore) {
+        store.tensors.truncate(self.tensors_len);
+        for &id in &self.free_ids {
+            if id < store.tensors.len() {
+                store.tensors[id] = None;
+            }
+        }
+        store.free_ids = self.free_ids;
+    }
 }
 
 struct PlannedTensorLoad {
@@ -935,6 +967,21 @@ mod tests {
         }
     }
 
+    fn write_partial_tiny_qwen35_checkpoint(dir: &Path, sentinel: f32) {
+        std::fs::write(dir.join("config.json"), TINY_QWEN35_CONFIG_JSON).expect("write config");
+        let embed_values = [sentinel; 8 * 4];
+        let embed = TestTensorView::from_f32(vec![8, 4], &embed_values);
+        serialize_to_file(
+            vec![(
+                "model.language_model.embed_tokens.weight".to_string(),
+                embed,
+            )],
+            None,
+            &dir.join("model.safetensors"),
+        )
+        .expect("write partial safetensors");
+    }
+
     #[test]
     fn parses_qwen35_nested_text_config() {
         let (cfg, schema) = Qwen35HfConfig::from_json_str(QWEN35_NESTED_CONFIG_JSON).unwrap();
@@ -1130,22 +1177,10 @@ mod tests {
     }
 
     #[test]
-    fn load_missing_tensor_preflights_before_checkpoint_weight_writes() {
+    fn load_missing_tensor_rolls_back_store_and_checkpoint_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("config.json"), TINY_QWEN35_CONFIG_JSON)
-            .expect("write config");
         let sentinel = 42.0_f32;
-        let embed_values = [sentinel; 8 * 4];
-        let embed = TestTensorView::from_f32(vec![8, 4], &embed_values);
-        serialize_to_file(
-            vec![(
-                "model.language_model.embed_tokens.weight".to_string(),
-                embed,
-            )],
-            None,
-            &dir.path().join("model.safetensors"),
-        )
-        .expect("write partial safetensors");
+        write_partial_tiny_qwen35_checkpoint(dir.path(), sentinel);
 
         let mut store = TensorStore::default();
         let err = match load_qwen35_from_hf_dir(dir.path(), &mut store) {
@@ -1159,18 +1194,45 @@ mod tests {
         assert!(message.contains("model.safetensors.index.json"));
         assert!(message.contains("HF-compatible"));
         assert!(
-            !store.tensors.is_empty(),
-            "tensor-level failure happens after eval model allocation"
+            store.tensors.is_empty(),
+            "failed checkpoint load must roll back scratch eval model allocation"
         );
-        let wrote_sentinel = store
-            .tensors
-            .iter()
-            .filter_map(|slot| slot.as_ref())
-            .flat_map(|tensor| tensor.data.iter())
-            .any(|value| value.to_bits() == sentinel.to_bits());
+    }
+
+    #[test]
+    fn load_failure_preserves_existing_store_tensors_and_free_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_partial_tiny_qwen35_checkpoint(dir.path(), 42.0);
+        let mut store = TensorStore::default();
+        let keep_id = store.alloc(Tensor::new(vec![1.25], vec![1], false).expect("keep tensor"));
+        let free_id = store.alloc(Tensor::new(vec![9.0], vec![1], false).expect("free tensor"));
+        store.free(free_id).expect("free scratch slot");
+        let before_free_ids = store.free_ids.clone();
+        let before_len = store.tensors.len();
+
+        let err = load_qwen35_from_hf_dir(dir.path(), &mut store)
+            .expect_err("partial checkpoint should fail on missing tensors");
+
+        assert!(err.to_string().contains("missing tensor"));
+        assert_eq!(
+            store.tensors.len(),
+            before_len,
+            "rollback must restore TensorStore length"
+        );
+        assert_eq!(
+            store.free_ids, before_free_ids,
+            "rollback must restore the free-list exactly"
+        );
+        assert_eq!(
+            store
+                .get(keep_id)
+                .expect("kept tensor survives rollback")
+                .data,
+            vec![1.25]
+        );
         assert!(
-            !wrote_sentinel,
-            "checkpoint tensor data must not be written before the whole load plan validates"
+            store.get(free_id).is_none(),
+            "model allocation that reused a pre-existing free slot must be cleared"
         );
     }
 }
