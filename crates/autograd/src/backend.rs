@@ -1041,6 +1041,37 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((handle, out_shape))
     }
 
+    /// Decode-time GQA causal attention for a one-token query:
+    /// `out = softmax(q @ k^T / sqrt(D)) @ v`.
+    ///
+    /// Shapes:
+    /// - `q`: `[batch, query_heads, 1, head_dim]`
+    /// - `k`/`v`: `[batch, kv_heads, kv_len, head_dim]`
+    ///
+    /// This is the narrow OPD rollout fast path. `query_heads` may be a
+    /// multiple of `kv_heads`; each query head maps to `kv_head =
+    /// query_head / (query_heads / kv_heads)`. The default fallback keeps
+    /// non-CUDA backends correct by using the CPU reference.
+    fn causal_sdpa_decode_gqa(
+        &self,
+        q: &DeviceHandle,
+        q_shape: &[usize],
+        k: &DeviceHandle,
+        k_shape: &[usize],
+        v: &DeviceHandle,
+        v_shape: &[usize],
+        q_start: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let q_host = self.readback(q)?;
+        let k_host = self.readback(k)?;
+        let v_host = self.readback(v)?;
+        let (data, out_shape) = cpu_causal_sdpa_decode_gqa(
+            &q_host, q_shape, &k_host, k_shape, &v_host, v_shape, q_start,
+        )?;
+        let handle = self.upload(&data, &out_shape)?;
+        Ok((handle, out_shape))
+    }
+
     /// Device-handle backward for a contiguous slice. Returns a full
     /// `old_shape` gradient with upstream values scattered into the sliced
     /// window and zeros elsewhere.
@@ -2986,6 +3017,157 @@ pub fn cpu_concat_axis2(
     }
 
     Ok((out, out_shape))
+}
+
+/// CPU reference for decode-time GQA causal attention.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_causal_sdpa_decode_gqa(
+    q: &[f32],
+    q_shape: &[usize],
+    k: &[f32],
+    k_shape: &[usize],
+    v: &[f32],
+    v_shape: &[usize],
+    q_start: usize,
+) -> Result<(Vec<f32>, Vec<usize>)> {
+    validate_decode_gqa_shapes(q_shape, k_shape, v_shape, q_start)?;
+    let q_size = shape_size(q_shape);
+    let k_size = shape_size(k_shape);
+    let v_size = shape_size(v_shape);
+    if q.len() != q_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: q.len(),
+            shape: q_shape.to_vec(),
+            size: q_size,
+        });
+    }
+    if k.len() != k_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: k.len(),
+            shape: k_shape.to_vec(),
+            size: k_size,
+        });
+    }
+    if v.len() != v_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: v.len(),
+            shape: v_shape.to_vec(),
+            size: v_size,
+        });
+    }
+
+    let batch = q_shape[0];
+    let query_heads = q_shape[1];
+    let kv_heads = k_shape[1];
+    let kv_len = k_shape[2];
+    let head_dim = q_shape[3];
+    let kv_repeat = query_heads / kv_heads;
+    let visible = (q_start + 1).min(kv_len);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let out_shape = vec![batch, query_heads, 1, head_dim];
+    let mut out = vec![0.0_f32; shape_size(&out_shape)];
+    let mut scores = vec![0.0_f32; visible];
+
+    for batch_idx in 0..batch {
+        for query_head in 0..query_heads {
+            let kv_head = query_head / kv_repeat;
+            let q_base = (batch_idx * query_heads + query_head) * head_dim;
+
+            let mut max_score = f32::NEG_INFINITY;
+            for (pos, score_slot) in scores.iter_mut().enumerate().take(visible) {
+                let k_base = ((batch_idx * kv_heads + kv_head) * kv_len + pos) * head_dim;
+                let mut dot = 0.0_f32;
+                for dim in 0..head_dim {
+                    dot += q[q_base + dim] * k[k_base + dim];
+                }
+                let score = dot * scale;
+                *score_slot = score;
+                max_score = max_score.max(score);
+            }
+
+            let mut denom = 0.0_f32;
+            for score in &mut scores {
+                *score = (*score - max_score).exp();
+                denom += *score;
+            }
+            let out_base = (batch_idx * query_heads + query_head) * head_dim;
+            if denom == 0.0 {
+                continue;
+            }
+
+            for dim in 0..head_dim {
+                let mut acc = 0.0_f32;
+                for (pos, &weight_exp) in scores.iter().enumerate() {
+                    let v_base = ((batch_idx * kv_heads + kv_head) * kv_len + pos) * head_dim;
+                    acc += (weight_exp / denom) * v[v_base + dim];
+                }
+                out[out_base + dim] = acc;
+            }
+        }
+    }
+
+    Ok((out, out_shape))
+}
+
+pub fn validate_decode_gqa_shapes(
+    q_shape: &[usize],
+    k_shape: &[usize],
+    v_shape: &[usize],
+    q_start: usize,
+) -> Result<()> {
+    for shape in [q_shape, k_shape, v_shape] {
+        if shape.len() != 4 {
+            return Err(crate::AutogradError::InvalidRank {
+                expected: "4",
+                got: shape.len(),
+            });
+        }
+    }
+
+    if q_shape[0] != k_shape[0] || q_shape[0] != v_shape[0] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: q_shape.to_vec(),
+            got: k_shape.to_vec(),
+        });
+    }
+    if q_shape[2] != 1 {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![1],
+            got: vec![q_shape[2]],
+        });
+    }
+    if q_shape[3] != k_shape[3] || q_shape[3] != v_shape[3] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: q_shape.to_vec(),
+            got: k_shape.to_vec(),
+        });
+    }
+    if k_shape[1] != v_shape[1] || k_shape[2] != v_shape[2] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: k_shape.to_vec(),
+            got: v_shape.to_vec(),
+        });
+    }
+    if k_shape[2] == 0 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-empty kv_len",
+            got: 0,
+        });
+    }
+    if q_shape[1] == 0 || k_shape[1] == 0 || !q_shape[1].is_multiple_of(k_shape[1]) {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![q_shape[1]],
+            got: vec![k_shape[1]],
+        });
+    }
+    if q_start >= k_shape[2] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![q_start + 1],
+            got: vec![k_shape[2]],
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_slice_shape(

@@ -120,6 +120,54 @@ pub fn causal_sdpa_with_q_start(
     reshape(context, &[batch, heads, q_len, head_dim], store, tape)
 }
 
+pub fn causal_sdpa_decode_gqa(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
+    if tape.enabled {
+        return Err(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa is rollout-only and requires tape disabled",
+        ));
+    }
+
+    let q_shape = store.tensor(q)?.shape.clone();
+    let k_shape = store.tensor(k)?.shape.clone();
+    let v_shape = store.tensor(v)?.shape.clone();
+
+    store.ensure_device(q)?;
+    store.ensure_device(k)?;
+    store.ensure_device(v)?;
+    let q_handle = store
+        .tensor(q)?
+        .device_handle
+        .clone()
+        .ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa: q missing device handle",
+        ))?;
+    let k_handle = store
+        .tensor(k)?
+        .device_handle
+        .clone()
+        .ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa: k missing device handle",
+        ))?;
+    let v_handle = store
+        .tensor(v)?
+        .device_handle
+        .clone()
+        .ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa: v missing device handle",
+        ))?;
+    let (out_handle, out_shape) = store.backend().causal_sdpa_decode_gqa(
+        &q_handle, &q_shape, &k_handle, &k_shape, &v_handle, &v_shape, q_start,
+    )?;
+    store.alloc_device_tensor(out_shape, out_handle)
+}
+
 fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
     let mut data = vec![0.0; seq_len * seq_len];
     for row in 0..seq_len {

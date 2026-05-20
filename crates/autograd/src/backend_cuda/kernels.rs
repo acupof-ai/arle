@@ -52,6 +52,8 @@ const RMS_NORM_BACKWARD_CU: &str = include_str!("kernels/rms_norm_backward.cu");
 const ROPE_BACKWARD_CU: &str = include_str!("kernels/rope_backward.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ROLLOUT_CU: &str = include_str!("kernels/rollout.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ATTENTION_CU: &str = include_str!("kernels/attention.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -102,6 +104,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "argmax_last_dim_f32",
     "embedding_f32_ids_f32",
     "write_scalar_at_f32",
+    "causal_sdpa_decode_gqa_f32",
 ];
 
 #[derive(Debug)]
@@ -260,6 +263,7 @@ fn concat_sources() -> String {
         RMS_NORM_BACKWARD_CU,
         ROPE_BACKWARD_CU,
         ROLLOUT_CU,
+        ATTENTION_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');
