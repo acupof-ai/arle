@@ -468,7 +468,8 @@ mod tests {
         qwen35_loader::load_qwen35_from_hf_dir,
     };
     use autograd::{Tape, TensorStore};
-    use safetensors::SafeTensors;
+    use half::bf16;
+    use safetensors::{Dtype, SafeTensors};
     use tempfile::tempdir;
     use tokenizers::Tokenizer;
 
@@ -558,6 +559,12 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    fn safetensor_dtypes(path: &Path) -> Vec<Dtype> {
+        let bytes = fs::read(path).expect("read safetensors");
+        let tensors = SafeTensors::deserialize(&bytes).expect("deserialize safetensors");
+        tensors.iter().map(|(_, view)| view.dtype()).collect()
     }
 
     fn test_lora_config() -> LoraConfig {
@@ -765,6 +772,52 @@ mod tests {
     }
 
     #[test]
+    fn save_qwen35_student_checkpoint_adapter_only_bf16_uses_bf16_dtype() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let lora = test_lora_config();
+        let adapter_config = test_adapter_config(lora);
+        let student =
+            Qwen35Model::new_with_lora(&cfg, Some(lora), &mut store).expect("lora student");
+
+        let step_dir = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 9,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "bfloat16",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut store,
+            &mut tape,
+            Qwen35StudentWeights::AdapterOnly {
+                bf16: true,
+                adapter_config: &adapter_config,
+            },
+        )
+        .expect("save bf16 adapter checkpoint");
+
+        let dtypes = safetensor_dtypes(&step_dir.join("adapter_model.safetensors"));
+        assert!(
+            !dtypes.is_empty(),
+            "adapter checkpoint should contain tensors"
+        );
+        assert!(
+            dtypes.iter().all(|dtype| *dtype == Dtype::BF16),
+            "adapter checkpoint should serialize BF16 tensors, got {dtypes:?}"
+        );
+    }
+
+    #[test]
     fn save_qwen35_student_checkpoint_full_materialized_cleans_lora_temps() {
         let tmp = tempdir().expect("tempdir");
         let cfg = tiny_qwen35_config();
@@ -867,6 +920,68 @@ mod tests {
     }
 
     #[test]
+    fn save_qwen35_student_checkpoint_full_materialized_bf16_loads_with_bf16_rounding() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut source_store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = Qwen35Model::new(&cfg, &mut source_store).expect("scratch student");
+        let source_param_map = student.param_name_map();
+
+        let step_dir = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 11,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "bfloat16",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut source_store,
+            &mut tape,
+            Qwen35StudentWeights::FullMaterialized { bf16: true },
+        )
+        .expect("save bf16 full checkpoint");
+
+        let dtypes = safetensor_dtypes(&step_dir.join("model.safetensors"));
+        assert!(!dtypes.is_empty(), "full checkpoint should contain tensors");
+        assert!(
+            dtypes.iter().all(|dtype| *dtype == Dtype::BF16),
+            "full checkpoint should serialize BF16 tensors, got {dtypes:?}"
+        );
+
+        let mut loaded_store = TensorStore::default();
+        let loaded =
+            load_qwen35_from_hf_dir(&step_dir, &mut loaded_store).expect("reload bf16 checkpoint");
+        let loaded_param_map = loaded.param_name_map();
+        assert_eq!(loaded_param_map.len(), source_param_map.len());
+
+        let mut names = source_param_map.keys().copied().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            let source_id = source_param_map[name];
+            let loaded_id = loaded_param_map[name];
+            let source = source_store.to_host(source_id).expect("source host");
+            let loaded = loaded_store.to_host(loaded_id).expect("loaded host");
+            assert_eq!(loaded.len(), source.len(), "tensor {name} length mismatch");
+            for (idx, (source_value, loaded_value)) in source.iter().zip(&loaded).enumerate() {
+                let expected = bf16::from_f32(*source_value).to_f32();
+                assert_eq!(
+                    loaded_value.to_bits(),
+                    expected.to_bits(),
+                    "tensor {name}[{idx}] did not match BF16-rounded source"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn save_qwen35_student_checkpoint_rejects_adapter_only_without_lora() {
         let tmp = tempdir().expect("tempdir");
         let cfg = tiny_qwen35_config();
@@ -878,7 +993,7 @@ mod tests {
         let err = save_qwen35_student_checkpoint(
             Qwen35StepCheckpoint {
                 out_dir: tmp.path(),
-                step: 11,
+                step: 12,
                 tokenizer_path: None,
                 config_json: ConfigJsonSource::Synthesize {
                     cfg: &cfg,
@@ -903,7 +1018,7 @@ mod tests {
         assert!(message.contains("adapter-only checkpoint requested"));
         assert!(message.contains("Qwen35Model::new_with_lora"));
         assert!(
-            !tmp.path().join("step_000011").exists(),
+            !tmp.path().join("step_000012").exists(),
             "failed adapter-only save must remove partial step dir"
         );
         assert!(
