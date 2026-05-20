@@ -31,26 +31,33 @@
 | `c4e507f` | Moderate-shape OPD baseline (codex) | **3.51 s/step at hidden=512, layers=12, vocab=32 768**; no SIGKILL, σ 0.5 % |
 | `67a4d63` | Production-faithful phase attribution (codex) | rollout_student_forward 30.4 %, backward 21.6 %, optimizer_step 15.1 % |
 | `e0bfbb0` | LoRA matmul_bt extension (codex) | **3.06× end-to-end** (3.51 s → 1.17 s/step); rollout_student_forward 6.37 ×, teacher 6.88 ×, student 7.26 ×, backward 3.07 × |
+| `506f02b` | AdamW host-zip-loop rewrite (codex) | **3.01× isolated** (65 ms → 22 ms/step), **1.40× end-to-end** (1.17 → 0.83 s/step); optimizer_step share 45.5 % → 23.3 % |
 
-**Cumulative: ~25× over naive 8e8effd baseline** at moderate shape. Per-call
-linear projection ops are ~17-19 × faster; lm_head per call is ~6 × faster;
-M=1 wide matmul is ~2 × faster. End-to-end matters more: 30 s → 1.17 s.
+**Cumulative: ~35× over naive 8e8effd baseline** at moderate shape, ~4.2×
+since the 2026-05-20 morning baseline (`c4e507f`). End-to-end OPD step:
+30 s (naive) → 1.80 s (substrate) → 0.83 s (post-AdamW). 7 commits this
+session, all license-or-kill validated.
 
-## Post-LoRA-matmul-bt phase attribution
+## Phase attribution rolling table
 
-After `e0bfbb0`, `optimizer_step` becomes the dominant phase because every
-other coarse phase shrank around it:
+| Phase | Pre-LoRA-bt (`67a4d63`) | Post-LoRA-bt (`e0bfbb0`) | Post-AdamW (`506f02b`) | Post-AdamW share |
+|---|---:|---:|---:|---:|
+| `backward` | 11.56 s | 3.76 s | 3.76 s | **29.0 %** |
+| `optimizer_step` | 8.09 s | 8.18 s | **3.02 s** | 23.3 % |
+| `rollout_student_forward` | 16.29 s | 2.56 s | 2.56 s | 19.7 % |
+| `teacher_forward` | 8.16 s | 1.19 s | 1.19 s | 9.2 % |
+| `student_forward` | 8.15 s | 1.12 s | 1.12 s | 8.6 % |
+| `grad_clip` + minor | ~1.3 s | ~1.2 s | ~1.3 s | ~10 % |
 
-| Phase | Before LoRA-bt | After LoRA-bt | Share after |
-|---|---:|---:|---:|
-| `optimizer_step` | 8.09 s | 8.18 s | **45.5 %** |
-| `backward` | 11.56 s | 3.76 s | 20.9 % |
-| `rollout_student_forward` | 16.29 s | 2.56 s | 14.2 % |
-| `teacher_forward` | 8.16 s | 1.19 s | 6.6 % |
-| `student_forward` | 8.15 s | 1.12 s | 6.2 % |
-| `grad_clip` + minor | ~1.3 s | ~1.2 s | 6.6 % |
+(15 measured steps; AdamW affects only `optimizer_step`; other phases
+unchanged between `e0bfbb0` and `506f02b`. Total step time
+$\approx 17.98 / 15 \rightarrow 12.97 / 15 = 1.20 \rightarrow 0.83$ s.)
 
-(15 measured steps total; totals match codex's `e0bfbb0` profile table.)
+**`backward` is now the dominant phase at 29 %.** It's already on the
+transpose-aware (`6e37b91`) + matmul_bt (`0b593e1`) substrate, so the
+remaining cost is concentrated in non-matmul backward kernels —
+embedding scatter-add, rmsnorm bwd, rope bwd, sdpa bwd. **The next
+hand-off is sub-phase profiling within `backward`** — see P4 below.
 
 ## What's still open
 
@@ -100,23 +107,30 @@ median speedup ≥ 1.20× at σ ≤ 5 %.
 **Hand-off:** codex owns this entirely. Claude's role is post-result:
 write the next-axis research after the AdamW result lands.
 
-### P4 — Backward (~21 % of post-LoRA step)
+### P4 — Backward (~29 % of post-AdamW step) — SUB-PHASE DATA IN
 
-`backward` is now the second-largest phase (3.76 s for 15 steps = 0.251 s
-per step = 21.4 %). Already on the transpose-aware (`6e37b91`) and
-matmul_bt-backward (`0b593e1`) substrate. Likely sub-axes:
+Backward is the new dominant phase after `506f02b`. Codex's existing
+`backward_op_summary` instrumentation already produced sub-phase data
+(`bench-output/2026-05-20-opd-backward-op-profile/run.txt`); full
+analysis in
+[`../research/2026-05-20-opd-backward-sub-phase-attribution.md`](../research/2026-05-20-opd-backward-sub-phase-attribution.md).
 
-- **Per-op breakdown.** Profile within `backward` to see whether matmul
-  backward, rmsnorm backward, rope backward, or sdpa backward dominates.
-  This is a profiling task, not a perf change — codex can extend
-  `opd_step_cpu_moderate_profile` to record sub-phases when backward
-  is the next licensed axis.
-- **Backward kernel reuse.** Some autograd `BackwardOp` variants may
-  still re-compute saved activations rather than reuse forward-saved
-  tensors. Worth surveying after sub-phase profiling.
+| Sub-phase | % of `backward` | % of step |
+|---|---:|---:|
+| `MatmulBT` backward kernel | 56.1 % | 16.3 % |
+| `merge_grad` host accumulation | 39.1 % | 11.4 % |
+| All other 16 ops combined | < 5 % | < 1.4 % |
 
-**Hand-off:** deferred until AdamW (P3') lands. Claude writes the
-backward sub-phase research after seeing AdamW's end-to-end.
+Two next-tier axes scoped:
+
+- **Axis E — `merge_grad` clone elimination** (~20 % step projected,
+  low complexity, snippet ready in the research doc).
+- **Axis F — `MatmulBT` backward kernel** (rayon N-shard for lm_head
+  bwd, or bf16 weight) — defer until Axis E lands and re-measure.
+
+**Hand-off:** codex implements Axis E (snippet copy-pasteable from
+the research doc), re-measures, then decides on Axis F based on the
+new dominant share.
 
 ### P5 — `rollout_student_forward` re-investigation (only after P4)
 
