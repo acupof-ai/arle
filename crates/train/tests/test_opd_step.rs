@@ -1,6 +1,6 @@
 use autograd::{Tape, TensorStore, optim::AdamW};
 use train::{
-    opd::{OpdStepConfig, opd_step},
+    opd::{OpdError, OpdStepConfig, opd_step},
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
 
@@ -131,4 +131,37 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
         live_counts[2], live_counts[0],
         "third step should not accumulate rollout/forward temporaries, got {live_counts:?}"
     );
+}
+
+#[test]
+fn opd_step_rejects_empty_prompt_with_actionable_error() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    let err = opd_step(
+        &student,
+        &teacher,
+        &[],
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("empty prompt should be rejected before rollout");
+
+    let OpdError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(message.contains("non-empty prompt_ids"));
+    assert!(message.contains("2026-05-18-opd-only-pivot.md"));
 }
