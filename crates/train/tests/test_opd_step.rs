@@ -237,3 +237,77 @@ fn opd_step_rejects_teacher_student_vocab_mismatch() {
     assert!(message.contains("tokenizer"));
     assert!(message.contains("2026-05-18-opd-only-pivot.md"));
 }
+
+#[test]
+fn opd_step_rejects_trainable_teacher_model() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new(&cfg, &mut store).expect("build trainable teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    let err = opd_step(
+        &student,
+        &teacher,
+        &[1, 3, 8],
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("trainable teacher should be rejected before rollout");
+
+    let OpdError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(message.contains("teacher_params"));
+    assert!(message.contains("requires_grad=true"));
+    assert!(message.contains("new_for_eval"));
+}
+
+#[test]
+fn opd_step_rejects_teacher_param_mixed_into_student_params() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let mut mixed_params = student.all_parameter_ids();
+    mixed_params.push(
+        teacher
+            .all_parameter_ids()
+            .into_iter()
+            .next()
+            .expect("teacher param"),
+    );
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    let err = opd_step(
+        &student,
+        &teacher,
+        &[1, 3, 8],
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &mixed_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("teacher parameter ids must not be accepted as student params");
+
+    let OpdError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(message.contains("belongs to the frozen"));
+    assert!(message.contains("teacher weights must not be optimized"));
+}
