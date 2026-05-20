@@ -9,7 +9,7 @@ use autograd::{Result, TensorId, TensorStore};
 ///
 /// Missing grads are skipped (matches `clip_grad_norm`'s traversal).
 fn compute_global_norm(params: &[TensorId], store: &TensorStore) -> f32 {
-    let mut total_sq_norm = 0.0_f32;
+    let mut total_sq_norm = 0.0_f64;
     for &param_id in params {
         let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
             continue;
@@ -17,9 +17,16 @@ fn compute_global_norm(params: &[TensorId], store: &TensorStore) -> f32 {
         let Some(grad) = store.get(grad_id) else {
             continue;
         };
-        total_sq_norm += grad.data.iter().map(|value| value * value).sum::<f32>();
+        total_sq_norm += grad
+            .data
+            .iter()
+            .map(|&value| {
+                let value = f64::from(value);
+                value * value
+            })
+            .sum::<f64>();
     }
-    total_sq_norm.sqrt()
+    total_sq_norm.sqrt() as f32
 }
 
 pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStore) {

@@ -37,13 +37,20 @@ fn setup_two_params_with_grads() -> (TensorStore, Vec<TensorId>) {
 }
 
 fn global_grad_l2(params: &[TensorId], store: &TensorStore) -> f32 {
-    let mut total_sq = 0.0_f32;
+    let mut total_sq = 0.0_f64;
     for &pid in params {
         let grad_id = store.get(pid).and_then(|t| t.grad).expect("param has grad");
         let grad = store.get(grad_id).expect("grad tensor exists");
-        total_sq += grad.data.iter().map(|v| v * v).sum::<f32>();
+        total_sq += grad
+            .data
+            .iter()
+            .map(|&v| {
+                let v = f64::from(v);
+                v * v
+            })
+            .sum::<f64>();
     }
-    total_sq.sqrt()
+    total_sq.sqrt() as f32
 }
 
 fn snapshot_grads(params: &[TensorId], store: &TensorStore) -> Vec<Vec<f32>> {
@@ -94,6 +101,39 @@ fn global_norm_below_threshold_rescales_grads() {
     assert!(
         (post_clip - 1.0).abs() < 1e-4,
         "post-clip norm {post_clip}, expected ~1.0"
+    );
+}
+
+#[test]
+fn global_norm_large_finite_grads_do_not_overflow_to_zero() {
+    let mut store = TensorStore::default();
+    let param = store.alloc(
+        Tensor::new(vec![0.0; 2], vec![2], /* requires_grad = */ true).expect("param tensor"),
+    );
+    let grad =
+        store.alloc(Tensor::new(vec![1.0e20, -1.0e20], vec![2], false).expect("large grad tensor"));
+    store
+        .accumulate_grad(param, grad)
+        .expect("accumulate large grad");
+
+    clip_grad_norm(&[param], 1.0e20, &mut store);
+
+    let grad_id = store.get(param).and_then(|tensor| tensor.grad).unwrap();
+    let clipped = store.get(grad_id).expect("clipped grad");
+    assert!(
+        clipped.data.iter().all(|value| value.is_finite()),
+        "clipped gradients must stay finite: {:?}",
+        clipped.data
+    );
+    assert!(
+        clipped.data.iter().all(|value| *value != 0.0),
+        "finite large gradients must not be zeroed by norm overflow: {:?}",
+        clipped.data
+    );
+    let post_norm = global_grad_l2(&[param], &store);
+    assert!(
+        (post_norm - 1.0e20).abs() / 1.0e20 < 1.0e-5,
+        "post-clip norm should be about 1e20, got {post_norm:e}"
     );
 }
 
