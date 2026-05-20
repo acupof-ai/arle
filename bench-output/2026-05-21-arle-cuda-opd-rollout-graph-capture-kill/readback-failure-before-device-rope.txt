@@ -1,0 +1,36 @@
+   Compiling autograd v0.1.5 (/home/ckl/projects/arle/crates/autograd)
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+warning: unused import: `trainer::extend_keep_with_params_and_grads`
+  --> crates/train/examples/opd_step_cuda_rollout_graph_probe.rs:14:9
+   |
+14 |         trainer::extend_keep_with_params_and_grads,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `train` (example "opd_step_cuda_rollout_graph_probe") generated 1 warning (run `cargo fix --example "opd_step_cuda_rollout_graph_probe" -p train` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 17.42s
+     Running `target/release/examples/opd_step_cuda_rollout_graph_probe`
+control_probe name=empty_capture status=captured
+control_probe name=preallocated_raw_mul_scalar status=captured output=[2.0, 4.0, 6.0, 8.0]
+control_probe name=backend_mul_scalar status=captured detail=op_ok
+probe_config model_dir=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B prompt=[1, 872, 198, 3456] hidden=1024 layers=28 vocab=151936 load_seconds=7.107887
+probe_prefill next_token=888 decode_input=[888] decode_positions=[4]
+cuda_readback_during_capture len=2048
+   0: <unknown>
+   1: <unknown>
+   2: <unknown>
+   3: <unknown>
+   4: <unknown>
+   5: <unknown>
+   6: <unknown>
+   7: <unknown>
+   8: <unknown>
+   9: <unknown>
+  10: <unknown>
+  11: <unknown>
+  12: __libc_start_main
+  13: <unknown>
+
+probe_result status=forward_error error=cuda readback called during graph capture end_capture_after_error=ok-with-graph capture_wall_seconds=0.003451
+Error: Autograd(TapeInvariant("cuda readback called during graph capture"))
