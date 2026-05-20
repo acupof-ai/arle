@@ -404,11 +404,6 @@ fn merge_grad(
     new_grad_id: TensorId,
     store: &mut TensorStore,
 ) -> Result<()> {
-    let (requires_grad, existing_accum_grad, tensor_shape) = store
-        .get(tensor_id)
-        .map(|tensor| (tensor.requires_grad, tensor.grad, tensor.shape.clone()))
-        .unwrap_or((false, None, Vec::new()));
-    let merged_grad_id;
     if let Some(existing_grad_id) = grads.get(&tensor_id).copied() {
         let expected = store.tensor(existing_grad_id)?.shape.clone();
         let incoming = store.tensor(new_grad_id)?.shape.clone();
@@ -460,29 +455,15 @@ fn merge_grad(
                 *dst += src;
             }
         }
-        merged_grad_id = existing_grad_id;
     } else {
         let cloned_grad_id = store.clone_tensor(new_grad_id)?;
         grads.insert(tensor_id, cloned_grad_id);
-        merged_grad_id = cloned_grad_id;
     }
 
-    if requires_grad {
-        let incoming_shape = store.tensor(new_grad_id)?.shape.clone();
-        if tensor_shape != incoming_shape {
-            return Err(AutogradError::GradientShapeMismatch {
-                tensor_id,
-                expected: tensor_shape,
-                got: incoming_shape,
-            });
-        }
-        if existing_accum_grad == Some(merged_grad_id) {
-            return Ok(());
-        }
-        if existing_accum_grad.is_none() {
-            store.set_grad(tensor_id, Some(merged_grad_id))?;
-            return Ok(());
-        }
+    if store
+        .get(tensor_id)
+        .is_some_and(|tensor| tensor.requires_grad)
+    {
         store.accumulate_grad(tensor_id, new_grad_id)?;
     }
 
