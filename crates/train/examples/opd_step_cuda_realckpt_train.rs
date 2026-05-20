@@ -13,10 +13,10 @@ mod app {
         time::Instant,
     };
 
-    use autograd::{Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
+    use autograd::{backend_cuda::CudaBackend, optim::AdamW, Tape, TensorId, TensorStore};
     use train::{
-        opd::{OpdStepConfig, opd_step},
-        qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
+        opd::{opd_step, OpdStepConfig},
+        qwen35::{forward_rollout_cached, Qwen35KvCache, Qwen35Model},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::extend_keep_with_params_and_grads,
     };
@@ -30,7 +30,7 @@ mod app {
     const PERTURB_SCALE: f32 = 1.0e-3;
     const PERTURB_SEED: u64 = 0x0f0d_cafe_2026_0521;
     const SAFETY_FIRST_STEP_MAX_SECONDS: f64 = 0.5;
-    const EVAL_STEPS: &[usize] = &[0, 50, 100, 200, 500];
+    const EVAL_STEPS: &[usize] = &[0, 100, 250, 500, 1000, 2000];
 
     const TRAIN_PROMPTS: &[&[u32]] = &[
         &[1, 872, 198, 3456],
@@ -180,7 +180,7 @@ mod app {
             }
             step_losses.push(outcome.loss as f64);
             step_seconds.push(elapsed);
-            if step == 1 || step % 10 == 0 || eval_steps.contains(&step) {
+            if step <= 5 || step % 10 == 0 || eval_steps.contains(&step) {
                 println!(
                     "train_step step={step} prompt_index={prompt_index} prompt={prompt:?} loss={:.12e} rollout_len={} step_seconds={elapsed:.6}",
                     outcome.loss, outcome.rollout_len
@@ -618,16 +618,16 @@ mod app {
         let median_step_seconds = sorted_step_seconds[sorted_step_seconds.len() / 2];
         let mean_loss = mean(losses.iter().copied());
         let first_loss = losses.first().copied().unwrap_or(0.0);
-        let step_200_loss = losses.get(199).copied();
+        let step_250_loss = losses.get(249).copied();
         let last_loss = losses.last().copied().unwrap_or(0.0);
-        let sampled_loss_reduction_200_pct = step_200_loss
+        let sampled_loss_reduction_250_pct = step_250_loss
             .map(|loss| pct_reduction(first_loss, loss))
             .unwrap_or(f64::NAN);
         let sampled_loss_reduction_final_pct = pct_reduction(first_loss, last_loss);
         let eval_0 = eval_summaries.iter().find(|summary| summary.step == 0);
-        let eval_200 = eval_summaries.iter().find(|summary| summary.step == 200);
+        let eval_250 = eval_summaries.iter().find(|summary| summary.step == 250);
         let eval_final = eval_summaries.last();
-        let train_kl_reduction_200_pct = match (eval_0, eval_200) {
+        let train_kl_reduction_250_pct = match (eval_0, eval_250) {
             (Some(start), Some(end)) => pct_reduction(start.train_kl, end.train_kl),
             _ => f64::NAN,
         };
@@ -636,9 +636,9 @@ mod app {
             _ => f64::NAN,
         };
         println!(
-            "training_summary total_steps={} total_wall_seconds={total_seconds:.6} mean_step_seconds={mean_step_seconds:.6} median_step_seconds={median_step_seconds:.6} mean_sampled_loss={mean_loss:.12e} first_sampled_loss={first_loss:.12e} step200_sampled_loss={step_200_loss:.12e} final_sampled_loss={last_loss:.12e} sampled_loss_reduction_200_pct={sampled_loss_reduction_200_pct:.6} sampled_loss_reduction_final_pct={sampled_loss_reduction_final_pct:.6} train_kl_reduction_200_pct={train_kl_reduction_200_pct:.6} train_kl_reduction_final_pct={train_kl_reduction_final_pct:.6}",
+            "training_summary total_steps={} total_wall_seconds={total_seconds:.6} mean_step_seconds={mean_step_seconds:.6} median_step_seconds={median_step_seconds:.6} mean_sampled_loss={mean_loss:.12e} first_sampled_loss={first_loss:.12e} step250_sampled_loss={step_250_loss:.12e} final_sampled_loss={last_loss:.12e} sampled_loss_reduction_250_pct={sampled_loss_reduction_250_pct:.6} sampled_loss_reduction_final_pct={sampled_loss_reduction_final_pct:.6} train_kl_reduction_250_pct={train_kl_reduction_250_pct:.6} train_kl_reduction_final_pct={train_kl_reduction_final_pct:.6}",
             losses.len(),
-            step_200_loss = step_200_loss.unwrap_or(f64::NAN)
+            step_250_loss = step_250_loss.unwrap_or(f64::NAN)
         );
         for summary in eval_summaries {
             println!(
