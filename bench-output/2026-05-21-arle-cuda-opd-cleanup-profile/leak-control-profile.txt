@@ -1,0 +1,46 @@
+   Compiling autograd v0.1.5 (/home/ckl/projects/arle/crates/autograd)
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `release` profile [optimized] target(s) in 18.95s
+     Running `target/release/examples/opd_step_cuda_realckpt_profile`
+config backend=cuda model_dir=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B prompt=[1, 872, 198, 3456] rollout_len=8 lr=0.00005 grad_clip=1 perturb_scale=0.001
+model config hidden=1024 intermediate=3072 layers=28 vocab=151936 num_heads=16 num_kv_heads=8 head_dim=128 tie_word_embeddings=true rope_theta=1000000 teacher_param_elements=601292800 student_model_elements=601292800 student_trainable_elements=596049920 teacher_load_seconds=7.073113 student_load_seconds=6.567790
+warmup_summary loss=1.788745430531e-5 seconds=1.906416
+host_mirror_control enabled=false
+cleanup_profile slots_visited=22670 tensors_freed=21736 device_tensors_freed=21716 elements_freed=1578036935 host_elements_freed=5242563
+step_summary loss=1.788745430531e-5 rollout_len=12 total_step_seconds=0.190994
+phase_summary rank=1 phase=rollout_student_forward seconds=0.082642 pct_total=43.269
+phase_summary rank=2 phase=backward seconds=0.027120 pct_total=14.199
+phase_summary rank=3 phase=optimizer_step seconds=0.025375 pct_total=13.286
+phase_summary rank=4 phase=grad_clip seconds=0.013390 pct_total=7.010
+phase_summary rank=5 phase=rollout_argmax_readback seconds=0.013033 pct_total=6.824
+phase_summary rank=6 phase=student_forward seconds=0.012975 pct_total=6.793
+phase_summary rank=7 phase=teacher_forward seconds=0.012145 pct_total=6.359
+phase_summary rank=8 phase=kl_distill_loss seconds=0.003755 pct_total=1.966
+phase_summary rank=9 phase=post_step_cleanup seconds=0.000435 pct_total=0.228
+phase_summary rank=10 phase=post_step_cleanup_retain_ids seconds=0.000373 pct_total=0.196
+phase_summary rank=11 phase=keep_extra_build seconds=0.000092 pct_total=0.048
+phase_summary rank=12 phase=post_step_cleanup_tape_clear seconds=0.000041 pct_total=0.021
+phase_summary rank=13 phase=post_step_cleanup_keep_extend seconds=0.000020 pct_total=0.011
+phase_summary rank=14 phase=loss_readback seconds=0.000010 pct_total=0.005
+phase_summary rank=15 phase=optimizer_zero_grad seconds=0.000002 pct_total=0.001
+phase_summary rank=16 phase=post_step_cleanup_keep_clone seconds=0.000001 pct_total=0.000
+phase_summary rank=17 phase=rollout_positions seconds=0.000001 pct_total=0.000
+phase_summary rank=18 phase=full_positions seconds=0.000000 pct_total=0.000
+phase_summary rank=19 phase=rollout_tape_disable seconds=0.000000 pct_total=0.000
+phase_summary rank=20 phase=student_tape_enable seconds=0.000000 pct_total=0.000
+backward_profile_summary total_seconds=0.027119 op_seconds=0.022422 merge_grad_seconds=0.004203 prelude_seconds=0.000238 unattributed_seconds=0.000257
+backward_op_summary rank=1 op=MatmulBT count=197 seconds=0.011786 pct_backward=43.462 pct_total=6.171
+backward_op_summary rank=2 op=Transpose count=140 seconds=0.002482 pct_backward=9.151 pct_total=1.299
+backward_op_summary rank=3 op=RMSNorm count=113 seconds=0.002308 pct_backward=8.511 pct_total=1.209
+backward_op_summary rank=4 op=Matmul count=56 seconds=0.001478 pct_backward=5.448 pct_total=0.774
+backward_op_summary rank=5 op=AddBroadcast count=84 seconds=0.001265 pct_backward=4.663 pct_total=0.662
+backward_op_summary rank=6 op=RoPE count=56 seconds=0.001023 pct_backward=3.774 pct_total=0.536
+backward_op_summary rank=7 op=Embedding count=1 seconds=0.000849 pct_backward=3.132 pct_total=0.445
+backward_op_summary rank=8 op=Mul count=29 seconds=0.000392 pct_backward=1.446 pct_total=0.205
+backward_op_summary rank=9 op=Silu count=28 seconds=0.000260 pct_backward=0.959 pct_total=0.136
+backward_op_summary rank=10 op=MulScalar count=29 seconds=0.000200 pct_backward=0.738 pct_total=0.105
+backward_op_summary rank=11 op=Softmax count=28 seconds=0.000199 pct_backward=0.735 pct_total=0.104
+backward_op_summary rank=12 op=Reshape count=731 seconds=0.000152 pct_backward=0.562 pct_total=0.080
+backward_op_summary rank=13 op=Add count=56 seconds=0.000010 pct_backward=0.037 pct_total=0.005
+backward_op_summary rank=14 op=Mean count=1 seconds=0.000009 pct_backward=0.033 pct_total=0.005
+backward_op_summary rank=15 op=LogSoftmax count=1 seconds=0.000007 pct_backward=0.027 pct_total=0.004
