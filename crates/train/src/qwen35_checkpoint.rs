@@ -3,13 +3,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use autograd::AutogradError;
+use autograd::{AutogradError, SafetensorsRegistry, Tape, TensorId, TensorStore};
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde_json::json;
 use thiserror::Error;
 use tokenizers::{Tokenizer, models::wordlevel::WordLevel};
 
-use crate::checkpoint::publish_latest_after_weights;
+use crate::{
+    causal_lm::{live_tensor_ids, save_materialized_registry},
+    checkpoint::write_latest_symlink,
+    lora::LoraAdapterConfig,
+    qwen35::Qwen35Model,
+};
 
 #[derive(Debug, Error)]
 pub enum Qwen35CheckpointError {
@@ -51,9 +56,37 @@ pub struct Qwen35StepCheckpoint<'a> {
     pub generation_config: GenerationConfigSource<'a>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Qwen35StudentWeights<'a> {
+    /// Save a full model checkpoint. For LoRA students this materializes
+    /// base+adapter weights under the base HF tensor names.
+    FullMaterialized { bf16: bool },
+    /// Save only LoRA adapter tensors as a PEFT adapter directory:
+    /// `adapter_config.json` plus `adapter_model.safetensors`.
+    AdapterOnly {
+        bf16: bool,
+        adapter_config: &'a LoraAdapterConfig,
+    },
+}
+
+const MODEL_WEIGHTS_FILENAME: &str = "model.safetensors";
+const ADAPTER_WEIGHTS_FILENAME: &str = "adapter_model.safetensors";
+const ADAPTER_CONFIG_FILENAME: &str = "adapter_config.json";
+
 pub fn save_step_checkpoint<F>(
     spec: Qwen35StepCheckpoint<'_>,
     save_weights: F,
+) -> Result<PathBuf, Qwen35CheckpointError>
+where
+    F: FnOnce(&Path) -> Result<(), Qwen35CheckpointError>,
+{
+    save_step_checkpoint_with_artifact(spec, MODEL_WEIGHTS_FILENAME, save_weights)
+}
+
+fn save_step_checkpoint_with_artifact<F>(
+    spec: Qwen35StepCheckpoint<'_>,
+    artifact_filename: &'static str,
+    save_artifact: F,
 ) -> Result<PathBuf, Qwen35CheckpointError>
 where
     F: FnOnce(&Path) -> Result<(), Qwen35CheckpointError>,
@@ -80,9 +113,9 @@ where
             spec.generation_config,
         )?;
 
-        let weights_path = step_dir.join("model.safetensors");
-        save_weights(&weights_path)?;
-        publish_latest_after_weights(spec.out_dir, &step_basename)?;
+        let artifact_path = step_dir.join(artifact_filename);
+        save_artifact(&artifact_path)?;
+        publish_latest_after_artifact(spec.out_dir, &step_basename, artifact_filename)?;
         Ok(step_dir.clone())
     })();
 
@@ -90,6 +123,133 @@ where
         let _ = fs::remove_dir_all(&step_dir);
     }
     result
+}
+
+pub fn save_qwen35_student_checkpoint<'a>(
+    spec: Qwen35StepCheckpoint<'_>,
+    student: &Qwen35Model,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    weights: Qwen35StudentWeights<'a>,
+) -> Result<PathBuf, Qwen35CheckpointError> {
+    match weights {
+        Qwen35StudentWeights::FullMaterialized { bf16 } => {
+            save_step_checkpoint(spec, |weights_path| {
+                save_full_materialized_weights(student, store, tape, weights_path, bf16)
+            })
+        }
+        Qwen35StudentWeights::AdapterOnly {
+            bf16,
+            adapter_config,
+        } => save_step_checkpoint_with_artifact(spec, ADAPTER_WEIGHTS_FILENAME, |weights_path| {
+            save_adapter_only_weights(student, store, weights_path, bf16, adapter_config)
+        }),
+    }
+}
+
+fn publish_latest_after_artifact(
+    parent: &Path,
+    target_basename: &str,
+    artifact_filename: &str,
+) -> io::Result<()> {
+    let artifact = parent.join(target_basename).join(artifact_filename);
+    if !artifact.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "publish_latest_after_artifact: {} missing — refusing to publish \
+                 `latest` before the final artifact lands (publish-last contract)",
+                artifact.display()
+            ),
+        ));
+    }
+    write_latest_symlink(parent, target_basename)
+}
+
+fn save_full_materialized_weights(
+    student: &Qwen35Model,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    weights_path: &Path,
+    bf16: bool,
+) -> Result<(), Qwen35CheckpointError> {
+    let keep = live_tensor_ids(store);
+    let result = save_materialized_registry(student, store, tape, weights_path, bf16)
+        .map_err(Qwen35CheckpointError::Autograd);
+    cleanup_materialized_temps(store, &keep);
+    result
+}
+
+fn cleanup_materialized_temps(store: &mut TensorStore, keep: &std::collections::HashSet<TensorId>) {
+    for tensor_id in 0..store.tensors.len() {
+        if keep.contains(&tensor_id) || store.get(tensor_id).is_none() {
+            continue;
+        }
+        let _ = store.free(tensor_id);
+    }
+}
+
+fn save_adapter_only_weights(
+    student: &Qwen35Model,
+    store: &mut TensorStore,
+    weights_path: &Path,
+    bf16: bool,
+    adapter_config: &LoraAdapterConfig,
+) -> Result<(), Qwen35CheckpointError> {
+    let registry = build_peft_adapter_registry(student)?;
+    if registry.is_empty() {
+        return Err(Qwen35CheckpointError::Custom(
+            "Qwen3.5 adapter-only checkpoint requested, but the student has no \
+             LoRA adapter tensors. Hint: build the student with \
+             Qwen35Model::new_with_lora(..., Some(LoraConfig { .. }), ...) or \
+             save a FullMaterialized checkpoint."
+                .to_owned(),
+        ));
+    }
+    let step_dir = weights_path.parent().ok_or_else(|| {
+        Qwen35CheckpointError::Custom(format!(
+            "adapter checkpoint path {} has no parent directory",
+            weights_path.display()
+        ))
+    })?;
+    fs::write(
+        step_dir.join(ADAPTER_CONFIG_FILENAME),
+        serde_json::to_string_pretty(adapter_config)?,
+    )?;
+    if bf16 {
+        registry.save_from_bf16(store, weights_path)?;
+    } else {
+        registry.save_from(store, weights_path)?;
+    }
+    Ok(())
+}
+
+fn build_peft_adapter_registry(
+    student: &Qwen35Model,
+) -> Result<SafetensorsRegistry, Qwen35CheckpointError> {
+    let mut registry = SafetensorsRegistry::new();
+    for (internal_name, tensor_id) in student.adapter_name_map() {
+        registry.insert(peft_adapter_name(internal_name)?, tensor_id);
+    }
+    Ok(registry)
+}
+
+fn peft_adapter_name(internal_name: &str) -> Result<String, Qwen35CheckpointError> {
+    let (base_name, peft_suffix) = if let Some(base_name) = internal_name.strip_suffix(".lora_a") {
+        (base_name, "lora_A")
+    } else if let Some(base_name) = internal_name.strip_suffix(".lora_b") {
+        (base_name, "lora_B")
+    } else {
+        return Err(Qwen35CheckpointError::Custom(format!(
+            "Qwen3.5 adapter tensor name {internal_name:?} does not end in .lora_a or .lora_b"
+        )));
+    };
+    let Some(base_name) = base_name.strip_suffix(".weight") else {
+        return Err(Qwen35CheckpointError::Custom(format!(
+            "Qwen3.5 adapter tensor base name {base_name:?} does not end in .weight"
+        )));
+    };
+    Ok(format!("base_model.model.{base_name}.{peft_suffix}.weight"))
 }
 
 fn write_config_json(
@@ -302,6 +462,12 @@ fn layer_type_name(layer_type: &LayerType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        lora::{LoraAdapterConfig, LoraConfig},
+        qwen35::Qwen35Model,
+    };
+    use autograd::{Tape, TensorStore};
+    use safetensors::SafeTensors;
     use tempfile::tempdir;
     use tokenizers::Tokenizer;
 
@@ -339,6 +505,69 @@ mod tests {
             mlp_only_layers: Vec::new(),
             full_attn_gated: true,
         }
+    }
+
+    fn tiny_qwen35_config() -> Qwen35Config {
+        let cfg = Qwen35Config {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_hidden_layers: 1,
+            vocab_size: 32,
+            rms_norm_eps: 1.0e-6,
+            stop_token_ids: vec![31],
+            bos_token_id: Some(1),
+            eos_token_id: 31,
+            tie_word_embeddings: false,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 8,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 8,
+            linear_num_value_heads: 2,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 8,
+            rope_cache_len_hint: Some(16),
+            layer_types: vec![LayerType::FullAttention],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+            full_attn_gated: true,
+        };
+        cfg.validate_train_scratch_contract()
+            .expect("tiny checkpoint config should satisfy scratch contract");
+        cfg.validate_train_lora_or_frozen_contract()
+            .expect("tiny checkpoint config should satisfy LoRA contract");
+        cfg
+    }
+
+    fn safetensor_names(path: &Path) -> Vec<String> {
+        let bytes = fs::read(path).expect("read safetensors");
+        let tensors = SafeTensors::deserialize(&bytes).expect("deserialize safetensors");
+        let mut names = tensors
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn test_lora_config() -> LoraConfig {
+        LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        }
+    }
+
+    fn test_adapter_config(lora: LoraConfig) -> LoraAdapterConfig {
+        LoraAdapterConfig::new("base-qwen35-test", "qwen35", lora)
     }
 
     #[test]
@@ -465,5 +694,166 @@ mod tests {
         )
         .expect("parse generation config");
         assert_eq!(generation_value["eos_token_id"], json!([9, 2]));
+    }
+
+    #[test]
+    fn save_qwen35_student_checkpoint_writes_adapter_only_safetensors() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let lora = test_lora_config();
+        let adapter_config = test_adapter_config(lora);
+        let student =
+            Qwen35Model::new_with_lora(&cfg, Some(lora), &mut store).expect("lora student");
+        let adapter_count = student.adapter_name_map().len();
+
+        let step_dir = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 8,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut store,
+            &mut tape,
+            Qwen35StudentWeights::AdapterOnly {
+                bf16: false,
+                adapter_config: &adapter_config,
+            },
+        )
+        .expect("save adapter checkpoint");
+
+        let names = safetensor_names(&step_dir.join("adapter_model.safetensors"));
+        assert_eq!(names.len(), adapter_count);
+        assert!(
+            names
+                .iter()
+                .all(|name| name.contains(".lora_A.weight") || name.contains(".lora_B.weight")),
+            "adapter-only checkpoint must use PEFT LoRA tensor keys: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".weight.lora_")),
+            "adapter-only checkpoint must not expose internal train-side keys: {names:?}"
+        );
+        let adapter_config_value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(step_dir.join("adapter_config.json")).unwrap(),
+        )
+        .expect("parse adapter config");
+        assert_eq!(adapter_config_value["r"], json!(2));
+        assert_eq!(adapter_config_value["lora_alpha"], json!(4.0));
+        assert!(
+            !step_dir.join("model.safetensors").exists(),
+            "adapter-only checkpoint must not masquerade as a full model"
+        );
+        assert!(
+            tmp.path()
+                .join("latest")
+                .join("adapter_model.safetensors")
+                .is_file(),
+            "latest should publish only after adapter_model.safetensors lands"
+        );
+    }
+
+    #[test]
+    fn save_qwen35_student_checkpoint_full_materialized_cleans_lora_temps() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = Qwen35Model::new_with_lora(&cfg, Some(test_lora_config()), &mut store)
+            .expect("lora student");
+        let live_before = live_tensor_ids(&store).len();
+
+        let step_dir = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 9,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut store,
+            &mut tape,
+            Qwen35StudentWeights::FullMaterialized { bf16: false },
+        )
+        .expect("save full checkpoint");
+
+        let live_after = live_tensor_ids(&store).len();
+        assert_eq!(
+            live_after, live_before,
+            "full materialized save must not retain merged LoRA temporary tensors"
+        );
+        let names = safetensor_names(&step_dir.join("model.safetensors"));
+        assert!(
+            names
+                .iter()
+                .any(|name| name == cfg.embed_tokens_tensor_name())
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".lora_")),
+            "full materialized checkpoint should use base HF tensor names: {names:?}"
+        );
+    }
+
+    #[test]
+    fn save_qwen35_student_checkpoint_rejects_adapter_only_without_lora() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = Qwen35Model::new(&cfg, &mut store).expect("scratch student");
+        let adapter_config = test_adapter_config(test_lora_config());
+
+        let err = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 10,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut store,
+            &mut tape,
+            Qwen35StudentWeights::AdapterOnly {
+                bf16: false,
+                adapter_config: &adapter_config,
+            },
+        )
+        .expect_err("adapter-only save should reject a non-LoRA student");
+
+        let message = err.to_string();
+        assert!(message.contains("adapter-only checkpoint requested"));
+        assert!(message.contains("Qwen35Model::new_with_lora"));
+        assert!(
+            !tmp.path().join("step_000010").exists(),
+            "failed adapter-only save must remove partial step dir"
+        );
+        assert!(
+            !tmp.path().join("latest").exists(),
+            "failed adapter-only save must not publish latest"
+        );
     }
 }
