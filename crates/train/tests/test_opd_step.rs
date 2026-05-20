@@ -1,4 +1,4 @@
-use autograd::{Tape, TensorStore, optim::AdamW};
+use autograd::{Tape, TensorId, TensorStore, optim::AdamW};
 use train::{
     lora::LoraConfig,
     opd::{OpdError, OpdStepConfig, opd_step},
@@ -7,6 +7,21 @@ use train::{
 
 fn live_tensor_count(store: &TensorStore) -> usize {
     store.tensors.iter().filter(|slot| slot.is_some()).count()
+}
+
+fn perturb_student_params(store: &mut TensorStore, params: &[TensorId]) {
+    for (param_index, &param_id) in params.iter().enumerate() {
+        let Some(tensor) = store.get_mut(param_id) else {
+            continue;
+        };
+        if !tensor.requires_grad {
+            continue;
+        }
+        for (value_index, value) in tensor.data.iter_mut().enumerate() {
+            let offset = ((param_index + value_index) % 7) as f32 - 3.0;
+            *value += offset * 1.0e-4;
+        }
+    }
 }
 
 fn tiny_qwen35_config() -> Qwen35Config {
@@ -129,6 +144,84 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
     assert_eq!(
         live_counts[2], live_counts[0],
         "third step should not accumulate rollout/forward temporaries, got {live_counts:?}"
+    );
+}
+
+#[test]
+fn opd_step_updates_student_without_mutating_teacher() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    perturb_student_params(&mut store, &student_params);
+
+    let teacher_before = teacher
+        .all_parameter_ids()
+        .into_iter()
+        .map(|id| {
+            let tensor = store.get(id).expect("teacher tensor");
+            (id, tensor.data.clone())
+        })
+        .collect::<Vec<_>>();
+    let student_before = student_params
+        .iter()
+        .copied()
+        .filter_map(|id| {
+            let tensor = store.get(id)?;
+            tensor.requires_grad.then(|| (id, tensor.data.clone()))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !student_before.is_empty(),
+        "scratch OPD student must expose trainable parameters"
+    );
+
+    let mut optimizer = AdamW::new(1.0e-2, (0.9, 0.999), 1.0e-8, 0.0);
+    let outcome = opd_step(
+        &student,
+        &teacher,
+        &[1, 3, 8],
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect("opd_step should update a perturbed student against a frozen teacher");
+    assert!(outcome.loss.is_finite());
+
+    for (id, before) in teacher_before {
+        let tensor = store.get(id).expect("teacher tensor survives cleanup");
+        assert_eq!(
+            tensor.data, before,
+            "opd_step must not mutate frozen teacher tensor {id}"
+        );
+        assert!(
+            !tensor.requires_grad,
+            "teacher tensor {id} must remain frozen after opd_step"
+        );
+        assert!(
+            tensor.grad.is_none(),
+            "teacher tensor {id} must not receive gradients"
+        );
+    }
+
+    let student_changed = student_before.iter().any(|(id, before)| {
+        store
+            .get(*id)
+            .expect("student tensor survives cleanup")
+            .data
+            != *before
+    });
+    assert!(
+        student_changed,
+        "opd_step should update at least one trainable student tensor"
     );
 }
 
