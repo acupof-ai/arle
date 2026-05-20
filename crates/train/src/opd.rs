@@ -117,7 +117,16 @@ fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> 
     }
 
     let mut trainable = 0usize;
+    let mut seen = std::collections::HashSet::new();
     for (index, &param_id) in student_params.iter().enumerate() {
+        if !seen.insert(param_id) {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD student_params[{index}]={param_id} duplicates an earlier \
+                 parameter id. Hint: pass each trainable student parameter \
+                 exactly once; duplicate ids would apply grad clipping and \
+                 optimizer updates more than once."
+            )));
+        }
         let tensor = store.get(param_id).ok_or_else(|| {
             OpdError::InvalidInput(format!(
                 "OPD student_params[{index}]={param_id} does not exist in the TensorStore. \
@@ -351,6 +360,24 @@ mod tests {
         };
         assert!(message.contains("student_params[0]=17"));
         assert!(message.contains("same student Qwen35Model"));
+    }
+
+    #[test]
+    fn validate_student_params_rejects_duplicate_tensor_id() {
+        let mut store = TensorStore::default();
+        let trainable =
+            store.alloc(Tensor::new(vec![0.0; 4], vec![2, 2], true).expect("trainable tensor"));
+
+        let err = validate_student_params(&[trainable, trainable], &store)
+            .expect_err("duplicate student parameter ids must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("student_params[1]"));
+        assert!(message.contains("duplicates"));
+        assert!(message.contains("exactly once"));
+        assert!(message.contains("optimizer updates more than once"));
     }
 
     #[test]
