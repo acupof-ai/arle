@@ -85,7 +85,7 @@ fn run_once() -> (f64, f32, f32) {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
     let cfg = moderate_qwen35_config();
-    let teacher = Qwen35Model::new(&cfg, &mut store).expect("teacher");
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("teacher");
     let student = Qwen35Model::new(&cfg, &mut store).expect("student");
     let student_params = student.all_parameter_ids();
     perturb_params_from_seed(&mut store, &student_params, SEED);

@@ -229,7 +229,7 @@ fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals)> {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
     let cfg = tiny_qwen35_config();
-    let teacher = Qwen35Model::new(&cfg, &mut store)?;
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store)?;
     let student = Qwen35Model::new(&cfg, &mut store)?;
     let student_params = student.all_parameter_ids();
     perturb_params_from_seed(&mut store, &student_params, SEED);
