@@ -86,13 +86,25 @@ pub enum LoaderError {
         #[source]
         source: io::Error,
     },
-    #[error("json: {0}")]
+    #[error(
+        "json: {0}. Hint: validate config.json or model.safetensors.index.json \
+         is valid JSON in the OPD checkpoint directory."
+    )]
     Json(#[from] serde_json::Error),
-    #[error("safetensors: {0}")]
+    #[error(
+        "safetensors: {0}. Hint: verify each shard is a complete local \
+         safetensors file and matches model.safetensors.index.json."
+    )]
     Safetensors(String),
-    #[error("config: {0}")]
+    #[error(
+        "config: {0}. Hint: verify config.json uses a supported Qwen3/Qwen3.5 \
+         schema and matches the checkpoint tensors."
+    )]
     Config(#[from] Qwen35ConfigError),
-    #[error("model: {0}")]
+    #[error(
+        "model: {0}. Hint: verify config.json is compatible with the train-side \
+         Qwen35Model schema before running OPD."
+    )]
     Model(#[from] Qwen35Error),
     #[error("shape mismatch for {name}: model expects {expected:?}, safetensors has {got:?}{hint}")]
     ShapeMismatch {
@@ -101,13 +113,21 @@ pub enum LoaderError {
         got: Vec<usize>,
         hint: String,
     },
-    #[error("missing tensor {0} in safetensors (and no fallback rule applies)")]
+    #[error(
+        "missing tensor {0} in safetensors (and no fallback rule applies). \
+         Hint: verify the checkpoint is complete for its config, \
+         model.safetensors.index.json points at every shard, and the directory \
+         uses HF-compatible Qwen3.5/Qwen3.6 tensor names."
+    )]
     MissingTensor(String),
     #[error(
         "unsupported dtype {0:?} for {1}. Hint: OPD loader currently accepts F32, BF16, and F16 safetensors only; convert quantized checkpoints before loading."
     )]
     UnsupportedDtype(Dtype, String),
-    #[error("autograd: {0}")]
+    #[error(
+        "autograd: {0}. Hint: report this with the checkpoint path, config.json, \
+         and OPD loader follow-up tranche context."
+    )]
     Autograd(#[from] autograd::AutogradError),
     #[error("loader: {0}")]
     Custom(String),
@@ -254,7 +274,9 @@ impl Qwen35HfConfig {
             Some(types) if types.len() == num_layers => types,
             Some(types) => {
                 return Err(LoaderError::Custom(format!(
-                    "layer_types length {} != num_hidden_layers {num_layers}",
+                    "layer_types length {} != num_hidden_layers {num_layers}. \
+                     Hint: fix config.json text_config.layer_types so it has \
+                     exactly one entry per decoder layer.",
                     types.len()
                 )));
             }
@@ -364,7 +386,12 @@ fn discover_shards(dir: &Path) -> Result<Vec<PathBuf>> {
             .get("weight_map")
             .and_then(|v| v.as_object())
             .ok_or_else(|| {
-                LoaderError::Custom(format!("{} missing weight_map object", index.display()))
+                LoaderError::Custom(format!(
+                    "{} missing weight_map object. Hint: regenerate \
+                     model.safetensors.index.json or provide a single \
+                     model.safetensors shard in the checkpoint directory.",
+                    index.display()
+                ))
             })?;
         let mut files: Vec<String> = weight_map
             .values()
@@ -621,12 +648,15 @@ fn plan_tensor_load(
     let got_shape: Vec<usize> = view.shape().to_vec();
     validate_supported_dtype(&view, hf_name)?;
 
-    let expected_shape = store
-        .get(id)
-        .map(|t| t.shape.clone())
-        .ok_or_else(|| LoaderError::Custom(format!("missing slot for {train_name}")))?;
+    let expected_shape = store.get(id).map(|t| t.shape.clone()).ok_or_else(|| {
+        LoaderError::Custom(format!(
+            "missing slot for {train_name}. Hint: this indicates a \
+             Qwen35Model::param_name_map/config mismatch; report it with \
+             the checkpoint config.json and OPD loader follow-up tranche."
+        ))
+    })?;
     if expected_shape != got_shape {
-        let hint = q_proj_gate_hint(train_name, &expected_shape, &got_shape);
+        let hint = shape_mismatch_hint(hf_name, train_name, &expected_shape, &got_shape);
         return Err(LoaderError::ShapeMismatch {
             name: train_name.to_owned(),
             expected: expected_shape,
@@ -670,6 +700,23 @@ fn load_planned_tensor_into_slot(
     })?;
     store.tensors[planned.id] = Some(tensor);
     Ok(())
+}
+
+fn shape_mismatch_hint(
+    hf_name: &str,
+    train_name: &str,
+    expected: &[usize],
+    got: &[usize],
+) -> String {
+    let q_proj_hint = q_proj_gate_hint(train_name, expected, got);
+    if !q_proj_hint.is_empty() {
+        return q_proj_hint;
+    }
+    format!(
+        ". Hint: verify config.json matches the safetensors checkpoint and \
+         that HF tensor `{hf_name}` belongs to the same Qwen3.5/Qwen3.6 model \
+         family as `{train_name}`."
+    )
 }
 
 /// Detect the specific "vanilla Qwen3 q_proj has half the rows the train
@@ -965,6 +1012,20 @@ mod tests {
     }
 
     #[test]
+    fn shape_mismatch_hint_falls_back_to_checkpoint_hint() {
+        let hint = shape_mismatch_hint(
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            &[16, 8],
+            &[8, 8],
+        );
+
+        assert!(hint.contains("Hint: verify config.json"));
+        assert!(hint.contains("HF tensor"));
+        assert!(hint.contains("Qwen3.5/Qwen3.6"));
+    }
+
+    #[test]
     fn missing_config_file_error_includes_path_and_hint() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.json");
@@ -1020,6 +1081,29 @@ mod tests {
     }
 
     #[test]
+    fn load_missing_weight_map_error_includes_hint_and_leaves_store_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), QWEN35_NESTED_CONFIG_JSON)
+            .expect("write config");
+        std::fs::write(dir.path().join("model.safetensors.index.json"), "{}").expect("write index");
+        let mut store = TensorStore::default();
+
+        let err = match load_qwen35_from_hf_dir(dir.path(), &mut store) {
+            Ok(_) => panic!("index without weight_map should fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(message.contains("missing weight_map object"));
+        assert!(message.contains("regenerate"));
+        assert!(message.contains("model.safetensors"));
+        assert!(
+            store.tensors.is_empty(),
+            "invalid-index failure must not allocate model tensors"
+        );
+    }
+
+    #[test]
     fn load_missing_tensor_preflights_before_checkpoint_weight_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config.json"), TINY_QWEN35_CONFIG_JSON)
@@ -1045,6 +1129,9 @@ mod tests {
 
         let message = err.to_string();
         assert!(message.contains("missing tensor"));
+        assert!(message.contains("Hint: verify"));
+        assert!(message.contains("model.safetensors.index.json"));
+        assert!(message.contains("HF-compatible"));
         assert!(
             !store.tensors.is_empty(),
             "tensor-level failure happens after eval model allocation"
