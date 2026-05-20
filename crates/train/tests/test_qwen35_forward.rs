@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use autograd::{Tape, TensorStore};
 use qwen35_spec::Qwen35AttentionTensorNames;
-use train::qwen35::Qwen35Model;
+use train::{LoraConfig, qwen35::Qwen35Model};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -85,6 +85,42 @@ fn qwen35_hybrid_forward_supports_partial_rope_and_linear_layers() -> TestResult
     let values = store.to_host(logits)?;
     assert_eq!(values.len(), 4 * cfg.vocab_size);
     assert!(values.iter().all(|value| value.is_finite()));
+
+    Ok(())
+}
+
+#[test]
+fn qwen35_lora_zero_b_matches_frozen_base_forward() -> TestResult {
+    let cfg = tiny_qwen35_scratch_config_with_vocab(16, 64);
+    cfg.validate_train_lora_or_frozen_contract()?;
+    let mut store = TensorStore::default();
+    let base = Qwen35Model::new_for_eval(&cfg, &mut store)?;
+    let lora = Qwen35Model::new_with_lora(
+        &cfg,
+        Some(LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        }),
+        &mut store,
+    )?;
+
+    let ids = vec![1, 2, 3, 4];
+    let mut tape = Tape::new();
+    let base_logits = base.forward_tokens(&ids, &mut store, &mut tape)?;
+    let base_values = store.to_host(base_logits)?;
+
+    tape.entries.clear();
+    let lora_logits = lora.forward_tokens(&ids, &mut store, &mut tape)?;
+    let lora_values = store.to_host(lora_logits)?;
+
+    assert_eq!(base_values.len(), lora_values.len());
+    for (idx, (&base_value, &lora_value)) in base_values.iter().zip(&lora_values).enumerate() {
+        assert!(
+            (base_value - lora_value).abs() <= 1.0e-6,
+            "LoRA zero-B path should match frozen base at index {idx}: \
+             base={base_value}, lora={lora_value}"
+        );
+    }
 
     Ok(())
 }
