@@ -404,6 +404,11 @@ fn merge_grad(
     new_grad_id: TensorId,
     store: &mut TensorStore,
 ) -> Result<()> {
+    let (requires_grad, existing_accum_grad, tensor_shape) = store
+        .get(tensor_id)
+        .map(|tensor| (tensor.requires_grad, tensor.grad, tensor.shape.clone()))
+        .unwrap_or((false, None, Vec::new()));
+    let merged_grad_id;
     if let Some(existing_grad_id) = grads.get(&tensor_id).copied() {
         let expected = store.tensor(existing_grad_id)?.shape.clone();
         let incoming = store.tensor(new_grad_id)?.shape.clone();
@@ -455,15 +460,29 @@ fn merge_grad(
                 *dst += src;
             }
         }
+        merged_grad_id = existing_grad_id;
     } else {
         let cloned_grad_id = store.clone_tensor(new_grad_id)?;
         grads.insert(tensor_id, cloned_grad_id);
+        merged_grad_id = cloned_grad_id;
     }
 
-    if store
-        .get(tensor_id)
-        .is_some_and(|tensor| tensor.requires_grad)
-    {
+    if requires_grad {
+        let incoming_shape = store.tensor(new_grad_id)?.shape.clone();
+        if tensor_shape != incoming_shape {
+            return Err(AutogradError::GradientShapeMismatch {
+                tensor_id,
+                expected: tensor_shape,
+                got: incoming_shape,
+            });
+        }
+        if existing_accum_grad == Some(merged_grad_id) {
+            return Ok(());
+        }
+        if existing_accum_grad.is_none() {
+            store.set_grad(tensor_id, Some(merged_grad_id))?;
+            return Ok(());
+        }
         store.accumulate_grad(tensor_id, new_grad_id)?;
     }
 
@@ -489,7 +508,7 @@ mod tests {
 
     #[test]
     fn backward_profiled_matches_backward_and_counts_ops() {
-        fn run(profiled: bool) -> (Vec<f32>, Option<BackwardProfile>) {
+        fn run(profiled: bool) -> (Vec<f32>, Vec<f32>, Option<BackwardProfile>) {
             let mut store = TensorStore::default();
             let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
             let mut tape = Tape::new();
@@ -508,13 +527,23 @@ mod tests {
                 )
             };
             let grad_id = grads.get(&x).copied().expect("x grad exists");
-            (store.to_host(grad_id).expect("x grad host"), profile)
+            let stored_grad_id = store
+                .get(x)
+                .and_then(|tensor| tensor.grad)
+                .expect("x stored grad exists");
+            (
+                store.to_host(grad_id).expect("x grad host"),
+                store.to_host(stored_grad_id).expect("x stored grad host"),
+                profile,
+            )
         }
 
-        let (plain_grad, _) = run(false);
-        let (profiled_grad, profile) = run(true);
+        let (plain_grad, plain_stored_grad, _) = run(false);
+        let (profiled_grad, profiled_stored_grad, profile) = run(true);
         assert_eq!(plain_grad, profiled_grad);
         assert_eq!(profiled_grad, vec![4.0, -6.0]);
+        assert_eq!(plain_stored_grad, profiled_grad);
+        assert_eq!(profiled_stored_grad, profiled_grad);
 
         let profile = profile.expect("profile returned");
         assert_eq!(profile.op_totals[&BackwardOp::Sum].count, 1);
