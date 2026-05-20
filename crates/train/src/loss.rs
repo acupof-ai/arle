@@ -1,5 +1,5 @@
 use autograd::{
-    Result, Tape, TensorId, TensorStore,
+    AutogradError, Result, Tape, TensorId, TensorStore,
     ops::{gather_last_dim, log_softmax, mean, mul, mul_scalar, softmax},
 };
 
@@ -22,17 +22,21 @@ pub fn cross_entropy_loss(
 /// Implementation note: `KL(t || s) = sum_v t_p * (log t_p - log s_p)
 ///                                   = -H(t) - sum_v t_p * log s_p`.
 /// The `-H(t)` term is constant w.r.t. student parameters, so we drop it
-/// and minimise the soft cross-entropy `-sum_v t_p * log s_p` averaged
-/// over `num_positions`. This is exactly the standard distillation loss
-/// (TRL `DistilTrainer`, MiniLLM, Agarwal et al. 2024 OPD) up to the
-/// constant `H(t)`.
+/// and minimise the soft cross-entropy `-sum_v t_p * log s_p`.
+///
+/// `num_positions` is validated against `logits.numel() / vocab` so a stale
+/// rollout length does not silently train against the wrong tensor shape. The
+/// current numeric path uses the existing mean-over-all-logits normalization
+/// (`positions * vocab`), which is a constant `1 / vocab` rescale of
+/// `sum_v / num_positions`; changing that scale is an OPD semantics decision.
 pub fn kl_distill_loss(
     student_logits: TensorId,
     teacher_logits: TensorId,
-    _num_positions: usize,
+    num_positions: usize,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
+    validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
     let teacher_probs = softmax(teacher_logits, store, tape)?;
     let student_log_probs = log_softmax(student_logits, store, tape)?;
     let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
@@ -45,4 +49,55 @@ pub fn kl_distill_loss(
     // through `sum_backward`'s untested scalar broadcast.
     let avg = mean(weighted, store, tape)?;
     mul_scalar(avg, -1.0, store, tape)
+}
+
+fn validate_kl_distill_inputs(
+    student_logits: TensorId,
+    teacher_logits: TensorId,
+    num_positions: usize,
+    store: &TensorStore,
+) -> Result<()> {
+    let student = store
+        .get(student_logits)
+        .ok_or(AutogradError::InvalidTensorId(student_logits))?;
+    let teacher = store
+        .get(teacher_logits)
+        .ok_or(AutogradError::InvalidTensorId(teacher_logits))?;
+    if student.shape != teacher.shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: student.shape.clone(),
+            got: teacher.shape.clone(),
+        });
+    }
+
+    let vocab = student
+        .shape
+        .last()
+        .copied()
+        .ok_or(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        })?;
+    if vocab == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: student.shape.len(),
+        });
+    }
+    if num_positions == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss: num_positions must be > 0. Hint: pass rollout.len() \
+             for OPD batch=1, or batch * seq_len for batched logits.",
+        ));
+    }
+    let actual_positions = student.size / vocab;
+    if actual_positions != num_positions {
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss: num_positions must match logits.numel() / vocab. \
+             Hint: pass rollout.len() for OPD batch=1, or batch * seq_len for \
+             batched logits.",
+        ));
+    }
+
+    Ok(())
 }
