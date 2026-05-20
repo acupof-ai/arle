@@ -255,6 +255,24 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn zeros(&self, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = shape;
+            todo!("GPU required: cuda zeros is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let size = shape_size(shape);
+            let slice = self
+                .stream
+                .alloc_zeros::<f32>(size)
+                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+            Ok(DeviceHandle::Cuda(CudaStorage::new(slice)))
+        }
+    }
+
     fn readback(&self, handle: &DeviceHandle) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -1305,11 +1323,10 @@ impl Backend for CudaBackend {
     /// Fused on-device AdamW per-parameter update. Replaces the default
     /// `Backend::adamw_step` host-loop fallback (which does
     /// `readback × 3 + cpu_adamw_step_in_place + upload × 3` per param per
-    /// step) with a single NVRTC kernel launch. The previous param/m/v
-    /// device handles remain untouched; this returns fresh handles so the
-    /// caller (`AdamW::step_device`) can install them via
-    /// `replace_device_handle` without disturbing the autograd store's
-    /// borrow discipline. Matches the formula in
+    /// step) with a single NVRTC kernel launch. The CUDA override mutates
+    /// the existing param/m/v device buffers in place and returns Arc-cloned
+    /// handles to those same buffers, avoiding the former 3x allocation +
+    /// DtoD seed-copy cost per tensor. Matches the formula in
     /// `crates/autograd/src/backend.rs::cpu_adamw_step_in_place` to
     /// floating-point rounding (validated by
     /// `tests/test_cuda_adamw_step.rs` to ≤1e-4 rel-error after 5 steps).
@@ -1575,36 +1592,6 @@ fn cuda_adamw_step(
         });
     }
 
-    // Allocate fresh output buffers and seed them with the current
-    // param/m/v state via device-to-device copy. The kernel then mutates
-    // these fresh slices in place, so the caller's previous handles
-    // remain valid (matches the Backend::adamw_step contract — caller
-    // does `replace_device_handle` with the returned handles).
-    let mut new_param = backend
-        .stream
-        .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw param)"))?;
-    let mut new_m = backend
-        .stream
-        .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw m)"))?;
-    let mut new_v = backend
-        .stream
-        .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw v)"))?;
-    backend
-        .stream
-        .memcpy_dtod(param_slice, &mut new_param)
-        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw param seed)"))?;
-    backend
-        .stream
-        .memcpy_dtod(m_slice, &mut new_m)
-        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw m seed)"))?;
-    backend
-        .stream
-        .memcpy_dtod(v_slice, &mut new_v)
-        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw v seed)"))?;
-
     // grad arrives host-side from autograd's host-authoritative gradient
     // path (matmul_backward still returns Vec<f32>); upload it once.
     let d_grad = backend
@@ -1619,10 +1606,14 @@ fn cuda_adamw_step(
         backend.kernels.function("adamw_step_f32")?,
         size,
         |mut builder| {
+            // `PushKernelArg<&CudaSlice<T>>` passes the raw CUdeviceptr.
+            // The kernel parameters are mutable `float*`, so CUDA updates
+            // the existing buffers in place. This deliberately avoids
+            // cloning the `CudaSlice`: `CudaSlice::clone()` is a device copy.
             builder
-                .arg(&mut new_param)
-                .arg(&mut new_m)
-                .arg(&mut new_v)
+                .arg(param_slice)
+                .arg(m_slice)
+                .arg(v_slice)
                 .arg(&d_grad)
                 .arg(&n)
                 .arg(&lr)
@@ -1636,17 +1627,10 @@ fn cuda_adamw_step(
         },
     )?;
 
-    // Per the Backend::adamw_step eval contract (M5.3b.11): return all
-    // three handles unevaluated. The caller (`AdamW::step_device`)
-    // batches one terminal `backend.eval(...)` after the param loop.
-    // For CUDA that terminal eval is `stream.synchronize()` — a single
-    // host fence per optimizer step regardless of param count, instead
-    // of `num_params × (3 readback + 3 upload)` PCIe roundtrips.
-    Ok((
-        DeviceHandle::Cuda(CudaStorage::new(new_param)),
-        DeviceHandle::Cuda(CudaStorage::new(new_m)),
-        DeviceHandle::Cuda(CudaStorage::new(new_v)),
-    ))
+    // Per the Backend::adamw_step eval contract (M5.3b.11): return
+    // unevaluated handles. These are Arc clones of the same in-place
+    // buffers, not fresh allocations.
+    Ok((param.clone(), m.clone(), v.clone()))
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -1687,34 +1671,6 @@ fn cuda_adamw_step_device(
         });
     }
 
-    // Allocate fresh output buffers and seed them via device-to-device copy.
-    // Mirrors `cuda_adamw_step` — keeps the caller's prior handles valid so
-    // the optimizer's `replace_device_handle` discipline is preserved.
-    let mut new_param = backend
-        .stream
-        .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw param)"))?;
-    let mut new_m = backend
-        .stream
-        .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw m)"))?;
-    let mut new_v = backend
-        .stream
-        .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (adamw v)"))?;
-    backend
-        .stream
-        .memcpy_dtod(param_slice, &mut new_param)
-        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw param seed)"))?;
-    backend
-        .stream
-        .memcpy_dtod(m_slice, &mut new_m)
-        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw m seed)"))?;
-    backend
-        .stream
-        .memcpy_dtod(v_slice, &mut new_v)
-        .map_err(|_| AutogradError::TapeInvariant("cuda dtod copy failed (adamw v seed)"))?;
-
     // Crucially: no `clone_htod(grad)`. The grad already lives on-device;
     // we pass the existing `&CudaSlice<f32>` straight into the kernel.
     let n = i32::try_from(size)
@@ -1724,10 +1680,13 @@ fn cuda_adamw_step_device(
         backend.kernels.function("adamw_step_f32")?,
         size,
         |mut builder| {
+            // In-place update: see `cuda_adamw_step` above. Passing the
+            // borrowed slices avoids `CudaSlice::clone()`, which is a DtoD
+            // allocation+copy in cudarc, not an Arc ref-count bump.
             builder
-                .arg(&mut new_param)
-                .arg(&mut new_m)
-                .arg(&mut new_v)
+                .arg(param_slice)
+                .arg(m_slice)
+                .arg(v_slice)
                 .arg(grad_slice)
                 .arg(&n)
                 .arg(&lr)
@@ -1743,11 +1702,7 @@ fn cuda_adamw_step_device(
 
     // Eval contract (M5.3b.11): return unevaluated; caller batches the
     // terminal `stream.synchronize()` for the whole optimizer step.
-    Ok((
-        DeviceHandle::Cuda(CudaStorage::new(new_param)),
-        DeviceHandle::Cuda(CudaStorage::new(new_m)),
-        DeviceHandle::Cuda(CudaStorage::new(new_v)),
-    ))
+    Ok((param.clone(), m.clone(), v.clone()))
 }
 
 #[cfg(not(feature = "no-cuda"))]

@@ -227,14 +227,14 @@ impl AdamW {
         let mut pending_eval: Vec<DeviceHandle> = Vec::with_capacity(params.len() * 3);
 
         for &param_id in params {
-            let (grad_id, param_shape, param_size) = {
+            let (grad_id, param_shape) = {
                 let Some(param_snapshot) = store.get(param_id) else {
                     panic!("adamw parameter {param_id} does not exist");
                 };
                 let Some(grad_id) = param_snapshot.grad else {
                     continue;
                 };
-                (grad_id, param_snapshot.shape.clone(), param_snapshot.size)
+                (grad_id, param_snapshot.shape.clone())
             };
 
             // Wave 2.0: peek at the grad's residency *before* any
@@ -274,13 +274,13 @@ impl AdamW {
             let entry = self.state.entry(param_id).or_insert_with(|| ParamMoments {
                 m: MomentStorage::Device(
                     backend
-                        .upload(&vec![0.0_f32; param_size], &param_shape)
-                        .expect("upload zero m on first adamw step"),
+                        .zeros(&param_shape)
+                        .expect("allocate zero m on first adamw step"),
                 ),
                 v: MomentStorage::Device(
                     backend
-                        .upload(&vec![0.0_f32; param_size], &param_shape)
-                        .expect("upload zero v on first adamw step"),
+                        .zeros(&param_shape)
+                        .expect("allocate zero v on first adamw step"),
                 ),
                 shape: param_shape.clone(),
             });

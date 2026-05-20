@@ -123,6 +123,16 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok(DeviceHandle::Cpu(host.to_vec()))
     }
 
+    /// Allocate a zero-filled device handle for `shape`.
+    ///
+    /// Default implementation uploads a host zero vector so existing
+    /// backends inherit correct behavior. CUDA overrides to allocate and
+    /// memset on device, which avoids first-step AdamW moment HtoD traffic.
+    fn zeros(&self, shape: &[usize]) -> Result<DeviceHandle> {
+        let size = shape_size(shape);
+        self.upload(&vec![0.0; size], shape)
+    }
+
     fn readback(&self, handle: &DeviceHandle) -> Result<Vec<f32>> {
         match handle {
             DeviceHandle::Cpu(data) => Ok(data.clone()),
