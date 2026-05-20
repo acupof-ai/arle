@@ -33,12 +33,15 @@
 | `e0bfbb0` | LoRA matmul_bt extension (codex) | **3.06× end-to-end** (3.51 s → 1.17 s/step); rollout_student_forward 6.37 ×, teacher 6.88 ×, student 7.26 ×, backward 3.07 × |
 | `506f02b` | AdamW host-zip-loop rewrite (codex) | **3.01× isolated** (65 ms → 22 ms/step), **1.40× end-to-end** (1.17 → 0.83 s/step); optimizer_step share 45.5 % → 23.3 % |
 | `5a92878` | OPD backward op attribution (codex) | Diagnostic only; no perf claim |
-| `e53654a` | Share-first accumulated grad tensor (codex) | **PENDING REVERT** — initial 3-sample claim -8.92 % step did not hold at higher sample count; follow-up A/B showed +2.6 % regression. Wall-clock ground truth kills the axis even though merge_grad isolated improved -31 % and backward -7 %. |
+| `e53654a` | Share-first accumulated grad tensor (codex) | KILLED at step level (+2.6 % regression on larger-sample A/B despite -31 % merge_grad and -7 % backward isolated wins). Reverted in `3492ec3`. |
+| `1a1d4c9` | OPD error path actionability (codex) | Robustness; not a perf claim. `OpdError::InvalidInput` for empty prompt / vocab=0 / shape overflow + regression test. |
+| `3492ec3` | Revert merge-grad sharing (codex) | License-or-kill cycle close: wall-clock ground truth wins over targeted metric. Errors entry preserved. |
 
 **Cumulative: ~35× over naive 8e8effd baseline** at moderate shape, ~4.2×
 since the 2026-05-20 morning baseline (`c4e507f`). End-to-end OPD step:
-30 s (naive) → 1.80 s (substrate) → 0.83 s (post-AdamW). 7 commits this
-session, all license-or-kill validated.
+30 s (naive) → 1.80 s (substrate) → 0.83 s (post-AdamW). 9 commits this
+session, every perf claim license-or-kill validated. Two axes killed
+(forward_last_logits, merge_grad sharing) confirming the SOLID gate works.
 
 ## Phase attribution rolling table
 
