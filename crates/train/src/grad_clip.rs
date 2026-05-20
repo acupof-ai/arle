@@ -8,7 +8,7 @@ use autograd::{Result, TensorId, TensorStore};
 /// Pre-clip global L2 norm across every param's gradient.
 ///
 /// Missing grads are skipped (matches `clip_grad_norm`'s traversal).
-fn compute_global_norm(params: &[TensorId], store: &TensorStore) -> f32 {
+fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 {
     let mut total_sq_norm = 0.0_f64;
     for &param_id in params {
         let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
@@ -26,7 +26,11 @@ fn compute_global_norm(params: &[TensorId], store: &TensorStore) -> f32 {
             })
             .sum::<f64>();
     }
-    total_sq_norm.sqrt() as f32
+    total_sq_norm.sqrt()
+}
+
+fn compute_global_norm(params: &[TensorId], store: &TensorStore) -> f32 {
+    compute_global_norm_f64(params, store) as f32
 }
 
 pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStore) {
@@ -37,12 +41,12 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
         return;
     }
 
-    let total_norm = compute_global_norm(params, store);
-    if total_norm <= max_norm || total_norm == 0.0 {
+    let total_norm = compute_global_norm_f64(params, store);
+    if total_norm <= f64::from(max_norm) || total_norm == 0.0 {
         return;
     }
 
-    let scale = max_norm / total_norm;
+    let scale = f64::from(max_norm) / total_norm;
     for &param_id in params {
         let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
             continue;
@@ -51,7 +55,7 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
             continue;
         };
         for value in &mut grad.data {
-            *value *= scale;
+            *value *= scale as f32;
         }
     }
 }

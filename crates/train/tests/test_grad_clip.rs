@@ -138,6 +138,39 @@ fn global_norm_large_finite_grads_do_not_overflow_to_zero() {
 }
 
 #[test]
+fn global_norm_above_f32_max_still_scales_to_finite_grads() {
+    let mut store = TensorStore::default();
+    let param = store.alloc(
+        Tensor::new(vec![0.0; 2], vec![2], /* requires_grad = */ true).expect("param tensor"),
+    );
+    let grad = store
+        .alloc(Tensor::new(vec![f32::MAX, -f32::MAX], vec![2], false).expect("max grad tensor"));
+    store
+        .accumulate_grad(param, grad)
+        .expect("accumulate max grad");
+
+    clip_grad_norm(&[param], 1.0e38, &mut store);
+
+    let grad_id = store.get(param).and_then(|tensor| tensor.grad).unwrap();
+    let clipped = store.get(grad_id).expect("clipped grad");
+    assert!(
+        clipped.data.iter().all(|value| value.is_finite()),
+        "clipped gradients must stay finite: {:?}",
+        clipped.data
+    );
+    assert!(
+        clipped.data.iter().all(|value| *value != 0.0),
+        "gradients with finite true scale must not be zeroed: {:?}",
+        clipped.data
+    );
+    let post_norm = global_grad_l2(&[param], &store);
+    assert!(
+        (post_norm - 1.0e38).abs() / 1.0e38 < 1.0e-5,
+        "post-clip norm should be about 1e38, got {post_norm:e}"
+    );
+}
+
+#[test]
 fn global_norm_above_threshold_is_noop() {
     let (mut store, params) = setup_two_params_with_grads();
     let before = snapshot_grads(&params, &store);
