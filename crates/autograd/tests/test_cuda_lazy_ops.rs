@@ -22,11 +22,11 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
 use autograd::backend::{
-    cpu_concat_axis2, cpu_embedding_forward, cpu_gather_last_dim_backward,
-    cpu_gather_last_dim_forward, cpu_log_softmax_backward, cpu_log_softmax_forward_last_axis,
-    cpu_matmul_backward, cpu_matmul_bt_backward, cpu_matmul_bt_forward, cpu_rms_norm_forward,
-    cpu_scatter_add_rows_forward, cpu_slice, cpu_softmax_backward, cpu_softmax_forward_last_axis,
-    cpu_transpose_swap,
+    cpu_causal_sdpa_decode_gqa, cpu_concat_axis2, cpu_embedding_forward,
+    cpu_gather_last_dim_backward, cpu_gather_last_dim_forward, cpu_log_softmax_backward,
+    cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_matmul_bt_backward,
+    cpu_matmul_bt_forward, cpu_rms_norm_forward, cpu_scatter_add_rows_forward, cpu_slice,
+    cpu_softmax_backward, cpu_softmax_forward_last_axis, cpu_transpose_swap,
 };
 use autograd::backend_cuda::CudaBackend;
 use autograd::{Backend, DeviceHandle};
@@ -756,6 +756,44 @@ fn cuda_concat_axis2_device_matches_cpu() {
     assert!(
         excess <= 1.0,
         "concat_axis2 exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev[idx],
+        host[idx]
+    );
+}
+
+#[test]
+fn cuda_causal_sdpa_decode_gqa_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_causal_sdpa_decode_gqa_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let q_shape: Vec<usize> = vec![1, 4, 1, 16];
+    let k_shape: Vec<usize> = vec![1, 2, 5, 16];
+    let v_shape = k_shape.clone();
+    let q = rng_vec(0x5D0A_0001, q_shape.iter().product(), 0.75);
+    let k = rng_vec(0x5D0A_0002, k_shape.iter().product(), 0.75);
+    let v = rng_vec(0x5D0A_0003, v_shape.iter().product(), 0.75);
+    let q_start = 4;
+    let (host, out_shape) =
+        cpu_causal_sdpa_decode_gqa(&q, &q_shape, &k, &k_shape, &v, &v_shape, q_start)
+            .expect("cpu decode sdpa");
+
+    let q_h = backend.upload(&q, &q_shape).expect("upload q");
+    let k_h = backend.upload(&k, &k_shape).expect("upload k");
+    let v_h = backend.upload(&v, &v_shape).expect("upload v");
+    let (out_h, dev_shape) = backend
+        .causal_sdpa_decode_gqa(&q_h, &q_shape, &k_h, &k_shape, &v_h, &v_shape, q_start)
+        .expect("cuda decode sdpa");
+    assert_eq!(dev_shape, out_shape);
+    backend.eval(&[&out_h]).expect("cuda eval decode sdpa");
+    let dev = backend.readback(&out_h).expect("decode sdpa readback");
+
+    let (excess, abs, idx) = max_err(&dev, &host);
+    assert!(
+        excess <= 1.0,
+        "decode sdpa exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
          (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
         dev[idx],
         host[idx]

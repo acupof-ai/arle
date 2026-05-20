@@ -6,9 +6,9 @@ use std::{
 
 use autograd::{
     ops::{
-        add, causal_sdpa, causal_sdpa_with_q_start, embedding, linear_attention_core, matmul_bt,
-        mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
-        LinearAttentionParams,
+        add, causal_sdpa, causal_sdpa_decode_gqa, causal_sdpa_with_q_start, embedding,
+        linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose, LinearAttentionParams,
     },
     AutogradError, Tape, Tensor, TensorId, TensorStore,
 };
@@ -616,16 +616,30 @@ impl Qwen35Layer {
         let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
 
-        let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
-        let k = repeat_kv(k, kv_repeat, store, tape)?;
-        let v = repeat_kv(v, kv_repeat, store, tape)?;
-
         let k_all = append_cached_kv(layer_cache.k, k, store)?;
         let v_all = append_cached_kv(layer_cache.v, v, store)?;
         layer_cache.k = Some(k_all);
         layer_cache.v = Some(v_all);
 
-        let attn_hidden = causal_sdpa_with_q_start(q, k_all, v_all, q_start, store, tape)?;
+        let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let kv_len = store
+            .get(k_all)
+            .ok_or(AutogradError::InvalidTensorId(k_all))?
+            .shape
+            .get(2)
+            .copied()
+            .ok_or(AutogradError::InvalidRank {
+                expected: "4",
+                got: 0,
+            })?;
+        let attn_hidden = if !tape.enabled && seq_len == 1 && q_start + 1 == kv_len && kv_len <= 32
+        {
+            causal_sdpa_decode_gqa(q, k_all, v_all, q_start, store, tape)?
+        } else {
+            let k_all = repeat_kv(k_all, kv_repeat, store, tape)?;
+            let v_all = repeat_kv(v_all, kv_repeat, store, tape)?;
+            causal_sdpa_with_q_start(q, k_all, v_all, q_start, store, tape)?
+        };
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?
@@ -740,12 +754,6 @@ impl Qwen35Layer {
         let k = rope(k, cos, sin, store, tape)?;
         profile.rope += started.elapsed();
 
-        let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
-        let started = Instant::now();
-        let k = repeat_kv(k, kv_repeat, store, tape)?;
-        let v = repeat_kv(v, kv_repeat, store, tape)?;
-        profile.repeat_kv += started.elapsed();
-
         let started = Instant::now();
         let k_all = append_cached_kv(layer_cache.k, k, store)?;
         let v_all = append_cached_kv(layer_cache.v, v, store)?;
@@ -753,9 +761,33 @@ impl Qwen35Layer {
         layer_cache.v = Some(v_all);
         profile.append_kv += started.elapsed();
 
-        let started = Instant::now();
-        let attn_hidden = causal_sdpa_with_q_start(q, k_all, v_all, q_start, store, tape)?;
-        profile.sdpa += started.elapsed();
+        let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let kv_len = store
+            .get(k_all)
+            .ok_or(AutogradError::InvalidTensorId(k_all))?
+            .shape
+            .get(2)
+            .copied()
+            .ok_or(AutogradError::InvalidRank {
+                expected: "4",
+                got: 0,
+            })?;
+        let attn_hidden = if !tape.enabled && seq_len == 1 && q_start + 1 == kv_len && kv_len <= 32
+        {
+            let started = Instant::now();
+            let out = causal_sdpa_decode_gqa(q, k_all, v_all, q_start, store, tape)?;
+            profile.sdpa += started.elapsed();
+            out
+        } else {
+            let repeat_started = Instant::now();
+            let k_all = repeat_kv(k_all, kv_repeat, store, tape)?;
+            let v_all = repeat_kv(v_all, kv_repeat, store, tape)?;
+            profile.repeat_kv += repeat_started.elapsed();
+            let started = Instant::now();
+            let out = causal_sdpa_with_q_start(q, k_all, v_all, q_start, store, tape)?;
+            profile.sdpa += started.elapsed();
+            out
+        };
 
         let started = Instant::now();
         let attn_hidden = if let Some(gate) = gate {
