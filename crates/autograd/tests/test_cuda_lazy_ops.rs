@@ -26,7 +26,7 @@ use autograd::backend::{
     cpu_gather_last_dim_backward, cpu_gather_last_dim_forward, cpu_log_softmax_backward,
     cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_matmul_bt_backward,
     cpu_matmul_bt_forward, cpu_rms_norm_forward, cpu_scatter_add_rows_forward, cpu_slice,
-    cpu_softmax_backward, cpu_softmax_forward_last_axis, cpu_transpose_swap,
+    cpu_softmax_backward, cpu_softmax_forward_last_axis, cpu_transpose_swap, CpuBackend,
 };
 use autograd::backend_cuda::CudaBackend;
 use autograd::{Backend, DeviceHandle};
@@ -797,6 +797,198 @@ fn cuda_causal_sdpa_decode_gqa_matches_cpu() {
          (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
         dev[idx],
         host[idx]
+    );
+}
+
+#[test]
+fn cuda_qwen_decode_prepare_q_and_kv_match_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_qwen_decode_prepare_q_and_kv_match_cpu: no CUDA device");
+        return;
+    };
+
+    let cpu = CpuBackend;
+    let batch = 2_usize;
+    let query_heads = 4_usize;
+    let kv_heads = 2_usize;
+    let head_dim = 16_usize;
+    let eps = 1e-6_f32;
+    let q_weight_shape = vec![head_dim];
+    let k_weight_shape = vec![head_dim];
+    let rope_shape = vec![1, head_dim / 2];
+    let q_weight = rng_vec(0x5150_0001, head_dim, 0.5);
+    let k_weight = rng_vec(0x5150_0002, head_dim, 0.5);
+    let cos = rng_vec(0x5150_0003, head_dim / 2, 1.0);
+    let sin = rng_vec(0x5150_0004, head_dim / 2, 1.0);
+
+    for gated in [false, true] {
+        let q_factor = if gated { 2 } else { 1 };
+        let q_shape = vec![batch, 1, query_heads * head_dim * q_factor];
+        let q_full = rng_vec(
+            if gated { 0x5150_0101 } else { 0x5150_0100 },
+            q_shape.iter().product(),
+            1.0,
+        );
+        let q_full_cpu = cpu.upload(&q_full, &q_shape).expect("cpu upload q_full");
+        let q_weight_cpu = cpu
+            .upload(&q_weight, &q_weight_shape)
+            .expect("cpu upload q_weight");
+        let cos_cpu = cpu.upload(&cos, &rope_shape).expect("cpu upload cos");
+        let sin_cpu = cpu.upload(&sin, &rope_shape).expect("cpu upload sin");
+        let (host_q_h, host_gate_h, out_shape) = cpu
+            .qwen_decode_prepare_q(
+                &q_full_cpu,
+                &q_shape,
+                &q_weight_cpu,
+                &q_weight_shape,
+                &cos_cpu,
+                &rope_shape,
+                &sin_cpu,
+                &rope_shape,
+                query_heads,
+                head_dim,
+                gated,
+                eps,
+            )
+            .expect("cpu qwen prepare q");
+        let host_q = cpu.readback(&host_q_h).expect("cpu read q");
+        let host_gate = host_gate_h
+            .as_ref()
+            .map(|handle| cpu.readback(handle).expect("cpu read gate"));
+
+        let q_full_cuda = backend
+            .upload(&q_full, &q_shape)
+            .expect("cuda upload q_full");
+        let q_weight_cuda = backend
+            .upload(&q_weight, &q_weight_shape)
+            .expect("cuda upload q_weight");
+        let cos_cuda = backend.upload(&cos, &rope_shape).expect("cuda upload cos");
+        let sin_cuda = backend.upload(&sin, &rope_shape).expect("cuda upload sin");
+        let (dev_q_h, dev_gate_h, dev_shape) = backend
+            .qwen_decode_prepare_q(
+                &q_full_cuda,
+                &q_shape,
+                &q_weight_cuda,
+                &q_weight_shape,
+                &cos_cuda,
+                &rope_shape,
+                &sin_cuda,
+                &rope_shape,
+                query_heads,
+                head_dim,
+                gated,
+                eps,
+            )
+            .expect("cuda qwen prepare q");
+        assert_eq!(dev_shape, out_shape);
+        if let Some(gate) = dev_gate_h.as_ref() {
+            backend.eval(&[&dev_q_h, gate]).expect("cuda eval q/gate");
+        } else {
+            backend.eval(&[&dev_q_h]).expect("cuda eval q");
+        }
+        let dev_q = backend.readback(&dev_q_h).expect("cuda q readback");
+        let (excess, abs, idx) = max_err_with_tol(&dev_q, &host_q, 1e-5, 1e-4);
+        assert!(
+            excess <= 1.0,
+            "qwen_decode_prepare_q gated={gated} exceeds atol=1e-5 + rtol=1e-4 at idx {idx} \
+             (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+            dev_q[idx],
+            host_q[idx]
+        );
+        match (dev_gate_h.as_ref(), host_gate.as_ref()) {
+            (Some(dev_gate_h), Some(host_gate)) => {
+                let dev_gate = backend.readback(dev_gate_h).expect("cuda gate readback");
+                let (excess, abs, idx) = max_err(&dev_gate, host_gate);
+                assert!(
+                    excess <= 1.0,
+                    "qwen_decode_prepare_q gate exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+                     (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+                    dev_gate[idx],
+                    host_gate[idx]
+                );
+            }
+            (None, None) => {}
+            _ => panic!("gate presence mismatch for gated={gated}"),
+        }
+    }
+
+    let kv_shape = vec![batch, 1, kv_heads * head_dim];
+    let k_full = rng_vec(0x5150_0201, kv_shape.iter().product(), 1.0);
+    let v_full = rng_vec(0x5150_0202, kv_shape.iter().product(), 1.0);
+    let k_full_cpu = cpu.upload(&k_full, &kv_shape).expect("cpu upload k_full");
+    let v_full_cpu = cpu.upload(&v_full, &kv_shape).expect("cpu upload v_full");
+    let k_weight_cpu = cpu
+        .upload(&k_weight, &k_weight_shape)
+        .expect("cpu upload k_weight");
+    let cos_cpu = cpu.upload(&cos, &rope_shape).expect("cpu upload cos");
+    let sin_cpu = cpu.upload(&sin, &rope_shape).expect("cpu upload sin");
+    let (host_k_h, host_v_h, out_shape) = cpu
+        .qwen_decode_prepare_kv(
+            &k_full_cpu,
+            &kv_shape,
+            &v_full_cpu,
+            &kv_shape,
+            &k_weight_cpu,
+            &k_weight_shape,
+            &cos_cpu,
+            &rope_shape,
+            &sin_cpu,
+            &rope_shape,
+            kv_heads,
+            head_dim,
+            eps,
+        )
+        .expect("cpu qwen prepare kv");
+    let host_k = cpu.readback(&host_k_h).expect("cpu read k");
+    let host_v = cpu.readback(&host_v_h).expect("cpu read v");
+
+    let k_full_cuda = backend
+        .upload(&k_full, &kv_shape)
+        .expect("cuda upload k_full");
+    let v_full_cuda = backend
+        .upload(&v_full, &kv_shape)
+        .expect("cuda upload v_full");
+    let k_weight_cuda = backend
+        .upload(&k_weight, &k_weight_shape)
+        .expect("cuda upload k_weight");
+    let cos_cuda = backend.upload(&cos, &rope_shape).expect("cuda upload cos");
+    let sin_cuda = backend.upload(&sin, &rope_shape).expect("cuda upload sin");
+    let (dev_k_h, dev_v_h, dev_shape) = backend
+        .qwen_decode_prepare_kv(
+            &k_full_cuda,
+            &kv_shape,
+            &v_full_cuda,
+            &kv_shape,
+            &k_weight_cuda,
+            &k_weight_shape,
+            &cos_cuda,
+            &rope_shape,
+            &sin_cuda,
+            &rope_shape,
+            kv_heads,
+            head_dim,
+            eps,
+        )
+        .expect("cuda qwen prepare kv");
+    assert_eq!(dev_shape, out_shape);
+    backend.eval(&[&dev_k_h, &dev_v_h]).expect("cuda eval kv");
+    let dev_k = backend.readback(&dev_k_h).expect("cuda k readback");
+    let dev_v = backend.readback(&dev_v_h).expect("cuda v readback");
+    let (excess_k, abs_k, idx_k) = max_err_with_tol(&dev_k, &host_k, 1e-5, 1e-4);
+    assert!(
+        excess_k <= 1.0,
+        "qwen_decode_prepare_kv k exceeds atol=1e-5 + rtol=1e-4 at idx {idx_k} \
+         (|diff|={abs_k}, dev={}, host={}, excess_ratio={excess_k})",
+        dev_k[idx_k],
+        host_k[idx_k]
+    );
+    let (excess_v, abs_v, idx_v) = max_err(&dev_v, &host_v);
+    assert!(
+        excess_v <= 1.0,
+        "qwen_decode_prepare_kv v exceeds atol=1e-6 + rtol=1e-4 at idx {idx_v} \
+         (|diff|={abs_v}, dev={}, host={}, excess_ratio={excess_v})",
+        dev_v[idx_v],
+        host_v[idx_v]
     );
 }
 

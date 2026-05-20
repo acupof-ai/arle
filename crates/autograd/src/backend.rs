@@ -116,6 +116,9 @@ pub enum DeviceHandle {
     Cuda(CudaStorage),
 }
 
+type QwenDecodePrepareQHost = (Vec<f32>, Option<Vec<f32>>, Vec<usize>);
+type QwenDecodePrepareKvHost = (Vec<f32>, Vec<f32>, Vec<usize>);
+
 #[derive(Debug, Clone)]
 pub struct DeviceGradClipResult {
     pub pre_clip_norm: f64,
@@ -1070,6 +1073,103 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         )?;
         let handle = self.upload(&data, &out_shape)?;
         Ok((handle, out_shape))
+    }
+
+    /// Decode-only Qwen attention preparation for the rollout fast path.
+    ///
+    /// Inputs are post-projection tensors with shape `[batch, 1, out_dim]`.
+    /// The output `q` has shape `[batch, query_heads, 1, head_dim]`; when
+    /// `gated` is true, the returned gate has the same shape and contains the
+    /// raw gate half in head-major layout. This fuses the decode-only
+    /// split/reshape/transpose/RMSNorm/RoPE chain while preserving the
+    /// existing gate order (`sigmoid(gate) * attn_hidden` happens later).
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_decode_prepare_q(
+        &self,
+        q_full: &DeviceHandle,
+        q_full_shape: &[usize],
+        q_norm_weight: &DeviceHandle,
+        q_norm_weight_shape: &[usize],
+        cos: &DeviceHandle,
+        cos_shape: &[usize],
+        sin: &DeviceHandle,
+        sin_shape: &[usize],
+        query_heads: usize,
+        head_dim: usize,
+        gated: bool,
+        eps: f32,
+    ) -> Result<(DeviceHandle, Option<DeviceHandle>, Vec<usize>)> {
+        let q_full_host = self.readback(q_full)?;
+        let weight_host = self.readback(q_norm_weight)?;
+        let cos_host = self.readback(cos)?;
+        let sin_host = self.readback(sin)?;
+        let (q, gate, out_shape) = cpu_qwen_decode_prepare_q(
+            &q_full_host,
+            q_full_shape,
+            &weight_host,
+            q_norm_weight_shape,
+            &cos_host,
+            cos_shape,
+            &sin_host,
+            sin_shape,
+            query_heads,
+            head_dim,
+            gated,
+            eps,
+        )?;
+        let q_handle = self.upload(&q, &out_shape)?;
+        let gate_handle = gate
+            .map(|gate| self.upload(&gate, &out_shape))
+            .transpose()?;
+        Ok((q_handle, gate_handle, out_shape))
+    }
+
+    /// Decode-only Qwen K/V preparation for the rollout fast path.
+    ///
+    /// Inputs are post-projection tensors with shape `[batch, 1,
+    /// kv_heads * head_dim]`. The returned K/V tensors have shape
+    /// `[batch, kv_heads, 1, head_dim]`; K is RMSNorm + RoPE transformed,
+    /// V is only laid out head-major.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_decode_prepare_kv(
+        &self,
+        k_full: &DeviceHandle,
+        k_full_shape: &[usize],
+        v_full: &DeviceHandle,
+        v_full_shape: &[usize],
+        k_norm_weight: &DeviceHandle,
+        k_norm_weight_shape: &[usize],
+        cos: &DeviceHandle,
+        cos_shape: &[usize],
+        sin: &DeviceHandle,
+        sin_shape: &[usize],
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<(DeviceHandle, DeviceHandle, Vec<usize>)> {
+        let k_full_host = self.readback(k_full)?;
+        let v_full_host = self.readback(v_full)?;
+        let weight_host = self.readback(k_norm_weight)?;
+        let cos_host = self.readback(cos)?;
+        let sin_host = self.readback(sin)?;
+        let (k, v, out_shape) = cpu_qwen_decode_prepare_kv(
+            &k_full_host,
+            k_full_shape,
+            &v_full_host,
+            v_full_shape,
+            &weight_host,
+            k_norm_weight_shape,
+            &cos_host,
+            cos_shape,
+            &sin_host,
+            sin_shape,
+            kv_heads,
+            head_dim,
+            eps,
+        )?;
+        let k_handle = self.upload(&k, &out_shape)?;
+        let v_handle = self.upload(&v, &out_shape)?;
+        Ok((k_handle, v_handle, out_shape))
     }
 
     /// Device-handle backward for a contiguous slice. Returns a full
@@ -3107,6 +3207,248 @@ pub fn cpu_causal_sdpa_decode_gqa(
     }
 
     Ok((out, out_shape))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_qwen_decode_prepare_q(
+    q_full: &[f32],
+    q_full_shape: &[usize],
+    q_norm_weight: &[f32],
+    q_norm_weight_shape: &[usize],
+    cos: &[f32],
+    cos_shape: &[usize],
+    sin: &[f32],
+    sin_shape: &[usize],
+    query_heads: usize,
+    head_dim: usize,
+    gated: bool,
+    eps: f32,
+) -> Result<QwenDecodePrepareQHost> {
+    validate_qwen_decode_prepare_q_shapes(
+        q_full_shape,
+        q_norm_weight_shape,
+        cos_shape,
+        sin_shape,
+        query_heads,
+        head_dim,
+        gated,
+    )?;
+    let q_full_size = shape_size(q_full_shape);
+    if q_full.len() != q_full_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: q_full.len(),
+            shape: q_full_shape.to_vec(),
+            size: q_full_size,
+        });
+    }
+    if q_norm_weight.len() != head_dim {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: q_norm_weight.len(),
+            shape: q_norm_weight_shape.to_vec(),
+            size: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    if cos.len() != half_dim || sin.len() != half_dim {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: cos.len().max(sin.len()),
+            shape: vec![1, half_dim],
+            size: half_dim,
+        });
+    }
+
+    let batch = q_full_shape[0];
+    let q_full_stride = q_full_shape[2];
+    let head_stride = if gated { head_dim * 2 } else { head_dim };
+    let out_shape = vec![batch, query_heads, 1, head_dim];
+    let mut q_layout = vec![0.0_f32; shape_size(&out_shape)];
+    let mut gate_layout = gated.then(|| vec![0.0_f32; shape_size(&out_shape)]);
+
+    for batch_idx in 0..batch {
+        for head in 0..query_heads {
+            let src_base = batch_idx * q_full_stride + head * head_stride;
+            let out_base = (batch_idx * query_heads + head) * head_dim;
+            q_layout[out_base..out_base + head_dim]
+                .copy_from_slice(&q_full[src_base..src_base + head_dim]);
+            if let Some(gate) = gate_layout.as_mut() {
+                gate[out_base..out_base + head_dim]
+                    .copy_from_slice(&q_full[src_base + head_dim..src_base + head_stride]);
+            }
+        }
+    }
+
+    let q_normed = cpu_rms_norm_forward(&q_layout, q_norm_weight, &out_shape, eps)?;
+    let q_roped = cpu_rope_forward(&q_normed, &out_shape, cos, sin)?;
+    Ok((q_roped, gate_layout, out_shape))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_qwen_decode_prepare_kv(
+    k_full: &[f32],
+    k_full_shape: &[usize],
+    v_full: &[f32],
+    v_full_shape: &[usize],
+    k_norm_weight: &[f32],
+    k_norm_weight_shape: &[usize],
+    cos: &[f32],
+    cos_shape: &[usize],
+    sin: &[f32],
+    sin_shape: &[usize],
+    kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<QwenDecodePrepareKvHost> {
+    validate_qwen_decode_prepare_kv_shapes(
+        k_full_shape,
+        v_full_shape,
+        k_norm_weight_shape,
+        cos_shape,
+        sin_shape,
+        kv_heads,
+        head_dim,
+    )?;
+    let k_full_size = shape_size(k_full_shape);
+    let v_full_size = shape_size(v_full_shape);
+    if k_full.len() != k_full_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: k_full.len(),
+            shape: k_full_shape.to_vec(),
+            size: k_full_size,
+        });
+    }
+    if v_full.len() != v_full_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: v_full.len(),
+            shape: v_full_shape.to_vec(),
+            size: v_full_size,
+        });
+    }
+    if k_norm_weight.len() != head_dim {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: k_norm_weight.len(),
+            shape: k_norm_weight_shape.to_vec(),
+            size: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    if cos.len() != half_dim || sin.len() != half_dim {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: cos.len().max(sin.len()),
+            shape: vec![1, half_dim],
+            size: half_dim,
+        });
+    }
+
+    let batch = k_full_shape[0];
+    let full_stride = k_full_shape[2];
+    let out_shape = vec![batch, kv_heads, 1, head_dim];
+    let mut k_layout = vec![0.0_f32; shape_size(&out_shape)];
+    let mut v_layout = vec![0.0_f32; shape_size(&out_shape)];
+
+    for batch_idx in 0..batch {
+        for head in 0..kv_heads {
+            let src_base = batch_idx * full_stride + head * head_dim;
+            let out_base = (batch_idx * kv_heads + head) * head_dim;
+            k_layout[out_base..out_base + head_dim]
+                .copy_from_slice(&k_full[src_base..src_base + head_dim]);
+            v_layout[out_base..out_base + head_dim]
+                .copy_from_slice(&v_full[src_base..src_base + head_dim]);
+        }
+    }
+
+    let k_normed = cpu_rms_norm_forward(&k_layout, k_norm_weight, &out_shape, eps)?;
+    let k_roped = cpu_rope_forward(&k_normed, &out_shape, cos, sin)?;
+    Ok((k_roped, v_layout, out_shape))
+}
+
+fn validate_qwen_decode_prepare_common(
+    full_shape: &[usize],
+    weight_shape: &[usize],
+    cos_shape: &[usize],
+    sin_shape: &[usize],
+    heads: usize,
+    head_dim: usize,
+    projected_dim: usize,
+) -> Result<()> {
+    if full_shape.len() != 3 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "3",
+            got: full_shape.len(),
+        });
+    }
+    if full_shape[1] != 1 || full_shape[2] != projected_dim {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![full_shape[0], 1, projected_dim],
+            got: full_shape.to_vec(),
+        });
+    }
+    if heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(crate::AutogradError::TapeInvariant(
+            "qwen decode prepare requires non-zero heads and even head_dim",
+        ));
+    }
+    if weight_shape != [head_dim] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![head_dim],
+            got: weight_shape.to_vec(),
+        });
+    }
+    let rope_shape = [1, head_dim / 2];
+    if cos_shape != rope_shape || sin_shape != rope_shape {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: rope_shape.to_vec(),
+            got: cos_shape.to_vec(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_qwen_decode_prepare_q_shapes(
+    q_full_shape: &[usize],
+    q_norm_weight_shape: &[usize],
+    cos_shape: &[usize],
+    sin_shape: &[usize],
+    query_heads: usize,
+    head_dim: usize,
+    gated: bool,
+) -> Result<()> {
+    let factor = if gated { 2 } else { 1 };
+    validate_qwen_decode_prepare_common(
+        q_full_shape,
+        q_norm_weight_shape,
+        cos_shape,
+        sin_shape,
+        query_heads,
+        head_dim,
+        query_heads * head_dim * factor,
+    )
+}
+
+pub(crate) fn validate_qwen_decode_prepare_kv_shapes(
+    k_full_shape: &[usize],
+    v_full_shape: &[usize],
+    k_norm_weight_shape: &[usize],
+    cos_shape: &[usize],
+    sin_shape: &[usize],
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    validate_qwen_decode_prepare_common(
+        k_full_shape,
+        k_norm_weight_shape,
+        cos_shape,
+        sin_shape,
+        kv_heads,
+        head_dim,
+        kv_heads * head_dim,
+    )?;
+    if v_full_shape != k_full_shape {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: k_full_shape.to_vec(),
+            got: v_full_shape.to_vec(),
+        });
+    }
+    Ok(())
 }
 
 pub fn validate_decode_gqa_shapes(

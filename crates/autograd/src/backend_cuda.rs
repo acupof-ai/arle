@@ -13,22 +13,23 @@
 
 #[cfg(not(feature = "no-cuda"))]
 use crate::{
-    AutogradError,
     backend::{
-        CudaStorage, matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
-        validate_decode_gqa_shapes,
+        matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
+        validate_decode_gqa_shapes, validate_qwen_decode_prepare_kv_shapes,
+        validate_qwen_decode_prepare_q_shapes, CudaStorage,
     },
+    AutogradError,
 };
 use crate::{
-    Result,
     backend::{Backend, Device, DeviceGradClipResult, DeviceHandle},
+    Result,
 };
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/kernels.rs"]
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{KernelCache, launch_1d, launch_rows};
+use self::kernels::{launch_1d, launch_rows, KernelCache};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
@@ -1354,6 +1355,117 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_causal_sdpa_decode_gqa(self, q, q_shape, k, k_shape, v, v_shape, q_start)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_decode_prepare_q(
+        &self,
+        q_full: &DeviceHandle,
+        q_full_shape: &[usize],
+        q_norm_weight: &DeviceHandle,
+        q_norm_weight_shape: &[usize],
+        cos: &DeviceHandle,
+        cos_shape: &[usize],
+        sin: &DeviceHandle,
+        sin_shape: &[usize],
+        query_heads: usize,
+        head_dim: usize,
+        gated: bool,
+        eps: f32,
+    ) -> Result<(DeviceHandle, Option<DeviceHandle>, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (
+                q_full,
+                q_full_shape,
+                q_norm_weight,
+                q_norm_weight_shape,
+                cos,
+                cos_shape,
+                sin,
+                sin_shape,
+                query_heads,
+                head_dim,
+                gated,
+                eps,
+            );
+            todo!("GPU required: cuda qwen_decode_prepare_q is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_qwen_decode_prepare_q(
+                self,
+                q_full,
+                q_full_shape,
+                q_norm_weight,
+                q_norm_weight_shape,
+                cos,
+                cos_shape,
+                sin,
+                sin_shape,
+                query_heads,
+                head_dim,
+                gated,
+                eps,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_decode_prepare_kv(
+        &self,
+        k_full: &DeviceHandle,
+        k_full_shape: &[usize],
+        v_full: &DeviceHandle,
+        v_full_shape: &[usize],
+        k_norm_weight: &DeviceHandle,
+        k_norm_weight_shape: &[usize],
+        cos: &DeviceHandle,
+        cos_shape: &[usize],
+        sin: &DeviceHandle,
+        sin_shape: &[usize],
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<(DeviceHandle, DeviceHandle, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (
+                k_full,
+                k_full_shape,
+                v_full,
+                v_full_shape,
+                k_norm_weight,
+                k_norm_weight_shape,
+                cos,
+                cos_shape,
+                sin,
+                sin_shape,
+                kv_heads,
+                head_dim,
+                eps,
+            );
+            todo!("GPU required: cuda qwen_decode_prepare_kv is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_qwen_decode_prepare_kv(
+                self,
+                k_full,
+                k_full_shape,
+                v_full,
+                v_full_shape,
+                k_norm_weight,
+                k_norm_weight_shape,
+                cos,
+                cos_shape,
+                sin,
+                sin_shape,
+                kv_heads,
+                head_dim,
+                eps,
+            )
         }
     }
 
@@ -4607,6 +4719,260 @@ fn cuda_causal_sdpa_decode_gqa(
         },
     )?;
     Ok((DeviceHandle::Cuda(CudaStorage::new(d_out)), out_shape))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_qwen_decode_prepare_q(
+    backend: &CudaBackend,
+    q_full: &DeviceHandle,
+    q_full_shape: &[usize],
+    q_norm_weight: &DeviceHandle,
+    q_norm_weight_shape: &[usize],
+    cos: &DeviceHandle,
+    cos_shape: &[usize],
+    sin: &DeviceHandle,
+    sin_shape: &[usize],
+    query_heads: usize,
+    head_dim: usize,
+    gated: bool,
+    eps: f32,
+) -> Result<(DeviceHandle, Option<DeviceHandle>, Vec<usize>)> {
+    validate_qwen_decode_prepare_q_shapes(
+        q_full_shape,
+        q_norm_weight_shape,
+        cos_shape,
+        sin_shape,
+        query_heads,
+        head_dim,
+        gated,
+    )?;
+    let q_full_size = shape_size(q_full_shape);
+    let d_q_full = backend.cuda_slice(q_full, "qwen_decode_prepare_q")?;
+    let d_weight = backend.cuda_slice(q_norm_weight, "qwen_decode_prepare_q")?;
+    let d_cos = backend.cuda_slice(cos, "qwen_decode_prepare_q")?;
+    let d_sin = backend.cuda_slice(sin, "qwen_decode_prepare_q")?;
+    if d_q_full.len() != q_full_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_q_full.len(),
+            shape: q_full_shape.to_vec(),
+            size: q_full_size,
+        });
+    }
+    if d_weight.len() != head_dim {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_weight.len(),
+            shape: q_norm_weight_shape.to_vec(),
+            size: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    if d_cos.len() != half_dim || d_sin.len() != half_dim {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_cos.len().max(d_sin.len()),
+            shape: vec![1, half_dim],
+            size: half_dim,
+        });
+    }
+
+    let batch = q_full_shape[0];
+    let out_shape = vec![batch, query_heads, 1, head_dim];
+    let out_total = shape_size(&out_shape);
+    let mut d_q = backend
+        .stream
+        .alloc_zeros::<f32>(out_total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep q)"))?;
+
+    let batch_i = i32::try_from(batch)
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep q batch exceeds i32"))?;
+    let query_heads_i = i32::try_from(query_heads)
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep q heads exceeds i32"))?;
+    let head_dim_i = i32::try_from(head_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep q head_dim exceeds i32"))?;
+    let q_full_stride_i = i32::try_from(q_full_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep q stride exceeds i32"))?;
+    let rows = batch * query_heads;
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+
+    let gate_handle = if gated {
+        let mut d_gate = backend.stream.alloc_zeros::<f32>(out_total).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep gate)")
+        })?;
+        launch_rows(
+            &backend.stream,
+            backend
+                .kernels
+                .function("qwen_decode_prepare_q_gated_f32")?,
+            rows,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder
+                    .arg(&mut d_q)
+                    .arg(&mut d_gate)
+                    .arg(d_q_full)
+                    .arg(d_weight)
+                    .arg(d_cos)
+                    .arg(d_sin)
+                    .arg(&batch_i)
+                    .arg(&query_heads_i)
+                    .arg(&head_dim_i)
+                    .arg(&q_full_stride_i)
+                    .arg(&eps);
+                builder
+            },
+        )?;
+        Some(DeviceHandle::Cuda(CudaStorage::new(d_gate)))
+    } else {
+        launch_rows(
+            &backend.stream,
+            backend.kernels.function("qwen_decode_prepare_q_f32")?,
+            rows,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder
+                    .arg(&mut d_q)
+                    .arg(d_q_full)
+                    .arg(d_weight)
+                    .arg(d_cos)
+                    .arg(d_sin)
+                    .arg(&batch_i)
+                    .arg(&query_heads_i)
+                    .arg(&head_dim_i)
+                    .arg(&q_full_stride_i)
+                    .arg(&eps);
+                builder
+            },
+        )?;
+        None
+    };
+
+    Ok((
+        DeviceHandle::Cuda(CudaStorage::new(d_q)),
+        gate_handle,
+        out_shape,
+    ))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_qwen_decode_prepare_kv(
+    backend: &CudaBackend,
+    k_full: &DeviceHandle,
+    k_full_shape: &[usize],
+    v_full: &DeviceHandle,
+    v_full_shape: &[usize],
+    k_norm_weight: &DeviceHandle,
+    k_norm_weight_shape: &[usize],
+    cos: &DeviceHandle,
+    cos_shape: &[usize],
+    sin: &DeviceHandle,
+    sin_shape: &[usize],
+    kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(DeviceHandle, DeviceHandle, Vec<usize>)> {
+    validate_qwen_decode_prepare_kv_shapes(
+        k_full_shape,
+        v_full_shape,
+        k_norm_weight_shape,
+        cos_shape,
+        sin_shape,
+        kv_heads,
+        head_dim,
+    )?;
+    let k_full_size = shape_size(k_full_shape);
+    let v_full_size = shape_size(v_full_shape);
+    let d_k_full = backend.cuda_slice(k_full, "qwen_decode_prepare_kv")?;
+    let d_v_full = backend.cuda_slice(v_full, "qwen_decode_prepare_kv")?;
+    let d_weight = backend.cuda_slice(k_norm_weight, "qwen_decode_prepare_kv")?;
+    let d_cos = backend.cuda_slice(cos, "qwen_decode_prepare_kv")?;
+    let d_sin = backend.cuda_slice(sin, "qwen_decode_prepare_kv")?;
+    if d_k_full.len() != k_full_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_k_full.len(),
+            shape: k_full_shape.to_vec(),
+            size: k_full_size,
+        });
+    }
+    if d_v_full.len() != v_full_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_v_full.len(),
+            shape: v_full_shape.to_vec(),
+            size: v_full_size,
+        });
+    }
+    if d_weight.len() != head_dim {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_weight.len(),
+            shape: k_norm_weight_shape.to_vec(),
+            size: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    if d_cos.len() != half_dim || d_sin.len() != half_dim {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_cos.len().max(d_sin.len()),
+            shape: vec![1, half_dim],
+            size: half_dim,
+        });
+    }
+
+    let batch = k_full_shape[0];
+    let out_shape = vec![batch, kv_heads, 1, head_dim];
+    let out_total = shape_size(&out_shape);
+    let mut d_k = backend
+        .stream
+        .alloc_zeros::<f32>(out_total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep k)"))?;
+    let mut d_v = backend
+        .stream
+        .alloc_zeros::<f32>(out_total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (qwen prep v)"))?;
+
+    let batch_i = i32::try_from(batch)
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep kv batch exceeds i32"))?;
+    let kv_heads_i = i32::try_from(kv_heads)
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep kv heads exceeds i32"))?;
+    let head_dim_i = i32::try_from(head_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep kv head_dim exceeds i32"))?;
+    let kv_full_stride_i = i32::try_from(k_full_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda qwen prep kv stride exceeds i32"))?;
+    let rows = batch * kv_heads;
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("qwen_decode_prepare_kv_f32")?,
+        rows,
+        BLOCK,
+        SHARED,
+        |mut builder| {
+            builder
+                .arg(&mut d_k)
+                .arg(&mut d_v)
+                .arg(d_k_full)
+                .arg(d_v_full)
+                .arg(d_weight)
+                .arg(d_cos)
+                .arg(d_sin)
+                .arg(&batch_i)
+                .arg(&kv_heads_i)
+                .arg(&head_dim_i)
+                .arg(&kv_full_stride_i)
+                .arg(&eps);
+            builder
+        },
+    )?;
+
+    Ok((
+        DeviceHandle::Cuda(CudaStorage::new(d_k)),
+        DeviceHandle::Cuda(CudaStorage::new(d_v)),
+        out_shape,
+    ))
 }
 
 #[cfg(not(feature = "no-cuda"))]
