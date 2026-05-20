@@ -97,7 +97,15 @@ where
     };
     let step_basename = format!("step_{:06}", spec.step);
     let step_dir = spec.out_dir.join(&step_basename);
-    let created_step_dir = !step_dir.exists();
+    if step_dir.exists() {
+        return Err(Qwen35CheckpointError::Custom(format!(
+            "OPD checkpoint step directory {} already exists. Hint: choose a \
+             fresh step number or inspect/remove the existing directory before \
+             retrying; refusing to merge new checkpoint artifacts into an \
+             existing step directory.",
+            step_dir.display()
+        )));
+    }
     fs::create_dir_all(&step_dir)?;
 
     let result = (|| {
@@ -119,7 +127,7 @@ where
         Ok(step_dir.clone())
     })();
 
-    if result.is_err() && created_step_dir {
+    if result.is_err() {
         let _ = fs::remove_dir_all(&step_dir);
     }
     result
@@ -698,6 +706,54 @@ mod tests {
         assert!(
             !tmp.path().join("latest").exists(),
             "failed weight save must not publish latest"
+        );
+    }
+
+    #[test]
+    fn save_step_checkpoint_refuses_existing_step_dir_without_writes() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = dense_qwen35_config();
+        let step_dir = tmp.path().join("step_000006");
+        fs::create_dir_all(&step_dir).expect("create existing step dir");
+        fs::write(step_dir.join("marker.txt"), "keep").expect("write marker");
+        let mut save_artifact_called = false;
+
+        let err = save_step_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 6,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            |_weights_path| {
+                save_artifact_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("existing checkpoint step dir must be refused before writes");
+
+        let message = err.to_string();
+        assert!(message.contains("already exists"));
+        assert!(message.contains("fresh step"));
+        assert!(
+            !save_artifact_called,
+            "artifact writer must not run when the step directory already exists"
+        );
+        assert_eq!(
+            fs::read_to_string(step_dir.join("marker.txt")).expect("read marker"),
+            "keep",
+            "existing checkpoint directory contents must be left untouched"
+        );
+        assert!(
+            !tmp.path().join("latest").exists(),
+            "refusing an existing step dir must not publish latest"
         );
     }
 
