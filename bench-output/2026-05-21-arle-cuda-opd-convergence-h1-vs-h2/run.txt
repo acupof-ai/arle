@@ -1,0 +1,232 @@
+diag_config backend=cuda model_dir=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B steps_per_config=100 rollout_len=8 decode_len=16 grad_clip=1 perturb_seed=0x0f0dcafe20260521
+diag_case label=A_min_perturb_same_lr perturb_scale=9.999999747e-6 lr=4.999999874e-5
+diag_case label=B_same_perturb_min_lr perturb_scale=1.000000047e-3 lr=1.000000012e-7
+diag_case label=C_min_perturb_min_lr perturb_scale=9.999999747e-6 lr=1.000000012e-7
+prompt split=train index=0 ids=[1, 872, 198, 3456]
+prompt split=train index=1 ids=[1, 198, 1512, 429]
+prompt split=train index=2 ids=[1, 770, 3186, 25, 220]
+prompt split=train index=3 ids=[1, 644, 374, 279, 1887]
+prompt split=train index=4 ids=[1, 3838, 374, 264, 2077, 13]
+prompt split=train index=5 ids=[1, 785, 594, 287, 374, 1690]
+prompt split=train index=6 ids=[1, 3347, 11, 358, 1052, 429]
+prompt split=train index=7 ids=[1, 2610, 527, 1139, 304, 279, 1670]
+prompt split=heldout index=0 ids=[1, 4438, 374, 279, 2768]
+prompt split=heldout index=1 ids=[1, 1516, 374, 264, 1296, 4339]
+prompt split=heldout index=2 ids=[1, 785, 1401, 315, 279, 1967]
+prompt split=heldout index=3 ids=[1, 3198, 279, 1296, 25, 220]
+config_start label=A_min_perturb_same_lr perturb_scale=9.999999747e-6 lr=4.999999874e-5 rollout_len=8 steps=100
+model_summary label=A_min_perturb_same_lr hidden=1024 intermediate=3072 layers=28 vocab=151936 num_heads=16 num_kv_heads=8 head_dim=128 teacher_params=601292800 student_model_params=601292800 student_trainable_params=596049920 teacher_load_seconds=7.103976 student_load_seconds=6.599277
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=0 overlap_pct=100.000000 kl=5.695529438017e-7
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=1 overlap_pct=100.000000 kl=1.247370133524e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=2 overlap_pct=100.000000 kl=1.411209813408e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=3 overlap_pct=31.250000 kl=1.408682550281e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=4 overlap_pct=100.000000 kl=1.813178794259e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=5 overlap_pct=100.000000 kl=2.480477189542e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=6 overlap_pct=100.000000 kl=1.305012256371e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=train prompt_index=7 overlap_pct=100.000000 kl=1.338962533717e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=heldout prompt_index=0 overlap_pct=100.000000 kl=1.999672733746e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=heldout prompt_index=1 overlap_pct=100.000000 kl=1.696207535644e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=heldout prompt_index=2 overlap_pct=100.000000 kl=5.665950644321e-6
+eval_detail label=A_min_perturb_same_lr step=0 split=heldout prompt_index=3 overlap_pct=100.000000 kl=5.293480382823e-7
+eval_summary label=A_min_perturb_same_lr step=0 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=1.446805776863e-6 heldout_kl=2.472794737998e-6 eval_seconds=8.727033
+train_step label=A_min_perturb_same_lr step=1 prompt_index=0 loss=1.746966336214e-5 rollout_len=12 step_seconds=0.262434
+train_step label=A_min_perturb_same_lr step=10 prompt_index=1 loss=4.236497989041e-5 rollout_len=12 step_seconds=0.291703
+train_step label=A_min_perturb_same_lr step=20 prompt_index=3 loss=3.561146877473e-5 rollout_len=13 step_seconds=0.293654
+train_step label=A_min_perturb_same_lr step=25 prompt_index=0 loss=3.213545278413e-5 rollout_len=12 step_seconds=0.294047
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=0 overlap_pct=0.000000 kl=1.660045303992e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=1 overlap_pct=0.000000 kl=3.595831260831e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=2 overlap_pct=100.000000 kl=1.323477270117e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=3 overlap_pct=25.000000 kl=6.766787377044e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=4 overlap_pct=0.000000 kl=4.932690295410e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=5 overlap_pct=12.500000 kl=8.059273861012e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=6 overlap_pct=12.500000 kl=1.305460090148e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=train prompt_index=7 overlap_pct=0.000000 kl=6.725837363353e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=heldout prompt_index=0 overlap_pct=31.250000 kl=4.911010104745e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=heldout prompt_index=1 overlap_pct=50.000000 kl=2.508443564672e-1
+eval_detail label=A_min_perturb_same_lr step=25 split=heldout prompt_index=2 overlap_pct=6.250000 kl=1.170960436471e0
+eval_detail label=A_min_perturb_same_lr step=25 split=heldout prompt_index=3 overlap_pct=37.500000 kl=2.126914724250e-1
+eval_summary label=A_min_perturb_same_lr step=25 train_overlap_pct=18.750000 heldout_overlap_pct=31.250000 train_kl=4.296175352738e-1 heldout_kl=5.313993189595e-1 eval_seconds=7.164284
+train_step label=A_min_perturb_same_lr step=30 prompt_index=5 loss=4.262265429134e-5 rollout_len=14 step_seconds=0.295297
+train_step label=A_min_perturb_same_lr step=40 prompt_index=7 loss=4.155792339589e-5 rollout_len=15 step_seconds=0.296409
+train_step label=A_min_perturb_same_lr step=50 prompt_index=1 loss=4.424445432960e-5 rollout_len=12 step_seconds=0.292577
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=0 overlap_pct=0.000000 kl=1.564594289059e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=1 overlap_pct=12.500000 kl=2.498636707438e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=2 overlap_pct=6.250000 kl=6.363021037827e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=3 overlap_pct=12.500000 kl=2.571534920464e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=4 overlap_pct=6.250000 kl=7.487416210248e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=5 overlap_pct=18.750000 kl=4.064953829542e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=6 overlap_pct=12.500000 kl=1.556907695624e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=train prompt_index=7 overlap_pct=6.250000 kl=6.519527842783e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=heldout prompt_index=0 overlap_pct=25.000000 kl=3.653741269648e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=heldout prompt_index=1 overlap_pct=50.000000 kl=2.302959827420e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=heldout prompt_index=2 overlap_pct=31.250000 kl=7.999894257871e-1
+eval_detail label=A_min_perturb_same_lr step=50 split=heldout prompt_index=3 overlap_pct=6.250000 kl=2.161462787751e-1
+eval_summary label=A_min_perturb_same_lr step=50 train_overlap_pct=9.375000 heldout_overlap_pct=28.125000 train_kl=4.078324066623e-1 heldout_kl=4.029514535672e-1 eval_seconds=7.176025
+train_step label=A_min_perturb_same_lr step=60 prompt_index=3 loss=3.887528509949e-5 rollout_len=13 step_seconds=0.295914
+train_step label=A_min_perturb_same_lr step=70 prompt_index=5 loss=3.211883813492e-5 rollout_len=14 step_seconds=0.295508
+train_step label=A_min_perturb_same_lr step=80 prompt_index=7 loss=3.741145337699e-5 rollout_len=15 step_seconds=0.299178
+train_step label=A_min_perturb_same_lr step=90 prompt_index=1 loss=3.651899169199e-5 rollout_len=12 step_seconds=0.291719
+train_step label=A_min_perturb_same_lr step=100 prompt_index=3 loss=4.011213968624e-5 rollout_len=13 step_seconds=0.300279
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=0 overlap_pct=93.750000 kl=1.356155768077e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=1 overlap_pct=75.000000 kl=9.313220118863e-2
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=2 overlap_pct=6.250000 kl=1.056836912723e0
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=3 overlap_pct=31.250000 kl=2.875445881037e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=4 overlap_pct=0.000000 kl=5.505997081866e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=5 overlap_pct=56.250000 kl=2.897249403599e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=6 overlap_pct=6.250000 kl=6.011715528140e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=train prompt_index=7 overlap_pct=50.000000 kl=3.215064647869e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=heldout prompt_index=0 overlap_pct=25.000000 kl=3.691964356985e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=heldout prompt_index=1 overlap_pct=12.500000 kl=3.177229215149e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=heldout prompt_index=2 overlap_pct=25.000000 kl=7.710972708888e-1
+eval_detail label=A_min_perturb_same_lr step=100 split=heldout prompt_index=3 overlap_pct=12.500000 kl=4.215427661799e-1
+eval_summary label=A_min_perturb_same_lr step=100 train_overlap_pct=39.843750 heldout_overlap_pct=18.750000 train_kl=4.170164931213e-1 heldout_kl=4.698898485705e-1 eval_seconds=7.235669
+config_summary label=A_min_perturb_same_lr first_loss=1.746966336214e-5 final_loss=4.011213968624e-5 sampled_loss_reduction_pct=-129.610261 train_kl_start=1.446805776863e-6 train_kl_final=4.170164931213e-1 train_kl_reduction_pct=-28823153.251412 train_overlap_start=91.406250 train_overlap_final=39.843750 heldout_kl_start=2.472794737998e-6 heldout_kl_final=4.698898485705e-1 heldout_overlap_start=100.000000 heldout_overlap_final=18.750000 mean_step_seconds=0.294305 median_step_seconds=0.295274 total_wall_seconds=74.031125
+summary_eval_row label=A_min_perturb_same_lr step=0 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=1.446805776863e-6 heldout_kl=2.472794737998e-6
+summary_eval_row label=A_min_perturb_same_lr step=25 train_overlap_pct=18.750000 heldout_overlap_pct=31.250000 train_kl=4.296175352738e-1 heldout_kl=5.313993189595e-1
+summary_eval_row label=A_min_perturb_same_lr step=50 train_overlap_pct=9.375000 heldout_overlap_pct=28.125000 train_kl=4.078324066623e-1 heldout_kl=4.029514535672e-1
+summary_eval_row label=A_min_perturb_same_lr step=100 train_overlap_pct=39.843750 heldout_overlap_pct=18.750000 train_kl=4.170164931213e-1 heldout_kl=4.698898485705e-1
+config_start label=B_same_perturb_min_lr perturb_scale=1.000000047e-3 lr=1.000000012e-7 rollout_len=8 steps=100
+model_summary label=B_same_perturb_min_lr hidden=1024 intermediate=3072 layers=28 vocab=151936 num_heads=16 num_kv_heads=8 head_dim=128 teacher_params=601292800 student_model_params=601292800 student_trainable_params=596049920 teacher_load_seconds=5.710527 student_load_seconds=6.264169
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=0 overlap_pct=100.000000 kl=5.621485744854e-3
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=1 overlap_pct=100.000000 kl=1.115262489178e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=2 overlap_pct=100.000000 kl=1.497549897173e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=3 overlap_pct=31.250000 kl=1.330972498486e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=4 overlap_pct=6.250000 kl=1.736336546338e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=5 overlap_pct=56.250000 kl=2.734693989953e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=6 overlap_pct=100.000000 kl=1.167650551419e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=train prompt_index=7 overlap_pct=100.000000 kl=1.322513795018e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=heldout prompt_index=0 overlap_pct=31.250000 kl=1.923349009451e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=heldout prompt_index=1 overlap_pct=18.750000 kl=1.733289758898e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=heldout prompt_index=2 overlap_pct=50.000000 kl=4.475668043414e-2
+eval_detail label=B_same_perturb_min_lr step=0 split=heldout prompt_index=3 overlap_pct=100.000000 kl=5.589429209807e-3
+eval_summary label=B_same_perturb_min_lr step=0 train_overlap_pct=74.218750 heldout_overlap_pct=50.000000 train_kl=1.433391042756e-2 heldout_kl=2.172812433186e-2 eval_seconds=8.355812
+train_step label=B_same_perturb_min_lr step=1 prompt_index=0 loss=1.788745430531e-5 rollout_len=12 step_seconds=0.257404
+train_step label=B_same_perturb_min_lr step=10 prompt_index=1 loss=3.805938104051e-5 rollout_len=12 step_seconds=0.294110
+train_step label=B_same_perturb_min_lr step=20 prompt_index=3 loss=3.934411506634e-5 rollout_len=13 step_seconds=0.295395
+train_step label=B_same_perturb_min_lr step=25 prompt_index=0 loss=1.755846642482e-5 rollout_len=12 step_seconds=0.294708
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=0 overlap_pct=100.000000 kl=4.640723666239e-3
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=1 overlap_pct=100.000000 kl=1.009841439222e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=2 overlap_pct=100.000000 kl=8.333451534927e-3
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=3 overlap_pct=31.250000 kl=1.299458690097e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=4 overlap_pct=6.250000 kl=1.640317302831e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=5 overlap_pct=50.000000 kl=2.415308302957e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=6 overlap_pct=100.000000 kl=1.061245147011e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=train prompt_index=7 overlap_pct=100.000000 kl=1.116518427778e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=heldout prompt_index=0 overlap_pct=31.250000 kl=1.881087004203e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=heldout prompt_index=1 overlap_pct=18.750000 kl=1.745769435020e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=heldout prompt_index=2 overlap_pct=50.000000 kl=4.411976464027e-2
+eval_detail label=B_same_perturb_min_lr step=25 split=heldout prompt_index=3 overlap_pct=100.000000 kl=5.482578826891e-3
+eval_summary label=B_same_perturb_min_lr step=25 train_overlap_pct=73.437500 heldout_overlap_pct=50.000000 train_kl=1.230013353752e-2 heldout_kl=2.146772696485e-2 eval_seconds=6.992673
+train_step label=B_same_perturb_min_lr step=30 prompt_index=5 loss=3.520914106048e-5 rollout_len=14 step_seconds=0.296926
+train_step label=B_same_perturb_min_lr step=40 prompt_index=7 loss=3.992492929683e-5 rollout_len=15 step_seconds=0.298995
+train_step label=B_same_perturb_min_lr step=50 prompt_index=1 loss=3.804211155511e-5 rollout_len=12 step_seconds=0.294069
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=0 overlap_pct=100.000000 kl=4.205619347186e-3
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=1 overlap_pct=100.000000 kl=9.303841193494e-3
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=2 overlap_pct=100.000000 kl=7.015143094485e-3
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=3 overlap_pct=31.250000 kl=1.266151387503e-2
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=4 overlap_pct=18.750000 kl=1.540783205582e-2
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=5 overlap_pct=50.000000 kl=2.405758219685e-2
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=6 overlap_pct=100.000000 kl=9.536280958109e-3
+eval_detail label=B_same_perturb_min_lr step=50 split=train prompt_index=7 overlap_pct=100.000000 kl=9.135539867783e-3
+eval_detail label=B_same_perturb_min_lr step=50 split=heldout prompt_index=0 overlap_pct=31.250000 kl=1.847108675102e-2
+eval_detail label=B_same_perturb_min_lr step=50 split=heldout prompt_index=1 overlap_pct=18.750000 kl=1.747763554751e-2
+eval_detail label=B_same_perturb_min_lr step=50 split=heldout prompt_index=2 overlap_pct=50.000000 kl=4.366684810067e-2
+eval_detail label=B_same_perturb_min_lr step=50 split=heldout prompt_index=3 overlap_pct=100.000000 kl=5.384251043790e-3
+eval_summary label=B_same_perturb_min_lr step=50 train_overlap_pct=75.000000 heldout_overlap_pct=50.000000 train_kl=1.141541907359e-2 heldout_kl=2.124995536075e-2 eval_seconds=6.940191
+train_step label=B_same_perturb_min_lr step=60 prompt_index=3 loss=3.933618427254e-5 rollout_len=13 step_seconds=0.294328
+train_step label=B_same_perturb_min_lr step=70 prompt_index=5 loss=3.519380334183e-5 rollout_len=14 step_seconds=0.295846
+train_step label=B_same_perturb_min_lr step=80 prompt_index=7 loss=3.990106415586e-5 rollout_len=15 step_seconds=0.296883
+train_step label=B_same_perturb_min_lr step=90 prompt_index=1 loss=3.803059007623e-5 rollout_len=12 step_seconds=0.295388
+train_step label=B_same_perturb_min_lr step=100 prompt_index=3 loss=3.932908293791e-5 rollout_len=13 step_seconds=0.296872
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=0 overlap_pct=100.000000 kl=3.659647304725e-3
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=1 overlap_pct=100.000000 kl=8.213714346970e-3
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=2 overlap_pct=100.000000 kl=5.972806679367e-3
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=3 overlap_pct=31.250000 kl=1.206390871072e-2
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=4 overlap_pct=18.750000 kl=1.418225509143e-2
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=5 overlap_pct=50.000000 kl=2.039082392256e-2
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=6 overlap_pct=100.000000 kl=8.055084552512e-3
+eval_detail label=B_same_perturb_min_lr step=100 split=train prompt_index=7 overlap_pct=100.000000 kl=7.037745849744e-3
+eval_detail label=B_same_perturb_min_lr step=100 split=heldout prompt_index=0 overlap_pct=31.250000 kl=1.781074049738e-2
+eval_detail label=B_same_perturb_min_lr step=100 split=heldout prompt_index=1 overlap_pct=25.000000 kl=1.736794087595e-2
+eval_detail label=B_same_perturb_min_lr step=100 split=heldout prompt_index=2 overlap_pct=100.000000 kl=4.304753649745e-2
+eval_detail label=B_same_perturb_min_lr step=100 split=heldout prompt_index=3 overlap_pct=100.000000 kl=5.235718316689e-3
+eval_summary label=B_same_perturb_min_lr step=100 train_overlap_pct=75.000000 heldout_overlap_pct=64.062500 train_kl=9.946998307254e-3 heldout_kl=2.086548404687e-2 eval_seconds=6.924325
+config_summary label=B_same_perturb_min_lr first_loss=1.788745430531e-5 final_loss=3.932908293791e-5 sampled_loss_reduction_pct=-119.869649 train_kl_start=1.433391042756e-2 train_kl_final=9.946998307254e-3 train_kl_reduction_pct=30.605131 train_overlap_start=74.218750 train_overlap_final=75.000000 heldout_kl_start=2.172812433186e-2 heldout_kl_final=2.086548404687e-2 heldout_overlap_start=50.000000 heldout_overlap_final=64.062500 mean_step_seconds=0.294771 median_step_seconds=0.295689 total_wall_seconds=71.258750
+summary_eval_row label=B_same_perturb_min_lr step=0 train_overlap_pct=74.218750 heldout_overlap_pct=50.000000 train_kl=1.433391042756e-2 heldout_kl=2.172812433186e-2
+summary_eval_row label=B_same_perturb_min_lr step=25 train_overlap_pct=73.437500 heldout_overlap_pct=50.000000 train_kl=1.230013353752e-2 heldout_kl=2.146772696485e-2
+summary_eval_row label=B_same_perturb_min_lr step=50 train_overlap_pct=75.000000 heldout_overlap_pct=50.000000 train_kl=1.141541907359e-2 heldout_kl=2.124995536075e-2
+summary_eval_row label=B_same_perturb_min_lr step=100 train_overlap_pct=75.000000 heldout_overlap_pct=64.062500 train_kl=9.946998307254e-3 heldout_kl=2.086548404687e-2
+config_start label=C_min_perturb_min_lr perturb_scale=9.999999747e-6 lr=1.000000012e-7 rollout_len=8 steps=100
+model_summary label=C_min_perturb_min_lr hidden=1024 intermediate=3072 layers=28 vocab=151936 num_heads=16 num_kv_heads=8 head_dim=128 teacher_params=601292800 student_model_params=601292800 student_trainable_params=596049920 teacher_load_seconds=5.709525 student_load_seconds=6.311259
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=0 overlap_pct=100.000000 kl=5.695529438017e-7
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=1 overlap_pct=100.000000 kl=1.247370133524e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=2 overlap_pct=100.000000 kl=1.411209813408e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=3 overlap_pct=31.250000 kl=1.408682550281e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=4 overlap_pct=100.000000 kl=1.813178794259e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=5 overlap_pct=100.000000 kl=2.480477189542e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=6 overlap_pct=100.000000 kl=1.305012256371e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=train prompt_index=7 overlap_pct=100.000000 kl=1.338962533717e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=heldout prompt_index=0 overlap_pct=100.000000 kl=1.999672733746e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=heldout prompt_index=1 overlap_pct=100.000000 kl=1.696207535644e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=heldout prompt_index=2 overlap_pct=100.000000 kl=5.665950644321e-6
+eval_detail label=C_min_perturb_min_lr step=0 split=heldout prompt_index=3 overlap_pct=100.000000 kl=5.293480382823e-7
+eval_summary label=C_min_perturb_min_lr step=0 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=1.446805776863e-6 heldout_kl=2.472794737998e-6 eval_seconds=8.482823
+train_step label=C_min_perturb_min_lr step=1 prompt_index=0 loss=1.746966336214e-5 rollout_len=12 step_seconds=0.256706
+train_step label=C_min_perturb_min_lr step=10 prompt_index=1 loss=3.795180236921e-5 rollout_len=12 step_seconds=0.294874
+train_step label=C_min_perturb_min_lr step=20 prompt_index=3 loss=3.924833436031e-5 rollout_len=13 step_seconds=0.297143
+train_step label=C_min_perturb_min_lr step=25 prompt_index=0 loss=1.746965972416e-5 rollout_len=12 step_seconds=0.294603
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=0 overlap_pct=100.000000 kl=4.038465209315e-7
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=1 overlap_pct=100.000000 kl=8.702128264285e-7
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=2 overlap_pct=100.000000 kl=6.658020078963e-7
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=3 overlap_pct=31.250000 kl=1.362434477031e-6
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=4 overlap_pct=100.000000 kl=1.325041192333e-6
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=5 overlap_pct=100.000000 kl=2.272138709958e-6
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=6 overlap_pct=100.000000 kl=9.431887504662e-7
+eval_detail label=C_min_perturb_min_lr step=25 split=train prompt_index=7 overlap_pct=100.000000 kl=8.720307265997e-7
+eval_detail label=C_min_perturb_min_lr step=25 split=heldout prompt_index=0 overlap_pct=100.000000 kl=1.787853126209e-6
+eval_detail label=C_min_perturb_min_lr step=25 split=heldout prompt_index=1 overlap_pct=100.000000 kl=1.709840230711e-6
+eval_detail label=C_min_perturb_min_lr step=25 split=heldout prompt_index=2 overlap_pct=100.000000 kl=5.187679082580e-6
+eval_detail label=C_min_perturb_min_lr step=25 split=heldout prompt_index=3 overlap_pct=100.000000 kl=4.976851658566e-7
+eval_summary label=C_min_perturb_min_lr step=25 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=1.089336901456e-6 heldout_kl=2.295764401339e-6 eval_seconds=6.999200
+train_step label=C_min_perturb_min_lr step=30 prompt_index=5 loss=3.453361932770e-5 rollout_len=14 step_seconds=0.298105
+train_step label=C_min_perturb_min_lr step=40 prompt_index=7 loss=3.980258043157e-5 rollout_len=15 step_seconds=0.299671
+train_step label=C_min_perturb_min_lr step=50 prompt_index=1 loss=3.795174779953e-5 rollout_len=12 step_seconds=0.296063
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=0 overlap_pct=100.000000 kl=3.521617038728e-7
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=1 overlap_pct=100.000000 kl=7.385857650296e-7
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=2 overlap_pct=100.000000 kl=5.477933709578e-7
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=3 overlap_pct=31.250000 kl=1.314456921434e-6
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=4 overlap_pct=100.000000 kl=1.114324320278e-6
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=5 overlap_pct=100.000000 kl=2.080923166377e-6
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=6 overlap_pct=100.000000 kl=7.697355990556e-7
+eval_detail label=C_min_perturb_min_lr step=50 split=train prompt_index=7 overlap_pct=100.000000 kl=6.810905121839e-7
+eval_detail label=C_min_perturb_min_lr step=50 split=heldout prompt_index=0 overlap_pct=100.000000 kl=1.697731308547e-6
+eval_detail label=C_min_perturb_min_lr step=50 split=heldout prompt_index=1 overlap_pct=100.000000 kl=1.692455272673e-6
+eval_detail label=C_min_perturb_min_lr step=50 split=heldout prompt_index=2 overlap_pct=100.000000 kl=5.085544681947e-6
+eval_detail label=C_min_perturb_min_lr step=50 split=heldout prompt_index=3 overlap_pct=100.000000 kl=4.806856342437e-7
+eval_summary label=C_min_perturb_min_lr step=50 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=9.498839198986e-7 heldout_kl=2.239104224353e-6 eval_seconds=6.972677
+train_step label=C_min_perturb_min_lr step=60 prompt_index=3 loss=3.924830161850e-5 rollout_len=13 step_seconds=0.296926
+train_step label=C_min_perturb_min_lr step=70 prompt_index=5 loss=3.453358294792e-5 rollout_len=14 step_seconds=0.297029
+train_step label=C_min_perturb_min_lr step=80 prompt_index=7 loss=3.980264227721e-5 rollout_len=15 step_seconds=0.299419
+train_step label=C_min_perturb_min_lr step=90 prompt_index=1 loss=3.795173688559e-5 rollout_len=12 step_seconds=0.296081
+train_step label=C_min_perturb_min_lr step=100 prompt_index=3 loss=3.924823249690e-5 rollout_len=13 step_seconds=0.295988
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=0 overlap_pct=100.000000 kl=2.939352991280e-7
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=1 overlap_pct=100.000000 kl=6.393899307057e-7
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=2 overlap_pct=100.000000 kl=4.478391658024e-7
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=3 overlap_pct=31.250000 kl=1.254309350671e-6
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=4 overlap_pct=100.000000 kl=9.219058190036e-7
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=5 overlap_pct=100.000000 kl=1.751568852584e-6
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=6 overlap_pct=100.000000 kl=6.336539693391e-7
+eval_detail label=C_min_perturb_min_lr step=100 split=train prompt_index=7 overlap_pct=100.000000 kl=5.602629429803e-7
+eval_detail label=C_min_perturb_min_lr step=100 split=heldout prompt_index=0 overlap_pct=100.000000 kl=1.625723359923e-6
+eval_detail label=C_min_perturb_min_lr step=100 split=heldout prompt_index=1 overlap_pct=100.000000 kl=1.636356652976e-6
+eval_detail label=C_min_perturb_min_lr step=100 split=heldout prompt_index=2 overlap_pct=100.000000 kl=4.926173121915e-6
+eval_detail label=C_min_perturb_min_lr step=100 split=heldout prompt_index=3 overlap_pct=100.000000 kl=4.614686867742e-7
+eval_summary label=C_min_perturb_min_lr step=100 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=8.128581662767e-7 heldout_kl=2.162430455397e-6 eval_seconds=7.001091
+config_summary label=C_min_perturb_min_lr first_loss=1.746966336214e-5 final_loss=3.924823249690e-5 sampled_loss_reduction_pct=-124.665076 train_kl_start=1.446805776863e-6 train_kl_final=8.128581662767e-7 train_kl_reduction_pct=43.817050 train_overlap_start=91.406250 train_overlap_final=91.406250 heldout_kl_start=2.472794737998e-6 heldout_kl_final=2.162430455397e-6 heldout_overlap_start=100.000000 heldout_overlap_final=100.000000 mean_step_seconds=0.295564 median_step_seconds=0.296602 total_wall_seconds=71.628018
+summary_eval_row label=C_min_perturb_min_lr step=0 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=1.446805776863e-6 heldout_kl=2.472794737998e-6
+summary_eval_row label=C_min_perturb_min_lr step=25 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=1.089336901456e-6 heldout_kl=2.295764401339e-6
+summary_eval_row label=C_min_perturb_min_lr step=50 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=9.498839198986e-7 heldout_kl=2.239104224353e-6
+summary_eval_row label=C_min_perturb_min_lr step=100 train_overlap_pct=91.406250 heldout_overlap_pct=100.000000 train_kl=8.128581662767e-7 heldout_kl=2.162430455397e-6
+diagnosis_matrix label=A_min_perturb_same_lr perturb_scale=9.999999747e-6 lr=4.999999874e-5 stable=false train_kl_ratio=288232.532514 train_overlap_delta_pct=-51.562500 heldout_kl_ratio=190023.798316
+diagnosis_matrix label=B_same_perturb_min_lr perturb_scale=1.000000047e-3 lr=1.000000012e-7 stable=true train_kl_ratio=0.693949 train_overlap_delta_pct=0.781250 heldout_kl_ratio=0.960298
+diagnosis_matrix label=C_min_perturb_min_lr perturb_scale=9.999999747e-6 lr=1.000000012e-7 stable=true train_kl_ratio=0.561830 train_overlap_delta_pct=0.000000 heldout_kl_ratio=0.874488
