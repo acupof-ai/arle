@@ -133,6 +133,53 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
 }
 
 #[test]
+fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let mut cfg = tiny_qwen35_config();
+    cfg.rope_cache_len_hint = Some(2);
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let live_before = live_tensor_count(&store);
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    let err = opd_step(
+        &student,
+        &teacher,
+        &[1],
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("teacher scoring should fail after student rollout grows past rope cache");
+
+    let OpdError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(message.contains("OPD teacher scoring"));
+    assert!(
+        tape.enabled,
+        "opd_step failure cleanup must re-enable tape for the next call"
+    );
+    assert!(
+        tape.entries.is_empty(),
+        "opd_step failure cleanup must clear stale tape entries"
+    );
+    assert_eq!(
+        live_tensor_count(&store),
+        live_before,
+        "opd_step failure cleanup must prune rollout/forward temporaries"
+    );
+}
+
+#[test]
 fn opd_step_with_lora_adapter_params_retains_frozen_student_base() {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();

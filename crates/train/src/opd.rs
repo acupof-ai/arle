@@ -361,59 +361,58 @@ pub fn opd_step<O: Optimizer>(
     validate_student_param_ownership(student_params, &student_model_params, &teacher_params)?;
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
 
-    // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
-    tape.entries.clear();
-    tape.set_enabled(false);
-    let mut rollout: Vec<u32> = prompt_ids.to_vec();
-    for _ in 0..cfg.rollout_len {
+    let result = (|| {
+        // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
+        tape.entries.clear();
+        tape.set_enabled(false);
+        let mut rollout: Vec<u32> = prompt_ids.to_vec();
+        for _ in 0..cfg.rollout_len {
+            let positions: Vec<u32> = (0..rollout.len() as u32).collect();
+            let logits = student
+                .forward(store, tape, &rollout, &positions)
+                .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
+            let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
+            rollout.push(next);
+        }
+
+        // 2. Teacher forward — still tape-disabled. Teacher params carry
+        //    `requires_grad = false` so no entries record even if tape was on,
+        //    but disabling cheap-defends against any rogue grad-bearing weight.
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
-        let logits = student
+        let teacher_logits = teacher
             .forward(store, tape, &rollout, &positions)
-            .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
-        let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
-        rollout.push(next);
-    }
-    // Note: rollout ephemerals (logits per iteration) stay in the store
-    // until the post-step `retain_ids` prune below. For long rollouts
-    // (>16 steps) we'd want per-iteration pruning, but that requires a
-    // `keep` set covering both teacher AND student parameters, not just
-    // `student_params`. Deferred until the production path benches.
+            .map_err(|err| map_qwen35_forward_error("teacher scoring", err))?;
 
-    // 2. Teacher forward — still tape-disabled. Teacher params carry
-    //    `requires_grad = false` so no entries record even if tape was on,
-    //    but disabling cheap-defends against any rogue grad-bearing weight.
-    let positions: Vec<u32> = (0..rollout.len() as u32).collect();
-    let teacher_logits = teacher
-        .forward(store, tape, &rollout, &positions)
-        .map_err(|err| map_qwen35_forward_error("teacher scoring", err))?;
+        // 3. Student forward — tape enabled now so backward can flow.
+        tape.set_enabled(true);
+        let student_logits = student
+            .forward(store, tape, &rollout, &positions)
+            .map_err(|err| map_qwen35_forward_error("student KL", err))?;
 
-    // 3. Student forward — tape enabled now so backward can flow.
-    tape.set_enabled(true);
-    let student_logits = student
-        .forward(store, tape, &rollout, &positions)
-        .map_err(|err| map_qwen35_forward_error("student KL", err))?;
+        // 4. KL distill loss.
+        let loss = kl_distill_loss(student_logits, teacher_logits, rollout.len(), store, tape)?;
+        let loss_value = store.to_host(loss)?[0];
+        validate_loss_value(loss_value)?;
 
-    // 4. KL distill loss.
-    let loss = kl_distill_loss(student_logits, teacher_logits, rollout.len(), store, tape)?;
-    let loss_value = store.to_host(loss)?[0];
-    validate_loss_value(loss_value)?;
+        // 5. Backward + grad clip + optimizer step.
+        optimizer.zero_grad(store, student_params);
+        tape.backward(loss, store)?;
+        clip_grad_norm(student_params, cfg.grad_clip, store);
+        optimizer.step(store, student_params)?;
 
-    // 5. Backward + grad clip + optimizer step.
-    optimizer.zero_grad(store, student_params);
-    tape.backward(loss, store)?;
-    clip_grad_norm(student_params, cfg.grad_clip, store);
-    optimizer.step(store, student_params)?;
+        Ok(OpdStepOutcome {
+            loss: loss_value,
+            rollout_len: rollout.len(),
+        })
+    })();
 
-    // 6. Prune rollout/teacher/student forward temporaries. Teacher params
-    //    live in `keep_extra`. Retain the full student model, not just the
-    //    optimizer target slice, because LoRA-only OPD optimizes adapter ids
-    //    while still needing frozen base weights for the next forward pass.
+    // 6. Prune rollout/teacher/student forward temporaries on both success
+    //    and failure. Teacher params live in `keep_extra`. Retain the full
+    //    student model, not just the optimizer target slice, because LoRA-only
+    //    OPD optimizes adapter ids while still needing frozen base weights for
+    //    the next forward pass.
     cleanup_after_backward(store, tape, &student_model_params, &keep_extra);
-
-    Ok(OpdStepOutcome {
-        loss: loss_value,
-        rollout_len: rollout.len(),
-    })
+    result
 }
 
 #[cfg(test)]
