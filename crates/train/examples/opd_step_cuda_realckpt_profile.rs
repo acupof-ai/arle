@@ -8,8 +8,11 @@ mod app {
     use std::{
         collections::{BTreeMap, HashSet},
         env,
+        ffi::{c_char, c_int, c_void, CString},
         path::PathBuf,
+        ptr,
         sync::Arc,
+        sync::OnceLock,
         time::{Duration, Instant},
     };
 
@@ -24,7 +27,10 @@ mod app {
         loss::kl_distill_loss,
         opd::{OpdStepConfig, OpdStepOutcome},
         qwen35::{
-            forward_rollout_cached, forward_rollout_cached_device_token, Qwen35KvCache, Qwen35Model,
+            forward_rollout_cached, forward_rollout_cached_device_token,
+            forward_rollout_cached_device_token_profiled, forward_rollout_cached_profiled,
+            Qwen35AttentionForwardProfile, Qwen35KvCache, Qwen35LayerForwardProfile, Qwen35Model,
+            Qwen35RolloutForwardProfile,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::{cleanup_after_backward, retained_param_and_grad_ids},
@@ -41,9 +47,151 @@ mod app {
 
     type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+    mod nvtx {
+        use super::*;
+
+        type NvtxPush = unsafe extern "C" fn(*const c_char) -> c_int;
+        type NvtxPop = unsafe extern "C" fn() -> c_int;
+
+        #[derive(Clone, Copy)]
+        struct NvtxFns {
+            push: Option<NvtxPush>,
+            pop: Option<NvtxPop>,
+        }
+
+        #[cfg(target_os = "linux")]
+        #[link(name = "dl")]
+        unsafe extern "C" {
+            fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+
+        const RTLD_LAZY: c_int = 1;
+        static NVTX: OnceLock<NvtxFns> = OnceLock::new();
+
+        fn load() -> NvtxFns {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let handle = [
+                    "libnvtx3interop.so.1",
+                    "libnvtx3interop.so",
+                    "/opt/cuda/targets/x86_64-linux/lib/libnvtx3interop.so.1",
+                ]
+                .iter()
+                .filter_map(|name| CString::new(*name).ok())
+                .map(|name| dlopen(name.as_ptr(), RTLD_LAZY))
+                .find(|handle| !handle.is_null())
+                .unwrap_or(ptr::null_mut());
+                if handle.is_null() {
+                    return NvtxFns {
+                        push: None,
+                        pop: None,
+                    };
+                }
+
+                let push_name = CString::new("nvtxRangePushA").expect("static nvtx symbol");
+                let pop_name = CString::new("nvtxRangePop").expect("static nvtx symbol");
+                let push_ptr = dlsym(handle, push_name.as_ptr());
+                let pop_ptr = dlsym(handle, pop_name.as_ptr());
+                NvtxFns {
+                    push: (!push_ptr.is_null()).then(|| std::mem::transmute(push_ptr)),
+                    pop: (!pop_ptr.is_null()).then(|| std::mem::transmute(pop_ptr)),
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                NvtxFns {
+                    push: None,
+                    pop: None,
+                }
+            }
+        }
+
+        pub struct Range {
+            active: bool,
+        }
+
+        pub fn range(name: &str) -> Range {
+            let fns = NVTX.get_or_init(load);
+            let Some(push) = fns.push else {
+                return Range { active: false };
+            };
+            let Ok(name) = CString::new(name) else {
+                return Range { active: false };
+            };
+            unsafe {
+                push(name.as_ptr());
+            }
+            Range {
+                active: fns.pop.is_some(),
+            }
+        }
+
+        impl Drop for Range {
+            fn drop(&mut self) {
+                if !self.active {
+                    return;
+                }
+                let Some(pop) = NVTX.get_or_init(load).pop else {
+                    return;
+                };
+                unsafe {
+                    pop();
+                }
+            }
+        }
+    }
+
     #[derive(Debug, Default, Clone)]
     struct PhaseTotals {
         durations: BTreeMap<&'static str, Duration>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RolloutIterAttribution {
+        iter: usize,
+        mode: &'static str,
+        seq_len: usize,
+        total: Duration,
+        cache_select: Duration,
+        embedding: Duration,
+        input_rmsnorm: Duration,
+        attention: Duration,
+        attention_residual: Duration,
+        post_attention_rmsnorm: Duration,
+        mlp: Duration,
+        mlp_residual: Duration,
+        final_norm: Duration,
+        lm_head: Duration,
+        layers: Vec<Qwen35LayerForwardProfile>,
+    }
+
+    impl RolloutIterAttribution {
+        fn from_profile(
+            iter: usize,
+            mode: &'static str,
+            seq_len: usize,
+            profile: Qwen35RolloutForwardProfile,
+        ) -> Self {
+            Self {
+                iter,
+                mode,
+                seq_len,
+                total: profile.total,
+                cache_select: profile.cache_select,
+                embedding: profile.embedding,
+                input_rmsnorm: profile.input_rmsnorm_total(),
+                attention: profile.attention_total(),
+                attention_residual: profile.attention_residual_total(),
+                post_attention_rmsnorm: profile.post_attention_rmsnorm_total(),
+                mlp: profile.mlp_total(),
+                mlp_residual: profile.mlp_residual_total(),
+                final_norm: profile.final_norm,
+                lm_head: profile.lm_head,
+                layers: profile.layers,
+            }
+        }
     }
 
     impl PhaseTotals {
@@ -175,7 +323,7 @@ mod app {
             println!("host_mirror_control enabled=false");
         }
 
-        let (outcome, totals, backward_profile) = profiled_opd_step(
+        let (outcome, totals, backward_profile, rollout_attribution) = profiled_opd_step(
             &student,
             &teacher,
             PROMPT_IDS,
@@ -187,7 +335,7 @@ mod app {
             &mut tape,
         )?;
 
-        print_profile(outcome, &totals, &backward_profile);
+        print_profile(outcome, &totals, &backward_profile, &rollout_attribution);
         Ok(())
     }
 
@@ -229,9 +377,15 @@ mod app {
         optimizer: &mut O,
         store: &mut TensorStore,
         tape: &mut Tape,
-    ) -> AnyResult<(OpdStepOutcome, PhaseTotals, BackwardProfile)> {
+    ) -> AnyResult<(
+        OpdStepOutcome,
+        PhaseTotals,
+        BackwardProfile,
+        Vec<RolloutIterAttribution>,
+    )> {
         let total_started = Instant::now();
         let mut totals = PhaseTotals::default();
+        let mut rollout_attribution = Vec::with_capacity(cfg.rollout_len);
         let vocab = student.config().vocab_size;
 
         let keep_extra = timed(&mut totals, "keep_extra_build", || {
@@ -256,47 +410,62 @@ mod app {
             })?)
         };
         let mut current_device_token: Option<TensorId> = None;
-        for step in 0..cfg.rollout_len {
-            let logits = if step == 0 {
-                let positions = timed(&mut totals, "rollout_positions", || {
-                    Ok((0..prompt_ids.len() as u32).collect::<Vec<_>>())
+        {
+            let _rollout_range = nvtx::range("opd_rollout_loop");
+            for step in 0..cfg.rollout_len {
+                let (logits, iter_profile, mode, seq_len) = if step == 0 {
+                    let positions = timed(&mut totals, "rollout_positions", || {
+                        Ok((0..prompt_ids.len() as u32).collect::<Vec<_>>())
+                    })?;
+                    let range_name = format!("opd_rollout_iter_{step}_prefill");
+                    let _iter_range = nvtx::range(&range_name);
+                    let (logits, profile) = timed(&mut totals, "rollout_student_forward", || {
+                        Ok(forward_rollout_cached_profiled(
+                            student,
+                            store,
+                            tape,
+                            prompt_ids,
+                            &positions,
+                            &mut rollout_cache,
+                        )?)
+                    })?;
+                    (logits, profile, "prefill", prompt_ids.len())
+                } else {
+                    let position = timed(&mut totals, "rollout_positions", || {
+                        Ok((prompt_ids.len() + step - 1) as u32)
+                    })?;
+                    let token_id = current_device_token
+                        .ok_or("rollout cache cannot decode without a previous device token")?;
+                    let range_name = format!("opd_rollout_iter_{step}_decode");
+                    let _iter_range = nvtx::range(&range_name);
+                    let (logits, profile) = timed(&mut totals, "rollout_student_forward", || {
+                        Ok(forward_rollout_cached_device_token_profiled(
+                            student,
+                            store,
+                            tape,
+                            token_id,
+                            position,
+                            &mut rollout_cache,
+                        )?)
+                    })?;
+                    (logits, profile, "decode", 1)
+                };
+                rollout_attribution.push(RolloutIterAttribution::from_profile(
+                    step,
+                    mode,
+                    seq_len,
+                    iter_profile,
+                ));
+                let next_token = timed(&mut totals, "rollout_argmax_device", || {
+                    device_argmax_token(logits, vocab, store)
                 })?;
-                timed(&mut totals, "rollout_student_forward", || {
-                    Ok(forward_rollout_cached(
-                        student,
-                        store,
-                        tape,
-                        prompt_ids,
-                        &positions,
-                        &mut rollout_cache,
-                    )?)
-                })?
-            } else {
-                let position = timed(&mut totals, "rollout_positions", || {
-                    Ok((prompt_ids.len() + step - 1) as u32)
-                })?;
-                let token_id = current_device_token
-                    .ok_or("rollout cache cannot decode without a previous device token")?;
-                timed(&mut totals, "rollout_student_forward", || {
-                    Ok(forward_rollout_cached_device_token(
-                        student,
-                        store,
-                        tape,
-                        token_id,
-                        position,
-                        &mut rollout_cache,
-                    )?)
-                })?
-            };
-            let next_token = timed(&mut totals, "rollout_argmax_device", || {
-                device_argmax_token(logits, vocab, store)
-            })?;
-            if let Some(buffer_id) = generated_tokens {
-                generated_tokens = Some(timed(&mut totals, "rollout_token_write", || {
-                    write_rollout_token(buffer_id, next_token, cfg.rollout_len, step, store)
-                })?);
+                if let Some(buffer_id) = generated_tokens {
+                    generated_tokens = Some(timed(&mut totals, "rollout_token_write", || {
+                        write_rollout_token(buffer_id, next_token, cfg.rollout_len, step, store)
+                    })?);
+                }
+                current_device_token = Some(next_token);
             }
-            current_device_token = Some(next_token);
         }
         if let Some(buffer_id) = generated_tokens {
             let generated = timed(&mut totals, "rollout_tokens_readback", || {
@@ -363,6 +532,7 @@ mod app {
             },
             totals,
             backward_profile,
+            rollout_attribution,
         ))
     }
 
@@ -776,6 +946,7 @@ mod app {
         outcome: OpdStepOutcome,
         totals: &PhaseTotals,
         backward_profile: &BackwardProfile,
+        rollout_attribution: &[RolloutIterAttribution],
     ) {
         let total_step_secs = totals.seconds("total_step");
         println!(
@@ -806,6 +977,11 @@ mod app {
                 pct_total
             );
         }
+
+        print_rollout_inner_profile(
+            rollout_attribution,
+            totals.seconds("rollout_student_forward"),
+        );
 
         let backward_total_secs = backward_profile.total_duration.as_secs_f64();
         let backward_op_secs = backward_profile.total_op_duration().as_secs_f64();
@@ -845,6 +1021,274 @@ mod app {
                 pct_total
             );
         }
+    }
+
+    fn print_rollout_inner_profile(
+        rollout_attribution: &[RolloutIterAttribution],
+        rollout_forward_seconds: f64,
+    ) {
+        if rollout_attribution.is_empty() {
+            return;
+        }
+        let total_profiled_seconds = rollout_attribution
+            .iter()
+            .map(|row| row.total.as_secs_f64())
+            .sum::<f64>();
+        println!(
+            "rollout_inner_summary timing=host_enqueue iters={} profiled_seconds={:.6} phase_seconds={:.6} profile_phase_ratio={:.6}",
+            rollout_attribution.len(),
+            total_profiled_seconds,
+            rollout_forward_seconds,
+            if rollout_forward_seconds == 0.0 {
+                0.0
+            } else {
+                total_profiled_seconds / rollout_forward_seconds
+            }
+        );
+
+        for row in rollout_attribution {
+            println!(
+                "rollout_iter_summary timing=host_enqueue iter={} mode={} seq_len={} layers={} total_seconds={:.6} cache_select_seconds={:.6} embedding_seconds={:.6} input_rmsnorm_seconds={:.6} attention_seconds={:.6} attention_residual_seconds={:.6} post_attention_rmsnorm_seconds={:.6} mlp_seconds={:.6} mlp_residual_seconds={:.6} final_norm_seconds={:.6} lm_head_seconds={:.6}",
+                row.iter,
+                row.mode,
+                row.seq_len,
+                row.layers.len(),
+                row.total.as_secs_f64(),
+                row.cache_select.as_secs_f64(),
+                row.embedding.as_secs_f64(),
+                row.input_rmsnorm.as_secs_f64(),
+                row.attention.as_secs_f64(),
+                row.attention_residual.as_secs_f64(),
+                row.post_attention_rmsnorm.as_secs_f64(),
+                row.mlp.as_secs_f64(),
+                row.mlp_residual.as_secs_f64(),
+                row.final_norm.as_secs_f64(),
+                row.lm_head.as_secs_f64(),
+            );
+        }
+
+        let component_totals = [
+            (
+                "cache_select",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.cache_select)
+                    .sum::<Duration>(),
+            ),
+            (
+                "embedding",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.embedding)
+                    .sum::<Duration>(),
+            ),
+            (
+                "input_rmsnorm",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.input_rmsnorm)
+                    .sum::<Duration>(),
+            ),
+            (
+                "attention",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.attention)
+                    .sum::<Duration>(),
+            ),
+            (
+                "attention_residual",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.attention_residual)
+                    .sum::<Duration>(),
+            ),
+            (
+                "post_attention_rmsnorm",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.post_attention_rmsnorm)
+                    .sum::<Duration>(),
+            ),
+            (
+                "mlp",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.mlp)
+                    .sum::<Duration>(),
+            ),
+            (
+                "mlp_residual",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.mlp_residual)
+                    .sum::<Duration>(),
+            ),
+            (
+                "final_norm",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.final_norm)
+                    .sum::<Duration>(),
+            ),
+            (
+                "lm_head",
+                rollout_attribution
+                    .iter()
+                    .map(|row| row.lm_head)
+                    .sum::<Duration>(),
+            ),
+        ];
+        for (component, duration) in component_totals {
+            let seconds = duration.as_secs_f64();
+            let pct_rollout = if total_profiled_seconds == 0.0 {
+                0.0
+            } else {
+                seconds / total_profiled_seconds * 100.0
+            };
+            println!(
+                "rollout_component_summary timing=host_enqueue component={} seconds={:.6} pct_rollout_forward={:.3}",
+                component, seconds, pct_rollout
+            );
+        }
+
+        let rollout_attention_detail = rollout_attribution.iter().fold(
+            Qwen35AttentionForwardProfile::default(),
+            |mut acc, row| {
+                add_attention_details_from_layers(&mut acc, &row.layers);
+                acc
+            },
+        );
+        let rollout_attention_seconds = rollout_attribution
+            .iter()
+            .map(|row| row.attention)
+            .sum::<Duration>()
+            .as_secs_f64();
+        for (component, duration) in attention_detail_rows(&rollout_attention_detail) {
+            let seconds = duration.as_secs_f64();
+            println!(
+                "rollout_attention_component_summary timing=host_enqueue component={} seconds={:.6} pct_attention={:.3} pct_rollout_forward={:.3}",
+                component,
+                seconds,
+                if rollout_attention_seconds == 0.0 {
+                    0.0
+                } else {
+                    seconds / rollout_attention_seconds * 100.0
+                },
+                if total_profiled_seconds == 0.0 {
+                    0.0
+                } else {
+                    seconds / total_profiled_seconds * 100.0
+                }
+            );
+        }
+
+        if let Some(row) = rollout_attribution.iter().find(|row| row.mode == "decode") {
+            let total = row.total.as_secs_f64();
+            for (component, duration) in [
+                ("cache_select", row.cache_select),
+                ("embedding", row.embedding),
+                ("input_rmsnorm", row.input_rmsnorm),
+                ("attention", row.attention),
+                ("attention_residual", row.attention_residual),
+                ("post_attention_rmsnorm", row.post_attention_rmsnorm),
+                ("mlp", row.mlp),
+                ("mlp_residual", row.mlp_residual),
+                ("final_norm", row.final_norm),
+                ("lm_head", row.lm_head),
+            ] {
+                let seconds = duration.as_secs_f64();
+                println!(
+                    "rollout_decode_component_summary timing=host_enqueue iter={} component={} seconds={:.6} pct_iter={:.3}",
+                    row.iter,
+                    component,
+                    seconds,
+                    if total == 0.0 { 0.0 } else { seconds / total * 100.0 }
+                );
+            }
+
+            let decode_attention_detail = attention_detail_for_layers(&row.layers);
+            let decode_attention_seconds = row.attention.as_secs_f64();
+            for (component, duration) in attention_detail_rows(&decode_attention_detail) {
+                let seconds = duration.as_secs_f64();
+                println!(
+                    "rollout_decode_attention_component_summary timing=host_enqueue iter={} component={} seconds={:.6} pct_decode_attention={:.3} pct_iter={:.3}",
+                    row.iter,
+                    component,
+                    seconds,
+                    if decode_attention_seconds == 0.0 {
+                        0.0
+                    } else {
+                        seconds / decode_attention_seconds * 100.0
+                    },
+                    if total == 0.0 { 0.0 } else { seconds / total * 100.0 }
+                );
+            }
+
+            for (layer_index, layer) in row.layers.iter().enumerate() {
+                println!(
+                    "rollout_decode_layer_summary timing=host_enqueue iter={} layer={} input_rmsnorm_seconds={:.6} attention_seconds={:.6} attention_residual_seconds={:.6} post_attention_rmsnorm_seconds={:.6} mlp_seconds={:.6} mlp_residual_seconds={:.6}",
+                    row.iter,
+                    layer_index,
+                    layer.input_rmsnorm.as_secs_f64(),
+                    layer.attention.as_secs_f64(),
+                    layer.attention_residual.as_secs_f64(),
+                    layer.post_attention_rmsnorm.as_secs_f64(),
+                    layer.mlp.as_secs_f64(),
+                    layer.mlp_residual.as_secs_f64(),
+                );
+            }
+        }
+    }
+
+    fn add_attention_details_from_layers(
+        dst: &mut Qwen35AttentionForwardProfile,
+        layers: &[Qwen35LayerForwardProfile],
+    ) {
+        for layer in layers {
+            let src = &layer.attention_detail;
+            dst.q_proj += src.q_proj;
+            dst.q_layout += src.q_layout;
+            dst.k_proj += src.k_proj;
+            dst.v_proj += src.v_proj;
+            dst.kv_split += src.kv_split;
+            dst.qk_norm += src.qk_norm;
+            dst.rope += src.rope;
+            dst.repeat_kv += src.repeat_kv;
+            dst.append_kv += src.append_kv;
+            dst.sdpa += src.sdpa;
+            dst.gate += src.gate;
+            dst.merge += src.merge;
+            dst.o_proj += src.o_proj;
+        }
+    }
+
+    fn attention_detail_for_layers(
+        layers: &[Qwen35LayerForwardProfile],
+    ) -> Qwen35AttentionForwardProfile {
+        let mut detail = Qwen35AttentionForwardProfile::default();
+        add_attention_details_from_layers(&mut detail, layers);
+        detail
+    }
+
+    fn attention_detail_rows(
+        detail: &Qwen35AttentionForwardProfile,
+    ) -> [(&'static str, Duration); 13] {
+        [
+            ("q_proj", detail.q_proj),
+            ("q_layout", detail.q_layout),
+            ("k_proj", detail.k_proj),
+            ("v_proj", detail.v_proj),
+            ("kv_split", detail.kv_split),
+            ("qk_norm", detail.qk_norm),
+            ("rope", detail.rope),
+            ("repeat_kv", detail.repeat_kv),
+            ("append_kv", detail.append_kv),
+            ("sdpa", detail.sdpa),
+            ("gate", detail.gate),
+            ("merge", detail.merge),
+            ("o_proj", detail.o_proj),
+        ]
     }
 }
 
