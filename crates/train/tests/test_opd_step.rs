@@ -4,6 +4,10 @@ use train::{
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
 
+fn live_tensor_count(store: &TensorStore) -> usize {
+    store.tensors.iter().filter(|slot| slot.is_some()).count()
+}
+
 fn tiny_qwen35_config() -> Qwen35Config {
     Qwen35Config {
         hidden_size: 16,
@@ -82,5 +86,49 @@ fn opd_step_runs_end_to_end() {
         outcome.loss.is_finite(),
         "opd_step loss should be finite, got {}",
         outcome.loss
+    );
+}
+
+#[test]
+fn opd_step_prunes_ephemeral_tensors_between_steps() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+    let prompt_ids: Vec<u32> = vec![1, 3, 8];
+    let step_cfg = OpdStepConfig {
+        rollout_len: 2,
+        grad_clip: 1.0,
+    };
+
+    let mut live_counts = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let outcome = opd_step(
+            &student,
+            &teacher,
+            &prompt_ids,
+            step_cfg,
+            &student_params,
+            &mut optimizer,
+            &mut store,
+            &mut tape,
+        )
+        .expect("opd_step runs without panic");
+        assert!(outcome.loss.is_finite());
+        live_counts.push(live_tensor_count(&store));
+    }
+
+    assert_eq!(
+        live_counts[1], live_counts[0],
+        "second step should reuse the same retained tensor set, got {live_counts:?}"
+    );
+    assert_eq!(
+        live_counts[2], live_counts[0],
+        "third step should not accumulate rollout/forward temporaries, got {live_counts:?}"
     );
 }

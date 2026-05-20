@@ -26,6 +26,7 @@ use crate::{
     grad_clip::clip_grad_norm,
     loss::kl_distill_loss,
     qwen35::{Qwen35Error, Qwen35Model},
+    trainer::{cleanup_after_backward, retained_param_and_grad_ids},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +94,8 @@ pub fn opd_step<O: Optimizer>(
     tape: &mut Tape,
 ) -> Result<OpdStepOutcome> {
     let vocab = student.config().vocab_size;
+    let teacher_params = teacher.all_parameter_ids();
+    let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
 
     // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
     tape.entries.clear();
@@ -136,13 +139,10 @@ pub fn opd_step<O: Optimizer>(
     clip_grad_norm(student_params, cfg.grad_clip, store);
     optimizer.step(store, student_params)?;
 
-    // 6. Tape cleared but no `retain_ids` here — the caller owns the keep
-    //    set (must include both teacher AND student params + cos/sin
-    //    caches). The training loop in `arle train opd` builds the keep
-    //    set once and reuses it; per-step `retain_ids` is the standard
-    //    pattern (see `test_lm.rs`).
-    tape.entries.clear();
-    tape.set_enabled(true);
+    // 6. Prune rollout/teacher/student forward temporaries. Teacher params
+    //    live in `keep_extra`; student params and their persistent grads are
+    //    retained by `cleanup_after_backward`.
+    cleanup_after_backward(store, tape, student_params, &keep_extra);
 
     Ok(OpdStepOutcome {
         loss: loss_value,
