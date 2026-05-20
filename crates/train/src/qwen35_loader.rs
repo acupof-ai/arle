@@ -482,7 +482,8 @@ fn dtype_to_f32(view: &TensorView<'_>, name: &str) -> Result<Vec<f32>> {
 
 // ─────────────────────────── public entry point ──────────────────────────────
 
-/// Load a HF-format Qwen3 / Qwen3.5 checkpoint into a fresh [`Qwen35Model`].
+/// Load a HF-format Qwen3 / Qwen3.5 checkpoint into a fresh frozen
+/// [`Qwen35Model`].
 ///
 /// The model is initialized via [`Qwen35Model::new_for_eval`] (frozen, no
 /// LoRA, no `requires_grad`) and every parameter slot is overwritten with
@@ -493,7 +494,7 @@ fn dtype_to_f32(view: &TensorView<'_>, name: &str) -> Result<Vec<f32>> {
 /// a failed OPD checkpoint load.
 pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
     let rollback = TensorStoreRollback::capture(store);
-    match load_qwen35_from_hf_dir_inner(dir, store) {
+    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::FrozenEval) {
         Ok(model) => Ok(model),
         Err(err) => {
             rollback.restore(store);
@@ -502,7 +503,38 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
     }
 }
 
-fn load_qwen35_from_hf_dir_inner(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
+/// Load a HF-format Qwen3 / Qwen3.5 checkpoint into a fresh trainable
+/// [`Qwen35Model`] suitable for OPD student optimization.
+///
+/// This keeps the same shard discovery, shape validation, dtype widening, and
+/// rollback semantics as [`load_qwen35_from_hf_dir`], but initializes the model
+/// with [`Qwen35Model::new`] so loaded trainable parameter slots keep
+/// `requires_grad = true`. Use the frozen loader for teachers.
+pub fn load_qwen35_trainable_from_hf_dir(
+    dir: &Path,
+    store: &mut TensorStore,
+) -> Result<Qwen35Model> {
+    let rollback = TensorStoreRollback::capture(store);
+    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::TrainableStudent) {
+        Ok(model) => Ok(model),
+        Err(err) => {
+            rollback.restore(store);
+            Err(err)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LoadMode {
+    FrozenEval,
+    TrainableStudent,
+}
+
+fn load_qwen35_from_hf_dir_inner(
+    dir: &Path,
+    store: &mut TensorStore,
+    mode: LoadMode,
+) -> Result<Qwen35Model> {
     if !dir.is_dir() {
         return Err(LoaderError::Custom(format!(
             "{} is not a directory. Hint: pass a local HF/ModelScope checkpoint \
@@ -540,8 +572,12 @@ fn load_qwen35_from_hf_dir_inner(dir: &Path, store: &mut TensorStore) -> Result<
         }
     }
 
-    // 3) Qwen35Config → eval-init Qwen35Model.
-    let model = Qwen35Model::new_for_eval(&cfg, store)?;
+    // 3) Qwen35Config → fresh model. The load mode controls whether loaded
+    //    slots remain frozen for teachers/eval or trainable for OPD students.
+    let model = match mode {
+        LoadMode::FrozenEval => Qwen35Model::new_for_eval(&cfg, store)?,
+        LoadMode::TrainableStudent => Qwen35Model::new(&cfg, store)?,
+    };
     let param_map = model.param_name_map();
 
     // 4) Preflight every tensor before writing any checkpoint data into the
@@ -593,6 +629,7 @@ struct PlannedTensorLoad {
     train_name: String,
     id: TensorId,
     expected_shape: Vec<usize>,
+    requires_grad: bool,
     shard_idx: usize,
 }
 
@@ -680,13 +717,15 @@ fn plan_tensor_load(
     let got_shape: Vec<usize> = view.shape().to_vec();
     validate_supported_dtype(&view, hf_name)?;
 
-    let expected_shape = store.get(id).map(|t| t.shape.clone()).ok_or_else(|| {
+    let slot = store.get(id).ok_or_else(|| {
         LoaderError::Custom(format!(
             "missing slot for {train_name}. Hint: this indicates a \
              Qwen35Model::param_name_map/config mismatch; report it with \
              the checkpoint config.json and OPD loader follow-up tranche."
         ))
     })?;
+    let expected_shape = slot.shape.clone();
+    let requires_grad = slot.requires_grad;
     if expected_shape != got_shape {
         let hint = shape_mismatch_hint(hf_name, train_name, &expected_shape, &got_shape);
         return Err(LoaderError::ShapeMismatch {
@@ -702,6 +741,7 @@ fn plan_tensor_load(
         train_name: train_name.to_owned(),
         id,
         expected_shape,
+        requires_grad,
         shard_idx,
     })
 }
@@ -723,13 +763,15 @@ fn load_planned_tensor_into_slot(
         .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", planned.hf_name)))?;
     let data = dtype_to_f32(&view, &planned.hf_name)?;
 
-    let tensor = Tensor::new(data, planned.expected_shape.clone(), false).map_err(|err| {
-        LoaderError::Custom(format!(
-            "failed to materialize {} from {}: {err}. Hint: verify the safetensors \
-             data length matches the validated checkpoint shape.",
-            planned.train_name, planned.hf_name
-        ))
-    })?;
+    let tensor = Tensor::new(data, planned.expected_shape.clone(), planned.requires_grad).map_err(
+        |err| {
+            LoaderError::Custom(format!(
+                "failed to materialize {} from {}: {err}. Hint: verify the safetensors \
+                 data length matches the validated checkpoint shape.",
+                planned.train_name, planned.hf_name
+            ))
+        },
+    )?;
     store.tensors[planned.id] = Some(tensor);
     Ok(())
 }
