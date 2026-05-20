@@ -473,7 +473,7 @@ mod tests {
     use crate::{
         lora::{LoraAdapterConfig, LoraConfig},
         qwen35::Qwen35Model,
-        qwen35_loader::load_qwen35_from_hf_dir,
+        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
     };
     use autograd::{Tape, TensorStore};
     use half::bf16;
@@ -1012,6 +1012,56 @@ mod tests {
                     "tensor {name}[{idx}] changed across save/load"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn save_qwen35_student_checkpoint_full_materialized_loads_trainable_student() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut source_store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = Qwen35Model::new(&cfg, &mut source_store).expect("scratch student");
+
+        let step_dir = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 12,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut source_store,
+            &mut tape,
+            Qwen35StudentWeights::FullMaterialized { bf16: false },
+        )
+        .expect("save full checkpoint");
+
+        let mut eval_store = TensorStore::default();
+        let eval_model =
+            load_qwen35_from_hf_dir(&step_dir, &mut eval_store).expect("reload frozen checkpoint");
+        for (name, id) in eval_model.param_name_map() {
+            assert!(
+                !eval_store.get(id).expect(name).requires_grad,
+                "frozen loader must keep {name} requires_grad=false"
+            );
+        }
+
+        let mut trainable_store = TensorStore::default();
+        let trainable_model = load_qwen35_trainable_from_hf_dir(&step_dir, &mut trainable_store)
+            .expect("reload trainable checkpoint");
+        for (name, id) in trainable_model.param_name_map() {
+            assert!(
+                trainable_store.get(id).expect(name).requires_grad,
+                "trainable loader must keep {name} requires_grad=true"
+            );
         }
     }
 
