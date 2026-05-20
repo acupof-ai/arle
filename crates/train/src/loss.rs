@@ -79,25 +79,26 @@ fn validate_kl_distill_inputs(
         ));
     }
     if student.shape != teacher.shape {
-        return Err(AutogradError::ShapeMismatch {
-            expected: student.shape.clone(),
-            got: teacher.shape.clone(),
-        });
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss: student_logits and teacher_logits must have identical shapes. \
+             Hint: pass logits from the same OPD rollout scored by compatible teacher and \
+             student Qwen3.5-family models with matching vocab_size.",
+        ));
     }
 
     let vocab = student
         .shape
         .last()
         .copied()
-        .ok_or(AutogradError::InvalidRank {
-            expected: "at least 1",
-            got: 0,
-        })?;
+        .ok_or(AutogradError::TapeInvariant(
+            "kl_distill_loss: logits must have at least one dimension with vocab on the last axis. \
+         Hint: pass Qwen35Model forward logits shaped [..., vocab_size].",
+        ))?;
     if vocab == 0 {
-        return Err(AutogradError::InvalidRank {
-            expected: "non-zero last dim",
-            got: student.shape.len(),
-        });
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss: logits last dimension (vocab) must be non-zero. \
+             Hint: verify teacher/student config.json vocab_size before running OPD.",
+        ));
     }
     if num_positions == 0 {
         return Err(AutogradError::TapeInvariant(
