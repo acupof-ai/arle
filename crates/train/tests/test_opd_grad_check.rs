@@ -141,13 +141,47 @@ fn kl_distill_loss_rejects_mismatched_logit_shapes() {
     let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
         .expect_err("mismatched logits must fail before softmax");
 
-    assert!(matches!(
-        err,
-        AutogradError::ShapeMismatch {
-            expected,
-            got
-        } if expected == vec![2, 3] && got == vec![2, 4]
-    ));
+    let AutogradError::TapeInvariant(message) = err else {
+        panic!("expected TapeInvariant, got {err:?}");
+    };
+    assert!(message.contains("student_logits and teacher_logits"));
+    assert!(message.contains("identical shapes"));
+    assert!(message.contains("matching vocab_size"));
+}
+
+#[test]
+fn kl_distill_loss_rejects_missing_vocab_axis_with_hint() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student = store.alloc(Tensor::new(vec![0.0], vec![], true).expect("student scalar"));
+    let teacher = store.alloc(Tensor::new(vec![0.0], vec![], false).expect("teacher scalar"));
+
+    let err = kl_distill_loss(student, teacher, 1, &mut store, &mut tape)
+        .expect_err("rank-0 logits must fail before softmax");
+
+    let AutogradError::TapeInvariant(message) = err else {
+        panic!("expected TapeInvariant, got {err:?}");
+    };
+    assert!(message.contains("at least one dimension"));
+    assert!(message.contains("[..., vocab_size]"));
+}
+
+#[test]
+fn kl_distill_loss_rejects_zero_vocab_with_hint() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student = store.alloc(Tensor::new(vec![], vec![2, 0], true).expect("student logits"));
+    let teacher = store.alloc(Tensor::new(vec![], vec![2, 0], false).expect("teacher logits"));
+
+    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
+        .expect_err("zero-vocab logits must fail before softmax");
+
+    let AutogradError::TapeInvariant(message) = err else {
+        panic!("expected TapeInvariant, got {err:?}");
+    };
+    assert!(message.contains("vocab"));
+    assert!(message.contains("non-zero"));
+    assert!(message.contains("config.json"));
 }
 
 #[test]
