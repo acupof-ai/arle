@@ -200,3 +200,42 @@ fn opd_step_rejects_prompt_token_outside_student_vocab() {
     assert!(message.contains("tokenizer"));
     assert!(message.contains("2026-05-18-opd-only-pivot.md"));
 }
+
+#[test]
+fn opd_step_rejects_teacher_student_vocab_mismatch() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student_cfg = tiny_qwen35_config();
+    let mut teacher_cfg = tiny_qwen35_config();
+    teacher_cfg.vocab_size = 12;
+    teacher_cfg.stop_token_ids = vec![11];
+    teacher_cfg.eos_token_id = 11;
+
+    let teacher = Qwen35Model::new(&teacher_cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&student_cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    let err = opd_step(
+        &student,
+        &teacher,
+        &[1, 3, 8],
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("vocab mismatch should be rejected before rollout");
+
+    let OpdError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(message.contains("teacher.config().vocab_size=12"));
+    assert!(message.contains("student.config().vocab_size=16"));
+    assert!(message.contains("tokenizer"));
+    assert!(message.contains("2026-05-18-opd-only-pivot.md"));
+}

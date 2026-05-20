@@ -132,6 +132,16 @@ pub fn opd_step<O: Optimizer>(
                 .to_owned(),
         ));
     }
+    let teacher_vocab = teacher.config().vocab_size;
+    if teacher_vocab != vocab {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD requires teacher/student vocab_size to match, got \
+             teacher.config().vocab_size={teacher_vocab} and \
+             student.config().vocab_size={vocab}. Hint: use model directories \
+             that share the same tokenizer before running OPD. See \
+             docs/projects/2026-05-18-opd-only-pivot.md."
+        )));
+    }
     if let Some((index, token_id)) = prompt_ids
         .iter()
         .copied()
