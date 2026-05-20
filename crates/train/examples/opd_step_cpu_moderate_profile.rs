@@ -24,7 +24,7 @@ use train::{
     trainer::{cleanup_after_backward, retained_param_and_grad_ids},
 };
 
-const WARMUP_RUNS: usize = 1;
+const WARMUP_RUNS: usize = 2;
 const MEASURED_RUNS: usize = 3;
 const STEPS_PER_RUN: usize = 5;
 const SEED: u64 = 0xB300_0D15_71A0_2026;
