@@ -1,5 +1,6 @@
 use autograd::{Tape, TensorStore, optim::AdamW};
 use train::{
+    lora::LoraConfig,
     opd::{OpdError, OpdStepConfig, opd_step},
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
@@ -129,6 +130,72 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
         live_counts[2], live_counts[0],
         "third step should not accumulate rollout/forward temporaries, got {live_counts:?}"
     );
+}
+
+#[test]
+fn opd_step_with_lora_adapter_params_retains_frozen_student_base() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new_with_lora(
+        &cfg,
+        Some(LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        }),
+        &mut store,
+    )
+    .expect("build lora student");
+    let adapter_params = student
+        .adapter_name_map()
+        .values()
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        !adapter_params.is_empty(),
+        "LoRA student should expose adapter tensors"
+    );
+    let frozen_base_params = student
+        .param_name_map()
+        .values()
+        .copied()
+        .filter(|id| !store.get(*id).expect("student base param").requires_grad)
+        .collect::<Vec<_>>();
+    assert!(
+        !frozen_base_params.is_empty(),
+        "LoRA student should keep frozen base tensors"
+    );
+
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+    let prompt_ids: Vec<u32> = vec![1, 3, 8];
+    let step_cfg = OpdStepConfig {
+        rollout_len: 1,
+        grad_clip: 1.0,
+    };
+
+    for _ in 0..2 {
+        let outcome = opd_step(
+            &student,
+            &teacher,
+            &prompt_ids,
+            step_cfg,
+            &adapter_params,
+            &mut optimizer,
+            &mut store,
+            &mut tape,
+        )
+        .expect("LoRA adapter-only opd_step should retain base weights");
+        assert!(outcome.loss.is_finite());
+        for &param_id in &frozen_base_params {
+            assert!(
+                store.get(param_id).is_some(),
+                "cleanup must retain frozen student base tensor {param_id} \
+                 even when only adapter ids are optimized"
+            );
+        }
+    }
 }
 
 #[test]
