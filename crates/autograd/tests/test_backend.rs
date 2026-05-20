@@ -129,6 +129,17 @@ fn cpu_matmul_forward_matches_slow_reference_2d_and_batched_3d() {
     assert_close(&got, &want, 1e-6, "cpu matmul forward batched 3d");
 }
 
+#[test]
+fn cpu_matmul_forward_matches_slow_reference_m1_wide() {
+    let a = make_rows(&[1, 17], 505);
+    let b = make_rows(&[17, 32_768], 606);
+    let (got, got_shape) =
+        cpu_matmul_forward(&a, &[1, 17], &b, &[17, 32_768]).expect("cpu m1 wide");
+    let (want, want_shape) = slow_matmul_reference(&a, &[1, 17], &b, &[17, 32_768]);
+    assert_eq!(got_shape, want_shape);
+    assert_close(&got, &want, 1e-6, "cpu matmul forward m1 wide");
+}
+
 fn run_lazy_matmul<B: Backend>(
     backend: &B,
     a: &[f32],

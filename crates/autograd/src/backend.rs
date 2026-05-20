@@ -1518,11 +1518,10 @@ pub fn cpu_matmul_forward(
 }
 
 /// Row-major `C = A @ B` for one rank-2 sgemm tile. OPD-shape-aware dispatch:
-///   - **Saxpy inline loop** for thin matmuls (`n < SAXPY_N_THRESHOLD`). Hits
-///     ~20 GFLOPs/s on Zen 2 because the A row (`m*k` floats, M=4 in OPD)
-///     and per-iter B row fit comfortably in L1d; matrixmultiply's
-///     pack-A / pack-B overhead would swamp the inner work at M=4 (measured
-///     3× regression on q/k/v/o/gate/up/down forward, 2026-05-19).
+///   - **Saxpy inline loop** for thin matmuls (`n < SAXPY_N_THRESHOLD`) and
+///     single-row matmuls (`m == 1`). Hits ~20 GFLOPs/s on Zen 2 for
+///     cache-resident OPD projection shapes, and avoids matrixmultiply's
+///     pack overhead in the M=1 rollout-last-row lm_head regime.
 ///   - **`matrixmultiply::sgemm`** for `n >= SAXPY_N_THRESHOLD`. With
 ///     `lm_head`'s `N=151936` the saxpy thrashes L1 (608 KB per B row);
 ///     matrixmultiply's tile-pack reuses A across N-tiles and pushes lm_head
@@ -1540,7 +1539,7 @@ fn sgemm_row_major(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], out: &mut
     if m == 0 || n == 0 || k == 0 {
         return;
     }
-    if n < SAXPY_N_THRESHOLD {
+    if m == 1 || n < SAXPY_N_THRESHOLD {
         for row in 0..m {
             let a_row = &a[row * k..(row + 1) * k];
             let out_row = &mut out[row * n..(row + 1) * n];
