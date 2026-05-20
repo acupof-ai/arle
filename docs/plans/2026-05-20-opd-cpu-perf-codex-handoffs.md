@@ -32,6 +32,8 @@
 | `67a4d63` | Production-faithful phase attribution (codex) | rollout_student_forward 30.4 %, backward 21.6 %, optimizer_step 15.1 % |
 | `e0bfbb0` | LoRA matmul_bt extension (codex) | **3.06× end-to-end** (3.51 s → 1.17 s/step); rollout_student_forward 6.37 ×, teacher 6.88 ×, student 7.26 ×, backward 3.07 × |
 | `506f02b` | AdamW host-zip-loop rewrite (codex) | **3.01× isolated** (65 ms → 22 ms/step), **1.40× end-to-end** (1.17 → 0.83 s/step); optimizer_step share 45.5 % → 23.3 % |
+| `5a92878` | OPD backward op attribution (codex) | Diagnostic only; no perf claim |
+| `e53654a` | Share-first accumulated grad tensor (codex) | **PENDING REVERT** — initial 3-sample claim -8.92 % step did not hold at higher sample count; follow-up A/B showed +2.6 % regression. Wall-clock ground truth kills the axis even though merge_grad isolated improved -31 % and backward -7 %. |
 
 **Cumulative: ~35× over naive 8e8effd baseline** at moderate shape, ~4.2×
 since the 2026-05-20 morning baseline (`c4e507f`). End-to-end OPD step:
@@ -121,16 +123,36 @@ analysis in
 | `merge_grad` host accumulation | 39.1 % | 11.4 % |
 | All other 16 ops combined | < 5 % | < 1.4 % |
 
-Two next-tier axes scoped:
+**Axis E (`merge_grad` shared-first / clone elimination) — KILLED
+2026-05-20.** Codex tried two variants:
 
-- **Axis E — `merge_grad` clone elimination** (~20 % step projected,
-  low complexity, snippet ready in the research doc).
-- **Axis F — `MatmulBT` backward kernel** (rayon N-shard for lm_head
-  bwd, or bf16 weight) — defer until Axis E lands and re-measure.
+- *shared-first short-circuit* (committed as `e53654a`): initial 3-sample
+  A/B claimed -8.92 % step; follow-up larger-sample A/B showed +2.6 %
+  step regression. Wall-clock ground truth kills the axis. Revert
+  pending.
+- *`add_into_host` clone elimination* (my originally-proposed Axis E,
+  prototyped in working tree): same regression pattern at step level
+  even though `merge_grad` isolated improved -31 % and `backward`
+  total -7 %. Per §0 SOLID framing-cross-check: wall-clock framing
+  beats targeted-metric framing — the targeted win does not survive
+  end-to-end integration. Reverted in working tree before commit.
 
-**Hand-off:** codex implements Axis E (snippet copy-pasteable from
-the research doc), re-measures, then decides on Axis F based on the
-new dominant share.
+The lesson is captured in
+[`../experience/errors/2026-05-20-forward-last-logits-killed-by-m1-dispatch-hypothesis.md`](../experience/errors/2026-05-20-forward-last-logits-killed-by-m1-dispatch-hypothesis.md)
+and reinforced by memory entries on 3-sample noise + clone-elimination
+ROI projection error. **Do not re-license merge_grad host-side
+optimisations without ≥ 5 samples per side AND a step-level cross-check.**
+
+**Axis F — `MatmulBT` backward kernel parallelism** is now codex's
+active scope (2026-05-20 EOD tmux: exploring `rayon`, `std::thread`,
+`available_parallelism`). The largest single backward call is
+`lm_head` bwd at `[N=151_936, K=hidden]`; N-axis sharding with explicit
+per-thread `sgemm` is the natural shape. `matrixmultiply::threading`
+already regressed at OPD M=4 shapes, so the manual sharding path is
+the correct choice.
+
+**Hand-off:** codex owns Axis F implementation + verification. Claude
+writes the next-axis research after Axis F result lands (PASS or KILL).
 
 ### P5 — `rollout_student_forward` re-investigation (only after P4)
 
