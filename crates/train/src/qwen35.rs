@@ -784,7 +784,7 @@ impl Qwen35Model {
         self.forward_batch_indices(store, tape, &token_indices, &positions, batch)
     }
 
-    fn forward_batch_indices(
+    fn forward_hidden_batch_indices(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -812,14 +812,50 @@ impl Qwen35Model {
         for layer in &self.layers {
             hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
         }
-        let hidden = rmsnorm(
+        rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
             store,
             tape,
-        )?;
+        )
+        .map_err(Into::into)
+    }
+
+    fn forward_batch_indices(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        batch: usize,
+    ) -> Result<TensorId> {
+        let hidden =
+            self.forward_hidden_batch_indices(store, tape, token_indices, positions, batch)?;
         linear_forward(hidden, self.lm_head, store, tape)
+    }
+
+    fn forward_last_logits_batch_indices(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        batch: usize,
+    ) -> Result<TensorId> {
+        let seq_len = positions.len();
+        let hidden =
+            self.forward_hidden_batch_indices(store, tape, token_indices, positions, batch)?;
+        let hidden_size = self.config.hidden_size;
+        let last = slice(
+            hidden,
+            &[0, seq_len - 1, 0],
+            &[batch, seq_len, hidden_size],
+            store,
+            tape,
+        )
+        .map_err(Qwen35Error::from)?;
+        linear_forward(last, self.lm_head, store, tape)
     }
 
     pub fn forward(
@@ -830,6 +866,42 @@ impl Qwen35Model {
         position_ids: &[u32],
     ) -> Result<TensorId> {
         self.forward_batch(store, tape, input_ids, position_ids, 1, position_ids.len())
+    }
+
+    /// Forward pass that returns logits **only for the last position**.
+    ///
+    /// Identical to [`forward`] up through `final_norm`, but slices the last
+    /// row of the post-norm hidden state before applying `lm_head`. Saves
+    /// `(seq_len - 1) × hidden_size × vocab_size` FMAs per call — at
+    /// Qwen3.5-0.6B (`vocab=151_936`) shapes this dominates the rollout
+    /// student step. Used by [`opd::opd_step`] during greedy rollout where
+    /// only the last token's logits are read by `greedy_next_token`.
+    pub fn forward_last_logits(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+    ) -> Result<TensorId> {
+        let batch = 1;
+        let seq_len = position_ids.len();
+        let max_seq_len = self
+            .config
+            .rope_cache_len_hint
+            .ok_or(Qwen35Error::InvalidConfig(
+                "train-side qwen3.5 requires rope_cache_len_hint",
+            ))?;
+        if seq_len > max_seq_len {
+            return Err(Qwen35Error::InvalidConfig(
+                "sequence length exceeds configured rope cache length",
+            ));
+        }
+        let token_indices = input_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let positions = position_ids
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        self.forward_last_logits_batch_indices(store, tape, &token_indices, &positions, batch)
     }
 
     pub fn param_name_map(&self) -> HashMap<&'static str, TensorId> {

@@ -52,21 +52,14 @@ pub struct OpdStepOutcome {
     pub rollout_len: usize,
 }
 
-/// Greedy-argmax the last-position row of a `[1, seq_len, vocab]` logits
-/// tensor. The student's lm-head returns dense logits per position; OPD
-/// only needs the next-token row.
-fn greedy_next_token(
-    logits_id: TensorId,
-    seq_len: usize,
-    vocab: usize,
-    store: &mut TensorStore,
-) -> Result<u32> {
+/// Greedy-argmax across a `[1, vocab]` (or any contiguous) logits buffer.
+/// Caller is responsible for handing in only the last-position row; with
+/// `forward_last_logits` the tensor is already shaped `[1, vocab]`.
+fn greedy_argmax_last_row(logits_id: TensorId, store: &mut TensorStore) -> Result<u32> {
     let host = store.to_host(logits_id)?;
-    let last_row_start = (seq_len - 1) * vocab;
-    let row = &host[last_row_start..last_row_start + vocab];
     let mut best_idx: usize = 0;
     let mut best_val: f32 = f32::NEG_INFINITY;
-    for (i, &v) in row.iter().enumerate() {
+    for (i, &v) in host.iter().enumerate() {
         if v > best_val {
             best_val = v;
             best_idx = i;
@@ -92,18 +85,20 @@ pub fn opd_step<O: Optimizer>(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<OpdStepOutcome> {
-    let vocab = student.config().vocab_size;
-
     // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
+    //    Only the last position's logits are read by `greedy_argmax_last_row`,
+    //    so route through `forward_last_logits` to skip computing lm_head over
+    //    earlier positions. At Qwen3-0.6B (vocab=151_936) this is the
+    //    dominant rollout cost.
     tape.entries.clear();
     tape.set_enabled(false);
     let mut rollout: Vec<u32> = prompt_ids.to_vec();
     for _ in 0..cfg.rollout_len {
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
         let logits = student
-            .forward(store, tape, &rollout, &positions)
+            .forward_last_logits(store, tape, &rollout, &positions)
             .map_err(OpdError::from)?;
-        let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
+        let next = greedy_argmax_last_row(logits, store)?;
         rollout.push(next);
     }
     // Note: rollout ephemerals (logits per iteration) stay in the store
