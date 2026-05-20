@@ -12,7 +12,7 @@ use std::{
 };
 
 use autograd::{
-    Tape, TensorId, TensorStore,
+    BackwardProfile, Tape, TensorId, TensorStore,
     optim::{AdamW, Optimizer},
 };
 use qwen35_spec::{LayerType, Qwen35Config};
@@ -149,7 +149,7 @@ fn profiled_opd_step<O: Optimizer>(
     optimizer: &mut O,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> AnyResult<(OpdStepOutcome, PhaseTotals)> {
+) -> AnyResult<(OpdStepOutcome, PhaseTotals, BackwardProfile)> {
     let total_started = Instant::now();
     let mut totals = PhaseTotals::default();
     let vocab = student.config().vocab_size;
@@ -211,8 +211,9 @@ fn profiled_opd_step<O: Optimizer>(
         optimizer.zero_grad(store, student_params);
         Ok(())
     })?;
-    timed(&mut totals, "backward", || {
-        Ok(tape.backward(loss, store).map(|_| ())?)
+    let backward_profile = timed(&mut totals, "backward", || {
+        let (_, profile) = tape.backward_profiled(loss, store)?;
+        Ok(profile)
     })?;
     timed(&mut totals, "grad_clip", || {
         clip_grad_norm(student_params, cfg.grad_clip, store);
@@ -235,10 +236,11 @@ fn profiled_opd_step<O: Optimizer>(
             rollout_len: rollout.len(),
         },
         totals,
+        backward_profile,
     ))
 }
 
-fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals)> {
+fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals, BackwardProfile)> {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
     let cfg = moderate_qwen35_config();
@@ -254,10 +256,11 @@ fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals)> {
 
     let started = Instant::now();
     let mut totals = PhaseTotals::default();
+    let mut backward_profile = BackwardProfile::default();
     let mut first_loss = None;
     let mut last_loss = 0.0f32;
     for _ in 0..STEPS_PER_RUN {
-        let (outcome, step_totals) = profiled_opd_step(
+        let (outcome, step_totals, step_backward_profile) = profiled_opd_step(
             &student,
             &teacher,
             PROMPT_IDS,
@@ -270,6 +273,7 @@ fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals)> {
         first_loss.get_or_insert(outcome.loss);
         last_loss = outcome.loss;
         totals.merge(&step_totals);
+        backward_profile.merge(&step_backward_profile);
     }
 
     Ok((
@@ -277,6 +281,7 @@ fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals)> {
         first_loss.expect("at least one OPD step"),
         last_loss,
         totals,
+        backward_profile,
     ))
 }
 
@@ -290,13 +295,15 @@ fn main() -> AnyResult<()> {
     }
 
     let mut aggregate = PhaseTotals::default();
+    let mut aggregate_backward = BackwardProfile::default();
     let mut rates = Vec::with_capacity(MEASURED_RUNS);
     for run in 1..=MEASURED_RUNS {
-        let (secs, first_loss, last_loss, totals) = run_once()?;
+        let (secs, first_loss, last_loss, totals, backward_profile) = run_once()?;
         let steps_per_sec = STEPS_PER_RUN as f64 / secs;
         let total_step_secs = totals.seconds("total_step");
         rates.push(steps_per_sec);
         aggregate.merge(&totals);
+        aggregate_backward.merge(&backward_profile);
         println!(
             "run={run} wall_seconds={secs:.6} summed_step_seconds={total_step_secs:.6} steps_per_sec={steps_per_sec:.6} first_loss={first_loss:.9} last_loss={last_loss:.9}"
         );
@@ -346,6 +353,39 @@ fn main() -> AnyResult<()> {
             phase,
             seconds,
             pct_total
+        );
+    }
+
+    let backward_total_secs = aggregate_backward.total_duration.as_secs_f64();
+    let backward_op_secs = aggregate_backward.total_op_duration().as_secs_f64();
+    let backward_merge_secs = aggregate_backward.merge_grad_duration.as_secs_f64();
+    let backward_prelude_secs = aggregate_backward.prelude_duration.as_secs_f64();
+    let backward_unattributed_secs =
+        (backward_total_secs - backward_op_secs - backward_merge_secs - backward_prelude_secs)
+            .max(0.0);
+    println!(
+        "backward_profile_summary total_seconds={backward_total_secs:.6} op_seconds={backward_op_secs:.6} merge_grad_seconds={backward_merge_secs:.6} prelude_seconds={backward_prelude_secs:.6} unattributed_seconds={backward_unattributed_secs:.6}"
+    );
+
+    let mut backward_rows = aggregate_backward
+        .op_totals
+        .iter()
+        .map(|(&op, stats)| (op, stats.count, stats.duration.as_secs_f64()))
+        .collect::<Vec<_>>();
+    backward_rows.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    for (rank, (op, count, seconds)) in backward_rows.iter().enumerate() {
+        let pct_backward = if backward_total_secs == 0.0 {
+            0.0
+        } else {
+            seconds / backward_total_secs * 100.0
+        };
+        println!(
+            "backward_op_summary rank={} op={:?} count={} seconds={:.6} pct_backward={:.3}",
+            rank + 1,
+            op,
+            count,
+            seconds,
+            pct_backward
         );
     }
 
