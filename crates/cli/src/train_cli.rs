@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use autograd::{TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
@@ -29,6 +30,24 @@ const TRAIN_ENV_COMMANDS: &[&str] = &[
     "train estimate-memory",
     "train opd",
 ];
+
+#[derive(Debug, Clone, Serialize)]
+struct OpdStepMetric {
+    step: usize,
+    loss: f32,
+    lr: f32,
+    grad_norm: f32,
+    rollout_len: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpdSummary {
+    step_count: usize,
+    final_loss: Option<f32>,
+    mean_loss: Option<f32>,
+    min_loss: Option<f32>,
+    max_loss: Option<f32>,
+}
 
 pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
     match train.command {
@@ -243,6 +262,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     };
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
+    let mut step_metrics: Vec<OpdStepMetric> = Vec::with_capacity(args.steps);
     for step in 1..=args.steps {
         let outcome = opd_step(
             &student,
@@ -255,10 +275,18 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
             &mut tape,
         )
         .with_context(|| format!("opd step {step} failed"))?;
+        let grad_norm = current_grad_norm(&student_params, &store);
         losses.push(outcome.loss);
+        step_metrics.push(OpdStepMetric {
+            step,
+            loss: outcome.loss,
+            lr: args.lr,
+            grad_norm,
+            rollout_len: outcome.rollout_len,
+        });
         if !args.json {
             println!(
-                "step {step}/{total} loss {loss:.6} rollout_len {rl}",
+                "step {step}/{total} loss {loss:.6} grad_norm {grad_norm:.6} rollout_len {rl}",
                 total = args.steps,
                 loss = outcome.loss,
                 rl = outcome.rollout_len,
@@ -274,6 +302,8 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
             "rollout_len": args.rollout_len,
             "lr": args.lr,
             "losses": losses,
+            "step_metrics": step_metrics,
+            "summary": opd_summary(&step_metrics),
             "prompt_ids": prompt_ids,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -284,6 +314,44 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn current_grad_norm(params: &[TensorId], store: &TensorStore) -> f32 {
+    let mut total_sq_norm = 0.0_f32;
+    for &param_id in params {
+        let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
+            continue;
+        };
+        let Some(grad) = store.get(grad_id) else {
+            continue;
+        };
+        total_sq_norm += grad.data.iter().map(|value| value * value).sum::<f32>();
+    }
+    total_sq_norm.sqrt()
+}
+
+fn opd_summary(step_metrics: &[OpdStepMetric]) -> OpdSummary {
+    let final_loss = step_metrics.last().map(|metric| metric.loss);
+    let mean_loss = if step_metrics.is_empty() {
+        None
+    } else {
+        Some(step_metrics.iter().map(|metric| metric.loss).sum::<f32>() / step_metrics.len() as f32)
+    };
+    let min_loss = step_metrics
+        .iter()
+        .map(|metric| metric.loss)
+        .min_by(f32::total_cmp);
+    let max_loss = step_metrics
+        .iter()
+        .map(|metric| metric.loss)
+        .max_by(f32::total_cmp);
+    OpdSummary {
+        step_count: step_metrics.len(),
+        final_loss,
+        mean_loss,
+        min_loss,
+        max_loss,
+    }
 }
 
 #[allow(unused_variables)]
@@ -1033,7 +1101,7 @@ impl SaveDtypeArg {
 
 #[cfg(test)]
 mod tests {
-    use super::{PretrainPresetArg, ScratchShape};
+    use super::{OpdStepMetric, PretrainPresetArg, ScratchShape, opd_summary};
 
     #[test]
     fn small_30m_preset_applies_expected_shape() {
@@ -1044,5 +1112,38 @@ mod tests {
         assert_eq!(shape.heads, 6);
         assert_eq!(shape.kv_heads, 3);
         assert_eq!(shape.head_dim, 32);
+    }
+
+    #[test]
+    fn opd_summary_schema_tracks_step_metrics() {
+        let steps = vec![
+            OpdStepMetric {
+                step: 1,
+                loss: 0.5,
+                lr: 1.0e-4,
+                grad_norm: 0.25,
+                rollout_len: 5,
+            },
+            OpdStepMetric {
+                step: 2,
+                loss: 0.25,
+                lr: 1.0e-4,
+                grad_norm: 0.125,
+                rollout_len: 5,
+            },
+        ];
+
+        let summary = serde_json::to_value(opd_summary(&steps)).expect("summary json");
+        assert_eq!(summary["step_count"], 2);
+        assert_eq!(summary["final_loss"], 0.25);
+        assert_eq!(summary["mean_loss"], 0.375);
+        assert_eq!(summary["min_loss"], 0.25);
+        assert_eq!(summary["max_loss"], 0.5);
+
+        let step = serde_json::to_value(&steps[0]).expect("step json");
+        assert!(step.get("loss").is_some());
+        assert!(step.get("lr").is_some());
+        assert!(step.get("grad_norm").is_some());
+        assert!(step.get("rollout_len").is_some());
     }
 }
