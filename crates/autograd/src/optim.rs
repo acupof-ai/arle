@@ -170,6 +170,11 @@ impl AdamW {
                 .get_mut(param_id)
                 .expect("parameter tensor should still exist when stepping");
 
+            assert_eq!(
+                grad.len(),
+                param.data.len(),
+                "AdamW grad length must match parameter length for param {param_id}"
+            );
             if self.wd > 0.0 {
                 let decay = 1.0 - (self.lr * self.wd);
                 for value in &mut param.data {
@@ -179,12 +184,20 @@ impl AdamW {
 
             let step_size = self.lr / bc1;
             let inv_bc2 = 1.0 / bc2;
-            for index in 0..param.data.len() {
-                let g = grad[index];
-                m[index] = (beta1 * m[index]) + ((1.0 - beta1) * g);
-                v[index] = (beta2 * v[index]) + ((1.0 - beta2) * g * g);
-                let denom = (v[index] * inv_bc2).sqrt() + self.eps;
-                param.data[index] -= step_size * m[index] / denom;
+            let one_minus_beta1 = 1.0 - beta1;
+            let one_minus_beta2 = 1.0 - beta2;
+            for ((param_value, &g), (m_value, v_value)) in param
+                .data
+                .iter_mut()
+                .zip(&grad)
+                .zip(m.iter_mut().zip(v.iter_mut()))
+            {
+                let m_next = (beta1 * *m_value) + (one_minus_beta1 * g);
+                let v_next = (beta2 * *v_value) + (one_minus_beta2 * g * g);
+                *m_value = m_next;
+                *v_value = v_next;
+                let denom = (v_next * inv_bc2).sqrt() + self.eps;
+                *param_value -= step_size * m_next / denom;
             }
         }
     }
