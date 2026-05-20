@@ -378,7 +378,9 @@ fn discover_shards(dir: &Path) -> Result<Vec<PathBuf>> {
         return Ok(vec![single]);
     }
     Err(LoaderError::Custom(format!(
-        "no safetensors shards found under {}",
+        "no safetensors shards found under {}. Hint: pass a local HF/ModelScope \
+         checkpoint directory containing model.safetensors or \
+         model.safetensors.index.json.",
         dir.display()
     )))
 }
@@ -455,12 +457,13 @@ fn dtype_to_f32(view: &TensorView<'_>, name: &str) -> Result<Vec<f32>> {
 pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
     if !dir.is_dir() {
         return Err(LoaderError::Custom(format!(
-            "{} is not a directory",
+            "{} is not a directory. Hint: pass a local HF/ModelScope checkpoint \
+             directory containing config.json and model.safetensors.",
             dir.display()
         )));
     }
 
-    // 1) HF config → Qwen35Config → eval-init Qwen35Model.
+    // 1) HF config → Qwen35Config.
     let (hf_cfg, schema) = Qwen35HfConfig::from_json_file(dir.join("config.json"))?;
     let mut cfg = hf_cfg.to_qwen35_config()?;
     // Vanilla Qwen3 (flat-schema HF config) ships un-gated q_proj. Qwen3.5 /
@@ -469,10 +472,10 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
     if matches!(schema, HfSchema::Qwen3) {
         cfg.full_attn_gated = false;
     }
-    let model = Qwen35Model::new_for_eval(&cfg, store)?;
-    let param_map = model.param_name_map();
 
-    // 2) Open every shard once and build a `hf_name -> shard_idx` lookup.
+    // 2) Open every shard once and build a `hf_name -> shard_idx` lookup before
+    //    allocating model tensors in the caller's store. Missing checkpoint
+    //    files should fail without leaving a half-constructed eval model behind.
     let shard_paths = discover_shards(dir)?;
     let shards: Vec<ShardFile> = shard_paths
         .iter()
@@ -489,7 +492,11 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
         }
     }
 
-    // 3) Materialize each train parameter from the safetensors.
+    // 3) Qwen35Config → eval-init Qwen35Model.
+    let model = Qwen35Model::new_for_eval(&cfg, store)?;
+    let param_map = model.param_name_map();
+
+    // 4) Materialize each train parameter from the safetensors.
     //
     // The `param_name_map()` contract returns the same `TensorId` for the
     // embedding row twice (once under the embed_tokens name, once under
@@ -810,5 +817,49 @@ mod tests {
         assert!(message.contains(&path.display().to_string()));
         assert!(message.contains("OPD checkpoint directory"));
         assert!(message.contains("readable"));
+    }
+
+    #[test]
+    fn load_non_directory_error_includes_hint_and_leaves_store_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-model-dir");
+        let mut store = TensorStore::default();
+
+        let err = match load_qwen35_from_hf_dir(&missing, &mut store) {
+            Ok(_) => panic!("non-directory load should fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(message.contains(&missing.display().to_string()));
+        assert!(message.contains("not a directory"));
+        assert!(message.contains("config.json"));
+        assert!(message.contains("model.safetensors"));
+        assert!(
+            store.tensors.is_empty(),
+            "non-directory failure must not allocate model tensors"
+        );
+    }
+
+    #[test]
+    fn load_missing_safetensors_error_includes_hint_and_leaves_store_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), QWEN35_NESTED_CONFIG_JSON)
+            .expect("write config");
+        let mut store = TensorStore::default();
+
+        let err = match load_qwen35_from_hf_dir(dir.path(), &mut store) {
+            Ok(_) => panic!("missing safetensors load should fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(message.contains("no safetensors shards found"));
+        assert!(message.contains("model.safetensors"));
+        assert!(message.contains("model.safetensors.index.json"));
+        assert!(
+            store.tensors.is_empty(),
+            "missing-shard failure must not allocate model tensors"
+        );
     }
 }
