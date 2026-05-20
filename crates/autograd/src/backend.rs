@@ -177,6 +177,24 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         b_shape: &[usize],
     ) -> Result<(Vec<f32>, Vec<usize>)>;
 
+    /// Compute `C = A @ B^T` for rank-2 row-major tensors where
+    /// `A:[M,K]`, `B:[N,K]`, and `C:[M,N]`.
+    ///
+    /// Default fallback reads host buffers and calls `cpu_matmul_bt_forward`.
+    /// Backends can override to avoid materialising `B^T`.
+    fn matmul_bt(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let a_host = self.readback(a)?;
+        let b_host = self.readback(b)?;
+        let (out, out_shape) = cpu_matmul_bt_forward(&a_host, a_shape, &b_host, b_shape)?;
+        Ok((self.upload(&out, &out_shape)?, out_shape))
+    }
+
     /// Compute the gradients for `C = A @ B` given upstream gradient `dC`.
     /// `need_grad_a`/`need_grad_b` let the caller skip one side; each returned
     /// vector is empty (`vec![]`) if the corresponding `need_grad_*` is false.
@@ -248,6 +266,48 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let b_host = self.readback(b)?;
         let grad_host = self.readback(grad_out)?;
         let (grad_a, grad_b) = cpu_matmul_backward(
+            &a_host,
+            a_shape,
+            &b_host,
+            b_shape,
+            &grad_host,
+            grad_out_shape,
+            need_grad_a,
+            need_grad_b,
+        )?;
+        let grad_a_handle = if need_grad_a {
+            Some(self.upload(&grad_a, a_shape)?)
+        } else {
+            None
+        };
+        let grad_b_handle = if need_grad_b {
+            Some(self.upload(&grad_b, b_shape)?)
+        } else {
+            None
+        };
+        Ok((grad_a_handle, grad_b_handle))
+    }
+
+    /// Device-handle backward for `C = A @ B^T`. Default fallback uses host
+    /// buffers and uploads the requested gradients.
+    fn matmul_bt_backward_device(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Option<DeviceHandle>, Option<DeviceHandle>)> {
+        if !need_grad_a && !need_grad_b {
+            return Ok((None, None));
+        }
+        let a_host = self.readback(a)?;
+        let b_host = self.readback(b)?;
+        let grad_host = self.readback(grad_out)?;
+        let (grad_a, grad_b) = cpu_matmul_bt_backward(
             &a_host,
             a_shape,
             &b_host,
@@ -1412,6 +1472,28 @@ impl Backend for CpuBackend {
     }
 
     #[allow(irrefutable_let_patterns)]
+    fn matmul_bt(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let DeviceHandle::Cpu(a_data) = a else {
+            return Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot matmul_bt a non-cpu device handle",
+            ));
+        };
+        let DeviceHandle::Cpu(b_data) = b else {
+            return Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot matmul_bt a non-cpu device handle",
+            ));
+        };
+        let (out, out_shape) = cpu_matmul_bt_forward(a_data, a_shape, b_data, b_shape)?;
+        Ok((DeviceHandle::Cpu(out), out_shape))
+    }
+
+    #[allow(irrefutable_let_patterns)]
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Cpu(a_data) = a else {
             return Err(crate::AutogradError::TapeInvariant(
@@ -1515,6 +1597,58 @@ pub fn cpu_matmul_forward(
             got: a_shape.len().max(b_shape.len()),
         }),
     }
+}
+
+pub fn matmul_bt_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {
+    use crate::AutogradError;
+    if a_shape.len() != 2 || b_shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "both operands must be rank-2",
+            got: a_shape.len().max(b_shape.len()),
+        });
+    }
+    let k_a = a_shape[1];
+    let k_b = b_shape[1];
+    if k_a != k_b {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![k_a],
+            got: vec![k_b],
+        });
+    }
+    Ok(vec![a_shape[0], b_shape[0]])
+}
+
+/// CPU `C = A @ B^T` for rank-2 row-major tensors without materialising `B^T`.
+/// Shapes: `A:[M,K]`, `B:[N,K]`, output `[M,N]`.
+pub fn cpu_matmul_bt_forward(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>)> {
+    let out_shape = matmul_bt_output_shape(a_shape, b_shape)?;
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let n = b_shape[0];
+    let expected_a = m * k;
+    let expected_b = n * k;
+    if a.len() != expected_a {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: expected_a,
+        });
+    }
+    if b.len() != expected_b {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: expected_b,
+        });
+    }
+    let mut out = vec![0.0f32; m * n];
+    matmul_a_bt_into(a, a_shape_2d(m, k), b, b_shape_2d(n, k), &mut out);
+    Ok((out, out_shape))
 }
 
 /// Row-major `C = A @ B` for one rank-2 sgemm tile. OPD-shape-aware dispatch:
@@ -1669,6 +1803,44 @@ pub fn cpu_matmul_backward(
             got: a_shape.len().max(b_shape.len()),
         }),
     }
+}
+
+pub fn cpu_matmul_bt_backward(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+    grad_out: &[f32],
+    grad_out_shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    use crate::AutogradError;
+    let expected_out = matmul_bt_output_shape(a_shape, b_shape)?;
+    if grad_out_shape != expected_out.as_slice() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: expected_out,
+            got: grad_out_shape.to_vec(),
+        });
+    }
+
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let n = b_shape[0];
+    let grad_a = if need_grad_a {
+        let (grad_a, _) = cpu_matmul_forward(grad_out, &[m, n], b, &[n, k])?;
+        grad_a
+    } else {
+        Vec::new()
+    };
+    let grad_b = if need_grad_b {
+        let mut out = vec![0.0f32; n * k];
+        matmul_at_b_into(grad_out, a_shape_2d(m, n), a, b_shape_2d(m, k), &mut out);
+        out
+    } else {
+        Vec::new()
+    };
+    Ok((grad_a, grad_b))
 }
 
 /// Pair of rank-2 row dimensions, kept inline so the rank-3 dispatcher can

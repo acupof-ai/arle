@@ -38,7 +38,7 @@ pub(crate) use embed::embedding_backward;
 pub(crate) use gather::gather_last_dim_backward;
 pub(crate) use layout::{reshape_backward, slice_backward, transpose_backward};
 pub(crate) use linear_attention::linear_attention_backward;
-pub(crate) use matmul::matmul_backward;
+pub(crate) use matmul::{matmul_backward, matmul_bt_backward};
 pub(crate) use norm::rmsnorm_backward;
 pub(crate) use reduce::{mean_backward, sum_backward};
 pub(crate) use rope::rope_backward;
@@ -230,6 +230,15 @@ pub fn matmul(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     matmul::matmul(a, b, store, tape)
+}
+
+pub fn matmul_bt(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    matmul::matmul_bt(a, b, store, tape)
 }
 
 pub use linear_attention::LinearAttentionParams;
