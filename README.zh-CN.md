@@ -118,7 +118,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | 后端 | 平台 | 状态 | 已交付 |
 |---|---|:---:|---|
 | **CUDA** | Linux + NVIDIA | **Stable** | 持续批处理、paged KV、radix 复用、TileLang BF16 attention、CUDA Graph decode。L4 / Qwen3-4B BF16 + FP8 KV：**c=16 / 4k-in 197 tok/s**。 |
-| **Metal** | Apple Silicon | **Beta** | 调度器驱动的实时服务、chunked prefill、replay prefix 复用。Qwen3.5-0.8B MLX-4bit step-driver：**M4 Pro 20c 305.5 tok/s**。 |
+| **Metal** | Apple Silicon | **Beta** | 调度器驱动的实时服务、chunked prefill、replay prefix 复用。Qwen3.6 35B-A3B 4-bit MLX HTTP serve：**M4 Pro 48GB 85.6 tok/s 解码 / TTFT 385 ms**（256/91, temp 0），与 `mlx-lm` 直跑（86.3）持平，两者均触达 273 GB/s 统一内存带宽 ~78% 上限。Qwen3.5-0.8B MLX-4bit step-driver：**M4 Pro 20c 305.5 tok/s**。 |
 | **Metal DFlash** | Apple Silicon | **Beta — 默认开启** | Qwen3 / Qwen3.5 推测解码。Qwen3-4B bf16：**5.9× decode**；Qwen3.5-4B-4bit 比特一致，c=1..8。 |
 | **CPU** | 通用 | **仅开发用** | 冒烟测试与请求路径校验，不作为性能目标。 |
 
