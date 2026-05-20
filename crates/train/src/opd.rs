@@ -35,6 +35,8 @@ pub enum OpdError {
     Autograd(#[from] AutogradError),
     #[error(transparent)]
     Qwen35(#[from] Qwen35Error),
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 pub type Result<T> = std::result::Result<T, OpdError>;
@@ -63,6 +65,27 @@ fn greedy_next_token(
     store: &mut TensorStore,
 ) -> Result<u32> {
     let host = store.to_host(logits_id)?;
+    if seq_len == 0 || vocab == 0 {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD rollout cannot sample next token with seq_len={seq_len}, vocab={vocab}. \
+             Hint: pass a non-empty prompt and a Qwen35Config with vocab_size > 0; \
+             see docs/projects/2026-05-18-opd-only-pivot.md."
+        )));
+    }
+    let expected_len = seq_len.checked_mul(vocab).ok_or_else(|| {
+        OpdError::InvalidInput(format!(
+            "OPD rollout logits shape overflow for seq_len={seq_len}, vocab={vocab}. \
+             Hint: check the prompt length and Qwen35Config::vocab_size before calling opd_step."
+        ))
+    })?;
+    if host.len() < expected_len {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD rollout logits are too short: logits_len={}, expected at least \
+             seq_len * vocab = {expected_len} ({seq_len} * {vocab}). Hint: check \
+             Qwen35Model::forward output shape and Qwen35Config::vocab_size.",
+            host.len()
+        )));
+    }
     let last_row_start = (seq_len - 1) * vocab;
     let row = &host[last_row_start..last_row_start + vocab];
     let mut best_idx: usize = 0;
@@ -94,6 +117,21 @@ pub fn opd_step<O: Optimizer>(
     tape: &mut Tape,
 ) -> Result<OpdStepOutcome> {
     let vocab = student.config().vocab_size;
+    if prompt_ids.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "OPD step requires a non-empty prompt_ids slice. Hint: pass at least \
+             one BOS/chat token; the OPD substrate does not synthesize prompts. \
+             See docs/projects/2026-05-18-opd-only-pivot.md."
+                .to_owned(),
+        ));
+    }
+    if vocab == 0 {
+        return Err(OpdError::InvalidInput(
+            "OPD step requires student.config().vocab_size > 0. Hint: verify the \
+             loaded Qwen35Config before constructing the student model."
+                .to_owned(),
+        ));
+    }
     let teacher_params = teacher.all_parameter_ids();
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
 

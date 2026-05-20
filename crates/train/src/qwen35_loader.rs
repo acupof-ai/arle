@@ -44,7 +44,7 @@
 
 use std::{
     collections::HashMap,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -62,6 +62,30 @@ use crate::qwen35::{Qwen35Error, Qwen35Model};
 pub enum LoaderError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "failed to read {path}: {source}. Hint: verify the OPD checkpoint directory contains the expected file and is readable."
+    )]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "failed to open safetensors shard {path}: {source}. Hint: verify model.safetensors or every shard listed in model.safetensors.index.json exists and is readable."
+    )]
+    OpenShard {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "failed to memory-map safetensors shard {path}: {source}. Hint: verify the checkpoint file is local, complete, and not being modified while OPD loads it."
+    )]
+    MmapShard {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("safetensors: {0}")]
@@ -79,7 +103,9 @@ pub enum LoaderError {
     },
     #[error("missing tensor {0} in safetensors (and no fallback rule applies)")]
     MissingTensor(String),
-    #[error("unsupported dtype {0:?} for {1}")]
+    #[error(
+        "unsupported dtype {0:?} for {1}. Hint: OPD loader currently accepts F32, BF16, and F16 safetensors only; convert quantized checkpoints before loading."
+    )]
     UnsupportedDtype(Dtype, String),
     #[error("autograd: {0}")]
     Autograd(#[from] autograd::AutogradError),
@@ -208,7 +234,11 @@ impl Qwen35HfConfig {
     }
 
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<(Self, HfSchema)> {
-        let content = fs::read_to_string(path.as_ref())?;
+        let path = path.as_ref();
+        let content = fs::read_to_string(path).map_err(|source| LoaderError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Self::from_json_str(&content)
     }
 
@@ -300,10 +330,15 @@ struct ShardFile {
 
 impl ShardFile {
     fn open(path: &Path) -> Result<Self> {
-        let file = fs::File::open(path)?;
+        let file = fs::File::open(path).map_err(|source| LoaderError::OpenShard {
+            path: path.to_path_buf(),
+            source,
+        })?;
         // SAFETY: weights file is not mutated during loading.
-        let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|err| LoaderError::Custom(format!("mmap {}: {err}", path.display())))?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|source| LoaderError::MmapShard {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(Self { mmap })
     }
 
@@ -320,7 +355,10 @@ fn discover_shards(dir: &Path) -> Result<Vec<PathBuf>> {
     let single = dir.join("model.safetensors");
     let index = dir.join("model.safetensors.index.json");
     if index.is_file() {
-        let content = fs::read_to_string(&index)?;
+        let content = fs::read_to_string(&index).map_err(|source| LoaderError::ReadFile {
+            path: index.clone(),
+            source,
+        })?;
         let manifest: serde_json::Value = serde_json::from_str(&content)?;
         let weight_map = manifest
             .get("weight_map")
@@ -761,5 +799,16 @@ mod tests {
             &[2048, 1024],
         );
         assert!(matching.is_empty());
+    }
+
+    #[test]
+    fn missing_config_file_error_includes_path_and_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let err = Qwen35HfConfig::from_json_file(&path).expect_err("missing config should fail");
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()));
+        assert!(message.contains("OPD checkpoint directory"));
+        assert!(message.contains("readable"));
     }
 }
