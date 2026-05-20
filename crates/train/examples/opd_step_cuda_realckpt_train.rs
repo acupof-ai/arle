@@ -25,7 +25,7 @@ mod app {
     const TRAIN_STEPS: usize = 500;
     const ROLLOUT_LEN: usize = 8;
     const DECODE_LEN: usize = 16;
-    const LEARNING_RATE: f32 = 5.0e-5;
+    const DEFAULT_LEARNING_RATE: f32 = 5.0e-5;
     const GRAD_CLIP: f32 = 1.0;
     const PERTURB_SCALE: f32 = 1.0e-3;
     const PERTURB_SEED: u64 = 0x0f0d_cafe_2026_0521;
@@ -89,7 +89,8 @@ mod app {
 
     pub fn main() -> AnyResult<()> {
         let model_dir = resolve_model_dir()?;
-        print_config(&model_dir);
+        let learning_rate = resolve_learning_rate()?;
+        print_config(&model_dir, learning_rate);
 
         let cuda_backend = Arc::new(CudaBackend::new(0)?);
         let mut store = TensorStore::with_backend(cuda_backend.clone());
@@ -116,7 +117,7 @@ mod app {
             PERTURB_SCALE,
         );
         let mut optimizer =
-            AdamW::new_with_device(LEARNING_RATE, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
+            AdamW::new_with_device(learning_rate, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
         let step_config = OpdStepConfig {
             rollout_len: ROLLOUT_LEN,
             grad_clip: GRAD_CLIP,
@@ -216,9 +217,48 @@ mod app {
         Ok(path)
     }
 
-    fn print_config(model_dir: &Path) {
+    fn resolve_learning_rate() -> AnyResult<f32> {
+        let mut learning_rate = DEFAULT_LEARNING_RATE;
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--lr" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--lr requires a positive finite f32 value".into());
+                    };
+                    learning_rate = parse_positive_f32("--lr", &raw)?;
+                }
+                "-h" | "--help" => {
+                    println!(
+                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE]"
+                    );
+                    std::process::exit(0);
+                }
+                unknown => {
+                    return Err(format!(
+                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(learning_rate)
+    }
+
+    fn parse_positive_f32(name: &str, raw: &str) -> AnyResult<f32> {
+        let value = raw
+            .parse::<f32>()
+            .map_err(|err| format!("invalid {name} value `{raw}`: {err}"))?;
+        if value.is_finite() && value > 0.0 {
+            Ok(value)
+        } else {
+            Err(format!("{name} must be positive and finite, got `{raw}`").into())
+        }
+    }
+
+    fn print_config(model_dir: &Path, learning_rate: f32) {
         println!(
-            "config backend=cuda model_dir={} train_steps={TRAIN_STEPS} rollout_len={ROLLOUT_LEN} decode_len={DECODE_LEN} lr={LEARNING_RATE} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS}",
+            "config backend=cuda model_dir={} train_steps={TRAIN_STEPS} rollout_len={ROLLOUT_LEN} decode_len={DECODE_LEN} lr={learning_rate:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS}",
             model_dir.display()
         );
         for (idx, prompt) in TRAIN_PROMPTS.iter().enumerate() {
