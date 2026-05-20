@@ -23,7 +23,7 @@ mod app {
 
     const DEFAULT_MODEL_DIR: &str = "/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B";
     const DEFAULT_TRAIN_STEPS: usize = 500;
-    const ROLLOUT_LEN: usize = 8;
+    const DEFAULT_ROLLOUT_LEN: usize = 8;
     const DECODE_LEN: usize = 16;
     const DEFAULT_LEARNING_RATE: f32 = 5.0e-5;
     const GRAD_CLIP: f32 = 1.0;
@@ -61,6 +61,14 @@ mod app {
         heldout_kl: f64,
     }
 
+    #[derive(Debug, Clone)]
+    struct TrainingArgs {
+        learning_rate: f32,
+        train_steps: usize,
+        rollout_len: usize,
+        eval_steps: Vec<usize>,
+    }
+
     #[derive(Debug)]
     struct DecodeEval {
         overlap_pct: f64,
@@ -89,9 +97,9 @@ mod app {
 
     pub fn main() -> AnyResult<()> {
         let model_dir = resolve_model_dir()?;
-        let (learning_rate, train_steps) = resolve_training_args()?;
-        let eval_steps = eval_steps_for(train_steps);
-        print_config(&model_dir, learning_rate, train_steps);
+        let args = resolve_training_args()?;
+        let eval_steps = eval_steps_for(args.train_steps, &args.eval_steps);
+        print_config(&model_dir, &args, &eval_steps);
 
         let cuda_backend = Arc::new(CudaBackend::new(0)?);
         let mut store = TensorStore::with_backend(cuda_backend.clone());
@@ -118,9 +126,9 @@ mod app {
             PERTURB_SCALE,
         );
         let mut optimizer =
-            AdamW::new_with_device(learning_rate, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
+            AdamW::new_with_device(args.learning_rate, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
         let step_config = OpdStepConfig {
-            rollout_len: ROLLOUT_LEN,
+            rollout_len: args.rollout_len,
             grad_clip: GRAD_CLIP,
         };
 
@@ -151,10 +159,10 @@ mod app {
             &mut tape,
         )?);
 
-        let mut step_losses = Vec::with_capacity(train_steps);
-        let mut step_seconds = Vec::with_capacity(train_steps);
+        let mut step_losses = Vec::with_capacity(args.train_steps);
+        let mut step_seconds = Vec::with_capacity(args.train_steps);
         let total_started = Instant::now();
-        for step in 1..=train_steps {
+        for step in 1..=args.train_steps {
             let prompt_index = (step - 1) % TRAIN_PROMPTS.len();
             let prompt = TRAIN_PROMPTS[prompt_index];
             let step_started = Instant::now();
@@ -218,9 +226,11 @@ mod app {
         Ok(path)
     }
 
-    fn resolve_training_args() -> AnyResult<(f32, usize)> {
+    fn resolve_training_args() -> AnyResult<TrainingArgs> {
         let mut learning_rate = DEFAULT_LEARNING_RATE;
         let mut train_steps = DEFAULT_TRAIN_STEPS;
+        let mut rollout_len = DEFAULT_ROLLOUT_LEN;
+        let mut eval_steps = EVAL_STEPS.to_vec();
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -236,21 +246,38 @@ mod app {
                     };
                     train_steps = parse_positive_usize("--steps", &raw)?;
                 }
+                "--rollout-len" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--rollout-len requires a positive usize value".into());
+                    };
+                    rollout_len = parse_positive_usize("--rollout-len", &raw)?;
+                }
+                "--eval-steps" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--eval-steps requires a comma-separated step list".into());
+                    };
+                    eval_steps = parse_eval_steps(&raw)?;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE]"
+                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV]"
                     );
                     std::process::exit(0);
                 }
                 unknown => {
                     return Err(format!(
-                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE"
+                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV"
                     )
                     .into());
                 }
             }
         }
-        Ok((learning_rate, train_steps))
+        Ok(TrainingArgs {
+            learning_rate,
+            train_steps,
+            rollout_len,
+            eval_steps,
+        })
     }
 
     fn parse_positive_f32(name: &str, raw: &str) -> AnyResult<f32> {
@@ -275,8 +302,29 @@ mod app {
         }
     }
 
-    fn eval_steps_for(train_steps: usize) -> Vec<usize> {
-        let mut steps = EVAL_STEPS
+    fn parse_eval_steps(raw: &str) -> AnyResult<Vec<usize>> {
+        let mut steps = Vec::new();
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return Err(format!("--eval-steps contains an empty item in `{raw}`").into());
+            }
+            steps.push(
+                trimmed
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid --eval-steps item `{trimmed}`: {err}"))?,
+            );
+        }
+        if steps.is_empty() {
+            return Err("--eval-steps requires at least one step".into());
+        }
+        steps.sort_unstable();
+        steps.dedup();
+        Ok(steps)
+    }
+
+    fn eval_steps_for(train_steps: usize, configured_steps: &[usize]) -> Vec<usize> {
+        let mut steps = configured_steps
             .iter()
             .copied()
             .filter(|step| *step <= train_steps)
@@ -287,10 +335,13 @@ mod app {
         steps
     }
 
-    fn print_config(model_dir: &Path, learning_rate: f32, train_steps: usize) {
+    fn print_config(model_dir: &Path, args: &TrainingArgs, eval_steps: &[usize]) {
         println!(
-            "config backend=cuda model_dir={} train_steps={train_steps} rollout_len={ROLLOUT_LEN} decode_len={DECODE_LEN} lr={learning_rate:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS}",
-            model_dir.display()
+            "config backend=cuda model_dir={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS} eval_steps={eval_steps:?}",
+            model_dir.display(),
+            args.train_steps,
+            args.rollout_len,
+            args.learning_rate
         );
         for (idx, prompt) in TRAIN_PROMPTS.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
