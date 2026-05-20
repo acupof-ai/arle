@@ -1,0 +1,6 @@
+config backend=cuda hidden=512 intermediate=1536 layers=12 vocab=32768 num_heads=8 head_dim=64 num_kv_heads=4 prompt=[1, 3, 8] rollout_len=2 lr=0.001 steps_per_run=10 warmup_runs=1 measured_runs=3
+correctness cpu_losses=[0.00031420233, 0.0003192265, 0.00031694287] cuda_losses=[0.00031420228, 0.0003192261, 0.00031694295] max_relative_error=0.000001276
+run=1 wall_seconds=0.973134 per_step_seconds=0.097313 steps_per_sec=10.276076 first_loss=0.000314202 last_loss=0.000315440
+run=2 wall_seconds=1.024238 per_step_seconds=0.102424 steps_per_sec=9.763353 first_loss=0.000314202 last_loss=0.000315440
+run=3 wall_seconds=0.978071 per_step_seconds=0.097807 steps_per_sec=10.224208 first_loss=0.000314202 last_loss=0.000315440
+summary mean_steps_per_sec=10.087879 median_steps_per_sec=10.224208 sigma_steps_per_sec=0.230449 sigma_pct=2.284 mean_step_seconds=0.099181 median_step_seconds=0.097807 max_loss_relative_error_vs_cpu=0.000001276

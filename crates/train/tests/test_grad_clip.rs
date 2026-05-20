@@ -3,7 +3,11 @@
 //! Setup: 2 params with hand-filled gradients whose true global L2 norm is
 //! exactly sqrt(4) = 2.0 (param A's grad sums-of-squares = 1, param B's = 3).
 
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use autograd::backend_cuda::CudaBackend;
 use autograd::{Tensor, TensorId, TensorStore};
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use std::sync::Arc;
 use train::grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm};
 
 /// Build a `TensorStore` with two params and pre-filled gradients.
@@ -102,6 +106,57 @@ fn global_norm_below_threshold_rescales_grads() {
         (post_clip - 1.0).abs() < 1e-4,
         "post-clip norm {post_clip}, expected ~1.0"
     );
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn global_norm_rescales_cuda_device_grads() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping global_norm_rescales_cuda_device_grads: no CUDA device");
+        return;
+    };
+    let mut store = TensorStore::with_backend(Arc::new(backend));
+
+    let param_a = store.alloc(Tensor::new(vec![0.0], vec![1], true).expect("param_a"));
+    let grad_a = store.alloc(Tensor::new(vec![1.0], vec![1], false).expect("grad_a"));
+    store
+        .accumulate_grad(param_a, grad_a)
+        .expect("accumulate grad_a");
+
+    let param_b = store.alloc(Tensor::new(vec![0.0; 3], vec![3], true).expect("param_b"));
+    let grad_b = store.alloc(Tensor::new(vec![1.0; 3], vec![3], false).expect("grad_b"));
+    store
+        .accumulate_grad(param_b, grad_b)
+        .expect("accumulate grad_b");
+
+    let params = vec![param_a, param_b];
+    for &param in &params {
+        let grad_id = store
+            .get(param)
+            .and_then(|tensor| tensor.grad)
+            .expect("param has grad");
+        store.ensure_device(grad_id).expect("grad upload");
+    }
+
+    clip_grad_norm(&params, 1.0, &mut store);
+
+    let mut clipped = Vec::new();
+    for &param in &params {
+        let grad_id = store
+            .get(param)
+            .and_then(|tensor| tensor.grad)
+            .expect("param has grad");
+        clipped.push(store.to_host(grad_id).expect("clipped grad readback"));
+    }
+    assert_eq!(clipped.len(), 2);
+    for (param_index, grad) in clipped.iter().enumerate() {
+        for (value_index, &value) in grad.iter().enumerate() {
+            assert!(
+                (value - 0.5).abs() < 1.0e-6,
+                "param {param_index} grad[{value_index}] = {value}, expected 0.5"
+            );
+        }
+    }
 }
 
 #[test]

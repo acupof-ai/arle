@@ -42,6 +42,7 @@ fn rmsnorm_device_lazy(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     store.ensure_host(weight)?;
+    store.ensure_device(weight)?;
     store.ensure_device(x)?;
 
     let (x_shape, x_requires_grad) = {

@@ -5,6 +5,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::Device,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -25,7 +26,8 @@ pub fn embedding(
     // route to the lazy path.
     let has_device_handle = {
         let t = store.tensor(table)?;
-        t.device_handle.is_some() && t.dirty != Dirty::Host
+        (t.device_handle.is_some() && t.dirty != Dirty::Host)
+            || matches!(store.backend().device(), Device::Cuda)
     };
     if has_device_handle {
         embedding_device_lazy(table, indices, store, tape)

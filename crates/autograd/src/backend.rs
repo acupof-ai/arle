@@ -372,6 +372,28 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// Sum of squares for a device handle, returned on host as `f64`.
+    /// The default fallback reads the full tensor; CUDA overrides with a
+    /// partial-reduction kernel so gradient clipping can stay device-resident.
+    fn sum_squares(&self, x: &DeviceHandle, shape: &[usize]) -> Result<f64> {
+        let host = self.readback(x)?;
+        let size = shape_size(shape);
+        if host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        Ok(host
+            .iter()
+            .map(|&value| {
+                let value = f64::from(value);
+                value * value
+            })
+            .sum())
+    }
+
     /// Reduce-sum **all** elements of `x` into a rank-0 scalar device handle.
     /// `shape` describes the input layout (`product(shape)` elements; an
     /// empty shape means a 1-element scalar).
@@ -412,6 +434,22 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let host = self.readback(x)?;
         let out = self.log_softmax_forward_last_axis(&host, shape)?;
         self.upload(&out, shape)
+    }
+
+    /// Device-handle variant of softmax backward. Computes
+    /// `grad_input = y * (upstream - sum(upstream * y, axis=-1, keepdim=true))`
+    /// row-wise over the last axis, where `y` is the saved forward softmax
+    /// output.
+    fn softmax_last_axis_backward(
+        &self,
+        upstream: &DeviceHandle,
+        softmax_output: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let output_host = self.readback(softmax_output)?;
+        let grad = cpu_softmax_backward(&upstream_host, &output_host, shape)?;
+        self.upload(&grad, shape)
     }
 
     /// Device-handle variant of `cpu_log_softmax_backward`. Computes
@@ -875,6 +913,41 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let host = self.readback(x)?;
         let (data, new_shape) = cpu_slice(&host, old_shape, starts, ends)?;
         self.upload(&data, &new_shape)
+    }
+
+    /// Device-handle backward for a contiguous slice. Returns a full
+    /// `old_shape` gradient with upstream values scattered into the sliced
+    /// window and zeros elsewhere.
+    fn slice_backward_device(
+        &self,
+        upstream: &DeviceHandle,
+        input_shape: &[usize],
+        starts: &[usize],
+        ends: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream)?;
+        let expected_shape = validate_slice_shape(input_shape, starts, ends)?;
+        let expected_size = shape_size(&expected_shape);
+        if upstream_host.len() != expected_size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: upstream_host.len(),
+                shape: expected_shape,
+                size: expected_size,
+            });
+        }
+
+        let input_strides = broadcast_strides(input_shape);
+        let mut grad = vec![0.0; shape_size(input_shape)];
+        for (out_index, &grad_value) in upstream_host.iter().enumerate() {
+            let out_coords = linear_to_coords(out_index, &expected_shape);
+            let input_index: usize = out_coords
+                .iter()
+                .enumerate()
+                .map(|(axis, &coord)| (coord + starts[axis]) * input_strides[axis])
+                .sum();
+            grad[input_index] += grad_value;
+        }
+        self.upload(&grad, input_shape)
     }
 
     /// In-place AdamW step for a single parameter given host-resident
@@ -2071,6 +2144,54 @@ pub fn cpu_log_softmax_backward(
     Ok(grad)
 }
 
+/// CPU reference for `softmax_last_axis_backward`. Computes
+/// `grad_input[i, j] = y[i, j] * (upstream[i, j] - sum_j(upstream[i, j] * y[i, j]))`
+/// row-wise over the last axis. `softmax_output` is the saved forward output.
+pub fn cpu_softmax_backward(
+    upstream: &[f32],
+    softmax_output: &[f32],
+    shape: &[usize],
+) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected = shape_size(shape);
+    if upstream.len() != expected {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: upstream.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
+    if softmax_output.len() != expected {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: softmax_output.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
+    let rows = expected / last_dim;
+    let mut grad = vec![0.0_f32; expected];
+    for row in 0..rows {
+        let base = row * last_dim;
+        let mut dot = 0.0_f32;
+        for col in 0..last_dim {
+            dot += upstream[base + col] * softmax_output[base + col];
+        }
+        for col in 0..last_dim {
+            grad[base + col] = softmax_output[base + col] * (upstream[base + col] - dot);
+        }
+    }
+    Ok(grad)
+}
+
 /// CPU reference `out = a * b` for equal-length contiguous slices.
 pub fn cpu_mul_forward(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
     if a.len() != b.len() {
@@ -2639,37 +2760,7 @@ pub fn cpu_slice(
     ends: &[usize],
 ) -> Result<(Vec<f32>, Vec<usize>)> {
     let rank = old_shape.len();
-    if starts.len() != rank {
-        return Err(crate::AutogradError::InvalidIndicesLen {
-            expected: rank,
-            got: starts.len(),
-        });
-    }
-    if ends.len() != rank {
-        return Err(crate::AutogradError::InvalidIndicesLen {
-            expected: rank,
-            got: ends.len(),
-        });
-    }
-    for ((&start, &end), &dim) in starts.iter().zip(ends.iter()).zip(old_shape.iter()) {
-        if start > end {
-            return Err(crate::AutogradError::TapeInvariant(
-                "cpu_slice: start must be <= end for every axis",
-            ));
-        }
-        if end > dim {
-            return Err(crate::AutogradError::IndexOutOfBounds {
-                index: end,
-                upper: dim,
-            });
-        }
-    }
-
-    let new_shape: Vec<usize> = starts
-        .iter()
-        .zip(ends.iter())
-        .map(|(&s, &e)| e - s)
-        .collect();
+    let new_shape = validate_slice_shape(old_shape, starts, ends)?;
     let new_numel: usize = if new_shape.is_empty() {
         1
     } else {
@@ -2702,6 +2793,50 @@ pub fn cpu_slice(
         *slot = data[input_index];
     }
     Ok((out, new_shape))
+}
+
+fn validate_slice_shape(
+    old_shape: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+) -> Result<Vec<usize>> {
+    let rank = old_shape.len();
+    if starts.len() != rank {
+        return Err(crate::AutogradError::InvalidIndicesLen {
+            expected: rank,
+            got: starts.len(),
+        });
+    }
+    if ends.len() != rank {
+        return Err(crate::AutogradError::InvalidIndicesLen {
+            expected: rank,
+            got: ends.len(),
+        });
+    }
+    for ((&start, &end), &dim) in starts.iter().zip(ends.iter()).zip(old_shape.iter()) {
+        if start > end {
+            return Err(crate::AutogradError::TapeInvariant(
+                "cpu_slice: start must be <= end for every axis",
+            ));
+        }
+        if end > dim {
+            return Err(crate::AutogradError::IndexOutOfBounds {
+                index: end,
+                upper: dim,
+            });
+        }
+        if start > dim {
+            return Err(crate::AutogradError::IndexOutOfBounds {
+                index: start,
+                upper: dim,
+            });
+        }
+    }
+    Ok(starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(&start, &end)| end - start)
+        .collect())
 }
 
 /// CPU reference in-place AdamW update. Matches the formula in

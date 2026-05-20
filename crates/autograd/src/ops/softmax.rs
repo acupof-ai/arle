@@ -149,14 +149,43 @@ pub(crate) fn softmax_backward(
             "softmax backward missing saved output",
         ));
     };
-    let output = store.tensor_host(y)?;
-    let upstream = store.tensor_host(output_grad_id)?;
-    if output.shape != upstream.shape {
+    let output_shape = store.tensor(y)?.shape.clone();
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if output_shape != upstream_shape {
         return Err(AutogradError::ShapeMismatch {
-            expected: output.shape,
-            got: upstream.shape,
+            expected: output_shape,
+            got: upstream_shape,
         });
     }
+
+    let saved_on_device =
+        store.tensor(y)?.dirty != Dirty::Host && store.tensor(y)?.device_handle.is_some();
+    let upstream_on_device = store.tensor(output_grad_id)?.dirty != Dirty::Host
+        && store.tensor(output_grad_id)?.device_handle.is_some();
+    if saved_on_device && upstream_on_device {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let output_handle = store
+            .tensor(y)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle = store.backend().softmax_last_axis_backward(
+            &upstream_handle,
+            &output_handle,
+            &output_shape,
+        )?;
+        let grad_id = store.alloc_device_tensor(output_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
+
+    let output = store.tensor_host(y)?;
+    let upstream = store.tensor_host(output_grad_id)?;
 
     // dL/dx = y * (dL/dy - sum(dL/dy * y, axis=-1, keepdim))
     // Stream row-wise so we only allocate the output buffer — full-vocab logits

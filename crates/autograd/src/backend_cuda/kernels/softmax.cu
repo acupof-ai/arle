@@ -96,3 +96,34 @@ extern "C" __global__ void log_softmax_last_axis_f32(
         row_out[i] = (row_x[i] - row_max) - log_denom;
     }
 }
+
+extern "C" __global__ void softmax_last_axis_backward_f32(
+    float* __restrict__ grad_input,
+    const float* __restrict__ upstream,
+    const float* __restrict__ softmax_output,
+    int cols
+) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int block = blockDim.x;
+    const float* row_up = upstream + row * cols;
+    const float* row_out = softmax_output + row * cols;
+    float* row_grad = grad_input + row * cols;
+
+    float local_dot = 0.0f;
+    for (int i = tid; i < cols; i += block) {
+        local_dot += row_up[i] * row_out[i];
+    }
+    smem[tid] = local_dot;
+    __syncthreads();
+    for (int step = block / 2; step > 0; step >>= 1) {
+        if (tid < step) smem[tid] += smem[tid + step];
+        __syncthreads();
+    }
+    float dot = smem[0];
+
+    for (int i = tid; i < cols; i += block) {
+        row_grad[i] = row_out[i] * (row_up[i] - dot);
+    }
+}

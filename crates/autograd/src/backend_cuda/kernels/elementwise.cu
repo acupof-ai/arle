@@ -19,6 +19,13 @@ extern "C" __global__ void mul_scalar_f32(float* out, const float* a, float s, i
     }
 }
 
+extern "C" __global__ void sigmoid_f32(float* out, const float* a, int n) {
+    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+    if (i < n) {
+        out[i] = 1.0f / (1.0f + __expf(-a[i]));
+    }
+}
+
 extern "C" __global__ void gelu_f32(float* out, const float* a, int n) {
     int i = (blockIdx.x * blockDim.x) + threadIdx.x;
     if (i < n) {
