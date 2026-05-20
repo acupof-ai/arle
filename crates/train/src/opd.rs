@@ -405,9 +405,10 @@ pub fn opd_step<O: Optimizer>(
     optimizer.step(store, student_params)?;
 
     // 6. Prune rollout/teacher/student forward temporaries. Teacher params
-    //    live in `keep_extra`; student params and their persistent grads are
-    //    retained by `cleanup_after_backward`.
-    cleanup_after_backward(store, tape, student_params, &keep_extra);
+    //    live in `keep_extra`. Retain the full student model, not just the
+    //    optimizer target slice, because LoRA-only OPD optimizes adapter ids
+    //    while still needing frozen base weights for the next forward pass.
+    cleanup_after_backward(store, tape, &student_model_params, &keep_extra);
 
     Ok(OpdStepOutcome {
         loss: loss_value,
