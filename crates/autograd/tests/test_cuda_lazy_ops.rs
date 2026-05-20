@@ -60,6 +60,28 @@ fn rng_ids(seed: u64, n: usize, upper: i32) -> Vec<i32> {
     out
 }
 
+fn cpu_argmax_last_dim(x: &[f32], shape: &[usize]) -> autograd::Result<Vec<f32>> {
+    let vocab = *shape.last().ok_or(autograd::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    let rows = shape.iter().product::<usize>() / vocab;
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let base = row * vocab;
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &value) in x[base..base + vocab].iter().enumerate() {
+            if value > best_val {
+                best_val = value;
+                best_idx = idx;
+            }
+        }
+        out.push(best_idx as f32);
+    }
+    Ok(out)
+}
+
 /// Combined `atol=1e-6 + rtol=1e-4` tolerance — matches `torch.allclose`
 /// and the AdamW parity gate. Returns the worst `|diff| / tol` excess
 /// ratio so the assert message can name the failing index.
@@ -230,6 +252,88 @@ fn cuda_embedding_device_lazy_matches_cpu() {
         dev_out[idx],
         host_out[idx]
     );
+}
+
+#[test]
+fn cuda_embedding_from_f32_ids_device_lazy_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_embedding_from_f32_ids_device_lazy_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let table_shape = vec![97, 32];
+    let ids = vec![3, 7, 3, 96, 0];
+    let ids_f32 = ids.iter().map(|&id| id as f32).collect::<Vec<_>>();
+    let table = rng_vec(0xEBD1_0002, table_shape.iter().product(), 1.0);
+    let host_out =
+        cpu_embedding_forward(&table, table_shape[0], table_shape[1], &ids).expect("cpu embedding");
+
+    let table_h = backend.upload(&table, &table_shape).expect("upload table");
+    let ids_h = backend.upload(&ids_f32, &[ids.len()]).expect("upload ids");
+    let out_h = backend
+        .embedding_from_f32_ids(&table_h, &table_shape, &ids_h, ids.len())
+        .expect("cuda embedding from f32 ids device");
+    backend.eval(&[&out_h]).expect("cuda eval");
+    let dev_out = backend
+        .readback(&out_h)
+        .expect("embedding f32 ids readback");
+
+    let (excess, abs, idx) = max_err(&dev_out, &host_out);
+    assert!(
+        excess <= 1.0,
+        "embedding_from_f32_ids device exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_out[idx],
+        host_out[idx]
+    );
+}
+
+#[test]
+fn cuda_argmax_last_dim_device_lazy_matches_cpu_tie_breaking() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!(
+            "skipping cuda_argmax_last_dim_device_lazy_matches_cpu_tie_breaking: no CUDA device"
+        );
+        return;
+    };
+
+    let shape = vec![2, 3, 257];
+    let mut logits = rng_vec(0xA6A6_0001, shape.iter().product(), 2.0);
+    let vocab = shape[2];
+    logits[5] = 9.0;
+    logits[17] = 9.0;
+    logits[vocab + 128] = 8.0;
+    let expected = cpu_argmax_last_dim(&logits, &shape).expect("cpu argmax");
+
+    let logits_h = backend.upload(&logits, &shape).expect("upload logits");
+    let out_h = backend
+        .argmax_last_dim(&logits_h, &shape)
+        .expect("cuda argmax_last_dim");
+    backend.eval(&[&out_h]).expect("cuda eval");
+    let dev_out = backend.readback(&out_h).expect("argmax readback");
+
+    assert_eq!(dev_out, expected);
+    assert_eq!(dev_out[0], 5.0, "ties must choose the smallest vocab index");
+}
+
+#[test]
+fn cuda_write_scalar_at_device_lazy_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_write_scalar_at_device_lazy_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let dest = vec![0.0, 0.0, 0.0, 0.0, 0.0];
+    let src = vec![42.0];
+    let dest_h = backend.upload(&dest, &[dest.len()]).expect("upload dest");
+    let src_h = backend.upload(&src, &[src.len()]).expect("upload src");
+    let out_h = backend
+        .write_scalar_at(&dest_h, &src_h, dest.len(), 3)
+        .expect("cuda write scalar");
+    backend.eval(&[&out_h]).expect("cuda eval");
+    let dev_out = backend.readback(&out_h).expect("write readback");
+
+    assert_eq!(dev_out, vec![0.0, 0.0, 0.0, 42.0, 0.0]);
 }
 
 #[test]

@@ -50,6 +50,8 @@ const MUL_BACKWARD_CU: &str = include_str!("kernels/mul_backward.cu");
 const RMS_NORM_BACKWARD_CU: &str = include_str!("kernels/rms_norm_backward.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ROPE_BACKWARD_CU: &str = include_str!("kernels/rope_backward.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ROLLOUT_CU: &str = include_str!("kernels/rollout.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -97,6 +99,9 @@ const FUNCTION_NAMES: &[&str] = &[
     "rms_norm_backward_x_f32",
     "rms_norm_backward_w_f32",
     "rope_backward_f32",
+    "argmax_last_dim_f32",
+    "embedding_f32_ids_f32",
+    "write_scalar_at_f32",
 ];
 
 #[derive(Debug)]
@@ -254,6 +259,7 @@ fn concat_sources() -> String {
         MUL_BACKWARD_CU,
         RMS_NORM_BACKWARD_CU,
         ROPE_BACKWARD_CU,
+        ROLLOUT_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

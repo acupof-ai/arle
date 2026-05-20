@@ -11,21 +11,21 @@
 //! of the output buffer matches the row-major layout we want on host.
 //! Batched (rank-3) uses `sgemm_strided_batched` with the same swap.
 
+use crate::{
+    backend::{matmul_bt_output_shape, Backend, Device, DeviceGradClipResult, DeviceHandle},
+    Result,
+};
 #[cfg(not(feature = "no-cuda"))]
 use crate::{
+    backend::{matmul_output_shape, validate_broadcast, CudaStorage},
     AutogradError,
-    backend::{CudaStorage, matmul_output_shape, validate_broadcast},
-};
-use crate::{
-    Result,
-    backend::{Backend, Device, DeviceGradClipResult, DeviceHandle, matmul_bt_output_shape},
 };
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/kernels.rs"]
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{KernelCache, launch_1d, launch_rows};
+use self::kernels::{launch_1d, launch_rows, KernelCache};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
@@ -1051,6 +1051,54 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_embedding_device(self, table, table_shape, ids)
+        }
+    }
+
+    fn embedding_from_f32_ids(
+        &self,
+        table: &DeviceHandle,
+        table_shape: &[usize],
+        ids: &DeviceHandle,
+        n_ids: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (table, table_shape, ids, n_ids);
+            todo!("GPU required: cuda embedding_from_f32_ids is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_embedding_from_f32_ids_device(self, table, table_shape, ids, n_ids)
+        }
+    }
+
+    fn argmax_last_dim(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda argmax_last_dim is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_argmax_last_dim(self, x, shape)
+        }
+    }
+
+    fn write_scalar_at(
+        &self,
+        dest: &DeviceHandle,
+        src: &DeviceHandle,
+        len: usize,
+        index: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (dest, src, len, index);
+            todo!("GPU required: cuda write_scalar_at is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_write_scalar_at(self, dest, src, len, index)
         }
     }
 
@@ -3257,6 +3305,175 @@ fn cuda_embedding_device(
         },
     )?;
 
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_embedding_from_f32_ids_device(
+    backend: &CudaBackend,
+    table: &DeviceHandle,
+    table_shape: &[usize],
+    ids: &DeviceHandle,
+    n_ids: usize,
+) -> Result<DeviceHandle> {
+    if table_shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: table_shape.len(),
+        });
+    }
+    let vocab = table_shape[0];
+    let dim = table_shape[1];
+    let d_w = backend.cuda_slice(table, "embedding_from_f32_ids")?;
+    let d_ids = backend.cuda_slice(ids, "embedding_from_f32_ids")?;
+    if d_w.len() != vocab * dim {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_w.len(),
+            shape: table_shape.to_vec(),
+            size: vocab * dim,
+        });
+    }
+    if d_ids.len() != n_ids {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_ids.len(),
+            shape: vec![n_ids],
+            size: n_ids,
+        });
+    }
+    let out_len = n_ids * dim;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(out_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding f32 ids)"))?;
+
+    let n_i32 = i32::try_from(n_ids)
+        .map_err(|_| AutogradError::TapeInvariant("cuda embedding n_ids exceeds i32"))?;
+    let vocab_i32 = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda embedding vocab exceeds i32"))?;
+    let dim_i32 = i32::try_from(dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda embedding dim exceeds i32"))?;
+
+    const BLOCK: u32 = 256;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("embedding_f32_ids_f32")?,
+        n_ids,
+        BLOCK,
+        0,
+        |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_w)
+                .arg(d_ids)
+                .arg(&n_i32)
+                .arg(&vocab_i32)
+                .arg(&dim_i32);
+            builder
+        },
+    )?;
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_argmax_last_dim(
+    backend: &CudaBackend,
+    x: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    let vocab = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if vocab == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-empty last dim",
+            got: 0,
+        });
+    }
+    let total = shape_size(shape);
+    if !total.is_multiple_of(vocab) {
+        return Err(AutogradError::DataLengthMismatch {
+            len: total,
+            shape: shape.to_vec(),
+            size: total,
+        });
+    }
+    let rows = total / vocab;
+    let d_x = backend.cuda_slice(x, "argmax_last_dim")?;
+    if d_x.len() != total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_x.len(),
+            shape: shape.to_vec(),
+            size: total,
+        });
+    }
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(rows)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (argmax)"))?;
+    let rows_i = i32::try_from(rows)
+        .map_err(|_| AutogradError::TapeInvariant("cuda argmax rows exceeds i32"))?;
+    let vocab_i = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda argmax vocab exceeds i32"))?;
+    const BLOCK: u32 = 256;
+    let shared = BLOCK * (std::mem::size_of::<f32>() as u32 + std::mem::size_of::<i32>() as u32);
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("argmax_last_dim_f32")?,
+        rows,
+        BLOCK,
+        shared,
+        |mut builder| {
+            builder.arg(&mut d_out).arg(d_x).arg(&rows_i).arg(&vocab_i);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_write_scalar_at(
+    backend: &CudaBackend,
+    dest: &DeviceHandle,
+    src: &DeviceHandle,
+    len: usize,
+    index: usize,
+) -> Result<DeviceHandle> {
+    if index >= len {
+        return Err(AutogradError::IndexOutOfBounds { index, upper: len });
+    }
+    let d_dest = backend.cuda_slice(dest, "write_scalar_at")?;
+    let d_src = backend.cuda_slice(src, "write_scalar_at")?;
+    if d_dest.len() != len || d_src.is_empty() {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_dest.len(),
+            shape: vec![len],
+            size: len,
+        });
+    }
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (write scalar)"))?;
+    let len_i = i32::try_from(len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda write scalar len exceeds i32"))?;
+    let index_i = i32::try_from(index)
+        .map_err(|_| AutogradError::TapeInvariant("cuda write scalar index exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("write_scalar_at_f32")?,
+        len,
+        |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_dest)
+                .arg(d_src)
+                .arg(&len_i)
+                .arg(&index_i);
+            builder
+        },
+    )?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
