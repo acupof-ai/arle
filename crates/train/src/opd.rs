@@ -155,6 +155,18 @@ fn validate_loss_value(loss_value: f32) -> Result<()> {
     )))
 }
 
+fn validate_step_config(cfg: OpdStepConfig) -> Result<()> {
+    if cfg.grad_clip.is_finite() {
+        return Ok(());
+    }
+    Err(OpdError::InvalidInput(format!(
+        "OPD step requires cfg.grad_clip to be finite, got {}. Hint: pass \
+         a positive finite threshold to enable clipping, or pass 0.0 to \
+         disable clipping explicitly.",
+        cfg.grad_clip
+    )))
+}
+
 /// Run one OPD step:
 /// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
@@ -172,6 +184,7 @@ pub fn opd_step<O: Optimizer>(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<OpdStepOutcome> {
+    validate_step_config(cfg)?;
     let vocab = student.config().vocab_size;
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(
@@ -273,7 +286,10 @@ pub fn opd_step<O: Optimizer>(
 mod tests {
     use autograd::{Tensor, TensorStore};
 
-    use super::{OpdError, greedy_next_token, validate_loss_value, validate_student_params};
+    use super::{
+        OpdError, OpdStepConfig, greedy_next_token, validate_loss_value, validate_step_config,
+        validate_student_params,
+    };
 
     #[test]
     fn greedy_next_token_rejects_logits_len_mismatch() {
@@ -367,6 +383,24 @@ mod tests {
             assert!(message.contains("teacher/student logits"));
             assert!(message.contains("learning rate"));
             assert!(message.contains("2026-05-18-opd-only-pivot.md"));
+        }
+    }
+
+    #[test]
+    fn validate_step_config_rejects_non_finite_grad_clip() {
+        for grad_clip in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = validate_step_config(OpdStepConfig {
+                rollout_len: 1,
+                grad_clip,
+            })
+            .expect_err("non-finite OPD grad_clip must not silently disable clipping");
+
+            let OpdError::InvalidInput(message) = err else {
+                panic!("expected InvalidInput, got {err:?}");
+            };
+            assert!(message.contains("cfg.grad_clip"));
+            assert!(message.contains("finite"));
+            assert!(message.contains("0.0"));
         }
     }
 }
