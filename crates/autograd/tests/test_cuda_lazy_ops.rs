@@ -1474,6 +1474,49 @@ fn cuda_rms_norm_backward_device_matches_cpu() {
     );
 }
 
+/// RoPE forward device-lazy parity. OPD rollout decode depends on this path
+/// staying device-resident; the default `Backend::rope` fallback readbacks
+/// the activation and breaks CUDA Graph capture.
+#[test]
+fn cuda_rope_device_lazy_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_rope_device_lazy_matches_cpu: no CUDA device");
+        return;
+    };
+
+    use autograd::backend::cpu_rope_forward;
+    let batch = 2_usize;
+    let heads = 5_usize;
+    let seq = 64_usize;
+    let head_dim = 32_usize;
+    let half_dim = head_dim / 2;
+    let shape: Vec<usize> = vec![batch, heads, seq, head_dim];
+    let size: usize = shape.iter().product();
+    let cache_len = seq * half_dim;
+
+    let x = rng_vec(0x69d, size, 1.0);
+    let cos = rng_vec(0x69c, cache_len, 1.0);
+    let sin = rng_vec(0x69b, cache_len, 1.0);
+
+    let host_out = cpu_rope_forward(&x, &shape, &cos, &sin).expect("cpu rope forward");
+
+    let x_h: DeviceHandle = backend.upload(&x, &shape).expect("upload x");
+    let out_h = backend
+        .rope(&x_h, &shape, &cos, &sin)
+        .expect("cuda rope device lazy");
+    backend.eval(&[&out_h]).expect("cuda eval");
+    let dev_out = backend.readback(&out_h).expect("rope readback");
+
+    let (excess, abs, idx) = max_err_with_tol(&dev_out, &host_out, 1e-5, 1e-4);
+    assert!(
+        excess <= 1.0,
+        "rope device lazy exceeds atol=1e-5 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev_out[idx],
+        host_out[idx]
+    );
+}
+
 /// RoPE backward parity. Per the wave-2.1 brief: `[B=2, n_heads=5,
 /// S=512, head_dim=32]` (NeoX layout, full-head rotation).
 #[test]
