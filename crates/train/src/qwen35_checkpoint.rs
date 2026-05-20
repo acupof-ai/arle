@@ -579,6 +579,46 @@ mod tests {
     }
 
     #[test]
+    fn peft_adapter_name_maps_qwen35_internal_lora_keys() {
+        let cases = [
+            (
+                "model.language_model.layers.0.self_attn.q_proj.weight.lora_a",
+                "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight",
+            ),
+            (
+                "model.language_model.layers.1.mlp.down_proj.weight.lora_b",
+                "base_model.model.model.language_model.layers.1.mlp.down_proj.lora_B.weight",
+            ),
+        ];
+
+        for (internal, expected) in cases {
+            assert_eq!(
+                peft_adapter_name(internal).expect("map PEFT adapter name"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn peft_adapter_name_rejects_malformed_internal_lora_keys() {
+        let bad_suffix = peft_adapter_name("model.language_model.layers.0.mlp.up_proj.weight.lora")
+            .expect_err("bad LoRA suffix should fail")
+            .to_string();
+        assert!(
+            bad_suffix.contains(".lora_a or .lora_b"),
+            "unexpected bad suffix error: {bad_suffix}"
+        );
+
+        let missing_weight = peft_adapter_name("model.language_model.layers.0.mlp.up_proj.lora_a")
+            .expect_err("missing base .weight should fail")
+            .to_string();
+        assert!(
+            missing_weight.contains("does not end in .weight"),
+            "unexpected missing weight error: {missing_weight}"
+        );
+    }
+
+    #[test]
     fn save_step_checkpoint_synthesizes_qwen35_dense_config() {
         let tmp = tempdir().expect("tempdir");
         let cfg = dense_qwen35_config();
