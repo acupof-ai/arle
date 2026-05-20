@@ -1,0 +1,153 @@
+config backend=cuda model_dir=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B prompt=[1, 872, 198, 3456] rollout_len=8 lr=0.00005 grad_clip=1 perturb_scale=0.001
+model config hidden=1024 intermediate=3072 layers=28 vocab=151936 num_heads=16 num_kv_heads=8 head_dim=128 tie_word_embeddings=true rope_theta=1000000 teacher_param_elements=601292800 student_model_elements=601292800 student_trainable_elements=596049920 teacher_load_seconds=7.133170 student_load_seconds=6.600606
+warmup_summary loss=1.788745430531e-5 seconds=9.034978
+host_mirror_control enabled=false
+step_summary loss=1.788745430531e-5 rollout_len=12 total_step_seconds=10.237365
+phase_summary rank=1 phase=rollout_student_forward seconds=6.521388 pct_total=63.702
+phase_summary rank=2 phase=optimizer_step seconds=1.437149 pct_total=14.038
+phase_summary rank=3 phase=student_forward seconds=0.808192 pct_total=7.895
+phase_summary rank=4 phase=teacher_forward seconds=0.795380 pct_total=7.769
+phase_summary rank=5 phase=backward seconds=0.280783 pct_total=2.743
+phase_summary rank=6 phase=rollout_argmax_readback seconds=0.259117 pct_total=2.531
+phase_summary rank=7 phase=post_step_cleanup seconds=0.050787 pct_total=0.496
+phase_summary rank=8 phase=grad_clip seconds=0.043199 pct_total=0.422
+phase_summary rank=9 phase=kl_distill_loss seconds=0.040529 pct_total=0.396
+phase_summary rank=10 phase=loss_readback seconds=0.000620 pct_total=0.006
+phase_summary rank=11 phase=keep_extra_build seconds=0.000186 pct_total=0.002
+phase_summary rank=12 phase=rollout_positions seconds=0.000007 pct_total=0.000
+phase_summary rank=13 phase=optimizer_zero_grad seconds=0.000002 pct_total=0.000
+phase_summary rank=14 phase=full_positions seconds=0.000000 pct_total=0.000
+phase_summary rank=15 phase=rollout_tape_disable seconds=0.000000 pct_total=0.000
+phase_summary rank=16 phase=student_tape_enable seconds=0.000000 pct_total=0.000
+backward_profile_summary total_seconds=0.280783 op_seconds=0.271685 merge_grad_seconds=0.008381 prelude_seconds=0.000296 unattributed_seconds=0.000421
+backward_op_summary rank=1 op=MatmulBT count=197 seconds=0.173164 pct_backward=61.672 pct_total=1.691
+backward_op_summary rank=2 op=RMSNorm count=113 seconds=0.039088 pct_backward=13.921 pct_total=0.382
+backward_op_summary rank=3 op=Transpose count=140 seconds=0.023152 pct_backward=8.245 pct_total=0.226
+backward_op_summary rank=4 op=AddBroadcast count=84 seconds=0.021094 pct_backward=7.512 pct_total=0.206
+backward_op_summary rank=5 op=RoPE count=56 seconds=0.007789 pct_backward=2.774 pct_total=0.076
+backward_op_summary rank=6 op=Matmul count=56 seconds=0.002934 pct_backward=1.045 pct_total=0.029
+backward_op_summary rank=7 op=Softmax count=28 seconds=0.001343 pct_backward=0.478 pct_total=0.013
+backward_op_summary rank=8 op=Mul count=29 seconds=0.001127 pct_backward=0.402 pct_total=0.011
+backward_op_summary rank=9 op=Embedding count=1 seconds=0.000870 pct_backward=0.310 pct_total=0.008
+backward_op_summary rank=10 op=MulScalar count=29 seconds=0.000452 pct_backward=0.161 pct_total=0.004
+backward_op_summary rank=11 op=Silu count=28 seconds=0.000393 pct_backward=0.140 pct_total=0.004
+backward_op_summary rank=12 op=Reshape count=731 seconds=0.000226 pct_backward=0.080 pct_total=0.002
+backward_op_summary rank=13 op=Add count=56 seconds=0.000020 pct_backward=0.007 pct_total=0.000
+backward_op_summary rank=14 op=Mean count=1 seconds=0.000018 pct_backward=0.006 pct_total=0.000
+backward_op_summary rank=15 op=LogSoftmax count=1 seconds=0.000016 pct_backward=0.006 pct_total=0.000
+Collecting data...
+Generating '/tmp/nsys-report-80ba.qdstrm'
+Press Ctrl-C to stop symbol files downloading
+[1/7] [0%                          ] realckpt-profile.nsys-rep[1/7] [0%                          ] realckpt-profile.nsys-rep[1/7] [6%                          ] realckpt-profile.nsys-rep[1/7] [5%                          ] realckpt-profile.nsys-rep[1/7] [=15%                        ] realckpt-profile.nsys-rep[1/7] [14%                         ] realckpt-profile.nsys-rep[1/7] [13%                         ] realckpt-profile.nsys-rep[1/7] [=15%                        ] realckpt-profile.nsys-rep[1/7] [14%                         ] realckpt-profile.nsys-rep[1/7] [13%                         ] realckpt-profile.nsys-rep[1/7] [12%                         ] realckpt-profile.nsys-rep[1/7] [11%                         ] realckpt-profile.nsys-rep[1/7] [10%                         ] realckpt-profile.nsys-rep[1/7] [9%                          ] realckpt-profile.nsys-rep[1/7] [8%                          ] realckpt-profile.nsys-rep[1/7] [7%                          ] realckpt-profile.nsys-rep[1/7] [6%                          ] realckpt-profile.nsys-rep[1/7] [5%                          ] realckpt-profile.nsys-rep[1/7] [6%                          ] realckpt-profile.nsys-rep[1/7] [7%                          ] realckpt-profile.nsys-rep[1/7] [8%                          ] realckpt-profile.nsys-rep[1/7] [9%                          ] realckpt-profile.nsys-rep[1/7] [10%                         ] realckpt-profile.nsys-rep[1/7] [11%                         ] realckpt-profile.nsys-rep[1/7] [12%                         ] realckpt-profile.nsys-rep[1/7] [13%                         ] realckpt-profile.nsys-rep[1/7] [14%                         ] realckpt-profile.nsys-rep[1/7] [=15%                        ] realckpt-profile.nsys-rep[1/7] [=17%                        ] realckpt-profile.nsys-rep[1/7] [==18%                       ] realckpt-profile.nsys-rep[1/7] [==19%                       ] realckpt-profile.nsys-rep[1/7] [==20%                       ] realckpt-profile.nsys-rep[1/7] [===22%                      ] realckpt-profile.nsys-rep[1/7] [===23%                      ] realckpt-profile.nsys-rep[1/7] [===24%                      ] realckpt-profile.nsys-rep[1/7] [====25%                     ] realckpt-profile.nsys-rep[1/7] [====26%                     ] realckpt-profile.nsys-rep[1/7] [====28%                     ] realckpt-profile.nsys-rep[1/7] [=====29%                    ] realckpt-profile.nsys-rep[1/7] [=====30%                    ] realckpt-profile.nsys-rep[1/7] [=====31%                    ] realckpt-profile.nsys-rep[1/7] [======33%                   ] realckpt-profile.nsys-rep[1/7] [======34%                   ] realckpt-profile.nsys-rep[1/7] [======35%                   ] realckpt-profile.nsys-rep[1/7] [=======36%                  ] realckpt-profile.nsys-rep[1/7] [=======37%                  ] realckpt-profile.nsys-rep[1/7] [=======39%                  ] realckpt-profile.nsys-rep[1/7] [========40%                 ] realckpt-profile.nsys-rep[1/7] [========41%                 ] realckpt-profile.nsys-rep[1/7] [========42%                 ] realckpt-profile.nsys-rep[1/7] [=========43%                ] realckpt-profile.nsys-rep[1/7] [=========45%                ] realckpt-profile.nsys-rep[1/7] [=========46%                ] realckpt-profile.nsys-rep[1/7] [==========47%               ] realckpt-profile.nsys-rep[1/7] [==========48%               ] realckpt-profile.nsys-rep[1/7] [===========50%              ] realckpt-profile.nsys-rep[1/7] [===========51%              ] realckpt-profile.nsys-rep[1/7] [===========52%              ] realckpt-profile.nsys-rep[1/7] [========================100%] realckpt-profile.nsys-rep[1/7] [========================100%] realckpt-profile.nsys-rep
+[2/7] [0%                          ] realckpt-profile.sqlite[2/7] [1%                          ] realckpt-profile.sqlite[2/7] [2%                          ] realckpt-profile.sqlite[2/7] [3%                          ] realckpt-profile.sqlite[2/7] [4%                          ] realckpt-profile.sqlite[2/7] [5%                          ] realckpt-profile.sqlite[2/7] [6%                          ] realckpt-profile.sqlite[2/7] [7%                          ] realckpt-profile.sqlite[2/7] [8%                          ] realckpt-profile.sqlite[2/7] [9%                          ] realckpt-profile.sqlite[2/7] [10%                         ] realckpt-profile.sqlite[2/7] [11%                         ] realckpt-profile.sqlite[2/7] [12%                         ] realckpt-profile.sqlite[2/7] [13%                         ] realckpt-profile.sqlite[2/7] [14%                         ] realckpt-profile.sqlite[2/7] [=15%                        ] realckpt-profile.sqlite[2/7] [=16%                        ] realckpt-profile.sqlite[2/7] [=17%                        ] realckpt-profile.sqlite[2/7] [==18%                       ] realckpt-profile.sqlite[2/7] [==19%                       ] realckpt-profile.sqlite[2/7] [==20%                       ] realckpt-profile.sqlite[2/7] [==21%                       ] realckpt-profile.sqlite[2/7] [===22%                      ] realckpt-profile.sqlite[2/7] [===23%                      ] realckpt-profile.sqlite[2/7] [===24%                      ] realckpt-profile.sqlite[2/7] [====25%                     ] realckpt-profile.sqlite[2/7] [====26%                     ] realckpt-profile.sqlite[2/7] [====27%                     ] realckpt-profile.sqlite[2/7] [====28%                     ] realckpt-profile.sqlite[2/7] [=====29%                    ] realckpt-profile.sqlite[2/7] [=====30%                    ] realckpt-profile.sqlite[2/7] [=====31%                    ] realckpt-profile.sqlite[2/7] [=====32%                    ] realckpt-profile.sqlite[2/7] [======33%                   ] realckpt-profile.sqlite[2/7] [======34%                   ] realckpt-profile.sqlite[2/7] [======35%                   ] realckpt-profile.sqlite[2/7] [=======36%                  ] realckpt-profile.sqlite[2/7] [=======37%                  ] realckpt-profile.sqlite[2/7] [=======38%                  ] realckpt-profile.sqlite[2/7] [=======39%                  ] realckpt-profile.sqlite[2/7] [========40%                 ] realckpt-profile.sqlite[2/7] [========41%                 ] realckpt-profile.sqlite[2/7] [========42%                 ] realckpt-profile.sqlite[2/7] [=========43%                ] realckpt-profile.sqlite[2/7] [=========44%                ] realckpt-profile.sqlite[2/7] [=========45%                ] realckpt-profile.sqlite[2/7] [=========46%                ] realckpt-profile.sqlite[2/7] [==========47%               ] realckpt-profile.sqlite[2/7] [==========48%               ] realckpt-profile.sqlite[2/7] [==========49%               ] realckpt-profile.sqlite[2/7] [===========50%              ] realckpt-profile.sqlite[2/7] [===========51%              ] realckpt-profile.sqlite[2/7] [===========52%              ] realckpt-profile.sqlite[2/7] [===========53%              ] realckpt-profile.sqlite[2/7] [============54%             ] realckpt-profile.sqlite[2/7] [============55%             ] realckpt-profile.sqlite[2/7] [============56%             ] realckpt-profile.sqlite[2/7] [============57%             ] realckpt-profile.sqlite[2/7] [=============58%            ] realckpt-profile.sqlite[2/7] [=============59%            ] realckpt-profile.sqlite[2/7] [=============60%            ] realckpt-profile.sqlite[2/7] [==============61%           ] realckpt-profile.sqlite[2/7] [==============62%           ] realckpt-profile.sqlite[2/7] [==============63%           ] realckpt-profile.sqlite[2/7] [==============64%           ] realckpt-profile.sqlite[2/7] [===============65%          ] realckpt-profile.sqlite[2/7] [===============66%          ] realckpt-profile.sqlite[2/7] [===============67%          ] realckpt-profile.sqlite[2/7] [================68%         ] realckpt-profile.sqlite[2/7] [================69%         ] realckpt-profile.sqlite[2/7] [================70%         ] realckpt-profile.sqlite[2/7] [================71%         ] realckpt-profile.sqlite[2/7] [=================72%        ] realckpt-profile.sqlite[2/7] [=================73%        ] realckpt-profile.sqlite[2/7] [=================74%        ] realckpt-profile.sqlite[2/7] [==================75%       ] realckpt-profile.sqlite[2/7] [==================76%       ] realckpt-profile.sqlite[2/7] [==================77%       ] realckpt-profile.sqlite[2/7] [==================78%       ] realckpt-profile.sqlite[2/7] [===================79%      ] realckpt-profile.sqlite[2/7] [===================80%      ] realckpt-profile.sqlite[2/7] [===================81%      ] realckpt-profile.sqlite[2/7] [===================82%      ] realckpt-profile.sqlite[2/7] [====================83%     ] realckpt-profile.sqlite[2/7] [====================84%     ] realckpt-profile.sqlite[2/7] [====================85%     ] realckpt-profile.sqlite[2/7] [=====================86%    ] realckpt-profile.sqlite[2/7] [=====================87%    ] realckpt-profile.sqlite[2/7] [=====================88%    ] realckpt-profile.sqlite[2/7] [=====================89%    ] realckpt-profile.sqlite[2/7] [======================90%   ] realckpt-profile.sqlite[2/7] [======================91%   ] realckpt-profile.sqlite[2/7] [======================92%   ] realckpt-profile.sqlite[2/7] [=======================93%  ] realckpt-profile.sqlite[2/7] [=======================94%  ] realckpt-profile.sqlite[2/7] [=======================95%  ] realckpt-profile.sqlite[2/7] [=======================96%  ] realckpt-profile.sqlite[2/7] [========================97% ] realckpt-profile.sqlite[2/7] [========================98% ] realckpt-profile.sqlite[2/7] [========================99% ] realckpt-profile.sqlite[2/7] [========================100%] realckpt-profile.sqlite[2/7] [========================100%] realckpt-profile.sqlite
+SKIPPED: /home/ckl/projects/arle/bench-output/2026-05-21-arle-cuda-opd-realckpt-profile/realckpt-profile.sqlite does not contain NV Tools Extension (NVTX) data.
+[3/7] Executing 'nvtx_sum' stats report
+[4/7] Executing 'cuda_api_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)   Med (ns)   Min (ns)  Max (ns)   StdDev (ns)                   Name
+ --------  ---------------  ---------  ----------  ---------  --------  ---------  -----------  ---------------------------------------
+     49.0       1684378949      19204     87709.8     3510.0      2281  190719005    1970792.2  cuMemcpyHtoDAsync_v2
+     11.0        378158413       2589    146063.5     1250.0       750   35115344    2064876.0  cuStreamSynchronize
+      7.6        260555341          4  65138835.3     3510.0      1740  260546581  130271830.5  cudaDeviceSynchronize
+      7.0        241310968       2570     93895.3    34016.0      8000   38585038     833850.3  cuMemcpyDtoHAsync_v2
+      5.3        181441487      19074      9512.5     4410.0      1800    1220479      43627.3  cuMemsetD8Async
+      4.3        147330368      38278      3849.0     1260.0       480    3882744      29908.2  cuMemAllocAsync
+      3.0        102013130         56   1821663.0      425.0       330  101989419   13628851.8  cuKernelGetFunction
+      2.5         85253143      12944      6586.3     4190.0      3080    1110257      40366.5  cuLaunchKernel
+      2.2         75791029       5510     13755.2     7910.0      3810    1109197      63257.4  cudaLaunchKernel
+      2.2         74657914      59406      1256.7      880.0       520    2981743      15275.4  cuEventRecord
+      1.6         53753424      76556       702.1      640.0       290      15270        410.0  cuStreamWaitEvent
+      1.2         41505582      38278      1084.3      940.0       560      24720        581.4  cuMemFreeAsync
+      0.8         28043247       2773     10113.0     6100.0      3370    3321681      72463.3  cudaLaunchKernelExC_v11060
+      0.7         25758894      76556       336.5      260.0       160      18951        317.6  cuEventCreate
+      0.6         21686910      76556       283.3      240.0       150     100262        568.5  cuEventDestroy_v2
+      0.4         15204619          5   3040923.8  3049355.0    221035    5805071    1976760.8  cuLibraryLoadData
+      0.2          5698817        930      6127.8     4530.0      3790      24980       3170.5  cuMemcpyDtoDAsync_v2
+      0.2          5219868       2773      1882.4     1810.0       860      14370        947.3  cudaEventRecord
+      0.1          3273390      16638       196.7      140.0       120       8540        188.4  cuStreamGetCaptureInfo_v2
+      0.1          1832119       5510       332.5      290.0       130       6081        216.0  cuKernelGetName
+      0.0          1550877          1   1550877.0  1550877.0   1550877    1550877          0.0  cuModuleLoadData
+      0.0           814320          4    203580.0   167719.0     29211     449671     178183.4  cuLibraryUnload
+      0.0           651046          4    162761.5    56411.5     16010     522213     241349.4  cudaFree
+      0.0           207855          1    207855.0   207855.0    207855     207855          0.0  cuModuleUnload
+      0.0           182865          3     60955.0    66942.0      2970     112953      55235.4  cudaMalloc
+      0.0           167532        880       190.4      150.0       110       4970        202.8  cuGetProcAddress_v2
+      0.0            27021          6      4503.5     4860.0       640       8311       2984.9  cuLibraryGetKernel
+      0.0            15080         18       837.8      375.0       360       6610       1497.3  cudaEventCreateWithFlags
+      0.0            10501         18       583.4      400.5       320       2880        585.9  cudaEventDestroy
+      0.0             8970          5      1794.0      890.0       530       4210       1588.1  cuInit
+      0.0             3190          1      3190.0     3190.0      3190       3190          0.0  cudaEventQuery
+      0.0             2980          1      2980.0     2980.0      2980       2980          0.0  cuCtxSetCurrent
+      0.0             1220          3       406.7      340.0       280        600        170.1  cudaGetDriverEntryPointByVersion_v12050
+      0.0              460          2       230.0      230.0       140        320        127.3  cuModuleGetLoadingMode
+
+[5/7] Executing 'cuda_gpu_kern_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances   Avg (ns)    Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                                                  Name
+ --------  ---------------  ---------  ----------  ----------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     54.3       1069571855       2594    412325.3    241969.5      9505  34744741    2124274.6  ampere_sgemm_64x32_sliced1x4_tn
+      7.3        144727058        224    646102.9    727045.0    335353    917027     163599.4  void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)10, (int)11, (bool)0, cublasGe…
+      7.1        140617964        336    418505.8    342345.0     47779    864511     244347.4  ampere_sgemm_32x32_sliced1x4_tn
+      6.1        119288801        280    426031.4    425775.0     54372    861054     273812.1  void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)8, (int)9, (bool)0, cublasGemv…
+      4.6         91306916        196    465851.6    312407.0      9601   1227033     432393.9  ampere_sgemm_128x32_nn
+      4.3         84989201        392    216809.2     46131.5      2240    775033     257748.7  void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)6, (int)7, (bool)0, cublasGemv…
+      1.8         35883194         56    640771.3    995737.0    102503   1094608     464030.2  add_broadcast_backward_f32
+      1.8         35229093         57    618054.3    100551.0      9536  31159327    4117860.4  ampere_sgemm_32x128_nt
+      1.8         35071676          1  35071676.0  35071676.0  35071676  35071676          0.0  ampere_sgemm_128x32_sliced1x4_nn
+      1.7         33929679        170    199586.3     32531.0     13345  15500170    1197567.1  void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)4, (int)4, (bool)1, cublasGemv…
+      1.3         25871817       2940      8799.9      9024.5      1472     20738       4737.9  transpose_axes_swap_f32
+      1.0         20250599        310     65324.5     36418.0      1952   5132566     291829.0  sum_squares_partial_f32
+      1.0         19047830       2260      8428.2      8961.0      1568     18049       4245.7  rms_norm_f32
+      0.9         17237084       2773      6216.0      6273.0      1248     60037       3421.3  void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, floa…
+      0.8         16191348        310     52230.2     10849.0      1152   7068771     401169.0  adamw_step_f32
+      0.6         12378148       1680      7367.9      8080.5      1376     16289       3777.4  add_broadcast_f32
+      0.5          9026517         84    107458.5    145642.5     13057    207279      76247.5  ampere_sgemm_128x32_nt
+      0.4          7825273        562     13924.0     12641.0      2048    839357      36036.1  softmax_last_axis_f32
+      0.4          7456921        282     26443.0      6992.5       960   3015420     253043.3  add_into_f32
+      0.3          5701409       1120      5090.5      5344.0      1056     12897       2534.0  rope_f32
+      0.2          4658255       1120      4159.2      4257.0       960      7713       1964.8  add_f32
+      0.2          3849269        336     11456.2     11328.5      1888     24385       5462.2  void gemmSN_NN_kernel<float, (int)256, (int)4, (int)2, (int)8, (int)5, (int)4, (bool)0, cublasGemvT…
+      0.2          3404068        336     10131.2     10576.5      3360     23393       4338.1  void gemmSN_NN_kernel<float, (int)256, (int)4, (int)2, (int)8, (int)6, (int)4, (bool)0, cublasGemvT…
+      0.2          3082191        336      9173.2      9008.5      1600     20065       5056.7  void gemmSN_NN_kernel<float, (int)256, (int)4, (int)2, (int)8, (int)4, (int)4, (bool)0, cublasGemvT…
+      0.1          2653085        560      4737.7      4896.0      1024      9344       2268.3  silu_f32
+      0.1          2610280        562      4644.6      4737.0       992     43747       2755.9  mul_f32
+      0.1          2309369        564      4094.6      4161.0       960      7969       1924.9  mul_scalar_f32
+      0.1          2223077        113     19673.2     19394.0      1568     44355      15877.3  rms_norm_inv_rms_f32
+      0.1          2215489        113     19606.1     17089.0      2080     44771      17169.7  rms_norm_backward_w_f32
+      0.1          2054009         56     36678.7     52372.0      5697     69189      26537.5  void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_nt_align1>(T1::Params)
+      0.1          1908466         56     34079.8     50708.0      4576     59141      24408.2  ampere_sgemm_128x128_nt
+      0.1          1422952        113     12592.5     18178.0      1760     37282       8936.7  rms_norm_backward_x_f32
+      0.1          1043275         29     35975.0     50627.0      1312     90823      26558.7  mul_backward_rhs_f32
+      0.0           976837         28     34887.0     51603.5      1472     64164      25367.6  silu_backward_f32
+      0.0           944356         28     33727.0     50388.0      1312     57924      24544.9  mul_backward_lhs_f32
+      0.0           932901          2    466450.5    466450.5    157452    775449     436989.9  log_softmax_last_axis_f32
+      0.0           771929        112      6892.2      6240.5      1824     13601       4944.8  void gemmSN_NN_kernel<float, (int)256, (int)4, (int)2, (int)8, (int)3, (int)4, (bool)0, cublasGemvT…
+      0.0           367483          1    367483.0    367483.0    367483    367483          0.0  log_softmax_last_axis_backward_f32
+      0.0           330902         56      5909.0      8880.5      1120     10017       4064.6  rope_backward_f32
+      0.0           301267         28     10759.5     16785.0      1760     17793       7563.7  softmax_last_axis_backward_f32
+      0.0           213584         20     10679.2     10177.0      1792     19233       5623.1  embedding_f32
+      0.0           140843         29      4856.7      6977.0       960      8128       3119.0  mul_scalar_backward_f32
+      0.0            35395          1     35395.0     35395.0     35395     35395          0.0  mean_backward_f32
+      0.0            30275          1     30275.0     30275.0     30275     30275          0.0  embedding_backward_f32
+
+[6/7] Executing 'cuda_gpu_mem_time_sum' stats report
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)   StdDev (ns)            Operation
+ --------  ---------------  -----  --------  --------  --------  ---------  -----------  ------------------------------
+     89.2       1610060461  19204   83839.8     512.0       320  190943389    1968563.0  [CUDA memcpy Host-to-Device]
+      7.1        127999826  19074    6710.7    4321.0       320   30415240     221035.9  [CUDA memset]
+      2.6         46486504   2570   18088.1    8048.5       992    2185056     104306.4  [CUDA memcpy Device-to-Host]
+      1.2         21052459    930   22637.1   11809.0       896    2026548     114932.3  [CUDA memcpy Device-to-Device]
+
+[7/7] Executing 'cuda_gpu_mem_size_sum' stats report
+
+ Total (MB)  Count  Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)            Operation
+ ----------  -----  --------  --------  --------  --------  -----------  ------------------------------
+  12485.798  19074     0.655     0.049     0.000   622.330       12.066  [CUDA memset]
+   9740.205  19204     0.507     0.000     0.000   622.330        9.177  [CUDA memcpy Host-to-Device]
+   7152.599    930     7.691     4.194     0.001   622.330       35.360  [CUDA memcpy Device-to-Device]
+    221.747   2570     0.086     0.045     0.000     7.293        0.433  [CUDA memcpy Device-to-Host]
+
+Generated:
+	/home/ckl/projects/arle/bench-output/2026-05-21-arle-cuda-opd-realckpt-profile/realckpt-profile.nsys-rep
+	/home/ckl/projects/arle/bench-output/2026-05-21-arle-cuda-opd-realckpt-profile/realckpt-profile.sqlite
