@@ -472,10 +472,11 @@ mod tests {
     use super::*;
     use crate::{
         lora::{LoraAdapterConfig, LoraConfig},
+        opd::{OpdStepConfig, opd_step},
         qwen35::Qwen35Model,
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
     };
-    use autograd::{Tape, TensorStore};
+    use autograd::{Tape, TensorStore, optim::AdamW};
     use half::bf16;
     use safetensors::{Dtype, SafeTensors};
     use tempfile::tempdir;
@@ -1063,6 +1064,69 @@ mod tests {
                 "trainable loader must keep {name} requires_grad=true"
             );
         }
+    }
+
+    #[test]
+    fn save_qwen35_student_checkpoint_trainable_reload_runs_opd_step() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut source_store = TensorStore::default();
+        let mut source_tape = Tape::new();
+        let source_student = Qwen35Model::new(&cfg, &mut source_store).expect("scratch student");
+
+        let step_dir = save_qwen35_student_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 13,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &source_student,
+            &mut source_store,
+            &mut source_tape,
+            Qwen35StudentWeights::FullMaterialized { bf16: false },
+        )
+        .expect("save full checkpoint");
+
+        let mut opd_store = TensorStore::default();
+        let teacher =
+            load_qwen35_from_hf_dir(&step_dir, &mut opd_store).expect("reload frozen teacher");
+        let student = load_qwen35_trainable_from_hf_dir(&step_dir, &mut opd_store)
+            .expect("reload trainable student");
+        let student_params = student.all_parameter_ids();
+        assert!(
+            student_params.iter().any(|id| opd_store
+                .get(*id)
+                .is_some_and(|tensor| tensor.requires_grad)),
+            "trainable reload must expose at least one optimizer target"
+        );
+
+        let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+        let mut opd_tape = Tape::new();
+        let outcome = opd_step(
+            &student,
+            &teacher,
+            &[1, 3, 8],
+            OpdStepConfig {
+                rollout_len: 1,
+                grad_clip: 1.0,
+            },
+            &student_params,
+            &mut optimizer,
+            &mut opd_store,
+            &mut opd_tape,
+        )
+        .expect("trainable reload should run one OPD step");
+
+        assert_eq!(outcome.rollout_len, 4);
+        assert!(outcome.loss.is_finite(), "loss must be finite");
     }
 
     #[test]
