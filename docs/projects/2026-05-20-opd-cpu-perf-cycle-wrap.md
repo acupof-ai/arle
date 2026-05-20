@@ -87,19 +87,27 @@ Within `backward` (4.23 s over 5 steps):
 | `merge_grad` host accumulation | 39.1 % | 11.4 % |
 | All other 16 ops combined | < 5 % | < 1.4 % |
 
-## Open perf axes (none active, ranked by viability)
+## Open perf axes (Axis F killed; per-layer profile + bf16 remain)
 
-1. **Axis F — rayon N-shard for `MatmulBT` backward** (lm_head bwd
-   specifically). Manual per-thread `sgemm` since
-   `matrixmultiply::threading` regressed at OPD M=4. Estimated ~10 %
-   step at 8C/16T. Codex scoped this briefly (rayon / std::thread /
-   `available_parallelism` survey) but pivoted to robustness instead.
-   **Acceptance criterion (pre-licensed):** step median ≥ 1.10×,
-   σ ≤ 5%, lm_head bwd isolated ≥ 1.5×.
-2. **Axis C — bf16 `lm_head` weight storage**. Halves 622 MB weight to
-   311 MB; bandwidth saving compounds with #1. Complex (new dtype path
-   in autograd, kernel variant, precision tolerance experiment).
-   Defer until #1 lands.
+~~**Axis F** — rayon N-shard for `MatmulBT` backward (lm_head bwd
+specifically). **KILLED 2026-05-20** after codex implemented + benched
+the snippet from
+[`../plans/2026-05-20-axis-f-matmul-bt-backward-rayon-shard.md`](../plans/2026-05-20-axis-f-matmul-bt-backward-rayon-shard.md).
+Microbench at lm_head [4×1024 @ 1024×151_936]: baseline 0.344 s vs
+parallel 0.348 s = **+1.1 % regression**. Same regression pattern
+across all 8 OPD backward shapes (+0-1.6 %). Root cause:
+`cpu_matmul_backward` already runs at 7.2 GF/s on lm_head, which is
+at single-channel DDR4 bandwidth ceiling — kernel is memory-bound,
+parallelism cannot help. Captured as memory entry
+`feedback_cpu_parallel_kernel_bandwidth_bound.md`. **The next axes for
+this kernel surface must reduce bandwidth, not add threads.**~~
+**Axis C — bf16 `lm_head` weight storage**. Halves 622 MB weight to
+311 MB. With Axis F killed by memory ceiling, **this is now the
+top-ranked perf axis** — bf16 directly attacks the binding constraint
+(bandwidth) where Axis F's threads failed. Complex (new dtype path in
+autograd, kernel variant, precision tolerance experiment).
+Acceptance criterion (pre-licensed): step median ≥ 1.10×, max relerr
+in `test_opd_grad_check` ≤ 1 % (i.e. ≥ 4× current).
 3. **Per-layer profile**. The 12-layer transformer body could have
    non-uniform per-layer cost. A per-layer instrument inside
    `opd_step_cpu_moderate_profile` would surface it. Cheap to add —
