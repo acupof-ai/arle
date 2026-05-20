@@ -232,7 +232,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
 
     let (mut store, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
-    let teacher = Qwen35Model::new(&cfg, &mut store).context("build smoke teacher")?;
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).context("build smoke teacher")?;
     let student = Qwen35Model::new(&cfg, &mut store).context("build smoke student")?;
     let student_params = student.all_parameter_ids();
 
