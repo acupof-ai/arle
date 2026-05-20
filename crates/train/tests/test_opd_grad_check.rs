@@ -93,6 +93,45 @@ fn kl_distill_loss_student_logits_grad_matches_finite_difference() {
 }
 
 #[test]
+fn kl_distill_loss_stays_finite_for_wide_range_teacher_logits() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student = store.alloc(
+        Tensor::new(
+            vec![0.25, -0.50, 0.75, -1.00, -0.25, 0.50, -0.75, 1.00],
+            vec![2, 4],
+            true,
+        )
+        .expect("student logits"),
+    );
+    let teacher = store.alloc(
+        Tensor::new(
+            vec![1000.0, 0.0, -1000.0, 500.0, -800.0, 800.0, 0.0, -400.0],
+            vec![2, 4],
+            false,
+        )
+        .expect("teacher logits"),
+    );
+
+    let loss = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
+        .expect("wide-range teacher logits must not overflow");
+    let loss_value = store.to_host(loss).expect("loss host value")[0];
+    assert!(loss_value.is_finite(), "loss must be finite: {loss_value}");
+
+    tape.backward(loss, &mut store)
+        .expect("wide-range backward must stay finite");
+    let grad = store
+        .get(student)
+        .and_then(|tensor| tensor.grad)
+        .expect("student logits gradient");
+    let grad_values = store.to_host(grad).expect("gradient host value");
+    assert!(
+        grad_values.iter().all(|value| value.is_finite()),
+        "gradient must be finite: {grad_values:?}"
+    );
+}
+
+#[test]
 fn kl_distill_loss_rejects_mismatched_logit_shapes() {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
