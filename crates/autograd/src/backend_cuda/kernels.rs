@@ -105,6 +105,9 @@ const FUNCTION_NAMES: &[&str] = &[
     "embedding_f32_ids_f32",
     "write_scalar_at_f32",
     "causal_sdpa_decode_gqa_f32",
+    "qwen_decode_prepare_q_f32",
+    "qwen_decode_prepare_q_gated_f32",
+    "qwen_decode_prepare_kv_f32",
 ];
 
 #[derive(Debug)]

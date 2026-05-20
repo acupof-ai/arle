@@ -85,3 +85,162 @@ extern "C" __global__ void causal_sdpa_decode_gqa_f32(
         out[out_base + dim] = acc;
     }
 }
+
+extern "C" __global__ void qwen_decode_prepare_q_f32(
+    float* __restrict__ q_out,
+    const float* __restrict__ q_full,
+    const float* __restrict__ q_norm_weight,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    int batch,
+    int query_heads,
+    int head_dim,
+    int q_full_stride,
+    float eps
+) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int b = row / query_heads;
+    int h = row - b * query_heads;
+    if (b >= batch) {
+        return;
+    }
+
+    int half_dim = head_dim >> 1;
+    int q_full_base = b * q_full_stride + h * head_dim;
+    int out_base = row * head_dim;
+
+    float local_sq = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float x = q_full[q_full_base + d];
+        local_sq += x * x;
+    }
+    smem[tid] = local_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf((smem[0] / (float)head_dim) + eps);
+
+    for (int i = tid; i < half_dim; i += blockDim.x) {
+        float x0 = q_full[q_full_base + i] * inv_rms * q_norm_weight[i];
+        float x1 = q_full[q_full_base + i + half_dim] * inv_rms * q_norm_weight[i + half_dim];
+        float c = cos_table[i];
+        float s = sin_table[i];
+        q_out[out_base + i] = x0 * c - x1 * s;
+        q_out[out_base + i + half_dim] = x1 * c + x0 * s;
+    }
+}
+
+extern "C" __global__ void qwen_decode_prepare_q_gated_f32(
+    float* __restrict__ q_out,
+    float* __restrict__ gate_out,
+    const float* __restrict__ q_full,
+    const float* __restrict__ q_norm_weight,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    int batch,
+    int query_heads,
+    int head_dim,
+    int q_full_stride,
+    float eps
+) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int b = row / query_heads;
+    int h = row - b * query_heads;
+    if (b >= batch) {
+        return;
+    }
+
+    int half_dim = head_dim >> 1;
+    int head_stride = head_dim * 2;
+    int q_full_base = b * q_full_stride + h * head_stride;
+    int out_base = row * head_dim;
+
+    float local_sq = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float x = q_full[q_full_base + d];
+        local_sq += x * x;
+        gate_out[out_base + d] = q_full[q_full_base + head_dim + d];
+    }
+    smem[tid] = local_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf((smem[0] / (float)head_dim) + eps);
+
+    for (int i = tid; i < half_dim; i += blockDim.x) {
+        float x0 = q_full[q_full_base + i] * inv_rms * q_norm_weight[i];
+        float x1 = q_full[q_full_base + i + half_dim] * inv_rms * q_norm_weight[i + half_dim];
+        float c = cos_table[i];
+        float s = sin_table[i];
+        q_out[out_base + i] = x0 * c - x1 * s;
+        q_out[out_base + i + half_dim] = x1 * c + x0 * s;
+    }
+}
+
+extern "C" __global__ void qwen_decode_prepare_kv_f32(
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    const float* __restrict__ k_full,
+    const float* __restrict__ v_full,
+    const float* __restrict__ k_norm_weight,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    int batch,
+    int kv_heads,
+    int head_dim,
+    int kv_full_stride,
+    float eps
+) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int b = row / kv_heads;
+    int h = row - b * kv_heads;
+    if (b >= batch) {
+        return;
+    }
+
+    int half_dim = head_dim >> 1;
+    int full_base = b * kv_full_stride + h * head_dim;
+    int out_base = row * head_dim;
+
+    float local_sq = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float x = k_full[full_base + d];
+        local_sq += x * x;
+        v_out[out_base + d] = v_full[full_base + d];
+    }
+    smem[tid] = local_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf((smem[0] / (float)head_dim) + eps);
+
+    for (int i = tid; i < half_dim; i += blockDim.x) {
+        float x0 = k_full[full_base + i] * inv_rms * k_norm_weight[i];
+        float x1 = k_full[full_base + i + half_dim] * inv_rms * k_norm_weight[i + half_dim];
+        float c = cos_table[i];
+        float s = sin_table[i];
+        k_out[out_base + i] = x0 * c - x1 * s;
+        k_out[out_base + i + half_dim] = x1 * c + x0 * s;
+    }
+}

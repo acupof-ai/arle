@@ -10,7 +10,7 @@ use autograd::{
         linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
         slice, transpose, LinearAttentionParams,
     },
-    AutogradError, Tape, Tensor, TensorId, TensorStore,
+    AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
 };
 use qwen35_spec::Qwen35AttentionTensorNames;
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
@@ -555,66 +555,80 @@ impl Qwen35Layer {
         tape: &mut Tape,
     ) -> Result<TensorId> {
         let q_full = attn.q_proj.forward(h, store, tape)?;
-        let (q, gate) = if cfg.full_attn_gated {
-            let q_full = reshape(
-                q_full,
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            let q = slice(
-                q_full,
-                &[0, 0, 0, 0],
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
-                store,
-                tape,
-            )?;
-            let gate = slice(
-                q_full,
-                &[0, 0, 0, cfg.head_dim],
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            (
-                transpose(q, 1, 2, store, tape)?,
-                Some(transpose(gate, 1, 2, store, tape)?),
-            )
+        let decode_prepare_fast = !tape.enabled
+            && seq_len == 1
+            && cfg.rotary_dim == cfg.head_dim
+            && store.backend().device() == Device::Cuda;
+        let (q, gate, k, v) = if decode_prepare_fast {
+            let (q, gate) =
+                qwen_decode_prepare_q(q_full, attn.q_norm, cos, sin, cfg, batch, store)?;
+            let k = attn.k_proj.forward(h, store, tape)?;
+            let v = attn.v_proj.forward(h, store, tape)?;
+            let (k, v) = qwen_decode_prepare_kv(k, v, attn.k_norm, cos, sin, cfg, batch, store)?;
+            (q, gate, k, v)
         } else {
-            let q = reshape(
-                q_full,
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+            let (q, gate) = if cfg.full_attn_gated {
+                let q_full = reshape(
+                    q_full,
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                    store,
+                    tape,
+                )?;
+                let q = slice(
+                    q_full,
+                    &[0, 0, 0, 0],
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                    store,
+                    tape,
+                )?;
+                let gate = slice(
+                    q_full,
+                    &[0, 0, 0, cfg.head_dim],
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                    store,
+                    tape,
+                )?;
+                (
+                    transpose(q, 1, 2, store, tape)?,
+                    Some(transpose(gate, 1, 2, store, tape)?),
+                )
+            } else {
+                let q = reshape(
+                    q_full,
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                    store,
+                    tape,
+                )?;
+                (transpose(q, 1, 2, store, tape)?, None)
+            };
+
+            let k = attn.k_proj.forward(h, store, tape)?;
+            let v = attn.v_proj.forward(h, store, tape)?;
+            let k = split_heads(
+                k,
+                batch,
+                seq_len,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
                 store,
                 tape,
             )?;
-            (transpose(q, 1, 2, store, tape)?, None)
+            let v = split_heads(
+                v,
+                batch,
+                seq_len,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                store,
+                tape,
+            )?;
+
+            let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+            let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+            let q = rope(q, cos, sin, store, tape)?;
+            let k = rope(k, cos, sin, store, tape)?;
+            (q, gate, k, v)
         };
-
-        let k = attn.k_proj.forward(h, store, tape)?;
-        let v = attn.v_proj.forward(h, store, tape)?;
-        let k = split_heads(
-            k,
-            batch,
-            seq_len,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            store,
-            tape,
-        )?;
-        let v = split_heads(
-            v,
-            batch,
-            seq_len,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            store,
-            tape,
-        )?;
-
-        let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
-        let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
-        let q = rope(q, cos, sin, store, tape)?;
-        let k = rope(k, cos, sin, store, tape)?;
 
         let k_all = append_cached_kv(layer_cache.k, k, store)?;
         let v_all = append_cached_kv(layer_cache.v, v, store)?;
@@ -678,81 +692,106 @@ impl Qwen35Layer {
         let q_full = attn.q_proj.forward(h, store, tape)?;
         profile.q_proj += started.elapsed();
 
-        let started = Instant::now();
-        let (q, gate) = if cfg.full_attn_gated {
-            let q_full = reshape(
-                q_full,
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            let q = slice(
-                q_full,
-                &[0, 0, 0, 0],
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
-                store,
-                tape,
-            )?;
-            let gate = slice(
-                q_full,
-                &[0, 0, 0, cfg.head_dim],
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
-                store,
-                tape,
-            )?;
-            (
-                transpose(q, 1, 2, store, tape)?,
-                Some(transpose(gate, 1, 2, store, tape)?),
-            )
+        let decode_prepare_fast = !tape.enabled
+            && seq_len == 1
+            && cfg.rotary_dim == cfg.head_dim
+            && store.backend().device() == Device::Cuda;
+        let (q, gate, k, v) = if decode_prepare_fast {
+            let started = Instant::now();
+            let (q, gate) =
+                qwen_decode_prepare_q(q_full, attn.q_norm, cos, sin, cfg, batch, store)?;
+            profile.q_layout += started.elapsed();
+
+            let started = Instant::now();
+            let k = attn.k_proj.forward(h, store, tape)?;
+            profile.k_proj += started.elapsed();
+
+            let started = Instant::now();
+            let v = attn.v_proj.forward(h, store, tape)?;
+            profile.v_proj += started.elapsed();
+
+            let started = Instant::now();
+            let (k, v) = qwen_decode_prepare_kv(k, v, attn.k_norm, cos, sin, cfg, batch, store)?;
+            profile.kv_split += started.elapsed();
+            (q, gate, k, v)
         } else {
-            let q = reshape(
-                q_full,
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+            let started = Instant::now();
+            let (q, gate) = if cfg.full_attn_gated {
+                let q_full = reshape(
+                    q_full,
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                    store,
+                    tape,
+                )?;
+                let q = slice(
+                    q_full,
+                    &[0, 0, 0, 0],
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                    store,
+                    tape,
+                )?;
+                let gate = slice(
+                    q_full,
+                    &[0, 0, 0, cfg.head_dim],
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                    store,
+                    tape,
+                )?;
+                (
+                    transpose(q, 1, 2, store, tape)?,
+                    Some(transpose(gate, 1, 2, store, tape)?),
+                )
+            } else {
+                let q = reshape(
+                    q_full,
+                    &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                    store,
+                    tape,
+                )?;
+                (transpose(q, 1, 2, store, tape)?, None)
+            };
+            profile.q_layout += started.elapsed();
+
+            let started = Instant::now();
+            let k = attn.k_proj.forward(h, store, tape)?;
+            profile.k_proj += started.elapsed();
+
+            let started = Instant::now();
+            let v = attn.v_proj.forward(h, store, tape)?;
+            profile.v_proj += started.elapsed();
+
+            let started = Instant::now();
+            let k = split_heads(
+                k,
+                batch,
+                seq_len,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
                 store,
                 tape,
             )?;
-            (transpose(q, 1, 2, store, tape)?, None)
+            let v = split_heads(
+                v,
+                batch,
+                seq_len,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                store,
+                tape,
+            )?;
+            profile.kv_split += started.elapsed();
+
+            let started = Instant::now();
+            let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+            let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+            profile.qk_norm += started.elapsed();
+
+            let started = Instant::now();
+            let q = rope(q, cos, sin, store, tape)?;
+            let k = rope(k, cos, sin, store, tape)?;
+            profile.rope += started.elapsed();
+            (q, gate, k, v)
         };
-        profile.q_layout += started.elapsed();
-
-        let started = Instant::now();
-        let k = attn.k_proj.forward(h, store, tape)?;
-        profile.k_proj += started.elapsed();
-
-        let started = Instant::now();
-        let v = attn.v_proj.forward(h, store, tape)?;
-        profile.v_proj += started.elapsed();
-
-        let started = Instant::now();
-        let k = split_heads(
-            k,
-            batch,
-            seq_len,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            store,
-            tape,
-        )?;
-        let v = split_heads(
-            v,
-            batch,
-            seq_len,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            store,
-            tape,
-        )?;
-        profile.kv_split += started.elapsed();
-
-        let started = Instant::now();
-        let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
-        let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
-        profile.qk_norm += started.elapsed();
-
-        let started = Instant::now();
-        let q = rope(q, cos, sin, store, tape)?;
-        let k = rope(k, cos, sin, store, tape)?;
-        profile.rope += started.elapsed();
 
         let started = Instant::now();
         let k_all = append_cached_kv(layer_cache.k, k, store)?;
@@ -2067,6 +2106,196 @@ fn append_cached_kv(
             .backend()
             .concat_axis2(&cached_handle, &cached_shape, &next_handle, &next_shape)?;
     Ok(store.alloc_device_tensor(out_shape, out_handle)?)
+}
+
+fn qwen_decode_prepare_q(
+    q_full: TensorId,
+    q_norm: TensorId,
+    cos: TensorId,
+    sin: TensorId,
+    cfg: &Qwen35Config,
+    batch: usize,
+    store: &mut TensorStore,
+) -> Result<(TensorId, Option<TensorId>)> {
+    store.ensure_device(q_full)?;
+    store.ensure_device(q_norm)?;
+    store.ensure_device(cos)?;
+    store.ensure_device(sin)?;
+
+    let q_full_shape = store
+        .get(q_full)
+        .ok_or(AutogradError::InvalidTensorId(q_full))?
+        .shape
+        .clone();
+    if q_full_shape.len() != 3 || q_full_shape[0] != batch || q_full_shape[1] != 1 {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![batch, 1, cfg.full_attn_q_proj_dim()],
+            got: q_full_shape,
+        }
+        .into());
+    }
+    let q_norm_shape = store
+        .get(q_norm)
+        .ok_or(AutogradError::InvalidTensorId(q_norm))?
+        .shape
+        .clone();
+    let cos_shape = store
+        .get(cos)
+        .ok_or(AutogradError::InvalidTensorId(cos))?
+        .shape
+        .clone();
+    let sin_shape = store
+        .get(sin)
+        .ok_or(AutogradError::InvalidTensorId(sin))?
+        .shape
+        .clone();
+    let q_full_handle = store
+        .get(q_full)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_q: q_full missing device handle",
+        ))?;
+    let q_norm_handle = store
+        .get(q_norm)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_q: q_norm missing device handle",
+        ))?;
+    let cos_handle = store
+        .get(cos)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_q: cos missing device handle",
+        ))?;
+    let sin_handle = store
+        .get(sin)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_q: sin missing device handle",
+        ))?;
+
+    let (q_handle, gate_handle, out_shape) = store.backend().qwen_decode_prepare_q(
+        &q_full_handle,
+        &q_full_shape,
+        &q_norm_handle,
+        &q_norm_shape,
+        &cos_handle,
+        &cos_shape,
+        &sin_handle,
+        &sin_shape,
+        cfg.num_attention_heads,
+        cfg.head_dim,
+        cfg.full_attn_gated,
+        cfg.rms_norm_eps,
+    )?;
+    let q = store.alloc_device_tensor(out_shape.clone(), q_handle)?;
+    let gate = gate_handle
+        .map(|handle| store.alloc_device_tensor(out_shape, handle))
+        .transpose()?;
+    Ok((q, gate))
+}
+
+fn qwen_decode_prepare_kv(
+    k_full: TensorId,
+    v_full: TensorId,
+    k_norm: TensorId,
+    cos: TensorId,
+    sin: TensorId,
+    cfg: &Qwen35Config,
+    batch: usize,
+    store: &mut TensorStore,
+) -> Result<(TensorId, TensorId)> {
+    store.ensure_device(k_full)?;
+    store.ensure_device(v_full)?;
+    store.ensure_device(k_norm)?;
+    store.ensure_device(cos)?;
+    store.ensure_device(sin)?;
+
+    let k_full_shape = store
+        .get(k_full)
+        .ok_or(AutogradError::InvalidTensorId(k_full))?
+        .shape
+        .clone();
+    if k_full_shape.len() != 3
+        || k_full_shape[0] != batch
+        || k_full_shape[1] != 1
+        || k_full_shape[2] != cfg.num_key_value_heads * cfg.head_dim
+    {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![batch, 1, cfg.num_key_value_heads * cfg.head_dim],
+            got: k_full_shape,
+        }
+        .into());
+    }
+    let v_full_shape = store
+        .get(v_full)
+        .ok_or(AutogradError::InvalidTensorId(v_full))?
+        .shape
+        .clone();
+    let k_norm_shape = store
+        .get(k_norm)
+        .ok_or(AutogradError::InvalidTensorId(k_norm))?
+        .shape
+        .clone();
+    let cos_shape = store
+        .get(cos)
+        .ok_or(AutogradError::InvalidTensorId(cos))?
+        .shape
+        .clone();
+    let sin_shape = store
+        .get(sin)
+        .ok_or(AutogradError::InvalidTensorId(sin))?
+        .shape
+        .clone();
+    let k_full_handle = store
+        .get(k_full)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_kv: k_full missing device handle",
+        ))?;
+    let v_full_handle = store
+        .get(v_full)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_kv: v_full missing device handle",
+        ))?;
+    let k_norm_handle = store
+        .get(k_norm)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_kv: k_norm missing device handle",
+        ))?;
+    let cos_handle = store
+        .get(cos)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_kv: cos missing device handle",
+        ))?;
+    let sin_handle = store
+        .get(sin)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "qwen_decode_prepare_kv: sin missing device handle",
+        ))?;
+
+    let (k_handle, v_handle, out_shape) = store.backend().qwen_decode_prepare_kv(
+        &k_full_handle,
+        &k_full_shape,
+        &v_full_handle,
+        &v_full_shape,
+        &k_norm_handle,
+        &k_norm_shape,
+        &cos_handle,
+        &cos_shape,
+        &sin_handle,
+        &sin_shape,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        cfg.rms_norm_eps,
+    )?;
+    let k = store.alloc_device_tensor(out_shape.clone(), k_handle)?;
+    let v = store.alloc_device_tensor(out_shape, v_handle)?;
+    Ok((k, v))
 }
 
 fn embedding_device_f32_ids(
