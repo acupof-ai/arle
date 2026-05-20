@@ -21,6 +21,7 @@
 //!   layered on via `Qwen35Model::new_with_lora`.
 
 use autograd::{AutogradError, Tape, TensorId, TensorStore, optim::Optimizer};
+use std::collections::HashSet;
 
 use crate::{
     grad_clip::clip_grad_norm,
@@ -152,6 +153,35 @@ fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> 
     Ok(())
 }
 
+fn validate_student_param_ownership(
+    student_params: &[TensorId],
+    student_model_params: &[TensorId],
+    teacher_params: &[TensorId],
+) -> Result<()> {
+    let student_model_param_set: HashSet<TensorId> = student_model_params.iter().copied().collect();
+    let teacher_param_set: HashSet<TensorId> = teacher_params.iter().copied().collect();
+    for (index, &param_id) in student_params.iter().enumerate() {
+        if teacher_param_set.contains(&param_id) {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD student_params[{index}]={param_id} belongs to the frozen \
+                 teacher model. Hint: pass student parameter ids from \
+                 student.all_parameter_ids() or the student's LoRA adapter ids; \
+                 teacher weights must not be optimized."
+            )));
+        }
+        if !student_model_param_set.contains(&param_id) {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD student_params[{index}]={param_id} is not owned by the \
+                 student Qwen35Model passed to opd_step. Hint: build \
+                 student_params from that exact student's all_parameter_ids() \
+                 or adapter ids, using the same TensorStore."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_teacher_params(teacher_params: &[TensorId], store: &TensorStore) -> Result<()> {
     if teacher_params.is_empty() {
         return Err(OpdError::InvalidInput(
@@ -264,8 +294,10 @@ pub fn opd_step<O: Optimizer>(
         )));
     }
     let teacher_params = teacher.all_parameter_ids();
+    let student_model_params = student.all_parameter_ids();
     validate_teacher_params(&teacher_params, store)?;
     validate_student_params(student_params, store)?;
+    validate_student_param_ownership(student_params, &student_model_params, &teacher_params)?;
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
 
     // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
@@ -328,7 +360,7 @@ mod tests {
 
     use super::{
         OpdError, OpdStepConfig, greedy_next_token, validate_loss_value, validate_step_config,
-        validate_student_params, validate_teacher_params,
+        validate_student_param_ownership, validate_student_params, validate_teacher_params,
     };
 
     #[test]
@@ -426,6 +458,40 @@ mod tests {
         assert!(message.contains("no trainable tensors"));
         assert!(message.contains("requires_grad=true"));
         assert!(message.contains("optimizer step a no-op"));
+    }
+
+    #[test]
+    fn validate_student_param_ownership_rejects_teacher_param_ids() {
+        let student_param = 10;
+        let teacher_param = 20;
+        let err = validate_student_param_ownership(
+            &[student_param, teacher_param],
+            &[student_param],
+            &[teacher_param],
+        )
+        .expect_err("teacher ids must not be accepted as student params");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("student_params[1]=20"));
+        assert!(message.contains("frozen teacher"));
+        assert!(message.contains("must not be optimized"));
+    }
+
+    #[test]
+    fn validate_student_param_ownership_rejects_non_student_param_ids() {
+        let student_param = 10;
+        let foreign_param = 30;
+        let err = validate_student_param_ownership(&[foreign_param], &[student_param], &[])
+            .expect_err("foreign ids must not be accepted as student params");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("student_params[0]=30"));
+        assert!(message.contains("not owned by the student"));
+        assert!(message.contains("same TensorStore"));
     }
 
     #[test]
