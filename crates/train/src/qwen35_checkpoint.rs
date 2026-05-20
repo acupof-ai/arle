@@ -170,11 +170,10 @@ fn write_generation_config(
                     ))
                 })?;
                 let text = config.get("text_config").unwrap_or(&config);
-                let bos_token_id = text
-                    .get("bos_token_id")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|value| u32::try_from(value).ok());
-                let eos_token_id = read_token_id(text, "eos_token_id", fallback_config_path)?;
+                let bos_token_id =
+                    read_optional_token_id(text, &config, "bos_token_id", fallback_config_path)?;
+                let eos_token_id =
+                    read_token_id(text, &config, "eos_token_id", fallback_config_path)?;
                 write_generation_config_json(target_path, bos_token_id, eos_token_id)?;
             }
         }
@@ -255,25 +254,42 @@ fn synth_token_for_id(id: usize, cfg: &Qwen35Config, unk_id: usize) -> String {
 }
 
 fn read_token_id(
-    config: &serde_json::Value,
+    text_config: &serde_json::Value,
+    root_config: &serde_json::Value,
     key: &str,
     fallback_config_path: &Path,
 ) -> Result<u32, Qwen35CheckpointError> {
-    let value = config
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            Qwen35CheckpointError::Custom(format!(
-                "source config {} is missing {key}",
-                fallback_config_path.display()
-            ))
-        })?;
-    u32::try_from(value).map_err(|_| {
+    read_optional_token_id(text_config, root_config, key, fallback_config_path)?.ok_or_else(|| {
         Qwen35CheckpointError::Custom(format!(
-            "source config {} has out-of-range {key}: {value}",
+            "source config {} is missing {key} in text_config or root object",
             fallback_config_path.display()
         ))
     })
+}
+
+fn read_optional_token_id(
+    text_config: &serde_json::Value,
+    root_config: &serde_json::Value,
+    key: &str,
+    fallback_config_path: &Path,
+) -> Result<Option<u32>, Qwen35CheckpointError> {
+    let Some(raw) = text_config.get(key).or_else(|| root_config.get(key)) else {
+        return Ok(None);
+    };
+    let value = raw.as_u64().ok_or_else(|| {
+        Qwen35CheckpointError::Custom(format!(
+            "source config {} has non-integer {key}: {raw}",
+            fallback_config_path.display()
+        ))
+    })?;
+    u32::try_from(value)
+        .map_err(|_| {
+            Qwen35CheckpointError::Custom(format!(
+                "source config {} has out-of-range {key}: {value}",
+                fallback_config_path.display()
+            ))
+        })
+        .map(Some)
 }
 
 fn layer_type_name(layer_type: &LayerType) -> &'static str {
@@ -406,5 +422,48 @@ mod tests {
             !tmp.path().join("latest").exists(),
             "failed weight save must not publish latest"
         );
+    }
+
+    #[test]
+    fn copy_or_synthesize_generation_config_reads_root_token_ids() {
+        let tmp = tempdir().expect("tempdir");
+        let source_config = tmp.path().join("source_config.json");
+        let missing_generation_config = tmp.path().join("missing_generation_config.json");
+        fs::write(
+            &source_config,
+            serde_json::to_string_pretty(&json!({
+                "eos_token_id": 9,
+                "bos_token_id": 2,
+                "text_config": {
+                    "hidden_size": 16
+                }
+            }))
+            .expect("serialize source config"),
+        )
+        .expect("write source config");
+
+        let step_dir = save_step_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 5,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::CopyFrom(&source_config),
+                generation_config: GenerationConfigSource::CopyOrSynthesize {
+                    source_path: &missing_generation_config,
+                    fallback_config_path: &source_config,
+                },
+            },
+            |weights_path| {
+                fs::write(weights_path, b"weights").expect("write weights");
+                Ok(())
+            },
+        )
+        .expect("save checkpoint");
+
+        let generation_value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(step_dir.join("generation_config.json")).unwrap(),
+        )
+        .expect("parse generation config");
+        assert_eq!(generation_value["eos_token_id"], json!([9, 2]));
     }
 }
