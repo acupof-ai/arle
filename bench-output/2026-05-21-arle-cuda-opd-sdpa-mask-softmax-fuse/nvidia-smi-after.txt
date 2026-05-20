@@ -1,0 +1,2 @@
+timestamp, name, memory.used [MiB], memory.free [MiB], utilization.gpu [%]
+2026/05/21 03:45:39.101, NVIDIA GeForce RTX 4070 Ti SUPER, 955 MiB, 14989 MiB, 0 %
