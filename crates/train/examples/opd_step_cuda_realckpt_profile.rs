@@ -14,16 +14,16 @@ mod app {
     };
 
     use autograd::{
+        BackwardProfile, Tape, TensorId, TensorStore,
         backend_cuda::CudaBackend,
         optim::{AdamW, Optimizer},
         tensor::Dirty,
-        BackwardProfile, Tape, TensorId, TensorStore,
     };
     use train::{
         grad_clip::clip_grad_norm,
         loss::kl_distill_loss,
         opd::{OpdStepConfig, OpdStepOutcome},
-        qwen35::Qwen35Model,
+        qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::{cleanup_after_backward, retained_param_and_grad_ids},
     };
@@ -228,15 +228,35 @@ mod app {
         })?;
 
         let mut rollout = prompt_ids.to_vec();
-        for _ in 0..cfg.rollout_len {
-            let positions = timed(&mut totals, "rollout_positions", || {
-                Ok((0..rollout.len() as u32).collect::<Vec<_>>())
-            })?;
+        let mut rollout_cache = Qwen35KvCache::new(student);
+        for step in 0..cfg.rollout_len {
+            let (input_ids, positions, logits_seq_len) =
+                timed(&mut totals, "rollout_positions", || {
+                    if step == 0 {
+                        Ok((
+                            rollout.clone(),
+                            (0..rollout.len() as u32).collect::<Vec<_>>(),
+                            1,
+                        ))
+                    } else {
+                        let Some(&last) = rollout.last() else {
+                            return Err("rollout cache cannot decode from an empty rollout".into());
+                        };
+                        Ok((vec![last], vec![(rollout.len() - 1) as u32], 1))
+                    }
+                })?;
             let logits = timed(&mut totals, "rollout_student_forward", || {
-                Ok(student.forward(store, tape, &rollout, &positions)?)
+                Ok(forward_rollout_cached(
+                    student,
+                    store,
+                    tape,
+                    &input_ids,
+                    &positions,
+                    &mut rollout_cache,
+                )?)
             })?;
             let next = timed(&mut totals, "rollout_argmax_readback", || {
-                greedy_next_token(logits, rollout.len(), vocab, store)
+                greedy_next_token(logits, logits_seq_len, vocab, store)
             })?;
             rollout.push(next);
         }
@@ -319,10 +339,29 @@ mod app {
         tape.set_enabled(false);
 
         let mut rollout = prompt_ids.to_vec();
-        for _ in 0..cfg.rollout_len {
-            let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
-            let logits = student.forward(store, tape, &rollout, &positions)?;
-            let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
+        let mut rollout_cache = Qwen35KvCache::new(student);
+        for step in 0..cfg.rollout_len {
+            let (input_ids, positions, logits_seq_len) = if step == 0 {
+                (
+                    rollout.clone(),
+                    (0..rollout.len() as u32).collect::<Vec<_>>(),
+                    1,
+                )
+            } else {
+                let Some(&last) = rollout.last() else {
+                    return Err("rollout cache cannot decode from an empty rollout".into());
+                };
+                (vec![last], vec![(rollout.len() - 1) as u32], 1)
+            };
+            let logits = forward_rollout_cached(
+                student,
+                store,
+                tape,
+                &input_ids,
+                &positions,
+                &mut rollout_cache,
+            )?;
+            let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
             rollout.push(next);
         }
 

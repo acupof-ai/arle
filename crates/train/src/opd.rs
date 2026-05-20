@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use crate::{
     grad_clip::clip_grad_norm,
     loss::kl_distill_loss,
-    qwen35::{Qwen35Error, Qwen35Model},
+    qwen35::{Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached},
     trainer::{cleanup_after_backward, retained_param_and_grad_ids},
 };
 
@@ -366,12 +366,35 @@ pub fn opd_step<O: Optimizer>(
         tape.entries.clear();
         tape.set_enabled(false);
         let mut rollout: Vec<u32> = prompt_ids.to_vec();
-        for _ in 0..cfg.rollout_len {
-            let positions: Vec<u32> = (0..rollout.len() as u32).collect();
-            let logits = student
-                .forward(store, tape, &rollout, &positions)
-                .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
-            let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
+        let mut rollout_cache = Qwen35KvCache::new(student);
+        for step in 0..cfg.rollout_len {
+            let (input_ids, positions, logits_seq_len) = if step == 0 {
+                (
+                    rollout.clone(),
+                    (0..rollout.len() as u32).collect::<Vec<_>>(),
+                    1,
+                )
+            } else {
+                let last = *rollout.last().ok_or_else(|| {
+                    OpdError::InvalidInput(
+                        "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
+                         non-empty prompt before calling opd_step."
+                            .to_owned(),
+                    )
+                })?;
+                let position = (rollout.len() - 1) as u32;
+                (vec![last], vec![position], 1)
+            };
+            let logits = forward_rollout_cached(
+                student,
+                store,
+                tape,
+                &input_ids,
+                &positions,
+                &mut rollout_cache,
+            )
+            .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
+            let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
             rollout.push(next);
         }
 

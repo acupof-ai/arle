@@ -6,8 +6,9 @@ use std::{
 use autograd::{
     AutogradError, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        LinearAttentionParams, add, causal_sdpa, embedding, linear_attention_core, matmul_bt, mul,
-        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        LinearAttentionParams, add, causal_sdpa, causal_sdpa_with_q_start, embedding,
+        linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
 };
 use qwen35_spec::Qwen35AttentionTensorNames;
@@ -82,6 +83,39 @@ struct Qwen35Layer {
     mlp: Qwen35Mlp,
 }
 
+#[derive(Debug, Clone, Default)]
+struct Qwen35LayerKvCache {
+    k: Option<TensorId>,
+    v: Option<TensorId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen35KvCache {
+    layers: Vec<Qwen35LayerKvCache>,
+    seq_len: usize,
+}
+
+impl Qwen35KvCache {
+    pub fn new(model: &Qwen35Model) -> Self {
+        Self {
+            layers: vec![Qwen35LayerKvCache::default(); model.layers.len()],
+            seq_len: 0,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn forward_rollout_cached(
+    model: &Qwen35Model,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    input_ids: &[u32],
+    position_ids: &[u32],
+    cache: &mut Qwen35KvCache,
+) -> Result<TensorId> {
+    model.forward_rollout_cached(store, tape, input_ids, position_ids, cache)
+}
+
 impl Qwen35Layer {
     fn forward(
         &self,
@@ -114,6 +148,70 @@ impl Qwen35Layer {
             }
             Qwen35Attention::Linear(attn) => {
                 self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
+            }
+        };
+        let x = add(x, attn_out, store, tape)?;
+
+        let h = rmsnorm(
+            x,
+            self.post_attention_layernorm,
+            cfg.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        let gate = self.mlp.gate_proj.forward(h, store, tape)?;
+        let up = self.mlp.up_proj.forward(h, store, tape)?;
+        let gate = silu(gate, store, tape)?;
+        let act = mul(gate, up, store, tape)?;
+        let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
+        Ok(add(x, mlp_out, store, tape)?)
+    }
+
+    fn forward_with_kv_cache(
+        &self,
+        x: TensorId,
+        cfg: &Qwen35Config,
+        cos: TensorId,
+        sin: TensorId,
+        layer_cache: &mut Qwen35LayerKvCache,
+        q_start: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let x_shape = store
+            .get(x)
+            .ok_or(AutogradError::InvalidTensorId(x))?
+            .shape
+            .clone();
+        if x_shape.len() != 3 {
+            return Err(AutogradError::InvalidRank {
+                expected: "rank-3 hidden states [batch, seq, hidden]",
+                got: x_shape.len(),
+            }
+            .into());
+        }
+        let batch = x_shape[0];
+        let seq_len = x_shape[1];
+
+        let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let attn_out = match &self.self_attn {
+            Qwen35Attention::Full(attn) => self.forward_full_attention_with_kv_cache(
+                h,
+                attn,
+                cfg,
+                cos,
+                sin,
+                batch,
+                seq_len,
+                layer_cache,
+                q_start,
+                store,
+                tape,
+            )?,
+            Qwen35Attention::Linear(_) => {
+                return Err(Qwen35Error::InvalidConfig(
+                    "rollout KV cache requires full-attention layers",
+                ));
             }
         };
         let x = add(x, attn_out, store, tape)?;
@@ -219,6 +317,111 @@ impl Qwen35Layer {
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
         let attn_hidden = causal_sdpa(q, k, v, store, tape)?;
+        let attn_hidden = if let Some(gate) = gate {
+            let gate = sigmoid(gate, store, tape)?;
+            mul(attn_hidden, gate, store, tape)?
+        } else {
+            attn_hidden
+        };
+        let attn_hidden = merge_heads(
+            attn_hidden,
+            batch,
+            seq_len,
+            cfg.num_attention_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        Ok(attn.o_proj.forward(attn_hidden, store, tape)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_full_attention_with_kv_cache(
+        &self,
+        h: TensorId,
+        attn: &Qwen35FullAttention,
+        cfg: &Qwen35Config,
+        cos: TensorId,
+        sin: TensorId,
+        batch: usize,
+        seq_len: usize,
+        layer_cache: &mut Qwen35LayerKvCache,
+        q_start: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let q_full = attn.q_proj.forward(h, store, tape)?;
+        let (q, gate) = if cfg.full_attn_gated {
+            let q_full = reshape(
+                q_full,
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            let q = slice(
+                q_full,
+                &[0, 0, 0, 0],
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            let gate = slice(
+                q_full,
+                &[0, 0, 0, cfg.head_dim],
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            (
+                transpose(q, 1, 2, store, tape)?,
+                Some(transpose(gate, 1, 2, store, tape)?),
+            )
+        } else {
+            let q = reshape(
+                q_full,
+                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            (transpose(q, 1, 2, store, tape)?, None)
+        };
+
+        let k = attn.k_proj.forward(h, store, tape)?;
+        let v = attn.v_proj.forward(h, store, tape)?;
+        let k = split_heads(
+            k,
+            batch,
+            seq_len,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let v = split_heads(
+            v,
+            batch,
+            seq_len,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+
+        let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+        let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+        let q = rope(q, cos, sin, store, tape)?;
+        let k = rope(k, cos, sin, store, tape)?;
+
+        let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let k = repeat_kv(k, kv_repeat, store, tape)?;
+        let v = repeat_kv(v, kv_repeat, store, tape)?;
+
+        let k_all = append_cached_kv(layer_cache.k, k, store)?;
+        let v_all = append_cached_kv(layer_cache.v, v, store)?;
+        layer_cache.k = Some(k_all);
+        layer_cache.v = Some(v_all);
+
+        let attn_hidden = causal_sdpa_with_q_start(q, k_all, v_all, q_start, store, tape)?;
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?
@@ -784,6 +987,28 @@ impl Qwen35Model {
         self.forward_batch_indices(store, tape, &token_indices, &positions, batch)
     }
 
+    fn forward_rollout_cached(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+        cache: &mut Qwen35KvCache,
+    ) -> Result<TensorId> {
+        if input_ids.len() != position_ids.len() {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: input_ids.len(),
+                expected_len: position_ids.len(),
+            });
+        }
+        let token_indices = input_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let positions = position_ids
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        self.forward_batch_indices_with_kv_cache(store, tape, &token_indices, &positions, cache)
+    }
+
     fn forward_batch_indices(
         &self,
         store: &mut TensorStore,
@@ -819,6 +1044,91 @@ impl Qwen35Model {
             store,
             tape,
         )?;
+        linear_forward(hidden, self.lm_head, store, tape)
+    }
+
+    fn forward_batch_indices_with_kv_cache(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        cache: &mut Qwen35KvCache,
+    ) -> Result<TensorId> {
+        let seq_len = positions.len();
+        if token_indices.len() != seq_len {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: token_indices.len(),
+                expected_len: seq_len,
+            });
+        }
+        if cache.layers.len() != self.layers.len() {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache layer count does not match model",
+            ));
+        }
+        if seq_len == 0 {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache requires at least one token",
+            ));
+        }
+        for (offset, &position) in positions.iter().enumerate() {
+            if position != cache.seq_len + offset {
+                return Err(Qwen35Error::InvalidConfig(
+                    "rollout KV cache requires contiguous positions starting at cache length",
+                ));
+            }
+        }
+        let max_seq_len = self
+            .config
+            .rope_cache_len_hint
+            .ok_or(Qwen35Error::InvalidConfig(
+                "train-side qwen3.5 requires rope_cache_len_hint",
+            ))?;
+        if cache.seq_len + seq_len > max_seq_len {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache sequence length exceeds configured rope cache length",
+            ));
+        }
+
+        let q_start = cache.seq_len;
+        let cos = select_cache_rows(self.cos_cache, positions, store)?;
+        let sin = select_cache_rows(self.sin_cache, positions, store)?;
+
+        let mut hidden = embedding(self.embed_tokens, token_indices, store, tape)?;
+        hidden = reshape(hidden, &[1, seq_len, self.config.hidden_size], store, tape)?;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let layer_cache = &mut cache.layers[layer_index];
+            hidden = layer.forward_with_kv_cache(
+                hidden,
+                &self.config,
+                cos,
+                sin,
+                layer_cache,
+                q_start,
+                store,
+                tape,
+            )?;
+        }
+        cache.seq_len += seq_len;
+        let hidden = rmsnorm(
+            hidden,
+            self.final_norm,
+            self.config.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        let hidden = if seq_len == 1 {
+            hidden
+        } else {
+            slice(
+                hidden,
+                &[0, seq_len - 1, 0],
+                &[1, seq_len, self.config.hidden_size],
+                store,
+                tape,
+            )?
+        };
         linear_forward(hidden, self.lm_head, store, tape)
     }
 
@@ -1061,6 +1371,47 @@ fn copy_frozen_tensor(source_id: TensorId, target_id: TensorId, store: &mut Tens
     store.tensors[target_id] = Some(replacement);
 }
 
+fn append_cached_kv(
+    cached: Option<TensorId>,
+    next: TensorId,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    let Some(cached) = cached else {
+        return Ok(next);
+    };
+
+    let cached_shape = store
+        .get(cached)
+        .ok_or(AutogradError::InvalidTensorId(cached))?
+        .shape
+        .clone();
+    let next_shape = store
+        .get(next)
+        .ok_or(AutogradError::InvalidTensorId(next))?
+        .shape
+        .clone();
+
+    store.ensure_device(cached)?;
+    store.ensure_device(next)?;
+    let cached_handle = store
+        .get(cached)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "append_cached_kv: cached tensor missing device handle",
+        ))?;
+    let next_handle = store
+        .get(next)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "append_cached_kv: next tensor missing device handle",
+        ))?;
+    let (out_handle, out_shape) =
+        store
+            .backend()
+            .concat_axis2(&cached_handle, &cached_shape, &next_handle, &next_shape)?;
+    Ok(store.alloc_device_tensor(out_shape, out_handle)?)
+}
+
 fn split_heads(
     x: TensorId,
     batch: usize,
@@ -1210,4 +1561,121 @@ fn next_uniform(state: &mut u64) -> f32 {
 
 fn leak_name(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use autograd::{Tape, TensorId, TensorStore};
+
+    use super::{LayerType, Qwen35Config, Qwen35KvCache, Qwen35Model};
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+    fn tiny_qwen35_config(max_seq_len: usize) -> Qwen35Config {
+        Qwen35Config {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_hidden_layers: 2,
+            vocab_size: 16,
+            rms_norm_eps: 1.0e-6,
+            stop_token_ids: vec![15],
+            bos_token_id: Some(1),
+            eos_token_id: 15,
+            tie_word_embeddings: false,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 8,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 8,
+            linear_num_value_heads: 2,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 8,
+            rope_cache_len_hint: Some(max_seq_len),
+            layer_types: vec![LayerType::FullAttention; 2],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+            full_attn_gated: true,
+        }
+    }
+
+    fn logits_host(store: &mut TensorStore, logits: TensorId) -> TestResult<Vec<f32>> {
+        Ok(store.to_host(logits)?)
+    }
+
+    fn greedy_next(host: &[f32], seq_len: usize, vocab: usize) -> u32 {
+        let row = &host[(seq_len - 1) * vocab..seq_len * vocab];
+        row.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(idx, _)| idx as u32)
+            .expect("non-empty vocab")
+    }
+
+    #[test]
+    fn qwen35_rollout_kv_cache_matches_full_forward_tokens() -> TestResult {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+
+        let cfg = tiny_qwen35_config(16);
+        let model = Qwen35Model::new_for_eval(&cfg, &mut store)?;
+        let vocab = cfg.vocab_size;
+        let mut cache = Qwen35KvCache::new(&model);
+        let mut rollout = vec![1_u32, 3, 8];
+
+        for step in 0..5 {
+            let full_positions = (0..rollout.len() as u32).collect::<Vec<_>>();
+            let full_logits = model.forward(&mut store, &mut tape, &rollout, &full_positions)?;
+            let full_host = logits_host(&mut store, full_logits)?;
+            let full_next = greedy_next(&full_host, rollout.len(), vocab);
+
+            let (cached_input, cached_positions, cached_seq_len) = if step == 0 {
+                (rollout.clone(), full_positions, 1)
+            } else {
+                let last = *rollout.last().expect("rollout stays non-empty");
+                (vec![last], vec![(rollout.len() - 1) as u32], 1)
+            };
+            let cached_logits = model.forward_rollout_cached(
+                &mut store,
+                &mut tape,
+                &cached_input,
+                &cached_positions,
+                &mut cache,
+            )?;
+            let cached_host = logits_host(&mut store, cached_logits)?;
+            let cached_next = greedy_next(&cached_host, cached_seq_len, vocab);
+
+            let full_row = &full_host[(rollout.len() - 1) * vocab..rollout.len() * vocab];
+            let cached_row = &cached_host[(cached_seq_len - 1) * vocab..cached_seq_len * vocab];
+            let max_abs = full_row
+                .iter()
+                .zip(cached_row.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs <= 1.0e-5,
+                "cached rollout logits must match full-forward last row at step {step}; max_abs={max_abs}"
+            );
+            assert_eq!(
+                cached_next, full_next,
+                "cached rollout token diverged at step {step}"
+            );
+
+            rollout.push(full_next);
+        }
+
+        assert_eq!(cache.seq_len, rollout.len() - 1);
+        Ok(())
+    }
 }

@@ -925,6 +925,24 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&data, &new_shape)
     }
 
+    /// Concatenate two rank-4 `[batch, heads, seq, dim]` tensors along the
+    /// sequence axis. Default: readback → host reference → upload. CUDA
+    /// overrides this for OPD rollout KV-cache appends so cached K/V stay
+    /// device-resident during greedy decode.
+    fn concat_axis2(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let a_host = self.readback(a)?;
+        let b_host = self.readback(b)?;
+        let (data, out_shape) = cpu_concat_axis2(&a_host, a_shape, &b_host, b_shape)?;
+        let handle = self.upload(&data, &out_shape)?;
+        Ok((handle, out_shape))
+    }
+
     /// Device-handle backward for a contiguous slice. Returns a full
     /// `old_shape` gradient with upstream values scattered into the sliced
     /// window and zeros elsewhere.
@@ -2803,6 +2821,73 @@ pub fn cpu_slice(
         *slot = data[input_index];
     }
     Ok((out, new_shape))
+}
+
+/// CPU reference for KV-cache append: concatenate two rank-4 contiguous
+/// tensors shaped `[batch, heads, seq, dim]` along axis 2.
+pub fn cpu_concat_axis2(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>)> {
+    if a_shape.len() != 4 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "4",
+            got: a_shape.len(),
+        });
+    }
+    if b_shape.len() != 4 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "4",
+            got: b_shape.len(),
+        });
+    }
+    if a_shape[0] != b_shape[0] || a_shape[1] != b_shape[1] || a_shape[3] != b_shape[3] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![a_shape[0], a_shape[1], a_shape[3]],
+            got: vec![b_shape[0], b_shape[1], b_shape[3]],
+        });
+    }
+    let a_size = shape_size(a_shape);
+    if a.len() != a_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: a_size,
+        });
+    }
+    let b_size = shape_size(b_shape);
+    if b.len() != b_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+
+    let batch = a_shape[0];
+    let heads = a_shape[1];
+    let a_seq = a_shape[2];
+    let b_seq = b_shape[2];
+    let dim = a_shape[3];
+    let out_shape = vec![batch, heads, a_seq + b_seq, dim];
+    let mut out = vec![0.0_f32; shape_size(&out_shape)];
+
+    for batch_idx in 0..batch {
+        for head_idx in 0..heads {
+            let out_base = ((batch_idx * heads + head_idx) * (a_seq + b_seq)) * dim;
+            let a_base = ((batch_idx * heads + head_idx) * a_seq) * dim;
+            let b_base = ((batch_idx * heads + head_idx) * b_seq) * dim;
+            let a_len = a_seq * dim;
+            let b_len = b_seq * dim;
+            out[out_base..out_base + a_len].copy_from_slice(&a[a_base..a_base + a_len]);
+            out[out_base + a_len..out_base + a_len + b_len]
+                .copy_from_slice(&b[b_base..b_base + b_len]);
+        }
+    }
+
+    Ok((out, out_shape))
 }
 
 fn validate_slice_shape(
