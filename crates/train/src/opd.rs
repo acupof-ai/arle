@@ -99,6 +99,43 @@ fn greedy_next_token(
     Ok(best_idx as u32)
 }
 
+fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> Result<()> {
+    if student_params.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "OPD step requires at least one student parameter id. Hint: pass \
+             student.all_parameter_ids() from the trainable student model; an empty \
+             parameter list makes the optimizer step a no-op."
+                .to_owned(),
+        ));
+    }
+
+    let mut trainable = 0usize;
+    for (index, &param_id) in student_params.iter().enumerate() {
+        let tensor = store.get(param_id).ok_or_else(|| {
+            OpdError::InvalidInput(format!(
+                "OPD student_params[{index}]={param_id} does not exist in the TensorStore. \
+                 Hint: pass parameter ids from the same student Qwen35Model and TensorStore \
+                 used for this opd_step call."
+            ))
+        })?;
+        if tensor.requires_grad {
+            trainable += 1;
+        }
+    }
+
+    if trainable == 0 {
+        return Err(OpdError::InvalidInput(
+            "OPD student_params contains no trainable tensors (requires_grad=true). \
+             Hint: build the student with Qwen35Model::new for scratch training or \
+             Qwen35Model::new_with_lora for LoRA; frozen teacher/eval parameter ids \
+             make the OPD optimizer step a no-op."
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Run one OPD step:
 /// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
@@ -152,9 +189,10 @@ pub fn opd_step<O: Optimizer>(
             "OPD prompt token id {token_id} at prompt_ids[{index}] is outside \
              student.config().vocab_size={vocab}. Hint: verify the tokenizer and \
              student model directory match before running OPD. See \
-             docs/projects/2026-05-18-opd-only-pivot.md."
+            docs/projects/2026-05-18-opd-only-pivot.md."
         )));
     }
+    validate_student_params(student_params, store)?;
     let teacher_params = teacher.all_parameter_ids();
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
 
@@ -215,7 +253,7 @@ pub fn opd_step<O: Optimizer>(
 mod tests {
     use autograd::{Tensor, TensorStore};
 
-    use super::{OpdError, greedy_next_token};
+    use super::{OpdError, greedy_next_token, validate_student_params};
 
     #[test]
     fn greedy_next_token_rejects_logits_len_mismatch() {
@@ -232,5 +270,48 @@ mod tests {
         assert!(message.contains("logits length mismatch"));
         assert!(message.contains("expected exactly"));
         assert!(message.contains("1 * 4"));
+    }
+
+    #[test]
+    fn validate_student_params_rejects_empty_list() {
+        let store = TensorStore::default();
+        let err = validate_student_params(&[], &store)
+            .expect_err("empty student parameter list must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("at least one student parameter id"));
+        assert!(message.contains("optimizer step a no-op"));
+    }
+
+    #[test]
+    fn validate_student_params_rejects_missing_tensor_id() {
+        let store = TensorStore::default();
+        let err = validate_student_params(&[17], &store)
+            .expect_err("missing TensorStore id must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("student_params[0]=17"));
+        assert!(message.contains("same student Qwen35Model"));
+    }
+
+    #[test]
+    fn validate_student_params_rejects_frozen_only_params() {
+        let mut store = TensorStore::default();
+        let frozen =
+            store.alloc(Tensor::new(vec![0.0; 4], vec![2, 2], false).expect("frozen tensor"));
+
+        let err = validate_student_params(&[frozen], &store)
+            .expect_err("frozen-only parameter list must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("no trainable tensors"));
+        assert!(message.contains("requires_grad=true"));
+        assert!(message.contains("optimizer step a no-op"));
     }
 }
