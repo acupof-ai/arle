@@ -104,6 +104,17 @@ pub fn causal_sdpa(
     attention::causal_sdpa(q, k, v, store, tape)
 }
 
+pub fn causal_sdpa_with_q_start(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    attention::causal_sdpa_with_q_start(q, k, v, q_start, store, tape)
+}
+
 pub fn add_broadcast(
     a: TensorId,
     b: TensorId,

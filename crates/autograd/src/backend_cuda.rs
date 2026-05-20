@@ -1232,6 +1232,24 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn concat_axis2(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, a_shape, b, b_shape);
+            todo!("GPU required: cuda concat_axis2 is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_concat_axis2_device(self, a, a_shape, b, b_shape)
+        }
+    }
+
     fn slice_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -3870,6 +3888,91 @@ fn cuda_slice_device(
         },
     )?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_concat_axis2_device(
+    backend: &CudaBackend,
+    a: &DeviceHandle,
+    a_shape: &[usize],
+    b: &DeviceHandle,
+    b_shape: &[usize],
+) -> Result<(DeviceHandle, Vec<usize>)> {
+    if a_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: a_shape.len(),
+        });
+    }
+    if b_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: b_shape.len(),
+        });
+    }
+    if a_shape[0] != b_shape[0] || a_shape[1] != b_shape[1] || a_shape[3] != b_shape[3] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![a_shape[0], a_shape[1], a_shape[3]],
+            got: vec![b_shape[0], b_shape[1], b_shape[3]],
+        });
+    }
+    let a_total = shape_size(a_shape);
+    let b_total = shape_size(b_shape);
+    let d_a = backend.cuda_slice(a, "concat_axis2")?;
+    let d_b = backend.cuda_slice(b, "concat_axis2")?;
+    if d_a.len() != a_total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_a.len(),
+            shape: a_shape.to_vec(),
+            size: a_total,
+        });
+    }
+    if d_b.len() != b_total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_b.len(),
+            shape: b_shape.to_vec(),
+            size: b_total,
+        });
+    }
+
+    let out_shape = vec![a_shape[0], a_shape[1], a_shape[2] + b_shape[2], a_shape[3]];
+    let total = shape_size(&out_shape);
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (concat_axis2)"))?;
+    let batch_i = i32::try_from(a_shape[0])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 batch exceeds i32"))?;
+    let heads_i = i32::try_from(a_shape[1])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 heads exceeds i32"))?;
+    let a_seq_i = i32::try_from(a_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 a_seq exceeds i32"))?;
+    let b_seq_i = i32::try_from(b_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 b_seq exceeds i32"))?;
+    let dim_i = i32::try_from(a_shape[3])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 dim exceeds i32"))?;
+    let total_i = i32::try_from(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 total exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("concat_axis2_f32")?,
+        total,
+        |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_a)
+                .arg(d_b)
+                .arg(&batch_i)
+                .arg(&heads_i)
+                .arg(&a_seq_i)
+                .arg(&b_seq_i)
+                .arg(&dim_i)
+                .arg(&total_i);
+            builder
+        },
+    )?;
+    Ok((DeviceHandle::Cuda(CudaStorage::new(d_out)), out_shape))
 }
 
 #[cfg(not(feature = "no-cuda"))]

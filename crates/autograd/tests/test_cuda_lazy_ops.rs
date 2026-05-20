@@ -22,9 +22,9 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
 use autograd::backend::{
-    cpu_embedding_forward, cpu_gather_last_dim_backward, cpu_gather_last_dim_forward,
-    cpu_log_softmax_backward, cpu_log_softmax_forward_last_axis, cpu_matmul_backward,
-    cpu_matmul_bt_backward, cpu_matmul_bt_forward, cpu_rms_norm_forward,
+    cpu_concat_axis2, cpu_embedding_forward, cpu_gather_last_dim_backward,
+    cpu_gather_last_dim_forward, cpu_log_softmax_backward, cpu_log_softmax_forward_last_axis,
+    cpu_matmul_backward, cpu_matmul_bt_backward, cpu_matmul_bt_forward, cpu_rms_norm_forward,
     cpu_scatter_add_rows_forward, cpu_slice, cpu_softmax_backward, cpu_softmax_forward_last_axis,
     cpu_transpose_swap,
 };
@@ -623,6 +623,38 @@ fn cuda_layout_device_lazy_matches_cpu() {
          (|diff|={abs_s}, dev={}, host={}, excess_ratio={excess_s})",
         dev_slice[idx_s],
         host_slice[idx_s]
+    );
+}
+
+#[test]
+fn cuda_concat_axis2_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_concat_axis2_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let a_shape: Vec<usize> = vec![2, 3, 4, 5];
+    let b_shape: Vec<usize> = vec![2, 3, 2, 5];
+    let a = rng_vec(0xC0CA_0001, a_shape.iter().product(), 1.0);
+    let b = rng_vec(0xC0CA_0002, b_shape.iter().product(), 1.0);
+    let (host, out_shape) = cpu_concat_axis2(&a, &a_shape, &b, &b_shape).expect("cpu concat_axis2");
+
+    let a_h = backend.upload(&a, &a_shape).expect("upload a");
+    let b_h = backend.upload(&b, &b_shape).expect("upload b");
+    let (out_h, dev_shape) = backend
+        .concat_axis2(&a_h, &a_shape, &b_h, &b_shape)
+        .expect("cuda concat_axis2");
+    assert_eq!(dev_shape, out_shape);
+    backend.eval(&[&out_h]).expect("cuda eval concat_axis2");
+    let dev = backend.readback(&out_h).expect("concat_axis2 readback");
+
+    let (excess, abs, idx) = max_err(&dev, &host);
+    assert!(
+        excess <= 1.0,
+        "concat_axis2 exceeds atol=1e-6 + rtol=1e-4 at idx {idx} \
+         (|diff|={abs}, dev={}, host={}, excess_ratio={excess})",
+        dev[idx],
+        host[idx]
     );
 }
 

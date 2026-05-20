@@ -60,6 +60,38 @@ extern "C" __global__ void slice_f32(
     out[idx] = x[old_offset];
 }
 
+extern "C" __global__ void concat_axis2_f32(
+    float* __restrict__ out,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    int batch,
+    int heads,
+    int a_seq,
+    int b_seq,
+    int dim,
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int out_seq = a_seq + b_seq;
+    int dim_idx = idx % dim;
+    int tmp = idx / dim;
+    int seq_idx = tmp % out_seq;
+    tmp /= out_seq;
+    int head_idx = tmp % heads;
+    int batch_idx = tmp / heads;
+
+    if (seq_idx < a_seq) {
+        int a_idx = (((batch_idx * heads + head_idx) * a_seq + seq_idx) * dim) + dim_idx;
+        out[idx] = a[a_idx];
+    } else {
+        int b_seq_idx = seq_idx - a_seq;
+        int b_idx = (((batch_idx * heads + head_idx) * b_seq + b_seq_idx) * dim) + dim_idx;
+        out[idx] = b[b_idx];
+    }
+}
+
 extern "C" __global__ void slice_backward_f32(
     float* __restrict__ grad,
     const float* __restrict__ upstream,

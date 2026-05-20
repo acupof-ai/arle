@@ -80,6 +80,46 @@ pub fn causal_sdpa(
     reshape(context, &[batch, heads, seq_len, head_dim], store, tape)
 }
 
+pub fn causal_sdpa_with_q_start(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
+    let q_shape = store.tensor(q)?.shape.clone();
+    let k_shape = store.tensor(k)?.shape.clone();
+    let v_shape = store.tensor(v)?.shape.clone();
+    validate_cached_attention_shapes(&q_shape, &k_shape, &v_shape, q_start)?;
+
+    let batch = q_shape[0];
+    let heads = q_shape[1];
+    let q_len = q_shape[2];
+    let kv_len = k_shape[2];
+    let head_dim = q_shape[3];
+    if q_start == 0 && q_len == kv_len {
+        return causal_sdpa(q, k, v, store, tape);
+    }
+
+    let merged_heads = batch * heads;
+    let q_3d = reshape(q, &[merged_heads, q_len, head_dim], store, tape)?;
+    let k_3d = reshape(k, &[merged_heads, kv_len, head_dim], store, tape)?;
+    let v_3d = reshape(v, &[merged_heads, kv_len, head_dim], store, tape)?;
+    let k_t = transpose(k_3d, 1, 2, store, tape)?;
+    let scores = matmul(q_3d, k_t, store, tape)?;
+    let scaled = mul_scalar(scores, 1.0 / (head_dim as f32).sqrt(), store, tape)?;
+    let masked = if q_len == 1 && q_start + 1 == kv_len {
+        scaled
+    } else {
+        let mask = causal_mask_window(q_len, kv_len, q_start, store)?;
+        add_broadcast(scaled, mask, store, tape)?
+    };
+    let probs = softmax(masked, store, tape)?;
+    let context = matmul(probs, v_3d, store, tape)?;
+    reshape(context, &[batch, heads, q_len, head_dim], store, tape)
+}
+
 fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
     let mut data = vec![0.0; seq_len * seq_len];
     for row in 0..seq_len {
@@ -88,6 +128,22 @@ fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
         }
     }
     Ok(store.alloc(Tensor::new(data, vec![1, seq_len, seq_len], false)?))
+}
+
+fn causal_mask_window(
+    q_len: usize,
+    kv_len: usize,
+    q_start: usize,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    let mut data = vec![0.0; q_len * kv_len];
+    for row in 0..q_len {
+        let max_visible = q_start + row;
+        for col in (max_visible + 1)..kv_len {
+            data[(row * kv_len) + col] = f32::NEG_INFINITY;
+        }
+    }
+    Ok(store.alloc(Tensor::new(data, vec![1, q_len, kv_len], false)?))
 }
 
 fn validate_attention_shapes(
@@ -126,6 +182,55 @@ fn validate_attention_shapes(
         return Err(AutogradError::ShapeMismatch {
             expected: q_shape.to_vec(),
             got: k_shape.to_vec(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_cached_attention_shapes(
+    q_shape: &[usize],
+    k_shape: &[usize],
+    v_shape: &[usize],
+    q_start: usize,
+) -> Result<()> {
+    for shape in [q_shape, k_shape, v_shape] {
+        if shape.len() != 4 {
+            return Err(AutogradError::InvalidRank {
+                expected: "4",
+                got: shape.len(),
+            });
+        }
+    }
+
+    if q_shape[0] != k_shape[0] || q_shape[0] != v_shape[0] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: q_shape.to_vec(),
+            got: k_shape.to_vec(),
+        });
+    }
+    if q_shape[1] != k_shape[1] || q_shape[1] != v_shape[1] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: q_shape.to_vec(),
+            got: k_shape.to_vec(),
+        });
+    }
+    if q_shape[3] != k_shape[3] || q_shape[3] != v_shape[3] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: q_shape.to_vec(),
+            got: k_shape.to_vec(),
+        });
+    }
+    if k_shape[2] != v_shape[2] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: k_shape.to_vec(),
+            got: v_shape.to_vec(),
+        });
+    }
+    if q_start + q_shape[2] > k_shape[2] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![q_start + q_shape[2]],
+            got: vec![k_shape[2]],
         });
     }
 

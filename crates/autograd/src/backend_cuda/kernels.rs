@@ -75,6 +75,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "add_broadcast_f32",
     "transpose_axes_swap_f32",
     "slice_f32",
+    "concat_axis2_f32",
     "slice_backward_f32",
     "adamw_step_f32",
     "log_softmax_last_axis_backward_f32",
