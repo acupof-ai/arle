@@ -411,12 +411,24 @@ fn train_name_to_hf(train_name: &str, schema: HfSchema) -> String {
 
 /// LM head fallback list. Vanilla Qwen3 ships `lm_head.weight` (not under
 /// `model.`). When `tie_word_embeddings` is true the embedding row is reused
-/// and the LM head tensor may be absent — the caller deduplicates this case
-/// by checking `cfg.tie_word_embeddings` *before* attempting to load.
+/// and the LM head tensor may be absent; the train-side tied case maps to
+/// `embed_tokens.weight`, so only explicit untied `*.lm_head.weight` names
+/// should route through these fallback candidates.
 fn hf_lm_head_candidates(schema: HfSchema) -> &'static [&'static str] {
     match schema {
         HfSchema::Qwen35 => &["lm_head.weight", "model.language_model.lm_head.weight"],
         HfSchema::Qwen3 => &["lm_head.weight", "model.lm_head.weight"],
+    }
+}
+
+fn hf_candidates_for_train_name(train_name: &str, schema: HfSchema) -> Vec<String> {
+    if train_name.ends_with("lm_head.weight") {
+        hf_lm_head_candidates(schema)
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    } else {
+        vec![train_name_to_hf(train_name, schema)]
     }
 }
 
@@ -450,10 +462,11 @@ fn dtype_to_f32(view: &TensorView<'_>, name: &str) -> Result<Vec<f32>> {
 /// the data read from the safetensors shards in `dir`.
 ///
 /// Returns the constructed model. On any name/shape mismatch the function
-/// returns a [`LoaderError`] without mutating anything that survives the
-/// returned `Err` — caller is responsible for not reusing the `store` if
-/// the error indicates partial writes (we error before the first
-/// successful tensor overwrite, so this is currently always safe).
+/// returns a [`LoaderError`] before committing any checkpoint tensor
+/// overwrites. Directory/config/shard-discovery failures leave `store`
+/// untouched; tensor-level failures can leave the scratch eval model
+/// allocation in `store`, so callers should discard the store after any
+/// returned `Err`.
 pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
     if !dir.is_dir() {
         return Err(LoaderError::Custom(format!(
@@ -496,7 +509,42 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
     let model = Qwen35Model::new_for_eval(&cfg, store)?;
     let param_map = model.param_name_map();
 
-    // 4) Materialize each train parameter from the safetensors.
+    // 4) Preflight every tensor before writing any checkpoint data into the
+    //    store. This keeps missing/mismatched later tensors from leaving
+    //    partially materialized checkpoint weights behind.
+    let load_plan = plan_tensor_loads(
+        &param_map,
+        &cfg,
+        schema,
+        &hf_name_to_shard,
+        &safetensors_views,
+        store,
+    )?;
+
+    // 5) Materialize each train parameter from the safetensors.
+    for planned in &load_plan {
+        load_planned_tensor_into_slot(planned, &safetensors_views, store)?;
+    }
+
+    Ok(model)
+}
+
+struct PlannedTensorLoad {
+    hf_name: String,
+    train_name: String,
+    id: TensorId,
+    expected_shape: Vec<usize>,
+    shard_idx: usize,
+}
+
+fn plan_tensor_loads(
+    param_map: &HashMap<&'static str, TensorId>,
+    cfg: &Qwen35Config,
+    schema: HfSchema,
+    hf_name_to_shard: &HashMap<String, usize>,
+    safetensors_views: &[SafeTensors<'_>],
+    store: &TensorStore,
+) -> Result<Vec<PlannedTensorLoad>> {
     //
     // The `param_name_map()` contract returns the same `TensorId` for the
     // embedding row twice (once under the embed_tokens name, once under
@@ -504,37 +552,27 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
     // us from writing the same slot twice and lets us report a clean
     // "missing lm_head" error only when the model genuinely needs a separate
     // head tensor.
-    let mut written: std::collections::HashSet<TensorId> = std::collections::HashSet::new();
-    for (&train_name, &id) in &param_map {
-        if !written.insert(id) {
+    let mut planned_ids: std::collections::HashSet<TensorId> = std::collections::HashSet::new();
+    let mut plan = Vec::new();
+    for (&train_name, &id) in param_map {
+        if planned_ids.contains(&id) {
             // Already filled (tied lm_head case).
             continue;
         }
-        let candidates: Vec<String> =
-            if train_name.ends_with("lm_head.weight") || train_name == cfg.lm_head_tensor_name() {
-                // The tied case is handled by the dedup above; if we reach here
-                // for a name that *isn't* also the embed_tokens id, fall back to
-                // the lm_head candidate list.
-                hf_lm_head_candidates(schema)
-                    .iter()
-                    .map(|s| (*s).to_owned())
-                    .collect()
-            } else {
-                vec![train_name_to_hf(train_name, schema)]
-            };
+        let candidates = hf_candidates_for_train_name(train_name, schema);
         let mut last_err: Option<LoaderError> = None;
-        let mut wrote = false;
+        let mut planned = None;
         for candidate in &candidates {
-            match load_tensor_into_slot(
+            match plan_tensor_load(
                 candidate,
                 train_name,
                 id,
-                &hf_name_to_shard,
-                &safetensors_views,
+                hf_name_to_shard,
+                safetensors_views,
                 store,
             ) {
-                Ok(()) => {
-                    wrote = true;
+                Ok(tensor_load) => {
+                    planned = Some(tensor_load);
                     break;
                 }
                 Err(LoaderError::MissingTensor(_)) => continue,
@@ -544,12 +582,16 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
                 }
             }
         }
-        if !wrote {
+        if let Some(tensor_load) = planned {
+            planned_ids.insert(id);
+            plan.push(tensor_load);
+            continue;
+        } else {
             // Tied-embedding fallback: if this slot is the lm_head and the
-            // tied embedding slot was already written, we're done.
-            if (train_name.ends_with("lm_head.weight") || train_name == cfg.lm_head_tensor_name())
-                && cfg.tie_word_embeddings
-            {
+            // tied embedding slot was already planned, we're done. If this
+            // lm_head name appears before embed_tokens in the HashMap order,
+            // leave the id unplanned so the embedding name can still load it.
+            if train_name.ends_with("lm_head.weight") && cfg.tie_word_embeddings {
                 continue;
             }
             return Err(last_err.unwrap_or_else(|| {
@@ -558,17 +600,17 @@ pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qw
         }
     }
 
-    Ok(model)
+    Ok(plan)
 }
 
-fn load_tensor_into_slot(
+fn plan_tensor_load(
     hf_name: &str,
     train_name: &str,
     id: TensorId,
     hf_name_to_shard: &HashMap<String, usize>,
     safetensors_views: &[SafeTensors<'_>],
-    store: &mut TensorStore,
-) -> Result<()> {
+    store: &TensorStore,
+) -> Result<PlannedTensorLoad> {
     let shard_idx = match hf_name_to_shard.get(hf_name) {
         Some(idx) => *idx,
         None => return Err(LoaderError::MissingTensor(hf_name.to_owned())),
@@ -577,7 +619,7 @@ fn load_tensor_into_slot(
         .tensor(hf_name)
         .map_err(|err| LoaderError::Safetensors(format!("{hf_name}: {err}")))?;
     let got_shape: Vec<usize> = view.shape().to_vec();
-    let data = dtype_to_f32(&view, hf_name)?;
+    validate_supported_dtype(&view, hf_name)?;
 
     let expected_shape = store
         .get(id)
@@ -593,8 +635,40 @@ fn load_tensor_into_slot(
         });
     }
 
-    let tensor = Tensor::new(data, expected_shape, false)?;
-    store.tensors[id] = Some(tensor);
+    Ok(PlannedTensorLoad {
+        hf_name: hf_name.to_owned(),
+        train_name: train_name.to_owned(),
+        id,
+        expected_shape,
+        shard_idx,
+    })
+}
+
+fn validate_supported_dtype(view: &TensorView<'_>, name: &str) -> Result<()> {
+    match view.dtype() {
+        Dtype::F32 | Dtype::BF16 | Dtype::F16 => Ok(()),
+        other => Err(LoaderError::UnsupportedDtype(other, name.to_owned())),
+    }
+}
+
+fn load_planned_tensor_into_slot(
+    planned: &PlannedTensorLoad,
+    safetensors_views: &[SafeTensors<'_>],
+    store: &mut TensorStore,
+) -> Result<()> {
+    let view = safetensors_views[planned.shard_idx]
+        .tensor(&planned.hf_name)
+        .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", planned.hf_name)))?;
+    let data = dtype_to_f32(&view, &planned.hf_name)?;
+
+    let tensor = Tensor::new(data, planned.expected_shape.clone(), false).map_err(|err| {
+        LoaderError::Custom(format!(
+            "failed to materialize {} from {}: {err}. Hint: verify the safetensors \
+             data length matches the validated checkpoint shape.",
+            planned.train_name, planned.hf_name
+        ))
+    })?;
+    store.tensors[planned.id] = Some(tensor);
     Ok(())
 }
 
@@ -627,6 +701,10 @@ fn q_proj_gate_hint(train_name: &str, expected: &[usize], got: &[usize]) -> Stri
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
+    use safetensors::{Dtype, serialize_to_file};
+
     use super::*;
 
     /// Canonical Qwen3-0.6B `config.json` (HF flat layout). Used to verify
@@ -737,6 +815,66 @@ mod tests {
         }
     }"#;
 
+    const TINY_QWEN35_CONFIG_JSON: &str = r#"{
+        "architectures": ["Qwen3_5_NextForCausalLM"],
+        "eos_token_id": 7,
+        "text_config": {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 8,
+            "rms_norm_eps": 1e-6,
+            "layer_types": ["full_attention"],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 4,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_value_head_dim": 4,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 1.0
+            },
+            "max_position_embeddings": 8,
+            "tie_word_embeddings": true
+        }
+    }"#;
+
+    struct TestTensorView {
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+
+    impl TestTensorView {
+        fn from_f32(shape: Vec<usize>, values: &[f32]) -> Self {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Self { shape, bytes }
+        }
+    }
+
+    impl safetensors::View for TestTensorView {
+        fn dtype(&self) -> Dtype {
+            Dtype::F32
+        }
+
+        fn shape(&self) -> &[usize] {
+            &self.shape
+        }
+
+        fn data(&self) -> Cow<'_, [u8]> {
+            Cow::Borrowed(self.bytes.as_slice())
+        }
+
+        fn data_len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
     #[test]
     fn parses_qwen35_nested_text_config() {
         let (cfg, schema) = Qwen35HfConfig::from_json_str(QWEN35_NESTED_CONFIG_JSON).unwrap();
@@ -778,6 +916,24 @@ mod tests {
                 HfSchema::Qwen35
             ),
             "model.language_model.layers.0.self_attn.q_proj.weight"
+        );
+    }
+
+    #[test]
+    fn tied_embedding_uses_embed_tokens_candidate_not_lm_head_fallback() {
+        let (hf, schema) = Qwen35HfConfig::from_json_str(TINY_QWEN35_CONFIG_JSON).unwrap();
+        let cfg = hf.to_qwen35_config().expect("convert");
+        assert!(cfg.tie_word_embeddings);
+
+        let candidates = hf_candidates_for_train_name(cfg.embed_tokens_tensor_name(), schema);
+
+        assert_eq!(
+            candidates,
+            vec!["model.language_model.embed_tokens.weight".to_string()]
+        );
+        assert!(
+            !candidates.iter().any(|name| name.contains("lm_head")),
+            "tied embedding must load the embedding tensor, not lm_head fallback candidates"
         );
     }
 
@@ -860,6 +1016,48 @@ mod tests {
         assert!(
             store.tensors.is_empty(),
             "missing-shard failure must not allocate model tensors"
+        );
+    }
+
+    #[test]
+    fn load_missing_tensor_preflights_before_checkpoint_weight_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), TINY_QWEN35_CONFIG_JSON)
+            .expect("write config");
+        let sentinel = 42.0_f32;
+        let embed_values = [sentinel; 8 * 4];
+        let embed = TestTensorView::from_f32(vec![8, 4], &embed_values);
+        serialize_to_file(
+            vec![(
+                "model.language_model.embed_tokens.weight".to_string(),
+                embed,
+            )],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .expect("write partial safetensors");
+
+        let mut store = TensorStore::default();
+        let err = match load_qwen35_from_hf_dir(dir.path(), &mut store) {
+            Ok(_) => panic!("partial checkpoint should fail on missing tensors"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(message.contains("missing tensor"));
+        assert!(
+            !store.tensors.is_empty(),
+            "tensor-level failure happens after eval model allocation"
+        );
+        let wrote_sentinel = store
+            .tensors
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .flat_map(|tensor| tensor.data.iter())
+            .any(|value| value.to_bits() == sentinel.to_bits());
+        assert!(
+            !wrote_sentinel,
+            "checkpoint tensor data must not be written before the whole load plan validates"
         );
     }
 }
