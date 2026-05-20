@@ -1,0 +1,10 @@
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running tests/test_qwen35_loader.rs (target/release/deps/test_qwen35_loader-5c17565d8929c241)
+
+running 1 test
+loader_smoke_qwen3_0_6b: loading /home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B
+loader_smoke_qwen3_0_6b: loaded ok, param_count = 312
+loader_smoke_qwen3_0_6b: last-row logits[..5] = [9.381229, 9.646318, 11.967355, 8.095458, 11.202717], all_finite = true
+test loader_smoke_qwen3_0_6b ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.77s
