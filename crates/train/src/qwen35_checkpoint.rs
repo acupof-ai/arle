@@ -64,24 +64,32 @@ where
     };
     let step_basename = format!("step_{:06}", spec.step);
     let step_dir = spec.out_dir.join(&step_basename);
+    let created_step_dir = !step_dir.exists();
     fs::create_dir_all(&step_dir)?;
 
-    write_config_json(step_dir.join("config.json"), spec.config_json)?;
-    let tokenizer_out = step_dir.join("tokenizer.json");
-    if let Some(tokenizer_path) = spec.tokenizer_path {
-        fs::copy(tokenizer_path, &tokenizer_out)?;
-    } else if let Some(cfg) = synth_tokenizer_cfg {
-        write_synth_tokenizer(&tokenizer_out, cfg)?;
-    }
-    write_generation_config(
-        step_dir.join("generation_config.json"),
-        spec.generation_config,
-    )?;
+    let result = (|| {
+        write_config_json(step_dir.join("config.json"), spec.config_json)?;
+        let tokenizer_out = step_dir.join("tokenizer.json");
+        if let Some(tokenizer_path) = spec.tokenizer_path {
+            fs::copy(tokenizer_path, &tokenizer_out)?;
+        } else if let Some(cfg) = synth_tokenizer_cfg {
+            write_synth_tokenizer(&tokenizer_out, cfg)?;
+        }
+        write_generation_config(
+            step_dir.join("generation_config.json"),
+            spec.generation_config,
+        )?;
 
-    let weights_path = step_dir.join("model.safetensors");
-    save_weights(&weights_path)?;
-    publish_latest_after_weights(spec.out_dir, &step_basename)?;
-    Ok(step_dir)
+        let weights_path = step_dir.join("model.safetensors");
+        save_weights(&weights_path)?;
+        publish_latest_after_weights(spec.out_dir, &step_basename)?;
+        Ok(step_dir.clone())
+    })();
+
+    if result.is_err() && created_step_dir {
+        let _ = fs::remove_dir_all(&step_dir);
+    }
+    result
 }
 
 fn write_config_json(
@@ -364,5 +372,39 @@ mod tests {
         let tokenizer =
             Tokenizer::from_file(step_dir.join("tokenizer.json")).expect("load tokenizer");
         assert_eq!(tokenizer.get_vocab_size(false), cfg.vocab_size);
+    }
+
+    #[test]
+    fn save_step_checkpoint_cleans_new_step_dir_when_weight_write_fails() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = dense_qwen35_config();
+
+        let err = save_step_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir: tmp.path(),
+                step: 4,
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            |_weights_path| Err(Qwen35CheckpointError::Custom("weight write failed".into())),
+        )
+        .expect_err("failing weight writer should fail checkpoint save");
+
+        assert!(err.to_string().contains("weight write failed"));
+        assert!(
+            !tmp.path().join("step_000004").exists(),
+            "failed weight save must remove the newly-created partial step dir"
+        );
+        assert!(
+            !tmp.path().join("latest").exists(),
+            "failed weight save must not publish latest"
+        );
     }
 }
