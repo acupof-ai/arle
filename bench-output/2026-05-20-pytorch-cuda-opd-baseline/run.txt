@@ -1,0 +1,7 @@
+env torch=2.11.0+cu130 torch_cuda=13.0 device=NVIDIA GeForce RTX 4070 Ti SUPER total_bytes=16717840384 free_bytes=15491465216
+config hidden=512 intermediate=1536 layers=12 vocab=32768 heads=8 kv_heads=4 head_dim=64 prompt=[1, 3, 8] rollout_len=2 lr=0.001 warmup_runs=1 measured_runs=3 steps_per_run=10
+warmup=1 wall_seconds=0.943978 per_step_seconds=0.094398 first_loss=0.000314202 last_loss=0.000315392 peak_memory_bytes=1833048064
+run=1 wall_seconds=0.805836 per_step_seconds=0.080584 steps_per_sec=12.409469 first_loss=0.000314202 last_loss=0.000315392 peak_memory_bytes=1829115904
+run=2 wall_seconds=0.854057 per_step_seconds=0.085406 steps_per_sec=11.708815 first_loss=0.000314202 last_loss=0.000315392 peak_memory_bytes=1829115904
+run=3 wall_seconds=0.835476 per_step_seconds=0.083548 steps_per_sec=11.969222 first_loss=0.000314202 last_loss=0.000315392 peak_memory_bytes=1829115904
+summary mean_step_seconds=0.083179 median_step_seconds=0.083548 sigma_pct=2.387 ratio_vs_arle_0p83=0.1002 speedup_vs_arle_0p83=9.9785
