@@ -16,8 +16,9 @@ pub fn cross_entropy_loss(
 }
 
 /// Forward KL divergence `KL(teacher || student)` used as the OPD distill
-/// objective. Teacher logits must carry `requires_grad = false`; the
-/// returned loss only backpropagates through `student_logits`.
+/// objective. Student logits must carry `requires_grad = true`; teacher
+/// logits must carry `requires_grad = false`; the returned loss only
+/// backpropagates through `student_logits`.
 ///
 /// Implementation note: `KL(t || s) = sum_v t_p * (log t_p - log s_p)
 ///                                   = -H(t) - sum_v t_p * log s_p`.
@@ -63,6 +64,13 @@ fn validate_kl_distill_inputs(
     let teacher = store
         .get(teacher_logits)
         .ok_or(AutogradError::InvalidTensorId(teacher_logits))?;
+    if !student.requires_grad {
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss: student_logits must have requires_grad=true. \
+             Hint: pass logits from the trainable OPD student forward; a \
+             frozen student loss would not produce gradients.",
+        ));
+    }
     if teacher.requires_grad {
         return Err(AutogradError::TapeInvariant(
             "kl_distill_loss: teacher_logits must have requires_grad=false. \

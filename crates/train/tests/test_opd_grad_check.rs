@@ -9,9 +9,8 @@ fn kl_loss_value(student_logits: &[f32], teacher_logits: &[f32], shape: &[usize]
     let mut tape = Tape::new();
     tape.set_enabled(false);
 
-    let student = store.alloc(
-        Tensor::new(student_logits.to_vec(), shape.to_vec(), false).expect("student logits"),
-    );
+    let student = store
+        .alloc(Tensor::new(student_logits.to_vec(), shape.to_vec(), true).expect("student logits"));
     let teacher = store.alloc(
         Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
     );
@@ -167,6 +166,26 @@ fn kl_distill_loss_rejects_teacher_logits_requiring_grad() {
     assert!(message.contains("teacher_logits"));
     assert!(message.contains("requires_grad=false"));
     assert!(message.contains("teacher"));
+}
+
+#[test]
+fn kl_distill_loss_rejects_student_logits_without_grad() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student =
+        store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], false).expect("student logits"));
+    let teacher =
+        store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], false).expect("teacher logits"));
+
+    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
+        .expect_err("frozen student logits must fail before producing a no-grad loss");
+
+    let AutogradError::TapeInvariant(message) = err else {
+        panic!("expected TapeInvariant, got {err:?}");
+    };
+    assert!(message.contains("student_logits"));
+    assert!(message.contains("requires_grad=true"));
+    assert!(message.contains("frozen student loss"));
 }
 
 #[test]
