@@ -8,8 +8,11 @@ pub type TensorId = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dirty {
+    /// Host data is authoritative; there is no usable device mirror.
     Host,
+    /// Device data is authoritative; host `data` must be empty.
     Device,
+    /// Host and device mirrors are both current.
     Both,
 }
 
@@ -47,13 +50,21 @@ impl Clone for Tensor {
         // host-only fallback paths inside those ops already
         // `ensure_host(x)` before they touch `.data`.
         Self {
-            data: self.data.clone(),
+            data: if self.dirty == Dirty::Device {
+                Vec::new()
+            } else {
+                self.data.clone()
+            },
             shape: self.shape.clone(),
             strides: self.strides.clone(),
             size: self.size,
             requires_grad: self.requires_grad,
             grad: self.grad,
-            device_handle: self.device_handle.clone(),
+            device_handle: if self.dirty == Dirty::Host {
+                None
+            } else {
+                self.device_handle.clone()
+            },
             dirty: self.dirty.clone(),
         }
     }
@@ -165,6 +176,7 @@ impl TensorStore {
         }
 
         let tensor = self.tensors.get_mut(id).and_then(Option::as_mut)?;
+        tensor.device_handle = None;
         tensor.dirty = Dirty::Host;
         Some(tensor)
     }
@@ -233,20 +245,19 @@ impl TensorStore {
     }
 
     pub fn ensure_device(&mut self, id: TensorId) -> Result<()> {
-        let (dirty, has_handle, data, shape) = {
+        let (dirty, has_handle) = {
             let tensor = self.tensor(id)?;
-            (
-                tensor.dirty.clone(),
-                tensor.device_handle.is_some(),
-                tensor.data.clone(),
-                tensor.shape.clone(),
-            )
+            (tensor.dirty.clone(), tensor.device_handle.is_some())
         };
 
         if has_handle && dirty != Dirty::Host {
             return Ok(());
         }
 
+        let (data, shape) = {
+            let tensor = self.tensor(id)?;
+            (tensor.data.clone(), tensor.shape.clone())
+        };
         let handle = self.backend().upload(&data, &shape)?;
         let tensor = self.raw_tensor_mut(id)?;
         tensor.device_handle = Some(handle);
@@ -519,5 +530,50 @@ mod tests {
             store.to_host(id).expect("host copy"),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         );
+    }
+
+    #[test]
+    fn mutable_host_access_drops_device_mirror() {
+        let mut store = TensorStore::default();
+        let id = store
+            .from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .expect("alloc tensor");
+        store.ensure_device(id).expect("upload tensor");
+
+        let tensor = store.get(id).expect("tensor exists");
+        assert_eq!(tensor.dirty, Dirty::Both);
+        assert!(tensor.device_handle.is_some());
+
+        let tensor = store.get_mut(id).expect("mutable tensor");
+        tensor.data[0] = 9.0;
+
+        let tensor = store.get(id).expect("tensor exists");
+        assert_eq!(tensor.dirty, Dirty::Host);
+        assert!(tensor.device_handle.is_none());
+        assert_eq!(tensor.data[0], 9.0);
+    }
+
+    #[test]
+    fn clone_tensor_preserves_device_only_empty_host_invariant() {
+        let mut store = TensorStore::default();
+        let id = store
+            .from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .expect("alloc tensor");
+        store.ensure_device(id).expect("upload tensor");
+        let handle = store
+            .tensor(id)
+            .expect("tensor exists")
+            .device_handle
+            .clone()
+            .expect("device handle");
+        store
+            .replace_device_handle(id, handle)
+            .expect("mark device authoritative");
+
+        let cloned_id = store.clone_tensor(id).expect("clone tensor");
+        let cloned = store.get(cloned_id).expect("cloned tensor exists");
+        assert_eq!(cloned.dirty, Dirty::Device);
+        assert!(cloned.data.is_empty());
+        assert!(cloned.device_handle.is_some());
     }
 }
