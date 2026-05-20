@@ -78,9 +78,9 @@ fn greedy_next_token(
              Hint: check the prompt length and Qwen35Config::vocab_size before calling opd_step."
         ))
     })?;
-    if host.len() < expected_len {
+    if host.len() != expected_len {
         return Err(OpdError::InvalidInput(format!(
-            "OPD rollout logits are too short: logits_len={}, expected at least \
+            "OPD rollout logits length mismatch: logits_len={}, expected exactly \
              seq_len * vocab = {expected_len} ({seq_len} * {vocab}). Hint: check \
              Qwen35Model::forward output shape and Qwen35Config::vocab_size.",
             host.len()
@@ -209,4 +209,28 @@ pub fn opd_step<O: Optimizer>(
         loss: loss_value,
         rollout_len: rollout.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use autograd::{Tensor, TensorStore};
+
+    use super::{OpdError, greedy_next_token};
+
+    #[test]
+    fn greedy_next_token_rejects_logits_len_mismatch() {
+        let mut store = TensorStore::default();
+        let logits =
+            store.alloc(Tensor::new(vec![0.0; 8], vec![1, 2, 4], false).expect("logits tensor"));
+
+        let err = greedy_next_token(logits, 1, 4, &mut store)
+            .expect_err("extra logits rows must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("logits length mismatch"));
+        assert!(message.contains("expected exactly"));
+        assert!(message.contains("1 * 4"));
+    }
 }
