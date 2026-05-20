@@ -13,16 +13,16 @@ mod app {
         time::Instant,
     };
 
-    use autograd::{backend_cuda::CudaBackend, optim::AdamW, Tape, TensorId, TensorStore};
+    use autograd::{Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
     use train::{
-        opd::{opd_step, OpdStepConfig},
-        qwen35::{forward_rollout_cached, Qwen35KvCache, Qwen35Model},
+        opd::{OpdStepConfig, opd_step},
+        qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::extend_keep_with_params_and_grads,
     };
 
     const DEFAULT_MODEL_DIR: &str = "/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B";
-    const TRAIN_STEPS: usize = 500;
+    const DEFAULT_TRAIN_STEPS: usize = 500;
     const ROLLOUT_LEN: usize = 8;
     const DECODE_LEN: usize = 16;
     const DEFAULT_LEARNING_RATE: f32 = 5.0e-5;
@@ -89,8 +89,9 @@ mod app {
 
     pub fn main() -> AnyResult<()> {
         let model_dir = resolve_model_dir()?;
-        let learning_rate = resolve_learning_rate()?;
-        print_config(&model_dir, learning_rate);
+        let (learning_rate, train_steps) = resolve_training_args()?;
+        let eval_steps = eval_steps_for(train_steps);
+        print_config(&model_dir, learning_rate, train_steps);
 
         let cuda_backend = Arc::new(CudaBackend::new(0)?);
         let mut store = TensorStore::with_backend(cuda_backend.clone());
@@ -150,10 +151,10 @@ mod app {
             &mut tape,
         )?);
 
-        let mut step_losses = Vec::with_capacity(TRAIN_STEPS);
-        let mut step_seconds = Vec::with_capacity(TRAIN_STEPS);
+        let mut step_losses = Vec::with_capacity(train_steps);
+        let mut step_seconds = Vec::with_capacity(train_steps);
         let total_started = Instant::now();
-        for step in 1..=TRAIN_STEPS {
+        for step in 1..=train_steps {
             let prompt_index = (step - 1) % TRAIN_PROMPTS.len();
             let prompt = TRAIN_PROMPTS[prompt_index];
             let step_started = Instant::now();
@@ -179,13 +180,13 @@ mod app {
             }
             step_losses.push(outcome.loss as f64);
             step_seconds.push(elapsed);
-            if step == 1 || step % 10 == 0 || EVAL_STEPS.contains(&step) {
+            if step == 1 || step % 10 == 0 || eval_steps.contains(&step) {
                 println!(
                     "train_step step={step} prompt_index={prompt_index} prompt={prompt:?} loss={:.12e} rollout_len={} step_seconds={elapsed:.6}",
                     outcome.loss, outcome.rollout_len
                 );
             }
-            if EVAL_STEPS.contains(&step) {
+            if eval_steps.contains(&step) {
                 eval_summaries.push(evaluate_snapshot(
                     step,
                     &teacher,
@@ -217,8 +218,9 @@ mod app {
         Ok(path)
     }
 
-    fn resolve_learning_rate() -> AnyResult<f32> {
+    fn resolve_training_args() -> AnyResult<(f32, usize)> {
         let mut learning_rate = DEFAULT_LEARNING_RATE;
+        let mut train_steps = DEFAULT_TRAIN_STEPS;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -228,21 +230,27 @@ mod app {
                     };
                     learning_rate = parse_positive_f32("--lr", &raw)?;
                 }
+                "--steps" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--steps requires a positive usize value".into());
+                    };
+                    train_steps = parse_positive_usize("--steps", &raw)?;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE]"
+                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE]"
                     );
                     std::process::exit(0);
                 }
                 unknown => {
                     return Err(format!(
-                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE"
+                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE"
                     )
                     .into());
                 }
             }
         }
-        Ok(learning_rate)
+        Ok((learning_rate, train_steps))
     }
 
     fn parse_positive_f32(name: &str, raw: &str) -> AnyResult<f32> {
@@ -256,9 +264,32 @@ mod app {
         }
     }
 
-    fn print_config(model_dir: &Path, learning_rate: f32) {
+    fn parse_positive_usize(name: &str, raw: &str) -> AnyResult<usize> {
+        let value = raw
+            .parse::<usize>()
+            .map_err(|err| format!("invalid {name} value `{raw}`: {err}"))?;
+        if value > 0 {
+            Ok(value)
+        } else {
+            Err(format!("{name} must be positive, got `{raw}`").into())
+        }
+    }
+
+    fn eval_steps_for(train_steps: usize) -> Vec<usize> {
+        let mut steps = EVAL_STEPS
+            .iter()
+            .copied()
+            .filter(|step| *step <= train_steps)
+            .collect::<Vec<_>>();
+        if !steps.contains(&train_steps) {
+            steps.push(train_steps);
+        }
+        steps
+    }
+
+    fn print_config(model_dir: &Path, learning_rate: f32, train_steps: usize) {
         println!(
-            "config backend=cuda model_dir={} train_steps={TRAIN_STEPS} rollout_len={ROLLOUT_LEN} decode_len={DECODE_LEN} lr={learning_rate:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS}",
+            "config backend=cuda model_dir={} train_steps={train_steps} rollout_len={ROLLOUT_LEN} decode_len={DECODE_LEN} lr={learning_rate:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS}",
             model_dir.display()
         );
         for (idx, prompt) in TRAIN_PROMPTS.iter().enumerate() {
@@ -587,24 +618,27 @@ mod app {
         let median_step_seconds = sorted_step_seconds[sorted_step_seconds.len() / 2];
         let mean_loss = mean(losses.iter().copied());
         let first_loss = losses.first().copied().unwrap_or(0.0);
-        let step_200_loss = losses.get(199).copied().unwrap_or(0.0);
+        let step_200_loss = losses.get(199).copied();
         let last_loss = losses.last().copied().unwrap_or(0.0);
-        let sampled_loss_reduction_200_pct = pct_reduction(first_loss, step_200_loss);
+        let sampled_loss_reduction_200_pct = step_200_loss
+            .map(|loss| pct_reduction(first_loss, loss))
+            .unwrap_or(f64::NAN);
         let sampled_loss_reduction_final_pct = pct_reduction(first_loss, last_loss);
         let eval_0 = eval_summaries.iter().find(|summary| summary.step == 0);
         let eval_200 = eval_summaries.iter().find(|summary| summary.step == 200);
-        let eval_500 = eval_summaries.iter().find(|summary| summary.step == 500);
+        let eval_final = eval_summaries.last();
         let train_kl_reduction_200_pct = match (eval_0, eval_200) {
             (Some(start), Some(end)) => pct_reduction(start.train_kl, end.train_kl),
-            _ => 0.0,
+            _ => f64::NAN,
         };
-        let train_kl_reduction_final_pct = match (eval_0, eval_500) {
+        let train_kl_reduction_final_pct = match (eval_0, eval_final) {
             (Some(start), Some(end)) => pct_reduction(start.train_kl, end.train_kl),
-            _ => 0.0,
+            _ => f64::NAN,
         };
         println!(
             "training_summary total_steps={} total_wall_seconds={total_seconds:.6} mean_step_seconds={mean_step_seconds:.6} median_step_seconds={median_step_seconds:.6} mean_sampled_loss={mean_loss:.12e} first_sampled_loss={first_loss:.12e} step200_sampled_loss={step_200_loss:.12e} final_sampled_loss={last_loss:.12e} sampled_loss_reduction_200_pct={sampled_loss_reduction_200_pct:.6} sampled_loss_reduction_final_pct={sampled_loss_reduction_final_pct:.6} train_kl_reduction_200_pct={train_kl_reduction_200_pct:.6} train_kl_reduction_final_pct={train_kl_reduction_final_pct:.6}",
-            losses.len()
+            losses.len(),
+            step_200_loss = step_200_loss.unwrap_or(f64::NAN)
         );
         for summary in eval_summaries {
             println!(

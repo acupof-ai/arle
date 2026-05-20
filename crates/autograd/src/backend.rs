@@ -116,6 +116,12 @@ pub enum DeviceHandle {
     Cuda(CudaStorage),
 }
 
+#[derive(Debug, Clone)]
+pub struct DeviceGradClipResult {
+    pub pre_clip_norm: f64,
+    pub clipped_grads: Option<Vec<DeviceHandle>>,
+}
+
 pub trait Backend: std::fmt::Debug + Send + Sync {
     fn device(&self) -> Device;
 
@@ -402,6 +408,20 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
                 value * value
             })
             .sum())
+    }
+
+    /// Device-resident global-norm gradient clip across many tensors.
+    ///
+    /// Default returns `None` so higher-level train code can fall back to the
+    /// portable per-tensor path. CUDA overrides with a batched pointer-array
+    /// reduction plus batched scale kernel.
+    fn clip_grad_norm_device(
+        &self,
+        grads: &[(DeviceHandle, Vec<usize>)],
+        max_norm: f32,
+    ) -> Result<Option<DeviceGradClipResult>> {
+        let _ = (grads, max_norm);
+        Ok(None)
     }
 
     /// Reduce-sum **all** elements of `x` into a rank-0 scalar device handle.

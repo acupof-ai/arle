@@ -18,7 +18,7 @@ use crate::{
 };
 use crate::{
     Result,
-    backend::{Backend, Device, DeviceHandle, matmul_bt_output_shape},
+    backend::{Backend, Device, DeviceGradClipResult, DeviceHandle, matmul_bt_output_shape},
 };
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/kernels.rs"]
@@ -31,7 +31,7 @@ use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::sys::cublasOperation_t;
 #[cfg(not(feature = "no-cuda"))]
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
 
@@ -489,6 +489,23 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_sum_squares(self, x, shape)
+        }
+    }
+
+    fn clip_grad_norm_device(
+        &self,
+        grads: &[(DeviceHandle, Vec<usize>)],
+        max_norm: f32,
+    ) -> Result<Option<DeviceGradClipResult>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (grads, max_norm);
+            todo!("GPU required: cuda clip_grad_norm_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_clip_grad_norm_device(self, grads, max_norm).map(Some)
         }
     }
 
@@ -3270,6 +3287,181 @@ fn cuda_sum_squares(backend: &CudaBackend, x: &DeviceHandle, shape: &[usize]) ->
         .synchronize()
         .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed (sum_squares)"))?;
     Ok(partial.into_iter().sum())
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_clip_grad_norm_device(
+    backend: &CudaBackend,
+    grads: &[(DeviceHandle, Vec<usize>)],
+    max_norm: f32,
+) -> Result<DeviceGradClipResult> {
+    if !(max_norm > 0.0 && max_norm.is_finite()) {
+        return Ok(DeviceGradClipResult {
+            pre_clip_norm: 0.0,
+            clipped_grads: None,
+        });
+    }
+    if grads.is_empty() {
+        return Ok(DeviceGradClipResult {
+            pre_clip_norm: 0.0,
+            clipped_grads: None,
+        });
+    }
+
+    const BLOCK: u32 = 256;
+    const ITEMS_PER_THREAD: usize = 8;
+    const CHUNK_ELEMS: usize = BLOCK as usize * ITEMS_PER_THREAD;
+
+    let mut grad_ptrs = Vec::with_capacity(grads.len());
+    let mut grad_sizes = Vec::with_capacity(grads.len());
+    let mut chunk_offsets = Vec::with_capacity(grads.len() + 1);
+    let mut input_guards = Vec::with_capacity(grads.len());
+    let mut total_chunks = 0usize;
+    chunk_offsets.push(0_i32);
+
+    for (handle, shape) in grads {
+        let size = shape_size(shape);
+        let d_grad = backend.cuda_slice(handle, "clip_grad_norm_device")?;
+        if d_grad.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_grad.len(),
+                shape: shape.clone(),
+                size,
+            });
+        }
+        let size_i32 = i32::try_from(size)
+            .map_err(|_| AutogradError::TapeInvariant("cuda grad_clip tensor size exceeds i32"))?;
+        let chunks = size.div_ceil(CHUNK_ELEMS);
+        total_chunks = total_chunks
+            .checked_add(chunks)
+            .ok_or(AutogradError::TapeInvariant(
+                "cuda grad_clip total chunk count overflow",
+            ))?;
+        let total_chunks_i32 = i32::try_from(total_chunks)
+            .map_err(|_| AutogradError::TapeInvariant("cuda grad_clip chunks exceed i32"))?;
+        let (ptr, guard) = d_grad.device_ptr(&backend.stream);
+        grad_ptrs.push(ptr);
+        input_guards.push(guard);
+        grad_sizes.push(size_i32);
+        chunk_offsets.push(total_chunks_i32);
+    }
+
+    if total_chunks == 0 {
+        return Ok(DeviceGradClipResult {
+            pre_clip_norm: 0.0,
+            clipped_grads: None,
+        });
+    }
+
+    let d_grad_ptrs = backend
+        .stream
+        .clone_htod(&grad_ptrs)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (grad_clip ptrs)"))?;
+    let d_grad_sizes = backend
+        .stream
+        .clone_htod(&grad_sizes)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (grad_clip sizes)"))?;
+    let d_chunk_offsets = backend
+        .stream
+        .clone_htod(&chunk_offsets)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (grad_clip offsets)"))?;
+    let mut d_partial = backend
+        .stream
+        .alloc_zeros::<f64>(total_chunks)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (grad_clip partial)"))?;
+    let num_grads_i32 = i32::try_from(grads.len())
+        .map_err(|_| AutogradError::TapeInvariant("cuda grad_clip grad count exceeds i32"))?;
+    let chunk_elems_i32 = i32::try_from(CHUNK_ELEMS)
+        .map_err(|_| AutogradError::TapeInvariant("cuda grad_clip chunk size exceeds i32"))?;
+
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("grad_clip_sumsq_f32")?,
+        total_chunks,
+        BLOCK,
+        BLOCK * std::mem::size_of::<f64>() as u32,
+        |mut builder| {
+            builder
+                .arg(&mut d_partial)
+                .arg(&d_grad_ptrs)
+                .arg(&d_grad_sizes)
+                .arg(&d_chunk_offsets)
+                .arg(&num_grads_i32)
+                .arg(&chunk_elems_i32);
+            builder
+        },
+    )?;
+
+    let mut partial = vec![0.0_f64; total_chunks];
+    backend
+        .stream
+        .memcpy_dtoh(&d_partial, &mut partial)
+        .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed (grad_clip partial)"))?;
+    backend
+        .stream
+        .synchronize()
+        .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed (grad_clip norm)"))?;
+    let total_sq_norm = partial.into_iter().sum::<f64>();
+    let pre_clip_norm = total_sq_norm.sqrt();
+    if pre_clip_norm <= f64::from(max_norm) || pre_clip_norm == 0.0 {
+        return Ok(DeviceGradClipResult {
+            pre_clip_norm,
+            clipped_grads: None,
+        });
+    }
+
+    let scale = (f64::from(max_norm) / pre_clip_norm) as f32;
+    let mut out_slices = Vec::with_capacity(grads.len());
+    for (_, shape) in grads {
+        let size = shape_size(shape);
+        out_slices.push(backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (grad_clip scaled)")
+        })?);
+    }
+
+    let mut out_ptrs = Vec::with_capacity(out_slices.len());
+    let mut out_guards = Vec::with_capacity(out_slices.len());
+    for out in &mut out_slices {
+        let (ptr, guard) = out.device_ptr_mut(&backend.stream);
+        out_ptrs.push(ptr);
+        out_guards.push(guard);
+    }
+    let mut d_out_ptrs = backend
+        .stream
+        .clone_htod(&out_ptrs)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (grad_clip out ptrs)"))?;
+
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("grad_clip_scale_f32")?,
+        total_chunks,
+        BLOCK,
+        0,
+        |mut builder| {
+            builder
+                .arg(&mut d_out_ptrs)
+                .arg(&d_grad_ptrs)
+                .arg(&d_grad_sizes)
+                .arg(&d_chunk_offsets)
+                .arg(&scale)
+                .arg(&num_grads_i32)
+                .arg(&chunk_elems_i32);
+            builder
+        },
+    )?;
+
+    drop(out_guards);
+    drop(input_guards);
+
+    Ok(DeviceGradClipResult {
+        pre_clip_norm,
+        clipped_grads: Some(
+            out_slices
+                .into_iter()
+                .map(|slice| DeviceHandle::Cuda(CudaStorage::new(slice)))
+                .collect(),
+        ),
+    })
 }
 
 #[cfg(not(feature = "no-cuda"))]
