@@ -6,7 +6,7 @@ use std::{
 use autograd::{
     AutogradError, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        LinearAttentionParams, add, causal_sdpa, embedding, linear_attention_core, matmul, mul,
+        LinearAttentionParams, add, causal_sdpa, embedding, linear_attention_core, matmul_bt, mul,
         repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
 };
@@ -1015,8 +1015,7 @@ fn linear_forward(
 
     let prefix_elems = x_shape.iter().product::<usize>() / input_dim;
     let flat_x = reshape(x, &[prefix_elems, input_dim], store, tape)?;
-    let weight_t = transpose(weight, 0, 1, store, tape)?;
-    let projected = matmul(flat_x, weight_t, store, tape)?;
+    let projected = matmul_bt(flat_x, weight, store, tape)?;
     let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
     output_shape.push(weight_shape[0]);
     Ok(reshape(projected, &output_shape, store, tape)?)

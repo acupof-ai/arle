@@ -3,8 +3,8 @@ mod helpers;
 use autograd::{
     Result, Tape, TensorStore,
     ops::{
-        add_broadcast, embedding, gather_last_dim, gelu, log_softmax, matmul, mean, mul, rmsnorm,
-        softmax, sum, transpose,
+        add_broadcast, embedding, gather_last_dim, gelu, log_softmax, matmul, matmul_bt, mean, mul,
+        rmsnorm, softmax, sum, transpose,
     },
 };
 use helpers::{max_abs_err, num_grad, random_vec};
@@ -114,6 +114,67 @@ fn matmul_grad_matches_numeric_for_2d_and_batched() -> Result<()> {
             let b = store.from_slice(x, &b_shape).expect("b");
             let coeff_id = store.from_slice(&coeff, &[2, 2, 2]).expect("coeff");
             let y = matmul(a, b, &mut store, &mut tape).expect("matmul");
+            let weighted = mul(y, coeff_id, &mut store, &mut tape).expect("mul");
+            let loss = sum(weighted, &mut store, &mut tape).expect("sum");
+            store.to_host(loss).expect("loss")[0]
+        },
+        &mut b_numeric,
+        1e-3,
+    );
+
+    assert!(max_abs_err(&analytic_a, &numeric_a) < 1e-3);
+    assert!(max_abs_err(&analytic_b, &numeric_b) < 1e-3);
+    Ok(())
+}
+
+#[test]
+fn matmul_bt_grad_matches_numeric() -> Result<()> {
+    let a_shape = [2, 3];
+    let b_shape = [4, 3];
+    let coeff = random_vec(8, 107);
+    let a_data = random_vec(6, 109);
+    let b_data = random_vec(12, 113);
+
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let a = store.from_slice(&a_data, &a_shape)?;
+    let b = store.from_slice(&b_data, &b_shape)?;
+    store.get_mut(a).expect("a exists").requires_grad = true;
+    store.get_mut(b).expect("b exists").requires_grad = true;
+    let coeff_id = store.from_slice(&coeff, &[2, 4])?;
+
+    let y = matmul_bt(a, b, &mut store, &mut tape)?;
+    let weighted = mul(y, coeff_id, &mut store, &mut tape)?;
+    let loss = sum(weighted, &mut store, &mut tape)?;
+    let grads = tape.backward(loss, &mut store)?;
+    let analytic_a = store.to_host(*grads.get(&a).expect("grad for a"))?;
+    let analytic_b = store.to_host(*grads.get(&b).expect("grad for b"))?;
+
+    let mut a_numeric = a_data.clone();
+    let numeric_a = num_grad(
+        |x| {
+            let mut store = TensorStore::default();
+            let mut tape = Tape::new();
+            let a = store.from_slice(x, &a_shape).expect("a");
+            let b = store.from_slice(&b_data, &b_shape).expect("b");
+            let coeff_id = store.from_slice(&coeff, &[2, 4]).expect("coeff");
+            let y = matmul_bt(a, b, &mut store, &mut tape).expect("matmul_bt");
+            let weighted = mul(y, coeff_id, &mut store, &mut tape).expect("mul");
+            let loss = sum(weighted, &mut store, &mut tape).expect("sum");
+            store.to_host(loss).expect("loss")[0]
+        },
+        &mut a_numeric,
+        1e-3,
+    );
+    let mut b_numeric = b_data.clone();
+    let numeric_b = num_grad(
+        |x| {
+            let mut store = TensorStore::default();
+            let mut tape = Tape::new();
+            let a = store.from_slice(&a_data, &a_shape).expect("a");
+            let b = store.from_slice(x, &b_shape).expect("b");
+            let coeff_id = store.from_slice(&coeff, &[2, 4]).expect("coeff");
+            let y = matmul_bt(a, b, &mut store, &mut tape).expect("matmul_bt");
             let weighted = mul(y, coeff_id, &mut store, &mut tape).expect("mul");
             let loss = sum(weighted, &mut store, &mut tape).expect("sum");
             store.to_host(loss).expect("loss")[0]

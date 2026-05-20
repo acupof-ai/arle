@@ -21,6 +21,10 @@ pub enum SavedContext {
         a: TensorId,
         b: TensorId,
     },
+    MatmulBTCtx {
+        a: TensorId,
+        b: TensorId,
+    },
     SoftmaxCtx {
         y: TensorId,
     },
@@ -102,6 +106,7 @@ pub enum BackwardOp {
     Exp,
     Sum,
     Matmul,
+    MatmulBT,
     Softmax,
     LogSoftmax,
     Gather,
@@ -241,6 +246,7 @@ impl Tape {
                     BackwardOp::Exp => ops::exp_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Sum => ops::sum_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Matmul => ops::matmul_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::MatmulBT => ops::matmul_bt_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Softmax => ops::softmax_backward(&entry, output_grad_id, store)?,
                     BackwardOp::LogSoftmax => {
                         ops::log_softmax_backward(&entry, output_grad_id, store)?

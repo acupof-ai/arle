@@ -8,9 +8,10 @@ use autograd::{
     backend::{
         Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gather_last_dim_forward,
         cpu_gelu_forward, cpu_log_softmax_forward_last_axis, cpu_matmul_backward,
-        cpu_matmul_forward, cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward,
-        cpu_neg_forward, cpu_rms_norm_forward, cpu_rope_forward, cpu_scatter_add_rows_forward,
-        cpu_silu_forward, cpu_softmax_forward_last_axis, cpu_sum_last_axis_forward,
+        cpu_matmul_bt_forward, cpu_matmul_forward, cpu_mean_last_axis_forward, cpu_mul_forward,
+        cpu_mul_scalar_forward, cpu_neg_forward, cpu_rms_norm_forward, cpu_rope_forward,
+        cpu_scatter_add_rows_forward, cpu_silu_forward, cpu_softmax_forward_last_axis,
+        cpu_sum_last_axis_forward,
     },
 };
 
@@ -138,6 +139,22 @@ fn cpu_matmul_forward_matches_slow_reference_m1_wide() {
     let (want, want_shape) = slow_matmul_reference(&a, &[1, 17], &b, &[17, 32_768]);
     assert_eq!(got_shape, want_shape);
     assert_close(&got, &want, 1e-6, "cpu matmul forward m1 wide");
+}
+
+#[test]
+fn cpu_matmul_bt_forward_matches_transpose_reference() {
+    let a = make_rows(&[3, 5], 707);
+    let b = make_rows(&[7, 5], 808);
+    let (got, got_shape) = cpu_matmul_bt_forward(&a, &[3, 5], &b, &[7, 5]).expect("cpu matmul_bt");
+    let mut b_t = vec![0.0f32; 5 * 7];
+    for row in 0..7 {
+        for col in 0..5 {
+            b_t[col * 7 + row] = b[row * 5 + col];
+        }
+    }
+    let (want, want_shape) = slow_matmul_reference(&a, &[3, 5], &b_t, &[5, 7]);
+    assert_eq!(got_shape, want_shape);
+    assert_close(&got, &want, 1e-6, "cpu matmul_bt forward");
 }
 
 fn run_lazy_matmul<B: Backend>(
