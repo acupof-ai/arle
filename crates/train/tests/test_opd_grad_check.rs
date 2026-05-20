@@ -131,6 +131,51 @@ fn kl_distill_loss_stays_finite_for_wide_range_teacher_logits() {
 }
 
 #[test]
+fn kl_distill_loss_wide_range_teacher_grad_matches_stable_reference() {
+    let student_logits = vec![0.25, -0.50, 0.75, -1.00, -0.25, 0.50, -0.75, 1.00];
+    let teacher_logits = vec![1000.0, 0.0, -1000.0, 500.0, -800.0, 800.0, 0.0, -400.0];
+    let shape = [2, 4];
+
+    let grad = kl_loss_student_grad(&student_logits, &teacher_logits, &shape);
+    let student_probs = stable_softmax_rows(&student_logits, shape[1]);
+    let teacher_probs = stable_softmax_rows(&teacher_logits, shape[1]);
+    let scale = 1.0_f64 / student_logits.len() as f64;
+
+    let mut max_abs_err = 0.0_f64;
+    for i in 0..grad.len() {
+        let expected = (student_probs[i] - teacher_probs[i]) * scale;
+        let abs_err = (f64::from(grad[i]) - expected).abs();
+        max_abs_err = max_abs_err.max(abs_err);
+        assert!(
+            abs_err < 2.0e-8,
+            "wide-range KL grad[{i}] mismatch: got {:.10e}, expected {:.10e}, abs_err={abs_err:.3e}",
+            grad[i],
+            expected
+        );
+    }
+    eprintln!("kl_distill_loss wide-range stable-reference max_abs_err={max_abs_err:.3e}");
+}
+
+fn stable_softmax_rows(logits: &[f32], vocab: usize) -> Vec<f64> {
+    logits
+        .chunks_exact(vocab)
+        .flat_map(|row| {
+            let max_value = row
+                .iter()
+                .copied()
+                .map(f64::from)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let denom = row
+                .iter()
+                .map(|&value| (f64::from(value) - max_value).exp())
+                .sum::<f64>();
+            row.iter()
+                .map(move |&value| (f64::from(value) - max_value).exp() / denom)
+        })
+        .collect()
+}
+
+#[test]
 fn kl_distill_loss_rejects_mismatched_logit_shapes() {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
