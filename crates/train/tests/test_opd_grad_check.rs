@@ -1,4 +1,4 @@
-use autograd::{Tape, Tensor, TensorStore};
+use autograd::{AutogradError, Tape, Tensor, TensorStore};
 use train::loss::kl_distill_loss;
 
 const EPSILON: f32 = 1.0e-3;
@@ -90,4 +90,42 @@ fn kl_distill_loss_student_logits_grad_matches_finite_difference() {
         worst.2,
         worst.3
     );
+}
+
+#[test]
+fn kl_distill_loss_rejects_mismatched_logit_shapes() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student = store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], true).expect("student logits"));
+    let teacher =
+        store.alloc(Tensor::new(vec![0.0; 8], vec![2, 4], false).expect("teacher logits"));
+
+    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
+        .expect_err("mismatched logits must fail before softmax");
+
+    assert!(matches!(
+        err,
+        AutogradError::ShapeMismatch {
+            expected,
+            got
+        } if expected == vec![2, 3] && got == vec![2, 4]
+    ));
+}
+
+#[test]
+fn kl_distill_loss_rejects_stale_num_positions() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student = store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], true).expect("student logits"));
+    let teacher =
+        store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], false).expect("teacher logits"));
+
+    let err = kl_distill_loss(student, teacher, 1, &mut store, &mut tape)
+        .expect_err("stale num_positions must fail before softmax");
+
+    let AutogradError::TapeInvariant(message) = err else {
+        panic!("expected TapeInvariant, got {err:?}");
+    };
+    assert!(message.contains("num_positions"));
+    assert!(message.contains("rollout.len()"));
 }
