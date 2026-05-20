@@ -4,12 +4,12 @@ use std::{
 };
 
 use autograd::{
-    AutogradError, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        LinearAttentionParams, add, causal_sdpa, causal_sdpa_with_q_start, embedding,
-        linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose,
+        add, causal_sdpa, causal_sdpa_with_q_start, embedding, linear_attention_core, matmul_bt,
+        mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        LinearAttentionParams,
     },
+    AutogradError, Tape, Tensor, TensorId, TensorStore,
 };
 use qwen35_spec::Qwen35AttentionTensorNames;
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
@@ -114,6 +114,18 @@ pub fn forward_rollout_cached(
     cache: &mut Qwen35KvCache,
 ) -> Result<TensorId> {
     model.forward_rollout_cached(store, tape, input_ids, position_ids, cache)
+}
+
+#[doc(hidden)]
+pub fn forward_rollout_cached_device_token(
+    model: &Qwen35Model,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    token_id: TensorId,
+    position_id: u32,
+    cache: &mut Qwen35KvCache,
+) -> Result<TensorId> {
+    model.forward_rollout_cached_device_token(store, tape, token_id, position_id, cache)
 }
 
 impl Qwen35Layer {
@@ -1009,6 +1021,72 @@ impl Qwen35Model {
         self.forward_batch_indices_with_kv_cache(store, tape, &token_indices, &positions, cache)
     }
 
+    fn forward_rollout_cached_device_token(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_id: TensorId,
+        position_id: u32,
+        cache: &mut Qwen35KvCache,
+    ) -> Result<TensorId> {
+        if tape.enabled {
+            return Err(Qwen35Error::InvalidConfig(
+                "device-token rollout requires tape disabled",
+            ));
+        }
+        if cache.layers.len() != self.layers.len() {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache layer count does not match model",
+            ));
+        }
+        let position = position_id as usize;
+        if position != cache.seq_len {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache device token requires position equal to cache length",
+            ));
+        }
+        let max_seq_len = self
+            .config
+            .rope_cache_len_hint
+            .ok_or(Qwen35Error::InvalidConfig(
+                "train-side qwen3.5 requires rope_cache_len_hint",
+            ))?;
+        if cache.seq_len + 1 > max_seq_len {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache sequence length exceeds configured rope cache length",
+            ));
+        }
+
+        let q_start = cache.seq_len;
+        let cos = select_cache_rows(self.cos_cache, &[position], store)?;
+        let sin = select_cache_rows(self.sin_cache, &[position], store)?;
+
+        let mut hidden = embedding_device_f32_ids(self.embed_tokens, token_id, 1, store)?;
+        hidden = reshape(hidden, &[1, 1, self.config.hidden_size], store, tape)?;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let layer_cache = &mut cache.layers[layer_index];
+            hidden = layer.forward_with_kv_cache(
+                hidden,
+                &self.config,
+                cos,
+                sin,
+                layer_cache,
+                q_start,
+                store,
+                tape,
+            )?;
+        }
+        cache.seq_len += 1;
+        let hidden = rmsnorm(
+            hidden,
+            self.final_norm,
+            self.config.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        linear_forward(hidden, self.lm_head, store, tape)
+    }
+
     fn forward_batch_indices(
         &self,
         store: &mut TensorStore,
@@ -1410,6 +1488,45 @@ fn append_cached_kv(
             .backend()
             .concat_axis2(&cached_handle, &cached_shape, &next_handle, &next_shape)?;
     Ok(store.alloc_device_tensor(out_shape, out_handle)?)
+}
+
+fn embedding_device_f32_ids(
+    table: TensorId,
+    ids: TensorId,
+    n_ids: usize,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    let table_shape = store
+        .get(table)
+        .ok_or(AutogradError::InvalidTensorId(table))?
+        .shape
+        .clone();
+    if table_shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: table_shape.len(),
+        }
+        .into());
+    }
+    store.ensure_device(table)?;
+    store.ensure_device(ids)?;
+    let table_handle = store
+        .get(table)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "embedding_device_f32_ids: table missing device handle",
+        ))?;
+    let ids_handle = store
+        .get(ids)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "embedding_device_f32_ids: ids missing device handle",
+        ))?;
+    let out_handle =
+        store
+            .backend()
+            .embedding_from_f32_ids(&table_handle, &table_shape, &ids_handle, n_ids)?;
+    Ok(store.alloc_device_tensor(vec![1, n_ids, table_shape[1]], out_handle)?)
 }
 
 fn split_heads(

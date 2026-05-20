@@ -20,13 +20,16 @@
 //! - Student initialised from a smaller checkpoint with LoRA adapter
 //!   layered on via `Qwen35Model::new_with_lora`.
 
-use autograd::{AutogradError, Tape, TensorId, TensorStore, optim::Optimizer};
+use autograd::{optim::Optimizer, AutogradError, Device, Tape, TensorId, TensorStore};
 use std::collections::HashSet;
 
 use crate::{
     grad_clip::clip_grad_norm,
     loss::kl_distill_loss,
-    qwen35::{Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached},
+    qwen35::{
+        forward_rollout_cached, forward_rollout_cached_device_token, Qwen35Error, Qwen35KvCache,
+        Qwen35Model,
+    },
     trainer::{cleanup_after_backward, retained_param_and_grad_ids},
 };
 
@@ -105,6 +108,129 @@ fn greedy_next_token(
         }
     }
     Ok(best_idx as u32)
+}
+
+fn device_argmax_token(
+    logits_id: TensorId,
+    vocab: usize,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    if vocab == 0 {
+        return Err(OpdError::InvalidInput(
+            "OPD rollout cannot sample next token with vocab=0. Hint: verify \
+             Qwen35Config::vocab_size before calling opd_step."
+                .to_owned(),
+        ));
+    }
+    let shape = store
+        .get(logits_id)
+        .ok_or(AutogradError::InvalidTensorId(logits_id))?
+        .shape
+        .clone();
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim != vocab {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD rollout logits last dim mismatch: got {last_dim}, expected \
+             vocab={vocab}. Hint: check Qwen35Model::forward output shape and \
+             Qwen35Config::vocab_size."
+        )));
+    }
+    let total = shape.iter().product::<usize>();
+    let rows = total / vocab;
+    if rows != 1 {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD device rollout expects exactly one logits row, got {rows}. \
+             Hint: rollout KV cache should return only the final next-token \
+             logits row."
+        )));
+    }
+    store.ensure_device(logits_id)?;
+    let logits_handle = store
+        .get(logits_id)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "device_argmax_token: logits missing device handle",
+        ))?;
+    let token_handle = store.backend().argmax_last_dim(&logits_handle, &shape)?;
+    Ok(store.alloc_device_tensor(vec![rows], token_handle)?)
+}
+
+fn write_rollout_token(
+    buffer_id: TensorId,
+    token_id: TensorId,
+    rollout_len: usize,
+    step: usize,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    store.ensure_device(buffer_id)?;
+    store.ensure_device(token_id)?;
+    let buffer_handle = store
+        .get(buffer_id)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "write_rollout_token: rollout buffer missing device handle",
+        ))?;
+    let token_handle = store
+        .get(token_id)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "write_rollout_token: token missing device handle",
+        ))?;
+    let next_handle =
+        store
+            .backend()
+            .write_scalar_at(&buffer_handle, &token_handle, rollout_len, step)?;
+    Ok(store.alloc_device_tensor(vec![rollout_len], next_handle)?)
+}
+
+fn read_generated_rollout_tokens(
+    buffer_id: TensorId,
+    rollout_len: usize,
+    vocab: usize,
+    store: &mut TensorStore,
+) -> Result<Vec<u32>> {
+    let host = store.to_host(buffer_id)?;
+    if host.len() != rollout_len {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD generated rollout token buffer length mismatch: got {}, \
+             expected {rollout_len}. Hint: device argmax rollout buffer shape \
+             should match cfg.rollout_len.",
+            host.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(rollout_len);
+    for (index, &value) in host.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD generated rollout token at index {index} is non-finite ({value}). \
+                 Hint: check CUDA argmax output and student forward numerics."
+            )));
+        }
+        let rounded = value.round();
+        if (value - rounded).abs() > 0.0 {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD generated rollout token at index {index} is not an exact \
+                 integer id ({value}). Hint: CUDA argmax should write exact \
+                 f32 token ids."
+            )));
+        }
+        if rounded < 0.0 || rounded as usize >= vocab {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD generated rollout token id {rounded} at index {index} is \
+                 outside student.config().vocab_size={vocab}. Hint: check the \
+                 argmax kernel bounds and model vocab size."
+            )));
+        }
+        out.push(rounded as u32);
+    }
+    Ok(out)
+}
+
+fn use_device_rollout_argmax(store: &TensorStore, rollout_len: usize, vocab: usize) -> bool {
+    matches!(store.backend().device(), Device::Cuda) && (rollout_len >= 4 || vocab >= 65_536)
 }
 
 fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> Result<()> {
@@ -366,36 +492,98 @@ pub fn opd_step<O: Optimizer>(
         tape.entries.clear();
         tape.set_enabled(false);
         let mut rollout: Vec<u32> = prompt_ids.to_vec();
-        let mut rollout_cache = Qwen35KvCache::new(student);
-        for step in 0..cfg.rollout_len {
-            let (input_ids, positions, logits_seq_len) = if step == 0 {
-                (
-                    rollout.clone(),
-                    (0..rollout.len() as u32).collect::<Vec<_>>(),
-                    1,
-                )
+        if use_device_rollout_argmax(store, cfg.rollout_len, vocab) {
+            let mut rollout_cache = Qwen35KvCache::new(student);
+            let mut generated_tokens = if cfg.rollout_len == 0 {
+                None
             } else {
-                let last = *rollout.last().ok_or_else(|| {
-                    OpdError::InvalidInput(
-                        "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
-                         non-empty prompt before calling opd_step."
-                            .to_owned(),
-                    )
-                })?;
-                let position = (rollout.len() - 1) as u32;
-                (vec![last], vec![position], 1)
+                let handle = store.backend().zeros(&[cfg.rollout_len])?;
+                Some(store.alloc_device_tensor(vec![cfg.rollout_len], handle)?)
             };
-            let logits = forward_rollout_cached(
-                student,
-                store,
-                tape,
-                &input_ids,
-                &positions,
-                &mut rollout_cache,
-            )
-            .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
-            let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
-            rollout.push(next);
+            let mut current_device_token: Option<TensorId> = None;
+            for step in 0..cfg.rollout_len {
+                let logits = if step == 0 {
+                    let positions = (0..prompt_ids.len() as u32).collect::<Vec<_>>();
+                    forward_rollout_cached(
+                        student,
+                        store,
+                        tape,
+                        prompt_ids,
+                        &positions,
+                        &mut rollout_cache,
+                    )
+                    .map_err(|err| map_qwen35_forward_error("student rollout", err))?
+                } else {
+                    let token_id = current_device_token.ok_or_else(|| {
+                        OpdError::InvalidInput(
+                            "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
+                             non-empty prompt before calling opd_step."
+                                .to_owned(),
+                        )
+                    })?;
+                    let position = (prompt_ids.len() + step - 1) as u32;
+                    forward_rollout_cached_device_token(
+                        student,
+                        store,
+                        tape,
+                        token_id,
+                        position,
+                        &mut rollout_cache,
+                    )
+                    .map_err(|err| map_qwen35_forward_error("student rollout", err))?
+                };
+                let next_token = device_argmax_token(logits, vocab, store)?;
+                if let Some(buffer_id) = generated_tokens {
+                    generated_tokens = Some(write_rollout_token(
+                        buffer_id,
+                        next_token,
+                        cfg.rollout_len,
+                        step,
+                        store,
+                    )?);
+                }
+                current_device_token = Some(next_token);
+            }
+            if let Some(buffer_id) = generated_tokens {
+                rollout.extend(read_generated_rollout_tokens(
+                    buffer_id,
+                    cfg.rollout_len,
+                    vocab,
+                    store,
+                )?);
+            }
+        } else {
+            let mut rollout_cache = Qwen35KvCache::new(student);
+            for step in 0..cfg.rollout_len {
+                let (input_ids, positions, logits_seq_len) = if step == 0 {
+                    (
+                        rollout.clone(),
+                        (0..rollout.len() as u32).collect::<Vec<_>>(),
+                        1,
+                    )
+                } else {
+                    let last = *rollout.last().ok_or_else(|| {
+                        OpdError::InvalidInput(
+                            "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
+                             non-empty prompt before calling opd_step."
+                                .to_owned(),
+                        )
+                    })?;
+                    let position = (rollout.len() - 1) as u32;
+                    (vec![last], vec![position], 1)
+                };
+                let logits = forward_rollout_cached(
+                    student,
+                    store,
+                    tape,
+                    &input_ids,
+                    &positions,
+                    &mut rollout_cache,
+                )
+                .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
+                let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
+                rollout.push(next);
+            }
         }
 
         // 2. Teacher forward — still tape-disabled. Teacher params carry
@@ -443,9 +631,9 @@ mod tests {
     use autograd::{AutogradError, Tensor, TensorStore};
 
     use super::{
-        OpdError, OpdStepConfig, greedy_next_token, map_qwen35_forward_error, validate_loss_value,
-        validate_rollout_shape, validate_step_config, validate_student_param_ownership,
-        validate_student_params, validate_teacher_params,
+        greedy_next_token, map_qwen35_forward_error, validate_loss_value, validate_rollout_shape,
+        validate_step_config, validate_student_param_ownership, validate_student_params,
+        validate_teacher_params, OpdError, OpdStepConfig,
     };
     use crate::qwen35::Qwen35Error;
 

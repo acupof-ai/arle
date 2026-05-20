@@ -769,6 +769,84 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, &[1, ids.len(), hidden])
     }
 
+    /// Device-token embedding variant for greedy decode loops. `ids` is a
+    /// device-resident f32 vector whose values are exact integer token ids.
+    /// Default fallback reads those tiny ids to host and reuses `embedding`.
+    fn embedding_from_f32_ids(
+        &self,
+        table: &DeviceHandle,
+        table_shape: &[usize],
+        ids: &DeviceHandle,
+        n_ids: usize,
+    ) -> Result<DeviceHandle> {
+        let ids_host = self.readback(ids)?;
+        if ids_host.len() != n_ids {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: ids_host.len(),
+                shape: vec![n_ids],
+                size: n_ids,
+            });
+        }
+        let ids_i32 = ids_host.iter().map(|&id| id as i32).collect::<Vec<_>>();
+        self.embedding(table, table_shape, &ids_i32)
+    }
+
+    /// Argmax over the last axis. Returns f32 indices shaped as
+    /// `[product(shape[..-1])]` so the existing f32-only DeviceHandle can
+    /// carry rollout token ids without adding an integer storage variant.
+    fn argmax_last_dim(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let vocab = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        })?;
+        if vocab == 0 {
+            return Err(crate::AutogradError::InvalidRank {
+                expected: "non-empty last dim",
+                got: 0,
+            });
+        }
+        let rows = shape_size(shape) / vocab;
+        let mut out = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let base = row * vocab;
+            let mut best_idx = 0usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (idx, &value) in host[base..base + vocab].iter().enumerate() {
+                if value > best_val {
+                    best_val = value;
+                    best_idx = idx;
+                }
+            }
+            out.push(best_idx as f32);
+        }
+        self.upload(&out, &[rows])
+    }
+
+    /// Return a new copy of `dest` with `src[0]` written at `index`.
+    fn write_scalar_at(
+        &self,
+        dest: &DeviceHandle,
+        src: &DeviceHandle,
+        len: usize,
+        index: usize,
+    ) -> Result<DeviceHandle> {
+        if index >= len {
+            return Err(crate::AutogradError::IndexOutOfBounds { index, upper: len });
+        }
+        let mut host = self.readback(dest)?;
+        let src_host = self.readback(src)?;
+        if host.len() != len || src_host.is_empty() {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: vec![len],
+                size: len,
+            });
+        }
+        host[index] = src_host[0];
+        self.upload(&host, &[len])
+    }
+
     /// Device-handle lazy GELU (erf form), matching `ops::activation::gelu`'s
     /// CPU body: `0.5 * x * (1 + erf(x / sqrt(2)))`. NOT the tanh-approx
     /// variant exposed by `gelu_forward` — those two formulas differ at the

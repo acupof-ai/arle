@@ -14,16 +14,18 @@ mod app {
     };
 
     use autograd::{
-        BackwardProfile, Tape, TensorId, TensorStore,
         backend_cuda::CudaBackend,
         optim::{AdamW, Optimizer},
         tensor::Dirty,
+        AutogradError, BackwardProfile, Tape, TensorId, TensorStore,
     };
     use train::{
         grad_clip::clip_grad_norm,
         loss::kl_distill_loss,
         opd::{OpdStepConfig, OpdStepOutcome},
-        qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
+        qwen35::{
+            forward_rollout_cached, forward_rollout_cached_device_token, Qwen35KvCache, Qwen35Model,
+        },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::{cleanup_after_backward, retained_param_and_grad_ids},
     };
@@ -143,6 +145,22 @@ mod app {
             "warmup_summary loss={warmup_loss:.12e} seconds={:.6}",
             warmup_started.elapsed().as_secs_f64()
         );
+        let (host_rollout, device_rollout) = rollout_equivalence_probe(
+            &student,
+            PROMPT_IDS,
+            rollout_len,
+            &teacher_params,
+            &student_model_params,
+            &mut store,
+            &mut tape,
+        )?;
+        println!(
+            "rollout_equivalence host={host_rollout:?} device={device_rollout:?} match={}",
+            host_rollout == device_rollout
+        );
+        if host_rollout != device_rollout {
+            return Err("device rollout token sequence differs from host greedy reference".into());
+        }
         if env_flag("ARLE_OPD_REALCKPT_PROFILE_DROP_HOST_MIRRORS") {
             let mirror_stats =
                 drop_large_host_mirrors(&teacher_params, &student_model_params, &mut store);
@@ -229,36 +247,62 @@ mod app {
 
         let mut rollout = prompt_ids.to_vec();
         let mut rollout_cache = Qwen35KvCache::new(student);
+        let mut generated_tokens = if cfg.rollout_len == 0 {
+            None
+        } else {
+            Some(timed(&mut totals, "rollout_token_buffer_alloc", || {
+                let handle = store.backend().zeros(&[cfg.rollout_len])?;
+                Ok(store.alloc_device_tensor(vec![cfg.rollout_len], handle)?)
+            })?)
+        };
+        let mut current_device_token: Option<TensorId> = None;
         for step in 0..cfg.rollout_len {
-            let (input_ids, positions, logits_seq_len) =
-                timed(&mut totals, "rollout_positions", || {
-                    if step == 0 {
-                        Ok((
-                            rollout.clone(),
-                            (0..rollout.len() as u32).collect::<Vec<_>>(),
-                            1,
-                        ))
-                    } else {
-                        let Some(&last) = rollout.last() else {
-                            return Err("rollout cache cannot decode from an empty rollout".into());
-                        };
-                        Ok((vec![last], vec![(rollout.len() - 1) as u32], 1))
-                    }
+            let logits = if step == 0 {
+                let positions = timed(&mut totals, "rollout_positions", || {
+                    Ok((0..prompt_ids.len() as u32).collect::<Vec<_>>())
                 })?;
-            let logits = timed(&mut totals, "rollout_student_forward", || {
-                Ok(forward_rollout_cached(
-                    student,
-                    store,
-                    tape,
-                    &input_ids,
-                    &positions,
-                    &mut rollout_cache,
-                )?)
+                timed(&mut totals, "rollout_student_forward", || {
+                    Ok(forward_rollout_cached(
+                        student,
+                        store,
+                        tape,
+                        prompt_ids,
+                        &positions,
+                        &mut rollout_cache,
+                    )?)
+                })?
+            } else {
+                let position = timed(&mut totals, "rollout_positions", || {
+                    Ok((prompt_ids.len() + step - 1) as u32)
+                })?;
+                let token_id = current_device_token
+                    .ok_or("rollout cache cannot decode without a previous device token")?;
+                timed(&mut totals, "rollout_student_forward", || {
+                    Ok(forward_rollout_cached_device_token(
+                        student,
+                        store,
+                        tape,
+                        token_id,
+                        position,
+                        &mut rollout_cache,
+                    )?)
+                })?
+            };
+            let next_token = timed(&mut totals, "rollout_argmax_device", || {
+                device_argmax_token(logits, vocab, store)
             })?;
-            let next = timed(&mut totals, "rollout_argmax_readback", || {
-                greedy_next_token(logits, logits_seq_len, vocab, store)
+            if let Some(buffer_id) = generated_tokens {
+                generated_tokens = Some(timed(&mut totals, "rollout_token_write", || {
+                    write_rollout_token(buffer_id, next_token, cfg.rollout_len, step, store)
+                })?);
+            }
+            current_device_token = Some(next_token);
+        }
+        if let Some(buffer_id) = generated_tokens {
+            let generated = timed(&mut totals, "rollout_tokens_readback", || {
+                read_generated_rollout_tokens(buffer_id, cfg.rollout_len, vocab, store)
             })?;
-            rollout.push(next);
+            rollout.extend(generated);
         }
 
         let positions = timed(&mut totals, "full_positions", || {
@@ -340,29 +384,55 @@ mod app {
 
         let mut rollout = prompt_ids.to_vec();
         let mut rollout_cache = Qwen35KvCache::new(student);
+        let mut generated_tokens = if cfg.rollout_len == 0 {
+            None
+        } else {
+            let handle = store.backend().zeros(&[cfg.rollout_len])?;
+            Some(store.alloc_device_tensor(vec![cfg.rollout_len], handle)?)
+        };
+        let mut current_device_token: Option<TensorId> = None;
         for step in 0..cfg.rollout_len {
-            let (input_ids, positions, logits_seq_len) = if step == 0 {
-                (
-                    rollout.clone(),
-                    (0..rollout.len() as u32).collect::<Vec<_>>(),
-                    1,
-                )
+            let logits = if step == 0 {
+                let positions = (0..prompt_ids.len() as u32).collect::<Vec<_>>();
+                forward_rollout_cached(
+                    student,
+                    store,
+                    tape,
+                    prompt_ids,
+                    &positions,
+                    &mut rollout_cache,
+                )?
             } else {
-                let Some(&last) = rollout.last() else {
-                    return Err("rollout cache cannot decode from an empty rollout".into());
-                };
-                (vec![last], vec![(rollout.len() - 1) as u32], 1)
+                let token_id = current_device_token
+                    .ok_or("rollout cache cannot decode without a previous device token")?;
+                forward_rollout_cached_device_token(
+                    student,
+                    store,
+                    tape,
+                    token_id,
+                    (prompt_ids.len() + step - 1) as u32,
+                    &mut rollout_cache,
+                )?
             };
-            let logits = forward_rollout_cached(
-                student,
+            let next_token = device_argmax_token(logits, vocab, store)?;
+            if let Some(buffer_id) = generated_tokens {
+                generated_tokens = Some(write_rollout_token(
+                    buffer_id,
+                    next_token,
+                    cfg.rollout_len,
+                    step,
+                    store,
+                )?);
+            }
+            current_device_token = Some(next_token);
+        }
+        if let Some(buffer_id) = generated_tokens {
+            rollout.extend(read_generated_rollout_tokens(
+                buffer_id,
+                cfg.rollout_len,
+                vocab,
                 store,
-                tape,
-                &input_ids,
-                &positions,
-                &mut rollout_cache,
-            )?;
-            let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
-            rollout.push(next);
+            )?);
         }
 
         let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
@@ -393,6 +463,232 @@ mod app {
             }
         }
         Ok(best_idx as u32)
+    }
+
+    fn device_argmax_token(
+        logits_id: TensorId,
+        vocab: usize,
+        store: &mut TensorStore,
+    ) -> AnyResult<TensorId> {
+        let shape = store
+            .get(logits_id)
+            .ok_or(AutogradError::InvalidTensorId(logits_id))?
+            .shape
+            .clone();
+        let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        })?;
+        if last_dim != vocab {
+            return Err(format!(
+                "rollout logits last dim mismatch: got {last_dim}, expected vocab={vocab}"
+            )
+            .into());
+        }
+        let total = shape.iter().product::<usize>();
+        let rows = total / vocab;
+        if rows != 1 {
+            return Err(format!("device rollout expected one logits row, got {rows}").into());
+        }
+        store.ensure_device(logits_id)?;
+        let logits_handle = store
+            .get(logits_id)
+            .and_then(|tensor| tensor.device_handle.clone())
+            .ok_or(AutogradError::TapeInvariant(
+                "device_argmax_token: logits missing device handle",
+            ))?;
+        let token_handle = store.backend().argmax_last_dim(&logits_handle, &shape)?;
+        Ok(store.alloc_device_tensor(vec![rows], token_handle)?)
+    }
+
+    fn write_rollout_token(
+        buffer_id: TensorId,
+        token_id: TensorId,
+        rollout_len: usize,
+        step: usize,
+        store: &mut TensorStore,
+    ) -> AnyResult<TensorId> {
+        store.ensure_device(buffer_id)?;
+        store.ensure_device(token_id)?;
+        let buffer_handle = store
+            .get(buffer_id)
+            .and_then(|tensor| tensor.device_handle.clone())
+            .ok_or(AutogradError::TapeInvariant(
+                "write_rollout_token: rollout buffer missing device handle",
+            ))?;
+        let token_handle = store
+            .get(token_id)
+            .and_then(|tensor| tensor.device_handle.clone())
+            .ok_or(AutogradError::TapeInvariant(
+                "write_rollout_token: token missing device handle",
+            ))?;
+        let next_handle =
+            store
+                .backend()
+                .write_scalar_at(&buffer_handle, &token_handle, rollout_len, step)?;
+        Ok(store.alloc_device_tensor(vec![rollout_len], next_handle)?)
+    }
+
+    fn read_generated_rollout_tokens(
+        buffer_id: TensorId,
+        rollout_len: usize,
+        vocab: usize,
+        store: &mut TensorStore,
+    ) -> AnyResult<Vec<u32>> {
+        let host = store.to_host(buffer_id)?;
+        if host.len() != rollout_len {
+            return Err(format!(
+                "generated rollout token buffer length mismatch: got {}, expected {rollout_len}",
+                host.len()
+            )
+            .into());
+        }
+        let mut out = Vec::with_capacity(rollout_len);
+        for (index, &value) in host.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "generated rollout token at index {index} is non-finite ({value})"
+                )
+                .into());
+            }
+            let rounded = value.round();
+            if (value - rounded).abs() > 0.0 {
+                return Err(format!(
+                    "generated rollout token at index {index} is not an exact integer ({value})"
+                )
+                .into());
+            }
+            if rounded < 0.0 || rounded as usize >= vocab {
+                return Err(format!(
+                    "generated rollout token id {rounded} at index {index} is outside vocab={vocab}"
+                )
+                .into());
+            }
+            out.push(rounded as u32);
+        }
+        Ok(out)
+    }
+
+    fn rollout_equivalence_probe(
+        student: &Qwen35Model,
+        prompt_ids: &[u32],
+        rollout_len: usize,
+        teacher_params: &[TensorId],
+        student_model_params: &[TensorId],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> AnyResult<(Vec<u32>, Vec<u32>)> {
+        let keep_extra = retained_param_and_grad_ids(teacher_params, store);
+        let host = host_rollout_reference(student, prompt_ids, rollout_len, store, tape)?;
+        cleanup_after_backward(store, tape, student_model_params, &keep_extra);
+        let device = device_rollout_reference(student, prompt_ids, rollout_len, store, tape)?;
+        cleanup_after_backward(store, tape, student_model_params, &keep_extra);
+        Ok((host, device))
+    }
+
+    fn host_rollout_reference(
+        student: &Qwen35Model,
+        prompt_ids: &[u32],
+        rollout_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> AnyResult<Vec<u32>> {
+        let vocab = student.config().vocab_size;
+        tape.entries.clear();
+        tape.set_enabled(false);
+
+        let mut rollout = prompt_ids.to_vec();
+        let mut rollout_cache = Qwen35KvCache::new(student);
+        for step in 0..rollout_len {
+            let (input_ids, positions) = if step == 0 {
+                (
+                    prompt_ids.to_vec(),
+                    (0..prompt_ids.len() as u32).collect::<Vec<_>>(),
+                )
+            } else {
+                let Some(&last) = rollout.last() else {
+                    return Err("rollout cache cannot decode from an empty rollout".into());
+                };
+                (vec![last], vec![(rollout.len() - 1) as u32])
+            };
+            let logits = forward_rollout_cached(
+                student,
+                store,
+                tape,
+                &input_ids,
+                &positions,
+                &mut rollout_cache,
+            )?;
+            let next = greedy_next_token(logits, 1, vocab, store)?;
+            rollout.push(next);
+        }
+        Ok(rollout)
+    }
+
+    fn device_rollout_reference(
+        student: &Qwen35Model,
+        prompt_ids: &[u32],
+        rollout_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> AnyResult<Vec<u32>> {
+        let vocab = student.config().vocab_size;
+        tape.entries.clear();
+        tape.set_enabled(false);
+
+        let mut rollout = prompt_ids.to_vec();
+        let mut rollout_cache = Qwen35KvCache::new(student);
+        let mut generated_tokens = if rollout_len == 0 {
+            None
+        } else {
+            let handle = store.backend().zeros(&[rollout_len])?;
+            Some(store.alloc_device_tensor(vec![rollout_len], handle)?)
+        };
+        let mut current_device_token: Option<TensorId> = None;
+        for step in 0..rollout_len {
+            let logits = if step == 0 {
+                let positions = (0..prompt_ids.len() as u32).collect::<Vec<_>>();
+                forward_rollout_cached(
+                    student,
+                    store,
+                    tape,
+                    prompt_ids,
+                    &positions,
+                    &mut rollout_cache,
+                )?
+            } else {
+                let token_id = current_device_token
+                    .ok_or("rollout cache cannot decode without a previous device token")?;
+                forward_rollout_cached_device_token(
+                    student,
+                    store,
+                    tape,
+                    token_id,
+                    (prompt_ids.len() + step - 1) as u32,
+                    &mut rollout_cache,
+                )?
+            };
+            let next_token = device_argmax_token(logits, vocab, store)?;
+            if let Some(buffer_id) = generated_tokens {
+                generated_tokens = Some(write_rollout_token(
+                    buffer_id,
+                    next_token,
+                    rollout_len,
+                    step,
+                    store,
+                )?);
+            }
+            current_device_token = Some(next_token);
+        }
+        if let Some(buffer_id) = generated_tokens {
+            rollout.extend(read_generated_rollout_tokens(
+                buffer_id,
+                rollout_len,
+                vocab,
+                store,
+            )?);
+        }
+        Ok(rollout)
     }
 
     fn trainable_params(model: &Qwen35Model, store: &TensorStore) -> Vec<TensorId> {
