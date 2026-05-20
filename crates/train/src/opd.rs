@@ -225,11 +225,11 @@ fn validate_loss_value(loss_value: f32) -> Result<()> {
 }
 
 fn validate_step_config(cfg: OpdStepConfig) -> Result<()> {
-    if cfg.grad_clip.is_finite() {
+    if cfg.grad_clip >= 0.0 && cfg.grad_clip.is_finite() {
         return Ok(());
     }
     Err(OpdError::InvalidInput(format!(
-        "OPD step requires cfg.grad_clip to be finite, got {}. Hint: pass \
+        "OPD step requires cfg.grad_clip to be non-negative and finite, got {}. Hint: pass \
          a positive finite threshold to enable clipping, or pass 0.0 to \
          disable clipping explicitly.",
         cfg.grad_clip
@@ -597,6 +597,22 @@ mod tests {
             assert!(message.contains("finite"));
             assert!(message.contains("0.0"));
         }
+    }
+
+    #[test]
+    fn validate_step_config_rejects_negative_grad_clip() {
+        let err = validate_step_config(OpdStepConfig {
+            rollout_len: 1,
+            grad_clip: -1.0,
+        })
+        .expect_err("negative OPD grad_clip must not silently disable clipping");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("cfg.grad_clip"));
+        assert!(message.contains("non-negative"));
+        assert!(message.contains("0.0"));
     }
 
     #[test]
