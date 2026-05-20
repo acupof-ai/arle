@@ -132,6 +132,19 @@ pub fn opd_step<O: Optimizer>(
                 .to_owned(),
         ));
     }
+    if let Some((index, token_id)) = prompt_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, token_id)| token_id as usize >= vocab)
+    {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD prompt token id {token_id} at prompt_ids[{index}] is outside \
+             student.config().vocab_size={vocab}. Hint: verify the tokenizer and \
+             student model directory match before running OPD. See \
+             docs/projects/2026-05-18-opd-only-pivot.md."
+        )));
+    }
     let teacher_params = teacher.all_parameter_ids();
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
 
