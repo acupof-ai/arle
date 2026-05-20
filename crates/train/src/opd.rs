@@ -91,6 +91,13 @@ fn greedy_next_token(
     let mut best_idx: usize = 0;
     let mut best_val: f32 = f32::NEG_INFINITY;
     for (i, &v) in row.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD rollout logits contain non-finite value at last-row vocab index {i}: {v}. \
+                 Hint: check student forward numerics, checkpoint dtype conversion, and \
+                 learning-rate stability before sampling the next token."
+            )));
+        }
         if v > best_val {
             best_val = v;
             best_idx = i;
@@ -283,6 +290,25 @@ mod tests {
         assert!(message.contains("logits length mismatch"));
         assert!(message.contains("expected exactly"));
         assert!(message.contains("1 * 4"));
+    }
+
+    #[test]
+    fn greedy_next_token_rejects_non_finite_logits() {
+        let mut store = TensorStore::default();
+        let logits = store.alloc(
+            Tensor::new(vec![0.0, 0.5, f32::NAN, 0.25], vec![1, 1, 4], false)
+                .expect("logits tensor"),
+        );
+
+        let err = greedy_next_token(logits, 1, 4, &mut store)
+            .expect_err("NaN logits must not silently sample token 0");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("non-finite"));
+        assert!(message.contains("vocab index 2"));
+        assert!(message.contains("student forward numerics"));
     }
 
     #[test]
