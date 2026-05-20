@@ -31,7 +31,7 @@ pub use lr_schedule::{ConstantLr, CosineWithWarmup, LinearWarmup, LrSchedule, pa
 pub use optim::{AdamW, Optimizer};
 #[cfg(feature = "safetensors")]
 pub use safetensors_io::SafetensorsRegistry;
-pub use tape::{BackwardOp, SavedContext, Tape, TapeEntry};
+pub use tape::{BackwardOp, BackwardOpProfile, BackwardProfile, SavedContext, Tape, TapeEntry};
 pub use tensor::{Tensor, TensorId, TensorStore};
 
 use thiserror::Error;

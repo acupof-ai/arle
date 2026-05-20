@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use smallvec::SmallVec;
 
@@ -98,7 +101,7 @@ pub enum SavedContext {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BackwardOp {
     Add,
     Mul,
@@ -122,6 +125,45 @@ pub enum BackwardOp {
     AddBroadcast,
     Embedding,
     LinearAttention,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackwardOpProfile {
+    pub count: usize,
+    pub duration: Duration,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BackwardProfile {
+    pub op_totals: BTreeMap<BackwardOp, BackwardOpProfile>,
+    pub merge_grad_duration: Duration,
+    pub prelude_duration: Duration,
+    pub total_duration: Duration,
+}
+
+impl BackwardProfile {
+    fn record_op(&mut self, op: BackwardOp, duration: Duration) {
+        let entry = self.op_totals.entry(op).or_default();
+        entry.count += 1;
+        entry.duration += duration;
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for (&op, &stats) in &other.op_totals {
+            let entry = self.op_totals.entry(op).or_default();
+            entry.count += stats.count;
+            entry.duration += stats.duration;
+        }
+        self.merge_grad_duration += other.merge_grad_duration;
+        self.prelude_duration += other.prelude_duration;
+        self.total_duration += other.total_duration;
+    }
+
+    pub fn total_op_duration(&self) -> Duration {
+        self.op_totals
+            .values()
+            .fold(Duration::default(), |acc, stats| acc + stats.duration)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -163,10 +205,31 @@ impl Tape {
         loss_id: TensorId,
         store: &mut TensorStore,
     ) -> Result<HashMap<TensorId, TensorId>> {
+        self.backward_impl(loss_id, store, None)
+    }
+
+    pub fn backward_profiled(
+        &mut self,
+        loss_id: TensorId,
+        store: &mut TensorStore,
+    ) -> Result<(HashMap<TensorId, TensorId>, BackwardProfile)> {
+        let mut profile = BackwardProfile::default();
+        let grads = self.backward_impl(loss_id, store, Some(&mut profile))?;
+        Ok((grads, profile))
+    }
+
+    fn backward_impl(
+        &mut self,
+        loss_id: TensorId,
+        store: &mut TensorStore,
+        mut profile: Option<&mut BackwardProfile>,
+    ) -> Result<HashMap<TensorId, TensorId>> {
+        let total_started = profile.is_some().then(Instant::now);
         let was_enabled = self.enabled;
         self.enabled = false;
 
         let result = (|| {
+            let prelude_started = profile.is_some().then(Instant::now);
             // Batch-flush all Dirty::Device tape outputs in a single
             // `mlx_eval` call before walking the backward graph. The naive
             // per-id `ensure_host` loop would call `eval` once per handle —
@@ -229,6 +292,9 @@ impl Tape {
             {
                 store.accumulate_grad(loss_id, loss_grad_id)?;
             }
+            if let (Some(profile), Some(started)) = (profile.as_deref_mut(), prelude_started) {
+                profile.prelude_duration += started.elapsed();
+            }
 
             for &entry_index in post_order.iter().rev() {
                 let entry = self.entries[entry_index].clone();
@@ -237,6 +303,7 @@ impl Tape {
                     None => continue,
                 };
 
+                let op_started = profile.is_some().then(Instant::now);
                 let input_grads = match entry.op {
                     BackwardOp::Add => ops::add_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Mul => ops::mul_backward(&entry, output_grad_id, store)?,
@@ -275,9 +342,16 @@ impl Tape {
                         ops::linear_attention_backward(&entry, output_grad_id, store)?
                     }
                 };
+                if let (Some(profile), Some(started)) = (profile.as_deref_mut(), op_started) {
+                    profile.record_op(entry.op, started.elapsed());
+                }
 
+                let merge_started = profile.is_some().then(Instant::now);
                 for (input_id, grad_id) in input_grads {
                     merge_grad(&mut grads, input_id, grad_id, store)?;
+                }
+                if let (Some(profile), Some(started)) = (profile.as_deref_mut(), merge_started) {
+                    profile.merge_grad_duration += started.elapsed();
                 }
             }
 
@@ -285,6 +359,9 @@ impl Tape {
         })();
 
         self.enabled = was_enabled;
+        if let (Some(profile), Some(started)) = (profile.take(), total_started) {
+            profile.total_duration += started.elapsed();
+        }
         result
     }
 }
@@ -408,5 +485,40 @@ mod tests {
 
         let grad_id = grads.get(&loss).copied().expect("loss grad exists");
         assert_eq!(store.to_host(grad_id).expect("copy grad"), vec![1.0]);
+    }
+
+    #[test]
+    fn backward_profiled_matches_backward_and_counts_ops() {
+        fn run(profiled: bool) -> (Vec<f32>, Option<BackwardProfile>) {
+            let mut store = TensorStore::default();
+            let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+            let mut tape = Tape::new();
+            let y = ops::mul(x, x, &mut store, &mut tape).expect("x*x");
+            let loss = ops::sum(y, &mut store, &mut tape).expect("sum");
+
+            let (grads, profile) = if profiled {
+                let (grads, profile) = tape
+                    .backward_profiled(loss, &mut store)
+                    .expect("profiled backward");
+                (grads, Some(profile))
+            } else {
+                (
+                    tape.backward(loss, &mut store).expect("plain backward"),
+                    None,
+                )
+            };
+            let grad_id = grads.get(&x).copied().expect("x grad exists");
+            (store.to_host(grad_id).expect("x grad host"), profile)
+        }
+
+        let (plain_grad, _) = run(false);
+        let (profiled_grad, profile) = run(true);
+        assert_eq!(plain_grad, profiled_grad);
+        assert_eq!(profiled_grad, vec![4.0, -6.0]);
+
+        let profile = profile.expect("profile returned");
+        assert_eq!(profile.op_totals[&BackwardOp::Sum].count, 1);
+        assert_eq!(profile.op_totals[&BackwardOp::Mul].count, 1);
+        assert!(profile.total_duration >= profile.total_op_duration());
     }
 }
