@@ -136,6 +136,18 @@ fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> 
     Ok(())
 }
 
+fn validate_loss_value(loss_value: f32) -> Result<()> {
+    if loss_value.is_finite() {
+        return Ok(());
+    }
+    Err(OpdError::InvalidInput(format!(
+        "OPD KL loss became non-finite ({loss_value}). Hint: check teacher/student logits \
+         for NaN or Inf, verify both checkpoints use the same tokenizer/model family, and \
+         reduce the learning rate before resuming. See \
+         docs/projects/2026-05-18-opd-only-pivot.md."
+    )))
+}
+
 /// Run one OPD step:
 /// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
@@ -231,6 +243,7 @@ pub fn opd_step<O: Optimizer>(
     // 4. KL distill loss.
     let loss = kl_distill_loss(student_logits, teacher_logits, rollout.len(), store, tape)?;
     let loss_value = store.to_host(loss)?[0];
+    validate_loss_value(loss_value)?;
 
     // 5. Backward + grad clip + optimizer step.
     optimizer.zero_grad(store, student_params);
@@ -253,7 +266,7 @@ pub fn opd_step<O: Optimizer>(
 mod tests {
     use autograd::{Tensor, TensorStore};
 
-    use super::{OpdError, greedy_next_token, validate_student_params};
+    use super::{OpdError, greedy_next_token, validate_loss_value, validate_student_params};
 
     #[test]
     fn greedy_next_token_rejects_logits_len_mismatch() {
@@ -313,5 +326,21 @@ mod tests {
         assert!(message.contains("no trainable tensors"));
         assert!(message.contains("requires_grad=true"));
         assert!(message.contains("optimizer step a no-op"));
+    }
+
+    #[test]
+    fn validate_loss_value_rejects_non_finite_loss() {
+        for loss_value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = validate_loss_value(loss_value)
+                .expect_err("non-finite OPD loss must be rejected before backward");
+
+            let OpdError::InvalidInput(message) = err else {
+                panic!("expected InvalidInput, got {err:?}");
+            };
+            assert!(message.contains("non-finite"));
+            assert!(message.contains("teacher/student logits"));
+            assert!(message.contains("learning rate"));
+            assert!(message.contains("2026-05-18-opd-only-pivot.md"));
+        }
     }
 }
