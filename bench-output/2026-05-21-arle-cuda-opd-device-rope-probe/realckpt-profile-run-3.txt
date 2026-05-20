@@ -1,0 +1,39 @@
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running `target/release/examples/opd_step_cuda_realckpt_profile`
+config backend=cuda model_dir=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B prompt=[1, 872, 198, 3456] rollout_len=8 lr=0.00005 grad_clip=1 perturb_scale=0.001
+model config hidden=1024 intermediate=3072 layers=28 vocab=151936 num_heads=16 num_kv_heads=8 head_dim=128 tie_word_embeddings=true rope_theta=1000000 teacher_param_elements=601292800 student_model_elements=601292800 student_trainable_elements=596049920 teacher_load_seconds=7.209682 student_load_seconds=6.693357
+warmup_summary loss=1.788745430531e-5 seconds=1.796256
+host_mirror_control enabled=false
+step_summary loss=1.788745430531e-5 rollout_len=12 total_step_seconds=0.209632
+phase_summary rank=1 phase=rollout_student_forward seconds=0.082771 pct_total=39.484
+phase_summary rank=2 phase=backward seconds=0.027282 pct_total=13.014
+phase_summary rank=3 phase=optimizer_step seconds=0.025427 pct_total=12.129
+phase_summary rank=4 phase=post_step_cleanup seconds=0.018634 pct_total=8.889
+phase_summary rank=5 phase=grad_clip seconds=0.013455 pct_total=6.419
+phase_summary rank=6 phase=student_forward seconds=0.013121 pct_total=6.259
+phase_summary rank=7 phase=rollout_argmax_readback seconds=0.012805 pct_total=6.108
+phase_summary rank=8 phase=teacher_forward seconds=0.012281 pct_total=5.858
+phase_summary rank=9 phase=kl_distill_loss seconds=0.003744 pct_total=1.786
+phase_summary rank=10 phase=keep_extra_build seconds=0.000087 pct_total=0.042
+phase_summary rank=11 phase=loss_readback seconds=0.000011 pct_total=0.005
+phase_summary rank=12 phase=optimizer_zero_grad seconds=0.000002 pct_total=0.001
+phase_summary rank=13 phase=rollout_positions seconds=0.000000 pct_total=0.000
+phase_summary rank=14 phase=full_positions seconds=0.000000 pct_total=0.000
+phase_summary rank=15 phase=rollout_tape_disable seconds=0.000000 pct_total=0.000
+phase_summary rank=16 phase=student_tape_enable seconds=0.000000 pct_total=0.000
+backward_profile_summary total_seconds=0.027282 op_seconds=0.022520 merge_grad_seconds=0.004246 prelude_seconds=0.000251 unattributed_seconds=0.000266
+backward_op_summary rank=1 op=MatmulBT count=197 seconds=0.011830 pct_backward=43.363 pct_total=5.643
+backward_op_summary rank=2 op=Transpose count=140 seconds=0.002510 pct_backward=9.201 pct_total=1.197
+backward_op_summary rank=3 op=RMSNorm count=113 seconds=0.002326 pct_backward=8.525 pct_total=1.109
+backward_op_summary rank=4 op=Matmul count=56 seconds=0.001481 pct_backward=5.428 pct_total=0.706
+backward_op_summary rank=5 op=AddBroadcast count=84 seconds=0.001283 pct_backward=4.704 pct_total=0.612
+backward_op_summary rank=6 op=RoPE count=56 seconds=0.001039 pct_backward=3.810 pct_total=0.496
+backward_op_summary rank=7 op=Embedding count=1 seconds=0.000837 pct_backward=3.067 pct_total=0.399
+backward_op_summary rank=8 op=Mul count=29 seconds=0.000389 pct_backward=1.424 pct_total=0.185
+backward_op_summary rank=9 op=Silu count=28 seconds=0.000262 pct_backward=0.960 pct_total=0.125
+backward_op_summary rank=10 op=Softmax count=28 seconds=0.000199 pct_backward=0.731 pct_total=0.095
+backward_op_summary rank=11 op=MulScalar count=29 seconds=0.000191 pct_backward=0.699 pct_total=0.091
+backward_op_summary rank=12 op=Reshape count=731 seconds=0.000145 pct_backward=0.530 pct_total=0.069
+backward_op_summary rank=13 op=Add count=56 seconds=0.000011 pct_backward=0.042 pct_total=0.005
+backward_op_summary rank=14 op=Mean count=1 seconds=0.000009 pct_backward=0.034 pct_total=0.004
+backward_op_summary rank=15 op=LogSoftmax count=1 seconds=0.000007 pct_backward=0.027 pct_total=0.004

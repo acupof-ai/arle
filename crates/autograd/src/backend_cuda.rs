@@ -1096,6 +1096,24 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn rope(
+        &self,
+        x: &DeviceHandle,
+        x_shape: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, x_shape, cos, sin);
+            todo!("GPU required: cuda rope is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_rope_device(self, x, x_shape, cos, sin)
+        }
+    }
+
     fn gather_last_dim_forward(
         &self,
         src: &[f32],
@@ -3599,6 +3617,94 @@ fn cuda_rope(
         },
     )?;
     cuda_download(backend, &d_out, total)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_rope_device(
+    backend: &CudaBackend,
+    x: &DeviceHandle,
+    x_shape: &[usize],
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<DeviceHandle> {
+    if x_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: x_shape.len(),
+        });
+    }
+    let batch = x_shape[0];
+    let heads = x_shape[1];
+    let seq = x_shape[2];
+    let head_dim = x_shape[3];
+    if !head_dim.is_multiple_of(2) {
+        return Err(AutogradError::InvalidRank {
+            expected: "even head dim",
+            got: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    let total = batch * heads * seq * head_dim;
+    let d_x = backend.cuda_slice(x, "rope")?;
+    if d_x.len() != total {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![total],
+            got: vec![d_x.len()],
+        });
+    }
+    let cache_len = seq * half_dim;
+    if cos.len() != cache_len || sin.len() != cache_len {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![cache_len],
+            got: vec![cos.len().min(sin.len())],
+        });
+    }
+
+    let d_cos = backend
+        .stream
+        .clone_htod(cos)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (rope cos)"))?;
+    let d_sin = backend
+        .stream
+        .clone_htod(sin)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (rope sin)"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope)"))?;
+
+    let batch_i = i32::try_from(batch)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope batch exceeds i32"))?;
+    let heads_i = i32::try_from(heads)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope heads exceeds i32"))?;
+    let seq_i = i32::try_from(seq)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope seq exceeds i32"))?;
+    let head_dim_i = i32::try_from(head_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope head_dim exceeds i32"))?;
+
+    let rows = batch * heads * seq;
+    let block = std::cmp::min(half_dim, 256) as u32;
+    let block = block.max(1);
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("rope_f32")?,
+        rows,
+        block,
+        0,
+        |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_x)
+                .arg(&d_cos)
+                .arg(&d_sin)
+                .arg(&batch_i)
+                .arg(&heads_i)
+                .arg(&seq_i)
+                .arg(&head_dim_i);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
 #[cfg(not(feature = "no-cuda"))]
