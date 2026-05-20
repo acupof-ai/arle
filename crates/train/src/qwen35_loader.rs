@@ -674,7 +674,7 @@ fn plan_tensor_load(
     })
 }
 
-fn validate_supported_dtype(view: &TensorView<'_>, name: &str) -> Result<()> {
+fn validate_supported_dtype(view: &impl safetensors::View, name: &str) -> Result<()> {
     match view.dtype() {
         Dtype::F32 | Dtype::BF16 | Dtype::F16 => Ok(()),
         other => Err(LoaderError::UnsupportedDtype(other, name.to_owned())),
@@ -890,6 +890,7 @@ mod tests {
     }"#;
 
     struct TestTensorView {
+        dtype: Dtype,
         shape: Vec<usize>,
         bytes: Vec<u8>,
     }
@@ -900,13 +901,25 @@ mod tests {
             for value in values {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
-            Self { shape, bytes }
+            Self {
+                dtype: Dtype::F32,
+                shape,
+                bytes,
+            }
+        }
+
+        fn from_dtype(dtype: Dtype, shape: Vec<usize>, bytes: Vec<u8>) -> Self {
+            Self {
+                dtype,
+                shape,
+                bytes,
+            }
         }
     }
 
     impl safetensors::View for TestTensorView {
         fn dtype(&self) -> Dtype {
-            Dtype::F32
+            self.dtype
         }
 
         fn shape(&self) -> &[usize] {
@@ -1023,6 +1036,19 @@ mod tests {
         assert!(hint.contains("Hint: verify config.json"));
         assert!(hint.contains("HF tensor"));
         assert!(hint.contains("Qwen3.5/Qwen3.6"));
+    }
+
+    #[test]
+    fn unsupported_dtype_error_includes_conversion_hint() {
+        let view = TestTensorView::from_dtype(Dtype::F8_E4M3, vec![2, 2], vec![0_u8; 4]);
+
+        let err = validate_supported_dtype(&view, "model.language_model.embed_tokens.weight")
+            .expect_err("quantized dtype must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("unsupported dtype F8_E4M3"));
+        assert!(message.contains("F32, BF16, and F16"));
+        assert!(message.contains("convert quantized checkpoints"));
     }
 
     #[test]
