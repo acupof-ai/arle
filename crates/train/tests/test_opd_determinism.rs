@@ -12,7 +12,7 @@ fn run_opd_loss_bits(seed: u64, lr: f32, prompt_ids: &[u32]) -> TestResult<Vec<u
     let mut tape = Tape::new();
     let cfg = tiny_qwen35_scratch_config(8);
 
-    let teacher = Qwen35Model::new(&cfg, &mut store)?;
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store)?;
     let student = Qwen35Model::new(&cfg, &mut store)?;
     let student_params = student.all_parameter_ids();
     perturb_params_from_seed(&mut store, &student_params, seed);

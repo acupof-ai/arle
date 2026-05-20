@@ -63,6 +63,13 @@ fn validate_kl_distill_inputs(
     let teacher = store
         .get(teacher_logits)
         .ok_or(AutogradError::InvalidTensorId(teacher_logits))?;
+    if teacher.requires_grad {
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss: teacher_logits must have requires_grad=false. \
+             Hint: pass logits from a frozen teacher/eval forward; OPD must \
+             not backpropagate into the teacher.",
+        ));
+    }
     if student.shape != teacher.shape {
         return Err(AutogradError::ShapeMismatch {
             expected: student.shape.clone(),

@@ -113,6 +113,24 @@ fn kl_distill_loss_rejects_mismatched_logit_shapes() {
 }
 
 #[test]
+fn kl_distill_loss_rejects_teacher_logits_requiring_grad() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let student = store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], true).expect("student logits"));
+    let teacher = store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], true).expect("teacher logits"));
+
+    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
+        .expect_err("teacher logits must be frozen");
+
+    let AutogradError::TapeInvariant(message) = err else {
+        panic!("expected TapeInvariant, got {err:?}");
+    };
+    assert!(message.contains("teacher_logits"));
+    assert!(message.contains("requires_grad=false"));
+    assert!(message.contains("teacher"));
+}
+
+#[test]
 fn kl_distill_loss_rejects_stale_num_positions() {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
