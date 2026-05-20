@@ -1,0 +1,7 @@
+    Finished `release` profile [optimized] target(s) in 0.13s
+     Running tests/test_opd_determinism.rs (target/release/deps/test_opd_determinism-a2625034491dfe64)
+
+running 1 test
+test opd_step_same_prompt_seed_and_lr_is_bit_identical ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

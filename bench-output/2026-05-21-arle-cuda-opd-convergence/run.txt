@@ -1,0 +1,72 @@
+config hidden=512 intermediate=1536 layers=12 vocab=32768 heads=8 kv_heads=4 head_dim=64 train_steps=500 repeat_steps=10 cross_backend_steps=10 prompt=[1, 3, 8] rollout_len=2 decode_len=8 lr=0.001 perturb_scale=0.05
+real_checkpoint_probe mode=auto_probe path=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B present=true run=false reason="convergence bench keeps the exercised substrate at the moderate shape; full Qwen3-0.6B OPD eval is recorded as follow-up unless explicitly promoted to a separate memory-budgeted run"
+cuda_repeat backend=Cuda steps=10 loss_bit_identical=true rollout_identical=true max_abs_loss_diff=0.000000000000e0
+cross_backend steps=10 rollout_match_steps=10/10 max_loss_relerr=2.154206928271e-6 first_divergence_step=none
+main_summary backend=Cuda steps=500 wall_seconds=49.335591 step_seconds=0.098671182 first_loss=3.270824381616e-4 last_loss=3.146462549921e-4 min_loss=3.146462549921e-4 delta_pct=-3.802156
+loss_trajectory step=1 loss=3.270824381616e-4
+loss_trajectory step=10 loss=3.203281667084e-4
+loss_trajectory step=20 loss=3.177304461133e-4
+loss_trajectory step=30 loss=3.161180939060e-4
+loss_trajectory step=40 loss=3.160676569678e-4
+loss_trajectory step=50 loss=3.158988838550e-4
+loss_trajectory step=60 loss=3.155826125294e-4
+loss_trajectory step=70 loss=3.154371806886e-4
+loss_trajectory step=80 loss=3.152163699269e-4
+loss_trajectory step=90 loss=3.155899175908e-4
+loss_trajectory step=100 loss=3.152190183755e-4
+loss_trajectory step=110 loss=3.152724821121e-4
+loss_trajectory step=120 loss=3.151296696160e-4
+loss_trajectory step=130 loss=3.155772574246e-4
+loss_trajectory step=140 loss=3.151488199364e-4
+loss_trajectory step=150 loss=3.153049037792e-4
+loss_trajectory step=160 loss=3.150817356072e-4
+loss_trajectory step=170 loss=3.151214623358e-4
+loss_trajectory step=180 loss=3.151843848173e-4
+loss_trajectory step=190 loss=3.152680292260e-4
+loss_trajectory step=200 loss=3.149906115141e-4
+loss_trajectory step=210 loss=3.150092670694e-4
+loss_trajectory step=220 loss=3.151026030537e-4
+loss_trajectory step=230 loss=3.151131968480e-4
+loss_trajectory step=240 loss=3.149403200950e-4
+loss_trajectory step=250 loss=3.150528063998e-4
+loss_trajectory step=260 loss=3.149219264742e-4
+loss_trajectory step=270 loss=3.150243719574e-4
+loss_trajectory step=280 loss=3.150885167997e-4
+loss_trajectory step=290 loss=3.150133125018e-4
+loss_trajectory step=300 loss=3.148884861730e-4
+loss_trajectory step=310 loss=3.149331605528e-4
+loss_trajectory step=320 loss=3.150064439978e-4
+loss_trajectory step=330 loss=3.148682881147e-4
+loss_trajectory step=340 loss=3.149527183268e-4
+loss_trajectory step=350 loss=3.150609263685e-4
+loss_trajectory step=360 loss=3.148147952743e-4
+loss_trajectory step=370 loss=3.148733521812e-4
+loss_trajectory step=380 loss=3.148293471895e-4
+loss_trajectory step=390 loss=3.149529220536e-4
+loss_trajectory step=400 loss=3.148029500153e-4
+loss_trajectory step=410 loss=3.147756506223e-4
+loss_trajectory step=420 loss=3.149232070427e-4
+loss_trajectory step=430 loss=3.147330426145e-4
+loss_trajectory step=440 loss=3.147198003717e-4
+loss_trajectory step=450 loss=3.147043171339e-4
+loss_trajectory step=460 loss=3.146923554596e-4
+loss_trajectory step=470 loss=3.146793169435e-4
+loss_trajectory step=480 loss=3.146683447994e-4
+loss_trajectory step=490 loss=3.146573144477e-4
+loss_trajectory step=500 loss=3.146462549921e-4
+decode_overlap step=0 prompt_index=0 overlap_pct=0.000 teacher=[30806, 4126, 23763, 24367, 904, 18324, 3074, 14928] student=[7561, 13731, 20716, 23043, 6640, 6542, 10073, 30391]
+decode_overlap step=0 prompt_index=1 overlap_pct=0.000 teacher=[16761, 17219, 16645, 5019, 28148, 1422, 32667, 21043] student=[21512, 10118, 6469, 11256, 30079, 20738, 27002, 11845]
+decode_overlap step=0 prompt_index=2 overlap_pct=0.000 teacher=[12199, 28662, 12492, 9890, 31245, 21480, 20918, 8899] student=[9498, 23050, 28902, 19806, 3339, 23848, 23572, 18961]
+decode_overlap step=50 prompt_index=0 overlap_pct=0.000 teacher=[30806, 4126, 23763, 24367, 904, 18324, 3074, 14928] student=[17736, 23981, 21677, 23981, 30806, 30806, 17736, 14800]
+decode_overlap step=50 prompt_index=1 overlap_pct=0.000 teacher=[16761, 17219, 16645, 5019, 28148, 1422, 32667, 21043] student=[14204, 1090, 31537, 10055, 8089, 31567, 6071, 9924]
+decode_overlap step=50 prompt_index=2 overlap_pct=0.000 teacher=[12199, 28662, 12492, 9890, 31245, 21480, 20918, 8899] student=[14461, 13063, 19663, 15711, 13410, 19570, 2192, 9104]
+decode_overlap step=100 prompt_index=0 overlap_pct=0.000 teacher=[30806, 4126, 23763, 24367, 904, 18324, 3074, 14928] student=[4126, 30806, 30806, 7489, 30806, 7489, 7489, 15417]
+decode_overlap step=100 prompt_index=1 overlap_pct=0.000 teacher=[16761, 17219, 16645, 5019, 28148, 1422, 32667, 21043] student=[20685, 29914, 26595, 1250, 29382, 19263, 1005, 24043]
+decode_overlap step=100 prompt_index=2 overlap_pct=0.000 teacher=[12199, 28662, 12492, 9890, 31245, 21480, 20918, 8899] student=[11301, 6303, 29508, 32014, 24125, 21771, 30244, 30833]
+decode_overlap step=500 prompt_index=0 overlap_pct=25.000 teacher=[30806, 4126, 23763, 24367, 904, 18324, 3074, 14928] student=[30806, 4126, 15289, 15289, 5038, 18514, 5038, 18514]
+decode_overlap step=500 prompt_index=1 overlap_pct=0.000 teacher=[16761, 17219, 16645, 5019, 28148, 1422, 32667, 21043] student=[20685, 20320, 18299, 30538, 8136, 16528, 9400, 14108]
+decode_overlap step=500 prompt_index=2 overlap_pct=0.000 teacher=[12199, 28662, 12492, 9890, 31245, 21480, 20918, 8899] student=[20535, 10052, 18591, 3530, 31024, 18571, 154, 23739]
+decode_overlap_summary step=0 mean_overlap_pct=0.000
+decode_overlap_summary step=50 mean_overlap_pct=0.000
+decode_overlap_summary step=100 mean_overlap_pct=0.000
+decode_overlap_summary step=500 mean_overlap_pct=8.333
