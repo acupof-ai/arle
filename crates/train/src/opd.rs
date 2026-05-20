@@ -152,6 +152,36 @@ fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> 
     Ok(())
 }
 
+fn validate_teacher_params(teacher_params: &[TensorId], store: &TensorStore) -> Result<()> {
+    if teacher_params.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "OPD teacher exposes no parameter ids. Hint: pass a Qwen35Model \
+             built by Qwen35Model::new_for_eval or load_qwen35_from_hf_dir."
+                .to_owned(),
+        ));
+    }
+
+    for (index, &param_id) in teacher_params.iter().enumerate() {
+        let tensor = store.get(param_id).ok_or_else(|| {
+            OpdError::InvalidInput(format!(
+                "OPD teacher parameter ids must belong to the same TensorStore, \
+                 but teacher_params[{index}]={param_id} is missing. Hint: build \
+                 teacher and student in the TensorStore passed to opd_step."
+            ))
+        })?;
+        if tensor.requires_grad {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD teacher parameter teacher_params[{index}]={param_id} has \
+                 requires_grad=true. Hint: build the teacher with \
+                 Qwen35Model::new_for_eval, load_qwen35_from_hf_dir, or \
+                 student.clone_frozen; OPD must not optimize teacher weights."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_loss_value(loss_value: f32) -> Result<()> {
     if loss_value.is_finite() {
         return Ok(());
@@ -233,8 +263,9 @@ pub fn opd_step<O: Optimizer>(
             docs/projects/2026-05-18-opd-only-pivot.md."
         )));
     }
-    validate_student_params(student_params, store)?;
     let teacher_params = teacher.all_parameter_ids();
+    validate_teacher_params(&teacher_params, store)?;
+    validate_student_params(student_params, store)?;
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
 
     // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
@@ -297,7 +328,7 @@ mod tests {
 
     use super::{
         OpdError, OpdStepConfig, greedy_next_token, validate_loss_value, validate_step_config,
-        validate_student_params,
+        validate_student_params, validate_teacher_params,
     };
 
     #[test]
@@ -395,6 +426,24 @@ mod tests {
         assert!(message.contains("no trainable tensors"));
         assert!(message.contains("requires_grad=true"));
         assert!(message.contains("optimizer step a no-op"));
+    }
+
+    #[test]
+    fn validate_teacher_params_rejects_trainable_params() {
+        let mut store = TensorStore::default();
+        let trainable_teacher =
+            store.alloc(Tensor::new(vec![0.0; 4], vec![2, 2], true).expect("teacher tensor"));
+
+        let err = validate_teacher_params(&[trainable_teacher], &store)
+            .expect_err("trainable teacher parameters must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("teacher_params[0]"));
+        assert!(message.contains("requires_grad=true"));
+        assert!(message.contains("new_for_eval"));
+        assert!(message.contains("must not optimize teacher weights"));
     }
 
     #[test]
