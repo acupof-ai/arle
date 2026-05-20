@@ -283,7 +283,16 @@ fn map_qwen35_forward_error(stage: &str, err: Qwen35Error) -> OpdError {
              Qwen35Config matches the checkpoint and that rope_cache_len_hint \
              covers prompt length plus rollout length."
         )),
-        other => OpdError::Qwen35(other),
+        Qwen35Error::Autograd(err) => OpdError::InvalidInput(format!(
+            "OPD {stage} Qwen3.5 forward autograd error: {err}. Hint: verify \
+             the checkpoint tensor shapes match config.json, that teacher and \
+             student use compatible Qwen3.5-family layouts, and include this \
+             stage name in the OPD loader/model follow-up report."
+        )),
+        Qwen35Error::Config(err) => OpdError::InvalidInput(format!(
+            "OPD {stage} Qwen3.5 config error: {err}. Hint: verify config.json \
+             is a supported Qwen3/Qwen3.5-family config before running OPD."
+        )),
     }
 }
 
@@ -408,13 +417,14 @@ pub fn opd_step<O: Optimizer>(
 
 #[cfg(test)]
 mod tests {
-    use autograd::{Tensor, TensorStore};
+    use autograd::{AutogradError, Tensor, TensorStore};
 
     use super::{
-        OpdError, OpdStepConfig, greedy_next_token, validate_loss_value, validate_rollout_shape,
-        validate_step_config, validate_student_param_ownership, validate_student_params,
-        validate_teacher_params,
+        OpdError, OpdStepConfig, greedy_next_token, map_qwen35_forward_error, validate_loss_value,
+        validate_rollout_shape, validate_step_config, validate_student_param_ownership,
+        validate_student_params, validate_teacher_params,
     };
+    use crate::qwen35::Qwen35Error;
 
     #[test]
     fn greedy_next_token_rejects_logits_len_mismatch() {
@@ -613,6 +623,25 @@ mod tests {
         assert!(message.contains("cfg.grad_clip"));
         assert!(message.contains("non-negative"));
         assert!(message.contains("0.0"));
+    }
+
+    #[test]
+    fn map_qwen35_forward_error_wraps_autograd_errors_with_opd_context() {
+        let err = map_qwen35_forward_error(
+            "student KL",
+            Qwen35Error::Autograd(AutogradError::ShapeMismatch {
+                expected: vec![1, 2, 3],
+                got: vec![1, 2],
+            }),
+        );
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("OPD student KL"));
+        assert!(message.contains("autograd error"));
+        assert!(message.contains("checkpoint tensor shapes"));
+        assert!(message.contains("OPD loader/model follow-up"));
     }
 
     #[test]
