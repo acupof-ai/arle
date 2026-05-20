@@ -311,3 +311,38 @@ fn opd_step_rejects_teacher_param_mixed_into_student_params() {
     assert!(message.contains("belongs to the frozen"));
     assert!(message.contains("teacher weights must not be optimized"));
 }
+
+#[test]
+fn opd_step_rejects_short_rope_cache_with_actionable_error() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let mut cfg = tiny_qwen35_config();
+    cfg.rope_cache_len_hint = Some(2);
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    let err = opd_step(
+        &student,
+        &teacher,
+        &[1, 3, 8],
+        OpdStepConfig {
+            rollout_len: 0,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("rope cache shorter than prompt must fail with OPD context");
+
+    let OpdError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(message.contains("OPD teacher scoring"));
+    assert!(message.contains("rope_cache_len_hint"));
+    assert!(message.contains("prompt length plus rollout length"));
+}

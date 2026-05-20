@@ -261,6 +261,32 @@ fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -
     Ok(())
 }
 
+fn map_qwen35_forward_error(stage: &str, err: Qwen35Error) -> OpdError {
+    match err {
+        Qwen35Error::InputLenMismatch {
+            input_len,
+            expected_len,
+        } => OpdError::InvalidInput(format!(
+            "OPD {stage} Qwen3.5 forward input length mismatch: got \
+             {input_len}, expected {expected_len}. Hint: verify prompt_ids, \
+             generated rollout length, and position ids were built from the \
+             same rollout."
+        )),
+        Qwen35Error::PositionOutOfBounds { position, upper } => OpdError::InvalidInput(format!(
+            "OPD {stage} Qwen3.5 forward position id {position} is outside \
+             rope cache size {upper}. Hint: reduce prompt length or \
+             --rollout-len, or load/build a Qwen35Config with a larger \
+             rope_cache_len_hint."
+        )),
+        Qwen35Error::InvalidConfig(reason) => OpdError::InvalidInput(format!(
+            "OPD {stage} Qwen3.5 forward config error: {reason}. Hint: verify \
+             Qwen35Config matches the checkpoint and that rope_cache_len_hint \
+             covers prompt length plus rollout length."
+        )),
+        other => OpdError::Qwen35(other),
+    }
+}
+
 /// Run one OPD step:
 /// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
@@ -334,7 +360,7 @@ pub fn opd_step<O: Optimizer>(
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
         let logits = student
             .forward(store, tape, &rollout, &positions)
-            .map_err(OpdError::from)?;
+            .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
         let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
         rollout.push(next);
     }
@@ -350,13 +376,13 @@ pub fn opd_step<O: Optimizer>(
     let positions: Vec<u32> = (0..rollout.len() as u32).collect();
     let teacher_logits = teacher
         .forward(store, tape, &rollout, &positions)
-        .map_err(OpdError::from)?;
+        .map_err(|err| map_qwen35_forward_error("teacher scoring", err))?;
 
     // 3. Student forward — tape enabled now so backward can flow.
     tape.set_enabled(true);
     let student_logits = student
         .forward(store, tape, &rollout, &positions)
-        .map_err(OpdError::from)?;
+        .map_err(|err| map_qwen35_forward_error("student KL", err))?;
 
     // 4. KL distill loss.
     let loss = kl_distill_loss(student_logits, teacher_logits, rollout.len(), store, tape)?;
