@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use autograd::{TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use indicatif::{ProgressBar, ProgressStyle};
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
@@ -263,6 +264,15 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     let mut step_metrics: Vec<OpdStepMetric> = Vec::with_capacity(args.steps);
+    let progress = if args.json || args.steps == 0 {
+        None
+    } else {
+        let progress = ProgressBar::new(args.steps as u64);
+        progress.set_style(opd_progress_style()?);
+        progress.set_message("avg_loss=pending");
+        Some(progress)
+    };
+    let mut loss_sum = 0.0_f32;
     for step in 1..=args.steps {
         let outcome = opd_step(
             &student,
@@ -276,6 +286,8 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         )
         .with_context(|| format!("opd step {step} failed"))?;
         let grad_norm = current_grad_norm(&student_params, &store);
+        loss_sum += outcome.loss;
+        let avg_loss = loss_sum / step as f32;
         losses.push(outcome.loss);
         step_metrics.push(OpdStepMetric {
             step,
@@ -284,14 +296,17 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
             grad_norm,
             rollout_len: outcome.rollout_len,
         });
-        if !args.json {
-            println!(
-                "step {step}/{total} loss {loss:.6} grad_norm {grad_norm:.6} rollout_len {rl}",
-                total = args.steps,
-                loss = outcome.loss,
-                rl = outcome.rollout_len,
-            );
+        if let Some(progress) = &progress {
+            progress.set_message(format!("{avg_loss:.6}"));
+            progress.inc(1);
         }
+    }
+    if let Some(progress) = progress {
+        let final_loss = losses
+            .last()
+            .map(|loss| format!("{loss:.6}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        progress.finish_with_message(format!("final_loss={final_loss}"));
     }
 
     if args.json {
@@ -314,6 +329,15 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn opd_progress_style() -> Result<ProgressStyle> {
+    ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} \
+         avg_loss={msg} eta={eta_precise}",
+    )
+    .map(|style| style.progress_chars("=>-"))
+    .context("build OPD progress style")
 }
 
 fn current_grad_norm(params: &[TensorId], store: &TensorStore) -> f32 {
