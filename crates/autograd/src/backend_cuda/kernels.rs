@@ -25,6 +25,8 @@ const SCATTER_ADD_CU: &str = include_str!("kernels/scatter_add.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ADD_BROADCAST_CU: &str = include_str!("kernels/add_broadcast.cu");
 #[cfg(not(feature = "no-cuda"))]
+const LAYOUT_CU: &str = include_str!("kernels/layout.cu");
+#[cfg(not(feature = "no-cuda"))]
 const ADAMW_CU: &str = include_str!("kernels/adamw.cu");
 #[cfg(not(feature = "no-cuda"))]
 const LOG_SOFTMAX_BACKWARD_CU: &str = include_str!("kernels/log_softmax_backward.cu");
@@ -54,20 +56,26 @@ const FUNCTION_NAMES: &[&str] = &[
     "add_f32",
     "mul_f32",
     "mul_scalar_f32",
+    "sigmoid_f32",
     "gelu_f32",
     "exp_f32",
     "neg_f32",
     "softmax_last_axis_f32",
     "log_softmax_last_axis_f32",
+    "softmax_last_axis_backward_f32",
     "silu_f32",
     "rms_norm_f32",
     "embedding_f32",
+    "sum_squares_partial_f32",
     "sum_last_axis_f32",
     "mean_last_axis_f32",
     "rope_f32",
     "gather_last_dim_f32",
     "scatter_add_rows_f32",
     "add_broadcast_f32",
+    "transpose_axes_swap_f32",
+    "slice_f32",
+    "slice_backward_f32",
     "adamw_step_f32",
     "log_softmax_last_axis_backward_f32",
     "gather_last_dim_backward_f32",
@@ -230,6 +238,7 @@ fn concat_sources() -> String {
         GATHER_CU,
         SCATTER_ADD_CU,
         ADD_BROADCAST_CU,
+        LAYOUT_CU,
         ADAMW_CU,
         LOG_SOFTMAX_BACKWARD_CU,
         GATHER_BACKWARD_CU,

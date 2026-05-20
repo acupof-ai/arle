@@ -3,7 +3,7 @@
 //!
 //! See `docs/plans/train-runtime-architecture-v1.md` §4.4.
 
-use autograd::{Result, TensorId, TensorStore};
+use autograd::{Device, Result, TensorId, TensorStore, tensor::Dirty};
 
 /// Pre-clip global L2 norm across every param's gradient.
 ///
@@ -17,14 +17,24 @@ fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 {
         let Some(grad) = store.get(grad_id) else {
             continue;
         };
-        total_sq_norm += grad
-            .data
-            .iter()
-            .map(|&value| {
-                let value = f64::from(value);
-                value * value
-            })
-            .sum::<f64>();
+        if store.backend().device() != Device::Cpu
+            && grad.dirty != Dirty::Host
+            && let Some(handle) = grad.device_handle.as_ref()
+        {
+            total_sq_norm += store
+                .backend()
+                .sum_squares(handle, &grad.shape)
+                .expect("device grad norm should be computable");
+        } else {
+            total_sq_norm += grad
+                .data
+                .iter()
+                .map(|&value| {
+                    let value = f64::from(value);
+                    value * value
+                })
+                .sum::<f64>();
+        }
     }
     total_sq_norm.sqrt()
 }
@@ -51,6 +61,28 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
         let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
             continue;
         };
+        let device_grad = {
+            let Some(grad) = store.get(grad_id) else {
+                continue;
+            };
+            if store.backend().device() != Device::Cpu && grad.dirty != Dirty::Host {
+                grad.device_handle
+                    .as_ref()
+                    .map(|handle| (handle.clone(), grad.shape.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((handle, shape)) = device_grad {
+            let scaled = store
+                .backend()
+                .mul_scalar(&handle, scale as f32, &shape)
+                .expect("device grad scale should be computable");
+            store
+                .replace_device_handle(grad_id, scaled)
+                .expect("scaled device grad should be installable");
+            continue;
+        }
         let Some(grad) = store.get_mut(grad_id) else {
             continue;
         };

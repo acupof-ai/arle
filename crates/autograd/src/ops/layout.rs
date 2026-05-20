@@ -345,6 +345,29 @@ pub(crate) fn reshape_backward(
             "reshape backward missing saved shape",
         ));
     };
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+        if shape_numel(&input_shape) != shape_numel(&upstream_shape) {
+            return Err(AutogradError::ShapeMismatch {
+                expected: input_shape,
+                got: upstream_shape,
+            });
+        }
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle = store.backend().reshape(&upstream_handle, &input_shape)?;
+        let grad_id = store.alloc_device_tensor(input_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
+
     let upstream = store.tensor_host(output_grad_id)?;
     if shape_numel(&input_shape) != upstream.size {
         return Err(AutogradError::ShapeMismatch {
@@ -375,6 +398,26 @@ pub(crate) fn transpose_backward(
             "transpose backward missing saved axes",
         ));
     };
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let (grad_handle, grad_shape) =
+            store
+                .backend()
+                .transpose_axes_swap(&upstream_handle, &upstream_shape, axis1, axis2)?;
+        let grad_id = store.alloc_device_tensor(grad_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
+
     let upstream = store.tensor_host(output_grad_id)?;
     let (data, shape) = transpose_data(&upstream.data, &upstream.shape, axis1, axis2)?;
     let grad_id = store.alloc(Tensor::new(data, shape, false)?);
@@ -405,19 +448,41 @@ pub(crate) fn slice_backward(
         ));
     };
 
-    let upstream = store.tensor_host(output_grad_id)?;
     let expected_shape: Vec<usize> = starts
         .iter()
         .zip(ends.iter())
         .map(|(&start, &end)| end - start)
         .collect();
-    if upstream.shape != expected_shape {
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if upstream_shape != expected_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: expected_shape,
-            got: upstream.shape,
+            got: upstream_shape,
         });
     }
 
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle = store.backend().slice_backward_device(
+            &upstream_handle,
+            &input_shape,
+            &starts,
+            &ends,
+        )?;
+        let grad_id = store.alloc_device_tensor(input_shape, grad_handle)?;
+        return Ok(smallvec![(x, grad_id)]);
+    }
+
+    let upstream = store.tensor_host(output_grad_id)?;
     let input_strides = contiguous_strides(&input_shape);
     let mut grad = vec![0.0; shape_numel(&input_shape)];
     for (out_index, &grad_value) in upstream.data.iter().enumerate() {

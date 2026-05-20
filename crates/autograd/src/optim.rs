@@ -375,6 +375,19 @@ impl AdamW {
     }
 
     pub fn zero_grad(&mut self, params: &[TensorId], store: &mut TensorStore) {
+        if self.backend.is_some() {
+            for &param_id in params {
+                let grad_id = store.get(param_id).and_then(|tensor| tensor.grad);
+                if let Some(grad_id) = grad_id {
+                    store
+                        .set_grad(param_id, None)
+                        .expect("clear device-backed grad id");
+                    store.free(grad_id).expect("free device-backed grad tensor");
+                }
+            }
+            return;
+        }
+
         for &param_id in params {
             let grad_id = store.get(param_id).and_then(|tensor| tensor.grad);
             if let Some(grad_id) = grad_id

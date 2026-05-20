@@ -6,6 +6,34 @@
 // block=(256, 1, 1), shared=block * f32. Output is a contiguous rank-(n-1)
 // tensor of length `rows`.
 
+extern "C" __global__ void sum_squares_partial_f32(
+    double* __restrict__ partial,
+    const float* __restrict__ x,
+    int n
+) {
+    extern __shared__ double smem64[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    double local = 0.0;
+    if (idx < n) {
+        double value = (double)x[idx];
+        local = value * value;
+    }
+    smem64[tid] = local;
+    __syncthreads();
+
+    for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+        if (tid < step) {
+            smem64[tid] += smem64[tid + step];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = smem64[0];
+    }
+}
+
 extern "C" __global__ void sum_last_axis_f32(
     float* __restrict__ out,
     const float* __restrict__ x,

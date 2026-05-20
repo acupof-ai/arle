@@ -1,0 +1,43 @@
+Initial CUDA OPD runnable breached the >500 ms/step guard, so the path was
+profiled before adding more code.
+
+Run 1: host AdamW path
+- mean: 0.704146 s/step outside nsys; 1.133207 s/step under nsys
+- CUDA API hot spots:
+  - cuMemcpyHtoDAsync_v2: 100,339 calls, 6.430 s API time
+  - cuMemcpyDtoHAsync_v2: 25,542 calls, 5.236 s API time
+  - cuStreamSynchronize: 35,948 calls
+- GPU memcpy:
+  - HtoD: 22.840 GB, 7.038 s
+  - DtoH: 6.566 GB, 2.617 s
+- Main diagnosis: optimizer fallback was round-tripping large params/grads.
+
+Run 2: device AdamW before zero_grad fix
+- mean: 0.788555 s/step outside nsys; 0.839289 s/step under nsys
+- GPU memcpy:
+  - DtoH: 20.017 GB, 6.095 s
+  - HtoD: 29.799 GB, 4.063 s
+  - DtoD: 38.423 GB
+  - memset: 45.665 GB
+- Main diagnosis: device-backed AdamW zero_grad used get_mut on retained grads,
+  forcing readbacks before the next step.
+
+Run 3: device AdamW after zero_grad fix, before softmax/embedding device fixes
+- mean: 0.646225 s/step outside nsys; 0.710069 s/step under nsys
+- GPU memcpy:
+  - DtoH: 16.658 GB, 4.788 s
+  - HtoD: 26.831 GB, 3.873 s
+  - DtoD: 38.423 GB
+  - memset: 45.665 GB
+- AdamW host-grad residency probe:
+  - before softmax backward: 127 host-grad params, 209.551 MiB per step
+  - after softmax backward: 2 first-step host-grad params, 64.002 MiB total
+  - after device embedding: 0 host-grad params
+
+Final committed bench also includes device-aware gradient clipping. It computes
+per-grad sumsq via CUDA partial reductions and scales device grad handles via
+the existing device mul_scalar path, avoiding full-gradient readback.
+
+Raw nsys .nsys-rep/.sqlite files were local diagnosis artifacts and are not
+committed because the text summary captures the decision evidence without
+adding hundreds of MiB to the repo.
