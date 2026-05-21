@@ -251,7 +251,7 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
 4. Done: full-model single-token logits after the f32-load fix pass the
    pragmatic 9B GPTQModel envelope: top-64 dominant relerr `0.124`, top-64
    RMSE/reference-RMS `0.043`, ARLE argmax `11`, PyTorch BF16 argmax `11`.
-5. Killed: 9B GPTQModel -> 0.8B LoRA OPD on the current train-side f32
+5. Killed: 9B GPTQModel -> 0.8B LoRA OPD on the old train-side f32
    student base. Both the 100-step real-prompt bench and a single-token,
    rollout-1 control fail before `eval_summary step=0` with
    `cuda htod copy failed`; live memory reached `14399 MiB / 16376 MiB`.
@@ -259,15 +259,15 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
    `[1024, 3584]` f32 projection upload (`14.68 MB`) returning
    `CUDA_ERROR_OUT_OF_MEMORY`, confirming whole-runtime memory exhaustion
    rather than a single oversized tensor.
-6. Next memory axis: make the train-side LoRA student base truly frozen BF16
-   (or add an equivalent low-memory frozen-base loader) before rerunning the
-   9B OPD bench. Step 0 audit:
-   `docs/research/2026-05-22-opd-frozen-bf16-lora-student-step0-audit.md`.
-   Upload-size instrumentation has already proven the failing allocation is a
-   small `[1024, 3584]` f32 projection upload, so the next implementation must
-   remove f32 residency for the frozen student base rather than rerun lower
-   rollout lengths.
-7. Next DX axis: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so
+6. Done, then killed: BF16 frozen-base substrate and Qwen3.5 LoRA loader
+   selection landed, but the same-card 9B GPTQModel -> 0.8B LoRA control still
+   OOMs during the first backward pass. The strictest no-eval control used
+   `rollout_len=1`, `prompt_max_tokens=1`, and hit `15871 MiB used / 73 MiB
+   free` immediately before `cuda alloc_zeros failed (mean_backward_device)`.
+   This rules out the original f32-loader bug as the remaining blocker and
+   reclassifies the issue as same-card teacher/student/tape co-residency on a
+   16 GB GPU.
+7. Current DX axis: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so
    `arle train opd` can select local infer, external API, or routed specialist
    teachers without editing examples.
    - Example-level surface: `opd_step_cuda_infer_teacher_train` accepts
@@ -275,8 +275,15 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
      `--teacher-config` for deterministic token-prefix routing across multiple
      API teachers.
    - Sample config: `examples/opd/multi-teacher-config.example.json`.
+   - Verified gate: `cargo test -p train --lib --release teacher_infer` passes
+     `ApiTeacher` BF16/f32 decode, HTTP full-logits upload, and
+     `MultiTeacher` longest-prefix routing tests.
    - Still open: wire the same config surface into `arle train opd` once the
      current CLI dirty work is reconciled.
+   - Memory note: a same-GPU local API teacher does not solve the 9B OOM,
+     because teacher+student still co-reside. API/multi-teacher is the right
+     9B path when the teacher runs on another GPU/host or separate service
+     memory budget.
 
 Evidence:
 
@@ -293,6 +300,7 @@ bench-output/2026-05-22-qwen35-9b-gptqmodel-dense-parity/
 bench-output/2026-05-22-qwen35-9b-gptqmodel-full-logits-after-f32load-fix/
 bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher/
 bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-smoke-minimal/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-bf16-student-smoke-noeval-memtrace/
 ```
 
 ## Implementation Order
@@ -303,11 +311,13 @@ bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-smoke-minimal/
 4. Next: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so `arle train
    opd` can select local infer, external API, or routed specialists without
    editing examples.
-5. Add train-side BF16 frozen-base support for LoRA students before claiming a
-   9B teacher -> 0.8B student 16 GB OPD bench.
-6. Add top-k loss only if a real target API cannot provide full logits.
-7. Return to 9B headline work only after the BF16 frozen-base memory gate and
-   OPD KL trajectory gate pass.
+5. Done: add train-side BF16 frozen-base support for LoRA students.
+6. Killed: same-card 9B GPTQModel -> 0.8B LoRA OPD still exceeds 16 GB even
+   after BF16 frozen-base support.
+7. Add top-k loss only if a real target API cannot provide full logits.
+8. Return to 9B headline work only after one of these passes: remote/API
+   teacher no-OOM + monotonic KL, smaller/quantized train-side student, or a
+   larger-memory GPU local-teacher bench.
 
 ## Cross-Links
 
