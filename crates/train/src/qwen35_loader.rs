@@ -52,7 +52,7 @@ use autograd::{Device, Tensor, TensorId, TensorStore};
 use half::{bf16, f16};
 use memmap2::Mmap;
 use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
-use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -109,9 +109,7 @@ pub enum LoaderError {
          Qwen35Model schema before running OPD."
     )]
     Model(#[from] Qwen35Error),
-    #[error(
-        "shape mismatch for {name}: model expects {expected:?}, safetensors has {got:?}{hint}"
-    )]
+    #[error("shape mismatch for {name}: model expects {expected:?}, safetensors has {got:?}{hint}")]
     ShapeMismatch {
         name: String,
         expected: Vec<usize>,
@@ -946,7 +944,7 @@ fn q_proj_gate_hint(train_name: &str, expected: &[usize], got: &[usize]) -> Stri
 mod tests {
     use std::borrow::Cow;
 
-    use safetensors::{serialize_to_file, Dtype};
+    use safetensors::{Dtype, serialize_to_file};
 
     use super::*;
 
@@ -1080,10 +1078,11 @@ mod tests {
         assert_eq!(cfg.bos_token_id, Some(151_643));
         assert!(cfg.tie_word_embeddings);
         assert_eq!(cfg.layer_types.len(), 28);
-        assert!(cfg
-            .layer_types
-            .iter()
-            .all(|lt| *lt == LayerType::FullAttention));
+        assert!(
+            cfg.layer_types
+                .iter()
+                .all(|lt| *lt == LayerType::FullAttention)
+        );
         // Synthesized linear_* fields are inert (no LinearAttention layers).
         assert_eq!(cfg.linear_num_key_heads, 16);
         assert_eq!(cfg.linear_key_head_dim, 128);

@@ -13,23 +13,23 @@
 
 #[cfg(not(feature = "no-cuda"))]
 use crate::{
-    backend::{
-        matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
-        validate_decode_gqa_shapes, validate_qwen_decode_prepare_kv_shapes,
-        validate_qwen_decode_prepare_q_shapes, CudaBf16Storage, CudaStorage,
-    },
     AutogradError,
+    backend::{
+        CudaBf16Storage, CudaStorage, matmul_bt_output_shape, matmul_output_shape,
+        validate_broadcast, validate_decode_gqa_shapes, validate_qwen_decode_prepare_kv_shapes,
+        validate_qwen_decode_prepare_q_shapes,
+    },
 };
 use crate::{
-    backend::{Backend, Device, DeviceGradClipResult, DeviceHandle},
     Result,
+    backend::{Backend, Device, DeviceGradClipResult, DeviceHandle},
 };
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/kernels.rs"]
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{launch_1d, launch_rows, KernelCache};
+use self::kernels::{KernelCache, launch_1d, launch_rows};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
@@ -37,7 +37,7 @@ use cudarc::cublas::sys::cublasOperation_t;
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 #[cfg(not(feature = "no-cuda"))]
-use cudarc::driver::sys::{cuMemcpyDtoD_v2, CUdeviceptr, CUresult};
+use cudarc::driver::sys::{CUdeviceptr, CUresult, cuMemcpyDtoD_v2};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
 #[cfg(not(feature = "no-cuda"))]
