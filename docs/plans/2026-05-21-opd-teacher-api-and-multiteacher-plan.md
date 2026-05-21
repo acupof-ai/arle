@@ -14,13 +14,17 @@ Train-side OPD already has a teacher abstraction:
 - `InferTeacher`: wraps an in-process `infer::LoadedInferenceEngine` and
   returns raw logits through the device bridge
 
-That means ARLE can use two local teacher classes today:
+That means ARLE can use four teacher classes today:
 
 1. A train-side frozen `Qwen35Model`
 2. A local `infer` runtime teacher through `InferTeacher`
+3. A full-logits HTTP teacher through `ApiTeacher`
+4. A deterministic token-prefix multi-teacher router through `MultiTeacher`
 
-It does **not** yet support an arbitrary external HTTP/OpenAI-style API as the
-OPD teacher.
+`ApiTeacher` is intentionally a full-logits API, not an ordinary chat API:
+it imports f32/bf16 logits into the caller `TensorStore` and can be routed
+through the same OPD KL path as local teachers. It is correct-first and
+profiled, but not claimed as a latency win over in-process `InferTeacher`.
 
 ## Why Ordinary Chat/Completions APIs Are Not Enough
 
@@ -70,7 +74,7 @@ docs/research/2026-05-21-arle-qwen35-9b-local-availability.md
 
 ## Work Queue
 
-### T1 — External Full-Logits Teacher API
+### T1 — External Full-Logits Teacher API — DONE
 
 Add an `ApiTeacher` implementation of `TeacherForward`.
 
@@ -87,10 +91,20 @@ POST /v1/token_logits
 response:
 {
   "shape": [seq_len, vocab_size],
-  "vocab_size": usize,
+  "dtype": "bf16" | "f32",
   "logits_b64": "..."
 }
 ```
+
+Implementation landed:
+
+- Commit: `c0a2975 feat(opd): add external API teacher logits bridge`
+- Code: `crates/train/src/teacher_infer.rs::ApiTeacher`
+- Supported response formats:
+  - JSON `logits: Vec<f32>`
+  - little-endian `logits_b64` with dtype `f32` / `float32`
+  - little-endian `logits_b64` with dtype `bf16` / `bfloat16`
+- Profile counters: HTTP, decode, upload, total.
 
 Constraints:
 
@@ -137,7 +151,7 @@ License gate:
   the direction of improvement: held-out KL/NLL improves within 10% of the
   full-logits run over 100 steps.
 
-### T3 — Multi-Teacher Router
+### T3 — Multi-Teacher Router — PROMPT ROUTER DONE
 
 Add a `MultiTeacher` implementation of `TeacherForward`.
 
@@ -152,6 +166,21 @@ Supported modes, in implementation order:
 
 Prompt-router is first because it preserves the current KL path exactly: each
 OPD step still has one teacher distribution.
+
+Implementation landed:
+
+- Commit: `0bfa852 feat(opd): add multi-teacher routing abstraction`
+- Code: `crates/train/src/teacher_infer.rs::MultiTeacher`
+- Routing mode: deterministic longest token-prefix match with configured
+  default teacher.
+- Safety: validates all teachers share `vocab_size`; unions all local teacher
+  parameter ids so cleanup does not free in-process teacher tensors.
+
+Still open:
+
+- CLI / JSON config surface for named teachers and token-prefix routes.
+- Per-step route logging in the real OPD harness.
+- Weighted ensemble and confidence-router modes.
 
 Weighted ensemble requires a stable distribution aggregation:
 
@@ -236,11 +265,14 @@ bench-output/2026-05-22-qwen35-9b-gptqmodel-dense-parity/
 
 ## Implementation Order
 
-1. Land the local 9B availability note and raw artifacts.
-2. Add `ApiTeacher` full-logits client behind `TeacherForward`.
-3. Add prompt-router `MultiTeacher`.
-4. Add top-k loss only if a real target API cannot provide full logits.
-5. Return to 9B loader work after the teacher abstraction is stable.
+1. Done: local 9B availability note and raw artifacts.
+2. Done: `ApiTeacher` full-logits client behind `TeacherForward`.
+3. Done: prompt-router `MultiTeacher`.
+4. Next: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so `arle train
+   opd` can select local infer, external API, or routed specialists without
+   editing examples.
+5. Add top-k loss only if a real target API cannot provide full logits.
+6. Return to 9B loader work after the teacher abstraction is stable.
 
 ## Cross-Links
 
