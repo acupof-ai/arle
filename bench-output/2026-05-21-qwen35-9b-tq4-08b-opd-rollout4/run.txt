@@ -1,0 +1,625 @@
+warning: cuda-kernels@0.1.5: Compiling CUDA kernels for targets: sm_89
+warning: cuda-kernels@0.1.5: TileLang AOT: built per-SM cubins for 1 target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.
+   Compiling infer v0.1.5 (/home/ckl/projects/arle/infer)
+warning: unused import: `half::bf16`
+  --> infer/src/model/deepseek/mlp.rs:23:5
+   |
+23 | use half::bf16;
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ensure_dispatch_payload_scratch`, `ensure_local_route_scratch`, `ensure_recv_route_scratch`, `ensure_route_logits_scratch`, and `ensure_send_route_scratch`
+  --> infer/src/model/deepseek/mlp.rs:34:67
+   |
+34 |     DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
+   |                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+35 |     ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+36 |     ensure_send_route_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `argmax_batch_readback_into`
+   --> infer/src/ops.rs:645:34
+    |
+645 |     argmax_batch_logprob_launch, argmax_batch_readback_into, gpu_sample_launch_raw,
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> infer/src/model/deepseek/weights.rs:188:13
+    |
+188 |         let mut comm = LayerCommunicator::new_with_ep(
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+   --> infer/src/model/deepseek/weights.rs:185:9
+    |
+185 |         ctx: &DeviceContext,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `forward_scratch_input` and `try_forward_scratch_input_segment` are never used
+   --> infer/src/model/deepseek/mlp.rs:105:19
+    |
+ 66 | impl DeepseekV4Expert {
+    | --------------------- methods in this implementation
+...
+105 |     pub(super) fn forward_scratch_input<'a>(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+157 |     pub(super) fn try_forward_scratch_input_segment(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `dsv4_run_block_scaled_gemv_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:317:4
+    |
+317 | fn dsv4_run_block_scaled_gemv_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_run_block_scaled_gemv_pair_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:404:4
+    |
+404 | fn dsv4_run_block_scaled_gemv_pair_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1090:4
+     |
+1090 | fn dsv4_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_pair_expert_gemv_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1102:4
+     |
+1102 | fn dsv4_pair_expert_gemv_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_route_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1114:4
+     |
+1114 | fn dsv4_route_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CountExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1229:6
+     |
+1229 | enum Dsv4CountExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_count_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1235:4
+     |
+1235 | fn dsv4_count_exchange_mode() -> Result<Dsv4CountExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_padded_dispatch_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1251:4
+     |
+1251 | fn dsv4_padded_dispatch_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_fused_dispatch_payload_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1263:4
+     |
+1263 | fn dsv4_fused_dispatch_payload_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CombineExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1276:6
+     |
+1276 | enum Dsv4CombineExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_combine_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1282:4
+     |
+1282 | fn dsv4_combine_exchange_mode() -> Result<Dsv4CombineExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_reduce_scatter_combine_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1294:4
+     |
+1294 | fn dsv4_reduce_scatter_combine_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_zero_i32_slice` is never used
+    --> infer/src/model/deepseek/mlp.rs:3933:4
+     |
+3933 | fn dsv4_zero_i32_slice(ctx: &DeviceContext, slice: &mut CudaSlice<i32>, len: usize) -> Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_offsets_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:3975:4
+     |
+3975 | fn dsv4_counts_to_offsets_i32(counts: &[i32], label: &str) -> Result<(Vec<i32>, usize)> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:3998:4
+     |
+3998 | fn dsv4_counts_to_usize(counts: &[i32], label: &str) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_offsets_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4013:4
+     |
+4013 | fn dsv4_offsets_to_usize(offsets: &[i32]) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_scale_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4028:4
+     |
+4028 | fn dsv4_scale_usize(values: &[usize], factor: usize) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_usize_to_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:4040:4
+     |
+4040 | fn dsv4_usize_to_i32(value: usize, label: &str) -> Result<i32> {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+  --> infer/src/model/deepseek/state.rs:88:16
+   |
+87 | pub(crate) struct DeepseekMoeRuntimeCache {
+   |                   ----------------------- fields in this struct
+88 |     pub(crate) route_logits: Option<DeepseekRouteLogitsRuntimeScratch>,
+   |                ^^^^^^^^^^^^
+89 |     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
+   |                ^^^^^^^^
+90 |     pub(crate) dispatch_payload: Option<DeepseekDispatchPayloadRuntimeScratch>,
+   |                ^^^^^^^^^^^^^^^^
+91 |     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+92 |     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+93 |     pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
+   |                ^^^^^^^^^^^
+94 |     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
+   |                ^^^^^^
+...
+97 |     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+   |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_tokens`, `n_experts`, and `logits` are never read
+   --> infer/src/model/deepseek/state.rs:102:16
+    |
+101 | pub(crate) struct DeepseekRouteLogitsRuntimeScratch {
+    |                   --------------------------------- fields in this struct
+102 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+103 |     pub(crate) n_experts: usize,
+    |                ^^^^^^^^^
+104 |     pub(crate) logits: HiddenStates,
+    |                ^^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:109:16
+    |
+108 | pub(crate) struct DeepseekDispatchRuntimeScratch {
+    |                   ------------------------------ fields in this struct
+109 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+110 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+111 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+112 |     pub(crate) topk: usize,
+    |                ^^^^
+113 |     pub(crate) ep_world: usize,
+    |                ^^^^^^^^
+114 |     pub(crate) experts_per_rank: usize,
+    |                ^^^^^^^^^^^^^^^^
+115 |     pub(crate) token_ids: CudaSlice<u32>,
+    |                ^^^^^^^^^
+116 |     pub(crate) route_indices: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+117 |     pub(crate) route_weights: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+118 |     pub(crate) send_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+119 |     pub(crate) send_rank_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+120 |     pub(crate) rank_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+121 |     pub(crate) send_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+122 |     pub(crate) send_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+123 |     pub(crate) all_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+124 |     pub(crate) recv_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+125 |     pub(crate) local_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+126 |     pub(crate) local_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+127 |     pub(crate) local_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `stride_elems`, `send_payload`, and `recv_payload` are never read
+   --> infer/src/model/deepseek/state.rs:132:16
+    |
+131 | pub(crate) struct DeepseekDispatchPayloadRuntimeScratch {
+    |                   ------------------------------------- fields in this struct
+132 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+133 |     pub(crate) stride_elems: usize,
+    |                ^^^^^^^^^^^^
+134 |     pub(crate) send_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+135 |     pub(crate) recv_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `send_token`, and `send_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:140:16
+    |
+139 | pub(crate) struct DeepseekSendRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+140 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+141 |     pub(crate) send_token: CudaSlice<i32>,
+    |                ^^^^^^^^^^
+142 |     pub(crate) send_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `recv_hidden`, `recv_meta`, and `route_out` are never read
+   --> infer/src/model/deepseek/state.rs:147:16
+    |
+146 | pub(crate) struct DeepseekRecvRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+147 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+148 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+149 |     pub(crate) recv_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+150 |     pub(crate) recv_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+151 |     pub(crate) route_out: HiddenStates,
+    |                ^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `expert_hidden`, `expert_weight`, and `expert_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:156:16
+    |
+155 | pub(crate) struct DeepseekLocalRouteRuntimeScratch {
+    |                   -------------------------------- fields in this struct
+156 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+157 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+158 |     pub(crate) expert_hidden: HiddenStates,
+    |                ^^^^^^^^^^^^^
+159 |     pub(crate) expert_weight: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+160 |     pub(crate) expert_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+
+warning: field `input` is never read
+   --> infer/src/model/deepseek/state.rs:188:16
+    |
+183 | pub(crate) struct DeepseekExpertRuntimeScratch {
+    |                   ---------------------------- field in this struct
+...
+188 |     pub(crate) input: HiddenStates,
+    |                ^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:238:16
+    |
+237 | pub(crate) struct DeepseekRouteCombineRuntimeScratch {
+    |                   ---------------------------------- fields in this struct
+238 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+239 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+240 |     pub(crate) combine_recv: HiddenStates,
+    |                ^^^^^^^^^^^^
+241 |     pub(crate) route_slot_out: HiddenStates,
+    |                ^^^^^^^^^^^^^^
+242 |     pub(crate) combine_fp8_send: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+243 |     pub(crate) combine_fp8_recv: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+244 |     pub(crate) combine_scale_send: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+245 |     pub(crate) combine_scale_recv: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+
+warning: methods `ensure_dispatch_scratch`, `ensure_expert_scratch`, and `ensure_route_combine_scratch` are never used
+   --> infer/src/model/deepseek/state.rs:250:19
+    |
+249 | impl DeepseekMoeRuntimeCache {
+    | ---------------------------- methods in this implementation
+250 |     pub(crate) fn ensure_dispatch_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+302 |     pub(crate) fn ensure_expert_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+416 |     pub(crate) fn ensure_route_combine_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_route_logits_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:456:15
+    |
+456 | pub(crate) fn ensure_route_logits_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_send_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:480:15
+    |
+480 | pub(crate) fn ensure_send_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_dispatch_payload_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:503:15
+    |
+503 | pub(crate) fn ensure_dispatch_payload_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_recv_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:532:15
+    |
+532 | pub(crate) fn ensure_recv_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_local_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:560:15
+    |
+560 | pub(crate) fn ensure_local_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `generate_greedy` is never used
+   --> infer/src/model/deepseek/reference.rs:111:19
+    |
+ 94 | impl DeepseekV4ReferenceModel {
+    | ----------------------------- method in this implementation
+...
+111 |     pub(crate) fn generate_greedy(
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `argmax` is never used
+    --> infer/src/model/deepseek/reference.rs:1803:4
+     |
+1803 | fn argmax(values: &[f32]) -> usize {
+     |    ^^^^^^
+
+warning: `infer` (lib) generated 41 warnings (run `cargo fix --lib -p infer` to apply 5 suggestions)
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `release` profile [optimized] target(s) in 1m 53s
+     Running `target/release/examples/opd_step_cuda_infer_teacher_train --teacher-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4 --student-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base --prompts-file examples/opd/sample-prompts.jsonl --steps 100 --rollout-len 4 --lr 1e-5 --eval-steps 0,25,50,100 --prompt-max-tokens 16 --max-step-seconds 90`
+config backend=cuda teacher_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4 student_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base student_mode=lora lora_rank=16 lora_alpha=32.000000 lora_target_set=attention-qv steps=100 rollout_len=4 lr=9.999999747e-6 grad_clip=1 prompt_source=jsonl:examples/opd/sample-prompts.jsonl rows=20 tokenizer=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base/tokenizer.json truncated_rows=1 train_prompt_count=16 heldout_prompt_count=4 eval_steps=[0, 25, 50, 100] cuda_graph=true
+prompt split=train index=0 ids=[814, 20139, 3069, 2526, 3992, 3983, 8495, 494, 383, 64179, 1527, 63853, 13]
+prompt split=train index=1 ids=[8917, 5437, 537, 279, 6463, 1881, 4487, 65427, 321, 9637, 65427, 13]
+prompt split=train index=2 ids=[7734, 264, 61446, 50802, 364, 26805, 264, 52965, 4706, 2923, 13]
+prompt split=train index=3 ids=[3710, 3520, 264, 27502, 1067, 54067, 30]
+prompt split=train index=4 ids=[72240, 1204, 264, 19088, 10756, 628, 8214, 264, 17671, 71698, 5286, 1558, 13]
+prompt split=train index=5 ids=[33963, 264, 2716, 3010, 314, 264, 9640, 421, 6813, 33633, 31626, 13]
+prompt split=train index=6 ids=[826, 2250, 11590, 421, 264, 4706, 1542, 369, 35140, 3072, 13]
+prompt split=train index=7 ids=[814, 20139, 3817, 11258, 35887, 303, 799, 13901, 13]
+prompt split=train index=8 ids=[4199, 1220, 449, 22839, 9973, 3315, 310, 2426, 466, 5332, 449, 24460, 30]
+prompt split=train index=9 ids=[7734, 264, 16338, 5020, 883, 21966, 4779, 22627, 16070, 13]
+prompt split=train index=10 ids=[9930, 369, 4581, 33686, 26370, 6807, 2166, 47590, 430, 449, 5428, 17723, 30]
+prompt split=train index=11 ids=[26487, 54102, 45543, 440, 47241, 6299, 11336, 364, 1527, 63853, 13]
+prompt split=train index=12 ids=[3710, 369, 279, 3364, 314, 5467, 9502, 49219, 303, 449, 12753, 35, 9064, 30]
+prompt split=train index=13 ids=[814, 20139, 3069, 17515, 11241, 4766, 303, 4906, 944, 13]
+prompt split=train index=14 ids=[33963, 264, 799, 1284, 17834, 7044, 314, 15135, 19441, 45597, 4706, 13]
+prompt split=train index=15 ids=[3710, 1220, 264, 1156, 1716, 1518, 4162, 264, 1167, 16451, 44424, 27502, 30]
+prompt split=heldout index=0 ids=[72240, 264, 5902, 1581, 6618, 4238, 364, 264, 3043, 15464, 2680, 5286, 13]
+prompt split=heldout index=1 ids=[9930, 628, 264, 4557, 15196, 7042, 1345, 4581, 26370, 25710, 9766, 30]
+prompt split=heldout index=2 ids=[7734, 264, 2716, 9663, 883, 5132, 49219, 1973, 449, 6326, 6696, 13]
+prompt split=heldout index=3 ids=[814, 20139, 3069, 264, 1865, 1414, 9640, 716, 369, 2577, 1056, 1375, 2195, 17952, 3817, 27437]
+model_summary student_hidden=1024 student_layers=24 student_vocab=248320 student_model_elements=769809216 student_trainable_elements=638976 student_load_seconds=10.172240 infer_load_seconds=119.872016
+eval_summary step=0 train_kl=1.499280006101e-5 heldout_kl=1.821073738029e-5 eval_seconds=21.878576
+train_step step=1 prompt_index=0 loss=1.524423714727e-5 rollout_len=17 step_seconds=4.558480
+phase_summary step=1 total=4.558480 student_rollout=1.017446 infer_forward_token_logits=0.004546 infer_sync=1.134504 d2d_bridge_import=0.000556 teacher_forward_total=1.139612 student_forward=0.284415 kl_loss=0.012312 optimizer_zero_grad=0.000001 backward=2.096027 grad_clip=0.000518 optimizer_step=0.000643 post_step_cleanup=0.007481 teacher_seq_len=17 teacher_vocab=248320
+train_step step=2 prompt_index=1 loss=2.026794754784e-5 rollout_len=16 step_seconds=4.489762
+phase_summary step=2 total=4.489762 student_rollout=0.992467 infer_forward_token_logits=0.004444 infer_sync=1.295522 d2d_bridge_import=0.000077 teacher_forward_total=1.300048 student_forward=0.261124 kl_loss=0.007636 optimizer_zero_grad=0.000021 backward=1.920050 grad_clip=0.000526 optimizer_step=0.000461 post_step_cleanup=0.007415 teacher_seq_len=16 teacher_vocab=248320
+train_step step=3 prompt_index=2 loss=1.944354335137e-5 rollout_len=15 step_seconds=4.197381
+phase_summary step=3 total=4.197381 student_rollout=0.907575 infer_forward_token_logits=0.004439 infer_sync=1.212220 d2d_bridge_import=0.000550 teacher_forward_total=1.217214 student_forward=0.247050 kl_loss=0.007292 optimizer_zero_grad=0.000024 backward=1.809759 grad_clip=0.000516 optimizer_step=0.000460 post_step_cleanup=0.007448 teacher_seq_len=15 teacher_vocab=248320
+train_step step=4 prompt_index=3 loss=1.132127999881e-5 rollout_len=11 step_seconds=3.190832
+phase_summary step=4 total=3.190831 student_rollout=0.654560 infer_forward_token_logits=0.004505 infer_sync=0.970569 d2d_bridge_import=0.000093 teacher_forward_total=0.975172 student_forward=0.182937 kl_loss=0.005849 optimizer_zero_grad=0.000020 backward=1.363880 grad_clip=0.000500 optimizer_step=0.000431 post_step_cleanup=0.007435 teacher_seq_len=11 teacher_vocab=248320
+train_step step=5 prompt_index=4 loss=1.720609361655e-5 rollout_len=17 step_seconds=4.575766
+phase_summary step=5 total=4.575765 student_rollout=1.011142 infer_forward_token_logits=0.004539 infer_sync=1.262894 d2d_bridge_import=0.000552 teacher_forward_total=1.267989 student_forward=0.277090 kl_loss=0.007978 optimizer_zero_grad=0.000024 backward=2.003098 grad_clip=0.000519 optimizer_step=0.000470 post_step_cleanup=0.007403 teacher_seq_len=17 teacher_vocab=248320
+train_step step=6 prompt_index=5 loss=1.609472565178e-5 rollout_len=16 step_seconds=4.415710
+phase_summary step=6 total=4.415710 student_rollout=0.989182 infer_forward_token_logits=0.004516 infer_sync=1.250314 d2d_bridge_import=0.000078 teacher_forward_total=1.254912 student_forward=0.262160 kl_loss=0.007658 optimizer_zero_grad=0.000024 backward=1.893328 grad_clip=0.000516 optimizer_step=0.000455 post_step_cleanup=0.007431 teacher_seq_len=16 teacher_vocab=248320
+train_step step=7 prompt_index=6 loss=1.817381962610e-5 rollout_len=15 step_seconds=4.182002
+phase_summary step=7 total=4.182001 student_rollout=0.905128 infer_forward_token_logits=0.004543 infer_sync=1.224379 d2d_bridge_import=0.000546 teacher_forward_total=1.229474 student_forward=0.246276 kl_loss=0.007405 optimizer_zero_grad=0.000024 backward=1.785106 grad_clip=0.000519 optimizer_step=0.000467 post_step_cleanup=0.007553 teacher_seq_len=15 teacher_vocab=248320
+train_step step=8 prompt_index=7 loss=1.813988819777e-5 rollout_len=13 step_seconds=3.634853
+phase_summary step=8 total=3.634853 student_rollout=0.782909 infer_forward_token_logits=0.004535 infer_sync=1.048163 d2d_bridge_import=0.000550 teacher_forward_total=1.053253 student_forward=0.215362 kl_loss=0.006542 optimizer_zero_grad=0.000022 backward=1.568224 grad_clip=0.000512 optimizer_step=0.000456 post_step_cleanup=0.007524 teacher_seq_len=13 teacher_vocab=248320
+train_step step=9 prompt_index=8 loss=1.290292584599e-5 rollout_len=17 step_seconds=4.699899
+phase_summary step=9 total=4.699899 student_rollout=1.027089 infer_forward_token_logits=0.002884 infer_sync=1.371808 d2d_bridge_import=0.000550 teacher_forward_total=1.375247 student_forward=0.277935 kl_loss=0.007997 optimizer_zero_grad=0.000023 backward=2.003128 grad_clip=0.000504 optimizer_step=0.000461 post_step_cleanup=0.007458 teacher_seq_len=17 teacher_vocab=248320
+train_step step=10 prompt_index=9 loss=1.750663068378e-5 rollout_len=14 step_seconds=3.903695
+phase_summary step=10 total=3.903694 student_rollout=0.845141 infer_forward_token_logits=0.004510 infer_sync=1.114387 d2d_bridge_import=0.000603 teacher_forward_total=1.119505 student_forward=0.230833 kl_loss=0.006908 optimizer_zero_grad=0.000025 backward=1.692750 grad_clip=0.000518 optimizer_step=0.000470 post_step_cleanup=0.007494 teacher_seq_len=14 teacher_vocab=248320
+train_step step=11 prompt_index=10 loss=2.240642788820e-5 rollout_len=17 step_seconds=4.713047
+phase_summary step=11 total=4.713046 student_rollout=1.041149 infer_forward_token_logits=0.004806 infer_sync=1.377801 d2d_bridge_import=0.000607 teacher_forward_total=1.383221 student_forward=0.278706 kl_loss=0.008010 optimizer_zero_grad=0.000027 backward=1.993503 grad_clip=0.000514 optimizer_step=0.000468 post_step_cleanup=0.007397 teacher_seq_len=17 teacher_vocab=248320
+train_step step=12 prompt_index=11 loss=1.932916893566e-5 rollout_len=15 step_seconds=4.217204
+phase_summary step=12 total=4.217204 student_rollout=0.908932 infer_forward_token_logits=0.002751 infer_sync=1.243785 d2d_bridge_import=0.000549 teacher_forward_total=1.247090 student_forward=0.246051 kl_loss=0.007377 optimizer_zero_grad=0.000026 backward=1.799160 grad_clip=0.000517 optimizer_step=0.000482 post_step_cleanup=0.007518 teacher_seq_len=15 teacher_vocab=248320
+train_step step=13 prompt_index=12 loss=2.302186658198e-5 rollout_len=18 step_seconds=4.975139
+phase_summary step=13 total=4.975139 student_rollout=1.109163 infer_forward_token_logits=0.004627 infer_sync=1.449307 d2d_bridge_import=0.000547 teacher_forward_total=1.454487 student_forward=0.293860 kl_loss=0.008403 optimizer_zero_grad=0.000023 backward=2.100599 grad_clip=0.000513 optimizer_step=0.000465 post_step_cleanup=0.007575 teacher_seq_len=18 teacher_vocab=248320
+train_step step=14 prompt_index=13 loss=1.632147177588e-5 rollout_len=14 step_seconds=3.883614
+phase_summary step=14 total=3.883613 student_rollout=0.860890 infer_forward_token_logits=0.004487 infer_sync=1.096818 d2d_bridge_import=0.000082 teacher_forward_total=1.101392 student_forward=0.230675 kl_loss=0.006900 optimizer_zero_grad=0.000024 backward=1.674983 grad_clip=0.000521 optimizer_step=0.000467 post_step_cleanup=0.007709 teacher_seq_len=14 teacher_vocab=248320
+train_step step=15 prompt_index=14 loss=1.446005444450e-5 rollout_len=16 step_seconds=4.382274
+phase_summary step=15 total=4.382273 student_rollout=0.973470 infer_forward_token_logits=0.004492 infer_sync=1.229235 d2d_bridge_import=0.000077 teacher_forward_total=1.233809 student_forward=0.262196 kl_loss=0.007617 optimizer_zero_grad=0.000026 backward=1.896570 grad_clip=0.000510 optimizer_step=0.000462 post_step_cleanup=0.007541 teacher_seq_len=16 teacher_vocab=248320
+train_step step=16 prompt_index=15 loss=1.960206100193e-5 rollout_len=17 step_seconds=4.720356
+phase_summary step=16 total=4.720356 student_rollout=1.035040 infer_forward_token_logits=0.004569 infer_sync=1.387288 d2d_bridge_import=0.000553 teacher_forward_total=1.392416 student_forward=0.277775 kl_loss=0.007976 optimizer_zero_grad=0.000024 backward=1.998745 grad_clip=0.000522 optimizer_step=0.000457 post_step_cleanup=0.007359 teacher_seq_len=17 teacher_vocab=248320
+train_step step=17 prompt_index=0 loss=1.516357588116e-5 rollout_len=17 step_seconds=4.671656
+phase_summary step=17 total=4.671656 student_rollout=1.037389 infer_forward_token_logits=0.004498 infer_sync=1.320993 d2d_bridge_import=0.000553 teacher_forward_total=1.326050 student_forward=0.280086 kl_loss=0.008003 optimizer_zero_grad=0.000026 backward=2.011674 grad_clip=0.000514 optimizer_step=0.000473 post_step_cleanup=0.007385 teacher_seq_len=17 teacher_vocab=248320
+train_step step=18 prompt_index=1 loss=2.016084545176e-5 rollout_len=16 step_seconds=4.408362
+phase_summary step=18 total=4.408362 student_rollout=0.995541 infer_forward_token_logits=0.004449 infer_sync=1.233984 d2d_bridge_import=0.000077 teacher_forward_total=1.238515 student_forward=0.263820 kl_loss=0.007699 optimizer_zero_grad=0.000026 backward=1.894156 grad_clip=0.000530 optimizer_step=0.000466 post_step_cleanup=0.007556 teacher_seq_len=16 teacher_vocab=248320
+train_step step=19 prompt_index=2 loss=1.939481808222e-5 rollout_len=15 step_seconds=4.176125
+phase_summary step=19 total=4.176125 student_rollout=0.912926 infer_forward_token_logits=0.004478 infer_sync=1.214091 d2d_bridge_import=0.000550 teacher_forward_total=1.219123 student_forward=0.247636 kl_loss=0.007275 optimizer_zero_grad=0.000024 backward=1.780536 grad_clip=0.000518 optimizer_step=0.000473 post_step_cleanup=0.007556 teacher_seq_len=15 teacher_vocab=248320
+train_step step=20 prompt_index=3 loss=1.131101817009e-5 rollout_len=11 step_seconds=3.203925
+phase_summary step=20 total=3.203925 student_rollout=0.661106 infer_forward_token_logits=0.004302 infer_sync=0.979544 d2d_bridge_import=0.000075 teacher_forward_total=0.983927 student_forward=0.184797 kl_loss=0.005984 optimizer_zero_grad=0.000022 backward=1.359500 grad_clip=0.000510 optimizer_step=0.000452 post_step_cleanup=0.007571 teacher_seq_len=11 teacher_vocab=248320
+train_step step=21 prompt_index=4 loss=1.716629230941e-5 rollout_len=17 step_seconds=4.599668
+phase_summary step=21 total=4.599668 student_rollout=1.023958 infer_forward_token_logits=0.004444 infer_sync=1.267352 d2d_bridge_import=0.000553 teacher_forward_total=1.272354 student_forward=0.281326 kl_loss=0.007999 optimizer_zero_grad=0.000025 backward=2.005487 grad_clip=0.000528 optimizer_step=0.000461 post_step_cleanup=0.007472 teacher_seq_len=17 teacher_vocab=248320
+train_step step=22 prompt_index=5 loss=1.605058605492e-5 rollout_len=16 step_seconds=4.418514
+phase_summary step=22 total=4.418513 student_rollout=0.996916 infer_forward_token_logits=0.004518 infer_sync=1.237794 d2d_bridge_import=0.000080 teacher_forward_total=1.242398 student_forward=0.265656 kl_loss=0.007639 optimizer_zero_grad=0.000025 backward=1.897327 grad_clip=0.000524 optimizer_step=0.000460 post_step_cleanup=0.007524 teacher_seq_len=16 teacher_vocab=248320
+train_step step=23 prompt_index=6 loss=1.810344474507e-5 rollout_len=15 step_seconds=4.207722
+phase_summary step=23 total=4.207722 student_rollout=0.913170 infer_forward_token_logits=0.004564 infer_sync=1.212244 d2d_bridge_import=0.000551 teacher_forward_total=1.217365 student_forward=0.248699 kl_loss=0.007287 optimizer_zero_grad=0.000024 backward=1.812598 grad_clip=0.000526 optimizer_step=0.000468 post_step_cleanup=0.007531 teacher_seq_len=15 teacher_vocab=248320
+train_step step=24 prompt_index=7 loss=1.803423037927e-5 rollout_len=13 step_seconds=3.627439
+phase_summary step=24 total=3.627438 student_rollout=0.791832 infer_forward_token_logits=0.004437 infer_sync=1.016094 d2d_bridge_import=0.000552 teacher_forward_total=1.021087 student_forward=0.217411 kl_loss=0.006579 optimizer_zero_grad=0.000024 backward=1.581849 grad_clip=0.000520 optimizer_step=0.000462 post_step_cleanup=0.007630 teacher_seq_len=13 teacher_vocab=248320
+train_step step=25 prompt_index=8 loss=1.289314604946e-5 rollout_len=17 step_seconds=4.706100
+phase_summary step=25 total=4.706099 student_rollout=1.037908 infer_forward_token_logits=0.004478 infer_sync=1.356218 d2d_bridge_import=0.000552 teacher_forward_total=1.361252 student_forward=0.279740 kl_loss=0.008003 optimizer_zero_grad=0.000026 backward=2.010685 grad_clip=0.000522 optimizer_step=0.000464 post_step_cleanup=0.007442 teacher_seq_len=17 teacher_vocab=248320
+eval_summary step=25 train_kl=1.496206778029e-5 heldout_kl=1.816574831537e-5 eval_seconds=20.233190
+train_step step=26 prompt_index=9 loss=1.745788176777e-5 rollout_len=14 step_seconds=3.678517
+phase_summary step=26 total=3.678517 student_rollout=0.801034 infer_forward_token_logits=0.004445 infer_sync=0.935346 d2d_bridge_import=0.000603 teacher_forward_total=0.940399 student_forward=0.232960 kl_loss=0.006929 optimizer_zero_grad=0.000022 backward=1.688541 grad_clip=0.000544 optimizer_step=0.000467 post_step_cleanup=0.007589 teacher_seq_len=14 teacher_vocab=248320
+train_step step=27 prompt_index=10 loss=2.229619167338e-5 rollout_len=17 step_seconds=4.706547
+phase_summary step=27 total=4.706547 student_rollout=1.048440 infer_forward_token_logits=0.004474 infer_sync=1.354499 d2d_bridge_import=0.000604 teacher_forward_total=1.359582 student_forward=0.281927 kl_loss=0.008025 optimizer_zero_grad=0.000024 backward=2.000018 grad_clip=0.000537 optimizer_step=0.000463 post_step_cleanup=0.007477 teacher_seq_len=17 teacher_vocab=248320
+train_step step=28 prompt_index=11 loss=1.924545176735e-5 rollout_len=15 step_seconds=4.239348
+phase_summary step=28 total=4.239347 student_rollout=0.933217 infer_forward_token_logits=0.002952 infer_sync=1.231957 d2d_bridge_import=0.000555 teacher_forward_total=1.235468 student_forward=0.248702 kl_loss=0.007290 optimizer_zero_grad=0.000024 backward=1.805926 grad_clip=0.000537 optimizer_step=0.000463 post_step_cleanup=0.007681 teacher_seq_len=15 teacher_vocab=248320
+train_step step=29 prompt_index=12 loss=2.293193574587e-5 rollout_len=18 step_seconds=4.967998
+phase_summary step=29 total=4.967997 student_rollout=1.121691 infer_forward_token_logits=0.004609 infer_sync=1.408425 d2d_bridge_import=0.000550 teacher_forward_total=1.413589 student_forward=0.298134 kl_loss=0.008549 optimizer_zero_grad=0.000025 backward=2.117283 grad_clip=0.000529 optimizer_step=0.000461 post_step_cleanup=0.007678 teacher_seq_len=18 teacher_vocab=248320
+train_step step=30 prompt_index=13 loss=1.626481935091e-5 rollout_len=14 step_seconds=4.008553
+phase_summary step=30 total=4.008552 student_rollout=0.871374 infer_forward_token_logits=0.004463 infer_sync=1.191028 d2d_bridge_import=0.000080 teacher_forward_total=1.195576 student_forward=0.233431 kl_loss=0.006905 optimizer_zero_grad=0.000023 backward=1.692639 grad_clip=0.000523 optimizer_step=0.000473 post_step_cleanup=0.007557 teacher_seq_len=14 teacher_vocab=248320
+train_step step=31 prompt_index=14 loss=1.440691357857e-5 rollout_len=16 step_seconds=4.440448
+phase_summary step=31 total=4.440448 student_rollout=0.985195 infer_forward_token_logits=0.004537 infer_sync=1.235969 d2d_bridge_import=0.000081 teacher_forward_total=1.240592 student_forward=0.264929 kl_loss=0.007641 optimizer_zero_grad=0.000026 backward=1.933415 grad_clip=0.000518 optimizer_step=0.000462 post_step_cleanup=0.007609 teacher_seq_len=16 teacher_vocab=248320
+train_step step=32 prompt_index=15 loss=1.957238964678e-5 rollout_len=17 step_seconds=4.735268
+phase_summary step=32 total=4.735268 student_rollout=1.046971 infer_forward_token_logits=0.004536 infer_sync=1.369283 d2d_bridge_import=0.000554 teacher_forward_total=1.374379 student_forward=0.281497 kl_loss=0.008033 optimizer_zero_grad=0.000023 backward=2.015931 grad_clip=0.000516 optimizer_step=0.000474 post_step_cleanup=0.007391 teacher_seq_len=17 teacher_vocab=248320
+train_step step=33 prompt_index=0 loss=1.510124184279e-5 rollout_len=17 step_seconds=4.808207
+phase_summary step=33 total=4.808206 student_rollout=1.068511 infer_forward_token_logits=0.004484 infer_sync=1.401707 d2d_bridge_import=0.000555 teacher_forward_total=1.406752 student_forward=0.282771 kl_loss=0.008049 optimizer_zero_grad=0.000025 backward=2.033564 grad_clip=0.000530 optimizer_step=0.000466 post_step_cleanup=0.007480 teacher_seq_len=17 teacher_vocab=248320
+train_step step=34 prompt_index=1 loss=2.007201692322e-5 rollout_len=16 step_seconds=4.449902
+phase_summary step=34 total=4.449901 student_rollout=1.007864 infer_forward_token_logits=0.004423 infer_sync=1.232336 d2d_bridge_import=0.000081 teacher_forward_total=1.236846 student_forward=0.268189 kl_loss=0.007681 optimizer_zero_grad=0.000027 backward=1.920568 grad_clip=0.000529 optimizer_step=0.000466 post_step_cleanup=0.007671 teacher_seq_len=16 teacher_vocab=248320
+train_step step=35 prompt_index=2 loss=1.935400177899e-5 rollout_len=15 step_seconds=4.186086
+phase_summary step=35 total=4.186085 student_rollout=0.927983 infer_forward_token_logits=0.004466 infer_sync=1.182493 d2d_bridge_import=0.000555 teacher_forward_total=1.187519 student_forward=0.252018 kl_loss=0.007324 optimizer_zero_grad=0.000026 backward=1.802451 grad_clip=0.000528 optimizer_step=0.000481 post_step_cleanup=0.007697 teacher_seq_len=15 teacher_vocab=248320
+train_step step=36 prompt_index=3 loss=1.130338750954e-5 rollout_len=11 step_seconds=3.212870
+phase_summary step=36 total=3.212869 student_rollout=0.668836 infer_forward_token_logits=0.004626 infer_sync=0.961967 d2d_bridge_import=0.000081 teacher_forward_total=0.966680 student_forward=0.186986 kl_loss=0.005917 optimizer_zero_grad=0.000022 backward=1.375745 grad_clip=0.000504 optimizer_step=0.000454 post_step_cleanup=0.007663 teacher_seq_len=11 teacher_vocab=248320
+train_step step=37 prompt_index=4 loss=1.712909033813e-5 rollout_len=17 step_seconds=4.724434
+phase_summary step=37 total=4.724434 student_rollout=1.026868 infer_forward_token_logits=0.004522 infer_sync=1.347520 d2d_bridge_import=0.000556 teacher_forward_total=1.352602 student_forward=0.283679 kl_loss=0.008042 optimizer_zero_grad=0.000026 backward=2.044687 grad_clip=0.000537 optimizer_step=0.000459 post_step_cleanup=0.007477 teacher_seq_len=17 teacher_vocab=248320
+train_step step=38 prompt_index=5 loss=1.601005897101e-5 rollout_len=16 step_seconds=4.484868
+phase_summary step=38 total=4.484867 student_rollout=0.998203 infer_forward_token_logits=0.004443 infer_sync=1.255129 d2d_bridge_import=0.000081 teacher_forward_total=1.259658 student_forward=0.267895 kl_loss=0.007698 optimizer_zero_grad=0.000024 backward=1.942490 grad_clip=0.000530 optimizer_step=0.000465 post_step_cleanup=0.007851 teacher_seq_len=16 teacher_vocab=248320
+train_step step=39 prompt_index=6 loss=1.803821942303e-5 rollout_len=15 step_seconds=4.205361
+phase_summary step=39 total=4.205360 student_rollout=0.926814 infer_forward_token_logits=0.004469 infer_sync=1.172988 d2d_bridge_import=0.000553 teacher_forward_total=1.178015 student_forward=0.252630 kl_loss=0.008676 optimizer_zero_grad=0.000035 backward=1.830487 grad_clip=0.000542 optimizer_step=0.000469 post_step_cleanup=0.007666 teacher_seq_len=15 teacher_vocab=248320
+train_step step=40 prompt_index=7 loss=1.793175033526e-5 rollout_len=13 step_seconds=3.754140
+phase_summary step=40 total=3.754139 student_rollout=0.802973 infer_forward_token_logits=0.004542 infer_sync=1.115606 d2d_bridge_import=0.000553 teacher_forward_total=1.120706 student_forward=0.219655 kl_loss=0.006618 optimizer_zero_grad=0.000022 backward=1.595400 grad_clip=0.000533 optimizer_step=0.000468 post_step_cleanup=0.007707 teacher_seq_len=13 teacher_vocab=248320
+train_step step=41 prompt_index=8 loss=1.288420389756e-5 rollout_len=17 step_seconds=4.736392
+phase_summary step=41 total=4.736391 student_rollout=1.059830 infer_forward_token_logits=0.004599 infer_sync=1.375883 d2d_bridge_import=0.000555 teacher_forward_total=1.381041 student_forward=0.284902 kl_loss=0.008138 optimizer_zero_grad=0.000025 backward=1.993993 grad_clip=0.000516 optimizer_step=0.000463 post_step_cleanup=0.007424 teacher_seq_len=17 teacher_vocab=248320
+train_step step=42 prompt_index=9 loss=1.741188498272e-5 rollout_len=14 step_seconds=3.860964
+phase_summary step=42 total=3.860964 student_rollout=0.856221 infer_forward_token_logits=0.002956 infer_sync=1.088921 d2d_bridge_import=0.000607 teacher_forward_total=1.092490 student_forward=0.231628 kl_loss=0.006892 optimizer_zero_grad=0.000021 backward=1.665197 grad_clip=0.000522 optimizer_step=0.000470 post_step_cleanup=0.007483 teacher_seq_len=14 teacher_vocab=248320
+train_step step=43 prompt_index=10 loss=2.218655390607e-5 rollout_len=17 step_seconds=4.748335
+phase_summary step=43 total=4.748334 student_rollout=1.039485 infer_forward_token_logits=0.004671 infer_sync=1.386131 d2d_bridge_import=0.000605 teacher_forward_total=1.391412 student_forward=0.278605 kl_loss=0.008010 optimizer_zero_grad=0.000024 backward=2.022257 grad_clip=0.000523 optimizer_step=0.000462 post_step_cleanup=0.007500 teacher_seq_len=17 teacher_vocab=248320
+train_step step=44 prompt_index=11 loss=1.916059409268e-5 rollout_len=15 step_seconds=4.186852
+phase_summary step=44 total=4.186852 student_rollout=0.912577 infer_forward_token_logits=0.004509 infer_sync=1.234257 d2d_bridge_import=0.000552 teacher_forward_total=1.239322 student_forward=0.249798 kl_loss=0.007249 optimizer_zero_grad=0.000025 backward=1.769271 grad_clip=0.000542 optimizer_step=0.000470 post_step_cleanup=0.007540 teacher_seq_len=15 teacher_vocab=248320
+train_step step=45 prompt_index=12 loss=2.284062429680e-5 rollout_len=18 step_seconds=5.009155
+phase_summary step=45 total=5.009154 student_rollout=1.113169 infer_forward_token_logits=0.004081 infer_sync=1.452246 d2d_bridge_import=0.000548 teacher_forward_total=1.456880 student_forward=0.294386 kl_loss=0.008354 optimizer_zero_grad=0.000023 backward=2.127709 grad_clip=0.000518 optimizer_step=0.000467 post_step_cleanup=0.007588 teacher_seq_len=18 teacher_vocab=248320
+train_step step=46 prompt_index=13 loss=1.620712828299e-5 rollout_len=14 step_seconds=3.856024
+phase_summary step=46 total=3.856023 student_rollout=0.865544 infer_forward_token_logits=0.004164 infer_sync=1.073540 d2d_bridge_import=0.000085 teacher_forward_total=1.077795 student_forward=0.231839 kl_loss=0.006912 optimizer_zero_grad=0.000024 backward=1.665356 grad_clip=0.000511 optimizer_step=0.000462 post_step_cleanup=0.007524 teacher_seq_len=14 teacher_vocab=248320
+train_step step=47 prompt_index=14 loss=1.435316244169e-5 rollout_len=16 step_seconds=4.364561
+phase_summary step=47 total=4.364561 student_rollout=0.974633 infer_forward_token_logits=0.004376 infer_sync=1.230302 d2d_bridge_import=0.000075 teacher_forward_total=1.234758 student_forward=0.262988 kl_loss=0.007661 optimizer_zero_grad=0.000027 backward=1.875927 grad_clip=0.000512 optimizer_step=0.000460 post_step_cleanup=0.007534 teacher_seq_len=16 teacher_vocab=248320
+train_step step=48 prompt_index=15 loss=1.954155595740e-5 rollout_len=17 step_seconds=4.599679
+phase_summary step=48 total=4.599678 student_rollout=1.036356 infer_forward_token_logits=0.004599 infer_sync=1.273735 d2d_bridge_import=0.000554 teacher_forward_total=1.278893 student_forward=0.277651 kl_loss=0.008039 optimizer_zero_grad=0.000025 backward=1.990312 grad_clip=0.000516 optimizer_step=0.000477 post_step_cleanup=0.007353 teacher_seq_len=17 teacher_vocab=248320
+train_step step=49 prompt_index=0 loss=1.503904695710e-5 rollout_len=17 step_seconds=4.762449
+phase_summary step=49 total=4.762449 student_rollout=1.057952 infer_forward_token_logits=0.004893 infer_sync=1.400410 d2d_bridge_import=0.000550 teacher_forward_total=1.405859 student_forward=0.282014 kl_loss=0.008008 optimizer_zero_grad=0.000023 backward=2.000159 grad_clip=0.000538 optimizer_step=0.000460 post_step_cleanup=0.007382 teacher_seq_len=17 teacher_vocab=248320
+train_step step=50 prompt_index=1 loss=1.998179686780e-5 rollout_len=16 step_seconds=4.427161
+phase_summary step=50 total=4.427161 student_rollout=0.974560 infer_forward_token_logits=0.004432 infer_sync=1.281588 d2d_bridge_import=0.000088 teacher_forward_total=1.286114 student_forward=0.261783 kl_loss=0.007652 optimizer_zero_grad=0.000025 backward=1.888553 grad_clip=0.000514 optimizer_step=0.000458 post_step_cleanup=0.007447 teacher_seq_len=16 teacher_vocab=248320
+eval_summary step=50 train_kl=1.493208799275e-5 heldout_kl=1.812112896005e-5 eval_seconds=20.188417
+train_step step=51 prompt_index=2 loss=1.931262158905e-5 rollout_len=15 step_seconds=3.919518
+phase_summary step=51 total=3.919518 student_rollout=0.860714 infer_forward_token_logits=0.002811 infer_sync=1.001985 d2d_bridge_import=0.000557 teacher_forward_total=1.005358 student_forward=0.248076 kl_loss=0.007437 optimizer_zero_grad=0.000024 backward=1.789140 grad_clip=0.000531 optimizer_step=0.000459 post_step_cleanup=0.007735 teacher_seq_len=15 teacher_vocab=248320
+train_step step=52 prompt_index=3 loss=1.129603788286e-5 rollout_len=11 step_seconds=3.168058
+phase_summary step=52 total=3.168057 student_rollout=0.645915 infer_forward_token_logits=0.004331 infer_sync=0.926051 d2d_bridge_import=0.000095 teacher_forward_total=0.930484 student_forward=0.183859 kl_loss=0.006132 optimizer_zero_grad=0.000024 backward=1.392964 grad_clip=0.000505 optimizer_step=0.000449 post_step_cleanup=0.007666 teacher_seq_len=11 teacher_vocab=248320
+train_step step=53 prompt_index=4 loss=1.709151001705e-5 rollout_len=17 step_seconds=4.694154
+phase_summary step=53 total=4.694153 student_rollout=1.024383 infer_forward_token_logits=0.004476 infer_sync=1.345300 d2d_bridge_import=0.000555 teacher_forward_total=1.350337 student_forward=0.279266 kl_loss=0.008035 optimizer_zero_grad=0.000025 backward=2.023673 grad_clip=0.000523 optimizer_step=0.000471 post_step_cleanup=0.007381 teacher_seq_len=17 teacher_vocab=248320
+train_step step=54 prompt_index=5 loss=1.596927722858e-5 rollout_len=16 step_seconds=4.480473
+phase_summary step=54 total=4.480472 student_rollout=0.986762 infer_forward_token_logits=0.004367 infer_sync=1.269789 d2d_bridge_import=0.000079 teacher_forward_total=1.274241 student_forward=0.263210 kl_loss=0.007722 optimizer_zero_grad=0.000023 backward=1.939764 grad_clip=0.000528 optimizer_step=0.000466 post_step_cleanup=0.007702 teacher_seq_len=16 teacher_vocab=248320
+train_step step=55 prompt_index=6 loss=1.797285767680e-5 rollout_len=15 step_seconds=4.189761
+phase_summary step=55 total=4.189761 student_rollout=0.914229 infer_forward_token_logits=0.004409 infer_sync=1.195805 d2d_bridge_import=0.000551 teacher_forward_total=1.200770 student_forward=0.248252 kl_loss=0.007275 optimizer_zero_grad=0.000025 backward=1.810670 grad_clip=0.000516 optimizer_step=0.000481 post_step_cleanup=0.007500 teacher_seq_len=15 teacher_vocab=248320
+train_step step=56 prompt_index=7 loss=1.782851722965e-5 rollout_len=13 step_seconds=3.622043
+phase_summary step=56 total=3.622042 student_rollout=0.792452 infer_forward_token_logits=0.004432 infer_sync=1.007808 d2d_bridge_import=0.000556 teacher_forward_total=1.012799 student_forward=0.216030 kl_loss=0.006585 optimizer_zero_grad=0.000024 backward=1.585387 grad_clip=0.000517 optimizer_step=0.000473 post_step_cleanup=0.007706 teacher_seq_len=13 teacher_vocab=248320
+train_step step=57 prompt_index=8 loss=1.287521263293e-5 rollout_len=17 step_seconds=4.729305
+phase_summary step=57 total=4.729304 student_rollout=1.040222 infer_forward_token_logits=0.004470 infer_sync=1.356897 d2d_bridge_import=0.000554 teacher_forward_total=1.361925 student_forward=0.283038 kl_loss=0.008009 optimizer_zero_grad=0.000022 backward=2.027599 grad_clip=0.000523 optimizer_step=0.000461 post_step_cleanup=0.007437 teacher_seq_len=17 teacher_vocab=248320
+train_step step=58 prompt_index=9 loss=1.671172867646e-5 rollout_len=14 step_seconds=3.842855
+phase_summary step=58 total=3.842855 student_rollout=0.847272 infer_forward_token_logits=0.004399 infer_sync=1.064491 d2d_bridge_import=0.000603 teacher_forward_total=1.069498 student_forward=0.233421 kl_loss=0.006939 optimizer_zero_grad=0.000022 backward=1.677086 grad_clip=0.000521 optimizer_step=0.000490 post_step_cleanup=0.007563 teacher_seq_len=14 teacher_vocab=248320
+train_step step=59 prompt_index=10 loss=2.207754187111e-5 rollout_len=17 step_seconds=4.734162
+phase_summary step=59 total=4.734161 student_rollout=1.042763 infer_forward_token_logits=0.004509 infer_sync=1.379420 d2d_bridge_import=0.000602 teacher_forward_total=1.384536 student_forward=0.280435 kl_loss=0.008004 optimizer_zero_grad=0.000026 backward=2.009983 grad_clip=0.000523 optimizer_step=0.000455 post_step_cleanup=0.007395 teacher_seq_len=17 teacher_vocab=248320
+train_step step=60 prompt_index=11 loss=1.907571640913e-5 rollout_len=15 step_seconds=4.258077
+phase_summary step=60 total=4.258077 student_rollout=0.926494 infer_forward_token_logits=0.004456 infer_sync=1.245215 d2d_bridge_import=0.000554 teacher_forward_total=1.250230 student_forward=0.248265 kl_loss=0.007262 optimizer_zero_grad=0.000022 backward=1.817176 grad_clip=0.000531 optimizer_step=0.000476 post_step_cleanup=0.007565 teacher_seq_len=15 teacher_vocab=248320
+train_step step=61 prompt_index=12 loss=2.274724829476e-5 rollout_len=18 step_seconds=5.017726
+phase_summary step=61 total=5.017725 student_rollout=1.118314 infer_forward_token_logits=0.004733 infer_sync=1.412346 d2d_bridge_import=0.000550 teacher_forward_total=1.417633 student_forward=0.296332 kl_loss=0.008363 optimizer_zero_grad=0.000025 backward=2.168298 grad_clip=0.000519 optimizer_step=0.000473 post_step_cleanup=0.007709 teacher_seq_len=18 teacher_vocab=248320
+train_step step=62 prompt_index=13 loss=1.614709981368e-5 rollout_len=14 step_seconds=4.030904
+phase_summary step=62 total=4.030903 student_rollout=0.874696 infer_forward_token_logits=0.004346 infer_sync=1.167418 d2d_bridge_import=0.000085 teacher_forward_total=1.171855 student_forward=0.232359 kl_loss=0.007235 optimizer_zero_grad=0.000028 backward=1.735892 grad_clip=0.000527 optimizer_step=0.000476 post_step_cleanup=0.007778 teacher_seq_len=14 teacher_vocab=248320
+train_step step=63 prompt_index=14 loss=1.429720487067e-5 rollout_len=16 step_seconds=4.538506
+phase_summary step=63 total=4.538506 student_rollout=0.988555 infer_forward_token_logits=0.004357 infer_sync=1.316011 d2d_bridge_import=0.000080 teacher_forward_total=1.320453 student_forward=0.265432 kl_loss=0.007638 optimizer_zero_grad=0.000026 backward=1.947809 grad_clip=0.000513 optimizer_step=0.000473 post_step_cleanup=0.007538 teacher_seq_len=16 teacher_vocab=248320
+train_step step=64 prompt_index=15 loss=1.950930709427e-5 rollout_len=17 step_seconds=4.820343
+phase_summary step=64 total=4.820342 student_rollout=1.060262 infer_forward_token_logits=0.004477 infer_sync=1.388131 d2d_bridge_import=0.000556 teacher_forward_total=1.393169 student_forward=0.281169 kl_loss=0.008044 optimizer_zero_grad=0.000024 backward=2.069138 grad_clip=0.000523 optimizer_step=0.000462 post_step_cleanup=0.007493 teacher_seq_len=17 teacher_vocab=248320
+train_step step=65 prompt_index=0 loss=1.497506218584e-5 rollout_len=17 step_seconds=4.792077
+phase_summary step=65 total=4.792076 student_rollout=1.068220 infer_forward_token_logits=0.004588 infer_sync=1.375267 d2d_bridge_import=0.000555 teacher_forward_total=1.380416 student_forward=0.280096 kl_loss=0.007989 optimizer_zero_grad=0.000028 backward=2.046789 grad_clip=0.000526 optimizer_step=0.000490 post_step_cleanup=0.007468 teacher_seq_len=17 teacher_vocab=248320
+train_step step=66 prompt_index=1 loss=1.988943949982e-5 rollout_len=16 step_seconds=4.408068
+phase_summary step=66 total=4.408068 student_rollout=0.995810 infer_forward_token_logits=0.002767 infer_sync=1.213529 d2d_bridge_import=0.000079 teacher_forward_total=1.216380 student_forward=0.263081 kl_loss=0.007603 optimizer_zero_grad=0.000024 backward=1.916521 grad_clip=0.000530 optimizer_step=0.000456 post_step_cleanup=0.007609 teacher_seq_len=16 teacher_vocab=248320
+train_step step=67 prompt_index=2 loss=1.927006996993e-5 rollout_len=15 step_seconds=4.221581
+phase_summary step=67 total=4.221581 student_rollout=0.912955 infer_forward_token_logits=0.004410 infer_sync=1.194649 d2d_bridge_import=0.000552 teacher_forward_total=1.199617 student_forward=0.249097 kl_loss=0.007492 optimizer_zero_grad=0.000022 backward=1.843541 grad_clip=0.000531 optimizer_step=0.000472 post_step_cleanup=0.007797 teacher_seq_len=15 teacher_vocab=248320
+train_step step=68 prompt_index=3 loss=1.128855001298e-5 rollout_len=11 step_seconds=3.211776
+phase_summary step=68 total=3.211776 student_rollout=0.660064 infer_forward_token_logits=0.004312 infer_sync=0.952340 d2d_bridge_import=0.000106 teacher_forward_total=0.956763 student_forward=0.185269 kl_loss=0.005850 optimizer_zero_grad=0.000025 backward=1.395223 grad_clip=0.000504 optimizer_step=0.000447 post_step_cleanup=0.007563 teacher_seq_len=11 teacher_vocab=248320
+train_step step=69 prompt_index=4 loss=1.705293107079e-5 rollout_len=17 step_seconds=4.658879
+phase_summary step=69 total=4.658879 student_rollout=1.013522 infer_forward_token_logits=0.004480 infer_sync=1.342750 d2d_bridge_import=0.000555 teacher_forward_total=1.347790 student_forward=0.280457 kl_loss=0.007952 optimizer_zero_grad=0.000025 backward=2.000638 grad_clip=0.000530 optimizer_step=0.000468 post_step_cleanup=0.007441 teacher_seq_len=17 teacher_vocab=248320
+train_step step=70 prompt_index=5 loss=1.592688931851e-5 rollout_len=16 step_seconds=4.456142
+phase_summary step=70 total=4.456142 student_rollout=0.978300 infer_forward_token_logits=0.004341 infer_sync=1.295402 d2d_bridge_import=0.000086 teacher_forward_total=1.299835 student_forward=0.263224 kl_loss=0.007652 optimizer_zero_grad=0.000022 backward=1.898549 grad_clip=0.000523 optimizer_step=0.000461 post_step_cleanup=0.007535 teacher_seq_len=16 teacher_vocab=248320
+train_step step=71 prompt_index=6 loss=1.790557507775e-5 rollout_len=15 step_seconds=4.204472
+phase_summary step=71 total=4.204472 student_rollout=0.920556 infer_forward_token_logits=0.004438 infer_sync=1.227548 d2d_bridge_import=0.000549 teacher_forward_total=1.232540 student_forward=0.247676 kl_loss=0.007272 optimizer_zero_grad=0.000020 backward=1.787900 grad_clip=0.000520 optimizer_step=0.000463 post_step_cleanup=0.007484 teacher_seq_len=15 teacher_vocab=248320
+train_step step=72 prompt_index=7 loss=1.772140240064e-5 rollout_len=13 step_seconds=3.649710
+phase_summary step=72 total=3.649710 student_rollout=0.787393 infer_forward_token_logits=0.004520 infer_sync=1.038507 d2d_bridge_import=0.000553 teacher_forward_total=1.043585 student_forward=0.216142 kl_loss=0.006541 optimizer_zero_grad=0.000023 backward=1.587370 grad_clip=0.000516 optimizer_step=0.000467 post_step_cleanup=0.007617 teacher_seq_len=13 teacher_vocab=248320
+train_step step=73 prompt_index=8 loss=1.286608767259e-5 rollout_len=17 step_seconds=4.734579
+phase_summary step=73 total=4.734579 student_rollout=1.031504 infer_forward_token_logits=0.004482 infer_sync=1.362727 d2d_bridge_import=0.000555 teacher_forward_total=1.367769 student_forward=0.279557 kl_loss=0.008007 optimizer_zero_grad=0.000026 backward=2.039240 grad_clip=0.000531 optimizer_step=0.000469 post_step_cleanup=0.007418 teacher_seq_len=17 teacher_vocab=248320
+train_step step=74 prompt_index=9 loss=1.665183117439e-5 rollout_len=14 step_seconds=3.981721
+phase_summary step=74 total=3.981720 student_rollout=0.857382 infer_forward_token_logits=0.004455 infer_sync=1.184293 d2d_bridge_import=0.000601 teacher_forward_total=1.189354 student_forward=0.234255 kl_loss=0.006911 optimizer_zero_grad=0.000023 backward=1.685256 grad_clip=0.000521 optimizer_step=0.000473 post_step_cleanup=0.007485 teacher_seq_len=14 teacher_vocab=248320
+train_step step=75 prompt_index=10 loss=2.196321474912e-5 rollout_len=17 step_seconds=4.637867
+phase_summary step=75 total=4.637866 student_rollout=1.033616 infer_forward_token_logits=0.004512 infer_sync=1.290422 d2d_bridge_import=0.000606 teacher_forward_total=1.295546 student_forward=0.278892 kl_loss=0.008012 optimizer_zero_grad=0.000025 backward=2.013294 grad_clip=0.000525 optimizer_step=0.000461 post_step_cleanup=0.007435 teacher_seq_len=17 teacher_vocab=248320
+train_step step=76 prompt_index=11 loss=1.898767550301e-5 rollout_len=15 step_seconds=4.181917
+phase_summary step=76 total=4.181917 student_rollout=0.928975 infer_forward_token_logits=0.004742 infer_sync=1.218163 d2d_bridge_import=0.000555 teacher_forward_total=1.223464 student_forward=0.247790 kl_loss=0.007266 optimizer_zero_grad=0.000022 backward=1.765797 grad_clip=0.000522 optimizer_step=0.000468 post_step_cleanup=0.007551 teacher_seq_len=15 teacher_vocab=248320
+train_step step=77 prompt_index=12 loss=2.265136936330e-5 rollout_len=18 step_seconds=4.967378
+phase_summary step=77 total=4.967377 student_rollout=1.117223 infer_forward_token_logits=0.004457 infer_sync=1.437411 d2d_bridge_import=0.000550 teacher_forward_total=1.442423 student_forward=0.296033 kl_loss=0.008359 optimizer_zero_grad=0.000024 backward=2.094610 grad_clip=0.000523 optimizer_step=0.000467 post_step_cleanup=0.007649 teacher_seq_len=18 teacher_vocab=248320
+train_step step=78 prompt_index=13 loss=1.608432285138e-5 rollout_len=14 step_seconds=3.866593
+phase_summary step=78 total=3.866593 student_rollout=0.864502 infer_forward_token_logits=0.004072 infer_sync=1.080996 d2d_bridge_import=0.000079 teacher_forward_total=1.085154 student_forward=0.231793 kl_loss=0.006908 optimizer_zero_grad=0.000029 backward=1.669602 grad_clip=0.000515 optimizer_step=0.000498 post_step_cleanup=0.007532 teacher_seq_len=14 teacher_vocab=248320
+train_step step=79 prompt_index=14 loss=1.423815228918e-5 rollout_len=16 step_seconds=4.379305
+phase_summary step=79 total=4.379305 student_rollout=0.980790 infer_forward_token_logits=0.002694 infer_sync=1.224693 d2d_bridge_import=0.000078 teacher_forward_total=1.227470 student_forward=0.263609 kl_loss=0.007614 optimizer_zero_grad=0.000026 backward=1.891193 grad_clip=0.000531 optimizer_step=0.000456 post_step_cleanup=0.007548 teacher_seq_len=16 teacher_vocab=248320
+train_step step=80 prompt_index=15 loss=1.947544842551e-5 rollout_len=17 step_seconds=4.713995
+phase_summary step=80 total=4.713995 student_rollout=1.038381 infer_forward_token_logits=0.004493 infer_sync=1.386535 d2d_bridge_import=0.000553 teacher_forward_total=1.391585 student_forward=0.280214 kl_loss=0.007989 optimizer_zero_grad=0.000025 backward=1.987369 grad_clip=0.000532 optimizer_step=0.000466 post_step_cleanup=0.007379 teacher_seq_len=17 teacher_vocab=248320
+train_step step=81 prompt_index=0 loss=1.490809700044e-5 rollout_len=17 step_seconds=4.690102
+phase_summary step=81 total=4.690102 student_rollout=1.043209 infer_forward_token_logits=0.004529 infer_sync=1.323626 d2d_bridge_import=0.000553 teacher_forward_total=1.328712 student_forward=0.279724 kl_loss=0.008010 optimizer_zero_grad=0.000021 backward=2.021968 grad_clip=0.000525 optimizer_step=0.000466 post_step_cleanup=0.007407 teacher_seq_len=17 teacher_vocab=248320
+train_step step=82 prompt_index=1 loss=1.979446460609e-5 rollout_len=16 step_seconds=4.390887
+phase_summary step=82 total=4.390886 student_rollout=0.996576 infer_forward_token_logits=0.004363 infer_sync=1.224982 d2d_bridge_import=0.000080 teacher_forward_total=1.229430 student_forward=0.263355 kl_loss=0.007789 optimizer_zero_grad=0.000024 backward=1.885134 grad_clip=0.000524 optimizer_step=0.000454 post_step_cleanup=0.007543 teacher_seq_len=16 teacher_vocab=248320
+train_step step=83 prompt_index=2 loss=1.922619958350e-5 rollout_len=15 step_seconds=4.207682
+phase_summary step=83 total=4.207682 student_rollout=0.910347 infer_forward_token_logits=0.004431 infer_sync=1.221992 d2d_bridge_import=0.000550 teacher_forward_total=1.226978 student_forward=0.247526 kl_loss=0.007280 optimizer_zero_grad=0.000023 backward=1.806925 grad_clip=0.000512 optimizer_step=0.000477 post_step_cleanup=0.007567 teacher_seq_len=15 teacher_vocab=248320
+train_step step=84 prompt_index=3 loss=1.128116218752e-5 rollout_len=11 step_seconds=3.192603
+phase_summary step=84 total=3.192602 student_rollout=0.657340 infer_forward_token_logits=0.004318 infer_sync=0.972409 d2d_bridge_import=0.000080 teacher_forward_total=0.976814 student_forward=0.184527 kl_loss=0.005844 optimizer_zero_grad=0.000021 backward=1.359510 grad_clip=0.000499 optimizer_step=0.000446 post_step_cleanup=0.007542 teacher_seq_len=11 teacher_vocab=248320
+train_step step=85 prompt_index=4 loss=1.701301334833e-5 rollout_len=17 step_seconds=4.570873
+phase_summary step=85 total=4.570872 student_rollout=1.021943 infer_forward_token_logits=0.004475 infer_sync=1.259227 d2d_bridge_import=0.000553 teacher_forward_total=1.264259 student_forward=0.279591 kl_loss=0.008086 optimizer_zero_grad=0.000025 backward=1.988552 grad_clip=0.000528 optimizer_step=0.000462 post_step_cleanup=0.007366 teacher_seq_len=17 teacher_vocab=248320
+train_step step=86 prompt_index=5 loss=1.588303166500e-5 rollout_len=16 step_seconds=4.419021
+phase_summary step=86 total=4.419021 student_rollout=0.995882 infer_forward_token_logits=0.004372 infer_sync=1.253640 d2d_bridge_import=0.000080 teacher_forward_total=1.258097 student_forward=0.263413 kl_loss=0.007695 optimizer_zero_grad=0.000022 backward=1.885373 grad_clip=0.000521 optimizer_step=0.000463 post_step_cleanup=0.007508 teacher_seq_len=16 teacher_vocab=248320
+train_step step=87 prompt_index=6 loss=1.783597508620e-5 rollout_len=15 step_seconds=4.191002
+phase_summary step=87 total=4.191002 student_rollout=0.909297 infer_forward_token_logits=0.004469 infer_sync=1.226712 d2d_bridge_import=0.000552 teacher_forward_total=1.231738 student_forward=0.247920 kl_loss=0.007282 optimizer_zero_grad=0.000025 backward=1.786126 grad_clip=0.000518 optimizer_step=0.000464 post_step_cleanup=0.007578 teacher_seq_len=15 teacher_vocab=248320
+train_step step=88 prompt_index=7 loss=1.761099701980e-5 rollout_len=13 step_seconds=3.640762
+phase_summary step=88 total=3.640762 student_rollout=0.786740 infer_forward_token_logits=0.004490 infer_sync=1.044059 d2d_bridge_import=0.000551 teacher_forward_total=1.049105 student_forward=0.215394 kl_loss=0.006943 optimizer_zero_grad=0.000028 backward=1.573937 grad_clip=0.000532 optimizer_step=0.000459 post_step_cleanup=0.007566 teacher_seq_len=13 teacher_vocab=248320
+train_step step=89 prompt_index=8 loss=1.285676080442e-5 rollout_len=17 step_seconds=4.722599
+phase_summary step=89 total=4.722599 student_rollout=1.033240 infer_forward_token_logits=0.004493 infer_sync=1.366876 d2d_bridge_import=0.000555 teacher_forward_total=1.371929 student_forward=0.280493 kl_loss=0.008033 optimizer_zero_grad=0.000027 backward=2.020355 grad_clip=0.000535 optimizer_step=0.000474 post_step_cleanup=0.007454 teacher_seq_len=17 teacher_vocab=248320
+train_step step=90 prompt_index=9 loss=1.659098234086e-5 rollout_len=14 step_seconds=3.865061
+phase_summary step=90 total=3.865060 student_rollout=0.849492 infer_forward_token_logits=0.004520 infer_sync=1.087205 d2d_bridge_import=0.000600 teacher_forward_total=1.092329 student_forward=0.232379 kl_loss=0.006904 optimizer_zero_grad=0.000022 backward=1.675100 grad_clip=0.000516 optimizer_step=0.000484 post_step_cleanup=0.007772 teacher_seq_len=14 teacher_vocab=248320
+train_step step=91 prompt_index=10 loss=2.184633558500e-5 rollout_len=17 step_seconds=4.747020
+phase_summary step=91 total=4.747019 student_rollout=1.043419 infer_forward_token_logits=0.004663 infer_sync=1.381795 d2d_bridge_import=0.000604 teacher_forward_total=1.387067 student_forward=0.279251 kl_loss=0.007992 optimizer_zero_grad=0.000026 backward=2.020677 grad_clip=0.000529 optimizer_step=0.000497 post_step_cleanup=0.007497 teacher_seq_len=17 teacher_vocab=248320
+train_step step=92 prompt_index=11 loss=1.889724262583e-5 rollout_len=15 step_seconds=4.197466
+phase_summary step=92 total=4.197466 student_rollout=0.914221 infer_forward_token_logits=0.004640 infer_sync=1.232593 d2d_bridge_import=0.000554 teacher_forward_total=1.237791 student_forward=0.248210 kl_loss=0.007290 optimizer_zero_grad=0.000024 backward=1.781163 grad_clip=0.000534 optimizer_step=0.000468 post_step_cleanup=0.007707 teacher_seq_len=15 teacher_vocab=248320
+train_step step=93 prompt_index=12 loss=2.255231083836e-5 rollout_len=18 step_seconds=4.976992
+phase_summary step=93 total=4.976991 student_rollout=1.113131 infer_forward_token_logits=0.004134 infer_sync=1.447625 d2d_bridge_import=0.000550 teacher_forward_total=1.452314 student_forward=0.294575 kl_loss=0.008369 optimizer_zero_grad=0.000032 backward=2.099483 grad_clip=0.000529 optimizer_step=0.000508 post_step_cleanup=0.008004 teacher_seq_len=18 teacher_vocab=248320
+train_step step=94 prompt_index=13 loss=1.601889016456e-5 rollout_len=14 step_seconds=3.879307
+phase_summary step=94 total=3.879307 student_rollout=0.862729 infer_forward_token_logits=0.004368 infer_sync=1.089606 d2d_bridge_import=0.000083 teacher_forward_total=1.094061 student_forward=0.231830 kl_loss=0.006924 optimizer_zero_grad=0.000023 backward=1.675175 grad_clip=0.000514 optimizer_step=0.000481 post_step_cleanup=0.007499 teacher_seq_len=14 teacher_vocab=248320
+train_step step=95 prompt_index=14 loss=1.417926796421e-5 rollout_len=16 step_seconds=4.392169
+phase_summary step=95 total=4.392168 student_rollout=0.978457 infer_forward_token_logits=0.004385 infer_sync=1.222763 d2d_bridge_import=0.000093 teacher_forward_total=1.227246 student_forward=0.263904 kl_loss=0.007637 optimizer_zero_grad=0.000025 backward=1.906292 grad_clip=0.000519 optimizer_step=0.000461 post_step_cleanup=0.007564 teacher_seq_len=16 teacher_vocab=248320
+train_step step=96 prompt_index=15 loss=1.944019459188e-5 rollout_len=17 step_seconds=4.709298
+phase_summary step=96 total=4.709297 student_rollout=1.040231 infer_forward_token_logits=0.004518 infer_sync=1.379763 d2d_bridge_import=0.000552 teacher_forward_total=1.384839 student_forward=0.280174 kl_loss=0.007989 optimizer_zero_grad=0.000025 backward=1.987652 grad_clip=0.000520 optimizer_step=0.000456 post_step_cleanup=0.007367 teacher_seq_len=17 teacher_vocab=248320
+train_step step=97 prompt_index=0 loss=1.483853611717e-5 rollout_len=17 step_seconds=4.677067
+phase_summary step=97 total=4.677066 student_rollout=1.041867 infer_forward_token_logits=0.002879 infer_sync=1.315986 d2d_bridge_import=0.000552 teacher_forward_total=1.319423 student_forward=0.278536 kl_loss=0.008055 optimizer_zero_grad=0.000028 backward=2.020771 grad_clip=0.000523 optimizer_step=0.000468 post_step_cleanup=0.007351 teacher_seq_len=17 teacher_vocab=248320
+train_step step=98 prompt_index=1 loss=1.969550248759e-5 rollout_len=16 step_seconds=4.413049
+phase_summary step=98 total=4.413049 student_rollout=0.993715 infer_forward_token_logits=0.004368 infer_sync=1.229073 d2d_bridge_import=0.000076 teacher_forward_total=1.233522 student_forward=0.264251 kl_loss=0.007626 optimizer_zero_grad=0.000025 backward=1.905326 grad_clip=0.000523 optimizer_step=0.000458 post_step_cleanup=0.007543 teacher_seq_len=16 teacher_vocab=248320
+train_step step=99 prompt_index=2 loss=1.918093585118e-5 rollout_len=15 step_seconds=4.188158
+phase_summary step=99 total=4.188158 student_rollout=0.911301 infer_forward_token_logits=0.004429 infer_sync=1.206837 d2d_bridge_import=0.000548 teacher_forward_total=1.211819 student_forward=0.247813 kl_loss=0.007250 optimizer_zero_grad=0.000024 backward=1.801315 grad_clip=0.000521 optimizer_step=0.000472 post_step_cleanup=0.007585 teacher_seq_len=15 teacher_vocab=248320
+train_step step=100 prompt_index=3 loss=1.127386985900e-5 rollout_len=11 step_seconds=3.184756
+phase_summary step=100 total=3.184755 student_rollout=0.657508 infer_forward_token_logits=0.004389 infer_sync=0.971634 d2d_bridge_import=0.000082 teacher_forward_total=0.976111 student_forward=0.184630 kl_loss=0.005855 optimizer_zero_grad=0.000022 backward=1.352102 grad_clip=0.000503 optimizer_step=0.000441 post_step_cleanup=0.007526 teacher_seq_len=11 teacher_vocab=248320
+eval_summary step=100 train_kl=1.487306491299e-5 heldout_kl=1.802543692975e-5 eval_seconds=20.070268
+training_summary total_steps=100 total_wall_seconds=490.774861 mean_step_seconds=4.302815 median_step_seconds=4.408362 first_loss=1.524423714727e-5 final_loss=1.127386985900e-5 sampled_loss_reduction_pct=26.045038
