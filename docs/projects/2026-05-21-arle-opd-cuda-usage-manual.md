@@ -62,6 +62,16 @@ TORCH_CUDA_ARCH_LIST=8.9 \
 cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- \
   --prompts-file examples/opd/sample-prompts.jsonl --lr 1e-7 --steps 500 \
   --eval-steps 0,100,250,500
+
+# 4. For adapter-only training, run the LoRA harness. It shares the frozen
+#    base with the teacher and trains q/v rank16 adapters only.
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo run -p train --example opd_step_cuda_realckpt_lora_bench --release --features cuda -- \
+  --lr 1e-5 --steps 500 --rollout-len 8 --prompt-set 32 \
+  --eval-steps 0,50,100,250,500
 ```
 
 Expected on RTX 4070 Ti SUPER:
@@ -85,7 +95,7 @@ Expected on RTX 4070 Ti SUPER:
 | Rust | 1.95+ |
 | Python venv | `/home/<user>/projects/arle/.venv/bin/python` with PyTorch 2.11.0+cu130. The PyTorch venv is only needed for the comparison baseline (`pytorch_cuda_opd_baseline.py`) and TileLang's NVRTC support; ARLE's training path itself is pure Rust + cudarc. |
 | Model checkpoint | Qwen3-0.6B safetensors in the local ModelScope cache (`~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B/`). The training harness loads from this path by default. |
-| Workspace memory | ~16 GB peak for Qwen3-0.6B full-finetune at `rollout_len=8`. Less for LoRA-only. |
+| Workspace memory | ~15 GB peak for Qwen3-0.6B full-finetune at `rollout_len=8`; q/v rank16 LoRA observed `3934 MiB` peak. |
 
 Env vars (all required for the CUDA build):
 
@@ -200,9 +210,29 @@ Memory budget heuristic (full-finetune, no LoRA):
 | 1.5 B | ~20-25 GB (won't fit on a 16 GB card without LoRA or grad checkpointing) |
 | 4 B | needs >32 GB or sharding |
 
-LoRA-only student support is in `crates/train/src/lora.rs` and reduces
-the AdamW state dramatically — recommended for ≥1.5 B models on
-single-GPU hardware.
+LoRA-only recipe:
+
+```bash
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo run -p train --example opd_step_cuda_realckpt_lora_bench --release --features cuda -- \
+  --lr 1e-5 --steps 500 --rollout-len 8 --prompt-set 32 \
+  --eval-steps 0,50,100,250,500
+```
+
+The current licensed default is `LoraTargetSet::AttentionQv`, rank16,
+alpha32. It trains only `q_proj` and `v_proj` adapters, shares frozen base
+weights with the teacher, and tracks `2.29M` trainable params instead of
+the full `~601M` student. The 500-step Qwen3-0.6B run measured
+`0.140092 s/step`, `3934 MiB` peak GPU memory, and held-out KL
+`7.63e-5 -> 4.86e-5` (`-36.39%`).
+
+Avoid all-linear rank16 by default: the probe was slower
+(`0.217415 s/step`) because the extra adapter GEMMs add launch overhead at
+short OPD sequence lengths. See
+[`../experience/wins/2026-05-21-arle-cuda-opd-realckpt-lora.md`](../experience/wins/2026-05-21-arle-cuda-opd-realckpt-lora.md).
 
 ## Correctness gates
 
@@ -286,7 +316,7 @@ Ranked by estimated step-level ROI:
 | bf16 weights for `lm_head` + embedding | ~2-3 % step | Memory bandwidth; needs grad-check threshold relaxation. |
 | Backward fused causal-SDPA | ~3-5 % step | Forward done (commit `67607a0`); backward still on matmul-decomposed path. |
 | Prompt corpus loader + attention masks | qualitative | `--prompts-file <jsonl>` has landed. Next DX tranche is larger prompt corpora, explicit train/held-out split files, and masked batching instead of one prompt per step. |
-| LoRA-only convergence benchmark | qualitative | Reuses the harness with `LoraConfig` set; smaller GPU footprint. |
+| Wider LoRA target A/B | qualitative | q/v rank16 is licensed. Only widen after wall-clock + KL A/B; all-linear rank16 was slower at this shape. |
 
 ## Cross-links
 
@@ -295,6 +325,7 @@ Ranked by estimated step-level ROI:
 - PyTorch CUDA baseline (the reference we beat at moderate): [`../experience/wins/2026-05-20-pytorch-cuda-opd-baseline.md`](../experience/wins/2026-05-20-pytorch-cuda-opd-baseline.md)
 - 5k-step convergence (held-out 50 → 82.8 %): [`../experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-5k-newmetric.md`](../experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-5k-newmetric.md)
 - JSONL prompt loader: [`../experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md`](../experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md)
+- LoRA-only Qwen3-0.6B bench: [`../experience/wins/2026-05-21-arle-cuda-opd-realckpt-lora.md`](../experience/wins/2026-05-21-arle-cuda-opd-realckpt-lora.md)
 - All today's wins entries (chronological): `docs/experience/wins/2026-05-21-arle-cuda-opd-*.md`
 - All today's research notes: `docs/research/2026-05-21-arle-cuda-opd-*.md`
 

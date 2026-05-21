@@ -4,7 +4,7 @@
 )]
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
-mod app {
+pub mod app {
     use std::{
         collections::HashSet,
         env,
@@ -15,6 +15,7 @@ mod app {
 
     use autograd::{Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
     use train::{
+        LoraConfig, LoraTargetSet,
         opd::{OpdStepConfig, opd_step},
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
@@ -29,10 +30,14 @@ mod app {
     const DEFAULT_JSONL_HELDOUT_PROMPTS: usize = 4;
     const DECODE_LEN: usize = 16;
     const DEFAULT_LEARNING_RATE: f32 = 5.0e-5;
+    const DEFAULT_LORA_LEARNING_RATE: f32 = 1.0e-5;
+    const DEFAULT_LORA_RANK: usize = 16;
+    const DEFAULT_LORA_ALPHA: f32 = 32.0;
     const GRAD_CLIP: f32 = 1.0;
     const PERTURB_SCALE: f32 = 1.0e-3;
     const PERTURB_SEED: u64 = 0x0f0d_cafe_2026_0521;
     const SAFETY_FIRST_STEP_MAX_SECONDS: f64 = 0.5;
+    const LORA_SAFETY_FIRST_STEP_MAX_SECONDS: f64 = 0.3;
     const EVAL_STEPS: &[usize] = &[0, 100, 250, 500, 1000, 2000];
 
     const TRAIN_PROMPTS_8: &[&[u32]] = &[
@@ -88,7 +93,83 @@ mod app {
         &[1, 3198, 279, 1296, 25, 220],
     ];
 
-    type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
+    pub type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+    #[derive(Debug, Clone, Copy)]
+    enum StudentMode {
+        FullFineTune,
+        Lora {
+            rank: usize,
+            alpha: f32,
+            target_set: LoraTargetSet,
+            default_learning_rate: f32,
+            safety_first_step_max_seconds: f64,
+        },
+    }
+
+    impl StudentMode {
+        fn full_finetune() -> Self {
+            Self::FullFineTune
+        }
+
+        fn lora_rank16() -> Self {
+            Self::Lora {
+                rank: DEFAULT_LORA_RANK,
+                alpha: DEFAULT_LORA_ALPHA,
+                target_set: LoraTargetSet::AttentionQv,
+                default_learning_rate: DEFAULT_LORA_LEARNING_RATE,
+                safety_first_step_max_seconds: LORA_SAFETY_FIRST_STEP_MAX_SECONDS,
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::FullFineTune => "full-finetune",
+                Self::Lora { .. } => "lora",
+            }
+        }
+
+        fn default_learning_rate(self) -> f32 {
+            match self {
+                Self::FullFineTune => DEFAULT_LEARNING_RATE,
+                Self::Lora {
+                    default_learning_rate,
+                    ..
+                } => default_learning_rate,
+            }
+        }
+
+        fn safety_first_step_max_seconds(self) -> f64 {
+            match self {
+                Self::FullFineTune => SAFETY_FIRST_STEP_MAX_SECONDS,
+                Self::Lora {
+                    safety_first_step_max_seconds,
+                    ..
+                } => safety_first_step_max_seconds,
+            }
+        }
+
+        fn lora_config(self) -> Option<LoraConfig> {
+            match self {
+                Self::FullFineTune => None,
+                Self::Lora { rank, alpha, .. } => Some(LoraConfig { rank, alpha }),
+            }
+        }
+
+        fn lora_target_set(self) -> Option<LoraTargetSet> {
+            match self {
+                Self::FullFineTune => None,
+                Self::Lora { target_set, .. } => Some(target_set),
+            }
+        }
+
+        fn usage_example(self) -> &'static str {
+            match self {
+                Self::FullFineTune => "opd_step_cuda_realckpt_train",
+                Self::Lora { .. } => "opd_step_cuda_realckpt_lora_bench",
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct EvalSummary {
@@ -206,11 +287,21 @@ mod app {
     }
 
     pub fn main() -> AnyResult<()> {
+        run(StudentMode::full_finetune())
+    }
+
+    pub fn main_lora_rank16() -> Result<(), Box<dyn std::error::Error>> {
+        run(StudentMode::lora_rank16())
+    }
+
+    fn run(student_mode: StudentMode) -> AnyResult<()> {
         let model_dir = resolve_model_dir()?;
-        let args = resolve_training_args()?;
+        let Some(args) = resolve_training_args(student_mode)? else {
+            return Ok(());
+        };
         let prompts = resolve_prompts(&model_dir, &args)?;
         let eval_steps = eval_steps_for(args.train_steps, &args.eval_steps);
-        print_config(&model_dir, &args, &prompts, &eval_steps);
+        print_config(&model_dir, student_mode, &args, &prompts, &eval_steps);
 
         let cuda_backend = Arc::new(CudaBackend::new(0)?);
         let mut store = TensorStore::with_backend(cuda_backend.clone());
@@ -220,7 +311,17 @@ mod app {
         let teacher = load_qwen35_from_hf_dir(&model_dir, &mut store)?;
         let teacher_load_seconds = teacher_load_started.elapsed().as_secs_f64();
         let student_load_started = Instant::now();
-        let student = load_qwen35_trainable_from_hf_dir(&model_dir, &mut store)?;
+        let student = match student_mode.lora_config() {
+            Some(lora) => Qwen35Model::new_lora_from_base(
+                &teacher,
+                lora,
+                student_mode
+                    .lora_target_set()
+                    .unwrap_or(LoraTargetSet::AllLinear),
+                &mut store,
+            )?,
+            None => load_qwen35_trainable_from_hf_dir(&model_dir, &mut store)?,
+        };
         let student_load_seconds = student_load_started.elapsed().as_secs_f64();
 
         let teacher_params = teacher.all_parameter_ids();
@@ -229,6 +330,7 @@ mod app {
         let teacher_param_elements = param_element_count(&teacher_params, &store);
         let student_model_elements = param_element_count(&student_model_params, &store);
         let student_trainable_elements = param_element_count(&student_trainable_params, &store);
+        let student_base_shared_with_teacher = student_mode.lora_config().is_some();
 
         perturb_params(
             &student_trainable_params,
@@ -244,7 +346,18 @@ mod app {
         };
 
         println!(
-            "model_summary hidden={} intermediate={} layers={} vocab={} num_heads={} num_kv_heads={} head_dim={} tie_word_embeddings={} rope_theta={} teacher_param_elements={} student_model_elements={} student_trainable_elements={} teacher_load_seconds={teacher_load_seconds:.6} student_load_seconds={student_load_seconds:.6}",
+            "model_summary student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} student_base_shared_with_teacher={} hidden={} intermediate={} layers={} vocab={} num_heads={} num_kv_heads={} head_dim={} tie_word_embeddings={} rope_theta={} teacher_param_elements={} student_model_elements={} student_trainable_elements={} teacher_load_seconds={teacher_load_seconds:.6} student_load_seconds={student_load_seconds:.6}",
+            student_mode.label(),
+            student_mode.lora_config().map(|cfg| cfg.rank).unwrap_or(0),
+            student_mode
+                .lora_config()
+                .map(|cfg| cfg.alpha)
+                .unwrap_or(0.0),
+            student_mode
+                .lora_target_set()
+                .map(LoraTargetSet::label)
+                .unwrap_or("none"),
+            student_base_shared_with_teacher,
             student.config().hidden_size,
             student.config().intermediate_size,
             student.config().num_hidden_layers,
@@ -290,12 +403,13 @@ mod app {
                 &mut tape,
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
-            if step == 1 && elapsed > SAFETY_FIRST_STEP_MAX_SECONDS {
+            let safety_first_step_max_seconds = student_mode.safety_first_step_max_seconds();
+            if step == 1 && elapsed > safety_first_step_max_seconds {
                 println!(
-                    "safety_stop first_step_seconds={elapsed:.6} max_allowed_seconds={SAFETY_FIRST_STEP_MAX_SECONDS:.6}"
+                    "safety_stop first_step_seconds={elapsed:.6} max_allowed_seconds={safety_first_step_max_seconds:.6}"
                 );
                 return Err(format!(
-                    "first OPD step took {elapsed:.6}s, exceeding the {SAFETY_FIRST_STEP_MAX_SECONDS:.6}s safety ceiling"
+                    "first OPD step took {elapsed:.6}s, exceeding the {safety_first_step_max_seconds:.6}s safety ceiling"
                 )
                 .into());
             }
@@ -341,8 +455,8 @@ mod app {
         Ok(path)
     }
 
-    fn resolve_training_args() -> AnyResult<TrainingArgs> {
-        let mut learning_rate = DEFAULT_LEARNING_RATE;
+    fn resolve_training_args(student_mode: StudentMode) -> AnyResult<Option<TrainingArgs>> {
+        let mut learning_rate = student_mode.default_learning_rate();
         let mut train_steps = DEFAULT_TRAIN_STEPS;
         let mut rollout_len = DEFAULT_ROLLOUT_LEN;
         let mut eval_steps = EVAL_STEPS.to_vec();
@@ -420,9 +534,10 @@ mod app {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train."
+                        "usage: cargo run -p train --example {} --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train.",
+                        student_mode.usage_example()
                     );
-                    std::process::exit(0);
+                    return Ok(None);
                 }
                 unknown => {
                     return Err(format!(
@@ -432,14 +547,14 @@ mod app {
                 }
             }
         }
-        Ok(TrainingArgs {
+        Ok(Some(TrainingArgs {
             learning_rate,
             train_steps,
             rollout_len,
             eval_steps,
             prompt_source,
             prompt_max_tokens,
-        })
+        }))
     }
 
     fn parse_positive_f32(name: &str, raw: &str) -> AnyResult<f32> {
@@ -539,16 +654,29 @@ mod app {
 
     fn print_config(
         model_dir: &Path,
+        student_mode: StudentMode,
         args: &TrainingArgs,
         prompts: &PromptData,
         eval_steps: &[usize],
     ) {
         println!(
-            "config backend=cuda model_dir={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS} prompt_source={} train_prompt_count={} heldout_prompt_count={} eval_steps={eval_steps:?}",
+            "config backend=cuda model_dir={} student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={:.6} prompt_source={} train_prompt_count={} heldout_prompt_count={} eval_steps={eval_steps:?}",
             model_dir.display(),
+            student_mode.label(),
+            student_mode.lora_config().map(|cfg| cfg.rank).unwrap_or(0),
+            student_mode
+                .lora_config()
+                .map(|cfg| cfg.alpha)
+                .unwrap_or(0.0),
+            student_mode
+                .lora_target_set()
+                .map(LoraTargetSet::label)
+                .unwrap_or("none"),
             args.train_steps,
             args.rollout_len,
             args.learning_rate,
+            student_mode.default_learning_rate(),
+            student_mode.safety_first_step_max_seconds(),
             prompts.source_label,
             prompts.train.len(),
             prompts.heldout.len()

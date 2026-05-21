@@ -18,6 +18,31 @@ impl LoraConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoraTargetSet {
+    AllLinear,
+    AttentionQv,
+}
+
+impl LoraTargetSet {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllLinear => "all-linear",
+            Self::AttentionQv => "attention-qv",
+        }
+    }
+
+    pub fn includes(self, base_name: &str) -> bool {
+        match self {
+            Self::AllLinear => true,
+            Self::AttentionQv => {
+                base_name.ends_with(".self_attn.q_proj.weight")
+                    || base_name.ends_with(".self_attn.v_proj.weight")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoraAdapterConfig {
     pub base_model_name_or_path: String,
@@ -166,6 +191,14 @@ impl LinearWithLora {
         let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
         output_shape.push(weight_shape[0]);
         reshape(projected, &output_shape, store, tape)
+    }
+
+    pub fn base_weight(&self) -> TensorId {
+        self.weight
+    }
+
+    pub fn set_base_weight(&mut self, weight: TensorId) {
+        self.weight = weight;
     }
 
     pub fn parameter_name_map(&self) -> HashMap<&'static str, TensorId> {

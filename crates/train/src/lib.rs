@@ -39,7 +39,7 @@ pub mod trainer;
 
 pub use causal_lm::CausalLm;
 pub use grad_accum::GradAccumulator;
-pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig};
+pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig, LoraTargetSet};
 pub use metrics::*;
 pub use trainer::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig, cleanup_after_backward,

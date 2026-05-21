@@ -5,12 +5,12 @@ use std::{
 };
 
 use autograd::{
-    ops::{
-        add, causal_sdpa, causal_sdpa_decode_gqa, causal_sdpa_with_q_start, embedding,
-        linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose, LinearAttentionParams,
-    },
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
+    ops::{
+        LinearAttentionParams, add, causal_sdpa, causal_sdpa_decode_gqa, causal_sdpa_with_q_start,
+        embedding, linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope,
+        sigmoid, silu, slice, transpose,
+    },
 };
 use qwen35_spec::Qwen35AttentionTensorNames;
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::{
     causal_lm::CausalLm,
-    lora::{LinearWithLora, LoraConfig},
+    lora::{LinearWithLora, LoraConfig, LoraTargetSet},
 };
 
 #[derive(Debug, Error)]
@@ -899,6 +899,7 @@ impl Qwen35Layer {
 pub struct Qwen35Model {
     config: Qwen35Config,
     lora: Option<LoraConfig>,
+    lora_target_set: LoraTargetSet,
     layers: Vec<Qwen35Layer>,
     embed_tokens: TensorId,
     final_norm: TensorId,
@@ -918,7 +919,13 @@ enum Qwen35InitMode {
 
 impl Qwen35Model {
     pub fn new(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
-        Self::new_internal(cfg, None, Qwen35InitMode::ScratchTrain, store)
+        Self::new_internal(
+            cfg,
+            None,
+            LoraTargetSet::AllLinear,
+            Qwen35InitMode::ScratchTrain,
+            store,
+        )
     }
 
     pub fn config(&self) -> &Qwen35Config {
@@ -926,7 +933,13 @@ impl Qwen35Model {
     }
 
     pub fn new_for_eval(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
-        Self::new_internal(cfg, None, Qwen35InitMode::LoraOrFrozen, store)
+        Self::new_internal(
+            cfg,
+            None,
+            LoraTargetSet::AllLinear,
+            Qwen35InitMode::LoraOrFrozen,
+            store,
+        )
     }
 
     pub fn new_with_lora(
@@ -934,12 +947,52 @@ impl Qwen35Model {
         lora: Option<LoraConfig>,
         store: &mut TensorStore,
     ) -> Result<Self> {
-        Self::new_internal(cfg, lora, Qwen35InitMode::LoraOrFrozen, store)
+        Self::new_internal(
+            cfg,
+            lora,
+            LoraTargetSet::AllLinear,
+            Qwen35InitMode::LoraOrFrozen,
+            store,
+        )
+    }
+
+    pub fn new_with_lora_targets(
+        cfg: &Qwen35Config,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        Self::new_internal(
+            cfg,
+            Some(lora),
+            target_set,
+            Qwen35InitMode::LoraOrFrozen,
+            store,
+        )
+    }
+
+    pub fn new_lora_from_base(
+        base: &Qwen35Model,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        let mut model = Self::new_with_lora_targets(&base.config, lora, target_set, store)?;
+        model.share_base_parameters_from(base)?;
+
+        let keep = base
+            .all_parameter_ids()
+            .into_iter()
+            .chain(model.all_parameter_ids())
+            .collect::<HashSet<_>>();
+        store.retain_ids(&keep);
+        Ok(model)
     }
 
     fn new_internal(
         cfg: &Qwen35Config,
         lora: Option<LoraConfig>,
+        lora_target_set: LoraTargetSet,
         mode: Qwen35InitMode,
         store: &mut TensorStore,
     ) -> Result<Self> {
@@ -1008,7 +1061,7 @@ impl Qwen35Model {
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 base_requires_grad,
-                lora,
+                lora_for_name(lora, lora_target_set, gate_proj_name),
                 store,
             )?;
             let up_proj = LinearWithLora::new(
@@ -1016,7 +1069,7 @@ impl Qwen35Model {
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 base_requires_grad,
-                lora,
+                lora_for_name(lora, lora_target_set, up_proj_name),
                 store,
             )?;
             let down_proj = LinearWithLora::new(
@@ -1024,7 +1077,7 @@ impl Qwen35Model {
                 cfg.intermediate_size,
                 cfg.hidden_size,
                 base_requires_grad,
-                lora,
+                lora_for_name(lora, lora_target_set, down_proj_name),
                 store,
             )?;
             let post_attention_layernorm = ones_parameter(
@@ -1073,7 +1126,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.full_attn_q_proj_dim(),
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, q_proj_name),
                         store,
                     )?;
                     let k_proj = LinearWithLora::new(
@@ -1081,7 +1134,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.full_attn_kv_dim(),
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, k_proj_name),
                         store,
                     )?;
                     let v_proj = LinearWithLora::new(
@@ -1089,7 +1142,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.full_attn_kv_dim(),
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, v_proj_name),
                         store,
                     )?;
                     let o_proj = LinearWithLora::new(
@@ -1097,7 +1150,7 @@ impl Qwen35Model {
                         cfg.full_attn_q_dim(),
                         cfg.hidden_size,
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, o_proj_name),
                         store,
                     )?;
                     let q_norm =
@@ -1157,7 +1210,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_attn_qkv_dim(),
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, in_proj_qkv_name),
                         store,
                     )?;
                     let in_proj_z = LinearWithLora::new(
@@ -1165,7 +1218,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_attn_z_dim(),
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, in_proj_z_name),
                         store,
                     )?;
                     let in_proj_b = LinearWithLora::new(
@@ -1173,7 +1226,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_num_value_heads,
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, in_proj_b_name),
                         store,
                     )?;
                     let in_proj_a = LinearWithLora::new(
@@ -1181,7 +1234,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_num_value_heads,
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, in_proj_a_name),
                         store,
                     )?;
                     let conv1d_weight = normal_parameter(
@@ -1216,7 +1269,7 @@ impl Qwen35Model {
                         cfg.linear_attn_z_dim(),
                         cfg.hidden_size,
                         base_requires_grad,
-                        lora,
+                        lora_for_name(lora, lora_target_set, out_proj_name),
                         store,
                     )?;
 
@@ -1301,6 +1354,7 @@ impl Qwen35Model {
         Ok(Self {
             config: cfg.clone(),
             lora,
+            lora_target_set,
             layers,
             embed_tokens,
             final_norm,
@@ -1317,9 +1371,63 @@ impl Qwen35Model {
         self.param_ids.clone()
     }
 
+    fn share_base_parameters_from(&mut self, base: &Qwen35Model) -> Result<()> {
+        if self.layers.len() != base.layers.len() {
+            return Err(Qwen35Error::InvalidConfig(
+                "cannot share Qwen3.5 base weights across mismatched layer counts",
+            ));
+        }
+
+        self.embed_tokens = base.embed_tokens;
+        self.final_norm = base.final_norm;
+        self.lm_head = base.lm_head;
+        self.cos_cache = base.cos_cache;
+        self.sin_cache = base.sin_cache;
+
+        for (layer, base_layer) in self.layers.iter_mut().zip(&base.layers) {
+            layer.input_layernorm = base_layer.input_layernorm;
+            layer.post_attention_layernorm = base_layer.post_attention_layernorm;
+            share_base_attention(&mut layer.self_attn, &base_layer.self_attn)?;
+            layer
+                .mlp
+                .gate_proj
+                .set_base_weight(base_layer.mlp.gate_proj.base_weight());
+            layer
+                .mlp
+                .up_proj
+                .set_base_weight(base_layer.mlp.up_proj.base_weight());
+            layer
+                .mlp
+                .down_proj
+                .set_base_weight(base_layer.mlp.down_proj.base_weight());
+        }
+
+        self.param_names = base.param_names.clone();
+        let adapter_ids = self.adapter_names.values().copied().collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        let mut param_ids = Vec::with_capacity(base.param_ids.len() + adapter_ids.len());
+        for &id in &base.param_ids {
+            if seen.insert(id) {
+                param_ids.push(id);
+            }
+        }
+        for &id in &self.param_ids {
+            if adapter_ids.contains(&id) && seen.insert(id) {
+                param_ids.push(id);
+            }
+        }
+        self.param_ids = param_ids;
+        Ok(())
+    }
+
     pub fn clone_frozen(&self, store: &mut TensorStore) -> Self {
-        let cloned = Self::new_with_lora(&self.config, self.lora, store)
-            .expect("clone_frozen should preserve config");
+        let cloned = match self.lora {
+            Some(lora) => {
+                Self::new_with_lora_targets(&self.config, lora, self.lora_target_set, store)
+            }
+            None => Self::new_for_eval(&self.config, store),
+        }
+        .expect("clone_frozen should preserve config");
         copy_frozen_tensor_map(&self.param_names, &cloned.param_names, store);
         copy_frozen_tensor_map(&self.adapter_names, &cloned.adapter_names, store);
         copy_frozen_tensor(self.cos_cache, cloned.cos_cache, store);
@@ -2039,6 +2147,51 @@ fn register_linear(
     for (name, id) in linear.adapter_name_map() {
         register_named(adapter_names, name, id);
     }
+}
+
+fn share_base_attention(
+    attention: &mut Qwen35Attention,
+    base_attention: &Qwen35Attention,
+) -> Result<()> {
+    match (attention, base_attention) {
+        (Qwen35Attention::Full(attn), Qwen35Attention::Full(base_attn)) => {
+            attn.q_proj.set_base_weight(base_attn.q_proj.base_weight());
+            attn.k_proj.set_base_weight(base_attn.k_proj.base_weight());
+            attn.v_proj.set_base_weight(base_attn.v_proj.base_weight());
+            attn.o_proj.set_base_weight(base_attn.o_proj.base_weight());
+            attn.q_norm = base_attn.q_norm;
+            attn.k_norm = base_attn.k_norm;
+            Ok(())
+        }
+        (Qwen35Attention::Linear(attn), Qwen35Attention::Linear(base_attn)) => {
+            attn.in_proj_qkv
+                .set_base_weight(base_attn.in_proj_qkv.base_weight());
+            attn.in_proj_z
+                .set_base_weight(base_attn.in_proj_z.base_weight());
+            attn.in_proj_b
+                .set_base_weight(base_attn.in_proj_b.base_weight());
+            attn.in_proj_a
+                .set_base_weight(base_attn.in_proj_a.base_weight());
+            attn.conv1d_weight = base_attn.conv1d_weight;
+            attn.dt_bias = base_attn.dt_bias;
+            attn.a_log = base_attn.a_log;
+            attn.norm = base_attn.norm;
+            attn.out_proj
+                .set_base_weight(base_attn.out_proj.base_weight());
+            Ok(())
+        }
+        _ => Err(Qwen35Error::InvalidConfig(
+            "cannot share Qwen3.5 base weights across mismatched attention layer types",
+        )),
+    }
+}
+
+fn lora_for_name(
+    lora: Option<LoraConfig>,
+    target_set: LoraTargetSet,
+    base_name: &str,
+) -> Option<LoraConfig> {
+    lora.filter(|_| target_set.includes(base_name))
 }
 
 fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {
