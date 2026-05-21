@@ -12,7 +12,7 @@ use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::{KVCache, KVFormat};
 use crate::ops;
 use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::{TokenKVPool, ffi, kv_quant};
+use cuda_kernels::{ffi, kv_quant, TokenKVPool};
 
 pub(super) struct Qwen35PagedPrefillRequest<'a> {
     pub tokens: &'a [u32],
@@ -62,12 +62,12 @@ impl Qwen35Model {
         kv_cache.advance_seq_len(seq_len);
         recurrent.seq_len += seq_len;
 
-        // Final norm (1+weight offset) + LM head (tied embeddings)
+        // Final norm (1+weight offset) + LM head
         crate::model::common::compute_logits_batch(
             &self.ctx,
             &hidden_batch,
             &self.norm,
-            &self.embed_tokens,
+            self.output_projection(),
             c.rms_norm_eps,
             true, // offset RMSNorm (1+weight)
         )
@@ -370,7 +370,7 @@ impl Qwen35Model {
             )?;
             ops::gemv(
                 &self.ctx,
-                &self.embed_tokens,
+                self.output_projection(),
                 &bufs.last_normed,
                 &mut bufs.logits,
             )?;
@@ -954,7 +954,7 @@ impl Qwen35Model {
         )?;
         ops::gemv(
             &self.ctx,
-            &self.embed_tokens,
+            self.output_projection(),
             &bufs.last_normed,
             &mut bufs.logits,
         )?;
@@ -1557,10 +1557,10 @@ impl Qwen35Model {
             &mut bufs.normed_out,
         )?;
 
-        // LM head (tied embeddings) → logits
+        // LM head → logits
         ops::gemv(
             &self.ctx,
-            &self.embed_tokens,
+            self.output_projection(),
             &bufs.normed_out,
             &mut bufs.logits,
         )?;

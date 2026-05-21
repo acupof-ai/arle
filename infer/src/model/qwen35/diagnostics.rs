@@ -135,8 +135,8 @@ impl Qwen35Model {
             c.rms_norm_eps,
             &mut final_norm,
         )?;
-        let lm_head =
-            ops::linear(&self.ctx, &final_norm, &self.embed_tokens)?.with_label("parity_lm_head");
+        let lm_head = ops::linear(&self.ctx, &final_norm, self.output_projection())?
+            .with_label("parity_lm_head");
 
         Ok(Qwen35InferParityStages {
             embedding,
@@ -174,7 +174,7 @@ impl Qwen35Model {
 
         let lm_head_input = deterministic_bf16_vec(c.hidden_size, 29);
         let lm_head_input = DeviceVec::from_host(&self.ctx, &lm_head_input)?;
-        let lm_head = ops::linear(&self.ctx, &lm_head_input, &self.embed_tokens)?
+        let lm_head = ops::linear(&self.ctx, &lm_head_input, self.output_projection())?
             .with_label("dense_parity_lm_head");
 
         Ok(Qwen35DenseModuleParityOutputs {

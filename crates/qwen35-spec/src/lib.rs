@@ -266,14 +266,26 @@ struct TextConfig {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawConfig {
-    Nested { text_config: TextConfig },
+    Nested {
+        text_config: TextConfig,
+        #[serde(default)]
+        tie_word_embeddings: Option<bool>,
+    },
     Flat(TextConfig),
 }
 
 impl RawConfig {
     fn into_text(self) -> TextConfig {
         match self {
-            Self::Nested { text_config } => text_config,
+            Self::Nested {
+                mut text_config,
+                tie_word_embeddings,
+            } => {
+                if let Some(tie_word_embeddings) = tie_word_embeddings {
+                    text_config.tie_word_embeddings = tie_word_embeddings;
+                }
+                text_config
+            }
             Self::Flat(text_config) => text_config,
         }
     }
@@ -994,6 +1006,17 @@ mod tests {
         assert_eq!(config.full_attn_kv_dim(), 1024);
         assert_eq!(config.linear_attn_qkv_dim(), 8192);
         assert_eq!(config.linear_attn_z_dim(), 4096);
+    }
+
+    #[test]
+    fn nested_config_top_level_tie_word_embeddings_overrides_default() {
+        let json = NESTED_CONFIG_JSON.replace(
+            "\"text_config\": {",
+            "\"tie_word_embeddings\": false,\n        \"text_config\": {",
+        );
+        let json = json.replace("\"tie_word_embeddings\": true,", "");
+        let config = Qwen35Config::from_json_str(&json).unwrap();
+        assert!(!config.tie_word_embeddings);
     }
 
     #[test]

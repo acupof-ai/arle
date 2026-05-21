@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::time::Instant;
 
 use super::config::{Config35, LayerType};
@@ -11,13 +11,14 @@ use crate::model::qwen35::prefill_buffers::PagedPrefillBuffers35;
 use crate::model_source::ResolvedModelSource;
 #[cfg(test)]
 use crate::tensor_parallel::ShardingSpec;
-use crate::tensor_parallel::{TpConfig, column_shard};
+use crate::tensor_parallel::{column_shard, TpConfig};
 use crate::tp::TpLoadContext;
 use crate::weight_loader::{
-    QuantLoadConfig, load_tensor_1d, load_tensor_1d_f32, load_tensor_1d_f32_sharded,
+    load_tensor_1d, load_tensor_1d_f32, load_tensor_1d_f32_sharded,
     load_tensor_1d_fused_segments_sharded, load_tensor_1d_sharded, load_tensor_2d,
     load_tensor_2d_fused_column_segments_sharded, load_tensor_2d_maybe_quantized_with_config,
     load_tensor_2d_sharded, precompute_rope_with_qwen35_scaling, resolve_rope_cache_len,
+    QuantLoadConfig,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -92,6 +93,7 @@ pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config35,
     pub(super) embed_tokens: DeviceMatrix,
+    pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock35>,
     pub(super) norm: DeviceVec,
     // Partial RoPE cache: [max_seq_len * rotary_dim]
@@ -307,6 +309,24 @@ impl Qwen35Model {
             "embed_tokens: [{}, {}]",
             embed_tokens.rows, embed_tokens.cols
         );
+        let lm_head_name = "lm_head.weight";
+        let lm_head_present = weight_map.contains_key(lm_head_name)
+            || shards
+                .iter()
+                .any(|shard| shard.tensor(lm_head_name).is_ok());
+        let lm_head = if config.tie_word_embeddings {
+            debug!("Using tied input/output embeddings");
+            None
+        } else if lm_head_present {
+            debug!("Loading untied LM head to GPU");
+            Some(load_linear(lm_head_name)?)
+        } else {
+            warn!(
+                "Qwen3.5 config has tie_word_embeddings=false but lm_head.weight is absent; \
+                 falling back to tied input/output embeddings"
+            );
+            None
+        };
 
         debug!(
             "Loading layers to GPU: num_layers={}",
@@ -476,6 +496,7 @@ impl Qwen35Model {
             ctx,
             config: runtime_config,
             embed_tokens,
+            lm_head,
             layers,
             norm,
             cos_cache,
@@ -531,6 +552,9 @@ impl Qwen35Model {
             c.vocab_size,
             c.hidden_size,
         )?;
+        if let Some(lm_head) = &self.lm_head {
+            assert_shape("lm_head", lm_head, c.vocab_size, c.hidden_size)?;
+        }
 
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("layer.{}", i);
@@ -869,6 +893,7 @@ impl Qwen35Model {
             ctx: ctx.clone(),
             config: config.clone(),
             embed_tokens,
+            lm_head: None,
             layers,
             norm,
             cos_cache,
@@ -885,6 +910,10 @@ impl Qwen35Model {
             paged_prefill_batch: std::sync::Mutex::new(None),
             medusa_hidden_capture: None,
         })
+    }
+
+    pub(super) fn output_projection(&self) -> &DeviceMatrix {
+        common::output_projection(self.lm_head.as_ref(), &self.embed_tokens)
     }
 }
 
