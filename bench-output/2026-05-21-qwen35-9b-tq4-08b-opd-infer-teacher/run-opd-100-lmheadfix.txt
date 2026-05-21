@@ -1,0 +1,23 @@
+config backend=cuda teacher_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4 student_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base student_mode=lora lora_rank=16 lora_alpha=32.000000 lora_target_set=attention-qv steps=100 rollout_len=8 lr=9.999999747e-6 grad_clip=1 prompt_source=jsonl:examples/opd/sample-prompts.jsonl rows=20 tokenizer=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base/tokenizer.json truncated_rows=1 train_prompt_count=16 heldout_prompt_count=4 eval_steps=[0, 25, 50, 100] cuda_graph=true
+prompt split=train index=0 ids=[814, 20139, 3069, 2526, 3992, 3983, 8495, 494, 383, 64179, 1527, 63853, 13]
+prompt split=train index=1 ids=[8917, 5437, 537, 279, 6463, 1881, 4487, 65427, 321, 9637, 65427, 13]
+prompt split=train index=2 ids=[7734, 264, 61446, 50802, 364, 26805, 264, 52965, 4706, 2923, 13]
+prompt split=train index=3 ids=[3710, 3520, 264, 27502, 1067, 54067, 30]
+prompt split=train index=4 ids=[72240, 1204, 264, 19088, 10756, 628, 8214, 264, 17671, 71698, 5286, 1558, 13]
+prompt split=train index=5 ids=[33963, 264, 2716, 3010, 314, 264, 9640, 421, 6813, 33633, 31626, 13]
+prompt split=train index=6 ids=[826, 2250, 11590, 421, 264, 4706, 1542, 369, 35140, 3072, 13]
+prompt split=train index=7 ids=[814, 20139, 3817, 11258, 35887, 303, 799, 13901, 13]
+prompt split=train index=8 ids=[4199, 1220, 449, 22839, 9973, 3315, 310, 2426, 466, 5332, 449, 24460, 30]
+prompt split=train index=9 ids=[7734, 264, 16338, 5020, 883, 21966, 4779, 22627, 16070, 13]
+prompt split=train index=10 ids=[9930, 369, 4581, 33686, 26370, 6807, 2166, 47590, 430, 449, 5428, 17723, 30]
+prompt split=train index=11 ids=[26487, 54102, 45543, 440, 47241, 6299, 11336, 364, 1527, 63853, 13]
+prompt split=train index=12 ids=[3710, 369, 279, 3364, 314, 5467, 9502, 49219, 303, 449, 12753, 35, 9064, 30]
+prompt split=train index=13 ids=[814, 20139, 3069, 17515, 11241, 4766, 303, 4906, 944, 13]
+prompt split=train index=14 ids=[33963, 264, 799, 1284, 17834, 7044, 314, 15135, 19441, 45597, 4706, 13]
+prompt split=train index=15 ids=[3710, 1220, 264, 1156, 1716, 1518, 4162, 264, 1167, 16451, 44424, 27502, 30]
+prompt split=heldout index=0 ids=[72240, 264, 5902, 1581, 6618, 4238, 364, 264, 3043, 15464, 2680, 5286, 13]
+prompt split=heldout index=1 ids=[9930, 628, 264, 4557, 15196, 7042, 1345, 4581, 26370, 25710, 9766, 30]
+prompt split=heldout index=2 ids=[7734, 264, 2716, 9663, 883, 5132, 49219, 1973, 449, 6326, 6696, 13]
+prompt split=heldout index=3 ids=[814, 20139, 3069, 264, 1865, 1414, 9640, 716, 369, 2577, 1056, 1375, 2195, 17952, 3817, 27437]
+model_summary student_hidden=1024 student_layers=24 student_vocab=248320 student_model_elements=769809216 student_trainable_elements=638976 student_load_seconds=9.998135 infer_load_seconds=120.854407
+eval_summary step=0 train_kl=1.499280006101e-5 heldout_kl=1.821073738029e-5 eval_seconds=31.627820
