@@ -1,4 +1,11 @@
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use std::sync::Arc;
+
 use autograd::{Tape, TensorId, TensorStore, optim::AdamW};
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use autograd::{backend::Backend, backend_cuda::CudaBackend};
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use train::lora::LoraTargetSet;
 use train::{
     lora::LoraConfig,
     opd::{OpdError, OpdStepConfig, opd_step},
@@ -336,6 +343,72 @@ fn opd_step_with_lora_adapter_params_retains_frozen_student_base() {
             );
         }
     }
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn lora_opd_step_cuda_matches_cpu_loss() {
+    fn run_once(cuda: bool) -> f32 {
+        let mut tape = Tape::new();
+        let cfg = tiny_qwen35_config();
+        let (mut store, mut optimizer) = if cuda {
+            let backend: Arc<dyn Backend + Send + Sync> =
+                Arc::new(CudaBackend::new(0).expect("create CUDA backend"));
+            (
+                TensorStore::with_backend(backend.clone()),
+                AdamW::new_with_device(1.0e-4, (0.9, 0.999), 1.0e-8, 0.0, backend),
+            )
+        } else {
+            (
+                TensorStore::default(),
+                AdamW::new(1.0e-4, (0.9, 0.999), 1.0e-8, 0.0),
+            )
+        };
+
+        let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+        let student = Qwen35Model::new_lora_from_base(
+            &teacher,
+            LoraConfig {
+                rank: 2,
+                alpha: 4.0,
+            },
+            LoraTargetSet::AttentionQv,
+            &mut store,
+        )
+        .expect("build shared-base LoRA student");
+        let adapter_params = student
+            .adapter_name_map()
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        perturb_student_params(&mut store, &adapter_params);
+
+        opd_step(
+            &student,
+            &teacher,
+            &[1, 3, 8],
+            OpdStepConfig {
+                rollout_len: 2,
+                grad_clip: 1.0,
+            },
+            &adapter_params,
+            &mut optimizer,
+            &mut store,
+            &mut tape,
+        )
+        .expect("LoRA OPD step should run")
+        .loss
+    }
+
+    let cpu = run_once(false);
+    let cuda = run_once(true);
+    let denom = cpu.abs().max(cuda.abs()).max(1.0e-12);
+    let relerr = (cpu - cuda).abs() / denom;
+    eprintln!("lora_opd_step_cuda_matches_cpu_loss cpu={cpu:e} cuda={cuda:e} relerr={relerr:e}");
+    assert!(
+        relerr <= 1.0e-4,
+        "LoRA OPD CPU/CUDA loss relerr {relerr:e} exceeds 1e-4 (cpu={cpu:e}, cuda={cuda:e})"
+    );
 }
 
 #[test]
