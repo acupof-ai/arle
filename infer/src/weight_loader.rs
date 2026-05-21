@@ -9,14 +9,14 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::{info, warn};
 use memmap2::Mmap;
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::{SafeTensors, tensor::Dtype};
 use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
 use crate::gguf::{
-    self, find_tensor_name, load_matrix_v_reorder_rows_bf16_host, load_vector_bf16_host,
-    load_vector_offset_norm_bf16_host, GgufFile,
+    self, GgufFile, find_tensor_name, load_matrix_v_reorder_rows_bf16_host, load_vector_bf16_host,
+    load_vector_offset_norm_bf16_host,
 };
 use crate::quant::QuantMeta;
 use crate::tp::{TpLoadContext, TpShardAxis};
@@ -247,17 +247,7 @@ pub(crate) fn load_tensor_1d_f32_sharded(
         tp.sharding.total,
         shape[0]
     );
-    let bytes = tensor.data();
-    anyhow::ensure!(
-        bytes.len() == shape[0] * std::mem::size_of::<f32>(),
-        "{name}: f32 byte length mismatch: expected {}, got {}",
-        shape[0] * std::mem::size_of::<f32>(),
-        bytes.len()
-    );
-    let all: Vec<f32> = bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
+    let all = tensor_1d_to_f32(name, tensor)?;
     ctx.stream
         .clone_htod(&all[tp.sharding.range()])
         .map_err(|e| anyhow::anyhow!("H2D copy failed: {e}"))
@@ -1499,8 +1489,8 @@ pub(crate) fn precompute_rope(
 fn qwen35_to_qwen3_rope_scaling(
     src: &qwen35_spec::RopeScalingConfig,
 ) -> qwen3_spec::RopeScalingConfig {
-    use qwen35_spec::RopeScalingConfig as Src;
     use qwen3_spec::RopeScalingConfig as Dst;
+    use qwen35_spec::RopeScalingConfig as Src;
     match src {
         Src::Yarn {
             factor,
@@ -1587,21 +1577,60 @@ pub(crate) fn load_tensor_1d_f32(
     name: &str,
 ) -> Result<CudaSlice<f32>> {
     let tensor = find_tensor(shards, weight_map, name)?;
-    let data = tensor.data();
-    if data.len() % 4 != 0 {
-        return Err(anyhow::anyhow!(
-            "F32 tensor '{}': data length {} not multiple of 4",
-            name,
-            data.len()
-        ));
-    }
-    let len = data.len() / 4;
-    let slice = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<f32>(), len) };
+    let values = tensor_1d_to_f32(name, tensor)?;
     let gpu_data = ctx
         .stream
-        .clone_htod(slice)
+        .clone_htod(&values)
         .map_err(|e| anyhow::anyhow!("H2D copy failed for '{}': {}", name, e))?;
     Ok(gpu_data)
+}
+
+fn tensor_1d_to_f32(name: &str, tensor: safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 1,
+        "{name}: expected 1D tensor for f32 load, got shape {:?}",
+        shape
+    );
+    let len = shape[0];
+    let data = tensor.data();
+    let values = match tensor.dtype() {
+        Dtype::F32 => {
+            anyhow::ensure!(
+                data.len() == len * std::mem::size_of::<f32>(),
+                "{name}: f32 byte length mismatch: expected {}, got {}",
+                len * std::mem::size_of::<f32>(),
+                data.len()
+            );
+            data.chunks_exact(std::mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect()
+        }
+        Dtype::BF16 => {
+            anyhow::ensure!(
+                data.len() == len * std::mem::size_of::<bf16>(),
+                "{name}: bf16 byte length mismatch: expected {}, got {}",
+                len * std::mem::size_of::<bf16>(),
+                data.len()
+            );
+            data.chunks_exact(std::mem::size_of::<bf16>())
+                .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                .collect()
+        }
+        Dtype::F16 => {
+            anyhow::ensure!(
+                data.len() == len * std::mem::size_of::<half::f16>(),
+                "{name}: f16 byte length mismatch: expected {}, got {}",
+                len * std::mem::size_of::<half::f16>(),
+                data.len()
+            );
+            data.chunks_exact(std::mem::size_of::<half::f16>())
+                .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                .collect()
+        }
+        dtype => anyhow::bail!("{name}: unsupported 1D f32-load dtype {dtype:?}"),
+    };
+    Ok(values)
 }
 
 /// Load shard info with fixup for mismatched shard filenames in index.json.
@@ -2202,10 +2231,11 @@ mod tests {
                 version: crate::quant::AwqVersion::Gemm,
             }));
         assert!(awq.enabled());
-        assert!(awq
-            .unsupported_reason
-            .expect("zero-point AWQ must be rejected")
-            .contains("AWQ"));
+        assert!(
+            awq.unsupported_reason
+                .expect("zero-point AWQ must be rejected")
+                .contains("AWQ")
+        );
 
         let gptq =
             QuantLoadConfig::from_meta(&crate::quant::QuantMeta::Gptq(crate::quant::GptqConfig {
@@ -2216,10 +2246,11 @@ mod tests {
                 checkpoint_format: None,
             }));
         assert!(gptq.enabled());
-        assert!(gptq
-            .unsupported_reason
-            .expect("asymmetric GPTQ must be rejected")
-            .contains("GPTQ"));
+        assert!(
+            gptq.unsupported_reason
+                .expect("asymmetric GPTQ must be rejected")
+                .contains("GPTQ")
+        );
     }
 
     #[test]
@@ -2459,7 +2490,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
     fn fp8_weight_scale_inv_loads_single_file_without_weight_map() -> Result<()> {
-        use safetensors::tensor::{serialize, TensorView};
+        use safetensors::tensor::{TensorView, serialize};
 
         let ctx = DeviceContext::new()?;
         let weights = [0x38, 0xb8, 0x40, 0xc0]; // 1, -1, 2, -2 in E4M3FN
