@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen3.5 TQ4 dense tensor and dense module parity diagnostics."""
+"""Qwen3.5 quantized-checkpoint dense tensor and dense module parity diagnostics."""
 
 from __future__ import annotations
 
@@ -16,7 +16,18 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, logging
 
 
-TQ_SUFFIXES = (".tq_packed", ".tq_scales", ".tq_signs")
+QUANT_SUFFIXES = (
+    ".tq_packed",
+    ".tq_scales",
+    ".tq_signs",
+    ".qweight",
+    ".qzeros",
+    ".scales",
+    ".g_idx",
+    ".marlin_qweight",
+    ".marlin_scales",
+    ".marlin_w4a8_qweight",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,15 +69,20 @@ def tensor_bits(tensor: torch.Tensor) -> torch.Tensor:
 def dense_tensor_compare(source_model: Path, tq_model: Path) -> tuple[list[dict[str, Any]], bool]:
     source_index = safetensor_index(source_model)
     tq_index = safetensor_index(tq_model)
-    dense_keys = sorted(key for key in tq_index if not key.endswith(TQ_SUFFIXES))
+    dense_keys = sorted(key for key in tq_index if not key.endswith(QUANT_SUFFIXES))
     rows: list[dict[str, Any]] = []
     all_pass = True
     for key in dense_keys:
-        source_path = source_index.get(key)
+        source_key = key
+        source_path = source_index.get(source_key)
+        if source_path is None and key == "model.language_model.lm_head.weight":
+            source_key = "lm_head.weight"
+            source_path = source_index.get(source_key)
         if source_path is None:
             rows.append(
                 {
                     "tensor": key,
+                    "source_tensor": source_key,
                     "source_file": None,
                     "tq_file": str(tq_index[key]),
                     "shape": None,
@@ -78,7 +94,7 @@ def dense_tensor_compare(source_model: Path, tq_model: Path) -> tuple[list[dict[
             all_pass = False
             continue
         with safe_open(source_path, framework="pt", device="cpu") as source_handle:
-            source = source_handle.get_tensor(key)
+            source = source_handle.get_tensor(source_key)
         with safe_open(tq_index[key], framework="pt", device="cpu") as tq_handle:
             tq = tq_handle.get_tensor(key)
         same_shape = tuple(source.shape) == tuple(tq.shape)
@@ -86,6 +102,7 @@ def dense_tensor_compare(source_model: Path, tq_model: Path) -> tuple[list[dict[
         bit_identical = same_shape and same_dtype and torch.equal(tensor_bits(source), tensor_bits(tq))
         row: dict[str, Any] = {
             "tensor": key,
+            "source_tensor": source_key,
             "source_file": str(source_path),
             "tq_file": str(tq_index[key]),
             "shape": list(tq.shape),
