@@ -70,6 +70,33 @@ extern "C" __global__ void embedding_f32_ids_f32(
     }
 }
 
+extern "C" __global__ void embedding_bf16_ids_f32(
+    float* __restrict__ out,
+    const unsigned short* __restrict__ weight,
+    const float* __restrict__ ids,
+    int n_ids,
+    int vocab,
+    int dim
+) {
+    int row = blockIdx.x;
+    if (row >= n_ids) return;
+    int tid = threadIdx.x;
+    int block = blockDim.x;
+    int id = static_cast<int>(ids[row]);
+    float* row_out = out + (long long)row * dim;
+    if (id < 0 || id >= vocab) {
+        for (int i = tid; i < dim; i += block) {
+            row_out[i] = 0.0f;
+        }
+        return;
+    }
+    const unsigned short* row_w = weight + (long long)id * dim;
+    for (int i = tid; i < dim; i += block) {
+        unsigned int bits = static_cast<unsigned int>(row_w[i]) << 16;
+        row_out[i] = __uint_as_float(bits);
+    }
+}
+
 extern "C" __global__ void write_scalar_at_f32(
     float* __restrict__ out,
     const float* __restrict__ dest,

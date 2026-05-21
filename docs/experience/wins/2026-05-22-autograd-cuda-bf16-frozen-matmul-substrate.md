@@ -3,8 +3,10 @@
 ## Goal
 
 Unblock the 9B GPTQModel teacher + 0.8B LoRA student memory path by adding the
-first train-side primitive needed for a frozen BF16 student base: device-resident
-BF16 storage plus `matmul_bt` with a frozen BF16 RHS.
+first train-side primitives needed for a frozen BF16 student base:
+device-resident BF16 storage, `matmul_bt` with a frozen BF16 RHS, and BF16
+embedding lookup for both host token ids and rollout decode's device token-id
+buffer.
 
 ## Hypothesis
 
@@ -16,7 +18,10 @@ the loader keep frozen base weights in 2-byte storage in a later tranche.
 
 - Scope: substrate only, not yet wired into Qwen3.5 loader/model.
 - New handle: `DeviceHandle::CudaBf16`.
-- New op path: `matmul_bt(f32 lhs, BF16 rhs) -> f32 output`.
+- New op paths:
+  - `matmul_bt(f32 lhs, BF16 rhs) -> f32 output`
+  - `embedding(BF16 table, i32 ids) -> f32 output`
+  - `embedding_from_f32_ids(BF16 table, f32 ids) -> f32 output`
 - CUDA env:
   - `NVCC_CCBIN=/usr/bin/g++-14`
   - `INFER_TILELANG_PYTHON=$PWD/.venv/bin/python`
@@ -30,10 +35,12 @@ Correctness gates:
 
 ```text
 cargo test -p autograd --test test_cuda_bf16_frozen_ops --release --features cuda
-running 2 tests
+running 4 tests
 test cuda_bf16_upload_readback_roundtrips_as_f32 ... ok
+test cuda_embedding_accepts_frozen_bf16_table ... ok
+test cuda_embedding_from_f32_ids_accepts_frozen_bf16_table ... ok
 test cuda_matmul_bt_accepts_frozen_bf16_rhs ... ok
-test result: ok. 2 passed
+test result: ok. 4 passed
 ```
 
 Type gate:
@@ -54,5 +61,6 @@ resident, but it is a precision tradeoff that must be checked at model level.
 ## Learnings
 
 This is a licensed substrate step, not a performance claim. The next tranche
-still needs BF16 frozen embedding / lm_head support and Qwen3.5 LoRA loader
-wiring before re-running the 9B GPTQModel -> 0.8B LoRA OPD memory gate.
+still needs Qwen3.5 LoRA loader/model wiring so large frozen base tensors choose
+these BF16 handles before re-running the 9B GPTQModel -> 0.8B LoRA OPD memory
+gate.

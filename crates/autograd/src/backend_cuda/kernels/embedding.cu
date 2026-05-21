@@ -34,3 +34,30 @@ extern "C" __global__ void embedding_f32(
         row_out[i] = row_w[i];
     }
 }
+
+extern "C" __global__ void embedding_bf16_to_f32(
+    float* __restrict__ out,
+    const unsigned short* __restrict__ weight,
+    const int* __restrict__ ids,
+    int n_ids,
+    int vocab,
+    int dim
+) {
+    int row = blockIdx.x;
+    if (row >= n_ids) return;
+    int tid = threadIdx.x;
+    int block = blockDim.x;
+    int id = ids[row];
+    float* row_out = out + row * dim;
+    if (id < 0 || id >= vocab) {
+        for (int i = tid; i < dim; i += block) {
+            row_out[i] = 0.0f;
+        }
+        return;
+    }
+    const unsigned short* row_w = weight + id * dim;
+    for (int i = tid; i < dim; i += block) {
+        unsigned int bits = static_cast<unsigned int>(row_w[i]) << 16;
+        row_out[i] = __uint_as_float(bits);
+    }
+}
