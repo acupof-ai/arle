@@ -212,9 +212,10 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
 
 1. Keep the GPTQModel W4 physical-layout branch behind
    `INFER_EXPERIMENTAL_GPTQMODEL_W4=1` until quality is licensed.
-2. Add a layer-local projection parity harness:
-   ARLE W4A16 GEMV vs PyTorch/GPTQModel reference on the same hidden vector.
-3. If projection parity passes, scan dense fallback modules under the same
+2. Done: layer-local projection parity harness landed as
+   `infer/examples/gptqmodel_w4_gemv_parity.rs`. Sampled W4 projections pass
+   ARLE CUDA W4A16 GEMV vs faithful GPTQ reference at <=0.25% RMSE/reference-RMS.
+3. Next: projection parity passed, so scan dense fallback modules under the same
    checkpoint: embedding, linear-attention dense tensors, final norm, and
    untied lm_head.
 4. Re-run multi-token generation before any OPD bench or headline switch.
@@ -223,7 +224,9 @@ Evidence:
 
 ```text
 docs/experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-generation-kill.md
+docs/research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md
 bench-output/2026-05-22-qwen35-9b-gptq-int4-loader/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-layerlocal/
 ```
 
 ## Implementation Order
@@ -242,5 +245,7 @@ bench-output/2026-05-22-qwen35-9b-gptq-int4-loader/
   [`../experience/errors/2026-05-21-arle-qwen35-9b-gptq-int4-loader-kill.md`](../experience/errors/2026-05-21-arle-qwen35-9b-gptq-int4-loader-kill.md)
 - FP8 compressed-tensors kill:
   [`../experience/errors/2026-05-21-arle-qwen35-9b-fp8-compressed-tensors-layout-kill.md`](../experience/errors/2026-05-21-arle-qwen35-9b-fp8-compressed-tensors-layout-kill.md)
+- GPTQModel W4 layer-local parity:
+  [`../research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md`](../research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md)
 - Infer-teacher adapter:
   [`../../crates/train/src/teacher_infer.rs`](../../crates/train/src/teacher_infer.rs)

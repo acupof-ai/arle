@@ -1,0 +1,200 @@
+{
+  "cpu_gptq_reference_vs_source": {
+    "comparison": {
+      "elements": 4096,
+      "lhs": "cpu_faithful_gptq_reference",
+      "max_abs": 0.5070937275886536,
+      "max_abs_index": 2077,
+      "max_rel": 404.1781005859375,
+      "max_rel_index": 3811,
+      "mean_abs": 0.08351089204461459,
+      "mean_rel": 0.8480783484004757,
+      "rhs": "bf16_source_dense_reference",
+      "rhs_rms": 0.7069683588321014,
+      "rmse": 0.10521440918328641,
+      "rmse_over_rhs_rms": 0.14882477817974576
+    },
+    "first8": [
+      {
+        "abs_err": 0.027849197387695312,
+        "bf16_source_dense_reference": 0.8042498826980591,
+        "cpu_faithful_gptq_reference": 0.8320990800857544,
+        "index": 0,
+        "rel_err": 0.03462754189968109
+      },
+      {
+        "abs_err": 0.03878319263458252,
+        "bf16_source_dense_reference": 1.1793715953826904,
+        "cpu_faithful_gptq_reference": 1.218154788017273,
+        "index": 1,
+        "rel_err": 0.0328846238553524
+      },
+      {
+        "abs_err": 0.1194915771484375,
+        "bf16_source_dense_reference": -0.7724106907844543,
+        "cpu_faithful_gptq_reference": -0.8919022679328918,
+        "index": 2,
+        "rel_err": 0.15469953417778015
+      },
+      {
+        "abs_err": 0.33669155836105347,
+        "bf16_source_dense_reference": 0.20135098695755005,
+        "cpu_faithful_gptq_reference": 0.5380425453186035,
+        "index": 3,
+        "rel_err": 1.672162413597107
+      },
+      {
+        "abs_err": 0.15464362502098083,
+        "bf16_source_dense_reference": -0.44939956068992615,
+        "cpu_faithful_gptq_reference": -0.2947559356689453,
+        "index": 4,
+        "rel_err": 0.3441116511821747
+      },
+      {
+        "abs_err": 0.18168014287948608,
+        "bf16_source_dense_reference": -0.18349137902259827,
+        "cpu_faithful_gptq_reference": -0.0018112435936927795,
+        "index": 5,
+        "rel_err": 0.9901290535926819
+      },
+      {
+        "abs_err": 0.002766534686088562,
+        "bf16_source_dense_reference": 0.14917749166488647,
+        "cpu_faithful_gptq_reference": 0.15194402635097504,
+        "index": 6,
+        "rel_err": 0.018545255064964294
+      },
+      {
+        "abs_err": 0.05316030979156494,
+        "bf16_source_dense_reference": -0.38634854555130005,
+        "cpu_faithful_gptq_reference": -0.439508855342865,
+        "index": 7,
+        "rel_err": 0.13759677112102509
+      }
+    ],
+    "source_key": "model.language_model.layers.0.mlp.down_proj.weight",
+    "source_model_path": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B"
+  },
+  "cuda_w4a16_vs_cpu_gptq_reference": {
+    "elements": 4096,
+    "lhs": "cuda_w4a16_gemv",
+    "max_abs": 0.019165515899658203,
+    "max_abs_index": 3994,
+    "max_rel": 15.489533424377441,
+    "max_rel_index": 2821,
+    "mean_abs": 0.0013516538544990908,
+    "mean_rel": 0.012994288281771071,
+    "rhs": "cpu_faithful_gptq_reference",
+    "rhs_rms": 0.7140750248474573,
+    "rmse": 0.0017727459776562063,
+    "rmse_over_rhs_rms": 0.002482576642468213
+  },
+  "first8_cuda_w4a16_vs_cpu_gptq_reference": [
+    {
+      "abs_err": 0.00006783008575439453,
+      "cpu_faithful_gptq_reference": 0.8320990800857544,
+      "cuda_w4a16_gemv": 0.83203125,
+      "index": 0,
+      "rel_err": 0.00008151683869073167
+    },
+    {
+      "abs_err": 0.0005952119827270508,
+      "cpu_faithful_gptq_reference": 1.218154788017273,
+      "cuda_w4a16_gemv": 1.21875,
+      "index": 1,
+      "rel_err": 0.0004886176902800798
+    },
+    {
+      "abs_err": 0.0012772679328918457,
+      "cpu_faithful_gptq_reference": -0.8919022679328918,
+      "cuda_w4a16_gemv": -0.890625,
+      "index": 2,
+      "rel_err": 0.0014320716727524996
+    },
+    {
+      "abs_err": 0.0010199546813964844,
+      "cpu_faithful_gptq_reference": 0.5380425453186035,
+      "cuda_w4a16_gemv": 0.5390625,
+      "index": 3,
+      "rel_err": 0.0018956765998154879
+    },
+    {
+      "abs_err": 0.0017871856689453125,
+      "cpu_faithful_gptq_reference": -0.2947559356689453,
+      "cuda_w4a16_gemv": -0.29296875,
+      "index": 4,
+      "rel_err": 0.006063272710889578
+    },
+    {
+      "abs_err": 0.0013038888573646545,
+      "cpu_faithful_gptq_reference": -0.0018112435936927795,
+      "cuda_w4a16_gemv": -0.000507354736328125,
+      "index": 5,
+      "rel_err": 0.7198859453201294
+    },
+    {
+      "abs_err": 0.0003997236490249634,
+      "cpu_faithful_gptq_reference": 0.15194402635097504,
+      "cuda_w4a16_gemv": 0.15234375,
+      "index": 6,
+      "rel_err": 0.0026307296939194202
+    },
+    {
+      "abs_err": 0.000055730342864990234,
+      "cpu_faithful_gptq_reference": -0.439508855342865,
+      "cuda_w4a16_gemv": -0.439453125,
+      "index": 7,
+      "rel_err": 0.0001268014166271314
+    }
+  ],
+  "input": {
+    "first8": [
+      0.60546875,
+      0.466796875,
+      -0.35546875,
+      -0.48828125,
+      -0.984375,
+      0.216796875,
+      -0.12890625,
+      -0.52734375
+    ],
+    "shape": [
+      1,
+      12288
+    ]
+  },
+  "model_path": "/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit",
+  "projection": {
+    "bits": 4,
+    "cols": 12288,
+    "g_idx": {
+      "first_mismatches": [],
+      "matches_k_div_group_size": true,
+      "present": true,
+      "shape": [
+        12288
+      ]
+    },
+    "group_size": 128,
+    "qweight_shape": [
+      1536,
+      4096
+    ],
+    "qzeros": {
+      "all_nibbles_are_7": true,
+      "first_bad": [],
+      "present": true,
+      "shape": [
+        96,
+        512
+      ]
+    },
+    "rows": 4096,
+    "scales_shape": [
+      96,
+      4096
+    ]
+  },
+  "seed": 1592594996,
+  "tensor_base": "model.language_model.layers.0.mlp.down_proj"
+}
