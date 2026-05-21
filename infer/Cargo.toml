@@ -113,6 +113,8 @@ cc = "1.0"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+autograd = { path = "../crates/autograd", default-features = false, features = ["cuda", "safetensors"] }
+train = { path = "../crates/train", default-features = false }
 base64 = "0.22"
 tower = "0.5"
 tempfile = "3"

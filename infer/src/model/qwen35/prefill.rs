@@ -75,7 +75,7 @@ impl Qwen35Model {
 
     /// Process one layer during prefill. Returns updated hidden_batch.
     #[allow(clippy::too_many_arguments)]
-    fn prefill_layer(
+    pub(super) fn prefill_layer(
         &self,
         _layer_idx: usize,
         layer: &TransformerBlock35,
@@ -143,7 +143,7 @@ impl Qwen35Model {
         ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
     }
 
-    fn prefill_full_attention(
+    pub(super) fn prefill_full_attention(
         &self,
         attn: &FullAttentionLayer,
         normed_batch: &HiddenStates,
@@ -194,7 +194,7 @@ impl Qwen35Model {
         ops::gemm(&self.ctx, &attn.o_proj, &attn_out_batch)
     }
 
-    fn prefill_linear_attention(
+    pub(super) fn prefill_linear_attention(
         &self,
         attn: &LinearAttentionLayer,
         normed_batch: &HiddenStates,
@@ -1293,7 +1293,7 @@ impl Qwen35Model {
         )
     }
 
-    fn batched_rms_norm_offset(
+    pub(super) fn batched_rms_norm_offset(
         &self,
         x: &HiddenStates,
         weight: &DeviceVec,
