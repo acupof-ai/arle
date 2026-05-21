@@ -95,6 +95,7 @@ peak teacher) and accept tighter memory. Worst case: revert to
 | **4** | Mirror in TRL `GKDTrainer` (`.venv` Python). Same teacher, same student, same prompts, same 1000 steps, constant LR. Save trained student. | codex | ~30-60 min compute | TRL run completes. Report step time + peak mem. |
 | **5** | Install `lm-eval-harness` (`pip install lm-eval`). Run MMLU + IFEval on 4 models: teacher / base student / ARLE-distilled / TRL-distilled. | codex | 1-2 hr compute | All 4 models evaluated. Verdict-table populated. |
 | **6** | Generate 4-bar comparison PNG (ARLE OPD step / TRL OPD step / PyTorch pure inference / ARLE pure inference). Update README + ZH README. Write wins entry summarizing perf + eval. | Claude | ~1 hr | README + ZH README updated; PNG committed; wins entry committed. |
+| **7** | One-click `examples/opd/run-distillation.sh` (✅ shipped 2026-05-21). Default smoke mode runs `arle train opd --smoke` end-to-end in <30 s with no download; opt-in real mode auto-resolves `ARLE_TEACHER`/`ARLE_STUDENT` (HF or ModelScope) to local cache via the `.venv`. Follow-up: extend `arle train opd` CLI itself with `--prompts-file <jsonl>` and `--model-id <hf-id>` native-Rust resolver (deferred to `hf-hub` integration). | Claude (shell wrapper); codex (native CLI later) | ~1 hr wrapper / multi-day native | Smoke path verified end-to-end without internet; real mode verified after the Phase 1 model downloads complete; native `--prompts-file` lands when codex's Phase 2 adapter is in flight. |
 
 ## Acceptance — overall
 
