@@ -128,8 +128,8 @@ extern "C" __global__ void qwen_decode_prepare_q_f32(
     float inv_rms = rsqrtf((smem[0] / (float)head_dim) + eps);
 
     for (int i = tid; i < half_dim; i += blockDim.x) {
-        float x0 = q_full[q_full_base + i] * inv_rms * q_norm_weight[i];
-        float x1 = q_full[q_full_base + i + half_dim] * inv_rms * q_norm_weight[i + half_dim];
+        float x0 = q_full[q_full_base + i] * inv_rms * (1.0f + q_norm_weight[i]);
+        float x1 = q_full[q_full_base + i + half_dim] * inv_rms * (1.0f + q_norm_weight[i + half_dim]);
         float c = cos_table[i];
         float s = sin_table[i];
         q_out[out_base + i] = x0 * c - x1 * s;
@@ -182,8 +182,8 @@ extern "C" __global__ void qwen_decode_prepare_q_gated_f32(
     float inv_rms = rsqrtf((smem[0] / (float)head_dim) + eps);
 
     for (int i = tid; i < half_dim; i += blockDim.x) {
-        float x0 = q_full[q_full_base + i] * inv_rms * q_norm_weight[i];
-        float x1 = q_full[q_full_base + i + half_dim] * inv_rms * q_norm_weight[i + half_dim];
+        float x0 = q_full[q_full_base + i] * inv_rms * (1.0f + q_norm_weight[i]);
+        float x1 = q_full[q_full_base + i + half_dim] * inv_rms * (1.0f + q_norm_weight[i + half_dim]);
         float c = cos_table[i];
         float s = sin_table[i];
         q_out[out_base + i] = x0 * c - x1 * s;
@@ -236,8 +236,8 @@ extern "C" __global__ void qwen_decode_prepare_kv_f32(
     float inv_rms = rsqrtf((smem[0] / (float)head_dim) + eps);
 
     for (int i = tid; i < half_dim; i += blockDim.x) {
-        float x0 = k_full[full_base + i] * inv_rms * k_norm_weight[i];
-        float x1 = k_full[full_base + i + half_dim] * inv_rms * k_norm_weight[i + half_dim];
+        float x0 = k_full[full_base + i] * inv_rms * (1.0f + k_norm_weight[i]);
+        float x1 = k_full[full_base + i + half_dim] * inv_rms * (1.0f + k_norm_weight[i + half_dim]);
         float c = cos_table[i];
         float s = sin_table[i];
         k_out[out_base + i] = x0 * c - x1 * s;

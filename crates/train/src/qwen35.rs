@@ -12,6 +12,7 @@ use autograd::{
         sigmoid, silu, slice, transpose,
     },
 };
+use half::bf16;
 use qwen35_spec::Qwen35AttentionTensorNames;
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
 use thiserror::Error;
@@ -243,6 +244,47 @@ pub fn forward_rollout_cached_device_token_profiled(
     model.forward_rollout_cached_device_token_profiled(store, tape, token_id, position_id, cache)
 }
 
+fn qwen35_rmsnorm(
+    x: TensorId,
+    weight: TensorId,
+    eps: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let weight_shape = store
+        .get(weight)
+        .ok_or(AutogradError::InvalidTensorId(weight))?
+        .shape
+        .clone();
+    if weight_shape.len() != 1 {
+        return Err(AutogradError::InvalidRank {
+            expected: "rank-1 RMSNorm weight",
+            got: weight_shape.len(),
+        }
+        .into());
+    }
+    let ones = store.alloc(Tensor::new(
+        vec![1.0; weight_shape[0]],
+        weight_shape,
+        false,
+    )?);
+    let offset_weight = add(weight, ones, store, tape)?;
+    Ok(rmsnorm(x, offset_weight, eps, store, tape)?)
+}
+
+fn qwen35_parity_bf16_round(id: TensorId, store: &mut TensorStore) -> Result<TensorId> {
+    let (shape, requires_grad) = {
+        let tensor = store.get(id).ok_or(AutogradError::InvalidTensorId(id))?;
+        (tensor.shape.clone(), tensor.requires_grad)
+    };
+    let rounded: Vec<f32> = store
+        .to_host(id)?
+        .into_iter()
+        .map(|value| bf16::from_f32(value).to_f32())
+        .collect();
+    Ok(store.alloc(Tensor::new(rounded, shape, requires_grad)?))
+}
+
 impl Qwen35Layer {
     fn forward(
         &self,
@@ -268,7 +310,7 @@ impl Qwen35Layer {
         let batch = x_shape[0];
         let seq_len = x_shape[1];
 
-        let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let attn_out = match &self.self_attn {
             Qwen35Attention::Full(attn) => {
                 self.forward_full_attention(h, attn, cfg, cos, sin, batch, seq_len, store, tape)?
@@ -279,7 +321,7 @@ impl Qwen35Layer {
         };
         let x = add(x, attn_out, store, tape)?;
 
-        let h = rmsnorm(
+        let h = qwen35_rmsnorm(
             x,
             self.post_attention_layernorm,
             cfg.rms_norm_eps,
@@ -320,7 +362,7 @@ impl Qwen35Layer {
         let batch = x_shape[0];
         let seq_len = x_shape[1];
 
-        let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let attn_out = match &self.self_attn {
             Qwen35Attention::Full(attn) => self.forward_full_attention_with_kv_cache(
                 h,
@@ -343,7 +385,7 @@ impl Qwen35Layer {
         };
         let x = add(x, attn_out, store, tape)?;
 
-        let h = rmsnorm(
+        let h = qwen35_rmsnorm(
             x,
             self.post_attention_layernorm,
             cfg.rms_norm_eps,
@@ -386,7 +428,7 @@ impl Qwen35Layer {
         let mut profile = Qwen35LayerForwardProfile::default();
 
         let started = Instant::now();
-        let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         profile.input_rmsnorm += started.elapsed();
 
         let started = Instant::now();
@@ -423,7 +465,7 @@ impl Qwen35Layer {
         profile.attention_residual += started.elapsed();
 
         let started = Instant::now();
-        let h = rmsnorm(
+        let h = qwen35_rmsnorm(
             x,
             self.post_attention_layernorm,
             cfg.rms_norm_eps,
@@ -523,8 +565,8 @@ impl Qwen35Layer {
             tape,
         )?;
 
-        let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
-        let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+        let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+        let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
         let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
 
@@ -635,8 +677,8 @@ impl Qwen35Layer {
                 tape,
             )?;
 
-            let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
-            let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+            let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+            let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
             let q = rope(q, cos, sin, store, tape)?;
             let k = rope(k, cos, sin, store, tape)?;
             (q, gate, k, v)
@@ -794,8 +836,8 @@ impl Qwen35Layer {
             profile.kv_split += started.elapsed();
 
             let started = Instant::now();
-            let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
-            let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+            let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+            let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
             profile.qk_norm += started.elapsed();
 
             let started = Instant::now();
@@ -958,6 +1000,11 @@ impl Qwen35Model {
         token_id: u32,
         position_id: u32,
     ) -> Result<Qwen35TrainParityStages> {
+        if tape.enabled {
+            return Err(Qwen35Error::InvalidConfig(
+                "parity diagnostics require tape disabled",
+            ));
+        }
         if self.layers.is_empty() {
             return Err(Qwen35Error::InvalidConfig(
                 "parity diagnostics require at least one layer",
@@ -989,15 +1036,17 @@ impl Qwen35Model {
             store,
             tape,
         )?;
+        let hidden0 = qwen35_parity_bf16_round(hidden0, store)?;
 
         let layer0 = &self.layers[0];
-        let layer0_norm = rmsnorm(
+        let layer0_norm = qwen35_rmsnorm(
             hidden0,
             layer0.input_layernorm,
             self.config.rms_norm_eps,
             store,
             tape,
         )?;
+        let layer0_norm = qwen35_parity_bf16_round(layer0_norm, store)?;
         let layer0_attention = match &layer0.self_attn {
             Qwen35Attention::Full(attn) => layer0.forward_full_attention(
                 layer0_norm,
@@ -1020,32 +1069,40 @@ impl Qwen35Model {
                 tape,
             )?,
         };
+        let layer0_attention = qwen35_parity_bf16_round(layer0_attention, store)?;
         let hidden_plus_attn = add(hidden0, layer0_attention, store, tape)?;
-        let post_attention_norm = rmsnorm(
+        let hidden_plus_attn = qwen35_parity_bf16_round(hidden_plus_attn, store)?;
+        let post_attention_norm = qwen35_rmsnorm(
             hidden_plus_attn,
             layer0.post_attention_layernorm,
             self.config.rms_norm_eps,
             store,
             tape,
         )?;
+        let post_attention_norm = qwen35_parity_bf16_round(post_attention_norm, store)?;
         let gate = layer0
             .mlp
             .gate_proj
             .forward(post_attention_norm, store, tape)?;
+        let gate = qwen35_parity_bf16_round(gate, store)?;
         let up = layer0
             .mlp
             .up_proj
             .forward(post_attention_norm, store, tape)?;
+        let up = qwen35_parity_bf16_round(up, store)?;
         let gate = silu(gate, store, tape)?;
         let act = mul(gate, up, store, tape)?;
+        let act = qwen35_parity_bf16_round(act, store)?;
         let layer0_ffn = layer0.mlp.down_proj.forward(act, store, tape)?;
+        let layer0_ffn = qwen35_parity_bf16_round(layer0_ffn, store)?;
         let layer0_residual = add(hidden_plus_attn, layer0_ffn, store, tape)?;
+        let layer0_residual = qwen35_parity_bf16_round(layer0_residual, store)?;
 
         let mut hidden = layer0_residual;
         for layer in self.layers.iter().skip(1) {
             hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
         }
-        let final_rmsnorm = rmsnorm(
+        let final_rmsnorm = qwen35_rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
@@ -1749,7 +1806,7 @@ impl Qwen35Model {
             )?;
         }
         cache.seq_len += 1;
-        let hidden = rmsnorm(
+        let hidden = qwen35_rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
@@ -1827,7 +1884,7 @@ impl Qwen35Model {
         cache.seq_len += 1;
 
         let started = Instant::now();
-        let hidden = rmsnorm(
+        let hidden = qwen35_rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
@@ -1871,7 +1928,7 @@ impl Qwen35Model {
         for layer in &self.layers {
             hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
         }
-        let hidden = rmsnorm(
+        let hidden = qwen35_rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
@@ -1945,7 +2002,7 @@ impl Qwen35Model {
             )?;
         }
         cache.seq_len += seq_len;
-        let hidden = rmsnorm(
+        let hidden = qwen35_rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
@@ -2041,7 +2098,7 @@ impl Qwen35Model {
         cache.seq_len += seq_len;
 
         let started = Instant::now();
-        let hidden = rmsnorm(
+        let hidden = qwen35_rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
