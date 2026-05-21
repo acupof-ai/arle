@@ -932,6 +932,12 @@ impl Qwen35Model {
         &self.config
     }
 
+    pub fn supports_rollout_kv_cache(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|layer| matches!(layer.self_attn, Qwen35Attention::Full(_)))
+    }
+
     pub fn new_for_eval(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
         Self::new_internal(
             cfg,
