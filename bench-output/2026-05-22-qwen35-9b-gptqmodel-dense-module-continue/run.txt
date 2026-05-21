@@ -1,0 +1,6 @@
+dense_tensor_count=576 gate_pass=False
+dense tensor bit-compare failed; continuing to module scan by request
+Loading weights:   0%|          | 0/427 [00:00<?, ?it/s]Loading weights:   9%|▉         | 38/427 [00:00<00:01, 269.28it/s]Loading weights:  18%|█▊        | 76/427 [00:00<00:01, 280.92it/s]Loading weights:  61%|██████    | 259/427 [00:00<00:00, 874.41it/s]Loading weights: 100%|██████████| 427/427 [00:00<00:00, 1079.82it/s]
+module=embedding rmse/ref_rms=0.00000000e+00 max_abs=0.00000000e+00 gate_pass=True
+module=final_rmsnorm rmse/ref_rms=0.00000000e+00 max_abs=0.00000000e+00 gate_pass=True
+module=lm_head rmse/ref_rms=1.75861725e-05 max_abs=7.81250000e-03 gate_pass=True
