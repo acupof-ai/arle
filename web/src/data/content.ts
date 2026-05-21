@@ -225,6 +225,20 @@ const BENCH_ROWS_EN: BenchRow[] = [
   {
     date: "2026-05-21",
     stability: "beta",
+    stabilityLabel: "beta · headline",
+    caption: '<b>cuda</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3.5-9B-TQ4 → Qwen3.5-0.8B LoRA</code> · infer teacher + train student, rollout_len=4',
+    cells: [
+      { key: "step", value: "4.30", unit: "s" },
+      { key: "peak", value: "15.9", unit: "GiB" },
+      { key: "held-out KL", value: "-1.02", unit: "% @100" },
+      { key: "status", value: "no", unit: "OOM/NaN" },
+    ],
+    cmd: "cargo run -p train --example opd_step_cuda_infer_teacher_train --release --features cuda -- --teacher-model Qwen3___5-9B-TQ4 --rollout-len 4",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-05-21-arle-cuda-opd-9b-tq4-rollout4.md",
+  },
+  {
+    date: "2026-05-21",
+    stability: "beta",
     stabilityLabel: "beta · cycle-wrap",
     caption: '<b>cuda</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3-0.6B real-checkpoint OPD step</code> · 32-commit session, kill-or-license-gated',
     cells: [
@@ -281,6 +295,20 @@ const BENCH_ROWS_EN: BenchRow[] = [
 ];
 
 const BENCH_ROWS_ZH: BenchRow[] = [
+  {
+    date: "2026-05-21",
+    stability: "beta",
+    stabilityLabel: "beta · headline",
+    caption: '<b>cuda</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3.5-9B-TQ4 → Qwen3.5-0.8B LoRA</code> · infer teacher + train student, rollout_len=4',
+    cells: [
+      { key: "step", value: "4.30", unit: "s" },
+      { key: "峰值", value: "15.9", unit: "GiB" },
+      { key: "held-out KL", value: "-1.02", unit: "% @100" },
+      { key: "状态", value: "无", unit: "OOM/NaN" },
+    ],
+    cmd: "cargo run -p train --example opd_step_cuda_infer_teacher_train --release --features cuda -- --teacher-model Qwen3___5-9B-TQ4 --rollout-len 4",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-05-21-arle-cuda-opd-9b-tq4-rollout4.md",
+  },
   {
     date: "2026-05-21",
     stability: "beta",
