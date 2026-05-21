@@ -1,0 +1,20 @@
+{
+  "bf16_model": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B",
+  "arle_logits": "bench-output/2026-05-21-qwen35-9b-tq4-fwht-fix-logits/arle-tq4-logits.json",
+  "input_ids": [
+    9419
+  ],
+  "vocab_size": 248320,
+  "torch_load_seconds": 50.719644418975804,
+  "torch_forward_seconds": 2.7275928260060027,
+  "top64_max_abs": 14.953125,
+  "top64_mean_abs": 9.844091415405273,
+  "top64_max_rel": 1.1724683046340942,
+  "top64_mean_rel": 0.9190282821655273,
+  "top64_ref_mean_abs": 10.701171875,
+  "full_vocab_max_abs": 14.953125,
+  "full_vocab_mean_abs": 3.5293121337890625,
+  "full_vocab_rmse": 4.141731776461906,
+  "gate_top64_max_rel_threshold": 0.05,
+  "gate_pass": false
+}
