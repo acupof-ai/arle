@@ -84,7 +84,7 @@ More copy-paste: [`examples/`](examples/).
 | **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, CUDA Graph decode. L4 / Qwen3.5-4B BF16 + FP8 KV: **197 tok/s @ c=16 / 4k-in**. |
 | **Metal** | Apple Silicon | **Beta** | Scheduler-backed serving, chunked prefill, replay prefix reuse. Qwen3.6 35B-A3B 4-bit MLX: **85.6 tok/s decode / 385 ms TTFT** on M4 Pro 48GB. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3.5. Qwen3.5-4B-4bit bit-identical, c=1..8. |
-| **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | **Qwen3.5-9B-TQ4 → 0.8B LoRA now runs on a 16 GB card**: 100-step real-text run, **4.30 s/step**, **15.9 GiB peak**, monotonic held-out KL. Matched Qwen3-0.6B setup remains **2.04× faster than HuggingFace TRL `GKDTrainer`**. See [Latest Updates](#latest-updates). |
+| **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | **2.04× faster than HuggingFace TRL `GKDTrainer`** at matched Qwen3-0.6B setup. **LoRA-only: 0.140 s/step at 3.9 GB peak** — fits 4 GB consumer cards. Cross-runtime large-teacher path validated end-to-end (Qwen3.5-4B → 0.8B LoRA). See [Latest Updates](#latest-updates). |
 | **CPU** | Portable | **Dev-only** | Smoke tests; not a perf target. |
 
 Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B) on CUDA + Metal. Next-model queue: **DeepSeek V4 (#1)** → **Qwen 3.6 (#2)** — see [ROADMAP.md](ROADMAP.md#next-model-priority-order).
@@ -125,23 +125,22 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 <!-- Last 1-2 entries. Older history → CHANGELOG.md. -->
 
-**2026-05-21 — ARLE OPD CUDA: 9B teacher on a 16 GB consumer GPU.**
-Qwen3.5-9B TurboQuant teacher in `infer` → Qwen3.5-0.8B-Base LoRA r=16 student in `train`, real text prompts, `rollout_len=4`, `lr=1e-5`, RTX 4070 Ti SUPER.
+**2026-05-21 — ARLE OPD CUDA: faster + smaller vs HuggingFace TRL.**
+Same Qwen3-0.6B teacher/student, 32 prompts, `rollout_len=8`, `lr=1e-7`, 500 steps, AdamW, RTX 4070 Ti SUPER.
 
-![ARLE OPD CUDA — licensed OPD distillation runs](docs/projects/img/2026-05-21-arle-vs-pytorch-opd-comparison.png)
+![ARLE OPD CUDA vs HuggingFace TRL — speed, memory, held-out KL](docs/projects/img/2026-05-21-arle-vs-pytorch-opd-comparison.png)
 
-| Run | Step time | Peak GPU memory | Held-out KL |
+| | TRL `GKDTrainer` | **ARLE full-finetune** | **ARLE LoRA r=16** |
 |---|---:|---:|---:|
-| **Qwen3.5-9B-TQ4 → 0.8B LoRA r=16** | **4.30 s** | **15.9 GiB** | **-1.02 % @ 100 steps** |
-| Qwen3.5-4B BF16 → 0.8B LoRA r=16 | 5.66 s | 14.8 GiB | -2.05 % @ 200 steps |
-| Qwen3-0.6B LoRA r=16 | 0.140 s | 3.93 GiB | -36.4 % @ 500 steps |
-| TRL `GKDTrainer` matched Qwen3-0.6B | 0.408 s | 12.6 GiB | -5.5 % @ 500 steps |
+| step time (s) | 0.408 | **0.164** (2.49×) | **0.140** (2.91×) |
+| peak GPU memory (GB) | 12.6 | 15.4 | **3.93** (fits 4 GB cards) |
+| held-out KL (500 steps) | -5.5 % | **-18.5 %** | **-36.4 %** |
 
-**Cross-runtime large-teacher path validated.** The OPD teacher is now the production `infer` runtime. The 9B-TQ4 run keeps the validated dense BF16 lm head, fits on the 16 GB card by using `rollout_len=4`, and decreases held-out KL monotonically at steps `0/25/50/100`. Qwen3.5-4B BF16 remains the smaller scaling reference.
+**Cross-runtime large-teacher path validated.** Qwen3.5-4B BF16 teacher in `infer` → Qwen3.5-0.8B-Base LoRA r=16 student in `train` via the `InferTeacher` device-logits bridge. 200-step real-text run: **5.66 s/step**, **14.8 GiB peak**, monotonic KL decrease (held-out -2.05%). Cross-runtime overhead measured at **1.5% of step time** — production-fast teacher integration.
 
 End-to-end convergence verified: held-out exact-overlap **50% → 82.8%** in 5000 steps (lr=1e-7).
 
-Evidence: [9B-TQ4 headline bench](docs/experience/wins/2026-05-21-arle-cuda-opd-9b-tq4-rollout4.md) · [usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) · [4B→0.8B cross-runtime bench](docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md) · [TRL head-to-head](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md).
+Evidence: [`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md) · [usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) · [TRL head-to-head](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md) · [4B→0.8B cross-runtime bench](docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md).
 

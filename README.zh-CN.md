@@ -84,7 +84,7 @@ arle --doctor --json              # CI 友好自检
 | **CUDA** | Linux + NVIDIA | **Stable** | 持续批处理、paged KV、radix 复用、TileLang BF16 attention、CUDA Graph decode。L4 / Qwen3.5-4B BF16 + FP8 KV:**c=16 / 4k-in 197 tok/s**。 |
 | **Metal** | Apple Silicon | **Beta** | 调度器驱动服务、chunked prefill、replay prefix 复用。Qwen3.6 35B-A3B 4-bit MLX:**M4 Pro 48GB 85.6 tok/s 解码 / TTFT 385 ms**。 |
 | **Metal DFlash** | Apple Silicon | **Beta — 默认开启** | Qwen3.5 推测解码。Qwen3.5-4B-4bit 比特一致,c=1..8。 |
-| **OPD 训练(CUDA)** | Linux + NVIDIA | **Beta** | **Qwen3.5-9B-TQ4 → 0.8B LoRA 已能在 16 GB 显卡上跑通**:100 步真实文本 run、**4.30 s/step**、**15.9 GiB 峰值**、held-out KL 单调下降。Qwen3-0.6B 同配置仍 **比 HuggingFace TRL `GKDTrainer` 快 2.04×**。详见 [最新动态](#最新动态)。 |
+| **OPD 训练(CUDA)** | Linux + NVIDIA | **Beta** | **对比 HuggingFace TRL `GKDTrainer` 同配置快 2.04×**(Qwen3-0.6B)。**LoRA 模式 0.140 s/step + 仅 3.9 GB 峰值** —— 4 GB 消费级显卡可跑。跨 runtime 大 teacher 路径已端到端验证(Qwen3.5-4B → 0.8B LoRA)。详见 [最新动态](#最新动态)。 |
 | **CPU** | 通用 | **仅开发用** | 冒烟测试,不作为性能目标。 |
 
 模型:**Qwen3.5 全家族**(0.8B / 4B / 30B-A3B / 35B)在 CUDA + Metal 上支持。后续模型队列:**DeepSeek V4 (#1)** → **Qwen 3.6 (#2)** —— 见 [ROADMAP.md](ROADMAP.md#next-model-priority-order)。
@@ -125,23 +125,22 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 
 <!-- 最近 1-2 条,更早历史见 CHANGELOG.md。 -->
 
-**2026-05-21 — ARLE OPD CUDA:16 GB 消费级显卡跑 9B teacher。**
-Qwen3.5-9B TurboQuant teacher 在 `infer`,Qwen3.5-0.8B-Base LoRA r=16 student 在 `train`,真实文本 prompts、`rollout_len=4`、`lr=1e-5`、RTX 4070 Ti SUPER。
+**2026-05-21 — ARLE OPD CUDA:更快 + 更省显存,对比 HuggingFace TRL。**
+同 Qwen3-0.6B teacher/student、32 prompts、`rollout_len=8`、`lr=1e-7`、500 步、AdamW、RTX 4070 Ti SUPER。
 
-![ARLE OPD CUDA — 已 license 的 OPD distillation runs](docs/projects/img/2026-05-21-arle-vs-pytorch-opd-comparison.png)
+![ARLE OPD CUDA vs HuggingFace TRL — 速度、显存、held-out KL](docs/projects/img/2026-05-21-arle-vs-pytorch-opd-comparison.png)
 
-| Run | Step 时间 | 显存峰值 | Held-out KL |
+| | TRL `GKDTrainer` | **ARLE 全量微调** | **ARLE LoRA r=16** |
 |---|---:|---:|---:|
-| **Qwen3.5-9B-TQ4 → 0.8B LoRA r=16** | **4.30 s** | **15.9 GiB** | **100 步 -1.02 %** |
-| Qwen3.5-4B BF16 → 0.8B LoRA r=16 | 5.66 s | 14.8 GiB | 200 步 -2.05 % |
-| Qwen3-0.6B LoRA r=16 | 0.140 s | 3.93 GiB | 500 步 -36.4 % |
-| TRL `GKDTrainer` 同 Qwen3-0.6B | 0.408 s | 12.6 GiB | 500 步 -5.5 % |
+| step 时间 (s) | 0.408 | **0.164** (2.49×) | **0.140** (2.91×) |
+| 显存峰值 (GB) | 12.6 | 15.4 | **3.93**(4 GB 显卡可跑) |
+| held-out KL(500 步) | -5.5 % | **-18.5 %** | **-36.4 %** |
 
-**跨 runtime 大 teacher 路径已端到端验证。** OPD teacher 现在就是生产 `infer` runtime。9B-TQ4 run 保留已验证的 dense BF16 lm head,通过 `rollout_len=4` 在 16 GB 显卡上跑通,并在 `0/25/50/100` 每个 eval 点 held-out KL 单调下降。Qwen3.5-4B BF16 保留为较小规模参考。
+**跨 runtime 大 teacher 路径已端到端验证。** Qwen3.5-4B BF16 teacher 在 `infer`,Qwen3.5-0.8B-Base LoRA r=16 student 在 `train`,通过 `InferTeacher` device-logits bridge 对接。200 步真实文本 run:**5.66 s/step**、**14.8 GiB 峰值**、KL 单调下降(held-out -2.05%)。跨 runtime 开销实测仅 **占 step 时间 1.5%** —— 生产级 teacher 集成成本可忽略。
 
 端到端收敛:lr=1e-7、5000 步,held-out exact-overlap **50% → 82.8%**。
 
-证据:[9B-TQ4 headline bench](docs/experience/wins/2026-05-21-arle-cuda-opd-9b-tq4-rollout4.md) · [使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) · [4B→0.8B 跨 runtime bench](docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md) · [TRL 对照](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md)。
+证据:[`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md) · [使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) · [TRL 对照](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md) · [4B→0.8B 跨 runtime bench](docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md)。
 
 完整历史:[CHANGELOG.md](CHANGELOG.md)。
 

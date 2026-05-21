@@ -1,0 +1,7 @@
+{
+  "prompt": "Write a Python function that returns the Fibonacci sequence up to n.",
+  "completion": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+  "prompt_tokens": 13,
+  "completion_tokens": 64,
+  "elapsed_seconds": 57.085596799850464
+}
