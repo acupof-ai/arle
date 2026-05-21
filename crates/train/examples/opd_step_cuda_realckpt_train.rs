@@ -94,6 +94,10 @@ mod app {
         heldout_overlap_pct: f64,
         train_kl: f64,
         heldout_kl: f64,
+        train_teacher_nll: f64,
+        heldout_teacher_nll: f64,
+        train_top3_overlap_pct: f64,
+        heldout_top3_overlap_pct: f64,
     }
 
     #[derive(Debug, Clone)]
@@ -139,6 +143,15 @@ mod app {
     struct DecodeEval {
         overlap_pct: f64,
         kl: f64,
+        teacher_nll: f64,
+        top3_overlap_pct: f64,
+    }
+
+    #[derive(Debug)]
+    struct TeacherForcedMetrics {
+        kl: f64,
+        teacher_nll: f64,
+        top3_overlap_pct: f64,
     }
 
     #[derive(Debug)]
@@ -474,13 +487,21 @@ mod app {
             heldout_overlap_pct: mean(heldout.iter().map(|eval| eval.overlap_pct)),
             train_kl: mean(train.iter().map(|eval| eval.kl)),
             heldout_kl: mean(heldout.iter().map(|eval| eval.kl)),
+            train_teacher_nll: mean(train.iter().map(|eval| eval.teacher_nll)),
+            heldout_teacher_nll: mean(heldout.iter().map(|eval| eval.teacher_nll)),
+            train_top3_overlap_pct: mean(train.iter().map(|eval| eval.top3_overlap_pct)),
+            heldout_top3_overlap_pct: mean(heldout.iter().map(|eval| eval.top3_overlap_pct)),
         };
         println!(
-            "eval_summary step={step} train_overlap_pct={:.6} heldout_overlap_pct={:.6} train_kl={:.12e} heldout_kl={:.12e} eval_seconds={:.6}",
+            "eval_summary step={step} train_overlap_pct={:.6} heldout_overlap_pct={:.6} train_kl={:.12e} heldout_kl={:.12e} train_teacher_nll={:.12e} heldout_teacher_nll={:.12e} train_top3_overlap_pct={:.6} heldout_top3_overlap_pct={:.6} eval_seconds={:.6}",
             summary.train_overlap_pct,
             summary.heldout_overlap_pct,
             summary.train_kl,
             summary.heldout_kl,
+            summary.train_teacher_nll,
+            summary.heldout_teacher_nll,
+            summary.train_top3_overlap_pct,
+            summary.heldout_top3_overlap_pct,
             started.elapsed().as_secs_f64()
         );
         Ok(summary)
@@ -518,7 +539,7 @@ mod app {
                 tape,
             )?;
             let overlap_pct = exact_overlap_pct(&student_suffix, &teacher_suffix);
-            let kl = mean_per_token_forward_kl(
+            let metrics = teacher_forced_metrics(
                 teacher,
                 student,
                 prompt,
@@ -529,9 +550,17 @@ mod app {
                 tape,
             )?;
             println!(
-                "eval_detail step={step} split={split} prompt_index={index} prompt={prompt:?} teacher_suffix={teacher_suffix:?} student_suffix={student_suffix:?} overlap_pct={overlap_pct:.6} kl={kl:.12e}"
+                "eval_detail step={step} split={split} prompt_index={index} prompt={prompt:?} teacher_suffix={teacher_suffix:?} student_suffix={student_suffix:?} overlap_pct={overlap_pct:.6} kl={:.12e} teacher_nll={:.12e} top3_overlap_pct={:.6}",
+                metrics.kl,
+                metrics.teacher_nll,
+                metrics.top3_overlap_pct
             );
-            rows.push(DecodeEval { overlap_pct, kl });
+            rows.push(DecodeEval {
+                overlap_pct,
+                kl: metrics.kl,
+                teacher_nll: metrics.teacher_nll,
+                top3_overlap_pct: metrics.top3_overlap_pct,
+            });
         }
         Ok(rows)
     }
@@ -573,7 +602,7 @@ mod app {
         Ok(suffix)
     }
 
-    fn mean_per_token_forward_kl(
+    fn teacher_forced_metrics(
         teacher: &Qwen35Model,
         student: &Qwen35Model,
         prompt: &[u32],
@@ -582,9 +611,11 @@ mod app {
         student_params: &[TensorId],
         store: &mut TensorStore,
         tape: &mut Tape,
-    ) -> AnyResult<f64> {
+    ) -> AnyResult<TeacherForcedMetrics> {
         if prompt.is_empty() || teacher_suffix.len() < DECODE_LEN {
-            return Err("KL eval requires a non-empty prompt and full teacher suffix".into());
+            return Err(
+                "teacher-forced eval requires a non-empty prompt and full teacher suffix".into(),
+            );
         }
         let mut sequence = prompt.to_vec();
         sequence.extend_from_slice(teacher_suffix);
@@ -598,51 +629,70 @@ mod app {
         let student_host = store.to_host(student_logits)?;
         let vocab = teacher.config().vocab_size;
         let first_row = prompt.len() - 1;
-        let kl = mean_forward_kl_rows(&teacher_host, &student_host, first_row, DECODE_LEN, vocab)?;
+        let metrics = mean_teacher_forced_metrics_rows(
+            &teacher_host,
+            &student_host,
+            first_row,
+            &teacher_suffix[..DECODE_LEN],
+            vocab,
+        )?;
         retain_model_state(store, tape, teacher_params, student_params);
-        Ok(kl)
+        Ok(metrics)
     }
 
-    fn mean_forward_kl_rows(
+    fn mean_teacher_forced_metrics_rows(
         teacher_logits: &[f32],
         student_logits: &[f32],
         first_row: usize,
-        rows: usize,
+        targets: &[u32],
         vocab: usize,
-    ) -> AnyResult<f64> {
+    ) -> AnyResult<TeacherForcedMetrics> {
+        let rows = targets.len();
         let required = (first_row + rows) * vocab;
         if teacher_logits.len() < required || student_logits.len() < required {
             return Err(format!(
-                "KL logits are too short: required {required}, teacher={}, student={}",
+                "teacher-forced logits are too short: required {required}, teacher={}, student={}",
                 teacher_logits.len(),
                 student_logits.len()
             )
             .into());
         }
-        let mut total = 0.0f64;
-        for row_idx in first_row..first_row + rows {
+        let mut total_kl = 0.0f64;
+        let mut total_teacher_nll = 0.0f64;
+        let mut top3_hits = 0usize;
+        for (target_idx, row_idx) in (first_row..first_row + rows).enumerate() {
+            let target = targets[target_idx] as usize;
+            if target >= vocab {
+                return Err(format!("teacher target token {target} exceeds vocab {vocab}").into());
+            }
             let offset = row_idx * vocab;
-            total += forward_kl_row(
-                &teacher_logits[offset..offset + vocab],
-                &student_logits[offset..offset + vocab],
-            );
+            let teacher_row = &teacher_logits[offset..offset + vocab];
+            let student_row = &student_logits[offset..offset + vocab];
+            let student_log_z = log_sum_exp_row(student_row);
+            total_kl += forward_kl_row_with_student_log_z(teacher_row, student_row, student_log_z);
+            total_teacher_nll += student_log_z - student_row[target] as f64;
+            if top_k_contains(student_row, target, 3) {
+                top3_hits += 1;
+            }
         }
-        Ok(total / rows as f64)
+        Ok(TeacherForcedMetrics {
+            kl: total_kl / rows as f64,
+            teacher_nll: total_teacher_nll / rows as f64,
+            top3_overlap_pct: top3_hits as f64 / rows as f64 * 100.0,
+        })
     }
 
-    fn forward_kl_row(teacher: &[f32], student: &[f32]) -> f64 {
+    fn forward_kl_row_with_student_log_z(
+        teacher: &[f32],
+        student: &[f32],
+        student_log_z: f64,
+    ) -> f64 {
         let teacher_max = teacher.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let student_max = student.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
         let teacher_sum_exp = teacher
             .iter()
             .map(|&value| ((value as f64) - teacher_max).exp())
             .sum::<f64>();
-        let student_sum_exp = student
-            .iter()
-            .map(|&value| ((value as f64) - student_max).exp())
-            .sum::<f64>();
         let teacher_log_z = teacher_max + teacher_sum_exp.ln();
-        let student_log_z = student_max + student_sum_exp.ln();
         teacher
             .iter()
             .zip(student)
@@ -652,6 +702,32 @@ mod app {
                 teacher_log_prob.exp() * (teacher_log_prob - student_log_prob)
             })
             .sum()
+    }
+
+    fn log_sum_exp_row(row: &[f32]) -> f64 {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let sum_exp = row
+            .iter()
+            .map(|&value| ((value as f64) - max).exp())
+            .sum::<f64>();
+        max + sum_exp.ln()
+    }
+
+    fn top_k_contains(row: &[f32], target: usize, k: usize) -> bool {
+        let mut top = vec![(f32::NEG_INFINITY, usize::MAX); k];
+        for (idx, &value) in row.iter().enumerate() {
+            for slot in 0..k {
+                let (slot_value, slot_idx) = top[slot];
+                if value > slot_value || (value == slot_value && idx < slot_idx) {
+                    for shift in (slot + 1..k).rev() {
+                        top[shift] = top[shift - 1];
+                    }
+                    top[slot] = (value, idx);
+                    break;
+                }
+            }
+        }
+        top.iter().any(|&(_, idx)| idx == target)
     }
 
     fn greedy_next_token(
@@ -778,12 +854,16 @@ mod app {
         );
         for summary in eval_summaries {
             println!(
-                "summary_eval_row step={} train_overlap_pct={:.6} heldout_overlap_pct={:.6} train_kl={:.12e} heldout_kl={:.12e}",
+                "summary_eval_row step={} train_overlap_pct={:.6} heldout_overlap_pct={:.6} train_kl={:.12e} heldout_kl={:.12e} train_teacher_nll={:.12e} heldout_teacher_nll={:.12e} train_top3_overlap_pct={:.6} heldout_top3_overlap_pct={:.6}",
                 summary.step,
                 summary.train_overlap_pct,
                 summary.heldout_overlap_pct,
                 summary.train_kl,
-                summary.heldout_kl
+                summary.heldout_kl,
+                summary.train_teacher_nll,
+                summary.heldout_teacher_nll,
+                summary.train_top3_overlap_pct,
+                summary.heldout_top3_overlap_pct
             );
         }
     }
