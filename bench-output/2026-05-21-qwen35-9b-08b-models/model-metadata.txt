@@ -1,0 +1,60 @@
+[teacher_awq]
+repo=tclf90/Qwen3.5-9B-AWQ
+path=/home/ckl/.cache/modelscope/hub/tclf90/Qwen3___5-9B-AWQ
+symlink_resolved=/home/ckl/.cache/modelscope/hub/tclf90/Qwen3___5-9B-AWQ
+dir_size_bytes=12399585238
+architectures=['Qwen3_5ForConditionalGeneration']
+model_type=qwen3_5
+text_model_type=qwen3_5_text
+dtype=float16
+hidden_size=4096
+intermediate_size=12288
+num_hidden_layers=32
+num_attention_heads=16
+num_key_value_heads=4
+head_dim=256
+vocab_size=248320
+layer_types_prefix=['linear_attention', 'linear_attention', 'linear_attention', 'full_attention', 'linear_attention', 'linear_attention', 'linear_attention', 'full_attention']
+quantization_config={'quant_method': 'awq', 'bits': 4, 'group_size': 128, 'version': 'gemm', 'zero_point': True, 'modules_to_not_convert': ['visual', 'linear_attn', 'self_attn', 'model.layers.0.', 'mtp']}
+safetensors=['model-00001-of-00005.safetensors', 'model-00002-of-00005.safetensors', 'model-00003-of-00005.safetensors', 'model-00004-of-00005.safetensors', 'model-00005-of-00005.safetensors']
+
+[teacher_bf16]
+repo=Qwen/Qwen3.5-9B
+path=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+symlink_resolved=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+dir_size_bytes=19329393288
+architectures=['Qwen3_5ForConditionalGeneration']
+model_type=qwen3_5
+text_model_type=qwen3_5_text
+dtype=bfloat16
+hidden_size=4096
+intermediate_size=12288
+num_hidden_layers=32
+num_attention_heads=16
+num_key_value_heads=4
+head_dim=256
+vocab_size=248320
+layer_types_prefix=['linear_attention', 'linear_attention', 'linear_attention', 'full_attention', 'linear_attention', 'linear_attention', 'linear_attention', 'full_attention']
+quantization_config=None
+safetensors=['model.safetensors-00001-of-00004.safetensors', 'model.safetensors-00002-of-00004.safetensors', 'model.safetensors-00003-of-00004.safetensors', 'model.safetensors-00004-of-00004.safetensors']
+
+[student]
+repo=Qwen/Qwen3.5-0.8B-Base
+path=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base
+symlink_resolved=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base
+dir_size_bytes=1769913219
+architectures=['Qwen3_5ForConditionalGeneration']
+model_type=qwen3_5
+text_model_type=qwen3_5_text
+dtype=bfloat16
+hidden_size=1024
+intermediate_size=3584
+num_hidden_layers=24
+num_attention_heads=8
+num_key_value_heads=2
+head_dim=256
+vocab_size=248320
+layer_types_prefix=['linear_attention', 'linear_attention', 'linear_attention', 'full_attention', 'linear_attention', 'linear_attention', 'linear_attention', 'full_attention']
+quantization_config=None
+safetensors=['model.safetensors-00001-of-00001.safetensors']
+

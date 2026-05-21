@@ -1,0 +1,13 @@
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `release` profile [optimized] target(s) in 17.41s
+     Running tests/test_qwen35_loader.rs (target/release/deps/test_qwen35_loader-5c17565d8929c241)
+
+running 1 test
+loader_smoke_qwen3_0_6b: loading /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base
+loader_smoke_qwen3_0_6b: loaded ok, param_count = 322
+loader_smoke_qwen3_0_6b: last-row logits[..5] = [7.4128284, 18.017591, 8.885979, 12.604919, 2.7894695], all_finite = true
+test loader_smoke_qwen3_0_6b ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.04s
+
+exit=0

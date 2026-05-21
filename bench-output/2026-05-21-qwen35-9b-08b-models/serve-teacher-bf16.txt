@@ -1,0 +1,25 @@
+[ARLE serve] launching cuda backend via /home/ckl/projects/arle/target/release/infer
+2026-05-21T11:42:33.351636+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.352278+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.353821+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.353828+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.353855+08:00   INFO infer: main.rs:1079 === Infer Server - Qwen3.5 (GPU) ===
+2026-05-21T11:42:33.378082+08:00   INFO infer::runtime_topology: runtime_topology.rs:132 Runtime topology: numa_nodes=1 gpus=1 nics=1 fallback_cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-05-21T11:42:33.378096+08:00   INFO infer::runtime_topology: runtime_topology.rs:140 Runtime topology NUMA node 0: cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-05-21T11:42:33.378100+08:00   INFO infer::runtime_topology: runtime_topology.rs:147 Runtime topology GPU 0: pci=26:00.0 numa=None local_cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 nearest_nics=enp34s0
+2026-05-21T11:42:33.378110+08:00   INFO infer::runtime_topology: runtime_topology.rs:161 Runtime topology NIC enp34s0: pci=22:00.0 numa=None local_cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-05-21T11:42:33.378193+08:00   INFO infer: main.rs:809 Final runtime worker placement: worker=0 cuda_ordinal=0 gpu=0 numa=None cpus=16 nics=enp34s0 affinity_applied=true reason=applied
+2026-05-21T11:42:33.512109+08:00   INFO infer: main.rs:826 GPU memory @ post_cuda_ctx (early): cuda_ordinal=0 gpu=0 free=15.40 GB / total=16.72 GB (driver+ctx+cuBLAS overhead = 1314 MB)
+2026-05-21T11:42:33.512144+08:00   INFO infer: main.rs:1126 Loading model...
+2026-05-21T11:42:33.512166+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:339 CUDA bootstrap worker placement: worker=0 gpu=0 cuda_ordinal=Some(0) numa=None cpus=16 nics=enp34s0 affinity_applied=true reason=applied
+2026-05-21T11:42:33.512181+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:377 GPU memory @ pre_model_load: free=15.40 GB / total=16.72 GB (delta vs post_cuda_ctx = +0 MB bytes — AOT cubins + lazy_static loaders)
+2026-05-21T11:42:33.512193+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.512232+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.888455+08:00   INFO infer::model::qwen35::weights: weights.rs:129 Loading Qwen3.5 model from: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.888520+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B
+2026-05-21T11:42:33.889585+08:00   INFO infer::weight_loader: weight_loader.rs:77 Memory-mapped 4 shard(s) (19306.3 MB) in 0ms
+
+thread 'main' (3213309) panicked at infer/src/main.rs:1176:17:
+Failed to create scheduler: worker=0 cuda_ordinal=0 gpu=0: H2D copy failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+exit=101
