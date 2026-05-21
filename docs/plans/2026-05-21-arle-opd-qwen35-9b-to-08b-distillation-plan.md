@@ -90,12 +90,19 @@ peak teacher) and accept tighter memory. Worst case: revert to
 | Phase | Work | Owner | Time | Acceptance / safety gate |
 |---:|---|---|---:|---|
 | **1** | Download Qwen3.5-9B (AWQ preferred) + Qwen3.5-0.8B from ModelScope; verify `infer` loads teacher (`arle --doctor --model-path <teacher>`) | codex | ~30-60 min | Teacher loads + decodes 1 token without crash; student loads via `qwen35_loader`. |
-| **2** | Create `crates/train/src/teacher_infer.rs` adapter exposing `forward(input_ids, positions) -> logits` via `infer::Engine` instance, sharing the train TensorStore's `CudaBackend` arc. Modify `opd_step` to take `&dyn TeacherForward`. | codex | 1-2 days | First runnable OPD step with infer-teacher ≤ 2× the current single-runtime step time (≤ 0.4 s on Qwen3-0.6B-class). If slower, stop + diagnose. |
+| **2** | Create `crates/train/src/teacher_infer.rs` adapter exposing `forward(input_ids, positions) -> logits` via the production `infer` runtime, sharing the train TensorStore's `CudaBackend` arc if the raw-logits/device-handle contract exists. | codex | 1-2 days | Commit `9cd072d` landed `TeacherForward` + `InProcessTeacher`. Commit 2 adds an `InferTeacher` stub against `LoadedInferenceEngine` and records the zero-copy blocker: `infer` currently exposes text completion, not raw device logits, and uses `cuda_kernels::DeviceContext` rather than `autograd::CudaBackend`. Real forward is paused until the shared CUDA/logits contract lands. |
 | **3** | Run ARLE 9B→0.8B OPD distillation: 1000 steps, LoRA r=16, lr=1e-5, real-text 64 prompts, eval cadence 0/100/250/500/1000. Save student LoRA adapter. | codex | ~3.5 min compute | Run completes without OOM; trajectory shows monotonic held-out KL decrease. |
 | **4** | Mirror in TRL `GKDTrainer` (`.venv` Python). Same teacher, same student, same prompts, same 1000 steps, constant LR. Save trained student. | codex | ~30-60 min compute | TRL run completes. Report step time + peak mem. |
 | **5** | Install `lm-eval-harness` (`pip install lm-eval`). Run MMLU + IFEval on 4 models: teacher / base student / ARLE-distilled / TRL-distilled. | codex | 1-2 hr compute | All 4 models evaluated. Verdict-table populated. |
 | **6** | Generate 4-bar comparison PNG (ARLE OPD step / TRL OPD step / PyTorch pure inference / ARLE pure inference). Update README + ZH README. Write wins entry summarizing perf + eval. | Claude | ~1 hr | README + ZH README updated; PNG committed; wins entry committed. |
 | **7** | One-click `examples/opd/run-distillation.sh` (✅ shipped 2026-05-21). Default smoke mode runs `arle train opd --smoke` end-to-end in <30 s with no download; opt-in real mode auto-resolves `ARLE_TEACHER`/`ARLE_STUDENT` (HF or ModelScope) to local cache via the `.venv`. Follow-up: extend `arle train opd` CLI itself with `--prompts-file <jsonl>` and `--model-id <hf-id>` native-Rust resolver (deferred to `hf-hub` integration). | Claude (shell wrapper); codex (native CLI later) | ~1 hr wrapper / multi-day native | Smoke path verified end-to-end without internet; real mode verified after the Phase 1 model downloads complete; native `--prompts-file` lands when codex's Phase 2 adapter is in flight. |
+
+### Phase 2 execution ledger
+
+| Commit | Scope | Result |
+|---|---|---|
+| `9cd072d` | `TeacherForward` trait + `InProcessTeacher` refactor | Existing `opd_step` signature preserved; `cargo check -p train`, `cargo check -p train --examples`, `cargo test -p train --test test_opd_determinism --release`, and `cargo check --workspace` passed. |
+| Commit 2 | `InferTeacher` stub against `LoadedInferenceEngine` + zero-copy blocker note | Type-checks the intended train-side stub, but real forward is paused because `infer` has no public raw-logits API and no shared CUDA handle ABI with `autograd`. See [`../research/2026-05-21-arle-opd-infer-teacher-zero-copy-blocker.md`](../research/2026-05-21-arle-opd-infer-teacher-zero-copy-blocker.md). |
 
 ## Acceptance — overall
 

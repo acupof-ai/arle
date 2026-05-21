@@ -17,7 +17,7 @@ autobins = false
 default = []
 no-cuda = ["autograd/no-cuda"]
 metal = ["autograd/metal"]
-cuda = ["autograd/cuda"]
+cuda = ["autograd/cuda", "dep:infer", "infer/cuda", "infer/unified_scheduler"]
 
 [dependencies]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
@@ -38,6 +38,7 @@ qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
 deepseek-spec = { path = "../deepseek-spec" }
 chat = { path = "../chat" }
+infer = { path = "../../infer", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

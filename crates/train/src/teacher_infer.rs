@@ -6,7 +6,14 @@
 //! a `TensorId` in the caller's `TensorStore` so the KL path can stay on the
 //! same backend without a host materialization.
 
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "cuda")]
+use autograd::Backend;
 use autograd::{AutogradError, Tape, TensorId, TensorStore};
+#[cfg(feature = "cuda")]
+use infer::server_engine::LoadedInferenceEngine;
 
 use crate::qwen35::{Qwen35Error, Qwen35Model};
 
@@ -82,5 +89,64 @@ impl TeacherForward for InProcessTeacher<'_> {
 
     fn parameter_ids(&self) -> &[TensorId] {
         &self.parameter_ids
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct InferTeacher {
+    engine: Arc<Mutex<LoadedInferenceEngine>>,
+    train_backend: Arc<dyn Backend>,
+    vocab_size: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl InferTeacher {
+    pub fn new(
+        engine: Arc<Mutex<LoadedInferenceEngine>>,
+        train_backend: Arc<dyn Backend>,
+        vocab_size: usize,
+    ) -> Self {
+        Self {
+            engine,
+            train_backend,
+            vocab_size,
+        }
+    }
+
+    pub fn engine(&self) -> &Arc<Mutex<LoadedInferenceEngine>> {
+        &self.engine
+    }
+
+    pub fn train_backend(&self) -> &Arc<dyn Backend> {
+        &self.train_backend
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl TeacherForward for InferTeacher {
+    fn forward_logits_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        let _ = (
+            &self.engine,
+            &self.train_backend,
+            input_ids,
+            positions,
+            store,
+            tape,
+        );
+        todo!(
+            "InferTeacher::forward_logits_device is blocked on a raw infer logits export \
+             and a shared CUDA handle bridge; see \
+             docs/research/2026-05-21-arle-opd-infer-teacher-zero-copy-blocker.md"
+        )
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
     }
 }

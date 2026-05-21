@@ -4024,6 +4024,7 @@ dependencies = [
  "deepseek-spec",
  "half",
  "hf-hub",
+ "infer",
  "memmap2",
  "opentelemetry",
  "opentelemetry-otlp",
