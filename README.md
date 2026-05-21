@@ -123,6 +123,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, CUDA Graph decode. L4 / Qwen3.5-4B BF16 + FP8 KV: **197 tok/s @ c=16 / 4k-in**. |
 | **Metal** | Apple Silicon | **Beta** | Scheduler-backed serving, chunked prefill, replay prefix reuse. Qwen3.6 35B-A3B 4-bit MLX HTTP serve: **85.6 tok/s decode / 385 ms TTFT** on M4 Pro 48GB (256/91, temp 0) — at parity with `mlx-lm` direct (86.3), both at ~78% of the 273 GB/s unified-memory ceiling. Qwen3.5-0.8B MLX-4bit step-driver: **305.5 tok/s** on M4 Pro 20c. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3.5. Qwen3.5-4B-4bit bit-identical, c=1..8. |
+| **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | End-to-end real-checkpoint OPD step at Qwen3-0.6B + RTX 4070 Ti SUPER: **0.164 s/step** with full-finetune (~170× over naive scratch baseline). Moderate-shape OPD step **48.5 ms** — **1.71× faster than PyTorch CUDA reference** (83 ms). Convergence verified at lr=1e-7: held-out exact-overlap **50 → 82.8 %** over 5k steps with KL/NLL still monotonically falling. Charts: [step-time arc](docs/projects/img/2026-05-21-opd-cuda-step-arc.png) · [convergence](docs/projects/img/2026-05-21-opd-cuda-convergence.png) · [usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a perf target. |
 
 Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B; dense, hybrid linear-attn, and MoE; GGUF Q4_K_M and 4B hybrid attention) on CUDA + Metal. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA stubbed. Next-model queue: **DeepSeek V4 (#1)** → **Qwen 3.6 (#2)**, see [ROADMAP.md](ROADMAP.md#next-model-priority-order). DeepSeek V2/V3/R1 intentionally out of scope.
@@ -154,7 +155,7 @@ Latest benchmark snapshots (per change, dated): [docs/experience/wins/](docs/exp
 | `arle` (no args) | Interactive agent REPL with built-in `python` and `shell` tools (sandboxed). |
 | `arle run --prompt "…"` / `--stdin --json` | Script-friendly one-shot agent prompt. Use `--no-tools` to disable tool execution. |
 | `arle serve --backend {cuda,metal,cpu} --model-path …` | Launch the OpenAI-compatible HTTP server through an ARLE-native backend. |
-| `arle train opd` | **On-Policy Distillation** — the one in-tree training surface (teacher in `infer`, student LoRA on the same runtime). Pretrain / SFT / GRPO / multi-turn RL were retired 2026-05-18 ([rationale](docs/projects/2026-05-18-opd-only-pivot.md)). |
+| `arle train opd` | **On-Policy Distillation** — the one in-tree training surface (teacher in `infer`, student LoRA or full-finetune on the same runtime). CUDA path runs Qwen3-0.6B at **0.164 s/step** on RTX 4070 Ti SUPER (~170× over naive). Usage manual: [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). Pretrain / SFT / GRPO / multi-turn RL were retired 2026-05-18 ([rationale](docs/projects/2026-05-18-opd-only-pivot.md)). |
 | `arle --doctor [--json] [--strict]` | Self-check: backend, hardware, HF cache, model resolution. CI-friendly. |
 
 The REPL persists line history at `~/.arle-history` and exposes slash commands: `/help`, `/reset`, `/clear`, `/tools`, `/model`, `/stats`, `/models`, `/save`, `/load`, `/export`.
@@ -167,6 +168,28 @@ Operators who want only the native serving binary can use `infer` directly (`car
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
+- **2026-05-21** — OPD CUDA training stack lands end-to-end on Qwen3-0.6B. Single-session
+  arc through 32 commits (kill-or-license-gated) brings the OPD moderate step
+  to **48.5 ms** on RTX 4070 Ti SUPER — **1.71× faster than the like-for-like
+  PyTorch CUDA reference (83 ms)** — and the real Qwen3-0.6B step to
+  **0.164 s** (~170× over naive scratch CPU). Substrate verified
+  bit-equivalent to CPU (relerr ~1.3e-6). Convergence at lr=1e-7 reaches
+  **held-out exact-overlap 50 → 82.8 %** by step 5000, with held-out KL/NLL
+  still falling monotonically.
+
+  ![ARLE OPD CUDA — Qwen3-0.6B step-time arc (10.41 s → 0.164 s, 30× session, ~170× vs naive)](docs/projects/img/2026-05-21-opd-cuda-step-arc.png)
+
+  ![ARLE OPD CUDA — Qwen3-0.6B convergence (held-out 50 → 82.8 % over 5000 steps at lr=1e-7)](docs/projects/img/2026-05-21-opd-cuda-convergence.png)
+
+  Axes landed: host-mirror invariant fix, in-place AdamW, KV cache for
+  rollout, RoPE/argmax device-resident, fused causal-SDPA decode, fused
+  attention-prepare layout, fused grad clip. Five parallel axes killed
+  cleanly via SOLID gates (forward_last_logits, merge_grad sharing, SDPA
+  mask-softmax fusion, high-level CUDA Graph rollout capture, SwiGLU
+  silu+multiply fusion). Evidence:
+  [`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md),
+  [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md),
+  [`docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`](docs/projects/2026-05-21-opd-industry-positioning-best-framework.md).
 - **2026-05-15** — DSv4 DeepEP decode lands default B=1 padded BF16
   reduce-scatter combine, fused local-expert prepare kernel, and broad
   scratch-reuse cleanup. Real 8xH20 on `DeepSeek-V4-Flash`: `decode64` holds
@@ -177,14 +200,6 @@ Operators who want only the native serving binary can use `infer` directly (`car
   Evidence: [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/),
   [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
   [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
-- **2026-05-10** — W4-hybrid prefill graph capture closes the 4k/c=4 SGLang
-  +76.6% gap via Path B.2 bucketed allocation key. Engine-side TTFT p50
-  **2000 → 150 ms (-92.5%)**, throughput **+632%** in 60s on RTX 4070 Ti
-  SUPER 16GB. Capture-key churn **388 → 7 unique** (98.5% LRU reuse). Opt-in
-  via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1`. Also lands
-  RoPE YARN/Linear/NtkAware scaling.
-  Evidence: [`docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`](docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md),
-  [`docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`](docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md). Next up: [ROADMAP.md](ROADMAP.md).
 
