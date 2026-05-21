@@ -72,18 +72,30 @@ GPU memory used: 14399 MiB / 16376 MiB
 GPU memory free: 1545 MiB
 ```
 
+Follow-up upload diagnostics changed the generic autograd error to include the
+failed H2D tensor shape, bytes, and CUDA driver error. Re-running the same
+single-token control failed on a small projection-weight upload:
+
+```text
+Error: Autograd(TapeInvariant("cuda htod copy failed: shape=[1024, 3584] \
+len=3670016 bytes=14680064 err=DriverError(CUDA_ERROR_OUT_OF_MEMORY, \
+\"out of memory\")"))
+```
+
+That is only `14.68 MB`, so the failure is not one unusually large tensor. The
+GPU is already effectively out of contiguous allocation headroom before the
+student's first full forward can finish uploading its f32 base weights.
+
 ## Root Cause
 
 This is not a prompt-length or rollout-length problem. The single-token,
 rollout-1 control fails before the first eval result, after both models load.
 
-Most likely cause: the current train-side LoRA student keeps the 0.8B base
-weights as f32 autograd tensors and uploads them through the generic f32 CUDA
-path during the first student forward. With the 9B GPTQModel teacher resident
-in `infer`, the remaining 16 GB GPU headroom is not enough for the next
-contiguous f32 student-base upload plus activations/logits. The generic error
-message loses the allocation size, but the live memory sample already showed
-only ~1.5 GiB free at failure time.
+Root cause: the current train-side LoRA student keeps the 0.8B base weights as
+f32 autograd tensors and uploads them through the generic f32 CUDA path during
+the first student forward. With the 9B GPTQModel teacher resident in `infer`,
+the remaining 16 GB GPU headroom is exhausted before even a `14.68 MB`
+student-projection upload can complete.
 
 ## Decision
 
