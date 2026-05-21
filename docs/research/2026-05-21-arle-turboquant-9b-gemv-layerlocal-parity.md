@@ -8,7 +8,8 @@ Qwen3.5-9B-TQ4 logits still failed against BF16 PyTorch
 
 This tranche tests the next attribution level: does the fused decode GEMV path
 match the reference path that bulk-dequants the same TQ4 weight and then calls
-cuBLAS GEMM?
+cuBLAS GEMM? The first commit tested one projection. This update extends the
+same parametric harness across sampled projection families and layers.
 
 ## Hypothesis
 
@@ -23,8 +24,16 @@ coverage, dense fallback weights, attention/norm integration, or accumulated
 ## Params
 
 - Model: `/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4`
-- Projection: `model.language_model.layers.0.mlp.gate_proj`
-- Shape: `[rows=12288, cols=4096]`
+- Projections:
+  - layer 0 MLP: `gate_proj`, `up_proj`, `down_proj`
+  - layer 3 full attention: `q_proj`, `k_proj`, `v_proj`, `o_proj`
+  - layer 3 MLP: `gate_proj`, `up_proj`, `down_proj`
+  - layer 10 MLP: `gate_proj`
+- Note: Qwen3.5-9B `config.json` has
+  `layer_types[0..12] = [linear_attention, linear_attention,
+  linear_attention, full_attention, ...]`, with `full_attention_interval=4`.
+  Layer 0 therefore has no `self_attn.q/k/v/o` tensors. The first full-attn
+  projection scan uses layer 3 instead.
 - Quantization: TurboQuant 4-bit, group size 128
 - Input: deterministic BF16 vector `[1, 4096]`, seed `1592594996`
 - GPU: RTX 4070 Ti SUPER
@@ -44,28 +53,44 @@ TORCH_CUDA_ARCH_LIST=8.9 \
 CARGO_BUILD_JOBS=1 \
 cargo run -p infer --example turboquant_weight_gemv_parity --release --features cuda -- \
   --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4 \
-  --tensor-base model.language_model.layers.0.mlp.gate_proj \
+  --tensor-base model.language_model.layers.3.self_attn.q_proj \
   --seed 1592594996 \
-  --output bench-output/2026-05-21-qwen35-9b-tq4-gemv-layerlocal/layer0-gate-proj-gemv-parity.json
+  --output bench-output/2026-05-21-qwen35-9b-tq4-projection-gemv-scan/layer3-self-attn-q.json
 ```
 
 Raw artifacts:
 
 - `bench-output/2026-05-21-qwen35-9b-tq4-gemv-layerlocal/layer0-gate-proj-gemv-parity-run.txt`
 - `bench-output/2026-05-21-qwen35-9b-tq4-gemv-layerlocal/layer0-gate-proj-gemv-parity.json`
+- `bench-output/2026-05-21-qwen35-9b-tq4-projection-gemv-scan/summary.json`
+- `bench-output/2026-05-21-qwen35-9b-tq4-projection-gemv-scan/*.json`
+- `bench-output/2026-05-21-qwen35-9b-tq4-projection-gemv-scan/*.run.txt`
 
 ## Results
 
-| Comparison | Max abs | Mean abs | RMSE | RMSE/reference-RMS | Max rel | Mean rel |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| fused TQ GEMV vs bulk-dequant+cuBLAS | `0.0078125` | `0.0005269` | `0.0010201` | `0.0024978` | `1526.1993` | `0.1386` |
+Gate: `RMSE/reference-RMS <= 1%`.
+
+| Label | Tensor | Shape | Max abs | RMSE/reference-RMS | Gate |
+| --- | --- | ---: | ---: | ---: | --- |
+| layer0-mlp-gate | `model.language_model.layers.0.mlp.gate_proj` | `12288x4096` | `0.0078125` | `0.2498%` | PASS |
+| layer0-mlp-up | `model.language_model.layers.0.mlp.up_proj` | `12288x4096` | `0.0078125` | `0.2519%` | PASS |
+| layer0-mlp-down | `model.language_model.layers.0.mlp.down_proj` | `4096x12288` | `0.015625` | `0.2558%` | PASS |
+| layer3-self-attn-q | `model.language_model.layers.3.self_attn.q_proj` | `8192x4096` | `0.015625` | `0.2627%` | PASS |
+| layer3-self-attn-k | `model.language_model.layers.3.self_attn.k_proj` | `1024x4096` | `0.015625` | `0.2771%` | PASS |
+| layer3-self-attn-v | `model.language_model.layers.3.self_attn.v_proj` | `1024x4096` | `0.0078125` | `0.2523%` | PASS |
+| layer3-self-attn-o | `model.language_model.layers.3.self_attn.o_proj` | `4096x4096` | `0.0078125` | `0.2436%` | PASS |
+| layer3-mlp-gate | `model.language_model.layers.3.mlp.gate_proj` | `12288x4096` | `0.0078125` | `0.2549%` | PASS |
+| layer3-mlp-up | `model.language_model.layers.3.mlp.up_proj` | `12288x4096` | `0.0078125` | `0.2567%` | PASS |
+| layer3-mlp-down | `model.language_model.layers.3.mlp.down_proj` | `4096x12288` | `0.015625` | `0.2555%` | PASS |
+| layer10-mlp-gate | `model.language_model.layers.10.mlp.gate_proj` | `12288x4096` | `0.0078125` | `0.2546%` | PASS |
 
 `max_rel` is a near-zero denominator artifact: the reference output at the
 max-rel index is close to zero. The scale-stable metric is
-`RMSE/reference-RMS = 0.2498%`, and max absolute error is one BF16-scale step
-for this output range.
+`RMSE/reference-RMS`. All sampled projections landed in the `0.24%-0.28%`
+band, and max absolute error was one to two BF16-scale steps for these output
+ranges.
 
-First 8 output entries:
+First 8 output entries for the original layer 0 `mlp.gate_proj` check:
 
 | Index | Fused GEMV | Bulk dequant + cuBLAS | Abs err | Rel err |
 | ---: | ---: | ---: | ---: | ---: |
@@ -80,20 +105,31 @@ First 8 output entries:
 
 ## Decision
 
-Layer 0 `mlp.gate_proj` fused TurboQuant GEMV reproduces the bulk-dequant
-cuBLAS reference. This does not support "fused GEMV compute path is the
-remaining root cause" for this projection.
+Layer-local fused TurboQuant GEMV reproduces the bulk-dequant cuBLAS reference
+for every sampled quantized projection:
 
-Do not run the 9B-TQ4 OPD bench yet. The next attribution step is a projection
-family scan on layer 0 (`q/k/v/o/gate/up/down`) with the same harness, followed
-by layer-0 forward parity if all projection-local GEMV checks pass.
+- layer 0 linear-attn-block MLP;
+- the first full-attn block's q/k/v/o projections and MLP;
+- a mid-layer MLP gate projection.
+
+This does not support "TurboQuant fused GEMV compute path is the remaining
+root cause" for the Qwen3.5-9B-TQ4 full-model logits failure.
+
+Do not run the 9B-TQ4 OPD bench yet. The next attribution step should move to
+the dense path. Since layer 0 is `linear_attention`, the first dense suspect is
+the layer-0 linear-attention forward path (`in_proj_qkv`, `in_proj_z`,
+`in_proj_a`, `in_proj_b`, `conv1d`, `A_log`, `dt_bias`, `norm`, and
+`out_proj`) against a PyTorch BF16 reference on the same hidden input.
+Embedding, final norm, and LM head remain secondary dense suspects.
 
 ## Problems
 
-This is one projection, not a model-wide license. It does not test:
+This is projection-local evidence, not a model-wide license. It does not test:
 
-- `q_proj`, `k_proj`, `v_proj`, `o_proj`, `up_proj`, or `down_proj`;
-- dense fallback modules, embeddings, final norm, or LM head;
+- every layer and every projection, though it samples layer 0, layer 3, and
+  layer 10;
+- dense fallback modules, especially layer-0 `linear_attn`, embeddings, final
+  norm, or LM head;
 - attention/RoPE/norm integration;
 - accumulated 4-bit quantization drift across the full network.
 
