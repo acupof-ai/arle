@@ -270,6 +270,13 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
 7. Next DX axis: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so
    `arle train opd` can select local infer, external API, or routed specialist
    teachers without editing examples.
+   - Example-level surface: `opd_step_cuda_infer_teacher_train` accepts
+     `--teacher-api-url` for a single full-logits API teacher and
+     `--teacher-config` for deterministic token-prefix routing across multiple
+     API teachers.
+   - Sample config: `examples/opd/multi-teacher-config.example.json`.
+   - Still open: wire the same config surface into `arle train opd` once the
+     current CLI dirty work is reconciled.
 
 Evidence:
 
