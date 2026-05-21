@@ -223,6 +223,20 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
 
 const BENCH_ROWS_EN: BenchRow[] = [
   {
+    date: "2026-05-21",
+    stability: "beta",
+    stabilityLabel: "beta · cycle-wrap",
+    caption: '<b>cuda</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3-0.6B real-checkpoint OPD step</code> · 32-commit session, kill-or-license-gated',
+    cells: [
+      { key: "step", value: "0.164", unit: "s" },
+      { key: "vs naive CPU", value: "~170", unit: "×" },
+      { key: "moderate vs PyTorch CUDA", value: "1.71", unit: "× ARLE faster" },
+      { key: "held-out overlap 5k", value: "50→82.8", unit: "%" },
+    ],
+    cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
+    href: "https://github.com/cklxx/arle/blob/main/docs/projects/2026-05-21-opd-cuda-cycle-wrap.md",
+  },
+  {
     date: "2026-05-18",
     stability: "beta",
     stabilityLabel: "beta · ad-hoc",
@@ -267,6 +281,20 @@ const BENCH_ROWS_EN: BenchRow[] = [
 ];
 
 const BENCH_ROWS_ZH: BenchRow[] = [
+  {
+    date: "2026-05-21",
+    stability: "beta",
+    stabilityLabel: "beta · 周期闭环",
+    caption: '<b>cuda</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3-0.6B 真实 checkpoint OPD step</code> · 32 commit 单 session、kill-or-license 闸门',
+    cells: [
+      { key: "step", value: "0.164", unit: "s" },
+      { key: "对比 naive CPU", value: "~170", unit: "×" },
+      { key: "moderate vs PyTorch CUDA", value: "1.71", unit: "× ARLE 领先" },
+      { key: "held-out 5k overlap", value: "50→82.8", unit: "%" },
+    ],
+    cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
+    href: "https://github.com/cklxx/arle/blob/main/docs/projects/2026-05-21-opd-cuda-cycle-wrap.md",
+  },
   {
     date: "2026-05-18",
     stability: "beta",

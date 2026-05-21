@@ -5,7 +5,15 @@
 ARLE OPD CUDA today: **~30 s naive -> 0.164387 s/step** on the real
 Qwen3-0.6B checkpoint path, a conservative **~170x** speedup headline, while
 the real-checkpoint eval moved from a failed high-LR recipe to **CONVERGES**
-at `lr=1e-7`.
+at `lr=1e-7` with held-out exact-overlap **50 % -> 82.8 %** by step 5000.
+
+**Step-time arc:**
+
+![Step-time arc — 10.41 s kill probe through 0.164 s post-attn-prep, across 9 perf wins + 5 SOLID-gated kills](img/2026-05-21-opd-cuda-step-arc.png)
+
+**Convergence trajectory:**
+
+![Convergence — held-out exact-overlap and KL across 5000 steps at lr=1e-7](img/2026-05-21-opd-cuda-convergence.png)
 
 Ground-truth wall-clock from this CUDA cycle:
 
@@ -132,9 +140,56 @@ whole OPD step moved under matched controls.
   - [`2026-05-21-arle-cuda-opd-swiglu-fused-kill.md`](../experience/errors/2026-05-21-arle-cuda-opd-swiglu-fused-kill.md)
   - [`2026-05-20-opd-cpu-perf-cycle-wrap.md`](2026-05-20-opd-cpu-perf-cycle-wrap.md)
 
+## Post-Wrap Eval Arc (added 2026-05-21 EOD)
+
+The original wrap (above) closed at the perf cycle. After it landed, three
+more tranches completed the eval / metric story:
+
+| Commit | Axis | Impact |
+| --- | --- | --- |
+| `0ba8350` | 2000-step convergence at lr=1e-7 | Showed held-out exact-overlap plateaued at `64.06%` from step 100 → 2000 while held-out KL kept improving monotonically. Identified the plateau as a metric artifact, not a substrate ceiling. |
+| `ff931b4` | `rollout_len=16` A/B | Held-out exact-overlap stayed FLAT at `64.06%`. Ruled out rollout length as binding constraint for held-out generalization. |
+| `1aed1ef` | 32-prompt training set A/B | Held-out exact-overlap still FLAT at `64.06%`, but held-out KL improved `-8.63%` vs 8-prompt control. Confirmed the metric (not supervision diversity) was the limiter. |
+| `cb07373` | Continuous eval metrics | Added held-out teacher-NLL + top-3 overlap alongside exact-overlap + KL. KL identified as the right primary metric; exact-overlap kept as final-step sanity check. |
+| `753bea1` | 5000-step convergence at lr=1e-7 + new metrics | Held-out exact-overlap **broke through** to `82.8125%` by step 3500. KL/NLL still falling at step 5000. Confirmed: substrate works, training keeps generalizing, "64% plateau" was metric resolution. |
+
+### Convergence trajectory (post-eval-arc, 5000-step lr=1e-7 + 32 prompts + rollout_len=8)
+
+| Step | Train overlap % | Held-out overlap % | Train KL | Held-out KL |
+|---:|---:|---:|---:|---:|
+| 0 | 59.77 | 50.00 | 1.416e-2 | 2.173e-2 |
+| 100 | 61.33 | 51.56 | 1.155e-2 | 2.052e-2 |
+| 500 | 73.44 | 64.06 | 7.759e-3 | 1.772e-2 |
+| 1000 | 77.93 | 64.06 | 6.255e-3 | 1.624e-2 |
+| 2500 | 80.66 | 75.00 | 4.680e-3 | 1.384e-2 |
+| 5000 | **85.74** | **82.81** | 3.576e-3 | **1.180e-2** |
+
+Held-out KL improved -46% over the run; held-out NLL `1.300 -> 1.260` (-3%);
+both still trending down at step 5000. A 10k-step extension is in flight
+to characterize true plateau.
+
+### Post-wrap evidence index
+
+- [`docs/experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-2k-steps.md`](../experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-2k-steps.md)
+- [`docs/research/2026-05-21-arle-cuda-opd-rollout-len-16-a-b.md`](../research/2026-05-21-arle-cuda-opd-rollout-len-16-a-b.md)
+- [`docs/research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md`](../research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md)
+- [`docs/experience/wins/2026-05-21-arle-cuda-opd-eval-metric-fix.md`](../experience/wins/2026-05-21-arle-cuda-opd-eval-metric-fix.md)
+- [`docs/experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-5k-newmetric.md`](../experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-5k-newmetric.md)
+
+### Companion docs
+
+- [`2026-05-21-arle-opd-cuda-usage-manual.md`](2026-05-21-arle-opd-cuda-usage-manual.md) — quick start, recommended hyperparameters, troubleshooting
+- [`2026-05-21-opd-industry-positioning-best-framework.md`](2026-05-21-opd-industry-positioning-best-framework.md) — industry OPD landscape + what ARLE needs to become "the best OPD framework"
+
 ## SOLID Check
 
 This wrap uses wall-clock step measurements as ground truth. Phase and
 sub-phase counters are used only to choose the next axis. The remaining open
 items are explicitly deferred because the last local micro-fusion did not move
 whole-step wall-clock under n=3 matched controls.
+
+The eval-arc tranches added 2026-05-21 EOD use the same standard: held-out KL
+and teacher-NLL are the licensed metrics; held-out exact-overlap is reported
+but not used as a kill criterion after `cb07373` identified its resolution
+limits. The 5000-step `82.8%` overlap is a confirmation result, not a target
+that drove the perf cycle.
