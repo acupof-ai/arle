@@ -1,0 +1,20 @@
+{
+  "bf16_model": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B",
+  "arle_logits": "bench-output/2026-05-21-qwen35-9b-tq4-lm-head-fix/arle-tq4-logits.json",
+  "input_ids": [
+    9419
+  ],
+  "vocab_size": 248320,
+  "torch_load_seconds": 47.83910365198972,
+  "torch_forward_seconds": 2.2572153079672717,
+  "top64_max_abs": 1.9375,
+  "top64_mean_abs": 0.5498046875,
+  "top64_max_rel": 0.18023255467414856,
+  "top64_mean_rel": 0.05194604769349098,
+  "top64_ref_mean_abs": 10.701171875,
+  "full_vocab_max_abs": 2.75,
+  "full_vocab_mean_abs": 0.4084216356277466,
+  "full_vocab_rmse": 0.5143748937168684,
+  "gate_top64_max_rel_threshold": 0.05,
+  "gate_pass": false
+}
