@@ -261,8 +261,12 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
    rather than a single oversized tensor.
 6. Next memory axis: make the train-side LoRA student base truly frozen BF16
    (or add an equivalent low-memory frozen-base loader) before rerunning the
-   9B OPD bench. Add upload-size instrumentation if this root-cause needs a
-   tighter allocation-level proof.
+   9B OPD bench. Step 0 audit:
+   `docs/research/2026-05-22-opd-frozen-bf16-lora-student-step0-audit.md`.
+   Upload-size instrumentation has already proven the failing allocation is a
+   small `[1024, 3584]` f32 projection upload, so the next implementation must
+   remove f32 residency for the frozen student base rather than rerun lower
+   rollout lengths.
 7. Next DX axis: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so
    `arle train opd` can select local infer, external API, or routed specialist
    teachers without editing examples.
@@ -316,5 +320,7 @@ bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-smoke-minimal/
   [`../research/2026-05-22-qwen35-9b-gptqmodel-full-logits-after-f32load-fix.md`](../research/2026-05-22-qwen35-9b-gptqmodel-full-logits-after-f32load-fix.md)
 - GPTQModel 9B -> 0.8B OPD memory kill:
   [`../experience/errors/2026-05-22-qwen35-9b-gptqmodel-08b-opd-memory-kill.md`](../experience/errors/2026-05-22-qwen35-9b-gptqmodel-08b-opd-memory-kill.md)
+- Frozen-BF16 LoRA student Step 0 audit:
+  [`../research/2026-05-22-opd-frozen-bf16-lora-student-step0-audit.md`](../research/2026-05-22-opd-frozen-bf16-lora-student-step0-audit.md)
 - Infer-teacher adapter:
   [`../../crates/train/src/teacher_infer.rs`](../../crates/train/src/teacher_infer.rs)
