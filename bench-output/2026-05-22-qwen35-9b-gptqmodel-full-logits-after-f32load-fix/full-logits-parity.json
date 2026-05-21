@@ -1,0 +1,83 @@
+{
+  "model_path_gptq": "/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit",
+  "reference_model_path": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B",
+  "input_ids": [
+    9419
+  ],
+  "vocab_size": 248320,
+  "finite_pairs": 248320,
+  "arle_nonfinite": 0,
+  "ref_nonfinite": 0,
+  "top64_max_rel": 0.12422360479831696,
+  "top64_mean_rel": 0.035639457404613495,
+  "top64_rmse_over_ref_rms": 0.04286704584956169,
+  "all_max_abs": 2.09375,
+  "all_mean_abs": 0.33429980278015137,
+  "all_rmse_over_ref_rms": 0.10757432878017426,
+  "arle_argmax": 11,
+  "arle_argmax_value": 14.25,
+  "ref_argmax": 11,
+  "ref_argmax_value": 14.25,
+  "load_seconds": 35.330610036849976,
+  "forward_seconds": 2.1923911571502686,
+  "arle_forward_seconds": 1.512694488,
+  "arle_load_seconds": 78.60008948,
+  "top8": [
+    {
+      "index": 175169,
+      "arle": -15.0625,
+      "ref": -15.125,
+      "abs_err": 0.0625,
+      "rel_err": 0.00413223123177886
+    },
+    {
+      "index": 11,
+      "arle": 14.25,
+      "ref": 14.25,
+      "abs_err": 0.0,
+      "rel_err": 0.0
+    },
+    {
+      "index": 53983,
+      "arle": -13.6875,
+      "ref": -14.1875,
+      "abs_err": 0.5,
+      "rel_err": 0.035242289304733276
+    },
+    {
+      "index": 0,
+      "arle": 13.5625,
+      "ref": 13.3125,
+      "abs_err": 0.25,
+      "rel_err": 0.018779342994093895
+    },
+    {
+      "index": 4858,
+      "arle": 12.0625,
+      "ref": 12.25,
+      "abs_err": 0.1875,
+      "rel_err": 0.015306122601032257
+    },
+    {
+      "index": 158457,
+      "arle": -11.9375,
+      "ref": -12.1875,
+      "abs_err": 0.25,
+      "rel_err": 0.020512821152806282
+    },
+    {
+      "index": 9332,
+      "arle": -11.6875,
+      "ref": -12.125,
+      "abs_err": 0.4375,
+      "rel_err": 0.036082472652196884
+    },
+    {
+      "index": 13,
+      "arle": 12.0625,
+      "ref": 12.0,
+      "abs_err": 0.0625,
+      "rel_err": 0.0052083334885537624
+    }
+  ]
+}
