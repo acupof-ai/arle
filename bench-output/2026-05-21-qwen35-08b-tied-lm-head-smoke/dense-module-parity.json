@@ -1,0 +1,220 @@
+{
+  "source_model": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base",
+  "tq_model": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base",
+  "token_id": 9419,
+  "arle_json": "bench-output/2026-05-21-qwen35-08b-tied-lm-head-smoke/arle-dense-modules.json",
+  "gate": "rmse/ref_rms <= 0.01",
+  "gate_pass": true,
+  "rows": [
+    {
+      "module": "embedding",
+      "len": 1024,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "ref_rms": 0.01769544274553782,
+      "rmse_over_ref_rms": 0.0,
+      "gate": 0.01,
+      "gate_pass": true,
+      "first8": [
+        {
+          "index": 0,
+          "arle": 0.0155029296875,
+          "pytorch": 0.0155029296875,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 1,
+          "arle": -0.03759765625,
+          "pytorch": -0.03759765625,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 2,
+          "arle": -0.01123046875,
+          "pytorch": -0.01123046875,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 3,
+          "arle": 0.0179443359375,
+          "pytorch": 0.0179443359375,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 4,
+          "arle": 0.00823974609375,
+          "pytorch": 0.00823974609375,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 5,
+          "arle": 0.0206298828125,
+          "pytorch": 0.0206298828125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 6,
+          "arle": 0.017578125,
+          "pytorch": 0.017578125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 7,
+          "arle": -0.0257568359375,
+          "pytorch": -0.0257568359375,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        }
+      ]
+    },
+    {
+      "module": "final_rmsnorm",
+      "len": 1024,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "ref_rms": 4.366344500200779,
+      "rmse_over_ref_rms": 0.0,
+      "gate": 0.01,
+      "gate_pass": true,
+      "first8": [
+        {
+          "index": 0,
+          "arle": -0.2890625,
+          "pytorch": -0.2890625,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 1,
+          "arle": -2.984375,
+          "pytorch": -2.984375,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 2,
+          "arle": -1.078125,
+          "pytorch": -1.078125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 3,
+          "arle": 0.8203125,
+          "pytorch": 0.8203125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 4,
+          "arle": 2.59375,
+          "pytorch": 2.59375,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 5,
+          "arle": 4.53125,
+          "pytorch": 4.53125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 6,
+          "arle": 6.78125,
+          "pytorch": 6.78125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 7,
+          "arle": -5.53125,
+          "pytorch": -5.53125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        }
+      ]
+    },
+    {
+      "module": "lm_head",
+      "len": 248320,
+      "max_abs": 0.00390625,
+      "max_rel": 0.007352941203862429,
+      "mean_abs": 3.4809382043476944e-08,
+      "rmse": 1.1140614394662714e-05,
+      "ref_rms": 0.9276135175184737,
+      "rmse_over_ref_rms": 1.2009974180266132e-05,
+      "gate": 0.01,
+      "gate_pass": true,
+      "first8": [
+        {
+          "index": 0,
+          "arle": 0.326171875,
+          "pytorch": 0.326171875,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 1,
+          "arle": -0.169921875,
+          "pytorch": -0.169921875,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 2,
+          "arle": -0.396484375,
+          "pytorch": -0.396484375,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 3,
+          "arle": -0.8359375,
+          "pytorch": -0.8359375,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 4,
+          "arle": 0.3046875,
+          "pytorch": 0.3046875,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 5,
+          "arle": 0.20703125,
+          "pytorch": 0.20703125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 6,
+          "arle": -0.8203125,
+          "pytorch": -0.8203125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        },
+        {
+          "index": 7,
+          "arle": -1.078125,
+          "pytorch": -1.078125,
+          "abs_err": 0.0,
+          "rel_err": 0.0
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+dense_module_dump model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base token_id=9419 embedding_len=1024 final_rmsnorm_len=1024 lm_head_len=248320 output=bench-output/2026-05-21-qwen35-08b-tied-lm-head-smoke/arle-dense-modules.json
+dense_tensor_count=488 gate_pass=True
+module=embedding rmse/ref_rms=0.00000000e+00 max_abs=0.00000000e+00 gate_pass=True
+module=final_rmsnorm rmse/ref_rms=0.00000000e+00 max_abs=0.00000000e+00 gate_pass=True
+module=lm_head rmse/ref_rms=1.20099742e-05 max_abs=3.90625000e-03 gate_pass=True

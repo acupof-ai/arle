@@ -709,7 +709,7 @@ impl Qwen35Model {
 
         // Lazy-init logits buffer
         if bufs.logits_batch.is_none() {
-            let vocab_size = self.embed_tokens.rows;
+            let vocab_size = self.output_projection().rows;
             bufs.logits_batch = Some(HiddenStates::zeros(
                 &self.ctx,
                 vocab_size,
@@ -867,7 +867,7 @@ impl Qwen35Model {
         logits_buf.seq_len = batch_size;
         ops::gemm_into(
             &self.ctx,
-            &self.embed_tokens,
+            self.output_projection(),
             &bufs.common.normed,
             logits_buf,
         );
