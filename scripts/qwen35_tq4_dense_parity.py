@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--arle-json", type=Path)
     parser.add_argument("--skip-arle-run", action="store_true")
+    parser.add_argument(
+        "--continue-after-dense-fail",
+        action="store_true",
+        help="Run dense module parity even when dense tensor bit-identity fails.",
+    )
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--module-gate", default=0.01, type=float)
     return parser.parse_args()
@@ -137,6 +142,7 @@ def run_arle_dump(args: argparse.Namespace, arle_json: Path) -> None:
     env.setdefault("CUDARC_CUDA_VERSION", "13010")
     env.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
     env.setdefault("CARGO_BUILD_JOBS", "1")
+    env.setdefault("INFER_EXPERIMENTAL_GPTQMODEL_W4", "1")
     cmd = [
         args.cargo,
         "run",
@@ -239,12 +245,14 @@ def main() -> None:
         json.dumps(dense_summary, indent=2), encoding="utf-8"
     )
     print(f"dense_tensor_count={len(dense_rows)} gate_pass={dense_pass}")
-    if not dense_pass:
+    if not dense_pass and not args.continue_after_dense_fail:
         print("dense tensor bit-compare failed; skipping module scan")
         (args.output_dir / "summary.json").write_text(
             json.dumps({"dense": dense_summary, "modules": None}, indent=2), encoding="utf-8"
         )
         raise SystemExit(1)
+    if not dense_pass:
+        print("dense tensor bit-compare failed; continuing to module scan by request")
 
     run_arle_dump(args, arle_json)
     module_rows, module_pass = module_compare(
