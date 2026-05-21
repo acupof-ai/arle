@@ -1,0 +1,426 @@
+warning: cuda-kernels@0.1.5: Compiling CUDA kernels for targets: sm_89
+warning: cuda-kernels@0.1.5: TileLang AOT: built per-SM cubins for 1 target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.
+   Compiling infer v0.1.5 (/home/ckl/projects/arle/infer)
+warning: unused import: `half::bf16`
+  --> infer/src/model/deepseek/mlp.rs:23:5
+   |
+23 | use half::bf16;
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ensure_dispatch_payload_scratch`, `ensure_local_route_scratch`, `ensure_recv_route_scratch`, `ensure_route_logits_scratch`, and `ensure_send_route_scratch`
+  --> infer/src/model/deepseek/mlp.rs:34:67
+   |
+34 |     DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
+   |                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+35 |     ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+36 |     ensure_send_route_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `argmax_batch_readback_into`
+   --> infer/src/ops.rs:645:34
+    |
+645 |     argmax_batch_logprob_launch, argmax_batch_readback_into, gpu_sample_launch_raw,
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> infer/src/model/deepseek/weights.rs:188:13
+    |
+188 |         let mut comm = LayerCommunicator::new_with_ep(
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+   --> infer/src/model/deepseek/weights.rs:185:9
+    |
+185 |         ctx: &DeviceContext,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `forward_scratch_input` and `try_forward_scratch_input_segment` are never used
+   --> infer/src/model/deepseek/mlp.rs:105:19
+    |
+ 66 | impl DeepseekV4Expert {
+    | --------------------- methods in this implementation
+...
+105 |     pub(super) fn forward_scratch_input<'a>(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+157 |     pub(super) fn try_forward_scratch_input_segment(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `dsv4_run_block_scaled_gemv_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:317:4
+    |
+317 | fn dsv4_run_block_scaled_gemv_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_run_block_scaled_gemv_pair_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:404:4
+    |
+404 | fn dsv4_run_block_scaled_gemv_pair_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1090:4
+     |
+1090 | fn dsv4_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_pair_expert_gemv_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1102:4
+     |
+1102 | fn dsv4_pair_expert_gemv_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_route_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1114:4
+     |
+1114 | fn dsv4_route_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CountExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1229:6
+     |
+1229 | enum Dsv4CountExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_count_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1235:4
+     |
+1235 | fn dsv4_count_exchange_mode() -> Result<Dsv4CountExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_padded_dispatch_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1251:4
+     |
+1251 | fn dsv4_padded_dispatch_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_fused_dispatch_payload_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1263:4
+     |
+1263 | fn dsv4_fused_dispatch_payload_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CombineExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1276:6
+     |
+1276 | enum Dsv4CombineExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_combine_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1282:4
+     |
+1282 | fn dsv4_combine_exchange_mode() -> Result<Dsv4CombineExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_reduce_scatter_combine_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1294:4
+     |
+1294 | fn dsv4_reduce_scatter_combine_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_zero_i32_slice` is never used
+    --> infer/src/model/deepseek/mlp.rs:3933:4
+     |
+3933 | fn dsv4_zero_i32_slice(ctx: &DeviceContext, slice: &mut CudaSlice<i32>, len: usize) -> Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_offsets_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:3975:4
+     |
+3975 | fn dsv4_counts_to_offsets_i32(counts: &[i32], label: &str) -> Result<(Vec<i32>, usize)> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:3998:4
+     |
+3998 | fn dsv4_counts_to_usize(counts: &[i32], label: &str) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_offsets_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4013:4
+     |
+4013 | fn dsv4_offsets_to_usize(offsets: &[i32]) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_scale_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4028:4
+     |
+4028 | fn dsv4_scale_usize(values: &[usize], factor: usize) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_usize_to_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:4040:4
+     |
+4040 | fn dsv4_usize_to_i32(value: usize, label: &str) -> Result<i32> {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+  --> infer/src/model/deepseek/state.rs:88:16
+   |
+87 | pub(crate) struct DeepseekMoeRuntimeCache {
+   |                   ----------------------- fields in this struct
+88 |     pub(crate) route_logits: Option<DeepseekRouteLogitsRuntimeScratch>,
+   |                ^^^^^^^^^^^^
+89 |     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
+   |                ^^^^^^^^
+90 |     pub(crate) dispatch_payload: Option<DeepseekDispatchPayloadRuntimeScratch>,
+   |                ^^^^^^^^^^^^^^^^
+91 |     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+92 |     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+93 |     pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
+   |                ^^^^^^^^^^^
+94 |     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
+   |                ^^^^^^
+...
+97 |     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+   |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_tokens`, `n_experts`, and `logits` are never read
+   --> infer/src/model/deepseek/state.rs:102:16
+    |
+101 | pub(crate) struct DeepseekRouteLogitsRuntimeScratch {
+    |                   --------------------------------- fields in this struct
+102 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+103 |     pub(crate) n_experts: usize,
+    |                ^^^^^^^^^
+104 |     pub(crate) logits: HiddenStates,
+    |                ^^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:109:16
+    |
+108 | pub(crate) struct DeepseekDispatchRuntimeScratch {
+    |                   ------------------------------ fields in this struct
+109 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+110 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+111 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+112 |     pub(crate) topk: usize,
+    |                ^^^^
+113 |     pub(crate) ep_world: usize,
+    |                ^^^^^^^^
+114 |     pub(crate) experts_per_rank: usize,
+    |                ^^^^^^^^^^^^^^^^
+115 |     pub(crate) token_ids: CudaSlice<u32>,
+    |                ^^^^^^^^^
+116 |     pub(crate) route_indices: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+117 |     pub(crate) route_weights: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+118 |     pub(crate) send_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+119 |     pub(crate) send_rank_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+120 |     pub(crate) rank_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+121 |     pub(crate) send_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+122 |     pub(crate) send_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+123 |     pub(crate) all_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+124 |     pub(crate) recv_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+125 |     pub(crate) local_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+126 |     pub(crate) local_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+127 |     pub(crate) local_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `stride_elems`, `send_payload`, and `recv_payload` are never read
+   --> infer/src/model/deepseek/state.rs:132:16
+    |
+131 | pub(crate) struct DeepseekDispatchPayloadRuntimeScratch {
+    |                   ------------------------------------- fields in this struct
+132 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+133 |     pub(crate) stride_elems: usize,
+    |                ^^^^^^^^^^^^
+134 |     pub(crate) send_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+135 |     pub(crate) recv_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `send_token`, and `send_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:140:16
+    |
+139 | pub(crate) struct DeepseekSendRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+140 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+141 |     pub(crate) send_token: CudaSlice<i32>,
+    |                ^^^^^^^^^^
+142 |     pub(crate) send_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `recv_hidden`, `recv_meta`, and `route_out` are never read
+   --> infer/src/model/deepseek/state.rs:147:16
+    |
+146 | pub(crate) struct DeepseekRecvRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+147 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+148 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+149 |     pub(crate) recv_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+150 |     pub(crate) recv_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+151 |     pub(crate) route_out: HiddenStates,
+    |                ^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `expert_hidden`, `expert_weight`, and `expert_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:156:16
+    |
+155 | pub(crate) struct DeepseekLocalRouteRuntimeScratch {
+    |                   -------------------------------- fields in this struct
+156 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+157 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+158 |     pub(crate) expert_hidden: HiddenStates,
+    |                ^^^^^^^^^^^^^
+159 |     pub(crate) expert_weight: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+160 |     pub(crate) expert_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+
+warning: field `input` is never read
+   --> infer/src/model/deepseek/state.rs:188:16
+    |
+183 | pub(crate) struct DeepseekExpertRuntimeScratch {
+    |                   ---------------------------- field in this struct
+...
+188 |     pub(crate) input: HiddenStates,
+    |                ^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:238:16
+    |
+237 | pub(crate) struct DeepseekRouteCombineRuntimeScratch {
+    |                   ---------------------------------- fields in this struct
+238 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+239 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+240 |     pub(crate) combine_recv: HiddenStates,
+    |                ^^^^^^^^^^^^
+241 |     pub(crate) route_slot_out: HiddenStates,
+    |                ^^^^^^^^^^^^^^
+242 |     pub(crate) combine_fp8_send: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+243 |     pub(crate) combine_fp8_recv: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+244 |     pub(crate) combine_scale_send: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+245 |     pub(crate) combine_scale_recv: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+
+warning: methods `ensure_dispatch_scratch`, `ensure_expert_scratch`, and `ensure_route_combine_scratch` are never used
+   --> infer/src/model/deepseek/state.rs:250:19
+    |
+249 | impl DeepseekMoeRuntimeCache {
+    | ---------------------------- methods in this implementation
+250 |     pub(crate) fn ensure_dispatch_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+302 |     pub(crate) fn ensure_expert_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+416 |     pub(crate) fn ensure_route_combine_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_route_logits_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:456:15
+    |
+456 | pub(crate) fn ensure_route_logits_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_send_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:480:15
+    |
+480 | pub(crate) fn ensure_send_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_dispatch_payload_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:503:15
+    |
+503 | pub(crate) fn ensure_dispatch_payload_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_recv_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:532:15
+    |
+532 | pub(crate) fn ensure_recv_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_local_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:560:15
+    |
+560 | pub(crate) fn ensure_local_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `generate_greedy` is never used
+   --> infer/src/model/deepseek/reference.rs:111:19
+    |
+ 94 | impl DeepseekV4ReferenceModel {
+    | ----------------------------- method in this implementation
+...
+111 |     pub(crate) fn generate_greedy(
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `argmax` is never used
+    --> infer/src/model/deepseek/reference.rs:1803:4
+     |
+1803 | fn argmax(values: &[f32]) -> usize {
+     |    ^^^^^^
+
+warning: `infer` (lib) generated 41 warnings (run `cargo fix --lib -p infer` to apply 5 suggestions)
+    Finished `release` profile [optimized] target(s) in 1m 02s
+     Running `target/release/examples/qwen35_linear_attn_substage_dump --model-path /home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit --token-id 9419 --output bench-output/2026-05-22-qwen35-9b-gptqmodel-linear-attn-substages-after-f32load-fix/qwen35-9b-gptqmodel.json`
+model_path=/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit
+token_id=9419 layer0_type=linear_attention first_nonfinite_stage=<none>
+
+| stage | len | finite | nan | +inf | -inf | max_abs | mean_abs | first8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| embedding | 4096 | 4096 | 0 | 0 | 0 | 6.10351562e-2 | 1.25131700e-2 | [0.0015411377, 0.004119873, 0.0061950684, -0.0061035156, -0.0025939941, -0.014831543, 0.002029419, -0.002532959] |
+| input_layernorm | 4096 | 4096 | 0 | 0 | 0 | 4.12500000e0 | 8.26028824e-1 | [0.11230469, 0.28515625, 0.39453125, -0.41015625, -0.17089844, -0.96875, 0.140625, -0.16992188] |
+| dt_bias_weight | 32 | 32 | 0 | 0 | 0 | 1.85000000e1 | 6.11816406e0 | [-3.53125, 12.5, -1.4453125, -3.03125, 18.5, -5.5625, 5.15625, -1.453125] |
+| a_log_weight | 32 | 32 | 0 | 0 | 0 | 4.71875000e0 | 3.40747070e0 | [-2.65625, -2.53125, -4.71875, -4.25, -2.875, -3.921875, -3.28125, -3.21875] |
+| norm_weight | 128 | 128 | 0 | 0 | 0 | 9.60937500e-1 | 8.81103516e-1 | [0.8828125, 0.9296875, 0.91015625, 0.86328125, 0.890625, 0.91796875, 0.90234375, 0.91015625] |
+| in_proj_qkv | 8192 | 8192 | 0 | 0 | 0 | 5.02500000e1 | 1.86621606e0 | [-0.5078125, 0.40234375, -0.41796875, -0.54296875, -1.2890625, 0.4765625, -0.8515625, -1.703125] |
+| in_proj_z | 4096 | 4096 | 0 | 0 | 0 | 1.15000000e1 | 1.29994798e0 | [3.703125, -2.484375, 0.15136719, 0.54296875, -2.578125, 2.296875, -0.050048828, -2.140625] |
+| in_proj_b | 32 | 32 | 0 | 0 | 0 | 3.84375000e0 | 1.17474365e0 | [-1.375, 0.95703125, 1.03125, 1.28125, 2.859375, -0.36914063, 2.359375, 3.84375] |
+| in_proj_a | 32 | 32 | 0 | 0 | 0 | 5.56250000e0 | 2.47891235e0 | [5.5625, 0.5859375, 5.125, 5.09375, 4.0625, -1.1953125, 0.515625, 1.5546875] |
+| conv1d_silu_qkv | 8192 | 8192 | 0 | 0 | 0 | 1.22500000e1 | 4.58762944e-2 | [0.026489258, 0.021850586, -0.018432617, -0.020629883, 0.048828125, 0.0002937317, 0.0018463135, 0.07324219] |
+| gdr_q_expanded | 4096 | 4096 | 0 | 0 | 0 | 8.67187500e-1 | 4.14028727e-2 | [0.021118164, 0.017333984, -0.0146484375, -0.016479492, 0.03881836, 0.00023365021, 0.0014724731, 0.05834961] |
+| gdr_k_expanded | 4096 | 4096 | 0 | 0 | 0 | 9.37500000e-1 | 4.10945229e-2 | [-0.0013961792, 0.0009651184, 0.0015945435, 0.00036239624, -0.0015029907, -0.030517578, 0.020507813, 0.002105713] |
+| gdr_v_raw | 4096 | 4096 | 0 | 0 | 0 | 1.22500000e1 | 4.83775772e-2 | [0.018920898, 0.041992188, 0.031982422, 0.046875, 0.044189453, 0.016723633, 0.013305664, -0.0073242188] |
+| gdr_g_cumsum | 32 | 32 | 0 | 0 | 0 | 1.63442481e0 | 3.68286848e-1 | [-0.1512699, -1.041111, -0.033068527, -0.031127121, -1.2728893, -2.2995118e-5, -0.21328528, -0.029812446] |
+| gdr_beta | 32 | 32 | 0 | 0 | 0 | 9.79035735e-1 | 6.80315018e-1 | [0.20181322, 0.722527, 0.7371582, 0.7826625, 0.9458012, 0.40874866, 0.91367656, 0.97903574] |
+| gdr_a_tril | 2048 | 2048 | 0 | 0 | 0 | 0.00000000e0 | 0.00000000e0 | [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] |
+| gdr_a_inv | 2048 | 2048 | 0 | 0 | 0 | 1.00000000e0 | 1.56250000e-2 | [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] |
+| gdr_w | 4096 | 4096 | 0 | 0 | 0 | 7.50000000e-1 | 2.09691375e-2 | [-0.00024223328, 0.00016784668, 0.00027656555, 6.2942505e-5, -0.00026130676, -0.005279541, 0.0035552979, 0.00036621094] |
+| gdr_u | 4096 | 4096 | 0 | 0 | 0 | 6.59375000e0 | 3.09617892e-2 | [0.0038146973, 0.008483887, 0.0064697266, 0.009460449, 0.008911133, 0.0033721924, 0.0026855469, -0.0014801025] |
+| gdr_chunk_state | 524288 | 524288 | 0 | 0 | 0 | 0.00000000e0 | 0.00000000e0 | [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] |
+| gdr_v_new | 4096 | 4096 | 0 | 0 | 0 | 6.59375000e0 | 3.09617892e-2 | [0.0038146973, 0.008483887, 0.0064697266, 0.009460449, 0.008911133, 0.0033721924, 0.0026855469, -0.0014801025] |
+| gdr_output | 4096 | 4096 | 0 | 0 | 0 | 2.94921875e-1 | 6.05831272e-4 | [4.9114227e-5, 0.00010919571, 8.34465e-5, 0.000121593475, 0.00011444092, 4.339218e-5, 3.4570694e-5, -1.9073486e-5] |
+| rms_norm_gated | 4096 | 4096 | 0 | 0 | 0 | 2.01562500e0 | 9.08761751e-3 | [0.052490234, -0.006500244, 0.0020751953, 0.012084961, -0.006225586, 0.027954102, -0.00025558472, 0.0013122559] |
+| out_proj | 4096 | 4096 | 0 | 0 | 0 | 6.43750000e0 | 1.65799893e-2 | [0.004638672, -0.008850098, -0.008483887, -0.036621094, -0.08544922, 0.0011291504, -0.0046691895, 0.015319824] |

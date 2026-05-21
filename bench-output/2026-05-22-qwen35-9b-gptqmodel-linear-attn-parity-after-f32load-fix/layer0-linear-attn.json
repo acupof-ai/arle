@@ -1,0 +1,78 @@
+{
+  "model_path": "/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit",
+  "reference_model_path": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B",
+  "token_id": 9419,
+  "python_device": "cpu",
+  "layer0_type": "linear_attention",
+  "len": 4096,
+  "finite_pair_count": 4096,
+  "arle_nonfinite_count": 0,
+  "pytorch_nonfinite_count": 0,
+  "pytorch_finite_count": 4096,
+  "max_abs": 0.029296875,
+  "max_rel": 310.35135,
+  "mean_abs": 0.003220859,
+  "rmse": 0.0041805697,
+  "ref_rms": 0.10282923,
+  "rmse_over_ref_rms": 0.04065546,
+  "gate_rmse_over_ref_rms": 0.05,
+  "gate_pass": true,
+  "first8": [
+    {
+      "index": 0,
+      "arle": 0.004638672,
+      "pytorch": 0.0005874634,
+      "abs_err": 0.0040512085,
+      "rel_err": 6.896104
+    },
+    {
+      "index": 1,
+      "arle": -0.008850098,
+      "pytorch": -0.007873535,
+      "abs_err": 0.0009765625,
+      "rel_err": 0.12403101
+    },
+    {
+      "index": 2,
+      "arle": -0.008483887,
+      "pytorch": -0.008972168,
+      "abs_err": 0.00048828125,
+      "rel_err": 0.054421768
+    },
+    {
+      "index": 3,
+      "arle": -0.036621094,
+      "pytorch": -0.033447266,
+      "abs_err": 0.0031738281,
+      "rel_err": 0.09489051
+    },
+    {
+      "index": 4,
+      "arle": -0.08544922,
+      "pytorch": -0.068359375,
+      "abs_err": 0.017089844,
+      "rel_err": 0.25
+    },
+    {
+      "index": 5,
+      "arle": 0.0011291504,
+      "pytorch": -0.006286621,
+      "abs_err": 0.0074157715,
+      "rel_err": 1.1796117
+    },
+    {
+      "index": 6,
+      "arle": -0.0046691895,
+      "pytorch": -0.006500244,
+      "abs_err": 0.0018310547,
+      "rel_err": 0.28169015
+    },
+    {
+      "index": 7,
+      "arle": 0.015319824,
+      "pytorch": 0.01977539,
+      "abs_err": 0.0044555664,
+      "rel_err": 0.22530864
+    }
+  ]
+}

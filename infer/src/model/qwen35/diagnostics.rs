@@ -1,6 +1,7 @@
 //! Diagnostic-only Qwen3.5 stage capture for train-vs-infer parity checks.
 
 use anyhow::Result;
+use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use super::{
@@ -27,6 +28,12 @@ pub struct Qwen35DenseModuleParityOutputs {
     pub embedding: DeviceVec,
     pub final_rmsnorm: DeviceVec,
     pub lm_head: DeviceVec,
+}
+
+#[doc(hidden)]
+pub struct Qwen35LinearAttentionDiagnosticTensor {
+    pub name: &'static str,
+    pub values: Vec<f32>,
 }
 
 impl Qwen35Model {
@@ -183,6 +190,214 @@ impl Qwen35Model {
             lm_head,
         })
     }
+
+    #[doc(hidden)]
+    pub fn layer0_linear_attention_diagnostic_tensors(
+        &self,
+        token_id: u32,
+    ) -> Result<Vec<Qwen35LinearAttentionDiagnosticTensor>> {
+        anyhow::ensure!(
+            !self.layers.is_empty(),
+            "infer linear-attn diagnostics require at least one layer"
+        );
+
+        let c = &self.config;
+        let seq_len = 1usize;
+        let token_ids = [token_id];
+        let mut recurrent = RecurrentState::new(&self.ctx, c)?;
+        let mut scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
+        let layer0 = &self.layers[0];
+        let attn = match &layer0.attn {
+            LayerKind::LinearAttention(attn) => attn,
+            LayerKind::FullAttention(_) => anyhow::bail!(
+                "layer 0 is full_attention, expected linear_attention for diagnostics"
+            ),
+        };
+
+        let mut tensors = Vec::new();
+        push_hidden_summary(
+            &mut tensors,
+            "embedding",
+            hidden_to_f32(
+                &self.ctx,
+                &common::get_embeddings_batch(
+                    &self.ctx,
+                    &self.embed_tokens,
+                    &token_ids,
+                    c.hidden_size,
+                )?,
+            )?,
+        );
+
+        let hidden0 =
+            common::get_embeddings_batch(&self.ctx, &self.embed_tokens, &token_ids, c.hidden_size)?;
+        let layer0_norm =
+            self.batched_rms_norm_offset(&hidden0, &layer0.input_layernorm, c.rms_norm_eps)?;
+        push_hidden_summary(
+            &mut tensors,
+            "input_layernorm",
+            hidden_to_f32(&self.ctx, &layer0_norm)?,
+        );
+
+        push_hidden_summary(
+            &mut tensors,
+            "dt_bias_weight",
+            device_vec_to_f32(&self.ctx, &attn.dt_bias)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "a_log_weight",
+            cuda_f32_to_host(&self.ctx, &attn.a_log)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "norm_weight",
+            cuda_f32_to_host(&self.ctx, &attn.norm_weight)?,
+        );
+
+        let qkv_batch = ops::gemm(&self.ctx, &attn.in_proj_qkv, &layer0_norm)?;
+        push_hidden_summary(
+            &mut tensors,
+            "in_proj_qkv",
+            hidden_to_f32(&self.ctx, &qkv_batch)?,
+        );
+        let z_batch = ops::gemm(&self.ctx, &attn.in_proj_z, &layer0_norm)?;
+        push_hidden_summary(
+            &mut tensors,
+            "in_proj_z",
+            hidden_to_f32(&self.ctx, &z_batch)?,
+        );
+        let b_batch = ops::gemm(&self.ctx, &attn.in_proj_b, &layer0_norm)?;
+        push_hidden_summary(
+            &mut tensors,
+            "in_proj_b",
+            hidden_to_f32(&self.ctx, &b_batch)?,
+        );
+        let a_batch = ops::gemm(&self.ctx, &attn.in_proj_a, &layer0_norm)?;
+        push_hidden_summary(
+            &mut tensors,
+            "in_proj_a",
+            hidden_to_f32(&self.ctx, &a_batch)?,
+        );
+
+        let mut qkv_conv_batch = HiddenStates::zeros(&self.ctx, c.linear_attn_qkv_dim(), seq_len)?;
+        ops::conv1d_prefill_batch_into(
+            &self.ctx,
+            &qkv_batch,
+            &attn.conv1d_weight,
+            &mut recurrent.layers[0].conv_state,
+            &mut qkv_conv_batch,
+            c.linear_conv_kernel_dim,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "conv1d_silu_qkv",
+            hidden_to_f32(&self.ctx, &qkv_conv_batch)?,
+        );
+
+        let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, c.linear_attn_z_dim(), seq_len)?;
+        ops::gated_delta_rule_prefill_chunkwise_into(
+            &self.ctx,
+            &qkv_conv_batch,
+            &b_batch,
+            &a_batch,
+            &ops::GdrWeights {
+                dt_bias: &attn.dt_bias,
+                a_log: &attn.a_log,
+            },
+            &mut recurrent.layers[0].state,
+            &mut scratch,
+            &mut gdr_out_batch,
+            &ops::GdrHeadConfig {
+                num_key_heads: c.linear_num_key_heads,
+                num_value_heads: c.linear_num_value_heads,
+                key_dim: c.linear_key_head_dim,
+                val_dim: c.linear_value_head_dim,
+            },
+        )?;
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_q_expanded",
+            hidden_to_f32(&self.ctx, &scratch.q_expanded)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_k_expanded",
+            hidden_to_f32(&self.ctx, &scratch.k_expanded)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_v_raw",
+            hidden_to_f32(&self.ctx, &scratch.v_raw)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_g_cumsum",
+            cuda_f32_to_host(&self.ctx, &scratch.g_cumsum)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_beta",
+            cuda_f32_to_host(&self.ctx, &scratch.beta)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_a_tril",
+            cuda_f32_to_host(&self.ctx, &scratch.a_tril)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_a_inv",
+            cuda_bf16_to_f32(&self.ctx, &scratch.a_inv)?,
+        );
+        push_hidden_summary(&mut tensors, "gdr_w", hidden_to_f32(&self.ctx, &scratch.w)?);
+        push_hidden_summary(&mut tensors, "gdr_u", hidden_to_f32(&self.ctx, &scratch.u)?);
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_chunk_state",
+            cuda_f32_to_host(&self.ctx, &scratch.chunk_state)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_v_new",
+            hidden_to_f32(&self.ctx, &scratch.v_new)?,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "gdr_output",
+            hidden_to_f32(&self.ctx, &gdr_out_batch)?,
+        );
+
+        let mut normed_out_batch = HiddenStates::zeros(&self.ctx, c.linear_attn_z_dim(), seq_len)?;
+        ops::rms_norm_gated_batch_into(
+            &self.ctx,
+            &gdr_out_batch,
+            &attn.norm_weight,
+            &z_batch,
+            &mut normed_out_batch,
+            c.linear_num_value_heads,
+            c.linear_value_head_dim,
+            c.rms_norm_eps,
+        );
+        push_hidden_summary(
+            &mut tensors,
+            "rms_norm_gated",
+            hidden_to_f32(&self.ctx, &normed_out_batch)?,
+        );
+
+        let output = ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)?;
+        push_hidden_summary(&mut tensors, "out_proj", hidden_to_f32(&self.ctx, &output)?);
+
+        Ok(tensors)
+    }
+}
+
+fn push_hidden_summary(
+    out: &mut Vec<Qwen35LinearAttentionDiagnosticTensor>,
+    name: &'static str,
+    values: Vec<f32>,
+) {
+    out.push(Qwen35LinearAttentionDiagnosticTensor { name, values });
 }
 
 fn copy_hidden(
@@ -196,6 +411,25 @@ fn copy_hidden(
         .memcpy_dtod(&hidden.data, &mut out.data)
         .map_err(|e| anyhow::anyhow!("D2D copy for {label} failed: {e}"))?;
     Ok(out)
+}
+
+fn hidden_to_f32(ctx: &DeviceContext, hidden: &HiddenStates) -> Result<Vec<f32>> {
+    let host = ctx.stream.clone_dtoh(&hidden.data)?;
+    Ok(host.into_iter().map(f32::from).collect())
+}
+
+fn device_vec_to_f32(ctx: &DeviceContext, vec: &DeviceVec) -> Result<Vec<f32>> {
+    let host = ctx.stream.clone_dtoh(&vec.data)?;
+    Ok(host.into_iter().map(f32::from).collect())
+}
+
+fn cuda_f32_to_host(ctx: &DeviceContext, slice: &CudaSlice<f32>) -> Result<Vec<f32>> {
+    Ok(ctx.stream.clone_dtoh(slice)?)
+}
+
+fn cuda_bf16_to_f32(ctx: &DeviceContext, slice: &CudaSlice<bf16>) -> Result<Vec<f32>> {
+    let host = ctx.stream.clone_dtoh(slice)?;
+    Ok(host.into_iter().map(f32::from).collect())
 }
 
 fn deterministic_bf16_vec(len: usize, salt: usize) -> Vec<bf16> {

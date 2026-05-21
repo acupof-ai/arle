@@ -1,0 +1,19 @@
+{
+  "id": "cmpl-4dec784f-ed8a-4ac5-bfa3-5a1c554f8702",
+  "object": "text_completion",
+  "created": 1779388122,
+  "model": "Qwen3___5-9B-GPTQ-4bit",
+  "choices": [
+    {
+      "text": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 13,
+    "completion_tokens": 64,
+    "total_tokens": 77
+  }
+}
