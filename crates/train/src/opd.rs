@@ -234,6 +234,25 @@ fn use_device_rollout_argmax(store: &TensorStore, rollout_len: usize, vocab: usi
     matches!(store.backend().device(), Device::Cuda) && (rollout_len >= 4 || vocab >= 65_536)
 }
 
+fn rollout_full_forward(
+    student: &Qwen35Model,
+    rollout: &mut Vec<u32>,
+    rollout_len: usize,
+    vocab: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<()> {
+    for _ in 0..rollout_len {
+        let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
+        let logits = student
+            .forward(store, tape, rollout, &positions)
+            .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
+        let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
+        rollout.push(next);
+    }
+    Ok(())
+}
+
 fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> Result<()> {
     if student_params.is_empty() {
         return Err(OpdError::InvalidInput(
@@ -534,7 +553,8 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
         tape.entries.clear();
         tape.set_enabled(false);
         let mut rollout: Vec<u32> = prompt_ids.to_vec();
-        if use_device_rollout_argmax(store, cfg.rollout_len, vocab) {
+        let use_rollout_kv_cache = student.supports_rollout_kv_cache();
+        if use_rollout_kv_cache && use_device_rollout_argmax(store, cfg.rollout_len, vocab) {
             let mut rollout_cache = Qwen35KvCache::new(student);
             let mut generated_tokens = if cfg.rollout_len == 0 {
                 None
@@ -594,7 +614,7 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
                     store,
                 )?);
             }
-        } else {
+        } else if use_rollout_kv_cache {
             let mut rollout_cache = Qwen35KvCache::new(student);
             for step in 0..cfg.rollout_len {
                 let (input_ids, positions, logits_seq_len) = if step == 0 {
@@ -626,6 +646,8 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
                 let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
                 rollout.push(next);
             }
+        } else {
+            rollout_full_forward(student, &mut rollout, cfg.rollout_len, vocab, store, tape)?;
         }
 
         // 2. Teacher forward — still tape-disabled. Teacher params carry

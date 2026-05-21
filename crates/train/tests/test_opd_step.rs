@@ -67,6 +67,16 @@ fn tiny_qwen35_config() -> Qwen35Config {
     }
 }
 
+fn tiny_hybrid_qwen35_config() -> Qwen35Config {
+    let mut cfg = tiny_qwen35_config();
+    cfg.rotary_dim = cfg.head_dim / 2;
+    cfg.partial_rotary_factor = 0.5;
+    cfg.linear_key_head_dim = cfg.rotary_dim;
+    cfg.linear_value_head_dim = cfg.rotary_dim;
+    cfg.layer_types = vec![LayerType::FullAttention, LayerType::LinearAttention];
+    cfg
+}
+
 /// End-to-end opd_step smoke: rollout → teacher forward → student forward
 /// → KL → backward → AdamW step. Teacher is built with `new_for_eval`, so
 /// its deterministic scratch weights match the student initializer while
@@ -108,6 +118,40 @@ fn opd_step_runs_end_to_end() {
         "opd_step loss should be finite, got {}",
         outcome.loss
     );
+}
+
+#[test]
+fn opd_step_falls_back_to_full_rollout_for_hybrid_student() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_hybrid_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build hybrid teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build hybrid student");
+    assert!(
+        !student.supports_rollout_kv_cache(),
+        "hybrid student has linear-attention layers and must not use KV-cache rollout"
+    );
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    let outcome = opd_step(
+        &student,
+        &teacher,
+        &[1, 3, 8],
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+    )
+    .expect("hybrid OPD step should full-forward rollout instead of requiring KV cache");
+
+    assert_eq!(outcome.rollout_len, 5);
+    assert!(outcome.loss.is_finite());
 }
 
 #[test]
@@ -512,7 +556,7 @@ fn opd_step_rejects_teacher_student_vocab_mismatch() {
     let OpdError::InvalidInput(message) = err else {
         panic!("expected InvalidInput, got {err:?}");
     };
-    assert!(message.contains("teacher.config().vocab_size=12"));
+    assert!(message.contains("teacher.vocab_size()=12"));
     assert!(message.contains("student.config().vocab_size=16"));
     assert!(message.contains("tokenizer"));
     assert!(message.contains("2026-05-18-opd-only-pivot.md"));

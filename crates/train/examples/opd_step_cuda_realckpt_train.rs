@@ -203,6 +203,7 @@ pub mod app {
         prompt_max_tokens: usize,
         teacher_model: Option<PathBuf>,
         student_model: Option<PathBuf>,
+        safety_first_step_max_seconds: f64,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -432,7 +433,7 @@ pub mod app {
                 &mut tape,
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
-            let safety_first_step_max_seconds = student_mode.safety_first_step_max_seconds();
+            let safety_first_step_max_seconds = args.safety_first_step_max_seconds;
             if step == 1 && elapsed > safety_first_step_max_seconds {
                 println!(
                     "safety_stop first_step_seconds={elapsed:.6} max_allowed_seconds={safety_first_step_max_seconds:.6}"
@@ -527,6 +528,7 @@ pub mod app {
         let mut prompt_max_tokens = DEFAULT_PROMPT_MAX_TOKENS;
         let mut teacher_model = None;
         let mut student_model = None;
+        let mut safety_first_step_max_seconds = student_mode.safety_first_step_max_seconds();
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -608,16 +610,26 @@ pub mod app {
                     };
                     prompt_max_tokens = parse_positive_usize("--prompt-max-tokens", &raw)?;
                 }
+                "--safety-first-step-max-seconds" => {
+                    let Some(raw) = args.next() else {
+                        return Err(
+                            "--safety-first-step-max-seconds requires a positive finite f64 value"
+                                .into(),
+                        );
+                    };
+                    safety_first_step_max_seconds =
+                        parse_positive_f64("--safety-first-step-max-seconds", &raw)?;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example {} --release --features cuda -- [--teacher-model DIR] [--student-model DIR] [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train.",
+                        "usage: cargo run -p train --example {} --release --features cuda -- [--teacher-model DIR] [--student-model DIR] [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE] [--safety-first-step-max-seconds VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train.",
                         student_mode.usage_example()
                     );
                     return Ok(None);
                 }
                 unknown => {
                     return Err(format!(
-                        "unknown argument `{unknown}`. Supported arguments: --teacher-model DIR, --student-model DIR, --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32, --prompts-file PATH, --example-prompts-file PATH, --prompt-max-tokens VALUE"
+                        "unknown argument `{unknown}`. Supported arguments: --teacher-model DIR, --student-model DIR, --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32, --prompts-file PATH, --example-prompts-file PATH, --prompt-max-tokens VALUE, --safety-first-step-max-seconds VALUE"
                     )
                     .into());
                 }
@@ -632,7 +644,19 @@ pub mod app {
             prompt_max_tokens,
             teacher_model,
             student_model,
+            safety_first_step_max_seconds,
         }))
+    }
+
+    fn parse_positive_f64(name: &str, raw: &str) -> AnyResult<f64> {
+        let value = raw
+            .parse::<f64>()
+            .map_err(|err| format!("invalid {name} value `{raw}`: {err}"))?;
+        if value.is_finite() && value > 0.0 {
+            Ok(value)
+        } else {
+            Err(format!("{name} must be positive and finite, got `{raw}`").into())
+        }
     }
 
     fn parse_positive_f32(name: &str, raw: &str) -> AnyResult<f32> {
@@ -756,7 +780,7 @@ pub mod app {
             args.rollout_len,
             args.learning_rate,
             student_mode.default_learning_rate(),
-            student_mode.safety_first_step_max_seconds(),
+            args.safety_first_step_max_seconds,
             prompts.source_label,
             prompts.train.len(),
             prompts.heldout.len()
@@ -911,6 +935,17 @@ pub mod app {
         if prompt.is_empty() {
             return Err("greedy decode requires a non-empty prompt".into());
         }
+        if !model.supports_rollout_kv_cache() {
+            return greedy_decode_suffix_full_forward(
+                model,
+                prompt,
+                decode_len,
+                teacher_params,
+                student_params,
+                store,
+                tape,
+            );
+        }
         tape.entries.clear();
         tape.set_enabled(false);
         let mut cache = Qwen35KvCache::new(model);
@@ -931,6 +966,32 @@ pub mod app {
             let next = greedy_next_token(logits, 1, vocab, store)?;
             tokens.push(next);
             suffix.push(next);
+        }
+        retain_model_state(store, tape, teacher_params, student_params);
+        Ok(suffix)
+    }
+
+    fn greedy_decode_suffix_full_forward(
+        model: &Qwen35Model,
+        prompt: &[u32],
+        decode_len: usize,
+        teacher_params: &[TensorId],
+        student_params: &[TensorId],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> AnyResult<Vec<u32>> {
+        tape.entries.clear();
+        tape.set_enabled(false);
+        let mut tokens = prompt.to_vec();
+        let mut suffix = Vec::with_capacity(decode_len);
+        let vocab = model.config().vocab_size;
+        for _ in 0..decode_len {
+            let positions = (0..tokens.len() as u32).collect::<Vec<_>>();
+            let logits = model.forward(store, tape, &tokens, &positions)?;
+            let next = greedy_next_token(logits, tokens.len(), vocab, store)?;
+            tokens.push(next);
+            suffix.push(next);
+            retain_model_state(store, tape, teacher_params, student_params);
         }
         retain_model_state(store, tape, teacher_params, student_params);
         Ok(suffix)
