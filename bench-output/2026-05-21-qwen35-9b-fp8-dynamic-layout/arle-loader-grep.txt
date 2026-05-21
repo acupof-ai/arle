@@ -1,0 +1,48 @@
+infer/src/weight_loader.rs:448:    pub(crate) fp8_weight_scale_inv: bool,
+infer/src/weight_loader.rs:449:    pub(crate) fp8_block_rows: usize,
+infer/src/weight_loader.rs:450:    pub(crate) fp8_block_cols: usize,
+infer/src/weight_loader.rs:501:                fp8_weight_scale_inv: true,
+infer/src/weight_loader.rs:502:                fp8_block_rows: config.weight_block_size[0],
+infer/src/weight_loader.rs:503:                fp8_block_cols: config.weight_block_size[1],
+infer/src/weight_loader.rs:547:            || self.fp8_weight_scale_inv
+infer/src/weight_loader.rs:812:    if config.fp8_weight_scale_inv {
+infer/src/weight_loader.rs:813:        let scale_name = name.replace(".weight", ".weight_scale_inv");
+infer/src/weight_loader.rs:823:                    let host = dequantize_fp8_e4m3_weight_scale_inv_to_bf16_host(
+infer/src/weight_loader.rs:831:                        config.fp8_block_rows,
+infer/src/weight_loader.rs:832:                        config.fp8_block_cols,
+infer/src/weight_loader.rs:835:                        "Loaded FP8 {} via weight_scale_inv: [{}x{}] block=[{},{}] scale {:?}",
+infer/src/weight_loader.rs:839:                        config.fp8_block_rows,
+infer/src/weight_loader.rs:840:                        config.fp8_block_cols,
+infer/src/weight_loader.rs:1064:fn dequantize_fp8_e4m3_weight_scale_inv_to_bf16_host(
+infer/src/weight_loader.rs:1089:        "{name}: weight_scale_inv shape {:?} does not match expected [{scale_rows},{scale_cols}] for weight [{rows},{cols}] and block [{block_rows},{block_cols}]",
+infer/src/weight_loader.rs:1095:        dtype => anyhow::bail!("{name}: unsupported FP8 weight_scale_inv dtype {dtype:?}"),
+infer/src/weight_loader.rs:1099:        "{name}: weight_scale_inv byte length mismatch: expected {}, got {}",
+infer/src/weight_loader.rs:1109:            let scale = fp8_scale_value(scales, scale_dtype, scale_row * scale_cols + scale_col)?;
+infer/src/weight_loader.rs:1110:            let value = decode_fp8_e4m3fn(weight[row * cols + col]) * scale;
+infer/src/weight_loader.rs:1117:fn fp8_scale_value(scales: &[u8], dtype: Dtype, idx: usize) -> Result<f32> {
+infer/src/weight_loader.rs:1137:fn decode_fp8_e4m3fn(bits: u8) -> f32 {
+infer/src/weight_loader.rs:2155:    fn fp8_weight_scale_inv_dequantizes_block_scaled_matrix() {
+infer/src/weight_loader.rs:2161:        let out = dequantize_fp8_e4m3_weight_scale_inv_to_bf16_host(
+infer/src/weight_loader.rs:2179:    fn fp8_weight_scale_inv_loads_single_file_without_weight_map() -> Result<()> {
+infer/src/weight_loader.rs:2192:                ("layer.weight_scale_inv".to_string(), scale),
+infer/src/weight_loader.rs:2205:                fp8_weight_scale_inv: true,
+infer/src/weight_loader.rs:2206:                fp8_block_rows: 1,
+infer/src/weight_loader.rs:2207:                fp8_block_cols: 2,
+infer/src/quant.rs:152:    pub weight_fp8: bool,
+infer/src/quant.rs:161:            weight_fp8: true,
+infer/src/quant.rs:482:        "fp8" | "float8" | "fp8_e4m3" => {
+infer/src/quant.rs:485:                    matches!(fmt.to_ascii_lowercase().as_str(), "e4m3" | "fp8_e4m3"),
+infer/src/quant.rs:511:                weight_fp8: true,
+infer/src/quant.rs:551:    fn fp8_dynamic_json() -> &'static str {
+infer/src/quant.rs:552:        r#"{"quantization_config":{"quant_type":"fp8","activation_scheme":"dynamic"}}"#
+infer/src/quant.rs:555:    fn fp8_static_json() -> &'static str {
+infer/src/quant.rs:556:        r#"{"quantization_config":{"quant_type":"fp8","activation_scheme":"static"}}"#
+infer/src/quant.rs:559:    fn fp8_modelopt_json() -> &'static str {
+infer/src/quant.rs:560:        r#"{"quantization_config":{"quant_method":"fp8","fmt":"e4m3","activation_scheme":"dynamic","weight_block_size":[128,128]}}"#
+infer/src/quant.rs:608:    fn parse_fp8_dynamic() {
+infer/src/quant.rs:609:        let meta = parse_quant_meta_from_config_json(fp8_dynamic_json()).unwrap();
+infer/src/quant.rs:619:    fn parse_fp8_static() {
+infer/src/quant.rs:620:        let meta = parse_quant_meta_from_config_json(fp8_static_json()).unwrap();
+infer/src/quant.rs:630:    fn parse_fp8_modelopt_quant_method() {
+infer/src/quant.rs:631:        let meta = parse_quant_meta_from_config_json(fp8_modelopt_json()).unwrap();
+infer/src/quant.rs:636:            assert!(c.weight_fp8);
