@@ -255,6 +255,10 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
    student base. Both the 100-step real-prompt bench and a single-token,
    rollout-1 control fail before `eval_summary step=0` with
    `cuda htod copy failed`; live memory reached `14399 MiB / 16376 MiB`.
+   Upload diagnostics narrowed the failing allocation to a small
+   `[1024, 3584]` f32 projection upload (`14.68 MB`) returning
+   `CUDA_ERROR_OUT_OF_MEMORY`, confirming whole-runtime memory exhaustion
+   rather than a single oversized tensor.
 6. Next memory axis: make the train-side LoRA student base truly frozen BF16
    (or add an equivalent low-memory frozen-base loader) before rerunning the
    9B OPD bench. Add upload-size instrumentation if this root-cause needs a

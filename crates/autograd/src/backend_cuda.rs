@@ -95,9 +95,17 @@ impl CudaBackend {
             });
         }
 
-        self.stream
-            .clone_htod(host)
-            .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))
+        self.stream.clone_htod(host).map_err(|err| {
+            let bytes = host.len().saturating_mul(std::mem::size_of::<f32>());
+            AutogradError::TapeInvariant(Box::leak(
+                format!(
+                    "cuda htod copy failed: shape={shape:?} len={} bytes={} err={err:?}",
+                    host.len(),
+                    bytes
+                )
+                .into_boxed_str(),
+            ))
+        })
     }
 
     #[cfg(not(feature = "no-cuda"))]
