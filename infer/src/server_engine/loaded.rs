@@ -96,6 +96,22 @@ impl LoadedInferenceEngine {
         })
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn load_with_runtime_config(
+        model_path: &str,
+        runtime: crate::backend::cuda::bootstrap::ServerRuntimeConfig,
+    ) -> Result<Self> {
+        let metrics = crate::metrics::ServerMetrics::new("");
+        let (handle, guard) = crate::backend::cuda::bootstrap::spawn_scheduler_handle_from_path(
+            model_path, runtime, metrics,
+        )?;
+        let model_id = handle.model_id().to_string();
+        Ok(Self::Cuda {
+            engine: RequestHandleInferenceEngine::from_handle(model_id, handle),
+            _guard: guard,
+        })
+    }
+
     pub fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "cuda")]

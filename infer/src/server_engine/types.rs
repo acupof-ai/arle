@@ -9,6 +9,8 @@ use crate::sampler::SamplingParams;
 
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceVec};
+#[cfg(feature = "cuda")]
+use cudarc::driver::DevicePtr;
 
 #[cfg(feature = "cuda")]
 pub struct RawLogits {
@@ -29,6 +31,11 @@ impl RawLogits {
 
     pub fn to_host_f32(&self) -> Result<Vec<f32>> {
         self.logits.to_host(&self.device)
+    }
+
+    pub fn with_logits_device_ptr<T>(&self, f: impl FnOnce(u64) -> T) -> T {
+        let (ptr, _guard) = self.logits.data.device_ptr(&self.device.stream);
+        f(ptr as u64)
     }
 }
 

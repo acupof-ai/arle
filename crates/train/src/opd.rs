@@ -455,6 +455,13 @@ fn map_teacher_forward_error(stage: &str, err: TeacherForwardError) -> OpdError 
              prompt_ids, rollout ids, and positions are aligned before scoring \
              the rollout."
         )),
+        #[cfg(feature = "cuda")]
+        TeacherForwardError::InferRuntime(reason) => OpdError::InvalidInput(format!(
+            "OPD {stage} infer teacher runtime error: {reason}. Hint: verify \
+             the infer teacher model is loaded on CUDA, raw logits export is \
+             available, and the token positions are contiguous from zero for \
+             the current Path B bridge."
+        )),
     }
 }
 
