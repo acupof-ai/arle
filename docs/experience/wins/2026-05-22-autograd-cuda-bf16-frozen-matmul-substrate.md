@@ -6,7 +6,9 @@ Unblock the 9B GPTQModel teacher + 0.8B LoRA student memory path by adding the
 first train-side primitives needed for a frozen BF16 student base:
 device-resident BF16 storage, `matmul_bt` with a frozen BF16 RHS, and BF16
 embedding lookup for both host token ids and rollout decode's device token-id
-buffer.
+buffer. Follow-up in the same substrate added the matching `matmul_bt`
+backward path for the trainable activation gradient, which is the path LoRA
+student base projections need while keeping the frozen RHS untrained.
 
 ## Hypothesis
 
@@ -20,6 +22,7 @@ the loader keep frozen base weights in 2-byte storage in a later tranche.
 - New handle: `DeviceHandle::CudaBf16`.
 - New op paths:
   - `matmul_bt(f32 lhs, BF16 rhs) -> f32 output`
+  - `matmul_bt_backward_device(..., BF16 rhs, need_grad_a=true, need_grad_b=false)`
   - `embedding(BF16 table, i32 ids) -> f32 output`
   - `embedding_from_f32_ids(BF16 table, f32 ids) -> f32 output`
 - CUDA env:
@@ -35,12 +38,13 @@ Correctness gates:
 
 ```text
 cargo test -p autograd --test test_cuda_bf16_frozen_ops --release --features cuda
-running 4 tests
+running 5 tests
 test cuda_bf16_upload_readback_roundtrips_as_f32 ... ok
 test cuda_embedding_accepts_frozen_bf16_table ... ok
 test cuda_embedding_from_f32_ids_accepts_frozen_bf16_table ... ok
+test cuda_matmul_bt_backward_accepts_frozen_bf16_rhs_for_lhs_grad ... ok
 test cuda_matmul_bt_accepts_frozen_bf16_rhs ... ok
-test result: ok. 4 passed
+test result: ok. 5 passed
 ```
 
 Type gate:
@@ -57,6 +61,11 @@ The landed path explicitly rounds the activation to BF16 on-device, runs native
 BF16 GEMM with FP32 accumulation, then converts the BF16 result back to f32.
 That matches the inference precision regime and keeps the tensor device
 resident, but it is a precision tradeoff that must be checked at model level.
+
+The backward support is intentionally one-sided: it computes `grad_a` through a
+frozen BF16 RHS and errors if a caller asks for `grad_b` on that BF16 handle.
+That keeps the invariant explicit: BF16 frozen handles are for non-trainable
+base weights, not adapter or full-finetune weights.
 
 ## Learnings
 

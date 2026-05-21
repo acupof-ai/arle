@@ -465,6 +465,76 @@ impl CudaBackend {
         let c = self.import_local_bf16_as_f32(&c_bf16, m * n)?;
         Ok((c, out_shape))
     }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn matmul_device_f32_bf16(
+        &self,
+        a: &CudaSlice<f32>,
+        a_shape: &[usize],
+        b: &CudaSlice<u16>,
+        b_shape: &[usize],
+    ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        if a.len() != shape_size(a_shape) || b.len() != shape_size(b_shape) {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend bf16 matmul handle size does not match shape",
+            ));
+        }
+
+        let out_shape = matmul_output_shape(a_shape, b_shape)?;
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(AutogradError::InvalidRank {
+                expected: "both operands must be rank-2",
+                got: a_shape.len().max(b_shape.len()),
+            });
+        }
+
+        let m = a_shape[0];
+        let n = a_shape[1];
+        let k = b_shape[1];
+        let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
+        let mut c_bf16 = self
+            .stream
+            .alloc_zeros::<u16>(m * k)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+        let alpha = 1.0_f32;
+        let beta = 0.0_f32;
+        {
+            let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
+            let (a_ptr, _a_guard) = a_bf16.device_ptr(&self.stream);
+            let (c_ptr, _c_guard) = c_bf16.device_ptr_mut(&self.stream);
+
+            // Row-major C[M,K] = A[M,N] @ B[N,K], using cuBLAS's column-major
+            // view as C_col[K,M] = B_col[K,N] @ A_col[N,M].
+            unsafe {
+                cublas_result::gemm_ex(
+                    *self.blas.handle(),
+                    cublasOperation_t::CUBLAS_OP_N,
+                    cublasOperation_t::CUBLAS_OP_N,
+                    k as i32,
+                    m as i32,
+                    n as i32,
+                    (&alpha) as *const f32 as *const _,
+                    b_ptr as *const _,
+                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    k as i32,
+                    a_ptr as *const _,
+                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    n as i32,
+                    (&beta) as *const f32 as *const _,
+                    c_ptr as *mut _,
+                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    k as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+                .map_err(|_| AutogradError::TapeInvariant("cuBLAS gemm_ex failed (bf16 matmul)"))?;
+            }
+        }
+
+        let c = self.import_local_bf16_as_f32(&c_bf16, m * k)?;
+        Ok((c, out_shape))
+    }
 }
 
 impl Backend for CudaBackend {
@@ -3092,12 +3162,8 @@ fn cuda_matmul_bt_backward_device(
     }
 
     let d_a = backend.cuda_slice(a, "matmul_bt_backward_device")?;
-    let d_b = backend.cuda_slice(b, "matmul_bt_backward_device")?;
     let d_g = backend.cuda_slice(grad_out, "matmul_bt_backward_device")?;
-    if d_a.len() != shape_size(a_shape)
-        || d_b.len() != shape_size(b_shape)
-        || d_g.len() != shape_size(grad_out_shape)
-    {
+    if d_a.len() != shape_size(a_shape) || d_g.len() != shape_size(grad_out_shape) {
         return Err(AutogradError::TapeInvariant(
             "cuda matmul_bt_backward_device handle size does not match shape",
         ));
@@ -3108,7 +3174,37 @@ fn cuda_matmul_bt_backward_device(
     let n = b_shape[0];
 
     let grad_a = if need_grad_a {
-        let (c, out_shape) = backend.matmul_device(d_g, grad_out_shape, d_b, b_shape)?;
+        let (c, out_shape) = match b {
+            DeviceHandle::Cuda(storage) => {
+                let d_b = backend.cuda_storage_slice(storage)?;
+                if d_b.len() != shape_size(b_shape) {
+                    return Err(AutogradError::TapeInvariant(
+                        "cuda matmul_bt_backward_device handle size does not match shape",
+                    ));
+                }
+                backend.matmul_device(d_g, grad_out_shape, d_b, b_shape)?
+            }
+            DeviceHandle::CudaBf16(storage) => {
+                let d_b = backend.cuda_bf16_storage_slice(storage)?;
+                if d_b.len() != shape_size(b_shape) {
+                    return Err(AutogradError::TapeInvariant(
+                        "cuda bf16 matmul_bt_backward_device handle size does not match shape",
+                    ));
+                }
+                backend.matmul_device_f32_bf16(d_g, grad_out_shape, d_b, b_shape)?
+            }
+            DeviceHandle::Cpu(_) => {
+                return Err(AutogradError::TapeInvariant(
+                    "cuda matmul_bt_backward_device requires cuda handles",
+                ));
+            }
+            #[cfg(feature = "metal")]
+            DeviceHandle::Metal(_) => {
+                return Err(AutogradError::TapeInvariant(
+                    "cuda matmul_bt_backward_device cannot use a metal handle",
+                ));
+            }
+        };
         if out_shape != a_shape {
             return Err(AutogradError::ShapeMismatch {
                 expected: a_shape.to_vec(),
@@ -3121,6 +3217,12 @@ fn cuda_matmul_bt_backward_device(
     };
 
     let grad_b = if need_grad_b {
+        let d_b = backend.cuda_slice(b, "matmul_bt_backward_device")?;
+        if d_b.len() != shape_size(b_shape) {
+            return Err(AutogradError::TapeInvariant(
+                "cuda matmul_bt_backward_device handle size does not match shape",
+            ));
+        }
         // grad_b[N,K] = grad_out^T[N,M] @ A[M,K]. The output's row-major
         // buffer is cuBLAS's column-major [K,N], so compute A^T[K,M] @
         // grad_out[M,N] directly into that column-major view.
