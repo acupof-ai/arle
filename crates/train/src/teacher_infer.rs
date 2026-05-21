@@ -8,6 +8,8 @@
 
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "cuda")]
+use std::time::Instant;
 
 #[cfg(feature = "cuda")]
 use autograd::Backend;
@@ -100,6 +102,18 @@ pub struct InferTeacher {
     engine: Arc<Mutex<LoadedInferenceEngine>>,
     train_backend: Arc<dyn Backend>,
     vocab_size: usize,
+    last_profile: Mutex<InferTeacherProfile>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InferTeacherProfile {
+    pub total_seconds: f64,
+    pub raw_forward_seconds: f64,
+    pub sync_seconds: f64,
+    pub d2d_bridge_import_seconds: f64,
+    pub seq_len: usize,
+    pub vocab_size: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -113,6 +127,7 @@ impl InferTeacher {
             engine,
             train_backend,
             vocab_size,
+            last_profile: Mutex::new(InferTeacherProfile::default()),
         }
     }
 
@@ -122,6 +137,13 @@ impl InferTeacher {
 
     pub fn train_backend(&self) -> &Arc<dyn Backend> {
         &self.train_backend
+    }
+
+    pub fn last_profile(&self) -> InferTeacherProfile {
+        self.last_profile
+            .lock()
+            .map(|profile| *profile)
+            .unwrap_or_default()
     }
 }
 
@@ -147,6 +169,8 @@ impl TeacherForward for InferTeacher {
             )));
         }
 
+        let total_started = Instant::now();
+        let raw_started = Instant::now();
         let raw_logits = {
             let engine = self.engine.lock().map_err(|err| {
                 TeacherForwardError::InferRuntime(format!(
@@ -157,6 +181,7 @@ impl TeacherForward for InferTeacher {
                 .forward_token_logits(input_ids, positions)
                 .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))?
         };
+        let raw_forward_seconds = raw_started.elapsed().as_secs_f64();
         if raw_logits.vocab_size() != self.vocab_size {
             return Err(TeacherForwardError::InvalidInput(format!(
                 "InferTeacher vocab mismatch: raw logits vocab={}, configured vocab={}. \
@@ -173,15 +198,29 @@ impl TeacherForward for InferTeacher {
             )));
         }
 
+        let sync_started = Instant::now();
         raw_logits
             .device
             .sync()
             .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))?;
+        let sync_seconds = sync_started.elapsed().as_secs_f64();
         let shape = vec![1, raw_logits.seq_len(), raw_logits.vocab_size()];
+        let bridge_started = Instant::now();
         let handle = raw_logits.with_logits_device_ptr(|src_ptr| {
             self.train_backend
                 .import_bf16_device_ptr_as_f32(src_ptr, raw_logits.logits.len, &shape)
         })?;
+        let d2d_bridge_import_seconds = bridge_started.elapsed().as_secs_f64();
+        if let Ok(mut profile) = self.last_profile.lock() {
+            *profile = InferTeacherProfile {
+                total_seconds: total_started.elapsed().as_secs_f64(),
+                raw_forward_seconds,
+                sync_seconds,
+                d2d_bridge_import_seconds,
+                seq_len: raw_logits.seq_len(),
+                vocab_size: raw_logits.vocab_size(),
+            };
+        }
         let tensor_id = store.alloc_device_tensor(shape.clone(), handle)?;
         Ok(DeviceLogits { tensor_id, shape })
     }
