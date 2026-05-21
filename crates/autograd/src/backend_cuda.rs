@@ -13,27 +13,29 @@
 
 #[cfg(not(feature = "no-cuda"))]
 use crate::{
-    backend::{
-        matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
-        validate_decode_gqa_shapes, validate_qwen_decode_prepare_kv_shapes,
-        validate_qwen_decode_prepare_q_shapes, CudaStorage,
-    },
     AutogradError,
+    backend::{
+        CudaStorage, matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
+        validate_decode_gqa_shapes, validate_qwen_decode_prepare_kv_shapes,
+        validate_qwen_decode_prepare_q_shapes,
+    },
 };
 use crate::{
-    backend::{Backend, Device, DeviceGradClipResult, DeviceHandle},
     Result,
+    backend::{Backend, Device, DeviceGradClipResult, DeviceHandle},
 };
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/kernels.rs"]
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{launch_1d, launch_rows, KernelCache};
+use self::kernels::{KernelCache, launch_1d, launch_rows};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::sys::cublasOperation_t;
+#[cfg(not(feature = "no-cuda"))]
+use cudarc::driver::sys::{CUdeviceptr, CUresult, cuMemcpyDtoD_v2};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
 #[cfg(not(feature = "no-cuda"))]
@@ -110,6 +112,75 @@ impl CudaBackend {
             ));
         }
         Ok(slice)
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn copy_bf16_device_ptr_to_local(
+        &self,
+        src_device_ptr: u64,
+        len: usize,
+    ) -> Result<CudaSlice<u16>> {
+        let mut staging = self
+            .stream
+            .alloc_zeros::<u16>(len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 bridge)"))?;
+        if len == 0 {
+            return Ok(staging);
+        }
+
+        let byte_count =
+            len.checked_mul(std::mem::size_of::<u16>())
+                .ok_or(AutogradError::TapeInvariant(
+                    "bf16 bridge byte count overflow",
+                ))?;
+        {
+            let (dst_ptr, _dst_guard) = staging.device_ptr_mut(&self.stream);
+            let status = unsafe {
+                cuMemcpyDtoD_v2(
+                    dst_ptr as CUdeviceptr,
+                    src_device_ptr as CUdeviceptr,
+                    byte_count,
+                )
+            };
+            if status != CUresult::CUDA_SUCCESS {
+                return Err(AutogradError::TapeInvariant(
+                    "cuda D2D copy failed (bf16 bridge)",
+                ));
+            }
+        };
+        Ok(staging)
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn import_local_bf16_as_f32(
+        &self,
+        staging: &CudaSlice<u16>,
+        len: usize,
+    ) -> Result<CudaSlice<f32>> {
+        let mut out = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 import)"))?;
+        if len == 0 {
+            return Ok(out);
+        }
+
+        let n_i32 = i32::try_from(len)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 import length exceeds i32"))?;
+        {
+            let (src_ptr, _src_guard) = staging.device_ptr(&self.stream);
+            let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+            launch_1d(
+                &self.stream,
+                self.kernels.function("bf16_bits_to_f32")?,
+                len,
+                |mut builder| {
+                    builder.arg(&src_ptr).arg(&dst_ptr).arg(&n_i32);
+                    builder
+                },
+            )?;
+        }
+        Ok(out)
     }
 
     #[cfg(not(feature = "no-cuda"))]
@@ -256,6 +327,33 @@ impl Backend for CudaBackend {
             Ok(DeviceHandle::Cuda(CudaStorage::new(
                 self.upload_slice(host, shape)?,
             )))
+        }
+    }
+
+    fn import_bf16_device_ptr_as_f32(
+        &self,
+        src_device_ptr: u64,
+        len: usize,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (src_device_ptr, len, shape);
+            todo!("GPU required: cuda bf16 device import is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            if shape_size(shape) != len {
+                return Err(AutogradError::DataLengthMismatch {
+                    len,
+                    shape: shape.to_vec(),
+                    size: shape_size(shape),
+                });
+            }
+            let staging = self.copy_bf16_device_ptr_to_local(src_device_ptr, len)?;
+            let f32_slice = self.import_local_bf16_as_f32(&staging, len)?;
+            Ok(DeviceHandle::Cuda(CudaStorage::new(f32_slice)))
         }
     }
 
@@ -5073,6 +5171,45 @@ fn cuda_slice_backward_device(
         },
     )?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+#[cfg(all(test, not(feature = "no-cuda")))]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+
+    #[test]
+    fn bf16_device_import_roundtrip_preserves_d2d_bytes_and_widens() -> Result<()> {
+        let backend = CudaBackend::new(0)?;
+        let bf16_bits: Vec<u16> = vec![0x3f80, 0xc020, 0x0000, 0x3e80, 0x7f7f];
+        let src = backend
+            .stream
+            .clone_htod(&bf16_bits)
+            .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (bf16 test)"))?;
+        let (src_ptr, _src_guard) = src.device_ptr(&backend.stream);
+        let src_ptr = src_ptr as u64;
+
+        let staging = backend.copy_bf16_device_ptr_to_local(src_ptr, bf16_bits.len())?;
+        let copied = backend
+            .stream
+            .clone_dtoh(&staging)
+            .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed (bf16 test)"))?;
+        backend
+            .stream
+            .synchronize()
+            .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed (bf16 test)"))?;
+        assert_eq!(copied, bf16_bits);
+
+        let handle =
+            backend.import_bf16_device_ptr_as_f32(src_ptr, bf16_bits.len(), &[bf16_bits.len()])?;
+        let widened = backend.readback(&handle)?;
+        let expected: Vec<f32> = bf16_bits
+            .iter()
+            .map(|&bits| f32::from_bits((bits as u32) << 16))
+            .collect();
+        assert_eq!(widened, expected);
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]

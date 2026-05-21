@@ -132,6 +132,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok(DeviceHandle::Cpu(host.to_vec()))
     }
 
+    fn import_bf16_device_ptr_as_f32(
+        &self,
+        src_device_ptr: u64,
+        len: usize,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let _ = (src_device_ptr, len, shape);
+        Err(crate::AutogradError::TapeInvariant(
+            "backend does not support importing bf16 device pointers",
+        ))
+    }
+
     /// Allocate a zero-filled device handle for `shape`.
     ///
     /// Default implementation uploads a host zero vector so existing
