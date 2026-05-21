@@ -32,7 +32,7 @@ CARGO_BUILD_JOBS=1 \
 cargo run -p infer --example qwen35_train_vs_infer_parity --release --features cuda
 ```
 
-## Results
+## Results Before RMSNorm Fix
 
 | stage | len | max_abs | max_rel | first train | first infer |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -46,21 +46,53 @@ cargo run -p infer --example qwen35_train_vs_infer_parity --release --features c
 
 First divergence over `1e-4`: `layer0_rmsnorm`.
 
+## Results After RMSNorm Fix
+
+Change:
+
+- Train-side Qwen3.5 ordinary RMSNorm call sites now apply `(1 + weight)` at
+  use time.
+- Train-side Qwen3.5 Q/K decode-prepare fast path now applies the same
+  `(1 + weight)` Q/K norm used by infer's paged decode prep.
+- The diagnostic harness materializes train-side captured stages through BF16
+  rounding so the stage table compares infer's BF16 device tensors against the
+  same precision boundary. Without that diagnostic-only rounding, layer 0
+  RMSNorm differed by one BF16 ulp (`max_abs=7.57646561e-3`) even after the
+  offset semantic fix.
+
+| stage | len | max_abs | max_rel | first train | first infer |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| embedding | 1024 | 0.00000000e0 | 0.00000000e0 | 1.55029297e-2 | 1.55029297e-2 |
+| layer0_rmsnorm | 1024 | 0.00000000e0 | 0.00000000e0 | 1.75000000e0 | 1.75000000e0 |
+| layer0_attention | 1024 | 3.90625000e-3 | 9.89448607e-1 | -6.71875000e-1 | -6.67968750e-1 |
+| layer0_ffn | 1024 | 9.76562500e-4 | 1.86394560e0 | 4.92187500e-1 | 4.92187500e-1 |
+| layer0_residual | 1024 | 3.90625000e-3 | 2.00000000e0 | -1.64062500e-1 | -1.60156250e-1 |
+| final_rmsnorm | 1024 | 3.82647514e-1 | 1.98029721e0 | 6.23808103e-3 | -1.77001953e-2 |
+| lm_head | 248320 | 2.43329287e-1 | 1.99170125e0 | 1.09028893e1 | 1.09375000e1 |
+
+First divergence over `1e-4`: `layer0_attention`.
+
 ## Interpretation
 
 Embedding is bit-equivalent after D2D import, so this is not a tokenizer ID,
 embedding lookup, device bridge, or tied-embedding indexing issue.
 
-The first measured break is layer 0 RMSNorm. The infer path intentionally uses
-the Qwen3.5 `(1 + weight)` offset RMSNorm variant in prefill and final norm.
-The train path currently records standard RMSNorm at the same stage. That
-makes the next fix axis narrow: align train-side Qwen3.5 RMSNorm semantics with
-infer, then rerun this harness before resuming Path B.
+The original first measured break was layer 0 RMSNorm. The infer path
+intentionally uses the Qwen3.5 `(1 + weight)` offset RMSNorm variant in prefill
+and final norm, while the train path used standard RMSNorm. The offset fix
+brings the layer 0 RMSNorm stage to exact parity under the BF16 materialization
+boundary.
+
+The next measured break is layer 0 attention. For this checkpoint, layer 0 is
+a linear-attention layer, so the next axis is the train-side
+`linear_attention_core` vs infer-side GDR prefill path. Path B full-logit parity
+should stay paused until that stage is under `1e-4`.
 
 ## Problems
 
-- This is a diagnostic harness, not a model fix. Path B remains paused until a
-  follow-up commit brings the stage table under `1e-4`.
+- The BF16 materialization in `forward_single_token_parity_stages` is
+  diagnostic-only. It keeps the parity table honest against infer's BF16
+  device tensors without changing the production OPD gradient path.
 - The comparison keeps infer tensors device-resident until the autograd D2D
   bridge import, but the final metric calculation downloads both tensors to
   host. That is acceptable for attribution and is not a perf claim.

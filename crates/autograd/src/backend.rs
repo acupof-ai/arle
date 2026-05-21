@@ -3289,7 +3289,8 @@ fn cpu_qwen_decode_prepare_q(
         }
     }
 
-    let q_normed = cpu_rms_norm_forward(&q_layout, q_norm_weight, &out_shape, eps)?;
+    let q_norm_weight: Vec<f32> = q_norm_weight.iter().map(|&value| value + 1.0).collect();
+    let q_normed = cpu_rms_norm_forward(&q_layout, &q_norm_weight, &out_shape, eps)?;
     let q_roped = cpu_rope_forward(&q_normed, &out_shape, cos, sin)?;
     Ok((q_roped, gate_layout, out_shape))
 }
@@ -3368,7 +3369,8 @@ fn cpu_qwen_decode_prepare_kv(
         }
     }
 
-    let k_normed = cpu_rms_norm_forward(&k_layout, k_norm_weight, &out_shape, eps)?;
+    let k_norm_weight: Vec<f32> = k_norm_weight.iter().map(|&value| value + 1.0).collect();
+    let k_normed = cpu_rms_norm_forward(&k_layout, &k_norm_weight, &out_shape, eps)?;
     let k_roped = cpu_rope_forward(&k_normed, &out_shape, cos, sin)?;
     Ok((k_roped, v_layout, out_shape))
 }
