@@ -19,6 +19,29 @@ Related governance docs:
 
 ## [Unreleased]
 
+### OPD train (CUDA) — new beta surface
+
+- **End-to-end OPD CUDA training stack landed on Qwen3-0.6B.** Single-session
+  32-commit arc through kill-or-license-gated wins brings the OPD step at the
+  moderate Qwen3.5-like shape to **48.5 ms** on RTX 4070 Ti SUPER —
+  **1.71× faster than the like-for-like PyTorch CUDA reference (83 ms)** —
+  and the real Qwen3-0.6B checkpoint OPD step to **0.164 s/step** (~170×
+  over a naive scratch CPU baseline). CPU/CUDA loss bit-equivalent to
+  relerr 1.276e-6. Convergence verified at lr=1e-7 with held-out
+  exact-overlap **50 → 82.8 %** by step 5000 (KL/NLL still monotonically
+  falling). Five parallel axes killed cleanly via SOLID gates with
+  recorded errors entries (forward_last_logits, merge_grad sharing, SDPA
+  mask-softmax fusion, high-level CUDA Graph rollout capture, SwiGLU
+  silu+multiply fusion). New CUDA op surfaces: `matmul_bt` forward +
+  backward, in-place AdamW, KV cache for OPD rollout, device-resident
+  RoPE / argmax, fused causal-SDPA decode, fused attention-prepare
+  layout, fused grad clip. Usage manual:
+  [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md).
+  Cycle wrap:
+  [`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md).
+  Industry positioning:
+  [`docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`](docs/projects/2026-05-21-opd-industry-positioning-best-framework.md).
+
 ### Observability
 
 - Added low-overhead HTTP `request_trace` JSON summaries for streaming and
