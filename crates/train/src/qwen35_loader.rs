@@ -48,11 +48,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use autograd::{Tensor, TensorId, TensorStore};
+use autograd::{Device, Tensor, TensorId, TensorStore};
 use half::{bf16, f16};
 use memmap2::Mmap;
 use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
+use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -109,7 +109,9 @@ pub enum LoaderError {
          Qwen35Model schema before running OPD."
     )]
     Model(#[from] Qwen35Error),
-    #[error("shape mismatch for {name}: model expects {expected:?}, safetensors has {got:?}{hint}")]
+    #[error(
+        "shape mismatch for {name}: model expects {expected:?}, safetensors has {got:?}{hint}"
+    )]
     ShapeMismatch {
         name: String,
         expected: Vec<usize>,
@@ -483,6 +485,23 @@ fn dtype_to_f32(view: &TensorView<'_>, name: &str) -> Result<Vec<f32>> {
     }
 }
 
+fn dtype_to_bf16_bits(view: &TensorView<'_>, name: &str) -> Result<Vec<u16>> {
+    if view.dtype() != Dtype::BF16 {
+        return Err(LoaderError::UnsupportedDtype(view.dtype(), name.to_owned()));
+    }
+    let bytes = view.data();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(LoaderError::Custom(format!(
+            "{name} BF16 byte length {} is not divisible by 2",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+
 // ─────────────────────────── public entry point ──────────────────────────────
 
 /// Load a HF-format Qwen3 / Qwen3.5 checkpoint into a fresh frozen
@@ -617,6 +636,7 @@ fn load_qwen35_from_hf_dir_inner(
         &param_map,
         &cfg,
         schema,
+        mode,
         &hf_name_to_shard,
         &safetensors_views,
         store,
@@ -661,12 +681,14 @@ struct PlannedTensorLoad {
     expected_shape: Vec<usize>,
     requires_grad: bool,
     shard_idx: usize,
+    bf16_cuda_frozen_base: bool,
 }
 
 fn plan_tensor_loads(
     param_map: &HashMap<&'static str, TensorId>,
     cfg: &Qwen35Config,
     schema: HfSchema,
+    mode: LoadMode,
     hf_name_to_shard: &HashMap<String, usize>,
     safetensors_views: &[SafeTensors<'_>],
     store: &TensorStore,
@@ -693,6 +715,7 @@ fn plan_tensor_loads(
                 candidate,
                 train_name,
                 id,
+                mode,
                 hf_name_to_shard,
                 safetensors_views,
                 store,
@@ -733,6 +756,7 @@ fn plan_tensor_load(
     hf_name: &str,
     train_name: &str,
     id: TensorId,
+    mode: LoadMode,
     hf_name_to_shard: &HashMap<String, usize>,
     safetensors_views: &[SafeTensors<'_>],
     store: &TensorStore,
@@ -768,6 +792,15 @@ fn plan_tensor_load(
         });
     }
 
+    let bf16_cuda_frozen_base = should_load_bf16_cuda_frozen_base(
+        mode,
+        train_name,
+        &expected_shape,
+        requires_grad,
+        view.dtype(),
+        store,
+    );
+
     Ok(PlannedTensorLoad {
         hf_name: hf_name.to_owned(),
         train_name: train_name.to_owned(),
@@ -775,6 +808,7 @@ fn plan_tensor_load(
         expected_shape,
         requires_grad,
         shard_idx,
+        bf16_cuda_frozen_base,
     })
 }
 
@@ -785,6 +819,41 @@ fn can_squeeze_linear_conv1d_weight(train_name: &str, expected: &[usize], got: &
         && got[1] == 1
         && expected[0] == got[0]
         && expected[1] == got[2]
+}
+
+fn should_load_bf16_cuda_frozen_base(
+    mode: LoadMode,
+    train_name: &str,
+    expected_shape: &[usize],
+    requires_grad: bool,
+    dtype: Dtype,
+    store: &TensorStore,
+) -> bool {
+    matches!(mode, LoadMode::LoraStudent { .. })
+        && !requires_grad
+        && dtype == Dtype::BF16
+        && store.backend().device() == Device::Cuda
+        && is_bf16_cuda_frozen_base_tensor(train_name, expected_shape)
+}
+
+fn is_bf16_cuda_frozen_base_tensor(train_name: &str, expected_shape: &[usize]) -> bool {
+    if expected_shape.len() != 2 {
+        return false;
+    }
+    train_name.ends_with("embed_tokens.weight")
+        || train_name.ends_with("lm_head.weight")
+        || train_name.ends_with(".self_attn.q_proj.weight")
+        || train_name.ends_with(".self_attn.k_proj.weight")
+        || train_name.ends_with(".self_attn.v_proj.weight")
+        || train_name.ends_with(".self_attn.o_proj.weight")
+        || train_name.ends_with(".linear_attn.in_proj_qkv.weight")
+        || train_name.ends_with(".linear_attn.in_proj_z.weight")
+        || train_name.ends_with(".linear_attn.in_proj_b.weight")
+        || train_name.ends_with(".linear_attn.in_proj_a.weight")
+        || train_name.ends_with(".linear_attn.out_proj.weight")
+        || train_name.ends_with(".mlp.gate_proj.weight")
+        || train_name.ends_with(".mlp.up_proj.weight")
+        || train_name.ends_with(".mlp.down_proj.weight")
 }
 
 fn validate_supported_dtype(view: &impl safetensors::View, name: &str) -> Result<()> {
@@ -802,6 +871,18 @@ fn load_planned_tensor_into_slot(
     let view = safetensors_views[planned.shard_idx]
         .tensor(&planned.hf_name)
         .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", planned.hf_name)))?;
+    if planned.bf16_cuda_frozen_base {
+        let data = dtype_to_bf16_bits(&view, &planned.hf_name)?;
+        let handle = store
+            .backend()
+            .upload_bf16_bits(&data, &planned.expected_shape)
+            .map_err(LoaderError::Autograd)?;
+        store
+            .replace_device_handle(planned.id, handle)
+            .map_err(LoaderError::Autograd)?;
+        return Ok(());
+    }
+
     let data = dtype_to_f32(&view, &planned.hf_name)?;
 
     let tensor = Tensor::new(data, planned.expected_shape.clone(), planned.requires_grad).map_err(
@@ -865,7 +946,7 @@ fn q_proj_gate_hint(train_name: &str, expected: &[usize], got: &[usize]) -> Stri
 mod tests {
     use std::borrow::Cow;
 
-    use safetensors::{Dtype, serialize_to_file};
+    use safetensors::{serialize_to_file, Dtype};
 
     use super::*;
 
@@ -900,6 +981,68 @@ mod tests {
         "use_sliding_window": false,
         "vocab_size": 151936
     }"#;
+
+    #[test]
+    fn bf16_cuda_frozen_base_predicate_includes_large_linear_tables() {
+        let shape = [151_936, 1024];
+        assert!(is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.embed_tokens.weight",
+            &shape
+        ));
+        assert!(is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.lm_head.weight",
+            &shape
+        ));
+
+        let linear_shape = [3072, 1024];
+        for name in [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.self_attn.k_proj.weight",
+            "model.language_model.layers.0.self_attn.v_proj.weight",
+            "model.language_model.layers.0.self_attn.o_proj.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.layers.0.mlp.up_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+        ] {
+            assert!(
+                is_bf16_cuda_frozen_base_tensor(name, &linear_shape),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_cuda_frozen_base_predicate_excludes_non_linear_tables() {
+        assert!(!is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.input_layernorm.weight",
+            &[1024]
+        ));
+        assert!(!is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.linear_attn.conv1d.weight",
+            &[1024, 1, 4]
+        ));
+        assert!(!is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.linear_attn.dt_bias",
+            &[1024]
+        ));
+        assert!(!is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.linear_attn.a_log",
+            &[1024]
+        ));
+        assert!(!is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.linear_attn.q_norm.weight",
+            &[1024]
+        ));
+        assert!(!is_bf16_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.unrelated.weight",
+            &[1024, 1024]
+        ));
+    }
 
     #[test]
     fn parses_qwen3_0_6b_flat_config() {
@@ -937,11 +1080,10 @@ mod tests {
         assert_eq!(cfg.bos_token_id, Some(151_643));
         assert!(cfg.tie_word_embeddings);
         assert_eq!(cfg.layer_types.len(), 28);
-        assert!(
-            cfg.layer_types
-                .iter()
-                .all(|lt| *lt == LayerType::FullAttention)
-        );
+        assert!(cfg
+            .layer_types
+            .iter()
+            .all(|lt| *lt == LayerType::FullAttention));
         // Synthesized linear_* fields are inert (no LinearAttention layers).
         assert_eq!(cfg.linear_num_key_heads, 16);
         assert_eq!(cfg.linear_key_head_dim, 128);
