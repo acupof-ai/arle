@@ -32,7 +32,7 @@ mod app {
     const SAFETY_FIRST_STEP_MAX_SECONDS: f64 = 0.5;
     const EVAL_STEPS: &[usize] = &[0, 100, 250, 500, 1000, 2000];
 
-    const TRAIN_PROMPTS: &[&[u32]] = &[
+    const TRAIN_PROMPTS_8: &[&[u32]] = &[
         &[1, 872, 198, 3456],
         &[1, 198, 1512, 429],
         &[1, 770, 3186, 25, 220],
@@ -41,6 +41,41 @@ mod app {
         &[1, 785, 594, 287, 374, 1690],
         &[1, 3347, 11, 358, 1052, 429],
         &[1, 2610, 527, 1139, 304, 279, 1670],
+    ];
+
+    const TRAIN_PROMPTS_32: &[&[u32]] = &[
+        &[1, 872, 198, 3456],
+        &[1, 198, 1512, 429],
+        &[1, 770, 3186, 25, 220],
+        &[1, 644, 374, 279, 1887],
+        &[1, 3838, 374, 264, 2077, 13],
+        &[1, 785, 594, 287, 374, 1690],
+        &[1, 3347, 11, 358, 1052, 429],
+        &[1, 2610, 527, 1139, 304, 279, 1670],
+        &[1, 888, 536, 4697, 972],
+        &[1, 374, 11, 279, 1372, 315],
+        &[1, 2874, 369, 279, 31559],
+        &[1, 7521, 481, 362, 5714],
+        &[1, 43059, 21938, 315, 7148],
+        &[1, 358, 646, 944, 1490, 432],
+        &[1, 477, 11, 323, 279, 62],
+        &[1, 576, 1102, 315, 264, 729],
+        &[1, 291, 504, 279, 1467, 11],
+        &[1, 702, 1012, 1483, 311, 7512],
+        &[1, 264, 11245, 2168, 429, 702],
+        &[1, 3555, 374, 264, 5714, 30],
+        &[1, 19257, 311, 279, 1251, 315],
+        &[1, 1156, 3019, 304, 279, 1882],
+        &[1, 2701, 1467, 25, 4710, 785],
+        &[1, 315, 279, 3364, 13, 576],
+        &[1, 279, 897, 5927, 553, 279],
+        &[1, 2055, 11, 369, 279, 1140],
+        &[1, 28469, 9363, 525, 279],
+        &[1, 1012, 13570, 14975, 304, 279],
+        &[1, 1887, 2242, 1294, 2827, 8],
+        &[1, 62, 716, 477, 11, 323],
+        &[1, 1512, 429, 374, 11, 279],
+        &[1, 74595, 11, 714, 279, 1467],
     ];
 
     const HELDOUT_PROMPTS: &[&[u32]] = &[
@@ -67,6 +102,37 @@ mod app {
         train_steps: usize,
         rollout_len: usize,
         eval_steps: Vec<usize>,
+        prompt_set: PromptSetArg,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PromptSetArg {
+        Eight,
+        ThirtyTwo,
+    }
+
+    impl PromptSetArg {
+        fn parse(raw: &str) -> AnyResult<Self> {
+            match raw {
+                "8" => Ok(Self::Eight),
+                "32" => Ok(Self::ThirtyTwo),
+                _ => Err(format!("--prompt-set must be `8` or `32`, got `{raw}`").into()),
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Eight => "8",
+                Self::ThirtyTwo => "32",
+            }
+        }
+
+        fn prompts(self) -> &'static [&'static [u32]] {
+            match self {
+                Self::Eight => TRAIN_PROMPTS_8,
+                Self::ThirtyTwo => TRAIN_PROMPTS_32,
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -98,8 +164,9 @@ mod app {
     pub fn main() -> AnyResult<()> {
         let model_dir = resolve_model_dir()?;
         let args = resolve_training_args()?;
+        let train_prompts = args.prompt_set.prompts();
         let eval_steps = eval_steps_for(args.train_steps, &args.eval_steps);
-        print_config(&model_dir, &args, &eval_steps);
+        print_config(&model_dir, &args, train_prompts, &eval_steps);
 
         let cuda_backend = Arc::new(CudaBackend::new(0)?);
         let mut store = TensorStore::with_backend(cuda_backend.clone());
@@ -151,6 +218,7 @@ mod app {
         let mut eval_summaries = Vec::new();
         eval_summaries.push(evaluate_snapshot(
             0,
+            train_prompts,
             &teacher,
             &student,
             &teacher_params,
@@ -163,8 +231,8 @@ mod app {
         let mut step_seconds = Vec::with_capacity(args.train_steps);
         let total_started = Instant::now();
         for step in 1..=args.train_steps {
-            let prompt_index = (step - 1) % TRAIN_PROMPTS.len();
-            let prompt = TRAIN_PROMPTS[prompt_index];
+            let prompt_index = (step - 1) % train_prompts.len();
+            let prompt = train_prompts[prompt_index];
             let step_started = Instant::now();
             let outcome = opd_step(
                 &student,
@@ -197,6 +265,7 @@ mod app {
             if eval_steps.contains(&step) {
                 eval_summaries.push(evaluate_snapshot(
                     step,
+                    train_prompts,
                     &teacher,
                     &student,
                     &teacher_params,
@@ -231,6 +300,7 @@ mod app {
         let mut train_steps = DEFAULT_TRAIN_STEPS;
         let mut rollout_len = DEFAULT_ROLLOUT_LEN;
         let mut eval_steps = EVAL_STEPS.to_vec();
+        let mut prompt_set = PromptSetArg::Eight;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -258,15 +328,21 @@ mod app {
                     };
                     eval_steps = parse_eval_steps(&raw)?;
                 }
+                "--prompt-set" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--prompt-set requires `8` or `32`".into());
+                    };
+                    prompt_set = PromptSetArg::parse(&raw)?;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV]"
+                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32]"
                     );
                     std::process::exit(0);
                 }
                 unknown => {
                     return Err(format!(
-                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV"
+                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32"
                     )
                     .into());
                 }
@@ -277,6 +353,7 @@ mod app {
             train_steps,
             rollout_len,
             eval_steps,
+            prompt_set,
         })
     }
 
@@ -335,15 +412,22 @@ mod app {
         steps
     }
 
-    fn print_config(model_dir: &Path, args: &TrainingArgs, eval_steps: &[usize]) {
+    fn print_config(
+        model_dir: &Path,
+        args: &TrainingArgs,
+        train_prompts: &[&[u32]],
+        eval_steps: &[usize],
+    ) {
         println!(
-            "config backend=cuda model_dir={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS} eval_steps={eval_steps:?}",
+            "config backend=cuda model_dir={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS} prompt_set={} train_prompt_count={} eval_steps={eval_steps:?}",
             model_dir.display(),
             args.train_steps,
             args.rollout_len,
-            args.learning_rate
+            args.learning_rate,
+            args.prompt_set.label(),
+            train_prompts.len()
         );
-        for (idx, prompt) in TRAIN_PROMPTS.iter().enumerate() {
+        for (idx, prompt) in train_prompts.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
         }
         for (idx, prompt) in HELDOUT_PROMPTS.iter().enumerate() {
@@ -353,6 +437,7 @@ mod app {
 
     fn evaluate_snapshot(
         step: usize,
+        train_prompts: &[&[u32]],
         teacher: &Qwen35Model,
         student: &Qwen35Model,
         teacher_params: &[TensorId],
@@ -364,7 +449,7 @@ mod app {
         let train = evaluate_split(
             "train",
             step,
-            TRAIN_PROMPTS,
+            train_prompts,
             teacher,
             student,
             teacher_params,
