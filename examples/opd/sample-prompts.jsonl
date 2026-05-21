@@ -1,0 +1,20 @@
+{"text":"Explain why small language models benefit from on-policy distillation.","max_tokens":16}
+{"text":"Summarize the difference between forward KL and reverse KL.","max_tokens":16}
+{"text":"Write a concise checklist for debugging a CUDA training step.","max_tokens":16}
+{"text":"What makes a benchmark result trustworthy?","max_tokens":16}
+{"text":"Describe how a frozen teacher can guide a perturbed student model.","max_tokens":16}
+{"text":"Give a short example of a prompt that tests arithmetic reasoning.","max_tokens":16}
+{"text":"List three signs that a training run is diverging.","max_tokens":16}
+{"text":"Explain token-level supervision in one paragraph.","max_tokens":16}
+{"text":"How should an engineer decide whether to keep or kill an optimization?","max_tokens":16}
+{"text":"Write a compact note about GPU memory leak monitoring.","max_tokens":16}
+{"text":"Why is exact-token overlap sometimes too coarse as an eval metric?","max_tokens":16}
+{"text":"Compare greedy decoding with sampled rollouts for distillation.","max_tokens":16}
+{"text":"What is the role of held-out prompts in an OPD experiment?","max_tokens":16}
+{"text":"Explain why matched controls matter in performance work.","max_tokens":16}
+{"text":"Give a one-sentence definition of runtime-integrated training.","max_tokens":16}
+{"text":"What should a user check before running a Qwen tokenizer benchmark?","max_tokens":16}
+{"text":"Describe a safe default learning rate for a near-checkpoint student.","max_tokens":16}
+{"text":"Why can a loss curve improve while exact overlap stays flat?","max_tokens":16}
+{"text":"Write a short warning about padding prompts without an attention mask.","max_tokens":16}
+{"text":"Explain why a real text prompt set is better than hand-picked token IDs.","max_tokens":16}

@@ -22,6 +22,8 @@ pub mod metrics;
 pub mod model_family;
 #[path = "opd.rs"]
 pub mod opd;
+#[path = "prompts.rs"]
+pub mod prompts;
 #[path = "qwen35.rs"]
 pub mod qwen35;
 #[path = "qwen35_checkpoint.rs"]
