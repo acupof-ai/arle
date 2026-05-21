@@ -1,0 +1,36 @@
+Thu May 21 11:57:00 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.71.05              Driver Version: 595.71.05      CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4070 ...    On  |   00000000:26:00.0 Off |                  N/A |
+|  0%   36C    P8             11W /  295W |   11610MiB /  16376MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            1296      G   /usr/bin/ksecretd                         3MiB |
+|    0   N/A  N/A            1360      G   /usr/bin/kwin_wayland                    36MiB |
+|    0   N/A  N/A            1433      G   /usr/bin/Xwayland                         4MiB |
+|    0   N/A  N/A            1469      G   /usr/bin/ksmserver                        3MiB |
+|    0   N/A  N/A            1471      G   /usr/bin/kded6                            3MiB |
+|    0   N/A  N/A            1499      G   /usr/bin/plasmashell                     92MiB |
+|    0   N/A  N/A            1532      G   /usr/bin/kaccess                          3MiB |
+|    0   N/A  N/A            1534      G   ...it-kde-authentication-agent-1          3MiB |
+|    0   N/A  N/A            1649      G   /usr/bin/kdeconnectd                      3MiB |
+|    0   N/A  N/A            1673      G   python3                                   3MiB |
+|    0   N/A  N/A            1699      G   /usr/lib/xdg-desktop-portal-kde           3MiB |
+|    0   N/A  N/A            1732      G   /opt/microsoft/msedge/msedge              3MiB |
+|    0   N/A  N/A            1733      G   /usr/bin/konsole                          3MiB |
+|    0   N/A  N/A            1966    C+G   ...rack-uuid=3190708988185955192        139MiB |
+|    0   N/A  N/A            1972      G   /usr/bin/kwalletd6                        3MiB |
+|    0   N/A  N/A         3240097      C   ...cts/arle/target/release/infer      10650MiB |
+|    0   N/A  N/A         4029544      G   /usr/lib/kscreenlocker_greet            226MiB |
++-----------------------------------------------------------------------------------------+

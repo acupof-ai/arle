@@ -1,0 +1,8 @@
+warning: cuda-kernels@0.1.5: cuda feature inactive: skipping CUDA/TileLang kernel compilation.
+   Compiling infer v0.1.5 (/home/ckl/projects/arle/infer)
+warning: mlx-sys@0.3.0: mlx-sys: skipping MLX/Metal bridge build on non-macOS target
+    Checking agent v0.1.5 (/home/ckl/projects/arle/crates/agent)
+    Checking cli v0.1.5 (/home/ckl/projects/arle/crates/cli)
+    Checking agent-infer v0.1.5 (/home/ckl/projects/arle)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.54s
+exit=0
