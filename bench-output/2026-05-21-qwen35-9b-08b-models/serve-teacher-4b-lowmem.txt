@@ -1,0 +1,80 @@
+[ARLE serve] launching cuda backend via /home/ckl/projects/arle/target/release/infer
+2026-05-21T11:56:31.673124+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:31.673749+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:31.675114+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:31.675123+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:31.675148+08:00   INFO infer: main.rs:1079 === Infer Server - Qwen3.5 (GPU) ===
+2026-05-21T11:56:31.703853+08:00   INFO infer::runtime_topology: runtime_topology.rs:132 Runtime topology: numa_nodes=1 gpus=1 nics=1 fallback_cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-05-21T11:56:31.703860+08:00   INFO infer::runtime_topology: runtime_topology.rs:140 Runtime topology NUMA node 0: cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-05-21T11:56:31.703865+08:00   INFO infer::runtime_topology: runtime_topology.rs:147 Runtime topology GPU 0: pci=26:00.0 numa=None local_cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 nearest_nics=enp34s0
+2026-05-21T11:56:31.703875+08:00   INFO infer::runtime_topology: runtime_topology.rs:161 Runtime topology NIC enp34s0: pci=22:00.0 numa=None local_cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-05-21T11:56:31.703961+08:00   INFO infer: main.rs:809 Final runtime worker placement: worker=0 cuda_ordinal=0 gpu=0 numa=None cpus=16 nics=enp34s0 affinity_applied=true reason=applied
+2026-05-21T11:56:31.848836+08:00   INFO infer: main.rs:826 GPU memory @ post_cuda_ctx (early): cuda_ordinal=0 gpu=0 free=15.40 GB / total=16.72 GB (driver+ctx+cuBLAS overhead = 1314 MB)
+2026-05-21T11:56:31.848871+08:00   INFO infer: main.rs:1126 Loading model...
+2026-05-21T11:56:31.848892+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:339 CUDA bootstrap worker placement: worker=0 gpu=0 cuda_ordinal=Some(0) numa=None cpus=16 nics=enp34s0 affinity_applied=true reason=applied
+2026-05-21T11:56:31.848908+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:377 GPU memory @ pre_model_load: free=15.40 GB / total=16.72 GB (delta vs post_cuda_ctx = +0 MB bytes — AOT cubins + lazy_static loaders)
+2026-05-21T11:56:31.848920+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:31.848963+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:32.235775+08:00   INFO infer::model::qwen35::weights: weights.rs:129 Loading Qwen3.5 model from: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:32.235839+08:00   INFO infer::hf_hub: hf_hub.rs:49 Using local model path: /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+2026-05-21T11:56:32.236334+08:00   INFO infer::weight_loader: weight_loader.rs:77 Memory-mapped 2 shard(s) (9319.8 MB) in 0ms
+2026-05-21T11:56:33.866877+08:00   INFO infer::model::qwen35::weights: weights.rs:461 GPU transfer complete in 1630ms
+2026-05-21T11:56:33.866914+08:00   INFO infer::model::qwen35::weights: weights.rs:465 Qwen3.5 GPU model loaded successfully
+2026-05-21T11:56:34.128140+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:391 GPU memory @ post_model_load: free=6.91 GB / total=16.72 GB
+2026-05-21T11:56:34.128198+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:522 Scheduling envelope (resolved | SGLang-equiv): max_num_batched_tokens=128 | 16384, chunked_prefill_size=128 | 2048, max_prefill_tokens=128 | 16384, mem_fraction_static=0.60 | 0.85, max_slots=1 | (n/a — SGLang has no fixed cap)
+2026-05-21T11:56:34.128215+08:00   INFO infer::scheduler::cuda::core: core.rs:1125 KV cache: using explicit --max-seq-len=128
+2026-05-21T11:56:34.128729+08:00   INFO infer::scheduler::cuda::core::construction: construction.rs:132 Initialized state slot 1/1
+2026-05-21T11:56:34.128750+08:00   INFO infer::scheduler::cuda::core::construction: construction.rs:214 TokenKVPool budget: 0.7 GB (contiguous=0.0 GB, est_workspace=0.3 GB, fraction=60%)
+2026-05-21T11:56:34.128763+08:00   INFO cuda_kernels::paged_kv: paged_kv.rs:333 TokenKVPool: 33040 max tokens (2065 pages @ page_size=16), 0.7 GB for 8 layers (4 kv_heads x 256 head_dim, kv_dim=1024, format=FP8E4M3)
+2026-05-21T11:56:34.129988+08:00   INFO cuda_kernels::paged_kv: paged_kv.rs:421 TokenKVPool FP8E4M3: data=67.7MB/layer scales=1.1MB/layer working=135.3MB
+2026-05-21T11:56:34.153710+08:00   INFO infer::scheduler::cuda::core::construction: construction.rs:245 Scheduler ready: model=Qwen3___5-4B, slots=1, seed=42, max_seq_len=128, max_waiting=256, chunked_prefill_size=128, max_num_batched_tokens=128, max_prefill_tokens=128, prefill_max_requests=none, schedule_policy=fcfs, admission_policy=queue-bound, cold_headroom=default, prefix_cache=on, short_prompt_bypass_tokens=256, stream_interval=1, host_pool=67.1MB, t1_min_prompt_tokens=4096
+2026-05-21T11:56:34.153852+08:00   INFO infer::scheduler::cuda::core::construction: construction.rs:290 Scheduler worker placement: worker=0 gpu=0 numa=None cpus=16 nics=enp34s0
+2026-05-21T11:56:34.208860+08:00   INFO infer::scheduler::cuda::core::emit_worker: emit_worker.rs:77 CUDA detokenizer worker ready: worker=0 numa=None cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.264699+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:565 CUDA scheduler worker ready: worker=0 gpu=0 cuda_ordinal=Some(0) numa=None cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.264737+08:00   INFO infer::scheduler::cuda::core::warmup: warmup.rs:40 Warming up CUDA Graphs for 1 batch sizes (max 1)...
+2026-05-21T11:56:34.297632+08:00   INFO infer: main.rs:1198 Config: model_path=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B, cuda_graph=true, num_slots=1 (explicit), kv_cache_mode=auto (auto-fp8), cuda_workers=1
+2026-05-21T11:56:34.297662+08:00   INFO infer: main.rs:1212 KV cache layout: contiguous=BF16, paged_pool=FP8E4M3
+2026-05-21T11:56:34.297667+08:00   INFO infer: main.rs:1215 Model loaded: elapsed_ms=2448, model_id=Qwen3___5-4B
+2026-05-21T11:56:34.297671+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:421 Waiting for scheduler warmup before accepting traffic (model=Qwen3___5-4B)
+2026-05-21T11:56:34.371098+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=0, layers=0-2, B=1
+2026-05-21T11:56:34.373127+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=1, layers=4-6, B=1
+2026-05-21T11:56:34.373516+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=2, layers=8-10, B=1
+2026-05-21T11:56:34.373894+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=3, layers=12-14, B=1
+2026-05-21T11:56:34.374274+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=4, layers=16-18, B=1
+2026-05-21T11:56:34.374656+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=5, layers=20-22, B=1
+2026-05-21T11:56:34.375231+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=6, layers=24-26, B=1
+2026-05-21T11:56:34.375617+08:00   INFO infer::model::qwen35::batch_decode: batch_decode.rs:943 Piecewise CUDA Graph captured: group=7, layers=28-30, B=1
+2026-05-21T11:56:34.386081+08:00   INFO infer::scheduler::cuda::core::warmup: warmup.rs:119 Autotuning cublasLt GEMM algorithms (1 shapes)...
+2026-05-21T11:56:34.386087+08:00   INFO infer::scheduler::cuda::core::warmup: warmup.rs:126 cublasLt autotune done in 0ms
+2026-05-21T11:56:34.400721+08:00   INFO infer::scheduler::cuda::core::warmup: warmup.rs:153 Re-captured 1 graphs with autotuned GEMM algorithms
+2026-05-21T11:56:34.400853+08:00   INFO infer::scheduler::cuda::core::warmup: warmup.rs:204 Pass 3: warming prefill code paths for 1 batch sizes (max 1)...
+2026-05-21T11:56:34.546710+08:00   INFO infer::scheduler::cuda::core::warmup: warmup.rs:314 Pass 3 prefill warmup done in 146ms (1 batch sizes, max 1)
+2026-05-21T11:56:34.546743+08:00   INFO infer::scheduler::cuda::core::warmup: warmup.rs:174 CUDA Graph warmup done in 282ms (decode=1 batch sizes, prefill=1 batch sizes, max decode 1)
+2026-05-21T11:56:34.546749+08:00   INFO infer::scheduler::cuda::runtime::scheduler_loop: scheduler_loop.rs:115 Scheduler run loop started
+2026-05-21T11:56:34.546768+08:00   INFO infer::backend::cuda::bootstrap: bootstrap.rs:431 Scheduler warmup complete; HTTP readiness may open (model=Qwen3___5-4B)
+2026-05-21T11:56:34.715494+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=0 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.744665+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=1 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.773885+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=2 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.803169+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=3 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.832409+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=4 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.861600+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=5 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.890864+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=6 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.920112+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=7 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.949609+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=8 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:34.978933+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=9 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:35.008312+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=10 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:35.037706+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=11 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:35.067087+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=12 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:35.097115+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=13 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:35.126452+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=14 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:35.155405+08:00   INFO infer::http_server::preprocess: preprocess.rs:105 Tokenizer worker ready: group=0 worker=15 numa=Some(0) cpus=16 affinity_applied=true reason=applied
+2026-05-21T11:56:35.173581+08:00   INFO infer: main.rs:1278 Server listening on 0.0.0.0:8123
+2026-05-21T11:57:00.072461+08:00   INFO infer::http_server::handlers: handlers.rs:935 Received request: prompt_bytes=5, max_tokens=1, stream=false
+2026-05-21T11:57:00.072721+08:00   INFO infer::scheduler::cuda::runtime::admission: admission.rs:663 Request 0 → slot 0 (prompt=1 tokens, queue=0)
+2026-05-21T11:57:00.072741+08:00   INFO infer::scheduler::cuda::prefill: prefill.rs:333 Request 0: prefix MISS
+2026-05-21T11:57:00.072899+08:00   INFO infer::scheduler::cuda::prefill: prefill.rs:376 Request 0: chunked prefill starting (1 effective tokens, chunk_size=128)
+2026-05-21T11:57:00.450167+08:00   INFO infer::scheduler::cuda::execution: execution.rs:988 step breakdown: plan=prefill admission=201us decode=0us emit=0us prefill=377245us total=377446us batch=1
+2026-05-21T11:57:00.450189+08:00   INFO infer::scheduler::cuda::runtime::scheduler_loop: scheduler_loop.rs:387 Request 0 done: 1 tokens (active=0, waiting=0)
+2026-05-21T11:57:00.450234+08:00   INFO infer::scheduler::cuda::runtime::scheduler_loop: scheduler_loop.rs:190 Scheduler step: assign=196us step=377280us cleanup=9us total=377525us active=0
+2026-05-21T11:57:00.450281+08:00   INFO infer::request_trace: handlers.rs:349 request_trace {"chunks_seen":2,"completion_tokens":1,"error":null,"finish_reason":"length","kv":{"fetch_backpressure":false,"fetch_queue_depth":0,"fetch_waiters":0,"gpu_util":0.0,"store_backpressure":false,"store_queue_depth":0},"max_tokens":1,"prefix":{"direct_gpu_attach":false,"hit_rate":0.0,"lookup_latency_us":0,"lookup_reusable_tokens":0,"matched_tokens":0,"prefetch":false,"ready_on_gpu":false,"recompute":false,"request_hit_rate":0.0,"request_skip_rate":0.0,"resume_prefill_tokens":1,"skip_rate":0.0,"staged":false},"preprocess":{"queue_depth":0,"tokenize_us":166,"wait_us":1},"prompt_bytes":5,"prompt_tokens":1,"request_id":"http-15f28833-5b2d-4733-b0ce-a6d80ace37e5","route":"/v1/completions","scheduler":{"active":0,"batch_width":1,"decode_tokens":0,"loop_us":{"cleanup":9,"total":377525},"phase_us":{"admission":201,"decode":0,"emit":0,"prefill":377245,"total":377446},"pipeline_us":{"cpu_plan":5,"gpu_command_queue_depth":1,"gpu_completion_wait":0,"snapshot":0},"prefill_queue":0,"prefill_tokens":1,"running_batch":0,"scheduled_decode_rows":0,"scheduled_prefill_rows":1,"scheduled_rows":1,"step_last_s":0.377446,"waiting":0},"stream":false,"terminal_seen":true,"text_bytes":1,"throughput":{"completion_tokens_per_s_e2e":2.6471297409137384,"prompt_tokens_per_s_at_ttft":2.6471396913112697,"total_tokens_per_s_e2e":5.294259481827477},"token_ids_seen":1,"total_ms":377.767657,"total_tokens":2,"ttft_ms":377.766237}
+2026-05-21T11:57:00.450322+08:00   INFO infer::http_server::handlers: handlers.rs:985 Request completed: prompt_tokens=1, completion_tokens=1

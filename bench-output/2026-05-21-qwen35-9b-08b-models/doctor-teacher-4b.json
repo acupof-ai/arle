@@ -1,0 +1,102 @@
+{
+  "schema_version": 3,
+  "mode": "doctor",
+  "status": "warn",
+  "version": "0.1.5",
+  "compiled_backend": "none",
+  "supports_inference": false,
+  "tty": {
+    "stdin": false,
+    "stdout": false,
+    "stderr": false
+  },
+  "cpu": {
+    "name": "AMD Ryzen 7 3700X 8-Core Processor",
+    "cores": 16
+  },
+  "ram_gb": {
+    "total": 31.282672882080078,
+    "available": 26.109867095947266,
+    "effective": 0.0
+  },
+  "gpu": {
+    "kind": "cuda",
+    "name": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "memory_gb": 15.9921875
+  },
+  "inputs": {
+    "env_model": null,
+    "model_path_arg": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B",
+    "hf_cache_root": "/home/ckl/.cache/huggingface/hub"
+  },
+  "resolution": {
+    "status": "ok",
+    "selected": {
+      "origin": "arg_model_path",
+      "value": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B",
+      "local_path": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B"
+    },
+    "error_code": null,
+    "error": null
+  },
+  "discovery": {
+    "preferred_local_model": {
+      "model_id": "Qwen/Qwen3-0.6B",
+      "path": "/home/ckl/projects/arle/infer/models/Qwen3-0.6B"
+    },
+    "supported_hub_snapshots": [
+      {
+        "model_id": "Qwen/Qwen3.5-0.8B-Base",
+        "path": "/home/ckl/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"
+      },
+      {
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "path": "/home/ckl/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17"
+      },
+      {
+        "model_id": "Qwen/Qwen3-8B-AWQ",
+        "path": "/home/ckl/.cache/huggingface/hub/models--Qwen--Qwen3-8B-AWQ/snapshots/4da05a8edb55c6046cce958586c33b61da07bb79"
+      }
+    ]
+  },
+  "recommendations": [],
+  "tools": {
+    "enabled_by_default": true,
+    "builtin_tools": [
+      "shell",
+      "python"
+    ],
+    "sandbox_backend": "bare",
+    "sandboxed": false,
+    "timeout_secs": 30,
+    "max_memory_mb": 512,
+    "workdir": "/home/ckl/projects/arle",
+    "python": "/usr/bin/python3"
+  },
+  "checks": [
+    {
+      "code": "backend_missing",
+      "name": "backend",
+      "status": "warn",
+      "message": "host NVIDIA GPU detected; rebuild with the default `cuda` feature to run inference"
+    },
+    {
+      "code": "catalog_backendless",
+      "name": "catalog",
+      "status": "warn",
+      "message": "backend-specific recommendations require a build with `cuda`, `metal,no-cuda`, or `cpu,no-cuda`"
+    },
+    {
+      "code": "resolution_resolved",
+      "name": "resolution",
+      "status": "ok",
+      "message": "resolved a model source"
+    },
+    {
+      "code": "tool_sandbox_missing",
+      "name": "tool_sandbox",
+      "status": "warn",
+      "message": "built-in shell/python tools are enabled by default and no supported sandbox backend was detected"
+    }
+  ]
+}

@@ -116,3 +116,94 @@ loader_smoke_qwen3_0_6b: last-row logits[..5] =
 - Teacher BF16 infer smoke: blocked by GPU memory
 
 Raw artefacts are in this directory.
+
+## Pivot 2026-05-21: runnable 4B teacher
+
+The 9B teacher remains blocked on this 16 GB card:
+
+- `tclf90/Qwen3.5-9B-AWQ` is blocked by ARLE infer's missing zero-point AWQ
+  decode path for `qweight/qzeros/scales` tensors.
+- `Qwen/Qwen3.5-9B` BF16 is blocked by the 16 GB HBM ceiling before a single
+  token can be decoded.
+
+The runnable substitute is `Qwen/Qwen3.5-4B` from ModelScope. This keeps the
+same Qwen3.5 family, keeps the distillation ratio at roughly 5x parameters
+versus the 0.8B student, and fits on the RTX 4070 Ti SUPER. AWQ zero-point
+support is filed as a separate axis, not on the critical path for the
+distillation demo.
+
+Download note: the first ModelScope command used `cache_dir='~/.cache/...'`,
+which the Python API treated as a literal relative directory. The downloaded
+snapshot was moved to the canonical cache path:
+`/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B`.
+
+4B teacher metadata:
+
+```text
+repo=Qwen/Qwen3.5-4B
+path=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B
+dtype=bfloat16
+hidden_size=2560
+intermediate_size=9216
+num_hidden_layers=32
+num_attention_heads=16
+num_key_value_heads=4
+head_dim=256
+vocab_size=248320
+shards=2
+directory_size=8.8G
+```
+
+Exact smoke command requested in the pivot:
+
+```bash
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+target/release/arle serve --backend cuda \
+  --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B \
+  --port 8123 -- \
+  --num-slots 1 --max-seq-len 128 --chunked-prefill-size 128 \
+  --max-num-batched-tokens 128
+```
+
+Result: server loaded and decoded one token:
+
+```json
+{"choices":[{"text":",","finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+```
+
+Default `mem_fraction_static=0.85` smoke facts:
+
+```text
+Memory-mapped 2 shard(s) (9319.8 MB)
+GPU transfer complete in 1650ms
+GPU memory @ post_model_load: free=6.91 GB / total=16.72 GB
+TokenKVPool budget: 4.5 GB
+nvidia-smi infer process: 14298 MiB
+```
+
+For Phase 2, the more practical same-shape smoke uses
+`--mem-fraction-static 0.60`, which keeps the teacher runnable with more HBM
+left for the student:
+
+```bash
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+target/release/arle serve --backend cuda \
+  --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B \
+  --port 8123 -- \
+  --num-slots 1 --max-seq-len 128 --chunked-prefill-size 128 \
+  --max-num-batched-tokens 128 --mem-fraction-static 0.60
+```
+
+Low-memory result:
+
+```text
+TokenKVPool budget: 0.7 GB
+nvidia-smi infer process: 10650 MiB
+completion: "Hello" -> ",", max_tokens=1
+```
