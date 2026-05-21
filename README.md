@@ -123,7 +123,7 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 | **CUDA** | Linux + NVIDIA | **Stable** | Continuous batching, paged KV, radix-backed reuse, TileLang BF16 attention, CUDA Graph decode. L4 / Qwen3.5-4B BF16 + FP8 KV: **197 tok/s @ c=16 / 4k-in**. |
 | **Metal** | Apple Silicon | **Beta** | Scheduler-backed serving, chunked prefill, replay prefix reuse. Qwen3.6 35B-A3B 4-bit MLX HTTP serve: **85.6 tok/s decode / 385 ms TTFT** on M4 Pro 48GB (256/91, temp 0) — at parity with `mlx-lm` direct (86.3), both at ~78% of the 273 GB/s unified-memory ceiling. Qwen3.5-0.8B MLX-4bit step-driver: **305.5 tok/s** on M4 Pro 20c. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3.5. Qwen3.5-4B-4bit bit-identical, c=1..8. |
-| **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | End-to-end real-checkpoint OPD step at Qwen3-0.6B + RTX 4070 Ti SUPER: **0.164 s/step** with full-finetune (~170× over naive scratch baseline). **2.04× faster than HuggingFace TRL `GKDTrainer`** at the matched setup (same checkpoint, same prompts, same `rollout_len=8`, same `lr=1e-7`, same 500 steps — ARLE 0.200 s/step vs TRL 0.409 s/step, ARLE -18.5 % held-out KL vs TRL -5.5 %). Moderate-shape OPD step **48.5 ms** — **1.71× faster than PyTorch CUDA reference** (83 ms). **LoRA-only OPD: 0.140 s/step at just 3.9 GB peak GPU memory — fits on 4 GB consumer cards** (`r=16` adapters on `q/v`, 2.29 M trainable params, -36 % held-out KL in 500 steps). Real-text supervision via `--prompts-file <jsonl>` (commit `50ef595`, uses checkpoint's tokenizer.json). Convergence verified at lr=1e-7: held-out exact-overlap **50 → 82.8 %** over 5k steps with KL/NLL still monotonically falling. Charts: [step-time arc](docs/projects/img/2026-05-21-opd-cuda-step-arc.png) · [convergence](docs/projects/img/2026-05-21-opd-cuda-convergence.png) · [usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
+| **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | End-to-end real-checkpoint OPD step at Qwen3-0.6B + RTX 4070 Ti SUPER: **0.164 s/step** with full-finetune (~170× over naive scratch baseline). **2.04× faster than HuggingFace TRL `GKDTrainer`** at the matched setup (same checkpoint, same prompts, same `rollout_len=8`, same `lr=1e-7`, same 500 steps — ARLE 0.200 s/step vs TRL 0.409 s/step, ARLE -18.5 % held-out KL vs TRL -5.5 %). Moderate-shape OPD step **48.5 ms** — **1.71× faster than PyTorch CUDA reference** (83 ms). **LoRA-only OPD: 0.140 s/step at just 3.9 GB peak GPU memory — fits on 4 GB consumer cards** (`r=16` adapters on `q/v`, 2.29 M trainable params, -36 % held-out KL in 500 steps). **Cross-runtime large-teacher path now runs Qwen3.5-4B teacher via `infer` → Qwen3.5-0.8B-Base LoRA student via `train`: 5.66 s/step, 14.8 GiB peak, 200-step KL monotonic down (-1.66 % train / -2.05 % held-out).** Real-text supervision via `--prompts-file <jsonl>` (commit `50ef595`, uses checkpoint's tokenizer.json). Convergence verified at lr=1e-7: held-out exact-overlap **50 → 82.8 %** over 5k steps with KL/NLL still monotonically falling. Charts: [step-time arc](docs/projects/img/2026-05-21-opd-cuda-step-arc.png) · [convergence](docs/projects/img/2026-05-21-opd-cuda-convergence.png) · [usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
 | **CPU** | Portable | **Dev-only** | Smoke tests and request-path validation; not a perf target. |
 
 Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B; dense, hybrid linear-attn, and MoE; GGUF Q4_K_M and 4B hybrid attention) on CUDA + Metal. **Qwen3.6 / Qwen3.5-MoE** has a narrow Metal Beta path; CUDA stubbed. Next-model queue: **DeepSeek V4 (#1)** → **Qwen 3.6 (#2)**, see [ROADMAP.md](ROADMAP.md#next-model-priority-order). DeepSeek V2/V3/R1 intentionally out of scope.
@@ -155,7 +155,7 @@ Latest benchmark snapshots (per change, dated): [docs/experience/wins/](docs/exp
 | `arle` (no args) | Interactive agent REPL with built-in `python` and `shell` tools (sandboxed). |
 | `arle run --prompt "…"` / `--stdin --json` | Script-friendly one-shot agent prompt. Use `--no-tools` to disable tool execution. |
 | `arle serve --backend {cuda,metal,cpu} --model-path …` | Launch the OpenAI-compatible HTTP server through an ARLE-native backend. |
-| `arle train opd` | **On-Policy Distillation** — the one in-tree training surface (teacher in `infer`, student LoRA or full-finetune on the same runtime). CUDA path runs Qwen3-0.6B at **0.164 s/step** on RTX 4070 Ti SUPER (~170× over naive). Usage manual: [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). Pretrain / SFT / GRPO / multi-turn RL were retired 2026-05-18 ([rationale](docs/projects/2026-05-18-opd-only-pivot.md)). |
+| `arle train opd` | **On-Policy Distillation** — the one in-tree training surface (teacher in `infer`, student LoRA or full-finetune on the same runtime). CUDA path runs Qwen3-0.6B at **0.164 s/step** on RTX 4070 Ti SUPER (~170× over naive); the cross-runtime Qwen3.5-4B → Qwen3.5-0.8B LoRA path runs at **5.66 s/step** with monotonic 200-step KL decrease. Usage manual: [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). Pretrain / SFT / GRPO / multi-turn RL were retired 2026-05-18 ([rationale](docs/projects/2026-05-18-opd-only-pivot.md)). |
 | `arle --doctor [--json] [--strict]` | Self-check: backend, hardware, HF cache, model resolution. CI-friendly. |
 
 The REPL persists line history at `~/.arle-history` and exposes slash commands: `/help`, `/reset`, `/clear`, `/tools`, `/model`, `/stats`, `/models`, `/save`, `/load`, `/export`.
@@ -180,6 +180,20 @@ Operators who want only the native serving binary can use `infer` directly (`car
   | peak GPU memory (GB) | 12.6 | 15.4 | **3.93** (fits 4 GB cards) |
   | held-out KL reduction (500 steps) | -5.5 % | **-18.5 %** | **-36.4 %** |
 
+  **Large-teacher path now measured through the production runtime boundary.**
+  Qwen3.5-4B BF16 teacher runs in `infer`; Qwen3.5-0.8B-Base LoRA r=16 student
+  trains in `train` through the `InferTeacher` device-logits bridge. On the same
+  RTX 4070 Ti SUPER, the 200-step real-text run completes at **5.66 s/step**
+  mean, **14.8 GiB** peak GPU memory, and monotonic KL decrease:
+
+  | Setup | Step time | Peak GPU memory | 200-step KL |
+  |---|---:|---:|---:|
+  | Qwen3.5-4B teacher → Qwen3.5-0.8B LoRA student | **5.66 s** | **14.8 GiB** | train **-1.66 %**, held-out **-2.05 %** |
+
+  This is a directionality and systems-path result, not yet a quality headline:
+  9B-class teachers still need the quantized infer-teacher path, and larger
+  eval runs remain the next step for benchmark-quality claims.
+
   **What the user pays vs what the user gets.** Migration cost is bounded —
   ARLE reuses the same artefacts HuggingFace users already have, and the
   switching surface is one CLI invocation instead of an `accelerate launch`.
@@ -203,7 +217,8 @@ Operators who want only the native serving binary can use `infer` directly (`car
   [`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md) ·
   [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) ·
   [`docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`](docs/projects/2026-05-21-opd-industry-positioning-best-framework.md) ·
-  [`docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md`](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md).
+  [`docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md`](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md) ·
+  [`docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md`](docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md).
 - **2026-05-15** — DSv4 DeepEP decode lands default B=1 padded BF16
   reduce-scatter combine, fused local-expert prepare kernel, and broad
   scratch-reuse cleanup. Real 8xH20 on `DeepSeek-V4-Flash`: `decode64` holds
