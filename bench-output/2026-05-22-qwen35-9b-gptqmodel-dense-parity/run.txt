@@ -1,0 +1,2 @@
+dense_tensor_count=576 gate_pass=False
+dense tensor bit-compare failed; skipping module scan

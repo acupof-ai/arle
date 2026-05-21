@@ -215,18 +215,23 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
 2. Done: layer-local projection parity harness landed as
    `infer/examples/gptqmodel_w4_gemv_parity.rs`. Sampled W4 projections pass
    ARLE CUDA W4A16 GEMV vs faithful GPTQ reference at <=0.25% RMSE/reference-RMS.
-3. Next: projection parity passed, so scan dense fallback modules under the same
-   checkpoint: embedding, linear-attention dense tensors, final norm, and
-   untied lm_head.
-4. Re-run multi-token generation before any OPD bench or headline switch.
+3. Done: dense fallback scan found a gate failure before module parity:
+   `DavidWen2025/Qwen3.5-9B-GPTQ-4bit` mutates 48 linear-attention dense
+   tensors (`A_log` and `norm.weight`) versus the BF16 source. Hold this
+   checkpoint until a module-level forward parity gate licenses that drift or a
+   cleaner checkpoint preserves dense tensors.
+4. Re-run multi-token generation before any OPD bench or headline switch only
+   after the dense/module parity gate is licensed.
 
 Evidence:
 
 ```text
 docs/experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-generation-kill.md
 docs/research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md
+docs/experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-dense-tensor-kill.md
 bench-output/2026-05-22-qwen35-9b-gptq-int4-loader/
 bench-output/2026-05-22-qwen35-9b-gptqmodel-layerlocal/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-dense-parity/
 ```
 
 ## Implementation Order
@@ -247,5 +252,7 @@ bench-output/2026-05-22-qwen35-9b-gptqmodel-layerlocal/
   [`../experience/errors/2026-05-21-arle-qwen35-9b-fp8-compressed-tensors-layout-kill.md`](../experience/errors/2026-05-21-arle-qwen35-9b-fp8-compressed-tensors-layout-kill.md)
 - GPTQModel W4 layer-local parity:
   [`../research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md`](../research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md)
+- GPTQModel dense tensor kill:
+  [`../experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-dense-tensor-kill.md`](../experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-dense-tensor-kill.md)
 - Infer-teacher adapter:
   [`../../crates/train/src/teacher_infer.rs`](../../crates/train/src/teacher_infer.rs)
