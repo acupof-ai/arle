@@ -1,0 +1,7 @@
+{
+  "model": "Qwen3___5-9B-TQ4",
+  "prompt": "Explain on-policy distillation in two sentences.",
+  "max_tokens": 64,
+  "temperature": 0,
+  "stream": false
+}

@@ -6,32 +6,26 @@
 # backend works for the smoke path). Takes < 30 s on a recent laptop —
 # verifies your build is sane and you can see an OPD loss curve come out.
 #
-# Real-models mode: set ARLE_TEACHER + ARLE_STUDENT to local directories,
-# HuggingFace IDs, or ModelScope IDs. The script will auto-download remote
-# IDs on first run, then run real OPD distillation through the
-# `opd_step_cuda_infer_teacher_train` example. Downloads resume on retry.
+# Real-models mode: set ARLE_TEACHER + ARLE_STUDENT to HuggingFace or
+# ModelScope IDs. The script will auto-download them on first run, then run
+# real OPD distillation through `arle train opd --teacher-model
+# <teacher-dir> --student-model <student-dir>`. Downloads resume on retry.
 #
 # Examples:
 #
 #   # Smoke (default, < 30 s, no internet, no GPU strictly required)
 #   ./examples/opd/run-distillation.sh
 #
-#   # Headline distillation: local Qwen3.5-9B-TQ4 → Qwen3.5-0.8B-Base.
-#   # The TQ4 teacher is produced by scripts/turboquant_weights.py from the
-#   # ModelScope Qwen/Qwen3.5-9B BF16 checkpoint. Keep lm_head.weight dense.
-#   ARLE_TEACHER=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4 \
-#   ARLE_STUDENT=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base \
-#   ARLE_STEPS=100 \
-#   ARLE_ROLLOUT_LEN=4 \
-#   ARLE_LR=1e-5 \
-#   ./examples/opd/run-distillation.sh
-#
-#   # Smaller reference from ModelScope
+#   # Real distillation Qwen3.5-4B → Qwen3.5-0.8B-Base from ModelScope
 #   ARLE_TEACHER=Qwen/Qwen3.5-4B \
 #   ARLE_STUDENT=Qwen/Qwen3.5-0.8B-Base \
-#   ARLE_STEPS=200 \
-#   ARLE_ROLLOUT_LEN=8 \
-#   ARLE_LR=1e-5 \
+#   ARLE_STEPS=500 \
+#   ./examples/opd/run-distillation.sh
+#
+#   # Same but HuggingFace
+#   ARLE_SOURCE=huggingface \
+#   ARLE_TEACHER=Qwen/Qwen3.5-4B \
+#   ARLE_STUDENT=Qwen/Qwen3.5-0.8B-Base \
 #   ./examples/opd/run-distillation.sh
 
 set -euo pipefail
@@ -42,14 +36,10 @@ ARLE_TEACHER="${ARLE_TEACHER:-}"
 ARLE_STUDENT="${ARLE_STUDENT:-}"
 ARLE_SOURCE="${ARLE_SOURCE:-modelscope}"     # modelscope | huggingface
 ARLE_STEPS="${ARLE_STEPS:-5}"
-ARLE_ROLLOUT_LEN="${ARLE_ROLLOUT_LEN:-4}"
+ARLE_ROLLOUT_LEN="${ARLE_ROLLOUT_LEN:-8}"
 ARLE_LR="${ARLE_LR:-1e-4}"
 ARLE_GRAD_CLIP="${ARLE_GRAD_CLIP:-1.0}"
 ARLE_BACKEND="${ARLE_BACKEND:-auto}"
-ARLE_PROMPTS_FILE="${ARLE_PROMPTS_FILE:-examples/opd/sample-prompts.jsonl}"
-ARLE_EVAL_STEPS="${ARLE_EVAL_STEPS:-}"
-ARLE_PROMPT_MAX_TOKENS="${ARLE_PROMPT_MAX_TOKENS:-16}"
-ARLE_MAX_STEP_SECONDS="${ARLE_MAX_STEP_SECONDS:-90}"
 ARLE_VENV="${ARLE_VENV:-$PWD/.venv}"
 ARLE_OUTPUT_DIR="${ARLE_OUTPUT_DIR:-$PWD/opd-output/$(date +%Y%m%d-%H%M%S)}"
 
@@ -129,14 +119,9 @@ resolve_model() {
   local model_id="$1"
   ARLE_RESOLVE_ID="$model_id" ARLE_RESOLVE_SOURCE="$ARLE_SOURCE" $PY - <<'PY'
 import os, sys
-from pathlib import Path
 model_id = os.environ["ARLE_RESOLVE_ID"]
 source = os.environ["ARLE_RESOLVE_SOURCE"]
 try:
-    local = Path(model_id).expanduser()
-    if local.is_dir():
-        print(local)
-        raise SystemExit(0)
     if source == "modelscope":
         from modelscope import snapshot_download
         path = snapshot_download(
@@ -165,29 +150,17 @@ echo "[run-distillation] resolving student: $ARLE_STUDENT"
 STUDENT_DIR="$(resolve_model "$ARLE_STUDENT")"
 echo "[run-distillation]   → $STUDENT_DIR"
 
-echo "[run-distillation] launching InferTeacher OPD example…"
+echo "[run-distillation] launching arle train opd…"
 echo "[run-distillation] output: $ARLE_OUTPUT_DIR/run.txt"
-if [[ -z "$ARLE_EVAL_STEPS" ]]; then
-  ARLE_EVAL_STEPS="0,$((ARLE_STEPS / 4)),$((ARLE_STEPS / 2)),$ARLE_STEPS"
-fi
-
-echo "[run-distillation] prompts: $ARLE_PROMPTS_FILE"
-echo "[run-distillation] eval steps: $ARLE_EVAL_STEPS"
-
-NVCC_CCBIN="${NVCC_CCBIN:-/usr/bin/g++-14}" \
-INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-$ARLE_VENV/bin/python}" \
-CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-13010}" \
-TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}" \
-cargo run -p train --example opd_step_cuda_infer_teacher_train --release --features cuda -- \
+"$ARLE_BIN" train opd \
+  --backend "$ARLE_BACKEND" \
   --teacher-model "$TEACHER_DIR" \
   --student-model "$STUDENT_DIR" \
-  --prompts-file "$ARLE_PROMPTS_FILE" \
   --lr "$ARLE_LR" \
   --steps "$ARLE_STEPS" \
   --rollout-len "$ARLE_ROLLOUT_LEN" \
-  --eval-steps "$ARLE_EVAL_STEPS" \
-  --prompt-max-tokens "$ARLE_PROMPT_MAX_TOKENS" \
-  --max-step-seconds "$ARLE_MAX_STEP_SECONDS" \
+  --grad-clip "$ARLE_GRAD_CLIP" \
+  --json \
   2>&1 | tee "$ARLE_OUTPUT_DIR/run.txt"
 
 echo "[run-distillation] done. Output: $ARLE_OUTPUT_DIR/run.txt"

@@ -1,0 +1,7 @@
+{
+  "model": "Qwen3___5-9B-TQ4",
+  "prompt": "Hello, world! Tell me a short story about a small robot.",
+  "max_tokens": 64,
+  "temperature": 0,
+  "stream": false
+}

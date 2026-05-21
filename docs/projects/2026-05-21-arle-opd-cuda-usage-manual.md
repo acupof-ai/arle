@@ -6,17 +6,6 @@
 
 ## Headline numbers
 
-**Cross-runtime large-teacher OPD (RTX 4070 Ti SUPER 16 GB, LoRA r=16):**
-
-- **Qwen3.5-9B-TQ4 → Qwen3.5-0.8B-Base LoRA**: **4.30 s/step**,
-  **15.9 GiB peak**, `rollout_len=4`, held-out KL
-  `1.8211e-5 → 1.8025e-5` over 100 steps, no OOM/NaN.
-- **Qwen3.5-4B BF16 → Qwen3.5-0.8B-Base LoRA** remains the smaller
-  scaling reference: **5.66 s/step**, **14.8 GiB peak**, held-out KL
-  `-2.05%` over 200 steps.
-- The 9B teacher uses the production `infer` runtime through the
-  `InferTeacher` bridge; student update stays in `train`.
-
 **Step time on Qwen3-0.6B (RTX 4070 Ti SUPER 16 GB, full-finetune, lr=1e-7):**
 
 ![Step-time arc across the 2026-05-21 session — 10.41 s → 0.164 s (~30 ×)](img/2026-05-21-opd-cuda-step-arc.png)
@@ -53,36 +42,19 @@ NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
 CUDARC_CUDA_VERSION=13010 \
 TORCH_CUDA_ARCH_LIST=8.9 \
-cargo build -p train --example opd_step_cuda_infer_teacher_train --release --features cuda
+cargo build -p train --example opd_step_cuda_realckpt_train --release --features cuda
 
-# 2. Headline run: Qwen3.5-9B-TQ4 infer teacher -> Qwen3.5-0.8B LoRA student.
-#    The Qwen3___5-9B-TQ4 directory is produced from the ModelScope BF16
-#    checkpoint with scripts/turboquant_weights.py; keep the dense BF16
-#    lm_head.weight from the validated TQ4 checkpoint.
+# 2. Run a 500-step OPD convergence experiment against a real Qwen3-0.6B
+#    checkpoint (loaded from the local ModelScope cache).
 NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
 CUDARC_CUDA_VERSION=13010 \
 TORCH_CUDA_ARCH_LIST=8.9 \
-cargo run -p train --example opd_step_cuda_infer_teacher_train --release --features cuda -- \
-  --teacher-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4 \
-  --student-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base \
-  --prompts-file examples/opd/sample-prompts.jsonl \
-  --steps 100 --rollout-len 4 --lr 1e-5 \
-  --eval-steps 0,25,50,100 --prompt-max-tokens 16
+cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- \
+  --lr 1e-7 --steps 500 --rollout-len 8 --prompt-set 32 \
+  --eval-steps 0,50,100,250,500
 
-# 3. Smaller scaling reference: Qwen3.5-4B BF16 -> Qwen3.5-0.8B LoRA.
-NVCC_CCBIN=/usr/bin/g++-14 \
-INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
-CUDARC_CUDA_VERSION=13010 \
-TORCH_CUDA_ARCH_LIST=8.9 \
-cargo run -p train --example opd_step_cuda_infer_teacher_train --release --features cuda -- \
-  --teacher-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B \
-  --student-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base \
-  --prompts-file examples/opd/sample-prompts.jsonl \
-  --steps 200 --rollout-len 8 --lr 1e-5 \
-  --eval-steps 0,50,100,200 --prompt-max-tokens 16
-
-# 4. For the in-train same-checkpoint convergence control, use the 0.6B harness.
+# 3. Or run the same harness against a JSONL of real text prompts.
 NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
 CUDARC_CUDA_VERSION=13010 \
@@ -90,13 +62,19 @@ TORCH_CUDA_ARCH_LIST=8.9 \
 cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- \
   --prompts-file examples/opd/sample-prompts.jsonl --lr 1e-7 --steps 500 \
   --eval-steps 0,100,250,500
+
+# 4. For adapter-only training, run the LoRA harness. It shares the frozen
+#    base with the teacher and trains q/v rank16 adapters only.
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo run -p train --example opd_step_cuda_realckpt_lora_bench --release --features cuda -- \
+  --lr 1e-5 --steps 500 --rollout-len 8 --prompt-set 32 \
+  --eval-steps 0,50,100,250,500
 ```
 
 Expected on RTX 4070 Ti SUPER:
-- 9B-TQ4 -> 0.8B LoRA headline: **~4.3 sec/step**, **~15.9 GiB peak**,
-  held-out KL monotonic over the 100-step gate.
-- 4B BF16 -> 0.8B LoRA reference: **~5.7 sec/step**, **~14.8 GiB peak**,
-  held-out KL monotonic over the 200-step gate.
 - Mean step seconds: **~0.20 sec/step** (the eval-cadenced harness adds
   per-step instrumentation overhead; the bare `opd_step_cuda_moderate_bench`
   reports **0.164 sec/step**)
@@ -116,8 +94,8 @@ Expected on RTX 4070 Ti SUPER:
 | CUDA driver | 13.0 or newer (CUDA 13.2 driver verified) |
 | Rust | 1.95+ |
 | Python venv | `/home/<user>/projects/arle/.venv/bin/python` with PyTorch 2.11.0+cu130. The PyTorch venv is only needed for the comparison baseline (`pytorch_cuda_opd_baseline.py`) and TileLang's NVRTC support; ARLE's training path itself is pure Rust + cudarc. |
-| Model checkpoint | Headline teacher: `/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4`; headline student: `/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base`. The older same-checkpoint harness still supports Qwen3-0.6B controls. |
-| Workspace memory | 9B-TQ4 -> 0.8B LoRA at `rollout_len=4` observed `15878 MiB` peak on a 16 GiB card. Qwen3-0.6B q/v rank16 LoRA observed `3934 MiB` peak. |
+| Model checkpoint | Qwen3-0.6B safetensors in the local ModelScope cache (`~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B/`). The training harness loads from this path by default. |
+| Workspace memory | ~15 GB peak for Qwen3-0.6B full-finetune at `rollout_len=8`; q/v rank16 LoRA observed `3934 MiB` peak. |
 
 Env vars (all required for the CUDA build):
 
@@ -136,10 +114,8 @@ entry first.
 
 | Knob | Recommended | Why |
 |---|---|---|
-| Headline teacher | `Qwen3___5-9B-TQ4` via `opd_step_cuda_infer_teacher_train` | This is the largest licensed teacher on the 16 GiB test card. It keeps the validated dense BF16 lm head and uses TQ4 for the layer projections. |
-| Headline student | `Qwen3___5-0___8B-Base`, LoRA rank16, target set `attention-qv` | Full student finetune with a 9B teacher is not the memory target; LoRA keeps trainable state small and matches the production OPD use case. |
 | `--lr` | `1e-7` for Qwen3-0.6B full-finetune from near-teacher init | `5e-5` diverges catastrophically (KL ratio 288232×). Confirmed by [`docs/research/2026-05-21-arle-cuda-opd-convergence-h1-vs-h2.md`](../research/2026-05-21-arle-cuda-opd-convergence-h1-vs-h2.md). |
-| `--rollout-len` | `4` for 9B-TQ4 -> 0.8B on 16 GiB; `8` for 0.6B/4B controls | The original 9B-TQ4 run at rollout 8 OOMed near `15.8/16.4 GiB`; rollout 4 completed with monotonic held-out KL. For small same-checkpoint controls, `16` was tested and did not improve held-out exact-overlap over `8`. |
+| `--rollout-len` | `8` | `16` was tested and held-out overlap plateaued identically at 64 % — rollout length isn't the binding constraint at our prompt scale. Confirmed by [`docs/research/2026-05-21-arle-cuda-opd-rollout-len-16-a-b.md`](../research/2026-05-21-arle-cuda-opd-rollout-len-16-a-b.md). |
 | Prompt source | Use `--prompts-file <jsonl>` for real text supervision; keep `--prompt-set 32` for matched-control regression runs | JSONL prompt loading uses the checkpoint's `tokenizer.json` and is the user-facing path. `--prompt-set 32` brings held-out KL down -8.63 % vs `8` at the same step count and remains useful as a fixed benchmark control. Confirmed by [`docs/research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md`](../research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md) and [`docs/experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md`](../experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md). |
 | `--steps` | `500` for substrate validation, `5000+` for real convergence study | 500-step run completes in ~2 minutes wall-clock; 5000-step in ~17 minutes. Held-out exact-overlap doesn't break the 64 % staircase until step ~3500; held-out KL+NLL improve monotonically throughout. |
 | `--eval-steps` | `0,50,100,250,500` (or include 1000, 2500, 5000 for longer runs) | Comma-separated list of step indices at which to greedy-decode held-out prompts and report all four metrics. |
