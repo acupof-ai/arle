@@ -1,0 +1,798 @@
+{
+  "gate": "rmse_over_rhs_rms <= 0.01",
+  "results": [
+    {
+      "label": "layer0-mlp-down",
+      "tensor_base": "model.language_model.layers.0.mlp.down_proj",
+      "rows": 4096,
+      "cols": 12288,
+      "max_abs": 0.015625,
+      "mean_abs": 0.0009130298858508468,
+      "rmse": 0.001802531595557099,
+      "rhs_rms": 0.7047128973611907,
+      "rmse_over_rhs_rms": 0.002557824047646508,
+      "max_rel": 5.657894611358643,
+      "mean_rel": 0.010505229450131992,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.828125,
+          "fused_gemv": 0.828125,
+          "index": 0,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 1.0546875,
+          "fused_gemv": 1.0546875,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.8203125,
+          "fused_gemv": -0.8203125,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.00146484375,
+          "bulk_dequant_cublas": 0.07177734375,
+          "fused_gemv": 0.0732421875,
+          "index": 3,
+          "rel_err": 0.020408162847161293
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.337890625,
+          "fused_gemv": -0.337890625,
+          "index": 4,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.19921875,
+          "fused_gemv": -0.19921875,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.1767578125,
+          "fused_gemv": 0.1767578125,
+          "index": 6,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": -0.353515625,
+          "fused_gemv": -0.35546875,
+          "index": 7,
+          "rel_err": 0.005524862091988325
+        }
+      ]
+    },
+    {
+      "label": "layer0-mlp-gate",
+      "tensor_base": "model.language_model.layers.0.mlp.gate_proj",
+      "rows": 12288,
+      "cols": 4096,
+      "max_abs": 0.0078125,
+      "mean_abs": 0.0005269470990848882,
+      "rmse": 0.0010200931715351007,
+      "rhs_rms": 0.40839972895704946,
+      "rmse_over_rhs_rms": 0.002497781215820498,
+      "max_rel": 1526.1993408203125,
+      "mean_rel": 0.13863844379363854,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.4140625,
+          "fused_gemv": -0.4140625,
+          "index": 0,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.20703125,
+          "fused_gemv": 0.20703125,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.71875,
+          "fused_gemv": 0.71875,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": 0.1796875,
+          "fused_gemv": 0.1806640625,
+          "index": 3,
+          "rel_err": 0.005434782709926367
+        },
+        {
+          "abs_err": 0.00048828125,
+          "bulk_dequant_cublas": 0.072265625,
+          "fused_gemv": 0.07177734375,
+          "index": 4,
+          "rel_err": 0.006756756920367479
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.56640625,
+          "fused_gemv": 0.56640625,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.166015625,
+          "fused_gemv": 0.166015625,
+          "index": 6,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.64453125,
+          "fused_gemv": 0.64453125,
+          "index": 7,
+          "rel_err": 0.0
+        }
+      ]
+    },
+    {
+      "label": "layer0-mlp-up",
+      "tensor_base": "model.language_model.layers.0.mlp.up_proj",
+      "rows": 12288,
+      "cols": 4096,
+      "max_abs": 0.0078125,
+      "mean_abs": 0.0005096865255230417,
+      "rmse": 0.0009784491757410957,
+      "rhs_rms": 0.3884690580087436,
+      "rmse_over_rhs_rms": 0.002518731300651165,
+      "max_rel": 4.591836929321289,
+      "mean_rel": 0.009938551390329545,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.28515625,
+          "fused_gemv": -0.28515625,
+          "index": 0,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": 0.1123046875,
+          "fused_gemv": 0.11328125,
+          "index": 1,
+          "rel_err": 0.008695651777088642
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": -0.208984375,
+          "fused_gemv": -0.2109375,
+          "index": 2,
+          "rel_err": 0.009345794096589088
+        },
+        {
+          "abs_err": 0.0006103515625,
+          "bulk_dequant_cublas": -0.0262451171875,
+          "fused_gemv": -0.025634765625,
+          "index": 3,
+          "rel_err": 0.023255813866853714
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": -0.134765625,
+          "fused_gemv": -0.13671875,
+          "index": 4,
+          "rel_err": 0.014492753893136978
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.5234375,
+          "fused_gemv": 0.5234375,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": 0.267578125,
+          "fused_gemv": 0.265625,
+          "index": 6,
+          "rel_err": 0.007299270015209913
+        },
+        {
+          "abs_err": 0.00048828125,
+          "bulk_dequant_cublas": -0.068359375,
+          "fused_gemv": -0.06787109375,
+          "index": 7,
+          "rel_err": 0.0071428571827709675
+        }
+      ]
+    },
+    {
+      "label": "layer10-mlp-gate",
+      "tensor_base": "model.language_model.layers.10.mlp.gate_proj",
+      "rows": 12288,
+      "cols": 4096,
+      "max_abs": 0.0078125,
+      "mean_abs": 0.00054884486598894,
+      "rmse": 0.0010549820192550035,
+      "rhs_rms": 0.414406758531513,
+      "rmse_over_rhs_rms": 0.002545764511644129,
+      "max_rel": 29.0944881439209,
+      "mean_rel": 0.014326672850719055,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": -0.2060546875,
+          "fused_gemv": -0.20703125,
+          "index": 0,
+          "rel_err": 0.004739336669445038
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.267578125,
+          "fused_gemv": -0.267578125,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.10888671875,
+          "fused_gemv": -0.10888671875,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.40625,
+          "fused_gemv": 0.40625,
+          "index": 3,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.220703125,
+          "fused_gemv": -0.220703125,
+          "index": 4,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.400390625,
+          "fused_gemv": -0.400390625,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.038330078125,
+          "fused_gemv": 0.038330078125,
+          "index": 6,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": -0.138671875,
+          "fused_gemv": -0.1396484375,
+          "index": 7,
+          "rel_err": 0.007042253389954567
+        }
+      ]
+    },
+    {
+      "label": "layer3-mlp-down",
+      "tensor_base": "model.language_model.layers.3.mlp.down_proj",
+      "rows": 4096,
+      "cols": 12288,
+      "max_abs": 0.015625,
+      "mean_abs": 0.000923495004826691,
+      "rmse": 0.0017891602000170233,
+      "rhs_rms": 0.7002984414198531,
+      "rmse_over_rhs_rms": 0.002554853893990548,
+      "max_rel": 2.744680881500244,
+      "mean_rel": 0.010134102004030865,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.287109375,
+          "fused_gemv": 0.287109375,
+          "index": 0,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.578125,
+          "fused_gemv": -0.578125,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.50390625,
+          "fused_gemv": -0.50390625,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": 0.240234375,
+          "fused_gemv": 0.2421875,
+          "index": 3,
+          "rel_err": 0.008130080997943878
+        },
+        {
+          "abs_err": 0.00048828125,
+          "bulk_dequant_cublas": -0.05712890625,
+          "fused_gemv": -0.0576171875,
+          "index": 4,
+          "rel_err": 0.008547008968889713
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": 0.34375,
+          "fused_gemv": 0.345703125,
+          "index": 5,
+          "rel_err": 0.005681818351149559
+        },
+        {
+          "abs_err": 0.00244140625,
+          "bulk_dequant_cublas": 0.06787109375,
+          "fused_gemv": 0.0703125,
+          "index": 6,
+          "rel_err": 0.035971224308013916
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.1533203125,
+          "fused_gemv": -0.1533203125,
+          "index": 7,
+          "rel_err": 0.0
+        }
+      ]
+    },
+    {
+      "label": "layer3-mlp-gate",
+      "tensor_base": "model.language_model.layers.3.mlp.gate_proj",
+      "rows": 12288,
+      "cols": 4096,
+      "max_abs": 0.0078125,
+      "mean_abs": 0.0005533330549951643,
+      "rmse": 0.001063563041675199,
+      "rhs_rms": 0.4173009786732155,
+      "rmse_over_rhs_rms": 0.0025486713332346757,
+      "max_rel": 36.818180084228516,
+      "mean_rel": 0.011529687884262785,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": 0.07958984375,
+          "fused_gemv": 0.08056640625,
+          "index": 0,
+          "rel_err": 0.012269938364624977
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.384765625,
+          "fused_gemv": 0.384765625,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.984375,
+          "fused_gemv": -0.984375,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": -0.478515625,
+          "fused_gemv": -0.48046875,
+          "index": 3,
+          "rel_err": 0.004081632476300001
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.0157470703125,
+          "fused_gemv": -0.0157470703125,
+          "index": 4,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.7734375,
+          "fused_gemv": 0.7734375,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 1.296875,
+          "fused_gemv": 1.296875,
+          "index": 6,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.71484375,
+          "fused_gemv": -0.71484375,
+          "index": 7,
+          "rel_err": 0.0
+        }
+      ]
+    },
+    {
+      "label": "layer3-mlp-up",
+      "tensor_base": "model.language_model.layers.3.mlp.up_proj",
+      "rows": 12288,
+      "cols": 4096,
+      "max_abs": 0.0078125,
+      "mean_abs": 0.0005340536930210268,
+      "rmse": 0.0010225989950180536,
+      "rhs_rms": 0.3983590482431456,
+      "rmse_over_rhs_rms": 0.002567028412001557,
+      "max_rel": 28.128204345703125,
+      "mean_rel": 0.011666374780626635,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.000732421875,
+          "bulk_dequant_cublas": 0.007110595703125,
+          "fused_gemv": 0.006378173828125,
+          "index": 0,
+          "rel_err": 0.10300429165363312
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": 0.251953125,
+          "fused_gemv": 0.25,
+          "index": 1,
+          "rel_err": 0.007751937955617905
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.208984375,
+          "fused_gemv": 0.208984375,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.58203125,
+          "fused_gemv": -0.58203125,
+          "index": 3,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": -0.1279296875,
+          "fused_gemv": -0.12890625,
+          "index": 4,
+          "rel_err": 0.007633587811142206
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.158203125,
+          "fused_gemv": 0.158203125,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": 0.353515625,
+          "fused_gemv": 0.35546875,
+          "index": 6,
+          "rel_err": 0.005524862091988325
+        },
+        {
+          "abs_err": 0.00048828125,
+          "bulk_dequant_cublas": 0.0703125,
+          "fused_gemv": 0.07080078125,
+          "index": 7,
+          "rel_err": 0.0069444444961845875
+        }
+      ]
+    },
+    {
+      "label": "layer3-self-attn-k",
+      "tensor_base": "model.language_model.layers.3.self_attn.k_proj",
+      "rows": 1024,
+      "cols": 4096,
+      "max_abs": 0.015625,
+      "mean_abs": 0.0007867664098739624,
+      "rmse": 0.001648442469949082,
+      "rhs_rms": 0.5948146975992104,
+      "rmse_over_rhs_rms": 0.0027713546363304768,
+      "max_rel": 0.3918918967247009,
+      "mean_rel": 0.006071774091196858,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.8203125,
+          "fused_gemv": 0.8203125,
+          "index": 0,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.474609375,
+          "fused_gemv": 0.474609375,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.5390625,
+          "fused_gemv": -0.5390625,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.90234375,
+          "fused_gemv": -0.90234375,
+          "index": 3,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.40625,
+          "fused_gemv": -0.40625,
+          "index": 4,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.734375,
+          "fused_gemv": 0.734375,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.55859375,
+          "fused_gemv": -0.55859375,
+          "index": 6,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": -0.3203125,
+          "fused_gemv": -0.322265625,
+          "index": 7,
+          "rel_err": 0.006097560748457909
+        }
+      ]
+    },
+    {
+      "label": "layer3-self-attn-o",
+      "tensor_base": "model.language_model.layers.3.self_attn.o_proj",
+      "rows": 4096,
+      "cols": 4096,
+      "max_abs": 0.0078125,
+      "mean_abs": 0.0007508644484914839,
+      "rmse": 0.0014473373169397725,
+      "rhs_rms": 0.594118056326469,
+      "rmse_over_rhs_rms": 0.0024361106374865974,
+      "max_rel": 50.284671783447266,
+      "mean_rel": 0.021170889410086602,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": -0.162109375,
+          "fused_gemv": -0.1640625,
+          "index": 0,
+          "rel_err": 0.012048192322254181
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.5234375,
+          "fused_gemv": 0.5234375,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0029296875,
+          "bulk_dequant_cublas": -0.111328125,
+          "fused_gemv": -0.1083984375,
+          "index": 2,
+          "rel_err": 0.02631578966975212
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.7421875,
+          "fused_gemv": -0.7421875,
+          "index": 3,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": -0.10205078125,
+          "fused_gemv": -0.10107421875,
+          "index": 4,
+          "rel_err": 0.009569377638399601
+        },
+        {
+          "abs_err": 0.00390625,
+          "bulk_dequant_cublas": -0.890625,
+          "fused_gemv": -0.89453125,
+          "index": 5,
+          "rel_err": 0.004385964944958687
+        },
+        {
+          "abs_err": 0.000244140625,
+          "bulk_dequant_cublas": 0.00994873046875,
+          "fused_gemv": 0.00970458984375,
+          "index": 6,
+          "rel_err": 0.024539876729249954
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.298828125,
+          "fused_gemv": 0.298828125,
+          "index": 7,
+          "rel_err": 0.0
+        }
+      ]
+    },
+    {
+      "label": "layer3-self-attn-q",
+      "tensor_base": "model.language_model.layers.3.self_attn.q_proj",
+      "rows": 8192,
+      "cols": 4096,
+      "max_abs": 0.015625,
+      "mean_abs": 0.000884038585354574,
+      "rmse": 0.001753553201512704,
+      "rhs_rms": 0.6674887352814866,
+      "rmse_over_rhs_rms": 0.0026270903295067794,
+      "max_rel": 28.821989059448242,
+      "mean_rel": 0.016175113132135266,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.341796875,
+          "fused_gemv": -0.341796875,
+          "index": 0,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.001953125,
+          "bulk_dequant_cublas": -0.37890625,
+          "fused_gemv": -0.380859375,
+          "index": 1,
+          "rel_err": 0.005154639016836882
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.5625,
+          "fused_gemv": 0.5625,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.244140625,
+          "fused_gemv": -0.244140625,
+          "index": 3,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 1.1328125,
+          "fused_gemv": 1.1328125,
+          "index": 4,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.23828125,
+          "fused_gemv": 0.23828125,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.72265625,
+          "fused_gemv": -0.72265625,
+          "index": 6,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.53515625,
+          "fused_gemv": 0.53515625,
+          "index": 7,
+          "rel_err": 0.0
+        }
+      ]
+    },
+    {
+      "label": "layer3-self-attn-v",
+      "tensor_base": "model.language_model.layers.3.self_attn.v_proj",
+      "rows": 1024,
+      "cols": 4096,
+      "max_abs": 0.0078125,
+      "mean_abs": 0.0007277596741914749,
+      "rmse": 0.0014372884353539754,
+      "rhs_rms": 0.569604787904976,
+      "rmse_over_rhs_rms": 0.0025233082057480004,
+      "max_rel": 1.2607914209365845,
+      "mean_rel": 0.008500115994593216,
+      "gate_pass_1pct": true,
+      "first8": [
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.2578125,
+          "fused_gemv": -0.2578125,
+          "index": 0,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.51171875,
+          "fused_gemv": 0.51171875,
+          "index": 1,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.055419921875,
+          "fused_gemv": -0.055419921875,
+          "index": 2,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.71484375,
+          "fused_gemv": -0.71484375,
+          "index": 3,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": 0.71875,
+          "fused_gemv": 0.71875,
+          "index": 4,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.37890625,
+          "fused_gemv": -0.37890625,
+          "index": 5,
+          "rel_err": 0.0
+        },
+        {
+          "abs_err": 0.0009765625,
+          "bulk_dequant_cublas": -0.2119140625,
+          "fused_gemv": -0.212890625,
+          "index": 6,
+          "rel_err": 0.004608294926583767
+        },
+        {
+          "abs_err": 0.0,
+          "bulk_dequant_cublas": -0.10009765625,
+          "fused_gemv": -0.10009765625,
+          "index": 7,
+          "rel_err": 0.0
+        }
+      ]
+    }
+  ],
+  "all_pass": true
+}

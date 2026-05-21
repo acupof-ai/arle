@@ -1,0 +1,101 @@
+{
+  "comparison": {
+    "elements": 4096,
+    "lhs": "fused_turboquant_gemv",
+    "max_abs": 0.0078125,
+    "max_abs_index": 431,
+    "max_rel": 50.284671783447266,
+    "max_rel_index": 2347,
+    "mean_abs": 0.0007508644484914839,
+    "mean_rel": 0.021170889410086602,
+    "rhs": "bulk_dequant_cublas",
+    "rhs_rms": 0.594118056326469,
+    "rmse": 0.0014473373169397725,
+    "rmse_over_rhs_rms": 0.0024361106374865974
+  },
+  "first8": [
+    {
+      "abs_err": 0.001953125,
+      "bulk_dequant_cublas": -0.162109375,
+      "fused_gemv": -0.1640625,
+      "index": 0,
+      "rel_err": 0.012048192322254181
+    },
+    {
+      "abs_err": 0.0,
+      "bulk_dequant_cublas": 0.5234375,
+      "fused_gemv": 0.5234375,
+      "index": 1,
+      "rel_err": 0.0
+    },
+    {
+      "abs_err": 0.0029296875,
+      "bulk_dequant_cublas": -0.111328125,
+      "fused_gemv": -0.1083984375,
+      "index": 2,
+      "rel_err": 0.02631578966975212
+    },
+    {
+      "abs_err": 0.0,
+      "bulk_dequant_cublas": -0.7421875,
+      "fused_gemv": -0.7421875,
+      "index": 3,
+      "rel_err": 0.0
+    },
+    {
+      "abs_err": 0.0009765625,
+      "bulk_dequant_cublas": -0.10205078125,
+      "fused_gemv": -0.10107421875,
+      "index": 4,
+      "rel_err": 0.009569377638399601
+    },
+    {
+      "abs_err": 0.00390625,
+      "bulk_dequant_cublas": -0.890625,
+      "fused_gemv": -0.89453125,
+      "index": 5,
+      "rel_err": 0.004385964944958687
+    },
+    {
+      "abs_err": 0.000244140625,
+      "bulk_dequant_cublas": 0.00994873046875,
+      "fused_gemv": 0.00970458984375,
+      "index": 6,
+      "rel_err": 0.024539876729249954
+    },
+    {
+      "abs_err": 0.0,
+      "bulk_dequant_cublas": 0.298828125,
+      "fused_gemv": 0.298828125,
+      "index": 7,
+      "rel_err": 0.0
+    }
+  ],
+  "input": {
+    "first8": [
+      0.60546875,
+      0.466796875,
+      -0.35546875,
+      -0.48828125,
+      -0.984375,
+      0.216796875,
+      -0.12890625,
+      -0.52734375
+    ],
+    "shape": [
+      1,
+      4096
+    ]
+  },
+  "model_path": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4",
+  "projection": {
+    "bits": 4,
+    "cols": 4096,
+    "group_size": 128,
+    "num_groups": 32,
+    "packed_cols": 2048,
+    "rows": 4096
+  },
+  "seed": 1592594996,
+  "tensor_base": "model.language_model.layers.3.self_attn.o_proj"
+}
