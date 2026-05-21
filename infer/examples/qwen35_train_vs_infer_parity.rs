@@ -9,13 +9,21 @@ use train::qwen35_loader::load_qwen35_from_hf_dir;
 
 const DEFAULT_MODEL_DIR: &str = "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base";
 const TOKEN_ID: u32 = 9419;
-const DIVERGENCE_THRESHOLD: f32 = 1.0e-4;
+const STRICT_DIVERGENCE_THRESHOLD: f32 = 1.0e-4;
+const BF16_ABS_GATE: f32 = 1.0e-2;
+const BF16_MEAN_RATIO_GATE: f32 = 1.0e-2;
+const LM_HEAD_DOMINANT_REL_GATE: f32 = 1.0e-2;
+const LM_HEAD_DOMINANT_TOP_K: usize = 64;
 
 struct StageReport {
     name: &'static str,
     len: usize,
     max_abs: f32,
     max_rel: f32,
+    mean_abs_ref: f32,
+    max_abs_over_mean_abs_ref: f32,
+    lm_head_dominant_rel: Option<f32>,
+    bf16_gate_pass: bool,
     first_train: f32,
     first_infer: f32,
 }
@@ -89,39 +97,91 @@ fn main() -> Result<()> {
     }
 
     println!();
-    println!("| stage | len | max_abs | max_rel | first train | first infer |");
-    println!("| --- | ---: | ---: | ---: | ---: | ---: |");
+    println!(
+        "| stage | len | max_abs | mean_abs_ref | max_abs/mean_abs_ref | max_rel | lm_head_top64_rel | bf16_gate | first train | first infer |"
+    );
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | ---: |");
     for report in &reports {
         println!(
-            "| {} | {} | {:.8e} | {:.8e} | {:.8e} | {:.8e} |",
+            "| {} | {} | {:.8e} | {:.8e} | {:.8e} | {:.8e} | {} | {} | {:.8e} | {:.8e} |",
             report.name,
             report.len,
             report.max_abs,
+            report.mean_abs_ref,
+            report.max_abs_over_mean_abs_ref,
             report.max_rel,
+            format_optional_f32(report.lm_head_dominant_rel),
+            if report.bf16_gate_pass {
+                "PASS"
+            } else {
+                "FAIL"
+            },
             report.first_train,
             report.first_infer
         );
     }
 
     let first_divergence = reports.iter().find(|report| {
-        report.max_abs > DIVERGENCE_THRESHOLD || report.max_rel > DIVERGENCE_THRESHOLD
+        report.max_abs > STRICT_DIVERGENCE_THRESHOLD || report.max_rel > STRICT_DIVERGENCE_THRESHOLD
     });
     match first_divergence {
         Some(report) => {
             println!(
                 "\nfirst_divergence={} max_abs={:.8e} max_rel={:.8e} threshold={:.1e}",
-                report.name, report.max_abs, report.max_rel, DIVERGENCE_THRESHOLD
+                report.name, report.max_abs, report.max_rel, STRICT_DIVERGENCE_THRESHOLD
             );
         }
         None => {
             println!(
                 "\nfirst_divergence=none threshold={:.1e}",
-                DIVERGENCE_THRESHOLD
+                STRICT_DIVERGENCE_THRESHOLD
             );
         }
     }
 
+    let first_bf16_failure = reports.iter().find(|report| !report.bf16_gate_pass);
+    match first_bf16_failure {
+        Some(report) => {
+            println!(
+                "first_bf16_gate_failure={} max_abs={:.8e} max_abs/mean_abs_ref={:.8e}",
+                report.name, report.max_abs, report.max_abs_over_mean_abs_ref
+            );
+        }
+        None => {
+            println!(
+                "first_bf16_gate_failure=none abs_gate={:.1e} mean_ratio_gate={:.1e}",
+                BF16_ABS_GATE, BF16_MEAN_RATIO_GATE
+            );
+        }
+    }
+
+    let lm_head_dominant_rel = reports
+        .iter()
+        .find(|report| report.name == "lm_head")
+        .and_then(|report| report.lm_head_dominant_rel)
+        .unwrap_or(f32::INFINITY);
+    let path_b_commit3_retry =
+        first_bf16_failure.is_none() && lm_head_dominant_rel <= LM_HEAD_DOMINANT_REL_GATE;
+    println!(
+        "lm_head_dominant_top_k={} rel_gate={:.1e} observed={:.8e}",
+        LM_HEAD_DOMINANT_TOP_K, LM_HEAD_DOMINANT_REL_GATE, lm_head_dominant_rel
+    );
+    println!(
+        "path_b_commit3_retry={}",
+        if path_b_commit3_retry {
+            "licensed"
+        } else {
+            "blocked"
+        }
+    );
+
     Ok(())
+}
+
+fn format_optional_f32(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.8e}"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn infer_stages_device(model: &InferQwen35Model) -> DeviceContext {
@@ -153,20 +213,63 @@ fn compare_stage(
 
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
+    let mut ref_abs_sum = 0.0f32;
     for (&train, &infer) in train_host.iter().zip(infer_host.iter()) {
         let abs = (train - infer).abs();
         let denom = train.abs().max(infer.abs()).max(1.0e-6);
         let rel = abs / denom;
         max_abs = max_abs.max(abs);
         max_rel = max_rel.max(rel);
+        ref_abs_sum += infer.abs();
     }
+    let mean_abs_ref = if infer_host.is_empty() {
+        0.0
+    } else {
+        ref_abs_sum / infer_host.len() as f32
+    };
+    let max_abs_over_mean_abs_ref = if mean_abs_ref > 0.0 {
+        max_abs / mean_abs_ref
+    } else if max_abs == 0.0 {
+        0.0
+    } else {
+        f32::INFINITY
+    };
+    let bf16_gate_pass =
+        max_abs <= BF16_ABS_GATE || max_abs_over_mean_abs_ref <= BF16_MEAN_RATIO_GATE;
+    let lm_head_dominant_rel = (name == "lm_head").then(|| {
+        max_dominant_relerr(
+            &train_host,
+            &infer_host,
+            LM_HEAD_DOMINANT_TOP_K.min(infer_host.len()),
+        )
+    });
 
     Ok(StageReport {
         name,
         len: train_host.len(),
         max_abs,
         max_rel,
+        mean_abs_ref,
+        max_abs_over_mean_abs_ref,
+        lm_head_dominant_rel,
+        bf16_gate_pass,
         first_train: train_host.first().copied().unwrap_or(0.0),
         first_infer: infer_host.first().copied().unwrap_or(0.0),
     })
+}
+
+fn max_dominant_relerr(train_host: &[f32], infer_host: &[f32], top_k: usize) -> f32 {
+    if top_k == 0 {
+        return 0.0;
+    }
+    let mut indices: Vec<usize> = (0..infer_host.len()).collect();
+    indices.sort_unstable_by(|&a, &b| infer_host[b].abs().total_cmp(&infer_host[a].abs()));
+    indices
+        .into_iter()
+        .take(top_k)
+        .map(|index| {
+            let reference = infer_host[index];
+            (train_host[index] - reference).abs() / reference.abs().max(1.0e-6)
+        })
+        .fold(0.0f32, f32::max)
 }

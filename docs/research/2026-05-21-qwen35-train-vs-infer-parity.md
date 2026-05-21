@@ -72,6 +72,37 @@ Change:
 
 First divergence over `1e-4`: `layer0_attention`.
 
+## BF16-Realistic Gate Rerun
+
+The strict `max_rel` column is dominated by near-zero denominators after the
+RMSNorm semantic fix. The BF16-realistic gate treats a stage as passing if
+`max_abs <= 1e-2` or `max_abs / mean_abs(reference) <= 1e-2`, where
+`reference` is the infer-side tensor imported through the D2D bridge. For
+`lm_head`, the dominant-magnitude check uses the top 64 logits by
+`abs(reference)`.
+
+| stage | len | max_abs | mean_abs_ref | max_abs/mean_abs_ref | max_rel | lm_head_top64_rel | bf16_gate | first train | first infer |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | ---: |
+| embedding | 1024 | 0.00000000e0 | 1.43243987e-2 | 0.00000000e0 | 0.00000000e0 | - | PASS | 1.55029297e-2 | 1.55029297e-2 |
+| layer0_rmsnorm | 1024 | 0.00000000e0 | 9.95991766e-1 | 0.00000000e0 | 0.00000000e0 | - | PASS | 1.75000000e0 | 1.75000000e0 |
+| layer0_attention | 1024 | 3.90625000e-3 | 3.01501583e-2 | 1.29559845e-1 | 9.89448607e-1 | - | PASS | -6.71875000e-1 | -6.67968750e-1 |
+| layer0_ffn | 1024 | 9.76562500e-4 | 2.61352248e-2 | 3.73657569e-2 | 1.86394560e0 | - | PASS | 4.92187500e-1 | 4.92187500e-1 |
+| layer0_residual | 1024 | 3.90625000e-3 | 4.21891361e-2 | 9.25889984e-2 | 2.00000000e0 | - | PASS | -1.64062500e-1 | -1.60156250e-1 |
+| final_rmsnorm | 1024 | 3.82647514e-1 | 2.43838215e0 | 1.56926796e-1 | 1.98029721e0 | - | FAIL | 6.23808103e-3 | -1.77001953e-2 |
+| lm_head | 248320 | 2.43329287e-1 | 4.54223394e0 | 5.35704009e-2 | 1.99170125e0 | 1.72917433e-2 | FAIL | 1.09028893e1 | 1.09375000e1 |
+
+Gate summary:
+
+- Strict first divergence remains `layer0_attention` at `max_abs=3.90625e-3`;
+  this is below the `1e-2` BF16 absolute gate and is not the current blocker.
+- First BF16-realistic gate failure is `final_rmsnorm`
+  (`max_abs/mean_abs_ref=1.56926796e-1`).
+- `lm_head` also fails the BF16 gate
+  (`max_abs/mean_abs_ref=5.35704009e-2`), and its top-64 dominant-magnitude
+  relative error is `1.72917433e-2`, above the `1e-2` Path B retry gate.
+- Path B Commit 3 retry is **blocked**. Do not re-wire
+  `InferTeacher.forward_logits_device` yet.
+
 ## Interpretation
 
 Embedding is bit-equivalent after D2D import, so this is not a tokenizer ID,
@@ -83,10 +114,13 @@ and final norm, while the train path used standard RMSNorm. The offset fix
 brings the layer 0 RMSNorm stage to exact parity under the BF16 materialization
 boundary.
 
-The next measured break is layer 0 attention. For this checkpoint, layer 0 is
-a linear-attention layer, so the next axis is the train-side
-`linear_attention_core` vs infer-side GDR prefill path. Path B full-logit parity
-should stay paused until that stage is under `1e-4`.
+Under the BF16-realistic gate, the layer 0 chain through residual sum now
+passes. The remaining blocker appears after the current harness's layer 0
+window and before the final RMSNorm. That means the next useful diagnostic is
+a per-layer residual scan over layers 1..N, not an immediate `InferTeacher`
+retry. The specific question is whether the later mismatch accumulates from
+BF16 materialization differences or whether a later attention/FFN path has a
+semantic difference that layer 0 does not exercise.
 
 ## Problems
 
