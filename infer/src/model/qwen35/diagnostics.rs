@@ -1,6 +1,7 @@
 //! Diagnostic-only Qwen3.5 stage capture for train-vs-infer parity checks.
 
 use anyhow::Result;
+use half::bf16;
 
 use super::{
     prefill_buffers::GdrChunkwiseScratch35,
@@ -17,6 +18,13 @@ pub struct Qwen35InferParityStages {
     pub layer0_attention: DeviceVec,
     pub layer0_ffn: DeviceVec,
     pub layer0_residual: DeviceVec,
+    pub final_rmsnorm: DeviceVec,
+    pub lm_head: DeviceVec,
+}
+
+#[doc(hidden)]
+pub struct Qwen35DenseModuleParityOutputs {
+    pub embedding: DeviceVec,
     pub final_rmsnorm: DeviceVec,
     pub lm_head: DeviceVec,
 }
@@ -140,6 +148,41 @@ impl Qwen35Model {
             lm_head,
         })
     }
+
+    #[doc(hidden)]
+    pub fn dense_module_parity_outputs(
+        &self,
+        token_id: u32,
+    ) -> Result<Qwen35DenseModuleParityOutputs> {
+        let c = &self.config;
+        let token_ids = [token_id];
+        let embedding =
+            common::get_embeddings_batch(&self.ctx, &self.embed_tokens, &token_ids, c.hidden_size)?;
+        let embedding = copy_hidden(&self.ctx, &embedding, "dense_parity_embedding")?;
+
+        let norm_input = deterministic_bf16_vec(c.hidden_size, 17);
+        let norm_input = DeviceVec::from_host(&self.ctx, &norm_input)?;
+        let mut final_rmsnorm =
+            DeviceVec::zeros(&self.ctx, c.hidden_size)?.with_label("dense_parity_final_rmsnorm");
+        ops::rms_norm_offset_into(
+            &self.ctx,
+            &norm_input,
+            &self.norm,
+            c.rms_norm_eps,
+            &mut final_rmsnorm,
+        )?;
+
+        let lm_head_input = deterministic_bf16_vec(c.hidden_size, 29);
+        let lm_head_input = DeviceVec::from_host(&self.ctx, &lm_head_input)?;
+        let lm_head = ops::linear(&self.ctx, &lm_head_input, &self.embed_tokens)?
+            .with_label("dense_parity_lm_head");
+
+        Ok(Qwen35DenseModuleParityOutputs {
+            embedding,
+            final_rmsnorm,
+            lm_head,
+        })
+    }
 }
 
 fn copy_hidden(
@@ -153,4 +196,13 @@ fn copy_hidden(
         .memcpy_dtod(&hidden.data, &mut out.data)
         .map_err(|e| anyhow::anyhow!("D2D copy for {label} failed: {e}"))?;
     Ok(out)
+}
+
+fn deterministic_bf16_vec(len: usize, salt: usize) -> Vec<bf16> {
+    (0..len)
+        .map(|idx| {
+            let raw = ((idx.wrapping_mul(37).wrapping_add(salt.wrapping_mul(17))) % 257) as f32;
+            bf16::from_f32((raw - 128.0) / 64.0)
+        })
+        .collect()
 }
