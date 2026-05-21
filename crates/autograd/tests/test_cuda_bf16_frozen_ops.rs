@@ -1,6 +1,8 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
-use autograd::backend::{bf16_bits_to_f32, cpu_embedding_forward, cpu_matmul_bt_forward};
+use autograd::backend::{
+    bf16_bits_to_f32, cpu_embedding_forward, cpu_matmul_bt_forward, cpu_matmul_forward,
+};
 use autograd::backend_cuda::CudaBackend;
 use autograd::Backend;
 
@@ -90,6 +92,65 @@ fn cuda_matmul_bt_accepts_frozen_bf16_rhs() {
         .collect();
     let expected_shape = vec![2, 3];
     assert_eq!(expected_shape, out_shape);
+    assert_close(&got, &expected, 2e-3, 2e-3);
+}
+
+#[test]
+fn cuda_matmul_bt_backward_accepts_frozen_bf16_rhs_for_lhs_grad() {
+    let backend = CudaBackend::new(0).expect("cuda backend");
+    let a_shape = [2, 4];
+    let b_shape = [3, 4];
+    let grad_shape = [2, 3];
+    let a = [0.25_f32, -1.0, 2.0, 0.5, 1.5, -0.75, 0.125, -2.0];
+    let b_f32 = [
+        -0.5_f32, 0.75, 1.25, -1.5, 2.0, -0.25, 0.5, 1.0, -1.0, -0.125, 0.875, 1.75,
+    ];
+    let grad_out = [0.25_f32, -0.5, 1.0, 1.5, -2.0, 0.125];
+    let b_bits: Vec<u16> = b_f32
+        .iter()
+        .map(|&value| f32_to_bf16_bits_round_nearest_even(value))
+        .collect();
+    let b_quantized: Vec<f32> = b_bits.iter().map(|&bits| bf16_bits_to_f32(bits)).collect();
+    let grad_quantized: Vec<f32> = grad_out
+        .iter()
+        .map(|&value| bf16_bits_to_f32(f32_to_bf16_bits_round_nearest_even(value)))
+        .collect();
+
+    let a_handle = backend.upload(&a, &a_shape).expect("upload lhs");
+    let b_handle = backend
+        .upload_bf16_bits(&b_bits, &b_shape)
+        .expect("upload rhs bf16");
+    let grad_handle = backend
+        .upload(&grad_out, &grad_shape)
+        .expect("upload grad out");
+    let (grad_a, grad_b) = backend
+        .matmul_bt_backward_device(
+            &a_handle,
+            &a_shape,
+            &b_handle,
+            &b_shape,
+            &grad_handle,
+            &grad_shape,
+            true,
+            false,
+        )
+        .expect("bf16 rhs matmul_bt backward");
+
+    assert!(grad_b.is_none());
+    let got = backend
+        .readback(&grad_a.expect("lhs grad"))
+        .expect("readback lhs grad");
+    let expected_bf16_bits: Vec<u16> =
+        cpu_matmul_forward(&grad_quantized, &grad_shape, &b_quantized, &b_shape)
+            .expect("cpu reference")
+            .0
+            .into_iter()
+            .map(f32_to_bf16_bits_round_nearest_even)
+            .collect();
+    let expected: Vec<f32> = expected_bf16_bits
+        .into_iter()
+        .map(bf16_bits_to_f32)
+        .collect();
     assert_close(&got, &expected, 2e-3, 2e-3);
 }
 
