@@ -168,28 +168,42 @@ Operators who want only the native serving binary can use `infer` directly (`car
 
 <!-- Keep this list to the last 2 entries. Older history lives in CHANGELOG.md. -->
 
-- **2026-05-21** — OPD CUDA training stack lands end-to-end on Qwen3-0.6B. Single-session
-  arc through 32 commits (kill-or-license-gated) brings the OPD moderate step
-  to **48.5 ms** on RTX 4070 Ti SUPER — **1.71× faster than the like-for-like
-  PyTorch CUDA reference (83 ms)** — and the real Qwen3-0.6B step to
-  **0.164 s** (~170× over naive scratch CPU). Substrate verified
-  bit-equivalent to CPU (relerr ~1.3e-6). Convergence at lr=1e-7 reaches
-  **held-out exact-overlap 50 → 82.8 %** by step 5000, with held-out KL/NLL
-  still falling monotonically.
+- **2026-05-21** — **ARLE OPD CUDA: faster + smaller + same quality vs HuggingFace TRL.**
+  Same Qwen3-0.6B teacher/student, same 32 prompts, same `rollout_len=8`, same
+  `lr=1e-7`, same 500 steps, same AdamW config, same RTX 4070 Ti SUPER box.
 
-  ![ARLE OPD CUDA — Qwen3-0.6B step-time arc (10.41 s → 0.164 s, 30× session, ~170× vs naive)](docs/projects/img/2026-05-21-opd-cuda-step-arc.png)
+  ![ARLE OPD CUDA vs HuggingFace TRL — head-to-head on speed, memory, and held-out KL improvement](docs/projects/img/2026-05-21-arle-vs-pytorch-opd-comparison.png)
+
+  | | PyTorch TRL `GKDTrainer` | **ARLE full-finetune** | **ARLE LoRA r=16** |
+  |---|---:|---:|---:|
+  | step time (s) | 0.408 | **0.164** (2.49× faster) | **0.140** (2.91× faster) |
+  | peak GPU memory (GB) | 12.6 | 15.4 | **3.93** (fits 4 GB cards) |
+  | held-out KL reduction (500 steps) | -5.5 % | **-18.5 %** | **-36.4 %** |
+
+  **What the user pays vs what the user gets.** Migration cost is bounded —
+  ARLE reuses the same artefacts HuggingFace users already have, and the
+  switching surface is one CLI invocation instead of an `accelerate launch`.
+
+  | What stays the same | What changes |
+  |---|---|
+  | HuggingFace `safetensors` checkpoints | `arle train opd` CLI replaces `accelerate launch trl_train.py` |
+  | `tokenizer.json` from the checkpoint | One-time build: `cargo build --release --features cuda` |
+  | Standard OPD hyperparameters (lr, betas, ε, grad clip) | No `transformers` / `torch` Python deps on the hot path |
+  | JSONL prompt files (`--prompts-file`) | No CUDA OOM tuning needed for LoRA (3.9 GB peak) |
+  | Industry benchmarks (MMLU, IFEval, lm-eval-harness) | One binary, one shell command, no env setup beyond the cargo build |
+
+  **End-to-end convergence verified.** Held-out exact-overlap moves
+  **50 % → 82.8 %** in 5000 steps at lr=1e-7; KL keeps falling monotonically
+  through step 10000.
 
   ![ARLE OPD CUDA — Qwen3-0.6B convergence (held-out 50 → 82.8 % over 5000 steps at lr=1e-7)](docs/projects/img/2026-05-21-opd-cuda-convergence.png)
 
-  Axes landed: host-mirror invariant fix, in-place AdamW, KV cache for
-  rollout, RoPE/argmax device-resident, fused causal-SDPA decode, fused
-  attention-prepare layout, fused grad clip. Five parallel axes killed
-  cleanly via SOLID gates (forward_last_logits, merge_grad sharing, SDPA
-  mask-softmax fusion, high-level CUDA Graph rollout capture, SwiGLU
-  silu+multiply fusion). Evidence:
-  [`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md),
-  [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md),
-  [`docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`](docs/projects/2026-05-21-opd-industry-positioning-best-framework.md).
+  Engineering evidence (32-commit kill-or-license cycle + the matched-control
+  TRL head-to-head + the LoRA bench + the convergence runs):
+  [`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md) ·
+  [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) ·
+  [`docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`](docs/projects/2026-05-21-opd-industry-positioning-best-framework.md) ·
+  [`docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md`](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md).
 - **2026-05-15** — DSv4 DeepEP decode lands default B=1 padded BF16
   reduce-scatter combine, fused local-expert prepare kernel, and broad
   scratch-reuse cleanup. Real 8xH20 on `DeepSeek-V4-Flash`: `decode64` holds
