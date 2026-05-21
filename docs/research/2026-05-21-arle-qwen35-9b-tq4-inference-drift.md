@@ -154,3 +154,55 @@ License criterion for reconsidering the headline:
 
 Until that gate passes, 9B-TQ4 remains an OPD-fit experiment, not the canonical
 inference teacher.
+
+## Optional 9B-Instruct Split Test Blocker
+
+Follow-up proposal: download `Qwen/Qwen3.5-9B-Instruct` from ModelScope and run
+the same three 64-token greedy prompts through ARLE BF16. This would separate:
+
+- H1: ARLE's 24-layer / 4096-hidden Qwen3.5 forward path has a cumulative drift
+  bug, so BF16 Instruct would also garble.
+- H2: the base checkpoint is weak on raw chat-style prompts and TQ4 quantization
+  pushes the teacher over the coherence threshold, so BF16 Instruct would be
+  coherent.
+
+Attempted command:
+
+```bash
+.venv/bin/python - <<'PY'
+from modelscope import snapshot_download
+print(snapshot_download(
+    'Qwen/Qwen3.5-9B-Instruct',
+    cache_dir='/home/ckl/.cache/modelscope/hub',
+    allow_patterns=['*.json','*.safetensors','*.txt','tokenizer*','*.jinja','merges.txt','vocab.json'],
+))
+PY
+```
+
+Result:
+
+```text
+Repo Qwen/Qwen3.5-9B-Instruct not exists on https://www.modelscope.cn,
+will try on alternative endpoint https://www.modelscope.ai.
+Repo Qwen/Qwen3.5-9B-Instruct not exists on either https://www.modelscope.cn
+or https://www.modelscope.ai
+requests.exceptions.HTTPError: <Response [404]>
+```
+
+So the proposed decisive split test is blocked as written: there is no
+ModelScope `Qwen/Qwen3.5-9B-Instruct` repo available through `snapshot_download`
+on this host.
+
+Do not substitute the existing `Qwen/Qwen3.5-9B` BF16 source and call it
+Instruct; that exact base checkpoint has already been used as the PyTorch BF16
+reference above and produced weak raw-completion outputs.
+
+Next-day alternatives:
+
+1. Run the same smoke through ARLE and PyTorch using the checkpoint's chat
+   template / non-thinking-mode prompt formatting instead of raw
+   `/v1/completions` prompts.
+2. Find a real ModelScope-available Qwen3.5-9B instruction LoRA or tuned
+   checkpoint and repeat the BF16 serve smoke.
+3. If neither is available, proceed with token-level parity on the existing
+   BF16 base versus TQ4 path.
