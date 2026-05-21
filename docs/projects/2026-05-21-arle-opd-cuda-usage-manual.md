@@ -53,6 +53,15 @@ TORCH_CUDA_ARCH_LIST=8.9 \
 cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- \
   --lr 1e-7 --steps 500 --rollout-len 8 --prompt-set 32 \
   --eval-steps 0,50,100,250,500
+
+# 3. Or run the same harness against a JSONL of real text prompts.
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- \
+  --prompts-file examples/opd/sample-prompts.jsonl --lr 1e-7 --steps 500 \
+  --eval-steps 0,100,250,500
 ```
 
 Expected on RTX 4070 Ti SUPER:
@@ -97,7 +106,7 @@ entry first.
 |---|---|---|
 | `--lr` | `1e-7` for Qwen3-0.6B full-finetune from near-teacher init | `5e-5` diverges catastrophically (KL ratio 288232×). Confirmed by [`docs/research/2026-05-21-arle-cuda-opd-convergence-h1-vs-h2.md`](../research/2026-05-21-arle-cuda-opd-convergence-h1-vs-h2.md). |
 | `--rollout-len` | `8` | `16` was tested and held-out overlap plateaued identically at 64 % — rollout length isn't the binding constraint at our prompt scale. Confirmed by [`docs/research/2026-05-21-arle-cuda-opd-rollout-len-16-a-b.md`](../research/2026-05-21-arle-cuda-opd-rollout-len-16-a-b.md). |
-| `--prompt-set` | `32` for production-grade experiments, `8` for fast smoke | `32` brings held-out KL down -8.63 % vs `8` at the same step count. Confirmed by [`docs/research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md`](../research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md). |
+| Prompt source | Use `--prompts-file <jsonl>` for real text supervision; keep `--prompt-set 32` for matched-control regression runs | JSONL prompt loading uses the checkpoint's `tokenizer.json` and is the user-facing path. `--prompt-set 32` brings held-out KL down -8.63 % vs `8` at the same step count and remains useful as a fixed benchmark control. Confirmed by [`docs/research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md`](../research/2026-05-21-arle-cuda-opd-prompts-32-a-b.md) and [`docs/experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md`](../experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md). |
 | `--steps` | `500` for substrate validation, `5000+` for real convergence study | 500-step run completes in ~2 minutes wall-clock; 5000-step in ~17 minutes. Held-out exact-overlap doesn't break the 64 % staircase until step ~3500; held-out KL+NLL improve monotonically throughout. |
 | `--eval-steps` | `0,50,100,250,500` (or include 1000, 2500, 5000 for longer runs) | Comma-separated list of step indices at which to greedy-decode held-out prompts and report all four metrics. |
 | Perturbation amplitude | `1e-3` (compile-time constant in the harness) | The teacher and student start from the same checkpoint; student gets uniform noise added at the start so OPD has signal to recover. |
@@ -121,18 +130,52 @@ plateau" — see [`docs/experience/wins/2026-05-21-arle-cuda-opd-eval-metric-fix
 
 ## Custom prompts
 
-The training prompt set is currently a compile-time array of token-id
-sequences in `crates/train/examples/opd_step_cuda_realckpt_train.rs`. To
-use your own prompts:
+Use `--prompts-file <jsonl>` for user-facing OPD runs. The JSONL format is one
+prompt per line:
 
-1. Pre-tokenize them outside ARLE (e.g. using HF transformers' `Qwen3Tokenizer`
-   in the project's `.venv`).
-2. Add the token-id arrays to the harness's `TRAINING_PROMPTS_*` constants.
-3. Recompile and run.
+```jsonl
+{"text":"Explain why small language models benefit from on-policy distillation.","max_tokens":16}
+{"text":"Summarize the difference between forward KL and reverse KL.","max_tokens":16}
+```
 
-A future tranche will likely add `--prompts-file <jsonl>` runtime loading;
-tracked as an open axis in
-[`./2026-05-21-opd-cuda-cycle-wrap.md`](2026-05-21-opd-cuda-cycle-wrap.md).
+Example:
+
+```bash
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- \
+  --prompts-file examples/opd/sample-prompts.jsonl \
+  --lr 1e-7 --steps 500 --rollout-len 8 --eval-steps 0,100,250,500
+```
+
+Behavior:
+
+- `tokenizer.json` is loaded from the selected model directory, for example
+  `~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B/tokenizer.json`.
+- The final 4 JSONL rows are held out; all earlier rows are training prompts.
+- Row-level `max_tokens` is optional. If omitted, `--prompt-max-tokens`
+  supplies the truncation ceiling, defaulting to 16.
+- The loader truncates prompts but does not add pad tokens. The current OPD
+  harness runs one prompt at a time and has no attention-mask path, so padding
+  would be semantically visible.
+- `--prompts-file`, `--example-prompts-file`, and `--prompt-set` are mutually
+  exclusive.
+
+The shipped sample file is
+[`examples/opd/sample-prompts.jsonl`](../../examples/opd/sample-prompts.jsonl).
+The validating 500-step CUDA run is documented in
+[`docs/experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md`](../experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md).
+
+The built-in token-id prompt sets remain in
+`crates/train/examples/opd_step_cuda_realckpt_train.rs` for exact matched
+controls:
+
+```bash
+cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- \
+  --prompt-set 32 --lr 1e-7 --steps 500 --eval-steps 0,50,100,250,500
+```
 
 ## Custom shapes
 
@@ -242,7 +285,7 @@ Ranked by estimated step-level ROI:
 | Backward attention-prepare fusion | ~3-6 % step | Mirror of `f3af58c` for the gradient path. |
 | bf16 weights for `lm_head` + embedding | ~2-3 % step | Memory bandwidth; needs grad-check threshold relaxation. |
 | Backward fused causal-SDPA | ~3-5 % step | Forward done (commit `67607a0`); backward still on matmul-decomposed path. |
-| Real-text prompt loader | qualitative | Add `--prompts-file <jsonl>`; enables tokenizer-based supervision. |
+| Prompt corpus loader + attention masks | qualitative | `--prompts-file <jsonl>` has landed. Next DX tranche is larger prompt corpora, explicit train/held-out split files, and masked batching instead of one prompt per step. |
 | LoRA-only convergence benchmark | qualitative | Reuses the harness with `LoraConfig` set; smaller GPU footprint. |
 
 ## Cross-links
@@ -251,6 +294,7 @@ Ranked by estimated step-level ROI:
 - OPD-only pivot rationale: [`./2026-05-18-opd-only-pivot.md`](2026-05-18-opd-only-pivot.md)
 - PyTorch CUDA baseline (the reference we beat at moderate): [`../experience/wins/2026-05-20-pytorch-cuda-opd-baseline.md`](../experience/wins/2026-05-20-pytorch-cuda-opd-baseline.md)
 - 5k-step convergence (held-out 50 → 82.8 %): [`../experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-5k-newmetric.md`](../experience/wins/2026-05-21-arle-cuda-opd-realckpt-convergence-5k-newmetric.md)
+- JSONL prompt loader: [`../experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md`](../experience/wins/2026-05-21-arle-cuda-opd-prompts-file-tokenizer.md)
 - All today's wins entries (chronological): `docs/experience/wins/2026-05-21-arle-cuda-opd-*.md`
 - All today's research notes: `docs/research/2026-05-21-arle-cuda-opd-*.md`
 
