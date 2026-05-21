@@ -29,6 +29,9 @@ pub enum TeacherForwardError {
     Autograd(#[from] AutogradError),
     #[error(transparent)]
     Qwen35(#[from] Qwen35Error),
+    #[cfg(feature = "cuda")]
+    #[error("infer runtime teacher forward failed: {0}")]
+    InferRuntime(String),
     #[error("{0}")]
     InvalidInput(String),
 }
@@ -129,21 +132,58 @@ impl TeacherForward for InferTeacher {
         input_ids: &[u32],
         positions: &[u32],
         store: &mut TensorStore,
-        tape: &mut Tape,
+        _tape: &mut Tape,
     ) -> Result<DeviceLogits> {
-        let _ = (
-            &self.engine,
-            &self.train_backend,
-            input_ids,
-            positions,
-            store,
-            tape,
-        );
-        todo!(
-            "InferTeacher::forward_logits_device is blocked on a raw infer logits export \
-             and a shared CUDA handle bridge; see \
-             docs/research/2026-05-21-arle-opd-infer-teacher-zero-copy-blocker.md"
-        )
+        if input_ids.is_empty() {
+            return Err(TeacherForwardError::InvalidInput(
+                "InferTeacher requires a non-empty token sequence".to_owned(),
+            ));
+        }
+        if input_ids.len() != positions.len() {
+            return Err(TeacherForwardError::InvalidInput(format!(
+                "InferTeacher token/position length mismatch: tokens={} positions={}",
+                input_ids.len(),
+                positions.len()
+            )));
+        }
+
+        let raw_logits = {
+            let engine = self.engine.lock().map_err(|err| {
+                TeacherForwardError::InferRuntime(format!(
+                    "LoadedInferenceEngine lock poisoned before raw logits forward: {err}"
+                ))
+            })?;
+            engine
+                .forward_token_logits(input_ids, positions)
+                .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))?
+        };
+        if raw_logits.vocab_size() != self.vocab_size {
+            return Err(TeacherForwardError::InvalidInput(format!(
+                "InferTeacher vocab mismatch: raw logits vocab={}, configured vocab={}. \
+                 Hint: construct InferTeacher with the vocab size from the same infer model.",
+                raw_logits.vocab_size(),
+                self.vocab_size
+            )));
+        }
+        if raw_logits.seq_len() != input_ids.len() {
+            return Err(TeacherForwardError::InvalidInput(format!(
+                "InferTeacher seq_len mismatch: raw logits seq_len={}, input token len={}",
+                raw_logits.seq_len(),
+                input_ids.len()
+            )));
+        }
+
+        raw_logits
+            .device
+            .sync()
+            .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))?;
+        let shape = vec![1, raw_logits.seq_len(), raw_logits.vocab_size()];
+        let handle = raw_logits.with_logits_device_ptr(|src_ptr| {
+            self.train_backend
+                .import_bf16_device_ptr_as_f32(src_ptr, raw_logits.logits.len, &shape)
+        })?;
+        let tensor_id = store.alloc_device_tensor(shape.clone(), handle)?;
+        Ok(DeviceLogits { tensor_id, shape })
     }
 
     fn vocab_size(&self) -> usize {
