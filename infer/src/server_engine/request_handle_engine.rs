@@ -52,6 +52,17 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl RequestHandleInferenceEngine<crate::scheduler::SchedulerHandle> {
+    pub fn forward_token_logits(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<super::RawLogits> {
+        self.handle.forward_token_logits(input_ids, positions)
+    }
+}
+
 impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
     fn model_id(&self) -> &str {
         &self.model_id

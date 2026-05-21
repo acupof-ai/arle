@@ -29,6 +29,8 @@ pub use pool::{
     EnginePoolModelType,
 };
 pub use request_handle_engine::RequestHandleInferenceEngine;
+#[cfg(feature = "cuda")]
+pub use types::RawLogits;
 pub use types::{
     CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry, FinishReason,
     InferenceEngine, PrefillPathStats, TokenUsage,
