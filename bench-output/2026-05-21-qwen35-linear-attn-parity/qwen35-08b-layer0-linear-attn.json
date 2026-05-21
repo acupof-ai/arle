@@ -1,0 +1,73 @@
+{
+  "model_path": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base",
+  "token_id": 9419,
+  "python_device": "cpu",
+  "layer0_type": "linear_attention",
+  "len": 1024,
+  "max_abs": 0.0007324219,
+  "max_rel": 4.9130435,
+  "mean_abs": 0.00015426069,
+  "rmse": 0.00021222493,
+  "ref_rms": 0.044085175,
+  "rmse_over_ref_rms": 0.004813975,
+  "gate_rmse_over_ref_rms": 0.05,
+  "gate_pass": true,
+  "first8": [
+    {
+      "index": 0,
+      "arle": -0.66796875,
+      "pytorch": -0.66796875,
+      "abs_err": 0.0,
+      "rel_err": 0.0
+    },
+    {
+      "index": 1,
+      "arle": 0.019897461,
+      "pytorch": 0.019897461,
+      "abs_err": 0.0,
+      "rel_err": 0.0
+    },
+    {
+      "index": 2,
+      "arle": 0.012084961,
+      "pytorch": 0.012023926,
+      "abs_err": 0.000061035156,
+      "rel_err": 0.005076142
+    },
+    {
+      "index": 3,
+      "arle": -0.03173828,
+      "pytorch": -0.03149414,
+      "abs_err": 0.00024414062,
+      "rel_err": 0.007751938
+    },
+    {
+      "index": 4,
+      "arle": -0.045410156,
+      "pytorch": -0.045166016,
+      "abs_err": 0.00024414062,
+      "rel_err": 0.0054054055
+    },
+    {
+      "index": 5,
+      "arle": -0.012023926,
+      "pytorch": -0.011657715,
+      "abs_err": 0.00036621094,
+      "rel_err": 0.03141361
+    },
+    {
+      "index": 6,
+      "arle": 0.13574219,
+      "pytorch": 0.13574219,
+      "abs_err": 0.0,
+      "rel_err": 0.0
+    },
+    {
+      "index": 7,
+      "arle": -0.035888672,
+      "pytorch": -0.036132812,
+      "abs_err": 0.00024414062,
+      "rel_err": 0.006756757
+    }
+  ]
+}
