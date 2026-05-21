@@ -119,3 +119,100 @@ f32. The next license gate must be one of:
 
 Do not run more 9B OPD benches with the current f32 LoRA base and expect a
 different result; the single-token control already ruled that out.
+
+## Follow-up: BF16 Frozen Student Base Still OOMs
+
+After landing the BF16 frozen-base substrate and Qwen3.5 LoRA loader wiring,
+the same minimal control was rerun with the student base no longer widened to
+f32 for the large frozen 2D tensors.
+
+Artifacts:
+
+```text
+bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-bf16-student-smoke/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-bf16-student-smoke-noeval/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-bf16-student-smoke-noeval-memtrace/
+```
+
+The strictest control skipped step-0 eval and used the smallest available
+training shape:
+
+```bash
+INFER_EXPERIMENTAL_GPTQMODEL_W4=1 \
+NVCC_CCBIN=/usr/bin/g++-14 \
+INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
+CUDARC_CUDA_VERSION=13010 \
+TORCH_CUDA_ARCH_LIST=8.9 \
+CARGO_BUILD_JOBS=1 \
+cargo run -p train --example opd_step_cuda_infer_teacher_train --release --features cuda -- \
+  --teacher-model /home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit \
+  --student-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base \
+  --prompts-file examples/opd/sample-prompts.jsonl \
+  --steps 1 \
+  --rollout-len 1 \
+  --lr 1e-5 \
+  --eval-steps 999 \
+  --prompt-max-tokens 1 \
+  --no-cuda-graph
+```
+
+It still failed during the first backward pass:
+
+```text
+model_summary teacher_source=infer student_hidden=1024 student_layers=24 \
+student_vocab=248320 student_model_elements=769809216 \
+student_trainable_elements=638976 student_load_seconds=8.435106 \
+teacher_load_seconds=73.336677
+Error: Autograd(TapeInvariant("cuda alloc_zeros failed (mean_backward_device)"))
+```
+
+The high-frequency `nvidia-smi` trace captured the actual peak immediately
+before failure:
+
+```text
+2026/05/22 03:45:04.858, 14355 MiB used, 1589 MiB free
+2026/05/22 03:45:05.358, 15839 MiB used, 105 MiB free
+2026/05/22 03:45:05.858, 15871 MiB used, 73 MiB free
+2026/05/22 03:45:06.358, 3999 MiB used, 11945 MiB free
+```
+
+That rules out the original "f32 frozen student base upload" as the remaining
+blocker. The BF16 loader moved the failure later, but the combined resident
+footprint of:
+
+- 9B GPTQModel teacher through `infer`;
+- 0.8B LoRA student through `train`;
+- student forward/backward tape, logits, and optimizer scratch;
+- CUDA allocator fragmentation / workspace headroom;
+
+still exceeds the usable 16 GB card budget even at `rollout_len=1` and one
+prompt token.
+
+## Revised Decision
+
+KILL the same-card local `InferTeacher` 9B-GPTQModel -> 0.8B-LoRA OPD bench on
+this 16 GB RTX 4070 Ti SUPER, even after BF16 frozen-base loader wiring. The
+failure is now a real co-residency ceiling, not the earlier obvious f32-loader
+bug.
+
+The next viable 9B teacher paths are:
+
+- remote/API teacher on another GPU or host (`ApiTeacher` / multi-teacher
+  routing can avoid same-card co-residency);
+- smaller or quantized train-side student base, not just BF16;
+- activation/tape memory reduction that is proven by a new peak-memory trace;
+- a larger-memory GPU for the headline 9B local-teacher run.
+
+Do not switch user-facing headlines to 9B GPTQModel OPD on this host until one
+of those paths passes a no-OOM + monotonic-heldout-KL bench.
+
+The API/multi-teacher surface already exists in the train harness:
+
+- `--teacher-api-url URL` for one remote teacher;
+- `--teacher-config JSON` for multiple named API teachers plus token-prefix
+  routing by teacher strength.
+
+That path is useful only when the teacher runs on another GPU/host or in a
+separate memory budget. Serving the teacher as a local API process on the same
+16 GB GPU would still require teacher+student co-residency and does not address
+this OOM root cause.
