@@ -1,0 +1,749 @@
+config model_dir=/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B steps=500 lr=1.000000000e-07 rollout_len=8 perturb_scale=1.000000000e-03 perturb_seed=0x0f0dcafe20260521 eval_steps=[0, 50, 100, 250, 500] gradient_checkpointing=False
+cuda device=NVIDIA GeForce RTX 4070 Ti SUPER torch=2.11.0+cu130
+prompts source=builtin_32 train_count=32 heldout_count=4
+loading teacher
+loading student
+perturbing student
+trainable_params=596049920
+eval_detail step=0 split=train prompt_index=0 prompt=[1, 872, 198, 3456] overlap_pct=93.750000 kl=3.109005279839e-02 teacher_nll=4.636253118515e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=1 prompt=[1, 198, 1512, 429] overlap_pct=87.500000 kl=1.419838890433e-02 teacher_nll=1.669297337532e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=2 prompt=[1, 770, 3186, 25, 220] overlap_pct=100.000000 kl=1.511309947819e-02 teacher_nll=6.314455866814e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=3 prompt=[1, 644, 374, 279, 1887] overlap_pct=68.750000 kl=2.707408368587e-02 teacher_nll=1.766305923462e+00 top3_overlap_pct=93.750000
+eval_detail step=0 split=train prompt_index=4 prompt=[1, 3838, 374, 264, 2077, 13] overlap_pct=0.000000 kl=4.643873870373e-02 teacher_nll=1.718343734741e+00 top3_overlap_pct=87.500000
+eval_detail step=0 split=train prompt_index=5 prompt=[1, 785, 594, 287, 374, 1690] overlap_pct=0.000000 kl=2.450336702168e-02 teacher_nll=1.336135625839e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=6 prompt=[1, 3347, 11, 358, 1052, 429] overlap_pct=100.000000 kl=1.752594113350e-02 teacher_nll=1.284706115723e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=7 prompt=[1, 2610, 527, 1139, 304, 279, 1670] overlap_pct=100.000000 kl=1.518251281232e-02 teacher_nll=1.275263071060e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=8 prompt=[1, 888, 536, 4697, 972] overlap_pct=100.000000 kl=5.954534560442e-02 teacher_nll=3.179169297218e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=9 prompt=[1, 374, 11, 279, 1372, 315] overlap_pct=100.000000 kl=1.585281640291e-02 teacher_nll=7.057138681412e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=10 prompt=[1, 2874, 369, 279, 31559] overlap_pct=12.500000 kl=3.778381645679e-02 teacher_nll=1.071332454681e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=11 prompt=[1, 7521, 481, 362, 5714] overlap_pct=12.500000 kl=7.616762071848e-02 teacher_nll=1.239987969398e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=12 prompt=[1, 43059, 21938, 315, 7148] overlap_pct=87.500000 kl=9.588328748941e-02 teacher_nll=9.841155409813e-01 top3_overlap_pct=93.750000
+eval_detail step=0 split=train prompt_index=13 prompt=[1, 358, 646, 944, 1490, 432] overlap_pct=50.000000 kl=8.027527481318e-02 teacher_nll=1.409965157509e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=14 prompt=[1, 477, 11, 323, 279, 62] overlap_pct=100.000000 kl=6.788868457079e-03 teacher_nll=2.654249966145e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=15 prompt=[1, 576, 1102, 315, 264, 729] overlap_pct=62.500000 kl=3.401010856032e-02 teacher_nll=1.146435260773e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=16 prompt=[1, 291, 504, 279, 1467, 11] overlap_pct=37.500000 kl=5.698444694281e-02 teacher_nll=1.053581953049e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=17 prompt=[1, 702, 1012, 1483, 311, 7512] overlap_pct=12.500000 kl=2.028385177255e-02 teacher_nll=1.771023511887e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=18 prompt=[1, 264, 11245, 2168, 429, 702] overlap_pct=62.500000 kl=3.134487941861e-02 teacher_nll=1.529378175735e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=19 prompt=[1, 3555, 374, 264, 5714, 30] overlap_pct=18.750000 kl=5.071166902781e-02 teacher_nll=1.077913045883e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=20 prompt=[1, 19257, 311, 279, 1251, 315] overlap_pct=100.000000 kl=1.695335097611e-02 teacher_nll=8.622968196869e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=21 prompt=[1, 1156, 3019, 304, 279, 1882] overlap_pct=18.750000 kl=4.740192741156e-02 teacher_nll=1.267392158508e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=22 prompt=[1, 2701, 1467, 25, 4710, 785] overlap_pct=0.000000 kl=5.151420459151e-02 teacher_nll=1.688759088516e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=23 prompt=[1, 315, 279, 3364, 13, 576] overlap_pct=93.750000 kl=1.732486858964e-02 teacher_nll=1.046406269073e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=24 prompt=[1, 279, 897, 5927, 553, 279] overlap_pct=43.750000 kl=2.503654360771e-02 teacher_nll=1.066993474960e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=25 prompt=[1, 2055, 11, 369, 279, 1140] overlap_pct=18.750000 kl=3.174077346921e-02 teacher_nll=1.447196722031e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=26 prompt=[1, 28469, 9363, 525, 279] overlap_pct=0.000000 kl=1.984749361873e-02 teacher_nll=1.680583357811e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=27 prompt=[1, 1012, 13570, 14975, 304, 279] overlap_pct=12.500000 kl=3.391375020146e-02 teacher_nll=1.823704957962e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=28 prompt=[1, 1887, 2242, 1294, 2827, 8] overlap_pct=12.500000 kl=5.488401278853e-02 teacher_nll=7.090343236923e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=29 prompt=[1, 62, 716, 477, 11, 323] overlap_pct=37.500000 kl=7.791196927428e-03 teacher_nll=5.728622674942e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=30 prompt=[1, 1512, 429, 374, 11, 279] overlap_pct=0.000000 kl=1.198946032673e-02 teacher_nll=6.772183775902e-01 top3_overlap_pct=100.000000
+eval_detail step=0 split=train prompt_index=31 prompt=[1, 74595, 11, 714, 279, 1467] overlap_pct=6.250000 kl=1.903179287910e-02 teacher_nll=1.582676887512e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=heldout prompt_index=0 prompt=[1, 4438, 374, 279, 2768] overlap_pct=100.000000 kl=1.335429027677e-02 teacher_nll=1.371749639511e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=heldout prompt_index=1 prompt=[1, 1516, 374, 264, 1296, 4339] overlap_pct=18.750000 kl=2.586659789085e-02 teacher_nll=1.764051556587e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=heldout prompt_index=2 prompt=[1, 785, 1401, 315, 279, 1967] overlap_pct=100.000000 kl=4.078944772482e-02 teacher_nll=1.180352210999e+00 top3_overlap_pct=100.000000
+eval_detail step=0 split=heldout prompt_index=3 prompt=[1, 3198, 279, 1296, 25, 220] overlap_pct=37.500000 kl=6.384555250406e-03 teacher_nll=8.259612321854e-01 top3_overlap_pct=100.000000
+eval_summary step=0 train_overlap_pct=48.437500 heldout_overlap_pct=64.062500 train_kl=3.419336079969e-02 heldout_kl=2.159872278571e-02 train_teacher_nll=1.160719883628e+00 heldout_teacher_nll=1.285528659821e+00 eval_seconds=30.173805
+train_step step=1 step_seconds=0.479229
+train_step step=2 step_seconds=0.468411
+train_step step=3 step_seconds=0.409594
+train_step step=4 step_seconds=0.410838
+train_step step=5 step_seconds=0.413393
+train_step step=6 step_seconds=0.409170
+train_step step=7 step_seconds=0.408426
+train_step step=8 step_seconds=0.409729
+train_step step=9 step_seconds=0.409669
+train_step step=10 step_seconds=0.409282
+{'loss': '0.02178', 'grad_norm': '9.49', 'learning_rate': '1e-07', 'epoch': '0.3125'}
+train_step step=11 step_seconds=0.408651
+train_step step=12 step_seconds=0.407233
+train_step step=13 step_seconds=0.415267
+train_step step=14 step_seconds=0.412037
+train_step step=15 step_seconds=0.415568
+train_step step=16 step_seconds=0.413110
+train_step step=17 step_seconds=0.412866
+train_step step=18 step_seconds=0.417056
+train_step step=19 step_seconds=0.414669
+train_step step=20 step_seconds=0.413443
+{'loss': '0.04893', 'grad_norm': '7.188', 'learning_rate': '1e-07', 'epoch': '0.625'}
+train_step step=21 step_seconds=0.412591
+train_step step=22 step_seconds=0.413653
+train_step step=23 step_seconds=0.411842
+train_step step=24 step_seconds=0.410575
+train_step step=25 step_seconds=0.413106
+train_step step=26 step_seconds=0.412894
+train_step step=27 step_seconds=0.411347
+train_step step=28 step_seconds=0.419785
+train_step step=29 step_seconds=0.411619
+train_step step=30 step_seconds=0.413887
+{'loss': '0.02696', 'grad_norm': '7.301', 'learning_rate': '1e-07', 'epoch': '0.9375'}
+train_step step=31 step_seconds=0.412010
+train_step step=32 step_seconds=0.411632
+train_step step=33 step_seconds=0.410184
+train_step step=34 step_seconds=0.415083
+train_step step=35 step_seconds=0.411361
+train_step step=36 step_seconds=0.410381
+train_step step=37 step_seconds=0.412881
+train_step step=38 step_seconds=0.412276
+train_step step=39 step_seconds=0.413339
+train_step step=40 step_seconds=0.414505
+{'loss': '0.02364', 'grad_norm': '4.469', 'learning_rate': '1e-07', 'epoch': '1.25'}
+train_step step=41 step_seconds=0.414522
+train_step step=42 step_seconds=0.412791
+train_step step=43 step_seconds=0.410029
+train_step step=44 step_seconds=0.414005
+train_step step=45 step_seconds=0.411201
+train_step step=46 step_seconds=0.410233
+train_step step=47 step_seconds=0.411738
+train_step step=48 step_seconds=0.409661
+train_step step=49 step_seconds=0.411393
+train_step step=50 step_seconds=0.412835
+eval_detail step=50 split=train prompt_index=0 prompt=[1, 872, 198, 3456] overlap_pct=0.000000 kl=2.285771630704e-02 teacher_nll=4.892489910126e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=1 prompt=[1, 198, 1512, 429] overlap_pct=87.500000 kl=7.038788869977e-03 teacher_nll=1.643854022026e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=2 prompt=[1, 770, 3186, 25, 220] overlap_pct=100.000000 kl=1.163115724921e-02 teacher_nll=6.603958606720e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=3 prompt=[1, 644, 374, 279, 1887] overlap_pct=68.750000 kl=1.576689444482e-02 teacher_nll=1.773283481598e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=4 prompt=[1, 3838, 374, 264, 2077, 13] overlap_pct=0.000000 kl=2.885115332901e-02 teacher_nll=1.645653963089e+00 top3_overlap_pct=93.750000
+eval_detail step=50 split=train prompt_index=5 prompt=[1, 785, 594, 287, 374, 1690] overlap_pct=87.500000 kl=1.604166254401e-02 teacher_nll=1.380517840385e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=6 prompt=[1, 3347, 11, 358, 1052, 429] overlap_pct=100.000000 kl=9.465867653489e-03 teacher_nll=1.262809514999e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=7 prompt=[1, 2610, 527, 1139, 304, 279, 1670] overlap_pct=100.000000 kl=1.002811081707e-02 teacher_nll=1.262840867043e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=8 prompt=[1, 888, 536, 4697, 972] overlap_pct=100.000000 kl=4.573702067137e-02 teacher_nll=2.948180139065e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=9 prompt=[1, 374, 11, 279, 1372, 315] overlap_pct=68.750000 kl=1.373855024576e-02 teacher_nll=7.205998897552e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=10 prompt=[1, 2874, 369, 279, 31559] overlap_pct=37.500000 kl=2.133710682392e-02 teacher_nll=1.074782133102e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=11 prompt=[1, 7521, 481, 362, 5714] overlap_pct=18.750000 kl=4.249230399728e-02 teacher_nll=1.191388368607e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=12 prompt=[1, 43059, 21938, 315, 7148] overlap_pct=87.500000 kl=9.265039861202e-02 teacher_nll=9.837339520454e-01 top3_overlap_pct=93.750000
+eval_detail step=50 split=train prompt_index=13 prompt=[1, 358, 646, 944, 1490, 432] overlap_pct=50.000000 kl=5.148973688483e-02 teacher_nll=1.369164824486e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=14 prompt=[1, 477, 11, 323, 279, 62] overlap_pct=100.000000 kl=3.890326013789e-03 teacher_nll=3.039861917496e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=15 prompt=[1, 576, 1102, 315, 264, 729] overlap_pct=56.250000 kl=2.061898633838e-02 teacher_nll=1.136579990387e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=16 prompt=[1, 291, 504, 279, 1467, 11] overlap_pct=100.000000 kl=3.046064451337e-02 teacher_nll=1.069252252579e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=17 prompt=[1, 702, 1012, 1483, 311, 7512] overlap_pct=93.750000 kl=1.165863312781e-02 teacher_nll=1.762827396393e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=18 prompt=[1, 264, 11245, 2168, 429, 702] overlap_pct=100.000000 kl=1.900686323643e-02 teacher_nll=1.547989606857e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=19 prompt=[1, 3555, 374, 264, 5714, 30] overlap_pct=100.000000 kl=2.291183173656e-02 teacher_nll=1.033328771591e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=20 prompt=[1, 19257, 311, 279, 1251, 315] overlap_pct=68.750000 kl=1.453700568527e-02 teacher_nll=8.915858268738e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=21 prompt=[1, 1156, 3019, 304, 279, 1882] overlap_pct=37.500000 kl=2.887697145343e-02 teacher_nll=1.271496534348e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=22 prompt=[1, 2701, 1467, 25, 4710, 785] overlap_pct=6.250000 kl=3.718041628599e-02 teacher_nll=1.678628802299e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=23 prompt=[1, 315, 279, 3364, 13, 576] overlap_pct=100.000000 kl=1.098591275513e-02 teacher_nll=1.080165386200e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=24 prompt=[1, 279, 897, 5927, 553, 279] overlap_pct=100.000000 kl=2.098514139652e-02 teacher_nll=1.035629510880e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=25 prompt=[1, 2055, 11, 369, 279, 1140] overlap_pct=18.750000 kl=1.898674666882e-02 teacher_nll=1.421349287033e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=26 prompt=[1, 28469, 9363, 525, 279] overlap_pct=0.000000 kl=1.192396879196e-02 teacher_nll=1.686824440956e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=27 prompt=[1, 1012, 13570, 14975, 304, 279] overlap_pct=12.500000 kl=1.877900585532e-02 teacher_nll=1.807373642921e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=28 prompt=[1, 1887, 2242, 1294, 2827, 8] overlap_pct=37.500000 kl=3.547724336386e-02 teacher_nll=6.928331851959e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=29 prompt=[1, 62, 716, 477, 11, 323] overlap_pct=100.000000 kl=5.720646120608e-03 teacher_nll=5.621516108513e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=30 prompt=[1, 1512, 429, 374, 11, 279] overlap_pct=100.000000 kl=1.108985859901e-02 teacher_nll=6.870214939117e-01 top3_overlap_pct=100.000000
+eval_detail step=50 split=train prompt_index=31 prompt=[1, 74595, 11, 714, 279, 1467] overlap_pct=6.250000 kl=1.268026791513e-02 teacher_nll=1.578752756119e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=heldout prompt_index=0 prompt=[1, 4438, 374, 279, 2768] overlap_pct=100.000000 kl=1.048937253654e-02 teacher_nll=1.399145245552e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=heldout prompt_index=1 prompt=[1, 1516, 374, 264, 1296, 4339] overlap_pct=18.750000 kl=1.896622031927e-02 teacher_nll=1.742701053619e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=heldout prompt_index=2 prompt=[1, 785, 1401, 315, 279, 1967] overlap_pct=100.000000 kl=4.312686622143e-02 teacher_nll=1.171696901321e+00 top3_overlap_pct=100.000000
+eval_detail step=50 split=heldout prompt_index=3 prompt=[1, 3198, 279, 1296, 25, 220] overlap_pct=37.500000 kl=9.213957004249e-03 teacher_nll=8.163385391235e-01 top3_overlap_pct=100.000000
+eval_summary step=50 train_overlap_pct=63.867188 heldout_overlap_pct=64.062500 train_kl=2.265302932210e-02 heldout_kl=2.044910402037e-02 train_teacher_nll=1.156277137809e+00 heldout_teacher_nll=1.282470434904e+00 eval_seconds=30.525472
+{'loss': '0.02489', 'grad_norm': '3.236', 'learning_rate': '1e-07', 'epoch': '1.562'}
+train_step step=51 step_seconds=0.440800
+train_step step=52 step_seconds=0.410310
+train_step step=53 step_seconds=0.410937
+train_step step=54 step_seconds=0.409800
+train_step step=55 step_seconds=0.411066
+train_step step=56 step_seconds=0.409773
+train_step step=57 step_seconds=0.411408
+train_step step=58 step_seconds=0.410979
+train_step step=59 step_seconds=0.410029
+train_step step=60 step_seconds=0.411823
+{'loss': '0.0133', 'grad_norm': '2.573', 'learning_rate': '1e-07', 'epoch': '1.875'}
+train_step step=61 step_seconds=0.413245
+train_step step=62 step_seconds=0.411593
+train_step step=63 step_seconds=0.411070
+train_step step=64 step_seconds=0.409827
+train_step step=65 step_seconds=0.411413
+train_step step=66 step_seconds=0.409617
+train_step step=67 step_seconds=0.411818
+train_step step=68 step_seconds=0.409897
+train_step step=69 step_seconds=0.408010
+train_step step=70 step_seconds=0.407215
+{'loss': '0.02092', 'grad_norm': '5.26', 'learning_rate': '1e-07', 'epoch': '2.188'}
+train_step step=71 step_seconds=0.407676
+train_step step=72 step_seconds=0.409533
+train_step step=73 step_seconds=0.409655
+train_step step=74 step_seconds=0.407506
+train_step step=75 step_seconds=0.407728
+train_step step=76 step_seconds=0.408813
+train_step step=77 step_seconds=0.409931
+train_step step=78 step_seconds=0.408694
+train_step step=79 step_seconds=0.408325
+train_step step=80 step_seconds=0.407392
+{'loss': '0.009262', 'grad_norm': '2.049', 'learning_rate': '1e-07', 'epoch': '2.5'}
+train_step step=81 step_seconds=0.407923
+train_step step=82 step_seconds=0.411040
+train_step step=83 step_seconds=0.408315
+train_step step=84 step_seconds=0.410077
+train_step step=85 step_seconds=0.411287
+train_step step=86 step_seconds=0.410572
+train_step step=87 step_seconds=0.419983
+train_step step=88 step_seconds=0.407547
+train_step step=89 step_seconds=0.408667
+train_step step=90 step_seconds=0.409073
+{'loss': '0.0158', 'grad_norm': '9.519', 'learning_rate': '1e-07', 'epoch': '2.812'}
+train_step step=91 step_seconds=0.410146
+train_step step=92 step_seconds=0.411751
+train_step step=93 step_seconds=0.409655
+train_step step=94 step_seconds=0.414681
+train_step step=95 step_seconds=0.408566
+train_step step=96 step_seconds=0.407501
+train_step step=97 step_seconds=0.407775
+train_step step=98 step_seconds=0.406363
+train_step step=99 step_seconds=0.408107
+train_step step=100 step_seconds=0.406586
+eval_detail step=100 split=train prompt_index=0 prompt=[1, 872, 198, 3456] overlap_pct=0.000000 kl=1.966092176735e-02 teacher_nll=4.812306761742e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=1 prompt=[1, 198, 1512, 429] overlap_pct=100.000000 kl=5.272214766592e-03 teacher_nll=1.643138051033e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=2 prompt=[1, 770, 3186, 25, 220] overlap_pct=100.000000 kl=9.562003426254e-03 teacher_nll=6.961249709129e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=3 prompt=[1, 644, 374, 279, 1887] overlap_pct=68.750000 kl=1.205029711127e-02 teacher_nll=1.760586977005e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=4 prompt=[1, 3838, 374, 264, 2077, 13] overlap_pct=0.000000 kl=2.117161825299e-02 teacher_nll=1.595474004745e+00 top3_overlap_pct=93.750000
+eval_detail step=100 split=train prompt_index=5 prompt=[1, 785, 594, 287, 374, 1690] overlap_pct=100.000000 kl=1.661422103643e-02 teacher_nll=1.307068109512e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=6 prompt=[1, 3347, 11, 358, 1052, 429] overlap_pct=100.000000 kl=5.889055784792e-03 teacher_nll=1.232964038849e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=7 prompt=[1, 2610, 527, 1139, 304, 279, 1670] overlap_pct=100.000000 kl=9.269077330828e-03 teacher_nll=1.228127717972e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=8 prompt=[1, 888, 536, 4697, 972] overlap_pct=100.000000 kl=3.247189521790e-02 teacher_nll=2.631560564041e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=9 prompt=[1, 374, 11, 279, 1372, 315] overlap_pct=31.250000 kl=1.140749640763e-02 teacher_nll=7.444295287132e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=10 prompt=[1, 2874, 369, 279, 31559] overlap_pct=37.500000 kl=1.310223340988e-02 teacher_nll=1.053321480751e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=11 prompt=[1, 7521, 481, 362, 5714] overlap_pct=18.750000 kl=3.540743514895e-02 teacher_nll=1.131330490112e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=12 prompt=[1, 43059, 21938, 315, 7148] overlap_pct=62.500000 kl=7.901148498058e-02 teacher_nll=9.572423696518e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=13 prompt=[1, 358, 646, 944, 1490, 432] overlap_pct=100.000000 kl=3.074197098613e-02 teacher_nll=1.324915885925e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=14 prompt=[1, 477, 11, 323, 279, 62] overlap_pct=100.000000 kl=3.181854961440e-03 teacher_nll=2.958353459835e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=15 prompt=[1, 576, 1102, 315, 264, 729] overlap_pct=56.250000 kl=1.556373480707e-02 teacher_nll=1.162616729736e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=16 prompt=[1, 291, 504, 279, 1467, 11] overlap_pct=100.000000 kl=2.036667615175e-02 teacher_nll=1.069172143936e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=17 prompt=[1, 702, 1012, 1483, 311, 7512] overlap_pct=93.750000 kl=7.710291538388e-03 teacher_nll=1.754405021667e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=18 prompt=[1, 264, 11245, 2168, 429, 702] overlap_pct=100.000000 kl=1.392990257591e-02 teacher_nll=1.544206619263e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=19 prompt=[1, 3555, 374, 264, 5714, 30] overlap_pct=100.000000 kl=1.137850899249e-02 teacher_nll=1.010031104088e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=20 prompt=[1, 19257, 311, 279, 1251, 315] overlap_pct=12.500000 kl=1.396601740271e-02 teacher_nll=8.773755431175e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=21 prompt=[1, 1156, 3019, 304, 279, 1882] overlap_pct=37.500000 kl=1.932140253484e-02 teacher_nll=1.263704538345e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=22 prompt=[1, 2701, 1467, 25, 4710, 785] overlap_pct=6.250000 kl=2.835430949926e-02 teacher_nll=1.665047049522e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=23 prompt=[1, 315, 279, 3364, 13, 576] overlap_pct=100.000000 kl=8.732382208109e-03 teacher_nll=1.086924076080e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=24 prompt=[1, 279, 897, 5927, 553, 279] overlap_pct=100.000000 kl=2.338515408337e-02 teacher_nll=1.017066001892e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=25 prompt=[1, 2055, 11, 369, 279, 1140] overlap_pct=43.750000 kl=1.190351508558e-02 teacher_nll=1.394852399826e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=26 prompt=[1, 28469, 9363, 525, 279] overlap_pct=25.000000 kl=8.261840790510e-03 teacher_nll=1.679072380066e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=27 prompt=[1, 1012, 13570, 14975, 304, 279] overlap_pct=12.500000 kl=1.258224621415e-02 teacher_nll=1.797049045563e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=28 prompt=[1, 1887, 2242, 1294, 2827, 8] overlap_pct=100.000000 kl=2.187191322446e-02 teacher_nll=6.485434770584e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=29 prompt=[1, 62, 716, 477, 11, 323] overlap_pct=100.000000 kl=4.081872291863e-03 teacher_nll=5.672988295555e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=30 prompt=[1, 1512, 429, 374, 11, 279] overlap_pct=100.000000 kl=8.429268375039e-03 teacher_nll=6.987159848213e-01 top3_overlap_pct=100.000000
+eval_detail step=100 split=train prompt_index=31 prompt=[1, 74595, 11, 714, 279, 1467] overlap_pct=6.250000 kl=1.035777665675e-02 teacher_nll=1.566657781601e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=heldout prompt_index=0 prompt=[1, 4438, 374, 279, 2768] overlap_pct=100.000000 kl=1.092403102666e-02 teacher_nll=1.403720617294e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=heldout prompt_index=1 prompt=[1, 1516, 374, 264, 1296, 4339] overlap_pct=18.750000 kl=1.630043610930e-02 teacher_nll=1.720743417740e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=heldout prompt_index=2 prompt=[1, 785, 1401, 315, 279, 1967] overlap_pct=100.000000 kl=4.537865519524e-02 teacher_nll=1.156749129295e+00 top3_overlap_pct=100.000000
+eval_detail step=100 split=heldout prompt_index=3 prompt=[1, 3198, 279, 1296, 25, 220] overlap_pct=37.500000 kl=1.178958360106e-02 teacher_nll=8.073772192001e-01 top3_overlap_pct=100.000000
+eval_summary step=100 train_overlap_pct=66.015625 heldout_overlap_pct=64.062500 train_kl=1.703158103192e-02 heldout_kl=2.109817648306e-02 train_teacher_nll=1.141177638434e+00 heldout_teacher_nll=1.272147595882e+00 eval_seconds=30.225508
+{'loss': '0.01091', 'grad_norm': '2.296', 'learning_rate': '1e-07', 'epoch': '3.125'}
+train_step step=101 step_seconds=0.441083
+train_step step=102 step_seconds=0.407907
+train_step step=103 step_seconds=0.415406
+train_step step=104 step_seconds=0.410734
+train_step step=105 step_seconds=0.410269
+train_step step=106 step_seconds=0.410049
+train_step step=107 step_seconds=0.404493
+train_step step=108 step_seconds=0.407062
+train_step step=109 step_seconds=0.408200
+train_step step=110 step_seconds=0.405495
+{'loss': '0.008199', 'grad_norm': '7.247', 'learning_rate': '1e-07', 'epoch': '3.438'}
+train_step step=111 step_seconds=0.406052
+train_step step=112 step_seconds=0.404897
+train_step step=113 step_seconds=0.409592
+train_step step=114 step_seconds=0.405452
+train_step step=115 step_seconds=0.406729
+train_step step=116 step_seconds=0.405363
+train_step step=117 step_seconds=0.404190
+train_step step=118 step_seconds=0.408658
+train_step step=119 step_seconds=0.407947
+train_step step=120 step_seconds=0.406967
+{'loss': '0.00971', 'grad_norm': '2.989', 'learning_rate': '1e-07', 'epoch': '3.75'}
+train_step step=121 step_seconds=0.408857
+train_step step=122 step_seconds=0.406523
+train_step step=123 step_seconds=0.407030
+train_step step=124 step_seconds=0.406305
+train_step step=125 step_seconds=0.408679
+train_step step=126 step_seconds=0.406632
+train_step step=127 step_seconds=0.405744
+train_step step=128 step_seconds=0.407025
+train_step step=129 step_seconds=0.407651
+train_step step=130 step_seconds=0.407061
+{'loss': '0.01044', 'grad_norm': '2.082', 'learning_rate': '1e-07', 'epoch': '4.062'}
+train_step step=131 step_seconds=0.406007
+train_step step=132 step_seconds=0.406688
+train_step step=133 step_seconds=0.410242
+train_step step=134 step_seconds=0.406761
+train_step step=135 step_seconds=0.407137
+train_step step=136 step_seconds=0.405917
+train_step step=137 step_seconds=0.406607
+train_step step=138 step_seconds=0.406195
+train_step step=139 step_seconds=0.405799
+train_step step=140 step_seconds=0.407801
+{'loss': '0.007764', 'grad_norm': '1.704', 'learning_rate': '1e-07', 'epoch': '4.375'}
+train_step step=141 step_seconds=0.409407
+train_step step=142 step_seconds=0.406540
+train_step step=143 step_seconds=0.405767
+train_step step=144 step_seconds=0.404952
+train_step step=145 step_seconds=0.408289
+train_step step=146 step_seconds=0.406195
+train_step step=147 step_seconds=0.408079
+train_step step=148 step_seconds=0.406156
+train_step step=149 step_seconds=0.406905
+train_step step=150 step_seconds=0.410256
+{'loss': '0.007322', 'grad_norm': '0.62', 'learning_rate': '1e-07', 'epoch': '4.688'}
+train_step step=151 step_seconds=0.406813
+train_step step=152 step_seconds=0.407360
+train_step step=153 step_seconds=0.407277
+train_step step=154 step_seconds=0.408664
+train_step step=155 step_seconds=0.406730
+train_step step=156 step_seconds=0.405907
+train_step step=157 step_seconds=0.407095
+train_step step=158 step_seconds=0.407222
+train_step step=159 step_seconds=0.407938
+train_step step=160 step_seconds=0.408575
+{'loss': '0.007774', 'grad_norm': '3.467', 'learning_rate': '1e-07', 'epoch': '5'}
+train_step step=161 step_seconds=0.405708
+train_step step=162 step_seconds=0.408363
+train_step step=163 step_seconds=0.407530
+train_step step=164 step_seconds=0.407268
+train_step step=165 step_seconds=0.406952
+train_step step=166 step_seconds=0.405706
+train_step step=167 step_seconds=0.408005
+train_step step=168 step_seconds=0.408124
+train_step step=169 step_seconds=0.407378
+train_step step=170 step_seconds=0.407311
+{'loss': '0.006363', 'grad_norm': '2.037', 'learning_rate': '1e-07', 'epoch': '5.312'}
+train_step step=171 step_seconds=0.406282
+train_step step=172 step_seconds=0.408388
+train_step step=173 step_seconds=0.406848
+train_step step=174 step_seconds=0.408809
+train_step step=175 step_seconds=0.406370
+train_step step=176 step_seconds=0.405961
+train_step step=177 step_seconds=0.406924
+train_step step=178 step_seconds=0.407705
+train_step step=179 step_seconds=0.407056
+train_step step=180 step_seconds=0.405385
+{'loss': '0.006327', 'grad_norm': '1.489', 'learning_rate': '1e-07', 'epoch': '5.625'}
+train_step step=181 step_seconds=0.406446
+train_step step=182 step_seconds=0.407897
+train_step step=183 step_seconds=0.411771
+train_step step=184 step_seconds=0.407292
+train_step step=185 step_seconds=0.408361
+train_step step=186 step_seconds=0.410101
+train_step step=187 step_seconds=0.407347
+train_step step=188 step_seconds=0.407541
+train_step step=189 step_seconds=0.409027
+train_step step=190 step_seconds=0.406825
+{'loss': '0.007727', 'grad_norm': '2.252', 'learning_rate': '1e-07', 'epoch': '5.938'}
+train_step step=191 step_seconds=0.408219
+train_step step=192 step_seconds=0.412374
+train_step step=193 step_seconds=0.409913
+train_step step=194 step_seconds=0.410689
+train_step step=195 step_seconds=0.407079
+train_step step=196 step_seconds=0.420087
+train_step step=197 step_seconds=0.409791
+train_step step=198 step_seconds=0.421427
+train_step step=199 step_seconds=0.408972
+train_step step=200 step_seconds=0.407607
+{'loss': '0.004188', 'grad_norm': '1.909', 'learning_rate': '1e-07', 'epoch': '6.25'}
+train_step step=201 step_seconds=0.408587
+train_step step=202 step_seconds=0.406375
+train_step step=203 step_seconds=0.407107
+train_step step=204 step_seconds=0.407971
+train_step step=205 step_seconds=0.406018
+train_step step=206 step_seconds=0.409636
+train_step step=207 step_seconds=0.407388
+train_step step=208 step_seconds=0.407093
+train_step step=209 step_seconds=0.408438
+train_step step=210 step_seconds=0.406977
+{'loss': '0.00679', 'grad_norm': '3.598', 'learning_rate': '1e-07', 'epoch': '6.562'}
+train_step step=211 step_seconds=0.407966
+train_step step=212 step_seconds=0.406286
+train_step step=213 step_seconds=0.408542
+train_step step=214 step_seconds=0.407210
+train_step step=215 step_seconds=0.406650
+train_step step=216 step_seconds=0.408374
+train_step step=217 step_seconds=0.407079
+train_step step=218 step_seconds=0.408118
+train_step step=219 step_seconds=0.408860
+train_step step=220 step_seconds=0.408967
+{'loss': '0.004418', 'grad_norm': '6.102', 'learning_rate': '1e-07', 'epoch': '6.875'}
+train_step step=221 step_seconds=0.408364
+train_step step=222 step_seconds=0.407817
+train_step step=223 step_seconds=0.409506
+train_step step=224 step_seconds=0.408948
+train_step step=225 step_seconds=0.410870
+train_step step=226 step_seconds=0.408125
+train_step step=227 step_seconds=0.407261
+train_step step=228 step_seconds=0.408696
+train_step step=229 step_seconds=0.407048
+train_step step=230 step_seconds=0.407920
+{'loss': '0.005514', 'grad_norm': '6.042', 'learning_rate': '1e-07', 'epoch': '7.188'}
+train_step step=231 step_seconds=0.409243
+train_step step=232 step_seconds=0.406611
+train_step step=233 step_seconds=0.408765
+train_step step=234 step_seconds=0.406085
+train_step step=235 step_seconds=0.407471
+train_step step=236 step_seconds=0.409013
+train_step step=237 step_seconds=0.407259
+train_step step=238 step_seconds=0.411359
+train_step step=239 step_seconds=0.407447
+train_step step=240 step_seconds=0.410007
+{'loss': '0.006654', 'grad_norm': '3.999', 'learning_rate': '1e-07', 'epoch': '7.5'}
+train_step step=241 step_seconds=0.409324
+train_step step=242 step_seconds=0.409074
+train_step step=243 step_seconds=0.413887
+train_step step=244 step_seconds=0.408322
+train_step step=245 step_seconds=0.408280
+train_step step=246 step_seconds=0.407655
+train_step step=247 step_seconds=0.410005
+train_step step=248 step_seconds=0.407820
+train_step step=249 step_seconds=0.407978
+train_step step=250 step_seconds=0.409352
+eval_detail step=250 split=train prompt_index=0 prompt=[1, 872, 198, 3456] overlap_pct=93.750000 kl=1.096446812153e-02 teacher_nll=4.529881179333e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=1 prompt=[1, 198, 1512, 429] overlap_pct=100.000000 kl=4.415308125317e-03 teacher_nll=1.645833730698e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=2 prompt=[1, 770, 3186, 25, 220] overlap_pct=100.000000 kl=7.862793281674e-03 teacher_nll=6.976781487465e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=3 prompt=[1, 644, 374, 279, 1887] overlap_pct=87.500000 kl=1.211001724005e-02 teacher_nll=1.744564533234e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=4 prompt=[1, 3838, 374, 264, 2077, 13] overlap_pct=0.000000 kl=1.548322103918e-02 teacher_nll=1.534019112587e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=5 prompt=[1, 785, 594, 287, 374, 1690] overlap_pct=100.000000 kl=1.277247723192e-02 teacher_nll=1.350998997688e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=6 prompt=[1, 3347, 11, 358, 1052, 429] overlap_pct=100.000000 kl=4.017634317279e-03 teacher_nll=1.214243531227e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=7 prompt=[1, 2610, 527, 1139, 304, 279, 1670] overlap_pct=100.000000 kl=5.455150268972e-03 teacher_nll=1.235798835754e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=8 prompt=[1, 888, 536, 4697, 972] overlap_pct=100.000000 kl=2.134415879846e-02 teacher_nll=2.426314651966e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=9 prompt=[1, 374, 11, 279, 1372, 315] overlap_pct=31.250000 kl=8.898993954062e-03 teacher_nll=7.568572759628e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=10 prompt=[1, 2874, 369, 279, 31559] overlap_pct=31.250000 kl=6.676760502160e-03 teacher_nll=1.018100380898e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=11 prompt=[1, 7521, 481, 362, 5714] overlap_pct=18.750000 kl=2.329925447702e-02 teacher_nll=1.145330667496e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=12 prompt=[1, 43059, 21938, 315, 7148] overlap_pct=68.750000 kl=4.191506281495e-02 teacher_nll=9.080829620361e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=13 prompt=[1, 358, 646, 944, 1490, 432] overlap_pct=50.000000 kl=1.684276014566e-02 teacher_nll=1.297178745270e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=14 prompt=[1, 477, 11, 323, 279, 62] overlap_pct=100.000000 kl=1.651586266235e-03 teacher_nll=3.016965091228e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=15 prompt=[1, 576, 1102, 315, 264, 729] overlap_pct=56.250000 kl=1.373378839344e-02 teacher_nll=1.163813591003e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=16 prompt=[1, 291, 504, 279, 1467, 11] overlap_pct=100.000000 kl=8.981345221400e-03 teacher_nll=1.049221515656e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=17 prompt=[1, 702, 1012, 1483, 311, 7512] overlap_pct=100.000000 kl=5.837471224368e-03 teacher_nll=1.740395188332e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=18 prompt=[1, 264, 11245, 2168, 429, 702] overlap_pct=100.000000 kl=8.845137432218e-03 teacher_nll=1.531126618385e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=19 prompt=[1, 3555, 374, 264, 5714, 30] overlap_pct=75.000000 kl=5.095155443996e-03 teacher_nll=1.031634092331e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=20 prompt=[1, 19257, 311, 279, 1251, 315] overlap_pct=68.750000 kl=1.062065642327e-02 teacher_nll=8.991308808327e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=21 prompt=[1, 1156, 3019, 304, 279, 1882] overlap_pct=37.500000 kl=9.190002456307e-03 teacher_nll=1.246931552887e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=22 prompt=[1, 2701, 1467, 25, 4710, 785] overlap_pct=87.500000 kl=1.473481673747e-02 teacher_nll=1.622381329536e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=23 prompt=[1, 315, 279, 3364, 13, 576] overlap_pct=100.000000 kl=7.152021862566e-03 teacher_nll=1.076852560043e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=24 prompt=[1, 279, 897, 5927, 553, 279] overlap_pct=75.000000 kl=2.684349007905e-02 teacher_nll=9.962532520294e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=25 prompt=[1, 2055, 11, 369, 279, 1140] overlap_pct=100.000000 kl=4.975729621947e-03 teacher_nll=1.351920843124e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=26 prompt=[1, 28469, 9363, 525, 279] overlap_pct=93.750000 kl=6.448579952121e-03 teacher_nll=1.670640110970e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=27 prompt=[1, 1012, 13570, 14975, 304, 279] overlap_pct=100.000000 kl=6.679070182145e-03 teacher_nll=1.777494192123e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=28 prompt=[1, 1887, 2242, 1294, 2827, 8] overlap_pct=100.000000 kl=1.177053339779e-02 teacher_nll=6.091136336327e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=29 prompt=[1, 62, 716, 477, 11, 323] overlap_pct=100.000000 kl=2.362629631534e-03 teacher_nll=5.769877433777e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=30 prompt=[1, 1512, 429, 374, 11, 279] overlap_pct=6.250000 kl=4.931052215397e-03 teacher_nll=7.002466917038e-01 top3_overlap_pct=100.000000
+eval_detail step=250 split=train prompt_index=31 prompt=[1, 74595, 11, 714, 279, 1467] overlap_pct=6.250000 kl=9.283578954637e-03 teacher_nll=1.558692216873e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=heldout prompt_index=0 prompt=[1, 4438, 374, 279, 2768] overlap_pct=100.000000 kl=1.179100573063e-02 teacher_nll=1.390676259995e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=heldout prompt_index=1 prompt=[1, 1516, 374, 264, 1296, 4339] overlap_pct=18.750000 kl=1.485271658748e-02 teacher_nll=1.692875623703e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=heldout prompt_index=2 prompt=[1, 785, 1401, 315, 279, 1967] overlap_pct=100.000000 kl=4.455430060625e-02 teacher_nll=1.143905162811e+00 top3_overlap_pct=100.000000
+eval_detail step=250 split=heldout prompt_index=3 prompt=[1, 3198, 279, 1296, 25, 220] overlap_pct=37.500000 kl=1.360182277858e-02 teacher_nll=7.984368801117e-01 top3_overlap_pct=100.000000
+eval_summary step=250 train_overlap_pct=74.609375 heldout_overlap_pct=64.062500 train_kl=1.097483455669e-02 heldout_kl=2.119996142574e-02 train_teacher_nll=1.129651219584e+00 heldout_teacher_nll=1.256473481655e+00 eval_seconds=29.956646
+{'loss': '0.00399', 'grad_norm': '3.499', 'learning_rate': '1e-07', 'epoch': '7.812'}
+train_step step=251 step_seconds=0.429994
+train_step step=252 step_seconds=0.406303
+train_step step=253 step_seconds=0.407801
+train_step step=254 step_seconds=0.405213
+train_step step=255 step_seconds=0.408974
+train_step step=256 step_seconds=0.406621
+train_step step=257 step_seconds=0.407061
+train_step step=258 step_seconds=0.407114
+train_step step=259 step_seconds=0.405527
+train_step step=260 step_seconds=0.407099
+{'loss': '0.004533', 'grad_norm': '3.237', 'learning_rate': '1e-07', 'epoch': '8.125'}
+train_step step=261 step_seconds=0.405700
+train_step step=262 step_seconds=0.406168
+train_step step=263 step_seconds=0.405716
+train_step step=264 step_seconds=0.405077
+train_step step=265 step_seconds=0.406745
+train_step step=266 step_seconds=0.404716
+train_step step=267 step_seconds=0.406890
+train_step step=268 step_seconds=0.407727
+train_step step=269 step_seconds=0.404643
+train_step step=270 step_seconds=0.406524
+{'loss': '0.004524', 'grad_norm': '5.201', 'learning_rate': '1e-07', 'epoch': '8.438'}
+train_step step=271 step_seconds=0.404382
+train_step step=272 step_seconds=0.406761
+train_step step=273 step_seconds=0.405656
+train_step step=274 step_seconds=0.406070
+train_step step=275 step_seconds=0.406618
+train_step step=276 step_seconds=0.405647
+train_step step=277 step_seconds=0.407730
+train_step step=278 step_seconds=0.405436
+train_step step=279 step_seconds=0.406740
+train_step step=280 step_seconds=0.407219
+{'loss': '0.004657', 'grad_norm': '4.045', 'learning_rate': '1e-07', 'epoch': '8.75'}
+train_step step=281 step_seconds=0.405684
+train_step step=282 step_seconds=0.407321
+train_step step=283 step_seconds=0.408190
+train_step step=284 step_seconds=0.407038
+train_step step=285 step_seconds=0.406738
+train_step step=286 step_seconds=0.406339
+train_step step=287 step_seconds=0.407170
+train_step step=288 step_seconds=0.404857
+train_step step=289 step_seconds=0.406251
+train_step step=290 step_seconds=0.405111
+{'loss': '0.00407', 'grad_norm': '7.627', 'learning_rate': '1e-07', 'epoch': '9.062'}
+train_step step=291 step_seconds=0.404336
+train_step step=292 step_seconds=0.408763
+train_step step=293 step_seconds=0.405985
+train_step step=294 step_seconds=0.406301
+train_step step=295 step_seconds=0.405242
+train_step step=296 step_seconds=0.404329
+train_step step=297 step_seconds=0.407272
+train_step step=298 step_seconds=0.404802
+train_step step=299 step_seconds=0.408221
+train_step step=300 step_seconds=0.406016
+{'loss': '0.003397', 'grad_norm': '2.677', 'learning_rate': '1e-07', 'epoch': '9.375'}
+train_step step=301 step_seconds=0.404389
+train_step step=302 step_seconds=0.406030
+train_step step=303 step_seconds=0.404087
+train_step step=304 step_seconds=0.406390
+train_step step=305 step_seconds=0.409006
+train_step step=306 step_seconds=0.405628
+train_step step=307 step_seconds=0.407407
+train_step step=308 step_seconds=0.404604
+train_step step=309 step_seconds=0.408812
+train_step step=310 step_seconds=0.406549
+{'loss': '0.004952', 'grad_norm': '6.839', 'learning_rate': '1e-07', 'epoch': '9.688'}
+train_step step=311 step_seconds=0.406401
+train_step step=312 step_seconds=0.407331
+train_step step=313 step_seconds=0.403424
+train_step step=314 step_seconds=0.406527
+train_step step=315 step_seconds=0.405077
+train_step step=316 step_seconds=0.406505
+train_step step=317 step_seconds=0.409408
+train_step step=318 step_seconds=0.405221
+train_step step=319 step_seconds=0.407356
+train_step step=320 step_seconds=0.404959
+{'loss': '0.00486', 'grad_norm': '3.077', 'learning_rate': '1e-07', 'epoch': '10'}
+train_step step=321 step_seconds=0.405476
+train_step step=322 step_seconds=0.404723
+train_step step=323 step_seconds=0.404506
+train_step step=324 step_seconds=0.408672
+train_step step=325 step_seconds=0.404757
+train_step step=326 step_seconds=0.405917
+train_step step=327 step_seconds=0.405591
+train_step step=328 step_seconds=0.405189
+train_step step=329 step_seconds=0.407240
+train_step step=330 step_seconds=0.407353
+{'loss': '0.004022', 'grad_norm': '2.549', 'learning_rate': '1e-07', 'epoch': '10.31'}
+train_step step=331 step_seconds=0.407674
+train_step step=332 step_seconds=0.405225
+train_step step=333 step_seconds=0.405356
+train_step step=334 step_seconds=0.406494
+train_step step=335 step_seconds=0.405144
+train_step step=336 step_seconds=0.406655
+train_step step=337 step_seconds=0.405484
+train_step step=338 step_seconds=0.406733
+train_step step=339 step_seconds=0.405667
+train_step step=340 step_seconds=0.404990
+{'loss': '0.003459', 'grad_norm': '4.346', 'learning_rate': '1e-07', 'epoch': '10.62'}
+train_step step=341 step_seconds=0.408707
+train_step step=342 step_seconds=0.407237
+train_step step=343 step_seconds=0.408223
+train_step step=344 step_seconds=0.407950
+train_step step=345 step_seconds=0.408600
+train_step step=346 step_seconds=0.409517
+train_step step=347 step_seconds=0.414220
+train_step step=348 step_seconds=0.410520
+train_step step=349 step_seconds=0.406341
+train_step step=350 step_seconds=0.406611
+{'loss': '0.004507', 'grad_norm': '1.853', 'learning_rate': '1e-07', 'epoch': '10.94'}
+train_step step=351 step_seconds=0.406621
+train_step step=352 step_seconds=0.405965
+train_step step=353 step_seconds=0.408546
+train_step step=354 step_seconds=0.408137
+train_step step=355 step_seconds=0.405644
+train_step step=356 step_seconds=0.408489
+train_step step=357 step_seconds=0.414823
+train_step step=358 step_seconds=0.411471
+train_step step=359 step_seconds=0.407620
+train_step step=360 step_seconds=0.410485
+{'loss': '0.002693', 'grad_norm': '3.422', 'learning_rate': '1e-07', 'epoch': '11.25'}
+train_step step=361 step_seconds=0.405528
+train_step step=362 step_seconds=0.405860
+train_step step=363 step_seconds=0.407916
+train_step step=364 step_seconds=0.407204
+train_step step=365 step_seconds=0.409175
+train_step step=366 step_seconds=0.408424
+train_step step=367 step_seconds=0.405946
+train_step step=368 step_seconds=0.407952
+train_step step=369 step_seconds=0.406694
+train_step step=370 step_seconds=0.407358
+{'loss': '0.003412', 'grad_norm': '3.564', 'learning_rate': '1e-07', 'epoch': '11.56'}
+train_step step=371 step_seconds=0.407954
+train_step step=372 step_seconds=0.405508
+train_step step=373 step_seconds=0.406738
+train_step step=374 step_seconds=0.408083
+train_step step=375 step_seconds=0.408685
+train_step step=376 step_seconds=0.406808
+train_step step=377 step_seconds=0.405587
+train_step step=378 step_seconds=0.407312
+train_step step=379 step_seconds=0.407718
+train_step step=380 step_seconds=0.406704
+{'loss': '0.004515', 'grad_norm': '5.931', 'learning_rate': '1e-07', 'epoch': '11.88'}
+train_step step=381 step_seconds=0.406730
+train_step step=382 step_seconds=0.410668
+train_step step=383 step_seconds=0.415137
+train_step step=384 step_seconds=0.414518
+train_step step=385 step_seconds=0.412716
+train_step step=386 step_seconds=0.408533
+train_step step=387 step_seconds=0.409292
+train_step step=388 step_seconds=0.408719
+train_step step=389 step_seconds=0.408904
+train_step step=390 step_seconds=0.411743
+{'loss': '0.003126', 'grad_norm': '0.4813', 'learning_rate': '1e-07', 'epoch': '12.19'}
+train_step step=391 step_seconds=0.409572
+train_step step=392 step_seconds=0.408493
+train_step step=393 step_seconds=0.408655
+train_step step=394 step_seconds=0.407272
+train_step step=395 step_seconds=0.412358
+train_step step=396 step_seconds=0.408888
+train_step step=397 step_seconds=0.409731
+train_step step=398 step_seconds=0.410823
+train_step step=399 step_seconds=0.408849
+train_step step=400 step_seconds=0.423133
+{'loss': '0.002474', 'grad_norm': '2.442', 'learning_rate': '1e-07', 'epoch': '12.5'}
+train_step step=401 step_seconds=0.406533
+train_step step=402 step_seconds=0.409819
+train_step step=403 step_seconds=0.408054
+train_step step=404 step_seconds=0.407676
+train_step step=405 step_seconds=0.408215
+train_step step=406 step_seconds=0.406426
+train_step step=407 step_seconds=0.410678
+train_step step=408 step_seconds=0.409527
+train_step step=409 step_seconds=0.408054
+train_step step=410 step_seconds=0.407596
+{'loss': '0.004172', 'grad_norm': '2.09', 'learning_rate': '1e-07', 'epoch': '12.81'}
+train_step step=411 step_seconds=0.406340
+train_step step=412 step_seconds=0.408772
+train_step step=413 step_seconds=0.409626
+train_step step=414 step_seconds=0.407666
+train_step step=415 step_seconds=0.409933
+train_step step=416 step_seconds=0.406016
+train_step step=417 step_seconds=0.406509
+train_step step=418 step_seconds=0.405965
+train_step step=419 step_seconds=0.408948
+train_step step=420 step_seconds=0.408897
+{'loss': '0.00626', 'grad_norm': '20.35', 'learning_rate': '1e-07', 'epoch': '13.12'}
+train_step step=421 step_seconds=0.408420
+train_step step=422 step_seconds=0.406377
+train_step step=423 step_seconds=0.405134
+train_step step=424 step_seconds=0.406979
+train_step step=425 step_seconds=0.405703
+train_step step=426 step_seconds=0.406325
+train_step step=427 step_seconds=0.410249
+train_step step=428 step_seconds=0.406730
+train_step step=429 step_seconds=0.409346
+train_step step=430 step_seconds=0.406236
+{'loss': '0.002813', 'grad_norm': '1.167', 'learning_rate': '1e-07', 'epoch': '13.44'}
+train_step step=431 step_seconds=0.406983
+train_step step=432 step_seconds=0.407934
+train_step step=433 step_seconds=0.406039
+train_step step=434 step_seconds=0.407959
+train_step step=435 step_seconds=0.407263
+train_step step=436 step_seconds=0.407062
+train_step step=437 step_seconds=0.407001
+train_step step=438 step_seconds=0.405840
+train_step step=439 step_seconds=0.411079
+train_step step=440 step_seconds=0.406249
+{'loss': '0.003879', 'grad_norm': '7.466', 'learning_rate': '1e-07', 'epoch': '13.75'}
+train_step step=441 step_seconds=0.406559
+train_step step=442 step_seconds=0.405995
+train_step step=443 step_seconds=0.405089
+train_step step=444 step_seconds=0.406950
+train_step step=445 step_seconds=0.404790
+train_step step=446 step_seconds=0.407184
+train_step step=447 step_seconds=0.407140
+train_step step=448 step_seconds=0.405434
+train_step step=449 step_seconds=0.406128
+train_step step=450 step_seconds=0.404099
+{'loss': '0.002968', 'grad_norm': '5.105', 'learning_rate': '1e-07', 'epoch': '14.06'}
+train_step step=451 step_seconds=0.410083
+train_step step=452 step_seconds=0.407214
+train_step step=453 step_seconds=0.407349
+train_step step=454 step_seconds=0.405887
+train_step step=455 step_seconds=0.404793
+train_step step=456 step_seconds=0.407375
+train_step step=457 step_seconds=0.406249
+train_step step=458 step_seconds=0.407020
+train_step step=459 step_seconds=0.405916
+train_step step=460 step_seconds=0.405615
+{'loss': '0.002353', 'grad_norm': '0.8323', 'learning_rate': '1e-07', 'epoch': '14.38'}
+train_step step=461 step_seconds=0.407050
+train_step step=462 step_seconds=0.405802
+train_step step=463 step_seconds=0.409369
+train_step step=464 step_seconds=0.408372
+train_step step=465 step_seconds=0.407653
+train_step step=466 step_seconds=0.407331
+train_step step=467 step_seconds=0.406464
+train_step step=468 step_seconds=0.409030
+train_step step=469 step_seconds=0.406997
+train_step step=470 step_seconds=0.407899
+{'loss': '0.003238', 'grad_norm': '7.955', 'learning_rate': '1e-07', 'epoch': '14.69'}
+train_step step=471 step_seconds=0.406877
+train_step step=472 step_seconds=0.406807
+train_step step=473 step_seconds=0.407079
+train_step step=474 step_seconds=0.405365
+train_step step=475 step_seconds=0.405367
+train_step step=476 step_seconds=0.408267
+train_step step=477 step_seconds=0.406351
+train_step step=478 step_seconds=0.408938
+train_step step=479 step_seconds=0.405302
+train_step step=480 step_seconds=0.407678
+{'loss': '0.003768', 'grad_norm': '2.064', 'learning_rate': '1e-07', 'epoch': '15'}
+train_step step=481 step_seconds=0.406587
+train_step step=482 step_seconds=0.406696
+train_step step=483 step_seconds=0.408498
+train_step step=484 step_seconds=0.406788
+train_step step=485 step_seconds=0.405881
+train_step step=486 step_seconds=0.407469
+train_step step=487 step_seconds=0.405173
+train_step step=488 step_seconds=0.411051
+train_step step=489 step_seconds=0.406861
+train_step step=490 step_seconds=0.407266
+{'loss': '0.003122', 'grad_norm': '2.529', 'learning_rate': '1e-07', 'epoch': '15.31'}
+train_step step=491 step_seconds=0.405886
+train_step step=492 step_seconds=0.406088
+train_step step=493 step_seconds=0.407297
+train_step step=494 step_seconds=0.405994
+train_step step=495 step_seconds=0.408422
+train_step step=496 step_seconds=0.407386
+train_step step=497 step_seconds=0.409728
+train_step step=498 step_seconds=0.406942
+train_step step=499 step_seconds=0.404626
+train_step step=500 step_seconds=0.408211
+eval_detail step=500 split=train prompt_index=0 prompt=[1, 872, 198, 3456] overlap_pct=100.000000 kl=7.373771630228e-03 teacher_nll=4.238734245300e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=1 prompt=[1, 198, 1512, 429] overlap_pct=100.000000 kl=3.612915286794e-03 teacher_nll=1.633992552757e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=2 prompt=[1, 770, 3186, 25, 220] overlap_pct=100.000000 kl=6.371278315783e-03 teacher_nll=7.118021249771e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=3 prompt=[1, 644, 374, 279, 1887] overlap_pct=37.500000 kl=1.380627788603e-02 teacher_nll=1.742921710014e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=4 prompt=[1, 3838, 374, 264, 2077, 13] overlap_pct=31.250000 kl=1.146802864969e-02 teacher_nll=1.547420263290e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=5 prompt=[1, 785, 594, 287, 374, 1690] overlap_pct=100.000000 kl=1.349169481546e-02 teacher_nll=1.298583745956e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=6 prompt=[1, 3347, 11, 358, 1052, 429] overlap_pct=100.000000 kl=3.534395014867e-03 teacher_nll=1.216736316681e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=7 prompt=[1, 2610, 527, 1139, 304, 279, 1670] overlap_pct=100.000000 kl=4.088995978236e-03 teacher_nll=1.253582715988e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=8 prompt=[1, 888, 536, 4697, 972] overlap_pct=100.000000 kl=1.686938479543e-02 teacher_nll=2.365686595440e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=9 prompt=[1, 374, 11, 279, 1372, 315] overlap_pct=68.750000 kl=6.296545732766e-03 teacher_nll=7.625752687454e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=10 prompt=[1, 2874, 369, 279, 31559] overlap_pct=18.750000 kl=5.579372867942e-03 teacher_nll=1.014795541763e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=11 prompt=[1, 7521, 481, 362, 5714] overlap_pct=100.000000 kl=2.778010629117e-02 teacher_nll=1.119076013565e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=12 prompt=[1, 43059, 21938, 315, 7148] overlap_pct=68.750000 kl=3.101010620594e-02 teacher_nll=8.961092233658e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=13 prompt=[1, 358, 646, 944, 1490, 432] overlap_pct=100.000000 kl=1.002361439168e-02 teacher_nll=1.288064002991e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=14 prompt=[1, 477, 11, 323, 279, 62] overlap_pct=100.000000 kl=1.928949262947e-03 teacher_nll=3.178788721561e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=15 prompt=[1, 576, 1102, 315, 264, 729] overlap_pct=56.250000 kl=1.248726807535e-02 teacher_nll=1.185002326965e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=16 prompt=[1, 291, 504, 279, 1467, 11] overlap_pct=100.000000 kl=6.123822648078e-03 teacher_nll=1.080425858498e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=17 prompt=[1, 702, 1012, 1483, 311, 7512] overlap_pct=93.750000 kl=4.772735759616e-03 teacher_nll=1.747148156166e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=18 prompt=[1, 264, 11245, 2168, 429, 702] overlap_pct=100.000000 kl=6.541906390339e-03 teacher_nll=1.548810720444e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=19 prompt=[1, 3555, 374, 264, 5714, 30] overlap_pct=100.000000 kl=4.279868211597e-03 teacher_nll=1.011763215065e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=20 prompt=[1, 19257, 311, 279, 1251, 315] overlap_pct=68.750000 kl=8.651987649500e-03 teacher_nll=8.751376867294e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=21 prompt=[1, 1156, 3019, 304, 279, 1882] overlap_pct=100.000000 kl=4.961860366166e-03 teacher_nll=1.238858938217e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=22 prompt=[1, 2701, 1467, 25, 4710, 785] overlap_pct=87.500000 kl=8.910880424082e-03 teacher_nll=1.616225719452e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=23 prompt=[1, 315, 279, 3364, 13, 576] overlap_pct=100.000000 kl=6.108571775258e-03 teacher_nll=1.080281615257e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=24 prompt=[1, 279, 897, 5927, 553, 279] overlap_pct=75.000000 kl=2.457654103637e-02 teacher_nll=1.001452088356e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=25 prompt=[1, 2055, 11, 369, 279, 1140] overlap_pct=100.000000 kl=3.508536843583e-03 teacher_nll=1.352138996124e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=26 prompt=[1, 28469, 9363, 525, 279] overlap_pct=93.750000 kl=6.309054791927e-03 teacher_nll=1.664303064346e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=27 prompt=[1, 1012, 13570, 14975, 304, 279] overlap_pct=100.000000 kl=4.288874100894e-03 teacher_nll=1.778053283691e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=28 prompt=[1, 1887, 2242, 1294, 2827, 8] overlap_pct=100.000000 kl=8.818188682199e-03 teacher_nll=6.071682572365e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=29 prompt=[1, 62, 716, 477, 11, 323] overlap_pct=100.000000 kl=2.283188514411e-03 teacher_nll=5.793318748474e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=30 prompt=[1, 1512, 429, 374, 11, 279] overlap_pct=100.000000 kl=2.777066547424e-03 teacher_nll=7.016849517822e-01 top3_overlap_pct=100.000000
+eval_detail step=500 split=train prompt_index=31 prompt=[1, 74595, 11, 714, 279, 1467] overlap_pct=100.000000 kl=8.451608940959e-03 teacher_nll=1.565414667130e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=heldout prompt_index=0 prompt=[1, 4438, 374, 279, 2768] overlap_pct=100.000000 kl=1.185955759138e-02 teacher_nll=1.387058496475e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=heldout prompt_index=1 prompt=[1, 1516, 374, 264, 1296, 4339] overlap_pct=100.000000 kl=1.479708030820e-02 teacher_nll=1.694549560547e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=heldout prompt_index=2 prompt=[1, 785, 1401, 315, 279, 1967] overlap_pct=100.000000 kl=4.247877374291e-02 teacher_nll=1.135433077812e+00 top3_overlap_pct=100.000000
+eval_detail step=500 split=heldout prompt_index=3 prompt=[1, 3198, 279, 1296, 25, 220] overlap_pct=100.000000 kl=1.251973398030e-02 teacher_nll=7.968597412109e-01 top3_overlap_pct=100.000000
+eval_summary step=500 train_overlap_pct=87.500000 heldout_overlap_pct=100.000000 train_kl=8.971481183835e-03 heldout_kl=2.041378640570e-02 train_teacher_nll=1.128036933020e+00 heldout_teacher_nll=1.253475219011e+00 eval_seconds=29.971646
+{'loss': '0.00274', 'grad_norm': '1.656', 'learning_rate': '1e-07', 'epoch': '15.62'}
+{'train_runtime': '325.3', 'train_samples_per_second': '1.537', 'train_steps_per_second': '1.537', 'train_loss': '0.008281', 'epoch': '15.62'}
+training_summary steps=500 mean_step_seconds=0.408634 median_step_seconds=0.407652 sigma_pct=1.327238 peak_allocated_mib=12575.7 peak_reserved_mib=12642.0
+summary_eval_row step=0 train_overlap_pct=48.437500 heldout_overlap_pct=64.062500 train_kl=3.419336079969e-02 heldout_kl=2.159872278571e-02 train_teacher_nll=1.160719883628e+00 heldout_teacher_nll=1.285528659821e+00
+summary_eval_row step=50 train_overlap_pct=63.867188 heldout_overlap_pct=64.062500 train_kl=2.265302932210e-02 heldout_kl=2.044910402037e-02 train_teacher_nll=1.156277137809e+00 heldout_teacher_nll=1.282470434904e+00
+summary_eval_row step=100 train_overlap_pct=66.015625 heldout_overlap_pct=64.062500 train_kl=1.703158103192e-02 heldout_kl=2.109817648306e-02 train_teacher_nll=1.141177638434e+00 heldout_teacher_nll=1.272147595882e+00
+summary_eval_row step=250 train_overlap_pct=74.609375 heldout_overlap_pct=64.062500 train_kl=1.097483455669e-02 heldout_kl=2.119996142574e-02 train_teacher_nll=1.129651219584e+00 heldout_teacher_nll=1.256473481655e+00
+summary_eval_row step=500 train_overlap_pct=87.500000 heldout_overlap_pct=100.000000 train_kl=8.971481183835e-03 heldout_kl=2.041378640570e-02 train_teacher_nll=1.128036933020e+00 heldout_teacher_nll=1.253475219011e+00

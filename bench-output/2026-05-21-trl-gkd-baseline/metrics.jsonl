@@ -1,0 +1,686 @@
+{"kind": "eval_detail", "kl": 0.03109005279839039, "overlap_pct": 93.75, "prompt": [1, 872, 198, 3456], "prompt_index": 0, "split": "train", "step": 0, "student_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739], "teacher_nll": 0.46362531185150146, "teacher_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 442], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.014198388904333115, "overlap_pct": 87.5, "prompt": [1, 198, 1512, 429], "prompt_index": 1, "split": "train", "step": 0, "student_suffix": [374, 11, 279, 1372, 315, 3039, 279, 6524, 7952, 304, 279, 914, 13, 2055, 11, 369], "teacher_nll": 1.6692973375320435, "teacher_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.015113099478185177, "overlap_pct": 100.0, "prompt": [1, 770, 3186, 25, 220], "prompt_index": 2, "split": "train", "step": 0, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.631445586681366, "teacher_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.02707408368587494, "overlap_pct": 68.75, "prompt": [1, 644, 374, 279, 1887], "prompt_index": 3, "split": "train", "step": 0, "student_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 13495, 525, 279, 13495, 315], "teacher_nll": 1.766305923461914, "teacher_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 1815, 28469, 9363, 525, 279], "top3_overlap_pct": 93.75}
+{"kind": "eval_detail", "kl": 0.04643873870372772, "overlap_pct": 0.0, "prompt": [1, 3838, 374, 264, 2077, 13], "prompt_index": 4, "split": "train", "step": 0, "student_suffix": [16, 35, 1334, 304, 49347, 11974, 1, 6713, 498, 10339, 279, 6672, 1948, 264, 220, 16], "teacher_nll": 1.718343734741211, "teacher_suffix": [7521, 481, 362, 5714, 374, 264, 897, 429, 374, 5927, 553, 264, 729, 13, 1752, 3110], "top3_overlap_pct": 87.5}
+{"kind": "eval_detail", "kl": 0.024503367021679878, "overlap_pct": 0.0, "prompt": [1, 785, 594, 287, 374, 1690], "prompt_index": 5, "split": "train", "step": 0, "student_suffix": [6, 323, 279, 364, 82, 404, 6, 525, 2176, 1483, 304, 279, 1852, 1616, 438, 279], "teacher_nll": 1.3361356258392334, "teacher_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.017525941133499146, "overlap_pct": 100.0, "prompt": [1, 3347, 11, 358, 1052, 429], "prompt_index": 6, "split": "train", "step": 0, "student_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "teacher_nll": 1.2847061157226562, "teacher_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.015182512812316418, "overlap_pct": 100.0, "prompt": [1, 2610, 527, 1139, 304, 279, 1670], "prompt_index": 7, "split": "train", "step": 0, "student_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 1.2752630710601807, "teacher_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.05954534560441971, "overlap_pct": 100.0, "prompt": [1, 888, 536, 4697, 972], "prompt_index": 8, "split": "train", "step": 0, "student_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "teacher_nll": 0.3179169297218323, "teacher_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01585281640291214, "overlap_pct": 100.0, "prompt": [1, 374, 11, 279, 1372, 315], "prompt_index": 9, "split": "train", "step": 0, "student_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 356, 7, 20, 11, 17, 8], "teacher_nll": 0.7057138681411743, "teacher_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 356, 7, 20, 11, 17, 8], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.03778381645679474, "overlap_pct": 12.5, "prompt": [1, 2874, 369, 279, 31559], "prompt_index": 10, "split": "train", "step": 0, "student_suffix": [315, 279, 3491, 315, 279, 31559, 315, 279, 3491, 315, 279, 31559, 315, 279, 3491, 315], "teacher_nll": 1.0713324546813965, "teacher_suffix": [315, 279, 8457, 1, 374, 279, 1852, 438, 279, 2874, 369, 279, 31559, 315, 279, 8457], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.07616762071847916, "overlap_pct": 12.5, "prompt": [1, 7521, 481, 362, 5714], "prompt_index": 11, "split": "train", "step": 0, "student_suffix": [315, 279, 11361, 198, 12, 330, 3838, 374, 279, 1102, 315, 279, 3239, 7521, 481, 362], "teacher_nll": 1.2399879693984985, "teacher_suffix": [315, 279, 15846, 271, 785, 3405, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 374], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.09588328748941422, "overlap_pct": 87.5, "prompt": [1, 43059, 21938, 315, 7148], "prompt_index": 12, "split": "train", "step": 0, "student_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 5944, 304, 279, 4311, 315, 7148, 11, 304], "teacher_nll": 0.9841155409812927, "teacher_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 2747, 304, 279, 4311, 315, 7148, 11, 9448], "top3_overlap_pct": 93.75}
+{"kind": "eval_detail", "kl": 0.0802752748131752, "overlap_pct": 50.0, "prompt": [1, 358, 646, 944, 1490, 432], "prompt_index": 13, "split": "train", "step": 0, "student_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 429, 3880, 311, 387, 27956, 13, 6771, 752], "teacher_nll": 1.40996515750885, "teacher_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 13, 1084, 594, 264, 3491, 429, 358, 646], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006788868457078934, "overlap_pct": 100.0, "prompt": [1, 477, 11, 323, 279, 62], "prompt_index": 14, "split": "train", "step": 0, "student_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.2654249966144562, "teacher_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.034010108560323715, "overlap_pct": 62.5, "prompt": [1, 576, 1102, 315, 264, 729], "prompt_index": 15, "split": "train", "step": 0, "student_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 2661, 2309, 304, 279, 1140, 11, 323], "teacher_nll": 1.146435260772705, "teacher_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 2661, 5693, 13, 2055, 11, 421, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.056984446942806244, "overlap_pct": 37.5, "prompt": [1, 291, 504, 279, 1467, 11], "prompt_index": 16, "split": "train", "step": 0, "student_suffix": [1128, 374, 279, 1887, 4522, 315, 419, 4549, 30, 362, 13, 576, 1887, 4522, 374, 311], "teacher_nll": 1.053581953048706, "teacher_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.020283851772546768, "overlap_pct": 12.5, "prompt": [1, 702, 1012, 1483, 311, 7512], "prompt_index": 17, "split": "train", "step": 0, "student_suffix": [279, 1882, 315, 279, 4401, 315, 279, 1849, 13, 576, 4647, 330, 29571, 1, 374, 1483], "teacher_nll": 1.7710235118865967, "teacher_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 2971, 1189, 758], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.031344879418611526, "overlap_pct": 62.5, "prompt": [1, 264, 11245, 2168, 429, 702], "prompt_index": 18, "split": "train", "step": 0, "student_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 476, 22136, 264, 1985, 476, 2473], "teacher_nll": 1.5293781757354736, "teacher_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.05071166902780533, "overlap_pct": 18.75, "prompt": [1, 3555, 374, 264, 5714, 30], "prompt_index": 19, "split": "train", "step": 0, "student_suffix": [330, 4710, 1, 3555, 374, 264, 5714, 30, 330, 4710, 1, 3555, 374, 264, 5714, 30], "teacher_nll": 1.0779130458831787, "teacher_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.016953350976109505, "overlap_pct": 100.0, "prompt": [1, 19257, 311, 279, 1251, 315], "prompt_index": 20, "split": "train", "step": 0, "student_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 323, 525, 17013, 369, 279], "teacher_nll": 0.8622968196868896, "teacher_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 323, 525, 17013, 369, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.047401927411556244, "overlap_pct": 18.75, "prompt": [1, 1156, 3019, 304, 279, 1882], "prompt_index": 21, "split": "train", "step": 0, "student_suffix": [315, 6832, 311, 990, 279, 6366, 1849, 13, 576, 1156, 3019, 374, 311, 3535, 279, 1849], "teacher_nll": 1.2673921585083008, "teacher_suffix": [315, 279, 4401, 315, 279, 1849, 11, 323, 279, 2086, 3019, 304, 279, 1882, 315, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.05151420459151268, "overlap_pct": 0.0, "prompt": [1, 2701, 1467, 25, 4710, 785], "prompt_index": 22, "split": "train", "step": 0, "student_suffix": [2701, 374, 264, 1140, 315, 279, 1429, 3213, 323, 9760, 1995, 389, 279, 8544, 315, 279], "teacher_nll": 1.6887590885162354, "teacher_suffix": [1156, 3019, 304, 279, 1882, 315, 11220, 264, 501, 1985, 374, 311, 8253, 279, 2169, 3081], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.017324868589639664, "overlap_pct": 93.75, "prompt": [1, 315, 279, 3364, 13, 576], "prompt_index": 23, "split": "train", "step": 0, "student_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 10838, 311, 1477, 1059, 5558], "teacher_nll": 1.0464062690734863, "teacher_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.025036543607711792, "overlap_pct": 43.75, "prompt": [1, 279, 897, 5927, 553, 279], "prompt_index": 24, "split": "train", "step": 0, "student_suffix": [729, 374, 279, 1852, 438, 279, 897, 5927, 553, 279, 729, 304, 279, 3681, 1618, 13], "teacher_nll": 1.0669934749603271, "teacher_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1156, 5693, 11, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.03174077346920967, "overlap_pct": 18.75, "prompt": [1, 2055, 11, 369, 279, 1140], "prompt_index": 25, "split": "train", "step": 0, "student_suffix": [315, 5109, 11, 1077, 594, 1977, 11, 220, 16, 11, 220, 17, 11, 220, 18, 11], "teacher_nll": 1.4471967220306396, "teacher_suffix": [315, 5109, 11, 582, 646, 990, 279, 2701, 5486, 25, 1156, 11, 582, 646, 1855, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01984749361872673, "overlap_pct": 0.0, "prompt": [1, 28469, 9363, 525, 279], "prompt_index": 26, "split": "train", "step": 0, "student_suffix": [6174, 429, 5240, 279, 8457, 13, 576, 1156, 3019, 304, 279, 1882, 374, 311, 10542, 279], "teacher_nll": 1.6805833578109741, "teacher_suffix": [1887, 9363, 429, 5240, 279, 4401, 315, 279, 8457, 13, 576, 1887, 9363, 525, 279, 11137], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0339137502014637, "overlap_pct": 12.5, "prompt": [1, 1012, 13570, 14975, 304, 279], "prompt_index": 27, "split": "train", "step": 0, "student_suffix": [2070, 315, 6731, 323, 29918, 13, 1084, 702, 1012, 13570, 14975, 304, 279, 2070, 315, 6731], "teacher_nll": 1.8237049579620361, "teacher_suffix": [2070, 315, 37596, 11, 323, 279, 3920, 315, 279, 5888, 315, 279, 1372, 1849, 374, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.054884012788534164, "overlap_pct": 12.5, "prompt": [1, 1887, 2242, 1294, 2827, 8], "prompt_index": 28, "split": "train", "step": 0, "student_suffix": [341, 262, 442, 4230, 264, 501, 2867, 315, 279, 1809, 198, 262, 4050, 1809, 284, 501], "teacher_nll": 0.7090343236923218, "teacher_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0077911969274282455, "overlap_pct": 37.5, "prompt": [1, 62, 716, 477, 11, 323], "prompt_index": 29, "split": "train", "step": 0, "student_suffix": [716, 716, 477, 11, 323, 716, 716, 477, 11, 323, 716, 716, 477, 11, 323, 716], "teacher_nll": 0.5728622674942017, "teacher_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.011989460326731205, "overlap_pct": 0.0, "prompt": [1, 1512, 429, 374, 11, 279], "prompt_index": 30, "split": "train", "step": 0, "student_suffix": [825, 429, 374, 11, 279, 825, 429, 374, 11, 279, 825, 429, 374, 11, 279, 825], "teacher_nll": 0.6772183775901794, "teacher_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.019031792879104614, "overlap_pct": 6.25, "prompt": [1, 74595, 11, 714, 279, 1467], "prompt_index": 31, "split": "train", "step": 0, "student_suffix": [374, 304, 279, 1352, 315, 264, 32794, 13, 2055, 11, 279, 32794, 374, 911, 279, 31743], "teacher_nll": 1.582676887512207, "teacher_suffix": [374, 537, 304, 279, 1852, 4128, 438, 279, 4024, 13, 2055, 11, 279, 1196, 374, 10161], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013354290276765823, "overlap_pct": 100.0, "prompt": [1, 4438, 374, 279, 2768], "prompt_index": 0, "split": "heldout", "step": 0, "student_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "teacher_nll": 1.3717496395111084, "teacher_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.025866597890853882, "overlap_pct": 18.75, "prompt": [1, 1516, 374, 264, 1296, 4339], "prompt_index": 1, "split": "heldout", "step": 0, "student_suffix": [291, 504, 279, 2701, 1467, 25, 4710, 1, 16, 13, 576, 1156, 3019, 304, 279, 1882], "teacher_nll": 1.7640515565872192, "teacher_suffix": [291, 504, 279, 1467, 11, 714, 279, 1467, 374, 537, 304, 6364, 13, 5209, 14683, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.04078944772481918, "overlap_pct": 100.0, "prompt": [1, 785, 1401, 315, 279, 1967], "prompt_index": 2, "split": "heldout", "step": 0, "student_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "teacher_nll": 1.1803522109985352, "teacher_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006384555250406265, "overlap_pct": 37.5, "prompt": [1, 3198, 279, 1296, 25, 220], "prompt_index": 3, "split": "heldout", "step": 0, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.8259612321853638, "teacher_suffix": [16, 24, 24, 15, 82, 11, 220, 17, 15, 15, 15, 82, 11, 220, 17, 15], "top3_overlap_pct": 100.0}
+{"eval_seconds": 30.17380491498625, "heldout_kl": 0.02159872278571129, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2855286598205566, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 0, "train_kl": 0.03419336079969071, "train_overlap_pct": 48.4375, "train_teacher_nll": 1.1607198836281896, "train_top3_overlap_pct": 99.21875}
+{"kind": "train_step", "step": 1, "step_seconds": 0.4792290430050343}
+{"kind": "train_step", "step": 2, "step_seconds": 0.4684114530100487}
+{"kind": "train_step", "step": 3, "step_seconds": 0.40959445299813524}
+{"kind": "train_step", "step": 4, "step_seconds": 0.4108379419776611}
+{"kind": "train_step", "step": 5, "step_seconds": 0.4133929619565606}
+{"kind": "train_step", "step": 6, "step_seconds": 0.4091701140278019}
+{"kind": "train_step", "step": 7, "step_seconds": 0.4084263929980807}
+{"kind": "train_step", "step": 8, "step_seconds": 0.40972862305352464}
+{"kind": "train_step", "step": 9, "step_seconds": 0.4096693319734186}
+{"kind": "train_step", "step": 10, "step_seconds": 0.4092820059740916}
+{"kind": "train_step", "step": 11, "step_seconds": 0.40865069499704987}
+{"kind": "train_step", "step": 12, "step_seconds": 0.4072331730276346}
+{"kind": "train_step", "step": 13, "step_seconds": 0.4152674399665557}
+{"kind": "train_step", "step": 14, "step_seconds": 0.41203661798499525}
+{"kind": "train_step", "step": 15, "step_seconds": 0.4155683239805512}
+{"kind": "train_step", "step": 16, "step_seconds": 0.4131096449564211}
+{"kind": "train_step", "step": 17, "step_seconds": 0.41286558099091053}
+{"kind": "train_step", "step": 18, "step_seconds": 0.4170563060324639}
+{"kind": "train_step", "step": 19, "step_seconds": 0.4146691699861549}
+{"kind": "train_step", "step": 20, "step_seconds": 0.4134425789816305}
+{"kind": "train_step", "step": 21, "step_seconds": 0.41259077499853447}
+{"kind": "train_step", "step": 22, "step_seconds": 0.4136530720279552}
+{"kind": "train_step", "step": 23, "step_seconds": 0.41184177302056924}
+{"kind": "train_step", "step": 24, "step_seconds": 0.41057498299051076}
+{"kind": "train_step", "step": 25, "step_seconds": 0.4131055229809135}
+{"kind": "train_step", "step": 26, "step_seconds": 0.41289363999385387}
+{"kind": "train_step", "step": 27, "step_seconds": 0.41134709399193525}
+{"kind": "train_step", "step": 28, "step_seconds": 0.41978469799505547}
+{"kind": "train_step", "step": 29, "step_seconds": 0.41161943902261555}
+{"kind": "train_step", "step": 30, "step_seconds": 0.41388667398132384}
+{"kind": "train_step", "step": 31, "step_seconds": 0.4120101439766586}
+{"kind": "train_step", "step": 32, "step_seconds": 0.41163235798012465}
+{"kind": "train_step", "step": 33, "step_seconds": 0.41018407500814646}
+{"kind": "train_step", "step": 34, "step_seconds": 0.4150834520114586}
+{"kind": "train_step", "step": 35, "step_seconds": 0.41136104305041954}
+{"kind": "train_step", "step": 36, "step_seconds": 0.4103814479894936}
+{"kind": "train_step", "step": 37, "step_seconds": 0.4128809670219198}
+{"kind": "train_step", "step": 38, "step_seconds": 0.4122764570056461}
+{"kind": "train_step", "step": 39, "step_seconds": 0.4133386730100028}
+{"kind": "train_step", "step": 40, "step_seconds": 0.41450527199776843}
+{"kind": "train_step", "step": 41, "step_seconds": 0.41452210198622197}
+{"kind": "train_step", "step": 42, "step_seconds": 0.4127911840332672}
+{"kind": "train_step", "step": 43, "step_seconds": 0.4100294510135427}
+{"kind": "train_step", "step": 44, "step_seconds": 0.4140050130081363}
+{"kind": "train_step", "step": 45, "step_seconds": 0.41120111901545897}
+{"kind": "train_step", "step": 46, "step_seconds": 0.4102332529728301}
+{"kind": "train_step", "step": 47, "step_seconds": 0.4117375059868209}
+{"kind": "train_step", "step": 48, "step_seconds": 0.40966093400493264}
+{"kind": "train_step", "step": 49, "step_seconds": 0.4113927509752102}
+{"kind": "train_step", "step": 50, "step_seconds": 0.4128346130019054}
+{"kind": "eval_detail", "kl": 0.02285771630704403, "overlap_pct": 0.0, "prompt": [1, 872, 198, 3456], "prompt_index": 0, "split": "train", "step": 50, "student_suffix": [1688, 633, 20616, 1130, 3153, 8, 972, 262, 1077, 897, 284, 2197, 39827, 463, 262, 1077], "teacher_nll": 0.48924899101257324, "teacher_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 442], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.007038788869976997, "overlap_pct": 87.5, "prompt": [1, 198, 1512, 429], "prompt_index": 1, "split": "train", "step": 50, "student_suffix": [374, 11, 279, 1372, 315, 3039, 279, 6524, 7952, 304, 279, 914, 13, 2055, 11, 369], "teacher_nll": 1.643854022026062, "teacher_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.011631157249212265, "overlap_pct": 100.0, "prompt": [1, 770, 3186, 25, 220], "prompt_index": 2, "split": "train", "step": 50, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.6603958606719971, "teacher_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.015766894444823265, "overlap_pct": 68.75, "prompt": [1, 644, 374, 279, 1887], "prompt_index": 3, "split": "train", "step": 50, "student_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 48548, 374, 279, 31559, 315], "teacher_nll": 1.7732834815979004, "teacher_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 1815, 28469, 9363, 525, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.028851153329014778, "overlap_pct": 0.0, "prompt": [1, 3838, 374, 264, 2077, 13], "prompt_index": 4, "split": "train", "step": 50, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 1.6456539630889893, "teacher_suffix": [7521, 481, 362, 5714, 374, 264, 897, 429, 374, 5927, 553, 264, 729, 13, 1752, 3110], "top3_overlap_pct": 93.75}
+{"kind": "eval_detail", "kl": 0.01604166254401207, "overlap_pct": 87.5, "prompt": [1, 785, 594, 287, 374, 1690], "prompt_index": 5, "split": "train", "step": 50, "student_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 12922, 315], "teacher_nll": 1.380517840385437, "teacher_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.009465867653489113, "overlap_pct": 100.0, "prompt": [1, 3347, 11, 358, 1052, 429], "prompt_index": 6, "split": "train", "step": 50, "student_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "teacher_nll": 1.2628095149993896, "teacher_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.010028110817074776, "overlap_pct": 100.0, "prompt": [1, 2610, 527, 1139, 304, 279, 1670], "prompt_index": 7, "split": "train", "step": 50, "student_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 1.2628408670425415, "teacher_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.045737020671367645, "overlap_pct": 100.0, "prompt": [1, 888, 536, 4697, 972], "prompt_index": 8, "split": "train", "step": 50, "student_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "teacher_nll": 0.2948180139064789, "teacher_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013738550245761871, "overlap_pct": 68.75, "prompt": [1, 374, 11, 279, 1372, 315], "prompt_index": 9, "split": "train", "step": 50, "student_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 220, 20, 5157, 220, 17, 11], "teacher_nll": 0.720599889755249, "teacher_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 356, 7, 20, 11, 17, 8], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.021337106823921204, "overlap_pct": 37.5, "prompt": [1, 2874, 369, 279, 31559], "prompt_index": 10, "split": "train", "step": 50, "student_suffix": [315, 279, 8457, 1, 323, 330, 19895, 369, 279, 31559, 315, 279, 8457, 1, 323, 330], "teacher_nll": 1.074782133102417, "teacher_suffix": [315, 279, 8457, 1, 374, 279, 1852, 438, 279, 2874, 369, 279, 31559, 315, 279, 8457], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.042492303997278214, "overlap_pct": 18.75, "prompt": [1, 7521, 481, 362, 5714], "prompt_index": 11, "split": "train", "step": 50, "student_suffix": [315, 279, 15846, 198, 12, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 481, 362], "teacher_nll": 1.1913883686065674, "teacher_suffix": [315, 279, 15846, 271, 785, 3405, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 374], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0926503986120224, "overlap_pct": 87.5, "prompt": [1, 43059, 21938, 315, 7148], "prompt_index": 12, "split": "train", "step": 50, "student_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 5944, 304, 279, 4311, 315, 7148, 11, 304], "teacher_nll": 0.9837339520454407, "teacher_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 2747, 304, 279, 4311, 315, 7148, 11, 9448], "top3_overlap_pct": 93.75}
+{"kind": "eval_detail", "kl": 0.05148973688483238, "overlap_pct": 50.0, "prompt": [1, 358, 646, 944, 1490, 432], "prompt_index": 13, "split": "train", "step": 50, "student_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 429, 3880, 311, 387, 27956, 13, 6771, 752], "teacher_nll": 1.3691648244857788, "teacher_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 13, 1084, 594, 264, 3491, 429, 358, 646], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.003890326013788581, "overlap_pct": 100.0, "prompt": [1, 477, 11, 323, 279, 62], "prompt_index": 14, "split": "train", "step": 50, "student_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.30398619174957275, "teacher_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.020618986338377, "overlap_pct": 56.25, "prompt": [1, 576, 1102, 315, 264, 729], "prompt_index": 15, "split": "train", "step": 50, "student_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 1459, 1380, 279, 729, 374, 2598, 13], "teacher_nll": 1.136579990386963, "teacher_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 2661, 5693, 13, 2055, 11, 421, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.030460644513368607, "overlap_pct": 100.0, "prompt": [1, 291, 504, 279, 1467, 11], "prompt_index": 16, "split": "train", "step": 50, "student_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "teacher_nll": 1.0692522525787354, "teacher_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01165863312780857, "overlap_pct": 93.75, "prompt": [1, 702, 1012, 1483, 311, 7512], "prompt_index": 17, "split": "train", "step": 50, "student_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 6534, 1189, 758], "teacher_nll": 1.7628273963928223, "teacher_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 2971, 1189, 758], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.019006863236427307, "overlap_pct": 100.0, "prompt": [1, 264, 11245, 2168, 429, 702], "prompt_index": 18, "split": "train", "step": 50, "student_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "teacher_nll": 1.5479896068572998, "teacher_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.022911831736564636, "overlap_pct": 100.0, "prompt": [1, 3555, 374, 264, 5714, 30], "prompt_index": 19, "split": "train", "step": 50, "student_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "teacher_nll": 1.0333287715911865, "teacher_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.014537005685269833, "overlap_pct": 68.75, "prompt": [1, 19257, 311, 279, 1251, 315], "prompt_index": 20, "split": "train", "step": 50, "student_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 11, 323, 614, 264, 3654], "teacher_nll": 0.8915858268737793, "teacher_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 323, 525, 17013, 369, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.02887697145342827, "overlap_pct": 37.5, "prompt": [1, 1156, 3019, 304, 279, 1882], "prompt_index": 21, "split": "train", "step": 50, "student_suffix": [315, 279, 4401, 315, 279, 1849, 13, 576, 1156, 3019, 374, 311, 8253, 279, 1849, 594], "teacher_nll": 1.2714965343475342, "teacher_suffix": [315, 279, 4401, 315, 279, 1849, 11, 323, 279, 2086, 3019, 304, 279, 1882, 315, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.03718041628599167, "overlap_pct": 6.25, "prompt": [1, 2701, 1467, 25, 4710, 785], "prompt_index": 22, "split": "train", "step": 50, "student_suffix": [1156, 882, 358, 5485, 279, 5700, 330, 785, 7996, 315, 3985, 1, 358, 572, 304, 279], "teacher_nll": 1.6786288022994995, "teacher_suffix": [1156, 3019, 304, 279, 1882, 315, 11220, 264, 501, 1985, 374, 311, 8253, 279, 2169, 3081], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.010985912755131721, "overlap_pct": 100.0, "prompt": [1, 315, 279, 3364, 13, 576], "prompt_index": 23, "split": "train", "step": 50, "student_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "teacher_nll": 1.0801653861999512, "teacher_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.020985141396522522, "overlap_pct": 100.0, "prompt": [1, 279, 897, 5927, 553, 279], "prompt_index": 24, "split": "train", "step": 50, "student_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1156, 5693, 11, 323], "teacher_nll": 1.0356295108795166, "teacher_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1156, 5693, 11, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.018986746668815613, "overlap_pct": 18.75, "prompt": [1, 2055, 11, 369, 279, 1140], "prompt_index": 25, "split": "train", "step": 50, "student_suffix": [315, 5109, 11, 1077, 594, 1977, 11, 220, 16, 11, 220, 17, 11, 220, 18, 11], "teacher_nll": 1.421349287033081, "teacher_suffix": [315, 5109, 11, 582, 646, 990, 279, 2701, 5486, 25, 1156, 11, 582, 646, 1855, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01192396879196167, "overlap_pct": 0.0, "prompt": [1, 28469, 9363, 525, 279], "prompt_index": 26, "split": "train", "step": 50, "student_suffix": [6174, 429, 5240, 279, 8457, 13, 576, 1156, 3019, 304, 279, 1882, 374, 311, 10542, 279], "teacher_nll": 1.6868244409561157, "teacher_suffix": [1887, 9363, 429, 5240, 279, 4401, 315, 279, 8457, 13, 576, 1887, 9363, 525, 279, 11137], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.018779005855321884, "overlap_pct": 12.5, "prompt": [1, 1012, 13570, 14975, 304, 279], "prompt_index": 27, "split": "train", "step": 50, "student_suffix": [2070, 315, 6731, 323, 29918, 11, 323, 702, 1012, 13570, 1483, 304, 279, 2070, 315, 6731], "teacher_nll": 1.8073736429214478, "teacher_suffix": [2070, 315, 37596, 11, 323, 279, 3920, 315, 279, 5888, 315, 279, 1372, 1849, 374, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.03547724336385727, "overlap_pct": 37.5, "prompt": [1, 1887, 2242, 1294, 2827, 8], "prompt_index": 28, "split": "train", "step": 50, "student_suffix": [341, 262, 739, 2532, 2913, 445, 13936, 311, 279, 1809, 11142, 262, 17170, 20775, 284, 501], "teacher_nll": 0.6928331851959229, "teacher_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.005720646120607853, "overlap_pct": 100.0, "prompt": [1, 62, 716, 477, 11, 323], "prompt_index": 29, "split": "train", "step": 50, "student_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.5621516108512878, "teacher_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01108985859900713, "overlap_pct": 100.0, "prompt": [1, 1512, 429, 374, 11, 279], "prompt_index": 30, "split": "train", "step": 50, "student_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "teacher_nll": 0.6870214939117432, "teacher_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.012680267915129662, "overlap_pct": 6.25, "prompt": [1, 74595, 11, 714, 279, 1467], "prompt_index": 31, "split": "train", "step": 50, "student_suffix": [374, 304, 279, 1352, 315, 264, 32794, 13, 2055, 11, 279, 32794, 374, 911, 279, 31743], "teacher_nll": 1.5787527561187744, "teacher_suffix": [374, 537, 304, 279, 1852, 4128, 438, 279, 4024, 13, 2055, 11, 279, 1196, 374, 10161], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.010489372536540031, "overlap_pct": 100.0, "prompt": [1, 4438, 374, 279, 2768], "prompt_index": 0, "split": "heldout", "step": 50, "student_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "teacher_nll": 1.399145245552063, "teacher_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.018966220319271088, "overlap_pct": 18.75, "prompt": [1, 1516, 374, 264, 1296, 4339], "prompt_index": 1, "split": "heldout", "step": 50, "student_suffix": [291, 504, 279, 2701, 1467, 25, 4710, 1, 16, 13, 576, 1156, 3019, 304, 279, 1882], "teacher_nll": 1.7427010536193848, "teacher_suffix": [291, 504, 279, 1467, 11, 714, 279, 1467, 374, 537, 304, 6364, 13, 5209, 14683, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.04312686622142792, "overlap_pct": 100.0, "prompt": [1, 785, 1401, 315, 279, 1967], "prompt_index": 2, "split": "heldout", "step": 50, "student_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "teacher_nll": 1.1716969013214111, "teacher_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.009213957004249096, "overlap_pct": 37.5, "prompt": [1, 3198, 279, 1296, 25, 220], "prompt_index": 3, "split": "heldout", "step": 50, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.8163385391235352, "teacher_suffix": [16, 24, 24, 15, 82, 11, 220, 17, 15, 15, 15, 82, 11, 220, 17, 15], "top3_overlap_pct": 100.0}
+{"eval_seconds": 30.525471827946603, "heldout_kl": 0.020449104020372033, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2824704349040985, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 50, "train_kl": 0.022653029322100338, "train_overlap_pct": 63.8671875, "train_teacher_nll": 1.1562771378085017, "train_top3_overlap_pct": 99.609375}
+{"kind": "train_step", "step": 51, "step_seconds": 0.4407996869995259}
+{"kind": "train_step", "step": 52, "step_seconds": 0.4103103880188428}
+{"kind": "train_step", "step": 53, "step_seconds": 0.4109365569893271}
+{"kind": "train_step", "step": 54, "step_seconds": 0.4097997189965099}
+{"kind": "train_step", "step": 55, "step_seconds": 0.41106648900313303}
+{"kind": "train_step", "step": 56, "step_seconds": 0.4097731880028732}
+{"kind": "train_step", "step": 57, "step_seconds": 0.4114080629660748}
+{"kind": "train_step", "step": 58, "step_seconds": 0.410978706961032}
+{"kind": "train_step", "step": 59, "step_seconds": 0.41002931096591055}
+{"kind": "train_step", "step": 60, "step_seconds": 0.41182307904819027}
+{"kind": "train_step", "step": 61, "step_seconds": 0.41324455197900534}
+{"kind": "train_step", "step": 62, "step_seconds": 0.41159291501389816}
+{"kind": "train_step", "step": 63, "step_seconds": 0.4110703569604084}
+{"kind": "train_step", "step": 64, "step_seconds": 0.40982677799183875}
+{"kind": "train_step", "step": 65, "step_seconds": 0.411413062014617}
+{"kind": "train_step", "step": 66, "step_seconds": 0.4096172630088404}
+{"kind": "train_step", "step": 67, "step_seconds": 0.4118182480451651}
+{"kind": "train_step", "step": 68, "step_seconds": 0.4098974679945968}
+{"kind": "train_step", "step": 69, "step_seconds": 0.40800987801048905}
+{"kind": "train_step", "step": 70, "step_seconds": 0.4072152350563556}
+{"kind": "train_step", "step": 71, "step_seconds": 0.4076761820469983}
+{"kind": "train_step", "step": 72, "step_seconds": 0.4095329709816724}
+{"kind": "train_step", "step": 73, "step_seconds": 0.4096549630048685}
+{"kind": "train_step", "step": 74, "step_seconds": 0.4075059889582917}
+{"kind": "train_step", "step": 75, "step_seconds": 0.40772794297663495}
+{"kind": "train_step", "step": 76, "step_seconds": 0.408812528999988}
+{"kind": "train_step", "step": 77, "step_seconds": 0.4099306560237892}
+{"kind": "train_step", "step": 78, "step_seconds": 0.4086940769921057}
+{"kind": "train_step", "step": 79, "step_seconds": 0.4083246410009451}
+{"kind": "train_step", "step": 80, "step_seconds": 0.4073916460038163}
+{"kind": "train_step", "step": 81, "step_seconds": 0.40792288398370147}
+{"kind": "train_step", "step": 82, "step_seconds": 0.41104020294733346}
+{"kind": "train_step", "step": 83, "step_seconds": 0.40831467002863064}
+{"kind": "train_step", "step": 84, "step_seconds": 0.4100771170342341}
+{"kind": "train_step", "step": 85, "step_seconds": 0.41128678602399305}
+{"kind": "train_step", "step": 86, "step_seconds": 0.4105718649807386}
+{"kind": "train_step", "step": 87, "step_seconds": 0.4199826830299571}
+{"kind": "train_step", "step": 88, "step_seconds": 0.4075467470102012}
+{"kind": "train_step", "step": 89, "step_seconds": 0.40866686502704397}
+{"kind": "train_step", "step": 90, "step_seconds": 0.40907333098584786}
+{"kind": "train_step", "step": 91, "step_seconds": 0.41014628700213507}
+{"kind": "train_step", "step": 92, "step_seconds": 0.41175125300651416}
+{"kind": "train_step", "step": 93, "step_seconds": 0.40965454903198406}
+{"kind": "train_step", "step": 94, "step_seconds": 0.41468140797223896}
+{"kind": "train_step", "step": 95, "step_seconds": 0.4085662110010162}
+{"kind": "train_step", "step": 96, "step_seconds": 0.40750106499763206}
+{"kind": "train_step", "step": 97, "step_seconds": 0.4077751889708452}
+{"kind": "train_step", "step": 98, "step_seconds": 0.4063625460257754}
+{"kind": "train_step", "step": 99, "step_seconds": 0.4081067929510027}
+{"kind": "train_step", "step": 100, "step_seconds": 0.4065863200230524}
+{"kind": "eval_detail", "kl": 0.01966092176735401, "overlap_pct": 0.0, "prompt": [1, 872, 198, 3456], "prompt_index": 0, "split": "train", "step": 100, "student_suffix": [1688, 633, 20616, 3153, 8, 972, 262, 1077, 897, 284, 2197, 39827, 463, 262, 1077, 1102], "teacher_nll": 0.4812306761741638, "teacher_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 442], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.005272214766591787, "overlap_pct": 100.0, "prompt": [1, 198, 1512, 429], "prompt_index": 1, "split": "train", "step": 100, "student_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "teacher_nll": 1.64313805103302, "teacher_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.009562003426253796, "overlap_pct": 100.0, "prompt": [1, 770, 3186, 25, 220], "prompt_index": 2, "split": "train", "step": 100, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.6961249709129333, "teacher_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.012050297111272812, "overlap_pct": 68.75, "prompt": [1, 644, 374, 279, 1887], "prompt_index": 3, "split": "train", "step": 100, "student_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 48548, 374, 279, 31559, 315], "teacher_nll": 1.7605869770050049, "teacher_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 1815, 28469, 9363, 525, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.02117161825299263, "overlap_pct": 0.0, "prompt": [1, 3838, 374, 264, 2077, 13], "prompt_index": 4, "split": "train", "step": 100, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 1.5954740047454834, "teacher_suffix": [7521, 481, 362, 5714, 374, 264, 897, 429, 374, 5927, 553, 264, 729, 13, 1752, 3110], "top3_overlap_pct": 93.75}
+{"kind": "eval_detail", "kl": 0.016614221036434174, "overlap_pct": 100.0, "prompt": [1, 785, 594, 287, 374, 1690], "prompt_index": 5, "split": "train", "step": 100, "student_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "teacher_nll": 1.307068109512329, "teacher_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.005889055784791708, "overlap_pct": 100.0, "prompt": [1, 3347, 11, 358, 1052, 429], "prompt_index": 6, "split": "train", "step": 100, "student_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "teacher_nll": 1.232964038848877, "teacher_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.009269077330827713, "overlap_pct": 100.0, "prompt": [1, 2610, 527, 1139, 304, 279, 1670], "prompt_index": 7, "split": "train", "step": 100, "student_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 1.2281277179718018, "teacher_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.03247189521789551, "overlap_pct": 100.0, "prompt": [1, 888, 536, 4697, 972], "prompt_index": 8, "split": "train", "step": 100, "student_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "teacher_nll": 0.26315605640411377, "teacher_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01140749640762806, "overlap_pct": 31.25, "prompt": [1, 374, 11, 279, 1372, 315], "prompt_index": 9, "split": "train", "step": 100, "student_suffix": [5510, 311, 5157, 220, 17, 1251, 700, 315, 220, 18, 374, 220, 18, 5157, 220, 17], "teacher_nll": 0.7444295287132263, "teacher_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 356, 7, 20, 11, 17, 8], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013102233409881592, "overlap_pct": 37.5, "prompt": [1, 2874, 369, 279, 31559], "prompt_index": 10, "split": "train", "step": 100, "student_suffix": [315, 279, 8457, 1, 323, 330, 19895, 369, 279, 31559, 315, 279, 8457, 1, 374, 279], "teacher_nll": 1.0533214807510376, "teacher_suffix": [315, 279, 8457, 1, 374, 279, 1852, 438, 279, 2874, 369, 279, 31559, 315, 279, 8457], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.03540743514895439, "overlap_pct": 18.75, "prompt": [1, 7521, 481, 362, 5714], "prompt_index": 11, "split": "train", "step": 100, "student_suffix": [315, 279, 15846, 198, 12, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 481, 362], "teacher_nll": 1.1313304901123047, "teacher_suffix": [315, 279, 15846, 271, 785, 3405, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 374], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.07901148498058319, "overlap_pct": 62.5, "prompt": [1, 43059, 21938, 315, 7148], "prompt_index": 12, "split": "train", "step": 100, "student_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 5944, 304, 279, 6424, 11, 7407, 304, 279], "teacher_nll": 0.9572423696517944, "teacher_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 2747, 304, 279, 4311, 315, 7148, 11, 9448], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.030741970986127853, "overlap_pct": 100.0, "prompt": [1, 358, 646, 944, 1490, 432], "prompt_index": 13, "split": "train", "step": 100, "student_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 13, 1084, 594, 264, 3491, 429, 358, 646], "teacher_nll": 1.324915885925293, "teacher_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 13, 1084, 594, 264, 3491, 429, 358, 646], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.003181854961439967, "overlap_pct": 100.0, "prompt": [1, 477, 11, 323, 279, 62], "prompt_index": 14, "split": "train", "step": 100, "student_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.29583534598350525, "teacher_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01556373480707407, "overlap_pct": 56.25, "prompt": [1, 576, 1102, 315, 264, 729], "prompt_index": 15, "split": "train", "step": 100, "student_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 1459, 1380, 279, 729, 374, 2598, 13], "teacher_nll": 1.1626167297363281, "teacher_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 2661, 5693, 13, 2055, 11, 421, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.020366676151752472, "overlap_pct": 100.0, "prompt": [1, 291, 504, 279, 1467, 11], "prompt_index": 16, "split": "train", "step": 100, "student_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "teacher_nll": 1.0691721439361572, "teacher_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.007710291538387537, "overlap_pct": 93.75, "prompt": [1, 702, 1012, 1483, 311, 7512], "prompt_index": 17, "split": "train", "step": 100, "student_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 6534, 1189, 758], "teacher_nll": 1.7544050216674805, "teacher_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 2971, 1189, 758], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013929902575910091, "overlap_pct": 100.0, "prompt": [1, 264, 11245, 2168, 429, 702], "prompt_index": 18, "split": "train", "step": 100, "student_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "teacher_nll": 1.5442066192626953, "teacher_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.011378508992493153, "overlap_pct": 100.0, "prompt": [1, 3555, 374, 264, 5714, 30], "prompt_index": 19, "split": "train", "step": 100, "student_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "teacher_nll": 1.0100311040878296, "teacher_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01396601740270853, "overlap_pct": 12.5, "prompt": [1, 19257, 311, 279, 1251, 315], "prompt_index": 20, "split": "train", "step": 100, "student_suffix": [279, 3146, 11, 323, 279, 1251, 315, 279, 3146, 525, 279, 3832, 315, 279, 5777, 5025], "teacher_nll": 0.8773755431175232, "teacher_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 323, 525, 17013, 369, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01932140253484249, "overlap_pct": 37.5, "prompt": [1, 1156, 3019, 304, 279, 1882], "prompt_index": 21, "split": "train", "step": 100, "student_suffix": [315, 279, 4401, 315, 279, 1849, 13, 576, 1156, 3019, 374, 311, 8253, 279, 1849, 594], "teacher_nll": 1.263704538345337, "teacher_suffix": [315, 279, 4401, 315, 279, 1849, 11, 323, 279, 2086, 3019, 304, 279, 1882, 315, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.028354309499263763, "overlap_pct": 6.25, "prompt": [1, 2701, 1467, 25, 4710, 785], "prompt_index": 22, "split": "train", "step": 100, "student_suffix": [1156, 882, 358, 5485, 279, 5700, 330, 785, 7996, 315, 3985, 1, 358, 572, 304, 279], "teacher_nll": 1.6650470495224, "teacher_suffix": [1156, 3019, 304, 279, 1882, 315, 11220, 264, 501, 1985, 374, 311, 8253, 279, 2169, 3081], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.008732382208108902, "overlap_pct": 100.0, "prompt": [1, 315, 279, 3364, 13, 576], "prompt_index": 23, "split": "train", "step": 100, "student_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "teacher_nll": 1.0869240760803223, "teacher_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.023385154083371162, "overlap_pct": 100.0, "prompt": [1, 279, 897, 5927, 553, 279], "prompt_index": 24, "split": "train", "step": 100, "student_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1156, 5693, 11, 323], "teacher_nll": 1.0170660018920898, "teacher_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1156, 5693, 11, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.011903515085577965, "overlap_pct": 43.75, "prompt": [1, 2055, 11, 369, 279, 1140], "prompt_index": 25, "split": "train", "step": 100, "student_suffix": [315, 5109, 11, 582, 646, 990, 279, 1140, 61094, 311, 1855, 264, 501, 1140, 13, 1752], "teacher_nll": 1.3948523998260498, "teacher_suffix": [315, 5109, 11, 582, 646, 990, 279, 2701, 5486, 25, 1156, 11, 582, 646, 1855, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.008261840790510178, "overlap_pct": 25.0, "prompt": [1, 28469, 9363, 525, 279], "prompt_index": 26, "split": "train", "step": 100, "student_suffix": [1887, 9363, 429, 8253, 279, 31559, 323, 4401, 315, 18808, 13, 576, 1887, 9363, 525, 279], "teacher_nll": 1.679072380065918, "teacher_suffix": [1887, 9363, 429, 5240, 279, 4401, 315, 279, 8457, 13, 576, 1887, 9363, 525, 279, 11137], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.012582246214151382, "overlap_pct": 12.5, "prompt": [1, 1012, 13570, 14975, 304, 279], "prompt_index": 27, "split": "train", "step": 100, "student_suffix": [2070, 315, 6731, 323, 702, 1012, 13570, 14975, 304, 279, 2070, 315, 6731, 323, 702, 1012], "teacher_nll": 1.7970490455627441, "teacher_suffix": [2070, 315, 37596, 11, 323, 279, 3920, 315, 279, 5888, 315, 279, 1372, 1849, 374, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.021871913224458694, "overlap_pct": 100.0, "prompt": [1, 1887, 2242, 1294, 2827, 8], "prompt_index": 28, "split": "train", "step": 100, "student_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "teacher_nll": 0.6485434770584106, "teacher_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004081872291862965, "overlap_pct": 100.0, "prompt": [1, 62, 716, 477, 11, 323], "prompt_index": 29, "split": "train", "step": 100, "student_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.5672988295555115, "teacher_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0084292683750391, "overlap_pct": 100.0, "prompt": [1, 1512, 429, 374, 11, 279], "prompt_index": 30, "split": "train", "step": 100, "student_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "teacher_nll": 0.6987159848213196, "teacher_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.010357776656746864, "overlap_pct": 6.25, "prompt": [1, 74595, 11, 714, 279, 1467], "prompt_index": 31, "split": "train", "step": 100, "student_suffix": [374, 304, 279, 1352, 315, 264, 32794, 11, 773, 432, 594, 803, 1075, 264, 32794, 1091], "teacher_nll": 1.5666577816009521, "teacher_suffix": [374, 537, 304, 279, 1852, 4128, 438, 279, 4024, 13, 2055, 11, 279, 1196, 374, 10161], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.010924031026661396, "overlap_pct": 100.0, "prompt": [1, 4438, 374, 279, 2768], "prompt_index": 0, "split": "heldout", "step": 100, "student_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "teacher_nll": 1.4037206172943115, "teacher_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.016300436109304428, "overlap_pct": 18.75, "prompt": [1, 1516, 374, 264, 1296, 4339], "prompt_index": 1, "split": "heldout", "step": 100, "student_suffix": [291, 504, 279, 2701, 1467, 25, 4710, 1, 16, 13, 576, 1156, 3019, 304, 279, 1882], "teacher_nll": 1.7207434177398682, "teacher_suffix": [291, 504, 279, 1467, 11, 714, 279, 1467, 374, 537, 304, 6364, 13, 5209, 14683, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.045378655195236206, "overlap_pct": 100.0, "prompt": [1, 785, 1401, 315, 279, 1967], "prompt_index": 2, "split": "heldout", "step": 100, "student_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "teacher_nll": 1.1567491292953491, "teacher_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01178958360105753, "overlap_pct": 37.5, "prompt": [1, 3198, 279, 1296, 25, 220], "prompt_index": 3, "split": "heldout", "step": 100, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.8073772192001343, "teacher_suffix": [16, 24, 24, 15, 82, 11, 220, 17, 15, 15, 15, 82, 11, 220, 17, 15], "top3_overlap_pct": 100.0}
+{"eval_seconds": 30.22550792200491, "heldout_kl": 0.02109817648306489, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2721475958824158, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 100, "train_kl": 0.017031581031915266, "train_overlap_pct": 66.015625, "train_teacher_nll": 1.1411776384338737, "train_top3_overlap_pct": 99.8046875}
+{"kind": "train_step", "step": 101, "step_seconds": 0.44108338601654395}
+{"kind": "train_step", "step": 102, "step_seconds": 0.40790715598268434}
+{"kind": "train_step", "step": 103, "step_seconds": 0.41540592297678813}
+{"kind": "train_step", "step": 104, "step_seconds": 0.4107337499735877}
+{"kind": "train_step", "step": 105, "step_seconds": 0.41026878298725933}
+{"kind": "train_step", "step": 106, "step_seconds": 0.4100489389966242}
+{"kind": "train_step", "step": 107, "step_seconds": 0.40449297201121226}
+{"kind": "train_step", "step": 108, "step_seconds": 0.40706205199239776}
+{"kind": "train_step", "step": 109, "step_seconds": 0.4081996890017763}
+{"kind": "train_step", "step": 110, "step_seconds": 0.40549502696376294}
+{"kind": "train_step", "step": 111, "step_seconds": 0.40605179499834776}
+{"kind": "train_step", "step": 112, "step_seconds": 0.40489713702118024}
+{"kind": "train_step", "step": 113, "step_seconds": 0.40959221101365983}
+{"kind": "train_step", "step": 114, "step_seconds": 0.40545249596470967}
+{"kind": "train_step", "step": 115, "step_seconds": 0.4067290750099346}
+{"kind": "train_step", "step": 116, "step_seconds": 0.4053634140291251}
+{"kind": "train_step", "step": 117, "step_seconds": 0.4041897559654899}
+{"kind": "train_step", "step": 118, "step_seconds": 0.4086581449955702}
+{"kind": "train_step", "step": 119, "step_seconds": 0.4079472940065898}
+{"kind": "train_step", "step": 120, "step_seconds": 0.4069672890473157}
+{"kind": "train_step", "step": 121, "step_seconds": 0.4088570480234921}
+{"kind": "train_step", "step": 122, "step_seconds": 0.40652264101663604}
+{"kind": "train_step", "step": 123, "step_seconds": 0.40702992799924687}
+{"kind": "train_step", "step": 124, "step_seconds": 0.40630519698606804}
+{"kind": "train_step", "step": 125, "step_seconds": 0.40867933398112655}
+{"kind": "train_step", "step": 126, "step_seconds": 0.40663247101474553}
+{"kind": "train_step", "step": 127, "step_seconds": 0.40574445796664804}
+{"kind": "train_step", "step": 128, "step_seconds": 0.40702521800994873}
+{"kind": "train_step", "step": 129, "step_seconds": 0.407650908047799}
+{"kind": "train_step", "step": 130, "step_seconds": 0.4070606680470519}
+{"kind": "train_step", "step": 131, "step_seconds": 0.40600696101319045}
+{"kind": "train_step", "step": 132, "step_seconds": 0.40668847202323377}
+{"kind": "train_step", "step": 133, "step_seconds": 0.41024232702329755}
+{"kind": "train_step", "step": 134, "step_seconds": 0.40676115202950314}
+{"kind": "train_step", "step": 135, "step_seconds": 0.4071373880142346}
+{"kind": "train_step", "step": 136, "step_seconds": 0.4059170589898713}
+{"kind": "train_step", "step": 137, "step_seconds": 0.4066066790255718}
+{"kind": "train_step", "step": 138, "step_seconds": 0.40619509300449863}
+{"kind": "train_step", "step": 139, "step_seconds": 0.4057987859705463}
+{"kind": "train_step", "step": 140, "step_seconds": 0.40780092700151727}
+{"kind": "train_step", "step": 141, "step_seconds": 0.4094066929537803}
+{"kind": "train_step", "step": 142, "step_seconds": 0.4065402270061895}
+{"kind": "train_step", "step": 143, "step_seconds": 0.4057667150045745}
+{"kind": "train_step", "step": 144, "step_seconds": 0.4049517519888468}
+{"kind": "train_step", "step": 145, "step_seconds": 0.4082888640114106}
+{"kind": "train_step", "step": 146, "step_seconds": 0.40619505202630535}
+{"kind": "train_step", "step": 147, "step_seconds": 0.408078711014241}
+{"kind": "train_step", "step": 148, "step_seconds": 0.40615550096845254}
+{"kind": "train_step", "step": 149, "step_seconds": 0.4069053929997608}
+{"kind": "train_step", "step": 150, "step_seconds": 0.41025578399421647}
+{"kind": "train_step", "step": 151, "step_seconds": 0.4068128900253214}
+{"kind": "train_step", "step": 152, "step_seconds": 0.4073599789990112}
+{"kind": "train_step", "step": 153, "step_seconds": 0.4072774680098519}
+{"kind": "train_step", "step": 154, "step_seconds": 0.4086638390435837}
+{"kind": "train_step", "step": 155, "step_seconds": 0.40672961802920327}
+{"kind": "train_step", "step": 156, "step_seconds": 0.4059069149661809}
+{"kind": "train_step", "step": 157, "step_seconds": 0.4070952929905616}
+{"kind": "train_step", "step": 158, "step_seconds": 0.4072223249822855}
+{"kind": "train_step", "step": 159, "step_seconds": 0.4079377470188774}
+{"kind": "train_step", "step": 160, "step_seconds": 0.408574785978999}
+{"kind": "train_step", "step": 161, "step_seconds": 0.4057081809733063}
+{"kind": "train_step", "step": 162, "step_seconds": 0.408362882968504}
+{"kind": "train_step", "step": 163, "step_seconds": 0.4075295999646187}
+{"kind": "train_step", "step": 164, "step_seconds": 0.40726812498178333}
+{"kind": "train_step", "step": 165, "step_seconds": 0.40695179998874664}
+{"kind": "train_step", "step": 166, "step_seconds": 0.40570609096903354}
+{"kind": "train_step", "step": 167, "step_seconds": 0.40800469601526856}
+{"kind": "train_step", "step": 168, "step_seconds": 0.40812356799142435}
+{"kind": "train_step", "step": 169, "step_seconds": 0.40737813600571826}
+{"kind": "train_step", "step": 170, "step_seconds": 0.40731138503178954}
+{"kind": "train_step", "step": 171, "step_seconds": 0.4062819280079566}
+{"kind": "train_step", "step": 172, "step_seconds": 0.40838824200909585}
+{"kind": "train_step", "step": 173, "step_seconds": 0.406848196987994}
+{"kind": "train_step", "step": 174, "step_seconds": 0.4088086769916117}
+{"kind": "train_step", "step": 175, "step_seconds": 0.40637048898497596}
+{"kind": "train_step", "step": 176, "step_seconds": 0.4059607920353301}
+{"kind": "train_step", "step": 177, "step_seconds": 0.40692413796205074}
+{"kind": "train_step", "step": 178, "step_seconds": 0.407705050020013}
+{"kind": "train_step", "step": 179, "step_seconds": 0.4070557589875534}
+{"kind": "train_step", "step": 180, "step_seconds": 0.40538531297352165}
+{"kind": "train_step", "step": 181, "step_seconds": 0.406446048989892}
+{"kind": "train_step", "step": 182, "step_seconds": 0.4078969120164402}
+{"kind": "train_step", "step": 183, "step_seconds": 0.4117710219579749}
+{"kind": "train_step", "step": 184, "step_seconds": 0.40729201200883836}
+{"kind": "train_step", "step": 185, "step_seconds": 0.40836146898800507}
+{"kind": "train_step", "step": 186, "step_seconds": 0.4101007460267283}
+{"kind": "train_step", "step": 187, "step_seconds": 0.407346852007322}
+{"kind": "train_step", "step": 188, "step_seconds": 0.40754090598784387}
+{"kind": "train_step", "step": 189, "step_seconds": 0.4090268880245276}
+{"kind": "train_step", "step": 190, "step_seconds": 0.40682518400717527}
+{"kind": "train_step", "step": 191, "step_seconds": 0.4082187060266733}
+{"kind": "train_step", "step": 192, "step_seconds": 0.41237444995203987}
+{"kind": "train_step", "step": 193, "step_seconds": 0.4099133809795603}
+{"kind": "train_step", "step": 194, "step_seconds": 0.41068880300736055}
+{"kind": "train_step", "step": 195, "step_seconds": 0.407079357013572}
+{"kind": "train_step", "step": 196, "step_seconds": 0.4200867499457672}
+{"kind": "train_step", "step": 197, "step_seconds": 0.4097905090311542}
+{"kind": "train_step", "step": 198, "step_seconds": 0.42142716102534905}
+{"kind": "train_step", "step": 199, "step_seconds": 0.40897233597934246}
+{"kind": "train_step", "step": 200, "step_seconds": 0.4076067939749919}
+{"kind": "train_step", "step": 201, "step_seconds": 0.40858691901667044}
+{"kind": "train_step", "step": 202, "step_seconds": 0.4063751649810001}
+{"kind": "train_step", "step": 203, "step_seconds": 0.40710697596659884}
+{"kind": "train_step", "step": 204, "step_seconds": 0.40797053900314495}
+{"kind": "train_step", "step": 205, "step_seconds": 0.4060180480009876}
+{"kind": "train_step", "step": 206, "step_seconds": 0.40963578497758135}
+{"kind": "train_step", "step": 207, "step_seconds": 0.40738758898805827}
+{"kind": "train_step", "step": 208, "step_seconds": 0.40709280502051115}
+{"kind": "train_step", "step": 209, "step_seconds": 0.40843813598621637}
+{"kind": "train_step", "step": 210, "step_seconds": 0.40697656298289075}
+{"kind": "train_step", "step": 211, "step_seconds": 0.407965618011076}
+{"kind": "train_step", "step": 212, "step_seconds": 0.40628551197005436}
+{"kind": "train_step", "step": 213, "step_seconds": 0.40854217699961737}
+{"kind": "train_step", "step": 214, "step_seconds": 0.40720969502581283}
+{"kind": "train_step", "step": 215, "step_seconds": 0.4066496370360255}
+{"kind": "train_step", "step": 216, "step_seconds": 0.4083743530209176}
+{"kind": "train_step", "step": 217, "step_seconds": 0.4070789029938169}
+{"kind": "train_step", "step": 218, "step_seconds": 0.408118178951554}
+{"kind": "train_step", "step": 219, "step_seconds": 0.4088598600355908}
+{"kind": "train_step", "step": 220, "step_seconds": 0.40896723204059526}
+{"kind": "train_step", "step": 221, "step_seconds": 0.40836448303889483}
+{"kind": "train_step", "step": 222, "step_seconds": 0.40781718399375677}
+{"kind": "train_step", "step": 223, "step_seconds": 0.40950554999290034}
+{"kind": "train_step", "step": 224, "step_seconds": 0.4089484909782186}
+{"kind": "train_step", "step": 225, "step_seconds": 0.4108703609672375}
+{"kind": "train_step", "step": 226, "step_seconds": 0.4081253379699774}
+{"kind": "train_step", "step": 227, "step_seconds": 0.4072610949515365}
+{"kind": "train_step", "step": 228, "step_seconds": 0.4086961970315315}
+{"kind": "train_step", "step": 229, "step_seconds": 0.40704765100963414}
+{"kind": "train_step", "step": 230, "step_seconds": 0.40791972499573603}
+{"kind": "train_step", "step": 231, "step_seconds": 0.4092432750039734}
+{"kind": "train_step", "step": 232, "step_seconds": 0.40661087300395593}
+{"kind": "train_step", "step": 233, "step_seconds": 0.4087648569839075}
+{"kind": "train_step", "step": 234, "step_seconds": 0.40608478599460796}
+{"kind": "train_step", "step": 235, "step_seconds": 0.40747135697165504}
+{"kind": "train_step", "step": 236, "step_seconds": 0.409012561023701}
+{"kind": "train_step", "step": 237, "step_seconds": 0.4072592130396515}
+{"kind": "train_step", "step": 238, "step_seconds": 0.4113585260347463}
+{"kind": "train_step", "step": 239, "step_seconds": 0.407446836004965}
+{"kind": "train_step", "step": 240, "step_seconds": 0.4100065749953501}
+{"kind": "train_step", "step": 241, "step_seconds": 0.40932351403171197}
+{"kind": "train_step", "step": 242, "step_seconds": 0.40907359996344894}
+{"kind": "train_step", "step": 243, "step_seconds": 0.4138865650165826}
+{"kind": "train_step", "step": 244, "step_seconds": 0.4083215180435218}
+{"kind": "train_step", "step": 245, "step_seconds": 0.4082796070142649}
+{"kind": "train_step", "step": 246, "step_seconds": 0.4076545070274733}
+{"kind": "train_step", "step": 247, "step_seconds": 0.41000480501679704}
+{"kind": "train_step", "step": 248, "step_seconds": 0.40782036999007687}
+{"kind": "train_step", "step": 249, "step_seconds": 0.4079780330066569}
+{"kind": "train_step", "step": 250, "step_seconds": 0.4093519730377011}
+{"kind": "eval_detail", "kl": 0.010964468121528625, "overlap_pct": 93.75, "prompt": [1, 872, 198, 3456], "prompt_index": 0, "split": "train", "step": 250, "student_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739], "teacher_nll": 0.4529881179332733, "teacher_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 442], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004415308125317097, "overlap_pct": 100.0, "prompt": [1, 198, 1512, 429], "prompt_index": 1, "split": "train", "step": 250, "student_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "teacher_nll": 1.6458337306976318, "teacher_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.007862793281674385, "overlap_pct": 100.0, "prompt": [1, 770, 3186, 25, 220], "prompt_index": 2, "split": "train", "step": 250, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.6976781487464905, "teacher_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.012110017240047455, "overlap_pct": 87.5, "prompt": [1, 644, 374, 279, 1887], "prompt_index": 3, "split": "train", "step": 250, "student_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 1815, 28469, 8168, 374, 279], "teacher_nll": 1.7445645332336426, "teacher_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 1815, 28469, 9363, 525, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.015483221039175987, "overlap_pct": 0.0, "prompt": [1, 3838, 374, 264, 2077, 13], "prompt_index": 4, "split": "train", "step": 250, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 1.534019112586975, "teacher_suffix": [7521, 481, 362, 5714, 374, 264, 897, 429, 374, 5927, 553, 264, 729, 13, 1752, 3110], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.012772477231919765, "overlap_pct": 100.0, "prompt": [1, 785, 594, 287, 374, 1690], "prompt_index": 5, "split": "train", "step": 250, "student_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "teacher_nll": 1.3509989976882935, "teacher_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004017634317278862, "overlap_pct": 100.0, "prompt": [1, 3347, 11, 358, 1052, 429], "prompt_index": 6, "split": "train", "step": 250, "student_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "teacher_nll": 1.2142435312271118, "teacher_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.00545515026897192, "overlap_pct": 100.0, "prompt": [1, 2610, 527, 1139, 304, 279, 1670], "prompt_index": 7, "split": "train", "step": 250, "student_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 1.2357988357543945, "teacher_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.021344158798456192, "overlap_pct": 100.0, "prompt": [1, 888, 536, 4697, 972], "prompt_index": 8, "split": "train", "step": 250, "student_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "teacher_nll": 0.2426314651966095, "teacher_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.008898993954062462, "overlap_pct": 31.25, "prompt": [1, 374, 11, 279, 1372, 315], "prompt_index": 9, "split": "train", "step": 250, "student_suffix": [5510, 311, 5157, 220, 17, 1251, 700, 315, 220, 18, 374, 220, 18, 5157, 220, 17], "teacher_nll": 0.7568572759628296, "teacher_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 356, 7, 20, 11, 17, 8], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0066767605021595955, "overlap_pct": 31.25, "prompt": [1, 2874, 369, 279, 31559], "prompt_index": 10, "split": "train", "step": 250, "student_suffix": [315, 279, 8457, 374, 279, 5240, 315, 279, 8457, 11, 323, 279, 2874, 369, 279, 31559], "teacher_nll": 1.018100380897522, "teacher_suffix": [315, 279, 8457, 1, 374, 279, 1852, 438, 279, 2874, 369, 279, 31559, 315, 279, 8457], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.02329925447702408, "overlap_pct": 18.75, "prompt": [1, 7521, 481, 362, 5714], "prompt_index": 11, "split": "train", "step": 250, "student_suffix": [315, 279, 15846, 198, 12, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 481, 362], "teacher_nll": 1.1453306674957275, "teacher_suffix": [315, 279, 15846, 271, 785, 3405, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 374], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.04191506281495094, "overlap_pct": 68.75, "prompt": [1, 43059, 21938, 315, 7148], "prompt_index": 12, "split": "train", "step": 250, "student_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 2747, 304, 279, 6424, 11, 7407, 304, 7148], "teacher_nll": 0.9080829620361328, "teacher_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 2747, 304, 279, 4311, 315, 7148, 11, 9448], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.016842760145664215, "overlap_pct": 50.0, "prompt": [1, 358, 646, 944, 1490, 432], "prompt_index": 13, "split": "train", "step": 250, "student_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 429, 3880, 311, 387, 27956, 13, 6771, 752], "teacher_nll": 1.2971787452697754, "teacher_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 13, 1084, 594, 264, 3491, 429, 358, 646], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.001651586266234517, "overlap_pct": 100.0, "prompt": [1, 477, 11, 323, 279, 62], "prompt_index": 14, "split": "train", "step": 250, "student_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.3016965091228485, "teacher_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013733788393437862, "overlap_pct": 56.25, "prompt": [1, 576, 1102, 315, 264, 729], "prompt_index": 15, "split": "train", "step": 250, "student_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 1459, 1380, 279, 729, 374, 2598, 13], "teacher_nll": 1.163813591003418, "teacher_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 2661, 5693, 13, 2055, 11, 421, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.008981345221400261, "overlap_pct": 100.0, "prompt": [1, 291, 504, 279, 1467, 11], "prompt_index": 16, "split": "train", "step": 250, "student_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "teacher_nll": 1.0492215156555176, "teacher_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0058374712243676186, "overlap_pct": 100.0, "prompt": [1, 702, 1012, 1483, 311, 7512], "prompt_index": 17, "split": "train", "step": 250, "student_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 2971, 1189, 758], "teacher_nll": 1.740395188331604, "teacher_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 2971, 1189, 758], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.008845137432217598, "overlap_pct": 100.0, "prompt": [1, 264, 11245, 2168, 429, 702], "prompt_index": 18, "split": "train", "step": 250, "student_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "teacher_nll": 1.531126618385315, "teacher_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.005095155443996191, "overlap_pct": 75.0, "prompt": [1, 3555, 374, 264, 5714, 30], "prompt_index": 19, "split": "train", "step": 250, "student_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 429, 19257, 311, 279, 15274, 315, 458, 1917], "teacher_nll": 1.0316340923309326, "teacher_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.010620656423270702, "overlap_pct": 68.75, "prompt": [1, 19257, 311, 279, 1251, 315], "prompt_index": 20, "split": "train", "step": 250, "student_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 11, 323, 614, 264, 3654], "teacher_nll": 0.8991308808326721, "teacher_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 323, 525, 17013, 369, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.009190002456307411, "overlap_pct": 37.5, "prompt": [1, 1156, 3019, 304, 279, 1882], "prompt_index": 21, "split": "train", "step": 250, "student_suffix": [315, 279, 4401, 315, 279, 1849, 13, 576, 1156, 3019, 374, 311, 8253, 279, 1849, 594], "teacher_nll": 1.246931552886963, "teacher_suffix": [315, 279, 4401, 315, 279, 1849, 11, 323, 279, 2086, 3019, 304, 279, 1882, 315, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.014734816737473011, "overlap_pct": 87.5, "prompt": [1, 2701, 1467, 25, 4710, 785], "prompt_index": 22, "split": "train", "step": 250, "student_suffix": [1156, 3019, 304, 279, 1882, 315, 11220, 264, 501, 1985, 374, 311, 8253, 279, 3081, 13], "teacher_nll": 1.622381329536438, "teacher_suffix": [1156, 3019, 304, 279, 1882, 315, 11220, 264, 501, 1985, 374, 311, 8253, 279, 2169, 3081], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.007152021862566471, "overlap_pct": 100.0, "prompt": [1, 315, 279, 3364, 13, 576], "prompt_index": 23, "split": "train", "step": 250, "student_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "teacher_nll": 1.076852560043335, "teacher_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.026843490079045296, "overlap_pct": 75.0, "prompt": [1, 279, 897, 5927, 553, 279], "prompt_index": 24, "split": "train", "step": 250, "student_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1459, 315, 279, 729], "teacher_nll": 0.996253252029419, "teacher_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1156, 5693, 11, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004975729621946812, "overlap_pct": 100.0, "prompt": [1, 2055, 11, 369, 279, 1140], "prompt_index": 25, "split": "train", "step": 250, "student_suffix": [315, 5109, 11, 582, 646, 990, 279, 2701, 5486, 25, 1156, 11, 582, 646, 1855, 264], "teacher_nll": 1.3519208431243896, "teacher_suffix": [315, 5109, 11, 582, 646, 990, 279, 2701, 5486, 25, 1156, 11, 582, 646, 1855, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006448579952120781, "overlap_pct": 93.75, "prompt": [1, 28469, 9363, 525, 279], "prompt_index": 26, "split": "train", "step": 250, "student_suffix": [1887, 9363, 429, 5240, 279, 4401, 315, 279, 8457, 13, 576, 1887, 9363, 525, 279, 6174], "teacher_nll": 1.6706401109695435, "teacher_suffix": [1887, 9363, 429, 5240, 279, 4401, 315, 279, 8457, 13, 576, 1887, 9363, 525, 279, 11137], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006679070182144642, "overlap_pct": 100.0, "prompt": [1, 1012, 13570, 14975, 304, 279], "prompt_index": 27, "split": "train", "step": 250, "student_suffix": [2070, 315, 37596, 11, 323, 279, 3920, 315, 279, 5888, 315, 279, 1372, 1849, 374, 264], "teacher_nll": 1.777494192123413, "teacher_suffix": [2070, 315, 37596, 11, 323, 279, 3920, 315, 279, 5888, 315, 279, 1372, 1849, 374, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.01177053339779377, "overlap_pct": 100.0, "prompt": [1, 1887, 2242, 1294, 2827, 8], "prompt_index": 28, "split": "train", "step": 250, "student_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "teacher_nll": 0.6091136336326599, "teacher_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.002362629631534219, "overlap_pct": 100.0, "prompt": [1, 62, 716, 477, 11, 323], "prompt_index": 29, "split": "train", "step": 250, "student_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.5769877433776855, "teacher_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004931052215397358, "overlap_pct": 6.25, "prompt": [1, 1512, 429, 374, 11, 279], "prompt_index": 30, "split": "train", "step": 250, "student_suffix": [1156, 825, 11, 279, 825, 429, 374, 11, 279, 825, 429, 374, 11, 279, 825, 429], "teacher_nll": 0.7002466917037964, "teacher_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.00928357895463705, "overlap_pct": 6.25, "prompt": [1, 74595, 11, 714, 279, 1467], "prompt_index": 31, "split": "train", "step": 250, "student_suffix": [374, 304, 279, 1352, 315, 264, 32794, 11, 773, 432, 594, 803, 1075, 264, 32794, 1091], "teacher_nll": 1.558692216873169, "teacher_suffix": [374, 537, 304, 279, 1852, 4128, 438, 279, 4024, 13, 2055, 11, 279, 1196, 374, 10161], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.011791005730628967, "overlap_pct": 100.0, "prompt": [1, 4438, 374, 279, 2768], "prompt_index": 0, "split": "heldout", "step": 250, "student_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "teacher_nll": 1.3906762599945068, "teacher_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.014852716587483883, "overlap_pct": 18.75, "prompt": [1, 1516, 374, 264, 1296, 4339], "prompt_index": 1, "split": "heldout", "step": 250, "student_suffix": [291, 504, 279, 2701, 1467, 25, 4710, 1, 16, 13, 576, 1156, 3019, 304, 279, 1882], "teacher_nll": 1.692875623703003, "teacher_suffix": [291, 504, 279, 1467, 11, 714, 279, 1467, 374, 537, 304, 6364, 13, 5209, 14683, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.04455430060625076, "overlap_pct": 100.0, "prompt": [1, 785, 1401, 315, 279, 1967], "prompt_index": 2, "split": "heldout", "step": 250, "student_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "teacher_nll": 1.1439051628112793, "teacher_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013601822778582573, "overlap_pct": 37.5, "prompt": [1, 3198, 279, 1296, 25, 220], "prompt_index": 3, "split": "heldout", "step": 250, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.7984368801116943, "teacher_suffix": [16, 24, 24, 15, 82, 11, 220, 17, 15, 15, 15, 82, 11, 220, 17, 15], "top3_overlap_pct": 100.0}
+{"eval_seconds": 29.956645947007928, "heldout_kl": 0.021199961425736547, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2564734816551208, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 250, "train_kl": 0.010974834556691349, "train_overlap_pct": 74.609375, "train_teacher_nll": 1.1296512195840478, "train_top3_overlap_pct": 100.0}
+{"kind": "train_step", "step": 251, "step_seconds": 0.4299940239870921}
+{"kind": "train_step", "step": 252, "step_seconds": 0.4063029440003447}
+{"kind": "train_step", "step": 253, "step_seconds": 0.4078006269992329}
+{"kind": "train_step", "step": 254, "step_seconds": 0.4052134460071102}
+{"kind": "train_step", "step": 255, "step_seconds": 0.40897363499971107}
+{"kind": "train_step", "step": 256, "step_seconds": 0.40662062901537865}
+{"kind": "train_step", "step": 257, "step_seconds": 0.4070612050127238}
+{"kind": "train_step", "step": 258, "step_seconds": 0.40711426601046696}
+{"kind": "train_step", "step": 259, "step_seconds": 0.405527300958056}
+{"kind": "train_step", "step": 260, "step_seconds": 0.40709858504123986}
+{"kind": "train_step", "step": 261, "step_seconds": 0.40570038300938904}
+{"kind": "train_step", "step": 262, "step_seconds": 0.4061684710322879}
+{"kind": "train_step", "step": 263, "step_seconds": 0.4057157229981385}
+{"kind": "train_step", "step": 264, "step_seconds": 0.40507683297619224}
+{"kind": "train_step", "step": 265, "step_seconds": 0.4067447989946231}
+{"kind": "train_step", "step": 266, "step_seconds": 0.40471609798260033}
+{"kind": "train_step", "step": 267, "step_seconds": 0.40688982099527493}
+{"kind": "train_step", "step": 268, "step_seconds": 0.40772682399256155}
+{"kind": "train_step", "step": 269, "step_seconds": 0.404642915003933}
+{"kind": "train_step", "step": 270, "step_seconds": 0.4065243840450421}
+{"kind": "train_step", "step": 271, "step_seconds": 0.4043817209894769}
+{"kind": "train_step", "step": 272, "step_seconds": 0.4067613279912621}
+{"kind": "train_step", "step": 273, "step_seconds": 0.40565607097232714}
+{"kind": "train_step", "step": 274, "step_seconds": 0.40607034700224176}
+{"kind": "train_step", "step": 275, "step_seconds": 0.40661750599974766}
+{"kind": "train_step", "step": 276, "step_seconds": 0.40564722096314654}
+{"kind": "train_step", "step": 277, "step_seconds": 0.4077300230273977}
+{"kind": "train_step", "step": 278, "step_seconds": 0.4054356970009394}
+{"kind": "train_step", "step": 279, "step_seconds": 0.406739646976348}
+{"kind": "train_step", "step": 280, "step_seconds": 0.4072194449836388}
+{"kind": "train_step", "step": 281, "step_seconds": 0.4056839100085199}
+{"kind": "train_step", "step": 282, "step_seconds": 0.40732072497485206}
+{"kind": "train_step", "step": 283, "step_seconds": 0.408189959009178}
+{"kind": "train_step", "step": 284, "step_seconds": 0.4070378110045567}
+{"kind": "train_step", "step": 285, "step_seconds": 0.406738416000735}
+{"kind": "train_step", "step": 286, "step_seconds": 0.4063392290263437}
+{"kind": "train_step", "step": 287, "step_seconds": 0.4071703819790855}
+{"kind": "train_step", "step": 288, "step_seconds": 0.4048567960271612}
+{"kind": "train_step", "step": 289, "step_seconds": 0.40625120798358694}
+{"kind": "train_step", "step": 290, "step_seconds": 0.4051111589651555}
+{"kind": "train_step", "step": 291, "step_seconds": 0.4043362869997509}
+{"kind": "train_step", "step": 292, "step_seconds": 0.4087628470151685}
+{"kind": "train_step", "step": 293, "step_seconds": 0.405984643031843}
+{"kind": "train_step", "step": 294, "step_seconds": 0.40630066802259535}
+{"kind": "train_step", "step": 295, "step_seconds": 0.40524228097638115}
+{"kind": "train_step", "step": 296, "step_seconds": 0.4043285970110446}
+{"kind": "train_step", "step": 297, "step_seconds": 0.4072724930010736}
+{"kind": "train_step", "step": 298, "step_seconds": 0.4048023240175098}
+{"kind": "train_step", "step": 299, "step_seconds": 0.40822123701218516}
+{"kind": "train_step", "step": 300, "step_seconds": 0.40601648297160864}
+{"kind": "train_step", "step": 301, "step_seconds": 0.4043892070185393}
+{"kind": "train_step", "step": 302, "step_seconds": 0.40602983301505446}
+{"kind": "train_step", "step": 303, "step_seconds": 0.4040865019778721}
+{"kind": "train_step", "step": 304, "step_seconds": 0.4063903669593856}
+{"kind": "train_step", "step": 305, "step_seconds": 0.4090058280271478}
+{"kind": "train_step", "step": 306, "step_seconds": 0.40562841499922797}
+{"kind": "train_step", "step": 307, "step_seconds": 0.4074074429809116}
+{"kind": "train_step", "step": 308, "step_seconds": 0.4046040389803238}
+{"kind": "train_step", "step": 309, "step_seconds": 0.40881242498289794}
+{"kind": "train_step", "step": 310, "step_seconds": 0.4065485190367326}
+{"kind": "train_step", "step": 311, "step_seconds": 0.40640095697017387}
+{"kind": "train_step", "step": 312, "step_seconds": 0.4073312009568326}
+{"kind": "train_step", "step": 313, "step_seconds": 0.4034235800500028}
+{"kind": "train_step", "step": 314, "step_seconds": 0.4065267579862848}
+{"kind": "train_step", "step": 315, "step_seconds": 0.4050771060283296}
+{"kind": "train_step", "step": 316, "step_seconds": 0.4065050479839556}
+{"kind": "train_step", "step": 317, "step_seconds": 0.40940815303474665}
+{"kind": "train_step", "step": 318, "step_seconds": 0.4052210769732483}
+{"kind": "train_step", "step": 319, "step_seconds": 0.40735605999361724}
+{"kind": "train_step", "step": 320, "step_seconds": 0.40495934401405975}
+{"kind": "train_step", "step": 321, "step_seconds": 0.4054760810104199}
+{"kind": "train_step", "step": 322, "step_seconds": 0.4047230799915269}
+{"kind": "train_step", "step": 323, "step_seconds": 0.4045060359640047}
+{"kind": "train_step", "step": 324, "step_seconds": 0.4086715599987656}
+{"kind": "train_step", "step": 325, "step_seconds": 0.4047570090042427}
+{"kind": "train_step", "step": 326, "step_seconds": 0.4059170570108108}
+{"kind": "train_step", "step": 327, "step_seconds": 0.4055910430033691}
+{"kind": "train_step", "step": 328, "step_seconds": 0.4051890459959395}
+{"kind": "train_step", "step": 329, "step_seconds": 0.40724005800439045}
+{"kind": "train_step", "step": 330, "step_seconds": 0.4073529790039174}
+{"kind": "train_step", "step": 331, "step_seconds": 0.4076736940187402}
+{"kind": "train_step", "step": 332, "step_seconds": 0.40522498602513224}
+{"kind": "train_step", "step": 333, "step_seconds": 0.40535643801558763}
+{"kind": "train_step", "step": 334, "step_seconds": 0.4064940059906803}
+{"kind": "train_step", "step": 335, "step_seconds": 0.4051444540382363}
+{"kind": "train_step", "step": 336, "step_seconds": 0.40665457694558427}
+{"kind": "train_step", "step": 337, "step_seconds": 0.40548396902158856}
+{"kind": "train_step", "step": 338, "step_seconds": 0.40673278796020895}
+{"kind": "train_step", "step": 339, "step_seconds": 0.40566726098768413}
+{"kind": "train_step", "step": 340, "step_seconds": 0.40498979098629206}
+{"kind": "train_step", "step": 341, "step_seconds": 0.40870734804775566}
+{"kind": "train_step", "step": 342, "step_seconds": 0.4072365749743767}
+{"kind": "train_step", "step": 343, "step_seconds": 0.4082234100205824}
+{"kind": "train_step", "step": 344, "step_seconds": 0.40794991597067565}
+{"kind": "train_step", "step": 345, "step_seconds": 0.40859983599511907}
+{"kind": "train_step", "step": 346, "step_seconds": 0.4095172300003469}
+{"kind": "train_step", "step": 347, "step_seconds": 0.4142198829795234}
+{"kind": "train_step", "step": 348, "step_seconds": 0.4105203550425358}
+{"kind": "train_step", "step": 349, "step_seconds": 0.4063413210096769}
+{"kind": "train_step", "step": 350, "step_seconds": 0.4066105450037867}
+{"kind": "train_step", "step": 351, "step_seconds": 0.4066209449665621}
+{"kind": "train_step", "step": 352, "step_seconds": 0.4059651449788362}
+{"kind": "train_step", "step": 353, "step_seconds": 0.4085455249878578}
+{"kind": "train_step", "step": 354, "step_seconds": 0.40813693800009787}
+{"kind": "train_step", "step": 355, "step_seconds": 0.4056435489910655}
+{"kind": "train_step", "step": 356, "step_seconds": 0.40848942298907787}
+{"kind": "train_step", "step": 357, "step_seconds": 0.41482345201075077}
+{"kind": "train_step", "step": 358, "step_seconds": 0.4114714390016161}
+{"kind": "train_step", "step": 359, "step_seconds": 0.4076203189906664}
+{"kind": "train_step", "step": 360, "step_seconds": 0.4104850640287623}
+{"kind": "train_step", "step": 361, "step_seconds": 0.4055275960126892}
+{"kind": "train_step", "step": 362, "step_seconds": 0.405859550985042}
+{"kind": "train_step", "step": 363, "step_seconds": 0.40791643399279565}
+{"kind": "train_step", "step": 364, "step_seconds": 0.4072038119775243}
+{"kind": "train_step", "step": 365, "step_seconds": 0.40917460300261155}
+{"kind": "train_step", "step": 366, "step_seconds": 0.4084243609686382}
+{"kind": "train_step", "step": 367, "step_seconds": 0.40594593196874484}
+{"kind": "train_step", "step": 368, "step_seconds": 0.4079521929961629}
+{"kind": "train_step", "step": 369, "step_seconds": 0.40669387398520485}
+{"kind": "train_step", "step": 370, "step_seconds": 0.4073579629766755}
+{"kind": "train_step", "step": 371, "step_seconds": 0.40795360202901065}
+{"kind": "train_step", "step": 372, "step_seconds": 0.40550840395735577}
+{"kind": "train_step", "step": 373, "step_seconds": 0.40673803398385644}
+{"kind": "train_step", "step": 374, "step_seconds": 0.40808295499300584}
+{"kind": "train_step", "step": 375, "step_seconds": 0.40868483402300626}
+{"kind": "train_step", "step": 376, "step_seconds": 0.40680756396614015}
+{"kind": "train_step", "step": 377, "step_seconds": 0.4055870750453323}
+{"kind": "train_step", "step": 378, "step_seconds": 0.4073123420239426}
+{"kind": "train_step", "step": 379, "step_seconds": 0.4077175380080007}
+{"kind": "train_step", "step": 380, "step_seconds": 0.4067043319810182}
+{"kind": "train_step", "step": 381, "step_seconds": 0.4067301519680768}
+{"kind": "train_step", "step": 382, "step_seconds": 0.41066777403466403}
+{"kind": "train_step", "step": 383, "step_seconds": 0.4151372619671747}
+{"kind": "train_step", "step": 384, "step_seconds": 0.41451825300464407}
+{"kind": "train_step", "step": 385, "step_seconds": 0.4127164449892007}
+{"kind": "train_step", "step": 386, "step_seconds": 0.40853290900122374}
+{"kind": "train_step", "step": 387, "step_seconds": 0.4092917910311371}
+{"kind": "train_step", "step": 388, "step_seconds": 0.40871913195587695}
+{"kind": "train_step", "step": 389, "step_seconds": 0.4089042950072326}
+{"kind": "train_step", "step": 390, "step_seconds": 0.4117425489821471}
+{"kind": "train_step", "step": 391, "step_seconds": 0.40957165497820824}
+{"kind": "train_step", "step": 392, "step_seconds": 0.40849346795585006}
+{"kind": "train_step", "step": 393, "step_seconds": 0.40865534998010844}
+{"kind": "train_step", "step": 394, "step_seconds": 0.407271649048198}
+{"kind": "train_step", "step": 395, "step_seconds": 0.41235761798452586}
+{"kind": "train_step", "step": 396, "step_seconds": 0.40888830402400345}
+{"kind": "train_step", "step": 397, "step_seconds": 0.40973064600257203}
+{"kind": "train_step", "step": 398, "step_seconds": 0.4108228830154985}
+{"kind": "train_step", "step": 399, "step_seconds": 0.40884873300092295}
+{"kind": "train_step", "step": 400, "step_seconds": 0.4231327750021592}
+{"kind": "train_step", "step": 401, "step_seconds": 0.406533447036054}
+{"kind": "train_step", "step": 402, "step_seconds": 0.40981943800579756}
+{"kind": "train_step", "step": 403, "step_seconds": 0.40805361000820994}
+{"kind": "train_step", "step": 404, "step_seconds": 0.40767587401205674}
+{"kind": "train_step", "step": 405, "step_seconds": 0.40821493201656267}
+{"kind": "train_step", "step": 406, "step_seconds": 0.40642635396216065}
+{"kind": "train_step", "step": 407, "step_seconds": 0.4106778300483711}
+{"kind": "train_step", "step": 408, "step_seconds": 0.40952742198714986}
+{"kind": "train_step", "step": 409, "step_seconds": 0.4080538190319203}
+{"kind": "train_step", "step": 410, "step_seconds": 0.40759598201839253}
+{"kind": "train_step", "step": 411, "step_seconds": 0.4063403229811229}
+{"kind": "train_step", "step": 412, "step_seconds": 0.4087717800284736}
+{"kind": "train_step", "step": 413, "step_seconds": 0.4096262440434657}
+{"kind": "train_step", "step": 414, "step_seconds": 0.4076662120060064}
+{"kind": "train_step", "step": 415, "step_seconds": 0.4099328870070167}
+{"kind": "train_step", "step": 416, "step_seconds": 0.40601648698793724}
+{"kind": "train_step", "step": 417, "step_seconds": 0.40650865400675684}
+{"kind": "train_step", "step": 418, "step_seconds": 0.4059651250136085}
+{"kind": "train_step", "step": 419, "step_seconds": 0.4089479319518432}
+{"kind": "train_step", "step": 420, "step_seconds": 0.408897360030096}
+{"kind": "train_step", "step": 421, "step_seconds": 0.4084195930045098}
+{"kind": "train_step", "step": 422, "step_seconds": 0.4063771210494451}
+{"kind": "train_step", "step": 423, "step_seconds": 0.4051338220015168}
+{"kind": "train_step", "step": 424, "step_seconds": 0.4069785409956239}
+{"kind": "train_step", "step": 425, "step_seconds": 0.40570307098096237}
+{"kind": "train_step", "step": 426, "step_seconds": 0.4063245399738662}
+{"kind": "train_step", "step": 427, "step_seconds": 0.410248730040621}
+{"kind": "train_step", "step": 428, "step_seconds": 0.40673013601917773}
+{"kind": "train_step", "step": 429, "step_seconds": 0.40934619604377076}
+{"kind": "train_step", "step": 430, "step_seconds": 0.4062361489632167}
+{"kind": "train_step", "step": 431, "step_seconds": 0.40698319900548086}
+{"kind": "train_step", "step": 432, "step_seconds": 0.4079341039760038}
+{"kind": "train_step", "step": 433, "step_seconds": 0.40603858401300386}
+{"kind": "train_step", "step": 434, "step_seconds": 0.4079585039871745}
+{"kind": "train_step", "step": 435, "step_seconds": 0.40726264397380874}
+{"kind": "train_step", "step": 436, "step_seconds": 0.4070623210282065}
+{"kind": "train_step", "step": 437, "step_seconds": 0.40700076904613525}
+{"kind": "train_step", "step": 438, "step_seconds": 0.4058401809888892}
+{"kind": "train_step", "step": 439, "step_seconds": 0.41107851202832535}
+{"kind": "train_step", "step": 440, "step_seconds": 0.4062486769980751}
+{"kind": "train_step", "step": 441, "step_seconds": 0.40655917197000235}
+{"kind": "train_step", "step": 442, "step_seconds": 0.4059947130153887}
+{"kind": "train_step", "step": 443, "step_seconds": 0.4050888989586383}
+{"kind": "train_step", "step": 444, "step_seconds": 0.4069495979929343}
+{"kind": "train_step", "step": 445, "step_seconds": 0.40478997403988615}
+{"kind": "train_step", "step": 446, "step_seconds": 0.4071835210197605}
+{"kind": "train_step", "step": 447, "step_seconds": 0.40714013000251725}
+{"kind": "train_step", "step": 448, "step_seconds": 0.40543353295652196}
+{"kind": "train_step", "step": 449, "step_seconds": 0.40612838399829343}
+{"kind": "train_step", "step": 450, "step_seconds": 0.4040986130130477}
+{"kind": "train_step", "step": 451, "step_seconds": 0.4100829649833031}
+{"kind": "train_step", "step": 452, "step_seconds": 0.40721400995971635}
+{"kind": "train_step", "step": 453, "step_seconds": 0.4073489820002578}
+{"kind": "train_step", "step": 454, "step_seconds": 0.4058868900174275}
+{"kind": "train_step", "step": 455, "step_seconds": 0.40479254303500056}
+{"kind": "train_step", "step": 456, "step_seconds": 0.40737530298065394}
+{"kind": "train_step", "step": 457, "step_seconds": 0.40624894498614594}
+{"kind": "train_step", "step": 458, "step_seconds": 0.4070202970178798}
+{"kind": "train_step", "step": 459, "step_seconds": 0.40591621899511665}
+{"kind": "train_step", "step": 460, "step_seconds": 0.4056154750287533}
+{"kind": "train_step", "step": 461, "step_seconds": 0.40704951604129747}
+{"kind": "train_step", "step": 462, "step_seconds": 0.4058017170173116}
+{"kind": "train_step", "step": 463, "step_seconds": 0.40936895296908915}
+{"kind": "train_step", "step": 464, "step_seconds": 0.4083721269853413}
+{"kind": "train_step", "step": 465, "step_seconds": 0.4076532550388947}
+{"kind": "train_step", "step": 466, "step_seconds": 0.40733096102485433}
+{"kind": "train_step", "step": 467, "step_seconds": 0.40646400599507615}
+{"kind": "train_step", "step": 468, "step_seconds": 0.4090295869973488}
+{"kind": "train_step", "step": 469, "step_seconds": 0.40699716500239447}
+{"kind": "train_step", "step": 470, "step_seconds": 0.40789884905098006}
+{"kind": "train_step", "step": 471, "step_seconds": 0.4068774720071815}
+{"kind": "train_step", "step": 472, "step_seconds": 0.40680716204224154}
+{"kind": "train_step", "step": 473, "step_seconds": 0.40707891498459503}
+{"kind": "train_step", "step": 474, "step_seconds": 0.40536522900220007}
+{"kind": "train_step", "step": 475, "step_seconds": 0.4053673190064728}
+{"kind": "train_step", "step": 476, "step_seconds": 0.4082667739712633}
+{"kind": "train_step", "step": 477, "step_seconds": 0.40635131299495697}
+{"kind": "train_step", "step": 478, "step_seconds": 0.40893817401956767}
+{"kind": "train_step", "step": 479, "step_seconds": 0.4053015770041384}
+{"kind": "train_step", "step": 480, "step_seconds": 0.4076782639604062}
+{"kind": "train_step", "step": 481, "step_seconds": 0.4065873370273039}
+{"kind": "train_step", "step": 482, "step_seconds": 0.40669585805153474}
+{"kind": "train_step", "step": 483, "step_seconds": 0.40849822701420635}
+{"kind": "train_step", "step": 484, "step_seconds": 0.40678781003225595}
+{"kind": "train_step", "step": 485, "step_seconds": 0.4058812960283831}
+{"kind": "train_step", "step": 486, "step_seconds": 0.4074694609735161}
+{"kind": "train_step", "step": 487, "step_seconds": 0.4051727939513512}
+{"kind": "train_step", "step": 488, "step_seconds": 0.41105070494813845}
+{"kind": "train_step", "step": 489, "step_seconds": 0.4068613210110925}
+{"kind": "train_step", "step": 490, "step_seconds": 0.40726565598743036}
+{"kind": "train_step", "step": 491, "step_seconds": 0.40588603395735845}
+{"kind": "train_step", "step": 492, "step_seconds": 0.40608788799727336}
+{"kind": "train_step", "step": 493, "step_seconds": 0.40729670698056}
+{"kind": "train_step", "step": 494, "step_seconds": 0.4059944360051304}
+{"kind": "train_step", "step": 495, "step_seconds": 0.40842231299029663}
+{"kind": "train_step", "step": 496, "step_seconds": 0.4073859979980625}
+{"kind": "train_step", "step": 497, "step_seconds": 0.40972841397160664}
+{"kind": "train_step", "step": 498, "step_seconds": 0.4069416800048202}
+{"kind": "train_step", "step": 499, "step_seconds": 0.4046256149886176}
+{"kind": "train_step", "step": 500, "step_seconds": 0.40821051999228075}
+{"kind": "eval_detail", "kl": 0.007373771630227566, "overlap_pct": 100.0, "prompt": [1, 872, 198, 3456], "prompt_index": 0, "split": "train", "step": 500, "student_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 442], "teacher_nll": 0.4238734245300293, "teacher_suffix": [888, 536, 4697, 972, 262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 442], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.003612915286794305, "overlap_pct": 100.0, "prompt": [1, 198, 1512, 429], "prompt_index": 1, "split": "train", "step": 500, "student_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "teacher_nll": 1.6339925527572632, "teacher_suffix": [374, 11, 279, 1372, 315, 3039, 279, 1372, 7952, 304, 279, 1140, 13, 2055, 11, 369], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006371278315782547, "overlap_pct": 100.0, "prompt": [1, 770, 3186, 25, 220], "prompt_index": 2, "split": "train", "step": 500, "student_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "teacher_nll": 0.7118021249771118, "teacher_suffix": [16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013806277886033058, "overlap_pct": 37.5, "prompt": [1, 644, 374, 279, 1887], "prompt_index": 3, "split": "train", "step": 500, "student_suffix": [2874, 369, 279, 18003, 315, 279, 1156, 323, 2086, 2188, 315, 279, 1156, 2188, 315, 279], "teacher_nll": 1.7429217100143433, "teacher_suffix": [2874, 369, 279, 31559, 315, 279, 8457, 11, 323, 279, 1887, 1815, 28469, 9363, 525, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.011468028649687767, "overlap_pct": 31.25, "prompt": [1, 3838, 374, 264, 2077, 13], "prompt_index": 4, "split": "train", "step": 500, "student_suffix": [7521, 481, 362, 5714, 13, 1939, 785, 3405, 374, 330, 3838, 374, 264, 2077, 13, 7521], "teacher_nll": 1.5474202632904053, "teacher_suffix": [7521, 481, 362, 5714, 374, 264, 897, 429, 374, 5927, 553, 264, 729, 13, 1752, 3110], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.013491694815456867, "overlap_pct": 100.0, "prompt": [1, 785, 594, 287, 374, 1690], "prompt_index": 5, "split": "train", "step": 500, "student_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "teacher_nll": 1.298583745956421, "teacher_suffix": [1, 374, 264, 4647, 429, 702, 1012, 1483, 311, 7512, 279, 1251, 315, 279, 7748, 1186], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0035343950148671865, "overlap_pct": 100.0, "prompt": [1, 3347, 11, 358, 1052, 429], "prompt_index": 6, "split": "train", "step": 500, "student_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "teacher_nll": 1.2167363166809082, "teacher_suffix": [358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490, 432, 13, 358, 646, 944, 1490], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004088995978236198, "overlap_pct": 100.0, "prompt": [1, 2610, 527, 1139, 304, 279, 1670], "prompt_index": 7, "split": "train", "step": 500, "student_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 1.2535827159881592, "teacher_suffix": [477, 11, 323, 279, 62, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.016869384795427322, "overlap_pct": 100.0, "prompt": [1, 888, 536, 4697, 972], "prompt_index": 8, "split": "train", "step": 500, "student_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "teacher_nll": 0.2365686595439911, "teacher_suffix": [262, 584, 1099, 737, 1887, 2242, 1294, 2827, 8, 972, 286, 739, 2532, 2913, 445, 9707], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.00629654573276639, "overlap_pct": 68.75, "prompt": [1, 374, 11, 279, 1372, 315], "prompt_index": 9, "split": "train", "step": 500, "student_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 220, 20, 5157, 220, 17, 11], "teacher_nll": 0.7625752687454224, "teacher_suffix": [5510, 311, 5157, 220, 17, 700, 315, 220, 20, 374, 356, 7, 20, 11, 17, 8], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.005579372867941856, "overlap_pct": 18.75, "prompt": [1, 2874, 369, 279, 31559], "prompt_index": 10, "split": "train", "step": 500, "student_suffix": [315, 279, 8457, 374, 279, 5240, 315, 279, 8457, 330, 374, 264, 5114, 429, 374, 830], "teacher_nll": 1.0147955417633057, "teacher_suffix": [315, 279, 8457, 1, 374, 279, 1852, 438, 279, 2874, 369, 279, 31559, 315, 279, 8457], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.02778010629117489, "overlap_pct": 100.0, "prompt": [1, 7521, 481, 362, 5714], "prompt_index": 11, "split": "train", "step": 500, "student_suffix": [315, 279, 15846, 271, 785, 3405, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 374], "teacher_nll": 1.1190760135650635, "teacher_suffix": [315, 279, 15846, 271, 785, 3405, 330, 3838, 374, 279, 1102, 315, 279, 3405, 7521, 374], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.031010106205940247, "overlap_pct": 68.75, "prompt": [1, 43059, 21938, 315, 7148], "prompt_index": 12, "split": "train", "step": 500, "student_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 2747, 304, 279, 6424, 11, 7407, 304, 7148], "teacher_nll": 0.8961092233657837, "teacher_suffix": [271, 785, 21938, 315, 7148, 374, 264, 18035, 2747, 304, 279, 4311, 315, 7148, 11, 9448], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.010023614391684532, "overlap_pct": 100.0, "prompt": [1, 358, 646, 944, 1490, 432], "prompt_index": 13, "split": "train", "step": 500, "student_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 13, 1084, 594, 264, 3491, 429, 358, 646], "teacher_nll": 1.2880640029907227, "teacher_suffix": [11, 714, 358, 1414, 432, 594, 264, 3491, 13, 1084, 594, 264, 3491, 429, 358, 646], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.001928949262946844, "overlap_pct": 100.0, "prompt": [1, 477, 11, 323, 279, 62], "prompt_index": 14, "split": "train", "step": 500, "student_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.3178788721561432, "teacher_suffix": [716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.012487268075346947, "overlap_pct": 56.25, "prompt": [1, 576, 1102, 315, 264, 729], "prompt_index": 15, "split": "train", "step": 500, "student_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 1459, 1380, 279, 729, 374, 2598, 13], "teacher_nll": 1.185002326965332, "teacher_suffix": [1618, 374, 279, 897, 315, 279, 729, 518, 279, 2661, 5693, 13, 2055, 11, 421, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006123822648078203, "overlap_pct": 100.0, "prompt": [1, 291, 504, 279, 1467, 11], "prompt_index": 16, "split": "train", "step": 500, "student_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "teacher_nll": 1.0804258584976196, "teacher_suffix": [1128, 374, 279, 1887, 4522, 315, 279, 21085, 11974, 785, 21085, 374, 911, 279, 12650, 315], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004772735759615898, "overlap_pct": 93.75, "prompt": [1, 702, 1012, 1483, 311, 7512], "prompt_index": 17, "split": "train", "step": 500, "student_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 6534, 1189, 758], "teacher_nll": 1.7471481561660767, "teacher_suffix": [279, 7286, 315, 330, 1782, 1584, 315, 1660, 304, 264, 3654, 2309, 476, 2971, 1189, 758], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006541906390339136, "overlap_pct": 100.0, "prompt": [1, 264, 11245, 2168, 429, 702], "prompt_index": 18, "split": "train", "step": 500, "student_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "teacher_nll": 1.5488107204437256, "teacher_suffix": [1012, 1483, 304, 279, 3267, 369, 279, 7428, 315, 12876, 11, 323, 374, 1431, 1660, 1483], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004279868211597204, "overlap_pct": 100.0, "prompt": [1, 3555, 374, 264, 5714, 30], "prompt_index": 19, "split": "train", "step": 500, "student_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "teacher_nll": 1.0117632150650024, "teacher_suffix": [330, 4710, 1, 2077, 1, 374, 264, 4647, 1483, 311, 7512, 279, 15274, 315, 458, 1538], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.00865198764950037, "overlap_pct": 68.75, "prompt": [1, 19257, 311, 279, 1251, 315], "prompt_index": 20, "split": "train", "step": 500, "student_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 11, 323, 614, 264, 3654], "teacher_nll": 0.8751376867294312, "teacher_suffix": [279, 3146, 879, 614, 8643, 279, 4231, 315, 220, 16, 23, 323, 525, 17013, 369, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004961860366165638, "overlap_pct": 100.0, "prompt": [1, 1156, 3019, 304, 279, 1882], "prompt_index": 21, "split": "train", "step": 500, "student_suffix": [315, 279, 4401, 315, 279, 1849, 11, 323, 279, 2086, 3019, 304, 279, 1882, 315, 279], "teacher_nll": 1.238858938217163, "teacher_suffix": [315, 279, 4401, 315, 279, 1849, 11, 323, 279, 2086, 3019, 304, 279, 1882, 315, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.00891088042408228, "overlap_pct": 87.5, "prompt": [1, 2701, 1467, 25, 4710, 785], "prompt_index": 22, "split": "train", "step": 500, "student_suffix": [1156, 3019, 304, 279, 1882, 315, 11220, 264, 501, 1985, 374, 311, 8253, 279, 3081, 13], "teacher_nll": 1.6162257194519043, "teacher_suffix": [1156, 3019, 304, 279, 1882, 315, 11220, 264, 501, 1985, 374, 311, 8253, 279, 2169, 3081], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006108571775257587, "overlap_pct": 100.0, "prompt": [1, 315, 279, 3364, 13, 576], "prompt_index": 23, "split": "train", "step": 500, "student_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "teacher_nll": 1.0802816152572632, "teacher_suffix": [3364, 374, 911, 264, 3908, 3743, 6941, 444, 10524, 879, 374, 4460, 311, 1477, 1059, 5558], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.024576541036367416, "overlap_pct": 75.0, "prompt": [1, 279, 897, 5927, 553, 279], "prompt_index": 24, "split": "train", "step": 500, "student_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1459, 315, 279, 729], "teacher_nll": 1.001452088356018, "teacher_suffix": [729, 374, 279, 1852, 438, 279, 897, 315, 279, 729, 518, 279, 1156, 5693, 11, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.003508536843582988, "overlap_pct": 100.0, "prompt": [1, 2055, 11, 369, 279, 1140], "prompt_index": 25, "split": "train", "step": 500, "student_suffix": [315, 5109, 11, 582, 646, 990, 279, 2701, 5486, 25, 1156, 11, 582, 646, 1855, 264], "teacher_nll": 1.3521389961242676, "teacher_suffix": [315, 5109, 11, 582, 646, 990, 279, 2701, 5486, 25, 1156, 11, 582, 646, 1855, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.006309054791927338, "overlap_pct": 93.75, "prompt": [1, 28469, 9363, 525, 279], "prompt_index": 26, "split": "train", "step": 500, "student_suffix": [1887, 9363, 429, 5240, 279, 4401, 315, 279, 8457, 13, 576, 1887, 9363, 525, 279, 6174], "teacher_nll": 1.6643030643463135, "teacher_suffix": [1887, 9363, 429, 5240, 279, 4401, 315, 279, 8457, 13, 576, 1887, 9363, 525, 279, 11137], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.004288874100893736, "overlap_pct": 100.0, "prompt": [1, 1012, 13570, 14975, 304, 279], "prompt_index": 27, "split": "train", "step": 500, "student_suffix": [2070, 315, 37596, 11, 323, 279, 3920, 315, 279, 5888, 315, 279, 1372, 1849, 374, 264], "teacher_nll": 1.7780532836914062, "teacher_suffix": [2070, 315, 37596, 11, 323, 279, 3920, 315, 279, 5888, 315, 279, 1372, 1849, 374, 264], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.008818188682198524, "overlap_pct": 100.0, "prompt": [1, 1887, 2242, 1294, 2827, 8], "prompt_index": 28, "split": "train", "step": 500, "student_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "teacher_nll": 0.6071682572364807, "teacher_suffix": [341, 262, 739, 2532, 2913, 445, 9707, 11, 4337, 11142, 630, 888, 536, 4697, 341, 262], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0022831885144114494, "overlap_pct": 100.0, "prompt": [1, 62, 716, 477, 11, 323], "prompt_index": 29, "split": "train", "step": 500, "student_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "teacher_nll": 0.5793318748474121, "teacher_suffix": [279, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716, 716], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.002777066547423601, "overlap_pct": 100.0, "prompt": [1, 1512, 429, 374, 11, 279], "prompt_index": 30, "split": "train", "step": 500, "student_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "teacher_nll": 0.7016849517822266, "teacher_suffix": [1156, 323, 2086, 323, 4843, 323, 11737, 323, 17702, 323, 25031, 323, 30387, 323, 36377, 323], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.008451608940958977, "overlap_pct": 100.0, "prompt": [1, 74595, 11, 714, 279, 1467], "prompt_index": 31, "split": "train", "step": 500, "student_suffix": [374, 537, 304, 279, 1852, 4128, 438, 279, 4024, 13, 2055, 11, 279, 1196, 374, 10161], "teacher_nll": 1.5654146671295166, "teacher_suffix": [374, 537, 304, 279, 1852, 4128, 438, 279, 4024, 13, 2055, 11, 279, 1196, 374, 10161], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.011859557591378689, "overlap_pct": 100.0, "prompt": [1, 4438, 374, 279, 2768], "prompt_index": 0, "split": "heldout", "step": 500, "student_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "teacher_nll": 1.3870584964752197, "teacher_suffix": [315, 279, 3364, 13, 576, 3364, 374, 911, 279, 11618, 315, 264, 3908, 3743, 6941, 444], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.014797080308198929, "overlap_pct": 100.0, "prompt": [1, 1516, 374, 264, 1296, 4339], "prompt_index": 1, "split": "heldout", "step": 500, "student_suffix": [291, 504, 279, 1467, 11, 714, 279, 1467, 374, 537, 304, 6364, 13, 5209, 14683, 279], "teacher_nll": 1.694549560546875, "teacher_suffix": [291, 504, 279, 1467, 11, 714, 279, 1467, 374, 537, 304, 6364, 13, 5209, 14683, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.0424787737429142, "overlap_pct": 100.0, "prompt": [1, 785, 1401, 315, 279, 1967], "prompt_index": 2, "split": "heldout", "step": 500, "student_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "teacher_nll": 1.1354330778121948, "teacher_suffix": [43059, 21938, 315, 7148, 1, 374, 264, 11245, 2168, 429, 702, 1012, 13570, 14975, 304, 279], "top3_overlap_pct": 100.0}
+{"kind": "eval_detail", "kl": 0.012519733980298042, "overlap_pct": 100.0, "prompt": [1, 3198, 279, 1296, 25, 220], "prompt_index": 3, "split": "heldout", "step": 500, "student_suffix": [16, 24, 24, 15, 82, 11, 220, 17, 15, 15, 15, 82, 11, 220, 17, 15], "teacher_nll": 0.7968597412109375, "teacher_suffix": [16, 24, 24, 15, 82, 11, 220, 17, 15, 15, 15, 82, 11, 220, 17, 15], "top3_overlap_pct": 100.0}
+{"eval_seconds": 29.971646161051467, "heldout_kl": 0.020413786405697465, "heldout_overlap_pct": 100.0, "heldout_teacher_nll": 1.2534752190113068, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 500, "train_kl": 0.00897148118383484, "train_overlap_pct": 87.5, "train_teacher_nll": 1.1280369330197573, "train_top3_overlap_pct": 100.0}
+{"eval_rows": [{"eval_seconds": 30.17380491498625, "heldout_kl": 0.02159872278571129, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2855286598205566, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 0, "train_kl": 0.03419336079969071, "train_overlap_pct": 48.4375, "train_teacher_nll": 1.1607198836281896, "train_top3_overlap_pct": 99.21875}, {"eval_seconds": 30.525471827946603, "heldout_kl": 0.020449104020372033, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2824704349040985, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 50, "train_kl": 0.022653029322100338, "train_overlap_pct": 63.8671875, "train_teacher_nll": 1.1562771378085017, "train_top3_overlap_pct": 99.609375}, {"eval_seconds": 30.22550792200491, "heldout_kl": 0.02109817648306489, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2721475958824158, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 100, "train_kl": 0.017031581031915266, "train_overlap_pct": 66.015625, "train_teacher_nll": 1.1411776384338737, "train_top3_overlap_pct": 99.8046875}, {"eval_seconds": 29.956645947007928, "heldout_kl": 0.021199961425736547, "heldout_overlap_pct": 64.0625, "heldout_teacher_nll": 1.2564734816551208, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 250, "train_kl": 0.010974834556691349, "train_overlap_pct": 74.609375, "train_teacher_nll": 1.1296512195840478, "train_top3_overlap_pct": 100.0}, {"eval_seconds": 29.971646161051467, "heldout_kl": 0.020413786405697465, "heldout_overlap_pct": 100.0, "heldout_teacher_nll": 1.2534752190113068, "heldout_top3_overlap_pct": 100.0, "kind": "eval_summary", "step": 500, "train_kl": 0.00897148118383484, "train_overlap_pct": 87.5, "train_teacher_nll": 1.1280369330197573, "train_top3_overlap_pct": 100.0}], "kind": "training_summary", "mean_step_seconds": 0.4086342146942625, "median_step_seconds": 0.40765208154334687, "peak_allocated_mib": 12575.6591796875, "peak_reserved_mib": 12642.0, "sigma_pct": 1.3272384513411561, "sigma_step_seconds": 0.005423550422758224, "steps": 500}
