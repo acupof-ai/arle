@@ -1,6 +1,6 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
-use autograd::backend::{bf16_bits_to_f32, cpu_matmul_bt_forward};
+use autograd::backend::{bf16_bits_to_f32, cpu_embedding_forward, cpu_matmul_bt_forward};
 use autograd::backend_cuda::CudaBackend;
 use autograd::Backend;
 
@@ -91,4 +91,66 @@ fn cuda_matmul_bt_accepts_frozen_bf16_rhs() {
     let expected_shape = vec![2, 3];
     assert_eq!(expected_shape, out_shape);
     assert_close(&got, &expected, 2e-3, 2e-3);
+}
+
+#[test]
+fn cuda_embedding_accepts_frozen_bf16_table() {
+    let backend = CudaBackend::new(0).expect("cuda backend");
+    let table_shape = [5, 3];
+    let table_f32 = [
+        0.0_f32, 0.25, -0.5, 1.0, -1.25, 2.5, 3.0, 4.0, -5.0, 0.125, 0.5, 0.875, -2.0, -3.0, -4.0,
+    ];
+    let table_bits: Vec<u16> = table_f32
+        .iter()
+        .map(|&value| f32_to_bf16_bits_round_nearest_even(value))
+        .collect();
+    let table_quantized: Vec<f32> = table_bits
+        .iter()
+        .map(|&bits| bf16_bits_to_f32(bits))
+        .collect();
+    let ids = [3_i32, 1, 4, 0];
+
+    let table = backend
+        .upload_bf16_bits(&table_bits, &table_shape)
+        .expect("upload bf16 embedding");
+    let out = backend
+        .embedding(&table, &table_shape, &ids)
+        .expect("embedding bf16 table");
+    let got = backend.readback(&out).expect("readback embedding");
+    let expected = cpu_embedding_forward(&table_quantized, table_shape[0], table_shape[1], &ids)
+        .expect("cpu embedding");
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn cuda_embedding_from_f32_ids_accepts_frozen_bf16_table() {
+    let backend = CudaBackend::new(0).expect("cuda backend");
+    let table_shape = [4, 4];
+    let table_f32 = [
+        0.0_f32, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, -1.0, -1.25, -1.5, -1.75, 2.0, 2.25, 2.5,
+        2.75,
+    ];
+    let table_bits: Vec<u16> = table_f32
+        .iter()
+        .map(|&value| f32_to_bf16_bits_round_nearest_even(value))
+        .collect();
+    let table_quantized: Vec<f32> = table_bits
+        .iter()
+        .map(|&bits| bf16_bits_to_f32(bits))
+        .collect();
+    let ids_f32 = [2.0_f32, 0.0, 3.0];
+    let ids_i32 = [2_i32, 0, 3];
+
+    let table = backend
+        .upload_bf16_bits(&table_bits, &table_shape)
+        .expect("upload bf16 embedding");
+    let ids = backend.upload(&ids_f32, &[3]).expect("upload f32 ids");
+    let out = backend
+        .embedding_from_f32_ids(&table, &table_shape, &ids, ids_f32.len())
+        .expect("embedding bf16 table from f32 ids");
+    let got = backend.readback(&out).expect("readback embedding");
+    let expected =
+        cpu_embedding_forward(&table_quantized, table_shape[0], table_shape[1], &ids_i32)
+            .expect("cpu embedding");
+    assert_eq!(got, expected);
 }

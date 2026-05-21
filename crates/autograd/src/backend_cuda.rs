@@ -3691,14 +3691,6 @@ fn cuda_embedding_device(
     }
     let vocab = table_shape[0];
     let dim = table_shape[1];
-    let d_w = backend.cuda_slice(table, "embedding")?;
-    if d_w.len() != vocab * dim {
-        return Err(AutogradError::DataLengthMismatch {
-            len: d_w.len(),
-            shape: table_shape.to_vec(),
-            size: vocab * dim,
-        });
-    }
     let n_ids = ids.len();
     let out_len = n_ids * dim;
     let d_ids = backend
@@ -3718,23 +3710,73 @@ fn cuda_embedding_device(
         .map_err(|_| AutogradError::TapeInvariant("cuda embedding dim exceeds i32"))?;
 
     const BLOCK: u32 = 256;
-    launch_rows(
-        &backend.stream,
-        backend.kernels.function("embedding_f32")?,
-        n_ids,
-        BLOCK,
-        0,
-        |mut builder| {
-            builder
-                .arg(&mut d_out)
-                .arg(d_w)
-                .arg(&d_ids)
-                .arg(&n_i32)
-                .arg(&vocab_i32)
-                .arg(&dim_i32);
-            builder
-        },
-    )?;
+    match table {
+        DeviceHandle::Cuda(storage) => {
+            let d_w = backend.cuda_storage_slice(storage)?;
+            if d_w.len() != vocab * dim {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: d_w.len(),
+                    shape: table_shape.to_vec(),
+                    size: vocab * dim,
+                });
+            }
+            launch_rows(
+                &backend.stream,
+                backend.kernels.function("embedding_f32")?,
+                n_ids,
+                BLOCK,
+                0,
+                |mut builder| {
+                    builder
+                        .arg(&mut d_out)
+                        .arg(d_w)
+                        .arg(&d_ids)
+                        .arg(&n_i32)
+                        .arg(&vocab_i32)
+                        .arg(&dim_i32);
+                    builder
+                },
+            )?;
+        }
+        DeviceHandle::CudaBf16(storage) => {
+            let d_w = backend.cuda_bf16_storage_slice(storage)?;
+            if d_w.len() != vocab * dim {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: d_w.len(),
+                    shape: table_shape.to_vec(),
+                    size: vocab * dim,
+                });
+            }
+            launch_rows(
+                &backend.stream,
+                backend.kernels.function("embedding_bf16_to_f32")?,
+                n_ids,
+                BLOCK,
+                0,
+                |mut builder| {
+                    builder
+                        .arg(&mut d_out)
+                        .arg(d_w)
+                        .arg(&d_ids)
+                        .arg(&n_i32)
+                        .arg(&vocab_i32)
+                        .arg(&dim_i32);
+                    builder
+                },
+            )?;
+        }
+        DeviceHandle::Cpu(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding a cpu device handle",
+            ));
+        }
+        #[cfg(feature = "metal")]
+        DeviceHandle::Metal(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding a metal device handle",
+            ));
+        }
+    }
 
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
@@ -3755,15 +3797,7 @@ fn cuda_embedding_from_f32_ids_device(
     }
     let vocab = table_shape[0];
     let dim = table_shape[1];
-    let d_w = backend.cuda_slice(table, "embedding_from_f32_ids")?;
     let d_ids = backend.cuda_slice(ids, "embedding_from_f32_ids")?;
-    if d_w.len() != vocab * dim {
-        return Err(AutogradError::DataLengthMismatch {
-            len: d_w.len(),
-            shape: table_shape.to_vec(),
-            size: vocab * dim,
-        });
-    }
     if d_ids.len() != n_ids {
         return Err(AutogradError::DataLengthMismatch {
             len: d_ids.len(),
@@ -3785,23 +3819,73 @@ fn cuda_embedding_from_f32_ids_device(
         .map_err(|_| AutogradError::TapeInvariant("cuda embedding dim exceeds i32"))?;
 
     const BLOCK: u32 = 256;
-    launch_rows(
-        &backend.stream,
-        backend.kernels.function("embedding_f32_ids_f32")?,
-        n_ids,
-        BLOCK,
-        0,
-        |mut builder| {
-            builder
-                .arg(&mut d_out)
-                .arg(d_w)
-                .arg(d_ids)
-                .arg(&n_i32)
-                .arg(&vocab_i32)
-                .arg(&dim_i32);
-            builder
-        },
-    )?;
+    match table {
+        DeviceHandle::Cuda(storage) => {
+            let d_w = backend.cuda_storage_slice(storage)?;
+            if d_w.len() != vocab * dim {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: d_w.len(),
+                    shape: table_shape.to_vec(),
+                    size: vocab * dim,
+                });
+            }
+            launch_rows(
+                &backend.stream,
+                backend.kernels.function("embedding_f32_ids_f32")?,
+                n_ids,
+                BLOCK,
+                0,
+                |mut builder| {
+                    builder
+                        .arg(&mut d_out)
+                        .arg(d_w)
+                        .arg(d_ids)
+                        .arg(&n_i32)
+                        .arg(&vocab_i32)
+                        .arg(&dim_i32);
+                    builder
+                },
+            )?;
+        }
+        DeviceHandle::CudaBf16(storage) => {
+            let d_w = backend.cuda_bf16_storage_slice(storage)?;
+            if d_w.len() != vocab * dim {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: d_w.len(),
+                    shape: table_shape.to_vec(),
+                    size: vocab * dim,
+                });
+            }
+            launch_rows(
+                &backend.stream,
+                backend.kernels.function("embedding_bf16_ids_f32")?,
+                n_ids,
+                BLOCK,
+                0,
+                |mut builder| {
+                    builder
+                        .arg(&mut d_out)
+                        .arg(d_w)
+                        .arg(d_ids)
+                        .arg(&n_i32)
+                        .arg(&vocab_i32)
+                        .arg(&dim_i32);
+                    builder
+                },
+            )?;
+        }
+        DeviceHandle::Cpu(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding_from_f32_ids a cpu device handle",
+            ));
+        }
+        #[cfg(feature = "metal")]
+        DeviceHandle::Metal(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding_from_f32_ids a metal device handle",
+            ));
+        }
+    }
 
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
