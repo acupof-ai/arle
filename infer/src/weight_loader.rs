@@ -9,14 +9,14 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::{info, warn};
 use memmap2::Mmap;
-use safetensors::{SafeTensors, tensor::Dtype};
+use safetensors::{tensor::Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
 use crate::gguf::{
-    self, GgufFile, find_tensor_name, load_matrix_v_reorder_rows_bf16_host, load_vector_bf16_host,
-    load_vector_offset_norm_bf16_host,
+    self, find_tensor_name, load_matrix_v_reorder_rows_bf16_host, load_vector_bf16_host,
+    load_vector_offset_norm_bf16_host, GgufFile,
 };
 use crate::quant::QuantMeta;
 use crate::tp::{TpLoadContext, TpShardAxis};
@@ -628,6 +628,194 @@ fn detect_uniform_quant_layout(
     Ok((orig_k, group_size, bits))
 }
 
+struct GptqModelW4Layout {
+    packed: Vec<u8>,
+    scales: Vec<bf16>,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+}
+
+fn read_u32_le(data: &[u8], idx: usize) -> Result<u32> {
+    let offset = idx * std::mem::size_of::<u32>();
+    let bytes = data
+        .get(offset..offset + std::mem::size_of::<u32>())
+        .ok_or_else(|| anyhow::anyhow!("u32 index {idx} out of range"))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn scale_to_bf16(data: &[u8], dtype: Dtype, idx: usize) -> Result<bf16> {
+    match dtype {
+        Dtype::BF16 => {
+            let offset = idx * std::mem::size_of::<bf16>();
+            let bytes = data
+                .get(offset..offset + std::mem::size_of::<bf16>())
+                .ok_or_else(|| anyhow::anyhow!("bf16 scale index {idx} out of range"))?;
+            Ok(bf16::from_le_bytes([bytes[0], bytes[1]]))
+        }
+        Dtype::F16 => {
+            let offset = idx * std::mem::size_of::<half::f16>();
+            let bytes = data
+                .get(offset..offset + std::mem::size_of::<half::f16>())
+                .ok_or_else(|| anyhow::anyhow!("f16 scale index {idx} out of range"))?;
+            Ok(bf16::from_f32(
+                half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32(),
+            ))
+        }
+        Dtype::F32 => {
+            let offset = idx * std::mem::size_of::<f32>();
+            let bytes = data
+                .get(offset..offset + std::mem::size_of::<f32>())
+                .ok_or_else(|| anyhow::anyhow!("f32 scale index {idx} out of range"))?;
+            Ok(bf16::from_f32(f32::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ])))
+        }
+        dtype => anyhow::bail!("unsupported GPTQModel scales dtype {dtype:?}"),
+    }
+}
+
+fn validate_symmetric_gptq_qzeros(
+    name: &str,
+    qzeros: safetensors::tensor::TensorView<'_>,
+) -> Result<()> {
+    anyhow::ensure!(
+        qzeros.dtype() == Dtype::I32 || qzeros.dtype() == Dtype::U32,
+        "{name}: GPTQModel qzeros dtype {:?} is unsupported; expected I32/U32",
+        qzeros.dtype()
+    );
+    anyhow::ensure!(
+        qzeros
+            .data()
+            .len()
+            .is_multiple_of(std::mem::size_of::<u32>()),
+        "{name}: GPTQModel qzeros byte length {} is not u32-aligned",
+        qzeros.data().len()
+    );
+    for (word_idx, bytes) in qzeros
+        .data()
+        .chunks_exact(std::mem::size_of::<u32>())
+        .enumerate()
+    {
+        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        for nibble_idx in 0..8 {
+            let nibble = (word >> (nibble_idx * 4)) & 0x0f;
+            anyhow::ensure!(
+                nibble == 7,
+                "{name}: GPTQModel qzeros contains non-symmetric zero-point \
+                 nibble {nibble} at word {word_idx} nibble {nibble_idx}; \
+                 only implicit symmetric zero-point 8 is supported"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn experimental_gptqmodel_w4_enabled() -> bool {
+    matches!(
+        std::env::var("INFER_EXPERIMENTAL_GPTQMODEL_W4").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+fn maybe_convert_gptqmodel_w4_layout(
+    name: &str,
+    qweight_data: &[u8],
+    qweight_dtype: Dtype,
+    qweight_shape: &[usize],
+    scales_data: &[u8],
+    scales_dtype: Dtype,
+    scales_shape: &[usize],
+    qzeros: Option<safetensors::tensor::TensorView<'_>>,
+    config: QuantLoadConfig,
+) -> Result<Option<GptqModelW4Layout>> {
+    if config.bits != Some(4) || qweight_shape.len() != 2 || scales_shape.len() != 2 {
+        return Ok(None);
+    }
+    let Some(group_size) = config.group_size else {
+        return Ok(None);
+    };
+    if group_size == 0 {
+        return Ok(None);
+    }
+    if !(qweight_dtype == Dtype::I32 || qweight_dtype == Dtype::U32) {
+        return Ok(None);
+    }
+
+    let gptq_rows = qweight_shape[0];
+    let rows = qweight_shape[1];
+    let cols = gptq_rows * 8;
+    let num_groups = cols / group_size;
+    if !cols.is_multiple_of(group_size) || scales_shape[0] != num_groups || scales_shape[1] != rows
+    {
+        return Ok(None);
+    }
+
+    anyhow::ensure!(
+        experimental_gptqmodel_w4_enabled(),
+        "{name}: detected GPTQModel W4 physical layout \
+         (qweight [K/8,N], scales [K/group,N]) but it is not licensed for \
+         default inference yet. Set INFER_EXPERIMENTAL_GPTQMODEL_W4=1 to \
+         reproduce the loader experiment; generation-quality gate failed on \
+         DavidWen2025/Qwen3.5-9B-GPTQ-4bit and needs layer-local parity before \
+         this path can be default."
+    );
+
+    if let Some(qzeros) = qzeros {
+        validate_symmetric_gptq_qzeros(name, qzeros)?;
+    }
+
+    anyhow::ensure!(
+        qweight_data.len() == gptq_rows * rows * std::mem::size_of::<u32>(),
+        "{name}: GPTQModel qweight byte length mismatch: expected {}, got {}",
+        gptq_rows * rows * std::mem::size_of::<u32>(),
+        qweight_data.len()
+    );
+    let scale_elem_size = match scales_dtype {
+        Dtype::BF16 | Dtype::F16 => 2,
+        Dtype::F32 => 4,
+        dtype => anyhow::bail!("{name}: unsupported GPTQModel scales dtype {dtype:?}"),
+    };
+    anyhow::ensure!(
+        scales_data.len() == num_groups * rows * scale_elem_size,
+        "{name}: GPTQModel scales byte length mismatch: expected {}, got {}",
+        num_groups * rows * scale_elem_size,
+        scales_data.len()
+    );
+
+    let mut packed = vec![0u8; rows * cols / 2];
+    for k in 0..cols {
+        let gptq_row = k / 8;
+        let bit_pos = (k % 8) * 4;
+        for row in 0..rows {
+            let word = read_u32_le(qweight_data, gptq_row * rows + row)?;
+            let nibble = ((word >> bit_pos) & 0x0f) as u8;
+            let byte_idx = row * (cols / 2) + k / 2;
+            if k % 2 == 0 {
+                packed[byte_idx] = (packed[byte_idx] & 0xf0) | nibble;
+            } else {
+                packed[byte_idx] = (packed[byte_idx] & 0x0f) | (nibble << 4);
+            }
+        }
+    }
+
+    let mut scales = vec![bf16::ZERO; rows * num_groups];
+    for g in 0..num_groups {
+        for row in 0..rows {
+            scales[row * num_groups + g] =
+                scale_to_bf16(scales_data, scales_dtype, g * rows + row)?;
+        }
+    }
+
+    Ok(Some(GptqModelW4Layout {
+        packed,
+        scales,
+        rows,
+        cols,
+        group_size,
+    }))
+}
+
 fn detect_turboquant_layout(
     name: &str,
     packed_cols: usize,
@@ -876,6 +1064,40 @@ pub(crate) fn load_tensor_2d_maybe_quantized_with_config(
 
         let qw_shape = qw_tensor.shape();
         let sc_shape = sc_tensor.shape();
+        let qzeros_name = name.replace(".weight", ".qzeros");
+        let qzeros_tensor = find_tensor(shards, weight_map, &qzeros_name).ok();
+        if let Some(layout) = maybe_convert_gptqmodel_w4_layout(
+            name,
+            qw_tensor.data(),
+            qw_tensor.dtype(),
+            qw_shape,
+            sc_tensor.data(),
+            sc_tensor.dtype(),
+            sc_shape,
+            qzeros_tensor,
+            config,
+        )? {
+            log::info!(
+                "Loaded GPTQModel {}: [{}x{}] INT4, group_size={} qweight {:?} scales {:?}",
+                name,
+                layout.rows,
+                layout.cols,
+                layout.group_size,
+                qw_shape,
+                sc_shape
+            );
+            let mut mat = DeviceMatrix::from_quantized_int4(
+                ctx,
+                &layout.packed,
+                &layout.scales,
+                layout.rows,
+                layout.cols,
+                layout.group_size,
+            )?;
+            mat.repack_for_marlin(ctx)?;
+            return Ok(mat);
+        }
+
         let rows = qw_shape[0];
         let qw_cols = qw_shape[1];
         let num_groups = sc_shape[1];
@@ -1277,8 +1499,8 @@ pub(crate) fn precompute_rope(
 fn qwen35_to_qwen3_rope_scaling(
     src: &qwen35_spec::RopeScalingConfig,
 ) -> qwen3_spec::RopeScalingConfig {
-    use qwen3_spec::RopeScalingConfig as Dst;
     use qwen35_spec::RopeScalingConfig as Src;
+    use qwen3_spec::RopeScalingConfig as Dst;
     match src {
         Src::Yarn {
             factor,
@@ -1873,6 +2095,68 @@ mod tests {
     }
 
     #[test]
+    fn gptqmodel_w4_layout_converts_to_internal_row_major() {
+        // SAFETY: this unit test is single-threaded with respect to the loader
+        // branch it exercises; no concurrent environment readers are spawned.
+        unsafe {
+            std::env::set_var("INFER_EXPERIMENTAL_GPTQMODEL_W4", "1");
+        }
+        let n0 = (0..8u32).fold(0u32, |acc, k| acc | (k << (k * 4)));
+        let n1 = 0x8888_8888u32;
+        let qweight = [n0, n1]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let scales = [half::f16::from_f32(0.25), half::f16::from_f32(0.5)]
+            .into_iter()
+            .flat_map(half::f16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let layout = maybe_convert_gptqmodel_w4_layout(
+            "layer.weight",
+            &qweight,
+            Dtype::I32,
+            &[1, 2],
+            &scales,
+            Dtype::F16,
+            &[1, 2],
+            None,
+            QuantLoadConfig {
+                group_size: Some(8),
+                bits: Some(4),
+                ..QuantLoadConfig::default()
+            },
+        )
+        .unwrap()
+        .expect("GPTQModel layout should be detected");
+
+        assert_eq!(layout.rows, 2);
+        assert_eq!(layout.cols, 8);
+        assert_eq!(layout.group_size, 8);
+        assert_eq!(
+            layout.packed,
+            [0x10, 0x32, 0x54, 0x76, 0x88, 0x88, 0x88, 0x88]
+        );
+        assert_eq!(layout.scales, [bf16::from_f32(0.25), bf16::from_f32(0.5)]);
+    }
+
+    #[test]
+    fn gptqmodel_w4_layout_rejects_non_symmetric_qzeros() {
+        // SAFETY: this unit test is single-threaded with respect to the loader
+        // branch it exercises; no concurrent environment readers are spawned.
+        unsafe {
+            std::env::set_var("INFER_EXPERIMENTAL_GPTQMODEL_W4", "1");
+        }
+        let qzeros = 0x7777_7776u32.to_le_bytes();
+        let qzeros = safetensors::tensor::TensorView::new(Dtype::I32, vec![1], &qzeros)
+            .expect("qzeros tensor");
+        let err = validate_symmetric_gptq_qzeros("layer.weight", qzeros)
+            .expect_err("non-symmetric qzeros must be rejected")
+            .to_string();
+        assert!(err.contains("non-symmetric"));
+    }
+
+    #[test]
     fn turboquant_layout_requires_explicit_bits() {
         let err = detect_turboquant_layout(
             "w",
@@ -1918,11 +2202,10 @@ mod tests {
                 version: crate::quant::AwqVersion::Gemm,
             }));
         assert!(awq.enabled());
-        assert!(
-            awq.unsupported_reason
-                .expect("zero-point AWQ must be rejected")
-                .contains("AWQ")
-        );
+        assert!(awq
+            .unsupported_reason
+            .expect("zero-point AWQ must be rejected")
+            .contains("AWQ"));
 
         let gptq =
             QuantLoadConfig::from_meta(&crate::quant::QuantMeta::Gptq(crate::quant::GptqConfig {
@@ -1933,11 +2216,10 @@ mod tests {
                 checkpoint_format: None,
             }));
         assert!(gptq.enabled());
-        assert!(
-            gptq.unsupported_reason
-                .expect("asymmetric GPTQ must be rejected")
-                .contains("GPTQ")
-        );
+        assert!(gptq
+            .unsupported_reason
+            .expect("asymmetric GPTQ must be rejected")
+            .contains("GPTQ"));
     }
 
     #[test]
@@ -2177,7 +2459,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
     fn fp8_weight_scale_inv_loads_single_file_without_weight_map() -> Result<()> {
-        use safetensors::tensor::{TensorView, serialize};
+        use safetensors::tensor::{serialize, TensorView};
 
         let ctx = DeviceContext::new()?;
         let weights = [0x38, 0xb8, 0x40, 0xc0]; // 1, -1, 2, -2 in E4M3FN

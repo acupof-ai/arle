@@ -1,0 +1,14 @@
+total 11G
+-rw-r--r-- 1 ckl ckl 7.6K May 21 22:05 chat_template.jinja
+-rw-r--r-- 1 ckl ckl 5.1K May 21 22:05 config.json
+-rw-r--r-- 1 ckl ckl   51 May 21 22:05 configuration.json
+-rw-r--r-- 1 ckl ckl 3.2G May 21 22:07 extra_weights.safetensors
+-rw-r--r-- 1 ckl ckl  199 May 21 22:05 generation_config.json
+-rw-r--r-- 1 ckl ckl 4.0G May 21 22:08 model-00001-of-00002.safetensors
+-rw-r--r-- 1 ckl ckl 3.2G May 21 22:07 model-00002-of-00002.safetensors
+-rw-r--r-- 1 ckl ckl 124K May 21 22:05 model.safetensors.index.json
+-rw-r--r-- 1 ckl ckl  390 May 21 22:05 preprocessor_config.json
+-rw-r--r-- 1 ckl ckl 1.1K May 21 22:05 quantize_config.json
+-rw-r--r-- 1 ckl ckl  20M May 21 22:05 tokenizer.json
+-rw-r--r-- 1 ckl ckl  17K May 21 22:05 tokenizer_config.json
+-rw-r--r-- 1 ckl ckl  385 May 21 22:05 video_preprocessor_config.json
