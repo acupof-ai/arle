@@ -13,29 +13,31 @@
 
 #[cfg(not(feature = "no-cuda"))]
 use crate::{
-    AutogradError,
     backend::{
-        CudaStorage, matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
+        matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
         validate_decode_gqa_shapes, validate_qwen_decode_prepare_kv_shapes,
-        validate_qwen_decode_prepare_q_shapes,
+        validate_qwen_decode_prepare_q_shapes, CudaBf16Storage, CudaStorage,
     },
+    AutogradError,
 };
 use crate::{
-    Result,
     backend::{Backend, Device, DeviceGradClipResult, DeviceHandle},
+    Result,
 };
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/kernels.rs"]
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{KernelCache, launch_1d, launch_rows};
+use self::kernels::{launch_1d, launch_rows, KernelCache};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::sys::cublasOperation_t;
 #[cfg(not(feature = "no-cuda"))]
-use cudarc::driver::sys::{CUdeviceptr, CUresult, cuMemcpyDtoD_v2};
+use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+#[cfg(not(feature = "no-cuda"))]
+use cudarc::driver::sys::{cuMemcpyDtoD_v2, CUdeviceptr, CUresult};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
 #[cfg(not(feature = "no-cuda"))]
@@ -123,6 +125,44 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
+    fn upload_bf16_bits_slice(&self, host: &[u16], shape: &[usize]) -> Result<CudaSlice<u16>> {
+        let size = shape_size(shape);
+        if host.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+
+        self.stream.clone_htod(host).map_err(|err| {
+            let bytes = host.len().saturating_mul(std::mem::size_of::<u16>());
+            AutogradError::TapeInvariant(Box::leak(
+                format!(
+                    "cuda bf16 htod copy failed: shape={shape:?} len={} bytes={} err={err:?}",
+                    host.len(),
+                    bytes
+                )
+                .into_boxed_str(),
+            ))
+        })
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn cuda_bf16_storage_slice<'a>(
+        &self,
+        storage: &'a CudaBf16Storage,
+    ) -> Result<&'a CudaSlice<u16>> {
+        let slice = storage.slice();
+        if slice.context() != self.stream.context() {
+            return Err(AutogradError::TapeInvariant(
+                "cuda bf16 handle from different context/ordinal",
+            ));
+        }
+        Ok(slice)
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
     fn copy_bf16_device_ptr_to_local(
         &self,
         src_device_ptr: u64,
@@ -192,6 +232,34 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
+    fn local_f32_as_bf16(&self, src: &CudaSlice<f32>, len: usize) -> Result<CudaSlice<u16>> {
+        let mut out = self
+            .stream
+            .alloc_zeros::<u16>(len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (f32->bf16)"))?;
+        if len == 0 {
+            return Ok(out);
+        }
+
+        let n_i32 = i32::try_from(len)
+            .map_err(|_| AutogradError::TapeInvariant("f32->bf16 length exceeds i32"))?;
+        {
+            let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
+            let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+            launch_1d(
+                &self.stream,
+                self.kernels.function("f32_to_bf16_bits")?,
+                len,
+                |mut builder| {
+                    builder.arg(&src_ptr).arg(&dst_ptr).arg(&n_i32);
+                    builder
+                },
+            )?;
+        }
+        Ok(out)
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
     fn cuda_slice<'a>(
         &self,
         handle: &'a DeviceHandle,
@@ -199,6 +267,12 @@ impl CudaBackend {
     ) -> Result<&'a CudaSlice<f32>> {
         match handle {
             DeviceHandle::Cuda(storage) => self.cuda_storage_slice(storage),
+            DeviceHandle::CudaBf16(_) => Err(AutogradError::TapeInvariant(match op {
+                "matmul" => "cuda backend cannot matmul a bf16 handle on this f32-only path",
+                "matmul_bt" => "cuda backend cannot use bf16 handle as lhs on this matmul_bt path",
+                "embedding_from_f32_ids" => "cuda backend cannot use bf16 handle for f32 token ids",
+                _ => "cuda backend cannot operate on a bf16 handle on this f32-only path",
+            })),
             DeviceHandle::Cpu(_) => Err(AutogradError::TapeInvariant(match op {
                 "add" => "cuda backend cannot add a cpu device handle",
                 "matmul" => "cuda backend cannot matmul a cpu device handle",
@@ -216,7 +290,7 @@ impl CudaBackend {
     #[cfg(not(feature = "no-cuda"))]
     fn validate_cuda_handle_kind(&self, handle: &DeviceHandle) -> Result<()> {
         match handle {
-            DeviceHandle::Cpu(_) | DeviceHandle::Cuda(_) => Ok(()),
+            DeviceHandle::Cpu(_) | DeviceHandle::Cuda(_) | DeviceHandle::CudaBf16(_) => Ok(()),
             #[cfg(feature = "metal")]
             DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(
                 "cuda backend cannot evaluate a metal device handle",
@@ -316,6 +390,81 @@ impl CudaBackend {
             }),
         }
     }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn matmul_bt_device_f32_bf16(
+        &self,
+        a: &CudaSlice<f32>,
+        a_shape: &[usize],
+        b: &CudaSlice<u16>,
+        b_shape: &[usize],
+    ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        if a.len() != shape_size(a_shape) || b.len() != shape_size(b_shape) {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend bf16 matmul_bt handle size does not match shape",
+            ));
+        }
+
+        let out_shape = matmul_bt_output_shape(a_shape, b_shape)?;
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(AutogradError::InvalidRank {
+                expected: "both operands must be rank-2",
+                got: a_shape.len().max(b_shape.len()),
+            });
+        }
+
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = b_shape[0];
+        let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
+        let mut c_bf16 = self
+            .stream
+            .alloc_zeros::<u16>(m * n)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+        let alpha = 1.0_f32;
+        let beta = 0.0_f32;
+        {
+            let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
+            let (a_ptr, _a_guard) = a_bf16.device_ptr(&self.stream);
+            let (c_ptr, _c_guard) = c_bf16.device_ptr_mut(&self.stream);
+
+            // Same row-major cuBLAS trick as the f32 path: swap operands so the
+            // column-major output view is the row-major [M, N] buffer. Operand B
+            // is stored as BF16; the activation is rounded to BF16 on-device,
+            // accumulated in FP32, and converted back to FP32 for downstream
+            // autograd ops.
+            unsafe {
+                cublas_result::gemm_ex(
+                    *self.blas.handle(),
+                    cublasOperation_t::CUBLAS_OP_T,
+                    cublasOperation_t::CUBLAS_OP_N,
+                    n as i32,
+                    m as i32,
+                    k as i32,
+                    (&alpha) as *const f32 as *const _,
+                    b_ptr as *const _,
+                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    k as i32,
+                    a_ptr as *const _,
+                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    k as i32,
+                    (&beta) as *const f32 as *const _,
+                    c_ptr as *mut _,
+                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    n as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+                .map_err(|_| {
+                    AutogradError::TapeInvariant("cuBLAS gemm_ex failed (bf16 matmul_bt)")
+                })?;
+            }
+        }
+
+        let c = self.import_local_bf16_as_f32(&c_bf16, m * n)?;
+        Ok((c, out_shape))
+    }
 }
 
 impl Backend for CudaBackend {
@@ -334,6 +483,21 @@ impl Backend for CudaBackend {
         {
             Ok(DeviceHandle::Cuda(CudaStorage::new(
                 self.upload_slice(host, shape)?,
+            )))
+        }
+    }
+
+    fn upload_bf16_bits(&self, host: &[u16], shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (host, shape);
+            todo!("GPU required: cuda bf16 upload is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(
+                self.upload_bf16_bits_slice(host, shape)?,
             )))
         }
     }
@@ -408,6 +572,20 @@ impl Backend for CudaBackend {
                         .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
                     Ok(host)
                 }
+                DeviceHandle::CudaBf16(storage) => {
+                    let slice = self.cuda_bf16_storage_slice(storage)?;
+                    let mut host = vec![0u16; slice.len()];
+                    self.stream
+                        .memcpy_dtoh(slice, &mut host)
+                        .map_err(|_| AutogradError::TapeInvariant("cuda bf16 dtoh copy failed"))?;
+                    self.stream
+                        .synchronize()
+                        .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
+                    Ok(host
+                        .into_iter()
+                        .map(crate::backend::bf16_bits_to_f32)
+                        .collect())
+                }
                 #[cfg(feature = "metal")]
                 DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(
                     "cuda backend cannot read back a metal device handle",
@@ -473,6 +651,17 @@ impl Backend for CudaBackend {
         {
             let out_shape = matmul_bt_output_shape(a_shape, b_shape)?;
             let d_a = self.cuda_slice(a, "matmul_bt")?;
+            if let DeviceHandle::CudaBf16(storage) = b {
+                let d_b = self.cuda_bf16_storage_slice(storage)?;
+                if d_a.len() != shape_size(a_shape) || d_b.len() != shape_size(b_shape) {
+                    return Err(AutogradError::TapeInvariant(
+                        "cuda backend bf16 matmul_bt handle size does not match shape",
+                    ));
+                }
+                let (c, out_shape) = self.matmul_bt_device_f32_bf16(d_a, a_shape, d_b, b_shape)?;
+                return Ok((DeviceHandle::Cuda(CudaStorage::new(c)), out_shape));
+            }
+
             let d_b = self.cuda_slice(b, "matmul_bt")?;
             if d_a.len() != shape_size(a_shape) || d_b.len() != shape_size(b_shape) {
                 return Err(AutogradError::TapeInvariant(

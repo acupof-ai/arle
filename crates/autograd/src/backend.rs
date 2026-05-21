@@ -107,6 +107,27 @@ impl CudaStorage {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+pub struct CudaBf16Storage {
+    inner: Arc<cudarc::driver::CudaSlice<u16>>,
+}
+
+#[cfg(feature = "cuda")]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+impl CudaBf16Storage {
+    pub(crate) fn new(inner: cudarc::driver::CudaSlice<u16>) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub(crate) fn slice(&self) -> &cudarc::driver::CudaSlice<u16> {
+        self.inner.as_ref()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DeviceHandle {
     Cpu(Vec<f32>),
@@ -114,6 +135,8 @@ pub enum DeviceHandle {
     Metal(MlxHandle),
     #[cfg(feature = "cuda")]
     Cuda(CudaStorage),
+    #[cfg(feature = "cuda")]
+    CudaBf16(CudaBf16Storage),
 }
 
 type QwenDecodePrepareQHost = (Vec<f32>, Option<Vec<f32>>, Vec<usize>);
@@ -130,6 +153,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
 
     fn upload(&self, host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
         Ok(DeviceHandle::Cpu(host.to_vec()))
+    }
+
+    fn upload_bf16_bits(&self, host: &[u16], shape: &[usize]) -> Result<DeviceHandle> {
+        if shape_size(shape) != host.len() {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: shape.to_vec(),
+                size: shape_size(shape),
+            });
+        }
+        let f32_host: Vec<f32> = host.iter().map(|&bits| bf16_bits_to_f32(bits)).collect();
+        self.upload(&f32_host, shape)
     }
 
     fn import_bf16_device_ptr_as_f32(
@@ -164,6 +199,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             #[cfg(feature = "cuda")]
             DeviceHandle::Cuda(_) => Err(crate::AutogradError::TapeInvariant(
                 "device handle readback not implemented for cuda on this backend",
+            )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaBf16(_) => Err(crate::AutogradError::TapeInvariant(
+                "device handle readback not implemented for cuda bf16 on this backend",
             )),
         }
     }
@@ -1774,6 +1813,10 @@ impl Backend for CpuBackend {
             DeviceHandle::Cuda(_) => Err(crate::AutogradError::TapeInvariant(
                 "cpu backend cannot read back a cuda device handle",
             )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaBf16(_) => Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot read back a cuda bf16 device handle",
+            )),
         }
     }
 
@@ -1888,6 +1931,10 @@ fn shape_size(shape: &[usize]) -> usize {
     } else {
         shape.iter().product()
     }
+}
+
+pub fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
 }
 
 /// CPU reference implementation of row-major matmul (2D + batched 3D).
