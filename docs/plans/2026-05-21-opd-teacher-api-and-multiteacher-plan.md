@@ -53,7 +53,7 @@ Latest local inventory:
 | --- | --- | --- |
 | `Qwen/Qwen3.5-9B` BF16 | Complete, 18.0 GiB files | Fails ARLE CUDA serve on 16 GB: H2D OOM before readiness |
 | `Qwen/Qwen3.5-9B-Instruct` | Directory exists, no weights | Not usable |
-| `DavidWen2025/Qwen3.5-9B-GPTQ-4bit` | Complete, 10.35 GiB safetensors | Loader blocked: GPTQModel physical layout unsupported |
+| `DavidWen2025/Qwen3.5-9B-GPTQ-4bit` | Complete, 10.35 GiB safetensors | Experimental GPTQModel W4 loader reaches HTTP readiness behind `INFER_EXPERIMENTAL_GPTQMODEL_W4=1`; generation quality gate fails with repeated `!`, so not OPD-licensed |
 | `RedHatAI/Qwen3.5-9B-FP8-dynamic` | Metadata only | Loader blocked: compressed-tensors `.weight_scale` unsupported |
 
 Raw evidence:
@@ -207,6 +207,24 @@ Acceptance order:
 
 Do not skip directly to serve smoke; previous 9B quant attempts proved that
 `loads and decodes one token` is not a sufficient quality gate.
+
+Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
+
+1. Keep the GPTQModel W4 physical-layout branch behind
+   `INFER_EXPERIMENTAL_GPTQMODEL_W4=1` until quality is licensed.
+2. Add a layer-local projection parity harness:
+   ARLE W4A16 GEMV vs PyTorch/GPTQModel reference on the same hidden vector.
+3. If projection parity passes, scan dense fallback modules under the same
+   checkpoint: embedding, linear-attention dense tensors, final norm, and
+   untied lm_head.
+4. Re-run multi-token generation before any OPD bench or headline switch.
+
+Evidence:
+
+```text
+docs/experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-generation-kill.md
+bench-output/2026-05-22-qwen35-9b-gptq-int4-loader/
+```
 
 ## Implementation Order
 

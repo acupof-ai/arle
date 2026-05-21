@@ -17,7 +17,7 @@ bench-output/2026-05-21-qwen35-9b-local-availability/
 | --- | ---: | --- |
 | `/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B` | 19 GB | Complete BF16 Base checkpoint; not serve-usable on this 16 GB GPU. |
 | `/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-Instruct` | 4 KB | Incomplete directory; no usable checkpoint files. |
-| `/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit` | 11 GB | Complete GPTQModel-format checkpoint; blocked by loader physical-layout mismatch. |
+| `/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit` | 11 GB | Complete GPTQModel-format checkpoint; experimental loader reaches HTTP readiness, but generation-quality gate fails. |
 | `/home/ckl/.cache/modelscope/hub/RedHatAI/Qwen3___5-9B-FP8-dynamic` | 20 MB | Metadata/tokenizer only; full weights not downloaded because compressed-tensors layout is not supported by the current FP8 loader. |
 
 ## BF16 Base Serve Probe
@@ -53,10 +53,12 @@ No HTTP server was started, so no generation or OPD bench was run.
 
 ## Prior Loader Gates
 
-The two compressed candidates are already blocked by loader gates:
+The compressed candidates are blocked by loader or quality gates:
 
 - GPTQ-INT4:
   [`docs/experience/errors/2026-05-21-arle-qwen35-9b-gptq-int4-loader-kill.md`](../experience/errors/2026-05-21-arle-qwen35-9b-gptq-int4-loader-kill.md)
+- GPTQModel W4 experimental loader quality:
+  [`docs/experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-generation-kill.md`](../experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-generation-kill.md)
 - FP8 compressed-tensors:
   [`docs/experience/errors/2026-05-21-arle-qwen35-9b-fp8-compressed-tensors-layout-kill.md`](../experience/errors/2026-05-21-arle-qwen35-9b-fp8-compressed-tensors-layout-kill.md)
 
@@ -70,8 +72,10 @@ for offline quantization and parity checks, but it does not fit as a runtime
 teacher. The usable runtime path today remains the validated Qwen3.5-4B BF16
 teacher; a 9B runtime teacher needs one of these loader tranches first:
 
-1. GPTQModel physical-layout loader for `[K/8, N]` `qweight` +
-   `[K/group_size, N]` `scales`.
+1. GPTQModel layer-local parity and generation-quality fix for `[K/8, N]`
+   `qweight` + `[K/group_size, N]` `scales`. The physical-layout import can
+   reach HTTP readiness behind `INFER_EXPERIMENTAL_GPTQMODEL_W4=1`, but it is
+   not default-licensed.
 2. Compressed-tensors FP8 loader for `.weight_scale`.
 3. A new ARLE-native quantized 9B artifact that passes tensor-local parity
    before full-model serve.
