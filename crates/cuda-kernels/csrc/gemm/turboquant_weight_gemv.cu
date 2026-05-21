@@ -32,15 +32,11 @@ __device__ __forceinline__ void fwht_warp_optimized(float* smem, int tid, float&
     #pragma unroll
     for (int stride = 1; stride < 32 && stride < GROUP_SIZE; stride <<= 1) {
         float other = __shfl_xor_sync(0xFFFFFFFF, val, stride);
-        // Butterfly: if tid & stride == 0 → val = val + other, else val = other - val
-        // Equivalent to: partner gets (a+b) if lower, (a-b) if upper
+        // Butterfly matches scripts/turboquant_weights.py::fwht_numpy:
+        // lower lane gets a+b, upper lane gets a-b.
         float sum = val + other;
-        float diff = val - other;
+        float diff = other - val;
         val = (tid & stride) ? diff : sum;
-        // Correction: we need the partner to get the opposite
-        // Actually for FWHT: pair (i, i^stride), lower gets a+b, upper gets a-b
-        // With shfl_xor, both see each other's value. Lower = tid < (tid^stride).
-        // tid & stride == 0 means tid is the lower of the pair.
     }
 
     // Stages with stride >= 32: need shared memory for cross-warp communication
@@ -54,7 +50,7 @@ __device__ __forceinline__ void fwht_warp_optimized(float* smem, int tid, float&
             if (pair < GROUP_SIZE) {
                 float a = smem[tid];
                 float b = smem[pair];
-                val = (tid < pair) ? (a + b) : (a - b);
+                val = (tid < pair) ? (a + b) : (b - a);
             }
             __syncthreads();
             smem[tid] = val;
