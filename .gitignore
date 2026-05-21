@@ -20,6 +20,7 @@ models/
 .context/
 /vendor/
 bench-output/
+opd-output/
 
 # web frontend build
 web/node_modules/
