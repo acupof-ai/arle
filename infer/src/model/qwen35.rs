@@ -22,6 +22,6 @@ mod single_token_buffers;
 #[path = "qwen35/weights.rs"]
 mod weights;
 
-pub use diagnostics::Qwen35InferParityStages;
+pub use diagnostics::{Qwen35DenseModuleParityOutputs, Qwen35InferParityStages};
 pub use forward::Qwen35State;
 pub use weights::{Qwen35Model, Qwen35RuntimeConfig};
