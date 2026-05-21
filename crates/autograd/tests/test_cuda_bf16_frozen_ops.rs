@@ -1,10 +1,10 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
+use autograd::Backend;
 use autograd::backend::{
     bf16_bits_to_f32, cpu_embedding_forward, cpu_matmul_bt_forward, cpu_matmul_forward,
 };
 use autograd::backend_cuda::CudaBackend;
-use autograd::Backend;
 
 fn f32_to_bf16_bits_round_nearest_even(value: f32) -> u16 {
     let bits = value.to_bits();
