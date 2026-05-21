@@ -1,0 +1,20 @@
+{
+  "bf16_model": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B",
+  "arle_logits": "bench-output/2026-05-21-qwen35-9b-tq4-08b-opd-infer-teacher/arle-tq4-logits.json",
+  "input_ids": [
+    9419
+  ],
+  "vocab_size": 248320,
+  "torch_load_seconds": 49.2492094959598,
+  "torch_forward_seconds": 2.303936568030622,
+  "top64_max_abs": 14.546875,
+  "top64_mean_abs": 10.775253295898438,
+  "top64_max_rel": 1.3515625,
+  "top64_mean_rel": 1.0082824230194092,
+  "top64_ref_mean_abs": 10.701171875,
+  "full_vocab_max_abs": 15.25,
+  "full_vocab_mean_abs": 3.7243921756744385,
+  "full_vocab_rmse": 4.357199505475688,
+  "gate_top64_max_rel_threshold": 0.05,
+  "gate_pass": false
+}
