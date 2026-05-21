@@ -19,7 +19,10 @@ pub mod app {
         opd::{OpdStepConfig, opd_step},
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
-        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
+        qwen35_loader::{
+            load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir,
+            load_qwen35_trainable_from_hf_dir,
+        },
         trainer::extend_keep_with_params_and_grads,
     };
 
@@ -172,6 +175,12 @@ pub mod app {
     }
 
     #[derive(Debug, Clone)]
+    struct ModelDirs {
+        teacher: PathBuf,
+        student: PathBuf,
+    }
+
+    #[derive(Debug, Clone)]
     struct EvalSummary {
         step: usize,
         train_overlap_pct: f64,
@@ -192,6 +201,8 @@ pub mod app {
         eval_steps: Vec<usize>,
         prompt_source: PromptSourceArg,
         prompt_max_tokens: usize,
+        teacher_model: Option<PathBuf>,
+        student_model: Option<PathBuf>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -295,32 +306,42 @@ pub mod app {
     }
 
     fn run(student_mode: StudentMode) -> AnyResult<()> {
-        let model_dir = resolve_model_dir()?;
         let Some(args) = resolve_training_args(student_mode)? else {
             return Ok(());
         };
-        let prompts = resolve_prompts(&model_dir, &args)?;
+        let model_dirs = resolve_model_dirs(&args)?;
+        let prompts = resolve_prompts(&model_dirs.student, &args)?;
         let eval_steps = eval_steps_for(args.train_steps, &args.eval_steps);
-        print_config(&model_dir, student_mode, &args, &prompts, &eval_steps);
+        print_config(&model_dirs, student_mode, &args, &prompts, &eval_steps);
 
         let cuda_backend = Arc::new(CudaBackend::new(0)?);
         let mut store = TensorStore::with_backend(cuda_backend.clone());
         let mut tape = Tape::new();
 
         let teacher_load_started = Instant::now();
-        let teacher = load_qwen35_from_hf_dir(&model_dir, &mut store)?;
+        let teacher = load_qwen35_from_hf_dir(&model_dirs.teacher, &mut store)?;
         let teacher_load_seconds = teacher_load_started.elapsed().as_secs_f64();
         let student_load_started = Instant::now();
         let student = match student_mode.lora_config() {
-            Some(lora) => Qwen35Model::new_lora_from_base(
-                &teacher,
+            Some(lora) if same_dir(&model_dirs.teacher, &model_dirs.student) => {
+                Qwen35Model::new_lora_from_base(
+                    &teacher,
+                    lora,
+                    student_mode
+                        .lora_target_set()
+                        .unwrap_or(LoraTargetSet::AllLinear),
+                    &mut store,
+                )?
+            }
+            Some(lora) => load_qwen35_lora_from_hf_dir(
+                &model_dirs.student,
                 lora,
                 student_mode
                     .lora_target_set()
                     .unwrap_or(LoraTargetSet::AllLinear),
                 &mut store,
             )?,
-            None => load_qwen35_trainable_from_hf_dir(&model_dir, &mut store)?,
+            None => load_qwen35_trainable_from_hf_dir(&model_dirs.student, &mut store)?,
         };
         let student_load_seconds = student_load_started.elapsed().as_secs_f64();
 
@@ -330,7 +351,8 @@ pub mod app {
         let teacher_param_elements = param_element_count(&teacher_params, &store);
         let student_model_elements = param_element_count(&student_model_params, &store);
         let student_trainable_elements = param_element_count(&student_trainable_params, &store);
-        let student_base_shared_with_teacher = student_mode.lora_config().is_some();
+        let student_base_shared_with_teacher = student_mode.lora_config().is_some()
+            && same_dir(&model_dirs.teacher, &model_dirs.student);
 
         perturb_params(
             &student_trainable_params,
@@ -346,7 +368,7 @@ pub mod app {
         };
 
         println!(
-            "model_summary student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} student_base_shared_with_teacher={} hidden={} intermediate={} layers={} vocab={} num_heads={} num_kv_heads={} head_dim={} tie_word_embeddings={} rope_theta={} teacher_param_elements={} student_model_elements={} student_trainable_elements={} teacher_load_seconds={teacher_load_seconds:.6} student_load_seconds={student_load_seconds:.6}",
+            "model_summary student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} student_base_shared_with_teacher={} teacher_hidden={} teacher_intermediate={} teacher_layers={} teacher_vocab={} teacher_num_heads={} teacher_num_kv_heads={} teacher_head_dim={} student_hidden={} student_intermediate={} student_layers={} student_vocab={} student_num_heads={} student_num_kv_heads={} student_head_dim={} student_tie_word_embeddings={} student_rope_theta={} teacher_param_elements={} student_model_elements={} student_trainable_elements={} teacher_load_seconds={teacher_load_seconds:.6} student_load_seconds={student_load_seconds:.6}",
             student_mode.label(),
             student_mode.lora_config().map(|cfg| cfg.rank).unwrap_or(0),
             student_mode
@@ -358,6 +380,13 @@ pub mod app {
                 .map(LoraTargetSet::label)
                 .unwrap_or("none"),
             student_base_shared_with_teacher,
+            teacher.config().hidden_size,
+            teacher.config().intermediate_size,
+            teacher.config().num_hidden_layers,
+            teacher.config().vocab_size,
+            teacher.config().num_attention_heads,
+            teacher.config().num_key_value_heads,
+            teacher.config().head_dim,
             student.config().hidden_size,
             student.config().intermediate_size,
             student.config().num_hidden_layers,
@@ -441,18 +470,51 @@ pub mod app {
         Ok(())
     }
 
-    fn resolve_model_dir() -> AnyResult<PathBuf> {
-        let path = env::var_os("ARLE_OPD_REALCKPT_DIR")
-            .map(PathBuf::from)
+    fn resolve_model_dirs(args: &TrainingArgs) -> AnyResult<ModelDirs> {
+        let legacy_dir = env::var_os("ARLE_OPD_REALCKPT_DIR").map(PathBuf::from);
+        let teacher = args
+            .teacher_model
+            .clone()
+            .or_else(|| env::var_os("ARLE_OPD_TEACHER_DIR").map(PathBuf::from))
+            .or_else(|| legacy_dir.clone())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
-        if !path.join("config.json").is_file() || !path.join("model.safetensors").is_file() {
+        let student = args
+            .student_model
+            .clone()
+            .or_else(|| env::var_os("ARLE_OPD_STUDENT_DIR").map(PathBuf::from))
+            .or(legacy_dir)
+            .unwrap_or_else(|| teacher.clone());
+        validate_model_dir("teacher", &teacher)?;
+        validate_model_dir("student", &student)?;
+        Ok(ModelDirs { teacher, student })
+    }
+
+    fn validate_model_dir(label: &str, path: &Path) -> AnyResult<()> {
+        if !path.join("config.json").is_file() {
             return Err(format!(
-                "{} is not a complete Qwen3-0.6B ModelScope checkpoint directory",
+                "{} model dir {} is missing config.json",
+                label,
                 path.display()
             )
             .into());
         }
-        Ok(path)
+        if !path.join("model.safetensors").is_file()
+            && !path.join("model.safetensors.index.json").is_file()
+        {
+            return Err(format!(
+                "{} model dir {} is missing model.safetensors or model.safetensors.index.json",
+                label,
+                path.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn same_dir(left: &Path, right: &Path) -> bool {
+        let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+        let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+        left == right
     }
 
     fn resolve_training_args(student_mode: StudentMode) -> AnyResult<Option<TrainingArgs>> {
@@ -463,9 +525,23 @@ pub mod app {
         let mut prompt_source = PromptSourceArg::BuiltIn(PromptSetArg::Eight);
         let mut prompt_source_explicit = false;
         let mut prompt_max_tokens = DEFAULT_PROMPT_MAX_TOKENS;
+        let mut teacher_model = None;
+        let mut student_model = None;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--teacher-model" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--teacher-model requires a checkpoint directory".into());
+                    };
+                    teacher_model = Some(PathBuf::from(raw));
+                }
+                "--student-model" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--student-model requires a checkpoint directory".into());
+                    };
+                    student_model = Some(PathBuf::from(raw));
+                }
                 "--lr" => {
                     let Some(raw) = args.next() else {
                         return Err("--lr requires a positive finite f32 value".into());
@@ -534,14 +610,14 @@ pub mod app {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example {} --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train.",
+                        "usage: cargo run -p train --example {} --release --features cuda -- [--teacher-model DIR] [--student-model DIR] [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train.",
                         student_mode.usage_example()
                     );
                     return Ok(None);
                 }
                 unknown => {
                     return Err(format!(
-                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32, --prompts-file PATH, --example-prompts-file PATH, --prompt-max-tokens VALUE"
+                        "unknown argument `{unknown}`. Supported arguments: --teacher-model DIR, --student-model DIR, --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32, --prompts-file PATH, --example-prompts-file PATH, --prompt-max-tokens VALUE"
                     )
                     .into());
                 }
@@ -554,6 +630,8 @@ pub mod app {
             eval_steps,
             prompt_source,
             prompt_max_tokens,
+            teacher_model,
+            student_model,
         }))
     }
 
@@ -653,15 +731,17 @@ pub mod app {
     }
 
     fn print_config(
-        model_dir: &Path,
+        model_dirs: &ModelDirs,
         student_mode: StudentMode,
         args: &TrainingArgs,
         prompts: &PromptData,
         eval_steps: &[usize],
     ) {
         println!(
-            "config backend=cuda model_dir={} student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={:.6} prompt_source={} train_prompt_count={} heldout_prompt_count={} eval_steps={eval_steps:?}",
-            model_dir.display(),
+            "config backend=cuda teacher_model_dir={} student_model_dir={} same_model_dir={} student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={:.6} prompt_source={} train_prompt_count={} heldout_prompt_count={} eval_steps={eval_steps:?}",
+            model_dirs.teacher.display(),
+            model_dirs.student.display(),
+            same_dir(&model_dirs.teacher, &model_dirs.student),
             student_mode.label(),
             student_mode.lora_config().map(|cfg| cfg.rank).unwrap_or(0),
             student_mode

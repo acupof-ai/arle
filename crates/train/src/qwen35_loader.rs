@@ -56,7 +56,10 @@ use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::qwen35::{Qwen35Error, Qwen35Model};
+use crate::{
+    lora::{LoraConfig, LoraTargetSet},
+    qwen35::{Qwen35Error, Qwen35Model},
+};
 
 #[derive(Debug, Error)]
 pub enum LoaderError {
@@ -524,10 +527,34 @@ pub fn load_qwen35_trainable_from_hf_dir(
     }
 }
 
+/// Load a HF-format Qwen3 / Qwen3.5 checkpoint as a frozen base plus
+/// trainable LoRA adapters. This is the cross-size OPD student path: teacher
+/// and student checkpoints can differ, while the student base stays frozen and
+/// only adapter weights receive gradients.
+pub fn load_qwen35_lora_from_hf_dir(
+    dir: &Path,
+    lora: LoraConfig,
+    target_set: LoraTargetSet,
+    store: &mut TensorStore,
+) -> Result<Qwen35Model> {
+    let rollback = TensorStoreRollback::capture(store);
+    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::LoraStudent { lora, target_set }) {
+        Ok(model) => Ok(model),
+        Err(err) => {
+            rollback.restore(store);
+            Err(err)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LoadMode {
     FrozenEval,
     TrainableStudent,
+    LoraStudent {
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+    },
 }
 
 fn load_qwen35_from_hf_dir_inner(
@@ -577,6 +604,9 @@ fn load_qwen35_from_hf_dir_inner(
     let model = match mode {
         LoadMode::FrozenEval => Qwen35Model::new_for_eval(&cfg, store)?,
         LoadMode::TrainableStudent => Qwen35Model::new(&cfg, store)?,
+        LoadMode::LoraStudent { lora, target_set } => {
+            Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, store)?
+        }
     };
     let param_map = model.param_name_map();
 
