@@ -21,7 +21,7 @@
 //!   layered on via `Qwen35Model::new_with_lora`.
 
 use autograd::{AutogradError, Device, Tape, TensorId, TensorStore, optim::Optimizer};
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Instant};
 
 use crate::{
     grad_clip::clip_grad_norm,
@@ -58,6 +58,29 @@ pub struct OpdStepConfig {
 pub struct OpdStepOutcome {
     pub loss: f32,
     pub rollout_len: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OpdStepProfile {
+    pub total_seconds: f64,
+    pub student_rollout_seconds: f64,
+    pub teacher_forward_seconds: f64,
+    pub student_forward_seconds: f64,
+    pub kl_loss_seconds: f64,
+    pub optimizer_zero_grad_seconds: f64,
+    pub backward_seconds: f64,
+    pub grad_clip_seconds: f64,
+    pub optimizer_step_seconds: f64,
+    pub post_step_cleanup_seconds: f64,
+}
+
+fn record_profile(
+    profile: &mut Option<&mut OpdStepProfile>,
+    update: impl FnOnce(&mut OpdStepProfile),
+) {
+    if let Some(profile) = profile.as_deref_mut() {
+        update(profile);
+    }
 }
 
 /// Greedy-argmax the last-position row of a `[1, seq_len, vocab]` logits
@@ -505,6 +528,35 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<OpdStepOutcome> {
+    opd_step_with_teacher_forward_profiled(
+        student,
+        teacher,
+        prompt_ids,
+        cfg,
+        student_params,
+        optimizer,
+        store,
+        tape,
+        None,
+    )
+}
+
+pub fn opd_step_with_teacher_forward_profiled<O: Optimizer, T: TeacherForward + ?Sized>(
+    student: &Qwen35Model,
+    teacher: &T,
+    prompt_ids: &[u32],
+    cfg: OpdStepConfig,
+    student_params: &[TensorId],
+    optimizer: &mut O,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    profile: Option<&mut OpdStepProfile>,
+) -> Result<OpdStepOutcome> {
+    let mut profile = profile;
+    if let Some(profile) = profile.as_deref_mut() {
+        *profile = OpdStepProfile::default();
+    }
+    let total_started = Instant::now();
     validate_step_config(cfg)?;
     let vocab = student.config().vocab_size;
     if prompt_ids.is_empty() {
@@ -557,6 +609,7 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
 
     let result = (|| {
         // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
+        let phase_started = Instant::now();
         tape.entries.clear();
         tape.set_enabled(false);
         let mut rollout: Vec<u32> = prompt_ids.to_vec();
@@ -656,14 +709,21 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
         } else {
             rollout_full_forward(student, &mut rollout, cfg.rollout_len, vocab, store, tape)?;
         }
+        record_profile(&mut profile, |profile| {
+            profile.student_rollout_seconds += phase_started.elapsed().as_secs_f64();
+        });
 
         // 2. Teacher forward — still tape-disabled. Teacher params carry
         //    `requires_grad = false` so no entries record even if tape was on,
         //    but disabling cheap-defends against any rogue grad-bearing weight.
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
+        let phase_started = Instant::now();
         let teacher_logits = teacher
             .forward_logits_device(&rollout, &positions, store, tape)
             .map_err(|err| map_teacher_forward_error("teacher scoring", err))?;
+        record_profile(&mut profile, |profile| {
+            profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
         let expected_teacher_shape = vec![1, rollout.len(), vocab];
         if teacher_logits.shape != expected_teacher_shape {
             return Err(OpdError::InvalidInput(format!(
@@ -677,11 +737,16 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
 
         // 3. Student forward — tape enabled now so backward can flow.
         tape.set_enabled(true);
+        let phase_started = Instant::now();
         let student_logits = student
             .forward(store, tape, &rollout, &positions)
             .map_err(|err| map_qwen35_forward_error("student KL", err))?;
+        record_profile(&mut profile, |profile| {
+            profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
 
         // 4. KL distill loss.
+        let phase_started = Instant::now();
         let loss = kl_distill_loss(
             student_logits,
             teacher_logits.tensor_id,
@@ -691,12 +756,31 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
         )?;
         let loss_value = store.to_host(loss)?[0];
         validate_loss_value(loss_value)?;
+        record_profile(&mut profile, |profile| {
+            profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+        });
 
         // 5. Backward + grad clip + optimizer step.
+        let phase_started = Instant::now();
         optimizer.zero_grad(store, student_params);
+        record_profile(&mut profile, |profile| {
+            profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        let phase_started = Instant::now();
         tape.backward(loss, store)?;
+        record_profile(&mut profile, |profile| {
+            profile.backward_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        let phase_started = Instant::now();
         clip_grad_norm(student_params, cfg.grad_clip, store);
+        record_profile(&mut profile, |profile| {
+            profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        let phase_started = Instant::now();
         optimizer.step(store, student_params)?;
+        record_profile(&mut profile, |profile| {
+            profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
+        });
 
         Ok(OpdStepOutcome {
             loss: loss_value,
@@ -709,7 +793,12 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
     //    student model, not just the optimizer target slice, because LoRA-only
     //    OPD optimizes adapter ids while still needing frozen base weights for
     //    the next forward pass.
+    let phase_started = Instant::now();
     cleanup_after_backward(store, tape, &student_model_params, &keep_extra);
+    record_profile(&mut profile, |profile| {
+        profile.post_step_cleanup_seconds += phase_started.elapsed().as_secs_f64();
+        profile.total_seconds = total_started.elapsed().as_secs_f64();
+    });
     result
 }
 
