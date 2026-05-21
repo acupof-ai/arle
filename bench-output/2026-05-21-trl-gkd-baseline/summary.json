@@ -1,0 +1,77 @@
+{
+  "eval_rows": [
+    {
+      "eval_seconds": 30.17380491498625,
+      "heldout_kl": 0.02159872278571129,
+      "heldout_overlap_pct": 64.0625,
+      "heldout_teacher_nll": 1.2855286598205566,
+      "heldout_top3_overlap_pct": 100.0,
+      "kind": "eval_summary",
+      "step": 0,
+      "train_kl": 0.03419336079969071,
+      "train_overlap_pct": 48.4375,
+      "train_teacher_nll": 1.1607198836281896,
+      "train_top3_overlap_pct": 99.21875
+    },
+    {
+      "eval_seconds": 30.525471827946603,
+      "heldout_kl": 0.020449104020372033,
+      "heldout_overlap_pct": 64.0625,
+      "heldout_teacher_nll": 1.2824704349040985,
+      "heldout_top3_overlap_pct": 100.0,
+      "kind": "eval_summary",
+      "step": 50,
+      "train_kl": 0.022653029322100338,
+      "train_overlap_pct": 63.8671875,
+      "train_teacher_nll": 1.1562771378085017,
+      "train_top3_overlap_pct": 99.609375
+    },
+    {
+      "eval_seconds": 30.22550792200491,
+      "heldout_kl": 0.02109817648306489,
+      "heldout_overlap_pct": 64.0625,
+      "heldout_teacher_nll": 1.2721475958824158,
+      "heldout_top3_overlap_pct": 100.0,
+      "kind": "eval_summary",
+      "step": 100,
+      "train_kl": 0.017031581031915266,
+      "train_overlap_pct": 66.015625,
+      "train_teacher_nll": 1.1411776384338737,
+      "train_top3_overlap_pct": 99.8046875
+    },
+    {
+      "eval_seconds": 29.956645947007928,
+      "heldout_kl": 0.021199961425736547,
+      "heldout_overlap_pct": 64.0625,
+      "heldout_teacher_nll": 1.2564734816551208,
+      "heldout_top3_overlap_pct": 100.0,
+      "kind": "eval_summary",
+      "step": 250,
+      "train_kl": 0.010974834556691349,
+      "train_overlap_pct": 74.609375,
+      "train_teacher_nll": 1.1296512195840478,
+      "train_top3_overlap_pct": 100.0
+    },
+    {
+      "eval_seconds": 29.971646161051467,
+      "heldout_kl": 0.020413786405697465,
+      "heldout_overlap_pct": 100.0,
+      "heldout_teacher_nll": 1.2534752190113068,
+      "heldout_top3_overlap_pct": 100.0,
+      "kind": "eval_summary",
+      "step": 500,
+      "train_kl": 0.00897148118383484,
+      "train_overlap_pct": 87.5,
+      "train_teacher_nll": 1.1280369330197573,
+      "train_top3_overlap_pct": 100.0
+    }
+  ],
+  "kind": "training_summary",
+  "mean_step_seconds": 0.4086342146942625,
+  "median_step_seconds": 0.40765208154334687,
+  "peak_allocated_mib": 12575.6591796875,
+  "peak_reserved_mib": 12642.0,
+  "sigma_pct": 1.3272384513411561,
+  "sigma_step_seconds": 0.005423550422758224,
+  "steps": 500
+}

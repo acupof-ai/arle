@@ -1,0 +1,2 @@
+timestamp, name, memory.total [MiB], memory.used [MiB], memory.free [MiB]
+2026/05/21 11:00:26.631, NVIDIA GeForce RTX 4070 Ti SUPER, 16376 MiB, 955 MiB, 14989 MiB
