@@ -32,6 +32,8 @@ pub mod qwen35_checkpoint;
 pub mod qwen35_loader;
 #[path = "server.rs"]
 pub mod server;
+#[path = "teacher_infer.rs"]
+pub mod teacher_infer;
 #[path = "tokenizer.rs"]
 pub mod tokenizer;
 #[path = "trainer.rs"]

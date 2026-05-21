@@ -20,16 +20,17 @@
 //! - Student initialised from a smaller checkpoint with LoRA adapter
 //!   layered on via `Qwen35Model::new_with_lora`.
 
-use autograd::{optim::Optimizer, AutogradError, Device, Tape, TensorId, TensorStore};
+use autograd::{AutogradError, Device, Tape, TensorId, TensorStore, optim::Optimizer};
 use std::collections::HashSet;
 
 use crate::{
     grad_clip::clip_grad_norm,
     loss::kl_distill_loss,
     qwen35::{
-        forward_rollout_cached, forward_rollout_cached_device_token, Qwen35Error, Qwen35KvCache,
-        Qwen35Model,
+        Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached,
+        forward_rollout_cached_device_token,
     },
+    teacher_infer::{InProcessTeacher, TeacherForward, TeacherForwardError},
     trainer::{cleanup_after_backward, retained_param_and_grad_ids},
 };
 
@@ -422,6 +423,22 @@ fn map_qwen35_forward_error(stage: &str, err: Qwen35Error) -> OpdError {
     }
 }
 
+fn map_teacher_forward_error(stage: &str, err: TeacherForwardError) -> OpdError {
+    match err {
+        TeacherForwardError::Qwen35(err) => map_qwen35_forward_error(stage, err),
+        TeacherForwardError::Autograd(err) => OpdError::InvalidInput(format!(
+            "OPD {stage} teacher forward autograd error: {err}. Hint: verify \
+             the teacher runtime shares the same TensorStore backend and returns \
+             device-resident logits compatible with the student KL path."
+        )),
+        TeacherForwardError::InvalidInput(reason) => OpdError::InvalidInput(format!(
+            "OPD {stage} teacher forward input error: {reason}. Hint: verify \
+             prompt_ids, rollout ids, and positions are aligned before scoring \
+             the rollout."
+        )),
+    }
+}
+
 /// Run one OPD step:
 /// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
@@ -432,6 +449,29 @@ fn map_qwen35_forward_error(stage: &str, err: Qwen35Error) -> OpdError {
 pub fn opd_step<O: Optimizer>(
     student: &Qwen35Model,
     teacher: &Qwen35Model,
+    prompt_ids: &[u32],
+    cfg: OpdStepConfig,
+    student_params: &[TensorId],
+    optimizer: &mut O,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<OpdStepOutcome> {
+    let teacher = InProcessTeacher::new(teacher);
+    opd_step_with_teacher_forward(
+        student,
+        &teacher,
+        prompt_ids,
+        cfg,
+        student_params,
+        optimizer,
+        store,
+        tape,
+    )
+}
+
+pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
+    student: &Qwen35Model,
+    teacher: &T,
     prompt_ids: &[u32],
     cfg: OpdStepConfig,
     student_params: &[TensorId],
@@ -457,11 +497,11 @@ pub fn opd_step<O: Optimizer>(
         ));
     }
     validate_rollout_shape(prompt_ids.len(), cfg.rollout_len, vocab)?;
-    let teacher_vocab = teacher.config().vocab_size;
+    let teacher_vocab = teacher.vocab_size();
     if teacher_vocab != vocab {
         return Err(OpdError::InvalidInput(format!(
             "OPD requires teacher/student vocab_size to match, got \
-             teacher.config().vocab_size={teacher_vocab} and \
+             teacher.vocab_size()={teacher_vocab} and \
              student.config().vocab_size={vocab}. Hint: use model directories \
              that share the same tokenizer before running OPD. See \
              docs/projects/2026-05-18-opd-only-pivot.md."
@@ -480,9 +520,11 @@ pub fn opd_step<O: Optimizer>(
             docs/projects/2026-05-18-opd-only-pivot.md."
         )));
     }
-    let teacher_params = teacher.all_parameter_ids();
+    let teacher_params = teacher.parameter_ids().to_vec();
     let student_model_params = student.all_parameter_ids();
-    validate_teacher_params(&teacher_params, store)?;
+    if !teacher_params.is_empty() {
+        validate_teacher_params(&teacher_params, store)?;
+    }
     validate_student_params(student_params, store)?;
     validate_student_param_ownership(student_params, &student_model_params, &teacher_params)?;
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
@@ -591,8 +633,18 @@ pub fn opd_step<O: Optimizer>(
         //    but disabling cheap-defends against any rogue grad-bearing weight.
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
         let teacher_logits = teacher
-            .forward(store, tape, &rollout, &positions)
-            .map_err(|err| map_qwen35_forward_error("teacher scoring", err))?;
+            .forward_logits_device(&rollout, &positions, store, tape)
+            .map_err(|err| map_teacher_forward_error("teacher scoring", err))?;
+        let expected_teacher_shape = vec![1, rollout.len(), vocab];
+        if teacher_logits.shape != expected_teacher_shape {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD teacher logits shape mismatch: got {:?}, expected {:?}. \
+                 Hint: the TeacherForward implementation must return \
+                 [batch=1, seq_len, vocab] logits for the exact rollout \
+                 scored by the student.",
+                teacher_logits.shape, expected_teacher_shape
+            )));
+        }
 
         // 3. Student forward — tape enabled now so backward can flow.
         tape.set_enabled(true);
@@ -601,7 +653,13 @@ pub fn opd_step<O: Optimizer>(
             .map_err(|err| map_qwen35_forward_error("student KL", err))?;
 
         // 4. KL distill loss.
-        let loss = kl_distill_loss(student_logits, teacher_logits, rollout.len(), store, tape)?;
+        let loss = kl_distill_loss(
+            student_logits,
+            teacher_logits.tensor_id,
+            rollout.len(),
+            store,
+            tape,
+        )?;
         let loss_value = store.to_host(loss)?[0];
         validate_loss_value(loss_value)?;
 
@@ -631,9 +689,9 @@ mod tests {
     use autograd::{AutogradError, Tensor, TensorStore};
 
     use super::{
-        greedy_next_token, map_qwen35_forward_error, validate_loss_value, validate_rollout_shape,
-        validate_step_config, validate_student_param_ownership, validate_student_params,
-        validate_teacher_params, OpdError, OpdStepConfig,
+        OpdError, OpdStepConfig, greedy_next_token, map_qwen35_forward_error, validate_loss_value,
+        validate_rollout_shape, validate_step_config, validate_student_param_ownership,
+        validate_student_params, validate_teacher_params,
     };
     use crate::qwen35::Qwen35Error;
 
