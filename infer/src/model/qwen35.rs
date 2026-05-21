@@ -7,6 +7,8 @@ mod batch_decode;
 pub(crate) mod config;
 #[path = "qwen35/decode_buffers.rs"]
 mod decode_buffers;
+#[path = "qwen35/diagnostics.rs"]
+mod diagnostics;
 #[path = "qwen35/forward.rs"]
 mod forward;
 #[path = "qwen35/prefill.rs"]
@@ -20,5 +22,6 @@ mod single_token_buffers;
 #[path = "qwen35/weights.rs"]
 mod weights;
 
+pub use diagnostics::Qwen35InferParityStages;
 pub use forward::Qwen35State;
 pub use weights::{Qwen35Model, Qwen35RuntimeConfig};
