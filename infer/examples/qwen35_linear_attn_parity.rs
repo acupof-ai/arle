@@ -61,6 +61,7 @@ with open(args.output, "w", encoding="utf-8") as handle:
 #[derive(Debug)]
 struct Args {
     model_path: PathBuf,
+    reference_model_path: PathBuf,
     python: PathBuf,
     token_id: u32,
     python_device: String,
@@ -76,10 +77,15 @@ struct PyReference {
 #[derive(Debug, Serialize)]
 struct ParityReport {
     model_path: String,
+    reference_model_path: String,
     token_id: u32,
     python_device: String,
     layer0_type: String,
     len: usize,
+    finite_pair_count: usize,
+    arle_nonfinite_count: usize,
+    pytorch_nonfinite_count: usize,
+    pytorch_finite_count: usize,
     max_abs: f32,
     max_rel: f32,
     mean_abs: f32,
@@ -111,6 +117,10 @@ fn main() -> Result<()> {
         .model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
+    let reference_model_path_str = args
+        .reference_model_path
+        .to_str()
+        .context("reference model path is not valid UTF-8")?;
     let model = Qwen35Model::from_safetensors_with_options(model_path_str, false)
         .with_context(|| format!("load ARLE Qwen3.5 model from {model_path_str}"))?;
     let stages = model.forward_single_token_parity_stages(args.token_id)?;
@@ -127,6 +137,7 @@ fn main() -> Result<()> {
 
     let report = compare(
         model_path_str,
+        reference_model_path_str,
         args.token_id,
         &args.python_device,
         &layer0_type,
@@ -159,6 +170,9 @@ fn parse_args() -> Result<Args> {
         model_path: env::var_os("ARLE_QWEN35_LINEAR_ATTN_MODEL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR)),
+        reference_model_path: env::var_os("ARLE_QWEN35_LINEAR_ATTN_REFERENCE_MODEL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR)),
         python: env::var_os("ARLE_PYTHON")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_PYTHON)),
@@ -171,6 +185,9 @@ fn parse_args() -> Result<Args> {
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--model-path" => args.model_path = next_path(&mut iter, "--model-path")?,
+            "--reference-model-path" => {
+                args.reference_model_path = next_path(&mut iter, "--reference-model-path")?
+            }
             "--python" => args.python = next_path(&mut iter, "--python")?,
             "--token-id" => args.token_id = next_value(&mut iter, "--token-id")?.parse()?,
             "--python-device" => args.python_device = next_value(&mut iter, "--python-device")?,
@@ -197,7 +214,7 @@ fn next_path(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Path
 
 fn print_help() {
     println!(
-        "qwen35_linear_attn_parity [--model-path PATH] [--python PATH] \\
+        "qwen35_linear_attn_parity [--model-path PATH] [--reference-model-path PATH] [--python PATH] \\
          [--python-device cpu|cuda] [--token-id ID] [--output PATH]"
     );
 }
@@ -228,7 +245,7 @@ fn run_pytorch_reference(args: &Args) -> Result<PyReference> {
     let status = Command::new(&args.python)
         .arg(&script_path)
         .arg("--model-path")
-        .arg(&args.model_path)
+        .arg(&args.reference_model_path)
         .arg("--token-id")
         .arg(args.token_id.to_string())
         .arg("--device")
@@ -250,6 +267,7 @@ fn run_pytorch_reference(args: &Args) -> Result<PyReference> {
 
 fn compare(
     model_path: &str,
+    reference_model_path: &str,
     token_id: u32,
     python_device: &str,
     layer0_type: &str,
@@ -268,16 +286,39 @@ fn compare(
     let mut abs_sum = 0.0f32;
     let mut sq_sum = 0.0f32;
     let mut ref_sq_sum = 0.0f32;
+    let mut finite_pair_count = 0usize;
+    let mut arle_nonfinite_count = 0usize;
+    let mut pytorch_nonfinite_count = 0usize;
+    let mut pytorch_finite_count = 0usize;
     let mut first8 = Vec::with_capacity(8.min(arle.len()));
 
     for (index, (&a, &p)) in arle.iter().zip(pytorch.iter()).enumerate() {
-        let abs_err = (a - p).abs();
-        let rel_err = abs_err / p.abs().max(1.0e-6);
-        max_abs = max_abs.max(abs_err);
-        max_rel = max_rel.max(rel_err);
-        abs_sum += abs_err;
-        sq_sum += abs_err * abs_err;
-        ref_sq_sum += p * p;
+        if !a.is_finite() {
+            arle_nonfinite_count += 1;
+        }
+        if !p.is_finite() {
+            pytorch_nonfinite_count += 1;
+        } else {
+            ref_sq_sum += p * p;
+            pytorch_finite_count += 1;
+        }
+        let abs_err = if a.is_finite() && p.is_finite() {
+            let abs_err = (a - p).abs();
+            let rel_err = abs_err / p.abs().max(1.0e-6);
+            max_abs = max_abs.max(abs_err);
+            max_rel = max_rel.max(rel_err);
+            abs_sum += abs_err;
+            sq_sum += abs_err * abs_err;
+            finite_pair_count += 1;
+            abs_err
+        } else {
+            f32::NAN
+        };
+        let rel_err = if a.is_finite() && p.is_finite() {
+            abs_err / p.abs().max(1.0e-6)
+        } else {
+            f32::NAN
+        };
         if first8.len() < 8 {
             first8.push(Entry {
                 index,
@@ -290,17 +331,37 @@ fn compare(
     }
 
     let len = arle.len();
-    let mean_abs = abs_sum / len as f32;
-    let rmse = (sq_sum / len as f32).sqrt();
-    let ref_rms = (ref_sq_sum / len as f32).sqrt();
+    let mean_abs = if finite_pair_count > 0 {
+        abs_sum / finite_pair_count as f32
+    } else {
+        f32::NAN
+    };
+    let rmse = if finite_pair_count > 0 {
+        (sq_sum / finite_pair_count as f32).sqrt()
+    } else {
+        f32::NAN
+    };
+    let ref_rms = if pytorch_finite_count > 0 {
+        (ref_sq_sum / pytorch_finite_count as f32).sqrt()
+    } else {
+        f32::NAN
+    };
     let rmse_over_ref_rms = rmse / ref_rms.max(1.0e-12);
+    let gate_pass = arle_nonfinite_count == 0
+        && pytorch_nonfinite_count == 0
+        && rmse_over_ref_rms <= RMSE_REF_RMS_GATE;
 
     Ok(ParityReport {
         model_path: model_path.to_string(),
+        reference_model_path: reference_model_path.to_string(),
         token_id,
         python_device: python_device.to_string(),
         layer0_type: layer0_type.to_string(),
         len,
+        finite_pair_count,
+        arle_nonfinite_count,
+        pytorch_nonfinite_count,
+        pytorch_finite_count,
         max_abs,
         max_rel,
         mean_abs,
@@ -308,20 +369,25 @@ fn compare(
         ref_rms,
         rmse_over_ref_rms,
         gate_rmse_over_ref_rms: RMSE_REF_RMS_GATE,
-        gate_pass: rmse_over_ref_rms <= RMSE_REF_RMS_GATE,
+        gate_pass,
         first8,
     })
 }
 
 fn print_report(report: &ParityReport) {
     println!("model_path={}", report.model_path);
+    println!("reference_model_path={}", report.reference_model_path);
     println!(
         "token_id={} python_device={} layer0_type={}",
         report.token_id, report.python_device, report.layer0_type
     );
     println!(
-        "len={} max_abs={:.8e} max_rel={:.8e} mean_abs={:.8e} rmse={:.8e} ref_rms={:.8e} rmse/ref_rms={:.8e} gate={:.8e} pass={}",
+        "len={} finite_pairs={} arle_nonfinite={} pytorch_nonfinite={} pytorch_finite={} max_abs={:.8e} max_rel={:.8e} mean_abs={:.8e} rmse={:.8e} ref_rms={:.8e} rmse/ref_rms={:.8e} gate={:.8e} pass={}",
         report.len,
+        report.finite_pair_count,
+        report.arle_nonfinite_count,
+        report.pytorch_nonfinite_count,
+        report.pytorch_finite_count,
         report.max_abs,
         report.max_rel,
         report.mean_abs,

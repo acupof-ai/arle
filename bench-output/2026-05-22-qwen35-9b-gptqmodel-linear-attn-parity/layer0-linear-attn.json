@@ -1,0 +1,78 @@
+{
+  "model_path": "/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit",
+  "reference_model_path": "/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B",
+  "token_id": 9419,
+  "python_device": "cpu",
+  "layer0_type": "linear_attention",
+  "len": 4096,
+  "finite_pair_count": 0,
+  "arle_nonfinite_count": 4096,
+  "pytorch_nonfinite_count": 0,
+  "pytorch_finite_count": 4096,
+  "max_abs": 0.0,
+  "max_rel": 0.0,
+  "mean_abs": null,
+  "rmse": null,
+  "ref_rms": 0.10282923,
+  "rmse_over_ref_rms": null,
+  "gate_rmse_over_ref_rms": 0.05,
+  "gate_pass": false,
+  "first8": [
+    {
+      "index": 0,
+      "arle": null,
+      "pytorch": 0.0005874634,
+      "abs_err": null,
+      "rel_err": null
+    },
+    {
+      "index": 1,
+      "arle": null,
+      "pytorch": -0.007873535,
+      "abs_err": null,
+      "rel_err": null
+    },
+    {
+      "index": 2,
+      "arle": null,
+      "pytorch": -0.008972168,
+      "abs_err": null,
+      "rel_err": null
+    },
+    {
+      "index": 3,
+      "arle": null,
+      "pytorch": -0.033447266,
+      "abs_err": null,
+      "rel_err": null
+    },
+    {
+      "index": 4,
+      "arle": null,
+      "pytorch": -0.068359375,
+      "abs_err": null,
+      "rel_err": null
+    },
+    {
+      "index": 5,
+      "arle": null,
+      "pytorch": -0.006286621,
+      "abs_err": null,
+      "rel_err": null
+    },
+    {
+      "index": 6,
+      "arle": null,
+      "pytorch": -0.006500244,
+      "abs_err": null,
+      "rel_err": null
+    },
+    {
+      "index": 7,
+      "arle": null,
+      "pytorch": 0.01977539,
+      "abs_err": null,
+      "rel_err": null
+    }
+  ]
+}
