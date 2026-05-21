@@ -13,10 +13,11 @@ mod app {
         time::Instant,
     };
 
-    use autograd::{backend_cuda::CudaBackend, optim::AdamW, Tape, TensorId, TensorStore};
+    use autograd::{Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
     use train::{
-        opd::{opd_step, OpdStepConfig},
-        qwen35::{forward_rollout_cached, Qwen35KvCache, Qwen35Model},
+        opd::{OpdStepConfig, opd_step},
+        prompts::load_jsonl_prompt_sets,
+        qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::extend_keep_with_params_and_grads,
     };
@@ -24,6 +25,8 @@ mod app {
     const DEFAULT_MODEL_DIR: &str = "/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B";
     const DEFAULT_TRAIN_STEPS: usize = 500;
     const DEFAULT_ROLLOUT_LEN: usize = 8;
+    const DEFAULT_PROMPT_MAX_TOKENS: usize = 16;
+    const DEFAULT_JSONL_HELDOUT_PROMPTS: usize = 4;
     const DECODE_LEN: usize = 16;
     const DEFAULT_LEARNING_RATE: f32 = 5.0e-5;
     const GRAD_CLIP: f32 = 1.0;
@@ -106,7 +109,8 @@ mod app {
         train_steps: usize,
         rollout_len: usize,
         eval_steps: Vec<usize>,
-        prompt_set: PromptSetArg,
+        prompt_source: PromptSourceArg,
+        prompt_max_tokens: usize,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -137,6 +141,33 @@ mod app {
                 Self::ThirtyTwo => TRAIN_PROMPTS_32,
             }
         }
+    }
+
+    #[derive(Debug, Clone)]
+    enum PromptSourceArg {
+        BuiltIn(PromptSetArg),
+        Jsonl { path: PathBuf, label: &'static str },
+    }
+
+    impl PromptSourceArg {
+        fn label(&self) -> String {
+            match self {
+                Self::BuiltIn(prompt_set) => format!("built-in-{}", prompt_set.label()),
+                Self::Jsonl { path, label } => format!("{label}:{}", path.display()),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PromptData {
+        train: Vec<Vec<u32>>,
+        heldout: Vec<Vec<u32>>,
+        source_label: String,
+        prompt_file: Option<PathBuf>,
+        tokenizer_path: Option<PathBuf>,
+        jsonl_rows: Option<usize>,
+        default_max_tokens: Option<usize>,
+        truncated_rows: Option<usize>,
     }
 
     #[derive(Debug)]
@@ -177,9 +208,9 @@ mod app {
     pub fn main() -> AnyResult<()> {
         let model_dir = resolve_model_dir()?;
         let args = resolve_training_args()?;
-        let train_prompts = args.prompt_set.prompts();
+        let prompts = resolve_prompts(&model_dir, &args)?;
         let eval_steps = eval_steps_for(args.train_steps, &args.eval_steps);
-        print_config(&model_dir, &args, train_prompts, &eval_steps);
+        print_config(&model_dir, &args, &prompts, &eval_steps);
 
         let cuda_backend = Arc::new(CudaBackend::new(0)?);
         let mut store = TensorStore::with_backend(cuda_backend.clone());
@@ -231,7 +262,8 @@ mod app {
         let mut eval_summaries = Vec::new();
         eval_summaries.push(evaluate_snapshot(
             0,
-            train_prompts,
+            &prompts.train,
+            &prompts.heldout,
             &teacher,
             &student,
             &teacher_params,
@@ -244,8 +276,8 @@ mod app {
         let mut step_seconds = Vec::with_capacity(args.train_steps);
         let total_started = Instant::now();
         for step in 1..=args.train_steps {
-            let prompt_index = (step - 1) % train_prompts.len();
-            let prompt = train_prompts[prompt_index];
+            let prompt_index = (step - 1) % prompts.train.len();
+            let prompt = prompts.train[prompt_index].as_slice();
             let step_started = Instant::now();
             let outcome = opd_step(
                 &student,
@@ -278,7 +310,8 @@ mod app {
             if eval_steps.contains(&step) {
                 eval_summaries.push(evaluate_snapshot(
                     step,
-                    train_prompts,
+                    &prompts.train,
+                    &prompts.heldout,
                     &teacher,
                     &student,
                     &teacher_params,
@@ -313,7 +346,9 @@ mod app {
         let mut train_steps = DEFAULT_TRAIN_STEPS;
         let mut rollout_len = DEFAULT_ROLLOUT_LEN;
         let mut eval_steps = EVAL_STEPS.to_vec();
-        let mut prompt_set = PromptSetArg::Eight;
+        let mut prompt_source = PromptSourceArg::BuiltIn(PromptSetArg::Eight);
+        let mut prompt_source_explicit = false;
+        let mut prompt_max_tokens = DEFAULT_PROMPT_MAX_TOKENS;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -345,17 +380,53 @@ mod app {
                     let Some(raw) = args.next() else {
                         return Err("--prompt-set requires `8` or `32`".into());
                     };
-                    prompt_set = PromptSetArg::parse(&raw)?;
+                    if prompt_source_explicit {
+                        return Err("--prompt-set cannot be combined with --prompts-file or --example-prompts-file".into());
+                    }
+                    prompt_source = PromptSourceArg::BuiltIn(PromptSetArg::parse(&raw)?);
+                    prompt_source_explicit = true;
+                }
+                "--prompts-file" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--prompts-file requires a JSONL path".into());
+                    };
+                    if prompt_source_explicit {
+                        return Err("--prompts-file cannot be combined with --prompt-set or --example-prompts-file".into());
+                    }
+                    prompt_source = PromptSourceArg::Jsonl {
+                        path: PathBuf::from(raw),
+                        label: "jsonl",
+                    };
+                    prompt_source_explicit = true;
+                }
+                "--example-prompts-file" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--example-prompts-file requires a JSONL path".into());
+                    };
+                    if prompt_source_explicit {
+                        return Err("--example-prompts-file cannot be combined with --prompt-set or --prompts-file".into());
+                    }
+                    prompt_source = PromptSourceArg::Jsonl {
+                        path: PathBuf::from(raw),
+                        label: "example-jsonl",
+                    };
+                    prompt_source_explicit = true;
+                }
+                "--prompt-max-tokens" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--prompt-max-tokens requires a positive usize value".into());
+                    };
+                    prompt_max_tokens = parse_positive_usize("--prompt-max-tokens", &raw)?;
                 }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32]"
+                        "usage: cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train."
                     );
                     std::process::exit(0);
                 }
                 unknown => {
                     return Err(format!(
-                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32"
+                        "unknown argument `{unknown}`. Supported arguments: --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32, --prompts-file PATH, --example-prompts-file PATH, --prompt-max-tokens VALUE"
                     )
                     .into());
                 }
@@ -366,7 +437,8 @@ mod app {
             train_steps,
             rollout_len,
             eval_steps,
-            prompt_set,
+            prompt_source,
+            prompt_max_tokens,
         })
     }
 
@@ -425,32 +497,88 @@ mod app {
         steps
     }
 
+    fn resolve_prompts(model_dir: &Path, args: &TrainingArgs) -> AnyResult<PromptData> {
+        match &args.prompt_source {
+            PromptSourceArg::BuiltIn(prompt_set) => Ok(PromptData {
+                train: prompt_set
+                    .prompts()
+                    .iter()
+                    .map(|prompt| prompt.to_vec())
+                    .collect(),
+                heldout: HELDOUT_PROMPTS
+                    .iter()
+                    .map(|prompt| prompt.to_vec())
+                    .collect(),
+                source_label: args.prompt_source.label(),
+                prompt_file: None,
+                tokenizer_path: None,
+                jsonl_rows: None,
+                default_max_tokens: None,
+                truncated_rows: None,
+            }),
+            PromptSourceArg::Jsonl { path, .. } => {
+                let loaded = load_jsonl_prompt_sets(
+                    model_dir,
+                    path,
+                    args.prompt_max_tokens,
+                    DEFAULT_JSONL_HELDOUT_PROMPTS,
+                )?;
+                Ok(PromptData {
+                    train: loaded.train,
+                    heldout: loaded.heldout,
+                    source_label: args.prompt_source.label(),
+                    prompt_file: Some(loaded.prompt_file),
+                    tokenizer_path: Some(loaded.tokenizer_path),
+                    jsonl_rows: Some(loaded.jsonl_rows),
+                    default_max_tokens: Some(loaded.default_max_tokens),
+                    truncated_rows: Some(loaded.truncated_rows),
+                })
+            }
+        }
+    }
+
     fn print_config(
         model_dir: &Path,
         args: &TrainingArgs,
-        train_prompts: &[&[u32]],
+        prompts: &PromptData,
         eval_steps: &[usize],
     ) {
         println!(
-            "config backend=cuda model_dir={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS} prompt_set={} train_prompt_count={} eval_steps={eval_steps:?}",
+            "config backend=cuda model_dir={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={DEFAULT_LEARNING_RATE:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={SAFETY_FIRST_STEP_MAX_SECONDS} prompt_source={} train_prompt_count={} heldout_prompt_count={} eval_steps={eval_steps:?}",
             model_dir.display(),
             args.train_steps,
             args.rollout_len,
             args.learning_rate,
-            args.prompt_set.label(),
-            train_prompts.len()
+            prompts.source_label,
+            prompts.train.len(),
+            prompts.heldout.len()
         );
-        for (idx, prompt) in train_prompts.iter().enumerate() {
+        if let Some(path) = &prompts.prompt_file {
+            println!(
+                "prompt_file path={} jsonl_rows={} tokenizer_path={} default_max_tokens={} truncated_rows={}",
+                path.display(),
+                prompts.jsonl_rows.unwrap_or(0),
+                prompts
+                    .tokenizer_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                prompts.default_max_tokens.unwrap_or(0),
+                prompts.truncated_rows.unwrap_or(0)
+            );
+        }
+        for (idx, prompt) in prompts.train.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
         }
-        for (idx, prompt) in HELDOUT_PROMPTS.iter().enumerate() {
+        for (idx, prompt) in prompts.heldout.iter().enumerate() {
             println!("prompt split=heldout index={idx} ids={prompt:?}");
         }
     }
 
     fn evaluate_snapshot(
         step: usize,
-        train_prompts: &[&[u32]],
+        train_prompts: &[Vec<u32>],
+        heldout_prompts: &[Vec<u32>],
         teacher: &Qwen35Model,
         student: &Qwen35Model,
         teacher_params: &[TensorId],
@@ -473,7 +601,7 @@ mod app {
         let heldout = evaluate_split(
             "heldout",
             step,
-            HELDOUT_PROMPTS,
+            heldout_prompts,
             teacher,
             student,
             teacher_params,
@@ -510,7 +638,7 @@ mod app {
     fn evaluate_split(
         split: &'static str,
         step: usize,
-        prompts: &[&[u32]],
+        prompts: &[Vec<u32>],
         teacher: &Qwen35Model,
         student: &Qwen35Model,
         teacher_params: &[TensorId],
@@ -551,9 +679,7 @@ mod app {
             )?;
             println!(
                 "eval_detail step={step} split={split} prompt_index={index} prompt={prompt:?} teacher_suffix={teacher_suffix:?} student_suffix={student_suffix:?} overlap_pct={overlap_pct:.6} kl={:.12e} teacher_nll={:.12e} top3_overlap_pct={:.6}",
-                metrics.kl,
-                metrics.teacher_nll,
-                metrics.top3_overlap_pct
+                metrics.kl, metrics.teacher_nll, metrics.top3_overlap_pct
             );
             rows.push(DecodeEval {
                 overlap_pct,
