@@ -1,5 +1,11 @@
 # ARLE Infer AWQ Zero-Point Support
 
+Status: not done. A 2026-05-21 implementation attempt made the checkpoint load
+and complete one-token `/v1/completions`, but failed the required logits parity
+gate against PyTorch/gptqmodel AWQ (`max_relerr=1.3827`, threshold `1e-3`).
+See
+[`docs/experience/errors/2026-05-21-arle-infer-awq-zero-point-relerr-kill.md`](../experience/errors/2026-05-21-arle-infer-awq-zero-point-relerr-kill.md).
+
 ## Context
 
 The Qwen3.5 9B -> 0.8B distillation plan originally preferred the ModelScope
