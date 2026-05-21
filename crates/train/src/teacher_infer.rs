@@ -674,6 +674,11 @@ impl TeacherForward for InferTeacher {
 mod tests {
     use super::*;
     use autograd::Tensor;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     struct FakeTeacher {
         marker: f32,
@@ -826,6 +831,102 @@ mod tests {
 
         assert_eq!(shape, vec![1, 1, 4]);
         assert_eq!(decoded, [1.25, -2.5, 3.75, 4.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn api_teacher_fetches_http_logits_into_tensor_store(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|err| err.to_string())?;
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            let mut header_end = None;
+            loop {
+                let read = stream.read(&mut buffer).map_err(|err| err.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = Some(index + 4);
+                    break;
+                }
+            }
+            let header_end =
+                header_end.ok_or_else(|| "missing HTTP header terminator".to_owned())?;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .ok_or_else(|| format!("missing Content-Length header: {headers}"))?;
+            let target_len = header_end + content_length;
+            while request.len() < target_len {
+                let read = stream.read(&mut buffer).map_err(|err| err.to_string())?;
+                if read == 0 {
+                    return Err(format!(
+                        "request body ended early: got {} bytes, expected {}",
+                        request.len().saturating_sub(header_end),
+                        content_length
+                    ));
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request_body = String::from_utf8_lossy(&request[header_end..target_len]);
+            if !request_body.contains("\"input_ids\":[11]") {
+                return Err(format!(
+                    "request missing expected input_ids: {request_body}"
+                ));
+            }
+            if !request_body.contains("\"positions\":[0]") {
+                return Err(format!(
+                    "request missing expected positions: {request_body}"
+                ));
+            }
+            let values = [0.5f32, 1.5, -2.0, 4.25];
+            let mut bytes = Vec::new();
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let body = serde_json::json!({
+                "shape": [1, 4],
+                "dtype": "f32",
+                "logits_b64": general_purpose::STANDARD.encode(bytes),
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        });
+
+        let teacher =
+            ApiTeacher::with_timeout(endpoint, 4, Duration::from_secs(5)).with_request_dtype("f32");
+        let mut store = TensorStore::default();
+        let mut tape = Tape::default();
+        let logits = teacher.forward_logits_device(&[11], &[0], &mut store, &mut tape)?;
+        let host = store.to_host(logits.tensor_id)?;
+        let profile = teacher.last_profile();
+
+        assert_eq!(logits.shape, vec![1, 1, 4]);
+        assert_eq!(host, [0.5, 1.5, -2.0, 4.25]);
+        assert_eq!(profile.seq_len, 1);
+        assert_eq!(profile.vocab_size, 4);
+        server
+            .join()
+            .map_err(|_| "mock API teacher server thread panicked")?
+            .map_err(|err| format!("mock API teacher server failed: {err}"))?;
         Ok(())
     }
 }
