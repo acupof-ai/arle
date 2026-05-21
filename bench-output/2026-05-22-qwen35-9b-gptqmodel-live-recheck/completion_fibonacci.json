@@ -1,0 +1,1 @@
+{"id":"cmpl-a2c797fd-b5c5-43b6-8a5b-d9ed8b8133f5","object":"text_completion","created":1779385938,"model":"Qwen3___5-9B-GPTQ-4bit","choices":[{"text":"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":13,"completion_tokens":64,"total_tokens":77}}
