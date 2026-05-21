@@ -6,17 +6,22 @@
 //! a `TensorId` in the caller's `TensorStore` so the KL path can stay on the
 //! same backend without a host materialization.
 
-use std::collections::HashSet;
 #[cfg(feature = "cuda")]
-use std::sync::{Arc, Mutex};
-#[cfg(feature = "cuda")]
-use std::time::Instant;
+use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 #[cfg(feature = "cuda")]
 use autograd::Backend;
-use autograd::{AutogradError, Tape, TensorId, TensorStore};
+use autograd::{AutogradError, Tape, Tensor, TensorId, TensorStore};
+use base64::{engine::general_purpose, Engine as _};
+use half::bf16;
 #[cfg(feature = "cuda")]
 use infer::server_engine::LoadedInferenceEngine;
+use serde::{Deserialize, Serialize};
 
 use crate::qwen35::{Qwen35Error, Qwen35Model};
 
@@ -35,6 +40,10 @@ pub enum TeacherForwardError {
     #[cfg(feature = "cuda")]
     #[error("infer runtime teacher forward failed: {0}")]
     InferRuntime(String),
+    #[error("API teacher forward failed: {0}")]
+    ApiRuntime(String),
+    #[error("API teacher logits decode failed: {0}")]
+    ApiDecode(String),
     #[error("{0}")]
     InvalidInput(String),
 }
@@ -246,6 +255,245 @@ impl TeacherForward for MultiTeacher<'_> {
     fn parameter_ids(&self) -> &[TensorId] {
         &self.parameter_ids
     }
+}
+
+pub struct ApiTeacher {
+    endpoint: String,
+    api_key: Option<String>,
+    request_dtype: String,
+    vocab_size: usize,
+    agent: ureq::Agent,
+    last_profile: Mutex<ApiTeacherProfile>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ApiTeacherProfile {
+    pub total_seconds: f64,
+    pub http_seconds: f64,
+    pub decode_seconds: f64,
+    pub upload_seconds: f64,
+    pub seq_len: usize,
+    pub vocab_size: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiTeacherRequest<'a> {
+    input_ids: &'a [u32],
+    positions: &'a [u32],
+    dtype: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiTeacherResponse {
+    shape: Vec<usize>,
+    dtype: String,
+    logits: Option<Vec<f32>>,
+    logits_b64: Option<String>,
+}
+
+impl ApiTeacher {
+    pub fn new(endpoint: impl Into<String>, vocab_size: usize) -> Self {
+        Self::with_timeout(endpoint, vocab_size, Duration::from_secs(30))
+    }
+
+    pub fn with_timeout(endpoint: impl Into<String>, vocab_size: usize, timeout: Duration) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            api_key: None,
+            request_dtype: "bf16".to_owned(),
+            vocab_size,
+            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            last_profile: Mutex::new(ApiTeacherProfile::default()),
+        }
+    }
+
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    pub fn with_request_dtype(mut self, dtype: impl Into<String>) -> Self {
+        self.request_dtype = dtype.into();
+        self
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn last_profile(&self) -> ApiTeacherProfile {
+        self.last_profile
+            .lock()
+            .map(|profile| *profile)
+            .unwrap_or_default()
+    }
+
+    fn post_logits(&self, input_ids: &[u32], positions: &[u32]) -> Result<ApiTeacherResponse> {
+        let body = ApiTeacherRequest {
+            input_ids,
+            positions,
+            dtype: self.request_dtype.as_str(),
+        };
+        let body = serde_json::to_value(&body).map_err(|err| {
+            TeacherForwardError::ApiRuntime(format!("serialize token-logits request: {err}"))
+        })?;
+        let mut request = self
+            .agent
+            .post(&self.endpoint)
+            .set("Content-Type", "application/json");
+        if let Some(api_key) = self.api_key.as_deref() {
+            request = request.set("Authorization", &format!("Bearer {api_key}"));
+        }
+        request
+            .send_json(body)
+            .map_err(|err| {
+                TeacherForwardError::ApiRuntime(format!(
+                    "POST {} failed: {err}. Hint: the API teacher endpoint must accept \
+                     {{input_ids, positions, dtype}} and return full token logits.",
+                    self.endpoint
+                ))
+            })?
+            .into_json()
+            .map_err(|err| {
+                TeacherForwardError::ApiRuntime(format!(
+                    "decode JSON response from {} failed: {err}",
+                    self.endpoint
+                ))
+            })
+    }
+}
+
+impl TeacherForward for ApiTeacher {
+    fn forward_logits_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        store: &mut TensorStore,
+        _tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        if input_ids.is_empty() {
+            return Err(TeacherForwardError::InvalidInput(
+                "ApiTeacher requires a non-empty token sequence".to_owned(),
+            ));
+        }
+        if input_ids.len() != positions.len() {
+            return Err(TeacherForwardError::InvalidInput(format!(
+                "ApiTeacher token/position length mismatch: tokens={} positions={}",
+                input_ids.len(),
+                positions.len()
+            )));
+        }
+
+        let total_started = Instant::now();
+        let http_started = Instant::now();
+        let response = self.post_logits(input_ids, positions)?;
+        let http_seconds = http_started.elapsed().as_secs_f64();
+        let decode_started = Instant::now();
+        let shape = normalize_api_teacher_shape(&response.shape, input_ids.len(), self.vocab_size)?;
+        let logits = decode_api_teacher_logits(&response, shape_size(&shape))?;
+        let decode_seconds = decode_started.elapsed().as_secs_f64();
+        let upload_started = Instant::now();
+        let tensor_id = store.alloc(Tensor::new(logits, shape.clone(), false)?);
+        store.ensure_device(tensor_id)?;
+        let upload_seconds = upload_started.elapsed().as_secs_f64();
+        if let Ok(mut profile) = self.last_profile.lock() {
+            *profile = ApiTeacherProfile {
+                total_seconds: total_started.elapsed().as_secs_f64(),
+                http_seconds,
+                decode_seconds,
+                upload_seconds,
+                seq_len: input_ids.len(),
+                vocab_size: self.vocab_size,
+            };
+        }
+        Ok(DeviceLogits { tensor_id, shape })
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+}
+
+fn normalize_api_teacher_shape(
+    shape: &[usize],
+    seq_len: usize,
+    vocab_size: usize,
+) -> Result<Vec<usize>> {
+    match shape {
+        [seq, vocab] if *seq == seq_len && *vocab == vocab_size => Ok(vec![1, seq_len, vocab_size]),
+        [batch, seq, vocab] if *batch == 1 && *seq == seq_len && *vocab == vocab_size => {
+            Ok(vec![1, seq_len, vocab_size])
+        }
+        _ => Err(TeacherForwardError::InvalidInput(format!(
+            "API teacher logits shape mismatch: got {:?}, expected [seq_len={}, vocab_size={}] \
+             or [1, seq_len={}, vocab_size={}].",
+            shape, seq_len, vocab_size, seq_len, vocab_size
+        ))),
+    }
+}
+
+fn decode_api_teacher_logits(
+    response: &ApiTeacherResponse,
+    expected_len: usize,
+) -> Result<Vec<f32>> {
+    if let Some(logits) = response.logits.as_ref() {
+        if logits.len() != expected_len {
+            return Err(TeacherForwardError::ApiDecode(format!(
+                "JSON logits length mismatch: got {}, expected {}",
+                logits.len(),
+                expected_len
+            )));
+        }
+        return Ok(logits.clone());
+    }
+
+    let encoded = response.logits_b64.as_deref().ok_or_else(|| {
+        TeacherForwardError::ApiDecode(
+            "response must include either `logits` or `logits_b64`".to_owned(),
+        )
+    })?;
+    let bytes = general_purpose::STANDARD.decode(encoded).map_err(|err| {
+        TeacherForwardError::ApiDecode(format!("base64 decode logits_b64 failed: {err}"))
+    })?;
+    match response.dtype.to_ascii_lowercase().as_str() {
+        "f32" | "float32" => decode_f32_le_logits(&bytes, expected_len),
+        "bf16" | "bfloat16" => decode_bf16_le_logits(&bytes, expected_len),
+        dtype => Err(TeacherForwardError::ApiDecode(format!(
+            "unsupported logits dtype '{dtype}', expected f32 or bf16"
+        ))),
+    }
+}
+
+fn decode_f32_le_logits(bytes: &[u8], expected_len: usize) -> Result<Vec<f32>> {
+    if bytes.len() != expected_len * std::mem::size_of::<f32>() {
+        return Err(TeacherForwardError::ApiDecode(format!(
+            "f32 logits byte length mismatch: got {}, expected {}",
+            bytes.len(),
+            expected_len * std::mem::size_of::<f32>()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn decode_bf16_le_logits(bytes: &[u8], expected_len: usize) -> Result<Vec<f32>> {
+    if bytes.len() != expected_len * std::mem::size_of::<u16>() {
+        return Err(TeacherForwardError::ApiDecode(format!(
+            "bf16 logits byte length mismatch: got {}, expected {}",
+            bytes.len(),
+            expected_len * std::mem::size_of::<u16>()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+        .collect())
+}
+
+fn shape_size(shape: &[usize]) -> usize {
+    shape.iter().copied().product()
 }
 
 pub struct InProcessTeacher<'a> {
@@ -530,5 +778,54 @@ mod tests {
         assert!(result.is_err(), "vocab mismatch must be rejected");
         let err = result.err().expect("checked above");
         assert!(err.to_string().contains("vocab_size"));
+    }
+
+    #[test]
+    fn api_teacher_decodes_f32_base64_logits() -> Result<()> {
+        let values = [1.25f32, -2.5, 3.75, 4.0];
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let response = ApiTeacherResponse {
+            shape: vec![1, 4],
+            dtype: "f32".to_owned(),
+            logits: None,
+            logits_b64: Some(general_purpose::STANDARD.encode(bytes)),
+        };
+
+        let shape = normalize_api_teacher_shape(&response.shape, 1, 4)?;
+        let decoded = decode_api_teacher_logits(&response, shape_size(&shape))?;
+
+        assert_eq!(shape, vec![1, 1, 4]);
+        assert_eq!(decoded, values);
+        Ok(())
+    }
+
+    #[test]
+    fn api_teacher_decodes_bf16_base64_logits() -> Result<()> {
+        let values = [
+            bf16::from_f32(1.25),
+            bf16::from_f32(-2.5),
+            bf16::from_f32(3.75),
+            bf16::from_f32(4.0),
+        ];
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let response = ApiTeacherResponse {
+            shape: vec![1, 1, 4],
+            dtype: "bf16".to_owned(),
+            logits: None,
+            logits_b64: Some(general_purpose::STANDARD.encode(bytes)),
+        };
+
+        let shape = normalize_api_teacher_shape(&response.shape, 1, 4)?;
+        let decoded = decode_api_teacher_logits(&response, shape_size(&shape))?;
+
+        assert_eq!(shape, vec![1, 1, 4]);
+        assert_eq!(decoded, [1.25, -2.5, 3.75, 4.0]);
+        Ok(())
     }
 }
