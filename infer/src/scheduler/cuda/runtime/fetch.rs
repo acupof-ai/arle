@@ -6,6 +6,7 @@
 
 use super::super::{ModelForward, Ordering, Phase, Scheduler, error, info, warn};
 use super::helpers::{FetchWaiter, WaitingInsertBias, staged_prefix_direct_host_blocks};
+use crate::model::GenerationState;
 use crate::scheduler::types::RequestLengthContract;
 
 impl<M: ModelForward> Scheduler<M> {
@@ -379,6 +380,64 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    pub(super) fn drain_raw_logits_rx(&mut self) {
+        while let Ok(req) = self.raw_logits_rx.try_recv() {
+            let result = self.forward_raw_logits(&req.input_ids, &req.positions);
+            let _ = req.response_tx.send(result);
+        }
+    }
+
+    fn forward_raw_logits(
+        &mut self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> anyhow::Result<crate::server_engine::RawLogits> {
+        anyhow::ensure!(
+            !input_ids.is_empty(),
+            "forward_token_logits requires at least one token"
+        );
+        anyhow::ensure!(
+            input_ids.len() == positions.len(),
+            "forward_token_logits token/position length mismatch: tokens={} positions={}",
+            input_ids.len(),
+            positions.len()
+        );
+        for (idx, &position) in positions.iter().enumerate() {
+            anyhow::ensure!(
+                position as usize == idx,
+                "forward_token_logits v1 only supports contiguous positions starting at 0; \
+                 got position {position} at index {idx}"
+            );
+        }
+
+        let ctx = self.model.device_context().clone();
+        let vocab_size = self.model.vocab_size();
+        let mut state = self.model.create_state()?;
+        state.set_max_seq_len(input_ids.len().max(1));
+        let mut logits =
+            cuda_kernels::prelude::DeviceVec::zeros(&ctx, input_ids.len() * vocab_size)?
+                .with_label("raw_token_logits[seq,vocab]");
+
+        for (idx, &token) in input_ids.iter().enumerate() {
+            let (_tokens, token_logits) = self.model.forward_with_logits(&[token], &mut state)?;
+            anyhow::ensure!(
+                token_logits.len == vocab_size,
+                "forward_token_logits expected one vocab row per token, got logits len {} \
+                 for vocab size {} at token index {}",
+                token_logits.len,
+                vocab_size,
+                idx
+            );
+            logits.copy_region_from_device(&ctx, idx * vocab_size, &token_logits, 0, vocab_size)?;
+        }
+
+        Ok(crate::server_engine::RawLogits {
+            logits,
+            shape: [input_ids.len(), vocab_size],
+            device: ctx,
+        })
+    }
+
     pub(super) fn drain_wakeup_rx(&mut self) {
         while self.wakeup_rx.try_recv().is_ok() {}
     }
@@ -386,5 +445,6 @@ impl<M: ModelForward> Scheduler<M> {
     pub(super) fn handle_wakeup_disconnect(&mut self) {
         self.wakeup_live = false;
         self.drain_request_rx();
+        self.drain_raw_logits_rx();
     }
 }

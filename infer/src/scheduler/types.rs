@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "cuda")]
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -771,6 +773,13 @@ pub struct IncomingRequest {
     pub distributed: Option<DistributedRequestCoordination>,
 }
 
+#[cfg(feature = "cuda")]
+pub struct RawLogitsRequest {
+    pub input_ids: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub response_tx: std_mpsc::Sender<anyhow::Result<crate::server_engine::RawLogits>>,
+}
+
 /// Error returned when the scheduler's waiting queue is full.
 #[derive(Debug)]
 pub struct SchedulerFull;
@@ -787,6 +796,8 @@ impl std::error::Error for SchedulerFull {}
 #[derive(Clone)]
 pub struct SchedulerHandle {
     tx: mpsc::UnboundedSender<IncomingRequest>,
+    #[cfg(feature = "cuda")]
+    raw_logits_tx: Option<mpsc::UnboundedSender<RawLogitsRequest>>,
     wakeup_tx: crossbeam_channel::Sender<()>,
     model_id: Arc<str>,
     tokenizer: Option<Tokenizer>,
@@ -862,6 +873,8 @@ impl SchedulerHandle {
         let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
         Self {
             tx,
+            #[cfg(feature = "cuda")]
+            raw_logits_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -880,6 +893,8 @@ impl SchedulerHandle {
         let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
         Self {
             tx,
+            #[cfg(feature = "cuda")]
+            raw_logits_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -899,6 +914,8 @@ impl SchedulerHandle {
         let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
         Self {
             tx,
+            #[cfg(feature = "cuda")]
+            raw_logits_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -917,6 +934,8 @@ impl SchedulerHandle {
     ) -> Self {
         Self {
             tx,
+            #[cfg(feature = "cuda")]
+            raw_logits_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -929,6 +948,16 @@ impl SchedulerHandle {
     #[must_use]
     pub fn with_tokenizer(mut self, tokenizer: Tokenizer) -> Self {
         self.tokenizer = Some(tokenizer);
+        self
+    }
+
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn with_raw_logits_tx(
+        mut self,
+        raw_logits_tx: mpsc::UnboundedSender<RawLogitsRequest>,
+    ) -> Self {
+        self.raw_logits_tx = Some(raw_logits_tx);
         self
     }
 
@@ -980,6 +1009,30 @@ impl SchedulerHandle {
         self.reserve_submission()?
             .submit(req)
             .map_err(|_| SchedulerFull)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn forward_token_logits(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> anyhow::Result<crate::server_engine::RawLogits> {
+        let raw_logits_tx = self
+            .raw_logits_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CUDA scheduler does not expose raw logits requests"))?;
+        let (response_tx, response_rx) = std_mpsc::channel();
+        raw_logits_tx
+            .send(RawLogitsRequest {
+                input_ids: input_ids.to_vec(),
+                positions: positions.to_vec(),
+                response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("raw logits request submission failed"))?;
+        let _ = self.wakeup_tx.send(());
+        response_rx
+            .recv()
+            .map_err(|err| anyhow::anyhow!("raw logits response channel closed: {err}"))?
     }
 
     /// Decrement the waiting count (called by the scheduler when it consumes a request).

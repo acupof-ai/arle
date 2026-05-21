@@ -51,6 +51,7 @@ impl<M: ModelForward> Scheduler<M> {
                 match wakeup {
                     Ok(()) => {
                         self.drain_request_rx();
+                        self.drain_raw_logits_rx();
                         self.drain_wakeup_rx();
                     }
                     Err(_) => self.handle_wakeup_disconnect(),
@@ -84,6 +85,7 @@ impl<M: ModelForward> Scheduler<M> {
             }
             if let Ok(()) = self.wakeup_rx.recv() {
                 self.drain_request_rx();
+                self.drain_raw_logits_rx();
                 self.drain_wakeup_rx();
                 return true;
             }
@@ -115,6 +117,7 @@ impl<M: ModelForward> Scheduler<M> {
         info!("Scheduler run loop started");
         loop {
             self.drain_request_rx();
+            self.drain_raw_logits_rx();
             self.drain_coordinator_events();
             self.drain_emit_events();
             if !self.wait_for_wakeup() {

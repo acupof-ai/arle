@@ -7,6 +7,37 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::model_arch::ModelArchSummary;
 use crate::sampler::SamplingParams;
 
+#[cfg(feature = "cuda")]
+use cuda_kernels::prelude::{DeviceContext, DeviceVec};
+
+#[cfg(feature = "cuda")]
+pub struct RawLogits {
+    pub logits: DeviceVec,
+    pub shape: [usize; 2],
+    pub device: DeviceContext,
+}
+
+#[cfg(feature = "cuda")]
+impl RawLogits {
+    pub fn seq_len(&self) -> usize {
+        self.shape[0]
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.shape[1]
+    }
+
+    pub fn to_host_f32(&self) -> Result<Vec<f32>> {
+        self.logits.to_host(&self.device)
+    }
+}
+
+// SAFETY: `RawLogits` owns a CUDA allocation plus the context needed to consume
+// it. The scheduler sends it once to a single caller, and callers must not share
+// the contained mutable device allocation across threads.
+#[cfg(feature = "cuda")]
+unsafe impl Send for RawLogits {}
+
 #[derive(Debug)]
 pub struct CompletionRequest {
     pub prompt: String,

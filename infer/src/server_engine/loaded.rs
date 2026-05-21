@@ -106,6 +106,21 @@ impl LoadedInferenceEngine {
             Self::Cpu(_) => "cpu",
         }
     }
+
+    #[cfg(feature = "cuda")]
+    pub fn forward_token_logits(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<super::RawLogits> {
+        match self {
+            Self::Cuda { engine, .. } => engine.forward_token_logits(input_ids, positions),
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => anyhow::bail!("forward_token_logits is only available on CUDA"),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => anyhow::bail!("forward_token_logits is only available on CUDA"),
+        }
+    }
 }
 
 impl InferenceEngine for LoadedInferenceEngine {
