@@ -1,0 +1,1 @@
+turboquant_weight_dequant_dump tensor=model.language_model.layers.1.mlp.gate_proj rows=0..8 shape=[8,4096] output=bench-output/2026-05-21-qwen35-9b-tq4-fwht-fix/arle-cuda-dequant.json
