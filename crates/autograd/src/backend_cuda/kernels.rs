@@ -111,6 +111,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "qwen_decode_prepare_q_gated_f32",
     "qwen_decode_prepare_kv_f32",
     "bf16_bits_to_f32",
+    "f32_to_bf16_bits",
 ];
 
 #[derive(Debug)]
