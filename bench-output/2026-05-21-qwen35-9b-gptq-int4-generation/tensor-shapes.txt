@@ -1,0 +1,17 @@
+
+## model-00001-of-00002.safetensors
+model.language_model.layers.0.linear_attn.in_proj_qkv.g_idx (4096,) torch.int32
+model.language_model.layers.0.linear_attn.in_proj_qkv.qweight (512, 8192) torch.int32
+model.language_model.layers.0.linear_attn.in_proj_qkv.qzeros (32, 1024) torch.int32
+model.language_model.layers.0.linear_attn.in_proj_qkv.scales (32, 8192) torch.float16
+model.language_model.layers.0.mlp.gate_proj.g_idx (4096,) torch.int32
+model.language_model.layers.0.mlp.gate_proj.qweight (512, 12288) torch.int32
+model.language_model.layers.0.mlp.gate_proj.qzeros (32, 1536) torch.int32
+model.language_model.layers.0.mlp.gate_proj.scales (32, 12288) torch.float16
+model.language_model.lm_head.weight (248320, 4096) torch.bfloat16
+
+## model-00002-of-00002.safetensors
+
+## extra_weights.safetensors
+lm_head.weight (248320, 4096) torch.bfloat16
+mtp.layers.0.mlp.gate_proj.weight (12288, 4096) torch.bfloat16

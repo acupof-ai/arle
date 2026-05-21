@@ -1,0 +1,98 @@
+{
+  "path": "/home/ckl/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit",
+  "config_quantization_config": {
+    "bits": 4,
+    "checkpoint_format": "gptq",
+    "desc_act": false,
+    "dynamic": {
+      "-:.*visual\\.blocks\\..*": {},
+      "-:.*visual\\.merger\\..*": {},
+      "-:mtp\\.fc": {}
+    },
+    "format": "gptq",
+    "group_size": 128,
+    "lm_head": false,
+    "meta": {
+      "act_group_aware": true,
+      "auto_forward_data_parallel": true,
+      "damp_auto_increment": 0.01,
+      "damp_percent": 0.05,
+      "failsafe": {
+        "smooth": null,
+        "strategy": "rtn",
+        "threshold": "0.5%"
+      },
+      "gc_mode": "interval",
+      "gptaq": null,
+      "hessian": {
+        "chunk_bytes": null,
+        "chunk_size": null,
+        "staging_dtype": "float32"
+      },
+      "mock_quantization": false,
+      "mse": 0.0,
+      "offload_to_disk": true,
+      "offload_to_disk_path": "./gptqmodel_offload/hqdpgrum-rkaakpxx/",
+      "pack_impl": "cpu",
+      "quantizer": [
+        "gptqmodel:5.8.0"
+      ],
+      "static_groups": false,
+      "true_sequential": true,
+      "uri": "https://github.com/modelcloud/gptqmodel",
+      "vram_strategy": "exclusive",
+      "wait_for_submodule_finalizers": false
+    },
+    "pack_dtype": "int32",
+    "quant_method": "gptq",
+    "sym": true
+  },
+  "tie_word_embeddings": false,
+  "quantize_config": {
+    "bits": 4,
+    "dynamic": {
+      "-:.*visual\\.blocks\\..*": {},
+      "-:.*visual\\.merger\\..*": {},
+      "-:mtp\\.fc": {}
+    },
+    "group_size": 128,
+    "desc_act": false,
+    "lm_head": false,
+    "quant_method": "gptq",
+    "checkpoint_format": "gptq",
+    "pack_dtype": "int32",
+    "meta": {
+      "quantizer": [
+        "gptqmodel:5.8.0"
+      ],
+      "uri": "https://github.com/modelcloud/gptqmodel",
+      "damp_percent": 0.05,
+      "damp_auto_increment": 0.01,
+      "static_groups": false,
+      "true_sequential": true,
+      "mse": 0.0,
+      "gptaq": null,
+      "act_group_aware": true,
+      "failsafe": {
+        "strategy": "rtn",
+        "threshold": "0.5%",
+        "smooth": null
+      },
+      "offload_to_disk": true,
+      "offload_to_disk_path": "./gptqmodel_offload/hqdpgrum-rkaakpxx/",
+      "pack_impl": "cpu",
+      "mock_quantization": false,
+      "gc_mode": "interval",
+      "wait_for_submodule_finalizers": false,
+      "auto_forward_data_parallel": true,
+      "hessian": {
+        "chunk_size": null,
+        "chunk_bytes": null,
+        "staging_dtype": "float32"
+      },
+      "vram_strategy": "exclusive"
+    },
+    "sym": true,
+    "format": "gptq"
+  }
+}
