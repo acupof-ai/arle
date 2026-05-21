@@ -1,0 +1,23 @@
+{
+  "default_teacher": "general",
+  "teachers": [
+    {
+      "id": "general",
+      "url": "http://127.0.0.1:8123/v1/token_logits",
+      "dtype": "bf16",
+      "timeout_seconds": 30
+    },
+    {
+      "id": "code",
+      "url": "http://127.0.0.1:8124/v1/token_logits",
+      "dtype": "bf16",
+      "timeout_seconds": 30
+    }
+  ],
+  "routes": [
+    {
+      "teacher_id": "code",
+      "token_prefix": [9419]
+    }
+  ]
+}
