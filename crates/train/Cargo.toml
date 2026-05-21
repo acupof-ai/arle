@@ -22,6 +22,7 @@ cuda = ["autograd/cuda", "dep:infer", "infer/cuda", "infer/unified_scheduler"]
 [dependencies]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
 anyhow = "1.0"
+base64 = "0.22"
 hf-hub = { version = "0.5", features = ["tokio"] }
 opentelemetry = { version = "0.31", default-features = false, features = ["logs"] }
 opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client"] }

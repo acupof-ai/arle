@@ -4022,6 +4022,7 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "autograd",
+ "base64 0.22.1",
  "chat",
  "deepseek-spec",
  "half",

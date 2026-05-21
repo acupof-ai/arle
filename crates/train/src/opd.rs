@@ -20,15 +20,15 @@
 //! - Student initialised from a smaller checkpoint with LoRA adapter
 //!   layered on via `Qwen35Model::new_with_lora`.
 
-use autograd::{AutogradError, Device, Tape, TensorId, TensorStore, optim::Optimizer};
+use autograd::{optim::Optimizer, AutogradError, Device, Tape, TensorId, TensorStore};
 use std::{collections::HashSet, time::Instant};
 
 use crate::{
     grad_clip::clip_grad_norm,
     loss::kl_distill_loss,
     qwen35::{
-        Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached,
-        forward_rollout_cached_device_token,
+        forward_rollout_cached, forward_rollout_cached_device_token, Qwen35Error, Qwen35KvCache,
+        Qwen35Model,
     },
     teacher_infer::{InProcessTeacher, TeacherForward, TeacherForwardError},
     trainer::{cleanup_after_backward, retained_param_and_grad_ids},
@@ -478,6 +478,17 @@ fn map_teacher_forward_error(stage: &str, err: TeacherForwardError) -> OpdError 
              prompt_ids, rollout ids, and positions are aligned before scoring \
              the rollout."
         )),
+        TeacherForwardError::ApiRuntime(reason) => OpdError::InvalidInput(format!(
+            "OPD {stage} API teacher runtime error: {reason}. Hint: verify \
+             the API teacher endpoint is reachable, returns full logits for \
+             every requested token position, and uses the same tokenizer/vocab \
+             as the student."
+        )),
+        TeacherForwardError::ApiDecode(reason) => OpdError::InvalidInput(format!(
+            "OPD {stage} API teacher logits decode error: {reason}. Hint: verify \
+             the response shape is [seq,vocab] or [1,seq,vocab], dtype is f32 \
+             or bf16, and logits_b64 is little-endian."
+        )),
         #[cfg(feature = "cuda")]
         TeacherForwardError::InferRuntime(reason) => OpdError::InvalidInput(format!(
             "OPD {stage} infer teacher runtime error: {reason}. Hint: verify \
@@ -807,9 +818,9 @@ mod tests {
     use autograd::{AutogradError, Tensor, TensorStore};
 
     use super::{
-        OpdError, OpdStepConfig, greedy_next_token, map_qwen35_forward_error, validate_loss_value,
-        validate_rollout_shape, validate_step_config, validate_student_param_ownership,
-        validate_student_params, validate_teacher_params,
+        greedy_next_token, map_qwen35_forward_error, validate_loss_value, validate_rollout_shape,
+        validate_step_config, validate_student_param_ownership, validate_student_params,
+        validate_teacher_params, OpdError, OpdStepConfig,
     };
     use crate::qwen35::Qwen35Error;
 
