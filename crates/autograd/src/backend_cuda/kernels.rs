@@ -54,6 +54,8 @@ const ROPE_BACKWARD_CU: &str = include_str!("kernels/rope_backward.cu");
 const ROLLOUT_CU: &str = include_str!("kernels/rollout.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ATTENTION_CU: &str = include_str!("kernels/attention.cu");
+#[cfg(not(feature = "no-cuda"))]
+const BRIDGE_CU: &str = include_str!("kernels/bridge.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -108,6 +110,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "qwen_decode_prepare_q_f32",
     "qwen_decode_prepare_q_gated_f32",
     "qwen_decode_prepare_kv_f32",
+    "bf16_bits_to_f32",
 ];
 
 #[derive(Debug)]
@@ -267,6 +270,7 @@ fn concat_sources() -> String {
         ROPE_BACKWARD_CU,
         ROLLOUT_CU,
         ATTENTION_CU,
+        BRIDGE_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');
