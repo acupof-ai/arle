@@ -244,13 +244,24 @@ Current TODO after the 2026-05-22 DavidWen GPTQModel probe:
 2. Done: layer-local projection parity harness landed as
    `infer/examples/gptqmodel_w4_gemv_parity.rs`. Sampled W4 projections pass
    ARLE CUDA W4A16 GEMV vs faithful GPTQ reference at <=0.25% RMSE/reference-RMS.
-3. Done: dense fallback scan found a gate failure before module parity:
-   `DavidWen2025/Qwen3.5-9B-GPTQ-4bit` mutates 48 linear-attention dense
-   tensors (`A_log` and `norm.weight`) versus the BF16 source. Hold this
-   checkpoint until a module-level forward parity gate licenses that drift or a
-   cleaner checkpoint preserves dense tensors.
-4. Re-run multi-token generation before any OPD bench or headline switch only
-   after the dense/module parity gate is licensed.
+3. Done: dense fallback scan found that the checkpoint stores
+   `linear_attn.A_log` and `linear_attn.norm.weight` as BF16. ARLE's f32 1D
+   loader was fixed to convert by dtype; layer-0 `linear_attention` now passes
+   the BF16-realistic gate at `4.07%` RMSE/reference-RMS with no NaNs.
+4. Done: full-model single-token logits after the f32-load fix pass the
+   pragmatic 9B GPTQModel envelope: top-64 dominant relerr `0.124`, top-64
+   RMSE/reference-RMS `0.043`, ARLE argmax `11`, PyTorch BF16 argmax `11`.
+5. Killed: 9B GPTQModel -> 0.8B LoRA OPD on the current train-side f32
+   student base. Both the 100-step real-prompt bench and a single-token,
+   rollout-1 control fail before `eval_summary step=0` with
+   `cuda htod copy failed`; live memory reached `14399 MiB / 16376 MiB`.
+6. Next memory axis: make the train-side LoRA student base truly frozen BF16
+   (or add an equivalent low-memory frozen-base loader) before rerunning the
+   9B OPD bench. Add upload-size instrumentation if this root-cause needs a
+   tighter allocation-level proof.
+7. Next DX axis: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so
+   `arle train opd` can select local infer, external API, or routed specialist
+   teachers without editing examples.
 
 Evidence:
 
@@ -258,9 +269,15 @@ Evidence:
 docs/experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-generation-kill.md
 docs/research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md
 docs/experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-dense-tensor-kill.md
+docs/research/2026-05-22-qwen35-9b-gptqmodel-linear-attn-f32load-fix.md
+docs/research/2026-05-22-qwen35-9b-gptqmodel-full-logits-after-f32load-fix.md
+docs/experience/errors/2026-05-22-qwen35-9b-gptqmodel-08b-opd-memory-kill.md
 bench-output/2026-05-22-qwen35-9b-gptq-int4-loader/
 bench-output/2026-05-22-qwen35-9b-gptqmodel-layerlocal/
 bench-output/2026-05-22-qwen35-9b-gptqmodel-dense-parity/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-full-logits-after-f32load-fix/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher/
+bench-output/2026-05-22-qwen35-9b-gptqmodel-08b-opd-infer-teacher-smoke-minimal/
 ```
 
 ## Implementation Order
@@ -271,8 +288,11 @@ bench-output/2026-05-22-qwen35-9b-gptqmodel-dense-parity/
 4. Next: add CLI / JSON config for `ApiTeacher` + `MultiTeacher` so `arle train
    opd` can select local infer, external API, or routed specialists without
    editing examples.
-5. Add top-k loss only if a real target API cannot provide full logits.
-6. Return to 9B loader work after the teacher abstraction is stable.
+5. Add train-side BF16 frozen-base support for LoRA students before claiming a
+   9B teacher -> 0.8B student 16 GB OPD bench.
+6. Add top-k loss only if a real target API cannot provide full logits.
+7. Return to 9B headline work only after the BF16 frozen-base memory gate and
+   OPD KL trajectory gate pass.
 
 ## Cross-Links
 
@@ -286,5 +306,11 @@ bench-output/2026-05-22-qwen35-9b-gptqmodel-dense-parity/
   [`../research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md`](../research/2026-05-22-arle-qwen35-9b-gptqmodel-w4-gemv-parity.md)
 - GPTQModel dense tensor kill:
   [`../experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-dense-tensor-kill.md`](../experience/errors/2026-05-22-arle-qwen35-9b-gptqmodel-dense-tensor-kill.md)
+- GPTQModel linear-attention f32-load fix:
+  [`../research/2026-05-22-qwen35-9b-gptqmodel-linear-attn-f32load-fix.md`](../research/2026-05-22-qwen35-9b-gptqmodel-linear-attn-f32load-fix.md)
+- GPTQModel full-logits gate after f32-load fix:
+  [`../research/2026-05-22-qwen35-9b-gptqmodel-full-logits-after-f32load-fix.md`](../research/2026-05-22-qwen35-9b-gptqmodel-full-logits-after-f32load-fix.md)
+- GPTQModel 9B -> 0.8B OPD memory kill:
+  [`../experience/errors/2026-05-22-qwen35-9b-gptqmodel-08b-opd-memory-kill.md`](../experience/errors/2026-05-22-qwen35-9b-gptqmodel-08b-opd-memory-kill.md)
 - Infer-teacher adapter:
   [`../../crates/train/src/teacher_infer.rs`](../../crates/train/src/teacher_infer.rs)

@@ -1,0 +1,9 @@
+Observed during the minimal single-token control, before the process exited:
+
+GPU memory used: 14399 MiB / 16376 MiB
+GPU memory free: 1545 MiB
+GPU utilization: 0%
+
+The process then failed before eval_summary step=0 with:
+
+Error: Autograd(TapeInvariant("cuda htod copy failed"))
