@@ -1,0 +1,1 @@
+raw_logits_dump model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-9B-TQ4 output=bench-output/2026-05-21-qwen35-9b-tq4-08b-opd-infer-teacher/arle-tq4-logits.json seq_len=1 vocab_size=248320 load_seconds=111.247646 forward_seconds=2.857958 host_readback_seconds=0.059612
