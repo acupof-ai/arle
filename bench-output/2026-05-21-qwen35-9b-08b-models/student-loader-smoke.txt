@@ -1,0 +1,22 @@
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `release` profile [optimized] target(s) in 17.47s
+     Running tests/test_qwen35_loader.rs (target/release/deps/test_qwen35_loader-5c17565d8929c241)
+
+running 1 test
+loader_smoke_qwen3_0_6b: loading /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base
+loader_smoke_qwen3_0_6b: structural mismatch as expected on vanilla Qwen3 layout — tensor=model.language_model.layers.22.linear_attn.conv1d.weight expected=[6144, 4] got=[6144, 1, 4]
+
+thread 'loader_smoke_qwen3_0_6b' (3215306) panicked at crates/train/tests/test_qwen35_loader.rs:137:13:
+shape-mismatch should be on q_proj; got tensor name model.language_model.layers.22.linear_attn.conv1d.weight
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test loader_smoke_qwen3_0_6b ... FAILED
+
+failures:
+
+failures:
+    loader_smoke_qwen3_0_6b
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.93s
+
+error: test failed, to rerun pass `-p train --test test_qwen35_loader`
+exit=101

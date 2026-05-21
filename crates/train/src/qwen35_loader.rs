@@ -726,7 +726,9 @@ fn plan_tensor_load(
     })?;
     let expected_shape = slot.shape.clone();
     let requires_grad = slot.requires_grad;
-    if expected_shape != got_shape {
+    let shape_compatible = expected_shape == got_shape
+        || can_squeeze_linear_conv1d_weight(train_name, &expected_shape, &got_shape);
+    if !shape_compatible {
         let hint = shape_mismatch_hint(hf_name, train_name, &expected_shape, &got_shape);
         return Err(LoaderError::ShapeMismatch {
             name: train_name.to_owned(),
@@ -744,6 +746,15 @@ fn plan_tensor_load(
         requires_grad,
         shard_idx,
     })
+}
+
+fn can_squeeze_linear_conv1d_weight(train_name: &str, expected: &[usize], got: &[usize]) -> bool {
+    train_name.ends_with(".linear_attn.conv1d.weight")
+        && expected.len() == 2
+        && got.len() == 3
+        && got[1] == 1
+        && expected[0] == got[0]
+        && expected[1] == got[2]
 }
 
 fn validate_supported_dtype(view: &impl safetensors::View, name: &str) -> Result<()> {

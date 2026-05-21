@@ -1,0 +1,4 @@
+    Checking autograd v0.1.5 (/home/ckl/projects/arle/crates/autograd)
+    Checking train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.50s
+exit=0
