@@ -13,26 +13,26 @@ mod app {
         time::{Duration, Instant},
     };
 
-    use autograd::{backend_cuda::CudaBackend, optim::AdamW, Backend, Tape, TensorId, TensorStore};
+    use autograd::{Backend, Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
     use infer::server_engine::{
         InferenceEngineOptions, LoadedInferenceEngine, ServerRuntimeConfig,
     };
     use train::{
+        LoraAdapterConfig, LoraConfig, LoraTargetSet,
         loss::kl_distill_loss,
-        opd::{opd_step_with_teacher_forward_profiled, OpdStepConfig, OpdStepProfile},
+        opd::{OpdStepConfig, OpdStepProfile, opd_step_with_teacher_forward_profiled_gkd},
         prompts::load_jsonl_prompt_sets,
         qwen35::Qwen35Model,
         qwen35_checkpoint::{
-            save_named_qwen35_student_checkpoint, save_qwen35_student_checkpoint, ConfigJsonSource,
-            GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
-            Qwen35StudentWeights,
+            ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
+            Qwen35StudentWeights, save_named_qwen35_student_checkpoint,
+            save_qwen35_student_checkpoint,
         },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
         teacher_infer::{
             ApiTeacher, InferTeacher, MultiTeacher, TeacherEntry, TeacherForward, TeacherRoute,
         },
         trainer::extend_keep_with_params_and_grads,
-        LoraAdapterConfig, LoraConfig, LoraTargetSet,
     };
 
     const DEFAULT_QWEN35_08B_DIR: &str =
@@ -65,6 +65,7 @@ mod app {
         enable_cuda_graph: bool,
         save_student_checkpoint: Option<PathBuf>,
         save_every: usize,
+        gkd_lambda: f32,
     }
 
     #[derive(Debug)]
@@ -134,7 +135,8 @@ mod app {
              lora_rank={LORA_RANK} lora_alpha={LORA_ALPHA:.6} lora_target_set={} \
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
-             eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={}",
+             eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
+             gkd_lambda={:.6}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
             args.teacher_config
@@ -155,7 +157,8 @@ mod app {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "none".to_owned()),
-            args.save_every
+            args.save_every,
+            args.gkd_lambda
         );
         for (idx, prompt) in prompts.train.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
@@ -287,6 +290,7 @@ mod app {
         let mut enable_cuda_graph = true;
         let mut save_student_checkpoint = None;
         let mut save_every = 0usize;
+        let mut gkd_lambda = 0.0f32;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -316,6 +320,7 @@ mod app {
                     save_student_checkpoint = Some(PathBuf::from(next_arg(&mut args, &arg)?))
                 }
                 "--save-every" => save_every = next_arg(&mut args, &arg)?.parse::<usize>()?,
+                "--gkd-lambda" => gkd_lambda = parse_gkd_lambda(&next_arg(&mut args, &arg)?)?,
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -324,7 +329,8 @@ mod app {
                          [--teacher-api-url URL] [--teacher-config JSON] [--prompts-file JSONL] \
                          [--steps N] [--rollout-len N] [--lr LR] \
                          [--eval-steps CSV] [--prompt-max-tokens N] [--max-step-seconds SEC] \
-                         [--save-student-checkpoint DIR] [--save-every N] [--no-cuda-graph]"
+                         [--save-student-checkpoint DIR] [--save-every N] \
+                         [--gkd-lambda LAMBDA] [--no-cuda-graph]"
                     );
                     std::process::exit(0);
                 }
@@ -363,6 +369,7 @@ mod app {
             enable_cuda_graph,
             save_student_checkpoint,
             save_every,
+            gkd_lambda,
         })
     }
 
@@ -394,6 +401,14 @@ mod app {
         out.sort_unstable();
         out.dedup();
         Ok(out)
+    }
+
+    fn parse_gkd_lambda(raw: &str) -> Result<f32, Box<dyn std::error::Error>> {
+        let value = raw.parse::<f32>()?;
+        if !(0.0..=1.0).contains(&value) || !value.is_finite() {
+            return Err("--gkd-lambda must be finite and in [0.0, 1.0]".into());
+        }
+        Ok(value)
     }
 
     fn load_prompts(args: &Args) -> Result<PromptSets, Box<dyn std::error::Error>> {
@@ -504,7 +519,7 @@ mod app {
             let selected_teacher = route_teacher_id(prompt);
             let mut profile = OpdStepProfile::default();
             let step_started = Instant::now();
-            let outcome = opd_step_with_teacher_forward_profiled(
+            let outcome = opd_step_with_teacher_forward_profiled_gkd(
                 student,
                 teacher,
                 prompt,
@@ -516,6 +531,7 @@ mod app {
                 &mut optimizer,
                 store,
                 tape,
+                args.gkd_lambda,
                 Some(&mut profile),
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();

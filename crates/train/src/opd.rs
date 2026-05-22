@@ -20,19 +20,20 @@
 //! - Student initialised from a smaller checkpoint with LoRA adapter
 //!   layered on via `Qwen35Model::new_with_lora`.
 
-use autograd::{optim::Optimizer, AutogradError, Device, Tape, TensorId, TensorStore};
+use autograd::{AutogradError, Device, Tape, TensorId, TensorStore, optim::Optimizer};
 use std::{collections::HashSet, time::Instant};
 
 use crate::{
     grad_clip::clip_grad_norm,
-    loss::kl_distill_loss,
+    loss::{cross_entropy_loss, kl_distill_loss},
     qwen35::{
-        forward_rollout_cached, forward_rollout_cached_device_token, Qwen35Error, Qwen35KvCache,
-        Qwen35Model,
+        Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached,
+        forward_rollout_cached_device_token,
     },
     teacher_infer::{InProcessTeacher, TeacherForward, TeacherForwardError},
     trainer::{cleanup_after_backward, retained_param_and_grad_ids},
 };
+use autograd::ops::{add, mul_scalar, slice};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpdError {
@@ -405,6 +406,17 @@ fn validate_step_config(cfg: OpdStepConfig) -> Result<()> {
     )))
 }
 
+fn validate_gkd_lambda(gkd_lambda: f32) -> Result<()> {
+    if (0.0..=1.0).contains(&gkd_lambda) && gkd_lambda.is_finite() {
+        return Ok(());
+    }
+    Err(OpdError::InvalidInput(format!(
+        "OPD GKD lambda must be finite and in [0.0, 1.0], got {gkd_lambda}. \
+         Hint: pass --gkd-lambda 0.0 for pure OPD, 0.3 for the literature \
+         SFT/OPD blend probe, or 1.0 for pure hard-token SFT proxy."
+    )))
+}
+
 fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -> Result<()> {
     let total_len = prompt_len.checked_add(rollout_len).ok_or_else(|| {
         OpdError::InvalidInput(format!(
@@ -428,6 +440,78 @@ fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -
         )));
     }
     Ok(())
+}
+
+fn shifted_rollout_sft_loss(
+    student_logits: TensorId,
+    rollout: &[u32],
+    vocab: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    if rollout.len() < 2 {
+        return Err(OpdError::InvalidInput(
+            "GKD SFT proxy requires at least two rollout tokens so logits can \
+             be trained against next-token labels. Hint: use a prompt with \
+             length >= 2 or set --rollout-len > 0 when --gkd-lambda > 0."
+                .to_owned(),
+        ));
+    }
+    let shape = store
+        .get(student_logits)
+        .ok_or(AutogradError::InvalidTensorId(student_logits))?
+        .shape
+        .clone();
+    let expected_shape = vec![1, rollout.len(), vocab];
+    if shape != expected_shape {
+        return Err(OpdError::InvalidInput(format!(
+            "GKD SFT proxy expected student logits shape {:?}, got {:?}. \
+             Hint: pass logits from the same full OPD rollout used for KL.",
+            expected_shape, shape
+        )));
+    }
+    let mut targets = Vec::with_capacity(rollout.len() - 1);
+    for (index, &token_id) in rollout.iter().enumerate().skip(1) {
+        if token_id as usize >= vocab {
+            return Err(OpdError::InvalidInput(format!(
+                "GKD SFT proxy target token {token_id} at rollout[{index}] is \
+                 outside vocab={vocab}. Hint: verify tokenizer/model vocab \
+                 alignment before mixing hard-token SFT into OPD."
+            )));
+        }
+        targets.push(token_id as usize);
+    }
+    let shifted_logits = slice(
+        student_logits,
+        &[0, 0, 0],
+        &[1, rollout.len() - 1, vocab],
+        store,
+        tape,
+    )?;
+    let token_mean_ce = cross_entropy_loss(shifted_logits, &targets, store, tape)?;
+    // `kl_distill_loss` intentionally uses mean over positions * vocab.
+    // Scale the hard-label CE to the same internal normalization before
+    // mixing, otherwise lambda=0.3 would dominate KL by roughly vocab_size.
+    mul_scalar(token_mean_ce, 1.0 / vocab as f32, store, tape).map_err(OpdError::from)
+}
+
+fn mix_gkd_losses(
+    kl_loss: TensorId,
+    sft_loss: TensorId,
+    gkd_lambda: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    validate_gkd_lambda(gkd_lambda)?;
+    if gkd_lambda == 0.0 {
+        return Ok(kl_loss);
+    }
+    if gkd_lambda == 1.0 {
+        return Ok(sft_loss);
+    }
+    let weighted_kl = mul_scalar(kl_loss, 1.0 - gkd_lambda, store, tape)?;
+    let weighted_sft = mul_scalar(sft_loss, gkd_lambda, store, tape)?;
+    add(weighted_kl, weighted_sft, store, tape).map_err(OpdError::from)
 }
 
 fn map_qwen35_forward_error(stage: &str, err: Qwen35Error) -> OpdError {
@@ -563,12 +647,39 @@ pub fn opd_step_with_teacher_forward_profiled<O: Optimizer, T: TeacherForward + 
     tape: &mut Tape,
     profile: Option<&mut OpdStepProfile>,
 ) -> Result<OpdStepOutcome> {
+    opd_step_with_teacher_forward_profiled_gkd(
+        student,
+        teacher,
+        prompt_ids,
+        cfg,
+        student_params,
+        optimizer,
+        store,
+        tape,
+        0.0,
+        profile,
+    )
+}
+
+pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForward + ?Sized>(
+    student: &Qwen35Model,
+    teacher: &T,
+    prompt_ids: &[u32],
+    cfg: OpdStepConfig,
+    student_params: &[TensorId],
+    optimizer: &mut O,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    gkd_lambda: f32,
+    profile: Option<&mut OpdStepProfile>,
+) -> Result<OpdStepOutcome> {
     let mut profile = profile;
     if let Some(profile) = profile.as_deref_mut() {
         *profile = OpdStepProfile::default();
     }
     let total_started = Instant::now();
     validate_step_config(cfg)?;
+    validate_gkd_lambda(gkd_lambda)?;
     let vocab = student.config().vocab_size;
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(
@@ -756,15 +867,22 @@ pub fn opd_step_with_teacher_forward_profiled<O: Optimizer, T: TeacherForward + 
             profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
         });
 
-        // 4. KL distill loss.
+        // 4. KL distill loss, optionally blended with the GKD hard-token
+        //    SFT proxy on the same on-policy rollout.
         let phase_started = Instant::now();
-        let loss = kl_distill_loss(
+        let kl_loss = kl_distill_loss(
             student_logits,
             teacher_logits.tensor_id,
             rollout.len(),
             store,
             tape,
         )?;
+        let loss = if gkd_lambda == 0.0 {
+            kl_loss
+        } else {
+            let sft_loss = shifted_rollout_sft_loss(student_logits, &rollout, vocab, store, tape)?;
+            mix_gkd_losses(kl_loss, sft_loss, gkd_lambda, store, tape)?
+        };
         let loss_value = store.to_host(loss)?[0];
         validate_loss_value(loss_value)?;
         record_profile(&mut profile, |profile| {
@@ -815,12 +933,13 @@ pub fn opd_step_with_teacher_forward_profiled<O: Optimizer, T: TeacherForward + 
 
 #[cfg(test)]
 mod tests {
-    use autograd::{AutogradError, Tensor, TensorStore};
+    use autograd::{AutogradError, Tape, Tensor, TensorStore};
 
     use super::{
-        greedy_next_token, map_qwen35_forward_error, validate_loss_value, validate_rollout_shape,
+        OpdError, OpdStepConfig, greedy_next_token, map_qwen35_forward_error, mix_gkd_losses,
+        shifted_rollout_sft_loss, validate_gkd_lambda, validate_loss_value, validate_rollout_shape,
         validate_step_config, validate_student_param_ownership, validate_student_params,
-        validate_teacher_params, OpdError, OpdStepConfig,
+        validate_teacher_params,
     };
     use crate::qwen35::Qwen35Error;
 
@@ -1021,6 +1140,73 @@ mod tests {
         assert!(message.contains("cfg.grad_clip"));
         assert!(message.contains("non-negative"));
         assert!(message.contains("0.0"));
+    }
+
+    #[test]
+    fn validate_gkd_lambda_rejects_out_of_range_values() {
+        for gkd_lambda in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            let err =
+                validate_gkd_lambda(gkd_lambda).expect_err("invalid GKD lambda must be rejected");
+
+            let OpdError::InvalidInput(message) = err else {
+                panic!("expected InvalidInput, got {err:?}");
+            };
+            assert!(message.contains("GKD lambda"));
+            assert!(message.contains("[0.0, 1.0]"));
+        }
+    }
+
+    #[test]
+    fn mix_gkd_losses_respects_lambda_endpoints_and_midpoint() {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let kl = store.alloc(Tensor::new(vec![2.0], vec![1], true).expect("kl scalar"));
+        let sft = store.alloc(Tensor::new(vec![10.0], vec![1], true).expect("sft scalar"));
+
+        let pure_kl = mix_gkd_losses(kl, sft, 0.0, &mut store, &mut tape)
+            .expect("lambda=0 should produce pure KL");
+        assert_eq!(store.to_host(pure_kl).expect("pure kl host")[0], 2.0);
+
+        let pure_sft = mix_gkd_losses(kl, sft, 1.0, &mut store, &mut tape)
+            .expect("lambda=1 should produce pure SFT");
+        assert_eq!(store.to_host(pure_sft).expect("pure sft host")[0], 10.0);
+
+        let midpoint = mix_gkd_losses(kl, sft, 0.5, &mut store, &mut tape)
+            .expect("lambda=0.5 should mix losses evenly");
+        let value = store.to_host(midpoint).expect("midpoint host")[0];
+        assert!((value - 6.0).abs() < 1.0e-6, "got {value}");
+    }
+
+    #[test]
+    fn shifted_rollout_sft_loss_uses_kl_internal_vocab_scale() {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let logits = store.alloc(
+            Tensor::new(
+                vec![
+                    0.0, 1.0, 2.0, 3.0, // position 0, target 2
+                    4.0, 3.0, 2.0, 1.0, // position 1, target 1
+                    0.5, 0.25, 0.0, -0.25, // position 2 ignored
+                ],
+                vec![1, 3, 4],
+                true,
+            )
+            .expect("student logits"),
+        );
+
+        let loss = shifted_rollout_sft_loss(logits, &[0, 2, 1], 4, &mut store, &mut tape)
+            .expect("shifted sft loss");
+        let value = store.to_host(loss).expect("loss host")[0];
+
+        // Manual CE over positions 0..1, then divided by vocab=4 to match
+        // the current KL internal normalization.
+        let ce0 = (0.0f32.exp() + 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln() - 2.0;
+        let ce1 = (4.0f32.exp() + 3.0f32.exp() + 2.0f32.exp() + 1.0f32.exp()).ln() - 3.0;
+        let expected = ((ce0 + ce1) * 0.5) / 4.0;
+        assert!(
+            (value - expected).abs() < 1.0e-6,
+            "got {value}, expected {expected}"
+        );
     }
 
     #[test]
