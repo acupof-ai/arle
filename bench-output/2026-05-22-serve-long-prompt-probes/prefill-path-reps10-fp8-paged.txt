@@ -1,0 +1,32 @@
+model_dir=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base
+prompt_tokens=35
+prompt="Hello world. Hello world. Hello world. Hello world. Hello world. Hello world. Hello world. Hello world. Hello world. Hello world. The capital of France is"
+sequential_decode:
+  #0: id=11751 logit=16.500000 text=" Paris"
+  #1: id=13 logit=14.125000 text="."
+  #2: id=1076 logit=13.937500 text="..."
+  #3: id=25 logit=13.875000 text=":"
+  #4: id=39509 logit=13.187500 text=" paris"
+  #5: id=279 logit=13.000000 text=" the"
+  #6: id=198 logit=12.500000 text="\n"
+  #7: id=271 logit=12.312500 text="\n\n"
+contiguous_prefill:
+  #0: id=11751 logit=16.500000 text=" Paris"
+  #1: id=13 logit=14.125000 text="."
+  #2: id=25 logit=13.875000 text=":"
+  #3: id=1076 logit=13.875000 text="..."
+  #4: id=39509 logit=13.125000 text=" paris"
+  #5: id=279 logit=12.937500 text=" the"
+  #6: id=198 logit=12.625000 text="\n"
+  #7: id=271 logit=12.375000 text="\n\n"
+paged_prefill_batch:
+  #0: id=11751 logit=16.500000 text=" Paris"
+  #1: id=13 logit=14.125000 text="."
+  #2: id=1076 logit=13.937500 text="..."
+  #3: id=25 logit=13.875000 text=":"
+  #4: id=39509 logit=13.187500 text=" paris"
+  #5: id=279 logit=12.937500 text=" the"
+  #6: id=198 logit=12.625000 text="\n"
+  #7: id=271 logit=12.375000 text="\n\n"
+delta sequential_vs_contiguous max_abs=0.156250
+delta contiguous_vs_paged max_abs=0.125000

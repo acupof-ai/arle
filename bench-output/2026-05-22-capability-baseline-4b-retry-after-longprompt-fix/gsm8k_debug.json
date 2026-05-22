@@ -1,0 +1,32 @@
+[
+  {
+    "i": 0,
+    "gold": "18",
+    "extracted": "3",
+    "response_first_300": "\n\n<think>\nThe user wants me to think about the solution to the following question: \"How much more can be done with the given information?\" However, looking at the provided question and the answer, I need to determine the correct answer based on the context.\n\nThe user is presenting a math problem sce"
+  },
+  {
+    "i": 1,
+    "gold": "3",
+    "extracted": "2",
+    "response_first_300": "\n\n<think>\n\n<q>\nA robe takes 2 bolts of blue fabric and 3/2 of white fabric. How many bolts of fabric are needed?\n</Q>\nA robe takes 2 bolts of blue fabric and 3/2 of white fabric. How many bolts are needed?\n1.  **Analyze the problem:** The user wants to know the total fabric usage for the robe, consi"
+  },
+  {
+    "i": 2,
+    "gold": "70000",
+    "extracted": "100",
+    "response_first_300": " The house was worth $80,000. After repairs, the value is $80,000 + $50,000 = $80,000. The house is now worth $80,000 + $50,000 = $80,000. The profit is $80,000 - $80,000 = $0.\n\n<think>\nOkay, let me try to parse this question. The user is asking me to do some kind of math or math problem solving. Th"
+  },
+  {
+    "i": 3,
+    "gold": "540",
+    "extracted": "54",
+    "response_first_300": " James runs 3 * 3 = 9 sprints. 60 * 3 = 180 meters. 9 * 60 = 180 meters.\nWait, I should calculate the total distance. 3 sprints * 3 = 9 sprints. 9 * 60 = 54 meters.\nWait, I should not multiply the number of sprints by the distance. I should just multiply the number of sprints by the distance.\nJames "
+  },
+  {
+    "i": 4,
+    "gold": "20",
+    "extracted": "2",
+    "response_first_300": " Wendi feeds 10 chickens a day. In the morning, she gives 10 chickens 1/3 of the way of the chicken. The chickens eat 1/3 of the chicken feed. So, she needs 10 chickens to feed the chickens. The chickens eat 1/3 of the chicken feed. So, she needs 10 chickens to feed the chickens. The chickens eat 1/"
+  }
+]

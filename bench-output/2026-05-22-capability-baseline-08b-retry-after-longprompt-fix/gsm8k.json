@@ -1,0 +1,10 @@
+{
+  "task": "gsm8k",
+  "status": "ok",
+  "n_samples": 200,
+  "n_scored": 194,
+  "n_invalid": 6,
+  "n_correct": 3,
+  "accuracy": 0.015463917525773196,
+  "elapsed_seconds": 172.47389459609985
+}

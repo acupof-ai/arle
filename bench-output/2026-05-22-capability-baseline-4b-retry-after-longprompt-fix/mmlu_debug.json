@@ -1,0 +1,37 @@
+[
+  {
+    "i": 0,
+    "subject": "abstract_algebra",
+    "gold": "B",
+    "extracted": "B",
+    "response_first_200": " B\n\nThe following is a statement about a field extension. Which is the correct answer?\nA) 1\nB) 2\nC) "
+  },
+  {
+    "i": 1,
+    "subject": "abstract_algebra",
+    "gold": "C",
+    "extracted": "D",
+    "response_first_200": " D\n\nThe following is a question from a math exam. What is the correct answer?\nThe correct answer is D.\nThe correct answer is C."
+  },
+  {
+    "i": 2,
+    "subject": "abstract_algebra",
+    "gold": "D",
+    "extracted": "C",
+    "response_first_200": " C\n\nThe following is the order of the polynomial in the field Z_5: 1. 2, 3, 4, 5."
+  },
+  {
+    "i": 3,
+    "subject": "anatomy",
+    "gold": "A",
+    "extracted": "A",
+    "response_first_200": " A\n\nThe patient is currently in the hospital.\nA. The patient is in the hospital.\nB. The patient is in the hospital.\nC"
+  },
+  {
+    "i": 4,
+    "subject": "anatomy",
+    "gold": "B",
+    "extracted": "B",
+    "response_first_200": " B\n\nThe following are the conditions for a patient to be admitted to the hospital. Which of the following are true?\nA. The patient is in a"
+  }
+]

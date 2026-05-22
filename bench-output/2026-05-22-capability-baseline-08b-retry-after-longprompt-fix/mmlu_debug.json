@@ -1,0 +1,37 @@
+[
+  {
+    "i": 0,
+    "subject": "abstract_algebra",
+    "gold": "B",
+    "extracted": "C",
+    "response_first_200": " C\n\nThe following are called the only thing that can be done in the field of the field.\nThe following are called the only thing that can be done"
+  },
+  {
+    "i": 1,
+    "subject": "abstract_algebra",
+    "gold": "C",
+    "extracted": "C",
+    "response_first_200": " C"
+  },
+  {
+    "i": 2,
+    "subject": "abstract_algebra",
+    "gold": "D",
+    "extracted": "C",
+    "response_first_200": " C\n\nThe following are called the only thing you and every other person in the world.\nAnswer: 1\nThe following are called the only thing you"
+  },
+  {
+    "i": 3,
+    "subject": "anatomy",
+    "gold": "A",
+    "extracted": "D",
+    "response_first_200": " D\n\nThe following are the only two types of cells in the body of a cell.\nA.\nB.\nC.\nD.\nE"
+  },
+  {
+    "i": 4,
+    "subject": "anatomy",
+    "gold": "B",
+    "extracted": "B",
+    "response_first_200": " B\n\nThe following are the only cases of which of the following are considered as a medical emergency?\nA.\t\t-\t-\t-\nB"
+  }
+]
