@@ -132,9 +132,12 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 - **Bug fixed:** `arle serve` corruption on prompts ≥ 33 tokens (Qwen3.5 hybrid GDR chunkwise prefill divergence) → MMLU recovered 0/171 invalid → 116/150 = 77.3 % ([`a374108`](https://github.com/cklxx/arle/commit/a374108)).
 - **Pipeline closed:** OPD train saves LoRA adapter (PEFT format) → `INFER_LORA_PATH` loads in CUDA serve → `scripts/arle_capability_eval.py` produces before/after MMLU table.
-- **Distill trajectory at lr=2e-5, 2 000 steps:** classic OPD U-curve. Base 51.4 % → step 1000 valley 47.9 % (−3.5 pp, invalid 29 → 2) → step 2000 50.0 % (recovering, +2.1 pp). KL bottoms at step 1000, but MMLU keeps moving — **KL ≠ capability** in the recovery phase. Literature horizon (10 k–100 k steps) needed to cross the +25.9 pp 4B teacher ceiling.
+- **Distill trajectory + lr sweep (2k steps each):** OPD U-curve is **fundamental, not just lr-driven**.
+  - `lr=2e-5`: base 51.4 % → step 1000 deep valley **47.9 %** (−3.5 pp) → step 2000 recovering **50.0 %** (+2.1 pp).
+  - `lr=1e-5`: base 51.4 % → step 1000 shallow valley **50.6 %** (−0.8 pp) → step 2000 **REGRESSED 48.5 %** (−2.1 pp from peak).
+  - Lower lr ≠ shallower valley ≠ faster recovery. Neither lr crosses base in 2 k steps. → Need longer horizon (10 k +) or GKD λ-mixing, not just lr tuning.
 
-Evidence: [`serve fix`](docs/experience/wins/2026-05-22-arle-serve-long-prompt-bug-fix.md) · [`pipeline close`](docs/experience/wins/2026-05-22-p1b-train-save-load-eval-loop.md) · [`U-curve diagnosis`](docs/experience/wins/2026-05-22-distill-trajectory-valley-then-recovery.md) · [`cross-validation`](docs/experience/wins/2026-05-22-arle-vs-hf-transformers-cross-validation.md) · [`cycle wrap`](docs/projects/2026-05-22-serve-fix-and-capability-baselines.md)
+Evidence: [`serve fix`](docs/experience/wins/2026-05-22-arle-serve-long-prompt-bug-fix.md) · [`pipeline close`](docs/experience/wins/2026-05-22-p1b-train-save-load-eval-loop.md) · [`U-curve diagnosis`](docs/experience/wins/2026-05-22-distill-trajectory-valley-then-recovery.md) · [`lr sweep KILL`](docs/experience/errors/2026-05-22-p2-lr-sweep-not-the-fix.md) · [`cross-validation`](docs/experience/wins/2026-05-22-arle-vs-hf-transformers-cross-validation.md) · [`cycle wrap`](docs/projects/2026-05-22-serve-fix-and-capability-baselines.md)
 
 ---
 
