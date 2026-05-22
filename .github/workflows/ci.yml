@@ -212,8 +212,14 @@ jobs:
         with:
           components: rustfmt
 
-      - name: cargo fmt check
-        run: cargo fmt --all -- --check
+      - name: cargo fmt check (scoped to changed .rs files)
+        # Workspace-wide `cargo fmt --all -- --check` trips on any
+        # un-formatted file the WORKTREE happens to contain — including
+        # files left dirty by parallel-track work that this commit
+        # didn't touch. Scope to the actual delta instead so CI failure
+        # tracks the commit, not the worktree. Drift is caught by the
+        # periodic nightly full-workspace fmt sweep (see fmt-nightly).
+        run: bash scripts/ci-fmt-check-changed.sh
 
   python-test:
     name: Python Tests

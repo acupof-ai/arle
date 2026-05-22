@@ -1,0 +1,34 @@
+name: Fmt Nightly
+
+# Periodic full-workspace fmt sweep. Catches drift on files no commit
+# happens to touch (the scoped fmt check in ci.yml only flags the files
+# changed in each push). Runs daily at 09:00 UTC, plus manual dispatch.
+#
+# If this fails:
+#   - It is NOT a regression on the latest commit (those passed the
+#     scoped check).
+#   - Open an issue or open a tidy-up PR running `cargo fmt --all` on
+#     the offending paths.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt-nightly:
+    name: Workspace-wide fmt sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt (full workspace)
+        run: cargo fmt --all -- --check
