@@ -88,6 +88,86 @@ class ArleClient:
         return payload["choices"][0]["text"]
 
 
+class HfTransformersClient:
+    """PyTorch / HuggingFace transformers client.
+
+    Loads a HF model directory directly and runs `model.generate()`. Same
+    interface as `ArleClient` so the eval task runners don't care which
+    backend they're scoring. Lets us cross-validate ARLE's serve numbers
+    against the PyTorch-ecosystem reference (transformers + Qwen Auto*
+    classes) for the same model checkpoint, on identical prompts.
+
+    Cost: loads the full model into VRAM on first call. Use for the
+    baseline triplet eval; don't mix with an ARLE serve process on the
+    same GPU unless there's free headroom.
+    """
+
+    def __init__(self, model_path: str, model_id: str | None = None, dtype: str = "bfloat16"):
+        try:
+            import torch  # noqa: F401
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "HfTransformersClient requires `torch` + `transformers`. "
+                "Install with `pip install torch transformers accelerate`."
+            ) from exc
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
+        self.model_path = model_path
+        self.model_id = model_id or model_path
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            device_map="cuda" if torch.cuda.is_available() else "cpu",
+            trust_remote_code=True,
+        )
+        self.model.eval()
+        self._torch = torch
+        self._device = next(self.model.parameters()).device
+
+    def completion(self, prompt: str, max_tokens: int = 64, temperature: float = 0.0) -> str:
+        torch = self._torch
+        ids = self.tokenizer(prompt, return_tensors="pt").to(self._device)
+        with torch.no_grad():
+            out = self.model.generate(
+                **ids,
+                max_new_tokens=max_tokens,
+                do_sample=temperature > 0.0,
+                temperature=max(temperature, 1e-5),
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        new_tokens = out[0, ids["input_ids"].shape[1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    def chat(self, messages: list[dict], max_tokens: int = 64, temperature: float = 0.0) -> str:
+        # Apply the tokenizer's chat template if available; fall back to
+        # naive concatenation for base models without one.
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except (ValueError, KeyError):
+                prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        return self.completion(prompt, max_tokens=max_tokens, temperature=temperature)
+
+
+def build_client(backend: str, *, base_url: str | None, model_id: str | None, model_path: str | None, dtype: str = "bfloat16"):
+    """Factory shared by CLI and tests so the eval-driver code stays backend-agnostic."""
+    if backend == "arle":
+        if not (base_url and model_id):
+            raise ValueError("--backend arle requires --base-url and --model-id")
+        return ArleClient(base_url=base_url, model_id=model_id)
+    if backend == "hf":
+        if not model_path:
+            raise ValueError("--backend hf requires --model-path")
+        return HfTransformersClient(model_path=model_path, model_id=model_id, dtype=dtype)
+    raise ValueError(f"unknown backend {backend!r}; pick arle | hf")
+
+
 # ───────────────────────── MMLU ─────────────────────────────────
 
 
@@ -383,15 +463,25 @@ TASK_RUNNERS = {
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base-url", default=os.environ.get("ARLE_BASE_URL", "http://localhost:8123"))
-    parser.add_argument("--model-id", required=True, help="model id as loaded by arle serve (e.g. Qwen3___5-0___8B-Base)")
+    parser.add_argument("--backend", choices=["arle", "hf"], default="arle",
+                        help="arle = OpenAI-v1 HTTP to arle serve; hf = transformers in-process")
+    parser.add_argument("--base-url", default=os.environ.get("ARLE_BASE_URL", "http://localhost:8123"),
+                        help="--backend arle only")
+    parser.add_argument("--model-id", required=True,
+                        help="logical name; for arle = served id (e.g. Qwen3___5-0___8B-Base); "
+                             "for hf = same id (used in report labelling)")
+    parser.add_argument("--model-path", default=None,
+                        help="--backend hf only: HF model directory (or HF repo id)")
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"],
+                        help="--backend hf only")
     parser.add_argument("--tasks", default="mmlu,gsm8k", help="comma-separated subset of: " + ", ".join(TASK_RUNNERS))
     parser.add_argument("--n-samples", type=int, default=200, help="samples per task")
     parser.add_argument("--output", type=Path, required=True, help="output directory for per-task reports")
     args = parser.parse_args(argv)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    client = ArleClient(args.base_url, args.model_id)
+    client = build_client(args.backend, base_url=args.base_url, model_id=args.model_id,
+                          model_path=args.model_path, dtype=args.dtype)
 
     requested = [t.strip() for t in args.tasks.split(",") if t.strip()]
     unknown = [t for t in requested if t not in TASK_RUNNERS]
@@ -400,7 +490,9 @@ def main(argv: list[str]) -> int:
         return 2
 
     summary = {
-        "base_url": args.base_url,
+        "backend": args.backend,
+        "base_url": args.base_url if args.backend == "arle" else None,
+        "model_path": args.model_path if args.backend == "hf" else None,
         "model_id": args.model_id,
         "tasks": {},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),

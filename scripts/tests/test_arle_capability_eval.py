@@ -150,5 +150,33 @@ class TaskRunnerRegistry(unittest.TestCase):
             self.assertTrue(callable(fn), f"runner {task!r} not callable")
 
 
+class ClientFactory(unittest.TestCase):
+    """build_client validates required args per backend without trying to actually
+    connect / load a model."""
+
+    def test_arle_requires_base_url_and_model_id(self):
+        with self.assertRaisesRegex(ValueError, "arle requires"):
+            eval_mod.build_client("arle", base_url=None, model_id="x", model_path=None)
+        with self.assertRaisesRegex(ValueError, "arle requires"):
+            eval_mod.build_client("arle", base_url="http://x", model_id=None, model_path=None)
+
+    def test_hf_requires_model_path(self):
+        with self.assertRaisesRegex(ValueError, "hf requires"):
+            eval_mod.build_client("hf", base_url=None, model_id="x", model_path=None)
+
+    def test_unknown_backend_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown backend"):
+            eval_mod.build_client("vllm", base_url="http://x", model_id="x", model_path="/x")
+
+    def test_arle_constructs_without_network(self):
+        # build_client should construct the ArleClient lazily without actually
+        # connecting; the connection happens on first .completion() call.
+        client = eval_mod.build_client("arle", base_url="http://localhost:99999",
+                                       model_id="m", model_path=None)
+        self.assertIsInstance(client, eval_mod.ArleClient)
+        self.assertEqual(client.model_id, "m")
+        self.assertEqual(client.base_url, "http://localhost:99999")
+
+
 if __name__ == "__main__":
     unittest.main()
